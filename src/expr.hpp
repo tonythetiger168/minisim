@@ -3,8 +3,14 @@
 //
 // Encoding: bit i is unknown if x bit i = 1; otherwise its value is v bit i.
 // An unknown bit is Z if z bit i = 1 (z is always a subset of x), else X.
-// Operators treat Z as X and return X; only slice/concat/insert/index/mux
-// and === / casez / casex preserve or inspect the Z distinction.
+// Most operators treat Z as X and return X (the result has no Z).
+// Logical shifts (<<, >>) keep Z on bits that move and fill vacated bits
+// with 0. An X or Z bit in the shift count makes the whole result X.
+// There is no arithmetic shift (<<<, >>>).
+// ?: with a known 0/1 condition selects that arm, Z included. With an X or Z
+// condition, a bit is kept when both arms have that same 0, 1, X, or Z;
+// any other pair becomes X (IEEE 1364/1800 conditional operator).
+// slice/concat/insert/index and === / casez / casex also preserve or inspect Z.
 // Invariant (enforced by make()): v bits are 0 wherever x bits are 1,
 // z is within x, and nothing is set above bit w-1.
 //
@@ -89,14 +95,17 @@ inline Val v_le(Val a, Val b) { return (a.x || b.x) ? allx(1) : mk(a.v <= b.v); 
 inline Val v_gt(Val a, Val b) { return v_lt(b, a); }
 inline Val v_ge(Val a, Val b) { return v_le(b, a); }
 
-// ---- shifts (logical); unknown shift amount -> all X ----
+// Logical << / >>. Vacated bits are 0. Z that remains in range stays Z.
+// Any X or Z in the count (z is part of x) -> all X. No <<< / >>>.
 inline Val v_shl(Val a, Val n) {
     if (n.x) return allx(a.w);
-    return n.v >= 64 ? mk(0, a.w) : make(a.v << n.v, a.x << n.v, a.w);
+    if (n.v >= 64) return mk(0, a.w);
+    return make(a.v << n.v, a.x << n.v, a.w, a.z << n.v);
 }
 inline Val v_shr(Val a, Val n) {
     if (n.x) return allx(a.w);
-    return n.v >= 64 ? mk(0, a.w) : make(a.v >> n.v, a.x >> n.v, a.w);
+    if (n.v >= 64) return mk(0, a.w);
+    return make(a.v >> n.v, a.x >> n.v, a.w, a.z >> n.v);
 }
 
 // ---- reductions and logical ops ----
@@ -143,13 +152,17 @@ inline Val v_concat(const std::vector<Val>& parts) {
     }
     return r;
 }
-// Unknown condition: keep bits where both branches agree and are known, else X.
+// X/Z condition: per bit, both arms equal (0, 1, X, or Z) keeps that value;
+// otherwise X. A known condition selects that arm unchanged.
 inline Val v_mux(Val c, Val a, Val b) {
     int t = truth(c);
     if (t == 1) return a;
     if (t == 0) return b;
-    uint64_t diff = (a.v ^ b.v) | a.x | b.x;
-    return make(a.v & ~diff, diff, wmax(a, b));
+    int w = wmax(a, b);
+    uint64_t m = mask(w);
+    uint64_t same = ~a.x & ~b.x & ~(a.v ^ b.v) & m; // both 0 or both 1
+    uint64_t bothz = a.z & b.z & m;
+    return make(a.v & same, m & ~same, w, bothz);
 }
 
 // Wire resolution of two drivers, per bit (no strengths):
