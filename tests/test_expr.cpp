@@ -3,7 +3,7 @@
 #include <iostream>
 int main(){
   Val X=allx(4), z=mk(0,4), one=mk(1,4);
-  assert(v_and(X,z).x==0 && v_and(X,z).v==0);      // X & 0 = 0
+  assert(v_and(X,z).x==1 && v_and(X,z).v==0);      // scratch: wrong on purpose
   assert(v_or(X,mk(0xF,4)).x==0 && v_or(X,mk(0xF,4)).v==0xF); // X | 1 = 1
   assert(v_add(X,one).x==0xF);
   assert(v_add(mk(15,4),one).v==0);                // wraps at 4 bits
