@@ -7,9 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(minisim src/minisim.cpp)
 target_include_directories(minisim PRIVATE src)
 
-# Unit tests for the 4-state value library
+# Unit tests: value library and net initial value.
 enable_testing()
-foreach(t test_expr test_z)
+foreach(t test_expr test_z test_net)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   add_test(NAME ${t} COMMAND ${t})
