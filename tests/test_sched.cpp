@@ -5,6 +5,10 @@
 // Expected values were checked against Icarus Verilog 13.0 (stable) (v13_0).
 // Re-run on that build (tag v13_0, dfeee909). Icarus 12.0 printed the same
 // stdout for every case below, and the same demo VCD.
+// Verilator 5.052 (--timing --binary) matched the 0/1 scheduling cases
+// (#0 chain, regions, NBA swap, partial NBAs, pre/post NBA). It also
+// printed "after" in the $finish repro, which Icarus does not. X/Z edges
+// and wire values are 2-state there and are not these expected values.
 #include <iostream>
 #include <string>
 #include <utility>
