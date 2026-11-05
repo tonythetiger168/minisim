@@ -21,7 +21,12 @@ Task exec(const Prog* p) {
                 else co_await Wait{i.sig, i.edge};
                 pc++; break;
             case IK::WaitDelay: co_await Delay{i.delay}; pc++; break;
-            case IK::Finish:    S.finished = true; pc++; break;
+            case IK::Finish:
+                // End this process. Sim::run checks `finished` only between
+                // time slots, so other processes already queued here still
+                // run and no later time starts (Icarus 12).
+                S.finished = true;
+                co_return;
         }
     }
 }

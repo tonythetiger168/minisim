@@ -201,6 +201,7 @@ Task stimulus() {
     S.finished = true;
 }
 
+#ifndef MINISIM_NO_MAIN
 int main() {
     clk = S.sig("clk", 1);
     rst = S.sig("rst", 1);
@@ -220,3 +221,4 @@ int main() {
     S.spawn(stimulus());
     S.run(1000);
 }
+#endif
