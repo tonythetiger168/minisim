@@ -38,6 +38,9 @@ int main(){
 
   // Shifts and ?: below: checked against Icarus Verilog 13.0 (stable) (v13_0),
   // tag v13_0 dfeee909. Icarus 12.0 printed the same string for every case.
+  // Verilator 5.052 rejected a Z shift count and a Z ?: condition, and where
+  // it did run the X/Z patterns came out 2-state. Those runs are not expected
+  // values. The kernel has no arithmetic <<< / >>>.
   // 4'bzzzz << 1 = zzz0. Vacated bit is 0; shifted Z stays Z.
   Val zzz0 = v_shl(Z, mk(1));
   assert(zzz0.v==0 && zzz0.x==0xE && zzz0.z==0xE);
