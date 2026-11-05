@@ -2,7 +2,9 @@
 // include path `src`. The kernel is src/minisim.cpp, which also contains the
 // demo main, so include it without that main.
 //
-// Expected values were checked against Icarus Verilog 12 (-g2012).
+// Expected values were checked against Icarus Verilog 13.0 (stable) (v13_0).
+// Re-run on that build (tag v13_0, dfeee909). Icarus 12.0 printed the same
+// stdout for every case below, and the same demo VCD.
 #include <iostream>
 #include <string>
 #include <utility>
@@ -37,7 +39,7 @@ static int drive2(Val a, Val b) {
     return bit_class(S.get(s));
 }
 
-// #0 chain. Icarus prints HASH A, HASH C, HASH B (the second #0 runs after
+// #0 chain. Icarus 13.0 (v13_0) prints HASH A, HASH C, HASH B (the second #0 runs after
 // the first inactive batch).
 Task pA() {
     co_await Delay{0};
@@ -51,7 +53,7 @@ Task pC() {
 }
 
 // Edge table on a 1-bit signal that starts as X.
-// Icarus: X->0 neg, 0->X pos, X->1 pos, 1->X neg, X->Z none,
+// Icarus 13.0 (v13_0): X->0 neg, 0->X pos, X->1 pos, 1->X neg, X->Z none,
 //         Z->0 neg, 0->Z pos, Z->1 pos, 1->0 neg.
 Task epos() {
     for (;;) {
@@ -87,7 +89,7 @@ Task edge_stim() {
     co_await Delay{1};
 }
 
-// 4-bit posedge is the LSB only. Icarus printed "MB pos" at t=1 (0001) and
+// 4-bit posedge is the LSB only. Icarus 13.0 (v13_0) printed "MB pos" at t=1 (0001) and
 // t=3 (0011), and not when the vector went 1 -> 2.
 Task mbw() {
     for (;;) {
@@ -106,7 +108,7 @@ Task mbs() {
     co_await Delay{1};
 }
 
-// Regions. Icarus: "R active 0", "R hash0 0", "R hash0b 2", "R t1 1".
+// Regions. Icarus 13.0 (v13_0): "R active 0", "R hash0 0", "R hash0b 2", "R t1 1".
 // a = 0; a <= 1; #0; (still 0); a = 2; then the NBA overwrites with 1.
 Task region() {
     co_await Delay{20};
@@ -123,7 +125,7 @@ Task region2() {
     region_log.push_back(S.get(ra).x ? -1 : (int)S.get(ra).v);
 }
 
-// NBA swap. Icarus: a<=b; b<=a on one posedge, from a=1 b=0, ends a=0 b=1.
+// NBA swap. Icarus 13.0 (v13_0): a<=b; b<=a on one posedge, from a=1 b=0, ends a=0 b=1.
 Task sw() {
     for (;;) {
         co_await Wait{sclk, POS};
@@ -141,7 +143,7 @@ Task swstim() {
     co_await Delay{1};
 }
 
-// Same-slot partial NBAs. Icarus: pv[0]<=1; pv[3:2]<=2'b11 from 0 -> 1101.
+// Same-slot partial NBAs. Icarus 13.0 (v13_0): pv[0]<=1; pv[3:2]<=2'b11 from 0 -> 1101.
 // Whole-word NBA of 0 then lw[0]<=1 from 1111 -> 0001.
 Task partial() {
     co_await Delay{40};
@@ -158,7 +160,7 @@ Task lastp() {
     co_await Delay{1};
 }
 
-// Blocking read sees the pre-NBA value. Icarus: q<=5; r=q leaves r==0 at #0,
+// Blocking read sees the pre-NBA value. Icarus 13.0 (v13_0): q<=5; r=q leaves r==0 at #0,
 // and q==5 at the next time.
 Task pre() {
     co_await Delay{60};
@@ -172,7 +174,7 @@ Task pre() {
 }
 Task post() { co_await Delay{61}; }
 
-// Same time slot as $finish. Icarus prints "other" and does not print "after".
+// Same time slot as $finish. Icarus 13.0 (v13_0) prints "other" and does not print "after".
 Task other_at_finish() {
     co_await Delay{80};
     other_saw_before = known(S.get(before_sig), 1) ? 1 : 0;
@@ -190,7 +192,7 @@ static int fail(const std::string& msg) {
 }
 
 int main() {
-    // Wire resolution. Icarus: 0 fighting 1 -> x, 0 with z -> 0, z with z -> z,
+    // Wire resolution. Icarus 13.0 (v13_0): 0 fighting 1 -> x, 0 with z -> 0, z with z -> z,
     // 0 with x -> x.
     if (drive2(mk(0), mk(1)) != 2) return fail("resolve 0/1 -> x");
     if (drive2(mk(0), allz(1)) != 0) return fail("resolve 0/z -> 0");
@@ -213,7 +215,7 @@ int main() {
     other_sig = S.sig("other", 1);
     later_sig = S.sig("later", 1);
 
-    // if (1'bx) takes the else. Icarus prints IFX 2.
+    // if (1'bx) takes the else. Icarus 13.0 (v13_0) prints IFX 2.
     static Prog ifp;
     { Instr i; i.k = IK::JmpIfNot; i.e = konst(allx(1)); i.target = 2; ifp.emit(i); }
     { Instr i; i.k = IK::Assign; i.sig = ixr; i.e = konst(mk(1, 4)); ifp.emit(i); }
@@ -223,7 +225,7 @@ int main() {
     //   #80 before = 1; $finish; after = 1;
     //   #80 other runs
     //   #81 later must not run
-    // Icarus prints "before" and "other", not "after", and nothing at #11
+    // Icarus 13.0 (v13_0) prints "before" and "other", not "after", and nothing at #11
     // (here the same shape at time 80 / 81). Same-slot processes already
     // queued still run; this process does not continue; later times do not.
     static Prog fp;
