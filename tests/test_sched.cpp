@@ -24,6 +24,8 @@ static std::vector<std::pair<uint64_t, uint64_t>> mb_pos;
 
 static int es, ra, sa, sb, sclk, pv, lw, qsig, rsig, mb, ixr;
 static int before_sig, after_sig, other_sig, later_sig;
+static int call_arg, call_out, call_done;
+static int saw_mid_out = -1, saw_mid_done_x = 0, saw_late_out = -1, saw_late_done = -1;
 static int pre_q = -1, pre_r = -1;
 static int other_saw_before = 0, other_saw_after_x = 0;
 
@@ -190,6 +192,18 @@ Task later_time() {
     S.set(later_sig, mk(1));
 }
 
+// Call a prog that assigns, delays, assigns again, then returns.
+// At t=1 the callee has run the first assign and is suspended, so the
+// instruction after Call has not run. At t=6 both assigns and the return have.
+Task call_probe() {
+    co_await Delay{1};
+    saw_mid_out = (int)S.get(call_out).v;
+    saw_mid_done_x = is_x(S.get(call_done)) ? 1 : 0;
+    co_await Delay{5};
+    saw_late_out = (int)S.get(call_out).v;
+    saw_late_done = (int)S.get(call_done).v;
+}
+
 static int fail(const std::string& msg) {
     std::cerr << "FAIL " << msg << "\n";
     return 1;
@@ -218,6 +232,20 @@ int main() {
     after_sig = S.sig("after", 4);
     other_sig = S.sig("other", 1);
     later_sig = S.sig("later", 1);
+    call_arg = S.sig("call_arg", 8);
+    call_out = S.sig("call_out", 8);
+    call_done = S.sig("call_done", 1);
+
+    // callee: out = arg; #5; out = 9; return
+    // caller: arg = 7; call; done = 1
+    static Prog call_sub, call_top;
+    { Instr i; i.k = IK::Assign; i.sig = call_out; i.e = ref(call_arg); call_sub.emit(i); }
+    { Instr i; i.k = IK::WaitDelay; i.delay = 5; call_sub.emit(i); }
+    { Instr i; i.k = IK::Assign; i.sig = call_out; i.e = konst(mk(9, 8)); call_sub.emit(i); }
+    { Instr i; i.k = IK::Ret; call_sub.emit(i); }
+    { Instr i; i.k = IK::Assign; i.sig = call_arg; i.e = konst(mk(7, 8)); call_top.emit(i); }
+    { Instr i; i.k = IK::Call; i.callee = &call_sub; call_top.emit(i); }
+    { Instr i; i.k = IK::Assign; i.sig = call_done; i.e = konst(mk(1, 1)); call_top.emit(i); }
 
     // if (1'bx) takes the else. Icarus 13.0 (v13_0) prints IFX 2.
     static Prog ifp;
@@ -255,6 +283,8 @@ int main() {
     S.spawn(mbw());
     S.spawn(mbs());
     S.spawn(exec(&fp));
+    S.spawn(exec(&call_top));
+    S.spawn(call_probe());
     S.spawn(other_at_finish());
     S.spawn(later_time());
     S.run(1000);
@@ -304,6 +334,8 @@ int main() {
     if (!known(S.get(other_sig), 1)) return fail("$finish: same-slot other process did not run");
     if (!is_x(S.get(later_sig))) return fail("$finish: a later time step ran");
     if (S.now != 80 || !S.finished) return fail("$finish: sim did not stop at the finish time");
+    if (saw_mid_out != 7 || !saw_mid_done_x) return fail("call: #delay did not suspend before the return");
+    if (saw_late_out != 9 || saw_late_done != 1) return fail("call: callee did not finish after #5");
 
     std::cout << "ok\n";
     return 0;

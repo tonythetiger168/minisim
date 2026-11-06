@@ -1,6 +1,8 @@
 // prog.hpp - process IR. Each Verilog process (always/initial) is lowered to a
 // flat instruction list; one coroutine (exec, in exec.inc) interprets it.
-// Flat code avoids recursive coroutines: if/else become jumps.
+// Flat code avoids nested coroutines: if/else are jumps. A task or function
+// is its own Prog. Call pushes a return address in that same coroutine, so a
+// #delay inside the callee suspends the process and keeps the address.
 #pragma once
 #include <cstdint>
 #include <string>
@@ -21,8 +23,12 @@ enum class IK {
     Finish,     // $finish
     Display,    // $display: print now, in the region the process is running in
     Strobe,     // $strobe: one print from the postponed region
-    Monitor     // $monitor: replace the watch; at most one postponed line per slot
+    Monitor,    // $monitor: replace the watch; at most one postponed line per slot
+    Call,       // push (this prog, pc+1) and transfer to callee
+    Ret         // pop that address; an empty stack ends the process
 };
+
+struct Prog;
 
 struct Instr {
     IK k = IK::Jmp;
@@ -38,6 +44,7 @@ struct Instr {
     // $strobe/$monitor sees values after NBA. %b, %d, %%, and other text.
     std::string fmt;
     std::vector<E> args;
+    const Prog* callee = nullptr; // Call
 };
 
 struct Prog {
@@ -56,13 +63,22 @@ inline void collectRefs(const E& e, std::vector<int>& out) {
 recurse:
     for (auto& k : e->kids) collectRefs(k, out);
 }
-// Every signal read by any expression in the program (for @* / always_comb).
-inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
-    std::vector<int> sigs;
+// Signals read by this prog and by any prog it calls. @* / always_comb must see
+// a function body, or a call would hide the signals that should wake it.
+inline void collectProgRefs(const Prog& p, std::vector<int>& sigs, std::vector<const Prog*>& seen) {
+    for (const Prog* s : seen)
+        if (s == &p) return;
+    seen.push_back(&p);
     for (auto& i : p.code) {
         collectRefs(i.e, sigs);
         for (auto& a : i.args) collectRefs(a, sigs);  // $display / $strobe / $monitor
+        if (i.k == IK::Call && i.callee) collectProgRefs(*i.callee, sigs, seen);
     }
+}
+inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
+    std::vector<int> sigs;
+    std::vector<const Prog*> seen;
+    collectProgRefs(p, sigs, seen);
     std::vector<std::pair<int, Edge>> ev;
     for (int s : sigs) ev.push_back({s, ANY});
     return ev;
