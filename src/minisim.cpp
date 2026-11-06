@@ -23,7 +23,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
-struct Sig { string name; int w; Val val; vector<Val> drv; };  // drv: one value per driver
+struct Sig { string name; int w; Val val; vector<Val> drv; bool net; };  // drv: one value per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
 struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
@@ -55,10 +55,10 @@ struct Sim {
     ~Sim() { for (auto h : all) h.destroy(); }
 
     // A wire (`net`) starts as Z, including before the first drive().
-    // A variable (reg/logic) starts as X. The kernel has no declaration
-    // kind of its own; the caller says which one this signal is.
+    // A variable (reg/logic) starts as X. The flag is stored so the VCD
+    // header can emit `$var wire` or `$var reg`.
     int sig(const string& n, int w, bool net = false) {
-        sigs.push_back({n, w, net ? allz(w) : Val{}});
+        sigs.push_back({n, w, net ? allz(w) : Val{}, {}, net});
         waiters.emplace_back();
         return (int)sigs.size() - 1;
     }
@@ -76,9 +76,8 @@ struct Sim {
     void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }
     static int bit0(const Val& v) { return (v.x & 1) ? 2 : (int)(v.v & 1); }
 
-    void dump(int s) {
-        if (!vcd) return;
-        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
+    // One value line, no timestamp. Shared so $dumpvars and later changes match.
+    void writeVal(int s) {
         const Sig& g = sigs[s];
         string id(1, char('!' + s));
         if (g.w == 1) { vcd << ((g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1))) << id << "\n"; return; }
@@ -86,6 +85,21 @@ struct Sim {
         for (int i = g.w - 1; i >= 0; i--)
             vcd << ((g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1)));
         vcd << " " << id << "\n";
+    }
+    void dump(int s) {
+        if (!vcd) return;
+        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
+        writeVal(s);
+    }
+    // set() only writes a line when a value changes, so a signal still holding
+    // its starting value (cnt stays X until the first clock) never appears.
+    // Checkpoint every signal at time 0, before the first event. lastDump is
+    // left alone so the change records that follow stay byte-for-byte the same.
+    void dumpvars() {
+        if (!vcd) return;
+        vcd << "$dumpvars\n";
+        for (size_t i = 0; i < sigs.size(); i++) writeVal((int)i);
+        vcd << "$end\n";
     }
 
     void set(int s, Val nv) {
@@ -112,12 +126,13 @@ struct Sim {
         vcd.open("dump.vcd");
         vcd << "$timescale 1ns $end\n$scope module top $end\n";
         for (size_t i = 0; i < sigs.size(); i++)
-            vcd << "$var wire " << sigs[i].w << " " << char('!' + i) << " " << sigs[i].name << " $end\n";
+            vcd << "$var " << (sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << char('!' + i) << " " << sigs[i].name << " $end\n";
         vcd << "$upscope $end\n$enddefinitions $end\n";
     }
 
     void run(uint64_t end) {
         header();
+        dumpvars();
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
             if (it->first > end) break;

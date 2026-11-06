@@ -7,13 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(minisim src/minisim.cpp)
 target_include_directories(minisim PRIVATE src)
 
-# Unit tests: value library, scheduler (test_sched), and net initial value (test_net).
+# Unit tests: value library, scheduler (test_sched), net initial value (test_net),
+# and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
 foreach(t test_expr test_z test_sched test_net)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+add_executable(test_vcd tests/test_vcd.cpp)
+add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 
 # Optional: slang front end (downloads and builds slang; takes a while)
 option(MINISIM_WITH_SLANG "Build the slang_dump front-end tool" OFF)
