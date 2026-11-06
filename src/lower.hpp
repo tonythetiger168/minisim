@@ -7,8 +7,10 @@
 //                compound assign (+= -= *= /= %= &= |= ^= <<= >>= <<<= >>>=),
 //                @(posedge/negedge/any sig [or ...]), @*, always_comb,
 //                for/while/do/forever/repeat(const), break/continue,
-//                #<literal>, $display / $strobe / $monitor / $finish, assign,
-//                module-level task and function calls (input, output, inout)
+//                #<literal>, $display / $strobe / $monitor / $finish, assign
+//                (optional drive strength), buf/not/and/nand/or/nor/xor/xnor
+//                and pullup/pulldown (same strength spec), module-level task
+//                and function calls (input, output, inout)
 //   expressions: literals, variable refs, unary/binary ops, ?:, {concat},
 //                a[expr], a[hi:lo], a function call
 // Assumes vectors are declared [N-1:0] (zero-based) so index == bit position.
@@ -21,7 +23,8 @@
 // expression drives the child's formal. An output's external expression is an
 // assignment whose right-hand side is an EmptyArgument (the formal), the same
 // shape as a subroutine output write-back. An inout net is both directions.
-// Not yet:  net initializers (wire y = ..), a[i +: w], recursive
+// Not yet:  nmos/pmos/cmos/tran, bufif/notif, trireg, net initializers
+//           (wire y = ..), a[i +: w], recursive
 //           tasks/functions, ref arguments, DPI, class methods,
 //           hierarchical calls, instance arrays, interfaces, hierarchical
 //           references into a child. Arguments are one static copy per subroutine.
@@ -55,8 +58,11 @@
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
 #include "slang/ast/expressions/SelectExpressions.h"
+#include "slang/ast/SemanticFacts.h"
 #include "slang/ast/statements/ConditionalStatements.h"
 #include "slang/ast/statements/MiscStatements.h"
+#include "slang/ast/symbols/InstanceSymbols.h"
+#include "slang/ast/symbols/MemberSymbols.h"
 
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
@@ -942,15 +948,109 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         out.procs.push_back({std::move(lw.prog), loops, "assign"});
     }
 
+    static uint8_t strengthOf(slang::ast::DriveStrength s) {
+        using slang::ast::DriveStrength;
+        switch (s) {
+            case DriveStrength::Supply: return STR_SUPPLY;
+            case DriveStrength::Strong: return STR_STRONG;
+            case DriveStrength::Pull: return STR_PULL;
+            case DriveStrength::Weak: return STR_WEAK;
+            case DriveStrength::HighZ: return STR_HIZ;
+        }
+        return STR_STRONG;
+    }
+
+    // slang's pair is (0-strength, 1-strength). A missing side keeps `fallback`.
+    static void applyStrength(Instr& i, std::optional<slang::ast::DriveStrength> ds0,
+                              std::optional<slang::ast::DriveStrength> ds1,
+                              uint8_t fb0, uint8_t fb1) {
+        i.s0 = ds0 ? strengthOf(*ds0) : fb0;
+        i.s1 = ds1 ? strengthOf(*ds1) : fb1;
+    }
+
+    void driveOut(const slang::ast::Expression& out, E rhs, uint8_t s0, uint8_t s1) {
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i;
+        i.k = IK::Assign;
+        i.s0 = s0;
+        i.s1 = s1;
+        // A gate output port is sometimes an assignment whose left side is the net.
+        const slang::ast::Expression* tgt = &out;
+        if (tgt->kind == slang::ast::ExpressionKind::Assignment)
+            tgt = &tgt->as<slang::ast::AssignmentExpression>().left();
+        lw.lhs(*tgt, i);
+        i.e = rhs;
+        finishAssign(lw, i);
+    }
+
     void handle(const slang::ast::ContinuousAssignSymbol& ca) {
         using namespace slang::ast;
         const auto& a = ca.getAssignment().as<AssignmentExpression>();
         Lowerer lw(sigmap);
         prep(lw);
         Instr i; i.k = IK::Assign;
+        auto [ds0, ds1] = ca.getDriveStrength();
+        applyStrength(i, ds0, ds1, STR_STRONG, STR_STRONG);
         lw.lhs(a.left(), i);
         i.e = lw.expr(a.right());
         finishAssign(lw, i);
+    }
+
+    // buf/not/and/nand/or/nor/xor/xnor and pullup/pulldown drive the same way
+    // as a continuous assign. Other primitives (mos, tran, bufif) do not.
+    void handle(const slang::ast::PrimitiveInstanceSymbol& g) {
+        using namespace slang::ast;
+        if (g.getDelay()) Lowerer::unsupported("gate delay");
+        std::string_view name = g.primitiveType.name;
+        auto ports = g.getPortConnections();
+        auto [ds0, ds1] = g.getDriveStrength();
+        uint8_t fb0 = STR_STRONG, fb1 = STR_STRONG;
+        bool pull = name == "pullup" || name == "pulldown";
+        if (name == "pullup") { fb0 = STR_HIZ; fb1 = STR_PULL; }
+        else if (name == "pulldown") { fb0 = STR_PULL; fb1 = STR_HIZ; }
+        uint8_t s0 = ds0 ? strengthOf(*ds0) : fb0;
+        uint8_t s1 = ds1 ? strengthOf(*ds1) : fb1;
+
+        bool ninput = name == "and" || name == "nand" || name == "or" || name == "nor" ||
+                      name == "xor" || name == "xnor";
+        bool noutput = name == "buf" || name == "not";
+        if (!pull && !ninput && !noutput)
+            throw std::runtime_error("lower: unsupported gate " + std::string(name));
+
+        if (pull) {
+            if (ports.size() != 1 || !ports[0]) Lowerer::unsupported("pull gate port");
+            int w = (int)ports[0]->type->getBitWidth();
+            if (w <= 0 || w > 64) Lowerer::unsupported("gate width");
+            driveOut(*ports[0], konst(mk(name == "pullup" ? mask(w) : 0, w)), s0, s1);
+            return;
+        }
+
+        Lowerer lw(sigmap);
+        prep(lw);
+        if (noutput) {
+            if (ports.size() < 2 || !ports.back()) Lowerer::unsupported("gate ports");
+            E in = lw.expr(*ports.back());
+            // not(not) is a buf. Z becomes X, and 0 and 1 pass through.
+            E rhs = name == "not" ? un(Op::Not, in) : un(Op::Not, un(Op::Not, in));
+            for (size_t i = 0; i + 1 < ports.size(); i++) {
+                if (!ports[i]) Lowerer::unsupported("gate ports");
+                driveOut(*ports[i], rhs, s0, s1);
+            }
+            return;
+        }
+
+        if (ports.size() < 2 || !ports[0]) Lowerer::unsupported("gate ports");
+        Op op = (name == "and" || name == "nand") ? Op::And
+              : (name == "or" || name == "nor") ? Op::Or : Op::Xor;
+        if (!ports[1]) Lowerer::unsupported("gate ports");
+        E acc = lw.expr(*ports[1]);
+        for (size_t i = 2; i < ports.size(); i++) {
+            if (!ports[i]) Lowerer::unsupported("gate ports");
+            acc = bin(op, acc, lw.expr(*ports[i]));
+        }
+        if (name == "nand" || name == "nor" || name == "xnor") acc = un(Op::Not, acc);
+        driveOut(*ports[0], acc, s0, s1);
     }
 
     // The child's formal signal. A null port (no internal connection) is skipped.
