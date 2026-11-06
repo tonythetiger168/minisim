@@ -368,12 +368,86 @@ static int testSigned() {
     return 0;
 }
 
+// examples/compound.sv. a += b matches a = a + b, including a wider
+// operand (NDIV is 0, not X from a 4-bit divide by the low bits of 16)
+// and a signed operand widened into an unsigned add (MIX is 9, not -7).
+// Icarus 13's compound /= and %= truncate a wider operand to the left-hand
+// width (NDIV xxxx, N20 0001, NMOD 0011) while a = a / b stays wide
+// (0000, 0000, 0111). minisim follows the plain assignment.
+static int testCompound() {
+    S.finished = false;
+    S.mon.on = false;
+    S.mon.queued = false;
+    S.vcd.close();
+    S.active.clear();
+    S.inactive.clear();
+    S.postq.clear();
+    S.nbaq.clear();
+
+    Compiled c = compileSv(srcPath("examples/compound.sv"), true);
+    if (c.result.procs.size() != 1) return fail("compound proc count");
+    for (auto& pr : c.result.procs) S.spawn(exec(&pr.prog));
+
+    auto saved = std::filesystem::current_path();
+    auto tmp = std::filesystem::temp_directory_path() / "minisim-compound-test";
+    std::filesystem::create_directories(tmp);
+    std::filesystem::current_path(tmp);
+    std::stringstream buf;
+    std::streambuf* old = std::cout.rdbuf(buf.rdbuf());
+    S.run(1000);
+    std::cout.rdbuf(old);
+    std::filesystem::current_path(saved);
+
+    const std::vector<std::string> want = {
+        "U_ADD 00101100", "U_ADD_EQ 00101100",
+        "U_SUB 11100010", "U_SUB_EQ 11100010",
+        "U_MUL 00000100", "U_MUL_EQ 00000100",
+        "U_DIV 00011100", "U_DIV_EQ 00011100",
+        "U_MOD 00000100", "U_MOD_EQ 00000100",
+        "S_ADD 10111010", "S_ADD_EQ 10111010",
+        "S_SUB 11001110", "S_SUB_EQ 11001110",
+        "S_MUL 11101000", "S_MUL_EQ 11101000",
+        "S_DIV 11111011", "S_DIV_EQ 11111011",
+        "S_MOD 11111011", "S_MOD_EQ 11111011",
+        "AND 10001000", "AND_EQ 10001000",
+        "OR 11101110", "XOR 01100110",
+        "SHL 00110100", "SHL_EQ 00110100",
+        "SHR 00000011",
+        "ASR 11111100", "ASR_EQ 11111100",
+        "ASR_U 00111100",
+        "X_ADD xxxx", "X_ADD_EQ xxxx",
+        "Z_AND 1x00",
+        "NAR 0000", "NAR_EQ 0000", "NAR_W 00010000",
+        "NDIV 0000", "NDIV_EQ 0000",
+        "N20 0000", "N20_EQ 0000",
+        "NMOD 0111", "NMOD_EQ 0111",
+        "WADD 11111001", "MIX 00001001",
+        "S4_DIV 1110", "S4_DIV_EQ 1110",
+        "S4_MOD 1110",
+        "S4_ASR 1100", "S4_ASR_EQ 1100",
+        "S4_MUL 0000",
+        "PART 10110000",
+        "FOR 0110",
+        "DIV0 xxxx",
+    };
+    auto got = linesOf(buf.str());
+    if (got != want) {
+        std::cerr << "FAIL compound stdout\n--- got ---\n";
+        for (auto& s : got) std::cerr << s << "\n";
+        std::cerr << "--- want ---\n";
+        for (auto& s : want) std::cerr << s << "\n";
+        return 1;
+    }
+    return 0;
+}
+
 int main() {
     if (int rc = testHier()) return rc;
     if (int rc = testCounter()) return rc;
     if (int rc = testChecks()) return rc;
     if (int rc = testSigned()) return rc;
     if (int rc = testDiv()) return rc;
+    if (int rc = testCompound()) return rc;
     std::cout << "ok\n";
     return 0;
 }

@@ -4,6 +4,7 @@
 // Supported subset (single module, flat):
 //   statements : begin/end, if/else, case/casez/casex, blocking &
 //                non-blocking assign to a variable, a[const], a[hi:lo],
+//                compound assign (+= -= *= /= %= &= |= ^= <<= >>= <<<= >>>=),
 //                @(posedge/negedge/any sig [or ...]), @*, always_comb,
 //                for/while/do/forever/repeat(const), #<literal>,
 //                $display / $strobe / $monitor / $finish, assign
@@ -16,7 +17,7 @@
 // when the operand is signed in that context (both operands signed, or an
 // assignment of a signed expression). $signed / $unsigned retag the bits.
 // Instantiating a module is an error until port connections are implemented.
-// Not yet:  compound assigns (+=), break/continue, net initializers (wire y = ..), a[i +: w], tasks/functions.
+// Not yet:  break/continue, net initializers (wire y = ..), a[i +: w], tasks/functions.
 //
 // Usage:
 //   LowerResult r = lower(compilation,
@@ -64,6 +65,10 @@ struct Lowerer {
     std::unordered_map<const slang::ast::Symbol*, int>& sigmap;
     Prog prog;
     std::vector<size_t> implicitWaits;  // WaitEdge slots for @*, filled by finishImplicit()
+    // Set while lowering a compound assignment. slang's right-hand side is the
+    // binary operator, and its left operand is an LValueReference: the target's
+    // type, and no symbol. The read is the assignment's left expression.
+    const slang::ast::Expression* lvalue = nullptr;
 
     explicit Lowerer(std::unordered_map<const slang::ast::Symbol*, int>& m) : sigmap(m) {}
 
@@ -191,6 +196,10 @@ struct Lowerer {
                 bool self = e.type->isSigned();
                 return sized(ref(it->second, self), src, self, ctx);
             }
+            case ExpressionKind::LValueReference: {
+                if (!lvalue) unsupported("lvalue reference");
+                return expr(*lvalue, ctx);
+            }
             case ExpressionKind::Conversion: {
                 // 4'hF inside an 8-bit add is a 4-bit literal under a conversion
                 // to 8. cnt+1 is a 32-bit add under a conversion to 4. Either
@@ -260,10 +269,24 @@ struct Lowerer {
                 bool sizeBoth = widthPropagates(b.op) || isDivMod(b.op);
                 bool shift = isShift(b.op);
                 E l, r;
+                int w = 0;
                 if (sizeBoth || shift) {
                     // Shifts size only the left operand. The count stays
                     // self-determined and is always treated as unsigned.
-                    int w = ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
+                    // A narrower context shrinks an unsized literal (`cnt + 1`
+                    // is 4 bits, not 32). A sized operand that is already wider
+                    // stays wide; the result is truncated afterwards
+                    // (`logic [3:0] a; logic [7:0] b; a = a / b`).
+                    int opW = (int)e.type->getBitWidth();
+                    w = opW;
+                    if (ctx.live && ctx.w > 0 && ctx.w != opW) {
+                        if (ctx.w > opW) {
+                            w = ctx.w;
+                        } else {
+                            auto eff = e.getEffectiveWidth();
+                            if (!eff || (int)*eff <= ctx.w) w = ctx.w;
+                        }
+                    }
                     needWidth(w);
                     bool sg = e.type->isSigned();
                     ExprCtx op{w, sg, sg, true};
@@ -301,7 +324,11 @@ struct Lowerer {
                     default: unsupported("binary operator");
                 }
                 E out = bin(kop, l, r);
-                if (sizeBoth || shift) return out;
+                if (sizeBoth || shift) {
+                    if (ctx.live && ctx.w > 0 && w != ctx.w)
+                        return resize(std::move(out), ctx.w, false, ctx.tag);
+                    return out;
+                }
                 return sized(out, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             case ExpressionKind::ConditionalOp: {
@@ -453,11 +480,13 @@ struct Lowerer {
         using namespace slang::ast;
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
-            if (a.isCompound()) unsupported("compound assignment (+=, -=, ...)");
             Instr i;
             i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
             lhs(a.left(), i);
+            const Expression* saved = lvalue;
+            if (a.isCompound()) lvalue = &a.left();
             i.e = expr(a.right());
+            lvalue = saved;
             prog.emit(i);
         } else if (ex.kind == ExpressionKind::UnaryOp) {   // i++ / ++i / i-- / --i
             const auto& u = ex.as<UnaryExpression>();
