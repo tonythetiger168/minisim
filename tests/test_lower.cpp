@@ -228,10 +228,76 @@ static int testChecks() {
     return 0;
 }
 
+static std::vector<std::string> linesOf(const std::string& text) {
+    std::vector<std::string> got;
+    std::string cur;
+    for (char ch : text) {
+        if (ch == '\n') {
+            got.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(ch);
+        }
+    }
+    if (!cur.empty()) got.push_back(cur);
+    return got;
+}
+
+// examples/signed.sv, checked against Icarus Verilog 13 (v13_0, dfeee909).
+// Dropping Val::sgn makes CMP_S print 0 and EXT_S print 00001000.
+static int testSigned() {
+    S.finished = false;
+    S.mon.on = false;
+    S.mon.queued = false;
+    S.vcd.close();
+    S.active.clear();
+    S.inactive.clear();
+    S.postq.clear();
+    S.nbaq.clear();
+
+    Compiled c = compileSv(srcPath("examples/signed.sv"), true);
+    if (c.result.procs.size() != 1) return fail("signed proc count");
+    for (auto& pr : c.result.procs) S.spawn(exec(&pr.prog));
+
+    auto saved = std::filesystem::current_path();
+    auto tmp = std::filesystem::temp_directory_path() / "minisim-signed-test";
+    std::filesystem::create_directories(tmp);
+    std::filesystem::current_path(tmp);
+    std::stringstream buf;
+    std::streambuf* old = std::cout.rdbuf(buf.rdbuf());
+    S.run(1000);
+    std::cout.rdbuf(old);
+    std::filesystem::current_path(saved);
+
+    const std::vector<std::string> want = {
+        "CMP_S 1",     "CMP_U 0",      "CMP_SU 0",    "CMP_SS 1",
+        "CMP_LE 1",    "CMP_GT 0",     "EQ_S 1",      "EQ_M 0",
+        "EXT_S 11111000", "EXT_US 11111000", "EXT_SU 00001000",
+        "ADD_SS 11110001", "ADD_SS_U 11110001",
+        "ADD_MIX 00010000", "ADD_MIX_S 00010000",
+        "SUB 11110111", "MUL 11110000",
+        "ASR 11111100", "ASR4 1100", "LSR 01111100", "ASR_U 00000100",
+        "SHL 11110000", "SHL_U 00010000",
+        "CAST_S 1", "CAST_U 0", "CAST_EXT 11111000", "CAST_UEXT 00001000",
+        "LT_X x", "ADD_X xxxxxxxx", "ASR_X xxxxxx00", "ASR_Z zzzzzz00",
+        "LT_Z x", "ASR_GE 11111111", "ASR_XC xxxxxxxx",
+    };
+    auto got = linesOf(buf.str());
+    if (got != want) {
+        std::cerr << "FAIL signed stdout\n--- got ---\n";
+        for (auto& s : got) std::cerr << s << "\n";
+        std::cerr << "--- want ---\n";
+        for (auto& s : want) std::cerr << s << "\n";
+        return 1;
+    }
+    return 0;
+}
+
 int main() {
     if (int rc = testHier()) return rc;
     if (int rc = testCounter()) return rc;
     if (int rc = testChecks()) return rc;
+    if (int rc = testSigned()) return rc;
     std::cout << "ok\n";
     return 0;
 }

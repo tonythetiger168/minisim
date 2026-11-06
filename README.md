@@ -9,6 +9,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 ## Features
 
 - **4-state logic** (0/1/X/Z) up to 64 bits, with Verilog X-propagation rules
+- **Signed arithmetic**: `signed` values, `$signed` / `$unsigned`, signed compare, add, subtract, multiply, and arithmetic right shift (`>>>`)
 - **Event-driven kernel**: time wheel, active / inactive (`#0`) / NBA / postponed regions
 - **`$display` / `$strobe` / `$monitor`** on the process IR, including from the slang lowerer. `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Format is `%b`, `%d`, and literal text.
 - **Coroutine processes**: `initial` / `always` as C++20 coroutines (`co_await Delay`, `co_await Wait`)
@@ -51,7 +52,7 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 
 ## Known limits
 
-- Signals up to 64 bits; no signed arithmetic, division, or strengths
+- Signals up to 64 bits; no division or strengths
 - Instantiating a module is an error until port connections are implemented
 - Not yet lowered: compound assigns (`+=`), `break`/`continue`, net initializers, tasks/functions
 - System tasks other than `$display` / `$strobe` / `$monitor` / `$finish` are ignored. Format is the kernel's `%b`, `%d`, and literal text
