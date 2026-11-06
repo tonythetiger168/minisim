@@ -57,8 +57,8 @@ static Compiled compileSv(const std::string& path, bool intoSim) {
     int next = 0;
     out.result = lower(
         comp,
-        [&](const std::string& n, int w) {
-            int id = intoSim ? S.sig(n, w) : next++;
+        [&](const std::string& n, int w, bool net) {
+            int id = intoSim ? S.sig(n, w, net) : next++;
             out.id[n] = id;
             return id;
         },
@@ -95,18 +95,10 @@ static const char* ikName(IK k) {
 }
 
 static int testHier() {
-    bool threw = false;
-    std::string msg;
-    try {
-        compileSv(srcPath("examples/hier.sv"), false);
-    } catch (const std::exception& ex) {
-        threw = true;
-        msg = ex.what();
-    }
-    if (!threw) return fail("hier.sv did not throw");
-    if (msg.find("not supported") == std::string::npos ||
-        msg.find("port connections") == std::string::npos)
-        return fail("hier.sv threw an unexpected error: " + msg);
+    Compiled c = compileSv(srcPath("examples/hier.sv"), false);
+    if (c.result.procs.empty()) return fail("hier.sv produced no processes");
+    if (!c.id.count("x") || !c.id.count("y")) return fail("hier parent signals");
+    if (!c.id.count("u.a") || !c.id.count("u.b")) return fail("hier child signals");
     return 0;
 }
 
@@ -549,6 +541,60 @@ static int testTasks() {
     return 0;
 }
 
+// examples/hierarchy.sv. A dropped input, a dropped output, or a rejected
+// instance fails these lines. Icarus Verilog 13 is the source of the text.
+static int testHierarchy() {
+    S.finished = false;
+    S.now = 0;
+    S.wheel.clear();
+    S.mon.on = false;
+    S.mon.queued = false;
+    S.vcd.close();
+    S.active.clear();
+    S.inactive.clear();
+    S.postq.clear();
+    S.nbaq.clear();
+
+    Compiled c = compileSv(srcPath("examples/hierarchy.sv"), true);
+    if (c.result.procs.empty()) return fail("hierarchy proc count");
+    for (auto& pr : c.result.procs) S.spawn(exec(&pr.prog));
+
+    auto saved = std::filesystem::current_path();
+    auto tmp = std::filesystem::temp_directory_path() / "minisim-hier-test";
+    std::filesystem::create_directories(tmp);
+    std::filesystem::current_path(tmp);
+    std::stringstream buf;
+    std::streambuf* old = std::cout.rdbuf(buf.rdbuf());
+    S.run(1000);
+    std::cout.rdbuf(old);
+    std::filesystem::current_path(saved);
+
+    const std::vector<std::string> want = {
+        "PROC0 0",
+        "HIDE 1x0z",
+        "NAMED 0",
+        "OTHER 1",
+        "POS 0",
+        "EXPR 1",
+        "GRAND 1100",
+        "XZ 1x0z",
+        "PROC1 1",
+        "W8 10110001",
+        "W4 0110",
+        "INOUT 1",
+    };
+    auto got = linesOf(buf.str());
+    if (got != want) {
+        std::cerr << "FAIL hierarchy stdout\n--- got ---\n";
+        for (auto& s : got) std::cerr << s << "\n";
+        std::cerr << "--- want ---\n";
+        for (auto& s : want) std::cerr << s << "\n";
+        return 1;
+    }
+    if (S.now < 2) return fail("hierarchy did not reach #2");
+    return 0;
+}
+
 static int testRecur() {
     bool threw = false;
     std::string msg;
@@ -574,6 +620,7 @@ int main() {
     if (int rc = testBreak()) return rc;
     if (int rc = testTasks()) return rc;
     if (int rc = testRecur()) return rc;
+    if (int rc = testHierarchy()) return rc;
     std::cout << "ok\n";
     return 0;
 }

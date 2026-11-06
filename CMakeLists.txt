@@ -47,5 +47,6 @@ if(MINISIM_WITH_SLANG)
 
   add_test(NAME slang_dump_hier
            COMMAND slang_dump ${CMAKE_SOURCE_DIR}/examples/hier.sv)
-  set_tests_properties(slang_dump_hier PROPERTIES WILL_FAIL TRUE)
+  set_tests_properties(slang_dump_hier PROPERTIES
+    PASS_REGULAR_EXPRESSION "module child")
 endif()
