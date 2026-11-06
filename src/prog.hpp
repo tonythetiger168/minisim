@@ -37,7 +37,8 @@ struct Instr {
     Edge edge = ANY;
     size_t target = 0;
     uint64_t delay = 0;
-    int drv = -1;         // Assign from a continuous assign: driver id on a resolved net
+    int drv = -1;         // Assign from a continuous driver: driver id on a resolved net
+    uint8_t s0 = STR_STRONG, s1 = STR_STRONG;  // that driver's 0-strength and 1-strength
     int hi = -1, lo = 0;  // Assign/Nba: hi >= 0 means partial write sig[hi:lo]
     std::vector<std::pair<int, Edge>> events;  // WaitEdge with 2+ events: @(a or b ...)
     // Display/Strobe/Monitor. `args` are read when the line is printed, so a

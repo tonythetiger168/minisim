@@ -61,6 +61,44 @@ int main() {
     if (resolve(allz(1), allz(1)) != 3) return fail("resolve z/z -> z");
     if (resolve(mk(0), allx(1)) != 2) return fail("resolve 0/x -> x");
 
+    // Strength. drive(s, d, v, s0, s1): (strong1, weak0) is s0=weak, s1=strong.
+    // A stronger unambiguous value wins. Equal opposite values are X.
+    // An X stays X even when its two strengths differ.
+    auto resolveS = [](Val a, int a0, int a1, Val b, int b0, int b1) {
+        int s = S.sig("ys", 1, true);
+        int d0 = S.newDriver(s), d1 = S.newDriver(s);
+        S.drive(s, d0, a, a0, a1);
+        S.drive(s, d1, b, b0, b1);
+        return bit_class(S.get(s));
+    };
+    if (resolveS(mk(1), STR_STRONG, STR_STRONG, mk(0), STR_WEAK, STR_WEAK) != 1)
+        return fail("strong1 beats weak0");
+    if (resolveS(mk(1), STR_WEAK, STR_WEAK, mk(0), STR_STRONG, STR_STRONG) != 0)
+        return fail("strong0 beats weak1");
+    if (resolveS(mk(1), STR_PULL, STR_PULL, mk(0), STR_PULL, STR_PULL) != 2)
+        return fail("equal pull 1/0 -> x");
+    if (resolveS(mk(1), STR_PULL, STR_PULL, allz(1), STR_STRONG, STR_STRONG) != 1)
+        return fail("pull1 vs z -> 1");
+    if (resolveS(mk(0), STR_WEAK, STR_WEAK, allx(1), STR_STRONG, STR_STRONG) != 2)
+        return fail("weak0 vs strong X -> x");
+    if (resolveS(mk(1), STR_STRONG, STR_STRONG, allx(1), STR_WEAK, STR_WEAK) != 1)
+        return fail("strong1 beats weak X");
+
+    int sx = S.sig("sx", 1, true);
+    int dx = S.newDriver(sx);
+    S.drive(sx, dx, allx(1), STR_WEAK, STR_STRONG);
+    if (bit_class(S.get(sx)) != 2) return fail("(strong1, weak0) on X is not x");
+    S.drive(sx, dx, allz(1), STR_WEAK, STR_STRONG);
+    if (!is_z(S.get(sx))) return fail("Z drive is not z");
+
+    // 4'b10xz at (strong1, weak0) against 4'b010z at (weak1, strong0) is xxxz.
+    int sv = S.sig("sv", 4, true);
+    int dv0 = S.newDriver(sv), dv1 = S.newDriver(sv);
+    S.drive(sv, dv0, make(0b1000, 0b0011, 4, 0b0001), STR_WEAK, STR_STRONG);
+    S.drive(sv, dv1, make(0b0100, 0b0001, 4, 0b0001), STR_STRONG, STR_WEAK);
+    Val got = S.get(sv);
+    if (got.v != 0 || got.x != 0b1111 || got.z != 0b0001) return fail("vector strength resolve");
+
     std::cout << "ok\n";
     return 0;
 }
