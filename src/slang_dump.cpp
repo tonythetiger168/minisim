@@ -1,26 +1,10 @@
-// slang_dump.cpp - step 1 of the front end: parse + elaborate with slang,
-// then walk the elaborated AST and list what the simulator must create.
-// Written against recent slang (v6+/v7); header paths / names may need small
-// tweaks for your version. Not compiled in the authoring environment.
-//
-// CMakeLists.txt:
-//   cmake_minimum_required(VERSION 3.20)
-//   project(slang_dump CXX)
-//   set(CMAKE_CXX_STANDARD 20)
-//   include(FetchContent)
-//   FetchContent_Declare(slang GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
-//                        GIT_TAG v7.0)
-//   FetchContent_MakeAvailable(slang)
-//   add_executable(slang_dump slang_dump.cpp)
-//   target_link_libraries(slang_dump PRIVATE slang::slang)
-//
-// Test input counter.sv:
-//   module counter(input logic clk, rst, output logic [3:0] cnt);
-//     always_ff @(posedge clk) if (rst) cnt <= 0; else cnt <= cnt + 1;
-//   endmodule
+// slang_dump.cpp - parse and elaborate with slang (v12.1), lower a flat module,
+// then list the signals and processes. A nested instance is an error.
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 
+#include "lower.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/diagnostics/DiagnosticEngine.h"
@@ -32,7 +16,7 @@ using namespace slang::ast;
 using namespace std;
 
 // Visits every symbol in the elaborated design.
-struct Dumper : ASTVisitor<Dumper, /*VisitStatements*/ false, /*VisitExpressions*/ false> {
+struct Dumper : ASTVisitor<Dumper> {
     void handle(const InstanceBodySymbol& body) {
         cout << "module " << body.name << "\n";
         visitDefault(body);  // recurse into members
@@ -71,10 +55,26 @@ int main(int argc, char** argv) {
     DiagnosticEngine engine(*comp.getSourceManager());
     auto client = make_shared<TextDiagnosticClient>();
     engine.addClient(client);
-    for (auto& d : comp.getAllDiagnostics()) engine.issue(d);
+    bool errors = false;
+    for (auto& d : comp.getAllDiagnostics()) {
+        engine.issue(d);
+        if (d.isError()) errors = true;
+    }
     string msgs = client->getString();
     if (!msgs.empty()) cerr << msgs;
+    if (errors) return 1;
+
+    // Lowering a flat module has to succeed; a nested instance is an error
+    // until port connections are implemented.
+    try {
+        int n = 0;
+        lower(comp, [&](const std::string&, int) { return n++; }, [](int) { return 0; });
+    } catch (const std::exception& ex) {
+        cerr << ex.what() << "\n";
+        return 1;
+    }
 
     Dumper dumper;
     comp.getRoot().visit(dumper);
+    return 0;
 }

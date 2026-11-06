@@ -1,17 +1,22 @@
 // lower.hpp - lower slang's elaborated AST into Sim signals + Prog processes.
-// Written against slang v7-ish API from memory; NOT compiled (slang unavailable
-// in the authoring environment). Expect small name/signature fixes.
+// Built against slang v12.1 (the tag FetchContent pins in CMakeLists.txt).
 //
 // Supported subset (single module, flat):
 //   statements : begin/end, if/else, case/casez/casex, blocking &
 //                non-blocking assign to a variable, a[const], a[hi:lo],
 //                @(posedge/negedge/any sig [or ...]), @*, always_comb,
-//                for/while/do/forever/repeat(const), #<literal>, $finish, assign
+//                for/while/do/forever/repeat(const), #<literal>,
+//                $display / $strobe / $monitor / $finish, assign
 //   expressions: literals, variable refs, unary/binary ops, ?:, {concat},
 //                a[expr], a[hi:lo]
 // Assumes vectors are declared [N-1:0] (zero-based) so index == bit position.
+// A ConversionExpression is lowered at the conversion's bit width so a
+// context-determined operator (a = 4'hF + 4'h1 with a 8 bits wide) is not
+// evaluated at the operands' self-determined width. The resize is unsigned;
+// signed arithmetic is not implemented.
+// Instantiating a module is an error until port connections are implemented.
 // Not yet:  compound assigns (+=), break/continue, net initializers (wire y = ..), a[i +: w], tasks/functions,
-//           hierarchy, $display, signed arithmetic.
+//           signed arithmetic.
 //
 // Usage:
 //   LowerResult r = lower(compilation,
@@ -63,20 +68,72 @@ struct Lowerer {
             return *e.as<IntegerLiteral>().getValue().as<int64_t>();
         if (e.kind == ExpressionKind::Conversion)
             return constInt(e.as<ConversionExpression>().operand());
-        if (e.constant) {
-            auto v = e.constant->integer().as<int64_t>();
-            if (v) return *v;
+        if (const auto* cv = e.getConstant(); cv && cv->isInteger()) {
+            if (auto v = cv->integer().as<int64_t>()) return *v;
         }
         unsupported("non-constant select bound");
     }
 
+    // Unsigned resize to the width slang's ConversionExpression asks for.
+    // A constant is rebuilt at that width (zero-extend or truncate). Anything
+    // else is a high-zero concat or a low-part slice, which is what an
+    // unsigned context-determined operand does.
+    E resizeTo(E e, int srcW, int dstW) {
+        if (dstW <= 0 || dstW > 64) unsupported("width conversion outside 1..64 bits");
+        if (e && e->op == Op::Const) {
+            if (e->k.w == dstW) return e;
+            return konst(make(e->k.v, e->k.x, dstW, e->k.z));
+        }
+        if (srcW == dstW) return e;
+        if (srcW <= 0 || srcW > 64) unsupported("width conversion outside 1..64 bits");
+        if (dstW < srcW) return slice(e, dstW - 1, 0);
+        return concat({konst(mk(0, dstW - srcW)), e});
+    }
+
+    // ctx > 0 asks for that many bits. A constant is rebuilt; a ref is
+    // zero-extended or sliced. ctx <= 0 leaves the value alone.
+    E fit(E r, int srcW, int ctx) {
+        if (ctx <= 0 || srcW == ctx) return r;
+        return resizeTo(r, srcW, ctx);
+    }
+
+    static bool widthPropagates(slang::ast::BinaryOperator op) {
+        using slang::ast::BinaryOperator;
+        switch (op) {
+            case BinaryOperator::Add:
+            case BinaryOperator::Subtract:
+            case BinaryOperator::Multiply:
+            case BinaryOperator::BinaryAnd:
+            case BinaryOperator::BinaryOr:
+            case BinaryOperator::BinaryXor:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static const slang::ast::Expression& peel(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        const Expression* p = &e;
+        while (p->kind == ExpressionKind::Conversion)
+            p = &p->as<ConversionExpression>().operand();
+        return *p;
+    }
+
     // ---------- expressions ----------
-    E expr(const slang::ast::Expression& e) {
+    // ctx > 0: produce a value of that width (the enclosing conversion, or the
+    // result width of a context-determined operator). An outer conversion wins
+    // over the self-determined widening slang inserts underneath it, so
+    // `cnt <= cnt + 1` with cnt 4 bits is a 4-bit add, not a 32-bit add sliced
+    // down. Arithmetic and bitwise results are congruent mod 2^w for unsigned
+    // values, which is the subset this lowerer implements.
+    E expr(const slang::ast::Expression& e, int ctx = -1) {
         using namespace slang::ast;
         switch (e.kind) {
             case ExpressionKind::IntegerLiteral: {
                 const auto& sv = e.as<IntegerLiteral>().getValue();
                 int w = (int)sv.getBitWidth();
+                E lit;
                 if (sv.hasUnknown()) {   // x / z / ? bits (VERIFY logic_t API for your slang version)
                     uint64_t v = 0, x = 0, z = 0;
                     for (int b = 0; b < w && b < 64; b++) {
@@ -88,78 +145,112 @@ struct Lowerer {
                             v |= 1ULL << b;
                         }
                     }
-                    return konst(make(v, x, w, z));
+                    lit = konst(make(v, x, w, z));
+                } else {
+                    lit = konst(mk(*sv.as<uint64_t>(), w));
                 }
-                return konst(mk(*sv.as<uint64_t>(), w));
+                return fit(lit, w, ctx);
             }
             case ExpressionKind::NamedValue: {
                 const Symbol* sym = &e.as<NamedValueExpression>().symbol;
                 auto it = sigmap.find(sym);
                 if (it == sigmap.end()) unsupported("reference to non-signal symbol");
-                return ref(it->second);
+                int src = (int)e.type->getBitWidth();
+                return fit(ref(it->second), src, ctx);
             }
-            case ExpressionKind::Conversion:  // implicit width/sign conversion; set() masks
-                return expr(e.as<ConversionExpression>().operand());
+            case ExpressionKind::Conversion: {
+                // 4'hF inside an 8-bit add is a 4-bit literal under a conversion
+                // to 8. cnt+1 is a 32-bit add under a conversion to 4. Either
+                // way the operand is lowered at the width that applies here.
+                const auto& c = e.as<ConversionExpression>();
+                int dst = ctx;
+                if (dst <= 0) {
+                    auto dstB = c.type->getBitWidth();
+                    if (dstB == 0 || dstB > 64) unsupported("width conversion outside 1..64 bits");
+                    dst = (int)dstB;
+                }
+                return expr(c.operand(), dst);
+            }
             case ExpressionKind::UnaryOp: {
                 const auto& u = e.as<UnaryExpression>();
-                E a = expr(u.operand());
+                bool bw = u.op == UnaryOperator::BitwiseNot;
+                int w = -1;
+                if (bw) {
+                    w = ctx > 0 ? ctx : (int)e.type->getBitWidth();
+                    if (w <= 0 || w > 64) unsupported("width conversion outside 1..64 bits");
+                }
+                E a = expr(u.operand(), w);
+                E out;
                 switch (u.op) {
-                    case UnaryOperator::BitwiseNot: return un(Op::Not, a);
-                    case UnaryOperator::LogicalNot: return un(Op::LogNot, a);
-                    case UnaryOperator::BitwiseAnd: return un(Op::RedAnd, a);
-                    case UnaryOperator::BitwiseOr: return un(Op::RedOr, a);
-                    case UnaryOperator::BitwiseXor: return un(Op::RedXor, a);
+                    case UnaryOperator::BitwiseNot: out = un(Op::Not, a); break;
+                    case UnaryOperator::LogicalNot: out = un(Op::LogNot, a); break;
+                    case UnaryOperator::BitwiseAnd: out = un(Op::RedAnd, a); break;
+                    case UnaryOperator::BitwiseOr: out = un(Op::RedOr, a); break;
+                    case UnaryOperator::BitwiseXor: out = un(Op::RedXor, a); break;
                     default: unsupported("unary operator");
                 }
+                if (!bw) return fit(out, (int)e.type->getBitWidth(), ctx);
+                return out;
             }
             case ExpressionKind::BinaryOp: {
                 const auto& b = e.as<BinaryExpression>();
-                E l = expr(b.left()), r = expr(b.right());
+                bool prop = widthPropagates(b.op);
+                int w = -1;
+                if (prop) {
+                    w = ctx > 0 ? ctx : (int)e.type->getBitWidth();
+                    if (w <= 0 || w > 64) unsupported("width conversion outside 1..64 bits");
+                }
+                E l = expr(b.left(), w), r = expr(b.right(), w);
+                E out;
                 switch (b.op) {
-                    case BinaryOperator::Add: return bin(Op::Add, l, r);
-                    case BinaryOperator::Subtract: return bin(Op::Sub, l, r);
-                    case BinaryOperator::Multiply: return bin(Op::Mul, l, r);
-                    case BinaryOperator::BinaryAnd: return bin(Op::And, l, r);
-                    case BinaryOperator::BinaryOr: return bin(Op::Or, l, r);
-                    case BinaryOperator::BinaryXor: return bin(Op::Xor, l, r);
-                    case BinaryOperator::Equality: return bin(Op::Eq, l, r);
-                    case BinaryOperator::Inequality: return bin(Op::Ne, l, r);
-                    case BinaryOperator::CaseEquality: return bin(Op::CaseEq, l, r);
-                    case BinaryOperator::LessThan: return bin(Op::Lt, l, r);
-                    case BinaryOperator::LessThanEqual: return bin(Op::Le, l, r);
-                    case BinaryOperator::GreaterThan: return bin(Op::Gt, l, r);
-                    case BinaryOperator::GreaterThanEqual: return bin(Op::Ge, l, r);
-                    case BinaryOperator::LogicalShiftLeft: return bin(Op::Shl, l, r);
-                    case BinaryOperator::LogicalShiftRight: return bin(Op::Shr, l, r);
-                    case BinaryOperator::LogicalAnd: return bin(Op::LogAnd, l, r);
-                    case BinaryOperator::LogicalOr: return bin(Op::LogOr, l, r);
+                    case BinaryOperator::Add: out = bin(Op::Add, l, r); break;
+                    case BinaryOperator::Subtract: out = bin(Op::Sub, l, r); break;
+                    case BinaryOperator::Multiply: out = bin(Op::Mul, l, r); break;
+                    case BinaryOperator::BinaryAnd: out = bin(Op::And, l, r); break;
+                    case BinaryOperator::BinaryOr: out = bin(Op::Or, l, r); break;
+                    case BinaryOperator::BinaryXor: out = bin(Op::Xor, l, r); break;
+                    case BinaryOperator::Equality: out = bin(Op::Eq, l, r); break;
+                    case BinaryOperator::Inequality: out = bin(Op::Ne, l, r); break;
+                    case BinaryOperator::CaseEquality: out = bin(Op::CaseEq, l, r); break;
+                    case BinaryOperator::LessThan: out = bin(Op::Lt, l, r); break;
+                    case BinaryOperator::LessThanEqual: out = bin(Op::Le, l, r); break;
+                    case BinaryOperator::GreaterThan: out = bin(Op::Gt, l, r); break;
+                    case BinaryOperator::GreaterThanEqual: out = bin(Op::Ge, l, r); break;
+                    case BinaryOperator::LogicalShiftLeft: out = bin(Op::Shl, l, r); break;
+                    case BinaryOperator::LogicalShiftRight: out = bin(Op::Shr, l, r); break;
+                    case BinaryOperator::LogicalAnd: out = bin(Op::LogAnd, l, r); break;
+                    case BinaryOperator::LogicalOr: out = bin(Op::LogOr, l, r); break;
                     default: unsupported("binary operator");
                 }
+                if (!prop) return fit(out, (int)e.type->getBitWidth(), ctx);
+                return out;
             }
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
                 if (c.conditions.size() != 1) unsupported("pattern conditional");
-                return mux(expr(*c.conditions[0].expr), expr(c.left()), expr(c.right()));
+                int w = ctx > 0 ? ctx : (int)e.type->getBitWidth();
+                return mux(expr(*c.conditions[0].expr), expr(c.left(), w), expr(c.right(), w));
             }
             case ExpressionKind::Concatenation: {
                 std::vector<E> parts;
                 for (auto* op : e.as<ConcatenationExpression>().operands()) parts.push_back(expr(*op));
-                return concat(parts);
+                return fit(concat(parts), (int)e.type->getBitWidth(), ctx);
             }
             case ExpressionKind::ElementSelect: {   // a[i]
                 const auto& sel = e.as<ElementSelectExpression>();
                 E base = expr(sel.value());
                 const auto& idx = sel.selector();
-                if (idx.kind == ExpressionKind::IntegerLiteral || idx.constant) {
+                if (idx.kind == ExpressionKind::IntegerLiteral || idx.getConstant()) {
                     int i = (int)constInt(idx);
-                    return slice(base, i, i);
+                    return fit(slice(base, i, i), (int)e.type->getBitWidth(), ctx);
                 }
-                return bin(Op::Index, base, expr(idx));
+                return fit(bin(Op::Index, base, expr(idx)), (int)e.type->getBitWidth(), ctx);
             }
             case ExpressionKind::RangeSelect: {     // a[hi:lo]
                 const auto& r = e.as<RangeSelectExpression>();
                 if (r.getSelectionKind() != RangeSelectionKind::Simple) unsupported("indexed part-select (+: / -:)");
-                return slice(expr(r.value()), (int)constInt(r.left()), (int)constInt(r.right()));
+                return fit(slice(expr(r.value()), (int)constInt(r.left()), (int)constInt(r.right())),
+                           (int)e.type->getBitWidth(), ctx);
             }
             default: unsupported("expression kind");
         }
@@ -239,6 +330,41 @@ struct Lowerer {
         }
     }
 
+    // $display / $strobe / $monitor use the kernel format (a string of %b / %d /
+    // literal text, arguments evaluated when the line is printed). $finish and
+    // $stop stop the sim. Anything else is still ignored.
+    void sysCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        std::string_view n = call.getSubroutineName();
+        if (n == "$finish" || n == "$stop") {
+            Instr i; i.k = IK::Finish; prog.emit(i); return;
+        }
+        IK k;
+        if (n == "$display") k = IK::Display;
+        else if (n == "$strobe") k = IK::Strobe;
+        else if (n == "$monitor") k = IK::Monitor;
+        else {
+            std::cerr << "lower: ignoring system call " << n << "\n";
+            return;
+        }
+        Instr i; i.k = k;
+        auto args = call.arguments();
+        size_t ai = 0;
+        if (!args.empty() && args[0]->kind != ExpressionKind::EmptyArgument) {
+            const Expression& first = peel(*args[0]);
+            if (first.kind != ExpressionKind::StringLiteral)
+                unsupported("system task without a format string");
+            i.fmt = std::string(first.as<StringLiteral>().getValue());
+            ai = 1;
+        }
+        for (; ai < args.size(); ai++) {
+            if (args[ai]->kind == ExpressionKind::EmptyArgument)
+                unsupported("empty system task argument");
+            i.args.push_back(expr(*args[ai]));
+        }
+        prog.emit(i);
+    }
+
     // Assignments, ++/--, and system calls used as statements.
     void exprStmt(const slang::ast::Expression& ex) {
         using namespace slang::ast;
@@ -260,9 +386,7 @@ struct Lowerer {
             i.e = bin(inc ? Op::Add : Op::Sub, expr(u.operand()), konst(mk(1, 32)));
             prog.emit(i);
         } else if (ex.kind == ExpressionKind::Call) {
-            std::string_view n = ex.as<CallExpression>().getSubroutineName();
-            if (n == "$finish" || n == "$stop") { Instr i; i.k = IK::Finish; prog.emit(i); }
-            else std::cerr << "lower: ignoring system call " << n << "\n";
+            sysCall(ex.as<CallExpression>());
         } else {
             unsupported("expression statement");
         }
@@ -284,7 +408,7 @@ struct Lowerer {
                 for (auto* st : s.as<StatementList>().list) stmt(*st);
                 break;
             case StatementKind::Block:
-                stmt(s.as<BlockStatement>().getStatements());
+                stmt(s.as<BlockStatement>().body);
                 break;
             case StatementKind::Timed: {
                 const auto& t = s.as<TimedStatement>();
@@ -397,8 +521,18 @@ struct Lowerer {
     }
 };
 
+// Nested instances are rejected until ports are actually connected. A top-level
+// instance (the design root) is visited; anything deeper is a hard error.
+inline void rejectNestedInstance(const slang::ast::InstanceSymbol& inst) {
+    if (inst.isTopLevel()) return;
+    throw std::runtime_error(
+        "lower: instantiating module '" + std::string(inst.getDefinition().name) +
+        "' (instance '" + std::string(inst.name) +
+        "') is not supported; port connections are not implemented");
+}
+
 // Pass 1: register every variable / net as a simulator signal.
-struct SigCollector : slang::ast::ASTVisitor<SigCollector, false, false> {
+struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     std::function<int(const std::string&, int)> mkSig;
     std::unordered_map<const slang::ast::Symbol*, int>& sigmap;
     SigCollector(std::function<int(const std::string&, int)> f,
@@ -413,10 +547,14 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector, false, false> {
     }
     void handle(const slang::ast::VariableSymbol& v) { reg(v); }
     void handle(const slang::ast::NetSymbol& n) { reg(n); }
+    void handle(const slang::ast::InstanceSymbol& inst) {
+        rejectNestedInstance(inst);
+        visitDefault(inst);
+    }
 };
 
 // Pass 2: lower every procedural block.
-struct ProcCollector : slang::ast::ASTVisitor<ProcCollector, false, false> {
+struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     std::unordered_map<const slang::ast::Symbol*, int>& sigmap;
     LowerResult& out;
     std::function<int(int)> newDriver;
@@ -439,6 +577,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector, false, false> {
         bool loops = !rs.empty();
         if (loops) { lw.prog.emit(waitInstr(rs)); Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }
         out.procs.push_back({std::move(lw.prog), loops, "assign"});
+    }
+    void handle(const slang::ast::InstanceSymbol& inst) {
+        rejectNestedInstance(inst);
+        visitDefault(inst);
     }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;

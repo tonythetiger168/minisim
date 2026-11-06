@@ -59,7 +59,10 @@ recurse:
 // Every signal read by any expression in the program (for @* / always_comb).
 inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
     std::vector<int> sigs;
-    for (auto& i : p.code) collectRefs(i.e, sigs);
+    for (auto& i : p.code) {
+        collectRefs(i.e, sigs);
+        for (auto& a : i.args) collectRefs(a, sigs);  // $display / $strobe / $monitor
+    }
     std::vector<std::pair<int, Edge>> ev;
     for (int s : sigs) ev.push_back({s, ANY});
     return ev;
