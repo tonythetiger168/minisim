@@ -12,11 +12,12 @@
 // Assumes vectors are declared [N-1:0] (zero-based) so index == bit position.
 // A ConversionExpression is lowered at the conversion's bit width so a
 // context-determined operator (a = 4'hF + 4'h1 with a 8 bits wide) is not
-// evaluated at the operands' self-determined width. The resize is unsigned;
-// signed arithmetic is not implemented.
+// evaluated at the operands' self-determined width. Widening sign-extends
+// when the operand is signed in that context (both operands signed, or an
+// assignment of a signed expression). $signed / $unsigned retag the bits.
 // Instantiating a module is an error until port connections are implemented.
 // Not yet:  compound assigns (+=), break/continue, net initializers (wire y = ..), a[i +: w], tasks/functions,
-//           signed arithmetic.
+//           division.
 //
 // Usage:
 //   LowerResult r = lower(compilation,
@@ -50,6 +51,16 @@
 struct LoweredProc { Prog prog; bool loops; std::string kind; };
 struct LowerResult { std::vector<LoweredProc> procs; };
 
+// A parent asked for a width. fill sign-extends when widening. tag is the
+// signedness after the resize. Propagated ops set fill == tag. An assignment
+// sets fill from the expression and tag from the destination type.
+struct ExprCtx {
+    int w = -1;
+    bool fill = false;
+    bool tag = false;
+    bool live = false;
+};
+
 struct Lowerer {
     std::unordered_map<const slang::ast::Symbol*, int>& sigmap;
     Prog prog;
@@ -74,27 +85,43 @@ struct Lowerer {
         unsupported("non-constant select bound");
     }
 
-    // Unsigned resize to the width slang's ConversionExpression asks for.
-    // A constant is rebuilt at that width (zero-extend or truncate). Anything
-    // else is a high-zero concat or a low-part slice, which is what an
-    // unsigned context-determined operand does.
-    E resizeTo(E e, int srcW, int dstW) {
-        if (dstW <= 0 || dstW > 64) unsupported("width conversion outside 1..64 bits");
-        if (e && e->op == Op::Const) {
-            if (e->k.w == dstW) return e;
-            return konst(make(e->k.v, e->k.x, dstW, e->k.z));
-        }
-        if (srcW == dstW) return e;
-        if (srcW <= 0 || srcW > 64) unsupported("width conversion outside 1..64 bits");
-        if (dstW < srcW) return slice(e, dstW - 1, 0);
-        return concat({konst(mk(0, dstW - srcW)), e});
+    static void needWidth(int w) {
+        if (w <= 0 || w > 64) unsupported("width conversion outside 1..64 bits");
     }
 
-    // ctx > 0 asks for that many bits. A constant is rebuilt; a ref is
-    // zero-extended or sliced. ctx <= 0 leaves the value alone.
-    E fit(E r, int srcW, int ctx) {
-        if (ctx <= 0 || srcW == ctx) return r;
-        return resizeTo(r, srcW, ctx);
+    // Put selfTag on a constant or a ref. Other ops take their signedness
+    // from eval, which reads the tags on their operands.
+    static E tagExpr(E e, bool selfTag) {
+        if (!e) return e;
+        if (e->op == Op::Const) {
+            if (e->k.sgn == selfTag) return e;
+            Val k = e->k;
+            k.sgn = selfTag;
+            return konst(k);
+        }
+        if (e->op == Op::Ref) return e->sgn == selfTag ? e : ref(e->sig, selfTag);
+        return e;
+    }
+
+    // Honor ctx when a parent asked for a width. Otherwise keep selfTag.
+    E sized(E e, int srcW, bool selfTag, ExprCtx ctx) {
+        if (!ctx.live) return tagExpr(e, selfTag);
+        needWidth(ctx.w);
+        if (ctx.w == srcW && ctx.tag == selfTag) return tagExpr(e, selfTag);
+        return resize(std::move(e), ctx.w, ctx.fill && ctx.w > srcW, ctx.tag);
+    }
+
+    static bool isShift(slang::ast::BinaryOperator op) {
+        using slang::ast::BinaryOperator;
+        switch (op) {
+            case BinaryOperator::LogicalShiftLeft:
+            case BinaryOperator::LogicalShiftRight:
+            case BinaryOperator::ArithmeticShiftLeft:
+            case BinaryOperator::ArithmeticShiftRight:
+                return true;
+            default:
+                return false;
+        }
     }
 
     static bool widthPropagates(slang::ast::BinaryOperator op) {
@@ -121,18 +148,19 @@ struct Lowerer {
     }
 
     // ---------- expressions ----------
-    // ctx > 0: produce a value of that width (the enclosing conversion, or the
-    // result width of a context-determined operator). An outer conversion wins
-    // over the self-determined widening slang inserts underneath it, so
+    // ctx.live: produce a value of that width. An outer conversion wins over
+    // the self-determined widening slang inserts underneath it, so
     // `cnt <= cnt + 1` with cnt 4 bits is a 4-bit add, not a 32-bit add sliced
-    // down. Arithmetic and bitwise results are congruent mod 2^w for unsigned
-    // values, which is the subset this lowerer implements.
-    E expr(const slang::ast::Expression& e, int ctx = -1) {
+    // down. Add/sub/mul stay congruent mod 2^w, signed or not, once operands
+    // are extended to that width. Sign-extension is not congruent that way
+    // for shifts or compares, so those extend before the operator.
+    E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
         switch (e.kind) {
             case ExpressionKind::IntegerLiteral: {
                 const auto& sv = e.as<IntegerLiteral>().getValue();
                 int w = (int)sv.getBitWidth();
+                bool self = e.type->isSigned();
                 E lit;
                 if (sv.hasUnknown()) {   // x / z / ? bits (VERIFY logic_t API for your slang version)
                     uint64_t v = 0, x = 0, z = 0;
@@ -145,41 +173,72 @@ struct Lowerer {
                             v |= 1ULL << b;
                         }
                     }
-                    lit = konst(make(v, x, w, z));
+                    lit = konst(make(v, x, w, z, self));
                 } else {
-                    lit = konst(mk(*sv.as<uint64_t>(), w));
+                    lit = konst(make(*sv.as<uint64_t>(), 0, w, 0, self));
                 }
-                return fit(lit, w, ctx);
+                return sized(lit, w, self, ctx);
             }
             case ExpressionKind::NamedValue: {
                 const Symbol* sym = &e.as<NamedValueExpression>().symbol;
                 auto it = sigmap.find(sym);
                 if (it == sigmap.end()) unsupported("reference to non-signal symbol");
                 int src = (int)e.type->getBitWidth();
-                return fit(ref(it->second), src, ctx);
+                bool self = e.type->isSigned();
+                return sized(ref(it->second, self), src, self, ctx);
             }
             case ExpressionKind::Conversion: {
                 // 4'hF inside an 8-bit add is a 4-bit literal under a conversion
                 // to 8. cnt+1 is a 32-bit add under a conversion to 4. Either
                 // way the operand is lowered at the width that applies here.
+                // Propagated (11.8.2): the context type's signedness replaces
+                // the operand's, then the value is extended. Implicit assignment
+                // (11.8.3): extend with the operand's signedness. An outer width
+                // still wins, so a truncating assign stays narrow.
                 const auto& c = e.as<ConversionExpression>();
-                int dst = ctx;
-                if (dst <= 0) {
-                    auto dstB = c.type->getBitWidth();
-                    if (dstB == 0 || dstB > 64) unsupported("width conversion outside 1..64 bits");
-                    dst = (int)dstB;
+                int dst = (int)c.type->getBitWidth();
+                bool fill, tag;
+                if (ctx.live && ctx.w > 0) {
+                    dst = ctx.w;
+                    fill = ctx.fill;
+                    tag = ctx.tag;
+                } else if (c.conversionKind == ConversionKind::Propagated) {
+                    fill = tag = c.type->isSigned();
+                } else {
+                    fill = c.operand().type->isSigned();
+                    tag = c.type->isSigned();
                 }
-                return expr(c.operand(), dst);
+                needWidth(dst);
+                return expr(c.operand(), ExprCtx{dst, fill, tag, true});
+            }
+            case ExpressionKind::Call: {
+                // $signed / $unsigned keep the bits and change the tag.
+                // Any other call used as a value is still unsupported.
+                const auto& call = e.as<CallExpression>();
+                std::string_view n = call.getSubroutineName();
+                if (n != "$signed" && n != "$unsigned") unsupported("system function");
+                auto args = call.arguments();
+                if (args.size() != 1 || args[0]->kind == ExpressionKind::EmptyArgument)
+                    unsupported("system function");
+                int aw = (int)args[0]->type->getBitWidth();
+                needWidth(aw);
+                bool toS = n == "$signed";
+                E arg = expr(*args[0]);
+                E cast = resize(std::move(arg), aw, false, toS);
+                return sized(cast, aw, toS, ctx);
             }
             case ExpressionKind::UnaryOp: {
                 const auto& u = e.as<UnaryExpression>();
                 bool bw = u.op == UnaryOperator::BitwiseNot;
-                int w = -1;
+                E a;
                 if (bw) {
-                    w = ctx > 0 ? ctx : (int)e.type->getBitWidth();
-                    if (w <= 0 || w > 64) unsupported("width conversion outside 1..64 bits");
+                    int w = ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
+                    needWidth(w);
+                    bool sg = e.type->isSigned();
+                    a = expr(u.operand(), ExprCtx{w, sg, sg, true});
+                } else {
+                    a = expr(u.operand());
                 }
-                E a = expr(u.operand(), w);
                 E out;
                 switch (u.op) {
                     case UnaryOperator::BitwiseNot: out = un(Op::Not, a); break;
@@ -189,68 +248,86 @@ struct Lowerer {
                     case UnaryOperator::BitwiseXor: out = un(Op::RedXor, a); break;
                     default: unsupported("unary operator");
                 }
-                if (!bw) return fit(out, (int)e.type->getBitWidth(), ctx);
+                if (!bw) return sized(out, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
                 return out;
             }
             case ExpressionKind::BinaryOp: {
                 const auto& b = e.as<BinaryExpression>();
                 bool prop = widthPropagates(b.op);
-                int w = -1;
-                if (prop) {
-                    w = ctx > 0 ? ctx : (int)e.type->getBitWidth();
-                    if (w <= 0 || w > 64) unsupported("width conversion outside 1..64 bits");
+                bool shift = isShift(b.op);
+                E l, r;
+                if (prop || shift) {
+                    // Shifts size only the left operand. The count stays
+                    // self-determined and is always treated as unsigned.
+                    int w = ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
+                    needWidth(w);
+                    bool sg = e.type->isSigned();
+                    ExprCtx op{w, sg, sg, true};
+                    l = expr(b.left(), op);
+                    r = shift ? expr(b.right()) : expr(b.right(), op);
+                } else {
+                    l = expr(b.left());
+                    r = expr(b.right());
                 }
-                E l = expr(b.left(), w), r = expr(b.right(), w);
-                E out;
+                Op kop;
                 switch (b.op) {
-                    case BinaryOperator::Add: out = bin(Op::Add, l, r); break;
-                    case BinaryOperator::Subtract: out = bin(Op::Sub, l, r); break;
-                    case BinaryOperator::Multiply: out = bin(Op::Mul, l, r); break;
-                    case BinaryOperator::BinaryAnd: out = bin(Op::And, l, r); break;
-                    case BinaryOperator::BinaryOr: out = bin(Op::Or, l, r); break;
-                    case BinaryOperator::BinaryXor: out = bin(Op::Xor, l, r); break;
-                    case BinaryOperator::Equality: out = bin(Op::Eq, l, r); break;
-                    case BinaryOperator::Inequality: out = bin(Op::Ne, l, r); break;
-                    case BinaryOperator::CaseEquality: out = bin(Op::CaseEq, l, r); break;
-                    case BinaryOperator::LessThan: out = bin(Op::Lt, l, r); break;
-                    case BinaryOperator::LessThanEqual: out = bin(Op::Le, l, r); break;
-                    case BinaryOperator::GreaterThan: out = bin(Op::Gt, l, r); break;
-                    case BinaryOperator::GreaterThanEqual: out = bin(Op::Ge, l, r); break;
-                    case BinaryOperator::LogicalShiftLeft: out = bin(Op::Shl, l, r); break;
-                    case BinaryOperator::LogicalShiftRight: out = bin(Op::Shr, l, r); break;
-                    case BinaryOperator::LogicalAnd: out = bin(Op::LogAnd, l, r); break;
-                    case BinaryOperator::LogicalOr: out = bin(Op::LogOr, l, r); break;
+                    case BinaryOperator::Add: kop = Op::Add; break;
+                    case BinaryOperator::Subtract: kop = Op::Sub; break;
+                    case BinaryOperator::Multiply: kop = Op::Mul; break;
+                    case BinaryOperator::BinaryAnd: kop = Op::And; break;
+                    case BinaryOperator::BinaryOr: kop = Op::Or; break;
+                    case BinaryOperator::BinaryXor: kop = Op::Xor; break;
+                    case BinaryOperator::Equality: kop = Op::Eq; break;
+                    case BinaryOperator::Inequality: kop = Op::Ne; break;
+                    case BinaryOperator::CaseEquality: kop = Op::CaseEq; break;
+                    case BinaryOperator::LessThan: kop = Op::Lt; break;
+                    case BinaryOperator::LessThanEqual: kop = Op::Le; break;
+                    case BinaryOperator::GreaterThan: kop = Op::Gt; break;
+                    case BinaryOperator::GreaterThanEqual: kop = Op::Ge; break;
+                    case BinaryOperator::LogicalShiftLeft:
+                    case BinaryOperator::ArithmeticShiftLeft: kop = Op::Shl; break;
+                    case BinaryOperator::LogicalShiftRight: kop = Op::Shr; break;
+                    case BinaryOperator::ArithmeticShiftRight:
+                        kop = e.type->isSigned() ? Op::Asr : Op::Shr;
+                        break;
+                    case BinaryOperator::LogicalAnd: kop = Op::LogAnd; break;
+                    case BinaryOperator::LogicalOr: kop = Op::LogOr; break;
                     default: unsupported("binary operator");
                 }
-                if (!prop) return fit(out, (int)e.type->getBitWidth(), ctx);
-                return out;
+                E out = bin(kop, l, r);
+                if (prop || shift) return out;
+                return sized(out, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
                 if (c.conditions.size() != 1) unsupported("pattern conditional");
-                int w = ctx > 0 ? ctx : (int)e.type->getBitWidth();
-                return mux(expr(*c.conditions[0].expr), expr(c.left(), w), expr(c.right(), w));
+                int w = ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
+                needWidth(w);
+                bool sg = e.type->isSigned();
+                ExprCtx arm{w, sg, sg, true};
+                return mux(expr(*c.conditions[0].expr), expr(c.left(), arm), expr(c.right(), arm));
             }
             case ExpressionKind::Concatenation: {
                 std::vector<E> parts;
                 for (auto* op : e.as<ConcatenationExpression>().operands()) parts.push_back(expr(*op));
-                return fit(concat(parts), (int)e.type->getBitWidth(), ctx);
+                return sized(concat(parts), (int)e.type->getBitWidth(), false, ctx);
             }
             case ExpressionKind::ElementSelect: {   // a[i]
                 const auto& sel = e.as<ElementSelectExpression>();
                 E base = expr(sel.value());
                 const auto& idx = sel.selector();
+                int tw = (int)e.type->getBitWidth();
                 if (idx.kind == ExpressionKind::IntegerLiteral || idx.getConstant()) {
                     int i = (int)constInt(idx);
-                    return fit(slice(base, i, i), (int)e.type->getBitWidth(), ctx);
+                    return sized(slice(base, i, i), tw, e.type->isSigned(), ctx);
                 }
-                return fit(bin(Op::Index, base, expr(idx)), (int)e.type->getBitWidth(), ctx);
+                return sized(bin(Op::Index, base, expr(idx)), tw, e.type->isSigned(), ctx);
             }
             case ExpressionKind::RangeSelect: {     // a[hi:lo]
                 const auto& r = e.as<RangeSelectExpression>();
                 if (r.getSelectionKind() != RangeSelectionKind::Simple) unsupported("indexed part-select (+: / -:)");
-                return fit(slice(expr(r.value()), (int)constInt(r.left()), (int)constInt(r.right())),
-                           (int)e.type->getBitWidth(), ctx);
+                return sized(slice(expr(r.value()), (int)constInt(r.left()), (int)constInt(r.right())),
+                             (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             default: unsupported("expression kind");
         }

@@ -195,7 +195,7 @@ struct Sim {
 
     void set(int s, Val nv) {
         uint64_t m = sigs[s].w >= 64 ? ~0ULL : ((1ULL << sigs[s].w) - 1);
-        nv.v &= m; nv.x &= m; nv.z &= m;
+        nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;
         if (nv == sigs[s].val) return;
         int o = bit0(sigs[s].val), n = bit0(nv);
         sigs[s].val = nv;
