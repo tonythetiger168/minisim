@@ -17,6 +17,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Multi-event waits**: `@(posedge clk or negedge rst_n)`, `@*`, `always_comb`
 - **Resolved nets**: several `assign`s to one wire resolve per bit (Z yields, conflicts give X)
 - **`case` / `casez` / `casex`**, part-selects, bit-selects, `for` / `while` / `do` / `forever` / `repeat`, `break` / `continue`
+- **Tasks and functions** at module scope, called from procedural code in that module. A `function` used in an expression returns a value (`return` or an assignment to the function name). A `task` is a statement. `input` is copied in. `output` and `inout` are copied back when the call returns. A `#delay` inside a task suspends that process.
 - **VCD output** (`dump.vcd`) for GTKWave
 
 ## Layout
@@ -55,7 +56,8 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 
 - Signals up to 64 bits; no strengths
 - Instantiating a module is an error until port connections are implemented
-- Not yet lowered: net initializers, tasks/functions
+- Not yet lowered: net initializers
+- Tasks and functions have no recursion, no `ref` arguments, no DPI, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
 - System tasks other than `$display` / `$strobe` / `$monitor` / `$finish` are ignored. Format is the kernel's `%b`, `%d`, and literal text
 - Vectors assumed declared `[N-1:0]`
 
