@@ -1,4 +1,4 @@
-// Parent instantiates child. Lowering must reject this until ports connect.
+// Parent instantiates child. x drives u.a, and u.b drives y.
 module child(input logic a, output logic b);
   assign b = a;
 endmodule

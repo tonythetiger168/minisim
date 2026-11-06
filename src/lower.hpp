@@ -1,7 +1,7 @@
 // lower.hpp - lower slang's elaborated AST into Sim signals + Prog processes.
 // Built against slang v12.1 (the tag FetchContent pins in CMakeLists.txt).
 //
-// Supported subset (single module, flat):
+// Supported subset (a parent may instantiate a child; ports connect):
 //   statements : begin/end, if/else, case/casez/casex, blocking &
 //                non-blocking assign to a variable, a[const], a[hi:lo],
 //                compound assign (+= -= *= /= %= &= |= ^= <<= >>= <<<= >>>=),
@@ -17,20 +17,25 @@
 // evaluated at the operands' self-determined width. Widening sign-extends
 // when the operand is signed in that context (both operands signed, or an
 // assignment of a signed expression). $signed / $unsigned retag the bits.
-// Instantiating a module is an error until port connections are implemented.
+// A module instance connects each port with a continuous assign. An input
+// expression drives the child's formal. An output's external expression is an
+// assignment whose right-hand side is an EmptyArgument (the formal), the same
+// shape as a subroutine output write-back. An inout net is both directions.
 // Not yet:  net initializers (wire y = ..), a[i +: w], recursive
 //           tasks/functions, ref arguments, DPI, class methods,
-//           hierarchical calls. Arguments are one static copy per subroutine.
+//           hierarchical calls, instance arrays, interfaces, hierarchical
+//           references into a child. Arguments are one static copy per subroutine.
 //
 // Usage:
 //   LowerResult r = lower(compilation,
-//                         [&](const std::string& n, int w){ return S.sig(n, w); },
+//                         [&](const std::string& n, int w, bool net){ return S.sig(n, w, net); },
 //                         [&](int sig){ return S.newDriver(sig); });
 //   for (auto& pr : r.procs) S.spawn(exec(&pr.prog));
 #pragma once
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -52,6 +57,9 @@
 #include "slang/ast/expressions/SelectExpressions.h"
 #include "slang/ast/statements/ConditionalStatements.h"
 #include "slang/ast/statements/MiscStatements.h"
+
+// name, width, and whether the signal is a net. A net starts at Z.
+using MkSig = std::function<int(const std::string&, int, bool)>;
 
 struct LoweredProc { Prog prog; bool loops; std::string kind; };
 
@@ -106,7 +114,7 @@ struct Lowerer {
     };
     std::vector<LoopJumps> loops;
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* subs = nullptr;
-    std::function<int(const std::string&, int)> mkSig;
+    MkSig mkSig;
     int* tempSeq = nullptr;
     int retSig = -1;     // function result signal while lowering a function body
     Subr* current = nullptr;
@@ -119,7 +127,7 @@ struct Lowerer {
     explicit Lowerer(std::unordered_map<const slang::ast::Symbol*, int>& m) : sigmap(m) {}
 
     void bind(std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* s,
-              std::function<int(const std::string&, int)> mk, int* seq) {
+              MkSig mk, int* seq) {
         subs = s;
         mkSig = std::move(mk);
         tempSeq = seq;
@@ -128,7 +136,7 @@ struct Lowerer {
     int fresh(int w) {
         if (!mkSig) unsupported("temporary");
         int n = tempSeq ? (*tempSeq)++ : 0;
-        return mkSig("_tf" + std::to_string(n), w);
+        return mkSig("_tf" + std::to_string(n), w, false);
     }
 
     [[noreturn]] static void unsupported(const char* what) {
@@ -859,57 +867,81 @@ struct Lowerer {
     }
 };
 
-// Nested instances are rejected until ports are actually connected. A top-level
-// instance (the design root) is visited; anything deeper is a hard error.
-inline void rejectNestedInstance(const slang::ast::InstanceSymbol& inst) {
-    if (inst.isTopLevel()) return;
-    throw std::runtime_error(
-        "lower: instantiating module '" + std::string(inst.getDefinition().name) +
-        "' (instance '" + std::string(inst.name) +
-        "') is not supported; port connections are not implemented");
+// Skip bodies slang built only for name lookup. Arrays and interfaces are
+// later limits, so they stay a hard error instead of a silent wrong netlist.
+inline bool enterInstance(const slang::ast::InstanceSymbol& inst) {
+    using namespace slang::ast;
+    if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return false;
+    if (!inst.arrayPath.empty()) Lowerer::unsupported("instance array");
+    if (inst.isInterface()) Lowerer::unsupported("interface instance");
+    if (!inst.isTopLevel() && !inst.isModule()) Lowerer::unsupported("non-module instance");
+    return true;
 }
 
 // Pass 1: register every variable / net as a simulator signal.
+// Nested signals are named from the instance path (`u.y`) so two children
+// with the same local name stay distinct. The top module keeps bare names.
 struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
-    std::function<int(const std::string&, int)> mkSig;
+    MkSig mkSig;
     std::unordered_map<const slang::ast::Symbol*, int>& sigmap;
-    SigCollector(std::function<int(const std::string&, int)> f,
-                 std::unordered_map<const slang::ast::Symbol*, int>& m) : mkSig(std::move(f)), sigmap(m) {}
-    template <typename T> void reg(const T& s) {
+    std::string prefix;
+    SigCollector(MkSig f, std::unordered_map<const slang::ast::Symbol*, int>& m)
+        : mkSig(std::move(f)), sigmap(m) {}
+    template <typename T> void reg(const T& s, bool net) {
         int w = (int)s.getType().getBitWidth();
         if (w > 64) unsupported_width(s.name);
-        sigmap[&s] = mkSig(std::string(s.name), w);
+        sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
     }
     static void unsupported_width(std::string_view n) {
         throw std::runtime_error("lower: signal wider than 64 bits: " + std::string(n));
     }
-    void handle(const slang::ast::VariableSymbol& v) { reg(v); }
-    void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v); }
-    void handle(const slang::ast::NetSymbol& n) { reg(n); }
+    void handle(const slang::ast::VariableSymbol& v) { reg(v, false); }
+    void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v, false); }
+    void handle(const slang::ast::NetSymbol& n) { reg(n, true); }
     void handle(const slang::ast::InstanceSymbol& inst) {
-        rejectNestedInstance(inst);
+        if (!enterInstance(inst)) return;
+        std::string saved = prefix;
+        if (!inst.isTopLevel()) {
+            if (inst.name.empty()) Lowerer::unsupported("unnamed instance");
+            prefix += std::string(inst.name);
+            prefix.push_back('.');
+        }
         visitDefault(inst);
+        prefix = std::move(saved);
     }
 };
 
-// Pass 2: lower every procedural block.
+// Pass 2: lower every procedural block and connect instance ports.
 struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     std::unordered_map<const slang::ast::Symbol*, int>& sigmap;
     LowerResult& out;
     std::function<int(int)> newDriver;
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* subs = nullptr;
-    std::function<int(const std::string&, int)> mkSig;
+    MkSig mkSig;
     int* tempSeq = nullptr;
     ProcCollector(std::unordered_map<const slang::ast::Symbol*, int>& m, LowerResult& o,
                   std::function<int(int)> nd,
                   std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* s,
-                  std::function<int(const std::string&, int)> mk, int* seq)
+                  MkSig mk, int* seq)
         : sigmap(m), out(o), newDriver(std::move(nd)), subs(s), mkSig(std::move(mk)), tempSeq(seq) {}
 
     void prep(Lowerer& lw) { lw.bind(subs, mkSig, tempSeq); }
 
-    // assign y = expr;  -> process: drive y, then re-run when any input changes.
-    // Each assign gets its own driver slot, so several assigns to one wire resolve.
+    // One driver, then wait on every signal the right-hand side reads.
+    // Several assigns to one wire each own a driver slot and resolve.
+    void finishAssign(Lowerer& lw, Instr i) {
+        if (i.hi >= 0) Lowerer::unsupported("assign to a bit/part select");
+        i.drv = newDriver(i.sig);
+        lw.prog.emit(i);
+        auto rs = readSet(lw.prog);
+        bool loops = !rs.empty();
+        if (loops) {
+            lw.prog.emit(waitInstr(rs));
+            Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "assign"});
+    }
+
     void handle(const slang::ast::ContinuousAssignSymbol& ca) {
         using namespace slang::ast;
         const auto& a = ca.getAssignment().as<AssignmentExpression>();
@@ -917,17 +949,84 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         prep(lw);
         Instr i; i.k = IK::Assign;
         lw.lhs(a.left(), i);
-        if (i.hi >= 0) Lowerer::unsupported("assign to a bit/part select");
         i.e = lw.expr(a.right());
-        i.drv = newDriver(i.sig);
-        lw.prog.emit(i);
-        auto rs = readSet(lw.prog);
-        bool loops = !rs.empty();
-        if (loops) { lw.prog.emit(waitInstr(rs)); Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }
-        out.procs.push_back({std::move(lw.prog), loops, "assign"});
+        finishAssign(lw, i);
     }
+
+    // The child's formal signal. A null port (no internal connection) is skipped.
+    struct Formal { int sig; int w; bool sgn; };
+    std::optional<Formal> portFormal(const slang::ast::PortSymbol& ps) {
+        using namespace slang::ast;
+        const Symbol* sym = ps.internalSymbol;
+        if (!sym) {
+            const Expression* in = ps.getInternalExpr();
+            if (!in) return std::nullopt;
+            const Expression& peeled = Lowerer::peel(*in);
+            if (peeled.kind != ExpressionKind::NamedValue)
+                Lowerer::unsupported("port internal connection");
+            sym = &peeled.as<NamedValueExpression>().symbol;
+        }
+        auto it = sigmap.find(sym);
+        if (it == sigmap.end())
+            throw std::runtime_error("lower: port '" + std::string(ps.name) + "' is not a signal");
+        int w = (int)ps.getType().getBitWidth();
+        if (w <= 0 || w > 64) Lowerer::unsupported("port width");
+        return Formal{it->second, w, ps.getType().isSigned()};
+    }
+
+    void driveSig(int sig, const slang::ast::Expression& rhs) {
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i; i.k = IK::Assign; i.sig = sig; i.e = lw.expr(rhs);
+        finishAssign(lw, i);
+    }
+
+    // Drive the parent's actual from the child's formal. `ext` is the
+    // assignment slang built for an output or inout; its right-hand side is
+    // an EmptyArgument standing in for that formal.
+    void driveActual(const slang::ast::AssignmentExpression& ext, const Formal& formal) {
+        Lowerer lw(sigmap);
+        prep(lw);
+        Lowerer::OutSlot slot{formal.sig, formal.w, formal.sgn};
+        lw.outSlot = &slot;
+        Instr i; i.k = IK::Assign;
+        lw.lhs(ext.left(), i);
+        i.e = lw.expr(ext.right());
+        finishAssign(lw, i);
+    }
+
+    void connectInstance(const slang::ast::InstanceSymbol& inst) {
+        using namespace slang::ast;
+        if (inst.isTopLevel()) return;
+        for (const PortConnection* conn : inst.getPortConnections()) {
+            if (!conn || conn->port.kind != SymbolKind::Port)
+                Lowerer::unsupported("interface port");
+            const auto& ps = conn->port.as<PortSymbol>();
+            const Expression* ext = conn->getExpression();
+            if (!ext || ps.isNullPort) continue;
+            auto formal = portFormal(ps);
+            if (!formal) continue;
+            if (ps.direction == ArgumentDirection::In) {
+                driveSig(formal->sig, *ext);
+                continue;
+            }
+            if (ps.direction != ArgumentDirection::Out && ps.direction != ArgumentDirection::InOut)
+                Lowerer::unsupported("ref port");
+            if (ext->kind != ExpressionKind::Assignment)
+                Lowerer::unsupported("output port connection");
+            const auto& asg = ext->as<AssignmentExpression>();
+            driveActual(asg, *formal);
+            if (ps.direction != ArgumentDirection::InOut) continue;
+            if (!ps.isNetPort()) Lowerer::unsupported("inout port that is not a net");
+            if ((int)asg.left().type->getBitWidth() != formal->w)
+                Lowerer::unsupported("inout width mismatch");
+            driveSig(formal->sig, asg.left());
+        }
+    }
+
     void handle(const slang::ast::InstanceSymbol& inst) {
-        rejectNestedInstance(inst);
+        if (!enterInstance(inst)) return;
+        connectInstance(inst);
         visitDefault(inst);
     }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
@@ -979,8 +1078,7 @@ inline void rejectRecursive(const std::vector<Subr*>& subs) {
         if (color[s] == Color::White) dfs(dfs, s);
 }
 
-inline LowerResult lower(slang::ast::Compilation& comp,
-                         std::function<int(const std::string&, int)> mkSig,
+inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                          std::function<int(int)> newDriver) {
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
@@ -990,7 +1088,7 @@ inline LowerResult lower(slang::ast::Compilation& comp,
     struct Finder : slang::ast::ASTVisitor<Finder> {
         std::vector<const slang::ast::SubroutineSymbol*> found;
         void handle(const slang::ast::InstanceSymbol& inst) {
-            rejectNestedInstance(inst);
+            if (!enterInstance(inst)) return;
             visitDefault(inst);
         }
         void handle(const slang::ast::SubroutineSymbol& s) { found.push_back(&s); }

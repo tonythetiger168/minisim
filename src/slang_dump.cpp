@@ -1,5 +1,5 @@
-// slang_dump.cpp - parse and elaborate with slang (v12.1), lower a flat module,
-// then list the signals and processes. A nested instance is an error.
+// slang_dump.cpp - parse and elaborate with slang (v12.1), lower the design
+// (including module instances), then list the signals and processes.
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -64,11 +64,9 @@ int main(int argc, char** argv) {
     if (!msgs.empty()) cerr << msgs;
     if (errors) return 1;
 
-    // Lowering a flat module has to succeed; a nested instance is an error
-    // until port connections are implemented.
     try {
         int n = 0;
-        lower(comp, [&](const std::string&, int) { return n++; }, [](int) { return 0; });
+        lower(comp, [&](const std::string&, int, bool) { return n++; }, [](int) { return 0; });
     } catch (const std::exception& ex) {
         cerr << ex.what() << "\n";
         return 1;
