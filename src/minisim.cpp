@@ -54,8 +54,11 @@ struct Sim {
 
     ~Sim() { for (auto h : all) h.destroy(); }
 
-    int sig(const string& n, int w) {
-        sigs.push_back({n, w, Val{}});
+    // A wire (`net`) starts as Z, including before the first drive().
+    // A variable (reg/logic) starts as X. The kernel has no declaration
+    // kind of its own; the caller says which one this signal is.
+    int sig(const string& n, int w, bool net = false) {
+        sigs.push_back({n, w, net ? allz(w) : Val{}});
         waiters.emplace_back();
         return (int)sigs.size() - 1;
     }
