@@ -12,6 +12,7 @@
 // $strobe            -> postponed region, after NBA
 // $monitor           -> one postponed line per slot if a watched value changed
 // $finish            -> S.finished = true
+// task/function      -> Call / Ret in this coroutine (exec.inc)
 #include <coroutine>
 #include <cstdint>
 #include <deque>

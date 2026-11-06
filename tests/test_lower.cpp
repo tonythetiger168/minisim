@@ -88,6 +88,8 @@ static const char* ikName(IK k) {
         case IK::Display: return "Display";
         case IK::Strobe: return "Strobe";
         case IK::Monitor: return "Monitor";
+        case IK::Call: return "Call";
+        case IK::Ret: return "Ret";
     }
     return "?";
 }
@@ -496,6 +498,72 @@ static int testBreak() {
     return 0;
 }
 
+// examples/tasks.sv. A wrong return value, a dropped output, or a rejected
+// call fails these lines. Icarus Verilog 13 is the source of the text.
+static int testTasks() {
+    S.finished = false;
+    S.now = 0;
+    S.wheel.clear();
+    S.mon.on = false;
+    S.mon.queued = false;
+    S.vcd.close();
+    S.active.clear();
+    S.inactive.clear();
+    S.postq.clear();
+    S.nbaq.clear();
+
+    Compiled c = compileSv(srcPath("examples/tasks.sv"), true);
+    if (c.result.procs.empty()) return fail("tasks proc count");
+    for (auto& pr : c.result.procs) S.spawn(exec(&pr.prog));
+
+    auto saved = std::filesystem::current_path();
+    auto tmp = std::filesystem::temp_directory_path() / "minisim-tasks-test";
+    std::filesystem::create_directories(tmp);
+    std::filesystem::current_path(tmp);
+    std::stringstream buf;
+    std::streambuf* old = std::cout.rdbuf(buf.rdbuf());
+    S.run(1000);
+    std::cout.rdbuf(old);
+    std::filesystem::current_path(saved);
+
+    const std::vector<std::string> want = {
+        "FUNC 00010000", "NAME 00000111", "SUM 00011000", "DISP 00010000", "IF 1",
+        "NEST 00000111", "SEXT 11111000", "ZEXT 00001000", "SLT 1", "SLT0 0",
+        "XZ 10xz", "ADDX xxxx", "SEXTZ zzzzz000",
+        "STICKY 00000101", "STICKY2 00000101",
+        "STEP 00000010", "STEP2 00000011",
+        "ASTEP 00000010", "ASTEP2 00000010",
+        "TASK 00010001", "INOUT 00000101", "NAMED 00000011", "PASSZ z10x",
+        "COUNT 00000100", "EARLY 00000001",
+        "D0 0000", "IN", "MID", "OUT", "D5 1010",
+    };
+    auto got = linesOf(buf.str());
+    if (got != want) {
+        std::cerr << "FAIL tasks stdout\n--- got ---\n";
+        for (auto& s : got) std::cerr << s << "\n";
+        std::cerr << "--- want ---\n";
+        for (auto& s : want) std::cerr << s << "\n";
+        return 1;
+    }
+    if (S.now < 5) return fail("delayed task did not reach #5");
+    return 0;
+}
+
+static int testRecur() {
+    bool threw = false;
+    std::string msg;
+    try {
+        compileSv(srcPath("examples/recur.sv"), false);
+    } catch (const std::exception& ex) {
+        threw = true;
+        msg = ex.what();
+    }
+    if (!threw) return fail("recur.sv did not throw");
+    if (msg.find("recursive") == std::string::npos)
+        return fail("recur.sv threw an unexpected error: " + msg);
+    return 0;
+}
+
 int main() {
     if (int rc = testHier()) return rc;
     if (int rc = testCounter()) return rc;
@@ -504,6 +572,8 @@ int main() {
     if (int rc = testDiv()) return rc;
     if (int rc = testCompound()) return rc;
     if (int rc = testBreak()) return rc;
+    if (int rc = testTasks()) return rc;
+    if (int rc = testRecur()) return rc;
     std::cout << "ok\n";
     return 0;
 }

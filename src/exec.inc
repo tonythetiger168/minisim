@@ -1,10 +1,24 @@
 // exec.inc - #include in minisim after the Delay/Wait awaiters (needs Sim S, Task).
-// Runs one Prog as a coroutine. `p` must outlive the simulation.
+// Runs one Prog as a coroutine. `entry` must outlive the simulation.
+// `rets` is a coroutine local. A #delay inside a callee hits co_await here,
+// and the return address is still on `rets` when the process resumes.
 static Val rd(int s) { return S.get(s); }
 
-Task exec(const Prog* p) {
+struct RetFrame { const Prog* prog; size_t pc; };
+
+Task exec(const Prog* entry) {
+    const Prog* p = entry;
     size_t pc = 0;
-    while (pc < p->code.size()) {
+    vector<RetFrame> rets;
+    while (p) {
+        if (pc >= p->code.size()) {
+            if (rets.empty()) co_return;
+            RetFrame f = rets.back();
+            rets.pop_back();
+            p = f.prog;
+            pc = f.pc;
+            continue;
+        }
         const Instr& i = p->code[pc];
         switch (i.k) {
             case IK::Assign: {
@@ -44,6 +58,22 @@ Task exec(const Prog* p) {
                 // that task itself runs (Icarus 13).
                 S.finished = true;
                 co_return;
+            case IK::Call: {
+                const Prog* callee = i.callee;
+                rets.push_back({p, pc + 1});
+                p = callee;
+                pc = 0;
+                break;
+            }
+            case IK::Ret:
+                if (rets.empty()) co_return;
+                {
+                    RetFrame f = rets.back();
+                    rets.pop_back();
+                    p = f.prog;
+                    pc = f.pc;
+                }
+                break;
         }
     }
 }

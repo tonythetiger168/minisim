@@ -7,9 +7,10 @@
 //                compound assign (+= -= *= /= %= &= |= ^= <<= >>= <<<= >>>=),
 //                @(posedge/negedge/any sig [or ...]), @*, always_comb,
 //                for/while/do/forever/repeat(const), break/continue,
-//                #<literal>, $display / $strobe / $monitor / $finish, assign
+//                #<literal>, $display / $strobe / $monitor / $finish, assign,
+//                module-level task and function calls (input, output, inout)
 //   expressions: literals, variable refs, unary/binary ops, ?:, {concat},
-//                a[expr], a[hi:lo]
+//                a[expr], a[hi:lo], a function call
 // Assumes vectors are declared [N-1:0] (zero-based) so index == bit position.
 // A ConversionExpression is lowered at the conversion's bit width so a
 // context-determined operator (a = 4'hF + 4'h1 with a 8 bits wide) is not
@@ -17,7 +18,9 @@
 // when the operand is signed in that context (both operands signed, or an
 // assignment of a signed expression). $signed / $unsigned retag the bits.
 // Instantiating a module is an error until port connections are implemented.
-// Not yet:  net initializers (wire y = ..), a[i +: w], tasks/functions.
+// Not yet:  net initializers (wire y = ..), a[i +: w], recursive
+//           tasks/functions, ref arguments, DPI, class methods,
+//           hierarchical calls. Arguments are one static copy per subroutine.
 //
 // Usage:
 //   LowerResult r = lower(compilation,
@@ -27,9 +30,11 @@
 #pragma once
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "prog.hpp"
@@ -49,7 +54,31 @@
 #include "slang/ast/statements/MiscStatements.h"
 
 struct LoweredProc { Prog prog; bool loops; std::string kind; };
-struct LowerResult { std::vector<LoweredProc> procs; };
+
+// One module-level task or function. Arguments and the function result are
+// signals (the formal and slang's returnValVar), shared by every call.
+// `prog` is owned by LowerResult::subs so a Call's pointer stays valid after
+// lower() returns.
+struct Subr {
+    Prog* prog = nullptr;
+    const slang::ast::SubroutineSymbol* sym = nullptr;
+    int retSig = -1;
+    int retW = 1;
+    bool retSgn = false;
+    struct Arg {
+        int sig = -1;
+        slang::ast::ArgumentDirection dir = slang::ast::ArgumentDirection::In;
+        int w = 1;
+        bool sgn = false;
+    };
+    std::vector<Arg> args;
+    std::vector<Subr*> calls;
+};
+
+struct LowerResult {
+    std::vector<LoweredProc> procs;
+    std::vector<std::unique_ptr<Prog>> subs;
+};
 
 // A parent asked for a width. fill sign-extends when widening. tag is the
 // signedness after the resize. Propagated ops set fill == tag. An assignment
@@ -76,8 +105,31 @@ struct Lowerer {
         std::vector<size_t> continues;
     };
     std::vector<LoopJumps> loops;
+    std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* subs = nullptr;
+    std::function<int(const std::string&, int)> mkSig;
+    int* tempSeq = nullptr;
+    int retSig = -1;     // function result signal while lowering a function body
+    Subr* current = nullptr;
+    // Set while lowering an output/inout write-back. slang's actual is an
+    // assignment whose right-hand side is an EmptyArgument (the formal),
+    // possibly wrapped in a conversion to the actual's type.
+    struct OutSlot { int sig; int w; bool sgn; };
+    const OutSlot* outSlot = nullptr;
 
     explicit Lowerer(std::unordered_map<const slang::ast::Symbol*, int>& m) : sigmap(m) {}
+
+    void bind(std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* s,
+              std::function<int(const std::string&, int)> mk, int* seq) {
+        subs = s;
+        mkSig = std::move(mk);
+        tempSeq = seq;
+    }
+
+    int fresh(int w) {
+        if (!mkSig) unsupported("temporary");
+        int n = tempSeq ? (*tempSeq)++ : 0;
+        return mkSig("_tf" + std::to_string(n), w);
+    }
 
     [[noreturn]] static void unsupported(const char* what) {
         throw std::runtime_error(std::string("lower: unsupported ") + what);
@@ -173,6 +225,83 @@ struct Lowerer {
         return *p;
     }
 
+    // Copy inputs in, call, copy outputs back. A function result is snapshotted
+    // into a fresh signal: f(a)+f(b) would otherwise read the same return signal
+    // twice and see only the second call.
+    E emitUserCall(const slang::ast::CallExpression& call, bool wantValue) {
+        using namespace slang::ast;
+        if (call.thisClass()) unsupported("class method");
+        if (call.isSystemCall()) unsupported("system call");
+        const auto* sym = std::get<const SubroutineSymbol*>(call.subroutine);
+        if (!sym || !subs) unsupported("subroutine call");
+        if (sym->flags.has(MethodFlags::DPIImport)) unsupported("DPI import");
+        auto it = subs->find(sym);
+        if (it == subs->end()) unsupported("subroutine call");
+        Subr* sub = it->second;
+        if (current) current->calls.push_back(sub);
+
+        auto args = call.arguments();
+        if (args.size() != sub->args.size()) unsupported("subroutine argument count");
+
+        for (size_t n = 0; n < args.size(); n++) {
+            const auto& formal = sub->args[n];
+            if (formal.dir == ArgumentDirection::Ref) unsupported("ref argument");
+            const Expression& a = *args[n];
+            if (formal.dir == ArgumentDirection::In) {
+                if (a.kind == ExpressionKind::EmptyArgument) unsupported("empty argument");
+                Instr i;
+                i.k = IK::Assign;
+                i.sig = formal.sig;
+                i.e = expr(a);
+                prog.emit(i);
+            } else if (formal.dir == ArgumentDirection::InOut) {
+                if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
+                Instr i;
+                i.k = IK::Assign;
+                i.sig = formal.sig;
+                i.e = expr(a.as<AssignmentExpression>().left());
+                prog.emit(i);
+            } else if (a.kind != ExpressionKind::Assignment &&
+                       a.kind != ExpressionKind::EmptyArgument) {
+                unsupported("output argument");
+            }
+        }
+
+        Instr c;
+        c.k = IK::Call;
+        c.callee = sub->prog;
+        prog.emit(c);
+
+        for (size_t n = 0; n < args.size(); n++) {
+            const auto& formal = sub->args[n];
+            if (formal.dir != ArgumentDirection::Out && formal.dir != ArgumentDirection::InOut)
+                continue;
+            const Expression& a = *args[n];
+            if (a.kind == ExpressionKind::EmptyArgument) continue;
+            if (a.kind != ExpressionKind::Assignment) unsupported("output argument");
+            const auto& as = a.as<AssignmentExpression>();
+            Instr i;
+            i.k = IK::Assign;
+            lhs(as.left(), i);
+            OutSlot slot{formal.sig, formal.w, formal.sgn};
+            const OutSlot* saved = outSlot;
+            outSlot = &slot;
+            i.e = expr(as.right());
+            outSlot = saved;
+            prog.emit(i);
+        }
+
+        if (!wantValue) return {};
+        if (sub->retSig < 0) unsupported("subroutine call has no return value");
+        int tmp = fresh(sub->retW);
+        Instr i;
+        i.k = IK::Assign;
+        i.sig = tmp;
+        i.e = ref(sub->retSig, sub->retSgn);
+        prog.emit(i);
+        return ref(tmp, sub->retSgn);
+    }
+
     // ---------- expressions ----------
     // ctx.live: produce a value of that width. An outer conversion wins over
     // the self-determined widening slang inserts underneath it, so
@@ -241,10 +370,19 @@ struct Lowerer {
                 needWidth(dst);
                 return expr(c.operand(), ExprCtx{dst, fill, tag, true});
             }
+            case ExpressionKind::EmptyArgument: {
+                if (!outSlot) unsupported("empty argument");
+                return sized(ref(outSlot->sig, outSlot->sgn), outSlot->w, outSlot->sgn, ctx);
+            }
             case ExpressionKind::Call: {
-                // $signed / $unsigned keep the bits and change the tag.
-                // Any other call used as a value is still unsupported.
                 const auto& call = e.as<CallExpression>();
+                if (!call.isSystemCall()) {
+                    E v = emitUserCall(call, true);
+                    int w = (int)e.type->getBitWidth();
+                    needWidth(w);
+                    return sized(std::move(v), w, e.type->isSigned(), ctx);
+                }
+                // $signed / $unsigned keep the bits and change the tag.
                 std::string_view n = call.getSubroutineName();
                 if (n != "$signed" && n != "$unsigned") unsupported("system function");
                 auto args = call.arguments();
@@ -515,7 +653,9 @@ struct Lowerer {
             i.e = bin(inc ? Op::Add : Op::Sub, expr(u.operand()), konst(mk(1, 32)));
             prog.emit(i);
         } else if (ex.kind == ExpressionKind::Call) {
-            sysCall(ex.as<CallExpression>());
+            const auto& call = ex.as<CallExpression>();
+            if (call.isSystemCall()) sysCall(call);
+            else emitUserCall(call, false);
         } else {
             unsupported("expression statement");
         }
@@ -567,10 +707,42 @@ struct Lowerer {
                 break;
             case StatementKind::VariableDeclaration: {   // int x = 5;  inside a block
                 const auto& vd = s.as<VariableDeclStatement>();
-                if (const Expression* init = vd.symbol.getInitializer()) {
+                const Expression* init = vd.symbol.getInitializer();
+                if (!init) break;
+                // A static local in a task or function is initialized on the
+                // first call, then left alone. The flag starts as X, so the
+                // first call fails the "already done" test and takes the init.
+                bool once = current && vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
+                if (!once) {
                     Instr i; i.k = IK::Assign; i.sig = sigmap.at(&vd.symbol); i.e = expr(*init);
                     prog.emit(i);
+                    break;
                 }
+                int flag = fresh(1);
+                Instr j; j.k = IK::JmpIfNot; j.e = ref(flag);
+                size_t jf = prog.emit(j);
+                size_t js = emitJmp();
+                prog.code[jf].target = prog.here();
+                Instr set; set.k = IK::Assign; set.sig = flag; set.e = konst(mk(1, 1));
+                prog.emit(set);
+                Instr i; i.k = IK::Assign; i.sig = sigmap.at(&vd.symbol); i.e = expr(*init);
+                prog.emit(i);
+                prog.code[js].target = prog.here();
+                break;
+            }
+            case StatementKind::Return: {
+                const auto& r = s.as<ReturnStatement>();
+                if (r.expr) {
+                    if (retSig < 0) unsupported("return value");
+                    Instr i;
+                    i.k = IK::Assign;
+                    i.sig = retSig;
+                    i.e = expr(*r.expr);
+                    prog.emit(i);
+                }
+                Instr ret;
+                ret.k = IK::Ret;
+                prog.emit(ret);
                 break;
             }
             case StatementKind::Break: {
@@ -712,6 +884,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         throw std::runtime_error("lower: signal wider than 64 bits: " + std::string(n));
     }
     void handle(const slang::ast::VariableSymbol& v) { reg(v); }
+    void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v); }
     void handle(const slang::ast::NetSymbol& n) { reg(n); }
     void handle(const slang::ast::InstanceSymbol& inst) {
         rejectNestedInstance(inst);
@@ -724,8 +897,16 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     std::unordered_map<const slang::ast::Symbol*, int>& sigmap;
     LowerResult& out;
     std::function<int(int)> newDriver;
+    std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* subs = nullptr;
+    std::function<int(const std::string&, int)> mkSig;
+    int* tempSeq = nullptr;
     ProcCollector(std::unordered_map<const slang::ast::Symbol*, int>& m, LowerResult& o,
-                  std::function<int(int)> nd) : sigmap(m), out(o), newDriver(std::move(nd)) {}
+                  std::function<int(int)> nd,
+                  std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* s,
+                  std::function<int(const std::string&, int)> mk, int* seq)
+        : sigmap(m), out(o), newDriver(std::move(nd)), subs(s), mkSig(std::move(mk)), tempSeq(seq) {}
+
+    void prep(Lowerer& lw) { lw.bind(subs, mkSig, tempSeq); }
 
     // assign y = expr;  -> process: drive y, then re-run when any input changes.
     // Each assign gets its own driver slot, so several assigns to one wire resolve.
@@ -733,6 +914,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         using namespace slang::ast;
         const auto& a = ca.getAssignment().as<AssignmentExpression>();
         Lowerer lw(sigmap);
+        prep(lw);
         Instr i; i.k = IK::Assign;
         lw.lhs(a.left(), i);
         if (i.hi >= 0) Lowerer::unsupported("assign to a bit/part select");
@@ -751,6 +933,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
         Lowerer lw(sigmap);
+        prep(lw);
         lw.stmt(p.getBody());
         lw.finishImplicit();
         bool loops = p.procedureKind != ProceduralBlockKind::Initial;
@@ -766,14 +949,98 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
 };
 
+// @* lowered inside a subroutine is a WaitEdge with no events yet. Patch it
+// after every callee body is installed, so the wait sees those reads too.
+inline void patchImplicit(Prog& prog) {
+    std::vector<size_t> slots;
+    for (size_t pc = 0; pc < prog.code.size(); pc++) {
+        const Instr& i = prog.code[pc];
+        if (i.k == IK::WaitEdge && i.events.empty() && i.sig < 0) slots.push_back(pc);
+    }
+    if (slots.empty()) return;
+    auto rs = readSet(prog);
+    if (rs.empty()) Lowerer::unsupported("@* in a block that reads no signals");
+    for (size_t pc : slots) prog.code[pc] = waitInstr(rs);
+}
+
+inline void rejectRecursive(const std::vector<Subr*>& subs) {
+    enum class Color { White, Gray, Black };
+    std::unordered_map<const Subr*, Color> color;
+    for (Subr* s : subs) color[s] = Color::White;
+    auto dfs = [&](auto& self, Subr* s) -> void {
+        color[s] = Color::Gray;
+        for (Subr* c : s->calls) {
+            if (color[c] == Color::Gray) Lowerer::unsupported("recursive subroutine");
+            if (color[c] == Color::White) self(self, c);
+        }
+        color[s] = Color::Black;
+    };
+    for (Subr* s : subs)
+        if (color[s] == Color::White) dfs(dfs, s);
+}
+
 inline LowerResult lower(slang::ast::Compilation& comp,
                          std::function<int(const std::string&, int)> mkSig,
                          std::function<int(int)> newDriver) {
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
-    SigCollector sc(std::move(mkSig), sigmap);
+    SigCollector sc(mkSig, sigmap);
     comp.getRoot().visit(sc);
-    ProcCollector pc(sigmap, out, std::move(newDriver));
+
+    struct Finder : slang::ast::ASTVisitor<Finder> {
+        std::vector<const slang::ast::SubroutineSymbol*> found;
+        void handle(const slang::ast::InstanceSymbol& inst) {
+            rejectNestedInstance(inst);
+            visitDefault(inst);
+        }
+        void handle(const slang::ast::SubroutineSymbol& s) { found.push_back(&s); }
+    };
+    Finder finder;
+    comp.getRoot().visit(finder);
+
+    std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*> subMap;
+    std::vector<std::unique_ptr<Subr>> owned;
+    std::vector<Subr*> order;
+    for (const slang::ast::SubroutineSymbol* sym : finder.found) {
+        if (subMap.count(sym)) continue;
+        auto sub = std::make_unique<Subr>();
+        out.subs.push_back(std::make_unique<Prog>());
+        sub->prog = out.subs.back().get();
+        sub->sym = sym;
+        if (sym->returnValVar) {
+            auto it = sigmap.find(sym->returnValVar);
+            if (it == sigmap.end()) Lowerer::unsupported("function return");
+            sub->retSig = it->second;
+            sub->retW = (int)sym->getReturnType().getBitWidth();
+            if (sub->retW <= 0 || sub->retW > 64) Lowerer::unsupported("function return width");
+            sub->retSgn = sym->getReturnType().isSigned();
+        }
+        for (const slang::ast::FormalArgumentSymbol* formal : sym->getArguments()) {
+            auto it = sigmap.find(formal);
+            if (it == sigmap.end()) Lowerer::unsupported("subroutine argument");
+            int w = (int)formal->getType().getBitWidth();
+            if (w <= 0 || w > 64) Lowerer::unsupported("subroutine argument width");
+            sub->args.push_back({it->second, formal->direction, w, formal->getType().isSigned()});
+        }
+        subMap[sym] = sub.get();
+        order.push_back(sub.get());
+        owned.push_back(std::move(sub));
+    }
+
+    int tempSeq = 0;
+    for (Subr* sub : order) {
+        if (sub->sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
+        Lowerer lw(sigmap);
+        lw.bind(&subMap, mkSig, &tempSeq);
+        lw.retSig = sub->retSig;
+        lw.current = sub;
+        lw.stmt(sub->sym->getBody());
+        *sub->prog = std::move(lw.prog);
+    }
+    for (Subr* sub : order) patchImplicit(*sub->prog);
+
+    ProcCollector pc(sigmap, out, std::move(newDriver), &subMap, mkSig, &tempSeq);
     comp.getRoot().visit(pc);
+    rejectRecursive(order);
     return out;
 }
