@@ -243,6 +243,81 @@ static std::vector<std::string> linesOf(const std::string& text) {
     return got;
 }
 
+static bool hasOp(const E& e, Op op) {
+    if (!e) return false;
+    if (e->op == op) return true;
+    for (const auto& k : e->kids)
+        if (hasOp(k, op)) return true;
+    return false;
+}
+
+static bool progHas(const Prog& p, Op op) {
+    for (const auto& i : p.code) {
+        if (hasOp(i.e, op)) return true;
+        for (const auto& a : i.args)
+            if (hasOp(a, op)) return true;
+    }
+    return false;
+}
+
+static int testDiv() {
+    S.finished = false;
+    S.mon.on = false;
+    S.mon.queued = false;
+    S.vcd.close();
+    S.active.clear();
+    S.inactive.clear();
+    S.postq.clear();
+    S.nbaq.clear();
+
+    Compiled c = compileSv(srcPath("examples/div.sv"), true);
+    if (c.result.procs.size() != 1) return fail("div proc count");
+    if (!progHas(c.result.procs[0].prog, Op::Div) || !progHas(c.result.procs[0].prog, Op::Mod))
+        return fail("div.sv did not lower / and %");
+    for (auto& pr : c.result.procs) S.spawn(exec(&pr.prog));
+
+    auto saved = std::filesystem::current_path();
+    auto tmp = std::filesystem::temp_directory_path() / "minisim-div-test";
+    std::filesystem::create_directories(tmp);
+    std::filesystem::current_path(tmp);
+    std::stringstream buf;
+    std::streambuf* old = std::cout.rdbuf(buf.rdbuf());
+    S.run(1000);
+    std::cout.rdbuf(old);
+    std::filesystem::current_path(saved);
+
+    const std::vector<std::string> want = {
+        "U_DIV 0010", "U_MOD 0001", "U_DIV15 0011", "U_MOD15 0011",
+        "U_0DIV1 0000", "U_0MOD1 0000", "U_HI_DIV 0111", "U_HI_MOD 0001",
+        "S_N_DIV 1110", "S_N_MOD 1111", "S_D_DIV 1110", "S_D_MOD 0001",
+        "S_ND_DIV 0010", "S_ND_MOD 1111", "S_M1_DIV 0000", "S_M1_MOD 1111",
+        "S_MIN2_DIV 1100", "S_MIN2_MOD 0000", "S_MIN1_DIV 1000", "S_MIN1_MOD 0000",
+        "U_DIV0 xxxx", "U_MOD0 xxxx", "S_DIV0 xxxx", "S_MOD0 xxxx",
+        "U_0DIV0 xxxx", "U_0MOD0 xxxx",
+        "X_N_DIV xxxx", "X_N_MOD xxxx", "X_D_DIV xxxx", "X_D_MOD xxxx",
+        "Z_N_DIV xxxx", "Z_N_MOD xxxx", "Z_D_DIV xxxx", "Z_D_MOD xxxx",
+        "X_S_DIV xxxx", "X_S_MOD xxxx",
+        "MIX_DIV 0100", "MIX_MOD 0000", "MIX_UD_DIV 0000", "MIX_UD_MOD 0111",
+        "CAST_U_DIV 0100", "CAST_U_MOD 0000", "CAST_S_DIV 1100", "CAST_S_MOD 0000",
+        "NARROW_MIN 1000", "NARROW_MIN_MOD 0000",
+        "WIDE_MIN 00001000", "WIDE_MIN_U 00001000", "WIDE_MIX 00000010",
+        "WIDE_S3 11111110", "WIDE_S3_MOD 11111110",
+        "S64_MIN1_DIV 1000000000000000000000000000000000000000000000000000000000000000",
+        "S64_MIN1_MOD 0000000000000000000000000000000000000000000000000000000000000000",
+        "S64_MIN3_DIV 1101010101010101010101010101010101010101010101010101010101010110",
+        "S64_MIN3_MOD 1111111111111111111111111111111111111111111111111111111111111110",
+    };
+    auto got = linesOf(buf.str());
+    if (got != want) {
+        std::cerr << "FAIL div stdout\n--- got ---\n";
+        for (auto& s : got) std::cerr << s << "\n";
+        std::cerr << "--- want ---\n";
+        for (auto& s : want) std::cerr << s << "\n";
+        return 1;
+    }
+    return 0;
+}
+
 // examples/signed.sv, checked against Icarus Verilog 13 (v13_0, dfeee909).
 // Dropping Val::sgn makes CMP_S print 0 and EXT_S print 00001000.
 static int testSigned() {
@@ -298,6 +373,7 @@ int main() {
     if (int rc = testCounter()) return rc;
     if (int rc = testChecks()) return rc;
     if (int rc = testSigned()) return rc;
+    if (int rc = testDiv()) return rc;
     std::cout << "ok\n";
     return 0;
 }

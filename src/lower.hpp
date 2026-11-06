@@ -16,8 +16,7 @@
 // when the operand is signed in that context (both operands signed, or an
 // assignment of a signed expression). $signed / $unsigned retag the bits.
 // Instantiating a module is an error until port connections are implemented.
-// Not yet:  compound assigns (+=), break/continue, net initializers (wire y = ..), a[i +: w], tasks/functions,
-//           division.
+// Not yet:  compound assigns (+=), break/continue, net initializers (wire y = ..), a[i +: w], tasks/functions.
 //
 // Usage:
 //   LowerResult r = lower(compilation,
@@ -139,6 +138,11 @@ struct Lowerer {
         }
     }
 
+    static bool isDivMod(slang::ast::BinaryOperator op) {
+        using slang::ast::BinaryOperator;
+        return op == BinaryOperator::Divide || op == BinaryOperator::Mod;
+    }
+
     static const slang::ast::Expression& peel(const slang::ast::Expression& e) {
         using namespace slang::ast;
         const Expression* p = &e;
@@ -253,10 +257,10 @@ struct Lowerer {
             }
             case ExpressionKind::BinaryOp: {
                 const auto& b = e.as<BinaryExpression>();
-                bool prop = widthPropagates(b.op);
+                bool sizeBoth = widthPropagates(b.op) || isDivMod(b.op);
                 bool shift = isShift(b.op);
                 E l, r;
-                if (prop || shift) {
+                if (sizeBoth || shift) {
                     // Shifts size only the left operand. The count stays
                     // self-determined and is always treated as unsigned.
                     int w = ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
@@ -274,6 +278,8 @@ struct Lowerer {
                     case BinaryOperator::Add: kop = Op::Add; break;
                     case BinaryOperator::Subtract: kop = Op::Sub; break;
                     case BinaryOperator::Multiply: kop = Op::Mul; break;
+                    case BinaryOperator::Divide: kop = Op::Div; break;
+                    case BinaryOperator::Mod: kop = Op::Mod; break;
                     case BinaryOperator::BinaryAnd: kop = Op::And; break;
                     case BinaryOperator::BinaryOr: kop = Op::Or; break;
                     case BinaryOperator::BinaryXor: kop = Op::Xor; break;
@@ -295,7 +301,7 @@ struct Lowerer {
                     default: unsupported("binary operator");
                 }
                 E out = bin(kop, l, r);
-                if (prop || shift) return out;
+                if (sizeBoth || shift) return out;
                 return sized(out, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             case ExpressionKind::ConditionalOp: {

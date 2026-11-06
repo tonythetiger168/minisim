@@ -10,8 +10,9 @@
 // its MSB (0, 1, X, or Z). An unsigned >>> is a logical >>.
 // Val::sgn is the signedness of an expression result. Nets store bits only;
 // a read comes back unsigned and the expression that reads it sets sgn.
-// Add, subtract, multiply, equality, and the relational operators are signed
-// only when both operands are signed. Otherwise they zero-extend.
+// Add, subtract, multiply, divide, remainder, equality, and the relational
+// operators are signed only when both operands are signed. Otherwise they
+// zero-extend.
 // ?: with a known 0/1 condition selects that arm, Z included. With an X or Z
 // condition, a bit is kept when both arms have that same 0, 1, X, or Z;
 // any other pair becomes X (IEEE 1364/1800 conditional operator).
@@ -114,6 +115,27 @@ inline Val arith(Val a, Val b, F f) {
 inline Val v_add(Val a, Val b) { return arith(a, b, [](uint64_t x, uint64_t y) { return x + y; }); }
 inline Val v_sub(Val a, Val b) { return arith(a, b, [](uint64_t x, uint64_t y) { return x - y; }); }
 inline Val v_mul(Val a, Val b) { return arith(a, b, [](uint64_t x, uint64_t y) { return x * y; }); }
+
+// Negate a w-bit pattern. The minimum negative value has magnitude 2^(w-1),
+// which fits in uint64_t through 64 bits. Negating that pattern with a
+// signed integer is undefined at 64 bits, so the magnitude stays unsigned.
+inline uint64_t neg_w(uint64_t v, int w) { return (0 - v) & mask(w); }
+inline Val v_divmod(Val a, Val b, bool rem) {
+    align_signed(a, b);
+    if (a.x || b.x || b.v == 0) return make(0, ~0ULL, a.w, 0, a.sgn);
+    uint64_t av = a.v, bv = b.v;
+    bool nq = false, nr = false;
+    if (a.sgn) {
+        uint64_t sign = 1ULL << (a.w >= 64 ? 63 : a.w - 1);
+        if (av & sign) { av = neg_w(av, a.w); nq = nr = true; }
+        if (bv & sign) { bv = neg_w(bv, a.w); nq = !nq; }
+    }
+    uint64_t bits = rem ? av % bv : av / bv;
+    if (rem ? nr : nq) bits = neg_w(bits, a.w);
+    return make(bits, 0, a.w, 0, a.sgn);
+}
+inline Val v_div(Val a, Val b) { return v_divmod(a, b, false); }
+inline Val v_mod(Val a, Val b) { return v_divmod(a, b, true); }
 
 // ---- comparison (1-bit result) ----
 inline Val v_eq(Val a, Val b) {
@@ -247,7 +269,7 @@ inline Val v_resolve(Val a, Val b) {
 // ================= expression tree =================
 enum class Op {
     Const, Ref,
-    Not, And, Or, Xor, Add, Sub, Mul,
+    Not, And, Or, Xor, Add, Sub, Mul, Div, Mod,
     Eq, Ne, CaseEq, CaseZEq, CaseXEq, Lt, Le, Gt, Ge, Shl, Shr, Asr, Resize,
     LogNot, LogAnd, LogOr, RedAnd, RedOr, RedXor,
     Slice, Index, Concat, Mux
@@ -314,6 +336,8 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::Add: return v_add(k(0), k(1));
         case Op::Sub: return v_sub(k(0), k(1));
         case Op::Mul: return v_mul(k(0), k(1));
+        case Op::Div: return v_div(k(0), k(1));
+        case Op::Mod: return v_mod(k(0), k(1));
         case Op::Eq: return v_eq(k(0), k(1));
         case Op::Ne: return v_ne(k(0), k(1));
         case Op::CaseEq: return v_case_eq(k(0), k(1));
