@@ -129,8 +129,6 @@ struct Lowerer {
             case BinaryOperator::Add:
             case BinaryOperator::Subtract:
             case BinaryOperator::Multiply:
-            case BinaryOperator::Divide:
-            case BinaryOperator::Mod:
             case BinaryOperator::BinaryAnd:
             case BinaryOperator::BinaryOr:
             case BinaryOperator::BinaryXor:
@@ -138,6 +136,11 @@ struct Lowerer {
             default:
                 return false;
         }
+    }
+
+    static bool isDivMod(slang::ast::BinaryOperator op) {
+        using slang::ast::BinaryOperator;
+        return op == BinaryOperator::Divide || op == BinaryOperator::Mod;
     }
 
     static const slang::ast::Expression& peel(const slang::ast::Expression& e) {
@@ -153,11 +156,8 @@ struct Lowerer {
     // the self-determined widening slang inserts underneath it, so
     // `cnt <= cnt + 1` with cnt 4 bits is a 4-bit add, not a 32-bit add sliced
     // down. Add/sub/mul stay congruent mod 2^w, signed or not, once operands
-    // are extended to that width. Division and remainder use that same width.
-    // A narrow signed minimum divided by -1 wraps; a wider context holds the
-    // positive quotient, so the result is not congruent across widths.
-    // Sign-extension is not congruent that way for shifts or compares, so
-    // those extend before the operator.
+    // are extended to that width. Sign-extension is not congruent that way
+    // for shifts or compares, so those extend before the operator.
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
         switch (e.kind) {
@@ -257,10 +257,10 @@ struct Lowerer {
             }
             case ExpressionKind::BinaryOp: {
                 const auto& b = e.as<BinaryExpression>();
-                bool prop = widthPropagates(b.op);
+                bool sizeBoth = widthPropagates(b.op) || isDivMod(b.op);
                 bool shift = isShift(b.op);
                 E l, r;
-                if (prop || shift) {
+                if (sizeBoth || shift) {
                     // Shifts size only the left operand. The count stays
                     // self-determined and is always treated as unsigned.
                     int w = ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
@@ -301,7 +301,7 @@ struct Lowerer {
                     default: unsupported("binary operator");
                 }
                 E out = bin(kop, l, r);
-                if (prop || shift) return out;
+                if (sizeBoth || shift) return out;
                 return sized(out, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             case ExpressionKind::ConditionalOp: {

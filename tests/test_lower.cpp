@@ -260,9 +260,6 @@ static bool progHas(const Prog& p, Op op) {
     return false;
 }
 
-// examples/div.sv, checked against Icarus Verilog 13 (v13_0, dfeee909).
-// An unsigned-only divide prints S_N_DIV 0010 (9/3) instead of 1110.
-// Ignoring X prints X_N_DIV 0100. Skipping the width push prints WIDE_MIN 11111000.
 static int testDiv() {
     S.finished = false;
     S.mon.on = false;

@@ -66,8 +66,6 @@ int main(){
   Val ev = eval(ext, [&](int) { return u4; });
   assert(ev.w == 8 && ev.v == 0xF8 && ev.sgn);
 
-  // Division truncates toward zero. Remainder takes the dividend's sign.
-  // Same bits, signed vs unsigned, disagree: 1110/0010 is -1 signed and 7 unsigned.
   Val m2 = make(0b1110, 0, 4, 0, true);
   Val p2 = make(0b0010, 0, 4, 0, true);
   Val sq = v_div(m2, p2);
@@ -77,7 +75,6 @@ int main(){
   assert(v_div(mk(7, 4), mk(3, 4)).v == 2 && v_mod(mk(7, 4), mk(3, 4)).v == 1);
   assert(v_div(mk(0, 4), mk(1, 4)).v == 0 && v_div(mk(0, 4), mk(1, 4)).x == 0);
   assert(v_mod(mk(0, 4), mk(1, 4)).v == 0);
-  // Negative numerator, negative denominator, and both.
   Val m7 = make(0b1001, 0, 4, 0, true);
   Val p3 = make(0b0011, 0, 4, 0, true);
   Val n3 = make(0b1101, 0, 4, 0, true);
@@ -85,14 +82,12 @@ int main(){
   assert(v_div(m7, p3).v == 0b1110 && v_mod(m7, p3).v == 0b1111);
   assert(v_div(p7, n3).v == 0b1110 && v_mod(p7, n3).v == 0b0001);
   assert(v_div(m7, n3).v == 0b0010 && v_mod(m7, n3).v == 0b1111);
-  // Either operand unsigned: zero-extend, so -8 is 8.
   Val m8 = make(0b1000, 0, 4, 0, true);
   Val mixed = v_div(m8, mk(2, 4));
   assert(mixed.v == 4 && mixed.w == 4 && !mixed.sgn);
   assert(v_mod(m8, mk(3, 4)).v == 2 && !v_mod(m8, mk(3, 4)).sgn);
   assert(v_div(mk(7, 4), n3).v == 0 && !v_div(mk(7, 4), n3).sgn);
   assert(v_mod(mk(7, 4), n3).v == 7);
-  // 4-bit minimum / -1 wraps to the same bits. Widened first, the quotient fits.
   Val m1 = make(0b1111, 0, 4, 0, true);
   assert(v_div(m8, m1).v == 0b1000 && v_mod(m8, m1).v == 0 && v_div(m8, m1).sgn);
   Val m8w = v_resize(m8, 8, true); m8w.sgn = true;
@@ -102,7 +97,6 @@ int main(){
   Val p3w = make(3, 0, 8, 0, true);
   assert(v_div(m8, p3w).v == 0xFE && v_div(m8, p3w).w == 8 && v_div(m8, p3w).sgn);
   assert(v_mod(m8, p3w).v == 0xFE);
-  // 64-bit minimum. Magnitude is 2^63, which the unsigned word can hold.
   Val smin = make(1ULL << 63, 0, 64, 0, true);
   Val sm1 = make(~0ULL, 0, 64, 0, true);
   Val s3 = make(3, 0, 64, 0, true);
@@ -110,7 +104,6 @@ int main(){
   assert(v_mod(smin, sm1).v == 0 && v_mod(smin, sm1).x == 0);
   assert(v_div(smin, s3).v == 0xD555555555555556ULL && v_div(smin, s3).sgn);
   assert(v_mod(smin, s3).v == 0xFFFFFFFFFFFFFFFEULL);
-  // Any X or Z bit, or a zero divisor, is all X. Z does not survive.
   assert(v_div(make(0b1000, 0b0001, 4), p2).x == 0xF && v_div(make(0b1000, 0b0001, 4), p2).v == 0);
   assert(v_mod(p7, make(0b0010, 0b0001, 4)).x == 0xF);
   Val zx = v_div(allz(4), mk(2, 4));
@@ -121,7 +114,6 @@ int main(){
   assert(v_div(mk(7, 4), mk(0, 4)).x == 0xF && v_mod(mk(7, 4), mk(0, 4)).x == 0xF);
   assert(v_div(m8, make(0, 0, 4, 0, true)).x == 0xF && v_mod(m8, make(0, 0, 4, 0, true)).x == 0xF);
   assert(v_div(mk(0, 4), mk(0, 4)).x == 0xF);
-  // The tree, not only the helper. A missing case returns a 1-bit X.
   auto ed = bin(Op::Div, ref(0, true), ref(1, true));
   Val edv = eval(ed, [&](int s) { return s == 0 ? mk(0b1110, 4) : mk(0b0010, 4); });
   assert(edv.v == 0b1111 && edv.w == 4 && edv.sgn && edv.x == 0);

@@ -12,9 +12,7 @@
 // a read comes back unsigned and the expression that reads it sets sgn.
 // Add, subtract, multiply, divide, remainder, equality, and the relational
 // operators are signed only when both operands are signed. Otherwise they
-// zero-extend. Divide and remainder truncate toward zero. The remainder
-// takes the sign of the dividend. A zero divisor, or any X or Z bit in
-// either operand, makes every result bit X.
+// zero-extend.
 // ?: with a known 0/1 condition selects that arm, Z included. With an X or Z
 // condition, a bit is kept when both arms have that same 0, 1, X, or Z;
 // any other pair becomes X (IEEE 1364/1800 conditional operator).
@@ -108,7 +106,6 @@ inline Val v_not(Val a) { return make(~a.v, a.x, a.w, 0, a.sgn); }
 // Both signed: sign-extend to the wider operand, result stays signed.
 // Either unsigned: zero-extend, result is unsigned. Two's-complement
 // add/sub/mul then matches an unsigned op on those extended bits.
-// Divide and remainder do not: the sign selects the operation.
 template <class F>
 inline Val arith(Val a, Val b, F f) {
     align_signed(a, b);

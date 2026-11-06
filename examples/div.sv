@@ -1,9 +1,3 @@
-// Division and remainder against Icarus Verilog 13.
-// Toward zero. Remainder takes the dividend's sign.
-// Either operand unsigned makes the expression unsigned.
-// A zero divisor, or any X or Z bit, makes every result bit X.
-// The operator takes the assignment width, same as multiply.
-// A 4-bit signed minimum divided by -1 wraps; the 8-bit context fits.
 // Each case uses its own variables. One initial that reuses a variable
 // makes Verilator 5.052 keep only the last write and print the earlier
 // quotients as zero.
