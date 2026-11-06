@@ -6,8 +6,8 @@
 //                non-blocking assign to a variable, a[const], a[hi:lo],
 //                compound assign (+= -= *= /= %= &= |= ^= <<= >>= <<<= >>>=),
 //                @(posedge/negedge/any sig [or ...]), @*, always_comb,
-//                for/while/do/forever/repeat(const), #<literal>,
-//                $display / $strobe / $monitor / $finish, assign
+//                for/while/do/forever/repeat(const), break/continue,
+//                #<literal>, $display / $strobe / $monitor / $finish, assign
 //   expressions: literals, variable refs, unary/binary ops, ?:, {concat},
 //                a[expr], a[hi:lo]
 // Assumes vectors are declared [N-1:0] (zero-based) so index == bit position.
@@ -17,7 +17,7 @@
 // when the operand is signed in that context (both operands signed, or an
 // assignment of a signed expression). $signed / $unsigned retag the bits.
 // Instantiating a module is an error until port connections are implemented.
-// Not yet:  break/continue, net initializers (wire y = ..), a[i +: w], tasks/functions.
+// Not yet:  net initializers (wire y = ..), a[i +: w], tasks/functions.
 //
 // Usage:
 //   LowerResult r = lower(compilation,
@@ -69,11 +69,28 @@ struct Lowerer {
     // binary operator, and its left operand is an LValueReference: the target's
     // type, and no symbol. The read is the assignment's left expression.
     const slang::ast::Expression* lvalue = nullptr;
+    // Innermost loop is back(). break and continue emit Jmp; the pc is filled
+    // in when that loop's end (break) or continuation (continue) is known.
+    struct LoopJumps {
+        std::vector<size_t> breaks;
+        std::vector<size_t> continues;
+    };
+    std::vector<LoopJumps> loops;
 
     explicit Lowerer(std::unordered_map<const slang::ast::Symbol*, int>& m) : sigmap(m) {}
 
     [[noreturn]] static void unsupported(const char* what) {
         throw std::runtime_error(std::string("lower: unsupported ") + what);
+    }
+
+    size_t emitJmp() {
+        Instr j;
+        j.k = IK::Jmp;
+        return prog.emit(j);
+    }
+    void patch(std::vector<size_t>& sites, size_t target) {
+        for (size_t pc : sites) prog.code[pc].target = target;
+        sites.clear();
     }
 
     // Constant integer from a literal or a slang-folded constant expression.
@@ -556,6 +573,16 @@ struct Lowerer {
                 }
                 break;
             }
+            case StatementKind::Break: {
+                if (loops.empty()) unsupported("break outside a loop");
+                loops.back().breaks.push_back(emitJmp());
+                break;
+            }
+            case StatementKind::Continue: {
+                if (loops.empty()) unsupported("continue outside a loop");
+                loops.back().continues.push_back(emitJmp());
+                break;
+            }
             case StatementKind::ForLoop: {
                 const auto& f = s.as<ForLoopStatement>();
                 for (const VariableSymbol* v : f.loopVars)
@@ -566,10 +593,16 @@ struct Lowerer {
                 for (const Expression* e : f.initializers) exprStmt(*e);
                 size_t top = prog.here(), jf = (size_t)-1;
                 if (f.stopExpr) { Instr j; j.k = IK::JmpIfNot; j.e = expr(*f.stopExpr); jf = prog.emit(j); }
+                loops.push_back({});
                 stmt(f.body);
+                // continue lands on the step. The step then falls into the
+                // back-edge, which checks the condition again.
+                patch(loops.back().continues, prog.here());
                 for (const Expression* e : f.steps) exprStmt(*e);
                 Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
                 if (jf != (size_t)-1) prog.code[jf].target = prog.here();
+                patch(loops.back().breaks, prog.here());
+                loops.pop_back();
                 break;
             }
             case StatementKind::WhileLoop: {
@@ -577,32 +610,53 @@ struct Lowerer {
                 size_t top = prog.here();
                 Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
                 size_t jf = prog.emit(j);
+                loops.push_back({});
                 stmt(w.body);
+                patch(loops.back().continues, prog.here());
                 Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
                 prog.code[jf].target = prog.here();
+                patch(loops.back().breaks, prog.here());
+                loops.pop_back();
                 break;
             }
             case StatementKind::DoWhileLoop: {
                 const auto& w = s.as<DoWhileLoopStatement>();
                 size_t top = prog.here();
+                loops.push_back({});
                 stmt(w.body);
+                // continue tests the condition before another trip through the body.
+                patch(loops.back().continues, prog.here());
                 Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
                 size_t jf = prog.emit(j);
                 Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
                 prog.code[jf].target = prog.here();
+                patch(loops.back().breaks, prog.here());
+                loops.pop_back();
                 break;
             }
             case StatementKind::ForeverLoop: {
                 size_t top = prog.here();
+                loops.push_back({});
                 stmt(s.as<ForeverLoopStatement>().body);
+                patch(loops.back().continues, prog.here());
                 Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                patch(loops.back().breaks, prog.here());
+                loops.pop_back();
                 break;
             }
             case StatementKind::RepeatLoop: {   // constant count only: unrolled
                 const auto& r = s.as<RepeatLoopStatement>();
                 int64_t n = constInt(r.count);
                 if (n > 1024) unsupported("repeat count > 1024 (unrolled)");
-                for (int64_t k = 0; k < n; k++) stmt(r.body);
+                loops.push_back({});
+                for (int64_t k = 0; k < n; k++) {
+                    stmt(r.body);
+                    // The next copy is the next iteration. After the last copy,
+                    // continue leaves the loop.
+                    patch(loops.back().continues, prog.here());
+                }
+                patch(loops.back().breaks, prog.here());
+                loops.pop_back();
                 break;
             }
             case StatementKind::Case: {

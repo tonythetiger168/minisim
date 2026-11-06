@@ -16,7 +16,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Coroutine processes**: `initial` / `always` as C++20 coroutines (`co_await Delay`, `co_await Wait`)
 - **Multi-event waits**: `@(posedge clk or negedge rst_n)`, `@*`, `always_comb`
 - **Resolved nets**: several `assign`s to one wire resolve per bit (Z yields, conflicts give X)
-- **`case` / `casez` / `casex`**, part-selects, bit-selects, `for` / `while` / `repeat`
+- **`case` / `casez` / `casex`**, part-selects, bit-selects, `for` / `while` / `do` / `forever` / `repeat`, `break` / `continue`
 - **VCD output** (`dump.vcd`) for GTKWave
 
 ## Layout
@@ -55,7 +55,7 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 
 - Signals up to 64 bits; no strengths
 - Instantiating a module is an error until port connections are implemented
-- Not yet lowered: `break`/`continue`, net initializers, tasks/functions
+- Not yet lowered: net initializers, tasks/functions
 - System tasks other than `$display` / `$strobe` / `$monitor` / `$finish` are ignored. Format is the kernel's `%b`, `%d`, and literal text
 - Vectors assumed declared `[N-1:0]`
 

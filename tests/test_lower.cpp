@@ -441,6 +441,61 @@ static int testCompound() {
     return 0;
 }
 
+// examples/breakcont.sv. break leaves the innermost loop. continue in a for
+// still runs the step, so FOR_CONT_I is 4 and FOR_CONT_G is 4. The guard ends
+// that loop if the step is skipped, and those counts then disagree.
+static int testBreak() {
+    S.finished = false;
+    S.mon.on = false;
+    S.mon.queued = false;
+    S.vcd.close();
+    S.active.clear();
+    S.inactive.clear();
+    S.postq.clear();
+    S.nbaq.clear();
+
+    Compiled c = compileSv(srcPath("examples/breakcont.sv"), true);
+    if (c.result.procs.size() != 1) return fail("breakcont proc count");
+    for (auto& pr : c.result.procs) S.spawn(exec(&pr.prog));
+
+    auto saved = std::filesystem::current_path();
+    auto tmp = std::filesystem::temp_directory_path() / "minisim-break-test";
+    std::filesystem::create_directories(tmp);
+    std::filesystem::current_path(tmp);
+    std::stringstream buf;
+    std::streambuf* old = std::cout.rdbuf(buf.rdbuf());
+    S.run(1000);
+    std::cout.rdbuf(old);
+    std::filesystem::current_path(saved);
+
+    const std::vector<std::string> want = {
+        "FOR_BRK 0000", "FOR_BRK 0001", "FOR_BRK_I 0010", "FOR_BRK_G 0011",
+        "FOR_CONT 0000", "FOR_CONT 0010", "FOR_CONT 0011",
+        "FOR_CONT_I 0100", "FOR_CONT_G 0100", "FOR_CONT_S 0011",
+        "WH_BRK 0000", "WH_BRK 0001", "WH_BRK_I 0010",
+        "WH_CONT 0001", "WH_CONT 0011", "WH_CONT 0100", "WH_CONT_I 0100",
+        "NEST_BRK 0000 0000", "NEST_BRK 0001 0000", "NEST_BRK 0010 0000",
+        "NEST_CONT 0000 0000", "NEST_CONT 0000 0010",
+        "NEST_CONT 0001 0000", "NEST_CONT 0001 0010",
+        "CASE 0000", "CASE_I 0010", "CASE_G 0011", "CASE_S 0001",
+        "DO_BRK 0000", "DO_BRK 0001", "DO_BRK_I 0010",
+        "DO_CONT 0000", "DO_CONT_I 1010",
+        "FV_BRK 0000", "FV_BRK 0001", "FV_BRK 0010", "FV_BRK_I 0011", "FV_BRK_G 0100",
+        "FV_CONT 0001", "FV_CONT 0011", "FV_CONT 0100", "FV_CONT_I 0100", "FV_CONT_G 0100",
+        "RP_BRK 0000", "RP_BRK 0001", "RP_BRK_I 0001",
+        "RP_CONT 0001", "RP_CONT 0011", "RP_CONT 0100", "RP_CONT_I 0100",
+    };
+    auto got = linesOf(buf.str());
+    if (got != want) {
+        std::cerr << "FAIL breakcont stdout\n--- got ---\n";
+        for (auto& s : got) std::cerr << s << "\n";
+        std::cerr << "--- want ---\n";
+        for (auto& s : want) std::cerr << s << "\n";
+        return 1;
+    }
+    return 0;
+}
+
 int main() {
     if (int rc = testHier()) return rc;
     if (int rc = testCounter()) return rc;
@@ -448,6 +503,7 @@ int main() {
     if (int rc = testSigned()) return rc;
     if (int rc = testDiv()) return rc;
     if (int rc = testCompound()) return rc;
+    if (int rc = testBreak()) return rc;
     std::cout << "ok\n";
     return 0;
 }
