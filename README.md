@@ -10,7 +10,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 
 - **4-state logic** (0/1/X/Z) up to 64 bits, with Verilog X-propagation rules
 - **Event-driven kernel**: time wheel, active / inactive (`#0`) / NBA / postponed regions
-- **`$display` / `$strobe` / `$monitor`** on the process IR. `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Format is `%b`, `%d`, and literal text. The slang lowerer does not emit these yet.
+- **`$display` / `$strobe` / `$monitor`** on the process IR, including from the slang lowerer. `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Format is `%b`, `%d`, and literal text.
 - **Coroutine processes**: `initial` / `always` as C++20 coroutines (`co_await Delay`, `co_await Wait`)
 - **Multi-event waits**: `@(posedge clk or negedge rst_n)`, `@*`, `always_comb`
 - **Resolved nets**: several `assign`s to one wire resolve per bit (Z yields, conflicts give X)
@@ -25,7 +25,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/prog.hpp` | Process IR: a flat instruction list per `always`/`initial` |
 | `src/exec.inc` | Coroutine that interprets a `Prog` |
 | `src/minisim.cpp` | Kernel (scheduler, nets, VCD) and a hand-built counter demo |
-| `src/lower.hpp` | slang AST to `Prog` lowering (**not yet compiled against slang**) |
+| `src/lower.hpp` | slang AST to `Prog` (flat module; a nested instance is an error) |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `tests/` | Unit tests for the value library |
 
@@ -42,16 +42,19 @@ gtkwave dump.vcd
 With the slang front end (downloads and builds slang, takes a while):
 
 ```sh
-cmake -B build -DMINISIM_WITH_SLANG=ON
+CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON
 cmake --build build -j
 ./build/slang_dump examples/counter.sv
 ```
 
+slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
+
 ## Known limits
 
 - Signals up to 64 bits; no signed arithmetic, division, or strengths
-- `lower.hpp` is written against slang's API from memory and needs verification
-- Not yet lowered: compound assigns (`+=`), `break`/`continue`, net initializers, tasks/functions, hierarchy. `$display` / `$strobe` / `$monitor` exist as kernel instructions; `lower.hpp` still ignores the calls
+- Instantiating a module is an error until port connections are implemented
+- Not yet lowered: compound assigns (`+=`), `break`/`continue`, net initializers, tasks/functions
+- System tasks other than `$display` / `$strobe` / `$monitor` / `$finish` are ignored. Format is the kernel's `%b`, `%d`, and literal text
 - Vectors assumed declared `[N-1:0]`
 
 ## License

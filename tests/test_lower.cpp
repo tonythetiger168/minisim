@@ -1,0 +1,237 @@
+// Lower a flat module with slang and run it on the kernel.
+//
+// counter.sv's always_ff is the same six instructions as the hand-built demo,
+// and cnt+1 is 4 bits (15 wraps to 0), not the unsized literal's 32.
+// checks.sv is also run on Icarus Verilog 13: an 8-bit context makes
+// 4'hF+4'h1 equal 00010000, the 4-bit context wraps to 0000, and
+// b=0; b<=1; $display prints 0 while $strobe / $monitor print 1.
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "lower.hpp"
+#include "slang/diagnostics/DiagnosticEngine.h"
+#include "slang/diagnostics/TextDiagnosticClient.h"
+#include "slang/syntax/SyntaxTree.h"
+
+#define MINISIM_NO_MAIN
+#include "minisim.cpp"
+
+static int fail(const std::string& msg) {
+    std::cerr << "FAIL " << msg << "\n";
+    return 1;
+}
+
+static std::string srcPath(const char* rel) {
+    return std::string(MINISIM_SOURCE_DIR) + "/" + rel;
+}
+
+struct Compiled {
+    LowerResult result;
+    std::unordered_map<std::string, int> id;
+};
+
+static Compiled compileSv(const std::string& path, bool intoSim) {
+    auto tree = slang::syntax::SyntaxTree::fromFile(path);
+    if (!tree) throw std::runtime_error("cannot read " + path);
+
+    slang::ast::Compilation comp;
+    comp.addSyntaxTree(tree.value());
+
+    slang::DiagnosticEngine engine(*comp.getSourceManager());
+    auto client = std::make_shared<slang::TextDiagnosticClient>();
+    engine.addClient(client);
+    bool errors = false;
+    for (auto& d : comp.getAllDiagnostics()) {
+        engine.issue(d);
+        if (d.isError()) errors = true;
+    }
+    std::string msgs = client->getString();
+    if (errors) throw std::runtime_error(msgs.empty() ? "slang error in " + path : msgs);
+
+    Compiled out;
+    int next = 0;
+    out.result = lower(
+        comp,
+        [&](const std::string& n, int w) {
+            int id = intoSim ? S.sig(n, w) : next++;
+            out.id[n] = id;
+            return id;
+        },
+        [&](int s) { return intoSim ? S.newDriver(s) : 0; });
+    return out;
+}
+
+static std::string describe(const E& e) {
+    if (!e) return "null";
+    if (e->op == Op::Const)
+        return "const w=" + std::to_string(e->k.w) + " v=" + std::to_string(e->k.v);
+    if (e->op == Op::Ref) return "ref " + std::to_string(e->sig);
+    if (e->op == Op::Add) return "add(" + describe(e->kids[0]) + ", " + describe(e->kids[1]) + ")";
+    if (e->op == Op::Concat) return "concat(" + std::to_string(e->kids.size()) + ")";
+    return "op";
+}
+
+static const char* ikName(IK k) {
+    switch (k) {
+        case IK::Assign: return "Assign";
+        case IK::Nba: return "Nba";
+        case IK::JmpIfNot: return "JmpIfNot";
+        case IK::Jmp: return "Jmp";
+        case IK::WaitEdge: return "WaitEdge";
+        case IK::WaitDelay: return "WaitDelay";
+        case IK::Finish: return "Finish";
+        case IK::Display: return "Display";
+        case IK::Strobe: return "Strobe";
+        case IK::Monitor: return "Monitor";
+    }
+    return "?";
+}
+
+static int testHier() {
+    bool threw = false;
+    std::string msg;
+    try {
+        compileSv(srcPath("examples/hier.sv"), false);
+    } catch (const std::exception& ex) {
+        threw = true;
+        msg = ex.what();
+    }
+    if (!threw) return fail("hier.sv did not throw");
+    if (msg.find("not supported") == std::string::npos ||
+        msg.find("port connections") == std::string::npos)
+        return fail("hier.sv threw an unexpected error: " + msg);
+    return 0;
+}
+
+static int testCounter() {
+    Compiled c = compileSv(srcPath("examples/counter.sv"), false);
+    if (c.result.procs.size() != 1) return fail("counter proc count");
+    if (!c.result.procs[0].loops) return fail("always_ff should loop");
+    const Prog& p = c.result.procs[0].prog;
+    if (p.code.size() != 6) {
+        std::string s = "counter instr count " + std::to_string(p.code.size()) + ":";
+        for (auto& i : p.code) s += std::string(" ") + ikName(i.k);
+        return fail(s);
+    }
+    int clk = c.id.at("clk"), rst = c.id.at("rst"), cnt = c.id.at("cnt");
+    const auto& code = p.code;
+    if (code[0].k != IK::WaitEdge || code[0].sig != clk || code[0].edge != POS)
+        return fail("counter[0] posedge clk");
+    if (code[1].k != IK::JmpIfNot || code[1].target != 4 || !code[1].e ||
+        code[1].e->op != Op::Ref || code[1].e->sig != rst)
+        return fail("counter[1] if (rst)");
+    if (code[2].k != IK::Nba || code[2].sig != cnt || !code[2].e || code[2].e->op != Op::Const ||
+        code[2].e->k.w != 4 || code[2].e->k.v != 0)
+        return fail("counter[2] NBA 0 should be 4-bit, got " + describe(code[2].e));
+    if (code[3].k != IK::Jmp || code[3].target != 5) return fail("counter[3] else jump");
+    if (code[4].k != IK::Nba || code[4].sig != cnt || !code[4].e || code[4].e->op != Op::Add)
+        return fail("counter[4] NBA cnt+1, got " + describe(code[4].e));
+    const E& add = code[4].e;
+    if (add->kids.size() != 2 || add->kids[0]->op != Op::Ref || add->kids[0]->sig != cnt ||
+        add->kids[1]->op != Op::Const || add->kids[1]->k.w != 4 || add->kids[1]->k.v != 1)
+        return fail("counter cnt+1 should be 4-bit, got " + describe(add));
+    if (code[5].k != IK::Jmp || code[5].target != 0) return fail("counter[5] loop");
+
+    // 15+1 in that 4-bit add wraps to 0. A 32-bit unsized +1 would be 16.
+    Val wrapped = eval(add, [&](int s) { return s == cnt ? mk(15, 4) : mk(0, 1); });
+    if (wrapped.w != 4 || wrapped.v != 0 || wrapped.x != 0)
+        return fail("4-bit 15+1 wrapped to w=" + std::to_string(wrapped.w) +
+                    " v=" + std::to_string(wrapped.v));
+    return 0;
+}
+
+static const Instr* findAssign(const Prog& p, int sig) {
+    for (auto& i : p.code)
+        if ((i.k == IK::Assign || i.k == IK::Nba) && i.sig == sig) return &i;
+    return nullptr;
+}
+
+static int testChecks() {
+    Compiled c = compileSv(srcPath("examples/checks.sv"), true);
+    if (c.result.procs.size() != 1) return fail("checks proc count");
+    if (c.result.procs[0].loops) return fail("initial should not loop");
+    const Prog& p = c.result.procs[0].prog;
+
+    const IK wantK[] = {IK::Assign, IK::Display, IK::Assign, IK::Display, IK::Assign,
+                        IK::Nba,    IK::Display, IK::Strobe, IK::Monitor, IK::Finish};
+    if (p.code.size() != 10) {
+        std::string s = "checks instr count " + std::to_string(p.code.size()) + ":";
+        for (auto& i : p.code) s += std::string(" ") + ikName(i.k);
+        return fail(s);
+    }
+    for (int i = 0; i < 10; i++)
+        if (p.code[i].k != wantK[i])
+            return fail(std::string("checks instr ") + std::to_string(i) + " is " + ikName(p.code[i].k));
+
+    if (p.code[1].fmt != "W %b" || p.code[3].fmt != "N %b" || p.code[6].fmt != "D %b")
+        return fail("display formats: [" + p.code[1].fmt + "] [" + p.code[3].fmt + "] [" +
+                    p.code[6].fmt + "]");
+    if (p.code[7].fmt != "S %b" || p.code[7].k != IK::Strobe) return fail("strobe format");
+    if (p.code[8].fmt != "M %b" || p.code[8].k != IK::Monitor) return fail("monitor format");
+    if (p.code[9].k != IK::Finish) return fail("finish");
+
+    int wide = c.id.at("wide"), narrow = c.id.at("narrow"), b = c.id.at("b");
+    const Instr* wAsg = findAssign(p, wide);
+    const Instr* nAsg = findAssign(p, narrow);
+    if (!wAsg || !wAsg->e || wAsg->e->op != Op::Add) return fail("wide rhs " + describe(wAsg ? wAsg->e : E{}));
+    if (!nAsg || !nAsg->e || nAsg->e->op != Op::Add) return fail("narrow rhs " + describe(nAsg ? nAsg->e : E{}));
+    auto litOk = [](const E& e, int w, uint64_t v) {
+        return e && e->op == Op::Const && e->k.w == w && e->k.v == v && e->k.x == 0;
+    };
+    if (!litOk(wAsg->e->kids[0], 8, 15) || !litOk(wAsg->e->kids[1], 8, 1))
+        return fail("wide add should be 8-bit 15+1, got " + describe(wAsg->e));
+    if (!litOk(nAsg->e->kids[0], 4, 15) || !litOk(nAsg->e->kids[1], 4, 1))
+        return fail("narrow add should be 4-bit 15+1, got " + describe(nAsg->e));
+
+    Val wideV = eval(wAsg->e, [](int) { return mk(0, 1); });
+    Val narrowV = eval(nAsg->e, [](int) { return mk(0, 1); });
+    if (wideV.w != 8 || wideV.v != 16) return fail("wide eval");
+    if (narrowV.w != 4 || narrowV.v != 0) return fail("narrow eval");
+
+    for (auto& pr : c.result.procs) S.spawn(exec(&pr.prog));
+
+    auto saved = std::filesystem::current_path();
+    auto tmp = std::filesystem::temp_directory_path() / "minisim-lower-test";
+    std::filesystem::create_directories(tmp);
+    std::filesystem::current_path(tmp);
+    std::stringstream buf;
+    std::streambuf* old = std::cout.rdbuf(buf.rdbuf());
+    S.run(1000);
+    std::cout.rdbuf(old);
+    std::filesystem::current_path(saved);
+
+    const std::vector<std::string> want = {"W 00010000", "N 0000", "D 0", "S 1", "M 1"};
+    std::vector<std::string> got;
+    std::string cur;
+    for (char ch : buf.str()) {
+        if (ch == '\n') { got.push_back(cur); cur.clear(); }
+        else cur.push_back(ch);
+    }
+    if (!cur.empty()) got.push_back(cur);
+    if (got != want) {
+        std::cerr << "FAIL checks stdout\n--- got ---\n";
+        for (auto& s : got) std::cerr << s << "\n";
+        std::cerr << "--- want ---\n";
+        for (auto& s : want) std::cerr << s << "\n";
+        return 1;
+    }
+    Val gv = S.get(wide), nv = S.get(narrow), bv = S.get(b);
+    if (gv.w != 8 || gv.v != 16 || gv.x) return fail("wide signal after run");
+    if (nv.w != 4 || nv.v != 0 || nv.x) return fail("narrow signal after run");
+    if (bv.w != 1 || bv.v != 1 || bv.x) return fail("b after NBA");
+    if (!S.finished || S.now != 0) return fail("$finish did not stop at time 0");
+    return 0;
+}
+
+int main() {
+    if (int rc = testHier()) return rc;
+    if (int rc = testCounter()) return rc;
+    if (int rc = testChecks()) return rc;
+    std::cout << "ok\n";
+    return 0;
+}
