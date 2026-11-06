@@ -3,6 +3,7 @@
 // Flat code avoids recursive coroutines: if/else become jumps.
 #pragma once
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -17,7 +18,10 @@ enum class IK {
     Jmp,        // pc = target
     WaitEdge,   // @(edge sig)  or  @(e1 or e2 ...) when events is non-empty
     WaitDelay,  // #delay
-    Finish      // $finish
+    Finish,     // $finish
+    Display,    // $display: print now, in the region the process is running in
+    Strobe,     // $strobe: one print from the postponed region
+    Monitor     // $monitor: replace the watch; at most one postponed line per slot
 };
 
 struct Instr {
@@ -30,6 +34,10 @@ struct Instr {
     int drv = -1;         // Assign from a continuous assign: driver id on a resolved net
     int hi = -1, lo = 0;  // Assign/Nba: hi >= 0 means partial write sig[hi:lo]
     std::vector<std::pair<int, Edge>> events;  // WaitEdge with 2+ events: @(a or b ...)
+    // Display/Strobe/Monitor. `args` are read when the line is printed, so a
+    // $strobe/$monitor sees values after NBA. %b, %d, %%, and other text.
+    std::string fmt;
+    std::vector<E> args;
 };
 
 struct Prog {

@@ -8,6 +8,9 @@
 // #10                -> co_await Delay{S,10}   (#0 goes to the inactive region)
 // @(sig)             -> co_await Wait{S,sig,ANY}
 // a <= b             -> S.nba(a, b)
+// $display           -> print in the region the process is running in
+// $strobe            -> postponed region, after NBA
+// $monitor           -> one postponed line per slot if a watched value changed
 // $finish            -> S.finished = true
 #include <coroutine>
 #include <cstdint>
@@ -46,7 +49,17 @@ struct Sim {
     vector<Handle> all;                              // owned coroutines
     deque<Handle> active, inactive;                  // active / inactive regions
     struct NbaItem { int s; Val v; int hi, lo; };    // hi < 0: whole signal
-    vector<NbaItem> nbaq;                     // NBA region
+    vector<NbaItem> nbaq;                            // NBA region
+    // Postponed region, after NBA and before time advances. `mon` marks the
+    // single $monitor slot; anything else is a $strobe, in schedule order.
+    struct Post { bool mon = false; string fmt; vector<E> args; };
+    deque<Post> postq;
+    struct Mon {
+        bool on = false, queued = false;
+        string fmt;
+        vector<E> args;
+        vector<int> watch;
+    } mon;
     map<uint64_t, vector<Handle>> wheel;             // time wheel
     uint64_t now = 0, lastDump = ~0ULL;
     bool finished = false;
@@ -75,6 +88,84 @@ struct Sim {
     Val get(int s) const { return make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z); }
     void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }
     static int bit0(const Val& v) { return (v.x & 1) ? 2 : (int)(v.v & 1); }
+
+    // %b is the full width, MSB first, each bit 0/1/x/z.
+    // %d is unsigned and right-justified to the width Icarus uses
+    // (digits of the maximum value). An all-X value is "x", all-Z is "z";
+    // a value that is only partly unknown is "X" or "Z".
+    void printSys(const string& fmt, const vector<E>& args) {
+        auto bin = [](Val v) {
+            string s(v.w, '0');
+            for (int i = 0; i < v.w; i++) {
+                int b = v.w - 1 - i;
+                if ((v.z >> b) & 1) s[i] = 'z';
+                else if ((v.x >> b) & 1) s[i] = 'x';
+                else s[i] = char('0' + ((v.v >> b) & 1));
+            }
+            return s;
+        };
+        auto dec = [](Val v) {
+            uint64_t m = mask(v.w);
+            int nx = __builtin_popcountll(v.x & ~v.z & m);
+            int nz = __builtin_popcountll(v.z & m);
+            string body;
+            if (nx == v.w) body = "x";
+            else if (nx) body = "X";
+            else if (nz == v.w) body = "z";
+            else if (nz) body = "Z";
+            else body = to_string(v.v);
+            int width = (int)((v.w * 146L + 484) / 485);
+            if (width < 1) width = 1;
+            if ((int)body.size() >= width) return body;
+            return string(width - body.size(), ' ') + body;
+        };
+        size_t ai = 0;
+        for (size_t i = 0; i < fmt.size(); ++i) {
+            char c = fmt[i];
+            if (c != '%') { cout << c; continue; }
+            if (i + 1 >= fmt.size()) { cout << '%'; break; }
+            c = fmt[++i];
+            if (c == '%') { cout << '%'; continue; }
+            bool num = c == 'b' || c == 'B' || c == 'd' || c == 'D';
+            if (!num || ai >= args.size()) { cout << '%' << c; continue; }
+            Val v = eval(args[ai++], [&](int s) { return get(s); });
+            cout << ((c == 'b' || c == 'B') ? bin(v) : dec(v));
+        }
+        cout << '\n';
+    }
+    void strobe(const string& fmt, const vector<E>& args) { postq.push_back({false, fmt, args}); }
+    void queueMon() {
+        if (!mon.on || mon.queued) return;
+        postq.push_back({true, mon.fmt, mon.args});
+        mon.queued = true;
+    }
+    // A new $monitor cancels the previous one. The call itself schedules a
+    // print, like $strobe; a later change in this slot does not schedule another.
+    void armMon(const string& fmt, const vector<E>& args) {
+        if (mon.queued) {
+            for (auto it = postq.begin(); it != postq.end(); ++it)
+                if (it->mon) { postq.erase(it); break; }
+            mon.queued = false;
+        }
+        mon.on = true;
+        mon.fmt = fmt;
+        mon.args = args;
+        mon.watch.clear();
+        for (const auto& a : args) collectRefs(a, mon.watch);
+        queueMon();
+    }
+    void noteChange(int s) {
+        if (!mon.on || mon.queued) return;
+        for (int w : mon.watch) if (w == s) { queueMon(); return; }
+    }
+    void drainPost() {
+        while (!postq.empty()) {
+            Post p = move(postq.front());
+            postq.pop_front();
+            if (p.mon) mon.queued = false;
+            printSys(p.fmt, p.args);
+        }
+    }
 
     // One value line, no timestamp. Shared so $dumpvars and later changes match.
     void writeVal(int s) {
@@ -109,6 +200,7 @@ struct Sim {
         int o = bit0(sigs[s].val), n = bit0(nv);
         sigs[s].val = nv;
         dump(s);
+        noteChange(s);  // $monitor: one postponed line if a watched signal changed
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);
         bool neg = (o != 0 && n == 0) || (o == 1 && n != 1);
         vector<Waiter> keep;
@@ -151,6 +243,8 @@ struct Sim {
                     // Partial writes merge into the value as it is *now*, so two NBAs to
                     // different bits of one reg in the same slot both take effect.
                     for (auto& n : q) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
+                } else if (!postq.empty()) {                   // postponed ($strobe/$monitor)
+                    drainPost();                               // then, and only then, time advances
                 } else break;
             }
         }

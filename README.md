@@ -9,7 +9,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 ## Features
 
 - **4-state logic** (0/1/X/Z) up to 64 bits, with Verilog X-propagation rules
-- **Event-driven kernel**: time wheel, active / inactive (`#0`) / NBA regions
+- **Event-driven kernel**: time wheel, active / inactive (`#0`) / NBA / postponed regions
+- **`$display` / `$strobe` / `$monitor`** on the process IR. `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Format is `%b`, `%d`, and literal text. The slang lowerer does not emit these yet.
 - **Coroutine processes**: `initial` / `always` as C++20 coroutines (`co_await Delay`, `co_await Wait`)
 - **Multi-event waits**: `@(posedge clk or negedge rst_n)`, `@*`, `always_comb`
 - **Resolved nets**: several `assign`s to one wire resolve per bit (Z yields, conflicts give X)
@@ -50,7 +51,7 @@ cmake --build build -j
 
 - Signals up to 64 bits; no signed arithmetic, division, or strengths
 - `lower.hpp` is written against slang's API from memory and needs verification
-- Not yet lowered: compound assigns (`+=`), `break`/`continue`, net initializers, tasks/functions, hierarchy, `$display`
+- Not yet lowered: compound assigns (`+=`), `break`/`continue`, net initializers, tasks/functions, hierarchy. `$display` / `$strobe` / `$monitor` exist as kernel instructions; `lower.hpp` still ignores the calls
 - Vectors assumed declared `[N-1:0]`
 
 ## License
