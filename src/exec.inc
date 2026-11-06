@@ -21,10 +21,27 @@ Task exec(const Prog* p) {
                 else co_await Wait{i.sig, i.edge};
                 pc++; break;
             case IK::WaitDelay: co_await Delay{i.delay}; pc++; break;
+            case IK::Display:
+                S.printSys(i.fmt, i.args);
+                if (S.finished) co_return;  // task ran; $finish already requested
+                pc++;
+                break;
+            case IK::Strobe:
+                S.strobe(i.fmt, i.args);
+                if (S.finished) co_return;
+                pc++;
+                break;
+            case IK::Monitor:
+                S.armMon(i.fmt, i.args);
+                if (S.finished) co_return;
+                pc++;
+                break;
             case IK::Finish:
-                // End this process. Sim::run checks `finished` only between
-                // time slots, so other processes already queued here still
-                // run and no later time starts (Icarus 12).
+                // Stop this process. The rest of this time slot still runs,
+                // including NBA and postponed, so a $strobe/$monitor already
+                // queued still prints. The next time does not start. Another
+                // process already queued runs until its next system task;
+                // that task itself runs (Icarus 13).
                 S.finished = true;
                 co_return;
         }

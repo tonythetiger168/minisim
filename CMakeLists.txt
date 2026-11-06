@@ -7,10 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(minisim src/minisim.cpp)
 target_include_directories(minisim PRIVATE src)
 
-# Unit tests: value library, scheduler (test_sched), net initial value (test_net),
-# and the demo VCD's time-0 $dumpvars sample (test_vcd).
+# Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
+# net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net)
+foreach(t test_expr test_z test_sched test_net test_sys)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   add_test(NAME ${t} COMMAND ${t})
