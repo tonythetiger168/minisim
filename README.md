@@ -96,7 +96,7 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 
 ## Spec coverage and tests
 
-[`docs/COVERAGE.md`](docs/COVERAGE.md) maps IEEE 1800-2017 clauses to what minisim
+[`docs/COVERAGE.md`](docs/COVERAGE.md) maps IEEE 1800-2023 clauses to what minisim
 supports. `tests/spec/` holds one small test per clause, named after it
 (`9.3.2-fork-join.sv`). The expected output is in the file as `//> ` comments.
 `ctest` runs each one on `msim` (`spec/...`), and on Icarus Verilog too when

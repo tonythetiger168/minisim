@@ -63,7 +63,7 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
-  # Spec suite: tests/spec/<clause>-<topic>.sv, one IEEE 1800-2017 clause each,
+  # Spec suite: tests/spec/<clause>-<topic>.sv, one IEEE 1800-2023 clause each,
   # expected output in "//> " comments. With Icarus Verilog installed, the
   # same expectations are also checked against it (icarus/<name>).
   file(GLOB SPEC_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/spec/*.sv)

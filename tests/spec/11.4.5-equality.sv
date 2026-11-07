@@ -1,4 +1,4 @@
-// IEEE 1800-2017 11.4.5 Equality operators: == / != give x with an x or z
+// IEEE 1800-2023 11.4.5 Equality operators: == / != give x with an x or z
 // operand; === / !== compare x and z bits exactly.
 module t;
   logic [1:0] a;

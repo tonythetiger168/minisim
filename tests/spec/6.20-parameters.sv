@@ -1,4 +1,4 @@
-// IEEE 1800-2017 6.20 Constants: parameter and localparam values, including
+// IEEE 1800-2023 6.20 Constants: parameter and localparam values, including
 // one computed from another and one overridden at instantiation.
 module child #(parameter int W = 4) ();
   localparam int W2 = W * 2;

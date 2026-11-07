@@ -1,5 +1,5 @@
-// IEEE 1800-2017 6.8 Variable declarations: a static variable's initializer
-// is applied before any initial or always procedure starts.
+// IEEE 1800-2023 10.5 Variable declaration assignment (also 6.8): a static
+// variable's initializer is applied before any initial or always procedure starts.
 module t;
   logic [7:0] v = 5;
   logic clk = 0;

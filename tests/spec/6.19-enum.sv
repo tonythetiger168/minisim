@@ -1,4 +1,4 @@
-// IEEE 1800-2017 6.19 Enumerations: a name is its value; values count up from 0.
+// IEEE 1800-2023 6.19 Enumerations: a name is its value; values count up from 0.
 module t;
   typedef enum logic [1:0] {IDLE, RUN, DONE = 3} st_t;
   st_t s;

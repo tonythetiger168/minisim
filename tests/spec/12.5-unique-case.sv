@@ -1,4 +1,4 @@
-// IEEE 1800-2017 12.5 Case statement, including unique case and default.
+// IEEE 1800-2023 12.5 Case statement, with 12.5.3 unique-case and default.
 module t;
   logic [1:0] s;
   initial begin

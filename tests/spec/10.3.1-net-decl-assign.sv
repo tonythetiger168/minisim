@@ -1,5 +1,5 @@
-// IEEE 1800-2017 6.7.1 Net declarations with a declaration assignment.
-// `wire w = v + 1` is a continuous assignment: w follows every change of v.
+// IEEE 1800-2023 10.3.1 The net declaration assignment: `wire w = v + 1` is a
+// continuous assignment, so w follows every change of v.
 module t;
   logic [7:0] v;
   wire  [7:0] w = v + 1;

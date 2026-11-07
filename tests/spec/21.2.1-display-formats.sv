@@ -1,4 +1,4 @@
-// IEEE 1800-2017 21.2.1 Display and write tasks: %b %o %h %d with and without
+// IEEE 1800-2023 21.2.1 Display and write tasks: %b %o %h %d with and without
 // a 0 width, an explicit width, x/z digits, $write without newline, and
 // $displayh / $displayb defaults for arguments with no specifier.
 module t;
