@@ -23,7 +23,7 @@ Task exec(const Prog* entry) {
         switch (i.k) {
             case IK::Assign: {
                 Val v = eval(i.e, rd);
-                if (i.drv >= 0) { S.drive(i.sig, i.drv, v); pc++; break; }
+                if (i.drv >= 0) { S.drive(i.sig, i.drv, v, i.s0, i.s1); pc++; break; }
                 S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
                 pc++; break;
             }

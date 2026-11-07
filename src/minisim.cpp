@@ -27,7 +27,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
-struct Sig { string name; int w; Val val; vector<Val> drv; bool net; };  // drv: one value per driver; net: wire, else reg
+struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; };  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
 struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
@@ -77,14 +77,19 @@ struct Sim {
         return (int)sigs.size() - 1;
     }
     void spawn(Task t) { all.push_back(t.h); wheel[now].push_back(t.h); }
-    // Resolved nets: each continuous assign owns a driver slot (starts as Z).
-    int newDriver(int s) { sigs[s].drv.push_back(allz(sigs[s].w)); return (int)sigs[s].drv.size() - 1; }
-    void drive(int s, int d, Val v) {
+    // Resolved nets: each continuous driver owns a slot (starts as Z).
+    // s0/s1 are that driver's strength spec. Omitted means strong0 and strong1,
+    // which is the default for a continuous assign with no strength written.
+    int newDriver(int s) {
+        sigs[s].drv.push_back(Drv{allz(sigs[s].w), STR_STRONG, STR_STRONG});
+        return (int)sigs[s].drv.size() - 1;
+    }
+    void drive(int s, int d, Val v, int s0 = STR_STRONG, int s1 = STR_STRONG) {
         auto& g = sigs[s];
-        g.drv[d] = make(v.v, v.x, g.w, v.z);
-        Val r = g.drv[0];
-        for (size_t i = 1; i < g.drv.size(); i++) r = v_resolve(r, g.drv[i]);
-        set(s, r);
+        g.drv[d].v = make(v.v, v.x, g.w, v.z);
+        g.drv[d].s0 = (uint8_t)s0;
+        g.drv[d].s1 = (uint8_t)s1;
+        set(s, resolveDrives(g.drv.data(), g.drv.size(), g.w));
     }
     Val get(int s) const { return make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z); }
     void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }

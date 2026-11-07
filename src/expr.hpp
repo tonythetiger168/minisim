@@ -256,14 +256,108 @@ inline Val v_mux(Val c, Val a, Val b) {
     return make(a.v & same, m & ~same, w, bothz, a.sgn && b.sgn);
 }
 
-// Wire resolution of two drivers, per bit (no strengths):
-// Z yields to the other driver; equal known values stay; any conflict or X -> X.
-inline Val v_resolve(Val a, Val b) {
-    uint64_t az = a.z, bz = b.z & ~a.z, both = ~(a.z | b.z);
-    uint64_t x = (az & b.x) | (bz & a.x) | (both & (a.x | b.x | (a.v ^ b.v)));
-    uint64_t z = (az & b.z) | (bz & a.z);
-    uint64_t v = (az & b.v) | (bz & a.v) | (both & a.v);
-    return make(v, x, wmax(a, b), z);
+// IEEE 1364 drive strength, weakest to strongest. A driver has one level for
+// the 0 it can drive and one for the 1. HighZ contributes nothing.
+enum : uint8_t {
+    STR_HIZ = 0,
+    STR_SMALL = 1,
+    STR_MEDIUM = 2,
+    STR_WEAK = 3,
+    STR_LARGE = 4,
+    STR_PULL = 5,
+    STR_STRONG = 6,
+    STR_SUPPLY = 7
+};
+
+// One continuous driver. s0 is the strength of a driven 0, s1 of a driven 1.
+// The resolved net value is still a plain Val. Strength stays on the driver.
+struct Drv {
+    Val v;
+    uint8_t s0 = STR_STRONG;
+    uint8_t s1 = STR_STRONG;
+};
+
+// One bit of a resolved net, in the form Icarus Verilog uses.
+// A 0 or a 1 is unambiguous: both strengths are that side's strength, and
+// both flags match. An X keeps s0 and s1 apart and stays X, even when one
+// strength is larger. Z is no drive. Combining bits takes the stronger
+// unambiguous value; equal strengths on opposite values become X.
+struct SBit {
+    unsigned s0 = 0, s1 = 0;
+    bool f0 = false, f1 = false;
+};
+inline bool sbit_z(SBit a) { return a.s0 == 0 && a.s1 == 0; }
+inline bool sbit_unamb(SBit a) { return a.s0 == a.s1 && a.f0 == a.f1; }
+inline SBit sbit_0(unsigned s) { return s ? SBit{s, s, false, false} : SBit{}; }
+inline SBit sbit_1(unsigned s) { return s ? SBit{s, s, true, true} : SBit{}; }
+inline SBit sbit_x(unsigned s0, unsigned s1) {
+    if (s0 == 0 && s1 == 0) return {};
+    return SBit{s0, s1, false, true};
+}
+inline int sbit_logic(SBit a) {
+    if (sbit_z(a)) return 3;
+    if (!a.f0 && !a.f1) return 0;
+    if (a.f0 && a.f1) return 1;
+    return 2;
+}
+inline SBit sbit_resolv(SBit a, SBit b) {
+    if (sbit_z(a)) return b;
+    if (sbit_z(b)) return a;
+    if (a.s0 == b.s0 && a.s1 == b.s1 && a.f0 == b.f0 && a.f1 == b.f1) return a;
+    if (sbit_unamb(a) && sbit_unamb(b)) {
+        if (b.s0 > a.s0) return b;
+        if (b.s0 == a.s0) return sbit_x(a.s0, a.s0);
+        return a;
+    }
+    if (sbit_unamb(a) || sbit_unamb(b)) {
+        SBit u = sbit_unamb(a) ? a : b;
+        SBit m = sbit_unamb(a) ? b : a;
+        SBit r;
+        if (u.s1 > m.s1) { r.s1 = u.s1; r.f1 = u.f1; }
+        else { r.s1 = m.s1; r.f1 = m.f1; }
+        if (u.s0 > m.s0) { r.s0 = u.s0; r.f0 = u.f0; }
+        else { r.s0 = m.s0; r.f0 = m.f0; }
+        return r;
+    }
+    int sv1a = a.f1 ? (int)a.s1 : -(int)a.s1;
+    int sv0a = a.f0 ? (int)a.s0 : -(int)a.s0;
+    int sv1b = b.f1 ? (int)b.s1 : -(int)b.s1;
+    int sv0b = b.f0 ? (int)b.s0 : -(int)b.s0;
+    int sv1 = sv1a, sv0 = sv0a;
+    if (sv0a > sv1) sv1 = sv0a;
+    if (sv1b > sv1) sv1 = sv1b;
+    if (sv0b > sv1) sv1 = sv0b;
+    if (sv1a < sv0) sv0 = sv1a;
+    if (sv1b < sv0) sv0 = sv1b;
+    if (sv0b < sv0) sv0 = sv0b;
+    SBit r;
+    if (sv1 > 0) { r.f1 = true; r.s1 = (unsigned)sv1; }
+    else { r.f1 = a.f1 && b.f1; r.s1 = (unsigned)(-sv1); }
+    if (sv0 > 0) { r.f0 = true; r.s0 = (unsigned)sv0; }
+    else r.s0 = (unsigned)(-sv0);
+    if (sbit_z(r)) return {};
+    return r;
+}
+
+inline Val resolveDrives(const Drv* d, size_t n, int w) {
+    uint64_t rv = 0, rx = 0, rz = 0;
+    for (int b = 0; b < w && b < 64; b++) {
+        uint64_t bit = 1ULL << b;
+        SBit acc;
+        for (size_t i = 0; i < n; i++) {
+            SBit cur;
+            if (d[i].v.z & bit) cur = {};
+            else if (d[i].v.x & bit) cur = sbit_x(d[i].s0, d[i].s1);
+            else if (d[i].v.v & bit) cur = sbit_1(d[i].s1);
+            else cur = sbit_0(d[i].s0);
+            acc = sbit_resolv(acc, cur);
+        }
+        int lg = sbit_logic(acc);
+        if (lg == 1) rv |= bit;
+        else if (lg == 2) rx |= bit;
+        else if (lg == 3) { rx |= bit; rz |= bit; }
+    }
+    return make(rv, rx, w, rz);
 }
 
 // ================= expression tree =================

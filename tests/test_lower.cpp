@@ -595,6 +595,58 @@ static int testHierarchy() {
     return 0;
 }
 
+// examples/strengths.sv. A weaker driver winning, equal 1 vs 0 staying 0 or 1,
+// or an explicit strength ignored, fails these lines. Icarus Verilog 13 is
+// the source of the text.
+static int testStrengths() {
+    S.finished = false;
+    S.now = 0;
+    S.wheel.clear();
+    S.mon.on = false;
+    S.mon.queued = false;
+    S.vcd.close();
+    S.active.clear();
+    S.inactive.clear();
+    S.postq.clear();
+    S.nbaq.clear();
+
+    Compiled c = compileSv(srcPath("examples/strengths.sv"), true);
+    if (c.result.procs.empty()) return fail("strengths proc count");
+    for (auto& pr : c.result.procs) S.spawn(exec(&pr.prog));
+
+    auto saved = std::filesystem::current_path();
+    auto tmp = std::filesystem::temp_directory_path() / "minisim-strength-test";
+    std::filesystem::create_directories(tmp);
+    std::filesystem::current_path(tmp);
+    std::stringstream buf;
+    std::streambuf* old = std::cout.rdbuf(buf.rdbuf());
+    S.run(1000);
+    std::cout.rdbuf(old);
+    std::filesystem::current_path(saved);
+
+    const std::vector<std::string> want = {
+        "UNDRIVEN z", "TRI z",
+        "STRONG 1", "STRONG0 0", "EQUAL x", "PULL x", "DEFAULT 1",
+        "SPEC1 1", "SPEC0 1",
+        "XUNEQ x", "XEQ x", "ZDRV z", "ZYIELD 1", "S1WX 1",
+        "HZ1 z", "HZ1Z 0", "HZ0 z", "HZ0O 1",
+        "PUW 1", "PUS 0", "PDW 0", "PDS 1", "PU 1", "PD 0", "PUSUP 1",
+        "AND 0", "ANDF 1", "NOT 0", "BUF1 1", "BUFX x", "OR 1",
+        "NAND 0", "NOR 1", "XOR 0", "XNOR 0",
+        "VEC xxxz", "LONE 1x0z",
+    };
+    auto got = linesOf(buf.str());
+    if (got != want) {
+        std::cerr << "FAIL strengths stdout\n--- got ---\n";
+        for (auto& s : got) std::cerr << s << "\n";
+        std::cerr << "--- want ---\n";
+        for (auto& s : want) std::cerr << s << "\n";
+        return 1;
+    }
+    if (S.now < 1) return fail("strengths did not reach #1");
+    return 0;
+}
+
 static int testRecur() {
     bool threw = false;
     std::string msg;
@@ -621,6 +673,7 @@ int main() {
     if (int rc = testTasks()) return rc;
     if (int rc = testRecur()) return rc;
     if (int rc = testHierarchy()) return rc;
+    if (int rc = testStrengths()) return rc;
     std::cout << "ok\n";
     return 0;
 }

@@ -15,7 +15,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`$display` / `$strobe` / `$monitor`** on the process IR, including from the slang lowerer. `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Format is `%b`, `%d`, and literal text.
 - **Coroutine processes**: `initial` / `always` as C++20 coroutines (`co_await Delay`, `co_await Wait`)
 - **Multi-event waits**: `@(posedge clk or negedge rst_n)`, `@*`, `always_comb`
-- **Resolved nets**: several `assign`s to one wire resolve per bit (Z yields, conflicts give X)
+- **Resolved nets**: several drivers on a `wire` or `tri` resolve per bit by drive strength. A stronger 0 or 1 wins. Equal strengths on opposite values resolve to X. A driven X stays X, including when its 0-strength and 1-strength differ. Z yields. `assign (strong1, weak0)` sets the strength, and so do `buf`, `not`, `and`, `nand`, `or`, `nor`, `xor`, `xnor`, `pullup`, and `pulldown`. An undriven net stays Z.
 - **`case` / `casez` / `casex`**, part-selects, bit-selects, `for` / `while` / `do` / `forever` / `repeat`, `break` / `continue`
 - **Tasks and functions** at module scope, called from procedural code in that module. A `function` used in an expression returns a value (`return` or an assignment to the function name). A `task` is a statement. `input` is copied in. `output` and `inout` are copied back when the call returns. A `#delay` inside a task suspends that process.
 - **Module instances.** A parent instantiates a child. Named (`.a(x)`) and positional port connections carry an `input` into the child and an `output` back to the parent. The output may be a continuous assign or a procedural write. An `inout` net is connected in both directions. A grandchild uses the same connection. A `#(.W(8))` override changes the port width. Child signals are named on the instance path (`u.y`).
@@ -55,7 +55,8 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 
 ## Known limits
 
-- Signals up to 64 bits; no strengths
+- Signals up to 64 bits
+- `nmos`, `pmos`, `cmos`, `tran` (and the resistive forms), `bufif` / `notif`, and `trireg` charge storage are an error. Strength is resolved when a net is driven, and a read of the net is 0, 1, X, or Z.
 - Instance arrays and interface or modport ports are an error. A hierarchical reference that reads a child's internal signal (`top.u.hidden`) is not lowered
 - An `inout` variable is an error. An `inout` net is connected. An `inout` whose two sides differ in width is an error
 - Not yet lowered: net initializers
