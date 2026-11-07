@@ -53,7 +53,7 @@ struct Sim {
     vector<Handle> all;                              // owned coroutines
     deque<Handle> active, inactive;                  // active / inactive regions
     struct NbaItem { int s; Val v; int hi, lo; };    // hi < 0: whole signal
-    vector<NbaItem> nbaq;                            // NBA region
+    vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
     // Postponed region, after NBA and before time advances. `mon` marks the
     // single $monitor slot; anything else is a $strobe, in schedule order.
     struct Post { bool mon = false; string fmt; vector<E> args; };
@@ -93,6 +93,9 @@ struct Sim {
         g.drv[d].v = make(v.v, v.x, g.w, v.z);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
+        // One driver that drives both 0 and 1 resolves to its own value
+        // (X stays X, Z stays Z). Skip the per-bit strength walk.
+        if (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) { set(s, g.drv[0].v); return; }
         set(s, resolveDrives(g.drv.data(), g.drv.size(), g.w));
     }
     Val get(int s) const { return make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z); }
@@ -272,15 +275,21 @@ struct Sim {
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);
         bool neg = (o != 0 && n == 0) || (o == 1 && n != 1);
-        vector<Waiter> keep;
-        for (auto& w : waiters[s]) {
+        // Wake matching waiters and compact the rest in place (no allocation).
+        auto& ws = waiters[s];
+        size_t keep = 0;
+        for (size_t j = 0; j < ws.size(); j++) {
+            Waiter& w = ws[j];
             if (w.fired && *w.fired) continue;  // stale: sibling event already woke it
             if (w.e == ANY || (w.e == POS && pos) || (w.e == NEG && neg)) {
                 if (w.fired) *w.fired = true;
                 active.push_back(w.h);
-            } else keep.push_back(w);
+            } else {
+                if (keep != j) ws[keep] = std::move(w);
+                keep++;
+            }
         }
-        waiters[s].swap(keep);
+        ws.erase(ws.begin() + (ptrdiff_t)keep, ws.end());
     }
 
     void header() {
@@ -311,10 +320,12 @@ struct Sim {
                     for (auto h : inactive) active.push_back(h);
                     inactive.clear();
                 } else if (!nbaq.empty()) {                    // NBA
-                    auto q = move(nbaq); nbaq.clear();
+                    // Swap, not move: both buffers keep their capacity across slots.
+                    nbaRun.clear();
+                    nbaRun.swap(nbaq);
                     // Partial writes merge into the value as it is *now*, so two NBAs to
                     // different bits of one reg in the same slot both take effect.
-                    for (auto& n : q) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
+                    for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
                 } else if (!postq.empty()) {                   // postponed ($strobe/$monitor)
                     drainPost();                               // then, and only then, time advances
                 } else break;
@@ -342,12 +353,13 @@ struct Wait {
     void await_resume() const {}
 };
 // @(e1 or e2 or ...): resumes once, on whichever event happens first.
+// `ev` points at the instruction's event list, which outlives the wait.
 struct WaitAny {
-    vector<pair<int, Edge>> ev;
+    const vector<pair<int, Edge>>* ev;
     bool await_ready() const { return false; }
     void await_suspend(Handle h) const {
         auto token = make_shared<bool>(false);
-        for (auto& [sg, e] : ev) S.waiters[sg].push_back({h, e, token});
+        for (auto& [sg, e] : *ev) S.waiters[sg].push_back({h, e, token});
     }
     void await_resume() const {}
 };

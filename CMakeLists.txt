@@ -38,6 +38,8 @@ if(MINISIM_WITH_SLANG)
   add_executable(msim src/msim.cpp)
   target_include_directories(msim PRIVATE src)
   target_link_libraries(msim PRIVATE slang::slang)
+  # -compile builds generated C++ against the kernel headers in src/.
+  target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -60,6 +62,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_vcd
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd.cmake)
+  # Compiled mode: generated C++ prints the same as the interpreter.
+  add_test(NAME msim_compile
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_compile.cmake)
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
