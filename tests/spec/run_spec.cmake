@@ -3,6 +3,8 @@
 #   cmake -DSIM=<msim|iverilog> -DSV=<file.sv> [-DVVP=<vvp>] -P run_spec.cmake
 # With -DVVP set, SIM is iverilog: compile with -g2012, then run under vvp and
 # drop vvp's own "$finish called" / "VCD info" lines.
+# Each test runs in its own directory, so a data file is a relative path.
+get_filename_component(dir ${SV} DIRECTORY)
 file(STRINGS ${SV} lines)
 set(expected "")
 foreach(l IN LISTS lines)
@@ -21,12 +23,14 @@ if(VVP)
   if(NOT rc EQUAL 0)
     message(FATAL_ERROR "iverilog failed on ${SV}:\n${err}")
   endif()
-  execute_process(COMMAND ${VVP} -n ${out} OUTPUT_VARIABLE got RESULT_VARIABLE rc TIMEOUT 20)
+  execute_process(COMMAND ${VVP} -n ${out} OUTPUT_VARIABLE got RESULT_VARIABLE rc TIMEOUT 20
+                  WORKING_DIRECTORY ${dir})
   string(REGEX REPLACE "[^\n]*\\$finish called[^\n]*\n" "" got "${got}")
   string(REGEX REPLACE "VCD info:[^\n]*\n" "" got "${got}")
+  string(REGEX REPLACE "WARNING: [^\n]*\n" "" got "${got}")   # vvp's warnings go to stdout
 else()
   execute_process(COMMAND ${SIM} ${SV} OUTPUT_VARIABLE got ERROR_VARIABLE err
-                  RESULT_VARIABLE rc TIMEOUT 20)
+                  RESULT_VARIABLE rc TIMEOUT 20 WORKING_DIRECTORY ${dir})
   if(NOT rc EQUAL 0)
     message(FATAL_ERROR "msim exited ${rc} on ${SV}:\n${err}")
   endif()

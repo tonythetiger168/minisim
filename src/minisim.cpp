@@ -30,7 +30,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
-struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; };  // drv: one contribution per driver; net: wire, else reg
+struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; };  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
 struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
@@ -76,7 +76,9 @@ struct Sim {
     // A variable (reg/logic) starts as X. The flag is stored so the VCD
     // header can emit `$var wire` or `$var reg`.
     int sig(const string& n, int w, bool net = false) {
-        sigs.push_back({n, w, net ? allz(w) : Val{}, {}, net});
+        // An unpacked array element is named "m[3]". The VCD leaves memories
+        // out, as $dumpvars does by default (21.7.1.2).
+        sigs.push_back({n, w, net ? allz(w) : Val{}, {}, net, n.find('[') != string::npos});
         waiters.emplace_back();
         return (int)sigs.size() - 1;
     }
@@ -242,15 +244,21 @@ struct Sim {
     // One value line, no timestamp. Shared so $dumpvars and later changes match.
     void writeVal(int s) {
         const Sig& g = sigs[s];
-        string id(1, char('!' + s));
+        string id = vcdId((size_t)s);
         if (g.w == 1) { vcd << ((g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1))) << id << "\n"; return; }
         vcd << "b";
         for (int i = g.w - 1; i >= 0; i--)
             vcd << ((g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1)));
         vcd << " " << id << "\n";
     }
+    // VCD identifier: base-94 over the printable characters '!'..'~'.
+    static string vcdId(size_t i) {
+        string id;
+        do { id += char('!' + i % 94); i /= 94; } while (i);
+        return id;
+    }
     void dump(int s) {
-        if (!vcd.is_open() || !vcd) return;
+        if (!vcd.is_open() || !vcd || sigs[s].hide) return;
         if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
         writeVal(s);
     }
@@ -261,7 +269,7 @@ struct Sim {
     void dumpvars() {
         if (!vcd.is_open() || !vcd) return;
         vcd << "$dumpvars\n";
-        for (size_t i = 0; i < sigs.size(); i++) writeVal((int)i);
+        for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
         vcd << "$end\n";
     }
 
@@ -298,7 +306,8 @@ struct Sim {
         if (!vcd) { cerr << "cannot write " << vcdPath << "\n"; return; }
         vcd << "$timescale 1ns $end\n$scope module top $end\n";
         for (size_t i = 0; i < sigs.size(); i++)
-            vcd << "$var " << (sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << char('!' + i) << " " << sigs[i].name << " $end\n";
+            if (!sigs[i].hide)
+                vcd << "$var " << (sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << vcdId(i) << " " << sigs[i].name << " $end\n";
         vcd << "$upscope $end\n$enddefinitions $end\n";
     }
 

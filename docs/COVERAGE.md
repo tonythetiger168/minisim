@@ -21,7 +21,7 @@ wrong result, that is a bug: please add a spec test for it.
 | 6.19 | Enumerations | 🟡 | values and compares; no `.name()` / `.next()`. `6.19-enum` |
 | 6.20 | parameter / localparam | ✅ | incl. overrides at instantiation. `6.20-parameters` |
 | 7.2 | Structures | ❌ | packed and unpacked |
-| 7.4 | Packed / unpacked arrays | 🟡 | packed vectors up to 64 bits. Unpacked arrays are an error |
+| 7.4 | Packed / unpacked arrays | 🟡 | fixed-size unpacked arrays of any number of dimensions (up to 2^20 elements), constant or variable index, read and write; out-of-range read gives X (7.4.6). Not yet: slices, whole-array assignment or compare, arrays as ports or arguments. `7.4-unpacked-arrays`, `7.4-array-sensitivity` |
 | 7.5–7.10 | Dynamic, associative arrays, queues | ❌ | |
 | 8 | Classes | ❌ | blocks UVM |
 | 9.2 | initial, always, always_comb/ff/latch | ✅ | |
@@ -43,12 +43,13 @@ wrong result, that is a bug: please add a spec test for it.
 | 11.4.11 | Conditional `?:` | ✅ | |
 | 11.4.12 | Concatenation, replication | ✅ | `11.4.12.1-replication` |
 | 11.4.13 | inside | ❌ | |
+| 11.5.1 | Bit-select with a variable index | ✅ | read and write. `11.5.1-variable-bit-select` |
 | 11.5.1 | Indexed part-select `+:` `-:` | ❌ | |
 | 11.6–11.8 | Expression width and sign rules | ✅ | context-determined widths, signed extension |
 | 12.4 | if / else; 12.4.2 unique / priority if | ✅ | the unique/priority violation itself is not reported |
 | 12.5 | case, casez, casex; 12.5.3 unique case | ✅ | `12.5-unique-case` |
 | 12.7 | for, while, do-while, repeat, forever | ✅ | |
-| 12.7.3 | foreach | ❌ | needs unpacked arrays |
+| 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue. `12.7.3-foreach`, `12.7.3-foreach-order` |
 | 12.8 | break, continue, return | ✅ | |
 | 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`, no DPI. `13.4-function-automatic` |
 | 16 | Assertions | ❌ | immediate and concurrent |
@@ -57,7 +58,8 @@ wrong result, that is a bug: please add a spec test for it.
 | 20.2 | $finish, $stop | ✅ | `$stop` ends the run like `$finish` |
 | 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m, `%0`, widths. `21.2.1-display-formats` |
 | 21.2.2–21.2.3 | $strobe, $monitor | ✅ | |
-| 21.3 | File I/O ($fopen, $readmemh, ...) | ❌ | currently ignored with a warning |
+| 21.3 | File I/O ($fopen, $fwrite, ...) | ❌ | ignored with a warning |
+| 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
 | 21.7 | VCD ($dumpfile, $dumpvars) | 🟡 | `msim -vcd` dumps every signal; the tasks are ignored |
 | 23.3 | Module instances, ports | ✅ | named and positional, parameter overrides |
 | 25 | Interfaces, modports | ❌ | |
@@ -68,11 +70,10 @@ wrong result, that is a bug: please add a spec test for it.
 
 In order of how often typical testbenches hit them:
 
-1. Unpacked arrays and memories (7.4), then `foreach` (12.7.3) and `$readmemh` (21.4)
-2. Generate blocks (27) and `+:` / `-:` part-selects (11.5.1)
+1. ~~Unpacked arrays and memories (7.4), `foreach` (12.7.3), `$readmemh` (21.4)~~ done
+2. Values wider than 64 bits, generate blocks (27), `+:` / `-:` part-selects (11.5.1)
 3. `` `timescale `` (22.7, 20.4) and delay expressions (9.4.1)
 4. Named events (15.5), `$urandom` (18.13), immediate assertions (16.3)
 5. Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2)
-6. Values wider than 64 bits
 
 Classes (8), randomization (18), and interfaces (25) are what UVM needs.

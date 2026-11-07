@@ -80,7 +80,8 @@ if(MINISIM_WITH_SLANG)
 
   # Spec suite: tests/spec/<clause>-<topic>.sv, one IEEE 1800-2023 clause each,
   # expected output in "//> " comments. With Icarus Verilog installed, the
-  # same expectations are also checked against it (icarus/<name>).
+  # same expectations are also checked against it (icarus/<name>), unless the
+  # file has a "//! icarus-skip: <reason>" line.
   file(GLOB SPEC_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/spec/*.sv)
   find_program(IVERILOG iverilog)
   find_program(VVP vvp)
@@ -90,7 +91,9 @@ if(MINISIM_WITH_SLANG)
     add_test(NAME spec/${name}
              COMMAND ${CMAKE_COMMAND} -DSIM=$<TARGET_FILE:msim> -DSV=${sv}
                      -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
-    if(IVERILOG AND VVP)
+    # A test Icarus cannot run says why on a line "//! icarus-skip: <reason>".
+    file(STRINGS ${sv} skip REGEX "^//! icarus-skip")
+    if(IVERILOG AND VVP AND NOT skip)
       add_test(NAME icarus/${name}
                COMMAND ${CMAKE_COMMAND} -DSIM=${IVERILOG} -DVVP=${VVP} -DSV=${sv}
                        -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)

@@ -91,6 +91,7 @@ static const char* ikName(IK k) {
         case IK::Call: return "Call";
         case IK::Ret: return "Ret";
         case IK::Fork: return "Fork";
+        case IK::ReadMem: return "ReadMem";
     }
     return "?";
 }

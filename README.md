@@ -14,6 +14,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Event-driven kernel**: time wheel, active / inactive (`#0`) / NBA / postponed regions
 - **`$display` / `$write` / `$strobe` / `$monitor`** (and the `b`/`o`/`h` variants). `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Formats: `%b %o %h %x %d %c %s %t %m`, `%0` and explicit widths. `$time` / `$stime` / `$realtime`
 - **`fork` / `join` / `join_any` / `join_none`**, `wait (expr)`
+- **Unpacked arrays and memories**: any number of dimensions, variable indices, `foreach`, `$readmemh` / `$readmemb`
 - **Constants**: `parameter`, `localparam`, enum values; unary `-`/`+`, `**`, `!==`, `~&` `~|` `~^`, replication
 - **Coroutine processes**: `initial` / `always` as C++20 coroutines (`co_await Delay`, `co_await Wait`)
 - **Multi-event waits**: `@(posedge clk or negedge rst_n)`, `@*`, `always_comb`
@@ -115,7 +116,7 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 - Declaration initializers (`logic x = 0;`, `wire y = a & b;`) are lowered. A module variable's initializer runs before every `initial` / `always`
 - Tasks and functions have no recursion, no `ref` arguments, no DPI, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
 - System tasks other than the display family, `$finish`, and `$stop` are ignored with a warning
-- Unpacked arrays are an error (no memories yet). See `docs/COVERAGE.md` for the full list
+- Unpacked arrays: fixed size only, at most 2^20 elements; no slices or whole-array operations. Array elements are left out of the VCD. See `docs/COVERAGE.md` for the full list
 - Vectors assumed declared `[N-1:0]`
 
 ## Spec coverage and tests

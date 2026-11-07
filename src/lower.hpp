@@ -59,11 +59,19 @@
 #include "slang/ast/expressions/SelectExpressions.h"
 #include "slang/ast/SemanticFacts.h"
 #include "slang/ast/statements/ConditionalStatements.h"
+#include "slang/ast/statements/LoopStatements.h"
 #include "slang/ast/statements/MiscStatements.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/types/AllTypes.h"
+
+// Fixed-size unpacked arrays (7.4), keyed by the array's symbol. SigCollector
+// fills it; Lowerer reads it. lower() clears it first, since symbols from an
+// earlier compilation may share addresses with this one's.
+using ArrMap = std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>>;
+inline ArrMap& arrMap() { static ArrMap m; return m; }
+constexpr int64_t kMaxArrayElems = 1 << 20;
 
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
@@ -377,6 +385,50 @@ struct Lowerer {
         }
     }
 
+    // a[i][j] on an unpacked array: the array and one index per dimension.
+    // Fewer indices than dimensions (a slice) is not supported yet.
+    struct ArrSel {
+        std::shared_ptr<const ArrShape> a;
+        std::vector<const slang::ast::Expression*> idx;
+        bool constant = true;
+    };
+    std::optional<ArrSel> arraySel(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        std::vector<const Expression*> idx;
+        const Expression* cur = &e;
+        while (cur->kind == ExpressionKind::ElementSelect &&
+               cur->as<ElementSelectExpression>().value().type->isUnpackedArray()) {
+            idx.push_back(&cur->as<ElementSelectExpression>().selector());
+            cur = &cur->as<ElementSelectExpression>().value();
+        }
+        if (idx.empty()) return std::nullopt;
+        if (cur->kind != ExpressionKind::NamedValue) unsupported("array select on a non-variable");
+        auto it = arrMap().find(&cur->as<NamedValueExpression>().symbol);
+        if (it == arrMap().end()) unsupported("array select");
+        ArrSel s;
+        s.a = it->second;
+        s.idx.assign(idx.rbegin(), idx.rend());
+        if (s.idx.size() != s.a->dims.size()) unsupported("array slice (fewer indices than dimensions)");
+        for (auto* x : s.idx)
+            if (!(x->kind == ExpressionKind::IntegerLiteral || x->getConstant())) s.constant = false;
+        return s;
+    }
+    int64_t constOffset(const ArrSel& s) {
+        std::vector<int64_t> v;
+        for (auto* x : s.idx) v.push_back(constInt(*x));
+        return s.a->offset(v);
+    }
+    E arrayRead(const ArrSel& s) {
+        if (s.constant) {
+            int64_t off = constOffset(s);
+            if (off >= 0) return ref(s.a->base + (int)off, s.a->sgn);
+        }
+        auto n = node(Op::ArrRead);
+        n->arr = s.a;
+        for (auto* x : s.idx) n->kids.push_back(expr(*x));
+        return n;
+    }
+
     // A parameter, localparam, or enum value (6.20, 6.19.3) is its constant.
     E constSym(const slang::ast::Symbol& sym, const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
@@ -588,6 +640,8 @@ struct Lowerer {
                 return sized(concat(parts), (int)e.type->getBitWidth(), false, ctx);
             }
             case ExpressionKind::ElementSelect: {   // a[i]
+                if (auto as = arraySel(e))
+                    return sized(arrayRead(*as), as->a->elemW, as->a->sgn, ctx);
                 const auto& sel = e.as<ElementSelectExpression>();
                 E base = expr(sel.value());
                 const auto& idx = sel.selector();
@@ -616,16 +670,33 @@ struct Lowerer {
                 i.sig = sigmap.at(&e.as<NamedValueExpression>().symbol);
                 return;
             case ExpressionKind::ElementSelect: {
+                if (auto as = arraySel(e)) {   // mem[i] = ...
+                    int64_t off = as->constant ? constOffset(*as) : -1;
+                    if (off >= 0) { i.sig = as->a->base + (int)off; return; }
+                    i.sig = as->a->base;
+                    i.arr = as->a;
+                    for (auto* x : as->idx) i.aidx.push_back(expr(*x));
+                    return;
+                }
                 const auto& sel = e.as<ElementSelectExpression>();
-                if (sel.value().kind != ExpressionKind::NamedValue) unsupported("nested select target");
+                if (sel.value().kind != ExpressionKind::NamedValue && !arraySel(sel.value()))
+                    unsupported("nested select target");
                 lhs(sel.value(), i);
-                i.hi = i.lo = (int)constInt(sel.selector());   // constant index only
+                const auto& idx = sel.selector();
+                if (idx.kind == ExpressionKind::IntegerLiteral || idx.getConstant()) {
+                    i.hi = i.lo = (int)constInt(idx);
+                } else {   // v[i] = ... with i known only at run time (11.5.1)
+                    i.bidx = expr(idx);
+                    i.hi = 0;
+                    i.lo = 0;   // the vector's low bound; vectors are [N-1:0]
+                }
                 return;
             }
             case ExpressionKind::RangeSelect: {
                 const auto& r = e.as<RangeSelectExpression>();
                 if (r.getSelectionKind() != RangeSelectionKind::Simple) unsupported("indexed part-select target");
-                if (r.value().kind != ExpressionKind::NamedValue) unsupported("nested select target");
+                if (r.value().kind != ExpressionKind::NamedValue && !arraySel(r.value()))
+                    unsupported("nested select target");
                 lhs(r.value(), i);
                 i.hi = (int)constInt(r.left());
                 i.lo = (int)constInt(r.right());
@@ -690,6 +761,30 @@ struct Lowerer {
         std::string_view n = call.getSubroutineName();
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
+        }
+        if (n == "$readmemh" || n == "$readmemb") {   // 21.4
+            auto args = call.arguments();
+            if (args.size() < 2) unsupported("$readmem arguments");
+            const Expression& fn = peel(*args[0]);
+            if (fn.kind != ExpressionKind::StringLiteral) unsupported("$readmem file name that is not a string literal");
+            // slang binds the memory as an output argument: an assignment to it.
+            const Expression* mp = &peel(*args[1]);
+            if (mp->kind == ExpressionKind::Assignment) mp = &peel(mp->as<AssignmentExpression>().left());
+            const Expression& mem = *mp;
+            const Symbol* msym = nullptr;
+            if (mem.kind == ExpressionKind::NamedValue) msym = &mem.as<NamedValueExpression>().symbol;
+            else if (mem.kind == ExpressionKind::ArbitrarySymbol) msym = mem.as<ArbitrarySymbolExpression>().symbol;
+            if (!msym) unsupported("$readmem target that is not a whole memory");
+            auto it = arrMap().find(msym);
+            if (it == arrMap().end()) unsupported("$readmem target that is not an unpacked array");
+            if (it->second->dims.size() != 1) unsupported("$readmem into a multidimensional array");
+            Instr i; i.k = IK::ReadMem;
+            i.fmt = std::string(fn.as<StringLiteral>().getValue());
+            i.arr = it->second;
+            i.hex = n == "$readmemh";
+            for (size_t a = 2; a < args.size() && a < 4; a++) i.args.push_back(expr(*args[a]));
+            prog.emit(i);
+            return;
         }
         // $display / $write and their b / o / h variants (21.2.1). The suffix
         // only changes the default format of an argument with no specifier.
@@ -939,6 +1034,44 @@ struct Lowerer {
                 loops.pop_back();
                 break;
             }
+            case StatementKind::ForeachLoop: {   // foreach (a[i, j]) (12.7.3)
+                // One counting loop per named dimension, outermost first, each
+                // from its left bound to its right bound. break leaves the whole
+                // foreach; continue steps the innermost loop.
+                const auto& f = s.as<ForeachLoopStatement>();
+                struct Lvl { int var; int64_t right; bool up; size_t top, jf; };
+                std::vector<Lvl> lv;
+                for (const auto& d : f.loopDims) {
+                    if (!d.loopVar) continue;
+                    if (!d.range) unsupported("foreach over a dynamic dimension");
+                    int v = fresh(32);
+                    sigmap[d.loopVar] = v;
+                    Instr init; init.k = IK::Assign; init.sig = v;
+                    init.e = konst(make((uint64_t)d.range->left, 0, 32, 0, true));
+                    prog.emit(init);
+                    Lvl L{v, d.range->right, d.range->left <= d.range->right, prog.here(), 0};
+                    Instr j; j.k = IK::JmpIfNot;
+                    j.e = bin(L.up ? Op::Le : Op::Ge, ref(v, true), konst(make((uint64_t)L.right, 0, 32, 0, true)));
+                    L.jf = prog.emit(j);
+                    lv.push_back(L);
+                }
+                loops.push_back({});
+                stmt(f.body);
+                patch(loops.back().continues, prog.here());
+                for (size_t k = lv.size(); k-- > 0;) {
+                    const Lvl& L = lv[k];
+                    Instr st; st.k = IK::Assign; st.sig = L.var;
+                    st.e = bin(L.up ? Op::Add : Op::Sub, ref(L.var, true), konst(make(1, 0, 32, 0, true)));
+                    prog.emit(st);
+                    Instr back; back.k = IK::Jmp; back.target = L.top; prog.emit(back);
+                    // The inner loop's init sits after the outer test, so each
+                    // outer pass starts the inner loop at its left bound again.
+                    prog.code[L.jf].target = prog.here();
+                }
+                patch(loops.back().breaks, prog.here());
+                loops.pop_back();
+                break;
+            }
             case StatementKind::WhileLoop: {
                 const auto& w = s.as<WhileLoopStatement>();
                 size_t top = prog.here();
@@ -1042,13 +1175,51 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     SigCollector(MkSig f, std::unordered_map<const slang::ast::Symbol*, int>& m)
         : mkSig(std::move(f)), sigmap(m) {}
     template <typename T> void reg(const T& s, bool net) {
-        // An unpacked array (7.4) would otherwise be one flat signal and an
-        // element select would read a bit of it. Refuse it until arrays exist.
-        if (s.getType().isUnpackedArray())
-            throw std::runtime_error("lower: unsupported unpacked array: " + std::string(s.name));
+        if (s.getType().isUnpackedArray()) { regArray(s, net); return; }
         int w = (int)s.getType().getBitWidth();
         if (w > 64) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
+    }
+    // One signal per element, named with its indices ("m[3]", "g[1][0]"),
+    // in row-major order with each dimension running left to right.
+    template <typename T> void regArray(const T& s, bool net) {
+        using namespace slang::ast;
+        auto shape = std::make_shared<ArrShape>();
+        const Type* t = &s.getType().getCanonicalType();
+        int64_t total = 1;
+        while (t->isUnpackedArray()) {
+            if (t->kind != SymbolKind::FixedSizeUnpackedArrayType)
+                throw std::runtime_error("lower: unsupported dynamic, associative, or queue array: " + std::string(s.name));
+            const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+            shape->dims.push_back({ft.range.left, ft.range.right});
+            total *= (int64_t)ft.range.width();
+            if (total > kMaxArrayElems)
+                throw std::runtime_error("lower: unsupported array with more than 2^20 elements: " + std::string(s.name));
+            t = &ft.elementType.getCanonicalType();
+        }
+        int w = (int)t->getBitWidth();
+        if (w <= 0 || w > 64) unsupported_width(s.name);
+        shape->count = (int)total;
+        shape->elemW = w;
+        shape->sgn = t->isSigned();
+        shape->twoState = !t->isFourState();
+        std::string base = prefix + std::string(s.name);
+        std::vector<int64_t> idx(shape->dims.size());
+        for (int64_t n = 0; n < total; n++) {
+            int64_t rem = n;
+            for (size_t d = shape->dims.size(); d-- > 0;) {
+                int64_t sz = shape->size(d), o = rem % sz;
+                rem /= sz;
+                auto [l, r] = shape->dims[d];
+                idx[d] = l <= r ? l + o : l - o;
+            }
+            std::string name = base;
+            for (int64_t i : idx) name += "[" + std::to_string(i) + "]";
+            int id = mkSig(name, w, net);
+            if (n == 0) shape->base = id;
+            else if (id != shape->base + n) Lowerer::unsupported("array elements that are not consecutive signals");
+        }
+        arrMap()[&s] = shape;
     }
     static void unsupported_width(std::string_view n) {
         throw std::runtime_error("lower: signal wider than 64 bits: " + std::string(n));
@@ -1089,6 +1260,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     // Several assigns to one wire each own a driver slot and resolve.
     void finishAssign(Lowerer& lw, Instr i) {
         if (i.hi >= 0) Lowerer::unsupported("assign to a bit/part select");
+        if (i.arr) Lowerer::unsupported("continuous assign to a variable array index");
         i.drv = newDriver(i.sig);
         lw.prog.emit(i);
         auto rs = readSet(lw.prog);
@@ -1368,6 +1540,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                          std::function<int(int)> newDriver) {
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
+    arrMap().clear();
     SigCollector sc(mkSig, sigmap);
     comp.getRoot().visit(sc);
 
