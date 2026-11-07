@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -73,6 +74,7 @@ struct Sim {
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
 
+    Sim() { g_sformat = &Sim::sformat; }
     ~Sim() { for (auto h : all) h.destroy(); }
 
     // A wire (`net`) starts as Z, including before the first drive().
@@ -131,7 +133,30 @@ struct Sim {
     //   %%           a percent sign
     // An argument without a matching specifier is ignored, and a specifier
     // without an argument is printed as written.
+    // %f %e %g (21.2.1.3): a real, or an integer converted to one; prec < 0
+    // is the C default of 6. `R` is a real argument with no specifier.
+    static string fmtReal(char c, double d, int minW, int prec, bool zero) {
+        char spec[16], buf[512];
+        if (c == 'R') { snprintf(buf, sizeof buf, "%#g", d); return buf; }
+        if (prec < 0) prec = 6;
+        snprintf(spec, sizeof spec, "%%%s*.*%c", zero ? "" : "", c);
+        snprintf(buf, sizeof buf, spec, zero ? 0 : minW, prec, d);
+        return buf;
+    }
     static string fmtVal(char c, Val v, int minW, bool zero) {
+        if (v.str) {   // a string (6.16) prints its text with %s, and as bytes otherwise
+            if (c == 's') {
+                string t = v_str(v);
+                if (minW > 0 && (int)t.size() < minW) t = string(minW - t.size(), ' ') + t;
+                return t;
+            }
+            const string& t = v_str(v);
+            uint64_t b = 0;
+            for (char ch : t) b = (b << 8) | (unsigned char)ch;
+            v = make(b, 0, std::max(8, std::min(64, (int)t.size() * 8)));
+        }
+        if (v.real && (c == 'd' || c == 't' || c == 'b' || c == 'o' || c == 'h' || c == 'x' || c == 'c'))
+            v = v_rtoi(v, 64, true, false);   // a real printed as an integer is rounded
         auto digits = [&](int bits) {
             int n = (v.w + bits - 1) / bits;
             string s(n, '0');
@@ -197,7 +222,9 @@ struct Sim {
         if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
         return body;
     }
-    void printSys(const string& fmt, const vector<E>& args, bool newline = true) {
+    // The text of a format and its arguments ($display, $sformatf).
+    static string sformat(const string& fmt, const vector<E>& args, const Reader& rd) {
+        std::ostringstream cout;
         size_t ai = 0;
         for (size_t i = 0; i < fmt.size(); ++i) {
             char c = fmt[i];
@@ -206,18 +233,37 @@ struct Sim {
             if (i + 1 >= fmt.size()) { cout << '%'; break; }
             c = fmt[++i];
             if (c == '%') { cout << '%'; continue; }
-            bool zero = false;
-            int minW = 0;
+            bool zero = false, left = false;
+            int minW = 0, prec = -1;
+            if (c == '-' && i + 1 < fmt.size()) { left = true; c = fmt[++i]; }   // %-8d: pad on the right
             if (c == '0') { zero = true; if (i + 1 < fmt.size()) c = fmt[++i]; }
             while (isdigit((unsigned char)c) && i + 1 < fmt.size()) { minW = minW * 10 + (c - '0'); c = fmt[++i]; }
+            if (c == '.' && i + 1 < fmt.size()) {
+                prec = 0;
+                c = fmt[++i];
+                while (isdigit((unsigned char)c) && i + 1 < fmt.size()) { prec = prec * 10 + (c - '0'); c = fmt[++i]; }
+            }
+            if (c == 'R') {   // internal: a real argument with no specifier
+                if (ai >= args.size()) continue;
+                Val v = eval(args[ai++], rd);
+                cout << fmtReal('R', v_real(v), 0, -1, false);
+                continue;
+            }
             char lc = (char)tolower((unsigned char)c);
             if (lc == 'm') { cout << "top"; continue; }
-            bool known = string_view("bohxdcst").find(lc) != string_view::npos;
+            bool known = string_view("bohxdcstfeg").find(lc) != string_view::npos;
             if (!known || ai >= args.size()) { cout << fmt.substr(start, i - start + 1); continue; }
-            Val v = eval(args[ai++], [&](int s) { return get(s); });
-            cout << fmtVal(lc, v, minW, zero);
+            Val v = eval(args[ai++], rd);
+            string out = (lc == 'f' || lc == 'e' || lc == 'g') ? fmtReal(lc, v_real(v), left ? 0 : minW, prec, zero)
+                                                               : fmtVal(lc, v, left ? 1 : minW, zero);
+            if (left && (int)out.size() < minW) out += string(minW - out.size(), ' ');
+            cout << out;
         }
-        if (newline) cout << '\n';
+        return cout.str();
+    }
+    void printSys(const string& fmt, const vector<E>& args, bool newline = true) {
+        std::cout << sformat(fmt, args, [&](int s) { return get(s); });
+        if (newline) std::cout << '\n';
     }
     void strobe(const string& fmt, const vector<E>& args) { postq.push_back({false, fmt, args}); }
     void queueMon() {
