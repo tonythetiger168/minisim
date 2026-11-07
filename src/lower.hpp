@@ -103,6 +103,8 @@ struct BlockIds {
     }
 };
 inline BlockIds& blockIds() { static BlockIds b; return b; }
+// Bits a value of this type takes in a signal: a string is a 64-bit id (6.16).
+inline int storeW(const slang::ast::Type& t) { return t.isString() ? 64 : (int)t.getBitWidth(); }
 inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return r; }
 
 // name, width, and whether the signal is a net. A net starts at Z.
@@ -440,8 +442,168 @@ struct Lowerer {
     // down. Add/sub/mul stay congruent mod 2^w, signed or not, once operands
     // are extended to that width. Sign-extension is not congruent that way
     // for shifts or compares, so those extend before the operator.
+    // real (6.12): a real-typed expression is lowered by exprReal. Its
+    // fallback lowers the same expression as plain bits once (rawNext).
+    bool rawNext = false;
+    static E realK(double d) { return konst(mkreal(d)); }
+    E realOf(const slang::ast::Expression& e) {   // any expression, as a real
+        if (e.type->isFloating()) return exprReal(e);
+        return un(Op::IToR, expr(e));
+    }
+    E fcmp(int kind, E a, E b) { auto n = node(Op::FCmp, {std::move(a), std::move(b)}); n->hi = kind; return n; }
+    E rtoi(E a, int w, bool sgn, bool trunc) {
+        auto n = node(Op::RToI, {std::move(a)});
+        n->hi = w; n->sgn = sgn; n->lo = trunc ? 1 : 0;
+        return n;
+    }
+    static int mathId(std::string_view n) {
+        static const std::pair<const char*, int> t[] = {
+            {"$ln", M_LN}, {"$log10", M_LOG10}, {"$exp", M_EXP}, {"$sqrt", M_SQRT}, {"$pow", M_POW},
+            {"$floor", M_FLOOR}, {"$ceil", M_CEIL}, {"$sin", M_SIN}, {"$cos", M_COS}, {"$tan", M_TAN},
+            {"$asin", M_ASIN}, {"$acos", M_ACOS}, {"$atan", M_ATAN}, {"$atan2", M_ATAN2},
+            {"$hypot", M_HYPOT}, {"$sinh", M_SINH}, {"$cosh", M_COSH}, {"$tanh", M_TANH},
+            {"$asinh", M_ASINH}, {"$acosh", M_ACOSH}, {"$atanh", M_ATANH}};
+        for (auto& [s, id] : t) if (n == s) return id;
+        return -1;
+    }
+    E exprReal(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        if (e.type->getBitWidth() != 64) unsupported("shortreal");
+        switch (e.kind) {
+            case ExpressionKind::RealLiteral: return realK(e.as<RealLiteral>().getValue());
+            case ExpressionKind::TimeLiteral: return realK(e.as<TimeLiteral>().getValue());
+            case ExpressionKind::Conversion: {
+                const Expression& op = e.as<ConversionExpression>().operand();
+                return realOf(op);
+            }
+            case ExpressionKind::BinaryOp: {
+                const auto& b = e.as<BinaryExpression>();
+                Op op;
+                switch (b.op) {
+                    case BinaryOperator::Add: op = Op::FAdd; break;
+                    case BinaryOperator::Subtract: op = Op::FSub; break;
+                    case BinaryOperator::Multiply: op = Op::FMul; break;
+                    case BinaryOperator::Divide: op = Op::FDiv; break;
+                    case BinaryOperator::Power: op = Op::FPow; break;
+                    default: unsupported("operator on real operands");
+                }
+                return bin(op, realOf(b.left()), realOf(b.right()));
+            }
+            case ExpressionKind::UnaryOp: {
+                const auto& u = e.as<UnaryExpression>();
+                if (u.op == UnaryOperator::Minus) return un(Op::FNeg, realOf(u.operand()));
+                if (u.op == UnaryOperator::Plus) return realOf(u.operand());
+                break;
+            }
+            case ExpressionKind::ConditionalOp: {
+                const auto& c = e.as<ConditionalExpression>();
+                if (c.conditions.size() != 1) unsupported("pattern conditional");
+                return mux(expr(*c.conditions[0].expr), realOf(c.left()), realOf(c.right()));
+            }
+            case ExpressionKind::Call: {
+                const auto& call = e.as<CallExpression>();
+                if (!call.isSystemCall()) break;
+                std::string_view n = call.getSubroutineName();
+                auto args = call.arguments();
+                if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));   // s.atoreal()
+                if (n == "$realtime") { E t = node(Op::RealTime); t->k = mk(ticksPerUnit(), 64); return t; }
+                if (n == "$itor" && args.size() == 1) return un(Op::IToR, expr(*args[0]));
+                if (n == "$bitstoreal" && args.size() == 1) return un(Op::AsReal, expr(*args[0]));
+                if (int id = mathId(n); id >= 0) {
+                    std::vector<E> ks;
+                    for (auto* a : args) ks.push_back(realOf(*a));
+                    auto m = node(Op::FMath, std::move(ks));
+                    m->hi = id;
+                    return m;
+                }
+                break;
+            }
+            default: break;
+        }
+        rawNext = true;   // a real variable, array element, function result...
+        return un(Op::AsReal, expr(e));
+    }
+
+    // string (6.16): a string-typed expression is lowered by exprStr.
+    E strOf(const slang::ast::Expression& e) {   // a string, or an integral value as one
+        if (e.type->isString()) return exprStr(e);
+        return un(Op::IntToStr, expr(e));
+    }
+    static int strMethodId(std::string_view n) {
+        static const std::pair<const char*, int> t[] = {
+            {"len", S_LEN}, {"getc", S_GETC}, {"toupper", S_TOUPPER}, {"tolower", S_TOLOWER},
+            {"compare", S_COMPARE}, {"icompare", S_ICOMPARE}, {"substr", S_SUBSTR}, {"atoi", S_ATOI},
+            {"atohex", S_ATOHEX}, {"atooct", S_ATOOCT}, {"atobin", S_ATOBIN}, {"atoreal", S_ATOREAL},
+            {"putc", S_PUTC}, {"itoa", S_ITOA}, {"hextoa", S_HEXTOA}, {"octtoa", S_OCTTOA},
+            {"bintoa", S_BINTOA}, {"realtoa", S_REALTOA}};
+        for (auto& [s, id] : t) if (n == s) return id;
+        return -1;
+    }
+    // s.len(), s.substr(i, j), ...: kid 0 is the string, then the arguments.
+    E strMethod(const slang::ast::CallExpression& call, int id) {
+        auto args = call.arguments();
+        std::vector<E> ks;
+        ks.push_back(exprStr(*args[0]));
+        for (size_t a = 1; a < args.size(); a++) {
+            if (id == S_COMPARE || id == S_ICOMPARE) ks.push_back(strOf(*args[a]));
+            else if (id == S_REALTOA) ks.push_back(realOf(*args[a]));
+            else ks.push_back(expr(*args[a]));
+        }
+        auto m = node(Op::StrMethod, std::move(ks));
+        m->hi = id;
+        return m;
+    }
+    bool isStrMethodCall(const slang::ast::CallExpression& call) {
+        return call.isSystemCall() && !call.arguments().empty() && call.arguments()[0]->type->isString() &&
+               strMethodId(call.getSubroutineName()) >= 0 && call.getSubroutineName()[0] != '$';
+    }
+    E exprStr(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        switch (e.kind) {
+            case ExpressionKind::StringLiteral:
+                return konst(mkstr(std::string(e.as<StringLiteral>().getValue())));
+            case ExpressionKind::Conversion: return strOf(e.as<ConversionExpression>().operand());
+            case ExpressionKind::Concatenation: {
+                std::vector<E> parts;
+                for (auto* op : e.as<ConcatenationExpression>().operands()) parts.push_back(strOf(*op));
+                return node(Op::StrCat, std::move(parts));
+            }
+            case ExpressionKind::Replication: {
+                const auto& r = e.as<ReplicationExpression>();
+                auto n = node(Op::StrRep, {strOf(r.concat())});
+                n->hi = (int)constInt(r.count());
+                return n;
+            }
+            case ExpressionKind::ConditionalOp: {
+                const auto& c = e.as<ConditionalExpression>();
+                if (c.conditions.size() != 1) unsupported("pattern conditional");
+                return mux(expr(*c.conditions[0].expr), strOf(c.left()), strOf(c.right()));
+            }
+            case ExpressionKind::Call: {
+                const auto& call = e.as<CallExpression>();
+                if (!call.isSystemCall()) break;
+                std::string_view n = call.getSubroutineName();
+                if (n == "$sformatf" || n == "$psprintf") {
+                    auto args = call.arguments();
+                    auto f = node(Op::SFormat);
+                    formatInto(args, 'd', f->fmt, f->kids);
+                    return f;
+                }
+                if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));
+                break;
+            }
+            default: break;
+        }
+        rawNext = true;   // a string variable, array element, function result...
+        return un(Op::AsStr, expr(e));
+    }
+
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
+        bool raw = rawNext;
+        rawNext = false;
+        if (!raw && e.type->isFloating()) return exprReal(e);
+        if (!raw && e.type->isString()) return exprStr(e);
         switch (e.kind) {
             case ExpressionKind::IntegerLiteral:
                 return svLit(e.as<IntegerLiteral>().getValue(), e.type->isSigned(), ctx);
@@ -590,6 +752,18 @@ struct Lowerer {
         bool down = r.getSelectionKind() == RangeSelectionKind::IndexedDown;
         return packedSel(vt, &r.left(), nullptr, constInt(r.right()), down ? PSel::Down : PSel::Up);
     }
+    // s.f on a packed struct or union (7.2.1, 7.3.1): a constant slice.
+    PSel memberPSel(const slang::ast::MemberAccessExpression& m) {
+        using namespace slang::ast;
+        if (!m.value().type->isIntegral())
+            unsupported("member of an unpacked struct or a class");
+        if (m.member.kind != SymbolKind::Field) unsupported("member access");
+        const auto& f = m.member.as<FieldSymbol>();
+        PSel ps;
+        ps.cbit = (int64_t)f.bitOffset;
+        ps.bits = (int)f.getType().getBitWidth();
+        return ps;
+    }
     E readPSel(E base, const PSel& ps) {
         if (ps.known && ps.cbit >= 0 && ps.cbit + ps.bits <= 64)
             return slice(std::move(base), (int)(ps.cbit + ps.bits - 1), (int)ps.cbit);
@@ -669,6 +843,18 @@ struct Lowerer {
                 // (11.8.3): extend with the operand's signedness. An outer width
                 // still wins, so a truncating assign stays narrow.
                 const auto& c = e.as<ConversionExpression>();
+                if (c.operand().type->isString() && c.type->isIntegral()) {   // the text as bytes (6.16)
+                    int w = (int)c.type->getBitWidth();
+                    needWidth(w);
+                    auto n = node(Op::StrToInt, {exprStr(c.operand())});
+                    n->hi = w;
+                    return sized(n, w, c.type->isSigned(), ctx);
+                }
+                if (c.operand().type->isFloating() && c.type->isIntegral()) {   // 6.12.1: rounded
+                    int w = (int)c.type->getBitWidth();
+                    needWidth(w);
+                    return sized(rtoi(exprReal(c.operand()), w, c.type->isSigned(), false), w, c.type->isSigned(), ctx);
+                }
                 int dst = (int)c.type->getBitWidth();
                 bool fill, tag;
                 if (ctx.live && ctx.w > 0) {
@@ -692,20 +878,34 @@ struct Lowerer {
                 const auto& call = e.as<CallExpression>();
                 if (!call.isSystemCall()) {
                     E v = emitUserCall(call, true);
-                    int w = (int)e.type->getBitWidth();
+                    int w = storeW(*e.type);
                     needWidth(w);
                     return sized(std::move(v), w, e.type->isSigned(), ctx);
                 }
                 std::string_view n = call.getSubroutineName();
                 // $time / $stime / $realtime (20.3.1): the current time. minisim
                 // has one time unit, so $realtime is the same integer.
-                if (n == "$time" || n == "$stime" || n == "$realtime") {
+                if (n == "$time" || n == "$stime") {
                     // In the calling module's time unit (20.3.1), rounded.
                     int w = n == "$stime" ? 32 : 64;
                     E t = node(Op::Time);
                     t->k = mk(ticksPerUnit(), 64);
                     if (w != 64) t = resize(std::move(t), w, false, false);
                     return sized(std::move(t), w, false, ctx);
+                }
+                if (isStrMethodCall(call)) {   // s.len(), s.getc(i), s.compare(t), s.atoi() ...
+                    int w = (int)e.type->getBitWidth();
+                    needWidth(w);
+                    return sized(strMethod(call, strMethodId(n)), w, e.type->isSigned(), ctx);
+                }
+                if ((n == "$rtoi" || n == "$realtobits") && call.arguments().size() == 1) {
+                    E r = realOf(*call.arguments()[0]);
+                    int w = (int)e.type->getBitWidth();
+                    needWidth(w);
+                    if (n == "$rtoi") return sized(rtoi(r, w, e.type->isSigned(), true), w, e.type->isSigned(), ctx);
+                    auto bits = node(Op::Resize, {r});   // the same 64 bits, as an integer
+                    bits->hi = 64;
+                    return sized(bits, 64, false, ctx);
                 }
                 // e.triggered (15.5.3): e was triggered in this time slot.
                 if (n == "triggered" && call.arguments().size() == 1) {
@@ -729,6 +929,22 @@ struct Lowerer {
             }
             case ExpressionKind::UnaryOp: {
                 const auto& u = e.as<UnaryExpression>();
+                if (u.op == UnaryOperator::Preincrement || u.op == UnaryOperator::Postincrement ||
+                    u.op == UnaryOperator::Predecrement || u.op == UnaryOperator::Postdecrement) {
+                    // ++ / -- inside an expression (11.4.2): the update runs
+                    // just before the statement, and the expression reads a
+                    // copy (the old value for i++, the new one for ++i).
+                    if (!stmtDepth) unsupported("++ / -- outside a procedural statement");
+                    int w = (int)u.operand().type->getBitWidth();
+                    needWidth(w);
+                    bool post = u.op == UnaryOperator::Postincrement || u.op == UnaryOperator::Postdecrement;
+                    int tmp = fresh(w);
+                    Instr save; save.k = IK::Assign; save.sig = tmp; save.e = expr(u.operand());
+                    if (post) prog.emit(save);
+                    exprStmt(e);
+                    if (!post) { save.e = expr(u.operand()); prog.emit(save); }
+                    return sized(ref(tmp, u.operand().type->isSigned()), w, u.operand().type->isSigned(), ctx);
+                }
                 // ~a, -a, +a are context-determined (11.6.1): the operand is
                 // extended to the context width before the operator.
                 bool bw = u.op == UnaryOperator::BitwiseNot || u.op == UnaryOperator::Minus ||
@@ -766,6 +982,40 @@ struct Lowerer {
             }
             case ExpressionKind::BinaryOp: {
                 const auto& b = e.as<BinaryExpression>();
+                if (b.left().type->isString() || b.right().type->isString()) {   // 6.16: string compare
+                    int kind = -1;
+                    switch (b.op) {
+                        case BinaryOperator::LessThan: kind = 0; break;
+                        case BinaryOperator::LessThanEqual: kind = 1; break;
+                        case BinaryOperator::GreaterThan: kind = 2; break;
+                        case BinaryOperator::GreaterThanEqual: kind = 3; break;
+                        case BinaryOperator::Equality: case BinaryOperator::CaseEquality: kind = 4; break;
+                        case BinaryOperator::Inequality: case BinaryOperator::CaseInequality: kind = 5; break;
+                        default: unsupported("operator on string operands");
+                    }
+                    auto n = node(Op::StrCmp, {strOf(b.left()), strOf(b.right())});
+                    n->hi = kind;
+                    return sized(n, 1, false, ctx);
+                }
+                if (b.left().type->isFloating() || b.right().type->isFloating()) {
+                    // A comparison or logical operator on reals: a 1-bit result.
+                    auto truthOf = [&](const Expression& x) {
+                        return x.type->isFloating() ? fcmp(5, exprReal(x), realK(0)) : expr(x);
+                    };
+                    E out;
+                    switch (b.op) {
+                        case BinaryOperator::LessThan: out = fcmp(0, realOf(b.left()), realOf(b.right())); break;
+                        case BinaryOperator::LessThanEqual: out = fcmp(1, realOf(b.left()), realOf(b.right())); break;
+                        case BinaryOperator::GreaterThan: out = fcmp(2, realOf(b.left()), realOf(b.right())); break;
+                        case BinaryOperator::GreaterThanEqual: out = fcmp(3, realOf(b.left()), realOf(b.right())); break;
+                        case BinaryOperator::Equality: out = fcmp(4, realOf(b.left()), realOf(b.right())); break;
+                        case BinaryOperator::Inequality: out = fcmp(5, realOf(b.left()), realOf(b.right())); break;
+                        case BinaryOperator::LogicalAnd: out = bin(Op::LogAnd, truthOf(b.left()), truthOf(b.right())); break;
+                        case BinaryOperator::LogicalOr: out = bin(Op::LogOr, truthOf(b.left()), truthOf(b.right())); break;
+                        default: unsupported("operator on real operands");
+                    }
+                    return sized(out, 1, false, ctx);
+                }
                 bool sizeBoth = widthPropagates(b.op) || isDivMod(b.op);
                 // a ** b sizes like a shift: the result is a's width, b is
                 // self-determined (11.6.1).
@@ -825,13 +1075,16 @@ struct Lowerer {
                     case BinaryOperator::LogicalOr: kop = Op::LogOr; break;
                     case BinaryOperator::Power: kop = Op::Pow; break;
                     case BinaryOperator::CaseInequality: kop = Op::CaseEq; break;
+                    case BinaryOperator::WildcardEquality: kop = Op::WildEq; break;
+                    case BinaryOperator::WildcardInequality: kop = Op::WildEq; break;
                     case BinaryOperator::BinaryXnor: kop = Op::Xor; break;
                     case BinaryOperator::LogicalImplication: kop = Op::LogOr; l = un(Op::LogNot, l); break;
                     case BinaryOperator::LogicalEquivalence: kop = Op::Eq; l = un(Op::RedOr, l); r = un(Op::RedOr, r); break;
                     default: unsupported("binary operator");
                 }
                 E out = bin(kop, l, r);
-                if (b.op == BinaryOperator::CaseInequality) out = un(Op::LogNot, out);
+                if (b.op == BinaryOperator::CaseInequality || b.op == BinaryOperator::WildcardInequality)
+                    out = un(Op::LogNot, out);
                 if (b.op == BinaryOperator::BinaryXnor) out = un(Op::Not, out);
                 if (sizeBoth || shift) {
                     if (ctx.live && ctx.w > 0 && w != ctx.w)
@@ -865,6 +1118,59 @@ struct Lowerer {
                 const auto& r = e.as<RangeSelectExpression>();
                 PSel ps = rangePSel(r);
                 return sized(readPSel(expr(r.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+            }
+            case ExpressionKind::Assignment: {      // (a = b) inside an expression (11.3.6)
+                if (!stmtDepth) unsupported("assignment inside an expression here");
+                const auto& a = e.as<AssignmentExpression>();
+                if (a.isNonBlocking() || a.timingControl) unsupported("assignment inside an expression");
+                exprStmt(e);
+                return expr(a.left(), ctx);
+            }
+            case ExpressionKind::Inside: {          // x inside {a, [lo:hi]} (11.4.13)
+                const auto& in = e.as<InsideExpression>();
+                E acc;
+                auto pair = [&](const Expression& x, const Expression& y) {
+                    int w = std::max((int)x.type->getBitWidth(), (int)y.type->getBitWidth());
+                    needWidth(w);
+                    bool sg = x.type->isSigned() && y.type->isSigned();
+                    ExprCtx c{w, sg, sg, true};
+                    return std::pair<E, E>{expr(x, c), expr(y, c)};
+                };
+                for (const Expression* it : in.rangeList()) {
+                    E m;
+                    if (it->kind == ExpressionKind::ValueRange) {
+                        const auto& vr = it->as<ValueRangeExpression>();
+                        if (vr.rangeKind != ValueRangeKind::Simple) unsupported("tolerance range in inside");
+                        auto [l1, lo] = pair(in.left(), vr.left());
+                        auto [l2, hi] = pair(in.left(), vr.right());
+                        m = bin(Op::LogAnd, bin(Op::Ge, l1, lo), bin(Op::Le, l2, hi));
+                    } else {
+                        if (!it->type->isIntegral()) unsupported("inside on a non-integral item");
+                        auto [l, r] = pair(in.left(), *it);
+                        m = bin(Op::WildEq, l, r);
+                    }
+                    acc = acc ? bin(Op::LogOr, acc, m) : m;
+                }
+                return sized(acc ? acc : konst(mk(0, 1)), 1, false, ctx);
+            }
+            case ExpressionKind::MemberAccess: {    // s.f
+                const auto& m = e.as<MemberAccessExpression>();
+                return sized(readPSel(expr(m.value()), memberPSel(m)), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+            }
+            case ExpressionKind::SimpleAssignmentPattern:
+            case ExpressionKind::StructuredAssignmentPattern:
+            case ExpressionKind::ReplicatedAssignmentPattern: {   // '{a, b}, '{f: x}, '{n{a}} (10.9)
+                if (!e.type->isIntegral()) unsupported("assignment pattern of an unpacked type");
+                const auto& ap = static_cast<const AssignmentPatternExpressionBase&>(e);
+                std::vector<E> parts;
+                for (auto* el : ap.elements()) parts.push_back(expr(*el));
+                if (e.kind == ExpressionKind::ReplicatedAssignmentPattern) {
+                    int64_t n = constInt(e.as<ReplicatedAssignmentPatternExpression>().count());
+                    std::vector<E> rep;
+                    for (int64_t k = 0; k < n; k++) rep.insert(rep.end(), parts.begin(), parts.end());
+                    parts = std::move(rep);
+                }
+                return sized(concat(parts), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             default:
                 throw std::runtime_error("lower: unsupported expression kind " + std::string(toString(e.kind)));
@@ -900,6 +1206,12 @@ struct Lowerer {
                 const auto& r = e.as<RangeSelectExpression>();
                 lhs(r.value(), i);
                 writePSel(i, rangePSel(r));
+                return;
+            }
+            case ExpressionKind::MemberAccess: {   // s.f = ...
+                const auto& m = e.as<MemberAccessExpression>();
+                lhs(m.value(), i);
+                writePSel(i, memberPSel(m));
                 return;
             }
             case ExpressionKind::Conversion:
@@ -952,6 +1264,39 @@ struct Lowerer {
         }
     }
 
+    // Each string-literal argument is format text; any other argument
+    // fills the next specifier, or prints with the default if none is
+    // waiting ($display(a, b) prints both in decimal).
+    template <typename Args>
+    void formatInto(const Args& argv, char dflt, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        int pending = 0;
+        auto countSpecs = [](const std::string& f) {
+            int c = 0;
+            for (size_t p = 0; p < f.size(); p++) {
+                if (f[p] != '%') continue;
+                if (p + 1 < f.size() && f[p + 1] == '%') { p++; continue; }
+                size_t q = p + 1;
+                while (q < f.size() && (isdigit((unsigned char)f[q]) || f[q] == '.' || f[q] == '-')) q++;
+                if (q < f.size() && f[q] != 'm' && f[q] != 'M') c++;
+            }
+            return c;
+        };
+        for (const Expression* a : argv) {
+            if (a->kind == ExpressionKind::EmptyArgument) { fmt += ' '; continue; }
+            const Expression& pe = peel(*a);
+            if (pe.kind == ExpressionKind::StringLiteral && pending == 0) {
+                std::string f(pe.as<StringLiteral>().getValue());
+                fmt += f;
+                pending = countSpecs(f);
+                continue;
+            }
+            if (pending > 0) pending--;
+            else { fmt += '%'; fmt += a->type->isFloating() ? 'R' : a->type->isString() ? 's' : dflt; }
+            out.push_back(expr(*a));
+        }
+    }
+
     // $display / $strobe / $monitor use the kernel format (a string of %b / %d /
     // literal text, arguments evaluated when the line is printed). $finish and
     // $stop stop the sim. Anything else is still ignored.
@@ -960,6 +1305,29 @@ struct Lowerer {
         std::string_view n = call.getSubroutineName();
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
+        }
+        if (isStrMethodCall(call)) {   // s.putc(i, c), s.itoa(v), ...: s gets the new string
+            int id = strMethodId(n);
+            if (id < S_PUTC) return;   // a value method used as a statement: no effect
+            Instr i; i.k = IK::Assign;
+            lhs(*call.arguments()[0], i);
+            i.e = strMethod(call, id);
+            prog.emit(i);
+            return;
+        }
+        if (n == "$sformat" || n == "$swrite") {   // $sformat(s, fmt, ...) (21.3.3)
+            auto args = call.arguments();
+            if (args.empty()) unsupported("$sformat");
+            const Expression* dst = args[0];
+            if (dst->kind == ExpressionKind::Assignment) dst = &dst->as<AssignmentExpression>().left();
+            Instr i; i.k = IK::Assign;
+            lhs(*dst, i);
+            auto f = node(Op::SFormat);
+            formatInto(args.subspan(1), 'd', f->fmt, f->kids);
+            i.e = dst->type->isString() ? f : E(node(Op::StrToInt, {f}));
+            if (!dst->type->isString()) i.e->hi = (int)dst->type->getBitWidth();
+            prog.emit(i);
+            return;
         }
         if (n == "$readmemh" || n == "$readmemb") {   // 21.4
             auto args = call.arguments();
@@ -1007,34 +1375,7 @@ struct Lowerer {
             return;
         }
         Instr i; i.k = k; i.nonl = nonl;
-        // Each string-literal argument is format text; any other argument
-        // fills the next specifier, or prints with the default if none is
-        // waiting ($display(a, b) prints both in decimal).
-        int pending = 0;
-        auto countSpecs = [](const std::string& f) {
-            int c = 0;
-            for (size_t p = 0; p < f.size(); p++) {
-                if (f[p] != '%') continue;
-                if (p + 1 < f.size() && f[p + 1] == '%') { p++; continue; }
-                size_t q = p + 1;
-                while (q < f.size() && isdigit((unsigned char)f[q])) q++;
-                if (q < f.size() && f[q] != 'm' && f[q] != 'M') c++;
-            }
-            return c;
-        };
-        for (const Expression* a : call.arguments()) {
-            if (a->kind == ExpressionKind::EmptyArgument) { i.fmt += ' '; continue; }
-            const Expression& pe = peel(*a);
-            if (pe.kind == ExpressionKind::StringLiteral && pending == 0) {
-                std::string f(pe.as<StringLiteral>().getValue());
-                i.fmt += f;
-                pending = countSpecs(f);
-                continue;
-            }
-            if (pending > 0) pending--;
-            else { i.fmt += '%'; i.fmt += dflt; }
-            i.args.push_back(expr(*a));
-        }
+        formatInto(call.arguments(), dflt, i.fmt, i.args);
         prog.emit(i);
     }
 
@@ -1100,7 +1441,9 @@ struct Lowerer {
         for (size_t pc : implicitWaits) prog.code[pc] = waitInstr(rs);
     }
 
+    int stmtDepth = 0;   // > 0 while lowering a procedural statement
     void stmt(const slang::ast::Statement& s) {
+        struct Depth { int& d; Depth(int& x) : d(x) { d++; } ~Depth() { d--; } } depth(stmtDepth);
         using namespace slang::ast;
         switch (s.kind) {
             case StatementKind::Empty: break;
@@ -1462,7 +1805,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             sigmap[&s] = id;
             return;
         }
-        int w = (int)s.getType().getBitWidth();
+        int w = storeW(s.getType());
         if (w > 64) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
     }
@@ -1483,7 +1826,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
                 throw std::runtime_error("lower: unsupported array with more than 2^20 elements: " + std::string(s.name));
             t = &ft.elementType.getCanonicalType();
         }
-        int w = (int)t->getBitWidth();
+        int w = storeW(*t);
         if (w <= 0 || w > 64) unsupported_width(s.name);
         shape->count = (int)total;
         shape->elemW = w;
@@ -1594,13 +1937,17 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
             return;
         }
-        if (!e) return;
         const slang::ast::Scope* sc = v.getParentScope();
         if (!sc) return;
         auto pk = sc->asSymbol().kind;
         if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock) return;
+        const auto& t = v.getType();
+        // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
+        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString());
+        if (!e && !zero) return;
         if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
-        Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v); i.e = init->expr(*e);
+        Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
+        i.e = e ? init->expr(*e) : konst(mk(0, (int)t.getBitWidth()));
         init->prog.emit(i);
     }
     // `wire y = a & b;` (IEEE 1800-2023 10.3.1) is a continuous assignment to y.
@@ -1904,14 +2251,14 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             auto it = sigmap.find(sym->returnValVar);
             if (it == sigmap.end()) Lowerer::unsupported("function return");
             sub->retSig = it->second;
-            sub->retW = (int)sym->getReturnType().getBitWidth();
+            sub->retW = storeW(sym->getReturnType());
             if (sub->retW <= 0 || sub->retW > 64) Lowerer::unsupported("function return width");
             sub->retSgn = sym->getReturnType().isSigned();
         }
         for (const slang::ast::FormalArgumentSymbol* formal : sym->getArguments()) {
             auto it = sigmap.find(formal);
             if (it == sigmap.end()) Lowerer::unsupported("subroutine argument");
-            int w = (int)formal->getType().getBitWidth();
+            int w = storeW(formal->getType());
             if (w <= 0 || w > 64) Lowerer::unsupported("subroutine argument width");
             sub->args.push_back({it->second, formal->direction, w, formal->getType().isSigned()});
         }

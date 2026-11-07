@@ -136,6 +136,7 @@ private:
         return b;
     }
     static std::string val(const Val& k) {
+        if (k.real || k.str) throw CodegenUnsupported("real or string constant");
         return "Val{" + hex(k.v) + ", " + hex(k.x) + ", " + std::to_string(k.w) + ", " + hex(k.z) + ", " +
                (k.sgn ? "true" : "false") + "}";
     }

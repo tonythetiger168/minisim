@@ -3,7 +3,7 @@
 What minisim simulates, clause by clause, against IEEE Std 1800-2023.
 Clause numbers were checked against the 2023 text; most are unchanged from 1800-2017.
 A ✅ row has a test in `tests/spec/` named after its clause. Each of those tests
-is also checked against Icarus Verilog when `iverilog` is installed.
+is also checked against Icarus Verilog 13 when `iverilog` is installed.
 🟡 works with the limits listed, ❌ is an error at lowering time ("lower: unsupported ..."),
 never a silent wrong answer. If you find a construct that runs but gives the
 wrong result, that is a bug: please add a spec test for it.
@@ -15,12 +15,14 @@ wrong result, that is a bug: please add a spec test for it.
 | 5.9 | String literals | 🟡 | up to 8 characters (64 bits). `5.9-string-literal` |
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |
 | 6.11 | Integer types | ✅ | int, byte, shortint, longint, integer, bit. `6.11-integer-types` |
-| 6.12 | real, shortreal, realtime | ❌ | |
-| 6.16 | string type | ❌ | |
+| 6.8 | Default values | ✅ | 2-state variables (int, bit, real, string) start at 0 / 0.0 / ""; 4-state at x. `6.8-default-values` |
+| 6.12 | real, realtime | ✅ | arithmetic, compare, `**`, conversion both ways (rounded, 6.12.1), real arrays and function results, `$itor` `$rtoi` `$realtobits` `$bitstoreal`, 20.8 math functions. Not yet: `shortreal` (an error), reals in the VCD. `6.12-real`, `6.12.1-real-conversions` |
+| 6.16 | string type | ✅ | concatenation, replication, compare, all 6.16 methods, string arrays and function arguments, conversion to and from integral types, `case` on strings. `6.16-string`, `6.16-string-methods` |
 | 6.18 | typedef | ✅ | for the types listed here |
 | 6.19 | Enumerations | 🟡 | values and compares; no `.name()` / `.next()`. `6.19-enum` |
 | 6.20 | parameter / localparam | ✅ | incl. overrides at instantiation. `6.20-parameters` |
-| 7.2 | Structures | ❌ | packed and unpacked |
+| 7.2.1, 7.3.1 | Packed structures and unions | ✅ | member read and write, nested members. `7.2.1-packed-struct` |
+| 7.2 | Unpacked structures | ❌ | |
 | 7.4.1 | Packed arrays and ranges | ✅ | any declared range ([7:0], [8:1], [0:7]) and multidimensional packed arrays, element and part selects. `7.4.1-packed-ranges`, `7.4.1-packed-nested-write` |
 | 7.4 | Unpacked arrays | 🟡 | fixed-size unpacked arrays of any number of dimensions (up to 2^20 elements), constant or variable index, read and write; out-of-range read gives X (7.4.6). Not yet: slices, whole-array assignment or compare, arrays as ports or arguments. `7.4-unpacked-arrays`, `7.4-array-sensitivity` |
 | 7.5–7.10 | Dynamic, associative arrays, queues | ❌ | |
@@ -40,12 +42,14 @@ wrong result, that is a bug: please add a spec test for it.
 | 10.3.1 | Net declaration assignment | ✅ | `10.3.1-net-decl-assign` |
 | 10.4 | Blocking / nonblocking | ✅ | whole signal, bit-select, part-select |
 | 10.5 | Variable declaration assignment | ✅ | runs before every initial/always. `10.5-var-decl-init` |
-| 11.4.2 | Increment / decrement | 🟡 | as statements only (`i++;`), not inside expressions |
+| 11.3.6 | Assignment inside an expression | ✅ | `if ((a = b) == 0)`, blocking only |
+| 11.4.2 | Increment / decrement | ✅ | also inside expressions (`x = i++ + 1`, `while (j++ < 3)`). `11.4.2-incdec-in-expr` |
 | 11.4.3 | Arithmetic incl. unary −/+, ** | ✅ | `11.4.3-arith-unary` |
 | 11.4.4–11.4.10 | Relational, equality, logical, bitwise, reduction, shift | ✅ | `11.4.5-equality`, `11.4.9-reduction` |
 | 11.4.11 | Conditional `?:` | ✅ | |
 | 11.4.12 | Concatenation, replication | ✅ | `11.4.12.1-replication` |
-| 11.4.13 | inside | ❌ | |
+| 11.4.6 | Wildcard equality `==?` `!=?` | ✅ | `11.4.2-incdec-in-expr` |
+| 11.4.13 | inside | ✅ | values and `[lo:hi]` ranges. Not yet: unpacked arrays as items, tolerance ranges. `11.4.13-inside` |
 | 11.5.1 | Bit-select with a variable index | ✅ | read and write. `11.5.1-variable-bit-select` |
 | 11.5.1 | Indexed part-select `+:` `-:` | ✅ | constant or variable start, read and write; out-of-range bits read x and are not written. `11.5.1-indexed-part-select` |
 | 11.6–11.8 | Expression width and sign rules | ✅ | context-determined widths, signed extension |
@@ -58,11 +62,12 @@ wrong result, that is a bug: please add a spec test for it.
 | 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
 | 16 | Assertions | ❌ | immediate and concurrent |
 | 18 | Randomization | ❌ | incl. `$urandom` |
-| 20.3 | $time, $stime, $realtime | 🟡 | in the calling module's time unit, rounded. `$realtime` is still an integer (real numbers come with round 4). `20.3-time` |
+| 20.3 | $time, $stime, $realtime | 🟡 | in the calling module's time unit, rounded. `$realtime` is a real. `20.3-time` |
 | 20.2 | $finish, $stop | ✅ | `$stop` ends the run like `$finish` |
-| 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m, `%0`, widths. `21.2.1-display-formats` |
+| 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m %f %e %g, `%0`, widths, `%-8d`, `%.3f`. `21.2.1-display-formats` |
 | 21.2.2–21.2.3 | $strobe, $monitor | ✅ | |
 | 21.3 | File I/O ($fopen, $fwrite, ...) | ❌ | ignored with a warning |
+| 21.3.3 | $sformatf, $sformat, $swrite | ✅ | the same formats as $display |
 | 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
 | 21.7 | VCD ($dumpfile, $dumpvars) | 🟡 | `msim -vcd` dumps every signal; the tasks are ignored |
 | 22.7 | `` `timescale `` | ✅ | per-module unit and precision; one kernel tick is the finest precision in the design, also used as the VCD `$timescale`. `22.7-timescale` |
@@ -80,6 +85,7 @@ In order of how often typical testbenches hit them:
 2. ~~Generate blocks (27), `+:` / `-:` part-selects (11.5.1)~~ done; values wider than 64 bits next
 3. ~~`` `timescale `` (22.7), delay expressions (9.4.1), named events (15.5), disable / wait fork (9.6), final (9.2.3)~~ done
 4. `$urandom` (18.13), immediate assertions (16.3)
-5. Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2)
+5. ~~Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2), real (6.12), string (6.16)~~ done
+6. Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8), unpacked structs (7.2)
 
 Classes (8), randomization (18), and interfaces (25) are what UVM needs.

@@ -1,4 +1,4 @@
-//! icarus-skip: Icarus 12 has no .triggered and no ->>
+//! icarus-skip: Icarus 13 has no .triggered and no ->>
 // IEEE 1800-2023 15.5.3: e.triggered is true in the time slot e fires, so a
 // wait on it does not miss a trigger that ran first. 15.5.1: ->> e fires in NBA.
 module top;

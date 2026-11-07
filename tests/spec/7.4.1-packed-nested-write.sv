@@ -1,7 +1,7 @@
 // IEEE 1800-2023 7.4.1 / 11.5.1: a select of a packed-array element as an
 // assignment target, with constant and variable indices at each level, and
 // an indexed part-select counted in elements (p[i +: 2] is 16 bits).
-//! icarus-skip: Icarus 12 aborts in elab_expr.cc on p[3][7:4] = ... and on p[i +: 2] (assert on packed_dims)
+//! icarus-skip: Icarus 13 rejects p[i +: 2] on a multidimensional packed array ("reference to a net or variable is not allowed in a constant expression")
 module t;
   logic [3:0][7:0] p;
   int i, j;

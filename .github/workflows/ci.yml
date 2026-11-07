@@ -26,9 +26,24 @@ jobs:
           path: build/_deps
           key: slang-v12.1-${{ hashFiles('CMakeLists.txt') }}-${{ runner.os }}
 
-      # Icarus Verilog cross-checks the tests/spec expectations (icarus/* tests).
-      - name: Install Icarus Verilog
-        run: sudo apt-get update && sudo apt-get install -y iverilog
+      # Icarus Verilog 13 cross-checks the tests/spec expectations (icarus/*
+      # tests). The distro package is older, so build the v13_0 tag once and cache it.
+      - name: Cache Icarus Verilog 13
+        id: iv13
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/iverilog13
+          key: iverilog-v13_0-${{ runner.os }}
+
+      - name: Build Icarus Verilog 13
+        if: steps.iv13.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y gperf flex bison autoconf
+          git clone --depth 1 --branch v13_0 https://github.com/steveicarus/iverilog /tmp/iverilog
+          cd /tmp/iverilog && sh autoconf.sh && ./configure --prefix=$HOME/iverilog13 && make -j2 && make install
+
+      - name: Put Icarus Verilog 13 on PATH
+        run: echo "$HOME/iverilog13/bin" >> "$GITHUB_PATH" && ("$HOME/iverilog13/bin/iverilog" -V 2>&1 || true) | head -1
 
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang

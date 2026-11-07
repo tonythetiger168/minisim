@@ -30,9 +30,16 @@
 //   auto e = bin(Op::Add, ref(cnt), konst(mk(1, 4)));
 //   S.nba(cnt, eval(e, rd));
 #pragma once
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 struct Val {
@@ -40,6 +47,8 @@ struct Val {
     int w = 1;
     uint64_t z = 0;             // which unknown bits are Z (subset of x)
     bool sgn = false;           // expression result is signed; not stored on a net
+    bool real = false;          // v holds an IEEE double (6.12); w is 64
+    bool str = false;           // v is a string id (6.16); see strPool
     bool operator==(const Val& o) const { return v == o.v && x == o.x && z == o.z; }
 };
 
@@ -154,6 +163,91 @@ inline Val v_casez_eq(Val a, Val b) {
 inline Val v_casex_eq(Val a, Val b) {
     uint64_t care = ~(a.x | b.x);
     return mk(((a.v ^ b.v) & care) == 0);
+}
+inline double v_real(const Val& a) {
+    if (!a.real) {   // an integer used as a real
+        uint64_t v = a.v & ~a.x;
+        if (a.sgn && a.w < 64 && a.w > 0 && ((v >> (a.w - 1)) & 1)) v |= ~mask(a.w);
+        return a.sgn ? (double)(int64_t)v : (double)v;
+    }
+    double d;
+    std::memcpy(&d, &a.v, 8);
+    return d;
+}
+inline Val mkreal(double d) {
+    Val r;
+    std::memcpy(&r.v, &d, 8);
+    r.x = 0; r.z = 0; r.w = 64; r.real = true;
+    return r;
+}
+// Real to integer (6.12.1): round to nearest, ties away from zero.
+inline Val v_rtoi(const Val& a, int w, bool sgn, bool trunc) {
+    double d = v_real(a);
+    if (std::isnan(d)) return allx(w);
+    double r = trunc ? std::trunc(d) : std::round(d);
+    uint64_t bits = r < 0 ? (uint64_t)(int64_t)r : (r >= 18446744073709551616.0 ? ~0ULL : (uint64_t)r);
+    Val v = make(bits, 0, w);
+    v.sgn = sgn;
+    return v;
+}
+enum MathFn { M_LN, M_LOG10, M_EXP, M_SQRT, M_POW, M_FLOOR, M_CEIL, M_SIN, M_COS, M_TAN, M_ASIN, M_ACOS,
+              M_ATAN, M_ATAN2, M_HYPOT, M_SINH, M_COSH, M_TANH, M_ASINH, M_ACOSH, M_ATANH };
+inline double mathFn(int f, double a, double b) {
+    switch (f) {
+        case M_LN: return std::log(a);       case M_LOG10: return std::log10(a);
+        case M_EXP: return std::exp(a);      case M_SQRT: return std::sqrt(a);
+        case M_POW: return std::pow(a, b);   case M_FLOOR: return std::floor(a);
+        case M_CEIL: return std::ceil(a);    case M_SIN: return std::sin(a);
+        case M_COS: return std::cos(a);      case M_TAN: return std::tan(a);
+        case M_ASIN: return std::asin(a);    case M_ACOS: return std::acos(a);
+        case M_ATAN: return std::atan(a);    case M_ATAN2: return std::atan2(a, b);
+        case M_HYPOT: return std::hypot(a, b); case M_SINH: return std::sinh(a);
+        case M_COSH: return std::cosh(a);    case M_TANH: return std::tanh(a);
+        case M_ASINH: return std::asinh(a);  case M_ACOSH: return std::acosh(a);
+        case M_ATANH: return std::atanh(a);
+    }
+    return 0;
+}
+struct StrPool {
+    std::vector<std::string> text{""};
+    std::unordered_map<std::string, uint64_t> id{{"", 0}};
+    uint64_t of(const std::string& s) {
+        auto [it, fresh] = id.try_emplace(s, text.size());
+        if (fresh) text.push_back(s);
+        return it->second;
+    }
+};
+inline StrPool& strPool() { static StrPool p; return p; }
+inline Val mkstr(const std::string& s) {
+    Val r = make(strPool().of(s), 0, 64);
+    r.str = true;
+    return r;
+}
+inline const std::string& v_str(const Val& a) {
+    static const std::string empty;
+    if (!a.str || a.x || a.v >= strPool().text.size()) return empty;
+    return strPool().text[a.v];
+}
+inline std::string bytesToStr(const Val& a) {   // integral to string: 0 bytes dropped
+    std::string s;
+    for (int b = (a.w + 7) / 8 - 1; b >= 0; b--) {
+        char c = char(((a.v & ~a.x) >> (8 * b)) & 0xff);
+        if (c) s += c;
+    }
+    return s;
+}
+enum StrFn { S_LEN, S_GETC, S_TOUPPER, S_TOLOWER, S_COMPARE, S_ICOMPARE, S_SUBSTR, S_ATOI, S_ATOHEX,
+             S_ATOOCT, S_ATOBIN, S_ATOREAL, S_PUTC, S_ITOA, S_HEXTOA, S_OCTTOA, S_BINTOA, S_REALTOA };
+// The hook $sformatf uses: the kernel's format engine (set by the kernel).
+using Reader = std::function<Val(int)>;
+struct Expr;
+using E = std::shared_ptr<Expr>;
+inline std::string (*g_sformat)(const std::string&, const std::vector<E>&, const Reader&) = nullptr;
+inline Val v_wild_eq(Val a, Val b) {
+    align_signed(a, b);
+    uint64_t care = ~b.x;
+    if ((a.v ^ b.v) & ~a.x & care) return mk(0);
+    return (a.x & care) ? allx(1) : mk(1);
 }
 inline Val v_lt(Val a, Val b) {
     align_signed(a, b);
@@ -380,6 +474,25 @@ enum class Op {
     LogNot, LogAnd, LogOr, RedAnd, RedOr, RedXor,
     Slice, Index, Concat, Mux,
     Pow, Time,
+    WildEq,    // a ==? b: x / z bits of b match anything (11.4.6)
+    // real (6.12). Values are doubles in v, with Val::real set.
+    FAdd, FSub, FMul, FDiv, FPow, FNeg,
+    FCmp,      // hi: 0 <, 1 <=, 2 >, 3 >=, 4 ==, 5 !=; 1-bit result
+    IToR,      // integer (signed if its Val is) to real; x and z bits count as 0
+    RToI,      // real to an integer of hi bits, rounded (lo = 1: truncated, $rtoi)
+    AsReal,    // the 64 bits of kid as a real ($bitstoreal, a real variable)
+    FMath,     // hi: a math function id (20.8), one or two kids
+    RealTime,  // $realtime: k.v ticks per unit
+    // string (6.16). A string value is an id into strPool(); equal text has
+    // one id, so == and a change on a string signal compare ids.
+    AsStr,     // kid's bits are a string id
+    IntToStr,  // the bytes of kid, leading zero bytes dropped (6.16)
+    StrToInt,  // the text as bytes, the last char in the low byte, hi bits
+    StrCat,    // {a, b, ...}
+    StrRep,    // {hi{a}}
+    StrCmp,    // hi as FCmp: <, <=, >, >=, ==, !=
+    StrMethod, // hi: StrFn; kid 0 is the string
+    SFormat,   // $sformatf: fmt, then kids as the arguments
     ArrRead,   // element of an unpacked array; kids are one index per dimension
     DynSlice   // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
 };
@@ -409,9 +522,8 @@ struct ArrShape {
     }
     int64_t size(size_t d) const { auto [l, r] = dims[d]; return (l > r ? l - r : r - l) + 1; }
 };
-struct Expr;
-using E = std::shared_ptr<Expr>;
 struct Expr {
+    std::string fmt;  // SFormat
     Op op;
     Val k;            // Const
     int sig = -1;     // Ref
@@ -491,8 +603,6 @@ inline int64_t v_to_i64(Val v) {
     return (int64_t)u;
 }
 
-using Reader = std::function<Val(int)>;
-
 inline Val eval(const E& e, const Reader& rd) {
     auto k = [&](int i) { return eval(e->kids[i], rd); };
     switch (e->op) {
@@ -517,6 +627,121 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::CaseZEq: return v_casez_eq(k(0), k(1));
         case Op::CaseXEq: return v_casex_eq(k(0), k(1));
         case Op::Lt: return v_lt(k(0), k(1));
+        case Op::WildEq: return v_wild_eq(k(0), k(1));
+        case Op::FAdd: return mkreal(v_real(k(0)) + v_real(k(1)));
+        case Op::FSub: return mkreal(v_real(k(0)) - v_real(k(1)));
+        case Op::FMul: return mkreal(v_real(k(0)) * v_real(k(1)));
+        case Op::FDiv: return mkreal(v_real(k(0)) / v_real(k(1)));
+        case Op::FPow: return mkreal(std::pow(v_real(k(0)), v_real(k(1))));
+        case Op::FNeg: return mkreal(-v_real(k(0)));
+        case Op::FCmp: {
+            double a = v_real(k(0)), b = v_real(k(1));
+            bool r = false;
+            switch (e->hi) {
+                case 0: r = a < b; break;  case 1: r = a <= b; break;
+                case 2: r = a > b; break;  case 3: r = a >= b; break;
+                case 4: r = a == b; break; default: r = a != b; break;
+            }
+            return mk(r);
+        }
+        case Op::IToR: return mkreal(v_real(k(0)));
+        case Op::RToI: return v_rtoi(k(0), e->hi, e->sgn, e->lo);
+        case Op::AsReal: { Val v = k(0); Val r = mkreal(0); r.v = v.v & ~v.x; return r; }
+        case Op::FMath: return mkreal(mathFn(e->hi, v_real(k(0)), e->kids.size() > 1 ? v_real(k(1)) : 0));
+        case Op::RealTime: return mkreal((double)g_simTime / (double)(e->k.v ? e->k.v : 1));
+        case Op::AsStr: { Val v = k(0); Val r = make(v.v, v.x, 64); r.str = true; return r; }
+        case Op::IntToStr: { Val v = k(0); return v.str ? v : mkstr(bytesToStr(v)); }
+        case Op::StrToInt: {
+            const std::string& s = v_str(k(0));
+            uint64_t v = 0;
+            for (size_t i = 0; i < s.size(); i++) v = (v << 8) | (unsigned char)s[i];
+            return make(v, 0, e->hi);
+        }
+        case Op::StrCat: {
+            std::string s;
+            for (size_t i = 0; i < e->kids.size(); i++) { Val v = k((int)i); s += v.str ? v_str(v) : bytesToStr(v); }
+            return mkstr(s);
+        }
+        case Op::StrRep: {
+            std::string one = v_str(k(0)), s;
+            for (int i = 0; i < e->hi; i++) s += one;
+            return mkstr(s);
+        }
+        case Op::StrCmp: {
+            int c = v_str(k(0)).compare(v_str(k(1)));
+            bool r = false;
+            switch (e->hi) {
+                case 0: r = c < 0; break;  case 1: r = c <= 0; break;
+                case 2: r = c > 0; break;  case 3: r = c >= 0; break;
+                case 4: r = c == 0; break; default: r = c != 0; break;
+            }
+            return mk(r);
+        }
+        case Op::StrMethod: {
+            std::string s = v_str(k(0));
+            auto ival = [&](int i) { return v_to_i64(k(i)); };
+            auto num = [](int64_t v, int w) { Val r = make((uint64_t)v, 0, w); r.sgn = true; return r; };
+            auto parse = [&](int base) {
+                int64_t v = 0;
+                size_t i = 0;
+                bool neg = false;
+                if (base == 10 && i < s.size() && (s[i] == '-' || s[i] == '+')) neg = s[i++] == '-';
+                for (; i < s.size(); i++) {
+                    char c = (char)std::tolower((unsigned char)s[i]);
+                    if (c == '_') continue;
+                    int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 99;
+                    if (d >= base) break;
+                    v = v * base + d;
+                }
+                return num(neg ? -v : v, 32);
+            };
+            auto radix = [&](int base) {
+                Val v = k(1);
+                uint64_t u = v.v & ~v.x;
+                if (base == 10) return std::to_string(v.sgn ? v_to_i64(v) : (int64_t)u);
+                if (!u) return std::string("0");
+                std::string r;
+                while (u) { r += "0123456789abcdef"[u % base]; u /= base; }
+                return std::string(r.rbegin(), r.rend());
+            };
+            switch (e->hi) {
+                case S_LEN: return num((int64_t)s.size(), 32);
+                case S_GETC: { int64_t i = ival(1); return make(i >= 0 && i < (int64_t)s.size() ? (unsigned char)s[i] : 0, 0, 8); }
+                case S_TOUPPER: for (auto& c : s) c = (char)std::toupper((unsigned char)c); return mkstr(s);
+                case S_TOLOWER: for (auto& c : s) c = (char)std::tolower((unsigned char)c); return mkstr(s);
+                case S_COMPARE: { int c = s.compare(v_str(k(1))); return num(c < 0 ? -1 : c > 0, 32); }
+                case S_ICOMPARE: {
+                    std::string a = s, b = v_str(k(1));
+                    for (auto& c : a) c = (char)std::tolower((unsigned char)c);
+                    for (auto& c : b) c = (char)std::tolower((unsigned char)c);
+                    int c = a.compare(b);
+                    return num(c < 0 ? -1 : c > 0, 32);
+                }
+                case S_SUBSTR: {   // s.substr(i, j): chars i..j, or "" when out of range
+                    int64_t i = ival(1), j = ival(2);
+                    if (i < 0 || j >= (int64_t)s.size() || i > j) return mkstr("");
+                    return mkstr(s.substr((size_t)i, (size_t)(j - i + 1)));
+                }
+                case S_ATOI: return parse(10);
+                case S_ATOHEX: return parse(16);
+                case S_ATOOCT: return parse(8);
+                case S_ATOBIN: return parse(2);
+                case S_ATOREAL: return mkreal(std::strtod(s.c_str(), nullptr));
+                case S_PUTC: {   // a new string; the statement writes it back
+                    int64_t i = ival(1);
+                    Val c = k(2);
+                    if (i >= 0 && i < (int64_t)s.size() && (c.v & 0xff)) s[i] = (char)(c.v & 0xff);
+                    return mkstr(s);
+                }
+                case S_ITOA: return mkstr(radix(10));
+                case S_HEXTOA: return mkstr(radix(16));
+                case S_OCTTOA: return mkstr(radix(8));
+                case S_BINTOA: return mkstr(radix(2));
+                case S_REALTOA: { char b[64]; snprintf(b, sizeof b, "%g", v_real(k(1))); return mkstr(b); }
+            }
+            return mkstr(s);
+        }
+        case Op::SFormat: return mkstr(g_sformat ? g_sformat(e->fmt, std::vector<E>(e->kids.begin(), e->kids.end()), rd) : "");
         case Op::Le: return v_le(k(0), k(1));
         case Op::Gt: return v_gt(k(0), k(1));
         case Op::Ge: return v_ge(k(0), k(1));
@@ -527,6 +752,7 @@ inline Val eval(const E& e, const Reader& rd) {
             Val v = k(0);
             Val r = v_resize(v, e->hi, e->lo && e->hi > v.w);
             r.sgn = e->sgn;
+            r.real = false;   // the bits of a real are an integer now ($realtobits)
             return r;
         }
         case Op::LogNot: return v_lnot(k(0));
