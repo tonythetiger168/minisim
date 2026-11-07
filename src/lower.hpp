@@ -34,6 +34,7 @@
 //                         [&](int sig){ return S.newDriver(sig); });
 //   for (auto& pr : r.procs) S.spawn(exec(&pr.prog));
 #pragma once
+#include <cmath>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -73,6 +74,37 @@ using ArrMap = std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<Arr
 inline ArrMap& arrMap() { static ArrMap m; return m; }
 constexpr int64_t kMaxArrayElems = 1 << 20;
 
+// Time (22.7, 3.14.3): one kernel tick is the simulation precision, the finest
+// time precision of any module, as a power of ten of a second (-9 = 1ns).
+inline int& simPrecExp() { static int p = -9; return p; }
+inline int tsExp(const slang::TimeScaleValue& v) {
+    int e = 0;
+    switch (v.unit) {
+        case slang::TimeUnit::Seconds: e = 0; break;
+        case slang::TimeUnit::Milliseconds: e = -3; break;
+        case slang::TimeUnit::Microseconds: e = -6; break;
+        case slang::TimeUnit::Nanoseconds: e = -9; break;
+        case slang::TimeUnit::Picoseconds: e = -12; break;
+        case slang::TimeUnit::Femtoseconds: e = -15; break;
+    }
+    if (v.magnitude == slang::TimeScaleMagnitude::Ten) e += 1;
+    if (v.magnitude == slang::TimeScaleMagnitude::Hundred) e += 2;
+    return e;
+}
+// Named blocks (9.6.2): an id for each block some `disable` names from outside
+// the block, and the blocks that are a whole process (Prog::roots).
+struct BlockIds {
+    std::unordered_map<const slang::ast::Symbol*, int> id;
+    std::unordered_set<int> roots;
+    std::vector<const slang::ast::Symbol*> disabledFromOutside;
+    int of(const slang::ast::Symbol* s) {
+        auto [it, fresh] = id.try_emplace(s, (int)id.size());
+        return it->second;
+    }
+};
+inline BlockIds& blockIds() { static BlockIds b; return b; }
+inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return r; }
+
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
 
@@ -101,6 +133,18 @@ struct Subr {
 struct LowerResult {
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
+    std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
+    int precExp = -9;                 // one kernel tick = 10^precExp s
+    // The tick as a VCD $timescale ("1ns", "100ps").
+    std::string timescale() const {
+        static const char* u[] = {"s", "ms", "us", "ns", "ps", "fs"};
+        int e = precExp, m = 1;
+        while (e % 3) { e--; m *= 10; }  // e.g. -10 = 100ps
+        int k = -e / 3;
+        if (k < 0) k = 0;
+        if (k > 5) k = 5;
+        return std::to_string(m) + u[k];
+    }
 };
 
 // A parent asked for a width. fill sign-extends when widening. tag is the
@@ -128,9 +172,69 @@ struct Lowerer {
         std::vector<size_t> continues;
     };
     std::vector<LoopJumps> loops;
+    // Named sequential blocks around the statement being lowered, each with
+    // the jumps a `disable` of it makes to its end.
+    std::vector<std::pair<const slang::ast::Symbol*, std::vector<size_t>>> named;
+    // A statement that is one named begin...end block.
+    static const slang::ast::Symbol* namedSeq(const slang::ast::Statement& st) {
+        using namespace slang::ast;
+        if (st.kind != StatementKind::Block) return nullptr;
+        const auto& b = st.as<BlockStatement>();
+        if (b.blockKind != StatementBlockKind::Sequential || !b.blockSymbol || b.blockSymbol->name.empty()) return nullptr;
+        return b.blockSymbol;
+    }
+    static int rootId(const slang::ast::Symbol* s) {
+        int id = blockIds().of(s);
+        blockIds().roots.insert(id);
+        return id;
+    }
+    // The event signal an event expression names (e, sub.e).
+    int eventSig(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        if (!ValueExpressionBase::isKind(x.kind)) unsupported("event expression");
+        auto it = sigmap.find(&x.as<ValueExpressionBase>().symbol);
+        if (it == sigmap.end()) unsupported("event expression");
+        return it->second;
+    }
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* subs = nullptr;
     MkSig mkSig;
     int* tempSeq = nullptr;
+    // The enclosing module's time unit and precision (powers of ten).
+    int tsUnit = -9, tsPrec = -9;
+    void setScope(const slang::ast::Scope* sc) {
+        if (!sc) return;
+        if (auto ts = sc->getTimeScale()) { tsUnit = tsExp(ts->base); tsPrec = tsExp(ts->precision); }
+    }
+    uint64_t ticksPerUnit() const { return pow10u(tsUnit - simPrecExp()); }
+    // A delay in this module's units, as kernel ticks: rounded to the module's
+    // precision first (22.7), then scaled to the simulation precision.
+    uint64_t ticksOf(double units) const {
+        double inPrec = units * (double)pow10u(tsUnit - tsPrec);
+        double r = inPrec < 0 ? 0 : std::floor(inPrec + 0.5);
+        return (uint64_t)r * pow10u(tsPrec - simPrecExp());
+    }
+    // #d: a constant becomes Instr::delay; anything else is an expression
+    // evaluated when the statement runs (9.4.1). x or z waits zero time.
+    void delayInto(const slang::ast::Expression& d, Instr& i) {
+        using namespace slang::ast;
+        const Expression& x = peel(d);
+        if (x.kind == ExpressionKind::RealLiteral) { i.delay = ticksOf(x.as<RealLiteral>().getValue()); return; }
+        if (x.kind == ExpressionKind::TimeLiteral) { i.delay = ticksOf(x.as<TimeLiteral>().getValue()); return; }
+        if (const auto* cv = d.getConstant()) {
+            if (cv->isReal()) { i.delay = ticksOf(cv->real()); return; }
+            if (cv->isInteger() && !cv->integer().hasUnknown()) {
+                auto v = cv->integer().as<int64_t>();
+                if (v) { i.delay = ticksOf((double)*v); return; }
+            }
+        }
+        if (x.kind == ExpressionKind::IntegerLiteral && !x.as<IntegerLiteral>().getValue().hasUnknown()) {
+            i.delay = ticksOf((double)*x.as<IntegerLiteral>().getValue().as<uint64_t>());
+            return;
+        }
+        if (!d.type->isIntegral()) unsupported("non-integral delay expression");
+        E v = resize(expr(d), 64, false, false);
+        i.de = bin(Op::Mul, v, konst(mk(ticksPerUnit(), 64)));
+    }
     int retSig = -1;     // function result signal while lowering a function body
     Subr* current = nullptr;
     // Set while lowering an output/inout write-back. slang's actual is an
@@ -596,10 +700,20 @@ struct Lowerer {
                 // $time / $stime / $realtime (20.3.1): the current time. minisim
                 // has one time unit, so $realtime is the same integer.
                 if (n == "$time" || n == "$stime" || n == "$realtime") {
+                    // In the calling module's time unit (20.3.1), rounded.
                     int w = n == "$stime" ? 32 : 64;
                     E t = node(Op::Time);
+                    t->k = mk(ticksPerUnit(), 64);
                     if (w != 64) t = resize(std::move(t), w, false, false);
                     return sized(std::move(t), w, false, ctx);
+                }
+                // e.triggered (15.5.3): e was triggered in this time slot.
+                if (n == "triggered" && call.arguments().size() == 1) {
+                    int s = eventSig(*call.arguments()[0]);
+                    E t = node(Op::Time);
+                    t->k = mk(1, 64);   // raw ticks
+                    E v = bin(Op::Eq, ref(s + 1), bin(Op::Add, t, konst(mk(1, 64))));
+                    return sized(std::move(v), 1, false, ctx);
                 }
                 // $signed / $unsigned keep the bits and change the tag.
                 if (n != "$signed" && n != "$unsigned") unsupported("system function");
@@ -802,8 +916,8 @@ struct Lowerer {
         using namespace slang::ast;
         if (t.kind == TimingControlKind::SignalEvent) {
             const auto& s = t.as<SignalEventControl>();
-            if (s.expr.kind != ExpressionKind::NamedValue) unsupported("event on non-signal");
-            int sig = sigmap.at(&s.expr.as<NamedValueExpression>().symbol);
+            if (!ValueExpressionBase::isKind(s.expr.kind)) unsupported("event on non-signal");
+            int sig = sigmap.at(&s.expr.as<ValueExpressionBase>().symbol);
             Edge e = s.edge == EdgeKind::PosEdge ? POS : s.edge == EdgeKind::NegEdge ? NEG : ANY;
             ev.push_back({sig, e});
         } else if (t.kind == TimingControlKind::EventList) {
@@ -818,9 +932,8 @@ struct Lowerer {
         switch (t.kind) {
             case TimingControlKind::Delay: {
                 const auto& d = t.as<DelayControl>();
-                if (d.expr.kind != ExpressionKind::IntegerLiteral) unsupported("non-literal delay");
                 Instr i; i.k = IK::WaitDelay;
-                i.delay = *d.expr.as<IntegerLiteral>().getValue().as<uint64_t>();
+                delayInto(d.expr, i);
                 prog.emit(i);
                 break;
             }
@@ -937,6 +1050,29 @@ struct Lowerer {
             if (a.isCompound()) lvalue = &a.left();
             i.e = expr(a.right());
             lvalue = saved;
+            if (const TimingControl* tc = a.timingControl) {   // a = #d b; a <= #d b (9.4.5)
+                if (tc->kind != TimingControlKind::Delay) unsupported("intra-assignment event control");
+                Instr d;
+                delayInto(tc->as<DelayControl>().expr, d);
+                if (a.isNonBlocking()) {   // the update is scheduled d later; the process goes on
+                    i.delay = d.delay;
+                    i.de = d.de;
+                    i.nbaLater = true;
+                    prog.emit(i);
+                    return;
+                }
+                // Blocking: the value is taken now, written after the wait.
+                int w = (int)a.left().type->getBitWidth();
+                needWidth(w);
+                int tmp = fresh(w);
+                Instr hold; hold.k = IK::Assign; hold.sig = tmp; hold.e = i.e;
+                prog.emit(hold);
+                d.k = IK::WaitDelay;
+                prog.emit(d);
+                i.e = ref(tmp);
+                prog.emit(i);
+                return;
+            }
             prog.emit(i);
         } else if (ex.kind == ExpressionKind::UnaryOp) {   // i++ / ++i / i-- / --i
             const auto& u = ex.as<UnaryExpression>();
@@ -973,7 +1109,15 @@ struct Lowerer {
                 break;
             case StatementKind::Block: {
                 const auto& b = s.as<BlockStatement>();
-                if (b.blockKind == StatementBlockKind::Sequential) { stmt(b.body); break; }
+                if (b.blockKind == StatementBlockKind::Sequential) {
+                    if (!b.blockSymbol || b.blockSymbol->name.empty()) { stmt(b.body); break; }
+                    size_t k = named.size();
+                    named.push_back({b.blockSymbol, {}});
+                    stmt(b.body);
+                    patch(named[k].second, prog.here());   // disable blk: jump past it
+                    named.pop_back();
+                    break;
+                }
                 // fork ... join / join_any / join_none (9.3.2): each statement
                 // of the block is its own process. Fork starts them all, then
                 // waits for all, for the first, or not at all.
@@ -984,10 +1128,15 @@ struct Lowerer {
                 auto branch = [&](const Statement& st) {
                     Lowerer lw(sigmap);
                     lw.bind(subs, mkSig, tempSeq, store);
+                    lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
                     lw.current = current;
                     lw.retSig = retSig;
                     lw.stmt(st);
                     lw.finishImplicit();
+                    // disable <named fork> ends every branch; disable <named
+                    // branch block> ends that branch.
+                    if (b.blockSymbol && !b.blockSymbol->name.empty()) lw.prog.roots.push_back(rootId(b.blockSymbol));
+                    if (const auto* nb = namedSeq(st)) lw.prog.roots.push_back(rootId(nb));
                     store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
                     f.branches.push_back(store->back().get());
                 };
@@ -1235,6 +1384,47 @@ struct Lowerer {
                 for (size_t k : toEnd) prog.code[k].target = prog.here();
                 break;
             }
+            case StatementKind::EventTrigger: {   // -> e, ->> e (15.5.1)
+                const auto& t = s.as<EventTriggerStatement>();
+                int sig = eventSig(t.target);
+                Instr cnt; cnt.k = t.isNonBlocking ? IK::Nba : IK::Assign;
+                cnt.sig = sig;
+                cnt.e = bin(Op::Add, ref(sig), konst(mk(1, 32)));
+                Instr at = cnt;
+                at.sig = sig + 1;
+                E now = node(Op::Time);
+                now->k = mk(1, 64);
+                at.e = bin(Op::Add, now, konst(mk(1, 64)));
+                if (t.timing) {
+                    if (!t.isNonBlocking || t.timing->kind != TimingControlKind::Delay)
+                        unsupported("event trigger with an event control");
+                    Instr d;
+                    delayInto(t.timing->as<DelayControl>().expr, d);
+                    for (Instr* x : {&cnt, &at}) { x->delay = d.delay; x->de = d.de; x->nbaLater = true; }
+                    // The trigger time is when it fires: now + d.
+                    E fire = node(Op::Time); fire->k = mk(1, 64);
+                    at.e = bin(Op::Add, bin(Op::Add, fire, d.de ? d.de : konst(mk(d.delay, 64))), konst(mk(1, 64)));
+                }
+                prog.emit(at);
+                prog.emit(cnt);
+                break;
+            }
+            case StatementKind::Disable: {   // disable blk (9.6.2)
+                const auto& d = s.as<DisableStatement>();
+                if (d.target.kind != ExpressionKind::ArbitrarySymbol) unsupported("disable target");
+                const Symbol* sym = d.target.as<ArbitrarySymbolExpression>().symbol;
+                if (sym->kind != SymbolKind::StatementBlock) unsupported("disable of a task");
+                for (size_t k = named.size(); k-- > 0;)
+                    if (named[k].first == sym) { named[k].second.push_back(emitJmp()); return; }
+                // A block another process is running: end that process.
+                Instr i; i.k = IK::Disable;
+                i.sig = blockIds().of(sym);
+                blockIds().disabledFromOutside.push_back(sym);
+                prog.emit(i);
+                break;
+            }
+            case StatementKind::WaitFork: { Instr i; i.k = IK::WaitFork; prog.emit(i); break; }
+            case StatementKind::DisableFork: { Instr i; i.k = IK::DisableFork; prog.emit(i); break; }
             default:
                 throw std::runtime_error("lower: unsupported statement kind " + std::string(toString(s.kind)));
         }
@@ -1263,6 +1453,15 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         : mkSig(std::move(f)), sigmap(m) {}
     template <typename T> void reg(const T& s, bool net) {
         if (s.getType().isUnpackedArray()) { regArray(s, net); return; }
+        if (s.getType().isEvent()) {
+            // A named event (15.5) is two signals: a trigger count, which an
+            // @e waits on, and the time of the last trigger + 1, which .triggered reads.
+            int id = mkSig(prefix + std::string(s.name), 32, false);
+            if (mkSig(prefix + std::string(s.name) + "$trig", 64, false) != id + 1)
+                Lowerer::unsupported("event signals that are not consecutive");
+            sigmap[&s] = id;
+            return;
+        }
         int w = (int)s.getType().getBitWidth();
         if (w > 64) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
@@ -1385,6 +1584,16 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     std::unique_ptr<Lowerer> init;
     void handle(const slang::ast::VariableSymbol& v) {
         const slang::ast::Expression* e = v.getInitializer();
+        if (v.getType().isEvent()) {   // both counters start at 0: not triggered
+            if (e) Lowerer::unsupported("event initializer (event aliasing)");
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            for (int k = 0; k < 2; k++) {
+                Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v) + k;
+                i.e = konst(mk(0, k ? 64 : 32));
+                init->prog.emit(i);
+            }
+            return;
+        }
         if (!e) return;
         const slang::ast::Scope* sc = v.getParentScope();
         if (!sc) return;
@@ -1598,11 +1807,19 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         using slang::ast::ProceduralBlockKind;
         // A final block (9.2.3) runs once when simulation ends. Lowering it as
         // a process would run it at time 0 and, looping, forever.
-        if (p.procedureKind == ProceduralBlockKind::Final) Lowerer::unsupported("final block");
         Lowerer lw(sigmap);
         prep(lw);
+        lw.setScope(p.getParentScope());
         lw.stmt(p.getBody());
         lw.finishImplicit();
+        if (p.procedureKind == ProceduralBlockKind::Initial)
+            if (const auto* nb = Lowerer::namedSeq(p.getBody())) lw.prog.roots.push_back(Lowerer::rootId(nb));
+        // A final block (9.2.3) runs once, after the last time slot. slang
+        // already rejects delays and event waits in it.
+        if (p.procedureKind == ProceduralBlockKind::Final) {
+            out.finals.push_back({std::move(lw.prog), false, "final"});
+            return;
+        }
         bool loops = p.procedureKind != ProceduralBlockKind::Initial;
         if (p.procedureKind == ProceduralBlockKind::AlwaysComb ||
             p.procedureKind == ProceduralBlockKind::AlwaysLatch) {
@@ -1651,13 +1868,16 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
     arrMap().clear();
+    blockIds() = BlockIds{};
     SigCollector sc(mkSig, sigmap);
     comp.getRoot().visit(sc);
 
     struct Finder : slang::ast::ASTVisitor<Finder> {
         std::vector<const slang::ast::SubroutineSymbol*> found;
+        int prec = 1000;
         void handle(const slang::ast::InstanceSymbol& inst) {
             if (!enterInstance(inst)) return;
+            if (auto ts = inst.body.getTimeScale()) prec = std::min(prec, tsExp(ts->precision));
             visitDefault(inst);
         }
         void handle(const slang::ast::SubroutineSymbol& s) { found.push_back(&s); }
@@ -1667,6 +1887,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     };
     Finder finder;
     comp.getRoot().visit(finder);
+    // The simulation precision is the finest precision of any module (3.14.3).
+    simPrecExp() = finder.prec == 1000 ? -9 : finder.prec;
+    out.precExp = simPrecExp();
 
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*> subMap;
     std::vector<std::unique_ptr<Subr>> owned;
@@ -1702,6 +1925,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (sub->sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
         Lowerer lw(sigmap);
         lw.bind(&subMap, mkSig, &tempSeq, &out.subs);
+        lw.setScope(sub->sym);
         lw.retSig = sub->retSig;
         lw.current = sub;
         lw.stmt(sub->sym->getBody());
@@ -1713,5 +1937,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     comp.getRoot().visit(pc);
     pc.placeInit();
     rejectRecursive(order);
+    for (const slang::ast::Symbol* b : blockIds().disabledFromOutside)
+        if (!blockIds().roots.count(blockIds().of(b)))
+            Lowerer::unsupported(("disable of block '" + std::string(b->name) +
+                                  "' from outside it, unless it is a whole initial or fork branch").c_str());
     return out;
 }

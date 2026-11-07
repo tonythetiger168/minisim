@@ -107,8 +107,12 @@ int main(int argc, char** argv) {
     }
 
     S.vcdPath = vcdPath.value_or("");
-    for (auto& pr : lowered.procs) S.spawn(exec(&pr.prog));
+    S.timescale = lowered.timescale();
+    for (auto& pr : lowered.procs) S.spawn(process(&pr.prog));
     S.run(maxTime);
+    std::vector<Task> finals;
+    for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
+    S.runFinal(finals);
     std::cout.flush();
     return 0;
 }
