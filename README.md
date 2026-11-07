@@ -12,7 +12,9 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Signed arithmetic**: `signed` values, `$signed` / `$unsigned`, signed compare, add, subtract, multiply, divide, remainder, and arithmetic right shift (`>>>`)
 - **Compound assignment**: `+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=` `<<<=` `>>>=`, same result as `a = a op b`
 - **Event-driven kernel**: time wheel, active / inactive (`#0`) / NBA / postponed regions
-- **`$display` / `$strobe` / `$monitor`** on the process IR, including from the slang lowerer. `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Format is `%b`, `%d`, and literal text.
+- **`$display` / `$write` / `$strobe` / `$monitor`** (and the `b`/`o`/`h` variants). `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Formats: `%b %o %h %x %d %c %s %t %m`, `%0` and explicit widths. `$time` / `$stime` / `$realtime`
+- **`fork` / `join` / `join_any` / `join_none`**, `wait (expr)`
+- **Constants**: `parameter`, `localparam`, enum values; unary `-`/`+`, `**`, `!==`, `~&` `~|` `~^`, replication
 - **Coroutine processes**: `initial` / `always` as C++20 coroutines (`co_await Delay`, `co_await Wait`)
 - **Multi-event waits**: `@(posedge clk or negedge rst_n)`, `@*`, `always_comb`
 - **Resolved nets**: several drivers on a `wire` or `tri` resolve per bit by drive strength. A stronger 0 or 1 wins. Equal strengths on opposite values resolve to X. A driven X stays X, including when its 0-strength and 1-strength differ. Z yields. `assign (strong1, weak0)` sets the strength, and so do `buf`, `not`, `and`, `nand`, `or`, `nor`, `xor`, `xnor`, `pullup`, and `pulldown`. An undriven net stays Z.
@@ -88,8 +90,18 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 - An `inout` variable is an error. An `inout` net is connected. An `inout` whose two sides differ in width is an error
 - Declaration initializers (`logic x = 0;`, `wire y = a & b;`) are lowered. A module variable's initializer runs before every `initial` / `always`
 - Tasks and functions have no recursion, no `ref` arguments, no DPI, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
-- System tasks other than `$display` / `$strobe` / `$monitor` / `$finish` are ignored. Format is the kernel's `%b`, `%d`, and literal text
+- System tasks other than the display family, `$finish`, and `$stop` are ignored with a warning
+- Unpacked arrays are an error (no memories yet). See `docs/COVERAGE.md` for the full list
 - Vectors assumed declared `[N-1:0]`
+
+## Spec coverage and tests
+
+[`docs/COVERAGE.md`](docs/COVERAGE.md) maps IEEE 1800-2017 clauses to what minisim
+supports. `tests/spec/` holds one small test per clause, named after it
+(`9.3.2-fork-join.sv`). The expected output is in the file as `//> ` comments.
+`ctest` runs each one on `msim` (`spec/...`), and on Icarus Verilog too when
+`iverilog` is installed (`icarus/...`), so an expectation is checked against
+a second simulator. To add one, drop a `.sv` file in `tests/spec/` and re-run cmake.
 
 ## License
 
