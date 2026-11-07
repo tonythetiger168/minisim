@@ -6,13 +6,35 @@ static Val rd(int s) { return S.get(s); }
 
 struct RetFrame { const Prog* prog; size_t pc; };
 
-Task exec(const Prog* entry) {
+// One fork...join. Each branch reports when it ends; the parent resumes when
+// every branch has ended (join) or the first one has (join_any).
+struct JoinState {
+    int left = 0;          // branches still running
+    int join = 0;          // 0 join, 1 join_any, 2 join_none
+    Handle parent{};
+    bool waiting = false;  // parent is suspended on this fork
+    bool ready() const { return join == 2 || left == 0 || (join == 1 && done > 0); }
+    int done = 0;
+    void branchEnded() {
+        left--;
+        done++;
+        if (waiting && ready()) { waiting = false; S.active.push_back(parent); }
+    }
+};
+struct JoinWait {
+    shared_ptr<JoinState> js;
+    bool await_ready() const { return js->ready(); }
+    void await_suspend(Handle h) const { js->parent = h; js->waiting = true; }
+    void await_resume() const {}
+};
+
+Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
     const Prog* p = entry;
     size_t pc = 0;
     vector<RetFrame> rets;
     while (p) {
         if (pc >= p->code.size()) {
-            if (rets.empty()) co_return;
+            if (rets.empty()) goto done;
             RetFrame f = rets.back();
             rets.pop_back();
             p = f.prog;
@@ -36,18 +58,18 @@ Task exec(const Prog* entry) {
                 pc++; break;
             case IK::WaitDelay: co_await Delay{i.delay}; pc++; break;
             case IK::Display:
-                S.printSys(i.fmt, i.args);
-                if (S.finished) co_return;  // task ran; $finish already requested
+                S.printSys(i.fmt, i.args, !i.nonl);
+                if (S.finished) goto done;  // task ran; $finish already requested
                 pc++;
                 break;
             case IK::Strobe:
                 S.strobe(i.fmt, i.args);
-                if (S.finished) co_return;
+                if (S.finished) goto done;
                 pc++;
                 break;
             case IK::Monitor:
                 S.armMon(i.fmt, i.args);
-                if (S.finished) co_return;
+                if (S.finished) goto done;
                 pc++;
                 break;
             case IK::Finish:
@@ -57,7 +79,7 @@ Task exec(const Prog* entry) {
                 // process already queued runs until its next system task;
                 // that task itself runs (Icarus 13).
                 S.finished = true;
-                co_return;
+                goto done;
             case IK::Call: {
                 const Prog* callee = i.callee;
                 rets.push_back({p, pc + 1});
@@ -65,8 +87,22 @@ Task exec(const Prog* entry) {
                 pc = 0;
                 break;
             }
+            case IK::Fork: {
+                auto js = make_shared<JoinState>();
+                js->join = i.join;
+                js->left = (int)i.branches.size();
+                for (const Prog* b : i.branches) {
+                    Task t = exec(b, js);
+                    S.all.push_back(t.h);
+                    S.active.push_back(t.h);
+                }
+                pc++;
+                if (i.join != 2) co_await JoinWait{js};
+                if (S.finished) goto done;
+                break;
+            }
             case IK::Ret:
-                if (rets.empty()) co_return;
+                if (rets.empty()) goto done;
                 {
                     RetFrame f = rets.back();
                     rets.pop_back();
@@ -76,4 +112,6 @@ Task exec(const Prog* entry) {
                 break;
         }
     }
+done:
+    if (joinOf) joinOf->branchEnded();
 }
