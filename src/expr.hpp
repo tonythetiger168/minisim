@@ -234,6 +234,18 @@ inline Val v_insert(Val base, Val part, int hi, int lo) {
 
 // ---- slice a[hi:lo], concat {a,b,...} (first = most significant), ?: ----
 inline Val v_slice(Val a, int hi, int lo) { return make(a.v >> lo, a.x >> lo, hi - lo + 1, a.z >> lo); }
+// w bits of a starting at bit lo; a bit outside a reads x (11.5.1).
+inline Val v_dynslice(Val a, int64_t lo, int w) {
+    uint64_t v = 0, x = 0, z = 0;
+    for (int b = 0; b < w; b++) {
+        int64_t s = lo + b;
+        if (s < 0 || s >= a.w) { x |= 1ULL << b; continue; }
+        v |= ((a.v >> s) & 1) << b;
+        x |= ((a.x >> s) & 1) << b;
+        z |= ((a.z >> s) & 1) << b;
+    }
+    return make(v, x, w, z);
+}
 inline Val v_concat(const std::vector<Val>& parts) {
     Val r{0, 0, 0};
     for (auto& p : parts) {
@@ -368,7 +380,8 @@ enum class Op {
     LogNot, LogAnd, LogOr, RedAnd, RedOr, RedXor,
     Slice, Index, Concat, Mux,
     Pow, Time,
-    ArrRead    // element of an unpacked array; kids are one index per dimension
+    ArrRead,   // element of an unpacked array; kids are one index per dimension
+    DynSlice   // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
 };
 
 // A fixed-size unpacked array (IEEE 1800-2023 7.4) is `count` consecutive
@@ -532,6 +545,12 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::Mux: return v_mux(k(0), k(1), k(2));
         case Op::Pow: return v_pow(k(0), k(1));
         case Op::Time: return make(g_simTime, 0, 64, 0);
+        case Op::DynSlice: {
+            Val a = k(0), i = k(1);
+            if (i.x) return allx(e->hi);
+            int64_t s = v_to_i64(i);
+            return v_dynslice(a, e->lo ? s - e->hi + 1 : s, e->hi);
+        }
         case Op::ArrRead: {
             // An index with x/z bits, or one outside the bounds, reads the
             // element type's default: X for 4-state, 0 for 2-state (7.4.6).

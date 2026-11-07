@@ -13,7 +13,7 @@
 //                and function calls (input, output, inout)
 //   expressions: literals, variable refs, unary/binary ops, ?:, {concat},
 //                a[expr], a[hi:lo], a function call
-// Assumes vectors are declared [N-1:0] (zero-based) so index == bit position.
+// Selects use the declared range ([7:0], [8:1], [0:7], [3:0][7:0]); see packedSel.
 // A ConversionExpression is lowered at the conversion's bit width so a
 // context-determined operator (a = 4'hF + 4'h1 with a 8 bits wide) is not
 // evaluated at the operands' self-determined width. Widening sign-extends
@@ -429,6 +429,106 @@ struct Lowerer {
         return n;
     }
 
+    // A select of a packed vector (11.5.1, 7.4.1), as a bit range of the
+    // signal. Indices are in declared numbering: [7:0], [8:1], or [0:7] all
+    // work, and an element of a packed array (logic [3:0][7:0] x; x[1]) is
+    // its whole element. Either the start bit is a constant (cbit) or it is
+    // computed at run time (vbit); a part outside the vector reads x.
+    struct PSel { enum Kind { Index, Up, Down, Range }; bool known = true; int64_t cbit = 0; E vbit; int bits = 1; };
+    PSel packedSel(const slang::ast::Type& vt, const slang::ast::Expression* idx,
+                   const slang::ast::Expression* idx2, int64_t count, PSel::Kind kind) {
+        using namespace slang::ast;
+        int W = (int)vt.getBitWidth();
+        int64_t left = W - 1, right = 0;
+        if (vt.hasFixedRange()) { auto fr = vt.getFixedRange(); left = fr.left; right = fr.right; }
+        bool desc = left >= right;
+        int64_t n = (desc ? left - right : right - left) + 1;
+        int ew = n > 0 ? (int)(W / n) : 1;
+        PSel ps;
+        auto isConst = [](const Expression* x) { return x->kind == ExpressionKind::IntegerLiteral || x->getConstant(); };
+        // first declared index covered by the select, lowest position first
+        auto startPos = [&](int64_t i) -> int64_t {
+            switch (kind) {
+                case PSel::Index: return desc ? i - right : right - i;
+                case PSel::Up:    return desc ? i - right : right - i - count + 1;
+                case PSel::Down:  return desc ? i - count + 1 - right : right - i;
+                case PSel::Range: return 0;
+            }
+            return 0;
+        };
+        if (kind == PSel::Range) {   // a[x:y], both constant
+            int64_t x = constInt(*idx), y = constInt(*idx2);
+            int64_t lo = desc ? std::min(x, y) - right : right - std::max(x, y);
+            ps.cbit = lo * ew;
+            ps.bits = (int)((x > y ? x - y : y - x) + 1) * ew;
+            return ps;
+        }
+        ps.bits = (int)count * ew;
+        if (isConst(idx)) { ps.cbit = startPos(constInt(*idx)) * ew; return ps; }
+        ps.known = false;
+        E ix = resize(expr(*idx), 64, idx->type->isSigned(), true);
+        auto K = [](int64_t v) { return konst(make((uint64_t)v, 0, 64, 0, true)); };
+        E pos;
+        switch (kind) {
+            case PSel::Index: pos = desc ? bin(Op::Sub, ix, K(right)) : bin(Op::Sub, K(right), ix); break;
+            case PSel::Up:    pos = desc ? bin(Op::Sub, ix, K(right)) : bin(Op::Sub, K(right - count + 1), ix); break;
+            case PSel::Down:  pos = desc ? bin(Op::Sub, ix, K(count - 1 + right)) : bin(Op::Sub, K(right), ix); break;
+            default: break;
+        }
+        ps.vbit = ew == 1 ? pos : bin(Op::Mul, pos, K(ew));
+        return ps;
+    }
+    PSel rangePSel(const slang::ast::RangeSelectExpression& r) {
+        using namespace slang::ast;
+        const Type& vt = *r.value().type;
+        if (r.getSelectionKind() == RangeSelectionKind::Simple)
+            return packedSel(vt, &r.left(), &r.right(), 0, PSel::Range);
+        bool down = r.getSelectionKind() == RangeSelectionKind::IndexedDown;
+        return packedSel(vt, &r.left(), nullptr, constInt(r.right()), down ? PSel::Down : PSel::Up);
+    }
+    E readPSel(E base, const PSel& ps) {
+        if (ps.known && ps.cbit >= 0 && ps.cbit + ps.bits <= 64)
+            return slice(std::move(base), (int)(ps.cbit + ps.bits - 1), (int)ps.cbit);
+        E start = ps.known ? konst(make((uint64_t)ps.cbit, 0, 64, 0, true)) : ps.vbit;
+        auto n = node(Op::DynSlice, {std::move(base), start});
+        n->hi = ps.bits;
+        n->lo = 0;
+        return n;
+    }
+    // The same select as an assignment target. When the target already has a
+    // select (p[3][7:4] = ...), this one is inside it: offsets add up.
+    void writePSel(Instr& i, const PSel& ps) {
+        bool inner = i.hi >= 0 || i.bidx;
+        if (inner) {
+            auto K = [](int64_t v) { return konst(make((uint64_t)v, 0, 64, 0, true)); };
+            if (!i.bidx && ps.known) {
+                if (ps.cbit < 0 || ps.cbit + ps.bits > i.hi - i.lo + 1) unsupported("constant select outside the element");
+                i.lo += (int)ps.cbit;
+                i.hi = i.lo + ps.bits - 1;
+                return;
+            }
+            E outer = ps.known ? K(ps.cbit) : ps.vbit;
+            E base = i.bidx ? i.bidx : K(i.lo);
+            i.bidx = bin(Op::Add, base, outer);
+            i.pw = ps.bits;
+            i.pdown = false;
+            i.hi = 0;
+            i.lo = 0;
+            return;
+        }
+        if (ps.known) {
+            if (ps.cbit < 0 || ps.cbit + ps.bits > 64) unsupported("constant select outside the vector");
+            i.lo = (int)ps.cbit;
+            i.hi = (int)(ps.cbit + ps.bits - 1);
+            return;
+        }
+        i.bidx = ps.vbit;
+        i.pw = ps.bits;
+        i.pdown = false;
+        i.hi = 0;
+        i.lo = 0;
+    }
+
     // A parameter, localparam, or enum value (6.20, 6.19.3) is its constant.
     E constSym(const slang::ast::Symbol& sym, const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
@@ -443,8 +543,9 @@ struct Lowerer {
     E expr2(const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
         switch (e.kind) {
-            case ExpressionKind::NamedValue: {
-                const Symbol* sym = &e.as<NamedValueExpression>().symbol;
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue: {   // x, or u.x / blk[2].x (23.6)
+                const Symbol* sym = &e.as<ValueExpressionBase>().symbol;
                 auto it = sigmap.find(sym);
                 if (it == sigmap.end()) return constSym(*sym, e, ctx);
                 int src = (int)e.type->getBitWidth();
@@ -643,22 +744,16 @@ struct Lowerer {
                 if (auto as = arraySel(e))
                     return sized(arrayRead(*as), as->a->elemW, as->a->sgn, ctx);
                 const auto& sel = e.as<ElementSelectExpression>();
-                E base = expr(sel.value());
-                const auto& idx = sel.selector();
-                int tw = (int)e.type->getBitWidth();
-                if (idx.kind == ExpressionKind::IntegerLiteral || idx.getConstant()) {
-                    int i = (int)constInt(idx);
-                    return sized(slice(base, i, i), tw, e.type->isSigned(), ctx);
-                }
-                return sized(bin(Op::Index, base, expr(idx)), tw, e.type->isSigned(), ctx);
+                PSel ps = packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index);
+                return sized(readPSel(expr(sel.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
-            case ExpressionKind::RangeSelect: {     // a[hi:lo]
+            case ExpressionKind::RangeSelect: {     // a[hi:lo], a[i +: w], a[i -: w]
                 const auto& r = e.as<RangeSelectExpression>();
-                if (r.getSelectionKind() != RangeSelectionKind::Simple) unsupported("indexed part-select (+: / -:)");
-                return sized(slice(expr(r.value()), (int)constInt(r.left()), (int)constInt(r.right())),
-                             (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                PSel ps = rangePSel(r);
+                return sized(readPSel(expr(r.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
-            default: unsupported("expression kind");
+            default:
+                throw std::runtime_error("lower: unsupported expression kind " + std::string(toString(e.kind)));
         }
     }
 
@@ -667,8 +762,12 @@ struct Lowerer {
         using namespace slang::ast;
         switch (e.kind) {
             case ExpressionKind::NamedValue:
-                i.sig = sigmap.at(&e.as<NamedValueExpression>().symbol);
+            case ExpressionKind::HierarchicalValue: {
+                auto it = sigmap.find(&e.as<ValueExpressionBase>().symbol);
+                if (it == sigmap.end()) unsupported("assignment to a non-signal");
+                i.sig = it->second;
                 return;
+            }
             case ExpressionKind::ElementSelect: {
                 if (auto as = arraySel(e)) {   // mem[i] = ...
                     int64_t off = as->constant ? constOffset(*as) : -1;
@@ -679,27 +778,14 @@ struct Lowerer {
                     return;
                 }
                 const auto& sel = e.as<ElementSelectExpression>();
-                if (sel.value().kind != ExpressionKind::NamedValue && !arraySel(sel.value()))
-                    unsupported("nested select target");
                 lhs(sel.value(), i);
-                const auto& idx = sel.selector();
-                if (idx.kind == ExpressionKind::IntegerLiteral || idx.getConstant()) {
-                    i.hi = i.lo = (int)constInt(idx);
-                } else {   // v[i] = ... with i known only at run time (11.5.1)
-                    i.bidx = expr(idx);
-                    i.hi = 0;
-                    i.lo = 0;   // the vector's low bound; vectors are [N-1:0]
-                }
+                writePSel(i, packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index));
                 return;
             }
-            case ExpressionKind::RangeSelect: {
+            case ExpressionKind::RangeSelect: {   // v[7:4] = ..., v[i +: w] = ... (11.5.1)
                 const auto& r = e.as<RangeSelectExpression>();
-                if (r.getSelectionKind() != RangeSelectionKind::Simple) unsupported("indexed part-select target");
-                if (r.value().kind != ExpressionKind::NamedValue && !arraySel(r.value()))
-                    unsupported("nested select target");
                 lhs(r.value(), i);
-                i.hi = (int)constInt(r.left());
-                i.lo = (int)constInt(r.right());
+                writePSel(i, rangePSel(r));
                 return;
             }
             case ExpressionKind::Conversion:
@@ -1149,7 +1235,8 @@ struct Lowerer {
                 for (size_t k : toEnd) prog.code[k].target = prog.here();
                 break;
             }
-            default: unsupported("statement kind");
+            default:
+                throw std::runtime_error("lower: unsupported statement kind " + std::string(toString(s.kind)));
         }
     }
 };
@@ -1238,6 +1325,22 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         visitDefault(inst);
         prefix = std::move(saved);
     }
+    // Generate blocks (27): a signal inside one is named with its block,
+    // "gen[2].x" for a loop iteration and "genblk1.x" for an unnamed block
+    // (27.6). A block that was not selected is skipped.
+    void handle(const slang::ast::GenerateBlockSymbol& g) {
+        if (g.isUninstantiated) return;
+        std::string saved = prefix;
+        const auto* parent = g.getParentScope() ? &g.getParentScope()->asSymbol() : nullptr;
+        if (parent && parent->kind == slang::ast::SymbolKind::GenerateBlockArray) {
+            std::string an = parent->name.empty() ? std::string("genblk") : std::string(parent->name);
+            prefix += an + "[" + (g.getArrayIndex() ? g.getArrayIndex()->toString() : std::string("?")) + "].";
+        } else {
+            prefix += g.getExternalName() + ".";
+        }
+        visitDefault(g);
+        prefix = std::move(saved);
+    }
 };
 
 // Pass 2: lower every procedural block and connect instance ports.
@@ -1259,8 +1362,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     // One driver, then wait on every signal the right-hand side reads.
     // Several assigns to one wire each own a driver slot and resolve.
     void finishAssign(Lowerer& lw, Instr i) {
-        if (i.hi >= 0) Lowerer::unsupported("assign to a bit/part select");
-        if (i.arr) Lowerer::unsupported("continuous assign to a variable array index");
+        // assign v[3] = ... / assign v[7:4] = ... (10.3): this driver drives
+        // only those bits; the rest of its slot stays Z, so other drivers of
+        // the other bits resolve with it.
+        if (i.arr || i.bidx) Lowerer::unsupported("continuous assign to a variable index");
         i.drv = newDriver(i.sig);
         lw.prog.emit(i);
         auto rs = readSet(lw.prog);
@@ -1282,7 +1387,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         const slang::ast::Expression* e = v.getInitializer();
         if (!e) return;
         const slang::ast::Scope* sc = v.getParentScope();
-        if (!sc || sc->asSymbol().kind != slang::ast::SymbolKind::InstanceBody) return;
+        if (!sc) return;
+        auto pk = sc->asSymbol().kind;
+        if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock) return;
         if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v); i.e = init->expr(*e);
         init->prog.emit(i);
@@ -1484,6 +1591,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         connectInstance(inst);
         visitDefault(inst);
     }
+    void handle(const slang::ast::GenerateBlockSymbol& g) {
+        if (!g.isUninstantiated) visitDefault(g);
+    }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
         // A final block (9.2.3) runs once when simulation ends. Lowering it as
@@ -1551,6 +1661,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             visitDefault(inst);
         }
         void handle(const slang::ast::SubroutineSymbol& s) { found.push_back(&s); }
+        void handle(const slang::ast::GenerateBlockSymbol& g) {
+            if (!g.isUninstantiated) visitDefault(g);
+        }
     };
     Finder finder;
     comp.getRoot().visit(finder);

@@ -21,7 +21,8 @@ wrong result, that is a bug: please add a spec test for it.
 | 6.19 | Enumerations | 🟡 | values and compares; no `.name()` / `.next()`. `6.19-enum` |
 | 6.20 | parameter / localparam | ✅ | incl. overrides at instantiation. `6.20-parameters` |
 | 7.2 | Structures | ❌ | packed and unpacked |
-| 7.4 | Packed / unpacked arrays | 🟡 | fixed-size unpacked arrays of any number of dimensions (up to 2^20 elements), constant or variable index, read and write; out-of-range read gives X (7.4.6). Not yet: slices, whole-array assignment or compare, arrays as ports or arguments. `7.4-unpacked-arrays`, `7.4-array-sensitivity` |
+| 7.4.1 | Packed arrays and ranges | ✅ | any declared range ([7:0], [8:1], [0:7]) and multidimensional packed arrays, element and part selects. `7.4.1-packed-ranges`, `7.4.1-packed-nested-write` |
+| 7.4 | Unpacked arrays | 🟡 | fixed-size unpacked arrays of any number of dimensions (up to 2^20 elements), constant or variable index, read and write; out-of-range read gives X (7.4.6). Not yet: slices, whole-array assignment or compare, arrays as ports or arguments. `7.4-unpacked-arrays`, `7.4-array-sensitivity` |
 | 7.5–7.10 | Dynamic, associative arrays, queues | ❌ | |
 | 8 | Classes | ❌ | blocks UVM |
 | 9.2 | initial, always, always_comb/ff/latch | ✅ | |
@@ -33,7 +34,7 @@ wrong result, that is a bug: please add a spec test for it.
 | 9.4.3 | wait | ✅ | `9.4.3-wait` |
 | 9.4.5 | Intra-assignment delay | ✅ | `a <= #2 b` |
 | 9.6 | disable, wait fork | ❌ | |
-| 10.3 | Continuous assignment | ✅ | with drive strength |
+| 10.3 | Continuous assignment | ✅ | with drive strength; to a whole signal or a constant bit / part select |
 | 10.3.1 | Net declaration assignment | ✅ | `10.3.1-net-decl-assign` |
 | 10.4 | Blocking / nonblocking | ✅ | whole signal, bit-select, part-select |
 | 10.5 | Variable declaration assignment | ✅ | runs before every initial/always. `10.5-var-decl-init` |
@@ -44,7 +45,7 @@ wrong result, that is a bug: please add a spec test for it.
 | 11.4.12 | Concatenation, replication | ✅ | `11.4.12.1-replication` |
 | 11.4.13 | inside | ❌ | |
 | 11.5.1 | Bit-select with a variable index | ✅ | read and write. `11.5.1-variable-bit-select` |
-| 11.5.1 | Indexed part-select `+:` `-:` | ❌ | |
+| 11.5.1 | Indexed part-select `+:` `-:` | ✅ | constant or variable start, read and write; out-of-range bits read x and are not written. `11.5.1-indexed-part-select` |
 | 11.6–11.8 | Expression width and sign rules | ✅ | context-determined widths, signed extension |
 | 12.4 | if / else; 12.4.2 unique / priority if | ✅ | the unique/priority violation itself is not reported |
 | 12.5 | case, casez, casex; 12.5.3 unique case | ✅ | `12.5-unique-case` |
@@ -62,8 +63,9 @@ wrong result, that is a bug: please add a spec test for it.
 | 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
 | 21.7 | VCD ($dumpfile, $dumpvars) | 🟡 | `msim -vcd` dumps every signal; the tasks are ignored |
 | 23.3 | Module instances, ports | ✅ | named and positional, parameter overrides |
+| 23.6 | Hierarchical names | ✅ | read and write `u.x`, `blk[2].x`. `23.6-hierarchical-names` |
 | 25 | Interfaces, modports | ❌ | |
-| 27 | Generate | ❌ | |
+| 27 | Generate | ✅ | loop, if, and case generate; named and unnamed blocks (`genblkN`); instances and continuous assigns to separate bits inside. `27-generate` |
 | 28 | Gate primitives | 🟡 | and/or/xor families, buf/not, pullup/pulldown |
 
 ## Next up
@@ -71,7 +73,7 @@ wrong result, that is a bug: please add a spec test for it.
 In order of how often typical testbenches hit them:
 
 1. ~~Unpacked arrays and memories (7.4), `foreach` (12.7.3), `$readmemh` (21.4)~~ done
-2. Values wider than 64 bits, generate blocks (27), `+:` / `-:` part-selects (11.5.1)
+2. ~~Generate blocks (27), `+:` / `-:` part-selects (11.5.1)~~ done; values wider than 64 bits next
 3. `` `timescale `` (22.7, 20.4) and delay expressions (9.4.1)
 4. Named events (15.5), `$urandom` (18.13), immediate assertions (16.3)
 5. Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2)

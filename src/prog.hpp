@@ -59,7 +59,10 @@ struct Instr {
     std::shared_ptr<const ArrShape> arr;
     std::vector<E> aidx;
     // Assign/Nba to a bit chosen at run time (v[i] = ...): hi = lo = bidx.
+    // With pw > 0 it is v[bidx +: pw] (or -: when pdown).
     E bidx;
+    int pw = 0;
+    bool pdown = false;
     bool hex = false;
 };
 

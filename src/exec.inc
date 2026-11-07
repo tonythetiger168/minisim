@@ -7,7 +7,9 @@ static Val rd(int s) { return S.get(s); }
 struct RetFrame { const Prog* prog; size_t pc; };
 
 // Resolve a run-time array index and bit index. false: no write happens.
-static bool target(const Instr& i, int& sig, int& hi, int& lo) {
+// v is the value to write; a part-select that is partly out of range writes
+// only the bits inside the vector (11.5.1), so v is shifted to match.
+static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
     if (i.arr) {
         std::vector<int64_t> idx;
         for (auto& a : i.aidx) {
@@ -23,8 +25,17 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo) {
         Val v = eval(i.bidx, rd);
         if (v.x) return false;
         int64_t b = v_to_i64(v) - i.lo;   // lo holds the vector's low bound here
-        if (b < 0 || b >= S.sigs[sig].w) return false;
-        hi = lo = (int)b;
+        if (!i.pw) {
+            if (b < 0 || b >= S.sigs[sig].w) return false;
+            hi = lo = (int)b;
+            return true;
+        }
+        int64_t l = i.pdown ? b - i.pw + 1 : b, h = l + i.pw - 1;
+        int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, S.sigs[sig].w - 1);
+        if (cl > ch) return false;
+        val = v_slice(val, (int)(ch - l), (int)(cl - l));
+        hi = (int)ch;
+        lo = (int)cl;
     }
     return true;
 }
@@ -139,11 +150,15 @@ Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
             case IK::Assign:
             case IK::Nba: {
                 Val v = eval(i.e, rd);
-                if (i.drv >= 0) { S.drive(i.sig, i.drv, v, i.s0, i.s1); pc++; break; }
+                if (i.drv >= 0) {
+                    if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
+                    S.drive(i.sig, i.drv, v, i.s0, i.s1);
+                    pc++; break;
+                }
                 int sig = i.sig, hi = i.hi, lo = i.lo;
                 // The index of a[i] / v[i] is read when the statement runs,
                 // also for a nonblocking write. An invalid one skips it (7.4.6, 11.5.1).
-                if (!target(i, sig, hi, lo)) { pc++; break; }
+                if (!target(i, sig, hi, lo, v)) { pc++; break; }
                 if (i.k == IK::Nba) S.nba(sig, v, hi, lo);
                 else S.set(sig, hi >= 0 ? v_insert(S.get(sig), v, hi, lo) : v);
                 pc++; break;
