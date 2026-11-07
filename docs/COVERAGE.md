@@ -26,14 +26,16 @@ wrong result, that is a bug: please add a spec test for it.
 | 7.5–7.10 | Dynamic, associative arrays, queues | ❌ | |
 | 8 | Classes | ❌ | blocks UVM |
 | 9.2 | initial, always, always_comb/ff/latch | ✅ | |
-| 9.2.3 | Final procedures | ❌ | an error |
+| 9.2.3 | Final procedures | ✅ | run once after the last time slot, also after `$finish`. `9.2.3-final` |
 | 9.3.1 | begin…end | ✅ | |
 | 9.3.2 | fork…join / join_any / join_none | ✅ | `9.3.2-fork-join` |
-| 9.4.1 | Delay control | 🟡 | integer literal delays only; no `timescale` units |
-| 9.4.2 | Event control | 🟡 | posedge / negedge / any change, `or`, `@*`. No named events (`->`) |
+| 9.4.1 | Delay control | ✅ | constant, real, time literal, or any integral expression (evaluated when reached; x or z waits 0). `9.4.5-intra-assign-delay` |
+| 9.4.2 | Event control | ✅ | posedge / negedge / any change, `or`, `@*`, named events |
 | 9.4.3 | wait | ✅ | `9.4.3-wait` |
-| 9.4.5 | Intra-assignment delay | ✅ | `a <= #2 b` |
-| 9.6 | disable, wait fork | ❌ | |
+| 9.4.5 | Intra-assignment delay | ✅ | `a = #d b` and `a <= #d b`. Intra-assignment event controls (`a = @e b`) are an error. `9.4.5-intra-assign-delay` |
+| 9.6.1 | wait fork | ✅ | `9.6.1-wait-fork` |
+| 9.6.2 | disable | 🟡 | an enclosing named block (jumps past it), or a named block that is a whole initial or fork branch, or a named fork, in another process (ends it and its children). Not yet: disabling a task, or a block nested inside another process; a jump out of a block does not end processes it forked. `9.6.2-disable` |
+| 9.6.3 | disable fork | ✅ | `9.6.3-disable-fork` |
 | 10.3 | Continuous assignment | ✅ | with drive strength; to a whole signal or a constant bit / part select |
 | 10.3.1 | Net declaration assignment | ✅ | `10.3.1-net-decl-assign` |
 | 10.4 | Blocking / nonblocking | ✅ | whole signal, bit-select, part-select |
@@ -53,15 +55,17 @@ wrong result, that is a bug: please add a spec test for it.
 | 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue. `12.7.3-foreach`, `12.7.3-foreach-order` |
 | 12.8 | break, continue, return | ✅ | |
 | 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`, no DPI. `13.4-function-automatic` |
+| 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
 | 16 | Assertions | ❌ | immediate and concurrent |
 | 18 | Randomization | ❌ | incl. `$urandom` |
-| 20.3 | $time, $stime, $realtime | 🟡 | one time unit. `20.3-time` |
+| 20.3 | $time, $stime, $realtime | 🟡 | in the calling module's time unit, rounded. `$realtime` is still an integer (real numbers come with round 4). `20.3-time` |
 | 20.2 | $finish, $stop | ✅ | `$stop` ends the run like `$finish` |
 | 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m, `%0`, widths. `21.2.1-display-formats` |
 | 21.2.2–21.2.3 | $strobe, $monitor | ✅ | |
 | 21.3 | File I/O ($fopen, $fwrite, ...) | ❌ | ignored with a warning |
 | 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
 | 21.7 | VCD ($dumpfile, $dumpvars) | 🟡 | `msim -vcd` dumps every signal; the tasks are ignored |
+| 22.7 | `` `timescale `` | ✅ | per-module unit and precision; one kernel tick is the finest precision in the design, also used as the VCD `$timescale`. `22.7-timescale` |
 | 23.3 | Module instances, ports | ✅ | named and positional, parameter overrides |
 | 23.6 | Hierarchical names | ✅ | read and write `u.x`, `blk[2].x`. `23.6-hierarchical-names` |
 | 25 | Interfaces, modports | ❌ | |
@@ -74,8 +78,8 @@ In order of how often typical testbenches hit them:
 
 1. ~~Unpacked arrays and memories (7.4), `foreach` (12.7.3), `$readmemh` (21.4)~~ done
 2. ~~Generate blocks (27), `+:` / `-:` part-selects (11.5.1)~~ done; values wider than 64 bits next
-3. `` `timescale `` (22.7, 20.4) and delay expressions (9.4.1)
-4. Named events (15.5), `$urandom` (18.13), immediate assertions (16.3)
+3. ~~`` `timescale `` (22.7), delay expressions (9.4.1), named events (15.5), disable / wait fork (9.6), final (9.2.3)~~ done
+4. `$urandom` (18.13), immediate assertions (16.3)
 5. Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2)
 
 Classes (8), randomization (18), and interfaces (25) are what UVM needs.

@@ -263,6 +263,8 @@ private:
                 auto tgt = [&](size_t t) { return L(P, t > p.code.size() ? p.code.size() : t); };
                 // A write chosen at run time (a[i] = ..., v[i] = ...) is not compiled yet.
                 if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
+                if (i.de || i.nbaLater) throw CodegenUnsupported("delay expression or intra-assignment delay");
+                if (!p.roots.empty()) throw CodegenUnsupported("disable of a named block");
                 switch (i.k) {
                     case IK::Assign:
                         if (i.drv >= 0)

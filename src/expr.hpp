@@ -544,7 +544,10 @@ inline Val eval(const E& e, const Reader& rd) {
         }
         case Op::Mux: return v_mux(k(0), k(1), k(2));
         case Op::Pow: return v_pow(k(0), k(1));
-        case Op::Time: return make(g_simTime, 0, 64, 0);
+        case Op::Time: {   // k.v ticks per time unit of the calling module
+            uint64_t d = e->k.v ? e->k.v : 1;
+            return make((g_simTime + d / 2) / d, 0, 64, 0);
+        }
         case Op::DynSlice: {
             Val a = k(0), i = k(1);
             if (i.x) return allx(e->hi);
