@@ -23,8 +23,7 @@
 // expression drives the child's formal. An output's external expression is an
 // assignment whose right-hand side is an EmptyArgument (the formal), the same
 // shape as a subroutine output write-back. An inout net is both directions.
-// Not yet:  nmos/pmos/cmos/tran, bufif/notif, trireg, net initializers
-//           (wire y = ..), a[i +: w], recursive
+// Not yet:  nmos/pmos/cmos/tran, bufif/notif, trireg, a[i +: w], recursive
 //           tasks/functions, ref arguments, DPI, class methods,
 //           hierarchical calls, instance arrays, interfaces, hierarchical
 //           references into a child. Arguments are one static copy per subroutine.
@@ -948,6 +947,37 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         out.procs.push_back({std::move(lw.prog), loops, "assign"});
     }
 
+    // Module-level `logic x = v;` (IEEE 1800 6.8): a static variable's
+    // declaration initializer runs before any initial or always procedure
+    // starts. All of them go into one process that lower() places first, so
+    // it is the first thing to run at time 0. Locals of a block, task or
+    // function are not module members and are handled by Lowerer.
+    std::unique_ptr<Lowerer> init;
+    void handle(const slang::ast::VariableSymbol& v) {
+        const slang::ast::Expression* e = v.getInitializer();
+        if (!e) return;
+        const slang::ast::Scope* sc = v.getParentScope();
+        if (!sc || sc->asSymbol().kind != slang::ast::SymbolKind::InstanceBody) return;
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v); i.e = init->expr(*e);
+        init->prog.emit(i);
+    }
+    // `wire y = a & b;` (IEEE 1800 6.7.1) is a continuous assignment to y.
+    void handle(const slang::ast::NetSymbol& n) {
+        const slang::ast::Expression* e = n.getInitializer();
+        if (!e) return;
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i; i.k = IK::Assign; i.sig = sigmap.at(&n); i.e = lw.expr(*e);
+        finishAssign(lw, i);
+    }
+    // Moves the initializer process to the front of `out.procs`.
+    void placeInit() {
+        if (!init) return;
+        out.procs.insert(out.procs.begin(), {std::move(init->prog), false, "init"});
+        init.reset();
+    }
+
     static uint8_t strengthOf(slang::ast::DriveStrength s) {
         using slang::ast::DriveStrength;
         switch (s) {
@@ -1239,6 +1269,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
 
     ProcCollector pc(sigmap, out, std::move(newDriver), &subMap, mkSig, &tempSeq);
     comp.getRoot().visit(pc);
+    pc.placeInit();
     rejectRecursive(order);
     return out;
 }

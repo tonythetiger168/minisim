@@ -64,6 +64,7 @@ struct Sim {
     map<uint64_t, vector<Handle>> wheel;             // time wheel
     uint64_t now = 0, lastDump = ~0ULL;
     bool finished = false;
+    string vcdPath = "dump.vcd";                     // empty: no waveform
     ofstream vcd;
 
     ~Sim() { for (auto h : all) h.destroy(); }
@@ -184,7 +185,7 @@ struct Sim {
         vcd << " " << id << "\n";
     }
     void dump(int s) {
-        if (!vcd) return;
+        if (!vcd.is_open() || !vcd) return;
         if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
         writeVal(s);
     }
@@ -193,7 +194,7 @@ struct Sim {
     // Checkpoint every signal at time 0, before the first event. lastDump is
     // left alone so the change records that follow stay byte-for-byte the same.
     void dumpvars() {
-        if (!vcd) return;
+        if (!vcd.is_open() || !vcd) return;
         vcd << "$dumpvars\n";
         for (size_t i = 0; i < sigs.size(); i++) writeVal((int)i);
         vcd << "$end\n";
@@ -221,7 +222,9 @@ struct Sim {
     }
 
     void header() {
-        vcd.open("dump.vcd");
+        if (vcdPath.empty()) return;
+        vcd.open(vcdPath);
+        if (!vcd) { cerr << "cannot write " << vcdPath << "\n"; return; }
         vcd << "$timescale 1ns $end\n$scope module top $end\n";
         for (size_t i = 0; i < sigs.size(); i++)
             vcd << "$var " << (sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << char('!' + i) << " " << sigs[i].name << " $end\n";
