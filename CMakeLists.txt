@@ -34,11 +34,34 @@ if(MINISIM_WITH_SLANG)
   target_include_directories(slang_dump PRIVATE src)
   target_link_libraries(slang_dump PRIVATE slang::slang)
 
+  # One-step compile + simulate, irun / vcs -R style: msim tb.sv -top tb -vcd w.vcd
+  add_executable(msim src/msim.cpp)
+  target_include_directories(msim PRIVATE src)
+  target_link_libraries(msim PRIVATE slang::slang)
+
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
   target_link_libraries(test_lower PRIVATE slang::slang)
   target_compile_definitions(test_lower PRIVATE MINISIM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME test_lower COMMAND test_lower)
+
+  # msim end to end: two files, -top, +define+, -maxtime, -vcd, and a bad file.
+  set(CLI ${CMAKE_SOURCE_DIR}/examples/cli)
+  add_test(NAME msim_define
+           COMMAND msim ${CLI}/adder.sv ${CLI}/adder_tb.sv -top adder_tb +define+WIDTH=8)
+  set_tests_properties(msim_define PROPERTIES PASS_REGULAR_EXPRESSION "W= +8 sum= *44\n")
+  add_test(NAME msim_default_width
+           COMMAND msim -sv ${CLI}/adder.sv ${CLI}/adder_tb.sv -top adder_tb)
+  set_tests_properties(msim_default_width PROPERTIES PASS_REGULAR_EXPRESSION "W= +4 sum=12\n")
+  add_test(NAME msim_init COMMAND msim ${CLI}/init.sv)
+  set_tests_properties(msim_init PROPERTIES PASS_REGULAR_EXPRESSION "v= +5\nw= +6\nw= +10\n")
+  add_test(NAME msim_maxtime COMMAND msim ${CLI}/spin.sv -maxtime 25)
+  set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION "^tick\ntick\ntick\n$")
+  add_test(NAME msim_vcd
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd.cmake)
+  add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
+  set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
   add_test(NAME slang_dump_counter
            COMMAND slang_dump ${CMAKE_SOURCE_DIR}/examples/counter.sv)

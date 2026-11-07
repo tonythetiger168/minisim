@@ -19,7 +19,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`case` / `casez` / `casex`**, part-selects, bit-selects, `for` / `while` / `do` / `forever` / `repeat`, `break` / `continue`
 - **Tasks and functions** at module scope, called from procedural code in that module. A `function` used in an expression returns a value (`return` or an assignment to the function name). A `task` is a statement. `input` is copied in. `output` and `inout` are copied back when the call returns. A `#delay` inside a task suspends that process.
 - **Module instances.** A parent instantiates a child. Named (`.a(x)`) and positional port connections carry an `input` into the child and an `output` back to the parent. The output may be a continuous assign or a procedural write. An `inout` net is connected in both directions. A grandchild uses the same connection. A `#(.W(8))` override changes the port width. Child signals are named on the instance path (`u.y`).
-- **VCD output** (`dump.vcd`) for GTKWave
+- **VCD output** (`dump.vcd`, or any file with `msim -vcd`) for GTKWave
+- **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 
 ## Layout
 
@@ -31,6 +32,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/minisim.cpp` | Kernel (scheduler, nets, VCD) and a hand-built counter demo |
 | `src/lower.hpp` | slang AST to `Prog`, including module instances and port connections |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
+| `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
 | `tests/` | Unit tests for the value library |
 
 ## Build and run
@@ -51,6 +53,31 @@ cmake --build build -j
 ./build/slang_dump examples/counter.sv
 ```
 
+### Simulating your own design: `msim`
+
+The slang build also makes `msim`, a one-step compile, elaborate, and simulate
+command in the style of `irun` / `xrun` or `vcs -R`:
+
+```sh
+./build/msim examples/cli/adder.sv examples/cli/adder_tb.sv -top adder_tb +define+WIDTH=8 -vcd adder.vcd
+```
+
+| Option | Meaning |
+|---|---|
+| `<files>` , `-f <file>` | Source files, or a command file listing them |
+| `-top <name>` | Top-level module (repeatable). Without it, slang picks uninstantiated modules |
+| `+define+N[=V]`, `-D N[=V]` | Preprocessor define |
+| `+incdir+<dir>`, `-I <dir>` | Include directory |
+| `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No VCD is written without it |
+| `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
+| `-sv`, `-sverilog` | Accepted and ignored |
+| `+<arg>` | Any other plusarg is accepted (not yet visible to `$test$plusargs`) |
+| `--help-slang` | Every front-end option slang accepts |
+
+`$display` output goes to stdout and diagnostics to stderr. The exit status is
+0 when the simulation ran, 1 on a compile or lowering error, and 2 on a bad
+command line.
+
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
 ## Known limits
@@ -59,7 +86,7 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 - `nmos`, `pmos`, `cmos`, `tran` (and the resistive forms), `bufif` / `notif`, and `trireg` charge storage are an error. Strength is resolved when a net is driven, and a read of the net is 0, 1, X, or Z.
 - Instance arrays and interface or modport ports are an error. A hierarchical reference that reads a child's internal signal (`top.u.hidden`) is not lowered
 - An `inout` variable is an error. An `inout` net is connected. An `inout` whose two sides differ in width is an error
-- Not yet lowered: net initializers
+- Declaration initializers (`logic x = 0;`, `wire y = a & b;`) are lowered. A module variable's initializer runs before every `initial` / `always`
 - Tasks and functions have no recursion, no `ref` arguments, no DPI, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
 - System tasks other than `$display` / `$strobe` / `$monitor` / `$finish` are ignored. Format is the kernel's `%b`, `%d`, and literal text
 - Vectors assumed declared `[N-1:0]`
