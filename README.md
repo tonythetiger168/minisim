@@ -35,6 +35,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/lower.hpp` | slang AST to `Prog`, including module instances and port connections |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
+| `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
+| `bench/` | Throughput designs and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
 ## Build and run
@@ -74,7 +76,29 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
 | `+<arg>` | Any other plusarg is accepted (not yet visible to `$test$plusargs`) |
+| `-compile` | Compiled mode: generate C++ for the design, build `<dir>/simv`, run it |
+| `-o <dir>` | Build directory for `-compile` (default `msim.d`); `simv` can be rerun with `-maxtime` / `-vcd` |
+| `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `--help-slang` | Every front-end option slang accepts |
+
+### Compiled mode
+
+By default `msim` interprets: each process is a flat instruction list that a
+coroutine walks. `msim -compile` translates every process into C++ instead
+(one coroutine per process, `goto` for jumps, inline 4-state operators for
+expressions), compiles it against the same kernel, and runs it. Output is the
+same as the interpreter's (`ctest -R msim_compile` checks this); a design that
+uses something `codegen.hpp` does not translate yet falls back to the
+interpreter with a note on stderr. Times from `bench/run.sh` (4-core cloud
+VM, g++ 13, seconds of run time, build time not included):
+
+| Design | msim | msim -compile | Verilator 5.020 -O3 | Icarus 12 |
+|---|---|---|---|---|
+| `bench/lanes.sv` (16 LFSR lanes, 1M cycles) | 9.31 | 3.37 | 0.39 | 46.7 |
+| `bench/chain.sv` (8-deep assign chain, 1M cycles) | 1.51 | 0.76 | 0.29 | 8.10 |
+| `bench/counter.sv` (one counter, 1M cycles) | 0.22 | 0.16 | 0.29 | 0.42 |
+
+The C++ build adds 2 to 4 seconds per design.
 
 `$display` output goes to stdout and diagnostics to stderr. The exit status is
 0 when the simulation ran, 1 on a compile or lowering error, and 2 on a bad
