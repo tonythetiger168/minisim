@@ -5,7 +5,9 @@
 // #delay inside the callee suspends the process and keeps the address.
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,7 @@ enum class IK {
     Monitor,    // $monitor: replace the watch; at most one postponed line per slot
     Call,       // push (this prog, pc+1) and transfer to callee
     Fork,       // start each of `branches` as a process; join 0 = all, 1 = any, 2 = none
+    ReadMem,    // $readmemh / $readmemb into `arr` (fmt is the file name)
     Ret         // pop that address; an empty stack ends the process
 };
 
@@ -50,6 +53,14 @@ struct Instr {
     const Prog* callee = nullptr; // Call
     std::vector<const Prog*> branches;  // Fork
     int join = 0;                       // Fork: 0 join, 1 join_any, 2 join_none
+    // Assign/Nba to an array element chosen at run time: the target is
+    // arr->base + offset(aidx). An invalid index skips the write (7.4.6).
+    // ReadMem: arr is the memory, args hold [start [, finish]], hex selects $readmemh.
+    std::shared_ptr<const ArrShape> arr;
+    std::vector<E> aidx;
+    // Assign/Nba to a bit chosen at run time (v[i] = ...): hi = lo = bidx.
+    E bidx;
+    bool hex = false;
 };
 
 struct Prog {
@@ -59,27 +70,39 @@ struct Prog {
 };
 
 // ---- helpers shared by lowering and tests ----
-inline void collectRefs(const E& e, std::vector<int>& out) {
+// Signals an expression reads, each once, in first-read order. A variable
+// array index reads every element, so a wait on it wakes on any of them.
+inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_set<int>& seen) {
     if (!e) return;
-    if (e->op == Op::Ref) {
-        for (int s : out) if (s == e->sig) goto recurse;
-        out.push_back(e->sig);
-    }
-recurse:
-    for (auto& k : e->kids) collectRefs(k, out);
+    auto add = [&](int s) { if (seen.insert(s).second) out.push_back(s); };
+    if (e->op == Op::Ref) add(e->sig);
+    if (e->op == Op::ArrRead)
+        for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
+    for (auto& k : e->kids) collectRefsInto(k, out, seen);
+}
+inline void collectRefs(const E& e, std::vector<int>& out) {
+    std::unordered_set<int> seen(out.begin(), out.end());
+    collectRefsInto(e, out, seen);
 }
 // Signals read by this prog and by any prog it calls. @* / always_comb must see
 // a function body, or a call would hide the signals that should wake it.
-inline void collectProgRefs(const Prog& p, std::vector<int>& sigs, std::vector<const Prog*>& seen) {
+inline void collectProgRefsInto(const Prog& p, std::vector<int>& sigs, std::unordered_set<int>& have,
+                                std::vector<const Prog*>& seen) {
     for (const Prog* s : seen)
         if (s == &p) return;
     seen.push_back(&p);
     for (auto& i : p.code) {
-        collectRefs(i.e, sigs);
-        for (auto& a : i.args) collectRefs(a, sigs);  // $display / $strobe / $monitor
-        if (i.k == IK::Call && i.callee) collectProgRefs(*i.callee, sigs, seen);
-        for (const Prog* b : i.branches) collectProgRefs(*b, sigs, seen);
+        collectRefsInto(i.e, sigs, have);
+        for (auto& a : i.args) collectRefsInto(a, sigs, have);  // $display / $strobe / $monitor
+        for (auto& a : i.aidx) collectRefsInto(a, sigs, have);  // a[i] = ... reads i
+        collectRefsInto(i.bidx, sigs, have);
+        if (i.k == IK::Call && i.callee) collectProgRefsInto(*i.callee, sigs, have, seen);
+        for (const Prog* b : i.branches) collectProgRefsInto(*b, sigs, have, seen);
     }
+}
+inline void collectProgRefs(const Prog& p, std::vector<int>& sigs, std::vector<const Prog*>& seen) {
+    std::unordered_set<int> have(sigs.begin(), sigs.end());
+    collectProgRefsInto(p, sigs, have, seen);
 }
 inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
     std::vector<int> sigs;

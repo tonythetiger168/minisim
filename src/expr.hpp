@@ -367,7 +367,34 @@ enum class Op {
     Eq, Ne, CaseEq, CaseZEq, CaseXEq, Lt, Le, Gt, Ge, Shl, Shr, Asr, Resize,
     LogNot, LogAnd, LogOr, RedAnd, RedOr, RedXor,
     Slice, Index, Concat, Mux,
-    Pow, Time
+    Pow, Time,
+    ArrRead    // element of an unpacked array; kids are one index per dimension
+};
+
+// A fixed-size unpacked array (IEEE 1800-2023 7.4) is `count` consecutive
+// signals starting at `base`, one per element, in row-major order. Each
+// dimension keeps its declared [left:right]; offset 0 is the left bound.
+struct ArrShape {
+    int base = -1;
+    int count = 0;
+    int elemW = 1;
+    bool sgn = false;
+    bool twoState = false;   // bit / int elements: an invalid read is 0, not X (7.4.6)
+    std::vector<std::pair<int64_t, int64_t>> dims;   // [left, right]
+    // Flat element offset, or -1 when an index is outside its dimension.
+    int64_t offset(const std::vector<int64_t>& idx) const {
+        int64_t off = 0;
+        for (size_t d = 0; d < dims.size(); d++) {
+            auto [l, r] = dims[d];
+            int64_t n = (l > r ? l - r : r - l) + 1;
+            int64_t i = idx[d];
+            int64_t o = l <= r ? i - l : l - i;
+            if (o < 0 || o >= n) return -1;
+            off = off * n + o;
+        }
+        return off;
+    }
+    int64_t size(size_t d) const { auto [l, r] = dims[d]; return (l > r ? l - r : r - l) + 1; }
 };
 struct Expr;
 using E = std::shared_ptr<Expr>;
@@ -378,6 +405,7 @@ struct Expr {
     int hi = 0, lo = 0;  // Slice, or Resize dest width / sign-fill
     bool sgn = false;    // Ref result, or Resize result
     std::vector<E> kids;
+    std::shared_ptr<const ArrShape> arr;   // ArrRead
 };
 
 inline E node(Op op, std::vector<E> kids = {}) {
@@ -442,6 +470,14 @@ inline Val v_pow(Val a, Val b) {
     return make(r & m, 0, w, 0, a.sgn);
 }
 
+// Integer value of a known Val, sign-extended when it is signed.
+inline int64_t v_to_i64(Val v) {
+    uint64_t m = mask(v.w);
+    uint64_t u = v.v & m;
+    if (v.sgn && v.w < 64 && ((u >> (v.w - 1)) & 1)) u |= ~m;
+    return (int64_t)u;
+}
+
 using Reader = std::function<Val(int)>;
 
 inline Val eval(const E& e, const Reader& rd) {
@@ -496,6 +532,23 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::Mux: return v_mux(k(0), k(1), k(2));
         case Op::Pow: return v_pow(k(0), k(1));
         case Op::Time: return make(g_simTime, 0, 64, 0);
+        case Op::ArrRead: {
+            // An index with x/z bits, or one outside the bounds, reads the
+            // element type's default: X for 4-state, 0 for 2-state (7.4.6).
+            const ArrShape& a = *e->arr;
+            Val bad = a.twoState ? make(0, 0, a.elemW, 0, a.sgn) : make(0, ~0ULL, a.elemW, 0, a.sgn);
+            std::vector<int64_t> idx;
+            for (size_t i = 0; i < e->kids.size(); i++) {
+                Val v = k((int)i);
+                if (v.x) return bad;
+                idx.push_back(v_to_i64(v));
+            }
+            int64_t off = a.offset(idx);
+            if (off < 0) return bad;
+            Val r = rd(a.base + (int)off);
+            r.sgn = a.sgn;
+            return r;
+        }
     }
     return allx(1);
 }

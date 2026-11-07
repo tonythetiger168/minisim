@@ -6,6 +6,99 @@ static Val rd(int s) { return S.get(s); }
 
 struct RetFrame { const Prog* prog; size_t pc; };
 
+// Resolve a run-time array index and bit index. false: no write happens.
+static bool target(const Instr& i, int& sig, int& hi, int& lo) {
+    if (i.arr) {
+        std::vector<int64_t> idx;
+        for (auto& a : i.aidx) {
+            Val v = eval(a, rd);
+            if (v.x) return false;
+            idx.push_back(v_to_i64(v));
+        }
+        int64_t off = i.arr->offset(idx);
+        if (off < 0) return false;
+        sig = i.arr->base + (int)off;
+    }
+    if (i.bidx) {
+        Val v = eval(i.bidx, rd);
+        if (v.x) return false;
+        int64_t b = v_to_i64(v) - i.lo;   // lo holds the vector's low bound here
+        if (b < 0 || b >= S.sigs[sig].w) return false;
+        hi = lo = (int)b;
+    }
+    return true;
+}
+
+// $readmemh / $readmemb (21.4) into a one-dimensional memory. Addresses are
+// index values. Without a range, loading starts at the lowest address and goes
+// up; with start and finish it goes from start toward finish. "@hex" in the
+// file moves the address. 2-state elements read x/z digits as 0 (21.4.2).
+static void readMem(const Instr& i) {
+    const ArrShape& a = *i.arr;
+    auto [l, r] = a.dims[0];
+    int64_t lowA = std::min(l, r), highA = std::max(l, r);
+    int64_t start = lowA, finish = highA;
+    bool haveFinish = false;
+    if (i.args.size() > 0) { Val v = eval(i.args[0], rd); if (!v.x) start = v_to_i64(v); }
+    if (i.args.size() > 1) { Val v = eval(i.args[1], rd); if (!v.x) { finish = v_to_i64(v); haveFinish = true; } }
+    int64_t step = (haveFinish && finish < start) ? -1 : 1;
+    if (!haveFinish) finish = highA;
+    std::ifstream in(i.fmt);
+    if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    int64_t addr = start;
+    int bits = i.hex ? 4 : 1;
+    int64_t words = 0;
+    bool sawAddr = false;
+    size_t p = 0;
+    auto inRange = [&](int64_t ad) {
+        return step > 0 ? (ad >= start && ad <= finish) : (ad <= start && ad >= finish);
+    };
+    while (p < text.size()) {
+        char c = text[p];
+        if (isspace((unsigned char)c)) { p++; continue; }
+        if (c == '/' && p + 1 < text.size() && text[p + 1] == '/') { while (p < text.size() && text[p] != '\n') p++; continue; }
+        if (c == '/' && p + 1 < text.size() && text[p + 1] == '*') {
+            size_t e = text.find("*/", p + 2);
+            p = e == std::string::npos ? text.size() : e + 2;
+            continue;
+        }
+        size_t q = p + (c == '@' ? 1 : 0);
+        size_t e = q;
+        while (e < text.size() && !isspace((unsigned char)text[e]) && text[e] != '/') e++;
+        std::string tok = text.substr(q, e - q);
+        p = e;
+        if (c == '@') {
+            addr = (int64_t)std::stoull(tok, nullptr, 16);
+            sawAddr = true;
+            if (!inRange(addr)) { std::cerr << "$readmem: address " << tok << " out of range in " << i.fmt << "\n"; return; }
+            continue;
+        }
+        uint64_t v = 0, x = 0, z = 0;
+        for (char d : tok) {
+            if (d == '_') continue;
+            v <<= bits; x <<= bits; z <<= bits;
+            uint64_t m = (1ULL << bits) - 1;
+            if (d == 'x' || d == 'X') x |= m;
+            else if (d == 'z' || d == 'Z' || d == '?') { x |= m; z |= m; }
+            else if (i.hex && isxdigit((unsigned char)d)) v |= (uint64_t)std::stoi(std::string(1, d), nullptr, 16);
+            else if (!i.hex && (d == '0' || d == '1')) v |= (uint64_t)(d - '0');
+            else { std::cerr << "$readmem: bad digit '" << d << "' in " << i.fmt << "\n"; return; }
+        }
+        if (!inRange(addr)) break;
+        int64_t off = a.offset({addr});
+        if (off < 0) break;
+        if (a.twoState) { v &= ~x; x = z = 0; }
+        S.set(a.base + (int)off, make(v, x, a.elemW, z));
+        addr += step;
+        words++;
+    }
+    // A file with no @address whose word count differs from the range warns.
+    int64_t range = (step > 0 ? finish - start : start - finish) + 1;
+    if (!sawAddr && words != range)
+        std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
+}
+
 // One fork...join. Each branch reports when it ends; the parent resumes when
 // every branch has ended (join) or the first one has (join_any).
 struct JoinState {
@@ -43,13 +136,19 @@ Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
         }
         const Instr& i = p->code[pc];
         switch (i.k) {
-            case IK::Assign: {
+            case IK::Assign:
+            case IK::Nba: {
                 Val v = eval(i.e, rd);
                 if (i.drv >= 0) { S.drive(i.sig, i.drv, v, i.s0, i.s1); pc++; break; }
-                S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
+                int sig = i.sig, hi = i.hi, lo = i.lo;
+                // The index of a[i] / v[i] is read when the statement runs,
+                // also for a nonblocking write. An invalid one skips it (7.4.6, 11.5.1).
+                if (!target(i, sig, hi, lo)) { pc++; break; }
+                if (i.k == IK::Nba) S.nba(sig, v, hi, lo);
+                else S.set(sig, hi >= 0 ? v_insert(S.get(sig), v, hi, lo) : v);
                 pc++; break;
             }
-            case IK::Nba:       S.nba(i.sig, eval(i.e, rd), i.hi, i.lo); pc++; break;
+            case IK::ReadMem: readMem(i); pc++; break;
             case IK::JmpIfNot:  pc = (truth(eval(i.e, rd)) == 1) ? pc + 1 : i.target; break;
             case IK::Jmp:       pc = i.target; break;
             case IK::WaitEdge:
