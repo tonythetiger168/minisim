@@ -54,11 +54,24 @@ struct CodegenProc {
     // Sim::addComb in rank order instead of being spawned.
     int combRank = -1;
     std::vector<int> combIns;
+    int combLevel = 0;
+    // A clocked process (prog.hpp: seqShape): emitted as a function that
+    // returns its NBAs, registered with Sim::addSeq on these events.
+    bool seq = false;
+    std::vector<std::pair<int, Edge>> seqEv;
+};
+
+// Arguments of Sim::buildPartitions (by rank; fixed NBA targets).
+struct CodegenParts {
+    bool on = false;
+    std::vector<std::vector<int>> outs, ins;
+    std::vector<int> targets;
 };
 
 class Codegen {
 public:
-    std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs) {
+    std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
+                    const CodegenParts& parts = {}) {
         std::ostringstream body;
         std::vector<int> byRank;
         for (size_t i = 0; i < procs.size(); i++) {
@@ -66,7 +79,9 @@ public:
                 emitComb(body, (int)i, *procs[i].prog, procs[i].kind);
                 if ((size_t)procs[i].combRank >= byRank.size()) byRank.resize(procs[i].combRank + 1, -1);
                 byRank[procs[i].combRank] = (int)i;
-            } else
+            } else if (procs[i].seq)
+                emitSeq(body, (int)i, *procs[i].prog, procs[i].kind);
+            else
                 emitProc(body, (int)i, *procs[i].prog, procs[i].kind);
         }
 
@@ -75,7 +90,8 @@ public:
              "#define MINISIM_NO_MAIN\n"
              "#include \"minisim.cpp\"\n"
              "#include <cstdlib>\n"
-             "#include <cstring>\n\n"
+             "#include <cstring>\n"
+             "#include <thread>\n\n"
              "#pragma GCC diagnostic ignored \"-Wunused-label\"\n\n"
              "static inline Val R(int s, bool sg) { Val v = S.get(s); v.sgn = sg; return v; }\n"
              "static inline Val RS(Val v, int w, bool fill, bool sg) {\n"
@@ -97,9 +113,13 @@ public:
         o << "int main(int argc, char** argv) {\n"
              "    uint64_t maxTime = ~0ULL;\n"
              "    S.vcdPath = \"\";\n"
+             "    S.threads = (int)std::thread::hardware_concurrency();\n"
+             "    if (S.threads < 1) S.threads = 1;\n"
              "    for (int i = 1; i < argc; i++) {\n"
              "        if (!std::strcmp(argv[i], \"-maxtime\") && i + 1 < argc) maxTime = std::strtoull(argv[++i], nullptr, 10);\n"
              "        else if (!std::strcmp(argv[i], \"-vcd\") && i + 1 < argc) S.vcdPath = argv[++i];\n"
+             "        else if (!std::strcmp(argv[i], \"-threads\") && i + 1 < argc) S.threads = std::max(1, std::atoi(argv[++i]));\n"
+             "    if (std::thread::hardware_concurrency() > 0) S.threads = std::min<int>(S.threads, (int)std::thread::hardware_concurrency());\n"
              "    }\n";
         for (size_t s = 0; s < sigs.size(); s++) {
             o << "    S.sig(" << quote(sigs[s].name) << ", " << sigs[s].w << ", " << (sigs[s].net ? "true" : "false") << ");";
@@ -121,10 +141,32 @@ public:
             if (i < 0) throw CodegenUnsupported("gap in the combinational ranks");
             o << "    S.addComb(comb" << i << ", nullptr, {";
             for (size_t j = 0; j < procs[i].combIns.size(); j++) o << (j ? ", " : "") << procs[i].combIns[j];
-            o << "});\n";
+            o << "}, " << procs[i].combLevel;
+            if (oneAssign(*procs[i].prog)) o << ", combv" << i << ", combc" << i;
+            o << ");\n";
         }
-        for (size_t i = 0; i < procs.size(); i++)
-            if (procs[i].combRank < 0) o << "    S.spawn(proc" << i << "());\n";
+        for (size_t i = 0; i < procs.size(); i++) {
+            if (procs[i].combRank >= 0) continue;
+            if (procs[i].seq) {
+                o << "    S.addSeq(seq" << i << ", nullptr, {";
+                for (size_t j = 0; j < procs[i].seqEv.size(); j++)
+                    o << (j ? ", " : "") << "{" << procs[i].seqEv[j].first << ", " << edge(procs[i].seqEv[j].second) << "}";
+                o << "});\n";
+            } else
+                o << "    S.spawn(proc" << i << "());\n";
+        }
+        if (parts.on) {
+            auto list = [&](const std::vector<int>& v) {
+                std::string r = "{";
+                for (size_t j = 0; j < v.size(); j++) r += (j ? ", " : "") + std::to_string(v[j]);
+                return r + "}";
+            };
+            o << "    S.buildPartitions({";
+            for (size_t r = 0; r < parts.outs.size(); r++) o << (r ? ", " : "") << list(parts.outs[r]);
+            o << "}, {";
+            for (size_t r = 0; r < parts.ins.size(); r++) o << (r ? ", " : "") << list(parts.ins[r]);
+            o << "}, " << list(parts.targets) << ");\n";
+        }
         o << "    S.run(maxTime);\n"
              "    std::cout.flush();\n"
              "    return 0;\n"
@@ -246,17 +288,44 @@ private:
         throw CodegenUnsupported("operator " + std::to_string((int)e->op));
     }
 
-    std::string assign(const Instr& i) {
+    // The write of an Assign, with `val` as the value (default: its expression).
+    std::string assign(const Instr& i, std::string val = "") {
+        if (val.empty()) val = ex(i.e);
         std::ostringstream o;
         if (i.drv >= 0)
-            o << " S.drive(" << i.sig << ", " << i.drv << ", " << ex(i.e) << ", " << (int)i.s0 << ", " << (int)i.s1
+            o << " S.drive(" << i.sig << ", " << i.drv << ", " << val << ", " << (int)i.s0 << ", " << (int)i.s1
               << ");\n";
         else if (i.hi >= 0)
-            o << " S.set(" << i.sig << ", v_insert(S.get(" << i.sig << "), " << ex(i.e) << ", " << i.hi << ", " << i.lo
+            o << " S.set(" << i.sig << ", v_insert(S.get(" << i.sig << "), " << val << ", " << i.hi << ", " << i.lo
               << "));\n";
         else
-            o << " S.set(" << i.sig << ", " << ex(i.e) << ");\n";
+            o << " S.set(" << i.sig << ", " << val << ");\n";
         return o.str();
+    }
+    static bool oneAssign(const Prog& p) {
+        return p.code.size() >= 2 && p.code[0].k == IK::Assign && p.code[1].k != IK::Assign;
+    }
+
+    // A clocked process: the body after its wait, NBAs into `nb`.
+    void emitSeq(std::ostream& o, int n, const Prog& p, const std::string& kind) {
+        size_t end = p.code.size() - 1;
+        auto L = [](size_t pc) { return "s_" + std::to_string(pc); };
+        o << "// process " << n << " (" << kind << ", clocked)\n";
+        o << "static void seq" << n << "(const void*, std::vector<Sim::NbaItem>& nb) {\n";
+        for (size_t pc = 1; pc < end; pc++) {
+            const Instr& i = p.code[pc];
+            o << L(pc) << ":";
+            switch (i.k) {
+                case IK::Nba:
+                    if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
+                    o << " nb.push_back({" << i.sig << ", " << ex(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
+                    break;
+                case IK::JmpIfNot: o << " if (truth(" << ex(i.e) << ") != 1) goto " << L(i.target) << ";\n"; break;
+                case IK::Jmp: o << " goto " << L(i.target) << ";\n"; break;
+                default: throw CodegenUnsupported("instruction in a clocked process");
+            }
+        }
+        o << L(end) << ": return;\n}\n\n";
     }
 
     // A combinational process: its leading Assign instructions as a function.
@@ -267,7 +336,12 @@ private:
             if (i.k != IK::Assign) break;
             o << "   " << assign(i);
         }
-        o << "}\n\n";
+        o << "}\n";
+        if (oneAssign(p)) {
+            o << "static Val combv" << n << "(const void*) { return " << ex(p.code[0].e) << "; }\n";
+            o << "static void combc" << n << "(const void*, Val v) {" << assign(p.code[0], "v") << "}\n";
+        }
+        o << "\n";
     }
 
     // Every Prog this process can run: the entry, then callees, depth first.
@@ -357,6 +431,7 @@ private:
     }
 };
 
-inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs) {
-    return Codegen{}.run(sigs, procs);
+inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
+                           const CodegenParts& parts = {}) {
+    return Codegen{}.run(sigs, procs, parts);
 }

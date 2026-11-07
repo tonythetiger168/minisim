@@ -1,6 +1,7 @@
-# Every execution mode must print the same: the interpreter with ordinary
-# event-driven processes (-no-static-comb) is the reference; the interpreter
-# with the static combinational schedule (default) and msim -compile must match.
+# Every execution mode must print the same. The reference is the interpreter
+# with only event-driven processes, on one thread. The default interpreter
+# (static schedule, clocked functions, partitions, every hardware thread),
+# the same on one thread, and msim -compile must match it.
 # -O1 keeps the twelve C++ builds quick. Called with -DMSIM=<msim> -DSRC=<source dir> -DOUT=<scratch dir>.
 set(CASES
   "examples/compound.sv"
@@ -28,7 +29,12 @@ foreach(c IN LISTS CASES)
       list(APPEND files "${a}")
     endif()
   endforeach()
-  execute_process(COMMAND ${MSIM} -no-static-comb ${files} OUTPUT_VARIABLE want RESULT_VARIABLE r1)
+  execute_process(COMMAND ${MSIM} -threads 1 -no-static-comb -no-static-seq -no-partition ${files}
+                  OUTPUT_VARIABLE want RESULT_VARIABLE r1)
+  execute_process(COMMAND ${MSIM} -threads 1 ${files} OUTPUT_VARIABLE one RESULT_VARIABLE r4)
+  if(NOT r4 EQUAL 0 OR NOT want STREQUAL one)
+    message(FATAL_ERROR "${c}: -threads 1 differs\n--- event-driven\n${want}--- -threads 1\n${one}")
+  endif()
   execute_process(COMMAND ${MSIM} ${files} OUTPUT_VARIABLE lev RESULT_VARIABLE r3)
   if(NOT r3 EQUAL 0 OR NOT want STREQUAL lev)
     message(FATAL_ERROR "${c}: static combinational schedule differs\n--- event-driven\n${want}--- levelized\n${lev}")

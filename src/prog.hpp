@@ -172,7 +172,11 @@ inline bool combShape(const Prog& p, CombShape& c) {
 // A process is never woken by its own writes (it is running, not waiting),
 // so a self-dependency is not an edge. Processes on a cycle, or fed by one,
 // are left out and stay ordinary event-driven processes.
-inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs) {
+// The order is sorted by level (longest path from an input that no process
+// in the set drives), stable within a level, so ranks of one level never
+// feed each other and can be computed in parallel. `levels` (optional)
+// receives the level of each entry of the returned order.
+inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::vector<int>* levels = nullptr) {
     size_t n = cs.size();
     std::vector<std::vector<size_t>> succ(n);
     std::vector<size_t> indeg(n, 0);
@@ -203,5 +207,46 @@ inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs) {
         for (size_t b : succ[a])
             if (--indeg[b] == 0) ready.push(b);
     }
+    std::vector<int> lv(n, 0);
+    for (size_t a : order)
+        for (size_t b : succ[a])
+            if (lv[b] < lv[a] + 1) lv[b] = lv[a] + 1;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return lv[a] < lv[b]; });
+    if (levels) {
+        levels->clear();
+        for (size_t a : order) levels->push_back(lv[a]);
+    }
     return order;
+}
+
+// A clocked process that only schedules nonblocking assignments:
+//     WaitEdge (fixed events) ; { Nba | JmpIfNot | Jmp } ... ; Jmp 0
+// with every jump inside the body. Typical always @(posedge clk) RTL. It
+// reads signals and writes nothing until the NBA region, so all such
+// processes triggered in one slot can run at the same time.
+inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
+    size_t n = p.code.size();
+    if (n < 3) return false;
+    const Instr& w = p.code[0];
+    const Instr& j = p.code[n - 1];
+    if (w.k != IK::WaitEdge || j.k != IK::Jmp || j.target != 0) return false;
+    for (size_t i = 1; i + 1 < n; i++) {
+        const Instr& x = p.code[i];
+        if (x.k == IK::Nba) {
+            if (x.drv >= 0) return false;
+        } else if (x.k == IK::JmpIfNot || x.k == IK::Jmp) {
+            if (x.target < 1 || x.target > n - 1) return false;
+        } else
+            return false;
+    }
+    ev.clear();
+    if (w.events.size() > 1) ev = w.events;
+    else ev.push_back({w.sig, w.edge});
+    return true;
+}
+
+// The NBA targets of a seqShape process that are fixed at compile time.
+inline void seqTargets(const Prog& p, std::vector<int>& out) {
+    for (const Instr& i : p.code)
+        if (i.k == IK::Nba && !i.arr && i.aidx.empty() && !i.bidx) out.push_back(i.sig);
 }

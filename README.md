@@ -37,7 +37,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
-| `bench/` | Throughput designs and `run.sh` (msim, msim -compile, Verilator, Icarus) |
+| `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
 ## Build and run
@@ -80,6 +80,8 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-compile` | Compiled mode: generate C++ for the design, build `<dir>/simv`, run it |
 | `-o <dir>` | Build directory for `-compile` (default `msim.d`); `simv` can be rerun with `-maxtime` / `-vcd` |
 | `-no-static-comb` | Run assigns and `always_comb` as ordinary event-driven processes |
+| `-threads <n>` | Worker threads (default: every hardware thread; capped at that) |
+| `-no-static-seq`, `-no-partition` | Turn off clocked-process functions / partition tasks |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `--help-slang` | Every front-end option slang accepts |
 
@@ -111,6 +113,27 @@ startup, the levelized scheduling Verilator and VCS use: when a signal
 changes, the dependent blocks run in that order, once each, as plain
 functions. Blocks on a combinational loop stay event-driven. Both the
 interpreter and `-compile` use the schedule; `-no-static-comb` turns it off.
+
+### Multi-core
+
+msim uses every hardware thread by default (`-threads N` to choose, `-threads 1`
+for one). Two kinds of work run in parallel:
+
+- **Clocked processes.** An `always @(posedge clk)` block that only makes
+  nonblocking assignments runs as a function that writes its NBAs into its
+  own buffer. All of them triggered in one time slot run as one parallel
+  batch, and their NBAs join the queue in process order.
+- **Partitions**, like Verilator's macro-tasks. Signals written by
+  combinational logic or by those NBAs are grouped with all the combinational
+  logic that reads them, so the design splits into islands that share no
+  written signal. In the NBA region each island applies its NBAs and
+  re-evaluates its logic as one task. An island goes through the ordinary
+  serial path when something outside could watch it mid-region (a VCD, a
+  `$monitor`, a process waiting on one of its signals).
+
+Results are committed in a fixed order, so the output is the same for every
+thread count (`ctest -R msim_threads` checks it). Small batches stay on one
+thread. `-no-static-seq` and `-no-partition` turn the two parts off.
 
 `$display` output goes to stdout and diagnostics to stderr. The exit status is
 0 when the simulation ran, 1 on a compile or lowering error, and 2 on a bad
