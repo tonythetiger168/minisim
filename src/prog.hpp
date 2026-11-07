@@ -25,6 +25,7 @@ enum class IK {
     Strobe,     // $strobe: one print from the postponed region
     Monitor,    // $monitor: replace the watch; at most one postponed line per slot
     Call,       // push (this prog, pc+1) and transfer to callee
+    Fork,       // start each of `branches` as a process; join 0 = all, 1 = any, 2 = none
     Ret         // pop that address; an empty stack ends the process
 };
 
@@ -44,8 +45,11 @@ struct Instr {
     // Display/Strobe/Monitor. `args` are read when the line is printed, so a
     // $strobe/$monitor sees values after NBA. %b, %d, %%, and other text.
     std::string fmt;
+    bool nonl = false;    // Display from $write: no newline at the end
     std::vector<E> args;
     const Prog* callee = nullptr; // Call
+    std::vector<const Prog*> branches;  // Fork
+    int join = 0;                       // Fork: 0 join, 1 join_any, 2 join_none
 };
 
 struct Prog {
@@ -74,6 +78,7 @@ inline void collectProgRefs(const Prog& p, std::vector<int>& sigs, std::vector<c
         collectRefs(i.e, sigs);
         for (auto& a : i.args) collectRefs(a, sigs);  // $display / $strobe / $monitor
         if (i.k == IK::Call && i.callee) collectProgRefs(*i.callee, sigs, seen);
+        for (const Prog* b : i.branches) collectProgRefs(*b, sigs, seen);
     }
 }
 inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {

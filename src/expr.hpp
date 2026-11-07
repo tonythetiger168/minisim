@@ -366,7 +366,8 @@ enum class Op {
     Not, And, Or, Xor, Add, Sub, Mul, Div, Mod,
     Eq, Ne, CaseEq, CaseZEq, CaseXEq, Lt, Le, Gt, Ge, Shl, Shr, Asr, Resize,
     LogNot, LogAnd, LogOr, RedAnd, RedOr, RedXor,
-    Slice, Index, Concat, Mux
+    Slice, Index, Concat, Mux,
+    Pow, Time
 };
 struct Expr;
 using E = std::shared_ptr<Expr>;
@@ -411,6 +412,35 @@ inline E bin(Op op, E a, E b) { return node(op, {a, b}); }
 inline E slice(E a, int hi, int lo) { auto e = node(Op::Slice, {a}); e->hi = hi; e->lo = lo; return e; }
 inline E concat(std::vector<E> parts) { return node(Op::Concat, std::move(parts)); }
 inline E mux(E c, E a, E b) { return node(Op::Mux, {c, a, b}); }
+
+// Current simulation time, for $time / $stime / $realtime (IEEE 1800 20.3).
+// The kernel sets it when time advances.
+inline uint64_t g_simTime = 0;
+
+// a ** b (IEEE 1800 11.4.5, table 11-4). The result has a's width and sign.
+// Any X/Z operand gives X. A negative exponent gives 0 except for a base of
+// 1 (1), -1 (+-1 by parity), and 0 (X).
+inline Val v_pow(Val a, Val b) {
+    int w = a.w;
+    if (a.x || b.x) return make(0, ~0ULL, w, 0, a.sgn);
+    uint64_t m = mask(w);
+    uint64_t base = a.v & m;
+    bool bneg = b.sgn && b.w > 0 && ((b.v >> (b.w - 1)) & 1);
+    if (bneg) {
+        bool aneg1 = a.sgn && base == m;  // -1
+        if (base == 0) return make(0, ~0ULL, w, 0, a.sgn);
+        if (base == 1) return make(1, 0, w, 0, a.sgn);
+        if (aneg1) return make((b.v & 1) ? m : 1, 0, w, 0, a.sgn);
+        return make(0, 0, w, 0, a.sgn);
+    }
+    uint64_t e = b.v & mask(b.w), r = 1;
+    while (e) {
+        if (e & 1) r *= base;
+        base *= base;
+        e >>= 1;
+    }
+    return make(r & m, 0, w, 0, a.sgn);
+}
 
 using Reader = std::function<Val(int)>;
 
@@ -464,6 +494,8 @@ inline Val eval(const E& e, const Reader& rd) {
             return v_concat(parts);
         }
         case Op::Mux: return v_mux(k(0), k(1), k(2));
+        case Op::Pow: return v_pow(k(0), k(1));
+        case Op::Time: return make(g_simTime, 0, 64, 0);
     }
     return allx(1);
 }
