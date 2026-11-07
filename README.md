@@ -79,6 +79,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `+<arg>` | Any other plusarg is accepted (not yet visible to `$test$plusargs`) |
 | `-compile` | Compiled mode: generate C++ for the design, build `<dir>/simv`, run it |
 | `-o <dir>` | Build directory for `-compile` (default `msim.d`); `simv` can be rerun with `-maxtime` / `-vcd` |
+| `-no-static-comb` | Run assigns and `always_comb` as ordinary event-driven processes |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `--help-slang` | Every front-end option slang accepts |
 
@@ -100,6 +101,16 @@ VM, g++ 13, seconds of run time, build time not included):
 | `bench/counter.sv` (one counter, 1M cycles) | 0.22 | 0.16 | 0.29 | 0.42 |
 
 The C++ build adds 2 to 4 seconds per design.
+
+### Static combinational schedule
+
+Continuous assigns, gates, and straight-line `always_comb` / `always @*`
+blocks (only assignments, waiting on any change of their inputs) do not run
+as event-driven processes. msim sorts them into one topological order at
+startup, the levelized scheduling Verilator and VCS use: when a signal
+changes, the dependent blocks run in that order, once each, as plain
+functions. Blocks on a combinational loop stay event-driven. Both the
+interpreter and `-compile` use the schedule; `-no-static-comb` turns it off.
 
 `$display` output goes to stdout and diagnostics to stderr. The exit status is
 0 when the simulation ran, 1 on a compile or lowering error, and 2 on a bad

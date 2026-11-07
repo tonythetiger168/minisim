@@ -20,7 +20,9 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <functional>
 #include <map>
+#include <queue>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -69,6 +71,43 @@ struct Sim {
     bool finished = false;
     string vcdPath = "dump.vcd";                     // empty: no waveform
     ofstream vcd;
+
+    // Static combinational schedule (prog.hpp: combShape / combSchedule).
+    // combs[r] is the process of rank r in topological order. A change on a
+    // signal marks the ranks that read it; when the active region is empty the
+    // kernel runs the marked ranks lowest first. A rank only feeds higher
+    // ranks, so each runs at most once per wave. `curComb` is the running one:
+    // its own writes do not mark it again (a process is not woken by itself).
+    struct Comb { void (*fn)(const void*); const void* ctx; };
+    vector<Comb> combs;
+    vector<vector<int>> combOf;                      // signal -> ranks that read it
+    vector<char> combPend;
+    priority_queue<int, vector<int>, greater<int>> combq;
+    int curComb = -1;
+    // Register the next rank. `ins` is the process's wait list.
+    void addComb(void (*fn)(const void*), const void* ctx, const vector<int>& ins) {
+        int r = (int)combs.size();
+        combs.push_back({fn, ctx});
+        combPend.push_back(0);
+        if (combOf.size() < sigs.size()) combOf.resize(sigs.size());
+        for (int s : ins) combOf[s].push_back(r);
+        markComb(r);  // runs once at time 0, as the process would have
+    }
+    void markComb(int r) {
+        if (combPend[r]) return;
+        combPend[r] = 1;
+        combq.push(r);
+    }
+    void runCombs() {
+        while (!combq.empty()) {
+            int r = combq.top();
+            combq.pop();
+            combPend[r] = 0;
+            curComb = r;
+            combs[r].fn(combs[r].ctx);
+            curComb = -1;
+        }
+    }
 
     ~Sim() { for (auto h : all) h.destroy(); }
 
@@ -298,6 +337,9 @@ struct Sim {
             }
         }
         ws.erase(ws.begin() + (ptrdiff_t)keep, ws.end());
+        if ((size_t)s < combOf.size())
+            for (int r : combOf[s])
+                if (r != curComb) markComb(r);
     }
 
     void header() {
@@ -314,6 +356,7 @@ struct Sim {
     void run(uint64_t end) {
         header();
         dumpvars();
+        if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
             if (it->first > end) break;
@@ -325,6 +368,8 @@ struct Sim {
                 if (!active.empty()) {                         // active
                     Handle h = active.front(); active.pop_front();
                     if (!h.done()) h.resume();
+                } else if (!combq.empty()) {                   // levelized combinational logic
+                    runCombs();
                 } else if (!inactive.empty()) {                // inactive (#0)
                     for (auto h : inactive) active.push_back(h);
                     inactive.clear();

@@ -4,9 +4,14 @@
 // is its own Prog. Call pushes a return address in that same coroutine, so a
 // #delay inside the callee suspends the process and keeps the address.
 #pragma once
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <queue>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -120,4 +125,83 @@ inline Instr waitInstr(const std::vector<std::pair<int, Edge>>& ev) {
     i.sig = ev[0].first;
     i.edge = ev[0].second;
     return i;
+}
+
+// ---- static combinational schedule ----
+// A process with this shape is pure combinational logic:
+//     Assign ... Assign ; WaitEdge (every event ANY) ; Jmp 0
+// i.e. a continuous assign, a gate, or a straight-line always_comb / always @*.
+// Such a process can run as a plain function, levelized like Verilator and
+// VCS do: the kernel keeps the functions in one topological order and, when a
+// signal changes, runs the dependent ones in that order once each, without a
+// coroutine, a waiter list, or an event per process. `ins` is the wait list
+// (exactly what the process would have waited on); `outs` are the signals it
+// assigns.
+struct CombShape {
+    std::vector<int> ins, outs;
+    size_t body = 0;  // number of leading Assign instructions
+};
+inline bool combShape(const Prog& p, CombShape& c) {
+    size_t n = p.code.size();
+    if (n < 3) return false;
+    const Instr& w = p.code[n - 2];
+    const Instr& j = p.code[n - 1];
+    if (j.k != IK::Jmp || j.target != 0 || w.k != IK::WaitEdge) return false;
+    c = CombShape{};
+    for (size_t i = 0; i + 2 < n; i++) {
+        if (p.code[i].k != IK::Assign) return false;
+        // A target chosen at run time (a[i] = ..., v[i] = ...) has no fixed output signal.
+        if (p.code[i].arr || !p.code[i].aidx.empty() || p.code[i].bidx) return false;
+        bool seen = false;
+        for (int o : c.outs) seen |= o == p.code[i].sig;
+        if (!seen) c.outs.push_back(p.code[i].sig);
+    }
+    c.body = n - 2;
+    if (w.events.size() > 1) {
+        for (auto& [s, e] : w.events) {
+            if (e != ANY) return false;
+            c.ins.push_back(s);
+        }
+    } else {
+        if (w.edge != ANY) return false;
+        c.ins.push_back(w.sig);
+    }
+    return true;
+}
+// Topological order of the given combinational processes (indices into cs).
+// A process is never woken by its own writes (it is running, not waiting),
+// so a self-dependency is not an edge. Processes on a cycle, or fed by one,
+// are left out and stay ordinary event-driven processes.
+inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs) {
+    size_t n = cs.size();
+    std::vector<std::vector<size_t>> succ(n);
+    std::vector<size_t> indeg(n, 0);
+    std::unordered_map<int, std::vector<size_t>> readers;  // signal -> processes waiting on it
+    for (size_t b = 0; b < n; b++)
+        for (int i : cs[b].ins) readers[i].push_back(b);
+    for (size_t a = 0; a < n; a++) {
+        std::vector<size_t> to;
+        for (int o : cs[a].outs) {
+            auto it = readers.find(o);
+            if (it == readers.end()) continue;
+            for (size_t b : it->second)
+                if (b != a) to.push_back(b);
+        }
+        std::sort(to.begin(), to.end());
+        to.erase(std::unique(to.begin(), to.end()), to.end());
+        for (size_t b : to) { succ[a].push_back(b); indeg[b]++; }
+    }
+    std::vector<size_t> order;
+    // Smallest index first among the ready ones keeps the order stable.
+    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> ready;
+    for (size_t i = 0; i < n; i++)
+        if (!indeg[i]) ready.push(i);
+    while (!ready.empty()) {
+        size_t a = ready.top();
+        ready.pop();
+        order.push_back(a);
+        for (size_t b : succ[a])
+            if (--indeg[b] == 0) ready.push(b);
+    }
+    return order;
 }

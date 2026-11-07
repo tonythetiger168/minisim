@@ -214,3 +214,15 @@ Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
 done:
     if (joinOf) joinOf->branchEnded();
 }
+
+// A combinational process (prog.hpp: combShape) run as a function: its
+// leading Assign instructions, exactly as exec() would run them.
+static void execComb(const void* ctx) {
+    const Prog* p = static_cast<const Prog*>(ctx);
+    for (const Instr& i : p->code) {
+        if (i.k != IK::Assign) return;
+        Val v = eval(i.e, rd);
+        if (i.drv >= 0) S.drive(i.sig, i.drv, v, i.s0, i.s1);
+        else S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
+    }
+}
