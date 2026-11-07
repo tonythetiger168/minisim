@@ -222,7 +222,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
             case IK::JmpIfNot:  pc = (truth(eval(i.e, rd)) == 1) ? pc + 1 : i.target; break;
             case IK::Jmp:       pc = i.target; break;
             case IK::WaitEdge:
-                if (i.events.size() > 1) co_await WaitAny{i.events};
+                if (i.events.size() > 1) co_await WaitAny{&i.events};
                 else co_await Wait{i.sig, i.edge};
                 pc++; break;
             case IK::WaitDelay: {

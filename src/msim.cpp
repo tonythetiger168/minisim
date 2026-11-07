@@ -13,16 +13,28 @@
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg (kept for $test$plusargs, not yet read)
+//   -compile         compiled mode: generate C++ for the design (codegen.hpp),
+//                    build it with a C++ compiler into <dir>/simv, and run it.
+//                    A design codegen cannot translate runs on the interpreter.
+//   -o <dir>         build directory for -compile (default msim.d)
+//   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
+//   -O<n>            optimization level for -compile (default -O2)
 //
 // Exit status: 0 when the simulation ran, 1 on a compile or lowering error,
 // 2 on a bad command line.
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <sys/wait.h>
+
+#include "codegen.hpp"
 #include "lower.hpp"
 #include "slang/driver/Driver.h"
 
@@ -36,11 +48,70 @@ static bool slangPlus(std::string_view a) {
     return startsWith(a, "+define+") || startsWith(a, "+incdir+") || startsWith(a, "+libext+");
 }
 
+// Single-quote a path for /bin/sh.
+static std::string shq(const std::string& s) {
+    std::string r = "'";
+    for (char c : s) r += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return r + "'";
+}
+
+#ifndef MINISIM_SRC_DIR
+#define MINISIM_SRC_DIR "src"
+#endif
+
+// -compile: generate, build and run. Returns the exit status, or -1 when the
+// design needs the interpreter.
+static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
+                       const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime) {
+    std::vector<CodegenSig> sigs;
+    for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
+    std::vector<CodegenProc> procs;
+    for (auto& pr : lowered.procs) procs.push_back({&pr.prog, pr.kind});
+    std::string src;
+    // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
+    const char* why = !lowered.finals.empty() ? "a final block"
+                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
+    if (why) {
+        std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
+        return -1;
+    }
+    try {
+        src = codegen(sigs, procs);
+    } catch (const CodegenUnsupported& ex) {
+        std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
+        return -1;
+    }
+    std::string inc = MINISIM_SRC_DIR;
+    if (const char* e = std::getenv("MINISIM_INCLUDE")) inc = e;
+    if (std::system(("mkdir -p " + shq(dir)).c_str()) != 0) { std::cerr << "msim: cannot create " << dir << "\n"; return 1; }
+    std::string cpp = dir + "/design.cpp", exe = dir + "/simv";
+    {
+        std::ofstream f(cpp);
+        f << src;
+        if (!f) { std::cerr << "msim: cannot write " << cpp << "\n"; return 1; }
+    }
+    std::string build = shq(cc) + " -std=c++20 " + opt + " -I" + shq(inc) + " " + shq(cpp) + " -o " + shq(exe);
+    if (std::system(build.c_str()) != 0) {
+        std::cerr << "msim: -compile: C++ build failed: " << build << "\n";
+        return 1;
+    }
+    std::string run = shq(exe);
+    if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
+    if (vcdPath) run += " -vcd " + shq(*vcdPath);
+    std::cout.flush();
+    int st = std::system(run.c_str());
+    if (st == -1) return 1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
+
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
+                 "  -compile       generate C++, build it (<dir>/simv) and run it\n"
+                 "  -o <dir>       build directory for -compile (default msim.d)\n"
+                 "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  --help-slang   list every front-end option\n";
 }
@@ -51,6 +122,9 @@ int main(int argc, char** argv) {
     std::vector<std::string> plusargs;
     std::optional<std::string> vcdPath;
     uint64_t maxTime = ~0ULL;
+    bool compiled = false;
+    std::string buildDir = "msim.d", opt = "-O2";
+    std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -61,6 +135,10 @@ int main(int argc, char** argv) {
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
+        if (a == "-compile") { compiled = true; continue; }
+        if (a == "-o") { buildDir = next("a directory"); continue; }
+        if (a == "-cc") { cc = next("a compiler"); continue; }
+        if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
         if (a == "-vcd") {
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".vcd")) vcdPath = argv[++i];
@@ -104,6 +182,11 @@ int main(int argc, char** argv) {
     if (lowered.procs.empty()) {
         std::cerr << "msim: design has no processes to run\n";
         return 1;
+    }
+
+    if (compiled) {
+        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime);
+        if (st >= 0) return st;
     }
 
     S.vcdPath = vcdPath.value_or("");
