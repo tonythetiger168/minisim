@@ -73,6 +73,11 @@
 using ArrMap = std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>>;
 inline ArrMap& arrMap() { static ArrMap m; return m; }
 constexpr int64_t kMaxArrayElems = 1 << 20;
+// Dynamic arrays, queues, and associative arrays: symbol -> handle signal.
+inline std::unordered_map<const slang::ast::Symbol*, int>& dynMap() {
+    static std::unordered_map<const slang::ast::Symbol*, int> m;
+    return m;
+}
 
 // Time (22.7, 3.14.3): one kernel tick is the simulation precision, the finest
 // time precision of any module, as a power of ten of a second (-9 = 1ns).
@@ -695,6 +700,214 @@ struct Lowerer {
         return n;
     }
 
+    // ---------- dynamic arrays, queues, associative arrays (7.5, 7.8, 7.10) ----------
+    // A container is a hidden 64-bit handle signal whose value counts its
+    // changes; the elements live in dynStore()[handle].
+    int dollarQ = -1;   // the queue whose `$` (last index) the selector being lowered uses
+    static int dynSig(const slang::ast::Expression& e0) {
+        using namespace slang::ast;
+        const Expression& e = peel(e0);
+        if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) return -1;
+        auto it = dynMap().find(&e.as<ValueExpressionBase>().symbol);
+        return it == dynMap().end() ? -1 : it->second;
+    }
+    static bool isDynType(const slang::ast::Type& t0) {
+        const auto& t = t0.getCanonicalType();
+        return t.isQueue() || t.isAssociativeArray() ||
+               t.kind == slang::ast::SymbolKind::DynamicArrayType;
+    }
+    // An index or key of container d, with `$` meaning its last index.
+    E dynKey(int d, const slang::ast::Expression& x) {
+        if (dynStore()[d].strKey) return strOf(x);
+        int saved = dollarQ;
+        dollarQ = d;
+        E k = expr(x);
+        dollarQ = saved;
+        return k;
+    }
+    E dynGet(int d, const slang::ast::Expression& key) {
+        auto n = node(Op::DynGet, {dynKey(d, key)});
+        n->sig = d;
+        return n;
+    }
+    E dynSize(int d) {
+        auto n = node(Op::DynSize);
+        n->sig = d;
+        return n;
+    }
+    Instr dynCmd(int d, int cmd) {
+        Instr i; i.k = IK::Dyn; i.sig = d; i.dcmd = cmd;
+        return i;
+    }
+    // A scratch container shaped like d, to build a new value in before
+    // copying it over, so q = {q[1:$], q[0]} reads the old q throughout.
+    int dynTemp(int d) {
+        int t = fresh(64);
+        DynObj o = dynStore()[d];
+        o.vec.clear(); o.map.clear();
+        dynStore()[t] = o;
+        return t;
+    }
+    static const slang::ast::Expression& outArg(const slang::ast::Expression& a) {
+        using namespace slang::ast;
+        const Expression* x = &peel(a);
+        if (x->kind == ExpressionKind::Assignment) x = &peel(x->as<AssignmentExpression>().left());
+        return *x;
+    }
+    // Append the value of `x` (an element, a container, or a queue slice) to t.
+    void dynAppend(int t, const slang::ast::Expression& x0) {
+        using namespace slang::ast;
+        const Expression& x = peel(x0);
+        if (int s = dynSig(x); s >= 0) {
+            Instr i = dynCmd(t, D_APPEND); i.dsrc = s; prog.emit(i); return;
+        }
+        if (x.kind == ExpressionKind::RangeSelect) {
+            const auto& r = x.as<RangeSelectExpression>();
+            if (int s = dynSig(r.value()); s >= 0) {
+                if (r.getSelectionKind() != RangeSelectionKind::Simple) unsupported("+: / -: slice of a queue");
+                Instr i = dynCmd(t, D_APPEND_SLICE); i.dsrc = s;
+                i.args = {dynKey(s, r.left()), dynKey(s, r.right())};
+                prog.emit(i);
+                return;
+            }
+        }
+        if (x.kind == ExpressionKind::NamedValue && x.type->isUnpackedArray()) {
+            auto it = arrMap().find(&x.as<NamedValueExpression>().symbol);
+            if (it == arrMap().end() || it->second->dims.size() != 1) unsupported("array in a container value");
+            for (int k = 0; k < it->second->count; k++) {
+                Instr i = dynCmd(t, D_PUSH_BACK); i.e = ref(it->second->base + k, it->second->sgn); prog.emit(i);
+            }
+            return;
+        }
+        if (x.kind == ExpressionKind::Concatenation && isDynType(*x.type)) {
+            for (auto* op : x.as<ConcatenationExpression>().operands()) dynAppend(t, *op);
+            return;
+        }
+        if (x.type->isUnpackedArray()) unsupported("container value");
+        Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(x); prog.emit(i);
+    }
+    // dst = rhs for a whole container: new[n](src), '{...}, {a, q, b}, {},
+    // another container, a fixed-size array, or a queue slice.
+    void assignContainer(int dst, const slang::ast::Expression& rhs0) {
+        using namespace slang::ast;
+        const Expression& rhs = peel(rhs0);
+        if (rhs.kind == ExpressionKind::NewArray) {   // 7.5.1
+            const auto& na = rhs.as<NewArrayExpression>();
+            Instr i = dynCmd(dst, D_NEW);
+            i.args = {expr(na.sizeExpr())};
+            if (const Expression* init = na.initExpr()) {
+                i.dsrc = dynSig(*init);
+                if (i.dsrc < 0) {   // new[n]('{...}): build the source first
+                    i.dsrc = dynTemp(dst);
+                    prog.emit(dynCmd(i.dsrc, D_DELETE));
+                    assignInto(i.dsrc, *init);
+                }
+            }
+            prog.emit(i);
+            return;
+        }
+        if (int s = dynSig(rhs); s >= 0) {
+            if (s == dst) return;
+            Instr i = dynCmd(dst, D_COPY); i.dsrc = s; prog.emit(i); return;
+        }
+        int t = dynTemp(dst);
+        prog.emit(dynCmd(t, D_DELETE));
+        assignInto(t, rhs);
+        Instr i = dynCmd(dst, D_COPY); i.dsrc = t; prog.emit(i);
+    }
+    // Build rhs into the empty container t.
+    void assignInto(int t, const slang::ast::Expression& rhs0) {
+        using namespace slang::ast;
+        const Expression& rhs = peel(rhs0);
+        switch (rhs.kind) {
+            case ExpressionKind::SimpleAssignmentPattern:
+            case ExpressionKind::ReplicatedAssignmentPattern: {
+                if (dynStore()[t].kind == 2) unsupported("positional pattern for an associative array");
+                const auto& ap = static_cast<const AssignmentPatternExpressionBase&>(rhs);
+                int64_t n = rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
+                                ? constInt(rhs.as<ReplicatedAssignmentPatternExpression>().count()) : 1;
+                for (int64_t k = 0; k < n; k++)
+                    for (auto* el : ap.elements()) { Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(*el); prog.emit(i); }
+                return;
+            }
+            case ExpressionKind::StructuredAssignmentPattern: {   // '{key: v, default: d} (10.9.2)
+                const auto& sp = rhs.as<StructuredAssignmentPatternExpression>();
+                if (dynStore()[t].kind != 2) unsupported("keyed pattern for this container");
+                if (!sp.memberSetters.empty() || !sp.typeSetters.empty()) unsupported("pattern member setter");
+                if (sp.defaultSetter) unsupported("default: in an associative array pattern");
+                for (auto& is : sp.indexSetters) {
+                    Instr i = dynCmd(t, D_SET); i.args = {dynKey(t, *is.index)}; i.e = expr(*is.expr); prog.emit(i);
+                }
+                return;
+            }
+            case ExpressionKind::EmptyArgument: return;
+            default: dynAppend(t, rhs);
+        }
+    }
+    // Built-in methods of a container (7.5.2, 7.8, 7.9, 7.10.2, 7.12): as a
+    // value, or as a statement when wantValue is false.
+    E dynMethod(const slang::ast::CallExpression& call, bool wantValue) {
+        using namespace slang::ast;
+        std::string_view n = call.getSubroutineName();
+        auto args = call.arguments();
+        int d = dynSig(*args[0]);
+        const DynObj& o = dynStore()[d];
+        if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
+            if (sci->getIteratorInfo().first) unsupported("array method with a `with` clause");
+        if (n == "size" || n == "num" || n == "$size") return dynSize(d);
+        if (n == "exists") {
+            auto x = node(Op::DynExists, {dynKey(d, *args[1])});
+            x->sig = d;
+            return x;
+        }
+        static const std::pair<const char*, int> red[] = {{"sum", 0}, {"product", 1}, {"and", 2}, {"or", 3}, {"xor", 4}};
+        for (auto& [s, id] : red)
+            if (n == s) {
+                if (o.dflt.real || o.dflt.str) unsupported("reduction of a real or string array");
+                auto x = node(Op::DynReduce);
+                x->sig = d;
+                x->hi = id;
+                x->k = mk(0, (int)call.type->getBitWidth());
+                x->k.sgn = call.type->isSigned();
+                return x;
+            }
+        if (n == "pop_front" || n == "pop_back") {
+            if (wantValue && !stmtDepth) unsupported("pop outside a procedural statement");
+            Instr i = dynCmd(d, n == "pop_front" ? D_POP_FRONT : D_POP_BACK);
+            int w = storeW(*call.type);
+            needWidth(w);
+            i.dres = fresh(w);
+            prog.emit(i);
+            return ref(i.dres, call.type->isSigned());
+        }
+        if (n == "first" || n == "last" || n == "next" || n == "prev") {   // 7.9.4-7.9.7
+            if (wantValue && !stmtDepth) unsupported("first/next outside a procedural statement");
+            Instr i = dynCmd(d, n == "first" ? D_FIRST : n == "last" ? D_LAST : n == "next" ? D_NEXT : D_PREV);
+            Instr k; k.k = IK::Assign;
+            lhs(outArg(*args[1]), k);
+            if (k.hi >= 0 || k.bidx || k.arr || k.dyn >= 0) unsupported("first/next into a part of a variable");
+            i.dkey = k.sig;
+            i.dres = fresh(32);
+            prog.emit(i);
+            return ref(i.dres, true);
+        }
+        if (wantValue) unsupported("container method used as a value");
+        static const std::pair<const char*, int> cmds[] = {{"push_back", D_PUSH_BACK}, {"push_front", D_PUSH_FRONT},
+            {"insert", D_INSERT}, {"reverse", D_REVERSE}, {"sort", D_SORT}, {"rsort", D_RSORT}, {"shuffle", D_SHUFFLE}};
+        Instr i;
+        if (n == "delete") i = dynCmd(d, args.size() > 1 ? D_DELETE_AT : D_DELETE);
+        else {
+            bool found = false;
+            for (auto& [s, c] : cmds) if (n == s) { i = dynCmd(d, c); found = true; }
+            if (!found) unsupported("container method");
+        }
+        if (i.dcmd == D_DELETE_AT) i.args = {dynKey(d, *args[1])};
+        if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = expr(*args[1]);
+        if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = expr(*args[2]); }
+        prog.emit(i);
+        return nullptr;
+    }
+
     // A select of a packed vector (11.5.1, 7.4.1), as a bit range of the
     // signal. Indices are in declared numbering: [7:0], [8:1], or [0:7] all
     // work, and an element of a packed array (logic [3:0][7:0] x; x[1]) is
@@ -824,6 +1037,7 @@ struct Lowerer {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {   // x, or u.x / blk[2].x (23.6)
                 const Symbol* sym = &e.as<ValueExpressionBase>().symbol;
+                if (dynMap().count(sym)) unsupported("a whole dynamic array, queue, or associative array as a value");
                 auto it = sigmap.find(sym);
                 if (it == sigmap.end()) return constSym(*sym, e, ctx);
                 int src = (int)e.type->getBitWidth();
@@ -870,6 +1084,11 @@ struct Lowerer {
                 needWidth(dst);
                 return expr(c.operand(), ExprCtx{dst, fill, tag, true});
             }
+            case ExpressionKind::UnboundedLiteral: {   // q[$]: the last index (7.10.1)
+                if (dollarQ < 0) unsupported("$ outside a queue index");
+                Val one = mk(1, 32); one.sgn = true;
+                return sized(bin(Op::Sub, dynSize(dollarQ), konst(one)), 32, true, ctx);
+            }
             case ExpressionKind::EmptyArgument: {
                 if (!outSlot) unsupported("empty argument");
                 return sized(ref(outSlot->sig, outSlot->sgn), outSlot->w, outSlot->sgn, ctx);
@@ -892,6 +1111,11 @@ struct Lowerer {
                     t->k = mk(ticksPerUnit(), 64);
                     if (w != 64) t = resize(std::move(t), w, false, false);
                     return sized(std::move(t), w, false, ctx);
+                }
+                if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.size(), aa.exists(k) ...
+                    int w = storeW(*e.type);
+                    needWidth(w);
+                    return sized(dynMethod(call, true), w, e.type->isSigned(), ctx);
                 }
                 if (isStrMethodCall(call)) {   // s.len(), s.getc(i), s.compare(t), s.atoi() ...
                     int w = (int)e.type->getBitWidth();
@@ -1108,6 +1332,11 @@ struct Lowerer {
                 return sized(concat(parts), (int)e.type->getBitWidth(), false, ctx);
             }
             case ExpressionKind::ElementSelect: {   // a[i]
+                if (int d = dynSig(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key]
+                    int w = storeW(*e.type);
+                    needWidth(w);
+                    return sized(dynGet(d, e.as<ElementSelectExpression>().selector()), w, e.type->isSigned(), ctx);
+                }
                 if (auto as = arraySel(e))
                     return sized(arrayRead(*as), as->a->elemW, as->a->sgn, ctx);
                 const auto& sel = e.as<ElementSelectExpression>();
@@ -1183,12 +1412,19 @@ struct Lowerer {
         switch (e.kind) {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {
+                if (dynMap().count(&e.as<ValueExpressionBase>().symbol)) unsupported("container assignment here");
                 auto it = sigmap.find(&e.as<ValueExpressionBase>().symbol);
                 if (it == sigmap.end()) unsupported("assignment to a non-signal");
                 i.sig = it->second;
                 return;
             }
             case ExpressionKind::ElementSelect: {
+                if (int d = dynSig(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i] = ..., aa[k] = ...
+                    i.sig = d;
+                    i.dyn = d;
+                    i.args = {dynKey(d, e.as<ElementSelectExpression>().selector())};
+                    return;
+                }
                 if (auto as = arraySel(e)) {   // mem[i] = ...
                     int64_t off = as->constant ? constOffset(*as) : -1;
                     if (off >= 0) { i.sig = as->a->base + (int)off; return; }
@@ -1199,18 +1435,22 @@ struct Lowerer {
                 }
                 const auto& sel = e.as<ElementSelectExpression>();
                 lhs(sel.value(), i);
+                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index));
                 return;
             }
             case ExpressionKind::RangeSelect: {   // v[7:4] = ..., v[i +: w] = ... (11.5.1)
                 const auto& r = e.as<RangeSelectExpression>();
+                if (dynSig(r.value()) >= 0) unsupported("write to a queue slice");
                 lhs(r.value(), i);
+                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, rangePSel(r));
                 return;
             }
             case ExpressionKind::MemberAccess: {   // s.f = ...
                 const auto& m = e.as<MemberAccessExpression>();
                 lhs(m.value(), i);
+                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, memberPSel(m));
                 return;
             }
@@ -1306,6 +1546,10 @@ struct Lowerer {
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
+        if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.push_back(x), aa.delete(k) ...
+            dynMethod(call, false);
+            return;
+        }
         if (isStrMethodCall(call)) {   // s.putc(i, c), s.itoa(v), ...: s gets the new string
             int id = strMethodId(n);
             if (id < S_PUTC) return;   // a value method used as a statement: no effect
@@ -1384,9 +1628,16 @@ struct Lowerer {
         using namespace slang::ast;
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
+            if (int d = dynSig(a.left()); d >= 0) {   // q = '{1, 2}; d = new[8]; aa = other;
+                if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this container assignment");
+                assignContainer(d, a.right());
+                return;
+            }
             Instr i;
             i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
             lhs(a.left(), i);
+            if (i.dyn >= 0 && (a.isNonBlocking() || a.timingControl))
+                unsupported("nonblocking or delayed write to a container element");
             const Expression* saved = lvalue;
             if (a.isCompound()) lvalue = &a.left();
             i.e = expr(a.right());
@@ -1439,6 +1690,49 @@ struct Lowerer {
         auto rs = readSet(prog);
         if (rs.empty()) unsupported("@* in a block that reads no signals");
         for (size_t pc : implicitWaits) prog.code[pc] = waitInstr(rs);
+    }
+
+    // foreach over a dynamic array or queue: index 0 up to size() - 1, read
+    // again each pass. Over an associative array: first() then next().
+    void foreachDyn(const slang::ast::ForeachLoopStatement& f, int d) {
+        if (f.loopDims.size() != 1) unsupported("foreach over more than one dimension of a container");
+        const auto* var = f.loopDims[0].loopVar;
+        if (!var) { stmt(f.body); return; }
+        const DynObj& o = dynStore()[d];
+        loops.push_back({});
+        if (o.kind != 2) {
+            int v = fresh(32);
+            sigmap[var] = v;
+            Instr init; init.k = IK::Assign; init.sig = v; init.e = konst(make(0, 0, 32, 0, true));
+            prog.emit(init);
+            size_t top = prog.here();
+            Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Lt, ref(v, true), dynSize(d));
+            size_t jf = prog.emit(j);
+            stmt(f.body);
+            patch(loops.back().continues, prog.here());
+            Instr st; st.k = IK::Assign; st.sig = v;
+            st.e = bin(Op::Add, ref(v, true), konst(make(1, 0, 32, 0, true)));
+            prog.emit(st);
+            Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+            prog.code[jf].target = prog.here();
+        } else {
+            int v = fresh(o.strKey ? 64 : o.keyW);
+            sigmap[var] = v;
+            int ok = fresh(32);
+            Instr first = dynCmd(d, D_FIRST); first.dkey = v; first.dres = ok;
+            prog.emit(first);
+            size_t top = prog.here();
+            Instr j; j.k = IK::JmpIfNot; j.e = ref(ok);
+            size_t jf = prog.emit(j);
+            stmt(f.body);
+            patch(loops.back().continues, prog.here());
+            Instr nx = dynCmd(d, D_NEXT); nx.dkey = v; nx.dres = ok;
+            prog.emit(nx);
+            Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+            prog.code[jf].target = prog.here();
+        }
+        patch(loops.back().breaks, prog.here());
+        loops.pop_back();
     }
 
     int stmtDepth = 0;   // > 0 while lowering a procedural statement
@@ -1543,6 +1837,13 @@ struct Lowerer {
             case StatementKind::VariableDeclaration: {   // int x = 5;  inside a block
                 const auto& vd = s.as<VariableDeclStatement>();
                 const Expression* init = vd.symbol.getInitializer();
+                if (auto it = dynMap().find(&vd.symbol); it != dynMap().end()) {
+                    if (vd.symbol.lifetime == slang::ast::VariableLifetime::Static && current)
+                        unsupported("static container in a task or function");
+                    prog.emit(dynCmd(it->second, D_DELETE));   // a block entry starts it empty
+                    if (init) assignContainer(it->second, *init);
+                    break;
+                }
                 if (!init) break;
                 // A static local in a task or function is initialized on the
                 // first call, then left alone. The flag starts as X, so the
@@ -1617,6 +1918,7 @@ struct Lowerer {
                 // from its left bound to its right bound. break leaves the whole
                 // foreach; continue steps the innermost loop.
                 const auto& f = s.as<ForeachLoopStatement>();
+                if (int d = dynSig(f.arrayRef); d >= 0) { foreachDyn(f, d); break; }
                 struct Lvl { int var; int64_t right; bool up; size_t top, jf; };
                 std::vector<Lvl> lv;
                 for (const auto& d : f.loopDims) {
@@ -1795,6 +2097,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     SigCollector(MkSig f, std::unordered_map<const slang::ast::Symbol*, int>& m)
         : mkSig(std::move(f)), sigmap(m) {}
     template <typename T> void reg(const T& s, bool net) {
+        if (Lowerer::isDynType(s.getType())) { regDyn(s); return; }
         if (s.getType().isUnpackedArray()) { regArray(s, net); return; }
         if (s.getType().isEvent()) {
             // A named event (15.5) is two signals: a trigger count, which an
@@ -1808,6 +2111,47 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         int w = storeW(s.getType());
         if (w > 64) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
+    }
+    // A dynamic array, queue, or associative array: a hidden handle signal
+    // (its name has '$') and its store entry.
+    template <typename T> void regDyn(const T& s) {
+        using namespace slang::ast;
+        if (s.kind == SymbolKind::FormalArgument) Lowerer::unsupported("container as a task or function argument");
+        const Type& t = s.getType().getCanonicalType();
+        DynObj o;
+        const Type* et = nullptr;
+        if (t.isQueue()) {
+            o.kind = 1;
+            const auto& q = t.as<QueueType>();
+            et = &q.elementType;
+            if (q.maxBound) o.bound = (int64_t)q.maxBound;
+        } else if (t.isAssociativeArray()) {
+            o.kind = 2;
+            const auto& a = t.as<AssociativeArrayType>();
+            et = &a.elementType;
+            if (a.indexType) {
+                const Type& kt = a.indexType->getCanonicalType();
+                if (kt.isString()) o.strKey = true;
+                else if (kt.isIntegral() && kt.getBitWidth() <= 64) {
+                    o.keyW = (int)kt.getBitWidth();
+                    o.keySgn = kt.isSigned();
+                } else Lowerer::unsupported("associative array index type");
+            } else { o.keyW = 64; o.keySgn = false; }   // [*]: integral keys, unsigned order
+        } else {
+            et = &t.as<DynamicArrayType>().elementType;
+        }
+        const Type& e = et->getCanonicalType();
+        if (e.isFloating()) o.dflt = mkreal(0);
+        else if (e.isString()) o.dflt = mkstr("");
+        else if (e.isIntegral()) {
+            int w = (int)e.getBitWidth();
+            if (w > 64) unsupported_width(s.name);
+            o.dflt = e.isFourState() ? allx(w) : make(0, 0, w);
+            o.dflt.sgn = e.isSigned();
+        } else Lowerer::unsupported("container element type");
+        int id = mkSig(prefix + std::string(s.name) + "$", 64, false);
+        dynStore()[id] = o;
+        dynMap()[&s] = id;
     }
     // One signal per element, named with its indices ("m[3]", "g[1][0]"),
     // in row-major order with each dimension running left to right.
@@ -1941,6 +2285,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (!sc) return;
         auto pk = sc->asSymbol().kind;
         if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock) return;
+        if (auto it = dynMap().find(&v); it != dynMap().end()) {   // int q[$] = '{1, 2};
+            if (!e) return;
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            init->assignContainer(it->second, *e);
+            return;
+        }
         const auto& t = v.getType();
         // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
         bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString());
@@ -2215,6 +2565,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
     arrMap().clear();
+    dynMap().clear();
+    dynStore().clear();
     blockIds() = BlockIds{};
     SigCollector sc(mkSig, sigmap);
     comp.getRoot().visit(sc);
