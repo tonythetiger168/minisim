@@ -1,4 +1,4 @@
-// IEEE 1800-2017 20.3 Simulation time system functions.
+// IEEE 1800-2023 20.3 Simulation time system functions.
 module t;
   initial begin
     $display("%0t", $time);

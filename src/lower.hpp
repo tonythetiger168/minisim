@@ -1100,7 +1100,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         out.procs.push_back({std::move(lw.prog), loops, "assign"});
     }
 
-    // Module-level `logic x = v;` (IEEE 1800 6.8): a static variable's
+    // Module-level `logic x = v;` (IEEE 1800-2023 10.5): a static variable's
     // declaration initializer runs before any initial or always procedure
     // starts. All of them go into one process that lower() places first, so
     // it is the first thing to run at time 0. Locals of a block, task or
@@ -1115,7 +1115,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v); i.e = init->expr(*e);
         init->prog.emit(i);
     }
-    // `wire y = a & b;` (IEEE 1800 6.7.1) is a continuous assignment to y.
+    // `wire y = a & b;` (IEEE 1800-2023 10.3.1) is a continuous assignment to y.
     void handle(const slang::ast::NetSymbol& n) {
         const slang::ast::Expression* e = n.getInitializer();
         if (!e) return;

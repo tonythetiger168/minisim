@@ -1,4 +1,4 @@
-// IEEE 1800-2017 11.4.3 Arithmetic operators: unary minus and plus, and **
+// IEEE 1800-2023 11.4.3 Arithmetic operators: unary minus and plus, and **
 // (table 11-4: negative exponents, X operands).
 module t;
   logic [7:0] u;

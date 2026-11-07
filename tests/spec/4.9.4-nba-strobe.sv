@@ -1,4 +1,4 @@
-// IEEE 1800-2017 4.9.4 Nonblocking assignment updates happen after the active
+// IEEE 1800-2023 4.9.4 Nonblocking assignment updates happen after the active
 // region; 21.2.2 $strobe prints in the postponed region, after NBA.
 module t;
   logic b;

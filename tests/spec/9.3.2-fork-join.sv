@@ -1,4 +1,4 @@
-// IEEE 1800-2017 9.3.2 Parallel blocks: fork...join waits for every branch,
+// IEEE 1800-2023 9.3.2 Parallel blocks: fork...join waits for every branch,
 // join_any for the first, join_none not at all.
 module t;
   initial begin

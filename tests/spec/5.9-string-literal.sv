@@ -1,4 +1,4 @@
-// IEEE 1800-2017 5.9 String literals; 21.2.1.7 %s, %c
+// IEEE 1800-2023 5.9 String literals; 21.2.1.7 %s, %c
 // A string literal is 8 bits per character, first character in the top byte.
 module t;
   logic [23:0] s;
