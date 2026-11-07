@@ -68,6 +68,13 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::vector<CodegenProc> procs;
     for (auto& pr : lowered.procs) procs.push_back({&pr.prog, pr.kind});
     std::string src;
+    // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
+    const char* why = !lowered.finals.empty() ? "a final block"
+                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
+    if (why) {
+        std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
+        return -1;
+    }
     try {
         src = codegen(sigs, procs);
     } catch (const CodegenUnsupported& ex) {
