@@ -91,14 +91,14 @@ coroutine walks. `msim -compile` translates every process into C++ instead
 expressions), compiles it against the same kernel, and runs it. Output is the
 same as the interpreter's (`ctest -R msim_compile` checks this); a design that
 uses something `codegen.hpp` does not translate yet falls back to the
-interpreter with a note on stderr. Times from `bench/run.sh` (4-core cloud
+interpreter with a note on stderr. Times from `bench/run.sh` (lanes with END_TIME=10000000; 4-core cloud
 VM, g++ 13, seconds of run time, build time not included):
 
-| Design | msim | msim -compile | Verilator 5.020 -O3 | Icarus 12 |
+| Design | msim | msim -compile | Verilator 5.020 -O3 | Icarus 13.0 |
 |---|---|---|---|---|
-| `bench/lanes.sv` (16 LFSR lanes, 1M cycles) | 9.31 | 3.37 | 0.39 | 46.7 |
-| `bench/chain.sv` (8-deep assign chain, 1M cycles) | 1.51 | 0.76 | 0.29 | 8.10 |
-| `bench/counter.sv` (one counter, 1M cycles) | 0.22 | 0.16 | 0.29 | 0.42 |
+| `bench/lanes.sv` (16 LFSR lanes, 1M cycles) | 8.13 | 3.11 | 0.29 | 29.2 |
+| `bench/chain.sv` (8-deep assign chain, 1M cycles) | 1.35 | 0.74 | 0.20 | 7.82 |
+| `bench/counter.sv` (one counter, 1M cycles) | 0.22 | 0.14 | 0.19 | 0.31 |
 
 The C++ build adds 2 to 4 seconds per design.
 
@@ -126,7 +126,9 @@ supports. `tests/spec/` holds one small test per clause, named after it
 (`9.3.2-fork-join.sv`). The expected output is in the file as `//> ` comments.
 `ctest` runs each one on `msim` (`spec/...`), and on Icarus Verilog too when
 `iverilog` is installed (`icarus/...`), so an expectation is checked against
-a second simulator. To add one, drop a `.sv` file in `tests/spec/` and re-run cmake.
+a second simulator. CI uses Icarus Verilog 13.0, built from its `v13_0` tag; a
+test Icarus 13 cannot run says why on a `//! icarus-skip:` line. Locally, point
+cmake at another build with `-DIVERILOG=... -DVVP=...`. To add one, drop a `.sv` file in `tests/spec/` and re-run cmake.
 
 ## License
 

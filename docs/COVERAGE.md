@@ -3,7 +3,7 @@
 What minisim simulates, clause by clause, against IEEE Std 1800-2023.
 Clause numbers were checked against the 2023 text; most are unchanged from 1800-2017.
 A ✅ row has a test in `tests/spec/` named after its clause. Each of those tests
-is also checked against Icarus Verilog when `iverilog` is installed.
+is also checked against Icarus Verilog 13 when `iverilog` is installed.
 🟡 works with the limits listed, ❌ is an error at lowering time ("lower: unsupported ..."),
 never a silent wrong answer. If you find a construct that runs but gives the
 wrong result, that is a bug: please add a spec test for it.

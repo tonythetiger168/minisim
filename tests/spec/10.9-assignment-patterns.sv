@@ -1,4 +1,4 @@
-//! icarus-skip: Icarus 12 has no named or default assignment patterns
+//! icarus-skip: Icarus 13 has no named or default assignment patterns
 // IEEE 1800-2023 10.9.2: '{member: v}, '{v, v}, '{default: v}, '{n{v}} for packed types.
 module top;
   typedef struct packed { logic [3:0] hi; logic [3:0] lo; } byte_t;

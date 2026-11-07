@@ -1,4 +1,4 @@
-//! icarus-skip: Icarus 12 has no inside, and no assignment inside an expression
+//! icarus-skip: Icarus 13 has no inside, and no assignment inside an expression
 // IEEE 1800-2023 11.4.13: inside matches values and [lo:hi] ranges with ==?, so an x
 // in an item matches anything and an x on the left gives x when nothing matches.
 // 11.3.6: an assignment in parentheses is an expression.

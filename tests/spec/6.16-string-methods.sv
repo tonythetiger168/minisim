@@ -1,4 +1,4 @@
-//! icarus-skip: Icarus 12 lacks most string methods (toupper, getc, compare, putc, itoa)
+//! icarus-skip: Icarus 13 lacks most string methods (toupper, getc, compare, putc, itoa)
 // IEEE 1800-2023 6.16.1-6.16.15: string methods; 21.3.3 $sformat; string
 // arrays and functions; integral to string conversion; case on a string.
 module top;
