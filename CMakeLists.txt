@@ -3,6 +3,13 @@ project(minisim LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Without a build type CMake passes no -O flag, and the kernel runs about 5x
+# slower (a 1M-cycle counter: 3.5 s unoptimized, 0.45 s at -O2). Default to
+# -O2 but keep assert() on, since tests/test_expr.cpp checks with it.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  add_compile_options(-O2)
+endif()
+
 # Simulator kernel + hand-built demo design (no external dependencies)
 add_executable(minisim src/minisim.cpp)
 target_include_directories(minisim PRIVATE src)
@@ -13,6 +20,7 @@ enable_testing()
 foreach(t test_expr test_z test_sched test_net test_sys)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
+  target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 add_executable(test_vcd tests/test_vcd.cpp)
@@ -38,6 +46,8 @@ if(MINISIM_WITH_SLANG)
   add_executable(msim src/msim.cpp)
   target_include_directories(msim PRIVATE src)
   target_link_libraries(msim PRIVATE slang::slang)
+  # -compile builds generated C++ against the kernel headers in src/.
+  target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -60,6 +70,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_vcd
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd.cmake)
+  # Compiled mode: generated C++ prints the same as the interpreter.
+  add_test(NAME msim_compile
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_compile.cmake)
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
