@@ -13,6 +13,8 @@
 // $monitor           -> one postponed line per slot if a watched value changed
 // $finish            -> S.finished = true
 // task/function      -> Call / Ret in this coroutine (exec.inc)
+#include <algorithm>
+#include <cctype>
 #include <coroutine>
 #include <cstdint>
 #include <deque>
@@ -21,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 using namespace std;
@@ -96,49 +99,108 @@ struct Sim {
     void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }
     static int bit0(const Val& v) { return (v.x & 1) ? 2 : (int)(v.v & 1); }
 
-    // %b is the full width, MSB first, each bit 0/1/x/z.
-    // %d is unsigned and right-justified to the width Icarus uses
-    // (digits of the maximum value). An all-X value is "x", all-Z is "z";
-    // a value that is only partly unknown is "X" or "Z".
-    void printSys(const string& fmt, const vector<E>& args) {
-        auto bin = [](Val v) {
-            string s(v.w, '0');
-            for (int i = 0; i < v.w; i++) {
-                int b = v.w - 1 - i;
-                if ((v.z >> b) & 1) s[i] = 'z';
-                else if ((v.x >> b) & 1) s[i] = 'x';
-                else s[i] = char('0' + ((v.v >> b) & 1));
+    // Format a $display / $write line (IEEE 1800 21.2.1).
+    //   %b %o %h/%x  full width, MSB first. A digit whose bits are all x is x,
+    //                all z is z; a digit that is only partly unknown is X / Z.
+    //   %d           right-justified to the width of the largest value (as
+    //                Icarus does). A signed value prints with a minus sign.
+    //                An all-X value is "x", all-Z is "z", partly unknown "X"/"Z".
+    //   %c           the low 8 bits as a character
+    //   %s           the value as 8-bit characters, leading zero bytes dropped
+    //   %t           a time, right-justified to 20 columns
+    //   %m           the scope name (minisim has one: the top module)
+    //   %0<f>        no padding: %0d / %0t drop the spaces, %0b / %0h / %0o
+    //                drop leading zeros. %<n><f> pads to at least n columns.
+    //   %%           a percent sign
+    // An argument without a matching specifier is ignored, and a specifier
+    // without an argument is printed as written.
+    static string fmtVal(char c, Val v, int minW, bool zero) {
+        auto digits = [&](int bits) {
+            int n = (v.w + bits - 1) / bits;
+            string s(n, '0');
+            for (int d = 0; d < n; d++) {
+                int lo = d * bits, hi = std::min(lo + bits, v.w);
+                uint64_t m = mask(hi - lo) << lo;
+                uint64_t x = v.x & m, z = v.z & m;
+                char ch;
+                if (z == m) ch = 'z';
+                else if (x == m && !z) ch = 'x';
+                else if (z) ch = 'Z';
+                else if (x) ch = 'X';
+                else ch = "0123456789abcdef"[(v.v & m) >> lo];
+                s[n - 1 - d] = ch;
+            }
+            if (zero) {
+                size_t k = s.find_first_not_of('0');
+                s = k == string::npos ? "0" : s.substr(k);
             }
             return s;
         };
-        auto dec = [](Val v) {
-            uint64_t m = mask(v.w);
-            int nx = __builtin_popcountll(v.x & ~v.z & m);
-            int nz = __builtin_popcountll(v.z & m);
-            string body;
-            if (nx == v.w) body = "x";
-            else if (nx) body = "X";
-            else if (nz == v.w) body = "z";
-            else if (nz) body = "Z";
-            else body = to_string(v.v);
-            int width = (int)((v.w * 146L + 484) / 485);
-            if (width < 1) width = 1;
-            if ((int)body.size() >= width) return body;
-            return string(width - body.size(), ' ') + body;
-        };
+        string body;
+        bool pad = true;   // right-justify %d / %t to their natural width
+        int natural = 0;
+        switch (c) {
+            case 'b': body = digits(1); pad = false; break;
+            case 'o': body = digits(3); pad = false; break;
+            case 'h': case 'x': body = digits(4); pad = false; break;
+            case 'c': body = string(1, char(v.v & 0xff)); pad = false; break;
+            case 's': {
+                for (int b = (v.w + 7) / 8 - 1; b >= 0; b--) {
+                    char ch = char((v.v >> (8 * b)) & 0xff);
+                    if (ch || !body.empty()) body += ch;
+                }
+                pad = false;
+                break;
+            }
+            case 't':
+            case 'd': {
+                uint64_t m = mask(v.w);
+                int nx = __builtin_popcountll(v.x & ~v.z & m);
+                int nz = __builtin_popcountll(v.z & m);
+                bool neg = v.sgn && v.w > 0 && !v.x && ((v.v >> (v.w - 1)) & 1);
+                if (nx == v.w) body = "x";
+                else if (nx) body = "X";
+                else if (nz == v.w) body = "z";
+                else if (nz) body = "Z";
+                else if (neg) {
+                    uint64_t mag = (~v.v + 1) & m;
+                    if (v.w == 64) mag = ~v.v + 1;
+                    body = "-" + to_string(mag);
+                } else body = to_string(v.v & m);
+                if (c == 't') natural = 20;
+                else {
+                    natural = (int)((v.w * 146L + 484) / 485);
+                    if (v.sgn) natural++;
+                    if (natural < 1) natural = 1;
+                }
+                break;
+            }
+        }
+        int width = zero ? 0 : (minW > 0 ? minW : (pad ? natural : 0));
+        if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
+        return body;
+    }
+    void printSys(const string& fmt, const vector<E>& args, bool newline = true) {
         size_t ai = 0;
         for (size_t i = 0; i < fmt.size(); ++i) {
             char c = fmt[i];
             if (c != '%') { cout << c; continue; }
+            size_t start = i;
             if (i + 1 >= fmt.size()) { cout << '%'; break; }
             c = fmt[++i];
             if (c == '%') { cout << '%'; continue; }
-            bool num = c == 'b' || c == 'B' || c == 'd' || c == 'D';
-            if (!num || ai >= args.size()) { cout << '%' << c; continue; }
+            bool zero = false;
+            int minW = 0;
+            if (c == '0') { zero = true; if (i + 1 < fmt.size()) c = fmt[++i]; }
+            while (isdigit((unsigned char)c) && i + 1 < fmt.size()) { minW = minW * 10 + (c - '0'); c = fmt[++i]; }
+            char lc = (char)tolower((unsigned char)c);
+            if (lc == 'm') { cout << "top"; continue; }
+            bool known = string_view("bohxdcst").find(lc) != string_view::npos;
+            if (!known || ai >= args.size()) { cout << fmt.substr(start, i - start + 1); continue; }
             Val v = eval(args[ai++], [&](int s) { return get(s); });
-            cout << ((c == 'b' || c == 'B') ? bin(v) : dec(v));
+            cout << fmtVal(lc, v, minW, zero);
         }
-        cout << '\n';
+        if (newline) cout << '\n';
     }
     void strobe(const string& fmt, const vector<E>& args) { postq.push_back({false, fmt, args}); }
     void queueMon() {
@@ -238,6 +300,7 @@ struct Sim {
             auto it = wheel.begin();
             if (it->first > end) break;
             now = it->first;
+            g_simTime = now;
             for (auto h : it->second) active.push_back(h);
             wheel.erase(it);
             for (;;) {                                         // one time slot

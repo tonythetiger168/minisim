@@ -26,6 +26,10 @@ jobs:
           path: build/_deps
           key: slang-v12.1-${{ hashFiles('CMakeLists.txt') }}-${{ runner.os }}
 
+      # Icarus Verilog cross-checks the tests/spec expectations (icarus/* tests).
+      - name: Install Icarus Verilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang
         run: CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON && cmake --build build -j2 && ctest --test-dir build --output-on-failure

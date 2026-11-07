@@ -62,6 +62,8 @@
 #include "slang/ast/statements/MiscStatements.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
+#include "slang/ast/symbols/ParameterSymbols.h"
+#include "slang/ast/types/AllTypes.h"
 
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
@@ -131,11 +133,14 @@ struct Lowerer {
 
     explicit Lowerer(std::unordered_map<const slang::ast::Symbol*, int>& m) : sigmap(m) {}
 
+    // Owns the Prog of each fork branch, so Fork's pointers outlive lower().
+    std::vector<std::unique_ptr<Prog>>* store = nullptr;
     void bind(std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* s,
-              MkSig mk, int* seq) {
+              MkSig mk, int* seq, std::vector<std::unique_ptr<Prog>>* st = nullptr) {
         subs = s;
         mkSig = std::move(mk);
         tempSeq = seq;
+        store = st;
     }
 
     int fresh(int w) {
@@ -219,6 +224,7 @@ struct Lowerer {
             case BinaryOperator::BinaryAnd:
             case BinaryOperator::BinaryOr:
             case BinaryOperator::BinaryXor:
+            case BinaryOperator::BinaryXnor:
                 return true;
             default:
                 return false;
@@ -325,10 +331,32 @@ struct Lowerer {
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
         switch (e.kind) {
-            case ExpressionKind::IntegerLiteral: {
-                const auto& sv = e.as<IntegerLiteral>().getValue();
-                int w = (int)sv.getBitWidth();
-                bool self = e.type->isSigned();
+            case ExpressionKind::IntegerLiteral:
+                return svLit(e.as<IntegerLiteral>().getValue(), e.type->isSigned(), ctx);
+            case ExpressionKind::StringLiteral: {   // "abc" is 8 bits per char (5.9)
+                const auto& sv = e.as<StringLiteral>().getIntValue().integer();
+                if (sv.getBitWidth() > 64) unsupported("string literal longer than 8 characters");
+                return svLit(sv, false, ctx);
+            }
+            case ExpressionKind::Replication: {     // {n{a}} (11.4.12.1)
+                const auto& r = e.as<ReplicationExpression>();
+                int64_t n = constInt(r.count());
+                if (n < 0 || n > 64) unsupported("replication count");
+                if (n == 0) unsupported("zero replication");
+                E one = expr(r.concat());
+                std::vector<E> parts((size_t)n, one);
+                return sized(concat(parts), (int)e.type->getBitWidth(), false, ctx);
+            }
+            default: break;
+        }
+        return expr2(e, ctx);
+    }
+
+    // A constant from slang's 4-state integer, at its own width and sign.
+    E svLit(const slang::SVInt& sv, bool self, ExprCtx ctx) {
+        int w = (int)sv.getBitWidth();
+        if (w > 64) unsupported("constant wider than 64 bits");
+        {
                 E lit;
                 if (sv.hasUnknown()) {   // x / z / ? bits (VERIFY logic_t API for your slang version)
                     uint64_t v = 0, x = 0, z = 0;
@@ -343,14 +371,30 @@ struct Lowerer {
                     }
                     lit = konst(make(v, x, w, z, self));
                 } else {
-                    lit = konst(make(*sv.as<uint64_t>(), 0, w, 0, self));
+                    lit = konst(make(sv.getRawPtr()[0], 0, w, 0, self));
                 }
                 return sized(lit, w, self, ctx);
-            }
+        }
+    }
+
+    // A parameter, localparam, or enum value (6.20, 6.19.3) is its constant.
+    E constSym(const slang::ast::Symbol& sym, const slang::ast::Expression& e, ExprCtx ctx) {
+        using namespace slang::ast;
+        const slang::ConstantValue* cv = nullptr;
+        if (sym.kind == SymbolKind::Parameter) cv = &sym.as<ParameterSymbol>().getValue();
+        else if (sym.kind == SymbolKind::EnumValue) cv = &sym.as<EnumValueSymbol>().getValue();
+        else if (const auto* c = e.getConstant()) cv = c;
+        if (!cv || !cv->isInteger()) unsupported("reference to non-signal symbol");
+        return svLit(cv->integer(), e.type->isSigned(), ctx);
+    }
+
+    E expr2(const slang::ast::Expression& e, ExprCtx ctx) {
+        using namespace slang::ast;
+        switch (e.kind) {
             case ExpressionKind::NamedValue: {
                 const Symbol* sym = &e.as<NamedValueExpression>().symbol;
                 auto it = sigmap.find(sym);
-                if (it == sigmap.end()) unsupported("reference to non-signal symbol");
+                if (it == sigmap.end()) return constSym(*sym, e, ctx);
                 int src = (int)e.type->getBitWidth();
                 bool self = e.type->isSigned();
                 return sized(ref(it->second, self), src, self, ctx);
@@ -395,8 +439,16 @@ struct Lowerer {
                     needWidth(w);
                     return sized(std::move(v), w, e.type->isSigned(), ctx);
                 }
-                // $signed / $unsigned keep the bits and change the tag.
                 std::string_view n = call.getSubroutineName();
+                // $time / $stime / $realtime (20.3.1): the current time. minisim
+                // has one time unit, so $realtime is the same integer.
+                if (n == "$time" || n == "$stime" || n == "$realtime") {
+                    int w = n == "$stime" ? 32 : 64;
+                    E t = node(Op::Time);
+                    if (w != 64) t = resize(std::move(t), w, false, false);
+                    return sized(std::move(t), w, false, ctx);
+                }
+                // $signed / $unsigned keep the bits and change the tag.
                 if (n != "$signed" && n != "$unsigned") unsupported("system function");
                 auto args = call.arguments();
                 if (args.size() != 1 || args[0]->kind == ExpressionKind::EmptyArgument)
@@ -410,7 +462,10 @@ struct Lowerer {
             }
             case ExpressionKind::UnaryOp: {
                 const auto& u = e.as<UnaryExpression>();
-                bool bw = u.op == UnaryOperator::BitwiseNot;
+                // ~a, -a, +a are context-determined (11.6.1): the operand is
+                // extended to the context width before the operator.
+                bool bw = u.op == UnaryOperator::BitwiseNot || u.op == UnaryOperator::Minus ||
+                          u.op == UnaryOperator::Plus;
                 E a;
                 if (bw) {
                     int w = ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
@@ -423,6 +478,16 @@ struct Lowerer {
                 E out;
                 switch (u.op) {
                     case UnaryOperator::BitwiseNot: out = un(Op::Not, a); break;
+                    case UnaryOperator::Plus: out = a; break;
+                    case UnaryOperator::Minus: {   // 0 - a at a's width and sign
+                        Val zero = mk(0, ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth());
+                        zero.sgn = e.type->isSigned();
+                        out = bin(Op::Sub, konst(zero), a);
+                        break;
+                    }
+                    case UnaryOperator::BitwiseNand: out = un(Op::LogNot, un(Op::RedAnd, a)); break;
+                    case UnaryOperator::BitwiseNor: out = un(Op::LogNot, un(Op::RedOr, a)); break;
+                    case UnaryOperator::BitwiseXnor: out = un(Op::Not, un(Op::RedXor, a)); break;
                     case UnaryOperator::LogicalNot: out = un(Op::LogNot, a); break;
                     case UnaryOperator::BitwiseAnd: out = un(Op::RedAnd, a); break;
                     case UnaryOperator::BitwiseOr: out = un(Op::RedOr, a); break;
@@ -435,7 +500,9 @@ struct Lowerer {
             case ExpressionKind::BinaryOp: {
                 const auto& b = e.as<BinaryExpression>();
                 bool sizeBoth = widthPropagates(b.op) || isDivMod(b.op);
-                bool shift = isShift(b.op);
+                // a ** b sizes like a shift: the result is a's width, b is
+                // self-determined (11.6.1).
+                bool shift = isShift(b.op) || b.op == BinaryOperator::Power;
                 E l, r;
                 int w = 0;
                 if (sizeBoth || shift) {
@@ -489,9 +556,16 @@ struct Lowerer {
                         break;
                     case BinaryOperator::LogicalAnd: kop = Op::LogAnd; break;
                     case BinaryOperator::LogicalOr: kop = Op::LogOr; break;
+                    case BinaryOperator::Power: kop = Op::Pow; break;
+                    case BinaryOperator::CaseInequality: kop = Op::CaseEq; break;
+                    case BinaryOperator::BinaryXnor: kop = Op::Xor; break;
+                    case BinaryOperator::LogicalImplication: kop = Op::LogOr; l = un(Op::LogNot, l); break;
+                    case BinaryOperator::LogicalEquivalence: kop = Op::Eq; l = un(Op::RedOr, l); r = un(Op::RedOr, r); break;
                     default: unsupported("binary operator");
                 }
                 E out = bin(kop, l, r);
+                if (b.op == BinaryOperator::CaseInequality) out = un(Op::LogNot, out);
+                if (b.op == BinaryOperator::BinaryXnor) out = un(Op::Not, out);
                 if (sizeBoth || shift) {
                     if (ctx.live && ctx.w > 0 && w != ctx.w)
                         return resize(std::move(out), ctx.w, false, ctx.tag);
@@ -617,28 +691,55 @@ struct Lowerer {
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
+        // $display / $write and their b / o / h variants (21.2.1). The suffix
+        // only changes the default format of an argument with no specifier.
         IK k;
-        if (n == "$display") k = IK::Display;
-        else if (n == "$strobe") k = IK::Strobe;
-        else if (n == "$monitor") k = IK::Monitor;
+        bool nonl = false;
+        char dflt = 'd';
+        std::string_view base = n;
+        if (base.size() > 1 && (base.ends_with('b') || base.ends_with('o') || base.ends_with('h')) &&
+            (base.starts_with("$display") || base.starts_with("$write") || base.starts_with("$strobe") ||
+             base.starts_with("$monitor")) &&
+            base != "$monitoron") {
+            dflt = base.back();
+            base.remove_suffix(1);
+        }
+        if (base == "$display") k = IK::Display;
+        else if (base == "$write") { k = IK::Display; nonl = true; }
+        else if (base == "$strobe") k = IK::Strobe;
+        else if (base == "$monitor") k = IK::Monitor;
         else {
             std::cerr << "lower: ignoring system call " << n << "\n";
             return;
         }
-        Instr i; i.k = k;
-        auto args = call.arguments();
-        size_t ai = 0;
-        if (!args.empty() && args[0]->kind != ExpressionKind::EmptyArgument) {
-            const Expression& first = peel(*args[0]);
-            if (first.kind != ExpressionKind::StringLiteral)
-                unsupported("system task without a format string");
-            i.fmt = std::string(first.as<StringLiteral>().getValue());
-            ai = 1;
-        }
-        for (; ai < args.size(); ai++) {
-            if (args[ai]->kind == ExpressionKind::EmptyArgument)
-                unsupported("empty system task argument");
-            i.args.push_back(expr(*args[ai]));
+        Instr i; i.k = k; i.nonl = nonl;
+        // Each string-literal argument is format text; any other argument
+        // fills the next specifier, or prints with the default if none is
+        // waiting ($display(a, b) prints both in decimal).
+        int pending = 0;
+        auto countSpecs = [](const std::string& f) {
+            int c = 0;
+            for (size_t p = 0; p < f.size(); p++) {
+                if (f[p] != '%') continue;
+                if (p + 1 < f.size() && f[p + 1] == '%') { p++; continue; }
+                size_t q = p + 1;
+                while (q < f.size() && isdigit((unsigned char)f[q])) q++;
+                if (q < f.size() && f[q] != 'm' && f[q] != 'M') c++;
+            }
+            return c;
+        };
+        for (const Expression* a : call.arguments()) {
+            if (a->kind == ExpressionKind::EmptyArgument) { i.fmt += ' '; continue; }
+            const Expression& pe = peel(*a);
+            if (pe.kind == ExpressionKind::StringLiteral && pending == 0) {
+                std::string f(pe.as<StringLiteral>().getValue());
+                i.fmt += f;
+                pending = countSpecs(f);
+                continue;
+            }
+            if (pending > 0) pending--;
+            else { i.fmt += '%'; i.fmt += dflt; }
+            i.args.push_back(expr(*a));
         }
         prog.emit(i);
     }
@@ -689,9 +790,57 @@ struct Lowerer {
             case StatementKind::List:
                 for (auto* st : s.as<StatementList>().list) stmt(*st);
                 break;
-            case StatementKind::Block:
-                stmt(s.as<BlockStatement>().body);
+            case StatementKind::Block: {
+                const auto& b = s.as<BlockStatement>();
+                if (b.blockKind == StatementBlockKind::Sequential) { stmt(b.body); break; }
+                // fork ... join / join_any / join_none (9.3.2): each statement
+                // of the block is its own process. Fork starts them all, then
+                // waits for all, for the first, or not at all.
+                if (!store) unsupported("fork here");
+                Instr f; f.k = IK::Fork;
+                f.join = b.blockKind == StatementBlockKind::JoinAll ? 0
+                       : b.blockKind == StatementBlockKind::JoinAny ? 1 : 2;
+                auto branch = [&](const Statement& st) {
+                    Lowerer lw(sigmap);
+                    lw.bind(subs, mkSig, tempSeq, store);
+                    lw.current = current;
+                    lw.retSig = retSig;
+                    lw.stmt(st);
+                    lw.finishImplicit();
+                    store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+                    f.branches.push_back(store->back().get());
+                };
+                if (b.body.kind == StatementKind::List) {
+                    for (const Statement* st : b.body.as<StatementList>().list) {
+                        // A declaration in a fork block belongs to the parent.
+                        if (st->kind == StatementKind::VariableDeclaration) { stmt(*st); continue; }
+                        branch(*st);
+                    }
+                } else if (b.body.kind != StatementKind::Empty) {
+                    branch(b.body);
+                }
+                prog.emit(f);
                 break;
+            }
+            case StatementKind::Wait: {   // wait (cond) stmt (9.4.3)
+                // top: if (cond) goto body; @(signals in cond); goto top
+                const auto& w = s.as<WaitStatement>();
+                size_t top = prog.here();
+                Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
+                size_t jf = prog.emit(j);
+                size_t jbody = emitJmp();
+                prog.code[jf].target = prog.here();
+                std::vector<int> refs;
+                collectRefs(prog.code[jf].e, refs);
+                if (refs.empty()) unsupported("wait on a constant");
+                std::vector<std::pair<int, Edge>> rs;
+                for (int r : refs) rs.push_back({r, ANY});
+                prog.emit(waitInstr(rs));
+                Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                prog.code[jbody].target = prog.here();
+                stmt(w.stmt);
+                break;
+            }
             case StatementKind::Timed: {
                 const auto& t = s.as<TimedStatement>();
                 timing(t.timing);
@@ -893,6 +1042,10 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     SigCollector(MkSig f, std::unordered_map<const slang::ast::Symbol*, int>& m)
         : mkSig(std::move(f)), sigmap(m) {}
     template <typename T> void reg(const T& s, bool net) {
+        // An unpacked array (7.4) would otherwise be one flat signal and an
+        // element select would read a bit of it. Refuse it until arrays exist.
+        if (s.getType().isUnpackedArray())
+            throw std::runtime_error("lower: unsupported unpacked array: " + std::string(s.name));
         int w = (int)s.getType().getBitWidth();
         if (w > 64) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
@@ -930,7 +1083,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                   MkSig mk, int* seq)
         : sigmap(m), out(o), newDriver(std::move(nd)), subs(s), mkSig(std::move(mk)), tempSeq(seq) {}
 
-    void prep(Lowerer& lw) { lw.bind(subs, mkSig, tempSeq); }
+    void prep(Lowerer& lw) { lw.bind(subs, mkSig, tempSeq, &out.subs); }
 
     // One driver, then wait on every signal the right-hand side reads.
     // Several assigns to one wire each own a driver slot and resolve.
@@ -947,7 +1100,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         out.procs.push_back({std::move(lw.prog), loops, "assign"});
     }
 
-    // Module-level `logic x = v;` (IEEE 1800 6.8): a static variable's
+    // Module-level `logic x = v;` (IEEE 1800-2023 10.5): a static variable's
     // declaration initializer runs before any initial or always procedure
     // starts. All of them go into one process that lower() places first, so
     // it is the first thing to run at time 0. Locals of a block, task or
@@ -962,7 +1115,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v); i.e = init->expr(*e);
         init->prog.emit(i);
     }
-    // `wire y = a & b;` (IEEE 1800 6.7.1) is a continuous assignment to y.
+    // `wire y = a & b;` (IEEE 1800-2023 10.3.1) is a continuous assignment to y.
     void handle(const slang::ast::NetSymbol& n) {
         const slang::ast::Expression* e = n.getInitializer();
         if (!e) return;
@@ -1161,6 +1314,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
+        // A final block (9.2.3) runs once when simulation ends. Lowering it as
+        // a process would run it at time 0 and, looping, forever.
+        if (p.procedureKind == ProceduralBlockKind::Final) Lowerer::unsupported("final block");
         Lowerer lw(sigmap);
         prep(lw);
         lw.stmt(p.getBody());
@@ -1259,7 +1415,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     for (Subr* sub : order) {
         if (sub->sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
         Lowerer lw(sigmap);
-        lw.bind(&subMap, mkSig, &tempSeq);
+        lw.bind(&subMap, mkSig, &tempSeq, &out.subs);
         lw.retSig = sub->retSig;
         lw.current = sub;
         lw.stmt(sub->sym->getBody());
