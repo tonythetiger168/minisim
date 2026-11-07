@@ -90,6 +90,7 @@ static const char* ikName(IK k) {
         case IK::Monitor: return "Monitor";
         case IK::Call: return "Call";
         case IK::Ret: return "Ret";
+        case IK::Fork: return "Fork";
     }
     return "?";
 }
