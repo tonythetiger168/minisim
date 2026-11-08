@@ -322,7 +322,7 @@ private:
         FastInfo fa{}, fb{}, fc{};
         switch (e->op) {
             case Op::Const:
-                if (e->k.x || e->k.w > 64 || e->k.w < 1) return false;
+                if (e->k.x || e->k.w > 64 || e->k.w < 1 || e->k.real || e->k.str) return false;
                 out = hex(e->k.v);
                 fi = {e->k.w, e->k.sgn};
                 return true;
