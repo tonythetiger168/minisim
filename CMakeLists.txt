@@ -75,6 +75,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_compile.cmake)
+  # Multi-core: 256 independent lanes run as parallel partitions. Every
+  # thread count must print what the single-threaded event-driven run prints.
+  add_test(NAME msim_threads
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_threads.cmake)
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 

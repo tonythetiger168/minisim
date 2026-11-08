@@ -339,6 +339,42 @@ done:
     procEnd(*ctl);
 }
 
+// The value of a one-assign combinational process, and its write
+// (Sim::Comb compute / commit). compute only reads signals.
+static Val combValue(const void* ctx) {
+    return eval(static_cast<const Prog*>(ctx)->code[0].e, rd);
+}
+static void combCommit(const void* ctx, Val v) {
+    const Instr& i = static_cast<const Prog*>(ctx)->code[0];
+    if (i.drv >= 0) {
+        if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);  // as in exec()
+        S.drive(i.sig, i.drv, v, i.s0, i.s1);
+    } else
+        S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
+}
+
+// A clocked process (prog.hpp: seqShape) run as a function: the body after
+// its wait, with each NBA going to `out` instead of the queue.
+static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
+    const Prog* p = static_cast<const Prog*>(ctx);
+    size_t pc = 1, end = p->code.size() - 1;
+    while (pc < end) {
+        const Instr& i = p->code[pc];
+        switch (i.k) {
+            case IK::Nba: {
+                Val v = eval(i.e, rd);
+                int sig = i.sig, hi = i.hi, lo = i.lo;
+                if (target(i, sig, hi, lo, v)) out.push_back({sig, v, hi, lo});
+                pc++;
+                break;
+            }
+            case IK::JmpIfNot: pc = (truth(eval(i.e, rd)) == 1) ? pc + 1 : i.target; break;
+            case IK::Jmp: pc = i.target; break;
+            default: pc++; break;  // seqShape admits nothing else
+        }
+    }
+}
+
 // A combinational process (prog.hpp: combShape) run as a function: its
 // leading Assign instructions, exactly as exec() would run them.
 static void execComb(const void* ctx) {
