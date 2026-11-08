@@ -7,7 +7,9 @@ static Val rd(int s) { return S.get(s); }
 struct RetFrame { const Prog* prog; size_t pc; };
 
 // Resolve a run-time array index and bit index. false: no write happens.
-static bool target(const Instr& i, int& sig, int& hi, int& lo) {
+// v is the value to write; a part-select that is partly out of range writes
+// only the bits inside the vector (11.5.1), so v is shifted to match.
+static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
     if (i.arr) {
         std::vector<int64_t> idx;
         for (auto& a : i.aidx) {
@@ -23,8 +25,17 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo) {
         Val v = eval(i.bidx, rd);
         if (v.x) return false;
         int64_t b = v_to_i64(v) - i.lo;   // lo holds the vector's low bound here
-        if (b < 0 || b >= S.sigs[sig].w) return false;
-        hi = lo = (int)b;
+        if (!i.pw) {
+            if (b < 0 || b >= S.sigs[sig].w) return false;
+            hi = lo = (int)b;
+            return true;
+        }
+        int64_t l = i.pdown ? b - i.pw + 1 : b, h = l + i.pw - 1;
+        int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, S.sigs[sig].w - 1);
+        if (cl > ch) return false;
+        val = v_slice(val, (int)(ch - l), (int)(cl - l));
+        hi = (int)ch;
+        lo = (int)cl;
     }
     return true;
 }
@@ -121,11 +132,62 @@ struct JoinWait {
     void await_resume() const {}
 };
 
-Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
+// One running process: its children (for wait fork / disable fork) and the
+// fork it belongs to. A disabled process ends at once for everyone waiting
+// on it; its coroutine, if it is resumed later, just returns.
+struct ProcCtl {
+    Handle h{};
+    bool killed = false, ended = false, waitingFork = false;
+    weak_ptr<ProcCtl> parent;
+    vector<shared_ptr<ProcCtl>> kids;
+    shared_ptr<JoinState> join;
+    bool kidsDone() const {
+        for (auto& k : kids) if (!k->ended) return false;
+        return true;
+    }
+};
+inline unordered_map<int, vector<weak_ptr<ProcCtl>>>& rootProcs() {
+    static unordered_map<int, vector<weak_ptr<ProcCtl>>> m;
+    return m;
+}
+inline void procEnd(ProcCtl& c) {
+    if (c.ended) return;
+    c.ended = true;
+    if (c.join) c.join->branchEnded();
+    if (auto p = c.parent.lock())
+        if (p->waitingFork && p->kidsDone()) { p->waitingFork = false; S.active.push_back(p->h); }
+}
+inline void procKill(const shared_ptr<ProcCtl>& c) {
+    if (c->ended) return;
+    c->killed = true;
+    for (auto& k : c->kids) procKill(k);
+    S.dead.insert(c->h.address());
+    procEnd(*c);
+}
+struct WaitFork {
+    shared_ptr<ProcCtl> c;
+    bool await_ready() const { return c->kidsDone(); }
+    void await_suspend(Handle h) const { c->h = h; c->waitingFork = true; }
+    void await_resume() const {}
+};
+
+Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl);
+inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c) {
+    Task t = exec(p, c);
+    c->h = t.h;
+    for (int r : p->roots) rootProcs()[r].push_back(c);
+    return t;
+}
+// A top-level process (initial, always, final).
+inline Task process(const Prog* p) { return startProc(p, make_shared<ProcCtl>()); }
+inline Task exec(const Prog* p) { return process(p); }
+
+Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
     const Prog* p = entry;
     size_t pc = 0;
     vector<RetFrame> rets;
     while (p) {
+        if (ctl->killed) goto done;
         if (pc >= p->code.size()) {
             if (rets.empty()) goto done;
             RetFrame f = rets.back();
@@ -139,12 +201,20 @@ Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
             case IK::Assign:
             case IK::Nba: {
                 Val v = eval(i.e, rd);
-                if (i.drv >= 0) { S.drive(i.sig, i.drv, v, i.s0, i.s1); pc++; break; }
+                if (i.drv >= 0) {
+                    if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
+                    S.drive(i.sig, i.drv, v, i.s0, i.s1);
+                    pc++; break;
+                }
                 int sig = i.sig, hi = i.hi, lo = i.lo;
                 // The index of a[i] / v[i] is read when the statement runs,
                 // also for a nonblocking write. An invalid one skips it (7.4.6, 11.5.1).
-                if (!target(i, sig, hi, lo)) { pc++; break; }
-                if (i.k == IK::Nba) S.nba(sig, v, hi, lo);
+                if (!target(i, sig, hi, lo, v)) { pc++; break; }
+                if (i.k == IK::Nba && i.nbaLater) {
+                    uint64_t d = i.delay;
+                    if (i.de) { Val dv = eval(i.de, rd); d = dv.x ? 0 : dv.v; }
+                    S.nbaAt(S.now + d, sig, v, hi, lo);
+                } else if (i.k == IK::Nba) S.nba(sig, v, hi, lo);
                 else S.set(sig, hi >= 0 ? v_insert(S.get(sig), v, hi, lo) : v);
                 pc++; break;
             }
@@ -155,7 +225,12 @@ Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
                 if (i.events.size() > 1) co_await WaitAny{&i.events};
                 else co_await Wait{i.sig, i.edge};
                 pc++; break;
-            case IK::WaitDelay: co_await Delay{i.delay}; pc++; break;
+            case IK::WaitDelay: {
+                uint64_t d = i.delay;
+                if (i.de) { Val v = eval(i.de, rd); d = v.x ? 0 : v.v; }
+                co_await Delay{d};
+                pc++; break;
+            }
             case IK::Display:
                 S.printSys(i.fmt, i.args, !i.nonl);
                 if (S.finished) goto done;  // task ran; $finish already requested
@@ -190,8 +265,13 @@ Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
                 auto js = make_shared<JoinState>();
                 js->join = i.join;
                 js->left = (int)i.branches.size();
+                std::erase_if(ctl->kids, [](auto& k) { return k->ended; });
                 for (const Prog* b : i.branches) {
-                    Task t = exec(b, js);
+                    auto c = make_shared<ProcCtl>();
+                    c->parent = ctl;
+                    c->join = js;
+                    ctl->kids.push_back(c);
+                    Task t = startProc(b, c);
                     S.all.push_back(t.h);
                     S.active.push_back(t.h);
                 }
@@ -200,6 +280,24 @@ Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
                 if (S.finished) goto done;
                 break;
             }
+            case IK::Disable: {   // 9.6.2
+                auto& v = rootProcs()[i.sig];
+                auto list = v;
+                for (auto& w : list)
+                    if (auto c = w.lock()) procKill(c);
+                std::erase_if(v, [](auto& w) { auto c = w.lock(); return !c || c->ended; });
+                pc++;
+                break;   // the loop top stops this process if it was one of them
+            }
+            case IK::WaitFork:
+                pc++;
+                co_await WaitFork{ctl};
+                break;
+            case IK::DisableFork:
+                for (auto& k : ctl->kids) procKill(k);
+                ctl->kids.clear();
+                pc++;
+                break;
             case IK::Ret:
                 if (rets.empty()) goto done;
                 {
@@ -212,7 +310,7 @@ Task exec(const Prog* entry, shared_ptr<JoinState> joinOf = nullptr) {
         }
     }
 done:
-    if (joinOf) joinOf->branchEnded();
+    procEnd(*ctl);
 }
 
 // The value of a one-assign combinational process, and its write
