@@ -59,17 +59,45 @@ struct Task {
 // batch costs one wake-up and one counter update per thread, not per item,
 // and neighbouring result slots are written by the same thread. Workers spin
 // briefly between batches, then sleep on an atomic wait.
+// Default worker count: the hardware threads, but at most 8. Measured on a
+// 20-core / 28-thread i7-14700 (bench/wide.sv): 4 to 12 threads were fastest,
+// 20 was slower than 8, and 24 or more was 5-50x slower, because one
+// descheduled thread holds up every batch. -threads N still picks any count
+// up to the hardware threads.
+inline int defaultThreads() {
+    int hw = (int)thread::hardware_concurrency();
+    return hw < 1 ? 1 : (hw > 8 ? 8 : hw);
+}
+
 struct Pool {
+    // Each thread starts on its own contiguous range of a batch (so the same
+    // items keep landing on the same core's cache), takes it in chunks, and
+    // then steals unclaimed chunks from the other ranges. A thread the OS has
+    // descheduled (a busy desktop, a VM with as many threads as CPUs) then
+    // holds up a batch only for the chunk it is in the middle of. With fixed
+    // ranges and no stealing, a batch waited for every descheduled worker,
+    // which made a loaded run 10x or more slower than one thread.
+    //
+    // A slot's claim packs the batch number (high 32 bits) with its next item
+    // (low 32 bits), so a worker that wakes up late can never take an item of
+    // a batch it did not see published.
+    static constexpr int kMaxThreads = 64;
     using Job = void (*)(void*, size_t);
+    struct alignas(64) Slot {
+        atomic<uint64_t> claim{0};
+        atomic<size_t> end{0}, chunk{1};
+    };
+    Slot slots[kMaxThreads];
     vector<thread> ts;
-    atomic<uint64_t> gen{0};
-    atomic<int> done{0};
-    size_t count = 0;   // written before gen is bumped, read after it is seen
-    Job job = nullptr;
+    atomic<uint64_t> gen{0};       // bumped once per batch; idle workers sleep on it
+    alignas(64) atomic<size_t> finished{0};   // items of the current batch that are done
+    atomic<size_t> total{0};       // items in the current batch
+    Job job = nullptr;             // written before a batch is published, read after a claim
     void* ctx = nullptr;
     atomic<bool> stop{false};
     int size() const { return (int)ts.size() + 1; }
     void ensure(int n) {
+        n = std::min(n, kMaxThreads);
         while ((int)ts.size() < n - 1) {
             int id = (int)ts.size() + 1;
             ts.emplace_back([this, id] { worker(id); });
@@ -81,10 +109,30 @@ struct Pool {
         gen.notify_all();
         for (auto& t : ts) t.join();
     }
-    void work(int id) {
-        size_t T = (size_t)size();
-        size_t lo = count * (size_t)id / T, hi = count * (size_t)(id + 1) / T;
-        for (size_t i = lo; i < hi; i++) job(ctx, i);
+    // Take chunks of slot s in batch b until it is empty. False once the
+    // batch is over, so stealing can stop early.
+    bool drain(Slot& s, uint32_t b) {
+        uint64_t c = s.claim.load(memory_order_acquire);
+        for (;;) {
+            if ((uint32_t)(c >> 32) != b) return false;
+            // Read after a claim of batch b was seen: a successful CAS below
+            // proves batch b was still open, so these are b's values.
+            size_t lo = (size_t)(uint32_t)c, n = s.end.load(memory_order_relaxed);
+            if (lo >= n) return true;
+            size_t hi = std::min(n, lo + s.chunk.load(memory_order_relaxed));
+            if (!s.claim.compare_exchange_weak(c, ((uint64_t)b << 32) | hi,
+                                               memory_order_acq_rel, memory_order_acquire)) continue;
+            for (size_t i = lo; i < hi; i++) job(ctx, i);
+            // The chunk that completes the batch wakes run() if it sleeps.
+            if (finished.fetch_add(hi - lo, memory_order_acq_rel) + (hi - lo) == total.load(memory_order_relaxed))
+                finished.notify_one();
+            c = s.claim.load(memory_order_acquire);
+        }
+    }
+    void work(int id, uint32_t b) {
+        int T = size();
+        for (int k = 0; k < T; k++)
+            if (!drain(slots[(id + k) % T], b)) return;
     }
     void worker(int id) {
         uint64_t seen = 0;
@@ -92,16 +140,15 @@ struct Pool {
             uint64_t g;
             int spins = 0;
             while ((g = gen.load(memory_order_acquire)) == seen) {
-                // Spin for the next batch of this slot; yield so an
-                // oversubscribed machine still makes progress; then sleep.
+                // Spin for the next batch; yield, which lets any other
+                // runnable thread have the CPU; then sleep.
                 if (++spins < 4000) relax();
                 else if (spins < 20000) this_thread::yield();
                 else gen.wait(seen);
             }
             seen = g;
             if (stop) return;
-            work(id);
-            done.fetch_add(1, memory_order_release);
+            work(id, (uint32_t)g);
         }
     }
     static void relax() {
@@ -110,17 +157,28 @@ struct Pool {
 #endif
     }
     void run(size_t n, Job j, void* c) {
+        uint32_t b = (uint32_t)(gen.load(memory_order_relaxed) + 1);
+        size_t T = (size_t)size();
         job = j;
         ctx = c;
-        count = n;
-        done.store(0, memory_order_relaxed);
-        gen.fetch_add(1, memory_order_release);
+        total.store(n, memory_order_relaxed);
+        finished.store(0, memory_order_relaxed);
+        for (size_t t = 0; t < T; t++) {
+            size_t lo = n * t / T, hi = n * (t + 1) / T;
+            slots[t].end.store(hi, memory_order_relaxed);
+            slots[t].chunk.store(std::max<size_t>(1, (hi - lo) / 4), memory_order_relaxed);
+            slots[t].claim.store(((uint64_t)b << 32) | lo, memory_order_release);
+        }
+        gen.store(b, memory_order_release);   // the only writer while the pool runs
         gen.notify_all();
-        work(0);
-        int others = size() - 1;
-        for (int spins = 0; done.load(memory_order_acquire) < others; spins++) {
+        work(0, b);
+        // Wait for chunks other threads are still running: spin, yield, then sleep.
+        for (int spins = 0;; spins++) {
+            size_t d = finished.load(memory_order_acquire);
+            if (d >= n) break;
             if (spins < 4000) relax();
-            else this_thread::yield();
+            else if (spins < 20000) this_thread::yield();
+            else finished.wait(d, memory_order_acquire);
         }
     }
 };
@@ -152,7 +210,7 @@ struct Sim {
     Sim() { g_sformat = &Sim::sformat; }
 
     // ---- multi-core: deterministic parallel batches ----
-    // `threads` workers (default: every hardware thread; msim -threads N).
+    // `threads` workers (default: defaultThreads(); msim -threads N).
     // Only work that reads signals and writes into its own buffer runs in
     // parallel: the value of a combinational process, or the NBAs of a
     // clocked process. Results are committed afterwards on this thread in a

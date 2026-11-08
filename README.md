@@ -81,7 +81,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-compile` | Compiled mode: generate C++ for the design, build `<dir>/simv`, run it |
 | `-o <dir>` | Build directory for `-compile` (default `msim.d`); `simv` can be rerun with `-maxtime` / `-vcd` |
 | `-no-static-comb` | Run assigns and `always_comb` as ordinary event-driven processes |
-| `-threads <n>` | Worker threads (default: every hardware thread; capped at that) |
+| `-threads <n>` | Worker threads (default: hardware threads, at most 8; capped at the hardware threads) |
 | `-no-static-seq`, `-no-partition` | Turn off clocked-process functions / partition tasks |
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
@@ -118,8 +118,12 @@ interpreter and `-compile` use the schedule; `-no-static-comb` turns it off.
 
 ### Multi-core
 
-msim uses every hardware thread by default (`-threads N` to choose, `-threads 1`
-for one). Two kinds of work run in parallel:
+msim uses up to 8 threads by default, fewer on a machine with fewer hardware
+threads (`-threads N` to choose, `-threads 1` for one). More is rarely faster:
+on a 20-core / 28-thread i7-14700, `bench/wide.sv` was fastest at 4 to 12
+threads, and at 24 or more one descheduled thread held up every batch. Idle
+workers, and the main thread waiting for a batch, spin briefly and then sleep.
+Two kinds of work run in parallel:
 
 - **Clocked processes.** An `always @(posedge clk)` block that only makes
   nonblocking assignments runs as a function that writes its NBAs into its

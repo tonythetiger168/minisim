@@ -111,14 +111,13 @@ public:
         o << "int main(int argc, char** argv) {\n"
              "    uint64_t maxTime = ~0ULL;\n"
              "    S.vcdPath = \"\";\n"
-             "    S.threads = (int)std::thread::hardware_concurrency();\n"
-             "    if (S.threads < 1) S.threads = 1;\n"
+             "    S.threads = defaultThreads();\n"
              "    for (int i = 1; i < argc; i++) {\n"
              "        if (!std::strcmp(argv[i], \"-maxtime\") && i + 1 < argc) maxTime = std::strtoull(argv[++i], nullptr, 10);\n"
              "        else if (!std::strcmp(argv[i], \"-vcd\") && i + 1 < argc) S.vcdPath = argv[++i];\n"
              "        else if (!std::strcmp(argv[i], \"-threads\") && i + 1 < argc) S.threads = std::max(1, std::atoi(argv[++i]));\n"
-             "    if (std::thread::hardware_concurrency() > 0) S.threads = std::min<int>(S.threads, (int)std::thread::hardware_concurrency());\n"
-             "    }\n";
+             "    }\n"
+             "    if (std::thread::hardware_concurrency() > 0) S.threads = std::min<int>(S.threads, (int)std::thread::hardware_concurrency());\n";
         for (size_t s = 0; s < sigs.size(); s++) {
             o << "    S.sig(" << quote(sigs[s].name) << ", " << sigs[s].w << ", " << (sigs[s].net ? "true" : "false") << ");";
             for (int d = 0; d < sigs[s].drivers; d++) o << " S.newDriver(" << s << ");";
