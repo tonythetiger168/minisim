@@ -293,7 +293,10 @@ private:
     std::string assign(const Instr& i, std::string val = "") {
         if (val.empty()) val = ex(i.e);
         std::ostringstream o;
-        if (i.drv >= 0)
+        if (i.drv >= 0 && i.hi >= 0)  // a driver of part of a net drives Z on the other bits
+            o << " S.drive(" << i.sig << ", " << i.drv << ", v_insert(allz(S.sigs[" << i.sig << "].w), " << val
+              << ", " << i.hi << ", " << i.lo << "), " << (int)i.s0 << ", " << (int)i.s1 << ");\n";
+        else if (i.drv >= 0)
             o << " S.drive(" << i.sig << ", " << i.drv << ", " << val << ", " << (int)i.s0 << ", " << (int)i.s1
               << ");\n";
         else if (i.hi >= 0)

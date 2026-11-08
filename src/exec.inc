@@ -320,8 +320,11 @@ static Val combValue(const void* ctx) {
 }
 static void combCommit(const void* ctx, Val v) {
     const Instr& i = static_cast<const Prog*>(ctx)->code[0];
-    if (i.drv >= 0) S.drive(i.sig, i.drv, v, i.s0, i.s1);
-    else S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
+    if (i.drv >= 0) {
+        if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);  // as in exec()
+        S.drive(i.sig, i.drv, v, i.s0, i.s1);
+    } else
+        S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
 }
 
 // A clocked process (prog.hpp: seqShape) run as a function: the body after
@@ -335,7 +338,7 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
             case IK::Nba: {
                 Val v = eval(i.e, rd);
                 int sig = i.sig, hi = i.hi, lo = i.lo;
-                if (target(i, sig, hi, lo)) out.push_back({sig, v, hi, lo});
+                if (target(i, sig, hi, lo, v)) out.push_back({sig, v, hi, lo});
                 pc++;
                 break;
             }
@@ -353,7 +356,11 @@ static void execComb(const void* ctx) {
     for (const Instr& i : p->code) {
         if (i.k != IK::Assign) return;
         Val v = eval(i.e, rd);
-        if (i.drv >= 0) S.drive(i.sig, i.drv, v, i.s0, i.s1);
-        else S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
+        if (i.drv >= 0) {
+            // A driver of part of a net drives Z on the other bits, as in exec().
+            if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
+            S.drive(i.sig, i.drv, v, i.s0, i.s1);
+        } else
+            S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
     }
 }
