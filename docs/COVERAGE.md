@@ -73,11 +73,14 @@ wrong result, that is a bug: please add a spec test for it.
 | 21.3 | File I/O ($fopen, $fwrite, ...) | ❌ | ignored with a warning |
 | 21.3.3 | $sformatf, $sformat, $swrite | ✅ | the same formats as $display |
 | 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
+| 20.6.2 | $bits | ✅ | of any fixed-size expression or type |
 | 21.7 | VCD ($dumpfile, $dumpvars) | 🟡 | `msim -vcd` dumps every signal; the tasks are ignored |
 | 22.7 | `` `timescale `` | ✅ | per-module unit and precision; one kernel tick is the finest precision in the design, also used as the VCD `$timescale`. `22.7-timescale` |
 | 23.3 | Module instances, ports | ✅ | named and positional, parameter overrides |
 | 23.6 | Hierarchical names | ✅ | read and write `u.x`, `blk[2].x`. `23.6-hierarchical-names` |
-| 25 | Interfaces, modports | ❌ | |
+| 25.3 | Interfaces | 🟡 | interface instances with ports and parameters, interface ports (generic `cnt_if c` or `bus_if.src b`), signals, nets with continuous assigns, processes, tasks and functions inside, `bus.send()` from the instantiating module. Not yet: interface arrays, virtual interfaces (needs classes, 25.9). `25.3-interface-ports` |
+| 25.5 | Modports | 🟡 | input/output/inout lists and `import` of interface functions. Not yet: modport expressions (25.5.4), `export`. Directions are not enforced. `25.5-modports` |
+| 26 | Packages | ✅ | parameters, localparams, typedefs, enums, structs, variables (named `pkg::x` in the VCD), functions and tasks; wildcard and explicit import, `pkg::name`. `26.3-package-import`, `26.2-package-items` |
 | 27 | Generate | ✅ | loop, if, and case generate; named and unnamed blocks (`genblkN`); instances and continuous assigns to separate bits inside. `27-generate` |
 | 28 | Gate primitives | 🟡 | and/or/xor families, buf/not, pullup/pulldown |
 
@@ -92,4 +95,6 @@ In order of how often typical testbenches hit them:
 5. ~~Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2), real (6.12), string (6.16)~~ done
 6. ~~Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8)~~ done; unpacked structs (7.2) next
 
-Classes (8), randomization (18), and interfaces (25) are what UVM needs.
+7. ~~Packages (26), interfaces and modports (25)~~ done
+
+Classes (8) and randomization (18) are what UVM needs next.

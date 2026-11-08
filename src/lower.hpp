@@ -1159,6 +1159,11 @@ struct Lowerer {
                     E v = bin(Op::Eq, ref(s + 1), bin(Op::Add, t, konst(mk(1, 64))));
                     return sized(std::move(v), 1, false, ctx);
                 }
+                if (n == "$bits" && call.arguments().size() == 1 && call.arguments()[0]->type->isFixedSize()) {   // 20.6.2
+                    Val b = mk(call.arguments()[0]->type->getBitstreamWidth(), 32);
+                    b.sgn = true;
+                    return sized(konst(b), 32, true, ctx);
+                }
                 // $signed / $unsigned keep the bits and change the tag.
                 if (n != "$signed" && n != "$unsigned") unsupported("system function");
                 auto args = call.arguments();
@@ -2102,8 +2107,9 @@ inline bool enterInstance(const slang::ast::InstanceSymbol& inst) {
     using namespace slang::ast;
     if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return false;
     if (!inst.arrayPath.empty()) Lowerer::unsupported("instance array");
-    if (inst.isInterface()) Lowerer::unsupported("interface instance");
-    if (!inst.isTopLevel() && !inst.isModule()) Lowerer::unsupported("non-module instance");
+    // An interface instance (25.3) is lowered like a module instance: its
+    // signals are named "bus.data", and its processes and tasks run as usual.
+    if (!inst.isTopLevel() && !inst.isModule() && !inst.isInterface()) Lowerer::unsupported("non-module instance");
     return true;
 }
 
@@ -2219,6 +2225,27 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     void handle(const slang::ast::VariableSymbol& v) { reg(v, false); }
     void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v, false); }
+    // A modport port (25.5) is another name for a signal of its interface.
+    // They are aliased after every signal is registered.
+    std::vector<const slang::ast::ModportPortSymbol*> modportPorts;
+    void handle(const slang::ast::ModportPortSymbol& m) { modportPorts.push_back(&m); }
+    // A package's variables are named "pkg::x" (26.3), apart from any module's x.
+    void handle(const slang::ast::PackageSymbol& p) {
+        std::string saved = prefix;
+        prefix = std::string(p.name) + "::";
+        visitDefault(p);
+        prefix = std::move(saved);
+    }
+    void aliasModports() {
+        for (const auto* m : modportPorts) {
+            if (m->explicitConnection) Lowerer::unsupported("modport expression (25.5.4)");
+            const slang::ast::Symbol* in = m->internalSymbol;
+            if (!in) continue;
+            if (auto it = sigmap.find(in); it != sigmap.end()) sigmap[m] = it->second;
+            if (auto it = arrMap().find(in); it != arrMap().end()) arrMap()[m] = it->second;
+            if (auto it = dynMap().find(in); it != dynMap().end()) dynMap()[m] = it->second;
+        }
+    }
     void handle(const slang::ast::NetSymbol& n) { reg(n, true); }
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
@@ -2304,7 +2331,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         const slang::ast::Scope* sc = v.getParentScope();
         if (!sc) return;
         auto pk = sc->asSymbol().kind;
-        if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock) return;
+        if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock &&
+            pk != slang::ast::SymbolKind::Package) return;   // package variables too (26.2)
         if (auto it = dynMap().find(&v); it != dynMap().end()) {   // int q[$] = '{1, 2};
             if (!e) return;
             if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
@@ -2487,8 +2515,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         using namespace slang::ast;
         if (inst.isTopLevel()) return;
         for (const PortConnection* conn : inst.getPortConnections()) {
+            if (conn && conn->port.kind == SymbolKind::InterfacePort) continue;   // b.x names the instance's own signal (25.3)
             if (!conn || conn->port.kind != SymbolKind::Port)
-                Lowerer::unsupported("interface port");
+                Lowerer::unsupported("port kind");
             const auto& ps = conn->port.as<PortSymbol>();
             const Expression* ext = conn->getExpression();
             if (!ext || ps.isNullPort) continue;
@@ -2590,6 +2619,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     blockIds() = BlockIds{};
     SigCollector sc(mkSig, sigmap);
     comp.getRoot().visit(sc);
+    sc.aliasModports();
 
     struct Finder : slang::ast::ASTVisitor<Finder> {
         std::vector<const slang::ast::SubroutineSymbol*> found;
