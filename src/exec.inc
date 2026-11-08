@@ -85,6 +85,32 @@ static void readMem(const Instr& i) {
             if (!inRange(addr)) { std::cerr << "$readmem: address " << tok << " out of range in " << i.fmt << "\n"; return; }
             continue;
         }
+        if (a.elemW > 64) {
+            Val acc = make(0, 0, a.elemW);
+            Val sh = mk((uint64_t)bits, 8);
+            for (char d : tok) {
+                if (d == '_') continue;
+                Val dig;
+                if (d == 'x' || d == 'X') dig = allx(bits);
+                else if (d == 'z' || d == 'Z' || d == '?') dig = allz(bits);
+                else if (i.hex && isxdigit((unsigned char)d))
+                    dig = mk((uint64_t)std::stoi(std::string(1, d), nullptr, 16), bits);
+                else if (!i.hex && (d == '0' || d == '1')) dig = mk((uint64_t)(d - '0'), bits);
+                else { std::cerr << "$readmem: bad digit '" << d << "' in " << i.fmt << "\n"; return; }
+                acc = v_or(v_shl(acc, sh), dig);
+            }
+            if (!inRange(addr)) break;
+            int64_t off = a.offset({addr});
+            if (off < 0) break;
+            if (a.twoState) {
+                acc.v &= ~acc.x; acc.x = acc.z = 0;
+                for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
+            }
+            S.set(a.base + (int)off, acc);
+            addr += step;
+            words++;
+            continue;
+        }
         uint64_t v = 0, x = 0, z = 0;
         for (char d : tok) {
             if (d == '_') continue;
@@ -212,7 +238,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 if (!target(i, sig, hi, lo, v)) { pc++; break; }
                 if (i.k == IK::Nba && i.nbaLater) {
                     uint64_t d = i.delay;
-                    if (i.de) { Val dv = eval(i.de, rd); d = dv.x ? 0 : dv.v; }
+                    if (i.de) { Val dv = eval(i.de, rd); d = v_time(dv); }
                     S.nbaAt(S.now + d, sig, v, hi, lo);
                 } else if (i.k == IK::Nba) S.nba(sig, v, hi, lo);
                 else S.set(sig, hi >= 0 ? v_insert(S.get(sig), v, hi, lo) : v);
@@ -227,7 +253,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 pc++; break;
             case IK::WaitDelay: {
                 uint64_t d = i.delay;
-                if (i.de) { Val v = eval(i.de, rd); d = v.x ? 0 : v.v; }
+                if (i.de) { Val v = eval(i.de, rd); d = v_time(v); }
                 co_await Delay{d};
                 pc++; break;
             }
