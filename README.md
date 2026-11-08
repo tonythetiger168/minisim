@@ -83,6 +83,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-static-comb` | Run assigns and `always_comb` as ordinary event-driven processes |
 | `-threads <n>` | Worker threads (default: every hardware thread; capped at that) |
 | `-no-static-seq`, `-no-partition` | Turn off clocked-process functions / partition tasks |
+| `-no-2state` | `-compile` without the 2-state fast path |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `--help-slang` | Every front-end option slang accepts |
 
@@ -135,6 +136,16 @@ for one). Two kinds of work run in parallel:
 Results are committed in a fixed order, so the output is the same for every
 thread count (`ctest -R msim_threads` checks it). Small batches stay on one
 thread. `-no-static-seq` and `-no-partition` turn the two parts off.
+
+### 2-state fast path (`-compile`)
+
+Most of the time no signal holds X or Z. For each expression, `-compile`
+emits a check that every signal it reads is fully known, and in that case
+plain 64-bit integer arithmetic; otherwise the 4-state operators. Division,
+modulo, `**`, and a variable bit index keep the 4-state code, because they
+can make X from known inputs. `-no-2state` turns the fast path off, and
+`ctest -R msim_fuzz` compares it with the interpreter on random expressions
+(`tests/fuzz/gen_expr.py`) with X and Z inputs.
 
 `$display` output goes to stdout and diagnostics to stderr. The exit status is
 0 when the simulation ran, 1 on a compile or lowering error, and 2 on a bad
