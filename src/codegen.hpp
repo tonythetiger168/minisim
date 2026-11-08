@@ -24,6 +24,7 @@
 // An instruction or operator this file does not know throws
 // CodegenUnsupported, and msim falls back to the interpreter.
 #pragma once
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <sstream>
@@ -72,6 +73,7 @@ class Codegen {
 public:
     std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                     const CodegenParts& parts = {}) {
+        for (auto& g : sigs) sigW_.push_back(g.w);
         std::ostringstream body;
         std::vector<int> byRank;
         for (size_t i = 0; i < procs.size(); i++) {
@@ -174,7 +176,11 @@ public:
         return o.str();
     }
 
+public:
+    bool twoState = true;  // emit the 2-state fast path (see fast())
+
 private:
+    std::vector<int> sigW_;
     std::vector<std::vector<E>> sysArgs_;
     std::vector<std::vector<std::pair<int, Edge>>> events_;
 
@@ -288,9 +294,188 @@ private:
         throw CodegenUnsupported("operator " + std::to_string((int)e->op));
     }
 
+    // ---- 2-state fast path ----
+    // Most of the time no signal holds X or Z. For an expression made of
+    // operators whose 0/1 result is plain integer arithmetic, emit
+    //     (every signal it reads is known) ? Val{uint64 arithmetic} : <4-state code>
+    // The integer form mirrors expr.hpp operator by operator (widths, sign
+    // extension, masks), so both arms give the same bits. Operators that can
+    // make X from known inputs (/, %, a[i] out of range, **) or that have no
+    // fixed width keep the 4-state code.
+    struct FastInfo { int w; bool sgn; };
+    static std::string M(int w) { return w >= 64 ? "~0ULL" : hex((1ULL << w) - 1); }
+    // Sign-extend a w-bit value to 64 bits (as a uint64_t expression).
+    static std::string sx(const std::string& a, int w) {
+        if (w >= 64) return a;
+        return "(uint64_t)((int64_t)((" + a + ") << " + std::to_string(64 - w) + ") >> " + std::to_string(64 - w) + ")";
+    }
+    // Extend a (wa bits) to w bits: sign-fill when `s`, else it is already zero-extended.
+    static std::string ext(const std::string& a, int wa, int w, bool s) {
+        if (!s || wa >= w) return a;
+        return "(" + sx(a, wa) + " & " + M(w) + ")";
+    }
+    bool fx(const E& e, std::string& out, FastInfo& fi, std::vector<int>& refs) {
+        if (!e) return false;
+        auto kid = [&](int i, std::string& o, FastInfo& f) { return i < (int)e->kids.size() && fx(e->kids[i], o, f, refs); };
+        std::string A, B, C;
+        FastInfo fa{}, fb{}, fc{};
+        switch (e->op) {
+            case Op::Const:
+                if (e->k.x || e->k.w > 64 || e->k.w < 1) return false;
+                out = hex(e->k.v);
+                fi = {e->k.w, e->k.sgn};
+                return true;
+            case Op::Ref:
+                if (e->sig < 0 || e->sig >= (int)sigW_.size()) return false;
+                refs.push_back(e->sig);
+                out = "S.sigs[" + std::to_string(e->sig) + "].val.v";
+                fi = {sigW_[e->sig], e->sgn};
+                return true;
+            case Op::Not:
+                if (!kid(0, A, fa)) return false;
+                out = "(~" + A + " & " + M(fa.w) + ")";
+                fi = fa;
+                return true;
+            case Op::And: case Op::Or: case Op::Xor: {
+                if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
+                const char* o = e->op == Op::And ? " & " : e->op == Op::Or ? " | " : " ^ ";
+                out = "(" + A + o + B + ")";
+                fi = {std::max(fa.w, fb.w), fa.sgn && fb.sgn};
+                return true;
+            }
+            case Op::Add: case Op::Sub: case Op::Mul: {
+                if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
+                int w = std::max(fa.w, fb.w);
+                bool sg = fa.sgn && fb.sgn;
+                const char* o = e->op == Op::Add ? " + " : e->op == Op::Sub ? " - " : " * ";
+                out = "((" + ext(A, fa.w, w, sg) + o + ext(B, fb.w, w, sg) + ") & " + M(w) + ")";
+                fi = {w, sg};
+                return true;
+            }
+            case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: {
+                if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
+                int w = std::max(fa.w, fb.w);
+                bool sg = fa.sgn && fb.sgn;
+                std::string a = ext(A, fa.w, w, sg), b = ext(B, fb.w, w, sg);
+                if (sg && e->op != Op::Eq && e->op != Op::Ne) { a = "(int64_t)" + sx(a, w); b = "(int64_t)" + sx(b, w); }
+                const char* o = e->op == Op::Eq ? " == " : e->op == Op::Ne ? " != " : e->op == Op::Lt ? " < "
+                              : e->op == Op::Le ? " <= " : e->op == Op::Gt ? " > " : " >= ";
+                out = "(uint64_t)(" + a + o + b + ")";
+                fi = {1, false};
+                return true;
+            }
+            case Op::CaseEq: case Op::CaseZEq: case Op::CaseXEq:
+                // No X or Z: every bit is cared about and compared as is (no extension).
+                if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
+                out = "(uint64_t)(" + A + " == " + B + ")";
+                fi = {1, false};
+                return true;
+            case Op::Shl: case Op::Shr: {
+                if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
+                std::string n = B;
+                if (e->op == Op::Shl) out = "(" + n + " >= 64 ? 0ULL : ((" + A + " << " + n + ") & " + M(fa.w) + "))";
+                else out = "(" + n + " >= 64 ? 0ULL : (" + A + " >> " + n + "))";
+                fi = fa;
+                return true;
+            }
+            case Op::Asr: {
+                if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
+                if (!fa.sgn) out = "(" + B + " >= 64 ? 0ULL : (" + A + " >> " + B + "))";
+                else
+                    out = "(" + B + " >= " + std::to_string(fa.w) + " ? (" + sx(A, fa.w) + " >> 63 ? " + M(fa.w) +
+                          " : 0ULL) : ((uint64_t)((int64_t)" + sx(A, fa.w) + " >> " + B + ") & " + M(fa.w) + "))";
+                fi = fa;
+                return true;
+            }
+            case Op::Resize: {
+                if (!kid(0, A, fa)) return false;
+                int w = e->hi;
+                if (w < 1 || w > 64) return false;
+                bool fill = e->lo && w > fa.w;
+                out = "(" + (fill ? sx(A, fa.w) : A) + " & " + M(w) + ")";
+                fi = {w, e->sgn};
+                return true;
+            }
+            case Op::LogNot:
+                if (!kid(0, A, fa)) return false;
+                out = "(uint64_t)(" + A + " == 0)";
+                fi = {1, false};
+                return true;
+            case Op::LogAnd: case Op::LogOr:
+                if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
+                out = "(uint64_t)((" + A + " != 0)" + (e->op == Op::LogAnd ? " & " : " | ") + "(" + B + " != 0))";
+                fi = {1, false};
+                return true;
+            case Op::RedAnd:
+                if (!kid(0, A, fa)) return false;
+                out = "(uint64_t)(" + A + " == " + M(fa.w) + ")";
+                fi = {1, false};
+                return true;
+            case Op::RedOr:
+                if (!kid(0, A, fa)) return false;
+                out = "(uint64_t)(" + A + " != 0)";
+                fi = {1, false};
+                return true;
+            case Op::RedXor:
+                if (!kid(0, A, fa)) return false;
+                out = "(uint64_t)__builtin_parityll(" + A + ")";
+                fi = {1, false};
+                return true;
+            case Op::Slice: {
+                if (!kid(0, A, fa)) return false;
+                int w = e->hi - e->lo + 1;
+                if (e->lo < 0 || e->lo >= 64 || w < 1 || w > 64) return false;
+                out = "((" + A + " >> " + std::to_string(e->lo) + ") & " + M(w) + ")";
+                fi = {w, false};
+                return true;
+            }
+            case Op::Concat: {
+                if (e->kids.empty()) return false;
+                std::string r;
+                int w = 0;
+                for (size_t i = 0; i < e->kids.size(); i++) {
+                    std::string P;
+                    FastInfo fp{};
+                    if (!fx(e->kids[i], P, fp, refs)) return false;
+                    w += fp.w;
+                    if (w > 64) return false;
+                    r = i ? "((" + r + " << " + std::to_string(fp.w) + ") | " + P + ")" : P;
+                }
+                out = r;
+                fi = {w, false};
+                return true;
+            }
+            case Op::Mux:
+                if (!kid(0, C, fc) || !kid(1, A, fa) || !kid(2, B, fb)) return false;
+                // v_mux returns the chosen arm as is: its own width and signedness.
+                if (fa.w != fb.w || fa.sgn != fb.sgn) return false;
+                out = "(" + C + " != 0 ? " + A + " : " + B + ")";
+                fi = fa;
+                return true;
+            default:
+                return false;
+        }
+    }
+    // The expression as a Val, with the 2-state fast path when it applies.
+    std::string fast(const E& e) {
+        std::string slow = ex(e);
+        if (!twoState) return slow;
+        std::string f;
+        FastInfo fi{};
+        std::vector<int> refs;
+        if (!fx(e, f, fi, refs)) return slow;
+        std::sort(refs.begin(), refs.end());
+        refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+        std::string g;
+        for (int r : refs) g += (g.empty() ? "" : " | ") + std::string("S.sigs[") + std::to_string(r) + "].val.x";
+        std::string val = "Val{" + f + ", 0, " + std::to_string(fi.w) + ", 0, " + (fi.sgn ? "true" : "false") + "}";
+        if (g.empty()) return val;
+        return "((" + g + ") == 0 ? " + val + " : " + slow + ")";
+    }
+
     // The write of an Assign, with `val` as the value (default: its expression).
     std::string assign(const Instr& i, std::string val = "") {
-        if (val.empty()) val = ex(i.e);
+        if (val.empty()) val = fast(i.e);
         std::ostringstream o;
         if (i.drv >= 0)
             o << " S.drive(" << i.sig << ", " << i.drv << ", " << val << ", " << (int)i.s0 << ", " << (int)i.s1
@@ -318,9 +503,9 @@ private:
             switch (i.k) {
                 case IK::Nba:
                     if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
-                    o << " nb.push_back({" << i.sig << ", " << ex(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
+                    o << " nb.push_back({" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
                     break;
-                case IK::JmpIfNot: o << " if (truth(" << ex(i.e) << ") != 1) goto " << L(i.target) << ";\n"; break;
+                case IK::JmpIfNot: o << " if (truth(" << fast(i.e) << ") != 1) goto " << L(i.target) << ";\n"; break;
                 case IK::Jmp: o << " goto " << L(i.target) << ";\n"; break;
                 default: throw CodegenUnsupported("instruction in a clocked process");
             }
@@ -338,7 +523,7 @@ private:
         }
         o << "}\n";
         if (oneAssign(p)) {
-            o << "static Val combv" << n << "(const void*) { return " << ex(p.code[0].e) << "; }\n";
+            o << "static Val combv" << n << "(const void*) { return " << fast(p.code[0].e) << "; }\n";
             o << "static void combc" << n << "(const void*, Val v) {" << assign(p.code[0], "v") << "}\n";
         }
         o << "\n";
@@ -384,10 +569,10 @@ private:
                 switch (i.k) {
                     case IK::Assign: o << assign(i); break;
                     case IK::Nba:
-                        o << " S.nba(" << i.sig << ", " << ex(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
+                        o << " S.nba(" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
                         break;
                     case IK::JmpIfNot:
-                        o << " if (truth(" << ex(i.e) << ") != 1) goto " << tgt(i.target) << ";\n";
+                        o << " if (truth(" << fast(i.e) << ") != 1) goto " << tgt(i.target) << ";\n";
                         break;
                     case IK::Jmp: o << " goto " << tgt(i.target) << ";\n"; break;
                     case IK::WaitEdge:
@@ -403,8 +588,9 @@ private:
                     case IK::Monitor: {
                         sysArgs_.push_back(i.args);
                         const char* fn = i.k == IK::Display ? "printSys" : i.k == IK::Strobe ? "strobe" : "armMon";
-                        o << " S." << fn << "(" << quote(i.fmt) << ", A" << sysArgs_.size() - 1
-                          << "); if (S.finished) co_return;\n";
+                        o << " S." << fn << "(" << quote(i.fmt) << ", A" << sysArgs_.size() - 1;
+                        if (i.k == IK::Display && i.nonl) o << ", false";  // $write: no newline
+                        o << "); if (S.finished) co_return;\n";
                         break;
                     }
                     case IK::Finish: o << " S.finished = true; co_return;\n"; break;
@@ -432,6 +618,8 @@ private:
 };
 
 inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
-                           const CodegenParts& parts = {}) {
-    return Codegen{}.run(sigs, procs, parts);
+                           const CodegenParts& parts = {}, bool twoState = true) {
+    Codegen g;
+    g.twoState = twoState;
+    return g.run(sigs, procs, parts);
 }

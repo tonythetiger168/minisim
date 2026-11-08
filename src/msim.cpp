@@ -21,6 +21,7 @@
 //                    event-driven processes instead of one levelized schedule
 //   -no-static-seq   run NBA-only always @(edge) blocks as ordinary processes
 //   -no-partition    apply every NBA on the main thread (no partition tasks)
+//   -no-2state       -compile without the 2-state fast path (codegen.hpp fast())
 //   -threads <n>     worker threads (default: every hardware thread). Results
 //                    are the same for any n; -threads 1 is single-threaded.
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
@@ -127,7 +128,7 @@ static void partitionInputs(const LowerResult& lowered, const Plan& pl, std::vec
 // design needs the interpreter.
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
-                       const Plan& pl, int threads, bool staticPart) {
+                       const Plan& pl, int threads, bool staticPart, bool twoState) {
     std::vector<CodegenSig> sigs;
     for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
     std::vector<CodegenProc> procs;
@@ -143,7 +144,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
     try {
-        src = codegen(sigs, procs, parts);
+        src = codegen(sigs, procs, parts, twoState);
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -191,7 +192,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> plusargs;
     std::optional<std::string> vcdPath;
     uint64_t maxTime = ~0ULL;
-    bool compiled = false, staticComb = true, staticSeq = true, staticPart = true;
+    bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true;
     int threads = (int)std::thread::hardware_concurrency();
     if (threads < 1) threads = 1;
     std::string buildDir = "msim.d", opt = "-O2";
@@ -210,6 +211,7 @@ int main(int argc, char** argv) {
         if (a == "-no-static-comb") { staticComb = false; continue; }
         if (a == "-no-static-seq") { staticSeq = false; continue; }
         if (a == "-no-partition") { staticPart = false; continue; }
+        if (a == "-no-2state") { twoState = false; continue; }
         if (a == "-threads") {
             std::string n = next("a thread count");
             try { threads = std::stoi(n); }
@@ -275,7 +277,7 @@ int main(int argc, char** argv) {
 
     Plan pl = plan(lowered, staticComb, staticSeq);
     if (compiled) {
-        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart);
+        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState);
         if (st >= 0) return st;
     }
 
