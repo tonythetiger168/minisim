@@ -15,6 +15,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`$display` / `$write` / `$strobe` / `$monitor`** (and the `b`/`o`/`h` variants). `$display` prints when the statement runs; `$strobe` and `$monitor` print from the postponed region, after NBA. Formats: `%b %o %h %x %d %c %s %t %m`, `%0` and explicit widths. `$time` / `$stime` / `$realtime`
 - **`fork` / `join` / `join_any` / `join_none`**, `wait (expr)`
 - **Unpacked arrays and memories**: any number of dimensions, variable indices, `foreach`, `$readmemh` / `$readmemb`
+- **Generate** (loop / if / case), hierarchical names (`u.x`, `blk[2].x`), `+:` / `-:`, any packed range (`[8:1]`, `[0:7]`, `[3:0][7:0]`)
 - **Constants**: `parameter`, `localparam`, enum values; unary `-`/`+`, `**`, `!==`, `~&` `~|` `~^`, replication
 - **Coroutine processes**: `initial` / `always` as C++20 coroutines (`co_await Delay`, `co_await Wait`)
 - **Multi-event waits**: `@(posedge clk or negedge rst_n)`, `@*`, `always_comb`
@@ -91,14 +92,14 @@ coroutine walks. `msim -compile` translates every process into C++ instead
 expressions), compiles it against the same kernel, and runs it. Output is the
 same as the interpreter's (`ctest -R msim_compile` checks this); a design that
 uses something `codegen.hpp` does not translate yet falls back to the
-interpreter with a note on stderr. Times from `bench/run.sh` (4-core cloud
+interpreter with a note on stderr. Times from `bench/run.sh` (lanes with END_TIME=10000000; 4-core cloud
 VM, g++ 13, seconds of run time, build time not included):
 
-| Design | msim | msim -compile | Verilator 5.020 -O3 | Icarus 12 |
+| Design | msim | msim -compile | Verilator 5.020 -O3 | Icarus 13.0 |
 |---|---|---|---|---|
-| `bench/lanes.sv` (16 LFSR lanes, 1M cycles) | 9.31 | 3.37 | 0.39 | 46.7 |
-| `bench/chain.sv` (8-deep assign chain, 1M cycles) | 1.51 | 0.76 | 0.29 | 8.10 |
-| `bench/counter.sv` (one counter, 1M cycles) | 0.22 | 0.16 | 0.29 | 0.42 |
+| `bench/lanes.sv` (16 LFSR lanes, 1M cycles) | 8.13 | 3.11 | 0.29 | 29.2 |
+| `bench/chain.sv` (8-deep assign chain, 1M cycles) | 1.35 | 0.74 | 0.20 | 7.82 |
+| `bench/counter.sv` (one counter, 1M cycles) | 0.22 | 0.14 | 0.19 | 0.31 |
 
 The C++ build adds 2 to 4 seconds per design.
 
@@ -122,13 +123,12 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 
 - Signals up to 64 bits
 - `nmos`, `pmos`, `cmos`, `tran` (and the resistive forms), `bufif` / `notif`, and `trireg` charge storage are an error. Strength is resolved when a net is driven, and a read of the net is 0, 1, X, or Z.
-- Instance arrays and interface or modport ports are an error. A hierarchical reference that reads a child's internal signal (`top.u.hidden`) is not lowered
+- Instance arrays and interface or modport ports are an error
 - An `inout` variable is an error. An `inout` net is connected. An `inout` whose two sides differ in width is an error
 - Declaration initializers (`logic x = 0;`, `wire y = a & b;`) are lowered. A module variable's initializer runs before every `initial` / `always`
 - Tasks and functions have no recursion, no `ref` arguments, no DPI, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
 - System tasks other than the display family, `$finish`, and `$stop` are ignored with a warning
 - Unpacked arrays: fixed size only, at most 2^20 elements; no slices or whole-array operations. Array elements are left out of the VCD. See `docs/COVERAGE.md` for the full list
-- Vectors assumed declared `[N-1:0]`
 
 ## Spec coverage and tests
 
@@ -137,7 +137,9 @@ supports. `tests/spec/` holds one small test per clause, named after it
 (`9.3.2-fork-join.sv`). The expected output is in the file as `//> ` comments.
 `ctest` runs each one on `msim` (`spec/...`), and on Icarus Verilog too when
 `iverilog` is installed (`icarus/...`), so an expectation is checked against
-a second simulator. To add one, drop a `.sv` file in `tests/spec/` and re-run cmake.
+a second simulator. CI uses Icarus Verilog 13.0, built from its `v13_0` tag; a
+test Icarus 13 cannot run says why on a `//! icarus-skip:` line. Locally, point
+cmake at another build with `-DIVERILOG=... -DVVP=...`. To add one, drop a `.sv` file in `tests/spec/` and re-run cmake.
 
 ## License
 

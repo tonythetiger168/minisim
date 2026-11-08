@@ -34,6 +34,9 @@ enum class IK {
     Call,       // push (this prog, pc+1) and transfer to callee
     Fork,       // start each of `branches` as a process; join 0 = all, 1 = any, 2 = none
     ReadMem,    // $readmemh / $readmemb into `arr` (fmt is the file name)
+    Disable,    // disable <block> run by other processes: end every process whose root is block `sig`
+    WaitFork,   // wait until every child process of this one has ended (9.6.1)
+    DisableFork,// end every descendant process of this one (9.6.3)
     Ret         // pop that address; an empty stack ends the process
 };
 
@@ -64,12 +67,23 @@ struct Instr {
     std::shared_ptr<const ArrShape> arr;
     std::vector<E> aidx;
     // Assign/Nba to a bit chosen at run time (v[i] = ...): hi = lo = bidx.
+    // With pw > 0 it is v[bidx +: pw] (or -: when pdown).
     E bidx;
+    // WaitDelay: `de`, when set, is the delay in ticks, computed at run time.
+    // Nba with nbaLater: the update happens `delay` / `de` ticks later (9.4.5).
+    E de;
+    bool nbaLater = false;
+    int pw = 0;
+    bool pdown = false;
     bool hex = false;
 };
 
 struct Prog {
     std::vector<Instr> code;
+    // Named blocks this process runs as a whole (an initial's named body, a
+    // fork branch that is a named block, every branch of a named fork).
+    // `disable` of one of them from another process ends the process.
+    std::vector<int> roots;
     size_t emit(Instr i) { code.push_back(i); return code.size() - 1; }
     size_t here() const { return code.size(); }
 };
@@ -147,11 +161,13 @@ inline bool combShape(const Prog& p, CombShape& c) {
     const Instr& w = p.code[n - 2];
     const Instr& j = p.code[n - 1];
     if (j.k != IK::Jmp || j.target != 0 || w.k != IK::WaitEdge) return false;
+    if (!p.roots.empty()) return false;  // another process can `disable` it
     c = CombShape{};
     for (size_t i = 0; i + 2 < n; i++) {
         if (p.code[i].k != IK::Assign) return false;
         // A target chosen at run time (a[i] = ..., v[i] = ...) has no fixed output signal.
         if (p.code[i].arr || !p.code[i].aidx.empty() || p.code[i].bidx) return false;
+        if (p.code[i].de || p.code[i].delay) return false;
         bool seen = false;
         for (int o : c.outs) seen |= o == p.code[i].sig;
         if (!seen) c.outs.push_back(p.code[i].sig);

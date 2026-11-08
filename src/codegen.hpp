@@ -156,6 +156,7 @@ private:
         return b;
     }
     static std::string val(const Val& k) {
+        if (k.real || k.str) throw CodegenUnsupported("real or string constant");
         return "Val{" + hex(k.v) + ", " + hex(k.x) + ", " + std::to_string(k.w) + ", " + hex(k.z) + ", " +
                (k.sgn ? "true" : "false") + "}";
     }
@@ -307,6 +308,8 @@ private:
                 auto tgt = [&](size_t t) { return L(P, t > p.code.size() ? p.code.size() : t); };
                 // A write chosen at run time (a[i] = ..., v[i] = ...) is not compiled yet.
                 if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
+                if (i.de || i.nbaLater) throw CodegenUnsupported("delay expression or intra-assignment delay");
+                if (!p.roots.empty()) throw CodegenUnsupported("disable of a named block");
                 switch (i.k) {
                     case IK::Assign: o << assign(i); break;
                     case IK::Nba:

@@ -23,9 +23,12 @@
 #include <functional>
 #include <map>
 #include <queue>
+#include <sstream>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 using namespace std;
@@ -70,7 +73,10 @@ struct Sim {
     uint64_t now = 0, lastDump = ~0ULL;
     bool finished = false;
     string vcdPath = "dump.vcd";                     // empty: no waveform
+    string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
+
+    Sim() { g_sformat = &Sim::sformat; }
 
     // Static combinational schedule (prog.hpp: combShape / combSchedule).
     // combs[r] is the process of rank r in topological order. A change on a
@@ -117,7 +123,8 @@ struct Sim {
     int sig(const string& n, int w, bool net = false) {
         // An unpacked array element is named "m[3]". The VCD leaves memories
         // out, as $dumpvars does by default (21.7.1.2).
-        sigs.push_back({n, w, net ? allz(w) : Val{}, {}, net, n.find('[') != string::npos});
+        // A name with '$' is internal (an event's last-trigger time).
+        sigs.push_back({n, w, net ? allz(w) : Val{}, {}, net, n.find_first_of("[$") != string::npos});
         waiters.emplace_back();
         return (int)sigs.size() - 1;
     }
@@ -141,6 +148,17 @@ struct Sim {
     }
     Val get(int s) const { return make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z); }
     void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }
+    // a <= #d b: an NBA in the slot d ticks from now (9.4.5). The empty wheel
+    // entry makes the kernel stop at that time even if nothing else does.
+    map<uint64_t, vector<NbaItem>> laterNba;
+    // Processes ended by disable / disable fork (9.6). Their pending delays
+    // are dropped, so they do not keep time going.
+    unordered_set<void*> dead;
+    void nbaAt(uint64_t t, int s, Val v, int hi = -1, int lo = 0) {
+        if (t == now) { nba(s, v, hi, lo); return; }
+        laterNba[t].push_back({s, v, hi, lo});
+        wheel[t];
+    }
     static int bit0(const Val& v) { return (v.x & 1) ? 2 : (int)(v.v & 1); }
 
     // Format a $display / $write line (IEEE 1800 21.2.1).
@@ -158,7 +176,30 @@ struct Sim {
     //   %%           a percent sign
     // An argument without a matching specifier is ignored, and a specifier
     // without an argument is printed as written.
+    // %f %e %g (21.2.1.3): a real, or an integer converted to one; prec < 0
+    // is the C default of 6. `R` is a real argument with no specifier.
+    static string fmtReal(char c, double d, int minW, int prec, bool zero) {
+        char spec[16], buf[512];
+        if (c == 'R') { snprintf(buf, sizeof buf, "%#g", d); return buf; }
+        if (prec < 0) prec = 6;
+        snprintf(spec, sizeof spec, "%%%s*.*%c", zero ? "" : "", c);
+        snprintf(buf, sizeof buf, spec, zero ? 0 : minW, prec, d);
+        return buf;
+    }
     static string fmtVal(char c, Val v, int minW, bool zero) {
+        if (v.str) {   // a string (6.16) prints its text with %s, and as bytes otherwise
+            if (c == 's') {
+                string t = v_str(v);
+                if (minW > 0 && (int)t.size() < minW) t = string(minW - t.size(), ' ') + t;
+                return t;
+            }
+            const string& t = v_str(v);
+            uint64_t b = 0;
+            for (char ch : t) b = (b << 8) | (unsigned char)ch;
+            v = make(b, 0, std::max(8, std::min(64, (int)t.size() * 8)));
+        }
+        if (v.real && (c == 'd' || c == 't' || c == 'b' || c == 'o' || c == 'h' || c == 'x' || c == 'c'))
+            v = v_rtoi(v, 64, true, false);   // a real printed as an integer is rounded
         auto digits = [&](int bits) {
             int n = (v.w + bits - 1) / bits;
             string s(n, '0');
@@ -224,7 +265,9 @@ struct Sim {
         if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
         return body;
     }
-    void printSys(const string& fmt, const vector<E>& args, bool newline = true) {
+    // The text of a format and its arguments ($display, $sformatf).
+    static string sformat(const string& fmt, const vector<E>& args, const Reader& rd) {
+        std::ostringstream cout;
         size_t ai = 0;
         for (size_t i = 0; i < fmt.size(); ++i) {
             char c = fmt[i];
@@ -233,18 +276,37 @@ struct Sim {
             if (i + 1 >= fmt.size()) { cout << '%'; break; }
             c = fmt[++i];
             if (c == '%') { cout << '%'; continue; }
-            bool zero = false;
-            int minW = 0;
+            bool zero = false, left = false;
+            int minW = 0, prec = -1;
+            if (c == '-' && i + 1 < fmt.size()) { left = true; c = fmt[++i]; }   // %-8d: pad on the right
             if (c == '0') { zero = true; if (i + 1 < fmt.size()) c = fmt[++i]; }
             while (isdigit((unsigned char)c) && i + 1 < fmt.size()) { minW = minW * 10 + (c - '0'); c = fmt[++i]; }
+            if (c == '.' && i + 1 < fmt.size()) {
+                prec = 0;
+                c = fmt[++i];
+                while (isdigit((unsigned char)c) && i + 1 < fmt.size()) { prec = prec * 10 + (c - '0'); c = fmt[++i]; }
+            }
+            if (c == 'R') {   // internal: a real argument with no specifier
+                if (ai >= args.size()) continue;
+                Val v = eval(args[ai++], rd);
+                cout << fmtReal('R', v_real(v), 0, -1, false);
+                continue;
+            }
             char lc = (char)tolower((unsigned char)c);
             if (lc == 'm') { cout << "top"; continue; }
-            bool known = string_view("bohxdcst").find(lc) != string_view::npos;
+            bool known = string_view("bohxdcstfeg").find(lc) != string_view::npos;
             if (!known || ai >= args.size()) { cout << fmt.substr(start, i - start + 1); continue; }
-            Val v = eval(args[ai++], [&](int s) { return get(s); });
-            cout << fmtVal(lc, v, minW, zero);
+            Val v = eval(args[ai++], rd);
+            string out = (lc == 'f' || lc == 'e' || lc == 'g') ? fmtReal(lc, v_real(v), left ? 0 : minW, prec, zero)
+                                                               : fmtVal(lc, v, left ? 1 : minW, zero);
+            if (left && (int)out.size() < minW) out += string(minW - out.size(), ' ');
+            cout << out;
         }
-        if (newline) cout << '\n';
+        return cout.str();
+    }
+    void printSys(const string& fmt, const vector<E>& args, bool newline = true) {
+        std::cout << sformat(fmt, args, [&](int s) { return get(s); });
+        if (newline) std::cout << '\n';
     }
     void strobe(const string& fmt, const vector<E>& args) { postq.push_back({false, fmt, args}); }
     void queueMon() {
@@ -346,24 +408,40 @@ struct Sim {
         if (vcdPath.empty()) return;
         vcd.open(vcdPath);
         if (!vcd) { cerr << "cannot write " << vcdPath << "\n"; return; }
-        vcd << "$timescale 1ns $end\n$scope module top $end\n";
+        vcd << "$timescale " << timescale << " $end\n$scope module top $end\n";
         for (size_t i = 0; i < sigs.size(); i++)
             if (!sigs[i].hide)
                 vcd << "$var " << (sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << vcdId(i) << " " << sigs[i].name << " $end\n";
         vcd << "$upscope $end\n$enddefinitions $end\n";
     }
 
-    void run(uint64_t end) {
-        header();
-        dumpvars();
+    // After the last slot ($finish, no more events, or the time limit):
+    // final blocks run in the same time, in one pass (9.2.3).
+    void runFinal(const vector<Task>& ts) {
+        if (ts.empty()) return;
+        wheel.clear(); laterNba.clear(); active.clear(); inactive.clear(); nbaq.clear();
+        finished = false;
+        for (auto& t : ts) spawn(t);
+        run(~0ULL, false);
+    }
+    void run(uint64_t end, bool start = true) {
+        if (start) { header(); dumpvars(); }
         if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
             if (it->first > end) break;
-            now = it->first;
-            g_simTime = now;
-            for (auto h : it->second) active.push_back(h);
+            uint64_t t = it->first;
+            bool any = laterNba.count(t) > 0 || !combq.empty();
+            for (auto h : it->second)
+                if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
+            if (!any) continue;   // only disabled processes were waiting here
+            now = t;
+            g_simTime = now;
+            if (auto ln = laterNba.find(now); ln != laterNba.end()) {
+                for (auto& n : ln->second) nbaq.push_back(n);
+                laterNba.erase(ln);
+            }
             for (;;) {                                         // one time slot
                 if (!active.empty()) {                         // active
                     Handle h = active.front(); active.pop_front();

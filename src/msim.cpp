@@ -93,6 +93,13 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     for (size_t i = 0; i < lowered.procs.size(); i++)
         procs.push_back({&lowered.procs[i].prog, lowered.procs[i].kind, rank[i], staticComb ? ins[i] : std::vector<int>{}});
     std::string src;
+    // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
+    const char* why = !lowered.finals.empty() ? "a final block"
+                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
+    if (why) {
+        std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
+        return -1;
+    }
     try {
         src = codegen(sigs, procs);
     } catch (const CodegenUnsupported& ex) {
@@ -209,6 +216,7 @@ int main(int argc, char** argv) {
     }
 
     S.vcdPath = vcdPath.value_or("");
+    S.timescale = lowered.timescale();
     std::vector<std::vector<int>> ins;
     std::vector<int> rank = staticComb ? combRanks(lowered, ins) : std::vector<int>(lowered.procs.size(), -1);
     std::vector<int> byRank(lowered.procs.size(), -1);
@@ -217,8 +225,11 @@ int main(int argc, char** argv) {
     for (int i : byRank)
         if (i >= 0) S.addComb(execComb, &lowered.procs[i].prog, ins[i]);
     for (size_t i = 0; i < lowered.procs.size(); i++)
-        if (rank[i] < 0) S.spawn(exec(&lowered.procs[i].prog));
+        if (rank[i] < 0) S.spawn(process(&lowered.procs[i].prog));
     S.run(maxTime);
+    std::vector<Task> finals;
+    for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
+    S.runFinal(finals);
     std::cout.flush();
     return 0;
 }
