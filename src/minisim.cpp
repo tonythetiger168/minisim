@@ -403,7 +403,10 @@ struct Sim {
         // An unpacked array element is named "m[3]". The VCD leaves memories
         // out, as $dumpvars does by default (21.7.1.2).
         // A name with '$' is internal (an event's last-trigger time).
-        sigs.push_back({n, w, net ? allz(w) : Val{}, {}, net, n.find_first_of("[$") != string::npos});
+        // A variable starts at X and a net at Z, across every limb. Widths of
+        // 64 or less keep the single-word initial value they had before.
+        Val init = net ? allz(w) : (w > 64 ? allx(w) : Val{});
+        sigs.push_back({n, w, init, {}, net, n.find_first_of("[$") != string::npos});
         waiters.emplace_back();
         return (int)sigs.size() - 1;
     }
@@ -417,7 +420,7 @@ struct Sim {
     }
     void drive(int s, int d, Val v, int s0 = STR_STRONG, int s1 = STR_STRONG) {
         auto& g = sigs[s];
-        g.drv[d].v = make(v.v, v.x, g.w, v.z);
+        g.drv[d].v = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
         // One driver that drives both 0 and 1 resolves to its own value
@@ -425,7 +428,10 @@ struct Sim {
         if (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) { set(s, g.drv[0].v); return; }
         set(s, resolveDrives(g.drv.data(), g.drv.size(), g.w));
     }
-    Val get(int s) const { return make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z); }
+    Val get(int s) const {
+        return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
+                               : clipRead(sigs[s].val, sigs[s].w);
+    }
     void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }
     // a <= #d b: an NBA in the slot d ticks from now (9.4.5). The empty wheel
     // entry makes the kernel stop at that time even if nothing else does.
@@ -465,6 +471,76 @@ struct Sim {
         snprintf(buf, sizeof buf, spec, zero ? 0 : minW, prec, d);
         return buf;
     }
+    // %b/%o/%h/%d of a value that does not fit in one limb. Digit rules match
+    // the single-word formatter: an all-x digit is x, a mixed digit is X.
+    static string fmtWide(char c, Val v, int minW, bool zero) {
+        auto digits = [&](int bits) {
+            int n = (v.w + bits - 1) / bits;
+            string s(n, '0');
+            for (int d = 0; d < n; d++) {
+                int lo = d * bits, hi = std::min(lo + bits, v.w);
+                int xz = 0, zz = 0, val = 0, cnt = hi - lo;
+                for (int b = 0; b < cnt; b++) {
+                    int t = bitAt(v, lo + b);
+                    if (t == 3) zz++;
+                    else if (t == 2) xz++;
+                    else if (t == 1) val |= 1 << b;
+                }
+                char ch;
+                if (zz == cnt) ch = 'z';
+                else if (xz + zz == cnt && zz == 0) ch = 'x';
+                else if (zz) ch = 'Z';
+                else if (xz) ch = 'X';
+                else ch = "0123456789abcdef"[val];
+                s[n - 1 - d] = ch;
+            }
+            if (zero) {
+                size_t k = s.find_first_not_of('0');
+                s = k == string::npos ? "0" : s.substr(k);
+            }
+            return s;
+        };
+        string body;
+        bool pad = true;
+        int natural = 0;
+        switch (c) {
+            case 'b': body = digits(1); pad = false; break;
+            case 'o': body = digits(3); pad = false; break;
+            case 'h': case 'x': body = digits(4); pad = false; break;
+            case 'c': {
+                unsigned char ch = 0;
+                for (int b = 0; b < 8; b++) if (bitAt(v, b) == 1) ch |= (unsigned char)(1u << b);
+                body = string(1, (char)ch);
+                pad = false;
+                break;
+            }
+            case 's': body = bytesToStr(v); pad = false; break;
+            case 't':
+            case 'd': {
+                int nx, nz;
+                countXZ(v, nx, nz);
+                bool neg = v.sgn && v.w > 0 && !anyX(v) && bitAt(v, v.w - 1) == 1;
+                if (nx == v.w) body = "x";
+                else if (nx) body = "X";
+                else if (nz == v.w) body = "z";
+                else if (nz) body = "Z";
+                else if (neg) body = "-" + uToDec(negVal(v));
+                else body = uToDec(v);
+                if (c == 't') natural = 20;
+                else {
+                    // Same width Icarus uses: floor((w - signed)*log10(2)) + 1, plus the sign.
+                    int nb = v.sgn ? v.w - 1 : v.w;
+                    natural = (int)((nb * 146L + 484) / 485);
+                    if (v.sgn) natural++;
+                    if (natural < 1) natural = 1;
+                }
+                break;
+            }
+        }
+        int width = zero ? 0 : (minW > 0 ? minW : (pad ? natural : 0));
+        if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
+        return body;
+    }
     static string fmtVal(char c, Val v, int minW, bool zero) {
         if (v.str) {   // a string (6.16) prints its text with %s, and as bytes otherwise
             if (c == 's') {
@@ -479,6 +555,7 @@ struct Sim {
         }
         if (v.real && (c == 'd' || c == 't' || c == 'b' || c == 'o' || c == 'h' || c == 'x' || c == 'c'))
             v = v_rtoi(v, 64, true, false);   // a real printed as an integer is rounded
+        if (v.w > 64) return fmtWide(c, v, minW, zero);
         auto digits = [&](int bits) {
             int n = (v.w + bits - 1) / bits;
             string s(n, '0');
@@ -627,8 +704,14 @@ struct Sim {
         string id = vcdId((size_t)s);
         if (g.w == 1) { vcd << ((g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1))) << id << "\n"; return; }
         vcd << "b";
-        for (int i = g.w - 1; i >= 0; i--)
-            vcd << ((g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1)));
+        for (int i = g.w - 1; i >= 0; i--) {
+            if (g.w <= 64)
+                vcd << ((g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1)));
+            else {
+                int t = bitAt(g.val, i);
+                vcd << (t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t));
+            }
+        }
         vcd << " " << id << "\n";
     }
     // VCD identifier: base-94 over the printable characters '!'..'~'.
@@ -654,8 +737,11 @@ struct Sim {
     }
 
     void set(int s, Val nv) {
-        uint64_t m = sigs[s].w >= 64 ? ~0ULL : ((1ULL << sigs[s].w) - 1);
-        nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;
+        if (sigs[s].w <= 64) {
+            uint64_t m = sigs[s].w >= 64 ? ~0ULL : ((1ULL << sigs[s].w) - 1);
+            nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;
+            nv.hi.clear();
+        } else nv = maskWidth(nv, sigs[s].w);
         if (tlPart) { setLocal(s, nv); return; }
         if (nv == sigs[s].val) return;
         int o = bit0(sigs[s].val), n = bit0(nv);

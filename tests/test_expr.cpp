@@ -120,5 +120,66 @@ int main(){
   auto em = bin(Op::Mod, konst(mk(7, 4)), konst(mk(0, 4)));
   Val emv = eval(em, [](int) { return mk(0, 1); });
   assert(emv.x == 0xF && emv.w == 4);
+
+  // Wider than one limb, and wider than two. Limb 0 is the low 64 bits.
+  auto wv = [](std::initializer_list<uint64_t> limbs, int w, bool sgn = false) {
+    Val a = make(0, 0, w, 0, sgn);
+    int i = 0;
+    for (uint64_t limb : limbs) { setLimb(a, i, limb, 0, 0); i++; }
+    return finish(a);
+  };
+  Val a128 = wv({0x0123456789abcdefULL, 0xfedcba9876543210ULL}, 128);
+  Val one128 = wv({1, 0}, 128);
+  assert(a128.w == 128 && a128.v == 0x0123456789abcdefULL && a128.hi.size() == 1);
+  assert(a128.hi[0].v == 0xfedcba9876543210ULL);
+  // Carry out of limb 0.
+  Val sum = v_add(wv({~0ULL, 0x1}, 128), one128);
+  assert(sum.v == 0 && sum.hi[0].v == 0x2 && !sum.x);
+  assert(v_add(wv({~0ULL, ~0ULL}, 128), one128).v == 0 && v_add(wv({~0ULL, ~0ULL}, 128), one128).hi[0].v == 0);
+  assert(v_sub(wv({0, 0}, 128), one128).v == ~0ULL && v_sub(wv({0, 0}, 128), one128).hi[0].v == ~0ULL);
+  // Shift across the 64-bit boundary.
+  Val sh64 = v_shl(one128, mk(64, 32));
+  assert(sh64.v == 0 && sh64.hi[0].v == 1 && !sh64.x);
+  Val sh4 = v_shl(a128, mk(4, 8));
+  assert(sh4.v == 0x123456789abcdef0ULL && sh4.hi[0].v == 0xedcba98765432100ULL);
+  Val shR = v_shr(a128, mk(4, 8));
+  assert(shR.v == 0x00123456789abcdeULL); // low nibble came from the high limb
+  assert((shR.hi[0].v & 0x0fffffffffffffffULL) == 0x0fedcba987654321ULL);
+  // 256 bits: multiply across two limbs, divide back.
+  Val a256 = wv({0, 0, 1, 0}, 256);          // 1 << 128
+  Val three = wv({3, 0, 0, 0}, 256);
+  Val prod = v_mul(a256, three);
+  assert(prod.v == 0 && prod.hi[0].v == 0 && prod.hi[1].v == 3 && prod.hi[2].v == 0);
+  assert(v_div(prod, three).hi[1].v == 1 && v_div(prod, three).v == 0);
+  assert(v_mod(wv({100, 0, 0, 0}, 256), wv({7, 0, 0, 0}, 256)).v == 2);
+  // Signed, past 64 bits.
+  Val m5 = wv({~0ULL - 4, ~0ULL}, 128, true); // -5
+  assert(v_div(m5, wv({2, 0}, 128, true)).v == (~0ULL - 1) && v_div(m5, wv({2, 0}, 128, true)).hi[0].v == ~0ULL);
+  assert(v_mod(m5, wv({2, 0}, 128, true)).v == ~0ULL && v_mod(m5, wv({2, 0}, 128, true)).hi[0].v == ~0ULL);
+  Val asr = v_asr(m5, mk(70, 32));
+  assert(asr.sgn && asr.v == ~0ULL && asr.hi[0].v == ~0ULL);
+  // X in the high limb contaminates arithmetic and is masked by a known 0.
+  Val hx = wv({0xffffffffffffffffULL, 0}, 128);
+  setLimb(hx, 1, 0, ~0ULL, 0);
+  hx = finish(hx);
+  assert(v_add(hx, one128).x == ~0ULL && v_add(hx, one128).hi[0].x == ~0ULL);
+  Val m0 = v_and(hx, wv({~0ULL, 0}, 128));
+  assert(m0.v == ~0ULL && m0.hi[0].v == 0 && m0.hi[0].x == 0);
+  // Part-select and concatenation across the boundary.
+  Val mid = v_slice(a128, 70, 60);
+  assert(mid.w == 11);
+  Val cat = v_concat({wv({0x11, 0x22}, 128), wv({0x33, 0x44}, 128)});
+  assert(cat.w == 256 && cat.v == 0x33 && cat.hi[0].v == 0x44 && cat.hi[1].v == 0x11 && cat.hi[2].v == 0x22);
+  Val ins = v_insert(wv({0, 0}, 128), mk(0x7ff, 11), 70, 60);
+  assert(bitAt(ins, 60) == 1 && bitAt(ins, 70) == 1 && bitAt(ins, 71) == 0 && bitAt(ins, 59) == 0);
+  // Z in the high limb survives a logical shift and a slice.
+  Val hz = allz(128);
+  hz = v_insert(hz, wv({0x5, 0}, 64), 63, 0); // low 64 known, high 64 Z
+  Val moved = v_shl(hz, mk(4, 8));
+  assert(bitAt(moved, 67) == 0 && bitAt(moved, 68) == 3 && bitAt(moved, 127) == 3);
+  assert(v_slice(hz, 127, 64).z == ~0ULL && v_slice(hz, 127, 64).x == ~0ULL);
+  assert(truth(wv({0, 1}, 128)) == 1 && truth(wv({0, 0}, 128)) == 0);
+  assert(v_red_xor(wv({1, 1}, 128)).v == 0 && v_red_and(v_ones(128)).v == 1);
+  assert(v_eq(a128, a128).v == 1 && v_lt(m5, wv({1, 0}, 128, true)).v == 1);
   std::cout<<"ok\n";
 }
