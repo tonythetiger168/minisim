@@ -330,7 +330,7 @@ private:
                 fi = {e->k.w, e->k.sgn};
                 return true;
             case Op::Ref:
-                if (e->sig < 0 || e->sig >= (int)sigW_.size()) return false;
+                if (e->sig < 0 || e->sig >= (int)sigW_.size() || sigW_[e->sig] > 64 || sigW_[e->sig] < 1) return false;
                 refs.push_back(e->sig);
                 out = "S.sigs[" + std::to_string(e->sig) + "].val.v";
                 fi = {sigW_[e->sig], e->sgn};
