@@ -8,7 +8,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 
 ## Features
 
-- **4-state logic** (0/1/X/Z) up to 64 bits, with Verilog X-propagation rules
+- **4-state logic** (0/1/X/Z), including packed vectors wider than 64 bits, with Verilog X-propagation rules
 - **Signed arithmetic**: `signed` values, `$signed` / `$unsigned`, signed compare, add, subtract, multiply, divide, remainder, and arithmetic right shift (`>>>`)
 - **Compound assignment**: `+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=` `<<<=` `>>>=`, same result as `a = a op b`
 - **Event-driven kernel**: time wheel, active / inactive (`#0`) / NBA / postponed regions
@@ -144,7 +144,6 @@ slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline`
 
 ## Known limits
 
-- Signals up to 64 bits
 - `nmos`, `pmos`, `cmos`, `tran` (and the resistive forms), `bufif` / `notif`, and `trireg` charge storage are an error. Strength is resolved when a net is driven, and a read of the net is 0, 1, X, or Z.
 - Instance arrays and interface or modport ports are an error
 - An `inout` variable is an error. An `inout` net is connected. An `inout` whose two sides differ in width is an error
