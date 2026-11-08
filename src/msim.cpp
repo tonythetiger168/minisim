@@ -17,6 +17,8 @@
 //                    build it with a C++ compiler into <dir>/simv, and run it.
 //                    A design codegen cannot translate runs on the interpreter.
 //   -o <dir>         build directory for -compile (default msim.d)
+//   -no-static-comb  run continuous assigns and always_comb as ordinary
+//                    event-driven processes instead of one levelized schedule
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
 //   -O<n>            optimization level for -compile (default -O2)
 //
@@ -61,12 +63,35 @@ static std::string shq(const std::string& s) {
 
 // -compile: generate, build and run. Returns the exit status, or -1 when the
 // design needs the interpreter.
+// Ranks of the static combinational schedule, one per process (-1: an
+// ordinary process). Empty when static scheduling is off.
+static std::vector<int> combRanks(const LowerResult& lowered, std::vector<std::vector<int>>& ins) {
+    std::vector<int> rank(lowered.procs.size(), -1);
+    std::vector<CombShape> shapes;
+    std::vector<size_t> procOf;
+    for (size_t i = 0; i < lowered.procs.size(); i++) {
+        CombShape c;
+        if (combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
+    }
+    ins.assign(lowered.procs.size(), {});
+    std::vector<size_t> order = combSchedule(shapes);
+    for (size_t r = 0; r < order.size(); r++) {
+        rank[procOf[order[r]]] = (int)r;
+        ins[procOf[order[r]]] = shapes[order[r]].ins;
+    }
+    return rank;
+}
+
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
-                       const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime) {
+                       const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
+                       bool staticComb) {
     std::vector<CodegenSig> sigs;
     for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
     std::vector<CodegenProc> procs;
-    for (auto& pr : lowered.procs) procs.push_back({&pr.prog, pr.kind});
+    std::vector<std::vector<int>> ins;
+    std::vector<int> rank = staticComb ? combRanks(lowered, ins) : std::vector<int>(lowered.procs.size(), -1);
+    for (size_t i = 0; i < lowered.procs.size(); i++)
+        procs.push_back({&lowered.procs[i].prog, lowered.procs[i].kind, rank[i], staticComb ? ins[i] : std::vector<int>{}});
     std::string src;
     // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
     const char* why = !lowered.finals.empty() ? "a final block"
@@ -122,7 +147,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> plusargs;
     std::optional<std::string> vcdPath;
     uint64_t maxTime = ~0ULL;
-    bool compiled = false;
+    bool compiled = false, staticComb = true;
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     for (int i = 1; i < argc; i++) {
@@ -136,6 +161,7 @@ int main(int argc, char** argv) {
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
         if (a == "-compile") { compiled = true; continue; }
+        if (a == "-no-static-comb") { staticComb = false; continue; }
         if (a == "-o") { buildDir = next("a directory"); continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
@@ -185,13 +211,21 @@ int main(int argc, char** argv) {
     }
 
     if (compiled) {
-        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime);
+        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, staticComb);
         if (st >= 0) return st;
     }
 
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
-    for (auto& pr : lowered.procs) S.spawn(process(&pr.prog));
+    std::vector<std::vector<int>> ins;
+    std::vector<int> rank = staticComb ? combRanks(lowered, ins) : std::vector<int>(lowered.procs.size(), -1);
+    std::vector<int> byRank(lowered.procs.size(), -1);
+    for (size_t i = 0; i < rank.size(); i++)
+        if (rank[i] >= 0) byRank[rank[i]] = (int)i;
+    for (int i : byRank)
+        if (i >= 0) S.addComb(execComb, &lowered.procs[i].prog, ins[i]);
+    for (size_t i = 0; i < lowered.procs.size(); i++)
+        if (rank[i] < 0) S.spawn(process(&lowered.procs[i].prog));
     S.run(maxTime);
     std::vector<Task> finals;
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
