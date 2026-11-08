@@ -90,6 +90,15 @@ if(MINISIM_WITH_SLANG)
   file(GLOB SPEC_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/spec/*.sv)
   find_program(IVERILOG iverilog)
   find_program(VVP vvp)
+  # Multicore output against Icarus, plus a same-slot NBA stability check.
+  # Same gate as icarus/*: the slang CI job is the one with Icarus on PATH.
+  if(IVERILOG AND VVP)
+    add_test(NAME msim_threads_icarus
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DIVERILOG=${IVERILOG} -DVVP=${VVP}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_threads_icarus
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_threads_ref.cmake)
+  endif()
   foreach(sv IN LISTS SPEC_TESTS)
     get_filename_component(name ${sv} NAME)
     string(REGEX REPLACE "\\.sv$" "" name ${name})
