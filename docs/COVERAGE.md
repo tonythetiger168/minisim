@@ -76,6 +76,7 @@ wrong result, that is a bug: please add a spec test for it.
 | 25 | Interfaces, modports | ❌ | |
 | 27 | Generate | ✅ | loop, if, and case generate; named and unnamed blocks (`genblkN`); instances and continuous assigns to separate bits inside. `27-generate` |
 | 28 | Gate primitives | 🟡 | and/or/xor families, buf/not, pullup/pulldown |
+| 34 | Protected envelopes | ✅ | `msimprotect` encrypts `` `pragma protect begin/end `` regions; `msim -keyfile` decrypts `begin_protected` envelopes, nested ones too. data_method aes128/192/256-cbc, 3des-cbc (des-cbc, blowfish-cbc, cast128-cbc when OpenSSL's legacy provider is present); key_method rsa (PKCS#1 v1.5); encodings base64, uuencode, raw; digest_block with sha1, md5, sha256/384/512. Not yet: `decrypt_license` / `runtime_license` / `viewport` (read and ignored), symmetric key_method, `data_decrypt_key`. `test_protect`, `protect_openssl_cli`, `msim_protect` |
 
 ## Next up
 

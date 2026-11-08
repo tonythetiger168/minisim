@@ -110,6 +110,18 @@ inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return 
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
 
+// Protected code (34): when set, signals whose declaration this accepts are
+// listed in hiddenSigs() so the caller can keep them out of the waveform.
+inline std::function<bool(const slang::ast::Symbol&)>& hideSigIf() {
+    static std::function<bool(const slang::ast::Symbol&)> f;
+    return f;
+}
+inline std::vector<int>& hiddenSigs() { static std::vector<int> v; return v; }
+inline void noteHidden(const slang::ast::Symbol& s, int first, int count) {
+    if (hideSigIf() && hideSigIf()(s))
+        for (int i = 0; i < count; i++) hiddenSigs().push_back(first + i);
+}
+
 struct LoweredProc { Prog prog; bool loops; std::string kind; };
 
 // One module-level task or function. Arguments and the function result are
@@ -1803,11 +1815,13 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             if (mkSig(prefix + std::string(s.name) + "$trig", 64, false) != id + 1)
                 Lowerer::unsupported("event signals that are not consecutive");
             sigmap[&s] = id;
+            noteHidden(s, id, 2);
             return;
         }
         int w = storeW(s.getType());
         if (w > 64) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
+        noteHidden(s, sigmap[&s], 1);
     }
     // One signal per element, named with its indices ("m[3]", "g[1][0]"),
     // in row-major order with each dimension running left to right.
@@ -1849,6 +1863,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             else if (id != shape->base + n) Lowerer::unsupported("array elements that are not consecutive signals");
         }
         arrMap()[&s] = shape;
+        noteHidden(s, shape->base, shape->count);
     }
     static void unsupported_width(std::string_view n) {
         throw std::runtime_error("lower: signal wider than 64 bits: " + std::string(n));
@@ -2215,6 +2230,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
     arrMap().clear();
+    hiddenSigs().clear();
     blockIds() = BlockIds{};
     SigCollector sc(mkSig, sigmap);
     comp.getRoot().visit(sc);

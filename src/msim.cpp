@@ -19,6 +19,16 @@
 //   -o <dir>         build directory for -compile (default msim.d)
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
 //   -O<n>            optimization level for -compile (default -O2)
+//   -keyfile [<key_keyname>=]<private.pem>
+//                    an RSA private key for protected envelopes (`pragma
+//                    protect begin_protected, IEEE 1800-2023 clause 34 /
+//                    IEEE 1735). Repeatable. With a key name the key only
+//                    opens key_blocks of that key_keyname (or whose
+//                    key_public_key is this key's). Encrypt with msimprotect.
+//
+// Protected code is decrypted in memory only. Diagnostics located in it are
+// reported without their text, its signals are left out of the VCD, and
+// -compile falls back to the interpreter so no generated C++ holds it.
 //
 // Exit status: 0 when the simulation ran, 1 on a compile or lowering error,
 // 2 on a bad command line.
@@ -32,11 +42,21 @@
 #include <string_view>
 #include <vector>
 
+#include <filesystem>
+#include <map>
+#include <set>
+
 #include <sys/wait.h>
 
 #include "codegen.hpp"
 #include "lower.hpp"
+#include "slang/diagnostics/DiagnosticClient.h"
+#include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/driver/Driver.h"
+#include "slang/text/SourceManager.h"
+#ifdef MINISIM_HAVE_OPENSSL
+#include "protect.hpp"
+#endif
 
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
@@ -104,6 +124,111 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }
 
+// Protected code: for each file (canonical path), the byte ranges of its
+// buffer that came out of decryption envelopes.
+struct ProtectedCode {
+    std::map<std::string, std::vector<std::pair<size_t, size_t>>> ranges;
+    const slang::SourceManager* sm = nullptr;
+    bool any() const { return !ranges.empty(); }
+    bool contains(slang::SourceLocation loc) const {
+        if (!sm || ranges.empty() || !loc.valid() || loc.buffer() == slang::SourceLocation::NoLocation.buffer()) return false;
+        loc = sm->getFullyOriginalLoc(loc);
+        if (!loc.buffer().valid() || !sm->isFileLoc(loc)) return false;
+        auto it = ranges.find(sm->getFullPath(loc.buffer()).string());
+        if (it == ranges.end()) return false;
+        for (auto [b, e] : it->second)
+            if (loc.offset() >= b && loc.offset() < e) return true;
+        return false;
+    }
+};
+
+// Passes diagnostics to slang's text client, except those that point into
+// protected code: they are reported by severity and file only.
+struct RedactingClient : slang::DiagnosticClient {
+    std::shared_ptr<slang::DiagnosticClient> inner;
+    const ProtectedCode& pc;
+    RedactingClient(std::shared_ptr<slang::DiagnosticClient> in, const ProtectedCode& p) : inner(std::move(in)), pc(p) {}
+    bool touches(const slang::ReportedDiagnosticInfo& d) const {
+        if (pc.contains(d.location)) return true;
+        for (auto l : d.expansionLocs) if (pc.contains(l)) return true;
+        for (auto& r : d.ranges) if (pc.contains(r.start())) return true;
+        return false;
+    }
+    void report(const slang::ReportedDiagnostic& d) override {
+        bool hide = touches(d);
+        for (auto& n : d.notes) hide = hide || touches(n);
+        if (!hide) { inner->report(d); return; }
+        const char* sev = d.severity == slang::DiagnosticSeverity::Error || d.severity == slang::DiagnosticSeverity::Fatal
+                              ? "error" : d.severity == slang::DiagnosticSeverity::Warning ? "warning" : "note";
+        std::string file = "protected code";
+        if (pc.sm && d.location.valid()) {
+            auto loc = pc.sm->getFullyOriginalLoc(d.location);
+            if (loc.buffer().valid()) file = std::string(pc.sm->getFileName(loc));
+        }
+        std::cerr << file << ": " << sev << ": in protected code (details hidden)\n";
+    }
+};
+
+// Decrypt every source the front end may read that holds an envelope, and
+// hand slang the cleartext under the file's own path so it never reads the
+// envelope itself. Looks at the source files, plus files with a Verilog
+// extension in their directories and in the +incdir+ / -I / -y directories,
+// so protected `include files and library cells are found too.
+static bool preloadProtected(slang::driver::Driver& driver, const std::vector<std::string>& keySpecs,
+                             const std::vector<std::string>& dirs, ProtectedCode& pc) {
+    namespace fs = std::filesystem;
+    std::set<std::string> files;
+    std::set<std::string> searchDirs(dirs.begin(), dirs.end());
+    for (auto& p : driver.sourceLoader.getFilePaths()) {
+        std::error_code ec;
+        auto c = fs::weakly_canonical(p, ec);
+        if (ec) continue;
+        files.insert(c.string());
+        searchDirs.insert(c.parent_path().string());
+    }
+    static const std::set<std::string> exts{".v", ".sv", ".vh", ".svh", ".vp", ".svp", ".inc", ".svi", ".vg"};
+    for (auto& d : searchDirs) {
+        std::error_code ec;
+        for (auto& e : fs::directory_iterator(d, ec)) {
+            std::error_code ec2;
+            if (!e.is_regular_file(ec2) || !exts.count(e.path().extension().string())) continue;
+            auto c = fs::weakly_canonical(e.path(), ec2);
+            if (!ec2) files.insert(c.string());
+        }
+    }
+    std::vector<std::pair<std::string, std::string>> found;
+    for (auto& f : files) {
+        std::ifstream in(f, std::ios::binary);
+        if (!in) continue;
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (text.find("begin_protected") != std::string::npos) found.emplace_back(f, std::move(text));
+    }
+    if (found.empty()) return true;
+#ifdef MINISIM_HAVE_OPENSSL
+    try {
+        protect::Keyring ring;
+        for (auto& k : keySpecs) ring.add(k);
+        for (auto& [path, text] : found) {
+            std::string shown = fs::proximate(path).string();
+            protect::Decrypted d = protect::decryptSource(text, ring, shown);
+            if (d.envelopes == 0) continue;   // "begin_protected" only in a comment
+            driver.sourceManager.assignText(path, d.text);
+            OPENSSL_cleanse(d.text.data(), d.text.size());
+            pc.ranges[path] = std::move(d.ranges);
+        }
+    } catch (const protect::Error& ex) {
+        std::cerr << "msim: " << ex.what() << "\n";
+        return false;
+    }
+    pc.sm = &driver.sourceManager;
+    return true;
+#else
+    (void)keySpecs;
+    std::cerr << "msim: " << found.front().first << " has a protected envelope, and this msim was built without OpenSSL\n";
+    return false;
+#endif
+}
+
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
@@ -112,6 +237,7 @@ static void usage() {
                  "  -compile       generate C++, build it (<dir>/simv) and run it\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
+                 "  -keyfile [<keyname>=]<private.pem>  key for protected envelopes (repeatable)\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  --help-slang   list every front-end option\n";
 }
@@ -125,6 +251,7 @@ int main(int argc, char** argv) {
     bool compiled = false;
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
+    std::vector<std::string> keySpecs, searchDirs;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -139,6 +266,20 @@ int main(int argc, char** argv) {
         if (a == "-o") { buildDir = next("a directory"); continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
+        if (a == "-keyfile") { keySpecs.push_back(next("a private key file")); continue; }
+        // Directories that may hold protected `include files or library cells.
+        if (startsWith(a, "+incdir+")) {
+            for (size_t p = 8; p < a.size();) {
+                size_t e = a.find('+', p);
+                if (e == std::string::npos) e = a.size();
+                if (e > p) searchDirs.push_back(a.substr(p, e - p));
+                p = e + 1;
+            }
+        } else if ((a == "-I" || a == "-y" || a == "--libdir" || a == "--include-directory") && i + 1 < argc) {
+            searchDirs.push_back(argv[i + 1]);
+        } else if (a.size() > 2 && (startsWith(a, "-I") || startsWith(a, "-y"))) {
+            searchDirs.push_back(a.substr(2));
+        }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
         if (a == "-vcd") {
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".vcd")) vcdPath = argv[++i];
@@ -163,6 +304,16 @@ int main(int argc, char** argv) {
     if (!driver.parseCommandLine((int)cargv.size(), cargv.data())) return 2;
     for (auto& s : fwd) if (s == "--help") { std::cout << driver.cmdLine.getHelpText("msim front end") << "\n"; return 0; }
     if (!driver.processOptions()) return 2;
+
+    // Protected envelopes (34): decrypt before slang reads the files, and
+    // route diagnostics through the redacting client.
+    ProtectedCode pc;
+    if (!preloadProtected(driver, keySpecs, searchDirs, pc)) return 1;
+    if (pc.any()) {
+        driver.diagEngine.removeClient(driver.textDiagClient);
+        driver.diagEngine.addClient(std::make_shared<RedactingClient>(driver.textDiagClient, pc));
+        hideSigIf() = [&pc](const slang::ast::Symbol& s) { return pc.contains(s.location); };
+    }
     if (!driver.parseAllSources()) return 1;
 
     auto comp = driver.createCompilation();
@@ -176,7 +327,9 @@ int main(int argc, char** argv) {
                         [](const std::string& n, int w, bool net) { return S.sig(n, w, net); },
                         [](int s) { return S.newDriver(s); });
     } catch (const std::exception& ex) {
-        std::cerr << "msim: " << ex.what() << "\n";
+        // The message may name something declared in protected code.
+        if (pc.any()) std::cerr << "msim: the design (which has protected code) uses a construct msim cannot simulate yet; details hidden\n";
+        else std::cerr << "msim: " << ex.what() << "\n";
         return 1;
     }
     if (lowered.procs.empty()) {
@@ -184,6 +337,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    for (int id : hiddenSigs()) S.sigs[(size_t)id].hide = true;
+
+    // Generated C++ would hold the protected design in the clear.
+    if (compiled && pc.any()) {
+        std::cerr << "msim: -compile: the design has protected code; using the interpreter\n";
+        compiled = false;
+    }
     if (compiled) {
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime);
         if (st >= 0) return st;
