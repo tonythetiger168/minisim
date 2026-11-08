@@ -36,6 +36,32 @@ foreach(t test_expr test_z test_sched test_net test_sys)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
+# libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
+find_package(OpenSSL COMPONENTS Crypto)
+if(OPENSSL_FOUND)
+  add_executable(msimprotect src/msimprotect.cpp)
+  target_include_directories(msimprotect PRIVATE src)
+  target_link_libraries(msimprotect PRIVATE OpenSSL::Crypto)
+  add_executable(test_protect tests/test_protect.cpp)
+  target_include_directories(test_protect PRIVATE src)
+  target_link_libraries(test_protect PRIVATE OpenSSL::Crypto)
+  target_compile_options(test_protect PRIVATE -UNDEBUG)
+  add_test(NAME test_protect COMMAND test_protect)
+  # Interop: envelopes made by msimprotect open with the openssl command line
+  # tool, and an envelope built with the openssl tool opens in msimprotect's
+  # decryptor (checked by msim in the slang build below).
+  find_program(OPENSSL_CLI openssl)
+  if(OPENSSL_CLI)
+    add_test(NAME protect_openssl_cli
+             COMMAND ${CMAKE_COMMAND} -DOPENSSL=${OPENSSL_CLI} -DPROTECT=$<TARGET_FILE:msimprotect>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/protect_openssl
+                     -P ${CMAKE_SOURCE_DIR}/tests/protect_openssl.cmake)
+  endif()
+else()
+  message(STATUS "OpenSSL not found: building without protected envelope support")
+endif()
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 
@@ -77,6 +103,10 @@ if(MINISIM_WITH_SLANG)
   add_executable(msim src/msim.cpp)
   target_include_directories(msim PRIVATE src)
   target_link_libraries(msim PRIVATE slang::slang)
+  if(OPENSSL_FOUND)
+    target_link_libraries(msim PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(msim PRIVATE MINISIM_HAVE_OPENSSL)
+  endif()
   # -compile builds generated C++ against the kernel headers in src/.
   target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
   if(MINISIM_WITH_FST)
@@ -154,6 +184,15 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DCHK=$<TARGET_FILE:test_fst>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
+  endif()
+  # Protected envelopes end to end: msimprotect, then msim -keyfile; no key,
+  # the wrong key, redacted diagnostics, and a VCD without protected signals.
+  if(OPENSSL_FOUND AND OPENSSL_CLI)
+    add_test(NAME msim_protect
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DPROTECT=$<TARGET_FILE:msimprotect>
+                     -DOPENSSL=${OPENSSL_CLI} -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_protect
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_protect.cmake)
   endif()
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)

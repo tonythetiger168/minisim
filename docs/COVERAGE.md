@@ -135,6 +135,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 27 | Generate | ✅ | loop, if, and case generate; named and unnamed blocks (`genblkN`); instances and continuous assigns to separate bits inside. `27-generate` |
 | 28 | Gate primitives | 🟡 | and/or/xor families, buf/not, pullup/pulldown |
 | 30.4 | Module path delays | 🟡 | `(a => b) = d` and `(a *> b) = (r, f)` with constant or specparam delays, to an output net. Every path to one output must have the same delays (minisim does not pick the path by which input changed last). Not yet: 6- and 12-value delays, outputs declared as variables, `$sdf_annotate` (an error), timing checks (`$setup`, `$hold`, ... are accepted and never report). `30.4-path-delays` |
+| 34 | Protected envelopes | ✅ | `msimprotect` encrypts `` `pragma protect begin/end `` regions; `msim -keyfile` decrypts `begin_protected` envelopes, nested ones too. data_method aes128/192/256-cbc, 3des-cbc (des-cbc, blowfish-cbc, cast128-cbc when OpenSSL's legacy provider is present); key_method rsa (PKCS#1 v1.5); encodings base64, uuencode, raw; digest_block with sha1, md5, sha256/384/512. Not yet: `decrypt_license` / `runtime_license` / `viewport` (read and ignored), symmetric key_method, `data_decrypt_key`. `test_protect`, `protect_openssl_cli`, `msim_protect` |
 
 ## Next up
 

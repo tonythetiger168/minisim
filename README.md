@@ -37,6 +37,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/lower.hpp` | slang AST to `Prog`, including module instances and port connections |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
+| `src/protect.hpp`, `src/msimprotect.cpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): encrypt and decrypt with OpenSSL |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
@@ -98,6 +99,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `-version` | Print the version and git commit |
+| `-keyfile [<keyname>=]<priv.pem>` | RSA private key for protected envelopes (repeatable); see below |
 | `--help-slang` | Every front-end option slang accepts |
 
 ### Regressions: `mregress`
@@ -144,6 +146,24 @@ mregress tests.list -cov            # regress.d/cov.json + regress.d/cov_html/
 The LCOV file works with `genhtml` and with editor and CI coverage plugins.
 Covergroups (functional coverage, 19) come with the spec work. `-compile`
 with `-cov` runs in the interpreter for now.
+
+### Protected IP: `msimprotect` and `msim -keyfile`
+
+minisim reads and writes the protected envelopes of IEEE 1800-2023 clause 34,
+the scheme IEEE 1735 builds on: a fresh AES session key encrypts the source
+(`data_block`), and each recipient's RSA public key encrypts the session key
+(`key_block`). The crypto is OpenSSL's libcrypto. Mark the region to hide and
+encrypt it:
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out acme.pem
+openssl pkey -in acme.pem -pubout -out acme_pub.pem
+./build/msimprotect -key acme_pub.pem -keyowner Acme -keyname acme-1 examples/protect/secret_alu.sv   # -> secret_alu.svp
+./build/msim -keyfile acme.pem examples/protect/secret_alu.svp examples/protect/alu_tb.sv
+```
+
+[`docs/PROTECT.md`](docs/PROTECT.md) has the envelope format, the options, and
+what msim does to keep the cleartext out of its output.
 
 ### Compiled mode
 
