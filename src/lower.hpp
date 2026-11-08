@@ -296,7 +296,7 @@ struct Lowerer {
     }
 
     static void needWidth(int w) {
-        if (w <= 0 || w > 64) unsupported("width conversion outside 1..64 bits");
+        if (w <= 0) unsupported("non-positive width");
     }
 
     // Put selfTag on a constant or a ref. Other ops take their signedness
@@ -620,7 +620,7 @@ struct Lowerer {
             case ExpressionKind::Replication: {     // {n{a}} (11.4.12.1)
                 const auto& r = e.as<ReplicationExpression>();
                 int64_t n = constInt(r.count());
-                if (n < 0 || n > 64) unsupported("replication count");
+                if (n < 0) unsupported("replication count");
                 if (n == 0) unsupported("zero replication");
                 E one = expr(r.concat());
                 std::vector<E> parts((size_t)n, one);
@@ -634,26 +634,44 @@ struct Lowerer {
     // A constant from slang's 4-state integer, at its own width and sign.
     E svLit(const slang::SVInt& sv, bool self, ExprCtx ctx) {
         int w = (int)sv.getBitWidth();
-        if (w > 64) unsupported("constant wider than 64 bits");
-        {
-                E lit;
-                if (sv.hasUnknown()) {   // x / z / ? bits (VERIFY logic_t API for your slang version)
-                    uint64_t v = 0, x = 0, z = 0;
-                    for (int b = 0; b < w && b < 64; b++) {
-                        auto bit = sv[b];
-                        if (bit.isUnknown()) {
-                            x |= 1ULL << b;
-                            if (bit.value == slang::logic_t::Z_VALUE) z |= 1ULL << b;
-                        } else if (bit.value) {
-                            v |= 1ULL << b;
-                        }
+        if (w <= 0) unsupported("constant");
+        E lit;
+        if (w <= 64) {
+            if (sv.hasUnknown()) {   // x / z / ? bits
+                uint64_t v = 0, x = 0, z = 0;
+                for (int b = 0; b < w && b < 64; b++) {
+                    auto bit = sv[b];
+                    if (bit.isUnknown()) {
+                        x |= 1ULL << b;
+                        if (bit.value == slang::logic_t::Z_VALUE) z |= 1ULL << b;
+                    } else if (bit.value) {
+                        v |= 1ULL << b;
                     }
-                    lit = konst(make(v, x, w, z, self));
-                } else {
-                    lit = konst(make(sv.getRawPtr()[0], 0, w, 0, self));
                 }
-                return sized(lit, w, self, ctx);
+                lit = konst(make(v, x, w, z, self));
+            } else {
+                lit = konst(make(sv.getRawPtr()[0], 0, w, 0, self));
+            }
+            return sized(lit, w, self, ctx);
         }
+        // Wider than one limb. A known value is little-endian words. An
+        // unknown value is walked a bit at a time: slang stores Z as a 1 in
+        // the value word and a 1 in the unknown word, X as a 0 and a 1.
+        Val bits = make(0, 0, w, 0, self);
+        if (!sv.hasUnknown()) {
+            bits = wordsToVal(w, self, sv.getRawPtr(), (w + 63) / 64);
+        } else {
+            for (int b = 0; b < w; b++) {
+                auto bit = sv[b];
+                if (bit.isUnknown())
+                    setBit(bits, b, bit.value == slang::logic_t::Z_VALUE ? 3 : 2);
+                else if (bit.value)
+                    setBit(bits, b, 1);
+            }
+            bits = finish(bits);
+            bits.sgn = self;
+        }
+        return sized(konst(bits), w, self, ctx);
     }
 
     // a[i][j] on an unpacked array: the array and one index per dimension.
@@ -978,7 +996,9 @@ struct Lowerer {
         return ps;
     }
     E readPSel(E base, const PSel& ps) {
-        if (ps.known && ps.cbit >= 0 && ps.cbit + ps.bits <= 64)
+        // A constant select is a slice even when the bits sit above bit 63.
+        // v_slice reads a bit past the vector as X.
+        if (ps.known && ps.cbit >= 0 && ps.bits > 0)
             return slice(std::move(base), (int)(ps.cbit + ps.bits - 1), (int)ps.cbit);
         E start = ps.known ? konst(make((uint64_t)ps.cbit, 0, 64, 0, true)) : ps.vbit;
         auto n = node(Op::DynSlice, {std::move(base), start});
@@ -1008,7 +1028,7 @@ struct Lowerer {
             return;
         }
         if (ps.known) {
-            if (ps.cbit < 0 || ps.cbit + ps.bits > 64) unsupported("constant select outside the vector");
+            if (ps.cbit < 0) unsupported("constant select outside the vector");
             i.lo = (int)ps.cbit;
             i.hi = (int)(ps.cbit + ps.bits - 1);
             return;
@@ -2109,7 +2129,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             return;
         }
         int w = storeW(s.getType());
-        if (w > 64) unsupported_width(s.name);
+        if (w <= 0) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
     }
     // A dynamic array, queue, or associative array: a hidden handle signal
@@ -2171,7 +2191,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             t = &ft.elementType.getCanonicalType();
         }
         int w = storeW(*t);
-        if (w <= 0 || w > 64) unsupported_width(s.name);
+        if (w <= 0) unsupported_width(s.name);
         shape->count = (int)total;
         shape->elemW = w;
         shape->sgn = t->isSigned();
@@ -2195,7 +2215,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         arrMap()[&s] = shape;
     }
     static void unsupported_width(std::string_view n) {
-        throw std::runtime_error("lower: signal wider than 64 bits: " + std::string(n));
+        throw std::runtime_error("lower: signal has a non-positive width: " + std::string(n));
     }
     void handle(const slang::ast::VariableSymbol& v) { reg(v, false); }
     void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v, false); }
@@ -2389,8 +2409,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (pull) {
             if (ports.size() != 1 || !ports[0]) Lowerer::unsupported("pull gate port");
             int w = (int)ports[0]->type->getBitWidth();
-            if (w <= 0 || w > 64) Lowerer::unsupported("gate width");
-            driveOut(*ports[0], konst(mk(name == "pullup" ? mask(w) : 0, w)), s0, s1);
+            if (w <= 0) Lowerer::unsupported("gate width");
+            driveOut(*ports[0], konst(name == "pullup" ? v_ones(w) : make(0, 0, w)), s0, s1);
             return;
         }
 
@@ -2438,7 +2458,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (it == sigmap.end())
             throw std::runtime_error("lower: port '" + std::string(ps.name) + "' is not a signal");
         int w = (int)ps.getType().getBitWidth();
-        if (w <= 0 || w > 64) Lowerer::unsupported("port width");
+        if (w <= 0) Lowerer::unsupported("port width");
         return Formal{it->second, w, ps.getType().isSigned()};
     }
 
@@ -2604,14 +2624,14 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             if (it == sigmap.end()) Lowerer::unsupported("function return");
             sub->retSig = it->second;
             sub->retW = storeW(sym->getReturnType());
-            if (sub->retW <= 0 || sub->retW > 64) Lowerer::unsupported("function return width");
+            if (sub->retW <= 0) Lowerer::unsupported("function return width");
             sub->retSgn = sym->getReturnType().isSigned();
         }
         for (const slang::ast::FormalArgumentSymbol* formal : sym->getArguments()) {
             auto it = sigmap.find(formal);
             if (it == sigmap.end()) Lowerer::unsupported("subroutine argument");
             int w = storeW(formal->getType());
-            if (w <= 0 || w > 64) Lowerer::unsupported("subroutine argument width");
+            if (w <= 0) Lowerer::unsupported("subroutine argument width");
             sub->args.push_back({it->second, formal->direction, w, formal->getType().isSigned()});
         }
         subMap[sym] = sub.get();

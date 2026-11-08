@@ -1,5 +1,12 @@
-// expr.hpp - 4-state (0/1/X) values, Verilog operators and an expression tree.
-// Replaces Val/mk/add from minisim2.cpp. Up to 64 bits per value.
+// expr.hpp - 4-state (0/1/X/Z) values, Verilog operators and an expression tree.
+// Replaces Val/mk/add from minisim2.cpp.
+//
+// A value wider than 64 bits is a little-endian sequence of Limbs. Each Limb
+// is 64 bits of the three planes v (0/1), x (unknown), and z (Z, a subset of
+// x). Limb 0 lives in Val::v / Val::x / Val::z, so a value of 64 bits or less
+// still has its whole state in those fields and an empty `hi`. Limb k (k > 0)
+// is hi[k-1] and holds bits [64k, 64k+63]. Operators walk every limb; the
+// single-word path is the same code the 64-bit results were checked with.
 //
 // Encoding: bit i is unknown if x bit i = 1; otherwise its value is v bit i.
 // An unknown bit is Z if z bit i = 1 (z is always a subset of x), else X.
@@ -44,34 +51,218 @@
 #include <unordered_map>
 #include <vector>
 
+// One 64-bit limb of a wide value. v/x/z use the same encoding as Val.
+struct Limb {
+    uint64_t v = 0, x = 0, z = 0;
+    bool operator==(const Limb& o) const { return v == o.v && x == o.x && z == o.z; }
+};
+
 struct Val {
-    uint64_t v = 0, x = ~0ULL;  // default: all X
+    uint64_t v = 0, x = ~0ULL;  // default: all X. Limb 0 (bits [0,63]).
     int w = 1;
     uint64_t z = 0;             // which unknown bits are Z (subset of x)
     bool sgn = false;           // expression result is signed; not stored on a net
     bool real = false;          // v holds an IEEE double (6.12); w is 64
     bool str = false;           // v is a string id (6.16); see strPool
-    bool operator==(const Val& o) const { return v == o.v && x == o.x && z == o.z; }
+    std::vector<Limb> hi;       // limbs 1.. : hi[k] is bits [64*(k+1), 64*(k+2))
+    // Missing high limbs compare as 0, so a 64-bit value (empty hi) still
+    // matches the way it did before hi existed.
+    bool operator==(const Val& o) const {
+        if (v != o.v || x != o.x || z != o.z) return false;
+        size_t n = hi.size() > o.hi.size() ? hi.size() : o.hi.size();
+        for (size_t i = 0; i < n; i++) {
+            Limb a = i < hi.size() ? hi[i] : Limb{};
+            Limb b = i < o.hi.size() ? o.hi[i] : Limb{};
+            if (!(a == b)) return false;
+        }
+        return true;
+    }
 };
 
 inline uint64_t mask(int w) { return w >= 64 ? ~0ULL : ((1ULL << w) - 1); }
+
+// How many limbs a w-bit value occupies, and the mask of limb i.
+inline int limbCount(int w) { return w <= 0 ? 1 : (w + 63) / 64; }
+inline uint64_t limbMask(int w, int i) {
+    int bits = w - i * 64;
+    if (bits >= 64) return ~0ULL;
+    if (bits <= 0) return 0;
+    return (1ULL << bits) - 1;
+}
+inline uint64_t limbV(const Val& a, int i) {
+    if (i <= 0) return a.v;
+    return i - 1 < (int)a.hi.size() ? a.hi[i - 1].v : 0;
+}
+inline uint64_t limbX(const Val& a, int i) {
+    if (i <= 0) return a.x;
+    return i - 1 < (int)a.hi.size() ? a.hi[i - 1].x : 0;
+}
+inline uint64_t limbZ(const Val& a, int i) {
+    if (i <= 0) return a.z;
+    return i - 1 < (int)a.hi.size() ? a.hi[i - 1].z : 0;
+}
+inline void setLimb(Val& a, int i, uint64_t v, uint64_t x, uint64_t z) {
+    if (i <= 0) { a.v = v; a.x = x; a.z = z; return; }
+    if ((int)a.hi.size() < i) a.hi.resize(i);
+    a.hi[i - 1] = Limb{v, x, z};
+}
+// Enforce the make() invariant on every limb and drop limbs past w.
+inline Val finish(Val a) {
+    if (a.w <= 64) {
+        uint64_t m = mask(a.w);
+        a.x &= m;
+        a.v &= m & ~a.x;
+        a.z &= a.x;
+        a.hi.clear();
+        return a;
+    }
+    int n = limbCount(a.w);
+    if ((int)a.hi.size() != n - 1) a.hi.resize(n - 1);
+    auto apply = [](uint64_t& v, uint64_t& x, uint64_t& z, uint64_t m) {
+        x &= m;
+        v &= m & ~x;
+        z &= x;
+    };
+    apply(a.v, a.x, a.z, ~0ULL);
+    for (int i = 1; i < n; i++)
+        apply(a.hi[i - 1].v, a.hi[i - 1].x, a.hi[i - 1].z, limbMask(a.w, i));
+    return a;
+}
 inline Val make(uint64_t v, uint64_t x, int w, uint64_t z = 0, bool sgn = false) {
+    if (w > 64) {
+        Val a;
+        a.v = v; a.x = x; a.z = z; a.w = w; a.sgn = sgn;
+        return finish(a);
+    }
     uint64_t m = mask(w);
     x &= m;
     v &= m & ~x;
     z &= x;
     return Val{v, x, w, z, sgn};
 }
+// Known 0/1 words, little-endian, no X/Z. Used for literals wider than 64 bits.
+inline Val wordsToVal(int w, bool sgn, const uint64_t* p, int nwords) {
+    Val a;
+    a.w = w;
+    a.sgn = sgn;
+    int n = limbCount(w);
+    if (n > 1) a.hi.resize(n - 1);
+    for (int i = 0; i < n; i++) setLimb(a, i, (p && i < nwords) ? p[i] : 0, 0, 0);
+    return finish(a);
+}
+inline bool anyX(const Val& a) {
+    if (a.x) return true;
+    for (const auto& h : a.hi) if (h.x) return true;
+    return false;
+}
+inline bool anyV(const Val& a) {
+    if (a.v) return true;
+    for (const auto& h : a.hi) if (h.v) return true;
+    return false;
+}
+inline bool isZero(const Val& a) { return !anyV(a); }
+// 0, 1, 2 = X, 3 = Z. A bit past the stored limbs is 0.
+inline int bitAt(const Val& a, int i) {
+    if (i < 0) return 2;
+    uint64_t m = 1ULL << (i & 63);
+    uint64_t v = limbV(a, i >> 6), x = limbX(a, i >> 6), z = limbZ(a, i >> 6);
+    if (z & m) return 3;
+    if (x & m) return 2;
+    return (v & m) ? 1 : 0;
+}
+inline void setBit(Val& a, int i, int t) {
+    if (i < 0) return;
+    int li = i >> 6;
+    uint64_t m = 1ULL << (i & 63);
+    uint64_t v = limbV(a, li), x = limbX(a, li), z = limbZ(a, li);
+    v &= ~m; x &= ~m; z &= ~m;
+    if (t == 1) v |= m;
+    else if (t == 2) x |= m;
+    else if (t == 3) { x |= m; z |= m; }
+    setLimb(a, li, v, x, z);
+}
+// Copy n bits from src[srcBit] into dst[dstBit]. Bits past either value read as 0.
+inline void copyBits(Val& dst, int dstBit, const Val& src, int srcBit, int n) {
+    int done = 0;
+    while (done < n) {
+        int d = dstBit + done, s = srcBit + done;
+        int dsh = d & 63, ssh = s & 63;
+        int chunk = n - done;
+        if (chunk > 64 - dsh) chunk = 64 - dsh;
+        if (chunk > 64 - ssh) chunk = 64 - ssh;
+        uint64_t sm = chunk == 64 ? ~0ULL : ((1ULL << chunk) - 1);
+        uint64_t sv = (limbV(src, s >> 6) >> ssh) & sm;
+        uint64_t sx = (limbX(src, s >> 6) >> ssh) & sm;
+        uint64_t sz = (limbZ(src, s >> 6) >> ssh) & sm;
+        uint64_t dm = sm << dsh;
+        int di = d >> 6;
+        setLimb(dst, di, (limbV(dst, di) & ~dm) | (sv << dsh),
+                (limbX(dst, di) & ~dm) | (sx << dsh),
+                (limbZ(dst, di) & ~dm) | (sz << dsh));
+        done += chunk;
+    }
+}
+// Mask to w the way set() does: drop bits past w, do not clear v under x.
+inline Val maskWidth(Val nv, int w) {
+    if (w <= 64) {
+        uint64_t m = mask(w);
+        nv.v &= m; nv.x &= m; nv.z &= m;
+        nv.hi.clear();
+        nv.sgn = false;
+        return nv;
+    }
+    int n = limbCount(w);
+    if ((int)nv.hi.size() != n - 1) nv.hi.resize(n - 1);
+    uint64_t m = limbMask(w, n - 1);
+    nv.hi[n - 2].v &= m;
+    nv.hi[n - 2].x &= m;
+    nv.hi[n - 2].z &= m;
+    nv.w = w;
+    nv.sgn = false;
+    return nv;
+}
+// make()'s invariant across every limb. A read of a stored signal uses this.
+inline Val clipRead(const Val& src, int w) {
+    if (w <= 64) return make(src.v, src.x, w, src.z);
+    Val a;
+    a.w = w;
+    a.hi.resize(limbCount(w) - 1);
+    for (int i = 0; i < limbCount(w); i++) {
+        uint64_t m = limbMask(w, i);
+        uint64_t x = limbX(src, i) & m;
+        uint64_t v = limbV(src, i) & m & ~x;
+        uint64_t z = limbZ(src, i) & x;
+        setLimb(a, i, v, x, z);
+    }
+    return a;
+}
 // Widen or truncate. signFill replicates bit (a.w-1) into the new high bits,
 // including when that bit is X or Z. Truncation keeps the low bits.
+inline Val v_slice(Val a, int hi, int lo);
 inline Val v_resize(Val a, int w, bool signFill) {
     if (w == a.w) return a;
-    if (w < a.w) return make(a.v, a.x, w, a.z);
-    if (!signFill) return make(a.v, a.x, w, a.z);
-    uint64_t sb = 1ULL << (a.w - 1);
-    uint64_t hi = mask(w) & ~mask(a.w);
-    return make(a.v | ((a.v & sb) ? hi : 0), a.x | ((a.x & sb) ? hi : 0), w,
-                a.z | ((a.z & sb) ? hi : 0));
+    if (a.w <= 64 && w <= 64) {
+        if (w < a.w) return make(a.v, a.x, w, a.z);
+        if (!signFill) return make(a.v, a.x, w, a.z);
+        uint64_t sb = 1ULL << (a.w - 1);
+        uint64_t hi = mask(w) & ~mask(a.w);
+        return make(a.v | ((a.v & sb) ? hi : 0), a.x | ((a.x & sb) ? hi : 0), w,
+                    a.z | ((a.z & sb) ? hi : 0));
+    }
+    if (w < a.w) {
+        Val r = v_slice(a, w - 1, 0);
+        r.sgn = a.sgn;
+        return r;
+    }
+    Val r = a;
+    r.w = w;
+    if (limbCount(w) > 1 && (int)r.hi.size() < limbCount(w) - 1) r.hi.resize(limbCount(w) - 1);
+    if (!signFill) return finish(r);
+    int sb = a.w > 0 ? bitAt(a, a.w - 1) : 0;
+    r = finish(r);
+    for (int i = a.w; i < w; i++) setBit(r, i, sb);
+    r.sgn = a.sgn;
+    return finish(r);
 }
 // Signed iff both operands are. Extend both to that common width first.
 inline void align_signed(Val& a, Val& b) {
@@ -90,91 +281,339 @@ inline int scmp(uint64_t a, uint64_t b, int w) {
     return a < b ? -1 : 1;
 }
 inline Val mk(uint64_t v, int w = 1) { return make(v, 0, w); }
-inline Val allx(int w) { return make(0, ~0ULL, w); }
-inline Val allz(int w) { return make(0, ~0ULL, w, ~0ULL); }
+inline Val allx(int w) {
+    if (w <= 64) return make(0, ~0ULL, w);
+    Val a;
+    a.w = w;
+    a.x = ~0ULL;
+    a.hi.resize(limbCount(w) - 1);
+    for (int i = 1; i < limbCount(w); i++) a.hi[i - 1].x = limbMask(w, i);
+    return a;
+}
+inline Val allz(int w) {
+    if (w <= 64) return make(0, ~0ULL, w, ~0ULL);
+    Val a = allx(w);
+    a.z = a.x;
+    for (auto& h : a.hi) h.z = h.x;
+    return a;
+}
+// Every bit 1. Pullup of a wide net, and a sized all-ones literal built by hand.
+inline Val v_ones(int w) {
+    if (w <= 64) return mk(mask(w), w);
+    Val a;
+    a.w = w;
+    a.v = ~0ULL;
+    a.x = 0;
+    a.z = 0;
+    a.hi.resize(limbCount(w) - 1);
+    for (int i = 1; i < limbCount(w); i++) a.hi[i - 1].v = limbMask(w, i);
+    return a;
+}
+inline Val xfill(int w, bool sgn = false) { Val a = allx(w); a.sgn = sgn; return a; }
 inline int wmax(const Val& a, const Val& b) { return a.w > b.w ? a.w : b.w; }
 
-// 0, 1, or 2 (= X). v is already 0 under X bits, so v != 0 means a known 1.
-inline int truth(const Val& a) { return a.v ? 1 : (a.x ? 2 : 0); }
+// 0, 1, or 2 (= X). v is already 0 under X bits, so a known 1 in any limb is true.
+inline int truth(const Val& a) {
+    if (a.v) return 1;
+    for (const auto& h : a.hi) if (h.v) return 1;
+    if (a.x) return 2;
+    for (const auto& h : a.hi) if (h.x) return 2;
+    return 0;
+}
 inline Val from_truth(int t) { return t == 2 ? allx(1) : mk(t, 1); }
 
 // ---- bitwise (X-aware: 0&X=0, 1|X=1) ----
-inline Val v_and(Val a, Val b) {
-    uint64_t a0 = ~a.x & ~a.v, b0 = ~b.x & ~b.v;  // known zeros
-    return make(a.v & b.v, (a.x | b.x) & ~(a0 | b0), wmax(a, b), 0, a.sgn && b.sgn);
+// One limb of AND/OR/XOR. `kind` 0 and, 1 or, 2 xor. Result z is 0.
+inline void bitPlane(uint64_t av, uint64_t ax, uint64_t bv, uint64_t bx, int kind,
+                     uint64_t& vv, uint64_t& xx) {
+    if (kind == 0) {
+        uint64_t a0 = ~ax & ~av, b0 = ~bx & ~bv;
+        vv = av & bv;
+        xx = (ax | bx) & ~(a0 | b0);
+    } else if (kind == 1) {
+        vv = av | bv;
+        xx = (ax | bx) & ~vv;
+    } else {
+        vv = av ^ bv;
+        xx = ax | bx;
+    }
 }
-inline Val v_or(Val a, Val b) {
-    uint64_t k1 = a.v | b.v;  // known ones
-    return make(k1, (a.x | b.x) & ~k1, wmax(a, b), 0, a.sgn && b.sgn);
+inline Val v_bitwise(Val a, Val b, int kind) {
+    if (a.w <= 64 && b.w <= 64 && a.hi.empty() && b.hi.empty()) {
+        uint64_t vv, xx;
+        bitPlane(a.v, a.x, b.v, b.x, kind, vv, xx);
+        return make(vv, xx, wmax(a, b), 0, a.sgn && b.sgn);
+    }
+    int w = wmax(a, b);
+    Val r;
+    r.w = w;
+    r.sgn = a.sgn && b.sgn;
+    int n = limbCount(w);
+    if (n > 1) r.hi.resize(n - 1);
+    for (int i = 0; i < n; i++) {
+        uint64_t vv, xx;
+        bitPlane(limbV(a, i), limbX(a, i), limbV(b, i), limbX(b, i), kind, vv, xx);
+        setLimb(r, i, vv, xx, 0);
+    }
+    return finish(r);
 }
-inline Val v_xor(Val a, Val b) {
-    uint64_t x = a.x | b.x;
-    return make(a.v ^ b.v, x, wmax(a, b), 0, a.sgn && b.sgn);
+inline Val v_and(Val a, Val b) { return v_bitwise(a, b, 0); }
+inline Val v_or(Val a, Val b) { return v_bitwise(a, b, 1); }
+inline Val v_xor(Val a, Val b) { return v_bitwise(a, b, 2); }
+inline Val v_not(Val a) {
+    if (a.w <= 64 && a.hi.empty()) return make(~a.v, a.x, a.w, 0, a.sgn);
+    Val r = a;
+    r.v = ~a.v; r.z = 0;
+    for (size_t i = 0; i < a.hi.size(); i++) { r.hi[i].v = ~a.hi[i].v; r.hi[i].z = 0; }
+    return finish(r);
 }
-inline Val v_not(Val a) { return make(~a.v, a.x, a.w, 0, a.sgn); }
 
 // ---- arithmetic: any X input -> all-X result ----
 // Both signed: sign-extend to the wider operand, result stays signed.
 // Either unsigned: zero-extend, result is unsigned. Two's-complement
 // add/sub/mul then matches an unsigned op on those extended bits.
-template <class F>
-inline Val arith(Val a, Val b, F f) {
-    align_signed(a, b);
-    if (a.x || b.x) return make(0, ~0ULL, a.w, 0, a.sgn);
-    return make(f(a.v, b.v), 0, a.w, 0, a.sgn);
+// sub: a + ~b + 1. The bits of ~b above the width do not feed back into
+// the bits that finish() keeps.
+inline Val addWide(const Val& a, const Val& b, bool sub) {
+    int n = limbCount(a.w);
+    Val r;
+    r.w = a.w;
+    r.sgn = a.sgn;
+    if (n > 1) r.hi.resize(n - 1);
+    uint64_t carry = sub ? 1 : 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t bv = limbV(b, i);
+        if (sub) bv = ~bv;
+        unsigned __int128 s = (unsigned __int128)limbV(a, i) + bv + carry;
+        setLimb(r, i, (uint64_t)s, 0, 0);
+        carry = (uint64_t)(s >> 64);
+    }
+    return finish(r);
 }
-inline Val v_add(Val a, Val b) { return arith(a, b, [](uint64_t x, uint64_t y) { return x + y; }); }
-inline Val v_sub(Val a, Val b) { return arith(a, b, [](uint64_t x, uint64_t y) { return x - y; }); }
-inline Val v_mul(Val a, Val b) { return arith(a, b, [](uint64_t x, uint64_t y) { return x * y; }); }
-
+inline Val mulWide(const Val& a, const Val& b) {
+    int n = limbCount(a.w);
+    std::vector<uint64_t> acc(n, 0);
+    for (int i = 0; i < n; i++) {
+        unsigned __int128 carry = 0;
+        for (int j = 0; j < n - i; j++) {
+            unsigned __int128 s = (unsigned __int128)acc[i + j] +
+                                  (unsigned __int128)limbV(a, i) * limbV(b, j) + carry;
+            acc[i + j] = (uint64_t)s;
+            carry = s >> 64;
+        }
+    }
+    Val r;
+    r.w = a.w;
+    r.sgn = a.sgn;
+    if (n > 1) r.hi.resize(n - 1);
+    for (int i = 0; i < n; i++) setLimb(r, i, acc[i], 0, 0);
+    return finish(r);
+}
+inline Val v_add(Val a, Val b) {
+    align_signed(a, b);
+    if (a.x || b.x || anyX(a) || anyX(b)) return xfill(a.w, a.sgn);
+    if (a.w <= 64) return make(a.v + b.v, 0, a.w, 0, a.sgn);
+    return addWide(a, b, false);
+}
+inline Val v_sub(Val a, Val b) {
+    align_signed(a, b);
+    if (a.x || b.x || anyX(a) || anyX(b)) return xfill(a.w, a.sgn);
+    if (a.w <= 64) return make(a.v - b.v, 0, a.w, 0, a.sgn);
+    return addWide(a, b, true);
+}
+inline Val v_mul(Val a, Val b) {
+    align_signed(a, b);
+    if (a.x || b.x || anyX(a) || anyX(b)) return xfill(a.w, a.sgn);
+    if (a.w <= 64) return make(a.v * b.v, 0, a.w, 0, a.sgn);
+    return mulWide(a, b);
+}
 // Negate a w-bit pattern. The minimum negative value has magnitude 2^(w-1),
 // which fits in uint64_t through 64 bits. Negating that pattern with a
 // signed integer is undefined at 64 bits, so the magnitude stays unsigned.
 inline uint64_t neg_w(uint64_t v, int w) { return (0 - v) & mask(w); }
+inline Val negVal(const Val& a) {
+    if (a.w <= 64 && a.hi.empty()) return make(neg_w(a.v, a.w), 0, a.w, 0, a.sgn);
+    Val z = make(0, 0, a.w, 0, a.sgn);
+    return addWide(z, a, true);
+}
+inline int cmpMag(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+    for (int i = (int)a.size() - 1; i >= 0; i--) {
+        if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    }
+    return 0;
+}
+inline void subMag(std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+    uint64_t br = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        unsigned __int128 aa = a[i];
+        unsigned __int128 bb = (unsigned __int128)b[i] + br;
+        if (aa < bb) {
+            a[i] = (uint64_t)(aa + ((unsigned __int128)1 << 64) - bb);
+            br = 1;
+        } else {
+            a[i] = (uint64_t)(aa - bb);
+            br = 0;
+        }
+    }
+}
+// Restoring division of two w-bit magnitudes. Remainder has one extra limb
+// so a left shift at a multiple of 64 bits does not lose the top bit.
+inline void divMag(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b, int w,
+                   std::vector<uint64_t>& q, std::vector<uint64_t>& r) {
+    int n = (int)a.size();
+    q.assign(n, 0);
+    std::vector<uint64_t> rem(n + 1, 0), divs(n + 1, 0);
+    for (int i = 0; i < n; i++) divs[i] = i < (int)b.size() ? b[i] : 0;
+    for (int i = w - 1; i >= 0; i--) {
+        uint64_t c = 0;
+        for (int k = 0; k <= n; k++) {
+            uint64_t nc = rem[k] >> 63;
+            rem[k] = (rem[k] << 1) | c;
+            c = nc;
+        }
+        if ((a[i >> 6] >> (i & 63)) & 1) rem[0] |= 1;
+        if (cmpMag(rem, divs) >= 0) {
+            subMag(rem, divs);
+            q[i >> 6] |= 1ULL << (i & 63);
+        }
+    }
+    r.assign(rem.begin(), rem.begin() + n);
+    uint64_t m = limbMask(w, n - 1);
+    q[n - 1] &= m;
+    r[n - 1] &= m;
+}
+inline std::vector<uint64_t> magOf(const Val& a) {
+    int n = limbCount(a.w);
+    std::vector<uint64_t> m(n);
+    for (int i = 0; i < n; i++) m[i] = limbV(a, i) & limbMask(a.w, i);
+    return m;
+}
+inline Val fromMag(const std::vector<uint64_t>& m, int w, bool sgn) {
+    Val a;
+    a.w = w;
+    a.sgn = sgn;
+    int n = limbCount(w);
+    if (n > 1) a.hi.resize(n - 1);
+    for (int i = 0; i < n; i++) setLimb(a, i, i < (int)m.size() ? m[i] : 0, 0, 0);
+    return finish(a);
+}
 inline Val v_divmod(Val a, Val b, bool rem) {
     align_signed(a, b);
-    if (a.x || b.x || b.v == 0) return make(0, ~0ULL, a.w, 0, a.sgn);
-    uint64_t av = a.v, bv = b.v;
-    bool nq = false, nr = false;
-    if (a.sgn) {
-        uint64_t sign = 1ULL << (a.w >= 64 ? 63 : a.w - 1);
-        if (av & sign) { av = neg_w(av, a.w); nq = nr = true; }
-        if (bv & sign) { bv = neg_w(bv, a.w); nq = !nq; }
+    if (a.x || b.x || anyX(a) || anyX(b) || isZero(b)) return xfill(a.w, a.sgn);
+    if (a.w <= 64) {
+        uint64_t av = a.v, bv = b.v;
+        bool nq = false, nr = false;
+        if (a.sgn) {
+            uint64_t sign = 1ULL << (a.w >= 64 ? 63 : a.w - 1);
+            if (av & sign) { av = neg_w(av, a.w); nq = nr = true; }
+            if (bv & sign) { bv = neg_w(bv, a.w); nq = !nq; }
+        }
+        uint64_t bits = rem ? av % bv : av / bv;
+        if (rem ? nr : nq) bits = neg_w(bits, a.w);
+        return make(bits, 0, a.w, 0, a.sgn);
     }
-    uint64_t bits = rem ? av % bv : av / bv;
-    if (rem ? nr : nq) bits = neg_w(bits, a.w);
-    return make(bits, 0, a.w, 0, a.sgn);
+    bool nq = false, nr = false;
+    Val av = a, bv = b;
+    if (a.sgn) {
+        if (bitAt(a, a.w - 1) == 1) { av = negVal(a); nq = nr = true; }
+        if (bitAt(b, b.w - 1) == 1) { bv = negVal(b); nq = !nq; }
+    }
+    std::vector<uint64_t> q, r;
+    divMag(magOf(av), magOf(bv), a.w, q, r);
+    Val out = fromMag(rem ? r : q, a.w, a.sgn);
+    if (rem ? nr : nq) out = negVal(out);
+    out.sgn = a.sgn;
+    return out;
 }
 inline Val v_div(Val a, Val b) { return v_divmod(a, b, false); }
 inline Val v_mod(Val a, Val b) { return v_divmod(a, b, true); }
 
 // ---- comparison (1-bit result) ----
+inline bool sameBits(const Val& a, const Val& b) {
+    if (a.v != b.v || a.x != b.x || a.z != b.z) return false;
+    size_t n = a.hi.size() > b.hi.size() ? a.hi.size() : b.hi.size();
+    for (size_t i = 0; i < n; i++) {
+        Limb A = i < a.hi.size() ? a.hi[i] : Limb{};
+        Limb B = i < b.hi.size() ? b.hi[i] : Limb{};
+        if (!(A == B)) return false;
+    }
+    return true;
+}
 inline Val v_eq(Val a, Val b) {
     align_signed(a, b);  // sign-extend only when both sides are signed
-    if ((a.v ^ b.v) & ~a.x & ~b.x) return mk(0);  // a known bit differs
-    return (a.x || b.x) ? allx(1) : mk(1);
+    if (a.w <= 64 && a.hi.empty() && b.hi.empty()) {
+        if ((a.v ^ b.v) & ~a.x & ~b.x) return mk(0);  // a known bit differs
+        return (a.x || b.x) ? allx(1) : mk(1);
+    }
+    bool xz = false;
+    int n = limbCount(a.w);
+    for (int i = 0; i < n; i++) {
+        uint64_t m = limbMask(a.w, i);
+        uint64_t av = limbV(a, i), ax = limbX(a, i), bv = limbV(b, i), bx = limbX(b, i);
+        if (((av ^ bv) & ~ax & ~bx) & m) return mk(0);
+        if ((ax | bx) & m) xz = true;
+    }
+    return xz ? allx(1) : mk(1);
 }
 inline Val v_ne(Val a, Val b) { Val e = v_eq(a, b); return e.x ? e : mk(!e.v); }
-inline Val v_case_eq(Val a, Val b) { return mk(a.v == b.v && a.x == b.x && a.z == b.z); }
+inline Val v_case_eq(Val a, Val b) { return mk(sameBits(a, b)); }
 // casez: Z bits on either side are wildcards. casex: X and Z bits are wildcards.
 // Remaining bits compare exactly (an X outside the wildcards must match X).
-inline Val v_casez_eq(Val a, Val b) {
-    uint64_t care = ~(a.z | b.z);
-    return mk((((a.v ^ b.v) | (a.x ^ b.x)) & care) == 0);
+inline Val v_case_wild(Val a, Val b, bool casex) {
+    if (a.w <= 64 && b.w <= 64 && a.hi.empty() && b.hi.empty()) {
+        if (casex) {
+            uint64_t care = ~(a.x | b.x);
+            return mk(((a.v ^ b.v) & care) == 0);
+        }
+        uint64_t care = ~(a.z | b.z);
+        return mk((((a.v ^ b.v) | (a.x ^ b.x)) & care) == 0);
+    }
+    int w = a.w > b.w ? a.w : b.w;
+    int n = limbCount(w);
+    for (int i = 0; i < n; i++) {
+        uint64_t m = limbMask(w, i);
+        uint64_t av = limbV(a, i), ax = limbX(a, i), az = limbZ(a, i);
+        uint64_t bv = limbV(b, i), bx = limbX(b, i), bz = limbZ(b, i);
+        uint64_t care = casex ? ~(ax | bx) : ~(az | bz);
+        uint64_t diff = casex ? (av ^ bv) : ((av ^ bv) | (ax ^ bx));
+        if ((diff & care) & m) return mk(0);
+    }
+    return mk(1);
 }
-inline Val v_casex_eq(Val a, Val b) {
-    uint64_t care = ~(a.x | b.x);
-    return mk(((a.v ^ b.v) & care) == 0);
-}
+inline Val v_casez_eq(Val a, Val b) { return v_case_wild(a, b, false); }
+inline Val v_casex_eq(Val a, Val b) { return v_case_wild(a, b, true); }
 inline double v_real(const Val& a) {
-    if (!a.real) {   // an integer used as a real
+    if (a.real) {
+        double d;
+        std::memcpy(&d, &a.v, 8);
+        return d;
+    }
+    // an integer used as a real. X and Z bits count as 0.
+    if (a.w <= 64 && a.hi.empty()) {
         uint64_t v = a.v & ~a.x;
         if (a.sgn && a.w < 64 && a.w > 0 && ((v >> (a.w - 1)) & 1)) v |= ~mask(a.w);
         return a.sgn ? (double)(int64_t)v : (double)v;
     }
-    double d;
-    std::memcpy(&d, &a.v, 8);
-    return d;
+    int n = limbCount(a.w);
+    std::vector<uint64_t> m(n);
+    for (int i = 0; i < n; i++) m[i] = (limbV(a, i) & ~limbX(a, i)) & limbMask(a.w, i);
+    bool neg = false;
+    if (a.sgn && a.w > 0 && ((m[n - 1] >> ((a.w - 1) & 63)) & 1)) {
+        neg = true;
+        uint64_t c = 1;
+        for (int i = 0; i < n; i++) {
+            unsigned __int128 s = (unsigned __int128)(~m[i]) + c;
+            m[i] = (uint64_t)s;
+            c = (uint64_t)(s >> 64);
+        }
+        m[n - 1] &= limbMask(a.w, n - 1);
+    }
+    double acc = 0, scale = 1;
+    for (int i = 0; i < n; i++) {
+        acc += (double)m[i] * scale;
+        scale *= 18446744073709551616.0;
+    }
+    return neg ? -acc : acc;
 }
 inline Val mkreal(double d) {
     Val r;
@@ -187,10 +626,27 @@ inline Val v_rtoi(const Val& a, int w, bool sgn, bool trunc) {
     double d = v_real(a);
     if (std::isnan(d)) return allx(w);
     double r = trunc ? std::trunc(d) : std::round(d);
-    uint64_t bits = r < 0 ? (uint64_t)(int64_t)r : (r >= 18446744073709551616.0 ? ~0ULL : (uint64_t)r);
-    Val v = make(bits, 0, w);
-    v.sgn = sgn;
-    return v;
+    if (w <= 64) {
+        uint64_t bits = r < 0 ? (uint64_t)(int64_t)r : (r >= 18446744073709551616.0 ? ~0ULL : (uint64_t)r);
+        Val v = make(bits, 0, w);
+        v.sgn = sgn;
+        return v;
+    }
+    bool neg = r < 0;
+    double mag = neg ? -r : r;
+    Val out = make(0, 0, w, 0, sgn);
+    if (!std::isfinite(mag)) return out;
+    int n = limbCount(w);
+    for (int i = 0; i < n && mag >= 1; i++) {
+        double chunk = std::fmod(mag, 18446744073709551616.0);
+        setLimb(out, i, (uint64_t)chunk, 0, 0);
+        mag = std::floor(mag / 18446744073709551616.0);
+    }
+    out = finish(out);
+    out.sgn = sgn;
+    if (neg) out = negVal(out);
+    out.sgn = sgn;
+    return out;
 }
 enum MathFn { M_LN, M_LOG10, M_EXP, M_SQRT, M_POW, M_FLOOR, M_CEIL, M_SIN, M_COS, M_TAN, M_ASIN, M_ACOS,
               M_ATAN, M_ATAN2, M_HYPOT, M_SINH, M_COSH, M_TANH, M_ASINH, M_ACOSH, M_ATANH };
@@ -233,10 +689,60 @@ inline const std::string& v_str(const Val& a) {
 inline std::string bytesToStr(const Val& a) {   // integral to string: 0 bytes dropped
     std::string s;
     for (int b = (a.w + 7) / 8 - 1; b >= 0; b--) {
-        char c = char(((a.v & ~a.x) >> (8 * b)) & 0xff);
-        if (c) s += c;
+        unsigned char c = 0;
+        if (a.w <= 64) c = (unsigned char)(((a.v & ~a.x) >> (8 * b)) & 0xff);
+        else for (int k = 0; k < 8; k++) if (bitAt(a, 8 * b + k) == 1) c |= (unsigned char)(1u << k);
+        if (c) s += (char)c;
     }
     return s;
+}
+// Decimal magnitude of a known value. A single word uses the host conversion.
+inline std::string uToDec(const Val& a) {
+    if (a.w <= 64 && a.hi.empty()) return std::to_string(a.v & mask(a.w));
+    int n = limbCount(a.w);
+    std::vector<uint64_t> d(n);
+    bool z = true;
+    for (int i = 0; i < n; i++) {
+        d[i] = limbV(a, i) & limbMask(a.w, i);
+        if (d[i]) z = false;
+    }
+    if (z) return "0";
+    std::string s;
+    for (;;) {
+        bool az = true;
+        for (uint64_t x : d) if (x) { az = false; break; }
+        if (az) break;
+        uint64_t rem = 0;
+        for (int i = n - 1; i >= 0; i--) {
+            unsigned __int128 cur = ((unsigned __int128)rem << 64) | d[i];
+            d[i] = (uint64_t)(cur / 10);
+            rem = (uint64_t)(cur % 10);
+        }
+        s.push_back(char('0' + rem));
+    }
+    for (size_t i = 0; i < s.size() / 2; i++) {
+        char t = s[i];
+        s[i] = s[s.size() - 1 - i];
+        s[s.size() - 1 - i] = t;
+    }
+    return s;
+}
+inline void countXZ(const Val& a, int& nx, int& nz) {
+    nx = nz = 0;
+    if (a.w <= 0) return;
+    for (int i = 0; i < limbCount(a.w); i++) {
+        uint64_t m = limbMask(a.w, i);
+        uint64_t x = limbX(a, i) & m, z = limbZ(a, i) & m;
+        nz += __builtin_popcountll(z);
+        nx += __builtin_popcountll(x & ~z);
+    }
+}
+// A delay. X/Z is 0. A magnitude past 64 bits saturates.
+inline uint64_t v_time(const Val& v) {
+    if (v.x) return 0;
+    for (const auto& h : v.hi) if (h.x) return 0;
+    for (const auto& h : v.hi) if (h.v) return ~0ULL;
+    return v.v;
 }
 enum StrFn { S_LEN, S_GETC, S_TOUPPER, S_TOLOWER, S_COMPARE, S_ICOMPARE, S_SUBSTR, S_ATOI, S_ATOHEX,
              S_ATOOCT, S_ATOBIN, S_ATOREAL, S_PUTC, S_ITOA, S_HEXTOA, S_OCTTOA, S_BINTOA, S_REALTOA };
@@ -296,23 +802,57 @@ struct DynObj {
     }
 };
 inline std::unordered_map<int, DynObj>& dynStore() { static std::unordered_map<int, DynObj> m; return m; }
+inline int ucmp(const Val& a, const Val& b) {
+    int n = limbCount(a.w > b.w ? a.w : b.w);
+    for (int i = n - 1; i >= 0; i--) {
+        uint64_t av = limbV(a, i) & limbMask(a.w, i);
+        uint64_t bv = limbV(b, i) & limbMask(b.w, i);
+        if (av != bv) return av < bv ? -1 : 1;
+    }
+    return 0;
+}
+inline int scmpWide(const Val& a, const Val& b) {
+    int as = bitAt(a, a.w - 1) == 1, bs = bitAt(b, b.w - 1) == 1;
+    if (as != bs) return as ? -1 : 1;
+    return ucmp(a, b);
+}
 inline Val v_wild_eq(Val a, Val b) {
     align_signed(a, b);
-    uint64_t care = ~b.x;
-    if ((a.v ^ b.v) & ~a.x & care) return mk(0);
-    return (a.x & care) ? allx(1) : mk(1);
+    if (a.w <= 64 && a.hi.empty() && b.hi.empty()) {
+        uint64_t care = ~b.x;
+        if ((a.v ^ b.v) & ~a.x & care) return mk(0);
+        return (a.x & care) ? allx(1) : mk(1);
+    }
+    bool xz = false;
+    int n = limbCount(a.w);
+    for (int i = 0; i < n; i++) {
+        uint64_t m = limbMask(a.w, i);
+        uint64_t av = limbV(a, i), ax = limbX(a, i), bv = limbV(b, i), bx = limbX(b, i);
+        uint64_t care = ~bx & m;
+        if ((av ^ bv) & ~ax & care) return mk(0);
+        if (ax & care) xz = true;
+    }
+    return xz ? allx(1) : mk(1);
 }
 inline Val v_lt(Val a, Val b) {
     align_signed(a, b);
-    if (a.x || b.x) return allx(1);
-    if (a.sgn) return mk(scmp(a.v, b.v, a.w) < 0);
-    return mk(a.v < b.v);
+    if (a.x || b.x || anyX(a) || anyX(b)) return allx(1);
+    if (a.w <= 64) {
+        if (a.sgn) return mk(scmp(a.v, b.v, a.w) < 0);
+        return mk(a.v < b.v);
+    }
+    if (a.sgn) return mk(scmpWide(a, b) < 0);
+    return mk(ucmp(a, b) < 0);
 }
 inline Val v_le(Val a, Val b) {
     align_signed(a, b);
-    if (a.x || b.x) return allx(1);
-    if (a.sgn) return mk(scmp(a.v, b.v, a.w) <= 0);
-    return mk(a.v <= b.v);
+    if (a.x || b.x || anyX(a) || anyX(b)) return allx(1);
+    if (a.w <= 64) {
+        if (a.sgn) return mk(scmp(a.v, b.v, a.w) <= 0);
+        return mk(a.v <= b.v);
+    }
+    if (a.sgn) return mk(scmpWide(a, b) <= 0);
+    return mk(ucmp(a, b) <= 0);
 }
 inline Val v_gt(Val a, Val b) { return v_lt(b, a); }
 inline Val v_ge(Val a, Val b) { return v_le(b, a); }
@@ -321,38 +861,100 @@ inline Val v_ge(Val a, Val b) { return v_le(b, a); }
 // Any X or Z in the count (z is part of x) -> all X. The result keeps the
 // left operand's signedness so a later widen can sign-extend it.
 // v_asr (>>>) sign-fills when the left operand is signed, else it is v_shr.
+// A count with a limb above bit 63 set is at least 2^64, which is past any
+// width that fits in an int, so the shifted word is all vacated bits.
+inline bool shiftUnknown(const Val& n) {
+    if (n.x) return true;
+    for (const auto& h : n.hi) if (h.x) return true;
+    return false;
+}
+inline bool shiftHuge(const Val& n) {
+    for (const auto& h : n.hi) if (h.v) return true;
+    return false;
+}
+inline Val shlBits(const Val& a, int sh) {
+    if (sh <= 0) return a;
+    if (sh >= a.w) return make(0, 0, a.w, 0, a.sgn);
+    Val r = make(0, 0, a.w, 0, a.sgn);
+    copyBits(r, sh, a, 0, a.w - sh);
+    r.sgn = a.sgn;
+    return finish(r);
+}
+inline Val shrBits(const Val& a, int sh) {
+    if (sh <= 0) return a;
+    if (sh >= a.w) return make(0, 0, a.w, 0, a.sgn);
+    Val r = make(0, 0, a.w, 0, a.sgn);
+    copyBits(r, 0, a, sh, a.w - sh);
+    r.sgn = a.sgn;
+    return finish(r);
+}
 inline Val v_shl(Val a, Val n) {
-    if (n.x) return make(0, ~0ULL, a.w, 0, a.sgn);
-    if (n.v >= 64) return make(0, 0, a.w, 0, a.sgn);
-    return make(a.v << n.v, a.x << n.v, a.w, a.z << n.v, a.sgn);
+    if (shiftUnknown(n)) return xfill(a.w, a.sgn);
+    if (!shiftHuge(n) && a.w <= 64 && a.hi.empty()) {
+        if (n.v >= 64) return make(0, 0, a.w, 0, a.sgn);
+        return make(a.v << n.v, a.x << n.v, a.w, a.z << n.v, a.sgn);
+    }
+    if (shiftHuge(n) || n.v >= (uint64_t)a.w) return make(0, 0, a.w, 0, a.sgn);
+    return shlBits(a, (int)n.v);
 }
 inline Val v_shr(Val a, Val n) {
-    if (n.x) return make(0, ~0ULL, a.w, 0, a.sgn);
-    if (n.v >= 64) return make(0, 0, a.w, 0, a.sgn);
-    return make(a.v >> n.v, a.x >> n.v, a.w, a.z >> n.v, a.sgn);
+    if (shiftUnknown(n)) return xfill(a.w, a.sgn);
+    if (!shiftHuge(n) && a.w <= 64 && a.hi.empty()) {
+        if (n.v >= 64) return make(0, 0, a.w, 0, a.sgn);
+        return make(a.v >> n.v, a.x >> n.v, a.w, a.z >> n.v, a.sgn);
+    }
+    if (shiftHuge(n) || n.v >= (uint64_t)a.w) return make(0, 0, a.w, 0, a.sgn);
+    return shrBits(a, (int)n.v);
 }
 inline Val v_asr(Val a, Val n) {
     if (!a.sgn) return v_shr(a, n);
-    if (n.x) return make(0, ~0ULL, a.w, 0, true);
-    if (n.v == 0) return a;
-    uint64_t sb = 1ULL << (a.w - 1);
-    uint64_t m = mask(a.w);
-    if (n.v >= (uint64_t)a.w) {
-        return make((a.v & sb) ? m : 0, (a.x & sb) ? m : 0, a.w, (a.z & sb) ? m : 0, true);
+    if (shiftUnknown(n)) return xfill(a.w, true);
+    if (!shiftHuge(n) && a.w <= 64 && a.hi.empty()) {
+        if (n.v == 0) return a;
+        uint64_t sb = 1ULL << (a.w - 1);
+        uint64_t m = mask(a.w);
+        if (n.v >= (uint64_t)a.w) {
+            return make((a.v & sb) ? m : 0, (a.x & sb) ? m : 0, a.w, (a.z & sb) ? m : 0, true);
+        }
+        Val r = v_shr(a, n);
+        uint64_t vac = mask((int)n.v) << (a.w - (int)n.v);
+        return make(r.v | ((a.v & sb) ? vac : 0), r.x | ((a.x & sb) ? vac : 0), a.w,
+                    r.z | ((a.z & sb) ? vac : 0), true);
     }
-    Val r = v_shr(a, n);
-    uint64_t vac = mask((int)n.v) << (a.w - (int)n.v);
-    return make(r.v | ((a.v & sb) ? vac : 0), r.x | ((a.x & sb) ? vac : 0), a.w,
-                r.z | ((a.z & sb) ? vac : 0), true);
+    int sh = (shiftHuge(n) || n.v >= (uint64_t)a.w) ? a.w : (int)n.v;
+    if (sh == 0) return a;
+    int sb = a.w > 0 ? bitAt(a, a.w - 1) : 0;
+    Val r = sh >= a.w ? make(0, 0, a.w, 0, true) : shrBits(a, sh);
+    int from = sh >= a.w ? 0 : a.w - sh;
+    for (int i = from; i < a.w; i++) setBit(r, i, sb);
+    r.sgn = true;
+    return finish(r);
 }
 
 // ---- reductions and logical ops ----
 inline Val v_red_and(Val a) {
-    if (mask(a.w) & ~a.x & ~a.v) return mk(0);  // some known 0
-    return a.x ? allx(1) : mk(1);
+    if (a.w <= 64 && a.hi.empty()) {
+        if (mask(a.w) & ~a.x & ~a.v) return mk(0);  // some known 0
+        return a.x ? allx(1) : mk(1);
+    }
+    int n = limbCount(a.w);
+    for (int i = 0; i < n; i++) {
+        uint64_t m = limbMask(a.w, i);
+        if (m & ~limbX(a, i) & ~limbV(a, i)) return mk(0);
+    }
+    return anyX(a) ? allx(1) : mk(1);
 }
-inline Val v_red_or(Val a) { return a.v ? mk(1) : (a.x ? allx(1) : mk(0)); }
-inline Val v_red_xor(Val a) { return a.x ? allx(1) : mk(__builtin_parityll(a.v)); }
+inline Val v_red_or(Val a) {
+    if (a.w <= 64 && a.hi.empty()) return a.v ? mk(1) : (a.x ? allx(1) : mk(0));
+    return anyV(a) ? mk(1) : (anyX(a) ? allx(1) : mk(0));
+}
+inline Val v_red_xor(Val a) {
+    if (a.w <= 64 && a.hi.empty()) return a.x ? allx(1) : mk(__builtin_parityll(a.v));
+    if (anyX(a)) return allx(1);
+    int p = 0;
+    for (int i = 0; i < limbCount(a.w); i++) p ^= __builtin_parityll(limbV(a, i) & limbMask(a.w, i));
+    return mk(p);
+}
 inline Val v_lnot(Val a) { int t = truth(a); return t == 2 ? allx(1) : mk(!t); }
 inline Val v_land(Val a, Val b) {
     int p = truth(a), q = truth(b);
@@ -367,38 +969,83 @@ inline Val v_lor(Val a, Val b) {
 
 // a[i] with a run-time index; out-of-range or unknown index -> X
 inline Val v_index(Val a, Val i) {
-    if (i.x || i.v >= (uint64_t)a.w) return allx(1);
-    return make(a.v >> i.v, a.x >> i.v, 1, a.z >> i.v);
+    if (shiftUnknown(i) || shiftHuge(i) || i.v >= (uint64_t)a.w) return allx(1);
+    if (a.w <= 64 && a.hi.empty()) return make(a.v >> i.v, a.x >> i.v, 1, a.z >> i.v);
+    return v_slice(a, (int)i.v, (int)i.v);
 }
 // base with bits [hi:lo] replaced by `part` (for a[hi:lo] = ... style assignments)
 inline Val v_insert(Val base, Val part, int hi, int lo) {
-    uint64_t m = mask(hi - lo + 1) << lo;
-    uint64_t pv = lo >= 64 ? 0 : part.v << lo;
-    uint64_t px = lo >= 64 ? 0 : part.x << lo;
-    uint64_t pz = lo >= 64 ? 0 : part.z << lo;
-    return make((base.v & ~m) | (pv & m), (base.x & ~m) | (px & m), base.w, (base.z & ~m) | (pz & m));
+    if (base.w <= 64 && base.hi.empty() && hi < 64 && lo >= 0 && lo < 64) {
+        uint64_t m = mask(hi - lo + 1) << lo;
+        uint64_t pv = part.v << lo;
+        uint64_t px = part.x << lo;
+        uint64_t pz = part.z << lo;
+        return make((base.v & ~m) | (pv & m), (base.x & ~m) | (px & m), base.w, (base.z & ~m) | (pz & m));
+    }
+    if (hi < lo || lo < 0) return base;
+    Val r = base;
+    if (limbCount(r.w) > 1 && (int)r.hi.size() < limbCount(r.w) - 1) r.hi.resize(limbCount(r.w) - 1);
+    int pw = hi - lo + 1;
+    int n = pw;
+    if (lo + n > r.w) n = r.w - lo;
+    if (n > 0) copyBits(r, lo, part, 0, n);
+    return finish(r);
 }
 
 // ---- slice a[hi:lo], concat {a,b,...} (first = most significant), ?: ----
-inline Val v_slice(Val a, int hi, int lo) { return make(a.v >> lo, a.x >> lo, hi - lo + 1, a.z >> lo); }
+inline Val v_slice(Val a, int hi, int lo) {
+    int w = hi - lo + 1;
+    if (w <= 0) return make(0, 0, 1);
+    if (a.hi.empty() && a.w <= 64 && lo >= 0 && lo < 64 && hi < 64)
+        return make(a.v >> lo, a.x >> lo, w, a.z >> lo);
+    // Bits outside the vector are X. In-range bits are copied over that.
+    Val r = allx(w);
+    if (lo < 0 || lo >= a.w) return r;
+    int n = w;
+    if (lo + n > a.w) n = a.w - lo;
+    copyBits(r, 0, a, lo, n);
+    return finish(r);
+}
 // w bits of a starting at bit lo; a bit outside a reads x (11.5.1).
 inline Val v_dynslice(Val a, int64_t lo, int w) {
-    uint64_t v = 0, x = 0, z = 0;
+    if (w <= 64 && a.w <= 64 && a.hi.empty()) {
+        uint64_t v = 0, x = 0, z = 0;
+        for (int b = 0; b < w; b++) {
+            int64_t s = lo + b;
+            if (s < 0 || s >= a.w) { x |= 1ULL << b; continue; }
+            v |= ((a.v >> s) & 1) << b;
+            x |= ((a.x >> s) & 1) << b;
+            z |= ((a.z >> s) & 1) << b;
+        }
+        return make(v, x, w, z);
+    }
+    if (w <= 0) return allx(1);
+    Val r = allx(w);
     for (int b = 0; b < w; b++) {
         int64_t s = lo + b;
-        if (s < 0 || s >= a.w) { x |= 1ULL << b; continue; }
-        v |= ((a.v >> s) & 1) << b;
-        x |= ((a.x >> s) & 1) << b;
-        z |= ((a.z >> s) & 1) << b;
+        if (s < 0 || s >= a.w) continue;
+        setBit(r, b, bitAt(a, (int)s));
     }
-    return make(v, x, w, z);
+    return finish(r);
 }
 inline Val v_concat(const std::vector<Val>& parts) {
-    Val r{0, 0, 0};
-    for (auto& p : parts) {
-        uint64_t rv = p.w >= 64 ? 0 : r.v << p.w, rx = p.w >= 64 ? 0 : r.x << p.w,
-                 rz = p.w >= 64 ? 0 : r.z << p.w;
-        r = make(rv | p.v, rx | p.x, r.w + p.w, rz | p.z);
+    int total = 0;
+    for (auto& p : parts) total += p.w;
+    if (total <= 64) {
+        Val r{0, 0, 0};
+        for (auto& p : parts) {
+            uint64_t rv = p.w >= 64 ? 0 : r.v << p.w, rx = p.w >= 64 ? 0 : r.x << p.w,
+                     rz = p.w >= 64 ? 0 : r.z << p.w;
+            r = make(rv | p.v, rx | p.x, r.w + p.w, rz | p.z);
+        }
+        return r;
+    }
+    Val r = make(0, 0, total);
+    int off = 0;
+    for (int i = (int)parts.size() - 1; i >= 0; i--) {
+        if (parts[i].w <= 0) continue;
+        r = v_insert(r, parts[i], off + parts[i].w - 1, off);
+        off += parts[i].w;
     }
     return r;
 }
@@ -409,10 +1056,26 @@ inline Val v_mux(Val c, Val a, Val b) {
     if (t == 1) return a;
     if (t == 0) return b;
     int w = wmax(a, b);
-    uint64_t m = mask(w);
-    uint64_t same = ~a.x & ~b.x & ~(a.v ^ b.v) & m; // both 0 or both 1
-    uint64_t bothz = a.z & b.z & m;
-    return make(a.v & same, m & ~same, w, bothz, a.sgn && b.sgn);
+    if (w <= 64 && a.hi.empty() && b.hi.empty()) {
+        uint64_t m = mask(w);
+        uint64_t same = ~a.x & ~b.x & ~(a.v ^ b.v) & m; // both 0 or both 1
+        uint64_t bothz = a.z & b.z & m;
+        return make(a.v & same, m & ~same, w, bothz, a.sgn && b.sgn);
+    }
+    Val r;
+    r.w = w;
+    r.sgn = a.sgn && b.sgn;
+    int n = limbCount(w);
+    if (n > 1) r.hi.resize(n - 1);
+    for (int i = 0; i < n; i++) {
+        uint64_t m = limbMask(w, i);
+        uint64_t av = limbV(a, i), ax = limbX(a, i), az = limbZ(a, i);
+        uint64_t bv = limbV(b, i), bx = limbX(b, i), bz = limbZ(b, i);
+        uint64_t same = ~ax & ~bx & ~(av ^ bv) & m;
+        uint64_t bothz = az & bz & m;
+        setLimb(r, i, av & same, m & ~same, bothz);
+    }
+    return finish(r);
 }
 
 // IEEE 1364 drive strength, weakest to strongest. A driver has one level for
@@ -499,6 +1162,23 @@ inline SBit sbit_resolv(SBit a, SBit b) {
 }
 
 inline Val resolveDrives(const Drv* d, size_t n, int w) {
+    if (w > 64) {
+        Val r = make(0, 0, w);
+        for (int b = 0; b < w; b++) {
+            SBit acc;
+            for (size_t i = 0; i < n; i++) {
+                int t = bitAt(d[i].v, b);
+                SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d[i].s0, d[i].s1)
+                         : t == 1 ? sbit_1(d[i].s1) : sbit_0(d[i].s0);
+                acc = sbit_resolv(acc, cur);
+            }
+            int lg = sbit_logic(acc);
+            if (lg == 1) setBit(r, b, 1);
+            else if (lg == 2) setBit(r, b, 2);
+            else if (lg == 3) setBit(r, b, 3);
+        }
+        return finish(r);
+    }
     uint64_t rv = 0, rx = 0, rz = 0;
     for (int b = 0; b < w && b < 64; b++) {
         uint64_t bit = 1ULL << b;
@@ -632,34 +1312,86 @@ inline uint64_t g_simTime = 0;
 // a ** b (IEEE 1800 11.4.5, table 11-4). The result has a's width and sign.
 // Any X/Z operand gives X. A negative exponent gives 0 except for a base of
 // 1 (1), -1 (+-1 by parity), and 0 (X).
+inline bool knownOne(const Val& a) {
+    if (anyX(a)) return false;
+    if ((limbV(a, 0) & limbMask(a.w, 0)) != 1) return false;
+    for (int i = 1; i < limbCount(a.w); i++)
+        if (limbV(a, i) & limbMask(a.w, i)) return false;
+    return true;
+}
+inline bool knownAllOnes(const Val& a) {
+    if (anyX(a)) return false;
+    for (int i = 0; i < limbCount(a.w); i++)
+        if ((limbV(a, i) & limbMask(a.w, i)) != limbMask(a.w, i)) return false;
+    return true;
+}
 inline Val v_pow(Val a, Val b) {
     int w = a.w;
-    if (a.x || b.x) return make(0, ~0ULL, w, 0, a.sgn);
-    uint64_t m = mask(w);
-    uint64_t base = a.v & m;
-    bool bneg = b.sgn && b.w > 0 && ((b.v >> (b.w - 1)) & 1);
+    if (a.w <= 64 && b.w <= 64 && a.hi.empty() && b.hi.empty()) {
+        if (a.x || b.x) return make(0, ~0ULL, w, 0, a.sgn);
+        uint64_t m = mask(w);
+        uint64_t base = a.v & m;
+        bool bneg = b.sgn && b.w > 0 && ((b.v >> (b.w - 1)) & 1);
+        if (bneg) {
+            bool aneg1 = a.sgn && base == m;  // -1
+            if (base == 0) return make(0, ~0ULL, w, 0, a.sgn);
+            if (base == 1) return make(1, 0, w, 0, a.sgn);
+            if (aneg1) return make((b.v & 1) ? m : 1, 0, w, 0, a.sgn);
+            return make(0, 0, w, 0, a.sgn);
+        }
+        uint64_t e = b.v & mask(b.w), r = 1;
+        while (e) {
+            if (e & 1) r *= base;
+            base *= base;
+            e >>= 1;
+        }
+        return make(r & m, 0, w, 0, a.sgn);
+    }
+    if (anyX(a) || anyX(b)) return xfill(w, a.sgn);
+    bool bneg = b.sgn && b.w > 0 && bitAt(b, b.w - 1) == 1;
     if (bneg) {
-        bool aneg1 = a.sgn && base == m;  // -1
-        if (base == 0) return make(0, ~0ULL, w, 0, a.sgn);
-        if (base == 1) return make(1, 0, w, 0, a.sgn);
-        if (aneg1) return make((b.v & 1) ? m : 1, 0, w, 0, a.sgn);
+        if (isZero(a)) return xfill(w, a.sgn);
+        if (knownOne(a)) return make(1, 0, w, 0, a.sgn);
+        if (a.sgn && knownAllOnes(a)) {
+            if (bitAt(b, 0) == 1) { Val r = v_ones(w); r.sgn = a.sgn; return r; }
+            return make(1, 0, w, 0, a.sgn);
+        }
         return make(0, 0, w, 0, a.sgn);
     }
-    uint64_t e = b.v & mask(b.w), r = 1;
-    while (e) {
-        if (e & 1) r *= base;
-        base *= base;
-        e >>= 1;
+    Val r = make(1, 0, w, 0, a.sgn);
+    Val base = a;
+    std::vector<uint64_t> e = magOf(b);
+    auto zero = [&]() { for (uint64_t x : e) if (x) return false; return true; };
+    while (!zero()) {
+        if (e[0] & 1) r = v_mul(r, base);
+        base = v_mul(base, base);
+        uint64_t c = 0;
+        for (int i = (int)e.size() - 1; i >= 0; i--) {
+            uint64_t nc = e[i] & 1;
+            e[i] = (e[i] >> 1) | (c << 63);
+            c = nc;
+        }
     }
-    return make(r & m, 0, w, 0, a.sgn);
+    return r;
 }
 
 // Integer value of a known Val, sign-extended when it is signed.
+// A value that does not fit in int64 saturates, so an out-of-range index misses.
 inline int64_t v_to_i64(Val v) {
-    uint64_t m = mask(v.w);
-    uint64_t u = v.v & m;
-    if (v.sgn && v.w < 64 && ((u >> (v.w - 1)) & 1)) u |= ~m;
-    return (int64_t)u;
+    if (v.w <= 64) {
+        uint64_t m = mask(v.w);
+        uint64_t u = v.v & m;
+        if (v.sgn && v.w < 64 && ((u >> (v.w - 1)) & 1)) u |= ~m;
+        return (int64_t)u;
+    }
+    bool neg = v.sgn && v.w > 0 && bitAt(v, v.w - 1) == 1;
+    for (int i = 1; i < limbCount(v.w); i++) {
+        uint64_t m = limbMask(v.w, i);
+        uint64_t got = limbV(v, i) & m;
+        if (got != (neg ? m : 0)) return neg ? INT64_MIN : INT64_MAX;
+    }
+    if (!neg && v.v > (uint64_t)INT64_MAX) return INT64_MAX;
+    return (int64_t)v.v;
 }
 
 inline Val eval(const E& e, const Reader& rd) {
@@ -862,7 +1594,7 @@ inline Val eval(const E& e, const Reader& rd) {
         }
         case Op::DynSlice: {
             Val a = k(0), i = k(1);
-            if (i.x) return allx(e->hi);
+            if (shiftUnknown(i)) return allx(e->hi);
             int64_t s = v_to_i64(i);
             return v_dynslice(a, e->lo ? s - e->hi + 1 : s, e->hi);
         }
@@ -870,11 +1602,11 @@ inline Val eval(const E& e, const Reader& rd) {
             // An index with x/z bits, or one outside the bounds, reads the
             // element type's default: X for 4-state, 0 for 2-state (7.4.6).
             const ArrShape& a = *e->arr;
-            Val bad = a.twoState ? make(0, 0, a.elemW, 0, a.sgn) : make(0, ~0ULL, a.elemW, 0, a.sgn);
+            Val bad = a.twoState ? make(0, 0, a.elemW, 0, a.sgn) : xfill(a.elemW, a.sgn);
             std::vector<int64_t> idx;
             for (size_t i = 0; i < e->kids.size(); i++) {
                 Val v = k((int)i);
-                if (v.x) return bad;
+                if (shiftUnknown(v)) return bad;
                 idx.push_back(v_to_i64(v));
             }
             int64_t off = a.offset(idx);

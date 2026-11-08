@@ -68,11 +68,7 @@ public:
              "static inline Val RS(Val v, int w, bool fill, bool sg) {\n"
              "    Val r = v_resize(v, w, fill && w > v.w); r.sgn = sg; return r;\n"
              "}\n"
-             "static inline Val cat1(Val r, Val p) {\n"
-             "    uint64_t rv = p.w >= 64 ? 0 : r.v << p.w, rx = p.w >= 64 ? 0 : r.x << p.w,\n"
-             "             rz = p.w >= 64 ? 0 : r.z << p.w;\n"
-             "    return make(rv | p.v, rx | p.x, r.w + p.w, rz | p.z);\n"
-             "}\n"
+             "static inline Val cat1(Val r, Val p) { return v_concat({r, p}); }\n"
              "template <class... T> static inline Val CAT(T... p) { Val r{0, 0, 0}; ((r = cat1(r, p)), ...); return r; }\n"
              "static E X(Op op, Val k, int sig, int hi, int lo, bool sg, std::vector<E> kids) {\n"
              "    E e = node(op, std::move(kids)); e->k = k; e->sig = sig; e->hi = hi; e->lo = lo; e->sgn = sg; return e;\n"
@@ -137,8 +133,15 @@ private:
     }
     static std::string val(const Val& k) {
         if (k.real || k.str) throw CodegenUnsupported("real or string constant");
-        return "Val{" + hex(k.v) + ", " + hex(k.x) + ", " + std::to_string(k.w) + ", " + hex(k.z) + ", " +
-               (k.sgn ? "true" : "false") + "}";
+        std::string base = "Val{" + hex(k.v) + ", " + hex(k.x) + ", " + std::to_string(k.w) + ", " + hex(k.z) +
+                           ", " + (k.sgn ? "true" : "false") + "}";
+        if (k.hi.empty()) return base;
+        std::string s = "([&]{ Val v = " + base + "; v.hi = {";
+        for (size_t i = 0; i < k.hi.size(); i++) {
+            if (i) s += ", ";
+            s += "Limb{" + hex(k.hi[i].v) + ", " + hex(k.hi[i].x) + ", " + hex(k.hi[i].z) + "}";
+        }
+        return s + "}; return v; }())";
     }
     static const char* edge(Edge e) { return e == POS ? "POS" : e == NEG ? "NEG" : "ANY"; }
 
