@@ -320,7 +320,11 @@ static void execComb(const void* ctx) {
     for (const Instr& i : p->code) {
         if (i.k != IK::Assign) return;
         Val v = eval(i.e, rd);
-        if (i.drv >= 0) S.drive(i.sig, i.drv, v, i.s0, i.s1);
-        else S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
+        if (i.drv >= 0) {
+            // A driver of part of a net drives Z on the other bits, as in exec().
+            if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
+            S.drive(i.sig, i.drv, v, i.s0, i.s1);
+        } else
+            S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
     }
 }
