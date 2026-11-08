@@ -143,6 +143,13 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     parts.on = staticPart;
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
+    // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
+    const char* why = !lowered.finals.empty() ? "a final block"
+                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
+    if (why) {
+        std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
+        return -1;
+    }
     try {
         src = codegen(sigs, procs, parts, twoState);
     } catch (const CodegenUnsupported& ex) {
@@ -282,6 +289,7 @@ int main(int argc, char** argv) {
     }
 
     S.vcdPath = vcdPath.value_or("");
+    S.timescale = lowered.timescale();
     S.threads = threads;
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
@@ -295,7 +303,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
         if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
-        else S.spawn(exec(&lowered.procs[i].prog));
+        else S.spawn(process(&lowered.procs[i].prog));
     }
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
@@ -304,6 +312,9 @@ int main(int argc, char** argv) {
         S.buildPartitions(po, pi, pt);
     }
     S.run(maxTime);
+    std::vector<Task> finals;
+    for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
+    S.runFinal(finals);
     std::cout.flush();
     return 0;
 }

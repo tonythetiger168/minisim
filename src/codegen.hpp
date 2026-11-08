@@ -204,6 +204,7 @@ private:
         return b;
     }
     static std::string val(const Val& k) {
+        if (k.real || k.str) throw CodegenUnsupported("real or string constant");
         return "Val{" + hex(k.v) + ", " + hex(k.x) + ", " + std::to_string(k.w) + ", " + hex(k.z) + ", " +
                (k.sgn ? "true" : "false") + "}";
     }
@@ -477,7 +478,10 @@ private:
     std::string assign(const Instr& i, std::string val = "") {
         if (val.empty()) val = fast(i.e);
         std::ostringstream o;
-        if (i.drv >= 0)
+        if (i.drv >= 0 && i.hi >= 0)  // a driver of part of a net drives Z on the other bits
+            o << " S.drive(" << i.sig << ", " << i.drv << ", v_insert(allz(S.sigs[" << i.sig << "].w), " << val
+              << ", " << i.hi << ", " << i.lo << "), " << (int)i.s0 << ", " << (int)i.s1 << ");\n";
+        else if (i.drv >= 0)
             o << " S.drive(" << i.sig << ", " << i.drv << ", " << val << ", " << (int)i.s0 << ", " << (int)i.s1
               << ");\n";
         else if (i.hi >= 0)
@@ -566,6 +570,8 @@ private:
                 auto tgt = [&](size_t t) { return L(P, t > p.code.size() ? p.code.size() : t); };
                 // A write chosen at run time (a[i] = ..., v[i] = ...) is not compiled yet.
                 if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
+                if (i.de || i.nbaLater) throw CodegenUnsupported("delay expression or intra-assignment delay");
+                if (!p.roots.empty()) throw CodegenUnsupported("disable of a named block");
                 switch (i.k) {
                     case IK::Assign: o << assign(i); break;
                     case IK::Nba:
