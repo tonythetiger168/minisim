@@ -184,6 +184,7 @@ inline bool isHandleType(const slang::ast::Type& t);
 inline int storeW(const slang::ast::Type& t0) {
     const auto& t = t0.getCanonicalType();
     if (t.kind == slang::ast::SymbolKind::CovergroupType) return 32;   // a covergroup handle (19.3)
+    if (t.isUntypedType()) return 64;   // a typeless mailbox's message (15.4.9): the value as it is
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) return uWidth(t);
     return t.isString() || t.isFloating() || isHandleType(t) ? 64 : (int)t.getBitWidth();
 }
@@ -311,16 +312,22 @@ struct ClassInfo {
     ClassInfo* base = nullptr;
     FrameLayout* lay = nullptr;
     Subr* ctor = nullptr;   // the constructor, written or implicit (8.7)
-    // A built-in class of the std package (1: weak_reference, 8.30) and
-    // the slot of its hidden state (the referent).
+    // A built-in class of the std package and the slots of its hidden
+    // state: 1 weak_reference (8.30: the referent), 2 semaphore (15.3: keys,
+    // change count), 3 mailbox (15.4: queue, bound, change count),
+    // 4 process (9.7: process number).
     int builtin = 0;
     int bslot = -1;
+    int bslot2 = -1, bslot3 = -1;
 };
 inline int builtinClassKind(const slang::ast::ClassType& ct) {
     const slang::ast::Scope* sc = ct.genericClass ? ct.genericClass->getParentScope() : ct.getParentScope();
     if (!sc || sc->asSymbol().kind != slang::ast::SymbolKind::Package || sc->asSymbol().name != "std") return 0;
     std::string_view n = ct.genericClass ? ct.genericClass->name : ct.name;
     if (n == "weak_reference") return 1;
+    if (n == "semaphore") return 2;
+    if (n == "mailbox") return 3;
+    if (n == "process") return 4;
     throw std::runtime_error("lower: unsupported built-in class std::" + std::string(n));
 }
 inline std::unordered_map<const slang::ast::Type*, ClassInfo*>& classMap() {
@@ -631,6 +638,7 @@ struct Lowerer {
         return w > 64 ? allx(w) : Val{};
     }
     static DynObj dynShapeOf(const slang::ast::Type& t0);
+    static void elemInto(DynObj& o, const slang::ast::Type& et);
     // Slots for a variable of type t in frame (or object) shape L.
     static PropSlot declSlot(const slang::ast::Type& t0, FrameLayout* L) {
         using namespace slang::ast;
@@ -1390,18 +1398,101 @@ struct Lowerer {
         if (args.size() != ci.ctor->args.size()) unsupported("constructor argument count");
         emitAutoCall(*ci.ctor, args, false, std::move(self));
     }
-    // The body of a method of a built-in class (8.30 weak_reference: new,
-    // get, clear, get_id).
+    // The body of a method of a built-in class: weak_reference (8.30),
+    // semaphore (15.3), mailbox (15.4), process (9.7).
     void builtinMethod(const ClassInfo& ci, const Subr& sub) {
+        using namespace slang::ast;
         std::string_view n = sub.sym ? sub.sym->name : "new";
-        auto arg = [&](size_t k) { return ref(relSig(0, sub.args.at(k).sig)); };
-        Instr i; i.k = IK::Assign;
-        if (n == "new") { i.sig = thisRel(ci.bslot); i.e = arg(0); }
-        else if (n == "get") { i.sig = relSig(0, sub.retSig); i.e = ref(thisRel(ci.bslot)); }
-        else if (n == "clear") { i.sig = thisRel(ci.bslot); i.e = konst(make(0, 0, 64)); }
-        else if (n == "get_id") { i.sig = relSig(0, sub.retSig); i.e = arg(0); }   // the handle: stable, nonzero, 0 for null
-        else unsupported("built-in method");
-        prog.emit(i);
+        auto arg = [&](size_t k) { return ref(relSig(0, sub.args.at(k).sig), sub.args.at(k).sgn); };
+        auto set = [&](int sig, E e) { Instr i; i.k = IK::Assign; i.sig = sig; i.e = std::move(e); prog.emit(i); };
+        auto ret = [&](E e) { set(relSig(0, sub.retSig), std::move(e)); };
+        auto slot = [&](int off, bool sgn = false) { return ref(thisRel(off), sgn); };
+        auto bump = [&](int off) { set(thisRel(off), bin(Op::Add, slot(off), konst(mk(1, 32)))); };
+        // while (cond) @(change count);
+        auto waitWhile = [&](const std::function<E()>& cond, int chg) {
+            size_t top = prog.code.size();
+            size_t go = emitJmpIfNot(cond());
+            Instr w; w.k = IK::WaitEdge; w.sig = thisRel(chg); w.edge = ANY;
+            prog.emit(w);
+            prog.code[emitJmp()].target = top;
+            prog.code[go].target = prog.code.size();
+        };
+        // if (cond) { then(); result 1 } else result 0
+        auto tryDo = [&](E cond, const std::function<void()>& then) {
+            ret(konst(mk(0, 32)));
+            size_t no = emitJmpIfNot(std::move(cond));
+            then();
+            ret(konst(mk(1, 32)));
+            prog.code[no].target = prog.code.size();
+        };
+        switch (ci.builtin) {
+            case 1: {
+                Instr i; i.k = IK::Assign;
+                if (n == "new") { i.sig = thisRel(ci.bslot); i.e = arg(0); }
+                else if (n == "get") { i.sig = relSig(0, sub.retSig); i.e = ref(thisRel(ci.bslot)); }
+                else if (n == "clear") { i.sig = thisRel(ci.bslot); i.e = konst(make(0, 0, 64)); }
+                else if (n == "get_id") { i.sig = relSig(0, sub.retSig); i.e = arg(0); }   // the handle: stable, nonzero, 0 for null
+                else unsupported("built-in method");
+                prog.emit(i);
+                return;
+            }
+            case 2: {   // semaphore: keys, change count
+                int keys = ci.bslot, chg = ci.bslot2;
+                auto enough = [&]() { return bin(Op::Ge, slot(keys, true), arg(0)); };
+                if (n == "new") set(thisRel(keys), arg(0));
+                else if (n == "put") { set(thisRel(keys), bin(Op::Add, slot(keys, true), arg(0))); bump(chg); }
+                else if (n == "get") {
+                    waitWhile([&]() { return bin(Op::Lt, slot(keys, true), arg(0)); }, chg);
+                    set(thisRel(keys), bin(Op::Sub, slot(keys, true), arg(0)));
+                    bump(chg);
+                } else if (n == "try_get")
+                    tryDo(enough(), [&]() { set(thisRel(keys), bin(Op::Sub, slot(keys, true), arg(0))); bump(chg); });
+                return;   // the methods every class has (randomize, ...) are handled at the call
+            }
+            case 3: {   // mailbox: queue, bound, change count
+                int q = thisRel(ci.bslot), bound = ci.bslot2, chg = ci.bslot3;
+                auto size = [&]() { auto x = node(Op::DynSize); x->sig = q; return x; };
+                auto full = [&]() {
+                    return bin(Op::LogAnd, bin(Op::Gt, slot(bound, true), konst(mk(0, 32))),
+                               bin(Op::Ge, size(), slot(bound, true)));
+                };
+                auto empty = [&]() { return bin(Op::Eq, size(), konst(mk(0, 32))); };
+                auto front = [&]() { auto x = node(Op::DynGet, {konst(mk(0, 32))}); x->sig = q; return x; };
+                auto msg = [&]() {   // the ref formal `message`
+                    const auto& f = *sub.sym->getArguments()[0];
+                    if (isDynType(f.getType()) || f.getType().isUnpackedArray()) unsupported("a mailbox of arrays");
+                    return sigAt(&f);
+                };
+                auto push = [&]() { Instr i = dynCmd(q, D_PUSH_BACK); i.e = arg(0); prog.emit(i); bump(chg); };
+                auto pop = [&]() {
+                    set(msg(), front());
+                    Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i);
+                    bump(chg);
+                };
+                if (n == "new") set(thisRel(bound), arg(0));
+                else if (n == "num") ret(size());
+                else if (n == "put") { waitWhile(full, chg); push(); }
+                else if (n == "try_put") tryDo(node(Op::LogNot, {full()}), push);
+                else if (n == "get") { waitWhile(empty, chg); pop(); }
+                else if (n == "try_get") tryDo(node(Op::LogNot, {empty()}), pop);
+                else if (n == "peek") { waitWhile(empty, chg); set(msg(), front()); }
+                else if (n == "try_peek") tryDo(node(Op::LogNot, {empty()}), [&]() { set(msg(), front()); });
+                return;
+            }
+            case 4: {   // process
+                static const std::pair<const char*, int> ops[] = {{"self", PO_SELF}, {"status", PO_STATUS},
+                    {"kill", PO_KILL}, {"await", PO_AWAIT}, {"suspend", PO_SUSPEND}, {"resume", PO_RESUME}};
+                for (auto& [s, op] : ops)
+                    if (n == s) {
+                        Instr i; i.k = IK::ProcOp; i.hi = op; i.lo = ci.id; i.dkey = ci.bslot;
+                        if (op != PO_SELF) i.e = node(Op::This);
+                        if (op == PO_SELF || op == PO_STATUS) i.sig = relSig(0, sub.retSig);
+                        prog.emit(i);
+                    }
+                return;   // srandom / get_randstate / set_randstate: handled at the call (18.13.3)
+            }
+        }
+        unsupported("built-in method");
     }
     // A constructor (8.7, 8.17): the base class's constructor (super.new,
     // written as the first statement or implied), then this class's property
@@ -5720,7 +5811,12 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
     } else {
         et = &t.as<DynamicArrayType>().elementType;
     }
-    const Type& e = et->getCanonicalType();
+    elemInto(o, *et);
+    return o;
+}
+inline void Lowerer::elemInto(DynObj& o, const slang::ast::Type& et) {
+    const auto& e = et.getCanonicalType();
+    if (e.isUntypedType()) { o.dflt = Val{}; return; }   // a typeless mailbox (15.4.9): values as they are
     if (isDynType(e)) {   // a container of containers: elements are inner container ids
         auto L = std::make_shared<FrameLayout>();
         L->name = "container";
@@ -5728,7 +5824,7 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
         L->dyn.push_back({0, dynShapeOf(e)});
         o.sub = L;
         o.dflt = make(0, 0, 64);
-        return o;
+        return;
     }
     if (e.isFloating()) o.dflt = mkreal(0);
     else if (e.isString()) o.dflt = mkstr("");
@@ -5741,7 +5837,6 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
     } else if ((e.isUnpackedStruct() || e.isUnpackedUnion()) && uWidth(e) > 0) {
         o.dflt = structDefaultVal(e);   // members' defaults
     } else throw std::runtime_error("lower: unsupported container element type " + e.toString());
-    return o;
 }
 
 inline void Lowerer::declLocals(const slang::ast::Statement& st, FrameLayout* L) {
@@ -6061,7 +6156,14 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (!sc) return;
         auto pk = sc->asSymbol().kind;
         if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock &&
-            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit) return;   // package variables too (26.2)
+            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit) {   // package variables too (26.2)
+            // A static local of a task, function or block with no
+            // initializer: a 2-state one starts at 0 like a module variable
+            // (6.8, 6.21). One with an initializer takes it on the first call.
+            if (v.lifetime == slang::ast::VariableLifetime::Static && !e && (sigmap.count(&v) || arrMap().count(&v)) && !dynMap().count(&v))
+                initStatic(v);
+            return;
+        }
         initStatic(v);
     }
     // A class's static property (8.9) starts like a module variable.
@@ -6707,7 +6809,25 @@ inline ClassInfo* buildClass(const slang::ast::ClassType& ct,
         ci->lay->add(32, make((uint64_t)ci->id, 0, 32));
     }
     classRt().back().lay = ci->lay;
-    if ((ci->builtin = builtinClassKind(ct)) == 1) ci->bslot = ci->lay->add(64, make(0, 0, 64));
+    switch (ci->builtin = builtinClassKind(ct)) {
+        case 1: case 4: ci->bslot = ci->lay->add(64, make(0, 0, 64)); break;
+        case 2:
+            ci->bslot = ci->lay->add(32, make(0, 0, 32, 0, true));
+            ci->bslot2 = ci->lay->add(32, make(0, 0, 32));
+            break;
+        case 3: {
+            const Type& t = ct.find("T")->as<TypeParameterSymbol>().targetType.getType();
+            DynObj o;
+            o.kind = 1;
+            Lowerer::elemInto(o, t);
+            ci->bslot = ci->lay->add(64, make(0, 0, 64));
+            ci->lay->dyn.push_back({ci->bslot, std::move(o)});
+            ci->bslot2 = ci->lay->add(32, make(0, 0, 32, 0, true));
+            ci->bslot3 = ci->lay->add(32, make(0, 0, 32));
+            break;
+        }
+        default: break;
+    }
     for (const auto& m : ct.members()) {
         if (m.kind == SymbolKind::ClassProperty) {
             const auto& p = m.as<ClassPropertySymbol>();
@@ -6936,9 +7056,11 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     comp.getRoot().visit(finder);
     // Built-in classes of the std package that are used (8.30).
     for (const auto& m : comp.getStdPackage().members())
-        if (m.kind == slang::ast::SymbolKind::GenericClassDef && m.name == "weak_reference")
+        if (m.kind == slang::ast::SymbolKind::GenericClassDef && (m.name == "weak_reference" || m.name == "mailbox"))
             for (const auto& spec : m.as<slang::ast::GenericClassDefSymbol>().specializations())
                 spec.visit(finder);
+        else if (m.kind == slang::ast::SymbolKind::ClassType && (m.name == "semaphore" || m.name == "process"))
+            m.visit(finder);
     // The simulation precision is the finest precision of any module (3.14.3).
     simPrecExp() = finder.prec == 1000 ? -9 : finder.prec;
     out.precExp = simPrecExp();

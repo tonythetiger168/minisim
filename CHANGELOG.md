@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `std::semaphore` (15.3), `std::mailbox` (15.4, parameterized, typeless and
+  bounded) and `std::process` (9.7: self, status, kill, await, suspend,
+  resume).
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
@@ -48,6 +51,8 @@ Spec references are IEEE 1800-2023 clauses.
   scope with `u.sum`).
 
 ### Fixed
+- A static 2-state local of a task, function or block with no initializer
+  (`static int c;`) started at x instead of 0 (6.8, 6.21).
 - A module-level unpacked array of a 2-state type (`int a[8]`) started at x
   instead of 0 (6.8).
 - Signals inside generate blocks (`blk[2].x`) were left out of the waveform as
