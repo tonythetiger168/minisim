@@ -41,6 +41,22 @@ Spec references are IEEE 1800-2023 clauses.
   prototypes with `-dpiheader`. msim now links libffi.
 - `chandle` variables (6.14).
 - `repeat (n)` with a count known only at run time (12.7.2).
+- `mbug`: files regression (mregress `results.json`), lint (mlint) and DFT
+  (mdft) failures as issues in GitHub Issues (default), Redmine or Jira, one
+  issue per failure signature. A repeat of an open failure becomes a comment,
+  and a failure that comes back after its issue was closed gets a new issue
+  linked to the old one. Issues have the reproduction command, the log tail,
+  attachments (Redmine, Jira), and the Jenkins or GitHub Actions build link.
+  `mbug sync-github` copies a repository's GitHub issues into Jira or
+  Redmine and keeps open / closed in step (`-two-way` also closes GitHub
+  issues resolved on the other side). It has `-dry-run` and a `max_issues`
+  cap, and credentials come from the environment only. `ci/Jenkinsfile`
+  has an opt-in `BUGS` parameter that runs it. `results.json` now records
+  each failure's `signature` and the test lists.
+- The constraint solver weights each choice by how many ways the other
+  variables can still be completed, so values are close to uniform over the
+  joint solution space (18.5.10): `s -> d == 0` gives s = 0, and `x < y`
+  is no longer biased toward a large x.
 - Containers of containers (7.5, 7.8, 7.10): `int m[][]`, `int q[$][$]`,
   associative arrays of queues, and fixed-size arrays of containers
   (`int f[2][]`); containers of unpacked structs and of vectors wider than
