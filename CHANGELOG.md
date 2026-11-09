@@ -31,21 +31,38 @@ Spec references are IEEE 1800-2023 clauses.
   `-min-branch` / `-min-toggle` gates; `mregress -cov` merges a whole
   regression.
 
+- Constrained randomization (18): rand / randc, constraint blocks (inside,
+  dist, unique, implication, if-else, foreach, solve-before, soft, static,
+  extern), `randomize()` with `with {...}`, pre/post_randomize,
+  rand_mode / constraint_mode, `std::randomize`, randcase, randsequence,
+  per-object random generators with srandom / get_randstate / set_randstate.
+- `sum()` / `product()` / `and()` / `or()` / `xor()` on fixed-size arrays,
+  with an optional `with` clause (7.12.3).
+- Classes (8): objects, constructors, static members, `this`, shallow copy,
+  inheritance, `super`, virtual and pure virtual methods, abstract and
+  parameterized classes, interface classes, typed constructors `D::new`,
+  `$cast` on class handles, out-of-block methods, `std::weak_reference`.
+- Arrays, dynamic arrays and queues as subroutine arguments (7.7).
+- Automatic subroutines get a frame per call (6.21, 13.3.2, 13.4.2): recursion,
+  automatic tasks called from several processes at once, and
+  `fork automatic int j = i; ... join_none` with one copy per fork. This is
+  the base for class methods (8).
+
 ### Changed
+- msim compiles as IEEE 1800-2023 by default (slang's default was 2017);
+  `--std` still selects another version.
 - Waveforms nest the instance hierarchy as scopes under the top module
   (`$scope module adder_tb` / `$scope module u` instead of one flat `top`
   scope with `u.sum`).
 
 ### Fixed
+- A module-level unpacked array of a 2-state type (`int a[8]`) started at x
+  instead of 0 (6.8).
 - Signals inside generate blocks (`blk[2].x`) were left out of the waveform as
   if they were array elements.
 - CI recipes: `ci/Jenkinsfile`, a declarative Jenkins pipeline (JUnit, HTML
   reports, LCOV coverage, `-rerun` on failure), and `ci/README.md` on the
   files mregress and mcov write for a CI job.
-- Automatic subroutines get a frame per call (6.21, 13.3.2, 13.4.2): recursion,
-  automatic tasks called from several processes at once, and
-  `fork automatic int j = i; ... join_none` with one copy per fork. This is
-  the base for class methods (8).
 
 ## [0.1.0] - unreleased
 
