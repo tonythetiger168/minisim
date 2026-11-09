@@ -54,6 +54,7 @@
 #include "sva.hpp"
 #include "sva_engine.hpp"
 #include "clocking.hpp"
+#include "cover.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Expression.h"
@@ -168,6 +169,7 @@ inline int uWidth(const slang::ast::Type& t0);
 // single precision whenever a shortreal value is made (6.12).
 inline int storeW(const slang::ast::Type& t0) {
     const auto& t = t0.getCanonicalType();
+    if (t.kind == slang::ast::SymbolKind::CovergroupType) return 32;   // a covergroup handle (19.3)
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) return uWidth(t);
     return t.isString() || t.isFloating() ? 64 : (int)t.getBitWidth();
 }
@@ -433,6 +435,7 @@ struct Lowerer {
         return frames[frames.size() - 1 - depth];
     }
     int sigFind(const slang::ast::Symbol* sym) const {
+        if (cgItemSig >= 0 && sym->kind == slang::ast::SymbolKind::Iterator && sym->name == "item") return cgItemSig;
         if (auto it = localMap().find(sym); it != localMap().end()) return relIn(it->second.lay, it->second.off);
         auto it = sigmap.find(sym);
         return it == sigmap.end() ? -1 : it->second;
@@ -530,6 +533,7 @@ struct Lowerer {
 
 #include "lower_assert.inc"
 #include "lower_clocking.inc"
+#include "lower_cover.inc"
 
     // Owns the Prog of each fork branch, so Fork's pointers outlive lower().
     std::vector<std::unique_ptr<Prog>>* store = nullptr;
@@ -862,9 +866,13 @@ struct Lowerer {
             }
             case ExpressionKind::Call: {
                 const auto& call = e.as<CallExpression>();
-                if (!call.isSystemCall()) break;
+                if (!call.isSystemCall()) {
+                    if (E r = cgCall(call)) return r;   // get_coverage() is real (19.8)
+                    break;
+                }
                 std::string_view n = call.getSubroutineName();
                 auto args = call.arguments();
+                if (n == "$get_coverage") return sysFnNode(SF_CG, {}, CG_GLOBAL);   // 19.9
                 if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));   // s.atoreal()
                 if (n == "$realtime") { E t = node(Op::RealTime); t->k = mk(ticksPerUnit(), 64); return t; }
                 if (n == "$itor" && args.size() == 1) return un(Op::IToR, expr(*args[0]));
@@ -1881,9 +1889,12 @@ struct Lowerer {
                 if (!outSlot) unsupported("empty argument");
                 return sized(ref(outSlot->sig, outSlot->sgn), outSlot->w, outSlot->sgn, ctx);
             }
+            case ExpressionKind::NewCovergroup:   // new(...) of a covergroup (19.3)
+                return cgNew(e, e.as<NewCovergroupExpression>().arguments);
             case ExpressionKind::Call: {
                 const auto& call = e.as<CallExpression>();
                 if (!call.isSystemCall()) {
+                    if (E r = cgCall(call)) return r;   // c.sample(), c.get_coverage(), ... (19.8)
                     E v = emitUserCall(call, true);
                     int w = storeW(*e.type);
                     needWidth(w);
@@ -2645,6 +2656,7 @@ struct Lowerer {
         return resize(slice(ref(tmp), 31, 0), 32, false, true);
     }
     E sysFn(const slang::ast::CallExpression& call, std::string_view n) {
+        if (n == "$get_coverage") return sysFnNode(SF_CG, {}, CG_GLOBAL);   // 19.9
         if (E r = sampledFn(call, n)) return r;   // $past, $rose, ... (16.9.3)
         if (E r = enumMethod(call)) return r;
         auto args = call.arguments();
@@ -3070,7 +3082,7 @@ struct Lowerer {
             // answer if it were skipped, so it is an error.
             static const std::set<std::string_view> harmless = {
                 "$dumpfile", "$dumpvars", "$dumpon", "$dumpoff", "$dumpall", "$dumpflush", "$dumplimit",
-                "$dumpports", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
+                "$dumpports", "$set_coverage_db_name", "$load_coverage_db", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
                 "$vcdpluson", "$vcdplusoff", "$vcdplusfile", "$shm_open", "$shm_probe", "$recordvars"};
             if (!harmless.count(n)) unsupported(("system task " + std::string(n)).c_str());
             std::cerr << "lower: ignoring system call " << n << "\n";
@@ -3424,7 +3436,10 @@ struct Lowerer {
         } else if (ex.kind == ExpressionKind::Call) {
             const auto& call = ex.as<CallExpression>();
             if (call.isSystemCall()) sysCall(call);
-            else emitUserCall(call, false);
+            else if (E r = cgCall(call)) {   // c.sample(), c.start(), ... (19.8)
+                Instr i; i.k = IK::Assign; i.sig = fresh(64); i.e = std::move(r);
+                prog.emit(i);
+            } else emitUserCall(call, false);
         } else {
             unsupported("expression statement");
         }
@@ -4202,6 +4217,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v, false); }
     // A clocking block (14): its event is a pair of signals like a named
     // event's, and its clockvars are named cb.x.
+    void handle(const slang::ast::CovergroupType&) {}   // built when used (lower_cover.inc)
     void handle(const slang::ast::ClockingBlockSymbol& cb) {
         std::string name = prefix + std::string(cb.name.empty() ? "$cb" : cb.name);
         int id = mkSig(name, 32, false);
@@ -4734,6 +4750,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
     }
+    void handle(const slang::ast::CovergroupType&) {}   // built when used (lower_cover.inc)
     void handle(const slang::ast::ClockingBlockSymbol& cb) {   // 14: runs on its clocking event
         Lowerer lw(sigmap);
         prep(lw);
@@ -4936,6 +4953,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     sampleClocks().clear();
     clockings().clear();
     Lowerer::clockingIdxMap().clear();
+    cgDefs().clear();
+    cgInsts().clear();
+    Lowerer::cgIdxMap().clear();
     sigInfo().clear();
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
@@ -5003,6 +5023,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             visitDefault(inst);
         }
         void handle(const slang::ast::SubroutineSymbol& s) { found.push_back(&s); }
+        void handle(const slang::ast::CovergroupType&) {}   // its methods are built in (19.8)
         void handle(const slang::ast::GenerateBlockSymbol& g) {
             if (!g.isUninstantiated) visitDefault(g);
         }

@@ -1077,3 +1077,4 @@ inline void startClockings() {
         S.spawn(cbProc((int)k));
     }
 }
+#include "cover_rt.inc"

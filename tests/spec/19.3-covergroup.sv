@@ -1,6 +1,5 @@
 // IEEE 1800-2023 19.3: A covergroup with a coverpoint sampled on a clock,
 // and get_coverage (19.3, 19.5, 19.8).
-//! xfail: covergroups are errors
 //! icarus-skip: Icarus 13 does not support covergroups
 module top;
   logic clk = 0;
