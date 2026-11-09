@@ -23,7 +23,8 @@ enum Edge { ANY, POS, NEG };
 // IK::Dyn commands (7.5, 7.8, 7.10).
 enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_INSERT, D_POP_FRONT,
               D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
-              D_SORT, D_RSORT, D_SHUFFLE };
+              D_SORT, D_RSORT, D_SHUFFLE,
+              D_SORT_BY, D_RSORT_BY };   // sort / rsort with (7.12.2): keys in dsrc
 enum class IK {
     Assign,     // sig = e            (blocking)
     Nba,        // sig <= e           (non-blocking)

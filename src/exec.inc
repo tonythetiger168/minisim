@@ -308,6 +308,27 @@ inline void dynExec(const Instr& i) {
             });
             break;
         }
+        case D_SORT_BY:
+        case D_RSORT_BY: {   // order d by the keys in dsrc, one per element
+            bool down = i.dcmd == D_RSORT_BY;
+            const auto& ks = dynStore()[i.dsrc].vec;
+            if (ks.size() != d.vec.size()) break;
+            std::vector<size_t> ord(ks.size());
+            for (size_t k = 0; k < ord.size(); k++) ord[k] = k;
+            std::stable_sort(ord.begin(), ord.end(), [&](size_t x, size_t y) {
+                const Val& a = down ? ks[y] : ks[x];
+                const Val& b = down ? ks[x] : ks[y];
+                if (a.str || b.str) return v_str(a) < v_str(b);
+                if (a.real || b.real) return v_real(a) < v_real(b);
+                Val lt = v_lt(a, b);
+                return !lt.x && lt.v;
+            });
+            std::vector<Val> nv;
+            nv.reserve(ord.size());
+            for (size_t k : ord) nv.push_back(d.vec[k]);
+            d.vec = std::move(nv);
+            break;
+        }
         case D_SHUFFLE: {
             static uint64_t seed = 0x9e3779b97f4a7c15ULL;
             for (size_t k = d.vec.size(); k > 1; k--) {
