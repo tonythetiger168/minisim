@@ -181,6 +181,10 @@ struct RandItem {
     bool isDist = false;
     E guard;                     // dist under an implication: holds when guard is false
     std::vector<RandDist> dist;
+    // foreach over a dynamic array or queue (18.5.8.1): body once per
+    // element at solve time, with signal loopVar read as the index.
+    int loopCont = -1, loopVar = -1;
+    std::vector<RandItem> body;
 };
 // A constraint block (18.5): its constraint_mode slot in the object.
 struct RandBlock {
@@ -197,6 +201,7 @@ struct RandVar {
     std::string name;
     int off = 0, count = 1, w = 1, mode = -1;
     bool sgn = false, randc = false, obj = false;
+    bool dyn = false;   // a dynamic array or queue: off is its container slot, w / sgn its elements'
 };
 struct RandSpec {
     std::vector<RandVar> vars;

@@ -33,9 +33,8 @@ whole command line (so `+UVM_TESTNAME` works but `+uvm_set_config_*` and
 
 - The UVM DPI code (`src/dpi/uvm_dpi.cc`): regular expressions, the full
   command line, and HDL backdoor access need it, and it uses VPI.
-- `rand` dynamic arrays and queues, and `foreach` constraints over them, are
-  not randomized yet (a warning names the first one). This affects
-  `uvm_reg_item`, `uvm_reg_fifo` and `uvm_tlm_generic_payload`.
+- Function calls in constraints, rand associative arrays and rand arrays of
+  arrays.
 
 ## Debugging
 
