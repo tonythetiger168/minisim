@@ -306,6 +306,18 @@ struct JoinWait {
     void await_resume() const {}
 };
 
+struct ProcCtl;
+// DPI-C imports (35) are run by dpi.inc, which msim links in. A call that
+// returns a JoinState is an import task waiting on an exported task that
+// consumes time: the process waits for it, then calls resume. kill runs a
+// waiting import task's C code to its end after the process is disabled (35.9).
+struct DpiHook {
+    shared_ptr<JoinState> (*call)(const Instr&, void*& fiber, const shared_ptr<ProcCtl>& ctl) = nullptr;
+    shared_ptr<JoinState> (*resume)(void* fiber) = nullptr;
+    void (*kill)(void* fiber) = nullptr;
+};
+inline DpiHook& dpiHook() { static DpiHook h; return h; }
+
 // One running process: its children (for wait fork / disable fork) and the
 // fork it belongs to. A disabled process ends at once for everyone waiting
 // on it; its coroutine, if it is resumed later, just returns.
@@ -315,6 +327,7 @@ struct ProcCtl {
     weak_ptr<ProcCtl> parent;
     vector<shared_ptr<ProcCtl>> kids;
     shared_ptr<JoinState> join;
+    void* dpiFiber = nullptr;   // an import task waiting on an exported task (dpi.inc)
     bool kidsDone() const {
         for (auto& k : kids) if (!k->ended) return false;
         return true;
@@ -335,6 +348,11 @@ inline void procKill(const shared_ptr<ProcCtl>& c) {
     if (c->ended) return;
     c->killed = true;
     for (auto& k : c->kids) procKill(k);
+    if (c->dpiFiber && dpiHook().kill) {
+        void* f = c->dpiFiber;
+        c->dpiFiber = nullptr;
+        dpiHook().kill(f);
+    }
     S.dead.insert(c->h.address());
     procEnd(*c);
 }
@@ -403,6 +421,21 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
             case IK::ReadMem: readMem(i); pc++; break;
             case IK::WriteMem: writeMem(i); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
+            case IK::Dpi: {
+                if (!dpiHook().call) { std::cerr << "msim: DPI call without DPI support\n"; S.finished = true; goto done; }
+                void* fib = nullptr;
+                auto js = dpiHook().call(i, fib, ctl);
+                while (js) {
+                    ctl->dpiFiber = fib;
+                    co_await JoinWait{js};
+                    if (ctl->killed) goto done;   // kill already ran the C code to its end (35.9)
+                    ctl->dpiFiber = nullptr;
+                    js = dpiHook().resume(fib);
+                }
+                if (S.finished) goto done;
+                pc++;
+                break;
+            }
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = i.target; }

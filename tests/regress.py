@@ -32,7 +32,8 @@ def parse(path):
 
 def run_msim(msim, path, want_rc):
     try:
-        r = subprocess.run([msim, os.path.basename(path)], cwd=os.path.dirname(path),
+        extra = parse(path)[1].get('args', '').split()
+        r = subprocess.run([msim, os.path.basename(path)] + extra, cwd=os.path.dirname(path),
                            capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         return None, 'timeout'

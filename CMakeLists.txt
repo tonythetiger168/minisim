@@ -76,7 +76,15 @@ if(MINISIM_WITH_SLANG)
   # One-step compile + simulate, irun / vcs -R style: msim tb.sv -top tb -vcd w.vcd
   add_executable(msim src/msim.cpp)
   target_include_directories(msim PRIVATE src)
-  target_link_libraries(msim PRIVATE slang::slang)
+  # DPI-C (35): libffi calls the imports; -rdynamic lets a loaded library
+  # find the svdpi.h functions and msim_dpi_export in msim itself.
+  find_library(FFI_LIB ffi REQUIRED)
+  find_path(FFI_INCLUDE ffi.h PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu)
+  target_link_libraries(msim PRIVATE slang::slang ${FFI_LIB} ${CMAKE_DL_LIBS})
+  if(FFI_INCLUDE)
+    target_include_directories(msim PRIVATE ${FFI_INCLUDE})
+  endif()
+  set_target_properties(msim PROPERTIES ENABLE_EXPORTS ON)
   # -compile builds generated C++ against the kernel headers in src/.
   target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
   if(MINISIM_WITH_FST)
@@ -145,6 +153,10 @@ if(MINISIM_WITH_SLANG)
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
   endif()
+  # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
+  add_test(NAME msim_dpi
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_dpi.cmake)
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
@@ -199,6 +211,7 @@ endif()
 # Install layout (cmake --install, and the cpack packages below):
 #   bin/msim, bin/minisim, bin/slang_dump
 #   share/minisim/include/   kernel sources that msim -compile builds against
+#   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -215,6 +228,7 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
+install(FILES include/svdpi.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 

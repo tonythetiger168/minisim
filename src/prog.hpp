@@ -43,6 +43,7 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    Dpi,        // call the C function of DPI import `dpi` (35); see DpiFunc
     Ret         // pop that address; an empty stack ends the process
 };
 
@@ -64,6 +65,47 @@ inline uint32_t covFileId(const std::string& path) {
 }
 // Relaxed atomic add: a task body can run on two worker threads at once.
 inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
+
+// ---- DPI-C (IEEE 1800-2023 clause 35, annex H) ----
+// How a value is passed to or from C (35.5.6, H.7). A packed type is passed
+// by pointer in canonical form; a scalar bit or logic is one byte.
+enum DpiType : uint8_t {
+    DT_VOID, DT_BYTE, DT_SHORT, DT_INT, DT_LONG, DT_REAL, DT_SHORTREAL, DT_CHANDLE, DT_STRING,
+    DT_BIT,      // svBit
+    DT_LOGIC,    // svLogic
+    DT_BITVEC,   // svBitVecVal[], 32 bits a word
+    DT_LOGICVEC  // svLogicVecVal[], aval/bval pairs
+};
+struct DpiArg {
+    DpiType t = DT_INT;
+    int dir = 0;          // 0 input, 1 output, 2 inout
+    int sig = -1;         // the formal's signal (not for an unpacked array)
+    int w = 32;           // bits of the value, or of one element of an unpacked array
+    bool sgn = false;
+    // An unpacked array formal: its dimensions, leftmost first. An open
+    // dimension `[]` (35.5.6.1) has open = true, and C gets an svOpenArrayHandle.
+    bool uarr = false, open = false;
+    std::vector<std::pair<int64_t, int64_t>> udims;
+    std::string name;
+};
+// One DPI import or export. An import is called by IK::Dpi; an export is an
+// SV task or function that C calls through a generated stub.
+struct DpiFunc {
+    std::string svName, cName;
+    std::string scope;    // hierarchical name of the module instance or package that declares it
+    bool task = false, context = false, pure = false, isExport = false;
+    DpiType ret = DT_VOID;
+    int retSig = -1, retW = 0;
+    bool retSgn = false;
+    std::vector<DpiArg> args;
+    const Prog* prog = nullptr;   // export: the SV body
+    void* rt = nullptr;           // run-time data (resolved C function)
+};
+// An unpacked array actual of a DPI call: a fixed array or a container.
+struct DpiActual {
+    std::shared_ptr<const ArrShape> arr;
+    int dyn = -1;
+};
 
 struct Instr {
     IK k = IK::Jmp;
@@ -108,6 +150,11 @@ struct Instr {
     bool hex = false;
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
+    // Dpi: the import, one entry per argument (arrays only), and the call's
+    // source location for svGetCallerInfo (file in fmt).
+    const DpiFunc* dpi = nullptr;
+    std::vector<DpiActual> dact;
+    int dline = 0;
 };
 
 struct Prog {

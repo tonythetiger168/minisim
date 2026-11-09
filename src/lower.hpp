@@ -70,6 +70,7 @@
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/symbols/SpecifySymbols.h"
 #include "slang/ast/types/AllTypes.h"
+#include "slang/syntax/AllSyntax.h"
 #include "slang/text/SourceManager.h"
 
 // Fixed-size unpacked arrays (7.4), keyed by the array's symbol. SigCollector
@@ -123,8 +124,9 @@ struct BlockIds {
     }
 };
 inline BlockIds& blockIds() { static BlockIds b; return b; }
-// Bits a value of this type takes in a signal: a string is a 64-bit id (6.16).
-inline int storeW(const slang::ast::Type& t) { return t.isString() ? 64 : (int)t.getBitWidth(); }
+// Bits a value of this type takes in a signal: a string is a 64-bit id (6.16),
+// and a chandle a 64-bit pointer (6.14).
+inline int storeW(const slang::ast::Type& t) { return t.isString() || t.isCHandle() ? 64 : (int)t.getBitWidth(); }
 inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return r; }
 
 // name, width, and whether the signal is a net. A net starts at Z.
@@ -152,7 +154,53 @@ struct Subr {
     std::vector<Subr*> calls;
 };
 
+// DPI imports by symbol (35); filled before any process is lowered.
+inline std::unordered_map<const slang::ast::SubroutineSymbol*, DpiFunc*>& dpiMap() {
+    static std::unordered_map<const slang::ast::SubroutineSymbol*, DpiFunc*> m;
+    return m;
+}
+// The hierarchical name of the instance, generate block or package a
+// subroutine is declared in: its DPI scope (35.5.3).
+inline std::string dpiScopeName(const slang::ast::Symbol& sub) {
+    using namespace slang::ast;
+    const Scope* sc = sub.getParentScope();
+    if (!sc) return "";
+    const Symbol& s = sc->asSymbol();
+    if (s.kind == SymbolKind::InstanceBody) {
+        const auto* inst = s.as<InstanceBodySymbol>().parentInstance;
+        return inst ? inst->getHierarchicalPath() : std::string(s.name);
+    }
+    return s.getHierarchicalPath();
+}
+// How a value of type t0 goes to C (35.5.6, H.7). w and sgn describe the
+// SV value. An enum is passed as its base type.
+inline DpiType dpiType(const slang::ast::Type& t0, int& w, bool& sgn) {
+    using namespace slang::ast;
+    const Type& t = t0.getCanonicalType();
+    if (t.kind == SymbolKind::EnumType) return dpiType(t.as<EnumType>().baseType, w, sgn);
+    sgn = t.isSigned();
+    if (t.isVoid()) { w = 0; return DT_VOID; }
+    if (t.isString()) { w = 64; return DT_STRING; }
+    if (t.isCHandle()) { w = 64; return DT_CHANDLE; }
+    if (t.isFloating()) { w = (int)t.getBitWidth(); return w == 32 ? DT_SHORTREAL : DT_REAL; }
+    if (!t.isIntegral()) throw std::runtime_error("lower: unsupported DPI argument type " + t0.toString());
+    w = (int)t.getBitWidth();
+    if (t.kind == SymbolKind::PredefinedIntegerType) {
+        switch (t.as<PredefinedIntegerType>().integerKind) {
+            case PredefinedIntegerType::Byte: return DT_BYTE;
+            case PredefinedIntegerType::ShortInt: return DT_SHORT;
+            case PredefinedIntegerType::Int: return DT_INT;
+            case PredefinedIntegerType::LongInt: return DT_LONG;
+            default: return DT_LOGICVEC;   // integer, time: 4-state packed
+        }
+    }
+    if (t.kind == SymbolKind::ScalarType) return t.isFourState() ? DT_LOGIC : DT_BIT;
+    return t.isFourState() ? DT_LOGICVEC : DT_BITVEC;
+}
+
 struct LowerResult {
+    std::vector<std::unique_ptr<DpiFunc>> dpi;   // DPI imports and exports (35)
+    std::vector<std::string> scopes;             // every instance and package, for svGetScopeFromName
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
@@ -417,7 +465,7 @@ struct Lowerer {
         if (call.isSystemCall()) unsupported("system call");
         const auto* sym = std::get<const SubroutineSymbol*>(call.subroutine);
         if (!sym || !subs) unsupported("subroutine call");
-        if (sym->flags.has(MethodFlags::DPIImport)) unsupported("DPI import");
+        if (sym->flags.has(MethodFlags::DPIImport)) return emitDpiCall(call, *sym, wantValue);
         auto it = subs->find(sym);
         if (it == subs->end()) unsupported("subroutine call");
         Subr* sub = it->second;
@@ -483,6 +531,91 @@ struct Lowerer {
         i.e = ref(sub->retSig, sub->retSgn);
         prog.emit(i);
         return ref(tmp, sub->retSgn);
+    }
+
+    // A DPI import call (35): inputs are copied into the formals' signals,
+    // IK::Dpi calls C, and outputs are copied back, as for an SV subroutine.
+    // An unpacked array argument is passed in place: the call records the
+    // actual array (a fixed array or a container) instead of a signal.
+    E emitDpiCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym, bool wantValue) {
+        using namespace slang::ast;
+        auto fit = dpiMap().find(&sym);
+        if (fit == dpiMap().end()) unsupported("DPI import");
+        const DpiFunc* f = fit->second;
+        auto args = call.arguments();
+        if (args.size() != f->args.size()) unsupported("DPI argument count");
+        Instr c;
+        c.k = IK::Dpi;
+        c.dpi = f;
+        c.dact.resize(args.size());
+        for (size_t n = 0; n < args.size(); n++) {
+            const DpiArg& formal = f->args[n];
+            const Expression& a = *args[n];
+            if (formal.uarr) {
+                const Expression* x = &a;
+                if (formal.dir != 0) {
+                    if (a.kind != ExpressionKind::Assignment) unsupported("DPI array argument");
+                    x = &a.as<AssignmentExpression>().left();
+                }
+                x = &peel(*x);
+                if (!ValueExpressionBase::isKind(x->kind)) unsupported("DPI array argument that is not a variable");
+                const Symbol* as = &x->as<ValueExpressionBase>().symbol;
+                if (auto it = arrMap().find(as); it != arrMap().end()) c.dact[n].arr = it->second;
+                else if (int d = dynSig(*x); d >= 0) c.dact[n].dyn = d;
+                else unsupported("DPI array argument of this kind");
+                continue;
+            }
+            if (formal.dir == 0) {
+                if (a.kind == ExpressionKind::EmptyArgument) unsupported("empty argument");
+                Instr i;
+                i.k = IK::Assign;
+                i.sig = formal.sig;
+                i.e = expr(a);
+                if (formal.t == DT_REAL || formal.t == DT_SHORTREAL) i.e = realOf(a);
+                prog.emit(i);
+            } else if (formal.dir == 2) {
+                if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
+                Instr i;
+                i.k = IK::Assign;
+                i.sig = formal.sig;
+                const Expression& l = a.as<AssignmentExpression>().left();
+                i.e = (formal.t == DT_REAL || formal.t == DT_SHORTREAL) ? realOf(l) : expr(l);
+                prog.emit(i);
+            } else if (a.kind != ExpressionKind::Assignment && a.kind != ExpressionKind::EmptyArgument) {
+                unsupported("output argument");
+            }
+        }
+        if (srcMgr()) {
+            auto loc = call.sourceRange.start();
+            c.fmt = std::string(srcMgr()->getFileName(loc));
+            c.dline = (int)srcMgr()->getLineNumber(loc);
+        }
+        prog.emit(c);
+        for (size_t n = 0; n < args.size(); n++) {
+            const DpiArg& formal = f->args[n];
+            if (formal.dir == 0 || formal.uarr) continue;
+            const Expression& a = *args[n];
+            if (a.kind == ExpressionKind::EmptyArgument) continue;
+            const auto& as = a.as<AssignmentExpression>();
+            Instr i;
+            i.k = IK::Assign;
+            lhs(as.left(), i);
+            OutSlot slot{formal.sig, formal.w, formal.sgn};
+            const OutSlot* saved = outSlot;
+            outSlot = &slot;
+            i.e = expr(as.right());
+            outSlot = saved;
+            prog.emit(i);
+        }
+        if (!wantValue) return {};
+        if (f->retSig < 0) unsupported("DPI call has no return value");
+        int tmp = fresh(f->retW);
+        Instr i;
+        i.k = IK::Assign;
+        i.sig = tmp;
+        i.e = ref(f->retSig, f->retSgn);
+        prog.emit(i);
+        return ref(tmp, f->retSgn);
     }
 
     // ---------- expressions ----------
@@ -658,6 +791,10 @@ struct Lowerer {
         switch (e.kind) {
             case ExpressionKind::IntegerLiteral:
                 return svLit(e.as<IntegerLiteral>().getValue(), e.type->isSigned(), ctx);
+            case ExpressionKind::NullLiteral: {     // a chandle's null (6.14)
+                Val z = make(0, 0, ctx.live && ctx.w > 0 ? ctx.w : 64);
+                return konst(z);
+            }
             case ExpressionKind::StringLiteral: {   // "abc" is 8 bits per char (5.9)
                 const auto& sv = e.as<StringLiteral>().getIntValue().integer();
                 if (sv.getBitWidth() > 64) unsupported("string literal longer than 8 characters");
@@ -2517,8 +2654,35 @@ struct Lowerer {
                 loops.pop_back();
                 break;
             }
-            case StatementKind::RepeatLoop: {   // constant count only: unrolled
+            case StatementKind::RepeatLoop: {   // a small constant count is unrolled
                 const auto& r = s.as<RepeatLoopStatement>();
+                const auto* cv = r.count.getConstant();
+                bool small = cv && cv->isInteger() && !cv->integer().hasUnknown() && cv->integer().as<int64_t>() &&
+                             *cv->integer().as<int64_t>() <= 1024;
+                if (!small && mkSig) {
+                    // repeat (n): n is read once (12.7.2); x, z or a negative n runs no times.
+                    int ctr = fresh(64);
+                    Instr init;
+                    init.k = IK::Assign;
+                    init.sig = ctr;
+                    init.e = resize(expr(r.count), 64, r.count.type->isSigned(), true);
+                    prog.emit(init);
+                    size_t top = prog.here();
+                    Val zero = make(0, 0, 64); zero.sgn = true;
+                    Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(ctr, true), konst(zero));
+                    size_t jf = prog.emit(j);
+                    loops.push_back({});
+                    stmt(r.body);
+                    patch(loops.back().continues, prog.here());
+                    Val one = make(1, 0, 64); one.sgn = true;
+                    Instr dec; dec.k = IK::Assign; dec.sig = ctr; dec.e = bin(Op::Sub, ref(ctr, true), konst(one));
+                    prog.emit(dec);
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    prog.code[jf].target = prog.here();
+                    patch(loops.back().breaks, prog.here());
+                    loops.pop_back();
+                    break;
+                }
                 int64_t n = constInt(r.count);
                 if (n > 1024) unsupported("repeat count > 1024 (unrolled)");
                 loops.push_back({});
@@ -2727,7 +2891,19 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         throw std::runtime_error("lower: signal has a non-positive width: " + std::string(n));
     }
     void handle(const slang::ast::VariableSymbol& v) { reg(v, false); }
-    void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v, false); }
+    void handle(const slang::ast::FormalArgumentSymbol& v) {
+        // A DPI import's array formal has no signal: the call passes the actual array (35.5.6.1).
+        using namespace slang::ast;
+        const auto& t = v.getType().getCanonicalType();
+        if (t.kind == SymbolKind::DPIOpenArrayType) return;
+        if (t.isUnpackedArray()) {
+            const Scope* sc = v.getParentScope();
+            if (sc && sc->asSymbol().kind == SymbolKind::Subroutine &&
+                sc->asSymbol().as<SubroutineSymbol>().flags.has(MethodFlags::DPIImport))
+                return;
+        }
+        reg(v, false);
+    }
     // A modport port (25.5) is another name for a signal of its interface.
     // They are aliased after every signal is registered.
     std::vector<const slang::ast::ModportPortSymbol*> modportPorts;
@@ -2875,11 +3051,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         const auto& t = v.getType();
         // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
-        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString());
+        // A chandle starts as null (6.14).
+        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || t.isCHandle());
         if (!e && !zero) return;
         if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
-        i.e = e ? init->expr(*e) : konst(mk(0, (int)t.getBitWidth()));
+        i.e = e ? init->expr(*e) : konst(mk(0, t.isCHandle() ? 64 : (int)t.getBitWidth()));
         init->prog.emit(i);
     }
     // Module path delays (30.4): (a => b) = d delays every change of output
@@ -3276,8 +3453,62 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*> subMap;
     std::vector<std::unique_ptr<Subr>> owned;
     std::vector<Subr*> order;
+    dpiMap().clear();
+    auto dpiArgs = [&](const slang::ast::SubroutineSymbol& sym, DpiFunc& f) {
+        using namespace slang::ast;
+        for (const FormalArgumentSymbol* formal : sym.getArguments()) {
+            DpiArg a;
+            a.name = std::string(formal->name);
+            a.dir = formal->direction == ArgumentDirection::Out ? 1 : formal->direction == ArgumentDirection::InOut ? 2 : 0;
+            const Type* t = &formal->getType().getCanonicalType();
+            while (t->kind == SymbolKind::FixedSizeUnpackedArrayType || t->kind == SymbolKind::DPIOpenArrayType) {
+                if (t->kind == SymbolKind::DPIOpenArrayType) {
+                    const auto& o = t->as<DPIOpenArrayType>();
+                    if (o.isPacked) Lowerer::unsupported("DPI packed open array argument (bit [])");
+                    a.open = true;
+                    a.udims.push_back({0, -1});
+                    t = &o.elementType.getCanonicalType();
+                } else {
+                    const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+                    a.udims.push_back({ft.range.left, ft.range.right});
+                    t = &ft.elementType.getCanonicalType();
+                }
+                a.uarr = true;
+            }
+            if (t->isUnpackedStruct()) Lowerer::unsupported("DPI unpacked struct argument");
+            a.t = dpiType(*t, a.w, a.sgn);
+            if (!a.uarr) {
+                auto it = sigmap.find(formal);
+                if (it == sigmap.end()) Lowerer::unsupported("DPI argument");
+                a.sig = it->second;
+            } else if (f.isExport) Lowerer::unsupported("unpacked array argument of a DPI export");
+            f.args.push_back(std::move(a));
+        }
+    };
     for (const slang::ast::SubroutineSymbol* sym : finder.found) {
-        if (subMap.count(sym)) continue;
+        if (!sym->flags.has(slang::ast::MethodFlags::DPIImport) || dpiMap().count(sym)) continue;
+        using namespace slang::ast;
+        auto f = std::make_unique<DpiFunc>();
+        f->svName = std::string(sym->name);
+        f->cName = f->svName;
+        if (auto* syn = sym->getSyntax(); syn && syn->kind == slang::syntax::SyntaxKind::DPIImport) {
+            auto cid = syn->as<slang::syntax::DPIImportSyntax>().c_identifier.valueText();
+            if (!cid.empty()) f->cName = std::string(cid);
+        }
+        f->scope = dpiScopeName(*sym);
+        f->task = sym->subroutineKind == SubroutineKind::Task;
+        f->context = sym->flags.has(MethodFlags::DPIContext);
+        f->pure = sym->flags.has(MethodFlags::Pure);
+        dpiArgs(*sym, *f);
+        if (!f->task) {
+            f->ret = dpiType(sym->getReturnType(), f->retW, f->retSgn);
+            if (f->ret != DT_VOID) f->retSig = mkSig("_dpi_ret$" + f->cName, f->retW, false);
+        }
+        dpiMap()[sym] = f.get();
+        out.dpi.push_back(std::move(f));
+    }
+    for (const slang::ast::SubroutineSymbol* sym : finder.found) {
+        if (subMap.count(sym) || sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
         auto sub = std::make_unique<Subr>();
         out.subs.push_back(std::make_unique<Prog>());
         sub->prog = out.subs.back().get();
@@ -3314,6 +3545,43 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         *sub->prog = std::move(lw.prog);
     }
     for (Subr* sub : order) patchImplicit(*sub->prog);
+    for (const auto& ex : comp.getDPIExports()) {   // export "DPI-C" (35.5.4)
+        using namespace slang::ast;
+        auto it = subMap.find(ex.subroutine);
+        if (it == subMap.end()) Lowerer::unsupported("DPI export of this subroutine");
+        Subr* sub = it->second;
+        auto f = std::make_unique<DpiFunc>();
+        f->isExport = true;
+        f->svName = std::string(ex.subroutine->name);
+        f->cName = ex.cIdentifier;
+        f->scope = dpiScopeName(*ex.subroutine);
+        f->task = ex.subroutine->subroutineKind == SubroutineKind::Task;
+        f->prog = sub->prog;
+        dpiArgs(*ex.subroutine, *f);
+        if (!f->task) {
+            f->ret = dpiType(ex.subroutine->getReturnType(), f->retW, f->retSgn);
+            f->retSig = sub->retSig;
+        }
+        out.dpi.push_back(std::move(f));
+    }
+    {   // DPI scope names (35.5.3): every instance and package
+        struct Scopes : slang::ast::ASTVisitor<Scopes> {
+            std::vector<std::string>* out;
+            void handle(const slang::ast::InstanceSymbol& inst) {
+                if (!enterInstance(inst)) return;
+                out->push_back(inst.getHierarchicalPath());
+                visitDefault(inst);
+            }
+            void handle(const slang::ast::PackageSymbol& p) { out->push_back(std::string(p.name)); }
+            void handle(const slang::ast::GenerateBlockSymbol& g) {
+                if (g.isUninstantiated) return;
+                out->push_back(g.getHierarchicalPath());
+                visitDefault(g);
+            }
+        } sv;
+        sv.out = &out.scopes;
+        comp.getRoot().visit(sv);
+    }
 
     ProcCollector pc(sigmap, out, std::move(newDriver), &subMap, mkSig, &tempSeq);
     comp.getRoot().visit(pc);

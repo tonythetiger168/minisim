@@ -24,6 +24,7 @@ script fails if any other test fails or if an xfail test starts passing.
 | 6.11 | Integer types | ✅ | int, byte, shortint, longint, integer, bit. `6.11-integer-types` |
 | 6.8 | Default values | ✅ | 2-state variables (int, bit, real, string) start at 0 / 0.0 / ""; 4-state at x. `6.8-default-values` |
 | 6.12 | real, realtime | ✅ | arithmetic, compare, `**`, conversion both ways (rounded, 6.12.1), real arrays and function results, `$itor` `$rtoi` `$realtobits` `$bitstoreal`, 20.8 math functions. Not yet: `shortreal` (an error), reals in the VCD. `6.12-real`, `6.12.1-real-conversions` |
+| 6.14 | chandle | ✅ | a 64-bit pointer value that starts as `null`; compare with `null`, pass to and from DPI-C. `6.14-chandle` |
 | 6.16 | string type | ✅ | concatenation, replication, compare, all 6.16 methods, string arrays and function arguments, conversion to and from integral types, `case` on strings. `6.16-string`, `6.16-string-methods` |
 | 6.18 | typedef | ✅ | for the types listed here |
 | 6.19 | Enumerations | 🟡 | values and compares; no `.name()` / `.next()`. `6.19-enum` |
@@ -71,7 +72,7 @@ script fails if any other test fails or if an xfail test starts passing.
 | 12.7 | for, while, do-while, repeat, forever | ✅ | |
 | 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue; dynamic arrays and queues by index, associative arrays in key order. `12.7.3-foreach`, `12.7.3-foreach-order`, `12.7.3-foreach-containers` |
 | 12.8 | break, continue, return | ✅ | |
-| 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`, no DPI. `13.4-function-automatic` |
+| 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`. DPI imports and exports: see 35. `13.4-function-automatic` |
 | 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
 | 16 | Assertions | ❌ | immediate and concurrent |
 | 18 | Randomization (constraints) | ❌ | classes, `randomize()`, `std::randomize`, randcase, randsequence |
@@ -102,6 +103,14 @@ script fails if any other test fails or if an xfail test starts passing.
 | 27 | Generate | ✅ | loop, if, and case generate; named and unnamed blocks (`genblkN`); instances and continuous assigns to separate bits inside. `27-generate` |
 | 28 | Gate primitives | 🟡 | and/or/xor families, buf/not, pullup/pulldown |
 | 30.4 | Module path delays | 🟡 | `(a => b) = d` and `(a *> b) = (r, f)` with constant or specparam delays, to an output net. Every path to one output must have the same delays (minisim does not pick the path by which input changed last). Not yet: 6- and 12-value delays, outputs declared as variables, `$sdf_annotate` (an error), timing checks (`$setup`, `$hold`, ... are accepted and never report). `30.4-path-delays` |
+| 35.5 | DPI-C imports | ✅ | `import "DPI-C" [pure\|context] [c_name =] function\|task`, in a module or package, called from procedural code, continuous assignments and `always_comb`. A C function is found in the C files and libraries on the command line, then in msim and the C library (so `abs` needs no library). `35.5-dpi-import`, `35.5.4-import-decl` |
+| 35.5.3 | Context and scopes | ✅ | `svGetScope`, `svSetScope`, `svGetNameFromScope`, `svGetScopeFromName` (every instance and package), `svPutUserData` / `svGetUserData`, `svGetCallerInfo`. An export with the same C name in several instances is chosen by the current scope. `35.5.3-context` |
+| 35.5.6 | Argument and result types | ✅ | byte, shortint, int, longint, real, bit, logic, string, chandle and enums by value; packed vectors (any width, 2- or 4-state, `integer`, packed structs) as `svBitVecVal*` / `svLogicVecVal*`; outputs and inouts by pointer. Not yet: `shortreal` (not in minisim yet), unpacked struct arguments, packed open arrays (`bit []`). `35.5.6-arg-types` |
+| 35.5.6.1 | Open arrays | ✅ | `[]` formals with fixed arrays (any bounds, several dimensions), dynamic arrays and queues as actuals; sized array formals as plain C arrays (leftmost index first); every svdpi.h query and element function (H.12). `35.5.6.1-open-arrays` |
+| 35.7 | Exported functions | ✅ | `export "DPI-C" [c_name =] function`; C calls them from an import with arguments mapped as for imports. Not yet: unpacked array arguments of an export. `35.7-export-functions` |
+| 35.8 | Exported tasks | ✅ | an import task may call exported tasks that wait on time: its C code runs on its own stack and is suspended while the SV task waits. `35.8-export-tasks` |
+| 35.9 | Disabling DPI tasks | ✅ | `disable` of a process waiting in an exported task: the export returns 1, `svIsDisabledState` is 1, a warning if the C code does not call `svAckDisabledState`. `35.9-disable` |
+| Annex J | Foreign code on the command line | ✅ | `-sv_lib`, `-sv_root`, `-sv_liblist`; msim also builds `.c` / `.cpp` files given on the command line (`-CFLAGS`, `-LDFLAGS`) and writes C prototypes with `-dpiheader`. Tested by the `msim_dpi` ctest |
 
 ## Next up
 

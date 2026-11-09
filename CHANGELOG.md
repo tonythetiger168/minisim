@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- DPI-C (clause 35): `import "DPI-C"` functions and tasks (`pure`, `context`,
+  C names), `export "DPI-C"` functions and tasks, every argument type
+  including packed vectors and open arrays, context scopes, exported tasks
+  that wait on time, and the 35.9 disable protocol. `include/svdpi.h` is
+  installed. msim builds C/C++ files given on its command line, loads
+  libraries with `-sv_lib` / `-sv_root` / `-sv_liblist` (annex J), and writes
+  prototypes with `-dpiheader`. msim now links libffi.
+- `chandle` variables (6.14).
+- `repeat (n)` with a count known only at run time (12.7.2).
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
