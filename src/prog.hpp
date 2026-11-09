@@ -48,6 +48,23 @@ enum class IK {
 
 struct Prog;
 
+// Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
+// is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
+// the interpreter counts executions per instruction (and, for JmpIfNot, how
+// often the jump was taken: the condition was false).
+struct SrcLoc { uint32_t file = 0, line = 0; };
+inline SrcLoc g_emitLoc;
+inline std::vector<std::string> g_covFiles{""};   // file id -> path; 0 = unknown
+inline bool g_cov = false;
+inline uint32_t covFileId(const std::string& path) {
+    static std::unordered_map<std::string, uint32_t> ids;
+    auto [it, fresh] = ids.try_emplace(path, (uint32_t)g_covFiles.size());
+    if (fresh) g_covFiles.push_back(path);
+    return it->second;
+}
+// Relaxed atomic add: a task body can run on two worker threads at once.
+inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
+
 struct Instr {
     IK k = IK::Jmp;
     int sig = -1;
@@ -89,6 +106,8 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    uint32_t file = 0, line = 0;            // source of the statement (coverage)
+    mutable uint64_t hits = 0, taken = 0;   // -cov counters
 };
 
 struct Prog {
@@ -97,7 +116,11 @@ struct Prog {
     // fork branch that is a named block, every branch of a named fork).
     // `disable` of one of them from another process ends the process.
     std::vector<int> roots;
-    size_t emit(Instr i) { code.push_back(i); return code.size() - 1; }
+    size_t emit(Instr i) {
+        if (!i.line) { i.file = g_emitLoc.file; i.line = g_emitLoc.line; }
+        code.push_back(i);
+        return code.size() - 1;
+    }
     size_t here() const { return code.size(); }
 };
 
