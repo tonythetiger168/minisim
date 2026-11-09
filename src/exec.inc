@@ -82,7 +82,37 @@ static void writeMem(const Instr& i) {
 // index values. Without a range, loading starts at the lowest address and goes
 // up; with start and finish it goes from start toward finish. "@hex" in the
 // file moves the address. 2-state elements read x/z digits as 0 (21.4.2).
+// $fread into a memory (21.3.4.4): args are fd, start, count (either may be
+// unset). Elements load from start toward the highest address; dres gets
+// the number of bytes read.
+static void freadMem(const Instr& i) {
+    const ArrShape& a = *i.arr;
+    auto [l, r] = a.dims[0];
+    int64_t lowA = std::min(l, r), highA = std::max(l, r);
+    FILE* f = fdFile((uint32_t)v_to_i64(eval(i.args[0], rd)));
+    int64_t start = lowA, count = highA - lowA + 1;
+    if (i.args[1]) { Val v = eval(i.args[1], rd); if (!v.x) start = v_to_i64(v); }
+    if (i.args[2]) { Val v = eval(i.args[2], rd); if (!v.x) count = v_to_i64(v); }
+    int64_t total = 0;
+    std::string buf;
+    for (int64_t ad = start; f && ad <= highA && count > 0; ad++, count--) {
+        int64_t off = a.offset({ad});
+        if (off < 0) break;
+        int sig = a.base + (int)off, w = S.sigs[sig].w;
+        size_t n = (size_t)(w + 7) / 8;
+        buf.assign(n, '\0');
+        size_t got = fread(buf.data(), 1, n, f);
+        total += (int64_t)got;
+        if (!got) break;
+        buf.resize(got);
+        S.set(sig, bytesValue(buf, n, w));
+        if (got < n) break;
+    }
+    S.set(i.dres, make((uint64_t)total, 0, 32, 0, true));
+}
+
 static void readMem(const Instr& i) {
+    if (i.pw == 1) { freadMem(i); return; }
     const ArrShape& a = *i.arr;
     auto [l, r] = a.dims[0];
     int64_t lowA = std::min(l, r), highA = std::max(l, r);
@@ -1027,14 +1057,24 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++;
                 break;
             case IK::Strobe:
-                if (fr) { vector<E> a; for (auto& x : i.args) a.push_back(bindRel(x)); S.strobe(i.fmt, a); }
-                else S.strobe(i.fmt, i.args);
+                {
+                    vector<E> a;
+                    if (fr) for (auto& x : i.args) a.push_back(bindRel(x));
+                    const vector<E>& use = fr ? a : i.args;
+                    if (i.fd) S.strobeF((uint32_t)v_to_i64(eval(i.fd, rd)), i.fmt, use);
+                    else S.strobe(i.fmt, use);
+                }
                 if (S.finished) goto done;
                 pc++;
                 break;
             case IK::Monitor:
-                if (fr) { vector<E> a; for (auto& x : i.args) a.push_back(bindRel(x)); S.armMon(i.fmt, a); }
-                else S.armMon(i.fmt, i.args);
+                {
+                    vector<E> a;
+                    if (fr) for (auto& x : i.args) a.push_back(bindRel(x));
+                    const vector<E>& use = fr ? a : i.args;
+                    if (i.fd) S.armFMon((uint32_t)v_to_i64(eval(i.fd, rd)), i.fmt, use);
+                    else S.armMon(i.fmt, use);
+                }
                 if (S.finished) goto done;
                 pc++;
                 break;

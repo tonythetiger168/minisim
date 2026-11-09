@@ -300,7 +300,13 @@ struct Sim {
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
     // Postponed region, after NBA and before time advances. `mon` marks the
     // single $monitor slot; anything else is a $strobe, in schedule order.
-    struct Post { bool mon = false; string fmt; vector<E> args; };
+    // A postponed print: $strobe, $monitor (mon), or to a file with $fstrobe /
+    // $fmonitor (file, fd; fmon is the $fmonitor's index).
+    struct Post { bool mon = false; string fmt; vector<E> args; bool file = false; uint32_t fd = 0; int fmon = -1; };
+    // $fmonitor (21.3.2): any number can be active at once; $fclose of the
+    // descriptor ends one (on = false).
+    struct FMon { bool on = true, queued = false; uint32_t fd; string fmt; vector<E> args; vector<int> watch; };
+    vector<FMon> fmons;
     deque<Post> postq;
     // The reactive region set (4.4.2.6-4.4.2.8): reactive, re-inactive
     // (#0 from the reactive region) and re-NBA. Assertion action blocks run
@@ -353,7 +359,10 @@ struct Sim {
         return !sigs[i].hide && (dumpSel.empty() || (i < dumpSel.size() && dumpSel[i]));
     }
 
-    Sim() { g_sformat = &Sim::sformat; }
+    Sim() {
+        g_sformat = &Sim::sformat;
+        g_fcloseHook = &Sim::closeHook;
+    }
 
     // ---- multi-core: deterministic parallel batches ----
     // `threads` workers (default: defaultThreads(); msim -threads N).
@@ -590,7 +599,7 @@ struct Sim {
             }
             return;
         }
-        if (parts.empty() || waving() || mon.on || g_cov) {
+        if (parts.empty() || waving() || mon.on || !fmons.empty() || g_cov) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
             for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
@@ -1274,7 +1283,49 @@ struct Sim {
         for (const auto& a : args) collectRefs(a, mon.watch);
         queueMon();
     }
+    static void closeHook(uint32_t fd);
+    void strobeF(uint32_t fd, const string& fmt, const vector<E>& args) {
+        Post p{false, fmt, args, true, fd};
+        postq.push_back(std::move(p));
+    }
+    void queueFMon(size_t k) {
+        FMon& m = fmons[k];
+        if (!m.on || m.queued) return;
+        Post p{false, m.fmt, m.args, true, m.fd, (int)k};
+        postq.push_back(std::move(p));
+        m.queued = true;
+    }
+    void armFMon(uint32_t fd, const string& fmt, const vector<E>& args) {
+        FMon m;
+        m.fd = fd;
+        m.fmt = fmt;
+        m.args = args;
+        for (const auto& a : args) collectRefs(a, m.watch);
+        fmons.push_back(std::move(m));
+        observed = true;
+        queueFMon(fmons.size() - 1);
+    }
+    // $fclose: the closed descriptor's pending $fstrobe / $fmonitor lines and
+    // its $fmonitors end. Closing channels of a multichannel descriptor drops
+    // them from it.
+    void fileClosed(uint32_t fd) {
+        auto left = [&](uint32_t d) -> uint32_t {
+            if ((fd & 0x80000000u) || (d & 0x80000000u)) return d == fd ? 0 : d;
+            return d & ~(fd & ~1u);   // channel 0 (stdout) is never closed
+        };
+        for (auto& m : fmons) if (m.on && !(m.fd = left(m.fd))) m.on = false;
+        for (auto it = postq.begin(); it != postq.end();) {
+            if (it->file && !(it->fd = left(it->fd))) {
+                if (it->fmon >= 0) fmons[(size_t)it->fmon].queued = false;
+                it = postq.erase(it);
+            } else ++it;
+        }
+    }
     void noteChange(int s) {
+        if (__builtin_expect(!fmons.empty(), 0))
+            for (size_t k = 0; k < fmons.size(); k++)
+                if (fmons[k].on && !fmons[k].queued)
+                    for (int w : fmons[k].watch) if (w == s) { queueFMon(k); break; }
         if (!mon.on || mon.queued) return;
         for (int w : mon.watch) if (w == s) { queueMon(); return; }
     }
@@ -1283,6 +1334,11 @@ struct Sim {
             Post p = move(postq.front());
             postq.pop_front();
             if (p.mon) mon.queued = false;
+            if (p.file) {
+                if (p.fmon >= 0) fmons[(size_t)p.fmon].queued = false;
+                fileWrite(p.fd, sformat(p.fmt, p.args, [&](int s) { return get(s); }) + "\n");
+                continue;
+            }
             printSys(p.fmt, p.args);
         }
     }
@@ -1829,6 +1885,7 @@ struct Sim {
 };
 
 Sim S;
+inline void Sim::closeHook(uint32_t fd) { S.fileClosed(fd); }
 
 // Frames and objects (expr.hpp): blocks of hidden signals made at run time.
 static int allocFrameSigs(const FrameLayout& L) {

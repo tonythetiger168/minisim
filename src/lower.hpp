@@ -3558,6 +3558,50 @@ struct Lowerer {
         prog.code[jf].target = prog.here();
         return ref(cnt, true);
     }
+    // $fread (21.3.4.4): binary, big-endian, (w + 7) / 8 bytes per value.
+    // Into a variable: written when any byte was read. Into a memory: an
+    // instruction loads elements from start (default: the lowest address)
+    // upward, at most count of them, until the file ends. The result is the
+    // number of bytes read.
+    E freadCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (args.size() < 2) unsupported("$fread arguments");
+        if (!stmtDepth) unsupported("$fread outside a procedural statement");
+        const Expression& dst = outArg(*args[0]);
+        const Type& t = dst.type->getCanonicalType();
+        int cnt = fresh(32);
+        if (t.isUnpackedArray()) {
+            const Symbol* msym = nullptr;
+            const Expression& m = peel(dst);
+            if (m.kind == ExpressionKind::NamedValue) msym = &m.as<NamedValueExpression>().symbol;
+            auto it = msym ? arrMap().find(msym) : arrMap().end();
+            if (it == arrMap().end()) unsupported("$fread into this array");
+            if (it->second->dims.size() != 1) unsupported("$fread into a multidimensional array");
+            const Type& el = t.getArrayElementType()->getCanonicalType();
+            if (!el.isIntegral()) unsupported("$fread into an array of non-integral elements");
+            Instr i; i.k = IK::ReadMem; i.arr = it->second; i.pw = 1;   // pw 1: $fread
+            i.dres = cnt;
+            i.args.push_back(expr(*args[1]));
+            for (size_t a = 2; a < 4; a++)
+                i.args.push_back(a < args.size() && args[a]->kind != ExpressionKind::EmptyArgument ? expr(*args[a]) : E());
+            prog.emit(i);
+            return ref(cnt, true);
+        }
+        if (!t.isIntegral()) unsupported("$fread into a non-integral variable (unpacked structs not yet)");
+        int w = (int)t.getBitWidth();
+        Instr r; r.k = IK::Assign; r.sig = cnt;
+        r.e = sysFnNode(SF_FREAD, {expr(*args[1]), konst(mk((w + 7) / 8, 32))});
+        prog.emit(r);
+        Instr j; j.k = IK::JmpIfNot; j.e = ref(cnt);
+        size_t jf = prog.emit(j);
+        Instr wr; wr.k = IK::Assign;
+        lhs(dst, wr);
+        wr.e = sysFnNode(SF_FREAD_GET, {}, w);
+        prog.emit(wr);
+        prog.code[jf].target = prog.here();
+        return ref(cnt, true);
+    }
     // Enumeration methods (6.19.5): first, last, num, next(N), prev(N), name.
     // Each is a chain of compares against the declared values. A value that
     // is not a member gives the type's default for next / prev and "" for name.
@@ -3857,6 +3901,7 @@ struct Lowerer {
         if (n == "$fseek" && args.size() == 3) return sysFnNode(SF_FSEEK, {a(0), a(1), a(2)});
         if (n == "$rewind" && args.size() == 1) return sysFnNode(SF_FSEEK, {a(0)});
         if (n == "$fgets") return fgetsCall(call);
+        if (n == "$fread") return freadCall(call);
         if (n == "$fscanf") return scanCall(call, true);
         if (n == "$sscanf") return scanCall(call, false);
         if (n == "$fdisplay" || n == "$fdisplayb" || n == "$fdisplayo" || n == "$fdisplayh" ||
@@ -4550,7 +4595,7 @@ struct Lowerer {
         std::string_view base = n;
         if (base.size() > 1 && (base.ends_with('b') || base.ends_with('o') || base.ends_with('h')) &&
             (base.starts_with("$display") || base.starts_with("$write") || base.starts_with("$strobe") ||
-             base.starts_with("$monitor")) &&
+             base.starts_with("$monitor") || base.starts_with("$fstrobe") || base.starts_with("$fmonitor")) &&
             base != "$monitoron") {
             dflt = base.back();
             base.remove_suffix(1);
@@ -4559,6 +4604,7 @@ struct Lowerer {
         else if (base == "$write") { k = IK::Display; nonl = true; }
         else if (base == "$strobe") k = IK::Strobe;
         else if (base == "$monitor") k = IK::Monitor;
+        else if (base == "$fstrobe" || base == "$fmonitor") k = base == "$fstrobe" ? IK::Strobe : IK::Monitor;
         else {
             // Waveform tasks only change what msim -vcd writes, so skipping
             // them changes no result. Any other task would be a silent wrong
@@ -4577,7 +4623,13 @@ struct Lowerer {
         }
         Instr i; i.k = k; i.nonl = nonl;
         hierName = scopeName(call);
-        formatInto(call.arguments(), dflt, i.fmt, i.args);
+        auto fargs = call.arguments();
+        if (base[1] == 'f') {   // $fstrobe / $fmonitor (21.3.2): the first argument is the descriptor
+            if (fargs.empty()) unsupported("$fstrobe / $fmonitor without a descriptor");
+            i.fd = expr(*fargs[0]);
+            fargs = fargs.subspan(1);
+        }
+        formatInto(fargs, dflt, i.fmt, i.args);
         prog.emit(i);
     }
 

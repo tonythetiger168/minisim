@@ -1115,6 +1115,7 @@ private:
                 if (i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) throw CodegenUnsupported("dynamic array");
                 if (!p.roots.empty()) throw CodegenUnsupported("disable of a named block");
                 if (i.k == IK::Finish && i.hi > 0) throw CodegenUnsupported("$fatal exit status");
+                if (i.fd) throw CodegenUnsupported("$fstrobe / $fmonitor");
                 if (!i.dly.empty()) throw CodegenUnsupported("delayed continuous assignment");
                 switch (i.k) {
                     case IK::Assign: o << assign(i); break;
