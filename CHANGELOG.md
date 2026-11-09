@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `rand join` in randsequence (18.17.5), with a constant bias, and production
+  arguments and return values (18.17.7).
+- `dist` default weights (`default :/ w`, 18.5.3) and rand associative
+  arrays with integral keys (18.4); foreach constraints over associative
+  arrays bind the index to each key.
 - Function calls in constraints (18.5.12): methods, static and package
   functions, nested calls, in guards, foreach bodies and inline `with`. The
   rand variables a call reads are solved first.
@@ -62,6 +67,7 @@ Spec references are IEEE 1800-2023 clauses.
   scope with `u.sum`).
 
 ### Fixed
+- `s[i]` on a string read X and could not be written (6.16).
 - The constraint solver re-evaluated known subexpressions at every node,
   so a long `sum()` constraint cost O(n^2) per check.
 - msim could crash at exit when a process with an automatic frame (a
