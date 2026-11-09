@@ -36,6 +36,7 @@
 #pragma once
 #include <cmath>
 #include <deque>
+#include <set>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -66,6 +67,7 @@
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
+#include "slang/ast/symbols/SpecifySymbols.h"
 #include "slang/ast/types/AllTypes.h"
 #include "slang/text/SourceManager.h"
 
@@ -1309,6 +1311,7 @@ struct Lowerer {
                     b.sgn = true;
                     return sized(konst(b), 32, true, ctx);
                 }
+                if (E r = sysFn(call, n)) return sized(r, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
                 // $signed / $unsigned keep the bits and change the tag.
                 if (n != "$signed" && n != "$unsigned") unsupported("system function");
                 auto args = call.arguments();
@@ -1710,6 +1713,117 @@ struct Lowerer {
         }
         return r;
     }
+    // $clog2, $countbits and friends (20.8, 20.9), $random / $dist_uniform
+    // (20.14), $urandom / $urandom_range (18.13). Null if n is none of them.
+    E sysFnNode(int id, std::vector<E> kids, int ctl = 0) {
+        auto n = node(Op::SysFn, std::move(kids));
+        n->hi = id;
+        n->lo = ctl;
+        return n;
+    }
+    // The control bits of $countbits: each argument is a 1-bit constant.
+    int countCtl(std::span<const slang::ast::Expression* const> ctl) {
+        using namespace slang::ast;
+        int m = 0;
+        for (const Expression* c : ctl) {
+            const Expression& x = peel(*c);
+            if (x.kind != ExpressionKind::IntegerLiteral) unsupported("$countbits control that is not a literal");
+            auto bit = x.as<IntegerLiteral>().getValue()[0];
+            m |= bit.value == slang::logic_t::Z_VALUE ? 8 : bit.isUnknown() ? 4 : bit.value ? 2 : 1;
+        }
+        return m;
+    }
+    // f(seed, ...) where seed is inout: one node gives {new seed, value}; the
+    // seed is written back just before the statement, the value read after.
+    E seededCall(int id, const slang::ast::Expression& seedArg, std::vector<E> more) {
+        if (!stmtDepth) unsupported("$random(seed) outside a procedural statement");
+        const slang::ast::Expression& sd = outArg(seedArg);
+        std::vector<E> kids{expr(sd)};
+        for (auto& m : more) kids.push_back(m);
+        int tmp = fresh(64);
+        Instr h; h.k = IK::Assign; h.sig = tmp; h.e = sysFnNode(id, kids);
+        prog.emit(h);
+        Instr w; w.k = IK::Assign;
+        lhs(sd, w);
+        int sw = (int)sd.type->getBitWidth();
+        w.e = resize(slice(ref(tmp), 63, 32), sw, false, sd.type->isSigned());
+        prog.emit(w);
+        return resize(slice(ref(tmp), 31, 0), 32, false, true);
+    }
+    E sysFn(const slang::ast::CallExpression& call, std::string_view n) {
+        auto args = call.arguments();
+        auto a = [&](size_t i) { return expr(*args[i]); };
+        if (n == "$clog2" && args.size() == 1) return sysFnNode(SF_CLOG2, {a(0)});
+        if (n == "$countones" && args.size() == 1) return sysFnNode(SF_COUNTBITS, {a(0)}, 2);
+        if (n == "$countbits" && args.size() >= 2) return sysFnNode(SF_COUNTBITS, {a(0)}, countCtl(args.subspan(1)));
+        if ((n == "$onehot" || n == "$onehot0") && args.size() == 1) {
+            E c = sysFnNode(SF_COUNTBITS, {a(0)}, 2);
+            return bin(n == "$onehot" ? Op::Eq : Op::Le, c, konst(make(1, 0, 32, 0, true)));
+        }
+        if (n == "$isunknown" && args.size() == 1)
+            return bin(Op::Ne, sysFnNode(SF_COUNTBITS, {a(0)}, 12), konst(make(0, 0, 32, 0, true)));
+        if (n == "$random") {
+            if (args.empty()) return sysFnNode(SF_RANDOM, {});
+            return seededCall(SF_RANDOM_SEED, *args[0], {});
+        }
+        if (n == "$dist_uniform" && args.size() == 3)
+            return seededCall(SF_DIST_UNIFORM, *args[0], {resize(a(1), 32, args[1]->type->isSigned(), true),
+                                                          resize(a(2), 32, args[2]->type->isSigned(), true)});
+        if (n == "$urandom") return args.empty() ? sysFnNode(SF_URANDOM, {}) : sysFnNode(SF_URANDOM_SEED, {a(0)});
+        if (n == "$urandom_range" && !args.empty()) {
+            std::vector<E> k{a(0)};
+            if (args.size() > 1) k.push_back(a(1));
+            return sysFnNode(SF_URANDOM_RANGE, k);
+        }
+        if (n == "$timeformat") {
+            std::vector<E> k;
+            for (size_t i = 0; i < args.size() && i < 4; i++) k.push_back(i == 2 ? strOf(*args[i]) : expr(*args[i]));
+            return sysFnNode(SF_TIMEFORMAT, k);
+        }
+        if (n == "$test$plusargs" && args.size() == 1) return sysFnNode(SF_PLUS_TEST, {strOf(*args[0])});
+        if (n == "$value$plusargs" && args.size() == 2) {
+            // "N=%d": the prefix is the text before the %, the letter says how
+            // to read the rest. The variable is written only on a match.
+            const auto& f = peel(*args[0]);
+            if (f.kind != slang::ast::ExpressionKind::StringLiteral) unsupported("$value$plusargs format that is not a literal");
+            std::string fs(f.as<slang::ast::StringLiteral>().getValue());
+            size_t pc = fs.find('%');
+            if (pc == std::string::npos) unsupported("$value$plusargs format without a specifier");
+            size_t q = pc + 1;
+            while (q < fs.size() && isdigit((unsigned char)fs[q])) q++;
+            if (q >= fs.size()) unsupported("$value$plusargs format");
+            char c = (char)tolower((unsigned char)fs[q]);
+            if (std::string_view("dhxobsfeg").find(c) == std::string_view::npos) unsupported("$value$plusargs format letter");
+            if (!stmtDepth) unsupported("$value$plusargs outside a procedural statement");
+            E pre = konst(mkstr(fs.substr(0, pc)));
+            int found = fresh(32);
+            Instr t; t.k = IK::Assign; t.sig = found; t.e = sysFnNode(SF_PLUS_TEST, {pre});
+            prog.emit(t);
+            Instr j; j.k = IK::JmpIfNot; j.e = ref(found);
+            size_t jf = prog.emit(j);
+            const slang::ast::Expression& dst = outArg(*args[1]);
+            Instr w; w.k = IK::Assign;
+            lhs(dst, w);
+            E v = sysFnNode(SF_PLUS_VALUE, {pre}, c);
+            if (dst.type->isString()) {
+                if (c != 's') unsupported("$value$plusargs into a string with a number format");
+            } else if (dst.type->isFloating()) {
+                if (c != 'f' && c != 'e' && c != 'g') v = un(Op::IToR, v);
+            } else if (c == 's') {
+                v = node(Op::StrToInt, {v});
+                v->hi = (int)dst.type->getBitWidth();
+            } else if (c == 'f' || c == 'e' || c == 'g') {
+                v = rtoi(v, (int)dst.type->getBitWidth(), dst.type->isSigned(), false);
+            } else {
+                v = resize(v, (int)dst.type->getBitWidth(), true, dst.type->isSigned());
+            }
+            w.e = v;
+            prog.emit(w);
+            prog.code[jf].target = prog.here();
+            return ref(found, true);
+        }
+        return nullptr;
+    }
     // %p (21.2.1.6): the format text and arguments that print value v of
     // type t as an assignment pattern. Integral values print in decimal (as
     // unformatted), enums by name, strings in quotes, packed structs and
@@ -1831,6 +1945,14 @@ struct Lowerer {
             if (!pending.empty()) {
                 Spec sp = pending.front();
                 pending.pop_front();
+                if (sp.c == 't') {   // %t (20.4.3): the value is in this module's units
+                    const Expression& x = peel(*a);
+                    E v = expr(*a);
+                    if (x.type->isFloating()) v = bin(Op::FMul, realOf(*a), konst(mkreal((double)ticksPerUnit())));
+                    else if (ticksPerUnit() != 1) v = bin(Op::Mul, resize(v, 64, x.type->isSigned(), false), konst(mk(ticksPerUnit(), 64)));
+                    out.push_back(v);
+                    continue;
+                }
                 if (sp.c == 'p') {
                     std::string x;
                     pfmt(*a, x, out);
@@ -1868,7 +1990,7 @@ struct Lowerer {
         for (char c : file) { escFile += c; if (c == '%') escFile += '%'; }
         i.fmt = substM(std::string(sev) + ": \"" + escFile + "\", " + std::to_string(line) + ": %m: at time %0t", hierName);
         E t = node(Op::Time);
-        t->k = mk(ticksPerUnit(), 64);
+        t->k = mk(1, 64);   // %t takes kernel ticks
         i.args.push_back(t);
         if (!args.empty()) {
             i.fmt += "\n";
@@ -1919,7 +2041,7 @@ struct Lowerer {
             prog.emit(i);
             return;
         }
-        if (n == "$readmemh" || n == "$readmemb") {   // 21.4
+        if (n == "$readmemh" || n == "$readmemb" || n == "$writememh" || n == "$writememb") {   // 21.4, 21.5
             auto args = call.arguments();
             if (args.size() < 2) unsupported("$readmem arguments");
             const Expression& fn = peel(*args[0]);
@@ -1935,11 +2057,42 @@ struct Lowerer {
             auto it = arrMap().find(msym);
             if (it == arrMap().end()) unsupported("$readmem target that is not an unpacked array");
             if (it->second->dims.size() != 1) unsupported("$readmem into a multidimensional array");
-            Instr i; i.k = IK::ReadMem;
+            Instr i; i.k = n[1] == 'r' ? IK::ReadMem : IK::WriteMem;
             i.fmt = std::string(fn.as<StringLiteral>().getValue());
             i.arr = it->second;
-            i.hex = n == "$readmemh";
+            i.hex = n.ends_with('h');
             for (size_t a = 2; a < args.size() && a < 4; a++) i.args.push_back(expr(*args[a]));
+            prog.emit(i);
+            return;
+        }
+        if (n == "$printtimescale") {   // 20.4.2
+            auto expStr = [](int e) {
+                static const char* u[] = {"s", "ms", "us", "ns", "ps", "fs"};
+                int m = 1;
+                while (((e % 3) + 3) % 3) { e--; m *= 10; }
+                int k = -e / 3;
+                return std::to_string(m) + (k >= 0 && k <= 5 ? u[k] : "?");
+            };
+            auto args = call.arguments();
+            std::string name = scopeName(call);
+            int u = tsUnit, pr = tsPrec;
+            if (!args.empty()) {
+                const Expression& x = peel(*args[0]);
+                const Symbol* sym = x.kind == ExpressionKind::ArbitrarySymbol ? x.as<ArbitrarySymbolExpression>().symbol.get() : nullptr;
+                if (sym && sym->kind == SymbolKind::Root) { name = "$root"; u = pr = simPrecExp(); }
+                else if (sym && sym->kind == SymbolKind::Instance) {
+                    name = sym->getHierarchicalPath();
+                    auto ts = sym->as<InstanceSymbol>().body.getTimeScale();
+                    if (ts) { u = tsExp(ts->base); pr = tsExp(ts->precision); }
+                } else unsupported("$printtimescale of this argument");
+            }
+            Instr i; i.k = IK::Display;
+            i.fmt = escPct("Time scale of (" + name + ") is " + expStr(u) + " / " + expStr(pr));
+            prog.emit(i);
+            return;
+        }
+        if (E r = sysFn(call, n)) {   // a system function called as a task: its effect only
+            Instr i; i.k = IK::Assign; i.sig = fresh(64); i.e = resize(r, 64, false, false);
             prog.emit(i);
             return;
         }
@@ -1961,6 +2114,14 @@ struct Lowerer {
         else if (base == "$strobe") k = IK::Strobe;
         else if (base == "$monitor") k = IK::Monitor;
         else {
+            // Waveform tasks only change what msim -vcd writes, so skipping
+            // them changes no result. Any other task would be a silent wrong
+            // answer if it were skipped, so it is an error.
+            static const std::set<std::string_view> harmless = {
+                "$dumpfile", "$dumpvars", "$dumpon", "$dumpoff", "$dumpall", "$dumpflush", "$dumplimit",
+                "$dumpports", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
+                "$vcdpluson", "$vcdplusoff", "$vcdplusfile", "$shm_open", "$shm_probe", "$recordvars"};
+            if (!harmless.count(n)) unsupported(("system task " + std::string(n)).c_str());
             std::cerr << "lower: ignoring system call " << n << "\n";
             return;
         }
@@ -2706,6 +2867,44 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.e = e ? init->expr(*e) : konst(mk(0, (int)t.getBitWidth()));
         init->prog.emit(i);
     }
+    // Module path delays (30.4): (a => b) = d delays every change of output
+    // net b by d, like a net delay. Paths to one output must all have the same
+    // delays, since minisim does not pick a path by which input changed last.
+    std::map<int, std::vector<uint64_t>> pathDelays;
+    void handle(const slang::ast::TimingPathSymbol& tp) {
+        using namespace slang::ast;
+        Lowerer d(sigmap);
+        prep(d);
+        d.setScope(tp.getParentScope());
+        std::vector<uint64_t> dl;
+        auto ds = tp.getDelays();
+        if (ds.size() != 1 && ds.size() != 2 && ds.size() != 3) Lowerer::unsupported("a path delay with 6 or 12 values");
+        for (const Expression* e : ds) {
+            Instr t;
+            d.delayInto(*e, t);
+            if (t.de) Lowerer::unsupported("a path delay that is not constant");
+            dl.push_back(t.delay);
+        }
+        for (const Expression* o : tp.getOutputs()) {
+            const Expression& x = Lowerer::peel(*o);
+            if (x.kind != ExpressionKind::NamedValue) Lowerer::unsupported("a path to a select of an output");
+            const Symbol& sym = x.as<NamedValueExpression>().symbol;
+            if (sym.kind != SymbolKind::Net) Lowerer::unsupported("a path delay to a variable output");
+            int sg = sigmap.at(&sym);
+            auto [it, fresh] = pathDelays.emplace(sg, dl);
+            if (!fresh && it->second != dl) Lowerer::unsupported("paths with different delays to one output");
+        }
+    }
+    void finishPaths() {
+        for (auto& [sg, dl] : pathDelays) {
+            bool any = false;
+            for (auto v : dl) any |= v != 0;
+            if (!any) continue;
+            for (auto& nd : out.netDelays)
+                if (nd.first == sg) Lowerer::unsupported("a path delay to a net that also has a net delay");
+            out.netDelays.push_back({sg, dl});
+        }
+    }
     // `wire y = a & b;` (IEEE 1800-2023 10.3.1) is a continuous assignment to y.
     // `wire #d w;` is a net delay: every change of w's resolved value takes
     // d to arrive (28.16). `wire #d w = a;` is instead a delayed continuous
@@ -3100,6 +3299,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
 
     ProcCollector pc(sigmap, out, std::move(newDriver), &subMap, mkSig, &tempSeq);
     comp.getRoot().visit(pc);
+    pc.finishPaths();
     pc.placeInit();
     rejectRecursive(order);
     for (const slang::ast::Symbol* b : blockIds().disabledFromOutside)

@@ -1,6 +1,5 @@
 // IEEE 1800-2023 30.4: A specify path delay delays the output of a module
 // (30.4, 30.5).
-//! xfail: specify path delays are ignored
 //! icarus-skip: Icarus 13 ignores specify delays unless run with -gspecify
 module buf2(input a, output b);
   assign b = a;

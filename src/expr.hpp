@@ -1261,8 +1261,34 @@ enum class Op {
     DynExists, // exists(kids[0])
     DynReduce, // hi: 0 sum, 1 product, 2 and, 3 or, 4 xor (7.12.3), at k.w bits
     ArrRead,   // element of an unpacked array; kids are one index per dimension
-    DynSlice   // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
+    DynSlice,  // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
+    SysFn      // hi: a SysFnId; kids are its arguments
 };
+// System functions computed by Op::SysFn.
+enum SysFnId : int {
+    SF_CLOG2,        // $clog2 (20.8.1)
+    SF_COUNTBITS,    // $countbits (20.9): lo is a mask of 1 << {0, 1, x=2, z=3}
+    SF_RANDOM,       // $random with no seed (20.14.1): the simulator's own seed
+    SF_RANDOM_SEED,  // $random(seed): {new seed, value}, 64 bits
+    SF_DIST_UNIFORM, // $dist_uniform(seed, start, end): {new seed, value}
+    SF_URANDOM,      // $urandom (18.13.1)
+    SF_URANDOM_SEED, // $urandom(seed)
+    SF_URANDOM_RANGE, // $urandom_range(max, min) (18.13.2)
+    SF_PLUS_TEST,    // $test$plusargs(prefix) (21.6); also "is there a match" for $value$plusargs
+    SF_PLUS_VALUE,   // the text after prefix kid0, read with format letter lo
+    SF_TIMEFORMAT    // $timeformat(units, precision, suffix, width) (20.4.3); returns 0
+};
+// How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
+// The default units are the simulation precision, with no decimals, no
+// suffix, and a minimum width of 20.
+struct TimeFmt {
+    int tickExp = -9;
+    int units = -9;
+    int prec = 0;
+    std::string suffix;
+    int width = 20;
+};
+inline TimeFmt& timeFmt() { static TimeFmt t; return t; }
 
 // A fixed-size unpacked array (IEEE 1800-2023 7.4) is `count` consecutive
 // signals starting at `base`, one per element, in row-major order. Each
@@ -1420,6 +1446,141 @@ inline int64_t v_to_i64(Val v) {
     }
     if (!neg && v.v > (uint64_t)INT64_MAX) return INT64_MAX;
     return (int64_t)v.v;
+}
+
+// $random and $dist_uniform follow the algorithm that IEEE 1800-2023 Annex N
+// defines, on 32-bit integers, so a seed gives the same values as other
+// simulators. The seed steps as seed = 69069 * seed + 1.
+inline double rtlUniform(int32_t& seed, int32_t start, int32_t end) {
+    if (seed == 0) seed = 259341593;
+    double a = 0.0, b = 2147483647.0;
+    if (start < end) { a = start; b = end; }
+    seed = (int32_t)(69069u * (uint32_t)seed + 1u);
+    uint32_t bits = ((uint32_t)seed >> 9) | 0x3f800000u;
+    float f;
+    memcpy(&f, &bits, 4);
+    double c = f;
+    c = c + c * 0.00000011920928955078125;
+    return (b - a) * (c - 1.0) + a;
+}
+inline int32_t rtlDistUniform(int32_t& seed, int32_t start, int32_t end) {
+    if (start >= end) return start;
+    auto flr = [](double r) { return r >= 0 ? (int64_t)r : (int64_t)(r - 1); };
+    int64_t i;
+    if (end != INT32_MAX) {
+        int64_t e1 = (int64_t)end + 1;
+        i = flr(rtlUniform(seed, start, (int32_t)e1));
+        if (i < start) i = start;
+        if (i >= e1) i = e1 - 1;
+    } else if (start != INT32_MIN) {
+        int64_t s1 = (int64_t)start - 1;
+        i = flr(rtlUniform(seed, (int32_t)s1, end) + 1.0);
+        if (i <= s1) i = s1 + 1;
+        if (i > end) i = end;
+    } else {
+        double r = (rtlUniform(seed, start, end) + 2147483648.0) / 4294967295.0;
+        r = r * 4294967296.0 - 2147483648.0;
+        i = flr(r);
+    }
+    return (int32_t)i;
+}
+inline int32_t& globalRandomSeed() { static int32_t s = 0; return s; }
+// $urandom: the generator is implementation-defined (18.13). minisim uses
+// one 64-bit xorshift* stream, seeded by -seed (default 1), so a run repeats.
+inline uint64_t& urandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
+inline uint32_t urandomNext(uint64_t& s) {
+    s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+    return (uint32_t)((s * 0x2545F4914F6CDD1Dull) >> 32);
+}
+// Runtime plusargs (21.6): every +arg on the command line, without the +.
+inline std::vector<std::string>& plusArgs() { static std::vector<std::string> v; return v; }
+inline const std::string* findPlusArg(const std::string& prefix) {
+    for (const auto& p : plusArgs())
+        if (p.compare(0, prefix.size(), prefix) == 0) return &p;
+    return nullptr;
+}
+inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
+    auto u64 = [](const Val& v) { return v.v & ~v.x & mask(std::min(64, v.w)); };
+    auto i32 = [&](const Val& v) { return (int32_t)(uint32_t)u64(v); };
+    auto sint = [](int64_t x) { Val r = make((uint64_t)(uint32_t)x, 0, 32, 0); r.sgn = true; return r; };
+    switch (id) {
+        case SF_CLOG2: {
+            if (anyX(a[0])) return xfill(32, true);
+            // the ceiling of log2, for a value up to its full width
+            int top = -1, ones = 0;
+            for (int b = 0; b < a[0].w; b++) if (bitAt(a[0], b) == 1) { top = b; ones++; }
+            return sint(top < 0 ? 0 : ones == 1 ? top : top + 1);
+        }
+        case SF_COUNTBITS: {
+            int n = 0;
+            for (int b = 0; b < a[0].w; b++) if (ctl & (1 << bitAt(a[0], b))) n++;
+            return sint(n);
+        }
+        case SF_RANDOM: return sint(rtlDistUniform(globalRandomSeed(), INT32_MIN, INT32_MAX));
+        case SF_RANDOM_SEED:
+        case SF_DIST_UNIFORM: {
+            int32_t seed = i32(a[0]);
+            int32_t r = id == SF_RANDOM_SEED ? rtlDistUniform(seed, INT32_MIN, INT32_MAX)
+                                             : rtlDistUniform(seed, i32(a[1]), i32(a[2]));
+            return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
+        }
+        case SF_URANDOM: return make(urandomNext(urandomState()), 0, 32, 0);
+        case SF_URANDOM_SEED: {
+            uint64_t s = (u64(a[0]) + 1) * 0x9E3779B97F4A7C15ull;
+            if (!s) s = 1;
+            urandomState() = s;
+            return make(urandomNext(urandomState()), 0, 32, 0);
+        }
+        case SF_URANDOM_RANGE: {
+            uint32_t hi = (uint32_t)u64(a[0]), lo = a.size() > 1 ? (uint32_t)u64(a[1]) : 0;
+            if (hi < lo) std::swap(hi, lo);
+            uint64_t span = (uint64_t)hi - lo + 1;
+            uint32_t r = urandomNext(urandomState());
+            return make(lo + (uint32_t)(r % span), 0, 32, 0);
+        }
+        case SF_PLUS_TEST: {
+            Val p = a[0]; p.str = true;
+            return make(findPlusArg(v_str(p)) ? 1 : 0, 0, 32, 0, true);
+        }
+        case SF_TIMEFORMAT: {
+            TimeFmt& t = timeFmt();
+            auto i64 = [&](const Val& v) { return v_to_i64(v); };
+            if (a.empty()) { t.units = t.tickExp; t.prec = 0; t.suffix.clear(); t.width = 20; }
+            if (a.size() > 0) t.units = (int)i64(a[0]);
+            if (a.size() > 1) t.prec = (int)i64(a[1]);
+            if (a.size() > 2) { Val s = a[2]; s.str = true; t.suffix = v_str(s); }
+            if (a.size() > 3) t.width = (int)i64(a[3]);
+            return make(0, 0, 1, 0);
+        }
+        case SF_PLUS_VALUE: {   // the caller has checked that a match exists
+            Val p = a[0]; p.str = true;
+            const std::string& pre = v_str(p);
+            const std::string* m = findPlusArg(pre);
+            std::string t = m ? m->substr(pre.size()) : "";
+            if (ctl == 's') return mkstr(t);
+            if (ctl == 'f' || ctl == 'e' || ctl == 'g') { Val r = make(0, 0, 64, 0); double d = atof(t.c_str()); memcpy(&r.v, &d, 8); r.real = true; return r; }
+            int base = ctl == 'h' || ctl == 'x' ? 16 : ctl == 'o' ? 8 : ctl == 'b' ? 2 : 10;
+            uint64_t v = 0, x = 0;
+            bool neg = false;
+            size_t i = 0;
+            if (base == 10 && i < t.size() && (t[i] == '-' || t[i] == '+')) neg = t[i++] == '-';
+            int bits = base == 16 ? 4 : base == 8 ? 3 : 1;
+            for (; i < t.size(); i++) {
+                char c = (char)tolower((unsigned char)t[i]);
+                if (c == '_') continue;
+                if (base != 10 && (c == 'x' || c == 'z')) { v <<= bits; x = (x << bits) | mask(bits); continue; }
+                int d = isdigit((unsigned char)c) ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : 99;
+                if (d >= base) break;
+                v = base == 10 ? v * 10 + d : (v << bits) | d;
+                x <<= base == 10 ? 0 : bits;
+            }
+            if (neg) v = ~v + 1;
+            Val r = make(v, x, 64, 0);
+            r.sgn = base == 10;
+            return r;
+        }
+    }
+    return xfill(32, false);
 }
 
 inline Val eval(const E& e, const Reader& rd) {
@@ -1619,6 +1780,11 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::Time: {   // k.v ticks per time unit of the calling module
             uint64_t d = e->k.v ? e->k.v : 1;
             return make((g_simTime + d / 2) / d, 0, 64, 0);
+        }
+        case Op::SysFn: {
+            std::vector<Val> a;
+            for (size_t i = 0; i < e->kids.size(); i++) a.push_back(k((int)i));
+            return v_sysfn(e->hi, e->lo, a);
         }
         case Op::DynSlice: {
             Val a = k(0), i = k(1);

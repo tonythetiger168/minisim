@@ -38,6 +38,7 @@ enum class IK {
     Call,       // push (this prog, pc+1) and transfer to callee
     Fork,       // start each of `branches` as a process; join 0 = all, 1 = any, 2 = none
     ReadMem,    // $readmemh / $readmemb into `arr` (fmt is the file name)
+    WriteMem,   // $writememh / $writememb of `arr` (21.5), the same fields as ReadMem
     Disable,    // disable <block> run by other processes: end every process whose root is block `sig`
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)

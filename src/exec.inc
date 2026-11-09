@@ -40,6 +40,43 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
     return true;
 }
 
+// $writememh / $writememb (21.5): one word per line, every digit written
+// (x and z as x and z), no @ addresses. The default range is the whole
+// memory, lowest address first; start and finish pick a range and order.
+static void writeMem(const Instr& i) {
+    const ArrShape& a = *i.arr;
+    auto [l, r] = a.dims[0];
+    int64_t lowA = std::min(l, r), highA = std::max(l, r);
+    int64_t start = lowA, finish = highA;
+    if (i.args.size() > 0) { Val v = eval(i.args[0], rd); if (!v.x) start = v_to_i64(v); }
+    if (i.args.size() > 1) { Val v = eval(i.args[1], rd); if (!v.x) finish = v_to_i64(v); }
+    std::ofstream out(i.fmt);
+    if (!out) { std::cerr << "$writemem: cannot open " << i.fmt << "\n"; return; }
+    int64_t step = finish < start ? -1 : 1;
+    for (int64_t ad = start;; ad += step) {
+        int64_t off = a.offset({ad});
+        if (off >= 0) {
+            Val v = S.get(a.base + (int)off);
+            v.sgn = false;
+            int bits = i.hex ? 4 : 1;
+            int n = (a.elemW + bits - 1) / bits;
+            std::string s(n, '0');
+            for (int d = 0; d < n; d++) {
+                int val = 0, xs = 0, zs = 0, cnt = 0;
+                for (int b = 0; b < bits && d * bits + b < a.elemW; b++, cnt++) {
+                    int t = bitAt(v, d * bits + b);
+                    if (t == 1) val |= 1 << b;
+                    else if (t == 2) xs++;
+                    else if (t == 3) zs++;
+                }
+                s[n - 1 - d] = zs == cnt ? 'z' : (xs || zs) ? 'x' : "0123456789abcdef"[val];
+            }
+            out << s << "\n";
+        }
+        if (ad == finish) break;
+    }
+}
+
 // $readmemh / $readmemb (21.4) into a one-dimensional memory. Addresses are
 // index values. Without a range, loading starts at the lowest address and goes
 // up; with start and finish it goes from start toward finish. "@hex" in the
@@ -363,6 +400,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 pc++; break;
             }
             case IK::ReadMem: readMem(i); pc++; break;
+            case IK::WriteMem: writeMem(i); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::JmpIfNot:  pc = (truth(eval(i.e, rd)) == 1) ? pc + 1 : i.target; break;
             case IK::Jmp:       pc = i.target; break;

@@ -1,6 +1,5 @@
 // IEEE 1800-2023 20.4: $timeformat sets the units, precision, suffix and
 // width that %t uses (20.4.3).
-//! xfail: $timeformat is ignored
 `timescale 1ns/1ps
 module top;
   initial begin

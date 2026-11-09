@@ -1,6 +1,5 @@
 // IEEE 1800-2023 21.5: $writememh / $writememb write a memory that
 // $readmemh / $readmemb read back (21.5).
-//! xfail: $writememh is ignored
 module top;
   logic [7:0] m[4], n[4];
   initial begin

@@ -760,6 +760,44 @@ struct Sim {
         if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
         return body;
     }
+    // A time in kernel ticks, in the units, precision and suffix $timeformat
+    // set (20.4.3), right-justified to its minimum width (or minW if given).
+    static string fmtTime(Val v, int minW) {
+        const TimeFmt& tf = timeFmt();
+        string body;
+        if (v.real) {
+            double d = v_real(v) * std::pow(10.0, tf.tickExp - tf.units);
+            char buf[512];
+            snprintf(buf, sizeof buf, "%.*f", std::max(0, tf.prec), d);
+            body = buf;
+        } else if (anyX(v)) {
+            body = fmtVal('d', v, 0, true);
+        } else {
+            unsigned __int128 t = (unsigned __int128)(v.v & mask(std::min(64, v.w)));
+            auto p10 = [](int n) { unsigned __int128 r = 1; while (n-- > 0) r *= 10; return r; };
+            int sh = tf.tickExp - tf.units;   // ticks -> units: * 10^sh
+            int pr = std::max(0, tf.prec);
+            // value * 10^pr, rounded to an integer
+            unsigned __int128 q;
+            if (sh + pr >= 0) q = t * p10(sh + pr);
+            else { unsigned __int128 d = p10(-(sh + pr)); q = (t + d / 2) / d; }
+            auto u128 = [](unsigned __int128 x) {
+                string r;
+                do { r += char('0' + (int)(x % 10)); x /= 10; } while (x);
+                return string(r.rbegin(), r.rend());
+            };
+            unsigned __int128 P = p10(pr);
+            body = u128(q / P);
+            if (pr > 0) {
+                string f = u128(q % P);
+                body += "." + string(pr - f.size(), '0') + f;
+            }
+        }
+        body += tf.suffix;
+        int w = minW >= 0 ? minW : tf.width;
+        if ((int)body.size() < w) body = string(w - body.size(), ' ') + body;
+        return body;
+    }
     // The text of a format and its arguments ($display, $sformatf).
     static string sformat(const string& fmt, const vector<E>& args, const Reader& rd) {
         std::ostringstream cout;
@@ -809,6 +847,13 @@ struct Sim {
                     for (size_t k = 0; k < o.vec.size(); k++) cout << (k ? ", " : "") << one(o.vec[k], style);
                 }
                 cout << '}';
+                continue;
+            }
+            if ((c == 't' || c == 'T') && ai < args.size()) {   // %t (20.4.3): ticks, printed per $timeformat
+                Val v = eval(args[ai++], rd);
+                string out = fmtTime(v, (zero || minW > 0) ? minW : -1);
+                if (left && (int)out.size() < minW) out += string(minW - out.size(), ' ');
+                cout << out;
                 continue;
             }
             char lc = (char)tolower((unsigned char)c);

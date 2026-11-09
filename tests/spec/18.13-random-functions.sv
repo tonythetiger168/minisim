@@ -1,6 +1,5 @@
 // IEEE 1800-2023 18.13: $urandom, $urandom_range and $random return values
 // in range (18.13).
-//! xfail: $urandom/$random are errors
 module top;
   int a, ok = 1;
   int unsigned u;

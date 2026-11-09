@@ -12,7 +12,8 @@
 //   +vcd             same as -vcd dump.vcd
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
-//   +<plusarg>       any other +arg is a runtime plusarg (kept for $test$plusargs, not yet read)
+//   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
+//   -seed <n>        seed for $urandom / $urandom_range (also +ntb_random_seed=<n>)
 //   -compile         compiled mode: generate C++ for the design (codegen.hpp),
 //                    build it with a C++ compiler into <dir>/simv, and run it.
 //                    A design codegen cannot translate runs on the interpreter.
@@ -200,6 +201,7 @@ int main(int argc, char** argv) {
     // Pass 1: take msim's own options out; translate VCS spellings for slang.
     std::vector<std::string> fwd{argv[0]};
     std::vector<std::string> plusargs;
+    uint64_t seed = 0;
     std::optional<std::string> vcdPath;
     uint64_t maxTime = ~0ULL;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true;
@@ -251,8 +253,24 @@ int main(int argc, char** argv) {
             catch (...) { std::cerr << "msim: bad -maxtime " << n << "\n"; return 2; }
             continue;
         }
+        if (a == "-seed") {
+            std::string n = next("a seed");
+            try { seed = std::stoull(n); }
+            catch (...) { std::cerr << "msim: bad -seed " << n << "\n"; return 2; }
+            continue;
+        }
+        if (startsWith(a, "+ntb_random_seed=")) {
+            try { seed = std::stoull(a.substr(17)); }
+            catch (...) { std::cerr << "msim: bad " << a << "\n"; return 2; }
+            continue;
+        }
         if (a.size() > 1 && a[0] == '+' && !slangPlus(a)) { plusargs.push_back(a.substr(1)); continue; }
         fwd.push_back(a);
+    }
+    plusArgs() = plusargs;
+    if (seed) {   // the $urandom stream (18.13); $random keeps its own seed (Annex N)
+        uint64_t st = (seed + 1) * 0x9E3779B97F4A7C15ull;
+        urandomState() = st ? st : 1;
     }
 
     // Pass 2: slang parses, elaborates and reports diagnostics.
@@ -279,6 +297,7 @@ int main(int argc, char** argv) {
         std::cerr << "msim: " << ex.what() << "\n";
         return 1;
     }
+    timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
     if (lowered.procs.empty()) {
         std::cerr << "msim: design has no processes to run\n";
         return 1;

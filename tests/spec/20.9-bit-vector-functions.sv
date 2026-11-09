@@ -1,6 +1,5 @@
 // IEEE 1800-2023 20.9: $countbits, $countones, $onehot, $onehot0,
 // $isunknown (20.9).
-//! xfail: bit vector functions are errors
 module top;
   initial begin
     $display("%0d %0d %0d", $countones(8'hf0), $countbits(8'b1x0z_1100, 1'b1), $countbits(8'b1x0z_1100, 1'bx, 1'bz));

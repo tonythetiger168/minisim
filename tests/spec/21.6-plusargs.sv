@@ -1,6 +1,5 @@
 // IEEE 1800-2023 21.6: $test$plusargs and $value$plusargs with no plusargs
 // given (21.6).
-//! xfail: plusargs are errors
 module top;
   int v = 5;
   initial begin
