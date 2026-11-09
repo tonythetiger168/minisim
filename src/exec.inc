@@ -184,6 +184,8 @@ inline void dynExec(const Instr& i) {
     // Container ids may be relative (automatic variables): resolve them once.
     const int sig = R(i.sig), dsrc = i.dsrc >= 0 ? R(i.dsrc) : -1;
     const int dres = i.dres >= 0 ? R(i.dres) : -1, dkey = i.dkey >= 0 ? R(i.dkey) : -1;
+    if (i.dcmd != D_DELETE && i.dcmd != D_DELETE_AT && i.dcmd != D_FIRST && i.dcmd != D_LAST && i.dcmd != D_NEXT && i.dcmd != D_PREV)
+        dynAttach(sig);
     auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };

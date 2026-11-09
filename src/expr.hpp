@@ -823,14 +823,28 @@ struct DynObj {
     Val dflt;                   // what a missing element reads as
     int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
     bool strKey = false;        // associative: string index
+    bool wideKey = false;       // associative: an integral index wider than 64 bits, kept as big-endian bytes in DynKey::s
     int keyW = 64;
     bool keySgn = true;
+    // A container of containers (7.5-7.10 with an unpacked dimension that is
+    // itself a container): each element is the 64-bit signal id of an inner
+    // container shaped like `sub` (0: none yet). Made on first write.
+    std::shared_ptr<const struct FrameLayout> sub;
     DynKey key(const Val& k) const {
         DynKey d;
         if (strKey) {   // a signal holds a string as its pool id, without the flag
             Val t = k;
             t.str = true;
             d.s = v_str(t);
+            return d;
+        }
+        if (wideKey) {
+            Val t = v_resize(k, keyW, false);
+            for (int b = (keyW + 7) / 8 - 1; b >= 0; b--) {
+                unsigned char c = 0;
+                for (int j = 0; j < 8 && 8 * b + j < keyW; j++) if (bitAt(t, 8 * b + j) == 1) c |= (unsigned char)(1u << j);
+                d.s += (char)c;
+            }
             return d;
         }
         uint64_t u = k.v & ~k.x & mask(keyW);
@@ -840,6 +854,16 @@ struct DynObj {
     }
     Val keyVal(const DynKey& d) const {
         if (strKey) return mkstr(d.s);
+        if (wideKey) {
+            Val v = make(0, 0, keyW);
+            int nb = (int)d.s.size();
+            for (int i = 0; i < nb; i++) {
+                int b = nb - 1 - i;
+                unsigned char c = (unsigned char)d.s[(size_t)i];
+                for (int j = 0; j < 8 && 8 * b + j < keyW; j++) if ((c >> j) & 1) setBit(v, 8 * b + j, 1);
+            }
+            return finish(v);
+        }
         uint64_t u = keySgn ? (uint64_t)d.i : ((uint64_t)d.i ^ (1ULL << 63));
         Val v = make(u, 0, keyW);
         v.sgn = keySgn;
@@ -1331,7 +1355,9 @@ enum class Op {
     This,      // the running method's `this`
     IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
     Addr,      // the signal id of slot `sig` of the object kids[0] names, or 0 for null
-    AddrOf     // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    DynStrJoin, // the strings in container sig, joined ({>>{q}} of a string queue, 11.4.14)
+    DynSub     // id + 1 of the inner container at key kids[0] of container of containers sig
 };
 // System functions computed by Op::SysFn.
 enum SysFnId : int {
@@ -2039,6 +2065,42 @@ inline int relSlow(int s) {
     if (!f) relFail("automatic variable outside its frame");
     return f->base + off;
 }
+// Containers of containers: an inner container that a read made but nothing
+// has written yet is not an element of its outer container until a write
+// (pendingSub; dynAttach puts it in), so reading a[k][j] does not add a[k].
+struct PendingSub { int outer; Val key; };
+inline std::unordered_map<int, PendingSub>& pendingSub() { static std::unordered_map<int, PendingSub> m; return m; }
+inline std::map<std::pair<int, DynKey>, int>& pendingAt() { static std::map<std::pair<int, DynKey>, int> m; return m; }
+inline int dynSubOf(int outer, const Val& key) {
+    DynObj& d = dynStore()[outer];
+    Val cur = d.get(key);
+    if (!cur.x && cur.v) return (int)cur.v;
+    if (!d.sub) relFail("container of containers without an inner shape");
+    auto at = std::make_pair(outer, d.key(key));
+    if (auto it = pendingAt().find(at); it != pendingAt().end()) return it->second;   // read again before a write
+    int id = g_allocSigs(*d.sub);
+    g_initSigs(*d.sub, id);
+    pendingSub()[id] = {outer, key};
+    pendingAt()[at] = id;
+    return id;
+}
+// A write to inner container `sig`: make it an element of its outer one.
+inline void dynAttach(int sig) {
+    if (pendingSub().empty()) return;
+    auto it = pendingSub().find(sig);
+    if (it == pendingSub().end()) return;
+    PendingSub p = it->second;
+    pendingSub().erase(it);
+    DynObj& d = dynStore()[p.outer];
+    pendingAt().erase(std::make_pair(p.outer, d.key(p.key)));
+    Val id = make((uint64_t)sig, 0, 64);
+    if (d.kind == 2) d.map[d.key(p.key)] = id;
+    else if (!p.key.x) {
+        int64_t i = v_to_i64(p.key);
+        if (i >= 0 && i < (int64_t)d.vec.size()) d.vec[(size_t)i] = id;
+        else if (d.kind == 1 && i == (int64_t)d.vec.size()) d.vec.push_back(id);
+    }
+}
 // The signal id a (possibly relative) id names right now.
 inline int R(int s) { return s < kRel ? s : relSlow(s); }
 // Every signal `e` reads, resolved now (a wait on automatic variables).
@@ -2207,6 +2269,14 @@ inline Val eval(const E& e, const Reader& rd) {
             return mkstr(s);
         }
         case Op::DynGet: return dynStore()[R(e->sig)].get(k(0));
+        case Op::DynStrJoin: {
+            auto& d = dynStore()[R(e->sig)];
+            std::string r;
+            if (d.kind == 2) for (auto& [key, v] : d.map) { Val t = v; t.str = true; r += v_str(t); }
+            else for (auto& v : d.vec) { Val t = v; t.str = true; r += v_str(t); }
+            return mkstr(r);
+        }
+        case Op::DynSub: return make((uint64_t)dynSubOf(R(e->sig), k(0)) + 1, 0, 64);
         case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {
             auto& d = dynStore()[R(e->sig)];

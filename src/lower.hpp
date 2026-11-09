@@ -237,8 +237,8 @@ inline int uWidth(const slang::ast::Type& t0) {
         }
         return w;
     }
-    if (t.isUnpackedArray() || t.isClass() || t.isEvent() || t.isCHandle() || t.isVirtualInterface()) return -1;
-    return storeW(t);
+    if (t.isUnpackedArray() || t.isEvent() || t.isVirtualInterface()) return -1;
+    return storeW(t);   // a class handle or chandle member is a 64-bit handle
 }
 // Offset and width of field f inside unpacked struct or union t.
 inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::FieldSymbol& f) {
@@ -254,6 +254,7 @@ inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::
     }
     return {after, fw};
 }
+inline Val structDefaultVal(const slang::ast::Type& t0);
 // A class handle (8), chandle, or null: a 64-bit signal holding an object's
 // first signal id (0 is null).
 inline bool isHandleType(const slang::ast::Type& t) { return t.isClass() || t.isNull() || t.isCHandle(); }
@@ -286,6 +287,7 @@ struct Subr {
     int retSig = -1;
     int retW = 1;
     bool retSgn = false;
+    bool retDyn = false;          // returns a queue, dynamic or associative array: retSig is its frame slot
     struct Arg {
         int sig = -1;
         slang::ast::ArgumentDirection dir = slang::ast::ArgumentDirection::In;
@@ -670,7 +672,12 @@ struct Lowerer {
             ps.arr = shape;
             return ps;
         }
-        if (t.isUnpackedStruct() || t.isUnpackedUnion()) unsupported("unpacked struct as an automatic variable or class property");
+        if (t.isUnpackedStruct() || t.isUnpackedUnion()) {   // one vector, as for a static one (7.2)
+            int w = uWidth(t);
+            if (w <= 0) unsupported("unpacked struct with an array or event member as an automatic variable or class property");
+            ps.off = L->add(w, structDefaultVal(t));
+            return ps;
+        }
         ps.off = L->add(storeW(t), initOf(t));
         return ps;
     }
@@ -1558,7 +1565,32 @@ struct Lowerer {
         const auto& p = peel(e);   // a literal keeps its text, whatever its length
         if (p.kind == slang::ast::ExpressionKind::StringLiteral)
             return konst(mkstr(std::string(p.as<slang::ast::StringLiteral>().getValue())));
+        if (E j = streamStrings(p)) return j;
         return un(Op::IntToStr, expr(e));
+    }
+    // {>>{s, q}} of strings and string containers (11.4.14): their text, joined.
+    E streamStrings(const slang::ast::Expression& p) {
+        using namespace slang::ast;
+        if (p.kind != ExpressionKind::Streaming) return nullptr;
+        const auto& sc = p.as<StreamingConcatenationExpression>();
+        if (!sc.isFixedSize() && false) return nullptr;
+        if (sc.getSliceSize() != 0) return nullptr;
+        std::vector<E> parts;
+        for (auto& st : sc.streams()) {
+            const Expression& op = peel(*st.operand);
+            if (st.withExpr) return nullptr;
+            if (op.type->isString()) { parts.push_back(exprStr(op)); continue; }
+            if (isDynType(*op.type) && op.type->getArrayElementType() && op.type->getArrayElementType()->isString()) {
+                int d = dynSig(op);
+                if (d < 0) return nullptr;
+                auto j = node(Op::DynStrJoin);
+                j->sig = d;
+                parts.push_back(j);
+                continue;
+            }
+            return nullptr;
+        }
+        return node(Op::StrCat, std::move(parts));
     }
     static int strMethodId(std::string_view n) {
         static const std::pair<const char*, int> t[] = {
@@ -2063,6 +2095,33 @@ struct Lowerer {
             if (!shape) unsupported("container property shape");
             int d = indSlot(exprH(m.value()), ps->off);
             indShape[d] = *shape;
+            return d;
+        }
+        if (e.kind == ExpressionKind::Call && isDynType(*e.type) && !e.as<CallExpression>().isSystemCall()) {
+            // f() returning a container: copy it out of the frame it returned from
+            const auto& call = e.as<CallExpression>();
+            const auto* sym = std::get<const SubroutineSymbol*>(call.subroutine);
+            if (!subs || !sym) return -1;
+            auto it = subs->find(sym);
+            if (it == subs->end() || !it->second->retDyn) return -1;
+            emitUserCall(call, false);
+            int t = dynTemp(dynShapeOf(*e.type));
+            Instr i = dynCmd(t, D_COPY); i.dsrc = relSig(kRelRet, it->second->retSig); prog.emit(i);
+            return t;
+        }
+        if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // a[k] of a container of containers
+            const auto& es = e.as<ElementSelectExpression>();
+            int outer = dynSig(es.value());
+            if (outer < 0) return -1;
+            const DynObj& os = dynShape(outer);
+            if (!os.sub) unsupported("container element of this kind");
+            auto n = node(Op::DynSub, {dynKey(outer, es.selector())});
+            n->sig = outer;
+            int tmp = fresh(64);
+            Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
+            prog.emit(i);
+            int d = indThrough(tmp);
+            indShape[d] = os.sub->dyn[0].second;
             return d;
         }
         if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) return -1;
@@ -2671,6 +2730,9 @@ struct Lowerer {
         if (sym.kind == SymbolKind::Parameter) cv = &sym.as<ParameterSymbol>().getValue();
         else if (sym.kind == SymbolKind::EnumValue) cv = &sym.as<EnumValueSymbol>().getValue();
         else if (const auto* c = e.getConstant()) cv = c;
+        if (cv && cv->isString()) return konst(mkstr(cv->str()));   // a string parameter
+        if (cv && cv->isReal()) return konst(mkreal(cv->real()));
+        if (cv && cv->isShortReal()) return konst(mkreal((double)(float)cv->shortReal()));
         if (!cv || !cv->isInteger()) unsupported("reference to non-signal symbol");
         return svLit(cv->integer(), e.type->isSigned(), ctx);
     }
@@ -5209,7 +5271,8 @@ struct Lowerer {
             }
             case StatementKind::Return: {
                 const auto& r = s.as<ReturnStatement>();
-                if (r.expr) {
+                if (r.expr && current && current->retDyn) assignContainer(retSig, *r.expr);
+                else if (r.expr) {
                     if (retSig < 0) unsupported("return value");
                     Instr i;
                     i.k = IK::Assign;
@@ -5268,6 +5331,31 @@ struct Lowerer {
                 // foreach; continue steps the innermost loop.
                 const auto& f = s.as<ForeachLoopStatement>();
                 if (int d = dynSig(f.arrayRef); d >= 0) { foreachDyn(f, d); break; }
+                if (f.arrayRef.type->isString()) {   // foreach (s[i]): 0 .. s.len()-1
+                    const ValueSymbol* lvar = nullptr;
+                    for (const auto& d : f.loopDims) if (d.loopVar) lvar = d.loopVar;
+                    if (!lvar) { break; }
+                    int v = fresh(32);
+                    bindVar(lvar, v);
+                    Instr init; init.k = IK::Assign; init.sig = v; init.e = konst(make(0, 0, 32, 0, true));
+                    prog.emit(init);
+                    size_t top = prog.here();
+                    auto len = node(Op::StrMethod, {exprStr(f.arrayRef)});
+                    len->hi = S_LEN;
+                    Instr j; j.k = IK::JmpIfNot;
+                    j.e = bin(Op::Lt, ref(v, true), resize(len, 32, false, true));
+                    size_t jf = prog.emit(j);
+                    loops.push_back({});
+                    stmt(f.body);
+                    patch(loops.back().continues, prog.here());
+                    Instr inc; inc.k = IK::Assign; inc.sig = v; inc.e = bin(Op::Add, ref(v, true), konst(make(1, 0, 32, 0, true)));
+                    prog.emit(inc);
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    prog.code[jf].target = prog.here();
+                    patch(loops.back().breaks, prog.here());
+                    loops.pop_back();
+                    break;
+                }
                 struct Lvl { int var; int64_t right; bool up; size_t top, jf; };
                 std::vector<Lvl> lv;
                 for (const auto& d : f.loopDims) {
@@ -5578,6 +5666,33 @@ struct Lowerer {
 
 // Skip bodies slang built only for name lookup. Arrays and interfaces are
 // later limits, so they stay a hard error instead of a silent wrong netlist.
+// The default value of an unpacked struct or union, as one vector (7.2).
+inline Val structDefaultVal(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    int W = uWidth(t);
+    Val r = make(0, 0, W);
+    if (t.isUnpackedUnion()) {
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+            const Type& ft = f.getType().getCanonicalType();
+            if (ft.isIntegral() && ft.isFourState()) r = xfill(W);
+            break;
+        }
+        return r;
+    }
+    int top = W;
+    for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+        const Type& ft = f.getType().getCanonicalType();
+        int w = uWidth(ft);
+        top -= w;
+        Val p;
+        if (ft.isUnpackedStruct() || ft.isUnpackedUnion()) p = structDefaultVal(ft);
+        else if (ft.isIntegral() && ft.isFourState()) p = xfill(w);
+        else p = make(0, 0, w);
+        copyBits(r, top, p, 0, w);
+    }
+    return finish(r);
+}
 // The empty shape of a container type (7.5, 7.8, 7.10).
 inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
     using namespace slang::ast;
@@ -5599,12 +5714,22 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
             else if (kt.isIntegral() && kt.getBitWidth() <= 64) {
                 o.keyW = (int)kt.getBitWidth();
                 o.keySgn = kt.isSigned();
-            } else unsupported("associative array index type");
+            } else if (kt.isIntegral()) { o.wideKey = true; o.keyW = (int)kt.getBitWidth(); o.keySgn = false; } else if (isHandleType(kt)) { o.keyW = 64; o.keySgn = false; }   // class key: by handle
+            else throw std::runtime_error("lower: unsupported associative array index type " + kt.toString());
         } else { o.keyW = 64; o.keySgn = false; }   // [*]: integral keys, unsigned order
     } else {
         et = &t.as<DynamicArrayType>().elementType;
     }
     const Type& e = et->getCanonicalType();
+    if (isDynType(e)) {   // a container of containers: elements are inner container ids
+        auto L = std::make_shared<FrameLayout>();
+        L->name = "container";
+        L->add(64, make(0, 0, 64));
+        L->dyn.push_back({0, dynShapeOf(e)});
+        o.sub = L;
+        o.dflt = make(0, 0, 64);
+        return o;
+    }
     if (e.isFloating()) o.dflt = mkreal(0);
     else if (e.isString()) o.dflt = mkstr("");
     else if (isHandleType(e)) o.dflt = make(0, 0, 64);   // a class handle starts null
@@ -5613,7 +5738,9 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
         if (w > 64) unsupported("container element wider than 64 bits");
         o.dflt = e.isFourState() ? allx(w) : make(0, 0, w);
         o.dflt.sgn = e.isSigned();
-    } else unsupported("container element type");
+    } else if ((e.isUnpackedStruct() || e.isUnpackedUnion()) && uWidth(e) > 0) {
+        o.dflt = structDefaultVal(e);   // members' defaults
+    } else throw std::runtime_error("lower: unsupported container element type " + e.toString());
     return o;
 }
 
@@ -6487,6 +6614,7 @@ framedSubroutines(const std::vector<const slang::ast::SubroutineSymbol*>& all) {
         Scan sc;
         s->getBody().visit(sc);
         calls[s] = std::move(sc.callees);
+        if (Lowerer::isDynType(s->getReturnType())) { out.insert(s); continue; }   // the result is a frame container
         if (!isAutomatic(*s)) continue;
         if (s->subroutineKind == SubroutineKind::Task || isClassMethod(*s) || sc.forks) out.insert(s);
     }
@@ -6613,7 +6741,7 @@ inline ClassInfo* buildClass(const slang::ast::ClassType& ct,
         vslotMap()[sub] = slot;
         if (!sub->flags.has(MethodFlags::Pure)) {
             auto it = subMap.find(sub);
-            if (it == subMap.end()) Lowerer::unsupported("virtual method");
+            if (it == subMap.end()) throw std::runtime_error("lower: unsupported virtual method " + std::string(ct.name) + "::" + std::string(sub->name) + (Lowerer::skippedSubs().count(sub) ? " (" + Lowerer::skippedSubs()[sub] + ")" : ""));
             vt[(size_t)slot] = {it->second->prog, it->second->lay};
         }
     }
@@ -6731,6 +6859,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     srcMgr() = comp.getSourceManager();
     dynMap().clear();
     dynStore().clear();
+    pendingSub().clear();
+    pendingAt().clear();
     blockIds() = BlockIds{};
     Lowerer::covSM() = g_cov ? comp.getSourceManager() : nullptr;
     {   // alias statements (10.11), before any signal is made
@@ -6820,7 +6950,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     auto framed = framedSubroutines(finder.found);
     for (const slang::ast::SubroutineSymbol* sym : finder.found) {
         if (subMap.count(sym)) continue;
-        if (sym->returnValVar && sym->getReturnType().isUnpackedArray()) {
+        if (sym->returnValVar && sym->getReturnType().isUnpackedArray() && !Lowerer::isDynType(sym->getReturnType())) {
             // Returning an unpacked array is only supported when every call
             // is constant (13.4.3) and slang evaluates it; a call that needs
             // the function at run time reports this then.
@@ -6840,10 +6970,17 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             if (sym->returnValVar || !sym->getReturnType().isVoid()) {   // (pure and built-in methods have no returnValVar)
                 // The result is slot 0 and the arguments follow, so every
                 // override of a virtual method has them at the same slots.
+                if (Lowerer::isDynType(sym->getReturnType())) {   // a container result: a container slot
+                    if (sym->returnValVar) { setup.declLocal(*sym->returnValVar, sub->lay); sub->retSig = localDyn().at(sym->returnValVar).off; }
+                    else sub->retSig = Lowerer::declSlot(sym->getReturnType(), sub->lay).off;
+                    sub->retDyn = true;
+                    sub->retW = 64;
+                } else {
                 if (sym->returnValVar) setup.declLocal(*sym->returnValVar, sub->lay);
                 else sub->lay->add(storeW(sym->getReturnType()), Lowerer::initOf(sym->getReturnType()));
                 sub->retSig = sym->returnValVar ? localMap().at(sym->returnValVar).off : 0;
                 sub->retW = storeW(sym->getReturnType());
+                }
                 if (sub->retW <= 0) Lowerer::unsupported("function return width");
                 sub->retSgn = sym->getReturnType().isSigned();
             }
