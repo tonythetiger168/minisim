@@ -662,6 +662,23 @@ struct Lowerer {
         switch (e.kind) {
             case ExpressionKind::IntegerLiteral:
                 return svLit(e.as<IntegerLiteral>().getValue(), e.type->isSigned(), ctx);
+            case ExpressionKind::UnbasedUnsizedIntegerLiteral: {   // '0 '1 'x 'z fill their context (5.7.1)
+                auto b = e.as<UnbasedUnsizedIntegerLiteral>().getLiteralValue();
+                int w = ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
+                if (w <= 0) w = 1;
+                needWidth(w);
+                int bit = b.value == slang::logic_t::Z_VALUE ? 3 : b.isUnknown() ? 2 : b.value ? 1 : 0;
+                Val v;
+                if (w <= 64) {
+                    uint64_t m = mask(w);
+                    v = make(bit == 1 ? m : 0, bit >= 2 ? m : 0, w, bit == 3 ? m : 0, false);
+                } else {
+                    v = make(0, 0, w, 0, false);
+                    for (int k = 0; k < w; k++) setBit(v, k, bit);
+                    v = finish(v);
+                }
+                return sized(konst(v), w, false, ctx);
+            }
             case ExpressionKind::StringLiteral: {   // "abc" is 8 bits per char (5.9)
                 const auto& sv = e.as<StringLiteral>().getIntValue().integer();
                 if (sv.getBitWidth() > 64) unsupported("string literal longer than 8 characters");
@@ -802,6 +819,40 @@ struct Lowerer {
                 auto it = arrMap().find(&x.as<ValueExpressionBase>().symbol);
                 if (it == arrMap().end()) unsupported("array value");
                 for (int k = 0; k < it->second->count; k++) out.push_back(ref(it->second->base + k, it->second->sgn));
+                return;
+            }
+            case ExpressionKind::Concatenation: {   // {a, 4, 5} into an unpacked array (10.10)
+                for (auto* op : x.as<ConcatenationExpression>().operands()) {
+                    if (op->type->isUnpackedArray()) arrayElems(*op->type, *op, out);
+                    else arrayElems(et, *op, out);
+                }
+                return;
+            }
+            case ExpressionKind::RangeSelect: {   // a[1:2], a[i +: 2] with a constant start (7.4.6)
+                const auto& rs = x.as<RangeSelectExpression>();
+                const Expression& base = peel(rs.value());
+                if (base.kind != ExpressionKind::NamedValue && base.kind != ExpressionKind::HierarchicalValue)
+                    unsupported("slice of an array expression");
+                auto it = arrMap().find(&base.as<ValueExpressionBase>().symbol);
+                if (it == arrMap().end() || it->second->dims.size() != 1) unsupported("slice of a multidimensional array");
+                const ArrShape& A = *it->second;
+                int64_t l, r;
+                if (rs.getSelectionKind() == RangeSelectionKind::Simple) { l = constInt(rs.left()); r = constInt(rs.right()); }
+                else {
+                    int64_t st = constInt(rs.left()), wd = constInt(rs.right());
+                    bool up = rs.getSelectionKind() == RangeSelectionKind::IndexedUp;
+                    auto [dl, dr] = A.dims[0];
+                    bool asc = dl <= dr;   // a[i +: w] runs from i upward in index value
+                    int64_t lo = up ? st : st - wd + 1, hi = up ? st + wd - 1 : st;
+                    l = asc ? lo : hi; r = asc ? hi : lo;
+                }
+                int64_t step = l <= r ? 1 : -1;
+                for (int64_t k = l;; k += step) {
+                    int64_t off = A.offset({k});
+                    if (off < 0) unsupported("array slice outside the array");
+                    out.push_back(ref(A.base + (int)off, A.sgn));
+                    if (k == r) break;
+                }
                 return;
             }
             default: unsupported("fixed-size array value of this kind");
@@ -1390,6 +1441,26 @@ struct Lowerer {
             }
             case ExpressionKind::BinaryOp: {
                 const auto& b = e.as<BinaryExpression>();
+                if (b.left().type->isUnpackedArray() &&
+                    (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
+                     b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality)) {
+                    // Whole fixed-size arrays (7.6): every element pair compares
+                    // equal, as == does on the elements (x if none differ but
+                    // some compare x), or === for case equality.
+                    std::vector<E> l, r;
+                    arrayElems(*b.left().type, b.left(), l);
+                    arrayElems(*b.right().type, b.right(), r);
+                    if (l.size() != r.size()) unsupported("compare of arrays of different sizes");
+                    bool cs = b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality;
+                    E acc;
+                    for (size_t k = 0; k < l.size(); k++) {
+                        E m = bin(cs ? Op::CaseEq : Op::Eq, l[k], r[k]);
+                        acc = acc ? bin(Op::LogAnd, acc, m) : m;
+                    }
+                    if (!acc) acc = konst(mk(1, 1));
+                    if (b.op == BinaryOperator::Inequality || b.op == BinaryOperator::CaseInequality) acc = un(Op::LogNot, acc);
+                    return sized(acc, 1, false, ctx);
+                }
                 if (b.left().type->isString() || b.right().type->isString()) {   // 6.16: string compare
                     int kind = -1;
                     switch (b.op) {
@@ -1542,26 +1613,8 @@ struct Lowerer {
             case ExpressionKind::Inside: {          // x inside {a, [lo:hi]} (11.4.13)
                 const auto& in = e.as<InsideExpression>();
                 E acc;
-                auto pair = [&](const Expression& x, const Expression& y) {
-                    int w = std::max((int)x.type->getBitWidth(), (int)y.type->getBitWidth());
-                    needWidth(w);
-                    bool sg = x.type->isSigned() && y.type->isSigned();
-                    ExprCtx c{w, sg, sg, true};
-                    return std::pair<E, E>{expr(x, c), expr(y, c)};
-                };
                 for (const Expression* it : in.rangeList()) {
-                    E m;
-                    if (it->kind == ExpressionKind::ValueRange) {
-                        const auto& vr = it->as<ValueRangeExpression>();
-                        if (vr.rangeKind != ValueRangeKind::Simple) unsupported("tolerance range in inside");
-                        auto [l1, lo] = pair(in.left(), vr.left());
-                        auto [l2, hi] = pair(in.left(), vr.right());
-                        m = bin(Op::LogAnd, bin(Op::Ge, l1, lo), bin(Op::Le, l2, hi));
-                    } else {
-                        if (!it->type->isIntegral()) unsupported("inside on a non-integral item");
-                        auto [l, r] = pair(in.left(), *it);
-                        m = bin(Op::WildEq, l, r);
-                    }
+                    E m = insideItem(in.left(), *it);
                     acc = acc ? bin(Op::LogOr, acc, m) : m;
                 }
                 return sized(acc ? acc : konst(mk(0, 1)), 1, false, ctx);
@@ -1903,6 +1956,28 @@ struct Lowerer {
             prog.code[jf].target = prog.here();
         }
         return resize(ref(ok), 32, false, true);
+    }
+    // One item of an inside list (11.4.13), also a case inside label
+    // (12.5.4): [lo:hi] is a range, anything else matches with ==?.
+    E insideItem(const slang::ast::Expression& l, const slang::ast::Expression& it) {
+        using namespace slang::ast;
+        auto pair = [&](const Expression& x, const Expression& y) {
+            int w = std::max((int)x.type->getBitWidth(), (int)y.type->getBitWidth());
+            needWidth(w);
+            bool sg = x.type->isSigned() && y.type->isSigned();
+            ExprCtx c{w, sg, sg, true};
+            return std::pair<E, E>{expr(x, c), expr(y, c)};
+        };
+        if (it.kind == ExpressionKind::ValueRange) {
+            const auto& vr = it.as<ValueRangeExpression>();
+            if (vr.rangeKind != ValueRangeKind::Simple) unsupported("tolerance range in inside");
+            auto [l1, lo] = pair(l, vr.left());
+            auto [l2, hi] = pair(l, vr.right());
+            return bin(Op::LogAnd, bin(Op::Ge, l1, lo), bin(Op::Le, l2, hi));
+        }
+        if (!it.type->isIntegral() || !l.type->isIntegral()) unsupported("inside on a non-integral item");
+        auto [a, b] = pair(l, it);
+        return bin(Op::WildEq, a, b);
     }
     // $clog2, $countbits and friends (20.8, 20.9), $random / $dist_uniform
     // (20.14), $urandom / $urandom_range (18.13). Null if n is none of them.
@@ -2356,8 +2431,36 @@ struct Lowerer {
             if (a.isCompound()) lvalue = &a.left();
             i.e = expr(a.right());
             lvalue = saved;
+            if (const TimingControl* tc = a.timingControl; tc && tc->kind != TimingControlKind::Delay) {
+                // a = @(e) b; a = repeat (n) @(e) b (9.4.5): b is taken now and
+                // written after the event (n events for repeat).
+                if (a.isNonBlocking()) unsupported("nonblocking assignment with an intra-assignment event control");
+                int w = (int)a.left().type->getBitWidth();
+                needWidth(w);
+                int tmp = fresh(w);
+                Instr hold; hold.k = IK::Assign; hold.sig = tmp; hold.e = i.e;
+                prog.emit(hold);
+                if (tc->kind == TimingControlKind::RepeatedEvent) {
+                    const auto& re = tc->as<RepeatedEventControl>();
+                    int cnt = fresh(32);
+                    Instr c0; c0.k = IK::Assign; c0.sig = cnt; c0.e = resize(expr(re.expr), 32, re.expr.type->isSigned(), true);
+                    prog.emit(c0);
+                    size_t top = prog.here();
+                    Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(cnt, true), konst(make(0, 0, 32, 0, true)));
+                    size_t jf = prog.emit(j);
+                    timing(re.event);
+                    Instr dec; dec.k = IK::Assign; dec.sig = cnt; dec.e = bin(Op::Sub, ref(cnt, true), konst(make(1, 0, 32, 0, true)));
+                    prog.emit(dec);
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    prog.code[jf].target = prog.here();
+                } else {
+                    timing(*tc);
+                }
+                i.e = ref(tmp, a.left().type->isSigned());
+                prog.emit(i);
+                return;
+            }
             if (const TimingControl* tc = a.timingControl) {   // a = #d b; a <= #d b (9.4.5)
-                if (tc->kind != TimingControlKind::Delay) unsupported("intra-assignment event control");
                 Instr d;
                 delayInto(tc->as<DelayControl>().expr, d);
                 if (a.isNonBlocking()) {   // the update is scheduled d later; the process goes on
@@ -2729,7 +2832,8 @@ struct Lowerer {
                 for (const auto& item : c.items) {
                     E cond;   // OR of (selector === item_expr) over this item's labels
                     for (const Expression* x : item.expressions) {
-                        E m = bin(cmp, expr(c.expr), expr(*x));
+                        E m = c.condition == CaseStatementCondition::Inside ? insideItem(c.expr, *x)
+                                                                             : bin(cmp, expr(c.expr), expr(*x));
                         cond = cond ? bin(Op::LogOr, cond, m) : m;
                     }
                     Instr j; j.k = IK::JmpIfNot; j.e = cond;
