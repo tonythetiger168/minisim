@@ -108,12 +108,18 @@ struct Pool {
         // The batch this thread is called to. Only the threads a batch uses are
         // woken: one left out sleeps on, so a batch on 2 of 8 threads costs no
         // wake-up (a futex call, a context switch) of the other 6.
-        atomic<uint64_t> gate{0};
+        // 32 bits: libstdc++ waits on a 4-byte atomic with a futex on its own
+        // address. A 64-bit one shares 16 hashed buckets, and every notify
+        // wakes the whole bucket: with 64-byte slots all gates hashed to one
+        // bucket, so each wake-up woke every sleeping thread of the pool.
+        atomic<uint32_t> gate{0};
+        atomic<uint32_t> sleeping{0};   // the worker is in (or entering) gate.wait()
     };
     Slot slots[kMaxThreads];
     vector<thread> ts;
-    atomic<uint64_t> gen{0};       // bumped once per batch; idle workers sleep on it
-    alignas(64) atomic<size_t> finished{0};   // items of the current batch that are done
+    atomic<uint64_t> gen{0};       // the last batch number (its low 32 bits)
+    alignas(64) atomic<uint32_t> finished{0};   // items of the current batch that are done
+    atomic<uint32_t> mainSleeping{0};
     atomic<size_t> total{0};       // items in the current batch
     Job job = nullptr;             // written before a batch is published, read after a claim
     void* ctx = nullptr;
@@ -136,7 +142,7 @@ struct Pool {
     }
     ~Pool() {
         stop = true;
-        uint64_t g = gen.fetch_add(1) + 1;
+        uint32_t g = (uint32_t)(gen.fetch_add(1) + 1);
         for (auto& sl : slots) { sl.gate.store(g); sl.gate.notify_all(); }
         for (auto& t : ts) t.join();
     }
@@ -155,7 +161,8 @@ struct Pool {
                                                memory_order_acq_rel, memory_order_acquire)) continue;
             for (size_t i = lo; i < hi; i++) job(ctx, i);
             // The chunk that completes the batch wakes run() if it sleeps.
-            if (finished.fetch_add(hi - lo, memory_order_acq_rel) + (hi - lo) == total.load(memory_order_relaxed))
+            if (finished.fetch_add((uint32_t)(hi - lo)) + (hi - lo) == total.load(memory_order_relaxed) &&
+                mainSleeping.load())
                 finished.notify_one();
             c = s.claim.load(memory_order_acquire);
         }
@@ -167,20 +174,25 @@ struct Pool {
             if (!drain(slots[(id + k) % T], b)) return;
     }
     void worker(int id) {
-        uint64_t seen = 0;
+        uint32_t seen = 0;
+        Slot& me = slots[id];
         for (;;) {
-            uint64_t g;
+            uint32_t g;
             int spins = 0;
-            atomic<uint64_t>& gate = slots[id].gate;
-            while ((g = gate.load(memory_order_acquire)) == seen) {
+            while ((g = me.gate.load(memory_order_acquire)) == seen) {
                 // Spin for the next batch; yield, which lets any other
                 // runnable thread have the CPU; then sleep.
                 // A thread left out of the last batch sleeps at once, so it
                 // does not spin on an SMT sibling of a thread that is working.
-                if (id >= active.load(memory_order_relaxed)) gate.wait(seen);
-                else if (++spins < 4000) relax();
-                else if (spins < 20000) this_thread::yield();
-                else gate.wait(seen);
+                if (id < active.load(memory_order_relaxed) && ++spins < 4000) relax();
+                else if (id < active.load(memory_order_relaxed) && spins < 20000) this_thread::yield();
+                else {
+                    // Announce the sleep, then look again (both seq_cst): either
+                    // run() sees `sleeping` and wakes us, or we see its gate.
+                    me.sleeping.store(1);
+                    if (me.gate.load() == seen) me.gate.wait(seen);
+                    me.sleeping.store(0);
+                }
             }
             seen = g;
             if (stop) return;
@@ -195,6 +207,7 @@ struct Pool {
     // Run items [0, n) on the first `use` threads (0: all of them).
     void run(size_t n, Job j, void* c, int use = 0) {
         uint32_t b = (uint32_t)(gen.load(memory_order_relaxed) + 1);
+        if (b == 0) b = 1;   // 0 is every gate's start value
         size_t T = (size_t)(use > 0 && use < size() ? use : size());
         active.store((int)T, memory_order_relaxed);
         job = j;
@@ -209,17 +222,21 @@ struct Pool {
         }
         gen.store(b, memory_order_release);   // the only writer while the pool runs
         for (size_t t = 1; t < T; t++) {
-            slots[t].gate.store(b, memory_order_release);
-            slots[t].gate.notify_one();
+            slots[t].gate.store(b);
+            if (slots[t].sleeping.load()) slots[t].gate.notify_one();   // no syscall for a spinning thread
         }
         work(0, b);
         // Wait for chunks other threads are still running: spin, yield, then sleep.
         for (int spins = 0;; spins++) {
-            size_t d = finished.load(memory_order_acquire);
+            uint32_t d = finished.load(memory_order_acquire);
             if (d >= n) break;
             if (spins < 4000) relax();
             else if (spins < 20000) this_thread::yield();
-            else finished.wait(d, memory_order_acquire);
+            else {
+                mainSleeping.store(1);
+                if (finished.load() == d) finished.wait(d);
+                mainSleeping.store(0);
+            }
         }
     }
 };
@@ -343,9 +360,10 @@ struct Sim {
             sum += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
             if (n < kWarm + kTry) return;
             int t = std::min(1 << cand, maxT);
+            bool worse = bestNs != INT64_MAX && sum > 2 * bestNs;   // more threads will not win back a 2x loss
             if (sum < bestNs) { bestNs = sum; best = t; }
             n = 0; sum = 0;
-            if (t >= maxT) { cand = -1; return; }
+            if (t >= maxT || worse) { cand = -1; return; }
             cand++;
         }
     };
