@@ -37,6 +37,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
+#include "sva.hpp"
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
@@ -186,6 +187,19 @@ struct Pool {
     }
 };
 
+struct ProcCtl;
+// A deferred assertion report waiting to mature (16.4.1): the assertion, the
+// process that queued it and that process's flush count then, and the
+// action's captured argument values.
+struct DeferRep {
+    int id;
+    bool pass;
+    shared_ptr<ProcCtl> ctl;
+    uint64_t epoch, killGen;
+    vector<pair<Expr*, Val>> caps;
+};
+// Event regions of one time slot (4.4.2), for the code that depends on them.
+enum Region : uint8_t { R_ACTIVE, R_OBSERVED, R_REACTIVE, R_POSTPONED };
 // The time wheel: pending times and the processes waiting for each. Kept as
 // a vector sorted latest first, so the next time is at the back and taking it
 // is a pop; emptied bucket vectors are kept for reuse. A std::map here cost
@@ -230,6 +244,25 @@ struct Sim {
     // single $monitor slot; anything else is a $strobe, in schedule order.
     struct Post { bool mon = false; string fmt; vector<E> args; };
     deque<Post> postq;
+    // The reactive region set (4.4.2.6-4.4.2.8): reactive, re-inactive
+    // (#0 from the reactive region) and re-NBA. Assertion action blocks run
+    // here. `region` says which region the running code is in.
+    deque<Handle> observedQ, reactive, reInactive;
+    vector<NbaItem> reNbaq;
+    Region region = R_ACTIVE;
+    bool rare = false;   // something may be queued in observed, the reactive set, defFin or ticked
+    // Pending deferred assertion reports (16.4.1): observed (#0) ones mature
+    // in the observed region, final ones in the postponed region.
+    vector<DeferRep> defObs, defFin;
+    // Sampled values (16.5.1). Each (signal, shadow) pair: the shadow holds
+    // the signal's value from the preponed region of this time slot. At time
+    // 0 it keeps the default sampled value (the declaration's initial value).
+    vector<pair<int, int>> shadows;
+    // Clocks of $past / $rose / ... (sva.hpp SampleClock); ticked: the ones
+    // that ticked in this slot, shifted at the end of the slot.
+    vector<SampleClock> sclocks;
+    vector<int> ticked;
+    uint64_t sampledAt = 0;
     struct Mon {
         bool on = false, queued = false;
         string fmt;
@@ -673,7 +706,11 @@ struct Sim {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
                                : clipRead(sigs[s].val, sigs[s].w);
     }
-    void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }
+    // A nonblocking assignment from the reactive region set goes to re-NBA (4.4.2.8).
+    void nba(int s, Val v, int hi = -1, int lo = 0) {
+        if (region == R_REACTIVE) { reNbaq.push_back({s, v, hi, lo}); rare = true; }
+        else nbaq.push_back({s, v, hi, lo});
+    }
 
     // Delayed drivers and net delays (10.3.3, 28.16). Each (signal, driver)
     // has at most one update in flight; d = -1 is the net delay of signal s,
@@ -1275,6 +1312,63 @@ struct Sim {
         if (__builtin_expect(sigs[s].fl & SF_LISTEN, 0)) heldInputChanged(s);
     }
 
+    void runObserved();
+    void matureFinal();
+    // The regions after NBA (4.5), once the active set is empty: observed,
+    // the reactive set, postponed, and the end-of-slot $past shift. False
+    // when all are empty and time can advance. `rare` is set whenever work is
+    // queued for any of them but postponed, so a design without assertions
+    // or programs pays one flag test per pass.
+    bool slotTail() {
+        if (!observedQ.empty() || !defObs.empty()) { runObserved(); return true; }   // observed (4.4.2.5)
+        if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
+            // Once the reactive set starts, it runs until it is empty, and
+            // only then does the active set run again (4.5).
+            for (;;) {
+                if (!reactive.empty()) {                   // reactive (4.4.2.6)
+                    Handle h = reactive.front(); reactive.pop_front();
+                    region = R_REACTIVE;
+                    if (!h.done()) h.resume();
+                    region = R_ACTIVE;
+                } else if (!reInactive.empty()) {          // re-inactive (#0 in the reactive set)
+                    for (auto h : reInactive) reactive.push_back(h);
+                    reInactive.clear();
+                } else if (!reNbaq.empty()) {              // re-NBA
+                    nbaRun.clear();
+                    nbaRun.swap(reNbaq);
+                    applyNba();
+                } else break;
+            }
+            return true;
+        }
+        if (!postq.empty() || !defFin.empty()) {           // postponed ($strobe, $monitor, assert final)
+            region = R_POSTPONED;
+            matureFinal();
+            region = R_ACTIVE;
+            drainPost();
+            return true;
+        }
+        if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
+        rare = false;
+        return false;
+    }
+    // The end of a slot where sample clocks ticked: shift each $past line
+    // (sva.hpp SampleClock). Shadows still hold this slot's sampled values.
+    void shiftSampled() {
+        auto rd = [&](int s) { return get(s); };
+        for (int c : ticked) {
+            SampleClock& k = sclocks[c];
+            if (k.gate && truth(eval(k.gate, rd)) != 1) continue;
+            for (auto& ln : k.lines) {
+                for (size_t j = ln.stages.size(); j-- > 1;) sigs[ln.stages[j]].val = sigs[ln.stages[j - 1]].val;
+                Val v = eval(ln.src, rd);
+                int s0 = ln.stages[0];
+                sigs[s0].val = sigs[s0].w <= 64 ? make(v.v, v.x, sigs[s0].w, v.z) : maskWidth(v, sigs[s0].w);
+            }
+        }
+        ticked.clear();
+    }
+
     void header() {
         if (vcdPath.empty()) return;
         observed = true;   // every change is written: the cycle domain uses set()
@@ -1351,6 +1445,7 @@ struct Sim {
     void runFinal(const vector<Task>& ts) {
         if (ts.empty()) return;
         wheel.clear(); laterNba.clear(); laterDrv.clear(); active.clear(); inactive.clear(); nbaq.clear();
+        observedQ.clear(); reactive.clear(); reInactive.clear(); reNbaq.clear(); defObs.clear(); defFin.clear();
         for (int id : seqq) seqPend[id] = 0;
         seqq.clear();
         finished = false;
@@ -1371,6 +1466,10 @@ struct Sim {
             if (!any) continue;   // only disabled processes were waiting here
             now = t;
             g_simTime = now;
+            if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
+                for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
+                sampledAt = now;
+            }
             runLaterDrv();   // delayed continuous assignments and net delays due now (active region)
             if (auto ln = laterNba.find(now); ln != laterNba.end()) {
                 for (auto& n : ln->second) nbaq.push_back(n);
@@ -1392,8 +1491,8 @@ struct Sim {
                     nbaRun.clear();
                     nbaRun.swap(nbaq);
                     applyNba();
-                } else if (!postq.empty()) {                   // postponed ($strobe/$monitor)
-                    drainPost();                               // then, and only then, time advances
+                } else if (rare || !postq.empty()) {           // observed, reactive set, postponed
+                    if (!slotTail()) break;                    // then, and only then, time advances
                 } else break;
             }
         }
@@ -1434,7 +1533,10 @@ struct Delay {
     uint64_t n;
     bool await_ready() const { return false; }
     void await_suspend(Handle h) const {
-        if (n == 0) S.inactive.push_back(h);
+        if (n == 0) {
+            if (S.region == R_REACTIVE) { S.reInactive.push_back(h); S.rare = true; }
+            else S.inactive.push_back(h);
+        }
         else S.wheel[S.now + n].push_back(h);
     }
     void await_resume() const {}
