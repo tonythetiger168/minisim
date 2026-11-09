@@ -743,13 +743,27 @@ struct Lowerer {
             auto shape = std::make_shared<ArrShape>();
             const Type* et = &t;
             int64_t total = 1;
-            while (et->isUnpackedArray()) {
+            while (et->isUnpackedArray() && !isDynType(*et)) {
                 if (et->kind != SymbolKind::FixedSizeUnpackedArrayType) unsupported("automatic array of this kind");
                 const auto& ft = et->as<FixedSizeUnpackedArrayType>();
                 shape->dims.push_back({ft.range.left, ft.range.right});
                 total *= (int64_t)ft.range.width();
                 if (total > (1 << 16)) unsupported("automatic array with more than 65536 elements");
                 et = &ft.elementType.getCanonicalType();
+            }
+            if (isDynType(*et)) {   // int f[2][$] (7.4): one container slot per element
+                shape->count = (int)total;
+                shape->elemW = 64;
+                shape->dynElem = std::make_shared<DynObj>(dynShapeOf(*et));
+                for (int64_t k = 0; k < total; k++) {
+                    int off = L->add(64, make(0, 0, 64));
+                    if (!k) shape->base = off;
+                    else if (off != shape->base + (int)k) unsupported("array of containers not laid out in a row");
+                    L->dyn.push_back({off, *shape->dynElem});
+                }
+                ps.kind = 1;
+                ps.arr = shape;
+                return ps;
             }
             Val iv = initOf(*et);
             shape->count = (int)total;
@@ -2635,19 +2649,13 @@ struct Lowerer {
                 idx.insert(idx.begin(), &b->as<ElementSelectExpression>().selector());
                 b = &peel(b->as<ElementSelectExpression>().value());
             }
-            if (ValueExpressionBase::isKind(b->kind))
-                if (auto f = dynArrMap().find(&b->as<ValueExpressionBase>().symbol); f != dynArrMap().end() && idx.size() == f->second->dims.size()) {
-                    std::vector<E> ks;
-                    for (auto* x : idx) ks.push_back(expr(*x));
-                    auto n = node(Op::ArrAddr, std::move(ks));
-                    n->arr = f->second;
-                    int tmp = fresh(64);
-                    Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
-                    prog.emit(i);
-                    int d = indThrough(tmp);
-                    indShape[d] = dynStore()[f->second->base];
-                    return d;
-                }
+            if (auto f = contArr(*b); f && idx.size() == f->dims.size()) {
+                std::vector<E> ks;
+                for (auto* x : idx) ks.push_back(expr(*x));
+                auto n = node(Op::ArrAddr, std::move(ks));
+                n->arr = f;
+                return bindCont(std::move(n), *f->dynElem);
+            }
             int outer = dynSig(sel.value());
             if (outer < 0 || !dynShape(outer).elem) return -1;
             auto n = node(Op::DynElemRef, {dynKey(outer, sel.selector())});
@@ -2656,6 +2664,41 @@ struct Lowerer {
         }
         if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) return -1;
         return dynFind(&e.as<ValueExpressionBase>().symbol);
+    }
+    // A fixed-size array of containers (int f[2][$]): static, automatic, a
+    // property of this object or one through a handle; its base resolved.
+    std::shared_ptr<const ArrShape> contArr(const slang::ast::Expression& b0) {
+        using namespace slang::ast;
+        const Expression& b = peel(b0);
+        std::shared_ptr<const ArrShape> a;
+        if (classMember(b)) {
+            const auto& m = b.as<MemberAccessExpression>();
+            const PropSlot* ps = memberSlot(m);
+            if (!ps) a = arrFind(&m.member);
+            else if (ps->kind == 1 && ps->arr->dynElem) {
+                auto c = std::make_shared<ArrShape>(*ps->arr);
+                c->base = indSlot(exprH(m.value()), ps->arr->base);
+                a = c;
+            }
+        } else if (ValueExpressionBase::isKind(b.kind)) {
+            const Symbol* sym = &b.as<ValueExpressionBase>().symbol;
+            a = arrFind(sym);   // an automatic one first: a local may also have a static twin
+            if (!(a && a->dynElem))
+                if (auto f = dynArrMap().find(sym); f != dynArrMap().end()) return f->second;
+        }
+        return a && a->dynElem ? a : nullptr;
+    }
+    // The indirect id of the container that n (an ArrAddr or DynElemRef,
+    // giving id + 1) names: read into a temporary now, or in a constraint
+    // kept on the item and resolved at solve time.
+    int bindCont(E n, const DynObj& shape) {
+        int tmp = fresh(64);
+        int d = indThrough(tmp);
+        indShape[d] = shape;
+        if (consDepth) { consRefs.push_back({d, std::move(n)}); return d; }
+        Instr i; i.k = IK::Assign; i.sig = tmp; i.e = std::move(n);
+        prog.emit(i);
+        return d;
     }
     // The indirect id of the element container that `ref` (a DynElemRef of
     // outer) names, read into a temporary now.
@@ -4489,6 +4532,36 @@ struct Lowerer {
             out.push_back(ref(d));
             return;
         }
+        if (auto ca = x.type->isUnpackedArray() ? contArr(x) : nullptr) {   // int f[2][$]: each element container by %Q
+            const Type* et = x.type;
+            for (size_t k = 0; k < ca->dims.size(); k++) et = et->getCanonicalType().getArrayElementType();
+            std::vector<int64_t> idx(ca->dims.size());
+            std::function<void(size_t)> walk = [&](size_t dim) {
+                auto [l, r] = ca->dims[dim];
+                int64_t n = (l > r ? l - r : r - l) + 1;
+                fmt += "'{";
+                for (int64_t k = 0; k < n; k++) {
+                    if (k) fmt += ", ";
+                    idx[dim] = l <= r ? l + k : l - k;
+                    if (dim + 1 < ca->dims.size()) { walk(dim + 1); continue; }
+                    std::vector<E> ks;
+                    for (int64_t i : idx) ks.push_back(konst(make((uint64_t)i, 0, 32, 0, true)));
+                    auto addr = node(Op::ArrAddr, std::move(ks));
+                    addr->arr = ca;
+                    const Type* it = et;
+                    while (isDynType(*it)) it = it->getCanonicalType().getArrayElementType();
+                    const Type& ec = it->getCanonicalType();
+                    if (!(ec.isIntegral() && ec.kind != SymbolKind::EnumType && !ec.isStruct()) && !ec.isString() && !ec.isFloating())
+                        unsupported("%p of a container of this element type");
+                    fmt += "%Q";
+                    fmt += ec.isString() ? 's' : ec.isFloating() ? 'R' : 'd';
+                    out.push_back(ref(bindCont(std::move(addr), *ca->dynElem)));
+                }
+                fmt += "}";
+            };
+            walk(0);
+            return;
+        }
         if (x.type->isUnpackedArray()) {
             const Symbol* sym = (x.kind == ExpressionKind::NamedValue || x.kind == ExpressionKind::HierarchicalValue)
                                     ? &x.as<ValueExpressionBase>().symbol : nullptr;
@@ -6063,9 +6136,7 @@ struct Lowerer {
                 std::vector<Lvl> lv;
                 // A fixed-size array of containers (int f[2][]): its fixed
                 // dimensions here, then each element container's own.
-                std::shared_ptr<ArrShape> da;
-                if (const Expression& ar = peel(f.arrayRef); ValueExpressionBase::isKind(ar.kind))
-                    if (auto it = dynArrMap().find(&ar.as<ValueExpressionBase>().symbol); it != dynArrMap().end()) da = it->second;
+                std::shared_ptr<const ArrShape> da = contArr(f.arrayRef);
                 size_t nfixed = da ? da->dims.size() : f.loopDims.size();
                 for (size_t dk = 0; dk < nfixed && dk < f.loopDims.size(); dk++) {
                     const auto& d = f.loopDims[dk];
@@ -6088,12 +6159,7 @@ struct Lowerer {
                     for (auto& L : lv) ks.push_back(ref(L.var, true));
                     auto n = node(Op::ArrAddr, std::move(ks));
                     n->arr = da;
-                    int tmp = fresh(64);
-                    Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
-                    prog.emit(i);
-                    int d = indThrough(tmp);
-                    indShape[d] = dynStore()[da->base];
-                    foreachDynDim(f, d, nfixed);
+                    foreachDynDim(f, bindCont(std::move(n), *da->dynElem), nfixed);
                 } else stmt(f.body);
                 patch(loops.back().continues, prog.here());
                 for (size_t k = lv.size(); k-- > 0;) {
@@ -6528,6 +6594,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         }
         shape->count = (int)total;
         shape->elemW = 64;
+        shape->dynElem = std::make_shared<DynObj>(o);
         dynArrMap()[&s] = shape;
     }
     template <typename T> void regDyn(const T& s) {
@@ -7987,22 +8054,28 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         rv.randc = p.randMode == RandMode::RandC;
                         rv.mode = randModeMap().at(&p);
                         const Type* et = &t;
-                        if (ps.kind == 1) {
+                        if (ps.kind == 1 && !ps.arr->dynElem) {
                             rv.off = ps.arr->base; rv.count = ps.arr->count;
                             while (et->isUnpackedArray()) et = &et->getArrayElementType()->getCanonicalType();
                         } else if (ps.kind == 0) rv.off = ps.off;
                         else {   // a dynamic array or queue (18.4): its size and elements
-                            if (t.isAssociativeArray()) {   // its values (18.4); the keys stay
-                                const auto* ix = t.as<AssociativeArrayType>().indexType;
+                            const Type* dt = &t;   // int q[4][$]: each of the 4 queues
+                            if (ps.kind == 1) {
+                                while (!Lowerer::isDynType(*dt)) dt = &dt->getArrayElementType()->getCanonicalType();
+                                rv.off = ps.arr->base; rv.count = ps.arr->count;
+                            } else rv.off = ps.off;
+                            if (dt->isAssociativeArray()) {   // its values (18.4); the keys stay
+                                const auto* ix = dt->as<AssociativeArrayType>().indexType;
                                 if (!ix || !(ix->getCanonicalType().isIntegral() || ix->getCanonicalType().isString()))
                                     Lowerer::unsupported("rand associative array with a wildcard or class index");
                             }
-                            rv.off = ps.off; rv.dyn = true;
-                            et = &t.getArrayElementType()->getCanonicalType();
+                            rv.dyn = true;
+                            et = &dt->getArrayElementType()->getCanonicalType();
                             while (Lowerer::isDynType(*et)) {   // int m[][] (7.5, 18.4): every level
                                 if (et->isAssociativeArray()) {
                                     const auto* ix = et->as<AssociativeArrayType>().indexType;
-                                    if (!ix || !ix->getCanonicalType().isIntegral()) Lowerer::unsupported("rand associative array without an integral index");
+                                    if (!ix || !(ix->getCanonicalType().isIntegral() || ix->getCanonicalType().isString()))
+                                        Lowerer::unsupported("rand associative array with a wildcard or class index");
                                 }
                                 rv.depth++;
                                 et = &et->getArrayElementType()->getCanonicalType();
@@ -8016,9 +8089,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
                             if (rv.w > 64) Lowerer::unsupported("rand variable wider than 64 bits");
                         } else Lowerer::unsupported("rand property of this type");
-                        if (et->isEnum() && rv.dyn) {   // each element: one of the named values
+                        if (et->isEnum() && rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // each element: one of the named values
                             RandItem loop;
-                            loop.loopCont = lw.thisRel(rv.off);
+                            loop.loopCont = lw.thisRel(rv.off + k0);
                             loop.loopVar = lw.fresh(32);
                             // Containers of containers: a loop per level, over m[i] then m[i][j].
                             std::vector<RandItem> outer;

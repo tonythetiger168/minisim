@@ -1430,6 +1430,7 @@ struct ArrShape {
     bool sgn = false;
     bool twoState = false;   // bit / int elements: an invalid read is 0, not X (7.4.6)
     std::vector<std::pair<int64_t, int64_t>> dims;   // [left, right]
+    std::shared_ptr<const DynObj> dynElem;   // int f[2][$]: each element a container of this shape (last: -compile writes the others in order)
     // Flat element offset, or -1 when an index is outside its dimension.
     int64_t offset(const std::vector<int64_t>& idx) const {
         int64_t off = 0;

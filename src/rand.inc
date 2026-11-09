@@ -808,7 +808,7 @@ static void randObjects(int obj, std::vector<int>& out) {
                         else hs.push_back((int)h.v);
                     }
             };
-            walk(obj + rv.off, rv.depth);
+            for (int k = 0; k < rv.count; k++) walk(obj + rv.off + k, rv.depth);
             for (int h : hs) randObjects(h, out);
             continue;
         }
@@ -1024,9 +1024,9 @@ static int doRandomize(int obj, const RandCall* rc) {
         if (!(rc && rc->argsGiven))
             for (const RandVar& rv : sp->vars) {
                 if (rv.obj || !(S.get(o + rv.mode).v & 1)) continue;
-                if (rv.dyn) {
+                if (rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // int q[4][$]: each queue
                     RCont c;
-                    c.cid = o + rv.off; c.w = rv.w; c.sgn = rv.sgn; c.owner = o; c.depth = rv.depth;
+                    c.cid = o + rv.off + k0; c.w = rv.w; c.sgn = rv.sgn; c.owner = o; c.depth = rv.depth;
                     const DynObj& dd = dynStore()[c.cid];
                     c.n = (int64_t)dd.size();
                     if (dd.kind == 2) {
@@ -1034,8 +1034,8 @@ static int doRandomize(int obj, const RandCall* rc) {
                         for (auto& kv : dd.map) c.keys.push_back(kv.first);
                     }
                     if (!contIdx.count(c.cid)) { contIdx[c.cid] = (int)conts.size(); conts.push_back(std::move(c)); }
-                    continue;
                 }
+                if (rv.dyn) continue;
                 for (int k = 0; k < rv.count; k++) scalars.push_back({o + rv.off + k, rv.w, rv.sgn, rv.randc, o});
             }
         for (const auto& b : sp->blocks) {
