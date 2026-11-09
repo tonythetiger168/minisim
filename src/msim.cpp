@@ -176,6 +176,35 @@ static void partitionInputs(const LowerResult& lowered, const Plan& pl, std::vec
 
 // -compile: generate, build and run. Returns the exit status, or -1 when the
 // design needs the interpreter.
+// simv -cov: the counters of each compiled instruction (hits, then taken
+// jumps) and the toggle masks per signal, read back into the instructions and
+// S so writeCoverage() writes the same database as an interpreted run.
+static bool readCompiledCov(const std::string& path, const std::vector<std::pair<const Prog*, size_t>>& slots) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    auto rd = [&](void* p, size_t n) { return std::fread(p, 8, n, f) == n; };
+    uint64_t n = 0, ns = 0;
+    bool ok = rd(&n, 1) && n >= 2 * slots.size();
+    std::vector<uint64_t> cv(ok ? n : 0);
+    ok = ok && rd(cv.data(), n) && rd(&ns, 1) && ns == S.sigs.size();
+    for (size_t k = 0; ok && k < slots.size(); k++) {
+        Instr& in = const_cast<Instr&>(slots[k].first->code[slots[k].second]);
+        in.hits += cv[2 * k];
+        in.taken += cv[2 * k + 1];
+    }
+    if (ok) { S.togRise.assign(ns, {}); S.togFall.assign(ns, {}); }
+    for (size_t s = 0; ok && s < ns; s++) {
+        uint64_t w = 0;
+        ok = rd(&w, 1) && w <= ((uint64_t)S.sigs[s].w + 63) / 64;
+        if (!ok) break;
+        S.togRise[s].resize(w);
+        S.togFall[s].resize(w);
+        ok = rd(S.togRise[s].data(), w) && rd(S.togFall[s].data(), w);
+    }
+    std::fclose(f);
+    return ok;
+}
+
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle) {
@@ -193,6 +222,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     parts.on = staticPart;
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
+    std::vector<std::pair<const Prog*, size_t>> covSlots;
     // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
@@ -204,7 +234,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     }
     try {
         // With a VCD every signal must live in S.sigs, so no private signals.
-        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath);
+        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr);
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -249,9 +279,15 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
     run += " -threads " + std::to_string(threads);
     if (!g_pin) run += " -no-pin";
+    std::string covBin = dir + "/cov.bin";
+    if (g_cov) { std::filesystem::remove(covBin); run += " -cov " + shq(covBin); }
     std::cout.flush();
     int st = std::system(run.c_str());
     if (st == -1) return 1;
+    if (g_cov && !readCompiledCov(covBin, covSlots)) {
+        std::cerr << "msim: -compile: simv wrote no coverage (" << covBin << ")\n";
+        return 1;
+    }
     return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }
 
@@ -501,13 +537,15 @@ int main(int argc, char** argv) {
     }
 
     Plan pl = plan(lowered, staticComb, staticSeq);
-    if (compiled && g_cov) {
-        std::cerr << "msim: -compile: coverage is not compiled yet; using the interpreter\n";
-        compiled = false;
-    }
     if (compiled) {
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle);
-        if (st >= 0) return st;
+        if (st >= 0) {
+            if (g_cov && !writeCoverage(covPath, lowered, S.vcdTop)) {
+                std::cerr << "msim: cannot write " << covPath << "\n";
+                return 1;
+            }
+            return st;
+        }
     }
 
     S.vcdPath = vcdPath.value_or("");
