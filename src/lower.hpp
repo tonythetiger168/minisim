@@ -252,7 +252,31 @@ inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::
 }
 // A class handle (8), chandle, or null: a 64-bit signal holding an object's
 // first signal id (0 is null).
-inline bool isHandleType(const slang::ast::Type& t) { return t.isClass() || t.isNull() || t.isCHandle(); }
+inline bool isHandleType(const slang::ast::Type& t) {
+    return t.isClass() || t.isNull() || t.isCHandle() || t.isVirtualInterface();   // a virtual interface is an instance number (25.9)
+}
+// Virtual interfaces (25.9): interface instances are numbered from 1 as
+// they are referenced, and each member reached through a virtual interface
+// gets a column of vifTab() (filled in once every signal exists).
+struct VifInfo {
+    std::unordered_map<const slang::ast::InstanceSymbol*, int> inst;
+    std::vector<const slang::ast::InstanceSymbol*> insts{nullptr};
+    std::unordered_map<const slang::ast::Symbol*, int> member;
+    std::vector<const slang::ast::Symbol*> members;
+};
+inline VifInfo& vifInfo() { static VifInfo v; return v; }
+inline int vifInstance(const slang::ast::InstanceSymbol& i) {
+    auto& v = vifInfo();
+    auto [it, fresh] = v.inst.emplace(&i, (int)v.insts.size());
+    if (fresh) v.insts.push_back(&i);
+    return it->second;
+}
+inline int vifMember(const slang::ast::Symbol& m) {
+    auto& v = vifInfo();
+    auto [it, fresh] = v.member.emplace(&m, (int)v.members.size());
+    if (fresh) v.members.push_back(&m);
+    return it->second;
+}
 // Class methods are always automatic (8.6); other subroutines when declared
 // so or inside an automatic module, program or interface (13.3.2).
 inline bool isClassMethod(const slang::ast::SubroutineSymbol& s) {
@@ -429,6 +453,12 @@ struct Lowerer {
     // The event signal an event expression names (e, sub.e).
     int eventSig(const slang::ast::Expression& x) {
         using namespace slang::ast;
+        if (vifAccess(x)) {   // v.e, v.x (25.9): an event is two signals
+            const auto& m = x.as<MemberAccessExpression>();
+            bool two = m.member.kind == slang::ast::SymbolKind::ClockingBlock ||
+                       (m.member.isValue() && m.member.as<slang::ast::ValueSymbol>().getType().isEvent());
+            return vifSlot(m, two ? 2 : 1);
+        }
         if (classMember(x)) {   // h.e: its two slots (count, last trigger) through the handle
             const auto& m = x.as<MemberAccessExpression>();
             const PropSlot* ps = memberSlot(m);
@@ -1023,10 +1053,49 @@ struct Lowerer {
         size_t k = t.find_first_not_of(" \t\r\n");
         return k != std::string::npos && t.compare(k, 5, "super") == 0;
     }
+    // A task or function of an interface called through a virtual
+    // interface (25.9): the same subroutine of whichever instance v names.
+    E vifCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym, bool wantValue) {
+        using namespace slang::ast;
+        const Expression& v = *call.thisClass();
+        const auto& vt = v.type->getCanonicalType().as<VirtualInterfaceType>();
+        const DefinitionSymbol* def = &vt.iface.getDefinition();
+        int h = fresh(64);
+        { Instr i; i.k = IK::Assign; i.sig = h; i.e = exprH(v); prog.emit(i); }
+        int res = -1;
+        int rw = 0;
+        if (wantValue) {
+            rw = storeW(sym.getReturnType());
+            if (rw <= 0) unsupported("return type of a function called through a virtual interface");
+            res = fresh(rw);
+        }
+        std::vector<size_t> ends;
+        auto& vi = vifInfo();
+        for (size_t k = 1; k < vi.insts.size(); k++) {
+            const InstanceSymbol& inst = *vi.insts[k];
+            if (&inst.getDefinition() != def) continue;
+            const Symbol* f = inst.body.find(sym.name);
+            if (!f || f->kind != SymbolKind::Subroutine) continue;
+            size_t no = emitJmpIfNot(bin(Op::Eq, ref(h), konst(make((uint64_t)k, 0, 64))));
+            vifTarget = &f->as<SubroutineSymbol>();
+            E r = emitUserCall(call, wantValue);
+            if (wantValue) { Instr i; i.k = IK::Assign; i.sig = res; i.e = resize(r, rw, sym.getReturnType().isSigned(), false); prog.emit(i); }
+            ends.push_back(emitJmp());
+            prog.code[no].target = prog.code.size();
+        }
+        // No instance matched: a null virtual interface (25.9).
+        { Instr i; i.k = IK::Assign; i.sig = fresh(64); i.e = node(Op::Ref); i.e->sig = -1; i.e->at = konst(make(0, 0, 64)); prog.emit(i); }
+        patch(ends, prog.code.size());
+        return wantValue ? ref(res, sym.getReturnType().isSigned()) : nullptr;
+    }
+    const slang::ast::SubroutineSymbol* vifTarget = nullptr;
     E emitUserCall(const slang::ast::CallExpression& call, bool wantValue) {
         using namespace slang::ast;
         if (call.isSystemCall()) unsupported("system call");
         const auto* sym = std::get<const SubroutineSymbol*>(call.subroutine);
+        bool viaVif = false;
+        if (vifTarget) { sym = vifTarget; vifTarget = nullptr; viaVif = true; }
+        else if (call.thisClass() && call.thisClass()->type->isVirtualInterface()) return vifCall(call, *sym, wantValue);
         if (!sym || !subs) unsupported("subroutine call");
         if (sym->flags.has(MethodFlags::DPIImport)) unsupported("DPI import");
         if (sym->flags.has(MethodFlags::Randomize)) return randomizeCall(call);
@@ -1072,7 +1141,7 @@ struct Lowerer {
             }
             return emitAutoCall(*sub, args, wantValue, self, isStatic, vslot);
         }
-        if (call.thisClass()) unsupported("method call on a non-class");
+        if (call.thisClass() && !viaVif) unsupported("method call on a non-class");
         if (sub->lay) return emitAutoCall(*sub, args, wantValue);
 
         for (size_t n = 0; n < args.size(); n++) {
@@ -1250,6 +1319,15 @@ struct Lowerer {
                 return ref(sg);
             }
             case ExpressionKind::NewClass: return newObject(e.as<NewClassExpression>());
+            case ExpressionKind::ArbitrarySymbol: {   // an interface instance as a virtual interface value (25.9)
+                const Symbol* sym = e.as<ArbitrarySymbolExpression>().symbol;
+                if (sym->kind == SymbolKind::InterfacePort) {
+                    auto [conn, mp] = sym->as<InterfacePortSymbol>().getConnection();
+                    sym = conn;
+                }
+                if (!sym || sym->kind != SymbolKind::Instance) unsupported("virtual interface value of this kind");
+                return konst(make((uint64_t)vifInstance(sym->as<InstanceSymbol>()), 0, 64));
+            }
             case ExpressionKind::CopyClass: {   // new h (8.12): a shallow copy
                 int tmp = fresh(64);
                 Instr i; i.k = IK::New; i.sig = tmp; i.e = exprH(e.as<CopyClassExpression>().sourceExpr());
@@ -1287,6 +1365,7 @@ struct Lowerer {
         using namespace slang::ast;
         const Expression& a = outArg(a0);
         auto at = [](int sig) { auto n = node(Op::AddrOf); n->sig = sig; return n; };
+        if (vifAccess(a)) return vifAddr(a.as<MemberAccessExpression>());   // ref to v.x (25.9)
         if (classMember(a)) {
             const auto& m = a.as<MemberAccessExpression>();
             const PropSlot* ps = memberSlot(m);
@@ -1335,8 +1414,114 @@ struct Lowerer {
         unsupported("class member access of this kind");
     }
     static bool classMember(const slang::ast::Expression& e) {
-        return e.kind == slang::ast::ExpressionKind::MemberAccess &&
-               isHandleType(*e.as<slang::ast::MemberAccessExpression>().value().type);
+        if (e.kind != slang::ast::ExpressionKind::MemberAccess) return false;
+        const auto& t = *e.as<slang::ast::MemberAccessExpression>().value().type;
+        return isHandleType(t) && !t.isVirtualInterface();
+    }
+    // The virtual interface v of v.x or v.cb.x (25.9), or null.
+    static const slang::ast::Expression* vifBase(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        if (e.kind != ExpressionKind::MemberAccess) return nullptr;
+        const Expression& v = e.as<MemberAccessExpression>().value();
+        if (v.type->isVirtualInterface()) return &v;
+        if (v.kind == ExpressionKind::MemberAccess && v.as<MemberAccessExpression>().member.kind == SymbolKind::ClockingBlock &&
+            v.as<MemberAccessExpression>().value().type->isVirtualInterface())
+            return &v.as<MemberAccessExpression>().value();
+        return nullptr;
+    }
+    static bool vifAccess(const slang::ast::Expression& e) { return vifBase(e) != nullptr; }
+    // The interface instances a virtual interface of this type can name.
+    static std::vector<std::pair<int, const slang::ast::InstanceSymbol*>> vifInstances(const slang::ast::Type& t) {
+        using namespace slang::ast;
+        const DefinitionSymbol* def = &t.getCanonicalType().as<VirtualInterfaceType>().iface.getDefinition();
+        std::vector<std::pair<int, const InstanceSymbol*>> r;
+        auto& vi = vifInfo();
+        for (size_t k = 1; k < vi.insts.size(); k++)
+            if (&vi.insts[k]->getDefinition() == def) r.push_back({(int)k, vi.insts[k]});
+        return r;
+    }
+    // The clocking block of instance `inst` that cb (of the interface's
+    // definition) stands for, built if nothing built it yet (14).
+    const slang::ast::ClockingBlockSymbol* vifClocking(const slang::ast::InstanceSymbol& inst, const slang::ast::ClockingBlockSymbol& cb) {
+        using namespace slang::ast;
+        const Symbol* f = inst.body.find(cb.name);
+        if (!f || f->kind != SymbolKind::ClockingBlock) return nullptr;
+        const auto& icb = f->as<ClockingBlockSymbol>();
+        auto savedFrames = frames;
+        frames.clear();
+        clockingIdx(icb);
+        frames = savedFrames;
+        return &icb;
+    }
+    // 1 + the signal id of v.x now (0 for a null v).
+    E vifAddr(const slang::ast::MemberAccessExpression& m) {
+        using namespace slang::ast;
+        const Expression* v = vifBase(m);
+        const Symbol& mem = m.member;
+        if (mem.kind == SymbolKind::ClockingBlock || mem.kind == SymbolKind::ClockVar) {
+            const auto& cb = mem.kind == SymbolKind::ClockingBlock ? mem.as<ClockingBlockSymbol>()
+                                                                     : mem.getParentScope()->asSymbol().as<ClockingBlockSymbol>();
+            for (auto& [k, inst] : vifInstances(*v->type)) vifClocking(*inst, cb);
+        } else {
+            if (!mem.isValue()) unsupported("this member through a virtual interface");
+            const Type& mt = mem.as<ValueSymbol>().getType().getCanonicalType();
+            if (mt.isUnpackedArray() || isDynType(mt)) unsupported("an array member through a virtual interface");
+        }
+        auto n = node(Op::VifSig, {exprH(*v)});
+        n->hi = vifMember(mem);
+        return n;
+    }
+    // v.cb.x <= e (14.16) through a virtual interface: the drive of
+    // whichever instance v names.
+    bool vifSyncDrive(const slang::ast::AssignmentExpression& a) {
+        using namespace slang::ast;
+        const Expression& l = a.left();
+        if (!vifAccess(l) || l.as<MemberAccessExpression>().member.kind != SymbolKind::ClockVar) return false;
+        if (!a.isNonBlocking()) unsupported("a write to a clockvar other than a synchronous drive (14.16)");
+        const auto& m = l.as<MemberAccessExpression>();
+        const auto& cb = m.member.getParentScope()->asSymbol().as<ClockingBlockSymbol>();
+        const Expression* v = vifBase(l);
+        int h = fresh(64);
+        { Instr i; i.k = IK::Assign; i.sig = h; i.e = exprH(*v); prog.emit(i); }
+        std::vector<size_t> ends;
+        for (auto& [k, inst] : vifInstances(*v->type)) {
+            const ClockingBlockSymbol* icb = vifClocking(*inst, cb);
+            if (!icb) continue;
+            const Symbol* cv = icb->find(m.member.name);
+            if (!cv) continue;
+            size_t no = emitJmpIfNot(bin(Op::Eq, ref(h), konst(make((uint64_t)k, 0, 64))));
+            Instr i;
+            i.k = IK::CbDrive;
+            i.sig = sigmap.at(cv);
+            i.dkey = clockingIdx(*icb);
+            i.dres = -1;
+            auto& outs = clockings()[i.dkey].outs;
+            for (size_t q = 0; q < outs.size(); q++)
+                if (outs[q].cv == i.sig) i.dres = (int)q;
+            if (i.dres < 0) unsupported("a drive of a clocking input (14.16)");
+            i.e = expr(a.right());
+            if (const TimingControl* tc = a.timingControl) {
+                if (tc->kind != TimingControlKind::CycleDelay) unsupported("an intra-assignment delay in a synchronous drive (14.16)");
+                i.de = expr(tc->as<CycleDelayControl>().expr);
+            }
+            prog.emit(i);
+            ends.push_back(emitJmp());
+            prog.code[no].target = prog.code.size();
+        }
+        patch(ends, prog.code.size());
+        return true;
+    }
+    // v.x as an indirect id (expr.hpp mode 10/11); n consecutive ids.
+    int vifSlot(const slang::ast::MemberAccessExpression& m, int n = 1) {
+        int first = -1;
+        for (int k = 0; k < n; k++) {
+            int tmp = fresh(64);
+            Instr i; i.k = IK::Assign; i.sig = tmp;
+            i.e = k ? bin(Op::Add, vifAddr(m), konst(make((uint64_t)k, 0, 64))) : vifAddr(m);
+            prog.emit(i);
+            if (!k) first = indThrough(tmp);
+        }
+        return first;
     }
     // new / new(args) (8.7): allocate, then run the constructor on it.
     E newObject(const slang::ast::NewClassExpression& n) {
@@ -3078,6 +3263,13 @@ struct Lowerer {
             }
             case ExpressionKind::MemberAccess: {    // s.f
                 const auto& m = e.as<MemberAccessExpression>();
+                if (vifAccess(e)) {   // v.x, v.cb.x (25.9)
+                    if (m.member.kind == SymbolKind::Subroutine) unsupported("a task or function call through a virtual interface");
+                    E r = ref(-1, e.type->isSigned());
+                    r->at = vifAddr(m);
+                    if (isHandleType(*e.type)) return r;
+                    return sized(r, storeW(*e.type), e.type->isSigned(), ctx);
+                }
                 if (isHandleType(*m.value().type)) {   // h.x (8.4): read through the handle when evaluated
                     const PropSlot* ps = memberSlot(m);
                     E r;
@@ -3160,6 +3352,7 @@ struct Lowerer {
             }
             case ExpressionKind::MemberAccess: {   // s.f = ...
                 const auto& m = e.as<MemberAccessExpression>();
+                if (vifAccess(e)) { i.sig = vifSlot(m); return; }   // v.x = ... (25.9)
                 if (isHandleType(*m.value().type)) {   // h.x = ... (8.4)
                     const PropSlot* ps = memberSlot(m);
                     if (!ps) { i.sig = sigAt(&m.member); return; }
@@ -3197,7 +3390,7 @@ struct Lowerer {
                 return;
             }
             int sig;
-            if (classMember(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x)
+            if (classMember(s.expr) || vifAccess(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x), @(v.x)
             else {
                 if (!ValueExpressionBase::isKind(s.expr.kind)) unsupported("event on non-signal");
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
@@ -4572,7 +4765,7 @@ struct Lowerer {
         using namespace slang::ast;
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
-            if (syncDrive(a)) return;   // cb.v <= e (14.16)
+            if (syncDrive(a) || vifSyncDrive(a)) return;   // cb.v <= e, v.cb.v <= e (14.16, 25.9)
             if (int d = dynSig(a.left()); d >= 0) {   // q = '{1, 2}; d = new[8]; aa = other;
                 if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this container assignment");
                 assignContainer(d, a.right());
@@ -6509,6 +6702,17 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 spec.visit(finder);
         else if (m.kind == slang::ast::SymbolKind::ClassType && (m.name == "semaphore" || m.name == "process"))
             m.visit(finder);
+    // Every interface instance gets its virtual interface number (25.9).
+    {
+        struct IfInst : slang::ast::ASTVisitor<IfInst> {
+            void handle(const slang::ast::InstanceSymbol& i) {
+                if (i.isInterface()) vifInstance(i);
+                visitDefault(i);
+            }
+            void handle(const slang::ast::GenerateBlockSymbol& g) { if (!g.isUninstantiated) visitDefault(g); }
+        } ifi;
+        comp.getRoot().visit(ifi);
+    }
     // The simulation precision is the finest precision of any module (3.14.3).
     simPrecExp() = finder.prec == 1000 ? -9 : finder.prec;
     out.precExp = simPrecExp();
@@ -6720,6 +6924,41 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     pc.placeInit();
     sampledInit(out);
     rejectRecursive(order);
+    // Virtual interfaces (25.9): each referenced instance's signal for each
+    // member reached through a virtual interface.
+    {
+        using namespace slang::ast;
+        auto& vi = vifInfo();
+        auto bodyDef = [](const Symbol& m) -> const DefinitionSymbol* {
+            const Scope* sc = m.getParentScope();
+            while (sc && sc->asSymbol().kind != SymbolKind::InstanceBody) sc = sc->asSymbol().getParentScope();
+            return sc ? &sc->asSymbol().as<InstanceBodySymbol>().getDefinition() : nullptr;
+        };
+        auto& tab = vifTab();
+        tab.assign(vi.insts.size(), {});
+        for (size_t k = 1; k < vi.insts.size(); k++) {
+            const InstanceSymbol& inst = *vi.insts[k];
+            tab[k].assign(vi.members.size(), -1);
+            for (size_t j = 0; j < vi.members.size(); j++) {
+                const Symbol* m = vi.members[j];
+                if (bodyDef(*m) != &inst.getDefinition()) continue;
+                if (m->kind == SymbolKind::ModportPort)
+                    if (const Symbol* in = m->as<ModportPortSymbol>().internalSymbol) m = in;
+                std::vector<std::string_view> path;   // cb.x: [cb, x]
+                for (const Symbol* q = m; q && q->kind != SymbolKind::InstanceBody; q = &q->getParentScope()->asSymbol())
+                    path.insert(path.begin(), q->name);
+                const Symbol* f = &inst.body;
+                for (auto nm : path) {
+                    if (!f || !f->isScope()) { f = nullptr; break; }
+                    f = f->as<Scope>().find(nm);
+                }
+                if (f && f->kind == SymbolKind::Port)
+                    if (const Symbol* in = f->as<PortSymbol>().internalSymbol) f = in;
+                if (!f) continue;
+                if (auto it = sigmap.find(f); it != sigmap.end()) tab[k][j] = it->second;
+            }
+        }
+    }
     for (const slang::ast::Symbol* b : blockIds().disabledFromOutside)
         if (!blockIds().roots.count(blockIds().of(b)))
             Lowerer::unsupported(("disable of block '" + std::string(b->name) +

@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Virtual interfaces (25.9): variables, properties and arguments of
+  `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
+  clocking blocks reached through them.
 - `std::semaphore` (15.3), `std::mailbox` (15.4, parameterized, typeless and
   bounded) and `std::process` (9.7: self, status, kill, await, suspend,
   resume).
