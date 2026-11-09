@@ -124,9 +124,48 @@ struct BlockIds {
 };
 inline BlockIds& blockIds() { static BlockIds b; return b; }
 // Bits a value of this type takes in a signal: a string is a 64-bit id (6.16).
+// Unpacked structs and unions (7.2, 7.3) are kept as one vector: the
+// members in declared order, the first at the top, each in its own storage
+// (a real as its 64 bits, a string as its 64-bit pool id). A union's members
+// all start at bit 0. -1: a member that cannot be laid out this way.
+inline int uWidth(const slang::ast::Type& t0);
 // A string is a 64-bit pool id; a shortreal is kept as a double, rounded to
 // single precision whenever a shortreal value is made (6.12).
-inline int storeW(const slang::ast::Type& t) { return t.isString() || t.isFloating() ? 64 : (int)t.getBitWidth(); }
+inline int storeW(const slang::ast::Type& t0) {
+    const auto& t = t0.getCanonicalType();
+    if (t.isUnpackedStruct() || t.isUnpackedUnion()) return uWidth(t);
+    return t.isString() || t.isFloating() ? 64 : (int)t.getBitWidth();
+}
+inline int uWidth(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (t.isUnpackedStruct() || t.isUnpackedUnion()) {
+        int w = 0;
+        bool u = t.isUnpackedUnion();
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+            int fw = uWidth(f.getType());
+            if (fw <= 0) return -1;
+            w = u ? std::max(w, fw) : w + fw;
+        }
+        return w;
+    }
+    if (t.isUnpackedArray() || t.isClass() || t.isEvent() || t.isCHandle() || t.isVirtualInterface()) return -1;
+    return storeW(t);
+}
+// Offset and width of field f inside unpacked struct or union t.
+inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::FieldSymbol& f) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    int fw = uWidth(f.getType());
+    if (t.isUnpackedUnion()) return {0, fw};
+    int after = 0;
+    bool seen = false;
+    for (const auto& g : t.as<Scope>().membersOfType<FieldSymbol>()) {
+        if (seen) after += uWidth(g.getType());
+        if (&g == &f) seen = true;
+    }
+    return {after, fw};
+}
 inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return r; }
 
 // name, width, and whether the signal is a net. A net starts at Z.
@@ -1199,10 +1238,18 @@ struct Lowerer {
     // s.f on a packed struct or union (7.2.1, 7.3.1): a constant slice.
     PSel memberPSel(const slang::ast::MemberAccessExpression& m) {
         using namespace slang::ast;
-        if (!m.value().type->isIntegral())
-            unsupported("member of an unpacked struct or a class");
         if (m.member.kind != SymbolKind::Field) unsupported("member access");
         const auto& f = m.member.as<FieldSymbol>();
+        const Type& vt = m.value().type->getCanonicalType();
+        if (vt.isUnpackedStruct() || vt.isUnpackedUnion()) {
+            auto [off, w] = uField(vt, f);
+            if (w <= 0 || uWidth(vt) <= 0) unsupported("member of an unpacked struct that holds an array, class or event");
+            PSel ps;
+            ps.cbit = off;
+            ps.bits = w;
+            return ps;
+        }
+        if (!vt.isIntegral()) unsupported("member of a class");
         PSel ps;
         ps.cbit = (int64_t)f.bitOffset;
         ps.bits = (int)f.getType().getBitWidth();
@@ -1633,11 +1680,12 @@ struct Lowerer {
             }
             case ExpressionKind::MemberAccess: {    // s.f
                 const auto& m = e.as<MemberAccessExpression>();
-                return sized(readPSel(expr(m.value()), memberPSel(m)), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                return sized(readPSel(expr(m.value()), memberPSel(m)), storeW(*e.type), e.type->isSigned(), ctx);
             }
             case ExpressionKind::SimpleAssignmentPattern:
             case ExpressionKind::StructuredAssignmentPattern:
             case ExpressionKind::ReplicatedAssignmentPattern: {   // '{a, b}, '{f: x}, '{n{a}} (10.9)
+                if (e.type->isUnpackedStruct() || e.type->isUnpackedUnion()) return sized(structValue(e), storeW(*e.type), false, ctx);
                 if (!e.type->isIntegral()) unsupported("assignment pattern of an unpacked type");
                 const auto& ap = static_cast<const AssignmentPatternExpressionBase&>(e);
                 std::vector<E> parts;
@@ -1991,6 +2039,53 @@ struct Lowerer {
         auto [a, b] = pair(l, it);
         return bin(Op::WildEq, a, b);
     }
+    // The storage bits of a value of type t (see uWidth): a real as its 64
+    // bits, a string as its pool id, a struct as its members.
+    E storageOf(const slang::ast::Type& t0, const slang::ast::Expression& x) {
+        const auto& t = t0.getCanonicalType();
+        if (t.isFloating()) { auto b = node(Op::Resize, {realOf(x)}); b->hi = 64; return b; }
+        if (t.isString()) return resize(strOf(x), 64, false, false);
+        int w = storeW(t);
+        if (t.isIntegral()) return resize(expr(x), w, x.type->isSigned(), false);
+        return resize(expr(x), w, false, false);
+    }
+    // '{a, b, c} or '{f: v, default: d} for an unpacked struct (10.9.2): slang
+    // gives one element per member, in member order.
+    E structValue(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        const Type& t = e.type->getCanonicalType();
+        if (t.isUnpackedUnion()) unsupported("assignment pattern of an unpacked union");
+        if (e.kind == ExpressionKind::ReplicatedAssignmentPattern) unsupported("replicated pattern of a struct");
+        const auto& ap = static_cast<const AssignmentPatternExpressionBase&>(e);
+        std::vector<const FieldSymbol*> fs;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) fs.push_back(&f);
+        auto els = ap.elements();
+        if (els.size() != fs.size()) unsupported("struct pattern");
+        std::vector<E> parts;
+        for (size_t k = 0; k < fs.size(); k++) parts.push_back(storageOf(fs[k]->getType(), *els[k]));
+        return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+    }
+    // The default value of an unpacked struct (6.8): x for 4-state members,
+    // 0 for 2-state members and reals, "" for strings.
+    E structDefault(const slang::ast::Type& t0) {
+        using namespace slang::ast;
+        const auto& t = t0.getCanonicalType();
+        std::vector<E> parts;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+            const Type& ft = f.getType().getCanonicalType();
+            int w = uWidth(ft);
+            if (ft.isUnpackedStruct()) parts.push_back(structDefault(ft));
+            else if (ft.isIntegral() && ft.isFourState()) parts.push_back(konst(xfill(w)));
+            else if (ft.isString()) parts.push_back(konst(make(mkstr("").v, 0, 64, 0)));
+            else parts.push_back(konst(make(0, 0, w, 0)));
+            if (t.isUnpackedUnion()) break;
+        }
+        if (t.isUnpackedUnion()) {
+            int w = uWidth(t);
+            return resize(parts[0], w, false, false);
+        }
+        return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+    }
     // $clog2, $countbits and friends (20.8, 20.9), $random / $dist_uniform
     // (20.14), $urandom / $urandom_range (18.13). Null if n is none of them.
     E sysFnNode(int id, std::vector<E> kids, int ctl = 0) {
@@ -2163,6 +2258,27 @@ struct Lowerer {
         if (t.isIntegral()) { fmt += "%0d"; out.push_back(v); return; }
         unsupported("%p of this type");
     }
+    // An unpacked struct prints with member names; a union, its first member (21.2.1.6).
+    void pfmtStruct(const slang::ast::Type& t0, E v, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        fmt += "'{";
+        bool first = true;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+            if (!first) fmt += ", ";
+            first = false;
+            fmt += escPct(std::string(f.name)) + ":";
+            auto [off, w] = uField(t, f);
+            E part = slice(v, off + w - 1, off);
+            const Type& ft = f.getType().getCanonicalType();
+            if (ft.isUnpackedStruct() || ft.isUnpackedUnion()) pfmtStruct(ft, part, fmt, out);
+            else if (ft.isString()) pfmtSingular(ft, un(Op::AsStr, part), fmt, out);
+            else if (ft.isFloating()) pfmtSingular(ft, un(Op::AsReal, part), fmt, out);
+            else pfmtSingular(ft, ft.isSigned() ? resize(part, w, false, true) : part, fmt, out);
+            if (t.isUnpackedUnion()) break;
+        }
+        fmt += "}";
+    }
     void pfmt(const slang::ast::Expression& a, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
         const Expression& x = peel(a);
@@ -2192,6 +2308,7 @@ struct Lowerer {
                 for (int64_t k = 0; k < n; k++) {
                     if (k) fmt += ", ";
                     if (dim + 1 < A.dims.size()) walk(dim + 1);
+                    else if (et->isUnpackedStruct() || et->isUnpackedUnion()) pfmtStruct(*et, ref(A.base + flat++), fmt, out);
                     else pfmtSingular(*et, ref(A.base + flat++, A.sgn), fmt, out);
                 }
                 fmt += "}";
@@ -2199,7 +2316,7 @@ struct Lowerer {
             walk(0);
             return;
         }
-        if (x.type->isUnpackedStruct() || x.type->isUnpackedUnion()) unsupported("%p of an unpacked struct");
+        if (x.type->isUnpackedStruct() || x.type->isUnpackedUnion()) { pfmtStruct(*x.type, expr(x), fmt, out); return; }
         pfmtSingular(*x.type, expr(x), fmt, out);
     }
     template <typename Args>
@@ -3209,6 +3326,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             return;
         }
         const auto& t = v.getType();
+        if (!e && (t.isUnpackedStruct() || t.isUnpackedUnion())) {   // 7.2: each member's default
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
+            i.e = init->structDefault(t);
+            init->prog.emit(i);
+            return;
+        }
         // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
         bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString());
         if (!e && !zero) return;

@@ -1,6 +1,5 @@
 // IEEE 1800-2023 12.5.4: case inside matches values, ranges and wildcards
 // (12.5.4).
-//! xfail: case inside is an error
 //! icarus-skip: Icarus 13 does not support case inside
 module top;
   int a;

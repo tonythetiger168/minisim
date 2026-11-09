@@ -1,6 +1,5 @@
 // IEEE 1800-2023 9.4.5: Intra-assignment repeat event control: the value is
 // taken now and written after n events (9.4.5).
-//! xfail: intra-assignment event controls are errors
 module top;
   logic clk = 0;
   always #1 clk = ~clk;
