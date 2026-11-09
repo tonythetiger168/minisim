@@ -33,7 +33,7 @@ whole command line (so `+UVM_TESTNAME` works but `+uvm_set_config_*` and
 
 - The UVM DPI code (`src/dpi/uvm_dpi.cc`): regular expressions, the full
   command line, and HDL backdoor access need it, and it uses VPI.
-- Function calls in constraints, rand associative arrays and rand arrays of
+- Rand associative arrays and rand arrays of
   arrays.
 
 ## Debugging

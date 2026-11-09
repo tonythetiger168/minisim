@@ -185,6 +185,10 @@ struct RandItem {
     // element at solve time, with signal loopVar read as the index.
     int loopCont = -1, loopVar = -1;
     std::vector<RandItem> body;
+    // Function calls in the constraint (18.5.12): each program computes one
+    // call's result into the temporary that e reads. They run at solve time
+    // once the rand variables they read have values.
+    std::vector<std::shared_ptr<Prog>> fns;
 };
 // A constraint block (18.5): its constraint_mode slot in the object.
 struct RandBlock {
