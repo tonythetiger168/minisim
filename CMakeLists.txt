@@ -105,6 +105,9 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_vcd
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd.cmake)
+  add_test(NAME msim_vcdtasks
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_vcdtasks.cmake)
   # Compiled mode: generated C++ prints the same as the interpreter.
   add_test(NAME msim_compile
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}

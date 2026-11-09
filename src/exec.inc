@@ -403,6 +403,17 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
             case IK::ReadMem: readMem(i); pc++; break;
             case IK::WriteMem: writeMem(i); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
+            case IK::Dump: {
+                Val a = i.args.empty() ? Val{} : eval(i.args[0], rd);
+                std::string str;
+                int64_t num = -1;
+                if (!i.args.empty()) {
+                    if (i.dcmd == DC_FILE) { a.str = true; str = v_str(a); }
+                    else if (!a.x) num = v_to_i64(a);
+                }
+                S.dumpTask(i.dcmd, str, num, i.dsel);
+                pc++; break;
+            }
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = i.target; }

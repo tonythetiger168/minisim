@@ -216,6 +216,18 @@ struct Sim {
     vector<uint32_t> fstH;                           // FST handle per signal (0: not dumped)
     string fstBuf;
     bool waving() const { return vcd.is_open() || fst != nullptr; }
+    // VCD tasks (21.7.1). msim -vcd dumps every signal from time 0 and the
+    // design's $dumpfile / $dumpvars are ignored; without -vcd, $dumpvars
+    // opens $dumpfile's file (default dump.vcd) at the end of its time slot,
+    // with the selected signals. $dumpoff / $dumpon / $dumpall / $dumpflush /
+    // $dumplimit work on either.
+    bool dumpCli = false, dumpPend = false, dumpOff = false, dumpStopped = false;
+    string dumpFile = "dump.vcd";
+    vector<char> dumpSel;                            // empty: every signal
+    uint64_t dumpLimit = 0;                          // bytes; 0: no limit
+    bool dumped(size_t i) const {
+        return !sigs[i].hide && (dumpSel.empty() || (i < dumpSel.size() && dumpSel[i]));
+    }
 
     Sim() { g_sformat = &Sim::sformat; }
 
@@ -970,14 +982,127 @@ struct Sim {
         if (sigs[s].hide) return;
 #ifdef MINISIM_FST
         if (fst) {
+            if (dumpOff || !dumped((size_t)s)) return;
             if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; }
             writeVal(s);
             return;
         }
 #endif
         if (!vcd.is_open() || !vcd) return;
-        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
+        if (dumpOff || dumpStopped || !dumped((size_t)s)) return;
+        stamp();
         writeVal(s);
+        if (dumpLimit && (uint64_t)vcd.tellp() >= dumpLimit) {
+            vcd << "$comment Note: $dumplimit reached; dumping stops $end\n";
+            dumpStopped = true;
+        }
+    }
+    void stamp() {
+#ifdef MINISIM_FST
+        if (fst) { if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; } return; }
+#endif
+        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
+    }
+    // Every dumped signal, as X ($dumpoff) or its value ($dumpon, $dumpall).
+    void dumpBlock(const char* kw, bool asX) {
+        stamp();
+        if (!fst) vcd << kw << "\n";
+        for (size_t i = 0; i < sigs.size(); i++) {
+            if (!dumped(i)) continue;
+            if (!asX) { writeVal((int)i); continue; }
+            Val keep = sigs[i].val;
+            sigs[i].val = allx(sigs[i].w);
+            writeVal((int)i);
+            sigs[i].val = keep;
+        }
+        if (!fst) vcd << "$end\n";
+    }
+    // Selects signals for $dumpvars: sel holds name prefixes of scopes
+    // (levels deep, 0 = all below) and exact names of variables.
+    void dumpSelect(int64_t levels, const vector<pair<string, bool>>& sel) {
+        if (dumpSel.size() != sigs.size()) dumpSel.assign(sigs.size(), 0);
+        vector<pair<string, bool>> all;
+        if (sel.empty()) all.push_back({"", false});
+        const auto& use = sel.empty() ? all : sel;
+        if (levels < 0) levels = 0;
+        for (size_t i = 0; i < sigs.size(); i++) {
+            const string& n = sigs[i].name;
+            for (const auto& [p, var] : use) {
+                if (n.compare(0, p.size(), p) != 0) continue;
+                if (var) {
+                    if (n.size() == p.size() || n[p.size()] == '[') { dumpSel[i] = 1; break; }
+                    continue;
+                }
+                if (p.find("::") == string::npos && n.find("::") != string::npos && !sel.empty()) continue;
+                int depth = 0, br = 0;
+                for (size_t k = p.size(); k < n.size(); k++) {
+                    if (n[k] == '[') br++;
+                    else if (n[k] == ']') br--;
+                    else if (n[k] == '.' && !br) depth++;
+                }
+                if (levels == 0 || depth < levels) { dumpSel[i] = 1; break; }
+            }
+        }
+    }
+    void dumpTask(int cmd, const string& str, int64_t num, const vector<pair<string, bool>>& sel) {
+        switch (cmd) {
+            case DC_FILE:
+                if (dumpCli || waving() || dumpPend) return;
+                if (!str.empty()) dumpFile = str;
+                return;
+            case DC_VARS:
+                if (dumpCli) return;
+                if (waving()) { cerr << "msim: $dumpvars after the dump has started is ignored (21.7.1.2)\n"; return; }
+                dumpPend = true;
+                if (sel.empty() && num < 0) { dumpSel.assign(sigs.size(), 1); return; }
+                dumpSelect(num, sel);
+                return;
+            case DC_OFF:
+                if (dumpOff) return;
+                dumpOff = true;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+                dumpBlock("$dumpoff", true);
+                return;
+            case DC_ON:
+                if (!dumpOff) return;
+                dumpOff = false;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 1); }
+#endif
+                dumpBlock("$dumpon", false);
+                return;
+            case DC_ALL:
+                if (waving() && !dumpOff && !dumpStopped) dumpBlock("$dumpall", false);
+                return;
+            case DC_FLUSH:
+#ifdef MINISIM_FST
+                if (fst) { fstWriterFlushContext((fstWriterContext*)fst); return; }
+#endif
+                if (vcd.is_open()) vcd.flush();
+                return;
+            case DC_LIMIT:
+                dumpLimit = num > 0 ? (uint64_t)num : 0;
+                return;
+        }
+    }
+    // $dumpvars without -vcd: the header and the values at the end of the slot.
+    void startDump() {
+        dumpPend = false;
+        vcdPath = dumpFile;
+        header();
+        if (!waving()) return;
+        if (!fst) { vcd << "#" << now << "\n"; lastDump = now; }
+        dumpvars();
+        if (dumpOff) {
+#ifdef MINISIM_FST
+            if (fst) { fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+            dumpBlock("$dumpoff", true);
+        }
     }
     // set() only writes a line when a value changes, so a signal still holding
     // its starting value (cnt stays X until the first clock) never appears.
@@ -988,14 +1113,14 @@ struct Sim {
         if (fst) {
             // FST has no $dumpvars block: the time-0 values are ordinary changes.
             fstWriterEmitTimeChange((fstWriterContext*)fst, now);
-            for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+            for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
             lastDump = now;
             return;
         }
 #endif
         if (!vcd.is_open() || !vcd) return;
         vcd << "$dumpvars\n";
-        for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+        for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
         vcd << "$end\n";
     }
 
@@ -1088,7 +1213,7 @@ struct Sim {
         struct Scope { string name; vector<size_t> vars; vector<Scope> kids; };
         Scope root{vcdTop.empty() ? string("top") : vcdTop, {}, {}};
         for (size_t i = 0; i < sigs.size(); i++) {
-            if (sigs[i].hide) continue;
+            if (!dumped(i)) continue;
             Scope* sc = &root;
             const string& n = sigs[i].name;
             size_t b = 0, e;
@@ -1144,7 +1269,7 @@ struct Sim {
         run(~0ULL, false);
     }
     void run(uint64_t end, bool start = true) {
-        if (start) { header(); dumpvars(); }
+        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); }
         if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
@@ -1180,6 +1305,8 @@ struct Sim {
                     applyNba();
                 } else if (!postq.empty()) {                   // postponed ($strobe/$monitor)
                     drainPost();                               // then, and only then, time advances
+                } else if (dumpPend) {
+                    startDump();                               // $dumpvars in this slot: the values it ends with
                 } else break;
             }
         }

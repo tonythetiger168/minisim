@@ -43,10 +43,14 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    Dump,       // a VCD task (21.7.1): dcmd is a DumpCmd; args / dsel hold the operands
     Ret         // pop that address; an empty stack ends the process
 };
 
 struct Prog;
+
+// IK::Dump commands, one per VCD task (21.7.1).
+enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT };
 
 // Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
 // is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
@@ -106,6 +110,10 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
+    // signal-name prefixes relative to the top ("" is the top, "u1." an
+    // instance); `second` is true for a variable (an exact name).
+    std::vector<std::pair<std::string, bool>> dsel;
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
 };
@@ -134,6 +142,7 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) add(e->sig);
+    if (e->op == Op::SysFn && e->sig >= 0) add(e->sig);   // a query of a container (SF_ASSOC_BOUND)
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 inline void collectRefs(const E& e, std::vector<int>& out) {

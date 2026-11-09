@@ -5,7 +5,7 @@ Clause numbers were checked against the 2023 text; most are unchanged from 1800-
 A ✅ row has a test in `tests/spec/` named after its clause. Each of those tests
 is also checked against Icarus Verilog 13 when `iverilog` is installed.
 🟡 works with the limits listed, ❌ is an error at lowering time ("lower: unsupported ..."),
-including any system task msim does not know (only the waveform tasks such as `$dumpvars` are skipped),
+including any system task msim does not know (only `$dumpports` and vendor waveform tasks such as `$fsdbDumpvars` are skipped),
 never a silent wrong answer. If you find a construct that runs but gives the
 wrong result, that is a bug: please add a spec test for it.
 
@@ -82,7 +82,7 @@ script fails if any other test fails or if an xfail test starts passing.
 | 20.8.1 | $clog2 | ✅ | `20.8-clog2` |
 | 20.9 | Bit vector functions | ✅ | `$countones`, `$countbits`, `$onehot`, `$onehot0`, `$isunknown`. `20.9-bit-vector-functions` |
 | 20.10 | Severity tasks | ✅ | `$fatal` / `$error` / `$warning` / `$info` print the severity, file, line, scope and time, then the message; `$fatal` ends the run with exit status 1. `20.10-severity-tasks` |
-| 20.14 | $random, $dist_uniform | ✅ | the Annex N algorithm, so a seed gives the same values as other simulators. Not yet: the other `$dist_*` functions. `20.14-distribution` |
+| 20.14 | $random, $dist_* | ✅ | `$dist_uniform`, `$dist_normal`, `$dist_exponential`, `$dist_poisson`, `$dist_chi_square`, `$dist_t`, `$dist_erlang` with the Annex N algorithms, so a seed gives the same values as other simulators. `20.14-distribution`, `20.14-dist-functions` |
 | 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m %f %e %g %p, `%0`, widths, `%-8d`, `%.3f`. `%m` is the scope of the call. `21.2.1-display-formats` |
 | 21.2.1.6 | %p assignment pattern format | 🟡 | fixed-size arrays (any dimensions), dynamic arrays, queues, associative arrays, packed structs with member names, enums by name, strings in quotes. Not yet: unpacked structs (7.2). `21.2.1.6-assignment-pattern-format` |
 | 21.2.2–21.2.3 | $strobe, $monitor | ✅ | |
@@ -91,8 +91,12 @@ script fails if any other test fails or if an xfail test starts passing.
 | 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
 | 21.5 | $writememh, $writememb | ✅ | 1-D memories, optional start/finish. `21.5-writemem` |
 | 21.6 | $test$plusargs, $value$plusargs | ✅ | `msim t.sv +N=5`; formats %d %h %o %b %s %f. `21.6-plusargs` |
+| 20.6.1 | $typename | ✅ | built-in, packed, enum, struct, array, class and string types, with the 20.6.1 spacing rules. `20.6.1-typename` |
 | 20.6.2 | $bits | ✅ | of any fixed-size expression or type |
-| 21.7 | VCD ($dumpfile, $dumpvars) | 🟡 | `msim -vcd` dumps every signal; the tasks are ignored |
+| 20.7 | Array query functions | ✅ | `$dimensions`, `$unpacked_dimensions`, `$left`, `$right`, `$low`, `$high`, `$increment`, `$size` of fixed, dynamic, queue and associative dimensions and of integer types; a run-time dimension number; out of range gives 'x. `7.11-array-query`, `20.7-array-query-dynamic` |
+| 20.17 | $system | ✅ | runs the command in a shell; the result is its exit status. `20.17-system` |
+| 21.7.1 | VCD tasks | ✅ | `$dumpfile`, `$dumpvars` (levels, scopes and variables), `$dumpoff`, `$dumpon`, `$dumpall`, `$dumpflush`, `$dumplimit`; also on FST. `msim -vcd` dumps every signal instead of the `$dumpvars` selection. `21.7-vcd-tasks` |
+| 21.7.3 | Extended VCD ($dumpports) | ❌ | skipped with a warning |
 | 22.7 | `` `timescale `` | ✅ | per-module unit and precision; one kernel tick is the finest precision in the design, also used as the VCD `$timescale`. `22.7-timescale` |
 | 23.3 | Module instances, ports | ✅ | named and positional, parameter overrides |
 | 23.6 | Hierarchical names | ✅ | read and write `u.x`, `blk[2].x`. `23.6-hierarchical-names` |
