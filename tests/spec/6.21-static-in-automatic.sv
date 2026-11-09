@@ -1,6 +1,7 @@
 // IEEE 1800-2023 6.21: a static variable declared in an automatic function
 // or a named block keeps its value between calls, and a 2-state one with no
 // initializer starts at 0 (6.8). Also a static array local.
+//! icarus-skip: Icarus 13 does not support a static variable in an automatic function ("overriding the default variable lifetime")
 module top;
   function automatic int f();
     static int c;
