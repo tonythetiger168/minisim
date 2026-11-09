@@ -7,6 +7,13 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Added
+- `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
+  VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
+  UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
+  `-rerun`, `results.json` / `junit.xml` / `report.html`, and `-spec` to run
+  the spec suite on any of them.
+
 ## [0.1.0] - unreleased
 
 First tagged release: everything merged up to spec round 5.
