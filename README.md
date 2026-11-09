@@ -253,6 +253,62 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
+### Lint and clock-domain checks: `mlint`
+
+`mlint` runs the same front end as `msim` and then checks the elaborated
+design, so it needs no separate build setup:
+
+```sh
+mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
+mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any finding (for CI)
+mlint rtl/*.sv -disable L004 -disable CDC002
+mlint -list                                 # the rules
+```
+
+| Rule | What it finds |
+|---|---|
+| `L001` | A value is assigned on some paths of an `always_comb` but not all, so it holds its old value: an unintended latch (an `if` with no `else`, a `case` with no `default`) |
+| `L002` | A blocking assignment to a non-local variable in an `always_ff` |
+| `L003` | A non-blocking assignment in an `always_comb` |
+| `L004` | One value is assigned by more than one process |
+| `CDC001` | A flop reads another clock domain with no synchronizer, or through one flop only |
+| `CDC002` | A multi-bit bus crosses domains through a two-flop synchronizer, which does not keep its bits together |
+
+Clock domains come from the clock of every edge-triggered block, with signals
+joined across port connections, so one clock passed down through several
+modules stays one domain. Findings print as
+`file:line:col: warning: [RULE] text`, sorted by file and line.
+
+### Design for test: `mdft`
+
+`mdft` checks that a design can be scan-tested, and prints the flop count per
+clock domain, which is what a chain plan is built from:
+
+```sh
+mdft rtl/*.sv -top soc_top
+mdft rtl/*.sv -top soc_top -Werror      # exit 1 on any finding (for CI)
+mdft -list
+```
+
+| Rule | What it finds |
+|---|---|
+| `DFT001` | A gated or unreachable clock: the tester cannot drive the flop in shift mode |
+| `DFT002` | An asynchronous set or reset built from logic, which scan shift cannot hold inactive |
+| `DFT003` | A latch: not scannable without a transparency control |
+| `DFT004` | Both edges of one clock, so the two halves need separate chains with a lockup latch |
+| `DFT005` | A combinational loop |
+| `DFT006` | A ripple or divided clock (a flop drives the clock) |
+
+```
+mdft: 5 flops in 3 clock domains
+  t.clk: 3 flops (2 rising, 1 falling)
+```
+
+`mlint` and `mdft` share one model of the elaborated design
+(`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
+every path, and the union-find that makes one clock one domain across module
+boundaries.
+
 ## Known limits
 
 - `nmos`, `pmos`, `cmos`, `tran` (and the resistive forms), `bufif` / `notif`, and `trireg` charge storage are an error. Strength is resolved when a net is driven, and a read of the net is 0, 1, X, or Z.

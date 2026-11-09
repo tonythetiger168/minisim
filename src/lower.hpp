@@ -87,6 +87,7 @@ inline std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*>&
     static std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> m;
     return m;
 }
+inline bool& usesForce() { static bool f = false; return f; }   // some force / assign (10.6): no partitions
 inline std::vector<std::pair<int, uint8_t>>& netKinds() { static std::vector<std::pair<int, uint8_t>> v; return v; }
 // Dynamic arrays, queues, and associative arrays: symbol -> handle signal.
 inline std::unordered_map<const slang::ast::Symbol*, int>& dynMap() {
@@ -577,6 +578,9 @@ struct Lowerer {
     // string (6.16): a string-typed expression is lowered by exprStr.
     E strOf(const slang::ast::Expression& e) {   // a string, or an integral value as one
         if (e.type->isString()) return exprStr(e);
+        const auto& p = peel(e);   // a literal keeps its text, whatever its length
+        if (p.kind == slang::ast::ExpressionKind::StringLiteral)
+            return konst(mkstr(std::string(p.as<slang::ast::StringLiteral>().getValue())));
         return un(Op::IntToStr, expr(e));
     }
     static int strMethodId(std::string_view n) {
@@ -641,6 +645,7 @@ struct Lowerer {
                     return f;
                 }
                 if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));
+                if (E r = enumMethod(call)) return r;   // e.name()
                 break;
             }
             default: break;
@@ -1714,6 +1719,192 @@ struct Lowerer {
         }
         return r;
     }
+    // A value read as text with format letter c (a string for %s, a real for
+    // %f %e %g, else a 64-bit integer), converted for a write to type dst.
+    E readAs(E v, char c, const slang::ast::Type& dst, const char* what) {
+        bool txt = c == 's', rl = c == 'f' || c == 'e' || c == 'g';
+        int w = (int)dst.getBitWidth();
+        if (dst.isString()) {
+            if (!txt) unsupported((std::string(what) + " into a string with a number format").c_str());
+            return v;
+        }
+        if (dst.isFloating()) return rl ? v : txt ? v : un(Op::IToR, v);
+        if (txt) { v = node(Op::StrToInt, {v}); v->hi = w; return v; }
+        if (rl) return rtoi(v, w, dst.isSigned(), false);
+        return resize(v, w, true, dst.isSigned());
+    }
+    // $fscanf / $sscanf (21.3.4): one node reads everything; then each output
+    // that a conversion reached is written. Returns the count.
+    E scanCall(const slang::ast::CallExpression& call, bool file) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (args.size() < 2) unsupported("$fscanf / $sscanf arguments");
+        if (!stmtDepth) unsupported("$fscanf / $sscanf outside a procedural statement");
+        const Expression& f = peel(*args[1]);
+        if (f.kind != ExpressionKind::StringLiteral) unsupported("$fscanf / $sscanf format that is not a literal");
+        std::string fs(f.as<StringLiteral>().getValue());
+        std::vector<char> letters;   // one per conversion that is stored
+        for (size_t i = 0; i < fs.size(); i++) {
+            if (fs[i] != '%' || i + 1 >= fs.size()) continue;
+            i++;
+            if (fs[i] == '%') continue;
+            bool skip = fs[i] == '*';
+            if (skip) i++;
+            while (i < fs.size() && isdigit((unsigned char)fs[i])) i++;
+            if (i >= fs.size()) break;
+            char c = (char)tolower((unsigned char)fs[i]);
+            if (std::string_view("dhxobcsfegtum").find(c) == std::string_view::npos)
+                unsupported(("$fscanf / $sscanf format %" + std::string(1, fs[i])).c_str());
+            if (!skip) letters.push_back(c);
+        }
+        if (letters.size() != args.size() - 2) unsupported("$fscanf / $sscanf with a different number of formats and outputs");
+        E src = file ? expr(*args[0]) : strOf(*args[0]);
+        int cnt = fresh(32);
+        Instr t; t.k = IK::Assign; t.sig = cnt; t.e = sysFnNode(SF_SCAN, {src, konst(mkstr(fs))}, file ? 1 : 0);
+        prog.emit(t);
+        for (size_t k = 0; k < letters.size(); k++) {
+            if (letters[k] == 'm') continue;
+            Instr j; j.k = IK::JmpIfNot;
+            j.e = bin(Op::Gt, ref(cnt, true), konst(make(k, 0, 32, 0, true)));
+            size_t jf = prog.emit(j);
+            const Expression& dst = outArg(*args[k + 2]);
+            Instr w; w.k = IK::Assign;
+            lhs(dst, w);
+            w.e = readAs(sysFnNode(SF_SCAN_GET, {konst(mk(k, 32))}), letters[k], *dst.type, "$fscanf / $sscanf");
+            prog.emit(w);
+            prog.code[jf].target = prog.here();
+        }
+        return ref(cnt, true);
+    }
+    // $fdisplay / $fwrite and their b / o / h forms (21.3.2).
+    E fileWriteCall(const slang::ast::CallExpression& call, std::string_view n) {
+        auto args = call.arguments();
+        if (args.empty()) unsupported("$fdisplay / $fwrite without a descriptor");
+        char dflt = 'd';
+        std::string_view base = n;
+        if (base.ends_with('b') || base.ends_with('o') || base.ends_with('h')) { dflt = base.back(); base.remove_suffix(1); }
+        auto f = node(Op::SFormat);
+        hierName = scopeName(call);
+        formatInto(args.subspan(1), dflt, f->fmt, f->kids);
+        return sysFnNode(SF_FWRITE, {expr(*args[0]), f}, base == "$fdisplay" ? 1 : 0);
+    }
+    // $fgets(str, fd) (21.3.4): the line is written only if one was read.
+    E fgetsCall(const slang::ast::CallExpression& call) {
+        auto args = call.arguments();
+        if (args.size() != 2) unsupported("$fgets arguments");
+        if (!stmtDepth) unsupported("$fgets outside a procedural statement");
+        int cnt = fresh(32);
+        Instr t; t.k = IK::Assign; t.sig = cnt; t.e = sysFnNode(SF_FGETS, {expr(*args[1])});
+        prog.emit(t);
+        Instr j; j.k = IK::JmpIfNot; j.e = ref(cnt);
+        size_t jf = prog.emit(j);
+        const auto& dst = outArg(*args[0]);
+        Instr w; w.k = IK::Assign;
+        lhs(dst, w);
+        w.e = readAs(sysFnNode(SF_SCAN_TEXT, {}), 's', *dst.type, "$fgets");
+        prog.emit(w);
+        prog.code[jf].target = prog.here();
+        return ref(cnt, true);
+    }
+    // Enumeration methods (6.19.5): first, last, num, next(N), prev(N), name.
+    // Each is a chain of compares against the declared values. A value that
+    // is not a member gives the type's default for next / prev and "" for name.
+    E enumMethod(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (!call.isSystemCall() || args.empty() || call.getSubroutineName()[0] == '$') return nullptr;
+        const Type& t = args[0]->type->getCanonicalType();
+        if (t.kind != SymbolKind::EnumType) return nullptr;
+        std::string_view n = call.getSubroutineName();
+        std::vector<const EnumValueSymbol*> vals;
+        for (const auto& ev : t.as<EnumType>().values()) vals.push_back(&ev);
+        int w = (int)t.getBitWidth();
+        bool sg = t.isSigned();
+        auto lit = [&](size_t k) { return resize(svLit(vals[k]->getValue().integer(), sg, {}), w, sg, sg); };
+        if (vals.empty()) unsupported("method of an empty enum");
+        if (n == "first") return lit(0);
+        if (n == "last") return lit(vals.size() - 1);
+        if (n == "num") return konst(make(vals.size(), 0, 32, 0, true));
+        E v = expr(*args[0]);
+        if (n == "name") {
+            E r = konst(mkstr(""));
+            for (size_t k = vals.size(); k-- > 0;)
+                r = mux(bin(Op::CaseEq, v, lit(k)), konst(mkstr(std::string(vals[k]->name))), r);
+            return r;
+        }
+        if (n == "next" || n == "prev") {
+            int64_t step = 1;
+            if (args.size() > 1) {
+                if (!args[1]->getConstant() && args[1]->kind != ExpressionKind::IntegerLiteral)
+                    unsupported("enum next(N) / prev(N) with N not a constant");
+                step = constInt(*args[1]);
+            }
+            int64_t cnt = (int64_t)vals.size();
+            int64_t sh = ((n == "next" ? step : -step) % cnt + cnt) % cnt;
+            Val d = t.isFourState() ? xfill(w, sg) : make(0, 0, w, 0, sg);
+            E r = konst(d);
+            for (size_t k = vals.size(); k-- > 0;)
+                r = mux(bin(Op::CaseEq, v, lit(k)), lit((size_t)(((int64_t)k + sh) % cnt)), r);
+            return r;
+        }
+        return nullptr;
+    }
+    // $cast(dst, src) (6.24.2) for integral, real and enum types: the cast
+    // is valid unless dst is an enum and src is not one of its values. A valid
+    // cast writes dst and gives 1; an invalid one leaves dst alone and gives 0,
+    // and as a task it is a run-time error.
+    bool asTask = false;   // the system call being lowered is a statement
+    E castCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (args.size() != 2) unsupported("$cast arguments");
+        if (!stmtDepth) unsupported("$cast outside a procedural statement");
+        bool task = asTask;
+        const Expression& dst = outArg(*args[0]);
+        const Expression& src = *args[1];
+        const Type& dt = dst.type->getCanonicalType();
+        const Type& st = src.type->getCanonicalType();
+        if (dt.isClass() || st.isClass() || !(dt.isIntegral() || dt.isFloating()) || !(st.isIntegral() || st.isFloating()))
+            unsupported("$cast of these types");
+        int w = (int)dt.getBitWidth();
+        E v;
+        if (dt.isFloating()) v = realOf(src);
+        else if (st.isFloating()) v = rtoi(realOf(src), w, dt.isSigned(), false);
+        else v = resize(expr(src), w, st.isSigned(), dt.isSigned());
+        int tmp = fresh(dt.isFloating() ? 64 : w);
+        Instr h; h.k = IK::Assign; h.sig = tmp; h.e = v;
+        prog.emit(h);
+        E val = ref(tmp, dt.isSigned());
+        E okE = konst(mk(1, 1));
+        if (dt.kind == SymbolKind::EnumType) {
+            okE = nullptr;
+            for (const auto& ev : dt.as<EnumType>().values()) {
+                E m = bin(Op::CaseEq, val, resize(svLit(ev.getValue().integer(), dt.isSigned(), {}), w, dt.isSigned(), dt.isSigned()));
+                okE = okE ? bin(Op::LogOr, okE, m) : m;
+            }
+            if (!okE) okE = konst(mk(0, 1));
+        }
+        int ok = fresh(1);
+        Instr o; o.k = IK::Assign; o.sig = ok; o.e = okE;
+        prog.emit(o);
+        Instr j; j.k = IK::JmpIfNot; j.e = ref(ok);
+        size_t jf = prog.emit(j);
+        Instr wr; wr.k = IK::Assign;
+        lhs(dst, wr);
+        wr.e = dt.isFloating() ? un(Op::AsReal, ref(tmp)) : val;
+        prog.emit(wr);
+        if (task) {
+            size_t js = emitJmp();
+            prog.code[jf].target = prog.here();
+            Instr d; d.k = IK::Display;
+            d.fmt = "Error: $cast failed: the value is not a valid " + escPct(std::string(dt.name.empty() ? "enum" : dt.name)) + " value";
+            prog.emit(d);
+            prog.code[js].target = prog.here();
+        } else {
+            prog.code[jf].target = prog.here();
+        }
+        return resize(ref(ok), 32, false, true);
+    }
     // $clog2, $countbits and friends (20.8, 20.9), $random / $dist_uniform
     // (20.14), $urandom / $urandom_range (18.13). Null if n is none of them.
     E sysFnNode(int id, std::vector<E> kids, int ctl = 0) {
@@ -1752,6 +1943,7 @@ struct Lowerer {
         return resize(slice(ref(tmp), 31, 0), 32, false, true);
     }
     E sysFn(const slang::ast::CallExpression& call, std::string_view n) {
+        if (E r = enumMethod(call)) return r;
         auto args = call.arguments();
         auto a = [&](size_t i) { return expr(*args[i]); };
         if (n == "$clog2" && args.size() == 1) return sysFnNode(SF_CLOG2, {a(0)});
@@ -1776,6 +1968,26 @@ struct Lowerer {
             if (args.size() > 1) k.push_back(a(1));
             return sysFnNode(SF_URANDOM_RANGE, k);
         }
+        if (n == "$fopen" && !args.empty() && args.size() <= 2) {
+            std::vector<E> k{strOf(*args[0])};
+            if (args.size() == 2) k.push_back(strOf(*args[1]));
+            return sysFnNode(SF_FOPEN, k, args.size() == 2 ? 1 : 0);
+        }
+        if (n == "$fclose" && args.size() == 1) return sysFnNode(SF_FCLOSE, {a(0)});
+        if (n == "$fflush") return args.empty() ? sysFnNode(SF_FFLUSH, {}) : sysFnNode(SF_FFLUSH, {a(0)});
+        if (n == "$fgetc" && args.size() == 1) return sysFnNode(SF_FGETC, {a(0)});
+        if (n == "$ungetc" && args.size() == 2) return sysFnNode(SF_UNGETC, {a(0), a(1)});
+        if (n == "$feof" && args.size() == 1) return sysFnNode(SF_FEOF, {a(0)});
+        if (n == "$ftell" && args.size() == 1) return sysFnNode(SF_FTELL, {a(0)});
+        if (n == "$fseek" && args.size() == 3) return sysFnNode(SF_FSEEK, {a(0), a(1), a(2)});
+        if (n == "$rewind" && args.size() == 1) return sysFnNode(SF_FSEEK, {a(0)});
+        if (n == "$fgets") return fgetsCall(call);
+        if (n == "$fscanf") return scanCall(call, true);
+        if (n == "$sscanf") return scanCall(call, false);
+        if (n == "$fdisplay" || n == "$fdisplayb" || n == "$fdisplayo" || n == "$fdisplayh" ||
+            n == "$fwrite" || n == "$fwriteb" || n == "$fwriteo" || n == "$fwriteh")
+            return fileWriteCall(call, n);
+        if (n == "$cast") return castCall(call);
         if (n == "$timeformat") {
             std::vector<E> k;
             for (size_t i = 0; i < args.size() && i < 4; i++) k.push_back(i == 2 ? strOf(*args[i]) : expr(*args[i]));
@@ -1805,19 +2017,7 @@ struct Lowerer {
             const slang::ast::Expression& dst = outArg(*args[1]);
             Instr w; w.k = IK::Assign;
             lhs(dst, w);
-            E v = sysFnNode(SF_PLUS_VALUE, {pre}, c);
-            if (dst.type->isString()) {
-                if (c != 's') unsupported("$value$plusargs into a string with a number format");
-            } else if (dst.type->isFloating()) {
-                if (c != 'f' && c != 'e' && c != 'g') v = un(Op::IToR, v);
-            } else if (c == 's') {
-                v = node(Op::StrToInt, {v});
-                v->hi = (int)dst.type->getBitWidth();
-            } else if (c == 'f' || c == 'e' || c == 'g') {
-                v = rtoi(v, (int)dst.type->getBitWidth(), dst.type->isSigned(), false);
-            } else {
-                v = resize(v, (int)dst.type->getBitWidth(), true, dst.type->isSigned());
-            }
+            E v = readAs(sysFnNode(SF_PLUS_VALUE, {pre}, c), c, *dst.type, "$value$plusargs");
             w.e = v;
             prog.emit(w);
             prog.code[jf].target = prog.here();
@@ -2092,7 +2292,10 @@ struct Lowerer {
             prog.emit(i);
             return;
         }
-        if (E r = sysFn(call, n)) {   // a system function called as a task: its effect only
+        asTask = true;
+        E rt = sysFn(call, n);
+        asTask = false;
+        if (E r = rt) {   // a system function called as a task: its effect only
             Instr i; i.k = IK::Assign; i.sig = fresh(64); i.e = resize(r, 64, false, false);
             prog.emit(i);
             return;
@@ -2578,6 +2781,36 @@ struct Lowerer {
                 }
                 prog.emit(at);
                 prog.emit(cnt);
+                break;
+            }
+            case StatementKind::ProceduralAssign:     // assign / force (10.6)
+            case StatementKind::ProceduralDeassign: { // deassign / release
+                bool assign = s.kind == StatementKind::ProceduralAssign;
+                const Expression* tgt;
+                const Expression* val = nullptr;
+                bool force;
+                if (assign) {
+                    const auto& pa = s.as<ProceduralAssignStatement>();
+                    force = pa.isForce;
+                    const Expression& a = pa.assignment;
+                    if (a.kind != ExpressionKind::Assignment) unsupported("force / assign");
+                    tgt = &a.as<AssignmentExpression>().left();
+                    val = &a.as<AssignmentExpression>().right();
+                } else {
+                    const auto& pd = s.as<ProceduralDeassignStatement>();
+                    force = pd.isRelease;
+                    tgt = &pd.lvalue;
+                }
+                Instr i;
+                lhs(*tgt, i);
+                if (i.arr || i.bidx || i.hi >= 0 || i.dyn >= 0 || i.drv >= 0)
+                    unsupported("force / assign of a bit, part, or array element (only whole signals)");
+                i.k = assign ? IK::Force : IK::Release;
+                i.hi = force ? 1 : 0;
+                i.lo = 0;
+                if (val) i.e = expr(*val);
+                usesForce() = true;
+                prog.emit(i);
                 break;
             }
             case StatementKind::Disable: {   // disable blk (9.6.2)
@@ -3216,6 +3449,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     LowerResult out;
     arrMap().clear();
     netKinds().clear();
+    usesForce() = false;
     srcMgr() = comp.getSourceManager();
     dynMap().clear();
     dynStore().clear();

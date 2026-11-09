@@ -40,7 +40,7 @@ using Handle = coroutine_handle<>;
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
-struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; };  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
+struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; uint8_t fl = 0; };  // fl: SF_HELD / SF_LISTEN (force, 10.6)  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
 struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
@@ -1154,6 +1154,62 @@ struct Sim {
         vcd << "$end\n";
     }
 
+    // force / assign (10.6). A held signal ignores every other write; its
+    // value follows the force expression (or, if there is no force, the
+    // procedural continuous assignment), re-evaluated when one of the
+    // expression's signals changes. release lets drivers resolve the net
+    // again; a variable keeps its value until it is next written.
+    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2 };
+    struct Hold { E fe, ae; };
+    unordered_map<int, Hold> holds;
+    unordered_map<int, vector<int>> holdListeners;   // signal -> held signals whose expression reads it
+    void listenTo(int s, const E& e) {
+        vector<int> refs;
+        collectRefs(e, refs);
+        for (int r : refs) {
+            auto& v = holdListeners[r];
+            if (std::find(v.begin(), v.end(), s) == v.end()) v.push_back(s);
+            sigs[r].fl |= SF_LISTEN;
+        }
+    }
+    void applyHold(int s) {
+        auto it = holds.find(s);
+        if (it == holds.end()) return;
+        const E& e = it->second.fe ? it->second.fe : it->second.ae;
+        if (!e) return;
+        Val v = eval(e, [&](int x) { return get(x); });
+        sigs[s].fl &= (uint8_t)~SF_HELD;
+        set(s, v);
+        sigs[s].fl |= SF_HELD;
+    }
+    void holdOn(int s, const E& e, bool force) {
+        auto& h = holds[s];
+        (force ? h.fe : h.ae) = e;
+        listenTo(s, e);
+        sigs[s].fl |= SF_HELD;
+        applyHold(s);
+    }
+    void holdOff(int s, bool force) {
+        auto it = holds.find(s);
+        if (it == holds.end()) return;
+        (force ? it->second.fe : it->second.ae) = nullptr;
+        if (it->second.fe || it->second.ae) { applyHold(s); return; }
+        holds.erase(it);
+        sigs[s].fl &= (uint8_t)~SF_HELD;
+        auto& g = sigs[s];
+        if (!g.drv.empty()) {   // a net (or a continuously assigned variable): its drivers take over
+            Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)
+                                      : resolveDrives(g.drv.data(), g.drv.size(), g.w);
+            set(s, r);
+        }
+    }
+    void heldInputChanged(int s) {
+        auto it = holdListeners.find(s);
+        if (it == holdListeners.end()) return;
+        vector<int> targets = it->second;
+        for (int t : targets) applyHold(t);
+    }
+
     // Toggle coverage (msim -cov): per signal, the bits seen rising 0->1 and
     // falling 1->0 (X and Z do not count), one 64-bit word per 64 bits.
     vector<vector<uint64_t>> togRise, togFall;
@@ -1177,6 +1233,7 @@ struct Sim {
     }
 
     void set(int s, Val nv) {
+        if (__builtin_expect(sigs[s].fl & SF_HELD, 0)) return;   // forced: other writes are ignored
         if (sigs[s].w <= 64) {
             uint64_t m = sigs[s].w >= 64 ? ~0ULL : ((1ULL << sigs[s].w) - 1);
             nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;
@@ -1215,6 +1272,7 @@ struct Sim {
                     seqPend[id] = 1;
                     seqq.push_back(id);
                 }
+        if (__builtin_expect(sigs[s].fl & SF_LISTEN, 0)) heldInputChanged(s);
     }
 
     void header() {

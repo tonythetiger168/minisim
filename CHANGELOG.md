@@ -40,6 +40,16 @@ Spec references are IEEE 1800-2023 clauses.
 First tagged release: everything merged up to spec round 5.
 
 ### Added
+- `mdft`, design-for-test checks and a scan chain plan: `DFT001` a gated or
+  unreachable clock, `DFT002` an asynchronous reset built from logic, `DFT003`
+  a latch, `DFT004` both edges of one clock, `DFT005` a combinational loop,
+  `DFT006` a ripple or divided clock. The summary counts the flops per clock
+  domain.
+- `mlint`, lint and clock-domain checks on the msim front end: `L001` latches
+  in `always_comb`, `L002` blocking assignment in `always_ff`, `L003`
+  non-blocking in `always_comb`, `L004` multiple drivers, `CDC001` a crossing
+  with no synchronizer or one flop, `CDC002` a multi-bit bus through a two-flop
+  synchronizer. `-disable RULE`, `-Werror`, `-list`.
 - Release engineering: a version number (`msim -version`), `cmake --install`
   rules, `cpack` packages (`.tar.gz`, `.deb`), a tag-triggered release
   workflow, this changelog, `docs/RELEASING.md` and `docs/PRODUCT.md`.
