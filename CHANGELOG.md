@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
+  `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
+  Negative `$setuphold` / `$recrem` limits with delayed signals under
+  `+neg_tchk` (31.9).
 - Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
   `always_ff` on sampled values, checker variables and free variables, all
   in the reactive region set. Before this, checker instances were ignored.
