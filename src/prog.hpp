@@ -167,6 +167,7 @@ struct RandItem {
     bool isDist = false;
     E guard;                     // dist under an implication: holds when guard is false
     std::vector<RandDist> dist;
+    E distDefault;               // default :/ w (18.5.3): w spread over the values no item names
     // foreach over a dynamic array or queue (18.5.8.1): body once per
     // element at solve time, with signal loopVar read as the index.
     int loopCont = -1, loopVar = -1;

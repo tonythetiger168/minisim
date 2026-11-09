@@ -379,7 +379,11 @@ inline bool itemOk(Item& k, bool* sure = nullptr) {
     } else if (k.it->isDist) {
         AV a = aeval(k.it->e, ex);
         ok = false;
+        bool e0;
+        // With a default weight, a value no item names may be taken too.
+        if (k.it->distDefault && canTrue(aeval(k.it->distDefault, e0))) ok = true;
         for (const RandDist& d : k.it->dist) {
+            if (ok) break;
             bool e1;
             AV lo = aeval(d.lo, e1);
             AV hi = d.hi ? aeval(d.hi, e1) : lo;
@@ -557,6 +561,36 @@ inline bool pickVar(Var& v) {
             double weight = d.perRange || !d.hi ? (double)wv : (double)wv * (double)(h - l + 1);
             opts.push_back({l, h, weight});
         }
+        if (v.dist->distDefault) {
+            // default :/ w (18.5.3): w over the values in [flo, fhi] that no
+            // item names, each gap by its size.
+            Val wt = eval(v.dist->distDefault, rcReader());
+            i128 wv;
+            if (valOf(wt, wv) && wv > 0) {
+                std::vector<std::pair<i128, i128>> named;
+                for (const RandDist& d : v.dist->dist) {
+                    Val lo = eval(d.lo, rcReader()), hi = d.hi ? eval(d.hi, rcReader()) : lo;
+                    i128 l, h;
+                    if (!valOf(lo, l) || !valOf(hi, h)) continue;
+                    AV cl = conv(single(l, lo.w, lo.sgn), v.w, v.sgn), ch = conv(single(h, hi.w, hi.sgn), v.w, v.sgn);
+                    if (cl.lo <= ch.lo) named.push_back({cl.lo, ch.lo});
+                }
+                std::sort(named.begin(), named.end());
+                std::vector<std::pair<i128, i128>> gaps;
+                i128 at = flo;
+                for (auto [l, h] : named) {
+                    if (h < at) continue;
+                    if (l > at) gaps.push_back({at, std::min(l - 1, fhi)});
+                    if (h >= fhi) { at = fhi + 1; break; }
+                    at = std::max(at, h + 1);
+                }
+                if (at <= fhi) gaps.push_back({at, fhi});
+                double tot = 0;
+                for (auto& [l, h] : gaps) if (l <= h) tot += (double)(h - l + 1);
+                for (auto& [l, h] : gaps)
+                    if (l <= h) opts.push_back({l, h, (double)wv * (double)(h - l + 1) / tot});
+            }
+        }
         g_fr = saved;
         while (!opts.empty()) {
             double tot = 0;
@@ -680,6 +714,8 @@ struct RCont {
     bool sgn = false;
     FrameP sizeFr;            // pass 1: the size, when a constraint reads it
     int64_t n = 0;            // the size for pass 2
+    bool assoc = false;       // an associative array: its keys stay, only the values change
+    std::vector<DynKey> keys;
     FrameP elems;             // pass 2: one signal per element
 };
 constexpr int kSizeW = 17;    // a solved size is at most 2^17 - 1
@@ -697,7 +733,7 @@ struct Rewrite {
     std::vector<RCont>* conts = nullptr;
     std::unordered_map<int, int>* contIdx = nullptr;
     int pass = 1;
-    std::vector<std::pair<int, int64_t>> loops;   // loop variable -> index
+    std::vector<std::pair<int, Val>> loops;       // loop variable -> index (or key)
     std::vector<std::pair<int, E>> items;          // `item` of a with clause -> the element
     bool dropped = false;                         // pass 1: reads an element
     std::vector<int>* sizeVars = nullptr;         // pass 1: containers whose size is read
@@ -713,14 +749,14 @@ struct Rewrite {
         if (!e) return e;
         if (e->op == Op::Ref && !e->at) {
             for (auto& [lv, k] : loops)
-                if (e->sig == lv) { Val v = make((uint64_t)k, 0, 32, 0, true); return konst(v); }
+                if (e->sig == lv) return konst(k);
             for (auto& [iv, x] : items)
                 if (e->sig == iv) return x;
         }
         if (e->op == Op::DynReduce && !e->kids.empty()) {   // sum() with (...) in a constraint: folded
             RCont* c = contOf(e->sig);
             if (c && pass == 1) { dropped = true; return e; }
-            int64_t n = c ? c->n : (int64_t)dynStore()[R(e->sig)].vec.size();
+            int64_t n = c ? c->n : (int64_t)dynStore()[R(e->sig)].size();
             int w = e->k.w;
             bool sg = e->k.sgn;
             static const Op ops[] = {Op::Add, Op::Mul, Op::And, Op::Or, Op::Xor};
@@ -729,7 +765,10 @@ struct Rewrite {
             for (int64_t k = 0; k < n; k++) {
                 E el;
                 if (c) el = elem(*c, k);
-                else { Val v = dynStore()[R(e->sig)].vec[(size_t)k]; el = konst(v); }
+                else {
+                    const DynObj& d = dynStore()[R(e->sig)];
+                    el = konst(d.kind == 2 ? std::next(d.map.begin(), (long)k)->second : d.vec[(size_t)k]);
+                }
                 items.push_back({e->lo, el});
                 E x = (*this)(e->kids[0]);
                 items.pop_back();
@@ -741,7 +780,7 @@ struct Rewrite {
         }
         if (e->op == Op::DynSize)
             if (RCont* c = contOf(e->sig)) {
-                if (pass == 2) return konst(make((uint64_t)c->n, 0, 32));
+                if (pass == 2 || c->assoc) return konst(make((uint64_t)c->n, 0, 32));   // an associative array keeps its keys
                 if (!c->sizeFr) {
                     c->sizeFr = newFrame(scratchLayout(kSizeW, false, 1), nullptr, 0);
                     S.set(c->sizeFr->base, make((uint64_t)c->n, 0, kSizeW));
@@ -756,6 +795,12 @@ struct Rewrite {
                     E ix = (*this)(e->kids[0]);
                     Val iv = eval(ix, rd);
                     if (iv.x) return konst(make(0, 0, c->w, 0, c->sgn));
+                    if (c->assoc) {   // the element at that key
+                        DynKey dk = dynStore()[c->cid].key(iv);
+                        auto f = std::lower_bound(c->keys.begin(), c->keys.end(), dk);
+                        if (f == c->keys.end() || dk < *f) return konst(dynStore()[c->cid].dflt);
+                        return elem(*c, f - c->keys.begin());
+                    }
                     int64_t k = (int64_t)iv.v;
                     if (iv.sgn && iv.w < 64 && (iv.v >> (iv.w - 1) & 1)) k -= (int64_t)1 << iv.w;
                     return elem(*c, k);
@@ -841,7 +886,12 @@ static int doRandomize(int obj, const RandCall* rc) {
                 if (rv.dyn) {
                     RCont c;
                     c.cid = o + rv.off; c.w = rv.w; c.sgn = rv.sgn; c.owner = o;
-                    c.n = (int64_t)dynStore()[c.cid].vec.size();
+                    const DynObj& dd = dynStore()[c.cid];
+                    c.n = (int64_t)dd.size();
+                    if (dd.kind == 2) {
+                        c.assoc = true;
+                        for (auto& kv : dd.map) c.keys.push_back(kv.first);
+                    }
                     if (!contIdx.count(c.cid)) { contIdx[c.cid] = (int)conts.size(); conts.push_back(std::move(c)); }
                     continue;
                 }
@@ -885,12 +935,16 @@ static int doRandomize(int obj, const RandCall* rc) {
                 g_fr = fr;
                 if (it.loopCont >= 0) {   // foreach over a container: once per element
                     int64_t n;
+                    const DynObj& d = dynStore()[R(it.loopCont)];
                     if (RCont* c = rw.contOf(it.loopCont)) {
                         if (pass == 1) continue;   // its elements are not known yet
                         n = c->n;
-                    } else n = (int64_t)dynStore()[R(it.loopCont)].vec.size();
+                    } else n = (int64_t)d.size();
+                    // An associative array (7.8): the loop variable is each key, in order.
+                    std::vector<Val> keys;
+                    if (d.kind == 2) for (auto& kv : d.map) keys.push_back(d.keyVal(kv.first));
                     for (int64_t k = 0; k < n; k++) {
-                        rw.loops.push_back({it.loopVar, k});
+                        rw.loops.push_back({it.loopVar, d.kind == 2 ? keys[(size_t)k] : make((uint64_t)k, 0, 32, 0, true)});
                         addItems(it.body, fr);
                         rw.loops.pop_back();
                     }
@@ -903,6 +957,7 @@ static int doRandomize(int obj, const RandCall* rc) {
                     x.e = rw(it.e);
                     x.guard = rw(it.guard);
                     for (auto& d : x.dist) { d.lo = rw(d.lo); d.hi = rw(d.hi); d.weight = rw(d.weight); }
+                    x.distDefault = rw(it.distDefault);
                     for (auto& fp : x.fns) {   // function arguments: loop indices, rand array elements
                         auto q = std::make_shared<Prog>(*fp);
                         for (Instr& ins : q->code) {
@@ -1061,19 +1116,23 @@ static int doRandomize(int obj, const RandCall* rc) {
             for (int ci : sizeVars) conts[(size_t)ci].n = (int64_t)S.get(conts[(size_t)ci].sizeFr->base).v;
             for (auto& c : conts) {
                 c.elems = newFrame(scratchLayout(c.w, c.sgn, c.n), nullptr, 0);
-                const auto& vec = dynStore()[c.cid].vec;
-                for (int64_t k = 0; k < c.n && k < (int64_t)vec.size(); k++) S.set(c.elems->base + (int)k, vec[(size_t)k]);
+                const DynObj& dd = dynStore()[c.cid];
+                if (c.assoc) {
+                    for (int64_t k = 0; k < c.n; k++) S.set(c.elems->base + (int)k, dd.map.at(c.keys[(size_t)k]));
+                } else
+                    for (int64_t k = 0; k < c.n && k < (int64_t)dd.vec.size(); k++) S.set(c.elems->base + (int)k, dd.vec[(size_t)k]);
             }
             ok = solvePass(2, sizeVars);
         }
         if (ok)
             for (auto& c : conts) {
                 auto& d = dynStore()[c.cid];
-                d.vec.assign((size_t)c.n, d.dflt);
+                if (!c.assoc) d.vec.assign((size_t)c.n, d.dflt);
                 for (int64_t k = 0; k < c.n; k++) {
                     Val v = S.get(c.elems->base + (int)k);
                     v.sgn = d.dflt.sgn;
-                    d.vec[(size_t)k] = v;
+                    if (c.assoc) d.map[c.keys[(size_t)k]] = v;
+                    else d.vec[(size_t)k] = v;
                 }
                 dynBump(c.cid);
             }

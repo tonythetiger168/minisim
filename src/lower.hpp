@@ -2773,7 +2773,7 @@ struct Lowerer {
         const ValueSymbol* itSym = nullptr;
         if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
             std::tie(withE, itSym) = sci->getIteratorInfo();
-        if (withE && consDepth && o.kind != 2) {   // in a constraint: sum() with (...) and the like, folded at solve time (18.5.8.2)
+        if (withE && consDepth) {   // in a constraint: sum() with (...) and the like, folded at solve time (18.5.8.2)
             static const std::pair<const char*, int> red[] = {{"sum", 0}, {"product", 1}, {"and", 2}, {"or", 3}, {"xor", 4}};
             for (auto& [s, id] : red)
                 if (n == s) {
@@ -4364,8 +4364,8 @@ struct Lowerer {
                 const Expression& x = ec.expr;
                 if (x.kind == ExpressionKind::Dist) {   // 18.5.3
                     const auto& d = x.as<DistExpression>();
-                    if (d.defaultWeight()) unsupported("dist default weight");
                     it.isDist = true;
+                    if (auto* dw = d.defaultWeight()) it.distDefault = dw->expr ? expr(*dw->expr) : konst(mk(1, 32));
                     it.e = expr(d.left());
                     it.guard = guard;
                     for (const auto& di : d.items()) {
@@ -7564,7 +7564,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             while (et->isUnpackedArray()) et = &et->getArrayElementType()->getCanonicalType();
                         } else if (ps.kind == 0) rv.off = ps.off;
                         else {   // a dynamic array or queue (18.4): its size and elements
-                            if (t.isAssociativeArray()) Lowerer::unsupported("rand associative array");
+                            if (t.isAssociativeArray()) {   // its values (18.4); the keys stay
+                                const auto* ix = t.as<AssociativeArrayType>().indexType;
+                                if (!ix || !ix->getCanonicalType().isIntegral()) Lowerer::unsupported("rand associative array without an integral index");
+                            }
                             rv.off = ps.off; rv.dyn = true;
                             et = &t.getArrayElementType()->getCanonicalType();
                             if (Lowerer::isDynType(*et) || et->isUnpackedArray()) Lowerer::unsupported("rand array of arrays");

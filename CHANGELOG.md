@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `dist` default weights (`default :/ w`, 18.5.3) and rand associative
+  arrays with integral keys (18.4); foreach constraints over associative
+  arrays bind the index to each key.
 - Function calls in constraints (18.5.12): methods, static and package
   functions, nested calls, in guards, foreach bodies and inline `with`. The
   rand variables a call reads are solved first.
