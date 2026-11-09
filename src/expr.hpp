@@ -821,6 +821,7 @@ struct DynObj {
     std::vector<Val> vec;
     std::map<DynKey, Val> map;
     Val dflt;                   // what a missing element reads as
+    std::shared_ptr<DynObj> elem;   // elements that are containers: their empty shape (an element holds the id)
     int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
     bool strKey = false;        // associative: string index
     int keyW = 64;
@@ -1247,6 +1248,37 @@ inline Val resolveNet(uint8_t k, const Drv* d, size_t n, int w, const Val& prev)
     return r;
 }
 inline Val resolveDrives(const Drv* d, size_t n, int w) {
+    // Every driver at one and the same strength for 0 and 1 (the usual case:
+    // several continuous assigns to parts of one net). Then per bit: no
+    // driver -> z; drivers that agree -> their value; disagreeing or x -> x.
+    // That is word-parallel, with no per-bit strength walk.
+    bool same = n > 0 && d[0].s0 == d[0].s1 && d[0].s0 != STR_HIZ;
+    for (size_t i = 1; i < n && same; i++) same = d[i].s0 == d[0].s0 && d[i].s1 == d[0].s0;
+    if (same) {
+        int L = w > 64 ? limbCount(w) : 1;
+        Val r = make(0, 0, w);
+        for (int j = 0; j < L; j++) {
+            uint64_t any0 = 0, any1 = 0, anyx = 0;
+            for (size_t i = 0; i < n; i++) {
+                const Val& a = d[i].v;
+                uint64_t v, x, z;
+                if (j == 0) { v = a.v; x = a.x; z = a.z; }
+                else if ((size_t)(j - 1) < a.hi.size()) { v = a.hi[j - 1].v; x = a.hi[j - 1].x; z = a.hi[j - 1].z; }
+                else { v = 0; x = ~0ULL; z = ~0ULL; }   // no bits here: undriven
+                any1 |= v & ~x & ~z;
+                any0 |= ~v & ~x & ~z;
+                anyx |= x & ~z;
+            }
+            int top = w - 64 * j;
+            uint64_t m = top >= 64 ? ~0ULL : (1ULL << top) - 1;
+            uint64_t bad = (anyx | (any0 & any1)) & m;
+            uint64_t none = ~(any0 | any1 | anyx) & m;
+            uint64_t rv = any1 & ~bad & m, rx = bad | none;
+            if (j == 0) { r.v = rv; r.x = rx; r.z = none; }
+            else { r.hi[j - 1].v = rv; r.hi[j - 1].x = rx; r.hi[j - 1].z = none; }
+        }
+        return finish(r);
+    }
     if (w > 64) {
         Val r = make(0, 0, w);
         for (int b = 0; b < w; b++) {
@@ -1327,11 +1359,14 @@ enum class Op {
     // reversed when lo > 0, then left-aligned into hi bits (hi < 0: as is).
     DynBits, StreamPack,
     DynHas,    // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
+    DynElemRef,   // element kids[0] of container sig, itself a container (7.5, 7.10): its id + 1, made if missing
+    ArrAddr,   // the signal id + 1 of element kids of array arr (0 when an index is outside it)
     // Classes (8). A handle is the first signal id of its object (0: null).
     This,      // the running method's `this`
     IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
     Addr,      // the signal id of slot `sig` of the object kids[0] names, or 0 for null
-    AddrOf     // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    VifSig     // 1 + the signal id of member hi of the interface instance the virtual interface kids[0] names, or 0 (25.9)
 };
 // System functions computed by Op::SysFn.
 enum SysFnId : int {
@@ -1963,6 +1998,7 @@ struct FrameLayout {
     std::vector<int> w;              // width of each slot
     std::vector<Val> init;           // its value when the frame is allocated
     std::vector<std::pair<int, DynObj>> dyn;   // container slots and their empty shape
+    std::vector<int> noCopy;         // slots a shallow copy leaves at their initial value
     std::string name;                // for messages
     mutable std::vector<int> pool;   // first signal of each free frame
     int add(int width, Val v) { w.push_back(width); init.push_back(v); return (int)w.size() - 1; }
@@ -1972,6 +2008,51 @@ inline int (*g_allocSigs)(const FrameLayout&) = nullptr;
 inline void (*g_initSigs)(const FrameLayout&, int base) = nullptr;
 inline void (*g_nullAccess)() = nullptr;
 inline Val (*g_getSig)(int) = nullptr;
+
+// Containers of containers (7.5, 7.10): an element holds the id of a
+// container of its own, which is a signal too (its change count).
+inline const FrameLayout& dynElemLay() {
+    static FrameLayout l = [] { FrameLayout x; x.add(64, make(0, 0, 64)); return x; }();
+    return l;
+}
+// A new element of d: an empty container when d holds containers.
+inline Val dynNewElem(const DynObj& d) {
+    if (!d.elem) return d.dflt;
+    int id = g_allocSigs(dynElemLay());
+    if (g_initSigs) g_initSigs(dynElemLay(), id);
+    DynObj o = *d.elem;
+    o.vec.clear();
+    o.map.clear();
+    dynStore()[id] = std::move(o);
+    return make((uint64_t)id, 0, 64);
+}
+// A copy of element v of d: a new container with copies of its elements.
+inline Val dynCopyElem(const DynObj& d, const Val& v) {
+    if (!d.elem) return v;
+    Val n = dynNewElem(d);
+    if (v.x || !v.v) return n;
+    DynObj s = dynStore()[(int)v.v];   // a copy: making elements may add to the store
+    DynObj& t = dynStore()[(int)n.v];
+    for (const Val& e : s.vec) t.vec.push_back(dynCopyElem(s, e));
+    for (const auto& [k, e] : s.map) t.map[k] = dynCopyElem(s, e);
+    return n;
+}
+// d = s: the elements of s (none from an associative array into a list),
+// within d's bound, each copied.
+inline void dynAssign(DynObj& d, const DynObj& s0) {
+    DynObj s = s0;   // s0 may be d itself, or move as elements are made
+    if (d.kind == 2) {
+        d.map.clear();
+        for (const auto& [k, e] : s.map) d.map[k] = dynCopyElem(s, e);
+        return;
+    }
+    d.vec.clear();
+    if (s.kind == 2) return;
+    for (const Val& e : s.vec) {
+        if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound) break;
+        d.vec.push_back(dynCopyElem(s, e));
+    }
+}
 inline bool (*g_isA)(int obj, int cls) = nullptr;   // is object obj of class cls or one derived from it
 // > 0 while an Op::Addr computes an address: reading through a null handle
 // there gives null (the access that uses the address reports it, if it runs).
@@ -2044,6 +2125,9 @@ inline int R(int s) { return s < kRel ? s : relSlow(s); }
 // Every signal `e` reads, resolved now (a wait on automatic variables).
 inline void collectAddrs(const std::shared_ptr<struct Expr>& e, std::vector<int>& out);
 
+// Virtual interfaces (25.9): vifTab()[k][m] is the signal id of member m
+// of interface instance k (k = 0: null), or -1.
+inline std::vector<std::vector<int>>& vifTab() { static std::vector<std::vector<int>> t; return t; }
 inline Val eval(const E& e, const Reader& rd) {
     auto k = [&](int i) { return eval(e->kids[i], rd); };
     switch (e->op) {
@@ -2071,6 +2155,13 @@ inline Val eval(const E& e, const Reader& rd) {
             return mk(g_isA ? g_isA((int)h.v, e->hi) : 0, 1);
         }
         case Op::AddrOf: return make((uint64_t)R(e->sig) + 1, 0, 64);
+        case Op::VifSig: {
+            Val h = k(0);
+            const auto& tab = vifTab();
+            if (h.x || !h.v || h.v >= tab.size() || (size_t)e->hi >= tab[h.v].size() || tab[h.v][(size_t)e->hi] < 0)
+                return make(0, 0, 64);
+            return make((uint64_t)tab[h.v][(size_t)e->hi] + 1, 0, 64);
+        }
         case Op::Addr: {
             g_nullOk++;
             Val h = k(0);
@@ -2207,6 +2298,34 @@ inline Val eval(const E& e, const Reader& rd) {
             return mkstr(s);
         }
         case Op::DynGet: return dynStore()[R(e->sig)].get(k(0));
+        case Op::ArrAddr: {
+            std::vector<int64_t> idx;
+            for (size_t n = 0; n < e->kids.size(); n++) {
+                Val v = k(n);
+                if (v.x) return make(0, 0, 64);
+                idx.push_back(v_to_i64(v));
+            }
+            int64_t off = e->arr->offset(idx);
+            return make(off < 0 ? 0 : (uint64_t)(R(e->arr->base) + off + 1), 0, 64);
+        }
+        case Op::DynElemRef: {
+            const int c = R(e->sig);
+            Val key = k(0);
+            DynObj& d = dynStore()[c];
+            if (!d.elem) relFail("element of a container that holds no containers");
+            if (d.kind == 2) {
+                if (key.x && !d.strKey) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
+                auto it = d.map.find(d.key(key));
+                if (it == d.map.end()) it = d.map.emplace(d.key(key), dynNewElem(d)).first;   // made on first use
+                return make(it->second.v + 1, 0, 64);
+            }
+            int64_t i = key.x ? -1 : v_to_i64(key);
+            // Out of range: an empty container of its own (writes to it are lost).
+            if (i < 0 || i >= (int64_t)d.vec.size()) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
+            Val& el = d.vec[(size_t)i];
+            if (el.x || !el.v) el = dynNewElem(d);
+            return make(el.v + 1, 0, 64);
+        }
         case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {
             auto& d = dynStore()[R(e->sig)];
@@ -2347,7 +2466,7 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
     if (e->op == Op::Ref) out.push_back(R(e->sig));
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base) + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) out.push_back(R(e->sig));
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef) out.push_back(R(e->sig));
     for (auto& k : e->kids) collectAddrs(k, out);
 }
 // A copy of `e` with every relative id resolved now: a $strobe / $monitor
@@ -2355,7 +2474,7 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
 // process may be running.
 inline E bindRel(const E& e) {
     if (!e) return e;
-    bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynSize ||
+    bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynElemRef || e->op == Op::DynSize ||
                                             e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas);
     if (e->op == Op::This) return konst(make(g_fr ? (uint64_t)g_fr->self : 0, 0, 64));
     bool arel = e->op == Op::ArrRead && e->arr && isRel(e->arr->base);

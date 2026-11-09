@@ -807,6 +807,7 @@ struct Sim {
     // A variable (reg/logic) starts as X. The flag is stored so the VCD
     // header can emit `$var wire` or `$var reg`.
     int sig(const string& n, int w, bool net = false) {
+        self = this;
         // An unpacked array element is named "m[3]". The VCD leaves memories
         // out, as $dumpvars does by default (21.7.1.2).
         // A name with '$' is internal (an event's last-trigger time).
@@ -1154,6 +1155,58 @@ struct Sim {
         if ((int)body.size() < w) body = string(w - body.size(), ' ') + body;
         return body;
     }
+    static inline Sim* self = nullptr;   // the simulator, for %v
+    // %v (21.2.1.4): two strength characters and a value. The strength of a
+    // net bit comes from its drivers, resolved as the net is (28.12); a
+    // variable, or a net with no driver that still has a value (tri0, tri1,
+    // supply, trireg), gets the strength its kind implies.
+    static string strengthText(const E& a0, const Reader& rd) {
+        static const char* MN[8] = {"Hi", "Sm", "Me", "We", "La", "Pu", "St", "Su"};
+        E a = a0;
+        while (a && a->op == Op::Resize && !a->kids.empty()) a = a->kids[0];
+        int sig = -1, bit = 0;
+        if (a && a->op == Op::Ref && !isRel(a->sig) && !a->at) sig = a->sig;
+        else if (a && a->op == Op::Slice && a->hi == a->lo && !a->kids.empty() && a->kids[0] &&
+                 a->kids[0]->op == Op::Ref && !isRel(a->kids[0]->sig) && !a->kids[0]->at) {
+            sig = a->kids[0]->sig; bit = a->lo;
+        }
+        int v = bitAt(eval(a0, rd), 0);   // 0, 1, 2 = x, 3 = z
+        SBit sb;
+        bool have = false;
+        if (sig >= 0 && self) {
+            const Sig& g = self->sigs[sig];
+            if (!g.drv.empty() && g.kind == NR_WIRE) {
+                for (const Drv& d : g.drv) {
+                    int t = bitAt(d.v, bit);
+                    SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
+                    sb = sbit_resolv(sb, cur);
+                }
+                have = true;
+            } else if (g.net) {
+                unsigned st = g.kind == NR_SUPPLY0 || g.kind == NR_SUPPLY1 ? STR_SUPPLY
+                            : g.kind == NR_TRIREG && g.drv.empty() ? STR_MEDIUM
+                            : (g.kind == NR_TRI0 || g.kind == NR_TRI1) && v == (g.kind == NR_TRI1 ? 1 : 0) ? STR_PULL
+                            : STR_STRONG;
+                if (v == 3) sb = SBit{};
+                else if (g.kind == NR_TRIREG && !g.drv.empty()) {   // a driven trireg: its drivers, else its charge
+                    for (const Drv& d : g.drv) {
+                        int t = bitAt(d.v, bit);
+                        SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
+                        sb = sbit_resolv(sb, cur);
+                    }
+                    if (sbit_z(sb)) sb = v == 1 ? sbit_1(STR_MEDIUM) : v == 0 ? sbit_0(STR_MEDIUM) : sbit_x(STR_MEDIUM, STR_MEDIUM);
+                } else sb = v == 1 ? sbit_1(st) : v == 0 ? sbit_0(st) : sbit_x(st, st);
+                have = true;
+            }
+        }
+        if (!have) sb = v == 3 ? SBit{} : v == 1 ? sbit_1(STR_STRONG) : v == 0 ? sbit_0(STR_STRONG) : sbit_x(STR_STRONG, STR_STRONG);
+        if (sbit_z(sb)) return "HiZ";
+        int lg = sbit_logic(sb);
+        if (lg == 0 || lg == 1) return string(MN[sb.s0]) + (lg ? "1" : "0");
+        // x: one strength on both sides, else the two levels as digits
+        if (sb.s0 == sb.s1) return string(MN[sb.s0]) + "X";
+        return std::to_string(sb.s0) + std::to_string(sb.s1) + "X";
+    }
     // The text of a format and its arguments ($display, $sformatf).
     static string sformat(const string& fmt, const vector<E>& args, const Reader& rd) {
         std::ostringstream cout;
@@ -1190,19 +1243,28 @@ struct Sim {
                     if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
                     return fmtVal('d', v, 0, true);
                 };
-                const DynObj& o = dynStore()[h->sig];
-                cout << "'{";
-                if (o.kind == 2) {
-                    bool first = true;
-                    for (const auto& [k, v] : o.map) {
-                        if (!first) cout << ", ";
-                        first = false;
-                        cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':' << one(v, style);
+                // A container of containers prints each element container nested.
+                std::function<void(const DynObj&)> show = [&](const DynObj& o) {
+                    auto el = [&](const Val& v) {
+                        if (!o.elem) { cout << one(v, style); return; }
+                        if (v.x || !v.v) { cout << "'{}"; return; }
+                        show(dynStore()[(int)v.v]);
+                    };
+                    cout << "'{";
+                    if (o.kind == 2) {
+                        bool first = true;
+                        for (const auto& [k, v] : o.map) {
+                            if (!first) cout << ", ";
+                            first = false;
+                            cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':';
+                            el(v);
+                        }
+                    } else {
+                        for (size_t k = 0; k < o.vec.size(); k++) { if (k) cout << ", "; el(o.vec[k]); }
                     }
-                } else {
-                    for (size_t k = 0; k < o.vec.size(); k++) cout << (k ? ", " : "") << one(o.vec[k], style);
-                }
-                cout << '}';
+                    cout << '}';
+                };
+                show(dynStore()[R(h->sig)]);   // R: a property through a handle, or an automatic container
                 continue;
             }
             if ((c == 't' || c == 'T') && ai < args.size()) {   // %t (20.4.3): ticks, printed per $timeformat
@@ -1214,6 +1276,10 @@ struct Sim {
             }
             char lc = (char)tolower((unsigned char)c);
             if (lc == 'm') { cout << "top"; continue; }
+            if (lc == 'v' && ai < args.size()) {   // %v (21.2.1.4): strength of a scalar net
+                cout << strengthText(args[ai++], rd);
+                continue;
+            }
             bool known = string_view("bohxdcstfeg").find(lc) != string_view::npos;
             if (!known || ai >= args.size()) { cout << fmt.substr(start, i - start + 1); continue; }
             Val v = eval(args[ai++], rd);

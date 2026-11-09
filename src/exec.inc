@@ -187,6 +187,13 @@ inline void dynExec(const Instr& i) {
     auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
+    // A new element: e's value; for a container of containers a copy of
+    // container dsrc, or an empty one.
+    auto elemVal = [&]() -> Val {
+        if (!d.elem) return eval(i.e, rd);
+        if (dsrc >= 0) { DynObj one; one.elem = d.elem; return dynCopyElem(one, make((uint64_t)dsrc, 0, 64)); }
+        return dynNewElem(d);
+    };
     auto full = [&]() {   // a bounded queue drops what does not fit (7.10)
         bool f = d.kind == 1 && d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1;
         if (f) dynWarn("write past the bound of a bounded queue is ignored");
@@ -206,10 +213,10 @@ inline void dynExec(const Instr& i) {
             int64_t n = idx(0);
             if (n < 0) { dynWarn("new[] with a negative or unknown size"); n = 0; }
             std::vector<Val> nv((size_t)n, d.dflt);
-            if (dsrc >= 0) {
-                auto src = dynStore()[dsrc].vec;
-                for (size_t k = 0; k < nv.size() && k < src.size(); k++) nv[k] = src[k];
-            }
+            DynObj src;
+            if (dsrc >= 0) src = dynStore()[dsrc];
+            for (size_t k = 0; k < nv.size(); k++)
+                nv[k] = k < src.vec.size() ? dynCopyElem(src, src.vec[k]) : dynNewElem(d);
             d.vec = std::move(nv);
             break;
         }
@@ -221,12 +228,12 @@ inline void dynExec(const Instr& i) {
             d.vec.erase(d.vec.begin() + k);
             break;
         }
-        case D_PUSH_BACK: d.vec.push_back(eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
-        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_BACK: d.vec.push_back(elemVal()); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), elemVal()); if (full()) d.vec.pop_back(); break;
         case D_INSERT: {
             int64_t k = idx(0);
             if (k < 0 || k > (int64_t)d.vec.size()) { dynWarn("insert(i) outside the queue"); return; }
-            d.vec.insert(d.vec.begin() + k, eval(i.e, rd));
+            d.vec.insert(d.vec.begin() + k, elemVal());
             if (full()) d.vec.pop_back();
             break;
         }
@@ -252,20 +259,19 @@ inline void dynExec(const Instr& i) {
             return;   // the container did not change
         }
         case D_COPY: {
-            auto& s = dynStore()[dsrc];
-            if (d.kind == 2) d.map = s.map;
-            else { d.vec = s.kind == 2 ? std::vector<Val>{} : s.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+            dynAssign(d, dynStore()[dsrc]);
             break;
         }
         case D_APPEND: {   // {q, r}: every element of r
-            auto s = dynStore()[dsrc].vec;
-            d.vec.insert(d.vec.end(), s.begin(), s.end());
+            DynObj s = dynStore()[dsrc];
+            for (const Val& e : s.vec) d.vec.push_back(dynCopyElem(s, e));
             break;
         }
         case D_APPEND_SLICE: {   // q[a:b] (7.10.1): out-of-range parts are left out
-            auto s = dynStore()[dsrc].vec;
+            DynObj so = dynStore()[dsrc];
+            const auto& s = so.vec;
             int64_t a = std::max<int64_t>(idx(0), 0), b = std::min<int64_t>(idx(1), (int64_t)s.size() - 1);
-            for (int64_t k = a; k <= b; k++) d.vec.push_back(s[(size_t)k]);
+            for (int64_t k = a; k <= b; k++) d.vec.push_back(dynCopyElem(so, s[(size_t)k]));
             break;
         }
         case D_REVERSE: std::reverse(d.vec.begin(), d.vec.end()); break;
@@ -341,6 +347,8 @@ inline void newObject(const Instr& i) {
     if (src)
         for (size_t k = 0; k < L.w.size(); k++) S.sigs[obj + (int)k].val = S.sigs[src + (int)k].val;
     if (src)
+        for (int off : L.noCopy) S.sigs[obj + off].val = L.init[(size_t)off];
+    if (src)
         for (auto& [off, o] : L.dyn) dynStore()[obj + off] = dynStore()[src + off];
     // Its own random generator (18.14.3): seeded from the $urandom stream, or
     // the source's state for a copy.
@@ -375,6 +383,11 @@ struct JoinWait {
 struct ProcCtl {
     Handle h{};
     bool killed = false, ended = false, waitingFork = false;
+    // std::process (9.7): suspended processes park at their next resume
+    // point; await() waiters resume when this one ends.
+    bool suspended = false, parked = false;
+    vector<Handle> awaiters;
+    int obj = 0;   // its process object, once process::self() made one
     weak_ptr<ProcCtl> parent;
     vector<shared_ptr<ProcCtl>> kids;
     shared_ptr<JoinState> join;
@@ -396,6 +409,8 @@ inline unordered_map<int, vector<weak_ptr<ProcCtl>>>& rootProcs() {
 inline void procEnd(ProcCtl& c) {
     if (c.ended) return;
     c.ended = true;
+    for (Handle h : c.awaiters) S.active.push_back(h);
+    c.awaiters.clear();
     if (c.join) c.join->branchEnded();
     if (auto p = c.parent.lock())
         if (p->waitingFork && p->kidsDone()) { p->waitingFork = false; S.active.push_back(p->h); }
@@ -415,6 +430,38 @@ struct WaitFork {
 };
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+
+// std::process (9.7): process objects index this table.
+inline vector<shared_ptr<ProcCtl>>& procTable() { static vector<shared_ptr<ProcCtl>> v; return v; }
+struct ProcAwait {   // p.await(): until p ends
+    ProcCtl* c;
+    bool await_ready() const { return c->ended; }
+    void await_suspend(Handle h) const { c->awaiters.push_back(h); }
+    void await_resume() const {}
+};
+struct ProcPark {    // a suspended process, until resume()
+    ProcCtl* c;
+    bool await_ready() const { return !c->suspended; }
+    void await_suspend(Handle h) const { c->h = h; c->parked = true; }
+    void await_resume() const {}
+};
+static ProcCtl* procOf(const Instr& i) {
+    Val h = eval(i.e, rd);
+    if (h.x || !h.v) nullAccess();
+    Val n = S.get((int)h.v + i.dkey);
+    if (n.x || n.v >= procTable().size()) relFail("a process object with no process");
+    return procTable()[n.v].get();
+}
+static int procStatus(const ProcCtl* c, const ProcCtl* self) {
+    if (c->killed) return 4;      // KILLED
+    if (c->ended) return 0;       // FINISHED
+    if (c->suspended) return 3;   // SUSPENDED
+    return c == self ? 1 : 2;     // RUNNING, WAITING
+}
+static void procResume(ProcCtl* c) {
+    c->suspended = false;
+    if (c->parked && !c->ended) { c->parked = false; S.active.push_back(c->h); }
+}
 static int doRandomize(int obj, const RandCall* rc);   // rand.inc
 static void randModeAll(int obj, bool blocks, bool on);
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
@@ -479,7 +526,7 @@ void Sim::runObserved() {
         ConcAssert& c = concAsserts()[k];
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p.caps);
+            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p);
         }
         c.pending.clear();
     }
@@ -636,19 +683,65 @@ struct LocalEnv final : sva::LocalHook {
 };
 // One clock tick of a concurrent assertion, in the observed region: start an
 // attempt, then step every attempt on the sampled values of the atoms.
-static void concTick(ConcAssert& c) {
+// An expect statement (16.17) waiting for its attempt's verdict.
+struct ExpectWait {
+    Handle h;
+    shared_ptr<ProcCtl> ctl;
+    int res = -1;   // 1 pass, 0 fail, 2 disabled or killed
+};
+struct ExpectAwait {
+    ExpectWait* w;
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { w->h = h; }
+    void await_resume() const {}
+};
+// The verdict of an expect attempt: its process goes on in the reactive region.
+static void expectDone(const shared_ptr<void>& p, int res) {
+    auto* w = static_cast<ExpectWait*>(p.get());
+    if (!w || w->res >= 0) return;
+    w->res = res;
+    if (w->ctl->killed || !w->h) return;
+    S.reactive.push_back(w->h);
+    S.rare = true;
+}
+static void dropAttempts(ConcAssert& c) {   // disabled or killed: expect statements go on
+    for (auto& at : c.att) expectDone(at.wait, 2);
+    for (auto& p : c.matured) expectDone(p.wait, 2);
+    c.att.clear();
+    c.matured.clear();
+}
+// expect (property) action (16.17): an attempt from the next tick of its clock.
+static shared_ptr<ExpectWait> startExpect(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
+    ConcAssert& c = concAsserts()[i.hi];
+    auto w = make_shared<ExpectWait>();
+    w->ctl = ctl;
+    ConcAssert::Caps caps;
+    if (!c.capSig.empty()) {
+        auto v = make_shared<vector<Val>>();
+        for (int s : c.capSig) v->push_back(S.get(R(s)));
+        caps = v;
+    }
+    c.matured.push_back({ctl, ctl->epoch, caps, w});
+    return w;
+}
+// `ticked`: the clocks that ticked (16.13); attempts start at the leading one.
+static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
-        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) { return t.killGen != a.killGen; });
+        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
+            if (t.killGen == a.killGen) return false;
+            expectDone(t.wait, 2);
+            return true;
+        });
     if (c.disable && truth(eval(c.disable, rd)) == 1) {   // disabled: no pass, no fail (16.12)
-        c.att.clear();
+        dropAttempts(c);
         c.pending.clear();
-        c.matured.clear();
-        if (a.on) a.evals++;
+        if (a.on && (ticked & 1)) a.evals++;
         return;
     }
-    if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& caps : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, caps}); a.evals++; }
+    if (!(ticked & 1)) {
+    } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
+        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait}); a.evals++; }
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
@@ -659,7 +752,10 @@ static void concTick(ConcAssert& c) {
         c.att.push_back({c.root, false, 1, a.killGen, nullptr});
         a.evals++;
     }
-    if (c.att.empty()) return;
+    if (c.att.empty()) {
+        for (int f : c.clearFlags) S.set(f, mk(0, 1));
+        return;
+    }
     // The atoms' values; with captured automatic values (16.14.6.1), once per
     // distinct set of them.
     vector<char> val(c.atoms.size());
@@ -674,12 +770,14 @@ static void concTick(ConcAssert& c) {
         for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
     };
     sva::Deriv dv{sva::store(), val};
+    dv.ticking = ticked;
     std::optional<LocalEnv> lenv;
     if (!c.acts.empty()) {   // local variables or subroutine calls in match items
         lenv.emplace(c);
         dv.lh = &*lenv;
     }
     vector<ConcAssert::Attempt> next;
+    bool ended = false;   // a match of an end point tracker
     for (auto& at : c.att) {
         values(at.caps);
         if (lenv) { lenv->start(at.envs); lenv->count = at.count; }
@@ -691,31 +789,41 @@ static void concTick(ConcAssert& c) {
         ConcAssert::Envs envs;
         if (lenv) std::tie(t, envs) = lenv->finish(t);
         if (c.coverSeq) {   // every match counts (16.14.3)
-            if (dv.matches) {
+            if (dv.matches) ended = true;
+            if (dv.matches && !a.hidden) {
                 a.passes += at.count * dv.matches;
                 if (a.passOn) runAction(c.pass, at.count * dv.matches, &c.capSlot, at.caps.get());
             }
             if (t->k == sva::DONE) continue;
         } else if (t->k == sva::PTRUE) {
             a.passes += at.count;
+            expectDone(at.wait, 1);
             if (dv.nonvac ? a.passOn : a.vacOn) runAction(c.pass, at.count, &c.capSlot, at.caps.get());
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
                 (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs)});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait});
     }
     c.att.swap(next);
+    if (ended && c.endSig >= 0) {   // the sequence's end point (16.13.6)
+        Val n = S.get(c.endSig);
+        S.set(c.endSig, mk((n.x ? 0 : n.v) + 1, 32));
+        S.set(c.endSig + 1, mk(S.now + 1, 64));
+        for (int f : c.matchFlags) S.set(f, mk(1, 1));
+    }
+    for (int f : c.clearFlags) S.set(f, mk(0, 1));
 }
 // A procedural concurrent assertion reached by its procedure (16.14.6):
 // queue an instance on this process, with its automatic values now.
@@ -731,6 +839,27 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     if (c.pending.empty()) concPending().push_back(i.hi);
     c.pending.push_back({ctl, ctl->epoch, caps});
     S.rare = true;
+}
+// A multiclock assertion (16.13): one process per clock marks it ticked;
+// the first in a time step runs the assertion in the observed region, once,
+// with every clock that ticked in that step.
+inline Task concClockProc(int k, int ci) {
+    ConcAssert& c = concAsserts()[k];
+    const auto* ev = ci == 0 ? &c.ev : &c.more[ci - 1].first;
+    const E& iff = ci == 0 ? c.clkIff : c.more[ci - 1].second;
+    for (;;) {
+        if (ev->size() > 1) co_await WaitAny{ev};
+        else co_await Wait{(*ev)[0].first, (*ev)[0].second};
+        if (iff && truth(eval(iff, rd)) != 1) continue;
+        c.ticked |= 1u << ci;
+        if (c.due) continue;
+        c.due = true;
+        co_await ToObserved{};
+        uint32_t t = c.ticked;
+        c.ticked = 0;
+        c.due = false;
+        concTick(c, t);
+    }
 }
 inline Task concProc(int k) {
     ConcAssert& c = concAsserts()[k];
@@ -750,12 +879,14 @@ inline Task concDisableProc(int k, shared_ptr<vector<pair<int, Edge>>> ev) {
     for (;;) {
         if (ev->size() > 1) co_await WaitAny{ev.get()};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
-        if (truth(eval(c.disable, rd)) == 1) c.att.clear();
+        if (truth(eval(c.disable, rd)) == 1) dropAttempts(c);
     }
 }
 inline void startConcAsserts() {
     for (size_t k = 0; k < concAsserts().size(); k++) {
-        S.spawn(concProc((int)k));
+        if (concAsserts()[k].more.empty()) S.spawn(concProc((int)k));
+        else
+            for (size_t ci = 0; ci <= concAsserts()[k].more.size(); ci++) S.spawn(concClockProc((int)k, (int)ci));
         if (const E& d = concAsserts()[k].disable) {
             vector<int> sigs;
             collectRefs(d, sigs);
@@ -833,6 +964,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         g_fr = fr.get();
         g_ret = lastRet.get();
         if (ctl->killed) goto done;
+        if (ctl->suspended) [[unlikely]] {   // 9.7: stop here until resume()
+            co_await ProcPark{ctl.get()};
+            if (ctl->killed) goto done;
+        }
         if (pc >= p->code.size()) {
             if (rets.empty()) goto done;
             ret();
@@ -853,6 +988,25 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 if (i.dyn >= 0) {   // q[i] = v, aa[key] = v
                     Instr set = i;
                     set.k = IK::Dyn; set.sig = i.dyn; set.dcmd = D_SET;
+                    if (i.hi >= 0 || i.bidx) {   // q[i].f = v, q[i][3:0] = v: the element with those bits changed
+                        Val old = dynStore()[R(i.dyn)].get(eval(i.args[0], rd));
+                        int hi = i.hi, lo = i.lo;
+                        if (i.bidx) {
+                            Val bv = eval(i.bidx, rd);
+                            if (bv.x) { pc++; break; }
+                            int64_t b = v_to_i64(bv) - i.lo;
+                            int64_t l = i.pw ? (i.pdown ? b - i.pw + 1 : b) : b, h = i.pw ? l + i.pw - 1 : b;
+                            int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, old.w - 1);
+                            if (cl > ch) { pc++; break; }
+                            v = v_slice(v, (int)(ch - l), (int)(cl - l));
+                            hi = (int)ch;
+                            lo = (int)cl;
+                        }
+                        if (hi >= old.w) { pc++; break; }
+                        Val nv = v_insert(old, v, hi, lo);
+                        nv.sgn = old.sgn;
+                        set.e = konst(nv);
+                    }
                     dynExec(set);
                     pc++; break;
                 }
@@ -895,6 +1049,37 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 g_ret = lastRet.get();
                 if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true));
                 pc++; break;
+            }
+            case IK::ProcOp: {   // std::process (9.7)
+                if (i.hi == PO_SELF) {
+                    if (!ctl->obj) {
+                        const FrameLayout& L = *classRt()[(size_t)i.lo].lay;
+                        int obj = g_allocSigs(L);
+                        g_initSigs(L, obj);
+                        S.sigs[obj + i.dkey].val = make((uint64_t)procTable().size(), 0, 64);
+                        procTable().push_back(ctl);
+                        ctl->obj = obj;
+                        // its srandom / get_randstate (18.13.3); seeded from its number, so
+                        // process::self() does not move the $urandom stream
+                        objRng()[obj] = seedState(0x9E3779B97F4A7C15ull * (procTable().size() + 1));
+                    }
+                    S.set(R(i.sig), make((uint64_t)ctl->obj, 0, 64));
+                    pc++; break;
+                }
+                ProcCtl* c = procOf(i);
+                pc++;
+                if (i.hi == PO_STATUS) S.set(R(i.sig), make((uint64_t)procStatus(c, ctl.get()), 0, 32, 0, true));
+                else if (i.hi == PO_KILL) {
+                    if (!c->ended) {
+                        for (auto& t : procTable()) if (t.get() == c) { procKill(t); break; }
+                    }
+                } else if (i.hi == PO_AWAIT) {
+                    if (c == ctl.get()) relFail("a process awaiting itself (9.7)");
+                    co_await ProcAwait{c};
+                } else if (i.hi == PO_SUSPEND) {
+                    if (!c->ended) c->suspended = true;
+                } else if (i.hi == PO_RESUME) procResume(c);
+                break;
             }
             case IK::RandMode: {   // obj.rand_mode(v) / obj.constraint_mode(v) (18.8, 18.9)
                 Val h = eval(i.e, rd);
@@ -987,10 +1172,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         S.set(nf->base + off, v);
                     }
                     for (auto [off, src] : i.dinit) {   // container arguments (7.7)
-                        auto& d = dynStore()[nf->base + off];
-                        const auto& sv = dynStore()[R(src)];
-                        if (d.kind == 2) d.map = sv.map;
-                        else { d.vec = sv.kind == 2 ? std::vector<Val>{} : sv.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+                        dynAssign(dynStore()[nf->base + off], dynStore()[R(src)]);
                     }
                     rets.push_back({p, pc + 1, fr});
                     fr = std::move(nf);
@@ -1045,7 +1227,17 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 ctl->kids.clear();
                 pc++;
                 break;
-            case IK::Assert: pc = runAssert(i, ctl, pc); break;
+            case IK::Assert:
+                if (i.join == 4) {   // expect (16.17): wait for the verdict
+                    auto w = startExpect(i, ctl);
+                    S.rare = true;
+                    co_await ExpectAwait{w.get()};
+                    ctl->epoch++;
+                    pc = w->res == 1 ? pc + 1 : w->res == 0 ? (size_t)i.target : (size_t)i.lo;
+                    break;
+                }
+                pc = runAssert(i, ctl, pc);
+                break;
             case IK::AssertCtl: assertCtl(i); pc++; break;
             case IK::CycleWait: {   // ##n (14.11)
                 Val nv = eval(i.e, rd);

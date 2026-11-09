@@ -1,5 +1,4 @@
 // IEEE 1800-2023 9.7: The process class: self, status, kill, await (9.7).
-//! xfail: the process class is not supported
 //! icarus-skip: Icarus 13 does not support the process class
 module top;
   process p;
