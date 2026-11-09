@@ -8,6 +8,18 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mbug`: files regression (mregress `results.json`), lint (mlint) and DFT
+  (mdft) failures as issues in GitHub Issues (default), Redmine or Jira, one
+  issue per failure signature. A repeat of an open failure becomes a comment,
+  and a failure that comes back after its issue was closed gets a new issue
+  linked to the old one. Issues have the reproduction command, the log tail,
+  attachments (Redmine, Jira), and the Jenkins or GitHub Actions build link.
+  `mbug sync-github` copies a repository's GitHub issues into Jira or
+  Redmine and keeps open / closed in step (`-two-way` also closes GitHub
+  issues resolved on the other side). It has `-dry-run` and a `max_issues`
+  cap, and credentials come from the environment only. `ci/Jenkinsfile`
+  has an opt-in `BUGS` parameter that runs it. `results.json` now records
+  each failure's `signature` and the test lists.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
