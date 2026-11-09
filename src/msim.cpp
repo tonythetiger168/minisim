@@ -11,6 +11,15 @@
 //   -vcd [<file>]    write a VCD waveform (default file dump.vcd)
 //   +vcd             same as -vcd dump.vcd
 //   +notimingcheck   turn off the specify block timing checks (31)
+//   -sdf [min|typ|max:]<instance>:<file>
+//                    annotate an SDF file to an instance before time 0, as
+//                    $sdf_annotate(file, instance) would (32); repeatable
+//   +mindelays / +typdelays / +maxdelays
+//                    pick the min, typ or max of min:typ:max delays (11.11)
+//                    and of SDF triples (default typ)
+//   -libmap <file>   a library map file (33.3); same as --libmap. -L <lib>
+//                    sets the library search order (33.8.1); a config is
+//                    chosen with -top <config>
 //   +neg_tchk        allow negative $setuphold / $recrem limits (31.9)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
@@ -91,6 +100,9 @@
 #include "codegen.hpp"
 #include "lower.hpp"
 #include "slang/driver/Driver.h"
+#include "slang/syntax/AllSyntax.h"
+#include "slang/syntax/SyntaxTree.h"
+#include "slang/syntax/SyntaxVisitor.h"
 
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
@@ -504,11 +516,80 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     return (bool)f;
 }
 
+// The tops msim picks when -top is not given and slang's own choice does
+// not cover the design: every config that no other config binds with
+// `use ... :config` (33.5.4); failing that, when slang found no top, every
+// module or program in a library (33.3) that nothing instantiates.
+static std::vector<std::string> implicitTops(slang::driver::Driver& driver, slang::ast::Compilation& comp) {
+    using namespace slang::syntax;
+    std::vector<std::pair<std::string, std::string>> cfgs;   // (bare name, name for --top)
+    std::set<std::string> bound;
+    auto scan = [&](const std::shared_ptr<SyntaxTree>& tree) {
+        auto visit = [&](const SyntaxNode& m) {
+            if (m.kind != SyntaxKind::ConfigDeclaration) return;
+            const auto& c = m.as<ConfigDeclarationSyntax>();
+            std::string name(c.name.valueText());
+            const auto* lib = tree->getSourceLibrary();
+            std::string q = lib && !lib->isDefault ? lib->name + "." + name : name;
+            cfgs.push_back({name, q + ":config"});
+            for (auto* r : c.rules) {
+                std::string t = r->toString();
+                for (size_t p = t.find(":config"); p != std::string::npos; p = t.find(":config", p + 1)) {
+                    size_t e = p;
+                    while (e > 0 && std::isspace((unsigned char)t[e - 1])) e--;
+                    size_t b = e;
+                    while (b > 0 && (std::isalnum((unsigned char)t[b - 1]) || t[b - 1] == '_' || t[b - 1] == '$')) b--;
+                    bound.insert(t.substr(b, e - b));
+                }
+            }
+        };
+        const SyntaxNode& root = tree->root();
+        if (root.kind == SyntaxKind::CompilationUnit)
+            for (auto* m : root.as<CompilationUnitSyntax>().members) visit(*m);
+        else if (root.kind == SyntaxKind::LibraryMap)
+            for (auto* m : root.as<LibraryMapSyntax>().members) visit(*m);
+    };
+    for (auto& t : driver.syntaxTrees) scan(t);
+    for (auto& t : driver.sourceLoader.getLibraryMaps()) scan(t);
+    std::vector<std::string> tops;
+    for (auto& [name, q] : cfgs)
+        if (!bound.count(name)) tops.push_back(q);
+    if (tops.size() > 1) {
+        std::cerr << "msim: several configs could be the top:";
+        for (auto& t : tops) std::cerr << " " << t.substr(0, t.size() - 7);
+        std::cerr << "; choose one with -top <config>\n";
+        std::exit(2);
+    }
+    if (!tops.empty() || !comp.getRoot().topInstances.empty()) return tops;
+    struct Inst : SyntaxVisitor<Inst> {
+        std::set<std::string> names;
+        void handle(const HierarchyInstantiationSyntax& h) {
+            names.insert(std::string(h.type.valueText()));
+            visitDefault(h);
+        }
+    } inst;
+    for (auto& t : driver.syntaxTrees) t->root().visit(inst);
+    std::set<std::string> seen;
+    for (const auto* sym : comp.getDefinitions()) {
+        using slang::ast::DefinitionKind;
+        if (sym->kind != slang::ast::SymbolKind::Definition) continue;
+        const auto& def = sym->as<slang::ast::DefinitionSymbol>();
+        if (def.sourceLibrary.isDefault || inst.names.count(std::string(def.name))) continue;
+        if (def.definitionKind != DefinitionKind::Module && def.definitionKind != DefinitionKind::Program) continue;
+        if (!seen.insert(std::string(def.name)).second) continue;   // the first library that has it (33.6.1)
+        tops.push_back(def.sourceLibrary.name + "." + std::string(def.name));
+    }
+    return tops;
+}
+
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
+                 "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
+                 "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
+                 "  -libmap <file>  library map (33.3); -L <lib> library search order\n"
                  "  +neg_tchk      allow negative $setuphold / $recrem limits, with delayed signals\n"
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
@@ -593,6 +674,33 @@ int main(int argc, char** argv) {
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
         if (a == "+notimingcheck" || a == "+notimingchecks") { timingChecksOn() = false; continue; }
+        if (a == "+mindelays" || a == "+typdelays" || a == "+maxdelays") {
+            mtmSelect() = a[1] == 'm' && a[2] == 'i' ? 0 : a[1] == 't' ? 1 : 2;
+            fwd.push_back("-T");
+            fwd.push_back(mtmSelect() == 0 ? "min" : mtmSelect() == 1 ? "typ" : "max");
+            continue;
+        }
+        if (a == "-sdf") {   // VCS: -sdf min|typ|max:instance:file
+            std::string v = next("[min|typ|max:]instance:file");
+            SdfRequest r;
+            r.where = "-sdf " + v + ": ";
+            r.cli = true;
+            auto c1 = v.find(':');
+            if (c1 != std::string::npos) {
+                std::string m = v.substr(0, c1);
+                if (m == "min" || m == "typ" || m == "max") {
+                    r.mtm = m == "min" ? "MINIMUM" : m == "typ" ? "TYPICAL" : "MAXIMUM";
+                    v = v.substr(c1 + 1);
+                }
+            }
+            auto c2 = v.find(':');
+            if (c2 == std::string::npos) { std::cerr << "msim: -sdf needs instance:file\n"; return 2; }
+            r.scope = v.substr(0, c2);
+            r.file = v.substr(c2 + 1);
+            sdfRequests().push_back(r);
+            continue;
+        }
+        if (a == "-libmap") { fwd.push_back("--libmap"); fwd.push_back(next("a library map file")); continue; }
         if (a == "+neg_tchk") { negTimingChecks() = true; continue; }
         if (a == "+fst") { vcdPath = "dump.fst"; continue; }
         if (a == "-cov") {
@@ -736,6 +844,16 @@ int main(int argc, char** argv) {
     }
 
     auto comp = driver.createCompilation();
+    // Without -top: a config on the command line names the top (33.5.4),
+    // and with library maps a module in any library that nothing
+    // instantiates is a top (23.3.1, 33.6.1); slang only looks in work.
+    if (driver.options.topModules.empty()) {
+        std::vector<std::string> tops = implicitTops(driver, *comp);
+        if (!tops.empty()) {
+            driver.options.topModules = tops;
+            comp = driver.createCompilation();
+        }
+    }
     if (vpi::st().active) vpi::declare(*comp);
     driver.reportCompilation(*comp, /*quiet*/ true);
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
@@ -808,6 +926,10 @@ int main(int argc, char** argv) {
         if (tmpDir) { std::error_code ec; std::filesystem::remove_all(dpiDir, ec); }   // the libraries stay mapped
         if (!ok) { std::cerr << "msim: DPI: " << err << "\n"; return 1; }
         compiled = false;   // -compile does not run DPI calls yet
+    }
+    if (compiled && (!pathRecs().empty() || !sdfRequests().empty() || sdfAtRunTime())) {
+        std::cerr << "msim: -compile: specify path delays and SDF annotation are not compiled yet; using the interpreter\n";
+        compiled = false;
     }
     if (earlyTmp) { std::error_code ec; std::filesystem::remove_all(earlyDir, ec); }   // the library stays mapped
 
@@ -908,7 +1030,9 @@ int main(int argc, char** argv) {
     startConcAsserts();
     startClockings();
     startCovergroups();
+    if (startSdf()) return 1;   // SDF timing first, so the checks start with the annotated limits
     startTimingChecks();
+    if (!pathRecs().empty() || !S.icDelay.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
