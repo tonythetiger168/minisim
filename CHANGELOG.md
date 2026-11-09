@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Rand containers of containers (18.4, 7.5): `rand int m[][]`, queues of
+  queues, associative arrays of queues, with constraints on `m.size()`,
+  `m[i].size()`, `m[i].sum()` and `m[i][j]` in nested foreach loops. Sizes
+  are solved level by level and picked again when the elements have no
+  solution; a failed randomize() leaves the arrays unchanged.
 - Containers of containers (7.5, 7.8, 7.10): `int m[][]`, `int q[$][$]`,
   associative arrays of queues, and fixed-size arrays of containers
   (`int f[2][]`); containers of unpacked structs and of vectors wider than
