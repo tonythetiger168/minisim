@@ -55,6 +55,7 @@
 #include "sva_engine.hpp"
 #include "clocking.hpp"
 #include "cover.hpp"
+#include "tchk.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Expression.h"
@@ -5630,6 +5631,124 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (!fresh && it->second != dl) Lowerer::unsupported("paths with different delays to one output");
         }
     }
+    // A timing check (31): its events, limits in ticks and notifier, for
+    // the kernel's check process (tchk.inc).
+    void handle(const slang::ast::SystemTimingCheckSymbol& sc) {
+        using namespace slang::ast;
+        using K = SystemTimingCheckKind;
+        Lowerer::lastLoc() = sc.location;
+        Lowerer lw(sigmap);
+        prep(lw);
+        lw.setScope(sc.getParentScope());
+        TimingCheck t;
+        static const std::pair<K, int> kinds[] = {
+            {K::Setup, TC_SETUP}, {K::Hold, TC_HOLD}, {K::SetupHold, TC_SETUPHOLD},
+            {K::Recovery, TC_RECOVERY}, {K::Removal, TC_REMOVAL}, {K::RecRem, TC_RECREM},
+            {K::Skew, TC_SKEW}, {K::TimeSkew, TC_TIMESKEW}, {K::FullSkew, TC_FULLSKEW},
+            {K::Period, TC_PERIOD}, {K::Width, TC_WIDTH}, {K::NoChange, TC_NOCHANGE}};
+        bool known = false;
+        for (auto [k, v] : kinds) if (k == sc.timingCheckKind) { t.kind = v; known = true; }
+        if (!known) Lowerer::unsupported("this timing check");
+        const auto* syn = sc.getSyntax() ? &sc.getSyntax()->as<slang::syntax::SystemTimingCheckSyntax>() : nullptr;
+        if (!syn) Lowerer::unsupported("a timing check with no syntax");
+        t.name = std::string(syn->name.valueText());
+        auto args = sc.getArguments();
+        auto text = [&](size_t k) {
+            if (k >= syn->args.size()) return std::string();
+            std::string x = syn->args[k]->toString();
+            size_t a = x.find_first_not_of(" \t\r\n"), b = x.find_last_not_of(" \t\r\n");
+            return a == std::string::npos ? std::string() : x.substr(a, b - a + 1);
+        };
+        t.nev = (t.kind == TC_PERIOD || t.kind == TC_WIDTH) ? 1 : 2;
+        if (t.kind == TC_SETUP) { t.data = 0; t.ref = 1; }
+        if (t.nev == 1) t.data = 0;
+        for (int k = 0; k < t.nev; k++) {
+            const auto& a = args[(size_t)k];
+            TcEvent& ev = t.ev[k];
+            if (!a.expr) Lowerer::unsupported("a timing check with an empty event");
+            ev.e = lw.expr(*a.expr);
+            ev.text = text((size_t)k);
+            if (a.condition) {
+                ev.cond = lw.expr(*a.condition);
+                const Expression& c = Lowerer::peel(*a.condition);
+                if (c.kind == ExpressionKind::BinaryOp) {
+                    auto op = c.as<BinaryExpression>().op;
+                    ev.nondet = op == BinaryOperator::Equality || op == BinaryOperator::Inequality;
+                }
+            }
+            if (!a.edgeDescriptors.empty()) {
+                auto lv = [](char c) { return c == '0' ? 0 : c == '1' ? 1 : 2; };
+                static const uint8_t bit[3][3] = {{0, TE_01, TE_0X}, {TE_10, 0, TE_1X}, {TE_X0, TE_X1, 0}};
+                for (auto d : a.edgeDescriptors) ev.edges |= bit[lv(d[0])][lv(d[1])];
+            } else if (a.edge == EdgeKind::PosEdge) ev.edges = TE_POS;
+            else if (a.edge == EdgeKind::NegEdge) ev.edges = TE_NEG;
+            else if (a.edge == EdgeKind::BothEdges) ev.edges = TE_ALL;
+            std::vector<int> sigs;
+            collectRefs(ev.e, sigs);
+            for (int sg : sigs) {
+                bool have = false;
+                for (auto& w : t.watch) have |= w.first == sg;
+                if (!have) t.watch.push_back({sg, ANY});
+            }
+        }
+        if ((t.kind == TC_PERIOD || t.kind == TC_WIDTH || t.kind == TC_NOCHANGE) && !t.ev[0].edges)
+            Lowerer::unsupported("a $period, $width or $nochange reference event without an edge");
+        // The limits: constants in the module's time unit.
+        auto ticks = [&](size_t k) -> int64_t {
+            if (k >= args.size() || !args[k].expr) return 0;
+            ASTContext ctx(*sc.getParentScope(), LookupLocation::max);
+            slang::ConstantValue cv = ctx.tryEval(*args[k].expr);
+            double u;
+            if (cv.isInteger() && !cv.integer().hasUnknown()) u = (double)*cv.integer().as<int64_t>();
+            else if (cv.isReal()) u = cv.real();
+            else Lowerer::unsupported("a timing check limit that is not constant");
+            return (int64_t)std::llround(u * (double)lw.ticksPerUnit());
+        };
+        auto flag = [&](size_t k) {
+            if (k >= args.size() || !args[k].expr) return false;
+            ASTContext ctx(*sc.getParentScope(), LookupLocation::max);
+            slang::ConstantValue cv = ctx.tryEval(*args[k].expr);
+            return cv.isTrue();
+        };
+        size_t first = (size_t)t.nev, nlim = 1, nIdx;
+        if (t.kind == TC_SETUPHOLD || t.kind == TC_RECREM || t.kind == TC_FULLSKEW || t.kind == TC_NOCHANGE ||
+            t.kind == TC_WIDTH)
+            nlim = 2;
+        t.lim1 = ticks(first);
+        if (nlim == 2) {
+            if (t.kind == TC_WIDTH) t.thresh = ticks(first + 1);
+            else t.lim2 = ticks(first + 1);
+        }
+        nIdx = first + nlim;
+        for (size_t k = first; k < first + nlim && k < syn->args.size(); k++) {
+            std::string x = text(k);
+            if (x.empty()) continue;
+            if (!t.limText.empty()) t.limText += ", ";
+            t.limText += x;
+        }
+        if (nIdx < args.size() && args[nIdx].expr) {
+            const Expression& n = Lowerer::peel(*args[nIdx].expr);
+            const Symbol* sym = n.getSymbolReference();
+            auto it = sym ? sigmap.find(sym) : sigmap.end();
+            if (it == sigmap.end()) Lowerer::unsupported("this timing check notifier");
+            t.notifier = it->second;
+        }
+        if (t.kind == TC_TIMESKEW || t.kind == TC_FULLSKEW) {
+            t.eventBased = flag(nIdx + 1);
+            t.remainActive = flag(nIdx + 2);
+        }
+        if ((t.kind == TC_SETUPHOLD || t.kind == TC_RECREM) && nIdx + 1 < args.size())
+            for (size_t k = nIdx + 1; k < args.size(); k++)
+                if (args[k].expr) Lowerer::unsupported("negative timing check conditions and delayed signals (31.9)");
+        t.inst = Lowerer::instPath(sc.getParentScope());
+        if (const auto* sm = srcMgr()) {
+            auto ol = sm->getFullyOriginalLoc(sc.location);
+            t.file = std::string(sm->getFileName(ol));
+            t.line = (int)sm->getLineNumber(ol);
+        }
+        t.unit = lw.ticksPerUnit();
+        timingChecks().push_back(std::move(t));
+    }
     void finishPaths() {
         for (auto& [sg, dl] : pathDelays) {
             bool any = false;
@@ -6288,6 +6407,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     LowerResult out;
     asserts().clear();
     concAsserts().clear();
+    timingChecks().clear();
     sva::store().clear();
     shadowPairs().clear();
     sampleClocks().clear();

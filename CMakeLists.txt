@@ -110,6 +110,9 @@ if(MINISIM_WITH_SLANG)
   set_tests_properties(msim_default_width PROPERTIES PASS_REGULAR_EXPRESSION "W= +4 sum=12\n")
   add_test(NAME msim_init COMMAND msim ${CLI}/init.sv)
   set_tests_properties(msim_init PROPERTIES PASS_REGULAR_EXPRESSION "v= +5\nw= +6\nw= +10\n")
+  # +notimingcheck (31): the setup and hold checks report nothing.
+  add_test(NAME msim_notimingcheck COMMAND msim +notimingcheck ${CMAKE_SOURCE_DIR}/tests/spec/31.3-setup-hold.sv)
+  set_tests_properties(msim_notimingcheck PROPERTIES PASS_REGULAR_EXPRESSION "^notifier=x\n$")
   add_test(NAME msim_maxtime COMMAND msim ${CLI}/spin.sv -maxtime 25)
   set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION "^tick\ntick\ntick\n$")
   add_test(NAME msim_vcd

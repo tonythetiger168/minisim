@@ -41,6 +41,7 @@ using Handle = coroutine_handle<>;
 #include "sva_engine.hpp"
 #include "clocking.hpp"
 #include "cover.hpp"
+#include "tchk.hpp"
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
