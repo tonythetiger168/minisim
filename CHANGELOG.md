@@ -18,6 +18,156 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- UVM (IEEE 1800.2-2020): the Accellera UVM library (uvm-core 2020.3.1)
+  compiles and runs with `+define+UVM_NO_DPI` (see `docs/UVM.md`): run_test,
+  the factory and overrides, phases and objections, sequences, sequencers and
+  drivers, TLM ports and FIFOs, analysis ports, `uvm_config_db`, field
+  macros (print, clone, compare, pack), report catchers. `tests/uvm` runs
+  three testbenches in CI.
+- Language features that UVM needs: containers of containers
+  (`int q[string][$]`, `bit m[C][C]`, foreach over several of their
+  dimensions), class-handle, packed-struct and wide associative array keys,
+  struct elements and writes to part of an element (`q[i][3:0] = v`,
+  `aa[k].f = v`), unpacked structs in classes and automatic variables,
+  functions that return queues and associative arrays, static containers in
+  functions, `==` / `!=` on whole containers, string indexing (`s[i]`,
+  `s[i] = c`, `foreach (s[i])`), `{n{s}}` with a run-time `n`, string
+  parameters, `{>>{q}}` of a string queue, `{<<bit{q}} = v` into a dynamic
+  array, a stream as the source of a streaming assignment, `inside` on
+  strings and handles, `wait (0)`, `%p` of class handles.
+- A run-time error (null object access, a crash) names the statement that
+  was running; `MSIM_CALLTRACE=1` prints every method and automatic
+  subroutine call.
+
+### Fixed
+- `super.f()` with a comment just before `super` called the override (and
+  recursed) instead of the base method.
+- An extern method that overrides a pure virtual method, or a virtual
+  method without repeating `virtual`, did not get its vtable slot.
+- A default argument that calls a method (`trigger(T d = get_default())`)
+  called it on the caller's object instead of the callee's.
+- A static property read by another static initializer before its own
+  initializer ran was x; defaults (null, 0) are now set before any
+  initializer.
+- `&&`, `||` and `?:` evaluated the operand they skip, so
+  `h != null && h.q.exists(k)` failed on a null `h`.
+- A fork in a class method lost `this`.
+- `wait (cond)` on automatic variables inside a subroutine could be turned
+  into an `@*` wait.
+- A process still waiting at the end of the simulation could corrupt the
+  heap when it was freed.
+- Virtual prototypes: `msim -mvp` adds an AXI4-Lite bridge (`mvp_axil_slave`,
+  `mvp_irq_slave`, `mvp_clock`) from the design to models written in C, C++ or
+  SystemC/TLM-2.0, with a memory map, 32 interrupt lines, timed callbacks and
+  a master path for a model that drives the bus itself (`include/mvp.h`,
+  `mvp_tlm.h`). A memory and a 16550-style UART are bundled in `mvp/models/`.
+  See `docs/VPROTO.md`.
+- SDF back-annotation (32): `$sdf_annotate` and `msim -sdf` read SDF 3.0
+  files and annotate specify paths (IOPATH, COND, CONDELSE, DEVICE),
+  interconnect delays (PORT, NETDELAY, INTERCONNECT), timing check limits
+  (Table 32-2) and specparams (LABEL), with ABSOLUTE / INCREMENT, min:typ:max
+  selection, scale factors, a config file and a log file. `+mindelays`,
+  `+typdelays` and `+maxdelays` pick from min:typ:max (11.11).
+- Specify path delays pick the delay of the paths whose input changed last
+  and whose condition holds (30.5.3), so paths to one output may differ;
+  6- and 12-value path delays (30.5.1, 30.5.2).
+- Configurations and libraries (33): `msim -libmap`, configs as the top
+  (with or without `-top`), library tops, `-L`, and `%l` / `%L`.
+- Spec tests can pass msim arguments with a `//! args:` line.
+- `%p` of containers of unpacked structs, unions, enums and packed structs
+  (21.2.1.6), at any nesting depth.
+- Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
+  `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
+  Negative `$setuphold` / `$recrem` limits with delayed signals under
+  `+neg_tchk` (31.9).
+- Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
+  `always_ff` on sampled values, checker variables and free variables, all
+  in the reactive region set. Before this, checker instances were ignored.
+- Programs (24): program code runs in the reactive region set, programs end
+  with an implicit `$finish`, `$exit`, nested and anonymous programs.
+- Gate-level switches (28): `bufif0/1`, `notif0/1` with L/H strength
+  resolution, `nmos`/`pmos`/`cmos` and their resistive forms, and the
+  bidirectional `tran`/`rtran`/`tranif0/1`/`rtranif0/1`.
+- User-defined primitives (29): combinational, level- and edge-sensitive.
+- Arrays of instances and of interfaces (23.3.3, 25.3), including
+  multidimensional instance arrays and per-element port slicing.
+- System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),
+  `$system`, the array query functions on every kind of dimension,
+  `$typename`, and the VCD tasks (`$dumpfile`, `$dumpvars` with a level and
+  scope selection, `$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` /
+  `$dumplimit`). A design's `$dumpvars` now writes its dump file without
+  `-vcd`.
+- `$fstrobe`, `$fmonitor` (several at once, cancelled by `$fclose`) and
+  `$fread` (21.3.2, 21.3.4.4).
+- VPI (clauses 36-38): `vpi_user.h`, VPI libraries loaded before
+  elaboration (`-load`, `-loadvpi`, or C files on the command line), user
+  system tasks and functions, the module / net / variable / memory /
+  parameter / port object model, `vpi_get_value` and `vpi_put_value` in all
+  the common formats, and callbacks. The tests match Icarus 13 VPI output.
+- DPI-C (clause 35): `import "DPI-C"` functions and tasks (`pure`, `context`,
+  C names), `export "DPI-C"` functions and tasks, every argument type
+  including packed vectors and open arrays, context scopes, exported tasks
+  that wait on time, and the 35.9 disable protocol. `include/svdpi.h` is
+  installed. msim builds C/C++ files given on its command line, loads
+  libraries with `-sv_lib` / `-sv_root` / `-sv_liblist` (annex J), and writes
+  prototypes with `-dpiheader`. msim now links libffi.
+- `chandle` variables (6.14).
+- `repeat (n)` with a count known only at run time (12.7.2).
+- randomize() arguments that are arrays or containers (18.11), and whole
+  fixed-size array properties through a handle: `h.a = '{...}` and `%p`
+  of `h.a` (8.4).
+- Fixed-size arrays of containers (`int q[4][$]`) as class properties,
+  rand properties and automatic variables (7.4, 18.4), with `%p`, foreach,
+  object copies and access through a handle.
+- `unique` constraints over dynamic arrays, queues and associative arrays
+  (18.5.5), alone or with scalars, under implications and on `m[i]`.
+- Rand containers of containers (18.4, 7.5): `rand int m[][]`, queues of
+  queues, associative arrays of queues, with constraints on `m.size()`,
+  `m[i].size()`, `m[i].sum()` and `m[i][j]` in nested foreach loops. Sizes
+  are solved level by level and picked again when the elements have no
+  solution; a failed randomize() leaves the arrays unchanged.
+- rand associative arrays with string keys (18.4).
+- Per-process random generators (18.14.2): a forked process is seeded from
+  its parent, so values one process draws do not depend on other processes.
+- `mbug`: files regression (mregress `results.json`), lint (mlint) and DFT
+  (mdft) failures as issues in GitHub Issues (default), Redmine or Jira, one
+  issue per failure signature. A repeat of an open failure becomes a comment,
+  and a failure that comes back after its issue was closed gets a new issue
+  linked to the old one. Issues have the reproduction command, the log tail,
+  attachments (Redmine, Jira), and the Jenkins or GitHub Actions build link.
+  `mbug sync-github` copies a repository's GitHub issues into Jira or
+  Redmine and keeps open / closed in step (`-two-way` also closes GitHub
+  issues resolved on the other side). It has `-dry-run` and a `max_issues`
+  cap, and credentials come from the environment only. `ci/Jenkinsfile`
+  has an opt-in `BUGS` parameter that runs it. `results.json` now records
+  each failure's `signature` and the test lists.
+- The constraint solver weights each choice by how many ways the other
+  variables can still be completed, so values are close to uniform over the
+  joint solution space (18.5.10): `s -> d == 0` gives s = 0, and `x < y`
+  is no longer biased toward a large x.
+- Containers of containers (7.5, 7.8, 7.10): `int m[][]`, `int q[$][$]`,
+  associative arrays of queues, and fixed-size arrays of containers
+  (`int f[2][]`); containers of unpacked structs and of vectors wider than
+  64 bits.
+- `rand join` in randsequence (18.17.5), with a constant bias, and production
+  arguments and return values (18.17.7).
+- `dist` default weights (`default :/ w`, 18.5.3) and rand associative
+  arrays with integral keys (18.4); foreach constraints over associative
+  arrays bind the index to each key.
+- Function calls in constraints (18.5.12): methods, static and package
+  functions, nested calls, in guards, foreach bodies and inline `with`. The
+  rand variables a call reads are solved first.
+- rand dynamic arrays and queues (18.4): `size()` constraints, `foreach`
+  over the elements and array reductions (`sum`, `product`, `and`, `or`,
+  `xor`, with or without `with`) in constraints (18.5.8). Sizes are solved
+  first, then the elements. Rand arrays and queues of class handles
+  randomize each element's object.
+- Virtual interfaces (25.9): variables, properties and arguments of
+  `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
+  clocking blocks reached through them.
+- `std::semaphore` (15.3), `std::mailbox` (15.4, parameterized, typeless and
+  bounded) and `std::process` (9.7: self, status, kill, await, suspend,
+  resume).
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
@@ -58,6 +208,14 @@ Spec references are IEEE 1800-2023 clauses.
   scope with `u.sum`).
 
 ### Fixed
+- `s[i]` on a string read X and could not be written (6.16).
+- The constraint solver re-evaluated known subexpressions at every node,
+  so a long `sum()` constraint cost O(n^2) per check.
+- msim could crash at exit when a process with an automatic frame (a
+  forked automatic task, a class method) was still suspended: its frame went
+  back to a frame shape that was already freed.
+- A static 2-state local of a task, function or block with no initializer
+  (`static int c;`) started at x instead of 0 (6.8, 6.21).
 - A module-level unpacked array of a 2-state type (`int a[8]`) started at x
   instead of 0 (6.8).
 - Signals inside generate blocks (`blk[2].x`) were left out of the waveform as

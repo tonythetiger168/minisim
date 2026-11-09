@@ -275,7 +275,10 @@ endif()
 if(MDFT)
   run(${MDFT} -keyfile Acme:acme-1=acme.pem core_none.svp ${EX}/core_tb.sv)
   reject("${out}${err}" "core_tb.u.clk")
-  expect("${out}" "in protected code (details hidden)")
+  reject("${out}${err}" "secret_core")
+  # The finding sits in the plain testbench, so it shows; the clock it shares
+  # with the protected core is named <protected>.
+  expect("${out}" "'<protected>'")
 endif()
 
 # A version 3 envelope made with the openssl tool only (IEEE 1735 5.4): a

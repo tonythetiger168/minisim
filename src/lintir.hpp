@@ -218,6 +218,7 @@ struct Block {
     std::set<const Symbol*> nba, blocking, reads;  // targets and reads
     std::set<const Symbol*> always;                // assigned on every path
     std::set<const Symbol*> locals;                // declared inside the block
+    std::set<const Symbol*> whole;                 // assigned as a whole word somewhere (not x[i], x[7:0])
     // src <- the one assignment "dst <= src" of a plain one-statement flop,
     // which is what a synchronizer stage looks like.
     const Symbol* chainFrom = nullptr;
@@ -271,8 +272,10 @@ struct BodyWalk {
                         (a.isNonBlocking() ? b.nba : b.blocking).insert(t);
                         // Only a whole-word assignment covers the target.
                         if (a.left().kind == ExpressionKind::NamedValue ||
-                            a.left().kind == ExpressionKind::HierarchicalValue)
+                            a.left().kind == ExpressionKind::HierarchicalValue) {
                             def.insert(t);
+                            b.whole.insert(t);
+                        }
                         if (!b.chainTo) {
                             b.chainTo = t;
                             b.chainFrom = oneName(a.right());
@@ -345,6 +348,9 @@ struct BodyWalk {
                             std::vector<const Symbol*> ln;
                             namesIn(a.left(), ln);
                             if (!ln.empty()) (a.isNonBlocking() ? b.nba : b.blocking).insert(ln[0]);
+                            if (!ln.empty() && (a.left().kind == ExpressionKind::NamedValue ||
+                                                a.left().kind == ExpressionKind::HierarchicalValue))
+                                b.whole.insert(ln[0]);
                             b.chainTo = b.chainFrom = nullptr;
                         } else {
                             expr(e);
@@ -372,6 +378,9 @@ struct Gather : ASTVisitor<Gather> {
     std::vector<Block>& blocks;
     // Every assignment of a symbol outside a process, for L004.
     std::map<const Symbol*, std::vector<SourceLocation>> drivers;
+    // ...and the symbols some driver writes as a whole word. Drivers of
+    // separate bits (assign x[i] = ... in a generate loop) are not a conflict.
+    std::set<const Symbol*> wholeDriven;
 
     Gather(Report& r, Join& j, std::vector<Block>& b) : rep(r), join(j), blocks(b) {}
 
@@ -383,16 +392,35 @@ struct Gather : ASTVisitor<Gather> {
             const Expression* outer = ext;
             if (outer->kind == ExpressionKind::Assignment)
                 outer = &outer->as<AssignmentExpression>().left();
-            if (const Symbol* actual = oneName(*outer)) join.join(&conn->port, actual);
+            if (const Symbol* actual = oneName(*outer)) {
+                join.join(&conn->port, actual);
+                // Inside the instance, processes name the port's internal
+                // net or variable, not the port: join that too, or every
+                // module's clk_i was a clock domain of its own.
+                if (const Symbol* in = conn->port.as<PortSymbol>().internalSymbol) join.join(actual, in);
+            }
         }
         visitDefault(inst);
+    }
+
+    // The branch of a generate if / case that elaboration did not pick (and a
+    // loop body for no iteration) is not part of the design: walking it made
+    // false findings, such as a port "assigned by 2 processes" when the two
+    // assigns sit in opposite branches.
+    void handle(const GenerateBlockSymbol& g) {
+        if (g.isUninstantiated) return;
+        visitDefault(g);
     }
 
     void handle(const ContinuousAssignSymbol& ca) {
         const Expression& e = ca.getAssignment();
         if (e.kind != ExpressionKind::Assignment) return;
         const auto& a = e.as<AssignmentExpression>();
-        if (const Symbol* t = lhsSymbol(a.left())) drivers[t].push_back(ca.location);
+        if (const Symbol* t = lhsSymbol(a.left())) {
+            drivers[t].push_back(ca.location);
+            if (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue)
+                wholeDriven.insert(t);
+        }
     }
 
     void handle(const ProceduralBlockSymbol& p) {
@@ -423,7 +451,10 @@ struct Gather : ASTVisitor<Gather> {
         std::set<const Symbol*> targets = b.nba;
         for (const Symbol* t : b.blocking)
             if (!b.locals.count(t)) targets.insert(t);
-        for (const Symbol* t : targets) drivers[t].push_back(p.location);
+        for (const Symbol* t : targets) {
+            drivers[t].push_back(p.location);
+            if (b.whole.count(t)) wholeDriven.insert(t);
+        }
         blocks.push_back(std::move(b));
     }
 };
@@ -466,11 +497,13 @@ struct Design {
     Join join;
     std::vector<Block> blocks;
     std::map<const Symbol*, std::vector<SourceLocation>> drivers;
+    std::set<const Symbol*> wholeDriven;
 
     void gather(Compilation& comp, Report& rep) {
         Gather g(rep, join, blocks);
         comp.getRoot().visit(g);
         drivers = std::move(g.drivers);
+        wholeDriven = std::move(g.wholeDriven);
     }
 };
 

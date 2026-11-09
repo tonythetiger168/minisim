@@ -1,0 +1,7 @@
+// Annotated to one instance at a time: the CELL's empty INSTANCE is the scope.
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "bufp") (INSTANCE)
+    (DELAY (ABSOLUTE (IOPATH A Z (1:2:3)))))
+)

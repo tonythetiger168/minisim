@@ -1,6 +1,5 @@
 // IEEE 1800-2023 24.3: A program block runs its initial blocks in the
 // reactive region and ends the run when they finish (24.3, 24.7).
-//! xfail: programs are errors
 //! icarus-skip: Icarus 13 has no reactive region, so the program reads q before the module updates it
 program tb(input logic [3:0] q);
   initial begin

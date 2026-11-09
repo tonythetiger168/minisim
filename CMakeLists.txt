@@ -64,6 +64,13 @@ endif()
 
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
+# mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+  add_test(NAME mbug
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
+                   ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
+endif()
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -90,8 +97,12 @@ if(MINISIM_WITH_SLANG)
     set(FST_SRC ${libfst_SOURCE_DIR}/src)
     add_library(fst STATIC ${FST_SRC}/fstapi.c ${FST_SRC}/fastlz.c ${FST_SRC}/lz4.c)
     target_include_directories(fst PUBLIC ${FST_SRC})
-    target_link_libraries(fst PUBLIC ZLIB::ZLIB)
-    target_compile_definitions(fst PRIVATE _GNU_SOURCE HAVE_FSEEKO HAVE_REALPATH)
+    # FST_WRITER_PARALLEL: libfst compresses and writes each finished block on
+    # a background thread while the simulation goes on (msim turns it on).
+    find_package(Threads REQUIRED)
+    target_link_libraries(fst PUBLIC ZLIB::ZLIB Threads::Threads)
+    target_compile_definitions(fst PRIVATE _GNU_SOURCE HAVE_FSEEKO HAVE_REALPATH
+                               HAVE_LIBPTHREAD FST_WRITER_PARALLEL)
     set_target_properties(fst PROPERTIES POSITION_INDEPENDENT_CODE ON)
   endif()
 
@@ -102,7 +113,15 @@ if(MINISIM_WITH_SLANG)
   # One-step compile + simulate, irun / vcs -R style: msim tb.sv -top tb -vcd w.vcd
   add_executable(msim src/msim.cpp)
   target_include_directories(msim PRIVATE src)
-  target_link_libraries(msim PRIVATE slang::slang)
+  # DPI-C (35): libffi calls the imports; -rdynamic lets a loaded library
+  # find the svdpi.h functions and msim_dpi_export in msim itself.
+  find_library(FFI_LIB ffi REQUIRED)
+  find_path(FFI_INCLUDE ffi.h PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu)
+  target_link_libraries(msim PRIVATE slang::slang ${FFI_LIB} ${CMAKE_DL_LIBS})
+  if(FFI_INCLUDE)
+    target_include_directories(msim PRIVATE ${FFI_INCLUDE})
+  endif()
+  set_target_properties(msim PROPERTIES ENABLE_EXPORTS ON)
   if(OPENSSL_FOUND)
     target_link_libraries(msim PRIVATE OpenSSL::Crypto)
     target_compile_definitions(msim PRIVATE MINISIM_HAVE_OPENSSL)
@@ -111,7 +130,7 @@ if(MINISIM_WITH_SLANG)
   target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
   if(MINISIM_WITH_FST)
     target_link_libraries(msim PRIVATE fst)
-    target_compile_definitions(msim PRIVATE MINISIM_FST MINISIM_FST_DIR="${FST_SRC}")
+    target_compile_definitions(msim PRIVATE MINISIM_FST MINISIM_FST_PARALLEL MINISIM_FST_DIR="${FST_SRC}")
   endif()
 
   # Lint and clock-domain checks on the same front end: mlint design.sv
@@ -148,11 +167,17 @@ if(MINISIM_WITH_SLANG)
   set_tests_properties(msim_default_width PROPERTIES PASS_REGULAR_EXPRESSION "W= +4 sum=12\n")
   add_test(NAME msim_init COMMAND msim ${CLI}/init.sv)
   set_tests_properties(msim_init PROPERTIES PASS_REGULAR_EXPRESSION "v= +5\nw= +6\nw= +10\n")
+  # +notimingcheck (31): the setup and hold checks report nothing.
+  add_test(NAME msim_notimingcheck COMMAND msim +notimingcheck ${CMAKE_SOURCE_DIR}/tests/spec/31.3-setup-hold.sv)
+  set_tests_properties(msim_notimingcheck PROPERTIES PASS_REGULAR_EXPRESSION "^notifier=x\n$")
   add_test(NAME msim_maxtime COMMAND msim ${CLI}/spin.sv -maxtime 25)
   set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION "^tick\ntick\ntick\n$")
   add_test(NAME msim_vcd
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd.cmake)
+  add_test(NAME msim_vcdtasks
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_vcdtasks.cmake)
   # Compiled mode: generated C++ prints the same as the interpreter.
   add_test(NAME msim_compile
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -203,6 +228,17 @@ if(MINISIM_WITH_SLANG)
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_protect
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_protect.cmake)
   endif()
+  # The virtual prototype layer: the design reaching C models over AXI4-Lite.
+  add_test(NAME msim_mvp
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_mvp
+                   -P ${CMAKE_SOURCE_DIR}/tests/mvp.cmake)
+  set_tests_properties(msim_mvp PROPERTIES ENVIRONMENT MINISIM_MVP=${CMAKE_SOURCE_DIR}/mvp)
+
+  # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
+  add_test(NAME msim_dpi
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_dpi.cmake)
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
@@ -237,6 +273,21 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  # UVM (IEEE 1800.2-2020) tests: tests/uvm/*.sv run against the Accellera
+  # UVM library when -DUVM_HOME=<uvm-core checkout> is given (CI fetches
+  # uvm-core 2020.3.1).
+  set(UVM_HOME "$ENV{UVM_HOME}" CACHE PATH "Accellera uvm-core checkout for the UVM tests")
+  if(UVM_HOME AND EXISTS ${UVM_HOME}/src/uvm_pkg.sv)
+    file(GLOB UVM_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/uvm/*.sv)
+    foreach(sv IN LISTS UVM_TESTS)
+      get_filename_component(name ${sv} NAME_WE)
+      add_test(NAME uvm/${name}
+               COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DUVM=${UVM_HOME}/src -DSV=${sv}
+                       -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
+      set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
+    endforeach()
+  endif()
+
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
@@ -263,8 +314,10 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump, bin/msimprotect (with OpenSSL)
+#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
+#   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
+#   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -276,6 +329,7 @@ if(OPENSSL_FOUND)
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
+install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
@@ -284,7 +338,13 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/PROTECT.md
+install(FILES include/svdpi.h include/vpi_user.h include/mvp.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+# The virtual prototype layer: msim -mvp looks for these next to itself.
+install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
+install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
+install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/PROTECT.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)

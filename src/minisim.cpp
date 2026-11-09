@@ -14,6 +14,7 @@
 // $finish            -> S.finished = true
 // task/function      -> Call / Ret in this coroutine (exec.inc)
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <coroutine>
 #include <cstdint>
@@ -21,10 +22,14 @@
 #include <fstream>
 #include <iostream>
 #include <atomic>
+#include <array>
+#include <bit>
+#include <charconv>
 #include <chrono>
 #include <climits>
 #include <functional>
 #include <map>
+#include <set>
 #include <queue>
 #include <sstream>
 #include <memory>
@@ -44,6 +49,9 @@ using Handle = coroutine_handle<>;
 #include "sva_engine.hpp"
 #include "clocking.hpp"
 #include "cover.hpp"
+#include "tchk.hpp"
+#include "specify.hpp"
+#include "sdf.hpp"
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
@@ -300,7 +308,13 @@ struct Sim {
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
     // Postponed region, after NBA and before time advances. `mon` marks the
     // single $monitor slot; anything else is a $strobe, in schedule order.
-    struct Post { bool mon = false; string fmt; vector<E> args; };
+    // A postponed print: $strobe, $monitor (mon), or to a file with $fstrobe /
+    // $fmonitor (file, fd; fmon is the $fmonitor's index).
+    struct Post { bool mon = false; string fmt; vector<E> args; bool file = false; uint32_t fd = 0; int fmon = -1; };
+    // $fmonitor (21.3.2): any number can be active at once; $fclose of the
+    // descriptor ends one (on = false).
+    struct FMon { bool on = true, queued = false; uint32_t fd; string fmt; vector<E> args; vector<int> watch; };
+    vector<FMon> fmons;
     deque<Post> postq;
     // The reactive region set (4.4.2.6-4.4.2.8): reactive, re-inactive
     // (#0 from the reactive region) and re-NBA. Assertion action blocks run
@@ -316,6 +330,20 @@ struct Sim {
     // the signal's value from the preponed region of this time slot. At time
     // 0 it keeps the default sampled value (the declaration's initial value).
     vector<pair<int, int>> shadows;
+    // Free checker variables (17.7.2): signal, and whether it takes a new
+    // random value in every time step (an active one).
+    vector<pair<int, bool>> freeVars;
+    Val freeValue(int s) {
+        int w = sigs[s].w;
+        uint64_t r = urandomNext(urandomState());
+        if (w > 32) r |= (uint64_t)urandomNext(urandomState()) << 32;
+        return make(w >= 64 ? r : (r & ((1ull << w) - 1)), 0, w, 0);
+    }
+    uint64_t freeAt = 0;   // the time step freeStep last ran in
+    void freeStep() {
+        for (auto [s, every] : freeVars)
+            if (every) set(s, freeValue(s));
+    }
     // Clocks of $past / $rose / ... (sva.hpp SampleClock); ticked: the ones
     // that ticked in this slot, shifted at the end of the slot.
     vector<SampleClock> sclocks;
@@ -335,13 +363,39 @@ struct Sim {
     string vcdTop = "top";   // name of the root VCD scope (the top module)
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
+    // VCD text is built here and written in large blocks (an ostream insert
+    // per character was most of the cost of dumping), with each signal's
+    // identifier made once in header().
+    string vbuf;
+    vector<string> vcdIds;
+    void flushVcd() {
+        if (!vbuf.empty() && vcd.is_open()) vcd.write(vbuf.data(), (streamsize)vbuf.size());
+        vbuf.clear();
+    }
     // FST output instead of VCD when vcdPath ends in ".fst" (built with libfst).
     void* fst = nullptr;
+    bool fstParallel = true;
+    size_t fstPending = 0;                           // value-change bytes since the last block
     vector<uint32_t> fstH;                           // FST handle per signal (0: not dumped)
     string fstBuf;
     bool waving() const { return vcd.is_open() || fst != nullptr; }
+    // VCD tasks (21.7.1). msim -vcd dumps every signal from time 0 and the
+    // design's $dumpfile / $dumpvars are ignored; without -vcd, $dumpvars
+    // opens $dumpfile's file (default dump.vcd) at the end of its time slot,
+    // with the selected signals. $dumpoff / $dumpon / $dumpall / $dumpflush /
+    // $dumplimit work on either.
+    bool dumpCli = false, dumpPend = false, dumpOff = false, dumpStopped = false;
+    string dumpFile = "dump.vcd";
+    vector<char> dumpSel;                            // empty: every signal
+    uint64_t dumpLimit = 0;                          // bytes; 0: no limit
+    bool dumped(size_t i) const {
+        return !sigs[i].hide && (dumpSel.empty() || (i < dumpSel.size() && dumpSel[i]));
+    }
 
-    Sim() { g_sformat = &Sim::sformat; }
+    Sim() {
+        g_sformat = &Sim::sformat;
+        g_fcloseHook = &Sim::closeHook;
+    }
 
     // ---- multi-core: deterministic parallel batches ----
     // `threads` workers (default: defaultThreads(); msim -threads N).
@@ -486,6 +540,8 @@ struct Sim {
         vector<NbaItem> items; // this region's NBAs, in queue order
         vector<char> pend;     // per entry of `combs`
         int cur = -1;          // entry being evaluated
+        vector<pair<int, Val>> changed;   // with a waveform open: changes to dump afterwards, in order
+        bool wave = false;
     };
     vector<Part> parts;
     vector<int> sigPart;       // signal -> partition, or -1
@@ -540,8 +596,12 @@ struct Sim {
     void setLocal(int s, Val nv) {
         Sig& g = sigs[s];
         if (nv == g.val) return;
-        g.val = nv;
         Part& pt = *tlPart;
+        // Toggle masks of a partition's own signals are written only by the
+        // thread running it (the per-signal table is sized beforehand).
+        if (g_cov) covToggle(s, g.val, nv);
+        if (pt.wave) pt.changed.emplace_back(s, nv);
+        g.val = nv;
         for (int r : combOf[s]) {
             int k = combLocal[r];
             if (k != pt.cur) pt.pend[k] = 1;
@@ -578,7 +638,9 @@ struct Sim {
             }
             return;
         }
-        if (parts.empty() || waving() || mon.on || g_cov) {
+        // A waveform and coverage keep the partitions parallel: each records
+        // its changes (dumped below, in partition order) and toggles.
+        if (parts.empty() || mon.on || !fmons.empty()) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
             for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
@@ -604,7 +666,15 @@ struct Sim {
         partsBusy.resize(keep);
         for (auto& n : nbaSerial) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
         if (!std::is_sorted(partsBusy.begin(), partsBusy.end())) std::sort(partsBusy.begin(), partsBusy.end());
+        bool wave = waving();
+        if (g_cov && togRise.size() < sigs.size()) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
+        for (int p : partsBusy) parts[p].wave = wave;
         parallelFor(partsBusy.size(), [&](size_t k) { runPart(parts[partsBusy[k]]); });
+        if (wave)
+            for (int p : partsBusy) {
+                for (auto& [sg, v] : parts[p].changed) dump(sg, v);
+                parts[p].changed.clear();
+            }
     }
 
     // ---- clocked processes as functions (prog.hpp: seqShape) ----
@@ -666,6 +736,7 @@ struct Sim {
         quiet.assign(sigs.size(), 1);
         for (size_t s = 0; s < sigs.size(); s++) {
             if (sigs[s].w > 64 || sigs[s].net && sigs[s].drv.empty()) quiet[s] = 0;
+            if (s < tranOf.size() && !tranOf[s].empty()) quiet[s] = 0;   // a tran net: drive() resolves its group
             if (s < seqOf.size())
                 if (!seqOf[s].empty()) quiet[s] = 0;   // a clock: set() detects its edges
             if (s < combOf.size())
@@ -676,7 +747,7 @@ struct Sim {
     // The common case inline: a narrow signal nobody else watches is a store.
     __attribute__((always_inline)) void fw(int s, const Val& nv) {
         Sig& g = sigs[s];
-        if (__builtin_expect(quiet[s] && !observed && waiters[s].empty(), 1)) {
+        if (__builtin_expect(quiet[s] && !observed && !g_cov && waiters[s].empty(), 1)) {
             uint64_t m = mask(g.w);
             g.val.v = nv.v & m;
             g.val.x = nv.x & m;
@@ -690,7 +761,7 @@ struct Sim {
     // The same for a known (2-state) value, without building a Val.
     __attribute__((always_inline)) void fwv(int s, uint64_t v) {
         Sig& g = sigs[s];
-        if (__builtin_expect(quiet[s] && !observed && waiters[s].empty(), 1)) {
+        if (__builtin_expect(quiet[s] && !observed && !g_cov && waiters[s].empty(), 1)) {
             g.val.v = v & mask(g.w);
             g.val.x = 0;
             g.val.z = 0;
@@ -714,12 +785,27 @@ struct Sim {
         }
         drive(s, d, make(v & mask(g.w), 0, g.w), s0, s1);
     }
-    __attribute__((noinline)) void fwSlow(int s, Val nv) {
+    __attribute__((noinline)) void fwSlow(int s, const Val& in) {
         Sig& g = sigs[s];
-        if (!quiet[s] || observed || !waiters[s].empty()) { set(s, std::move(nv)); return; }
-        nv = maskWidth(nv, g.w);   // a wide quiet signal
+        // Only a waveform (or coverage) watches a quiet signal: compare, store
+        // and record the change. A full set() would also queue the domain's
+        // comb pass and scan for waiters, which made -vcd runs 20x slower.
+        bool waveOnly = !mon.on && !g.fl;
+        if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) { set(s, in); return; }
+        if (g.w <= 64 && g.val.hi.empty()) {   // the common case, without copying a Val
+            uint64_t m = mask(g.w), v = in.v & m, x = in.x & m, z = in.z & m;
+            if (v == g.val.v && x == g.val.x && z == g.val.z) return;
+            if (g_cov) covToggle(s, g.val, Val{v, x, g.w, z});
+            g.val.v = v; g.val.x = x; g.val.z = z;
+            g.val.real = in.real; g.val.str = in.str; g.val.sgn = false;
+            if (observed) dump(s);
+            return;
+        }
+        Val nv = maskWidth(in, g.w);
         if (nv == g.val) return;
+        if (g_cov) covToggle(s, g.val, nv);
         g.val = std::move(nv);
+        if (observed) dump(s);
     }
     // A continuous assign: the net's only driver, strong 0 and 1, resolves to its value.
     __attribute__((always_inline)) void fwd(int s, int d, const Val& v, int s0, int s1) {
@@ -755,7 +841,7 @@ struct Sim {
 #ifdef MINISIM_FST
         if (fst) { fstWriterClose((fstWriterContext*)fst); fst = nullptr; }
 #endif
-        if (vcd.is_open()) vcd.close();
+        if (vcd.is_open()) { flushVcd(); vcd.close(); }
     }
 
     // A wire (`net`) starts as Z, including before the first drive().
@@ -790,6 +876,7 @@ struct Sim {
         g.drv[d].v = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
+        if (__builtin_expect(!tranOf.empty(), 0) && (size_t)s < tranOf.size() && !tranOf[(size_t)s].empty()) { tranResolve(s); return; }
         // One driver that drives both 0 and 1 resolves to its own value
         // (X stays X, Z stays Z). Skip the per-bit strength walk.
         Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
@@ -799,7 +886,169 @@ struct Sim {
             auto nd = netDelay.find(s);
             if (nd != netDelay.end()) { schedule(s, -1, r, g.val, nd->second, STR_STRONG, STR_STRONG); return; }
         }
+        if (!timedOut.empty() && (size_t)s < timedOut.size() && timedOut[s]) {   // 30.5.3, 32.4.4
+            scheduleIn(s, -1, r, g.val, pathDelay(s, g.val, r), STR_STRONG, STR_STRONG);
+            return;
+        }
         set(s, r);
+    }
+
+    // Specify path outputs and interconnect loads (30.4, 32.4.4). timedOut[s]
+    // marks a net whose resolved value takes a path or interconnect delay;
+    // lastChg is the time each path input last changed (30.5.3).
+    vector<uint8_t> timedOut, pathIn;
+    vector<uint64_t> lastChg;
+    unordered_map<int, vector<int>> pathsTo;               // output -> pathRecs() indices
+    unordered_map<int, array<uint64_t, 12>> icDelay;       // load port -> interconnect delay
+    bool (*pathCond)(const E&) = nullptr;                  // a path condition holds (x counts)
+    // Sizes the tables once the design is lowered and annotated.
+    void setupPaths() {
+        timedOut.assign(sigs.size(), 0);
+        pathIn.assign(sigs.size(), 0);
+        lastChg.assign(sigs.size(), 0);
+        pathsTo.clear();
+        auto& P = pathRecs();
+        for (size_t k = 0; k < P.size(); k++) {
+            pathsTo[P[k].dst].push_back((int)k);
+            timedOut[(size_t)P[k].dst] = 1;
+            pathIn[(size_t)P[k].src] = 1;
+        }
+        for (auto& [sg, d] : icDelay) timedOut[(size_t)sg] = 1;
+        // Like a net delay, a delayed net with drivers is x until its first
+        // value arrives (28.16).
+        for (size_t k = 0; k < timedOut.size(); k++)
+            if (timedOut[k] && !sigs[k].drv.empty() && now == 0) sigs[k].val = allx(sigs[k].w);
+    }
+    // The delay of one transition: each changed bit's from/to levels pick
+    // one of the 12 delays; a vector takes the smallest.
+    template <class D> static uint64_t delay12(const D& d, const Val& from, const Val& to) {
+        uint64_t best = ~0ULL;
+        int w = to.w;
+        for (int k = 0; k < w; k++) {
+            int f = bitAt(from, k), t = bitAt(to, k);
+            if (f == t) continue;
+            best = std::min<uint64_t>(best, d[(size_t)transIdx(f, t)]);
+        }
+        return best == ~0ULL ? 0 : best;
+    }
+    // 30.5.3: the paths to s whose input changed most recently and whose
+    // condition holds (an ifnone path when no conditional path between the
+    // same ports holds) are active; the delay is the smallest of theirs.
+    // With no active path there is no path delay. An interconnect delay to
+    // a load port comes after the path delay of a path ending there.
+    uint64_t pathDelay(int s, const Val& from, const Val& to) {
+        uint64_t t = 0;
+        auto pt = pathsTo.find(s);
+        if (pt != pathsTo.end()) {
+            auto& P = pathRecs();
+            auto& ids = pt->second;
+            auto on = [&](const PathRec& p) {
+                if (p.hasCond) return !pathCond || pathCond(p.condE);
+                if (!p.ifnone) return true;
+                for (int j : ids) {
+                    const PathRec& q = P[(size_t)j];
+                    if (q.hasCond && q.src == p.src && (!pathCond || pathCond(q.condE))) return false;
+                }
+                return true;
+            };
+            uint64_t latest = 0, best = ~0ULL;
+            bool any = false;
+            for (int j : ids) {
+                const PathRec& p = P[(size_t)j];
+                if (!on(p)) continue;
+                uint64_t lc = lastChg[(size_t)p.src];
+                uint64_t d = delay12(p.d, from, to);
+                if (!any || lc > latest) { latest = lc; best = d; any = true; }
+                else if (lc == latest) best = std::min(best, d);
+            }
+            if (any) t = best;
+        }
+        if (!icDelay.empty()) {
+            auto ic = icDelay.find(s);
+            if (ic != icDelay.end()) t += delay12(ic->second, from, to);
+        }
+        return t;
+    }
+    // Bidirectional switches (28.8). Nets joined by switches that are on form
+    // one group; every net in it takes the resolution of all the group's
+    // drivers. A driver seen through a switch is reduced (28.13.1): supply
+    // becomes strong through a tran, and each rtran lowers it one more step.
+    // A switch with an X or Z control is resolved both ways: bits that
+    // differ become X.
+    struct TranSw { int a, b; bool resist; int state = -1; };   // state: 0 off, 1 on, 2 unknown
+    vector<TranSw> trans;
+    vector<vector<int>> tranOf;   // net -> its switches
+    void addTran(int a, int b, bool resist) {
+        if (tranOf.size() != sigs.size()) tranOf.resize(sigs.size());
+        tranOf[(size_t)a].push_back((int)trans.size());
+        tranOf[(size_t)b].push_back((int)trans.size());
+        trans.push_back({a, b, resist});
+    }
+    void tranCtl(int id, int st) {
+        if (trans[(size_t)id].state == st) return;
+        trans[(size_t)id].state = st;
+        tranResolve(trans[(size_t)id].a);
+        tranResolve(trans[(size_t)id].b);
+    }
+    static uint8_t tranReduce(uint8_t s, bool resist) {
+        static const uint8_t r[8] = {STR_HIZ, STR_SMALL, STR_SMALL, STR_MEDIUM, STR_MEDIUM, STR_WEAK, STR_PULL, STR_PULL};
+        if (resist) return r[s & 7];
+        return s == STR_SUPPLY ? STR_STRONG : s;
+    }
+    // The value net n sees: the drivers of every net it reaches through
+    // switches that are on (and, when unkOn, those with an unknown control).
+    Val tranValue(int n, bool unkOn, vector<int>& seen) {
+        // Best path to each net: the fewest resistive steps, then any switch at all.
+        map<int, pair<int, bool>> best;   // net -> (resistive steps, crossed a switch)
+        deque<int> q{n};
+        best[n] = {0, false};
+        while (!q.empty()) {
+            int m = q.front(); q.pop_front();
+            auto [k, crossed] = best[m];
+            for (int id : tranOf[(size_t)m]) {
+                const TranSw& t = trans[(size_t)id];
+                if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
+                int o = t.a == m ? t.b : t.a;
+                pair<int, bool> nb{k + (t.resist ? 1 : 0), true};
+                auto it = best.find(o);
+                if (it != best.end() && it->second.first <= nb.first) continue;
+                best[o] = nb;
+                q.push_back(o);
+            }
+        }
+        vector<Drv> all;
+        for (auto& [m, kc] : best) {
+            seen.push_back(m);
+            for (Drv d : sigs[(size_t)m].drv) {
+                if (kc.second) {
+                    d.s0 = tranReduce(d.s0, false);
+                    d.s1 = tranReduce(d.s1, false);
+                }
+                for (int r = 0; r < kc.first; r++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                all.push_back(d);
+            }
+        }
+        const Sig& g = sigs[(size_t)n];
+        return g.kind != NR_WIRE ? resolveNet(g.kind, all.data(), all.size(), g.w, g.val)
+                                 : resolveDrives(all.data(), all.size(), g.w);
+    }
+    void tranResolve(int s) {
+        vector<int> group, scratch;
+        Val v = tranValue(s, true, group);
+        bool unknown = false;
+        for (int m : group)
+            for (int id : tranOf[(size_t)m]) if (trans[(size_t)id].state == 2) unknown = true;
+        vector<pair<int, Val>> vals;
+        for (int m : group) {
+            Val on = m == s ? v : tranValue(m, true, scratch);
+            if (unknown) {
+                Val off = tranValue(m, false, scratch);
+                for (int b = 0; b < sigs[(size_t)m].w; b++)
+                    if (bitAt(on, b) != bitAt(off, b)) setBit(on, b, 2);
+            }
+            vals.push_back({m, on});
+        }
+        for (auto& [m, val] : vals) set(m, val);
     }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
@@ -847,13 +1096,17 @@ struct Sim {
         return rise;
     }
     void schedule(int s, int d, Val v, const Val& cur, const vector<uint64_t>& dl, uint8_t s0, uint8_t s1) {
+        uint64_t t = sameVal(v, cur) ? 0 : pickDelay(dl, cur, v);
+        scheduleIn(s, d, std::move(v), cur, t, s0, s1);
+    }
+    // The same with the delay t already chosen for the change from cur to v.
+    void scheduleIn(int s, int d, Val v, const Val& cur, uint64_t t, uint8_t s0, uint8_t s1) {
         auto& p = pend[{s, d}];
         if (p.live) {
             if (sameVal(v, p.v)) return;   // already on its way
             p.live = false;
         }
         if (sameVal(v, cur)) return;
-        uint64_t t = pickDelay(dl, cur, v);
         if (t == 0) { apply(s, d, v, s0, s1); return; }
         p.v = v;
         p.gen = ++pendGen;
@@ -1193,24 +1446,57 @@ struct Sim {
                 char style = fmt[++i];
                 if (ai >= args.size()) continue;
                 const E& h = args[ai++];
-                auto one = [&](Val v, char st) {
+                E slot, sub;   // %QF: each element set into slot, printed by sub
+                if (style == 'F') {
+                    if (ai + 2 > args.size()) continue;
+                    slot = args[ai++];
+                    sub = args[ai++];
+                }
+                auto one = [&](Val v, char st) -> string {
+                    if (st == 'F') {   // the element in place of the slot
+                        std::function<E(const E&)> put = [&](const E& e) -> E {
+                            if (!e) return e;
+                            if (e->op == Op::Ref && !e->at && e->sig == slot->sig) {
+                                Val k = v;
+                                k.sgn = e->sgn;
+                                return konst(k);
+                            }
+                            bool ch = false;
+                            std::vector<E> kids;
+                            for (auto& kd : e->kids) { kids.push_back(put(kd)); ch |= kids.back() != kd; }
+                            if (!ch) return e;
+                            auto c = std::make_shared<Expr>(*e);
+                            c->kids = std::move(kids);
+                            return c;
+                        };
+                        return v_str(eval(put(sub), rd));
+                    }
                     if (st == 's') { v.str = true; return "\"" + v_str(v) + "\""; }
                     if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
                     return fmtVal('d', v, 0, true);
                 };
-                const DynObj& o = dynStore()[h->sig];
-                cout << "'{";
-                if (o.kind == 2) {
-                    bool first = true;
-                    for (const auto& [k, v] : o.map) {
-                        if (!first) cout << ", ";
-                        first = false;
-                        cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':' << one(v, style);
+                // A container of containers prints each element container nested.
+                std::function<void(const DynObj&)> show = [&](const DynObj& o) {
+                    auto el = [&](const Val& v) {
+                        if (!o.elem) { cout << one(v, style); return; }
+                        if (v.x || !v.v) { cout << "'{}"; return; }
+                        show(dynStore()[(int)v.v]);
+                    };
+                    cout << "'{";
+                    if (o.kind == 2) {
+                        bool first = true;
+                        for (const auto& [k, v] : o.map) {
+                            if (!first) cout << ", ";
+                            first = false;
+                            cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':';
+                            el(v);
+                        }
+                    } else {
+                        for (size_t k = 0; k < o.vec.size(); k++) { if (k) cout << ", "; el(o.vec[k]); }
                     }
-                } else {
-                    for (size_t k = 0; k < o.vec.size(); k++) cout << (k ? ", " : "") << one(o.vec[k], style);
-                }
-                cout << '}';
+                    cout << '}';
+                };
+                show(dynStore()[R(h->sig)]);   // R: a property through a handle, or an automatic container
                 continue;
             }
             if ((c == 't' || c == 'T') && ai < args.size()) {   // %t (20.4.3): ticks, printed per $timeformat
@@ -1262,7 +1548,49 @@ struct Sim {
         for (const auto& a : args) collectRefs(a, mon.watch);
         queueMon();
     }
+    static void closeHook(uint32_t fd);
+    void strobeF(uint32_t fd, const string& fmt, const vector<E>& args) {
+        Post p{false, fmt, args, true, fd};
+        postq.push_back(std::move(p));
+    }
+    void queueFMon(size_t k) {
+        FMon& m = fmons[k];
+        if (!m.on || m.queued) return;
+        Post p{false, m.fmt, m.args, true, m.fd, (int)k};
+        postq.push_back(std::move(p));
+        m.queued = true;
+    }
+    void armFMon(uint32_t fd, const string& fmt, const vector<E>& args) {
+        FMon m;
+        m.fd = fd;
+        m.fmt = fmt;
+        m.args = args;
+        for (const auto& a : args) collectRefs(a, m.watch);
+        fmons.push_back(std::move(m));
+        observed = true;
+        queueFMon(fmons.size() - 1);
+    }
+    // $fclose: the closed descriptor's pending $fstrobe / $fmonitor lines and
+    // its $fmonitors end. Closing channels of a multichannel descriptor drops
+    // them from it.
+    void fileClosed(uint32_t fd) {
+        auto left = [&](uint32_t d) -> uint32_t {
+            if ((fd & 0x80000000u) || (d & 0x80000000u)) return d == fd ? 0 : d;
+            return d & ~(fd & ~1u);   // channel 0 (stdout) is never closed
+        };
+        for (auto& m : fmons) if (m.on && !(m.fd = left(m.fd))) m.on = false;
+        for (auto it = postq.begin(); it != postq.end();) {
+            if (it->file && !(it->fd = left(it->fd))) {
+                if (it->fmon >= 0) fmons[(size_t)it->fmon].queued = false;
+                it = postq.erase(it);
+            } else ++it;
+        }
+    }
     void noteChange(int s) {
+        if (__builtin_expect(!fmons.empty(), 0))
+            for (size_t k = 0; k < fmons.size(); k++)
+                if (fmons[k].on && !fmons[k].queued)
+                    for (int w : fmons[k].watch) if (w == s) { queueFMon(k); break; }
         if (!mon.on || mon.queued) return;
         for (int w : mon.watch) if (w == s) { queueMon(); return; }
     }
@@ -1271,41 +1599,79 @@ struct Sim {
             Post p = move(postq.front());
             postq.pop_front();
             if (p.mon) mon.queued = false;
+            if (p.file) {
+                if (p.fmon >= 0) fmons[(size_t)p.fmon].queued = false;
+                fileWrite(p.fd, sformat(p.fmt, p.args, [&](int s) { return get(s); }) + "\n");
+                continue;
+            }
             printSys(p.fmt, p.args);
         }
     }
 
+    // A value's w bits as '0' / '1' / 'x' / 'z' characters, MSB first.
+    static void putBits(char* p, const Val& val, int w) {
+        if (w <= 64) {
+            uint64_t v = val.v, x = val.x, z = val.z;
+            if (!x && std::endian::native == std::endian::little) {
+                // Known bits: eight characters per table lookup.
+                int i = w;
+                for (int r = i % 8; r > 0; r--) *p++ = char('0' + (v >> --i & 1));
+                for (; i > 0; i -= 8, p += 8) memcpy(p, &kBitChars[(v >> (i - 8)) & 0xFF], 8);
+            } else
+                for (int i = w - 1; i >= 0; i--)
+                    *p++ = (x >> i & 1) ? ((z >> i & 1) ? 'z' : 'x') : char('0' + (v >> i & 1));
+            return;
+        }
+        for (int i = w - 1; i >= 0; i--) {
+            int t = bitAt(val, i);
+            *p++ = t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t);
+        }
+    }
+    // Byte b as eight ASCII digits, MSB first, in memory order.
+    static constexpr std::array<uint64_t, 256> kBitChars = [] {
+        std::array<uint64_t, 256> t{};
+        for (int b = 0; b < 256; b++)
+            for (int k = 0; k < 8; k++) t[b] |= uint64_t('0' + (b >> (7 - k) & 1)) << (8 * k);
+        return t;
+    }();
     // One value line, no timestamp. Shared so $dumpvars and later changes match.
-    void writeVal(int s) {
-        const Sig& g = sigs[s];
+    void writeVal(int s) { writeVal(s, sigs[s].val); }
+    void writeVal(int s, const Val& val) {
+        const int w = sigs[s].w;
 #ifdef MINISIM_FST
         if (fst) {
             // FST takes one '0' / '1' / 'x' / 'z' character per bit, MSB first.
-            fstBuf.resize((size_t)g.w);
-            for (int i = g.w - 1, k = 0; i >= 0; i--, k++) {
-                if (g.w <= 64)
-                    fstBuf[k] = (g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1));
-                else {
-                    int t = bitAt(g.val, i);
-                    fstBuf[k] = t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t);
-                }
-            }
+            fstBuf.resize((size_t)w);
+            putBits(fstBuf.data(), val, w);
             fstWriterEmitValueChange((fstWriterContext*)fst, fstH[s], fstBuf.data());
+            // Hand a block to the writer thread every few MB, so it compresses
+            // while the simulation goes on. libfst's own block is 128 MB, so a
+            // run wrote one or two blocks and then flushed the rest at close.
+            fstPending += (size_t)w + 8;
+            if (fstPending >= (16u << 20)) { fstWriterFlushContext((fstWriterContext*)fst); fstPending = 0; }
             return;
         }
 #endif
-        string id = vcdId((size_t)s);
-        if (g.w == 1) { vcd << ((g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1))) << id << "\n"; return; }
-        vcd << "b";
-        for (int i = g.w - 1; i >= 0; i--) {
-            if (g.w <= 64)
-                vcd << ((g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1)));
-            else {
-                int t = bitAt(g.val, i);
-                vcd << (t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t));
-            }
+        // Signals made after header() (frames, objects) get their id here.
+        if ((size_t)s >= vcdIds.size()) {
+            size_t from = vcdIds.size();
+            vcdIds.resize(sigs.size());
+            for (size_t i = from; i < vcdIds.size(); i++) vcdIds[i] = vcdId(i);
         }
-        vcd << " " << id << "\n";
+        const string& id = vcdIds[s];
+        if (w == 1) {
+            vbuf += (val.x & 1) ? ((val.z & 1) ? 'z' : 'x') : char('0' + (val.v & 1));
+        } else {
+            size_t at = vbuf.size();
+            vbuf.resize(at + 1 + (size_t)w);
+            char* p = vbuf.data() + at;
+            *p++ = 'b';
+            putBits(p, val, w);
+            vbuf += ' ';
+        }
+        vbuf += id;
+        vbuf += '\n';
+        if (vbuf.size() >= (1u << 16)) flushVcd();
     }
     // VCD identifier: base-94 over the printable characters '!'..'~'.
     static string vcdId(size_t i) {
@@ -1313,18 +1679,137 @@ struct Sim {
         do { id += char('!' + i % 94); i /= 94; } while (i);
         return id;
     }
-    void dump(int s) {
+    void dump(int s) { dump(s, sigs[s].val); }
+    void dump(int s, const Val& v) {
         if (sigs[s].hide) return;
 #ifdef MINISIM_FST
         if (fst) {
+            if (dumpOff || !dumped((size_t)s)) return;
             if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; }
-            writeVal(s);
+            writeVal(s, v);
             return;
         }
 #endif
         if (!vcd.is_open() || !vcd) return;
-        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
-        writeVal(s);
+        if (dumpOff || dumpStopped || !dumped((size_t)s)) return;
+        stamp();
+        writeVal(s, v);
+        if (dumpLimit && (uint64_t)vcd.tellp() + vbuf.size() >= dumpLimit) {
+            vbuf += "$comment Note: $dumplimit reached; dumping stops $end\n";
+            dumpStopped = true;
+        }
+    }
+    void stamp() {
+#ifdef MINISIM_FST
+        if (fst) { if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; } return; }
+#endif
+        if (lastDump != now) {
+            char t[24];
+            auto r = std::to_chars(t, t + sizeof t, now);
+            vbuf += '#';
+            vbuf.append(t, r.ptr);
+            vbuf += '\n';
+            lastDump = now;
+        }
+    }
+    // Every dumped signal, as X ($dumpoff) or its value ($dumpon, $dumpall).
+    void dumpBlock(const char* kw, bool asX) {
+        stamp();
+        if (!fst) { vbuf += kw; vbuf += '\n'; }
+        for (size_t i = 0; i < sigs.size(); i++) {
+            if (!dumped(i)) continue;
+            if (asX) writeVal((int)i, allx(sigs[i].w));
+            else writeVal((int)i);
+        }
+        if (!fst) vbuf += "$end\n";
+    }
+    // Selects signals for $dumpvars: sel holds name prefixes of scopes
+    // (levels deep, 0 = all below) and exact names of variables.
+    void dumpSelect(int64_t levels, const vector<pair<string, bool>>& sel) {
+        if (dumpSel.size() != sigs.size()) dumpSel.assign(sigs.size(), 0);
+        vector<pair<string, bool>> all;
+        if (sel.empty()) all.push_back({"", false});
+        const auto& use = sel.empty() ? all : sel;
+        if (levels < 0) levels = 0;
+        for (size_t i = 0; i < sigs.size(); i++) {
+            const string& n = sigs[i].name;
+            for (const auto& [p, var] : use) {
+                if (n.compare(0, p.size(), p) != 0) continue;
+                if (var) {
+                    if (n.size() == p.size() || n[p.size()] == '[') { dumpSel[i] = 1; break; }
+                    continue;
+                }
+                if (p.find("::") == string::npos && n.find("::") != string::npos && !sel.empty()) continue;
+                int depth = 0, br = 0;
+                for (size_t k = p.size(); k < n.size(); k++) {
+                    if (n[k] == '[') br++;
+                    else if (n[k] == ']') br--;
+                    else if (n[k] == '.' && !br) depth++;
+                }
+                if (levels == 0 || depth < levels) { dumpSel[i] = 1; break; }
+            }
+        }
+    }
+    void dumpTask(int cmd, const string& str, int64_t num, const vector<pair<string, bool>>& sel) {
+        switch (cmd) {
+            case DC_FILE:
+                if (dumpCli || waving() || dumpPend) return;
+                if (!str.empty()) dumpFile = str;
+                return;
+            case DC_VARS:
+                if (dumpCli) return;
+                if (waving()) { cerr << "msim: $dumpvars after the dump has started is ignored (21.7.1.2)\n"; return; }
+                dumpPend = true;
+                rare = true;   // slotTail() opens the file at the end of this slot
+                if (sel.empty() && num < 0) { dumpSel.assign(sigs.size(), 1); return; }
+                dumpSelect(num, sel);
+                return;
+            case DC_OFF:
+                if (dumpOff) return;
+                dumpOff = true;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+                dumpBlock("$dumpoff", true);
+                return;
+            case DC_ON:
+                if (!dumpOff) return;
+                dumpOff = false;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 1); }
+#endif
+                dumpBlock("$dumpon", false);
+                return;
+            case DC_ALL:
+                if (waving() && !dumpOff && !dumpStopped) dumpBlock("$dumpall", false);
+                return;
+            case DC_FLUSH:
+#ifdef MINISIM_FST
+                if (fst) { fstWriterFlushContext((fstWriterContext*)fst); return; }
+#endif
+                if (vcd.is_open()) { flushVcd(); vcd.flush(); }
+                return;
+            case DC_LIMIT:
+                dumpLimit = num > 0 ? (uint64_t)num : 0;
+                return;
+        }
+    }
+    // $dumpvars without -vcd: the header and the values at the end of the slot.
+    void startDump() {
+        dumpPend = false;
+        vcdPath = dumpFile;
+        header();
+        if (!waving()) return;
+        if (!fst) { lastDump = now - 1; stamp(); }
+        dumpvars();
+        if (dumpOff) {
+#ifdef MINISIM_FST
+            if (fst) { fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+            dumpBlock("$dumpoff", true);
+        }
     }
     // set() only writes a line when a value changes, so a signal still holding
     // its starting value (cnt stays X until the first clock) never appears.
@@ -1335,15 +1820,15 @@ struct Sim {
         if (fst) {
             // FST has no $dumpvars block: the time-0 values are ordinary changes.
             fstWriterEmitTimeChange((fstWriterContext*)fst, now);
-            for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+            for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
             lastDump = now;
             return;
         }
 #endif
         if (!vcd.is_open() || !vcd) return;
-        vcd << "$dumpvars\n";
-        for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
-        vcd << "$end\n";
+        vbuf += "$dumpvars\n";
+        for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
+        vbuf += "$end\n";
     }
 
     // force / assign (10.6). A held signal ignores every other write; its
@@ -1353,7 +1838,7 @@ struct Sim {
     // again; a variable keeps its value until it is next written.
     // force v[3:0] = e holds those bits only (SF_PART): other writes still
     // change the other bits.
-    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4 };
+    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8 };   // SF_VPI: a VPI value-change callback watches it
     struct PartHold { int hi, lo; E fe, ae; };
     struct Hold { E fe, ae; vector<PartHold> parts; };
     unordered_map<int, Hold> holds;
@@ -1468,6 +1953,14 @@ struct Sim {
         }
     }
 
+    // VPI (36-38): hooks set by vpi.inc. vpiChange runs the value-change
+    // callbacks of a signal; vpiRegion runs the callbacks of a point in the
+    // time slot (VR_*) and says whether any ran. vpiAt counts the
+    // cbAfterDelay callbacks due at each time, so that slot is not skipped.
+    enum { VR_START, VR_RW, VR_RO };
+    void (*vpiChange)(int) = nullptr;
+    bool (*vpiRegion)(int) = nullptr;
+    std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         if (__builtin_expect(sigs[s].fl & (SF_HELD | SF_PART), 0)) {
             if (sigs[s].fl & SF_HELD) return;   // forced: other writes are ignored
@@ -1483,8 +1976,10 @@ struct Sim {
         int o = bit0(sigs[s].val), n = bit0(nv);
         if (g_cov) covToggle(s, sigs[s].val, nv);
         sigs[s].val = nv;
+        if (__builtin_expect(!pathIn.empty(), 0) && (size_t)s < pathIn.size() && pathIn[s]) lastChg[s] = now;
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
+        if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);
         bool neg = (o != 0 && n == 0) || (o == 1 && n != 1);
         // Wake matching waiters and compact the rest in place (no allocation).
@@ -1522,6 +2017,7 @@ struct Sim {
     // queued for any of them but postponed, so a design without assertions
     // or programs pays one flag test per pass.
     bool slotTail() {
+        if (vpiRegion && vpiRegion(VR_RW)) return true;   // cbReadWriteSynch (38.36.2)
         if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) { runObserved(); return true; }   // observed (4.4.2.5)
         if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
             // Once the reactive set starts, it runs until it is empty, and
@@ -1550,6 +2046,8 @@ struct Sim {
             drainPost();
             return true;
         }
+        if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
+        if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
         rare = false;
         return false;
@@ -1581,6 +2079,12 @@ struct Sim {
             if (!f) { cerr << "cannot write " << vcdPath << "\n"; return; }
             fst = f;
             fstWriterSetPackType(f, FST_WR_PT_LZ4);
+#ifdef MINISIM_FST_PARALLEL
+            // Compress and write finished blocks on libfst's own thread. Only
+            // with a libfst built with FST_WRITER_PARALLEL, which the build
+            // says with MINISIM_FST_PARALLEL (libfst exits otherwise).
+            if (fstParallel && !getenv("MINISIM_FST_SERIAL")) fstWriterSetParallelMode(f, 1);
+#endif
             fstWriterSetTimescaleFromString(f, timescale.c_str());
             fstH.assign(sigs.size(), 0);
         }
@@ -1598,7 +2102,7 @@ struct Sim {
         struct Scope { string name; vector<size_t> vars; vector<Scope> kids; };
         Scope root{vcdTop.empty() ? string("top") : vcdTop, {}, {}};
         for (size_t i = 0; i < sigs.size(); i++) {
-            if (sigs[i].hide) continue;
+            if (!dumped(i)) continue;
             Scope* sc = &root;
             const string& n = sigs[i].name;
             size_t b = 0, e;
@@ -1639,7 +2143,11 @@ struct Sim {
             vcd << "$upscope $end\n";
         };
         emit(root);
-        if (!fst) vcd << "$enddefinitions $end\n";
+        if (!fst) {
+            vcd << "$enddefinitions $end\n";
+            vcdIds.resize(sigs.size());
+            for (size_t i = 0; i < sigs.size(); i++) vcdIds[i] = vcdId(i);
+        }
     }
 
     // After the last slot ($finish, no more events, or the time limit):
@@ -1655,19 +2163,21 @@ struct Sim {
         run(~0ULL, false);
     }
     void run(uint64_t end, bool start = true) {
-        if (start) { header(); dumpvars(); }
+        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); }
         if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty();
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t));
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
             if (!any) continue;   // only disabled processes were waiting here
             now = t;
             g_simTime = now;
+            if (!freeVars.empty() && now && now != freeAt) { freeStep(); freeAt = now; }   // active free checker variables (17.7.2)
+            if (vpiRegion) vpiRegion(VR_START);   // cbNextSimTime, cbAtStartOfSimTime, cbAfterDelay
             if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
                 for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
                 sampledAt = now;
@@ -1702,6 +2212,7 @@ struct Sim {
 };
 
 Sim S;
+inline void Sim::closeHook(uint32_t fd) { S.fileClosed(fd); }
 
 // Frames and objects (expr.hpp): blocks of hidden signals made at run time.
 static int allocFrameSigs(const FrameLayout& L) {
@@ -1725,7 +2236,7 @@ static void initFrameSigs(const FrameLayout& L, int base) {
     for (auto& [off, o] : L.dyn) dynStore()[base + off] = o;
 }
 [[noreturn]] static void nullAccess() {
-    cerr << "error: null object access at time " << S.now << "\n";
+    cerr << "error: null object access at time " << S.now << runLocStr() << "\n";
     exit(1);
 }
 static Val getSig(int s) { return S.get(s); }
@@ -1744,6 +2255,13 @@ struct Delay {
         }
         else S.wheel[S.now + n].push_back(h);
     }
+    void await_resume() const {}
+};
+// A program process (24.3.1) woken in the active region set moves to the
+// reactive region, and runs there once the design is quiet.
+struct ToReactive {
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { S.reactive.push_back(h); S.rare = true; }
     void await_resume() const {}
 };
 struct Wait {

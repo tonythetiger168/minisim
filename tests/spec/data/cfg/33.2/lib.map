@@ -1,0 +1,5 @@
+// IEEE 1800-2023 33.3.1: top.v and adder.v in rtlLib, adder.vg in gateLib.
+library rtlLib *.v;      // matches all files in the current directory with
+                         // a .v suffix
+library gateLib ./*.vg;  // matches all files in the current directory with
+                         // a .vg suffix
