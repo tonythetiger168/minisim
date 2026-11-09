@@ -131,6 +131,16 @@ inline std::unordered_map<const slang::ast::Symbol*, RefFormal>& refFormals() {
     static std::unordered_map<const slang::ast::Symbol*, RefFormal> m;
     return m;
 }
+// Frame shapes outlive the result that owns them: processes still
+// suspended when the program exits are destroyed with the kernel, after
+// main's LowerResult, and each of their frames goes back to its shape's
+// pool. So the shapes are never freed.
+struct LayoutList : std::vector<std::unique_ptr<FrameLayout>> {
+    LayoutList() = default;
+    LayoutList(LayoutList&&) = default;
+    LayoutList& operator=(LayoutList&&) = default;
+    ~LayoutList() { for (auto& p : *this) (void)p.release(); }
+};
 // Owner of every frame shape made by this lowering (LowerResult::layouts).
 inline std::vector<std::unique_ptr<FrameLayout>>*& layoutStore() {
     static std::vector<std::unique_ptr<FrameLayout>>* v = nullptr;
@@ -398,7 +408,7 @@ struct LowerResult {
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
-    std::vector<std::unique_ptr<FrameLayout>> layouts;   // frame shapes of automatic subroutines and fork branches
+    LayoutList layouts;   // frame shapes of automatic subroutines and fork branches
     std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
     std::vector<std::pair<int, uint8_t>> netKinds;                   // wand, wor, tri0, ... (6.6): signal, NetResolve
     int precExp = -9;                 // one kernel tick = 10^precExp s
