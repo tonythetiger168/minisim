@@ -3,3 +3,4 @@ build/
 *.o
 .vscode/
 .idea/
+tests/spec/_regress_*
