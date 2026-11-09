@@ -45,6 +45,9 @@ jobs:
       - name: Put Icarus Verilog 13 on PATH
         run: echo "$HOME/iverilog13/bin" >> "$GITHUB_PATH" && ("$HOME/iverilog13/bin/iverilog" -V 2>&1 || true) | head -1
 
+      - name: Install zlib (FST waveforms)
+        run: sudo apt-get install -y zlib1g-dev
+
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang
         run: CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON && cmake --build build -j2 && ctest --test-dir build --output-on-failure
