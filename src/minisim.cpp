@@ -22,8 +22,14 @@
 #include <fstream>
 #include <iostream>
 #include <atomic>
+#include <array>
+#include <bit>
+#include <charconv>
+#include <chrono>
+#include <climits>
 #include <functional>
 #include <map>
+#include <set>
 #include <queue>
 #include <sstream>
 #include <memory>
@@ -38,6 +44,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
+#include "cpu.hpp"
 #include "sva.hpp"
 #include "sva_engine.hpp"
 #include "clocking.hpp"
@@ -75,10 +82,23 @@ struct Task {
 // 20 was slower than 8, and 24 or more was 5-50x slower, because one
 // descheduled thread holds up every batch. -threads N still picks any count
 // up to the hardware threads.
+// Counting physical cores, not hardware threads: an SMT sibling shares its
+// core's execution units, and on a hybrid part the E cores are slower and
+// hold up every batch (cpu.hpp). So the default is one thread per P core
+// (every core when not hybrid), at most 8; -threads N goes up to every
+// logical CPU, siblings last.
 inline int defaultThreads() {
-    int hw = (int)thread::hardware_concurrency();
-    return hw < 1 ? 1 : (hw > 8 ? 8 : hw);
+    int n = cpuTopo().fastCores();
+    return n < 1 ? 1 : (n > 8 ? 8 : n);
 }
+inline int maxThreads() { return std::max(1, cpuTopo().logical()); }
+// Pin pool thread k to cpuTopo().order[k]: the same items of a batch then
+// stay in the same core's cache, and N threads sit on N distinct physical
+// cores. -1 (default): pin unless under a hypervisor, where a pinned thread
+// waits for its virtual CPU (WSL2 on an i7-14700: 8 pinned threads 2.3 s,
+// unpinned 0.8 s). msim -pin / -no-pin force it.
+inline int g_pin = -1;
+inline bool pinThreads() { return g_pin < 0 ? !cpuTopo().hypervisor : g_pin > 0; }
 
 struct Pool {
     // Each thread starts on its own contiguous range of a batch (so the same
@@ -97,27 +117,45 @@ struct Pool {
     struct alignas(64) Slot {
         atomic<uint64_t> claim{0};
         atomic<size_t> end{0}, chunk{1};
+        // The batch this thread is called to. Only the threads a batch uses are
+        // woken: one left out sleeps on, so a batch on 2 of 8 threads costs no
+        // wake-up (a futex call, a context switch) of the other 6.
+        // 32 bits: libstdc++ waits on a 4-byte atomic with a futex on its own
+        // address. A 64-bit one shares 16 hashed buckets, and every notify
+        // wakes the whole bucket: with 64-byte slots all gates hashed to one
+        // bucket, so each wake-up woke every sleeping thread of the pool.
+        atomic<uint32_t> gate{0};
+        atomic<uint32_t> sleeping{0};   // the worker is in (or entering) gate.wait()
     };
     Slot slots[kMaxThreads];
     vector<thread> ts;
-    atomic<uint64_t> gen{0};       // bumped once per batch; idle workers sleep on it
-    alignas(64) atomic<size_t> finished{0};   // items of the current batch that are done
+    atomic<uint64_t> gen{0};       // the last batch number (its low 32 bits)
+    alignas(64) atomic<uint32_t> finished{0};   // items of the current batch that are done
+    atomic<uint32_t> mainSleeping{0};
     atomic<size_t> total{0};       // items in the current batch
     Job job = nullptr;             // written before a batch is published, read after a claim
     void* ctx = nullptr;
     atomic<bool> stop{false};
+    atomic<int> active{1};         // threads taking part in the current batch
     int size() const { return (int)ts.size() + 1; }
+    bool pinned = false;
+    static void pinSelf(int id) {
+        const auto& o = cpuTopo().order;
+        if (!o.empty()) pinToCpu(o[(size_t)id % o.size()]);
+    }
     void ensure(int n) {
         n = std::min(n, kMaxThreads);
+        if (n > 1 && !pinned && pinThreads()) { pinned = true; pinSelf(0); }
         while ((int)ts.size() < n - 1) {
             int id = (int)ts.size() + 1;
-            ts.emplace_back([this, id] { worker(id); });
+            bool pin = pinned;
+            ts.emplace_back([this, id, pin] { if (pin) pinSelf(id); worker(id); });
         }
     }
     ~Pool() {
         stop = true;
-        gen.fetch_add(1);
-        gen.notify_all();
+        uint32_t g = (uint32_t)(gen.fetch_add(1) + 1);
+        for (auto& sl : slots) { sl.gate.store(g); sl.gate.notify_all(); }
         for (auto& t : ts) t.join();
     }
     // Take chunks of slot s in batch b until it is empty. False once the
@@ -135,27 +173,38 @@ struct Pool {
                                                memory_order_acq_rel, memory_order_acquire)) continue;
             for (size_t i = lo; i < hi; i++) job(ctx, i);
             // The chunk that completes the batch wakes run() if it sleeps.
-            if (finished.fetch_add(hi - lo, memory_order_acq_rel) + (hi - lo) == total.load(memory_order_relaxed))
+            if (finished.fetch_add((uint32_t)(hi - lo)) + (hi - lo) == total.load(memory_order_relaxed) &&
+                mainSleeping.load())
                 finished.notify_one();
             c = s.claim.load(memory_order_acquire);
         }
     }
     void work(int id, uint32_t b) {
-        int T = size();
+        int T = active.load(memory_order_relaxed);
+        if (id >= T) return;
         for (int k = 0; k < T; k++)
             if (!drain(slots[(id + k) % T], b)) return;
     }
     void worker(int id) {
-        uint64_t seen = 0;
+        uint32_t seen = 0;
+        Slot& me = slots[id];
         for (;;) {
-            uint64_t g;
+            uint32_t g;
             int spins = 0;
-            while ((g = gen.load(memory_order_acquire)) == seen) {
+            while ((g = me.gate.load(memory_order_acquire)) == seen) {
                 // Spin for the next batch; yield, which lets any other
                 // runnable thread have the CPU; then sleep.
-                if (++spins < 4000) relax();
-                else if (spins < 20000) this_thread::yield();
-                else gen.wait(seen);
+                // A thread left out of the last batch sleeps at once, so it
+                // does not spin on an SMT sibling of a thread that is working.
+                if (id < active.load(memory_order_relaxed) && ++spins < 4000) relax();
+                else if (id < active.load(memory_order_relaxed) && spins < 20000) this_thread::yield();
+                else {
+                    // Announce the sleep, then look again (both seq_cst): either
+                    // run() sees `sleeping` and wakes us, or we see its gate.
+                    me.sleeping.store(1);
+                    if (me.gate.load() == seen) me.gate.wait(seen);
+                    me.sleeping.store(0);
+                }
             }
             seen = g;
             if (stop) return;
@@ -167,9 +216,12 @@ struct Pool {
         __builtin_ia32_pause();
 #endif
     }
-    void run(size_t n, Job j, void* c) {
+    // Run items [0, n) on the first `use` threads (0: all of them).
+    void run(size_t n, Job j, void* c, int use = 0) {
         uint32_t b = (uint32_t)(gen.load(memory_order_relaxed) + 1);
-        size_t T = (size_t)size();
+        if (b == 0) b = 1;   // 0 is every gate's start value
+        size_t T = (size_t)(use > 0 && use < size() ? use : size());
+        active.store((int)T, memory_order_relaxed);
         job = j;
         ctx = c;
         total.store(n, memory_order_relaxed);
@@ -181,15 +233,22 @@ struct Pool {
             slots[t].claim.store(((uint64_t)b << 32) | lo, memory_order_release);
         }
         gen.store(b, memory_order_release);   // the only writer while the pool runs
-        gen.notify_all();
+        for (size_t t = 1; t < T; t++) {
+            slots[t].gate.store(b);
+            if (slots[t].sleeping.load()) slots[t].gate.notify_one();   // no syscall for a spinning thread
+        }
         work(0, b);
         // Wait for chunks other threads are still running: spin, yield, then sleep.
         for (int spins = 0;; spins++) {
-            size_t d = finished.load(memory_order_acquire);
+            uint32_t d = finished.load(memory_order_acquire);
             if (d >= n) break;
             if (spins < 4000) relax();
             else if (spins < 20000) this_thread::yield();
-            else finished.wait(d, memory_order_acquire);
+            else {
+                mainSleeping.store(1);
+                if (finished.load() == d) finished.wait(d);
+                mainSleeping.store(0);
+            }
         }
     }
 };
@@ -249,7 +308,13 @@ struct Sim {
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
     // Postponed region, after NBA and before time advances. `mon` marks the
     // single $monitor slot; anything else is a $strobe, in schedule order.
-    struct Post { bool mon = false; string fmt; vector<E> args; };
+    // A postponed print: $strobe, $monitor (mon), or to a file with $fstrobe /
+    // $fmonitor (file, fd; fmon is the $fmonitor's index).
+    struct Post { bool mon = false; string fmt; vector<E> args; bool file = false; uint32_t fd = 0; int fmon = -1; };
+    // $fmonitor (21.3.2): any number can be active at once; $fclose of the
+    // descriptor ends one (on = false).
+    struct FMon { bool on = true, queued = false; uint32_t fd; string fmt; vector<E> args; vector<int> watch; };
+    vector<FMon> fmons;
     deque<Post> postq;
     // The reactive region set (4.4.2.6-4.4.2.8): reactive, re-inactive
     // (#0 from the reactive region) and re-NBA. Assertion action blocks run
@@ -265,6 +330,20 @@ struct Sim {
     // the signal's value from the preponed region of this time slot. At time
     // 0 it keeps the default sampled value (the declaration's initial value).
     vector<pair<int, int>> shadows;
+    // Free checker variables (17.7.2): signal, and whether it takes a new
+    // random value in every time step (an active one).
+    vector<pair<int, bool>> freeVars;
+    Val freeValue(int s) {
+        int w = sigs[s].w;
+        uint64_t r = urandomNext(urandomState());
+        if (w > 32) r |= (uint64_t)urandomNext(urandomState()) << 32;
+        return make(w >= 64 ? r : (r & ((1ull << w) - 1)), 0, w, 0);
+    }
+    uint64_t freeAt = 0;   // the time step freeStep last ran in
+    void freeStep() {
+        for (auto [s, every] : freeVars)
+            if (every) set(s, freeValue(s));
+    }
     // Clocks of $past / $rose / ... (sva.hpp SampleClock); ticked: the ones
     // that ticked in this slot, shifted at the end of the slot.
     vector<SampleClock> sclocks;
@@ -284,13 +363,39 @@ struct Sim {
     string vcdTop = "top";   // name of the root VCD scope (the top module)
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
+    // VCD text is built here and written in large blocks (an ostream insert
+    // per character was most of the cost of dumping), with each signal's
+    // identifier made once in header().
+    string vbuf;
+    vector<string> vcdIds;
+    void flushVcd() {
+        if (!vbuf.empty() && vcd.is_open()) vcd.write(vbuf.data(), (streamsize)vbuf.size());
+        vbuf.clear();
+    }
     // FST output instead of VCD when vcdPath ends in ".fst" (built with libfst).
     void* fst = nullptr;
+    bool fstParallel = true;
+    size_t fstPending = 0;                           // value-change bytes since the last block
     vector<uint32_t> fstH;                           // FST handle per signal (0: not dumped)
     string fstBuf;
     bool waving() const { return vcd.is_open() || fst != nullptr; }
+    // VCD tasks (21.7.1). msim -vcd dumps every signal from time 0 and the
+    // design's $dumpfile / $dumpvars are ignored; without -vcd, $dumpvars
+    // opens $dumpfile's file (default dump.vcd) at the end of its time slot,
+    // with the selected signals. $dumpoff / $dumpon / $dumpall / $dumpflush /
+    // $dumplimit work on either.
+    bool dumpCli = false, dumpPend = false, dumpOff = false, dumpStopped = false;
+    string dumpFile = "dump.vcd";
+    vector<char> dumpSel;                            // empty: every signal
+    uint64_t dumpLimit = 0;                          // bytes; 0: no limit
+    bool dumped(size_t i) const {
+        return !sigs[i].hide && (dumpSel.empty() || (i < dumpSel.size() && dumpSel[i]));
+    }
 
-    Sim() { g_sformat = &Sim::sformat; }
+    Sim() {
+        g_sformat = &Sim::sformat;
+        g_fcloseHook = &Sim::closeHook;
+    }
 
     // ---- multi-core: deterministic parallel batches ----
     // `threads` workers (default: defaultThreads(); msim -threads N).
@@ -303,16 +408,56 @@ struct Sim {
     static constexpr size_t kMinParallel = 32;
     static inline thread_local bool tlInPar = false;   // inside a parallelFor task
     Pool pool;
+    // `use`: run on at most this many threads (0: `threads`).
     template <class F>
-    void parallelFor(size_t n, F&& f) {
+    void parallelFor(size_t n, F&& f, int use = 0) {
         // A small batch is cheaper on this thread than a wake-up of the pool.
         // Nested (a task that calls parallelFor) runs on its own thread.
-        if (threads <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
+        int T = use > 0 ? std::min(use, threads) : threads;
+        if (T <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
         pool.ensure(threads);
         tlInPar = true;
-        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f);
+        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f, T);
         tlInPar = false;
     }
+
+    // Picks the thread count of one repeated parallel step by measuring it:
+    // each candidate (1, 2, 4, ... up to `threads`) runs kTry steps, the
+    // fastest is used for the next kKeep, then they are measured again. A
+    // step of a few microseconds is slower on 8 threads than on 2 (the batch
+    // hand-off costs more than the work), and the best count depends on the
+    // machine (cores, SMT, P/E cores) and the design, so no fixed default
+    // fits. Results never depend on it: only the speed does.
+    struct Tuner {
+        // kWarm steps of each candidate are not timed: right after a switch,
+        // threads that just left the batch may still be spinning.
+        static constexpr int kWarm = 32, kTry = 256, kKeep = 1 << 16;
+        int cand = 0, n = 0, best = 1;   // cand: index into 1, 2, 4, ...; -1 = exploiting
+        int64_t sum = 0, bestNs = INT64_MAX;
+        std::chrono::steady_clock::time_point t0;
+        int pick(int maxT) {
+            if (maxT <= 1) return 1;
+            if (cand < 0) {
+                if (++n < kKeep) return best;
+                cand = 0; n = 0; sum = 0; bestNs = INT64_MAX;   // re-measure
+            }
+            t0 = std::chrono::steady_clock::now();
+            return std::min(1 << cand, maxT);
+        }
+        void done(int maxT) {
+            if (maxT <= 1 || cand < 0) return;
+            if (++n <= kWarm) return;
+            sum += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (n < kWarm + kTry) return;
+            int t = std::min(1 << cand, maxT);
+            bool worse = bestNs != INT64_MAX && sum > 2 * bestNs;   // more threads will not win back a 2x loss
+            if (sum < bestNs) { bestNs = sum; best = t; }
+            n = 0; sum = 0;
+            if (t >= maxT || worse) { cand = -1; return; }
+            cand++;
+        }
+    };
+    Tuner domainTune[3];   // cycle domain (codegen.hpp): fused step, NBA compute, commit
 
     // ---- static combinational schedule (prog.hpp: combShape / combSchedule) ----
     // combs[r] is the process of rank r. Ranks are in topological order and
@@ -395,6 +540,8 @@ struct Sim {
         vector<NbaItem> items; // this region's NBAs, in queue order
         vector<char> pend;     // per entry of `combs`
         int cur = -1;          // entry being evaluated
+        vector<pair<int, Val>> changed;   // with a waveform open: changes to dump afterwards, in order
+        bool wave = false;
     };
     vector<Part> parts;
     vector<int> sigPart;       // signal -> partition, or -1
@@ -449,8 +596,12 @@ struct Sim {
     void setLocal(int s, Val nv) {
         Sig& g = sigs[s];
         if (nv == g.val) return;
-        g.val = nv;
         Part& pt = *tlPart;
+        // Toggle masks of a partition's own signals are written only by the
+        // thread running it (the per-signal table is sized beforehand).
+        if (g_cov) covToggle(s, g.val, nv);
+        if (pt.wave) pt.changed.emplace_back(s, nv);
+        g.val = nv;
         for (int r : combOf[s]) {
             int k = combLocal[r];
             if (k != pt.cur) pt.pend[k] = 1;
@@ -487,7 +638,9 @@ struct Sim {
             }
             return;
         }
-        if (parts.empty() || waving() || mon.on || g_cov) {
+        // A waveform and coverage keep the partitions parallel: each records
+        // its changes (dumped below, in partition order) and toggles.
+        if (parts.empty() || mon.on || !fmons.empty()) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
             for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
@@ -513,7 +666,15 @@ struct Sim {
         partsBusy.resize(keep);
         for (auto& n : nbaSerial) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
         if (!std::is_sorted(partsBusy.begin(), partsBusy.end())) std::sort(partsBusy.begin(), partsBusy.end());
+        bool wave = waving();
+        if (g_cov && togRise.size() < sigs.size()) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
+        for (int p : partsBusy) parts[p].wave = wave;
         parallelFor(partsBusy.size(), [&](size_t k) { runPart(parts[partsBusy[k]]); });
+        if (wave)
+            for (int p : partsBusy) {
+                for (auto& [sg, v] : parts[p].changed) dump(sg, v);
+                parts[p].changed.clear();
+            }
     }
 
     // ---- clocked processes as functions (prog.hpp: seqShape) ----
@@ -575,6 +736,7 @@ struct Sim {
         quiet.assign(sigs.size(), 1);
         for (size_t s = 0; s < sigs.size(); s++) {
             if (sigs[s].w > 64 || sigs[s].net && sigs[s].drv.empty()) quiet[s] = 0;
+            if (s < tranOf.size() && !tranOf[s].empty()) quiet[s] = 0;   // a tran net: drive() resolves its group
             if (s < seqOf.size())
                 if (!seqOf[s].empty()) quiet[s] = 0;   // a clock: set() detects its edges
             if (s < combOf.size())
@@ -585,7 +747,7 @@ struct Sim {
     // The common case inline: a narrow signal nobody else watches is a store.
     __attribute__((always_inline)) void fw(int s, const Val& nv) {
         Sig& g = sigs[s];
-        if (__builtin_expect(quiet[s] && !observed && waiters[s].empty(), 1)) {
+        if (__builtin_expect(quiet[s] && !observed && !g_cov && waiters[s].empty(), 1)) {
             uint64_t m = mask(g.w);
             g.val.v = nv.v & m;
             g.val.x = nv.x & m;
@@ -599,7 +761,7 @@ struct Sim {
     // The same for a known (2-state) value, without building a Val.
     __attribute__((always_inline)) void fwv(int s, uint64_t v) {
         Sig& g = sigs[s];
-        if (__builtin_expect(quiet[s] && !observed && waiters[s].empty(), 1)) {
+        if (__builtin_expect(quiet[s] && !observed && !g_cov && waiters[s].empty(), 1)) {
             g.val.v = v & mask(g.w);
             g.val.x = 0;
             g.val.z = 0;
@@ -623,12 +785,27 @@ struct Sim {
         }
         drive(s, d, make(v & mask(g.w), 0, g.w), s0, s1);
     }
-    __attribute__((noinline)) void fwSlow(int s, Val nv) {
+    __attribute__((noinline)) void fwSlow(int s, const Val& in) {
         Sig& g = sigs[s];
-        if (!quiet[s] || observed || !waiters[s].empty()) { set(s, std::move(nv)); return; }
-        nv = maskWidth(nv, g.w);   // a wide quiet signal
+        // Only a waveform (or coverage) watches a quiet signal: compare, store
+        // and record the change. A full set() would also queue the domain's
+        // comb pass and scan for waiters, which made -vcd runs 20x slower.
+        bool waveOnly = !mon.on && !g.fl;
+        if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) { set(s, in); return; }
+        if (g.w <= 64 && g.val.hi.empty()) {   // the common case, without copying a Val
+            uint64_t m = mask(g.w), v = in.v & m, x = in.x & m, z = in.z & m;
+            if (v == g.val.v && x == g.val.x && z == g.val.z) return;
+            if (g_cov) covToggle(s, g.val, Val{v, x, g.w, z});
+            g.val.v = v; g.val.x = x; g.val.z = z;
+            g.val.real = in.real; g.val.str = in.str; g.val.sgn = false;
+            if (observed) dump(s);
+            return;
+        }
+        Val nv = maskWidth(in, g.w);
         if (nv == g.val) return;
+        if (g_cov) covToggle(s, g.val, nv);
         g.val = std::move(nv);
+        if (observed) dump(s);
     }
     // A continuous assign: the net's only driver, strong 0 and 1, resolves to its value.
     __attribute__((always_inline)) void fwd(int s, int d, const Val& v, int s0, int s1) {
@@ -664,13 +841,14 @@ struct Sim {
 #ifdef MINISIM_FST
         if (fst) { fstWriterClose((fstWriterContext*)fst); fst = nullptr; }
 #endif
-        if (vcd.is_open()) vcd.close();
+        if (vcd.is_open()) { flushVcd(); vcd.close(); }
     }
 
     // A wire (`net`) starts as Z, including before the first drive().
     // A variable (reg/logic) starts as X. The flag is stored so the VCD
     // header can emit `$var wire` or `$var reg`.
     int sig(const string& n, int w, bool net = false) {
+        self = this;
         // An unpacked array element is named "m[3]". The VCD leaves memories
         // out, as $dumpvars does by default (21.7.1.2).
         // A name with '$' is internal (an event's last-trigger time).
@@ -698,6 +876,7 @@ struct Sim {
         g.drv[d].v = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
+        if (__builtin_expect(!tranOf.empty(), 0) && (size_t)s < tranOf.size() && !tranOf[(size_t)s].empty()) { tranResolve(s); return; }
         // One driver that drives both 0 and 1 resolves to its own value
         // (X stays X, Z stays Z). Skip the per-bit strength walk.
         Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
@@ -789,6 +968,87 @@ struct Sim {
             if (ic != icDelay.end()) t += delay12(ic->second, from, to);
         }
         return t;
+    }
+    // Bidirectional switches (28.8). Nets joined by switches that are on form
+    // one group; every net in it takes the resolution of all the group's
+    // drivers. A driver seen through a switch is reduced (28.13.1): supply
+    // becomes strong through a tran, and each rtran lowers it one more step.
+    // A switch with an X or Z control is resolved both ways: bits that
+    // differ become X.
+    struct TranSw { int a, b; bool resist; int state = -1; };   // state: 0 off, 1 on, 2 unknown
+    vector<TranSw> trans;
+    vector<vector<int>> tranOf;   // net -> its switches
+    void addTran(int a, int b, bool resist) {
+        if (tranOf.size() != sigs.size()) tranOf.resize(sigs.size());
+        tranOf[(size_t)a].push_back((int)trans.size());
+        tranOf[(size_t)b].push_back((int)trans.size());
+        trans.push_back({a, b, resist});
+    }
+    void tranCtl(int id, int st) {
+        if (trans[(size_t)id].state == st) return;
+        trans[(size_t)id].state = st;
+        tranResolve(trans[(size_t)id].a);
+        tranResolve(trans[(size_t)id].b);
+    }
+    static uint8_t tranReduce(uint8_t s, bool resist) {
+        static const uint8_t r[8] = {STR_HIZ, STR_SMALL, STR_SMALL, STR_MEDIUM, STR_MEDIUM, STR_WEAK, STR_PULL, STR_PULL};
+        if (resist) return r[s & 7];
+        return s == STR_SUPPLY ? STR_STRONG : s;
+    }
+    // The value net n sees: the drivers of every net it reaches through
+    // switches that are on (and, when unkOn, those with an unknown control).
+    Val tranValue(int n, bool unkOn, vector<int>& seen) {
+        // Best path to each net: the fewest resistive steps, then any switch at all.
+        map<int, pair<int, bool>> best;   // net -> (resistive steps, crossed a switch)
+        deque<int> q{n};
+        best[n] = {0, false};
+        while (!q.empty()) {
+            int m = q.front(); q.pop_front();
+            auto [k, crossed] = best[m];
+            for (int id : tranOf[(size_t)m]) {
+                const TranSw& t = trans[(size_t)id];
+                if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
+                int o = t.a == m ? t.b : t.a;
+                pair<int, bool> nb{k + (t.resist ? 1 : 0), true};
+                auto it = best.find(o);
+                if (it != best.end() && it->second.first <= nb.first) continue;
+                best[o] = nb;
+                q.push_back(o);
+            }
+        }
+        vector<Drv> all;
+        for (auto& [m, kc] : best) {
+            seen.push_back(m);
+            for (Drv d : sigs[(size_t)m].drv) {
+                if (kc.second) {
+                    d.s0 = tranReduce(d.s0, false);
+                    d.s1 = tranReduce(d.s1, false);
+                }
+                for (int r = 0; r < kc.first; r++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                all.push_back(d);
+            }
+        }
+        const Sig& g = sigs[(size_t)n];
+        return g.kind != NR_WIRE ? resolveNet(g.kind, all.data(), all.size(), g.w, g.val)
+                                 : resolveDrives(all.data(), all.size(), g.w);
+    }
+    void tranResolve(int s) {
+        vector<int> group, scratch;
+        Val v = tranValue(s, true, group);
+        bool unknown = false;
+        for (int m : group)
+            for (int id : tranOf[(size_t)m]) if (trans[(size_t)id].state == 2) unknown = true;
+        vector<pair<int, Val>> vals;
+        for (int m : group) {
+            Val on = m == s ? v : tranValue(m, true, scratch);
+            if (unknown) {
+                Val off = tranValue(m, false, scratch);
+                for (int b = 0; b < sigs[(size_t)m].w; b++)
+                    if (bitAt(on, b) != bitAt(off, b)) setBit(on, b, 2);
+            }
+            vals.push_back({m, on});
+        }
+        for (auto& [m, val] : vals) set(m, val);
     }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
@@ -1103,6 +1363,58 @@ struct Sim {
         if ((int)body.size() < w) body = string(w - body.size(), ' ') + body;
         return body;
     }
+    static inline Sim* self = nullptr;   // the simulator, for %v
+    // %v (21.2.1.4): two strength characters and a value. The strength of a
+    // net bit comes from its drivers, resolved as the net is (28.12); a
+    // variable, or a net with no driver that still has a value (tri0, tri1,
+    // supply, trireg), gets the strength its kind implies.
+    static string strengthText(const E& a0, const Reader& rd) {
+        static const char* MN[8] = {"Hi", "Sm", "Me", "We", "La", "Pu", "St", "Su"};
+        E a = a0;
+        while (a && a->op == Op::Resize && !a->kids.empty()) a = a->kids[0];
+        int sig = -1, bit = 0;
+        if (a && a->op == Op::Ref && !isRel(a->sig) && !a->at) sig = a->sig;
+        else if (a && a->op == Op::Slice && a->hi == a->lo && !a->kids.empty() && a->kids[0] &&
+                 a->kids[0]->op == Op::Ref && !isRel(a->kids[0]->sig) && !a->kids[0]->at) {
+            sig = a->kids[0]->sig; bit = a->lo;
+        }
+        int v = bitAt(eval(a0, rd), 0);   // 0, 1, 2 = x, 3 = z
+        SBit sb;
+        bool have = false;
+        if (sig >= 0 && self) {
+            const Sig& g = self->sigs[sig];
+            if (!g.drv.empty() && g.kind == NR_WIRE) {
+                for (const Drv& d : g.drv) {
+                    int t = bitAt(d.v, bit);
+                    SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
+                    sb = sbit_resolv(sb, cur);
+                }
+                have = true;
+            } else if (g.net) {
+                unsigned st = g.kind == NR_SUPPLY0 || g.kind == NR_SUPPLY1 ? STR_SUPPLY
+                            : g.kind == NR_TRIREG && g.drv.empty() ? STR_MEDIUM
+                            : (g.kind == NR_TRI0 || g.kind == NR_TRI1) && v == (g.kind == NR_TRI1 ? 1 : 0) ? STR_PULL
+                            : STR_STRONG;
+                if (v == 3) sb = SBit{};
+                else if (g.kind == NR_TRIREG && !g.drv.empty()) {   // a driven trireg: its drivers, else its charge
+                    for (const Drv& d : g.drv) {
+                        int t = bitAt(d.v, bit);
+                        SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
+                        sb = sbit_resolv(sb, cur);
+                    }
+                    if (sbit_z(sb)) sb = v == 1 ? sbit_1(STR_MEDIUM) : v == 0 ? sbit_0(STR_MEDIUM) : sbit_x(STR_MEDIUM, STR_MEDIUM);
+                } else sb = v == 1 ? sbit_1(st) : v == 0 ? sbit_0(st) : sbit_x(st, st);
+                have = true;
+            }
+        }
+        if (!have) sb = v == 3 ? SBit{} : v == 1 ? sbit_1(STR_STRONG) : v == 0 ? sbit_0(STR_STRONG) : sbit_x(STR_STRONG, STR_STRONG);
+        if (sbit_z(sb)) return "HiZ";
+        int lg = sbit_logic(sb);
+        if (lg == 0 || lg == 1) return string(MN[sb.s0]) + (lg ? "1" : "0");
+        // x: one strength on both sides, else the two levels as digits
+        if (sb.s0 == sb.s1) return string(MN[sb.s0]) + "X";
+        return std::to_string(sb.s0) + std::to_string(sb.s1) + "X";
+    }
     // The text of a format and its arguments ($display, $sformatf).
     static string sformat(const string& fmt, const vector<E>& args, const Reader& rd) {
         std::ostringstream cout;
@@ -1139,19 +1451,28 @@ struct Sim {
                     if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
                     return fmtVal('d', v, 0, true);
                 };
-                const DynObj& o = dynStore()[h->sig];
-                cout << "'{";
-                if (o.kind == 2) {
-                    bool first = true;
-                    for (const auto& [k, v] : o.map) {
-                        if (!first) cout << ", ";
-                        first = false;
-                        cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':' << one(v, style);
+                // A container of containers prints each element container nested.
+                std::function<void(const DynObj&)> show = [&](const DynObj& o) {
+                    auto el = [&](const Val& v) {
+                        if (!o.elem) { cout << one(v, style); return; }
+                        if (v.x || !v.v) { cout << "'{}"; return; }
+                        show(dynStore()[(int)v.v]);
+                    };
+                    cout << "'{";
+                    if (o.kind == 2) {
+                        bool first = true;
+                        for (const auto& [k, v] : o.map) {
+                            if (!first) cout << ", ";
+                            first = false;
+                            cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':';
+                            el(v);
+                        }
+                    } else {
+                        for (size_t k = 0; k < o.vec.size(); k++) { if (k) cout << ", "; el(o.vec[k]); }
                     }
-                } else {
-                    for (size_t k = 0; k < o.vec.size(); k++) cout << (k ? ", " : "") << one(o.vec[k], style);
-                }
-                cout << '}';
+                    cout << '}';
+                };
+                show(dynStore()[R(h->sig)]);   // R: a property through a handle, or an automatic container
                 continue;
             }
             if ((c == 't' || c == 'T') && ai < args.size()) {   // %t (20.4.3): ticks, printed per $timeformat
@@ -1163,6 +1484,10 @@ struct Sim {
             }
             char lc = (char)tolower((unsigned char)c);
             if (lc == 'm') { cout << "top"; continue; }
+            if (lc == 'v' && ai < args.size()) {   // %v (21.2.1.4): strength of a scalar net
+                cout << strengthText(args[ai++], rd);
+                continue;
+            }
             bool known = string_view("bohxdcstfeg").find(lc) != string_view::npos;
             if (!known || ai >= args.size()) { cout << fmt.substr(start, i - start + 1); continue; }
             Val v = eval(args[ai++], rd);
@@ -1199,7 +1524,49 @@ struct Sim {
         for (const auto& a : args) collectRefs(a, mon.watch);
         queueMon();
     }
+    static void closeHook(uint32_t fd);
+    void strobeF(uint32_t fd, const string& fmt, const vector<E>& args) {
+        Post p{false, fmt, args, true, fd};
+        postq.push_back(std::move(p));
+    }
+    void queueFMon(size_t k) {
+        FMon& m = fmons[k];
+        if (!m.on || m.queued) return;
+        Post p{false, m.fmt, m.args, true, m.fd, (int)k};
+        postq.push_back(std::move(p));
+        m.queued = true;
+    }
+    void armFMon(uint32_t fd, const string& fmt, const vector<E>& args) {
+        FMon m;
+        m.fd = fd;
+        m.fmt = fmt;
+        m.args = args;
+        for (const auto& a : args) collectRefs(a, m.watch);
+        fmons.push_back(std::move(m));
+        observed = true;
+        queueFMon(fmons.size() - 1);
+    }
+    // $fclose: the closed descriptor's pending $fstrobe / $fmonitor lines and
+    // its $fmonitors end. Closing channels of a multichannel descriptor drops
+    // them from it.
+    void fileClosed(uint32_t fd) {
+        auto left = [&](uint32_t d) -> uint32_t {
+            if ((fd & 0x80000000u) || (d & 0x80000000u)) return d == fd ? 0 : d;
+            return d & ~(fd & ~1u);   // channel 0 (stdout) is never closed
+        };
+        for (auto& m : fmons) if (m.on && !(m.fd = left(m.fd))) m.on = false;
+        for (auto it = postq.begin(); it != postq.end();) {
+            if (it->file && !(it->fd = left(it->fd))) {
+                if (it->fmon >= 0) fmons[(size_t)it->fmon].queued = false;
+                it = postq.erase(it);
+            } else ++it;
+        }
+    }
     void noteChange(int s) {
+        if (__builtin_expect(!fmons.empty(), 0))
+            for (size_t k = 0; k < fmons.size(); k++)
+                if (fmons[k].on && !fmons[k].queued)
+                    for (int w : fmons[k].watch) if (w == s) { queueFMon(k); break; }
         if (!mon.on || mon.queued) return;
         for (int w : mon.watch) if (w == s) { queueMon(); return; }
     }
@@ -1208,41 +1575,79 @@ struct Sim {
             Post p = move(postq.front());
             postq.pop_front();
             if (p.mon) mon.queued = false;
+            if (p.file) {
+                if (p.fmon >= 0) fmons[(size_t)p.fmon].queued = false;
+                fileWrite(p.fd, sformat(p.fmt, p.args, [&](int s) { return get(s); }) + "\n");
+                continue;
+            }
             printSys(p.fmt, p.args);
         }
     }
 
+    // A value's w bits as '0' / '1' / 'x' / 'z' characters, MSB first.
+    static void putBits(char* p, const Val& val, int w) {
+        if (w <= 64) {
+            uint64_t v = val.v, x = val.x, z = val.z;
+            if (!x && std::endian::native == std::endian::little) {
+                // Known bits: eight characters per table lookup.
+                int i = w;
+                for (int r = i % 8; r > 0; r--) *p++ = char('0' + (v >> --i & 1));
+                for (; i > 0; i -= 8, p += 8) memcpy(p, &kBitChars[(v >> (i - 8)) & 0xFF], 8);
+            } else
+                for (int i = w - 1; i >= 0; i--)
+                    *p++ = (x >> i & 1) ? ((z >> i & 1) ? 'z' : 'x') : char('0' + (v >> i & 1));
+            return;
+        }
+        for (int i = w - 1; i >= 0; i--) {
+            int t = bitAt(val, i);
+            *p++ = t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t);
+        }
+    }
+    // Byte b as eight ASCII digits, MSB first, in memory order.
+    static constexpr std::array<uint64_t, 256> kBitChars = [] {
+        std::array<uint64_t, 256> t{};
+        for (int b = 0; b < 256; b++)
+            for (int k = 0; k < 8; k++) t[b] |= uint64_t('0' + (b >> (7 - k) & 1)) << (8 * k);
+        return t;
+    }();
     // One value line, no timestamp. Shared so $dumpvars and later changes match.
-    void writeVal(int s) {
-        const Sig& g = sigs[s];
+    void writeVal(int s) { writeVal(s, sigs[s].val); }
+    void writeVal(int s, const Val& val) {
+        const int w = sigs[s].w;
 #ifdef MINISIM_FST
         if (fst) {
             // FST takes one '0' / '1' / 'x' / 'z' character per bit, MSB first.
-            fstBuf.resize((size_t)g.w);
-            for (int i = g.w - 1, k = 0; i >= 0; i--, k++) {
-                if (g.w <= 64)
-                    fstBuf[k] = (g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1));
-                else {
-                    int t = bitAt(g.val, i);
-                    fstBuf[k] = t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t);
-                }
-            }
+            fstBuf.resize((size_t)w);
+            putBits(fstBuf.data(), val, w);
             fstWriterEmitValueChange((fstWriterContext*)fst, fstH[s], fstBuf.data());
+            // Hand a block to the writer thread every few MB, so it compresses
+            // while the simulation goes on. libfst's own block is 128 MB, so a
+            // run wrote one or two blocks and then flushed the rest at close.
+            fstPending += (size_t)w + 8;
+            if (fstPending >= (16u << 20)) { fstWriterFlushContext((fstWriterContext*)fst); fstPending = 0; }
             return;
         }
 #endif
-        string id = vcdId((size_t)s);
-        if (g.w == 1) { vcd << ((g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1))) << id << "\n"; return; }
-        vcd << "b";
-        for (int i = g.w - 1; i >= 0; i--) {
-            if (g.w <= 64)
-                vcd << ((g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1)));
-            else {
-                int t = bitAt(g.val, i);
-                vcd << (t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t));
-            }
+        // Signals made after header() (frames, objects) get their id here.
+        if ((size_t)s >= vcdIds.size()) {
+            size_t from = vcdIds.size();
+            vcdIds.resize(sigs.size());
+            for (size_t i = from; i < vcdIds.size(); i++) vcdIds[i] = vcdId(i);
         }
-        vcd << " " << id << "\n";
+        const string& id = vcdIds[s];
+        if (w == 1) {
+            vbuf += (val.x & 1) ? ((val.z & 1) ? 'z' : 'x') : char('0' + (val.v & 1));
+        } else {
+            size_t at = vbuf.size();
+            vbuf.resize(at + 1 + (size_t)w);
+            char* p = vbuf.data() + at;
+            *p++ = 'b';
+            putBits(p, val, w);
+            vbuf += ' ';
+        }
+        vbuf += id;
+        vbuf += '\n';
+        if (vbuf.size() >= (1u << 16)) flushVcd();
     }
     // VCD identifier: base-94 over the printable characters '!'..'~'.
     static string vcdId(size_t i) {
@@ -1250,18 +1655,137 @@ struct Sim {
         do { id += char('!' + i % 94); i /= 94; } while (i);
         return id;
     }
-    void dump(int s) {
+    void dump(int s) { dump(s, sigs[s].val); }
+    void dump(int s, const Val& v) {
         if (sigs[s].hide) return;
 #ifdef MINISIM_FST
         if (fst) {
+            if (dumpOff || !dumped((size_t)s)) return;
             if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; }
-            writeVal(s);
+            writeVal(s, v);
             return;
         }
 #endif
         if (!vcd.is_open() || !vcd) return;
-        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
-        writeVal(s);
+        if (dumpOff || dumpStopped || !dumped((size_t)s)) return;
+        stamp();
+        writeVal(s, v);
+        if (dumpLimit && (uint64_t)vcd.tellp() + vbuf.size() >= dumpLimit) {
+            vbuf += "$comment Note: $dumplimit reached; dumping stops $end\n";
+            dumpStopped = true;
+        }
+    }
+    void stamp() {
+#ifdef MINISIM_FST
+        if (fst) { if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; } return; }
+#endif
+        if (lastDump != now) {
+            char t[24];
+            auto r = std::to_chars(t, t + sizeof t, now);
+            vbuf += '#';
+            vbuf.append(t, r.ptr);
+            vbuf += '\n';
+            lastDump = now;
+        }
+    }
+    // Every dumped signal, as X ($dumpoff) or its value ($dumpon, $dumpall).
+    void dumpBlock(const char* kw, bool asX) {
+        stamp();
+        if (!fst) { vbuf += kw; vbuf += '\n'; }
+        for (size_t i = 0; i < sigs.size(); i++) {
+            if (!dumped(i)) continue;
+            if (asX) writeVal((int)i, allx(sigs[i].w));
+            else writeVal((int)i);
+        }
+        if (!fst) vbuf += "$end\n";
+    }
+    // Selects signals for $dumpvars: sel holds name prefixes of scopes
+    // (levels deep, 0 = all below) and exact names of variables.
+    void dumpSelect(int64_t levels, const vector<pair<string, bool>>& sel) {
+        if (dumpSel.size() != sigs.size()) dumpSel.assign(sigs.size(), 0);
+        vector<pair<string, bool>> all;
+        if (sel.empty()) all.push_back({"", false});
+        const auto& use = sel.empty() ? all : sel;
+        if (levels < 0) levels = 0;
+        for (size_t i = 0; i < sigs.size(); i++) {
+            const string& n = sigs[i].name;
+            for (const auto& [p, var] : use) {
+                if (n.compare(0, p.size(), p) != 0) continue;
+                if (var) {
+                    if (n.size() == p.size() || n[p.size()] == '[') { dumpSel[i] = 1; break; }
+                    continue;
+                }
+                if (p.find("::") == string::npos && n.find("::") != string::npos && !sel.empty()) continue;
+                int depth = 0, br = 0;
+                for (size_t k = p.size(); k < n.size(); k++) {
+                    if (n[k] == '[') br++;
+                    else if (n[k] == ']') br--;
+                    else if (n[k] == '.' && !br) depth++;
+                }
+                if (levels == 0 || depth < levels) { dumpSel[i] = 1; break; }
+            }
+        }
+    }
+    void dumpTask(int cmd, const string& str, int64_t num, const vector<pair<string, bool>>& sel) {
+        switch (cmd) {
+            case DC_FILE:
+                if (dumpCli || waving() || dumpPend) return;
+                if (!str.empty()) dumpFile = str;
+                return;
+            case DC_VARS:
+                if (dumpCli) return;
+                if (waving()) { cerr << "msim: $dumpvars after the dump has started is ignored (21.7.1.2)\n"; return; }
+                dumpPend = true;
+                rare = true;   // slotTail() opens the file at the end of this slot
+                if (sel.empty() && num < 0) { dumpSel.assign(sigs.size(), 1); return; }
+                dumpSelect(num, sel);
+                return;
+            case DC_OFF:
+                if (dumpOff) return;
+                dumpOff = true;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+                dumpBlock("$dumpoff", true);
+                return;
+            case DC_ON:
+                if (!dumpOff) return;
+                dumpOff = false;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 1); }
+#endif
+                dumpBlock("$dumpon", false);
+                return;
+            case DC_ALL:
+                if (waving() && !dumpOff && !dumpStopped) dumpBlock("$dumpall", false);
+                return;
+            case DC_FLUSH:
+#ifdef MINISIM_FST
+                if (fst) { fstWriterFlushContext((fstWriterContext*)fst); return; }
+#endif
+                if (vcd.is_open()) { flushVcd(); vcd.flush(); }
+                return;
+            case DC_LIMIT:
+                dumpLimit = num > 0 ? (uint64_t)num : 0;
+                return;
+        }
+    }
+    // $dumpvars without -vcd: the header and the values at the end of the slot.
+    void startDump() {
+        dumpPend = false;
+        vcdPath = dumpFile;
+        header();
+        if (!waving()) return;
+        if (!fst) { lastDump = now - 1; stamp(); }
+        dumpvars();
+        if (dumpOff) {
+#ifdef MINISIM_FST
+            if (fst) { fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+            dumpBlock("$dumpoff", true);
+        }
     }
     // set() only writes a line when a value changes, so a signal still holding
     // its starting value (cnt stays X until the first clock) never appears.
@@ -1272,15 +1796,15 @@ struct Sim {
         if (fst) {
             // FST has no $dumpvars block: the time-0 values are ordinary changes.
             fstWriterEmitTimeChange((fstWriterContext*)fst, now);
-            for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+            for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
             lastDump = now;
             return;
         }
 #endif
         if (!vcd.is_open() || !vcd) return;
-        vcd << "$dumpvars\n";
-        for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
-        vcd << "$end\n";
+        vbuf += "$dumpvars\n";
+        for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
+        vbuf += "$end\n";
     }
 
     // force / assign (10.6). A held signal ignores every other write; its
@@ -1290,7 +1814,7 @@ struct Sim {
     // again; a variable keeps its value until it is next written.
     // force v[3:0] = e holds those bits only (SF_PART): other writes still
     // change the other bits.
-    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4 };
+    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8 };   // SF_VPI: a VPI value-change callback watches it
     struct PartHold { int hi, lo; E fe, ae; };
     struct Hold { E fe, ae; vector<PartHold> parts; };
     unordered_map<int, Hold> holds;
@@ -1405,6 +1929,14 @@ struct Sim {
         }
     }
 
+    // VPI (36-38): hooks set by vpi.inc. vpiChange runs the value-change
+    // callbacks of a signal; vpiRegion runs the callbacks of a point in the
+    // time slot (VR_*) and says whether any ran. vpiAt counts the
+    // cbAfterDelay callbacks due at each time, so that slot is not skipped.
+    enum { VR_START, VR_RW, VR_RO };
+    void (*vpiChange)(int) = nullptr;
+    bool (*vpiRegion)(int) = nullptr;
+    std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         if (__builtin_expect(sigs[s].fl & (SF_HELD | SF_PART), 0)) {
             if (sigs[s].fl & SF_HELD) return;   // forced: other writes are ignored
@@ -1423,6 +1955,7 @@ struct Sim {
         if (__builtin_expect(!pathIn.empty(), 0) && (size_t)s < pathIn.size() && pathIn[s]) lastChg[s] = now;
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
+        if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);
         bool neg = (o != 0 && n == 0) || (o == 1 && n != 1);
         // Wake matching waiters and compact the rest in place (no allocation).
@@ -1460,6 +1993,7 @@ struct Sim {
     // queued for any of them but postponed, so a design without assertions
     // or programs pays one flag test per pass.
     bool slotTail() {
+        if (vpiRegion && vpiRegion(VR_RW)) return true;   // cbReadWriteSynch (38.36.2)
         if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) { runObserved(); return true; }   // observed (4.4.2.5)
         if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
             // Once the reactive set starts, it runs until it is empty, and
@@ -1488,6 +2022,8 @@ struct Sim {
             drainPost();
             return true;
         }
+        if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
+        if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
         rare = false;
         return false;
@@ -1519,6 +2055,12 @@ struct Sim {
             if (!f) { cerr << "cannot write " << vcdPath << "\n"; return; }
             fst = f;
             fstWriterSetPackType(f, FST_WR_PT_LZ4);
+#ifdef MINISIM_FST_PARALLEL
+            // Compress and write finished blocks on libfst's own thread. Only
+            // with a libfst built with FST_WRITER_PARALLEL, which the build
+            // says with MINISIM_FST_PARALLEL (libfst exits otherwise).
+            if (fstParallel && !getenv("MINISIM_FST_SERIAL")) fstWriterSetParallelMode(f, 1);
+#endif
             fstWriterSetTimescaleFromString(f, timescale.c_str());
             fstH.assign(sigs.size(), 0);
         }
@@ -1536,7 +2078,7 @@ struct Sim {
         struct Scope { string name; vector<size_t> vars; vector<Scope> kids; };
         Scope root{vcdTop.empty() ? string("top") : vcdTop, {}, {}};
         for (size_t i = 0; i < sigs.size(); i++) {
-            if (sigs[i].hide) continue;
+            if (!dumped(i)) continue;
             Scope* sc = &root;
             const string& n = sigs[i].name;
             size_t b = 0, e;
@@ -1577,7 +2119,11 @@ struct Sim {
             vcd << "$upscope $end\n";
         };
         emit(root);
-        if (!fst) vcd << "$enddefinitions $end\n";
+        if (!fst) {
+            vcd << "$enddefinitions $end\n";
+            vcdIds.resize(sigs.size());
+            for (size_t i = 0; i < sigs.size(); i++) vcdIds[i] = vcdId(i);
+        }
     }
 
     // After the last slot ($finish, no more events, or the time limit):
@@ -1593,19 +2139,21 @@ struct Sim {
         run(~0ULL, false);
     }
     void run(uint64_t end, bool start = true) {
-        if (start) { header(); dumpvars(); }
+        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); }
         if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty();
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t));
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
             if (!any) continue;   // only disabled processes were waiting here
             now = t;
             g_simTime = now;
+            if (!freeVars.empty() && now && now != freeAt) { freeStep(); freeAt = now; }   // active free checker variables (17.7.2)
+            if (vpiRegion) vpiRegion(VR_START);   // cbNextSimTime, cbAtStartOfSimTime, cbAfterDelay
             if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
                 for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
                 sampledAt = now;
@@ -1640,6 +2188,7 @@ struct Sim {
 };
 
 Sim S;
+inline void Sim::closeHook(uint32_t fd) { S.fileClosed(fd); }
 
 // Frames and objects (expr.hpp): blocks of hidden signals made at run time.
 static int allocFrameSigs(const FrameLayout& L) {
@@ -1682,6 +2231,13 @@ struct Delay {
         }
         else S.wheel[S.now + n].push_back(h);
     }
+    void await_resume() const {}
+};
+// A program process (24.3.1) woken in the active region set moves to the
+// reactive region, and runs there once the design is quiet.
+struct ToReactive {
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { S.reactive.push_back(h); S.rare = true; }
     void await_resume() const {}
 };
 struct Wait {

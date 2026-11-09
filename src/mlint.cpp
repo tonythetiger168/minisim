@@ -60,9 +60,11 @@ void checkBlock(const Block& b, Report& rep) {
                         "' in an always_comb; use = (IEEE 1800-2023 10.4.1)");
 }
 
-void checkDrivers(const std::map<const Symbol*, std::vector<SourceLocation>>& drivers, Report& rep) {
+void checkDrivers(const std::map<const Symbol*, std::vector<SourceLocation>>& drivers,
+                  const std::set<const Symbol*>& wholeDriven, Report& rep) {
     for (auto& [sym, locs] : drivers) {
         if (locs.size() < 2) continue;
+        if (!wholeDriven.count(sym)) continue;   // only part selects: each may own its bits
         rep.add("L004", locs[1],
                 "'" + path(*sym) + "' is assigned by " + std::to_string(locs.size()) +
                     " processes; in simulation the last write wins and in synthesis this is a "
@@ -214,7 +216,7 @@ int main(int argc, char** argv) {
     d.gather(*fe.comp, rep);
 
     for (const Block& b : d.blocks) checkBlock(b, rep);
-    checkDrivers(d.drivers, rep);
+    checkDrivers(d.drivers, d.wholeDriven, rep);
     checkCdc(d.blocks, d.join, rep);
 
     rep.print(std::cout, quiet, "mlint");

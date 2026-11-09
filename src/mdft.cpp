@@ -95,14 +95,38 @@ struct Dft {
 
     // Every signal combinational logic drives, with what it is made from, for
     // the clock-gating and loop rules.
+    // Logic, as opposed to a testbench: always_comb / always_latch, or an
+    // always with only an event control (always @(*), always @(a or b)).
+    // An initial block or `always #5 clk = ~clk` drives a pin the way a tester
+    // does, so a clock or reset it makes is not "made by logic".
+    static bool combLogic(const Block& b) {
+        auto k = b.sym->procedureKind;
+        if (k == ProceduralBlockKind::AlwaysComb || k == ProceduralBlockKind::AlwaysLatch) return true;
+        if (k != ProceduralBlockKind::Always) return false;
+        const Statement& body = b.sym->getBody();
+        if (body.kind != StatementKind::Timed) return false;
+        auto tk = body.as<TimedStatement>().timing.kind;
+        return tk == TimingControlKind::SignalEvent || tk == TimingControlKind::EventList ||
+               tk == TimingControlKind::ImplicitEvent;
+    }
+
     std::map<const Symbol*, std::vector<const Symbol*>> combFrom() {
         std::map<const Symbol*, std::vector<const Symbol*>> m;
         for (const Block& b : d.blocks) {
-            if (b.seq) continue;
+            if (b.seq || !combLogic(b)) continue;
+            // A value the block assigns on every path before using it (y = a + b;
+            // z = y == 0;, or sum = 0; sum = sum ^ x;) is not feedback: within one
+            // evaluation the read sees this pass's write. Its own inputs are
+            // already among the block's reads.
+            // A block's own target read back (bit by bit in a loop, or one part
+            // select after another) is not counted either: a self-edge was most
+            // of the false loops on OpenTitan.
             for (const Symbol* t : b.blocking) {
                 if (b.locals.count(t)) continue;
-                auto& v = m[d.join.find(t)];
-                for (const Symbol* r : b.reads) v.push_back(d.join.find(r));
+                const Symbol* ct = d.join.find(t);
+                auto& v = m[ct];
+                for (const Symbol* r : b.reads)
+                    if (!b.always.count(r) && d.join.find(r) != ct) v.push_back(d.join.find(r));
             }
         }
         return m;

@@ -17,6 +17,49 @@ const slang::ast::ClockingBlockSymbol* globalClocking() {
     }
     unsupported("$global_clock with no global clocking (14.14)");
 }
+// The scope a checker instance's context is inferred from (17.3, 16.14.7):
+// for code in a checker body, the scope the outermost checker is instantiated in.
+const slang::ast::Scope* contextScope() {
+    using namespace slang::ast;
+    const Scope* sc = scope;
+    while (sc && sc->asSymbol().kind == SymbolKind::CheckerInstanceBody) {
+        const auto* inst = sc->asSymbol().as<CheckerInstanceBodySymbol>().parentInstance;
+        if (!inst) break;
+        sc = inst->getParentScope();
+    }
+    return sc;
+}
+// The default clocking in effect here (14.12): this scope's, else the
+// checker's instantiation context's.
+const slang::ast::ClockingBlockSymbol* defaultClockingBlock() {
+    using namespace slang::ast;
+    if (!compilation()) return nullptr;
+    for (const Scope* sc : {scope, contextScope()})
+        if (sc)
+            if (const Symbol* dc = compilation()->getDefaultClocking(*sc))
+                if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) return cb;
+    return nullptr;
+}
+// The default disable iff in effect here (16.15), as for defaultClocking.
+const slang::ast::Expression* defaultDisable() {
+    if (!compilation()) return nullptr;
+    for (const slang::ast::Scope* sc : {scope, contextScope()})
+        if (sc)
+            if (const auto* d = compilation()->getDefaultDisable(*sc)) return d;
+    return nullptr;
+}
+// Is this a call of the system function name (no arguments)?
+static bool isSysCall(const slang::ast::Expression& e, std::string_view name) {
+    using namespace slang::ast;
+    return e.kind == ExpressionKind::Call && e.as<CallExpression>().isSystemCall() &&
+           e.as<CallExpression>().getSubroutineName() == name;
+}
+// $inferred_clock (16.14.7): the default clocking's event.
+const slang::ast::ClockingBlockSymbol* inferredClock(const slang::ast::Expression& e) {
+    if (!isSysCall(e, "$inferred_clock")) return nullptr;
+    if (const auto* cb = defaultClockingBlock()) return cb;
+    unsupported("$inferred_clock with no default clocking (16.14.7)");
+}
 // Is this $global_clock (14.14)?
 static bool isGlobalClock(const slang::ast::Expression& e) {
     using namespace slang::ast;
@@ -131,9 +174,7 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
 // The clocking block a ## uses: the default clocking (14.11, 14.12).
 int defaultClocking() {
     using namespace slang::ast;
-    if (compilation() && scope)
-        if (const Symbol* dc = compilation()->getDefaultClocking(*scope))
-            if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) return clockingIdx(*cb);
+    if (const auto* cb = defaultClockingBlock()) return clockingIdx(*cb);
     unsupported("## with no default clocking (14.11)");
 }
 // ##n as a statement prefix (14.11).

@@ -24,7 +24,10 @@ enum Edge { ANY, POS, NEG };
 enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_INSERT, D_POP_FRONT,
               D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
               D_SORT, D_RSORT, D_SHUFFLE,
-              D_SORT_BY, D_RSORT_BY };   // sort / rsort with (7.12.2): keys in dsrc
+              D_SORT_BY, D_RSORT_BY,     // sort / rsort with (7.12.2): keys in dsrc
+              D_UNPACK };                // q = {>>{v}} (11.4.14.3): e cut into elements
+// IK::ProcOp operations (9.7).
+enum ProcOpKind { PO_SELF, PO_STATUS, PO_KILL, PO_AWAIT, PO_SUSPEND, PO_RESUME };
 enum class IK {
     Assign,     // sig = e            (blocking)
     Nba,        // sig <= e           (non-blocking)
@@ -46,9 +49,17 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    Udp,        // a user-defined primitive (29): udp's table, inputs in args, state `sig`, last inputs `dres`
+    Tran,       // bidirectional switch `sig` (28.8): its control is e (null: always on), active low if pdown
+    Dump,       // a VCD task (21.7.1): dcmd is a DumpCmd; args / dsel hold the operands
+    Dpi,        // call the C function of DPI import `dpi` (35); see DpiFunc
+    Vpi,        // call the calltf of a VPI user system task or function (36-38); see VpiSite
     New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
     Randomize,  // sig = randomize the object e (null e: std::randomize), with rc (18.6, 18.12)
     RandMode,   // obj e: every rand variable (hi = 0) or constraint block (hi = 1) on or off by de (18.8, 18.9)
+    // std::process (9.7): hi is the ProcOp, e the process object (its slot
+    // `dkey` holds the process number), lo the class id, sig the result.
+    ProcOp,
     // An immediate assertion (16.3, 16.4) of asserts()[sig] on condition e.
     // join 0, simple: pass falls through to the pass action, a fail jumps to
     // target, and an assertion that is off or whose action is off jumps to hi.
@@ -61,10 +72,19 @@ enum class IK {
     // of clockings()[dkey], take e at the clocking event `de` cycles on.
     CbDrive,
     AssertCtl,  // $assertcontrol (20.11): args are control, assertion and directive type, levels; fmt the targets
+    Exit,       // $exit (24.7): end the calling thread's program
     Ret         // pop that address; an empty stack ends the process
 };
 
 struct Prog;
+
+// A user-defined primitive's table (29.3.4). Each row has one field per
+// input: a level ('0' '1' 'x' '?' 'b'), an edge symbol ('r' 'f' 'p' 'n' '*'),
+// or an edge pair "(01)". `edge` is the input with the edge, or -1.
+struct UdpRow { std::vector<std::string> in; char state = 0, out = 'x'; int edge = -1; };
+struct UdpTable { int nin = 0; bool seq = false; bool edges = false; std::vector<UdpRow> rows; };
+// IK::Dump commands, one per VCD task (21.7.1).
+enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT };
 
 // Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
 // is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
@@ -83,6 +103,83 @@ inline uint32_t covFileId(const std::string& path) {
 // Relaxed atomic add: a task body can run on two worker threads at once.
 inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
 
+// ---- DPI-C (IEEE 1800-2023 clause 35, annex H) ----
+// How a value is passed to or from C (35.5.6, H.7). A packed type is passed
+// by pointer in canonical form; a scalar bit or logic is one byte.
+enum DpiType : uint8_t {
+    DT_VOID, DT_BYTE, DT_SHORT, DT_INT, DT_LONG, DT_REAL, DT_SHORTREAL, DT_CHANDLE, DT_STRING,
+    DT_BIT,      // svBit
+    DT_LOGIC,    // svLogic
+    DT_BITVEC,   // svBitVecVal[], 32 bits a word
+    DT_LOGICVEC  // svLogicVecVal[], aval/bval pairs
+};
+struct DpiArg {
+    DpiType t = DT_INT;
+    int dir = 0;          // 0 input, 1 output, 2 inout
+    int sig = -1;         // the formal's signal (not for an unpacked array)
+    int w = 32;           // bits of the value, or of one element of an unpacked array
+    bool sgn = false;
+    // An unpacked array formal: its dimensions, leftmost first. An open
+    // dimension `[]` (35.5.6.1) has open = true, and C gets an svOpenArrayHandle.
+    bool uarr = false, open = false;
+    std::vector<std::pair<int64_t, int64_t>> udims;
+    std::vector<bool> uopen;   // per dimension: open
+
+    std::string name;
+};
+// One DPI import or export. An import is called by IK::Dpi; an export is an
+// SV task or function that C calls through a generated stub.
+struct DpiFunc {
+    std::string svName, cName;
+    std::string scope;    // hierarchical name of the module instance or package that declares it
+    bool task = false, context = false, pure = false, isExport = false;
+    DpiType ret = DT_VOID;
+    int retSig = -1, retW = 0;
+    bool retSgn = false;
+    std::vector<DpiArg> args;
+    const Prog* prog = nullptr;   // export: the SV body
+    void* rt = nullptr;           // run-time data (resolved C function)
+};
+// A user system task or function registered with vpi_register_systf
+// (38.37). The names are known before elaboration, so slang accepts calls.
+struct VpiSystfInfo {
+    int idx = 0;          // into vpi::st().systfs
+    bool func = false;
+    int ftype = 1;        // vpiIntFunc, vpiRealFunc, vpiTimeFunc, vpiSizedFunc, vpiSizedSignedFunc
+    int size = 32;        // result width (sizetf for a sized function)
+};
+inline std::unordered_map<std::string, VpiSystfInfo>& vpiSystfNames() {
+    static std::unordered_map<std::string, VpiSystfInfo> m;
+    return m;
+}
+// One argument of a call of a user system task or function, as VPI sees it.
+struct VpiArg {
+    enum Kind { Empty, Signal, Value, String, Scope } kind = Empty;
+    int sig = -1;               // Signal: the variable or net; Value: a temporary holding the value
+    int w = 0;
+    bool sgn = false, real = false, str = false;
+    std::string text;           // String: the literal
+    const void* sym = nullptr;  // Signal: its slang symbol; Scope: the instance
+    int vtype = 0;              // Value / String: the object type VPI reports (vpiConstant, vpiOperation, ...)
+};
+// One call site of a user system task or function (an IK::Vpi).
+struct VpiSite {
+    int systf = 0;
+    bool func = false;
+    std::vector<VpiArg> args;
+    int ret = -1, retW = 32;    // function: the result signal
+    bool retSgn = false, retReal = false;
+    std::string file;
+    int line = 0;
+    const void* scope = nullptr;   // the instance the call is in (slang InstanceSymbol)
+    mutable void* userdata = nullptr;   // vpi_put_userdata (38.40)
+};
+// An unpacked array actual of a DPI call: a fixed array or a container.
+struct DpiActual {
+    std::shared_ptr<const ArrShape> arr;
+    int dyn = -1;
+};
+
 struct Instr {
     IK k = IK::Jmp;
     int sig = -1;
@@ -98,6 +195,7 @@ struct Instr {
     // $strobe/$monitor sees values after NBA. %b, %d, %%, and other text.
     std::string fmt;
     bool nonl = false;    // Display from $write: no newline at the end
+    E fd;                 // Strobe / Monitor from $fstrobe / $fmonitor: the descriptor (21.3.2)
     std::vector<E> args;
     const Prog* callee = nullptr; // Call
     std::vector<const Prog*> branches;  // Fork
@@ -124,6 +222,11 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    const UdpTable* udp = nullptr;   // Udp
+    // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
+    // signal-name prefixes relative to the top ("" is the top, "u1." an
+    // instance); `second` is true for a variable (an exact name).
+    std::vector<std::pair<std::string, bool>> dsel;
     // Frames (expr.hpp). Call: when `lay` is set the callee is automatic and
     // runs in a new frame of that shape; `init` gives each argument slot its
     // value, evaluated in the caller before the switch. Fork: `blays` is the
@@ -140,6 +243,12 @@ struct Instr {
     bool dynWait = false;
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
+    // Dpi: the import, one entry per argument (arrays only), and the call's
+    // source location for svGetCallerInfo (file in fmt).
+    const DpiFunc* dpi = nullptr;
+    const VpiSite* vpi = nullptr;   // Vpi: the call site
+    std::vector<DpiActual> dact;
+    int dline = 0;
     // Call of a class method (8): `self` is the object (null: the caller's
     // own `this`; noSelf: a static method). vslot >= 0 picks the body from
     // the object's class (a virtual method, 8.20).
@@ -161,6 +270,15 @@ struct RandItem {
     bool isDist = false;
     E guard;                     // dist under an implication: holds when guard is false
     std::vector<RandDist> dist;
+    E distDefault;               // default :/ w (18.5.3): w spread over the values no item names
+    // foreach over a dynamic array or queue (18.5.8.1): body once per
+    // element at solve time, with signal loopVar read as the index.
+    int loopCont = -1, loopVar = -1;
+    std::vector<RandItem> body;
+    // Function calls in the constraint (18.5.12): each program computes one
+    // call's result into the temporary that e reads. They run at solve time
+    // once the rand variables they read have values.
+    std::vector<std::shared_ptr<Prog>> fns;
 };
 // A constraint block (18.5): its constraint_mode slot in the object.
 struct RandBlock {
@@ -177,6 +295,7 @@ struct RandVar {
     std::string name;
     int off = 0, count = 1, w = 1, mode = -1;
     bool sgn = false, randc = false, obj = false;
+    bool dyn = false;   // a dynamic array or queue: off is its container slot, w / sgn its elements'
 };
 struct RandSpec {
     std::vector<RandVar> vars;
@@ -244,14 +363,15 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     collectRefsInto(e->at, out, seen);
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) add(e->sig);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef) add(e->sig);
+    if (e->op == Op::SysFn && e->sig >= 0) add(e->sig);   // a query of a container (SF_ASSOC_BOUND)
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 // Does e read an automatic variable (a relative id)?
 inline bool hasRel(const E& e) {
     if (!e) return false;
     if (isRel(e->sig) && e->op != Op::Const) return true;
-    if (e->at || e->op == Op::This || e->op == Op::Addr || e->op == Op::AddrOf) return true;   // objects (8), ref (13.5.2)
+    if (e->at || e->op == Op::This || e->op == Op::Addr || e->op == Op::AddrOf || e->op == Op::VifSig || e->op == Op::DynElemRef) return true;   // objects (8), ref (13.5.2), virtual interfaces (25.9)
     if (e->op == Op::ArrRead && isRel(e->arr->base)) return true;
     for (auto& k : e->kids) if (hasRel(k)) return true;
     return false;
@@ -307,12 +427,90 @@ inline void collectProgWrites(const Prog& p, std::unordered_set<int>& out, std::
         for (const Prog* b : i.branches) collectProgWrites(*b, out, seen);
     }
 }
+// Bits of a signal: ranges [lo, hi], or every bit.
+struct BitSet {
+    bool all = false;
+    std::vector<std::pair<int, int>> r;
+    bool covers(int lo, int hi) const {   // is every bit of [lo, hi] in r?
+        if (all) return true;
+        for (int b = lo; b <= hi; b++) {
+            bool in = false;
+            for (auto& [l, h] : r) if (b >= l && b <= h) { in = true; break; }
+            if (!in) return false;
+        }
+        return true;
+    }
+};
+// The bits of each signal that e reads: a constant part select of a signal
+// reads only those bits, any other reference reads all of it.
+inline void collectReadBits(const E& e, std::unordered_map<int, BitSet>& m) {
+    if (!e) return;
+    if (e->op == Op::Slice && e->kids.size() == 1 && e->kids[0] && e->kids[0]->op == Op::Ref &&
+        !e->kids[0]->at && !isRel(e->kids[0]->sig)) {
+        m[e->kids[0]->sig].r.push_back({e->lo, e->hi});
+        return;
+    }
+    if (e->op == Op::Ref && !e->at && !isRel(e->sig)) m[e->sig].all = true;
+    if (e->op == Op::ArrRead)
+        for (int i = 0; i < e->arr->count; i++) m[e->arr->base + i].all = true;
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
+        e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef)
+        m[e->sig].all = true;
+    collectReadBits(e->at, m);
+    for (auto& k : e->kids) collectReadBits(k, m);
+}
+inline void collectProgReadBits(const Prog& p, std::unordered_map<int, BitSet>& m, std::vector<const Prog*>& seen) {
+    for (const Prog* s : seen)
+        if (s == &p) return;
+    seen.push_back(&p);
+    for (auto& i : p.code) {
+        collectReadBits(i.e, m);
+        for (auto& a : i.args) collectReadBits(a, m);
+        for (auto& a : i.aidx) collectReadBits(a, m);
+        collectReadBits(i.bidx, m);
+        for (auto& a : i.init) collectReadBits(a.second, m);
+        if (i.k == IK::Call && i.callee) collectProgReadBits(*i.callee, m, seen);
+        for (const Prog* b : i.branches) collectProgReadBits(*b, m, seen);
+    }
+}
+// Bits written at a constant part select (v[3] = ..., v[7:4] = ...).
+inline void collectProgPartWrites(const Prog& p, std::unordered_map<int, BitSet>& out, std::vector<const Prog*>& seen) {
+    for (const Prog* s : seen)
+        if (s == &p) return;
+    seen.push_back(&p);
+    for (auto& i : p.code) {
+        if ((i.k == IK::Assign || i.k == IK::Nba) && i.sig >= 0 && i.drv < 0 && i.dyn < 0 && !i.arr &&
+            i.hi >= 0 && !i.bidx)
+            out[i.sig].r.push_back({i.lo, i.hi});
+        if (i.k == IK::Call && i.callee) collectProgPartWrites(*i.callee, out, seen);
+        for (const Prog* b : i.branches) collectProgPartWrites(*b, out, seen);
+    }
+}
+// always_comb / always_latch sensitivity (9.2.2.2.1): what the block reads,
+// less what it also writes. A signal written only in part stays in the list
+// unless every read of it is of bits the block writes, so two blocks that
+// each own a bit of one vector do not wake each other.
 inline std::vector<std::pair<int, Edge>> combReadSet(const Prog& p) {
     auto rs = readSet(p);
     std::unordered_set<int> wr;
     std::vector<const Prog*> seen;
     collectProgWrites(p, wr, seen);
     std::erase_if(rs, [&](const std::pair<int, Edge>& e) { return wr.count(e.first) > 0; });
+    std::unordered_map<int, BitSet> pw;
+    seen.clear();
+    collectProgPartWrites(p, pw, seen);
+    if (pw.empty()) return rs;
+    std::unordered_map<int, BitSet> rd;
+    seen.clear();
+    collectProgReadBits(p, rd, seen);
+    std::erase_if(rs, [&](const std::pair<int, Edge>& e) {
+        auto w = pw.find(e.first);
+        if (w == pw.end()) return false;
+        auto r = rd.find(e.first);
+        if (r == rd.end() || r->second.all) return false;
+        for (auto& [l, h] : r->second.r) if (!w->second.covers(l, h)) return false;
+        return true;
+    });
     return rs;
 }
 // A WaitEdge on one or more events (ev must be non-empty).

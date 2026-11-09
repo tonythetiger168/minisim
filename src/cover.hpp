@@ -25,6 +25,9 @@ struct CgItem {
     bool range = false;
     bool loMin = false, hiMax = false;
     bool loSgn = false, hiSgn = false;
+    // A real coverpoint (19.5.1): lo and hi are reals; tol 1 is [lo +/- hi],
+    // 2 is [lo +%- hi] (a tolerance range, 11.4.13).
+    int tol = 0;
 };
 // One step of a transition (19.5.2): a set of values, repeated.
 struct CgStep {
@@ -58,6 +61,8 @@ struct CgCpDef {
     bool sgn = false;
     std::vector<std::pair<std::string, uint64_t>> enumVals;   // an enum coverpoint's values
     bool isEnum = false;
+    bool isReal = false;        // a real coverpoint: keys order the doubles (19.5.1)
+    E realInterval;             // type_option.real_interval; null: the group's, else 1.0
     std::vector<CgBinDef> bins;
     std::vector<CgOptSet> opts;
 };
@@ -89,9 +94,11 @@ struct CgDef {
     std::vector<std::pair<int, Edge>> ev;   // the sampling event, if any
     E evIff;
     std::vector<CgOptSet> opts;
+    E realInterval;                 // type_option.real_interval of the group (19.7.1)
     std::vector<CgCpDef> cps;
     std::vector<CgCrossDef> crosses;
     std::vector<int> insts;         // instance ids, in creation order
+    bool inClass = false;           // embedded in a class (19.4): new() passes `this` last
 };
 inline std::vector<CgDef>& cgDefs() { static std::vector<CgDef> v; return v; }
 
@@ -139,6 +146,7 @@ struct CgInst {
     std::vector<std::vector<int64_t>> cpOpt, crOpt;   // per coverpoint / cross: weight, goal, at_least, auto_bin_max
     std::vector<CgCpInst> cps;
     std::vector<CgCrossInst> crosses;
+    FrameP self;                     // a class's covergroup (19.4): the object it samples
 };
 inline std::vector<CgInst>& cgInsts() { static std::vector<CgInst> v; return v; }
 

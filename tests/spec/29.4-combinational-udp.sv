@@ -1,5 +1,4 @@
 // IEEE 1800-2023 29.4: A combinational UDP with a table (29.4).
-//! xfail: UDPs are errors
 //! icarus-skip: Icarus 13 does not parse UDPs inside this file layout
 primitive mux2(output y, input s, a, b);
   table

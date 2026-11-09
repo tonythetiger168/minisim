@@ -233,17 +233,23 @@ int shadowOf(int s) {
 // An expression with every static variable read replaced by its sampled value.
 // The hidden signals of assertion local variables (16.10): read as they are.
 static std::unordered_set<int>& svaLocalSigs() { static std::unordered_set<int> s; return s; }
+// The signals of sequence end points (16.13.6): read as they are, too.
+static std::unordered_set<int>& svaLiveSigs() { static std::unordered_set<int> s; return s; }
+// Signals from this id on are read as they are (temporaries; see sampleProg).
+static int& sampleBelow() { static int n = INT_MAX; return n; }
 E sampledE(const E& e) {
     if (!e) return e;
     if (e->op == Op::Const) return e;
     if (e->op == Op::Ref) {
-        if (isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig)) return e;   // automatic: read as it is
+        if (isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig) || svaLiveSigs().count(e->sig) ||
+            e->sig >= sampleBelow())
+            return e;   // automatic, local, or an end point: read as it is
         auto c = std::make_shared<Expr>(*e);
         c->sig = shadowOf(e->sig);
         return c;
     }
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
-        e->op == Op::DynSlice)
+        e->op == Op::DynSlice || e->op == Op::DynElemRef)
         return e;   // containers are read as they are now
     auto c = std::make_shared<Expr>(*e);
     if (e->op == Op::ArrRead) {
@@ -265,6 +271,21 @@ E sampledE(const E& e) {
     return c;
 }
 
+// Every expression of prog but its event controls reads sampled values
+// (a checker's always_ff, 17.5); signals from `below` on are read as they are.
+void sampleProg(int below) {
+    int saved = sampleBelow();
+    sampleBelow() = below;
+    for (auto& i : prog.code) {
+        if (i.k == IK::WaitEdge) continue;
+        i.e = sampledE(i.e);
+        for (auto& a : i.args) a = sampledE(a);
+        for (auto& a : i.aidx) a = sampledE(a);
+        i.bidx = sampledE(i.bidx);
+    }
+    sampleBelow() = saved;
+}
+
 // The clock of a sampled value function: its clocking_event argument, else
 // the clock of the context (16.9.3), else the default clocking (14.12).
 std::vector<std::pair<int, Edge>> clockArg(const slang::ast::CallExpression& call, size_t idx) {
@@ -277,12 +298,10 @@ std::vector<std::pair<int, Edge>> clockArg(const slang::ast::CallExpression& cal
         return ev;
     }
     if (!sampleEv.empty()) return sampleEv;
-    if (compilation() && scope)
-        if (const Symbol* dc = compilation()->getDefaultClocking(*scope))
-            if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) {
-                collectEvents(cb->getEvent(), ev);
-                return ev;
-            }
+    if (const auto* cb = defaultClockingBlock()) {
+        collectEvents(cb->getEvent(), ev);
+        return ev;
+    }
     unsupported("sampled value function with no clock to use (16.9.3)");
 }
 // $past(e, n, gate) on clock ev: the signal holding the value n ticks back.
@@ -346,6 +365,8 @@ struct SvaBuild {
     std::vector<char> atomLocal;     // the atom reads a local variable
     std::vector<int> localSigs;      // local variables (16.10), as hidden signals
     std::vector<std::vector<ConcAssert::Item>> acts;   // match items and initializers
+    std::vector<int> matchFlags;     // .matched flags read (16.13.6)
+    std::vector<std::pair<std::vector<std::pair<int, Edge>>, E>> more;   // the other clocks (16.13)
     std::unordered_map<const slang::ast::Expression*, int> atomOf;
     std::vector<std::pair<int, Edge>> clk;
     E clkIff;
@@ -479,7 +500,9 @@ void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge
     using namespace slang::ast;
     if (t.kind == TimingControlKind::SignalEvent) {
         const auto& s = t.as<SignalEventControl>();
-        if (const auto* cb = isGlobalClock(s.expr) ? globalClocking() : clockingRef(s.expr)) {
+        const auto* cb = isGlobalClock(s.expr) ? globalClocking() : clockingRef(s.expr);
+        if (!cb) cb = inferredClock(s.expr);
+        if (cb) {
             clockOf(cb->getEvent(), ev, iff);   // @(cb) or @($global_clock) as a clock (14.10, 14.14, 16.16)
             return;
         }
@@ -490,13 +513,28 @@ void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge
     }
     collectEvents(t, ev);
 }
-// A clock inside the assertion: the same as the leading clock, or multiclock.
-void sameClock(const slang::ast::TimingControl& t) {
+// A clock inside the assertion (16.13): its index, 0 for the leading clock;
+// a different one is a clock of a multiclock assertion.
+int clockIdx(const slang::ast::TimingControl& t) {
     std::vector<std::pair<int, Edge>> ev;
     E iff;
     clockOf(t, ev, iff);
-    if (svb->clk.empty()) { svb->clk = ev; svb->clkIff = iff; return; }
-    if (ev != svb->clk) unsupported("multiclock assertion (16.13)");
+    if (svb->clk.empty()) { svb->clk = ev; svb->clkIff = iff; return 0; }
+    if (ev == svb->clk && !iff && !svb->clkIff) return 0;
+    for (size_t k = 0; k < svb->more.size(); k++)
+        if (svb->more[k].first == ev && !iff && !svb->more[k].second) return (int)k + 1;
+    if (svb->more.size() >= 31) unsupported("an assertion with more than 32 clocks");
+    svb->more.push_back({ev, iff});
+    return (int)svb->more.size();
+}
+// t's subterm under clock ci.
+template <class F> const sva::Node* underClock(int ci, F f) {
+    auto& st = sva::store();
+    int saved = st.clk;
+    st.clk = ci;
+    const sva::Node* r = f();
+    st.clk = saved;
+    return r;
 }
 static int rangeHi(const std::optional<uint32_t>& m) { return m ? (int)*m : -1; }
 
@@ -536,11 +574,6 @@ const sva::Node* seqTerm(const slang::ast::AssertionExpr& a) {
                 int init = instLocals(*ai);
                 return repeated(st.init(init, seqTerm(ai->body)), nullptr, s.repetition);
             }
-            if (s.expr.kind == ExpressionKind::Call) {
-                const auto& c = s.expr.as<CallExpression>();
-                if (c.getSubroutineName() == "triggered" || c.getSubroutineName() == "matched")
-                    unsupported("sequence methods triggered and matched (16.13.6)");
-            }
             return repeated(st.boolean(svaAtom(s.expr)), &s.expr, s.repetition);
         }
         case AssertionExprKind::SequenceConcat: {
@@ -579,8 +612,7 @@ const sva::Node* seqTerm(const slang::ast::AssertionExpr& a) {
         }
         case AssertionExprKind::Clocking: {
             const auto& c = a.as<ClockingAssertionExpr>();
-            sameClock(c.clocking);
-            return seqTerm(c.expr);
+            return underClock(clockIdx(c.clocking), [&] { return seqTerm(c.expr); });
         }
         default: unsupported("this sequence expression");
     }
@@ -667,8 +699,7 @@ const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
         }
         case AssertionExprKind::Clocking: {
             const auto& c = a.as<ClockingAssertionExpr>();
-            sameClock(c.clocking);
-            return propTerm(c.expr, strong);
+            return underClock(clockIdx(c.clocking), [&] { return propTerm(c.expr, strong); });
         }
         case AssertionExprKind::StrongWeak: {
             const auto& s = a.as<StrongWeakAssertionExpr>();
@@ -721,11 +752,122 @@ const Prog* concAction(const slang::ast::Statement* st, const slang::ast::Statem
     return store->back().get();
 }
 
+// The end point tracker of a sequence instance (16.13.6, 9.4.2.4): its first
+// signal counts the ticks where the sequence matches (@(s) waits on it), the
+// next holds the time + 1 of the last one (.triggered compares it with now).
+// It runs like a cover sequence, starting an attempt at every tick of the
+// sequence's clock: its own, else the clock of the assertion reading it,
+// else the default clocking.
+static std::map<const void*, int>& seqTrackers() { static std::map<const void*, int> m; return m; }   // -> concAsserts index
+int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
+    using namespace slang::ast;
+    if (ai.symbol.kind != SymbolKind::Sequence) unsupported("an end point of something other than a sequence");
+    // Instances without arguments share one tracker.
+    const void* key = ai.arguments.empty() ? (const void*)&ai.symbol : (const void*)&ai;
+    if (auto it = seqTrackers().find(key); it != seqTrackers().end()) return it->second;
+    if (!mkSig) unsupported("a sequence end point here");
+    std::string base = ai.symbol.getHierarchicalPath() + "$end" + std::to_string(tempSeq ? (*tempSeq)++ : 0);
+    int sg = mkSig(base, 32, false);
+    if (mkSig(base + "$t", 64, false) != sg + 1) unsupported("sequence end point signals that are not consecutive");
+    svaLiveSigs().insert(sg);
+    svaLiveSigs().insert(sg + 1);
+    SvaBuild b;
+    SvaBuild* saved = svb;
+    const std::vector<char>* savedLocal = sva::store().localAtoms;
+    auto savedEv = sampleEv;
+    const AssertionExpr* body = &ai.body;
+    if (body->kind == AssertionExprKind::Clocking) {
+        clockOf(body->as<ClockingAssertionExpr>().clocking, b.clk, b.clkIff);
+        body = &body->as<ClockingAssertionExpr>().expr;
+    } else if (saved && !saved->clk.empty()) {
+        b.clk = saved->clk;
+        b.clkIff = saved->clkIff;
+    } else if (const auto* cb = defaultClockingBlock())
+        clockOf(cb->getEvent(), b.clk, b.clkIff);
+    if (b.clk.empty()) unsupported("an end point of a sequence with no clock (16.13.6)");
+    svb = &b;
+    sva::store().localAtoms = &b.atomLocal;
+    int savedClk = sva::store().clk;
+    sva::store().clk = 0;
+    sampleEv = b.clk;
+    ConcAssert c;
+    AssertInfo info;
+    info.name = base;
+    info.inst = instPath(scope);
+    info.type = AT_CONCURRENT;
+    info.dir = AD_COVER;
+    info.hidden = true;
+    c.id = (int)asserts().size();
+    asserts().push_back(std::move(info));
+    c.coverSeq = true;
+    int init = instLocals(ai);
+    c.root = sva::store().covseq(sva::store().init(init, seqTerm(*body)));
+    c.ev = b.clk;
+    c.clkIff = b.clkIff;
+    c.atoms = std::move(b.atoms);
+    c.localSig = std::move(b.localSigs);
+    c.acts = std::move(b.acts);
+    c.endSig = sg;
+    c.more = std::move(b.more);
+    svb = saved;
+    sva::store().localAtoms = savedLocal;
+    sva::store().clk = savedClk;
+    sampleEv = savedEv;
+    int k = (int)concAsserts().size();
+    concAsserts().push_back(std::move(c));
+    seqTrackers()[key] = k;
+    return k;
+}
+// s.triggered (true in a time step where s matched), and s.matched: in an
+// assertion, true when s matched since the assertion's last tick (its clock
+// may differ, 16.13.6); elsewhere the same as triggered.
+E seqEndPoint(const slang::ast::Expression& arg, bool matched) {
+    using namespace slang::ast;
+    const Expression& x = peel(arg);
+    if (x.kind != ExpressionKind::AssertionInstance) unsupported("triggered or matched of this expression");
+    int k = seqTracker(x.as<AssertionInstanceExpression>());
+    if (matched && svb) {
+        if (!mkSig) unsupported("matched here");
+        int f = mkSig(asserts()[concAsserts()[k].id].name + "$m" + std::to_string(tempSeq ? (*tempSeq)++ : 0), 1, false);
+        svaLiveSigs().insert(f);
+        concAsserts()[k].matchFlags.push_back(f);
+        svb->matchFlags.push_back(f);
+        return bin(Op::CaseEq, ref(f), konst(mk(1, 1)));
+    }
+    int s = concAsserts()[k].endSig;
+    E t = node(Op::Time);
+    t->k = mk(1, 64);   // raw ticks
+    return bin(Op::CaseEq, ref(s + 1), bin(Op::Add, t, konst(mk(1, 64))));
+}
+// @(s) for a sequence instance s (9.4.2.4): its end point count.
+int seqEventSig(const slang::ast::Expression& x) {
+    return concAsserts()[seqTracker(peel(x).as<slang::ast::AssertionInstanceExpression>())].endSig;
+}
+
 // assert / assume / cover property, cover sequence (16.14).
+// The leading clock written inside a sequence or property operand, if any:
+// `cover property (s)` with s's own @(posedge clk) is clocked by it (16.16).
+const slang::ast::TimingControl* leadingClock(const slang::ast::AssertionExpr& a) {
+    using namespace slang::ast;
+    if (const auto* ai = instanceOf(a)) return leadingClock(ai->body);
+    switch (a.kind) {
+        case AssertionExprKind::Clocking: return &a.as<ClockingAssertionExpr>().clocking;
+        case AssertionExprKind::SequenceConcat: {
+            const auto& c = a.as<SequenceConcatExpr>();
+            return c.elements.empty() ? nullptr : leadingClock(*c.elements[0].sequence);
+        }
+        case AssertionExprKind::SequenceWithMatch: return leadingClock(a.as<SequenceWithMatchExpr>().expr);
+        case AssertionExprKind::FirstMatch: return leadingClock(a.as<FirstMatchAssertionExpr>().seq);
+        case AssertionExprKind::Unary: return leadingClock(a.as<UnaryAssertionExpr>().expr);
+        case AssertionExprKind::Binary: return leadingClock(a.as<BinaryAssertionExpr>().left);
+        default: return nullptr;
+    }
+}
 void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     using namespace slang::ast;
     if (s.assertionKind == AssertionKind::Restrict) return;   // for formal tools only (16.14.4)
-    if (s.assertionKind == AssertionKind::Expect) unsupported("expect (16.17)");
+    bool expect = s.assertionKind == AssertionKind::Expect;
+    if (expect && staticAssert) unsupported("expect outside a procedure (16.17)");
     SvaBuild b;
     SvaBuild* saved = svb;
     svb = &b;
@@ -736,7 +878,8 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     const Expression* dis = nullptr;
     std::vector<int> inits;   // the local variables of the leading property instances
     sva::store().localAtoms = &b.atomLocal;
-    struct Reset { ~Reset() { sva::store().localAtoms = nullptr; } } reset;
+    sva::store().clk = 0;
+    struct Reset { ~Reset() { sva::store().localAtoms = nullptr; sva::store().clk = 0; } } reset;
     for (;;) {
         if (const auto* ai = instanceOf(*a); ai && ai->symbol.kind == SymbolKind::Property) {
             inits.push_back(instLocals(*ai));
@@ -744,7 +887,7 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         } else if (a->kind == AssertionExprKind::Clocking) {
             const auto& c = a->as<ClockingAssertionExpr>();
             if (b.clk.empty()) clockOf(c.clocking, b.clk, b.clkIff);
-            else sameClock(c.clocking);
+            else sva::store().clk = clockIdx(c.clocking);
             a = &c.expr;
         } else if (a->kind == AssertionExprKind::DisableIff) {
             if (dis) unsupported("nested disable iff (16.12)");
@@ -752,14 +895,15 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
             a = &a->as<DisableIffAssertionExpr>().expr;
         } else break;
     }
+    if (b.clk.empty())
+        if (const auto* tc = leadingClock(*a)) clockOf(*tc, b.clk, b.clkIff);
     if (b.clk.empty()) {   // inferred from the procedure, else the default clocking (16.16)
         if (!sampleEv.empty()) b.clk = sampleEv;
-        else if (compilation() && scope)
-            if (const Symbol* dc = compilation()->getDefaultClocking(*scope))
-                if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) clockOf(cb->getEvent(), b.clk, b.clkIff);
+        else if (const auto* cb = defaultClockingBlock()) clockOf(cb->getEvent(), b.clk, b.clkIff);
     }
     if (b.clk.empty()) unsupported("concurrent assertion with no clock (16.16)");
-    if (!dis && compilation() && scope) dis = compilation()->getDefaultDisable(*scope);   // 16.15
+    if (dis && isSysCall(*dis, "$inferred_disable")) dis = defaultDisable();   // 16.14.7
+    if (!dis) dis = defaultDisable();   // 16.15
     sampleEv = b.clk;   // $past and friends in the assertion use its clock
     ConcAssert c;
     c.id = newAssert(AT_CONCURRENT, dir, s);
@@ -772,14 +916,20 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     sva::store().localAtoms = nullptr;
     if (dis) c.disable = expr(*dis);   // current values, not sampled (16.12)
     std::string name = asserts()[c.id].name;
-    if (!emptyStmt(s.ifTrue)) c.pass = concAction(s.ifTrue, s, name);
-    if (!emptyStmt(s.ifFalse)) c.fail = concAction(s.ifFalse, s, name);
+    c.expect = expect;
+    if (expect) {}   // the action block runs in the process, after the verdict
+    else if (!emptyStmt(s.ifTrue)) c.pass = concAction(s.ifTrue, s, name);
+    if (expect) {}
+    else if (!emptyStmt(s.ifFalse)) c.fail = concAction(s.ifFalse, s, name);
     else if (dir != AD_COVER) c.fail = concAction(nullptr, s, name);
     c.ev = b.clk;
     c.clkIff = b.clkIff;
     c.atoms = std::move(b.atoms);
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
+    c.clearFlags = std::move(b.matchFlags);
+    c.more = std::move(b.more);
+    if (!c.more.empty() && !staticAssert) unsupported("a multiclock assertion in a procedure (16.14.6)");
     if (!staticAssert) {   // in a procedure (16.14.6): queued when the procedure reaches it
         c.procedural = true;
         // Automatic variables are read as they were when the instance was
@@ -822,9 +972,18 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         Instr q;
         q.k = IK::Assert;
         q.sig = c.id;
-        q.join = 3;
+        q.join = expect ? 4 : 3;
         q.hi = (int)concAsserts().size();
-        prog.emit(q);
+        size_t at = prog.emit(q);
+        if (expect) {   // pass: on; fail: target; disabled or killed: lo (after both)
+            if (!emptyStmt(s.ifTrue)) stmt(*s.ifTrue);
+            size_t j = emitJmp();
+            prog.code[at].target = prog.here();
+            if (!emptyStmt(s.ifFalse)) stmt(*s.ifFalse);
+            else emitAssertError(s, name);
+            prog.code[j].target = prog.here();
+            prog.code[at].lo = (int)prog.here();
+        }
     }
     concAsserts().push_back(std::move(c));
     sampleEv = savedEv;
