@@ -382,6 +382,8 @@ struct DpiHook {
     void (*kill)(void* fiber) = nullptr;
 };
 inline DpiHook& dpiHook() { static DpiHook h; return h; }
+// VPI (36-38), set by vpi.inc: run the calltf of a user system task or function.
+inline void (*&vpiCallHook())(const Instr&) { static void (*h)(const Instr&) = nullptr; return h; }
 
 // One running process: its children (for wait fork / disable fork) and the
 // fork it belongs to. A disabled process ends at once for everyone waiting
@@ -1028,6 +1030,12 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
+            case IK::Vpi:
+                if (!vpiCallHook()) { std::cerr << "msim: VPI call without VPI support\n"; S.finished = true; goto done; }
+                vpiCallHook()(i);
+                if (S.finished) goto done;
+                pc++;
+                break;
             case IK::Dpi: {
                 if (!dpiHook().call) { std::cerr << "msim: DPI call without DPI support\n"; S.finished = true; goto done; }
                 void* fib = nullptr;

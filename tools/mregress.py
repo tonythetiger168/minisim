@@ -126,7 +126,9 @@ def spec_tests(directory):
                 m = re.match(r"//! ([a-z-]+): ?(.*)", l.rstrip("\n"))
                 if not m:
                     continue
-                if m.group(1) == "icarus-skip":
+                if m.group(1) in ("icarus-skip", "icarus-vpi"):
+                    # icarus-vpi tests need a VPI module built with
+                    # iverilog-vpi; run_spec.cmake does that, mregress doesn't.
                     opts["skip"] = "iverilog"
                 elif m.group(1) == "xfail":
                     opts["xfail"], opts["xfail-sims"] = m.group(2) or "known gap", "msim"

@@ -461,6 +461,7 @@ inline ClassInfo* classInfo(const slang::ast::Type& t) {
 struct LowerResult {
     std::vector<std::unique_ptr<DpiFunc>> dpi;   // DPI imports and exports (35)
     std::vector<std::string> scopes;             // every instance and package, for svGetScopeFromName
+    std::unordered_map<const slang::ast::Symbol*, int> sigOf;   // variable / net -> signal (VPI, 37)
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
@@ -1420,6 +1421,111 @@ struct Lowerer {
         return ref(tmp, f->retSgn);
     }
 
+    // A call of a user system task or function registered through VPI
+    // (38.37). A variable or net argument is passed as itself (the C side
+    // reads and writes it); any other expression is evaluated into a
+    // temporary just before the call. A function's result is whatever the
+    // calltf puts on the call handle (vpi_put_value), read right after it.
+    static std::vector<std::unique_ptr<VpiSite>>& vpiSites() {
+        static std::vector<std::unique_ptr<VpiSite>> v;
+        return v;
+    }
+    E emitVpiCall(const slang::ast::CallExpression& call, const VpiSystfInfo& info, bool wantValue) {
+        using namespace slang::ast;
+        auto site = std::make_unique<VpiSite>();
+        site->systf = info.idx;
+        site->func = info.func;
+        for (const Expression* a0 : call.arguments()) {
+            VpiArg va;
+            const Expression& a = *a0;
+            if (a.kind == ExpressionKind::EmptyArgument) { site->args.push_back(va); continue; }
+            if (a.kind == ExpressionKind::ArbitrarySymbol) {
+                const Symbol* sym = a.as<ArbitrarySymbolExpression>().symbol;
+                if (sym && sym->kind == SymbolKind::Instance) {
+                    va.kind = VpiArg::Scope;
+                    va.sym = sym;
+                    site->args.push_back(va);
+                    continue;
+                }
+                unsupported("this argument of a VPI system task");
+            }
+            va.vtype = a.getConstant() || a.kind == ExpressionKind::StringLiteral ? 7 : 39;   // vpiConstant, vpiOperation
+            if (a.kind == ExpressionKind::StringLiteral) {
+                va.kind = VpiArg::String;
+                va.text = std::string(a.as<StringLiteral>().getValue());
+                site->args.push_back(va);
+                continue;
+            }
+            const Type& t = *a.type;
+            if (ValueExpressionBase::isKind(a.kind) && t.isIntegral()) {
+                const Symbol* sym = &a.as<ValueExpressionBase>().symbol;
+                if (auto it = sigmap.find(sym); it != sigmap.end() && !symOverride.count(sym) && !localMap().count(sym)) {
+                    va.kind = VpiArg::Signal;
+                    va.sig = it->second;
+                    va.w = (int)t.getBitWidth();
+                    va.sgn = t.isSigned();
+                    va.sym = sym;
+                    site->args.push_back(va);
+                    continue;
+                }
+            }
+            va.kind = VpiArg::Value;
+            Instr i;
+            i.k = IK::Assign;
+            if (t.isFloating()) {
+                va.real = true;
+                va.w = 64;
+                i.e = realOf(a);
+            } else if (t.isString()) {
+                va.str = true;
+                va.w = 64;
+                i.e = expr(a);
+            } else if (t.isIntegral()) {
+                va.w = (int)t.getBitWidth();
+                va.sgn = t.isSigned();
+                i.e = expr(a);
+            } else {
+                unsupported("an argument of this type to a VPI system task");
+            }
+            va.sig = i.sig = fresh(va.w);
+            prog.emit(i);
+            site->args.push_back(va);
+        }
+        if (info.func) {
+            site->retReal = info.ftype == 2;   // vpiRealFunc
+            site->retW = site->retReal || info.ftype == 3 ? 64 : info.ftype == 1 ? 32 : info.size;
+            site->retSgn = info.ftype == 1 || info.ftype == 5;
+            site->ret = fresh(site->retW);
+        }
+        if (srcMgr()) {
+            auto loc = call.sourceRange.start();
+            site->file = std::string(srcMgr()->getFileName(loc));
+            site->line = (int)srcMgr()->getLineNumber(loc);
+        }
+        for (const Scope* sc = scope; sc; sc = sc->asSymbol().getParentScope()) {
+            const Symbol& sy = sc->asSymbol();
+            if (sy.kind == SymbolKind::InstanceBody) {
+                site->scope = sy.as<InstanceBodySymbol>().parentInstance;
+                break;
+            }
+        }
+        Instr c;
+        c.k = IK::Vpi;
+        c.vpi = site.get();
+        prog.emit(c);
+        int ret = site->ret, retW = site->retW;
+        bool sgn = site->retSgn;
+        vpiSites().push_back(std::move(site));
+        if (!wantValue) return {};
+        int tmp = fresh(retW);
+        Instr i;
+        i.k = IK::Assign;
+        i.sig = tmp;
+        i.e = ref(ret, sgn);
+        prog.emit(i);
+        return ref(tmp, sgn);
+    }
+
     // A call of an automatic subroutine (13.3.2): its arguments go straight
     // into the new frame; outputs and the result are copied out of the frame
     // it returned from (relative mode kRelRet) right after the call.
@@ -1988,6 +2094,8 @@ struct Lowerer {
                 }
                 std::string_view n = call.getSubroutineName();
                 auto args = call.arguments();
+                if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end() && vi->second.ftype == 2)
+                    return un(Op::AsReal, emitVpiCall(call, vi->second, true));   // a VPI real function (38.37)
                 if (n == "$get_coverage") return sysFnNode(SF_CG, {}, CG_GLOBAL);   // 19.9
                 if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));   // s.atoreal()
                 if (n == "$realtime") { E t = node(Op::RealTime); t->k = mk(ticksPerUnit(), 64); return t; }
@@ -3238,6 +3346,10 @@ struct Lowerer {
                     return sized(std::move(v), w, e.type->isSigned(), ctx);
                 }
                 std::string_view n = call.getSubroutineName();
+                if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end()) {   // VPI (38.37)
+                    if (vi->second.func && vi->second.ftype == 2) unsupported("a VPI real function as an integral value");
+                    return sized(emitVpiCall(call, vi->second, true), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                }
                 if (n == "randomize") return sized(randomizeCall(call), 32, true, ctx);
                 if (n == "rand_mode" || n == "constraint_mode") return sized(randModeCall(call, true), 32, true, ctx);
                 if ((n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor") && !call.arguments().empty() &&
@@ -4712,6 +4824,10 @@ struct Lowerer {
     void sysCall(const slang::ast::CallExpression& call) {
         using namespace slang::ast;
         std::string_view n = call.getSubroutineName();
+        if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end()) {   // VPI (38.37)
+            emitVpiCall(call, vi->second, false);
+            return;
+        }
         if (n == "randomize") { randomizeCall(call); return; }
         if (n == "rand_mode" || n == "constraint_mode") { randModeCall(call, false); return; }
         if (n == "$cast" && call.arguments().size() == 2 && isHandleType(*outArg(*call.arguments()[0]).type)) {
@@ -7337,6 +7453,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     Lowerer::svaLocalSigs().clear();
     Lowerer::svaLiveSigs().clear();
     sigInfo().clear();
+    Lowerer::vpiSites().clear();
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
     Lowerer::compilation() = &comp;
@@ -7830,5 +7947,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (!blockIds().roots.count(blockIds().of(b)))
             Lowerer::unsupported(("disable of block '" + std::string(b->name) +
                                   "' from outside it, unless it is a whole initial or fork branch").c_str());
+    out.sigOf = sigmap;
     return out;
 }
