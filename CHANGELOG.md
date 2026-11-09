@@ -11,8 +11,10 @@ Spec references are IEEE 1800-2023 clauses.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
-  `-rerun`, `results.json` / `junit.xml` / `report.html`, and `-spec` to run
-  the spec suite on any of them.
+  `-rerun`, `results.json` / `junit.xml` / `report.html`, `@xfail` known gaps
+  (XPASS is an error) and `@exit`, and `-spec` to run the spec suite on any
+  of them, honouring `//! xfail:` / `//! exit:` and printing a per-chapter
+  pass table.
 - FST waveforms: `msim -fst [file]`, `+fst`, or `-vcd file.fst`, in the
   interpreter and in `-compile` (libfst from GTKWave, MIT, fetched at build;
   `-DMINISIM_WITH_FST=OFF` builds VCD only).
