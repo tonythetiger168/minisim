@@ -117,7 +117,7 @@ public:
              "}\n\n";
         for (size_t i = 0; i < sysArgs_.size(); i++) o << "static std::vector<E> A" << i << ";\n";
         for (size_t i = 0; i < events_.size(); i++) o << "static std::vector<std::pair<int, Edge>> EV" << i << ";\n";
-        o << "static bool pclean = false;   // every private signal is known (no X or Z bit)\n";
+        o << "static std::atomic<bool> pclean{false};   // every private signal is known (no X or Z bit)\n";
         // Private signals start as their S.sigs counterparts do: a variable X, a net Z.
         for (size_t s = 0; s < priv_.size(); s++)
             if (priv_[s]) {
@@ -748,6 +748,7 @@ private:
             for (auto& [sg, ed] : pr.seqEv) if (sg >= 0 && (size_t)sg < clock_.size()) clock_[sg] = 1;
         struct Slot { int sig, hi, lo; };
         std::vector<Slot> slots;
+        std::vector<int> slotProc;   // the domain process of each slot
         std::ostringstream fns, fns2;
         // 2-state mode: when no signal the domain reads holds X or Z, every
         // statement takes its 2-state path, so a second copy without the
@@ -779,6 +780,7 @@ private:
                         if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
                         int k = (int)slots.size();
                         slots.push_back({i.sig, i.hi, i.lo});
+                        slotProc.push_back(n);
                         std::string g, u, sl;
                         bool sp = i.hi < 0 && split(i.e, g, u, sl);
                         if (sp) fns2 << " V" << k << " = " << u << "; H" << k << " = 1;\n";
@@ -823,10 +825,12 @@ private:
         o << "}\n";
         // Comb statements first: their reads are part of `ext`, which twoNow checks.
         std::vector<std::string> combStmts, combStmts2, commitStmts;
+        std::vector<const Instr*> combIns;
         for (int i : byRank)
             for (const Instr& in : procs[i].prog->code) {
                 if (in.k != IK::Assign) break;
                 combStmts.push_back("   " + fassign(in));
+                combIns.push_back(&in);
                 noteRefs(in.e);
                 std::string g, u, sl;
                 if (in.hi >= 0 || !split(in.e, g, u, sl)) { two = false; continue; }
@@ -860,10 +864,92 @@ private:
             for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j] << "_2";
             o << "};\n";
         }
+        // Islands (like the kernel's partitions): processes and comb statements
+        // that share no signal the domain writes. When every domain target is
+        // private, each group of islands runs its NBAs, commit and comb logic
+        // on one thread with no locks: the groups write disjoint variables.
+        std::vector<int> isl;          // per signal: union-find parent
+        isl.resize(sigW_.size());
+        for (size_t x = 0; x < isl.size(); x++) isl[x] = (int)x;
+        std::function<int(int)> find = [&](int x) { while (isl[x] != x) x = isl[x] = isl[isl[x]]; return x; };
+        auto unite = [&](int a, int b) { a = find(a); b = find(b); if (a != b) isl[std::max(a, b)] = std::min(a, b); };
+        std::vector<char> written(sigW_.size(), 0);
+        bool allPriv = two;
+        for (auto& sl : slots) { written[sl.sig] = 1; if (!isPriv(sl.sig)) allPriv = false; }
+        for (auto* in : combIns) { written[in->sig] = 1; if (!isPriv(in->sig)) allPriv = false; }
+        auto refsOf = [&](const E& e, std::vector<int>& out) {
+            std::function<void(const E&)> f = [&](const E& x) {
+                if (!x) return;
+                if (x->op == Op::Ref && x->sig >= 0 && (size_t)x->sig < written.size() && written[x->sig]) out.push_back(x->sig);
+                for (auto& k : x->kids) f(k);
+            };
+            f(e);
+        };
+        std::map<int, int> procSig;    // domain process -> one of its targets
+        for (size_t k = 0; k < slots.size(); k++) {
+            int n = slotProc[k];
+            if (!procSig.count(n)) procSig[n] = slots[k].sig;
+            unite(procSig[n], slots[k].sig);
+        }
+        for (int n : dom) {
+            if (!procSig.count(n)) { allPriv = false; continue; }
+            std::vector<int> rs;
+            for (auto& in : procs[n].prog->code) refsOf(in.e, rs);
+            for (int r : rs) unite(procSig[n], r);
+        }
+        for (auto* in : combIns) {
+            std::vector<int> rs;
+            refsOf(in->e, rs);
+            for (int r : rs) unite(in->sig, r);
+        }
+        std::map<int, int> islandId;
+        auto islandOf = [&](int sig) {
+            int r = find(sig);
+            auto it = islandId.find(r);
+            if (it != islandId.end()) return it->second;
+            int id = (int)islandId.size();
+            islandId[r] = id;
+            return id;
+        };
+        for (int n : dom) if (procSig.count(n)) islandOf(procSig[n]);
+        for (auto* in : combIns) islandOf(in->sig);
+        int nIsl = (int)islandId.size();
+        const int kGroups = 64;
+        bool par = allPriv && nIsl >= 32;
+        int G = par ? std::min(nIsl, kGroups) : 0;
+        auto groupOf = [&](int sig) { return (int)((int64_t)islandOf(sig) * G / nIsl); };
+        if (par) {
+            std::vector<std::vector<int>> gProcs(G);
+            for (int n : dom) gProcs[groupOf(procSig[n])].push_back(n);
+            for (int g = 0; g < G; g++) {
+                o << "static void dsG" << g << "(bool two) {\n    if (two) {";
+                for (int n : gProcs[g]) o << " ds" << n << "_2();";
+                o << " } else {";
+                for (int n : gProcs[g]) o << " ds" << n << "();";
+                o << " }\n}\n";
+            }
+            for (int g = 0; g < G; g++) o << "static void cmG" << g << "(bool);\n";
+            o << "static void (*const CMG[])(bool) = {";
+            for (int g = 0; g < G; g++) o << (g ? ", " : "") << "cmG" << g;
+            o << "};\n";
+            o << "static void (*const DSG[])(bool) = {";
+            for (int g = 0; g < G; g++) o << (g ? ", " : "") << "dsG" << g;
+            o << "};\n";
+        }
         o << "static void dseq(const void*, std::vector<Sim::NbaItem>& nb) {\n";
-        if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
-        o << "    for (auto f : DS) f();\n"
-             "    nb.push_back({-1, Val{}, -1, 0});\n}\n";
+        if (par)
+            // Nothing else runs before the NBA region (S.fuseOk()): each group
+            // computes, commits and settles its islands in one parallel pass.
+            o << "    if (S.fuseOk()) {\n"
+                 "        const bool t = twoNow();\n"
+                 "        S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); CMG[g](t); });\n"
+                 "        if (!t) scanP();\n"
+                 "        if (S.observed) syncP();\n"
+                 "        return;\n    }\n"
+                 "    { const bool t = twoNow(); S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); }); }\n";
+        else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
+        if (!par) o << "    for (auto f : DS) f();\n";
+        o << "    nb.push_back({-1, Val{}, -1, 0});\n}\n";
         // Both are split into functions of at most kChunk statements: one huge
         // function takes the C++ compiler minutes and is no faster.
         const int kChunk = 64;
@@ -903,6 +989,27 @@ private:
         } else
             for (int j = 0; j < nc; j++) o << "    combP" << j << "();\n";
         o << "    if (S.observed) syncP();\n}\n";
+        if (par) {
+            // Per group: its slots' commits, then its comb statements in rank order.
+            std::vector<std::string> gCommit(G), gComb(G), gComb2(G);
+            for (size_t k = 0; k < slots.size(); k++) gCommit[groupOf(slots[k].sig)] += commitStmts[k];
+            for (size_t j = 0; j < combIns.size(); j++) {
+                int g = groupOf(combIns[j]->sig);
+                gComb[g] += combStmts[j];
+                gComb2[g] += combStmts2[j];
+            }
+            for (int g = 0; g < G; g++)
+                o << "static void cmG" << g << "(bool two) {\n    const bool obs = false; (void)obs;\n" << gCommit[g]
+                  << "    if (two) {\n" << gComb2[g] << "    } else {\n" << gComb[g] << "    }\n}\n";
+            // twoNow() before the commits: in 2-state mode every slot holds a
+            // known value, so the commits keep every private signal known.
+            o << "static void fcommit() {\n"
+                 "    const bool t = twoNow();\n"
+                 "    S.parallelFor(" << G << ", [t](size_t g) { CMG[g](t); });\n"
+                 "    if (!t) scanP();\n"
+                 "    if (S.observed) syncP();\n}\n\n";
+            return;
+        }
         o << "static void fcommit() {";
         for (int j = 0; j < nm; j++) o << " commitP" << j << "();";
         o << " S.fastCombs(combAll); if (S.observed) syncP(); }\n\n";
