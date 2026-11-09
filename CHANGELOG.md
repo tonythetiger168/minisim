@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Arrays of instances and of interfaces (23.3.3, 25.3), including
+  multidimensional instance arrays and per-element port slicing.
 - System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),
   `$system`, the array query functions on every kind of dimension,
   `$typename`, and the VCD tasks (`$dumpfile`, `$dumpvars` with a level and
