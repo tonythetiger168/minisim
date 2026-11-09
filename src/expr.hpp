@@ -1326,7 +1326,12 @@ enum class Op {
     // their run-time widths, then cut into lo-bit slices from the right and
     // reversed when lo > 0, then left-aligned into hi bits (hi < 0: as is).
     DynBits, StreamPack,
-    DynHas     // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
+    DynHas,    // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
+    // Classes (8). A handle is the first signal id of its object (0: null).
+    This,      // the running method's `this`
+    IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
+    Addr,      // the signal id of slot `sig` of the object kids[0] names, or 0 for null
+    AddrOf     // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
 };
 // System functions computed by Op::SysFn.
 enum SysFnId : int {
@@ -1359,8 +1364,12 @@ enum SysFnId : int {
     SF_FSEEK,        // $fseek(fd, offset, whence), $rewind(fd) is fseek(fd, 0, 0)
     SF_FERROR,       // $ferror(fd, str): 0, no error text kept
     SF_SR2BITS,      // $shortrealtobits (20.5)
-    SF_BITS2SR       // $bitstoshortreal
+    SF_BITS2SR,      // $bitstoshortreal
+    SF_CG            // a covergroup operation (19): lo is the CgOp, run by g_cgHook
 };
+// Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
+enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
+inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
 // suffix, and a minimum width of 20.
@@ -1407,6 +1416,10 @@ struct Expr {
     bool sgn = false;    // Ref result, or Resize result
     std::vector<E> kids;
     std::shared_ptr<const ArrShape> arr;   // ArrRead
+    // Ref of a class property through a handle (h.x): the object is at[0]'s
+    // value, and sig is the property's slot in it. Read only when evaluated,
+    // so `h != null && h.x` never touches a null h.
+    std::shared_ptr<Expr> at;
 };
 
 inline E node(Op op, std::vector<E> kids = {}) {
@@ -1851,6 +1864,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         }
         case SF_FERROR: return sint(0);
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
+        case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
         case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();
@@ -1903,13 +1917,18 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
 //            reaches its parent's locals at depth 1),
 // mode 8:    a property of `this` (the running method's object),
 // mode 9:    a slot of the frame that the last call returned from (the
-//            caller copies a function result and output arguments from it).
+//            caller copies a function result and output arguments from it),
+// mode 10:   indirect: signal `offset` holds the signal id,
+// mode 11+d: indirect: slot `offset` of the frame d levels up (d < 5) holds
+//            the signal id. Op::Addr makes such an id for a property reached
+//            through a handle (h.q, h.a[i]); a `ref` argument (13.5.2)
+//            holds its actual's id. The slot holds id + 1, so 0 is null.
 // An object is a block of signals too; a handle holds its first signal id
 // (0 is null). Every relative id stays inside its mode as long as the
 // offset is below 2^26, so arr->base + k still resolves correctly.
 constexpr int kRel = 1 << 30;
 constexpr int kRelOffBits = 26;
-constexpr int kRelThis = 8, kRelRet = 9;
+constexpr int kRelThis = 8, kRelRet = 9, kRelIndSig = 10, kRelIndFrame = 11;   // kRelIndFrame + depth, up to 15
 inline int relSig(int mode, int off) { return kRel | (mode << kRelOffBits) | off; }
 inline bool isRel(int s) { return s >= kRel; }
 inline int relMode(int s) { return (s >> kRelOffBits) & 15; }
@@ -1928,6 +1947,12 @@ struct FrameLayout {
 inline int (*g_allocSigs)(const FrameLayout&) = nullptr;
 inline void (*g_initSigs)(const FrameLayout&, int base) = nullptr;
 inline void (*g_nullAccess)() = nullptr;
+inline Val (*g_getSig)(int) = nullptr;
+inline bool (*g_isA)(int obj, int cls) = nullptr;   // is object obj of class cls or one derived from it
+// > 0 while an Op::Addr computes an address: reading through a null handle
+// there gives null (the access that uses the address reports it, if it runs).
+inline int g_nullOk = 0;
+inline int g_nullSig = 0;   // a signal that always holds 0, read in place of a null object's slot
 struct Frame {
     int base = 0;                    // first signal of this frame's slots
     int self = 0;                    // `this` (a handle), 0 outside methods
@@ -1969,6 +1994,22 @@ inline int relSlow(int s) {
         if (!g_ret) relFail("no returned frame");
         return g_ret->base + off;
     }
+    if (m >= kRelIndSig) {
+        int at = off;
+        if (m >= kRelIndFrame) {
+            Frame* f = g_fr;
+            for (int d = 0; d < m - kRelIndFrame && f; d++) f = f->up.get();
+            if (!f) relFail("indirect id outside a frame");
+            at = f->base + off;
+        }
+        Val a = g_getSig(at);   // the signal id + 1; 0 is a null handle
+        if (a.x || !a.v) {
+            if (g_nullOk) return g_nullSig;
+            if (g_nullAccess) g_nullAccess();
+            relFail("null object access");
+        }
+        return (int)a.v - 1;
+    }
     Frame* f = g_fr;
     for (int d = 0; d < m && f; d++) f = f->up.get();
     if (!f) relFail("automatic variable outside its frame");
@@ -1984,9 +2025,33 @@ inline Val eval(const E& e, const Reader& rd) {
     switch (e->op) {
         case Op::Const: return e->k;
         case Op::Ref: {
+            if (e->at) {   // h.x
+                Val h = eval(e->at, rd);
+                if (h.x || !h.v) {
+                    if (g_nullOk) return make(0, 0, 64);
+                    if (g_nullAccess) g_nullAccess();
+                    relFail("null object access");
+                }
+                Val v = rd((int)h.v + e->sig);
+                v.sgn = e->sgn;
+                return v;
+            }
             Val v = rd(R(e->sig));
             v.sgn = e->sgn;
             return v;
+        }
+        case Op::This: return make(g_fr ? (uint64_t)g_fr->self : 0, 0, 64);
+        case Op::IsA: {
+            Val h = k(0);
+            if (h.x || !h.v) return mk(1, 1);
+            return mk(g_isA ? g_isA((int)h.v, e->hi) : 0, 1);
+        }
+        case Op::AddrOf: return make((uint64_t)R(e->sig) + 1, 0, 64);
+        case Op::Addr: {
+            g_nullOk++;
+            Val h = k(0);
+            g_nullOk--;
+            return make(h.x || !h.v ? 0 : h.v + (uint64_t)e->sig + 1, 0, 64);
         }
         case Op::Not: return v_not(k(0));
         case Op::And: return v_and(k(0), k(1));
@@ -2239,7 +2304,7 @@ inline Val eval(const E& e, const Reader& rd) {
             }
             int64_t off = a.offset(idx);
             if (off < 0) return bad;
-            Val r = rd(R(a.base + (int)off));
+            Val r = rd(R(a.base) + (int)off);
             r.sgn = a.sgn;
             return r;
         }
@@ -2249,9 +2314,15 @@ inline Val eval(const E& e, const Reader& rd) {
 
 inline void collectAddrs(const E& e, std::vector<int>& out) {
     if (!e) return;
+    if (e->op == Op::Ref && e->at) {   // h.x: the slot of the object h names now
+        Val h = eval(e->at, [](int s) { return g_getSig(s); });
+        if (!h.x && h.v) out.push_back((int)h.v + e->sig);
+        collectAddrs(e->at, out);
+        return;
+    }
     if (e->op == Op::Ref) out.push_back(R(e->sig));
     if (e->op == Op::ArrRead)
-        for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base + i));
+        for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base) + i);
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) out.push_back(R(e->sig));
     for (auto& k : e->kids) collectAddrs(k, out);
 }
@@ -2260,15 +2331,18 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
 // process may be running.
 inline E bindRel(const E& e) {
     if (!e) return e;
-    bool rel = isRel(e->sig) && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynSize ||
-                                 e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas);
+    bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynSize ||
+                                            e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas);
+    if (e->op == Op::This) return konst(make(g_fr ? (uint64_t)g_fr->self : 0, 0, 64));
     bool arel = e->op == Op::ArrRead && e->arr && isRel(e->arr->base);
     std::vector<E> kids;
     bool kch = false;
     for (auto& k : e->kids) { kids.push_back(bindRel(k)); kch |= kids.back() != k; }
-    if (!rel && !arel && !kch) return e;
+    E at = bindRel(e->at);
+    if (!rel && !arel && !kch && at == e->at) return e;
     auto c = std::make_shared<Expr>(*e);
     c->kids = std::move(kids);
+    c->at = at;
     if (rel) c->sig = R(e->sig);
     if (arel) { auto a = std::make_shared<ArrShape>(*e->arr); a->base = R(a->base); c->arr = a; }
     return c;

@@ -1,6 +1,5 @@
 // IEEE 1800-2023 8.4: A class with a property, a constructor and a method
 // (8.4-8.7).
-//! xfail: classes are not supported (round 7)
 module top;
   class C;
     int a;

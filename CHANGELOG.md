@@ -34,6 +34,13 @@ Spec references are IEEE 1800-2023 clauses.
 - CI recipes: `ci/Jenkinsfile`, a declarative Jenkins pipeline (JUnit, HTML
   reports, LCOV coverage, `-rerun` on failure), and `ci/README.md` on the
   files mregress and mcov write for a CI job.
+- Classes (8): objects, constructors, static members, `this`, shallow copy,
+  inheritance, `super`, virtual and pure virtual methods, abstract and
+  parameterized classes, interface classes, typed constructors `D::new`,
+  `$cast` on class handles, out-of-block methods, `std::weak_reference`.
+- Arrays, dynamic arrays and queues as subroutine arguments (7.7).
+- msim compiles as IEEE 1800-2023 by default (slang's default was 2017);
+  `--std` still selects another version.
 - Automatic subroutines get a frame per call (6.21, 13.3.2, 13.4.2): recursion,
   automatic tasks called from several processes at once, and
   `fork automatic int j = i; ... join_none` with one copy per fork. This is

@@ -196,6 +196,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                     : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
                     : !asserts().empty() ? "an assertion"
                     : !clockings().empty() ? "a clocking block"
+                    : !cgDefs().empty() ? "a covergroup"
                     : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -430,6 +431,10 @@ int main(int argc, char** argv) {
         fwd.push_back(a);
     }
     plusArgs() = plusargs;
+    // The language is IEEE 1800-2023 unless --std says otherwise (slang's
+    // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (std::none_of(fwd.begin(), fwd.end(), [](const std::string& s) { return startsWith(s, "--std"); }))
+        fwd.push_back("--std=1800-2023");
     if (seed) {   // the $urandom stream (18.13); $random keeps its own seed (Annex N)
         uint64_t st = (seed + 1) * 0x9E3779B97F4A7C15ull;
         urandomState() = st ? st : 1;
@@ -544,6 +549,7 @@ int main(int argc, char** argv) {
     for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
     startConcAsserts();
     startClockings();
+    startCovergroups();
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
