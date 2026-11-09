@@ -3,6 +3,7 @@
 // join_none fork in a loop therefore gives each set of branches its own
 // copy of the loop index. An automatic variable inside a branch is
 // initialized when the branch starts, after the loop has moved on.
+//! icarus-skip: Icarus 13 does not support automatic variables in a static block
 module top;
   initial begin
     for (int i = 0; i < 3; i++)
