@@ -452,7 +452,7 @@ struct Sim {
         nbaSerial.clear();
         partsBusy.clear();
         for (auto& n : nbaRun) {
-            int p = sigPart[n.s];
+            int p = (size_t)n.s < sigPart.size() ? sigPart[n.s] : -1;   // frame and object signals come later
             if (p >= 0) {
                 if (parts[p].items.empty()) partsBusy.push_back(p);
                 parts[p].items.push_back(n);
@@ -1385,6 +1385,33 @@ struct Sim {
 };
 
 Sim S;
+
+// Frames and objects (expr.hpp): blocks of hidden signals made at run time.
+static int allocFrameSigs(const FrameLayout& L) {
+    int base = -1;
+    for (size_t k = 0; k < L.w.size(); k++) {
+        int s = S.sig("$f", L.w[k]);
+        if (!k) base = s;
+    }
+    return base;
+}
+// A frame's slots start at their initial values, with no events: nothing
+// can be waiting on a frame that is just being made.
+static void initFrameSigs(const FrameLayout& L, int base) {
+    for (size_t k = 0; k < L.w.size(); k++) {
+        Val v = L.init[k];
+        int w = L.w[k];
+        if (w <= 64) { uint64_t m = mask(w); v.v &= m; v.x &= m; v.z &= m; v.hi.clear(); }
+        v.sgn = false;
+        S.sigs[base + (int)k].val = v;
+    }
+    for (auto& [off, o] : L.dyn) dynStore()[base + off] = o;
+}
+static void nullAccess() {
+    cerr << "error: null object access at time " << S.now << "\n";
+    exit(1);
+}
+static const bool frameHooks = (g_allocSigs = allocFrameSigs, g_initSigs = initFrameSigs, g_nullAccess = nullAccess, true);
 
 // ---- awaiters ----
 struct Delay {

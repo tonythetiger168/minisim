@@ -43,6 +43,10 @@ Spec references are IEEE 1800-2023 clauses.
 - CI recipes: `ci/Jenkinsfile`, a declarative Jenkins pipeline (JUnit, HTML
   reports, LCOV coverage, `-rerun` on failure), and `ci/README.md` on the
   files mregress and mcov write for a CI job.
+- Automatic subroutines get a frame per call (6.21, 13.3.2, 13.4.2): recursion,
+  automatic tasks called from several processes at once, and
+  `fork automatic int j = i; ... join_none` with one copy per fork. This is
+  the base for class methods (8).
 
 ## [0.1.0] - unreleased
 
