@@ -14,6 +14,10 @@ Spec references are IEEE 1800-2023 clauses.
   a master path for a model that drives the bus itself (`include/mvp.h`,
   `mvp_tlm.h`). A memory and a 16550-style UART are bundled in `mvp/models/`.
   See `docs/VPROTO.md`.
+- Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
+  `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
+  Negative `$setuphold` / `$recrem` limits with delayed signals under
+  `+neg_tchk` (31.9).
 - Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
   `always_ff` on sampled values, checker variables and free variables, all
   in the reactive region set. Before this, checker instances were ignored.

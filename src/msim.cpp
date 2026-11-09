@@ -10,6 +10,8 @@
 //   -top <name>      same as --top (the VCS / irun spelling)
 //   -vcd [<file>]    write a VCD waveform (default file dump.vcd)
 //   +vcd             same as -vcd dump.vcd
+//   +notimingcheck   turn off the specify block timing checks (31)
+//   +neg_tchk        allow negative $setuphold / $recrem limits (31.9)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
@@ -506,6 +508,8 @@ static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
+                 "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
+                 "  +neg_tchk      allow negative $setuphold / $recrem limits, with delayed signals\n"
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
                  "  -maxtime <n>   stop after simulation time n\n"
@@ -588,6 +592,8 @@ int main(int argc, char** argv) {
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
+        if (a == "+notimingcheck" || a == "+notimingchecks") { timingChecksOn() = false; continue; }
+        if (a == "+neg_tchk") { negTimingChecks() = true; continue; }
         if (a == "+fst") { vcdPath = "dump.fst"; continue; }
         if (a == "-cov") {
             g_cov = true;
@@ -815,6 +821,10 @@ int main(int argc, char** argv) {
         threads = 1;
     }
     Plan pl = plan(lowered, staticComb, staticSeq);
+    if (compiled && timingChecksOn() && !timingChecks().empty()) {
+        std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
     bool anyReactive = false;
     for (auto& lp : lowered.procs) anyReactive |= lp.reactive;
     if (compiled && (lowered.programs || anyReactive)) {
@@ -898,6 +908,7 @@ int main(int argc, char** argv) {
     startConcAsserts();
     startClockings();
     startCovergroups();
+    startTimingChecks();
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
