@@ -67,6 +67,12 @@
 //                    mvp_irq_slave, mvp_clock) and the runtime its models use.
 //                    Give your model C files on the command line as well; the
 //                    bundled examples are in <prefix>/share/minisim/mvp/models
+//   -uvm             the Accellera UVM library (IEEE 1800.2) in $UVM_HOME:
+//                    +incdir+$UVM_HOME/src, uvm_pkg.sv, and UVM's C code
+//                    (regular expressions, command line, HDL backdoor over
+//                    VPI) built from uvm/uvm_dpi_minisim.cc
+//   -uvmhome <dir>   the same with the library in <dir>
+//   -uvmnodpi        the same without the C code (+define+UVM_NO_DPI)
 //   -CFLAGS <s>      extra flags for compiling the C files
 //   -LDFLAGS <s>     extra flags for linking them (e.g. -lm)
 //
@@ -195,6 +201,19 @@ static std::string mvpDir() {
         if (std::filesystem::exists(inst / "mvp.c", ec)) return inst.string();
     }
     return std::string(MINISIM_SRC_DIR) + "/../mvp";
+}
+
+// minisim's build of UVM's C code (uvm/uvm_dpi_minisim.cc), next to an
+// installed msim or in the source tree.
+static std::string uvmDpiDir() {
+    if (const char* e = std::getenv("MINISIM_UVM")) return e;
+    std::error_code ec;
+    auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        auto inst = exe.parent_path().parent_path() / "share" / "minisim" / "uvm";
+        if (std::filesystem::exists(inst / "uvm_dpi_minisim.cc", ec)) return inst.string();
+    }
+    return std::string(MINISIM_SRC_DIR) + "/../uvm";
 }
 
 static bool hasExt(const std::string& a, std::initializer_list<const char*> exts) {
@@ -612,6 +631,8 @@ static void usage() {
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
                  "  <file>.c       C or C++ for DPI-C imports; also -sv_lib / -sv_root / -dpiheader\n"
                  "  -mvp           add the virtual prototype layer (mvp_axil_slave and its runtime)\n"
+                 "  -uvm           compile the Accellera UVM library from $UVM_HOME, with its C code\n"
+                 "                 (-uvmhome <dir>: from <dir>; -uvmnodpi: without C, +define+UVM_NO_DPI)\n"
                  "  -load <lib>    load a VPI library before elaboration\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  -version       print the msim version\n"
@@ -641,6 +662,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
+    std::string uvmHome;    // -uvm / -uvmhome: a uvm-core checkout
+    bool uvmWanted = false, uvmNoDpi = false;
     bool buildDirGiven = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -795,11 +818,36 @@ int main(int argc, char** argv) {
             cFiles.push_back(d + "/mvp.c");
             continue;
         }
+        if (a == "-uvm") { uvmHome = uvmHome.empty() && std::getenv("UVM_HOME") ? std::getenv("UVM_HOME") : uvmHome; uvmWanted = true; continue; }
+        if (a == "-uvmhome") { uvmHome = next("a uvm-core directory"); uvmWanted = true; continue; }
+        if (a == "-uvmnodpi") { uvmNoDpi = uvmWanted = true; continue; }
         if (a == "-CFLAGS") { cflags += " " + next("flags"); continue; }
         if (a == "-LDFLAGS") { ldflags += " " + next("flags"); continue; }
         if (a.size() && a[0] != '-' && hasExt(a, {".c", ".cc", ".cpp", ".cxx", ".C", ".o", ".a"})) { cFiles.push_back(a); continue; }
         if (a.size() && a[0] != '-' && hasExt(a, {".so"})) { soFiles.push_back(a); continue; }
         fwd.push_back(a);
+    }
+    if (uvmWanted) {   // -uvm: the package first, then its C code (regex, command line, HDL backdoor)
+        if (uvmHome.empty() && std::getenv("UVM_HOME")) uvmHome = std::getenv("UVM_HOME");
+        if (uvmHome.empty()) { std::cerr << "msim: -uvm needs $UVM_HOME or -uvmhome <dir>\n"; return 2; }
+        std::string uvmSrc = uvmHome + "/src";
+        std::error_code ec0;
+        if (!std::filesystem::exists(uvmSrc + "/uvm_pkg.sv", ec0)) {
+            std::cerr << "msim: no " << uvmSrc << "/uvm_pkg.sv (is " << uvmHome << " a uvm-core checkout?)\n";
+            return 2;
+        }
+        fwd.insert(fwd.begin() + 1, {"+incdir+" + uvmSrc, uvmSrc + "/uvm_pkg.sv"});
+        if (uvmNoDpi) fwd.push_back("+define+UVM_NO_DPI");
+        else {
+            std::string d = uvmDpiDir();
+            std::error_code ec;
+            if (!std::filesystem::exists(d + "/uvm_dpi_minisim.cc", ec)) {
+                std::cerr << "msim: -uvm cannot find uvm_dpi_minisim.cc in " << d << " (set $MINISIM_UVM, or use -uvmnodpi)\n";
+                return 2;
+            }
+            cFiles.push_back(d + "/uvm_dpi_minisim.cc");
+            cflags += " -I" + shq(uvmSrc + "/dpi") + " -w";
+        }
     }
     for (auto& l : svLibs) soFiles.push_back(svLibPath(svRoot, l));
     plusArgs() = plusargs;
@@ -969,6 +1017,10 @@ int main(int argc, char** argv) {
     }
     if (earlyTmp) { std::error_code ec; std::filesystem::remove_all(earlyDir, ec); }   // the library stays mapped
 
+    // A context import may call VPI (35.5.3), as UVM's HDL backdoor does:
+    // VPI's object model is then set up as for a VPI library.
+    for (const auto& f : lowered.dpi)
+        if (f->context) vpi::st().active = true;
     // VPI: callbacks and calltf routines may touch any signal at any time,
     // so the design runs on one thread in the interpreter, every process
     // scheduled the plain way.
