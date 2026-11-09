@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Programs (24): program code runs in the reactive region set, programs end
+  with an implicit `$finish`, `$exit`, nested and anonymous programs.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,

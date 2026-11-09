@@ -1594,6 +1594,13 @@ struct Delay {
     }
     void await_resume() const {}
 };
+// A program process (24.3.1) woken in the active region set moves to the
+// reactive region, and runs there once the design is quiet.
+struct ToReactive {
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { S.reactive.push_back(h); S.rare = true; }
+    void await_resume() const {}
+};
 struct Wait {
     int sig; Edge e;
     bool await_ready() const { return false; }

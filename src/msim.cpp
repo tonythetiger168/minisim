@@ -138,7 +138,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
         std::vector<size_t> procOf;
         for (size_t i = 0; i < n; i++) {
             CombShape c;
-            if (combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
+            if (lowered.procs[i].program < 0 && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
         std::vector<size_t> order = combSchedule(shapes, &lv);
@@ -153,7 +153,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     }
     if (staticSeq)
         for (size_t i = 0; i < n; i++)
-            if (p.rank[i] < 0 && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
+            if (p.rank[i] < 0 && lowered.procs[i].program < 0 && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
     return p;
 }
 
@@ -496,6 +496,10 @@ int main(int argc, char** argv) {
         std::cerr << "msim: -compile: coverage is not compiled yet; using the interpreter\n";
         compiled = false;
     }
+    if (compiled && lowered.programs) {
+        std::cerr << "msim: -compile: programs are not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
     if (compiled) {
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle);
         if (st >= 0) return st;
@@ -540,6 +544,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
         if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
+        else if (lowered.procs[i].program >= 0) S.spawn(programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial"));
         else S.spawn(process(&lowered.procs[i].prog));
     }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at

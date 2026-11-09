@@ -369,6 +369,11 @@ struct ProcCtl {
     // Written before the process starts: a deferred assertion action's
     // captured arguments, written into their slots (16.4.1).
     vector<pair<Expr*, Val>> init;
+    // A program thread (24.3.1): the program instance, or -1. It and every
+    // thread it forks run in the reactive region set. progRoot: one of the
+    // program's initial procedures.
+    int program = -1;
+    bool progRoot = false;
     bool kidsDone() const {
         for (auto& k : kids) if (!k->ended) return false;
         return true;
@@ -378,9 +383,11 @@ inline unordered_map<int, vector<weak_ptr<ProcCtl>>>& rootProcs() {
     static unordered_map<int, vector<weak_ptr<ProcCtl>>> m;
     return m;
 }
+inline void programRootEnded(int p);
 inline void procEnd(ProcCtl& c) {
     if (c.ended) return;
     c.ended = true;
+    if (c.progRoot) programRootEnded(c.program);
     if (c.join) c.join->branchEnded();
     if (auto p = c.parent.lock())
         if (p->waitingFork && p->kidsDone()) { p->waitingFork = false; S.active.push_back(p->h); }
@@ -400,6 +407,34 @@ struct WaitFork {
 };
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+
+// ---- programs (24.3, 24.7) ----
+// When every initial procedure of a program has ended, the program ends:
+// the threads they forked are killed. When every program with an initial
+// procedure has ended, the run ends with an implicit $finish.
+struct ProgramRun { vector<shared_ptr<ProcCtl>> roots; int live = 0; bool ended = false; };
+inline vector<ProgramRun>& programRuns() { static vector<ProgramRun> v; return v; }
+inline int& programsLive() { static int n = 0; return n; }
+inline void programRootEnded(int p) {
+    ProgramRun& r = programRuns()[p];
+    if (--r.live > 0 || r.ended) return;
+    r.ended = true;
+    for (auto& c : r.roots) {
+        auto kids = c->kids;
+        for (auto& k : kids) procKill(k);
+    }
+    if (--programsLive() == 0) S.finished = true;
+}
+// $exit (24.7): end the calling thread's program. Outside a program it is
+// ignored, with a warning.
+inline void programExit(const shared_ptr<ProcCtl>& ctl) {
+    if (ctl->program < 0) {
+        std::cerr << "msim: warning: $exit outside a program is ignored (24.7)\n";
+        return;
+    }
+    auto roots = programRuns()[ctl->program].roots;
+    for (auto& c : roots) procKill(c);
+}
 static int doRandomize(int obj, const RandCall* rc);   // rand.inc
 static void randModeAll(int obj, bool blocks, bool on);
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
@@ -410,6 +445,21 @@ inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr)
 }
 // A top-level process (initial, always, final).
 inline Task process(const Prog* p) { return startProc(p, make_shared<ProcCtl>(), nullptr); }
+// A process of a program (24.3): an initial procedure, or a continuous assign.
+inline Task programProc(const Prog* prog, int program, bool initial) {
+    auto c = make_shared<ProcCtl>();
+    c->program = program;
+    if (initial) {
+        auto& runs = programRuns();
+        if ((size_t)program >= runs.size()) runs.resize(program + 1);
+        ProgramRun& r = runs[program];
+        if (r.roots.empty()) programsLive()++;
+        r.roots.push_back(c);
+        r.live++;
+        c->progRoot = true;
+    }
+    return startProc(prog, c, nullptr);
+}
 inline Task exec(const Prog* p) { return process(p); }
 
 // ---- assertions (16.3, 16.4, 20.11) ----
@@ -814,6 +864,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         if (f.fr != fr) { lastRet = std::move(fr); fr = std::move(f.fr); }
     };
     for (auto& [slot, v] : ctl->init) slot->k = v;
+    // A program thread runs in the reactive region set (24.3.1): it starts
+    // there, and goes back there after every wait.
+#define TO_REACTIVE if (__builtin_expect(ctl->program >= 0, 0) && S.region != R_REACTIVE) co_await ToReactive{}
+    TO_REACTIVE;
     while (p) {
         g_fr = fr.get();
         g_ret = lastRet.get();
@@ -901,12 +955,14 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     else co_await Wait{evbuf[0].first, evbuf[0].second};
                 } else if (i.events.size() > 1) co_await WaitAny{&i.events};
                 else co_await Wait{i.sig, i.edge};
+                TO_REACTIVE;
                 ctl->epoch++;   // a deferred assertion flush point (16.4.2)
                 pc++; break;
             case IK::WaitDelay: {
                 uint64_t d = i.delay;
                 if (i.de) { Val v = eval(i.de, rd); d = v_time(v); }
                 co_await Delay{d};
+                TO_REACTIVE;
                 pc++; break;
             }
             case IK::Display:
@@ -926,6 +982,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 if (S.finished) goto done;
                 pc++;
                 break;
+            case IK::Exit:
+                programExit(ctl);
+                if (ctl->killed) goto done;
+                pc++; break;
             case IK::Finish:
                 // Stop this process. The rest of this time slot still runs,
                 // including NBA and postponed, so a $strobe/$monitor already
@@ -1001,6 +1061,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     auto c = make_shared<ProcCtl>();
                     c->parent = ctl;
                     c->join = js;
+                    c->program = ctl->program;
                     ctl->kids.push_back(c);
                     FrameP bf = bn < i.blays.size() && i.blays[bn] ? newFrame(i.blays[bn], ff, ff ? ff->self : 0) : ff;
                     Task t = startProc(b, c, std::move(bf));
@@ -1008,7 +1069,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     S.active.push_back(t.h);
                 }
                 pc++;
-                if (i.join != 2) co_await JoinWait{js};
+                if (i.join != 2) { co_await JoinWait{js}; TO_REACTIVE; }
                 if (S.finished) goto done;
                 break;
             }
@@ -1024,6 +1085,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::WaitFork:
                 pc++;
                 co_await WaitFork{ctl};
+                TO_REACTIVE;
                 break;
             case IK::DisableFork:
                 for (auto& k : ctl->kids) procKill(k);
@@ -1040,6 +1102,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     if (t.x || t.v != S.now + 1) co_await Wait{i.sig, ANY};
                 } else
                     for (uint64_t k = 0; k < n; k++) co_await Wait{i.sig, ANY};
+                TO_REACTIVE;
                 ctl->epoch++;
                 pc++; break;
             }
@@ -1058,6 +1121,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
 done:
     procEnd(*ctl);
 }
+#undef TO_REACTIVE
 
 // The value of a one-assign combinational process, and its write
 // (Sim::Comb compute / commit). compute only reads signals.

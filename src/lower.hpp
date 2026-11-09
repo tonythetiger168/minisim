@@ -266,7 +266,10 @@ inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return 
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
 
-struct LoweredProc { Prog prog; bool loops; std::string kind; };
+// program: the index of the program instance (24) the process belongs to,
+// or -1. A program's initial procedures and continuous assigns run in the
+// reactive region set (24.3.1).
+struct LoweredProc { Prog prog; bool loops; std::string kind; int program = -1; };
 
 // One module-level task or function. Arguments and the function result are
 // signals (the formal and slang's returnValVar), shared by every call.
@@ -362,6 +365,7 @@ struct LowerResult {
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
+    int programs = 0;                 // program instances (24.3)
     std::vector<std::unique_ptr<FrameLayout>> layouts;   // frame shapes of automatic subroutines and fork branches
     std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
     std::vector<std::pair<int, uint8_t>> netKinds;                   // wand, wor, tri0, ... (6.6): signal, NetResolve
@@ -4086,6 +4090,7 @@ struct Lowerer {
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
+        if (n == "$exit") { Instr i; i.k = IK::Exit; prog.emit(i); return; }
         if (n == "$fatal" || n == "$error" || n == "$warning" || n == "$info") { severity(call, n); return; }
         if (assertCtlCall(call, n)) return;   // $asserton, $assertcontrol, ... (20.11)
         if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.push_back(x), aa.delete(k) ...
@@ -5297,7 +5302,11 @@ inline bool enterInstance(const slang::ast::InstanceSymbol& inst) {
     if (!inst.arrayPath.empty()) Lowerer::unsupported("instance array");
     // An interface instance (25.3) is lowered like a module instance: its
     // signals are named "bus.data", and its processes and tasks run as usual.
-    if (!inst.isTopLevel() && !inst.isModule() && !inst.isInterface()) Lowerer::unsupported("non-module instance");
+    // A program (24.3) is lowered like a module; its processes are marked
+    // and run in the reactive region set.
+    if (!inst.isTopLevel() && !inst.isModule() && !inst.isInterface() &&
+        inst.getDefinition().definitionKind != slang::ast::DefinitionKind::Program)
+        Lowerer::unsupported("non-module instance");
     return true;
 }
 
@@ -5528,7 +5537,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             lw.prog.emit(waitInstr(rs));
             Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
         }
-        out.procs.push_back({std::move(lw.prog), loops, "assign"});
+        out.procs.push_back({std::move(lw.prog), loops, "assign", program});
     }
 
     // Module-level `logic x = v;` (IEEE 1800-2023 10.5): a static variable's
@@ -5955,10 +5964,14 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
     }
 
+    int program = -1;   // the program instance being visited (24.3), or -1
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
         connectInstance(inst);
+        int saved = program;
+        if (inst.getDefinition().definitionKind == slang::ast::DefinitionKind::Program) program = out.programs++;
         visitDefault(inst);
+        program = saved;
     }
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
@@ -6043,7 +6056,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             else lw.prog.emit(waitInstr(rs));
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
-        out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind))});
+        out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind)),
+                             p.procedureKind == ProceduralBlockKind::Initial ? program : -1});
     }
 };
 

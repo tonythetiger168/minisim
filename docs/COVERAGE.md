@@ -16,7 +16,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 
 | Clause | Topic | Status | Notes / test |
 |---|---|---|---|
-| 4.4–4.9 | Scheduling regions | ✅ | preponed (sampled values), active, inactive (`#0`), NBA, observed, reactive, re-inactive, re-NBA, postponed; once the reactive set starts it runs until it is empty (4.5). Programs, which also run in the reactive set, are not supported yet (24). `4.9.4-nba-strobe`, `16.4-observed-final` |
+| 4.4–4.9 | Scheduling regions | ✅ | preponed (sampled values), active, inactive (`#0`), NBA, observed, reactive, re-inactive, re-NBA, postponed; once the reactive set starts it runs until it is empty (4.5). Program code runs in the reactive set (24). `4.9.4-nba-strobe`, `16.4-observed-final` |
 | 5.7.1 | Integer literals | ✅ | sized, unsized, x/z digits, signed (`'s`), and `'0` `'1` `'x` `'z` in any context. `5.7.1-unbased-unsized` |
 | 5.9 | String literals | 🟡 | up to 8 characters (64 bits). `5.9-string-literal` |
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |
@@ -127,6 +127,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 22.7 | `` `timescale `` | ✅ | per-module unit and precision; an element with none, in a design where others have one, gets 1ns/1ps (3.14.2.3; `--timescale` changes it); one kernel tick is the finest precision in the design, also used as the VCD `$timescale`. `22.7-timescale` |
 | 23.3 | Module instances, ports | ✅ | named and positional, parameter overrides; unpacked-array input and output ports, element by element. `7.6-array-ports` |
 | 23.6 | Hierarchical names | ✅ | read and write `u.x`, `blk[2].x`. `23.6-hierarchical-names` |
+| 24 | Programs | ✅ | Top-level, instantiated and nested programs (a nested one with no ports is instantiated once). Initial procedures and continuous assigns of a program, and every thread they fork or task they call, run in the reactive region set; `#0` goes to re-inactive and `<=` to re-NBA (24.3.1, 24.5). When all of a program's initial procedures end, the threads they forked are killed; when all programs end, the run ends with an implicit `$finish` (24.3). `$exit` (24.7); anonymous programs in packages (24.6). With `-compile`, a design with programs runs in the interpreter. Not checked: references to program signals from outside programs. `24.3-program`, `24.3.1-program-reactive`, `24.3.1-program-renba`, `24.3-program-end`, `24.3.2-program-assign`, `24.4-program-clocking`, `24.5-program-calls-module-task`, `24.6-anonymous-program`, `24.7-exit` |
 | 25.3 | Interfaces | 🟡 | interface instances with ports and parameters, interface ports (generic `cnt_if c` or `bus_if.src b`), signals, nets with continuous assigns, processes, tasks and functions inside, `bus.send()` from the instantiating module. Not yet: interface arrays, virtual interfaces (needs classes, 25.9). `25.3-interface-ports` |
 | 25.5 | Modports | 🟡 | input/output/inout lists and `import` of interface functions. Not yet: modport expressions (25.5.4), `export`. Directions are not enforced. `25.5-modports` |
 | 26 | Packages | ✅ | parameters, localparams, typedefs, enums, structs, variables (named `pkg::x` in the VCD), functions and tasks; wildcard and explicit import, `pkg::name`. `26.3-package-import`, `26.2-package-items` |

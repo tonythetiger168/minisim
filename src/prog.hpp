@@ -61,6 +61,7 @@ enum class IK {
     // of clockings()[dkey], take e at the clocking event `de` cycles on.
     CbDrive,
     AssertCtl,  // $assertcontrol (20.11): args are control, assertion and directive type, levels; fmt the targets
+    Exit,       // $exit (24.7): end the calling thread's program
     Ret         // pop that address; an empty stack ends the process
 };
 
