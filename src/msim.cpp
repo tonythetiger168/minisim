@@ -196,6 +196,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                     : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
                     : !asserts().empty() ? "an assertion"
                     : !clockings().empty() ? "a clocking block"
+                    : !cgDefs().empty() ? "a covergroup"
                     : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -544,6 +545,7 @@ int main(int argc, char** argv) {
     for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
     startConcAsserts();
     startClockings();
+    startCovergroups();
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;

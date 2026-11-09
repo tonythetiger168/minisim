@@ -88,6 +88,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 16.15, 16.16 | Default disable iff, clock inference | ✅ | `default disable iff`; the clock from the assertion, else the procedure, else the default clocking. |
 | 18 | Randomization (constraints) | ❌ | classes, `randomize()`, `std::randomize`, randcase, randsequence |
 | 18.13 | $urandom, $urandom_range | ✅ | one deterministic stream per run, seeded by `-seed <n>` or `+ntb_random_seed=<n>` (the generator is implementation-defined). `18.13-random-functions` |
+| 19 | Functional coverage (covergroups) | ✅ | Covergroups in modules and interfaces with constructor arguments (`input` and `ref`), a sampling event with `iff`, or `with function sample(...)` (19.3, 19.8.1). Coverpoints with `iff`; auto bins with `auto_bin_max` and enum auto bins; explicit, array (`[]`) and fixed-size (`[N]`) bins with `$` bounds; `default` and `default sequence`; `wildcard`; `with` clauses; `ignore_bins` and `illegal_bins` (an error naming the bin) (19.5). Transition bins with `=>`, `[*]`, `[->]`, `[=]` (19.5.2). Crosses with auto bins and user bins built from `binsof`, `intersect`, `!`, `&&`, `\|\|`, plus `ignore_bins` and `illegal_bins` (19.6). Options and type options, including `weight`, `goal`, `at_least`, `per_instance`, `merge_instances` (19.7). `sample`, `get_coverage`, `get_inst_coverage` (with `cov`/`tot` arguments), `start`, `stop`, `set_inst_name` on groups, coverpoints and crosses, and `$get_coverage` (19.8, 19.9). Coverage follows 19.11. Not yet: real coverpoints, coverpoints wider than 64 bits, bin set expressions (19.5.1.2), cross bins built from `with` or set expressions (19.6.1.2, 19.6.1.3), covergroups in classes (classes are not supported), covergroups that extend another (19.4.1), block-event sampling. `19.3-covergroup`, `19.5-bins`, `19.5.1-bin-kinds`, `19.6-transitions-crosses`, `19.8-sample-start-stop` |
 | 20.3 | $time, $stime, $realtime | 🟡 | in the calling module's time unit, rounded. `$realtime` is a real. `20.3-time` |
 | 20.2 | $finish, $stop | ✅ | `$stop` ends the run like `$finish` |
 | 20.4 | $timeformat, $printtimescale | ✅ | `%t` prints in the `$timeformat` units, precision, suffix and width; the default is the simulation precision, width 20. `$printtimescale` with no argument, `$root`, or an instance. `20.4-timeformat`, `20.4-printtimescale` |
@@ -123,7 +124,7 @@ In order of how often typical testbenches hit them:
 1. ~~Unpacked arrays and memories (7.4), `foreach` (12.7.3), `$readmemh` (21.4)~~ done
 2. ~~Generate blocks (27), `+:` / `-:` part-selects (11.5.1)~~ done; values wider than 64 bits next
 3. ~~`` `timescale `` (22.7), delay expressions (9.4.1), named events (15.5), disable / wait fork (9.6), final (9.2.3)~~ done
-4. ~~`$urandom` (18.13), immediate and deferred assertions (16.3, 16.4), concurrent assertions (16.5–16.16), clocking blocks (14)~~ done; covergroups (19) next
+4. ~~`$urandom` (18.13), immediate and deferred assertions (16.3, 16.4), concurrent assertions (16.5–16.16), clocking blocks (14), covergroups (19)~~ done
 5. ~~Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2), real (6.12), string (6.16)~~ done
 6. ~~Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8)~~ done; unpacked structs (7.2) next
 
