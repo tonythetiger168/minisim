@@ -70,6 +70,8 @@ before the simulation starts and are not value changes.
 `vpi_mcd_close`, `vpi_mcd_name`, `vpi_mcd_printf`, `vpi_flush`,
 `vpi_chk_error`, `vpi_get_vlog_info`, `vpi_control(vpiFinish)` and
 `vpi_control(vpiStop)`, `vpi_free_object` / `vpi_release_handle`.
+`vpi_handle_by_name` takes a bit or a part select (`top.u.r[3:0]`, a
+`vpiPartSelect`), which reads, writes, forces and releases those bits only.
 `vpi_put_value` with `vpiForceFlag` / `vpiReleaseFlag` forces and releases a
 net or variable (or one bit of it) like `force` / `release` (10.6.2); a
 release returns the value the object then has. `veriuser.h` declares

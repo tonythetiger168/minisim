@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
+  `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
+  bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
