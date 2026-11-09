@@ -487,8 +487,9 @@ int main(int argc, char** argv) {
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
     if (usesForce()) staticPart = false;   // a forced signal must see every write (10.6)
     if (lowered.procs.empty()) {
-        std::cerr << "msim: design has no processes to run\n";
-        return 1;
+        // Nothing to schedule: the simulation ends at time 0 (4.4.1).
+        std::cerr << "msim: note: design has no processes; simulation ends at time 0\n";
+        return 0;
     }
 
     Plan pl = plan(lowered, staticComb, staticSeq);

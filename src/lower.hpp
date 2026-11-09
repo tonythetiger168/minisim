@@ -57,6 +57,7 @@
 #include "cover.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
+#include "slang/ast/EvalContext.h"
 #include "slang/ast/Expression.h"
 #include "slang/ast/Statement.h"
 #include "slang/ast/TimingControl.h"
@@ -725,6 +726,16 @@ struct Lowerer {
         auto ol = sm->getFullyOriginalLoc(l);
         return std::string(sm->getFileName(ol)) + ":" + std::to_string(sm->getLineNumber(ol)) + ": ";
     }
+    // Subroutines not lowered, with the reason a run-time call reports.
+    static std::unordered_map<const slang::ast::SubroutineSymbol*, std::string>& skippedSubs() {
+        static std::unordered_map<const slang::ast::SubroutineSymbol*, std::string> m;
+        return m;
+    }
+    // Makes a signal driven by an event expression; set while lowering a design.
+    static std::function<int(const slang::ast::Expression&)>& eventExprHook() {
+        static std::function<int(const slang::ast::Expression&)> h;
+        return h;
+    }
     [[noreturn]] static void unsupported(const char* what) {
         throw std::runtime_error(whereStr() + "lower: unsupported " + what);
     }
@@ -1048,7 +1059,10 @@ struct Lowerer {
             }
         }
         auto it = subs->find(sym);
-        if (it == subs->end()) unsupported("subroutine call");
+        if (it == subs->end()) {
+            auto sk = skippedSubs().find(sym);
+            unsupported(sk != skippedSubs().end() ? sk->second.c_str() : "subroutine call");
+        }
         Subr* sub = it->second;
         if (current) current->calls.push_back(sub);
 
@@ -1772,6 +1786,64 @@ struct Lowerer {
         return sized(konst(bits), w, self, ctx);
     }
 
+    // The symbol a select chain (a[i][j], a.f[k]) starts from, or null.
+    static const slang::ast::Symbol* selectBase(const slang::ast::Expression& e0) {
+        using namespace slang::ast;
+        const Expression* e = &e0;
+        for (;;) {
+            if (e->kind == ExpressionKind::ElementSelect) e = &e->as<ElementSelectExpression>().value();
+            else if (e->kind == ExpressionKind::RangeSelect) e = &e->as<RangeSelectExpression>().value();
+            else if (e->kind == ExpressionKind::MemberAccess) e = &e->as<MemberAccessExpression>().value();
+            else if (e->kind == ExpressionKind::Conversion) e = &e->as<ConversionExpression>().operand();
+            else break;
+        }
+        if (e->kind == ExpressionKind::NamedValue || e->kind == ExpressionKind::HierarchicalValue)
+            return &e->as<ValueExpressionBase>().symbol;
+        return nullptr;
+    }
+    // Evaluates a constant expression that slang did not fold, such as an
+    // element of a parameter array or a constant function call (11.2.1,
+    // 13.4.3). Returns a bad value when the expression is not constant.
+    slang::ConstantValue tryConst(const slang::ast::Expression& e, const slang::ast::Symbol* anchor = nullptr) const {
+        using namespace slang::ast;
+        if (const auto* c = e.getConstant()) return *c;
+        if (anchor && anchor->getParentScope()) {
+            EvalContext ec(*anchor);
+            return e.eval(ec);
+        }
+        if (!scope) return {};
+        EvalContext ec(ASTContext(*scope, LookupLocation::max));
+        return e.eval(ec);
+    }
+    // A constant unpacked array value, one entry per element, leftmost first.
+    void constElems(const slang::ast::Type& t0, const slang::ConstantValue& cv, std::vector<E>& out) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            const Type& et = t.as<FixedSizeUnpackedArrayType>().elementType;
+            if (!cv.isUnpacked()) unsupported("constant array value");
+            for (const auto& el : cv.elements()) constElems(et, el, out);
+            return;
+        }
+        if (cv.isInteger()) {
+            out.push_back(resize(svLit(cv.integer(), t.isSigned(), {}), (int)t.getBitWidth(),
+                                 cv.integer().isSigned(), t.isSigned()));
+            return;
+        }
+        if (cv.isReal()) { out.push_back(konst(mkreal(cv.real()))); return; }
+        unsupported("constant array element of this kind");
+    }
+
+    // P[i][j:k] where P is a parameter unpacked array and every index is
+    // constant: the selected value. Null when this is not such a select.
+    E paramSelect(const slang::ast::Expression& e, ExprCtx ctx) {
+        using namespace slang::ast;
+        const Symbol* b = selectBase(e);
+        if (!b || b->kind != SymbolKind::Parameter || !b->as<ParameterSymbol>().getType().isUnpackedArray()) return nullptr;
+        auto cv = tryConst(e, b);
+        if (!cv || !cv.isInteger()) unsupported("non-constant select of a parameter unpacked array");
+        return svLit(cv.integer(), e.type->isSigned(), ctx);
+    }
     // a[i][j] on an unpacked array: the array and one index per dimension.
     // Fewer indices than dimensions (a slice) is not supported yet.
     struct ArrSel {
@@ -1861,7 +1933,12 @@ struct Lowerer {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {
                 auto a = arrFind(&x.as<ValueExpressionBase>().symbol);
-                if (!a) unsupported("array value");
+                if (!a) {   // a parameter array (6.20.1)
+                    auto cv = tryConst(x, &x.as<ValueExpressionBase>().symbol);
+                    if (!cv) unsupported("array value");
+                    constElems(t, cv, out);
+                    return;
+                }
                 for (int k = 0; k < a->count; k++) out.push_back(ref(a->base + k, a->sgn));
                 return;
             }
@@ -1899,7 +1976,12 @@ struct Lowerer {
                 }
                 return;
             }
-            default: unsupported("fixed-size array value of this kind");
+            default: {   // a constant function call or a parameter array element
+                auto cv = tryConst(x, selectBase(x));
+                if (!cv) unsupported("fixed-size array value of this kind");
+                constElems(t, cv, out);
+                return;
+            }
         }
     }
     // default: v fills every element below type t (10.9.1), unless v is
@@ -2962,10 +3044,17 @@ struct Lowerer {
             }
             case ExpressionKind::Concatenation: {
                 std::vector<E> parts;
-                for (auto* op : e.as<ConcatenationExpression>().operands()) parts.push_back(expr(*op));
+                for (auto* op : e.as<ConcatenationExpression>().operands()) {
+                    // {0{x}} inside a concatenation is ignored (11.4.12.1).
+                    if (op->kind == ExpressionKind::Replication && constInt(op->as<ReplicationExpression>().count()) == 0)
+                        continue;
+                    parts.push_back(expr(*op));
+                }
+                if (parts.empty()) unsupported("concatenation of only zero replications");
                 return sized(concat(parts), (int)e.type->getBitWidth(), false, ctx);
             }
             case ExpressionKind::ElementSelect: {   // a[i]
+                if (E k = paramSelect(e, ctx)) return k;
                 if (int d = dynSig(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key]
                     int w = storeW(*e.type);
                     needWidth(w);
@@ -2978,6 +3067,7 @@ struct Lowerer {
                 return sized(readPSel(expr(sel.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             case ExpressionKind::RangeSelect: {     // a[hi:lo], a[i +: w], a[i -: w]
+                if (E k = paramSelect(e, ctx)) return k;
                 const auto& r = e.as<RangeSelectExpression>();
                 PSel ps = rangePSel(r);
                 return sized(readPSel(expr(r.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
@@ -3120,9 +3210,14 @@ struct Lowerer {
             }
             int sig;
             if (classMember(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x)
-            else {
-                if (!ValueExpressionBase::isKind(s.expr.kind)) unsupported("event on non-signal");
+            else if (ValueExpressionBase::isKind(s.expr.kind)) {
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
+            } else {
+                // @(posedge clk[i]), @(a & b): wait on a signal that a
+                // continuous assignment keeps equal to the expression; an
+                // edge is that value's least significant bit (9.4.2).
+                if (!eventExprHook()) unsupported("event on non-signal");
+                sig = eventExprHook()(s.expr);
             }
             Edge e = s.edge == EdgeKind::PosEdge ? POS : s.edge == EdgeKind::NegEdge ? NEG : ANY;
             ev.push_back({sig, e});
@@ -5756,7 +5851,37 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                   std::function<int(int)> nd,
                   std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* s,
                   MkSig mk, int* seq)
-        : sigmap(m), out(o), newDriver(std::move(nd)), subs(s), mkSig(std::move(mk)), tempSeq(seq) {}
+        : sigmap(m), out(o), newDriver(std::move(nd)), subs(s), mkSig(std::move(mk)), tempSeq(seq) {
+        Lowerer::eventExprHook() = [this](const slang::ast::Expression& x) { return eventSignal(x); };
+    }
+    ~ProcCollector() { Lowerer::eventExprHook() = nullptr; }
+
+    // One signal per distinct event expression, driven by a continuous
+    // assignment of that expression.
+    std::unordered_map<const slang::ast::Expression*, int> evSigs;
+    int eventSignal(const slang::ast::Expression& x) {
+        if (auto it = evSigs.find(&x); it != evSigs.end()) return it->second;
+        int w = (int)x.type->getBitWidth();
+        if (w <= 0 || !x.type->isIntegral()) Lowerer::unsupported("event on an expression of this type");
+        int sg = mkSig("__event" + std::to_string((*tempSeq)++), w, false);
+        // Start equal to the expression, before any procedure waits, so
+        // variables that start with a value give no event at time 0.
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        {
+            Instr i0; i0.k = IK::Assign; i0.sig = sg;
+            i0.e = init->expr(x);
+            init->prog.emit(i0);
+        }
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i; i.k = IK::Assign;
+        i.sig = sg;
+        i.e = lw.expr(x);
+        if (!lw.prog.code.empty()) Lowerer::unsupported("event expression with a call");
+        finishAssign(lw, i);
+        evSigs[&x] = sg;
+        return sg;
+    }
 
     void prep(Lowerer& lw) { lw.bind(subs, mkSig, tempSeq, &out.subs); }
 
@@ -5972,6 +6097,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             auto it = arrMap().find(&l.as<ValueExpressionBase>().symbol);
             if (it == arrMap().end()) Lowerer::unsupported("continuous assign to this array");
             std::vector<E> els;
+            lw.setScope(ca.getParentScope());
             lw.arrayElems(*a.left().type, a.right(), els);
             if ((int)els.size() != it->second->count || !lw.prog.code.empty())
                 Lowerer::unsupported("continuous assign of an unpacked array from this value");
@@ -6161,6 +6287,24 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         prep(lw);
         Lowerer::OutSlot slot{formal.sig, formal.w, formal.sgn};
         lw.outSlot = &slot;
+        if (Lowerer::peel(ext.left()).kind == slang::ast::ExpressionKind::Concatenation) {
+            // .q({a, b}): one driver per part, each its slice of the port (23.3.2).
+            int w = (int)ext.left().type->getBitWidth();
+            std::vector<std::tuple<const slang::ast::Expression*, int, int>> parts;
+            Lowerer::concatParts(ext.left(), w - 1, parts);
+            bool first = true;
+            for (auto& [x, hi, lo] : parts) {
+                Lowerer pw(sigmap);
+                if (!first) { prep(pw); pw.outSlot = &slot; }
+                Lowerer& L = first ? lw : pw;
+                first = false;
+                Instr i; i.k = IK::Assign;
+                L.lhs(*x, i);
+                i.e = slice(resize(L.expr(ext.right()), w, false, false), hi, lo);
+                finishAssign(L, i);
+            }
+            return;
+        }
         Instr i; i.k = IK::Assign;
         lw.lhs(ext.left(), i);
         i.e = lw.expr(ext.right());
@@ -6665,6 +6809,13 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     auto framed = framedSubroutines(finder.found);
     for (const slang::ast::SubroutineSymbol* sym : finder.found) {
         if (subMap.count(sym)) continue;
+        if (sym->returnValVar && sym->getReturnType().isUnpackedArray()) {
+            // Returning an unpacked array is only supported when every call
+            // is constant (13.4.3) and slang evaluates it; a call that needs
+            // the function at run time reports this then.
+            Lowerer::skippedSubs()[sym] = "function returning an unpacked array";
+            continue;
+        }
         auto sub = std::make_unique<Subr>();
         out.subs.push_back(std::make_unique<Prog>());
         sub->prog = out.subs.back().get();
