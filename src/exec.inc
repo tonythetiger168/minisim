@@ -464,7 +464,7 @@ void Sim::runObserved() {
         ConcAssert& c = concAsserts()[k];
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p.caps);
+            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p);
         }
         c.pending.clear();
     }
@@ -621,21 +621,65 @@ struct LocalEnv final : sva::LocalHook {
 };
 // One clock tick of a concurrent assertion, in the observed region: start an
 // attempt, then step every attempt on the sampled values of the atoms.
+// An expect statement (16.17) waiting for its attempt's verdict.
+struct ExpectWait {
+    Handle h;
+    shared_ptr<ProcCtl> ctl;
+    int res = -1;   // 1 pass, 0 fail, 2 disabled or killed
+};
+struct ExpectAwait {
+    ExpectWait* w;
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { w->h = h; }
+    void await_resume() const {}
+};
+// The verdict of an expect attempt: its process goes on in the reactive region.
+static void expectDone(const shared_ptr<void>& p, int res) {
+    auto* w = static_cast<ExpectWait*>(p.get());
+    if (!w || w->res >= 0) return;
+    w->res = res;
+    if (w->ctl->killed || !w->h) return;
+    S.reactive.push_back(w->h);
+    S.rare = true;
+}
+static void dropAttempts(ConcAssert& c) {   // disabled or killed: expect statements go on
+    for (auto& at : c.att) expectDone(at.wait, 2);
+    for (auto& p : c.matured) expectDone(p.wait, 2);
+    c.att.clear();
+    c.matured.clear();
+}
+// expect (property) action (16.17): an attempt from the next tick of its clock.
+static shared_ptr<ExpectWait> startExpect(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
+    ConcAssert& c = concAsserts()[i.hi];
+    auto w = make_shared<ExpectWait>();
+    w->ctl = ctl;
+    ConcAssert::Caps caps;
+    if (!c.capSig.empty()) {
+        auto v = make_shared<vector<Val>>();
+        for (int s : c.capSig) v->push_back(S.get(R(s)));
+        caps = v;
+    }
+    c.matured.push_back({ctl, ctl->epoch, caps, w});
+    return w;
+}
 // `ticked`: the clocks that ticked (16.13); attempts start at the leading one.
 static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
-        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) { return t.killGen != a.killGen; });
+        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
+            if (t.killGen == a.killGen) return false;
+            expectDone(t.wait, 2);
+            return true;
+        });
     if (c.disable && truth(eval(c.disable, rd)) == 1) {   // disabled: no pass, no fail (16.12)
-        c.att.clear();
+        dropAttempts(c);
         c.pending.clear();
-        c.matured.clear();
         if (a.on && (ticked & 1)) a.evals++;
         return;
     }
     if (!(ticked & 1)) {
     } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& caps : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, caps}); a.evals++; }
+        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait}); a.evals++; }
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
@@ -691,22 +735,24 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
             if (t->k == sva::DONE) continue;
         } else if (t->k == sva::PTRUE) {
             a.passes += at.count;
+            expectDone(at.wait, 1);
             if (dv.nonvac ? a.passOn : a.vacOn) runAction(c.pass, at.count, &c.capSlot, at.caps.get());
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
                 (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs)});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait});
     }
     c.att.swap(next);
     if (ended && c.endSig >= 0) {   // the sequence's end point (16.13.6)
@@ -771,7 +817,7 @@ inline Task concDisableProc(int k, shared_ptr<vector<pair<int, Edge>>> ev) {
     for (;;) {
         if (ev->size() > 1) co_await WaitAny{ev.get()};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
-        if (truth(eval(c.disable, rd)) == 1) c.att.clear();
+        if (truth(eval(c.disable, rd)) == 1) dropAttempts(c);
     }
 }
 inline void startConcAsserts() {
@@ -1068,7 +1114,17 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 ctl->kids.clear();
                 pc++;
                 break;
-            case IK::Assert: pc = runAssert(i, ctl, pc); break;
+            case IK::Assert:
+                if (i.join == 4) {   // expect (16.17): wait for the verdict
+                    auto w = startExpect(i, ctl);
+                    S.rare = true;
+                    co_await ExpectAwait{w.get()};
+                    ctl->epoch++;
+                    pc = w->res == 1 ? pc + 1 : w->res == 0 ? (size_t)i.target : (size_t)i.lo;
+                    break;
+                }
+                pc = runAssert(i, ctl, pc);
+                break;
             case IK::AssertCtl: assertCtl(i); pc++; break;
             case IK::CycleWait: {   // ##n (14.11)
                 Val nv = eval(i.e, rd);
