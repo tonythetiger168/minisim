@@ -112,11 +112,16 @@ mregress -spec tests/spec -sim iverilog         # the spec suite on another simu
 
 A test list line is `name: <simulator arguments>` with optional settings
 (`@seeds=N`, `@timeout=SEC`, `@pass=<regex>`, `@fail=<regex>`,
-`@expect=inline` for `//> ` expected output, `@skip=<sim>`); `%common` and
+`@expect=inline` for `//> ` expected output, `@skip=<sim>`, `@exit=N`,
+`@xfail=<reason>` for a known gap); `%common` and
 `%sim` set shared arguments and the default simulator, and `-f` includes
 another list. A run fails on a non-zero exit, a UVM_ERROR / UVM_FATAL count
 above zero, a simulator error line (`Error-[`, `*E,`, `** Error`), `$fatal`,
-or a failed `@pass` / `@expect` check. See `tests/regress/smoke.list` and
+or a failed `@pass` / `@expect` check. An `@xfail` test that fails counts as
+a known gap; one that passes (XPASS) fails the regression so the marker gets
+removed. With `-spec`, a test's `//! xfail: <reason>` and `//! exit: <n>`
+lines mean the same on msim, and a per-chapter pass table is printed
+(`-md FILE` also writes it as Markdown). See `tests/regress/smoke.list` and
 `mregress -h`.
 
 ### Compiled mode
