@@ -1,6 +1,5 @@
 // IEEE 1800-2023 10.6.1: Procedural continuous assign and deassign on a
 // variable (10.6.1).
-//! xfail: assign/deassign are errors
 module top;
   logic q = 0, d = 1;
   initial begin

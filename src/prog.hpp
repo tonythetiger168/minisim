@@ -39,6 +39,8 @@ enum class IK {
     Fork,       // start each of `branches` as a process; join 0 = all, 1 = any, 2 = none
     ReadMem,    // $readmemh / $readmemb into `arr` (fmt is the file name)
     WriteMem,   // $writememh / $writememb of `arr` (21.5), the same fields as ReadMem
+    Force,      // force (hi = 1) or assign (hi = 0) sig = e until released (10.6)
+    Release,    // release (hi = 1) or deassign (hi = 0) sig (10.6)
     Disable,    // disable <block> run by other processes: end every process whose root is block `sig`
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
@@ -112,6 +114,17 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    // Frames (expr.hpp). Call: when `lay` is set the callee is automatic and
+    // runs in a new frame of that shape; `init` gives each argument slot its
+    // value, evaluated in the caller before the switch. Fork: `blays` is the
+    // frame shape of each branch, and `lay` with `init` a frame for the fork
+    // block's own automatic variables, shared by its branches (9.3.2).
+    const FrameLayout* lay = nullptr;
+    std::vector<std::pair<int, E>> init;
+    std::vector<const FrameLayout*> blays;
+    // WaitEdge with dynWait: wait for a change of any signal `e` reads,
+    // resolved when the wait starts (wait (cond) on automatic variables).
+    bool dynWait = false;
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
 };
@@ -135,12 +148,22 @@ struct Prog {
 // array index reads every element, so a wait on it wakes on any of them.
 inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_set<int>& seen) {
     if (!e) return;
-    auto add = [&](int s) { if (seen.insert(s).second) out.push_back(s); };
+    // A relative id (an automatic variable) has no fixed signal: it is left
+    // out here, and a wait on one resolves it at run time (Instr::dynWait).
+    auto add = [&](int s) { if (!isRel(s) && seen.insert(s).second) out.push_back(s); };
     if (e->op == Op::Ref) add(e->sig);
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) add(e->sig);
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
+}
+// Does e read an automatic variable (a relative id)?
+inline bool hasRel(const E& e) {
+    if (!e) return false;
+    if (isRel(e->sig) && e->op != Op::Const) return true;
+    if (e->op == Op::ArrRead && isRel(e->arr->base)) return true;
+    for (auto& k : e->kids) if (hasRel(k)) return true;
+    return false;
 }
 inline void collectRefs(const E& e, std::vector<int>& out) {
     std::unordered_set<int> seen(out.begin(), out.end());
@@ -160,6 +183,7 @@ inline void collectProgRefsInto(const Prog& p, std::vector<int>& sigs, std::unor
         if (i.k == IK::Dyn || i.dyn >= 0)
             for (auto& a : i.args) collectRefsInto(a, sigs, have);
         collectRefsInto(i.bidx, sigs, have);
+        for (auto& a : i.init) collectRefsInto(a.second, sigs, have);
         if (i.k == IK::Call && i.callee) collectProgRefsInto(*i.callee, sigs, have, seen);
         for (const Prog* b : i.branches) collectProgRefsInto(*b, sigs, have, seen);
     }

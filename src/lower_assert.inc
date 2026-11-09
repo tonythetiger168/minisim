@@ -234,7 +234,7 @@ int shadowOf(int s) {
 E sampledE(const E& e) {
     if (!e) return e;
     if (e->op == Op::Ref) {
-        if (automaticSigs().count(e->sig)) return e;
+        if (isRel(e->sig) || automaticSigs().count(e->sig)) return e;   // automatic: read as it is
         auto c = std::make_shared<Expr>(*e);
         c->sig = shadowOf(e->sig);
         return c;
@@ -663,7 +663,7 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         std::unordered_map<int, E> slotOf;
         std::function<E(const E&)> capture = [&](const E& e) -> E {
             if (!e) return e;
-            if (e->op == Op::Ref && automaticSigs().count(e->sig)) {
+            if (e->op == Op::Ref && (isRel(e->sig) || automaticSigs().count(e->sig))) {
                 auto [it, fresh] = slotOf.try_emplace(e->sig);
                 if (fresh) {
                     it->second = konst(Val{});

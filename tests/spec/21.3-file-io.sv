@@ -1,6 +1,5 @@
 // IEEE 1800-2023 21.3: $fopen, $fdisplay, $fwrite, $fclose, $fgets,
 // $fscanf, $feof, $sscanf, $sformatf (21.3).
-//! xfail: file I/O is an error
 module top;
   int f, r, v, w;
   string s;

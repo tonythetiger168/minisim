@@ -4,12 +4,13 @@
 // and the return address is still on `rets` when the process resumes.
 static Val rd(int s) { return S.get(s); }
 
-struct RetFrame { const Prog* prog; size_t pc; };
+struct RetFrame { const Prog* prog; size_t pc; FrameP fr; };
 
 // Resolve a run-time array index and bit index. false: no write happens.
 // v is the value to write; a part-select that is partly out of range writes
 // only the bits inside the vector (11.5.1), so v is shifted to match.
 static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
+    sig = R(sig);
     if (i.arr) {
         std::vector<int64_t> idx;
         for (auto& a : i.aidx) {
@@ -19,7 +20,7 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
         }
         int64_t off = i.arr->offset(idx);
         if (off < 0) return false;
-        sig = i.arr->base + (int)off;
+        sig = R(i.arr->base + (int)off);
     }
     if (i.bidx) {
         Val v = eval(i.bidx, rd);
@@ -56,7 +57,7 @@ static void writeMem(const Instr& i) {
     for (int64_t ad = start;; ad += step) {
         int64_t off = a.offset({ad});
         if (off >= 0) {
-            Val v = S.get(a.base + (int)off);
+            Val v = S.get(R(a.base + (int)off));
             v.sgn = false;
             int bits = i.hex ? 4 : 1;
             int n = (a.elemW + bits - 1) / bits;
@@ -143,7 +144,7 @@ static void readMem(const Instr& i) {
                 acc.v &= ~acc.x; acc.x = acc.z = 0;
                 for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
             }
-            S.set(a.base + (int)off, acc);
+            S.set(R(a.base + (int)off), acc);
             addr += step;
             words++;
             continue;
@@ -163,7 +164,7 @@ static void readMem(const Instr& i) {
         int64_t off = a.offset({addr});
         if (off < 0) break;
         if (a.twoState) { v &= ~x; x = z = 0; }
-        S.set(a.base + (int)off, make(v, x, a.elemW, z));
+        S.set(R(a.base + (int)off), make(v, x, a.elemW, z));
         addr += step;
         words++;
     }
@@ -178,7 +179,10 @@ static void readMem(const Instr& i) {
 inline void dynBump(int sig) { Val v = S.get(sig); S.set(sig, make((v.x ? 0 : v.v) + 1, 0, 64)); }
 inline void dynWarn(const char* what) { std::cerr << "warning: " << what << "\n"; }
 inline void dynExec(const Instr& i) {
-    auto& d = dynStore()[i.sig];
+    // Container ids may be relative (automatic variables): resolve them once.
+    const int sig = R(i.sig), dsrc = i.dsrc >= 0 ? R(i.dsrc) : -1;
+    const int dres = i.dres >= 0 ? R(i.dres) : -1, dkey = i.dkey >= 0 ? R(i.dkey) : -1;
+    auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
     auto full = [&]() {   // a bounded queue drops what does not fit (7.10)
@@ -200,8 +204,8 @@ inline void dynExec(const Instr& i) {
             int64_t n = idx(0);
             if (n < 0) { dynWarn("new[] with a negative or unknown size"); n = 0; }
             std::vector<Val> nv((size_t)n, d.dflt);
-            if (i.dsrc >= 0) {
-                auto src = dynStore()[i.dsrc].vec;
+            if (dsrc >= 0) {
+                auto src = dynStore()[dsrc].vec;
                 for (size_t k = 0; k < nv.size() && k < src.size(); k++) nv[k] = src[k];
             }
             d.vec = std::move(nv);
@@ -230,34 +234,34 @@ inline void dynExec(const Instr& i) {
             if (d.vec.empty()) dynWarn("pop from an empty queue");
             else if (i.dcmd == D_POP_FRONT) { v = d.vec.front(); d.vec.erase(d.vec.begin()); }
             else { v = d.vec.back(); d.vec.pop_back(); }
-            if (i.dres >= 0) S.set(i.dres, v);
+            if (dres >= 0) S.set(dres, v);
             break;
         }
         case D_FIRST: case D_LAST: case D_NEXT: case D_PREV: {   // 7.9.4-7.9.7
             bool ok = false;
-            DynKey cur = d.key(S.get(i.dkey));
+            DynKey cur = d.key(S.get(dkey));
             std::map<DynKey, Val>::iterator it = d.map.end();
             if (i.dcmd == D_FIRST) it = d.map.begin();
             else if (i.dcmd == D_LAST) { if (!d.map.empty()) it = std::prev(d.map.end()); }
             else if (i.dcmd == D_NEXT) it = d.map.upper_bound(cur);
             else { it = d.map.lower_bound(cur); it = it == d.map.begin() ? d.map.end() : std::prev(it); }
-            if (it != d.map.end()) { ok = true; S.set(i.dkey, d.keyVal(it->first)); }
-            if (i.dres >= 0) { Val r = make(ok, 0, 32); r.sgn = true; S.set(i.dres, r); }
+            if (it != d.map.end()) { ok = true; S.set(dkey, d.keyVal(it->first)); }
+            if (dres >= 0) { Val r = make(ok, 0, 32); r.sgn = true; S.set(dres, r); }
             return;   // the container did not change
         }
         case D_COPY: {
-            auto& s = dynStore()[i.dsrc];
+            auto& s = dynStore()[dsrc];
             if (d.kind == 2) d.map = s.map;
             else { d.vec = s.kind == 2 ? std::vector<Val>{} : s.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
             break;
         }
         case D_APPEND: {   // {q, r}: every element of r
-            auto s = dynStore()[i.dsrc].vec;
+            auto s = dynStore()[dsrc].vec;
             d.vec.insert(d.vec.end(), s.begin(), s.end());
             break;
         }
         case D_APPEND_SLICE: {   // q[a:b] (7.10.1): out-of-range parts are left out
-            auto s = dynStore()[i.dsrc].vec;
+            auto s = dynStore()[dsrc].vec;
             int64_t a = std::max<int64_t>(idx(0), 0), b = std::min<int64_t>(idx(1), (int64_t)s.size() - 1);
             for (int64_t k = a; k <= b; k++) d.vec.push_back(s[(size_t)k]);
             break;
@@ -283,7 +287,7 @@ inline void dynExec(const Instr& i) {
             break;
         }
     }
-    dynBump(i.sig);
+    dynBump(sig);
 }
 
 struct JoinState {
@@ -351,16 +355,15 @@ struct WaitFork {
     void await_resume() const {}
 };
 
-Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl);
-
-inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c) {
-    Task t = exec(p, c);
+Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
+    Task t = exec(p, c, std::move(fr));
     c->h = t.h;
     for (int r : p->roots) rootProcs()[r].push_back(c);
     return t;
 }
 // A top-level process (initial, always, final).
-inline Task process(const Prog* p) { return startProc(p, make_shared<ProcCtl>()); }
+inline Task process(const Prog* p) { return startProc(p, make_shared<ProcCtl>(), nullptr); }
 inline Task exec(const Prog* p) { return process(p); }
 
 // ---- assertions (16.3, 16.4, 20.11) ----
@@ -403,9 +406,9 @@ static Task startReport(DeferRep& r) {
 // deferred reports mature and their actions go to the reactive region (16.4.1).
 void Sim::runObserved() {
     region = R_OBSERVED;
-    while (!observed.empty()) {
-        Handle h = observed.front();
-        observed.pop_front();
+    while (!observedQ.empty()) {
+        Handle h = observedQ.front();
+        observedQ.pop_front();
         if (!h.done()) h.resume();
     }
     // Pending procedural concurrent assertions mature (16.14.6); those whose
@@ -462,7 +465,7 @@ static void assertCtl(const Instr& i) {
 // ---- concurrent assertions (16.14) ----
 struct ToObserved {   // resume in the observed region of this time slot (4.4.2.5)
     bool await_ready() const { return false; }
-    void await_suspend(Handle h) const { S.observed.push_back(h); S.rare = true; }
+    void await_suspend(Handle h) const { S.observedQ.push_back(h); S.rare = true; }
     void await_resume() const {}
 };
 // Pass and fail actions run in the reactive region (16.14.1), once per attempt.
@@ -560,7 +563,7 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     ConcAssert::Caps caps;
     if (!c.capSig.empty()) {
         auto v = make_shared<vector<Val>>();
-        for (int s : c.capSig) v->push_back(S.get(s));
+        for (int s : c.capSig) v->push_back(S.get(R(s)));   // R: the variable in this process's frame
         caps = v;
     }
     if (c.pending.empty()) concPending().push_back(i.hi);
@@ -628,19 +631,49 @@ inline Task sampleClockProc(int c) {
     }
 }
 
-Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
+// A wait on signals named by relative ids (automatic variables): the ids
+// are resolved when the wait starts.
+static vector<pair<int, Edge>> resolveEvents(const Instr& i) {
+    vector<pair<int, Edge>> ev;
+    if (i.dynWait) {
+        vector<int> a;
+        collectAddrs(i.e, a);
+        std::sort(a.begin(), a.end());
+        a.erase(std::unique(a.begin(), a.end()), a.end());
+        for (int s : a) ev.push_back({s, ANY});
+        return ev;
+    }
+    if (i.events.size() > 1) for (auto& [s, e] : i.events) ev.push_back({R(s), e});
+    else ev.push_back({R(i.sig), i.edge});
+    return ev;
+}
+static bool relEvents(const Instr& i) {
+    if (i.dynWait) return true;
+    if (i.events.size() > 1) { for (auto& ev : i.events) if (isRel(ev.first)) return true; return false; }
+    return isRel(i.sig);
+}
+
+Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
     const Prog* p = entry;
     size_t pc = 0;
     vector<RetFrame> rets;
+    FrameP lastRet;   // the frame the last call returned from (mode kRelRet)
+    vector<pair<int, Edge>> evbuf;
+    auto ret = [&]() {
+        RetFrame f = std::move(rets.back());
+        rets.pop_back();
+        p = f.prog;
+        pc = f.pc;
+        if (f.fr != fr) { lastRet = std::move(fr); fr = std::move(f.fr); }
+    };
     for (auto& [slot, v] : ctl->init) slot->k = v;
     while (p) {
+        g_fr = fr.get();
+        g_ret = lastRet.get();
         if (ctl->killed) goto done;
         if (pc >= p->code.size()) {
             if (rets.empty()) goto done;
-            RetFrame f = rets.back();
-            rets.pop_back();
-            p = f.prog;
-            pc = f.pc;
+            ret();
             continue;
         }
         const Instr& i = p->code[pc];
@@ -675,6 +708,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
             }
             case IK::ReadMem: readMem(i); pc++; break;
             case IK::WriteMem: writeMem(i); pc++; break;
+            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0); pc++; break;
+            case IK::Release: S.holdOff(i.sig, i.hi != 0); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;
@@ -682,7 +717,12 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 break;
             case IK::Jmp:       pc = i.target; break;
             case IK::WaitEdge:
-                if (i.events.size() > 1) co_await WaitAny{&i.events};
+                if (relEvents(i)) {
+                    evbuf = resolveEvents(i);
+                    if (evbuf.empty()) relFail("wait on nothing");
+                    if (evbuf.size() > 1) co_await WaitAny{&evbuf};
+                    else co_await Wait{evbuf[0].first, evbuf[0].second};
+                } else if (i.events.size() > 1) co_await WaitAny{&i.events};
                 else co_await Wait{i.sig, i.edge};
                 ctl->epoch++;   // a deferred assertion flush point (16.4.2)
                 pc++; break;
@@ -698,12 +738,14 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 pc++;
                 break;
             case IK::Strobe:
-                S.strobe(i.fmt, i.args);
+                if (fr) { vector<E> a; for (auto& x : i.args) a.push_back(bindRel(x)); S.strobe(i.fmt, a); }
+                else S.strobe(i.fmt, i.args);
                 if (S.finished) goto done;
                 pc++;
                 break;
             case IK::Monitor:
-                S.armMon(i.fmt, i.args);
+                if (fr) { vector<E> a; for (auto& x : i.args) a.push_back(bindRel(x)); S.armMon(i.fmt, a); }
+                else S.armMon(i.fmt, i.args);
                 if (S.finished) goto done;
                 pc++;
                 break;
@@ -718,7 +760,15 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 goto done;
             case IK::Call: {
                 const Prog* callee = i.callee;
-                rets.push_back({p, pc + 1});
+                if (i.lay) {   // an automatic subroutine: a new frame (13.3.2)
+                    FrameP nf = newFrame(i.lay, nullptr, fr ? fr->self : 0);
+                    for (auto& [off, e] : i.init) {   // arguments, read in the caller's frame
+                        Val v = eval(e, rd);
+                        S.set(nf->base + off, v);
+                    }
+                    rets.push_back({p, pc + 1, fr});
+                    fr = std::move(nf);
+                } else rets.push_back({p, pc + 1, fr});
                 p = callee;
                 pc = 0;
                 break;
@@ -728,12 +778,21 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 js->join = i.join;
                 js->left = (int)i.branches.size();
                 std::erase_if(ctl->kids, [](auto& k) { return k->ended; });
-                for (const Prog* b : i.branches) {
+                // The fork block's automatic variables get one frame, set
+                // in the parent before any branch starts (9.3.2).
+                FrameP ff = fr;
+                if (i.lay) {
+                    ff = newFrame(i.lay, fr, fr ? fr->self : 0);
+                    for (auto& [off, e] : i.init) { Val v = eval(e, rd); S.set(ff->base + off, v); }
+                }
+                for (size_t bn = 0; bn < i.branches.size(); bn++) {
+                    const Prog* b = i.branches[bn];
                     auto c = make_shared<ProcCtl>();
                     c->parent = ctl;
                     c->join = js;
                     ctl->kids.push_back(c);
-                    Task t = startProc(b, c);
+                    FrameP bf = bn < i.blays.size() && i.blays[bn] ? newFrame(i.blays[bn], ff, ff ? ff->self : 0) : ff;
+                    Task t = startProc(b, c, std::move(bf));
                     S.all.push_back(t.h);
                     S.active.push_back(t.h);
                 }
@@ -764,12 +823,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
             case IK::AssertCtl: assertCtl(i); pc++; break;
             case IK::Ret:
                 if (rets.empty()) goto done;
-                {
-                    RetFrame f = rets.back();
-                    rets.pop_back();
-                    p = f.prog;
-                    pc = f.pc;
-                }
+                ret();
                 break;
         }
     }

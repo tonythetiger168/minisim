@@ -1,6 +1,5 @@
 // IEEE 1800-2023 10.10: Unpacked array concatenation into a fixed array
 // (10.10).
-//! xfail: unpacked concatenation into a fixed array is an error
 //! icarus-skip: Icarus 13 assigns zeros
 module top;
   int a[3], b[5];
