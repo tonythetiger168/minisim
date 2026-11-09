@@ -19,7 +19,7 @@ module top;
     foreach (mem[k]) mem[k] = 0;
     code = $fread(mem, fd, 2, 3);
     $display("mem=%h %h %h %h %h code=%0d", mem[1], mem[2], mem[3], mem[4], mem[5], code);
-    code = $fread(mw, fd, , 2);
+    code = $fread(mw, fd, 0, 2);
     $display("mw=%h %h %h code=%0d", mw[0], mw[1], mw[2], code);
     code = $fread(w, fd);
     $display("w=%h code=%0d", w, code);
