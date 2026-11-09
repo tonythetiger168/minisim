@@ -2396,6 +2396,130 @@ struct Lowerer {
         return -1;
     }
     // s.len(), s.substr(i, j), ...: kid 0 is the string, then the arguments.
+    // ---- array query functions (20.7) ----
+    static bool isArrayQuery(std::string_view n) {
+        return n == "$left" || n == "$right" || n == "$low" || n == "$high" || n == "$increment" || n == "$size" ||
+               n == "$dimensions" || n == "$unpacked_dimensions";
+    }
+    // The type as $typename writes it (20.6.1): typedefs resolved, no
+    // default signing, ranges as decimal numbers.
+    static std::string typeName(const slang::ast::Type& t) {
+        std::string s = t.getCanonicalType().toString();
+        std::string out;
+        for (size_t i = 0; i < s.size(); i++) {   // "logic [3:0]" -> "logic[3:0]"
+            if (s[i] == ' ' && i + 1 < s.size() && s[i + 1] == '[') continue;
+            out += s[i];
+        }
+        return out;
+    }
+    struct QDim { int kind; int64_t l, r; };   // kind: 0 fixed, 1 dynamic array or queue, 2 associative
+    static void queryDims(const slang::ast::Type& t0, std::vector<QDim>& dims, int& unpacked, int64_t& assocMax) {
+        using namespace slang::ast;
+        const Type* t = &t0.getCanonicalType();
+        unpacked = 0;
+        assocMax = 0;
+        for (;;) {
+            if (t->kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                const auto& f = t->as<FixedSizeUnpackedArrayType>();
+                dims.push_back({0, f.range.left, f.range.right});
+                t = &f.elementType.getCanonicalType();
+            } else if (t->kind == SymbolKind::DynamicArrayType) {
+                dims.push_back({1, 0, 0});
+                t = &t->as<DynamicArrayType>().elementType.getCanonicalType();
+            } else if (t->kind == SymbolKind::QueueType) {
+                dims.push_back({1, 0, 0});
+                t = &t->as<QueueType>().elementType.getCanonicalType();
+            } else if (t->kind == SymbolKind::AssociativeArrayType) {
+                const auto& a = t->as<AssociativeArrayType>();
+                if (a.indexType && a.indexType->isIntegral()) {
+                    int kw = (int)a.indexType->getBitWidth();
+                    bool ks = a.indexType->isSigned();
+                    assocMax = kw >= 64 ? INT64_MAX : ks ? ((int64_t)1 << (kw - 1)) - 1 : ((int64_t)1 << kw) - 1;
+                } else assocMax = -1;
+                dims.push_back({2, 0, 0});
+                t = &a.elementType.getCanonicalType();
+            } else break;
+            unpacked++;
+        }
+        if (t->kind == SymbolKind::EnumType) t = &t->as<EnumType>().baseType.getCanonicalType();
+        while (t->kind == SymbolKind::PackedArrayType) {
+            const auto& p = t->as<PackedArrayType>();
+            dims.push_back({0, p.range.left, p.range.right});
+            t = &p.elementType.getCanonicalType();
+            if (t->kind == SymbolKind::EnumType) t = &t->as<EnumType>().baseType.getCanonicalType();
+        }
+        if (t->kind == SymbolKind::PredefinedIntegerType || t->kind == SymbolKind::PackedStructType || t->kind == SymbolKind::PackedUnionType)
+            dims.push_back({0, (int64_t)t->getBitWidth() - 1, 0});   // int is [31:0] (20.7)
+    }
+    E arrayQuery(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (args.empty()) unsupported("array query without an argument");
+        auto num = [](int64_t v) { Val r = make((uint64_t)v, 0, 32); r.sgn = true; return konst(r); };
+        E xv = konst(xfill(32, true));
+        std::vector<QDim> dims;
+        int unpacked = 0;
+        int64_t assocMax = 0;
+        const Type& t = *args[0]->type;
+        queryDims(t, dims, unpacked, assocMax);
+        if (n == "$dimensions") {
+            if (dims.empty() && (t.isString() || t.isIntegral())) return num(t.isString() ? 1 : 1);
+            return num((int64_t)dims.size());
+        }
+        if (n == "$unpacked_dimensions") return num(unpacked);
+        if (dims.empty() && t.isIntegral() && t.getBitWidth() == 1) dims.push_back({0, 0, 0});   // a scalar
+        int64_t d = 1;
+        if (args.size() > 1) {
+            const auto* cv = args[1]->getConstant();
+            bool known = (cv && cv->isInteger() && !cv->integer().hasUnknown()) || args[1]->kind == ExpressionKind::IntegerLiteral;
+            if (!known) {   // a dimension known only at run time: pick among the answers
+                E dv = resize(expr(*args[1]), 64, args[1]->type->isSigned(), true);
+                E r = xv;
+                for (size_t k = dims.size(); k-- > 0;) {
+                    if (dims[k].kind != 0 && k != 0) continue;
+                    Val kk = make(k + 1, 0, 64); kk.sgn = true;
+                    r = mux(bin(Op::Eq, dv, konst(kk)), queryDim(args, n, dims[k], (int64_t)k + 1, assocMax), r);
+                }
+                return r;
+            }
+            d = constInt(*args[1]);
+        }
+        if (d < 1 || d > (int64_t)dims.size()) return xv;
+        return queryDim(args, n, dims[(size_t)d - 1], d, assocMax);
+    }
+    E queryDim(std::span<const slang::ast::Expression* const> args, std::string_view n, const QDim& q, int64_t d,
+               int64_t assocMax) {
+        auto num = [](int64_t v) { Val r = make((uint64_t)v, 0, 32); r.sgn = true; return konst(r); };
+        E xv = konst(xfill(32, true));
+        if (q.kind == 0) {
+            int64_t l = q.l, r = q.r, inc = l >= r ? 1 : -1;
+            int64_t lo = std::min(l, r), hi = std::max(l, r);
+            if (n == "$left") return num(l);
+            if (n == "$right") return num(r);
+            if (n == "$low") return num(lo);
+            if (n == "$high") return num(hi);
+            if (n == "$increment") return num(inc);
+            return num(hi - lo + 1);
+        }
+        int h = d == 1 ? dynSig(*args[0]) : -1;
+        if (h < 0) unsupported("array query of a dynamic dimension that is not a variable's first dimension");
+        E size = dynSize(h);
+        Val one = make(1, 0, 32); one.sgn = true;
+        if (n == "$increment") return num(-1);
+        if (n == "$size") return size;
+        if (q.kind == 1) {   // dynamic array or queue: [0 : size-1]
+            if (n == "$left" || n == "$low") return num(0);
+            return bin(Op::Sub, size, konst(one));
+        }
+        if (n == "$left") return num(0);   // associative (20.7)
+        if (n == "$right") return assocMax < 0 ? xv : num(assocMax);
+        auto b = node(Op::SysFn);
+        b->hi = SF_ASSOC_BOUND;
+        b->lo = n == "$high" ? 1 : 0;
+        b->sig = h;
+        return b;
+    }
+
     E strMethod(const slang::ast::CallExpression& call, int id) {
         auto args = call.arguments();
         std::vector<E> ks;
@@ -3827,6 +3951,11 @@ struct Lowerer {
                     if (w != 64) t = resize(std::move(t), w, false, false);
                     return sized(std::move(t), w, false, ctx);
                 }
+                if (isArrayQuery(n)) return sized(arrayQuery(call, n), 32, true, ctx);
+                if (n == "$typename" && call.arguments().size() == 1) {   // 20.6.1
+                    if (ctx.live && !e.type->isString()) unsupported("$typename used as a number");
+                    return konst(mkstr(typeName(*call.arguments()[0]->type)));
+                }
                 if (!call.arguments().empty() &&
                     (dynSig(*call.arguments()[0]) >= 0 ||
                      (isFixedArr(*call.arguments()[0]) && isReduction(n)))) {   // q.size(), aa.exists(k), a.sum() ...
@@ -4445,6 +4574,50 @@ struct Lowerer {
         prog.code[jf].target = prog.here();
         return ref(cnt, true);
     }
+    // $fread (21.3.4.4): binary, big-endian, (w + 7) / 8 bytes per value.
+    // Into a variable: written when any byte was read. Into a memory: an
+    // instruction loads elements from start (default: the lowest address)
+    // upward, at most count of them, until the file ends. The result is the
+    // number of bytes read.
+    E freadCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (args.size() < 2) unsupported("$fread arguments");
+        if (!stmtDepth) unsupported("$fread outside a procedural statement");
+        const Expression& dst = outArg(*args[0]);
+        const Type& t = dst.type->getCanonicalType();
+        int cnt = fresh(32);
+        if (t.isUnpackedArray()) {
+            const Symbol* msym = nullptr;
+            const Expression& m = peel(dst);
+            if (m.kind == ExpressionKind::NamedValue) msym = &m.as<NamedValueExpression>().symbol;
+            auto it = msym ? arrMap().find(msym) : arrMap().end();
+            if (it == arrMap().end()) unsupported("$fread into this array");
+            if (it->second->dims.size() != 1) unsupported("$fread into a multidimensional array");
+            const Type& el = t.getArrayElementType()->getCanonicalType();
+            if (!el.isIntegral()) unsupported("$fread into an array of non-integral elements");
+            Instr i; i.k = IK::ReadMem; i.arr = it->second; i.pw = 1;   // pw 1: $fread
+            i.dres = cnt;
+            i.args.push_back(expr(*args[1]));
+            for (size_t a = 2; a < 4; a++)
+                i.args.push_back(a < args.size() && args[a]->kind != ExpressionKind::EmptyArgument ? expr(*args[a]) : E());
+            prog.emit(i);
+            return ref(cnt, true);
+        }
+        if (!t.isIntegral()) unsupported("$fread into a non-integral variable (unpacked structs not yet)");
+        int w = (int)t.getBitWidth();
+        Instr r; r.k = IK::Assign; r.sig = cnt;
+        r.e = sysFnNode(SF_FREAD, {expr(*args[1]), konst(mk((w + 7) / 8, 32))});
+        prog.emit(r);
+        Instr j; j.k = IK::JmpIfNot; j.e = ref(cnt);
+        size_t jf = prog.emit(j);
+        Instr wr; wr.k = IK::Assign;
+        lhs(dst, wr);
+        wr.e = sysFnNode(SF_FREAD_GET, {}, w);
+        prog.emit(wr);
+        prog.code[jf].target = prog.here();
+        return ref(cnt, true);
+    }
     // Enumeration methods (6.19.5): first, last, num, next(N), prev(N), name.
     // Each is a chain of compares against the declared values. A value that
     // is not a member gives the type's default for next / prev and "" for name.
@@ -4735,6 +4908,19 @@ struct Lowerer {
         if (n == "$dist_uniform" && args.size() == 3)
             return seededCall(SF_DIST_UNIFORM, *args[0], {resize(a(1), 32, args[1]->type->isSigned(), true),
                                                           resize(a(2), 32, args[2]->type->isSigned(), true)});
+        {   // $dist_normal and the rest of 20.14 / Annex N
+            static const std::pair<const char*, int> dists[] = {
+                {"$dist_normal", SF_DIST_NORMAL}, {"$dist_exponential", SF_DIST_EXPONENTIAL},
+                {"$dist_poisson", SF_DIST_POISSON}, {"$dist_chi_square", SF_DIST_CHI_SQUARE},
+                {"$dist_t", SF_DIST_T}, {"$dist_erlang", SF_DIST_ERLANG}};
+            for (auto& [dn, id] : dists)
+                if (n == dn && !args.empty()) {
+                    std::vector<E> more;
+                    for (size_t i = 1; i < args.size(); i++) more.push_back(resize(a(i), 32, args[i]->type->isSigned(), true));
+                    return seededCall(id, *args[0], more);
+                }
+        }
+        if (n == "$system") return args.empty() ? sysFnNode(SF_SYSTEM, {}) : sysFnNode(SF_SYSTEM, {strOf(*args[0])});
         if (n == "$urandom") return args.empty() ? sysFnNode(SF_URANDOM, {}) : sysFnNode(SF_URANDOM_SEED, {a(0)});
         if (n == "$urandom_range" && !args.empty()) {
             std::vector<E> k{a(0)};
@@ -4755,6 +4941,7 @@ struct Lowerer {
         if (n == "$fseek" && args.size() == 3) return sysFnNode(SF_FSEEK, {a(0), a(1), a(2)});
         if (n == "$rewind" && args.size() == 1) return sysFnNode(SF_FSEEK, {a(0)});
         if (n == "$fgets") return fgetsCall(call);
+        if (n == "$fread") return freadCall(call);
         if (n == "$fscanf") return scanCall(call, true);
         if (n == "$sscanf") return scanCall(call, false);
         if (n == "$fdisplay" || n == "$fdisplayb" || n == "$fdisplayo" || n == "$fdisplayh" ||
@@ -5619,7 +5806,7 @@ struct Lowerer {
         std::string_view base = n;
         if (base.size() > 1 && (base.ends_with('b') || base.ends_with('o') || base.ends_with('h')) &&
             (base.starts_with("$display") || base.starts_with("$write") || base.starts_with("$strobe") ||
-             base.starts_with("$monitor")) &&
+             base.starts_with("$monitor") || base.starts_with("$fstrobe") || base.starts_with("$fmonitor")) &&
             base != "$monitoron") {
             dflt = base.back();
             base.remove_suffix(1);
@@ -5628,12 +5815,17 @@ struct Lowerer {
         else if (base == "$write") { k = IK::Display; nonl = true; }
         else if (base == "$strobe") k = IK::Strobe;
         else if (base == "$monitor") k = IK::Monitor;
+        else if (base == "$fstrobe" || base == "$fmonitor") k = base == "$fstrobe" ? IK::Strobe : IK::Monitor;
         else {
             // Waveform tasks only change what msim -vcd writes, so skipping
             // them changes no result. Any other task would be a silent wrong
             // answer if it were skipped, so it is an error.
+            if (n == "$dumpfile" || n == "$dumpvars" || n == "$dumpon" || n == "$dumpoff" || n == "$dumpall" ||
+                n == "$dumpflush" || n == "$dumplimit") {
+                lowerDump(call, n);
+                return;
+            }
             static const std::set<std::string_view> harmless = {
-                "$dumpfile", "$dumpvars", "$dumpon", "$dumpoff", "$dumpall", "$dumpflush", "$dumplimit",
                 "$dumpports", "$set_coverage_db_name", "$load_coverage_db", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
                 "$vcdpluson", "$vcdplusoff", "$vcdplusfile", "$shm_open", "$shm_probe", "$recordvars"};
             if (!harmless.count(n)) unsupported(("system task " + std::string(n)).c_str());
@@ -5642,7 +5834,50 @@ struct Lowerer {
         }
         Instr i; i.k = k; i.nonl = nonl;
         hierName = scopeName(call);
-        formatInto(call.arguments(), dflt, i.fmt, i.args);
+        auto fargs = call.arguments();
+        if (base[1] == 'f') {   // $fstrobe / $fmonitor (21.3.2): the first argument is the descriptor
+            if (fargs.empty()) unsupported("$fstrobe / $fmonitor without a descriptor");
+            i.fd = expr(*fargs[0]);
+            fargs = fargs.subspan(1);
+        }
+        formatInto(fargs, dflt, i.fmt, i.args);
+        prog.emit(i);
+    }
+
+    // VCD tasks (21.7.1). $dumpvars scope and variable arguments become
+    // signal-name prefixes: msim names a signal by its path below the top
+    // module ("u1.x"), so top.u1 is "u1." and the top itself is "".
+    void lowerDump(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        Instr i;
+        i.k = IK::Dump;
+        auto args = call.arguments();
+        if (n == "$dumpfile") {
+            i.dcmd = DC_FILE;
+            if (!args.empty()) i.args.push_back(strOf(*args[0]));
+        } else if (n == "$dumpvars") {
+            i.dcmd = DC_VARS;
+            if (!args.empty()) i.args.push_back(expr(*args[0]));
+            for (size_t a = 1; a < args.size(); a++) {
+                const Expression* x = args[a];
+                const Symbol* sym = nullptr;
+                if (x->kind == ExpressionKind::ArbitrarySymbol) sym = x->as<ArbitrarySymbolExpression>().symbol.get();
+                else if (x->kind == ExpressionKind::NamedValue || x->kind == ExpressionKind::HierarchicalValue)
+                    sym = &x->as<ValueExpressionBase>().symbol;
+                if (!sym) unsupported("$dumpvars argument");
+                std::string path = sym->getHierarchicalPath();
+                size_t d = path.find('.');
+                std::string rel = path.find("::") != std::string::npos ? path   // a package variable: "pkg::x"
+                                : d == std::string::npos ? std::string() : path.substr(d + 1);
+                bool var = sym->kind != SymbolKind::Instance;
+                if (!var && !rel.empty()) rel.push_back('.');
+                i.dsel.push_back({rel, var});
+            }
+        } else {
+            i.dcmd = n == "$dumpon" ? DC_ON : n == "$dumpoff" ? DC_OFF : n == "$dumpall" ? DC_ALL
+                   : n == "$dumpflush" ? DC_FLUSH : DC_LIMIT;
+            if (i.dcmd == DC_LIMIT && !args.empty()) i.args.push_back(expr(*args[0]));
+        }
         prog.emit(i);
     }
 

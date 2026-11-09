@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),
+  `$system`, the array query functions on every kind of dimension,
+  `$typename`, and the VCD tasks (`$dumpfile`, `$dumpvars` with a level and
+  scope selection, `$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` /
+  `$dumplimit`). A design's `$dumpvars` now writes its dump file without
+  `-vcd`.
+- `$fstrobe`, `$fmonitor` (several at once, cancelled by `$fclose`) and
+  `$fread` (21.3.2, 21.3.4.4).
 - VPI (clauses 36-38): `vpi_user.h`, VPI libraries loaded before
   elaboration (`-load`, `-loadvpi`, or C files on the command line), user
   system tasks and functions, the module / net / variable / memory /

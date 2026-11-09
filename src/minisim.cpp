@@ -303,7 +303,13 @@ struct Sim {
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
     // Postponed region, after NBA and before time advances. `mon` marks the
     // single $monitor slot; anything else is a $strobe, in schedule order.
-    struct Post { bool mon = false; string fmt; vector<E> args; };
+    // A postponed print: $strobe, $monitor (mon), or to a file with $fstrobe /
+    // $fmonitor (file, fd; fmon is the $fmonitor's index).
+    struct Post { bool mon = false; string fmt; vector<E> args; bool file = false; uint32_t fd = 0; int fmon = -1; };
+    // $fmonitor (21.3.2): any number can be active at once; $fclose of the
+    // descriptor ends one (on = false).
+    struct FMon { bool on = true, queued = false; uint32_t fd; string fmt; vector<E> args; vector<int> watch; };
+    vector<FMon> fmons;
     deque<Post> postq;
     // The reactive region set (4.4.2.6-4.4.2.8): reactive, re-inactive
     // (#0 from the reactive region) and re-NBA. Assertion action blocks run
@@ -354,8 +360,23 @@ struct Sim {
     vector<uint32_t> fstH;                           // FST handle per signal (0: not dumped)
     string fstBuf;
     bool waving() const { return vcd.is_open() || fst != nullptr; }
+    // VCD tasks (21.7.1). msim -vcd dumps every signal from time 0 and the
+    // design's $dumpfile / $dumpvars are ignored; without -vcd, $dumpvars
+    // opens $dumpfile's file (default dump.vcd) at the end of its time slot,
+    // with the selected signals. $dumpoff / $dumpon / $dumpall / $dumpflush /
+    // $dumplimit work on either.
+    bool dumpCli = false, dumpPend = false, dumpOff = false, dumpStopped = false;
+    string dumpFile = "dump.vcd";
+    vector<char> dumpSel;                            // empty: every signal
+    uint64_t dumpLimit = 0;                          // bytes; 0: no limit
+    bool dumped(size_t i) const {
+        return !sigs[i].hide && (dumpSel.empty() || (i < dumpSel.size() && dumpSel[i]));
+    }
 
-    Sim() { g_sformat = &Sim::sformat; }
+    Sim() {
+        g_sformat = &Sim::sformat;
+        g_fcloseHook = &Sim::closeHook;
+    }
 
     // ---- multi-core: deterministic parallel batches ----
     // `threads` workers (default: defaultThreads(); msim -threads N).
@@ -600,7 +621,7 @@ struct Sim {
         }
         // A waveform and coverage keep the partitions parallel: each records
         // its changes (dumped below, in partition order) and toggles.
-        if (parts.empty() || mon.on) {
+        if (parts.empty() || mon.on || !fmons.empty()) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
             for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
@@ -1316,7 +1337,49 @@ struct Sim {
         for (const auto& a : args) collectRefs(a, mon.watch);
         queueMon();
     }
+    static void closeHook(uint32_t fd);
+    void strobeF(uint32_t fd, const string& fmt, const vector<E>& args) {
+        Post p{false, fmt, args, true, fd};
+        postq.push_back(std::move(p));
+    }
+    void queueFMon(size_t k) {
+        FMon& m = fmons[k];
+        if (!m.on || m.queued) return;
+        Post p{false, m.fmt, m.args, true, m.fd, (int)k};
+        postq.push_back(std::move(p));
+        m.queued = true;
+    }
+    void armFMon(uint32_t fd, const string& fmt, const vector<E>& args) {
+        FMon m;
+        m.fd = fd;
+        m.fmt = fmt;
+        m.args = args;
+        for (const auto& a : args) collectRefs(a, m.watch);
+        fmons.push_back(std::move(m));
+        observed = true;
+        queueFMon(fmons.size() - 1);
+    }
+    // $fclose: the closed descriptor's pending $fstrobe / $fmonitor lines and
+    // its $fmonitors end. Closing channels of a multichannel descriptor drops
+    // them from it.
+    void fileClosed(uint32_t fd) {
+        auto left = [&](uint32_t d) -> uint32_t {
+            if ((fd & 0x80000000u) || (d & 0x80000000u)) return d == fd ? 0 : d;
+            return d & ~(fd & ~1u);   // channel 0 (stdout) is never closed
+        };
+        for (auto& m : fmons) if (m.on && !(m.fd = left(m.fd))) m.on = false;
+        for (auto it = postq.begin(); it != postq.end();) {
+            if (it->file && !(it->fd = left(it->fd))) {
+                if (it->fmon >= 0) fmons[(size_t)it->fmon].queued = false;
+                it = postq.erase(it);
+            } else ++it;
+        }
+    }
     void noteChange(int s) {
+        if (__builtin_expect(!fmons.empty(), 0))
+            for (size_t k = 0; k < fmons.size(); k++)
+                if (fmons[k].on && !fmons[k].queued)
+                    for (int w : fmons[k].watch) if (w == s) { queueFMon(k); break; }
         if (!mon.on || mon.queued) return;
         for (int w : mon.watch) if (w == s) { queueMon(); return; }
     }
@@ -1325,6 +1388,11 @@ struct Sim {
             Post p = move(postq.front());
             postq.pop_front();
             if (p.mon) mon.queued = false;
+            if (p.file) {
+                if (p.fmon >= 0) fmons[(size_t)p.fmon].queued = false;
+                fileWrite(p.fd, sformat(p.fmt, p.args, [&](int s) { return get(s); }) + "\n");
+                continue;
+            }
             printSys(p.fmt, p.args);
         }
     }
@@ -1405,12 +1473,25 @@ struct Sim {
         if (sigs[s].hide) return;
 #ifdef MINISIM_FST
         if (fst) {
+            if (dumpOff || !dumped((size_t)s)) return;
             if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; }
             writeVal(s, v);
             return;
         }
 #endif
-        if (!vcd.is_open()) return;
+        if (!vcd.is_open() || !vcd) return;
+        if (dumpOff || dumpStopped || !dumped((size_t)s)) return;
+        stamp();
+        writeVal(s, v);
+        if (dumpLimit && (uint64_t)vcd.tellp() + vbuf.size() >= dumpLimit) {
+            vbuf += "$comment Note: $dumplimit reached; dumping stops $end\n";
+            dumpStopped = true;
+        }
+    }
+    void stamp() {
+#ifdef MINISIM_FST
+        if (fst) { if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; } return; }
+#endif
         if (lastDump != now) {
             char t[24];
             auto r = std::to_chars(t, t + sizeof t, now);
@@ -1419,7 +1500,105 @@ struct Sim {
             vbuf += '\n';
             lastDump = now;
         }
-        writeVal(s, v);
+    }
+    // Every dumped signal, as X ($dumpoff) or its value ($dumpon, $dumpall).
+    void dumpBlock(const char* kw, bool asX) {
+        stamp();
+        if (!fst) { vbuf += kw; vbuf += '\n'; }
+        for (size_t i = 0; i < sigs.size(); i++) {
+            if (!dumped(i)) continue;
+            if (asX) writeVal((int)i, allx(sigs[i].w));
+            else writeVal((int)i);
+        }
+        if (!fst) vbuf += "$end\n";
+    }
+    // Selects signals for $dumpvars: sel holds name prefixes of scopes
+    // (levels deep, 0 = all below) and exact names of variables.
+    void dumpSelect(int64_t levels, const vector<pair<string, bool>>& sel) {
+        if (dumpSel.size() != sigs.size()) dumpSel.assign(sigs.size(), 0);
+        vector<pair<string, bool>> all;
+        if (sel.empty()) all.push_back({"", false});
+        const auto& use = sel.empty() ? all : sel;
+        if (levels < 0) levels = 0;
+        for (size_t i = 0; i < sigs.size(); i++) {
+            const string& n = sigs[i].name;
+            for (const auto& [p, var] : use) {
+                if (n.compare(0, p.size(), p) != 0) continue;
+                if (var) {
+                    if (n.size() == p.size() || n[p.size()] == '[') { dumpSel[i] = 1; break; }
+                    continue;
+                }
+                if (p.find("::") == string::npos && n.find("::") != string::npos && !sel.empty()) continue;
+                int depth = 0, br = 0;
+                for (size_t k = p.size(); k < n.size(); k++) {
+                    if (n[k] == '[') br++;
+                    else if (n[k] == ']') br--;
+                    else if (n[k] == '.' && !br) depth++;
+                }
+                if (levels == 0 || depth < levels) { dumpSel[i] = 1; break; }
+            }
+        }
+    }
+    void dumpTask(int cmd, const string& str, int64_t num, const vector<pair<string, bool>>& sel) {
+        switch (cmd) {
+            case DC_FILE:
+                if (dumpCli || waving() || dumpPend) return;
+                if (!str.empty()) dumpFile = str;
+                return;
+            case DC_VARS:
+                if (dumpCli) return;
+                if (waving()) { cerr << "msim: $dumpvars after the dump has started is ignored (21.7.1.2)\n"; return; }
+                dumpPend = true;
+                rare = true;   // slotTail() opens the file at the end of this slot
+                if (sel.empty() && num < 0) { dumpSel.assign(sigs.size(), 1); return; }
+                dumpSelect(num, sel);
+                return;
+            case DC_OFF:
+                if (dumpOff) return;
+                dumpOff = true;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+                dumpBlock("$dumpoff", true);
+                return;
+            case DC_ON:
+                if (!dumpOff) return;
+                dumpOff = false;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 1); }
+#endif
+                dumpBlock("$dumpon", false);
+                return;
+            case DC_ALL:
+                if (waving() && !dumpOff && !dumpStopped) dumpBlock("$dumpall", false);
+                return;
+            case DC_FLUSH:
+#ifdef MINISIM_FST
+                if (fst) { fstWriterFlushContext((fstWriterContext*)fst); return; }
+#endif
+                if (vcd.is_open()) { flushVcd(); vcd.flush(); }
+                return;
+            case DC_LIMIT:
+                dumpLimit = num > 0 ? (uint64_t)num : 0;
+                return;
+        }
+    }
+    // $dumpvars without -vcd: the header and the values at the end of the slot.
+    void startDump() {
+        dumpPend = false;
+        vcdPath = dumpFile;
+        header();
+        if (!waving()) return;
+        if (!fst) { lastDump = now - 1; stamp(); }
+        dumpvars();
+        if (dumpOff) {
+#ifdef MINISIM_FST
+            if (fst) { fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+            dumpBlock("$dumpoff", true);
+        }
     }
     // set() only writes a line when a value changes, so a signal still holding
     // its starting value (cnt stays X until the first clock) never appears.
@@ -1430,14 +1609,14 @@ struct Sim {
         if (fst) {
             // FST has no $dumpvars block: the time-0 values are ordinary changes.
             fstWriterEmitTimeChange((fstWriterContext*)fst, now);
-            for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+            for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
             lastDump = now;
             return;
         }
 #endif
-        if (!vcd.is_open()) return;
+        if (!vcd.is_open() || !vcd) return;
         vbuf += "$dumpvars\n";
-        for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+        for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
         vbuf += "$end\n";
     }
 
@@ -1655,6 +1834,7 @@ struct Sim {
             drainPost();
             return true;
         }
+        if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
         if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
         rare = false;
@@ -1710,7 +1890,7 @@ struct Sim {
         struct Scope { string name; vector<size_t> vars; vector<Scope> kids; };
         Scope root{vcdTop.empty() ? string("top") : vcdTop, {}, {}};
         for (size_t i = 0; i < sigs.size(); i++) {
-            if (sigs[i].hide) continue;
+            if (!dumped(i)) continue;
             Scope* sc = &root;
             const string& n = sigs[i].name;
             size_t b = 0, e;
@@ -1771,7 +1951,7 @@ struct Sim {
         run(~0ULL, false);
     }
     void run(uint64_t end, bool start = true) {
-        if (start) { header(); dumpvars(); }
+        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); }
         if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
@@ -1819,6 +1999,7 @@ struct Sim {
 };
 
 Sim S;
+inline void Sim::closeHook(uint32_t fd) { S.fileClosed(fd); }
 
 // Frames and objects (expr.hpp): blocks of hidden signals made at run time.
 static int allocFrameSigs(const FrameLayout& L) {

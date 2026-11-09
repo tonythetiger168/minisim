@@ -52,6 +52,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <iostream>
+#include <sys/wait.h>
 
 // One 64-bit limb of a wide value. v/x/z use the same encoding as Val.
 struct Limb {
@@ -1403,7 +1405,19 @@ enum SysFnId : int {
     SF_OBJ_SRANDOM,  // obj.srandom(seed) (18.13.3): kid0 the object
     SF_OBJ_GETSTATE, // obj.get_randstate(): the generator state as a string
     SF_OBJ_SETSTATE, // obj.set_randstate(state)
-    SF_CG            // a covergroup operation (19): lo is the CgOp, run by g_cgHook
+    SF_CG,           // a covergroup operation (19): lo is the CgOp, run by g_cgHook
+    // ---- DPI / remaining-chapters thread ----
+    // $dist_* (20.14, Annex N): {new seed, value}, 64 bits, like SF_DIST_UNIFORM.
+    SF_DIST_NORMAL,      // (seed, mean, standard deviation)
+    SF_DIST_EXPONENTIAL, // (seed, mean)
+    SF_DIST_POISSON,     // (seed, mean)
+    SF_DIST_CHI_SQUARE,  // (seed, degrees of freedom)
+    SF_DIST_T,           // (seed, degrees of freedom)
+    SF_DIST_ERLANG,      // (seed, k, mean)
+    SF_SYSTEM,           // $system(command) (20.17): the shell's exit status
+    SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
+    SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
+    SF_FREAD_GET         // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
 };
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
 enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
@@ -1620,6 +1634,50 @@ inline int32_t rtlDistUniform(int32_t& seed, int32_t start, int32_t end) {
     return (int32_t)i;
 }
 inline int32_t& globalRandomSeed() { static int32_t s = 0; return s; }
+// The other Annex N distributions, in the same 32-bit arithmetic.
+inline double rtlNormal(int32_t& seed, int32_t mean, int32_t dev) {
+    double v1 = 0, v2 = 0, s = 1.0;
+    while (s >= 1.0 || s == 0.0) {
+        v1 = rtlUniform(seed, -1, 1);
+        v2 = rtlUniform(seed, -1, 1);
+        s = v1 * v1 + v2 * v2;
+    }
+    s = v1 * std::sqrt(-2.0 * std::log(s) / s);
+    return s * (double)dev + (double)mean;
+}
+inline double rtlExponential(int32_t& seed, int32_t mean) {
+    double n = rtlUniform(seed, 0, 1);
+    if (n != 0) n = -std::log(n) * mean;
+    return n;
+}
+inline int32_t rtlPoisson(int32_t& seed, int32_t mean) {
+    int32_t n = 0;
+    double p = std::exp(-(double)mean), q = rtlUniform(seed, 0, 1);
+    while (p < q) {
+        n++;
+        q = rtlUniform(seed, 0, 1) * q;
+    }
+    return n;
+}
+inline double rtlChiSquare(int32_t& seed, int32_t df) {
+    double x = 0.0;
+    if (df % 2) { x = rtlNormal(seed, 0, 1); x = x * x; }
+    for (int32_t k = 2; k <= df; k += 2) x = x + 2 * rtlExponential(seed, 1);
+    return x;
+}
+inline double rtlT(int32_t& seed, int32_t df) {
+    double chi2 = rtlChiSquare(seed, df);
+    double root = std::sqrt(chi2 / (double)df);
+    return rtlNormal(seed, 0, 1) / root;
+}
+inline double rtlErlang(int32_t& seed, int32_t k, int32_t mean) {
+    double x = 1.0;
+    for (int32_t i = 1; i <= k; i++) x = x * rtlUniform(seed, 0, 1);
+    return -(double)mean * std::log(x) / (double)k;
+}
+// Round half away from zero, as the rtl_dist_* wrappers do.
+inline int32_t rtlRound(double r) { return r >= 0 ? (int32_t)(r + 0.5) : -(int32_t)(-r + 0.5); }
+inline void rtlWarn(const char* what) { std::cerr << "WARNING: " << what << "\n"; }
 // $urandom: the generator is implementation-defined (18.13). minisim uses
 // one 64-bit xorshift* stream, seeded by -seed (default 1), so a run repeats.
 // Random stability (18.14.2): every process (thread) has its own generator.
@@ -1673,6 +1731,20 @@ inline void fileWrite(uint32_t fd, const std::string& t) {
         if ((fd >> b) & 1 && files().mcd[b]) fwrite(t.data(), 1, t.size(), files().mcd[b]);
 }
 inline std::string& scanText() { static std::string s; return s; }
+inline std::string& freadBuf() { static std::string s; return s; }
+// $fclose cancels the $fstrobe / $fmonitor output to the closed descriptor (21.3.1).
+inline void (*g_fcloseHook)(uint32_t fd) = nullptr;
+// The first n bytes of `b` (zero past its end) as an unsigned big-endian value of w bits.
+inline Val bytesValue(const std::string& b, size_t n, int w) {
+    int bw = (int)n * 8;
+    Val v = make(0, 0, std::max(bw, 1), 0, false);
+    if (bw > 64) v = maskWidth(v, bw);
+    for (size_t k = 0; k < n; k++) {
+        unsigned char c = k < b.size() ? (unsigned char)b[k] : 0;
+        for (int j = 0; j < 8; j++) setBit(v, bw - 8 * (int)(k + 1) + j, (c >> j) & 1);
+    }
+    return v_resize(v, w, false);
+}
 inline std::vector<Val>& scanOut() { static std::vector<Val> v; return v; }
 // $fscanf / $sscanf (21.3.4) from a character source: next() gives a char or
 // EOF, back() returns the last one. The values read go to scanOut(); returns
@@ -1793,6 +1865,44 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
                                              : rtlDistUniform(seed, i32(a[1]), i32(a[2]));
             return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
         }
+        case SF_DIST_NORMAL: case SF_DIST_EXPONENTIAL: case SF_DIST_POISSON:
+        case SF_DIST_CHI_SQUARE: case SF_DIST_T: case SF_DIST_ERLANG: {
+            int32_t seed = i32(a[0]), r = 0;
+            int32_t p1 = a.size() > 1 ? i32(a[1]) : 0, p2 = a.size() > 2 ? i32(a[2]) : 0;
+            switch (id) {
+                case SF_DIST_NORMAL: r = rtlRound(rtlNormal(seed, p1, p2)); break;
+                case SF_DIST_EXPONENTIAL:
+                    if (p1 > 0) r = rtlRound(rtlExponential(seed, p1));
+                    else rtlWarn("Exponential distribution must have a positive mean");
+                    break;
+                case SF_DIST_POISSON:
+                    if (p1 > 0) r = rtlPoisson(seed, p1);
+                    else rtlWarn("Poisson distribution must have a positive mean");
+                    break;
+                case SF_DIST_CHI_SQUARE:
+                    if (p1 > 0) r = rtlRound(rtlChiSquare(seed, p1));
+                    else rtlWarn("Chi_square distribution must have positive degree of freedom");
+                    break;
+                case SF_DIST_T:
+                    if (p1 > 0) r = rtlRound(rtlT(seed, p1));
+                    else rtlWarn("t distribution must have positive degree of freedom");
+                    break;
+                default:
+                    if (p1 > 0) r = rtlRound(rtlErlang(seed, p1, p2));
+                    else rtlWarn("k-stage erlangian distribution must have positive k");
+                    break;
+            }
+            return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
+        }
+        case SF_SYSTEM: {   // 20.17: run the command in a shell; the result is its exit status
+            Val c = a.empty() ? mkstr("") : a[0];
+            c.str = true;
+            std::cout.flush();
+            fflush(stdout);
+            int st = std::system(v_str(c).c_str());
+            if (a.empty()) return sint(st != 0);   // $system() with no command: is a shell there
+            return sint(st == -1 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+        }
         case SF_URANDOM: return make(urandomNext(urandomState()), 0, 32, 0);
         case SF_OBJ_SRANDOM:
             objRng()[(int)u64(a[0])] = seedState(u64(a[1]));
@@ -1846,6 +1956,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         }
         case SF_FCLOSE: {
             uint32_t fd = (uint32_t)u64(a[0]);
+            if (g_fcloseHook) g_fcloseHook(fd);
             if (fd & 0x80000000u) {
                 uint32_t i = fd & 0x7fffffffu;
                 if (i >= 3 && i < files().fds.size() && files().fds[i]) { fclose(files().fds[i]); files().fds[i] = nullptr; }
@@ -1855,6 +1966,16 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             }
             return make(0, 0, 1, 0);
         }
+        case SF_FREAD: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            size_t n = (size_t)u64(a[1]);
+            std::string& b = freadBuf();
+            b.assign(n, '\0');
+            size_t got = f && n ? fread(b.data(), 1, n, f) : 0;
+            b.resize(got);
+            return sint((int64_t)got);
+        }
+        case SF_FREAD_GET: return bytesValue(freadBuf(), (size_t)(ctl + 7) / 8, ctl);
         case SF_FWRITE: {
             Val t = a[1]; t.str = true;
             fileWrite((uint32_t)u64(a[0]), v_str(t) + (ctl ? "\n" : ""));
@@ -2429,6 +2550,15 @@ inline Val eval(const E& e, const Reader& rd) {
             return make((g_simTime + d / 2) / d, 0, 64, 0);
         }
         case Op::SysFn: {
+            if (e->hi == SF_ASSOC_BOUND) {
+                auto& d = dynStore()[e->sig];
+                if (d.map.empty()) return xfill(32, true);
+                const DynKey& key = e->lo ? std::prev(d.map.end())->first : d.map.begin()->first;
+                Val kv = d.keyVal(key);
+                Val r = make((uint64_t)(uint32_t)v_to_i64(kv), 0, 32, 0);
+                r.sgn = true;
+                return r;
+            }
             std::vector<Val> a;
             for (size_t i = 0; i < e->kids.size(); i++) a.push_back(k((int)i));
             return v_sysfn(e->hi, e->lo, a);
