@@ -24,6 +24,7 @@
 //   -no-static-seq   run NBA-only always @(edge) blocks as ordinary processes
 //   -no-partition    apply every NBA on the main thread (no partition tasks)
 //   -no-2state       -compile without the 2-state fast path (codegen.hpp fast())
+//   -no-cycle        -compile without the cycle domain (codegen.hpp cycleDomain())
 //   -threads <n>     worker threads (default: every hardware thread). Results
 //                    are the same for any n; -threads 1 is single-threaded.
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
@@ -173,7 +174,7 @@ static void partitionInputs(const LowerResult& lowered, const Plan& pl, std::vec
 // design needs the interpreter.
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
-                       const Plan& pl, int threads, bool staticPart, bool twoState) {
+                       const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle) {
     std::vector<CodegenSig> sigs;
     for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
     std::vector<CodegenProc> procs;
@@ -198,7 +199,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         return -1;
     }
     try {
-        src = codegen(sigs, procs, parts, twoState);
+        // With a VCD every signal must live in S.sigs, so no private signals.
+        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath);
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -351,7 +353,7 @@ int main(int argc, char** argv) {
     std::optional<std::string> vcdPath;
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
-    bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true;
+    bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
@@ -371,6 +373,7 @@ int main(int argc, char** argv) {
         if (a == "-no-static-seq") { staticSeq = false; continue; }
         if (a == "-no-partition") { staticPart = false; continue; }
         if (a == "-no-2state") { twoState = false; continue; }
+        if (a == "-no-cycle") { cycle = false; continue; }
         if (a == "-threads") {
             std::string n = next("a thread count");
             try { threads = std::stoi(n); }
@@ -486,7 +489,7 @@ int main(int argc, char** argv) {
         compiled = false;
     }
     if (compiled) {
-        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState);
+        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle);
         if (st >= 0) return st;
     }
 

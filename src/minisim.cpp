@@ -186,6 +186,39 @@ struct Pool {
     }
 };
 
+// The time wheel: pending times and the processes waiting for each. Kept as
+// a vector sorted latest first, so the next time is at the back and taking it
+// is a pop; emptied bucket vectors are kept for reuse. A std::map here cost
+// two allocations and frees per time step (a clock toggling every few ticks
+// is most of them).
+struct Wheel {
+    struct Bucket { uint64_t first; vector<Handle> second; };
+    vector<Bucket> b;                 // descending by time
+    vector<vector<Handle>> spare;
+    vector<Handle>& operator[](uint64_t t) {
+        // Most inserts are the latest time or already present: look from the front.
+        size_t lo = 0, hi = b.size();
+        while (lo < hi) {             // first index with time <= t
+            size_t mid = (lo + hi) / 2;
+            if (b[mid].first > t) lo = mid + 1; else hi = mid;
+        }
+        if (lo < b.size() && b[lo].first == t) return b[lo].second;
+        vector<Handle> v;
+        if (!spare.empty()) { v = std::move(spare.back()); spare.pop_back(); }
+        b.insert(b.begin() + (ptrdiff_t)lo, Bucket{t, std::move(v)});
+        return b[lo].second;
+    }
+    bool empty() const { return b.empty(); }
+    Bucket* begin() { return &b.back(); }   // the earliest time
+    void erase(Bucket* it) {                // only the earliest
+        (void)it;
+        b.back().second.clear();
+        spare.push_back(std::move(b.back().second));
+        b.pop_back();
+    }
+    void clear() { b.clear(); }
+};
+
 struct Sim {
     vector<Sig> sigs;
     vector<vector<Waiter>> waiters;                  // dynamic sensitivity
@@ -203,7 +236,7 @@ struct Sim {
         vector<E> args;
         vector<int> watch;
     } mon;
-    map<uint64_t, vector<Handle>> wheel;             // time wheel
+    Wheel wheel;                                     // time wheel
     uint64_t now = 0, lastDump = ~0ULL;
     bool finished = false;
     int exitCode = 0;                                // the process exit status ($fatal sets 1)
@@ -401,6 +434,15 @@ struct Sim {
         return true;
     }
     void applyNba() {
+        if (fastCommit) {
+            // A compiled cycle domain: its NBAs are one marker item (s < 0).
+            // Partitions are never built alongside it.
+            for (auto& n : nbaRun) {
+                if (n.s < 0) { fastCommit(); continue; }
+                set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
+            }
+            return;
+        }
         if (parts.empty() || waving() || mon.on || g_cov) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
@@ -460,6 +502,102 @@ struct Sim {
             nbaq.insert(nbaq.end(), seqBufs[k].begin(), seqBufs[k].end());
         }
         seqq.clear();
+    }
+
+    // ---- compiled cycle domain (msim -compile, codegen.hpp) ----
+    // Like Verilator's eval(): the clocked processes that share one event
+    // list run as one function that stores their NBAs in fixed slots, and
+    // `fastCommit` writes those slots and then re-evaluates every static
+    // combinational process in rank order (registered as the single comb
+    // rank `fastComb`). Writes go through fw(), which stores the value
+    // directly when nothing else can see the signal change; otherwise it is
+    // an ordinary set(), so VCD, $monitor and waiting processes still work.
+    void (*fastCommit)() = nullptr;
+    int fastSeqId = -1, fastComb = -1;
+    vector<char> quiet;   // signal -> at most 64 bits, and only the cycle domain reacts to it
+    void fastInit() {
+        quiet.assign(sigs.size(), 1);
+        for (size_t s = 0; s < sigs.size(); s++) {
+            if (sigs[s].w > 64 || sigs[s].net && sigs[s].drv.empty()) quiet[s] = 0;
+            if (s < seqOf.size())
+                if (!seqOf[s].empty()) quiet[s] = 0;   // a clock: set() detects its edges
+            if (s < combOf.size())
+                for (int r : combOf[s]) if (r != fastComb) quiet[s] = 0;
+        }
+    }
+    bool observed = false;   // a VCD is open or $monitor was armed: every change is seen
+    // The common case inline: a narrow signal nobody else watches is a store.
+    __attribute__((always_inline)) void fw(int s, const Val& nv) {
+        Sig& g = sigs[s];
+        if (__builtin_expect(quiet[s] && !observed && waiters[s].empty(), 1)) {
+            uint64_t m = mask(g.w);
+            g.val.v = nv.v & m;
+            g.val.x = nv.x & m;
+            g.val.z = nv.z & m;
+            g.val.real = nv.real;
+            g.val.str = nv.str;
+            return;
+        }
+        fwSlow(s, nv);
+    }
+    // The same for a known (2-state) value, without building a Val.
+    __attribute__((always_inline)) void fwv(int s, uint64_t v) {
+        Sig& g = sigs[s];
+        if (__builtin_expect(quiet[s] && !observed && waiters[s].empty(), 1)) {
+            g.val.v = v & mask(g.w);
+            g.val.x = 0;
+            g.val.z = 0;
+            g.val.real = false;
+            g.val.str = false;
+            return;
+        }
+        fwSlow(s, make(v & mask(g.w), 0, g.w));
+    }
+    __attribute__((always_inline)) void fwdv(int s, int d, uint64_t v, int s0, int s1) {
+        Sig& g = sigs[s];
+        if (__builtin_expect(quiet[s] && g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ, 1)) {
+            Drv& dr = g.drv[0];
+            dr.v.v = v & mask(g.w);
+            dr.v.x = 0;
+            dr.v.z = 0;
+            dr.s0 = (uint8_t)s0;
+            dr.s1 = (uint8_t)s1;
+            fwv(s, v);
+            return;
+        }
+        drive(s, d, make(v & mask(g.w), 0, g.w), s0, s1);
+    }
+    __attribute__((noinline)) void fwSlow(int s, Val nv) {
+        Sig& g = sigs[s];
+        if (!quiet[s] || observed || !waiters[s].empty()) { set(s, std::move(nv)); return; }
+        nv = maskWidth(nv, g.w);   // a wide quiet signal
+        if (nv == g.val) return;
+        g.val = std::move(nv);
+    }
+    // A continuous assign: the net's only driver, strong 0 and 1, resolves to its value.
+    __attribute__((always_inline)) void fwd(int s, int d, const Val& v, int s0, int s1) {
+        Sig& g = sigs[s];
+        if (__builtin_expect(quiet[s] && g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ, 1)) {
+            uint64_t m = mask(g.w);
+            Drv& dr = g.drv[0];
+            dr.v.v = v.v & m & ~v.x;   // make(): an unknown bit's v is 0
+            dr.v.x = v.x & m;
+            dr.v.z = v.z & dr.v.x;
+            dr.s0 = (uint8_t)s0;
+            dr.s1 = (uint8_t)s1;
+            fw(s, dr.v);
+            return;
+        }
+        drive(s, d, v, s0, s1);
+    }
+    // A testbench wrote a private signal: re-evaluate the domain's comb logic.
+    void markFast() { if (fastComb >= 0) markComb(fastComb); }
+    // fastCommit's own comb pass: its writes must not queue the pass again.
+    void fastCombs(void (*all)(const void*)) {
+        int saved = curComb;
+        curComb = fastComb;
+        all(nullptr);
+        curComb = saved;
     }
 
     ~Sim() {
@@ -909,6 +1047,7 @@ struct Sim {
             mon.queued = false;
         }
         mon.on = true;
+        observed = true;
         mon.fmt = fmt;
         mon.args = args;
         mon.watch.clear();
@@ -1122,6 +1261,7 @@ struct Sim {
 
     void header() {
         if (vcdPath.empty()) return;
+        observed = true;   // every change is written: the cycle domain uses set()
         bool asFst = vcdPath.size() > 4 && vcdPath.compare(vcdPath.size() - 4, 4, ".fst") == 0;
 #ifdef MINISIM_FST
         if (asFst) {

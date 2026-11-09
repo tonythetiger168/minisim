@@ -84,6 +84,16 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(msim PRIVATE MINISIM_FST MINISIM_FST_DIR="${FST_SRC}")
   endif()
 
+  # Lint and clock-domain checks on the same front end: mlint design.sv
+  add_executable(mlint src/mlint.cpp)
+  target_include_directories(mlint PRIVATE src)
+  target_link_libraries(mlint PRIVATE slang::slang)
+
+  # Design-for-test checks and a scan chain plan: mdft design.sv
+  add_executable(mdft src/mdft.cpp)
+  target_include_directories(mdft PRIVATE src)
+  target_link_libraries(mdft PRIVATE slang::slang)
+
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
   target_link_libraries(test_lower PRIVATE slang::slang)
@@ -179,6 +189,14 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  add_test(NAME mlint
+           COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
+                   -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+
+  add_test(NAME mdft
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
+                   -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
+
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec
@@ -203,7 +221,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
