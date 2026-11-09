@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Function calls in constraints (18.5.12): methods, static and package
+  functions, nested calls, in guards, foreach bodies and inline `with`. The
+  rand variables a call reads are solved first.
 - rand dynamic arrays and queues (18.4): `size()` constraints, `foreach`
   over the elements and array reductions (`sum`, `product`, `and`, `or`,
   `xor`, with or without `with`) in constraints (18.5.8). Sizes are solved

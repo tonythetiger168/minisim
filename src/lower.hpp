@@ -3115,7 +3115,20 @@ struct Lowerer {
                 const auto& call = e.as<CallExpression>();
                 if (!call.isSystemCall()) {
                     if (E r = cgCall(call)) return r;   // c.sample(), c.get_coverage(), ... (19.8)
-                    E v = emitUserCall(call, true);
+                    E v;
+                    if (consDepth) {   // in a constraint: its own program, run at solve time (18.5.12)
+                        Prog saved = std::move(prog);
+                        prog = Prog{};
+                        v = emitUserCall(call, true);
+                        // The result into a temporary of its own: the callee's frame is gone by then.
+                        int w = storeW(*e.type);
+                        int t = fresh(w);
+                        Instr i; i.k = IK::Assign; i.sig = t; i.e = v;
+                        prog.emit(i);
+                        v = ref(t, e.type->isSigned());
+                        consFns.push_back(std::make_shared<Prog>(std::move(prog)));
+                        prog = std::move(saved);
+                    } else v = emitUserCall(call, true);
                     int w = storeW(*e.type);
                     needWidth(w);
                     return sized(std::move(v), w, e.type->isSigned(), ctx);
@@ -4319,10 +4332,22 @@ struct Lowerer {
     // The constraints of c (18.5), each guarded by `guard` (implication and
     // if-else bodies), as items.
     int consDepth = 0;   // > 0 while lowering constraints
+    std::vector<std::shared_ptr<Prog>> consFns;   // function calls lowered in the current constraint (18.5.12)
     void constraintItems(const slang::ast::Constraint& c, E guard, std::vector<RandItem>& items, BeforeList& before) {
         consDepth++;
         struct Out { int& d; ~Out() { d--; } } out{consDepth};
+        size_t f0 = consFns.size(), i0 = items.size();
         constraintItems1(c, guard, items, before);
+        // Calls lowered here (in a guard or an expression) go with every item
+        // this constraint made, after those of its parts.
+        if (consFns.size() > f0) {
+            std::function<void(RandItem&)> add = [&](RandItem& it) {
+                it.fns.insert(it.fns.end(), consFns.begin() + (long)f0, consFns.end());
+                for (auto& b : it.body) add(b);
+            };
+            for (size_t k = i0; k < items.size(); k++) add(items[k]);
+            consFns.resize(f0);
+        }
     }
     void constraintItems1(const slang::ast::Constraint& c, E guard, std::vector<RandItem>& items, BeforeList& before) {
         using namespace slang::ast;
