@@ -100,6 +100,16 @@ inline std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*>&
     static std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> m;
     return m;
 }
+// Events that an assignment or initializer may make an alias of another
+// (6.17): symbol -> a 64-bit slot holding (signal id + 1) of the event it names now.
+inline std::unordered_map<const slang::ast::Symbol*, int>& eventPtr() {
+    static std::unordered_map<const slang::ast::Symbol*, int> m;
+    return m;
+}
+inline std::unordered_set<const slang::ast::Symbol*>& assignedEvents() {
+    static std::unordered_set<const slang::ast::Symbol*> m;
+    return m;
+}
 inline bool& usesForce() { static bool f = false; return f; }   // some force / assign (10.6): no partitions
 inline std::vector<std::pair<int, uint8_t>>& netKinds() { static std::vector<std::pair<int, uint8_t>> v; return v; }
 // Dynamic arrays, queues, and associative arrays: symbol -> handle signal.
@@ -451,9 +461,39 @@ struct Lowerer {
             return indSlot(exprH(m.value()), ps->off, 2);
         }
         if (!ValueExpressionBase::isKind(x.kind)) unsupported("event expression");
-        int s = sigFind(&x.as<ValueExpressionBase>().symbol);
+        const Symbol* sym = &x.as<ValueExpressionBase>().symbol;
+        if (auto p = eventPtr().find(sym); p != eventPtr().end()) {   // maybe an alias (6.17): through its slot
+            int first = -1;
+            for (int k = 0; k < 2; k++) {
+                int tmp = fresh(64);
+                Instr i; i.k = IK::Assign; i.sig = tmp;
+                i.e = k ? bin(Op::Add, ref(p->second), konst(mk(1, 64))) : ref(p->second);
+                prog.emit(i);
+                int id = indThrough(tmp);
+                if (!k) first = id;
+            }
+            return first;
+        }
+        int s = sigFind(sym);
         if (s < 0) unsupported("event expression");
         return s;
+    }
+    // The (signal id + 1) of the event an expression names now: e, an alias, or null.
+    E eventAddr(const slang::ast::Expression& x0) {
+        using namespace slang::ast;
+        const Expression& x = peel(x0);
+        if (x.kind == ExpressionKind::NullLiteral) {   // a fresh event that is never triggered
+            int c = fresh(32);
+            if (fresh(64) != c + 1) unsupported("event signals that are not consecutive");
+            auto n = node(Op::AddrOf); n->sig = c;
+            return n;
+        }
+        if (ValueExpressionBase::isKind(x.kind))
+            if (auto p = eventPtr().find(&x.as<ValueExpressionBase>().symbol); p != eventPtr().end())
+                return ref(p->second);
+        if (classMember(x)) unsupported("assignment of an event property");
+        auto n = node(Op::AddrOf); n->sig = eventSig(x);
+        return n;
     }
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* subs = nullptr;
     MkSig mkSig;
@@ -3325,6 +3365,8 @@ struct Lowerer {
             }
             int sig;
             if (classMember(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x)
+            else if (ValueExpressionBase::isKind(s.expr.kind) && eventPtr().count(&s.expr.as<ValueExpressionBase>().symbol))
+                sig = eventSig(s.expr);   // an event that may be an alias (6.17)
             else if (ValueExpressionBase::isKind(s.expr.kind)) {
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
             } else {
@@ -3966,6 +4008,10 @@ struct Lowerer {
                     if (x.type->isFloating()) v = bin(Op::FMul, realOf(*a), konst(mkreal((double)ticksPerUnit())));
                     else if (ticksPerUnit() != 1) v = bin(Op::Mul, resize(v, 64, x.type->isSigned(), false), konst(mk(ticksPerUnit(), 64)));
                     out.push_back(v);
+                    continue;
+                }
+                if (sp.c == 's' && pe.kind == ExpressionKind::StringLiteral) {   // a literal of any length (5.9)
+                    out.push_back(strOf(*a));
                     continue;
                 }
                 if (sp.c == 'p') {
@@ -4911,6 +4957,14 @@ struct Lowerer {
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
             if (syncDrive(a)) return;   // cb.v <= e (14.16)
+            if (a.left().type->isEvent()) {   // e2 = e1: e2 names e1's event from now on (6.17)
+                const Expression& l = peel(a.left());
+                auto p = ValueExpressionBase::isKind(l.kind) ? eventPtr().find(&l.as<ValueExpressionBase>().symbol) : eventPtr().end();
+                if (p == eventPtr().end() || a.isNonBlocking() || a.timingControl) unsupported("this event assignment");
+                Instr i; i.k = IK::Assign; i.sig = p->second; i.e = eventAddr(a.right());
+                prog.emit(i);
+                return;
+            }
             if (int d = dynSig(a.left()); d >= 0) {   // q = '{1, 2}; d = new[8]; aa = other;
                 if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this container assignment");
                 assignContainer(d, a.right());
@@ -5781,6 +5835,8 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             if (mkSig(prefix + std::string(s.name) + "$trig", 64, false) != id + 1)
                 Lowerer::unsupported("event signals that are not consecutive");
             sigmap[&s] = id;
+            if (assignedEvents().count(&s))
+                eventPtr()[&s] = mkSig(prefix + std::string(s.name) + "$ptr", 64, false);
             return;
         }
         int w = storeW(s.getType());
@@ -6004,6 +6060,75 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
 
     void prep(Lowerer& lw) { lw.bind(subs, mkSig, tempSeq, &out.subs); }
 
+    // Nets of a user-defined nettype with a resolution function (6.6.7):
+    // each continuous driver writes its own variable, and one process calls
+    // the function with all of them whenever one changes (and once at time 0).
+    struct UserNet {
+        const slang::ast::NetSymbol* net = nullptr;
+        const slang::ast::SubroutineSymbol* fn = nullptr;
+        int w = 0;
+        std::vector<int> drivers;
+    };
+    std::map<int, UserNet> userNets;
+    bool userNetsFound = false;
+    UserNet* userNet(int sig) {
+        using namespace slang::ast;
+        if (!userNetsFound) {
+            userNetsFound = true;
+            for (auto& [sym, id] : sigmap) {
+                if (sym->kind != SymbolKind::Net) continue;
+                const auto& n = sym->as<NetSymbol>();
+                if (n.netType.netKind != NetType::UserDefined) continue;
+                if (const SubroutineSymbol* fn = n.netType.getResolutionFunction())
+                    userNets[id] = UserNet{&n, fn, storeW(n.getType()), {}};
+            }
+        }
+        auto it = userNets.find(sig);
+        return it == userNets.end() ? nullptr : &it->second;
+    }
+    void finishUserNets() {
+        using namespace slang::ast;
+        userNet(-1);
+        for (auto& [sig, un] : userNets) {
+            Lowerer L(sigmap);
+            prep(L);
+            L.setScope(un.net->getParentScope());
+            auto si = subs->find(un.fn);
+            if (si == subs->end()) Lowerer::unsupported("resolution function");
+            const Subr& sub = *si->second;
+            if (sub.args.size() != 1 || !sub.args[0].arr || !Lowerer::isDynType(sub.args[0].arr->getType()))
+                Lowerer::unsupported("resolution function that does not take one dynamic array");
+            int d = L.dynTemp(Lowerer::dynShapeOf(sub.args[0].arr->getType()));
+            L.prog.emit(L.dynCmd(d, D_DELETE));
+            for (int dv : un.drivers) { Instr p = L.dynCmd(d, D_PUSH_BACK); p.e = ref(dv); L.prog.emit(p); }
+            Instr c; c.k = IK::Call; c.callee = sub.prog;
+            E ret;
+            if (sub.lay) {
+                c.lay = sub.lay; c.noSelf = true;
+                c.dinit.push_back({sub.args[0].sig, d});
+                L.prog.emit(c);
+                ret = ref(relSig(kRelRet, sub.retSig), sub.retSgn);
+            } else {
+                int fd = L.dynFind(sub.args[0].arr);
+                if (fd < 0) Lowerer::unsupported("resolution function argument");
+                Instr cp = L.dynCmd(fd, D_COPY); cp.dsrc = d; L.prog.emit(cp);
+                L.prog.emit(c);
+                ret = ref(sub.retSig, sub.retSgn);
+            }
+            if (sub.retSig < 0) Lowerer::unsupported("resolution function with no result");
+            Instr a; a.k = IK::Assign; a.sig = sig; a.e = ret; a.drv = newDriver(sig);
+            L.prog.emit(a);
+            std::vector<std::pair<int, Edge>> ev;
+            for (int dv : un.drivers) ev.push_back({dv, ANY});
+            bool loops = !ev.empty();
+            if (loops) {
+                L.prog.emit(waitInstr(ev));
+                Instr j; j.k = IK::Jmp; j.target = 0; L.prog.emit(j);
+            }
+            out.procs.push_back({std::move(L.prog), loops, "resolve"});
+        }
+    }
+
     // One driver, then wait on every signal the right-hand side reads.
     // Several assigns to one wire each own a driver slot and resolve.
     void finishAssign(Lowerer& lw, Instr i) {
@@ -6011,6 +6136,21 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         // only those bits; the rest of its slot stays Z, so other drivers of
         // the other bits resolve with it.
         if (i.arr || i.bidx) Lowerer::unsupported("continuous assign to a variable index");
+        if (auto un = userNet(i.sig)) {   // a driver of a net with a resolution function (6.6.7): its own variable
+            if (i.hi >= 0) Lowerer::unsupported("continuous assign to part of a net of a user-defined nettype");
+            i.sig = mkSig("$" + std::to_string(i.sig) + "$drv" + std::to_string(un->drivers.size()), un->w, false);
+            un->drivers.push_back(i.sig);
+            i.s0 = i.s1 = STR_STRONG;
+            i.dly.clear();
+            lw.prog.emit(i);
+            auto rs = readSet(lw.prog);
+            if (!rs.empty()) {
+                lw.prog.emit(waitInstr(rs));
+                Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+            }
+            out.procs.push_back({std::move(lw.prog), !rs.empty(), "assign"});
+            return;
+        }
         i.drv = newDriver(i.sig);
         lw.prog.emit(i);
         auto rs = readSet(lw.prog);
@@ -6032,13 +6172,18 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         const slang::ast::Expression* e = v.getInitializer();
         if (v.getType().isEvent()) {   // both counters start at 0: not triggered
             if (!sigmap.count(&v)) return;   // an automatic one lives in a frame
-            if (e) Lowerer::unsupported("event initializer (event aliasing)");
             if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
             for (int k = 0; k < 2; k++) {
                 Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v) + k;
                 i.e = konst(mk(0, k ? 64 : 32));
                 init->prog.emit(i);
             }
+            if (auto p = eventPtr().find(&v); p != eventPtr().end()) {   // names itself, or its initializer's event
+                Instr i; i.k = IK::Assign; i.sig = p->second;
+                if (e) { init->setScope(v.getParentScope()); i.e = init->eventAddr(*e); }
+                else { auto n = node(Op::AddrOf); n->sig = sigmap.at(&v); i.e = n; }
+                init->prog.emit(i);
+            } else if (e) Lowerer::unsupported("event initializer");
             return;
         }
         const slang::ast::Scope* sc = v.getParentScope();
@@ -6446,6 +6591,21 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 Lowerer::unsupported("port kind");
             const auto& ps = conn->port.as<PortSymbol>();
             const Expression* ext = conn->getExpression();
+            if (!ext && !ps.isNullPort && ps.direction == ArgumentDirection::In && ps.isNetPort() &&
+                inst.getDefinition().unconnectedDrive != UnconnectedDrive::None) {
+                // `unconnected_drive pull1 / pull0 (22.9): an unconnected input is pulled.
+                if (auto formal = portFormal(ps)) {
+                    bool one = inst.getDefinition().unconnectedDrive == UnconnectedDrive::Pull1;
+                    std::vector<E> bits((size_t)formal->w, konst(mk(one ? 1 : 0, 1)));
+                    Lowerer lw(sigmap);
+                    prep(lw);
+                    Instr i; i.k = IK::Assign; i.sig = formal->sig;
+                    i.s0 = i.s1 = STR_PULL;
+                    i.e = formal->w == 1 ? bits[0] : concat(bits);
+                    finishAssign(lw, i);
+                }
+                continue;
+            }
             if (!ext || ps.isNullPort) continue;
             Lowerer::lastLoc() = ext->sourceRange.start().valid() ? ext->sourceRange.start() : inst.location;
             if (ps.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
@@ -6721,6 +6881,10 @@ inline ClassInfo* buildClass(const slang::ast::ClassType& ct,
             const auto& p = m.as<ClassPropertySymbol>();
             if (p.lifetime == VariableLifetime::Static) continue;
             propMap()[&p] = Lowerer::declSlot(p.getType(), ci->lay);
+            // An embedded covergroup's handle is null in a shallow copy (8.12, 19.4).
+            if (const Type& pt = p.getType().getCanonicalType(); pt.kind == SymbolKind::CovergroupType &&
+                pt.as<CovergroupType>().getParentScope() == static_cast<const Scope*>(&ct))
+                ci->lay->noCopy.push_back(propMap()[&p].off);
             if (p.randMode != RandMode::None) randModeMap()[&p] = ci->lay->add(1, mk(1));
             continue;
         }
@@ -6914,6 +7078,24 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             }
         } af;
         comp.getRoot().visit(af);
+        assignedEvents().clear();
+        eventPtr().clear();
+        struct EventAssignFinder : slang::ast::ASTVisitor<EventAssignFinder,
+                                       slang::ast::VisitFlags::Statements | slang::ast::VisitFlags::Expressions> {
+            void handle(const slang::ast::AssignmentExpression& a) {
+                using namespace slang::ast;
+                if (a.left().type->isEvent()) {
+                    const Expression& l = Lowerer::peel(a.left());
+                    if (ValueExpressionBase::isKind(l.kind)) assignedEvents().insert(&l.as<ValueExpressionBase>().symbol);
+                }
+                visitDefault(a);
+            }
+            void handle(const slang::ast::VariableSymbol& v) {
+                if (v.getType().isEvent() && v.getInitializer()) assignedEvents().insert(&v);
+                visitDefault(v);
+            }
+        } eaf;
+        comp.getRoot().visit(eaf);
         for (auto& [s, p] : af.up) aliasOf()[s] = af.root(s);
     }
     SigCollector sc(mkSig, sigmap);
@@ -7162,6 +7344,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     ProcCollector pc(sigmap, out, std::move(newDriver), &subMap, mkSig, &tempSeq);
     comp.getRoot().visit(pc);
     pc.finishPaths();
+    pc.finishUserNets();
     pc.placeInit();
     sampledInit(out);
     rejectRecursive(order);
