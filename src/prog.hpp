@@ -279,6 +279,15 @@ struct RandItem {
     // call's result into the temporary that e reads. They run at solve time
     // once the rand variables they read have values.
     std::vector<std::shared_ptr<Prog>> fns;
+    // m[i] of a container of containers (7.5, 18.4): the indirect id the
+    // constraint uses for it, and the DynElemRef that names it, resolved at
+    // solve time with the loop indices of that moment.
+    std::vector<std::pair<int, E>> refs;
+    // unique {q, x} with a dynamic array, queue or associative array in it
+    // (18.5.5): every element of those containers and every uniqElems value
+    // differ, pairwise, made at solve time when the sizes are known.
+    std::vector<int> uniqConts;
+    std::vector<E> uniqElems;
 };
 // A constraint block (18.5): its constraint_mode slot in the object.
 struct RandBlock {
@@ -296,6 +305,7 @@ struct RandVar {
     int off = 0, count = 1, w = 1, mode = -1;
     bool sgn = false, randc = false, obj = false;
     bool dyn = false;   // a dynamic array or queue: off is its container slot, w / sgn its elements'
+    int depth = 1;      // containers of containers (int m[][]): how many levels
 };
 struct RandSpec {
     std::vector<RandVar> vars;
@@ -311,6 +321,10 @@ struct RandCall {
     std::vector<E> args;        // the variables to randomize, as Refs
     bool argsGiven = false;     // randomize(...) with arguments (18.11): only those
     int objTmp = -1;
+    // Container arguments (randomize(q), 18.11): the container, its
+    // innermost element width and sign, and its levels (int m[][] is 2).
+    struct ContArg { int sig; int w; bool sgn; int depth; E addr; };   // addr: an ArrAddr giving id + 1, read in the object
+    std::vector<ContArg> contArgs;
 };
 struct Prog;
 // A class at run time (8): its object shape (slot 0 holds the class id),

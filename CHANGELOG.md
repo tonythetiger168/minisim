@@ -41,6 +41,22 @@ Spec references are IEEE 1800-2023 clauses.
   prototypes with `-dpiheader`. msim now links libffi.
 - `chandle` variables (6.14).
 - `repeat (n)` with a count known only at run time (12.7.2).
+- randomize() arguments that are arrays or containers (18.11), and whole
+  fixed-size array properties through a handle: `h.a = '{...}` and `%p`
+  of `h.a` (8.4).
+- Fixed-size arrays of containers (`int q[4][$]`) as class properties,
+  rand properties and automatic variables (7.4, 18.4), with `%p`, foreach,
+  object copies and access through a handle.
+- `unique` constraints over dynamic arrays, queues and associative arrays
+  (18.5.5), alone or with scalars, under implications and on `m[i]`.
+- Rand containers of containers (18.4, 7.5): `rand int m[][]`, queues of
+  queues, associative arrays of queues, with constraints on `m.size()`,
+  `m[i].size()`, `m[i].sum()` and `m[i][j]` in nested foreach loops. Sizes
+  are solved level by level and picked again when the elements have no
+  solution; a failed randomize() leaves the arrays unchanged.
+- rand associative arrays with string keys (18.4).
+- Per-process random generators (18.14.2): a forked process is seeded from
+  its parent, so values one process draws do not depend on other processes.
 - `mbug`: files regression (mregress `results.json`), lint (mlint) and DFT
   (mdft) failures as issues in GitHub Issues (default), Redmine or Jira, one
   issue per failure signature. A repeat of an open failure becomes a comment,
