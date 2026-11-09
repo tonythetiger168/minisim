@@ -62,6 +62,11 @@ if(MINISIM_WITH_SLANG)
   # -compile builds generated C++ against the kernel headers in src/.
   target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
 
+  # Lint and clock-domain checks on the same front end: mlint design.sv
+  add_executable(mlint src/mlint.cpp)
+  target_include_directories(mlint PRIVATE src)
+  target_link_libraries(mlint PRIVATE slang::slang)
+
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
   target_link_libraries(test_lower PRIVATE slang::slang)
@@ -135,6 +140,10 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  add_test(NAME mlint
+           COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
+                   -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+
   add_test(NAME slang_dump_counter
            COMMAND slang_dump ${CMAKE_SOURCE_DIR}/examples/counter.sv)
   set_tests_properties(slang_dump_counter PROPERTIES
@@ -153,7 +162,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)

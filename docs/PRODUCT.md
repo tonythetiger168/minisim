@@ -13,6 +13,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **msimprotect** | IEEE 1735 IP protection: encrypt source with `msimprotect`, simulate it with `msim -keyfile` | PR #29, planned for 0.2 |
 | **nocgen** | UVM testbench and memory-profile generator for AXI NoC meshes ([SoC-tb-regress-builder](https://github.com/tonythetiger168/SoC-tb-regress-builder)) | Separate repo; runs on msim once classes and UVM land |
 | **mregress** | Regression runner: test lists, seeds, parallel jobs, pass/fail triage, JUnit and HTML reports | Planned 0.3 |
+| **mlint** | Lint and clock-domain checks on the elaborated design: latches, assignment kind, multiple drivers, missing synchronizers, multi-bit crossings | Shipping next |
 | **mcov** | Functional coverage (covergroups) and code coverage, merged across a regression, UCIS-style report | Planned 0.4 |
 | **mwave** | Waveform output beyond VCD (FST), and a `$dumpfile`-compatible debug flow for GTKWave / Surfer | Planned 0.3 |
 

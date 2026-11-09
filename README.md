@@ -167,6 +167,32 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
+### Lint and clock-domain checks: `mlint`
+
+`mlint` runs the same front end as `msim` and then checks the elaborated
+design, so it needs no separate build setup:
+
+```sh
+mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
+mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any finding (for CI)
+mlint rtl/*.sv -disable L004 -disable CDC002
+mlint -list                                 # the rules
+```
+
+| Rule | What it finds |
+|---|---|
+| `L001` | A value is assigned on some paths of an `always_comb` but not all, so it holds its old value: an unintended latch (an `if` with no `else`, a `case` with no `default`) |
+| `L002` | A blocking assignment to a non-local variable in an `always_ff` |
+| `L003` | A non-blocking assignment in an `always_comb` |
+| `L004` | One value is assigned by more than one process |
+| `CDC001` | A flop reads another clock domain with no synchronizer, or through one flop only |
+| `CDC002` | A multi-bit bus crosses domains through a two-flop synchronizer, which does not keep its bits together |
+
+Clock domains come from the clock of every edge-triggered block, with signals
+joined across port connections, so one clock passed down through several
+modules stays one domain. Findings print as
+`file:line:col: warning: [RULE] text`, sorted by file and line.
+
 ## Known limits
 
 - `nmos`, `pmos`, `cmos`, `tran` (and the resistive forms), `bufif` / `notif`, and `trireg` charge storage are an error. Strength is resolved when a net is driven, and a read of the net is 0, 1, X, or Z.
