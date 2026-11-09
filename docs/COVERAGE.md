@@ -54,7 +54,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 10.3 | Continuous assignment | ✅ | with drive strength; to a whole signal or a constant bit / part select |
 | 10.3.1 | Net declaration assignment | ✅ | `10.3.1-net-decl-assign` |
 | 10.3.3 | Continuous assignment delays | ✅ | `assign #(r, f, z)`, `wire #d w = a`, net delays `wire #d w;`, gate delays; inertial, rise/fall/turn-off picked per Table 28-9, min:typ:max uses typ. `10.3.3-assign-delay`, `28.16-gate-delays` |
-| 10.6 | assign / deassign, force / release | ✅ | on whole variables and nets, constant bit and part selects of nets, array elements with a constant index, and concatenations of these (10.6.2); the expression is re-evaluated whenever its operands change; release hands a net back to its drivers, and a variable keeps its value. Not yet: inside an automatic task. `10.6.1-assign-deassign`, `10.6.2-force-release`, `10.6.2-force-expression`, `10.6.2-force-bits` |
+| 10.6 | assign / deassign, force / release | ✅ | on whole variables and nets, constant bit and part selects of nets, and concatenations of these (10.6.2); the expression is re-evaluated whenever its operands change; release hands a net back to its drivers, and a variable keeps its value. Not yet: inside an automatic task. `10.6.1-assign-deassign`, `10.6.2-force-release`, `10.6.2-force-expression`, `10.6.2-force-bits` |
 | 10.4 | Blocking / nonblocking | ✅ | whole signal, bit-select, part-select, and a concatenation `{a, b} = v` (also in `assign`). `11.4.12-concatenation-lvalue` |
 | 10.5 | Variable declaration assignment | ✅ | runs before every initial/always. `10.5-var-decl-init` |
 | 10.11 | Net aliasing | ✅ | `alias a = b = c;` makes one net. `10.11-net-alias` |
