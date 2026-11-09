@@ -72,6 +72,7 @@ script fails if any other test fails or if an xfail test starts passing.
 | 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue; dynamic arrays and queues by index, associative arrays in key order. `12.7.3-foreach`, `12.7.3-foreach-order`, `12.7.3-foreach-containers` |
 | 12.8 | break, continue, return | ✅ | |
 | 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`, no DPI. `13.4-function-automatic` |
+| 14 | Clocking blocks | ✅ | Inputs and inouts sampled with `#1step` (the value before the time step), `#0` (in the observed region), or `#N` (the value N time units before the event), and default skews (14.4, 14.13). Outputs: synchronous drives `cb.v[hi:lo] <= ##n e` in the re-NBA region after the output skew, the next event for a drive between events, last drive wins (14.16, 14.16.2). Targets may be hierarchical, slices, or concatenations; a net target gets its own driver, Z until the first drive. `@(cb)` runs after the inputs are updated, in the observed region (14.10); `@(cb.x)` waits on a sampled value (14.15); `##n` and `##0` (14.11); default clocking (14.12); global clocking and `$global_clock` (14.14); a clocking event with `iff`; clocking blocks in interfaces; `@(cb)` as an assertion clock. Not yet: skews with an edge (`output negedge #1`), clocking blocks in programs (24). `14.3-clocking-blocks`, `14.11-cycle-delay`, `14.13-input-skews`, `14.16-synchronous-drives`, `14.16-output-skews`, `14.9-interface-clocking`, `14.14-global-clocking` |
 | 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
 | 16.3 | Immediate assertions | ✅ | `assert`, `assume`, `cover` with pass and fail actions; an assert or assume with no `else` calls `$error`, named by its label (`top.a1`). `16.3-immediate-assertions` |
 | 16.4 | Deferred assertions | ✅ | `#0` (observed) and `final`, in procedures and as module items (an implied `always_comb`, 16.4.3). Reports wait on a per-process queue; a resume after an event control, or a `disable`, flushes it (16.4.2). Action arguments are evaluated when the assertion runs; observed actions run in the reactive region, final ones in the postponed region. `16.4-deferred-assertions`, `16.4.2-deferred-flush`, `16.4-observed-final` |
@@ -117,7 +118,7 @@ In order of how often typical testbenches hit them:
 1. ~~Unpacked arrays and memories (7.4), `foreach` (12.7.3), `$readmemh` (21.4)~~ done
 2. ~~Generate blocks (27), `+:` / `-:` part-selects (11.5.1)~~ done; values wider than 64 bits next
 3. ~~`` `timescale `` (22.7), delay expressions (9.4.1), named events (15.5), disable / wait fork (9.6), final (9.2.3)~~ done
-4. ~~`$urandom` (18.13), immediate and deferred assertions (16.3, 16.4), concurrent assertions (16.5–16.16)~~ done; clocking blocks (14) next
+4. ~~`$urandom` (18.13), immediate and deferred assertions (16.3, 16.4), concurrent assertions (16.5–16.16), clocking blocks (14)~~ done; covergroups (19) next
 5. ~~Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2), real (6.12), string (6.16)~~ done
 6. ~~Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8)~~ done; unpacked structs (7.2) next
 
