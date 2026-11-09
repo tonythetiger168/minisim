@@ -1358,6 +1358,9 @@ enum SysFnId : int {
     SF_FERROR,       // $ferror(fd, str): 0, no error text kept
     SF_SR2BITS,      // $shortrealtobits (20.5)
     SF_BITS2SR,      // $bitstoshortreal
+    SF_OBJ_SRANDOM,  // obj.srandom(seed) (18.13.3): kid0 the object
+    SF_OBJ_GETSTATE, // obj.get_randstate(): the generator state as a string
+    SF_OBJ_SETSTATE, // obj.set_randstate(state)
     SF_CG            // a covergroup operation (19): lo is the CgOp, run by g_cgHook
 };
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
@@ -1581,6 +1584,14 @@ inline uint32_t urandomNext(uint64_t& s) {
     s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
     return (uint32_t)((s * 0x2545F4914F6CDD1Dull) >> 32);
 }
+// Random stability (18.14.3): every object has its own generator, seeded
+// from the $urandom stream when the object is made; its randomize() and
+// srandom() use that one.
+inline std::unordered_map<int, uint64_t>& objRng() { static std::unordered_map<int, uint64_t> m; return m; }
+inline uint64_t seedState(uint64_t seed) {
+    uint64_t s = (seed + 1) * 0x9E3779B97F4A7C15ull;
+    return s ? s : 1;
+}
 // Runtime plusargs (21.6): every +arg on the command line, without the +.
 inline std::vector<std::string>& plusArgs() { static std::vector<std::string> v; return v; }
 inline const std::string* findPlusArg(const std::string& prefix) {
@@ -1736,6 +1747,19 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
         }
         case SF_URANDOM: return make(urandomNext(urandomState()), 0, 32, 0);
+        case SF_OBJ_SRANDOM:
+            objRng()[(int)u64(a[0])] = seedState(u64(a[1]));
+            return make(0, 0, 32, 0);
+        case SF_OBJ_GETSTATE: {
+            char b[32];
+            snprintf(b, sizeof b, "MS%016llx", (unsigned long long)objRng()[(int)u64(a[0])]);
+            return mkstr(b);
+        }
+        case SF_OBJ_SETSTATE: {
+            const std::string& t = v_str(a[1]);
+            if (t.size() == 18 && t[0] == 'M' && t[1] == 'S') objRng()[(int)u64(a[0])] = std::stoull(t.substr(2), nullptr, 16);
+            return make(0, 0, 32, 0);
+        }
         case SF_URANDOM_SEED: {
             uint64_t s = (u64(a[0]) + 1) * 0x9E3779B97F4A7C15ull;
             if (!s) s = 1;

@@ -327,6 +327,10 @@ inline void newObject(const Instr& i) {
         for (size_t k = 0; k < L.w.size(); k++) S.sigs[obj + (int)k].val = S.sigs[src + (int)k].val;
     if (src)
         for (auto& [off, o] : L.dyn) dynStore()[obj + off] = dynStore()[src + off];
+    // Its own random generator (18.14.3): seeded from the $urandom stream, or
+    // the source's state for a copy.
+    if (src) objRng()[obj] = objRng()[src];
+    else { uint64_t a = urandomNext(urandomState()), b = urandomNext(urandomState()); objRng()[obj] = seedState(a << 32 | b); }
     S.set(R(i.sig), make((uint64_t)obj, 0, 64));
 }
 
@@ -396,6 +400,8 @@ struct WaitFork {
 };
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+static int doRandomize(int obj, const RandCall* rc);   // rand.inc
+static void randModeAll(int obj, bool blocks, bool on);
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
     Task t = exec(p, c, std::move(fr));
     c->h = t.h;
@@ -761,6 +767,27 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::New: newObject(i); pc++; break;
+            case IK::Randomize: {   // 18.6, 18.12
+                int obj = 0;
+                if (i.e) {
+                    Val h = eval(i.e, rd);
+                    if (h.x || !h.v) nullAccess();
+                    obj = (int)h.v;
+                    if (i.rc && i.rc->objTmp >= 0) S.set(R(i.rc->objTmp), make((uint64_t)obj, 0, 64));
+                }
+                int r = doRandomize(obj, i.rc.get());
+                g_fr = fr.get();
+                g_ret = lastRet.get();
+                if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true));
+                pc++; break;
+            }
+            case IK::RandMode: {   // obj.rand_mode(v) / obj.constraint_mode(v) (18.8, 18.9)
+                Val h = eval(i.e, rd);
+                if (h.x || !h.v) nullAccess();
+                Val on = eval(i.de, rd);   // the on / off value
+                randModeAll((int)h.v, i.hi != 0, truth(on) == 1);
+                pc++; break;
+            }
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = i.target; }

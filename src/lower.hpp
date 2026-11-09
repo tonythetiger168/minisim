@@ -333,6 +333,19 @@ inline std::unordered_map<const slang::ast::SubroutineSymbol*, int>& vslotMap() 
     static std::unordered_map<const slang::ast::SubroutineSymbol*, int> m;
     return m;
 }
+// rand_mode / constraint_mode slots (18.8, 18.9) of rand properties and constraint blocks.
+inline std::unordered_map<const slang::ast::Symbol*, int>& randModeMap() {
+    static std::unordered_map<const slang::ast::Symbol*, int> m;
+    return m;
+}
+inline std::unordered_map<const slang::ast::Symbol*, int>& consModeMap() {
+    static std::unordered_map<const slang::ast::Symbol*, int> m;
+    return m;
+}
+inline std::unordered_map<const slang::ast::Symbol*, int>& staticConsMode() {
+    static std::unordered_map<const slang::ast::Symbol*, int> m;
+    return m;
+}
 // An interface class method's global number k (8.26); a call through an
 // interface handle has vslot -2 - k.
 inline std::unordered_map<const slang::ast::SubroutineSymbol*, int>& ifaceSlotMap() {
@@ -539,6 +552,7 @@ struct Lowerer {
         return it->second;
     }
     int sigFind(const slang::ast::Symbol* sym) const {
+        if (auto ov = symOverride.find(sym); ov != symOverride.end()) return ov->second;
         if (cgItemSig >= 0 && sym->kind == slang::ast::SymbolKind::Iterator && sym->name == "item") return cgItemSig;
         if (auto rf = refFormals().find(sym); rf != refFormals().end())
             return rf->second.kind == 0 ? indThrough(refSlot(sym)) : -1;
@@ -711,6 +725,195 @@ struct Lowerer {
         throw std::runtime_error(whereStr() + "lower: unsupported " + what);
     }
 
+    size_t emitJmpIfNot(E c) {
+        Instr j;
+        j.k = IK::JmpIfNot;
+        j.e = std::move(c);
+        return prog.emit(j);
+    }
+    // A random number in [0, total) for weighted choices (18.16, 18.17.1): two
+    // $urandom draws, so the 64-bit remainder is close to uniform.
+    E weightedPick(E total) {
+        E hi = resize(sysFnNode(SF_URANDOM, {}), 64, false, false);
+        E lo = resize(sysFnNode(SF_URANDOM, {}), 64, false, false);
+        E r = bin(Op::Or, bin(Op::Shl, hi, konst(mk(32, 32))), lo);
+        return bin(Op::Mod, r, total);
+    }
+    // randcase (18.16): weights summed, one draw, the branch whose share
+    // holds it. All weights zero: no branch.
+    void randCase(const slang::ast::RandCaseStatement& rc) {
+        std::vector<int> w;
+        E total;
+        for (const auto& it : rc.items) {
+            int t = fresh(64);
+            Instr i; i.k = IK::Assign; i.sig = t;
+            i.e = resize(expr(*it.expr), 64, it.expr->type->isSigned(), false);
+            prog.emit(i);
+            w.push_back(t);
+            total = total ? bin(Op::Add, total, ref(t)) : ref(t);
+        }
+        if (!total) return;
+        int r = fresh(64);
+        Instr d; d.k = IK::Assign; d.sig = r; d.e = weightedPick(total);
+        prog.emit(d);
+        std::vector<size_t> ends;
+        for (size_t k = 0; k < rc.items.size(); k++) {
+            size_t skip = emitJmpIfNot(bin(Op::Lt, ref(r), ref(w[k])));
+            stmt(*rc.items[k].stmt);
+            ends.push_back(emitJmp());
+            prog.code[skip].target = prog.here();
+            Instr sub; sub.k = IK::Assign; sub.sig = r; sub.e = bin(Op::Sub, ref(r), ref(w[k]));
+            prog.emit(sub);
+        }
+        patch(ends, prog.here());
+    }
+    // randsequence (18.17): each production is a subroutine with no frame, so
+    // productions can recurse; return in a code block ends its production,
+    // break ends the whole sequence (a flag every caller checks).
+    int rsBreak = -1;
+    std::unordered_map<const slang::ast::RandSeqProductionSymbol*, Prog*> rsProds;
+    void randSequence(const slang::ast::RandSequenceStatement& rs) {
+        using namespace slang::ast;
+        if (!rs.firstProduction) return;
+        if (!store) unsupported("randsequence here");
+        int savedBreak = rsBreak;
+        auto savedProds = rsProds;
+        rsBreak = fresh(1);
+        for (const RandSeqProductionSymbol* p : rs.productions) {
+            if (!p->arguments.empty() || !p->getReturnType().isVoid()) unsupported("randsequence production with arguments or a value");
+            store->push_back(std::make_unique<Prog>());
+            rsProds[p] = store->back().get();
+        }
+        for (const RandSeqProductionSymbol* p : rs.productions) {
+            Prog body;
+            std::swap(prog, body);
+            auto savedLoops = std::move(loops);
+            loops.clear();
+            auto savedNamed = std::move(named);
+            named.clear();
+            rsProduction(*p);
+            loops = std::move(savedLoops);
+            named = std::move(savedNamed);
+            std::swap(prog, body);
+            *rsProds[p] = std::move(body);
+        }
+        Instr clr; clr.k = IK::Assign; clr.sig = rsBreak; clr.e = konst(mk(0, 1));
+        prog.emit(clr);
+        rsCall(rs.firstProduction, false);
+        rsBreak = savedBreak;
+        rsProds = std::move(savedProds);
+    }
+    // Call production p; inside a production, return at once after a break.
+    void rsCall(const slang::ast::RandSeqProductionSymbol* p, bool inProd) {
+        Instr c; c.k = IK::Call; c.callee = rsProds.at(p);
+        prog.emit(c);
+        if (!inProd) return;
+        size_t go = emitJmpIfNot(ref(rsBreak));
+        Instr r; r.k = IK::Ret; prog.emit(r);
+        prog.code[go].target = prog.here();
+    }
+    void rsItem(const slang::ast::RandSeqProductionSymbol::ProdItem& it) {
+        if (!it.target) unsupported("randsequence production");
+        if (!it.args.empty()) unsupported("randsequence production arguments");
+        rsCall(it.target, true);
+    }
+    void rsProduction(const slang::ast::RandSeqProductionSymbol& p) {
+        using namespace slang::ast;
+        using RS = RandSeqProductionSymbol;
+        auto rules = p.getRules();
+        if (rules.empty()) return;
+        // Pick a rule by weight (default 1) when there is more than one (18.17.1).
+        std::vector<size_t> starts, ends;
+        int pick = -1;
+        std::vector<int> w;
+        if (rules.size() > 1) {
+            E total;
+            for (const auto& r : rules) {
+                int t = fresh(64);
+                Instr i; i.k = IK::Assign; i.sig = t;
+                i.e = r.weightExpr ? resize(expr(*r.weightExpr), 64, r.weightExpr->type->isSigned(), false) : konst(mk(1, 64));
+                prog.emit(i);
+                w.push_back(t);
+                total = total ? bin(Op::Add, total, ref(t)) : ref(t);
+            }
+            pick = fresh(64);
+            Instr d; d.k = IK::Assign; d.sig = pick; d.e = weightedPick(total);
+            prog.emit(d);
+        }
+        for (size_t k = 0; k < rules.size(); k++) {
+            const auto& r = rules[k];
+            size_t skip = 0;
+            if (pick >= 0) skip = emitJmpIfNot(bin(Op::Lt, ref(pick), ref(w[k])));
+            if (r.isRandJoin) unsupported("rand join");
+            for (const RS::ProdBase* pb : r.prods) {
+                switch (pb->kind) {
+                    case RS::ProdKind::Item: rsItem(pb->as<RS::ProdItem>()); break;
+                    case RS::ProdKind::CodeBlock: {
+                        const Statement* st = pb->as<RS::CodeBlockProd>().block->tryGetStatement();
+                        if (st) stmt(*st);
+                        break;
+                    }
+                    case RS::ProdKind::IfElse: {
+                        const auto& ie = pb->as<RS::IfElseProd>();
+                        size_t no = emitJmpIfNot(expr(*ie.expr));
+                        rsItem(ie.ifItem);
+                        size_t end = emitJmp();
+                        prog.code[no].target = prog.here();
+                        if (ie.elseItem) rsItem(*ie.elseItem);
+                        prog.code[end].target = prog.here();
+                        break;
+                    }
+                    case RS::ProdKind::Repeat: {
+                        const auto& rp = pb->as<RS::RepeatProd>();
+                        int n = fresh(64);
+                        Instr i; i.k = IK::Assign; i.sig = n;
+                        i.e = resize(expr(*rp.expr), 64, rp.expr->type->isSigned(), false);
+                        prog.emit(i);
+                        size_t top = prog.here();
+                        size_t done = emitJmpIfNot(bin(Op::Gt, ref(n), konst(mk(0, 64))));
+                        rsItem(rp.item);
+                        Instr dec; dec.k = IK::Assign; dec.sig = n; dec.e = bin(Op::Sub, ref(n), konst(mk(1, 64)));
+                        prog.emit(dec);
+                        Instr j; j.k = IK::Jmp; j.target = top; prog.emit(j);
+                        prog.code[done].target = prog.here();
+                        break;
+                    }
+                    case RS::ProdKind::Case: {
+                        const auto& cp = pb->as<RS::CaseProd>();
+                        int v = fresh(64);
+                        Instr i; i.k = IK::Assign; i.sig = v;
+                        i.e = resize(expr(*cp.expr), 64, cp.expr->type->isSigned(), false);
+                        prog.emit(i);
+                        std::vector<size_t> out;
+                        for (const auto& ci : cp.items) {
+                            E any;
+                            for (const Expression* x : ci.expressions) {
+                                E eq = bin(Op::CaseEq, ref(v), resize(expr(*x), 64, x->type->isSigned(), false));
+                                any = any ? bin(Op::LogOr, any, eq) : eq;
+                            }
+                            size_t no = emitJmpIfNot(any);
+                            rsItem(ci.item);
+                            out.push_back(emitJmp());
+                            prog.code[no].target = prog.here();
+                        }
+                        if (cp.defaultItem) rsItem(*cp.defaultItem);
+                        patch(out, prog.here());
+                        break;
+                    }
+                }
+            }
+            if (r.codeBlock) {
+                if (const Statement* st = r.codeBlock->block->tryGetStatement()) stmt(*st);
+            }
+            if (pick >= 0) {
+                ends.push_back(emitJmp());
+                prog.code[skip].target = prog.here();
+                Instr sub; sub.k = IK::Assign; sub.sig = pick; sub.e = bin(Op::Sub, ref(pick), ref(w[k]));
+                prog.emit(sub);
+            }
+        }
+        patch(ends, prog.here());
+    }
     size_t emitJmp() {
         Instr j;
         j.k = IK::Jmp;
@@ -818,6 +1021,28 @@ struct Lowerer {
         const auto* sym = std::get<const SubroutineSymbol*>(call.subroutine);
         if (!sym || !subs) unsupported("subroutine call");
         if (sym->flags.has(MethodFlags::DPIImport)) unsupported("DPI import");
+        if (sym->flags.has(MethodFlags::Randomize)) return randomizeCall(call);
+        if (!sym->getSyntax() && isClassMethod(*sym)) {   // built-in methods of every class (18.8, 18.9, 18.13.3)
+            if (sym->name == "rand_mode" || sym->name == "constraint_mode") {
+                Instr i; i.k = IK::RandMode;
+                i.e = call.thisClass() ? exprH(*call.thisClass()) : node(Op::This);
+                i.de = expr(*call.arguments()[0]);
+                i.hi = sym->name == "constraint_mode";
+                prog.emit(i);
+                return konst(mk(0, 32));
+            }
+            if (sym->name == "srandom" || sym->name == "get_randstate" || sym->name == "set_randstate") {   // 18.13.3, 18.15
+                E self = call.thisClass() ? exprH(*call.thisClass()) : node(Op::This);
+                std::vector<E> k{self};
+                if (sym->name == "srandom") k.push_back(resize(expr(*call.arguments()[0]), 64, true, false));
+                if (sym->name == "set_randstate") k.push_back(exprStr(*call.arguments()[0]));
+                E r = sysFnNode(sym->name == "srandom" ? SF_OBJ_SRANDOM : sym->name == "get_randstate" ? SF_OBJ_GETSTATE : SF_OBJ_SETSTATE, k);
+                if (wantValue) return r;
+                Instr i; i.k = IK::Assign; i.sig = fresh(sym->name == "get_randstate" ? 64 : 32); i.e = r;
+                prog.emit(i);
+                return nullptr;
+            }
+        }
         auto it = subs->find(sym);
         if (it == subs->end()) unsupported("subroutine call");
         Subr* sub = it->second;
@@ -2361,6 +2586,10 @@ struct Lowerer {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {   // x, or u.x / blk[2].x (23.6)
                 const Symbol* sym = &e.as<ValueExpressionBase>().symbol;
+                if (auto cv = constVals.find(sym); cv != constVals.end())   // an unrolled foreach index (18.5.8)
+                    return sized(konst(cv->second), cv->second.w, cv->second.sgn, ctx);
+                if (auto xb = exprBind.find(sym); xb != exprBind.end())   // `item` of a reduction's with clause
+                    return sized(xb->second, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
                 if (dynFind(sym) >= 0) unsupported("a whole dynamic array, queue, or associative array as a value");
                 int sg = sigFind(sym);
                 if (sg < 0) return constSym(*sym, e, ctx);
@@ -2447,6 +2676,11 @@ struct Lowerer {
                     return sized(std::move(v), w, e.type->isSigned(), ctx);
                 }
                 std::string_view n = call.getSubroutineName();
+                if (n == "randomize") return sized(randomizeCall(call), 32, true, ctx);
+                if (n == "rand_mode" || n == "constraint_mode") return sized(randModeCall(call, true), 32, true, ctx);
+                if ((n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor") && !call.arguments().empty() &&
+                    call.arguments()[0]->type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType)
+                    return sized(fixedReduce(call, n), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
                 // $time / $stime / $realtime (20.3.1): the current time. minisim
                 // has one time unit, so $realtime is the same integer.
                 if (n == "$time" || n == "$stime") {
@@ -3526,6 +3760,293 @@ struct Lowerer {
     // $display / $strobe / $monitor use the kernel format (a string of %b / %d /
     // literal text, arguments evaluated when the line is printed). $finish and
     // $stop stop the sim. Anything else is still ignored.
+    // ---------- constrained randomization (18) ----------
+    std::unordered_map<const slang::ast::Symbol*, Val> constVals;     // foreach indices of a constraint, unrolled
+    std::unordered_map<const slang::ast::Symbol*, int> symOverride;   // with {...}: the caller's properties, copied
+    using BeforeList = std::vector<std::pair<std::vector<E>, std::vector<E>>>;
+    std::unordered_map<const slang::ast::Symbol*, E> exprBind;
+    // a.sum(), a.sum() with (expr) ... of a fixed-size array (7.12.3): the
+    // elements folded, at the result's width.
+    E fixedReduce(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        const Expression& arr = *call.arguments()[0];
+        std::vector<E> el;
+        arrayElems(*arr.type, arr, el);
+        auto [iter, iv] = std::get<CallExpression::SystemCallInfo>(call.subroutine).getIteratorInfo();
+        const auto& et = arr.type->getArrayElementType()->getCanonicalType();
+        int w = (int)call.type->getBitWidth();
+        bool sg = call.type->isSigned();
+        needWidth(w);
+        Op op = n == "sum" ? Op::Add : n == "product" ? Op::Mul : n == "and" ? Op::And : n == "or" ? Op::Or : Op::Xor;
+        E acc;
+        for (E x : el) {
+            E t;
+            if (iter) {
+                exprBind[iv] = x;
+                t = expr(*iter, ExprCtx{w, sg, sg, true});
+                exprBind.erase(iv);
+            } else t = resize(x, w, et.isSigned(), sg);
+            acc = acc ? bin(op, acc, t) : t;
+        }
+        if (!acc) return konst(make(n == "product" ? 1 : n == "and" ? ~0ULL : 0, 0, w, 0, sg));
+        return acc;
+    }
+    // The values of x: one, or every element of a fixed-size array.
+    void randElems(const slang::ast::Expression& x, std::vector<E>& out) {
+        if (x.type->isUnpackedArray()) {
+            if (isDynType(*x.type)) unsupported("a dynamic array or queue in unique or solve-before");
+            arrayElems(*x.type, x, out);
+        } else out.push_back(expr(x));
+    }
+    // The constraints of c (18.5), each guarded by `guard` (implication and
+    // if-else bodies), as items.
+    void constraintItems(const slang::ast::Constraint& c, E guard, std::vector<RandItem>& items, BeforeList& before) {
+        using namespace slang::ast;
+        size_t code = prog.code.size();
+        auto andG = [&](E p) { return guard ? bin(Op::LogAnd, guard, p) : p; };
+        switch (c.kind) {
+            case ConstraintKind::List:
+                for (const Constraint* x : c.as<ConstraintList>().list) constraintItems(*x, guard, items, before);
+                break;
+            case ConstraintKind::Expression: {
+                const auto& ec = c.as<ExpressionConstraint>();
+                RandItem it;
+                it.soft = ec.isSoft;
+                const Expression& x = ec.expr;
+                if (x.kind == ExpressionKind::Dist) {   // 18.5.3
+                    const auto& d = x.as<DistExpression>();
+                    if (d.defaultWeight()) unsupported("dist default weight");
+                    it.isDist = true;
+                    it.e = expr(d.left());
+                    it.guard = guard;
+                    for (const auto& di : d.items()) {
+                        RandDist rd;
+                        if (di.value.kind == ExpressionKind::ValueRange) {
+                            const auto& vr = di.value.as<ValueRangeExpression>();
+                            if (vr.rangeKind != ValueRangeKind::Simple) unsupported("dist range with a tolerance");
+                            rd.lo = expr(vr.left());
+                            rd.hi = expr(vr.right());
+                        } else rd.lo = expr(di.value);
+                        rd.weight = di.weight && di.weight->expr ? expr(*di.weight->expr) : konst(mk(1, 32));
+                        rd.perRange = di.weight && di.weight->kind == DistExpression::DistWeight::PerRange;
+                        it.dist.push_back(std::move(rd));
+                    }
+                } else {
+                    E e = expr(x);
+                    it.e = guard ? bin(Op::LogOr, un(Op::LogNot, guard), e) : e;
+                }
+                items.push_back(std::move(it));
+                break;
+            }
+            case ConstraintKind::Implication: {   // 18.5.6
+                const auto& ic = c.as<ImplicationConstraint>();
+                constraintItems(ic.body, andG(expr(ic.predicate)), items, before);
+                break;
+            }
+            case ConstraintKind::Conditional: {   // 18.5.7
+                const auto& cc = c.as<ConditionalConstraint>();
+                E p = expr(cc.predicate);
+                constraintItems(cc.ifBody, andG(p), items, before);
+                if (cc.elseBody) constraintItems(*cc.elseBody, andG(un(Op::LogNot, p)), items, before);
+                break;
+            }
+            case ConstraintKind::Uniqueness: {   // 18.5.5
+                std::vector<E> el;
+                for (const Expression* x : c.as<UniquenessConstraint>().items) randElems(*x, el);
+                for (size_t a = 0; a < el.size(); a++)
+                    for (size_t b = a + 1; b < el.size(); b++) {
+                        RandItem it;
+                        E ne = bin(Op::Ne, el[a], el[b]);
+                        it.e = guard ? bin(Op::LogOr, un(Op::LogNot, guard), ne) : ne;
+                        items.push_back(std::move(it));
+                    }
+                break;
+            }
+            case ConstraintKind::SolveBefore: {   // 18.5.9
+                const auto& sb = c.as<SolveBeforeConstraint>();
+                std::vector<E> a, b;
+                for (const Expression* x : sb.solve) randElems(*x, a);
+                for (const Expression* x : sb.after) randElems(*x, b);
+                before.push_back({std::move(a), std::move(b)});
+                break;
+            }
+            case ConstraintKind::Foreach: {   // 18.5.8.1: unrolled over a fixed-size array
+                const auto& fc = c.as<ForeachConstraint>();
+                std::vector<std::pair<const Symbol*, slang::ConstantRange>> dims;
+                for (const auto& d : fc.loopDims) {
+                    if (!d.range) unsupported("foreach constraint over a dynamic array or queue");
+                    if (d.loopVar) dims.push_back({d.loopVar, *d.range});
+                }
+                std::function<void(size_t)> loop = [&](size_t k) {
+                    if (k == dims.size()) { constraintItems(fc.body, guard, items, before); return; }
+                    const slang::ConstantRange& r = dims[k].second;
+                    int step = r.left <= r.right ? 1 : -1;
+                    for (int32_t v = r.left;; v += step) {
+                        Val cv = mk((uint64_t)(int64_t)v, 32);
+                        cv.sgn = true;
+                        constVals[dims[k].first] = cv;
+                        loop(k + 1);
+                        if (v == r.right) break;
+                    }
+                    constVals.erase(dims[k].first);
+                };
+                loop(0);
+                break;
+            }
+            case ConstraintKind::DisableSoft: {   // 18.5.13.2
+                RandItem it;
+                it.disableSoft = true;
+                it.e = expr(c.as<DisableSoftConstraint>().target);
+                items.push_back(std::move(it));
+                break;
+            }
+            default: unsupported("constraint of this kind");
+        }
+        if (prog.code.size() != code) unsupported("a function call in a constraint");
+    }
+    // A constraint block, lowered once in the context of its class (18.5).
+    std::shared_ptr<RandBlock> randBlock(const slang::ast::ConstraintBlockSymbol& cb) {
+        auto b = std::make_shared<RandBlock>();
+        b->name = std::string(cb.name);
+        if (auto it = consModeMap().find(&cb); it != consModeMap().end()) b->mode = it->second;
+        else if (cb.flags.has(slang::ast::ConstraintBlockFlags::Static)) { b->mode = staticModeSig(cb); b->staticMode = true; }
+        constraintItems(cb.getConstraints(), nullptr, b->items, b->before);
+        return b;
+    }
+    // A static constraint block's constraint_mode: one signal for every object (18.5.10).
+    int staticModeSig(const slang::ast::ConstraintBlockSymbol& cb) {
+        auto& m = staticConsMode();
+        if (auto it = m.find(&cb); it != m.end()) return it->second;
+        if (!mkSig) unsupported("static constraint block");
+        int s = mkSig(std::string(cb.getParentScope()->asSymbol().name) + "::" + std::string(cb.name) + "$mode", 1, false);
+        m[&cb] = s;
+        return s;
+    }
+    // obj.randomize(), randomize() in a method, std::randomize(a, b) (18.6, 18.7, 18.11, 18.12).
+    E randomizeCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        auto rc = std::make_shared<RandCall>();
+        Instr i;
+        i.k = IK::Randomize;
+        size_t first = 0;
+        ClassInfo* wc = nullptr;
+        bool isStd = !call.isSystemCall();
+        if (!isStd && !args.empty() && args[0]->kind != ExpressionKind::Assignment && isHandleType(*args[0]->type) &&
+            args[0]->type->isClass()) {
+            wc = classInfo(*args[0]->type);
+            i.e = exprH(*args[0]);
+            first = 1;
+        } else if (!isStd && curClass) {
+            wc = curClass;
+            i.e = node(Op::This);
+        }
+        const CallExpression::RandomizeCallInfo* info = nullptr;
+        if (call.isSystemCall())
+            info = std::get_if<CallExpression::RandomizeCallInfo>(&std::get<1>(call.subroutine).extraInfo);
+        ClassInfo* savedCls = curClass;
+        auto savedOv = symOverride;
+        if (wc) {
+            // The caller's own properties named in with {...} are copied
+            // first: inside the call `this` is the object being randomized.
+            if (info && info->inlineConstraints && savedCls) {
+                struct V : ASTVisitor<V, VisitFlags::Expressions> {
+                    std::vector<const Symbol*> found;
+                    void handle(const NamedValueExpression& n) { found.push_back(&n.symbol); }
+                } v;
+                info->inlineConstraints->visit(v);
+                for (const Symbol* sym : v.found) {
+                    auto pm = propMap().find(sym);
+                    if (pm == propMap().end() || symOverride.count(sym)) continue;
+                    const Scope* sc = sym->getParentScope();
+                    bool inObj = false;
+                    for (ClassInfo* c = wc; c; c = c->base)
+                        if (sc == static_cast<const Scope*>(c->ty)) inObj = true;
+                    if (inObj) continue;
+                    if (pm->second.kind != 0) unsupported("an array or container of the caller in with {...}");
+                    int t = fresh(storeW(sym->as<ValueSymbol>().getType()));
+                    Instr a; a.k = IK::Assign; a.sig = t;
+                    a.e = ref(thisRel(pm->second.off));
+                    prog.emit(a);
+                    symOverride[sym] = t;
+                }
+            }
+            curClass = wc;
+        }
+        for (size_t k = first; k < args.size(); k++) {
+            const Expression& a = outArg(*args[k]);
+            if (a.kind == ExpressionKind::NullLiteral) { rc->argsGiven = true; continue; }   // randomize(null): check only
+            if (a.type->isUnpackedArray() || !a.type->isIntegral()) unsupported("randomize() argument of this type");
+            E r = expr(a);
+            if (r->op != Op::Ref) unsupported("randomize() argument that is not a variable");
+            rc->args.push_back(r);
+            rc->argsGiven = true;
+        }
+        if (info && info->inlineConstraints) constraintItems(*info->inlineConstraints, nullptr, rc->items, rc->before);
+        curClass = savedCls;
+        symOverride = std::move(savedOv);
+        i.sig = fresh(32);
+        i.rc = rc;
+        prog.emit(i);
+        return ref(i.sig, true);
+    }
+    // x.rand_mode(v), obj.rand_mode(v), c.constraint_mode(v), and their
+    // function forms that read the mode (18.8, 18.9).
+    E randModeCall(const slang::ast::CallExpression& call, bool wantValue) {
+        using namespace slang::ast;
+        bool cons = call.getSubroutineName() == "constraint_mode";
+        auto args = call.arguments();
+        if (args.empty()) unsupported("rand_mode / constraint_mode without an object");
+        const Expression& t = *args[0];
+        E val = args.size() > 1 ? expr(*args[1]) : nullptr;
+        auto staticOf = [&](const Symbol& m) -> int {
+            if (!cons || m.kind != SymbolKind::ConstraintBlock || !m.as<ConstraintBlockSymbol>().flags.has(ConstraintBlockFlags::Static)) return -1;
+            return staticModeSig(m.as<ConstraintBlockSymbol>());
+        };
+        auto modeOf = [&](const Symbol& m) -> int {
+            if (cons) {
+                auto it = consModeMap().find(&m);
+                if (it == consModeMap().end()) unsupported("constraint_mode of this kind");
+                return it->second;
+            }
+            auto it = randModeMap().find(&m);
+            if (it == randModeMap().end()) unsupported("rand_mode of a variable that is not rand");
+            return it->second;
+        };
+        int slot = -1;
+        const Symbol* named = t.kind == ExpressionKind::MemberAccess ? &t.as<MemberAccessExpression>().member
+                            : t.kind == ExpressionKind::NamedValue ? &t.as<NamedValueExpression>().symbol
+                            : t.kind == ExpressionKind::ArbitrarySymbol ? t.as<ArbitrarySymbolExpression>().symbol.get() : nullptr;
+        if (int ss = named ? staticOf(*named) : -1; ss >= 0) {
+            if (!val) return resize(un(Op::LogNot, bin(Op::CaseEq, ref(ss), konst(mk(0, 1)))), 32, false, true);
+            slot = ss;
+        } else if (t.kind == ExpressionKind::MemberAccess && (t.as<MemberAccessExpression>().member.kind == SymbolKind::ClassProperty ||
+                                                       t.as<MemberAccessExpression>().member.kind == SymbolKind::ConstraintBlock)) {
+            const auto& m = t.as<MemberAccessExpression>();
+            int off = modeOf(m.member);
+            if (!val) { E r = ref(off); r->at = exprH(m.value()); return resize(r, 32, false, true); }
+            slot = indSlot(exprH(m.value()), off);
+        } else if ((t.kind == ExpressionKind::NamedValue && (randModeMap().count(&t.as<NamedValueExpression>().symbol) ||
+                                                             consModeMap().count(&t.as<NamedValueExpression>().symbol)))) {
+            int off = modeOf(t.as<NamedValueExpression>().symbol);
+            if (!val) return resize(ref(thisRel(off)), 32, false, true);
+            slot = thisRel(off);
+        } else if (t.kind == ExpressionKind::ArbitrarySymbol && consModeMap().count(t.as<ArbitrarySymbolExpression>().symbol)) {
+            int off = modeOf(*t.as<ArbitrarySymbolExpression>().symbol);
+            if (!val) return resize(ref(thisRel(off)), 32, false, true);
+            slot = thisRel(off);
+        } else if (isHandleType(*t.type) && t.type->isClass()) {
+            if (!val) unsupported("rand_mode() / constraint_mode() of a whole object as a value");
+            Instr i; i.k = IK::RandMode; i.e = exprH(t); i.de = val; i.hi = cons;
+            prog.emit(i);
+            return konst(mk(0, 32));
+        } else unsupported("rand_mode / constraint_mode of this kind");
+        Instr i; i.k = IK::Assign; i.sig = slot;
+        i.e = un(Op::RedOr, val);   // any nonzero value turns it on
+        prog.emit(i);
+        (void)wantValue;
+        return konst(mk(0, 32));
+    }
     // $cast(dst, src) of class handles (8.16): dst = src when src is null
     // or an object of dst's class (or one derived from it). As a task, a
     // failed cast is an error and dst is unchanged.
@@ -3556,6 +4077,8 @@ struct Lowerer {
     void sysCall(const slang::ast::CallExpression& call) {
         using namespace slang::ast;
         std::string_view n = call.getSubroutineName();
+        if (n == "randomize") { randomizeCall(call); return; }
+        if (n == "rand_mode" || n == "constraint_mode") { randModeCall(call, false); return; }
         if (n == "$cast" && call.arguments().size() == 2 && isHandleType(*outArg(*call.arguments()[0]).type)) {
             castClass(call, false);
             return;
@@ -4376,7 +4899,15 @@ struct Lowerer {
                 prog.emit(ret);
                 break;
             }
+            case StatementKind::RandCase: { randCase(s.as<RandCaseStatement>()); break; }
+            case StatementKind::RandSequence: { randSequence(s.as<RandSequenceStatement>()); break; }
             case StatementKind::Break: {
+                if (loops.empty() && rsBreak >= 0) {   // break in a randsequence code block: end the whole sequence (18.17.6)
+                    Instr i; i.k = IK::Assign; i.sig = rsBreak; i.e = konst(mk(1, 1));
+                    prog.emit(i);
+                    Instr r; r.k = IK::Ret; prog.emit(r);
+                    break;
+                }
                 if (loops.empty()) unsupported("break outside a loop");
                 loops.back().breaks.push_back(emitJmp());
                 break;
@@ -5043,6 +5574,17 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             init->assignWholeArray(v, v.getType(), *e, false);
             return;
         }
+        if (auto ar = arrMap().find(&v); ar != arrMap().end()) {   // int a[3]: 2-state elements start at 0 (6.8)
+            const auto& s = *ar->second;
+            if (!s.twoState) return;
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            for (int k = 0; k < s.count; k++) {
+                Instr i; i.k = IK::Assign; i.sig = s.base + k;
+                i.e = konst(make(0, 0, s.elemW, 0, s.sgn));
+                init->prog.emit(i);
+            }
+            return;
+        }
         const auto& t = v.getType();
         if (!e && (t.isUnpackedStruct() || t.isUnpackedUnion())) {   // 7.2: each member's default
             if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
@@ -5644,6 +6186,12 @@ inline ClassInfo* buildClass(const slang::ast::ClassType& ct,
             const auto& p = m.as<ClassPropertySymbol>();
             if (p.lifetime == VariableLifetime::Static) continue;
             propMap()[&p] = Lowerer::declSlot(p.getType(), ci->lay);
+            if (p.randMode != RandMode::None) randModeMap()[&p] = ci->lay->add(1, mk(1));
+            continue;
+        }
+        if (m.kind == SymbolKind::ConstraintBlock) {
+            if (!m.as<ConstraintBlockSymbol>().flags.has(ConstraintBlockFlags::Static))
+                consModeMap()[&m] = ci->lay->add(1, mk(1));
             continue;
         }
         const SubroutineSymbol* sub = method(m);
@@ -5771,6 +6319,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     propMap().clear();
     vslotMap().clear();
     ifaceSlotMap().clear();
+    randModeMap().clear();
+    consModeMap().clear();
+    staticConsMode().clear();
     classRt().clear();
     layoutStore() = &out.layouts;
     netKinds().clear();
@@ -5963,6 +6514,83 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         *sub->prog = std::move(lw.prog);
     }
     for (Subr* sub : order) patchImplicit(*sub->prog);
+
+    // Randomization (18): each class's rand variables, constraint blocks
+    // (an override by name replaces the base block), pre/post_randomize.
+    {
+        using namespace slang::ast;
+        std::unordered_map<const ConstraintBlockSymbol*, std::shared_ptr<RandBlock>> blockOf;
+        for (auto& up : classStore()) {
+            ClassInfo* ci = up.get();
+            if (ci->ty->isInterface || ci->builtin || !ci->lay) continue;
+            std::vector<ClassInfo*> chain;
+            for (ClassInfo* c = ci; c; c = c->base) chain.insert(chain.begin(), c);
+            auto sp = std::make_shared<RandSpec>();
+            std::unordered_map<std::string, size_t> byName;
+            for (ClassInfo* c : chain) {
+                Lowerer lw(sigmap);
+                lw.bind(&subMap, mkSig, &tempSeq, &out.subs);
+                lw.curClass = c;
+                auto enumBlock = std::make_shared<RandBlock>();
+                for (const auto& m : c->ty->members()) {
+                    if (m.kind == SymbolKind::ClassProperty) {
+                        const auto& p = m.as<ClassPropertySymbol>();
+                        if (p.randMode == RandMode::None) continue;
+                        if (p.lifetime == VariableLifetime::Static) Lowerer::unsupported("static rand property");
+                        const PropSlot& ps = propMap().at(&p);
+                        const Type& t = p.getType().getCanonicalType();
+                        RandVar rv;
+                        rv.name = std::string(p.name);
+                        rv.randc = p.randMode == RandMode::RandC;
+                        rv.mode = randModeMap().at(&p);
+                        const Type* et = &t;
+                        if (ps.kind == 1) {
+                            rv.off = ps.arr->base; rv.count = ps.arr->count;
+                            while (et->isUnpackedArray()) et = &et->getArrayElementType()->getCanonicalType();
+                        } else if (ps.kind == 0) rv.off = ps.off;
+                        else Lowerer::unsupported("rand dynamic array or queue");
+                        if (isHandleType(*et)) { rv.obj = true; rv.w = 64; }
+                        else if (et->isIntegral() && !et->isUnpackedStruct()) {
+                            rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
+                            if (rv.w > 64) Lowerer::unsupported("rand variable wider than 64 bits");
+                        } else Lowerer::unsupported("rand property of this type");
+                        if (et->isEnum()) {   // an enum takes only its named values (18.4)
+                            for (int k = 0; k < rv.count; k++) {
+                                E any;
+                                for (const auto& ev : et->as<EnumType>().values()) {
+                                    const auto& cv = ev.getValue();
+                                    if (!cv.isInteger()) continue;
+                                    auto u = cv.integer().as<uint64_t>();
+                                    E eq = bin(Op::Eq, ref(lw.thisRel(rv.off + k), false), konst(mk(u ? *u : 0, rv.w)));
+                                    any = any ? bin(Op::LogOr, any, eq) : eq;
+                                }
+                                if (any) { RandItem it; it.e = any; enumBlock->items.push_back(std::move(it)); }
+                            }
+                        }
+                        sp->vars.push_back(std::move(rv));
+                        continue;
+                    }
+                    if (m.kind == SymbolKind::ConstraintBlock) {
+                        const auto& cb = m.as<ConstraintBlockSymbol>();
+                        auto& b = blockOf[&cb];
+                        if (!b) b = lw.randBlock(cb);
+                        if (auto f = byName.find(b->name); f != byName.end()) sp->blocks[f->second] = b;
+                        else { byName[b->name] = sp->blocks.size(); sp->blocks.push_back(b); }
+                        continue;
+                    }
+                    // (slang adds a built-in pre/post_randomize, with no body, to a class that declares none)
+                    if (m.kind == SymbolKind::Subroutine && m.getSyntax() && (m.name == "pre_randomize" || m.name == "post_randomize")) {
+                        auto it = subMap.find(&m.as<SubroutineSymbol>());
+                        if (it == subMap.end()) continue;
+                        if (m.name == "pre_randomize") { sp->pre = it->second->prog; sp->preLay = it->second->lay; }
+                        else { sp->post = it->second->prog; sp->postLay = it->second->lay; }
+                    }
+                }
+                if (!enumBlock->items.empty()) sp->blocks.push_back(enumBlock);
+            }
+            classRt()[(size_t)ci->id].rand = sp;
+        }
+    }
 
     ProcCollector pc(sigmap, out, std::move(newDriver), &subMap, mkSig, &tempSeq);
     comp.getRoot().visit(pc);
