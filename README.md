@@ -26,6 +26,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Waveforms**: VCD (`msim -vcd`) or compressed FST (`msim -fst`), with the instance hierarchy as scopes, for GTKWave or Surfer
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches; see [`docs/UVM.md`](docs/UVM.md)
+- **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
+- **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
 ## Layout
 
@@ -39,6 +41,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
+| `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
+| `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -98,8 +102,28 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
+| `<file>.c`, `.cpp`, `.o`, `.a` | DPI-C code: msim builds it (with `svdpi.h` on the include path) and loads it |
+| `<file>.so`, `-sv_lib <name>`, `-sv_root <dir>`, `-sv_liblist <file>` | DPI-C libraries to load (IEEE 1800-2023 annex J) |
+| `-dpiheader <file>` | Write the C prototypes of every DPI import and export |
+| `-load <lib>[:<boot>]`, `-loadvpi <lib>:<boot>` | Load a VPI library before elaboration; its `vlog_startup_routines` run (the C files and `.so` files above are VPI libraries too) |
+| `-CFLAGS <s>`, `-LDFLAGS <s>` | Extra flags for building the DPI C files |
 | `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |
+
+### C code: DPI-C
+
+`import "DPI-C"` and `export "DPI-C"` work as in IEEE 1800-2023 clause 35.
+Give the C files on the command line, or a prebuilt library with `-sv_lib`:
+
+```sh
+./build/msim tb.sv model.c                     # builds model.c, then runs
+./build/msim tb.sv -sv_lib libmodel            # loads libmodel.so
+./build/msim tb.sv model.c -dpiheader dpi.h    # also writes the C prototypes
+```
+
+C code includes `svdpi.h` (installed in `include/`, and in `include/` of the
+source tree). Import tasks may call exported tasks that wait on simulation
+time. A DPI call runs on the interpreter: `-compile` falls back to it.
 
 ### Regressions: `mregress`
 
@@ -127,6 +151,31 @@ removed. With `-spec`, a test's `//! xfail: <reason>` and `//! exit: <n>`
 lines mean the same on msim, and a per-chapter pass table is printed
 (`-md FILE` also writes it as Markdown). See `tests/regress/smoke.list` and
 `mregress -h`.
+
+### Bug reports: `mbug`
+
+`mbug` (in the source tree `tools/mbug.py`) files each distinct failure as
+one issue in **GitHub Issues** (the default), **Redmine** or **Jira**. A
+failure that is already open gets a comment for the new occurrence instead
+of a duplicate. A failure whose issue was closed gets a new issue that links
+to the old one. Each issue has the failing tests and seeds, a reproduction
+command, the log tail and a link to the CI build. Redmine and Jira also get
+`sim.log` and `cmd.sh` attached.
+
+```sh
+export GITHUB_TOKEN=...                                          # issues: write
+mregress tests.list -o regress || mbug regress regress/results.json -project you/repo
+mlint -top top rtl/*.sv | mbug lint - -project you/repo          # one issue per rule
+mdft -top top rtl/*.sv > dft.log; mbug lint dft.log -tool mdft -project you/repo
+mbug regress regress/results.json -tracker jira -project VER     # JIRA_URL, JIRA_USER, JIRA_TOKEN
+mbug regress regress/results.json -tracker redmine -project soc  # REDMINE_URL, REDMINE_KEY
+mbug sync-github -repo you/repo -tracker jira -project VER       # GitHub issues -> Jira, kept in step
+mbug regress regress/results.json -project you/repo -dry-run     # show the plan only
+```
+
+Credentials are read only from the environment, and a `-config` file that
+contains a token is refused. See [`ci/README.md`](ci/README.md#bug-reports)
+and `mbug -h`.
 
 ### Coverage: `msim -cov` and `mcov`
 
@@ -316,7 +365,7 @@ boundaries.
 - Instance arrays and interface or modport ports are an error
 - An `inout` variable is an error. An `inout` net is connected. An `inout` whose two sides differ in width is an error
 - Declaration initializers (`logic x = 0;`, `wire y = a & b;`) are lowered. A module variable's initializer runs before every `initial` / `always`
-- Tasks and functions have no recursion, no `ref` arguments, no DPI, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
+- Tasks and functions have no recursion, no `ref` arguments, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
 - System tasks other than the display family, `$finish`, and `$stop` are ignored with a warning
 - Unpacked arrays: fixed size only, at most 2^20 elements; no slices or whole-array operations. Array elements are left out of the VCD. See `docs/COVERAGE.md` for the full list
 

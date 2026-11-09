@@ -1270,6 +1270,37 @@ inline Val resolveNet(uint8_t k, const Drv* d, size_t n, int w, const Val& prev)
     return r;
 }
 inline Val resolveDrives(const Drv* d, size_t n, int w) {
+    // Every driver at one and the same strength for 0 and 1 (the usual case:
+    // several continuous assigns to parts of one net). Then per bit: no
+    // driver -> z; drivers that agree -> their value; disagreeing or x -> x.
+    // That is word-parallel, with no per-bit strength walk.
+    bool same = n > 0 && d[0].s0 == d[0].s1 && d[0].s0 != STR_HIZ;
+    for (size_t i = 1; i < n && same; i++) same = d[i].s0 == d[0].s0 && d[i].s1 == d[0].s0;
+    if (same) {
+        int L = w > 64 ? limbCount(w) : 1;
+        Val r = make(0, 0, w);
+        for (int j = 0; j < L; j++) {
+            uint64_t any0 = 0, any1 = 0, anyx = 0;
+            for (size_t i = 0; i < n; i++) {
+                const Val& a = d[i].v;
+                uint64_t v, x, z;
+                if (j == 0) { v = a.v; x = a.x; z = a.z; }
+                else if ((size_t)(j - 1) < a.hi.size()) { v = a.hi[j - 1].v; x = a.hi[j - 1].x; z = a.hi[j - 1].z; }
+                else { v = 0; x = ~0ULL; z = ~0ULL; }   // no bits here: undriven
+                any1 |= v & ~x & ~z;
+                any0 |= ~v & ~x & ~z;
+                anyx |= x & ~z;
+            }
+            int top = w - 64 * j;
+            uint64_t m = top >= 64 ? ~0ULL : (1ULL << top) - 1;
+            uint64_t bad = (anyx | (any0 & any1)) & m;
+            uint64_t none = ~(any0 | any1 | anyx) & m;
+            uint64_t rv = any1 & ~bad & m, rx = bad | none;
+            if (j == 0) { r.v = rv; r.x = rx; r.z = none; }
+            else { r.hi[j - 1].v = rv; r.hi[j - 1].x = rx; r.hi[j - 1].z = none; }
+        }
+        return finish(r);
+    }
     if (w > 64) {
         Val r = make(0, 0, w);
         for (int b = 0; b < w; b++) {
@@ -1406,7 +1437,9 @@ enum SysFnId : int {
     SF_DIST_T,           // (seed, degrees of freedom)
     SF_DIST_ERLANG,      // (seed, k, mean)
     SF_SYSTEM,           // $system(command) (20.17): the shell's exit status
-    SF_ASSOC_BOUND       // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
+    SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
+    SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
+    SF_FREAD_GET         // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
 };
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
 enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
@@ -1433,6 +1466,7 @@ struct ArrShape {
     bool sgn = false;
     bool twoState = false;   // bit / int elements: an invalid read is 0, not X (7.4.6)
     std::vector<std::pair<int64_t, int64_t>> dims;   // [left, right]
+    std::shared_ptr<const DynObj> dynElem;   // int f[2][$]: each element a container of this shape (last: -compile writes the others in order)
     // Flat element offset, or -1 when an index is outside its dimension.
     int64_t offset(const std::vector<int64_t>& idx) const {
         int64_t off = 0;
@@ -1668,7 +1702,11 @@ inline int32_t rtlRound(double r) { return r >= 0 ? (int32_t)(r + 0.5) : -(int32
 inline void rtlWarn(const char* what) { std::cerr << "WARNING: " << what << "\n"; }
 // $urandom: the generator is implementation-defined (18.13). minisim uses
 // one 64-bit xorshift* stream, seeded by -seed (default 1), so a run repeats.
-inline uint64_t& urandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
+// Random stability (18.14.2): every process (thread) has its own generator.
+// g_threadRng is the running process's; with none running, the global one.
+inline uint64_t& globalRandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
+inline uint64_t* g_threadRng = nullptr;
+inline uint64_t& urandomState() { return g_threadRng ? *g_threadRng : globalRandomState(); }
 inline uint32_t urandomNext(uint64_t& s) {
     s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
     return (uint32_t)((s * 0x2545F4914F6CDD1Dull) >> 32);
@@ -1715,6 +1753,20 @@ inline void fileWrite(uint32_t fd, const std::string& t) {
         if ((fd >> b) & 1 && files().mcd[b]) fwrite(t.data(), 1, t.size(), files().mcd[b]);
 }
 inline std::string& scanText() { static std::string s; return s; }
+inline std::string& freadBuf() { static std::string s; return s; }
+// $fclose cancels the $fstrobe / $fmonitor output to the closed descriptor (21.3.1).
+inline void (*g_fcloseHook)(uint32_t fd) = nullptr;
+// The first n bytes of `b` (zero past its end) as an unsigned big-endian value of w bits.
+inline Val bytesValue(const std::string& b, size_t n, int w) {
+    int bw = (int)n * 8;
+    Val v = make(0, 0, std::max(bw, 1), 0, false);
+    if (bw > 64) v = maskWidth(v, bw);
+    for (size_t k = 0; k < n; k++) {
+        unsigned char c = k < b.size() ? (unsigned char)b[k] : 0;
+        for (int j = 0; j < 8; j++) setBit(v, bw - 8 * (int)(k + 1) + j, (c >> j) & 1);
+    }
+    return v_resize(v, w, false);
+}
 inline std::vector<Val>& scanOut() { static std::vector<Val> v; return v; }
 // $fscanf / $sscanf (21.3.4) from a character source: next() gives a char or
 // EOF, back() returns the last one. The values read go to scanOut(); returns
@@ -1926,6 +1978,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         }
         case SF_FCLOSE: {
             uint32_t fd = (uint32_t)u64(a[0]);
+            if (g_fcloseHook) g_fcloseHook(fd);
             if (fd & 0x80000000u) {
                 uint32_t i = fd & 0x7fffffffu;
                 if (i >= 3 && i < files().fds.size() && files().fds[i]) { fclose(files().fds[i]); files().fds[i] = nullptr; }
@@ -1935,6 +1988,16 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             }
             return make(0, 0, 1, 0);
         }
+        case SF_FREAD: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            size_t n = (size_t)u64(a[1]);
+            std::string& b = freadBuf();
+            b.assign(n, '\0');
+            size_t got = f && n ? fread(b.data(), 1, n, f) : 0;
+            b.resize(got);
+            return sint((int64_t)got);
+        }
+        case SF_FREAD_GET: return bytesValue(freadBuf(), (size_t)(ctl + 7) / 8, ctl);
         case SF_FWRITE: {
             Val t = a[1]; t.str = true;
             fileWrite((uint32_t)u64(a[0]), v_str(t) + (ctl ? "\n" : ""));

@@ -78,6 +78,7 @@ struct Var {
     std::vector<int> items;   // the constraints that read it
     const RandItem* dist = nullptr;   // a `v dist {...}` on it
     Frame* distFr = nullptr;
+    bool ordered = false;     // solved first on purpose (solve-before, a function argument): its values alike
 };
 struct Item {
     const RandItem* it;
@@ -350,6 +351,7 @@ inline bool runFns(Item& k) {
     FrameP fp(k.fr, [](Frame*) {});   // the item's frame, owned by randomize()
     for (const auto& p : k.it->fns) {
         auto ctl = std::make_shared<ProcCtl>();
+        if (g_threadRng) ctl->rngp = g_threadRng;   // the calling process's generator
         Task t = exec(p.get(), ctl, fp);
         t.h.resume();
         if (!t.h.done()) {
@@ -524,6 +526,21 @@ inline std::map<std::pair<int, int>, std::vector<i128>>& randcLeft() {
     return m;
 }
 
+// log2 of how many values u has left. Bounds alone miss holes (`inside`
+// sets, data < addr * 2 with addr in {[a:b], c}), so with few variables a
+// big range is cut into chunks and only the chunks that can hold count.
+inline double volLog2(Var& u) {
+    i128 n = u.hi - u.lo + 1;
+    if (n < 64 || g_ctx->vars.size() > 8 || u.items.empty())
+        return std::log2((double)n);
+    i128 step = n / 16;
+    int ok = 0;
+    for (int j = 0; j < 16; j++) {
+        i128 a = u.lo + step * j, b = j == 15 ? u.hi : a + step - 1;
+        if (feasibleIn(u, a, b)) ok++;
+    }
+    return ok ? std::log2((double)n * ok / 16) : -1e300;
+}
 inline bool pickVar(Var& v) {
     i128 flo = v.lo, fhi = v.hi;   // the range left after propagation
     if (v.randc && v.w <= 16) {
@@ -602,6 +619,43 @@ inline bool pickVar(Var& v) {
             opts.erase(opts.begin() + (long)k);
         }
     }
+    // A variable with few values (a mode bit, an enum): each value weighted
+    // by how many ways the other variables can still be completed, measured
+    // as the product of their ranges after propagation, so the solutions
+    // come out close to uniform (18.5.10: `s -> d == 0` gives s = 1 rarely).
+    if (!v.ordered && fhi - flo < 16 && g_ctx->vars.size() <= 32 && !v.items.empty()) {
+        struct Snap { i128 lo, hi; };
+        std::vector<Snap> snap;
+        for (auto& u : g_ctx->vars) snap.push_back({u.lo, u.hi});
+        auto restore = [&]() {
+            for (size_t k = 0; k < snap.size(); k++) { g_ctx->vars[k].lo = snap[k].lo; g_ctx->vars[k].hi = snap[k].hi; }
+        };
+        std::vector<std::pair<i128, double>> cand;   // value, log2 of its completions
+        double best = -1e300;
+        for (i128 x = flo; x <= fhi; x++) {
+            v.lo = v.hi = x;
+            if (varOk(v) && propagate()) {
+                double lg = 0;
+                for (auto& u : g_ctx->vars)
+                    if (!u.set && &u != &v) lg += volLog2(u);
+                cand.push_back({x, lg});
+                best = std::max(best, lg);
+            }
+            restore();
+        }
+        while (!cand.empty()) {
+            double tot = 0;
+            for (auto& c : cand) tot += std::exp2(c.second - best);
+            double r = (double)(rnd64() >> 11) / 9007199254740992.0 * tot;
+            size_t k = 0;
+            for (; k + 1 < cand.size(); k++) { double w = std::exp2(cand[k].second - best); if (r < w) break; r -= w; }
+            if (search(v, cand[k].first, cand[k].first)) return true;
+            restore();
+            cand.erase(cand.begin() + (long)k);
+        }
+        v.lo = flo; v.hi = fhi;
+        return false;
+    }
     // Cover the range with pieces that can hold a value, splitting the
     // biggest undecided piece a bounded number of times, then pick a piece
     // by its size, so the values come out close to uniform (a piece of size
@@ -627,12 +681,61 @@ inline bool pickVar(Var& v) {
             if (st) ps.push_back({a, b, st});
         }
     }
+    // Each piece also weighted by how many ways the other variables can
+    // still be completed (x < y: a small x leaves y more room), as above.
+    // Big pieces are cut into chunks first, so the weight can vary inside
+    // what would otherwise be one piece (data < addr * 2 with data first).
+    bool weigh = !v.ordered && g_ctx->vars.size() > 1 && g_ctx->vars.size() <= 32;
+    if (weigh && ps.size() < 16) {
+        std::vector<Piece> cut;
+        for (auto& p : ps) {
+            i128 n = p.hi - p.lo + 1;
+            int parts = n >= 64 ? 16 : 1;
+            for (int j = 0; j < parts; j++) {
+                i128 a = p.lo + n / parts * j, b = j == parts - 1 ? p.hi : a + n / parts - 1;
+                cut.push_back({a, b, p.st});
+            }
+        }
+        ps = std::move(cut);
+    }
+    weigh = weigh && ps.size() > 1;
+    std::vector<double> lgs(ps.size(), 0.0);
+    if (weigh) {
+        std::vector<std::pair<i128, i128>> snap;
+        for (auto& u : g_ctx->vars) snap.push_back({u.lo, u.hi});
+        double best = -1e300;
+        for (size_t k = 0; k < ps.size(); k++) {
+            v.lo = ps[k].lo; v.hi = ps[k].hi;
+            double lg = -1e300;
+            if (propagate()) {
+                lg = 0;
+                // v counts too, narrowed: a piece [8000:80ff] may hold one value
+                for (auto& u : g_ctx->vars)
+                    if (!u.set) lg += volLog2(u);
+            }
+            lgs[k] = lg;
+            best = std::max(best, lg);
+            for (size_t j = 0; j < snap.size(); j++) { g_ctx->vars[j].lo = snap[j].first; g_ctx->vars[j].hi = snap[j].second; }
+        }
+        for (auto& l : lgs) l -= best;
+    }
     while (!ps.empty()) {
-        i128 tot = 0;
-        for (auto& p : ps) tot += p.hi - p.lo + 1;
-        i128 r = below(tot);
         size_t k = 0;
-        for (; k + 1 < ps.size(); k++) { if (r < ps[k].hi - ps[k].lo + 1) break; r -= ps[k].hi - ps[k].lo + 1; }
+        if (weigh) {
+            double tot = 0;
+            for (size_t j = 0; j < ps.size(); j++) tot += std::exp2(lgs[j]);
+            double r = (double)(rnd64() >> 11) / 9007199254740992.0 * tot;
+            for (; k + 1 < ps.size(); k++) {
+                double w = std::exp2(lgs[k]);
+                if (r < w) break;
+                r -= w;
+            }
+        } else {
+            i128 tot = 0;
+            for (auto& p : ps) tot += p.hi - p.lo + 1;
+            i128 r = below(tot);
+            for (; k + 1 < ps.size(); k++) { if (r < ps[k].hi - ps[k].lo + 1) break; r -= ps[k].hi - ps[k].lo + 1; }
+        }
         if (ps[k].st == 2) {   // every value works: take one directly
             v.set = true;
             v.val = ps[k].lo + below(ps[k].hi - ps[k].lo + 1);
@@ -640,6 +743,7 @@ inline bool pickVar(Var& v) {
         }
         if (search(v, ps[k].lo, ps[k].hi)) return true;
         ps.erase(ps.begin() + (long)k);
+        lgs.erase(lgs.begin() + (long)k);
     }
     v.lo = flo; v.hi = fhi;
     return false;
@@ -671,6 +775,7 @@ static void runSync(const Prog* p, const FrameLayout* lay, int self) {
     Frame* sf = g_fr;
     Frame* sr = g_ret;
     auto ctl = make_shared<ProcCtl>();
+    if (g_threadRng) ctl->rngp = g_threadRng;   // the calling process's generator
     Task t = exec(p, ctl, newFrame(lay, nullptr, self));
     t.h.resume();
     if (!t.h.done()) {
@@ -691,10 +796,19 @@ static void randObjects(int obj, std::vector<int>& out) {
     if (!cr.rand) return;
     for (const RandVar& rv : cr.rand->vars) {
         if (!rv.obj || (S.get(obj + rv.mode).v & 1) == 0) continue;
-        if (rv.dyn) {   // a rand dynamic array or queue of handles: each element's object
+        if (rv.dyn) {   // a rand container of handles: each element's object, at every level
             std::vector<int> hs;
-            for (const Val& h : dynStore()[obj + rv.off].vec)
-                if (!h.x && h.v) hs.push_back((int)h.v);
+            std::function<void(int, int)> walk = [&](int cid, int depth) {
+                const DynObj& d = dynStore()[cid];
+                std::vector<Val> el(d.vec.begin(), d.vec.end());
+                for (auto& kv : d.map) el.push_back(kv.second);
+                for (const Val& h : el)
+                    if (!h.x && h.v) {
+                        if (depth > 1) walk((int)h.v, depth - 1);
+                        else hs.push_back((int)h.v);
+                    }
+            };
+            for (int k = 0; k < rv.count; k++) walk(obj + rv.off + k, rv.depth);
             for (int h : hs) randObjects(h, out);
             continue;
         }
@@ -717,6 +831,8 @@ struct RCont {
     bool assoc = false;       // an associative array: its keys stay, only the values change
     std::vector<DynKey> keys;
     FrameP elems;             // pass 2: one signal per element
+    int depth = 1;            // int m[][]: 2 until its size is fixed and its elements stand in for it
+    bool sized = false;       // its size is fixed (an outer level was solved before)
 };
 constexpr int kSizeW = 17;    // a solved size is at most 2^17 - 1
 inline const FrameLayout* scratchLayout(int w, bool sgn, int64_t n) {
@@ -737,6 +853,22 @@ struct Rewrite {
     std::vector<std::pair<int, E>> items;          // `item` of a with clause -> the element
     bool dropped = false;                         // pass 1: reads an element
     std::vector<int>* sizeVars = nullptr;         // pass 1: containers whose size is read
+    std::vector<const std::vector<std::pair<int, E>>*> refScope;   // RandItem::refs in force
+    const E* refOf(int sig) {
+        if (sig < kRel) return nullptr;
+        for (size_t k = refScope.size(); k-- > 0;)
+            for (auto& [d, r] : *refScope[k])
+                if (d == sig) return &r;
+        return nullptr;
+    }
+    // The container m[i] names now (loop indices in place), or -1 when m is
+    // itself still being sized (the constraint waits for a later pass).
+    int resolveRef(const E& r) {
+        E x = (*this)(r);
+        if (dropped || contOf(x->sig)) { dropped = true; return -1; }
+        Val v = eval(x, rd);
+        return (int)v.v - 1;
+    }
     RCont* contOf(int sig) {
         auto it = contIdx->find(R(sig));
         return it == contIdx->end() ? nullptr : &(*conts)[(size_t)it->second];
@@ -745,8 +877,17 @@ struct Rewrite {
         if (k < 0 || k >= c.n) return konst(make(0, 0, c.w, 0, c.sgn));
         return ref(c.elems->base + (int)k, c.sgn);
     }
-    E operator()(const E& e) {
-        if (!e) return e;
+    E operator()(const E& e0) {
+        if (!e0) return e0;
+        E e = e0;
+        if (e->op != Op::Ref && !refScope.empty())
+            if (const E* r = refOf(e->sig)) {   // m[i].size(), m[i][j]: on the container m[i] is now
+                int cid = resolveRef(*r);
+                if (cid < 0) return e0;
+                auto c = std::make_shared<Expr>(*e);
+                c->sig = cid;
+                e = c;
+            }
         if (e->op == Op::Ref && !e->at) {
             for (auto& [lv, k] : loops)
                 if (e->sig == lv) return konst(k);
@@ -780,7 +921,7 @@ struct Rewrite {
         }
         if (e->op == Op::DynSize)
             if (RCont* c = contOf(e->sig)) {
-                if (pass == 2 || c->assoc) return konst(make((uint64_t)c->n, 0, 32));   // an associative array keeps its keys
+                if (pass == 2 || c->assoc || c->sized) return konst(make((uint64_t)c->n, 0, 32));   // an associative array keeps its keys
                 if (!c->sizeFr) {
                     c->sizeFr = newFrame(scratchLayout(kSizeW, false, 1), nullptr, 0);
                     S.set(c->sizeFr->base, make((uint64_t)c->n, 0, kSizeW));
@@ -874,6 +1015,17 @@ static int doRandomize(int obj, const RandCall* rc) {
             int addr = a->at ? (int)eval(a->at, rd).v + a->sig : R(a->sig);
             scalars.push_back({addr, S.sigs[addr].w, a->sgn, false, obj});
         }
+        for (const auto& ca : rc->contArgs) {   // randomize(q): its size and elements
+            RCont c;
+            c.cid = ca.addr ? (int)eval(ca.addr, rd).v - 1 : R(ca.sig); c.w = ca.w; c.sgn = ca.sgn; c.owner = obj; c.depth = ca.depth;
+            const DynObj& dd = dynStore()[c.cid];
+            c.n = (int64_t)dd.size();
+            if (dd.kind == 2) {
+                c.assoc = true;
+                for (auto& kv : dd.map) c.keys.push_back(kv.first);
+            }
+            if (!contIdx.count(c.cid)) { contIdx[c.cid] = (int)conts.size(); conts.push_back(std::move(c)); }
+        }
         g_fr = callerFr;
     }
     for (int o : objs) {
@@ -883,9 +1035,9 @@ static int doRandomize(int obj, const RandCall* rc) {
         if (!(rc && rc->argsGiven))
             for (const RandVar& rv : sp->vars) {
                 if (rv.obj || !(S.get(o + rv.mode).v & 1)) continue;
-                if (rv.dyn) {
+                if (rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // int q[4][$]: each queue
                     RCont c;
-                    c.cid = o + rv.off; c.w = rv.w; c.sgn = rv.sgn; c.owner = o;
+                    c.cid = o + rv.off + k0; c.w = rv.w; c.sgn = rv.sgn; c.owner = o; c.depth = rv.depth;
                     const DynObj& dd = dynStore()[c.cid];
                     c.n = (int64_t)dd.size();
                     if (dd.kind == 2) {
@@ -893,8 +1045,8 @@ static int doRandomize(int obj, const RandCall* rc) {
                         for (auto& kv : dd.map) c.keys.push_back(kv.first);
                     }
                     if (!contIdx.count(c.cid)) { contIdx[c.cid] = (int)conts.size(); conts.push_back(std::move(c)); }
-                    continue;
                 }
+                if (rv.dyn) continue;
                 for (int k = 0; k < rv.count; k++) scalars.push_back({o + rv.off + k, rv.w, rv.sgn, rv.randc, o});
             }
         for (const auto& b : sp->blocks) {
@@ -933,10 +1085,18 @@ static int doRandomize(int obj, const RandCall* rc) {
         std::function<void(const std::vector<RandItem>&, Frame*)> addItems = [&](const std::vector<RandItem>& its, Frame* fr) {
             for (const RandItem& it : its) {
                 g_fr = fr;
+                rw.refScope.push_back(&it.refs);
+                struct Pop { Rewrite& r; ~Pop() { r.refScope.pop_back(); } } pop{rw};
                 if (it.loopCont >= 0) {   // foreach over a container: once per element
                     int64_t n;
-                    const DynObj& d = dynStore()[R(it.loopCont)];
-                    if (RCont* c = rw.contOf(it.loopCont)) {
+                    int lc = it.loopCont;
+                    if (const E* r = rw.refOf(lc)) {   // foreach (m[i][j]): over the container m[i] is now
+                        rw.dropped = false;
+                        lc = rw.resolveRef(*r);
+                        if (lc < 0) continue;
+                    }
+                    const DynObj& d = dynStore()[R(lc)];
+                    if (RCont* c = rw.contOf(lc)) {
                         if (pass == 1) continue;   // its elements are not known yet
                         n = c->n;
                     } else n = (int64_t)d.size();
@@ -948,6 +1108,37 @@ static int doRandomize(int obj, const RandCall* rc) {
                         addItems(it.body, fr);
                         rw.loops.pop_back();
                     }
+                    continue;
+                }
+                if (!it.uniqConts.empty()) {   // unique {q, ...}: pairwise differences now
+                    std::vector<E> el;
+                    bool wait = false;
+                    rw.dropped = false;
+                    for (int cs : it.uniqConts) {
+                        if (const E* r = rw.refOf(cs)) { cs = rw.resolveRef(*r); if (cs < 0) { wait = true; break; } }
+                        if (RCont* c = rw.contOf(cs)) {
+                            if (pass == 1) { wait = true; break; }   // elements not known yet
+                            for (int64_t k = 0; k < c->n; k++) el.push_back(rw.elem(*c, k));
+                        } else {
+                            const DynObj& d = dynStore()[R(cs)];
+                            for (auto& v : d.vec) el.push_back(konst(v));
+                            for (auto& kv : d.map) el.push_back(konst(kv.second));
+                        }
+                    }
+                    if (wait) continue;
+                    for (const E& x : it.uniqElems) el.push_back(rw(x));
+                    E g = rw(it.guard);
+                    if (rw.dropped) continue;
+                    for (size_t a = 0; a < el.size(); a++)
+                        for (size_t b = a + 1; b < el.size(); b++) {
+                            RandItem x;
+                            E ne = bin(Op::Ne, el[a], el[b]);
+                            x.e = g ? bin(Op::LogOr, un(Op::LogNot, g), ne) : ne;
+                            owned.push_back(std::move(x));
+                            Item k;
+                            k.it = &owned.back(); k.fr = fr;
+                            ctx.items.push_back(k);
+                        }
                     continue;
                 }
                 const RandItem* use = &it;
@@ -1049,6 +1240,8 @@ static int doRandomize(int obj, const RandCall* rc) {
         // Function arguments before the other variables of their constraint (18.5.12).
         for (auto& it : ctx.items)
             for (int v : it.fnVars) rank[(size_t)v] = std::min(rank[(size_t)v], 0);
+        for (size_t k = 0; k < ctx.vars.size(); k++)
+            if (rank[k] == 0) ctx.vars[k].ordered = true;
         if (pass == 1)   // sizes before everything else (18.4)
             for (int ci : sizeVars) rank[(size_t)ctx.idx.at(conts[(size_t)ci].sizeFr->base)] = -1;
         for (int r = -1; r <= 2; r++)
@@ -1110,20 +1303,79 @@ static int doRandomize(int obj, const RandCall* rc) {
         std::vector<int> none;
         ok = solvePass(0, none);
     } else {
-        std::vector<int> sizeVars;
-        ok = solvePass(1, sizeVars);
-        if (ok) {
-            for (int ci : sizeVars) conts[(size_t)ci].n = (int64_t)S.get(conts[(size_t)ci].sizeFr->base).v;
-            for (auto& c : conts) {
-                c.elems = newFrame(scratchLayout(c.w, c.sgn, c.n), nullptr, 0);
-                const DynObj& dd = dynStore()[c.cid];
-                if (c.assoc) {
-                    for (int64_t k = 0; k < c.n; k++) S.set(c.elems->base + (int)k, dd.map.at(c.keys[(size_t)k]));
-                } else
-                    for (int64_t k = 0; k < c.n && k < (int64_t)dd.vec.size(); k++) S.set(c.elems->base + (int)k, dd.vec[(size_t)k]);
+        // Sizes are solved before elements (18.5.8.1), so a size may leave
+        // the elements no solution: then the sizes are picked again.
+        const std::vector<RCont> conts0 = conts;
+        const auto contIdx0 = contIdx;
+        std::map<int, DynObj> saved;   // containers resized on the way, restored on failure
+        for (int attempt = 0; attempt < 8; attempt++) {
+            if (attempt) { conts = conts0; contIdx = contIdx0; }
+            ok = true;
+            std::vector<int> sizeVars;
+            // Containers of containers (int m[][]): the outer sizes are solved
+            // first, the container resized, and its elements take its place for
+            // the next level, down to the containers that hold values.
+            for (;;) {
+                bool nested = false;
+                for (auto& c : conts) nested |= c.depth > 1;
+                if (!nested) break;
+                sizeVars.clear();
+                ok = solvePass(1, sizeVars);
+                if (!ok) break;
+                for (int ci : sizeVars) conts[(size_t)ci].n = (int64_t)S.get(conts[(size_t)ci].sizeFr->base).v;
+                std::vector<RCont> next;
+                for (auto& c : conts) {
+                    c.sizeFr = nullptr;
+                    c.sized = true;
+                    if (c.depth == 1) { next.push_back(std::move(c)); continue; }
+                    auto& d = dynStore()[c.cid];
+                    if (!c.assoc) {
+                        if (!saved.count(c.cid)) saved[c.cid] = d;
+                        size_t old = d.vec.size();
+                        d.vec.resize((size_t)c.n);
+                        for (size_t k = old; k < d.vec.size(); k++) d.vec[k] = dynNewElem(d);
+                        dynBump(c.cid);
+                    }
+                    std::vector<Val*> els;
+                    for (auto& v : d.vec) els.push_back(&v);
+                    for (auto& kv : d.map) els.push_back(&kv.second);
+                    for (Val* el : els) {
+                        if (el->x || !el->v) *el = dynNewElem(d);
+                        RCont k;
+                        k.cid = (int)el->v; k.w = c.w; k.sgn = c.sgn; k.owner = c.owner; k.depth = c.depth - 1;
+                        const DynObj& kd = dynStore()[k.cid];
+                        k.n = (int64_t)kd.size();
+                        if (kd.kind == 2) {
+                            k.assoc = true;
+                            for (auto& kv : kd.map) k.keys.push_back(kv.first);
+                        }
+                        next.push_back(std::move(k));
+                    }
+                }
+                conts = std::move(next);
+                contIdx.clear();
+                for (size_t k = 0; k < conts.size(); k++) contIdx[conts[k].cid] = (int)k;
             }
-            ok = solvePass(2, sizeVars);
+            if (ok) { sizeVars.clear(); ok = solvePass(1, sizeVars); }
+            if (ok) {
+                for (int ci : sizeVars) conts[(size_t)ci].n = (int64_t)S.get(conts[(size_t)ci].sizeFr->base).v;
+                for (auto& c : conts) {
+                    c.elems = newFrame(scratchLayout(c.w, c.sgn, c.n), nullptr, 0);
+                    const DynObj& dd = dynStore()[c.cid];
+                    if (c.assoc) {
+                        for (int64_t k = 0; k < c.n; k++) S.set(c.elems->base + (int)k, dd.map.at(c.keys[(size_t)k]));
+                    } else
+                        for (int64_t k = 0; k < c.n && k < (int64_t)dd.vec.size(); k++) S.set(c.elems->base + (int)k, dd.vec[(size_t)k]);
+                }
+                ok = solvePass(2, sizeVars);
+            }
+            if (ok) break;
+            bool sizesVary = !sizeVars.empty();
+            for (auto& c : conts0) sizesVary |= c.depth > 1;
+            if (!sizesVary) break;
         }
+        if (!ok)
+            for (auto& [cid, o] : saved) { dynStore()[cid] = o; dynBump(cid); }
         if (ok)
             for (auto& c : conts) {
                 auto& d = dynStore()[c.cid];

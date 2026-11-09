@@ -46,6 +46,62 @@ Spec references are IEEE 1800-2023 clauses.
   into an `@*` wait.
 - A process still waiting at the end of the simulation could corrupt the
   heap when it was freed.
+- Arrays of instances and of interfaces (23.3.3, 25.3), including
+  multidimensional instance arrays and per-element port slicing.
+- System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),
+  `$system`, the array query functions on every kind of dimension,
+  `$typename`, and the VCD tasks (`$dumpfile`, `$dumpvars` with a level and
+  scope selection, `$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` /
+  `$dumplimit`). A design's `$dumpvars` now writes its dump file without
+  `-vcd`.
+- `$fstrobe`, `$fmonitor` (several at once, cancelled by `$fclose`) and
+  `$fread` (21.3.2, 21.3.4.4).
+- VPI (clauses 36-38): `vpi_user.h`, VPI libraries loaded before
+  elaboration (`-load`, `-loadvpi`, or C files on the command line), user
+  system tasks and functions, the module / net / variable / memory /
+  parameter / port object model, `vpi_get_value` and `vpi_put_value` in all
+  the common formats, and callbacks. The tests match Icarus 13 VPI output.
+- DPI-C (clause 35): `import "DPI-C"` functions and tasks (`pure`, `context`,
+  C names), `export "DPI-C"` functions and tasks, every argument type
+  including packed vectors and open arrays, context scopes, exported tasks
+  that wait on time, and the 35.9 disable protocol. `include/svdpi.h` is
+  installed. msim builds C/C++ files given on its command line, loads
+  libraries with `-sv_lib` / `-sv_root` / `-sv_liblist` (annex J), and writes
+  prototypes with `-dpiheader`. msim now links libffi.
+- `chandle` variables (6.14).
+- `repeat (n)` with a count known only at run time (12.7.2).
+- randomize() arguments that are arrays or containers (18.11), and whole
+  fixed-size array properties through a handle: `h.a = '{...}` and `%p`
+  of `h.a` (8.4).
+- Fixed-size arrays of containers (`int q[4][$]`) as class properties,
+  rand properties and automatic variables (7.4, 18.4), with `%p`, foreach,
+  object copies and access through a handle.
+- `unique` constraints over dynamic arrays, queues and associative arrays
+  (18.5.5), alone or with scalars, under implications and on `m[i]`.
+- Rand containers of containers (18.4, 7.5): `rand int m[][]`, queues of
+  queues, associative arrays of queues, with constraints on `m.size()`,
+  `m[i].size()`, `m[i].sum()` and `m[i][j]` in nested foreach loops. Sizes
+  are solved level by level and picked again when the elements have no
+  solution; a failed randomize() leaves the arrays unchanged.
+- rand associative arrays with string keys (18.4).
+- Per-process random generators (18.14.2): a forked process is seeded from
+  its parent, so values one process draws do not depend on other processes.
+- `mbug`: files regression (mregress `results.json`), lint (mlint) and DFT
+  (mdft) failures as issues in GitHub Issues (default), Redmine or Jira, one
+  issue per failure signature. A repeat of an open failure becomes a comment,
+  and a failure that comes back after its issue was closed gets a new issue
+  linked to the old one. Issues have the reproduction command, the log tail,
+  attachments (Redmine, Jira), and the Jenkins or GitHub Actions build link.
+  `mbug sync-github` copies a repository's GitHub issues into Jira or
+  Redmine and keeps open / closed in step (`-two-way` also closes GitHub
+  issues resolved on the other side). It has `-dry-run` and a `max_issues`
+  cap, and credentials come from the environment only. `ci/Jenkinsfile`
+  has an opt-in `BUGS` parameter that runs it. `results.json` now records
+  each failure's `signature` and the test lists.
+- The constraint solver weights each choice by how many ways the other
+  variables can still be completed, so values are close to uniform over the
+  joint solution space (18.5.10): `s -> d == 0` gives s = 0, and `x < y`
+  is no longer biased toward a large x.
 - Containers of containers (7.5, 7.8, 7.10): `int m[][]`, `int q[$][$]`,
   associative arrays of queues, and fixed-size arrays of containers
   (`int f[2][]`); containers of unpacked structs and of vectors wider than
@@ -69,12 +125,6 @@ Spec references are IEEE 1800-2023 clauses.
 - `std::semaphore` (15.3), `std::mailbox` (15.4, parameterized, typeless and
   bounded) and `std::process` (9.7: self, status, kill, await, suspend,
   resume).
-- System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),
-  `$system`, the array query functions on every kind of dimension,
-  `$typename`, and the VCD tasks (`$dumpfile`, `$dumpvars` with a level and
-  scope selection, `$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` /
-  `$dumplimit`). A design's `$dumpvars` now writes its dump file without
-  `-vcd`.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
