@@ -15,6 +15,7 @@ module t;
     $displayh(a);
     $displayb(five);
     $display("100%%");
+    $display("[%0s] [%12s]", "a string literal", "abcdefghij");   // literals longer than 8 characters
   end
 endmodule
 //> 10101011 253 ab 171
@@ -25,3 +26,4 @@ endmodule
 //> ab
 //> 00000101
 //> 100%
+//> [a string literal] [  abcdefghij]
