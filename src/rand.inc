@@ -1015,6 +1015,17 @@ static int doRandomize(int obj, const RandCall* rc) {
             int addr = a->at ? (int)eval(a->at, rd).v + a->sig : R(a->sig);
             scalars.push_back({addr, S.sigs[addr].w, a->sgn, false, obj});
         }
+        for (const auto& ca : rc->contArgs) {   // randomize(q): its size and elements
+            RCont c;
+            c.cid = ca.addr ? (int)eval(ca.addr, rd).v - 1 : R(ca.sig); c.w = ca.w; c.sgn = ca.sgn; c.owner = obj; c.depth = ca.depth;
+            const DynObj& dd = dynStore()[c.cid];
+            c.n = (int64_t)dd.size();
+            if (dd.kind == 2) {
+                c.assoc = true;
+                for (auto& kv : dd.map) c.keys.push_back(kv.first);
+            }
+            if (!contIdx.count(c.cid)) { contIdx[c.cid] = (int)conts.size(); conts.push_back(std::move(c)); }
+        }
         g_fr = callerFr;
     }
     for (int o : objs) {

@@ -2551,6 +2551,37 @@ struct Lowerer {
                 }
                 return;
             }
+            case ExpressionKind::MemberAccess:
+                if (classMember(x)) {   // h.a (8.4): each element read through the handle
+                    const auto& m = x.as<MemberAccessExpression>();
+                    const PropSlot* ps = memberSlot(m);
+                    std::shared_ptr<const ArrShape> A;
+                    if (!ps) A = arrFind(&m.member);
+                    else {
+                        if (ps->kind != 1 || ps->arr->dynElem) unsupported("array value of this property");
+                        auto c = std::make_shared<ArrShape>(*ps->arr);
+                        c->base = indSlot(exprH(m.value()), ps->arr->base);
+                        A = c;
+                    }
+                    if (!A) unsupported("array value of this property");
+                    for (int k = 0; k < A->count; k++) {
+                        std::vector<int64_t> idx(A->dims.size());
+                        int64_t rest = k;
+                        for (size_t dd = A->dims.size(); dd-- > 0;) {
+                            auto [l, r] = A->dims[dd];
+                            int64_t nn = (l > r ? l - r : r - l) + 1;
+                            int64_t o = rest % nn;
+                            rest /= nn;
+                            idx[dd] = l <= r ? l + o : l - o;
+                        }
+                        auto rd = node(Op::ArrRead);
+                        rd->arr = A;
+                        for (int64_t i : idx) rd->kids.push_back(konst(make((uint64_t)i, 0, 32, 0, true)));
+                        out.push_back(rd);
+                    }
+                    return;
+                }
+                [[fallthrough]];
             default: {   // a constant function call or a parameter array element
                 auto cv = tryConst(x, selectBase(x));
                 if (!cv) unsupported("fixed-size array value of this kind");
@@ -2575,6 +2606,41 @@ struct Lowerer {
     bool assignWholeArray(const slang::ast::Expression& l0, const slang::ast::Expression& rhs, bool nba) {
         using namespace slang::ast;
         const Expression& l = peel(l0);
+        if (classMember(l) && l.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {   // h.a = '{...} (8.4)
+            const auto& m = l.as<MemberAccessExpression>();
+            const PropSlot* ps = memberSlot(m);
+            if (!ps) return assignWholeArray(m.member, *l.type, rhs, nba);
+            if (ps->kind != 1 || ps->arr->dynElem) return false;
+            std::vector<E> vals;
+            arrayElems(*l.type, rhs, vals);
+            const ArrShape& P = *ps->arr;
+            if ((int)vals.size() != P.count) unsupported("array value with the wrong number of elements");
+            for (auto& v : vals) {   // every value first: h.a = '{h.a[1], h.a[0]} swaps
+                if (v->op == Op::Const && !nba) continue;
+                int tmp = fresh(P.elemW);
+                Instr h; h.k = IK::Assign; h.sig = tmp; h.e = v;
+                prog.emit(h);
+                v = ref(tmp, P.sgn);
+            }
+            auto A = std::make_shared<ArrShape>(P);
+            A->base = indSlot(exprH(m.value()), P.base);
+            for (int k = 0; k < P.count; k++) {
+                std::vector<int64_t> idx(P.dims.size());
+                int64_t rest = k;
+                for (size_t dd = P.dims.size(); dd-- > 0;) {
+                    auto [lo, ro] = P.dims[dd];
+                    int64_t nn = (lo > ro ? lo - ro : ro - lo) + 1;
+                    int64_t o = rest % nn;
+                    rest /= nn;
+                    idx[dd] = lo <= ro ? lo + o : lo - o;
+                }
+                Instr i; i.k = nba ? IK::Nba : IK::Assign;
+                i.sig = A->base; i.arr = A; i.e = vals[(size_t)k];
+                for (int64_t x : idx) i.aidx.push_back(konst(make((uint64_t)x, 0, 32, 0, true)));
+                prog.emit(i);
+            }
+            return true;
+        }
         if (l.kind != ExpressionKind::NamedValue && l.kind != ExpressionKind::HierarchicalValue) return false;
         return assignWholeArray(l.as<ValueExpressionBase>().symbol, *l.type, rhs, nba);
     }
@@ -4566,7 +4632,28 @@ struct Lowerer {
             const Symbol* sym = (x.kind == ExpressionKind::NamedValue || x.kind == ExpressionKind::HierarchicalValue)
                                     ? &x.as<ValueExpressionBase>().symbol : nullptr;
             auto ap = sym ? arrFind(sym) : nullptr;
-            if (!ap) unsupported("%p of an unpacked array expression");
+            if (!ap) {   // h.a and other array expressions: their elements, flattened (7.4)
+                std::vector<E> el;
+                arrayElems(*x.type, x, el);
+                std::vector<int64_t> dims;
+                const Type* et = x.type;
+                while (et->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                    dims.push_back((int64_t)et->getCanonicalType().as<FixedSizeUnpackedArrayType>().range.width());
+                    et = et->getCanonicalType().getArrayElementType();
+                }
+                size_t flat = 0;
+                std::function<void(size_t)> walk = [&](size_t dim) {
+                    fmt += "'{";
+                    for (int64_t k = 0; k < dims[dim]; k++) {
+                        if (k) fmt += ", ";
+                        if (dim + 1 < dims.size()) walk(dim + 1);
+                        else if (flat < el.size()) pfmtSingular(*et, el[flat++], fmt, out);
+                    }
+                    fmt += "}";
+                };
+                walk(0);
+                return;
+            }
             const ArrShape& A = *ap;
             const Type* et = x.type;
             for (size_t k = 0; k < A.dims.size(); k++) et = et->getCanonicalType().getArrayElementType();
@@ -4955,7 +5042,51 @@ struct Lowerer {
         for (size_t k = first; k < args.size(); k++) {
             const Expression& a = outArg(*args[k]);
             if (a.kind == ExpressionKind::NullLiteral) { rc->argsGiven = true; continue; }   // randomize(null): check only
-            if (a.type->isUnpackedArray() || !a.type->isIntegral()) unsupported("randomize() argument of this type");
+            if (a.type->isUnpackedArray()) {   // a container or a fixed-size array (18.11): every element
+                rc->argsGiven = true;
+                const Type* et = a.type;
+                std::vector<int> conts;
+                std::vector<E> addrs;
+                if (isDynType(*a.type)) {
+                    int d = dynSig(a);
+                    if (d < 0) unsupported("randomize() argument: this container");
+                    conts.push_back(d);
+                } else if (auto ca = contArr(a)) {   // int q[4][$]: each queue
+                    while (!isDynType(*et)) et = et->getCanonicalType().getArrayElementType();
+                    for (int k = 0; k < ca->count; k++) {
+                        std::vector<E> ks;
+                        int64_t rest = k;
+                        std::vector<int64_t> idx(ca->dims.size());
+                        for (size_t dd = ca->dims.size(); dd-- > 0;) {
+                            auto [l, r] = ca->dims[dd];
+                            int64_t n = (l > r ? l - r : r - l) + 1;
+                            int64_t o = rest % n;
+                            rest /= n;
+                            idx[dd] = l <= r ? l + o : l - o;
+                        }
+                        for (int64_t i : idx) ks.push_back(konst(make((uint64_t)i, 0, 32, 0, true)));
+                        auto n = node(Op::ArrAddr, std::move(ks));
+                        n->arr = ca;
+                        addrs.push_back(std::move(n));
+                    }
+                } else {   // int a[4]: its elements
+                    std::vector<E> el;
+                    arrayElems(*a.type, a, el);
+                    for (E& r : el) {
+                        if (r->op != Op::Ref) unsupported("randomize() argument: an array element that is not a variable");
+                        rc->args.push_back(r);
+                    }
+                    continue;
+                }
+                int depth = 0;
+                while (isDynType(*et)) { depth++; et = et->getCanonicalType().getArrayElementType(); }
+                const Type& ec = et->getCanonicalType();
+                if (!ec.isIntegral() || ec.isUnpackedStruct() || ec.getBitWidth() > 64) unsupported("randomize() argument: a container of this element type");
+                for (int d : conts) rc->contArgs.push_back({d, (int)ec.getBitWidth(), ec.isSigned(), depth, nullptr});
+                for (E& n : addrs) rc->contArgs.push_back({-1, (int)ec.getBitWidth(), ec.isSigned(), depth, std::move(n)});
+                continue;
+            }
+            if (!a.type->isIntegral()) unsupported("randomize() argument of this type");
             E r = expr(a);
             if (r->op != Op::Ref) unsupported("randomize() argument that is not a variable");
             rc->args.push_back(r);
