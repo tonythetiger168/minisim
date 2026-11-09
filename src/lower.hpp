@@ -1558,6 +1558,12 @@ struct Lowerer {
                 if (!lvalue) unsupported("lvalue reference");
                 return expr(*lvalue, ctx);
             }
+            case ExpressionKind::Streaming: {
+                const auto& sc = e.as<StreamingConcatenationExpression>();
+                int w = 0;
+                E v = streamBits(sc, w);
+                return sized(v, w, false, ctx);
+            }
             case ExpressionKind::Conversion: {
                 // 4'hF inside an 8-bit add is a 4-bit literal under a conversion
                 // to 8. cnt+1 is a 32-bit add under a conversion to 4. Either
@@ -1567,6 +1573,14 @@ struct Lowerer {
                 // (11.8.3): extend with the operand's signedness. An outer width
                 // still wins, so a truncating assign stays narrow.
                 const auto& c = e.as<ConversionExpression>();
+                if (peel(c.operand()).kind == ExpressionKind::Streaming && c.type->isIntegral()) {
+                    // a stream into a wider integral type is left-aligned,
+                    // padded with zeros on the right (11.4.14)
+                    int w = (int)c.type->getBitWidth();
+                    needWidth(w);
+                    return sized(streamTo(peel(c.operand()).as<StreamingConcatenationExpression>(), w),
+                                 w, c.type->isSigned(), ctx);
+                }
                 if (c.operand().type->isString() && c.type->isIntegral()) {   // the text as bytes (6.16)
                     int w = (int)c.type->getBitWidth();
                     needWidth(w);
@@ -2771,6 +2785,73 @@ struct Lowerer {
         prog.emit(i);
     }
 
+    // {<<s{...}} (11.4.14.2): the stream cut into s-bit slices from the
+    // right, in reverse order, so the rightmost slice comes first and the
+    // leftmost one, which may be shorter, comes last.
+    static E reverseSlices(E v, int w, int s) {
+        if (s <= 0 || s >= w) return v;
+        std::vector<E> parts;
+        for (int lo = 0; lo < w; lo += s) parts.push_back(slice(v, std::min(lo + s, w) - 1, lo));
+        return concat(std::move(parts));
+    }
+    // The inverse, for unpacking (11.4.14.3): the first s bits of the stream
+    // are the rightmost slice of the targets.
+    static E unreverseSlices(E v, int w, int s) {
+        if (s <= 0 || s >= w) return v;
+        std::vector<E> parts;   // slices of the targets, rightmost first
+        int hi = w - 1;
+        for (int lo = 0; lo < w; lo += s) {
+            int len = std::min(lo + s, w) - lo;
+            parts.push_back(slice(v, hi, hi - len + 1));
+            hi -= len;
+        }
+        std::reverse(parts.begin(), parts.end());
+        return concat(std::move(parts));
+    }
+    // The bits of a streaming concatenation of integral operands, and fixed
+    // unpacked arrays of them (elements left to right).
+    E streamBits(const slang::ast::StreamingConcatenationExpression& sc, int& w) {
+        using namespace slang::ast;
+        std::vector<E> parts;
+        w = 0;
+        for (auto& st : sc.streams()) {
+            if (st.withExpr) unsupported("with [] in a streaming concatenation");
+            const Expression& op = peel(*st.operand);
+            int pw = 0;
+            if (op.kind == ExpressionKind::Streaming) {
+                parts.push_back(streamBits(op.as<StreamingConcatenationExpression>(), pw));
+            } else if (op.type->isIntegral()) {
+                pw = (int)op.type->getBitWidth();
+                parts.push_back(expr(op));
+            } else if (isFixedArr(op) && op.kind == ExpressionKind::NamedValue) {
+                auto it = arrMap().find(&op.as<NamedValueExpression>().symbol);
+                if (it == arrMap().end() || it->second->dims.size() != 1 ||
+                    !op.type->getArrayElementType()->isIntegral())
+                    unsupported("this array in a streaming concatenation");
+                int ew = (int)op.type->getArrayElementType()->getBitWidth();
+                auto r = op.type->getCanonicalType().as<FixedSizeUnpackedArrayType>().range;
+                (void)r;
+                for (int k = 0; k < it->second->count; k++) {   // foreach order: left index first
+                    parts.push_back(ref(it->second->base + k));
+                    pw += ew;
+                }
+            } else {
+                unsupported("this operand in a streaming concatenation");
+            }
+            w += pw;
+        }
+        needWidth(w);
+        E v = parts.size() == 1 ? parts[0] : concat(std::move(parts));
+        return reverseSlices(v, w, (int)sc.getSliceSize());
+    }
+    E streamTo(const slang::ast::StreamingConcatenationExpression& sc, int w) {
+        int sw = 0;
+        E v = streamBits(sc, sw);
+        if (w == sw) return v;
+        if (w < sw) return slice(v, sw - 1, sw - w);
+        return concat({v, konst(mk(0, w - sw))});
+    }
+
     // The parts of a concatenation assignment target, first (most
     // significant) first, with their offsets in the whole (11.4.12, 10.4).
     static void concatParts(const slang::ast::Expression& e, int hi,
@@ -2830,6 +2911,42 @@ struct Lowerer {
         }
     }
 
+    // {>>{a, b}} = v; {<<8{a, b}} = v (11.4.14.3): the leftmost bits of v,
+    // slices reversed for <<, are spread over the targets, first one on top.
+    void streamAssign(const slang::ast::AssignmentExpression& a) {
+        using namespace slang::ast;
+        if (a.timingControl || a.isCompound()) unsupported("delayed or compound streaming assignment");
+        const auto& sc = peel(a.left()).as<StreamingConcatenationExpression>();
+        std::vector<std::pair<const Expression*, int>> tg;   // target, width
+        int sw = 0;
+        for (auto& st : sc.streams()) {
+            if (st.withExpr) unsupported("with [] in a streaming concatenation");
+            const Expression& op = peel(*st.operand);
+            if (!op.type->isIntegral()) unsupported("this target of a streaming assignment");
+            int w = (int)op.type->getBitWidth();
+            tg.push_back({&op, w});
+            sw += w;
+        }
+        needWidth(sw);
+        const Expression& r = peel(a.right());
+        int rw = (int)r.type->getBitWidth();
+        if (!r.type->isIntegral() || rw < sw) unsupported("streaming assignment from a narrower or non-integral value");
+        E v = expr(r);
+        if (rw > sw) v = slice(v, rw - 1, rw - sw);
+        int tmp = fresh(sw);
+        Instr hold; hold.k = IK::Assign; hold.sig = tmp; hold.e = unreverseSlices(v, sw, (int)sc.getSliceSize());
+        prog.emit(hold);
+        int hi = sw - 1;
+        for (auto& [x, w] : tg) {
+            Instr i;
+            i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
+            lhs(*x, i);
+            i.e = slice(ref(tmp), hi, hi - w + 1);
+            prog.emit(i);
+            hi -= w;
+        }
+    }
+
     // Assignments, ++/--, and system calls used as statements.
     void exprStmt(const slang::ast::Expression& ex) {
         using namespace slang::ast;
@@ -2845,6 +2962,10 @@ struct Lowerer {
                 return;
             if (peel(a.left()).kind == ExpressionKind::Concatenation) {
                 concatAssign(a);
+                return;
+            }
+            if (peel(a.left()).kind == ExpressionKind::Streaming) {
+                streamAssign(a);
                 return;
             }
             Instr i;
