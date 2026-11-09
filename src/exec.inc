@@ -82,6 +82,89 @@ static void writeMem(const Instr& i) {
 // index values. Without a range, loading starts at the lowest address and goes
 // up; with start and finish it goes from start toward finish. "@hex" in the
 // file moves the address. 2-state elements read x/z digits as 0 (21.4.2).
+// A user-defined primitive (29). Values are 0, 1, 2 (x); z inputs read as x
+// (29.3.5). `last` holds each input's previous value in two bits (all X
+// before the first evaluation). Inputs that changed are taken one at a time, in port order; for
+// each, a matching level row wins over a matching edge row (29.9, 29.10),
+// and a change no row covers gives x (29.6). '-' keeps the state.
+static bool udpLevel(char c, int v) {
+    switch (c) {
+        case '0': return v == 0;
+        case '1': return v == 1;
+        case 'x': return v == 2;
+        case 'b': return v < 2;
+        case '?': return true;
+        default: return false;
+    }
+}
+static bool udpEdge(const std::string& f, int a, int b) {
+    if (f.size() == 4) return udpLevel(f[1], a) && udpLevel(f[2], b);
+    switch (f[0]) {
+        case 'r': return a == 0 && b == 1;
+        case 'f': return a == 1 && b == 0;
+        case 'p': return (a == 0 && b != 0) || (a == 2 && b == 1);
+        case 'n': return (a == 1 && b != 1) || (a == 2 && b == 0);
+        case '*': return true;
+        default: return false;
+    }
+}
+static char udpMatch(const UdpTable& t, const std::vector<int>& in, int q, int edgeAt, int from) {
+    for (const UdpRow& r : t.rows) {
+        if (r.edge != edgeAt) continue;
+        if (t.seq && !udpLevel(r.state, q)) continue;
+        bool ok = true;
+        for (int k = 0; k < t.nin && ok; k++)
+            ok = k == edgeAt ? udpEdge(r.in[(size_t)k], from, in[(size_t)k]) : udpLevel(r.in[(size_t)k][0], in[(size_t)k]);
+        if (ok) return r.out;
+    }
+    return 0;
+}
+static void udpExec(const Instr& i) {
+    const UdpTable& t = *i.udp;
+    Val qv = S.get(i.sig), lv = S.get(i.dres);
+    int q = (qv.x & 1) ? 2 : (int)(qv.v & 1);
+    std::vector<int> prev((size_t)t.nin), cur((size_t)t.nin);
+    for (int k = 0; k < t.nin; k++) {
+        Val a = eval(i.args[(size_t)k], rd);
+        cur[(size_t)k] = (a.x & 1) ? 2 : (int)(a.v & 1);
+        int code = bitAt(lv, 2 * k) | (bitAt(lv, 2 * k + 1) == 1 ? 2 : 0);
+        prev[(size_t)k] = bitAt(lv, 2 * k) >= 2 ? 2 : code;
+    }
+    // The first evaluation (time 0) takes the inputs as they are: their
+    // starting values are not transitions.
+    bool first = t.nin > 0 && bitAt(lv, 0) >= 2;
+    if (first) prev = cur;
+    auto apply = [&](char r) { if (r == '0') q = 0; else if (r == '1') q = 1; else if (r != '-') q = 2; };
+    if (!t.seq) {
+        char r = udpMatch(t, cur, q, -1, 0);
+        apply(r ? r : 'x');
+    } else {
+        std::vector<int> now = prev;
+        bool any = false;
+        for (int k = 0; k < t.nin; k++) {
+            if (cur[(size_t)k] == prev[(size_t)k]) continue;
+            any = true;
+            now[(size_t)k] = cur[(size_t)k];
+            char r = udpMatch(t, now, q, -1, 0);
+            if (!r && t.edges) r = udpMatch(t, now, q, k, prev[(size_t)k]);
+            apply(r ? r : 'x');
+        }
+        if (!any && first) {   // a sequential UDP's first evaluation: its level rows only
+            char r = udpMatch(t, cur, q, -1, 0);
+            if (r) apply(r);
+        }
+    }
+    Val nl = make(0, 0, 2 * t.nin);
+    if (2 * t.nin > 64) nl = maskWidth(nl, 2 * t.nin);
+    for (int k = 0; k < t.nin; k++) {
+        int v = cur[(size_t)k];
+        setBit(nl, 2 * k, v == 2 ? 0 : v);
+        setBit(nl, 2 * k + 1, v == 2 ? 1 : 0);
+    }
+    S.set(i.dres, nl);
+    S.set(i.sig, q == 2 ? allx(1) : make((uint64_t)q, 0, 1));
+}
+
 static void readMem(const Instr& i) {
     const ArrShape& a = *i.arr;
     auto [l, r] = a.dims[0];
@@ -460,6 +543,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0); pc++; break;
             case IK::Release: S.holdOff(i.sig, i.hi != 0); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
+            case IK::Udp: udpExec(i); pc++; break;
             case IK::Tran: {   // 28.8: 1 on, 0 off, 2 an X or Z control
                 int st = 1;
                 if (i.e) {
