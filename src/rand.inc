@@ -85,6 +85,7 @@ struct Item {
     std::vector<int> vars;    // the variables it reads
     bool on = true;
     int prio = 0;             // soft: higher wins (18.5.13.1)
+    std::vector<int> fnVars;  // the variables its function calls read (18.5.12)
 };
 
 struct Ctx {
@@ -172,7 +173,9 @@ inline AV aeval(const E& e, bool& exact) {
             bool ex;
             AV a = aeval(e->kids[0], ex);
             exact = ex;
-            if (ex) return concrete(e, exact);
+            // A known value: extend it here rather than re-evaluating the
+            // subtree (a long sum() chain would cost O(n^2)).
+            if (ex && !isSingle(a)) return concrete(e, exact);
             if (isFull(a)) return full(e->hi, e->sgn);
             // The source bits, sign- or zero-extended, then read as the result.
             AV b = wrap(a.lo, a.hi, a.w, e->lo != 0);
@@ -182,9 +185,11 @@ inline AV aeval(const E& e, bool& exact) {
             bool ea, eb;
             AV a = aeval(e->kids[0], ea), b = aeval(e->kids[1], eb);
             exact = ea && eb;
-            if (exact) return concrete(e, exact);
             int w = std::max(a.w, b.w);
             bool s = a.sgn && b.sgn;
+            // Two known values of one width: interval arithmetic is exact, and
+            // avoids re-evaluating the subtrees (O(n^2) for a long sum chain).
+            if (exact && !(a.w == b.w && w <= kMaxW / 2 && isSingle(a) && isSingle(b))) return concrete(e, exact);
             if (w > kMaxW / 2) return full(w, s);
             a = conv(a, w, s); b = conv(b, w, s);
             if (e->op == Op::Add) return wrap(a.lo + b.lo, a.hi + b.hi, w, s);
@@ -314,8 +319,57 @@ inline AV aeval(const E& e, bool& exact) {
     }
 }
 
+// The signals an expression of a constraint's function call reads, except
+// the callee's result (in the frame the call returned from, gone by now).
+inline void fnAddrs(const E& e, std::vector<int>& out) {
+    if (!e) return;
+    auto ret = [](int s) { return isRel(s) && (s >> kRelOffBits & 15) == kRelRet; };
+    if (e->op == Op::Ref && !e->at) { if (!ret(e->sig)) out.push_back(R(e->sig)); }
+    else if (e->op == Op::Ref) { collectAddrs(e, out); return; }
+    else if (e->op == Op::ArrRead) { if (!ret(e->arr->base)) for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base) + i); }
+    for (auto& k : e->kids) fnAddrs(k, out);
+}
+
+// Run item k's function calls (18.5.12) with the values its variables have
+// now. False, running nothing, while one of them has no single value yet.
+inline bool runFns(Item& k) {
+    for (int vi : k.fnVars) {
+        const Var& v = g_ctx->vars[(size_t)vi];
+        if (!v.set && v.lo != v.hi) return false;
+    }
+    std::vector<std::pair<int, Val>> old;
+    for (int vi : k.fnVars) {
+        const Var& v = g_ctx->vars[(size_t)vi];
+        i128 x = v.set ? v.val : v.lo;
+        old.push_back({v.addr, S.get(v.addr)});
+        S.set(v.addr, make(v.w >= 64 ? (uint64_t)x : (uint64_t)x & ((1ULL << v.w) - 1), 0, v.w, 0, v.sgn));
+    }
+    Frame* sf = g_fr;
+    Frame* sr = g_ret;
+    g_fr = k.fr;
+    FrameP fp(k.fr, [](Frame*) {});   // the item's frame, owned by randomize()
+    for (const auto& p : k.it->fns) {
+        auto ctl = std::make_shared<ProcCtl>();
+        Task t = exec(p.get(), ctl, fp);
+        t.h.resume();
+        if (!t.h.done()) {
+            cerr << "error: a function called in a constraint waited (time " << S.now << ")\n";
+            exit(1);
+        }
+        t.h.destroy();
+    }
+    g_fr = sf;
+    g_ret = sr;
+    for (auto& [a, v] : old) S.set(a, v);
+    return true;
+}
+
 // Can item k still be true (and must it be: *sure)?
 inline bool itemOk(Item& k, bool* sure = nullptr) {
+    if (!k.it->fns.empty() && !runFns(k)) {   // not known until its calls run
+        if (sure) *sure = false;
+        return true;
+    }
     Frame* saved = g_fr;
     g_fr = k.fr;
     bool ok = true;
@@ -325,7 +379,11 @@ inline bool itemOk(Item& k, bool* sure = nullptr) {
     } else if (k.it->isDist) {
         AV a = aeval(k.it->e, ex);
         ok = false;
+        bool e0;
+        // With a default weight, a value no item names may be taken too.
+        if (k.it->distDefault && canTrue(aeval(k.it->distDefault, e0))) ok = true;
         for (const RandDist& d : k.it->dist) {
+            if (ok) break;
             bool e1;
             AV lo = aeval(d.lo, e1);
             AV hi = d.hi ? aeval(d.hi, e1) : lo;
@@ -423,27 +481,37 @@ inline bool feasibleIn(Var& v, i128 lo, i128 hi) {
     v.lo = slo; v.hi = shi;
     return ok;
 }
+// Shrink one variable's range to its feasible bounds: -1 if empty, 1 if changed.
+inline int narrowVar(Var& v) {
+    if (v.set || v.items.empty()) return 0;
+    if (--g_ctx->budget < 0) return -1;
+    if (!feasibleIn(v, v.lo, v.hi)) return -1;
+    // smallest m with [lo, m] feasible (lo itself, most of the time)
+    i128 a = v.lo, b = v.hi;
+    if (a < b && feasibleIn(v, a, a)) b = a;
+    while (a < b) {
+        i128 m = a + (b - a) / 2;
+        if (feasibleIn(v, v.lo, m)) b = m; else a = m + 1;
+    }
+    i128 nlo = a;
+    a = nlo; b = v.hi;
+    if (a < b && feasibleIn(v, b, b)) a = b;
+    while (a < b) {
+        i128 m = a + (b - a + 1) / 2;
+        if (feasibleIn(v, m, v.hi)) a = m; else b = m - 1;
+    }
+    i128 nhi = a;
+    if (nlo == v.lo && nhi == v.hi) return 0;
+    v.lo = nlo; v.hi = nhi;
+    return 1;
+}
 inline bool propagate() {
     for (int round = 0; round < 8; round++) {
         bool changed = false;
         for (auto& v : g_ctx->vars) {
-            if (v.set || v.items.empty()) continue;
-            if (--g_ctx->budget < 0) return false;
-            if (!feasibleIn(v, v.lo, v.hi)) return false;
-            // smallest m with [lo, m] feasible
-            i128 a = v.lo, b = v.hi;
-            while (a < b) {
-                i128 m = a + (b - a) / 2;
-                if (feasibleIn(v, v.lo, m)) b = m; else a = m + 1;
-            }
-            i128 nlo = a;
-            a = nlo; b = v.hi;
-            while (a < b) {
-                i128 m = a + (b - a + 1) / 2;
-                if (feasibleIn(v, m, v.hi)) a = m; else b = m - 1;
-            }
-            i128 nhi = a;
-            if (nlo != v.lo || nhi != v.hi) { v.lo = nlo; v.hi = nhi; changed = true; }
+            int r = narrowVar(v);
+            if (r < 0) return false;
+            if (r) changed = true;
         }
         if (!changed) break;
     }
@@ -492,6 +560,36 @@ inline bool pickVar(Var& v) {
             if (l > h) continue;
             double weight = d.perRange || !d.hi ? (double)wv : (double)wv * (double)(h - l + 1);
             opts.push_back({l, h, weight});
+        }
+        if (v.dist->distDefault) {
+            // default :/ w (18.5.3): w over the values in [flo, fhi] that no
+            // item names, each gap by its size.
+            Val wt = eval(v.dist->distDefault, rcReader());
+            i128 wv;
+            if (valOf(wt, wv) && wv > 0) {
+                std::vector<std::pair<i128, i128>> named;
+                for (const RandDist& d : v.dist->dist) {
+                    Val lo = eval(d.lo, rcReader()), hi = d.hi ? eval(d.hi, rcReader()) : lo;
+                    i128 l, h;
+                    if (!valOf(lo, l) || !valOf(hi, h)) continue;
+                    AV cl = conv(single(l, lo.w, lo.sgn), v.w, v.sgn), ch = conv(single(h, hi.w, hi.sgn), v.w, v.sgn);
+                    if (cl.lo <= ch.lo) named.push_back({cl.lo, ch.lo});
+                }
+                std::sort(named.begin(), named.end());
+                std::vector<std::pair<i128, i128>> gaps;
+                i128 at = flo;
+                for (auto [l, h] : named) {
+                    if (h < at) continue;
+                    if (l > at) gaps.push_back({at, std::min(l - 1, fhi)});
+                    if (h >= fhi) { at = fhi + 1; break; }
+                    at = std::max(at, h + 1);
+                }
+                if (at <= fhi) gaps.push_back({at, fhi});
+                double tot = 0;
+                for (auto& [l, h] : gaps) if (l <= h) tot += (double)(h - l + 1);
+                for (auto& [l, h] : gaps)
+                    if (l <= h) opts.push_back({l, h, (double)wv * (double)(h - l + 1) / tot});
+            }
         }
         g_fr = saved;
         while (!opts.empty()) {
@@ -551,9 +649,14 @@ inline bool pickVar(Var& v) {
 inline bool solveOnce(const std::vector<int>& order) {
     for (auto& v : g_ctx->vars) { v.set = false; v.lo = rMin(v.w, v.sgn); v.hi = rMax(v.w, v.sgn); }
     if (!propagate()) return false;
-    for (int k : order) {
-        if (!pickVar(g_ctx->vars[(size_t)k])) return false;
-        if (!propagate()) return false;
+    // Many variables (rand arrays): full propagation after every pick costs
+    // O(n^2) item checks per pick, so narrow only the variable picked next.
+    bool lazy = g_ctx->vars.size() > 32;
+    for (size_t i = 0; i < order.size(); i++) {
+        auto& v = g_ctx->vars[(size_t)order[i]];
+        if (lazy && i > 0 && narrowVar(v) < 0) return false;
+        if (!pickVar(v)) return false;
+        if (!lazy && !propagate()) return false;
     }
     // Constraints that read no random variable still have to hold.
     for (auto& it : g_ctx->items)
@@ -588,6 +691,13 @@ static void randObjects(int obj, std::vector<int>& out) {
     if (!cr.rand) return;
     for (const RandVar& rv : cr.rand->vars) {
         if (!rv.obj || (S.get(obj + rv.mode).v & 1) == 0) continue;
+        if (rv.dyn) {   // a rand dynamic array or queue of handles: each element's object
+            std::vector<int> hs;
+            for (const Val& h : dynStore()[obj + rv.off].vec)
+                if (!h.x && h.v) hs.push_back((int)h.v);
+            for (int h : hs) randObjects(h, out);
+            continue;
+        }
         for (int k = 0; k < rv.count; k++) {
             Val h = S.get(obj + rv.off + k);
             if (!h.x && h.v) randObjects((int)h.v, out);
@@ -596,6 +706,135 @@ static void randObjects(int obj, std::vector<int>& out) {
 }
 
 // obj.randomize() / std::randomize(): 1 when every constraint was met.
+// Rand dynamic arrays and queues (18.4): their sizes are solved first, then
+// their elements, each in a scratch signal while the solver works.
+namespace rnd {
+struct RCont {
+    int cid = 0, w = 1, owner = 0;
+    bool sgn = false;
+    FrameP sizeFr;            // pass 1: the size, when a constraint reads it
+    int64_t n = 0;            // the size for pass 2
+    bool assoc = false;       // an associative array: its keys stay, only the values change
+    std::vector<DynKey> keys;
+    FrameP elems;             // pass 2: one signal per element
+};
+constexpr int kSizeW = 17;    // a solved size is at most 2^17 - 1
+inline const FrameLayout* scratchLayout(int w, bool sgn, int64_t n) {
+    static std::map<std::tuple<int, bool, int64_t>, std::unique_ptr<FrameLayout>> m;
+    auto& l = m[{w, sgn, n}];
+    if (!l) {
+        l = std::make_unique<FrameLayout>();
+        l->name = "randomize scratch";
+        for (int64_t k = 0; k < n; k++) l->add(w, make(0, 0, w, 0, sgn));
+    }
+    return l.get();
+}
+struct Rewrite {
+    std::vector<RCont>* conts = nullptr;
+    std::unordered_map<int, int>* contIdx = nullptr;
+    int pass = 1;
+    std::vector<std::pair<int, Val>> loops;       // loop variable -> index (or key)
+    std::vector<std::pair<int, E>> items;          // `item` of a with clause -> the element
+    bool dropped = false;                         // pass 1: reads an element
+    std::vector<int>* sizeVars = nullptr;         // pass 1: containers whose size is read
+    RCont* contOf(int sig) {
+        auto it = contIdx->find(R(sig));
+        return it == contIdx->end() ? nullptr : &(*conts)[(size_t)it->second];
+    }
+    E elem(RCont& c, int64_t k) {
+        if (k < 0 || k >= c.n) return konst(make(0, 0, c.w, 0, c.sgn));
+        return ref(c.elems->base + (int)k, c.sgn);
+    }
+    E operator()(const E& e) {
+        if (!e) return e;
+        if (e->op == Op::Ref && !e->at) {
+            for (auto& [lv, k] : loops)
+                if (e->sig == lv) return konst(k);
+            for (auto& [iv, x] : items)
+                if (e->sig == iv) return x;
+        }
+        if (e->op == Op::DynReduce && !e->kids.empty()) {   // sum() with (...) in a constraint: folded
+            RCont* c = contOf(e->sig);
+            if (c && pass == 1) { dropped = true; return e; }
+            int64_t n = c ? c->n : (int64_t)dynStore()[R(e->sig)].size();
+            int w = e->k.w;
+            bool sg = e->k.sgn;
+            static const Op ops[] = {Op::Add, Op::Mul, Op::And, Op::Or, Op::Xor};
+            if (n == 0) return konst(make(e->hi == 1 ? 1 : e->hi == 2 ? ~0ULL : 0, 0, w, 0, sg));
+            E acc;
+            for (int64_t k = 0; k < n; k++) {
+                E el;
+                if (c) el = elem(*c, k);
+                else {
+                    const DynObj& d = dynStore()[R(e->sig)];
+                    el = konst(d.kind == 2 ? std::next(d.map.begin(), (long)k)->second : d.vec[(size_t)k]);
+                }
+                items.push_back({e->lo, el});
+                E x = (*this)(e->kids[0]);
+                items.pop_back();
+                acc = acc ? bin(ops[e->hi], acc, x) : x;
+            }
+            auto r = resize(acc, w, sg, false);
+            r->sgn = sg;
+            return r;
+        }
+        if (e->op == Op::DynSize)
+            if (RCont* c = contOf(e->sig)) {
+                if (pass == 2 || c->assoc) return konst(make((uint64_t)c->n, 0, 32));   // an associative array keeps its keys
+                if (!c->sizeFr) {
+                    c->sizeFr = newFrame(scratchLayout(kSizeW, false, 1), nullptr, 0);
+                    S.set(c->sizeFr->base, make((uint64_t)c->n, 0, kSizeW));
+                    sizeVars->push_back((int)(c - conts->data()));
+                }
+                return ref(c->sizeFr->base, false);
+            }
+        if (e->op == Op::DynGet || e->op == Op::DynReduce)
+            if (RCont* c = contOf(e->sig)) {
+                if (pass == 1) { dropped = true; return e; }
+                if (e->op == Op::DynGet) {
+                    E ix = (*this)(e->kids[0]);
+                    Val iv = eval(ix, rd);
+                    if (iv.x) return konst(make(0, 0, c->w, 0, c->sgn));
+                    if (c->assoc) {   // the element at that key
+                        DynKey dk = dynStore()[c->cid].key(iv);
+                        auto f = std::lower_bound(c->keys.begin(), c->keys.end(), dk);
+                        if (f == c->keys.end() || dk < *f) return konst(dynStore()[c->cid].dflt);
+                        return elem(*c, f - c->keys.begin());
+                    }
+                    int64_t k = (int64_t)iv.v;
+                    if (iv.sgn && iv.w < 64 && (iv.v >> (iv.w - 1) & 1)) k -= (int64_t)1 << iv.w;
+                    return elem(*c, k);
+                }
+                // sum / product / and / or / xor (7.12.3): folded over the elements
+                int w = e->k.w;
+                bool sg = e->k.sgn;
+                static const Op ops[] = {Op::Add, Op::Mul, Op::And, Op::Or, Op::Xor};
+                if (c->n == 0) {
+                    uint64_t id = e->hi == 1 ? 1 : e->hi == 2 ? ~0ULL : 0;
+                    return konst(make(id, 0, w, 0, sg));
+                }
+                E acc;
+                for (int64_t k = 0; k < c->n; k++) {
+                    E x = resize(elem(*c, k), w, c->sgn, false);
+                    acc = acc ? bin(ops[e->hi], acc, x) : x;
+                }
+                acc->sgn = sg;
+                return acc;
+            }
+        std::vector<E> kids;
+        bool changed = false;
+        for (auto& kd : e->kids) { kids.push_back((*this)(kd)); changed |= kids.back() != kd; }
+        E at = (*this)(e->at);
+        changed |= at != e->at;
+        if (!changed) return e;
+        auto c = std::make_shared<Expr>(*e);
+        c->kids = std::move(kids);
+        c->at = at;
+        return c;
+    }
+};
+}   // namespace rnd
+
 static int doRandomize(int obj, const RandCall* rc) {
     using namespace rnd;
     std::vector<int> objs;
@@ -604,9 +843,6 @@ static int doRandomize(int obj, const RandCall* rc) {
         const auto& sp = classRt()[(size_t)S.sigs[o].val.v].rand;
         if (sp && sp->pre) runSync(sp->pre, sp->preLay, o);
     }
-    Ctx ctx;
-    Ctx* savedCtx = g_ctx;
-    g_ctx = &ctx;
     uint64_t* savedRng = g_rng;
     g_rng = obj ? &objRng()[obj] : nullptr;
     Frame* callerFr = g_fr;
@@ -623,30 +859,20 @@ static int doRandomize(int obj, const RandCall* rc) {
         selfFrames.push_back(std::move(f));
         return selfFrames.back().get();
     };
-    auto addVar = [&](int addr, int w, bool sgn, bool randc, int owner) {
-        if (ctx.idx.count(addr) || w > 64) return;
-        ctx.idx[addr] = (int)ctx.vars.size();
-        Var v;
-        v.addr = addr; v.w = w; v.sgn = sgn; v.randc = randc; v.owner = owner;
-        ctx.vars.push_back(v);
-    };
+    // What takes part: scalar variables, containers, constraint lists.
+    struct ScalarVar { int addr, w; bool sgn, randc; int owner; };
+    std::vector<ScalarVar> scalars;
+    std::vector<RCont> conts;
+    std::unordered_map<int, int> contIdx;
+    struct Src { const std::vector<RandItem>* items; Frame* fr; };
+    std::vector<Src> srcs;
     std::vector<std::pair<const std::vector<std::pair<std::vector<E>, std::vector<E>>>*, Frame*>> befores;
-    int prio = 0;
-    auto addItems = [&](const std::vector<RandItem>& its, Frame* fr) {
-        for (const RandItem& it : its) {
-            Item k;
-            k.it = &it; k.fr = fr;
-            k.prio = it.soft || it.disableSoft ? ++prio : 0;
-            if (it.disableSoft) k.on = false;   // not a constraint itself
-            ctx.items.push_back(k);
-        }
-    };
     if (rc && rc->argsGiven) {
         // randomize(a, b) / std::randomize(a, b): just these (18.11, 18.12).
         g_fr = callFr;
         for (const E& a : rc->args) {
             int addr = a->at ? (int)eval(a->at, rd).v + a->sig : R(a->sig);
-            addVar(addr, S.sigs[addr].w, a->sgn, false, obj);
+            scalars.push_back({addr, S.sigs[addr].w, a->sgn, false, obj});
         }
         g_fr = callerFr;
     }
@@ -655,114 +881,264 @@ static int doRandomize(int obj, const RandCall* rc) {
         if (!sp) continue;
         Frame* fr = frameFor(o);
         if (!(rc && rc->argsGiven))
-            for (const RandVar& rv : sp->vars)
-                if (!rv.obj && (S.get(o + rv.mode).v & 1))
-                    for (int k = 0; k < rv.count; k++) addVar(o + rv.off + k, rv.w, rv.sgn, rv.randc, o);
+            for (const RandVar& rv : sp->vars) {
+                if (rv.obj || !(S.get(o + rv.mode).v & 1)) continue;
+                if (rv.dyn) {
+                    RCont c;
+                    c.cid = o + rv.off; c.w = rv.w; c.sgn = rv.sgn; c.owner = o;
+                    const DynObj& dd = dynStore()[c.cid];
+                    c.n = (int64_t)dd.size();
+                    if (dd.kind == 2) {
+                        c.assoc = true;
+                        for (auto& kv : dd.map) c.keys.push_back(kv.first);
+                    }
+                    if (!contIdx.count(c.cid)) { contIdx[c.cid] = (int)conts.size(); conts.push_back(std::move(c)); }
+                    continue;
+                }
+                for (int k = 0; k < rv.count; k++) scalars.push_back({o + rv.off + k, rv.w, rv.sgn, rv.randc, o});
+            }
         for (const auto& b : sp->blocks) {
             if (b->staticMode) { Val m = S.get(b->mode); if (!m.x && !(m.v & 1)) continue; }
             else if (b->mode >= 0 && (S.get(o + b->mode).v & 1) == 0) continue;
-            addItems(b->items, fr);
+            srcs.push_back({&b->items, fr});
             befores.push_back({&b->before, fr});
         }
     }
     if (rc) {
-        addItems(rc->items, callFr);
+        srcs.push_back({&rc->items, callFr});
         befores.push_back({&rc->before, callFr});
     }
-    // Which variables each constraint reads.
-    for (size_t k = 0; k < ctx.items.size(); k++) {
-        Item& it = ctx.items[k];
-        g_fr = it.fr;
-        std::vector<int> a;
-        collectAddrs(it.it->e, a);
-        if (it.it->guard) collectAddrs(it.it->guard, a);
-        for (const RandDist& d : it.it->dist) {
-            collectAddrs(d.lo, a);
-            if (d.hi) collectAddrs(d.hi, a);
-        }
-        std::sort(a.begin(), a.end());
-        a.erase(std::unique(a.begin(), a.end()), a.end());
-        for (int s : a)
-            if (auto f = ctx.idx.find(s); f != ctx.idx.end()) {
-                it.vars.push_back(f->second);
-                ctx.vars[(size_t)f->second].items.push_back((int)k);
-            }
-        const Expr* de = it.it->e.get();
-        while (de && de->op == Op::Resize && !de->kids.empty() && de->kids[0]->op != Op::Const) de = de->kids[0].get();
-        if (it.it->isDist && !it.it->guard && de && de->op == Op::Ref && it.vars.size() == 1 && !it.it->soft) {
-            Var& v = ctx.vars[(size_t)it.vars[0]];
-            if (!v.dist) { v.dist = it.it; v.distFr = it.fr; }
-        }
-    }
-    // disable soft x: soft constraints on x of lower priority are dropped.
-    for (auto& d : ctx.items) {
-        if (!d.it->disableSoft) continue;
-        for (auto& sft : ctx.items) {
-            if (!sft.it->soft || sft.prio >= d.prio) continue;
-            for (int a : sft.vars)
-                if (std::find(d.vars.begin(), d.vars.end(), a) != d.vars.end()) { sft.on = false; break; }
-        }
-    }
-    // Order: solve-before (18.5.9), randc, then the rest.
-    std::vector<int> order, rank(ctx.vars.size(), 2);
-    for (size_t k = 0; k < ctx.vars.size(); k++)
-        if (ctx.vars[k].randc) rank[k] = 1;
-    for (auto& [bl, fr] : befores) {
-        g_fr = fr;
-        for (auto& [first, after] : *bl) {
-            for (const E& e : first) {
-                std::vector<int> a;
-                collectAddrs(e, a);
-                for (int s : a) if (auto f = ctx.idx.find(s); f != ctx.idx.end()) rank[(size_t)f->second] = 0;
-            }
-        }
-    }
-    for (int r = 0; r <= 2; r++)
-        for (size_t k = 0; k < ctx.vars.size(); k++)
-            if (rank[k] == r) order.push_back((int)k);
-    g_fr = callerFr;
 
-    bool ok = false;
-    std::vector<int> softs;
-    for (size_t k = 0; k < ctx.items.size(); k++)
-        if (ctx.items[k].it->soft && ctx.items[k].on) softs.push_back((int)k);
-    std::sort(softs.begin(), softs.end(), [&](int a, int b) { return ctx.items[(size_t)a].prio < ctx.items[(size_t)b].prio; });
-    auto attempt = [&]() {
-        for (int a = 0; a < 16; a++) {
-            ctx.budget = 20000 + 2000 * (long)ctx.vars.size();
-            auto saveRandc = randcLeft();
-            if (solveOnce(order)) return true;
-            randcLeft() = saveRandc;
-        }
-        return false;
-    };
-    ok = attempt();
-    if (!ok && !softs.empty()) {
-        // Keep soft constraints from the highest priority down, each only if
-        // it still leaves a solution (18.5.13.1).
-        for (int k : softs) ctx.items[(size_t)k].on = false;
-        ok = attempt();
-        if (ok) {
-            std::vector<i128> best;
-            for (auto& v : ctx.vars) best.push_back(v.val);
-            for (auto it = softs.rbegin(); it != softs.rend(); ++it) {
-                ctx.items[(size_t)*it].on = true;
-                if (attempt()) { best.clear(); for (auto& v : ctx.vars) best.push_back(v.val); }
-                else ctx.items[(size_t)*it].on = false;
+    // One solve. Pass 0: no containers. Pass 1: their sizes, with the
+    // constraints that read no element. Pass 2: elements, sizes fixed.
+    auto solvePass = [&](int pass, std::vector<int>& sizeVars) -> bool {
+        Ctx ctx;
+        Ctx* savedCtx = g_ctx;
+        g_ctx = &ctx;
+        std::deque<RandItem> owned;
+        auto addVar = [&](int addr, int w, bool sgn, bool randc, int owner) {
+            if (ctx.idx.count(addr) || w > 64) return;
+            ctx.idx[addr] = (int)ctx.vars.size();
+            Var v;
+            v.addr = addr; v.w = w; v.sgn = sgn; v.randc = randc; v.owner = owner;
+            ctx.vars.push_back(v);
+        };
+        for (auto& sv : scalars) addVar(sv.addr, sv.w, sv.sgn, sv.randc, sv.owner);
+        if (pass == 2)
+            for (auto& c : conts)
+                for (int64_t k = 0; k < c.n; k++) addVar(c.elems->base + (int)k, c.w, c.sgn, false, c.owner);
+        int prio = 0;
+        Rewrite rw;
+        rw.conts = &conts; rw.contIdx = &contIdx; rw.pass = pass; rw.sizeVars = &sizeVars;
+        std::function<void(const std::vector<RandItem>&, Frame*)> addItems = [&](const std::vector<RandItem>& its, Frame* fr) {
+            for (const RandItem& it : its) {
+                g_fr = fr;
+                if (it.loopCont >= 0) {   // foreach over a container: once per element
+                    int64_t n;
+                    const DynObj& d = dynStore()[R(it.loopCont)];
+                    if (RCont* c = rw.contOf(it.loopCont)) {
+                        if (pass == 1) continue;   // its elements are not known yet
+                        n = c->n;
+                    } else n = (int64_t)d.size();
+                    // An associative array (7.8): the loop variable is each key, in order.
+                    std::vector<Val> keys;
+                    if (d.kind == 2) for (auto& kv : d.map) keys.push_back(d.keyVal(kv.first));
+                    for (int64_t k = 0; k < n; k++) {
+                        rw.loops.push_back({it.loopVar, d.kind == 2 ? keys[(size_t)k] : make((uint64_t)k, 0, 32, 0, true)});
+                        addItems(it.body, fr);
+                        rw.loops.pop_back();
+                    }
+                    continue;
+                }
+                const RandItem* use = &it;
+                {
+                    rw.dropped = false;
+                    RandItem x = it;
+                    x.e = rw(it.e);
+                    x.guard = rw(it.guard);
+                    for (auto& d : x.dist) { d.lo = rw(d.lo); d.hi = rw(d.hi); d.weight = rw(d.weight); }
+                    x.distDefault = rw(it.distDefault);
+                    for (auto& fp : x.fns) {   // function arguments: loop indices, rand array elements
+                        auto q = std::make_shared<Prog>(*fp);
+                        for (Instr& ins : q->code) {
+                            ins.e = rw(ins.e);
+                            for (E& y : ins.args) y = rw(y);
+                            for (auto& in : ins.init) in.second = rw(in.second);
+                            ins.self = rw(ins.self);
+                        }
+                        fp = std::move(q);
+                    }
+                    if (rw.dropped) continue;
+                    owned.push_back(std::move(x));
+                    use = &owned.back();
+                }
+                Item k;
+                k.it = use; k.fr = fr;
+                k.prio = it.soft || it.disableSoft ? ++prio : 0;
+                if (it.disableSoft) k.on = false;   // not a constraint itself
+                ctx.items.push_back(k);
             }
-            for (size_t k = 0; k < ctx.vars.size(); k++) ctx.vars[k].val = best[k];
+        };
+        for (auto& sr : srcs) addItems(*sr.items, sr.fr);
+        if (pass == 1) {
+            if (sizeVars.empty()) { g_ctx = savedCtx; g_fr = callerFr; return true; }   // no size is constrained
+            for (int ci : sizeVars) addVar(conts[(size_t)ci].sizeFr->base, kSizeW, false, false, conts[(size_t)ci].owner);
         }
-    }
-    g_fr = callerFr;
-    if (ok) {
-        for (auto& v : ctx.vars) {
-            uint64_t bits = (uint64_t)v.val;
-            S.set(v.addr, make(v.w >= 64 ? bits : bits & ((1ULL << v.w) - 1), 0, v.w, 0, false));
+        // Which variables each constraint reads.
+        for (size_t k = 0; k < ctx.items.size(); k++) {
+            Item& it = ctx.items[k];
+            g_fr = it.fr;
+            std::vector<int> a;
+            collectAddrs(it.it->e, a);
+            if (it.it->guard) collectAddrs(it.it->guard, a);
+            for (const RandDist& d : it.it->dist) {
+                collectAddrs(d.lo, a);
+                if (d.hi) collectAddrs(d.hi, a);
+            }
+            // What its function calls read: their arguments (18.5.12).
+            std::vector<int> fa;
+            for (const auto& p : it.it->fns)
+                for (const Instr& ins : p->code) {
+                    if (ins.e) fnAddrs(ins.e, fa);
+                    for (const E& x : ins.args) fnAddrs(x, fa);
+                    for (const auto& in : ins.init) fnAddrs(in.second, fa);
+                    fnAddrs(ins.self, fa);
+                }
+            for (int s : fa)
+                if (auto f = ctx.idx.find(s); f != ctx.idx.end()) it.fnVars.push_back(f->second);
+            std::sort(it.fnVars.begin(), it.fnVars.end());
+            it.fnVars.erase(std::unique(it.fnVars.begin(), it.fnVars.end()), it.fnVars.end());
+            a.insert(a.end(), fa.begin(), fa.end());
+            std::sort(a.begin(), a.end());
+            a.erase(std::unique(a.begin(), a.end()), a.end());
+            for (int s : a)
+                if (auto f = ctx.idx.find(s); f != ctx.idx.end()) {
+                    it.vars.push_back(f->second);
+                    ctx.vars[(size_t)f->second].items.push_back((int)k);
+                }
+            const Expr* de = it.it->e.get();
+            while (de && de->op == Op::Resize && !de->kids.empty() && de->kids[0]->op != Op::Const) de = de->kids[0].get();
+            if (it.it->isDist && !it.it->guard && de && de->op == Op::Ref && it.vars.size() == 1 && !it.it->soft) {
+                Var& v = ctx.vars[(size_t)it.vars[0]];
+                if (!v.dist) { v.dist = it.it; v.distFr = it.fr; }
+            }
         }
+        // disable soft x: soft constraints on x of lower priority are dropped.
+        for (auto& d : ctx.items) {
+            if (!d.it->disableSoft) continue;
+            for (auto& sft : ctx.items) {
+                if (!sft.it->soft || sft.prio >= d.prio) continue;
+                for (int a : sft.vars)
+                    if (std::find(d.vars.begin(), d.vars.end(), a) != d.vars.end()) { sft.on = false; break; }
+            }
+        }
+        // Order: solve-before (18.5.9), randc, then the rest.
+        std::vector<int> order, rank(ctx.vars.size(), 2);
+        for (size_t k = 0; k < ctx.vars.size(); k++)
+            if (ctx.vars[k].randc) rank[k] = 1;
+        for (auto& [bl, fr] : befores) {
+            g_fr = fr;
+            for (auto& [first, after] : *bl) {
+                for (const E& e : first) {
+                    std::vector<int> a;
+                    collectAddrs(e, a);
+                    for (int s : a) if (auto f = ctx.idx.find(s); f != ctx.idx.end()) rank[(size_t)f->second] = 0;
+                }
+            }
+        }
+        // Function arguments before the other variables of their constraint (18.5.12).
+        for (auto& it : ctx.items)
+            for (int v : it.fnVars) rank[(size_t)v] = std::min(rank[(size_t)v], 0);
+        if (pass == 1)   // sizes before everything else (18.4)
+            for (int ci : sizeVars) rank[(size_t)ctx.idx.at(conts[(size_t)ci].sizeFr->base)] = -1;
+        for (int r = -1; r <= 2; r++)
+            for (size_t k = 0; k < ctx.vars.size(); k++)
+                if (rank[k] == r) order.push_back((int)k);
+        g_fr = callerFr;
+
+        bool ok = false;
+        std::vector<int> softs;
+        for (size_t k = 0; k < ctx.items.size(); k++)
+            if (ctx.items[k].it->soft && ctx.items[k].on) softs.push_back((int)k);
+        std::sort(softs.begin(), softs.end(), [&](int a, int b) { return ctx.items[(size_t)a].prio < ctx.items[(size_t)b].prio; });
+        auto attempt = [&]() {
+            for (int a = 0; a < 16; a++) {
+                ctx.budget = 20000 + 2000 * (long)ctx.vars.size();
+                auto saveRandc = randcLeft();
+                if (solveOnce(order)) return true;
+                randcLeft() = saveRandc;
+            }
+            return false;
+        };
+        ok = attempt();
+        if (!ok && !softs.empty()) {
+            // Keep soft constraints from the highest priority down, each only if
+            // it still leaves a solution (18.5.13.1).
+            for (int k : softs) ctx.items[(size_t)k].on = false;
+            ok = attempt();
+            if (ok) {
+                std::vector<i128> best;
+                for (auto& v : ctx.vars) best.push_back(v.val);
+                for (auto it = softs.rbegin(); it != softs.rend(); ++it) {
+                    ctx.items[(size_t)*it].on = true;
+                    if (attempt()) { best.clear(); for (auto& v : ctx.vars) best.push_back(v.val); }
+                    else ctx.items[(size_t)*it].on = false;
+                }
+                for (size_t k = 0; k < ctx.vars.size(); k++) ctx.vars[k].val = best[k];
+            }
+        }
+        g_fr = callerFr;
+        if (ok) {
+            for (auto& v : ctx.vars) {
+                if (pass == 1 && !ctx.idx.count(v.addr)) continue;
+                uint64_t bits = (uint64_t)v.val;
+                Val nv = make(v.w >= 64 ? bits : bits & ((1ULL << v.w) - 1), 0, v.w, 0, false);
+                if (pass == 1) {   // only the sizes are kept from this pass
+                    bool isSize = false;
+                    for (int ci : sizeVars) if (conts[(size_t)ci].sizeFr->base == v.addr) isSize = true;
+                    if (!isSize) continue;
+                }
+                S.set(v.addr, nv);
+            }
+        }
+        g_ctx = savedCtx;
+        return ok;
+    };
+
+    bool ok;
+    if (conts.empty()) {
+        std::vector<int> none;
+        ok = solvePass(0, none);
     } else {
-        cerr << "warning: randomize() failed: the constraints cannot all be met (time " << S.now << ")\n";
+        std::vector<int> sizeVars;
+        ok = solvePass(1, sizeVars);
+        if (ok) {
+            for (int ci : sizeVars) conts[(size_t)ci].n = (int64_t)S.get(conts[(size_t)ci].sizeFr->base).v;
+            for (auto& c : conts) {
+                c.elems = newFrame(scratchLayout(c.w, c.sgn, c.n), nullptr, 0);
+                const DynObj& dd = dynStore()[c.cid];
+                if (c.assoc) {
+                    for (int64_t k = 0; k < c.n; k++) S.set(c.elems->base + (int)k, dd.map.at(c.keys[(size_t)k]));
+                } else
+                    for (int64_t k = 0; k < c.n && k < (int64_t)dd.vec.size(); k++) S.set(c.elems->base + (int)k, dd.vec[(size_t)k]);
+            }
+            ok = solvePass(2, sizeVars);
+        }
+        if (ok)
+            for (auto& c : conts) {
+                auto& d = dynStore()[c.cid];
+                if (!c.assoc) d.vec.assign((size_t)c.n, d.dflt);
+                for (int64_t k = 0; k < c.n; k++) {
+                    Val v = S.get(c.elems->base + (int)k);
+                    v.sgn = d.dflt.sgn;
+                    if (c.assoc) d.map[c.keys[(size_t)k]] = v;
+                    else d.vec[(size_t)k] = v;
+                }
+                dynBump(c.cid);
+            }
     }
-    g_ctx = savedCtx;
+    if (!ok) cerr << "warning: randomize() failed: the constraints cannot all be met (time " << S.now << ")\n";
+    g_fr = callerFr;
     g_rng = savedRng;
     if (ok)
         for (int o : objs) {

@@ -252,6 +252,15 @@ struct RandItem {
     bool isDist = false;
     E guard;                     // dist under an implication: holds when guard is false
     std::vector<RandDist> dist;
+    E distDefault;               // default :/ w (18.5.3): w spread over the values no item names
+    // foreach over a dynamic array or queue (18.5.8.1): body once per
+    // element at solve time, with signal loopVar read as the index.
+    int loopCont = -1, loopVar = -1;
+    std::vector<RandItem> body;
+    // Function calls in the constraint (18.5.12): each program computes one
+    // call's result into the temporary that e reads. They run at solve time
+    // once the rand variables they read have values.
+    std::vector<std::shared_ptr<Prog>> fns;
 };
 // A constraint block (18.5): its constraint_mode slot in the object.
 struct RandBlock {
@@ -268,6 +277,7 @@ struct RandVar {
     std::string name;
     int off = 0, count = 1, w = 1, mode = -1;
     bool sgn = false, randc = false, obj = false;
+    bool dyn = false;   // a dynamic array or queue: off is its container slot, w / sgn its elements'
 };
 struct RandSpec {
     std::vector<RandVar> vars;
@@ -335,14 +345,14 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     collectRefsInto(e->at, out, seen);
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) add(e->sig);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef) add(e->sig);
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 // Does e read an automatic variable (a relative id)?
 inline bool hasRel(const E& e) {
     if (!e) return false;
     if (isRel(e->sig) && e->op != Op::Const) return true;
-    if (e->at || e->op == Op::This || e->op == Op::Addr || e->op == Op::AddrOf || e->op == Op::VifSig) return true;   // objects (8), ref (13.5.2), virtual interfaces (25.9)
+    if (e->at || e->op == Op::This || e->op == Op::Addr || e->op == Op::AddrOf || e->op == Op::VifSig || e->op == Op::DynElemRef) return true;   // objects (8), ref (13.5.2), virtual interfaces (25.9)
     if (e->op == Op::ArrRead && isRel(e->arr->base)) return true;
     for (auto& k : e->kids) if (hasRel(k)) return true;
     return false;
@@ -425,7 +435,7 @@ inline void collectReadBits(const E& e, std::unordered_map<int, BitSet>& m) {
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) m[e->arr->base + i].all = true;
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
-        e->op == Op::DynBits || e->op == Op::DynHas)
+        e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef)
         m[e->sig].all = true;
     collectReadBits(e->at, m);
     for (auto& k : e->kids) collectReadBits(k, m);
