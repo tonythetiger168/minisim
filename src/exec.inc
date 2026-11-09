@@ -391,6 +391,7 @@ struct ProcCtl {
     // program's initial procedures.
     int program = -1;
     bool progRoot = false;
+    bool reactive = false;   // a program or checker thread: runs in the reactive region set
     bool kidsDone() const {
         for (auto& k : kids) if (!k->ended) return false;
         return true;
@@ -466,7 +467,8 @@ inline Task process(const Prog* p) { return startProc(p, make_shared<ProcCtl>(),
 inline Task programProc(const Prog* prog, int program, bool initial) {
     auto c = make_shared<ProcCtl>();
     c->program = program;
-    if (initial) {
+    c->reactive = true;
+    if (initial && program >= 0) {
         auto& runs = programRuns();
         if ((size_t)program >= runs.size()) runs.resize(program + 1);
         ProgramRun& r = runs[program];
@@ -967,7 +969,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
     for (auto& [slot, v] : ctl->init) slot->k = v;
     // A program thread runs in the reactive region set (24.3.1): it starts
     // there, and goes back there after every wait.
-#define TO_REACTIVE if (__builtin_expect(ctl->program >= 0, 0) && S.region != R_REACTIVE) co_await ToReactive{}
+#define TO_REACTIVE if (__builtin_expect(ctl->reactive, 0) && S.region != R_REACTIVE) co_await ToReactive{}
     TO_REACTIVE;
     while (p) {
         g_fr = fr.get();
@@ -1163,6 +1165,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     c->parent = ctl;
                     c->join = js;
                     c->program = ctl->program;
+                    c->reactive = ctl->reactive;
                     ctl->kids.push_back(c);
                     FrameP bf = bn < i.blays.size() && i.blays[bn] ? newFrame(i.blays[bn], ff, ff ? ff->self : 0) : ff;
                     Task t = startProc(b, c, std::move(bf));

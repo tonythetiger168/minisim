@@ -235,11 +235,14 @@ int shadowOf(int s) {
 static std::unordered_set<int>& svaLocalSigs() { static std::unordered_set<int> s; return s; }
 // The signals of sequence end points (16.13.6): read as they are, too.
 static std::unordered_set<int>& svaLiveSigs() { static std::unordered_set<int> s; return s; }
+// Signals from this id on are read as they are (temporaries; see sampleProg).
+static int& sampleBelow() { static int n = INT_MAX; return n; }
 E sampledE(const E& e) {
     if (!e) return e;
     if (e->op == Op::Const) return e;
     if (e->op == Op::Ref) {
-        if (isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig) || svaLiveSigs().count(e->sig))
+        if (isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig) || svaLiveSigs().count(e->sig) ||
+            e->sig >= sampleBelow())
             return e;   // automatic, local, or an end point: read as it is
         auto c = std::make_shared<Expr>(*e);
         c->sig = shadowOf(e->sig);
@@ -268,6 +271,21 @@ E sampledE(const E& e) {
     return c;
 }
 
+// Every expression of prog but its event controls reads sampled values
+// (a checker's always_ff, 17.5); signals from `below` on are read as they are.
+void sampleProg(int below) {
+    int saved = sampleBelow();
+    sampleBelow() = below;
+    for (auto& i : prog.code) {
+        if (i.k == IK::WaitEdge) continue;
+        i.e = sampledE(i.e);
+        for (auto& a : i.args) a = sampledE(a);
+        for (auto& a : i.aidx) a = sampledE(a);
+        i.bidx = sampledE(i.bidx);
+    }
+    sampleBelow() = saved;
+}
+
 // The clock of a sampled value function: its clocking_event argument, else
 // the clock of the context (16.9.3), else the default clocking (14.12).
 std::vector<std::pair<int, Edge>> clockArg(const slang::ast::CallExpression& call, size_t idx) {
@@ -280,12 +298,10 @@ std::vector<std::pair<int, Edge>> clockArg(const slang::ast::CallExpression& cal
         return ev;
     }
     if (!sampleEv.empty()) return sampleEv;
-    if (compilation() && scope)
-        if (const Symbol* dc = compilation()->getDefaultClocking(*scope))
-            if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) {
-                collectEvents(cb->getEvent(), ev);
-                return ev;
-            }
+    if (const auto* cb = defaultClockingBlock()) {
+        collectEvents(cb->getEvent(), ev);
+        return ev;
+    }
     unsupported("sampled value function with no clock to use (16.9.3)");
 }
 // $past(e, n, gate) on clock ev: the signal holding the value n ticks back.
@@ -484,7 +500,9 @@ void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge
     using namespace slang::ast;
     if (t.kind == TimingControlKind::SignalEvent) {
         const auto& s = t.as<SignalEventControl>();
-        if (const auto* cb = isGlobalClock(s.expr) ? globalClocking() : clockingRef(s.expr)) {
+        const auto* cb = isGlobalClock(s.expr) ? globalClocking() : clockingRef(s.expr);
+        if (!cb) cb = inferredClock(s.expr);
+        if (cb) {
             clockOf(cb->getEvent(), ev, iff);   // @(cb) or @($global_clock) as a clock (14.10, 14.14, 16.16)
             return;
         }
@@ -764,9 +782,8 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     } else if (saved && !saved->clk.empty()) {
         b.clk = saved->clk;
         b.clkIff = saved->clkIff;
-    } else if (compilation() && scope)
-        if (const Symbol* dc = compilation()->getDefaultClocking(*scope))
-            if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) clockOf(cb->getEvent(), b.clk, b.clkIff);
+    } else if (const auto* cb = defaultClockingBlock())
+        clockOf(cb->getEvent(), b.clk, b.clkIff);
     if (b.clk.empty()) unsupported("an end point of a sequence with no clock (16.13.6)");
     svb = &b;
     sva::store().localAtoms = &b.atomLocal;
@@ -882,12 +899,11 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         if (const auto* tc = leadingClock(*a)) clockOf(*tc, b.clk, b.clkIff);
     if (b.clk.empty()) {   // inferred from the procedure, else the default clocking (16.16)
         if (!sampleEv.empty()) b.clk = sampleEv;
-        else if (compilation() && scope)
-            if (const Symbol* dc = compilation()->getDefaultClocking(*scope))
-                if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) clockOf(cb->getEvent(), b.clk, b.clkIff);
+        else if (const auto* cb = defaultClockingBlock()) clockOf(cb->getEvent(), b.clk, b.clkIff);
     }
     if (b.clk.empty()) unsupported("concurrent assertion with no clock (16.16)");
-    if (!dis && compilation() && scope) dis = compilation()->getDefaultDisable(*scope);   // 16.15
+    if (dis && isSysCall(*dis, "$inferred_disable")) dis = defaultDisable();   // 16.14.7
+    if (!dis) dis = defaultDisable();   // 16.15
     sampleEv = b.clk;   // $past and friends in the assertion use its clock
     ConcAssert c;
     c.id = newAssert(AT_CONCURRENT, dir, s);

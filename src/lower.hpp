@@ -284,7 +284,9 @@ using MkSig = std::function<int(const std::string&, int, bool)>;
 // program: the index of the program instance (24) the process belongs to,
 // or -1. A program's initial procedures and continuous assigns run in the
 // reactive region set (24.3.1).
-struct LoweredProc { Prog prog; bool loops; std::string kind; int program = -1; };
+// reactive: a process of a checker (17.7.3), which also runs in the
+// reactive region set but takes no part in ending the run.
+struct LoweredProc { Prog prog; bool loops; std::string kind; int program = -1; bool reactive = false; };
 
 // One module-level task or function. Arguments and the function result are
 // signals (the formal and slang's returnValVar), shared by every call.
@@ -384,6 +386,10 @@ struct LowerResult {
     std::vector<std::unique_ptr<FrameLayout>> layouts;   // frame shapes of automatic subroutines and fork branches
     std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
     std::vector<std::pair<int, uint8_t>> netKinds;                   // wand, wor, tri0, ... (6.6): signal, NetResolve
+    // Free checker variables (17.7) with no initializer: each starts random;
+    // an active one (never assigned, not const) takes a new random value
+    // in every time step (17.7.2). Signal, every step.
+    std::vector<std::pair<int, bool>> freeVars;
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
     std::string timescale() const {
@@ -3256,6 +3262,11 @@ struct Lowerer {
                 collectEvents(globalClocking()->getEvent(), ev);
                 return;
             }
+            if (const auto* cb = inferredClock(s.expr)) {   // @($inferred_clock) (16.14.7)
+                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $inferred_clock");
+                collectEvents(cb->getEvent(), ev);
+                return;
+            }
             if (const auto* cb = clockingRef(s.expr)) {   // @(cb): the clocking block event (14.10)
                 if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a clocking block event");
                 ev.push_back({clockings()[clockingIdx(*cb)].evSig, ANY});
@@ -5889,6 +5900,15 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         if (n.getType().isUnpackedArray()) Lowerer::unsupported("an array of wand/wor/tri0/tri1/trireg/supply nets");
         netKinds().push_back({sigmap.at(&n), k});
     }
+    // A checker instance (17.3): its variables and output formals are named
+    // like an instance's, "chk.v". Its input formals are not signals: slang
+    // puts each actual in place of the formal.
+    void handle(const slang::ast::CheckerInstanceSymbol& ci) {
+        std::string saved = prefix;
+        prefix += std::string(ci.name) + ".";
+        visitDefault(ci);
+        prefix = std::move(saved);
+    }
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
         std::string saved = prefix;
@@ -6063,7 +6083,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             lw.prog.emit(waitInstr(rs));
             Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
         }
-        out.procs.push_back({std::move(lw.prog), loops, "assign", program});
+        out.procs.push_back({std::move(lw.prog), loops, "assign", program, checkerDepth > 0});
     }
 
     // Module-level `logic x = v;` (IEEE 1800-2023 10.5): a static variable's
@@ -6094,7 +6114,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (!sc) return;
         auto pk = sc->asSymbol().kind;
         if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock &&
-            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit) return;   // package variables too (26.2)
+            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit &&
+            pk != slang::ast::SymbolKind::CheckerInstanceBody) return;   // package (26.2) and checker (17.7) variables too
+        if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
         initStatic(v);
     }
     // A class's static property (8.9) starts like a module variable.
@@ -6529,6 +6551,83 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
     }
 
+    // A checker instance (17.3): its body is lowered like an instance's,
+    // with its processes in the reactive region set (17.7.3). Each output
+    // formal is continuously assigned to its actual in the reactive region.
+    int checkerDepth = 0;
+    std::unordered_set<const slang::ast::Symbol*> freeAssigned;
+    bool checkerAssumes = false;
+    // A free checker variable (17.7): random from the start, unless it has
+    // an initializer; an active one gets a new random value every time step.
+    void freeVar(const slang::ast::VariableSymbol& v) {
+        using namespace slang::ast;
+        int w = storeW(v.getType());
+        if (w > 64 || !v.getType().isIntegral()) Lowerer::unsupported("a free checker variable wider than 64 bits or not integral");
+        bool isConst = v.flags.has(VariableFlags::Const);
+        bool active = !isConst && !freeAssigned.count(&v);
+        if (active && checkerAssumes)
+            Lowerer::unsupported("free checker variables constrained by assume statements (17.7.2)");
+        out.freeVars.push_back({sigmap.at(&v), active});
+    }
+    void handle(const slang::ast::CheckerInstanceSymbol& ci) {
+        using namespace slang::ast;
+        if (ci.body.isProcedural) Lowerer::unsupported("a checker instance in procedural code (17.3)");
+        // Which variables the checker assigns, and whether it has assume
+        // statements (17.7.2): an active free variable is one it never assigns.
+        struct Scan : ASTVisitor<Scan, VisitFlags::Statements | VisitFlags::Expressions> {
+            std::unordered_set<const Symbol*> assigned;
+            bool assumes = false;
+            void handle(const AssignmentExpression& a) {
+                const Expression* l = &a.left();
+                for (;;) {
+                    if (l->kind == ExpressionKind::ElementSelect) l = &l->as<ElementSelectExpression>().value();
+                    else if (l->kind == ExpressionKind::RangeSelect) l = &l->as<RangeSelectExpression>().value();
+                    else if (l->kind == ExpressionKind::MemberAccess) l = &l->as<MemberAccessExpression>().value();
+                    else break;
+                }
+                if (const Symbol* sym = l->getSymbolReference()) assigned.insert(sym);
+                visitDefault(a);
+            }
+            void handle(const ConcurrentAssertionStatement& c) {
+                if (c.assertionKind == AssertionKind::Assume) assumes = true;
+                visitDefault(c);
+            }
+        } scan;
+        ci.body.visit(scan);
+        std::swap(freeAssigned, scan.assigned);
+        bool savedAssumes = checkerAssumes;
+        checkerAssumes = scan.assumes;
+        checkerDepth++;
+        visitDefault(ci);
+        checkerDepth--;
+        checkerAssumes = savedAssumes;
+        for (const auto& c : ci.getPortConnections()) {
+            if (c.formal.kind != SymbolKind::FormalArgument) continue;
+            const auto& f = c.formal.as<FormalArgumentSymbol>();
+            if (f.direction != ArgumentDirection::Out) continue;
+            int fs = sigmap.at(&f);
+            int w = storeW(f.getType());
+            if (const Expression* ie = c.getOutputInitialExpr()) {   // output int ctr = 0 (17.2)
+                if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+                Instr i; i.k = IK::Assign; i.sig = fs;
+                i.e = resize(init->expr(*ie), w, f.getType().isSigned(), ie->type->isSigned());
+                init->prog.emit(i);
+            }
+            const auto* ap = std::get_if<const Expression*>(&c.actual);
+            if (!ap || !*ap) continue;
+            const Expression* a = *ap;
+            if (a->kind == ExpressionKind::Assignment) a = &a->as<AssignmentExpression>().left();
+            Lowerer lw(sigmap);
+            prep(lw);
+            lw.setScope(ci.getParentScope());
+            Instr i; i.k = IK::Assign;
+            lw.lhs(*a, i);
+            int tw = storeW(*a->type);
+            i.e = resize(ref(fs, f.getType().isSigned()), tw, f.getType().isSigned(), f.getType().isSigned());
+            finishAssign(lw, i);
+            out.procs.back().reactive = true;
+        }
+    }
     int program = -1;   // the program instance being visited (24.3), or -1
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
@@ -6601,8 +6700,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (const auto* t = leadingEvent(p.getBody())) {
                 try { E iff; lw.clockOf(*t, lw.sampleEv, iff); } catch (const std::runtime_error&) { lw.sampleEv.clear(); }
             }
+        int below = checkerDepth > 0 && p.procedureKind == ProceduralBlockKind::AlwaysFF ? lw.fresh(1) : -1;
         lw.stmt(p.getBody());
         lw.finishImplicit();
+        // 17.5: in a checker's always_ff, every expression but the event
+        // control reads sampled values. Signals made while lowering the body
+        // (temporaries) are read as they are.
+        if (below >= 0) lw.sampleProg(below);
         if (p.procedureKind == ProceduralBlockKind::Initial)
             if (const auto* nb = Lowerer::namedSeq(p.getBody())) lw.prog.roots.push_back(Lowerer::rootId(nb));
         // A final block (9.2.3) runs once, after the last time slot. slang
@@ -6622,7 +6726,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
         out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind)),
-                             p.procedureKind == ProceduralBlockKind::Initial ? program : -1});
+                             p.procedureKind == ProceduralBlockKind::Initial ? program : -1, checkerDepth > 0});
     }
 };
 
