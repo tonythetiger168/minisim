@@ -1,6 +1,5 @@
 // IEEE 1800-2023 28.7: nmos, pmos, rnmos switches pass or block by gate
 // (28.7).
-//! xfail: MOS switches are errors
 module top;
   logic d = 1, g = 1;
   wire o1, o2;

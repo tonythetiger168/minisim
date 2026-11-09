@@ -26,8 +26,7 @@
 // Automatic tasks, class methods, and automatic functions that recurse or
 // fork run each call in a frame (expr.hpp: Frame); their variables are
 // relative ids. Everything else is a static signal.
-// Not yet:  nmos/pmos/cmos/tran, bufif/notif, trireg, a[i +: w],
-//           ref arguments, DPI, class methods,
+// Not yet:  ref arguments, DPI, class methods,
 //           hierarchical calls, instance arrays, interfaces, hierarchical
 //           references into a child. Arguments are one static copy per subroutine.
 //
@@ -55,6 +54,7 @@
 #include "sva_engine.hpp"
 #include "clocking.hpp"
 #include "cover.hpp"
+#include "tchk.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
@@ -205,14 +205,15 @@ inline BlockIds& blockIds() { static BlockIds b; return b; }
 // all start at bit 0. -1: a member that cannot be laid out this way.
 inline int uWidth(const slang::ast::Type& t0);
 // A string is a 64-bit pool id; a shortreal is kept as a double, rounded to
-// single precision whenever a shortreal value is made (6.12).
+// single precision whenever a shortreal value is made (6.12); a chandle is a
+// 64-bit pointer (6.14).
 inline bool isHandleType(const slang::ast::Type& t);
 inline int storeW(const slang::ast::Type& t0) {
     const auto& t = t0.getCanonicalType();
     if (t.kind == slang::ast::SymbolKind::CovergroupType) return 32;   // a covergroup handle (19.3)
     if (t.isUntypedType()) return 64;   // a typeless mailbox's message (15.4.9): the value as it is
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) return uWidth(t);
-    return t.isString() || t.isFloating() || isHandleType(t) ? 64 : (int)t.getBitWidth();
+    return t.isString() || t.isFloating() || t.isCHandle() || isHandleType(t) ? 64 : (int)t.getBitWidth();
 }
 // Tag bits of a tagged union (7.3.2): enough to number its members. The tag
 // is at the top; a member's value is right-justified below it.
@@ -264,8 +265,19 @@ inline int uWidth(const slang::ast::Type& t0) {
         }
         return w;
     }
+    if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {   // a struct member that is an array: its elements, left one highest
+        const auto& a = t.as<FixedSizeUnpackedArrayType>();
+        int ew = uWidth(a.elementType);
+        if (ew <= 0 || (int64_t)ew * (int64_t)a.range.width() > (1 << 24)) return -1;
+        return ew * (int)a.range.width();
+    }
     if (t.isUnpackedArray() || t.isClass() || t.isEvent() || t.isCHandle() || t.isVirtualInterface()) return -1;
     return storeW(t);
+}
+// The bits a value of type t takes inside an unpacked struct or array (uWidth),
+// or its storage width (storeW).
+inline int bitsOf(const slang::ast::Type& t) {
+    return t.getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType ? uWidth(t) : storeW(t);
 }
 // Offset and width of field f inside unpacked struct or union t.
 inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::FieldSymbol& f) {
@@ -322,7 +334,12 @@ inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return 
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
 
-struct LoweredProc { Prog prog; bool loops; std::string kind; };
+// program: the index of the program instance (24) the process belongs to,
+// or -1. A program's initial procedures and continuous assigns run in the
+// reactive region set (24.3.1).
+// reactive: a process of a checker (17.7.3), which also runs in the
+// reactive region set but takes no part in ending the run.
+struct LoweredProc { Prog prog; bool loops; std::string kind; int program = -1; bool reactive = false; };
 
 // One module-level task or function. Arguments and the function result are
 // signals (the formal and slang's returnValVar), shared by every call.
@@ -350,6 +367,49 @@ struct Subr {
     std::vector<Subr*> calls;
 };
 
+// DPI imports by symbol (35); filled before any process is lowered.
+inline std::unordered_map<const slang::ast::SubroutineSymbol*, DpiFunc*>& dpiMap() {
+    static std::unordered_map<const slang::ast::SubroutineSymbol*, DpiFunc*> m;
+    return m;
+}
+// The hierarchical name of the instance, generate block or package a
+// subroutine is declared in: its DPI scope (35.5.3).
+inline std::string dpiScopeName(const slang::ast::Symbol& sub) {
+    using namespace slang::ast;
+    const Scope* sc = sub.getParentScope();
+    if (!sc) return "";
+    const Symbol& s = sc->asSymbol();
+    if (s.kind == SymbolKind::InstanceBody) {
+        const auto* inst = s.as<InstanceBodySymbol>().parentInstance;
+        return inst ? inst->getHierarchicalPath() : std::string(s.name);
+    }
+    return s.getHierarchicalPath();
+}
+// How a value of type t0 goes to C (35.5.6, H.7). w and sgn describe the
+// SV value. An enum is passed as its base type.
+inline DpiType dpiType(const slang::ast::Type& t0, int& w, bool& sgn) {
+    using namespace slang::ast;
+    const Type& t = t0.getCanonicalType();
+    if (t.kind == SymbolKind::EnumType) return dpiType(t.as<EnumType>().baseType, w, sgn);
+    sgn = t.isSigned();
+    if (t.isVoid()) { w = 0; return DT_VOID; }
+    if (t.isString()) { w = 64; return DT_STRING; }
+    if (t.isCHandle()) { w = 64; return DT_CHANDLE; }
+    if (t.isFloating()) { w = (int)t.getBitWidth(); return w == 32 ? DT_SHORTREAL : DT_REAL; }
+    if (!t.isIntegral()) throw std::runtime_error("lower: unsupported DPI argument type " + t0.toString());
+    w = (int)t.getBitWidth();
+    if (t.kind == SymbolKind::PredefinedIntegerType) {
+        switch (t.as<PredefinedIntegerType>().integerKind) {
+            case PredefinedIntegerType::Byte: return DT_BYTE;
+            case PredefinedIntegerType::ShortInt: return DT_SHORT;
+            case PredefinedIntegerType::Int: return DT_INT;
+            case PredefinedIntegerType::LongInt: return DT_LONG;
+            default: return DT_LOGICVEC;   // integer, time: 4-state packed
+        }
+    }
+    if (t.kind == SymbolKind::ScalarType) return t.isFourState() ? DT_LOGIC : DT_BIT;
+    return t.isFourState() ? DT_LOGICVEC : DT_BITVEC;
+}
 // ---------- classes (8) ----------
 // An object is a block of signals laid out like a frame: slot 0 holds its
 // class id, then the base class's properties, then its own. A non-static
@@ -421,12 +481,23 @@ inline ClassInfo* classInfo(const slang::ast::Type& t) {
 }
 
 struct LowerResult {
+    std::vector<std::unique_ptr<DpiFunc>> dpi;   // DPI imports and exports (35)
+    std::vector<std::string> scopes;             // every instance and package, for svGetScopeFromName
+    std::unordered_map<const slang::ast::Symbol*, int> sigOf;   // variable / net -> signal (VPI, 37)
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
+    int programs = 0;                 // program instances (24.3)
     LayoutList layouts;   // frame shapes of automatic subroutines and fork branches
     std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
     std::vector<std::pair<int, uint8_t>> netKinds;                   // wand, wor, tri0, ... (6.6): signal, NetResolve
+    // Free checker variables (17.7) with no initializer: each starts random;
+    // an active one (never assigned, not const) takes a new random value
+    // in every time step (17.7.2). Signal, every step.
+    std::vector<std::pair<int, bool>> freeVars;
+    std::vector<std::unique_ptr<UdpTable>> udps;   // tables of the user-defined primitives (29)
+    struct TranDecl { int a, b; bool resist; };
+    std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
     std::string timescale() const {
@@ -1411,7 +1482,7 @@ struct Lowerer {
         if (vifTarget) { sym = vifTarget; vifTarget = nullptr; viaVif = true; }
         else if (call.thisClass() && call.thisClass()->type->isVirtualInterface()) return vifCall(call, *sym, wantValue);
         if (!sym || !subs) unsupported("subroutine call");
-        if (sym->flags.has(MethodFlags::DPIImport)) unsupported("DPI import");
+        if (sym->flags.has(MethodFlags::DPIImport)) return emitDpiCall(call, *sym, wantValue);
         if (sym->flags.has(MethodFlags::Randomize)) return randomizeCall(call);
         if (!sym->getSyntax() && isClassMethod(*sym)) {   // built-in methods of every class (18.8, 18.9, 18.13.3)
             if (sym->name == "rand_mode" || sym->name == "constraint_mode") {
@@ -1536,6 +1607,196 @@ struct Lowerer {
         i.e = ref(sub->retSig, sub->retSgn);
         prog.emit(i);
         return ref(tmp, sub->retSgn);
+    }
+
+    // A DPI import call (35): inputs are copied into the formals' signals,
+    // IK::Dpi calls C, and outputs are copied back, as for an SV subroutine.
+    // An unpacked array argument is passed in place: the call records the
+    // actual array (a fixed array or a container) instead of a signal.
+    E emitDpiCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym, bool wantValue) {
+        using namespace slang::ast;
+        auto fit = dpiMap().find(&sym);
+        if (fit == dpiMap().end()) unsupported("DPI import");
+        const DpiFunc* f = fit->second;
+        auto args = call.arguments();
+        if (args.size() != f->args.size()) unsupported("DPI argument count");
+        Instr c;
+        c.k = IK::Dpi;
+        c.dpi = f;
+        c.dact.resize(args.size());
+        for (size_t n = 0; n < args.size(); n++) {
+            const DpiArg& formal = f->args[n];
+            const Expression& a = *args[n];
+            if (formal.uarr) {
+                const Expression* x = &a;
+                if (formal.dir != 0) {
+                    if (a.kind != ExpressionKind::Assignment) unsupported("DPI array argument");
+                    x = &a.as<AssignmentExpression>().left();
+                }
+                x = &peel(*x);
+                if (!ValueExpressionBase::isKind(x->kind)) unsupported("DPI array argument that is not a variable");
+                const Symbol* as = &x->as<ValueExpressionBase>().symbol;
+                if (auto it = arrMap().find(as); it != arrMap().end()) c.dact[n].arr = it->second;
+                else if (int d = dynSig(*x); d >= 0) c.dact[n].dyn = d;
+                else unsupported("DPI array argument of this kind");
+                continue;
+            }
+            if (formal.dir == 0) {
+                if (a.kind == ExpressionKind::EmptyArgument) unsupported("empty argument");
+                Instr i;
+                i.k = IK::Assign;
+                i.sig = formal.sig;
+                i.e = expr(a);
+                if (formal.t == DT_REAL || formal.t == DT_SHORTREAL) i.e = realOf(a);
+                prog.emit(i);
+            } else if (formal.dir == 2) {
+                if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
+                Instr i;
+                i.k = IK::Assign;
+                i.sig = formal.sig;
+                const Expression& l = a.as<AssignmentExpression>().left();
+                i.e = (formal.t == DT_REAL || formal.t == DT_SHORTREAL) ? realOf(l) : expr(l);
+                prog.emit(i);
+            } else if (a.kind != ExpressionKind::Assignment && a.kind != ExpressionKind::EmptyArgument) {
+                unsupported("output argument");
+            }
+        }
+        if (srcMgr()) {
+            auto loc = call.sourceRange.start();
+            c.fmt = std::string(srcMgr()->getFileName(loc));
+            c.dline = (int)srcMgr()->getLineNumber(loc);
+        }
+        prog.emit(c);
+        for (size_t n = 0; n < args.size(); n++) {
+            const DpiArg& formal = f->args[n];
+            if (formal.dir == 0 || formal.uarr) continue;
+            const Expression& a = *args[n];
+            if (a.kind == ExpressionKind::EmptyArgument) continue;
+            const auto& as = a.as<AssignmentExpression>();
+            Instr i;
+            i.k = IK::Assign;
+            lhs(as.left(), i);
+            OutSlot slot{formal.sig, formal.w, formal.sgn};
+            const OutSlot* saved = outSlot;
+            outSlot = &slot;
+            i.e = expr(as.right());
+            outSlot = saved;
+            prog.emit(i);
+        }
+        if (!wantValue) return {};
+        if (f->retSig < 0) unsupported("DPI call has no return value");
+        int tmp = fresh(f->retW);
+        Instr i;
+        i.k = IK::Assign;
+        i.sig = tmp;
+        i.e = ref(f->retSig, f->retSgn);
+        prog.emit(i);
+        return ref(tmp, f->retSgn);
+    }
+
+    // A call of a user system task or function registered through VPI
+    // (38.37). A variable or net argument is passed as itself (the C side
+    // reads and writes it); any other expression is evaluated into a
+    // temporary just before the call. A function's result is whatever the
+    // calltf puts on the call handle (vpi_put_value), read right after it.
+    static std::vector<std::unique_ptr<VpiSite>>& vpiSites() {
+        static std::vector<std::unique_ptr<VpiSite>> v;
+        return v;
+    }
+    E emitVpiCall(const slang::ast::CallExpression& call, const VpiSystfInfo& info, bool wantValue) {
+        using namespace slang::ast;
+        auto site = std::make_unique<VpiSite>();
+        site->systf = info.idx;
+        site->func = info.func;
+        for (const Expression* a0 : call.arguments()) {
+            VpiArg va;
+            const Expression& a = *a0;
+            if (a.kind == ExpressionKind::EmptyArgument) { site->args.push_back(va); continue; }
+            if (a.kind == ExpressionKind::ArbitrarySymbol) {
+                const Symbol* sym = a.as<ArbitrarySymbolExpression>().symbol;
+                if (sym && sym->kind == SymbolKind::Instance) {
+                    va.kind = VpiArg::Scope;
+                    va.sym = sym;
+                    site->args.push_back(va);
+                    continue;
+                }
+                unsupported("this argument of a VPI system task");
+            }
+            va.vtype = a.getConstant() || a.kind == ExpressionKind::StringLiteral ? 7 : 39;   // vpiConstant, vpiOperation
+            if (a.kind == ExpressionKind::StringLiteral) {
+                va.kind = VpiArg::String;
+                va.text = std::string(a.as<StringLiteral>().getValue());
+                site->args.push_back(va);
+                continue;
+            }
+            const Type& t = *a.type;
+            if (ValueExpressionBase::isKind(a.kind) && t.isIntegral()) {
+                const Symbol* sym = &a.as<ValueExpressionBase>().symbol;
+                if (auto it = sigmap.find(sym); it != sigmap.end() && !symOverride.count(sym) && !localMap().count(sym)) {
+                    va.kind = VpiArg::Signal;
+                    va.sig = it->second;
+                    va.w = (int)t.getBitWidth();
+                    va.sgn = t.isSigned();
+                    va.sym = sym;
+                    site->args.push_back(va);
+                    continue;
+                }
+            }
+            va.kind = VpiArg::Value;
+            Instr i;
+            i.k = IK::Assign;
+            if (t.isFloating()) {
+                va.real = true;
+                va.w = 64;
+                i.e = realOf(a);
+            } else if (t.isString()) {
+                va.str = true;
+                va.w = 64;
+                i.e = expr(a);
+            } else if (t.isIntegral()) {
+                va.w = (int)t.getBitWidth();
+                va.sgn = t.isSigned();
+                i.e = expr(a);
+            } else {
+                unsupported("an argument of this type to a VPI system task");
+            }
+            va.sig = i.sig = fresh(va.w);
+            prog.emit(i);
+            site->args.push_back(va);
+        }
+        if (info.func) {
+            site->retReal = info.ftype == 2;   // vpiRealFunc
+            site->retW = site->retReal || info.ftype == 3 ? 64 : info.ftype == 1 ? 32 : info.size;
+            site->retSgn = info.ftype == 1 || info.ftype == 5;
+            site->ret = fresh(site->retW);
+        }
+        if (srcMgr()) {
+            auto loc = call.sourceRange.start();
+            site->file = std::string(srcMgr()->getFileName(loc));
+            site->line = (int)srcMgr()->getLineNumber(loc);
+        }
+        for (const Scope* sc = scope; sc; sc = sc->asSymbol().getParentScope()) {
+            const Symbol& sy = sc->asSymbol();
+            if (sy.kind == SymbolKind::InstanceBody) {
+                site->scope = sy.as<InstanceBodySymbol>().parentInstance;
+                break;
+            }
+        }
+        Instr c;
+        c.k = IK::Vpi;
+        c.vpi = site.get();
+        prog.emit(c);
+        int ret = site->ret, retW = site->retW;
+        bool sgn = site->retSgn;
+        vpiSites().push_back(std::move(site));
+        if (!wantValue) return {};
+        int tmp = fresh(retW);
+        Instr i;
+        i.k = IK::Assign;
+        i.sig = tmp;
+        i.e = ref(ret, sgn);
+        prog.emit(i);
+        return ref(tmp, sgn);
     }
 
     // A call of an automatic subroutine (13.3.2): its arguments go straight
@@ -2106,6 +2367,8 @@ struct Lowerer {
                 }
                 std::string_view n = call.getSubroutineName();
                 auto args = call.arguments();
+                if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end() && vi->second.ftype == 2)
+                    return un(Op::AsReal, emitVpiCall(call, vi->second, true));   // a VPI real function (38.37)
                 if (n == "$get_coverage") return sysFnNode(SF_CG, {}, CG_GLOBAL);   // 19.9
                 if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));   // s.atoreal()
                 if (n == "$realtime") { E t = node(Op::RealTime); t->k = mk(ticksPerUnit(), 64); return t; }
@@ -2146,6 +2409,130 @@ struct Lowerer {
         return -1;
     }
     // s.len(), s.substr(i, j), ...: kid 0 is the string, then the arguments.
+    // ---- array query functions (20.7) ----
+    static bool isArrayQuery(std::string_view n) {
+        return n == "$left" || n == "$right" || n == "$low" || n == "$high" || n == "$increment" || n == "$size" ||
+               n == "$dimensions" || n == "$unpacked_dimensions";
+    }
+    // The type as $typename writes it (20.6.1): typedefs resolved, no
+    // default signing, ranges as decimal numbers.
+    static std::string typeName(const slang::ast::Type& t) {
+        std::string s = t.getCanonicalType().toString();
+        std::string out;
+        for (size_t i = 0; i < s.size(); i++) {   // "logic [3:0]" -> "logic[3:0]"
+            if (s[i] == ' ' && i + 1 < s.size() && s[i + 1] == '[') continue;
+            out += s[i];
+        }
+        return out;
+    }
+    struct QDim { int kind; int64_t l, r; };   // kind: 0 fixed, 1 dynamic array or queue, 2 associative
+    static void queryDims(const slang::ast::Type& t0, std::vector<QDim>& dims, int& unpacked, int64_t& assocMax) {
+        using namespace slang::ast;
+        const Type* t = &t0.getCanonicalType();
+        unpacked = 0;
+        assocMax = 0;
+        for (;;) {
+            if (t->kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                const auto& f = t->as<FixedSizeUnpackedArrayType>();
+                dims.push_back({0, f.range.left, f.range.right});
+                t = &f.elementType.getCanonicalType();
+            } else if (t->kind == SymbolKind::DynamicArrayType) {
+                dims.push_back({1, 0, 0});
+                t = &t->as<DynamicArrayType>().elementType.getCanonicalType();
+            } else if (t->kind == SymbolKind::QueueType) {
+                dims.push_back({1, 0, 0});
+                t = &t->as<QueueType>().elementType.getCanonicalType();
+            } else if (t->kind == SymbolKind::AssociativeArrayType) {
+                const auto& a = t->as<AssociativeArrayType>();
+                if (a.indexType && a.indexType->isIntegral()) {
+                    int kw = (int)a.indexType->getBitWidth();
+                    bool ks = a.indexType->isSigned();
+                    assocMax = kw >= 64 ? INT64_MAX : ks ? ((int64_t)1 << (kw - 1)) - 1 : ((int64_t)1 << kw) - 1;
+                } else assocMax = -1;
+                dims.push_back({2, 0, 0});
+                t = &a.elementType.getCanonicalType();
+            } else break;
+            unpacked++;
+        }
+        if (t->kind == SymbolKind::EnumType) t = &t->as<EnumType>().baseType.getCanonicalType();
+        while (t->kind == SymbolKind::PackedArrayType) {
+            const auto& p = t->as<PackedArrayType>();
+            dims.push_back({0, p.range.left, p.range.right});
+            t = &p.elementType.getCanonicalType();
+            if (t->kind == SymbolKind::EnumType) t = &t->as<EnumType>().baseType.getCanonicalType();
+        }
+        if (t->kind == SymbolKind::PredefinedIntegerType || t->kind == SymbolKind::PackedStructType || t->kind == SymbolKind::PackedUnionType)
+            dims.push_back({0, (int64_t)t->getBitWidth() - 1, 0});   // int is [31:0] (20.7)
+    }
+    E arrayQuery(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (args.empty()) unsupported("array query without an argument");
+        auto num = [](int64_t v) { Val r = make((uint64_t)v, 0, 32); r.sgn = true; return konst(r); };
+        E xv = konst(xfill(32, true));
+        std::vector<QDim> dims;
+        int unpacked = 0;
+        int64_t assocMax = 0;
+        const Type& t = *args[0]->type;
+        queryDims(t, dims, unpacked, assocMax);
+        if (n == "$dimensions") {
+            if (dims.empty() && (t.isString() || t.isIntegral())) return num(t.isString() ? 1 : 1);
+            return num((int64_t)dims.size());
+        }
+        if (n == "$unpacked_dimensions") return num(unpacked);
+        if (dims.empty() && t.isIntegral() && t.getBitWidth() == 1) dims.push_back({0, 0, 0});   // a scalar
+        int64_t d = 1;
+        if (args.size() > 1) {
+            const auto* cv = args[1]->getConstant();
+            bool known = (cv && cv->isInteger() && !cv->integer().hasUnknown()) || args[1]->kind == ExpressionKind::IntegerLiteral;
+            if (!known) {   // a dimension known only at run time: pick among the answers
+                E dv = resize(expr(*args[1]), 64, args[1]->type->isSigned(), true);
+                E r = xv;
+                for (size_t k = dims.size(); k-- > 0;) {
+                    if (dims[k].kind != 0 && k != 0) continue;
+                    Val kk = make(k + 1, 0, 64); kk.sgn = true;
+                    r = mux(bin(Op::Eq, dv, konst(kk)), queryDim(args, n, dims[k], (int64_t)k + 1, assocMax), r);
+                }
+                return r;
+            }
+            d = constInt(*args[1]);
+        }
+        if (d < 1 || d > (int64_t)dims.size()) return xv;
+        return queryDim(args, n, dims[(size_t)d - 1], d, assocMax);
+    }
+    E queryDim(std::span<const slang::ast::Expression* const> args, std::string_view n, const QDim& q, int64_t d,
+               int64_t assocMax) {
+        auto num = [](int64_t v) { Val r = make((uint64_t)v, 0, 32); r.sgn = true; return konst(r); };
+        E xv = konst(xfill(32, true));
+        if (q.kind == 0) {
+            int64_t l = q.l, r = q.r, inc = l >= r ? 1 : -1;
+            int64_t lo = std::min(l, r), hi = std::max(l, r);
+            if (n == "$left") return num(l);
+            if (n == "$right") return num(r);
+            if (n == "$low") return num(lo);
+            if (n == "$high") return num(hi);
+            if (n == "$increment") return num(inc);
+            return num(hi - lo + 1);
+        }
+        int h = d == 1 ? dynSig(*args[0]) : -1;
+        if (h < 0) unsupported("array query of a dynamic dimension that is not a variable's first dimension");
+        E size = dynSize(h);
+        Val one = make(1, 0, 32); one.sgn = true;
+        if (n == "$increment") return num(-1);
+        if (n == "$size") return size;
+        if (q.kind == 1) {   // dynamic array or queue: [0 : size-1]
+            if (n == "$left" || n == "$low") return num(0);
+            return bin(Op::Sub, size, konst(one));
+        }
+        if (n == "$left") return num(0);   // associative (20.7)
+        if (n == "$right") return assocMax < 0 ? xv : num(assocMax);
+        auto b = node(Op::SysFn);
+        b->hi = SF_ASSOC_BOUND;
+        b->lo = n == "$high" ? 1 : 0;
+        b->sig = h;
+        return b;
+    }
+
     E strMethod(const slang::ast::CallExpression& call, int id) {
         auto args = call.arguments();
         std::vector<E> ks;
@@ -2282,6 +2669,10 @@ struct Lowerer {
         switch (e.kind) {
             case ExpressionKind::IntegerLiteral:
                 return svLit(e.as<IntegerLiteral>().getValue(), e.type->isSigned(), ctx);
+            case ExpressionKind::NullLiteral: {     // a chandle's null (6.14)
+                Val z = make(0, 0, ctx.live && ctx.w > 0 ? ctx.w : 64);
+                return konst(z);
+            }
             case ExpressionKind::UnbasedUnsizedIntegerLiteral: {   // '0 '1 'x 'z fill their context (5.7.1)
                 auto b = e.as<UnbasedUnsizedIntegerLiteral>().getLiteralValue();
                 int w = ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
@@ -2448,6 +2839,8 @@ struct Lowerer {
                 shape = a;
             }
         } else {
+            if (cur->kind == ExpressionKind::MemberAccess || cur->kind == ExpressionKind::ElementSelect)
+                return std::nullopt;   // s.arr[i]: an array inside an unpacked struct is bits of it (7.2)
             if (cur->kind != ExpressionKind::NamedValue) unsupported("array select on a non-variable");
             shape = arrFind(&cur->as<NamedValueExpression>().symbol);
         }
@@ -3313,7 +3706,7 @@ struct Lowerer {
     PSel packedSel(const slang::ast::Type& vt, const slang::ast::Expression* idx,
                    const slang::ast::Expression* idx2, int64_t count, PSel::Kind kind) {
         using namespace slang::ast;
-        int W = (int)vt.getBitWidth();
+        int W = vt.getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType ? uWidth(vt) : (int)vt.getBitWidth();
         int64_t left = W - 1, right = 0;
         if (vt.hasFixedRange()) { auto fr = vt.getFixedRange(); left = fr.left; right = fr.right; }
         bool desc = left >= right;
@@ -3552,6 +3945,10 @@ struct Lowerer {
                     return sized(std::move(v), w, e.type->isSigned(), ctx);
                 }
                 std::string_view n = call.getSubroutineName();
+                if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end()) {   // VPI (38.37)
+                    if (vi->second.func && vi->second.ftype == 2) unsupported("a VPI real function as an integral value");
+                    return sized(emitVpiCall(call, vi->second, true), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                }
                 if (n == "randomize") return sized(randomizeCall(call), 32, true, ctx);
                 if (n == "rand_mode" || n == "constraint_mode") return sized(randModeCall(call, true), 32, true, ctx);
                 if ((n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor") && !call.arguments().empty() &&
@@ -3566,6 +3963,11 @@ struct Lowerer {
                     t->k = mk(ticksPerUnit(), 64);
                     if (w != 64) t = resize(std::move(t), w, false, false);
                     return sized(std::move(t), w, false, ctx);
+                }
+                if (isArrayQuery(n)) return sized(arrayQuery(call, n), 32, true, ctx);
+                if (n == "$typename" && call.arguments().size() == 1) {   // 20.6.1
+                    if (ctx.live && !e.type->isString()) unsupported("$typename used as a number");
+                    return konst(mkstr(typeName(*call.arguments()[0]->type)));
                 }
                 if (!call.arguments().empty() &&
                     (dynSig(*call.arguments()[0]) >= 0 ||
@@ -3862,7 +4264,7 @@ struct Lowerer {
                     return sized(std::move(m), 8, false, ctx);
                 }
                 PSel ps = packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index);
-                return sized(readPSel(expr(sel.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                return sized(readPSel(expr(sel.value()), ps), sel.value().type->isUnpackedArray() ? bitsOf(*e.type) : (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             case ExpressionKind::RangeSelect: {     // a[hi:lo], a[i +: w], a[i -: w]
                 if (E k = paramSelect(e, ctx)) return k;
@@ -3911,12 +4313,14 @@ struct Lowerer {
                     int src = storeW(*e.type);
                     return sized(r, src, e.type->isSigned(), ctx);
                 }
-                                return sized(readPSel(expr(m.value()), memberPSel(m)), storeW(*e.type), e.type->isSigned(), ctx);
+                                return sized(readPSel(expr(m.value()), memberPSel(m)), bitsOf(*e.type), e.type->isSigned(), ctx);
             }
             case ExpressionKind::SimpleAssignmentPattern:
             case ExpressionKind::StructuredAssignmentPattern:
             case ExpressionKind::ReplicatedAssignmentPattern: {   // '{a, b}, '{f: x}, '{n{a}} (10.9)
                 if (e.type->isUnpackedStruct() || e.type->isUnpackedUnion()) return sized(structValue(e), storeW(*e.type), false, ctx);
+                if (e.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType && uWidth(*e.type) > 0)
+                    return sized(arrayBitsValue(e), uWidth(*e.type), false, ctx);   // s.arr = '{...} (7.2)
                 if (!e.type->isIntegral()) unsupported("assignment pattern of an unpacked type");
                 const auto& ap = static_cast<const AssignmentPatternExpressionBase&>(e);
                 std::vector<E> parts;
@@ -4004,6 +4408,11 @@ struct Lowerer {
             if (isGlobalClock(s.expr)) {   // @($global_clock): the global clocking's event (14.14)
                 if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $global_clock");
                 collectEvents(globalClocking()->getEvent(), ev);
+                return;
+            }
+            if (const auto* cb = inferredClock(s.expr)) {   // @($inferred_clock) (16.14.7)
+                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $inferred_clock");
+                collectEvents(cb->getEvent(), ev);
                 return;
             }
             if (const auto* cb = clockingRef(s.expr)) {   // @(cb): the clocking block event (14.10)
@@ -4183,6 +4592,50 @@ struct Lowerer {
         prog.code[jf].target = prog.here();
         return ref(cnt, true);
     }
+    // $fread (21.3.4.4): binary, big-endian, (w + 7) / 8 bytes per value.
+    // Into a variable: written when any byte was read. Into a memory: an
+    // instruction loads elements from start (default: the lowest address)
+    // upward, at most count of them, until the file ends. The result is the
+    // number of bytes read.
+    E freadCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (args.size() < 2) unsupported("$fread arguments");
+        if (!stmtDepth) unsupported("$fread outside a procedural statement");
+        const Expression& dst = outArg(*args[0]);
+        const Type& t = dst.type->getCanonicalType();
+        int cnt = fresh(32);
+        if (t.isUnpackedArray()) {
+            const Symbol* msym = nullptr;
+            const Expression& m = peel(dst);
+            if (m.kind == ExpressionKind::NamedValue) msym = &m.as<NamedValueExpression>().symbol;
+            auto it = msym ? arrMap().find(msym) : arrMap().end();
+            if (it == arrMap().end()) unsupported("$fread into this array");
+            if (it->second->dims.size() != 1) unsupported("$fread into a multidimensional array");
+            const Type& el = t.getArrayElementType()->getCanonicalType();
+            if (!el.isIntegral()) unsupported("$fread into an array of non-integral elements");
+            Instr i; i.k = IK::ReadMem; i.arr = it->second; i.pw = 1;   // pw 1: $fread
+            i.dres = cnt;
+            i.args.push_back(expr(*args[1]));
+            for (size_t a = 2; a < 4; a++)
+                i.args.push_back(a < args.size() && args[a]->kind != ExpressionKind::EmptyArgument ? expr(*args[a]) : E());
+            prog.emit(i);
+            return ref(cnt, true);
+        }
+        if (!t.isIntegral()) unsupported("$fread into a non-integral variable (unpacked structs not yet)");
+        int w = (int)t.getBitWidth();
+        Instr r; r.k = IK::Assign; r.sig = cnt;
+        r.e = sysFnNode(SF_FREAD, {expr(*args[1]), konst(mk((w + 7) / 8, 32))});
+        prog.emit(r);
+        Instr j; j.k = IK::JmpIfNot; j.e = ref(cnt);
+        size_t jf = prog.emit(j);
+        Instr wr; wr.k = IK::Assign;
+        lhs(dst, wr);
+        wr.e = sysFnNode(SF_FREAD_GET, {}, w);
+        prog.emit(wr);
+        prog.code[jf].target = prog.here();
+        return ref(cnt, true);
+    }
     // Enumeration methods (6.19.5): first, last, num, next(N), prev(N), name.
     // Each is a chain of compares against the declared values. A value that
     // is not a member gives the type's default for next / prev and "" for name.
@@ -4348,9 +4801,22 @@ struct Lowerer {
         const auto& t = t0.getCanonicalType();
         if (t.isFloating()) { auto b = node(Op::Resize, {realOf(x)}); b->hi = 64; return b; }
         if (t.isString()) return resize(strOf(x), 64, false, false);
-        int w = storeW(t);
+        int w = bitsOf(t);
         if (t.isIntegral()) return resize(expr(x), w, x.type->isSigned(), false);
         return resize(expr(x), w, false, false);
+    }
+    // '{a, b} or '{n{a}} for an array held as bits of an unpacked struct (7.2): the left element highest.
+    E arrayBitsValue(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        const auto& a = e.type->getCanonicalType().as<FixedSizeUnpackedArrayType>();
+        const auto& ap = static_cast<const AssignmentPatternExpressionBase&>(e);
+        int64_t reps = e.kind == ExpressionKind::ReplicatedAssignmentPattern
+                           ? constInt(e.as<ReplicatedAssignmentPatternExpression>().count()) : 1;
+        std::vector<E> parts;
+        for (int64_t r = 0; r < reps; r++)
+            for (auto* el : ap.elements()) parts.push_back(storageOf(a.elementType, *el));
+        if ((int64_t)parts.size() != (int64_t)a.range.width()) unsupported("array pattern with the wrong number of elements");
+        return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
     }
     // '{a, b, c} or '{f: v, default: d} for an unpacked struct (10.9.2): slang
     // gives one element per member, in member order.
@@ -4373,11 +4839,22 @@ struct Lowerer {
     E structDefault(const slang::ast::Type& t0) {
         using namespace slang::ast;
         const auto& t = t0.getCanonicalType();
+        if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {   // an array member: each element's default
+            const auto& a = t.as<FixedSizeUnpackedArrayType>();
+            const Type& et = a.elementType.getCanonicalType();
+            E one;
+            if (et.isUnpackedStruct() || et.isUnpackedUnion() || et.kind == SymbolKind::FixedSizeUnpackedArrayType) one = structDefault(et);
+            else if (et.isIntegral() && et.isFourState()) one = konst(xfill(uWidth(et)));
+            else if (et.isString()) one = konst(make(mkstr("").v, 0, 64, 0));
+            else one = konst(make(0, 0, uWidth(et), 0));
+            std::vector<E> parts((size_t)a.range.width(), one);
+            return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+        }
         std::vector<E> parts;
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
             const Type& ft = f.getType().getCanonicalType();
             int w = uWidth(ft);
-            if (ft.isUnpackedStruct()) parts.push_back(structDefault(ft));
+            if (ft.isUnpackedStruct() || ft.kind == SymbolKind::FixedSizeUnpackedArrayType) parts.push_back(structDefault(ft));
             else if (ft.isIntegral() && ft.isFourState()) parts.push_back(konst(xfill(w)));
             else if (ft.isString()) parts.push_back(konst(make(mkstr("").v, 0, 64, 0)));
             else parts.push_back(konst(make(0, 0, w, 0)));
@@ -4449,6 +4926,19 @@ struct Lowerer {
         if (n == "$dist_uniform" && args.size() == 3)
             return seededCall(SF_DIST_UNIFORM, *args[0], {resize(a(1), 32, args[1]->type->isSigned(), true),
                                                           resize(a(2), 32, args[2]->type->isSigned(), true)});
+        {   // $dist_normal and the rest of 20.14 / Annex N
+            static const std::pair<const char*, int> dists[] = {
+                {"$dist_normal", SF_DIST_NORMAL}, {"$dist_exponential", SF_DIST_EXPONENTIAL},
+                {"$dist_poisson", SF_DIST_POISSON}, {"$dist_chi_square", SF_DIST_CHI_SQUARE},
+                {"$dist_t", SF_DIST_T}, {"$dist_erlang", SF_DIST_ERLANG}};
+            for (auto& [dn, id] : dists)
+                if (n == dn && !args.empty()) {
+                    std::vector<E> more;
+                    for (size_t i = 1; i < args.size(); i++) more.push_back(resize(a(i), 32, args[i]->type->isSigned(), true));
+                    return seededCall(id, *args[0], more);
+                }
+        }
+        if (n == "$system") return args.empty() ? sysFnNode(SF_SYSTEM, {}) : sysFnNode(SF_SYSTEM, {strOf(*args[0])});
         if (n == "$urandom") return args.empty() ? sysFnNode(SF_URANDOM, {}) : sysFnNode(SF_URANDOM_SEED, {a(0)});
         if (n == "$urandom_range" && !args.empty()) {
             std::vector<E> k{a(0)};
@@ -4469,6 +4959,7 @@ struct Lowerer {
         if (n == "$fseek" && args.size() == 3) return sysFnNode(SF_FSEEK, {a(0), a(1), a(2)});
         if (n == "$rewind" && args.size() == 1) return sysFnNode(SF_FSEEK, {a(0)});
         if (n == "$fgets") return fgetsCall(call);
+        if (n == "$fread") return freadCall(call);
         if (n == "$fscanf") return scanCall(call, true);
         if (n == "$sscanf") return scanCall(call, false);
         if (n == "$fdisplay" || n == "$fdisplayb" || n == "$fdisplayo" || n == "$fdisplayh" ||
@@ -4575,11 +5066,7 @@ struct Lowerer {
             fmt += escPct(std::string(f.name)) + ":";
             auto [off, w] = uField(t, f);
             E part = slice(v, off + w - 1, off);
-            const Type& ft = f.getType().getCanonicalType();
-            if (ft.isUnpackedStruct() || ft.isUnpackedUnion()) pfmtStruct(ft, part, fmt, out);
-            else if (ft.isString()) pfmtSingular(ft, un(Op::AsStr, part), fmt, out);
-            else if (ft.isFloating()) pfmtSingular(ft, un(Op::AsReal, part), fmt, out);
-            else pfmtSingular(ft, ft.isSigned() ? resize(part, w, false, true) : part, fmt, out);
+            pfmtBits(f.getType(), part, fmt, out);
             if (t.isUnpackedUnion()) break;
         }
         fmt += "}";
@@ -4605,6 +5092,27 @@ struct Lowerer {
         out.push_back(h);
         out.push_back(ref(tmp));
         out.push_back(sf);
+    }
+    // A value held as the bits of an unpacked struct member (uWidth).
+    void pfmtBits(const slang::ast::Type& t0, E part, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        const Type& ft = t0.getCanonicalType();
+        int w = uWidth(ft);
+        if (ft.kind == SymbolKind::FixedSizeUnpackedArrayType) {   // '{e0, e1, ...}, the left element first
+            const auto& a = ft.as<FixedSizeUnpackedArrayType>();
+            int ew = uWidth(a.elementType), n = (int)a.range.width();
+            fmt += "'{";
+            for (int k = 0; k < n; k++) {
+                if (k) fmt += ", ";
+                int hi = w - 1 - k * ew;
+                pfmtBits(a.elementType, slice(part, hi, hi - ew + 1), fmt, out);
+            }
+            fmt += "}";
+        }
+        else if (ft.isUnpackedStruct() || ft.isUnpackedUnion()) pfmtStruct(ft, part, fmt, out);
+        else if (ft.isString()) pfmtSingular(ft, un(Op::AsStr, part), fmt, out);
+        else if (ft.isFloating()) pfmtSingular(ft, un(Op::AsReal, part), fmt, out);
+        else pfmtSingular(ft, ft.isSigned() ? resize(part, w, false, true) : part, fmt, out);
     }
     void pfmt(const slang::ast::Expression& a, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
@@ -5199,6 +5707,10 @@ struct Lowerer {
     void sysCall(const slang::ast::CallExpression& call) {
         using namespace slang::ast;
         std::string_view n = call.getSubroutineName();
+        if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end()) {   // VPI (38.37)
+            emitVpiCall(call, vi->second, false);
+            return;
+        }
         if (n == "randomize") { randomizeCall(call); return; }
         if (n == "rand_mode" || n == "constraint_mode") { randModeCall(call, false); return; }
         if (n == "$cast" && call.arguments().size() == 2 && isHandleType(*outArg(*call.arguments()[0]).type)) {
@@ -5208,6 +5720,7 @@ struct Lowerer {
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
+        if (n == "$exit") { Instr i; i.k = IK::Exit; prog.emit(i); return; }
         if (n == "$fatal" || n == "$error" || n == "$warning" || n == "$info") { severity(call, n); return; }
         if (assertCtlCall(call, n)) return;   // $asserton, $assertcontrol, ... (20.11)
         if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.push_back(x), aa.delete(k) ...
@@ -5324,7 +5837,7 @@ struct Lowerer {
         std::string_view base = n;
         if (base.size() > 1 && (base.ends_with('b') || base.ends_with('o') || base.ends_with('h')) &&
             (base.starts_with("$display") || base.starts_with("$write") || base.starts_with("$strobe") ||
-             base.starts_with("$monitor")) &&
+             base.starts_with("$monitor") || base.starts_with("$fstrobe") || base.starts_with("$fmonitor")) &&
             base != "$monitoron") {
             dflt = base.back();
             base.remove_suffix(1);
@@ -5333,12 +5846,17 @@ struct Lowerer {
         else if (base == "$write") { k = IK::Display; nonl = true; }
         else if (base == "$strobe") k = IK::Strobe;
         else if (base == "$monitor") k = IK::Monitor;
+        else if (base == "$fstrobe" || base == "$fmonitor") k = base == "$fstrobe" ? IK::Strobe : IK::Monitor;
         else {
             // Waveform tasks only change what msim -vcd writes, so skipping
             // them changes no result. Any other task would be a silent wrong
             // answer if it were skipped, so it is an error.
+            if (n == "$dumpfile" || n == "$dumpvars" || n == "$dumpon" || n == "$dumpoff" || n == "$dumpall" ||
+                n == "$dumpflush" || n == "$dumplimit") {
+                lowerDump(call, n);
+                return;
+            }
             static const std::set<std::string_view> harmless = {
-                "$dumpfile", "$dumpvars", "$dumpon", "$dumpoff", "$dumpall", "$dumpflush", "$dumplimit",
                 "$dumpports", "$set_coverage_db_name", "$load_coverage_db", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
                 "$vcdpluson", "$vcdplusoff", "$vcdplusfile", "$shm_open", "$shm_probe", "$recordvars"};
             if (!harmless.count(n)) unsupported(("system task " + std::string(n)).c_str());
@@ -5347,7 +5865,50 @@ struct Lowerer {
         }
         Instr i; i.k = k; i.nonl = nonl;
         hierName = scopeName(call);
-        formatInto(call.arguments(), dflt, i.fmt, i.args);
+        auto fargs = call.arguments();
+        if (base[1] == 'f') {   // $fstrobe / $fmonitor (21.3.2): the first argument is the descriptor
+            if (fargs.empty()) unsupported("$fstrobe / $fmonitor without a descriptor");
+            i.fd = expr(*fargs[0]);
+            fargs = fargs.subspan(1);
+        }
+        formatInto(fargs, dflt, i.fmt, i.args);
+        prog.emit(i);
+    }
+
+    // VCD tasks (21.7.1). $dumpvars scope and variable arguments become
+    // signal-name prefixes: msim names a signal by its path below the top
+    // module ("u1.x"), so top.u1 is "u1." and the top itself is "".
+    void lowerDump(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        Instr i;
+        i.k = IK::Dump;
+        auto args = call.arguments();
+        if (n == "$dumpfile") {
+            i.dcmd = DC_FILE;
+            if (!args.empty()) i.args.push_back(strOf(*args[0]));
+        } else if (n == "$dumpvars") {
+            i.dcmd = DC_VARS;
+            if (!args.empty()) i.args.push_back(expr(*args[0]));
+            for (size_t a = 1; a < args.size(); a++) {
+                const Expression* x = args[a];
+                const Symbol* sym = nullptr;
+                if (x->kind == ExpressionKind::ArbitrarySymbol) sym = x->as<ArbitrarySymbolExpression>().symbol.get();
+                else if (x->kind == ExpressionKind::NamedValue || x->kind == ExpressionKind::HierarchicalValue)
+                    sym = &x->as<ValueExpressionBase>().symbol;
+                if (!sym) unsupported("$dumpvars argument");
+                std::string path = sym->getHierarchicalPath();
+                size_t d = path.find('.');
+                std::string rel = path.find("::") != std::string::npos ? path   // a package variable: "pkg::x"
+                                : d == std::string::npos ? std::string() : path.substr(d + 1);
+                bool var = sym->kind != SymbolKind::Instance;
+                if (!var && !rel.empty()) rel.push_back('.');
+                i.dsel.push_back({rel, var});
+            }
+        } else {
+            i.dcmd = n == "$dumpon" ? DC_ON : n == "$dumpoff" ? DC_OFF : n == "$dumpall" ? DC_ALL
+                   : n == "$dumpflush" ? DC_FLUSH : DC_LIMIT;
+            if (i.dcmd == DC_LIMIT && !args.empty()) i.args.push_back(expr(*args[0]));
+        }
         prog.emit(i);
     }
 
@@ -6668,13 +7229,46 @@ inline void Lowerer::declLocals(const slang::ast::Statement& st, FrameLayout* L)
     st.visit(w);
 }
 
+// An instance's name; an element of an instance array (23.3.3) is named with
+// its indices, "u[2]" or "m[1][0]", like its hierarchical path.
+inline std::string instName(const slang::ast::InstanceSymbol& inst) {
+    if (inst.arrayPath.empty()) return std::string(inst.name);
+    std::string_view name;
+    for (const slang::ast::Scope* sc = inst.getParentScope();
+         sc && sc->asSymbol().kind == slang::ast::SymbolKind::InstanceArray; sc = sc->asSymbol().getParentScope())
+        name = sc->asSymbol().name;
+    slang::SmallVector<slang::ConstantRange, 4> dims;
+    inst.getArrayDimensions(dims);
+    std::string r(name);
+    for (size_t d = 0; d < dims.size() && d < inst.arrayPath.size(); d++)
+        r += "[" + std::to_string((int64_t)inst.arrayPath[d] + dims[d].lower()) + "]";
+    return r;
+}
+// Where an element sits in its instance array, counted from the left-most
+// index of each dimension, row-major (23.3.3.5), and how many there are.
+inline std::pair<int, int> instArrayPos(const slang::ast::InstanceSymbol& inst) {
+    slang::SmallVector<slang::ConstantRange, 4> dims;
+    inst.getArrayDimensions(dims);
+    int pos = 0, n = 1;
+    for (size_t d = 0; d < dims.size() && d < inst.arrayPath.size(); d++) {
+        int idx = (int)inst.arrayPath[d] + dims[d].lower();
+        int p = dims[d].isDescending() ? dims[d].left - idx : idx - dims[d].left;
+        pos = pos * (int)dims[d].width() + p;
+        n *= (int)dims[d].width();
+    }
+    return {pos, n};
+}
+
 inline bool enterInstance(const slang::ast::InstanceSymbol& inst) {
     using namespace slang::ast;
     if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return false;
-    if (!inst.arrayPath.empty()) Lowerer::unsupported("instance array");
     // An interface instance (25.3) is lowered like a module instance: its
     // signals are named "bus.data", and its processes and tasks run as usual.
-    if (!inst.isTopLevel() && !inst.isModule() && !inst.isInterface()) Lowerer::unsupported("non-module instance");
+    // A program (24.3) is lowered like a module; its processes are marked
+    // and run in the reactive region set.
+    if (!inst.isTopLevel() && !inst.isModule() && !inst.isInterface() &&
+        inst.getDefinition().definitionKind != slang::ast::DefinitionKind::Program)
+        Lowerer::unsupported("non-module instance");
     return true;
 }
 
@@ -6800,7 +7394,17 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         reg(v, false);
     }
     void handle(const slang::ast::FormalArgumentSymbol& v) {
-        if (!inMethod && v.direction != slang::ast::ArgumentDirection::Ref) reg(v, false);   // a ref formal gets an address slot later
+        // A DPI import's array formal has no signal: the call passes the actual array (35.5.6.1).
+        using namespace slang::ast;
+        const auto& t = v.getType().getCanonicalType();
+        if (t.kind == SymbolKind::DPIOpenArrayType) return;
+        if (t.isUnpackedArray()) {
+            const Scope* sc = v.getParentScope();
+            if (sc && sc->asSymbol().kind == SymbolKind::Subroutine &&
+                sc->asSymbol().as<SubroutineSymbol>().flags.has(MethodFlags::DPIImport))
+                return;
+        }
+        if (!inMethod && v.direction != ArgumentDirection::Ref) reg(v, false);   // a ref formal gets an address slot later
     }
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) reg(p, false);
@@ -6878,12 +7482,22 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         if (n.getType().isUnpackedArray()) Lowerer::unsupported("an array of wand/wor/tri0/tri1/trireg/supply nets");
         netKinds().push_back({sigmap.at(&n), k});
     }
+    // A checker instance (17.3): its variables and output formals are named
+    // like an instance's, "chk.v". Its input formals are not signals: slang
+    // puts each actual in place of the formal.
+    void handle(const slang::ast::CheckerInstanceSymbol& ci) {
+        std::string saved = prefix;
+        prefix += std::string(ci.name) + ".";
+        visitDefault(ci);
+        prefix = std::move(saved);
+    }
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
         std::string saved = prefix;
         if (!inst.isTopLevel()) {
-            if (inst.name.empty()) Lowerer::unsupported("unnamed instance");
-            prefix += std::string(inst.name);
+            std::string nm = instName(inst);
+            if (nm.empty()) Lowerer::unsupported("unnamed instance");
+            prefix += nm;
             prefix.push_back('.');
         }
         visitDefault(inst);
@@ -7052,7 +7666,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             lw.prog.emit(waitInstr(rs));
             Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
         }
-        out.procs.push_back({std::move(lw.prog), loops, "assign"});
+        out.procs.push_back({std::move(lw.prog), loops, "assign", program, checkerDepth > 0});
     }
 
     // Module-level `logic x = v;` (IEEE 1800-2023 10.5): a static variable's
@@ -7083,7 +7697,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (!sc) return;
         auto pk = sc->asSymbol().kind;
         if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock &&
-            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit) {   // package variables too (26.2)
+            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit &&
+            pk != slang::ast::SymbolKind::CheckerInstanceBody) {   // package (26.2) and checker (17.7) variables too
             // A static local of a task, function or block with no
             // initializer: a 2-state one starts at 0 like a module variable
             // (6.8, 6.21). One with an initializer takes it on the first call.
@@ -7091,6 +7706,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 initStatic(v);
             return;
         }
+        if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
         initStatic(v);
     }
     // A class's static property (8.9) starts like a module variable.
@@ -7130,8 +7746,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             return;
         }
         // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
-        // A class handle starts as null (8.4).
-        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || isHandleType(t));
+        // A chandle (6.14) or a class handle (8.4) starts as null.
+        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || t.isCHandle() || isHandleType(t));
         if (!e && !zero) return;
         if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
@@ -7165,6 +7781,138 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             auto [it, fresh] = pathDelays.emplace(sg, dl);
             if (!fresh && it->second != dl) Lowerer::unsupported("paths with different delays to one output");
         }
+    }
+    // A timing check (31): its events, limits in ticks and notifier, for
+    // the kernel's check process (tchk.inc).
+    void handle(const slang::ast::SystemTimingCheckSymbol& sc) {
+        using namespace slang::ast;
+        using K = SystemTimingCheckKind;
+        Lowerer::lastLoc() = sc.location;
+        Lowerer lw(sigmap);
+        prep(lw);
+        lw.setScope(sc.getParentScope());
+        TimingCheck t;
+        static const std::pair<K, int> kinds[] = {
+            {K::Setup, TC_SETUP}, {K::Hold, TC_HOLD}, {K::SetupHold, TC_SETUPHOLD},
+            {K::Recovery, TC_RECOVERY}, {K::Removal, TC_REMOVAL}, {K::RecRem, TC_RECREM},
+            {K::Skew, TC_SKEW}, {K::TimeSkew, TC_TIMESKEW}, {K::FullSkew, TC_FULLSKEW},
+            {K::Period, TC_PERIOD}, {K::Width, TC_WIDTH}, {K::NoChange, TC_NOCHANGE}};
+        bool known = false;
+        for (auto [k, v] : kinds) if (k == sc.timingCheckKind) { t.kind = v; known = true; }
+        if (!known) Lowerer::unsupported("this timing check");
+        const auto* syn = sc.getSyntax() ? &sc.getSyntax()->as<slang::syntax::SystemTimingCheckSyntax>() : nullptr;
+        if (!syn) Lowerer::unsupported("a timing check with no syntax");
+        t.name = std::string(syn->name.valueText());
+        auto args = sc.getArguments();
+        auto text = [&](size_t k) {
+            if (k >= syn->args.size()) return std::string();
+            std::string x = syn->args[k]->toString();
+            size_t a = x.find_first_not_of(" \t\r\n"), b = x.find_last_not_of(" \t\r\n");
+            return a == std::string::npos ? std::string() : x.substr(a, b - a + 1);
+        };
+        t.nev = (t.kind == TC_PERIOD || t.kind == TC_WIDTH) ? 1 : 2;
+        if (t.kind == TC_SETUP) { t.data = 0; t.ref = 1; }
+        if (t.nev == 1) t.data = 0;
+        for (int k = 0; k < t.nev; k++) {
+            const auto& a = args[(size_t)k];
+            TcEvent& ev = t.ev[k];
+            if (!a.expr) Lowerer::unsupported("a timing check with an empty event");
+            ev.e = lw.expr(*a.expr);
+            ev.text = text((size_t)k);
+            if (a.condition) {
+                ev.cond = lw.expr(*a.condition);
+                const Expression& c = Lowerer::peel(*a.condition);
+                if (c.kind == ExpressionKind::BinaryOp) {
+                    auto op = c.as<BinaryExpression>().op;
+                    ev.nondet = op == BinaryOperator::Equality || op == BinaryOperator::Inequality;
+                }
+            }
+            if (!a.edgeDescriptors.empty()) {
+                auto lv = [](char c) { return c == '0' ? 0 : c == '1' ? 1 : 2; };
+                static const uint8_t bit[3][3] = {{0, TE_01, TE_0X}, {TE_10, 0, TE_1X}, {TE_X0, TE_X1, 0}};
+                for (auto d : a.edgeDescriptors) ev.edges |= bit[lv(d[0])][lv(d[1])];
+            } else if (a.edge == EdgeKind::PosEdge) ev.edges = TE_POS;
+            else if (a.edge == EdgeKind::NegEdge) ev.edges = TE_NEG;
+            else if (a.edge == EdgeKind::BothEdges) ev.edges = TE_ALL;
+            std::vector<int> sigs;
+            collectRefs(ev.e, sigs);
+            if (sigs.size() == 1) ev.sig = sigs[0];
+            for (int sg : sigs) {
+                bool have = false;
+                for (auto& w : t.watch) have |= w.first == sg;
+                if (!have) t.watch.push_back({sg, ANY});
+            }
+        }
+        if ((t.kind == TC_PERIOD || t.kind == TC_WIDTH || t.kind == TC_NOCHANGE) && !t.ev[0].edges)
+            Lowerer::unsupported("a $period, $width or $nochange reference event without an edge");
+        // The limits: constants in the module's time unit.
+        auto ticks = [&](size_t k) -> int64_t {
+            if (k >= args.size() || !args[k].expr) return 0;
+            ASTContext ctx(*sc.getParentScope(), LookupLocation::max);
+            slang::ConstantValue cv = ctx.tryEval(*args[k].expr);
+            double u;
+            if (cv.isInteger() && !cv.integer().hasUnknown()) u = (double)*cv.integer().as<int64_t>();
+            else if (cv.isReal()) u = cv.real();
+            else Lowerer::unsupported("a timing check limit that is not constant");
+            return (int64_t)std::llround(u * (double)lw.ticksPerUnit());
+        };
+        auto flag = [&](size_t k) {
+            if (k >= args.size() || !args[k].expr) return false;
+            ASTContext ctx(*sc.getParentScope(), LookupLocation::max);
+            slang::ConstantValue cv = ctx.tryEval(*args[k].expr);
+            return cv.isTrue();
+        };
+        size_t first = (size_t)t.nev, nlim = 1, nIdx;
+        if (t.kind == TC_SETUPHOLD || t.kind == TC_RECREM || t.kind == TC_FULLSKEW || t.kind == TC_NOCHANGE ||
+            t.kind == TC_WIDTH)
+            nlim = 2;
+        t.lim1 = ticks(first);
+        if (nlim == 2) {
+            if (t.kind == TC_WIDTH) t.thresh = ticks(first + 1);
+            else t.lim2 = ticks(first + 1);
+        }
+        nIdx = first + nlim;
+        for (size_t k = first; k < first + nlim && k < syn->args.size(); k++) {
+            std::string x = text(k);
+            if (x.empty()) continue;
+            if (!t.limText.empty()) t.limText += ", ";
+            t.limText += x;
+        }
+        if (nIdx < args.size() && args[nIdx].expr) {
+            const Expression& n = Lowerer::peel(*args[nIdx].expr);
+            const Symbol* sym = n.getSymbolReference();
+            auto it = sym ? sigmap.find(sym) : sigmap.end();
+            if (it == sigmap.end()) Lowerer::unsupported("this timing check notifier");
+            t.notifier = it->second;
+        }
+        if (t.kind == TC_TIMESKEW || t.kind == TC_FULLSKEW) {
+            t.eventBased = flag(nIdx + 1);
+            t.remainActive = flag(nIdx + 2);
+        }
+        if (t.kind == TC_SETUPHOLD || t.kind == TC_RECREM) {
+            // 31.9: timestamp and timecheck conditions, delayed reference and data.
+            if (nIdx + 1 < args.size() && args[nIdx + 1].expr) t.tsCond = lw.expr(*args[nIdx + 1].expr);
+            if (nIdx + 2 < args.size() && args[nIdx + 2].expr) t.tcCond = lw.expr(*args[nIdx + 2].expr);
+            for (int k = 0; k < 2; k++) {
+                size_t ix = nIdx + 3 + (size_t)k;
+                if (ix >= args.size() || !args[ix].expr) continue;
+                const Expression* dx = args[ix].expr;   // bound as an output: an assignment to it
+                if (dx->kind == ExpressionKind::Assignment) dx = &dx->as<AssignmentExpression>().left();
+                const Expression& x = Lowerer::peel(*dx);
+                const Symbol* sym = x.getSymbolReference();
+                if (x.kind != ExpressionKind::NamedValue || !sym || !sigmap.count(sym))
+                    Lowerer::unsupported("a delayed signal that is not a whole net or variable");
+                t.ev[k].delayed = sigmap.at(sym);
+            }
+        }
+        t.inst = Lowerer::instPath(sc.getParentScope());
+        if (const auto* sm = srcMgr()) {
+            auto ol = sm->getFullyOriginalLoc(sc.location);
+            t.file = std::string(sm->getFileName(ol));
+            t.line = (int)sm->getLineNumber(ol);
+        }
+        t.unit = lw.ticksPerUnit();
+        timingChecks().push_back(std::move(t));
     }
     void finishPaths() {
         for (auto& [sg, dl] : pathDelays) {
@@ -7328,6 +8076,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         std::string_view name = g.primitiveType.name;
         auto ports = g.getPortConnections();
         auto [ds0, ds1] = g.getDriveStrength();
+        if (g.primitiveType.primitiveKind == PrimitiveSymbol::UserDefined) {
+            lowerUdp(g, ports, ds0 ? strengthOf(*ds0) : STR_STRONG, ds1 ? strengthOf(*ds1) : STR_STRONG);
+            return;
+        }
         uint8_t fb0 = STR_STRONG, fb1 = STR_STRONG;
         bool pull = name == "pullup" || name == "pulldown";
         if (name == "pullup") { fb0 = STR_HIZ; fb1 = STR_PULL; }
@@ -7338,8 +8090,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         bool ninput = name == "and" || name == "nand" || name == "or" || name == "nor" ||
                       name == "xor" || name == "xnor";
         bool noutput = name == "buf" || name == "not";
-        if (!pull && !ninput && !noutput)
+        bool tri = name == "bufif0" || name == "bufif1" || name == "notif0" || name == "notif1";
+        bool mos = name == "nmos" || name == "pmos" || name == "rnmos" || name == "rpmos";
+        bool cmos = name == "cmos" || name == "rcmos";
+        if (name.find("tran") != std::string_view::npos) { lowerTran(name, ports); return; }
+        if (!pull && !ninput && !noutput && !tri && !mos && !cmos)
             throw std::runtime_error("lower: unsupported gate " + std::string(name));
+        if (tri || mos || cmos) { lowerSwitchGate(name, ports, s0, s1); return; }
 
         if (pull) {
             if (ports.size() != 1 || !ports[0]) Lowerer::unsupported("pull gate port");
@@ -7374,6 +8131,164 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         if (name == "nand" || name == "nor" || name == "xnor") acc = un(Op::Not, acc);
         driveOut(*ports[0], acc, s0, s1);
+    }
+
+    // Three-state gates and MOS switches (28.5, 28.7): out = data (inverted
+    // for notif) while the control enables it and Z while it disables it. An
+    // X or Z control gives L or H (28.12.1): the value might be the data or
+    // Z. Each gate is two drivers, one with only its 0 strength and one with
+    // only its 1 strength, so an X on the first is L and on the second is H,
+    // and the net resolves them by strength like any other driver. A MOS
+    // switch passes Z. cmos is an nmos and a pmos on one output. The r forms
+    // are resistive (28.13.1): minisim drives them at pull, the strength a
+    // strong data gets through them.
+    template <class Ports>
+    void lowerSwitchGate(std::string_view name, const Ports& ports, uint8_t s0, uint8_t s1) {
+        size_t need = name.ends_with("cmos") ? 4 : 3;
+        if (ports.size() != need) Lowerer::unsupported("gate ports");
+        for (auto* p : ports) if (!p) Lowerer::unsupported("gate ports");
+        Lowerer lw(sigmap);
+        prep(lw);
+        int w = (int)ports[0]->type->getBitWidth();
+        if (w != 1) Lowerer::unsupported("a three-state gate or switch wider than one bit");
+        bool resist = name[0] == 'r';
+        if (resist) {
+            s0 = std::min<uint8_t>(s0, STR_PULL);
+            s1 = std::min<uint8_t>(s1, STR_PULL);
+        }
+        auto bit = [&](const slang::ast::Expression& x) { return resize(lw.expr(x), 1, false, false); };
+        auto is = [](E v, Val k) { return node(Op::CaseEq, {v, konst(k)}); };
+        auto mux = [](E c, E a, E b) { return node(Op::Mux, {c, a, b}); };
+        E d = bit(*ports[1]);
+        E Z = konst(allz(1)), X = konst(allx(1));
+        auto drive = [&](E ctl, bool activeHigh, bool invert, bool passZ) {
+            E val = invert ? un(Op::Not, d) : passZ ? d : un(Op::Not, un(Op::Not, d));
+            E on = is(ctl, make(activeHigh ? 1 : 0, 0, 1)), off = is(ctl, make(activeHigh ? 0 : 1, 0, 1));
+            for (int part = 0; part < 2; part++) {   // 0: the 0-strength driver, 1: the 1-strength driver
+                // With an unknown control this driver may drive unless the value is the other level or Z.
+                E unk = mux(is(val, make(part ? 0 : 1, 0, 1)), Z, mux(is(val, allz(1)), Z, X));
+                driveOut(*ports[0], mux(on, val, mux(off, Z, unk)), part ? STR_HIZ : s0, part ? s1 : STR_HIZ);
+            }
+        };
+        if (name.starts_with("bufif") || name.starts_with("notif")) {
+            drive(bit(*ports[2]), name.back() == '1', name[0] == 'n', false);
+            return;
+        }
+        std::string_view base = resist ? name.substr(1) : name;
+        if (base == "nmos" || base == "pmos") {
+            drive(bit(*ports[2]), base == "nmos", false, true);
+            return;
+        }
+        drive(bit(*ports[2]), true, false, true);    // cmos: the n control
+        drive(bit(*ports[3]), false, false, true);   // and the p control
+    }
+
+    // A user-defined primitive instance (29). One process evaluates the table
+    // whenever an input changes and keeps the UDP's state in a signal of its
+    // own; a driver (with the instance's strength and delay) copies the state
+    // to the output net.
+    template <class Ports>
+    void lowerUdp(const slang::ast::PrimitiveInstanceSymbol& g, const Ports& ports, uint8_t s0, uint8_t s1) {
+        using namespace slang::ast;
+        const PrimitiveSymbol& p = g.primitiveType;
+        auto tab = std::make_unique<UdpTable>();
+        tab->nin = (int)p.ports.size() - 1;
+        tab->seq = p.isSequential;
+        for (const auto& e : p.table) {
+            UdpRow r;
+            r.state = e.state;
+            r.out = e.output;
+            for (size_t k = 0; k < e.inputs.size(); k++) {
+                char c = e.inputs[k];
+                if (c == '(') {
+                    if (k + 3 >= e.inputs.size()) Lowerer::unsupported("UDP table edge");
+                    r.in.push_back(std::string(e.inputs.substr(k, 4)));
+                    k += 3;
+                } else r.in.push_back(std::string(1, c));
+                const std::string& f = r.in.back();
+                if (f[0] == '(' || f == "r" || f == "f" || f == "p" || f == "n" || f == "*") {
+                    r.edge = (int)r.in.size() - 1;
+                    tab->edges = true;
+                }
+            }
+            if ((int)r.in.size() != tab->nin) Lowerer::unsupported("UDP table row");
+            tab->rows.push_back(std::move(r));
+        }
+        if (ports.size() != p.ports.size()) Lowerer::unsupported("UDP instance ports");
+        for (auto* x : ports) if (!x) Lowerer::unsupported("UDP instance ports");
+        Lowerer lw(sigmap);
+        prep(lw);
+        int state = lw.fresh(1), last = lw.fresh(2 * tab->nin);
+        Instr init; init.k = IK::Assign; init.sig = state;
+        int iv = 2;   // x unless the UDP has an initial statement (29.7)
+        if (p.initVal && p.initVal->isInteger()) {
+            const auto& ci = p.initVal->integer();
+            iv = ci.hasUnknown() ? 2 : (int)(ci.as<uint64_t>().value_or(0) & 1);
+        }
+        init.e = konst(iv == 2 ? allx(1) : make((uint64_t)iv, 0, 1));
+        lw.prog.emit(init);
+        Instr li; li.k = IK::Assign; li.sig = last; li.e = konst(allx(2 * tab->nin));   // inputs start at x
+        lw.prog.emit(li);
+        size_t top = lw.prog.here();
+        Instr u; u.k = IK::Udp; u.udp = tab.get(); u.sig = state; u.dres = last;
+        for (int k = 0; k < tab->nin; k++) u.args.push_back(resize(lw.expr(*ports[(size_t)k + 1]), 1, false, false));
+        lw.prog.emit(u);
+        auto rs = readSet(lw.prog);
+        rs.erase(std::remove_if(rs.begin(), rs.end(), [&](const std::pair<int, Edge>& r) { return r.first == state || r.first == last; }), rs.end());
+        bool loops = !rs.empty();
+        if (loops) {
+            lw.prog.emit(waitInstr(rs));
+            Instr j; j.k = IK::Jmp; j.target = top; lw.prog.emit(j);
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "udp"});
+        out.udps.push_back(std::move(tab));
+        driveOut(*ports[0], ref(state), s0, s1);
+    }
+
+    // tran, rtran, tranif0/1, rtranif0/1 (28.8): the two terminals become one
+    // switch the kernel resolves with the drivers of both nets. A process
+    // feeds it the control's value whenever the control changes.
+    template <class Ports>
+    void lowerTran(std::string_view name, const Ports& ports) {
+        using namespace slang::ast;
+        bool ctl = name.find("tranif") != std::string_view::npos;
+        if (ports.size() != (ctl ? 3u : 2u)) Lowerer::unsupported("tran ports");
+        int t[2];
+        for (int k = 0; k < 2; k++) {
+            if (!ports[k]) Lowerer::unsupported("tran ports");
+            const Expression* x = ports[k];
+            if (x->kind == ExpressionKind::Assignment) x = &x->as<AssignmentExpression>().left();
+            x = &Lowerer::peel(*x);
+            const Symbol* sym = ValueExpressionBase::isKind(x->kind) ? &x->as<ValueExpressionBase>().symbol : nullptr;
+            auto it = sym ? sigmap.find(sym) : sigmap.end();
+            if (!sym || sym->kind != SymbolKind::Net || it == sigmap.end())
+                Lowerer::unsupported("a tran terminal that is not a whole net");
+            t[k] = it->second;
+        }
+        if (ports[0]->type->getBitWidth() != ports[1]->type->getBitWidth()) Lowerer::unsupported("tran terminals of different widths");
+        int id = (int)out.trans.size();
+        out.trans.push_back({t[0], t[1], name[0] == 'r'});
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i;
+        i.k = IK::Tran;
+        i.sig = id;
+        if (ctl) {
+            if (!ports[2]) Lowerer::unsupported("tran ports");
+            i.e = resize(lw.expr(*ports[2]), 1, false, false);
+            i.pdown = name.back() == '0';
+        }
+        lw.prog.emit(i);
+        bool loops = false;
+        if (ctl) {
+            auto rs = readSet(lw.prog);
+            if (!rs.empty()) {
+                lw.prog.emit(waitInstr(rs));
+                Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+                loops = true;
+            }
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "tran"});
     }
 
     // The child's formal signal. A null port (no internal connection) is skipped.
@@ -7475,6 +8390,45 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         finishAssign(lw, i);
     }
 
+    // A port of an element of a multidimensional instance array (23.3.3.5).
+    // slang slices a packed actual N times the port width for each element,
+    // but for two or more dimensions of different sizes it picks the wrong
+    // part (it scales by the previous dimension's size). Here the part is
+    // taken again from the whole actual: the left-most element (row-major,
+    // left-most index of each dimension first) gets the most significant
+    // bits. Returns false to let the normal path connect slang's expression.
+    bool connectArrayElem(const slang::ast::InstanceSymbol& inst, const slang::ast::PortSymbol& ps,
+                          const slang::ast::Expression& ext, const Formal& formal) {
+        using namespace slang::ast;
+        if (inst.arrayPath.size() < 2) return false;
+        bool in = ps.direction == ArgumentDirection::In;
+        if (!in && ps.direction != ArgumentDirection::Out) return false;
+        if (!in && ext.kind != ExpressionKind::Assignment) return false;
+        const Expression& act = in ? Lowerer::peel(ext) : ext.as<AssignmentExpression>().left();
+        if (act.kind != ExpressionKind::RangeSelect) return false;
+        const Expression& whole = act.as<RangeSelectExpression>().value();
+        auto [pos, n] = instArrayPos(inst);
+        int W = (int)whole.type->getBitWidth();
+        if (whole.type->isUnpackedArray() || W != n * formal.w) return false;
+        int hi = W - 1 - pos * formal.w, lo = hi - formal.w + 1;
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i; i.k = IK::Assign;
+        if (in) {
+            i.sig = formal.sig;
+            i.e = slice(lw.expr(whole), hi, lo);
+        } else {
+            lw.lhs(whole, i);
+            if (i.arr || i.bidx || i.dyn >= 0 || i.sig < 0) return false;
+            int base = i.hi >= 0 ? i.lo : 0;
+            i.lo = base + lo;
+            i.hi = base + hi;
+            i.e = ref(formal.sig, formal.sgn);
+        }
+        finishAssign(lw, i);
+        return true;
+    }
+
     void connectInstance(const slang::ast::InstanceSymbol& inst) {
         using namespace slang::ast;
         if (inst.isTopLevel()) return;
@@ -7507,6 +8461,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
             auto formal = portFormal(ps);
             if (!formal) continue;
+            if (connectArrayElem(inst, ps, *ext, *formal)) continue;
             if (ps.direction == ArgumentDirection::In) {
                 driveSig(formal->sig, *ext);
                 continue;
@@ -7525,10 +8480,91 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
     }
 
+    // A checker instance (17.3): its body is lowered like an instance's,
+    // with its processes in the reactive region set (17.7.3). Each output
+    // formal is continuously assigned to its actual in the reactive region.
+    int checkerDepth = 0;
+    std::unordered_set<const slang::ast::Symbol*> freeAssigned;
+    bool checkerAssumes = false;
+    // A free checker variable (17.7): random from the start, unless it has
+    // an initializer; an active one gets a new random value every time step.
+    void freeVar(const slang::ast::VariableSymbol& v) {
+        using namespace slang::ast;
+        int w = storeW(v.getType());
+        if (w > 64 || !v.getType().isIntegral()) Lowerer::unsupported("a free checker variable wider than 64 bits or not integral");
+        bool isConst = v.flags.has(VariableFlags::Const);
+        bool active = !isConst && !freeAssigned.count(&v);
+        if (active && checkerAssumes)
+            Lowerer::unsupported("free checker variables constrained by assume statements (17.7.2)");
+        out.freeVars.push_back({sigmap.at(&v), active});
+    }
+    void handle(const slang::ast::CheckerInstanceSymbol& ci) {
+        using namespace slang::ast;
+        if (ci.body.isProcedural) Lowerer::unsupported("a checker instance in procedural code (17.3)");
+        // Which variables the checker assigns, and whether it has assume
+        // statements (17.7.2): an active free variable is one it never assigns.
+        struct Scan : ASTVisitor<Scan, VisitFlags::Statements | VisitFlags::Expressions> {
+            std::unordered_set<const Symbol*> assigned;
+            bool assumes = false;
+            void handle(const AssignmentExpression& a) {
+                const Expression* l = &a.left();
+                for (;;) {
+                    if (l->kind == ExpressionKind::ElementSelect) l = &l->as<ElementSelectExpression>().value();
+                    else if (l->kind == ExpressionKind::RangeSelect) l = &l->as<RangeSelectExpression>().value();
+                    else if (l->kind == ExpressionKind::MemberAccess) l = &l->as<MemberAccessExpression>().value();
+                    else break;
+                }
+                if (const Symbol* sym = l->getSymbolReference()) assigned.insert(sym);
+                visitDefault(a);
+            }
+            void handle(const ConcurrentAssertionStatement& c) {
+                if (c.assertionKind == AssertionKind::Assume) assumes = true;
+                visitDefault(c);
+            }
+        } scan;
+        ci.body.visit(scan);
+        std::swap(freeAssigned, scan.assigned);
+        bool savedAssumes = checkerAssumes;
+        checkerAssumes = scan.assumes;
+        checkerDepth++;
+        visitDefault(ci);
+        checkerDepth--;
+        checkerAssumes = savedAssumes;
+        for (const auto& c : ci.getPortConnections()) {
+            if (c.formal.kind != SymbolKind::FormalArgument) continue;
+            const auto& f = c.formal.as<FormalArgumentSymbol>();
+            if (f.direction != ArgumentDirection::Out) continue;
+            int fs = sigmap.at(&f);
+            int w = storeW(f.getType());
+            if (const Expression* ie = c.getOutputInitialExpr()) {   // output int ctr = 0 (17.2)
+                if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+                Instr i; i.k = IK::Assign; i.sig = fs;
+                i.e = resize(init->expr(*ie), w, f.getType().isSigned(), ie->type->isSigned());
+                init->prog.emit(i);
+            }
+            const auto* ap = std::get_if<const Expression*>(&c.actual);
+            if (!ap || !*ap) continue;
+            const Expression* a = *ap;
+            if (a->kind == ExpressionKind::Assignment) a = &a->as<AssignmentExpression>().left();
+            Lowerer lw(sigmap);
+            prep(lw);
+            lw.setScope(ci.getParentScope());
+            Instr i; i.k = IK::Assign;
+            lw.lhs(*a, i);
+            int tw = storeW(*a->type);
+            i.e = resize(ref(fs, f.getType().isSigned()), tw, f.getType().isSigned(), f.getType().isSigned());
+            finishAssign(lw, i);
+            out.procs.back().reactive = true;
+        }
+    }
+    int program = -1;   // the program instance being visited (24.3), or -1
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
         connectInstance(inst);
+        int saved = program;
+        if (inst.getDefinition().definitionKind == slang::ast::DefinitionKind::Program) program = out.programs++;
         visitDefault(inst);
+        program = saved;
     }
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
@@ -7593,8 +8629,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (const auto* t = leadingEvent(p.getBody())) {
                 try { E iff; lw.clockOf(*t, lw.sampleEv, iff); } catch (const std::runtime_error&) { lw.sampleEv.clear(); }
             }
+        int below = checkerDepth > 0 && p.procedureKind == ProceduralBlockKind::AlwaysFF ? lw.fresh(1) : -1;
         lw.stmt(p.getBody());
         lw.finishImplicit();
+        // 17.5: in a checker's always_ff, every expression but the event
+        // control reads sampled values. Signals made while lowering the body
+        // (temporaries) are read as they are.
+        if (below >= 0) lw.sampleProg(below);
         if (p.procedureKind == ProceduralBlockKind::Initial)
             if (const auto* nb = Lowerer::namedSeq(p.getBody())) lw.prog.roots.push_back(Lowerer::rootId(nb));
         // A final block (9.2.3) runs once, after the last time slot. slang
@@ -7613,7 +8654,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             else lw.prog.emit(waitInstr(rs));
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
-        out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind))});
+        out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind)),
+                             p.procedureKind == ProceduralBlockKind::Initial ? program : -1, checkerDepth > 0});
     }
 };
 
@@ -7880,6 +8922,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     LowerResult out;
     asserts().clear();
     concAsserts().clear();
+    timingChecks().clear();
     sva::store().clear();
     shadowPairs().clear();
     sampleClocks().clear();
@@ -7892,6 +8935,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     Lowerer::svaLocalSigs().clear();
     Lowerer::svaLiveSigs().clear();
     sigInfo().clear();
+    Lowerer::vpiSites().clear();
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
     Lowerer::compilation() = &comp;
@@ -8040,10 +9084,66 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*> subMap;
     std::vector<std::unique_ptr<Subr>> owned;
     std::vector<Subr*> order;
+    dpiMap().clear();
+    auto dpiArgs = [&](const slang::ast::SubroutineSymbol& sym, DpiFunc& f) {
+        using namespace slang::ast;
+        for (const FormalArgumentSymbol* formal : sym.getArguments()) {
+            DpiArg a;
+            a.name = std::string(formal->name);
+            a.dir = formal->direction == ArgumentDirection::Out ? 1 : formal->direction == ArgumentDirection::InOut ? 2 : 0;
+            const Type* t = &formal->getType().getCanonicalType();
+            while (t->kind == SymbolKind::FixedSizeUnpackedArrayType || t->kind == SymbolKind::DPIOpenArrayType) {
+                if (t->kind == SymbolKind::DPIOpenArrayType) {
+                    const auto& o = t->as<DPIOpenArrayType>();
+                    if (o.isPacked) Lowerer::unsupported("DPI packed open array argument (bit [])");
+                    a.open = true;
+                    a.udims.push_back({0, 0});
+                    a.uopen.push_back(true);
+                    t = &o.elementType.getCanonicalType();
+                } else {
+                    const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+                    a.udims.push_back({ft.range.left, ft.range.right});
+                    a.uopen.push_back(false);
+                    t = &ft.elementType.getCanonicalType();
+                }
+                a.uarr = true;
+            }
+            if (t->isUnpackedStruct()) Lowerer::unsupported("DPI unpacked struct argument");
+            a.t = dpiType(*t, a.w, a.sgn);
+            if (!a.uarr) {
+                auto it = sigmap.find(formal);
+                if (it == sigmap.end()) Lowerer::unsupported("DPI argument");
+                a.sig = it->second;
+            } else if (f.isExport) Lowerer::unsupported("unpacked array argument of a DPI export");
+            f.args.push_back(std::move(a));
+        }
+    };
     Lowerer setup(sigmap);
     auto framed = framedSubroutines(finder.found);
     for (const slang::ast::SubroutineSymbol* sym : finder.found) {
-        if (subMap.count(sym)) continue;
+        if (!sym->flags.has(slang::ast::MethodFlags::DPIImport) || dpiMap().count(sym)) continue;
+        using namespace slang::ast;
+        auto f = std::make_unique<DpiFunc>();
+        f->svName = std::string(sym->name);
+        f->cName = f->svName;
+        if (auto* syn = sym->getSyntax(); syn && syn->kind == slang::syntax::SyntaxKind::DPIImport) {
+            auto cid = syn->as<slang::syntax::DPIImportSyntax>().c_identifier.valueText();
+            if (!cid.empty()) f->cName = std::string(cid);
+        }
+        f->scope = dpiScopeName(*sym);
+        f->task = sym->subroutineKind == SubroutineKind::Task;
+        f->context = sym->flags.has(MethodFlags::DPIContext);
+        f->pure = sym->flags.has(MethodFlags::Pure);
+        dpiArgs(*sym, *f);
+        if (!f->task) {
+            f->ret = dpiType(sym->getReturnType(), f->retW, f->retSgn);
+            if (f->ret != DT_VOID) f->retSig = mkSig("_dpi_ret$" + f->cName, f->retW, false);
+        }
+        dpiMap()[sym] = f.get();
+        out.dpi.push_back(std::move(f));
+    }
+    for (const slang::ast::SubroutineSymbol* sym : finder.found) {
+        if (subMap.count(sym) || sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
         if (sym->returnValVar && sym->getReturnType().isUnpackedArray()) {
             // Returning an unpacked array is only supported when every call
             // is constant (13.4.3) and slang evaluates it; a call that needs
@@ -8167,6 +9267,44 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         *sub->prog = std::move(lw.prog);
     }
     for (Subr* sub : order) patchImplicit(*sub->prog);
+    for (const auto& ex : comp.getDPIExports()) {   // export "DPI-C" (35.5.4)
+        using namespace slang::ast;
+        auto it = subMap.find(ex.subroutine);
+        if (it == subMap.end()) Lowerer::unsupported("DPI export of this subroutine");
+        Subr* sub = it->second;
+        if (sub->lay) Lowerer::unsupported("DPI export of an automatic task, or of a function that recurses");
+        auto f = std::make_unique<DpiFunc>();
+        f->isExport = true;
+        f->svName = std::string(ex.subroutine->name);
+        f->cName = ex.cIdentifier;
+        f->scope = dpiScopeName(*ex.subroutine);
+        f->task = ex.subroutine->subroutineKind == SubroutineKind::Task;
+        f->prog = sub->prog;
+        dpiArgs(*ex.subroutine, *f);
+        if (!f->task) {
+            f->ret = dpiType(ex.subroutine->getReturnType(), f->retW, f->retSgn);
+            f->retSig = sub->retSig;
+        }
+        out.dpi.push_back(std::move(f));
+    }
+    {   // DPI scope names (35.5.3): every instance and package
+        struct Scopes : slang::ast::ASTVisitor<Scopes> {
+            std::vector<std::string>* out;
+            void handle(const slang::ast::InstanceSymbol& inst) {
+                if (!enterInstance(inst)) return;
+                out->push_back(inst.getHierarchicalPath());
+                visitDefault(inst);
+            }
+            void handle(const slang::ast::PackageSymbol& p) { out->push_back(std::string(p.name)); }
+            void handle(const slang::ast::GenerateBlockSymbol& g) {
+                if (g.isUninstantiated) return;
+                out->push_back(g.getHierarchicalPath());
+                visitDefault(g);
+            }
+        } sv;
+        sv.out = &out.scopes;
+        comp.getRoot().visit(sv);
+    }
 
     // Randomization (18): each class's rand variables, constraint blocks
     // (an override by name replaces the base block), pre/post_randomize.
@@ -8352,5 +9490,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (!blockIds().roots.count(blockIds().of(b)))
             Lowerer::unsupported(("disable of block '" + std::string(b->name) +
                                   "' from outside it, unless it is a whole initial or fork branch").c_str());
+    out.sigOf = sigmap;
     return out;
 }

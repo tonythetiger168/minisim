@@ -1,5 +1,4 @@
 // IEEE 1800-2023 20.6.1: $typename returns the type as a string (20.6.1).
-//! xfail: $typename is an error
 //! icarus-skip: Icarus 13 does not support $typename
 module top;
   int a;

@@ -49,6 +49,11 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    Udp,        // a user-defined primitive (29): udp's table, inputs in args, state `sig`, last inputs `dres`
+    Tran,       // bidirectional switch `sig` (28.8): its control is e (null: always on), active low if pdown
+    Dump,       // a VCD task (21.7.1): dcmd is a DumpCmd; args / dsel hold the operands
+    Dpi,        // call the C function of DPI import `dpi` (35); see DpiFunc
+    Vpi,        // call the calltf of a VPI user system task or function (36-38); see VpiSite
     New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
     Randomize,  // sig = randomize the object e (null e: std::randomize), with rc (18.6, 18.12)
     RandMode,   // obj e: every rand variable (hi = 0) or constraint block (hi = 1) on or off by de (18.8, 18.9)
@@ -67,10 +72,19 @@ enum class IK {
     // of clockings()[dkey], take e at the clocking event `de` cycles on.
     CbDrive,
     AssertCtl,  // $assertcontrol (20.11): args are control, assertion and directive type, levels; fmt the targets
+    Exit,       // $exit (24.7): end the calling thread's program
     Ret         // pop that address; an empty stack ends the process
 };
 
 struct Prog;
+
+// A user-defined primitive's table (29.3.4). Each row has one field per
+// input: a level ('0' '1' 'x' '?' 'b'), an edge symbol ('r' 'f' 'p' 'n' '*'),
+// or an edge pair "(01)". `edge` is the input with the edge, or -1.
+struct UdpRow { std::vector<std::string> in; char state = 0, out = 'x'; int edge = -1; };
+struct UdpTable { int nin = 0; bool seq = false; bool edges = false; std::vector<UdpRow> rows; };
+// IK::Dump commands, one per VCD task (21.7.1).
+enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT };
 
 // Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
 // is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
@@ -89,6 +103,83 @@ inline uint32_t covFileId(const std::string& path) {
 // Relaxed atomic add: a task body can run on two worker threads at once.
 inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
 
+// ---- DPI-C (IEEE 1800-2023 clause 35, annex H) ----
+// How a value is passed to or from C (35.5.6, H.7). A packed type is passed
+// by pointer in canonical form; a scalar bit or logic is one byte.
+enum DpiType : uint8_t {
+    DT_VOID, DT_BYTE, DT_SHORT, DT_INT, DT_LONG, DT_REAL, DT_SHORTREAL, DT_CHANDLE, DT_STRING,
+    DT_BIT,      // svBit
+    DT_LOGIC,    // svLogic
+    DT_BITVEC,   // svBitVecVal[], 32 bits a word
+    DT_LOGICVEC  // svLogicVecVal[], aval/bval pairs
+};
+struct DpiArg {
+    DpiType t = DT_INT;
+    int dir = 0;          // 0 input, 1 output, 2 inout
+    int sig = -1;         // the formal's signal (not for an unpacked array)
+    int w = 32;           // bits of the value, or of one element of an unpacked array
+    bool sgn = false;
+    // An unpacked array formal: its dimensions, leftmost first. An open
+    // dimension `[]` (35.5.6.1) has open = true, and C gets an svOpenArrayHandle.
+    bool uarr = false, open = false;
+    std::vector<std::pair<int64_t, int64_t>> udims;
+    std::vector<bool> uopen;   // per dimension: open
+
+    std::string name;
+};
+// One DPI import or export. An import is called by IK::Dpi; an export is an
+// SV task or function that C calls through a generated stub.
+struct DpiFunc {
+    std::string svName, cName;
+    std::string scope;    // hierarchical name of the module instance or package that declares it
+    bool task = false, context = false, pure = false, isExport = false;
+    DpiType ret = DT_VOID;
+    int retSig = -1, retW = 0;
+    bool retSgn = false;
+    std::vector<DpiArg> args;
+    const Prog* prog = nullptr;   // export: the SV body
+    void* rt = nullptr;           // run-time data (resolved C function)
+};
+// A user system task or function registered with vpi_register_systf
+// (38.37). The names are known before elaboration, so slang accepts calls.
+struct VpiSystfInfo {
+    int idx = 0;          // into vpi::st().systfs
+    bool func = false;
+    int ftype = 1;        // vpiIntFunc, vpiRealFunc, vpiTimeFunc, vpiSizedFunc, vpiSizedSignedFunc
+    int size = 32;        // result width (sizetf for a sized function)
+};
+inline std::unordered_map<std::string, VpiSystfInfo>& vpiSystfNames() {
+    static std::unordered_map<std::string, VpiSystfInfo> m;
+    return m;
+}
+// One argument of a call of a user system task or function, as VPI sees it.
+struct VpiArg {
+    enum Kind { Empty, Signal, Value, String, Scope } kind = Empty;
+    int sig = -1;               // Signal: the variable or net; Value: a temporary holding the value
+    int w = 0;
+    bool sgn = false, real = false, str = false;
+    std::string text;           // String: the literal
+    const void* sym = nullptr;  // Signal: its slang symbol; Scope: the instance
+    int vtype = 0;              // Value / String: the object type VPI reports (vpiConstant, vpiOperation, ...)
+};
+// One call site of a user system task or function (an IK::Vpi).
+struct VpiSite {
+    int systf = 0;
+    bool func = false;
+    std::vector<VpiArg> args;
+    int ret = -1, retW = 32;    // function: the result signal
+    bool retSgn = false, retReal = false;
+    std::string file;
+    int line = 0;
+    const void* scope = nullptr;   // the instance the call is in (slang InstanceSymbol)
+    mutable void* userdata = nullptr;   // vpi_put_userdata (38.40)
+};
+// An unpacked array actual of a DPI call: a fixed array or a container.
+struct DpiActual {
+    std::shared_ptr<const ArrShape> arr;
+    int dyn = -1;
+};
+
 struct Instr {
     IK k = IK::Jmp;
     int sig = -1;
@@ -104,6 +195,7 @@ struct Instr {
     // $strobe/$monitor sees values after NBA. %b, %d, %%, and other text.
     std::string fmt;
     bool nonl = false;    // Display from $write: no newline at the end
+    E fd;                 // Strobe / Monitor from $fstrobe / $fmonitor: the descriptor (21.3.2)
     std::vector<E> args;
     const Prog* callee = nullptr; // Call
     std::vector<const Prog*> branches;  // Fork
@@ -130,6 +222,11 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    const UdpTable* udp = nullptr;   // Udp
+    // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
+    // signal-name prefixes relative to the top ("" is the top, "u1." an
+    // instance); `second` is true for a variable (an exact name).
+    std::vector<std::pair<std::string, bool>> dsel;
     // Frames (expr.hpp). Call: when `lay` is set the callee is automatic and
     // runs in a new frame of that shape; `init` gives each argument slot its
     // value, evaluated in the caller before the switch. Fork: `blays` is the
@@ -146,6 +243,12 @@ struct Instr {
     bool dynWait = false;
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
+    // Dpi: the import, one entry per argument (arrays only), and the call's
+    // source location for svGetCallerInfo (file in fmt).
+    const DpiFunc* dpi = nullptr;
+    const VpiSite* vpi = nullptr;   // Vpi: the call site
+    std::vector<DpiActual> dact;
+    int dline = 0;
     // Call of a class method (8): `self` is the object (null: the caller's
     // own `this`; noSelf: a static method). vslot >= 0 picks the body from
     // the object's class (a virtual method, 8.20).
@@ -275,6 +378,7 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef) add(e->sig);
+    if (e->op == Op::SysFn && e->sig >= 0) add(e->sig);   // a query of a container (SF_ASSOC_BOUND)
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 // Does e read an automatic variable (a relative id)?

@@ -87,7 +87,15 @@ if(MINISIM_WITH_SLANG)
   # One-step compile + simulate, irun / vcs -R style: msim tb.sv -top tb -vcd w.vcd
   add_executable(msim src/msim.cpp)
   target_include_directories(msim PRIVATE src)
-  target_link_libraries(msim PRIVATE slang::slang)
+  # DPI-C (35): libffi calls the imports; -rdynamic lets a loaded library
+  # find the svdpi.h functions and msim_dpi_export in msim itself.
+  find_library(FFI_LIB ffi REQUIRED)
+  find_path(FFI_INCLUDE ffi.h PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu)
+  target_link_libraries(msim PRIVATE slang::slang ${FFI_LIB} ${CMAKE_DL_LIBS})
+  if(FFI_INCLUDE)
+    target_include_directories(msim PRIVATE ${FFI_INCLUDE})
+  endif()
+  set_target_properties(msim PROPERTIES ENABLE_EXPORTS ON)
   # -compile builds generated C++ against the kernel headers in src/.
   target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
   if(MINISIM_WITH_FST)
@@ -121,11 +129,17 @@ if(MINISIM_WITH_SLANG)
   set_tests_properties(msim_default_width PROPERTIES PASS_REGULAR_EXPRESSION "W= +4 sum=12\n")
   add_test(NAME msim_init COMMAND msim ${CLI}/init.sv)
   set_tests_properties(msim_init PROPERTIES PASS_REGULAR_EXPRESSION "v= +5\nw= +6\nw= +10\n")
+  # +notimingcheck (31): the setup and hold checks report nothing.
+  add_test(NAME msim_notimingcheck COMMAND msim +notimingcheck ${CMAKE_SOURCE_DIR}/tests/spec/31.3-setup-hold.sv)
+  set_tests_properties(msim_notimingcheck PROPERTIES PASS_REGULAR_EXPRESSION "^notifier=x\n$")
   add_test(NAME msim_maxtime COMMAND msim ${CLI}/spin.sv -maxtime 25)
   set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION "^tick\ntick\ntick\n$")
   add_test(NAME msim_vcd
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd.cmake)
+  add_test(NAME msim_vcdtasks
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_vcdtasks.cmake)
   # Compiled mode: generated C++ prints the same as the interpreter.
   add_test(NAME msim_compile
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -166,6 +180,10 @@ if(MINISIM_WITH_SLANG)
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
   endif()
+  # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
+  add_test(NAME msim_dpi
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_dpi.cmake)
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
@@ -228,6 +246,8 @@ endif()
 # Install layout (cmake --install, and the cpack packages below):
 #   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug
 #   share/minisim/include/   kernel sources that msim -compile builds against
+#   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
+#   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -245,7 +265,8 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md
+install(FILES include/svdpi.h include/vpi_user.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
