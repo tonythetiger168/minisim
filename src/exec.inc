@@ -389,6 +389,11 @@ inline DpiHook& dpiHook() { static DpiHook h; return h; }
 struct ProcCtl {
     Handle h{};
     bool killed = false, ended = false, waitingFork = false;
+    // std::process (9.7): suspended processes park at their next resume
+    // point; await() waiters resume when this one ends.
+    bool suspended = false, parked = false;
+    vector<Handle> awaiters;
+    int obj = 0;   // its process object, once process::self() made one
     weak_ptr<ProcCtl> parent;
     vector<shared_ptr<ProcCtl>> kids;
     shared_ptr<JoinState> join;
@@ -411,6 +416,8 @@ inline unordered_map<int, vector<weak_ptr<ProcCtl>>>& rootProcs() {
 inline void procEnd(ProcCtl& c) {
     if (c.ended) return;
     c.ended = true;
+    for (Handle h : c.awaiters) S.active.push_back(h);
+    c.awaiters.clear();
     if (c.join) c.join->branchEnded();
     if (auto p = c.parent.lock())
         if (p->waitingFork && p->kidsDone()) { p->waitingFork = false; S.active.push_back(p->h); }
@@ -435,6 +442,38 @@ struct WaitFork {
 };
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+
+// std::process (9.7): process objects index this table.
+inline vector<shared_ptr<ProcCtl>>& procTable() { static vector<shared_ptr<ProcCtl>> v; return v; }
+struct ProcAwait {   // p.await(): until p ends
+    ProcCtl* c;
+    bool await_ready() const { return c->ended; }
+    void await_suspend(Handle h) const { c->awaiters.push_back(h); }
+    void await_resume() const {}
+};
+struct ProcPark {    // a suspended process, until resume()
+    ProcCtl* c;
+    bool await_ready() const { return !c->suspended; }
+    void await_suspend(Handle h) const { c->h = h; c->parked = true; }
+    void await_resume() const {}
+};
+static ProcCtl* procOf(const Instr& i) {
+    Val h = eval(i.e, rd);
+    if (h.x || !h.v) nullAccess();
+    Val n = S.get((int)h.v + i.dkey);
+    if (n.x || n.v >= procTable().size()) relFail("a process object with no process");
+    return procTable()[n.v].get();
+}
+static int procStatus(const ProcCtl* c, const ProcCtl* self) {
+    if (c->killed) return 4;      // KILLED
+    if (c->ended) return 0;       // FINISHED
+    if (c->suspended) return 3;   // SUSPENDED
+    return c == self ? 1 : 2;     // RUNNING, WAITING
+}
+static void procResume(ProcCtl* c) {
+    c->suspended = false;
+    if (c->parked && !c->ended) { c->parked = false; S.active.push_back(c->h); }
+}
 static int doRandomize(int obj, const RandCall* rc);   // rand.inc
 static void randModeAll(int obj, bool blocks, bool on);
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
@@ -937,6 +976,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         g_fr = fr.get();
         g_ret = lastRet.get();
         if (ctl->killed) goto done;
+        if (ctl->suspended) [[unlikely]] {   // 9.7: stop here until resume()
+            co_await ProcPark{ctl.get()};
+            if (ctl->killed) goto done;
+        }
         if (pc >= p->code.size()) {
             if (rets.empty()) goto done;
             ret();
@@ -1014,6 +1057,37 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 g_ret = lastRet.get();
                 if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true));
                 pc++; break;
+            }
+            case IK::ProcOp: {   // std::process (9.7)
+                if (i.hi == PO_SELF) {
+                    if (!ctl->obj) {
+                        const FrameLayout& L = *classRt()[(size_t)i.lo].lay;
+                        int obj = g_allocSigs(L);
+                        g_initSigs(L, obj);
+                        S.sigs[obj + i.dkey].val = make((uint64_t)procTable().size(), 0, 64);
+                        procTable().push_back(ctl);
+                        ctl->obj = obj;
+                        // its srandom / get_randstate (18.13.3); seeded from its number, so
+                        // process::self() does not move the $urandom stream
+                        objRng()[obj] = seedState(0x9E3779B97F4A7C15ull * (procTable().size() + 1));
+                    }
+                    S.set(R(i.sig), make((uint64_t)ctl->obj, 0, 64));
+                    pc++; break;
+                }
+                ProcCtl* c = procOf(i);
+                pc++;
+                if (i.hi == PO_STATUS) S.set(R(i.sig), make((uint64_t)procStatus(c, ctl.get()), 0, 32, 0, true));
+                else if (i.hi == PO_KILL) {
+                    if (!c->ended) {
+                        for (auto& t : procTable()) if (t.get() == c) { procKill(t); break; }
+                    }
+                } else if (i.hi == PO_AWAIT) {
+                    if (c == ctl.get()) relFail("a process awaiting itself (9.7)");
+                    co_await ProcAwait{c};
+                } else if (i.hi == PO_SUSPEND) {
+                    if (!c->ended) c->suspended = true;
+                } else if (i.hi == PO_RESUME) procResume(c);
+                break;
             }
             case IK::RandMode: {   // obj.rand_mode(v) / obj.constraint_mode(v) (18.8, 18.9)
                 Val h = eval(i.e, rd);
