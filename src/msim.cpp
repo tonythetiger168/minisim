@@ -38,6 +38,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <unordered_set>
+#include <cstdio>
 #include <optional>
 #include <set>
 #include <string>
@@ -246,11 +249,92 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }
 
+// Coverage database (msim -cov): JSON with line hits, branch outcomes, and
+// toggle masks. mcov merges databases and writes reports.
+static std::string jstr(const std::string& x) {
+    std::string r = "\"";
+    for (char c : x) {
+        if (c == '"' || c == '\\') { r += '\\'; r += c; }
+        else if ((unsigned char)c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); r += b; }
+        else r += c;
+    }
+    return r + "\"";
+}
+static void collectProgs(const Prog* p, std::vector<const Prog*>& all, std::unordered_set<const Prog*>& seen) {
+    if (!p || !seen.insert(p).second) return;
+    all.push_back(p);
+    for (auto& i : p->code) {
+        if (i.callee) collectProgs(i.callee, all, seen);
+        for (auto* b : i.branches) collectProgs(b, all, seen);
+    }
+}
+static bool writeCoverage(const std::string& path, const LowerResult& lw, const std::string& top) {
+    std::vector<const Prog*> progs;
+    std::unordered_set<const Prog*> seen;
+    for (auto& p : lw.procs) collectProgs(&p.prog, progs, seen);
+    for (auto& p : lw.finals) collectProgs(&p.prog, progs, seen);
+    for (auto& p : lw.subs) collectProgs(p.get(), progs, seen);
+    std::map<std::pair<uint32_t, uint32_t>, uint64_t> lines;            // (file, line) -> hits
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint64_t, uint64_t>>> branches;
+    for (const Prog* p : progs)
+        for (auto& i : p->code) {
+            if (!i.line) continue;
+            auto key = std::make_pair(i.file, i.line);
+            auto& h = lines[key];
+            h = std::max(h, i.hits);
+            // A JmpIfNot is a two-way decision: true = fell through, false = jumped.
+            if (i.k == IK::JmpIfNot) branches[key].push_back({i.hits - i.taken, i.taken});
+        }
+    std::ofstream f(path);
+    if (!f) return false;
+    f << "{\n \"format\": \"msim-cov\", \"version\": 1, \"tool\": \"msim " MINISIM_VERSION "\", \"top\": " << jstr(top)
+      << ",\n \"files\": [";
+    for (size_t k = 0; k < g_covFiles.size(); k++) f << (k ? ", " : "") << jstr(g_covFiles[k]);
+    f << "],\n \"lines\": [";
+    bool first = true;
+    for (auto& [k, h] : lines) {
+        f << (first ? "\n  " : ",\n  ") << "[" << k.first << ", " << k.second << ", " << h << "]";
+        first = false;
+    }
+    f << "\n ],\n \"branches\": [";
+    first = true;
+    for (auto& [k, v] : branches)
+        for (size_t n = 0; n < v.size(); n++) {
+            f << (first ? "\n  " : ",\n  ") << "[" << k.first << ", " << k.second << ", " << n << ", " << v[n].first << ", " << v[n].second << "]";
+            first = false;
+        }
+    f << "\n ],\n \"toggles\": [";
+    first = true;
+    auto hex = [](const std::vector<uint64_t>& m, int w) {
+        // MSB-first hex of the low w bits.
+        std::string r;
+        int digits = (w + 3) / 4;
+        for (int d = digits - 1; d >= 0; d--) {
+            int bit = d * 4;
+            uint64_t word = (size_t)bit / 64 < m.size() ? m[(size_t)bit / 64] : 0;
+            r += "0123456789abcdef"[(word >> (bit % 64)) & 0xF];
+        }
+        return r;
+    };
+    for (size_t sidx = 0; sidx < S.sigs.size(); sidx++) {
+        const auto& g = S.sigs[sidx];
+        if (g.hide) continue;
+        static const std::vector<uint64_t> none;
+        const auto& R = sidx < S.togRise.size() ? S.togRise[sidx] : none;
+        const auto& F = sidx < S.togFall.size() ? S.togFall[sidx] : none;
+        f << (first ? "\n  " : ",\n  ") << "[" << jstr(top + "." + g.name) << ", " << g.w << ", \"" << hex(R, g.w) << "\", \"" << hex(F, g.w) << "\"]";
+        first = false;
+    }
+    f << "\n ]\n}\n";
+    return (bool)f;
+}
+
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
+                 "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
                  "  -maxtime <n>   stop after simulation time n\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
@@ -267,6 +351,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> plusargs;
     uint64_t seed = 0;
     std::optional<std::string> vcdPath;
+    std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
@@ -309,6 +394,11 @@ int main(int argc, char** argv) {
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
         if (a == "+fst") { vcdPath = "dump.fst"; continue; }
+        if (a == "-cov") {
+            g_cov = true;
+            if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
+            continue;
+        }
         // -vcd x.fst writes FST too: the file name picks the format.
         if (a == "-vcd" || a == "-fst") {
             std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
@@ -376,6 +466,10 @@ int main(int argc, char** argv) {
     }
 
     Plan pl = plan(lowered, staticComb, staticSeq);
+    if (compiled && g_cov) {
+        std::cerr << "msim: -compile: coverage is not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
     if (compiled) {
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle);
         if (st >= 0) return st;
@@ -433,5 +527,9 @@ int main(int argc, char** argv) {
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
     std::cout.flush();
+    if (g_cov && !writeCoverage(covPath, lowered, S.vcdTop)) {
+        std::cerr << "msim: cannot write " << covPath << "\n";
+        return 1;
+    }
     return S.exitCode;
 }

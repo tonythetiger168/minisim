@@ -443,7 +443,7 @@ struct Sim {
             }
             return;
         }
-        if (parts.empty() || waving() || mon.on) {
+        if (parts.empty() || waving() || mon.on || g_cov) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
             for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
@@ -1138,6 +1138,28 @@ struct Sim {
         vcd << "$end\n";
     }
 
+    // Toggle coverage (msim -cov): per signal, the bits seen rising 0->1 and
+    // falling 1->0 (X and Z do not count), one 64-bit word per 64 bits.
+    vector<vector<uint64_t>> togRise, togFall;
+    void covToggle(int s, const Val& o, const Val& n) {
+        if (togRise.size() <= (size_t)s) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
+        int w = sigs[s].w;
+        auto& R = togRise[s];
+        auto& F = togFall[s];
+        if (R.empty()) { R.assign((size_t)(w + 63) / 64, 0); F.assign(R.size(), 0); }
+        if (w <= 64) {
+            uint64_t known = ~(o.x | n.x);
+            R[0] |= ~o.v & n.v & known;
+            F[0] |= o.v & ~n.v & known;
+            return;
+        }
+        for (int i = 0; i < w; i++) {
+            int a = bitAt(o, i), b = bitAt(n, i);
+            if (a == 0 && b == 1) R[(size_t)i / 64] |= 1ULL << (i % 64);
+            else if (a == 1 && b == 0) F[(size_t)i / 64] |= 1ULL << (i % 64);
+        }
+    }
+
     void set(int s, Val nv) {
         if (sigs[s].w <= 64) {
             uint64_t m = sigs[s].w >= 64 ? ~0ULL : ((1ULL << sigs[s].w) - 1);
@@ -1147,6 +1169,7 @@ struct Sim {
         if (tlPart) { setLocal(s, nv); return; }
         if (nv == sigs[s].val) return;
         int o = bit0(sigs[s].val), n = bit0(nv);
+        if (g_cov) covToggle(s, sigs[s].val, nv);
         sigs[s].val = nv;
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
