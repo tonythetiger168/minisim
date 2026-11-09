@@ -20,6 +20,9 @@
 //   -compile         compiled mode: generate C++ for the design (codegen.hpp),
 //                    build it with a C++ compiler into <dir>/simv, and run it.
 //                    A design codegen cannot translate runs on the interpreter.
+//                    With -cov the generated code counts hits too. An
+//                    unchanged design reuses the simv already in <dir>; seeds
+//                    and plusargs are passed to it at run time.
 //   -o <dir>         build directory for -compile (default msim.d)
 //   -no-static-comb  run continuous assigns and always_comb as ordinary
 //                    event-driven processes instead of one levelized schedule
@@ -76,7 +79,10 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "codegen.hpp"
 #include "lower.hpp"
@@ -249,9 +255,39 @@ static void partitionInputs(const LowerResult& lowered, const Plan& pl, std::vec
 
 // -compile: generate, build and run. Returns the exit status, or -1 when the
 // design needs the interpreter.
+// simv -cov: the counters of each compiled instruction (hits, then taken
+// jumps) and the toggle masks per signal, read back into the instructions and
+// S so writeCoverage() writes the same database as an interpreted run.
+static bool readCompiledCov(const std::string& path, const std::vector<std::pair<const Prog*, size_t>>& slots) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    auto rd = [&](void* p, size_t n) { return std::fread(p, 8, n, f) == n; };
+    uint64_t n = 0, ns = 0;
+    bool ok = rd(&n, 1) && n >= 2 * slots.size();
+    std::vector<uint64_t> cv(ok ? n : 0);
+    ok = ok && rd(cv.data(), n) && rd(&ns, 1) && ns == S.sigs.size();
+    for (size_t k = 0; ok && k < slots.size(); k++) {
+        Instr& in = const_cast<Instr&>(slots[k].first->code[slots[k].second]);
+        in.hits += cv[2 * k];
+        in.taken += cv[2 * k + 1];
+    }
+    if (ok) { S.togRise.assign(ns, {}); S.togFall.assign(ns, {}); }
+    for (size_t s = 0; ok && s < ns; s++) {
+        uint64_t w = 0;
+        ok = rd(&w, 1) && w <= ((uint64_t)S.sigs[s].w + 63) / 64;
+        if (!ok) break;
+        S.togRise[s].resize(w);
+        S.togFall[s].resize(w);
+        ok = rd(S.togRise[s].data(), w) && rd(S.togFall[s].data(), w);
+    }
+    std::fclose(f);
+    return ok;
+}
+
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
-                       const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle) {
+                       const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
+                       uint64_t seed, const std::string& covPath) {
     std::vector<CodegenSig> sigs;
     for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
     std::vector<CodegenProc> procs;
@@ -266,6 +302,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     parts.on = staticPart;
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
+    std::vector<std::pair<const Prog*, size_t>> covSlots;
     // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
@@ -281,7 +318,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     }
     try {
         // With a VCD every signal must live in S.sigs, so no private signals.
-        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath);
+        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr);
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -289,11 +326,11 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::string inc = kernelIncludeDir();
     if (std::system(("mkdir -p " + shq(dir)).c_str()) != 0) { std::cerr << "msim: cannot create " << dir << "\n"; return 1; }
     std::string cpp = dir + "/design.cpp", exe = dir + "/simv";
-    {
-        std::ofstream f(cpp);
-        f << src;
-        if (!f) { std::cerr << "msim: cannot write " << cpp << "\n"; return 1; }
-    }
+    // One build at a time per directory: parallel runs of one test (seeds in
+    // mregress) share the build, the first one compiles and the rest reuse it.
+    int lockFd = ::open((dir + "/.build.lock").c_str(), O_CREAT | O_RDWR, 0644);
+    if (lockFd >= 0) ::flock(lockFd, LOCK_EX);
+    struct Unlock { int fd; ~Unlock() { if (fd >= 0) ::close(fd); } } unlock{lockFd};
     std::string build = shq(cc) + " -std=c++20 " + opt + " -I" + shq(inc) + " " + shq(cpp) + " -o " + shq(exe);
     // An FST waveform: build simv with libfst too. Its C sources are compiled
     // once into <dir>/fst/*.o with $CC (default cc).
@@ -304,30 +341,67 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             return -1;
         }
         std::string ccC = std::getenv("CC") ? std::getenv("CC") : "cc";
-        std::string od = dir + "/fst", objs;
+        std::string od = dir + "/fst-par", objs;   // built with the background writer thread
         if (std::system(("mkdir -p " + shq(od)).c_str()) != 0) return 1;
         for (const char* f : {"fstapi", "fastlz", "lz4"}) {
             std::string o = od + "/" + f + ".o";
             objs += " " + shq(o);
             if (std::filesystem::exists(o)) continue;
-            std::string c = shq(ccC) + " -O2 -c -D_GNU_SOURCE -DHAVE_FSEEKO -DHAVE_REALPATH " +
+            std::string c = shq(ccC) + " -O2 -c -D_GNU_SOURCE -DHAVE_FSEEKO -DHAVE_REALPATH"
+                            " -DHAVE_LIBPTHREAD -DFST_WRITER_PARALLEL " +
                             shq(fd + "/" + f + ".c") + " -o " + shq(o);
             if (std::system(c.c_str()) != 0) { std::cerr << "msim: -compile: libfst build failed: " << c << "\n"; return 1; }
         }
-        build += " -DMINISIM_FST -I" + shq(fd) + objs + " -lz";
+        build += " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fd) + objs + " -lz -pthread";
     }
-    if (std::system(build.c_str()) != 0) {
-        std::cerr << "msim: -compile: C++ build failed: " << build << "\n";
-        return 1;
+    // Build cache: the same generated source, compiler command and kernel
+    // sources as the simv already in `dir` reuse it. A rebuild of a large
+    // design takes minutes; a regression runs the same design many times.
+    auto slurp = [](const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    };
+    std::string stamp = build + "\n";
+    for (const char* k : {"minisim.cpp", "exec.inc", "expr.hpp", "prog.hpp", "cpu.hpp"}) {
+        std::error_code ec;
+        auto p = std::filesystem::path(inc) / k;
+        auto t = std::filesystem::last_write_time(p, ec);
+        stamp += std::string(k) + " " + std::to_string(ec ? 0 : std::filesystem::file_size(p, ec)) + " " +
+                 std::to_string(ec ? 0 : (long long)t.time_since_epoch().count()) + "\n";
     }
+    std::error_code ec;
+    bool fresh = std::filesystem::exists(exe, ec) && slurp(dir + "/simv.stamp") == stamp && slurp(cpp) == src;
+    if (!fresh) {
+        std::filesystem::remove(dir + "/simv.stamp", ec);
+        {
+            std::ofstream f(cpp);
+            f << src;
+            if (!f) { std::cerr << "msim: cannot write " << cpp << "\n"; return 1; }
+        }
+        if (std::system(build.c_str()) != 0) {
+            std::cerr << "msim: -compile: C++ build failed: " << build << "\n";
+            return 1;
+        }
+        std::ofstream(dir + "/simv.stamp") << stamp;
+    }
+    if (lockFd >= 0) ::flock(lockFd, LOCK_UN);
     std::string run = shq(exe);
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
     run += " -threads " + std::to_string(threads);
     if (g_pin >= 0) run += g_pin ? " -pin" : " -no-pin";
+    // Run-time inputs go to simv, so one build serves every seed and plusarg.
+    if (seed) run += " -seed " + std::to_string(seed);
+    for (auto& a : plusArgs()) run += " " + shq("+" + a);
+    std::string covBin = covPath + ".bin";   // per run: parallel runs share the build directory
+    if (g_cov) { std::filesystem::remove(covBin); run += " -cov " + shq(covBin); }
     std::cout.flush();
     int st = std::system(run.c_str());
     if (st == -1) return 1;
+    if (g_cov && !readCompiledCov(covBin, covSlots)) {
+        std::cerr << "msim: -compile: simv wrote no coverage (" << covBin << ")\n";
+        return 1;
+    }
     return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }
 
@@ -420,7 +494,8 @@ static void usage() {
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
                  "  -maxtime <n>   stop after simulation time n\n"
-                 "  -compile       generate C++, build it (<dir>/simv) and run it\n"
+                 "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
+                 "                 and reuses <dir>/simv while the design is unchanged\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
                  "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
@@ -441,6 +516,7 @@ int main(int argc, char** argv) {
     uint64_t maxTime = ~0ULL;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
+    bool threadsGiven = false;
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     std::vector<std::string> svLibs, cFiles, soFiles;
@@ -474,6 +550,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (a == "-threads") {
+            threadsGiven = true;
             std::string n = next("a thread count");
             if (n == "all") { threads = maxThreads(); continue; }
             try { threads = std::stoi(n); }
@@ -710,10 +787,6 @@ int main(int argc, char** argv) {
         threads = 1;
     }
     Plan pl = plan(lowered, staticComb, staticSeq);
-    if (compiled && g_cov) {
-        std::cerr << "msim: -compile: coverage is not compiled yet; using the interpreter\n";
-        compiled = false;
-    }
     if (compiled && timingChecksOn() && !timingChecks().empty()) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
         compiled = false;
@@ -725,8 +798,15 @@ int main(int argc, char** argv) {
         compiled = false;
     }
     if (compiled) {
-        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle);
-        if (st >= 0) return st;
+        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle,
+                             seed, covPath);
+        if (st >= 0) {
+            if (g_cov && !writeCoverage(covPath, lowered, S.vcdTop)) {
+                std::cerr << "msim: cannot write " << covPath << "\n";
+                return 1;
+            }
+            return st;
+        }
     }
 
     S.vcdPath = vcdPath.value_or("");
@@ -756,6 +836,9 @@ int main(int argc, char** argv) {
         for (auto& [s, d] : lowered.netDelays)
             if (!S.sigs[s].drv.empty()) S.sigs[s].val = allx(S.sigs[s].w);
     }
+    // An FST file is compressed on libfst's own writer thread: leave it a
+    // core, unless -threads was given.
+    if (!threadsGiven && threads > 1 && vcdPath && vcdPath->ends_with(".fst")) threads--;
     S.threads = threads;
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
