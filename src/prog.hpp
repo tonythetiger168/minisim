@@ -52,6 +52,12 @@ enum class IK {
     // target, and an assertion that is off or whose action is off jumps to hi.
     // join 1 (#0) or 2 (final), deferred: queue a report and go on.
     Assert,
+    // ##n (14.11): wait for n events of clockings()[dkey] (its event is
+    // signal sig); ##0 waits only if that event has not happened in this step.
+    CycleWait,
+    // A synchronous drive (14.16): bits [hi:lo] of clockvar sig, output dres
+    // of clockings()[dkey], take e at the clocking event `de` cycles on.
+    CbDrive,
     AssertCtl,  // $assertcontrol (20.11): args are control, assertion and directive type, levels; fmt the targets
     Ret         // pop that address; an empty stack ends the process
 };
