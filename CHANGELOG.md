@@ -20,6 +20,8 @@ Spec references are IEEE 1800-2023 clauses.
 - Configurations and libraries (33): `msim -libmap`, configs as the top
   (with or without `-top`), library tops, `-L`, and `%l` / `%L`.
 - Spec tests can pass msim arguments with a `//! args:` line.
+- `%p` of containers of unpacked structs, unions, enums and packed structs
+  (21.2.1.6), at any nesting depth.
 - Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
   `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
   Negative `$setuphold` / `$recrem` limits with delayed signals under

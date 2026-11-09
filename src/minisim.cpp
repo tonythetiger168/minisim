@@ -1446,7 +1446,31 @@ struct Sim {
                 char style = fmt[++i];
                 if (ai >= args.size()) continue;
                 const E& h = args[ai++];
-                auto one = [&](Val v, char st) {
+                E slot, sub;   // %QF: each element set into slot, printed by sub
+                if (style == 'F') {
+                    if (ai + 2 > args.size()) continue;
+                    slot = args[ai++];
+                    sub = args[ai++];
+                }
+                auto one = [&](Val v, char st) -> string {
+                    if (st == 'F') {   // the element in place of the slot
+                        std::function<E(const E&)> put = [&](const E& e) -> E {
+                            if (!e) return e;
+                            if (e->op == Op::Ref && !e->at && e->sig == slot->sig) {
+                                Val k = v;
+                                k.sgn = e->sgn;
+                                return konst(k);
+                            }
+                            bool ch = false;
+                            std::vector<E> kids;
+                            for (auto& kd : e->kids) { kids.push_back(put(kd)); ch |= kids.back() != kd; }
+                            if (!ch) return e;
+                            auto c = std::make_shared<Expr>(*e);
+                            c->kids = std::move(kids);
+                            return c;
+                        };
+                        return v_str(eval(put(sub), rd));
+                    }
                     if (st == 's') { v.str = true; return "\"" + v_str(v) + "\""; }
                     if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
                     return fmtVal('d', v, 0, true);
