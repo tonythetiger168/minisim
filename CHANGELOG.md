@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Pulse filtering at path outputs (30.7): `PATHPULSE$` limits, `+pulse_r/N`
+  and `+pulse_e/N`, pulses to x, pulse styles (`pulsestyle_ondetect`,
+  `showcancelled` and the `+pulse_on_detect` / `+showcancelled` options).
+  Path delays now combine with gate and net delays inside the module by
+  taking the larger (30.6).
+- SDF: pulse limits (`((d) (r) (e))`, PATHPULSE, PATHPULSEPERCENT, 32.7),
+  DEVICE on gates and UDPs, INTERCONNECT from one source of a net with
+  several sources (32.4.4, 32.5), and SCOND / CCOND.
 - UVM (IEEE 1800.2-2020): the Accellera UVM library (uvm-core 2020.3.1)
   compiles and runs with `+define+UVM_NO_DPI` (see `docs/UVM.md`): run_test,
   the factory and overrides, phases and objections, sequences, sequencers and

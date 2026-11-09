@@ -23,6 +23,10 @@
 //                    sets the library search order (33.8.1); a config is
 //                    chosen with -top <config>
 //   +neg_tchk        allow negative $setuphold / $recrem limits (31.9)
+//   +pulse_r/<n> +pulse_e/<n>
+//                    reject and error pulse limits as n% of each path delay (30.7.2)
+//   +pulse_on_event / +pulse_on_detect, +showcancelled / +noshowcancelled
+//                    pulse styles of every path output (30.7.4)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
@@ -593,6 +597,8 @@ static void usage() {
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
                  "  -libmap <file>  library map (33.3); -L <lib> library search order\n"
                  "  +neg_tchk      allow negative $setuphold / $recrem limits, with delayed signals\n"
+                 "  +pulse_r/<n> +pulse_e/<n>  pulse reject / error limits as n% of path delays\n"
+                 "  +pulse_on_event / +pulse_on_detect, +showcancelled / +noshowcancelled  pulse styles\n"
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
                  "  -maxtime <n>   stop after simulation time n\n"
@@ -711,6 +717,17 @@ int main(int argc, char** argv) {
         }
         if (a == "-libmap") { fwd.push_back("--libmap"); fwd.push_back(next("a library map file")); continue; }
         if (a == "+neg_tchk") { negTimingChecks() = true; continue; }
+        if (a.rfind("+pulse_r/", 0) == 0 || a.rfind("+pulse_e/", 0) == 0) {   // 30.7.2
+            std::string n = a.substr(9);
+            char* end = nullptr;
+            long p = std::strtol(n.c_str(), &end, 10);
+            if (n.empty() || *end || p < 0 || p > 100) { std::cerr << "msim: " << a << ": the percentage is an integer from 0 to 100\n"; return 2; }
+            (a[7] == 'r' ? pulseOpts().rejectPct : pulseOpts().errorPct) = (int)p;
+            continue;
+        }
+        if (a == "+pulse_on_event" || a == "+pulse_on_detect") { pulseOpts().detect = a == "+pulse_on_detect"; continue; }   // 30.7.4.1
+        if (a == "+showcancelled" || a == "+show_cancelled") { pulseOpts().showCancelled = 1; continue; }                   // 30.7.4.2
+        if (a == "+noshowcancelled" || a == "+noshow_cancelled") { pulseOpts().showCancelled = 0; continue; }
         if (a == "+fst") { vcdPath = "dump.fst"; continue; }
         if (a == "-cov") {
             g_cov = true;
@@ -951,6 +968,9 @@ int main(int argc, char** argv) {
         staticComb = staticSeq = staticPart = false;
         threads = 1;
     }
+    // SDF DEVICE may give gates new delays (32.4.1): their drivers then
+    // run the plain way.
+    if ((!sdfRequests().empty() || sdfAtRunTime()) && !gateRecs().empty()) staticComb = staticSeq = false;
     Plan pl = plan(lowered, staticComb, staticSeq);
     if (compiled && timingChecksOn() && !timingChecks().empty()) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
@@ -1041,7 +1061,7 @@ int main(int argc, char** argv) {
     startCovergroups();
     if (startSdf()) return 1;   // SDF timing first, so the checks start with the annotated limits
     startTimingChecks();
-    if (!pathRecs().empty() || !S.icDelay.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
+    if (!pathRecs().empty() || !S.icDelay.empty() || !S.shadowOf.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {

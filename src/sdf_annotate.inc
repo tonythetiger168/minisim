@@ -79,6 +79,70 @@ template <class D> bool apply12(Ctx& c, const Op& op, D& d) {
     return true;
 }
 
+// Delays with pulse limits (32.7): a value written ((d) (r) (e)) sets the
+// limits too, and "()" keeps one; a plain value sets them to the
+// +pulse_r / +pulse_e percentages of the delay it gives (in INCREMENT
+// mode, of the increment). Limits below 0 are 0.
+inline bool applyDel(Ctx& c, const Op& op, uint64_t* d, uint64_t* rj, uint64_t* er) {
+    std::vector<std::optional<int64_t>> dv, rv, ev;
+    for (const DelVal& x : op.vals) {
+        auto dd = pick(x.d, c);
+        dv.push_back(dd);
+        if (x.pulse) {
+            auto r = pick(x.r, c);
+            rv.push_back(r);
+            ev.push_back(x.hasE ? pick(x.e, c) : r);
+        } else {
+            auto pct = [&](int p) -> std::optional<int64_t> {
+                if (!dd) return std::nullopt;
+                return *dd * p / 100;
+            };
+            rv.push_back(pct(pulseOpts().rejectPct));
+            ev.push_back(pct(std::max(pulseOpts().errorPct, pulseOpts().rejectPct)));
+        }
+    }
+    std::array<std::optional<int64_t>, 12> td, tr, te;
+    if (!table32_4(dv, td) || !table32_4(rv, tr) || !table32_4(ev, te)) {
+        c.warn(&op, std::to_string(op.vals.size()) + " delay values (1, 2, 3, 6 or 12 are allowed)");
+        return false;
+    }
+    auto put = [&](uint64_t& at, const std::optional<int64_t>& x) {
+        if (!x) return;
+        at = (uint64_t)std::max<int64_t>(0, op.incr ? (int64_t)at + *x : *x);
+    };
+    for (size_t k = 0; k < 12; k++) { put(d[k], td[k]); put(rj[k], tr[k]); put(er[k], te[k]); }
+    return true;
+}
+
+// PATHPULSE (r) (e) / PATHPULSEPERCENT (r%) (e%): only the limits.
+inline bool applyPulse(Ctx& c, const Op& op, const uint64_t* d, uint64_t* rj, uint64_t* er) {
+    if (op.vals.empty() || op.vals.size() > 2) {
+        c.warn(&op, "PATHPULSE needs one or two values");
+        return false;
+    }
+    bool pct = op.kind == sdf::PATHPULSEPERCENT;
+    std::optional<double> r, e;
+    auto val = [&](const Triple& t) -> std::optional<double> {
+        if (pct) return sdf::pick(t, c.sel);   // percentages are not scaled to time
+        auto v = pick(t, c);
+        if (!v) return std::nullopt;
+        return (double)*v;
+    };
+    r = val(op.vals[0].d);
+    e = op.vals.size() > 1 ? val(op.vals[1].d) : r;
+    for (int k = 0; k < 12; k++) {
+        auto one = [&](uint64_t& at, const std::optional<double>& x) {
+            if (!x) return;
+            double v = pct ? (double)d[k] * *x / 100.0 : *x;
+            int64_t n = (int64_t)std::llround(v);
+            at = (uint64_t)std::max<int64_t>(0, op.incr ? (int64_t)at + n : n);
+        };
+        one(rj[k], r);
+        one(er[k], e);
+    }
+    return true;
+}
+
 inline std::string joinPath(const std::string& a, const std::string& b) {
     if (a.empty()) return b;
     if (b.empty()) return a;
@@ -140,7 +204,7 @@ inline void iopath(Ctx& c, const Op& op, const std::string& inst) {
             uint8_t e = op.a.edge == "posedge" ? 1 : op.a.edge == "negedge" ? 2 : 0;
             if (e && p.edge != 3 && p.edge != e) continue;
         }
-        if (!apply12(c, op, p.d)) return;
+        if (!applyDel(c, op, p.d, p.rj, p.er)) return;
         p.annotated = true;
         hits++;
     }
@@ -152,32 +216,95 @@ inline void iopath(Ctx& c, const Op& op, const std::string& inst) {
     else c.note(op, what + " -> " + inst + " (" + std::to_string(hits) + " path" + (hits > 1 ? "s" : "") + ")");
 }
 
-// DEVICE: every path to the instance's outputs, or to the one output named.
+// PATHPULSE / PATHPULSEPERCENT (32.7): the pulse limits of the paths
+// from in to out, or of every path of the instance when no path is named.
+inline void pathPulse(Ctx& c, const Op& op, const std::string& inst) {
+    int hits = 0;
+    for (auto& p : pathRecs()) {
+        if (p.inst != inst) continue;
+        if (!op.a.name.empty() && (!sameName(p.in, op.a.name) || !sameName(p.out, op.b.name))) continue;
+        if (!applyPulse(c, op, p.d, p.rj, p.er)) return;
+        hits++;
+    }
+    std::string what = std::string(op.kind == sdf::PATHPULSE ? "PATHPULSE" : "PATHPULSEPERCENT") +
+                       (op.a.name.empty() ? "" : " " + op.a.name + " " + op.b.name);
+    if (!hits) c.warn(&op, "no specify path in " + inst + " for " + what);
+    else c.note(op, what + " -> " + inst + " (" + std::to_string(hits) + " path" + (hits > 1 ? "s" : "") + ")");
+}
+
+// DEVICE (Table 32-1): every specify path to the instance's outputs, or to
+// the one output named; with no such path, every gate or UDP that drives
+// those outputs. "DEVICE u1" names a child instance, "DEVICE u1.y" its port.
 inline void device(Ctx& c, const Op& op, const std::string& inst) {
     int hits = 0;
     std::string port = op.a.name.empty() ? "" : clean(op.a.name);
     std::string where = inst;
-    // DEVICE u1.y: the port of a child instance.
     if (auto dot = port.rfind('.'); dot != std::string::npos) {
         where = joinPath(inst, port.substr(0, dot));
         port = port.substr(dot + 1);
-    } else if (!port.empty() && instCells().count(joinPath(inst, port))) {   // DEVICE u1: a child instance
+    } else if (!port.empty() && instCells().count(joinPath(inst, port))) {
         where = joinPath(inst, port);
         port.clear();
     }
     for (auto& p : pathRecs()) {
         if (p.inst != where || (!port.empty() && !sameName(p.out, port))) continue;
-        if (!apply12(c, op, p.d)) return;
+        if (!applyDel(c, op, p.d, p.rj, p.er)) return;
         p.annotated = true;
         hits++;
     }
-    if (!hits) c.warn(&op, "DEVICE: no specify path to " + (port.empty() ? "the outputs of " + where : where + "." + port) +
-                               " (primitive delays are not annotated)");
-    else c.note(op, "DEVICE -> " + std::to_string(hits) + " paths in " + where);
+    if (hits) { c.note(op, "DEVICE -> " + std::to_string(hits) + " path" + (hits > 1 ? "s" : "") + " in " + where); return; }
+    // The output ports in question, by signal.
+    std::set<int> outs;
+    std::string pre = where + ".";
+    for (auto& [name, pr] : portRecs()) {
+        if (name.rfind(pre, 0) != 0 || name.find('.', pre.size()) != std::string::npos || pr.dir == 0) continue;
+        if (!port.empty() && !sameName(name.substr(pre.size()), port)) continue;
+        outs.insert(pr.sig);
+    }
+    for (auto& g : gateRecs()) {
+        if (g.inst != where) continue;
+        bool drives = false;
+        for (int o : g.outs) drives |= outs.count(o) > 0;
+        if (!drives) continue;
+        if (!apply12(c, op, g.d)) return;   // () keeps a declared delay
+        g.annotated = true;
+        hits++;
+    }
+    if (!hits) c.warn(&op, "DEVICE: no specify path or primitive drives " + (port.empty() ? "the outputs of " + where : where + "." + port));
+    else c.note(op, "DEVICE -> " + std::to_string(hits) + " primitive" + (hits > 1 ? "s" : "") + " in " + where);
+}
+
+// The net whose drivers a load port sees: up through input ports
+// connected to whole nets, to the net where the sources meet.
+inline int loadNet(int load) {
+    auto it = inLinks().find(load);
+    if (it == inLinks().end()) return -1;
+    int n = it->second;
+    for (int guard = 0; guard < 64; guard++) {
+        auto up = inLinks().find(n);
+        if (up == inLinks().end() || S.sigs[(size_t)n].drv.size() != 1) break;
+        n = up->second;
+    }
+    return n;
+}
+// The driver of `net` through which source port `src` (an output or inout
+// formal) reaches it, up through output ports; -1 if it does not.
+inline int sourceDriver(int src, int net) {
+    int s = src;
+    for (int guard = 0; guard < 64; guard++) {
+        const PortLink* l = nullptr;
+        for (auto& x : outLinks()) if (x.formal == s) { l = &x; break; }
+        if (!l) return -1;
+        if (l->net == net) return l->drv;
+        s = l->net;
+    }
+    return -1;
 }
 
 // PORT / NETDELAY / INTERCONNECT (32.4.4): a delay to a load port, an input
-// or inout of an instance. The delay applies to every source of the net.
+// or inout of an instance. PORT and NETDELAY delay every source of the
+// net; INTERCONNECT on a net with several sources delays the one source,
+// and a later PORT replaces it (32.5).
 inline void interconnect(Ctx& c, const Op& op, const std::string& inst) {
     const sdf::Port& load = op.kind == sdf::INTERCONNECT ? op.b : op.a;
     std::string lp = joinPath(inst, clean(load.name));
@@ -190,18 +317,47 @@ inline void interconnect(Ctx& c, const Op& op, const std::string& inst) {
         c.warn(&op, "port " + lp + " is a variable, not a net: no interconnect delay");
         return;
     }
+    int L = it->second.sig;
+    int drv = -1, net = -1;
     if (op.kind == sdf::INTERCONNECT) {
         std::string sp = joinPath(inst, clean(op.a.name));
         auto si = portRecs().find(sp);
         if (si == portRecs().end() || si->second.dir == 0)
             c.warn(&op, "no output or inout port " + sp + " (annotating the delay to " + lp + " from every source)");
+        else {
+            net = loadNet(L);
+            drv = net < 0 ? -1 : sourceDriver(si->second.sig, net);
+            if (drv < 0)
+                c.warn(&op, "ports " + sp + " and " + lp + " are not on one net (annotating the delay to " + lp + " from every source)");
+            else if (S.sigs[(size_t)net].drv.size() < 2) drv = -1;   // one source: the same as PORT
+        }
     }
-    auto [ic, fresh] = S.icDelay.try_emplace(it->second.sig);
-    if (fresh) ic->second.fill(0);
-    if (!apply12(c, op, ic->second)) return;
-    if ((size_t)it->second.sig < S.timedOut.size()) S.timedOut[(size_t)it->second.sig] = 1;
-    c.note(op, std::string(op.kind == sdf::PORT ? "PORT" : op.kind == sdf::NETDELAY ? "NETDELAY" : "INTERCONNECT") +
-                   " -> " + lp);
+    std::string what = std::string(op.kind == sdf::PORT ? "PORT" : op.kind == sdf::NETDELAY ? "NETDELAY" : "INTERCONNECT") + " -> " + lp;
+    auto sh = S.shadowOf.find(L);
+    if (drv >= 0 || sh != S.shadowOf.end()) {   // per-source delays on this load
+        Sim::Shadow* x;
+        if (sh == S.shadowOf.end()) {
+            if (net < 0) net = loadNet(L);
+            x = &S.addShadow(L, net);
+            auto ic = S.icDelay.find(L);   // an earlier PORT delay: now the delay from every source
+            if (ic != S.icDelay.end()) { x->all = ic->second; S.icDelay.erase(ic); }
+        } else x = &sh->second;
+        if (drv >= 0) {
+            auto [f, fresh] = x->from.try_emplace(drv, x->all);
+            if (!applyDel(c, op, f->second.d, f->second.rj, f->second.er)) return;
+        } else {
+            if (!applyDel(c, op, x->all.d, x->all.rj, x->all.er)) return;
+            if (op.incr) {
+                for (auto& [k, d] : x->from) applyDel(c, op, d.d, d.rj, d.er);
+            } else x->from.clear();
+        }
+        c.note(op, what);
+        return;
+    }
+    auto [ic, fresh] = S.icDelay.try_emplace(L);
+    if (!applyDel(c, op, ic->second.d, ic->second.rj, ic->second.er)) return;
+    if ((size_t)L < S.timedOut.size()) S.timedOut[(size_t)L] = 1;
+    c.note(op, what);
 }
 
 // A limit in the module's time unit, as the violation report prints it.
@@ -235,8 +391,8 @@ inline void timingCheck(Ctx& c, const Op& op, const std::string& inst) {
         c.warn(&op, k + " needs " + std::to_string(need) + " value" + (need > 1 ? "s" : ""));
         return;
     }
-    if (!op.scond.empty() || !op.ccond.empty())
-        c.warn(&op, k + ": SCOND / CCOND are not matched; annotating as if they were absent");
+    if ((!op.scond.empty() || !op.ccond.empty()) && k != "SETUPHOLD" && k != "RECREM")
+        c.warn(&op, k + ": SCOND / CCOND belong to SETUPHOLD and RECREM; ignoring them");
     // SDF names the data signal first for SETUP, HOLD and SETUPHOLD, and the
     // reference first for the others (as SystemVerilog writes them).
     bool dataFirst = k == "SETUP" || k == "HOLD" || k == "SETUPHOLD";
@@ -258,6 +414,14 @@ inline void timingCheck(Ctx& c, const Op& op, const std::string& inst) {
         if (!m) continue;
         if (!match(tc.ev[tc.ref], *refP)) continue;
         if (dataP && tc.nev == 2 && !match(tc.ev[tc.data], *dataP)) continue;
+        // SCOND / CCOND: the timestamp and timecheck conditions of
+        // $setuphold / $recrem (31.9.2); they bind only to $setuphold and
+        // $recrem with the same conditions.
+        if ((k == "SETUPHOLD" || k == "RECREM") && (!op.scond.empty() || !op.ccond.empty())) {
+            if (tc.kind != TC_SETUPHOLD && tc.kind != TC_RECREM) continue;
+            if (!op.scond.empty() && tc.tsText != op.scond) continue;
+            if (!op.ccond.empty() && tc.tcText != op.ccond) continue;
+        }
         bool neg = tc.kind == TC_SETUPHOLD || tc.kind == TC_RECREM;   // 31.9: negative limits
         auto put = [&](int64_t& lim, int vi) {
             if (vi < 0 || !v[vi]) return;
@@ -317,14 +481,12 @@ inline int annotate(const SdfRequest& r, bool early) {
         c.log << "SDF " << r.file << " -> " << r.scope << " (" << (c.sel.mtm == 0 ? "MINIMUM" : c.sel.mtm == 2 ? "MAXIMUM" : "TYPICAL") << ")\n";
     for (const Op& op : f.ops) {
         // 32.7: pulse limits are not modeled; a delay's pulse limits follow it.
-        if (op.kind == sdf::PATHPULSE || op.kind == sdf::PATHPULSEPERCENT) {
-            c.warn(&op, "PATHPULSE / PATHPULSEPERCENT: pulse limits are not modeled (pulses shorter than the delay are rejected)");
-            continue;
-        }
         for (const std::string& inst : targets(c, op)) {
             switch (op.kind) {
                 case sdf::IOPATH: iopath(c, op, inst); break;
                 case sdf::DEVICE: device(c, op, inst); break;
+                case sdf::PATHPULSE:
+                case sdf::PATHPULSEPERCENT: pathPulse(c, op, inst); break;
                 case sdf::PORT:
                 case sdf::NETDELAY:
                 case sdf::INTERCONNECT: interconnect(c, op, inst); break;
@@ -345,6 +507,8 @@ inline void hook(const std::vector<std::string>& a) {
     for (size_t k = 0; k < a.size() && k < 7; k++) *f[k] = a[k];
     annotate(r, false);
     for (auto& [sg, d] : S.icDelay)
+        if ((size_t)sg < S.timedOut.size()) S.timedOut[(size_t)sg] = 1;
+    for (auto& [sg, d] : S.shadowOf)
         if ((size_t)sg < S.timedOut.size()) S.timedOut[(size_t)sg] = 1;
 }
 

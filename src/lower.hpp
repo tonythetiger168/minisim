@@ -7943,6 +7943,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             return;
         }
         i.drv = newDriver(i.sig);
+        if (linkFormal >= 0 && i.hi < 0) outLinks().push_back({linkFormal, i.sig, i.drv});
         lw.prog.emit(i);
         auto rs = readSet(lw.prog);
         bool loops = !rs.empty();
@@ -8096,6 +8097,44 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                   : tp.edgeIdentifier == EdgeKind::BothEdges ? 3 : 0;
         std::copy(d12.begin(), d12.end(), base.d);
         auto ins = tp.getInputs(), outs = tp.getOutputs();
+        // Pulse limits (30.7.1): PATHPULSE$in$out names the first input and
+        // output of this declaration and covers all its paths; PATHPULSE$
+        // covers every path of the module the others do not name. Without
+        // either, the +pulse_r / +pulse_e percentages of the delay (30.7.2).
+        for (int k = 0; k < 12; k++) { base.rj[k] = rejectOf(base.d[k]); base.er[k] = errorOf(base.d[k]); }
+        {
+            const SpecparamSymbol *mine = nullptr, *all = nullptr;
+            const Symbol* in0 = ins.empty() ? nullptr : sigOf(ins[0], "a path from this input").second;
+            const Symbol* out0 = outs.empty() ? nullptr : sigOf(outs[0], "a path to this output").second;
+            // slang marks only the two-value form as a path pulse; with one
+            // value PATHPULSE$a$y is a plain specparam, named the same way.
+            std::string in0n = ins.empty() ? "" : std::string(in0->name), out0n = outs.empty() ? "" : std::string(out0->name);
+            for (const Symbol& m : tp.getParentScope()->members()) {
+                if (m.kind != SymbolKind::Specparam) continue;
+                const auto& sp = m.as<SpecparamSymbol>();
+                std::string_view nm = sp.name;
+                if (!nm.starts_with("PATHPULSE$")) continue;
+                if (sp.isPathPulse && (sp.getPathSource() || sp.getPathDest())) {
+                    if (sp.getPathSource() == in0 && sp.getPathDest() == out0) mine = &sp;
+                    continue;
+                }
+                std::string rest(nm.substr(10));
+                if (rest.empty()) all = &sp;
+                else if (rest == in0n + "$" + out0n) mine = &sp;
+            }
+            if (const SpecparamSymbol* sp = mine ? mine : all) {
+                auto ticks = [&](const slang::ConstantValue& cv) -> uint64_t {
+                    double v = cv.isReal() ? (double)cv.real() : cv.isInteger() && !cv.integer().hasUnknown()
+                                   ? (double)*cv.integer().as<int64_t>() : 0.0;
+                    if (v < 0) v = 0;
+                    return (uint64_t)std::llround(v * (double)d.ticksPerUnit());
+                };
+                uint64_t r = ticks(sp->isPathPulse ? sp->getPulseRejectLimit() : sp->getValue());
+                uint64_t e = r;
+                if (sp->isPathPulse && !sp->getPulseErrorLimit().bad()) e = ticks(sp->getPulseErrorLimit());
+                for (int k = 0; k < 12; k++) { base.rj[k] = r; base.er[k] = std::max(e, r); }
+            }
+        }
         for (const Expression* o : outs) {
             auto [dst, osym] = sigOf(o, "a path to this output");
             if (osym->kind != SymbolKind::Net) Lowerer::unsupported("a path delay to a variable output");
@@ -8106,6 +8145,26 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 r.src = sigOf(i, "a path from this input").first;
                 r.dst = dst;
                 pathRecs().push_back(std::move(r));
+            }
+        }
+    }
+    // pulsestyle_onevent / pulsestyle_ondetect / showcancelled /
+    // noshowcancelled (30.7.4): the style of each path output named.
+    void handle(const slang::ast::PulseStyleSymbol& ps) {
+        using namespace slang::ast;
+        for (const Expression* t : ps.getTerminals()) {
+            const Expression& p = Lowerer::peel(*t);
+            const Symbol* sym = p.getSymbolReference();
+            if (p.kind == ExpressionKind::ElementSelect) sym = Lowerer::peel(p.as<ElementSelectExpression>().value()).getSymbolReference();
+            else if (p.kind == ExpressionKind::RangeSelect) sym = Lowerer::peel(p.as<RangeSelectExpression>().value()).getSymbolReference();
+            auto it = sym ? sigmap.find(sym) : sigmap.end();
+            if (it == sigmap.end()) continue;
+            uint8_t& st = pulseStyles()[it->second];
+            switch (ps.pulseStyleKind) {
+                case PulseStyleKind::OnEvent: st &= (uint8_t)~PS_DETECT; break;
+                case PulseStyleKind::OnDetect: st |= PS_DETECT; break;
+                case PulseStyleKind::ShowCancelled: st |= PS_SHOWCANCELLED; break;
+                case PulseStyleKind::NoShowCancelled: st &= (uint8_t)~PS_SHOWCANCELLED; break;
             }
         }
     }
@@ -8221,8 +8280,14 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         if (t.kind == TC_SETUPHOLD || t.kind == TC_RECREM) {
             // 31.9: timestamp and timecheck conditions, delayed reference and data.
-            if (nIdx + 1 < args.size() && args[nIdx + 1].expr) t.tsCond = lw.expr(*args[nIdx + 1].expr);
-            if (nIdx + 2 < args.size() && args[nIdx + 2].expr) t.tcCond = lw.expr(*args[nIdx + 2].expr);
+            if (nIdx + 1 < args.size() && args[nIdx + 1].expr) {
+                t.tsCond = lw.expr(*args[nIdx + 1].expr);
+                t.tsText = termText(*args[nIdx + 1].expr);
+            }
+            if (nIdx + 2 < args.size() && args[nIdx + 2].expr) {
+                t.tcCond = lw.expr(*args[nIdx + 2].expr);
+                t.tcText = termText(*args[nIdx + 2].expr);
+            }
             for (int k = 0; k < 2; k++) {
                 size_t ix = nIdx + 3 + (size_t)k;
                 if (ix >= args.size() || !args[ix].expr) continue;
@@ -8245,11 +8310,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         timingChecks().push_back(std::move(t));
     }
     // A path delay to a net that also has a net delay is not modeled (30.6).
-    void finishPaths() {
-        for (auto& p : pathRecs())
-            for (auto& nd : out.netDelays)
-                if (nd.first == p.dst) Lowerer::unsupported("a path delay to a net that also has a net delay");
-    }
+    void finishPaths() {}   // a net delay on a path output combines with the path delay (30.6)
     // `wire y = a & b;` (IEEE 1800-2023 10.3.1) is a continuous assignment to y.
     // `wire #d w;` is a net delay: every change of w's resolved value takes
     // d to arrive (28.16). `wire #d w = a;` is instead a delayed continuous
@@ -8303,6 +8364,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
 
     const std::vector<uint64_t>* gateDelay = nullptr;   // the delays of the gate being lowered
+    int curGate = -1;                                    // its gateRecs() entry
+    int linkFormal = -1;                                 // the output port being connected (outLinks)
     void driveOut(const slang::ast::Expression& out, E rhs, uint8_t s0, uint8_t s1) {
         Lowerer lw(sigmap);
         prep(lw);
@@ -8316,6 +8379,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (tgt->kind == slang::ast::ExpressionKind::Assignment)
             tgt = &tgt->as<slang::ast::AssignmentExpression>().left();
         lw.lhs(*tgt, i);
+        if (curGate >= 0) {
+            i.gate = curGate;
+            auto& o = gateRecs()[(size_t)curGate].outs;
+            if (i.sig >= 0 && std::find(o.begin(), o.end(), i.sig) == o.end()) o.push_back(i.sig);
+        }
         i.e = rhs;
         finishAssign(lw, i);
     }
@@ -8399,7 +8467,18 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             gdly = dl.delays3(g.getDelay());
         }
         gateDelay = &gdly;
-        struct Reset { const std::vector<uint64_t>*& p; ~Reset() { p = nullptr; } } reset{gateDelay};
+        struct Reset { const std::vector<uint64_t>*& p; int& g; ~Reset() { p = nullptr; g = -1; } } reset{gateDelay, curGate};
+        {
+            GateRec gr;
+            gr.inst = Lowerer::instPath(g.getParentScope());
+            gr.name = std::string(g.name);
+            std::vector<uint64_t> d3 = gdly;
+            if (d3.size() > 3) d3.resize(3);
+            std::vector<uint64_t> d12 = expand12(d3);
+            std::copy(d12.begin(), d12.end(), gr.d);
+            curGate = (int)gateRecs().size();
+            gateRecs().push_back(std::move(gr));
+        }
         std::string_view name = g.primitiveType.name;
         auto ports = g.getPortConnections();
         auto [ds0, ds1] = g.getDriveStrength();
@@ -8789,7 +8868,15 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             auto formal = portFormal(ps);
             if (!formal) continue;
             if (connectArrayElem(inst, ps, *ext, *formal)) continue;
+            // The links of a port to a whole net, for INTERCONNECT (32.4.4).
+            auto inLink = [&](const Expression& x) {
+                const Symbol* sym = Lowerer::peel(x).getSymbolReference();
+                if (!sym || Lowerer::peel(x).kind == ExpressionKind::ElementSelect || Lowerer::peel(x).kind == ExpressionKind::RangeSelect) return;
+                auto it = sigmap.find(sym);
+                if (it != sigmap.end() && (int)x.type->getBitWidth() == formal->w) inLinks()[formal->sig] = it->second;
+            };
             if (ps.direction == ArgumentDirection::In) {
+                inLink(*ext);
                 driveSig(formal->sig, *ext);
                 continue;
             }
@@ -8798,8 +8885,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (ext->kind != ExpressionKind::Assignment)
                 Lowerer::unsupported("output port connection");
             const auto& asg = ext->as<AssignmentExpression>();
+            if (Lowerer::peel(asg.left()).kind != ExpressionKind::Concatenation) linkFormal = formal->sig;
             driveActual(asg, *formal);
+            linkFormal = -1;
             if (ps.direction != ArgumentDirection::InOut) continue;
+            inLink(asg.left());
             if (!ps.isNetPort()) Lowerer::unsupported("inout port that is not a net");
             if ((int)asg.left().type->getBitWidth() != formal->w)
                 Lowerer::unsupported("inout width mismatch");
@@ -9390,6 +9480,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     pathRecs().clear();
     portRecs().clear();
     instCells().clear();
+    gateRecs().clear();
+    pulseStyles().clear();
+    outLinks().clear();
+    inLinks().clear();
     std::erase_if(sdfRequests(), [](const SdfRequest& r) { return !r.cli; });
     sdfAtRunTime() = false;
     sdfLabels(comp);
