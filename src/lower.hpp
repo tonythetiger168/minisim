@@ -3818,7 +3818,7 @@ struct Lowerer {
     }
     // Whether a stream has a container operand, so its width is known only
     // at run time.
-    bool streamIsDyn(const slang::ast::StreamingConcatenationExpression& sc) const {
+    bool streamIsDyn(const slang::ast::StreamingConcatenationExpression& sc) {
         using namespace slang::ast;
         for (auto& st : sc.streams()) {
             const Expression& op = peel(*st.operand);
