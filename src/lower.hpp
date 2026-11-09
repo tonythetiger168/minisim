@@ -3470,10 +3470,39 @@ inline void Lowerer::declLocals(const slang::ast::Statement& st, FrameLayout* L)
     st.visit(w);
 }
 
+// An instance's name; an element of an instance array (23.3.3) is named with
+// its indices, "u[2]" or "m[1][0]", like its hierarchical path.
+inline std::string instName(const slang::ast::InstanceSymbol& inst) {
+    if (inst.arrayPath.empty()) return std::string(inst.name);
+    std::string_view name;
+    for (const slang::ast::Scope* sc = inst.getParentScope();
+         sc && sc->asSymbol().kind == slang::ast::SymbolKind::InstanceArray; sc = sc->asSymbol().getParentScope())
+        name = sc->asSymbol().name;
+    slang::SmallVector<slang::ConstantRange, 4> dims;
+    inst.getArrayDimensions(dims);
+    std::string r(name);
+    for (size_t d = 0; d < dims.size() && d < inst.arrayPath.size(); d++)
+        r += "[" + std::to_string((int64_t)inst.arrayPath[d] + dims[d].lower()) + "]";
+    return r;
+}
+// Where an element sits in its instance array, counted from the left-most
+// index of each dimension, row-major (23.3.3.5), and how many there are.
+inline std::pair<int, int> instArrayPos(const slang::ast::InstanceSymbol& inst) {
+    slang::SmallVector<slang::ConstantRange, 4> dims;
+    inst.getArrayDimensions(dims);
+    int pos = 0, n = 1;
+    for (size_t d = 0; d < dims.size() && d < inst.arrayPath.size(); d++) {
+        int idx = (int)inst.arrayPath[d] + dims[d].lower();
+        int p = dims[d].isDescending() ? dims[d].left - idx : idx - dims[d].left;
+        pos = pos * (int)dims[d].width() + p;
+        n *= (int)dims[d].width();
+    }
+    return {pos, n};
+}
+
 inline bool enterInstance(const slang::ast::InstanceSymbol& inst) {
     using namespace slang::ast;
     if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return false;
-    if (!inst.arrayPath.empty()) Lowerer::unsupported("instance array");
     // An interface instance (25.3) is lowered like a module instance: its
     // signals are named "bus.data", and its processes and tasks run as usual.
     if (!inst.isTopLevel() && !inst.isModule() && !inst.isInterface()) Lowerer::unsupported("non-module instance");
@@ -3615,8 +3644,9 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         if (!enterInstance(inst)) return;
         std::string saved = prefix;
         if (!inst.isTopLevel()) {
-            if (inst.name.empty()) Lowerer::unsupported("unnamed instance");
-            prefix += std::string(inst.name);
+            std::string nm = instName(inst);
+            if (nm.empty()) Lowerer::unsupported("unnamed instance");
+            prefix += nm;
             prefix.push_back('.');
         }
         visitDefault(inst);
@@ -3977,6 +4007,45 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         finishAssign(lw, i);
     }
 
+    // A port of an element of a multidimensional instance array (23.3.3.5).
+    // slang slices a packed actual N times the port width for each element,
+    // but for two or more dimensions of different sizes it picks the wrong
+    // part (it scales by the previous dimension's size). Here the part is
+    // taken again from the whole actual: the left-most element (row-major,
+    // left-most index of each dimension first) gets the most significant
+    // bits. Returns false to let the normal path connect slang's expression.
+    bool connectArrayElem(const slang::ast::InstanceSymbol& inst, const slang::ast::PortSymbol& ps,
+                          const slang::ast::Expression& ext, const Formal& formal) {
+        using namespace slang::ast;
+        if (inst.arrayPath.size() < 2) return false;
+        bool in = ps.direction == ArgumentDirection::In;
+        if (!in && ps.direction != ArgumentDirection::Out) return false;
+        if (!in && ext.kind != ExpressionKind::Assignment) return false;
+        const Expression& act = in ? Lowerer::peel(ext) : ext.as<AssignmentExpression>().left();
+        if (act.kind != ExpressionKind::RangeSelect) return false;
+        const Expression& whole = act.as<RangeSelectExpression>().value();
+        auto [pos, n] = instArrayPos(inst);
+        int W = (int)whole.type->getBitWidth();
+        if (whole.type->isUnpackedArray() || W != n * formal.w) return false;
+        int hi = W - 1 - pos * formal.w, lo = hi - formal.w + 1;
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i; i.k = IK::Assign;
+        if (in) {
+            i.sig = formal.sig;
+            i.e = slice(lw.expr(whole), hi, lo);
+        } else {
+            lw.lhs(whole, i);
+            if (i.arr || i.bidx || i.dyn >= 0 || i.sig < 0) return false;
+            int base = i.hi >= 0 ? i.lo : 0;
+            i.lo = base + lo;
+            i.hi = base + hi;
+            i.e = ref(formal.sig, formal.sgn);
+        }
+        finishAssign(lw, i);
+        return true;
+    }
+
     void connectInstance(const slang::ast::InstanceSymbol& inst) {
         using namespace slang::ast;
         if (inst.isTopLevel()) return;
@@ -3989,6 +4058,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (!ext || ps.isNullPort) continue;
             auto formal = portFormal(ps);
             if (!formal) continue;
+            if (connectArrayElem(inst, ps, *ext, *formal)) continue;
             if (ps.direction == ArgumentDirection::In) {
                 driveSig(formal->sig, *ext);
                 continue;
