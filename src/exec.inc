@@ -20,7 +20,7 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
         }
         int64_t off = i.arr->offset(idx);
         if (off < 0) return false;
-        sig = R(i.arr->base + (int)off);
+        sig = R(i.arr->base) + (int)off;
     }
     if (i.bidx) {
         Val v = eval(i.bidx, rd);
@@ -57,7 +57,7 @@ static void writeMem(const Instr& i) {
     for (int64_t ad = start;; ad += step) {
         int64_t off = a.offset({ad});
         if (off >= 0) {
-            Val v = S.get(R(a.base + (int)off));
+            Val v = S.get(R(a.base) + (int)off);
             v.sgn = false;
             int bits = i.hex ? 4 : 1;
             int n = (a.elemW + bits - 1) / bits;
@@ -144,7 +144,7 @@ static void readMem(const Instr& i) {
                 acc.v &= ~acc.x; acc.x = acc.z = 0;
                 for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
             }
-            S.set(R(a.base + (int)off), acc);
+            S.set(R(a.base) + (int)off, acc);
             addr += step;
             words++;
             continue;
@@ -164,7 +164,7 @@ static void readMem(const Instr& i) {
         int64_t off = a.offset({addr});
         if (off < 0) break;
         if (a.twoState) { v &= ~x; x = z = 0; }
-        S.set(R(a.base + (int)off), make(v, x, a.elemW, z));
+        S.set(R(a.base) + (int)off, make(v, x, a.elemW, z));
         addr += step;
         words++;
     }
@@ -311,6 +311,29 @@ inline void dynExec(const Instr& i) {
     dynBump(sig);
 }
 
+// new (8.7) and a shallow copy `new h` (8.12). Objects are never freed.
+inline void newObject(const Instr& i) {
+    int src = 0, cls = i.hi;
+    if (i.e) {
+        Val h = eval(i.e, rd);
+        if (h.x || !h.v) nullAccess();
+        src = (int)h.v;
+        cls = (int)S.sigs[src].val.v;
+    }
+    const FrameLayout& L = *classRt()[(size_t)cls].lay;
+    int obj = g_allocSigs(L);
+    g_initSigs(L, obj);
+    if (src)
+        for (size_t k = 0; k < L.w.size(); k++) S.sigs[obj + (int)k].val = S.sigs[src + (int)k].val;
+    if (src)
+        for (auto& [off, o] : L.dyn) dynStore()[obj + off] = dynStore()[src + off];
+    // Its own random generator (18.14.3): seeded from the $urandom stream, or
+    // the source's state for a copy.
+    if (src) objRng()[obj] = objRng()[src];
+    else { uint64_t a = urandomNext(urandomState()), b = urandomNext(urandomState()); objRng()[obj] = seedState(a << 32 | b); }
+    S.set(R(i.sig), make((uint64_t)obj, 0, 64));
+}
+
 struct JoinState {
     int left = 0;          // branches still running
     int join = 0;          // 0 join, 1 join_any, 2 join_none
@@ -377,6 +400,8 @@ struct WaitFork {
 };
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+static int doRandomize(int obj, const RandCall* rc);   // rand.inc
+static void randModeAll(int obj, bool blocks, bool on);
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
     Task t = exec(p, c, std::move(fr));
     c->h = t.h;
@@ -853,6 +878,28 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
+            case IK::New: newObject(i); pc++; break;
+            case IK::Randomize: {   // 18.6, 18.12
+                int obj = 0;
+                if (i.e) {
+                    Val h = eval(i.e, rd);
+                    if (h.x || !h.v) nullAccess();
+                    obj = (int)h.v;
+                    if (i.rc && i.rc->objTmp >= 0) S.set(R(i.rc->objTmp), make((uint64_t)obj, 0, 64));
+                }
+                int r = doRandomize(obj, i.rc.get());
+                g_fr = fr.get();
+                g_ret = lastRet.get();
+                if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true));
+                pc++; break;
+            }
+            case IK::RandMode: {   // obj.rand_mode(v) / obj.constraint_mode(v) (18.8, 18.9)
+                Val h = eval(i.e, rd);
+                if (h.x || !h.v) nullAccess();
+                Val on = eval(i.de, rd);   // the on / off value
+                randModeAll((int)h.v, i.hi != 0, truth(on) == 1);
+                pc++; break;
+            }
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = i.target; }
@@ -903,10 +950,44 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Call: {
                 const Prog* callee = i.callee;
                 if (i.lay) {   // an automatic subroutine: a new frame (13.3.2)
-                    FrameP nf = newFrame(i.lay, nullptr, fr ? fr->self : 0);
+                    int self = fr ? fr->self : 0;
+                    const FrameLayout* lay = i.lay;
+                    if (i.noSelf) self = 0;
+                    else if (i.self) {
+                        Val h = eval(i.self, rd);
+                        if (h.x || !h.v) nullAccess();
+                        self = (int)h.v;
+                    }
+                    if (i.vslot >= 0 || i.vslot <= -2) {   // virtual (8.20): the body of the object's own class
+                        if (!self) nullAccess();
+                        const ClassRt& cr = classRt()[(size_t)S.sigs[self].val.v];
+                        int vs = i.vslot;
+                        if (vs <= -2) {   // an interface class method (8.26): k = -2 - vslot
+                            size_t k = (size_t)(-2 - vs);
+                            vs = k < cr.imap.size() ? cr.imap[k] : -1;
+                            if (vs < 0) {
+                                cerr << "error: class " << cr.name << " has no implementation of an interface method\n";
+                                exit(1);
+                            }
+                        }
+                        const auto& ve = cr.vt[(size_t)vs];
+                        if (!ve.first) {
+                            cerr << "error: call of a pure virtual method at time " << S.now << "\n";
+                            exit(1);
+                        }
+                        callee = ve.first;
+                        lay = ve.second;
+                    }
+                    FrameP nf = newFrame(lay, nullptr, self);
                     for (auto& [off, e] : i.init) {   // arguments, read in the caller's frame
                         Val v = eval(e, rd);
                         S.set(nf->base + off, v);
+                    }
+                    for (auto [off, src] : i.dinit) {   // container arguments (7.7)
+                        auto& d = dynStore()[nf->base + off];
+                        const auto& sv = dynStore()[R(src)];
+                        if (d.kind == 2) d.map = sv.map;
+                        else { d.vec = sv.kind == 2 ? std::vector<Val>{} : sv.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
                     }
                     rets.push_back({p, pc + 1, fr});
                     fr = std::move(nf);
