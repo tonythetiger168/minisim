@@ -82,6 +82,9 @@ struct Instr {
     // container dsrc, a result signal dres, and the key variable dkey.
     // Assign with dyn >= 0 writes element args[0] of container dyn.
     int dcmd = 0, dsrc = -1, dres = -1, dkey = -1, dyn = -1;
+    // A driver (drv >= 0) with a delay (10.3.3, 28.16): 1 to 3 values in
+    // ticks, rise / fall / turn-off. Updates are inertial.
+    std::vector<uint64_t> dly;
     int pw = 0;
     bool pdown = false;
     bool hex = false;
@@ -179,7 +182,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
         if (p.code[i].k != IK::Assign) return false;
         // A target chosen at run time (a[i] = ..., v[i] = ...) has no fixed output signal.
         if (p.code[i].arr || !p.code[i].aidx.empty() || p.code[i].bidx) return false;
-        if (p.code[i].de || p.code[i].delay) return false;
+        if (p.code[i].de || p.code[i].delay || !p.code[i].dly.empty()) return false;
         bool seen = false;
         for (int o : c.outs) seen |= o == p.code[i].sig;
         if (!seen) c.outs.push_back(p.code[i].sig);

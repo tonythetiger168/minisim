@@ -340,7 +340,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 Val v = eval(i.e, rd);
                 if (i.drv >= 0) {
                     if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
-                    S.drive(i.sig, i.drv, v, i.s0, i.s1);
+                    if (!i.dly.empty()) S.driveLater(i.sig, i.drv, v, i.s0, i.s1, i.dly);   // assign #d (10.3.3)
+                    else S.drive(i.sig, i.drv, v, i.s0, i.s1);
                     pc++; break;
                 }
                 if (i.dyn >= 0) {   // q[i] = v, aa[key] = v
@@ -397,6 +398,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 // process already queued runs until its next system task;
                 // that task itself runs (Icarus 13).
                 S.finished = true;
+                if (i.hi > S.exitCode) S.exitCode = i.hi;   // $fatal
                 goto done;
             case IK::Call: {
                 const Prog* callee = i.callee;

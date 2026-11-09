@@ -203,6 +203,7 @@ struct Sim {
     map<uint64_t, vector<Handle>> wheel;             // time wheel
     uint64_t now = 0, lastDump = ~0ULL;
     bool finished = false;
+    int exitCode = 0;                                // the process exit status ($fatal sets 1)
     string vcdPath = "dump.vcd";                     // empty: no waveform
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
@@ -483,14 +484,93 @@ struct Sim {
         g.drv[d].s1 = (uint8_t)s1;
         // One driver that drives both 0 and 1 resolves to its own value
         // (X stays X, Z stays Z). Skip the per-bit strength walk.
-        if (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) { set(s, g.drv[0].v); return; }
-        set(s, resolveDrives(g.drv.data(), g.drv.size(), g.w));
+        Val r = (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) ? g.drv[0].v
+                                                                       : resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        if (!netDelay.empty()) {   // wire #d w (28.16): the resolved value arrives d later
+            auto nd = netDelay.find(s);
+            if (nd != netDelay.end()) { schedule(s, -1, r, g.val, nd->second, STR_STRONG, STR_STRONG); return; }
+        }
+        set(s, r);
     }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
                                : clipRead(sigs[s].val, sigs[s].w);
     }
     void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }
+
+    // Delayed drivers and net delays (10.3.3, 28.16). Each (signal, driver)
+    // has at most one update in flight; d = -1 is the net delay of signal s,
+    // applied to its resolved value. A new value that differs from the one in
+    // flight cancels it, and one equal to the current value schedules nothing.
+    unordered_map<int, vector<uint64_t>> netDelay;   // signal -> rise, fall, turn-off ticks
+    struct Pend { Val v; uint64_t gen = 0; bool live = false; };
+    map<pair<int, int>, Pend> pend;
+    struct LaterDrv { int s, d; uint64_t gen; uint8_t s0, s1; };
+    map<uint64_t, vector<LaterDrv>> laterDrv;
+    uint64_t pendGen = 0;
+    static bool sameVal(const Val& a, const Val& b) {
+        return a.w == b.w && a == b;
+    }
+    // Table 28-9 for one bit (0, 1, x = 2, z = 3); 10.3.3 for vectors.
+    static uint64_t pickDelay(const vector<uint64_t>& dl, const Val& from, const Val& to) {
+        size_t n = dl.size();
+        if (n == 1) return dl[0];
+        uint64_t rise = dl[0], fall = dl[1];
+        uint64_t off = n == 3 ? dl[2] : std::min(rise, fall);
+        uint64_t lo = std::min({rise, fall, off});
+        if (to.w == 1) {
+            int b = (to.x & 1) ? ((to.z & 1) ? 3 : 2) : (int)(to.v & 1);
+            return b == 1 ? rise : b == 0 ? fall : b == 3 ? off : lo;
+        }
+        bool allZ = true, zero = true, fromZero = true;
+        for (int k = 0; k < to.w; k++) {
+            int t = bitAt(to, k), f = bitAt(from, k);   // 0, 1, 2 = x, 3 = z
+            if (t != 3) allZ = false;
+            if (t != 0) zero = false;
+            if (f != 0) fromZero = false;
+        }
+        if (allZ) return off;
+        if (zero && !fromZero) return fall;
+        return rise;
+    }
+    void schedule(int s, int d, Val v, const Val& cur, const vector<uint64_t>& dl, uint8_t s0, uint8_t s1) {
+        auto& p = pend[{s, d}];
+        if (p.live) {
+            if (sameVal(v, p.v)) return;   // already on its way
+            p.live = false;
+        }
+        if (sameVal(v, cur)) return;
+        uint64_t t = pickDelay(dl, cur, v);
+        if (t == 0) { apply(s, d, v, s0, s1); return; }
+        p.v = v;
+        p.gen = ++pendGen;
+        p.live = true;
+        laterDrv[now + t].push_back({s, d, p.gen, s0, s1});
+        wheel[now + t];
+    }
+    void apply(int s, int d, const Val& v, uint8_t s0, uint8_t s1) {
+        if (d >= 0) drive(s, d, v, s0, s1);
+        else set(s, v);
+    }
+    // A driver with a delay: schedule its new value.
+    void driveLater(int s, int d, Val v, uint8_t s0, uint8_t s1, const vector<uint64_t>& dl) {
+        auto& g = sigs[s];
+        Val nv = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
+        schedule(s, d, nv, g.drv[d].v, dl, s0, s1);
+    }
+    void runLaterDrv() {
+        auto it = laterDrv.find(now);
+        if (it == laterDrv.end()) return;
+        auto batch = std::move(it->second);
+        laterDrv.erase(it);
+        for (auto& l : batch) {
+            auto pi = pend.find({l.s, l.d});
+            if (pi == pend.end() || !pi->second.live || pi->second.gen != l.gen) continue;   // cancelled
+            Val v = pi->second.v;
+            pi->second.live = false;
+            apply(l.s, l.d, v, l.s0, l.s1);
+        }
+    }
     // a <= #d b: an NBA in the slot d ticks from now (9.4.5). The empty wheel
     // entry makes the kernel stop at that time even if nothing else does.
     map<uint64_t, vector<NbaItem>> laterNba;
@@ -849,7 +929,7 @@ struct Sim {
     // final blocks run in the same time, in one pass (9.2.3).
     void runFinal(const vector<Task>& ts) {
         if (ts.empty()) return;
-        wheel.clear(); laterNba.clear(); active.clear(); inactive.clear(); nbaq.clear();
+        wheel.clear(); laterNba.clear(); laterDrv.clear(); active.clear(); inactive.clear(); nbaq.clear();
         for (int id : seqq) seqPend[id] = 0;
         seqq.clear();
         finished = false;
@@ -863,13 +943,14 @@ struct Sim {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || !combq.empty();
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty();
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
             if (!any) continue;   // only disabled processes were waiting here
             now = t;
             g_simTime = now;
+            runLaterDrv();   // delayed continuous assignments and net delays due now (active region)
             if (auto ln = laterNba.find(now); ln != laterNba.end()) {
                 for (auto& n : ln->second) nbaq.push_back(n);
                 laterNba.erase(ln);

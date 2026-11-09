@@ -1,6 +1,5 @@
 // IEEE 1800-2023 28.16: Gate delays, with separate rise and fall values
 // (28.16).
-//! xfail: gate delays are errors
 module top;
   logic a = 0;
   wire o1, o2;

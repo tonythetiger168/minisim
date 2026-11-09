@@ -66,6 +66,7 @@
 #include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/types/AllTypes.h"
+#include "slang/text/SourceManager.h"
 
 // Fixed-size unpacked arrays (7.4), keyed by the array's symbol. SigCollector
 // fills it; Lowerer reads it. lower() clears it first, since symbols from an
@@ -73,6 +74,8 @@
 using ArrMap = std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>>;
 inline ArrMap& arrMap() { static ArrMap m; return m; }
 constexpr int64_t kMaxArrayElems = 1 << 20;
+// The design's source manager, for file names and line numbers in messages.
+inline const slang::SourceManager*& srcMgr() { static const slang::SourceManager* m = nullptr; return m; }
 // Dynamic arrays, queues, and associative arrays: symbol -> handle signal.
 inline std::unordered_map<const slang::ast::Symbol*, int>& dynMap() {
     static std::unordered_map<const slang::ast::Symbol*, int> m;
@@ -141,6 +144,7 @@ struct LowerResult {
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
+    std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
     std::string timescale() const {
@@ -222,8 +226,36 @@ struct Lowerer {
     }
     // #d: a constant becomes Instr::delay; anything else is an expression
     // evaluated when the statement runs (9.4.1). x or z waits zero time.
+    // The rise / fall / turn-off delays of a continuous assign, gate or net
+    // (10.3.3, 28.16), in ticks. They must be constant.
+    std::vector<uint64_t> delays3(const slang::ast::TimingControl* tc) {
+        using namespace slang::ast;
+        std::vector<uint64_t> out;
+        if (!tc) return out;
+        auto one = [&](const Expression& e) {
+            Instr t;
+            delayInto(e, t);
+            if (t.de) unsupported("a delay on a continuous assignment, gate or net that is not constant");
+            out.push_back(t.delay);
+        };
+        if (tc->kind == TimingControlKind::Delay) one(tc->as<DelayControl>().expr);
+        else if (tc->kind == TimingControlKind::Delay3) {
+            const auto& d3 = tc->as<Delay3Control>();
+            one(d3.expr1);
+            if (d3.expr2) one(*d3.expr2);
+            if (d3.expr3) one(*d3.expr3);
+        } else unsupported("this kind of delay");
+        bool any = false;
+        for (auto v : out) any |= v != 0;
+        if (!any) out.clear();   // #0 is no delay
+        return out;
+    }
     void delayInto(const slang::ast::Expression& d, Instr& i) {
         using namespace slang::ast;
+        if (peel(d).kind == ExpressionKind::MinTypMax) {   // #(1:2:3) uses the typical value (11.11)
+            delayInto(peel(d).as<MinTypMaxExpression>().typ(), i);
+            return;
+        }
         const Expression& x = peel(d);
         if (x.kind == ExpressionKind::RealLiteral) { i.delay = ticksOf(x.as<RealLiteral>().getValue()); return; }
         if (x.kind == ExpressionKind::TimeLiteral) { i.delay = ticksOf(x.as<TimeLiteral>().getValue()); return; }
@@ -1105,6 +1137,8 @@ struct Lowerer {
                 needWidth(dst);
                 return expr(c.operand(), ExprCtx{dst, fill, tag, true});
             }
+            case ExpressionKind::MinTypMax:   // (1:2:3) is its typical value (11.11)
+                return expr(e.as<MinTypMaxExpression>().typ(), ctx);
             case ExpressionKind::UnboundedLiteral: {   // q[$]: the last index (7.10.1)
                 if (dollarQ < 0) unsupported("$ outside a queue index");
                 Val one = mk(1, 32); one.sgn = true;
@@ -1596,6 +1630,44 @@ struct Lowerer {
         }
     }
 
+    // $fatal / $error / $warning / $info (20.10): a header line with the
+    // severity, the file and line of the call, its scope, and the time, then
+    // the user's message (formatted like $display) if there is one. $fatal
+    // then ends the run like $finish, and msim exits with status 1.
+    void severity(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (n == "$fatal" && !args.empty()) {
+            const Expression& a0 = peel(*args[0]);
+            if (a0.kind != ExpressionKind::StringLiteral) args = args.subspan(1);   // finish_number
+        }
+        std::string file = "?";
+        size_t line = 0;
+        if (const auto* sm = srcMgr()) {
+            auto loc = sm->getFullyOriginalLoc(call.sourceRange.start());
+            file = std::string(sm->getFileName(loc));
+            line = sm->getLineNumber(loc);
+        }
+        const char* sev = n == "$fatal" ? "Fatal" : n == "$error" ? "Error" : n == "$warning" ? "Warning" : "Info";
+        Instr i; i.k = IK::Display;
+        hierName = scopeName(call);
+        std::string escFile;   // a '%' in a file name prints as itself
+        for (char c : file) { escFile += c; if (c == '%') escFile += '%'; }
+        i.fmt = substM(std::string(sev) + ": \"" + escFile + "\", " + std::to_string(line) + ": %m: at time %0t", hierName);
+        E t = node(Op::Time);
+        t->k = mk(ticksPerUnit(), 64);
+        i.args.push_back(t);
+        if (!args.empty()) {
+            i.fmt += "\n";
+            formatInto(args, 'd', i.fmt, i.args);
+        }
+        prog.emit(i);
+        if (n == "$fatal") {
+            Instr f; f.k = IK::Finish; f.hi = 1;   // exit status 1
+            prog.emit(f);
+        }
+    }
+
     // $display / $strobe / $monitor use the kernel format (a string of %b / %d /
     // literal text, arguments evaluated when the line is printed). $finish and
     // $stop stop the sim. Anything else is still ignored.
@@ -1605,6 +1677,7 @@ struct Lowerer {
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
+        if (n == "$fatal" || n == "$error" || n == "$warning" || n == "$info") { severity(call, n); return; }
         if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.push_back(x), aa.delete(k) ...
             dynMethod(call, false);
             return;
@@ -2385,12 +2458,27 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         init->prog.emit(i);
     }
     // `wire y = a & b;` (IEEE 1800-2023 10.3.1) is a continuous assignment to y.
+    // `wire #d w;` is a net delay: every change of w's resolved value takes
+    // d to arrive (28.16). `wire #d w = a;` is instead a delayed continuous
+    // assignment (10.3.3), and the net itself has no delay.
     void handle(const slang::ast::NetSymbol& n) {
         const slang::ast::Expression* e = n.getInitializer();
-        if (!e) return;
+        std::vector<uint64_t> dl;
+        if (n.getDelay()) {
+            Lowerer d(sigmap);
+            prep(d);
+            d.setScope(n.getParentScope());
+            dl = d.delays3(n.getDelay());
+        }
+        if (!e) {
+            if (!dl.empty()) out.netDelays.push_back({sigmap.at(&n), dl});
+            return;
+        }
         Lowerer lw(sigmap);
         prep(lw);
+        lw.setScope(n.getParentScope());
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&n); i.e = lw.expr(*e);
+        i.dly = dl;
         finishAssign(lw, i);
     }
     // Moves the initializer process to the front of `out.procs`.
@@ -2420,6 +2508,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.s1 = ds1 ? strengthOf(*ds1) : fb1;
     }
 
+    const std::vector<uint64_t>* gateDelay = nullptr;   // the delays of the gate being lowered
     void driveOut(const slang::ast::Expression& out, E rhs, uint8_t s0, uint8_t s1) {
         Lowerer lw(sigmap);
         prep(lw);
@@ -2427,6 +2516,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.k = IK::Assign;
         i.s0 = s0;
         i.s1 = s1;
+        if (gateDelay) i.dly = *gateDelay;
         // A gate output port is sometimes an assignment whose left side is the net.
         const slang::ast::Expression* tgt = &out;
         if (tgt->kind == slang::ast::ExpressionKind::Assignment)
@@ -2446,6 +2536,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         applyStrength(i, ds0, ds1, STR_STRONG, STR_STRONG);
         lw.lhs(a.left(), i);
         i.e = lw.expr(a.right());
+        lw.setScope(ca.getParentScope());
+        i.dly = lw.delays3(ca.getDelay());
         finishAssign(lw, i);
     }
 
@@ -2453,7 +2545,15 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     // as a continuous assign. Other primitives (mos, tran, bufif) do not.
     void handle(const slang::ast::PrimitiveInstanceSymbol& g) {
         using namespace slang::ast;
-        if (g.getDelay()) Lowerer::unsupported("gate delay");
+        std::vector<uint64_t> gdly;
+        {
+            Lowerer dl(sigmap);
+            prep(dl);
+            dl.setScope(g.getParentScope());
+            gdly = dl.delays3(g.getDelay());
+        }
+        gateDelay = &gdly;
+        struct Reset { const std::vector<uint64_t>*& p; ~Reset() { p = nullptr; } } reset{gateDelay};
         std::string_view name = g.primitiveType.name;
         auto ports = g.getPortConnections();
         auto [ds0, ds1] = g.getDriveStrength();
@@ -2650,6 +2750,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
     arrMap().clear();
+    srcMgr() = comp.getSourceManager();
     dynMap().clear();
     dynStore().clear();
     blockIds() = BlockIds{};

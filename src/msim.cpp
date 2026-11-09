@@ -35,6 +35,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -145,6 +146,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::string src;
     // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
     const char* why = !lowered.finals.empty() ? "a final block"
+                    : !lowered.netDelays.empty() ? "a net delay"
                     : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -289,6 +291,25 @@ int main(int argc, char** argv) {
 
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
+    for (auto& [s, d] : lowered.netDelays) S.netDelay[s] = d;
+    // A delayed driver is x until its first update arrives (10.3.3, 28.16),
+    // and so is a net with a net delay that has drivers.
+    {
+        std::set<int> touched;
+        for (auto& lp : lowered.procs)
+            for (auto& i : lp.prog.code)
+                if (!i.dly.empty() && i.drv >= 0) {
+                    int w = S.sigs[i.sig].w;
+                    S.sigs[i.sig].drv[i.drv].v = i.hi >= 0 ? v_insert(allz(w), allx(i.hi - i.lo + 1), i.hi, i.lo) : allx(w);
+                    touched.insert(i.sig);
+                }
+        for (int s : touched) {
+            auto& g = S.sigs[s];
+            g.val = resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        }
+        for (auto& [s, d] : lowered.netDelays)
+            if (!S.sigs[s].drv.empty()) S.sigs[s].val = allx(S.sigs[s].w);
+    }
     S.threads = threads;
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
@@ -315,5 +336,5 @@ int main(int argc, char** argv) {
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
     std::cout.flush();
-    return 0;
+    return S.exitCode;
 }
