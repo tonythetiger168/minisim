@@ -5463,10 +5463,10 @@ struct Lowerer {
                 prog.emit(i);
                 return;
             }
-            if (a.left().type->isEvent()) {   // e2 = e1: e2 names e1's event from now on (6.17)
-                const Expression& l = peel(a.left());
-                auto p = ValueExpressionBase::isKind(l.kind) ? eventPtr().find(&l.as<ValueExpressionBase>().symbol) : eventPtr().end();
-                if (p == eventPtr().end() || a.isNonBlocking() || a.timingControl) unsupported("this event assignment");
+            if (const Expression& l = peel(a.left()); a.left().type->isEvent() && ValueExpressionBase::isKind(l.kind) &&
+                eventPtr().count(&l.as<ValueExpressionBase>().symbol)) {   // e2 = e1: e2 names e1's event from now on (6.17)
+                auto p = eventPtr().find(&l.as<ValueExpressionBase>().symbol);
+                if (a.isNonBlocking() || a.timingControl) unsupported("this event assignment");
                 Instr i; i.k = IK::Assign; i.sig = p->second; i.e = eventAddr(a.right());
                 prog.emit(i);
                 return;
