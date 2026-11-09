@@ -2085,6 +2085,7 @@ struct FrameLayout {
     std::vector<int> w;              // width of each slot
     std::vector<Val> init;           // its value when the frame is allocated
     std::vector<std::pair<int, DynObj>> dyn;   // container slots and their empty shape
+    std::vector<int> noCopy;         // slots a shallow copy leaves at their initial value
     std::string name;                // for messages
     mutable std::vector<int> pool;   // first signal of each free frame
     int add(int width, Val v) { w.push_back(width); init.push_back(v); return (int)w.size() - 1; }

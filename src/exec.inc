@@ -343,6 +343,8 @@ inline void newObject(const Instr& i) {
     if (src)
         for (size_t k = 0; k < L.w.size(); k++) S.sigs[obj + (int)k].val = S.sigs[src + (int)k].val;
     if (src)
+        for (int off : L.noCopy) S.sigs[obj + off].val = L.init[(size_t)off];
+    if (src)
         for (auto& [off, o] : L.dyn) dynStore()[obj + off] = dynStore()[src + off];
     // Its own random generator (18.14.3): seeded from the $urandom stream, or
     // the source's state for a copy.
