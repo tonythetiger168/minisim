@@ -826,6 +826,7 @@ struct DynObj {
     std::shared_ptr<DynObj> elem;   // elements that are containers: their empty shape (an element holds the id)
     int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
     bool strKey = false;        // associative: string index
+    bool wideKey = false;       // associative: an integral index wider than 64 bits, kept as big-endian bytes in DynKey::s
     int keyW = 64;
     bool keySgn = true;
     DynKey key(const Val& k) const {
@@ -836,6 +837,15 @@ struct DynObj {
             d.s = v_str(t);
             return d;
         }
+        if (wideKey) {
+            Val t = v_resize(k, keyW, false);
+            for (int b = (keyW + 7) / 8 - 1; b >= 0; b--) {
+                unsigned char c = 0;
+                for (int j = 0; j < 8 && 8 * b + j < keyW; j++) if (bitAt(t, 8 * b + j) == 1) c |= (unsigned char)(1u << j);
+                d.s += (char)c;
+            }
+            return d;
+        }
         uint64_t u = k.v & ~k.x & mask(keyW);
         if (keySgn && keyW < 64 && ((u >> (keyW - 1)) & 1)) u |= ~mask(keyW);
         d.i = keySgn ? (int64_t)u : (int64_t)(u ^ (1ULL << 63));
@@ -843,6 +853,16 @@ struct DynObj {
     }
     Val keyVal(const DynKey& d) const {
         if (strKey) return mkstr(d.s);
+        if (wideKey) {
+            Val v = make(0, 0, keyW);
+            int nb = (int)d.s.size();
+            for (int i = 0; i < nb; i++) {
+                int b = nb - 1 - i;
+                unsigned char c = (unsigned char)d.s[(size_t)i];
+                for (int j = 0; j < 8 && 8 * b + j < keyW; j++) if ((c >> j) & 1) setBit(v, 8 * b + j, 1);
+            }
+            return finish(v);
+        }
         uint64_t u = keySgn ? (uint64_t)d.i : ((uint64_t)d.i ^ (1ULL << 63));
         Val v = make(u, 0, keyW);
         v.sgn = keySgn;
@@ -1368,6 +1388,8 @@ enum class Op {
     IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
     Addr,      // the signal id of slot `sig` of the object kids[0] names, or 0 for null
     AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    DynEq,     // containers sig and hi have the same size and equal elements (=== when lo)
+    DynStrJoin, // the strings in container sig, joined ({>>{q}} of a string queue, 11.4.14)
     VifSig     // 1 + the signal id of member hi of the interface instance the virtual interface kids[0] names, or 0 (25.9)
 };
 // System functions computed by Op::SysFn.
@@ -2150,6 +2172,22 @@ inline const FrameLayout& dynElemLay() {
     return l;
 }
 // A new element of d: an empty container when d holds containers.
+// Element containers of an associative array made by a read of a missing key:
+// not in the array until a write to them (dynAttach).
+struct DynPending { int outer; Val key; };
+inline std::unordered_map<int, DynPending>& dynPending() { static std::unordered_map<int, DynPending> m; return m; }
+inline std::map<std::pair<int, DynKey>, int>& dynPendingAt() { static std::map<std::pair<int, DynKey>, int> m; return m; }
+inline void dynAttach(int sig) {
+    if (dynPending().empty()) return;
+    auto it = dynPending().find(sig);
+    if (it == dynPending().end()) return;
+    DynPending p = it->second;
+    dynPending().erase(it);
+    DynObj& d = dynStore()[p.outer];
+    DynKey k = d.key(p.key);
+    dynPendingAt().erase(std::make_pair(p.outer, k));
+    d.map.emplace(k, make((uint64_t)sig, 0, 64));
+}
 inline Val dynNewElem(const DynObj& d) {
     if (!d.elem) return d.dflt;
     int id = g_allocSigs(dynElemLay());
@@ -2192,6 +2230,9 @@ inline bool (*g_isA)(int obj, int cls) = nullptr;   // is object obj of class cl
 // there gives null (the access that uses the address reports it, if it runs).
 inline int g_nullOk = 0;
 inline int g_nullSig = 0;   // a signal that always holds 0, read in place of a null object's slot
+// Set at exit: processes still waiting are destroyed after the lowered
+// design (and its frame layouts) is gone, so their frames are not recycled.
+inline bool g_framesDead = false;
 struct Frame {
     int base = 0;                    // first signal of this frame's slots
     int self = 0;                    // `this` (a handle), 0 outside methods
@@ -2199,7 +2240,7 @@ struct Frame {
     std::shared_ptr<Frame> up;       // the lexically enclosing frame (fork branches)
     Frame() = default;
     Frame(const Frame&) = delete;
-    ~Frame() { if (lay && !lay->w.empty()) lay->pool.push_back(base); }
+    ~Frame() { if (lay && !lay->w.empty() && !g_framesDead) lay->pool.push_back(base); }
 };
 using FrameP = std::shared_ptr<Frame>;
 inline FrameP newFrame(const FrameLayout* lay, FrameP up, int self) {
@@ -2354,7 +2395,9 @@ inline Val eval(const E& e, const Reader& rd) {
         }
         case Op::StrRep: {
             std::string one = v_str(k(0)), s;
-            for (int i = 0; i < e->hi; i++) s += one;
+            int64_t n = e->hi;
+            if (e->kids.size() > 1) { Val c = k(1); n = c.x ? 0 : v_to_i64(c); }   // a count known at run time
+            for (int64_t i = 0; i < n; i++) s += one;
             return mkstr(s);
         }
         case Op::StrCmp: {
@@ -2432,6 +2475,32 @@ inline Val eval(const E& e, const Reader& rd) {
             return mkstr(s);
         }
         case Op::DynGet: return dynStore()[R(e->sig)].get(k(0));
+        case Op::DynEq: {
+            const DynObj& a = dynStore()[R(e->sig)];
+            const DynObj& b = dynStore()[R(e->hi)];
+            if (a.size() != b.size()) return mk(0, 1);
+            bool unk = false;
+            auto one = [&](const Val& x, const Val& y) {
+                if (x.str || y.str) return v_str(x) == v_str(y);
+                Val r = e->lo ? v_case_eq(x, y) : v_eq(x, y);
+                if (r.x) { unk = true; return true; }
+                return (r.v & 1) != 0;
+            };
+            if (a.kind == 2 && b.kind == 2) {
+                for (auto ia = a.map.begin(), ib = b.map.begin(); ia != a.map.end(); ++ia, ++ib)
+                    if (ia->first.i != ib->first.i || ia->first.s != ib->first.s || !one(ia->second, ib->second)) return mk(0, 1);
+            } else if (a.kind != 2 && b.kind != 2) {
+                for (size_t k = 0; k < a.vec.size(); k++) if (!one(a.vec[k], b.vec[k])) return mk(0, 1);
+            } else return mk(0, 1);
+            return unk ? allx(1) : mk(1, 1);
+        }
+        case Op::DynStrJoin: {
+            auto& d = dynStore()[R(e->sig)];
+            std::string r;
+            if (d.kind == 2) for (auto& [key, v] : d.map) { Val t = v; t.str = true; r += v_str(t); }
+            else for (auto& v : d.vec) { Val t = v; t.str = true; r += v_str(t); }
+            return mkstr(r);
+        }
         case Op::ArrAddr: {
             std::vector<int64_t> idx;
             for (size_t n = 0; n < e->kids.size(); n++) {
@@ -2450,8 +2519,15 @@ inline Val eval(const E& e, const Reader& rd) {
             if (d.kind == 2) {
                 if (key.x && !d.strKey) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
                 auto it = d.map.find(d.key(key));
-                if (it == d.map.end()) it = d.map.emplace(d.key(key), dynNewElem(d)).first;   // made on first use
-                return make(it->second.v + 1, 0, 64);
+                if (it != d.map.end()) return make(it->second.v + 1, 0, 64);
+                // Missing: a new empty container that joins d only when written
+                // (dynAttach), so reading aa[k].size() does not add aa[k] (7.8.6).
+                auto at = std::make_pair(c, d.key(key));
+                if (auto p = dynPendingAt().find(at); p != dynPendingAt().end()) return make((uint64_t)p->second + 1, 0, 64);
+                int id = (int)dynNewElem(d).v;
+                dynPendingAt()[at] = id;
+                dynPending()[id] = {c, key};
+                return make((uint64_t)id + 1, 0, 64);
             }
             int64_t i = key.x ? -1 : v_to_i64(key);
             // Out of range: an empty container of its own (writes to it are lost).
@@ -2539,8 +2615,16 @@ inline Val eval(const E& e, const Reader& rd) {
             return r;
         }
         case Op::LogNot: return v_lnot(k(0));
-        case Op::LogAnd: return v_land(k(0), k(1));
-        case Op::LogOr: return v_lor(k(0), k(1));
+        case Op::LogAnd: {   // the right operand is not evaluated when the left is false (11.4.7)
+            Val a = k(0);
+            if (truth(a) == 0) return mk(0);
+            return v_land(a, k(1));
+        }
+        case Op::LogOr: {
+            Val a = k(0);
+            if (truth(a) == 1) return mk(1);
+            return v_lor(a, k(1));
+        }
         case Op::RedAnd: return v_red_and(k(0));
         case Op::RedOr: return v_red_or(k(0));
         case Op::RedXor: return v_red_xor(k(0));
@@ -2551,7 +2635,13 @@ inline Val eval(const E& e, const Reader& rd) {
             for (size_t i = 0; i < e->kids.size(); i++) parts.push_back(k((int)i));
             return v_concat(parts);
         }
-        case Op::Mux: return v_mux(k(0), k(1), k(2));
+        case Op::Mux: {   // only the selected operand is evaluated (11.4.11); an unknown condition merges both
+            Val c = k(0);
+            int t = truth(c);
+            if (t == 1) return k(1);
+            if (t == 0) return k(2);
+            return v_mux(c, k(1), k(2));
+        }
         case Op::Pow: return v_pow(k(0), k(1));
         case Op::Time: {   // k.v ticks per time unit of the calling module
             uint64_t d = e->k.v ? e->k.v : 1;
