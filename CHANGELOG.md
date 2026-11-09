@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Fixed-size arrays of containers (`int q[4][$]`) as class properties,
+  rand properties and automatic variables (7.4, 18.4), with `%p`, foreach,
+  object copies and access through a handle.
 - `unique` constraints over dynamic arrays, queues and associative arrays
   (18.5.5), alone or with scalars, under implications and on `m[i]`.
 - Rand containers of containers (18.4, 7.5): `rand int m[][]`, queues of
