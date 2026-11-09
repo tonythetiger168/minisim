@@ -43,8 +43,10 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -803,6 +805,57 @@ using Reader = std::function<Val(int)>;
 struct Expr;
 using E = std::shared_ptr<Expr>;
 inline std::string (*g_sformat)(const std::string&, const std::vector<E>&, const Reader&) = nullptr;
+// The contents of every dynamic container, by handle signal. A change bumps
+// the handle's value, so a process waiting on the container wakes.
+inline int64_t v_to_i64(Val v);
+struct DynKey {
+    int64_t i = 0;     // integral key (unsigned keys have the top bit flipped, so order holds)
+    std::string s;     // string key
+    bool operator<(const DynKey& o) const { return s != o.s ? s < o.s : i < o.i; }
+};
+struct DynObj {
+    int kind = 0;               // 0 dynamic array, 1 queue, 2 associative array
+    std::vector<Val> vec;
+    std::map<DynKey, Val> map;
+    Val dflt;                   // what a missing element reads as
+    int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
+    bool strKey = false;        // associative: string index
+    int keyW = 64;
+    bool keySgn = true;
+    DynKey key(const Val& k) const {
+        DynKey d;
+        if (strKey) {   // a signal holds a string as its pool id, without the flag
+            Val t = k;
+            t.str = true;
+            d.s = v_str(t);
+            return d;
+        }
+        uint64_t u = k.v & ~k.x & mask(keyW);
+        if (keySgn && keyW < 64 && ((u >> (keyW - 1)) & 1)) u |= ~mask(keyW);
+        d.i = keySgn ? (int64_t)u : (int64_t)(u ^ (1ULL << 63));
+        return d;
+    }
+    Val keyVal(const DynKey& d) const {
+        if (strKey) return mkstr(d.s);
+        uint64_t u = keySgn ? (uint64_t)d.i : ((uint64_t)d.i ^ (1ULL << 63));
+        Val v = make(u, 0, keyW);
+        v.sgn = keySgn;
+        return v;
+    }
+    size_t size() const { return kind == 2 ? map.size() : vec.size(); }
+    Val get(const Val& k) const {
+        if (kind == 2) {
+            if (k.x && !strKey) return dflt;
+            auto it = map.find(key(k));
+            return it == map.end() ? dflt : it->second;
+        }
+        if (k.x) return dflt;
+        int64_t i = v_to_i64(k);
+        if (i < 0 || i >= (int64_t)vec.size()) return dflt;
+        return vec[(size_t)i];
+    }
+};
+inline std::unordered_map<int, DynObj>& dynStore() { static std::unordered_map<int, DynObj> m; return m; }
 inline int ucmp(const Val& a, const Val& b) {
     int n = limbCount(a.w > b.w ? a.w : b.w);
     for (int i = n - 1; i >= 0; i--) {
@@ -1162,6 +1215,34 @@ inline SBit sbit_resolv(SBit a, SBit b) {
     return r;
 }
 
+// Net types that resolve differently from wire and tri (6.6.3-6.6.6).
+enum NetResolve : uint8_t { NR_WIRE, NR_WAND, NR_WOR, NR_TRI0, NR_TRI1, NR_TRIREG, NR_SUPPLY0, NR_SUPPLY1 };
+// The value of a net of kind k from its drivers; `prev` is its current value,
+// which a trireg keeps on bits no driver drives (charge storage, 6.6.4).
+inline Val resolveDrives(const Drv* d, size_t n, int w);
+inline Val resolveNet(uint8_t k, const Drv* d, size_t n, int w, const Val& prev) {
+    Val r = make(0, 0, w);
+    for (int b = 0; b < w; b++) {
+        int t = 3;
+        if (k == NR_SUPPLY0) t = 0;
+        else if (k == NR_SUPPLY1) t = 1;
+        else if (k == NR_WAND || k == NR_WOR) {   // wired AND / OR (6.6.3): z drivers do not take part
+            bool any0 = false, any1 = false, anyx = false;
+            for (size_t i = 0; i < n; i++) {
+                int v = bitAt(d[i].v, b);
+                if (v == 0) any0 = true; else if (v == 1) any1 = true; else if (v == 2) anyx = true;
+            }
+            if (k == NR_WAND) t = any0 ? 0 : anyx ? 2 : any1 ? 1 : 3;
+            else t = any1 ? 1 : anyx ? 2 : any0 ? 0 : 3;
+        } else {
+            t = 3;
+            if (n) t = bitAt(resolveDrives(d, n, w), b);
+            if (t == 3) t = k == NR_TRI0 ? 0 : k == NR_TRI1 ? 1 : k == NR_TRIREG ? bitAt(prev, b) : 3;
+        }
+        setBit(r, b, t);
+    }
+    return r;
+}
 inline Val resolveDrives(const Drv* d, size_t n, int w) {
     if (w > 64) {
         Val r = make(0, 0, w);
@@ -1227,9 +1308,41 @@ enum class Op {
     StrCmp,    // hi as FCmp: <, <=, >, >=, ==, !=
     StrMethod, // hi: StrFn; kid 0 is the string
     SFormat,   // $sformatf: fmt, then kids as the arguments
+    // Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8). sig is the
+    // container's handle signal; its contents live in dynStore().
+    DynGet,    // element kids[0] (index or key); a missing one reads the default
+    DynSize,   // size() / num()
+    DynExists, // exists(kids[0])
+    DynReduce, // hi: 0 sum, 1 product, 2 and, 3 or, 4 xor (7.12.3), at k.w bits
     ArrRead,   // element of an unpacked array; kids are one index per dimension
-    DynSlice   // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
+    DynSlice,  // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
+    SysFn      // hi: a SysFnId; kids are its arguments
 };
+// System functions computed by Op::SysFn.
+enum SysFnId : int {
+    SF_CLOG2,        // $clog2 (20.8.1)
+    SF_COUNTBITS,    // $countbits (20.9): lo is a mask of 1 << {0, 1, x=2, z=3}
+    SF_RANDOM,       // $random with no seed (20.14.1): the simulator's own seed
+    SF_RANDOM_SEED,  // $random(seed): {new seed, value}, 64 bits
+    SF_DIST_UNIFORM, // $dist_uniform(seed, start, end): {new seed, value}
+    SF_URANDOM,      // $urandom (18.13.1)
+    SF_URANDOM_SEED, // $urandom(seed)
+    SF_URANDOM_RANGE, // $urandom_range(max, min) (18.13.2)
+    SF_PLUS_TEST,    // $test$plusargs(prefix) (21.6); also "is there a match" for $value$plusargs
+    SF_PLUS_VALUE,   // the text after prefix kid0, read with format letter lo
+    SF_TIMEFORMAT    // $timeformat(units, precision, suffix, width) (20.4.3); returns 0
+};
+// How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
+// The default units are the simulation precision, with no decimals, no
+// suffix, and a minimum width of 20.
+struct TimeFmt {
+    int tickExp = -9;
+    int units = -9;
+    int prec = 0;
+    std::string suffix;
+    int width = 20;
+};
+inline TimeFmt& timeFmt() { static TimeFmt t; return t; }
 
 // A fixed-size unpacked array (IEEE 1800-2023 7.4) is `count` consecutive
 // signals starting at `base`, one per element, in row-major order. Each
@@ -1389,6 +1502,141 @@ inline int64_t v_to_i64(Val v) {
     return (int64_t)v.v;
 }
 
+// $random and $dist_uniform follow the algorithm that IEEE 1800-2023 Annex N
+// defines, on 32-bit integers, so a seed gives the same values as other
+// simulators. The seed steps as seed = 69069 * seed + 1.
+inline double rtlUniform(int32_t& seed, int32_t start, int32_t end) {
+    if (seed == 0) seed = 259341593;
+    double a = 0.0, b = 2147483647.0;
+    if (start < end) { a = start; b = end; }
+    seed = (int32_t)(69069u * (uint32_t)seed + 1u);
+    uint32_t bits = ((uint32_t)seed >> 9) | 0x3f800000u;
+    float f;
+    memcpy(&f, &bits, 4);
+    double c = f;
+    c = c + c * 0.00000011920928955078125;
+    return (b - a) * (c - 1.0) + a;
+}
+inline int32_t rtlDistUniform(int32_t& seed, int32_t start, int32_t end) {
+    if (start >= end) return start;
+    auto flr = [](double r) { return r >= 0 ? (int64_t)r : (int64_t)(r - 1); };
+    int64_t i;
+    if (end != INT32_MAX) {
+        int64_t e1 = (int64_t)end + 1;
+        i = flr(rtlUniform(seed, start, (int32_t)e1));
+        if (i < start) i = start;
+        if (i >= e1) i = e1 - 1;
+    } else if (start != INT32_MIN) {
+        int64_t s1 = (int64_t)start - 1;
+        i = flr(rtlUniform(seed, (int32_t)s1, end) + 1.0);
+        if (i <= s1) i = s1 + 1;
+        if (i > end) i = end;
+    } else {
+        double r = (rtlUniform(seed, start, end) + 2147483648.0) / 4294967295.0;
+        r = r * 4294967296.0 - 2147483648.0;
+        i = flr(r);
+    }
+    return (int32_t)i;
+}
+inline int32_t& globalRandomSeed() { static int32_t s = 0; return s; }
+// $urandom: the generator is implementation-defined (18.13). minisim uses
+// one 64-bit xorshift* stream, seeded by -seed (default 1), so a run repeats.
+inline uint64_t& urandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
+inline uint32_t urandomNext(uint64_t& s) {
+    s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+    return (uint32_t)((s * 0x2545F4914F6CDD1Dull) >> 32);
+}
+// Runtime plusargs (21.6): every +arg on the command line, without the +.
+inline std::vector<std::string>& plusArgs() { static std::vector<std::string> v; return v; }
+inline const std::string* findPlusArg(const std::string& prefix) {
+    for (const auto& p : plusArgs())
+        if (p.compare(0, prefix.size(), prefix) == 0) return &p;
+    return nullptr;
+}
+inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
+    auto u64 = [](const Val& v) { return v.v & ~v.x & mask(std::min(64, v.w)); };
+    auto i32 = [&](const Val& v) { return (int32_t)(uint32_t)u64(v); };
+    auto sint = [](int64_t x) { Val r = make((uint64_t)(uint32_t)x, 0, 32, 0); r.sgn = true; return r; };
+    switch (id) {
+        case SF_CLOG2: {
+            if (anyX(a[0])) return xfill(32, true);
+            // the ceiling of log2, for a value up to its full width
+            int top = -1, ones = 0;
+            for (int b = 0; b < a[0].w; b++) if (bitAt(a[0], b) == 1) { top = b; ones++; }
+            return sint(top < 0 ? 0 : ones == 1 ? top : top + 1);
+        }
+        case SF_COUNTBITS: {
+            int n = 0;
+            for (int b = 0; b < a[0].w; b++) if (ctl & (1 << bitAt(a[0], b))) n++;
+            return sint(n);
+        }
+        case SF_RANDOM: return sint(rtlDistUniform(globalRandomSeed(), INT32_MIN, INT32_MAX));
+        case SF_RANDOM_SEED:
+        case SF_DIST_UNIFORM: {
+            int32_t seed = i32(a[0]);
+            int32_t r = id == SF_RANDOM_SEED ? rtlDistUniform(seed, INT32_MIN, INT32_MAX)
+                                             : rtlDistUniform(seed, i32(a[1]), i32(a[2]));
+            return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
+        }
+        case SF_URANDOM: return make(urandomNext(urandomState()), 0, 32, 0);
+        case SF_URANDOM_SEED: {
+            uint64_t s = (u64(a[0]) + 1) * 0x9E3779B97F4A7C15ull;
+            if (!s) s = 1;
+            urandomState() = s;
+            return make(urandomNext(urandomState()), 0, 32, 0);
+        }
+        case SF_URANDOM_RANGE: {
+            uint32_t hi = (uint32_t)u64(a[0]), lo = a.size() > 1 ? (uint32_t)u64(a[1]) : 0;
+            if (hi < lo) std::swap(hi, lo);
+            uint64_t span = (uint64_t)hi - lo + 1;
+            uint32_t r = urandomNext(urandomState());
+            return make(lo + (uint32_t)(r % span), 0, 32, 0);
+        }
+        case SF_PLUS_TEST: {
+            Val p = a[0]; p.str = true;
+            return make(findPlusArg(v_str(p)) ? 1 : 0, 0, 32, 0, true);
+        }
+        case SF_TIMEFORMAT: {
+            TimeFmt& t = timeFmt();
+            auto i64 = [&](const Val& v) { return v_to_i64(v); };
+            if (a.empty()) { t.units = t.tickExp; t.prec = 0; t.suffix.clear(); t.width = 20; }
+            if (a.size() > 0) t.units = (int)i64(a[0]);
+            if (a.size() > 1) t.prec = (int)i64(a[1]);
+            if (a.size() > 2) { Val s = a[2]; s.str = true; t.suffix = v_str(s); }
+            if (a.size() > 3) t.width = (int)i64(a[3]);
+            return make(0, 0, 1, 0);
+        }
+        case SF_PLUS_VALUE: {   // the caller has checked that a match exists
+            Val p = a[0]; p.str = true;
+            const std::string& pre = v_str(p);
+            const std::string* m = findPlusArg(pre);
+            std::string t = m ? m->substr(pre.size()) : "";
+            if (ctl == 's') return mkstr(t);
+            if (ctl == 'f' || ctl == 'e' || ctl == 'g') { Val r = make(0, 0, 64, 0); double d = atof(t.c_str()); memcpy(&r.v, &d, 8); r.real = true; return r; }
+            int base = ctl == 'h' || ctl == 'x' ? 16 : ctl == 'o' ? 8 : ctl == 'b' ? 2 : 10;
+            uint64_t v = 0, x = 0;
+            bool neg = false;
+            size_t i = 0;
+            if (base == 10 && i < t.size() && (t[i] == '-' || t[i] == '+')) neg = t[i++] == '-';
+            int bits = base == 16 ? 4 : base == 8 ? 3 : 1;
+            for (; i < t.size(); i++) {
+                char c = (char)tolower((unsigned char)t[i]);
+                if (c == '_') continue;
+                if (base != 10 && (c == 'x' || c == 'z')) { v <<= bits; x = (x << bits) | mask(bits); continue; }
+                int d = isdigit((unsigned char)c) ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : 99;
+                if (d >= base) break;
+                v = base == 10 ? v * 10 + d : (v << bits) | d;
+                x <<= base == 10 ? 0 : bits;
+            }
+            if (neg) v = ~v + 1;
+            Val r = make(v, x, 64, 0);
+            r.sgn = base == 10;
+            return r;
+        }
+    }
+    return xfill(32, false);
+}
+
 inline Val eval(const E& e, const Reader& rd) {
     auto k = [&](int i) { return eval(e->kids[i], rd); };
     switch (e->op) {
@@ -1527,6 +1775,33 @@ inline Val eval(const E& e, const Reader& rd) {
             }
             return mkstr(s);
         }
+        case Op::DynGet: return dynStore()[e->sig].get(k(0));
+        case Op::DynSize: { Val r = make(dynStore()[e->sig].size(), 0, 32); r.sgn = true; return r; }
+        case Op::DynExists: {
+            auto& d = dynStore()[e->sig];
+            Val key = k(0);
+            if (d.kind != 2) { int64_t i = v_to_i64(key); return mk(!key.x && i >= 0 && i < (int64_t)d.vec.size()); }
+            return mk(d.map.count(d.key(key)) > 0);
+        }
+        case Op::DynReduce: {
+            auto& d = dynStore()[e->sig];
+            int w = e->k.w;
+            Val acc = make(e->hi == 1 ? 1 : e->hi == 2 ? ~0ULL : 0, 0, w);
+            auto one = [&](const Val& x) {
+                Val v = v_resize(x, w, x.sgn);
+                switch (e->hi) {
+                    case 0: acc = v_add(acc, v); break;
+                    case 1: acc = v_mul(acc, v); break;
+                    case 2: acc = v_and(acc, v); break;
+                    case 3: acc = v_or(acc, v); break;
+                    default: acc = v_xor(acc, v); break;
+                }
+            };
+            if (d.kind == 2) for (auto& [key, v] : d.map) one(v);
+            else for (auto& v : d.vec) one(v);
+            acc.sgn = e->k.sgn;
+            return acc;
+        }
         case Op::SFormat: return mkstr(g_sformat ? g_sformat(e->fmt, std::vector<E>(e->kids.begin(), e->kids.end()), rd) : "");
         case Op::Le: return v_le(k(0), k(1));
         case Op::Gt: return v_gt(k(0), k(1));
@@ -1559,6 +1834,11 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::Time: {   // k.v ticks per time unit of the calling module
             uint64_t d = e->k.v ? e->k.v : 1;
             return make((g_simTime + d / 2) / d, 0, 64, 0);
+        }
+        case Op::SysFn: {
+            std::vector<Val> a;
+            for (size_t i = 0; i < e->kids.size(); i++) a.push_back(k((int)i));
+            return v_sysfn(e->hi, e->lo, a);
         }
         case Op::DynSlice: {
             Val a = k(0), i = k(1);

@@ -12,7 +12,8 @@
 //   +vcd             same as -vcd dump.vcd
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
-//   +<plusarg>       any other +arg is a runtime plusarg (kept for $test$plusargs, not yet read)
+//   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
+//   -seed <n>        seed for $urandom / $urandom_range (also +ntb_random_seed=<n>)
 //   -compile         compiled mode: generate C++ for the design (codegen.hpp),
 //                    build it with a C++ compiler into <dir>/simv, and run it.
 //                    A design codegen cannot translate runs on the interpreter.
@@ -32,9 +33,11 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -66,6 +69,29 @@ static std::string shq(const std::string& s) {
 #ifndef MINISIM_SRC_DIR
 #define MINISIM_SRC_DIR "src"
 #endif
+
+#include "version.hpp"
+
+static void version() {
+    std::cout << "msim " MINISIM_VERSION;
+    if (*MINISIM_GIT) std::cout << " (" MINISIM_GIT ")";
+    std::cout << "\nIEEE 1800-2023 SystemVerilog simulator, slang front end\n"
+                 "https://github.com/tonythetiger168/minisim\n";
+}
+
+// Kernel sources that -compile builds against. $MINISIM_INCLUDE wins. An
+// installed msim (bin/msim) finds them in ../share/minisim/include next to
+// itself; a build-tree msim uses the source tree it was configured from.
+static std::string kernelIncludeDir() {
+    if (const char* e = std::getenv("MINISIM_INCLUDE")) return e;
+    std::error_code ec;
+    auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        auto inst = exe.parent_path().parent_path() / "share" / "minisim" / "include";
+        if (std::filesystem::exists(inst / "minisim.cpp", ec)) return inst.string();
+    }
+    return MINISIM_SRC_DIR;
+}
 
 // How each process runs: on the static combinational schedule (rank and
 // level), as a clocked function (seq), or as an ordinary coroutine.
@@ -145,6 +171,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::string src;
     // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
     const char* why = !lowered.finals.empty() ? "a final block"
+                    : !lowered.netDelays.empty() ? "a net delay"
+                    : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
                     : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -156,8 +184,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
     }
-    std::string inc = MINISIM_SRC_DIR;
-    if (const char* e = std::getenv("MINISIM_INCLUDE")) inc = e;
+    std::string inc = kernelIncludeDir();
     if (std::system(("mkdir -p " + shq(dir)).c_str()) != 0) { std::cerr << "msim: cannot create " << dir << "\n"; return 1; }
     std::string cpp = dir + "/design.cpp", exe = dir + "/simv";
     {
@@ -190,6 +217,7 @@ static void usage() {
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
                  "  -threads <n>   worker threads (default: all hardware threads)\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
+                 "  -version       print the msim version\n"
                  "  --help-slang   list every front-end option\n";
 }
 
@@ -197,6 +225,7 @@ int main(int argc, char** argv) {
     // Pass 1: take msim's own options out; translate VCS spellings for slang.
     std::vector<std::string> fwd{argv[0]};
     std::vector<std::string> plusargs;
+    uint64_t seed = 0;
     std::optional<std::string> vcdPath;
     uint64_t maxTime = ~0ULL;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true;
@@ -210,6 +239,7 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "-h" || a == "--help" || a == "-help") { usage(); return 0; }
+        if (a == "-version" || a == "--version" || a == "-v") { version(); return 0; }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
@@ -248,8 +278,24 @@ int main(int argc, char** argv) {
             catch (...) { std::cerr << "msim: bad -maxtime " << n << "\n"; return 2; }
             continue;
         }
+        if (a == "-seed") {
+            std::string n = next("a seed");
+            try { seed = std::stoull(n); }
+            catch (...) { std::cerr << "msim: bad -seed " << n << "\n"; return 2; }
+            continue;
+        }
+        if (startsWith(a, "+ntb_random_seed=")) {
+            try { seed = std::stoull(a.substr(17)); }
+            catch (...) { std::cerr << "msim: bad " << a << "\n"; return 2; }
+            continue;
+        }
         if (a.size() > 1 && a[0] == '+' && !slangPlus(a)) { plusargs.push_back(a.substr(1)); continue; }
         fwd.push_back(a);
+    }
+    plusArgs() = plusargs;
+    if (seed) {   // the $urandom stream (18.13); $random keeps its own seed (Annex N)
+        uint64_t st = (seed + 1) * 0x9E3779B97F4A7C15ull;
+        urandomState() = st ? st : 1;
     }
 
     // Pass 2: slang parses, elaborates and reports diagnostics.
@@ -276,6 +322,7 @@ int main(int argc, char** argv) {
         std::cerr << "msim: " << ex.what() << "\n";
         return 1;
     }
+    timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
     if (lowered.procs.empty()) {
         std::cerr << "msim: design has no processes to run\n";
         return 1;
@@ -289,6 +336,30 @@ int main(int argc, char** argv) {
 
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
+    for (auto& [s, d] : lowered.netDelays) S.netDelay[s] = d;
+    for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
+        auto& g = S.sigs[s];
+        g.kind = k;
+        g.val = resolveNet(k, g.drv.data(), g.drv.size(), g.w, allx(g.w));
+    }
+    // A delayed driver is x until its first update arrives (10.3.3, 28.16),
+    // and so is a net with a net delay that has drivers.
+    {
+        std::set<int> touched;
+        for (auto& lp : lowered.procs)
+            for (auto& i : lp.prog.code)
+                if (!i.dly.empty() && i.drv >= 0) {
+                    int w = S.sigs[i.sig].w;
+                    S.sigs[i.sig].drv[i.drv].v = i.hi >= 0 ? v_insert(allz(w), allx(i.hi - i.lo + 1), i.hi, i.lo) : allx(w);
+                    touched.insert(i.sig);
+                }
+        for (int s : touched) {
+            auto& g = S.sigs[s];
+            g.val = resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        }
+        for (auto& [s, d] : lowered.netDelays)
+            if (!S.sigs[s].drv.empty()) S.sigs[s].val = allx(S.sigs[s].w);
+    }
     S.threads = threads;
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
@@ -315,5 +386,5 @@ int main(int argc, char** argv) {
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
     std::cout.flush();
-    return 0;
+    return S.exitCode;
 }
