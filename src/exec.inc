@@ -529,6 +529,96 @@ static void runAction(const Prog* p, uint64_t n, const vector<E>* slots = nullpt
     }
     S.rare = true;
 }
+// Local variables of a concurrent assertion (16.10): environments are
+// interned value vectors; an atom or a match item that reads local variables
+// is evaluated with their hidden signals set (without events) from an environment.
+struct LocalEnv final : sva::LocalHook {
+    ConcAssert& c;
+    int loaded = -1;
+    vector<vector<Val>> tbl;                    // this attempt's environments
+    uint64_t count = 1;                         // the attempts merged into this one
+    std::unordered_map<uint64_t, bool> cache;   // (env, atom) -> value, for one attempt
+    explicit LocalEnv(ConcAssert& c) : c(c) {}
+    static void poke(int s, Val v) {
+        int w = S.sigs[s].w;
+        if (w <= 64) {
+            uint64_t m = w >= 64 ? ~0ULL : ((1ULL << w) - 1);
+            v.v &= m; v.x &= m; v.z &= m; v.sgn = false;
+            v.hi.clear();
+        } else v = maskWidth(v, w);
+        S.sigs[s].val = v;
+    }
+    void start(const ConcAssert::Envs& e) {
+        if (e) tbl = *e;
+        else {   // the initial environment: every local variable unassigned (x)
+            tbl.assign(1, {});
+            for (int s : c.localSig) tbl[0].push_back(allx(S.sigs[s].w));
+        }
+        loaded = -1;
+        cache.clear();
+    }
+    void load(int e) {
+        if (loaded == e) return;
+        for (size_t k = 0; k < c.localSig.size(); k++) poke(c.localSig[k], tbl[e][k]);
+        loaded = e;
+    }
+    int intern(vector<Val> v) {
+        for (size_t i = 0; i < tbl.size(); i++)
+            if (tbl[i] == v) return (int)i;
+        tbl.push_back(std::move(v));
+        return (int)tbl.size() - 1;
+    }
+    bool atom(int a, int e) override {
+        uint64_t key = (uint64_t)(uint32_t)e << 32 | (uint32_t)a;
+        if (auto it = cache.find(key); it != cache.end()) return it->second;
+        load(e);
+        bool v = truth(eval(c.atoms[a], rd)) == 1;
+        cache[key] = v;
+        return v;
+    }
+    int apply(int act, int e) override {
+        load(e);
+        for (auto& item : c.acts[act]) {   // in order: later items see earlier ones
+            if (item.k >= 0) { poke(c.localSig[item.k], eval(item.rhs, rd)); continue; }
+            vector<Val> args;   // a subroutine call (16.11): its arguments now, the call in the reactive region
+            for (const E& x : item.caps) args.push_back(eval(x, rd));
+            runAction(item.call, count, &item.slots, &args);
+        }
+        vector<Val> v;
+        for (int s : c.localSig) v.push_back(S.get(s));
+        int id = intern(std::move(v));
+        loaded = id;
+        return id;
+    }
+    int merge(int ctx, int a, int b) override {
+        if (a == b || b == ctx) return a;
+        if (a == ctx) return b;
+        vector<Val> v = tbl[a];
+        for (size_t k = 0; k < v.size(); k++)
+            if (!(tbl[b][k] == tbl[ctx][k])) v[k] = tbl[b][k];
+        return intern(std::move(v));
+    }
+    // The stepped term with its environments numbered in order of use.
+    std::pair<const sva::Node*, ConcAssert::Envs> finish(const sva::Node* t) {
+        if (!t->envDep) return {t, nullptr};
+        vector<int> used{0};
+        std::unordered_set<const sva::Node*> seen;
+        sva::Store::envsUsed(t, used, seen);
+        std::unordered_map<int, int> to;
+        auto out = make_shared<vector<vector<Val>>>();
+        bool same = true;
+        for (size_t i = 0; i < used.size(); i++) {
+            to[used[i]] = (int)i;
+            same = same && used[i] == (int)i;
+            out->push_back(tbl[used[i]]);
+        }
+        if (!same) {
+            std::unordered_map<const sva::Node*, const sva::Node*> memo;
+            t = sva::store().renumber(t, to, memo);
+        }
+        return {t, out};
+    }
+};
 // One clock tick of a concurrent assertion, in the observed region: start an
 // attempt, then step every attempt on the sampled values of the atoms.
 static void concTick(ConcAssert& c) {
@@ -569,13 +659,22 @@ static void concTick(ConcAssert& c) {
         for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
     };
     sva::Deriv dv{sva::store(), val};
+    std::optional<LocalEnv> lenv;
+    if (!c.acts.empty()) {   // local variables or subroutine calls in match items
+        lenv.emplace(c);
+        dv.lh = &*lenv;
+    }
     vector<ConcAssert::Attempt> next;
     for (auto& at : c.att) {
         values(at.caps);
+        if (lenv) { lenv->start(at.envs); lenv->count = at.count; }
+        dv.env = 0;
         dv.memo.clear();
         dv.nonvac = at.nonvac;
         dv.matches = 0;
         const sva::Node* t = dv.d(at.t);
+        ConcAssert::Envs envs;
+        if (lenv) std::tie(t, envs) = lenv->finish(t);
         if (c.coverSeq) {   // every match counts (16.14.3)
             if (dv.matches) {
                 a.passes += at.count * dv.matches;
@@ -593,12 +692,13 @@ static void concTick(ConcAssert& c) {
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps))) {
+            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+                (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs)});
     }
     c.att.swap(next);
 }
