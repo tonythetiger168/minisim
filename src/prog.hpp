@@ -46,6 +46,7 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
     // An immediate assertion (16.3, 16.4) of asserts()[sig] on condition e.
     // join 0, simple: pass falls through to the pass action, a fail jumps to
     // target, and an assertion that is off or whose action is off jumps to hi.
@@ -129,12 +130,45 @@ struct Instr {
     const FrameLayout* lay = nullptr;
     std::vector<std::pair<int, E>> init;
     std::vector<const FrameLayout*> blays;
+    // Call: containers copied into the new frame (7.7): its slot, the
+    // caller's container signal.
+    std::vector<std::pair<int, int>> dinit;
     // WaitEdge with dynWait: wait for a change of any signal `e` reads,
     // resolved when the wait starts (wait (cond) on automatic variables).
     bool dynWait = false;
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
+    // Call of a class method (8): `self` is the object (null: the caller's
+    // own `this`; noSelf: a static method). vslot >= 0 picks the body from
+    // the object's class (a virtual method, 8.20).
+    E self;
+    bool noSelf = false;
+    int vslot = -1;
 };
+
+struct Prog;
+// A class at run time (8): its object shape (slot 0 holds the class id),
+// its virtual method table, and its base class.
+struct ClassRt {
+    std::string name;
+    const FrameLayout* lay = nullptr;
+    int base = -1;
+    std::vector<std::pair<const Prog*, const FrameLayout*>> vt;
+    // Interface classes (8.26) this class implements, and for each
+    // interface method k (global numbering) the vt slot of its
+    // implementation (-1: none).
+    std::vector<int> ifs;
+    std::vector<int> imap;
+};
+inline std::vector<ClassRt>& classRt() { static std::vector<ClassRt> v; return v; }
+inline bool classIsA(int cls, int want) {
+    for (; cls >= 0; cls = classRt()[(size_t)cls].base) {
+        if (cls == want) return true;
+        for (int k : classRt()[(size_t)cls].ifs)
+            if (k == want) return true;
+    }
+    return false;
+}
 
 struct Prog {
     std::vector<Instr> code;
@@ -158,7 +192,8 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     // A relative id (an automatic variable) has no fixed signal: it is left
     // out here, and a wait on one resolves it at run time (Instr::dynWait).
     auto add = [&](int s) { if (!isRel(s) && seen.insert(s).second) out.push_back(s); };
-    if (e->op == Op::Ref) add(e->sig);
+    if (e->op == Op::Ref && !e->at) add(e->sig);   // h.x has no fixed signal either
+    collectRefsInto(e->at, out, seen);
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) add(e->sig);
@@ -168,6 +203,7 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
 inline bool hasRel(const E& e) {
     if (!e) return false;
     if (isRel(e->sig) && e->op != Op::Const) return true;
+    if (e->at || e->op == Op::This || e->op == Op::Addr || e->op == Op::AddrOf) return true;   // objects (8), ref (13.5.2)
     if (e->op == Op::ArrRead && isRel(e->arr->base)) return true;
     for (auto& k : e->kids) if (hasRel(k)) return true;
     return false;
