@@ -70,8 +70,8 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 11.5.1 | Bit-select with a variable index | ✅ | read and write. `11.5.1-variable-bit-select` |
 | 11.5.1 | Indexed part-select `+:` `-:` | ✅ | constant or variable start, read and write; out-of-range bits read x and are not written. `11.5.1-indexed-part-select` |
 | 11.6–11.8 | Expression width and sign rules | ✅ | context-determined widths, signed extension |
-| 12.4 | if / else; 12.4.2 unique / priority if | ✅ | the unique/priority violation itself is not reported |
-| 12.5 | case, casez, casex; 12.5.3 unique case; 12.5.4 case inside | ✅ | `12.5-unique-case`, `12.5.4-case-inside` |
+| 12.4 | if / else; 12.4.2 unique / unique0 / priority if | ✅ | violations (no condition true, more than one true) print a warning at once. Not yet: deferring the report to the end of the time step, so a glitch that resolves does not report (12.4.2.1). `12.4.2-unique-priority-violations` |
+| 12.5 | case, casez, casex; 12.5.3 unique case; 12.5.4 case inside | ✅ | unique / unique0 / priority violations are warnings, as for if; constant labels that cannot overlap cost nothing at run time. `12.5-unique-case`, `12.5.4-case-inside`, `12.4.2-unique-priority-violations` |
 | 12.6 | Pattern matching | ✅ | `if (x matches p)` with `&&&` guards, `case`/`casez`/`casex (x) matches` with `&&&` filters; tagged, variable (`.v`), wildcard (`.*`), constant and structure (`'{.a, 4}`) patterns. Not yet: `matches` in a `?:` expression, real or string constant patterns. `7.3.2-tagged-unions` |
 | 12.7 | for, while, do-while, repeat, forever | ✅ | |
 | 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue; dynamic arrays and queues by index, associative arrays in key order. `12.7.3-foreach`, `12.7.3-foreach-order`, `12.7.3-foreach-containers` |
