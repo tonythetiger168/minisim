@@ -1,0 +1,39 @@
+# Power intent for gating.sv (run with -power_top u_dut or set_design_top).
+upf_version 4.0
+set_design_top dut
+set iso_sig iso_en
+
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_CORE -elements {u_core}
+
+create_supply_port VDD
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSS
+create_supply_net VDD_CORE
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VSS -ports {VSS}
+
+create_supply_set SS_AON -function {power VDD} -function {ground VSS}
+create_supply_set SS_CORE -function {power VDD_CORE} -function {ground VSS}
+associate_supply_set SS_AON -handle PD_TOP.primary
+associate_supply_set SS_CORE -handle PD_CORE.primary
+
+create_power_switch SW_CORE \
+    -output_supply_port {vout VDD_CORE} \
+    -input_supply_port {vin VDD} \
+    -control_port {en sw_en} \
+    -ack_port {ack ack {en}} \
+    -on_state {on vin {en}} \
+    -off_state {off {!en}}
+
+set_isolation ISO_0 -domain PD_CORE -applies_to outputs -elements {u_core/cnt u_core/q} \
+    -isolation_supply SS_AON -clamp_value 0 \
+    -isolation_signal $iso_sig -isolation_sense high
+set_isolation ISO_1 -domain PD_CORE -applies_to outputs -elements {u_core/hi} \
+    -isolation_supply SS_AON -clamp_value 1 \
+    -isolation_signal $iso_sig -isolation_sense high
+set_isolation ISO_L -domain PD_CORE -applies_to outputs -elements {u_core/lat} \
+    -isolation_supply SS_AON -clamp_value latch \
+    -isolation_signal ${iso_sig} -isolation_sense high
+set_level_shifter LS_IN -domain PD_CORE -applies_to inputs -elements {u_core/d}

@@ -97,6 +97,8 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
+| `-upf <file>` | Power-aware simulation with this UPF (IEEE 1801) power intent; see [`docs/LOWPOWER.md`](docs/LOWPOWER.md) |
+| `-power_top <inst>`, `-upf_verbose` | The instance the UPF describes; print supply, power state and simstate changes |
 | `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |
 
@@ -278,6 +280,21 @@ Clock domains come from the clock of every edge-triggered block, with signals
 joined across port connections, so one clock passed down through several
 modules stays one domain. Findings print as
 `file:line:col: warning: [RULE] text`, sorted by file and line.
+
+### Low-power simulation: UPF (IEEE 1801)
+
+`msim -upf dut.upf` simulates with the design's power intent: power domains,
+supply nets and power switches, corruption of powered-off logic, isolation,
+level shifters, retention, power states and PSTs. The testbench drives
+supplies with `supply_on` / `supply_off` from package `UPF`, which msim
+adds. `mlint -upf dut.upf` checks the power intent statically (missing
+isolation or level shifters, names not in the design, ...). See
+[`docs/LOWPOWER.md`](docs/LOWPOWER.md).
+
+```sh
+msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
+mlint tb.sv dut.sv -top tb -upf dut.upf
+```
 
 ### Design for test: `mdft`
 

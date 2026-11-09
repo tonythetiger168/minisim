@@ -30,7 +30,7 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys)
+foreach(t test_expr test_z test_sched test_net test_sys test_upf)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -192,6 +192,10 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+  # Power-aware simulation and UPF checks (IEEE 1801-2024): msim -upf, mlint -upf.
+  add_test(NAME upf
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
+                   -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
