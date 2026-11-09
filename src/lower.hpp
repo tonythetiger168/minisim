@@ -112,6 +112,12 @@ inline std::unordered_set<const slang::ast::Symbol*>& assignedEvents() {
 }
 inline bool& usesForce() { static bool f = false; return f; }   // some force / assign (10.6): no partitions
 inline std::vector<std::pair<int, uint8_t>>& netKinds() { static std::vector<std::pair<int, uint8_t>> v; return v; }
+// Fixed-size arrays of containers (int f[2][]): one container per element,
+// their ids in a row; the shape's base is the first.
+inline std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>>& dynArrMap() {
+    static std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>> m;
+    return m;
+}
 // Dynamic arrays, queues, and associative arrays: symbol -> handle signal.
 inline std::unordered_map<const slang::ast::Symbol*, int>& dynMap() {
     static std::unordered_map<const slang::ast::Symbol*, int> m;
@@ -883,6 +889,16 @@ struct Lowerer {
     // break ends the whole sequence (a flag every caller checks).
     int rsBreak = -1;
     std::unordered_map<const slang::ast::RandSeqProductionSymbol*, Prog*> rsProds;
+    // Arguments and values (18.17.7): each production's arguments and return
+    // value live in signals of their own; each use of a production with a
+    // value keeps it in a temporary. A production saves its own signals on a
+    // stack around every call it makes, so recursion keeps them.
+    struct RsSig { std::vector<int> args; int ret = -1; };
+    std::unordered_map<const slang::ast::RandSeqProductionSymbol*, RsSig> rsSigs;
+    std::unordered_map<const void*, int> rsItemVal;   // a ProdItem -> its value's temporary
+    std::unordered_map<const slang::ast::Symbol*, std::vector<int>> rsVals;   // slang's variable for a production's values, in the rule being lowered
+    std::vector<int> rsState;   // the signals the production being lowered saves around calls
+    int rsStack = -1;
     void randSequence(const slang::ast::RandSequenceStatement& rs) {
         using namespace slang::ast;
         if (!rs.firstProduction) return;
@@ -890,11 +906,30 @@ struct Lowerer {
         int savedBreak = rsBreak;
         auto savedProds = rsProds;
         rsBreak = fresh(1);
+        auto savedSigs = rsSigs;
+        int savedStack = rsStack;
+        bool any = false;
         for (const RandSeqProductionSymbol* p : rs.productions) {
-            if (!p->arguments.empty() || !p->getReturnType().isVoid()) unsupported("randsequence production with arguments or a value");
             store->push_back(std::make_unique<Prog>());
             rsProds[p] = store->back().get();
+            RsSig& rsg = rsSigs[p];
+            for (const FormalArgumentSymbol* a : p->arguments) {
+                if (a->direction != ArgumentDirection::In) unsupported("randsequence production argument that is not input");
+                int w = storeW(a->getType());
+                needWidth(w);
+                int sg = fresh(w);
+                rsg.args.push_back(sg);
+                symOverride[a] = sg;
+                any = true;
+            }
+            if (!p->getReturnType().isVoid()) {
+                int w = storeW(p->getReturnType());
+                needWidth(w);
+                rsg.ret = fresh(w);
+                any = true;
+            }
         }
+        if (any) { DynObj st; st.kind = 1; rsStack = dynTemp(std::move(st)); }
         for (const RandSeqProductionSymbol* p : rs.productions) {
             Prog body;
             std::swap(prog, body);
@@ -902,7 +937,13 @@ struct Lowerer {
             loops.clear();
             auto savedNamed = std::move(named);
             named.clear();
+            int savedRet = retSig;
+            retSig = rsSigs[p].ret;   // return in a code block: this production's value
+            auto savedState = std::move(rsState);
+            rsState = rsSigs[p].args;
             rsProduction(*p);
+            rsState = std::move(savedState);
+            retSig = savedRet;
             loops = std::move(savedLoops);
             named = std::move(savedNamed);
             std::swap(prog, body);
@@ -913,11 +954,42 @@ struct Lowerer {
         rsCall(rs.firstProduction, false);
         rsBreak = savedBreak;
         rsProds = std::move(savedProds);
+        rsSigs = std::move(savedSigs);
+        rsStack = savedStack;
     }
     // Call production p; inside a production, return at once after a break.
-    void rsCall(const slang::ast::RandSeqProductionSymbol* p, bool inProd) {
+    void rsCall(const slang::ast::RandSeqProductionSymbol* p, bool inProd,
+                const slang::ast::RandSeqProductionSymbol::ProdItem* item = nullptr) {
+        const RsSig& callee = rsSigs[p];
+        // The arguments, all evaluated before any is set (the callee may be this production).
+        std::vector<int> av;
+        if (item) {
+            if (item->args.size() > callee.args.size()) unsupported("randsequence production argument count");
+            for (size_t k = 0; k < item->args.size(); k++) {
+                int t = fresh(storeW(*item->args[k]->type) > 0 ? storeW(*item->args[k]->type) : 1);
+                Instr i; i.k = IK::Assign; i.sig = t; i.e = expr(*item->args[k]);
+                prog.emit(i);
+                av.push_back(t);
+            }
+        }
+        bool save = inProd && !rsState.empty();
+        if (save)
+            for (int sg : rsState) { Instr i = dynCmd(rsStack, D_PUSH_BACK); i.e = ref(sg); prog.emit(i); }
+        for (size_t k = 0; k < av.size(); k++) {
+            Instr i; i.k = IK::Assign; i.sig = callee.args[k]; i.e = ref(av[k]);
+            prog.emit(i);
+        }
         Instr c; c.k = IK::Call; c.callee = rsProds.at(p);
         prog.emit(c);
+        int got = -1;
+        if (callee.ret >= 0 && item && rsItemVal.count(item)) {
+            got = fresh(storeW(p->getReturnType()));
+            Instr i; i.k = IK::Assign; i.sig = got; i.e = ref(callee.ret);
+            prog.emit(i);
+        }
+        if (save)
+            for (size_t k = rsState.size(); k-- > 0;) { Instr i = dynCmd(rsStack, D_POP_BACK); i.dres = rsState[k]; prog.emit(i); }
+        if (got >= 0) { Instr i; i.k = IK::Assign; i.sig = rsItemVal.at(item); i.e = ref(got); prog.emit(i); }
         if (!inProd) return;
         size_t go = emitJmpIfNot(ref(rsBreak));
         Instr r; r.k = IK::Ret; prog.emit(r);
@@ -925,8 +997,7 @@ struct Lowerer {
     }
     void rsItem(const slang::ast::RandSeqProductionSymbol::ProdItem& it) {
         if (!it.target) unsupported("randsequence production");
-        if (!it.args.empty()) unsupported("randsequence production arguments");
-        rsCall(it.target, true);
+        rsCall(it.target, true, &it);
     }
     void rsProduction(const slang::ast::RandSeqProductionSymbol& p) {
         using namespace slang::ast;
@@ -951,71 +1022,60 @@ struct Lowerer {
             Instr d; d.k = IK::Assign; d.sig = pick; d.e = weightedPick(total);
             prog.emit(d);
         }
+        // Each use of a production with a value: a temporary, named in the
+        // rule's code as the production (or production[i], from 1).
+        std::vector<std::unordered_map<const RS*, std::vector<int>>> ruleVals(rules.size());
         for (size_t k = 0; k < rules.size(); k++) {
-            const auto& r = rules[k];
-            size_t skip = 0;
-            if (pick >= 0) skip = emitJmpIfNot(bin(Op::Lt, ref(pick), ref(w[k])));
-            if (r.isRandJoin) unsupported("rand join");
-            for (const RS::ProdBase* pb : r.prods) {
+            std::function<void(const RS::ProdItem&)> use = [&](const RS::ProdItem& it) {
+                if (!it.target || rsSigs[it.target].ret < 0) return;
+                int t = fresh(storeW(it.target->getReturnType()));
+                rsItemVal[&it] = t;
+                ruleVals[k][it.target].push_back(t);
+                rsState.push_back(t);
+            };
+            for (const RS::ProdBase* pb : rules[k].prods) {
                 switch (pb->kind) {
-                    case RS::ProdKind::Item: rsItem(pb->as<RS::ProdItem>()); break;
-                    case RS::ProdKind::CodeBlock: {
-                        const Statement* st = pb->as<RS::CodeBlockProd>().block->tryGetStatement();
-                        if (st) stmt(*st);
-                        break;
-                    }
+                    case RS::ProdKind::Item: use(pb->as<RS::ProdItem>()); break;
                     case RS::ProdKind::IfElse: {
                         const auto& ie = pb->as<RS::IfElseProd>();
-                        size_t no = emitJmpIfNot(expr(*ie.expr));
-                        rsItem(ie.ifItem);
-                        size_t end = emitJmp();
-                        prog.code[no].target = prog.here();
-                        if (ie.elseItem) rsItem(*ie.elseItem);
-                        prog.code[end].target = prog.here();
+                        use(ie.ifItem);
+                        if (ie.elseItem) use(*ie.elseItem);
                         break;
                     }
-                    case RS::ProdKind::Repeat: {
-                        const auto& rp = pb->as<RS::RepeatProd>();
-                        int n = fresh(64);
-                        Instr i; i.k = IK::Assign; i.sig = n;
-                        i.e = resize(expr(*rp.expr), 64, rp.expr->type->isSigned(), false);
-                        prog.emit(i);
-                        size_t top = prog.here();
-                        size_t done = emitJmpIfNot(bin(Op::Gt, ref(n), konst(mk(0, 64))));
-                        rsItem(rp.item);
-                        Instr dec; dec.k = IK::Assign; dec.sig = n; dec.e = bin(Op::Sub, ref(n), konst(mk(1, 64)));
-                        prog.emit(dec);
-                        Instr j; j.k = IK::Jmp; j.target = top; prog.emit(j);
-                        prog.code[done].target = prog.here();
-                        break;
-                    }
+                    case RS::ProdKind::Repeat: use(pb->as<RS::RepeatProd>().item); break;
                     case RS::ProdKind::Case: {
                         const auto& cp = pb->as<RS::CaseProd>();
-                        int v = fresh(64);
-                        Instr i; i.k = IK::Assign; i.sig = v;
-                        i.e = resize(expr(*cp.expr), 64, cp.expr->type->isSigned(), false);
-                        prog.emit(i);
-                        std::vector<size_t> out;
-                        for (const auto& ci : cp.items) {
-                            E any;
-                            for (const Expression* x : ci.expressions) {
-                                E eq = bin(Op::CaseEq, ref(v), resize(expr(*x), 64, x->type->isSigned(), false));
-                                any = any ? bin(Op::LogOr, any, eq) : eq;
-                            }
-                            size_t no = emitJmpIfNot(any);
-                            rsItem(ci.item);
-                            out.push_back(emitJmp());
-                            prog.code[no].target = prog.here();
-                        }
-                        if (cp.defaultItem) rsItem(*cp.defaultItem);
-                        patch(out, prog.here());
+                        for (const auto& ci : cp.items) use(ci.item);
+                        if (cp.defaultItem) use(*cp.defaultItem);
                         break;
                     }
+                    default: break;
                 }
             }
+        }
+        for (size_t k = 0; k < rules.size(); k++) {
+            const auto& r = rules[k];
+            // slang declares, in the rule's block, a variable per production
+            // with a value: an int, or int[1:n] when it is used n times.
+            auto savedVals = std::move(rsVals);
+            rsVals.clear();
+            for (const auto& m : r.ruleBlock->members()) {
+                if (m.kind != SymbolKind::Variable || !m.as<VariableSymbol>().flags.has(VariableFlags::CompilerGenerated)) continue;
+                for (auto& [ps, ts] : ruleVals[k])
+                    if (ps->name == m.name) {
+                        if (m.as<VariableSymbol>().getType().isUnpackedArray()) rsVals[&m] = ts;
+                        else symOverride[&m] = ts.back();
+                    }
+            }
+            size_t skip = 0;
+            if (pick >= 0) skip = emitJmpIfNot(bin(Op::Lt, ref(pick), ref(w[k])));
+            if (r.isRandJoin) { rsJoin(r); }
+            else for (const RS::ProdBase* pb : r.prods) rsProd(pb);
             if (r.codeBlock) {
                 if (const Statement* st = r.codeBlock->block->tryGetStatement()) stmt(*st);
             }
+            for (const auto& m : r.ruleBlock->members()) symOverride.erase(&m);
+            rsVals = std::move(savedVals);
             if (pick >= 0) {
                 ends.push_back(emitJmp());
                 prog.code[skip].target = prog.here();
@@ -1024,6 +1084,181 @@ struct Lowerer {
             }
         }
         patch(ends, prog.here());
+    }
+    // rand join (18.17.5): the items of the listed productions, interleaved
+    // at random, each production's own items in order. Each step picks a
+    // production with items left, weighted by how many it has left raised
+    // to 2N-1 (N the join's bias, 0.5 by default: every one alike).
+    void rsJoin(const slang::ast::RandSeqProductionSymbol::Rule& jr) {
+        using namespace slang::ast;
+        using RS = RandSeqProductionSymbol;
+        double bias = 0.5;
+        if (jr.randJoinExpr) {
+            slang::ConstantValue cv = tryConst(*jr.randJoinExpr);
+            if (cv.isReal()) bias = double(cv.real());
+            else if (cv.isShortReal()) bias = double(cv.shortReal());
+            else if (cv.isInteger()) bias = (double)cv.integer().as<int64_t>().value_or(0);
+            else unsupported("rand join with a bias that is not constant");
+        }
+        bias = std::clamp(bias, 0.0, 1.0);
+        auto k64 = [](uint64_t v) { return konst(mk(v, 64)); };
+        struct Part { std::span<const RS::Rule> rules; int rule = -1, cnt = 0; E len; size_t maxLen = 0; };
+        std::vector<Part> parts;
+        for (const RS::ProdBase* pb : jr.prods) {
+            if (pb->kind != RS::ProdKind::Item) unsupported("rand join of something other than a production");
+            const auto& it = pb->as<RS::ProdItem>();
+            if (!it.target || !it.args.empty()) unsupported("rand join of a production with arguments");
+            Part pt;
+            pt.rules = it.target->getRules();
+            for (const auto& r : pt.rules)
+                if (r.isRandJoin) unsupported("rand join of a production that is itself a rand join");
+            if (pt.rules.size() > 1) {   // its rule, by weight, first (18.17.1)
+                std::vector<int> w;
+                E total;
+                for (const auto& r : pt.rules) {
+                    int t = fresh(64);
+                    Instr i; i.k = IK::Assign; i.sig = t;
+                    i.e = r.weightExpr ? resize(expr(*r.weightExpr), 64, r.weightExpr->type->isSigned(), false) : k64(1);
+                    prog.emit(i);
+                    w.push_back(t);
+                    total = total ? bin(Op::Add, total, ref(t)) : ref(t);
+                }
+                int pick = fresh(64);
+                Instr d; d.k = IK::Assign; d.sig = pick; d.e = weightedPick(total);
+                prog.emit(d);
+                E sel = k64(pt.rules.size() - 1), cum;
+                std::vector<E> cums;
+                for (size_t k = 0; k < w.size(); k++) { cum = cum ? bin(Op::Add, cum, ref(w[k])) : ref(w[k]); cums.push_back(cum); }
+                for (size_t k = w.size() - 1; k-- > 0;) sel = mux(bin(Op::Lt, ref(pick), cums[k]), k64(k), sel);
+                pt.rule = fresh(64);
+                Instr a; a.k = IK::Assign; a.sig = pt.rule; a.e = sel;
+                prog.emit(a);
+            }
+            // Its steps: the rule's items, then its code block.
+            E len;
+            for (size_t k = pt.rules.size(); k-- > 0;) {
+                size_t n = pt.rules[k].prods.size() + (pt.rules[k].codeBlock ? 1 : 0);
+                pt.maxLen = std::max(pt.maxLen, n);
+                len = len ? mux(bin(Op::Eq, ref(pt.rule), k64(k)), k64(n), len) : k64(n);
+            }
+            pt.len = len;
+            pt.cnt = fresh(64);
+            Instr z; z.k = IK::Assign; z.sig = pt.cnt; z.e = k64(0);
+            prog.emit(z);
+            parts.push_back(std::move(pt));
+        }
+        size_t top = prog.here();
+        std::vector<int> wts;
+        E total;
+        for (auto& pt : parts) {
+            E rem = bin(Op::Sub, pt.len, ref(pt.cnt));
+            E wt;
+            if (bias == 0.5) wt = k64(1);
+            else {   // round(1e6 * rem^(2N-1)), at least 1
+                wt = k64(1);
+                for (size_t r = pt.maxLen; r >= 1; r--) {
+                    double x = std::pow((double)r, 2 * bias - 1) * 1e6;
+                    wt = mux(bin(Op::Eq, rem, k64(r)), k64(std::max<uint64_t>(1, (uint64_t)std::llround(x))), wt);
+                }
+            }
+            int t = fresh(64);
+            Instr i; i.k = IK::Assign; i.sig = t; i.e = mux(bin(Op::Eq, rem, k64(0)), k64(0), wt);
+            prog.emit(i);
+            wts.push_back(t);
+            total = total ? bin(Op::Add, total, ref(t)) : ref(t);
+        }
+        size_t done = emitJmpIfNot(bin(Op::Ne, total, k64(0)));
+        int pick = fresh(64);
+        { Instr d; d.k = IK::Assign; d.sig = pick; d.e = weightedPick(total); prog.emit(d); }
+        std::vector<size_t> next;
+        for (size_t p = 0; p < parts.size(); p++) {
+            Part& pt = parts[p];
+            size_t skip = emitJmpIfNot(bin(Op::Lt, ref(pick), ref(wts[p])));
+            Instr inc; inc.k = IK::Assign; inc.sig = pt.cnt; inc.e = bin(Op::Add, ref(pt.cnt), k64(1));
+            std::vector<size_t> out;
+            for (size_t k = 0; k < pt.rules.size(); k++) {
+                const auto& r = pt.rules[k];
+                size_t n = r.prods.size() + (r.codeBlock ? 1 : 0);
+                for (size_t st = 0; st < n; st++) {
+                    E here = bin(Op::Eq, ref(pt.cnt), k64(st));
+                    if (pt.rule >= 0) here = bin(Op::LogAnd, bin(Op::Eq, ref(pt.rule), k64(k)), here);
+                    size_t no = emitJmpIfNot(here);
+                    prog.emit(inc);   // first, so a step that ends the join early is counted
+                    if (st < r.prods.size()) rsProd(r.prods[st]);
+                    else if (const Statement* s = r.codeBlock->block->tryGetStatement()) stmt(*s);
+                    out.push_back(emitJmp());
+                    prog.code[no].target = prog.here();
+                }
+            }
+            patch(out, prog.here());
+            next.push_back(emitJmp());
+            prog.code[skip].target = prog.here();
+            Instr sub; sub.k = IK::Assign; sub.sig = pick; sub.e = bin(Op::Sub, ref(pick), ref(wts[p]));
+            prog.emit(sub);
+        }
+        patch(next, top);
+        Instr j; j.k = IK::Jmp; j.target = top; prog.emit(j);
+        prog.code[done].target = prog.here();
+    }
+    // One item of a randsequence rule (18.17).
+    void rsProd(const slang::ast::RandSeqProductionSymbol::ProdBase* pb) {
+        using namespace slang::ast;
+        using RS = RandSeqProductionSymbol;
+        switch (pb->kind) {
+            case RS::ProdKind::Item: rsItem(pb->as<RS::ProdItem>()); break;
+            case RS::ProdKind::CodeBlock: {
+                const Statement* st = pb->as<RS::CodeBlockProd>().block->tryGetStatement();
+                if (st) stmt(*st);
+                break;
+            }
+            case RS::ProdKind::IfElse: {
+                const auto& ie = pb->as<RS::IfElseProd>();
+                size_t no = emitJmpIfNot(expr(*ie.expr));
+                rsItem(ie.ifItem);
+                size_t end = emitJmp();
+                prog.code[no].target = prog.here();
+                if (ie.elseItem) rsItem(*ie.elseItem);
+                prog.code[end].target = prog.here();
+                break;
+            }
+            case RS::ProdKind::Repeat: {
+                const auto& rp = pb->as<RS::RepeatProd>();
+                int n = fresh(64);
+                Instr i; i.k = IK::Assign; i.sig = n;
+                i.e = resize(expr(*rp.expr), 64, rp.expr->type->isSigned(), false);
+                prog.emit(i);
+                size_t top = prog.here();
+                size_t done = emitJmpIfNot(bin(Op::Gt, ref(n), konst(mk(0, 64))));
+                rsItem(rp.item);
+                Instr dec; dec.k = IK::Assign; dec.sig = n; dec.e = bin(Op::Sub, ref(n), konst(mk(1, 64)));
+                prog.emit(dec);
+                Instr j; j.k = IK::Jmp; j.target = top; prog.emit(j);
+                prog.code[done].target = prog.here();
+                break;
+            }
+            case RS::ProdKind::Case: {
+                const auto& cp = pb->as<RS::CaseProd>();
+                int v = fresh(64);
+                Instr i; i.k = IK::Assign; i.sig = v;
+                i.e = resize(expr(*cp.expr), 64, cp.expr->type->isSigned(), false);
+                prog.emit(i);
+                std::vector<size_t> out;
+                for (const auto& ci : cp.items) {
+                    E any;
+                    for (const Expression* x : ci.expressions) {
+                        E eq = bin(Op::CaseEq, ref(v), resize(expr(*x), 64, x->type->isSigned(), false));
+                        any = any ? bin(Op::LogOr, any, eq) : eq;
+                    }
+                    size_t no = emitJmpIfNot(any);
+                    rsItem(ci.item);
+                    out.push_back(emitJmp());
+                    prog.code[no].target = prog.here();
+                }
+                if (cp.defaultItem) rsItem(*cp.defaultItem);
+                patch(out, prog.here());
+                break;
+            }
+        }
     }
     size_t emitJmp() {
         Instr j;
@@ -2580,24 +2815,66 @@ struct Lowerer {
             Instr i = dynCmd(t, D_COPY); i.dsrc = relSig(kRelRet, it->second->retSig); prog.emit(i);
             return t;
         }
-        if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // a[k] of a container of containers
-            const auto& es = e.as<ElementSelectExpression>();
-            int outer = dynSig(es.value());
-            if (outer < 0) return -1;
-            const DynObj& os = dynShape(outer);
-            if (!os.sub) unsupported("container element of this kind");
-            auto n = node(Op::DynSub, {dynKey(outer, es.selector())});
+        if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // m[i] of a container of containers
+            const auto& sel = e.as<ElementSelectExpression>();
+            // f[i][j] of a fixed-size array of containers: its element's id
+            std::vector<const Expression*> idx;
+            const Expression* b = &e;
+            while (b->kind == ExpressionKind::ElementSelect) {
+                idx.insert(idx.begin(), &b->as<ElementSelectExpression>().selector());
+                b = &peel(b->as<ElementSelectExpression>().value());
+            }
+            if (ValueExpressionBase::isKind(b->kind))
+                if (auto f = dynArrMap().find(&b->as<ValueExpressionBase>().symbol); f != dynArrMap().end() && idx.size() == f->second->dims.size()) {
+                    std::vector<E> ks;
+                    for (auto* x : idx) ks.push_back(expr(*x));
+                    auto n = node(Op::ArrAddr, std::move(ks));
+                    n->arr = f->second;
+                    int tmp = fresh(64);
+                    Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
+                    prog.emit(i);
+                    int d = indThrough(tmp);
+                    indShape[d] = dynStore()[f->second->base];
+                    return d;
+                }
+            int outer = dynSig(sel.value());
+            if (outer < 0 || !dynShape(outer).elem) return -1;
+            auto n = node(Op::DynElemRef, {dynKey(outer, sel.selector())});
             n->sig = outer;
-            int tmp = fresh(64);
-            Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
-            prog.emit(i);
-            int d = indThrough(tmp);
-            indShape[d] = os.sub->dyn[0].second;
-            return d;
+            return elemRef(outer, n);
         }
         if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) return -1;
         return dynFind(&e.as<ValueExpressionBase>().symbol);
     }
+    // The indirect id of the element container that `ref` (a DynElemRef of
+    // outer) names, read into a temporary now.
+    int elemRef(int outer, E ref0) {
+        DynObj shape = *dynShape(outer).elem;
+        int tmp = fresh(64);
+        Instr i; i.k = IK::Assign; i.sig = tmp; i.e = std::move(ref0);
+        prog.emit(i);
+        int d = indThrough(tmp);
+        indShape[d] = std::move(shape);
+        return d;
+    }
+    // push_back / push_front / insert of x into t, a container of containers:
+    // a new empty element, then x assigned to it.
+    void pushContainer(int t, int cmd, const slang::ast::Expression& x, const slang::ast::Expression* at = nullptr) {
+        Instr i = dynCmd(t, cmd);
+        E key;
+        if (cmd == D_INSERT) { i.args = {dynKey(t, *at)}; key = i.args[0]; }
+        else if (cmd == D_PUSH_FRONT) key = konst(mk(0, 32));
+        prog.emit(i);
+        if (!key) key = bin(Op::Sub, resize(dynSize(t), 64, false, false), konst(mk(1, 64)));
+        auto n = node(Op::DynElemRef, {key});
+        n->sig = t;
+        assignContainer(elemRef(t, n), x);
+    }
+    // How many container levels a type or a shape has (int[][] is 2).
+    static int dynDepth(const slang::ast::Type& t) {
+        return isDynType(t) ? 1 + dynDepth(*t.getCanonicalType().getArrayElementType()) : 0;
+    }
+    static int dynDepth(const DynObj& o) { return 1 + (o.elem ? dynDepth(*o.elem) : 0); }
     static bool isDynType(const slang::ast::Type& t0) {
         const auto& t = t0.getCanonicalType();
         return t.isQueue() || t.isAssociativeArray() ||
@@ -2649,6 +2926,10 @@ struct Lowerer {
     void dynAppend(int t, const slang::ast::Expression& x0) {
         using namespace slang::ast;
         const Expression& x = peel(x0);
+        if (const DynObj& ts = dynShape(t); ts.elem && dynDepth(*x.type) == dynDepth(*ts.elem)) {   // {qq, q}: q is one element
+            pushContainer(t, D_PUSH_BACK, x);
+            return;
+        }
         if (int s = dynSig(x); s >= 0) {
             Instr i = dynCmd(t, D_APPEND); i.dsrc = s; prog.emit(i); return;
         }
@@ -2768,7 +3049,10 @@ struct Lowerer {
                 int64_t n = rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
                                 ? constInt(rhs.as<ReplicatedAssignmentPatternExpression>().count()) : 1;
                 for (int64_t k = 0; k < n; k++)
-                    for (auto* el : ap.elements()) { Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(*el); prog.emit(i); }
+                    for (auto* el : ap.elements()) {
+                        if (dynShape(t).elem) { pushContainer(t, D_PUSH_BACK, *el); continue; }   // '{'{1, 2}, '{3}}
+                        Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(*el); prog.emit(i);
+                    }
                 return;
             }
             case ExpressionKind::StructuredAssignmentPattern: {   // '{key: v, default: d} (10.9.2)
@@ -2969,7 +3253,7 @@ struct Lowerer {
         const ValueSymbol* itSym = nullptr;
         if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
             std::tie(withE, itSym) = sci->getIteratorInfo();
-        if (withE && consDepth && o.kind != 2) {   // in a constraint: sum() with (...) and the like, folded at solve time (18.5.8.2)
+        if (withE && consDepth) {   // in a constraint: sum() with (...) and the like, folded at solve time (18.5.8.2)
             static const std::pair<const char*, int> red[] = {{"sum", 0}, {"product", 1}, {"and", 2}, {"or", 3}, {"xor", 4}};
             for (auto& [s, id] : red)
                 if (n == s) {
@@ -3076,6 +3360,10 @@ struct Lowerer {
             if (!found) unsupported("container method");
         }
         if (i.dcmd == D_DELETE_AT) i.args = {dynKey(d, *args[1])};
+        if (dynShape(d).elem && (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT || i.dcmd == D_INSERT)) {
+            pushContainer(d, i.dcmd, i.dcmd == D_INSERT ? *args[2] : *args[1], i.dcmd == D_INSERT ? args[1] : nullptr);
+            return nullptr;
+        }
         if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = expr(*args[1]);
         if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = expr(*args[2]); }
         prog.emit(i);
@@ -3643,11 +3931,14 @@ struct Lowerer {
             }
             case ExpressionKind::ElementSelect: {   // a[i]
                 if (E k = paramSelect(e, ctx)) return k;
-                if (e.as<ElementSelectExpression>().value().type->isString()) {   // s[i]: a byte of a string (6.16)
-                    const auto& sel = e.as<ElementSelectExpression>();
-                    auto g = node(Op::StrMethod, {exprStr(sel.value()), expr(sel.selector())});
-                    g->hi = S_GETC;
-                    return sized(g, 8, false, ctx);
+                if (const auto& sv = e.as<ElementSelectExpression>().value();
+                    ValueExpressionBase::isKind(sv.kind) && rsVals.count(&sv.as<ValueExpressionBase>().symbol)) {   // P[i] (18.17.7)
+                    const auto& ts = rsVals.at(&sv.as<ValueExpressionBase>().symbol);
+                    auto cv = tryConst(e.as<ElementSelectExpression>().selector());
+                    if (!cv.isInteger()) unsupported("a production value with an index that is not constant");
+                    int64_t n = cv.integer().as<int64_t>().value_or(0);
+                    if (n < 1 || n > (int64_t)ts.size()) unsupported("production value index out of range");
+                    return sized(ref(ts[(size_t)n - 1], e.type->isSigned()), storeW(*e.type), e.type->isSigned(), ctx);
                 }
                 if (int d = dynSig(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key]
                     int w = storeW(*e.type);
@@ -3657,6 +3948,11 @@ struct Lowerer {
                 if (auto as = arraySel(e))
                     return sized(arrayRead(*as), as->a->elemW, as->a->sgn, ctx);
                 const auto& sel = e.as<ElementSelectExpression>();
+                if (sel.value().type->isString()) {   // s[i]: its byte i, 0 when out of range (6.16)
+                    auto m = node(Op::StrMethod, {exprStr(sel.value()), expr(sel.selector())});
+                    m->hi = S_GETC;
+                    return sized(std::move(m), 8, false, ctx);
+                }
                 PSel ps = packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index);
                 return sized(readPSel(expr(sel.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
@@ -4411,6 +4707,7 @@ struct Lowerer {
         const Expression& x = peel(a);
         if (int d = dynSig(x); d >= 0) {
             const Type* et = x.type->getCanonicalType().getArrayElementType();
+            while (isDynType(*et)) et = et->getCanonicalType().getArrayElementType();   // a container of containers: the innermost elements
             const Type& ec = et->getCanonicalType();
             // (handles, enums, structs: their stored bits as a number, for now)
             fmt += "%Q";
@@ -4614,8 +4911,8 @@ struct Lowerer {
                 const Expression& x = ec.expr;
                 if (x.kind == ExpressionKind::Dist) {   // 18.5.3
                     const auto& d = x.as<DistExpression>();
-                    if (d.defaultWeight()) unsupported("dist default weight");
                     it.isDist = true;
+                    if (auto* dw = d.defaultWeight()) it.distDefault = dw->expr ? expr(*dw->expr) : konst(mk(1, 32));
                     it.e = expr(d.left());
                     it.guard = guard;
                     for (const auto& di : d.items()) {
@@ -5522,24 +5819,23 @@ struct Lowerer {
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
             if (syncDrive(a) || vifSyncDrive(a)) return;   // cb.v <= e, v.cb.v <= e (14.16, 25.9)
-            if (peel(a.left()).kind == ExpressionKind::ElementSelect &&
-                peel(a.left()).as<ElementSelectExpression>().value().type->isString()) {   // s[i] = c (6.16): putc
-                const auto& sel = peel(a.left()).as<ElementSelectExpression>();
-                if (a.isCompound() || a.timingControl) unsupported("compound or delayed write to a string character");
-                Instr i;
-                i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
-                lhs(sel.value(), i);
-                auto p = node(Op::StrMethod, {exprStr(sel.value()), expr(sel.selector()), resize(expr(a.right()), 8, false, false)});
-                p->hi = S_PUTC;
-                i.e = p;
-                prog.emit(i);
-                return;
-            }
             if (const Expression& l = peel(a.left()); a.left().type->isEvent() && ValueExpressionBase::isKind(l.kind) &&
                 eventPtr().count(&l.as<ValueExpressionBase>().symbol)) {   // e2 = e1: e2 names e1's event from now on (6.17)
                 auto p = eventPtr().find(&l.as<ValueExpressionBase>().symbol);
                 if (a.isNonBlocking() || a.timingControl) unsupported("this event assignment");
                 Instr i; i.k = IK::Assign; i.sig = p->second; i.e = eventAddr(a.right());
+                prog.emit(i);
+                return;
+            }
+            if (const Expression& l = peel(a.left()); l.kind == ExpressionKind::ElementSelect &&
+                l.as<ElementSelectExpression>().value().type->isString()) {   // s[i] = c (6.16): s.putc(i, c)
+                if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this write to a string character");
+                const auto& sel = l.as<ElementSelectExpression>();
+                Instr i; i.k = IK::Assign;
+                lhs(sel.value(), i);
+                auto m = node(Op::StrMethod, {exprStr(sel.value()), expr(sel.selector()), expr(a.right())});
+                m->hi = S_PUTC;
+                i.e = m;
                 prog.emit(i);
                 return;
             }
@@ -5658,30 +5954,29 @@ struct Lowerer {
     void foreachDyn(const slang::ast::ForeachLoopStatement& f, int d) {
         if (f.loopDims.size() == 1 && !f.loopDims[0].loopVar) { stmt(f.body); return; }
         loops.push_back({});
-        foreachLevel(f, 0, d);
+        foreachDynDim(f, d, 0);
         patch(loops.back().breaks, prog.here());
         loops.pop_back();
     }
-    void foreachLevel(const slang::ast::ForeachLoopStatement& f, size_t lvl, int d) {
+    // Dimension k of a foreach over container d; a container of containers
+    // (7.5, 7.10) loops over each element's own elements next.
+    void foreachDynDim(const slang::ast::ForeachLoopStatement& f, int d, size_t k) {
+        const auto* var = f.loopDims[k].loopVar;
         const DynObj o = dynShape(d);
-        bool last = lvl + 1 == f.loopDims.size();
-        if (!last && !o.sub) unsupported("foreach over a container dimension that is not a container");
-        const auto* var = f.loopDims[lvl].loopVar;
-        auto inner = [&](int v) {
+        bool last = k + 1 == f.loopDims.size();
+        if (!last && !o.elem) unsupported("foreach over more dimensions than the container has");
+        auto body = [&](E key) {
             if (last) {
                 stmt(f.body);
-                patch(loops.back().continues, prog.here());
                 return;
             }
-            auto n = node(Op::DynSub, {ref(v, o.kind != 2 || o.keySgn)});
+            auto n = node(Op::DynElemRef, {key});
             n->sig = d;
-            int tmp = fresh(64);
-            Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
-            prog.emit(i);
-            int in = indThrough(tmp);
-            indShape[in] = o.sub->dyn[0].second;
-            foreachLevel(f, lvl + 1, in);
+            foreachDynDim(f, elemRef(d, n), k + 1);
         };
+        // continue in the body goes to the step of the innermost loop only
+        auto saved = std::move(loops.back().continues);
+        loops.back().continues.clear();
         if (o.kind != 2) {
             int v = fresh(32);
             if (var) bindVar(var, v);
@@ -5690,7 +5985,8 @@ struct Lowerer {
             size_t top = prog.here();
             Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Lt, ref(v, true), dynSize(d));
             size_t jf = prog.emit(j);
-            inner(v);
+            body(ref(v, true));
+            if (last) patch(loops.back().continues, prog.here());
             Instr st; st.k = IK::Assign; st.sig = v;
             st.e = bin(Op::Add, ref(v, true), konst(make(1, 0, 32, 0, true)));
             prog.emit(st);
@@ -5705,12 +6001,14 @@ struct Lowerer {
             size_t top = prog.here();
             Instr j; j.k = IK::JmpIfNot; j.e = ref(ok);
             size_t jf = prog.emit(j);
-            inner(v);
+            body(ref(v, !o.strKey && o.keySgn));
+            if (last) patch(loops.back().continues, prog.here());
             Instr nx = dynCmd(d, D_NEXT); nx.dkey = v; nx.dres = ok;
             prog.emit(nx);
             Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
             prog.code[jf].target = prog.here();
         }
+        loops.back().continues = std::move(saved);
     }
 
     int stmtDepth = 0;   // > 0 while lowering a procedural statement
@@ -6058,11 +6356,18 @@ struct Lowerer {
                 }
                 struct Lvl { int var; int64_t right; bool up; size_t top, jf; };
                 std::vector<Lvl> lv;
-                for (const auto& d : f.loopDims) {
-                    if (!d.loopVar) continue;
+                // A fixed-size array of containers (int f[2][]): its fixed
+                // dimensions here, then each element container's own.
+                std::shared_ptr<ArrShape> da;
+                if (const Expression& ar = peel(f.arrayRef); ValueExpressionBase::isKind(ar.kind))
+                    if (auto it = dynArrMap().find(&ar.as<ValueExpressionBase>().symbol); it != dynArrMap().end()) da = it->second;
+                size_t nfixed = da ? da->dims.size() : f.loopDims.size();
+                for (size_t dk = 0; dk < nfixed && dk < f.loopDims.size(); dk++) {
+                    const auto& d = f.loopDims[dk];
+                    if (!d.loopVar && !(da && f.loopDims.size() > nfixed)) continue;
                     if (!d.range) unsupported("foreach over a dynamic dimension");
                     int v = fresh(32);
-                    bindVar(d.loopVar, v);
+                    if (d.loopVar) bindVar(d.loopVar, v);
                     Instr init; init.k = IK::Assign; init.sig = v;
                     init.e = konst(make((uint64_t)d.range->left, 0, 32, 0, true));
                     prog.emit(init);
@@ -6073,7 +6378,18 @@ struct Lowerer {
                     lv.push_back(L);
                 }
                 loops.push_back({});
-                stmt(f.body);
+                if (da && f.loopDims.size() > nfixed) {
+                    std::vector<E> ks;
+                    for (auto& L : lv) ks.push_back(ref(L.var, true));
+                    auto n = node(Op::ArrAddr, std::move(ks));
+                    n->arr = da;
+                    int tmp = fresh(64);
+                    Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
+                    prog.emit(i);
+                    int d = indThrough(tmp);
+                    indShape[d] = dynStore()[da->base];
+                    foreachDynDim(f, d, nfixed);
+                } else stmt(f.body);
                 patch(loops.back().continues, prog.here());
                 for (size_t k = lv.size(); k-- > 0;) {
                     const Lvl& L = lv[k];
@@ -6426,13 +6742,9 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
 inline void Lowerer::elemInto(DynObj& o, const slang::ast::Type& et) {
     const auto& e = et.getCanonicalType();
     if (e.isUntypedType()) { o.dflt = Val{}; return; }   // a typeless mailbox (15.4.9): values as they are
-    if (isDynType(e)) {   // a container of containers: elements are inner container ids
-        auto L = std::make_shared<FrameLayout>();
-        L->name = "container";
-        L->add(64, make(0, 0, 64));
-        L->dyn.push_back({0, dynShapeOf(e)});
-        o.sub = L;
+    if (isDynType(e)) {   // a container of containers (7.5, 7.10): each element names a container
         o.dflt = make(0, 0, 64);
+        o.elem = std::make_shared<DynObj>(dynShapeOf(e));
         return;
     }
     if (e.isFloating()) o.dflt = mkreal(0);
@@ -6440,12 +6752,11 @@ inline void Lowerer::elemInto(DynObj& o, const slang::ast::Type& et) {
     else if (isHandleType(e)) o.dflt = make(0, 0, 64);   // a class handle starts null
     else if (e.isIntegral()) {
         int w = (int)e.getBitWidth();
-        if (w > 64) unsupported("container element wider than 64 bits");
         o.dflt = e.isFourState() ? allx(w) : make(0, 0, w);
         o.dflt.sgn = e.isSigned();
     } else if ((e.isUnpackedStruct() || e.isUnpackedUnion()) && uWidth(e) > 0) {
         o.dflt = structDefaultVal(e);   // members' defaults
-    } else throw std::runtime_error("lower: unsupported container element type " + e.toString());
+    } else unsupported("container element type");
 }
 
 inline void Lowerer::declLocals(const slang::ast::Statement& st, FrameLayout* L) {
@@ -6493,7 +6804,13 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     template <typename T> void reg(const T& s, bool net) {
         if (auto a = aliasOf().find(&s); a != aliasOf().end() && a->second != &s) { aliased.push_back(&s); return; }
         if (Lowerer::isDynType(s.getType())) { regDyn(s); return; }
-        if (s.getType().isUnpackedArray()) { regArray(s, net); return; }
+        if (s.getType().isUnpackedArray()) {
+            const slang::ast::Type* t = &s.getType().getCanonicalType();
+            while (t->kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) t = &t->getArrayElementType()->getCanonicalType();
+            if (Lowerer::isDynType(*t)) { regDynArray(s, *t); return; }
+            regArray(s, net);
+            return;
+        }
         if (s.getType().isEvent()) {
             // A named event (15.5) is two signals: a trigger count, which an
             // @e waits on, and the time of the last trigger + 1, which .triggered reads.
@@ -6513,6 +6830,28 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     // A dynamic array, queue, or associative array: a hidden handle signal
     // (its name has '$') and its store entry.
+    template <typename T> void regDynArray(const T& s, const slang::ast::Type& et) {
+        using namespace slang::ast;
+        auto shape = std::make_shared<ArrShape>();
+        int64_t total = 1;
+        for (const Type* t = &s.getType().getCanonicalType(); t->kind == SymbolKind::FixedSizeUnpackedArrayType;
+             t = &t->getArrayElementType()->getCanonicalType()) {
+            const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+            shape->dims.push_back({ft.range.left, ft.range.right});
+            total *= (int64_t)ft.range.width();
+        }
+        if (total > 4096) throw std::runtime_error("lower: unsupported array of more than 4096 containers: " + std::string(s.name));
+        DynObj o = Lowerer::dynShapeOf(et);
+        for (int64_t k = 0; k < total; k++) {
+            int id = mkSig(prefix + std::string(s.name) + "[" + std::to_string(k) + "]$", 64, false);
+            if (k == 0) shape->base = id;
+            else if (id != shape->base + (int)k) throw std::runtime_error("lower: array of containers not laid out in a row: " + std::string(s.name));
+            dynStore()[id] = o;
+        }
+        shape->count = (int)total;
+        shape->elemW = 64;
+        dynArrMap()[&s] = shape;
+    }
     template <typename T> void regDyn(const T& s) {
         using namespace slang::ast;
         DynObj o = Lowerer::dynShapeOf(s.getType());
@@ -7721,8 +8060,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     srcMgr() = comp.getSourceManager();
     dynMap().clear();
     dynStore().clear();
-    pendingSub().clear();
-    pendingAt().clear();
+    dynPending().clear();
+    dynPendingAt().clear();
     blockIds() = BlockIds{};
     Lowerer::covSM() = comp.getSourceManager();   // statement locations, for coverage and run-time messages
     {   // alias statements (10.11), before any signal is made
@@ -8008,7 +8347,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             while (et->isUnpackedArray()) et = &et->getArrayElementType()->getCanonicalType();
                         } else if (ps.kind == 0) rv.off = ps.off;
                         else {   // a dynamic array or queue (18.4): its size and elements
-                            if (t.isAssociativeArray()) Lowerer::unsupported("rand associative array");
+                            if (t.isAssociativeArray()) {   // its values (18.4); the keys stay
+                                const auto* ix = t.as<AssociativeArrayType>().indexType;
+                                if (!ix || !ix->getCanonicalType().isIntegral()) Lowerer::unsupported("rand associative array without an integral index");
+                            }
                             rv.off = ps.off; rv.dyn = true;
                             et = &t.getArrayElementType()->getCanonicalType();
                             if (Lowerer::isDynType(*et) || et->isUnpackedArray()) Lowerer::unsupported("rand array of arrays");

@@ -823,15 +823,12 @@ struct DynObj {
     std::vector<Val> vec;
     std::map<DynKey, Val> map;
     Val dflt;                   // what a missing element reads as
+    std::shared_ptr<DynObj> elem;   // elements that are containers: their empty shape (an element holds the id)
     int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
     bool strKey = false;        // associative: string index
     bool wideKey = false;       // associative: an integral index wider than 64 bits, kept as big-endian bytes in DynKey::s
     int keyW = 64;
     bool keySgn = true;
-    // A container of containers (7.5-7.10 with an unpacked dimension that is
-    // itself a container): each element is the 64-bit signal id of an inner
-    // container shaped like `sub` (0: none yet). Made on first write.
-    std::shared_ptr<const struct FrameLayout> sub;
     DynKey key(const Val& k) const {
         DynKey d;
         if (strKey) {   // a signal holds a string as its pool id, without the flag
@@ -1353,6 +1350,8 @@ enum class Op {
     // reversed when lo > 0, then left-aligned into hi bits (hi < 0: as is).
     DynBits, StreamPack,
     DynHas,    // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
+    DynElemRef,   // element kids[0] of container sig, itself a container (7.5, 7.10): its id + 1, made if missing
+    ArrAddr,   // the signal id + 1 of element kids of array arr (0 when an index is outside it)
     // Classes (8). A handle is the first signal id of its object (0: null).
     This,      // the running method's `this`
     IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
@@ -1360,7 +1359,6 @@ enum class Op {
     AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
     DynEq,     // containers sig and hi have the same size and equal elements (=== when lo)
     DynStrJoin, // the strings in container sig, joined ({>>{q}} of a string queue, 11.4.14)
-    DynSub,    // id + 1 of the inner container at key kids[0] of container of containers sig
     VifSig     // 1 + the signal id of member hi of the interface instance the virtual interface kids[0] names, or 0 (25.9)
 };
 // System functions computed by Op::SysFn.
@@ -2095,6 +2093,67 @@ inline int (*g_allocSigs)(const FrameLayout&) = nullptr;
 inline void (*g_initSigs)(const FrameLayout&, int base) = nullptr;
 inline void (*g_nullAccess)() = nullptr;
 inline Val (*g_getSig)(int) = nullptr;
+
+// Containers of containers (7.5, 7.10): an element holds the id of a
+// container of its own, which is a signal too (its change count).
+inline const FrameLayout& dynElemLay() {
+    static FrameLayout l = [] { FrameLayout x; x.add(64, make(0, 0, 64)); return x; }();
+    return l;
+}
+// A new element of d: an empty container when d holds containers.
+// Element containers of an associative array made by a read of a missing key:
+// not in the array until a write to them (dynAttach).
+struct DynPending { int outer; Val key; };
+inline std::unordered_map<int, DynPending>& dynPending() { static std::unordered_map<int, DynPending> m; return m; }
+inline std::map<std::pair<int, DynKey>, int>& dynPendingAt() { static std::map<std::pair<int, DynKey>, int> m; return m; }
+inline void dynAttach(int sig) {
+    if (dynPending().empty()) return;
+    auto it = dynPending().find(sig);
+    if (it == dynPending().end()) return;
+    DynPending p = it->second;
+    dynPending().erase(it);
+    DynObj& d = dynStore()[p.outer];
+    DynKey k = d.key(p.key);
+    dynPendingAt().erase(std::make_pair(p.outer, k));
+    d.map.emplace(k, make((uint64_t)sig, 0, 64));
+}
+inline Val dynNewElem(const DynObj& d) {
+    if (!d.elem) return d.dflt;
+    int id = g_allocSigs(dynElemLay());
+    if (g_initSigs) g_initSigs(dynElemLay(), id);
+    DynObj o = *d.elem;
+    o.vec.clear();
+    o.map.clear();
+    dynStore()[id] = std::move(o);
+    return make((uint64_t)id, 0, 64);
+}
+// A copy of element v of d: a new container with copies of its elements.
+inline Val dynCopyElem(const DynObj& d, const Val& v) {
+    if (!d.elem) return v;
+    Val n = dynNewElem(d);
+    if (v.x || !v.v) return n;
+    DynObj s = dynStore()[(int)v.v];   // a copy: making elements may add to the store
+    DynObj& t = dynStore()[(int)n.v];
+    for (const Val& e : s.vec) t.vec.push_back(dynCopyElem(s, e));
+    for (const auto& [k, e] : s.map) t.map[k] = dynCopyElem(s, e);
+    return n;
+}
+// d = s: the elements of s (none from an associative array into a list),
+// within d's bound, each copied.
+inline void dynAssign(DynObj& d, const DynObj& s0) {
+    DynObj s = s0;   // s0 may be d itself, or move as elements are made
+    if (d.kind == 2) {
+        d.map.clear();
+        for (const auto& [k, e] : s.map) d.map[k] = dynCopyElem(s, e);
+        return;
+    }
+    d.vec.clear();
+    if (s.kind == 2) return;
+    for (const Val& e : s.vec) {
+        if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound) break;
+        d.vec.push_back(dynCopyElem(s, e));
+    }
+}
 inline bool (*g_isA)(int obj, int cls) = nullptr;   // is object obj of class cls or one derived from it
 // > 0 while an Op::Addr computes an address: reading through a null handle
 // there gives null (the access that uses the address reports it, if it runs).
@@ -2164,42 +2223,6 @@ inline int relSlow(int s) {
     for (int d = 0; d < m && f; d++) f = f->up.get();
     if (!f) relFail("automatic variable outside its frame");
     return f->base + off;
-}
-// Containers of containers: an inner container that a read made but nothing
-// has written yet is not an element of its outer container until a write
-// (pendingSub; dynAttach puts it in), so reading a[k][j] does not add a[k].
-struct PendingSub { int outer; Val key; };
-inline std::unordered_map<int, PendingSub>& pendingSub() { static std::unordered_map<int, PendingSub> m; return m; }
-inline std::map<std::pair<int, DynKey>, int>& pendingAt() { static std::map<std::pair<int, DynKey>, int> m; return m; }
-inline int dynSubOf(int outer, const Val& key) {
-    DynObj& d = dynStore()[outer];
-    Val cur = d.get(key);
-    if (!cur.x && cur.v) return (int)cur.v;
-    if (!d.sub) relFail("container of containers without an inner shape");
-    auto at = std::make_pair(outer, d.key(key));
-    if (auto it = pendingAt().find(at); it != pendingAt().end()) return it->second;   // read again before a write
-    int id = g_allocSigs(*d.sub);
-    g_initSigs(*d.sub, id);
-    pendingSub()[id] = {outer, key};
-    pendingAt()[at] = id;
-    return id;
-}
-// A write to inner container `sig`: make it an element of its outer one.
-inline void dynAttach(int sig) {
-    if (pendingSub().empty()) return;
-    auto it = pendingSub().find(sig);
-    if (it == pendingSub().end()) return;
-    PendingSub p = it->second;
-    pendingSub().erase(it);
-    DynObj& d = dynStore()[p.outer];
-    pendingAt().erase(std::make_pair(p.outer, d.key(p.key)));
-    Val id = make((uint64_t)sig, 0, 64);
-    if (d.kind == 2) d.map[d.key(p.key)] = id;
-    else if (!p.key.x) {
-        int64_t i = v_to_i64(p.key);
-        if (i >= 0 && i < (int64_t)d.vec.size()) d.vec[(size_t)i] = id;
-        else if (d.kind == 1 && i == (int64_t)d.vec.size()) d.vec.push_back(id);
-    }
 }
 // The signal id a (possibly relative) id names right now.
 inline int R(int s) { return s < kRel ? s : relSlow(s); }
@@ -2407,7 +2430,41 @@ inline Val eval(const E& e, const Reader& rd) {
             else for (auto& v : d.vec) { Val t = v; t.str = true; r += v_str(t); }
             return mkstr(r);
         }
-        case Op::DynSub: return make((uint64_t)dynSubOf(R(e->sig), k(0)) + 1, 0, 64);
+        case Op::ArrAddr: {
+            std::vector<int64_t> idx;
+            for (size_t n = 0; n < e->kids.size(); n++) {
+                Val v = k(n);
+                if (v.x) return make(0, 0, 64);
+                idx.push_back(v_to_i64(v));
+            }
+            int64_t off = e->arr->offset(idx);
+            return make(off < 0 ? 0 : (uint64_t)(R(e->arr->base) + off + 1), 0, 64);
+        }
+        case Op::DynElemRef: {
+            const int c = R(e->sig);
+            Val key = k(0);
+            DynObj& d = dynStore()[c];
+            if (!d.elem) relFail("element of a container that holds no containers");
+            if (d.kind == 2) {
+                if (key.x && !d.strKey) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
+                auto it = d.map.find(d.key(key));
+                if (it != d.map.end()) return make(it->second.v + 1, 0, 64);
+                // Missing: a new empty container that joins d only when written
+                // (dynAttach), so reading aa[k].size() does not add aa[k] (7.8.6).
+                auto at = std::make_pair(c, d.key(key));
+                if (auto p = dynPendingAt().find(at); p != dynPendingAt().end()) return make((uint64_t)p->second + 1, 0, 64);
+                int id = (int)dynNewElem(d).v;
+                dynPendingAt()[at] = id;
+                dynPending()[id] = {c, key};
+                return make((uint64_t)id + 1, 0, 64);
+            }
+            int64_t i = key.x ? -1 : v_to_i64(key);
+            // Out of range: an empty container of its own (writes to it are lost).
+            if (i < 0 || i >= (int64_t)d.vec.size()) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
+            Val& el = d.vec[(size_t)i];
+            if (el.x || !el.v) el = dynNewElem(d);
+            return make(el.v + 1, 0, 64);
+        }
         case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {
             auto& d = dynStore()[R(e->sig)];
@@ -2571,7 +2628,7 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
     if (e->op == Op::Ref) out.push_back(R(e->sig));
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base) + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) out.push_back(R(e->sig));
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef) out.push_back(R(e->sig));
     for (auto& k : e->kids) collectAddrs(k, out);
 }
 // A copy of `e` with every relative id resolved now: a $strobe / $monitor
@@ -2579,7 +2636,7 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
 // process may be running.
 inline E bindRel(const E& e) {
     if (!e) return e;
-    bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynSize ||
+    bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynElemRef || e->op == Op::DynSize ||
                                             e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas);
     if (e->op == Op::This) return konst(make(g_fr ? (uint64_t)g_fr->self : 0, 0, 64));
     bool arel = e->op == Op::ArrRead && e->arr && isRel(e->arr->base);

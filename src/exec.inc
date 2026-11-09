@@ -185,10 +185,17 @@ inline void dynExec(const Instr& i) {
     const int sig = R(i.sig), dsrc = i.dsrc >= 0 ? R(i.dsrc) : -1;
     const int dres = i.dres >= 0 ? R(i.dres) : -1, dkey = i.dkey >= 0 ? R(i.dkey) : -1;
     if (i.dcmd != D_DELETE && i.dcmd != D_DELETE_AT && i.dcmd != D_FIRST && i.dcmd != D_LAST && i.dcmd != D_NEXT && i.dcmd != D_PREV)
-        dynAttach(sig);
+        dynAttach(sig);   // a write to an element container made by a read: it joins its array now
     auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
+    // A new element: e's value; for a container of containers a copy of
+    // container dsrc, or an empty one.
+    auto elemVal = [&]() -> Val {
+        if (!d.elem) return eval(i.e, rd);
+        if (dsrc >= 0) { DynObj one; one.elem = d.elem; return dynCopyElem(one, make((uint64_t)dsrc, 0, 64)); }
+        return dynNewElem(d);
+    };
     auto full = [&]() {   // a bounded queue drops what does not fit (7.10)
         bool f = d.kind == 1 && d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1;
         if (f) dynWarn("write past the bound of a bounded queue is ignored");
@@ -208,10 +215,10 @@ inline void dynExec(const Instr& i) {
             int64_t n = idx(0);
             if (n < 0) { dynWarn("new[] with a negative or unknown size"); n = 0; }
             std::vector<Val> nv((size_t)n, d.dflt);
-            if (dsrc >= 0) {
-                auto src = dynStore()[dsrc].vec;
-                for (size_t k = 0; k < nv.size() && k < src.size(); k++) nv[k] = src[k];
-            }
+            DynObj src;
+            if (dsrc >= 0) src = dynStore()[dsrc];
+            for (size_t k = 0; k < nv.size(); k++)
+                nv[k] = k < src.vec.size() ? dynCopyElem(src, src.vec[k]) : dynNewElem(d);
             d.vec = std::move(nv);
             break;
         }
@@ -223,12 +230,12 @@ inline void dynExec(const Instr& i) {
             d.vec.erase(d.vec.begin() + k);
             break;
         }
-        case D_PUSH_BACK: d.vec.push_back(eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
-        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_BACK: d.vec.push_back(elemVal()); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), elemVal()); if (full()) d.vec.pop_back(); break;
         case D_INSERT: {
             int64_t k = idx(0);
             if (k < 0 || k > (int64_t)d.vec.size()) { dynWarn("insert(i) outside the queue"); return; }
-            d.vec.insert(d.vec.begin() + k, eval(i.e, rd));
+            d.vec.insert(d.vec.begin() + k, elemVal());
             if (full()) d.vec.pop_back();
             break;
         }
@@ -254,20 +261,19 @@ inline void dynExec(const Instr& i) {
             return;   // the container did not change
         }
         case D_COPY: {
-            auto& s = dynStore()[dsrc];
-            if (d.kind == 2) d.map = s.map;
-            else { d.vec = s.kind == 2 ? std::vector<Val>{} : s.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+            dynAssign(d, dynStore()[dsrc]);
             break;
         }
         case D_APPEND: {   // {q, r}: every element of r
-            auto s = dynStore()[dsrc].vec;
-            d.vec.insert(d.vec.end(), s.begin(), s.end());
+            DynObj s = dynStore()[dsrc];
+            for (const Val& e : s.vec) d.vec.push_back(dynCopyElem(s, e));
             break;
         }
         case D_APPEND_SLICE: {   // q[a:b] (7.10.1): out-of-range parts are left out
-            auto s = dynStore()[dsrc].vec;
+            DynObj so = dynStore()[dsrc];
+            const auto& s = so.vec;
             int64_t a = std::max<int64_t>(idx(0), 0), b = std::min<int64_t>(idx(1), (int64_t)s.size() - 1);
-            for (int64_t k = a; k <= b; k++) d.vec.push_back(s[(size_t)k]);
+            for (int64_t k = a; k <= b; k++) d.vec.push_back(dynCopyElem(so, s[(size_t)k]));
             break;
         }
         case D_REVERSE: std::reverse(d.vec.begin(), d.vec.end()); break;
@@ -985,21 +991,23 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 if (i.dyn >= 0) {   // q[i] = v, aa[key] = v
                     Instr set = i;
                     set.k = IK::Dyn; set.sig = i.dyn; set.dcmd = D_SET;
-                    if (i.hi >= 0 || i.bidx) {   // q[i][3:0] = v, q[i].f = v: read, change, write back
+                    if (i.hi >= 0 || i.bidx) {   // q[i].f = v, q[i][3:0] = v: the element with those bits changed
                         Val old = dynStore()[R(i.dyn)].get(eval(i.args[0], rd));
-                        int W = old.w, hi = i.hi, lo = i.lo;
+                        int hi = i.hi, lo = i.lo;
                         if (i.bidx) {
                             Val bv = eval(i.bidx, rd);
                             if (bv.x) { pc++; break; }
                             int64_t b = v_to_i64(bv) - i.lo;
-                            int64_t l = !i.pw ? b : i.pdown ? b - i.pw + 1 : b, h = !i.pw ? b : l + i.pw - 1;
-                            int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, W - 1);
+                            int64_t l = i.pw ? (i.pdown ? b - i.pw + 1 : b) : b, h = i.pw ? l + i.pw - 1 : b;
+                            int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, old.w - 1);
                             if (cl > ch) { pc++; break; }
-                            if (i.pw) v = v_slice(v, (int)(ch - l), (int)(cl - l));
-                            hi = (int)ch; lo = (int)cl;
+                            v = v_slice(v, (int)(ch - l), (int)(cl - l));
+                            hi = (int)ch;
+                            lo = (int)cl;
                         }
+                        if (hi >= old.w) { pc++; break; }
                         Val nv = v_insert(old, v, hi, lo);
-                        nv.sgn = old.sgn; nv.str = old.str; nv.real = old.real;
+                        nv.sgn = old.sgn;
                         set.e = konst(nv);
                     }
                     dynExec(set);
@@ -1184,10 +1192,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         S.set(nf->base + off, v);
                     }
                     for (auto [off, src] : i.dinit) {   // container arguments (7.7)
-                        auto& d = dynStore()[nf->base + off];
-                        const auto& sv = dynStore()[R(src)];
-                        if (d.kind == 2) d.map = sv.map;
-                        else { d.vec = sv.kind == 2 ? std::vector<Val>{} : sv.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+                        dynAssign(dynStore()[nf->base + off], dynStore()[R(src)]);
                     }
                     rets.push_back({p, pc + 1, fr});
                     fr = std::move(nf);
