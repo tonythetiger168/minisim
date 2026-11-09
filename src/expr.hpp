@@ -1247,6 +1247,37 @@ inline Val resolveNet(uint8_t k, const Drv* d, size_t n, int w, const Val& prev)
     return r;
 }
 inline Val resolveDrives(const Drv* d, size_t n, int w) {
+    // Every driver at one and the same strength for 0 and 1 (the usual case:
+    // several continuous assigns to parts of one net). Then per bit: no
+    // driver -> z; drivers that agree -> their value; disagreeing or x -> x.
+    // That is word-parallel, with no per-bit strength walk.
+    bool same = n > 0 && d[0].s0 == d[0].s1 && d[0].s0 != STR_HIZ;
+    for (size_t i = 1; i < n && same; i++) same = d[i].s0 == d[0].s0 && d[i].s1 == d[0].s0;
+    if (same) {
+        int L = w > 64 ? limbCount(w) : 1;
+        Val r = make(0, 0, w);
+        for (int j = 0; j < L; j++) {
+            uint64_t any0 = 0, any1 = 0, anyx = 0;
+            for (size_t i = 0; i < n; i++) {
+                const Val& a = d[i].v;
+                uint64_t v, x, z;
+                if (j == 0) { v = a.v; x = a.x; z = a.z; }
+                else if ((size_t)(j - 1) < a.hi.size()) { v = a.hi[j - 1].v; x = a.hi[j - 1].x; z = a.hi[j - 1].z; }
+                else { v = 0; x = ~0ULL; z = ~0ULL; }   // no bits here: undriven
+                any1 |= v & ~x & ~z;
+                any0 |= ~v & ~x & ~z;
+                anyx |= x & ~z;
+            }
+            int top = w - 64 * j;
+            uint64_t m = top >= 64 ? ~0ULL : (1ULL << top) - 1;
+            uint64_t bad = (anyx | (any0 & any1)) & m;
+            uint64_t none = ~(any0 | any1 | anyx) & m;
+            uint64_t rv = any1 & ~bad & m, rx = bad | none;
+            if (j == 0) { r.v = rv; r.x = rx; r.z = none; }
+            else { r.hi[j - 1].v = rv; r.hi[j - 1].x = rx; r.hi[j - 1].z = none; }
+        }
+        return finish(r);
+    }
     if (w > 64) {
         Val r = make(0, 0, w);
         for (int b = 0; b < w; b++) {
