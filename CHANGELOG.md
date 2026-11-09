@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Virtual prototypes: `msim -mvp` adds an AXI4-Lite bridge (`mvp_axil_slave`,
+  `mvp_irq_slave`, `mvp_clock`) from the design to models written in C, C++ or
+  SystemC/TLM-2.0, with a memory map, 32 interrupt lines, timed callbacks and
+  a master path for a model that drives the bus itself (`include/mvp.h`,
+  `mvp_tlm.h`). A memory and a 16550-style UART are bundled in `mvp/models/`.
+  See `docs/VPROTO.md`.
 - SDF back-annotation (32): `$sdf_annotate` and `msim -sdf` read SDF 3.0
   files and annotate specify paths (IOPATH, COND, CONDELSE, DEVICE),
   interconnect delays (PORT, NETDELAY, INTERCONNECT), timing check limits
