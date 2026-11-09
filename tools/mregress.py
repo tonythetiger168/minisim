@@ -302,7 +302,7 @@ def signature(reason):
     return s[:160]
 
 
-def run_one(job, sim, exe, outdir, timeout_default, common, cov=False, threads=0):
+def run_one(job, sim, exe, outdir, timeout_default, common, cov=False, threads=0, compiled=False):
     test, seed = job
     if sim in test.opts.get("skip", "").split(","):
         return {"test": test.name, "seed": seed, "status": "skip", "reason": f"@skip={test.opts['skip']}",
@@ -312,6 +312,12 @@ def run_one(job, sim, exe, outdir, timeout_default, common, cov=False, threads=0
     os.makedirs(rundir, exist_ok=True)
     if cov:
         args = args + ["-cov", os.path.join(rundir, "cov.json")]
+    if sim == "msim" and compiled and "-compile" not in args:
+        args = args + ["-compile"]
+    if sim == "msim" and "-compile" in args and "-o" not in args:
+        # One build directory per test: its seeds reuse one simv (msim
+        # caches the build and serializes it), and tests do not share one.
+        args = args + ["-o", os.path.join(outdir, "build", test.name.replace("/", "_"))]
     cmd = command(sim, exe, args, seed, rundir, threads)
     with open(os.path.join(rundir, "cmd.sh"), "w") as f:
         f.write(f"#!/bin/sh\ncd {shlex.quote(test.base)}\n{cmd}\n")
@@ -437,6 +443,8 @@ def main(argv=None):
     ap.add_argument("-chapters", action="store_true",
                     help="print a pass table per chapter (leading number of the test name; on by default with -spec)")
     ap.add_argument("-md", metavar="FILE", help="also write the chapter table as Markdown")
+    ap.add_argument("-compile", action="store_true",
+                    help="msim only: run every test with msim -compile (one C++ build per test, reused by its seeds)")
     ap.add_argument("-cov", action="store_true",
                     help="msim only: collect coverage per run and merge it into <o>/cov.json (see mcov)")
     ap.add_argument("-version", action="version", version=f"mregress {VERSION}")
@@ -499,7 +507,7 @@ def main(argv=None):
         if a.cov and sim != "msim":
             ap.error("-cov needs -sim msim")
         futs = [pool.submit(run_one, j, sim, exe, outdir, a.timeout, settings.get("common", []), a.cov,
-                            threads if sim == "msim" else 0) for j in jobs]
+                            threads if sim == "msim" else 0, a.compile) for j in jobs]
         for fut in cf.as_completed(futs):
             r = fut.result()
             results.append(r)

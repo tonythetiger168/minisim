@@ -158,6 +158,11 @@ public:
              "        }\n"
              "        else if (!std::strcmp(argv[i], \"-no-pin\")) g_pin = false;\n"
              "        else if (!std::strcmp(argv[i], \"-cov\") && i + 1 < argc) { g_cov = true; covOut = argv[++i]; }\n"
+             "        else if (!std::strcmp(argv[i], \"-seed\") && i + 1 < argc) {   // as msim -seed\n"
+             "            uint64_t st = (std::strtoull(argv[++i], nullptr, 10) + 1) * 0x9E3779B97F4A7C15ull;\n"
+             "            urandomState() = st ? st : 1;\n"
+             "        }\n"
+             "        else if (argv[i][0] == '+') plusArgs().push_back(argv[i] + 1);\n"
              "    }\n"
              "    S.threads = std::min(S.threads, maxThreads());\n";
         for (size_t s = 0; s < sigs.size(); s++) {

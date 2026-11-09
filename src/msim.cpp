@@ -52,7 +52,10 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "codegen.hpp"
 #include "lower.hpp"
@@ -207,7 +210,8 @@ static bool readCompiledCov(const std::string& path, const std::vector<std::pair
 
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
-                       const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle) {
+                       const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
+                       uint64_t seed, const std::string& covPath) {
     std::vector<CodegenSig> sigs;
     for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
     std::vector<CodegenProc> procs;
@@ -242,11 +246,11 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::string inc = kernelIncludeDir();
     if (std::system(("mkdir -p " + shq(dir)).c_str()) != 0) { std::cerr << "msim: cannot create " << dir << "\n"; return 1; }
     std::string cpp = dir + "/design.cpp", exe = dir + "/simv";
-    {
-        std::ofstream f(cpp);
-        f << src;
-        if (!f) { std::cerr << "msim: cannot write " << cpp << "\n"; return 1; }
-    }
+    // One build at a time per directory: parallel runs of one test (seeds in
+    // mregress) share the build, the first one compiles and the rest reuse it.
+    int lockFd = ::open((dir + "/.build.lock").c_str(), O_CREAT | O_RDWR, 0644);
+    if (lockFd >= 0) ::flock(lockFd, LOCK_EX);
+    struct Unlock { int fd; ~Unlock() { if (fd >= 0) ::close(fd); } } unlock{lockFd};
     std::string build = shq(cc) + " -std=c++20 " + opt + " -I" + shq(inc) + " " + shq(cpp) + " -o " + shq(exe);
     // An FST waveform: build simv with libfst too. Its C sources are compiled
     // once into <dir>/fst/*.o with $CC (default cc).
@@ -270,16 +274,46 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         }
         build += " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fd) + objs + " -lz -pthread";
     }
-    if (std::system(build.c_str()) != 0) {
-        std::cerr << "msim: -compile: C++ build failed: " << build << "\n";
-        return 1;
+    // Build cache: the same generated source, compiler command and kernel
+    // sources as the simv already in `dir` reuse it. A rebuild of a large
+    // design takes minutes; a regression runs the same design many times.
+    auto slurp = [](const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    };
+    std::string stamp = build + "\n";
+    for (const char* k : {"minisim.cpp", "exec.inc", "expr.hpp", "prog.hpp", "cpu.hpp"}) {
+        std::error_code ec;
+        auto p = std::filesystem::path(inc) / k;
+        auto t = std::filesystem::last_write_time(p, ec);
+        stamp += std::string(k) + " " + std::to_string(ec ? 0 : std::filesystem::file_size(p, ec)) + " " +
+                 std::to_string(ec ? 0 : (long long)t.time_since_epoch().count()) + "\n";
     }
+    std::error_code ec;
+    bool fresh = std::filesystem::exists(exe, ec) && slurp(dir + "/simv.stamp") == stamp && slurp(cpp) == src;
+    if (!fresh) {
+        std::filesystem::remove(dir + "/simv.stamp", ec);
+        {
+            std::ofstream f(cpp);
+            f << src;
+            if (!f) { std::cerr << "msim: cannot write " << cpp << "\n"; return 1; }
+        }
+        if (std::system(build.c_str()) != 0) {
+            std::cerr << "msim: -compile: C++ build failed: " << build << "\n";
+            return 1;
+        }
+        std::ofstream(dir + "/simv.stamp") << stamp;
+    }
+    if (lockFd >= 0) ::flock(lockFd, LOCK_UN);
     std::string run = shq(exe);
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
     run += " -threads " + std::to_string(threads);
     if (!g_pin) run += " -no-pin";
-    std::string covBin = dir + "/cov.bin";
+    // Run-time inputs go to simv, so one build serves every seed and plusarg.
+    if (seed) run += " -seed " + std::to_string(seed);
+    for (auto& a : plusArgs()) run += " " + shq("+" + a);
+    std::string covBin = covPath + ".bin";   // per run: parallel runs share the build directory
     if (g_cov) { std::filesystem::remove(covBin); run += " -cov " + shq(covBin); }
     std::cout.flush();
     int st = std::system(run.c_str());
@@ -538,7 +572,8 @@ int main(int argc, char** argv) {
 
     Plan pl = plan(lowered, staticComb, staticSeq);
     if (compiled) {
-        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle);
+        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle,
+                             seed, covPath);
         if (st >= 0) {
             if (g_cov && !writeCoverage(covPath, lowered, S.vcdTop)) {
                 std::cerr << "msim: cannot write " << covPath << "\n";
