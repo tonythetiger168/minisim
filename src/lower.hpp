@@ -56,6 +56,7 @@
 #include "slang/ast/expressions/AssignmentExpressions.h"
 #include "slang/ast/expressions/CallExpression.h"
 #include "slang/ast/expressions/ConversionExpression.h"
+#include "slang/text/SourceManager.h"
 #include "slang/ast/expressions/LiteralExpressions.h"
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
@@ -2683,8 +2684,22 @@ struct Lowerer {
     }
 
     int stmtDepth = 0;   // > 0 while lowering a procedural statement
+    // Source of a location, for coverage (set by lower() when -cov is on).
+    static const slang::SourceManager*& covSM() { static const slang::SourceManager* sm = nullptr; return sm; }
+    static void covLoc(slang::SourceLocation loc) {
+        auto* sm = covSM();
+        if (!sm || !loc.valid()) return;
+        auto ol = sm->getFullyOriginalLoc(loc);
+        g_emitLoc = {covFileId(std::string(sm->getFullPath(ol.buffer()).string())), (uint32_t)sm->getLineNumber(ol)};
+    }
     void stmt(const slang::ast::Statement& s) {
         struct Depth { int& d; Depth(int& x) : d(x) { d++; } ~Depth() { d--; } } depth(stmtDepth);
+        // Each statement's instructions carry its line; a block's own
+        // instructions keep the line of the statement around them.
+        SrcLoc savedLoc = g_emitLoc;
+        struct RestoreLoc { SrcLoc& l; SrcLoc v; ~RestoreLoc() { g_emitLoc = v; } } restoreLoc{g_emitLoc, savedLoc};
+        if (s.kind != slang::ast::StatementKind::List && s.kind != slang::ast::StatementKind::Block)
+            covLoc(s.sourceRange.start());
         using namespace slang::ast;
         switch (s.kind) {
             case StatementKind::Empty: break;
@@ -3451,6 +3466,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::ContinuousAssignSymbol& ca) {
         using namespace slang::ast;
         const auto& a = ca.getAssignment().as<AssignmentExpression>();
+        Lowerer::covLoc(ca.location);
         Lowerer lw(sigmap);
         prep(lw);
         Instr i; i.k = IK::Assign;
@@ -3461,6 +3477,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         lw.setScope(ca.getParentScope());
         i.dly = lw.delays3(ca.getDelay());
         finishAssign(lw, i);
+        g_emitLoc = {};
     }
 
     // buf/not/and/nand/or/nor/xor/xnor and pullup/pulldown drive the same way
@@ -3678,6 +3695,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     dynMap().clear();
     dynStore().clear();
     blockIds() = BlockIds{};
+    Lowerer::covSM() = g_cov ? comp.getSourceManager() : nullptr;
     {   // alias statements (10.11), before any signal is made
         aliasOf().clear();
         struct AliasFinder : slang::ast::ASTVisitor<AliasFinder> {

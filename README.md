@@ -84,6 +84,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `+define+N[=V]`, `-D N[=V]` | Preprocessor define |
 | `+incdir+<dir>`, `-I <dir>` | Include directory |
 | `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
+| `-cov [<file>]` | Write line / branch / toggle coverage (default `cov.json`); see `mcov` |
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
 | `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
@@ -123,8 +124,25 @@ a known gap; one that passes (XPASS) fails the regression so the marker gets
 removed. With `-spec`, a test's `//! xfail: <reason>` and `//! exit: <n>`
 lines mean the same on msim, and a per-chapter pass table is printed
 (`-md FILE` also writes it as Markdown). See `tests/regress/smoke.list` and
-`mregress -h`. For Jenkins and other CI, see [`ci/README.md`](ci/README.md)
-and the pipeline in [`ci/Jenkinsfile`](ci/Jenkinsfile).
+`mregress -h`.
+
+### Coverage: `msim -cov` and `mcov`
+
+`msim -cov [file.json]` records line coverage, branch coverage (both outcomes
+of every `if`, `case` arm, and loop test), and toggle coverage (every signal
+bit seen rising and falling) into `cov.json`. `mcov` merges databases and
+reports them; `mregress -cov` does both for a whole regression:
+
+```sh
+msim tb.sv -cov run1.json
+mcov merge run1.json run2.json -o all.json
+mcov report all.json -html cov_html -lcov all.info -min-line 90
+mregress tests.list -cov            # regress.d/cov.json + regress.d/cov_html/
+```
+
+The LCOV file works with `genhtml` and with editor and CI coverage plugins.
+Covergroups (functional coverage, 19) come with the spec work. `-compile`
+with `-cov` runs in the interpreter for now.
 
 ### Compiled mode
 
