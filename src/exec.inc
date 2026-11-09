@@ -636,7 +636,8 @@ struct LocalEnv final : sva::LocalHook {
 };
 // One clock tick of a concurrent assertion, in the observed region: start an
 // attempt, then step every attempt on the sampled values of the atoms.
-static void concTick(ConcAssert& c) {
+// `ticked`: the clocks that ticked (16.13); attempts start at the leading one.
+static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
         std::erase_if(c.att, [&](const ConcAssert::Attempt& t) { return t.killGen != a.killGen; });
@@ -644,10 +645,11 @@ static void concTick(ConcAssert& c) {
         c.att.clear();
         c.pending.clear();
         c.matured.clear();
-        if (a.on) a.evals++;
+        if (a.on && (ticked & 1)) a.evals++;
         return;
     }
-    if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
+    if (!(ticked & 1)) {
+    } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
         for (auto& caps : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, caps}); a.evals++; }
         c.matured.clear();
         for (auto& p : c.pending) {
@@ -677,6 +679,7 @@ static void concTick(ConcAssert& c) {
         for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
     };
     sva::Deriv dv{sva::store(), val};
+    dv.ticking = ticked;
     std::optional<LocalEnv> lenv;
     if (!c.acts.empty()) {   // local variables or subroutine calls in match items
         lenv.emplace(c);
@@ -744,6 +747,27 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     c.pending.push_back({ctl, ctl->epoch, caps});
     S.rare = true;
 }
+// A multiclock assertion (16.13): one process per clock marks it ticked;
+// the first in a time step runs the assertion in the observed region, once,
+// with every clock that ticked in that step.
+inline Task concClockProc(int k, int ci) {
+    ConcAssert& c = concAsserts()[k];
+    const auto* ev = ci == 0 ? &c.ev : &c.more[ci - 1].first;
+    const E& iff = ci == 0 ? c.clkIff : c.more[ci - 1].second;
+    for (;;) {
+        if (ev->size() > 1) co_await WaitAny{ev};
+        else co_await Wait{(*ev)[0].first, (*ev)[0].second};
+        if (iff && truth(eval(iff, rd)) != 1) continue;
+        c.ticked |= 1u << ci;
+        if (c.due) continue;
+        c.due = true;
+        co_await ToObserved{};
+        uint32_t t = c.ticked;
+        c.ticked = 0;
+        c.due = false;
+        concTick(c, t);
+    }
+}
 inline Task concProc(int k) {
     ConcAssert& c = concAsserts()[k];
     const auto* ev = &c.ev;
@@ -767,7 +791,9 @@ inline Task concDisableProc(int k, shared_ptr<vector<pair<int, Edge>>> ev) {
 }
 inline void startConcAsserts() {
     for (size_t k = 0; k < concAsserts().size(); k++) {
-        S.spawn(concProc((int)k));
+        if (concAsserts()[k].more.empty()) S.spawn(concProc((int)k));
+        else
+            for (size_t ci = 0; ci <= concAsserts()[k].more.size(); ci++) S.spawn(concClockProc((int)k, (int)ci));
         if (const E& d = concAsserts()[k].disable) {
             vector<int> sigs;
             collectRefs(d, sigs);

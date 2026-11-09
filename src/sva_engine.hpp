@@ -95,6 +95,12 @@ struct Node {
     bool isect = false;   // has an intersection inside: may be empty without being NUL
     bool envDep = false;  // depends on local variables: reads or sets one, or has an ENV inside
     bool prop = false;    // a property term (not a sequence)
+    // Multiclock (16.13): the clock of a node that waits for ticks (an index
+    // into the assertion's clocks; 0 is the leading one), and the clocks of
+    // the node and everything in it. A step where none of those ticked
+    // leaves the node as it is.
+    int clk = -1;
+    uint32_t mask = 0;
     int atom = -1;
     int lo = 0, hi = 0;
     std::vector<const Node*> kids;
@@ -107,7 +113,7 @@ class Store {
     struct Eq {
         bool operator()(const Node* a, const Node* b) const {
             return a->k == b->k && a->flags == b->flags && a->atom == b->atom && a->lo == b->lo && a->hi == b->hi &&
-                   a->kids == b->kids;
+                   a->clk == b->clk && a->kids == b->kids;
         }
     };
     std::deque<Node> arena;
@@ -116,12 +122,18 @@ class Store {
 public:
     // While lowering an assertion with local variables: which of its atoms read one.
     const std::vector<char>* localAtoms = nullptr;
+    int clk = 0;   // the clock new waiting nodes get (16.13)
+    static bool clocked(K k) {
+        return k == BOOL || k == ANY || k == NEXT || k == ALWAYS || k == EVENT || k == IF || k == ACCEPT || k == REJECT;
+    }
     const Node* mk(Node n) {
+        if (!clocked(n.k)) n.clk = 0;
+        else if (n.clk < 0) n.clk = clk;
         if (localAtoms && n.atom >= 0 && (n.k == BOOL || n.k == IF || n.k == ACCEPT || n.k == REJECT) &&
             n.atom < (int)localAtoms->size() && (*localAtoms)[n.atom])
             n.flags |= LOCAL;
         size_t h = (size_t)n.k * 1000003u ^ (size_t)n.flags * 7919u ^ (size_t)(n.atom + 1) * 31u ^
-                   (size_t)(n.lo + 3) * 131u ^ (size_t)(n.hi + 3) * 524287u;
+                   (size_t)(n.lo + 3) * 131u ^ (size_t)(n.hi + 3) * 524287u ^ (size_t)n.clk * 2654435761u;
         for (const Node* k : n.kids) h = h * 1315423911u ^ k->id;
         n.hash = h;
         if (auto it = set.find(&n); it != set.end()) return *it;
@@ -141,6 +153,8 @@ public:
         n.envDep = (n.flags & LOCAL) || n.k == ENV || n.k == MATCH || n.k == INIT;
         for (const Node* k : n.kids) n.envDep |= k->envDep;
         n.prop = (n.k >= PTRUE && n.k <= COVSEQ) || ((n.k == ENV || n.k == INIT) && n.kids[0]->prop);
+        n.mask = clocked(n.k) ? 1u << (n.clk & 31) : 0;
+        for (const Node* k : n.kids) n.mask |= k->mask;
         arena.push_back(std::move(n));
         set.insert(&arena.back());
         return &arena.back();
@@ -316,7 +330,7 @@ public:
         } else if (same) r = t;
         else if (t->k == SOR) r = sor(std::move(kids));
         else if (t->k == PAND || t->k == POR) r = pjunct(t->k, std::move(kids));
-        else { Node n; n.k = t->k; n.flags = t->flags; n.atom = t->atom; n.lo = t->lo; n.hi = t->hi; n.kids = std::move(kids); r = mk(n); }
+        else { Node n; n.k = t->k; n.flags = t->flags; n.atom = t->atom; n.lo = t->lo; n.hi = t->hi; n.clk = t->clk; n.kids = std::move(kids); r = mk(n); }
         memo[t] = r;
         return r;
     }
@@ -365,22 +379,28 @@ struct Deriv {
     Memo memo;
     LocalHook* lh = nullptr;   // null: no local variables
     int env = 0;               // the context environment
+    uint32_t ticking = ~0u;    // the clocks that ticked in this step (16.13): all of them for one clock
+    bool ticks(const Node* n) const { return (ticking >> (n->clk & 31)) & 1; }
     bool atom(const Node* n) const {
         bool v = (n->flags & LOCAL) && lh ? lh->atom(n->atom, env) : val[n->atom] != 0;
         return v != ((n->flags & NEG) != 0);
     }
 
     const Node* d(const Node* n) {
+        if (n->mask && !(n->mask & ticking)) return n;   // none of its clocks ticked: it waits (16.13)
         switch (n->k) {   // leaves without the memo
             case EMPTY: case NUL: return st.nul();
-            case ANY: return st.empty();
-            case BOOL: return atom(n) ? st.empty() : st.nul();
+            case ANY: return ticks(n) ? st.empty() : n;
+            case BOOL: return !ticks(n) ? n : atom(n) ? st.empty() : st.nul();
             case PTRUE: case PFALSE: case DONE: return n;
             default: break;
         }
         uint64_t key = (uint64_t)(n->envDep ? (uint32_t)env : 0u) << 32 | n->id;
         if (auto it = memo.find(key); it != memo.end()) return it->second;
+        int savedClk = st.clk;
+        st.clk = n->clk;   // nodes this step builds wait on the same clock
         const Node* r = step(n);
+        st.clk = savedClk;
         memo[key] = r;
         return r;
     }
@@ -512,8 +532,10 @@ struct Deriv {
                 follow(r, k[1], v);
                 return st.pand(std::move(v));
             }
-            case NEXT: return n->lo == 0 ? d(k[0]) : st.nextR(k[0], n->lo - 1, n->flags & STRONG);
+            // nexttime[0] as a residual is "from the next step on": it does not wait for its own clock.
+            case NEXT: return n->lo == 0 ? d(k[0]) : !ticks(n) ? n : st.nextR(k[0], n->lo - 1, n->flags & STRONG);
             case ALWAYS: {
+                if (!ticks(n)) return n;
                 const Node* now = n->lo == 0 ? d(k[0]) : st.ptrue();
                 const Node* rest = n->hi == 0 ? st.ptrue()
                                               : st.ranged(ALWAYS, k[0], n->lo ? n->lo - 1 : 0, n->hi < 0 ? -1 : n->hi - 1,
@@ -521,6 +543,7 @@ struct Deriv {
                 return st.pand({now, rest});
             }
             case EVENT: {
+                if (!ticks(n)) return n;
                 const Node* now = n->lo == 0 ? d(k[0]) : st.pfalse();
                 const Node* rest = n->hi == 0 ? st.pfalse()
                                               : st.ranged(EVENT, k[0], n->lo ? n->lo - 1 : 0, n->hi < 0 ? -1 : n->hi - 1,
@@ -533,9 +556,11 @@ struct Deriv {
                 const Node* stop = (n->flags & WITH) ? st.pand({dp, dq}) : dq;
                 return st.por({stop, st.pand({dp, n})});
             }
-            case IF: return atom(n) ? d(k[0]) : k.size() > 1 ? d(k[1]) : st.ptrue();
-            case ACCEPT: return atom(n) ? st.ptrue() : st.abort(ACCEPT, n->atom, d(k[0]));
-            case REJECT: return atom(n) ? st.pfalse() : st.abort(REJECT, n->atom, d(k[0]));
+            case IF:
+                if (!ticks(n)) return n;
+                return atom(n) ? d(k[0]) : k.size() > 1 ? d(k[1]) : st.ptrue();
+            case ACCEPT: return ticks(n) && atom(n) ? st.ptrue() : st.abort(ACCEPT, n->atom, d(k[0]));
+            case REJECT: return ticks(n) && atom(n) ? st.pfalse() : st.abort(REJECT, n->atom, d(k[0]));
             case COVSEQ: {
                 const Node* r = d(k[0]);
                 if (r->nullable) matches++;
@@ -658,6 +683,10 @@ struct ConcAssert {
     // matches, endSig (a count, for @(s)) and endSig + 1 (the time + 1, for
     // .triggered) are set, and so is each flag in matchFlags (.matched).
     int endSig = -1;
+    // The clocks after the leading one (16.13): each event and iff.
+    std::vector<std::pair<std::vector<std::pair<int, Edge>>, E>> more;
+    uint32_t ticked = 0;   // runtime: the clocks that ticked in this time step
+    bool due = false;      // runtime: a step is waiting for the observed region
     std::vector<int> matchFlags;
     std::vector<int> clearFlags;   // .matched flags this assertion reads: cleared after each of its ticks
 };

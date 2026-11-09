@@ -350,6 +350,7 @@ struct SvaBuild {
     std::vector<int> localSigs;      // local variables (16.10), as hidden signals
     std::vector<std::vector<ConcAssert::Item>> acts;   // match items and initializers
     std::vector<int> matchFlags;     // .matched flags read (16.13.6)
+    std::vector<std::pair<std::vector<std::pair<int, Edge>>, E>> more;   // the other clocks (16.13)
     std::unordered_map<const slang::ast::Expression*, int> atomOf;
     std::vector<std::pair<int, Edge>> clk;
     E clkIff;
@@ -494,13 +495,28 @@ void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge
     }
     collectEvents(t, ev);
 }
-// A clock inside the assertion: the same as the leading clock, or multiclock.
-void sameClock(const slang::ast::TimingControl& t) {
+// A clock inside the assertion (16.13): its index, 0 for the leading clock;
+// a different one is a clock of a multiclock assertion.
+int clockIdx(const slang::ast::TimingControl& t) {
     std::vector<std::pair<int, Edge>> ev;
     E iff;
     clockOf(t, ev, iff);
-    if (svb->clk.empty()) { svb->clk = ev; svb->clkIff = iff; return; }
-    if (ev != svb->clk) unsupported("multiclock assertion (16.13)");
+    if (svb->clk.empty()) { svb->clk = ev; svb->clkIff = iff; return 0; }
+    if (ev == svb->clk && !iff && !svb->clkIff) return 0;
+    for (size_t k = 0; k < svb->more.size(); k++)
+        if (svb->more[k].first == ev && !iff && !svb->more[k].second) return (int)k + 1;
+    if (svb->more.size() >= 31) unsupported("an assertion with more than 32 clocks");
+    svb->more.push_back({ev, iff});
+    return (int)svb->more.size();
+}
+// t's subterm under clock ci.
+template <class F> const sva::Node* underClock(int ci, F f) {
+    auto& st = sva::store();
+    int saved = st.clk;
+    st.clk = ci;
+    const sva::Node* r = f();
+    st.clk = saved;
+    return r;
 }
 static int rangeHi(const std::optional<uint32_t>& m) { return m ? (int)*m : -1; }
 
@@ -578,8 +594,7 @@ const sva::Node* seqTerm(const slang::ast::AssertionExpr& a) {
         }
         case AssertionExprKind::Clocking: {
             const auto& c = a.as<ClockingAssertionExpr>();
-            sameClock(c.clocking);
-            return seqTerm(c.expr);
+            return underClock(clockIdx(c.clocking), [&] { return seqTerm(c.expr); });
         }
         default: unsupported("this sequence expression");
     }
@@ -666,8 +681,7 @@ const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
         }
         case AssertionExprKind::Clocking: {
             const auto& c = a.as<ClockingAssertionExpr>();
-            sameClock(c.clocking);
-            return propTerm(c.expr, strong);
+            return underClock(clockIdx(c.clocking), [&] { return propTerm(c.expr, strong); });
         }
         case AssertionExprKind::StrongWeak: {
             const auto& s = a.as<StrongWeakAssertionExpr>();
@@ -756,6 +770,8 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     if (b.clk.empty()) unsupported("an end point of a sequence with no clock (16.13.6)");
     svb = &b;
     sva::store().localAtoms = &b.atomLocal;
+    int savedClk = sva::store().clk;
+    sva::store().clk = 0;
     sampleEv = b.clk;
     ConcAssert c;
     AssertInfo info;
@@ -775,8 +791,10 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
     c.endSig = sg;
+    c.more = std::move(b.more);
     svb = saved;
     sva::store().localAtoms = savedLocal;
+    sva::store().clk = savedClk;
     sampleEv = savedEv;
     int k = (int)concAsserts().size();
     concAsserts().push_back(std::move(c));
@@ -824,7 +842,8 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     const Expression* dis = nullptr;
     std::vector<int> inits;   // the local variables of the leading property instances
     sva::store().localAtoms = &b.atomLocal;
-    struct Reset { ~Reset() { sva::store().localAtoms = nullptr; } } reset;
+    sva::store().clk = 0;
+    struct Reset { ~Reset() { sva::store().localAtoms = nullptr; sva::store().clk = 0; } } reset;
     for (;;) {
         if (const auto* ai = instanceOf(*a); ai && ai->symbol.kind == SymbolKind::Property) {
             inits.push_back(instLocals(*ai));
@@ -832,7 +851,7 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         } else if (a->kind == AssertionExprKind::Clocking) {
             const auto& c = a->as<ClockingAssertionExpr>();
             if (b.clk.empty()) clockOf(c.clocking, b.clk, b.clkIff);
-            else sameClock(c.clocking);
+            else sva::store().clk = clockIdx(c.clocking);
             a = &c.expr;
         } else if (a->kind == AssertionExprKind::DisableIff) {
             if (dis) unsupported("nested disable iff (16.12)");
@@ -869,6 +888,8 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
     c.clearFlags = std::move(b.matchFlags);
+    c.more = std::move(b.more);
+    if (!c.more.empty() && !staticAssert) unsupported("a multiclock assertion in a procedure (16.14.6)");
     if (!staticAssert) {   // in a procedure (16.14.6): queued when the procedure reaches it
         c.procedural = true;
         // Automatic variables are read as they were when the instance was
