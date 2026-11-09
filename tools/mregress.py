@@ -118,6 +118,7 @@ def spec_tests(directory):
     for sv in sorted(glob.glob(os.path.join(directory, "*.sv"))):
         name = os.path.splitext(os.path.basename(sv))[0]
         opts = {"expect": "inline"}
+        extra = []
         # Markers shared with tests/spec/run_spec.cmake and the spec suite:
         # icarus-skip, and (msim only) xfail: <known gap> and exit: <status>.
         with open(sv, encoding="utf-8", errors="replace") as f:
@@ -131,7 +132,9 @@ def spec_tests(directory):
                     opts["xfail"], opts["xfail-sims"] = m.group(2) or "known gap", "msim"
                 elif m.group(1) == "exit":
                     opts["exit"], opts["exit-sims"] = m.group(2), "msim"
-        tests.append(Test(name, [os.path.abspath(sv)], opts, os.path.dirname(sv)))
+                elif m.group(1) == "args":
+                    extra = shlex.split(m.group(2))
+        tests.append(Test(name, [os.path.abspath(sv)] + extra, opts, os.path.dirname(sv)))
     return tests
 
 

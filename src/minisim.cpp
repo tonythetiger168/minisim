@@ -14,6 +14,7 @@
 // $finish            -> S.finished = true
 // task/function      -> Call / Ret in this coroutine (exec.inc)
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <coroutine>
 #include <cstdint>
@@ -42,6 +43,8 @@ using Handle = coroutine_handle<>;
 #include "clocking.hpp"
 #include "cover.hpp"
 #include "tchk.hpp"
+#include "specify.hpp"
+#include "sdf.hpp"
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
@@ -704,7 +707,88 @@ struct Sim {
             auto nd = netDelay.find(s);
             if (nd != netDelay.end()) { schedule(s, -1, r, g.val, nd->second, STR_STRONG, STR_STRONG); return; }
         }
+        if (!timedOut.empty() && (size_t)s < timedOut.size() && timedOut[s]) {   // 30.5.3, 32.4.4
+            scheduleIn(s, -1, r, g.val, pathDelay(s, g.val, r), STR_STRONG, STR_STRONG);
+            return;
+        }
         set(s, r);
+    }
+
+    // Specify path outputs and interconnect loads (30.4, 32.4.4). timedOut[s]
+    // marks a net whose resolved value takes a path or interconnect delay;
+    // lastChg is the time each path input last changed (30.5.3).
+    vector<uint8_t> timedOut, pathIn;
+    vector<uint64_t> lastChg;
+    unordered_map<int, vector<int>> pathsTo;               // output -> pathRecs() indices
+    unordered_map<int, array<uint64_t, 12>> icDelay;       // load port -> interconnect delay
+    bool (*pathCond)(const E&) = nullptr;                  // a path condition holds (x counts)
+    // Sizes the tables once the design is lowered and annotated.
+    void setupPaths() {
+        timedOut.assign(sigs.size(), 0);
+        pathIn.assign(sigs.size(), 0);
+        lastChg.assign(sigs.size(), 0);
+        pathsTo.clear();
+        auto& P = pathRecs();
+        for (size_t k = 0; k < P.size(); k++) {
+            pathsTo[P[k].dst].push_back((int)k);
+            timedOut[(size_t)P[k].dst] = 1;
+            pathIn[(size_t)P[k].src] = 1;
+        }
+        for (auto& [sg, d] : icDelay) timedOut[(size_t)sg] = 1;
+        // Like a net delay, a delayed net with drivers is x until its first
+        // value arrives (28.16).
+        for (size_t k = 0; k < timedOut.size(); k++)
+            if (timedOut[k] && !sigs[k].drv.empty() && now == 0) sigs[k].val = allx(sigs[k].w);
+    }
+    // The delay of one transition: each changed bit's from/to levels pick
+    // one of the 12 delays; a vector takes the smallest.
+    template <class D> static uint64_t delay12(const D& d, const Val& from, const Val& to) {
+        uint64_t best = ~0ULL;
+        int w = to.w;
+        for (int k = 0; k < w; k++) {
+            int f = bitAt(from, k), t = bitAt(to, k);
+            if (f == t) continue;
+            best = std::min<uint64_t>(best, d[(size_t)transIdx(f, t)]);
+        }
+        return best == ~0ULL ? 0 : best;
+    }
+    // 30.5.3: the paths to s whose input changed most recently and whose
+    // condition holds (an ifnone path when no conditional path between the
+    // same ports holds) are active; the delay is the smallest of theirs.
+    // With no active path there is no path delay. An interconnect delay to
+    // a load port comes after the path delay of a path ending there.
+    uint64_t pathDelay(int s, const Val& from, const Val& to) {
+        uint64_t t = 0;
+        auto pt = pathsTo.find(s);
+        if (pt != pathsTo.end()) {
+            auto& P = pathRecs();
+            auto& ids = pt->second;
+            auto on = [&](const PathRec& p) {
+                if (p.hasCond) return !pathCond || pathCond(p.condE);
+                if (!p.ifnone) return true;
+                for (int j : ids) {
+                    const PathRec& q = P[(size_t)j];
+                    if (q.hasCond && q.src == p.src && (!pathCond || pathCond(q.condE))) return false;
+                }
+                return true;
+            };
+            uint64_t latest = 0, best = ~0ULL;
+            bool any = false;
+            for (int j : ids) {
+                const PathRec& p = P[(size_t)j];
+                if (!on(p)) continue;
+                uint64_t lc = lastChg[(size_t)p.src];
+                uint64_t d = delay12(p.d, from, to);
+                if (!any || lc > latest) { latest = lc; best = d; any = true; }
+                else if (lc == latest) best = std::min(best, d);
+            }
+            if (any) t = best;
+        }
+        if (!icDelay.empty()) {
+            auto ic = icDelay.find(s);
+            if (ic != icDelay.end()) t += delay12(ic->second, from, to);
+        }
+        return t;
     }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
@@ -752,13 +836,17 @@ struct Sim {
         return rise;
     }
     void schedule(int s, int d, Val v, const Val& cur, const vector<uint64_t>& dl, uint8_t s0, uint8_t s1) {
+        uint64_t t = sameVal(v, cur) ? 0 : pickDelay(dl, cur, v);
+        scheduleIn(s, d, std::move(v), cur, t, s0, s1);
+    }
+    // The same with the delay t already chosen for the change from cur to v.
+    void scheduleIn(int s, int d, Val v, const Val& cur, uint64_t t, uint8_t s0, uint8_t s1) {
         auto& p = pend[{s, d}];
         if (p.live) {
             if (sameVal(v, p.v)) return;   // already on its way
             p.live = false;
         }
         if (sameVal(v, cur)) return;
-        uint64_t t = pickDelay(dl, cur, v);
         if (t == 0) { apply(s, d, v, s0, s1); return; }
         p.v = v;
         p.gen = ++pendGen;
@@ -1332,6 +1420,7 @@ struct Sim {
         int o = bit0(sigs[s].val), n = bit0(nv);
         if (g_cov) covToggle(s, sigs[s].val, nv);
         sigs[s].val = nv;
+        if (__builtin_expect(!pathIn.empty(), 0) && (size_t)s < pathIn.size() && pathIn[s]) lastChg[s] = now;
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);

@@ -1,0 +1,4 @@
+// IEEE 1800-2023 33.8.2: relative file path specifications, from proj.
+library L1 .../rtl/*.v;        // lib1/rtl/a.v, lib1/rtl/b.v
+library L2 ./lib2/gates/?.v;   // lib2/gates/a.v, lib2/gates/b.v
+library L3 ./lib3/;            // every file in lib3

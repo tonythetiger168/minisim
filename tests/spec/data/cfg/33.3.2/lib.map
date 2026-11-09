@@ -1,0 +1,2 @@
+// IEEE 1800-2023 33.3.2: a user's map includes the provider's map.
+include vendor/vendor.map;

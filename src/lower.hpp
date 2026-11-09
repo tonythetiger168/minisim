@@ -56,6 +56,8 @@
 #include "clocking.hpp"
 #include "cover.hpp"
 #include "tchk.hpp"
+#include "specify.hpp"
+#include "sdf.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Expression.h"
@@ -137,6 +139,13 @@ inline FrameLayout* newLayout(std::string name) {
     layoutStore()->push_back(std::make_unique<FrameLayout>());
     layoutStore()->back()->name = std::move(name);
     return layoutStore()->back().get();
+}
+
+// Specparams an SDF LABEL (32.4.3) gives a new value, in the module's time
+// unit. Every expression that reads one is computed with that value.
+inline std::unordered_map<const slang::ast::Symbol*, double>& labelled() {
+    static std::unordered_map<const slang::ast::Symbol*, double> m;
+    return m;
 }
 
 // Time (22.7, 3.14.3): one kernel tick is the simulation precision, the finest
@@ -478,12 +487,57 @@ struct Lowerer {
         if (!any) out.clear();   // #0 is no delay
         return out;
     }
+    // $sdf_annotate ( sdf_file [, module_instance [, config_file [, log_file
+    // [, mtm_spec [, scale_factors [, scale_type ]]]]]] ) (32.9): each
+    // argument's text, and whether it is known before the run (a literal,
+    // the instance, or left out). The scope defaults to the caller's instance.
+    static void sdfArgs(const slang::ast::CallExpression& call, std::string (&fields)[7], bool (&known)[7]) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (args.empty() || args.size() > 7) unsupported("$sdf_annotate arguments");
+        const auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine);
+        fields[1] = sci && sci->scope ? instPath(sci->scope.get()) : std::string("top");
+        for (size_t k = 0; k < 7; k++) {
+            known[k] = true;
+            if (k >= args.size() || peel(*args[k]).kind == ExpressionKind::EmptyArgument) continue;
+            const Expression& a = peel(*args[k]);
+            if (k == 1) {
+                const Symbol* sym = a.kind == ExpressionKind::ArbitrarySymbol ? a.as<ArbitrarySymbolExpression>().symbol.get() : nullptr;
+                if (!sym || sym->kind != SymbolKind::Instance) unsupported("a $sdf_annotate scope that is not an instance");
+                fields[1] = sym->getHierarchicalPath();
+            } else if (a.kind == ExpressionKind::StringLiteral) fields[k] = std::string(a.as<StringLiteral>().getValue());
+            else known[k] = false;
+        }
+    }
+    static const slang::ast::Expression& mtmOf(const slang::ast::MinTypMaxExpression& m) {
+        return mtmSelect() == 0 ? m.min() : mtmSelect() == 2 ? m.max() : m.typ();
+    }
+    // Does e read a specparam that an SDF LABEL changed?
+    static bool readsLabel(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        if (labelled().empty()) return false;
+        struct V : ASTVisitor<V, VisitFlags::Expressions> {
+            bool hit = false;
+            void handle(const NamedValueExpression& n) { hit |= labelled().count(&n.symbol) != 0; }
+        } v;
+        e.visit(v);
+        return v.hit;
+    }
+    // A constant expression that reads a LABEL'd specparam, computed with
+    // its new value (32.4.3).
+    std::optional<double> labelFold(const slang::ast::Expression& e) {
+        if (!readsLabel(e)) return std::nullopt;
+        E v = realOf(e);
+        Val r = eval(v, [](int) -> Val { unsupported("a specparam expression that reads a signal"); });
+        return v_real(r);
+    }
     void delayInto(const slang::ast::Expression& d, Instr& i) {
         using namespace slang::ast;
-        if (peel(d).kind == ExpressionKind::MinTypMax) {   // #(1:2:3) uses the typical value (11.11)
-            delayInto(peel(d).as<MinTypMaxExpression>().typ(), i);
+        if (peel(d).kind == ExpressionKind::MinTypMax) {   // #(1:2:3): the typical value unless +mindelays / +maxdelays (11.11)
+            delayInto(mtmOf(peel(d).as<MinTypMaxExpression>()), i);
             return;
         }
+        if (auto lv = labelFold(d)) { i.delay = ticksOf(*lv); return; }
         const Expression& x = peel(d);
         if (x.kind == ExpressionKind::RealLiteral) { i.delay = ticksOf(x.as<RealLiteral>().getValue()); return; }
         if (x.kind == ExpressionKind::TimeLiteral) { i.delay = ticksOf(x.as<TimeLiteral>().getValue()); return; }
@@ -1600,7 +1654,7 @@ struct Lowerer {
                 if (n == "$sformatf" || n == "$psprintf") {
                     auto args = call.arguments();
                     auto f = node(Op::SFormat);
-                    hierName = scopeName(call);
+                    hierName = scopeName(call); libName = libCell(call);
                     formatInto(args, 'd', f->fmt, f->kids);
                     return f;
                 }
@@ -1680,6 +1734,13 @@ struct Lowerer {
     }
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
+        if (e.kind == ExpressionKind::NamedValue && !labelled().empty())   // a LABEL'd specparam (32.4.3)
+            if (auto lv = labelled().find(&e.as<NamedValueExpression>().symbol); lv != labelled().end()) {
+                if (e.type->isFloating()) return konst(mkreal(lv->second));
+                int w = (int)e.type->getBitWidth();
+                Val k = make((uint64_t)std::llround(lv->second), 0, w, 0, e.type->isSigned());
+                return sized(konst(k), w, e.type->isSigned(), ctx);
+            }
         if (!rawNext)
             if (E l = lazyExpr(e, ctx)) return l;
         bool raw = rawNext;
@@ -2574,7 +2635,18 @@ struct Lowerer {
     E constSym(const slang::ast::Symbol& sym, const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
         const slang::ConstantValue* cv = nullptr;
-        if (sym.kind == SymbolKind::Parameter) cv = &sym.as<ParameterSymbol>().getValue();
+        if (sym.kind == SymbolKind::Specparam) {   // 30.3; an SDF LABEL may have changed it (32.4.3)
+            if (auto lv = labelled().find(&sym); lv != labelled().end()) {
+                if (e.type->isFloating()) return konst(mkreal(lv->second));
+                int w = (int)e.type->getBitWidth();
+                return sized(konst(make((uint64_t)std::llround(lv->second), 0, w, 0, e.type->isSigned())), w, e.type->isSigned(), ctx);
+            }
+            cv = &sym.as<SpecparamSymbol>().getValue();
+            if (cv->isReal()) return konst(mkreal(cv->real()));
+            if (cv->isShortReal()) return konst(mkreal(cv->shortReal()));
+        }
+        if (cv) {}
+        else if (sym.kind == SymbolKind::Parameter) cv = &sym.as<ParameterSymbol>().getValue();
         else if (sym.kind == SymbolKind::EnumValue) cv = &sym.as<EnumValueSymbol>().getValue();
         else if (const auto* c = e.getConstant()) cv = c;
         if (!cv || !cv->isInteger()) unsupported("reference to non-signal symbol");
@@ -2654,8 +2726,8 @@ struct Lowerer {
                 needWidth(dst);
                 return expr(c.operand(), ExprCtx{dst, fill, tag, true});
             }
-            case ExpressionKind::MinTypMax:   // (1:2:3) is its typical value (11.11)
-                return expr(e.as<MinTypMaxExpression>().typ(), ctx);
+            case ExpressionKind::MinTypMax:   // (1:2:3) is its typical value, or min / max (11.11)
+                return expr(mtmOf(e.as<MinTypMaxExpression>()), ctx);
             case ExpressionKind::UnboundedLiteral: {   // q[$]: the last index (7.10.1)
                 if (dollarQ < 0) unsupported("$ outside a queue index");
                 Val one = mk(1, 32); one.sgn = true;
@@ -3166,8 +3238,25 @@ struct Lowerer {
         return s->getHierarchicalPath();
     }
     std::string hierName = "top";   // what %m prints for the call being lowered
-    static std::string substM(const std::string& f, const std::string& name) {
-        std::string esc, r;
+    std::string libName = "work.top";   // what %l prints (33.7)
+    // The library.cell bound to the instance containing the call (33.7).
+    static std::string libCell(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        const auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine);
+        for (const Scope* sc = sci && sci->scope ? sci->scope.get() : nullptr; sc; ) {
+            const Symbol& s = sc->asSymbol();
+            if (s.kind == SymbolKind::InstanceBody) {
+                const auto& def = s.as<InstanceBodySymbol>().getDefinition();
+                return def.sourceLibrary.name + "." + std::string(def.name);
+            }
+            sc = s.getParentScope();
+        }
+        return "work.top";
+    }
+    // %m (21.2.1.1) and %l (33.7) are known when lowering: put them in the text.
+    static std::string substM(const std::string& f, const std::string& name, const std::string& lib = "") {
+        std::string esc, escL, r;
+        for (char c : lib) { escL += c; if (c == '%') escL += '%'; }
         for (char c : name) { esc += c; if (c == '%') esc += '%'; }
         for (size_t p = 0; p < f.size(); p++) {
             if (f[p] != '%') { r += f[p]; continue; }
@@ -3175,6 +3264,7 @@ struct Lowerer {
             size_t q = p + 1;
             while (q < f.size() && (isdigit((unsigned char)f[q]) || f[q] == '.' || f[q] == '-')) q++;
             if (q < f.size() && (f[q] == 'm' || f[q] == 'M')) { r += esc; p = q; continue; }
+            if (q < f.size() && (f[q] == 'l' || f[q] == 'L') && !lib.empty()) { r += escL; p = q; continue; }
             r += f[p];
         }
         return r;
@@ -3244,7 +3334,7 @@ struct Lowerer {
         std::string_view base = n;
         if (base.ends_with('b') || base.ends_with('o') || base.ends_with('h')) { dflt = base.back(); base.remove_suffix(1); }
         auto f = node(Op::SFormat);
-        hierName = scopeName(call);
+        hierName = scopeName(call); libName = libCell(call);
         formatInto(args.subspan(1), dflt, f->fmt, f->kids);
         return sysFnNode(SF_FWRITE, {expr(*args[0]), f}, base == "$fdisplay" ? 1 : 0);
     }
@@ -3691,7 +3781,7 @@ struct Lowerer {
             if (a->kind == ExpressionKind::EmptyArgument) { fmt += ' '; continue; }
             const Expression& pe = peel(*a);
             if (pe.kind == ExpressionKind::StringLiteral && pending.empty()) {
-                std::string f = substM(std::string(pe.as<StringLiteral>().getValue()), hierName);
+                std::string f = substM(std::string(pe.as<StringLiteral>().getValue()), hierName, libName);
                 size_t at = fmt.size();
                 fmt += f;
                 addSpecs(f, at);
@@ -3740,10 +3830,10 @@ struct Lowerer {
         }
         const char* sev = n == "$fatal" ? "Fatal" : n == "$error" ? "Error" : n == "$warning" ? "Warning" : "Info";
         Instr i; i.k = IK::Display;
-        hierName = scopeName(call);
+        hierName = scopeName(call); libName = libCell(call);
         std::string escFile;   // a '%' in a file name prints as itself
         for (char c : file) { escFile += c; if (c == '%') escFile += '%'; }
-        i.fmt = substM(std::string(sev) + ": \"" + escFile + "\", " + std::to_string(line) + ": %m: at time %0t", hierName);
+        i.fmt = substM(std::string(sev) + ": \"" + escFile + "\", " + std::to_string(line) + ": %m: at time %0t", hierName, libName);
         E t = node(Op::Time);
         t->k = mk(1, 64);   // %t takes kernel ticks
         i.args.push_back(t);
@@ -4110,7 +4200,7 @@ struct Lowerer {
             Instr i; i.k = IK::Assign;
             lhs(*dst, i);
             auto f = node(Op::SFormat);
-            hierName = scopeName(call);
+            hierName = scopeName(call); libName = libCell(call);
             formatInto(args.subspan(1), 'd', f->fmt, f->kids);
             i.e = dst->type->isString() ? f : E(node(Op::StrToInt, {f}));
             if (!dst->type->isString()) i.e->hi = (int)dst->type->getBitWidth();
@@ -4158,6 +4248,31 @@ struct Lowerer {
             i.arr = ap;
             i.hex = n.ends_with('h');
             for (size_t a = 2; a < args.size() && a < 4; a++) i.args.push_back(expr(*args[a]));
+            prog.emit(i);
+            return;
+        }
+        if (n == "$sdf_annotate") {   // 32.9
+            // With every argument known now, the annotation is made before
+            // time 0, so the timing checks start with the annotated limits
+            // and LABELs reach the specparams; otherwise when the call runs.
+            auto args = call.arguments();
+            std::string fields[7];
+            bool known[7];
+            sdfArgs(call, fields, known);
+            std::vector<E> kids;
+            bool all = true;
+            for (size_t k = 0; k < 7; k++) {
+                if (known[k]) { kids.push_back(konst(mkstr(fields[k]))); continue; }
+                all = false;
+                kids.push_back(strOf(*args[k]));
+            }
+            if (all) {
+                SdfRequest r{fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], whereStr()};
+                sdfRequests().push_back(r);
+                return;
+            }
+            sdfAtRunTime() = true;
+            Instr i; i.k = IK::Assign; i.sig = fresh(32); i.e = sysFnNode(SF_SDF, std::move(kids));
             prog.emit(i);
             return;
         }
@@ -4225,7 +4340,7 @@ struct Lowerer {
             return;
         }
         Instr i; i.k = k; i.nonl = nonl;
-        hierName = scopeName(call);
+        hierName = scopeName(call); libName = libCell(call);
         formatInto(call.arguments(), dflt, i.fmt, i.args);
         prog.emit(i);
     }
@@ -5603,10 +5718,16 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.e = e ? init->expr(*e) : konst(mk(0, storeW(t)));
         init->prog.emit(i);
     }
-    // Module path delays (30.4): (a => b) = d delays every change of output
-    // net b by d, like a net delay. Paths to one output must all have the same
-    // delays, since minisim does not pick a path by which input changed last.
-    std::map<int, std::vector<uint64_t>> pathDelays;
+    // Module path delays (30.4, 30.5): each input-to-output pair of a path
+    // is a PathRec. When an output with paths changes, the kernel picks the
+    // delay from the paths whose input changed last and whose condition
+    // holds (30.5.3), so paths to one output may have different delays and
+    // SDF IOPATH entries (32.4.1) annotate each pair.
+    static std::string termText(const slang::ast::Expression& e) {
+        if (e.syntax) return sdf::squeeze(e.syntax->toString());
+        const slang::ast::Symbol* s = e.getSymbolReference();
+        return s ? std::string(s->name) : std::string();
+    }
     void handle(const slang::ast::TimingPathSymbol& tp) {
         using namespace slang::ast;
         Lowerer d(sigmap);
@@ -5614,21 +5735,50 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         d.setScope(tp.getParentScope());
         std::vector<uint64_t> dl;
         auto ds = tp.getDelays();
-        if (ds.size() != 1 && ds.size() != 2 && ds.size() != 3) Lowerer::unsupported("a path delay with 6 or 12 values");
+        if (ds.size() != 1 && ds.size() != 2 && ds.size() != 3 && ds.size() != 6 && ds.size() != 12)
+            Lowerer::unsupported("a path delay with this many values");
         for (const Expression* e : ds) {
             Instr t;
             d.delayInto(*e, t);
             if (t.de) Lowerer::unsupported("a path delay that is not constant");
             dl.push_back(t.delay);
         }
-        for (const Expression* o : tp.getOutputs()) {
-            const Expression& x = Lowerer::peel(*o);
-            if (x.kind != ExpressionKind::NamedValue) Lowerer::unsupported("a path to a select of an output");
-            const Symbol& sym = x.as<NamedValueExpression>().symbol;
-            if (sym.kind != SymbolKind::Net) Lowerer::unsupported("a path delay to a variable output");
-            int sg = sigmap.at(&sym);
-            auto [it, fresh] = pathDelays.emplace(sg, dl);
-            if (!fresh && it->second != dl) Lowerer::unsupported("paths with different delays to one output");
+        std::vector<uint64_t> d12 = expand12(dl);
+        auto sigOf = [&](const Expression* x, const char* what) {
+            const Expression& p = Lowerer::peel(*x);
+            const Symbol* sym = p.getSymbolReference();
+            if (p.kind == ExpressionKind::ElementSelect || p.kind == ExpressionKind::RangeSelect) {
+                const Expression& v = p.kind == ExpressionKind::ElementSelect ? p.as<ElementSelectExpression>().value()
+                                                                              : p.as<RangeSelectExpression>().value();
+                sym = Lowerer::peel(v).getSymbolReference();
+            }
+            auto it = sym ? sigmap.find(sym) : sigmap.end();
+            if (it == sigmap.end()) Lowerer::unsupported(what);
+            return std::pair<int, const Symbol*>(it->second, sym);
+        };
+        PathRec base;
+        base.inst = Lowerer::instPath(tp.getParentScope());
+        base.unit = d.ticksPerUnit();
+        if (const Expression* c = tp.getConditionExpr()) {
+            base.hasCond = true;
+            base.cond = termText(*c);
+            base.condE = d.expr(*c);
+        } else if (tp.isStateDependent) base.ifnone = true;
+        base.edge = tp.edgeIdentifier == EdgeKind::PosEdge ? 1 : tp.edgeIdentifier == EdgeKind::NegEdge ? 2
+                  : tp.edgeIdentifier == EdgeKind::BothEdges ? 3 : 0;
+        std::copy(d12.begin(), d12.end(), base.d);
+        auto ins = tp.getInputs(), outs = tp.getOutputs();
+        for (const Expression* o : outs) {
+            auto [dst, osym] = sigOf(o, "a path to this output");
+            if (osym->kind != SymbolKind::Net) Lowerer::unsupported("a path delay to a variable output");
+            for (const Expression* i : ins) {
+                PathRec r = base;
+                r.in = termText(*i);
+                r.out = termText(*o);
+                r.src = sigOf(i, "a path from this input").first;
+                r.dst = dst;
+                pathRecs().push_back(std::move(r));
+            }
         }
     }
     // A timing check (31): its events, limits in ticks and notifier, for
@@ -5668,6 +5818,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (!a.expr) Lowerer::unsupported("a timing check with an empty event");
             ev.e = lw.expr(*a.expr);
             ev.text = text((size_t)k);
+            ev.port = termText(*a.expr);
+            if (a.condition) ev.condText = termText(*a.condition);
             if (a.condition) {
                 ev.cond = lw.expr(*a.condition);
                 const Expression& c = Lowerer::peel(*a.condition);
@@ -5696,6 +5848,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         // The limits: constants in the module's time unit.
         auto ticks = [&](size_t k) -> int64_t {
             if (k >= args.size() || !args[k].expr) return 0;
+            if (auto lv = lw.labelFold(*args[k].expr)) return (int64_t)std::llround(*lv * (double)lw.ticksPerUnit());
             ASTContext ctx(*sc.getParentScope(), LookupLocation::max);
             slang::ConstantValue cv = ctx.tryEval(*args[k].expr);
             double u;
@@ -5749,15 +5902,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         t.unit = lw.ticksPerUnit();
         timingChecks().push_back(std::move(t));
     }
+    // A path delay to a net that also has a net delay is not modeled (30.6).
     void finishPaths() {
-        for (auto& [sg, dl] : pathDelays) {
-            bool any = false;
-            for (auto v : dl) any |= v != 0;
-            if (!any) continue;
+        for (auto& p : pathRecs())
             for (auto& nd : out.netDelays)
-                if (nd.first == sg) Lowerer::unsupported("a path delay to a net that also has a net delay");
-            out.netDelays.push_back({sg, dl});
-        }
+                if (nd.first == p.dst) Lowerer::unsupported("a path delay to a net that also has a net delay");
     }
     // `wire y = a & b;` (IEEE 1800-2023 10.3.1) is a continuous assignment to y.
     // `wire #d w;` is a net delay: every change of w's resolved value takes
@@ -6076,8 +6225,28 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
 
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
+        noteInstance(inst);
         connectInstance(inst);
         visitDefault(inst);
+    }
+    // What SDF annotation (32) looks up: each instance's cell, and the
+    // formal signal of each of its ports.
+    void noteInstance(const slang::ast::InstanceSymbol& inst) {
+        using namespace slang::ast;
+        std::string path = inst.getHierarchicalPath();
+        instCells()[path] = std::string(inst.getDefinition().name);
+        for (const Symbol* p : inst.body.getPortList()) {
+            if (p->kind != SymbolKind::Port) continue;
+            const auto& ps = p->as<PortSymbol>();
+            if (ps.isNullPort || !ps.internalSymbol) continue;
+            auto it = sigmap.find(ps.internalSymbol);
+            if (it == sigmap.end()) continue;
+            PortRec r;
+            r.sig = it->second;
+            r.dir = ps.direction == ArgumentDirection::In ? 0 : ps.direction == ArgumentDirection::Out ? 1 : 2;
+            r.net = ps.internalSymbol->kind == SymbolKind::Net;
+            portRecs()[path + "." + std::string(ps.name)] = r;
+        }
     }
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
@@ -6401,6 +6570,92 @@ inline void sampledInit(LowerResult& out) {
     out.procs.insert(out.procs.begin() + (ptrdiff_t)at, {std::move(p), false, "sampled"});
 }
 
+// SDF LABELs (32.4.3) before lowering: the $sdf_annotate calls whose
+// arguments are known and msim -sdf are read here only for their LABEL
+// entries, which set labelled() so that the specparams' new values are
+// used wherever they are read. The rest of each file is annotated before
+// time 0 (sdf_annotate.inc).
+inline void sdfLabels(slang::ast::Compilation& comp) {
+    using namespace slang::ast;
+    labelled().clear();
+    labelledNames().clear();
+    std::vector<SdfRequest> reqs;
+    for (auto& r : sdfRequests()) if (r.cli) reqs.push_back(r);
+    std::map<std::string, const InstanceSymbol*> insts;
+    struct Scan : ASTVisitor<Scan, VisitFlags::Statements | VisitFlags::Expressions> {
+        std::vector<SdfRequest>* reqs;
+        std::map<std::string, const InstanceSymbol*>* insts;
+        void handle(const InstanceSymbol& i) {
+            if (i.body.flags.has(InstanceFlags::Uninstantiated)) return;
+            (*insts)[i.getHierarchicalPath()] = &i;
+            visitDefault(i);
+        }
+        void handle(const CallExpression& c) {
+            if (c.isSystemCall() && c.getSubroutineName() == "$sdf_annotate") {
+                std::string f[7];
+                bool known[7];
+                try { Lowerer::sdfArgs(c, f, known); } catch (const std::exception&) { return; }
+                bool all = true;
+                for (bool k : known) all &= k;
+                if (all) reqs->push_back({f[0], f[1], f[2], f[3], f[4], f[5], f[6], ""});
+            }
+            visitDefault(c);
+        }
+    } scan;
+    scan.reqs = &reqs;
+    scan.insts = &insts;
+    comp.getRoot().visit(scan);
+    std::map<std::string, double> vals;   // current value of each LABEL'd specparam, in its module's unit
+    std::map<std::string, const SpecparamSymbol*> syms;
+    for (auto& r : reqs) {
+        sdf::File f;
+        sdf::Error err;
+        if (!sdf::read(r.file, f, err)) continue;   // reported when annotating
+        sdf::Sel sel;
+        sel.mtm = mtmSelect();
+        std::vector<std::string> warn;
+        if (!r.config.empty()) sdf::readConfig(sel, r.config, mtmSelect(), warn);
+        if (!r.mtm.empty()) sdf::setMtm(sel, r.mtm, mtmSelect());
+        if (!r.scale.empty()) sdf::setScale(sel, r.scale);
+        if (!r.scaleType.empty()) sdf::setScaleType(sel, r.scaleType);
+        for (const sdf::Op& op : f.ops) {
+            if (op.kind != sdf::LABEL || op.vals.size() != 1) continue;
+            std::vector<const InstanceSymbol*> where;
+            if (op.wild) {
+                for (auto& [p, i] : insts)
+                    if ((p == r.scope || p.rfind(r.scope + ".", 0) == 0) && i->getDefinition().name == op.cellType)
+                        where.push_back(i);
+            } else {
+                std::string p = r.scope;
+                for (auto& n : sdf::splitPath(op.inst)) p += "." + n;
+                if (auto it = insts.find(p); it != insts.end()) where.push_back(it->second);
+            }
+            auto v = sdf::pick(op.vals[0].d, sel);
+            if (!v) continue;
+            for (const InstanceSymbol* i : where) {
+                const Symbol* sym = i->body.find(sdf::unescape(op.label));
+                if (!sym || sym->kind != SymbolKind::Specparam) continue;
+                const auto& sp = sym->as<SpecparamSymbol>();
+                int unit = -9;
+                if (auto ts = i->body.getTimeScale()) unit = tsExp(ts->base);
+                double units = *v * f.timescale / std::pow(10.0, unit);
+                std::string name = i->getHierarchicalPath() + "." + std::string(sp.name);
+                if (!vals.count(name)) {
+                    const auto& cv = sp.getValue();
+                    vals[name] = cv.isReal() ? (double)cv.real() : cv.isInteger() && !cv.integer().hasUnknown()
+                                 ? (double)*cv.integer().as<int64_t>() : 0.0;
+                }
+                vals[name] = op.incr ? vals[name] + units : units;
+                syms[name] = &sp;
+            }
+        }
+    }
+    for (auto& [name, v] : vals) {
+        labelled()[syms[name]] = v;
+        labelledNames()[name] = v;
+    }
+}
+
 inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                          std::function<int(int)> newDriver) {
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
@@ -6420,6 +6675,12 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
     Lowerer::compilation() = &comp;
+    pathRecs().clear();
+    portRecs().clear();
+    instCells().clear();
+    std::erase_if(sdfRequests(), [](const SdfRequest& r) { return !r.cli; });
+    sdfAtRunTime() = false;
+    sdfLabels(comp);
     {   // remember every signal's name and width, for sampled-value shadows (16.5.1)
         MkSig inner = std::move(mkSig);
         mkSig = [inner](const std::string& n, int w, bool net) {

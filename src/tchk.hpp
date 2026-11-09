@@ -27,6 +27,8 @@ struct TcEvent {
     bool nondet = false;   // the condition is == or !=: x enables the check
     uint8_t edges = 0;
     std::string text;      // the argument as written, for messages
+    std::string port;      // the terminal ("d", "d[3]"), for SDF matching (32.4.2)
+    std::string condText;  // the &&& condition, spaces removed
 };
 
 struct TimingCheck {
@@ -39,7 +41,7 @@ struct TimingCheck {
     int64_t thresh = 0;          // $width
     bool eventBased = false, remainActive = false;   // $timeskew, $fullskew
     int notifier = -1;           // signal, or -1
-    std::string limText;         // the limits as written
+    std::string limText;         // the limits as written (SDF annotation rewrites them)
     std::string inst, file;
     int line = 0;
     uint64_t unit = 1;           // ticks per time unit of the module, for messages

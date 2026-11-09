@@ -8,6 +8,18 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- SDF back-annotation (32): `$sdf_annotate` and `msim -sdf` read SDF 3.0
+  files and annotate specify paths (IOPATH, COND, CONDELSE, DEVICE),
+  interconnect delays (PORT, NETDELAY, INTERCONNECT), timing check limits
+  (Table 32-2) and specparams (LABEL), with ABSOLUTE / INCREMENT, min:typ:max
+  selection, scale factors, a config file and a log file. `+mindelays`,
+  `+typdelays` and `+maxdelays` pick from min:typ:max (11.11).
+- Specify path delays pick the delay of the paths whose input changed last
+  and whose condition holds (30.5.3), so paths to one output may differ;
+  6- and 12-value path delays (30.5.1, 30.5.2).
+- Configurations and libraries (33): `msim -libmap`, configs as the top
+  (with or without `-top`), library tops, `-L`, and `%l` / `%L`.
+- Spec tests can pass msim arguments with a `//! args:` line.
 - Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
   `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
