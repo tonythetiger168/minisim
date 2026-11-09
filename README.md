@@ -95,6 +95,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-threads <n>` | Worker threads (default: hardware threads, at most 8; capped at the hardware threads) |
 | `-no-static-seq`, `-no-partition` | Turn off clocked-process functions / partition tasks |
 | `-no-2state` | `-compile` without the 2-state fast path |
+| `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |
@@ -197,6 +198,32 @@ Two kinds of work run in parallel:
 Results are committed in a fixed order, so the output is the same for every
 thread count (`ctest -R msim_threads` checks it). Small batches stay on one
 thread. `-no-static-seq` and `-no-partition` turn the two parts off.
+
+### Cycle domain (`-compile`)
+
+Like Verilator's `eval()`. The largest group of clocked processes that wait
+on the same events (usually every `always @(posedge clk)`) runs as one
+function. Their NBAs go into fixed slots, and in the NBA region the slots are
+written and every static combinational process is re-evaluated once, in rank
+order. Writes skip `set()` when nothing else can see the signal (no process
+waits on it, no VCD, no `$monitor`), and a signal that only the domain touches
+lives in a plain C++ variable instead of the kernel's signal table. The time
+wheel also no longer allocates per time step. `-no-cycle` turns the domain off.
+
+Signals the testbench only initializes and `$display`s can be private too:
+those writes and reads are compiled to use the variable. When every signal
+the domain reads is known (no X or Z), a second copy of the domain without
+the per-expression X checks runs instead, and the rare 4-state code is kept
+out of the hot path.
+
+On a 4-core VM, run seconds, 1 thread (bench/run.sh):
+
+| design | before (main) | cycle domain | Verilator -O3 |
+|---|---|---|---|
+| lanes | 0.34 | 0.07 | 0.09 |
+| chain | 0.35 | 0.08 | 0.28 |
+| counter | 0.16 | 0.08 | 0.28 |
+| wide | 1.2 (4 threads) | 0.18 | 0.10 |
 
 ### 2-state fast path (`-compile`)
 
