@@ -1,6 +1,5 @@
 // IEEE 1800-2023 16.5: A concurrent assertion with an implication, checked
 // on each clock (16.5, 16.12).
-//! xfail: concurrent assertions are errors
 //! icarus-skip: Icarus 13 does not support concurrent assertions
 module top;
   logic clk = 0, req = 0, ack = 0;

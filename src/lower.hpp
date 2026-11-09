@@ -52,6 +52,7 @@
 
 #include "prog.hpp"
 #include "sva.hpp"
+#include "sva_engine.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Expression.h"
@@ -3968,6 +3969,9 @@ struct Lowerer {
             }
             case StatementKind::WaitFork: { Instr i; i.k = IK::WaitFork; prog.emit(i); break; }
             case StatementKind::ImmediateAssertion: immAssert(s.as<ImmediateAssertionStatement>()); break;
+            case StatementKind::ConcurrentAssertion:
+                concAssert(s.as<ConcurrentAssertionStatement>());
+                break;
             case StatementKind::DisableFork: { Instr i; i.k = IK::DisableFork; prog.emit(i); break; }
             default:
                 throw std::runtime_error("lower: unsupported statement kind " + std::string(toString(s.kind)));
@@ -4604,11 +4608,16 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         const Statement* st = &p.getBody();
         if (st->kind == StatementKind::Block && st->as<BlockStatement>().blockKind == StatementBlockKind::Sequential)
             st = &st->as<BlockStatement>().body;
-        if (st->kind != StatementKind::ImmediateAssertion) Lowerer::unsupported("concurrent assertion");
-        // A static deferred assertion acts as if in an always_comb (16.4.3).
         Lowerer lw(sigmap);
         prep(lw);
         lw.setScope(p.getParentScope());
+        if (st->kind == StatementKind::ConcurrentAssertion) {   // runs on its clock, not as a process
+            lw.staticAssert = true;
+            lw.stmt(p.getBody());
+            return;
+        }
+        if (st->kind != StatementKind::ImmediateAssertion) Lowerer::unsupported("this assertion item");
+        // A static deferred assertion acts as if in an always_comb (16.4.3).
         lw.stmt(p.getBody());
         auto rs = readSet(lw.prog);
         bool loops = !rs.empty();
@@ -4766,6 +4775,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
     asserts().clear();
+    concAsserts().clear();
+    sva::store().clear();
     shadowPairs().clear();
     sampleClocks().clear();
     sigInfo().clear();

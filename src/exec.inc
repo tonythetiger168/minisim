@@ -391,7 +391,9 @@ inline Task exec(const Prog* p) { return process(p); }
 // An immediate assertion. Returns the next pc. A simple one picks its
 // action by jumping; a deferred one queues a report on this process with
 // the action's arguments evaluated now (16.4).
+static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl);
 static size_t runAssert(const Instr& i, const shared_ptr<ProcCtl>& ctl, size_t pc) {
+    if (i.join == 3) { queueConc(i, ctl); return pc + 1; }   // a procedural concurrent assertion
     AssertInfo& a = asserts()[i.sig];
     if (!a.on) return i.join ? pc + 1 : i.hi;
     bool ok = truth(eval(i.e, rd)) == 1;
@@ -430,6 +432,17 @@ void Sim::runObserved() {
         observedQ.pop_front();
         if (!h.done()) h.resume();
     }
+    // Pending procedural concurrent assertions mature (16.14.6); those whose
+    // clock did not tick in this step start at its next tick.
+    for (int k : concPending()) {
+        ConcAssert& c = concAsserts()[k];
+        for (auto& p : c.pending) {
+            auto* pc = static_cast<ProcCtl*>(p.ctl.get());
+            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p.caps);
+        }
+        c.pending.clear();
+    }
+    concPending().clear();
     vector<DeferRep> reps;
     reps.swap(defObs);
     for (auto& r : reps)
@@ -470,6 +483,164 @@ static void assertCtl(const Instr& i) {
         for (auto* q : {&S.defObs, &S.defFin})
             std::erase_if(*q, [](const DeferRep& r) { return asserts()[r.id].killGen != r.killGen; });
 }
+// ---- concurrent assertions (16.14) ----
+struct ToObserved {   // resume in the observed region of this time slot (4.4.2.5)
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { S.observedQ.push_back(h); S.rare = true; }
+    void await_resume() const {}
+};
+// Pass and fail actions run in the reactive region (16.14.1), once per attempt.
+// `slots` take the attempt's captured automatic values (16.14.6.1).
+static void runAction(const Prog* p, uint64_t n, const vector<E>* slots = nullptr, const vector<Val>* caps = nullptr) {
+    if (!p) return;
+    for (uint64_t k = 0; k < n; k++) {
+        auto ctl = make_shared<ProcCtl>();
+        if (slots && caps)
+            for (size_t j = 0; j < slots->size(); j++) ctl->init.push_back({(*slots)[j].get(), (*caps)[j]});
+        Task t = startProc(p, ctl);
+        S.all.push_back(t.h);
+        S.reactive.push_back(t.h);
+    }
+    S.rare = true;
+}
+// One clock tick of a concurrent assertion, in the observed region: start an
+// attempt, then step every attempt on the sampled values of the atoms.
+static void concTick(ConcAssert& c) {
+    AssertInfo& a = asserts()[c.id];
+    if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
+        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) { return t.killGen != a.killGen; });
+    if (c.disable && truth(eval(c.disable, rd)) == 1) {   // disabled: no pass, no fail (16.12)
+        c.att.clear();
+        c.pending.clear();
+        c.matured.clear();
+        if (a.on) a.evals++;
+        return;
+    }
+    if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
+        for (auto& caps : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, caps}); a.evals++; }
+        c.matured.clear();
+        for (auto& p : c.pending) {
+            auto* pc = static_cast<ProcCtl*>(p.ctl.get());
+            if (!pc->killed && pc->epoch == p.epoch) { c.att.push_back({c.root, false, 1, a.killGen, p.caps}); a.evals++; }
+        }
+        c.pending.clear();
+    } else if (a.on) {
+        c.att.push_back({c.root, false, 1, a.killGen, nullptr});
+        a.evals++;
+    }
+    if (c.att.empty()) return;
+    // The atoms' values; with captured automatic values (16.14.6.1), once per
+    // distinct set of them.
+    vector<char> val(c.atoms.size());
+    const vector<Val>* valCaps = nullptr;
+    bool have = false;
+    auto values = [&](const ConcAssert::Caps& caps) {
+        if (have && (c.capSlot.empty() || valCaps == caps.get())) return;
+        if (caps)
+            for (size_t k = 0; k < c.capSlot.size(); k++) c.capSlot[k]->k = (*caps)[k];
+        valCaps = caps.get();
+        have = true;
+        for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
+    };
+    sva::Deriv dv{sva::store(), val};
+    vector<ConcAssert::Attempt> next;
+    for (auto& at : c.att) {
+        values(at.caps);
+        dv.memo.clear();
+        dv.nonvac = at.nonvac;
+        dv.matches = 0;
+        const sva::Node* t = dv.d(at.t);
+        if (c.coverSeq) {   // every match counts (16.14.3)
+            if (dv.matches) {
+                a.passes += at.count * dv.matches;
+                if (a.passOn) runAction(c.pass, at.count * dv.matches, &c.capSlot, at.caps.get());
+            }
+            if (t->k == sva::DONE) continue;
+        } else if (t->k == sva::PTRUE) {
+            a.passes += at.count;
+            if (dv.nonvac ? a.passOn : a.vacOn) runAction(c.pass, at.count, &c.capSlot, at.caps.get());
+            continue;
+        } else if (t->k == sva::PFALSE) {
+            a.fails += at.count;
+            if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
+            continue;
+        }
+        bool merged = false;
+        for (auto& n : next)
+            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps))) {
+                n.count += at.count;
+                merged = true;
+                break;
+            }
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps});
+    }
+    c.att.swap(next);
+}
+// A procedural concurrent assertion reached by its procedure (16.14.6):
+// queue an instance on this process, with its automatic values now.
+static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
+    ConcAssert& c = concAsserts()[i.hi];
+    if (!asserts()[c.id].on) return;   // $assertoff: no new instances (20.11)
+    ConcAssert::Caps caps;
+    if (!c.capSig.empty()) {
+        auto v = make_shared<vector<Val>>();
+        for (int s : c.capSig) v->push_back(S.get(R(s)));   // R: the variable in this process's frame
+        caps = v;
+    }
+    if (c.pending.empty()) concPending().push_back(i.hi);
+    c.pending.push_back({ctl, ctl->epoch, caps});
+    S.rare = true;
+}
+inline Task concProc(int k) {
+    ConcAssert& c = concAsserts()[k];
+    const auto* ev = &c.ev;
+    for (;;) {
+        if (ev->size() > 1) co_await WaitAny{ev};
+        else co_await Wait{(*ev)[0].first, (*ev)[0].second};
+        if (c.clkIff && truth(eval(c.clkIff, rd)) != 1) continue;   // @(posedge clk iff en)
+        co_await ToObserved{};
+        concTick(c);
+    }
+}
+// disable iff is checked whenever its value may change, not only at ticks:
+// once true, every attempt in flight is disabled (16.12).
+inline Task concDisableProc(int k, shared_ptr<vector<pair<int, Edge>>> ev) {
+    ConcAssert& c = concAsserts()[k];
+    for (;;) {
+        if (ev->size() > 1) co_await WaitAny{ev.get()};
+        else co_await Wait{(*ev)[0].first, (*ev)[0].second};
+        if (truth(eval(c.disable, rd)) == 1) c.att.clear();
+    }
+}
+inline void startConcAsserts() {
+    for (size_t k = 0; k < concAsserts().size(); k++) {
+        S.spawn(concProc((int)k));
+        if (const E& d = concAsserts()[k].disable) {
+            vector<int> sigs;
+            collectRefs(d, sigs);
+            auto ev = make_shared<vector<pair<int, Edge>>>();
+            for (int s : sigs) ev->push_back({s, ANY});
+            if (!ev->empty()) S.spawn(concDisableProc((int)k, ev));
+        }
+    }
+}
+// At the end of simulation, attempts still pending fail if they owe a
+// strong obligation (16.12.21). Their fail actions run with the final blocks.
+inline vector<Task> concEnd() {
+    vector<Task> ts;
+    for (auto& c : concAsserts()) {
+        AssertInfo& a = asserts()[c.id];
+        for (auto& at : c.att)
+            if (at.killGen == a.killGen && !sva::endValue(at.t)) {
+                a.fails += at.count;
+                if (a.failOn && c.fail)
+                    for (uint64_t n = 0; n < at.count; n++) ts.push_back(startProc(c.fail, make_shared<ProcCtl>()));
+            }
+        c.att.clear();
+    }
+    return ts;
+}
+
 // A sample clock (sva.hpp): marks the slots where it ticks.
 inline Task sampleClockProc(int c) {
     const auto* ev = &S.sclocks[c].ev;

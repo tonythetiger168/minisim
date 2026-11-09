@@ -38,6 +38,7 @@ using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
 #include "sva.hpp"
+#include "sva_engine.hpp"
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
@@ -1320,7 +1321,7 @@ struct Sim {
     // queued for any of them but postponed, so a design without assertions
     // or programs pays one flag test per pass.
     bool slotTail() {
-        if (!observedQ.empty() || !defObs.empty()) { runObserved(); return true; }   // observed (4.4.2.5)
+        if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) { runObserved(); return true; }   // observed (4.4.2.5)
         if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
             // Once the reactive set starts, it runs until it is empty, and
             // only then does the active set run again (4.5).

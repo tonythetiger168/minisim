@@ -4,6 +4,7 @@
 // The runtime side is in sva.hpp and exec.inc.
 
 const slang::ast::Scope* scope = nullptr;   // set by setScope
+bool staticAssert = false;   // lowering a module-level assertion (16.14.5), not procedural code
 // The clock of sampled value functions called without one (16.9.3): the
 // assertion's clock, or the clock inferred from the procedure (16.14.6).
 std::vector<std::pair<int, Edge>> sampleEv;
@@ -332,4 +333,371 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
     Val want = mk(n == "$rose" ? 1 : 0, 1);
     return bin(Op::LogAnd, bin(Op::CaseEq, bit0(cur), konst(want)),
                un(Op::LogNot, bin(Op::CaseEq, bit0(prev), konst(want))));
+}
+
+// ---- concurrent assertions (16.5 to 16.18) ----
+// The terms of one assertion while it is built (sva_engine.hpp).
+struct SvaBuild {
+    std::vector<E> atoms;
+    std::unordered_map<const slang::ast::Expression*, int> atomOf;
+    std::vector<std::pair<int, Edge>> clk;
+    E clkIff;
+};
+SvaBuild* svb = nullptr;
+
+// A boolean of the assertion, on sampled values (16.5.1).
+int svaAtom(const slang::ast::Expression& x) {
+    if (auto it = svb->atomOf.find(&x); it != svb->atomOf.end()) return it->second;
+    svb->atoms.push_back(sampledE(expr(x)));
+    int id = (int)svb->atoms.size() - 1;
+    svb->atomOf[&x] = id;
+    return id;
+}
+int svaAtomE(E e) {
+    svb->atoms.push_back(std::move(e));
+    return (int)svb->atoms.size() - 1;
+}
+// A clocking event as signal events and an optional iff condition.
+void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge>>& ev, E& iff) {
+    using namespace slang::ast;
+    if (t.kind == TimingControlKind::SignalEvent) {
+        const auto& s = t.as<SignalEventControl>();
+        if (s.iffCondition) {
+            if (iff) unsupported("a clock with more than one iff");
+            iff = expr(*s.iffCondition);
+        }
+    }
+    collectEvents(t, ev);
+}
+// A clock inside the assertion: the same as the leading clock, or multiclock.
+void sameClock(const slang::ast::TimingControl& t) {
+    std::vector<std::pair<int, Edge>> ev;
+    E iff;
+    clockOf(t, ev, iff);
+    if (svb->clk.empty()) { svb->clk = ev; svb->clkIff = iff; return; }
+    if (ev != svb->clk) unsupported("multiclock assertion (16.13)");
+}
+static int rangeHi(const std::optional<uint32_t>& m) { return m ? (int)*m : -1; }
+
+const sva::Node* repeated(const sva::Node* base, const slang::ast::Expression* boolX,
+                          const std::optional<slang::ast::SequenceRepetition>& rp) {
+    using slang::ast::SequenceRepetition;
+    auto& st = sva::store();
+    if (!rp) return base;
+    int lo = (int)rp->range.min, hi = rangeHi(rp->range.max);
+    switch (rp->kind) {
+        case SequenceRepetition::Consecutive: return st.rep(base, lo, hi);
+        case SequenceRepetition::GoTo:
+        case SequenceRepetition::Nonconsecutive: {
+            if (!boolX) unsupported("goto or nonconsecutive repetition of a sequence");
+            int a = svaAtom(*boolX);
+            return rp->kind == SequenceRepetition::GoTo ? st.gotoRep(a, lo, hi) : st.nonconsec(a, lo, hi);
+        }
+    }
+    return base;
+}
+static const slang::ast::AssertionInstanceExpression* instanceOf(const slang::ast::AssertionExpr& a) {
+    using namespace slang::ast;
+    if (a.kind != AssertionExprKind::Simple) return nullptr;
+    const Expression& x = a.as<SimpleAssertionExpr>().expr;
+    if (x.kind != ExpressionKind::AssertionInstance) return nullptr;
+    return &x.as<AssertionInstanceExpression>();
+}
+static void noLocals(const slang::ast::AssertionInstanceExpression& ai) {
+    if (!ai.localVars.empty()) unsupported("local variables in a sequence or property (16.10)");
+    if (ai.isRecursiveProperty) unsupported("recursive property (16.12.17)");
+}
+
+// A sequence (16.7, 16.9).
+const sva::Node* seqTerm(const slang::ast::AssertionExpr& a) {
+    using namespace slang::ast;
+    auto& st = sva::store();
+    switch (a.kind) {
+        case AssertionExprKind::Simple: {
+            const auto& s = a.as<SimpleAssertionExpr>();
+            if (const auto* ai = instanceOf(a)) {
+                noLocals(*ai);
+                return repeated(seqTerm(ai->body), nullptr, s.repetition);
+            }
+            if (s.expr.kind == ExpressionKind::Call) {
+                const auto& c = s.expr.as<CallExpression>();
+                if (c.getSubroutineName() == "triggered" || c.getSubroutineName() == "matched")
+                    unsupported("sequence methods triggered and matched (16.13.6)");
+            }
+            return repeated(st.boolean(svaAtom(s.expr)), &s.expr, s.repetition);
+        }
+        case AssertionExprKind::SequenceConcat: {
+            const sva::Node* r = nullptr;
+            for (auto& el : a.as<SequenceConcatExpr>().elements) {
+                const sva::Node* s = seqTerm(*el.sequence);
+                int lo = (int)el.delay.min, hi = rangeHi(el.delay.max);
+                if (!r && lo == 0 && hi == 0) r = s;
+                else r = st.delay(r, lo, hi, s);
+            }
+            return r ? r : st.empty();
+        }
+        case AssertionExprKind::SequenceWithMatch: {
+            const auto& s = a.as<SequenceWithMatchExpr>();
+            if (!s.matchItems.empty()) unsupported("sequence match items (16.10, 16.11)");
+            return repeated(seqTerm(s.expr), nullptr, s.repetition);
+        }
+        case AssertionExprKind::FirstMatch: {
+            const auto& f = a.as<FirstMatchAssertionExpr>();
+            if (!f.matchItems.empty()) unsupported("sequence match items (16.10, 16.11)");
+            return st.fm(seqTerm(f.seq));
+        }
+        case AssertionExprKind::Binary: {
+            const auto& b = a.as<BinaryAssertionExpr>();
+            switch (b.op) {
+                case BinaryAssertionOperator::And: return st.seqAnd(seqTerm(b.left), seqTerm(b.right));
+                case BinaryAssertionOperator::Or: return st.sor({seqTerm(b.left), seqTerm(b.right)});
+                case BinaryAssertionOperator::Intersect: return st.sand(seqTerm(b.left), seqTerm(b.right));
+                case BinaryAssertionOperator::Within: return st.within(seqTerm(b.left), seqTerm(b.right));
+                case BinaryAssertionOperator::Throughout: {
+                    if (b.left.kind != AssertionExprKind::Simple) unsupported("throughout of a sequence");
+                    return st.sand(st.rep(seqTerm(b.left), 0, -1), seqTerm(b.right));
+                }
+                default: unsupported("this property operator where a sequence is needed");
+            }
+        }
+        case AssertionExprKind::Clocking: {
+            const auto& c = a.as<ClockingAssertionExpr>();
+            sameClock(c.clocking);
+            return seqTerm(c.expr);
+        }
+        default: unsupported("this sequence expression");
+    }
+}
+// Whether an assertion expression is a sequence, as opposed to a property.
+bool isSeq(const slang::ast::AssertionExpr& a) {
+    using namespace slang::ast;
+    switch (a.kind) {
+        case AssertionExprKind::Simple:
+            if (const auto* ai = instanceOf(a)) return ai->symbol.kind != SymbolKind::Property && isSeq(ai->body);
+            return true;
+        case AssertionExprKind::SequenceConcat:
+        case AssertionExprKind::SequenceWithMatch:
+        case AssertionExprKind::FirstMatch: return true;
+        case AssertionExprKind::Binary: {
+            const auto& b = a.as<BinaryAssertionExpr>();
+            switch (b.op) {
+                case BinaryAssertionOperator::Intersect:
+                case BinaryAssertionOperator::Within:
+                case BinaryAssertionOperator::Throughout: return true;
+                case BinaryAssertionOperator::And:
+                case BinaryAssertionOperator::Or: return isSeq(b.left) && isSeq(b.right);
+                default: return false;
+            }
+        }
+        case AssertionExprKind::Clocking: return isSeq(a.as<ClockingAssertionExpr>().expr);
+        default: return false;
+    }
+}
+// A property (16.12). `strong`: how a bare sequence is read (16.12.2).
+const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
+    using namespace slang::ast;
+    auto& st = sva::store();
+    if (const auto* ai = instanceOf(a); ai && ai->symbol.kind == SymbolKind::Property) {
+        noLocals(*ai);
+        return propTerm(ai->body, strong);
+    }
+    if (isSeq(a)) return st.pseq(seqTerm(a), strong);
+    switch (a.kind) {
+        case AssertionExprKind::Unary: {
+            const auto& u = a.as<UnaryAssertionExpr>();
+            int lo = u.range ? (int)u.range->min : 0, hi = u.range ? rangeHi(u.range->max) : -1;
+            switch (u.op) {
+                case UnaryAssertionOperator::Not: return st.pnot(propTerm(u.expr, strong));
+                case UnaryAssertionOperator::NextTime:
+                case UnaryAssertionOperator::SNextTime:
+                    return st.next(propTerm(u.expr, strong), u.range ? (int)u.range->min : 1,
+                                   u.op == UnaryAssertionOperator::SNextTime);
+                case UnaryAssertionOperator::Always:
+                case UnaryAssertionOperator::SAlways:
+                    return st.ranged(sva::ALWAYS, propTerm(u.expr, strong), lo, hi, u.op == UnaryAssertionOperator::SAlways);
+                case UnaryAssertionOperator::Eventually:
+                case UnaryAssertionOperator::SEventually:
+                    return st.ranged(sva::EVENT, propTerm(u.expr, strong), lo, hi, u.op == UnaryAssertionOperator::SEventually);
+            }
+            break;
+        }
+        case AssertionExprKind::Binary: {
+            const auto& b = a.as<BinaryAssertionExpr>();
+            auto P = [&](const AssertionExpr& x) { return propTerm(x, strong); };
+            switch (b.op) {
+                case BinaryAssertionOperator::And: return st.pand({P(b.left), P(b.right)});
+                case BinaryAssertionOperator::Or: return st.por({P(b.left), P(b.right)});
+                case BinaryAssertionOperator::Iff: {
+                    const sva::Node* l = P(b.left), *r = P(b.right);
+                    return st.por({st.pand({l, r}), st.pand({st.pnot(l), st.pnot(r)})});
+                }
+                case BinaryAssertionOperator::Implies: return st.por({st.pnot(P(b.left)), P(b.right)});
+                case BinaryAssertionOperator::Until: return st.until(P(b.left), P(b.right), false, false);
+                case BinaryAssertionOperator::SUntil: return st.until(P(b.left), P(b.right), true, false);
+                case BinaryAssertionOperator::UntilWith: return st.until(P(b.left), P(b.right), false, true);
+                case BinaryAssertionOperator::SUntilWith: return st.until(P(b.left), P(b.right), true, true);
+                case BinaryAssertionOperator::OverlappedImplication:
+                    return st.impl(seqTerm(b.left), P(b.right), false);
+                case BinaryAssertionOperator::NonOverlappedImplication:
+                    return st.impl(seqTerm(b.left), P(b.right), true);
+                case BinaryAssertionOperator::OverlappedFollowedBy:      // s #-# p = not (s |-> not p)
+                    return st.pnot(st.impl(seqTerm(b.left), st.pnot(P(b.right)), false));
+                case BinaryAssertionOperator::NonOverlappedFollowedBy:   // s #=# p = not (s |=> not p)
+                    return st.pnot(st.impl(seqTerm(b.left), st.pnot(P(b.right)), true));
+                default: break;
+            }
+            break;
+        }
+        case AssertionExprKind::Clocking: {
+            const auto& c = a.as<ClockingAssertionExpr>();
+            sameClock(c.clocking);
+            return propTerm(c.expr, strong);
+        }
+        case AssertionExprKind::StrongWeak: {
+            const auto& s = a.as<StrongWeakAssertionExpr>();
+            return st.pseq(seqTerm(s.expr), s.strength == StrongWeakAssertionExpr::Strong);
+        }
+        case AssertionExprKind::Abort: {
+            const auto& ab = a.as<AbortAssertionExpr>();
+            return st.abort(ab.action == AbortAssertionExpr::Accept ? sva::ACCEPT : sva::REJECT, svaAtom(ab.condition),
+                            propTerm(ab.expr, strong));
+        }
+        case AssertionExprKind::Conditional: {
+            const auto& c = a.as<ConditionalAssertionExpr>();
+            return st.pif(svaAtom(c.condition), propTerm(c.ifExpr, strong),
+                          c.elseExpr ? propTerm(*c.elseExpr, strong) : nullptr);
+        }
+        case AssertionExprKind::Case: {   // 16.12.16: the first item whose expression matches
+            const auto& c = a.as<CaseAssertionExpr>();
+            E sel = sampledE(expr(c.expr));
+            const sva::Node* r = c.defaultCase ? propTerm(*c.defaultCase, strong) : nullptr;
+            for (size_t i = c.items.size(); i-- > 0;) {
+                E cond;
+                for (const Expression* x : c.items[i].expressions) {
+                    E eq = bin(Op::CaseEq, sel, sampledE(expr(*x)));
+                    cond = cond ? bin(Op::LogOr, cond, eq) : eq;
+                }
+                r = st.pif(svaAtomE(cond), propTerm(*c.items[i].body, strong), r);
+            }
+            return r ? r : st.ptrue();
+        }
+        case AssertionExprKind::DisableIff: unsupported("disable iff inside a property (16.12)");
+        default: break;
+    }
+    unsupported("this property expression");
+}
+
+// The action block of a concurrent assertion as a process: `st`, or $error
+// when it is null. It runs in the reactive region (16.14.1).
+const Prog* concAction(const slang::ast::Statement* st, const slang::ast::Statement& as, const std::string& name) {
+    if (!store) unsupported("concurrent assertion here");
+    Lowerer lw(sigmap);
+    lw.bind(subs, mkSig, tempSeq, store);
+    lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
+    lw.scope = scope;
+    lw.current = current;
+    lw.sampleEv = sampleEv;
+    if (st) lw.stmt(*st);
+    else lw.emitAssertError(as, name);
+    lw.finishImplicit();
+    store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+    return store->back().get();
+}
+
+// assert / assume / cover property, cover sequence (16.14).
+void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
+    using namespace slang::ast;
+    if (s.assertionKind == AssertionKind::Restrict) return;   // for formal tools only (16.14.4)
+    if (s.assertionKind == AssertionKind::Expect) unsupported("expect (16.17)");
+    SvaBuild b;
+    SvaBuild* saved = svb;
+    svb = &b;
+    auto savedEv = sampleEv;
+    int dir = directiveOf(s.assertionKind);
+    // The leading clock and disable iff, through named property instances.
+    const AssertionExpr* a = &s.propertySpec;
+    const Expression* dis = nullptr;
+    for (;;) {
+        if (const auto* ai = instanceOf(*a); ai && ai->symbol.kind == SymbolKind::Property) {
+            noLocals(*ai);
+            a = &ai->body;
+        } else if (a->kind == AssertionExprKind::Clocking) {
+            const auto& c = a->as<ClockingAssertionExpr>();
+            if (b.clk.empty()) clockOf(c.clocking, b.clk, b.clkIff);
+            else sameClock(c.clocking);
+            a = &c.expr;
+        } else if (a->kind == AssertionExprKind::DisableIff) {
+            if (dis) unsupported("nested disable iff (16.12)");
+            dis = &a->as<DisableIffAssertionExpr>().condition;
+            a = &a->as<DisableIffAssertionExpr>().expr;
+        } else break;
+    }
+    if (b.clk.empty()) {   // inferred from the procedure, else the default clocking (16.16)
+        if (!sampleEv.empty()) b.clk = sampleEv;
+        else if (compilation() && scope)
+            if (const Symbol* dc = compilation()->getDefaultClocking(*scope))
+                if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) clockOf(cb->getEvent(), b.clk, b.clkIff);
+    }
+    if (b.clk.empty()) unsupported("concurrent assertion with no clock (16.16)");
+    if (!dis && compilation() && scope) dis = compilation()->getDefaultDisable(*scope);   // 16.15
+    sampleEv = b.clk;   // $past and friends in the assertion use its clock
+    ConcAssert c;
+    c.id = newAssert(AT_CONCURRENT, dir, s);
+    if (s.assertionKind == AssertionKind::CoverSequence) {
+        c.coverSeq = true;
+        c.root = sva::store().covseq(seqTerm(*a));
+    } else
+        c.root = propTerm(*a, dir == AD_COVER);
+    if (dis) c.disable = expr(*dis);   // current values, not sampled (16.12)
+    std::string name = asserts()[c.id].name;
+    if (!emptyStmt(s.ifTrue)) c.pass = concAction(s.ifTrue, s, name);
+    if (!emptyStmt(s.ifFalse)) c.fail = concAction(s.ifFalse, s, name);
+    else if (dir != AD_COVER) c.fail = concAction(nullptr, s, name);
+    c.ev = b.clk;
+    c.clkIff = b.clkIff;
+    c.atoms = std::move(b.atoms);
+    if (!staticAssert) {   // in a procedure (16.14.6): queued when the procedure reaches it
+        c.procedural = true;
+        // Automatic variables are read as they were when the instance was
+        // queued (16.14.6.1): each becomes a slot, filled per attempt.
+        std::unordered_map<int, E> slotOf;
+        std::function<E(const E&)> capture = [&](const E& e) -> E {
+            if (!e) return e;
+            if (e->op == Op::Ref && (isRel(e->sig) || automaticSigs().count(e->sig))) {
+                auto [it, fresh] = slotOf.try_emplace(e->sig);
+                if (fresh) {
+                    it->second = konst(Val{});
+                    c.capSig.push_back(e->sig);
+                    c.capSlot.push_back(it->second);
+                }
+                return it->second;
+            }
+            bool same = true;
+            std::vector<E> kids;
+            for (auto& k : e->kids) { kids.push_back(capture(k)); same = same && kids.back() == k; }
+            if (same) return e;
+            auto n = std::make_shared<Expr>(*e);
+            n->kids = std::move(kids);
+            return n;
+        };
+        for (auto& at : c.atoms) at = capture(at);
+        for (const Prog* act : {c.pass, c.fail})   // the action blocks see them too
+            if (act)
+                for (auto& i : const_cast<Prog*>(act)->code) {
+                    i.e = capture(i.e);
+                    i.bidx = capture(i.bidx);
+                    i.de = capture(i.de);
+                    for (auto& x : i.args) x = capture(x);
+                    for (auto& x : i.aidx) x = capture(x);
+                }
+        Instr q;
+        q.k = IK::Assert;
+        q.sig = c.id;
+        q.join = 3;
+        q.hi = (int)concAsserts().size();
+        prog.emit(q);
+    }
+    concAsserts().push_back(std::move(c));
+    sampleEv = savedEv;
+    svb = saved;
 }

@@ -541,6 +541,7 @@ int main(int argc, char** argv) {
     S.shadows = shadowPairs();
     S.sclocks = sampleClocks();
     for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
+    startConcAsserts();
     if (!S.shadows.empty() || !asserts().empty()) staticPart = false;
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
@@ -549,7 +550,7 @@ int main(int argc, char** argv) {
         S.buildPartitions(po, pi, pt);
     }
     S.run(maxTime);
-    std::vector<Task> finals;
+    std::vector<Task> finals = concEnd();   // strong obligations still pending fail (16.12.21)
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
     std::cout.flush();
