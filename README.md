@@ -41,6 +41,15 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
+## Install
+
+Release packages for Linux x86_64 (`.deb` and `.tar.gz`) are on the
+[Releases](https://github.com/tonythetiger168/minisim/releases) page; see
+[`docs/RELEASING.md`](docs/RELEASING.md) for installing and for how releases
+are made, [`CHANGELOG.md`](CHANGELOG.md) for what changed, and
+[`docs/PRODUCT.md`](docs/PRODUCT.md) for the product line and roadmap.
+`msim -version` prints the installed version.
+
 ## Build and run
 
 ```sh
@@ -85,6 +94,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-static-seq`, `-no-partition` | Turn off clocked-process functions / partition tasks |
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
+| `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |
 
 ### Compiled mode

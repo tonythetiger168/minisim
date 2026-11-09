@@ -32,6 +32,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -66,6 +67,29 @@ static std::string shq(const std::string& s) {
 #ifndef MINISIM_SRC_DIR
 #define MINISIM_SRC_DIR "src"
 #endif
+
+#include "version.hpp"
+
+static void version() {
+    std::cout << "msim " MINISIM_VERSION;
+    if (*MINISIM_GIT) std::cout << " (" MINISIM_GIT ")";
+    std::cout << "\nIEEE 1800-2023 SystemVerilog simulator, slang front end\n"
+                 "https://github.com/tonythetiger168/minisim\n";
+}
+
+// Kernel sources that -compile builds against. $MINISIM_INCLUDE wins. An
+// installed msim (bin/msim) finds them in ../share/minisim/include next to
+// itself; a build-tree msim uses the source tree it was configured from.
+static std::string kernelIncludeDir() {
+    if (const char* e = std::getenv("MINISIM_INCLUDE")) return e;
+    std::error_code ec;
+    auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        auto inst = exe.parent_path().parent_path() / "share" / "minisim" / "include";
+        if (std::filesystem::exists(inst / "minisim.cpp", ec)) return inst.string();
+    }
+    return MINISIM_SRC_DIR;
+}
 
 // How each process runs: on the static combinational schedule (rank and
 // level), as a clocked function (seq), or as an ordinary coroutine.
@@ -156,8 +180,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
     }
-    std::string inc = MINISIM_SRC_DIR;
-    if (const char* e = std::getenv("MINISIM_INCLUDE")) inc = e;
+    std::string inc = kernelIncludeDir();
     if (std::system(("mkdir -p " + shq(dir)).c_str()) != 0) { std::cerr << "msim: cannot create " << dir << "\n"; return 1; }
     std::string cpp = dir + "/design.cpp", exe = dir + "/simv";
     {
@@ -190,6 +213,7 @@ static void usage() {
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
                  "  -threads <n>   worker threads (default: all hardware threads)\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
+                 "  -version       print the msim version\n"
                  "  --help-slang   list every front-end option\n";
 }
 
@@ -210,6 +234,7 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "-h" || a == "--help" || a == "-help") { usage(); return 0; }
+        if (a == "-version" || a == "--version" || a == "-v") { version(); return 0; }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
