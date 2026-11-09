@@ -437,6 +437,7 @@ int main(int argc, char** argv) {
     uint64_t maxTime = ~0ULL;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
+    bool threadsGiven = false;
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     for (int i = 1; i < argc; i++) {
@@ -465,6 +466,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (a == "-threads") {
+            threadsGiven = true;
             std::string n = next("a thread count");
             if (n == "all") { threads = maxThreads(); continue; }
             try { threads = std::stoi(n); }
@@ -613,6 +615,9 @@ int main(int argc, char** argv) {
         for (auto& [s, d] : lowered.netDelays)
             if (!S.sigs[s].drv.empty()) S.sigs[s].val = allx(S.sigs[s].w);
     }
+    // An FST file is compressed on libfst's own writer thread: leave it a
+    // core, unless -threads was given.
+    if (!threadsGiven && threads > 1 && vcdPath && vcdPath->ends_with(".fst")) threads--;
     S.threads = threads;
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)

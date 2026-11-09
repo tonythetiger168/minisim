@@ -321,7 +321,8 @@ struct Sim {
     }
     // FST output instead of VCD when vcdPath ends in ".fst" (built with libfst).
     void* fst = nullptr;
-    bool fstParallel = true;                         // msim -fst-serial turns the writer thread off
+    bool fstParallel = true;
+    size_t fstPending = 0;                           // value-change bytes since the last block
     vector<uint32_t> fstH;                           // FST handle per signal (0: not dumped)
     string fstBuf;
     bool waving() const { return vcd.is_open() || fst != nullptr; }
@@ -1266,6 +1267,11 @@ struct Sim {
             fstBuf.resize((size_t)w);
             putBits(fstBuf.data(), val, w);
             fstWriterEmitValueChange((fstWriterContext*)fst, fstH[s], fstBuf.data());
+            // Hand a block to the writer thread every few MB, so it compresses
+            // while the simulation goes on. libfst's own block is 128 MB, so a
+            // run wrote one or two blocks and then flushed the rest at close.
+            fstPending += (size_t)w + 8;
+            if (fstPending >= (16u << 20)) { fstWriterFlushContext((fstWriterContext*)fst); fstPending = 0; }
             return;
         }
 #endif
@@ -1576,7 +1582,7 @@ struct Sim {
             // Compress and write finished blocks on libfst's own thread. Only
             // with a libfst built with FST_WRITER_PARALLEL, which the build
             // says with MINISIM_FST_PARALLEL (libfst exits otherwise).
-            if (fstParallel) fstWriterSetParallelMode(f, 1);
+            if (fstParallel && !getenv("MINISIM_FST_SERIAL")) fstWriterSetParallelMode(f, 1);
 #endif
             fstWriterSetTimescaleFromString(f, timescale.c_str());
             fstH.assign(sigs.size(), 0);
