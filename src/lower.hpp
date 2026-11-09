@@ -1054,6 +1054,13 @@ struct Lowerer {
             for (auto* op : x.as<ConcatenationExpression>().operands()) dynAppend(t, *op);
             return;
         }
+        if (x.kind == ExpressionKind::Call && isDynType(*x.type)) {   // r = q.find(x) with (...)
+            const auto& c = x.as<CallExpression>();
+            if (c.isSystemCall() && isLocator(c.getSubroutineName())) {
+                Instr i = dynCmd(t, D_APPEND); i.dsrc = locatorCall(c); prog.emit(i);
+                return;
+            }
+        }
         if (x.type->isUnpackedArray()) unsupported("container value");
         Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(x); prog.emit(i);
     }
@@ -1115,6 +1122,184 @@ struct Lowerer {
             default: dynAppend(t, rhs);
         }
     }
+    static bool isReduction(std::string_view n) {
+        return n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor";
+    }
+    static bool isLocator(std::string_view n) {
+        return n == "find" || n == "find_index" || n == "find_first" || n == "find_first_index" ||
+               n == "find_last" || n == "find_last_index" || n == "min" || n == "max" ||
+               n == "unique" || n == "unique_index";
+    }
+    // A fixed-size array, numbered [0:N-1], for an array method: a scratch
+    // queue holding a copy of its elements.
+    static bool isFixedArr(const slang::ast::Expression& x) {
+        return x.type->getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType;
+    }
+    int fixedAsQueue(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        const Type& at = x.type->getCanonicalType();
+        if (!isFixedArr(x)) unsupported("array method of this array");
+        if (!stmtDepth) unsupported("array method of a fixed-size array outside a procedural statement");
+        auto r = at.as<FixedSizeUnpackedArrayType>().range;
+        if (r.left != 0 || r.right < 0) unsupported("array method of an array not declared [N] or [0:N-1]");
+        int q = keyQueue(*at.getArrayElementType());
+        dynAppend(q, x);
+        return q;
+    }
+    // An element of container d for an array method: the with expression
+    // evaluated with the iterator set to element ix, or the element itself.
+    struct ElemKey { int d; const slang::ast::Expression* withE; const slang::ast::ValueSymbol* it; int itSig; };
+    E elemAt(int d, int ix) {
+        auto g = node(Op::DynGet, {ref(ix, true)});
+        g->sig = d;
+        return g;
+    }
+    E elemKey(const ElemKey& k, int ix) {
+        if (!k.withE) return elemAt(k.d, ix);
+        Instr a; a.k = IK::Assign; a.sig = k.itSig; a.e = elemAt(k.d, ix);
+        prog.emit(a);
+        return expr(*k.withE);
+    }
+    // An empty scratch queue whose elements have type t.
+    int keyQueue(const slang::ast::Type& t) {
+        int q = fresh(64);
+        DynObj o;
+        o.kind = 1;
+        const auto& ct = t.getCanonicalType();
+        if (ct.isFloating()) o.dflt = mkreal(0);
+        else if (ct.isString()) o.dflt = mkstr("");
+        else {
+            int w = (int)ct.getBitWidth();
+            needWidth(w);
+            o.dflt = ct.isFourState() ? xfill(w) : mk(0, w);
+            o.dflt.sgn = ct.isSigned();
+        }
+        dynStore()[q] = o;
+        prog.emit(dynCmd(q, D_DELETE));
+        return q;
+    }
+    // for (ix = 0; ix < d.size(); ix++) body, or from the end when back is
+    // set. body may add jumps to the end of the loop to exits.
+    template <class F>
+    void dynLoop(int d, bool back, F body) {
+        int ix = fresh(32);
+        Val one = mk(1, 32); one.sgn = true;
+        Val zero = mk(0, 32); zero.sgn = true;
+        Instr i0; i0.k = IK::Assign; i0.sig = ix;
+        i0.e = back ? bin(Op::Sub, resize(dynSize(d), 32, false, true), konst(one)) : konst(zero);
+        prog.emit(i0);
+        size_t top = prog.here();
+        Instr j; j.k = IK::JmpIfNot;
+        j.e = back ? bin(Op::Ge, ref(ix, true), konst(zero))
+                   : bin(Op::Lt, ref(ix, true), resize(dynSize(d), 32, false, true));
+        std::vector<size_t> exits{prog.emit(j)};
+        body(ix, exits);
+        Instr st; st.k = IK::Assign; st.sig = ix;
+        st.e = bin(back ? Op::Sub : Op::Add, ref(ix, true), konst(one));
+        prog.emit(st);
+        Instr bk; bk.k = IK::Jmp; bk.target = top; prog.emit(bk);
+        for (size_t x : exits) prog.code[x].target = prog.here();
+    }
+    // q.find(x) with (...), q.min(), q.unique_index() ... (7.12.1): the
+    // result goes into a scratch queue, which is returned.
+    int locatorCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        std::string_view n = call.getSubroutineName();
+        auto args = call.arguments();
+        if (!stmtDepth) unsupported("locator method outside a procedural statement");
+        int d = dynSig(*args[0]);
+        if (d < 0) d = fixedAsQueue(*args[0]);
+        if (dynStore()[d].kind == 2) unsupported("locator method of an associative array");
+        const Expression* withE = nullptr;
+        const ValueSymbol* itSym = nullptr;
+        if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
+            std::tie(withE, itSym) = sci->getIteratorInfo();
+        ElemKey ek{d, withE, itSym, -1};
+        if (itSym) {
+            int w = storeW(itSym->getType());
+            needWidth(w);
+            ek.itSig = fresh(w);
+            sigmap[itSym] = ek.itSig;
+        }
+        bool index = n.ends_with("_index");
+        const Type& et = call.type->getCanonicalType().getArrayElementType()->getCanonicalType();
+        int res = keyQueue(et);
+        auto push = [&](int ix) {
+            Instr p = dynCmd(res, D_PUSH_BACK);
+            p.e = index ? ref(ix, true) : elemAt(d, ix);
+            prog.emit(p);
+        };
+        if (n.starts_with("find")) {
+            if (!withE) unsupported("find without a with clause");
+            bool first = n.starts_with("find_first"), last = n.starts_with("find_last");
+            dynLoop(d, last, [&](int ix, std::vector<size_t>& exits) {
+                Instr j; j.k = IK::JmpIfNot; j.e = elemKey(ek, ix);
+                size_t jf = prog.emit(j);
+                push(ix);
+                if (first || last) { Instr x; x.k = IK::Jmp; exits.push_back(prog.emit(x)); }
+                prog.code[jf].target = prog.here();
+            });
+            return res;
+        }
+        const Type& kt = (withE ? *withE->type : *args[0]->type->getArrayElementType()).getCanonicalType();
+        if (!kt.isIntegral()) unsupported("min / max / unique on a real, string or aggregate key");
+        int kw = (int)kt.getBitWidth();
+        needWidth(kw);
+        bool ks = kt.isSigned();
+        if (n == "min" || n == "max") {
+            int best = fresh(32), bk = fresh(kw);
+            Val m1 = mk(-1, 32); m1.sgn = true; m1.v = mask(32);
+            Instr b0; b0.k = IK::Assign; b0.sig = best; b0.e = konst(m1); prog.emit(b0);
+            dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                int cur = fresh(kw);
+                Instr c; c.k = IK::Assign; c.sig = cur; c.e = resize(elemKey(ek, ix), kw, ks, ks);
+                prog.emit(c);
+                Val zero = mk(0, 32); zero.sgn = true;
+                E better = n == "min" ? bin(Op::Lt, ref(cur, ks), ref(bk, ks)) : bin(Op::Gt, ref(cur, ks), ref(bk, ks));
+                Instr j; j.k = IK::JmpIfNot;
+                j.e = bin(Op::LogOr, bin(Op::Lt, ref(best, true), konst(zero)), better);
+                size_t jf = prog.emit(j);
+                Instr s1; s1.k = IK::Assign; s1.sig = bk; s1.e = ref(cur, ks); prog.emit(s1);
+                Instr s2; s2.k = IK::Assign; s2.sig = best; s2.e = ref(ix, true); prog.emit(s2);
+                prog.code[jf].target = prog.here();
+            });
+            Val zero = mk(0, 32); zero.sgn = true;
+            Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Ge, ref(best, true), konst(zero));
+            size_t jf = prog.emit(j);
+            push(best);
+            prog.code[jf].target = prog.here();
+            return res;
+        }
+        if (n == "unique" || n == "unique_index") {
+            // element ix is kept when no earlier element has an equal key
+            int cur = fresh(kw), dup = fresh(1);
+            dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                Instr c; c.k = IK::Assign; c.sig = cur; c.e = resize(elemKey(ek, ix), kw, ks, ks); prog.emit(c);
+                Instr z; z.k = IK::Assign; z.sig = dup; z.e = konst(mk(0, 1)); prog.emit(z);
+                int jx = fresh(32);
+                Val zero = mk(0, 32); zero.sgn = true;
+                Val one = mk(1, 32); one.sgn = true;
+                Instr j0; j0.k = IK::Assign; j0.sig = jx; j0.e = konst(zero); prog.emit(j0);
+                size_t top = prog.here();
+                Instr jt; jt.k = IK::JmpIfNot; jt.e = bin(Op::Lt, ref(jx, true), ref(ix, true));
+                size_t jf = prog.emit(jt);
+                E eq = bin(Op::CaseEq, resize(elemKey(ek, jx), kw, ks, ks), ref(cur, ks));
+                Instr sd; sd.k = IK::Assign; sd.sig = dup;
+                sd.e = bin(Op::LogOr, ref(dup, false), eq);
+                prog.emit(sd);
+                Instr inc; inc.k = IK::Assign; inc.sig = jx; inc.e = bin(Op::Add, ref(jx, true), konst(one)); prog.emit(inc);
+                Instr bk; bk.k = IK::Jmp; bk.target = top; prog.emit(bk);
+                prog.code[jf].target = prog.here();
+                Instr k; k.k = IK::JmpIfNot; k.e = un(Op::LogNot, ref(dup, false));
+                size_t kf = prog.emit(k);
+                push(ix);
+                prog.code[kf].target = prog.here();
+            });
+            return res;
+        }
+        unsupported("locator method");
+    }
+
     // Built-in methods of a container (7.5.2, 7.8, 7.9, 7.10.2, 7.12): as a
     // value, or as a statement when wantValue is false.
     E dynMethod(const slang::ast::CallExpression& call, bool wantValue) {
@@ -1122,9 +1307,53 @@ struct Lowerer {
         std::string_view n = call.getSubroutineName();
         auto args = call.arguments();
         int d = dynSig(*args[0]);
+        if (d < 0) d = fixedAsQueue(*args[0]);
         const DynObj& o = dynStore()[d];
+        const Expression* withE = nullptr;
+        const ValueSymbol* itSym = nullptr;
         if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
-            if (sci->getIteratorInfo().first) unsupported("array method with a `with` clause");
+            std::tie(withE, itSym) = sci->getIteratorInfo();
+        if (withE || isLocator(n)) {
+            if (!stmtDepth) unsupported("array method with a `with` clause outside a procedural statement");
+            if (o.kind == 2) unsupported("locator or with method of an associative array");
+            ElemKey ek{d, withE, itSym, -1};
+            if (itSym) {
+                int w = storeW(itSym->getType());
+                needWidth(w);
+                ek.itSig = fresh(w);
+                sigmap[itSym] = ek.itSig;
+            }
+            static const std::pair<const char*, Op> redw[] = {
+                {"sum", Op::Add}, {"product", Op::Mul}, {"and", Op::And}, {"or", Op::Or}, {"xor", Op::Xor}};
+            for (auto& [s, op] : redw)
+                if (n == s) {   // 7.12.3: the result has the type of the with expression
+                    int w = (int)call.type->getBitWidth();
+                    bool sg = call.type->isSigned();
+                    if (!call.type->isIntegral()) unsupported("reduction with a non-integral with clause");
+                    int acc = fresh(w);
+                    Val init = n == "product" ? mk(1, w) : n == "and" ? v_not(mk(0, w)) : mk(0, w);
+                    Instr a0; a0.k = IK::Assign; a0.sig = acc; a0.e = konst(init); prog.emit(a0);
+                    dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                        Instr a; a.k = IK::Assign; a.sig = acc;
+                        a.e = bin(op, ref(acc, sg), resize(elemKey(ek, ix), w, withE ? withE->type->isSigned() : sg, sg));
+                        prog.emit(a);
+                    });
+                    return ref(acc, sg);
+                }
+            if (n == "sort" || n == "rsort") {   // 7.12.2: order by the with expression
+                if (wantValue) unsupported("sort used as a value");
+                int kc = keyQueue(*withE->type);
+                dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                    Instr p = dynCmd(kc, D_PUSH_BACK); p.e = elemKey(ek, ix); prog.emit(p);
+                });
+                Instr i = dynCmd(d, n == "sort" ? D_SORT_BY : D_RSORT_BY);
+                i.dsrc = kc;
+                prog.emit(i);
+                return nullptr;
+            }
+            if (isLocator(n)) unsupported("locator method here (assign its result to a queue)");
+            unsupported("array method with a `with` clause");
+        }
         if (n == "size" || n == "num" || n == "$size") return dynSize(d);
         if (n == "exists") {
             auto x = node(Op::DynExists, {dynKey(d, *args[1])});
@@ -1395,7 +1624,9 @@ struct Lowerer {
                     if (w != 64) t = resize(std::move(t), w, false, false);
                     return sized(std::move(t), w, false, ctx);
                 }
-                if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.size(), aa.exists(k) ...
+                if (!call.arguments().empty() &&
+                    (dynSig(*call.arguments()[0]) >= 0 ||
+                     (isFixedArr(*call.arguments()[0]) && isReduction(n)))) {   // q.size(), aa.exists(k), a.sum() ...
                     int w = storeW(*e.type);
                     needWidth(w);
                     return sized(dynMethod(call, true), w, e.type->isSigned(), ctx);
