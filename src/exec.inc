@@ -402,6 +402,15 @@ struct ProcCtl {
     bool suspended = false, parked = false;
     vector<Handle> awaiters;
     int obj = 0;   // its process object, once process::self() made one
+    // Its random generator (18.14.2): seeded from its parent's when forked,
+    // from the global one for a top-level process. rngp names it: rng, the
+    // process object's once there is one (process::srandom), or the caller's
+    // for a synchronous helper (pre_randomize, a constraint's function).
+    uint64_t rng = 1;
+    uint64_t* rngp = &rng;
+    ProcCtl() = default;
+    ProcCtl(const ProcCtl&) = delete;
+    ~ProcCtl() { if (g_threadRng == &rng) g_threadRng = nullptr; }
     weak_ptr<ProcCtl> parent;
     vector<shared_ptr<ProcCtl>> kids;
     shared_ptr<JoinState> join;
@@ -491,7 +500,13 @@ inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr)
     return t;
 }
 // A top-level process (initial, always, final).
-inline Task process(const Prog* p) { return startProc(p, make_shared<ProcCtl>(), nullptr); }
+inline Task process(const Prog* p) {
+    auto c = make_shared<ProcCtl>();
+    uint64_t& g = globalRandomState();   // seeded in the order the processes start
+    uint64_t a = urandomNext(g), b = urandomNext(g);
+    c->rng = seedState(a << 32 | b);
+    return startProc(p, std::move(c), nullptr);
+}
 inline Task exec(const Prog* p) { return process(p); }
 
 // ---- assertions (16.3, 16.4, 20.11) ----
@@ -983,6 +998,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
     while (p) {
         g_fr = fr.get();
         g_ret = lastRet.get();
+        g_threadRng = ctl->rngp;
         if (ctl->killed) goto done;
         if (ctl->suspended) [[unlikely]] {   // 9.7: stop here until resume()
             co_await ProcPark{ctl.get()};
@@ -1100,9 +1116,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         S.sigs[obj + i.dkey].val = make((uint64_t)procTable().size(), 0, 64);
                         procTable().push_back(ctl);
                         ctl->obj = obj;
-                        // its srandom / get_randstate (18.13.3); seeded from its number, so
-                        // process::self() does not move the $urandom stream
-                        objRng()[obj] = seedState(0x9E3779B97F4A7C15ull * (procTable().size() + 1));
+                        // its srandom / get_randstate (18.13.3) work on the process's own generator
+                        objRng()[obj] = *ctl->rngp;
+                        ctl->rngp = &objRng()[obj];
+                        g_threadRng = ctl->rngp;
                     }
                     S.set(R(i.sig), make((uint64_t)ctl->obj, 0, 64));
                     pc++; break;
@@ -1239,6 +1256,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     auto c = make_shared<ProcCtl>();
                     c->parent = ctl;
                     c->join = js;
+                    {   // 18.14.2: a forked process's generator is seeded from its parent's
+                        uint64_t a = urandomNext(*ctl->rngp), b = urandomNext(*ctl->rngp);
+                        c->rng = seedState(a << 32 | b);
+                    }
                     ctl->kids.push_back(c);
                     FrameP bf = bn < i.blays.size() && i.blays[bn] ? newFrame(i.blays[bn], ff, ff ? ff->self : 0) : ff;
                     Task t = startProc(b, c, std::move(bf));

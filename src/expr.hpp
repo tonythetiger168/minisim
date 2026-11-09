@@ -1430,6 +1430,7 @@ struct ArrShape {
     bool sgn = false;
     bool twoState = false;   // bit / int elements: an invalid read is 0, not X (7.4.6)
     std::vector<std::pair<int64_t, int64_t>> dims;   // [left, right]
+    std::shared_ptr<const DynObj> dynElem;   // int f[2][$]: each element a container of this shape (last: -compile writes the others in order)
     // Flat element offset, or -1 when an index is outside its dimension.
     int64_t offset(const std::vector<int64_t>& idx) const {
         int64_t off = 0;
@@ -1621,7 +1622,11 @@ inline int32_t rtlDistUniform(int32_t& seed, int32_t start, int32_t end) {
 inline int32_t& globalRandomSeed() { static int32_t s = 0; return s; }
 // $urandom: the generator is implementation-defined (18.13). minisim uses
 // one 64-bit xorshift* stream, seeded by -seed (default 1), so a run repeats.
-inline uint64_t& urandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
+// Random stability (18.14.2): every process (thread) has its own generator.
+// g_threadRng is the running process's; with none running, the global one.
+inline uint64_t& globalRandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
+inline uint64_t* g_threadRng = nullptr;
+inline uint64_t& urandomState() { return g_threadRng ? *g_threadRng : globalRandomState(); }
 inline uint32_t urandomNext(uint64_t& s) {
     s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
     return (uint32_t)((s * 0x2545F4914F6CDD1Dull) >> 32);
