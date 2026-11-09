@@ -112,6 +112,12 @@ inline std::unordered_set<const slang::ast::Symbol*>& assignedEvents() {
 }
 inline bool& usesForce() { static bool f = false; return f; }   // some force / assign (10.6): no partitions
 inline std::vector<std::pair<int, uint8_t>>& netKinds() { static std::vector<std::pair<int, uint8_t>> v; return v; }
+// Fixed-size arrays of containers (int f[2][]): one container per element,
+// their ids in a row; the shape's base is the first.
+inline std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>>& dynArrMap() {
+    static std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>> m;
+    return m;
+}
 // Dynamic arrays, queues, and associative arrays: symbol -> handle signal.
 inline std::unordered_map<const slang::ast::Symbol*, int>& dynMap() {
     static std::unordered_map<const slang::ast::Symbol*, int> m;
@@ -2620,9 +2626,66 @@ struct Lowerer {
             indShape[d] = *shape;
             return d;
         }
+        if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // m[i] of a container of containers
+            const auto& sel = e.as<ElementSelectExpression>();
+            // f[i][j] of a fixed-size array of containers: its element's id
+            std::vector<const Expression*> idx;
+            const Expression* b = &e;
+            while (b->kind == ExpressionKind::ElementSelect) {
+                idx.insert(idx.begin(), &b->as<ElementSelectExpression>().selector());
+                b = &peel(b->as<ElementSelectExpression>().value());
+            }
+            if (ValueExpressionBase::isKind(b->kind))
+                if (auto f = dynArrMap().find(&b->as<ValueExpressionBase>().symbol); f != dynArrMap().end() && idx.size() == f->second->dims.size()) {
+                    std::vector<E> ks;
+                    for (auto* x : idx) ks.push_back(expr(*x));
+                    auto n = node(Op::ArrAddr, std::move(ks));
+                    n->arr = f->second;
+                    int tmp = fresh(64);
+                    Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
+                    prog.emit(i);
+                    int d = indThrough(tmp);
+                    indShape[d] = dynStore()[f->second->base];
+                    return d;
+                }
+            int outer = dynSig(sel.value());
+            if (outer < 0 || !dynShape(outer).elem) return -1;
+            auto n = node(Op::DynElemRef, {dynKey(outer, sel.selector())});
+            n->sig = outer;
+            return elemRef(outer, n);
+        }
         if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) return -1;
         return dynFind(&e.as<ValueExpressionBase>().symbol);
     }
+    // The indirect id of the element container that `ref` (a DynElemRef of
+    // outer) names, read into a temporary now.
+    int elemRef(int outer, E ref0) {
+        DynObj shape = *dynShape(outer).elem;
+        int tmp = fresh(64);
+        Instr i; i.k = IK::Assign; i.sig = tmp; i.e = std::move(ref0);
+        prog.emit(i);
+        int d = indThrough(tmp);
+        indShape[d] = std::move(shape);
+        return d;
+    }
+    // push_back / push_front / insert of x into t, a container of containers:
+    // a new empty element, then x assigned to it.
+    void pushContainer(int t, int cmd, const slang::ast::Expression& x, const slang::ast::Expression* at = nullptr) {
+        Instr i = dynCmd(t, cmd);
+        E key;
+        if (cmd == D_INSERT) { i.args = {dynKey(t, *at)}; key = i.args[0]; }
+        else if (cmd == D_PUSH_FRONT) key = konst(mk(0, 32));
+        prog.emit(i);
+        if (!key) key = bin(Op::Sub, resize(dynSize(t), 64, false, false), konst(mk(1, 64)));
+        auto n = node(Op::DynElemRef, {key});
+        n->sig = t;
+        assignContainer(elemRef(t, n), x);
+    }
+    // How many container levels a type or a shape has (int[][] is 2).
+    static int dynDepth(const slang::ast::Type& t) {
+        return isDynType(t) ? 1 + dynDepth(*t.getCanonicalType().getArrayElementType()) : 0;
+    }
+    static int dynDepth(const DynObj& o) { return 1 + (o.elem ? dynDepth(*o.elem) : 0); }
     static bool isDynType(const slang::ast::Type& t0) {
         const auto& t = t0.getCanonicalType();
         return t.isQueue() || t.isAssociativeArray() ||
@@ -2674,6 +2737,10 @@ struct Lowerer {
     void dynAppend(int t, const slang::ast::Expression& x0) {
         using namespace slang::ast;
         const Expression& x = peel(x0);
+        if (const DynObj& ts = dynShape(t); ts.elem && dynDepth(*x.type) == dynDepth(*ts.elem)) {   // {qq, q}: q is one element
+            pushContainer(t, D_PUSH_BACK, x);
+            return;
+        }
         if (int s = dynSig(x); s >= 0) {
             Instr i = dynCmd(t, D_APPEND); i.dsrc = s; prog.emit(i); return;
         }
@@ -2793,7 +2860,10 @@ struct Lowerer {
                 int64_t n = rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
                                 ? constInt(rhs.as<ReplicatedAssignmentPatternExpression>().count()) : 1;
                 for (int64_t k = 0; k < n; k++)
-                    for (auto* el : ap.elements()) { Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(*el); prog.emit(i); }
+                    for (auto* el : ap.elements()) {
+                        if (dynShape(t).elem) { pushContainer(t, D_PUSH_BACK, *el); continue; }   // '{'{1, 2}, '{3}}
+                        Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(*el); prog.emit(i);
+                    }
                 return;
             }
             case ExpressionKind::StructuredAssignmentPattern: {   // '{key: v, default: d} (10.9.2)
@@ -3109,6 +3179,10 @@ struct Lowerer {
             if (!found) unsupported("container method");
         }
         if (i.dcmd == D_DELETE_AT) i.args = {dynKey(d, *args[1])};
+        if (dynShape(d).elem && (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT || i.dcmd == D_INSERT)) {
+            pushContainer(d, i.dcmd, i.dcmd == D_INSERT ? *args[2] : *args[1], i.dcmd == D_INSERT ? args[1] : nullptr);
+            return nullptr;
+        }
         if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = expr(*args[1]);
         if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = expr(*args[2]); }
         prog.emit(i);
@@ -3774,7 +3848,6 @@ struct Lowerer {
                 }
                 const auto& sel = e.as<ElementSelectExpression>();
                 lhs(sel.value(), i);
-                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index));
                 return;
             }
@@ -3782,7 +3855,6 @@ struct Lowerer {
                 const auto& r = e.as<RangeSelectExpression>();
                 if (dynSig(r.value()) >= 0) unsupported("write to a queue slice");
                 lhs(r.value(), i);
-                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, rangePSel(r));
                 return;
             }
@@ -3797,7 +3869,6 @@ struct Lowerer {
                     return;
                 }
                 lhs(m.value(), i);
-                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, memberPSel(m));
                 return;
             }
@@ -4403,6 +4474,7 @@ struct Lowerer {
         const Expression& x = peel(a);
         if (int d = dynSig(x); d >= 0) {
             const Type* et = x.type->getCanonicalType().getArrayElementType();
+            while (isDynType(*et)) et = et->getCanonicalType().getArrayElementType();   // a container of containers: the innermost elements
             const Type& ec = et->getCanonicalType();
             if (!(ec.isIntegral() && ec.kind != SymbolKind::EnumType && !ec.isStruct()) && !ec.isString() && !ec.isFloating())
                 unsupported("%p of a container of this element type");
@@ -5586,21 +5658,41 @@ struct Lowerer {
     // foreach over a dynamic array or queue: index 0 up to size() - 1, read
     // again each pass. Over an associative array: first() then next().
     void foreachDyn(const slang::ast::ForeachLoopStatement& f, int d) {
-        if (f.loopDims.size() != 1) unsupported("foreach over more than one dimension of a container");
-        const auto* var = f.loopDims[0].loopVar;
-        if (!var) { stmt(f.body); return; }
-        const DynObj o = dynShape(d);
+        if (f.loopDims.size() == 1 && !f.loopDims[0].loopVar) { stmt(f.body); return; }
         loops.push_back({});
+        foreachDynDim(f, d, 0);
+        patch(loops.back().breaks, prog.here());
+        loops.pop_back();
+    }
+    // Dimension k of a foreach over container d; a container of containers
+    // (7.5, 7.10) loops over each element's own elements next.
+    void foreachDynDim(const slang::ast::ForeachLoopStatement& f, int d, size_t k) {
+        const auto* var = f.loopDims[k].loopVar;
+        const DynObj o = dynShape(d);
+        bool last = k + 1 == f.loopDims.size();
+        if (!last && !o.elem) unsupported("foreach over more dimensions than the container has");
+        auto body = [&](E key) {
+            if (last) {
+                stmt(f.body);
+                return;
+            }
+            auto n = node(Op::DynElemRef, {key});
+            n->sig = d;
+            foreachDynDim(f, elemRef(d, n), k + 1);
+        };
+        // continue in the body goes to the step of the innermost loop only
+        auto saved = std::move(loops.back().continues);
+        loops.back().continues.clear();
         if (o.kind != 2) {
             int v = fresh(32);
-            bindVar(var, v);
+            if (var) bindVar(var, v);
             Instr init; init.k = IK::Assign; init.sig = v; init.e = konst(make(0, 0, 32, 0, true));
             prog.emit(init);
             size_t top = prog.here();
             Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Lt, ref(v, true), dynSize(d));
             size_t jf = prog.emit(j);
-            stmt(f.body);
-            patch(loops.back().continues, prog.here());
+            body(ref(v, true));
+            if (last) patch(loops.back().continues, prog.here());
             Instr st; st.k = IK::Assign; st.sig = v;
             st.e = bin(Op::Add, ref(v, true), konst(make(1, 0, 32, 0, true)));
             prog.emit(st);
@@ -5608,22 +5700,21 @@ struct Lowerer {
             prog.code[jf].target = prog.here();
         } else {
             int v = fresh(o.strKey ? 64 : o.keyW);
-            bindVar(var, v);
+            if (var) bindVar(var, v);
             int ok = fresh(32);
             Instr first = dynCmd(d, D_FIRST); first.dkey = v; first.dres = ok;
             prog.emit(first);
             size_t top = prog.here();
             Instr j; j.k = IK::JmpIfNot; j.e = ref(ok);
             size_t jf = prog.emit(j);
-            stmt(f.body);
-            patch(loops.back().continues, prog.here());
+            body(ref(v, !o.strKey && o.keySgn));
+            if (last) patch(loops.back().continues, prog.here());
             Instr nx = dynCmd(d, D_NEXT); nx.dkey = v; nx.dres = ok;
             prog.emit(nx);
             Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
             prog.code[jf].target = prog.here();
         }
-        patch(loops.back().breaks, prog.here());
-        loops.pop_back();
+        loops.back().continues = std::move(saved);
     }
 
     int stmtDepth = 0;   // > 0 while lowering a procedural statement
@@ -5941,11 +6032,18 @@ struct Lowerer {
                 if (int d = dynSig(f.arrayRef); d >= 0) { foreachDyn(f, d); break; }
                 struct Lvl { int var; int64_t right; bool up; size_t top, jf; };
                 std::vector<Lvl> lv;
-                for (const auto& d : f.loopDims) {
-                    if (!d.loopVar) continue;
+                // A fixed-size array of containers (int f[2][]): its fixed
+                // dimensions here, then each element container's own.
+                std::shared_ptr<ArrShape> da;
+                if (const Expression& ar = peel(f.arrayRef); ValueExpressionBase::isKind(ar.kind))
+                    if (auto it = dynArrMap().find(&ar.as<ValueExpressionBase>().symbol); it != dynArrMap().end()) da = it->second;
+                size_t nfixed = da ? da->dims.size() : f.loopDims.size();
+                for (size_t dk = 0; dk < nfixed && dk < f.loopDims.size(); dk++) {
+                    const auto& d = f.loopDims[dk];
+                    if (!d.loopVar && !(da && f.loopDims.size() > nfixed)) continue;
                     if (!d.range) unsupported("foreach over a dynamic dimension");
                     int v = fresh(32);
-                    bindVar(d.loopVar, v);
+                    if (d.loopVar) bindVar(d.loopVar, v);
                     Instr init; init.k = IK::Assign; init.sig = v;
                     init.e = konst(make((uint64_t)d.range->left, 0, 32, 0, true));
                     prog.emit(init);
@@ -5956,7 +6054,18 @@ struct Lowerer {
                     lv.push_back(L);
                 }
                 loops.push_back({});
-                stmt(f.body);
+                if (da && f.loopDims.size() > nfixed) {
+                    std::vector<E> ks;
+                    for (auto& L : lv) ks.push_back(ref(L.var, true));
+                    auto n = node(Op::ArrAddr, std::move(ks));
+                    n->arr = da;
+                    int tmp = fresh(64);
+                    Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
+                    prog.emit(i);
+                    int d = indThrough(tmp);
+                    indShape[d] = dynStore()[da->base];
+                    foreachDynDim(f, d, nfixed);
+                } else stmt(f.body);
                 patch(loops.back().continues, prog.here());
                 for (size_t k = lv.size(); k-- > 0;) {
                     const Lvl& L = lv[k];
@@ -6281,14 +6390,21 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
 inline void Lowerer::elemInto(DynObj& o, const slang::ast::Type& et) {
     const auto& e = et.getCanonicalType();
     if (e.isUntypedType()) { o.dflt = Val{}; return; }   // a typeless mailbox (15.4.9): values as they are
+    if (isDynType(e)) {   // a container of containers (7.5, 7.10): each element names a container
+        o.dflt = make(0, 0, 64);
+        o.elem = std::make_shared<DynObj>(dynShapeOf(e));
+        return;
+    }
     if (e.isFloating()) o.dflt = mkreal(0);
     else if (e.isString()) o.dflt = mkstr("");
     else if (isHandleType(e)) o.dflt = make(0, 0, 64);   // a class handle starts null
     else if (e.isIntegral()) {
         int w = (int)e.getBitWidth();
-        if (w > 64) unsupported("container element wider than 64 bits");
         o.dflt = e.isFourState() ? allx(w) : make(0, 0, w);
         o.dflt.sgn = e.isSigned();
+    } else if (e.isUnpackedStruct() && storeW(e) > 0) {   // its fields packed into one value, as a struct variable is
+        int w = storeW(e);
+        o.dflt = allx(w);
     } else unsupported("container element type");
 }
 
@@ -6337,7 +6453,13 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     template <typename T> void reg(const T& s, bool net) {
         if (auto a = aliasOf().find(&s); a != aliasOf().end() && a->second != &s) { aliased.push_back(&s); return; }
         if (Lowerer::isDynType(s.getType())) { regDyn(s); return; }
-        if (s.getType().isUnpackedArray()) { regArray(s, net); return; }
+        if (s.getType().isUnpackedArray()) {
+            const slang::ast::Type* t = &s.getType().getCanonicalType();
+            while (t->kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) t = &t->getArrayElementType()->getCanonicalType();
+            if (Lowerer::isDynType(*t)) { regDynArray(s, *t); return; }
+            regArray(s, net);
+            return;
+        }
         if (s.getType().isEvent()) {
             // A named event (15.5) is two signals: a trigger count, which an
             // @e waits on, and the time of the last trigger + 1, which .triggered reads.
@@ -6357,6 +6479,28 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     // A dynamic array, queue, or associative array: a hidden handle signal
     // (its name has '$') and its store entry.
+    template <typename T> void regDynArray(const T& s, const slang::ast::Type& et) {
+        using namespace slang::ast;
+        auto shape = std::make_shared<ArrShape>();
+        int64_t total = 1;
+        for (const Type* t = &s.getType().getCanonicalType(); t->kind == SymbolKind::FixedSizeUnpackedArrayType;
+             t = &t->getArrayElementType()->getCanonicalType()) {
+            const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+            shape->dims.push_back({ft.range.left, ft.range.right});
+            total *= (int64_t)ft.range.width();
+        }
+        if (total > 4096) throw std::runtime_error("lower: unsupported array of more than 4096 containers: " + std::string(s.name));
+        DynObj o = Lowerer::dynShapeOf(et);
+        for (int64_t k = 0; k < total; k++) {
+            int id = mkSig(prefix + std::string(s.name) + "[" + std::to_string(k) + "]$", 64, false);
+            if (k == 0) shape->base = id;
+            else if (id != shape->base + (int)k) throw std::runtime_error("lower: array of containers not laid out in a row: " + std::string(s.name));
+            dynStore()[id] = o;
+        }
+        shape->count = (int)total;
+        shape->elemW = 64;
+        dynArrMap()[&s] = shape;
+    }
     template <typename T> void regDyn(const T& s) {
         using namespace slang::ast;
         DynObj o = Lowerer::dynShapeOf(s.getType());
