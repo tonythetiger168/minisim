@@ -14,6 +14,8 @@ Spec references are IEEE 1800-2023 clauses.
   scope selection, `$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` /
   `$dumplimit`). A design's `$dumpvars` now writes its dump file without
   `-vcd`.
+- `$fstrobe`, `$fmonitor` (several at once, cancelled by `$fclose`) and
+  `$fread` (21.3.2, 21.3.4.4).
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,

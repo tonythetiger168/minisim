@@ -88,7 +88,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m %f %e %g %p, `%0`, widths, `%-8d`, `%.3f`. `%m` is the scope of the call. `21.2.1-display-formats` |
 | 21.2.1.6 | %p assignment pattern format | 🟡 | fixed-size arrays (any dimensions), dynamic arrays, queues, associative arrays, packed structs with member names, enums by name, strings in quotes. Not yet: unpacked structs (7.2). `21.2.1.6-assignment-pattern-format` |
 | 21.2.2–21.2.3 | $strobe, $monitor | ✅ | |
-| 21.3 | File I/O | ✅ | `$fopen` (descriptors and multichannel), `$fclose`, `$fdisplay`/`$fwrite` and b/o/h forms, `$fgets`, `$fgetc`, `$ungetc`, `$feof`, `$fscanf`, `$sscanf` (all conversions, `%*`, widths), `$fseek`, `$ftell`, `$rewind`, `$fflush`. Not yet: `$fstrobe`, `$fmonitor`, `$fread`. `21.3-file-io`, `21.3.1-multichannel` |
+| 21.3 | File I/O | ✅ | `$fopen` (descriptors and multichannel), `$fclose`, `$fdisplay`/`$fwrite` and b/o/h forms, `$fgets`, `$fgetc`, `$ungetc`, `$feof`, `$fscanf`, `$sscanf` (all conversions, `%*`, widths), `$fseek`, `$ftell`, `$rewind`, `$fflush`, `$fstrobe` and `$fmonitor` (any number active; `$fclose` cancels them), `$fread` into a variable or a 1-D memory with start and count. Not yet: `$fread` into an unpacked struct. `21.3-file-io`, `21.3.1-multichannel`, `21.3.2-fstrobe-fmonitor`, `21.3.4.4-fread` |
 | 21.3.3 | $sformatf, $sformat, $swrite | ✅ | the same formats as $display |
 | 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
 | 21.5 | $writememh, $writememb | ✅ | 1-D memories, optional start/finish. `21.5-writemem` |

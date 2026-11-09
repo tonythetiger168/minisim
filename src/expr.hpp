@@ -1364,7 +1364,9 @@ enum SysFnId : int {
     SF_DIST_T,           // (seed, degrees of freedom)
     SF_DIST_ERLANG,      // (seed, k, mean)
     SF_SYSTEM,           // $system(command) (20.17): the shell's exit status
-    SF_ASSOC_BOUND       // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
+    SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
+    SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
+    SF_FREAD_GET         // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
 };
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
@@ -1658,6 +1660,20 @@ inline void fileWrite(uint32_t fd, const std::string& t) {
         if ((fd >> b) & 1 && files().mcd[b]) fwrite(t.data(), 1, t.size(), files().mcd[b]);
 }
 inline std::string& scanText() { static std::string s; return s; }
+inline std::string& freadBuf() { static std::string s; return s; }
+// $fclose cancels the $fstrobe / $fmonitor output to the closed descriptor (21.3.1).
+inline void (*g_fcloseHook)(uint32_t fd) = nullptr;
+// The first n bytes of `b` (zero past its end) as an unsigned big-endian value of w bits.
+inline Val bytesValue(const std::string& b, size_t n, int w) {
+    int bw = (int)n * 8;
+    Val v = make(0, 0, std::max(bw, 1), 0, false);
+    if (bw > 64) v = maskWidth(v, bw);
+    for (size_t k = 0; k < n; k++) {
+        unsigned char c = k < b.size() ? (unsigned char)b[k] : 0;
+        for (int j = 0; j < 8; j++) setBit(v, bw - 8 * (int)(k + 1) + j, (c >> j) & 1);
+    }
+    return v_resize(v, w, false);
+}
 inline std::vector<Val>& scanOut() { static std::vector<Val> v; return v; }
 // $fscanf / $sscanf (21.3.4) from a character source: next() gives a char or
 // EOF, back() returns the last one. The values read go to scanOut(); returns
@@ -1856,6 +1872,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         }
         case SF_FCLOSE: {
             uint32_t fd = (uint32_t)u64(a[0]);
+            if (g_fcloseHook) g_fcloseHook(fd);
             if (fd & 0x80000000u) {
                 uint32_t i = fd & 0x7fffffffu;
                 if (i >= 3 && i < files().fds.size() && files().fds[i]) { fclose(files().fds[i]); files().fds[i] = nullptr; }
@@ -1865,6 +1882,16 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             }
             return make(0, 0, 1, 0);
         }
+        case SF_FREAD: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            size_t n = (size_t)u64(a[1]);
+            std::string& b = freadBuf();
+            b.assign(n, '\0');
+            size_t got = f && n ? fread(b.data(), 1, n, f) : 0;
+            b.resize(got);
+            return sint((int64_t)got);
+        }
+        case SF_FREAD_GET: return bytesValue(freadBuf(), (size_t)(ctl + 7) / 8, ctl);
         case SF_FWRITE: {
             Val t = a[1]; t.str = true;
             fileWrite((uint32_t)u64(a[0]), v_str(t) + (ctl ? "\n" : ""));

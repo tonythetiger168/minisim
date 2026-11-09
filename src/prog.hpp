@@ -86,6 +86,7 @@ struct Instr {
     // $strobe/$monitor sees values after NBA. %b, %d, %%, and other text.
     std::string fmt;
     bool nonl = false;    // Display from $write: no newline at the end
+    E fd;                 // Strobe / Monitor from $fstrobe / $fmonitor: the descriptor (21.3.2)
     std::vector<E> args;
     const Prog* callee = nullptr; // Call
     std::vector<const Prog*> branches;  // Fork
