@@ -1657,6 +1657,16 @@ struct Lowerer {
         if (p.kind == slang::ast::ExpressionKind::StringLiteral)
             return konst(mkstr(std::string(p.as<slang::ast::StringLiteral>().getValue())));
         if (E j = streamStrings(p)) return j;
+        if (p.kind == slang::ast::ExpressionKind::Concatenation) {   // {"ab", "cd"} given to a string
+            bool lits = true;
+            for (auto* op : p.as<slang::ast::ConcatenationExpression>().operands())
+                if (peel(*op).kind != slang::ast::ExpressionKind::StringLiteral && !op->type->isString()) lits = false;
+            if (lits) {
+                std::vector<E> parts;
+                for (auto* op : p.as<slang::ast::ConcatenationExpression>().operands()) parts.push_back(strOf(*op));
+                return node(Op::StrCat, std::move(parts));
+            }
+        }
         return un(Op::IntToStr, expr(e));
     }
     // {>>{s, q}} of strings and string containers (11.4.14): their text, joined.
@@ -1725,7 +1735,8 @@ struct Lowerer {
             case ExpressionKind::Replication: {
                 const auto& r = e.as<ReplicationExpression>();
                 auto n = node(Op::StrRep, {strOf(r.concat())});
-                n->hi = (int)constInt(r.count());
+                if (const auto* cv = r.count().getConstant(); cv && cv->isInteger()) n->hi = (int)constInt(r.count());
+                else n->kids.push_back(expr(r.count()));   // {n{s}} with n a variable (11.4.12.2)
                 return n;
             }
             case ExpressionKind::ConditionalOp: {
@@ -1745,6 +1756,10 @@ struct Lowerer {
                     return f;
                 }
                 if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));
+                if (n == "$typename" && !call.arguments().empty()) {   // 20.6.1: the type's name, known now
+                    if (const auto* cv = e.getConstant(); cv && cv->isString()) return konst(mkstr(cv->str()));
+                    return konst(mkstr(call.arguments()[0]->type->toString()));
+                }
                 if (E r = enumMethod(call)) return r;   // e.name()
                 break;
             }
@@ -1849,7 +1864,6 @@ struct Lowerer {
             }
             case ExpressionKind::StringLiteral: {   // "abc" is 8 bits per char (5.9)
                 const auto& sv = e.as<StringLiteral>().getIntValue().integer();
-                if (sv.getBitWidth() > 64) unsupported("string literal longer than 8 characters");
                 return svLit(sv, false, ctx);
             }
             case ExpressionKind::Replication: {     // {n{a}} (11.4.12.1)
@@ -2448,15 +2462,7 @@ struct Lowerer {
         int q = fresh(64);
         DynObj o;
         o.kind = 1;
-        const auto& ct = t.getCanonicalType();
-        if (ct.isFloating()) o.dflt = mkreal(0);
-        else if (ct.isString()) o.dflt = mkstr("");
-        else {
-            int w = (int)ct.getBitWidth();
-            needWidth(w);
-            o.dflt = ct.isFourState() ? xfill(w) : mk(0, w);
-            o.dflt.sgn = ct.isSigned();
-        }
+        elemInto(o, t);
         if (isRel(q)) frames.back()->dyn.push_back({relOff(q), o});
         else dynStore()[q] = o;
         prog.emit(dynCmd(q, D_DELETE));
@@ -2501,7 +2507,7 @@ struct Lowerer {
         ElemKey ek{d, withE, itSym, -1};
         if (itSym) {
             int w = storeW(itSym->getType());
-            needWidth(w);
+            if (w <= 0) throw std::runtime_error(whereStr() + "lower: unsupported locator iterator of type " + itSym->getType().toString());
             ek.itSig = fresh(w);
             sigmap[itSym] = ek.itSig;
         }
@@ -2980,7 +2986,7 @@ struct Lowerer {
                     return sized(castClass(call, true), 1, false, ctx);
                 if (E r = sysFn(call, n)) return sized(r, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
                 // $signed / $unsigned keep the bits and change the tag.
-                if (n != "$signed" && n != "$unsigned") unsupported("system function");
+                if (n != "$signed" && n != "$unsigned") throw std::runtime_error(whereStr() + "lower: unsupported system function " + std::string(n));
                 auto args = call.arguments();
                 if (args.size() != 1 || args[0]->kind == ExpressionKind::EmptyArgument)
                     unsupported("system function");
@@ -3192,7 +3198,7 @@ struct Lowerer {
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
                 if (c.conditions.size() != 1) unsupported("pattern conditional");
-                int w = ctx.live && ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
+                int w = ctx.live && ctx.w > 0 ? ctx.w : e.type->isIntegral() ? (int)e.type->getBitWidth() : storeW(*e.type);
                 needWidth(w);
                 bool sg = e.type->isSigned();
                 ExprCtx arm{w, sg, sg, true};
@@ -3912,6 +3918,13 @@ struct Lowerer {
             return;
         }
         if (t.isIntegral()) { fmt += "%0d"; out.push_back(v); return; }
+        if (isHandleType(t) || t.isEvent() || t.isVirtualInterface()) {   // a handle: null, or @ and its object id
+            auto at = node(Op::SFormat, {v});
+            at->fmt = "@%0d";
+            fmt += "%s";
+            out.push_back(mux(bin(Op::Eq, v, konst(make(0, 0, 64))), konst(mkstr("null")), at));
+            return;
+        }
         unsupported("%p of this type");
     }
     // An unpacked struct prints with member names; a union, its first member (21.2.1.6).
@@ -3941,8 +3954,7 @@ struct Lowerer {
         if (int d = dynSig(x); d >= 0) {
             const Type* et = x.type->getCanonicalType().getArrayElementType();
             const Type& ec = et->getCanonicalType();
-            if (!(ec.isIntegral() && ec.kind != SymbolKind::EnumType && !ec.isStruct()) && !ec.isString() && !ec.isFloating())
-                unsupported("%p of a container of this element type");
+            // (handles, enums, structs: their stored bits as a number, for now)
             fmt += "%Q";
             fmt += ec.isString() ? 's' : ec.isFloating() ? 'R' : 'd';
             out.push_back(ref(d));
@@ -5067,22 +5079,44 @@ struct Lowerer {
 
     // foreach over a dynamic array or queue: index 0 up to size() - 1, read
     // again each pass. Over an associative array: first() then next().
+    // foreach over a container (12.7.3): one loop per dimension; a dimension
+    // past the first walks the inner container of a container of containers.
     void foreachDyn(const slang::ast::ForeachLoopStatement& f, int d) {
-        if (f.loopDims.size() != 1) unsupported("foreach over more than one dimension of a container");
-        const auto* var = f.loopDims[0].loopVar;
-        if (!var) { stmt(f.body); return; }
-        const DynObj o = dynShape(d);
+        if (f.loopDims.size() == 1 && !f.loopDims[0].loopVar) { stmt(f.body); return; }
         loops.push_back({});
+        foreachLevel(f, 0, d);
+        patch(loops.back().breaks, prog.here());
+        loops.pop_back();
+    }
+    void foreachLevel(const slang::ast::ForeachLoopStatement& f, size_t lvl, int d) {
+        const DynObj o = dynShape(d);
+        bool last = lvl + 1 == f.loopDims.size();
+        if (!last && !o.sub) unsupported("foreach over a container dimension that is not a container");
+        const auto* var = f.loopDims[lvl].loopVar;
+        auto inner = [&](int v) {
+            if (last) {
+                stmt(f.body);
+                patch(loops.back().continues, prog.here());
+                return;
+            }
+            auto n = node(Op::DynSub, {ref(v, o.kind != 2 || o.keySgn)});
+            n->sig = d;
+            int tmp = fresh(64);
+            Instr i; i.k = IK::Assign; i.sig = tmp; i.e = n;
+            prog.emit(i);
+            int in = indThrough(tmp);
+            indShape[in] = o.sub->dyn[0].second;
+            foreachLevel(f, lvl + 1, in);
+        };
         if (o.kind != 2) {
             int v = fresh(32);
-            bindVar(var, v);
+            if (var) bindVar(var, v);
             Instr init; init.k = IK::Assign; init.sig = v; init.e = konst(make(0, 0, 32, 0, true));
             prog.emit(init);
             size_t top = prog.here();
             Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Lt, ref(v, true), dynSize(d));
             size_t jf = prog.emit(j);
-            stmt(f.body);
-            patch(loops.back().continues, prog.here());
+            inner(v);
             Instr st; st.k = IK::Assign; st.sig = v;
             st.e = bin(Op::Add, ref(v, true), konst(make(1, 0, 32, 0, true)));
             prog.emit(st);
@@ -5090,22 +5124,19 @@ struct Lowerer {
             prog.code[jf].target = prog.here();
         } else {
             int v = fresh(o.strKey ? 64 : o.keyW);
-            bindVar(var, v);
+            if (var) bindVar(var, v);
             int ok = fresh(32);
             Instr first = dynCmd(d, D_FIRST); first.dkey = v; first.dres = ok;
             prog.emit(first);
             size_t top = prog.here();
             Instr j; j.k = IK::JmpIfNot; j.e = ref(ok);
             size_t jf = prog.emit(j);
-            stmt(f.body);
-            patch(loops.back().continues, prog.here());
+            inner(v);
             Instr nx = dynCmd(d, D_NEXT); nx.dkey = v; nx.dres = ok;
             prog.emit(nx);
             Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
             prog.code[jf].target = prog.here();
         }
-        patch(loops.back().breaks, prog.here());
-        loops.pop_back();
     }
 
     int stmtDepth = 0;   // > 0 while lowering a procedural statement

@@ -2191,7 +2191,9 @@ inline Val eval(const E& e, const Reader& rd) {
         }
         case Op::StrRep: {
             std::string one = v_str(k(0)), s;
-            for (int i = 0; i < e->hi; i++) s += one;
+            int64_t n = e->hi;
+            if (e->kids.size() > 1) { Val c = k(1); n = c.x ? 0 : v_to_i64(c); }   // a count known at run time
+            for (int64_t i = 0; i < n; i++) s += one;
             return mkstr(s);
         }
         case Op::StrCmp: {
