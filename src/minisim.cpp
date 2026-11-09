@@ -1700,7 +1700,7 @@ static void initFrameSigs(const FrameLayout& L, int base) {
     for (auto& [off, o] : L.dyn) dynStore()[base + off] = o;
 }
 [[noreturn]] static void nullAccess() {
-    cerr << "error: null object access at time " << S.now << "\n";
+    cerr << "error: null object access at time " << S.now << runLocStr() << "\n";
     exit(1);
 }
 static Val getSig(int s) { return S.get(s); }

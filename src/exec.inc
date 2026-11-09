@@ -968,6 +968,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             continue;
         }
         const Instr& i = p->code[pc];
+        g_runLoc = {i.file, i.line};
         if (g_cov) covHit(i.hits);
         switch (i.k) {
             case IK::Assign:
@@ -982,6 +983,23 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 if (i.dyn >= 0) {   // q[i] = v, aa[key] = v
                     Instr set = i;
                     set.k = IK::Dyn; set.sig = i.dyn; set.dcmd = D_SET;
+                    if (i.hi >= 0 || i.bidx) {   // q[i][3:0] = v, q[i].f = v: read, change, write back
+                        Val old = dynStore()[R(i.dyn)].get(eval(i.args[0], rd));
+                        int W = old.w, hi = i.hi, lo = i.lo;
+                        if (i.bidx) {
+                            Val bv = eval(i.bidx, rd);
+                            if (bv.x) { pc++; break; }
+                            int64_t b = v_to_i64(bv) - i.lo;
+                            int64_t l = !i.pw ? b : i.pdown ? b - i.pw + 1 : b, h = !i.pw ? b : l + i.pw - 1;
+                            int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, W - 1);
+                            if (cl > ch) { pc++; break; }
+                            if (i.pw) v = v_slice(v, (int)(ch - l), (int)(cl - l));
+                            hi = (int)ch; lo = (int)cl;
+                        }
+                        Val nv = v_insert(old, v, hi, lo);
+                        nv.sgn = old.sgn; nv.str = old.str; nv.real = old.real;
+                        set.e = konst(nv);
+                    }
                     dynExec(set);
                     pc++; break;
                 }
@@ -1146,7 +1164,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         }
                         const auto& ve = cr.vt[(size_t)vs];
                         if (!ve.first) {
-                            cerr << "error: call of a pure virtual method at time " << S.now << "\n";
+                            cerr << "error: call of a pure virtual method at time " << S.now << runLocStr() << "\n";
                             exit(1);
                         }
                         callee = ve.first;

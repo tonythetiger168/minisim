@@ -1358,6 +1358,7 @@ enum class Op {
     IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
     Addr,      // the signal id of slot `sig` of the object kids[0] names, or 0 for null
     AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    DynEq,     // containers sig and hi have the same size and equal elements (=== when lo)
     DynStrJoin, // the strings in container sig, joined ({>>{q}} of a string queue, 11.4.14)
     DynSub     // id + 1 of the inner container at key kids[0] of container of containers sig
 };
@@ -2097,6 +2098,9 @@ inline bool (*g_isA)(int obj, int cls) = nullptr;   // is object obj of class cl
 // there gives null (the access that uses the address reports it, if it runs).
 inline int g_nullOk = 0;
 inline int g_nullSig = 0;   // a signal that always holds 0, read in place of a null object's slot
+// Set at exit: processes still waiting are destroyed after the lowered
+// design (and its frame layouts) is gone, so their frames are not recycled.
+inline bool g_framesDead = false;
 struct Frame {
     int base = 0;                    // first signal of this frame's slots
     int self = 0;                    // `this` (a handle), 0 outside methods
@@ -2104,7 +2108,7 @@ struct Frame {
     std::shared_ptr<Frame> up;       // the lexically enclosing frame (fork branches)
     Frame() = default;
     Frame(const Frame&) = delete;
-    ~Frame() { if (lay && !lay->w.empty()) lay->pool.push_back(base); }
+    ~Frame() { if (lay && !lay->w.empty() && !g_framesDead) lay->pool.push_back(base); }
 };
 using FrameP = std::shared_ptr<Frame>;
 inline FrameP newFrame(const FrameLayout* lay, FrameP up, int self) {
@@ -2365,6 +2369,25 @@ inline Val eval(const E& e, const Reader& rd) {
             return mkstr(s);
         }
         case Op::DynGet: return dynStore()[R(e->sig)].get(k(0));
+        case Op::DynEq: {
+            const DynObj& a = dynStore()[R(e->sig)];
+            const DynObj& b = dynStore()[R(e->hi)];
+            if (a.size() != b.size()) return mk(0, 1);
+            bool unk = false;
+            auto one = [&](const Val& x, const Val& y) {
+                if (x.str || y.str) return v_str(x) == v_str(y);
+                Val r = e->lo ? v_case_eq(x, y) : v_eq(x, y);
+                if (r.x) { unk = true; return true; }
+                return (r.v & 1) != 0;
+            };
+            if (a.kind == 2 && b.kind == 2) {
+                for (auto ia = a.map.begin(), ib = b.map.begin(); ia != a.map.end(); ++ia, ++ib)
+                    if (ia->first.i != ib->first.i || ia->first.s != ib->first.s || !one(ia->second, ib->second)) return mk(0, 1);
+            } else if (a.kind != 2 && b.kind != 2) {
+                for (size_t k = 0; k < a.vec.size(); k++) if (!one(a.vec[k], b.vec[k])) return mk(0, 1);
+            } else return mk(0, 1);
+            return unk ? allx(1) : mk(1, 1);
+        }
         case Op::DynStrJoin: {
             auto& d = dynStore()[R(e->sig)];
             std::string r;

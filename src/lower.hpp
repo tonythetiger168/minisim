@@ -3189,6 +3189,26 @@ struct Lowerer {
                     if (!eq && !ne) unsupported("this operator on class handles");
                     return sized(bin(eq ? Op::Eq : Op::Ne, exprH(b.left()), exprH(b.right())), 1, false, ctx);
                 }
+                if ((isDynType(*b.left().type) || isDynType(*b.right().type)) &&
+                    (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
+                     b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality)) {
+                    // Whole containers (7.6, 11.4.5): same size, and every element pair equal.
+                    auto side = [&](const Expression& x, const Expression& other) {
+                        int d = dynSig(x);
+                        if (d >= 0) return d;
+                        d = dynTemp(dynShapeOf(isDynType(*x.type) ? *x.type : *other.type));
+                        assignContainer(d, x);
+                        return d;
+                    };
+                    int da = side(b.left(), b.right()), db = side(b.right(), b.left());
+                    auto n = node(Op::DynEq);
+                    n->sig = da;
+                    n->hi = db;
+                    n->lo = b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality;
+                    E acc = n;
+                    if (b.op == BinaryOperator::Inequality || b.op == BinaryOperator::CaseInequality) acc = un(Op::LogNot, acc);
+                    return sized(acc, 1, false, ctx);
+                }
                 if (b.left().type->isUnpackedArray() &&
                     (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
                      b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality)) {
@@ -3342,6 +3362,12 @@ struct Lowerer {
             }
             case ExpressionKind::ElementSelect: {   // a[i]
                 if (E k = paramSelect(e, ctx)) return k;
+                if (e.as<ElementSelectExpression>().value().type->isString()) {   // s[i]: a byte of a string (6.16)
+                    const auto& sel = e.as<ElementSelectExpression>();
+                    auto g = node(Op::StrMethod, {exprStr(sel.value()), expr(sel.selector())});
+                    g->hi = S_GETC;
+                    return sized(g, 8, false, ctx);
+                }
                 if (int d = dynSig(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key]
                     int w = storeW(*e.type);
                     needWidth(w);
@@ -3445,7 +3471,6 @@ struct Lowerer {
                 }
                 const auto& sel = e.as<ElementSelectExpression>();
                 lhs(sel.value(), i);
-                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index));
                 return;
             }
@@ -3453,7 +3478,6 @@ struct Lowerer {
                 const auto& r = e.as<RangeSelectExpression>();
                 if (dynSig(r.value()) >= 0) unsupported("write to a queue slice");
                 lhs(r.value(), i);
-                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, rangePSel(r));
                 return;
             }
@@ -3467,7 +3491,6 @@ struct Lowerer {
                     return;
                 }
                 lhs(m.value(), i);
-                if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, memberPSel(m));
                 return;
             }
@@ -3820,6 +3843,12 @@ struct Lowerer {
             return n;
         }
         if (isReal(l) || isReal(it)) return fcmp(4, realOf(l), realOf(it));
+        if (l.type->isString() || it.type->isString()) {   // strings compare by text (11.4.13)
+            auto c = node(Op::StrCmp, {strOf(l), strOf(it)});
+            c->hi = 4;
+            return c;
+        }
+        if (isHandleType(*l.type) && isHandleType(*it.type)) return bin(Op::Eq, exprH(l), exprH(it));
         if (!it.type->isIntegral() || !l.type->isIntegral()) unsupported("inside on a non-integral item");
         auto [a, b] = pair(l, it);
         return bin(Op::WildEq, a, b);
@@ -5112,6 +5141,19 @@ struct Lowerer {
         using namespace slang::ast;
         if (a.timingControl || a.isCompound()) unsupported("delayed or compound streaming assignment");
         const auto& sc = peel(a.left()).as<StreamingConcatenationExpression>();
+        if (sc.streams().size() == 1 && !sc.streams()[0].withExpr) {   // {<<bit{q}} = v: q gets every element of the stream
+            const Expression& op = peel(*sc.streams()[0].operand);
+            const Expression& r = peel(a.right());
+            if (int d = dynSig(op); d >= 0 && r.type->isIntegral()) {
+                if (dynShape(d).kind == 2) unsupported("streaming into an associative array");
+                int rw = (int)r.type->getBitWidth();
+                needWidth(rw);
+                Instr i = dynCmd(d, D_UNPACK);
+                i.e = unreverseSlices(expr(r), rw, (int)sc.getSliceSize());
+                prog.emit(i);
+                return;
+            }
+        }
         std::vector<std::pair<const Expression*, int>> tg;   // target, width
         int sw = 0;
         for (auto& st : sc.streams()) {
@@ -5125,8 +5167,14 @@ struct Lowerer {
         needWidth(sw);
         const Expression& r = peel(a.right());
         int rw = (int)r.type->getBitWidth();
-        if (!r.type->isIntegral() || rw < sw) unsupported("streaming assignment from a narrower or non-integral value");
-        E v = expr(r);
+        E v;
+        if (r.kind == ExpressionKind::Streaming && !streamIsDyn(r.as<StreamingConcatenationExpression>())) {
+            v = streamBits(r.as<StreamingConcatenationExpression>(), rw);   // {>>{a}} = {<<8{a}}
+            if (rw < sw) unsupported("streaming assignment from a narrower stream");
+        } else {
+            if (!r.type->isIntegral() || rw < sw) unsupported("streaming assignment from a narrower or non-integral value");
+            v = expr(r);
+        }
         if (rw > sw) v = slice(v, rw - 1, rw - sw);
         int tmp = fresh(sw);
         Instr hold; hold.k = IK::Assign; hold.sig = tmp; hold.e = unreverseSlices(v, sw, (int)sc.getSliceSize());
@@ -5148,6 +5196,19 @@ struct Lowerer {
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
             if (syncDrive(a)) return;   // cb.v <= e (14.16)
+            if (peel(a.left()).kind == ExpressionKind::ElementSelect &&
+                peel(a.left()).as<ElementSelectExpression>().value().type->isString()) {   // s[i] = c (6.16): putc
+                const auto& sel = peel(a.left()).as<ElementSelectExpression>();
+                if (a.isCompound() || a.timingControl) unsupported("compound or delayed write to a string character");
+                Instr i;
+                i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
+                lhs(sel.value(), i);
+                auto p = node(Op::StrMethod, {exprStr(sel.value()), expr(sel.selector()), resize(expr(a.right()), 8, false, false)});
+                p->hi = S_PUTC;
+                i.e = p;
+                prog.emit(i);
+                return;
+            }
             if (int d = dynSig(a.left()); d >= 0) {   // q = '{1, 2}; d = new[8]; aa = other;
                 if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this container assignment");
                 assignContainer(d, a.right());
@@ -5388,6 +5449,7 @@ struct Lowerer {
                     lw.retSig = retSig;
                     lw.scope = scope;
                     lw.sampleEv = sampleEv;
+                    lw.curClass = curClass;   // a fork in a method: `this` is the method's object
                     // Each branch has a frame for its own automatic variables
                     // (and temporaries), unless it is plain static code.
                     FrameLayout* bl = newLayout("fork branch");
@@ -5440,7 +5502,7 @@ struct Lowerer {
                 }
                 std::vector<int> refs;
                 collectRefs(prog.code[jf].e, refs);
-                if (refs.empty()) unsupported("wait on a constant");
+                if (refs.empty()) refs.push_back(freshStatic(1));   // wait(0): a signal nothing writes, so forever
                 std::vector<std::pair<int, Edge>> rs;
                 for (int r : refs) rs.push_back({r, ANY});
                 prog.emit(waitInstr(rs));
@@ -5532,8 +5594,11 @@ struct Lowerer {
                     break;
                 }
                 if (auto it = dynMap().find(&vd.symbol); it != dynMap().end()) {
-                    if (vd.symbol.lifetime == slang::ast::VariableLifetime::Static && current)
-                        unsupported("static container in a task or function");
+                    if (vd.symbol.lifetime == slang::ast::VariableLifetime::Static && current) {
+                        // keeps its contents from call to call (6.21)
+                        if (init) unsupported("static container with an initializer in a task or function");
+                        break;
+                    }
                     prog.emit(dynCmd(it->second, D_DELETE));   // a block entry starts it empty
                     if (init) assignContainer(it->second, *init);
                     break;
@@ -6349,6 +6414,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     // it is the first thing to run at time 0. Locals of a block, task or
     // function are not module members and are handled by Lowerer.
     std::unique_ptr<Lowerer> init;
+    std::unique_ptr<Lowerer> init0;   // default values (no initializer): run before every initializer
     void handle(const slang::ast::VariableSymbol& v) {
         const slang::ast::Expression* e = v.getInitializer();
         if (v.getType().isEvent()) {   // both counters start at 0: not triggered
@@ -6396,29 +6462,36 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (auto ar = arrMap().find(&v); ar != arrMap().end()) {   // int a[3]: 2-state elements start at 0 (6.8)
             const auto& s = *ar->second;
             if (!s.twoState) return;
-            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            if (!init0) { init0 = std::make_unique<Lowerer>(sigmap); prep(*init0); }
             for (int k = 0; k < s.count; k++) {
                 Instr i; i.k = IK::Assign; i.sig = s.base + k;
                 i.e = konst(make(0, 0, s.elemW, 0, s.sgn));
-                init->prog.emit(i);
+                init0->prog.emit(i);
             }
             return;
         }
         const auto& t = v.getType();
         if (!e && (t.isUnpackedStruct() || t.isUnpackedUnion())) {   // 7.2: each member's default
-            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            if (!init0) { init0 = std::make_unique<Lowerer>(sigmap); prep(*init0); }
             Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
-            i.e = init->structDefault(t);
-            init->prog.emit(i);
+            i.e = init0->structDefault(t);
+            init0->prog.emit(i);
             return;
         }
         // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
         // A class handle starts as null (8.4).
         bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || isHandleType(t));
         if (!e && !zero) return;
+        if (!e) {   // defaults go first, so no initializer (which may call any function) sees an unset variable
+            if (!init0) { init0 = std::make_unique<Lowerer>(sigmap); prep(*init0); }
+            Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
+            i.e = konst(mk(0, storeW(t)));
+            init0->prog.emit(i);
+            return;
+        }
         if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
-        i.e = e ? init->expr(*e) : konst(mk(0, storeW(t)));
+        i.e = init->expr(*e);
         init->prog.emit(i);
     }
     // Module path delays (30.4): (a => b) = d delays every change of output
@@ -6485,9 +6558,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     // Moves the initializer process to the front of `out.procs`.
     void placeInit() {
-        if (!init) return;
-        out.procs.insert(out.procs.begin(), {std::move(init->prog), false, "init"});
+        if (init) out.procs.insert(out.procs.begin(), {std::move(init->prog), false, "init"});
+        if (init0) out.procs.insert(out.procs.begin(), {std::move(init0->prog), false, "init"});
         init.reset();
+        init0.reset();
     }
 
     static uint8_t strengthOf(slang::ast::DriveStrength s) {
@@ -6891,7 +6965,7 @@ inline void patchImplicit(Prog& prog) {
     std::vector<size_t> slots;
     for (size_t pc = 0; pc < prog.code.size(); pc++) {
         const Instr& i = prog.code[pc];
-        if (i.k == IK::WaitEdge && i.events.empty() && i.sig < 0) slots.push_back(pc);
+        if (i.k == IK::WaitEdge && i.events.empty() && i.sig < 0 && !i.dynWait) slots.push_back(pc);
     }
     if (slots.empty()) return;
     auto rs = readSet(prog);
@@ -7060,12 +7134,26 @@ inline ClassInfo* buildClass(const slang::ast::ClassType& ct,
             ci->ctor->cls = ci;
             continue;
         }
-        if (!sub->isVirtual() || sub->flags.has(MethodFlags::Static)) continue;
+        if (sub->flags.has(MethodFlags::Static)) continue;
         int slot = -1;
         if (const SubroutineSymbol* ov = sub->getOverride()) {
             auto vs = vslotMap().find(ov);
             if (vs != vslotMap().end()) slot = vs->second;
         }
+        // An override of a virtual method a base class declares, also through
+        // extern prototypes (8.20, 8.24): the nearest base method of that name.
+        for (ClassInfo* b = base; slot < 0 && b; b = b->base) {
+            const Symbol* f = b->ty->find(sub->name);
+            if (!f || f->getParentScope() != b->ty) continue;
+            if (const SubroutineSymbol* bs = method(*f)) {
+                auto vs = vslotMap().find(bs);
+                if (vs != vslotMap().end()) slot = vs->second;
+                break;
+            }
+        }
+        bool isVirt = sub->isVirtual() || slot >= 0 ||
+                      (m.kind == SymbolKind::MethodPrototype && m.as<MethodPrototypeSymbol>().flags.has(MethodFlags::Virtual));
+        if (!isVirt) continue;
         auto& vt = classRt()[(size_t)ci->id].vt;
         if (slot < 0) { slot = (int)vt.size(); vt.push_back({nullptr, nullptr}); }
         vslotMap()[sub] = slot;
@@ -7192,7 +7280,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     pendingSub().clear();
     pendingAt().clear();
     blockIds() = BlockIds{};
-    Lowerer::covSM() = g_cov ? comp.getSourceManager() : nullptr;
+    Lowerer::covSM() = comp.getSourceManager();   // statement locations, for coverage and run-time messages
     {   // alias statements (10.11), before any signal is made
         aliasOf().clear();
         interconnectW().clear();
@@ -7446,7 +7534,11 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             rv.off = ps.arr->base; rv.count = ps.arr->count;
                             while (et->isUnpackedArray()) et = &et->getArrayElementType()->getCanonicalType();
                         } else if (ps.kind == 0) rv.off = ps.off;
-                        else Lowerer::unsupported("rand dynamic array or queue");
+                        else {   // rand dynamic arrays and queues: not randomized yet (left as they are)
+                            static bool warned = false;
+                            if (!warned) { warned = true; fprintf(stderr, "warning: rand dynamic arrays and queues are not randomized yet (%s)\n", rv.name.c_str()); }
+                            continue;
+                        }
                         if (isHandleType(*et)) { rv.obj = true; rv.w = 64; }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
@@ -7471,7 +7563,14 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     if (m.kind == SymbolKind::ConstraintBlock) {
                         const auto& cb = m.as<ConstraintBlockSymbol>();
                         auto& b = blockOf[&cb];
-                        if (!b) b = lw.randBlock(cb);
+                        if (!b) {
+                            try { b = lw.randBlock(cb); }
+                            catch (const std::runtime_error& ex) {   // e.g. constraints on rand queues: left out, with a warning
+                                fprintf(stderr, "warning: constraint %s::%s left out: %s\n", std::string(c->ty->name).c_str(),
+                                        std::string(cb.name).c_str(), ex.what());
+                                continue;
+                            }
+                        }
                         if (auto f = byName.find(b->name); f != byName.end()) sp->blocks[f->second] = b;
                         else { byName[b->name] = sp->blocks.size(); sp->blocks.push_back(b); }
                         continue;

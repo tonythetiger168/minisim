@@ -350,6 +350,7 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+    std::atexit([] { g_framesDead = true; });   // before the kernel's waiting processes are destroyed
     // Pass 1: take msim's own options out; translate VCS spellings for slang.
     std::vector<std::string> fwd{argv[0]};
     std::vector<std::string> plusargs;
