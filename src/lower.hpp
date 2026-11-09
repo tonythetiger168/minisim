@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "prog.hpp"
+#include "sva.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Expression.h"
@@ -227,6 +228,7 @@ struct Lowerer {
     int tsUnit = -9, tsPrec = -9;
     void setScope(const slang::ast::Scope* sc) {
         if (!sc) return;
+        scope = sc;
         if (auto ts = sc->getTimeScale()) { tsUnit = tsExp(ts->base); tsPrec = tsExp(ts->precision); }
     }
     uint64_t ticksPerUnit() const { return pow10u(tsUnit - simPrecExp()); }
@@ -296,6 +298,8 @@ struct Lowerer {
     const OutSlot* outSlot = nullptr;
 
     explicit Lowerer(std::unordered_map<const slang::ast::Symbol*, int>& m) : sigmap(m) {}
+
+#include "lower_assert.inc"
 
     // Owns the Prog of each fork branch, so Fork's pointers outlive lower().
     std::vector<std::unique_ptr<Prog>>* store = nullptr;
@@ -1752,6 +1756,7 @@ struct Lowerer {
         return resize(slice(ref(tmp), 31, 0), 32, false, true);
     }
     E sysFn(const slang::ast::CallExpression& call, std::string_view n) {
+        if (E r = sampledFn(call, n)) return r;   // $past, $rose, ... (16.9.3)
         auto args = call.arguments();
         auto a = [&](size_t i) { return expr(*args[i]); };
         if (n == "$clog2" && args.size() == 1) return sysFnNode(SF_CLOG2, {a(0)});
@@ -2014,6 +2019,7 @@ struct Lowerer {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
         if (n == "$fatal" || n == "$error" || n == "$warning" || n == "$info") { severity(call, n); return; }
+        if (assertCtlCall(call, n)) return;   // $asserton, $assertcontrol, ... (20.11)
         if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.push_back(x), aa.delete(k) ...
             dynMethod(call, false);
             return;
@@ -2276,6 +2282,8 @@ struct Lowerer {
                     if (!b.blockSymbol || b.blockSymbol->name.empty()) { stmt(b.body); break; }
                     size_t k = named.size();
                     named.push_back({b.blockSymbol, {}});
+                    labelSym = b.blockSymbol;   // label: assert ... names the assertion
+                    labelOf = &b.body;
                     stmt(b.body);
                     patch(named[k].second, prog.here());   // disable blk: jump past it
                     named.pop_back();
@@ -2294,6 +2302,8 @@ struct Lowerer {
                     lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
                     lw.current = current;
                     lw.retSig = retSig;
+                    lw.scope = scope;
+                    lw.sampleEv = sampleEv;
                     lw.stmt(st);
                     lw.finishImplicit();
                     // disable <named fork> ends every branch; disable <named
@@ -2595,6 +2605,7 @@ struct Lowerer {
                 break;
             }
             case StatementKind::WaitFork: { Instr i; i.k = IK::WaitFork; prog.emit(i); break; }
+            case StatementKind::ImmediateAssertion: immAssert(s.as<ImmediateAssertionStatement>()); break;
             case StatementKind::DisableFork: { Instr i; i.k = IK::DisableFork; prog.emit(i); break; }
             default:
                 throw std::runtime_error("lower: unsupported statement kind " + std::string(toString(s.kind)));
@@ -3150,13 +3161,54 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
     }
+    // The clock a procedure infers for its sampled value functions and
+    // assertions (16.14.6): an event control at its start.
+    static const slang::ast::TimingControl* leadingEvent(const slang::ast::Statement& st) {
+        using namespace slang::ast;
+        if (st.kind == StatementKind::Timed) {
+            const auto& t = st.as<TimedStatement>().timing;
+            if (t.kind == TimingControlKind::SignalEvent || t.kind == TimingControlKind::EventList) return &t;
+            return nullptr;
+        }
+        if (st.kind == StatementKind::Block && st.as<BlockStatement>().blockKind == StatementBlockKind::Sequential)
+            return leadingEvent(st.as<BlockStatement>().body);
+        if (st.kind == StatementKind::List && !st.as<StatementList>().list.empty())
+            return leadingEvent(*st.as<StatementList>().list[0]);
+        return nullptr;
+    }
+    // An assertion written as a module item (16.4.3, 16.14.5). slang wraps it
+    // in a procedure marked isFromAssertion.
+    void assertionItem(const slang::ast::ProceduralBlockSymbol& p) {
+        using namespace slang::ast;
+        const Statement* st = &p.getBody();
+        if (st->kind == StatementKind::Block && st->as<BlockStatement>().blockKind == StatementBlockKind::Sequential)
+            st = &st->as<BlockStatement>().body;
+        if (st->kind != StatementKind::ImmediateAssertion) Lowerer::unsupported("concurrent assertion");
+        // A static deferred assertion acts as if in an always_comb (16.4.3).
+        Lowerer lw(sigmap);
+        prep(lw);
+        lw.setScope(p.getParentScope());
+        lw.stmt(p.getBody());
+        auto rs = readSet(lw.prog);
+        bool loops = !rs.empty();
+        if (loops) {
+            lw.prog.emit(waitInstr(rs));
+            Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "always_comb"});
+    }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
+        if (p.isFromAssertion) { assertionItem(p); return; }
         // A final block (9.2.3) runs once when simulation ends. Lowering it as
         // a process would run it at time 0 and, looping, forever.
         Lowerer lw(sigmap);
         prep(lw);
         lw.setScope(p.getParentScope());
+        if (p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final)
+            if (const auto* t = leadingEvent(p.getBody())) {
+                try { lw.collectEvents(*t, lw.sampleEv); } catch (const std::runtime_error&) { lw.sampleEv.clear(); }
+            }
         lw.stmt(p.getBody());
         lw.finishImplicit();
         if (p.procedureKind == ProceduralBlockKind::Initial)
@@ -3210,10 +3262,48 @@ inline void rejectRecursive(const std::vector<Subr*>& subs) {
         if (color[s] == Color::White) dfs(dfs, s);
 }
 
+// Default sampled values (16.5.1): at time 0, right after the declaration
+// initializers ran, every shadow takes its signal's value and every $past
+// stage the sampled value of its expression.
+inline void sampledInit(LowerResult& out) {
+    if (shadowPairs().empty() && sampleClocks().empty()) return;
+    Prog p;
+    for (auto [src, sh] : shadowPairs()) {
+        Instr i; i.k = IK::Assign; i.sig = sh; i.e = ref(src);
+        p.emit(i);
+    }
+    for (auto& c : sampleClocks())
+        for (auto& ln : c.lines)
+            for (int st : ln.stages) {
+                Instr i; i.k = IK::Assign; i.sig = st; i.e = ln.src;
+                p.emit(i);
+            }
+    size_t at = 0;
+    for (size_t k = 0; k < out.procs.size(); k++)
+        if (out.procs[k].kind == "init") at = k + 1;
+    out.procs.insert(out.procs.begin() + (ptrdiff_t)at, {std::move(p), false, "sampled"});
+}
+
 inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                          std::function<int(int)> newDriver) {
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
+    asserts().clear();
+    shadowPairs().clear();
+    sampleClocks().clear();
+    sigInfo().clear();
+    Lowerer::shadowMap().clear();
+    Lowerer::shadowArrs().clear();
+    Lowerer::compilation() = &comp;
+    {   // remember every signal's name and width, for sampled-value shadows (16.5.1)
+        MkSig inner = std::move(mkSig);
+        mkSig = [inner](const std::string& n, int w, bool net) {
+            int id = inner(n, w, net);
+            if ((size_t)id >= sigInfo().size()) sigInfo().resize(id + 1);
+            sigInfo()[id] = {n, w};
+            return id;
+        };
+    }
     arrMap().clear();
     netKinds().clear();
     srcMgr() = comp.getSourceManager();
@@ -3319,6 +3409,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     comp.getRoot().visit(pc);
     pc.finishPaths();
     pc.placeInit();
+    sampledInit(out);
     rejectRecursive(order);
     for (const slang::ast::Symbol* b : blockIds().disabledFromOutside)
         if (!blockIds().roots.count(blockIds().of(b)))
