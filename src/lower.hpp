@@ -54,6 +54,7 @@
 #include "sva.hpp"
 #include "sva_engine.hpp"
 #include "clocking.hpp"
+#include "cover.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
@@ -77,6 +78,7 @@
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/symbols/SpecifySymbols.h"
 #include "slang/ast/types/AllTypes.h"
+#include "slang/syntax/AllSyntax.h"
 #include "slang/text/SourceManager.h"
 
 // Fixed-size unpacked arrays (7.4), keyed by the array's symbol. SigCollector
@@ -120,6 +122,13 @@ inline std::unordered_map<const slang::ast::Symbol*, std::pair<FrameLayout*, std
 }
 inline std::unordered_map<const slang::ast::Symbol*, LocalSlot>& localDyn() {
     static std::unordered_map<const slang::ast::Symbol*, LocalSlot> m;
+    return m;
+}
+// `ref` arguments (13.5.2): the formal's slot holds the actual's signal id.
+// kind as PropSlot (0 value, 1 unpacked array, 2 container), with the shape.
+struct RefFormal { int kind = 0; std::shared_ptr<ArrShape> arr; DynObj dyn; };
+inline std::unordered_map<const slang::ast::Symbol*, RefFormal>& refFormals() {
+    static std::unordered_map<const slang::ast::Symbol*, RefFormal> m;
     return m;
 }
 // Owner of every frame shape made by this lowering (LowerResult::layouts).
@@ -171,10 +180,12 @@ inline BlockIds& blockIds() { static BlockIds b; return b; }
 inline int uWidth(const slang::ast::Type& t0);
 // A string is a 64-bit pool id; a shortreal is kept as a double, rounded to
 // single precision whenever a shortreal value is made (6.12).
+inline bool isHandleType(const slang::ast::Type& t);
 inline int storeW(const slang::ast::Type& t0) {
     const auto& t = t0.getCanonicalType();
+    if (t.kind == slang::ast::SymbolKind::CovergroupType) return 32;   // a covergroup handle (19.3)
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) return uWidth(t);
-    return t.isString() || t.isFloating() ? 64 : (int)t.getBitWidth();
+    return t.isString() || t.isFloating() || isHandleType(t) ? 64 : (int)t.getBitWidth();
 }
 // Tag bits of a tagged union (7.3.2): enough to number its members. The tag
 // is at the top; a member's value is right-justified below it.
@@ -243,6 +254,18 @@ inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::
     }
     return {after, fw};
 }
+// A class handle (8), chandle, or null: a 64-bit signal holding an object's
+// first signal id (0 is null).
+inline bool isHandleType(const slang::ast::Type& t) { return t.isClass() || t.isNull() || t.isCHandle(); }
+// Class methods are always automatic (8.6); other subroutines when declared
+// so or inside an automatic module, program or interface (13.3.2).
+inline bool isClassMethod(const slang::ast::SubroutineSymbol& s) {
+    const slang::ast::Scope* p = s.getParentScope();
+    return p && p->asSymbol().kind == slang::ast::SymbolKind::ClassType;
+}
+inline bool isAutomatic(const slang::ast::SubroutineSymbol& s) {
+    return s.defaultLifetime == slang::ast::VariableLifetime::Automatic || isClassMethod(s);
+}
 inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return r; }
 
 // name, width, and whether the signal is a net. A net starts at Z.
@@ -254,8 +277,10 @@ struct LoweredProc { Prog prog; bool loops; std::string kind; };
 // signals (the formal and slang's returnValVar), shared by every call.
 // `prog` is owned by LowerResult::subs so a Call's pointer stays valid after
 // lower() returns.
+struct ClassInfo;
 struct Subr {
     Prog* prog = nullptr;
+    ClassInfo* cls = nullptr;     // a constructor of this class (8.7): base constructor, initializers, body
     FrameLayout* lay = nullptr;   // automatic (13.3.2): arguments, result and locals are frame slots
     const slang::ast::SubroutineSymbol* sym = nullptr;
     int retSig = -1;
@@ -266,10 +291,64 @@ struct Subr {
         slang::ast::ArgumentDirection dir = slang::ast::ArgumentDirection::In;
         int w = 1;
         bool sgn = false;
+        // An unpacked array or container argument (7.7), copied element by
+        // element (sig is -1).
+        const slang::ast::FormalArgumentSymbol* arr = nullptr;
     };
     std::vector<Arg> args;
     std::vector<Subr*> calls;
 };
+
+// ---------- classes (8) ----------
+// An object is a block of signals laid out like a frame: slot 0 holds its
+// class id, then the base class's properties, then its own. A non-static
+// property is a slot offset; static ones are ordinary signals ("C::x").
+struct ClassInfo {
+    const slang::ast::ClassType* ty = nullptr;
+    int id = -1;
+    ClassInfo* base = nullptr;
+    FrameLayout* lay = nullptr;
+    Subr* ctor = nullptr;   // the constructor, written or implicit (8.7)
+    // A built-in class of the std package (1: weak_reference, 8.30) and
+    // the slot of its hidden state (the referent).
+    int builtin = 0;
+    int bslot = -1;
+};
+inline int builtinClassKind(const slang::ast::ClassType& ct) {
+    const slang::ast::Scope* sc = ct.genericClass ? ct.genericClass->getParentScope() : ct.getParentScope();
+    if (!sc || sc->asSymbol().kind != slang::ast::SymbolKind::Package || sc->asSymbol().name != "std") return 0;
+    std::string_view n = ct.genericClass ? ct.genericClass->name : ct.name;
+    if (n == "weak_reference") return 1;
+    throw std::runtime_error("lower: unsupported built-in class std::" + std::string(n));
+}
+inline std::unordered_map<const slang::ast::Type*, ClassInfo*>& classMap() {
+    static std::unordered_map<const slang::ast::Type*, ClassInfo*> m;
+    return m;
+}
+inline std::vector<std::unique_ptr<ClassInfo>>& classStore() { static std::vector<std::unique_ptr<ClassInfo>> v; return v; }
+// A non-static property's slot: kind 0 a value (or an event: two slots),
+// 1 an unpacked array (arr->base is its first slot), 2 a container.
+struct PropSlot { int kind = 0; int off = 0; std::shared_ptr<ArrShape> arr; };
+inline std::unordered_map<const slang::ast::Symbol*, PropSlot>& propMap() {
+    static std::unordered_map<const slang::ast::Symbol*, PropSlot> m;
+    return m;
+}
+// A virtual method's index in the virtual method table (8.20).
+inline std::unordered_map<const slang::ast::SubroutineSymbol*, int>& vslotMap() {
+    static std::unordered_map<const slang::ast::SubroutineSymbol*, int> m;
+    return m;
+}
+// An interface class method's global number k (8.26); a call through an
+// interface handle has vslot -2 - k.
+inline std::unordered_map<const slang::ast::SubroutineSymbol*, int>& ifaceSlotMap() {
+    static std::unordered_map<const slang::ast::SubroutineSymbol*, int> m;
+    return m;
+}
+inline ClassInfo* classInfo(const slang::ast::Type& t) {
+    auto it = classMap().find(&t.getCanonicalType());
+    if (it == classMap().end()) throw std::runtime_error("lower: unsupported class type " + t.toString());
+    return it->second;
+}
 
 struct LowerResult {
     std::vector<LoweredProc> procs;
@@ -335,6 +414,12 @@ struct Lowerer {
     // The event signal an event expression names (e, sub.e).
     int eventSig(const slang::ast::Expression& x) {
         using namespace slang::ast;
+        if (classMember(x)) {   // h.e: its two slots (count, last trigger) through the handle
+            const auto& m = x.as<MemberAccessExpression>();
+            const PropSlot* ps = memberSlot(m);
+            if (!ps) return sigAt(&m.member);
+            return indSlot(exprH(m.value()), ps->off, 2);
+        }
         if (!ValueExpressionBase::isKind(x.kind)) unsupported("event expression");
         int s = sigFind(&x.as<ValueExpressionBase>().symbol);
         if (s < 0) unsupported("event expression");
@@ -423,6 +508,20 @@ struct Lowerer {
     // automatic subroutine's, then a fork block's, then a branch's. Empty in
     // static code, where every variable is a signal.
     std::vector<FrameLayout*> frames;
+    ClassInfo* curClass = nullptr;   // the class whose method is being lowered
+    // Containers reached through a handle (indirect ids): their shapes.
+    mutable std::unordered_map<int, DynObj> indShape;
+    static bool isInd(int s) { return isRel(s) && relMode(s) >= kRelIndSig; }
+    // The indirect id through the slot `slot` names (a static signal or a frame slot).
+    static int indThrough(int slot) {
+        if (!isRel(slot)) return relSig(kRelIndSig, slot);
+        if (relMode(slot) > 4) unsupported("reference through a slot more than 4 frames up");
+        return relSig(kRelIndFrame + relMode(slot), relOff(slot));
+    }
+    int thisRel(int off) const {
+        if (!curClass) unsupported("class property outside a method of its class");
+        return relSig(kRelThis, off);
+    }
     int relIn(const FrameLayout* L, int off) const {
         for (size_t k = frames.size(); k-- > 0;)
             if (frames[k] == L) {
@@ -437,8 +536,19 @@ struct Lowerer {
         if (depth >= (int)frames.size()) unsupported("automatic variable outside a frame");
         return frames[frames.size() - 1 - depth];
     }
-    int sigFind(const slang::ast::Symbol* sym) const {
+    // The slot that holds a ref formal's address (a frame slot or a signal).
+    int refSlot(const slang::ast::Symbol* sym) const {
         if (auto it = localMap().find(sym); it != localMap().end()) return relIn(it->second.lay, it->second.off);
+        auto it = sigmap.find(sym);
+        if (it == sigmap.end()) unsupported("ref argument with no slot");
+        return it->second;
+    }
+    int sigFind(const slang::ast::Symbol* sym) const {
+        if (cgItemSig >= 0 && sym->kind == slang::ast::SymbolKind::Iterator && sym->name == "item") return cgItemSig;
+        if (auto rf = refFormals().find(sym); rf != refFormals().end())
+            return rf->second.kind == 0 ? indThrough(refSlot(sym)) : -1;
+        if (auto it = localMap().find(sym); it != localMap().end()) return relIn(it->second.lay, it->second.off);
+        if (auto it = propMap().find(sym); it != propMap().end() && it->second.kind == 0) return thisRel(it->second.off);
         auto it = sigmap.find(sym);
         return it == sigmap.end() ? -1 : it->second;
     }
@@ -448,6 +558,17 @@ struct Lowerer {
         return s;
     }
     std::shared_ptr<const ArrShape> arrFind(const slang::ast::Symbol* sym) const {
+        if (auto rf = refFormals().find(sym); rf != refFormals().end()) {
+            if (rf->second.kind != 1) return nullptr;
+            auto a = std::make_shared<ArrShape>(*rf->second.arr);
+            a->base = indThrough(refSlot(sym));
+            return a;
+        }
+        if (auto it = propMap().find(sym); it != propMap().end() && it->second.kind == 1) {
+            auto a = std::make_shared<ArrShape>(*it->second.arr);
+            a->base = thisRel(it->second.arr->base);
+            return a;
+        }
         if (auto it = localArr().find(sym); it != localArr().end()) {
             auto a = std::make_shared<ArrShape>(*it->second.second);
             a->base = relIn(it->second.first, it->second.second->base);
@@ -457,6 +578,13 @@ struct Lowerer {
         return it == arrMap().end() ? nullptr : it->second;
     }
     int dynFind(const slang::ast::Symbol* sym) const {
+        if (auto rf = refFormals().find(sym); rf != refFormals().end()) {
+            if (rf->second.kind != 2) return -1;
+            int d = indThrough(refSlot(sym));
+            indShape[d] = rf->second.dyn;
+            return d;
+        }
+        if (auto it = propMap().find(sym); it != propMap().end() && it->second.kind == 2) return thisRel(it->second.off);
         if (auto it = localDyn().find(sym); it != localDyn().end()) return relIn(it->second.lay, it->second.off);
         auto it = dynMap().find(sym);
         return it == dynMap().end() ? -1 : it->second;
@@ -464,7 +592,13 @@ struct Lowerer {
     // The empty shape of container d (a signal, or a frame slot).
     const DynObj& dynShape(int d) const {
         if (!isRel(d)) return dynStore()[d];
-        const FrameLayout* L = layOf(d);
+        if (isInd(d)) {
+            auto it = indShape.find(d);
+            if (it == indShape.end()) unsupported("container through a handle");
+            return it->second;
+        }
+        const FrameLayout* L = relMode(d) == kRelThis ? (curClass ? curClass->lay : nullptr) : layOf(d);
+        if (!L) unsupported("container slot");
         for (auto& [off, o] : L->dyn)
             if (off == relOff(d)) return o;
         unsupported("container slot");
@@ -481,21 +615,21 @@ struct Lowerer {
         return w > 64 ? allx(w) : Val{};
     }
     static DynObj dynShapeOf(const slang::ast::Type& t0);
-    void declLocal(const slang::ast::VariableSymbol& v, FrameLayout* L) {
+    // Slots for a variable of type t in frame (or object) shape L.
+    static PropSlot declSlot(const slang::ast::Type& t0, FrameLayout* L) {
         using namespace slang::ast;
-        if (localMap().count(&v) || localArr().count(&v) || localDyn().count(&v)) return;
-        const Type& t = v.getType().getCanonicalType();
+        const Type& t = t0.getCanonicalType();
+        PropSlot ps;
         if (isDynType(t)) {
-            int off = L->add(64, make(0, 0, 64));
-            L->dyn.push_back({off, dynShapeOf(t)});
-            localDyn()[&v] = {L, off};
-            return;
+            ps.kind = 2;
+            ps.off = L->add(64, make(0, 0, 64));
+            L->dyn.push_back({ps.off, dynShapeOf(t)});
+            return ps;
         }
         if (t.isEvent()) {
-            int off = L->add(32, make(0, 0, 32));
+            ps.off = L->add(32, make(0, 0, 32));
             L->add(64, make(0, 0, 64));
-            localMap()[&v] = {L, off};
-            return;
+            return ps;
         }
         if (t.isUnpackedArray()) {
             auto shape = std::make_shared<ArrShape>();
@@ -518,10 +652,20 @@ struct Lowerer {
                 int off = L->add(shape->elemW, iv);
                 if (!k) shape->base = off;
             }
-            localArr()[&v] = {L, shape};
-            return;
+            ps.kind = 1;
+            ps.arr = shape;
+            return ps;
         }
-        localMap()[&v] = {L, L->add(storeW(t), initOf(t))};
+        if (t.isUnpackedStruct() || t.isUnpackedUnion()) unsupported("unpacked struct as an automatic variable or class property");
+        ps.off = L->add(storeW(t), initOf(t));
+        return ps;
+    }
+    void declLocal(const slang::ast::VariableSymbol& v, FrameLayout* L) {
+        if (localMap().count(&v) || localArr().count(&v) || localDyn().count(&v)) return;
+        PropSlot ps = declSlot(v.getType(), L);
+        if (ps.kind == 2) localDyn()[&v] = {L, ps.off};
+        else if (ps.kind == 1) localArr()[&v] = {L, ps.arr};
+        else localMap()[&v] = {L, ps.off};
     }
     // Every automatic variable that `st` declares, outside nested fork
     // branches (which get their own frames), as a slot of frame L.
@@ -535,6 +679,7 @@ struct Lowerer {
 
 #include "lower_assert.inc"
 #include "lower_clocking.inc"
+#include "lower_cover.inc"
 
     // Owns the Prog of each fork branch, so Fork's pointers outlive lower().
     std::vector<std::unique_ptr<Prog>>* store = nullptr;
@@ -670,9 +815,15 @@ struct Lowerer {
     // Copy inputs in, call, copy outputs back. A function result is snapshotted
     // into a fresh signal: f(a)+f(b) would otherwise read the same return signal
     // twice and see only the second call.
+    // super.f() (8.15) calls the base class's body, never a derived override.
+    static bool superCall(const slang::ast::CallExpression& call) {
+        if (!call.syntax) return false;
+        std::string t = call.syntax->toString();
+        size_t k = t.find_first_not_of(" \t\r\n");
+        return k != std::string::npos && t.compare(k, 5, "super") == 0;
+    }
     E emitUserCall(const slang::ast::CallExpression& call, bool wantValue) {
         using namespace slang::ast;
-        if (call.thisClass()) unsupported("class method");
         if (call.isSystemCall()) unsupported("system call");
         const auto* sym = std::get<const SubroutineSymbol*>(call.subroutine);
         if (!sym || !subs) unsupported("subroutine call");
@@ -687,12 +838,37 @@ struct Lowerer {
 
         auto args = call.arguments();
         if (args.size() != sub->args.size()) unsupported("subroutine argument count");
+        if (isClassMethod(*sym)) {   // 8.6, 8.10, 8.20
+            bool isStatic = sym->flags.has(MethodFlags::Static);
+            E self;
+            if (!isStatic && call.thisClass()) self = exprH(*call.thisClass());
+            if (!isStatic && !call.thisClass() && !curClass) unsupported("method call without an object");
+            int vslot = -1;
+            if (!isStatic && sym->isVirtual() && !superCall(call)) {
+                auto vs = vslotMap().find(sym);
+                if (vs != vslotMap().end()) vslot = vs->second;
+                auto is = ifaceSlotMap().find(sym);
+                if (is != ifaceSlotMap().end()) vslot = -2 - is->second;
+            }
+            return emitAutoCall(*sub, args, wantValue, self, isStatic, vslot);
+        }
+        if (call.thisClass()) unsupported("method call on a non-class");
         if (sub->lay) return emitAutoCall(*sub, args, wantValue);
 
         for (size_t n = 0; n < args.size(); n++) {
             const auto& formal = sub->args[n];
-            if (formal.dir == ArgumentDirection::Ref) unsupported("ref argument");
             const Expression& a = *args[n];
+            if (formal.dir == ArgumentDirection::Ref) {
+                Instr i; i.k = IK::Assign; i.sig = formal.sig; i.e = addrOf(a);
+                prog.emit(i);
+                continue;
+            }
+            if (formal.arr) {   // 7.7: copy the whole array in
+                if (formal.dir == ArgumentDirection::Out) continue;
+                const Expression& src = formal.dir == ArgumentDirection::InOut ? a.as<AssignmentExpression>().left() : a;
+                copyArrayArg(*formal.arr, src);
+                continue;
+            }
             if (formal.dir == ArgumentDirection::In) {
                 if (a.kind == ExpressionKind::EmptyArgument) unsupported("empty argument");
                 Instr i;
@@ -726,6 +902,14 @@ struct Lowerer {
             if (a.kind == ExpressionKind::EmptyArgument) continue;
             if (a.kind != ExpressionKind::Assignment) unsupported("output argument");
             const auto& as = a.as<AssignmentExpression>();
+            if (formal.arr) {
+                int src = -1;
+                if (isDynType(formal.arr->getType())) src = dynFind(formal.arr);
+                else if (auto fs = arrFind(formal.arr)) src = fs->base;
+                if (src < 0) unsupported("array output argument");
+                copyArrayOut(*formal.arr, as.left(), src);
+                continue;
+            }
             Instr i;
             i.k = IK::Assign;
             lhs(as.left(), i);
@@ -751,16 +935,37 @@ struct Lowerer {
     // A call of an automatic subroutine (13.3.2): its arguments go straight
     // into the new frame; outputs and the result are copied out of the frame
     // it returned from (relative mode kRelRet) right after the call.
-    E emitAutoCall(const Subr& sub, std::span<const slang::ast::Expression* const> args, bool wantValue) {
+    E emitAutoCall(const Subr& sub, std::span<const slang::ast::Expression* const> args, bool wantValue,
+                   E self = nullptr, bool noSelf = false, int vslot = -1) {
         using namespace slang::ast;
         Instr c;
         c.k = IK::Call;
         c.callee = sub.prog;
         c.lay = sub.lay;
+        c.self = std::move(self);
+        c.noSelf = noSelf;
+        c.vslot = vslot;
         for (size_t n = 0; n < args.size(); n++) {
             const auto& formal = sub.args[n];
             const Expression& a = *args[n];
-            if (formal.dir == ArgumentDirection::Ref) unsupported("ref argument");
+            if (formal.dir == ArgumentDirection::Ref) { c.init.push_back({formal.sig, addrOf(a)}); continue; }
+            if (formal.arr) {   // 7.7: the whole array, copied into the new frame
+                if (formal.dir == ArgumentDirection::Out) continue;
+                const Expression& src = formal.dir == ArgumentDirection::InOut ? a.as<AssignmentExpression>().left() : a;
+                if (isDynType(formal.arr->getType())) {
+                    int d = dynSig(src);
+                    if (d < 0) {   // build it in a temporary first
+                        d = dynTemp(dynShapeOf(formal.arr->getType()));
+                        assignContainer(d, src);
+                    }
+                    c.dinit.push_back({formal.sig, d});
+                } else {
+                    std::vector<E> el;
+                    arrayElems(*src.type, src, el);
+                    for (size_t k = 0; k < el.size(); k++) c.init.push_back({formal.sig + (int)k, el[k]});
+                }
+                continue;
+            }
             if (formal.dir == ArgumentDirection::In) {
                 if (a.kind == ExpressionKind::EmptyArgument) unsupported("empty argument");
                 c.init.push_back({formal.sig, expr(a)});
@@ -778,6 +983,7 @@ struct Lowerer {
             const Expression& a = *args[n];
             if (a.kind == ExpressionKind::EmptyArgument) continue;
             const auto& as = a.as<AssignmentExpression>();
+            if (formal.arr) { copyArrayOut(*formal.arr, as.left(), relSig(kRelRet, formal.sig)); continue; }
             Instr i;
             i.k = IK::Assign;
             lhs(as.left(), i);
@@ -797,6 +1003,220 @@ struct Lowerer {
         i.e = ref(relSig(kRelRet, sub.retSig), sub.retSgn);
         prog.emit(i);
         return ref(tmp, sub.retSgn);
+    }
+
+    // ---------- class handles (8) ----------
+    // The value of a handle-typed expression: an object's first signal id, 0 for null.
+    static bool isThisSym(const slang::ast::Symbol& s) { return s.name == "this" && s.kind == slang::ast::SymbolKind::Variable; }
+    E exprH(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        if (E l = lazyExpr(e, ExprCtx{})) return l;
+        switch (e.kind) {
+            case ExpressionKind::NullLiteral: return konst(make(0, 0, 64));
+            case ExpressionKind::Conversion: {
+                const Expression& op = e.as<ConversionExpression>().operand();
+                if (isHandleType(*op.type)) return exprH(op);
+                if (op.type->isIntegral() && e.type->isCHandle()) return resize(expr(op), 64, false, false);
+                unsupported("conversion to a class handle");
+            }
+            case ExpressionKind::NamedValue: {
+                const Symbol& sym = e.as<NamedValueExpression>().symbol;
+                if (isThisSym(sym)) {
+                    if (!curClass) unsupported("`this` outside a method");
+                    return node(Op::This);
+                }
+                int sg = sigFind(&sym);
+                if (sg < 0) unsupported("class handle with no signal");
+                return ref(sg);
+            }
+            case ExpressionKind::NewClass: return newObject(e.as<NewClassExpression>());
+            case ExpressionKind::CopyClass: {   // new h (8.12): a shallow copy
+                int tmp = fresh(64);
+                Instr i; i.k = IK::New; i.sig = tmp; i.e = exprH(e.as<CopyClassExpression>().sourceExpr());
+                prog.emit(i);
+                return ref(tmp);
+            }
+            case ExpressionKind::ConditionalOp: {
+                const auto& c = e.as<ConditionalExpression>();
+                if (c.conditions.size() != 1) unsupported("pattern ?:");
+                return mux(un(Op::LogNot, un(Op::LogNot, expr(*c.conditions[0].expr))), exprH(c.left()), exprH(c.right()));
+            }
+            case ExpressionKind::Assignment: unsupported("assignment of a handle inside an expression");
+            default: break;
+        }
+        return expr2(e, ExprCtx{});
+    }
+    // The slot of property `member` in the object h names, as an indirect
+    // id (expr.hpp mode 10/11). `n` consecutive ids for n consecutive slots.
+    int indSlot(E h, int off, int n = 1) {
+        int first = -1;
+        for (int k = 0; k < n; k++) {
+            int tmp = fresh(64);
+            auto a = node(Op::Addr, {h});
+            a->sig = off + k;
+            Instr i; i.k = IK::Assign; i.sig = tmp; i.e = a;
+            prog.emit(i);
+            int id = indThrough(tmp);
+            if (!k) first = id;
+        }
+        return first;
+    }
+    // The signal id of a ref argument's actual (13.5.2): a variable, an
+    // array or container, or a property through a handle.
+    E addrOf(const slang::ast::Expression& a0) {
+        using namespace slang::ast;
+        const Expression& a = outArg(a0);
+        auto at = [](int sig) { auto n = node(Op::AddrOf); n->sig = sig; return n; };
+        if (classMember(a)) {
+            const auto& m = a.as<MemberAccessExpression>();
+            const PropSlot* ps = memberSlot(m);
+            if (!ps) {
+                if (int d = dynFind(&m.member); d >= 0) return at(d);
+                if (auto ar = arrFind(&m.member)) return at(ar->base);
+                return at(sigAt(&m.member));
+            }
+            auto n = node(Op::Addr, {exprH(m.value())});
+            n->sig = ps->kind == 1 ? ps->arr->base : ps->off;
+            return n;
+        }
+        if (a.kind == ExpressionKind::NamedValue || a.kind == ExpressionKind::HierarchicalValue) {
+            const Symbol* sym = &a.as<ValueExpressionBase>().symbol;
+            if (int d = dynFind(sym); d >= 0) return at(d);
+            if (auto ar = arrFind(sym)) return at(ar->base);
+            return at(sigAt(sym));
+        }
+        unsupported("ref argument that is not a whole variable or property");
+    }
+    // A ref formal's kind and shape, from its type.
+    static RefFormal refFormalOf(const slang::ast::Type& t0) {
+        const auto& t = t0.getCanonicalType();
+        RefFormal r;
+        if (isDynType(t)) { r.kind = 2; r.dyn = dynShapeOf(t); return r; }
+        if (t.isUnpackedArray()) {
+            FrameLayout tmp;
+            PropSlot ps = declSlot(t, &tmp);
+            r.kind = 1;
+            r.arr = ps.arr;
+            r.arr->base = 0;
+            return r;
+        }
+        if (t.isEvent()) unsupported("ref event argument");
+        return r;
+    }
+    // h.member where h is a class handle: the property's PropSlot, or null
+    // for a static property (an ordinary signal).
+    static const PropSlot* memberSlot(const slang::ast::MemberAccessExpression& m) {
+        auto it = propMap().find(&m.member);
+        if (it != propMap().end()) return &it->second;
+        if (m.member.kind == slang::ast::SymbolKind::ClassProperty) {
+            if (m.member.as<slang::ast::ClassPropertySymbol>().lifetime == slang::ast::VariableLifetime::Static) return nullptr;
+            unsupported("class property with no slot");
+        }
+        unsupported("class member access of this kind");
+    }
+    static bool classMember(const slang::ast::Expression& e) {
+        return e.kind == slang::ast::ExpressionKind::MemberAccess &&
+               isHandleType(*e.as<slang::ast::MemberAccessExpression>().value().type);
+    }
+    // new / new(args) (8.7): allocate, then run the constructor on it.
+    E newObject(const slang::ast::NewClassExpression& n) {
+        using namespace slang::ast;
+        if (n.isSuperClass) unsupported("super.new outside a constructor");
+        ClassInfo* ci = classInfo(*n.type);
+        if (ci->ty->isAbstract) unsupported("new of an abstract class");
+        int tmp = fresh(64);
+        Instr i; i.k = IK::New; i.sig = tmp; i.hi = ci->id;
+        prog.emit(i);
+        callCtor(*ci, n.constructorCall(), ref(tmp));
+        return ref(tmp);
+    }
+    // Run ci's constructor on object `self` (null: this object, from a
+    // derived constructor) with the arguments of call (none if null).
+    void callCtor(const ClassInfo& ci, const slang::ast::Expression* call, E self) {
+        using namespace slang::ast;
+        if (!ci.ctor) unsupported("class with no constructor");
+        std::vector<const Expression*> args;
+        if (call) {
+            if (call->kind != ExpressionKind::Call) unsupported("constructor call");
+            for (auto* a : call->as<CallExpression>().arguments()) args.push_back(a);
+        }
+        // An implied super.new() (8.17) passes no arguments: the base
+        // constructor's defaults apply.
+        if (ci.ctor->sym && args.size() < ci.ctor->args.size()) {
+            auto formals = ci.ctor->sym->getArguments();
+            for (size_t k = args.size(); k < formals.size(); k++) {
+                const Expression* d = formals[k]->getDefaultValue();
+                if (!d) break;
+                args.push_back(d);
+            }
+        }
+        if (args.size() != ci.ctor->args.size()) unsupported("constructor argument count");
+        emitAutoCall(*ci.ctor, args, false, std::move(self));
+    }
+    // The body of a method of a built-in class (8.30 weak_reference: new,
+    // get, clear, get_id).
+    void builtinMethod(const ClassInfo& ci, const Subr& sub) {
+        std::string_view n = sub.sym ? sub.sym->name : "new";
+        auto arg = [&](size_t k) { return ref(relSig(0, sub.args.at(k).sig)); };
+        Instr i; i.k = IK::Assign;
+        if (n == "new") { i.sig = thisRel(ci.bslot); i.e = arg(0); }
+        else if (n == "get") { i.sig = relSig(0, sub.retSig); i.e = ref(thisRel(ci.bslot)); }
+        else if (n == "clear") { i.sig = thisRel(ci.bslot); i.e = konst(make(0, 0, 64)); }
+        else if (n == "get_id") { i.sig = relSig(0, sub.retSig); i.e = arg(0); }   // the handle: stable, nonzero, 0 for null
+        else unsupported("built-in method");
+        prog.emit(i);
+    }
+    // A constructor (8.7, 8.17): the base class's constructor (super.new,
+    // written as the first statement or implied), then this class's property
+    // initializers, then the rest of the body.
+    const slang::ast::Expression* superNewDone = nullptr;
+    void ctorBody(ClassInfo& ci, const slang::ast::Statement* body) {
+        using namespace slang::ast;
+        const Expression* explicitSuper = nullptr;
+        if (body) {
+            const Statement* st = body;
+            while (true) {
+                if (st->kind == StatementKind::Block) { st = &st->as<BlockStatement>().body; continue; }
+                if (st->kind == StatementKind::List) {
+                    const Statement* first = nullptr;
+                    for (auto* x : st->as<StatementList>().list)
+                        if (x->kind != StatementKind::VariableDeclaration) { first = x; break; }
+                    if (!first) break;
+                    st = first;
+                    continue;
+                }
+                break;
+            }
+            if (st->kind == StatementKind::ExpressionStatement) {
+                const Expression& x = st->as<ExpressionStatement>().expr;
+                if (x.kind == ExpressionKind::NewClass && x.as<NewClassExpression>().isSuperClass) explicitSuper = &x;
+            }
+        }
+        if (ci.base) {
+            const Expression* call = nullptr;
+            if (explicitSuper) call = explicitSuper->as<NewClassExpression>().constructorCall();
+            else if (const Expression* bc = ci.ty->getBaseConstructorCall()) {
+                if (bc->kind == ExpressionKind::NewClass) call = bc->as<NewClassExpression>().constructorCall();
+                else if (bc->kind == ExpressionKind::Call) call = bc;
+            }
+            callCtor(*ci.base, call, nullptr);
+        }
+        for (const auto& m : ci.ty->members()) {
+            if (m.kind != SymbolKind::ClassProperty) continue;
+            const auto& p = m.as<ClassPropertySymbol>();
+            if (p.lifetime == VariableLifetime::Static) continue;
+            const Expression* init = p.getInitializer();
+            if (!init) continue;
+            const PropSlot& ps = propMap().at(&p);
+            if (ps.kind == 2) { assignContainer(thisRel(ps.off), *init); continue; }
+            if (ps.kind == 1) { assignWholeArray(p, p.getType(), *init, false); continue; }
+            Instr i; i.k = IK::Assign; i.sig = thisRel(ps.off);
+            i.e = isHandleType(p.getType()) ? exprH(*init) : expr(*init);
+            prog.emit(i);
+        }
+        superNewDone = explicitSuper;
+        if (body) stmt(*body);
+        superNewDone = nullptr;
     }
 
     // ---------- expressions ----------
@@ -875,9 +1295,13 @@ struct Lowerer {
             }
             case ExpressionKind::Call: {
                 const auto& call = e.as<CallExpression>();
-                if (!call.isSystemCall()) break;
+                if (!call.isSystemCall()) {
+                    if (E r = cgCall(call)) return r;   // get_coverage() is real (19.8)
+                    break;
+                }
                 std::string_view n = call.getSubroutineName();
                 auto args = call.arguments();
+                if (n == "$get_coverage") return sysFnNode(SF_CG, {}, CG_GLOBAL);   // 19.9
                 if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));   // s.atoreal()
                 if (n == "$realtime") { E t = node(Op::RealTime); t->k = mk(ticksPerUnit(), 64); return t; }
                 if (n == "$itor" && args.size() == 1) return un(Op::IToR, expr(*args[0]));
@@ -977,10 +1401,77 @@ struct Lowerer {
         return un(Op::AsStr, expr(e));
     }
 
+    // Does x call a user subroutine or make an object? Such an operand of
+    // ?:, && or || runs only when it is selected (11.4.7, 11.4.11), so it
+    // is lowered with jumps instead of as one expression.
+    static bool sideEffects(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        struct V : ASTVisitor<V, VisitFlags::Expressions> {
+            bool found = false;
+            void handle(const CallExpression& c) { if (!c.isSystemCall()) found = true; else visitDefault(c); }
+            void handle(const NewClassExpression&) { found = true; }
+            void handle(const CopyClassExpression&) { found = true; }
+        } v;
+        x.visit(v);
+        return v.found;
+    }
+    // The value of e as a new temporary, by its type.
+    E asType(const slang::ast::Type& t, int sig, bool sgn) {
+        if (t.isFloating()) return un(Op::AsReal, ref(sig));
+        if (t.isString()) return un(Op::AsStr, ref(sig));
+        return ref(sig, sgn);
+    }
+    E lowerAs(const slang::ast::Expression& x, const slang::ast::Type& t, ExprCtx ctx) {
+        if (isHandleType(t)) return exprH(x);
+        if (t.isFloating()) return realOf(x);
+        if (t.isString()) return exprStr(x);
+        return expr(x, ctx);
+    }
+    E lazyExpr(const slang::ast::Expression& e, ExprCtx ctx) {
+        using namespace slang::ast;
+        if (e.kind == ExpressionKind::ConditionalOp) {
+            const auto& c = e.as<ConditionalExpression>();
+            if (c.conditions.size() != 1 || (!sideEffects(c.left()) && !sideEffects(c.right()))) return nullptr;
+            int w = isHandleType(*e.type) || e.type->isFloating() || e.type->isString() ? 64
+                  : ctx.live ? ctx.w : (int)e.type->getBitWidth();
+            needWidth(w);
+            bool sg = ctx.live ? ctx.tag : e.type->isSigned();
+            int tmp = fresh(w);
+            Instr j; j.k = IK::JmpIfNot; j.e = expr(*c.conditions[0].expr);
+            size_t jf = prog.emit(j);
+            Instr a; a.k = IK::Assign; a.sig = tmp; a.e = lowerAs(c.left(), *e.type, ctx); prog.emit(a);
+            size_t je = emitJmp();
+            prog.code[jf].target = prog.here();
+            Instr b; b.k = IK::Assign; b.sig = tmp; b.e = lowerAs(c.right(), *e.type, ctx); prog.emit(b);
+            prog.code[je].target = prog.here();
+            return asType(*e.type, tmp, sg);
+        }
+        if (e.kind == ExpressionKind::BinaryOp) {
+            const auto& b = e.as<BinaryExpression>();
+            bool andOp = b.op == BinaryOperator::LogicalAnd, orOp = b.op == BinaryOperator::LogicalOr;
+            if ((!andOp && !orOp) || !sideEffects(b.right())) return nullptr;
+            auto truthE = [&](const Expression& x) {
+                E v = isHandleType(*x.type) ? exprH(x) : x.type->isFloating() ? realOf(x) : expr(x);
+                return un(Op::LogNot, un(Op::LogNot, v));
+            };
+            int tmp = fresh(1);
+            Instr l; l.k = IK::Assign; l.sig = tmp; l.e = truthE(b.left()); prog.emit(l);
+            Instr j; j.k = IK::JmpIfNot; j.e = andOp ? ref(tmp) : un(Op::LogNot, ref(tmp));
+            size_t jf = prog.emit(j);
+            Instr r; r.k = IK::Assign; r.sig = tmp; r.e = bin(andOp ? Op::LogAnd : Op::LogOr, ref(tmp), truthE(b.right()));
+            prog.emit(r);
+            prog.code[jf].target = prog.here();
+            return sized(ref(tmp), 1, false, ctx);
+        }
+        return nullptr;
+    }
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
+        if (!rawNext)
+            if (E l = lazyExpr(e, ctx)) return l;
         bool raw = rawNext;
         rawNext = false;
+        if (isHandleType(*e.type)) return exprH(e);
         if (!raw && e.type->isFloating()) return exprReal(e);
         if (!raw && e.type->isString()) return exprStr(e);
         switch (e.kind) {
@@ -1140,8 +1631,21 @@ struct Lowerer {
             cur = &cur->as<ElementSelectExpression>().value();
         }
         if (idx.empty()) return std::nullopt;
-        if (cur->kind != ExpressionKind::NamedValue) unsupported("array select on a non-variable");
-        auto shape = arrFind(&cur->as<NamedValueExpression>().symbol);
+        std::shared_ptr<const ArrShape> shape;
+        if (classMember(*cur)) {   // h.a[i] (8.4): the array's first slot through the handle
+            const auto& m = cur->as<MemberAccessExpression>();
+            const PropSlot* ps = memberSlot(m);
+            if (!ps) shape = arrFind(&m.member);
+            else {
+                if (ps->kind != 1) unsupported("array select on this property");
+                auto a = std::make_shared<ArrShape>(*ps->arr);
+                a->base = indSlot(exprH(m.value()), ps->arr->base);
+                shape = a;
+            }
+        } else {
+            if (cur->kind != ExpressionKind::NamedValue) unsupported("array select on a non-variable");
+            shape = arrFind(&cur->as<NamedValueExpression>().symbol);
+        }
         if (!shape) unsupported("array select");
         ArrSel s;
         s.a = shape;
@@ -1303,7 +1807,7 @@ struct Lowerer {
     E arrayRead(const ArrSel& s) {
         if (s.constant) {
             int64_t off = constOffset(s);
-            if (off >= 0) return ref(s.a->base + (int)off, s.a->sgn);
+            if (off >= 0 && !isInd(s.a->base)) return ref(s.a->base + (int)off, s.a->sgn);
         }
         auto n = node(Op::ArrRead);
         n->arr = s.a;
@@ -1315,9 +1819,22 @@ struct Lowerer {
     // A container is a hidden 64-bit handle signal whose value counts its
     // changes; the elements live in dynStore()[handle].
     int dollarQ = -1;   // the queue whose `$` (last index) the selector being lowered uses
-    int dynSig(const slang::ast::Expression& e0) const {
+    int dynSig(const slang::ast::Expression& e0) {
         using namespace slang::ast;
         const Expression& e = peel(e0);
+        if (classMember(e)) {   // h.q (8.4): the container slot through the handle
+            const auto& m = e.as<MemberAccessExpression>();
+            const PropSlot* ps = memberSlot(m);
+            if (!ps) return dynFind(&m.member);
+            if (ps->kind != 2) return -1;
+            const ClassInfo* ci = classInfo(*m.value().type);
+            const DynObj* shape = nullptr;
+            for (auto& [off, o] : ci->lay->dyn) if (off == ps->off) shape = &o;
+            if (!shape) unsupported("container property shape");
+            int d = indSlot(exprH(m.value()), ps->off);
+            indShape[d] = *shape;
+            return d;
+        }
         if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) return -1;
         return dynFind(&e.as<ValueExpressionBase>().symbol);
     }
@@ -1354,6 +1871,9 @@ struct Lowerer {
     int dynTemp(int d) {
         DynObj o = dynShape(d);
         o.vec.clear(); o.map.clear();
+        return dynTemp(std::move(o));
+    }
+    int dynTemp(DynObj o) {
         int t = fresh(64);
         if (isRel(t)) frames.back()->dyn.push_back({relOff(t), o});
         else dynStore()[t] = o;
@@ -1403,6 +1923,40 @@ struct Lowerer {
         }
         if (x.type->isUnpackedArray()) unsupported("container value");
         Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(x); prog.emit(i);
+    }
+    // An array argument (7.7): the formal gets a copy of the actual.
+    void copyArrayArg(const slang::ast::FormalArgumentSymbol& f, const slang::ast::Expression& a) {
+        if (isDynType(f.getType())) {
+            int d = dynFind(&f);
+            if (d < 0) unsupported("container argument");
+            assignContainer(d, a);
+            return;
+        }
+        if (!assignWholeArray(f, f.getType(), a, false)) unsupported("array argument");
+    }
+    // An output array argument (7.7): the actual gets a copy of the formal.
+    // src: the formal's container signal, or its first element.
+    void copyArrayOut(const slang::ast::FormalArgumentSymbol& f, const slang::ast::Expression& target0, int src) {
+        using namespace slang::ast;
+        const Expression& target = peel(target0);
+        if (isDynType(f.getType())) {
+            int t = dynSig(target);
+            if (t < 0) unsupported("container output argument into this target");
+            Instr i = dynCmd(t, D_COPY); i.dsrc = src; prog.emit(i);
+            return;
+        }
+        if (!target.type->isUnpackedArray() || isDynType(*target.type) || target.kind != ExpressionKind::NamedValue)
+            unsupported("array output argument into this target");
+        auto ts = arrFind(&target.as<ValueExpressionBase>().symbol);
+        std::vector<E> el;
+        arrayElems(*target.type, target, el);
+        if (!ts || (size_t)ts->count != el.size()) unsupported("array output argument of another shape");
+        bool sg = target.type->getArrayElementType()->isSigned();
+        for (int k = 0; k < ts->count; k++) {
+            Instr i; i.k = IK::Assign; i.sig = ts->base + k;
+            i.e = ref(src + k, sg);
+            prog.emit(i);
+        }
     }
     // dst = rhs for a whole container: new[n](src), '{...}, {a, q, b}, {},
     // another container, a fixed-size array, or a queue slice.
@@ -1971,9 +2525,12 @@ struct Lowerer {
                 if (!outSlot) unsupported("empty argument");
                 return sized(ref(outSlot->sig, outSlot->sgn), outSlot->w, outSlot->sgn, ctx);
             }
+            case ExpressionKind::NewCovergroup:   // new(...) of a covergroup (19.3)
+                return cgNew(e, e.as<NewCovergroupExpression>().arguments);
             case ExpressionKind::Call: {
                 const auto& call = e.as<CallExpression>();
                 if (!call.isSystemCall()) {
+                    if (E r = cgCall(call)) return r;   // c.sample(), c.get_coverage(), ... (19.8)
                     E v = emitUserCall(call, true);
                     int w = storeW(*e.type);
                     needWidth(w);
@@ -2024,6 +2581,8 @@ struct Lowerer {
                     b.sgn = true;
                     return sized(konst(b), 32, true, ctx);
                 }
+                if (n == "$cast" && call.arguments().size() == 2 && isHandleType(*outArg(*call.arguments()[0]).type))
+                    return sized(castClass(call, true), 1, false, ctx);
                 if (E r = sysFn(call, n)) return sized(r, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
                 // $signed / $unsigned keep the bits and change the tag.
                 if (n != "$signed" && n != "$unsigned") unsupported("system function");
@@ -2098,6 +2657,12 @@ struct Lowerer {
             }
             case ExpressionKind::BinaryOp: {
                 const auto& b = e.as<BinaryExpression>();
+                if (isHandleType(*b.left().type) || isHandleType(*b.right().type)) {   // handle ==, != (8.4)
+                    bool eq = b.op == BinaryOperator::Equality || b.op == BinaryOperator::CaseEquality;
+                    bool ne = b.op == BinaryOperator::Inequality || b.op == BinaryOperator::CaseInequality;
+                    if (!eq && !ne) unsupported("this operator on class handles");
+                    return sized(bin(eq ? Op::Eq : Op::Ne, exprH(b.left()), exprH(b.right())), 1, false, ctx);
+                }
                 if (b.left().type->isUnpackedArray() &&
                     (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
                      b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality)) {
@@ -2286,7 +2851,23 @@ struct Lowerer {
             }
             case ExpressionKind::MemberAccess: {    // s.f
                 const auto& m = e.as<MemberAccessExpression>();
-                return sized(readPSel(expr(m.value()), memberPSel(m)), storeW(*e.type), e.type->isSigned(), ctx);
+                if (isHandleType(*m.value().type)) {   // h.x (8.4): read through the handle when evaluated
+                    const PropSlot* ps = memberSlot(m);
+                    E r;
+                    if (!ps) {
+                        int sg = sigFind(&m.member);
+                        if (sg < 0) unsupported("static class property with no signal");
+                        r = ref(sg, e.type->isSigned());
+                    } else {
+                        if (ps->kind != 0) unsupported("whole array or container property as a value");
+                        r = ref(ps->off, e.type->isSigned());
+                        r->at = exprH(m.value());
+                    }
+                    if (isHandleType(*e.type)) return r;
+                    int src = storeW(*e.type);
+                    return sized(r, src, e.type->isSigned(), ctx);
+                }
+                                return sized(readPSel(expr(m.value()), memberPSel(m)), storeW(*e.type), e.type->isSigned(), ctx);
             }
             case ExpressionKind::SimpleAssignmentPattern:
             case ExpressionKind::StructuredAssignmentPattern:
@@ -2330,7 +2911,7 @@ struct Lowerer {
                 }
                 if (auto as = arraySel(e)) {   // mem[i] = ...
                     int64_t off = as->constant ? constOffset(*as) : -1;
-                    if (off >= 0) { i.sig = as->a->base + (int)off; return; }
+                    if (off >= 0 && !isInd(as->a->base)) { i.sig = as->a->base + (int)off; return; }
                     i.sig = as->a->base;
                     i.arr = as->a;
                     for (auto* x : as->idx) i.aidx.push_back(expr(*x));
@@ -2352,6 +2933,13 @@ struct Lowerer {
             }
             case ExpressionKind::MemberAccess: {   // s.f = ...
                 const auto& m = e.as<MemberAccessExpression>();
+                if (isHandleType(*m.value().type)) {   // h.x = ... (8.4)
+                    const PropSlot* ps = memberSlot(m);
+                    if (!ps) { i.sig = sigAt(&m.member); return; }
+                    if (ps->kind != 0) unsupported("assignment to a whole array or container property here");
+                    i.sig = indSlot(exprH(m.value()), ps->off);
+                    return;
+                }
                 lhs(m.value(), i);
                 if (i.dyn >= 0) unsupported("write to part of a container element");
                 writePSel(i, memberPSel(m));
@@ -2381,8 +2969,12 @@ struct Lowerer {
                 ev.push_back({clockings()[clockingIdx(*cb)].evSig, ANY});
                 return;
             }
-            if (!ValueExpressionBase::isKind(s.expr.kind)) unsupported("event on non-signal");
-            int sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
+            int sig;
+            if (classMember(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x)
+            else {
+                if (!ValueExpressionBase::isKind(s.expr.kind)) unsupported("event on non-signal");
+                sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
+            }
             Edge e = s.edge == EdgeKind::PosEdge ? POS : s.edge == EdgeKind::NegEdge ? NEG : ANY;
             ev.push_back({sig, e});
         } else if (t.kind == TimingControlKind::EventList) {
@@ -2781,6 +3373,7 @@ struct Lowerer {
         return resize(slice(ref(tmp), 31, 0), 32, false, true);
     }
     E sysFn(const slang::ast::CallExpression& call, std::string_view n) {
+        if (n == "$get_coverage") return sysFnNode(SF_CG, {}, CG_GLOBAL);   // 19.9
         if (E r = sampledFn(call, n)) return r;   // $past, $rose, ... (16.9.3)
         if (E r = enumMethod(call)) return r;
         auto args = call.arguments();
@@ -3069,9 +3662,40 @@ struct Lowerer {
     // $display / $strobe / $monitor use the kernel format (a string of %b / %d /
     // literal text, arguments evaluated when the line is printed). $finish and
     // $stop stop the sim. Anything else is still ignored.
+    // $cast(dst, src) of class handles (8.16): dst = src when src is null
+    // or an object of dst's class (or one derived from it). As a task, a
+    // failed cast is an error and dst is unchanged.
+    E castClass(const slang::ast::CallExpression& call, bool wantValue) {
+        using namespace slang::ast;
+        const Expression& dst = outArg(*call.arguments()[0]);
+        const Expression& src = *call.arguments()[1];
+        if (!dst.type->isClass()) unsupported("$cast to a non-class handle");
+        int h = fresh(64), ok = fresh(1);
+        Instr a; a.k = IK::Assign; a.sig = h; a.e = exprH(src); prog.emit(a);
+        auto t = node(Op::IsA, {ref(h)});
+        t->hi = classInfo(*dst.type)->id;
+        Instr b; b.k = IK::Assign; b.sig = ok; b.e = t; prog.emit(b);
+        Instr j; j.k = IK::JmpIfNot; j.e = ref(ok);
+        size_t jf = prog.emit(j);
+        Instr w; w.k = IK::Assign; lhs(dst, w); w.e = ref(h); prog.emit(w);
+        if (!wantValue) {
+            size_t js = emitJmp();
+            prog.code[jf].target = prog.here();
+            Instr d; d.k = IK::Display; d.fmt = "Error: $cast failed: the object is not a " + dst.type->toString();
+            prog.emit(d);
+            prog.code[js].target = prog.here();
+            return {};
+        }
+        prog.code[jf].target = prog.here();
+        return ref(ok);
+    }
     void sysCall(const slang::ast::CallExpression& call) {
         using namespace slang::ast;
         std::string_view n = call.getSubroutineName();
+        if (n == "$cast" && call.arguments().size() == 2 && isHandleType(*outArg(*call.arguments()[0]).type)) {
+            castClass(call, false);
+            return;
+        }
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
@@ -3206,7 +3830,7 @@ struct Lowerer {
             // answer if it were skipped, so it is an error.
             static const std::set<std::string_view> harmless = {
                 "$dumpfile", "$dumpvars", "$dumpon", "$dumpoff", "$dumpall", "$dumpflush", "$dumplimit",
-                "$dumpports", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
+                "$dumpports", "$set_coverage_db_name", "$load_coverage_db", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
                 "$vcdpluson", "$vcdplusoff", "$vcdplusfile", "$shm_open", "$shm_probe", "$recordvars"};
             if (!harmless.count(n)) unsupported(("system task " + std::string(n)).c_str());
             std::cerr << "lower: ignoring system call " << n << "\n";
@@ -3728,7 +4352,12 @@ struct Lowerer {
         } else if (ex.kind == ExpressionKind::Call) {
             const auto& call = ex.as<CallExpression>();
             if (call.isSystemCall()) sysCall(call);
-            else emitUserCall(call, false);
+            else if (E r = cgCall(call)) {   // c.sample(), c.start(), ... (19.8)
+                Instr i; i.k = IK::Assign; i.sig = fresh(64); i.e = std::move(r);
+                prog.emit(i);
+            } else emitUserCall(call, false);
+        } else if (ex.kind == ExpressionKind::NewClass && ex.as<NewClassExpression>().isSuperClass) {
+            if (&ex != superNewDone) unsupported("super.new that is not the first statement of a constructor");
         } else {
             unsupported("expression statement");
         }
@@ -4162,10 +4791,33 @@ struct Lowerer {
                 loops.pop_back();
                 break;
             }
-            case StatementKind::RepeatLoop: {   // constant count only: unrolled
+            case StatementKind::RepeatLoop: {   // a small constant count is unrolled
                 const auto& r = s.as<RepeatLoopStatement>();
+                const auto* cv = r.count.getConstant();
+                bool small = (r.count.kind == ExpressionKind::IntegerLiteral || (cv && cv->isInteger())) &&
+                             constInt(r.count) <= 1024;
+                if (!small) {   // a counter (12.7.2): x, z or a negative count runs the body zero times
+                    int c = fresh(64);
+                    Instr init; init.k = IK::Assign; init.sig = c;
+                    init.e = resize(expr(r.count), 64, r.count.type->isSigned(), true);
+                    prog.emit(init);
+                    size_t top = prog.here();
+                    Val zero = make(0, 0, 64); zero.sgn = true;
+                    Val one = make(1, 0, 64); one.sgn = true;
+                    Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(c, true), konst(zero));
+                    size_t jf = prog.emit(j);
+                    loops.push_back({});
+                    stmt(r.body);
+                    patch(loops.back().continues, prog.here());
+                    Instr dec; dec.k = IK::Assign; dec.sig = c; dec.e = bin(Op::Sub, ref(c, true), konst(one));
+                    prog.emit(dec);
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    prog.code[jf].target = prog.here();
+                    patch(loops.back().breaks, prog.here());
+                    loops.pop_back();
+                    break;
+                }
                 int64_t n = constInt(r.count);
-                if (n > 1024) unsupported("repeat count > 1024 (unrolled)");
                 loops.push_back({});
                 for (int64_t k = 0; k < n; k++) {
                     stmt(r.body);
@@ -4406,6 +5058,7 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
     const Type& e = et->getCanonicalType();
     if (e.isFloating()) o.dflt = mkreal(0);
     else if (e.isString()) o.dflt = mkstr("");
+    else if (isHandleType(e)) o.dflt = make(0, 0, 64);   // a class handle starts null
     else if (e.isIntegral()) {
         int w = (int)e.getBitWidth();
         if (w > 64) unsupported("container element wider than 64 bits");
@@ -4480,7 +5133,6 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     // (its name has '$') and its store entry.
     template <typename T> void regDyn(const T& s) {
         using namespace slang::ast;
-        if (s.kind == SymbolKind::FormalArgument) Lowerer::unsupported("container as a task or function argument");
         DynObj o = Lowerer::dynShapeOf(s.getType());
         int id = mkSig(prefix + std::string(s.name) + "$", 64, false);
         dynStore()[id] = o;
@@ -4530,10 +5182,35 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     static void unsupported_width(std::string_view n) {
         throw std::runtime_error("lower: signal has a non-positive width: " + std::string(n));
     }
-    void handle(const slang::ast::VariableSymbol& v) { reg(v, false); }
-    void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v, false); }
+    // Inside a class method, automatic variables live in frames: only a
+    // static local gets a signal. A class's static properties are signals
+    // named "C::x"; the others are object slots (ClassInfo).
+    int inMethod = 0;
+    void handle(const slang::ast::VariableSymbol& v) {
+        if (inMethod && v.lifetime == slang::ast::VariableLifetime::Automatic) return;
+        reg(v, false);
+    }
+    void handle(const slang::ast::FormalArgumentSymbol& v) {
+        if (!inMethod && v.direction != slang::ast::ArgumentDirection::Ref) reg(v, false);   // a ref formal gets an address slot later
+    }
+    void handle(const slang::ast::ClassPropertySymbol& p) {
+        if (p.lifetime == slang::ast::VariableLifetime::Static) reg(p, false);
+    }
+    void handle(const slang::ast::SubroutineSymbol& sub) {
+        bool m = isClassMethod(sub);
+        inMethod += m;
+        visitDefault(sub);
+        inMethod -= m;
+    }
+    void handle(const slang::ast::ClassType& c) {
+        std::string saved = prefix;
+        prefix += std::string(c.name) + "::";
+        visitDefault(c);
+        prefix = std::move(saved);
+    }
     // A clocking block (14): its event is a pair of signals like a named
     // event's, and its clockvars are named cb.x.
+    void handle(const slang::ast::CovergroupType&) {}   // built when used (lower_cover.inc)
     void handle(const slang::ast::ClockingBlockSymbol& cb) {
         std::string name = prefix + std::string(cb.name.empty() ? "$cb" : cb.name);
         int id = mkSig(name, 32, false);
@@ -4664,6 +5341,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::VariableSymbol& v) {
         const slang::ast::Expression* e = v.getInitializer();
         if (v.getType().isEvent()) {   // both counters start at 0: not triggered
+            if (!sigmap.count(&v)) return;   // an automatic one lives in a frame
             if (e) Lowerer::unsupported("event initializer (event aliasing)");
             if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
             for (int k = 0; k < 2; k++) {
@@ -4677,7 +5355,15 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (!sc) return;
         auto pk = sc->asSymbol().kind;
         if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock &&
-            pk != slang::ast::SymbolKind::Package) return;   // package variables too (26.2)
+            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit) return;   // package variables too (26.2)
+        initStatic(v);
+    }
+    // A class's static property (8.9) starts like a module variable.
+    void handle(const slang::ast::ClassPropertySymbol& p) {
+        if (p.lifetime == slang::ast::VariableLifetime::Static) initStatic(p);
+    }
+    void initStatic(const slang::ast::VariableSymbol& v) {
+        const slang::ast::Expression* e = v.getInitializer();
         if (auto it = dynMap().find(&v); it != dynMap().end()) {   // int q[$] = '{1, 2};
             if (!e) return;
             if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
@@ -4698,11 +5384,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             return;
         }
         // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
-        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString());
+        // A class handle starts as null (8.4).
+        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || isHandleType(t));
         if (!e && !zero) return;
         if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
-        i.e = e ? init->expr(*e) : konst(mk(0, (int)t.getBitWidth()));
+        i.e = e ? init->expr(*e) : konst(mk(0, storeW(t)));
         init->prog.emit(i);
     }
     // Module path delays (30.4): (a => b) = d delays every change of output
@@ -5085,6 +5772,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
     }
+    void handle(const slang::ast::CovergroupType&) {}   // built when used (lower_cover.inc)
     void handle(const slang::ast::ClockingBlockSymbol& cb) {   // 14: runs on its clocking event
         Lowerer lw(sigmap);
         prep(lw);
@@ -5182,15 +5870,6 @@ inline void patchImplicit(Prog& prog) {
     for (size_t pc : slots) prog.code[pc] = waitInstr(rs);
 }
 
-// Class methods are always automatic (8.6); other subroutines when declared
-// so or inside an automatic module, program or interface (13.3.2).
-inline bool isClassMethod(const slang::ast::SubroutineSymbol& s) {
-    const slang::ast::Scope* p = s.getParentScope();
-    return p && p->asSymbol().kind == slang::ast::SymbolKind::ClassType;
-}
-inline bool isAutomatic(const slang::ast::SubroutineSymbol& s) {
-    return s.defaultLifetime == slang::ast::VariableLifetime::Automatic || isClassMethod(s);
-}
 // The automatic subroutines that need a frame per call: tasks (they can
 // wait, so two calls can be live at once), class methods, and functions
 // that recurse or fork. Any other automatic function runs one call at a
@@ -5254,6 +5933,136 @@ inline void rejectRecursive(const std::vector<Subr*>& subs) {
         if (color[s] == Color::White) dfs(dfs, s);
 }
 
+// Object shape, constructor and virtual method table of every class,
+// base classes first (8.13). Called after every subroutine has its Subr.
+inline ClassInfo* buildClass(const slang::ast::ClassType& ct,
+                             std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>& subMap,
+                             LowerResult& out, std::vector<std::unique_ptr<Subr>>& owned, std::vector<Subr*>& order) {
+    using namespace slang::ast;
+    if (auto it = classMap().find(&ct); it != classMap().end()) return it->second;
+    auto method = [&](const Symbol& m) -> const SubroutineSymbol* {
+        if (m.kind == SymbolKind::Subroutine) return &m.as<SubroutineSymbol>();
+        if (m.kind == SymbolKind::MethodPrototype) return m.as<MethodPrototypeSymbol>().getSubroutine();
+        return nullptr;
+    };
+    if (ct.isInterface) {   // 8.26: a type to cast to and call through; no objects of its own
+        classStore().push_back(std::make_unique<ClassInfo>());
+        ClassInfo* ii = classStore().back().get();
+        classMap()[&ct] = ii;
+        ii->ty = &ct;
+        ii->id = (int)classRt().size();
+        classRt().push_back({});
+        classRt().back().name = std::string(ct.name);
+        for (const Type* t : ct.getImplementedInterfaces())
+            classRt()[(size_t)ii->id].ifs.push_back(buildClass(t->getCanonicalType().as<ClassType>(), subMap, out, owned, order)->id);
+        for (const auto& m : ct.members())
+            if (const SubroutineSymbol* sub = method(m); sub && !ifaceSlotMap().count(sub))
+                ifaceSlotMap().emplace(sub, (int)ifaceSlotMap().size());
+        return ii;
+    }
+    ClassInfo* base = nullptr;
+    if (const Type* bt = ct.getBaseClass()) {
+        if (!bt->getCanonicalType().isClass()) Lowerer::unsupported("base class of this kind");
+        base = buildClass(bt->getCanonicalType().as<ClassType>(), subMap, out, owned, order);
+    }
+    std::vector<ClassInfo*> ifaces;
+    for (const Type* t : ct.getImplementedInterfaces())
+        ifaces.push_back(buildClass(t->getCanonicalType().as<ClassType>(), subMap, out, owned, order));
+    classStore().push_back(std::make_unique<ClassInfo>());
+    ClassInfo* ci = classStore().back().get();
+    classMap()[&ct] = ci;
+    ci->ty = &ct;
+    ci->base = base;
+    ci->id = (int)classRt().size();
+    classRt().push_back({});
+    classRt().back().name = std::string(ct.name);
+    classRt().back().base = base ? base->id : -1;
+    ci->lay = newLayout("class " + std::string(ct.name));
+    if (base) {
+        *ci->lay = *base->lay;
+        ci->lay->pool.clear();
+        ci->lay->name = "class " + std::string(ct.name);
+        ci->lay->init[0] = make((uint64_t)ci->id, 0, 32);
+        classRt().back().vt = classRt()[(size_t)base->id].vt;
+        classRt().back().imap = classRt()[(size_t)base->id].imap;
+    } else {
+        ci->lay->add(32, make((uint64_t)ci->id, 0, 32));
+    }
+    classRt().back().lay = ci->lay;
+    if ((ci->builtin = builtinClassKind(ct)) == 1) ci->bslot = ci->lay->add(64, make(0, 0, 64));
+    for (const auto& m : ct.members()) {
+        if (m.kind == SymbolKind::ClassProperty) {
+            const auto& p = m.as<ClassPropertySymbol>();
+            if (p.lifetime == VariableLifetime::Static) continue;
+            propMap()[&p] = Lowerer::declSlot(p.getType(), ci->lay);
+            continue;
+        }
+        const SubroutineSymbol* sub = method(m);
+        if (!sub) continue;
+        if (sub->flags.has(MethodFlags::Constructor)) {
+            auto it = subMap.find(sub);
+            if (it == subMap.end()) Lowerer::unsupported("constructor");
+            ci->ctor = it->second;
+            ci->ctor->cls = ci;
+            continue;
+        }
+        if (!sub->isVirtual() || sub->flags.has(MethodFlags::Static)) continue;
+        int slot = -1;
+        if (const SubroutineSymbol* ov = sub->getOverride()) {
+            auto vs = vslotMap().find(ov);
+            if (vs != vslotMap().end()) slot = vs->second;
+        }
+        auto& vt = classRt()[(size_t)ci->id].vt;
+        if (slot < 0) { slot = (int)vt.size(); vt.push_back({nullptr, nullptr}); }
+        vslotMap()[sub] = slot;
+        if (!sub->flags.has(MethodFlags::Pure)) {
+            auto it = subMap.find(sub);
+            if (it == subMap.end()) Lowerer::unsupported("virtual method");
+            vt[(size_t)slot] = {it->second->prog, it->second->lay};
+        }
+    }
+    // Interface methods (8.26): each maps to the vt slot of the method of
+    // the same name in this class or a base class.
+    for (ClassInfo* ii : ifaces) {
+        auto& cr = classRt()[(size_t)ci->id];
+        cr.ifs.push_back(ii->id);
+        for (const auto& m : ii->ty->members()) {
+            const SubroutineSymbol* isub = method(m);
+            if (!isub) continue;
+            int k = ifaceSlotMap().at(isub);
+            const SubroutineSymbol* impl = nullptr;
+            for (const ClassInfo* c = ci; c && !impl; c = c->base)
+                if (const Symbol* f = c->ty->find(isub->name)) impl = method(*f);
+            if (!impl) continue;   // a virtual class may leave it to a subclass
+            int slot = -1;
+            if (auto vs = vslotMap().find(impl); vs != vslotMap().end()) slot = vs->second;
+            else {
+                auto it = subMap.find(impl);
+                if (it == subMap.end() || impl->flags.has(MethodFlags::Pure)) continue;
+                slot = (int)cr.vt.size();
+                cr.vt.push_back({it->second->prog, it->second->lay});
+            }
+            if (cr.imap.size() <= (size_t)k) cr.imap.resize((size_t)k + 1, -1);
+            cr.imap[(size_t)k] = slot;
+        }
+    }
+    if (!ci->ctor) {   // no `new`: an implicit constructor with no arguments (8.7)
+        auto sub = std::make_unique<Subr>();
+        out.subs.push_back(std::make_unique<Prog>());
+        sub->prog = out.subs.back().get();
+        sub->lay = newLayout("new of " + std::string(ct.name));
+        sub->cls = ci;
+        ci->ctor = sub.get();
+        order.push_back(sub.get());
+        owned.push_back(std::move(sub));
+    }
+    return ci;
+}
+inline void buildClasses(const std::vector<const slang::ast::ClassType*>& cs,
+                         std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>& subMap,
+                         LowerResult& out, std::vector<std::unique_ptr<Subr>>& owned, std::vector<Subr*>& order) {
+    for (const auto* c : cs) buildClass(*c, subMap, out, owned, order);
+}
 // Default sampled values (16.5.1): at time 0, right after the declaration
 // initializers ran, every shadow takes its signal's value and every $past
 // stage the sampled value of its expression.
@@ -5287,6 +6096,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     sampleClocks().clear();
     clockings().clear();
     Lowerer::clockingIdxMap().clear();
+    cgDefs().clear();
+    cgInsts().clear();
+    Lowerer::cgIdxMap().clear();
     sigInfo().clear();
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
@@ -5304,6 +6116,13 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     localMap().clear();
     localArr().clear();
     localDyn().clear();
+    refFormals().clear();
+    classMap().clear();
+    classStore().clear();
+    propMap().clear();
+    vslotMap().clear();
+    ifaceSlotMap().clear();
+    classRt().clear();
     layoutStore() = &out.layouts;
     netKinds().clear();
     usesForce() = false;
@@ -5374,12 +6193,20 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             visitDefault(inst);
         }
         void handle(const slang::ast::SubroutineSymbol& s) { found.push_back(&s); }
+        std::vector<const slang::ast::ClassType*> classes;
+        void handle(const slang::ast::ClassType& c) { classes.push_back(&c); visitDefault(c); }
+        void handle(const slang::ast::CovergroupType&) {}   // its methods are built in (19.8)
         void handle(const slang::ast::GenerateBlockSymbol& g) {
             if (!g.isUninstantiated) visitDefault(g);
         }
     };
     Finder finder;
     comp.getRoot().visit(finder);
+    // Built-in classes of the std package that are used (8.30).
+    for (const auto& m : comp.getStdPackage().members())
+        if (m.kind == slang::ast::SymbolKind::GenericClassDef && m.name == "weak_reference")
+            for (const auto& spec : m.as<slang::ast::GenericClassDefSymbol>().specializations())
+                spec.visit(finder);
     // The simulation precision is the finest precision of any module (3.14.3).
     simPrecExp() = finder.prec == 1000 ? -9 : finder.prec;
     out.precExp = simPrecExp();
@@ -5408,16 +6235,34 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             // run in several processes at once.
             using namespace slang::ast;
             sub->lay = newLayout(std::string(sym->name));
-            if (sym->returnValVar) {
-                setup.declLocal(*sym->returnValVar, sub->lay);
-                sub->retSig = localMap().at(sym->returnValVar).off;
+            if (sym->returnValVar || !sym->getReturnType().isVoid()) {   // (pure and built-in methods have no returnValVar)
+                // The result is slot 0 and the arguments follow, so every
+                // override of a virtual method has them at the same slots.
+                if (sym->returnValVar) setup.declLocal(*sym->returnValVar, sub->lay);
+                else sub->lay->add(storeW(sym->getReturnType()), Lowerer::initOf(sym->getReturnType()));
+                sub->retSig = sym->returnValVar ? localMap().at(sym->returnValVar).off : 0;
                 sub->retW = storeW(sym->getReturnType());
                 if (sub->retW <= 0) Lowerer::unsupported("function return width");
                 sub->retSgn = sym->getReturnType().isSigned();
             }
             for (const FormalArgumentSymbol* formal : sym->getArguments()) {
-                if (Lowerer::isDynType(formal->getType()) || formal->getType().isUnpackedArray())
-                    Lowerer::unsupported("array or container as an argument of an automatic subroutine");
+                if (formal->direction == ArgumentDirection::Ref) {   // a slot for the actual's signal id
+                    refFormals()[formal] = Lowerer::refFormalOf(formal->getType());
+                    int off = sub->lay->add(64, make(0, 0, 64));
+                    localMap()[formal] = {sub->lay, off};
+                    sub->args.push_back({off, formal->direction, 64, false});
+                    continue;
+                }
+                if (Lowerer::isDynType(formal->getType()) || formal->getType().isUnpackedArray()) {
+                    // 7.7: a frame array or container, copied in at the call
+                    setup.declLocal(*formal, sub->lay);
+                    Subr::Arg ar{-1, formal->direction, 0, false};
+                    if (auto la = localArr().find(formal); la != localArr().end()) ar.sig = la->second.second->base;
+                    else ar.sig = localDyn().at(formal).off;
+                    ar.arr = formal;
+                    sub->args.push_back(ar);
+                    continue;
+                }
                 setup.declLocal(*formal, sub->lay);
                 int w = storeW(formal->getType());
                 if (w <= 0) Lowerer::unsupported("subroutine argument width");
@@ -5438,6 +6283,19 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             sub->retSgn = sym->getReturnType().isSigned();
         }
         for (const slang::ast::FormalArgumentSymbol* formal : sym->getArguments()) {
+            if (formal->direction == slang::ast::ArgumentDirection::Ref) {   // its signal holds the actual's id
+                refFormals()[formal] = Lowerer::refFormalOf(formal->getType());
+                int sg = mkSig(std::string(sym->name) + "." + std::string(formal->name) + "$ref", 64, false);
+                sigmap[formal] = sg;
+                sub->args.push_back({sg, formal->direction, 64, false});
+                continue;
+            }
+            if (Lowerer::isDynType(formal->getType()) || formal->getType().isUnpackedArray()) {
+                Subr::Arg ar{-1, formal->direction, 0, false};
+                ar.arr = formal;
+                sub->args.push_back(ar);
+                continue;
+            }
             auto it = sigmap.find(formal);
             if (it == sigmap.end()) Lowerer::unsupported("subroutine argument");
             int w = storeW(formal->getType());
@@ -5449,16 +6307,37 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         owned.push_back(std::move(sub));
     }
 
+    // Classes (8): object shapes, constructors, virtual method tables.
+    buildClasses(finder.classes, subMap, out, owned, order);
+    if (!classStore().empty()) {
+        g_nullSig = mkSig("$null", 64, false);
+    }
+
     int tempSeq = 0;
     for (Subr* sub : order) {
-        if (sub->sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
+        if (sub->sym && sub->sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
+        if (sub->sym && sub->sym->flags.has(slang::ast::MethodFlags::Pure)) continue;
+        if (sub->cls) {   // a constructor, written or implicit
+            Lowerer lw(sigmap);
+            lw.bind(&subMap, mkSig, &tempSeq, &out.subs);
+            if (sub->sym) lw.setScope(sub->sym);
+            lw.frames = {sub->lay};
+            lw.curClass = sub->cls;
+            lw.current = sub;
+            if (sub->cls->builtin) lw.builtinMethod(*sub->cls, *sub);
+            else lw.ctorBody(*sub->cls, sub->sym ? &sub->sym->getBody() : nullptr);
+            *sub->prog = std::move(lw.prog);
+            continue;
+        }
         Lowerer lw(sigmap);
         lw.bind(&subMap, mkSig, &tempSeq, &out.subs);
         lw.setScope(sub->sym);
         lw.retSig = sub->retSig;
         if (sub->lay) { lw.frames = {sub->lay}; lw.retSig = sub->retSig >= 0 ? relSig(0, sub->retSig) : -1; }
+        if (isClassMethod(*sub->sym)) lw.curClass = classInfo(sub->sym->getParentScope()->asSymbol().as<slang::ast::ClassType>());
         lw.current = sub;
-        lw.stmt(sub->sym->getBody());
+        if (lw.curClass && lw.curClass->builtin) lw.builtinMethod(*lw.curClass, *sub);
+        else lw.stmt(sub->sym->getBody());
         *sub->prog = std::move(lw.prog);
     }
     for (Subr* sub : order) patchImplicit(*sub->prog);
