@@ -257,7 +257,7 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
 inline bool hasRel(const E& e) {
     if (!e) return false;
     if (isRel(e->sig) && e->op != Op::Const) return true;
-    if (e->at || e->op == Op::This || e->op == Op::Addr || e->op == Op::AddrOf) return true;   // objects (8), ref (13.5.2)
+    if (e->at || e->op == Op::This || e->op == Op::Addr || e->op == Op::AddrOf || e->op == Op::VifSig) return true;   // objects (8), ref (13.5.2), virtual interfaces (25.9)
     if (e->op == Op::ArrRead && isRel(e->arr->base)) return true;
     for (auto& k : e->kids) if (hasRel(k)) return true;
     return false;
