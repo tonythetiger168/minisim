@@ -223,17 +223,18 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             return -1;
         }
         std::string ccC = std::getenv("CC") ? std::getenv("CC") : "cc";
-        std::string od = dir + "/fst", objs;
+        std::string od = dir + "/fst-par", objs;   // built with the background writer thread
         if (std::system(("mkdir -p " + shq(od)).c_str()) != 0) return 1;
         for (const char* f : {"fstapi", "fastlz", "lz4"}) {
             std::string o = od + "/" + f + ".o";
             objs += " " + shq(o);
             if (std::filesystem::exists(o)) continue;
-            std::string c = shq(ccC) + " -O2 -c -D_GNU_SOURCE -DHAVE_FSEEKO -DHAVE_REALPATH " +
+            std::string c = shq(ccC) + " -O2 -c -D_GNU_SOURCE -DHAVE_FSEEKO -DHAVE_REALPATH"
+                            " -DHAVE_LIBPTHREAD -DFST_WRITER_PARALLEL " +
                             shq(fd + "/" + f + ".c") + " -o " + shq(o);
             if (std::system(c.c_str()) != 0) { std::cerr << "msim: -compile: libfst build failed: " << c << "\n"; return 1; }
         }
-        build += " -DMINISIM_FST -I" + shq(fd) + objs + " -lz";
+        build += " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fd) + objs + " -lz -pthread";
     }
     if (std::system(build.c_str()) != 0) {
         std::cerr << "msim: -compile: C++ build failed: " << build << "\n";

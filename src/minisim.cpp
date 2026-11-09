@@ -21,6 +21,9 @@
 #include <fstream>
 #include <iostream>
 #include <atomic>
+#include <array>
+#include <bit>
+#include <charconv>
 #include <functional>
 #include <map>
 #include <queue>
@@ -244,8 +247,18 @@ struct Sim {
     string vcdTop = "top";   // name of the root VCD scope (the top module)
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
+    // VCD text is built here and written in large blocks (an ostream insert
+    // per character was most of the cost of dumping), with each signal's
+    // identifier made once in header().
+    string vbuf;
+    vector<string> vcdIds;
+    void flushVcd() {
+        if (!vbuf.empty() && vcd.is_open()) vcd.write(vbuf.data(), (streamsize)vbuf.size());
+        vbuf.clear();
+    }
     // FST output instead of VCD when vcdPath ends in ".fst" (built with libfst).
     void* fst = nullptr;
+    bool fstParallel = true;                         // msim -fst-serial turns the writer thread off
     vector<uint32_t> fstH;                           // FST handle per signal (0: not dumped)
     string fstBuf;
     bool waving() const { return vcd.is_open() || fst != nullptr; }
@@ -545,7 +558,7 @@ struct Sim {
     // The common case inline: a narrow signal nobody else watches is a store.
     __attribute__((always_inline)) void fw(int s, const Val& nv) {
         Sig& g = sigs[s];
-        if (__builtin_expect(quiet[s] && !observed && waiters[s].empty(), 1)) {
+        if (__builtin_expect(quiet[s] && !observed && !g_cov && waiters[s].empty(), 1)) {
             uint64_t m = mask(g.w);
             g.val.v = nv.v & m;
             g.val.x = nv.x & m;
@@ -559,7 +572,7 @@ struct Sim {
     // The same for a known (2-state) value, without building a Val.
     __attribute__((always_inline)) void fwv(int s, uint64_t v) {
         Sig& g = sigs[s];
-        if (__builtin_expect(quiet[s] && !observed && waiters[s].empty(), 1)) {
+        if (__builtin_expect(quiet[s] && !observed && !g_cov && waiters[s].empty(), 1)) {
             g.val.v = v & mask(g.w);
             g.val.x = 0;
             g.val.z = 0;
@@ -583,12 +596,27 @@ struct Sim {
         }
         drive(s, d, make(v & mask(g.w), 0, g.w), s0, s1);
     }
-    __attribute__((noinline)) void fwSlow(int s, Val nv) {
+    __attribute__((noinline)) void fwSlow(int s, const Val& in) {
         Sig& g = sigs[s];
-        if (!quiet[s] || observed || !waiters[s].empty()) { set(s, std::move(nv)); return; }
-        nv = maskWidth(nv, g.w);   // a wide quiet signal
+        // Only a waveform (or coverage) watches a quiet signal: compare, store
+        // and record the change. A full set() would also queue the domain's
+        // comb pass and scan for waiters, which made -vcd runs 20x slower.
+        bool waveOnly = !mon.on && !g.fl;
+        if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) { set(s, in); return; }
+        if (g.w <= 64 && g.val.hi.empty()) {   // the common case, without copying a Val
+            uint64_t m = mask(g.w), v = in.v & m, x = in.x & m, z = in.z & m;
+            if (v == g.val.v && x == g.val.x && z == g.val.z) return;
+            if (g_cov) covToggle(s, g.val, Val{v, x, g.w, z});
+            g.val.v = v; g.val.x = x; g.val.z = z;
+            g.val.real = in.real; g.val.str = in.str; g.val.sgn = false;
+            if (observed) dump(s);
+            return;
+        }
+        Val nv = maskWidth(in, g.w);
         if (nv == g.val) return;
+        if (g_cov) covToggle(s, g.val, nv);
         g.val = std::move(nv);
+        if (observed) dump(s);
     }
     // A continuous assign: the net's only driver, strong 0 and 1, resolves to its value.
     __attribute__((always_inline)) void fwd(int s, int d, const Val& v, int s0, int s1) {
@@ -624,7 +652,7 @@ struct Sim {
 #ifdef MINISIM_FST
         if (fst) { fstWriterClose((fstWriterContext*)fst); fst = nullptr; }
 #endif
-        if (vcd.is_open()) vcd.close();
+        if (vcd.is_open()) { flushVcd(); vcd.close(); }
     }
 
     // A wire (`net`) starts as Z, including before the first drive().
@@ -1083,6 +1111,32 @@ struct Sim {
         }
     }
 
+    // A value's w bits as '0' / '1' / 'x' / 'z' characters, MSB first.
+    static void putBits(char* p, const Val& val, int w) {
+        if (w <= 64) {
+            uint64_t v = val.v, x = val.x, z = val.z;
+            if (!x && std::endian::native == std::endian::little) {
+                // Known bits: eight characters per table lookup.
+                int i = w;
+                for (int r = i % 8; r > 0; r--) *p++ = char('0' + (v >> --i & 1));
+                for (; i > 0; i -= 8, p += 8) memcpy(p, &kBitChars[(v >> (i - 8)) & 0xFF], 8);
+            } else
+                for (int i = w - 1; i >= 0; i--)
+                    *p++ = (x >> i & 1) ? ((z >> i & 1) ? 'z' : 'x') : char('0' + (v >> i & 1));
+            return;
+        }
+        for (int i = w - 1; i >= 0; i--) {
+            int t = bitAt(val, i);
+            *p++ = t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t);
+        }
+    }
+    // Byte b as eight ASCII digits, MSB first, in memory order.
+    static constexpr std::array<uint64_t, 256> kBitChars = [] {
+        std::array<uint64_t, 256> t{};
+        for (int b = 0; b < 256; b++)
+            for (int k = 0; k < 8; k++) t[b] |= uint64_t('0' + (b >> (7 - k) & 1)) << (8 * k);
+        return t;
+    }();
     // One value line, no timestamp. Shared so $dumpvars and later changes match.
     void writeVal(int s) {
         const Sig& g = sigs[s];
@@ -1090,30 +1144,31 @@ struct Sim {
         if (fst) {
             // FST takes one '0' / '1' / 'x' / 'z' character per bit, MSB first.
             fstBuf.resize((size_t)g.w);
-            for (int i = g.w - 1, k = 0; i >= 0; i--, k++) {
-                if (g.w <= 64)
-                    fstBuf[k] = (g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1));
-                else {
-                    int t = bitAt(g.val, i);
-                    fstBuf[k] = t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t);
-                }
-            }
+            putBits(fstBuf.data(), g.val, g.w);
             fstWriterEmitValueChange((fstWriterContext*)fst, fstH[s], fstBuf.data());
             return;
         }
 #endif
-        string id = vcdId((size_t)s);
-        if (g.w == 1) { vcd << ((g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1))) << id << "\n"; return; }
-        vcd << "b";
-        for (int i = g.w - 1; i >= 0; i--) {
-            if (g.w <= 64)
-                vcd << ((g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1)));
-            else {
-                int t = bitAt(g.val, i);
-                vcd << (t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t));
-            }
+        // Signals made after header() (frames, objects) get their id here.
+        if ((size_t)s >= vcdIds.size()) {
+            size_t from = vcdIds.size();
+            vcdIds.resize(sigs.size());
+            for (size_t i = from; i < vcdIds.size(); i++) vcdIds[i] = vcdId(i);
         }
-        vcd << " " << id << "\n";
+        const string& id = vcdIds[s];
+        if (g.w == 1) {
+            vbuf += (g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1));
+        } else {
+            size_t at = vbuf.size();
+            vbuf.resize(at + 1 + (size_t)g.w);
+            char* p = vbuf.data() + at;
+            *p++ = 'b';
+            putBits(p, g.val, g.w);
+            vbuf += ' ';
+        }
+        vbuf += id;
+        vbuf += '\n';
+        if (vbuf.size() >= (1u << 16)) flushVcd();
     }
     // VCD identifier: base-94 over the printable characters '!'..'~'.
     static string vcdId(size_t i) {
@@ -1130,8 +1185,15 @@ struct Sim {
             return;
         }
 #endif
-        if (!vcd.is_open() || !vcd) return;
-        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
+        if (!vcd.is_open()) return;
+        if (lastDump != now) {
+            char t[24];
+            auto r = std::to_chars(t, t + sizeof t, now);
+            vbuf += '#';
+            vbuf.append(t, r.ptr);
+            vbuf += '\n';
+            lastDump = now;
+        }
         writeVal(s);
     }
     // set() only writes a line when a value changes, so a signal still holding
@@ -1148,10 +1210,10 @@ struct Sim {
             return;
         }
 #endif
-        if (!vcd.is_open() || !vcd) return;
-        vcd << "$dumpvars\n";
+        if (!vcd.is_open()) return;
+        vbuf += "$dumpvars\n";
         for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
-        vcd << "$end\n";
+        vbuf += "$end\n";
     }
 
     // force / assign (10.6). A held signal ignores every other write; its
@@ -1285,6 +1347,12 @@ struct Sim {
             if (!f) { cerr << "cannot write " << vcdPath << "\n"; return; }
             fst = f;
             fstWriterSetPackType(f, FST_WR_PT_LZ4);
+#ifdef MINISIM_FST_PARALLEL
+            // Compress and write finished blocks on libfst's own thread. Only
+            // with a libfst built with FST_WRITER_PARALLEL, which the build
+            // says with MINISIM_FST_PARALLEL (libfst exits otherwise).
+            if (fstParallel) fstWriterSetParallelMode(f, 1);
+#endif
             fstWriterSetTimescaleFromString(f, timescale.c_str());
             fstH.assign(sigs.size(), 0);
         }
@@ -1343,7 +1411,11 @@ struct Sim {
             vcd << "$upscope $end\n";
         };
         emit(root);
-        if (!fst) vcd << "$enddefinitions $end\n";
+        if (!fst) {
+            vcd << "$enddefinitions $end\n";
+            vcdIds.resize(sigs.size());
+            for (size_t i = 0; i < sigs.size(); i++) vcdIds[i] = vcdId(i);
+        }
     }
 
     // After the last slot ($finish, no more events, or the time limit):

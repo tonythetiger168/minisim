@@ -821,7 +821,7 @@ private:
         // Only when something watches every change (a VCD opened at run time).
         o << "static void syncP() {\n";
         for (int s : privs)
-            o << "    S.set(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
+            o << "    S.fw(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
         o << "}\n";
         // Comb statements first: their reads are part of `ext`, which twoNow checks.
         std::vector<std::string> combStmts, combStmts2, commitStmts;
