@@ -44,6 +44,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -55,6 +56,59 @@ struct Limb {
     bool operator==(const Limb& o) const { return v == o.v && x == o.x && z == o.z; }
 };
 
+// The high limbs of a Val. Most values are 64 bits or less, so this is
+// almost always empty, and copying an empty one must cost no more than two
+// stores: a std::vector here made Val's copy constructor and assignment
+// about a fifth of a -compile run. Only the operations Val uses.
+class LimbVec {
+    Limb* p_ = nullptr;
+    uint32_t n_ = 0;
+    void copyFrom(const LimbVec& o) {
+        n_ = o.n_;
+        p_ = n_ ? new Limb[n_] : nullptr;
+        for (uint32_t i = 0; i < n_; i++) p_[i] = o.p_[i];
+    }
+public:
+    LimbVec() = default;
+    LimbVec(std::initializer_list<Limb> l) : p_(l.size() ? new Limb[l.size()] : nullptr), n_((uint32_t)l.size()) {
+        uint32_t i = 0;
+        for (const Limb& x : l) p_[i++] = x;
+    }
+    LimbVec(const LimbVec& o) { if (o.n_) copyFrom(o); }
+    LimbVec(LimbVec&& o) noexcept : p_(o.p_), n_(o.n_) { o.p_ = nullptr; o.n_ = 0; }
+    LimbVec& operator=(const LimbVec& o) {
+        if (this == &o) return *this;
+        if (!n_ && !o.n_) return *this;
+        if (n_ == o.n_) { for (uint32_t i = 0; i < n_; i++) p_[i] = o.p_[i]; return *this; }
+        delete[] p_;
+        p_ = nullptr; n_ = 0;
+        if (o.n_) copyFrom(o);
+        return *this;
+    }
+    LimbVec& operator=(LimbVec&& o) noexcept {
+        if (this != &o) { delete[] p_; p_ = o.p_; n_ = o.n_; o.p_ = nullptr; o.n_ = 0; }
+        return *this;
+    }
+    ~LimbVec() { delete[] p_; }
+    size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    void clear() { delete[] p_; p_ = nullptr; n_ = 0; }
+    void resize(size_t n) {   // new limbs are zero
+        if (n == n_) return;
+        if (n == 0) { clear(); return; }
+        Limb* q = new Limb[n];
+        for (size_t i = 0; i < n && i < n_; i++) q[i] = p_[i];
+        delete[] p_;
+        p_ = q; n_ = (uint32_t)n;
+    }
+    Limb& operator[](size_t i) { return p_[i]; }
+    const Limb& operator[](size_t i) const { return p_[i]; }
+    Limb* begin() { return p_; }
+    Limb* end() { return p_ + n_; }
+    const Limb* begin() const { return p_; }
+    const Limb* end() const { return p_ + n_; }
+};
+
 struct Val {
     uint64_t v = 0, x = ~0ULL;  // default: all X. Limb 0 (bits [0,63]).
     int w = 1;
@@ -62,7 +116,7 @@ struct Val {
     bool sgn = false;           // expression result is signed; not stored on a net
     bool real = false;          // v holds an IEEE double (6.12); w is 64
     bool str = false;           // v is a string id (6.16); see strPool
-    std::vector<Limb> hi;       // limbs 1.. : hi[k] is bits [64*(k+1), 64*(k+2))
+    LimbVec hi;                 // limbs 1.. : hi[k] is bits [64*(k+1), 64*(k+2))
     // Missing high limbs compare as 0, so a 64-bit value (empty hi) still
     // matches the way it did before hi existed.
     bool operator==(const Val& o) const {
