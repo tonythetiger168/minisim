@@ -4518,18 +4518,35 @@ struct Lowerer {
         }
         fmt += "}";
     }
+    // %p of container h whose innermost elements have type ec: %Q with d, s
+    // or R; other elements (enums, structs) %QF with a temporary that holds
+    // each element in turn and the format that prints it.
+    void pfmtCont(const slang::ast::Type& ec, E h, std::string& fmt, std::vector<E>& out) {
+        fmt += "%Q";
+        if (ec.isString()) { fmt += 's'; out.push_back(h); return; }
+        if (ec.isFloating()) { fmt += 'R'; out.push_back(h); return; }
+        if (ec.isIntegral() && ec.kind != slang::ast::SymbolKind::EnumType && !ec.isStruct()) { fmt += 'd'; out.push_back(h); return; }
+        int w = storeW(ec);
+        if (w <= 0) unsupported("%p of a container of this element type");
+        int tmp = fresh(w);
+        std::string sub;
+        std::vector<E> subArgs;
+        if (ec.isUnpackedStruct() || ec.isUnpackedUnion()) pfmtStruct(ec, ref(tmp), sub, subArgs);
+        else pfmtSingular(ec, ref(tmp, ec.isSigned()), sub, subArgs);
+        auto sf = node(Op::SFormat, std::move(subArgs));
+        sf->fmt = sub;
+        fmt += 'F';
+        out.push_back(h);
+        out.push_back(ref(tmp));
+        out.push_back(sf);
+    }
     void pfmt(const slang::ast::Expression& a, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
         const Expression& x = peel(a);
         if (int d = dynSig(x); d >= 0) {
             const Type* et = x.type->getCanonicalType().getArrayElementType();
             while (isDynType(*et)) et = et->getCanonicalType().getArrayElementType();   // a container of containers: the innermost elements
-            const Type& ec = et->getCanonicalType();
-            if (!(ec.isIntegral() && ec.kind != SymbolKind::EnumType && !ec.isStruct()) && !ec.isString() && !ec.isFloating())
-                unsupported("%p of a container of this element type");
-            fmt += "%Q";
-            fmt += ec.isString() ? 's' : ec.isFloating() ? 'R' : 'd';
-            out.push_back(ref(d));
+            pfmtCont(et->getCanonicalType(), ref(d), fmt, out);
             return;
         }
         if (auto ca = x.type->isUnpackedArray() ? contArr(x) : nullptr) {   // int f[2][$]: each element container by %Q
@@ -4550,12 +4567,7 @@ struct Lowerer {
                     addr->arr = ca;
                     const Type* it = et;
                     while (isDynType(*it)) it = it->getCanonicalType().getArrayElementType();
-                    const Type& ec = it->getCanonicalType();
-                    if (!(ec.isIntegral() && ec.kind != SymbolKind::EnumType && !ec.isStruct()) && !ec.isString() && !ec.isFloating())
-                        unsupported("%p of a container of this element type");
-                    fmt += "%Q";
-                    fmt += ec.isString() ? 's' : ec.isFloating() ? 'R' : 'd';
-                    out.push_back(ref(bindCont(std::move(addr), *ca->dynElem)));
+                    pfmtCont(it->getCanonicalType(), ref(bindCont(std::move(addr), *ca->dynElem)), fmt, out);
                 }
                 fmt += "}";
             };

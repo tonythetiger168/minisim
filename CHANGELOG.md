@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `%p` of containers of unpacked structs, unions, enums and packed structs
+  (21.2.1.6), at any nesting depth.
 - Fixed-size arrays of containers (`int q[4][$]`) as class properties,
   rand properties and automatic variables (7.4, 18.4), with `%p`, foreach,
   object copies and access through a handle.
