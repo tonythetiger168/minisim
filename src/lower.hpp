@@ -7965,7 +7965,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         else {   // a dynamic array or queue (18.4): its size and elements
                             if (t.isAssociativeArray()) {   // its values (18.4); the keys stay
                                 const auto* ix = t.as<AssociativeArrayType>().indexType;
-                                if (!ix || !ix->getCanonicalType().isIntegral()) Lowerer::unsupported("rand associative array without an integral index");
+                                if (!ix || !(ix->getCanonicalType().isIntegral() || ix->getCanonicalType().isString()))
+                                    Lowerer::unsupported("rand associative array with a wildcard or class index");
                             }
                             rv.off = ps.off; rv.dyn = true;
                             et = &t.getArrayElementType()->getCanonicalType();

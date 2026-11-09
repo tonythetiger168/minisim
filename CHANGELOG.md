@@ -8,6 +8,7 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- rand associative arrays with string keys (18.4).
 - Per-process random generators (18.14.2): a forked process is seeded from
   its parent, so values one process draws do not depend on other processes.
 - `mbug`: files regression (mregress `results.json`), lint (mlint) and DFT
