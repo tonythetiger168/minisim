@@ -9,10 +9,10 @@ including any system task msim does not know (only the waveform tasks such as `$
 never a silent wrong answer. If you find a construct that runs but gives the
 wrong result, that is a bug: please add a spec test for it.
 
-`tests/regress.py` runs every spec test and prints a per-chapter table. A test
-marked `//! xfail: <reason>` is a known gap (ctest expects it to fail); the
-script fails if any other test fails or if an xfail test starts passing.
-`python3 tests/regress.py --icarus` also compares each test with Icarus.
+`mregress -spec tests/spec` (`tools/mregress.py`) runs every spec test and prints a
+per-chapter table. A test marked `//! xfail: <reason>` is a known gap (ctest expects
+it to fail); the run fails if any other test fails or if an xfail test starts
+passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 
 | Clause | Topic | Status | Notes / test |
 |---|---|---|---|
@@ -26,7 +26,8 @@ script fails if any other test fails or if an xfail test starts passing.
 | 6.12 | real, realtime | ✅ | arithmetic, compare, `**`, conversion both ways (rounded, 6.12.1), real arrays and function results, `$itor` `$rtoi` `$realtobits` `$bitstoreal`, 20.8 math functions. Not yet: `shortreal` (an error), reals in the VCD. `6.12-real`, `6.12.1-real-conversions` |
 | 6.16 | string type | ✅ | concatenation, replication, compare, all 6.16 methods, string arrays and function arguments, conversion to and from integral types, `case` on strings. `6.16-string`, `6.16-string-methods` |
 | 6.18 | typedef | ✅ | for the types listed here |
-| 6.19 | Enumerations | 🟡 | values and compares; no `.name()` / `.next()`. `6.19-enum` |
+| 6.19 | Enumerations | ✅ | values, compares, and the methods `first`, `last`, `num`, `next(N)`, `prev(N)`, `name` (6.19.5); `%p` prints the name. `6.19-enum`, `6.19-enum-methods` |
+| 6.24.2 | $cast | 🟡 | integral, real and enum destinations: an enum value that is not a member fails (0, or an error as a task). Class handles come with classes (8). `6.24.2-dollar-cast` |
 | 6.20 | parameter / localparam | ✅ | incl. overrides at instantiation. `6.20-parameters` |
 | 7.2.1, 7.3.1 | Packed structures and unions | ✅ | member read and write, nested members. `7.2.1-packed-struct` |
 | 7.2 | Unpacked structures | ❌ | |
@@ -52,6 +53,7 @@ script fails if any other test fails or if an xfail test starts passing.
 | 10.3 | Continuous assignment | ✅ | with drive strength; to a whole signal or a constant bit / part select |
 | 10.3.1 | Net declaration assignment | ✅ | `10.3.1-net-decl-assign` |
 | 10.3.3 | Continuous assignment delays | ✅ | `assign #(r, f, z)`, `wire #d w = a`, net delays `wire #d w;`, gate delays; inertial, rise/fall/turn-off picked per Table 28-9, min:typ:max uses typ. `10.3.3-assign-delay`, `28.16-gate-delays` |
+| 10.6 | assign / deassign, force / release | 🟡 | on whole variables and nets; the expression is re-evaluated whenever its operands change; release hands a net back to its drivers, and a variable keeps its value. Not yet: forcing a bit, part or array element. `10.6.1-assign-deassign`, `10.6.2-force-release`, `10.6.2-force-expression` |
 | 10.4 | Blocking / nonblocking | ✅ | whole signal, bit-select, part-select |
 | 10.5 | Variable declaration assignment | ✅ | runs before every initial/always. `10.5-var-decl-init` |
 | 10.11 | Net aliasing | ✅ | `alias a = b = c;` makes one net. `10.11-net-alias` |
@@ -86,7 +88,7 @@ script fails if any other test fails or if an xfail test starts passing.
 | 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m %f %e %g %p, `%0`, widths, `%-8d`, `%.3f`. `%m` is the scope of the call. `21.2.1-display-formats` |
 | 21.2.1.6 | %p assignment pattern format | 🟡 | fixed-size arrays (any dimensions), dynamic arrays, queues, associative arrays, packed structs with member names, enums by name, strings in quotes. Not yet: unpacked structs (7.2). `21.2.1.6-assignment-pattern-format` |
 | 21.2.2–21.2.3 | $strobe, $monitor | ✅ | |
-| 21.3 | File I/O ($fopen, $fwrite, ...) | ❌ | |
+| 21.3 | File I/O | ✅ | `$fopen` (descriptors and multichannel), `$fclose`, `$fdisplay`/`$fwrite` and b/o/h forms, `$fgets`, `$fgetc`, `$ungetc`, `$feof`, `$fscanf`, `$sscanf` (all conversions, `%*`, widths), `$fseek`, `$ftell`, `$rewind`, `$fflush`. Not yet: `$fstrobe`, `$fmonitor`, `$fread`. `21.3-file-io`, `21.3.1-multichannel` |
 | 21.3.3 | $sformatf, $sformat, $swrite | ✅ | the same formats as $display |
 | 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
 | 21.5 | $writememh, $writememb | ✅ | 1-D memories, optional start/finish. `21.5-writemem` |

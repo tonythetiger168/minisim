@@ -1,6 +1,5 @@
 // IEEE 1800-2023 6.19: Enumeration methods first, last, next, prev, num,
 // name (6.19.5).
-//! xfail: enum methods are an error
 //! icarus-skip: Icarus 13 does not support e.first().name()
 module top;
   typedef enum {A, B, C} e_t;

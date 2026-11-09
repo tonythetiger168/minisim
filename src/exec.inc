@@ -405,6 +405,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             continue;
         }
         const Instr& i = p->code[pc];
+        if (g_cov) covHit(i.hits);
         switch (i.k) {
             case IK::Assign:
             case IK::Nba: {
@@ -435,8 +436,13 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             }
             case IK::ReadMem: readMem(i); pc++; break;
             case IK::WriteMem: writeMem(i); pc++; break;
+            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0); pc++; break;
+            case IK::Release: S.holdOff(i.sig, i.hi != 0); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
-            case IK::JmpIfNot:  pc = (truth(eval(i.e, rd)) == 1) ? pc + 1 : i.target; break;
+            case IK::JmpIfNot:
+                if (truth(eval(i.e, rd)) == 1) pc++;
+                else { if (g_cov) covHit(i.taken); pc = i.target; }
+                break;
             case IK::Jmp:       pc = i.target; break;
             case IK::WaitEdge:
                 if (relEvents(i)) {
@@ -553,6 +559,7 @@ done:
 // The value of a one-assign combinational process, and its write
 // (Sim::Comb compute / commit). compute only reads signals.
 static Val combValue(const void* ctx) {
+    if (g_cov) covHit(static_cast<const Prog*>(ctx)->code[0].hits);
     return eval(static_cast<const Prog*>(ctx)->code[0].e, rd);
 }
 static void combCommit(const void* ctx, Val v) {
@@ -569,8 +576,10 @@ static void combCommit(const void* ctx, Val v) {
 static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
     const Prog* p = static_cast<const Prog*>(ctx);
     size_t pc = 1, end = p->code.size() - 1;
+    if (g_cov) covHit(p->code[0].hits);   // the clock wait this function stands for
     while (pc < end) {
         const Instr& i = p->code[pc];
+        if (g_cov) covHit(i.hits);
         switch (i.k) {
             case IK::Nba: {
                 Val v = eval(i.e, rd);
@@ -579,7 +588,10 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
                 pc++;
                 break;
             }
-            case IK::JmpIfNot: pc = (truth(eval(i.e, rd)) == 1) ? pc + 1 : i.target; break;
+            case IK::JmpIfNot:
+                if (truth(eval(i.e, rd)) == 1) pc++;
+                else { if (g_cov) covHit(i.taken); pc = i.target; }
+                break;
             case IK::Jmp: pc = i.target; break;
             default: pc++; break;  // seqShape admits nothing else
         }
@@ -592,6 +604,7 @@ static void execComb(const void* ctx) {
     const Prog* p = static_cast<const Prog*>(ctx);
     for (const Instr& i : p->code) {
         if (i.k != IK::Assign) return;
+        if (g_cov) covHit(i.hits);
         Val v = eval(i.e, rd);
         if (i.drv >= 0) {
             // A driver of part of a net drives Z on the other bits, as in exec().

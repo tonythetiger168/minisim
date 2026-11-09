@@ -48,6 +48,7 @@ jobs:
           CXX=g++-13 msim -compile -o /tmp/msim.d examples/cli/adder.sv examples/cli/adder_tb.sv -top adder_tb -fst /tmp/a.fst
           test -s /tmp/a.fst
           mregress -version
+          mcov -version
 
       - name: Upload packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
