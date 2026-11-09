@@ -24,7 +24,8 @@ enum Edge { ANY, POS, NEG };
 enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_INSERT, D_POP_FRONT,
               D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
               D_SORT, D_RSORT, D_SHUFFLE,
-              D_SORT_BY, D_RSORT_BY };   // sort / rsort with (7.12.2): keys in dsrc
+              D_SORT_BY, D_RSORT_BY,     // sort / rsort with (7.12.2): keys in dsrc
+              D_UNPACK };                // q = {>>{v}} (11.4.14.3): e cut into elements
 enum class IK {
     Assign,     // sig = e            (blocking)
     Nba,        // sig <= e           (non-blocking)
@@ -47,6 +48,9 @@ enum class IK {
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
     Dpi,        // call the C function of DPI import `dpi` (35); see DpiFunc
+    New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
+    Randomize,  // sig = randomize the object e (null e: std::randomize), with rc (18.6, 18.12)
+    RandMode,   // obj e: every rand variable (hi = 0) or constraint block (hi = 1) on or off by de (18.8, 18.9)
     // An immediate assertion (16.3, 16.4) of asserts()[sig] on condition e.
     // join 0, simple: pass falls through to the pass action, a fail jumps to
     // target, and an assertion that is off or whose action is off jumps to hi.
@@ -173,6 +177,9 @@ struct Instr {
     const FrameLayout* lay = nullptr;
     std::vector<std::pair<int, E>> init;
     std::vector<const FrameLayout*> blays;
+    // Call: containers copied into the new frame (7.7): its slot, the
+    // caller's container signal.
+    std::vector<std::pair<int, int>> dinit;
     // WaitEdge with dynWait: wait for a change of any signal `e` reads,
     // resolved when the wait starts (wait (cond) on automatic variables).
     bool dynWait = false;
@@ -183,7 +190,83 @@ struct Instr {
     const DpiFunc* dpi = nullptr;
     std::vector<DpiActual> dact;
     int dline = 0;
+    // Call of a class method (8): `self` is the object (null: the caller's
+    // own `this`; noSelf: a static method). vslot >= 0 picks the body from
+    // the object's class (a virtual method, 8.20).
+    E self;
+    bool noSelf = false;
+    int vslot = -1;
+    std::shared_ptr<const struct RandCall> rc;   // Randomize
 };
+
+// ---------- constrained randomization (18) ----------
+// One range of a dist (18.5.3): [lo, hi] (hi null: the single value lo),
+// with its weight, := per value or :/ shared by the range.
+struct RandDist { E lo, hi, weight; bool perRange = false; };
+// One constraint, a truth value; or, when isDist, `e dist {...}`.
+struct RandItem {
+    E e;
+    bool soft = false;           // 18.5.13
+    bool disableSoft = false;    // disable soft e (18.5.13.2): drops the earlier soft constraints on e
+    bool isDist = false;
+    E guard;                     // dist under an implication: holds when guard is false
+    std::vector<RandDist> dist;
+};
+// A constraint block (18.5): its constraint_mode slot in the object.
+struct RandBlock {
+    std::string name;
+    int mode = -1;
+    bool staticMode = false;   // a static block (18.5.10): mode is a signal holding "off" as 0 (x or 1: on)
+    std::vector<RandItem> items;
+    std::vector<std::pair<std::vector<E>, std::vector<E>>> before;   // solve a before b (18.5.9)
+};
+// A rand / randc property (18.4): `count` slots from `off`, each w bits;
+// `mode` is its rand_mode slot. obj: a rand class handle, whose object is
+// randomized with this one.
+struct RandVar {
+    std::string name;
+    int off = 0, count = 1, w = 1, mode = -1;
+    bool sgn = false, randc = false, obj = false;
+};
+struct RandSpec {
+    std::vector<RandVar> vars;
+    std::vector<std::shared_ptr<const RandBlock>> blocks;   // own and inherited; an override by name replaces the base block
+    const Prog* pre = nullptr; const FrameLayout* preLay = nullptr;     // pre_randomize (18.6.2)
+    const Prog* post = nullptr; const FrameLayout* postLay = nullptr;   // post_randomize
+};
+// A randomize() call: with {...} constraints, read in the caller's frame
+// (the object's members through objTmp), and randomize(a, b) arguments.
+struct RandCall {
+    std::vector<RandItem> items;
+    std::vector<std::pair<std::vector<E>, std::vector<E>>> before;
+    std::vector<E> args;        // the variables to randomize, as Refs
+    bool argsGiven = false;     // randomize(...) with arguments (18.11): only those
+    int objTmp = -1;
+};
+struct Prog;
+// A class at run time (8): its object shape (slot 0 holds the class id),
+// its virtual method table, and its base class.
+struct ClassRt {
+    std::string name;
+    const FrameLayout* lay = nullptr;
+    int base = -1;
+    std::vector<std::pair<const Prog*, const FrameLayout*>> vt;
+    // Interface classes (8.26) this class implements, and for each
+    // interface method k (global numbering) the vt slot of its
+    // implementation (-1: none).
+    std::vector<int> ifs;
+    std::vector<int> imap;
+    std::shared_ptr<RandSpec> rand;   // 18
+};
+inline std::vector<ClassRt>& classRt() { static std::vector<ClassRt> v; return v; }
+inline bool classIsA(int cls, int want) {
+    for (; cls >= 0; cls = classRt()[(size_t)cls].base) {
+        if (cls == want) return true;
+        for (int k : classRt()[(size_t)cls].ifs)
+            if (k == want) return true;
+    }
+    return false;
+}
 
 struct Prog {
     std::vector<Instr> code;
@@ -207,16 +290,18 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     // A relative id (an automatic variable) has no fixed signal: it is left
     // out here, and a wait on one resolves it at run time (Instr::dynWait).
     auto add = [&](int s) { if (!isRel(s) && seen.insert(s).second) out.push_back(s); };
-    if (e->op == Op::Ref) add(e->sig);
+    if (e->op == Op::Ref && !e->at) add(e->sig);   // h.x has no fixed signal either
+    collectRefsInto(e->at, out, seen);
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) add(e->sig);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) add(e->sig);
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 // Does e read an automatic variable (a relative id)?
 inline bool hasRel(const E& e) {
     if (!e) return false;
     if (isRel(e->sig) && e->op != Op::Const) return true;
+    if (e->at || e->op == Op::This || e->op == Op::Addr || e->op == Op::AddrOf) return true;   // objects (8), ref (13.5.2)
     if (e->op == Op::ArrRead && isRel(e->arr->base)) return true;
     for (auto& k : e->kids) if (hasRel(k)) return true;
     return false;
@@ -272,12 +357,90 @@ inline void collectProgWrites(const Prog& p, std::unordered_set<int>& out, std::
         for (const Prog* b : i.branches) collectProgWrites(*b, out, seen);
     }
 }
+// Bits of a signal: ranges [lo, hi], or every bit.
+struct BitSet {
+    bool all = false;
+    std::vector<std::pair<int, int>> r;
+    bool covers(int lo, int hi) const {   // is every bit of [lo, hi] in r?
+        if (all) return true;
+        for (int b = lo; b <= hi; b++) {
+            bool in = false;
+            for (auto& [l, h] : r) if (b >= l && b <= h) { in = true; break; }
+            if (!in) return false;
+        }
+        return true;
+    }
+};
+// The bits of each signal that e reads: a constant part select of a signal
+// reads only those bits, any other reference reads all of it.
+inline void collectReadBits(const E& e, std::unordered_map<int, BitSet>& m) {
+    if (!e) return;
+    if (e->op == Op::Slice && e->kids.size() == 1 && e->kids[0] && e->kids[0]->op == Op::Ref &&
+        !e->kids[0]->at && !isRel(e->kids[0]->sig)) {
+        m[e->kids[0]->sig].r.push_back({e->lo, e->hi});
+        return;
+    }
+    if (e->op == Op::Ref && !e->at && !isRel(e->sig)) m[e->sig].all = true;
+    if (e->op == Op::ArrRead)
+        for (int i = 0; i < e->arr->count; i++) m[e->arr->base + i].all = true;
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
+        e->op == Op::DynBits || e->op == Op::DynHas)
+        m[e->sig].all = true;
+    collectReadBits(e->at, m);
+    for (auto& k : e->kids) collectReadBits(k, m);
+}
+inline void collectProgReadBits(const Prog& p, std::unordered_map<int, BitSet>& m, std::vector<const Prog*>& seen) {
+    for (const Prog* s : seen)
+        if (s == &p) return;
+    seen.push_back(&p);
+    for (auto& i : p.code) {
+        collectReadBits(i.e, m);
+        for (auto& a : i.args) collectReadBits(a, m);
+        for (auto& a : i.aidx) collectReadBits(a, m);
+        collectReadBits(i.bidx, m);
+        for (auto& a : i.init) collectReadBits(a.second, m);
+        if (i.k == IK::Call && i.callee) collectProgReadBits(*i.callee, m, seen);
+        for (const Prog* b : i.branches) collectProgReadBits(*b, m, seen);
+    }
+}
+// Bits written at a constant part select (v[3] = ..., v[7:4] = ...).
+inline void collectProgPartWrites(const Prog& p, std::unordered_map<int, BitSet>& out, std::vector<const Prog*>& seen) {
+    for (const Prog* s : seen)
+        if (s == &p) return;
+    seen.push_back(&p);
+    for (auto& i : p.code) {
+        if ((i.k == IK::Assign || i.k == IK::Nba) && i.sig >= 0 && i.drv < 0 && i.dyn < 0 && !i.arr &&
+            i.hi >= 0 && !i.bidx)
+            out[i.sig].r.push_back({i.lo, i.hi});
+        if (i.k == IK::Call && i.callee) collectProgPartWrites(*i.callee, out, seen);
+        for (const Prog* b : i.branches) collectProgPartWrites(*b, out, seen);
+    }
+}
+// always_comb / always_latch sensitivity (9.2.2.2.1): what the block reads,
+// less what it also writes. A signal written only in part stays in the list
+// unless every read of it is of bits the block writes, so two blocks that
+// each own a bit of one vector do not wake each other.
 inline std::vector<std::pair<int, Edge>> combReadSet(const Prog& p) {
     auto rs = readSet(p);
     std::unordered_set<int> wr;
     std::vector<const Prog*> seen;
     collectProgWrites(p, wr, seen);
     std::erase_if(rs, [&](const std::pair<int, Edge>& e) { return wr.count(e.first) > 0; });
+    std::unordered_map<int, BitSet> pw;
+    seen.clear();
+    collectProgPartWrites(p, pw, seen);
+    if (pw.empty()) return rs;
+    std::unordered_map<int, BitSet> rd;
+    seen.clear();
+    collectProgReadBits(p, rd, seen);
+    std::erase_if(rs, [&](const std::pair<int, Edge>& e) {
+        auto w = pw.find(e.first);
+        if (w == pw.end()) return false;
+        auto r = rd.find(e.first);
+        if (r == rd.end() || r->second.all) return false;
+        for (auto& [l, h] : r->second.r) if (!w->second.covers(l, h)) return false;
+        return true;
+    });
     return rs;
 }
 // A WaitEdge on one or more events (ev must be non-empty).
