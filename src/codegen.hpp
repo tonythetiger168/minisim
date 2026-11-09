@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "prog.hpp"
+#include "sva.hpp"
 
 struct CodegenUnsupported : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -184,6 +185,59 @@ public:
             t += " MI" + std::to_string(k) + ".args = {" + args + "};\n";
             memInit.push_back(t);
         }
+        // The assertion table (sva.hpp), rebuilt at startup: what $assertcontrol
+        // and the reports read, and the deferred actions as interpreted
+        // processes whose captured arguments go into slots SL<k>.
+        std::string asInit;
+        int nSlots = 0, nAct = 0;
+        if (!asserts().empty()) {
+            asInit += "    asserts().resize(" + std::to_string(asserts().size()) + ");\n";
+            auto action = [&](const Prog* p, const std::vector<E>& slots) -> std::string {
+                if (!p) return "nullptr";
+                std::string AP = "AP" + std::to_string(nAct++);
+                for (auto& sl : slots) {
+                    std::string n = "SL" + std::to_string(nSlots++);
+                    asInit += "    " + n + " = " + tree(sl) + ";\n";
+                    slotNames_[sl.get()] = n;
+                }
+                for (auto& i : p->code) {
+                    if ((i.k != IK::Display && i.k != IK::Strobe) || i.lay || !i.init.empty())
+                        throw CodegenUnsupported("an assertion action other than $display");
+                    std::string args;
+                    for (size_t j = 0; j < i.args.size(); j++) args += (j ? ", " : "") + tree(i.args[j]);
+                    asInit += "    { Instr n; n.k = IK::" + std::string(i.k == IK::Display ? "Display" : "Strobe") + "; n.fmt = " +
+                              quote(i.fmt) + "; n.nonl = " + (i.nonl ? "true" : "false") + "; n.args = {" + args + "}; " + AP +
+                              ".code.push_back(n); }\n";
+                }
+                return "&" + AP;
+            };
+            auto list = [&](const std::vector<E>& v) {
+                std::string t;
+                for (size_t j = 0; j < v.size(); j++) t += (j ? ", " : "") + tree(v[j]);
+                return "{" + t + "}";
+            };
+            for (size_t k = 0; k < asserts().size(); k++) {
+                const AssertInfo& a = asserts()[k];
+                std::string pass = action(a.pass, a.passSlot), fail = action(a.fail, a.failSlot);
+                asInit += "    { auto& a = asserts()[" + std::to_string(k) + "]; a.name = " + quote(a.name) + "; a.inst = " +
+                          quote(a.inst) + "; a.type = " + std::to_string(a.type) + "; a.dir = " + std::to_string(a.dir) +
+                          "; a.hidden = " + (a.hidden ? "true" : "false") + "; a.pass = " + pass + "; a.fail = " + fail +
+                          "; a.passCap = " + list(a.passCap) + "; a.failCap = " + list(a.failCap) + "; a.passSlot = " +
+                          list(a.passSlot) + "; a.failSlot = " + list(a.failSlot) + "; }\n";
+            }
+        }
+        for (size_t k = 0; k < asrts_.size(); k++) {
+            const Instr& i = *asrts_[k];
+            std::string A_ = "AI" + std::to_string(k);
+            if (i.k == IK::AssertCtl) {
+                std::string args;
+                for (size_t j = 0; j < i.args.size(); j++) args += (j ? ", " : "") + tree(i.args[j]);
+                asInit += "    " + A_ + ".k = IK::AssertCtl; " + A_ + ".fmt = " + quote(i.fmt) + "; " + A_ + ".args = {" + args + "};\n";
+                continue;
+            }
+            asInit += "    " + A_ + ".k = IK::Assert; " + A_ + ".sig = " + std::to_string(i.sig) + "; " + A_ + ".join = " +
+                      std::to_string(i.join) + "; " + A_ + ".target = 1; " + A_ + ".hi = 2; " + A_ + ".e = " + tree(i.e) + ";\n";
+        }
         for (size_t k = 0; k < arrs_.size(); k++) {
             const ArrShape& a = *arrs_[k];
             o << "static const ArrShape AS" << k << "{" << a.base << ", " << a.count << ", " << a.elemW << ", "
@@ -195,6 +249,9 @@ public:
         for (size_t i = 0; i < sysArgs_.size(); i++) o << "static std::vector<E> A" << i << ";\n";
         for (size_t i = 0; i < evals_.size(); i++) o << "static E T" << i << ";\n";
         for (size_t i = 0; i < mems_.size(); i++) o << "static Instr MI" << i << ";\n";
+        for (size_t i = 0; i < asrts_.size(); i++) o << "static Instr AI" << i << ";\n";
+        for (int i = 0; i < nAct; i++) o << "static Prog AP" << i << ";\n";
+        for (int i = 0; i < nSlots; i++) o << "static E SL" << i << ";\n";
         for (size_t i = 0; i < events_.size(); i++) o << "static std::vector<std::pair<int, Edge>> EV" << i << ";\n";
         if (cov) o << "uint64_t CV[" << std::max<size_t>(2, 2 * covSlots.size()) << "];\n";
         o << "static std::atomic<bool> pclean{false};   // every private signal is known (no X or Z bit)\n";
@@ -253,6 +310,7 @@ public:
         for (size_t i = 0; i < sysArgs_.size(); i++) o << "    A" << i << " = {" << sysTrees[i] << "};\n";
         for (size_t i = 0; i < evals_.size(); i++) o << "    T" << i << " = " << evTrees[i] << ";\n";
         for (auto& m : memInit) o << m;
+        o << asInit;
         for (size_t i = 0; i < events_.size(); i++) {
             o << "    EV" << i << " = {";
             for (size_t j = 0; j < events_[i].size(); j++)
@@ -366,6 +424,8 @@ private:
     std::vector<const ArrShape*> arrs_;   // unpacked arrays, emitted as AS<k>
     std::vector<E> evals_;                // operators without C++ yet: interpreted (T<k>)
     std::vector<const Instr*> mems_;      // $readmem / $writemem instructions, rebuilt as MI<k>
+    std::vector<const Instr*> asrts_;     // immediate assertions and $assertcontrol, rebuilt as AI<k>
+    std::map<const Expr*, std::string> slotNames_;   // assertion action slots, rebuilt as SL<k>
     bool readsPriv(const E& e) const {
         if (!e) return false;
         if (e->op == Op::Ref && isPriv(e->sig)) return true;
@@ -435,6 +495,7 @@ private:
     // The tree itself, rebuilt at startup (for the printing system tasks).
     std::string tree(const E& e) {
         if (!e) return "E{}";
+        if (auto it = slotNames_.find(e.get()); it != slotNames_.end()) return it->second;
         std::string kids;
         for (size_t i = 0; i < e->kids.size(); i++) kids += (i ? ", " : "") + tree(e->kids[i]);
         if (e->op == Op::ArrRead)
@@ -1257,6 +1318,10 @@ private:
         o << "// process " << n << " (" << kind << ")\n";
         o << "static Task proc" << n << "() {\n";
         if (calls) o << "    std::vector<int> rs;\n";
+        bool asserting = false;
+        for (const Prog* q : progs)
+            for (auto& i : q->code) asserting |= i.k == IK::Assert;
+        if (asserting) o << "    auto ctl = std::make_shared<ProcCtl>();\n";
         for (size_t pi = 0; pi < progs.size(); pi++) {
             const Prog& p = *progs[pi];
             int P = (int)pi;
@@ -1305,9 +1370,10 @@ private:
                     case IK::WaitEdge:
                         if (i.events.size() > 1) {
                             events_.push_back(i.events);
-                            o << " co_await WaitAny{&EV" << events_.size() - 1 << "};\n";
+                            o << " co_await WaitAny{&EV" << events_.size() - 1 << "};";
                         } else
-                            o << " co_await Wait{" << i.sig << ", " << edge(i.edge) << "};\n";
+                            o << " co_await Wait{" << i.sig << ", " << edge(i.edge) << "};";
+                        o << (asserting ? " ctl->epoch++;\n" : "\n");   // a deferred assertion flush point (16.4.2)
                         break;
                     case IK::WaitDelay: o << " co_await Delay{" << i.delay << "ULL};\n"; break;
                     case IK::Display:
@@ -1333,6 +1399,28 @@ private:
                         break;
                     }
                     case IK::Finish: o << " S.finished = true; co_return;\n"; break;
+                    case IK::Assert: {   // an immediate assertion (16.3, 16.4), through the kernel's runAssert
+                        if (i.join > 2) throw CodegenUnsupported("a procedural concurrent assertion or expect");
+                        const AssertInfo& a = asserts().at(i.sig);
+                        bool priv = readsPriv(i.e);
+                        for (auto* cs : {&a.passCap, &a.failCap})
+                            for (auto& c : *cs) priv |= readsPriv(c);
+                        if (priv) throw CodegenUnsupported("an assertion on a private signal");
+                        asrts_.push_back(&i);
+                        std::string A_ = "AI" + std::to_string(asrts_.size() - 1);
+                        if (i.join)   // deferred: queues its report and goes on
+                            o << " runAssert(" << A_ << ", ctl, 0);\n";
+                        else   // simple: 11 runs the pass action, 1 the fail action, 2 neither
+                            o << " { size_t r = runAssert(" << A_ << ", ctl, 10); if (r == 1) goto " << tgt(i.target)
+                              << "; if (r == 2) goto " << tgt((size_t)i.hi) << "; }\n";
+                        break;
+                    }
+                    case IK::AssertCtl:   // $assertcontrol and friends (20.11)
+                        for (auto& a : i.args)
+                            if (readsPriv(a)) throw CodegenUnsupported("$assertcontrol on a private signal");
+                        asrts_.push_back(&i);
+                        o << " assertCtl(AI" << asrts_.size() - 1 << ");\n";
+                        break;
                     case IK::Call:
                         retLabels.push_back(L(P, pc + 1));
                         o << " rs.push_back(" << retLabels.size() - 1 << "); goto " << L(idx(i.callee), 0) << ";\n";
