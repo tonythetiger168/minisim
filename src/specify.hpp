@@ -57,6 +57,11 @@ struct PathRec {
     int src = -1, dst = -1;      // signals
     E condE;                     // the condition, evaluated when dst changes
     uint64_t d[12] = {};         // ticks, one per transition
+    // Pulse limits (30.7): a pulse narrower than the reject limit is
+    // dropped, one narrower than the error limit becomes x. Ticks, one per
+    // transition; PATHPULSE$, the +pulse_r / +pulse_e percentages and SDF
+    // set them. Limits above the delay act as the delay (32.7).
+    uint64_t rj[12] = {}, er[12] = {};
     uint64_t unit = 1;           // ticks per time unit of the module
     bool annotated = false;
 };
@@ -69,6 +74,45 @@ struct PortRec {
     bool net = true;
 };
 inline std::map<std::string, PortRec>& portRecs() { static std::map<std::string, PortRec> m; return m; }   // "top.u1.a"
+// Pulse styles of path outputs (30.7.4), by output signal: PS_DETECT for
+// pulsestyle_ondetect, PS_SHOWCANCELLED for showcancelled. The invocation
+// options (+pulse_on_detect, +show_cancelled ...) override them.
+enum { PS_DETECT = 1, PS_SHOWCANCELLED = 2 };
+inline std::map<int, uint8_t>& pulseStyles() { static std::map<int, uint8_t> m; return m; }
+struct PulseOpts {
+    int rejectPct = 100, errorPct = 100;   // +pulse_r/N, +pulse_e/N (30.7.2)
+    int detect = -1, showCancelled = -1;    // -1: as declared; 0 / 1: forced
+};
+inline PulseOpts& pulseOpts() { static PulseOpts o; return o; }
+// The default limits of a delay: the percentages of 30.7.2.
+inline uint64_t rejectOf(uint64_t d) { return d * (uint64_t)pulseOpts().rejectPct / 100; }
+inline uint64_t errorOf(uint64_t d) { return d * (uint64_t)std::max(pulseOpts().errorPct, pulseOpts().rejectPct) / 100; }
+
+// Delays with pulse limits, one per transition: an interconnect delay
+// (32.4.4) or a primitive's SDF delay.
+struct Delay12 {
+    uint64_t d[12] = {}, rj[12] = {}, er[12] = {};
+};
+
+// A gate or UDP instance (28, 29) that drives a port of its module, for
+// SDF DEVICE (Table 32-1): when annotated, its 12 delays replace the
+// declared ones.
+struct GateRec {
+    std::string inst;            // the module instance, "top.u1"
+    std::string name;            // the primitive instance's name
+    std::vector<int> outs;       // the signals it drives
+    uint64_t d[12] = {};
+    bool annotated = false;
+};
+inline std::vector<GateRec>& gateRecs() { static std::vector<GateRec> v; return v; }
+
+// Port connections, for INTERCONNECT between one source and one load of a
+// net with several sources (32.4.4): an output or inout formal drives its
+// actual net with driver drv; an input's formal copies the whole actual net.
+struct PortLink { int formal = -1, net = -1, drv = -1; };
+inline std::vector<PortLink>& outLinks() { static std::vector<PortLink> v; return v; }
+inline std::map<int, int>& inLinks() { static std::map<int, int> m; return m; }   // formal -> actual net
+
 // Every instance and the cell (module) it is.
 inline std::map<std::string, std::string>& instCells() { static std::map<std::string, std::string> m; return m; }
 // The specparams an SDF LABEL (32.4.3) gave a value: "top.u1.tpd".

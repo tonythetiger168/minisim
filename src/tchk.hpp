@@ -46,6 +46,7 @@ struct TimingCheck {
     // $setuphold / $recrem (31.9.2): conditions on the event that comes
     // first (the timestamp) and the one that comes second (the timecheck).
     E tsCond, tcCond;
+    std::string tsText, tcText;  // their text, spaces removed (SDF SCOND / CCOND)
     int64_t dly[2] = {0, 0};     // the delay of each event's signal (31.9), set at the start
     std::string limText;         // the limits as written (SDF annotation rewrites them)
     std::string inst, file;
