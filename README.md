@@ -122,7 +122,8 @@ a known gap; one that passes (XPASS) fails the regression so the marker gets
 removed. With `-spec`, a test's `//! xfail: <reason>` and `//! exit: <n>`
 lines mean the same on msim, and a per-chapter pass table is printed
 (`-md FILE` also writes it as Markdown). See `tests/regress/smoke.list` and
-`mregress -h`.
+`mregress -h`. For Jenkins and other CI, see [`ci/README.md`](ci/README.md)
+and the pipeline in [`ci/Jenkinsfile`](ci/Jenkinsfile).
 
 ### Compiled mode
 
