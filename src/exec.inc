@@ -168,9 +168,11 @@ static void readMem(const Instr& i) {
         addr += step;
         words++;
     }
-    // A file with no @address whose word count differs from the range warns.
+    // A file with no @address whose word count differs from the range warns
+    // (21.4): the range given by start and finish addresses, or, with no
+    // finish address, a file with more words than the memory has room for.
     int64_t range = (step > 0 ? finish - start : start - finish) + 1;
-    if (!sawAddr && words != range)
+    if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
 }
 
@@ -276,6 +278,19 @@ inline void dynExec(const Instr& i) {
                 Val lt = down ? v_lt(b, a) : v_lt(a, b);
                 return !lt.x && lt.v;
             });
+            break;
+        }
+        case D_UNPACK: {   // the stream e, cut into elements from the left; the last is padded on the right
+            Val v = eval(i.e, rd);
+            int ew = d.dflt.w, W = v.w;
+            d.vec.clear();
+            for (int hi = W - 1; hi >= 0; hi -= ew) {
+                int lo = hi - ew + 1;
+                Val el = lo >= 0 ? v_slice(v, hi, lo) : v_concat({v_slice(v, hi, 0), make(0, 0, -lo, 0)});
+                el.sgn = d.dflt.sgn;
+                d.vec.push_back(el);
+                if (full()) { d.vec.pop_back(); break; }
+            }
             break;
         }
         case D_SORT_BY:
@@ -514,7 +529,7 @@ void Sim::runObserved() {
         ConcAssert& c = concAsserts()[k];
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p.caps);
+            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p);
         }
         c.pending.clear();
     }
@@ -671,19 +686,65 @@ struct LocalEnv final : sva::LocalHook {
 };
 // One clock tick of a concurrent assertion, in the observed region: start an
 // attempt, then step every attempt on the sampled values of the atoms.
-static void concTick(ConcAssert& c) {
+// An expect statement (16.17) waiting for its attempt's verdict.
+struct ExpectWait {
+    Handle h;
+    shared_ptr<ProcCtl> ctl;
+    int res = -1;   // 1 pass, 0 fail, 2 disabled or killed
+};
+struct ExpectAwait {
+    ExpectWait* w;
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { w->h = h; }
+    void await_resume() const {}
+};
+// The verdict of an expect attempt: its process goes on in the reactive region.
+static void expectDone(const shared_ptr<void>& p, int res) {
+    auto* w = static_cast<ExpectWait*>(p.get());
+    if (!w || w->res >= 0) return;
+    w->res = res;
+    if (w->ctl->killed || !w->h) return;
+    S.reactive.push_back(w->h);
+    S.rare = true;
+}
+static void dropAttempts(ConcAssert& c) {   // disabled or killed: expect statements go on
+    for (auto& at : c.att) expectDone(at.wait, 2);
+    for (auto& p : c.matured) expectDone(p.wait, 2);
+    c.att.clear();
+    c.matured.clear();
+}
+// expect (property) action (16.17): an attempt from the next tick of its clock.
+static shared_ptr<ExpectWait> startExpect(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
+    ConcAssert& c = concAsserts()[i.hi];
+    auto w = make_shared<ExpectWait>();
+    w->ctl = ctl;
+    ConcAssert::Caps caps;
+    if (!c.capSig.empty()) {
+        auto v = make_shared<vector<Val>>();
+        for (int s : c.capSig) v->push_back(S.get(R(s)));
+        caps = v;
+    }
+    c.matured.push_back({ctl, ctl->epoch, caps, w});
+    return w;
+}
+// `ticked`: the clocks that ticked (16.13); attempts start at the leading one.
+static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
-        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) { return t.killGen != a.killGen; });
+        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
+            if (t.killGen == a.killGen) return false;
+            expectDone(t.wait, 2);
+            return true;
+        });
     if (c.disable && truth(eval(c.disable, rd)) == 1) {   // disabled: no pass, no fail (16.12)
-        c.att.clear();
+        dropAttempts(c);
         c.pending.clear();
-        c.matured.clear();
-        if (a.on) a.evals++;
+        if (a.on && (ticked & 1)) a.evals++;
         return;
     }
-    if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& caps : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, caps}); a.evals++; }
+    if (!(ticked & 1)) {
+    } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
+        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait}); a.evals++; }
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
@@ -694,7 +755,10 @@ static void concTick(ConcAssert& c) {
         c.att.push_back({c.root, false, 1, a.killGen, nullptr});
         a.evals++;
     }
-    if (c.att.empty()) return;
+    if (c.att.empty()) {
+        for (int f : c.clearFlags) S.set(f, mk(0, 1));
+        return;
+    }
     // The atoms' values; with captured automatic values (16.14.6.1), once per
     // distinct set of them.
     vector<char> val(c.atoms.size());
@@ -709,12 +773,14 @@ static void concTick(ConcAssert& c) {
         for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
     };
     sva::Deriv dv{sva::store(), val};
+    dv.ticking = ticked;
     std::optional<LocalEnv> lenv;
     if (!c.acts.empty()) {   // local variables or subroutine calls in match items
         lenv.emplace(c);
         dv.lh = &*lenv;
     }
     vector<ConcAssert::Attempt> next;
+    bool ended = false;   // a match of an end point tracker
     for (auto& at : c.att) {
         values(at.caps);
         if (lenv) { lenv->start(at.envs); lenv->count = at.count; }
@@ -726,31 +792,41 @@ static void concTick(ConcAssert& c) {
         ConcAssert::Envs envs;
         if (lenv) std::tie(t, envs) = lenv->finish(t);
         if (c.coverSeq) {   // every match counts (16.14.3)
-            if (dv.matches) {
+            if (dv.matches) ended = true;
+            if (dv.matches && !a.hidden) {
                 a.passes += at.count * dv.matches;
                 if (a.passOn) runAction(c.pass, at.count * dv.matches, &c.capSlot, at.caps.get());
             }
             if (t->k == sva::DONE) continue;
         } else if (t->k == sva::PTRUE) {
             a.passes += at.count;
+            expectDone(at.wait, 1);
             if (dv.nonvac ? a.passOn : a.vacOn) runAction(c.pass, at.count, &c.capSlot, at.caps.get());
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
                 (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs)});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait});
     }
     c.att.swap(next);
+    if (ended && c.endSig >= 0) {   // the sequence's end point (16.13.6)
+        Val n = S.get(c.endSig);
+        S.set(c.endSig, mk((n.x ? 0 : n.v) + 1, 32));
+        S.set(c.endSig + 1, mk(S.now + 1, 64));
+        for (int f : c.matchFlags) S.set(f, mk(1, 1));
+    }
+    for (int f : c.clearFlags) S.set(f, mk(0, 1));
 }
 // A procedural concurrent assertion reached by its procedure (16.14.6):
 // queue an instance on this process, with its automatic values now.
@@ -766,6 +842,27 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     if (c.pending.empty()) concPending().push_back(i.hi);
     c.pending.push_back({ctl, ctl->epoch, caps});
     S.rare = true;
+}
+// A multiclock assertion (16.13): one process per clock marks it ticked;
+// the first in a time step runs the assertion in the observed region, once,
+// with every clock that ticked in that step.
+inline Task concClockProc(int k, int ci) {
+    ConcAssert& c = concAsserts()[k];
+    const auto* ev = ci == 0 ? &c.ev : &c.more[ci - 1].first;
+    const E& iff = ci == 0 ? c.clkIff : c.more[ci - 1].second;
+    for (;;) {
+        if (ev->size() > 1) co_await WaitAny{ev};
+        else co_await Wait{(*ev)[0].first, (*ev)[0].second};
+        if (iff && truth(eval(iff, rd)) != 1) continue;
+        c.ticked |= 1u << ci;
+        if (c.due) continue;
+        c.due = true;
+        co_await ToObserved{};
+        uint32_t t = c.ticked;
+        c.ticked = 0;
+        c.due = false;
+        concTick(c, t);
+    }
 }
 inline Task concProc(int k) {
     ConcAssert& c = concAsserts()[k];
@@ -785,12 +882,14 @@ inline Task concDisableProc(int k, shared_ptr<vector<pair<int, Edge>>> ev) {
     for (;;) {
         if (ev->size() > 1) co_await WaitAny{ev.get()};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
-        if (truth(eval(c.disable, rd)) == 1) c.att.clear();
+        if (truth(eval(c.disable, rd)) == 1) dropAttempts(c);
     }
 }
 inline void startConcAsserts() {
     for (size_t k = 0; k < concAsserts().size(); k++) {
-        S.spawn(concProc((int)k));
+        if (concAsserts()[k].more.empty()) S.spawn(concProc((int)k));
+        else
+            for (size_t ci = 0; ci <= concAsserts()[k].more.size(); ci++) S.spawn(concClockProc((int)k, (int)ci));
         if (const E& d = concAsserts()[k].disable) {
             vector<int> sigs;
             collectRefs(d, sigs);
@@ -1092,7 +1191,17 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 ctl->kids.clear();
                 pc++;
                 break;
-            case IK::Assert: pc = runAssert(i, ctl, pc); break;
+            case IK::Assert:
+                if (i.join == 4) {   // expect (16.17): wait for the verdict
+                    auto w = startExpect(i, ctl);
+                    S.rare = true;
+                    co_await ExpectAwait{w.get()};
+                    ctl->epoch++;
+                    pc = w->res == 1 ? pc + 1 : w->res == 0 ? (size_t)i.target : (size_t)i.lo;
+                    break;
+                }
+                pc = runAssert(i, ctl, pc);
+                break;
             case IK::AssertCtl: assertCtl(i); pc++; break;
             case IK::CycleWait: {   // ##n (14.11)
                 Val nv = eval(i.e, rd);

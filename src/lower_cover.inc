@@ -42,6 +42,28 @@ CgItem cgItem(const slang::ast::Expression& x) {
     it.lo = cgBound(x, it.loSgn);
     return it;
 }
+// A bins value or range of a real coverpoint (19.5.1): reals, and
+// tolerance ranges.
+CgItem cgItemReal(const slang::ast::Expression& x) {
+    using namespace slang::ast;
+    CgItem it;
+    if (x.kind == ExpressionKind::ValueRange) {
+        const auto& r = x.as<ValueRangeExpression>();
+        it.range = true;
+        it.tol = r.rangeKind == ValueRangeKind::AbsoluteTolerance ? 1 : r.rangeKind == ValueRangeKind::RelativeTolerance ? 2 : 0;
+        auto bound = [&](const Expression& b, bool& unb) -> E {
+            const Expression* p = &b;
+            while (p->kind == ExpressionKind::Conversion) p = &p->as<ConversionExpression>().operand();
+            if (p->kind == ExpressionKind::UnboundedLiteral) { unb = true; return nullptr; }
+            return realOf(b);
+        };
+        it.lo = bound(r.left(), it.loMin);
+        it.hi = bound(r.right(), it.hiMax);
+        return it;
+    }
+    it.lo = realOf(x);
+    return it;
+}
 static int cgOptId(std::string_view n, bool type) {
     if (type) {
         if (n == "weight") return CO_TYPE_WEIGHT;
@@ -50,7 +72,6 @@ static int cgOptId(std::string_view n, bool type) {
         if (n == "merge_instances") return CO_TYPE_MERGE;
         if (n == "distribute_first") return CO_TYPE_DISTRIBUTE_FIRST;
         if (n == "comment") return CO_TYPE_COMMENT;
-        if (n == "real_interval") unsupported("type_option.real_interval (real coverpoints)");
         return -1;
     }
     if (n == "weight") return CO_WEIGHT;
@@ -65,9 +86,15 @@ static int cgOptId(std::string_view n, bool type) {
     if (n == "comment") return CO_COMMENT;
     return -1;
 }
-void cgOpts(std::span<const slang::ast::CoverageOptionSetter> in, std::vector<CgOptSet>& out) {
+void cgOpts(std::span<const slang::ast::CoverageOptionSetter> in, std::vector<CgOptSet>& out, E* realInterval = nullptr) {
     using namespace slang::ast;
     for (const auto& o : in) {
+        if (o.isTypeOption() && o.getName() == "real_interval") {   // a real (19.7.1)
+            const Expression& e = o.getExpression();
+            const Expression& v = e.kind == ExpressionKind::Assignment ? e.as<AssignmentExpression>().right() : e;
+            if (realInterval) *realInterval = realOf(v);
+            continue;
+        }
         int id = cgOptId(o.getName(), o.isTypeOption());
         if (id < 0) unsupported("this coverage option");
         if (id == CO_NAME || id == CO_COMMENT || id == CO_TYPE_COMMENT) continue;   // strings: reports only
@@ -90,7 +117,8 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             for (size_t k = 0; k < x.targets.size(); k++)
                 if (x.targets[k] == cp) s->cp = (int)k;
             if (s->cp < 0) unsupported("binsof of a coverpoint not in the cross");
-            for (const Expression* e : c.intersects) s->isect.push_back(cgItem(*e));
+            bool real = x.targets[s->cp]->getType().isFloating();
+            for (const Expression* e : c.intersects) s->isect.push_back(real ? cgItemReal(*e) : cgItem(*e));
             return s;
         }
         case BinsSelectExprKind::Unary:
@@ -137,7 +165,7 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         clockOf(*ev, d.ev, d.evIff);
     }
     const auto& body = t.getBody();
-    cgOpts(body.options, d.opts);
+    cgOpts(body.options, d.opts, &d.realInterval);
     std::unordered_map<const CoverpointSymbol*, int> cpIdx;
     for (const auto& m : body.members()) {
         const auto* cp = m.as_if<CoverpointSymbol>();
@@ -146,16 +174,22 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         c.name = std::string(cp->name);
         const Type& ty = cp->getType().getCanonicalType();
         const Expression& ce = cp->getCoverageExpr();
-        if (!ty.isIntegral()) unsupported("a coverpoint that is not integral (real coverpoints, 19.5)");
-        c.w = (int)ty.getBitWidth();
-        if (c.w > 64) unsupported("a coverpoint wider than 64 bits");
-        c.sgn = ty.isSigned();
-        c.expr = resize(expr(ce), c.w, ce.type->isSigned(), c.sgn);
+        if (ty.isFloating()) {   // a real coverpoint (19.5)
+            c.isReal = true;
+            c.w = 64;
+            c.expr = realOf(ce);
+        } else {
+            if (!ty.isIntegral()) unsupported("a coverpoint of this type (19.5)");
+            c.w = (int)ty.getBitWidth();
+            if (c.w > 64) unsupported("a coverpoint wider than 64 bits");
+            c.sgn = ty.isSigned();
+            c.expr = resize(expr(ce), c.w, ce.type->isSigned(), c.sgn);
+        }
         if (const Expression* iff = cp->getIffExpr()) c.iff = expr(*iff);
         const Expression* pe = &ce;   // the coverpoint expression under its conversion to the coverpoint type
         while (pe->kind == ExpressionKind::Conversion) pe = &pe->as<ConversionExpression>().operand();
         const Type& et = ty.isEnum() ? ty : pe->type->getCanonicalType();
-        if (et.isEnum() && (int)et.getBitWidth() == c.w) {
+        if (!c.isReal && et.isEnum() && (int)et.getBitWidth() == c.w) {
             c.isEnum = true;
             for (const auto& ev : et.as<EnumType>().values()) {
                 const auto& cv = ev.getValue();
@@ -164,7 +198,7 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
                 c.enumVals.push_back({std::string(ev.name), v ? (uint64_t)*v : 0});
             }
         }
-        cgOpts(cp->options, c.opts);
+        cgOpts(cp->options, c.opts, &c.realInterval);
         for (const auto& bm : cp->members()) {
             const auto* b = bm.as_if<CoverageBinSymbol>();
             if (!b) continue;
@@ -178,7 +212,12 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             bd.dfltSeq = b->isDefaultSequence;
             if (const Expression* iff = b->getIffExpr()) bd.iff = expr(*iff);
             if (b->getSetCoverageExpr()) unsupported("a bin set expression (19.5.1.2)");
-            for (const Expression* v : b->getValues()) bd.items.push_back(cgItem(*v));
+            for (const Expression* v : b->getValues()) bd.items.push_back(c.isReal ? cgItemReal(*v) : cgItem(*v));
+            if (c.isReal) {   // only value bins (19.5)
+                if (!b->getTransList().empty()) unsupported("a transition bin of a real coverpoint (19.5)");
+                if (b->isWildcard || b->getWithExpr()) unsupported("a wildcard or with bin of a real coverpoint (19.5)");
+                if (b->isDefault && b->isArray) unsupported("an array of default bins of a real coverpoint (19.5)");
+            }
             for (const auto& ts : b->getTransList()) {
                 std::vector<CgStep> seq;
                 for (const auto& r : ts) {
@@ -202,6 +241,8 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             }
             c.bins.push_back(std::move(bd));
         }
+        if (c.isReal && std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0; }))
+            unsupported("a real coverpoint without bins: there are no automatic bins for reals (19.5.3)");
         cpIdx[cp] = (int)d.cps.size();
         d.cps.push_back(std::move(c));
     }
