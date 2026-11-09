@@ -7,5 +7,11 @@ module clean(input logic clk, rst_n, input logic [3:0] a, output logic [3:0] y, 
     else        r <= a;
   end
   always_ff @(posedge clk) q <= r[0];
-  always_comb y = r ^ a;
+  // A block that reads back what it just assigned is not a loop.
+  logic [3:0] sum;
+  always_comb begin
+    sum = 4'd0;
+    sum = sum ^ r;
+    y = sum ^ a;
+  end
 endmodule

@@ -78,6 +78,7 @@ struct Var {
     std::vector<int> items;   // the constraints that read it
     const RandItem* dist = nullptr;   // a `v dist {...}` on it
     Frame* distFr = nullptr;
+    bool ordered = false;     // solved first on purpose (solve-before, a function argument): its values alike
 };
 struct Item {
     const RandItem* it;
@@ -524,6 +525,21 @@ inline std::map<std::pair<int, int>, std::vector<i128>>& randcLeft() {
     return m;
 }
 
+// log2 of how many values u has left. Bounds alone miss holes (`inside`
+// sets, data < addr * 2 with addr in {[a:b], c}), so with few variables a
+// big range is cut into chunks and only the chunks that can hold count.
+inline double volLog2(Var& u) {
+    i128 n = u.hi - u.lo + 1;
+    if (n < 64 || g_ctx->vars.size() > 8 || u.items.empty())
+        return std::log2((double)n);
+    i128 step = n / 16;
+    int ok = 0;
+    for (int j = 0; j < 16; j++) {
+        i128 a = u.lo + step * j, b = j == 15 ? u.hi : a + step - 1;
+        if (feasibleIn(u, a, b)) ok++;
+    }
+    return ok ? std::log2((double)n * ok / 16) : -1e300;
+}
 inline bool pickVar(Var& v) {
     i128 flo = v.lo, fhi = v.hi;   // the range left after propagation
     if (v.randc && v.w <= 16) {
@@ -602,6 +618,43 @@ inline bool pickVar(Var& v) {
             opts.erase(opts.begin() + (long)k);
         }
     }
+    // A variable with few values (a mode bit, an enum): each value weighted
+    // by how many ways the other variables can still be completed, measured
+    // as the product of their ranges after propagation, so the solutions
+    // come out close to uniform (18.5.10: `s -> d == 0` gives s = 1 rarely).
+    if (!v.ordered && fhi - flo < 16 && g_ctx->vars.size() <= 32 && !v.items.empty()) {
+        struct Snap { i128 lo, hi; };
+        std::vector<Snap> snap;
+        for (auto& u : g_ctx->vars) snap.push_back({u.lo, u.hi});
+        auto restore = [&]() {
+            for (size_t k = 0; k < snap.size(); k++) { g_ctx->vars[k].lo = snap[k].lo; g_ctx->vars[k].hi = snap[k].hi; }
+        };
+        std::vector<std::pair<i128, double>> cand;   // value, log2 of its completions
+        double best = -1e300;
+        for (i128 x = flo; x <= fhi; x++) {
+            v.lo = v.hi = x;
+            if (varOk(v) && propagate()) {
+                double lg = 0;
+                for (auto& u : g_ctx->vars)
+                    if (!u.set && &u != &v) lg += volLog2(u);
+                cand.push_back({x, lg});
+                best = std::max(best, lg);
+            }
+            restore();
+        }
+        while (!cand.empty()) {
+            double tot = 0;
+            for (auto& c : cand) tot += std::exp2(c.second - best);
+            double r = (double)(rnd64() >> 11) / 9007199254740992.0 * tot;
+            size_t k = 0;
+            for (; k + 1 < cand.size(); k++) { double w = std::exp2(cand[k].second - best); if (r < w) break; r -= w; }
+            if (search(v, cand[k].first, cand[k].first)) return true;
+            restore();
+            cand.erase(cand.begin() + (long)k);
+        }
+        v.lo = flo; v.hi = fhi;
+        return false;
+    }
     // Cover the range with pieces that can hold a value, splitting the
     // biggest undecided piece a bounded number of times, then pick a piece
     // by its size, so the values come out close to uniform (a piece of size
@@ -627,12 +680,61 @@ inline bool pickVar(Var& v) {
             if (st) ps.push_back({a, b, st});
         }
     }
+    // Each piece also weighted by how many ways the other variables can
+    // still be completed (x < y: a small x leaves y more room), as above.
+    // Big pieces are cut into chunks first, so the weight can vary inside
+    // what would otherwise be one piece (data < addr * 2 with data first).
+    bool weigh = !v.ordered && g_ctx->vars.size() > 1 && g_ctx->vars.size() <= 32;
+    if (weigh && ps.size() < 16) {
+        std::vector<Piece> cut;
+        for (auto& p : ps) {
+            i128 n = p.hi - p.lo + 1;
+            int parts = n >= 64 ? 16 : 1;
+            for (int j = 0; j < parts; j++) {
+                i128 a = p.lo + n / parts * j, b = j == parts - 1 ? p.hi : a + n / parts - 1;
+                cut.push_back({a, b, p.st});
+            }
+        }
+        ps = std::move(cut);
+    }
+    weigh = weigh && ps.size() > 1;
+    std::vector<double> lgs(ps.size(), 0.0);
+    if (weigh) {
+        std::vector<std::pair<i128, i128>> snap;
+        for (auto& u : g_ctx->vars) snap.push_back({u.lo, u.hi});
+        double best = -1e300;
+        for (size_t k = 0; k < ps.size(); k++) {
+            v.lo = ps[k].lo; v.hi = ps[k].hi;
+            double lg = -1e300;
+            if (propagate()) {
+                lg = 0;
+                // v counts too, narrowed: a piece [8000:80ff] may hold one value
+                for (auto& u : g_ctx->vars)
+                    if (!u.set) lg += volLog2(u);
+            }
+            lgs[k] = lg;
+            best = std::max(best, lg);
+            for (size_t j = 0; j < snap.size(); j++) { g_ctx->vars[j].lo = snap[j].first; g_ctx->vars[j].hi = snap[j].second; }
+        }
+        for (auto& l : lgs) l -= best;
+    }
     while (!ps.empty()) {
-        i128 tot = 0;
-        for (auto& p : ps) tot += p.hi - p.lo + 1;
-        i128 r = below(tot);
         size_t k = 0;
-        for (; k + 1 < ps.size(); k++) { if (r < ps[k].hi - ps[k].lo + 1) break; r -= ps[k].hi - ps[k].lo + 1; }
+        if (weigh) {
+            double tot = 0;
+            for (size_t j = 0; j < ps.size(); j++) tot += std::exp2(lgs[j]);
+            double r = (double)(rnd64() >> 11) / 9007199254740992.0 * tot;
+            for (; k + 1 < ps.size(); k++) {
+                double w = std::exp2(lgs[k]);
+                if (r < w) break;
+                r -= w;
+            }
+        } else {
+            i128 tot = 0;
+            for (auto& p : ps) tot += p.hi - p.lo + 1;
+            i128 r = below(tot);
+            for (; k + 1 < ps.size(); k++) { if (r < ps[k].hi - ps[k].lo + 1) break; r -= ps[k].hi - ps[k].lo + 1; }
+        }
         if (ps[k].st == 2) {   // every value works: take one directly
             v.set = true;
             v.val = ps[k].lo + below(ps[k].hi - ps[k].lo + 1);
@@ -640,6 +742,7 @@ inline bool pickVar(Var& v) {
         }
         if (search(v, ps[k].lo, ps[k].hi)) return true;
         ps.erase(ps.begin() + (long)k);
+        lgs.erase(lgs.begin() + (long)k);
     }
     v.lo = flo; v.hi = fhi;
     return false;
@@ -1049,6 +1152,8 @@ static int doRandomize(int obj, const RandCall* rc) {
         // Function arguments before the other variables of their constraint (18.5.12).
         for (auto& it : ctx.items)
             for (int v : it.fnVars) rank[(size_t)v] = std::min(rank[(size_t)v], 0);
+        for (size_t k = 0; k < ctx.vars.size(); k++)
+            if (rank[k] == 0) ctx.vars[k].ordered = true;
         if (pass == 1)   // sizes before everything else (18.4)
             for (int ci : sizeVars) rank[(size_t)ctx.idx.at(conts[(size_t)ci].sizeFr->base)] = -1;
         for (int r = -1; r <= 2; r++)

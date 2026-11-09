@@ -77,7 +77,7 @@ public:
         for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); }
         std::ostringstream body;
         std::vector<int> byRank;
-        std::vector<int> dom = cycle ? cycleDomain(procs) : std::vector<int>{};
+        std::vector<int> dom = cycle && !cov ? cycleDomain(procs) : std::vector<int>{};
         {
             // The domain re-evaluates every static combinational statement on
             // each commit (and whenever any input changes). That pays when the
@@ -196,6 +196,7 @@ public:
         for (size_t i = 0; i < evals_.size(); i++) o << "static E T" << i << ";\n";
         for (size_t i = 0; i < mems_.size(); i++) o << "static Instr MI" << i << ";\n";
         for (size_t i = 0; i < events_.size(); i++) o << "static std::vector<std::pair<int, Edge>> EV" << i << ";\n";
+        if (cov) o << "uint64_t CV[" << std::max<size_t>(2, 2 * covSlots.size()) << "];\n";
         o << "static std::atomic<bool> pclean{false};   // every private signal is known (no X or Z bit)\n";
         // Private signals start as their S.sigs counterparts do: a variable X, a net Z.
         for (size_t s = 0; s < priv_.size(); s++)
@@ -205,8 +206,25 @@ public:
             }
         o << "\n" << body.str();
 
+        if (cov)
+            o << "// Counters, then per signal its toggle masks (Sim::togRise / togFall), for msim.\n"
+                 "static bool writeCov(const char* path) {\n"
+                 "    FILE* f = std::fopen(path, \"wb\");\n"
+                 "    if (!f) return false;\n"
+                 "    uint64_t n = sizeof CV / sizeof CV[0], ns = S.sigs.size();\n"
+                 "    std::fwrite(&n, 8, 1, f); std::fwrite(CV, 8, n, f); std::fwrite(&ns, 8, 1, f);\n"
+                 "    for (size_t s = 0; s < ns; s++) {\n"
+                 "        static const std::vector<uint64_t> none;\n"
+                 "        const auto& R = s < S.togRise.size() ? S.togRise[s] : none;\n"
+                 "        const auto& F = s < S.togFall.size() ? S.togFall[s] : none;\n"
+                 "        uint64_t k = R.size();\n"
+                 "        std::fwrite(&k, 8, 1, f); std::fwrite(R.data(), 8, k, f); std::fwrite(F.data(), 8, k, f);\n"
+                 "    }\n"
+                 "    return std::fclose(f) == 0;\n"
+                 "}\n\n";
         o << "int main(int argc, char** argv) {\n"
              "    uint64_t maxTime = ~0ULL;\n"
+             "    const char* covOut = nullptr;\n"
              "    S.vcdPath = \"\";\n"
              "    S.threads = defaultThreads();\n"
              "    for (int i = 1; i < argc; i++) {\n"
@@ -219,6 +237,12 @@ public:
              "        }\n"
              "        else if (!std::strcmp(argv[i], \"-no-pin\")) g_pin = 0;\n"
              "        else if (!std::strcmp(argv[i], \"-pin\")) g_pin = 1;\n"
+             "        else if (!std::strcmp(argv[i], \"-cov\") && i + 1 < argc) { g_cov = true; covOut = argv[++i]; }\n"
+             "        else if (!std::strcmp(argv[i], \"-seed\") && i + 1 < argc) {   // as msim -seed\n"
+             "            uint64_t st = (std::strtoull(argv[++i], nullptr, 10) + 1) * 0x9E3779B97F4A7C15ull;\n"
+             "            urandomState() = st ? st : 1;\n"
+             "        }\n"
+             "        else if (argv[i][0] == '+') plusArgs().push_back(argv[i] + 1);\n"
              "    }\n"
              "    S.threads = std::min(S.threads, maxThreads());\n";
         for (size_t s = 0; s < sigs.size(); s++) {
@@ -286,8 +310,9 @@ public:
             o << "}, " << list(parts.targets) << ");\n";
         }
         o << "    S.run(maxTime);\n"
-             "    std::cout.flush();\n"
-             "    return 0;\n"
+             "    std::cout.flush();\n";
+        if (cov) o << "    if (covOut && !writeCov(covOut)) { std::cerr << \"simv: cannot write \" << covOut << \"\\n\"; return 1; }\n";
+        o << "    return 0;\n"
              "}\n";
         return o.str();
     }
@@ -296,6 +321,27 @@ public:
     bool twoState = true;  // emit the 2-state fast path (see fast())
     bool cycle = true;     // emit the cycle domain (see cycleDomain())
     bool privates = true;  // ...with its private signals in static variables (no VCD planned)
+    // msim -compile -cov: count executions in CV[2k] and taken jumps in
+    // CV[2k+1] for instruction covSlots[k], as exec.inc's covHit does. simv
+    // writes the counters and toggle masks to its -cov file and msim turns
+    // them into the coverage database. The cycle domain is off with it.
+    bool cov = false;
+    std::vector<std::pair<const Prog*, size_t>> covSlots;
+    std::map<std::pair<const Prog*, size_t>, size_t> covIdx_;
+    size_t covSlot(const Prog* p, size_t pc) {
+        auto [it, fresh] = covIdx_.try_emplace({p, pc}, covSlots.size());
+        if (fresh) covSlots.push_back({p, pc});
+        return it->second;
+    }
+    std::string CH(const Prog* p, size_t pc) {   // instruction pc of p runs
+        return cov ? " ++CV[" + std::to_string(2 * covSlot(p, pc)) + "];" : std::string();
+    }
+    std::string CT(const Prog* p, size_t pc) {   // ...and its JmpIfNot jumps
+        return cov ? " ++CV[" + std::to_string(2 * covSlot(p, pc) + 1) + "];" : std::string();
+    }
+    std::string jumpTo(const Prog* p, size_t pc, const std::string& label) {
+        return cov ? "{" + CT(p, pc) + " goto " + label + "; }" : "goto " + label + ";";
+    }
 
 private:
     std::vector<int> sigW_;
@@ -933,7 +979,7 @@ private:
         // Only when something watches every change (a VCD opened at run time).
         o << "static void syncP() {\n";
         for (int s : privs)
-            o << "    S.set(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
+            o << "    S.fw(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
         o << "}\n";
         // Comb statements first: their reads are part of `ext`, which twoNow checks.
         std::vector<std::string> combStmts, combStmts2, commitStmts;
@@ -1137,17 +1183,17 @@ private:
         size_t end = p.code.size() - 1;
         auto L = [](size_t pc) { return "s_" + std::to_string(pc); };
         o << "// process " << n << " (" << kind << ", clocked)\n";
-        o << "static void seq" << n << "(const void*, std::vector<Sim::NbaItem>& nb) {\n";
+        o << "static void seq" << n << "(const void*, std::vector<Sim::NbaItem>& nb) {" << CH(&p, 0) << "\n";
         for (size_t pc = 1; pc < end; pc++) {
             const Instr& i = p.code[pc];
-            o << L(pc) << ":";
+            o << L(pc) << ":" << CH(&p, pc);
             switch (i.k) {
                 case IK::Nba:
                     if (i.drv >= 0 || i.dyn >= 0 || i.nbaLater) throw CodegenUnsupported("NBA kind in a clocked process");
                     if (i.arr || i.bidx) o << dynTarget(i, fast(i.e), " nb.push_back({s, v, hi, lo});");
                     else o << " nb.push_back({" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
                     break;
-                case IK::JmpIfNot: o << " if (truth(" << fast(i.e) << ") != 1) goto " << L(i.target) << ";\n"; break;
+                case IK::JmpIfNot: o << " if (truth(" << fast(i.e) << ") != 1) " << jumpTo(&p, pc, L(i.target)) << "\n"; break;
                 case IK::Jmp: o << " goto " << L(i.target) << ";\n"; break;
                 default: throw CodegenUnsupported("instruction in a clocked process");
             }
@@ -1159,14 +1205,15 @@ private:
     void emitComb(std::ostream& o, int n, const Prog& p, const std::string& kind) {
         o << "// process " << n << " (" << kind << ", combinational)\n";
         o << "static void comb" << n << "(const void*) {\n";
-        for (const Instr& i : p.code) {
+        for (size_t pc = 0; pc < p.code.size(); pc++) {
+            const Instr& i = p.code[pc];
             if (i.k != IK::Assign) break;
             if (i.arr || i.bidx) throw CodegenUnsupported("variable-index write in a static combinational process");
-            o << "   " << assign(i);
+            o << "  " << CH(&p, pc) << " " << assign(i);
         }
         o << "}\n";
         if (oneAssign(p)) {
-            o << "static Val combv" << n << "(const void*) { return " << fast(p.code[0].e) << "; }\n";
+            o << "static Val combv" << n << "(const void*) {" << CH(&p, 0) << " return " << fast(p.code[0].e) << "; }\n";
             o << "static void combc" << n << "(const void*, Val v) {" << assign(p.code[0], "v") << "}\n";
         }
         o << "\n";
@@ -1216,7 +1263,7 @@ private:
             if (pi) o << "    // subroutine body\n";
             for (size_t pc = 0; pc < p.code.size(); pc++) {
                 const Instr& i = p.code[pc];
-                o << L(P, pc) << ":";
+                o << L(P, pc) << ":" << CH(&p, pc);
                 auto tgt = [&](size_t t) { return L(P, t > p.code.size() ? p.code.size() : t); };
                 // A write chosen at run time (a[i] = ..., v[i] = ...): Assign and Nba only.
                 bool dynW = (i.k == IK::Assign || i.k == IK::Nba) && (i.arr || i.bidx);
@@ -1253,7 +1300,7 @@ private:
                         o << " S.nba(" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
                         break;
                     case IK::JmpIfNot:
-                        o << " if (truth(" << fast(i.e) << ") != 1) goto " << tgt(i.target) << ";\n";
+                        o << " if (truth(" << fast(i.e) << ") != 1) " << jumpTo(&p, pc, tgt(i.target)) << "\n";
                         break;
                     case IK::Jmp: o << " goto " << tgt(i.target) << ";\n"; break;
                     case IK::WaitEdge:
@@ -1312,10 +1359,14 @@ private:
 
 inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                            const CodegenParts& parts = {}, bool twoState = true, bool cycle = true,
-                           bool privates = true) {
+                           bool privates = true,
+                           std::vector<std::pair<const Prog*, size_t>>* covSlots = nullptr) {
     Codegen g;
     g.twoState = twoState;
     g.cycle = cycle;
     g.privates = privates;
-    return g.run(sigs, procs, parts);
+    g.cov = covSlots != nullptr;
+    std::string src = g.run(sigs, procs, parts);
+    if (covSlots) *covSlots = std::move(g.covSlots);
+    return src;
 }

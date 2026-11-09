@@ -1,0 +1,7 @@
+{
+  "tracker": "github",
+  "project": "yourorg/yourrepo",
+  "labels": ["nightly"],
+  "attach": true,
+  "max_issues": 20
+}
