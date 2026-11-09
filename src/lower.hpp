@@ -420,6 +420,7 @@ struct LowerResult {
     LayoutList layouts;   // frame shapes of automatic subroutines and fork branches
     std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
     std::vector<std::pair<int, uint8_t>> netKinds;                   // wand, wor, tri0, ... (6.6): signal, NetResolve
+    std::vector<std::unique_ptr<UdpTable>> udps;   // tables of the user-defined primitives (29)
     struct TranDecl { int a, b; bool resist; };
     std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive
     int precExp = -9;                 // one kernel tick = 10^precExp s
@@ -6629,6 +6630,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         std::string_view name = g.primitiveType.name;
         auto ports = g.getPortConnections();
         auto [ds0, ds1] = g.getDriveStrength();
+        if (g.primitiveType.primitiveKind == PrimitiveSymbol::UserDefined) {
+            lowerUdp(g, ports, ds0 ? strengthOf(*ds0) : STR_STRONG, ds1 ? strengthOf(*ds1) : STR_STRONG);
+            return;
+        }
         uint8_t fb0 = STR_STRONG, fb1 = STR_STRONG;
         bool pull = name == "pullup" || name == "pulldown";
         if (name == "pullup") { fb0 = STR_HIZ; fb1 = STR_PULL; }
@@ -6730,6 +6735,68 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         drive(bit(*ports[2]), true, false, true);    // cmos: the n control
         drive(bit(*ports[3]), false, false, true);   // and the p control
+    }
+
+    // A user-defined primitive instance (29). One process evaluates the table
+    // whenever an input changes and keeps the UDP's state in a signal of its
+    // own; a driver (with the instance's strength and delay) copies the state
+    // to the output net.
+    template <class Ports>
+    void lowerUdp(const slang::ast::PrimitiveInstanceSymbol& g, const Ports& ports, uint8_t s0, uint8_t s1) {
+        using namespace slang::ast;
+        const PrimitiveSymbol& p = g.primitiveType;
+        auto tab = std::make_unique<UdpTable>();
+        tab->nin = (int)p.ports.size() - 1;
+        tab->seq = p.isSequential;
+        for (const auto& e : p.table) {
+            UdpRow r;
+            r.state = e.state;
+            r.out = e.output;
+            for (size_t k = 0; k < e.inputs.size(); k++) {
+                char c = e.inputs[k];
+                if (c == '(') {
+                    if (k + 3 >= e.inputs.size()) Lowerer::unsupported("UDP table edge");
+                    r.in.push_back(std::string(e.inputs.substr(k, 4)));
+                    k += 3;
+                } else r.in.push_back(std::string(1, c));
+                const std::string& f = r.in.back();
+                if (f[0] == '(' || f == "r" || f == "f" || f == "p" || f == "n" || f == "*") {
+                    r.edge = (int)r.in.size() - 1;
+                    tab->edges = true;
+                }
+            }
+            if ((int)r.in.size() != tab->nin) Lowerer::unsupported("UDP table row");
+            tab->rows.push_back(std::move(r));
+        }
+        if (ports.size() != p.ports.size()) Lowerer::unsupported("UDP instance ports");
+        for (auto* x : ports) if (!x) Lowerer::unsupported("UDP instance ports");
+        Lowerer lw(sigmap);
+        prep(lw);
+        int state = lw.fresh(1), last = lw.fresh(2 * tab->nin);
+        Instr init; init.k = IK::Assign; init.sig = state;
+        int iv = 2;   // x unless the UDP has an initial statement (29.7)
+        if (p.initVal && p.initVal->isInteger()) {
+            const auto& ci = p.initVal->integer();
+            iv = ci.hasUnknown() ? 2 : (int)(ci.as<uint64_t>().value_or(0) & 1);
+        }
+        init.e = konst(iv == 2 ? allx(1) : make((uint64_t)iv, 0, 1));
+        lw.prog.emit(init);
+        Instr li; li.k = IK::Assign; li.sig = last; li.e = konst(allx(2 * tab->nin));   // inputs start at x
+        lw.prog.emit(li);
+        size_t top = lw.prog.here();
+        Instr u; u.k = IK::Udp; u.udp = tab.get(); u.sig = state; u.dres = last;
+        for (int k = 0; k < tab->nin; k++) u.args.push_back(resize(lw.expr(*ports[(size_t)k + 1]), 1, false, false));
+        lw.prog.emit(u);
+        auto rs = readSet(lw.prog);
+        rs.erase(std::remove_if(rs.begin(), rs.end(), [&](const std::pair<int, Edge>& r) { return r.first == state || r.first == last; }), rs.end());
+        bool loops = !rs.empty();
+        if (loops) {
+            lw.prog.emit(waitInstr(rs));
+            Instr j; j.k = IK::Jmp; j.target = top; lw.prog.emit(j);
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "udp"});
+        out.udps.push_back(std::move(tab));
+        driveOut(*ports[0], ref(state), s0, s1);
     }
 
     // tran, rtran, tranif0/1, rtranif0/1 (28.8): the two terminals become one

@@ -49,6 +49,7 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    Udp,        // a user-defined primitive (29): udp's table, inputs in args, state `sig`, last inputs `dres`
     Tran,       // bidirectional switch `sig` (28.8): its control is e (null: always on), active low if pdown
     New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
     Randomize,  // sig = randomize the object e (null e: std::randomize), with rc (18.6, 18.12)
@@ -72,6 +73,12 @@ enum class IK {
 };
 
 struct Prog;
+
+// A user-defined primitive's table (29.3.4). Each row has one field per
+// input: a level ('0' '1' 'x' '?' 'b'), an edge symbol ('r' 'f' 'p' 'n' '*'),
+// or an edge pair "(01)". `edge` is the input with the edge, or -1.
+struct UdpRow { std::vector<std::string> in; char state = 0, out = 'x'; int edge = -1; };
+struct UdpTable { int nin = 0; bool seq = false; bool edges = false; std::vector<UdpRow> rows; };
 
 // Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
 // is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
@@ -131,6 +138,7 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    const UdpTable* udp = nullptr;   // Udp
     // Frames (expr.hpp). Call: when `lay` is set the callee is automatic and
     // runs in a new frame of that shape; `init` gives each argument slot its
     // value, evaluated in the caller before the switch. Fork: `blays` is the

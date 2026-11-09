@@ -11,6 +11,7 @@ Spec references are IEEE 1800-2023 clauses.
 - Gate-level switches (28): `bufif0/1`, `notif0/1` with L/H strength
   resolution, `nmos`/`pmos`/`cmos` and their resistive forms, and the
   bidirectional `tran`/`rtran`/`tranif0/1`/`rtranif0/1`.
+- User-defined primitives (29): combinational, level- and edge-sensitive.
 - Virtual interfaces (25.9): variables, properties and arguments of
   `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
   clocking blocks reached through them.
