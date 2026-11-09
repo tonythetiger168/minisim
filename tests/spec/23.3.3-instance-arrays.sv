@@ -1,6 +1,5 @@
 // IEEE 1800-2023 23.3.3: An array of instances: each gets its slice of the
 // port connections (23.3.3).
-//! xfail: instance arrays are errors
 module inv(input logic a, output logic y);
   assign y = ~a;
 endmodule

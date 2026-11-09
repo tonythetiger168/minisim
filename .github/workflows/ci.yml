@@ -50,4 +50,4 @@ jobs:
 
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang
-        run: CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON && cmake --build build -j2 && ctest --test-dir build --output-on-failure
+        run: sudo apt-get install -y libffi-dev && CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON && cmake --build build -j2 && ctest --test-dir build --output-on-failure

@@ -165,7 +165,37 @@ static void udpExec(const Instr& i) {
     S.set(i.sig, q == 2 ? allx(1) : make((uint64_t)q, 0, 1));
 }
 
+// $fread into a memory (21.3.4.4): args are fd, start, count (either may be
+// unset). Elements load from start toward the highest address; dres gets
+// the number of bytes read.
+static void freadMem(const Instr& i) {
+    const ArrShape& a = *i.arr;
+    auto [l, r] = a.dims[0];
+    int64_t lowA = std::min(l, r), highA = std::max(l, r);
+    FILE* f = fdFile((uint32_t)v_to_i64(eval(i.args[0], rd)));
+    int64_t start = lowA, count = highA - lowA + 1;
+    if (i.args[1]) { Val v = eval(i.args[1], rd); if (!v.x) start = v_to_i64(v); }
+    if (i.args[2]) { Val v = eval(i.args[2], rd); if (!v.x) count = v_to_i64(v); }
+    int64_t total = 0;
+    std::string buf;
+    for (int64_t ad = start; f && ad <= highA && count > 0; ad++, count--) {
+        int64_t off = a.offset({ad});
+        if (off < 0) break;
+        int sig = a.base + (int)off, w = S.sigs[sig].w;
+        size_t n = (size_t)(w + 7) / 8;
+        buf.assign(n, '\0');
+        size_t got = fread(buf.data(), 1, n, f);
+        total += (int64_t)got;
+        if (!got) break;
+        buf.resize(got);
+        S.set(sig, bytesValue(buf, n, w));
+        if (got < n) break;
+    }
+    S.set(i.dres, make((uint64_t)total, 0, 32, 0, true));
+}
+
 static void readMem(const Instr& i) {
+    if (i.pw == 1) { freadMem(i); return; }
     const ArrShape& a = *i.arr;
     auto [l, r] = a.dims[0];
     int64_t lowA = std::min(l, r), highA = std::max(l, r);
@@ -270,6 +300,13 @@ inline void dynExec(const Instr& i) {
     auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
+    // A new element: e's value; for a container of containers a copy of
+    // container dsrc, or an empty one.
+    auto elemVal = [&]() -> Val {
+        if (!d.elem) return eval(i.e, rd);
+        if (dsrc >= 0) { DynObj one; one.elem = d.elem; return dynCopyElem(one, make((uint64_t)dsrc, 0, 64)); }
+        return dynNewElem(d);
+    };
     auto full = [&]() {   // a bounded queue drops what does not fit (7.10)
         bool f = d.kind == 1 && d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1;
         if (f) dynWarn("write past the bound of a bounded queue is ignored");
@@ -289,10 +326,10 @@ inline void dynExec(const Instr& i) {
             int64_t n = idx(0);
             if (n < 0) { dynWarn("new[] with a negative or unknown size"); n = 0; }
             std::vector<Val> nv((size_t)n, d.dflt);
-            if (dsrc >= 0) {
-                auto src = dynStore()[dsrc].vec;
-                for (size_t k = 0; k < nv.size() && k < src.size(); k++) nv[k] = src[k];
-            }
+            DynObj src;
+            if (dsrc >= 0) src = dynStore()[dsrc];
+            for (size_t k = 0; k < nv.size(); k++)
+                nv[k] = k < src.vec.size() ? dynCopyElem(src, src.vec[k]) : dynNewElem(d);
             d.vec = std::move(nv);
             break;
         }
@@ -304,12 +341,12 @@ inline void dynExec(const Instr& i) {
             d.vec.erase(d.vec.begin() + k);
             break;
         }
-        case D_PUSH_BACK: d.vec.push_back(eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
-        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_BACK: d.vec.push_back(elemVal()); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), elemVal()); if (full()) d.vec.pop_back(); break;
         case D_INSERT: {
             int64_t k = idx(0);
             if (k < 0 || k > (int64_t)d.vec.size()) { dynWarn("insert(i) outside the queue"); return; }
-            d.vec.insert(d.vec.begin() + k, eval(i.e, rd));
+            d.vec.insert(d.vec.begin() + k, elemVal());
             if (full()) d.vec.pop_back();
             break;
         }
@@ -335,20 +372,19 @@ inline void dynExec(const Instr& i) {
             return;   // the container did not change
         }
         case D_COPY: {
-            auto& s = dynStore()[dsrc];
-            if (d.kind == 2) d.map = s.map;
-            else { d.vec = s.kind == 2 ? std::vector<Val>{} : s.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+            dynAssign(d, dynStore()[dsrc]);
             break;
         }
         case D_APPEND: {   // {q, r}: every element of r
-            auto s = dynStore()[dsrc].vec;
-            d.vec.insert(d.vec.end(), s.begin(), s.end());
+            DynObj s = dynStore()[dsrc];
+            for (const Val& e : s.vec) d.vec.push_back(dynCopyElem(s, e));
             break;
         }
         case D_APPEND_SLICE: {   // q[a:b] (7.10.1): out-of-range parts are left out
-            auto s = dynStore()[dsrc].vec;
+            DynObj so = dynStore()[dsrc];
+            const auto& s = so.vec;
             int64_t a = std::max<int64_t>(idx(0), 0), b = std::min<int64_t>(idx(1), (int64_t)s.size() - 1);
-            for (int64_t k = a; k <= b; k++) d.vec.push_back(s[(size_t)k]);
+            for (int64_t k = a; k <= b; k++) d.vec.push_back(dynCopyElem(so, s[(size_t)k]));
             break;
         }
         case D_REVERSE: std::reverse(d.vec.begin(), d.vec.end()); break;
@@ -454,6 +490,20 @@ struct JoinWait {
     void await_resume() const {}
 };
 
+struct ProcCtl;
+// DPI-C imports (35) are run by dpi.inc, which msim links in. A call that
+// returns a JoinState is an import task waiting on an exported task that
+// consumes time: the process waits for it, then calls resume. kill runs a
+// waiting import task's C code to its end after the process is disabled (35.9).
+struct DpiHook {
+    shared_ptr<JoinState> (*call)(const Instr&, void*& fiber, const shared_ptr<ProcCtl>& ctl) = nullptr;
+    shared_ptr<JoinState> (*resume)(void* fiber) = nullptr;
+    void (*kill)(void* fiber) = nullptr;
+};
+inline DpiHook& dpiHook() { static DpiHook h; return h; }
+// VPI (36-38), set by vpi.inc: run the calltf of a user system task or function.
+inline void (*&vpiCallHook())(const Instr&) { static void (*h)(const Instr&) = nullptr; return h; }
+
 // One running process: its children (for wait fork / disable fork) and the
 // fork it belongs to. A disabled process ends at once for everyone waiting
 // on it; its coroutine, if it is resumed later, just returns.
@@ -468,6 +518,7 @@ struct ProcCtl {
     weak_ptr<ProcCtl> parent;
     vector<shared_ptr<ProcCtl>> kids;
     shared_ptr<JoinState> join;
+    void* dpiFiber = nullptr;   // an import task waiting on an exported task (dpi.inc)
     // Deferred assertions (16.4.2): a resume after an event control is a
     // flush point; it bumps `epoch`, and reports queued before it are dropped.
     uint64_t epoch = 0;
@@ -496,6 +547,11 @@ inline void procKill(const shared_ptr<ProcCtl>& c) {
     if (c->ended) return;
     c->killed = true;
     for (auto& k : c->kids) procKill(k);
+    if (c->dpiFiber && dpiHook().kill) {
+        void* f = c->dpiFiber;
+        c->dpiFiber = nullptr;
+        dpiHook().kill(f);
+    }
     S.dead.insert(c->h.address());
     procEnd(*c);
 }
@@ -1065,6 +1121,25 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 if (i.dyn >= 0) {   // q[i] = v, aa[key] = v
                     Instr set = i;
                     set.k = IK::Dyn; set.sig = i.dyn; set.dcmd = D_SET;
+                    if (i.hi >= 0 || i.bidx) {   // q[i].f = v, q[i][3:0] = v: the element with those bits changed
+                        Val old = dynStore()[R(i.dyn)].get(eval(i.args[0], rd));
+                        int hi = i.hi, lo = i.lo;
+                        if (i.bidx) {
+                            Val bv = eval(i.bidx, rd);
+                            if (bv.x) { pc++; break; }
+                            int64_t b = v_to_i64(bv) - i.lo;
+                            int64_t l = i.pw ? (i.pdown ? b - i.pw + 1 : b) : b, h = i.pw ? l + i.pw - 1 : b;
+                            int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, old.w - 1);
+                            if (cl > ch) { pc++; break; }
+                            v = v_slice(v, (int)(ch - l), (int)(cl - l));
+                            hi = (int)ch;
+                            lo = (int)cl;
+                        }
+                        if (hi >= old.w) { pc++; break; }
+                        Val nv = v_insert(old, v, hi, lo);
+                        nv.sgn = old.sgn;
+                        set.e = konst(nv);
+                    }
                     dynExec(set);
                     pc++; break;
                 }
@@ -1102,6 +1177,38 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 }
                 S.tranCtl(i.sig, st);
                 pc++; break;
+            }
+            case IK::Dump: {
+                Val a = i.args.empty() ? Val{} : eval(i.args[0], rd);
+                std::string str;
+                int64_t num = -1;
+                if (!i.args.empty()) {
+                    if (i.dcmd == DC_FILE) { a.str = true; str = v_str(a); }
+                    else if (!a.x) num = v_to_i64(a);
+                }
+                S.dumpTask(i.dcmd, str, num, i.dsel);
+                pc++; break;
+            }
+            case IK::Vpi:
+                if (!vpiCallHook()) { std::cerr << "msim: VPI call without VPI support\n"; S.finished = true; goto done; }
+                vpiCallHook()(i);
+                if (S.finished) goto done;
+                pc++;
+                break;
+            case IK::Dpi: {
+                if (!dpiHook().call) { std::cerr << "msim: DPI call without DPI support\n"; S.finished = true; goto done; }
+                void* fib = nullptr;
+                auto js = dpiHook().call(i, fib, ctl);
+                while (js) {
+                    ctl->dpiFiber = fib;
+                    co_await JoinWait{js};
+                    if (ctl->killed) goto done;   // kill already ran the C code to its end (35.9)
+                    ctl->dpiFiber = nullptr;
+                    js = dpiHook().resume(fib);
+                }
+                if (S.finished) goto done;
+                pc++;
+                break;
             }
             case IK::New: newObject(i); pc++; break;
             case IK::Randomize: {   // 18.6, 18.12
@@ -1183,14 +1290,24 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++;
                 break;
             case IK::Strobe:
-                if (fr) { vector<E> a; for (auto& x : i.args) a.push_back(bindRel(x)); S.strobe(i.fmt, a); }
-                else S.strobe(i.fmt, i.args);
+                {
+                    vector<E> a;
+                    if (fr) for (auto& x : i.args) a.push_back(bindRel(x));
+                    const vector<E>& use = fr ? a : i.args;
+                    if (i.fd) S.strobeF((uint32_t)v_to_i64(eval(i.fd, rd)), i.fmt, use);
+                    else S.strobe(i.fmt, use);
+                }
                 if (S.finished) goto done;
                 pc++;
                 break;
             case IK::Monitor:
-                if (fr) { vector<E> a; for (auto& x : i.args) a.push_back(bindRel(x)); S.armMon(i.fmt, a); }
-                else S.armMon(i.fmt, i.args);
+                {
+                    vector<E> a;
+                    if (fr) for (auto& x : i.args) a.push_back(bindRel(x));
+                    const vector<E>& use = fr ? a : i.args;
+                    if (i.fd) S.armFMon((uint32_t)v_to_i64(eval(i.fd, rd)), i.fmt, use);
+                    else S.armMon(i.fmt, use);
+                }
                 if (S.finished) goto done;
                 pc++;
                 break;
@@ -1240,10 +1357,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         S.set(nf->base + off, v);
                     }
                     for (auto [off, src] : i.dinit) {   // container arguments (7.7)
-                        auto& d = dynStore()[nf->base + off];
-                        const auto& sv = dynStore()[R(src)];
-                        if (d.kind == 2) d.map = sv.map;
-                        else { d.vec = sv.kind == 2 ? std::vector<Val>{} : sv.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+                        dynAssign(dynStore()[nf->base + off], dynStore()[R(src)]);
                     }
                     rets.push_back({p, pc + 1, fr});
                     fr = std::move(nf);
