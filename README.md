@@ -225,6 +225,18 @@ On a 4-core VM, run seconds, 1 thread (bench/run.sh):
 | counter | 0.16 | 0.08 | 0.28 |
 | wide | 1.2 (4 threads) | 0.18 | 0.10 |
 
+When every signal the domain writes is private, the domain is split into
+islands: processes and continuous assignments that share no signal it writes.
+With at least 32 islands, groups of them run on separate threads, each
+computing its NBAs, writing them and re-evaluating its own combinational logic
+with no locks. When nothing else can run before the NBA region (no `#0` and no
+other combinational process pending), that is one parallel pass per clock edge.
+
+| wide (run seconds) | 1 thread | 2 threads | 4 threads |
+|---|---|---|---|
+| msim -compile | 0.13 | 0.07 | 0.08 |
+| Verilator -O3 `--threads N` | 0.10 | 0.14 | slower |
+
 ### 2-state fast path (`-compile`)
 
 Most of the time no signal holds X or Z. For each expression, `-compile`
