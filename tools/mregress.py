@@ -31,6 +31,12 @@ directory with ``cmd.sh`` and ``sim.log``. Results go to ``results.json``,
 ``junit.xml`` and ``report.html`` in the output directory, and failures are
 grouped by their first error line. Exit status: 0 all passed, 1 some failed,
 2 bad usage.
+
+Speed: ``-j`` defaults to every logical CPU (hyper-threads included) and each
+msim run gets ``-threads`` = physical cores / runs, so parallel runs do not
+oversubscribe the machine. Runs start longest first, by the times in the
+last results.json. ``-compile`` runs every test with msim -compile in its own
+build directory under <o>/build, so the seeds of a test share one C++ build.
 """
 
 import argparse

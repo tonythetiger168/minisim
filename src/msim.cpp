@@ -18,6 +18,9 @@
 //   -compile         compiled mode: generate C++ for the design (codegen.hpp),
 //                    build it with a C++ compiler into <dir>/simv, and run it.
 //                    A design codegen cannot translate runs on the interpreter.
+//                    With -cov the generated code counts hits too. An
+//                    unchanged design reuses the simv already in <dir>; seeds
+//                    and plusargs are passed to it at run time.
 //   -o <dir>         build directory for -compile (default msim.d)
 //   -no-static-comb  run continuous assigns and always_comb as ordinary
 //                    event-driven processes instead of one levelized schedule
@@ -416,7 +419,8 @@ static void usage() {
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
                  "  -maxtime <n>   stop after simulation time n\n"
-                 "  -compile       generate C++, build it (<dir>/simv) and run it\n"
+                 "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
+                 "                 and reuses <dir>/simv while the design is unchanged\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
                  "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
