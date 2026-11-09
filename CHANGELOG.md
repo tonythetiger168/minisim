@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Gate-level switches (28): `bufif0/1`, `notif0/1` with L/H strength
+  resolution, `nmos`/`pmos`/`cmos` and their resistive forms, and the
+  bidirectional `tran`/`rtran`/`tranif0/1`/`rtranif0/1`.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,

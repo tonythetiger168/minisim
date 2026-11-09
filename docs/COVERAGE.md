@@ -105,7 +105,10 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 25.5 | Modports | 🟡 | input/output/inout lists and `import` of interface functions. Not yet: modport expressions (25.5.4), `export`. Directions are not enforced. `25.5-modports` |
 | 26 | Packages | ✅ | parameters, localparams, typedefs, enums, structs, variables (named `pkg::x` in the VCD), functions and tasks; wildcard and explicit import, `pkg::name`. `26.3-package-import`, `26.2-package-items` |
 | 27 | Generate | ✅ | loop, if, and case generate; named and unnamed blocks (`genblkN`); instances and continuous assigns to separate bits inside. `27-generate` |
-| 28 | Gate primitives | 🟡 | and/or/xor families, buf/not, pullup/pulldown |
+| 28 | Gate and switch primitives | ✅ | and/or/xor families, buf/not, pullup/pulldown, drive strengths, delays (28.16). |
+| 28.6 | bufif0/1, notif0/1 | ✅ | an X or Z control gives L or H: the gate is two drivers, one with its 0 strength and one with its 1 strength, so the net resolves L/H by strength (an L against a strong 0 is 0). `28.6-bufif-notif`, `28.6-bufif-notif-strengths` |
+| 28.7, 28.9 | MOS switches: nmos, pmos, cmos and the r forms | ✅ | Z passes through; the r forms drive at most pull. Not yet: a supply-strength data is not lowered to strong through a non-resistive switch. One-bit terminals. `28.7-mos-switches`, `28.7-mos-truth-table`, `28.9-cmos` |
+| 28.8 | Bidirectional switches: tran, rtran, tranif0/1, rtranif0/1 | ✅ | nets joined by switches that are on resolve all their drivers together; supply becomes strong through a switch and each r switch lowers the strength one step (28.13.1); an X or Z control gives X where on and off differ. Terminals are whole nets. `28.8-tran`, `28.8-tran-strengths` |
 | 30.4 | Module path delays | 🟡 | `(a => b) = d` and `(a *> b) = (r, f)` with constant or specparam delays, to an output net. Every path to one output must have the same delays (minisim does not pick the path by which input changed last). Not yet: 6- and 12-value delays, outputs declared as variables, `$sdf_annotate` (an error), timing checks (`$setup`, `$hold`, ... are accepted and never report). `30.4-path-delays` |
 
 ## Next up

@@ -26,8 +26,7 @@
 // Automatic tasks, class methods, and automatic functions that recurse or
 // fork run each call in a frame (expr.hpp: Frame); their variables are
 // relative ids. Everything else is a static signal.
-// Not yet:  nmos/pmos/cmos/tran, bufif/notif, trireg, a[i +: w],
-//           ref arguments, DPI, class methods,
+// Not yet:  ref arguments, DPI, class methods,
 //           hierarchical calls, instance arrays, interfaces, hierarchical
 //           references into a child. Arguments are one static copy per subroutine.
 //
@@ -270,6 +269,8 @@ struct LowerResult {
     std::vector<std::unique_ptr<FrameLayout>> layouts;   // frame shapes of automatic subroutines and fork branches
     std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
     std::vector<std::pair<int, uint8_t>> netKinds;                   // wand, wor, tri0, ... (6.6): signal, NetResolve
+    struct TranDecl { int a, b; bool resist; };
+    std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
     std::string timescale() const {
@@ -4453,8 +4454,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         bool ninput = name == "and" || name == "nand" || name == "or" || name == "nor" ||
                       name == "xor" || name == "xnor";
         bool noutput = name == "buf" || name == "not";
-        if (!pull && !ninput && !noutput)
+        bool tri = name == "bufif0" || name == "bufif1" || name == "notif0" || name == "notif1";
+        bool mos = name == "nmos" || name == "pmos" || name == "rnmos" || name == "rpmos";
+        bool cmos = name == "cmos" || name == "rcmos";
+        if (name.find("tran") != std::string_view::npos) { lowerTran(name, ports); return; }
+        if (!pull && !ninput && !noutput && !tri && !mos && !cmos)
             throw std::runtime_error("lower: unsupported gate " + std::string(name));
+        if (tri || mos || cmos) { lowerSwitchGate(name, ports, s0, s1); return; }
 
         if (pull) {
             if (ports.size() != 1 || !ports[0]) Lowerer::unsupported("pull gate port");
@@ -4489,6 +4495,102 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         if (name == "nand" || name == "nor" || name == "xnor") acc = un(Op::Not, acc);
         driveOut(*ports[0], acc, s0, s1);
+    }
+
+    // Three-state gates and MOS switches (28.5, 28.7): out = data (inverted
+    // for notif) while the control enables it and Z while it disables it. An
+    // X or Z control gives L or H (28.12.1): the value might be the data or
+    // Z. Each gate is two drivers, one with only its 0 strength and one with
+    // only its 1 strength, so an X on the first is L and on the second is H,
+    // and the net resolves them by strength like any other driver. A MOS
+    // switch passes Z. cmos is an nmos and a pmos on one output. The r forms
+    // are resistive (28.13.1): minisim drives them at pull, the strength a
+    // strong data gets through them.
+    template <class Ports>
+    void lowerSwitchGate(std::string_view name, const Ports& ports, uint8_t s0, uint8_t s1) {
+        size_t need = name.ends_with("cmos") ? 4 : 3;
+        if (ports.size() != need) Lowerer::unsupported("gate ports");
+        for (auto* p : ports) if (!p) Lowerer::unsupported("gate ports");
+        Lowerer lw(sigmap);
+        prep(lw);
+        int w = (int)ports[0]->type->getBitWidth();
+        if (w != 1) Lowerer::unsupported("a three-state gate or switch wider than one bit");
+        bool resist = name[0] == 'r';
+        if (resist) {
+            s0 = std::min<uint8_t>(s0, STR_PULL);
+            s1 = std::min<uint8_t>(s1, STR_PULL);
+        }
+        auto bit = [&](const slang::ast::Expression& x) { return resize(lw.expr(x), 1, false, false); };
+        auto is = [](E v, Val k) { return node(Op::CaseEq, {v, konst(k)}); };
+        auto mux = [](E c, E a, E b) { return node(Op::Mux, {c, a, b}); };
+        E d = bit(*ports[1]);
+        E Z = konst(allz(1)), X = konst(allx(1));
+        auto drive = [&](E ctl, bool activeHigh, bool invert, bool passZ) {
+            E val = invert ? un(Op::Not, d) : passZ ? d : un(Op::Not, un(Op::Not, d));
+            E on = is(ctl, make(activeHigh ? 1 : 0, 0, 1)), off = is(ctl, make(activeHigh ? 0 : 1, 0, 1));
+            for (int part = 0; part < 2; part++) {   // 0: the 0-strength driver, 1: the 1-strength driver
+                // With an unknown control this driver may drive unless the value is the other level or Z.
+                E unk = mux(is(val, make(part ? 0 : 1, 0, 1)), Z, mux(is(val, allz(1)), Z, X));
+                driveOut(*ports[0], mux(on, val, mux(off, Z, unk)), part ? STR_HIZ : s0, part ? s1 : STR_HIZ);
+            }
+        };
+        if (name.starts_with("bufif") || name.starts_with("notif")) {
+            drive(bit(*ports[2]), name.back() == '1', name[0] == 'n', false);
+            return;
+        }
+        std::string_view base = resist ? name.substr(1) : name;
+        if (base == "nmos" || base == "pmos") {
+            drive(bit(*ports[2]), base == "nmos", false, true);
+            return;
+        }
+        drive(bit(*ports[2]), true, false, true);    // cmos: the n control
+        drive(bit(*ports[3]), false, false, true);   // and the p control
+    }
+
+    // tran, rtran, tranif0/1, rtranif0/1 (28.8): the two terminals become one
+    // switch the kernel resolves with the drivers of both nets. A process
+    // feeds it the control's value whenever the control changes.
+    template <class Ports>
+    void lowerTran(std::string_view name, const Ports& ports) {
+        using namespace slang::ast;
+        bool ctl = name.find("tranif") != std::string_view::npos;
+        if (ports.size() != (ctl ? 3u : 2u)) Lowerer::unsupported("tran ports");
+        int t[2];
+        for (int k = 0; k < 2; k++) {
+            if (!ports[k]) Lowerer::unsupported("tran ports");
+            const Expression* x = ports[k];
+            if (x->kind == ExpressionKind::Assignment) x = &x->as<AssignmentExpression>().left();
+            x = &Lowerer::peel(*x);
+            const Symbol* sym = ValueExpressionBase::isKind(x->kind) ? &x->as<ValueExpressionBase>().symbol : nullptr;
+            auto it = sym ? sigmap.find(sym) : sigmap.end();
+            if (!sym || sym->kind != SymbolKind::Net || it == sigmap.end())
+                Lowerer::unsupported("a tran terminal that is not a whole net");
+            t[k] = it->second;
+        }
+        if (ports[0]->type->getBitWidth() != ports[1]->type->getBitWidth()) Lowerer::unsupported("tran terminals of different widths");
+        int id = (int)out.trans.size();
+        out.trans.push_back({t[0], t[1], name[0] == 'r'});
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i;
+        i.k = IK::Tran;
+        i.sig = id;
+        if (ctl) {
+            if (!ports[2]) Lowerer::unsupported("tran ports");
+            i.e = resize(lw.expr(*ports[2]), 1, false, false);
+            i.pdown = name.back() == '0';
+        }
+        lw.prog.emit(i);
+        bool loops = false;
+        if (ctl) {
+            auto rs = readSet(lw.prog);
+            if (!rs.empty()) {
+                lw.prog.emit(waitInstr(rs));
+                Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+                loops = true;
+            }
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "tran"});
     }
 
     // The child's formal signal. A null port (no internal connection) is skipped.

@@ -46,6 +46,7 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    Tran,       // bidirectional switch `sig` (28.8): its control is e (null: always on), active low if pdown
     Ret         // pop that address; an empty stack ends the process
 };
 

@@ -460,6 +460,15 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0); pc++; break;
             case IK::Release: S.holdOff(i.sig, i.hi != 0); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
+            case IK::Tran: {   // 28.8: 1 on, 0 off, 2 an X or Z control
+                int st = 1;
+                if (i.e) {
+                    Val c = eval(i.e, rd);
+                    st = (c.x & 1) ? 2 : (int)((c.v & 1) ^ (i.pdown ? 1 : 0));
+                }
+                S.tranCtl(i.sig, st);
+                pc++; break;
+            }
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = i.target; }
