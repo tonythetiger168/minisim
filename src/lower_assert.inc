@@ -233,11 +233,14 @@ int shadowOf(int s) {
 // An expression with every static variable read replaced by its sampled value.
 // The hidden signals of assertion local variables (16.10): read as they are.
 static std::unordered_set<int>& svaLocalSigs() { static std::unordered_set<int> s; return s; }
+// The signals of sequence end points (16.13.6): read as they are, too.
+static std::unordered_set<int>& svaLiveSigs() { static std::unordered_set<int> s; return s; }
 E sampledE(const E& e) {
     if (!e) return e;
     if (e->op == Op::Const) return e;
     if (e->op == Op::Ref) {
-        if (isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig)) return e;   // automatic: read as it is
+        if (isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig) || svaLiveSigs().count(e->sig))
+            return e;   // automatic, local, or an end point: read as it is
         auto c = std::make_shared<Expr>(*e);
         c->sig = shadowOf(e->sig);
         return c;
@@ -346,6 +349,7 @@ struct SvaBuild {
     std::vector<char> atomLocal;     // the atom reads a local variable
     std::vector<int> localSigs;      // local variables (16.10), as hidden signals
     std::vector<std::vector<ConcAssert::Item>> acts;   // match items and initializers
+    std::vector<int> matchFlags;     // .matched flags read (16.13.6)
     std::unordered_map<const slang::ast::Expression*, int> atomOf;
     std::vector<std::pair<int, Edge>> clk;
     E clkIff;
@@ -536,11 +540,6 @@ const sva::Node* seqTerm(const slang::ast::AssertionExpr& a) {
                 int init = instLocals(*ai);
                 return repeated(st.init(init, seqTerm(ai->body)), nullptr, s.repetition);
             }
-            if (s.expr.kind == ExpressionKind::Call) {
-                const auto& c = s.expr.as<CallExpression>();
-                if (c.getSubroutineName() == "triggered" || c.getSubroutineName() == "matched")
-                    unsupported("sequence methods triggered and matched (16.13.6)");
-            }
             return repeated(st.boolean(svaAtom(s.expr)), &s.expr, s.repetition);
         }
         case AssertionExprKind::SequenceConcat: {
@@ -721,6 +720,95 @@ const Prog* concAction(const slang::ast::Statement* st, const slang::ast::Statem
     return store->back().get();
 }
 
+// The end point tracker of a sequence instance (16.13.6, 9.4.2.4): its first
+// signal counts the ticks where the sequence matches (@(s) waits on it), the
+// next holds the time + 1 of the last one (.triggered compares it with now).
+// It runs like a cover sequence, starting an attempt at every tick of the
+// sequence's clock: its own, else the clock of the assertion reading it,
+// else the default clocking.
+static std::map<const void*, int>& seqTrackers() { static std::map<const void*, int> m; return m; }   // -> concAsserts index
+int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
+    using namespace slang::ast;
+    if (ai.symbol.kind != SymbolKind::Sequence) unsupported("an end point of something other than a sequence");
+    // Instances without arguments share one tracker.
+    const void* key = ai.arguments.empty() ? (const void*)&ai.symbol : (const void*)&ai;
+    if (auto it = seqTrackers().find(key); it != seqTrackers().end()) return it->second;
+    if (!mkSig) unsupported("a sequence end point here");
+    std::string base = ai.symbol.getHierarchicalPath() + "$end" + std::to_string(tempSeq ? (*tempSeq)++ : 0);
+    int sg = mkSig(base, 32, false);
+    if (mkSig(base + "$t", 64, false) != sg + 1) unsupported("sequence end point signals that are not consecutive");
+    svaLiveSigs().insert(sg);
+    svaLiveSigs().insert(sg + 1);
+    SvaBuild b;
+    SvaBuild* saved = svb;
+    const std::vector<char>* savedLocal = sva::store().localAtoms;
+    auto savedEv = sampleEv;
+    const AssertionExpr* body = &ai.body;
+    if (body->kind == AssertionExprKind::Clocking) {
+        clockOf(body->as<ClockingAssertionExpr>().clocking, b.clk, b.clkIff);
+        body = &body->as<ClockingAssertionExpr>().expr;
+    } else if (saved && !saved->clk.empty()) {
+        b.clk = saved->clk;
+        b.clkIff = saved->clkIff;
+    } else if (compilation() && scope)
+        if (const Symbol* dc = compilation()->getDefaultClocking(*scope))
+            if (const auto* cb = dc->as_if<ClockingBlockSymbol>()) clockOf(cb->getEvent(), b.clk, b.clkIff);
+    if (b.clk.empty()) unsupported("an end point of a sequence with no clock (16.13.6)");
+    svb = &b;
+    sva::store().localAtoms = &b.atomLocal;
+    sampleEv = b.clk;
+    ConcAssert c;
+    AssertInfo info;
+    info.name = base;
+    info.inst = instPath(scope);
+    info.type = AT_CONCURRENT;
+    info.dir = AD_COVER;
+    info.hidden = true;
+    c.id = (int)asserts().size();
+    asserts().push_back(std::move(info));
+    c.coverSeq = true;
+    int init = instLocals(ai);
+    c.root = sva::store().covseq(sva::store().init(init, seqTerm(*body)));
+    c.ev = b.clk;
+    c.clkIff = b.clkIff;
+    c.atoms = std::move(b.atoms);
+    c.localSig = std::move(b.localSigs);
+    c.acts = std::move(b.acts);
+    c.endSig = sg;
+    svb = saved;
+    sva::store().localAtoms = savedLocal;
+    sampleEv = savedEv;
+    int k = (int)concAsserts().size();
+    concAsserts().push_back(std::move(c));
+    seqTrackers()[key] = k;
+    return k;
+}
+// s.triggered (true in a time step where s matched), and s.matched: in an
+// assertion, true when s matched since the assertion's last tick (its clock
+// may differ, 16.13.6); elsewhere the same as triggered.
+E seqEndPoint(const slang::ast::Expression& arg, bool matched) {
+    using namespace slang::ast;
+    const Expression& x = peel(arg);
+    if (x.kind != ExpressionKind::AssertionInstance) unsupported("triggered or matched of this expression");
+    int k = seqTracker(x.as<AssertionInstanceExpression>());
+    if (matched && svb) {
+        if (!mkSig) unsupported("matched here");
+        int f = mkSig(asserts()[concAsserts()[k].id].name + "$m" + std::to_string(tempSeq ? (*tempSeq)++ : 0), 1, false);
+        svaLiveSigs().insert(f);
+        concAsserts()[k].matchFlags.push_back(f);
+        svb->matchFlags.push_back(f);
+        return bin(Op::CaseEq, ref(f), konst(mk(1, 1)));
+    }
+    int s = concAsserts()[k].endSig;
+    E t = node(Op::Time);
+    t->k = mk(1, 64);   // raw ticks
+    return bin(Op::CaseEq, ref(s + 1), bin(Op::Add, t, konst(mk(1, 64))));
+}
+// @(s) for a sequence instance s (9.4.2.4): its end point count.
+int seqEventSig(const slang::ast::Expression& x) {
+    return concAsserts()[seqTracker(peel(x).as<slang::ast::AssertionInstanceExpression>())].endSig;
+}
+
 // assert / assume / cover property, cover sequence (16.14).
 void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     using namespace slang::ast;
@@ -780,6 +868,7 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     c.atoms = std::move(b.atoms);
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
+    c.clearFlags = std::move(b.matchFlags);
     if (!staticAssert) {   // in a procedure (16.14.6): queued when the procedure reaches it
         c.procedural = true;
         // Automatic variables are read as they were when the instance was

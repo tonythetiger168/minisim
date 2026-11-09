@@ -619,7 +619,10 @@ static void concTick(ConcAssert& c) {
         c.att.push_back({c.root, false, 1, a.killGen, nullptr});
         a.evals++;
     }
-    if (c.att.empty()) return;
+    if (c.att.empty()) {
+        for (int f : c.clearFlags) S.set(f, mk(0, 1));
+        return;
+    }
     // The atoms' values; with captured automatic values (16.14.6.1), once per
     // distinct set of them.
     vector<char> val(c.atoms.size());
@@ -640,6 +643,7 @@ static void concTick(ConcAssert& c) {
         dv.lh = &*lenv;
     }
     vector<ConcAssert::Attempt> next;
+    bool ended = false;   // a match of an end point tracker
     for (auto& at : c.att) {
         values(at.caps);
         if (lenv) { lenv->start(at.envs); lenv->count = at.count; }
@@ -651,7 +655,8 @@ static void concTick(ConcAssert& c) {
         ConcAssert::Envs envs;
         if (lenv) std::tie(t, envs) = lenv->finish(t);
         if (c.coverSeq) {   // every match counts (16.14.3)
-            if (dv.matches) {
+            if (dv.matches) ended = true;
+            if (dv.matches && !a.hidden) {
                 a.passes += at.count * dv.matches;
                 if (a.passOn) runAction(c.pass, at.count * dv.matches, &c.capSlot, at.caps.get());
             }
@@ -676,6 +681,13 @@ static void concTick(ConcAssert& c) {
         if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs)});
     }
     c.att.swap(next);
+    if (ended && c.endSig >= 0) {   // the sequence's end point (16.13.6)
+        Val n = S.get(c.endSig);
+        S.set(c.endSig, mk((n.x ? 0 : n.v) + 1, 32));
+        S.set(c.endSig + 1, mk(S.now + 1, 64));
+        for (int f : c.matchFlags) S.set(f, mk(1, 1));
+    }
+    for (int f : c.clearFlags) S.set(f, mk(0, 1));
 }
 // A procedural concurrent assertion reached by its procedure (16.14.6):
 // queue an instance on this process, with its automatic values now.

@@ -1933,6 +1933,9 @@ struct Lowerer {
                     return sized(bits, 64, false, ctx);
                 }
                 // e.triggered (15.5.3): e was triggered in this time slot.
+                if ((n == "triggered" || n == "matched") && call.arguments().size() == 1 &&
+                    peel(*call.arguments()[0]).kind == ExpressionKind::AssertionInstance)   // a sequence's end point (16.13.6)
+                    return sized(seqEndPoint(*call.arguments()[0], n == "matched"), 1, false, ctx);
                 if (n == "triggered" && call.arguments().size() == 1) {
                     int s = eventSig(*call.arguments()[0]);
                     E t = node(Op::Time);
@@ -2292,6 +2295,11 @@ struct Lowerer {
             if (const auto* cb = clockingRef(s.expr)) {   // @(cb): the clocking block event (14.10)
                 if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a clocking block event");
                 ev.push_back({clockings()[clockingIdx(*cb)].evSig, ANY});
+                return;
+            }
+            if (peel(s.expr).kind == ExpressionKind::AssertionInstance) {   // @(seq): its end point (9.4.2.4)
+                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a sequence event");
+                ev.push_back({seqEventSig(s.expr), ANY});
                 return;
             }
             if (!ValueExpressionBase::isKind(s.expr.kind)) unsupported("event on non-signal");
@@ -4956,6 +4964,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     cgDefs().clear();
     cgInsts().clear();
     Lowerer::cgIdxMap().clear();
+    Lowerer::seqTrackers().clear();
+    Lowerer::svaLocalSigs().clear();
+    Lowerer::svaLiveSigs().clear();
     sigInfo().clear();
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
