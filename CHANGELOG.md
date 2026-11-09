@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Containers of containers (7.5, 7.8, 7.10): `int m[][]`, `int q[$][$]`,
+  associative arrays of queues, and fixed-size arrays of containers
+  (`int f[2][]`); containers of unpacked structs and of vectors wider than
+  64 bits.
 - `rand join` in randsequence (18.17.5), with a constant bias, and production
   arguments and return values (18.17.7).
 - `dist` default weights (`default :/ w`, 18.5.3) and rand associative
