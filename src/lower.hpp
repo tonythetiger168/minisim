@@ -3192,6 +3192,98 @@ struct Lowerer {
         return concat({v, konst(mk(0, w - sw))});
     }
 
+    static std::string checkName(slang::ast::UniquePriorityCheck k) {
+        using slang::ast::UniquePriorityCheck;
+        return k == UniquePriorityCheck::Unique ? "unique" : k == UniquePriorityCheck::Unique0 ? "unique0" : "priority";
+    }
+    // A unique / priority violation report (12.4.2, 12.5.3), as a warning.
+    void violation(const slang::ast::Statement& st, const std::string& what) {
+        std::string file = "?";
+        size_t line = 0;
+        if (const auto* sm = srcMgr()) {
+            auto loc = sm->getFullyOriginalLoc(st.sourceRange.start());
+            file = std::string(sm->getFileName(loc));
+            line = sm->getLineNumber(loc);
+        }
+        std::string esc;
+        for (char ch : file) { esc += ch; if (ch == '%') esc += '%'; }
+        Instr i; i.k = IK::Display;
+        i.fmt = "Warning: \"" + esc + "\", " + std::to_string(line) + ": " + what + " at time %0t";
+        E t = node(Op::Time); t->k = mk(1, 64);
+        i.args.push_back(t);
+        prog.emit(i);
+    }
+    // Whether two items of a unique case can match the same selector value:
+    // 0 never, 1 only when the selector has x or z bits, 2 maybe. Only
+    // constant labels are checked here; anything else is checked at run time.
+    static int caseMayOverlap(const slang::ast::CaseStatement& c) {
+        using namespace slang::ast;
+        using slang::logic_t;
+        if (c.condition == CaseStatementCondition::Inside) return 2;
+        bool z = c.condition == CaseStatementCondition::WildcardJustZ;
+        bool xz = c.condition == CaseStatementCondition::WildcardXOrZ;
+        auto wild = [&](logic_t b) { return (z && b == logic_t::z) || (xz && b.isUnknown()); };
+        std::vector<slang::SVInt> seen;
+        for (const auto& item : c.items)
+            for (const Expression* x : item.expressions) {
+                const auto* cv = x->getConstant();
+                if (!cv || !cv->isInteger()) return 2;
+                const slang::SVInt& v = cv->integer();
+                if (!z && !xz && v.hasUnknown()) return 2;
+                for (const auto& o : seen) {
+                    if (o.getBitWidth() != v.getBitWidth()) return 2;
+                    bool disjoint = false;   // some bit is concrete in both and differs
+                    for (uint32_t b = 0; b < v.getBitWidth() && !disjoint; b++) {
+                        logic_t p = v[(int32_t)b], q = o[(int32_t)b];
+                        if (wild(p) || wild(q)) continue;
+                        if (p.isUnknown() || q.isUnknown()) { if (!(p == q)) disjoint = true; continue; }
+                        if (p.value != q.value) disjoint = true;
+                    }
+                    if (!disjoint) return 2;
+                }
+                seen.push_back(v);
+            }
+        return z || xz ? 1 : 0;
+    }
+    // unique if / unique0 if / priority if (12.4.2): the chain of else-ifs is
+    // one statement. unique and unique0 also check that no later condition
+    // is true; unique and priority report when none is true and there is no
+    // final else.
+    void checkedIf(const slang::ast::ConditionalStatement& top) {
+        using namespace slang::ast;
+        std::vector<const ConditionalStatement*> chain{&top};
+        while (chain.back()->ifFalse && chain.back()->ifFalse->kind == StatementKind::Conditional &&
+               chain.back()->ifFalse->as<ConditionalStatement>().check == UniquePriorityCheck::None)
+            chain.push_back(&chain.back()->ifFalse->as<ConditionalStatement>());
+        for (auto* c : chain)
+            if (c->conditions.size() != 1 || c->conditions[0].pattern) unsupported("unique or priority if with a pattern");
+        bool uniq = top.check == UniquePriorityCheck::Unique || top.check == UniquePriorityCheck::Unique0;
+        bool needAll = top.check == UniquePriorityCheck::Unique || top.check == UniquePriorityCheck::Priority;
+        std::vector<size_t> toEnd;
+        for (size_t k = 0; k < chain.size(); k++) {
+            Instr j; j.k = IK::JmpIfNot; j.e = expr(*chain[k]->conditions[0].expr);
+            size_t jf = prog.emit(j);
+            if (uniq && k + 1 < chain.size()) {
+                E more;
+                for (size_t m = k + 1; m < chain.size(); m++) {
+                    E x = expr(*chain[m]->conditions[0].expr);
+                    more = more ? bin(Op::LogOr, more, x) : x;
+                }
+                Instr o; o.k = IK::JmpIfNot; o.e = more;
+                size_t jo = prog.emit(o);
+                violation(top, checkName(top.check) + " if: more than one condition is true");
+                prog.code[jo].target = prog.here();
+            }
+            stmt(chain[k]->ifTrue);
+            Instr skip; skip.k = IK::Jmp;
+            toEnd.push_back(prog.emit(skip));
+            prog.code[jf].target = prog.here();
+        }
+        if (const Statement* last = chain.back()->ifFalse) stmt(*last);
+        else if (needAll) violation(top, checkName(top.check) + " if: no condition is true");
+        for (size_t k : toEnd) prog.code[k].target = prog.here();
+    }
+
     // x matches p (12.6): x is held in a temporary, so pattern variables
     // bound along the way read a stable value.
     E matchExpr(const slang::ast::Expression& x, const slang::ast::Pattern& p,
@@ -3664,6 +3756,7 @@ struct Lowerer {
                 // if (a &&& b matches p &&& c) (12.6.2): each condition in
                 // turn; a pattern binds its variables for the ones after it.
                 const auto& c = s.as<ConditionalStatement>();
+                if (c.check != UniquePriorityCheck::None) { checkedIf(c); break; }
                 std::vector<size_t> jfs;
                 for (auto& cd : c.conditions) {
                     Instr j; j.k = IK::JmpIfNot;
@@ -3919,7 +4012,7 @@ struct Lowerer {
                 Op cmp = c.condition == CaseStatementCondition::Normal        ? Op::CaseEq
                          : c.condition == CaseStatementCondition::WildcardJustZ ? Op::CaseZEq
                                                                                 : Op::CaseXEq;
-                std::vector<size_t> toEnd;
+                std::vector<E> conds;
                 for (const auto& item : c.items) {
                     E cond;   // OR of (selector === item_expr) over this item's labels
                     for (const Expression* x : item.expressions) {
@@ -3927,14 +4020,39 @@ struct Lowerer {
                                                                              : bin(cmp, expr(c.expr), expr(*x));
                         cond = cond ? bin(Op::LogOr, cond, m) : m;
                     }
-                    Instr j; j.k = IK::JmpIfNot; j.e = cond;
+                    conds.push_back(cond);
+                }
+                // unique / unique0 (12.5.3): after item k matches, a later
+                // item that also matches is a violation. Constant labels that
+                // cannot overlap need no check at run time.
+                bool uniq = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Unique0;
+                bool needAll = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Priority;
+                int ov = uniq ? caseMayOverlap(c) : 0;
+                bool mayOverlap = ov > 0;
+                E selUnknown;   // casez / casex labels that never overlap can still
+                                // both match a selector with z (or x) bits
+                if (ov == 1)
+                    selUnknown = bin(Op::Ne, sysFnNode(SF_COUNTBITS, {expr(c.expr)}, 12), konst(make(0, 0, 32, 0, true)));
+                std::vector<size_t> toEnd;
+                for (size_t k = 0; k < c.items.size(); k++) {
+                    Instr j; j.k = IK::JmpIfNot; j.e = conds[k];
                     size_t jf = prog.emit(j);
-                    stmt(*item.stmt);
+                    if (mayOverlap && k + 1 < c.items.size()) {
+                        E more;
+                        for (size_t m = k + 1; m < c.items.size(); m++) more = more ? bin(Op::LogOr, more, conds[m]) : conds[m];
+                        if (selUnknown) more = bin(Op::LogAnd, selUnknown, more);
+                        Instr o; o.k = IK::JmpIfNot; o.e = more;
+                        size_t jo = prog.emit(o);
+                        violation(s, checkName(c.check) + " case: more than one case item matches");
+                        prog.code[jo].target = prog.here();
+                    }
+                    stmt(*c.items[k].stmt);
                     Instr skip; skip.k = IK::Jmp;
                     toEnd.push_back(prog.emit(skip));
                     prog.code[jf].target = prog.here();
                 }
                 if (c.defaultCase) stmt(*c.defaultCase);
+                else if (needAll) violation(s, checkName(c.check) + " case: no case item matches");
                 for (size_t k : toEnd) prog.code[k].target = prog.here();
                 break;
             }
