@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(minisim LANGUAGES CXX)
+project(minisim VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -9,6 +9,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   add_compile_options(-O2)
 endif()
+
+# Version: the project() VERSION above is the release number (docs/RELEASING.md).
+# The git commit is added when the source is a git checkout.
+set(MINISIM_GIT "")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS ${CMAKE_SOURCE_DIR}/.git)
+  execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                  OUTPUT_VARIABLE MINISIM_GIT OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET)
+endif()
+configure_file(src/version.hpp.in ${CMAKE_BINARY_DIR}/gen/version.hpp @ONLY)
+include_directories(${CMAKE_BINARY_DIR}/gen)
 
 # Simulator kernel + hand-built demo design (no external dependencies)
 add_executable(minisim src/minisim.cpp)
@@ -123,3 +136,30 @@ if(MINISIM_WITH_SLANG)
   set_tests_properties(slang_dump_hier PROPERTIES
     PASS_REGULAR_EXPRESSION "module child")
 endif()
+
+# Install layout (cmake --install, and the cpack packages below):
+#   bin/msim, bin/minisim, bin/slang_dump
+#   share/minisim/include/   kernel sources that msim -compile builds against
+#   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
+include(GNUInstallDirs)
+install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(MINISIM_WITH_SLANG)
+  install(TARGETS msim slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+set(CPACK_PACKAGE_NAME minisim)
+set(CPACK_PACKAGE_VENDOR "minisim")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SystemVerilog simulator (IEEE 1800-2023) with an irun/vcs-style command line")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/tonythetiger168/minisim")
+set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_SOURCE_DIR}/LICENSE)
+set(CPACK_PACKAGE_CONTACT "https://github.com/tonythetiger168/minisim/issues")
+set(CPACK_GENERATOR TGZ)
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+# msim -compile runs a C++20 compiler on the generated design.
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "g++ (>= 11)")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+include(CPack)
