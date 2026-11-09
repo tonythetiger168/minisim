@@ -3197,7 +3197,37 @@ struct Lowerer {
         return k == UniquePriorityCheck::Unique ? "unique" : k == UniquePriorityCheck::Unique0 ? "unique0" : "priority";
     }
     // A unique / priority violation report (12.4.2, 12.5.3), as a warning.
-    void violation(const slang::ast::Statement& st, const std::string& what) {
+    // A unique / unique0 / priority violation (12.4.2.1): checked now,
+    // reported in the Observed region unless the process reaches a flush
+    // point first (it resumes from a wait, or an always_comb re-runs), so a
+    // zero-delay glitch is not reported. $assertoff and friends control it
+    // as an assertion of type 32 / 64 / 128 (20.11). The report is a warning.
+    void violation(const slang::ast::Statement& st, const std::string& what, slang::ast::UniquePriorityCheck chk) {
+        using slang::ast::UniquePriorityCheck;
+        int type = chk == UniquePriorityCheck::Unique ? AT_UNIQUE : chk == UniquePriorityCheck::Unique0 ? AT_UNIQUE0 : AT_PRIORITY;
+        if (!store) {   // nowhere to keep the report's process: print at once
+            prog.emit(violationMsg(st, what));
+            return;
+        }
+        int id = newAssert(type, AD_ASSERT, st);
+        Lowerer lw(sigmap);
+        lw.bind(subs, mkSig, tempSeq, store);
+        lw.prog.emit(lw.violationMsg(st, what));
+        std::vector<E> caps, slots;
+        for (auto& x : lw.prog.code[0].args) {   // the time, taken when the check fails
+            caps.push_back(x);
+            E k = konst(Val{});
+            slots.push_back(k);
+            x = k;
+        }
+        store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+        asserts()[id].fail = store->back().get();
+        asserts()[id].failCap = std::move(caps);
+        asserts()[id].failSlot = std::move(slots);
+        Instr a; a.k = IK::Assert; a.sig = id; a.e = konst(mk(0, 1)); a.join = 1;
+        prog.emit(a);
+    }
+    Instr violationMsg(const slang::ast::Statement& st, const std::string& what) {
         std::string file = "?";
         size_t line = 0;
         if (const auto* sm = srcMgr()) {
@@ -3211,7 +3241,7 @@ struct Lowerer {
         i.fmt = "Warning: \"" + esc + "\", " + std::to_string(line) + ": " + what + " at time %0t";
         E t = node(Op::Time); t->k = mk(1, 64);
         i.args.push_back(t);
-        prog.emit(i);
+        return i;
     }
     // Whether two items of a unique case can match the same selector value:
     // 0 never, 1 only when the selector has x or z bits, 2 maybe. Only
@@ -3271,7 +3301,7 @@ struct Lowerer {
                 }
                 Instr o; o.k = IK::JmpIfNot; o.e = more;
                 size_t jo = prog.emit(o);
-                violation(top, checkName(top.check) + " if: more than one condition is true");
+                violation(top, checkName(top.check) + " if: more than one condition is true", top.check);
                 prog.code[jo].target = prog.here();
             }
             stmt(chain[k]->ifTrue);
@@ -3280,7 +3310,7 @@ struct Lowerer {
             prog.code[jf].target = prog.here();
         }
         if (const Statement* last = chain.back()->ifFalse) stmt(*last);
-        else if (needAll) violation(top, checkName(top.check) + " if: no condition is true");
+        else if (needAll) violation(top, checkName(top.check) + " if: no condition is true", top.check);
         for (size_t k : toEnd) prog.code[k].target = prog.here();
     }
 
@@ -4043,7 +4073,7 @@ struct Lowerer {
                         if (selUnknown) more = bin(Op::LogAnd, selUnknown, more);
                         Instr o; o.k = IK::JmpIfNot; o.e = more;
                         size_t jo = prog.emit(o);
-                        violation(s, checkName(c.check) + " case: more than one case item matches");
+                        violation(s, checkName(c.check) + " case: more than one case item matches", c.check);
                         prog.code[jo].target = prog.here();
                     }
                     stmt(*c.items[k].stmt);
@@ -4052,7 +4082,7 @@ struct Lowerer {
                     prog.code[jf].target = prog.here();
                 }
                 if (c.defaultCase) stmt(*c.defaultCase);
-                else if (needAll) violation(s, checkName(c.check) + " case: no case item matches");
+                else if (needAll) violation(s, checkName(c.check) + " case: no case item matches", c.check);
                 for (size_t k : toEnd) prog.code[k].target = prog.here();
                 break;
             }
