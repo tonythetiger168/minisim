@@ -15,6 +15,18 @@ Spec references are IEEE 1800-2023 clauses.
   (XPASS is an error) and `@exit`, and `-spec` to run the spec suite on any
   of them, honouring `//! xfail:` / `//! exit:` and printing a per-chapter
   pass table.
+- FST waveforms: `msim -fst [file]`, `+fst`, or `-vcd file.fst`, in the
+  interpreter and in `-compile` (libfst from GTKWave, MIT, fetched at build;
+  `-DMINISIM_WITH_FST=OFF` builds VCD only).
+
+### Changed
+- Waveforms nest the instance hierarchy as scopes under the top module
+  (`$scope module adder_tb` / `$scope module u` instead of one flat `top`
+  scope with `u.sum`).
+
+### Fixed
+- Signals inside generate blocks (`blk[2].x`) were left out of the waveform as
+  if they were array elements.
 - CI recipes: `ci/Jenkinsfile`, a declarative Jenkins pipeline (JUnit, HTML
   reports, LCOV coverage, `-rerun` on failure), and `ci/README.md` on the
   files mregress and mcov write for a CI job.

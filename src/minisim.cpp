@@ -37,6 +37,9 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
+#ifdef MINISIM_FST
+#include "fstapi.h"
+#endif
 struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; };  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
@@ -238,8 +241,14 @@ struct Sim {
     bool finished = false;
     int exitCode = 0;                                // the process exit status ($fatal sets 1)
     string vcdPath = "dump.vcd";                     // empty: no waveform
+    string vcdTop = "top";   // name of the root VCD scope (the top module)
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
+    // FST output instead of VCD when vcdPath ends in ".fst" (built with libfst).
+    void* fst = nullptr;
+    vector<uint32_t> fstH;                           // FST handle per signal (0: not dumped)
+    string fstBuf;
+    bool waving() const { return vcd.is_open() || fst != nullptr; }
 
     Sim() { g_sformat = &Sim::sformat; }
 
@@ -434,7 +443,7 @@ struct Sim {
             }
             return;
         }
-        if (parts.empty() || vcd.is_open() || mon.on) {
+        if (parts.empty() || waving() || mon.on) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
             for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
@@ -591,7 +600,16 @@ struct Sim {
         curComb = saved;
     }
 
-    ~Sim() { for (auto h : all) h.destroy(); }
+    ~Sim() {
+        for (auto h : all) h.destroy();
+        closeWaves();
+    }
+    void closeWaves() {
+#ifdef MINISIM_FST
+        if (fst) { fstWriterClose((fstWriterContext*)fst); fst = nullptr; }
+#endif
+        if (vcd.is_open()) vcd.close();
+    }
 
     // A wire (`net`) starts as Z, including before the first drive().
     // A variable (reg/logic) starts as X. The flag is stored so the VCD
@@ -603,7 +621,11 @@ struct Sim {
         // A variable starts at X and a net at Z, across every limb. Widths of
         // 64 or less keep the single-word initial value they had before.
         Val init = net ? allz(w) : (w > 64 ? allx(w) : Val{});
-        sigs.push_back({n, w, init, {}, net, n.find_first_of("[$") != string::npos});
+        // Only the last name component decides "array element": u.m[3] is
+        // one, blk[2].x (a signal in a generate block) is not.
+        size_t dot = n.rfind('.');
+        bool elem = n.find('[', dot == string::npos ? 0 : dot + 1) != string::npos;
+        sigs.push_back({n, w, init, {}, net, elem || n.find('$') != string::npos});
         waiters.emplace_back();
         return (int)sigs.size() - 1;
     }
@@ -1048,6 +1070,22 @@ struct Sim {
     // One value line, no timestamp. Shared so $dumpvars and later changes match.
     void writeVal(int s) {
         const Sig& g = sigs[s];
+#ifdef MINISIM_FST
+        if (fst) {
+            // FST takes one '0' / '1' / 'x' / 'z' character per bit, MSB first.
+            fstBuf.resize((size_t)g.w);
+            for (int i = g.w - 1, k = 0; i >= 0; i--, k++) {
+                if (g.w <= 64)
+                    fstBuf[k] = (g.val.x >> i & 1) ? ((g.val.z >> i & 1) ? 'z' : 'x') : char('0' + (g.val.v >> i & 1));
+                else {
+                    int t = bitAt(g.val, i);
+                    fstBuf[k] = t == 3 ? 'z' : t == 2 ? 'x' : char('0' + t);
+                }
+            }
+            fstWriterEmitValueChange((fstWriterContext*)fst, fstH[s], fstBuf.data());
+            return;
+        }
+#endif
         string id = vcdId((size_t)s);
         if (g.w == 1) { vcd << ((g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1))) << id << "\n"; return; }
         vcd << "b";
@@ -1068,7 +1106,15 @@ struct Sim {
         return id;
     }
     void dump(int s) {
-        if (!vcd.is_open() || !vcd || sigs[s].hide) return;
+        if (sigs[s].hide) return;
+#ifdef MINISIM_FST
+        if (fst) {
+            if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; }
+            writeVal(s);
+            return;
+        }
+#endif
+        if (!vcd.is_open() || !vcd) return;
         if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
         writeVal(s);
     }
@@ -1077,6 +1123,15 @@ struct Sim {
     // Checkpoint every signal at time 0, before the first event. lastDump is
     // left alone so the change records that follow stay byte-for-byte the same.
     void dumpvars() {
+#ifdef MINISIM_FST
+        if (fst) {
+            // FST has no $dumpvars block: the time-0 values are ordinary changes.
+            fstWriterEmitTimeChange((fstWriterContext*)fst, now);
+            for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+            lastDump = now;
+            return;
+        }
+#endif
         if (!vcd.is_open() || !vcd) return;
         vcd << "$dumpvars\n";
         for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
@@ -1125,14 +1180,73 @@ struct Sim {
 
     void header() {
         if (vcdPath.empty()) return;
-        vcd.open(vcdPath);
-        observed = true;
-        if (!vcd) { cerr << "cannot write " << vcdPath << "\n"; return; }
-        vcd << "$timescale " << timescale << " $end\n$scope module top $end\n";
-        for (size_t i = 0; i < sigs.size(); i++)
-            if (!sigs[i].hide)
-                vcd << "$var " << (sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << vcdId(i) << " " << sigs[i].name << " $end\n";
-        vcd << "$upscope $end\n$enddefinitions $end\n";
+        observed = true;   // every change is written: the cycle domain uses set()
+        bool asFst = vcdPath.size() > 4 && vcdPath.compare(vcdPath.size() - 4, 4, ".fst") == 0;
+#ifdef MINISIM_FST
+        if (asFst) {
+            auto* f = fstWriterCreate(vcdPath.c_str(), 1);
+            if (!f) { cerr << "cannot write " << vcdPath << "\n"; return; }
+            fst = f;
+            fstWriterSetPackType(f, FST_WR_PT_LZ4);
+            fstWriterSetTimescaleFromString(f, timescale.c_str());
+            fstH.assign(sigs.size(), 0);
+        }
+#else
+        if (asFst) { cerr << "msim: this build has no FST support (built without libfst); writing VCD to " << vcdPath << "\n"; }
+#endif
+        if (!fst) {
+            vcd.open(vcdPath);
+            if (!vcd) { cerr << "cannot write " << vcdPath << "\n"; return; }
+            vcd << "$timescale " << timescale << " $end\n";
+        }
+        // Hierarchical scopes: u.v.x is variable x in scope v inside scope u
+        // under the top module, so a waveform viewer shows the instance tree.
+        // Scopes keep the order their first signal was declared in.
+        struct Scope { string name; vector<size_t> vars; vector<Scope> kids; };
+        Scope root{vcdTop.empty() ? string("top") : vcdTop, {}, {}};
+        for (size_t i = 0; i < sigs.size(); i++) {
+            if (sigs[i].hide) continue;
+            Scope* sc = &root;
+            const string& n = sigs[i].name;
+            size_t b = 0, e;
+            while ((e = n.find('.', b)) != string::npos) {
+                string part = n.substr(b, e - b);
+                auto it = std::find_if(sc->kids.begin(), sc->kids.end(), [&](const Scope& k) { return k.name == part; });
+                if (it == sc->kids.end()) { sc->kids.push_back({part, {}, {}}); sc = &sc->kids.back(); }
+                else sc = &*it;
+                b = e + 1;
+            }
+            sc->vars.push_back(i);
+        }
+        std::function<void(const Scope&)> emit = [&](const Scope& sc) {
+#ifdef MINISIM_FST
+            if (fst) {
+                auto* f = (fstWriterContext*)fst;
+                fstWriterSetScope(f, FST_ST_VCD_MODULE, sc.name.c_str(), nullptr);
+                for (size_t i : sc.vars) {
+                    const string& n = sigs[i].name;
+                    size_t d = n.rfind('.');
+                    string leaf = d == string::npos ? n : n.substr(d + 1);
+                    fstH[i] = fstWriterCreateVar(f, sigs[i].net ? FST_VT_VCD_WIRE : FST_VT_VCD_REG, FST_VD_IMPLICIT,
+                                                 (uint32_t)sigs[i].w, leaf.c_str(), 0);
+                }
+                for (const Scope& k : sc.kids) emit(k);
+                fstWriterSetUpscope(f);
+                return;
+            }
+#endif
+            vcd << "$scope module " << sc.name << " $end\n";
+            for (size_t i : sc.vars) {
+                const string& n = sigs[i].name;
+                size_t d = n.rfind('.');
+                vcd << "$var " << (sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << vcdId(i) << " "
+                    << (d == string::npos ? n : n.substr(d + 1)) << " $end\n";
+            }
+            for (const Scope& k : sc.kids) emit(k);
+            vcd << "$upscope $end\n";
+        };
+        emit(root);
+        if (!fst) vcd << "$enddefinitions $end\n";
     }
 
     // After the last slot ($finish, no more events, or the time limit):

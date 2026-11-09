@@ -10,6 +10,7 @@
 //   -top <name>      same as --top (the VCS / irun spelling)
 //   -vcd [<file>]    write a VCD waveform (default file dump.vcd)
 //   +vcd             same as -vcd dump.vcd
+//   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -83,6 +84,21 @@ static void version() {
 // Kernel sources that -compile builds against. $MINISIM_INCLUDE wins. An
 // installed msim (bin/msim) finds them in ../share/minisim/include next to
 // itself; a build-tree msim uses the source tree it was configured from.
+// libfst sources for an FST waveform from simv: $MINISIM_FST_SRC, the
+// installed share/minisim/include/fst, or the build tree's fetched copy.
+static std::string kernelIncludeDir();
+static std::string fstSourceDir() {
+    std::error_code ec;
+    for (std::string d : {std::getenv("MINISIM_FST_SRC") ? std::string(std::getenv("MINISIM_FST_SRC")) : std::string(),
+                          kernelIncludeDir() + "/fst",
+#ifdef MINISIM_FST_DIR
+                          std::string(MINISIM_FST_DIR),
+#endif
+                          std::string()})
+        if (!d.empty() && std::filesystem::exists(d + "/fstapi.c", ec)) return d;
+    return "";
+}
+
 static std::string kernelIncludeDir() {
     if (const char* e = std::getenv("MINISIM_INCLUDE")) return e;
     std::error_code ec;
@@ -195,13 +211,34 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         if (!f) { std::cerr << "msim: cannot write " << cpp << "\n"; return 1; }
     }
     std::string build = shq(cc) + " -std=c++20 " + opt + " -I" + shq(inc) + " " + shq(cpp) + " -o " + shq(exe);
+    // An FST waveform: build simv with libfst too. Its C sources are compiled
+    // once into <dir>/fst/*.o with $CC (default cc).
+    if (vcdPath && vcdPath->ends_with(".fst")) {
+        std::string fd = fstSourceDir();
+        if (fd.empty()) {
+            std::cerr << "msim: -compile: no libfst sources for FST output; using the interpreter\n";
+            return -1;
+        }
+        std::string ccC = std::getenv("CC") ? std::getenv("CC") : "cc";
+        std::string od = dir + "/fst", objs;
+        if (std::system(("mkdir -p " + shq(od)).c_str()) != 0) return 1;
+        for (const char* f : {"fstapi", "fastlz", "lz4"}) {
+            std::string o = od + "/" + f + ".o";
+            objs += " " + shq(o);
+            if (std::filesystem::exists(o)) continue;
+            std::string c = shq(ccC) + " -O2 -c -D_GNU_SOURCE -DHAVE_FSEEKO -DHAVE_REALPATH " +
+                            shq(fd + "/" + f + ".c") + " -o " + shq(o);
+            if (std::system(c.c_str()) != 0) { std::cerr << "msim: -compile: libfst build failed: " << c << "\n"; return 1; }
+        }
+        build += " -DMINISIM_FST -I" + shq(fd) + objs + " -lz";
+    }
     if (std::system(build.c_str()) != 0) {
         std::cerr << "msim: -compile: C++ build failed: " << build << "\n";
         return 1;
     }
     std::string run = shq(exe);
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
-    if (vcdPath) run += " -vcd " + shq(*vcdPath);
+    if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
     run += " -threads " + std::to_string(threads);
     std::cout.flush();
     int st = std::system(run.c_str());
@@ -212,7 +249,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
-                 "  -vcd [<file>]  write a VCD waveform (default dump.vcd)\n"
+                 "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
+                 "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
@@ -270,9 +308,12 @@ int main(int argc, char** argv) {
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
-        if (a == "-vcd") {
-            if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".vcd")) vcdPath = argv[++i];
-            else vcdPath = "dump.vcd";
+        if (a == "+fst") { vcdPath = "dump.fst"; continue; }
+        // -vcd x.fst writes FST too: the file name picks the format.
+        if (a == "-vcd" || a == "-fst") {
+            std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
+            if (nx.ends_with(".vcd") || nx.ends_with(".fst")) vcdPath = argv[++i];
+            else vcdPath = a == "-fst" ? "dump.fst" : "dump.vcd";
             continue;
         }
         if (a == "-maxtime") {
@@ -314,6 +355,9 @@ int main(int argc, char** argv) {
     auto comp = driver.createCompilation();
     driver.reportCompilation(*comp, /*quiet*/ true);
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
+
+    // The VCD's root scope is the top module (several tops: "top").
+    if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);
 
     // Pass 3: lower to the process IR and run on the kernel.
     LowerResult lowered;
