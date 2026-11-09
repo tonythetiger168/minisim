@@ -1,6 +1,5 @@
 // IEEE 1800-2023 10.6.2: force and release on a variable and on a net
 // (10.6.2).
-//! xfail: force/release are errors
 module top;
   logic v = 0, a = 0;
   wire w;

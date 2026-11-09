@@ -1,6 +1,5 @@
 // IEEE 1800-2023 7.6: Whole fixed-array assignment, equality, and slices
 // (7.6, 7.4.5, 11.4.5).
-//! xfail: whole-array assignment and compare are errors
 //! icarus-skip: Icarus 13 does not support array compare
 module top;
   int a[4], b[4], c[2];

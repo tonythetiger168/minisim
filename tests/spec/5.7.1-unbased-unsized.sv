@@ -1,5 +1,4 @@
 // IEEE 1800-2023 5.7.1: '0 '1 'x 'z fill every bit of the target (5.7.1).
-//! xfail: '0 / '1 literals are an error
 module top;
   logic [7:0] a;
   logic [69:0] w;

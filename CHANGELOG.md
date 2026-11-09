@@ -34,12 +34,26 @@ Spec references are IEEE 1800-2023 clauses.
 - CI recipes: `ci/Jenkinsfile`, a declarative Jenkins pipeline (JUnit, HTML
   reports, LCOV coverage, `-rerun` on failure), and `ci/README.md` on the
   files mregress and mcov write for a CI job.
+- Automatic subroutines get a frame per call (6.21, 13.3.2, 13.4.2): recursion,
+  automatic tasks called from several processes at once, and
+  `fork automatic int j = i; ... join_none` with one copy per fork. This is
+  the base for class methods (8).
 
 ## [0.1.0] - unreleased
 
 First tagged release: everything merged up to spec round 5.
 
 ### Added
+- `mdft`, design-for-test checks and a scan chain plan: `DFT001` a gated or
+  unreachable clock, `DFT002` an asynchronous reset built from logic, `DFT003`
+  a latch, `DFT004` both edges of one clock, `DFT005` a combinational loop,
+  `DFT006` a ripple or divided clock. The summary counts the flops per clock
+  domain.
+- `mlint`, lint and clock-domain checks on the msim front end: `L001` latches
+  in `always_comb`, `L002` blocking assignment in `always_ff`, `L003`
+  non-blocking in `always_comb`, `L004` multiple drivers, `CDC001` a crossing
+  with no synchronizer or one flop, `CDC002` a multi-bit bus through a two-flop
+  synchronizer. `-disable RULE`, `-Werror`, `-list`.
 - Release engineering: a version number (`msim -version`), `cmake --install`
   rules, `cpack` packages (`.tar.gz`, `.deb`), a tag-triggered release
   workflow, this changelog, `docs/RELEASING.md` and `docs/PRODUCT.md`.

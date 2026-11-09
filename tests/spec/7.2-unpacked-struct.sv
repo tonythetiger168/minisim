@@ -1,6 +1,5 @@
 // IEEE 1800-2023 7.2: An unpacked struct: member read and write, a struct
 // literal, whole-struct copy and compare (7.2, 5.10).
-//! xfail: unpacked structs are an error
 //! icarus-skip: Icarus 13 does not compare unpacked structs
 module top;
   typedef struct { int a; logic [7:0] b; string s; } s_t;
