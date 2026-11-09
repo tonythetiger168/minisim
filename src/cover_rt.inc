@@ -9,8 +9,35 @@ struct KR { uint64_t a, b; };   // keys a..b, inclusive
 inline i128 tmin(const CgCpDef& c) { return c.sgn ? -((i128)1 << (c.w - 1)) : 0; }
 inline i128 tmax(const CgCpDef& c) { return c.sgn ? ((i128)1 << (c.w - 1)) - 1 : ((i128)1 << c.w) - 1; }
 inline uint64_t kmask(int w) { return w >= 64 ? ~0ull : (1ull << w) - 1; }
+// A real's key: its bits, ordered like the reals (-0.0 is 0.0).
+inline uint64_t rkey(double d) {
+    if (d == 0) d = 0;
+    uint64_t b;
+    std::memcpy(&b, &d, 8);
+    return (b >> 63) ? ~b : b | (1ull << 63);
+}
+inline double rval(uint64_t k) {
+    uint64_t b = (k >> 63) ? k & ~(1ull << 63) : ~k;
+    double d;
+    std::memcpy(&d, &b, 8);
+    return d;
+}
+inline double realOfVal(const Val& v) {
+    double d;
+    std::memcpy(&d, &v.v, 8);
+    return d;
+}
+// A real as in bin names: 1.0, 0.75 (19.5.1).
+inline std::string realName(double d) {
+    char buf[40];
+    snprintf(buf, sizeof buf, "%.15g", d);
+    std::string s = buf;
+    if (s.find_first_of(".eni") == std::string::npos) s += ".0";
+    return s;
+}
 // A sampled value's key: its w bits, the sign bit flipped when signed.
 inline uint64_t keyOf(const CgCpDef& c, const Val& v) {
+    if (c.isReal) return rkey(realOfVal(v));
     uint64_t x = v.v & kmask(c.w);
     return c.sgn ? x ^ (1ull << (c.w - 1)) : x;
 }
@@ -23,7 +50,7 @@ inline std::string str128(i128 v) {
     while (u) { s.insert(s.begin(), char('0' + (int)(u % 10))); u /= 10; }
     return neg ? "-" + s : s;
 }
-inline std::string keyName(const CgCpDef& c, uint64_t k) { return str128(valOfKey(c, k)); }
+inline std::string keyName(const CgCpDef& c, uint64_t k) { return c.isReal ? realName(rval(k)) : str128(valOfKey(c, k)); }
 inline i128 boundOf(const Val& v, bool sgn) { return sgn ? (i128)(int64_t)v.v : (i128)(uint64_t)v.v; }
 inline bool inRanges(const std::vector<KR>& rs, uint64_t k) {
     for (auto& r : rs) if (k >= r.a && k <= r.b) return true;
@@ -37,8 +64,32 @@ inline bool inPairs(const std::vector<std::pair<uint64_t, uint64_t>>& rs, uint64
 // One covergroup_range_list element as keys, in order (19.5.7: clipped to
 // the coverpoint type; a value outside it is dropped). Values with x/z go to
 // `xv` (matched with ===) or, for a wildcard bin, to `wild` as (care, value).
+// A real item's bounds: lo, hi, and whether either is $ (19.5.1).
+struct RealItem { double lo, hi; bool unbounded; bool range; };
+inline RealItem realItem(const CgItem& it) {
+    RealItem r{0, 0, false, it.range};
+    if (!it.range) { r.lo = r.hi = realOfVal(eval(it.lo, rd)); return r; }
+    if (it.tol) {   // [c +/- t], [c +%- p] (11.4.13)
+        double ctr = realOfVal(eval(it.lo, rd)), t = realOfVal(eval(it.hi, rd));
+        if (it.tol == 2) t = std::fabs(ctr) * t / 100.0;
+        t = std::fabs(t);
+        r.lo = ctr - t;
+        r.hi = ctr + t;
+        return r;
+    }
+    r.lo = it.loMin ? -INFINITY : realOfVal(eval(it.lo, rd));
+    r.hi = it.hiMax ? INFINITY : realOfVal(eval(it.hi, rd));
+    r.unbounded = it.loMin || it.hiMax;
+    if (r.lo > r.hi) std::swap(r.lo, r.hi);
+    return r;
+}
 inline void itemKeys(const CgCpDef& c, const CgItem& it, bool wildcard, std::vector<KR>& out,
                      std::vector<Val>* xv, std::vector<std::pair<uint64_t, uint64_t>>* wild) {
+    if (c.isReal) {
+        RealItem r = realItem(it);
+        out.push_back({r.lo == -INFINITY ? 0 : rkey(r.lo), r.hi == INFINITY ? ~0ull : rkey(r.hi)});
+        return;
+    }
     i128 lo = tmin(c), hi = tmax(c);
     if (!it.range) {
         Val v = eval(it.lo, rd);
@@ -117,6 +168,14 @@ inline int64_t optOr(const std::vector<CgOptSet>& opts, int which, int64_t dflt)
         }
     return dflt;
 }
+// A class's covergroup reads its object's properties: `this` is the object
+// it was created for, whatever process samples it.
+inline void (*g_cgInstStart)(int id) = nullptr;   // a class covergroup's own sampling process
+struct SelfScope {
+    Frame* saved;
+    explicit SelfScope(const CgInst& in) : saved(g_fr) { if (in.self) g_fr = in.self.get(); }
+    ~SelfScope() { g_fr = saved; }
+};
 inline void setArgs(const CgInst& in) {
     const CgDef& d = cgDefs()[in.def];
     for (size_t k = 0; k < d.argSigs.size(); k++)
@@ -226,7 +285,76 @@ inline void transBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci) {
 }
 
 // A coverpoint's bins for one instance (19.5).
-inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax) {
+// The bins of one bins construct of a real coverpoint (19.5.1): a single bin;
+// name[], a bin per value and per interval of each range (identical ones
+// merged); or name[N], the values and intervals spread over N bins.
+inline void realBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci, double iv, std::vector<KR>& excl) {
+    struct Piece { double lo, hi; bool hiIn; bool single; };
+    std::vector<Piece> ps;
+    for (const auto& it : bd.items) {
+        RealItem r = realItem(it);
+        if (!r.range) { ps.push_back({r.lo, r.lo, true, true}); continue; }
+        double w = r.hi - r.lo;
+        if (r.unbounded || !bd.array || !(iv > 0) || w <= iv) { ps.push_back({r.lo, r.hi, true, false}); continue; }
+        double nf = std::ceil(w / iv - 1e-9);
+        if (nf > (double)kMaxBins) fail("too many intervals in " + bd.name);
+        int64_t n = (int64_t)nf;
+        for (int64_t k = 0; k < n; k++) {
+            double a = r.lo + (double)k * iv;
+            if (k == n - 1) ps.push_back({a, r.hi, true, false});
+            else ps.push_back({a, r.lo + (double)(k + 1) * iv, false, false});
+        }
+    }
+    auto keys = [](const Piece& p) -> KR {
+        uint64_t a = p.lo == -INFINITY ? 0 : rkey(p.lo);
+        uint64_t b = p.hi == INFINITY ? ~0ull : rkey(p.hi);
+        if (!p.hiIn && b > a) b--;   // [lo:hi): up to the real just below hi
+        return {a, b};
+    };
+    auto name = [](const Piece& p) {
+        if (p.single) return realName(p.lo);
+        auto bound = [](double d) { return d == INFINITY || d == -INFINITY ? std::string("$") : realName(d); };
+        return bound(p.lo) + ":" + bound(p.hi) + (p.hiIn ? "]" : ")");
+    };
+    if (bd.kind == 1 || bd.kind == 2)
+        for (auto& p : ps) excl.push_back(keys(p));
+    auto mkBin = [&](std::string nm, const std::vector<Piece>& in) {
+        CgBin b;
+        b.name = std::move(nm);
+        b.base = bd.name;
+        b.kind = bd.kind;
+        b.iff = bd.iff;
+        for (auto& p : in) { KR k = keys(p); b.ranges.push_back({k.a, k.b}); }
+        ci.bins.push_back(std::move(b));
+    };
+    if (!bd.array) { mkBin(bd.name, ps); return; }
+    if (!bd.count) {
+        std::vector<Piece> seen;
+        for (auto& p : ps) {
+            bool dup = false;
+            for (auto& q : seen) dup = dup || (q.lo == p.lo && q.hi == p.hi && q.hiIn == p.hiIn && q.single == p.single);
+            if (dup) continue;
+            seen.push_back(p);
+            mkBin(bd.name + "[" + name(p) + "]", {p});
+        }
+        return;
+    }
+    Val nv = eval(bd.count, rd);
+    int64_t n = (int64_t)nv.v;
+    if (n <= 0 || (size_t)n > kMaxBins) fail("bad number of bins for " + bd.name);
+    // Values after the intervals, in order (19.5.1: the items are the intervals, then the values).
+    std::vector<Piece> items;
+    for (auto& p : ps) if (!p.single) items.push_back(p);
+    for (auto& p : ps) if (p.single) items.push_back(p);
+    int64_t total = (int64_t)items.size(), per = std::max<int64_t>(1, total / n);
+    for (int64_t k = 0; k < n; k++) {
+        int64_t from = per * k, to = k == n - 1 ? total : std::min(total, per * (k + 1));
+        std::vector<Piece> in;
+        for (int64_t j = from; j < to; j++) in.push_back(items[j]);
+        mkBin(bd.name + "[" + std::to_string(k) + "]", in);
+    }
+}
+inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double realInterval = 1.0) {
     std::vector<KR> excl;   // ignored and illegal values
     bool explicitBins = false;
     for (const auto& bd : c.bins) {
@@ -243,6 +371,11 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax) {
             b.iff = bd.iff;
             ci.bins.push_back(std::move(b));
             explicitBins = true;
+            continue;
+        }
+        if (c.isReal) {
+            realBins(c, bd, ci, realInterval, excl);
+            if (bd.kind == 0) explicitBins = true;
             continue;
         }
         std::vector<KR> seq;
@@ -438,6 +571,8 @@ inline Val cgNew(const std::vector<Val>& a) {
     CgInst in;
     in.def = d;
     in.name = def.name + "#" + std::to_string(def.insts.size());
+    if (def.inClass) in.self = newFrame(nullptr, nullptr, (int)a.back().v);
+    SelfScope ss(in);
     for (size_t k = 0; k < def.argSigs.size(); k++) {
         if (def.argRef[k]) { in.refSigs.push_back((int)a[k + 1].v); in.args.push_back(Val{}); }
         else { in.refSigs.push_back(-1); in.args.push_back(a[k + 1]); }
@@ -459,7 +594,9 @@ inline Val cgNew(const std::vector<Val>& a) {
                                optOr(c.opts, CO_AUTO_BIN_MAX, in.opt[CO_AUTO_BIN_MAX])};
         in.cpOpt.push_back(o);
         CgCpInst ci;
-        buildCp(c, ci, o[3]);
+        double iv = 1.0;   // type_option.real_interval (19.7.1)
+        if (const E& r = c.realInterval ? c.realInterval : def.realInterval) iv = realOfVal(eval(r, rd));
+        buildCp(c, ci, o[3], iv);
         in.cps.push_back(std::move(ci));
     }
     for (const auto& x : def.crosses) {
@@ -472,6 +609,7 @@ inline Val cgNew(const std::vector<Val>& a) {
     cgInsts().push_back(std::move(in));
     int id = (int)cgInsts().size() - 1;
     cgDefs()[d].insts.push_back(id);
+    if (def.inClass && !def.ev.empty()) g_cgInstStart(id);
     return make((uint64_t)id + 1, 0, 32, 0);
 }
 inline void report(const CgInst& in, const std::string& what, const std::string& bin, const std::string& value) {
@@ -481,6 +619,7 @@ inline void report(const CgInst& in, const std::string& what, const std::string&
 // One sample of an instance (19.3, 19.5).
 inline void sampleInst(CgInst& in) {
     if (!in.on) return;
+    SelfScope ss(in);
     const CgDef& d = cgDefs()[in.def];
     setArgs(in);
     for (size_t ci = 0; ci < d.cps.size(); ci++) {
@@ -490,7 +629,7 @@ inline void sampleInst(CgInst& in) {
         cp.sampled = false;
         if (c.iff && truth(eval(c.iff, rd)) != 1) continue;
         Val v = eval(c.expr, rd);
-        bool hasX = (v.x & kmask(c.w)) != 0;
+        bool hasX = !c.isReal && (v.x & kmask(c.w)) != 0;
         uint64_t k = keyOf(c, v);
         auto iffOk = [&](const CgBin& b) { return !b.iff || truth(eval(b.iff, rd)) == 1; };
         bool illegal = false, ignored = false;
@@ -739,8 +878,31 @@ inline Task cgProc(int d) {
         for (int id : def.insts) cg::sampleInst(cgInsts()[id]);
     }
 }
+// A class's covergroup (19.4): each instance waits on its own object's
+// event, resolved when the instance is created (the event may name a
+// property or another object's member: it has to exist by then).
+inline Task cgInstProc(int id, std::vector<std::pair<int, Edge>> ev) {
+    for (;;) {
+        if (ev.size() > 1) co_await WaitAny{&ev};
+        else co_await Wait{ev[0].first, ev[0].second};
+        CgInst& in = cgInsts()[id];
+        const CgDef& def = cgDefs()[in.def];
+        if (def.evIff) {
+            cg::SelfScope ss(in);
+            if (truth(eval(def.evIff, rd)) != 1) continue;
+        }
+        cg::sampleInst(in);
+    }
+}
 inline void startCovergroups() {
     g_cgHook = cg::hook;
+    cg::g_cgInstStart = [](int id) {
+        const CgInst& in = cgInsts()[id];
+        cg::SelfScope ss(in);
+        std::vector<std::pair<int, Edge>> ev;
+        for (auto& [s, e] : cgDefs()[in.def].ev) ev.push_back({R(s), e});
+        S.spawn(cgInstProc(id, std::move(ev)));
+    };
     for (size_t d = 0; d < cgDefs().size(); d++)
-        if (!cgDefs()[d].ev.empty()) S.spawn(cgProc((int)d));
+        if (!cgDefs()[d].ev.empty() && !cgDefs()[d].inClass) S.spawn(cgProc((int)d));
 }
