@@ -51,6 +51,9 @@
 #include <vector>
 
 #include "prog.hpp"
+#include "sva.hpp"
+#include "sva_engine.hpp"
+#include "clocking.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Expression.h"
@@ -177,9 +180,46 @@ inline int storeW(const slang::ast::Type& t0) {
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) return uWidth(t);
     return t.isString() || t.isFloating() || isHandleType(t) ? 64 : (int)t.getBitWidth();
 }
+// Tag bits of a tagged union (7.3.2): enough to number its members. The tag
+// is at the top; a member's value is right-justified below it.
+inline int tagBitsOf(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (t.kind == SymbolKind::PackedUnionType) return (int)t.as<PackedUnionType>().tagBits;
+    size_t n = t.as<UnpackedUnionType>().fields.size();
+    int b = 1;
+    while (((size_t)1 << b) < n) b++;
+    return b;
+}
+inline bool isTaggedUnion(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (t.kind == SymbolKind::PackedUnionType) return t.as<PackedUnionType>().isTagged;
+    if (t.kind == SymbolKind::UnpackedUnionType) return t.as<UnpackedUnionType>().isTagged;
+    return false;
+}
+inline int tagIndexOf(const slang::ast::Type& t0, const slang::ast::Symbol& f) {
+    using namespace slang::ast;
+    int k = 0;
+    for (const auto& g : t0.getCanonicalType().as<Scope>().membersOfType<FieldSymbol>()) {
+        if (&g == &f) return k;
+        k++;
+    }
+    return -1;
+}
 inline int uWidth(const slang::ast::Type& t0) {
     using namespace slang::ast;
     const auto& t = t0.getCanonicalType();
+    if (isTaggedUnion(t) && t.isUnpackedUnion()) {
+        int w = 0;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+            if (f.getType().isVoid()) continue;
+            int fw = uWidth(f.getType());
+            if (fw <= 0) return -1;
+            w = std::max(w, fw);
+        }
+        return w + tagBitsOf(t);
+    }
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) {
         int w = 0;
         bool u = t.isUnpackedUnion();
@@ -398,6 +438,7 @@ struct Lowerer {
     int tsUnit = -9, tsPrec = -9;
     void setScope(const slang::ast::Scope* sc) {
         if (!sc) return;
+        scope = sc;
         if (auto ts = sc->getTimeScale()) { tsUnit = tsExp(ts->base); tsPrec = tsExp(ts->precision); }
     }
     uint64_t ticksPerUnit() const { return pow10u(tsUnit - simPrecExp()); }
@@ -641,6 +682,9 @@ struct Lowerer {
         if (isRel(sig)) localMap()[sym] = {frames.back(), relOff(sig)};
         else sigmap[sym] = sig;
     }
+
+#include "lower_assert.inc"
+#include "lower_clocking.inc"
 
     // Owns the Prog of each fork branch, so Fork's pointers outlive lower().
     std::vector<std::unique_ptr<Prog>>* store = nullptr;
@@ -1997,6 +2041,13 @@ struct Lowerer {
             for (auto* op : x.as<ConcatenationExpression>().operands()) dynAppend(t, *op);
             return;
         }
+        if (x.kind == ExpressionKind::Call && isDynType(*x.type)) {   // r = q.find(x) with (...)
+            const auto& c = x.as<CallExpression>();
+            if (c.isSystemCall() && isLocator(c.getSubroutineName())) {
+                Instr i = dynCmd(t, D_APPEND); i.dsrc = locatorCall(c); prog.emit(i);
+                return;
+            }
+        }
         if (x.type->isUnpackedArray()) unsupported("container value");
         Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(x); prog.emit(i);
     }
@@ -2092,6 +2143,185 @@ struct Lowerer {
             default: dynAppend(t, rhs);
         }
     }
+    static bool isReduction(std::string_view n) {
+        return n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor";
+    }
+    static bool isLocator(std::string_view n) {
+        return n == "find" || n == "find_index" || n == "find_first" || n == "find_first_index" ||
+               n == "find_last" || n == "find_last_index" || n == "min" || n == "max" ||
+               n == "unique" || n == "unique_index";
+    }
+    // A fixed-size array, numbered [0:N-1], for an array method: a scratch
+    // queue holding a copy of its elements.
+    static bool isFixedArr(const slang::ast::Expression& x) {
+        return x.type->getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType;
+    }
+    int fixedAsQueue(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        const Type& at = x.type->getCanonicalType();
+        if (!isFixedArr(x)) unsupported("array method of this array");
+        if (!stmtDepth) unsupported("array method of a fixed-size array outside a procedural statement");
+        auto r = at.as<FixedSizeUnpackedArrayType>().range;
+        if (r.left != 0 || r.right < 0) unsupported("array method of an array not declared [N] or [0:N-1]");
+        int q = keyQueue(*at.getArrayElementType());
+        dynAppend(q, x);
+        return q;
+    }
+    // An element of container d for an array method: the with expression
+    // evaluated with the iterator set to element ix, or the element itself.
+    struct ElemKey { int d; const slang::ast::Expression* withE; const slang::ast::ValueSymbol* it; int itSig; };
+    E elemAt(int d, int ix) {
+        auto g = node(Op::DynGet, {ref(ix, true)});
+        g->sig = d;
+        return g;
+    }
+    E elemKey(const ElemKey& k, int ix) {
+        if (!k.withE) return elemAt(k.d, ix);
+        Instr a; a.k = IK::Assign; a.sig = k.itSig; a.e = elemAt(k.d, ix);
+        prog.emit(a);
+        return expr(*k.withE);
+    }
+    // An empty scratch queue whose elements have type t.
+    int keyQueue(const slang::ast::Type& t) {
+        int q = fresh(64);
+        DynObj o;
+        o.kind = 1;
+        const auto& ct = t.getCanonicalType();
+        if (ct.isFloating()) o.dflt = mkreal(0);
+        else if (ct.isString()) o.dflt = mkstr("");
+        else {
+            int w = (int)ct.getBitWidth();
+            needWidth(w);
+            o.dflt = ct.isFourState() ? xfill(w) : mk(0, w);
+            o.dflt.sgn = ct.isSigned();
+        }
+        if (isRel(q)) frames.back()->dyn.push_back({relOff(q), o});
+        else dynStore()[q] = o;
+        prog.emit(dynCmd(q, D_DELETE));
+        return q;
+    }
+    // for (ix = 0; ix < d.size(); ix++) body, or from the end when back is
+    // set. body may add jumps to the end of the loop to exits.
+    template <class F>
+    void dynLoop(int d, bool back, F body) {
+        int ix = fresh(32);
+        Val one = mk(1, 32); one.sgn = true;
+        Val zero = mk(0, 32); zero.sgn = true;
+        Instr i0; i0.k = IK::Assign; i0.sig = ix;
+        i0.e = back ? bin(Op::Sub, resize(dynSize(d), 32, false, true), konst(one)) : konst(zero);
+        prog.emit(i0);
+        size_t top = prog.here();
+        Instr j; j.k = IK::JmpIfNot;
+        j.e = back ? bin(Op::Ge, ref(ix, true), konst(zero))
+                   : bin(Op::Lt, ref(ix, true), resize(dynSize(d), 32, false, true));
+        std::vector<size_t> exits{prog.emit(j)};
+        body(ix, exits);
+        Instr st; st.k = IK::Assign; st.sig = ix;
+        st.e = bin(back ? Op::Sub : Op::Add, ref(ix, true), konst(one));
+        prog.emit(st);
+        Instr bk; bk.k = IK::Jmp; bk.target = top; prog.emit(bk);
+        for (size_t x : exits) prog.code[x].target = prog.here();
+    }
+    // q.find(x) with (...), q.min(), q.unique_index() ... (7.12.1): the
+    // result goes into a scratch queue, which is returned.
+    int locatorCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        std::string_view n = call.getSubroutineName();
+        auto args = call.arguments();
+        if (!stmtDepth) unsupported("locator method outside a procedural statement");
+        int d = dynSig(*args[0]);
+        if (d < 0) d = fixedAsQueue(*args[0]);
+        if (dynShape(d).kind == 2) unsupported("locator method of an associative array");
+        const Expression* withE = nullptr;
+        const ValueSymbol* itSym = nullptr;
+        if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
+            std::tie(withE, itSym) = sci->getIteratorInfo();
+        ElemKey ek{d, withE, itSym, -1};
+        if (itSym) {
+            int w = storeW(itSym->getType());
+            needWidth(w);
+            ek.itSig = fresh(w);
+            sigmap[itSym] = ek.itSig;
+        }
+        bool index = n.ends_with("_index");
+        const Type& et = call.type->getCanonicalType().getArrayElementType()->getCanonicalType();
+        int res = keyQueue(et);
+        auto push = [&](int ix) {
+            Instr p = dynCmd(res, D_PUSH_BACK);
+            p.e = index ? ref(ix, true) : elemAt(d, ix);
+            prog.emit(p);
+        };
+        if (n.starts_with("find")) {
+            if (!withE) unsupported("find without a with clause");
+            bool first = n.starts_with("find_first"), last = n.starts_with("find_last");
+            dynLoop(d, last, [&](int ix, std::vector<size_t>& exits) {
+                Instr j; j.k = IK::JmpIfNot; j.e = elemKey(ek, ix);
+                size_t jf = prog.emit(j);
+                push(ix);
+                if (first || last) { Instr x; x.k = IK::Jmp; exits.push_back(prog.emit(x)); }
+                prog.code[jf].target = prog.here();
+            });
+            return res;
+        }
+        const Type& kt = (withE ? *withE->type : *args[0]->type->getArrayElementType()).getCanonicalType();
+        if (!kt.isIntegral()) unsupported("min / max / unique on a real, string or aggregate key");
+        int kw = (int)kt.getBitWidth();
+        needWidth(kw);
+        bool ks = kt.isSigned();
+        if (n == "min" || n == "max") {
+            int best = fresh(32), bk = fresh(kw);
+            Val m1 = mk(-1, 32); m1.sgn = true; m1.v = mask(32);
+            Instr b0; b0.k = IK::Assign; b0.sig = best; b0.e = konst(m1); prog.emit(b0);
+            dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                int cur = fresh(kw);
+                Instr c; c.k = IK::Assign; c.sig = cur; c.e = resize(elemKey(ek, ix), kw, ks, ks);
+                prog.emit(c);
+                Val zero = mk(0, 32); zero.sgn = true;
+                E better = n == "min" ? bin(Op::Lt, ref(cur, ks), ref(bk, ks)) : bin(Op::Gt, ref(cur, ks), ref(bk, ks));
+                Instr j; j.k = IK::JmpIfNot;
+                j.e = bin(Op::LogOr, bin(Op::Lt, ref(best, true), konst(zero)), better);
+                size_t jf = prog.emit(j);
+                Instr s1; s1.k = IK::Assign; s1.sig = bk; s1.e = ref(cur, ks); prog.emit(s1);
+                Instr s2; s2.k = IK::Assign; s2.sig = best; s2.e = ref(ix, true); prog.emit(s2);
+                prog.code[jf].target = prog.here();
+            });
+            Val zero = mk(0, 32); zero.sgn = true;
+            Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Ge, ref(best, true), konst(zero));
+            size_t jf = prog.emit(j);
+            push(best);
+            prog.code[jf].target = prog.here();
+            return res;
+        }
+        if (n == "unique" || n == "unique_index") {
+            // element ix is kept when no earlier element has an equal key
+            int cur = fresh(kw), dup = fresh(1);
+            dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                Instr c; c.k = IK::Assign; c.sig = cur; c.e = resize(elemKey(ek, ix), kw, ks, ks); prog.emit(c);
+                Instr z; z.k = IK::Assign; z.sig = dup; z.e = konst(mk(0, 1)); prog.emit(z);
+                int jx = fresh(32);
+                Val zero = mk(0, 32); zero.sgn = true;
+                Val one = mk(1, 32); one.sgn = true;
+                Instr j0; j0.k = IK::Assign; j0.sig = jx; j0.e = konst(zero); prog.emit(j0);
+                size_t top = prog.here();
+                Instr jt; jt.k = IK::JmpIfNot; jt.e = bin(Op::Lt, ref(jx, true), ref(ix, true));
+                size_t jf = prog.emit(jt);
+                E eq = bin(Op::CaseEq, resize(elemKey(ek, jx), kw, ks, ks), ref(cur, ks));
+                Instr sd; sd.k = IK::Assign; sd.sig = dup;
+                sd.e = bin(Op::LogOr, ref(dup, false), eq);
+                prog.emit(sd);
+                Instr inc; inc.k = IK::Assign; inc.sig = jx; inc.e = bin(Op::Add, ref(jx, true), konst(one)); prog.emit(inc);
+                Instr bk; bk.k = IK::Jmp; bk.target = top; prog.emit(bk);
+                prog.code[jf].target = prog.here();
+                Instr k; k.k = IK::JmpIfNot; k.e = un(Op::LogNot, ref(dup, false));
+                size_t kf = prog.emit(k);
+                push(ix);
+                prog.code[kf].target = prog.here();
+            });
+            return res;
+        }
+        unsupported("locator method");
+    }
+
     // Built-in methods of a container (7.5.2, 7.8, 7.9, 7.10.2, 7.12): as a
     // value, or as a statement when wantValue is false.
     E dynMethod(const slang::ast::CallExpression& call, bool wantValue) {
@@ -2099,9 +2329,53 @@ struct Lowerer {
         std::string_view n = call.getSubroutineName();
         auto args = call.arguments();
         int d = dynSig(*args[0]);
+        if (d < 0) d = fixedAsQueue(*args[0]);
         const DynObj& o = dynShape(d);
+        const Expression* withE = nullptr;
+        const ValueSymbol* itSym = nullptr;
         if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
-            if (sci->getIteratorInfo().first) unsupported("array method with a `with` clause");
+            std::tie(withE, itSym) = sci->getIteratorInfo();
+        if (withE || isLocator(n)) {
+            if (!stmtDepth) unsupported("array method with a `with` clause outside a procedural statement");
+            if (o.kind == 2) unsupported("locator or with method of an associative array");
+            ElemKey ek{d, withE, itSym, -1};
+            if (itSym) {
+                int w = storeW(itSym->getType());
+                needWidth(w);
+                ek.itSig = fresh(w);
+                sigmap[itSym] = ek.itSig;
+            }
+            static const std::pair<const char*, Op> redw[] = {
+                {"sum", Op::Add}, {"product", Op::Mul}, {"and", Op::And}, {"or", Op::Or}, {"xor", Op::Xor}};
+            for (auto& [s, op] : redw)
+                if (n == s) {   // 7.12.3: the result has the type of the with expression
+                    int w = (int)call.type->getBitWidth();
+                    bool sg = call.type->isSigned();
+                    if (!call.type->isIntegral()) unsupported("reduction with a non-integral with clause");
+                    int acc = fresh(w);
+                    Val init = n == "product" ? mk(1, w) : n == "and" ? v_not(mk(0, w)) : mk(0, w);
+                    Instr a0; a0.k = IK::Assign; a0.sig = acc; a0.e = konst(init); prog.emit(a0);
+                    dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                        Instr a; a.k = IK::Assign; a.sig = acc;
+                        a.e = bin(op, ref(acc, sg), resize(elemKey(ek, ix), w, withE ? withE->type->isSigned() : sg, sg));
+                        prog.emit(a);
+                    });
+                    return ref(acc, sg);
+                }
+            if (n == "sort" || n == "rsort") {   // 7.12.2: order by the with expression
+                if (wantValue) unsupported("sort used as a value");
+                int kc = keyQueue(*withE->type);
+                dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                    Instr p = dynCmd(kc, D_PUSH_BACK); p.e = elemKey(ek, ix); prog.emit(p);
+                });
+                Instr i = dynCmd(d, n == "sort" ? D_SORT_BY : D_RSORT_BY);
+                i.dsrc = kc;
+                prog.emit(i);
+                return nullptr;
+            }
+            if (isLocator(n)) unsupported("locator method here (assign its result to a queue)");
+            unsupported("array method with a `with` clause");
+        }
         if (n == "size" || n == "num" || n == "$size") return dynSize(d);
         if (n == "exists") {
             auto x = node(Op::DynExists, {dynKey(d, *args[1])});
@@ -2310,6 +2584,14 @@ struct Lowerer {
                 if (!lvalue) unsupported("lvalue reference");
                 return expr(*lvalue, ctx);
             }
+            case ExpressionKind::TaggedUnion:
+                return sized(taggedValue(e.as<TaggedUnionExpression>()), storeW(*e.type), false, ctx);
+            case ExpressionKind::Streaming: {
+                const auto& sc = e.as<StreamingConcatenationExpression>();
+                int w = 0;
+                E v = streamBits(sc, w);
+                return sized(v, w, false, ctx);
+            }
             case ExpressionKind::Conversion: {
                 // 4'hF inside an 8-bit add is a 4-bit literal under a conversion
                 // to 8. cnt+1 is a 32-bit add under a conversion to 4. Either
@@ -2319,6 +2601,14 @@ struct Lowerer {
                 // (11.8.3): extend with the operand's signedness. An outer width
                 // still wins, so a truncating assign stays narrow.
                 const auto& c = e.as<ConversionExpression>();
+                if (peel(c.operand()).kind == ExpressionKind::Streaming && c.type->isIntegral()) {
+                    // a stream into a wider integral type is left-aligned,
+                    // padded with zeros on the right (11.4.14)
+                    int w = (int)c.type->getBitWidth();
+                    needWidth(w);
+                    return sized(streamTo(peel(c.operand()).as<StreamingConcatenationExpression>(), w),
+                                 w, c.type->isSigned(), ctx);
+                }
                 if (c.operand().type->isString() && c.type->isIntegral()) {   // the text as bytes (6.16)
                     int w = (int)c.type->getBitWidth();
                     needWidth(w);
@@ -2381,7 +2671,9 @@ struct Lowerer {
                     if (w != 64) t = resize(std::move(t), w, false, false);
                     return sized(std::move(t), w, false, ctx);
                 }
-                if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.size(), aa.exists(k) ...
+                if (!call.arguments().empty() &&
+                    (dynSig(*call.arguments()[0]) >= 0 ||
+                     (isFixedArr(*call.arguments()[0]) && isReduction(n)))) {   // q.size(), aa.exists(k), a.sum() ...
                     int w = storeW(*e.type);
                     needWidth(w);
                     return sized(dynMethod(call, true), w, e.type->isSigned(), ctx);
@@ -2783,6 +3075,16 @@ struct Lowerer {
         using namespace slang::ast;
         if (t.kind == TimingControlKind::SignalEvent) {
             const auto& s = t.as<SignalEventControl>();
+            if (isGlobalClock(s.expr)) {   // @($global_clock): the global clocking's event (14.14)
+                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $global_clock");
+                collectEvents(globalClocking()->getEvent(), ev);
+                return;
+            }
+            if (const auto* cb = clockingRef(s.expr)) {   // @(cb): the clocking block event (14.10)
+                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a clocking block event");
+                ev.push_back({clockings()[clockingIdx(*cb)].evSig, ANY});
+                return;
+            }
             int sig;
             if (classMember(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x)
             else {
@@ -2808,6 +3110,9 @@ struct Lowerer {
                 prog.emit(i);
                 break;
             }
+            case TimingControlKind::CycleDelay:   // ##n (14.11)
+                cycleDelay(t.as<CycleDelayControl>());
+                break;
             case TimingControlKind::ImplicitEvent: {   // @*  -> patched once the whole block is lowered
                 Instr i; i.k = IK::WaitEdge;
                 implicitWaits.push_back(prog.emit(i));
@@ -3146,6 +3451,7 @@ struct Lowerer {
         return resize(slice(ref(tmp), 31, 0), 32, false, true);
     }
     E sysFn(const slang::ast::CallExpression& call, std::string_view n) {
+        if (E r = sampledFn(call, n)) return r;   // $past, $rose, ... (16.9.3)
         if (E r = enumMethod(call)) return r;
         auto args = call.arguments();
         auto a = [&](size_t i) { return expr(*args[i]); };
@@ -3760,6 +4066,7 @@ struct Lowerer {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
         if (n == "$fatal" || n == "$error" || n == "$warning" || n == "$info") { severity(call, n); return; }
+        if (assertCtlCall(call, n)) return;   // $asserton, $assertcontrol, ... (20.11)
         if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.push_back(x), aa.delete(k) ...
             dynMethod(call, false);
             return;
@@ -3881,6 +4188,158 @@ struct Lowerer {
         prog.emit(i);
     }
 
+    // {<<s{...}} (11.4.14.2): the stream cut into s-bit slices from the
+    // right, in reverse order, so the rightmost slice comes first and the
+    // leftmost one, which may be shorter, comes last.
+    static E reverseSlices(E v, int w, int s) {
+        if (s <= 0 || s >= w) return v;
+        std::vector<E> parts;
+        for (int lo = 0; lo < w; lo += s) parts.push_back(slice(v, std::min(lo + s, w) - 1, lo));
+        return concat(std::move(parts));
+    }
+    // The inverse, for unpacking (11.4.14.3): the first s bits of the stream
+    // are the rightmost slice of the targets.
+    static E unreverseSlices(E v, int w, int s) {
+        if (s <= 0 || s >= w) return v;
+        std::vector<E> parts;   // slices of the targets, rightmost first
+        int hi = w - 1;
+        for (int lo = 0; lo < w; lo += s) {
+            int len = std::min(lo + s, w) - lo;
+            parts.push_back(slice(v, hi, hi - len + 1));
+            hi -= len;
+        }
+        std::reverse(parts.begin(), parts.end());
+        return concat(std::move(parts));
+    }
+    // The bits of a streaming concatenation of integral operands, and fixed
+    // unpacked arrays of them (elements left to right).
+    E streamBits(const slang::ast::StreamingConcatenationExpression& sc, int& w) {
+        using namespace slang::ast;
+        std::vector<E> parts;
+        w = 0;
+        for (auto& st : sc.streams()) {
+            if (st.withExpr) unsupported("with [] in a streaming concatenation");
+            const Expression& op = peel(*st.operand);
+            int pw = 0;
+            if (op.kind == ExpressionKind::Streaming) {
+                parts.push_back(streamBits(op.as<StreamingConcatenationExpression>(), pw));
+            } else if (op.type->isIntegral()) {
+                pw = (int)op.type->getBitWidth();
+                parts.push_back(expr(op));
+            } else if (isFixedArr(op) && op.kind == ExpressionKind::NamedValue) {
+                auto it = arrMap().find(&op.as<NamedValueExpression>().symbol);
+                if (it == arrMap().end() || it->second->dims.size() != 1 ||
+                    !op.type->getArrayElementType()->isIntegral())
+                    unsupported("this array in a streaming concatenation");
+                int ew = (int)op.type->getArrayElementType()->getBitWidth();
+                auto r = op.type->getCanonicalType().as<FixedSizeUnpackedArrayType>().range;
+                (void)r;
+                for (int k = 0; k < it->second->count; k++) {   // foreach order: left index first
+                    parts.push_back(ref(it->second->base + k));
+                    pw += ew;
+                }
+            } else {
+                unsupported("this operand in a streaming concatenation");
+            }
+            w += pw;
+        }
+        needWidth(w);
+        E v = parts.size() == 1 ? parts[0] : concat(std::move(parts));
+        return reverseSlices(v, w, (int)sc.getSliceSize());
+    }
+    E streamTo(const slang::ast::StreamingConcatenationExpression& sc, int w) {
+        int sw = 0;
+        E v = streamBits(sc, sw);
+        if (w == sw) return v;
+        if (w < sw) return slice(v, sw - 1, sw - w);
+        return concat({v, konst(mk(0, w - sw))});
+    }
+
+    // x matches p (12.6): x is held in a temporary, so pattern variables
+    // bound along the way read a stable value.
+    E matchExpr(const slang::ast::Expression& x, const slang::ast::Pattern& p,
+                slang::ast::CaseStatementCondition cc) {
+        int w = storeW(*x.type);
+        needWidth(w);
+        int v = fresh(w);
+        Instr h; h.k = IK::Assign; h.sig = v; h.e = storageOf(*x.type, x); prog.emit(h);
+        return matchP(p, ref(v), *x.type, w, cc);
+    }
+    // Whether v (w bits, the storage of a value of type t) matches p. A
+    // pattern variable is bound here, whether or not the match succeeds.
+    E matchP(const slang::ast::Pattern& p, E v, const slang::ast::Type& t0, int w,
+             slang::ast::CaseStatementCondition cc) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        Op eqOp = cc == CaseStatementCondition::Normal ? Op::CaseEq
+                  : cc == CaseStatementCondition::WildcardJustZ ? Op::CaseZEq : Op::CaseXEq;
+        switch (p.kind) {
+            case PatternKind::Wildcard: return konst(mk(1, 1));
+            case PatternKind::Variable: {
+                const auto& var = p.as<VariablePattern>().variable;
+                int sig = fresh(w);
+                sigmap[&var] = sig;
+                Instr a; a.k = IK::Assign; a.sig = sig; a.e = v; prog.emit(a);
+                return konst(mk(1, 1));
+            }
+            case PatternKind::Constant: {
+                const Expression& ce = p.as<ConstantPattern>().expr;
+                if (t.isFloating() || t.isString()) unsupported("constant pattern of a real or string");
+                return bin(eqOp, v, resize(storageOf(t, ce), w, ce.type->isSigned(), false));
+            }
+            case PatternKind::Tagged: {
+                const auto& tp = p.as<TaggedPattern>();
+                if (!isTaggedUnion(t)) unsupported("tagged pattern");
+                int tb = tagBitsOf(t);
+                int idx = tagIndexOf(t, tp.member);
+                E cond = tb > 0 ? bin(Op::CaseEq, slice(v, w - 1, w - tb), konst(mk((uint64_t)idx, tb)))
+                                : konst(mk(1, 1));
+                if (tp.valuePattern) {
+                    const Type& mt = tp.member.getType();
+                    int fw = t.isUnpackedUnion() ? uWidth(mt) : (int)mt.getBitWidth();
+                    if (fw > 0) cond = bin(Op::LogAnd, cond, matchP(*tp.valuePattern, slice(v, fw - 1, 0), mt, fw, cc));
+                }
+                return cond;
+            }
+            case PatternKind::Structure: {
+                const auto& sp = p.as<StructurePattern>();
+                E cond = konst(mk(1, 1));
+                for (auto& fp : sp.patterns) {
+                    const Type& ft = fp.field->getType();
+                    int off, fw;
+                    if (t.isUnpackedStruct()) std::tie(off, fw) = uField(t, *fp.field);
+                    else { off = (int)fp.field->bitOffset; fw = (int)ft.getBitWidth(); }
+                    if (fw <= 0) unsupported("structure pattern member");
+                    cond = bin(Op::LogAnd, cond, matchP(*fp.pattern, slice(v, off + fw - 1, off), ft, fw, cc));
+                }
+                return cond;
+            }
+            default: unsupported("pattern");
+        }
+    }
+    // tagged M v (11.9): the tag on top, the member value right-justified.
+    E taggedValue(const slang::ast::TaggedUnionExpression& te) {
+        using namespace slang::ast;
+        const Type& t = te.type->getCanonicalType();
+        int w = t.isUnpackedUnion() ? uWidth(t) : (int)t.getBitWidth();
+        needWidth(w);
+        int tb = tagBitsOf(t);
+        int idx = tagIndexOf(t, te.member);
+        const Type& mt = te.member.as<FieldSymbol>().getType();
+        int fw = 0;
+        E val;
+        if (te.valueExpr && !mt.isVoid()) {
+            fw = t.isUnpackedUnion() ? uWidth(mt) : (int)mt.getBitWidth();
+            val = t.isUnpackedUnion() ? storageOf(mt, *te.valueExpr)
+                                      : resize(expr(*te.valueExpr), fw, te.valueExpr->type->isSigned(), false);
+        }
+        std::vector<E> parts;
+        if (tb > 0) parts.push_back(konst(mk((uint64_t)idx, tb)));
+        if (w - tb - fw > 0) parts.push_back(konst(mk(0, w - tb - fw)));
+        if (val) parts.push_back(val);
+        return parts.size() == 1 ? parts[0] : concat(std::move(parts));
+    }
+
     // The parts of a concatenation assignment target, first (most
     // significant) first, with their offsets in the whole (11.4.12, 10.4).
     static void concatParts(const slang::ast::Expression& e, int hi,
@@ -3940,11 +4399,48 @@ struct Lowerer {
         }
     }
 
+    // {>>{a, b}} = v; {<<8{a, b}} = v (11.4.14.3): the leftmost bits of v,
+    // slices reversed for <<, are spread over the targets, first one on top.
+    void streamAssign(const slang::ast::AssignmentExpression& a) {
+        using namespace slang::ast;
+        if (a.timingControl || a.isCompound()) unsupported("delayed or compound streaming assignment");
+        const auto& sc = peel(a.left()).as<StreamingConcatenationExpression>();
+        std::vector<std::pair<const Expression*, int>> tg;   // target, width
+        int sw = 0;
+        for (auto& st : sc.streams()) {
+            if (st.withExpr) unsupported("with [] in a streaming concatenation");
+            const Expression& op = peel(*st.operand);
+            if (!op.type->isIntegral()) unsupported("this target of a streaming assignment");
+            int w = (int)op.type->getBitWidth();
+            tg.push_back({&op, w});
+            sw += w;
+        }
+        needWidth(sw);
+        const Expression& r = peel(a.right());
+        int rw = (int)r.type->getBitWidth();
+        if (!r.type->isIntegral() || rw < sw) unsupported("streaming assignment from a narrower or non-integral value");
+        E v = expr(r);
+        if (rw > sw) v = slice(v, rw - 1, rw - sw);
+        int tmp = fresh(sw);
+        Instr hold; hold.k = IK::Assign; hold.sig = tmp; hold.e = unreverseSlices(v, sw, (int)sc.getSliceSize());
+        prog.emit(hold);
+        int hi = sw - 1;
+        for (auto& [x, w] : tg) {
+            Instr i;
+            i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
+            lhs(*x, i);
+            i.e = slice(ref(tmp), hi, hi - w + 1);
+            prog.emit(i);
+            hi -= w;
+        }
+    }
+
     // Assignments, ++/--, and system calls used as statements.
     void exprStmt(const slang::ast::Expression& ex) {
         using namespace slang::ast;
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
+            if (syncDrive(a)) return;   // cb.v <= e (14.16)
             if (int d = dynSig(a.left()); d >= 0) {   // q = '{1, 2}; d = new[8]; aa = other;
                 if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this container assignment");
                 assignContainer(d, a.right());
@@ -3955,6 +4451,10 @@ struct Lowerer {
                 return;
             if (peel(a.left()).kind == ExpressionKind::Concatenation) {
                 concatAssign(a);
+                return;
+            }
+            if (peel(a.left()).kind == ExpressionKind::Streaming) {
+                streamAssign(a);
                 return;
             }
             Instr i;
@@ -4118,6 +4618,8 @@ struct Lowerer {
                     if (!b.blockSymbol || b.blockSymbol->name.empty()) { stmt(b.body); break; }
                     size_t k = named.size();
                     named.push_back({b.blockSymbol, {}});
+                    labelSym = b.blockSymbol;   // label: assert ... names the assertion
+                    labelOf = &b.body;
                     stmt(b.body);
                     patch(named[k].second, prog.here());   // disable blk: jump past it
                     named.pop_back();
@@ -4153,6 +4655,8 @@ struct Lowerer {
                     lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
                     lw.current = current;
                     lw.retSig = retSig;
+                    lw.scope = scope;
+                    lw.sampleEv = sampleEv;
                     // Each branch has a frame for its own automatic variables
                     // (and temporaries), unless it is plain static code.
                     FrameLayout* bl = newLayout("fork branch");
@@ -4221,20 +4725,50 @@ struct Lowerer {
                 break;
             }
             case StatementKind::Conditional: {
+                // if (a &&& b matches p &&& c) (12.6.2): each condition in
+                // turn; a pattern binds its variables for the ones after it.
                 const auto& c = s.as<ConditionalStatement>();
-                if (c.conditions.size() != 1) unsupported("pattern if");
-                Instr j; j.k = IK::JmpIfNot; j.e = expr(*c.conditions[0].expr);
-                size_t jf = prog.emit(j);
+                std::vector<size_t> jfs;
+                for (auto& cd : c.conditions) {
+                    Instr j; j.k = IK::JmpIfNot;
+                    j.e = cd.pattern ? matchExpr(*cd.expr, *cd.pattern, CaseStatementCondition::Normal)
+                                     : expr(*cd.expr);
+                    jfs.push_back(prog.emit(j));
+                }
                 stmt(c.ifTrue);
                 if (c.ifFalse) {
                     Instr skip; skip.k = IK::Jmp;
                     size_t js = prog.emit(skip);
-                    prog.code[jf].target = prog.here();
+                    for (size_t jf : jfs) prog.code[jf].target = prog.here();
                     stmt(*c.ifFalse);
                     prog.code[js].target = prog.here();
                 } else {
-                    prog.code[jf].target = prog.here();
+                    for (size_t jf : jfs) prog.code[jf].target = prog.here();
                 }
+                break;
+            }
+            case StatementKind::PatternCase: {   // case (x) matches (12.6.1)
+                const auto& c = s.as<PatternCaseStatement>();
+                int w = storeW(*c.expr.type);
+                needWidth(w);
+                int v = fresh(w);
+                Instr h; h.k = IK::Assign; h.sig = v; h.e = storageOf(*c.expr.type, c.expr); prog.emit(h);
+                std::vector<size_t> toEnd;
+                for (auto& it : c.items) {
+                    std::vector<size_t> next;
+                    Instr j; j.k = IK::JmpIfNot; j.e = matchP(*it.pattern, ref(v), *c.expr.type, w, c.condition);
+                    next.push_back(prog.emit(j));
+                    if (it.filter) {
+                        Instr g; g.k = IK::JmpIfNot; g.e = expr(*it.filter);
+                        next.push_back(prog.emit(g));
+                    }
+                    stmt(*it.stmt);
+                    Instr skip; skip.k = IK::Jmp;
+                    toEnd.push_back(prog.emit(skip));
+                    for (size_t x : next) prog.code[x].target = prog.here();
+                }
+                if (c.defaultCase) stmt(*c.defaultCase);
+                for (size_t x : toEnd) prog.code[x].target = prog.here();
                 break;
             }
             case StatementKind::ExpressionStatement:
@@ -4499,6 +5033,55 @@ struct Lowerer {
                 for (size_t k : toEnd) prog.code[k].target = prog.here();
                 break;
             }
+            case StatementKind::WaitOrder: {   // wait_order (a, b, c) pass; else fail (15.5.4)
+                // For each event in turn, wait for it or any later one. A
+                // later one triggering first is out of order and fails.
+                const auto& w = s.as<WaitOrderStatement>();
+                std::vector<int> ev;
+                for (auto* x : w.events) ev.push_back(eventSig(*x));
+                std::vector<size_t> toFail;
+                for (size_t k = 0; k < ev.size(); k++) {
+                    std::vector<int> snap;
+                    std::vector<std::pair<int, Edge>> on;
+                    for (size_t j = k; j < ev.size(); j++) {
+                        int sn = fresh(32);
+                        Instr c; c.k = IK::Assign; c.sig = sn; c.e = ref(ev[j]); prog.emit(c);
+                        snap.push_back(sn);
+                        on.push_back({ev[j], ANY});
+                    }
+                    size_t top = prog.here();
+                    prog.emit(waitInstr(on));
+                    for (size_t j = k + 1; j < ev.size(); j++) {
+                        Instr f; f.k = IK::JmpIfNot; f.e = bin(Op::CaseEq, ref(ev[j]), ref(snap[j - k]));
+                        toFail.push_back(prog.emit(f));
+                    }
+                    Instr again; again.k = IK::JmpIfNot; again.e = un(Op::LogNot, bin(Op::CaseEq, ref(ev[k]), ref(snap[0])));
+                    again.target = top;
+                    prog.emit(again);
+                }
+                if (w.ifTrue) stmt(*w.ifTrue);
+                Instr skip; skip.k = IK::Jmp;
+                size_t js = prog.emit(skip);
+                for (size_t f : toFail) prog.code[f].target = prog.here();
+                if (w.ifFalse) stmt(*w.ifFalse);
+                else {   // no else: the failure is an error (15.5.4)
+                    std::string file = "?";
+                    size_t line = 0;
+                    if (const auto* sm = srcMgr()) {
+                        auto loc = sm->getFullyOriginalLoc(s.sourceRange.start());
+                        file = std::string(sm->getFileName(loc));
+                        line = sm->getLineNumber(loc);
+                    }
+                    Instr i; i.k = IK::Display;
+                    i.fmt = "Error: \"" + file + "\", " + std::to_string(line) +
+                            ": wait_order: events triggered out of order at time %0t";
+                    E t = node(Op::Time); t->k = mk(1, 64);
+                    i.args.push_back(t);
+                    prog.emit(i);
+                }
+                prog.code[js].target = prog.here();
+                break;
+            }
             case StatementKind::EventTrigger: {   // -> e, ->> e (15.5.1)
                 const auto& t = s.as<EventTriggerStatement>();
                 int sig = eventSig(t.target);
@@ -4569,6 +5152,10 @@ struct Lowerer {
                 break;
             }
             case StatementKind::WaitFork: { Instr i; i.k = IK::WaitFork; prog.emit(i); break; }
+            case StatementKind::ImmediateAssertion: immAssert(s.as<ImmediateAssertionStatement>()); break;
+            case StatementKind::ConcurrentAssertion:
+                concAssert(s.as<ConcurrentAssertionStatement>());
+                break;
             case StatementKind::DisableFork: { Instr i; i.k = IK::DisableFork; prog.emit(i); break; }
             default:
                 throw std::runtime_error("lower: unsupported statement kind " + std::string(toString(s.kind)));
@@ -4753,6 +5340,18 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         std::string saved = prefix;
         prefix += std::string(c.name) + "::";
         visitDefault(c);
+        prefix = std::move(saved);
+    }
+    // A clocking block (14): its event is a pair of signals like a named
+    // event's, and its clockvars are named cb.x.
+    void handle(const slang::ast::ClockingBlockSymbol& cb) {
+        std::string name = prefix + std::string(cb.name.empty() ? "$cb" : cb.name);
+        int id = mkSig(name, 32, false);
+        if (mkSig(name + "$trig", 64, false) != id + 1) Lowerer::unsupported("event signals that are not consecutive");
+        sigmap[&cb] = id;
+        std::string saved = prefix;
+        prefix = name + ".";
+        visitDefault(cb);
         prefix = std::move(saved);
     }
     // A modport port (25.5) is another name for a signal of its interface.
@@ -5228,13 +5827,65 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
     }
+    void handle(const slang::ast::ClockingBlockSymbol& cb) {   // 14: runs on its clocking event
+        Lowerer lw(sigmap);
+        prep(lw);
+        lw.setScope(cb.getParentScope());
+        lw.clockingIdx(cb);
+    }
+    // The clock a procedure infers for its sampled value functions and
+    // assertions (16.14.6): an event control at its start.
+    static const slang::ast::TimingControl* leadingEvent(const slang::ast::Statement& st) {
+        using namespace slang::ast;
+        if (st.kind == StatementKind::Timed) {
+            const auto& t = st.as<TimedStatement>().timing;
+            if (t.kind == TimingControlKind::SignalEvent || t.kind == TimingControlKind::EventList) return &t;
+            return nullptr;
+        }
+        if (st.kind == StatementKind::Block && st.as<BlockStatement>().blockKind == StatementBlockKind::Sequential)
+            return leadingEvent(st.as<BlockStatement>().body);
+        if (st.kind == StatementKind::List && !st.as<StatementList>().list.empty())
+            return leadingEvent(*st.as<StatementList>().list[0]);
+        return nullptr;
+    }
+    // An assertion written as a module item (16.4.3, 16.14.5). slang wraps it
+    // in a procedure marked isFromAssertion.
+    void assertionItem(const slang::ast::ProceduralBlockSymbol& p) {
+        using namespace slang::ast;
+        const Statement* st = &p.getBody();
+        if (st->kind == StatementKind::Block && st->as<BlockStatement>().blockKind == StatementBlockKind::Sequential)
+            st = &st->as<BlockStatement>().body;
+        Lowerer lw(sigmap);
+        prep(lw);
+        lw.setScope(p.getParentScope());
+        if (st->kind == StatementKind::ConcurrentAssertion) {   // runs on its clock, not as a process
+            lw.staticAssert = true;
+            lw.stmt(p.getBody());
+            return;
+        }
+        if (st->kind != StatementKind::ImmediateAssertion) Lowerer::unsupported("this assertion item");
+        // A static deferred assertion acts as if in an always_comb (16.4.3).
+        lw.stmt(p.getBody());
+        auto rs = readSet(lw.prog);
+        bool loops = !rs.empty();
+        if (loops) {
+            lw.prog.emit(waitInstr(rs));
+            Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "always_comb"});
+    }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
+        if (p.isFromAssertion) { assertionItem(p); return; }
         // A final block (9.2.3) runs once when simulation ends. Lowering it as
         // a process would run it at time 0 and, looping, forever.
         Lowerer lw(sigmap);
         prep(lw);
         lw.setScope(p.getParentScope());
+        if (p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final)
+            if (const auto* t = leadingEvent(p.getBody())) {
+                try { E iff; lw.clockOf(*t, lw.sampleEv, iff); } catch (const std::runtime_error&) { lw.sampleEv.clear(); }
+            }
         lw.stmt(p.getBody());
         lw.finishImplicit();
         if (p.procedureKind == ProceduralBlockKind::Initial)
@@ -5471,11 +6122,52 @@ inline void buildClasses(const std::vector<const slang::ast::ClassType*>& cs,
                          LowerResult& out, std::vector<std::unique_ptr<Subr>>& owned, std::vector<Subr*>& order) {
     for (const auto* c : cs) buildClass(*c, subMap, out, owned, order);
 }
+// Default sampled values (16.5.1): at time 0, right after the declaration
+// initializers ran, every shadow takes its signal's value and every $past
+// stage the sampled value of its expression.
+inline void sampledInit(LowerResult& out) {
+    if (shadowPairs().empty() && sampleClocks().empty()) return;
+    Prog p;
+    for (auto [src, sh] : shadowPairs()) {
+        Instr i; i.k = IK::Assign; i.sig = sh; i.e = ref(src);
+        p.emit(i);
+    }
+    for (auto& c : sampleClocks())
+        for (auto& ln : c.lines)
+            for (int st : ln.stages) {
+                Instr i; i.k = IK::Assign; i.sig = st; i.e = ln.src;
+                p.emit(i);
+            }
+    size_t at = 0;
+    for (size_t k = 0; k < out.procs.size(); k++)
+        if (out.procs[k].kind == "init") at = k + 1;
+    out.procs.insert(out.procs.begin() + (ptrdiff_t)at, {std::move(p), false, "sampled"});
+}
 
 inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                          std::function<int(int)> newDriver) {
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
+    asserts().clear();
+    concAsserts().clear();
+    sva::store().clear();
+    shadowPairs().clear();
+    sampleClocks().clear();
+    clockings().clear();
+    Lowerer::clockingIdxMap().clear();
+    sigInfo().clear();
+    Lowerer::shadowMap().clear();
+    Lowerer::shadowArrs().clear();
+    Lowerer::compilation() = &comp;
+    {   // remember every signal's name and width, for sampled-value shadows (16.5.1)
+        MkSig inner = std::move(mkSig);
+        mkSig = [inner](const std::string& n, int w, bool net) {
+            int id = inner(n, w, net);
+            if ((size_t)id >= sigInfo().size()) sigInfo().resize(id + 1);
+            sigInfo()[id] = {n, w};
+            return id;
+        };
+    }
     arrMap().clear();
     localMap().clear();
     localArr().clear();
@@ -5762,6 +6454,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     comp.getRoot().visit(pc);
     pc.finishPaths();
     pc.placeInit();
+    sampledInit(out);
     rejectRecursive(order);
     for (const slang::ast::Symbol* b : blockIds().disabledFromOutside)
         if (!blockIds().roots.count(blockIds().of(b)))
