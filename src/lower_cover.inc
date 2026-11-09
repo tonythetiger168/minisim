@@ -144,6 +144,16 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
     auto savedUnit = tsUnit, savedPrec = tsPrec;
     setScope(t.getParentScope());
     CgDef d;
+    // A covergroup in a class (19.4): its expressions read the properties
+    // of the object it was created for, through `this`, with no frame.
+    ClassInfo* savedCls = curClass;
+    auto savedFrames = std::move(frames);
+    frames.clear();
+    const Symbol& ps = t.getParentScope()->asSymbol();
+    if (ps.kind == SymbolKind::ClassType) {
+        curClass = classInfo(ps.as<ClassType>());
+        d.inClass = true;
+    }
     d.name = t.getParentScope()->asSymbol().getHierarchicalPath() + "." + std::string(t.name);
     auto hidden = [&](const Symbol& s, const Type& ty) {
         int w = storeW(ty);
@@ -278,6 +288,8 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
     cgDefs().push_back(std::move(d));
     int idx = (int)cgDefs().size() - 1;
     cgIdxMap()[&t] = idx;
+    curClass = savedCls;
+    frames = std::move(savedFrames);
     scope = savedScope;
     tsUnit = savedUnit; tsPrec = savedPrec;
     return idx;
@@ -301,6 +313,10 @@ E cgNew(const slang::ast::Expression& e, std::span<const slang::ast::Expression*
             ks.push_back(konst(mk((uint64_t)s, 32)));
         } else
             ks.push_back(resize(expr(*a), sigInfo()[cgDefs()[d].argSigs[k]].second, a->type->isSigned(), false));
+    }
+    if (cgDefs()[d].inClass) {
+        if (!curClass) unsupported("new() of a class's covergroup outside its class");
+        ks.push_back(node(Op::This));
     }
     return sysFnNode(SF_CG, std::move(ks), CG_NEW);
 }
