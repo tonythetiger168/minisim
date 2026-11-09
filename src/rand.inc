@@ -351,6 +351,7 @@ inline bool runFns(Item& k) {
     FrameP fp(k.fr, [](Frame*) {});   // the item's frame, owned by randomize()
     for (const auto& p : k.it->fns) {
         auto ctl = std::make_shared<ProcCtl>();
+        if (g_threadRng) ctl->rngp = g_threadRng;   // the calling process's generator
         Task t = exec(p.get(), ctl, fp);
         t.h.resume();
         if (!t.h.done()) {
@@ -774,6 +775,7 @@ static void runSync(const Prog* p, const FrameLayout* lay, int self) {
     Frame* sf = g_fr;
     Frame* sr = g_ret;
     auto ctl = make_shared<ProcCtl>();
+    if (g_threadRng) ctl->rngp = g_threadRng;   // the calling process's generator
     Task t = exec(p, ctl, newFrame(lay, nullptr, self));
     t.h.resume();
     if (!t.h.done()) {
