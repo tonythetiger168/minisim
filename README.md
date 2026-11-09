@@ -129,6 +129,31 @@ lines mean the same on msim, and a per-chapter pass table is printed
 (`-md FILE` also writes it as Markdown). See `tests/regress/smoke.list` and
 `mregress -h`.
 
+### Bug reports: `mbug`
+
+`mbug` (in the source tree `tools/mbug.py`) files each distinct failure as
+one issue in **GitHub Issues** (the default), **Redmine** or **Jira**. A
+failure that is already open gets a comment for the new occurrence instead
+of a duplicate. A failure whose issue was closed gets a new issue that links
+to the old one. Each issue has the failing tests and seeds, a reproduction
+command, the log tail and a link to the CI build. Redmine and Jira also get
+`sim.log` and `cmd.sh` attached.
+
+```sh
+export GITHUB_TOKEN=...                                          # issues: write
+mregress tests.list -o regress || mbug regress regress/results.json -project you/repo
+mlint -top top rtl/*.sv | mbug lint - -project you/repo          # one issue per rule
+mdft -top top rtl/*.sv > dft.log; mbug lint dft.log -tool mdft -project you/repo
+mbug regress regress/results.json -tracker jira -project VER     # JIRA_URL, JIRA_USER, JIRA_TOKEN
+mbug regress regress/results.json -tracker redmine -project soc  # REDMINE_URL, REDMINE_KEY
+mbug sync-github -repo you/repo -tracker jira -project VER       # GitHub issues -> Jira, kept in step
+mbug regress regress/results.json -project you/repo -dry-run     # show the plan only
+```
+
+Credentials are read only from the environment, and a `-config` file that
+contains a token is refused. See [`ci/README.md`](ci/README.md#bug-reports)
+and `mbug -h`.
+
 ### Coverage: `msim -cov` and `mcov`
 
 `msim -cov [file.json]` records line coverage, branch coverage (both outcomes
