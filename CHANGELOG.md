@@ -51,6 +51,9 @@ Spec references are IEEE 1800-2023 clauses.
   scope with `u.sum`).
 
 ### Fixed
+- msim could crash at exit when a process with an automatic frame (a
+  forked automatic task, a class method) was still suspended: its frame went
+  back to a frame shape that was already freed.
 - A static 2-state local of a task, function or block with no initializer
   (`static int c;`) started at x instead of 0 (6.8, 6.21).
 - A module-level unpacked array of a 2-state type (`int a[8]`) started at x
