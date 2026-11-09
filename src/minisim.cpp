@@ -431,6 +431,8 @@ struct Sim {
         vector<NbaItem> items; // this region's NBAs, in queue order
         vector<char> pend;     // per entry of `combs`
         int cur = -1;          // entry being evaluated
+        vector<pair<int, Val>> changed;   // with a waveform open: changes to dump afterwards, in order
+        bool wave = false;
     };
     vector<Part> parts;
     vector<int> sigPart;       // signal -> partition, or -1
@@ -485,8 +487,12 @@ struct Sim {
     void setLocal(int s, Val nv) {
         Sig& g = sigs[s];
         if (nv == g.val) return;
-        g.val = nv;
         Part& pt = *tlPart;
+        // Toggle masks of a partition's own signals are written only by the
+        // thread running it (the per-signal table is sized beforehand).
+        if (g_cov) covToggle(s, g.val, nv);
+        if (pt.wave) pt.changed.emplace_back(s, nv);
+        g.val = nv;
         for (int r : combOf[s]) {
             int k = combLocal[r];
             if (k != pt.cur) pt.pend[k] = 1;
@@ -523,7 +529,9 @@ struct Sim {
             }
             return;
         }
-        if (parts.empty() || waving() || mon.on || g_cov) {
+        // A waveform and coverage keep the partitions parallel: each records
+        // its changes (dumped below, in partition order) and toggles.
+        if (parts.empty() || mon.on) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
             for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
@@ -549,7 +557,15 @@ struct Sim {
         partsBusy.resize(keep);
         for (auto& n : nbaSerial) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
         if (!std::is_sorted(partsBusy.begin(), partsBusy.end())) std::sort(partsBusy.begin(), partsBusy.end());
+        bool wave = waving();
+        if (g_cov && togRise.size() < sigs.size()) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
+        for (int p : partsBusy) parts[p].wave = wave;
         parallelFor(partsBusy.size(), [&](size_t k) { runPart(parts[partsBusy[k]]); });
+        if (wave)
+            for (int p : partsBusy) {
+                for (auto& [sg, v] : parts[p].changed) dump(sg, v);
+                parts[p].changed.clear();
+            }
     }
 
     // ---- clocked processes as functions (prog.hpp: seqShape) ----
@@ -1201,13 +1217,14 @@ struct Sim {
         return t;
     }();
     // One value line, no timestamp. Shared so $dumpvars and later changes match.
-    void writeVal(int s) {
-        const Sig& g = sigs[s];
+    void writeVal(int s) { writeVal(s, sigs[s].val); }
+    void writeVal(int s, const Val& val) {
+        const int w = sigs[s].w;
 #ifdef MINISIM_FST
         if (fst) {
             // FST takes one '0' / '1' / 'x' / 'z' character per bit, MSB first.
-            fstBuf.resize((size_t)g.w);
-            putBits(fstBuf.data(), g.val, g.w);
+            fstBuf.resize((size_t)w);
+            putBits(fstBuf.data(), val, w);
             fstWriterEmitValueChange((fstWriterContext*)fst, fstH[s], fstBuf.data());
             return;
         }
@@ -1219,14 +1236,14 @@ struct Sim {
             for (size_t i = from; i < vcdIds.size(); i++) vcdIds[i] = vcdId(i);
         }
         const string& id = vcdIds[s];
-        if (g.w == 1) {
-            vbuf += (g.val.x & 1) ? ((g.val.z & 1) ? 'z' : 'x') : char('0' + (g.val.v & 1));
+        if (w == 1) {
+            vbuf += (val.x & 1) ? ((val.z & 1) ? 'z' : 'x') : char('0' + (val.v & 1));
         } else {
             size_t at = vbuf.size();
-            vbuf.resize(at + 1 + (size_t)g.w);
+            vbuf.resize(at + 1 + (size_t)w);
             char* p = vbuf.data() + at;
             *p++ = 'b';
-            putBits(p, g.val, g.w);
+            putBits(p, val, w);
             vbuf += ' ';
         }
         vbuf += id;
@@ -1239,12 +1256,13 @@ struct Sim {
         do { id += char('!' + i % 94); i /= 94; } while (i);
         return id;
     }
-    void dump(int s) {
+    void dump(int s) { dump(s, sigs[s].val); }
+    void dump(int s, const Val& v) {
         if (sigs[s].hide) return;
 #ifdef MINISIM_FST
         if (fst) {
             if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; }
-            writeVal(s);
+            writeVal(s, v);
             return;
         }
 #endif
@@ -1257,7 +1275,7 @@ struct Sim {
             vbuf += '\n';
             lastDump = now;
         }
-        writeVal(s);
+        writeVal(s, v);
     }
     // set() only writes a line when a value changes, so a signal still holding
     // its starting value (cnt stays X until the first clock) never appears.
