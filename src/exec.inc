@@ -168,9 +168,11 @@ static void readMem(const Instr& i) {
         addr += step;
         words++;
     }
-    // A file with no @address whose word count differs from the range warns.
+    // A file with no @address whose word count differs from the range warns
+    // (21.4): the range given by start and finish addresses, or, with no
+    // finish address, a file with more words than the memory has room for.
     int64_t range = (step > 0 ? finish - start : start - finish) + 1;
-    if (!sawAddr && words != range)
+    if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
 }
 
