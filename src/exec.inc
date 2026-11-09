@@ -217,6 +217,13 @@ inline void dynExec(const Instr& i) {
     auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
+    // A new element: e's value; for a container of containers a copy of
+    // container dsrc, or an empty one.
+    auto elemVal = [&]() -> Val {
+        if (!d.elem) return eval(i.e, rd);
+        if (dsrc >= 0) { DynObj one; one.elem = d.elem; return dynCopyElem(one, make((uint64_t)dsrc, 0, 64)); }
+        return dynNewElem(d);
+    };
     auto full = [&]() {   // a bounded queue drops what does not fit (7.10)
         bool f = d.kind == 1 && d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1;
         if (f) dynWarn("write past the bound of a bounded queue is ignored");
@@ -236,10 +243,10 @@ inline void dynExec(const Instr& i) {
             int64_t n = idx(0);
             if (n < 0) { dynWarn("new[] with a negative or unknown size"); n = 0; }
             std::vector<Val> nv((size_t)n, d.dflt);
-            if (dsrc >= 0) {
-                auto src = dynStore()[dsrc].vec;
-                for (size_t k = 0; k < nv.size() && k < src.size(); k++) nv[k] = src[k];
-            }
+            DynObj src;
+            if (dsrc >= 0) src = dynStore()[dsrc];
+            for (size_t k = 0; k < nv.size(); k++)
+                nv[k] = k < src.vec.size() ? dynCopyElem(src, src.vec[k]) : dynNewElem(d);
             d.vec = std::move(nv);
             break;
         }
@@ -251,12 +258,12 @@ inline void dynExec(const Instr& i) {
             d.vec.erase(d.vec.begin() + k);
             break;
         }
-        case D_PUSH_BACK: d.vec.push_back(eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
-        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_BACK: d.vec.push_back(elemVal()); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), elemVal()); if (full()) d.vec.pop_back(); break;
         case D_INSERT: {
             int64_t k = idx(0);
             if (k < 0 || k > (int64_t)d.vec.size()) { dynWarn("insert(i) outside the queue"); return; }
-            d.vec.insert(d.vec.begin() + k, eval(i.e, rd));
+            d.vec.insert(d.vec.begin() + k, elemVal());
             if (full()) d.vec.pop_back();
             break;
         }
@@ -282,20 +289,19 @@ inline void dynExec(const Instr& i) {
             return;   // the container did not change
         }
         case D_COPY: {
-            auto& s = dynStore()[dsrc];
-            if (d.kind == 2) d.map = s.map;
-            else { d.vec = s.kind == 2 ? std::vector<Val>{} : s.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+            dynAssign(d, dynStore()[dsrc]);
             break;
         }
         case D_APPEND: {   // {q, r}: every element of r
-            auto s = dynStore()[dsrc].vec;
-            d.vec.insert(d.vec.end(), s.begin(), s.end());
+            DynObj s = dynStore()[dsrc];
+            for (const Val& e : s.vec) d.vec.push_back(dynCopyElem(s, e));
             break;
         }
         case D_APPEND_SLICE: {   // q[a:b] (7.10.1): out-of-range parts are left out
-            auto s = dynStore()[dsrc].vec;
+            DynObj so = dynStore()[dsrc];
+            const auto& s = so.vec;
             int64_t a = std::max<int64_t>(idx(0), 0), b = std::min<int64_t>(idx(1), (int64_t)s.size() - 1);
-            for (int64_t k = a; k <= b; k++) d.vec.push_back(s[(size_t)k]);
+            for (int64_t k = a; k <= b; k++) d.vec.push_back(dynCopyElem(so, s[(size_t)k]));
             break;
         }
         case D_REVERSE: std::reverse(d.vec.begin(), d.vec.end()); break;
@@ -401,15 +407,35 @@ struct JoinWait {
     void await_resume() const {}
 };
 
+struct ProcCtl;
+// DPI-C imports (35) are run by dpi.inc, which msim links in. A call that
+// returns a JoinState is an import task waiting on an exported task that
+// consumes time: the process waits for it, then calls resume. kill runs a
+// waiting import task's C code to its end after the process is disabled (35.9).
+struct DpiHook {
+    shared_ptr<JoinState> (*call)(const Instr&, void*& fiber, const shared_ptr<ProcCtl>& ctl) = nullptr;
+    shared_ptr<JoinState> (*resume)(void* fiber) = nullptr;
+    void (*kill)(void* fiber) = nullptr;
+};
+inline DpiHook& dpiHook() { static DpiHook h; return h; }
+// VPI (36-38), set by vpi.inc: run the calltf of a user system task or function.
+inline void (*&vpiCallHook())(const Instr&) { static void (*h)(const Instr&) = nullptr; return h; }
+
 // One running process: its children (for wait fork / disable fork) and the
 // fork it belongs to. A disabled process ends at once for everyone waiting
 // on it; its coroutine, if it is resumed later, just returns.
 struct ProcCtl {
     Handle h{};
     bool killed = false, ended = false, waitingFork = false;
+    // std::process (9.7): suspended processes park at their next resume
+    // point; await() waiters resume when this one ends.
+    bool suspended = false, parked = false;
+    vector<Handle> awaiters;
+    int obj = 0;   // its process object, once process::self() made one
     weak_ptr<ProcCtl> parent;
     vector<shared_ptr<ProcCtl>> kids;
     shared_ptr<JoinState> join;
+    void* dpiFiber = nullptr;   // an import task waiting on an exported task (dpi.inc)
     // Deferred assertions (16.4.2): a resume after an event control is a
     // flush point; it bumps `epoch`, and reports queued before it are dropped.
     uint64_t epoch = 0;
@@ -428,6 +454,8 @@ inline unordered_map<int, vector<weak_ptr<ProcCtl>>>& rootProcs() {
 inline void procEnd(ProcCtl& c) {
     if (c.ended) return;
     c.ended = true;
+    for (Handle h : c.awaiters) S.active.push_back(h);
+    c.awaiters.clear();
     if (c.join) c.join->branchEnded();
     if (auto p = c.parent.lock())
         if (p->waitingFork && p->kidsDone()) { p->waitingFork = false; S.active.push_back(p->h); }
@@ -436,6 +464,11 @@ inline void procKill(const shared_ptr<ProcCtl>& c) {
     if (c->ended) return;
     c->killed = true;
     for (auto& k : c->kids) procKill(k);
+    if (c->dpiFiber && dpiHook().kill) {
+        void* f = c->dpiFiber;
+        c->dpiFiber = nullptr;
+        dpiHook().kill(f);
+    }
     S.dead.insert(c->h.address());
     procEnd(*c);
 }
@@ -447,6 +480,38 @@ struct WaitFork {
 };
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+
+// std::process (9.7): process objects index this table.
+inline vector<shared_ptr<ProcCtl>>& procTable() { static vector<shared_ptr<ProcCtl>> v; return v; }
+struct ProcAwait {   // p.await(): until p ends
+    ProcCtl* c;
+    bool await_ready() const { return c->ended; }
+    void await_suspend(Handle h) const { c->awaiters.push_back(h); }
+    void await_resume() const {}
+};
+struct ProcPark {    // a suspended process, until resume()
+    ProcCtl* c;
+    bool await_ready() const { return !c->suspended; }
+    void await_suspend(Handle h) const { c->h = h; c->parked = true; }
+    void await_resume() const {}
+};
+static ProcCtl* procOf(const Instr& i) {
+    Val h = eval(i.e, rd);
+    if (h.x || !h.v) nullAccess();
+    Val n = S.get((int)h.v + i.dkey);
+    if (n.x || n.v >= procTable().size()) relFail("a process object with no process");
+    return procTable()[n.v].get();
+}
+static int procStatus(const ProcCtl* c, const ProcCtl* self) {
+    if (c->killed) return 4;      // KILLED
+    if (c->ended) return 0;       // FINISHED
+    if (c->suspended) return 3;   // SUSPENDED
+    return c == self ? 1 : 2;     // RUNNING, WAITING
+}
+static void procResume(ProcCtl* c) {
+    c->suspended = false;
+    if (c->parked && !c->ended) { c->parked = false; S.active.push_back(c->h); }
+}
 static int doRandomize(int obj, const RandCall* rc);   // rand.inc
 static void randModeAll(int obj, bool blocks, bool on);
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
@@ -949,6 +1014,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         g_fr = fr.get();
         g_ret = lastRet.get();
         if (ctl->killed) goto done;
+        if (ctl->suspended) [[unlikely]] {   // 9.7: stop here until resume()
+            co_await ProcPark{ctl.get()};
+            if (ctl->killed) goto done;
+        }
         if (pc >= p->code.size()) {
             if (rets.empty()) goto done;
             ret();
@@ -969,6 +1038,25 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 if (i.dyn >= 0) {   // q[i] = v, aa[key] = v
                     Instr set = i;
                     set.k = IK::Dyn; set.sig = i.dyn; set.dcmd = D_SET;
+                    if (i.hi >= 0 || i.bidx) {   // q[i].f = v, q[i][3:0] = v: the element with those bits changed
+                        Val old = dynStore()[R(i.dyn)].get(eval(i.args[0], rd));
+                        int hi = i.hi, lo = i.lo;
+                        if (i.bidx) {
+                            Val bv = eval(i.bidx, rd);
+                            if (bv.x) { pc++; break; }
+                            int64_t b = v_to_i64(bv) - i.lo;
+                            int64_t l = i.pw ? (i.pdown ? b - i.pw + 1 : b) : b, h = i.pw ? l + i.pw - 1 : b;
+                            int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, old.w - 1);
+                            if (cl > ch) { pc++; break; }
+                            v = v_slice(v, (int)(ch - l), (int)(cl - l));
+                            hi = (int)ch;
+                            lo = (int)cl;
+                        }
+                        if (hi >= old.w) { pc++; break; }
+                        Val nv = v_insert(old, v, hi, lo);
+                        nv.sgn = old.sgn;
+                        set.e = konst(nv);
+                    }
                     dynExec(set);
                     pc++; break;
                 }
@@ -1008,6 +1096,27 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 S.dumpTask(i.dcmd, str, num, i.dsel);
                 pc++; break;
             }
+            case IK::Vpi:
+                if (!vpiCallHook()) { std::cerr << "msim: VPI call without VPI support\n"; S.finished = true; goto done; }
+                vpiCallHook()(i);
+                if (S.finished) goto done;
+                pc++;
+                break;
+            case IK::Dpi: {
+                if (!dpiHook().call) { std::cerr << "msim: DPI call without DPI support\n"; S.finished = true; goto done; }
+                void* fib = nullptr;
+                auto js = dpiHook().call(i, fib, ctl);
+                while (js) {
+                    ctl->dpiFiber = fib;
+                    co_await JoinWait{js};
+                    if (ctl->killed) goto done;   // kill already ran the C code to its end (35.9)
+                    ctl->dpiFiber = nullptr;
+                    js = dpiHook().resume(fib);
+                }
+                if (S.finished) goto done;
+                pc++;
+                break;
+            }
             case IK::New: newObject(i); pc++; break;
             case IK::Randomize: {   // 18.6, 18.12
                 int obj = 0;
@@ -1022,6 +1131,37 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 g_ret = lastRet.get();
                 if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true));
                 pc++; break;
+            }
+            case IK::ProcOp: {   // std::process (9.7)
+                if (i.hi == PO_SELF) {
+                    if (!ctl->obj) {
+                        const FrameLayout& L = *classRt()[(size_t)i.lo].lay;
+                        int obj = g_allocSigs(L);
+                        g_initSigs(L, obj);
+                        S.sigs[obj + i.dkey].val = make((uint64_t)procTable().size(), 0, 64);
+                        procTable().push_back(ctl);
+                        ctl->obj = obj;
+                        // its srandom / get_randstate (18.13.3); seeded from its number, so
+                        // process::self() does not move the $urandom stream
+                        objRng()[obj] = seedState(0x9E3779B97F4A7C15ull * (procTable().size() + 1));
+                    }
+                    S.set(R(i.sig), make((uint64_t)ctl->obj, 0, 64));
+                    pc++; break;
+                }
+                ProcCtl* c = procOf(i);
+                pc++;
+                if (i.hi == PO_STATUS) S.set(R(i.sig), make((uint64_t)procStatus(c, ctl.get()), 0, 32, 0, true));
+                else if (i.hi == PO_KILL) {
+                    if (!c->ended) {
+                        for (auto& t : procTable()) if (t.get() == c) { procKill(t); break; }
+                    }
+                } else if (i.hi == PO_AWAIT) {
+                    if (c == ctl.get()) relFail("a process awaiting itself (9.7)");
+                    co_await ProcAwait{c};
+                } else if (i.hi == PO_SUSPEND) {
+                    if (!c->ended) c->suspended = true;
+                } else if (i.hi == PO_RESUME) procResume(c);
+                break;
             }
             case IK::RandMode: {   // obj.rand_mode(v) / obj.constraint_mode(v) (18.8, 18.9)
                 Val h = eval(i.e, rd);
@@ -1124,10 +1264,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         S.set(nf->base + off, v);
                     }
                     for (auto [off, src] : i.dinit) {   // container arguments (7.7)
-                        auto& d = dynStore()[nf->base + off];
-                        const auto& sv = dynStore()[R(src)];
-                        if (d.kind == 2) d.map = sv.map;
-                        else { d.vec = sv.kind == 2 ? std::vector<Val>{} : sv.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+                        dynAssign(dynStore()[nf->base + off], dynStore()[R(src)]);
                     }
                     rets.push_back({p, pc + 1, fr});
                     fr = std::move(nf);

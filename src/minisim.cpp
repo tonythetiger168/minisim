@@ -1219,19 +1219,28 @@ struct Sim {
                     if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
                     return fmtVal('d', v, 0, true);
                 };
-                const DynObj& o = dynStore()[h->sig];
-                cout << "'{";
-                if (o.kind == 2) {
-                    bool first = true;
-                    for (const auto& [k, v] : o.map) {
-                        if (!first) cout << ", ";
-                        first = false;
-                        cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':' << one(v, style);
+                // A container of containers prints each element container nested.
+                std::function<void(const DynObj&)> show = [&](const DynObj& o) {
+                    auto el = [&](const Val& v) {
+                        if (!o.elem) { cout << one(v, style); return; }
+                        if (v.x || !v.v) { cout << "'{}"; return; }
+                        show(dynStore()[(int)v.v]);
+                    };
+                    cout << "'{";
+                    if (o.kind == 2) {
+                        bool first = true;
+                        for (const auto& [k, v] : o.map) {
+                            if (!first) cout << ", ";
+                            first = false;
+                            cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':';
+                            el(v);
+                        }
+                    } else {
+                        for (size_t k = 0; k < o.vec.size(); k++) { if (k) cout << ", "; el(o.vec[k]); }
                     }
-                } else {
-                    for (size_t k = 0; k < o.vec.size(); k++) cout << (k ? ", " : "") << one(o.vec[k], style);
-                }
-                cout << '}';
+                    cout << '}';
+                };
+                show(dynStore()[R(h->sig)]);   // R: a property through a handle, or an automatic container
                 continue;
             }
             if ((c == 't' || c == 'T') && ai < args.size()) {   // %t (20.4.3): ticks, printed per $timeformat
@@ -1535,7 +1544,7 @@ struct Sim {
     // again; a variable keeps its value until it is next written.
     // force v[3:0] = e holds those bits only (SF_PART): other writes still
     // change the other bits.
-    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4 };
+    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8 };   // SF_VPI: a VPI value-change callback watches it
     struct PartHold { int hi, lo; E fe, ae; };
     struct Hold { E fe, ae; vector<PartHold> parts; };
     unordered_map<int, Hold> holds;
@@ -1650,6 +1659,14 @@ struct Sim {
         }
     }
 
+    // VPI (36-38): hooks set by vpi.inc. vpiChange runs the value-change
+    // callbacks of a signal; vpiRegion runs the callbacks of a point in the
+    // time slot (VR_*) and says whether any ran. vpiAt counts the
+    // cbAfterDelay callbacks due at each time, so that slot is not skipped.
+    enum { VR_START, VR_RW, VR_RO };
+    void (*vpiChange)(int) = nullptr;
+    bool (*vpiRegion)(int) = nullptr;
+    std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         if (__builtin_expect(sigs[s].fl & (SF_HELD | SF_PART), 0)) {
             if (sigs[s].fl & SF_HELD) return;   // forced: other writes are ignored
@@ -1667,6 +1684,7 @@ struct Sim {
         sigs[s].val = nv;
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
+        if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);
         bool neg = (o != 0 && n == 0) || (o == 1 && n != 1);
         // Wake matching waiters and compact the rest in place (no allocation).
@@ -1704,6 +1722,7 @@ struct Sim {
     // queued for any of them but postponed, so a design without assertions
     // or programs pays one flag test per pass.
     bool slotTail() {
+        if (vpiRegion && vpiRegion(VR_RW)) return true;   // cbReadWriteSynch (38.36.2)
         if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) { runObserved(); return true; }   // observed (4.4.2.5)
         if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
             // Once the reactive set starts, it runs until it is empty, and
@@ -1733,6 +1752,7 @@ struct Sim {
             return true;
         }
         if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
+        if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
         rare = false;
         return false;
@@ -1844,13 +1864,14 @@ struct Sim {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty();
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t));
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
             if (!any) continue;   // only disabled processes were waiting here
             now = t;
             g_simTime = now;
+            if (vpiRegion) vpiRegion(VR_START);   // cbNextSimTime, cbAtStartOfSimTime, cbAfterDelay
             if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
                 for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
                 sampledAt = now;
