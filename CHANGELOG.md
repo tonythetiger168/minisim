@@ -17,6 +17,33 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- The constraint solver weights each choice by how many ways the other
+  variables can still be completed, so values are close to uniform over the
+  joint solution space (18.5.10): `s -> d == 0` gives s = 0, and `x < y`
+  is no longer biased toward a large x.
+- Containers of containers (7.5, 7.8, 7.10): `int m[][]`, `int q[$][$]`,
+  associative arrays of queues, and fixed-size arrays of containers
+  (`int f[2][]`); containers of unpacked structs and of vectors wider than
+  64 bits.
+- `rand join` in randsequence (18.17.5), with a constant bias, and production
+  arguments and return values (18.17.7).
+- `dist` default weights (`default :/ w`, 18.5.3) and rand associative
+  arrays with integral keys (18.4); foreach constraints over associative
+  arrays bind the index to each key.
+- Function calls in constraints (18.5.12): methods, static and package
+  functions, nested calls, in guards, foreach bodies and inline `with`. The
+  rand variables a call reads are solved first.
+- rand dynamic arrays and queues (18.4): `size()` constraints, `foreach`
+  over the elements and array reductions (`sum`, `product`, `and`, `or`,
+  `xor`, with or without `with`) in constraints (18.5.8). Sizes are solved
+  first, then the elements. Rand arrays and queues of class handles
+  randomize each element's object.
+- Virtual interfaces (25.9): variables, properties and arguments of
+  `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
+  clocking blocks reached through them.
+- `std::semaphore` (15.3), `std::mailbox` (15.4, parameterized, typeless and
+  bounded) and `std::process` (9.7: self, status, kill, await, suspend,
+  resume).
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
@@ -57,6 +84,14 @@ Spec references are IEEE 1800-2023 clauses.
   scope with `u.sum`).
 
 ### Fixed
+- `s[i]` on a string read X and could not be written (6.16).
+- The constraint solver re-evaluated known subexpressions at every node,
+  so a long `sum()` constraint cost O(n^2) per check.
+- msim could crash at exit when a process with an automatic frame (a
+  forked automatic task, a class method) was still suspended: its frame went
+  back to a frame shape that was already freed.
+- A static 2-state local of a task, function or block with no initializer
+  (`static int c;`) started at x instead of 0 (6.8, 6.21).
 - A module-level unpacked array of a 2-state type (`int a[8]`) started at x
   instead of 0 (6.8).
 - Signals inside generate blocks (`blk[2].x`) were left out of the waveform as
