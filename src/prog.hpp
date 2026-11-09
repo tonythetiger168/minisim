@@ -218,6 +218,10 @@ struct RandCall {
     std::vector<E> args;        // the variables to randomize, as Refs
     bool argsGiven = false;     // randomize(...) with arguments (18.11): only those
     int objTmp = -1;
+    // Container arguments (randomize(q), 18.11): the container, its
+    // innermost element width and sign, and its levels (int m[][] is 2).
+    struct ContArg { int sig; int w; bool sgn; int depth; E addr; };   // addr: an ArrAddr giving id + 1, read in the object
+    std::vector<ContArg> contArgs;
 };
 struct Prog;
 // A class at run time (8): its object shape (slot 0 holds the class id),

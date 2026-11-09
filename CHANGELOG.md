@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- randomize() arguments that are arrays or containers (18.11), and whole
+  fixed-size array properties through a handle: `h.a = '{...}` and `%p`
+  of `h.a` (8.4).
 - Fixed-size arrays of containers (`int q[4][$]`) as class properties,
   rand properties and automatic variables (7.4, 18.4), with `%p`, foreach,
   object copies and access through a handle.
