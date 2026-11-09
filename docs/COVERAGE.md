@@ -9,10 +9,10 @@ including any system task msim does not know (only the waveform tasks such as `$
 never a silent wrong answer. If you find a construct that runs but gives the
 wrong result, that is a bug: please add a spec test for it.
 
-`tests/regress.py` runs every spec test and prints a per-chapter table. A test
-marked `//! xfail: <reason>` is a known gap (ctest expects it to fail); the
-script fails if any other test fails or if an xfail test starts passing.
-`python3 tests/regress.py --icarus` also compares each test with Icarus.
+`mregress -spec tests/spec` (`tools/mregress.py`) runs every spec test and prints a
+per-chapter table. A test marked `//! xfail: <reason>` is a known gap (ctest expects
+it to fail); the run fails if any other test fails or if an xfail test starts
+passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 
 | Clause | Topic | Status | Notes / test |
 |---|---|---|---|
