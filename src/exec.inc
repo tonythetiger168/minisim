@@ -20,7 +20,7 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
         }
         int64_t off = i.arr->offset(idx);
         if (off < 0) return false;
-        sig = R(i.arr->base + (int)off);
+        sig = R(i.arr->base) + (int)off;
     }
     if (i.bidx) {
         Val v = eval(i.bidx, rd);
@@ -57,7 +57,7 @@ static void writeMem(const Instr& i) {
     for (int64_t ad = start;; ad += step) {
         int64_t off = a.offset({ad});
         if (off >= 0) {
-            Val v = S.get(R(a.base + (int)off));
+            Val v = S.get(R(a.base) + (int)off);
             v.sgn = false;
             int bits = i.hex ? 4 : 1;
             int n = (a.elemW + bits - 1) / bits;
@@ -227,7 +227,7 @@ static void readMem(const Instr& i) {
                 acc.v &= ~acc.x; acc.x = acc.z = 0;
                 for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
             }
-            S.set(R(a.base + (int)off), acc);
+            S.set(R(a.base) + (int)off, acc);
             addr += step;
             words++;
             continue;
@@ -247,13 +247,15 @@ static void readMem(const Instr& i) {
         int64_t off = a.offset({addr});
         if (off < 0) break;
         if (a.twoState) { v &= ~x; x = z = 0; }
-        S.set(R(a.base + (int)off), make(v, x, a.elemW, z));
+        S.set(R(a.base) + (int)off, make(v, x, a.elemW, z));
         addr += step;
         words++;
     }
-    // A file with no @address whose word count differs from the range warns.
+    // A file with no @address whose word count differs from the range warns
+    // (21.4): the range given by start and finish addresses, or, with no
+    // finish address, a file with more words than the memory has room for.
     int64_t range = (step > 0 ? finish - start : start - finish) + 1;
-    if (!sawAddr && words != range)
+    if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
 }
 
@@ -361,6 +363,19 @@ inline void dynExec(const Instr& i) {
             });
             break;
         }
+        case D_UNPACK: {   // the stream e, cut into elements from the left; the last is padded on the right
+            Val v = eval(i.e, rd);
+            int ew = d.dflt.w, W = v.w;
+            d.vec.clear();
+            for (int hi = W - 1; hi >= 0; hi -= ew) {
+                int lo = hi - ew + 1;
+                Val el = lo >= 0 ? v_slice(v, hi, lo) : v_concat({v_slice(v, hi, 0), make(0, 0, -lo, 0)});
+                el.sgn = d.dflt.sgn;
+                d.vec.push_back(el);
+                if (full()) { d.vec.pop_back(); break; }
+            }
+            break;
+        }
         case D_SORT_BY:
         case D_RSORT_BY: {   // order d by the keys in dsrc, one per element
             bool down = i.dcmd == D_RSORT_BY;
@@ -392,6 +407,29 @@ inline void dynExec(const Instr& i) {
         }
     }
     dynBump(sig);
+}
+
+// new (8.7) and a shallow copy `new h` (8.12). Objects are never freed.
+inline void newObject(const Instr& i) {
+    int src = 0, cls = i.hi;
+    if (i.e) {
+        Val h = eval(i.e, rd);
+        if (h.x || !h.v) nullAccess();
+        src = (int)h.v;
+        cls = (int)S.sigs[src].val.v;
+    }
+    const FrameLayout& L = *classRt()[(size_t)cls].lay;
+    int obj = g_allocSigs(L);
+    g_initSigs(L, obj);
+    if (src)
+        for (size_t k = 0; k < L.w.size(); k++) S.sigs[obj + (int)k].val = S.sigs[src + (int)k].val;
+    if (src)
+        for (auto& [off, o] : L.dyn) dynStore()[obj + off] = dynStore()[src + off];
+    // Its own random generator (18.14.3): seeded from the $urandom stream, or
+    // the source's state for a copy.
+    if (src) objRng()[obj] = objRng()[src];
+    else { uint64_t a = urandomNext(urandomState()), b = urandomNext(urandomState()); objRng()[obj] = seedState(a << 32 | b); }
+    S.set(R(i.sig), make((uint64_t)obj, 0, 64));
 }
 
 struct JoinState {
@@ -460,6 +498,8 @@ struct WaitFork {
 };
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+static int doRandomize(int obj, const RandCall* rc);   // rand.inc
+static void randModeAll(int obj, bool blocks, bool on);
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
     Task t = exec(p, c, std::move(fr));
     c->h = t.h;
@@ -522,7 +562,7 @@ void Sim::runObserved() {
         ConcAssert& c = concAsserts()[k];
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p.caps);
+            if (!pc->killed && pc->epoch == p.epoch) c.matured.push_back(p);
         }
         c.pending.clear();
     }
@@ -587,21 +627,157 @@ static void runAction(const Prog* p, uint64_t n, const vector<E>* slots = nullpt
     }
     S.rare = true;
 }
+// Local variables of a concurrent assertion (16.10): environments are
+// interned value vectors; an atom or a match item that reads local variables
+// is evaluated with their hidden signals set (without events) from an environment.
+struct LocalEnv final : sva::LocalHook {
+    ConcAssert& c;
+    int loaded = -1;
+    vector<vector<Val>> tbl;                    // this attempt's environments
+    uint64_t count = 1;                         // the attempts merged into this one
+    std::unordered_map<uint64_t, bool> cache;   // (env, atom) -> value, for one attempt
+    explicit LocalEnv(ConcAssert& c) : c(c) {}
+    static void poke(int s, Val v) {
+        int w = S.sigs[s].w;
+        if (w <= 64) {
+            uint64_t m = w >= 64 ? ~0ULL : ((1ULL << w) - 1);
+            v.v &= m; v.x &= m; v.z &= m; v.sgn = false;
+            v.hi.clear();
+        } else v = maskWidth(v, w);
+        S.sigs[s].val = v;
+    }
+    void start(const ConcAssert::Envs& e) {
+        if (e) tbl = *e;
+        else {   // the initial environment: every local variable unassigned (x)
+            tbl.assign(1, {});
+            for (int s : c.localSig) tbl[0].push_back(allx(S.sigs[s].w));
+        }
+        loaded = -1;
+        cache.clear();
+    }
+    void load(int e) {
+        if (loaded == e) return;
+        for (size_t k = 0; k < c.localSig.size(); k++) poke(c.localSig[k], tbl[e][k]);
+        loaded = e;
+    }
+    int intern(vector<Val> v) {
+        for (size_t i = 0; i < tbl.size(); i++)
+            if (tbl[i] == v) return (int)i;
+        tbl.push_back(std::move(v));
+        return (int)tbl.size() - 1;
+    }
+    bool atom(int a, int e) override {
+        uint64_t key = (uint64_t)(uint32_t)e << 32 | (uint32_t)a;
+        if (auto it = cache.find(key); it != cache.end()) return it->second;
+        load(e);
+        bool v = truth(eval(c.atoms[a], rd)) == 1;
+        cache[key] = v;
+        return v;
+    }
+    int apply(int act, int e) override {
+        load(e);
+        for (auto& item : c.acts[act]) {   // in order: later items see earlier ones
+            if (item.k >= 0) { poke(c.localSig[item.k], eval(item.rhs, rd)); continue; }
+            vector<Val> args;   // a subroutine call (16.11): its arguments now, the call in the reactive region
+            for (const E& x : item.caps) args.push_back(eval(x, rd));
+            runAction(item.call, count, &item.slots, &args);
+        }
+        vector<Val> v;
+        for (int s : c.localSig) v.push_back(S.get(s));
+        int id = intern(std::move(v));
+        loaded = id;
+        return id;
+    }
+    int merge(int ctx, int a, int b) override {
+        if (a == b || b == ctx) return a;
+        if (a == ctx) return b;
+        vector<Val> v = tbl[a];
+        for (size_t k = 0; k < v.size(); k++)
+            if (!(tbl[b][k] == tbl[ctx][k])) v[k] = tbl[b][k];
+        return intern(std::move(v));
+    }
+    // The stepped term with its environments numbered in order of use.
+    std::pair<const sva::Node*, ConcAssert::Envs> finish(const sva::Node* t) {
+        if (!t->envDep) return {t, nullptr};
+        vector<int> used{0};
+        std::unordered_set<const sva::Node*> seen;
+        sva::Store::envsUsed(t, used, seen);
+        std::unordered_map<int, int> to;
+        auto out = make_shared<vector<vector<Val>>>();
+        bool same = true;
+        for (size_t i = 0; i < used.size(); i++) {
+            to[used[i]] = (int)i;
+            same = same && used[i] == (int)i;
+            out->push_back(tbl[used[i]]);
+        }
+        if (!same) {
+            std::unordered_map<const sva::Node*, const sva::Node*> memo;
+            t = sva::store().renumber(t, to, memo);
+        }
+        return {t, out};
+    }
+};
 // One clock tick of a concurrent assertion, in the observed region: start an
 // attempt, then step every attempt on the sampled values of the atoms.
-static void concTick(ConcAssert& c) {
+// An expect statement (16.17) waiting for its attempt's verdict.
+struct ExpectWait {
+    Handle h;
+    shared_ptr<ProcCtl> ctl;
+    int res = -1;   // 1 pass, 0 fail, 2 disabled or killed
+};
+struct ExpectAwait {
+    ExpectWait* w;
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { w->h = h; }
+    void await_resume() const {}
+};
+// The verdict of an expect attempt: its process goes on in the reactive region.
+static void expectDone(const shared_ptr<void>& p, int res) {
+    auto* w = static_cast<ExpectWait*>(p.get());
+    if (!w || w->res >= 0) return;
+    w->res = res;
+    if (w->ctl->killed || !w->h) return;
+    S.reactive.push_back(w->h);
+    S.rare = true;
+}
+static void dropAttempts(ConcAssert& c) {   // disabled or killed: expect statements go on
+    for (auto& at : c.att) expectDone(at.wait, 2);
+    for (auto& p : c.matured) expectDone(p.wait, 2);
+    c.att.clear();
+    c.matured.clear();
+}
+// expect (property) action (16.17): an attempt from the next tick of its clock.
+static shared_ptr<ExpectWait> startExpect(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
+    ConcAssert& c = concAsserts()[i.hi];
+    auto w = make_shared<ExpectWait>();
+    w->ctl = ctl;
+    ConcAssert::Caps caps;
+    if (!c.capSig.empty()) {
+        auto v = make_shared<vector<Val>>();
+        for (int s : c.capSig) v->push_back(S.get(R(s)));
+        caps = v;
+    }
+    c.matured.push_back({ctl, ctl->epoch, caps, w});
+    return w;
+}
+// `ticked`: the clocks that ticked (16.13); attempts start at the leading one.
+static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
-        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) { return t.killGen != a.killGen; });
+        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
+            if (t.killGen == a.killGen) return false;
+            expectDone(t.wait, 2);
+            return true;
+        });
     if (c.disable && truth(eval(c.disable, rd)) == 1) {   // disabled: no pass, no fail (16.12)
-        c.att.clear();
+        dropAttempts(c);
         c.pending.clear();
-        c.matured.clear();
-        if (a.on) a.evals++;
+        if (a.on && (ticked & 1)) a.evals++;
         return;
     }
-    if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& caps : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, caps}); a.evals++; }
+    if (!(ticked & 1)) {
+    } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
+        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait}); a.evals++; }
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
@@ -612,7 +788,10 @@ static void concTick(ConcAssert& c) {
         c.att.push_back({c.root, false, 1, a.killGen, nullptr});
         a.evals++;
     }
-    if (c.att.empty()) return;
+    if (c.att.empty()) {
+        for (int f : c.clearFlags) S.set(f, mk(0, 1));
+        return;
+    }
     // The atoms' values; with captured automatic values (16.14.6.1), once per
     // distinct set of them.
     vector<char> val(c.atoms.size());
@@ -627,38 +806,60 @@ static void concTick(ConcAssert& c) {
         for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
     };
     sva::Deriv dv{sva::store(), val};
+    dv.ticking = ticked;
+    std::optional<LocalEnv> lenv;
+    if (!c.acts.empty()) {   // local variables or subroutine calls in match items
+        lenv.emplace(c);
+        dv.lh = &*lenv;
+    }
     vector<ConcAssert::Attempt> next;
+    bool ended = false;   // a match of an end point tracker
     for (auto& at : c.att) {
         values(at.caps);
+        if (lenv) { lenv->start(at.envs); lenv->count = at.count; }
+        dv.env = 0;
         dv.memo.clear();
         dv.nonvac = at.nonvac;
         dv.matches = 0;
         const sva::Node* t = dv.d(at.t);
+        ConcAssert::Envs envs;
+        if (lenv) std::tie(t, envs) = lenv->finish(t);
         if (c.coverSeq) {   // every match counts (16.14.3)
-            if (dv.matches) {
+            if (dv.matches) ended = true;
+            if (dv.matches && !a.hidden) {
                 a.passes += at.count * dv.matches;
                 if (a.passOn) runAction(c.pass, at.count * dv.matches, &c.capSlot, at.caps.get());
             }
             if (t->k == sva::DONE) continue;
         } else if (t->k == sva::PTRUE) {
             a.passes += at.count;
+            expectDone(at.wait, 1);
             if (dv.nonvac ? a.passOn : a.vacOn) runAction(c.pass, at.count, &c.capSlot, at.caps.get());
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps))) {
+            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+                (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait});
     }
     c.att.swap(next);
+    if (ended && c.endSig >= 0) {   // the sequence's end point (16.13.6)
+        Val n = S.get(c.endSig);
+        S.set(c.endSig, mk((n.x ? 0 : n.v) + 1, 32));
+        S.set(c.endSig + 1, mk(S.now + 1, 64));
+        for (int f : c.matchFlags) S.set(f, mk(1, 1));
+    }
+    for (int f : c.clearFlags) S.set(f, mk(0, 1));
 }
 // A procedural concurrent assertion reached by its procedure (16.14.6):
 // queue an instance on this process, with its automatic values now.
@@ -674,6 +875,27 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     if (c.pending.empty()) concPending().push_back(i.hi);
     c.pending.push_back({ctl, ctl->epoch, caps});
     S.rare = true;
+}
+// A multiclock assertion (16.13): one process per clock marks it ticked;
+// the first in a time step runs the assertion in the observed region, once,
+// with every clock that ticked in that step.
+inline Task concClockProc(int k, int ci) {
+    ConcAssert& c = concAsserts()[k];
+    const auto* ev = ci == 0 ? &c.ev : &c.more[ci - 1].first;
+    const E& iff = ci == 0 ? c.clkIff : c.more[ci - 1].second;
+    for (;;) {
+        if (ev->size() > 1) co_await WaitAny{ev};
+        else co_await Wait{(*ev)[0].first, (*ev)[0].second};
+        if (iff && truth(eval(iff, rd)) != 1) continue;
+        c.ticked |= 1u << ci;
+        if (c.due) continue;
+        c.due = true;
+        co_await ToObserved{};
+        uint32_t t = c.ticked;
+        c.ticked = 0;
+        c.due = false;
+        concTick(c, t);
+    }
 }
 inline Task concProc(int k) {
     ConcAssert& c = concAsserts()[k];
@@ -693,12 +915,14 @@ inline Task concDisableProc(int k, shared_ptr<vector<pair<int, Edge>>> ev) {
     for (;;) {
         if (ev->size() > 1) co_await WaitAny{ev.get()};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
-        if (truth(eval(c.disable, rd)) == 1) c.att.clear();
+        if (truth(eval(c.disable, rd)) == 1) dropAttempts(c);
     }
 }
 inline void startConcAsserts() {
     for (size_t k = 0; k < concAsserts().size(); k++) {
-        S.spawn(concProc((int)k));
+        if (concAsserts()[k].more.empty()) S.spawn(concProc((int)k));
+        else
+            for (size_t ci = 0; ci <= concAsserts()[k].more.size(); ci++) S.spawn(concClockProc((int)k, (int)ci));
         if (const E& d = concAsserts()[k].disable) {
             vector<int> sigs;
             collectRefs(d, sigs);
@@ -834,6 +1058,28 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 S.tranCtl(i.sig, st);
                 pc++; break;
             }
+            case IK::New: newObject(i); pc++; break;
+            case IK::Randomize: {   // 18.6, 18.12
+                int obj = 0;
+                if (i.e) {
+                    Val h = eval(i.e, rd);
+                    if (h.x || !h.v) nullAccess();
+                    obj = (int)h.v;
+                    if (i.rc && i.rc->objTmp >= 0) S.set(R(i.rc->objTmp), make((uint64_t)obj, 0, 64));
+                }
+                int r = doRandomize(obj, i.rc.get());
+                g_fr = fr.get();
+                g_ret = lastRet.get();
+                if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true));
+                pc++; break;
+            }
+            case IK::RandMode: {   // obj.rand_mode(v) / obj.constraint_mode(v) (18.8, 18.9)
+                Val h = eval(i.e, rd);
+                if (h.x || !h.v) nullAccess();
+                Val on = eval(i.de, rd);   // the on / off value
+                randModeAll((int)h.v, i.hi != 0, truth(on) == 1);
+                pc++; break;
+            }
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = i.target; }
@@ -884,10 +1130,44 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Call: {
                 const Prog* callee = i.callee;
                 if (i.lay) {   // an automatic subroutine: a new frame (13.3.2)
-                    FrameP nf = newFrame(i.lay, nullptr, fr ? fr->self : 0);
+                    int self = fr ? fr->self : 0;
+                    const FrameLayout* lay = i.lay;
+                    if (i.noSelf) self = 0;
+                    else if (i.self) {
+                        Val h = eval(i.self, rd);
+                        if (h.x || !h.v) nullAccess();
+                        self = (int)h.v;
+                    }
+                    if (i.vslot >= 0 || i.vslot <= -2) {   // virtual (8.20): the body of the object's own class
+                        if (!self) nullAccess();
+                        const ClassRt& cr = classRt()[(size_t)S.sigs[self].val.v];
+                        int vs = i.vslot;
+                        if (vs <= -2) {   // an interface class method (8.26): k = -2 - vslot
+                            size_t k = (size_t)(-2 - vs);
+                            vs = k < cr.imap.size() ? cr.imap[k] : -1;
+                            if (vs < 0) {
+                                cerr << "error: class " << cr.name << " has no implementation of an interface method\n";
+                                exit(1);
+                            }
+                        }
+                        const auto& ve = cr.vt[(size_t)vs];
+                        if (!ve.first) {
+                            cerr << "error: call of a pure virtual method at time " << S.now << "\n";
+                            exit(1);
+                        }
+                        callee = ve.first;
+                        lay = ve.second;
+                    }
+                    FrameP nf = newFrame(lay, nullptr, self);
                     for (auto& [off, e] : i.init) {   // arguments, read in the caller's frame
                         Val v = eval(e, rd);
                         S.set(nf->base + off, v);
+                    }
+                    for (auto [off, src] : i.dinit) {   // container arguments (7.7)
+                        auto& d = dynStore()[nf->base + off];
+                        const auto& sv = dynStore()[R(src)];
+                        if (d.kind == 2) d.map = sv.map;
+                        else { d.vec = sv.kind == 2 ? std::vector<Val>{} : sv.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
                     }
                     rets.push_back({p, pc + 1, fr});
                     fr = std::move(nf);
@@ -942,7 +1222,17 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 ctl->kids.clear();
                 pc++;
                 break;
-            case IK::Assert: pc = runAssert(i, ctl, pc); break;
+            case IK::Assert:
+                if (i.join == 4) {   // expect (16.17): wait for the verdict
+                    auto w = startExpect(i, ctl);
+                    S.rare = true;
+                    co_await ExpectAwait{w.get()};
+                    ctl->epoch++;
+                    pc = w->res == 1 ? pc + 1 : w->res == 0 ? (size_t)i.target : (size_t)i.lo;
+                    break;
+                }
+                pc = runAssert(i, ctl, pc);
+                break;
             case IK::AssertCtl: assertCtl(i); pc++; break;
             case IK::CycleWait: {   // ##n (14.11)
                 Val nv = eval(i.e, rd);
