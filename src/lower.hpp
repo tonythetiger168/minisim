@@ -1437,6 +1437,8 @@ struct Lowerer {
             return konst(k);
         }
         if (e->op == Op::Ref) return e->sgn == selfTag ? e : ref(e->sig, selfTag);
+        // A signed field of a struct (s.offset) is a slice, which reads as unsigned.
+        if (e->op == Op::Slice && selfTag) { int w = e->hi - e->lo + 1; return resize(std::move(e), w, false, true); }
         return e;
     }
 

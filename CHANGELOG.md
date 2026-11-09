@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
+  library from `$UVM_HOME` with its C code, so regular expressions, the full
+  command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
+  access (`uvm_hdl_*`, register backdoor reads and writes) work.
+  `uvm/uvm_dpi_minisim.cc` builds uvm-core's `src/dpi` with a backdoor over
+  plain VPI.
+- VPI: `vpi_put_value` with `vpiForceFlag` and `vpiReleaseFlag` (38.35);
+  `tf_dofinish` / `tf_dostop` (`veriuser.h`) and `sv_vpi_user.h`; VPI calls
+  from DPI context imports (35.5.3).
 - UVM (IEEE 1800.2-2020): the Accellera UVM library (uvm-core 2020.3.1)
   compiles and runs with `+define+UVM_NO_DPI` (see `docs/UVM.md`): run_test,
   the factory and overrides, phases and objections, sequences, sequencers and
@@ -30,6 +39,8 @@ Spec references are IEEE 1800-2023 clauses.
   subroutine call.
 
 ### Fixed
+- A signed member of an unpacked struct (`int`, `byte`) read as unsigned, so
+  `s.f < 0` was false for a negative member (7.2).
 - `super.f()` with a comment just before `super` called the override (and
   recursed) instead of the base method.
 - An extern method that overrides a pure virtual method, or a virtual
