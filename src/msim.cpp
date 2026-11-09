@@ -200,8 +200,7 @@ int main(int argc, char** argv) {
     std::optional<std::string> vcdPath;
     uint64_t maxTime = ~0ULL;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true;
-    int threads = (int)std::thread::hardware_concurrency();
-    if (threads < 1) threads = 1;
+    int threads = defaultThreads();
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     for (int i = 1; i < argc; i++) {
