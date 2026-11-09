@@ -1190,7 +1190,9 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 Val v = eval(i.e, rd);
                 if (i.drv >= 0) {
                     if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
-                    if (!i.dly.empty()) S.driveLater(i.sig, i.drv, v, i.s0, i.s1, i.dly);   // assign #d (10.3.3)
+                    if (i.gate >= 0 && gateRecs()[(size_t)i.gate].annotated)   // SDF DEVICE delays (32.4.1)
+                        S.driveGate(i.sig, i.drv, v, i.s0, i.s1, gateRecs()[(size_t)i.gate].d);
+                    else if (!i.dly.empty()) S.driveLater(i.sig, i.drv, v, i.s0, i.s1, i.dly);   // assign #d (10.3.3)
                     else S.drive(i.sig, i.drv, v, i.s0, i.s1);
                     pc++; break;
                 }
