@@ -662,14 +662,16 @@ struct ConcAssert {
     // 0 is the initial one. Numbered in the order the term uses them, so equal
     // attempts have equal terms and the store does not grow with the values.
     using Envs = std::shared_ptr<const std::vector<std::vector<Val>>>;
-    struct Attempt { const sva::Node* t; bool nonvac; uint64_t count; uint64_t killGen; Caps caps; Envs envs = nullptr; };
+    // wait: an expect statement's process, resumed with the verdict (16.17).
+    struct Attempt { const sva::Node* t; bool nonvac; uint64_t count; uint64_t killGen; Caps caps; Envs envs = nullptr; std::shared_ptr<void> wait = nullptr; };
     std::vector<Attempt> att;
     // Procedural instances (16.14.6): pending ones on the process that queued
     // them (dropped at its next flush point), and matured ones waiting for
     // the next clock tick.
-    struct Pending { std::shared_ptr<void> ctl; uint64_t epoch; Caps caps; };
+    struct Pending { std::shared_ptr<void> ctl; uint64_t epoch; Caps caps; std::shared_ptr<void> wait = nullptr; };
     std::vector<Pending> pending;
-    std::vector<Caps> matured;
+    std::vector<Pending> matured;
+    bool expect = false;   // an expect statement (16.17)
     // Local variables (16.10): each is a hidden signal, set from an
     // environment before the atoms that read it are evaluated. acts[i] is a
     // list of match items or initializers: (local variable, value).

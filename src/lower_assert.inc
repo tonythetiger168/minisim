@@ -831,7 +831,8 @@ int seqEventSig(const slang::ast::Expression& x) {
 void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     using namespace slang::ast;
     if (s.assertionKind == AssertionKind::Restrict) return;   // for formal tools only (16.14.4)
-    if (s.assertionKind == AssertionKind::Expect) unsupported("expect (16.17)");
+    bool expect = s.assertionKind == AssertionKind::Expect;
+    if (expect && staticAssert) unsupported("expect outside a procedure (16.17)");
     SvaBuild b;
     SvaBuild* saved = svb;
     svb = &b;
@@ -879,8 +880,11 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     sva::store().localAtoms = nullptr;
     if (dis) c.disable = expr(*dis);   // current values, not sampled (16.12)
     std::string name = asserts()[c.id].name;
-    if (!emptyStmt(s.ifTrue)) c.pass = concAction(s.ifTrue, s, name);
-    if (!emptyStmt(s.ifFalse)) c.fail = concAction(s.ifFalse, s, name);
+    c.expect = expect;
+    if (expect) {}   // the action block runs in the process, after the verdict
+    else if (!emptyStmt(s.ifTrue)) c.pass = concAction(s.ifTrue, s, name);
+    if (expect) {}
+    else if (!emptyStmt(s.ifFalse)) c.fail = concAction(s.ifFalse, s, name);
     else if (dir != AD_COVER) c.fail = concAction(nullptr, s, name);
     c.ev = b.clk;
     c.clkIff = b.clkIff;
@@ -932,9 +936,18 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         Instr q;
         q.k = IK::Assert;
         q.sig = c.id;
-        q.join = 3;
+        q.join = expect ? 4 : 3;
         q.hi = (int)concAsserts().size();
-        prog.emit(q);
+        size_t at = prog.emit(q);
+        if (expect) {   // pass: on; fail: target; disabled or killed: lo (after both)
+            if (!emptyStmt(s.ifTrue)) stmt(*s.ifTrue);
+            size_t j = emitJmp();
+            prog.code[at].target = prog.here();
+            if (!emptyStmt(s.ifFalse)) stmt(*s.ifFalse);
+            else emitAssertError(s, name);
+            prog.code[j].target = prog.here();
+            prog.code[at].lo = (int)prog.here();
+        }
     }
     concAsserts().push_back(std::move(c));
     sampleEv = savedEv;
