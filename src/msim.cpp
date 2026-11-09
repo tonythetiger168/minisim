@@ -28,8 +28,8 @@
 //   -threads <n>     worker threads (default: one per physical P core, at most
 //                    8; cpu.hpp). `-threads all` uses every logical CPU, SMT
 //                    siblings included. Results are the same for any n.
-//   -no-pin          let the OS place the worker threads (default: thread k is
-//                    pinned to a distinct physical core, SMT siblings last)
+//   -pin / -no-pin   pin worker thread k to a distinct physical core, SMT
+//                    siblings last (default: pin, except under a hypervisor)
 //   -cpuinfo         print the detected CPU topology and exit
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
 //   -O<n>            optimization level for -compile (default -O2)
@@ -247,7 +247,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
     run += " -threads " + std::to_string(threads);
-    if (!g_pin) run += " -no-pin";
+    if (g_pin >= 0) run += g_pin ? " -pin" : " -no-pin";
     std::cout.flush();
     int st = std::system(run.c_str());
     if (st == -1) return 1;
@@ -345,7 +345,7 @@ static void usage() {
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
                  "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
-                 "  -no-pin        do not pin worker threads to cores\n"
+                 "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  -version       print the msim version\n"
@@ -381,7 +381,8 @@ int main(int argc, char** argv) {
         if (a == "-no-partition") { staticPart = false; continue; }
         if (a == "-no-2state") { twoState = false; continue; }
         if (a == "-no-cycle") { cycle = false; continue; }
-        if (a == "-no-pin") { g_pin = false; continue; }
+        if (a == "-no-pin") { g_pin = 0; continue; }
+        if (a == "-pin") { g_pin = 1; continue; }
         if (a == "-cpuinfo") {
             const CpuTopo& t = cpuTopo();
             std::cout << t.describe() << "\ndefault -threads " << defaultThreads() << "\nplacement:";

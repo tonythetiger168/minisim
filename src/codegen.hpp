@@ -138,7 +138,8 @@ public:
              "            ++i;\n"
              "            S.threads = !std::strcmp(argv[i], \"all\") ? maxThreads() : std::max(1, std::atoi(argv[i]));\n"
              "        }\n"
-             "        else if (!std::strcmp(argv[i], \"-no-pin\")) g_pin = false;\n"
+             "        else if (!std::strcmp(argv[i], \"-no-pin\")) g_pin = 0;\n"
+             "        else if (!std::strcmp(argv[i], \"-pin\")) g_pin = 1;\n"
              "    }\n"
              "    S.threads = std::min(S.threads, maxThreads());\n";
         for (size_t s = 0; s < sigs.size(); s++) {

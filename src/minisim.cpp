@@ -80,10 +80,13 @@ inline int defaultThreads() {
     return n < 1 ? 1 : (n > 8 ? 8 : n);
 }
 inline int maxThreads() { return std::max(1, cpuTopo().logical()); }
-// Pin pool thread k to cpuTopo().order[k] (msim -no-pin turns it off): the
-// same items of a batch then stay in the same core's cache, and N threads sit
-// on N distinct physical cores.
-inline bool g_pin = true;
+// Pin pool thread k to cpuTopo().order[k]: the same items of a batch then
+// stay in the same core's cache, and N threads sit on N distinct physical
+// cores. -1 (default): pin unless under a hypervisor, where a pinned thread
+// waits for its virtual CPU (WSL2 on an i7-14700: 8 pinned threads 2.3 s,
+// unpinned 0.8 s). msim -pin / -no-pin force it.
+inline int g_pin = -1;
+inline bool pinThreads() { return g_pin < 0 ? !cpuTopo().hypervisor : g_pin > 0; }
 
 struct Pool {
     // Each thread starts on its own contiguous range of a batch (so the same
@@ -102,6 +105,10 @@ struct Pool {
     struct alignas(64) Slot {
         atomic<uint64_t> claim{0};
         atomic<size_t> end{0}, chunk{1};
+        // The batch this thread is called to. Only the threads a batch uses are
+        // woken: one left out sleeps on, so a batch on 2 of 8 threads costs no
+        // wake-up (a futex call, a context switch) of the other 6.
+        atomic<uint64_t> gate{0};
     };
     Slot slots[kMaxThreads];
     vector<thread> ts;
@@ -120,7 +127,7 @@ struct Pool {
     }
     void ensure(int n) {
         n = std::min(n, kMaxThreads);
-        if (g_pin && n > 1 && !pinned) { pinned = true; pinSelf(0); }
+        if (n > 1 && !pinned && pinThreads()) { pinned = true; pinSelf(0); }
         while ((int)ts.size() < n - 1) {
             int id = (int)ts.size() + 1;
             bool pin = pinned;
@@ -129,8 +136,8 @@ struct Pool {
     }
     ~Pool() {
         stop = true;
-        gen.fetch_add(1);
-        gen.notify_all();
+        uint64_t g = gen.fetch_add(1) + 1;
+        for (auto& sl : slots) { sl.gate.store(g); sl.gate.notify_all(); }
         for (auto& t : ts) t.join();
     }
     // Take chunks of slot s in batch b until it is empty. False once the
@@ -164,15 +171,16 @@ struct Pool {
         for (;;) {
             uint64_t g;
             int spins = 0;
-            while ((g = gen.load(memory_order_acquire)) == seen) {
+            atomic<uint64_t>& gate = slots[id].gate;
+            while ((g = gate.load(memory_order_acquire)) == seen) {
                 // Spin for the next batch; yield, which lets any other
                 // runnable thread have the CPU; then sleep.
                 // A thread left out of the last batch sleeps at once, so it
                 // does not spin on an SMT sibling of a thread that is working.
-                if (id >= active.load(memory_order_relaxed)) gen.wait(seen);
+                if (id >= active.load(memory_order_relaxed)) gate.wait(seen);
                 else if (++spins < 4000) relax();
                 else if (spins < 20000) this_thread::yield();
-                else gen.wait(seen);
+                else gate.wait(seen);
             }
             seen = g;
             if (stop) return;
@@ -200,7 +208,10 @@ struct Pool {
             slots[t].claim.store(((uint64_t)b << 32) | lo, memory_order_release);
         }
         gen.store(b, memory_order_release);   // the only writer while the pool runs
-        gen.notify_all();
+        for (size_t t = 1; t < T; t++) {
+            slots[t].gate.store(b, memory_order_release);
+            slots[t].gate.notify_one();
+        }
         work(0, b);
         // Wait for chunks other threads are still running: spin, yield, then sleep.
         for (int spins = 0;; spins++) {
@@ -311,7 +322,9 @@ struct Sim {
     // machine (cores, SMT, P/E cores) and the design, so no fixed default
     // fits. Results never depend on it: only the speed does.
     struct Tuner {
-        static constexpr int kTry = 256, kKeep = 1 << 16;
+        // kWarm steps of each candidate are not timed: right after a switch,
+        // threads that just left the batch may still be spinning.
+        static constexpr int kWarm = 32, kTry = 256, kKeep = 1 << 16;
         int cand = 0, n = 0, best = 1;   // cand: index into 1, 2, 4, ...; -1 = exploiting
         int64_t sum = 0, bestNs = INT64_MAX;
         std::chrono::steady_clock::time_point t0;
@@ -326,8 +339,9 @@ struct Sim {
         }
         void done(int maxT) {
             if (maxT <= 1 || cand < 0) return;
+            if (++n <= kWarm) return;
             sum += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-            if (++n < kTry) return;
+            if (n < kWarm + kTry) return;
             int t = std::min(1 << cand, maxT);
             if (sum < bestNs) { bestNs = sum; best = t; }
             n = 0; sum = 0;
