@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
+  `always_ff` on sampled values, checker variables and free variables, all
+  in the reactive region set. Before this, checker instances were ignored.
 - Programs (24): program code runs in the reactive region set, programs end
   with an implicit `$finish`, `$exit`, nested and anonymous programs.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
