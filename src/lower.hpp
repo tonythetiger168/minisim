@@ -947,64 +947,8 @@ struct Lowerer {
             const auto& r = rules[k];
             size_t skip = 0;
             if (pick >= 0) skip = emitJmpIfNot(bin(Op::Lt, ref(pick), ref(w[k])));
-            if (r.isRandJoin) unsupported("rand join");
-            for (const RS::ProdBase* pb : r.prods) {
-                switch (pb->kind) {
-                    case RS::ProdKind::Item: rsItem(pb->as<RS::ProdItem>()); break;
-                    case RS::ProdKind::CodeBlock: {
-                        const Statement* st = pb->as<RS::CodeBlockProd>().block->tryGetStatement();
-                        if (st) stmt(*st);
-                        break;
-                    }
-                    case RS::ProdKind::IfElse: {
-                        const auto& ie = pb->as<RS::IfElseProd>();
-                        size_t no = emitJmpIfNot(expr(*ie.expr));
-                        rsItem(ie.ifItem);
-                        size_t end = emitJmp();
-                        prog.code[no].target = prog.here();
-                        if (ie.elseItem) rsItem(*ie.elseItem);
-                        prog.code[end].target = prog.here();
-                        break;
-                    }
-                    case RS::ProdKind::Repeat: {
-                        const auto& rp = pb->as<RS::RepeatProd>();
-                        int n = fresh(64);
-                        Instr i; i.k = IK::Assign; i.sig = n;
-                        i.e = resize(expr(*rp.expr), 64, rp.expr->type->isSigned(), false);
-                        prog.emit(i);
-                        size_t top = prog.here();
-                        size_t done = emitJmpIfNot(bin(Op::Gt, ref(n), konst(mk(0, 64))));
-                        rsItem(rp.item);
-                        Instr dec; dec.k = IK::Assign; dec.sig = n; dec.e = bin(Op::Sub, ref(n), konst(mk(1, 64)));
-                        prog.emit(dec);
-                        Instr j; j.k = IK::Jmp; j.target = top; prog.emit(j);
-                        prog.code[done].target = prog.here();
-                        break;
-                    }
-                    case RS::ProdKind::Case: {
-                        const auto& cp = pb->as<RS::CaseProd>();
-                        int v = fresh(64);
-                        Instr i; i.k = IK::Assign; i.sig = v;
-                        i.e = resize(expr(*cp.expr), 64, cp.expr->type->isSigned(), false);
-                        prog.emit(i);
-                        std::vector<size_t> out;
-                        for (const auto& ci : cp.items) {
-                            E any;
-                            for (const Expression* x : ci.expressions) {
-                                E eq = bin(Op::CaseEq, ref(v), resize(expr(*x), 64, x->type->isSigned(), false));
-                                any = any ? bin(Op::LogOr, any, eq) : eq;
-                            }
-                            size_t no = emitJmpIfNot(any);
-                            rsItem(ci.item);
-                            out.push_back(emitJmp());
-                            prog.code[no].target = prog.here();
-                        }
-                        if (cp.defaultItem) rsItem(*cp.defaultItem);
-                        patch(out, prog.here());
-                        break;
-                    }
-                }
-            }
+            if (r.isRandJoin) { rsJoin(r); }
+            else for (const RS::ProdBase* pb : r.prods) rsProd(pb);
             if (r.codeBlock) {
                 if (const Statement* st = r.codeBlock->block->tryGetStatement()) stmt(*st);
             }
@@ -1016,6 +960,181 @@ struct Lowerer {
             }
         }
         patch(ends, prog.here());
+    }
+    // rand join (18.17.5): the items of the listed productions, interleaved
+    // at random, each production's own items in order. Each step picks a
+    // production with items left, weighted by how many it has left raised
+    // to 2N-1 (N the join's bias, 0.5 by default: every one alike).
+    void rsJoin(const slang::ast::RandSeqProductionSymbol::Rule& jr) {
+        using namespace slang::ast;
+        using RS = RandSeqProductionSymbol;
+        double bias = 0.5;
+        if (jr.randJoinExpr) {
+            slang::ConstantValue cv = tryConst(*jr.randJoinExpr);
+            if (cv.isReal()) bias = double(cv.real());
+            else if (cv.isShortReal()) bias = double(cv.shortReal());
+            else if (cv.isInteger()) bias = (double)cv.integer().as<int64_t>().value_or(0);
+            else unsupported("rand join with a bias that is not constant");
+        }
+        bias = std::clamp(bias, 0.0, 1.0);
+        auto k64 = [](uint64_t v) { return konst(mk(v, 64)); };
+        struct Part { std::span<const RS::Rule> rules; int rule = -1, cnt = 0; E len; size_t maxLen = 0; };
+        std::vector<Part> parts;
+        for (const RS::ProdBase* pb : jr.prods) {
+            if (pb->kind != RS::ProdKind::Item) unsupported("rand join of something other than a production");
+            const auto& it = pb->as<RS::ProdItem>();
+            if (!it.target || !it.args.empty()) unsupported("rand join of a production with arguments");
+            Part pt;
+            pt.rules = it.target->getRules();
+            for (const auto& r : pt.rules)
+                if (r.isRandJoin) unsupported("rand join of a production that is itself a rand join");
+            if (pt.rules.size() > 1) {   // its rule, by weight, first (18.17.1)
+                std::vector<int> w;
+                E total;
+                for (const auto& r : pt.rules) {
+                    int t = fresh(64);
+                    Instr i; i.k = IK::Assign; i.sig = t;
+                    i.e = r.weightExpr ? resize(expr(*r.weightExpr), 64, r.weightExpr->type->isSigned(), false) : k64(1);
+                    prog.emit(i);
+                    w.push_back(t);
+                    total = total ? bin(Op::Add, total, ref(t)) : ref(t);
+                }
+                int pick = fresh(64);
+                Instr d; d.k = IK::Assign; d.sig = pick; d.e = weightedPick(total);
+                prog.emit(d);
+                E sel = k64(pt.rules.size() - 1), cum;
+                std::vector<E> cums;
+                for (size_t k = 0; k < w.size(); k++) { cum = cum ? bin(Op::Add, cum, ref(w[k])) : ref(w[k]); cums.push_back(cum); }
+                for (size_t k = w.size() - 1; k-- > 0;) sel = mux(bin(Op::Lt, ref(pick), cums[k]), k64(k), sel);
+                pt.rule = fresh(64);
+                Instr a; a.k = IK::Assign; a.sig = pt.rule; a.e = sel;
+                prog.emit(a);
+            }
+            // Its steps: the rule's items, then its code block.
+            E len;
+            for (size_t k = pt.rules.size(); k-- > 0;) {
+                size_t n = pt.rules[k].prods.size() + (pt.rules[k].codeBlock ? 1 : 0);
+                pt.maxLen = std::max(pt.maxLen, n);
+                len = len ? mux(bin(Op::Eq, ref(pt.rule), k64(k)), k64(n), len) : k64(n);
+            }
+            pt.len = len;
+            pt.cnt = fresh(64);
+            Instr z; z.k = IK::Assign; z.sig = pt.cnt; z.e = k64(0);
+            prog.emit(z);
+            parts.push_back(std::move(pt));
+        }
+        size_t top = prog.here();
+        std::vector<int> wts;
+        E total;
+        for (auto& pt : parts) {
+            E rem = bin(Op::Sub, pt.len, ref(pt.cnt));
+            E wt;
+            if (bias == 0.5) wt = k64(1);
+            else {   // round(1e6 * rem^(2N-1)), at least 1
+                wt = k64(1);
+                for (size_t r = pt.maxLen; r >= 1; r--) {
+                    double x = std::pow((double)r, 2 * bias - 1) * 1e6;
+                    wt = mux(bin(Op::Eq, rem, k64(r)), k64(std::max<uint64_t>(1, (uint64_t)std::llround(x))), wt);
+                }
+            }
+            int t = fresh(64);
+            Instr i; i.k = IK::Assign; i.sig = t; i.e = mux(bin(Op::Eq, rem, k64(0)), k64(0), wt);
+            prog.emit(i);
+            wts.push_back(t);
+            total = total ? bin(Op::Add, total, ref(t)) : ref(t);
+        }
+        size_t done = emitJmpIfNot(bin(Op::Ne, total, k64(0)));
+        int pick = fresh(64);
+        { Instr d; d.k = IK::Assign; d.sig = pick; d.e = weightedPick(total); prog.emit(d); }
+        std::vector<size_t> next;
+        for (size_t p = 0; p < parts.size(); p++) {
+            Part& pt = parts[p];
+            size_t skip = emitJmpIfNot(bin(Op::Lt, ref(pick), ref(wts[p])));
+            Instr inc; inc.k = IK::Assign; inc.sig = pt.cnt; inc.e = bin(Op::Add, ref(pt.cnt), k64(1));
+            std::vector<size_t> out;
+            for (size_t k = 0; k < pt.rules.size(); k++) {
+                const auto& r = pt.rules[k];
+                size_t n = r.prods.size() + (r.codeBlock ? 1 : 0);
+                for (size_t st = 0; st < n; st++) {
+                    E here = bin(Op::Eq, ref(pt.cnt), k64(st));
+                    if (pt.rule >= 0) here = bin(Op::LogAnd, bin(Op::Eq, ref(pt.rule), k64(k)), here);
+                    size_t no = emitJmpIfNot(here);
+                    prog.emit(inc);   // first, so a step that ends the join early is counted
+                    if (st < r.prods.size()) rsProd(r.prods[st]);
+                    else if (const Statement* s = r.codeBlock->block->tryGetStatement()) stmt(*s);
+                    out.push_back(emitJmp());
+                    prog.code[no].target = prog.here();
+                }
+            }
+            patch(out, prog.here());
+            next.push_back(emitJmp());
+            prog.code[skip].target = prog.here();
+            Instr sub; sub.k = IK::Assign; sub.sig = pick; sub.e = bin(Op::Sub, ref(pick), ref(wts[p]));
+            prog.emit(sub);
+        }
+        patch(next, top);
+        Instr j; j.k = IK::Jmp; j.target = top; prog.emit(j);
+        prog.code[done].target = prog.here();
+    }
+    // One item of a randsequence rule (18.17).
+    void rsProd(const slang::ast::RandSeqProductionSymbol::ProdBase* pb) {
+        using namespace slang::ast;
+        using RS = RandSeqProductionSymbol;
+        switch (pb->kind) {
+            case RS::ProdKind::Item: rsItem(pb->as<RS::ProdItem>()); break;
+            case RS::ProdKind::CodeBlock: {
+                const Statement* st = pb->as<RS::CodeBlockProd>().block->tryGetStatement();
+                if (st) stmt(*st);
+                break;
+            }
+            case RS::ProdKind::IfElse: {
+                const auto& ie = pb->as<RS::IfElseProd>();
+                size_t no = emitJmpIfNot(expr(*ie.expr));
+                rsItem(ie.ifItem);
+                size_t end = emitJmp();
+                prog.code[no].target = prog.here();
+                if (ie.elseItem) rsItem(*ie.elseItem);
+                prog.code[end].target = prog.here();
+                break;
+            }
+            case RS::ProdKind::Repeat: {
+                const auto& rp = pb->as<RS::RepeatProd>();
+                int n = fresh(64);
+                Instr i; i.k = IK::Assign; i.sig = n;
+                i.e = resize(expr(*rp.expr), 64, rp.expr->type->isSigned(), false);
+                prog.emit(i);
+                size_t top = prog.here();
+                size_t done = emitJmpIfNot(bin(Op::Gt, ref(n), konst(mk(0, 64))));
+                rsItem(rp.item);
+                Instr dec; dec.k = IK::Assign; dec.sig = n; dec.e = bin(Op::Sub, ref(n), konst(mk(1, 64)));
+                prog.emit(dec);
+                Instr j; j.k = IK::Jmp; j.target = top; prog.emit(j);
+                prog.code[done].target = prog.here();
+                break;
+            }
+            case RS::ProdKind::Case: {
+                const auto& cp = pb->as<RS::CaseProd>();
+                int v = fresh(64);
+                Instr i; i.k = IK::Assign; i.sig = v;
+                i.e = resize(expr(*cp.expr), 64, cp.expr->type->isSigned(), false);
+                prog.emit(i);
+                std::vector<size_t> out;
+                for (const auto& ci : cp.items) {
+                    E any;
+                    for (const Expression* x : ci.expressions) {
+                        E eq = bin(Op::CaseEq, ref(v), resize(expr(*x), 64, x->type->isSigned(), false));
+                        any = any ? bin(Op::LogOr, any, eq) : eq;
+                    }
+                    size_t no = emitJmpIfNot(any);
+                    rsItem(ci.item);
+                    out.push_back(emitJmp());
+                    prog.code[no].target = prog.here();
+                }
+                if (cp.defaultItem) rsItem(*cp.defaultItem);
+                patch(out, prog.here());
+                break;
+            }
+        }
     }
     size_t emitJmp() {
         Instr j;
@@ -3429,6 +3548,11 @@ struct Lowerer {
                 if (auto as = arraySel(e))
                     return sized(arrayRead(*as), as->a->elemW, as->a->sgn, ctx);
                 const auto& sel = e.as<ElementSelectExpression>();
+                if (sel.value().type->isString()) {   // s[i]: its byte i, 0 when out of range (6.16)
+                    auto m = node(Op::StrMethod, {exprStr(sel.value()), expr(sel.selector())});
+                    m->hi = S_GETC;
+                    return sized(std::move(m), 8, false, ctx);
+                }
                 PSel ps = packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index);
                 return sized(readPSel(expr(sel.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
@@ -5217,6 +5341,18 @@ struct Lowerer {
                 auto p = ValueExpressionBase::isKind(l.kind) ? eventPtr().find(&l.as<ValueExpressionBase>().symbol) : eventPtr().end();
                 if (p == eventPtr().end() || a.isNonBlocking() || a.timingControl) unsupported("this event assignment");
                 Instr i; i.k = IK::Assign; i.sig = p->second; i.e = eventAddr(a.right());
+                prog.emit(i);
+                return;
+            }
+            if (const Expression& l = peel(a.left()); l.kind == ExpressionKind::ElementSelect &&
+                l.as<ElementSelectExpression>().value().type->isString()) {   // s[i] = c (6.16): s.putc(i, c)
+                if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this write to a string character");
+                const auto& sel = l.as<ElementSelectExpression>();
+                Instr i; i.k = IK::Assign;
+                lhs(sel.value(), i);
+                auto m = node(Op::StrMethod, {exprStr(sel.value()), expr(sel.selector()), expr(a.right())});
+                m->hi = S_PUTC;
+                i.e = m;
                 prog.emit(i);
                 return;
             }
