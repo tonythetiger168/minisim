@@ -6591,6 +6591,10 @@ inline ClassInfo* buildClass(const slang::ast::ClassType& ct,
             const auto& p = m.as<ClassPropertySymbol>();
             if (p.lifetime == VariableLifetime::Static) continue;
             propMap()[&p] = Lowerer::declSlot(p.getType(), ci->lay);
+            // An embedded covergroup's handle is null in a shallow copy (8.12, 19.4).
+            if (const Type& pt = p.getType().getCanonicalType(); pt.kind == SymbolKind::CovergroupType &&
+                pt.as<CovergroupType>().getParentScope() == static_cast<const Scope*>(&ct))
+                ci->lay->noCopy.push_back(propMap()[&p].off);
             if (p.randMode != RandMode::None) randModeMap()[&p] = ci->lay->add(1, mk(1));
             continue;
         }
