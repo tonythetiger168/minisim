@@ -111,6 +111,7 @@
 
 #include "codegen.hpp"
 #include "lower.hpp"
+#include "slang/diagnostics/LookupDiags.h"
 #include "slang/driver/Driver.h"
 #include "slang/syntax/AllSyntax.h"
 #include "slang/syntax/SyntaxTree.h"
@@ -871,6 +872,15 @@ int main(int argc, char** argv) {
     if (auto& f = driver.options.compilationFlags[slang::ast::CompilationFlags::AllowUseBeforeDeclare]; !f)
         f = true;
     if (!driver.processOptions()) return 2;
+    // 33.3.1.1: two cells with one name in one library are a warning, and
+    // the last one encountered is the one used (slang keeps the later
+    // definition first in its list). -Werror=duplicate-definition keeps
+    // the error.
+    {
+        bool userSet = false;
+        for (auto& s : fwd) userSet |= s.find("duplicate-definition") != std::string::npos;
+        if (!userSet) driver.diagEngine.setSeverity(slang::diag::DuplicateDefinition, slang::DiagnosticSeverity::Warning);
+    }
     if (!driver.parseAllSources()) return 1;
     // A design element with no `timescale or timeunit, in a design where
     // others have one, gets 1ns/1ps instead of an error (--timescale sets

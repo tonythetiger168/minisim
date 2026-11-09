@@ -17,6 +17,10 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_put_value` with `vpiForceFlag` and `vpiReleaseFlag` (38.35);
   `tf_dofinish` / `tf_dostop` (`veriuser.h`) and `sv_vpi_user.h`; VPI calls
   from DPI context imports (35.5.3).
+- Specify paths to outputs declared as variables (30.4): the port
+  connection takes the path delay.
+- Two cells with one name in one library are a warning, and the last one is
+  used (33.3.1.1). VPI `vpiLibrary`, `vpiCell` and `vpiConfig` (33.7).
 - Pulse filtering at path outputs (30.7): `PATHPULSE$` limits, `+pulse_r/N`
   and `+pulse_e/N`, pulses to x, pulse styles (`pulsestyle_ondetect`,
   `showcancelled` and the `+pulse_on_detect` / `+showcancelled` options).

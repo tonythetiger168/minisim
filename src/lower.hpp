@@ -8139,13 +8139,16 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         for (const Expression* o : outs) {
             auto [dst, osym] = sigOf(o, "a path to this output");
-            if (osym->kind != SymbolKind::Net) Lowerer::unsupported("a path delay to a variable output");
+            // A variable output (output reg q): the module reads q at once,
+            // and the path delay is on its port connection (30.4).
+            bool var = osym->kind != SymbolKind::Net;
             for (const Expression* i : ins) {
                 PathRec r = base;
                 r.in = termText(*i);
                 r.out = termText(*o);
                 r.src = sigOf(i, "a path from this input").first;
                 r.dst = dst;
+                r.dstVar = var;
                 pathRecs().push_back(std::move(r));
             }
         }
