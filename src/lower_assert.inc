@@ -231,10 +231,13 @@ int shadowOf(int s) {
     return sh;
 }
 // An expression with every static variable read replaced by its sampled value.
+// The hidden signals of assertion local variables (16.10): read as they are.
+static std::unordered_set<int>& svaLocalSigs() { static std::unordered_set<int> s; return s; }
 E sampledE(const E& e) {
     if (!e) return e;
+    if (e->op == Op::Const) return e;
     if (e->op == Op::Ref) {
-        if (isRel(e->sig) || automaticSigs().count(e->sig)) return e;   // automatic: read as it is
+        if (isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig)) return e;   // automatic: read as it is
         auto c = std::make_shared<Expr>(*e);
         c->sig = shadowOf(e->sig);
         return c;
@@ -340,6 +343,9 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
 // The terms of one assertion while it is built (sva_engine.hpp).
 struct SvaBuild {
     std::vector<E> atoms;
+    std::vector<char> atomLocal;     // the atom reads a local variable
+    std::vector<int> localSigs;      // local variables (16.10), as hidden signals
+    std::vector<std::vector<ConcAssert::Item>> acts;   // match items and initializers
     std::unordered_map<const slang::ast::Expression*, int> atomOf;
     std::vector<std::pair<int, Edge>> clk;
     E clkIff;
@@ -347,16 +353,126 @@ struct SvaBuild {
 SvaBuild* svb = nullptr;
 
 // A boolean of the assertion, on sampled values (16.5.1).
+static bool readsLocal(const E& e) {
+    if (!e) return false;
+    if (e->op == Op::Ref && svaLocalSigs().count(e->sig)) return true;
+    for (const auto& k : e->kids)
+        if (readsLocal(k)) return true;
+    return false;
+}
 int svaAtom(const slang::ast::Expression& x) {
     if (auto it = svb->atomOf.find(&x); it != svb->atomOf.end()) return it->second;
-    svb->atoms.push_back(sampledE(expr(x)));
-    int id = (int)svb->atoms.size() - 1;
+    int id = svaAtomE(sampledE(expr(x)));
     svb->atomOf[&x] = id;
     return id;
 }
 int svaAtomE(E e) {
+    svb->atomLocal.push_back(readsLocal(e));
     svb->atoms.push_back(std::move(e));
     return (int)svb->atoms.size() - 1;
+}
+// The local variables of a sequence or property instance (16.10): a hidden
+// signal each, and the act that initializes them when the instance starts
+// (declaration initializers and local input arguments, 16.8.2); -1: none.
+int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
+    using namespace slang::ast;
+    if (ai.isRecursiveProperty) unsupported("recursive property (16.12.17)");
+    if (ai.localVars.empty()) return -1;
+    std::vector<ConcAssert::Item> init;
+    for (const LocalAssertionVarSymbol* lv : ai.localVars) {
+        const Type& t = lv->getType();
+        if (!t.isIntegral()) unsupported("a local variable that is not integral (16.10)");
+        int w = (int)t.getBitWidth();
+        if (!mkSig) unsupported("local variable here");
+        int sg = mkSig(scopePath(scope) + ".$lv_" + std::string(lv->name) + std::to_string(tempSeq ? (*tempSeq)++ : 0), w, false);
+        sigmap[lv] = sg;
+        svaLocalSigs().insert(sg);
+        int k = (int)svb->localSigs.size();
+        svb->localSigs.push_back(sg);
+        const Expression* from = nullptr;
+        if (lv->formalPort) {
+            if (lv->formalPort->direction && *lv->formalPort->direction != ArgumentDirection::In)
+                unsupported("a local variable argument that is output or inout (16.8.2)");
+            for (auto& [port, actual] : ai.arguments)
+                if (port == lv->formalPort)
+                    if (auto* x = std::get_if<const Expression*>(&actual)) from = *x;
+        } else if (const DeclaredType* dt = lv->getDeclaredType())
+            from = dt->getInitializer();
+        if (from) init.push_back({k, resize(sampledE(expr(*from)), w, from->type->isSigned(), false)});
+    }
+    if (init.empty()) return -1;
+    svb->acts.push_back(std::move(init));
+    return (int)svb->acts.size() - 1;
+}
+// A subroutine call in a match item (16.11) as a process. Its arguments are
+// evaluated at the match, on sampled values and the local variables' values
+// then: each becomes a constant slot, as in actionProg.
+const Prog* callProg(const slang::ast::CallExpression& call, std::vector<E>& caps, std::vector<E>& slots) {
+    if (!store) unsupported("a subroutine call in a match item here");
+    Lowerer lw(sigmap);
+    lw.bind(subs, mkSig, tempSeq, store);
+    lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
+    lw.scope = scope;
+    lw.current = current;
+    lw.sampleEv = sampleEv;
+    if (call.isSystemCall()) lw.sysCall(call);
+    else lw.emitUserCall(call, false);
+    lw.finishImplicit();
+    auto cap = [&](E& e) {
+        if (!e || e->op == Op::Const) return;
+        caps.push_back(sampledE(e));
+        E k = konst(Val{});
+        slots.push_back(k);
+        e = k;
+    };
+    for (auto& i : lw.prog.code) {
+        if (i.k == IK::Call) break;
+        if (i.k == IK::Display || i.k == IK::Strobe || i.k == IK::Monitor) for (auto& x : i.args) cap(x);
+        else if (i.k == IK::Assign) cap(i.e);
+    }
+    store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+    return store->back().get();
+}
+// Match items (16.10): assignments, ++ and -- of local variables, as an act; -1: none.
+int matchAct(std::span<const slang::ast::Expression* const> items) {
+    using namespace slang::ast;
+    if (items.empty()) return -1;
+    std::vector<ConcAssert::Item> act;
+    auto localOf = [&](const Expression& x) -> int {
+        const Expression& t = peel(x);
+        if (t.kind == ExpressionKind::NamedValue)
+            if (auto it = sigmap.find(&t.as<NamedValueExpression>().symbol); it != sigmap.end())
+                for (size_t k = 0; k < svb->localSigs.size(); k++)
+                    if (svb->localSigs[k] == it->second) return (int)k;
+        unsupported("a match item that assigns something other than a local variable (16.10)");
+    };
+    for (const Expression* it : items) {
+        if (it->kind == ExpressionKind::Assignment) {
+            const auto& a = it->as<AssignmentExpression>();
+            int k = localOf(a.left());
+            int w = (int)a.left().type->getBitWidth();
+            const Expression* saved = lvalue;
+            if (a.isCompound()) lvalue = &a.left();
+            E r = expr(a.right());
+            lvalue = saved;
+            act.push_back({k, resize(sampledE(r), w, a.right().type->isSigned(), false)});
+        } else if (it->kind == ExpressionKind::UnaryOp) {
+            const auto& u = it->as<UnaryExpression>();
+            bool inc = u.op == UnaryOperator::Preincrement || u.op == UnaryOperator::Postincrement;
+            bool dec = u.op == UnaryOperator::Predecrement || u.op == UnaryOperator::Postdecrement;
+            if (!inc && !dec) unsupported("this match item (16.10)");
+            int k = localOf(u.operand());
+            int w = (int)u.operand().type->getBitWidth();
+            act.push_back({k, resize(bin(inc ? Op::Add : Op::Sub, expr(u.operand()), konst(mk(1, 32))), w, false, false)});
+        } else if (it->kind == ExpressionKind::Call) {
+            ConcAssert::Item ci;
+            ci.call = callProg(it->as<CallExpression>(), ci.caps, ci.slots);
+            act.push_back(std::move(ci));
+        } else
+            unsupported("this match item (16.10)");
+    }
+    svb->acts.push_back(std::move(act));
+    return (int)svb->acts.size() - 1;
 }
 // A clocking event as signal events and an optional iff condition.
 void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge>>& ev, E& iff) {
@@ -408,10 +524,6 @@ static const slang::ast::AssertionInstanceExpression* instanceOf(const slang::as
     if (x.kind != ExpressionKind::AssertionInstance) return nullptr;
     return &x.as<AssertionInstanceExpression>();
 }
-static void noLocals(const slang::ast::AssertionInstanceExpression& ai) {
-    if (!ai.localVars.empty()) unsupported("local variables in a sequence or property (16.10)");
-    if (ai.isRecursiveProperty) unsupported("recursive property (16.12.17)");
-}
 
 // A sequence (16.7, 16.9).
 const sva::Node* seqTerm(const slang::ast::AssertionExpr& a) {
@@ -421,8 +533,8 @@ const sva::Node* seqTerm(const slang::ast::AssertionExpr& a) {
         case AssertionExprKind::Simple: {
             const auto& s = a.as<SimpleAssertionExpr>();
             if (const auto* ai = instanceOf(a)) {
-                noLocals(*ai);
-                return repeated(seqTerm(ai->body), nullptr, s.repetition);
+                int init = instLocals(*ai);
+                return repeated(st.init(init, seqTerm(ai->body)), nullptr, s.repetition);
             }
             if (s.expr.kind == ExpressionKind::Call) {
                 const auto& c = s.expr.as<CallExpression>();
@@ -443,13 +555,13 @@ const sva::Node* seqTerm(const slang::ast::AssertionExpr& a) {
         }
         case AssertionExprKind::SequenceWithMatch: {
             const auto& s = a.as<SequenceWithMatchExpr>();
-            if (!s.matchItems.empty()) unsupported("sequence match items (16.10, 16.11)");
-            return repeated(seqTerm(s.expr), nullptr, s.repetition);
+            const sva::Node* r = seqTerm(s.expr);
+            return repeated(st.match(r, matchAct(s.matchItems)), nullptr, s.repetition);
         }
         case AssertionExprKind::FirstMatch: {
             const auto& f = a.as<FirstMatchAssertionExpr>();
-            if (!f.matchItems.empty()) unsupported("sequence match items (16.10, 16.11)");
-            return st.fm(seqTerm(f.seq));
+            const sva::Node* r = st.fm(seqTerm(f.seq));
+            return st.match(r, matchAct(f.matchItems));
         }
         case AssertionExprKind::Binary: {
             const auto& b = a.as<BinaryAssertionExpr>();
@@ -503,8 +615,8 @@ const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
     using namespace slang::ast;
     auto& st = sva::store();
     if (const auto* ai = instanceOf(a); ai && ai->symbol.kind == SymbolKind::Property) {
-        noLocals(*ai);
-        return propTerm(ai->body, strong);
+        int init = instLocals(*ai);
+        return st.init(init, propTerm(ai->body, strong));
     }
     if (isSeq(a)) return st.pseq(seqTerm(a), strong);
     switch (a.kind) {
@@ -622,9 +734,12 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     // The leading clock and disable iff, through named property instances.
     const AssertionExpr* a = &s.propertySpec;
     const Expression* dis = nullptr;
+    std::vector<int> inits;   // the local variables of the leading property instances
+    sva::store().localAtoms = &b.atomLocal;
+    struct Reset { ~Reset() { sva::store().localAtoms = nullptr; } } reset;
     for (;;) {
         if (const auto* ai = instanceOf(*a); ai && ai->symbol.kind == SymbolKind::Property) {
-            noLocals(*ai);
+            inits.push_back(instLocals(*ai));
             a = &ai->body;
         } else if (a->kind == AssertionExprKind::Clocking) {
             const auto& c = a->as<ClockingAssertionExpr>();
@@ -653,6 +768,8 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         c.root = sva::store().covseq(seqTerm(*a));
     } else
         c.root = propTerm(*a, dir == AD_COVER);
+    for (size_t k = inits.size(); k-- > 0;) c.root = sva::store().init(inits[k], c.root);
+    sva::store().localAtoms = nullptr;
     if (dis) c.disable = expr(*dis);   // current values, not sampled (16.12)
     std::string name = asserts()[c.id].name;
     if (!emptyStmt(s.ifTrue)) c.pass = concAction(s.ifTrue, s, name);
@@ -661,6 +778,8 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     c.ev = b.clk;
     c.clkIff = b.clkIff;
     c.atoms = std::move(b.atoms);
+    c.localSig = std::move(b.localSigs);
+    c.acts = std::move(b.acts);
     if (!staticAssert) {   // in a procedure (16.14.6): queued when the procedure reaches it
         c.procedural = true;
         // Automatic variables are read as they were when the instance was
@@ -686,6 +805,11 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
             return n;
         };
         for (auto& at : c.atoms) at = capture(at);
+        for (auto& act : c.acts)
+            for (auto& item : act) {
+                item.rhs = capture(item.rhs);
+                for (auto& x : item.caps) x = capture(x);
+            }
         for (const Prog* act : {c.pass, c.fail})   // the action blocks see them too
             if (act)
                 for (auto& i : const_cast<Prog*>(act)->code) {
