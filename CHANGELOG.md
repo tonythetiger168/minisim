@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Per-process random generators (18.14.2): a forked process is seeded from
+  its parent, so values one process draws do not depend on other processes.
 - `mbug`: files regression (mregress `results.json`), lint (mlint) and DFT
   (mdft) failures as issues in GitHub Issues (default), Redmine or Jira, one
   issue per failure signature. A repeat of an open failure becomes a comment,
