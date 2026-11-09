@@ -728,10 +728,18 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 else S.set(sig, hi >= 0 ? v_insert(S.get(sig), v, hi, lo) : v);
                 pc++; break;
             }
-            case IK::ReadMem: readMem(i); pc++; break;
-            case IK::WriteMem: writeMem(i); pc++; break;
-            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0); pc++; break;
-            case IK::Release: S.holdOff(i.sig, i.hi != 0); pc++; break;
+            case IK::ReadMem:
+            case IK::WriteMem: {
+                if (i.e) {   // a file name known only at run time: a string variable or expression
+                    Instr n = i;
+                    n.fmt = v_str(eval(i.e, rd));
+                    if (i.k == IK::ReadMem) readMem(n); else writeMem(n);
+                } else if (i.k == IK::ReadMem) readMem(i);
+                else writeMem(i);
+                pc++; break;
+            }
+            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
+            case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;

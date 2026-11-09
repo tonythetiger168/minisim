@@ -1198,8 +1198,11 @@ struct Sim {
     // procedural continuous assignment), re-evaluated when one of the
     // expression's signals changes. release lets drivers resolve the net
     // again; a variable keeps its value until it is next written.
-    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2 };
-    struct Hold { E fe, ae; };
+    // force v[3:0] = e holds those bits only (SF_PART): other writes still
+    // change the other bits.
+    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4 };
+    struct PartHold { int hi, lo; E fe, ae; };
+    struct Hold { E fe, ae; vector<PartHold> parts; };
     unordered_map<int, Hold> holds;
     unordered_map<int, vector<int>> holdListeners;   // signal -> held signals whose expression reads it
     void listenTo(int s, const E& e) {
@@ -1211,30 +1214,71 @@ struct Sim {
             sigs[r].fl |= SF_LISTEN;
         }
     }
+    // A write to a partly held signal keeps the held bits.
+    Val keepHeld(int s, Val nv) {
+        auto it = holds.find(s);
+        if (it == holds.end()) return nv;
+        for (auto& p : it->second.parts)
+            if (p.fe || p.ae) nv = v_insert(nv, v_slice(sigs[s].val, p.hi, p.lo), p.hi, p.lo);
+        return nv;
+    }
     void applyHold(int s) {
         auto it = holds.find(s);
         if (it == holds.end()) return;
+        auto rd = [&](int x) { return get(x); };
         const E& e = it->second.fe ? it->second.fe : it->second.ae;
-        if (!e) return;
-        Val v = eval(e, [&](int x) { return get(x); });
-        sigs[s].fl &= (uint8_t)~SF_HELD;
+        uint8_t fl = sigs[s].fl;
+        if (e) {
+            Val v = eval(e, rd);
+            sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
+            set(s, v);
+            sigs[s].fl = fl;
+            return;
+        }
+        Val v = sigs[s].val;
+        for (auto& p : it->second.parts) {
+            const E& pe = p.fe ? p.fe : p.ae;
+            if (pe) v = v_insert(v, eval(pe, rd), p.hi, p.lo);
+        }
+        sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
         set(s, v);
-        sigs[s].fl |= SF_HELD;
+        sigs[s].fl = fl;
     }
-    void holdOn(int s, const E& e, bool force) {
+    // Recompute the flags of s from its holds.
+    void holdFlags(int s, const Hold& h) {
+        sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
+        if (h.fe || h.ae) { sigs[s].fl |= SF_HELD; return; }
+        for (auto& p : h.parts) if (p.fe || p.ae) { sigs[s].fl |= SF_PART; return; }
+    }
+    void holdOn(int s, const E& e, bool force, int hi = -1, int lo = 0) {
         auto& h = holds[s];
-        (force ? h.fe : h.ae) = e;
+        if (hi < 0) (force ? h.fe : h.ae) = e;
+        else {
+            PartHold* ph = nullptr;
+            for (auto& p : h.parts) if (p.hi == hi && p.lo == lo) ph = &p;
+            if (!ph) { h.parts.push_back({hi, lo, nullptr, nullptr}); ph = &h.parts.back(); }
+            (force ? ph->fe : ph->ae) = e;
+        }
         listenTo(s, e);
-        sigs[s].fl |= SF_HELD;
+        holdFlags(s, h);
         applyHold(s);
     }
-    void holdOff(int s, bool force) {
+    void holdOff(int s, bool force, int hi = -1, int lo = 0) {
         auto it = holds.find(s);
         if (it == holds.end()) return;
-        (force ? it->second.fe : it->second.ae) = nullptr;
-        if (it->second.fe || it->second.ae) { applyHold(s); return; }
-        holds.erase(it);
-        sigs[s].fl &= (uint8_t)~SF_HELD;
+        Hold& h = it->second;
+        if (hi < 0) {
+            (force ? h.fe : h.ae) = nullptr;
+            // release of the whole signal also ends forces of its parts
+            if (force) for (auto& p : h.parts) p.fe = nullptr;
+        } else {
+            for (auto& p : h.parts) if (p.hi == hi && p.lo == lo) (force ? p.fe : p.ae) = nullptr;
+        }
+        std::erase_if(h.parts, [](const PartHold& p) { return !p.fe && !p.ae; });
+        holdFlags(s, h);
+        if (h.fe || h.ae) { applyHold(s); return; }
+        if (h.parts.empty()) holds.erase(it);
+        else applyHold(s);
         auto& g = sigs[s];
         if (!g.drv.empty()) {   // a net (or a continuously assigned variable): its drivers take over
             Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)
@@ -1272,7 +1316,10 @@ struct Sim {
     }
 
     void set(int s, Val nv) {
-        if (__builtin_expect(sigs[s].fl & SF_HELD, 0)) return;   // forced: other writes are ignored
+        if (__builtin_expect(sigs[s].fl & (SF_HELD | SF_PART), 0)) {
+            if (sigs[s].fl & SF_HELD) return;   // forced: other writes are ignored
+            nv = keepHeld(s, nv);               // only some bits are held
+        }
         if (sigs[s].w <= 64) {
             uint64_t m = sigs[s].w >= 64 ? ~0ULL : ((1ULL << sigs[s].w) - 1);
             nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;

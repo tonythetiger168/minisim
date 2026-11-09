@@ -553,8 +553,17 @@ struct Lowerer {
         return mkSig("_tf" + std::to_string(n), w, false);
     }
 
+    // The statement or construct being lowered, so an error can say where.
+    static slang::SourceLocation& lastLoc() { static slang::SourceLocation l; return l; }
+    static std::string whereStr() {
+        const auto* sm = srcMgr();
+        slang::SourceLocation l = lastLoc();
+        if (!sm || !l.valid()) return "";
+        auto ol = sm->getFullyOriginalLoc(l);
+        return std::string(sm->getFileName(ol)) + ":" + std::to_string(sm->getLineNumber(ol)) + ": ";
+    }
     [[noreturn]] static void unsupported(const char* what) {
-        throw std::runtime_error(std::string("lower: unsupported ") + what);
+        throw std::runtime_error(whereStr() + "lower: unsupported " + what);
     }
 
     size_t emitJmp() {
@@ -2964,7 +2973,26 @@ struct Lowerer {
             auto args = call.arguments();
             if (args.size() < 2) unsupported("$readmem arguments");
             const Expression& fn = peel(*args[0]);
-            if (fn.kind != ExpressionKind::StringLiteral) unsupported("$readmem file name that is not a string literal");
+            // The file name: a literal, a constant such as a string parameter,
+            // or an expression evaluated when the task runs.
+            std::optional<std::string> fname;
+            if (fn.kind == ExpressionKind::StringLiteral) fname = std::string(fn.as<StringLiteral>().getValue());
+            else if (const slang::ConstantValue* cv = fn.kind == ExpressionKind::NamedValue &&
+                                                     fn.as<NamedValueExpression>().symbol.kind == SymbolKind::Parameter
+                                                 ? &fn.as<NamedValueExpression>().symbol.as<ParameterSymbol>().getValue()
+                                                 : args[0]->getConstant();
+                     cv && !cv->bad()) {
+                if (cv->isString()) fname = cv->str();
+                else if (cv->isInteger()) {   // a string literal held in an integral parameter
+                    auto sv = cv->integer();
+                    std::string t;
+                    for (int b = (int)sv.getBitWidth() - 8; b >= 0; b -= 8) {
+                        char ch = (char)sv.slice(b + 7, b).as<uint8_t>().value_or(0);
+                        if (ch) t += ch;
+                    }
+                    fname = t;
+                }
+            }
             // slang binds the memory as an output argument: an assignment to it.
             const Expression* mp = &peel(*args[1]);
             if (mp->kind == ExpressionKind::Assignment) mp = &peel(mp->as<AssignmentExpression>().left());
@@ -2977,7 +3005,8 @@ struct Lowerer {
             if (!ap) unsupported("$readmem target that is not an unpacked array");
             if (ap->dims.size() != 1) unsupported("$readmem into a multidimensional array");
             Instr i; i.k = n[1] == 'r' ? IK::ReadMem : IK::WriteMem;
-            i.fmt = std::string(fn.as<StringLiteral>().getValue());
+            if (fname) i.fmt = *fname;
+            else i.e = strOf(*args[0]);
             i.arr = ap;
             i.hex = n.ends_with('h');
             for (size_t a = 2; a < args.size() && a < 4; a++) i.args.push_back(expr(*args[a]));
@@ -3467,8 +3496,10 @@ struct Lowerer {
         // instructions keep the line of the statement around them.
         SrcLoc savedLoc = g_emitLoc;
         struct RestoreLoc { SrcLoc& l; SrcLoc v; ~RestoreLoc() { g_emitLoc = v; } } restoreLoc{g_emitLoc, savedLoc};
-        if (s.kind != slang::ast::StatementKind::List && s.kind != slang::ast::StatementKind::Block)
+        if (s.kind != slang::ast::StatementKind::List && s.kind != slang::ast::StatementKind::Block) {
             covLoc(s.sourceRange.start());
+            lastLoc() = s.sourceRange.start();
+        }
         using namespace slang::ast;
         switch (s.kind) {
             case StatementKind::Empty: break;
@@ -3957,16 +3988,35 @@ struct Lowerer {
                     force = pd.isRelease;
                     tgt = &pd.lvalue;
                 }
-                Instr i;
-                lhs(*tgt, i);
-                if (i.arr || i.bidx || i.hi >= 0 || i.dyn >= 0 || i.drv >= 0)
-                    unsupported("force / assign of a bit, part, or array element (only whole signals)");
-                i.k = assign ? IK::Force : IK::Release;
-                i.hi = force ? 1 : 0;
-                i.lo = 0;
-                if (val) i.e = expr(*val);
-                usesForce() = true;
-                prog.emit(i);
+                // force {a, w[3]} = v: each part takes its slice of v (10.6.2).
+                std::vector<std::tuple<const Expression*, int, int>> parts;
+                int tw = (int)tgt->type->getBitWidth();
+                if (peel(*tgt).kind == ExpressionKind::Concatenation) concatParts(*tgt, tw - 1, parts);
+                else parts.push_back({tgt, -1, -1});
+                E whole;
+                if (val) {
+                    whole = expr(*val);
+                    if (parts.size() > 1) {   // evaluated as one value, sliced per part
+                        needWidth(tw);
+                        whole = resize(whole, tw, false, false);
+                    }
+                }
+                for (auto& [x, phi, plo] : parts) {
+                    Instr i;
+                    lhs(*x, i);
+                    if (i.arr || i.bidx || i.dyn >= 0 || i.drv >= 0)
+                        unsupported("force / assign of a variable bit, part, or array element");
+                    if (i.hi >= 0 && !force) unsupported("assign / deassign of a bit or part (only force can, 10.6.2)");
+                    // A constant bit or part: pw is its width and dkey its low bit.
+                    i.pw = i.hi >= 0 ? i.hi - i.lo + 1 : 0;
+                    i.dkey = i.hi >= 0 ? i.lo : -1;
+                    i.k = assign ? IK::Force : IK::Release;
+                    i.hi = force ? 1 : 0;
+                    i.lo = 0;
+                    if (whole) i.e = phi >= 0 ? slice(whole, phi, plo) : whole;
+                    usesForce() = true;
+                    prog.emit(i);
+                }
                 break;
             }
             case StatementKind::Disable: {   // disable blk (9.6.2)
@@ -4434,9 +4484,35 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         using namespace slang::ast;
         const auto& a = ca.getAssignment().as<AssignmentExpression>();
         Lowerer::covLoc(ca.location);
+        Lowerer::lastLoc() = ca.location;
         Lowerer lw(sigmap);
         prep(lw);
         auto [ds0, ds1] = ca.getDriveStrength();
+        if (a.left().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            // assign arr = other_arr / '{...}: one assign per element (10.3, 7.6)
+            const Expression& l = Lowerer::peel(a.left());
+            if (l.kind != ExpressionKind::NamedValue && l.kind != ExpressionKind::HierarchicalValue)
+                Lowerer::unsupported("continuous assign to part of an unpacked array");
+            auto it = arrMap().find(&l.as<ValueExpressionBase>().symbol);
+            if (it == arrMap().end()) Lowerer::unsupported("continuous assign to this array");
+            std::vector<E> els;
+            lw.arrayElems(*a.left().type, a.right(), els);
+            if ((int)els.size() != it->second->count || !lw.prog.code.empty())
+                Lowerer::unsupported("continuous assign of an unpacked array from this value");
+            for (int k = 0; k < it->second->count; k++) {
+                Lowerer L(sigmap);
+                prep(L);
+                Instr i; i.k = IK::Assign;
+                applyStrength(i, ds0, ds1, STR_STRONG, STR_STRONG);
+                i.sig = it->second->base + k;
+                i.e = els[(size_t)k];
+                L.setScope(ca.getParentScope());
+                i.dly = L.delays3(ca.getDelay());
+                finishAssign(L, i);
+            }
+            g_emitLoc = {};
+            return;
+        }
         if (Lowerer::peel(a.left()).kind == ExpressionKind::Concatenation) {
             // assign {c, s} = x + y: one driver per part, each driving its
             // slice of the right-hand side.
@@ -4555,6 +4631,45 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         return Formal{it->second, w, ps.getType().isSigned()};
     }
 
+    // An unpacked array port (23.3.3.4 via 7.6): element by element, each
+    // a continuous assignment, leftmost element to leftmost element.
+    void connectArrayPort(const slang::ast::PortSymbol& ps, const slang::ast::Expression& ext) {
+        using namespace slang::ast;
+        const Symbol* sym = ps.internalSymbol;
+        if (!sym) Lowerer::unsupported("array port with an internal expression");
+        auto fit = arrMap().find(sym);
+        if (fit == arrMap().end()) throw std::runtime_error("lower: array port '" + std::string(ps.name) + "' is not an array");
+        const ArrShape& f = *fit->second;
+        if (ps.direction == ArgumentDirection::In) {
+            Lowerer lw(sigmap);
+            prep(lw);
+            std::vector<E> els;
+            lw.arrayElems(ps.getType(), ext, els);
+            if ((int)els.size() != f.count) Lowerer::unsupported("array port connection of another size");
+            if (!lw.prog.code.empty()) Lowerer::unsupported("array port connection that needs statements");
+            for (int k = 0; k < f.count; k++) {
+                Lowerer L(sigmap);
+                prep(L);
+                Instr i; i.k = IK::Assign; i.sig = f.base + k; i.e = els[(size_t)k];
+                finishAssign(L, i);
+            }
+            return;
+        }
+        if (ps.direction != ArgumentDirection::Out) Lowerer::unsupported("inout or ref array port");
+        if (ext.kind != ExpressionKind::Assignment) Lowerer::unsupported("output port connection");
+        const Expression& act = Lowerer::peel(ext.as<AssignmentExpression>().left());
+        if (act.kind != ExpressionKind::NamedValue && act.kind != ExpressionKind::HierarchicalValue)
+            Lowerer::unsupported("array output port connected to an expression");
+        auto ait = arrMap().find(&act.as<ValueExpressionBase>().symbol);
+        if (ait == arrMap().end() || ait->second->count != f.count) Lowerer::unsupported("array output port connection");
+        for (int k = 0; k < f.count; k++) {
+            Lowerer L(sigmap);
+            prep(L);
+            Instr i; i.k = IK::Assign; i.sig = ait->second->base + k; i.e = ref(f.base + k, f.sgn);
+            finishAssign(L, i);
+        }
+    }
+
     void driveSig(int sig, const slang::ast::Expression& rhs) {
         Lowerer lw(sigmap);
         prep(lw);
@@ -4586,6 +4701,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             const auto& ps = conn->port.as<PortSymbol>();
             const Expression* ext = conn->getExpression();
             if (!ext || ps.isNullPort) continue;
+            Lowerer::lastLoc() = ext->sourceRange.start().valid() ? ext->sourceRange.start() : inst.location;
+            if (ps.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                connectArrayPort(ps, *ext);
+                continue;
+            }
             auto formal = portFormal(ps);
             if (!formal) continue;
             if (ps.direction == ArgumentDirection::In) {
@@ -4686,8 +4806,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         bool loops = p.procedureKind != ProceduralBlockKind::Initial;
         if (p.procedureKind == ProceduralBlockKind::AlwaysComb ||
             p.procedureKind == ProceduralBlockKind::AlwaysLatch) {
-            // runs once at t=0, then re-runs whenever any signal it reads changes
-            auto rs = readSet(lw.prog);
+            // runs once at t=0, then re-runs whenever any signal it reads,
+            // and does not itself write, changes (9.2.2.2.1)
+            auto rs = combReadSet(lw.prog);
             if (rs.empty()) loops = false;
             else lw.prog.emit(waitInstr(rs));
         }
