@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Per-process random generators (18.14.2): a forked process is seeded from
+  its parent, so values one process draws do not depend on other processes.
 - `rand join` in randsequence (18.17.5), with a constant bias, and production
   arguments and return values (18.17.7).
 - `dist` default weights (`default :/ w`, 18.5.3) and rand associative
