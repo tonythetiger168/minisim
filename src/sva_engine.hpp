@@ -23,11 +23,21 @@
 //   r within s           = (1[*0:$] . r . 1[*0:$]) & s
 // A term is nullable when its set has the empty word: a match ends at the
 // last tick consumed.
+//
+// Local variables (16.10): an environment is a vector of their values,
+// interned by the kernel as an id. A term is read in a context environment;
+// ENV(e, t) reads t in environment e instead. MATCH(r, act) runs the match
+// items `act` at the end of each match of r, and INIT(act, t) runs the
+// initializers of an instance's local variables when t starts. A sequence
+// that ends hands its exit environment on to what follows (`exits`), so
+// r ##1 s reads s in the environment r ended in. Terms without local
+// variables never build ENV nodes, so they are stepped and merged as before.
 #pragma once
 #include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -62,15 +72,35 @@ enum K : uint8_t {
     IF,      // if (atom) kids[0] else kids[1] (kids[1] may be absent: true)
     ACCEPT,  // accept_on(atom) kids[0]
     REJECT,  // reject_on(atom) kids[0]
-    COVSEQ   // cover sequence kids[0]: count every match
+    COVSEQ,  // cover sequence kids[0]: count every match
+    // local variables (16.10)
+    ENV,     // kids[0] read in environment lo
+    MATCH,   // kids[0], running match items lo at the end of each match (never nullable)
+    INIT     // kids[0], running initializers lo when it starts
 };
-enum Flag : uint8_t { STRONG = 1, NONOVERLAP = 2, WITH = 4, NEG = 8 };
+enum Flag : uint8_t { STRONG = 1, NONOVERLAP = 2, WITH = 4, NEG = 8, LOCAL = 16 /* the atom reads a local variable */ };
+
+// How the kernel evaluates what depends on local variables.
+struct LocalHook {
+    virtual bool atom(int atom, int env) = 0;           // an atom's value in an environment
+    virtual int apply(int act, int env) = 0;            // the environment after match items or initializers
+    virtual int merge(int ctx, int a, int b) = 0;       // the two sides of an intersection, joined
+    virtual ~LocalHook() = default;
+};
 
 struct Node {
     K k = NUL;
     uint8_t flags = 0;
     bool nullable = false;
     bool isect = false;   // has an intersection inside: may be empty without being NUL
+    bool envDep = false;  // depends on local variables: reads or sets one, or has an ENV inside
+    bool prop = false;    // a property term (not a sequence)
+    // Multiclock (16.13): the clock of a node that waits for ticks (an index
+    // into the assertion's clocks; 0 is the leading one), and the clocks of
+    // the node and everything in it. A step where none of those ticked
+    // leaves the node as it is.
+    int clk = -1;
+    uint32_t mask = 0;
     int atom = -1;
     int lo = 0, hi = 0;
     std::vector<const Node*> kids;
@@ -83,16 +113,27 @@ class Store {
     struct Eq {
         bool operator()(const Node* a, const Node* b) const {
             return a->k == b->k && a->flags == b->flags && a->atom == b->atom && a->lo == b->lo && a->hi == b->hi &&
-                   a->kids == b->kids;
+                   a->clk == b->clk && a->kids == b->kids;
         }
     };
     std::deque<Node> arena;
     std::unordered_set<const Node*, H, Eq> set;
 
 public:
+    // While lowering an assertion with local variables: which of its atoms read one.
+    const std::vector<char>* localAtoms = nullptr;
+    int clk = 0;   // the clock new waiting nodes get (16.13)
+    static bool clocked(K k) {
+        return k == BOOL || k == ANY || k == NEXT || k == ALWAYS || k == EVENT || k == IF || k == ACCEPT || k == REJECT;
+    }
     const Node* mk(Node n) {
+        if (!clocked(n.k)) n.clk = 0;
+        else if (n.clk < 0) n.clk = clk;
+        if (localAtoms && n.atom >= 0 && (n.k == BOOL || n.k == IF || n.k == ACCEPT || n.k == REJECT) &&
+            n.atom < (int)localAtoms->size() && (*localAtoms)[n.atom])
+            n.flags |= LOCAL;
         size_t h = (size_t)n.k * 1000003u ^ (size_t)n.flags * 7919u ^ (size_t)(n.atom + 1) * 31u ^
-                   (size_t)(n.lo + 3) * 131u ^ (size_t)(n.hi + 3) * 524287u;
+                   (size_t)(n.lo + 3) * 131u ^ (size_t)(n.hi + 3) * 524287u ^ (size_t)n.clk * 2654435761u;
         for (const Node* k : n.kids) h = h * 1315423911u ^ k->id;
         n.hash = h;
         if (auto it = set.find(&n); it != set.end()) return *it;
@@ -104,10 +145,16 @@ public:
             case SAND: n.nullable = n.kids[0]->nullable && n.kids[1]->nullable; break;
             case REP: n.nullable = n.lo == 0 || n.kids[0]->nullable; break;
             case FM: n.nullable = n.kids[0]->nullable; break;
+            case ENV: case INIT: n.nullable = n.kids[0]->nullable; break;
             default: n.nullable = false;
         }
         n.isect = n.k == SAND;
         for (const Node* k : n.kids) n.isect |= k->isect;
+        n.envDep = (n.flags & LOCAL) || n.k == ENV || n.k == MATCH || n.k == INIT;
+        for (const Node* k : n.kids) n.envDep |= k->envDep;
+        n.prop = (n.k >= PTRUE && n.k <= COVSEQ) || ((n.k == ENV || n.k == INIT) && n.kids[0]->prop);
+        n.mask = clocked(n.k) ? 1u << (n.clk & 31) : 0;
+        for (const Node* k : n.kids) n.mask |= k->mask;
         arena.push_back(std::move(n));
         set.insert(&arena.back());
         return &arena.back();
@@ -155,8 +202,8 @@ public:
     const Node* sand(const Node* a, const Node* b) {
         if (a->k == NUL || b->k == NUL) return nul();
         if (a == b) return a;
-        if (a->k == EMPTY) return b->nullable ? a : nul();
-        if (b->k == EMPTY) return a->nullable ? b : nul();
+        if (a->k == EMPTY && !b->envDep) return b->nullable ? a : nul();
+        if (b->k == EMPTY && !a->envDep) return a->nullable ? b : nul();
         if (a->id > b->id) std::swap(a, b);
         Node n; n.k = SAND; n.kids = {a, b};
         return mk(n);
@@ -268,10 +315,56 @@ public:
         Node n; n.k = COVSEQ; n.kids = {r};
         return mk(n);
     }
+    // ---- local variables ----
+    // t with the environment ids of its ENV nodes renamed by `to`.
+    const Node* renumber(const Node* t, const std::unordered_map<int, int>& to, std::unordered_map<const Node*, const Node*>& memo) {
+        if (!t->envDep) return t;
+        if (auto it = memo.find(t); it != memo.end()) return it->second;
+        std::vector<const Node*> kids;
+        bool same = true;
+        for (const Node* k : t->kids) { kids.push_back(renumber(k, to, memo)); same = same && kids.back() == k; }
+        const Node* r;
+        if (t->k == ENV) {
+            int e = to.at(t->lo);
+            r = e == t->lo && same ? t : env(e, kids[0]);
+        } else if (same) r = t;
+        else if (t->k == SOR) r = sor(std::move(kids));
+        else if (t->k == PAND || t->k == POR) r = pjunct(t->k, std::move(kids));
+        else { Node n; n.k = t->k; n.flags = t->flags; n.atom = t->atom; n.lo = t->lo; n.hi = t->hi; n.clk = t->clk; n.kids = std::move(kids); r = mk(n); }
+        memo[t] = r;
+        return r;
+    }
+    // The environment ids t uses, in order of first use.
+    static void envsUsed(const Node* t, std::vector<int>& out, std::unordered_set<const Node*>& seen) {
+        if (!t->envDep || !seen.insert(t).second) return;
+        if (t->k == ENV && std::find(out.begin(), out.end(), t->lo) == out.end()) out.push_back(t->lo);
+        for (const Node* k : t->kids) envsUsed(k, out, seen);
+    }
+    // t read in environment e. Verdicts and terms that do not depend on local
+    // variables need no environment; a sequence keeps it, since what follows
+    // it starts in the environment it ends in.
+    const Node* env(int e, const Node* t) {
+        if (t->k == NUL || t->k == PTRUE || t->k == PFALSE || t->k == DONE || t->k == ENV) return t;
+        if (t->prop && !t->envDep) return t;
+        Node n; n.k = ENV; n.lo = e; n.kids = {t};
+        return mk(n);
+    }
+    const Node* match(const Node* r, int act) {
+        if (act < 0) return r;
+        if (r->k == NUL) return r;
+        Node n; n.k = MATCH; n.lo = act; n.kids = {r};
+        return mk(n);
+    }
+    const Node* init(int act, const Node* t) {
+        if (act < 0) return t;
+        Node n; n.k = INIT; n.lo = act; n.kids = {t};
+        return mk(n);
+    }
 };
 inline Store& store() { static Store s; return s; }
 
-inline const Node* derivSeq(const Node* n, const std::vector<char>& val, std::unordered_map<const Node*, const Node*>& memo);
+using Memo = std::unordered_map<uint64_t, const Node*>;
+inline const Node* derivSeq(const Node* n, const std::vector<char>& val, Memo& memo);
 inline bool seqLive(const Node* r);
 
 // One derivative step: the term after a clock tick where atom i has value
@@ -283,33 +376,115 @@ struct Deriv {
     const std::vector<char>& val;
     bool nonvac = false;
     int matches = 0;
-    std::unordered_map<const Node*, const Node*> memo;
-    bool atom(const Node* n) const { return (val[n->atom] != 0) != ((n->flags & NEG) != 0); }
+    Memo memo;
+    LocalHook* lh = nullptr;   // null: no local variables
+    int env = 0;               // the context environment
+    uint32_t ticking = ~0u;    // the clocks that ticked in this step (16.13): all of them for one clock
+    bool ticks(const Node* n) const { return (ticking >> (n->clk & 31)) & 1; }
+    bool atom(const Node* n) const {
+        bool v = (n->flags & LOCAL) && lh ? lh->atom(n->atom, env) : val[n->atom] != 0;
+        return v != ((n->flags & NEG) != 0);
+    }
 
     const Node* d(const Node* n) {
+        if (n->mask && !(n->mask & ticking)) return n;   // none of its clocks ticked: it waits (16.13)
         switch (n->k) {   // leaves without the memo
             case EMPTY: case NUL: return st.nul();
-            case ANY: return st.empty();
-            case BOOL: return atom(n) ? st.empty() : st.nul();
+            case ANY: return ticks(n) ? st.empty() : n;
+            case BOOL: return !ticks(n) ? n : atom(n) ? st.empty() : st.nul();
             case PTRUE: case PFALSE: case DONE: return n;
             default: break;
         }
-        if (auto it = memo.find(n); it != memo.end()) return it->second;
+        uint64_t key = (uint64_t)(n->envDep ? (uint32_t)env : 0u) << 32 | n->id;
+        if (auto it = memo.find(key); it != memo.end()) return it->second;
+        int savedClk = st.clk;
+        st.clk = n->clk;   // nodes this step builds wait on the same clock
         const Node* r = step(n);
-        memo[n] = r;
+        st.clk = savedClk;
+        memo[key] = r;
         return r;
+    }
+    // The derivative of n read in environment e, as a term read in the context.
+    const Node* dIn(int e, const Node* n) {
+        if (e == env) return d(n);
+        int saved = env;
+        env = e;
+        const Node* r = d(n);
+        env = saved;
+        return st.env(e, r);
+    }
+    // The environments a nullable term can end in now, from context ctx.
+    void exits(const Node* n, int ctx, std::vector<int>& out) {
+        if (!n->nullable) return;
+        if (!n->envDep || !lh) { out.push_back(ctx); return; }
+        const auto& k = n->kids;
+        switch (n->k) {
+            case ENV: exits(k[0], n->lo, out); return;
+            case INIT: exits(k[0], lh->apply(n->lo, ctx), out); return;
+            case SOR: for (const Node* x : k) exits(x, ctx, out); return;
+            case CAT: {
+                std::vector<int> m;
+                exits(k[0], ctx, m);
+                for (int e : m) exits(k[1], e, out);
+                return;
+            }
+            case SAND: {
+                std::vector<int> a, b;
+                exits(k[0], ctx, a);
+                exits(k[1], ctx, b);
+                for (int x : a)
+                    for (int y : b) out.push_back(lh->merge(ctx, x, y));
+                return;
+            }
+            case REP:
+                if (n->lo == 0) out.push_back(ctx);
+                exits(k[0], ctx, out);
+                return;
+            case FM: exits(k[0], ctx, out); return;
+            default: out.push_back(ctx); return;
+        }
+    }
+    // What follows a sequence that can end now: `next` started in each
+    // environment it can end in.
+    void follow(const Node* a, const Node* next, std::vector<const Node*>& out) {
+        if (!a->envDep || !lh) { out.push_back(d(next)); return; }
+        std::vector<int> ex;
+        exits(a, env, ex);
+        std::sort(ex.begin(), ex.end());
+        ex.erase(std::unique(ex.begin(), ex.end()), ex.end());
+        for (int e : ex) out.push_back(dIn(e, next));
     }
     const Node* step(const Node* n) {
         const auto& k = n->kids;
         switch (n->k) {
             case CAT: {
                 const Node* r = st.cat(d(k[0]), k[1]);
-                return k[0]->nullable ? st.sor({r, d(k[1])}) : r;
+                if (!k[0]->nullable) return r;
+                std::vector<const Node*> v{r};
+                follow(k[0], k[1], v);
+                return st.sor(std::move(v));
             }
             case FUSE: {
                 const Node* da = d(k[0]);
                 const Node* r = st.fuse(da, k[1]);
-                return da->nullable ? st.sor({r, d(k[1])}) : r;
+                if (!da->nullable) return r;
+                std::vector<const Node*> v{r};
+                follow(da, k[1], v);
+                return st.sor(std::move(v));
+            }
+            case ENV: return dIn(n->lo, k[0]);
+            case INIT: return dIn(lh ? lh->apply(n->lo, env) : env, k[0]);
+            case MATCH: {   // the items run at the end of each match of k[0] (16.10)
+                const Node* r = d(k[0]);
+                std::vector<const Node*> v{st.match(r, n->lo)};
+                if (r->nullable) {
+                    std::vector<int> ex;
+                    exits(r, env, ex);
+                    std::sort(ex.begin(), ex.end());
+                    ex.erase(std::unique(ex.begin(), ex.end()), ex.end());
+                    for (int e : ex) v.push_back(st.env(lh ? lh->apply(n->lo, e) : e, st.empty()));
+                }
+                return st.sor(std::move(v));
             }
             case SOR: {
                 std::vector<const Node*> v;
@@ -339,14 +514,28 @@ struct Deriv {
             }
             case IMPL: {
                 const Node* r = d(k[0]);
-                const Node* later = r->k == NUL ? st.ptrue() : st.impl(r, k[1], n->flags & NONOVERLAP);
+                // No later match: an antecedent that can only end now (EMPTY) has no more.
+                bool over = r->k == NUL || r->k == EMPTY || (r->k == ENV && r->kids[0]->k == EMPTY);
+                const Node* later = over ? st.ptrue() : st.impl(r, k[1], n->flags & NONOVERLAP);
                 if (!r->nullable) return later;
                 nonvac = true;
                 // s |=> p is s ##1 1 |-> p: with no later tick there is no match (16.12.7).
-                return st.pand({later, (n->flags & NONOVERLAP) ? st.nextR(k[1], 0, false) : d(k[1])});
+                if (n->flags & NONOVERLAP) {
+                    std::vector<int> ex;
+                    if (r->envDep && lh) exits(r, env, ex);
+                    else ex.push_back(env);
+                    std::vector<const Node*> v{later};
+                    for (int e : ex) v.push_back(e == env ? st.nextR(k[1], 0, false) : st.env(e, st.nextR(k[1], 0, false)));
+                    return st.pand(std::move(v));
+                }
+                std::vector<const Node*> v{later};
+                follow(r, k[1], v);
+                return st.pand(std::move(v));
             }
-            case NEXT: return n->lo == 0 ? d(k[0]) : st.nextR(k[0], n->lo - 1, n->flags & STRONG);
+            // nexttime[0] as a residual is "from the next step on": it does not wait for its own clock.
+            case NEXT: return n->lo == 0 ? d(k[0]) : !ticks(n) ? n : st.nextR(k[0], n->lo - 1, n->flags & STRONG);
             case ALWAYS: {
+                if (!ticks(n)) return n;
                 const Node* now = n->lo == 0 ? d(k[0]) : st.ptrue();
                 const Node* rest = n->hi == 0 ? st.ptrue()
                                               : st.ranged(ALWAYS, k[0], n->lo ? n->lo - 1 : 0, n->hi < 0 ? -1 : n->hi - 1,
@@ -354,6 +543,7 @@ struct Deriv {
                 return st.pand({now, rest});
             }
             case EVENT: {
+                if (!ticks(n)) return n;
                 const Node* now = n->lo == 0 ? d(k[0]) : st.pfalse();
                 const Node* rest = n->hi == 0 ? st.pfalse()
                                               : st.ranged(EVENT, k[0], n->lo ? n->lo - 1 : 0, n->hi < 0 ? -1 : n->hi - 1,
@@ -366,9 +556,11 @@ struct Deriv {
                 const Node* stop = (n->flags & WITH) ? st.pand({dp, dq}) : dq;
                 return st.por({stop, st.pand({dp, n})});
             }
-            case IF: return atom(n) ? d(k[0]) : k.size() > 1 ? d(k[1]) : st.ptrue();
-            case ACCEPT: return atom(n) ? st.ptrue() : st.abort(ACCEPT, n->atom, d(k[0]));
-            case REJECT: return atom(n) ? st.pfalse() : st.abort(REJECT, n->atom, d(k[0]));
+            case IF:
+                if (!ticks(n)) return n;
+                return atom(n) ? d(k[0]) : k.size() > 1 ? d(k[1]) : st.ptrue();
+            case ACCEPT: return ticks(n) && atom(n) ? st.ptrue() : st.abort(ACCEPT, n->atom, d(k[0]));
+            case REJECT: return ticks(n) && atom(n) ? st.pfalse() : st.abort(REJECT, n->atom, d(k[0]));
             case COVSEQ: {
                 const Node* r = d(k[0]);
                 if (r->nullable) matches++;
@@ -379,7 +571,7 @@ struct Deriv {
     }
 };
 
-inline const Node* derivSeq(const Node* n, const std::vector<char>& val, std::unordered_map<const Node*, const Node*>& memo) {
+inline const Node* derivSeq(const Node* n, const std::vector<char>& val, Memo& memo) {
     Deriv dv{store(), val};
     dv.memo.swap(memo);
     const Node* r = dv.d(n);
@@ -417,7 +609,7 @@ inline bool seqLive(const Node* r) {
             if (q.size() > 20000) { live = true; break; }
             for (uint32_t m = 0; m < (1u << atoms.size()) && !live; m++) {
                 for (size_t b = 0; b < atoms.size(); b++) val[atoms[b]] = (m >> b) & 1;
-                std::unordered_map<const Node*, const Node*> memo;
+                Memo memo;
                 const Node* x = derivSeq(q[i], val, memo);
                 if (x->nullable) live = true;
                 else if (x->k != NUL && vis.insert(x).second) q.push_back(x);
@@ -440,7 +632,7 @@ inline bool endValue(const Node* n) {
         case PAND: for (auto* k : n->kids) if (!endValue(k)) return false; return true;
         case POR: for (auto* k : n->kids) if (endValue(k)) return true; return false;
         case IMPL: return true;
-        case ACCEPT: case REJECT: return endValue(n->kids[0]);
+        case ACCEPT: case REJECT: case ENV: case INIT: return endValue(n->kids[0]);
         default: return true;
     }
 }
@@ -466,14 +658,39 @@ struct ConcAssert {
     std::vector<E> capSlot;                     // their slots in the atoms
     // runtime: the live attempts, merged by term, vacuity and captured values
     using Caps = std::shared_ptr<const std::vector<Val>>;
-    struct Attempt { const sva::Node* t; bool nonvac; uint64_t count; uint64_t killGen; Caps caps; };
+    // An attempt's environments (16.10): ENV(i, ...) in its term reads (*envs)[i];
+    // 0 is the initial one. Numbered in the order the term uses them, so equal
+    // attempts have equal terms and the store does not grow with the values.
+    using Envs = std::shared_ptr<const std::vector<std::vector<Val>>>;
+    // wait: an expect statement's process, resumed with the verdict (16.17).
+    struct Attempt { const sva::Node* t; bool nonvac; uint64_t count; uint64_t killGen; Caps caps; Envs envs = nullptr; std::shared_ptr<void> wait = nullptr; };
     std::vector<Attempt> att;
     // Procedural instances (16.14.6): pending ones on the process that queued
     // them (dropped at its next flush point), and matured ones waiting for
     // the next clock tick.
-    struct Pending { std::shared_ptr<void> ctl; uint64_t epoch; Caps caps; };
+    struct Pending { std::shared_ptr<void> ctl; uint64_t epoch; Caps caps; std::shared_ptr<void> wait = nullptr; };
     std::vector<Pending> pending;
-    std::vector<Caps> matured;
+    std::vector<Pending> matured;
+    bool expect = false;   // an expect statement (16.17)
+    // Local variables (16.10): each is a hidden signal, set from an
+    // environment before the atoms that read it are evaluated. acts[i] is a
+    // list of match items or initializers: (local variable, value).
+    // A match item or initializer: local variable k takes rhs; or k < 0: a
+    // subroutine call (16.11), whose arguments `caps` are evaluated at the
+    // match into the constant slots `slots` of `call`, run in the reactive region.
+    struct Item { int k = -1; E rhs; const Prog* call = nullptr; std::vector<E> caps, slots; };
+    std::vector<int> localSig;
+    std::vector<std::vector<Item>> acts;
+    // A sequence's end point tracker (16.13.6): at a tick where the sequence
+    // matches, endSig (a count, for @(s)) and endSig + 1 (the time + 1, for
+    // .triggered) are set, and so is each flag in matchFlags (.matched).
+    int endSig = -1;
+    // The clocks after the leading one (16.13): each event and iff.
+    std::vector<std::pair<std::vector<std::pair<int, Edge>>, E>> more;
+    uint32_t ticked = 0;   // runtime: the clocks that ticked in this time step
+    bool due = false;      // runtime: a step is waiting for the observed region
+    std::vector<int> matchFlags;
+    std::vector<int> clearFlags;   // .matched flags this assertion reads: cleared after each of its ticks
 };
 inline std::vector<ConcAssert>& concAsserts() { static std::vector<ConcAssert> v; return v; }
 inline std::vector<int>& concPending() { static std::vector<int> v; return v; }   // procedural ones with pending instances

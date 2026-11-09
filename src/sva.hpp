@@ -33,6 +33,7 @@ struct AssertInfo {
     bool on = true, locked = false;
     bool passOn = true, failOn = true;   // PassOn/PassOff, FailOn/FailOff
     bool vacOn = true;                   // VacuousOff clears it, PassOn sets it
+    bool hidden = false;                 // tracks a sequence's end points (16.13.6): not an assertion
     uint64_t killGen = 0;                // Kill: pending deferred reports and attempts made before it die
     // Deferred assertions (16.4): the action subroutine call as a process,
     // and the argument expressions captured when the assertion is evaluated.
@@ -66,7 +67,7 @@ inline void assertControl(int ctl, int atype, int dtype, int levels, const std::
         return 0;
     };
     for (auto& a : asserts()) {
-        if (!(a.type & atype) || !(a.dir & dtype)) continue;
+        if (a.hidden || !(a.type & atype) || !(a.dir & dtype)) continue;
         bool hit = targets.empty();
         int depth = 0;
         if (hit) {   // the whole design: levels count from the top-level instances
