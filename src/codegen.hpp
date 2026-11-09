@@ -537,10 +537,21 @@ private:
     }
 
     // Every Prog this process can run: the entry, then callees, depth first.
+    // Frames (automatic variables, expr.hpp) are interpreter-only.
+    static void noFrames(const Instr& i) {
+        bool rel = i.lay || !i.init.empty() || i.dynWait || isRel(i.sig) || hasRel(i.e) || hasRel(i.bidx) || hasRel(i.de);
+        for (auto* b : i.blays) rel |= b != nullptr;
+        for (auto& a : i.args) rel |= hasRel(a);
+        for (auto& a : i.aidx) rel |= hasRel(a);
+        for (auto& [s, e] : i.events) rel |= isRel(s);
+        if (i.arr) rel |= isRel(i.arr->base);
+        if (rel) throw CodegenUnsupported("automatic variables (frames)");
+    }
     static void reach(const Prog* p, std::vector<const Prog*>& out) {
         for (const Prog* q : out)
             if (q == p) return;
         out.push_back(p);
+        for (auto& i : p->code) noFrames(i);
         for (auto& i : p->code)
             if (i.k == IK::Call) {
                 if (!i.callee) throw CodegenUnsupported("call without a callee");

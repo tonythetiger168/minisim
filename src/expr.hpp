@@ -1637,12 +1637,98 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
     return xfill(32, false);
 }
 
+// ---- frames: automatic variables (6.21, 13.3.2) and class objects (8) ----
+// A static variable is a signal with a fixed id. An automatic variable lives
+// in a frame: a block of signals allocated when its subroutine is called (or
+// its fork branch starts) and freed when the last user is done with it. Code
+// refers to a frame slot with a relative id, resolved by R() at run time:
+//   kRel | mode << 26 | offset
+// mode 0..7: the frame `mode` levels up from the running one (a fork branch
+//            reaches its parent's locals at depth 1),
+// mode 8:    a property of `this` (the running method's object),
+// mode 9:    a slot of the frame that the last call returned from (the
+//            caller copies a function result and output arguments from it).
+// An object is a block of signals too; a handle holds its first signal id
+// (0 is null). Every relative id stays inside its mode as long as the
+// offset is below 2^26, so arr->base + k still resolves correctly.
+constexpr int kRel = 1 << 30;
+constexpr int kRelOffBits = 26;
+constexpr int kRelThis = 8, kRelRet = 9;
+inline int relSig(int mode, int off) { return kRel | (mode << kRelOffBits) | off; }
+inline bool isRel(int s) { return s >= kRel; }
+inline int relMode(int s) { return (s >> kRelOffBits) & 15; }
+inline int relOff(int s) { return s & ((1 << kRelOffBits) - 1); }
+// Slot shape of a frame: widths, initial values, containers. Shared by every
+// frame of one subroutine; freed frames go back to `pool` and are reused.
+struct FrameLayout {
+    std::vector<int> w;              // width of each slot
+    std::vector<Val> init;           // its value when the frame is allocated
+    std::vector<std::pair<int, DynObj>> dyn;   // container slots and their empty shape
+    std::string name;                // for messages
+    mutable std::vector<int> pool;   // first signal of each free frame
+    int add(int width, Val v) { w.push_back(width); init.push_back(v); return (int)w.size() - 1; }
+};
+// The kernel allocates frame signals (Sim::sig is not visible here).
+inline int (*g_allocSigs)(const FrameLayout&) = nullptr;
+inline void (*g_initSigs)(const FrameLayout&, int base) = nullptr;
+inline void (*g_nullAccess)() = nullptr;
+struct Frame {
+    int base = 0;                    // first signal of this frame's slots
+    int self = 0;                    // `this` (a handle), 0 outside methods
+    const FrameLayout* lay = nullptr;
+    std::shared_ptr<Frame> up;       // the lexically enclosing frame (fork branches)
+    Frame() = default;
+    Frame(const Frame&) = delete;
+    ~Frame() { if (lay && !lay->w.empty()) lay->pool.push_back(base); }
+};
+using FrameP = std::shared_ptr<Frame>;
+inline FrameP newFrame(const FrameLayout* lay, FrameP up, int self) {
+    auto f = std::make_shared<Frame>();
+    f->lay = lay;
+    f->up = std::move(up);
+    f->self = self;
+    if (lay && !lay->w.empty()) {
+        if (!lay->pool.empty()) { f->base = lay->pool.back(); lay->pool.pop_back(); }
+        else f->base = g_allocSigs(*lay);
+        g_initSigs(*lay, f->base);
+    }
+    return f;
+}
+// The running process's frame and the frame its last call returned from.
+// Only the kernel's main thread runs processes, so these are plain globals;
+// exec() sets them before every instruction.
+inline Frame* g_fr = nullptr;
+inline Frame* g_ret = nullptr;
+[[noreturn]] inline void relFail(const char* what) {
+    fprintf(stderr, "internal error: %s\n", what);
+    abort();
+}
+inline int relSlow(int s) {
+    int m = relMode(s), off = relOff(s);
+    if (m == kRelThis) {
+        if (!g_fr || !g_fr->self) { if (g_nullAccess) g_nullAccess(); relFail("this outside a method"); }
+        return g_fr->self + off;
+    }
+    if (m == kRelRet) {
+        if (!g_ret) relFail("no returned frame");
+        return g_ret->base + off;
+    }
+    Frame* f = g_fr;
+    for (int d = 0; d < m && f; d++) f = f->up.get();
+    if (!f) relFail("automatic variable outside its frame");
+    return f->base + off;
+}
+// The signal id a (possibly relative) id names right now.
+inline int R(int s) { return s < kRel ? s : relSlow(s); }
+// Every signal `e` reads, resolved now (a wait on automatic variables).
+inline void collectAddrs(const std::shared_ptr<struct Expr>& e, std::vector<int>& out);
+
 inline Val eval(const E& e, const Reader& rd) {
     auto k = [&](int i) { return eval(e->kids[i], rd); };
     switch (e->op) {
         case Op::Const: return e->k;
         case Op::Ref: {
-            Val v = rd(e->sig);
+            Val v = rd(R(e->sig));
             v.sgn = e->sgn;
             return v;
         }
@@ -1775,16 +1861,16 @@ inline Val eval(const E& e, const Reader& rd) {
             }
             return mkstr(s);
         }
-        case Op::DynGet: return dynStore()[e->sig].get(k(0));
-        case Op::DynSize: { Val r = make(dynStore()[e->sig].size(), 0, 32); r.sgn = true; return r; }
+        case Op::DynGet: return dynStore()[R(e->sig)].get(k(0));
+        case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {
-            auto& d = dynStore()[e->sig];
+            auto& d = dynStore()[R(e->sig)];
             Val key = k(0);
             if (d.kind != 2) { int64_t i = v_to_i64(key); return mk(!key.x && i >= 0 && i < (int64_t)d.vec.size()); }
             return mk(d.map.count(d.key(key)) > 0);
         }
         case Op::DynReduce: {
-            auto& d = dynStore()[e->sig];
+            auto& d = dynStore()[R(e->sig)];
             int w = e->k.w;
             Val acc = make(e->hi == 1 ? 1 : e->hi == 2 ? ~0ULL : 0, 0, w);
             auto one = [&](const Val& x) {
@@ -1859,10 +1945,37 @@ inline Val eval(const E& e, const Reader& rd) {
             }
             int64_t off = a.offset(idx);
             if (off < 0) return bad;
-            Val r = rd(a.base + (int)off);
+            Val r = rd(R(a.base + (int)off));
             r.sgn = a.sgn;
             return r;
         }
     }
     return allx(1);
+}
+
+inline void collectAddrs(const E& e, std::vector<int>& out) {
+    if (!e) return;
+    if (e->op == Op::Ref) out.push_back(R(e->sig));
+    if (e->op == Op::ArrRead)
+        for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base + i));
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) out.push_back(R(e->sig));
+    for (auto& k : e->kids) collectAddrs(k, out);
+}
+// A copy of `e` with every relative id resolved now: a $strobe / $monitor
+// argument is read later, when the frame it names may be gone or another
+// process may be running.
+inline E bindRel(const E& e) {
+    if (!e) return e;
+    bool rel = isRel(e->sig) && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynSize ||
+                                 e->op == Op::DynExists || e->op == Op::DynReduce);
+    bool arel = e->op == Op::ArrRead && e->arr && isRel(e->arr->base);
+    std::vector<E> kids;
+    bool kch = false;
+    for (auto& k : e->kids) { kids.push_back(bindRel(k)); kch |= kids.back() != k; }
+    if (!rel && !arel && !kch) return e;
+    auto c = std::make_shared<Expr>(*e);
+    c->kids = std::move(kids);
+    if (rel) c->sig = R(e->sig);
+    if (arel) { auto a = std::make_shared<ArrShape>(*e->arr); a->base = R(a->base); c->arr = a; }
+    return c;
 }

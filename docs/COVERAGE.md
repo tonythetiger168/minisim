@@ -41,7 +41,7 @@ script fails if any other test fails or if an xfail test starts passing.
 | 9.2 | initial, always, always_comb/ff/latch | ✅ | |
 | 9.2.3 | Final procedures | ✅ | run once after the last time slot, also after `$finish`. `9.2.3-final` |
 | 9.3.1 | begin…end | ✅ | |
-| 9.3.2 | fork…join / join_any / join_none | ✅ | `9.3.2-fork-join` |
+| 9.3.2 | fork…join / join_any / join_none | ✅ | automatic variables in a fork block get one copy per execution of the fork (`fork automatic int j = i; ... join_none` in a loop). `9.3.2-fork-join`, `9.3.2-fork-automatic` |
 | 9.4.1 | Delay control | ✅ | constant, real, time literal, or any integral expression (evaluated when reached; x or z waits 0). `9.4.5-intra-assign-delay` |
 | 9.4.2 | Event control | ✅ | posedge / negedge / any change, `or`, `@*`, named events |
 | 9.4.3 | wait | ✅ | `9.4.3-wait` |
@@ -71,7 +71,7 @@ script fails if any other test fails or if an xfail test starts passing.
 | 12.7 | for, while, do-while, repeat, forever | ✅ | |
 | 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue; dynamic arrays and queues by index, associative arrays in key order. `12.7.3-foreach`, `12.7.3-foreach-order`, `12.7.3-foreach-containers` |
 | 12.8 | break, continue, return | ✅ | |
-| 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`, no DPI. `13.4-function-automatic` |
+| 13 | Tasks and functions | 🟡 | module scope. Automatic tasks, and automatic functions that recurse or fork, run each call in its own frame (13.3.2, 13.4.2): recursion, overlapping calls from several processes. An automatic local starts at its default on every call (6.21). Not yet: `ref`, DPI, arrays or containers as arguments of an automatic task. `13.4-function-automatic`, `6.21-recursion`, `13.3.2-automatic-tasks`, `13.4.2-recursive-task` |
 | 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
 | 16 | Assertions | ❌ | immediate and concurrent |
 | 18 | Randomization (constraints) | ❌ | classes, `randomize()`, `std::randomize`, randcase, randsequence |
