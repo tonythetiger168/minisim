@@ -1,6 +1,7 @@
 // IEEE 1800-2023 24.7: $exit ends every initial procedure of the calling
 // program and the threads they forked. Another program runs on, and the
 // run ends when it ends.
+//! icarus-skip: Icarus 13 has no $exit
 module top;
   p1 a();
   p2 b();

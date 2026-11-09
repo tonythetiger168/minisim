@@ -21,6 +21,8 @@
 #include <fstream>
 #include <iostream>
 #include <atomic>
+#include <chrono>
+#include <climits>
 #include <functional>
 #include <map>
 #include <queue>
@@ -37,6 +39,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
+#include "cpu.hpp"
 #include "sva.hpp"
 #include "sva_engine.hpp"
 #include "clocking.hpp"
@@ -71,10 +74,23 @@ struct Task {
 // 20 was slower than 8, and 24 or more was 5-50x slower, because one
 // descheduled thread holds up every batch. -threads N still picks any count
 // up to the hardware threads.
+// Counting physical cores, not hardware threads: an SMT sibling shares its
+// core's execution units, and on a hybrid part the E cores are slower and
+// hold up every batch (cpu.hpp). So the default is one thread per P core
+// (every core when not hybrid), at most 8; -threads N goes up to every
+// logical CPU, siblings last.
 inline int defaultThreads() {
-    int hw = (int)thread::hardware_concurrency();
-    return hw < 1 ? 1 : (hw > 8 ? 8 : hw);
+    int n = cpuTopo().fastCores();
+    return n < 1 ? 1 : (n > 8 ? 8 : n);
 }
+inline int maxThreads() { return std::max(1, cpuTopo().logical()); }
+// Pin pool thread k to cpuTopo().order[k]: the same items of a batch then
+// stay in the same core's cache, and N threads sit on N distinct physical
+// cores. -1 (default): pin unless under a hypervisor, where a pinned thread
+// waits for its virtual CPU (WSL2 on an i7-14700: 8 pinned threads 2.3 s,
+// unpinned 0.8 s). msim -pin / -no-pin force it.
+inline int g_pin = -1;
+inline bool pinThreads() { return g_pin < 0 ? !cpuTopo().hypervisor : g_pin > 0; }
 
 struct Pool {
     // Each thread starts on its own contiguous range of a batch (so the same
@@ -93,27 +109,45 @@ struct Pool {
     struct alignas(64) Slot {
         atomic<uint64_t> claim{0};
         atomic<size_t> end{0}, chunk{1};
+        // The batch this thread is called to. Only the threads a batch uses are
+        // woken: one left out sleeps on, so a batch on 2 of 8 threads costs no
+        // wake-up (a futex call, a context switch) of the other 6.
+        // 32 bits: libstdc++ waits on a 4-byte atomic with a futex on its own
+        // address. A 64-bit one shares 16 hashed buckets, and every notify
+        // wakes the whole bucket: with 64-byte slots all gates hashed to one
+        // bucket, so each wake-up woke every sleeping thread of the pool.
+        atomic<uint32_t> gate{0};
+        atomic<uint32_t> sleeping{0};   // the worker is in (or entering) gate.wait()
     };
     Slot slots[kMaxThreads];
     vector<thread> ts;
-    atomic<uint64_t> gen{0};       // bumped once per batch; idle workers sleep on it
-    alignas(64) atomic<size_t> finished{0};   // items of the current batch that are done
+    atomic<uint64_t> gen{0};       // the last batch number (its low 32 bits)
+    alignas(64) atomic<uint32_t> finished{0};   // items of the current batch that are done
+    atomic<uint32_t> mainSleeping{0};
     atomic<size_t> total{0};       // items in the current batch
     Job job = nullptr;             // written before a batch is published, read after a claim
     void* ctx = nullptr;
     atomic<bool> stop{false};
+    atomic<int> active{1};         // threads taking part in the current batch
     int size() const { return (int)ts.size() + 1; }
+    bool pinned = false;
+    static void pinSelf(int id) {
+        const auto& o = cpuTopo().order;
+        if (!o.empty()) pinToCpu(o[(size_t)id % o.size()]);
+    }
     void ensure(int n) {
         n = std::min(n, kMaxThreads);
+        if (n > 1 && !pinned && pinThreads()) { pinned = true; pinSelf(0); }
         while ((int)ts.size() < n - 1) {
             int id = (int)ts.size() + 1;
-            ts.emplace_back([this, id] { worker(id); });
+            bool pin = pinned;
+            ts.emplace_back([this, id, pin] { if (pin) pinSelf(id); worker(id); });
         }
     }
     ~Pool() {
         stop = true;
-        gen.fetch_add(1);
-        gen.notify_all();
+        uint32_t g = (uint32_t)(gen.fetch_add(1) + 1);
+        for (auto& sl : slots) { sl.gate.store(g); sl.gate.notify_all(); }
         for (auto& t : ts) t.join();
     }
     // Take chunks of slot s in batch b until it is empty. False once the
@@ -131,27 +165,38 @@ struct Pool {
                                                memory_order_acq_rel, memory_order_acquire)) continue;
             for (size_t i = lo; i < hi; i++) job(ctx, i);
             // The chunk that completes the batch wakes run() if it sleeps.
-            if (finished.fetch_add(hi - lo, memory_order_acq_rel) + (hi - lo) == total.load(memory_order_relaxed))
+            if (finished.fetch_add((uint32_t)(hi - lo)) + (hi - lo) == total.load(memory_order_relaxed) &&
+                mainSleeping.load())
                 finished.notify_one();
             c = s.claim.load(memory_order_acquire);
         }
     }
     void work(int id, uint32_t b) {
-        int T = size();
+        int T = active.load(memory_order_relaxed);
+        if (id >= T) return;
         for (int k = 0; k < T; k++)
             if (!drain(slots[(id + k) % T], b)) return;
     }
     void worker(int id) {
-        uint64_t seen = 0;
+        uint32_t seen = 0;
+        Slot& me = slots[id];
         for (;;) {
-            uint64_t g;
+            uint32_t g;
             int spins = 0;
-            while ((g = gen.load(memory_order_acquire)) == seen) {
+            while ((g = me.gate.load(memory_order_acquire)) == seen) {
                 // Spin for the next batch; yield, which lets any other
                 // runnable thread have the CPU; then sleep.
-                if (++spins < 4000) relax();
-                else if (spins < 20000) this_thread::yield();
-                else gen.wait(seen);
+                // A thread left out of the last batch sleeps at once, so it
+                // does not spin on an SMT sibling of a thread that is working.
+                if (id < active.load(memory_order_relaxed) && ++spins < 4000) relax();
+                else if (id < active.load(memory_order_relaxed) && spins < 20000) this_thread::yield();
+                else {
+                    // Announce the sleep, then look again (both seq_cst): either
+                    // run() sees `sleeping` and wakes us, or we see its gate.
+                    me.sleeping.store(1);
+                    if (me.gate.load() == seen) me.gate.wait(seen);
+                    me.sleeping.store(0);
+                }
             }
             seen = g;
             if (stop) return;
@@ -163,9 +208,12 @@ struct Pool {
         __builtin_ia32_pause();
 #endif
     }
-    void run(size_t n, Job j, void* c) {
+    // Run items [0, n) on the first `use` threads (0: all of them).
+    void run(size_t n, Job j, void* c, int use = 0) {
         uint32_t b = (uint32_t)(gen.load(memory_order_relaxed) + 1);
-        size_t T = (size_t)size();
+        if (b == 0) b = 1;   // 0 is every gate's start value
+        size_t T = (size_t)(use > 0 && use < size() ? use : size());
+        active.store((int)T, memory_order_relaxed);
         job = j;
         ctx = c;
         total.store(n, memory_order_relaxed);
@@ -177,15 +225,22 @@ struct Pool {
             slots[t].claim.store(((uint64_t)b << 32) | lo, memory_order_release);
         }
         gen.store(b, memory_order_release);   // the only writer while the pool runs
-        gen.notify_all();
+        for (size_t t = 1; t < T; t++) {
+            slots[t].gate.store(b);
+            if (slots[t].sleeping.load()) slots[t].gate.notify_one();   // no syscall for a spinning thread
+        }
         work(0, b);
         // Wait for chunks other threads are still running: spin, yield, then sleep.
         for (int spins = 0;; spins++) {
-            size_t d = finished.load(memory_order_acquire);
+            uint32_t d = finished.load(memory_order_acquire);
             if (d >= n) break;
             if (spins < 4000) relax();
             else if (spins < 20000) this_thread::yield();
-            else finished.wait(d, memory_order_acquire);
+            else {
+                mainSleeping.store(1);
+                if (finished.load() == d) finished.wait(d);
+                mainSleeping.store(0);
+            }
         }
     }
 };
@@ -313,16 +368,56 @@ struct Sim {
     static constexpr size_t kMinParallel = 32;
     static inline thread_local bool tlInPar = false;   // inside a parallelFor task
     Pool pool;
+    // `use`: run on at most this many threads (0: `threads`).
     template <class F>
-    void parallelFor(size_t n, F&& f) {
+    void parallelFor(size_t n, F&& f, int use = 0) {
         // A small batch is cheaper on this thread than a wake-up of the pool.
         // Nested (a task that calls parallelFor) runs on its own thread.
-        if (threads <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
+        int T = use > 0 ? std::min(use, threads) : threads;
+        if (T <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
         pool.ensure(threads);
         tlInPar = true;
-        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f);
+        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f, T);
         tlInPar = false;
     }
+
+    // Picks the thread count of one repeated parallel step by measuring it:
+    // each candidate (1, 2, 4, ... up to `threads`) runs kTry steps, the
+    // fastest is used for the next kKeep, then they are measured again. A
+    // step of a few microseconds is slower on 8 threads than on 2 (the batch
+    // hand-off costs more than the work), and the best count depends on the
+    // machine (cores, SMT, P/E cores) and the design, so no fixed default
+    // fits. Results never depend on it: only the speed does.
+    struct Tuner {
+        // kWarm steps of each candidate are not timed: right after a switch,
+        // threads that just left the batch may still be spinning.
+        static constexpr int kWarm = 32, kTry = 256, kKeep = 1 << 16;
+        int cand = 0, n = 0, best = 1;   // cand: index into 1, 2, 4, ...; -1 = exploiting
+        int64_t sum = 0, bestNs = INT64_MAX;
+        std::chrono::steady_clock::time_point t0;
+        int pick(int maxT) {
+            if (maxT <= 1) return 1;
+            if (cand < 0) {
+                if (++n < kKeep) return best;
+                cand = 0; n = 0; sum = 0; bestNs = INT64_MAX;   // re-measure
+            }
+            t0 = std::chrono::steady_clock::now();
+            return std::min(1 << cand, maxT);
+        }
+        void done(int maxT) {
+            if (maxT <= 1 || cand < 0) return;
+            if (++n <= kWarm) return;
+            sum += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (n < kWarm + kTry) return;
+            int t = std::min(1 << cand, maxT);
+            bool worse = bestNs != INT64_MAX && sum > 2 * bestNs;   // more threads will not win back a 2x loss
+            if (sum < bestNs) { bestNs = sum; best = t; }
+            n = 0; sum = 0;
+            if (t >= maxT || worse) { cand = -1; return; }
+            cand++;
+        }
+    };
+    Tuner domainTune[3];   // cycle domain (codegen.hpp): fused step, NBA compute, commit
 
     // ---- static combinational schedule (prog.hpp: combShape / combSchedule) ----
     // combs[r] is the process of rank r. Ranks are in topological order and
@@ -681,6 +776,7 @@ struct Sim {
     // A variable (reg/logic) starts as X. The flag is stored so the VCD
     // header can emit `$var wire` or `$var reg`.
     int sig(const string& n, int w, bool net = false) {
+        self = this;
         // An unpacked array element is named "m[3]". The VCD leaves memories
         // out, as $dumpvars does by default (21.7.1.2).
         // A name with '$' is internal (an event's last-trigger time).
@@ -1028,6 +1124,58 @@ struct Sim {
         if ((int)body.size() < w) body = string(w - body.size(), ' ') + body;
         return body;
     }
+    static inline Sim* self = nullptr;   // the simulator, for %v
+    // %v (21.2.1.4): two strength characters and a value. The strength of a
+    // net bit comes from its drivers, resolved as the net is (28.12); a
+    // variable, or a net with no driver that still has a value (tri0, tri1,
+    // supply, trireg), gets the strength its kind implies.
+    static string strengthText(const E& a0, const Reader& rd) {
+        static const char* MN[8] = {"Hi", "Sm", "Me", "We", "La", "Pu", "St", "Su"};
+        E a = a0;
+        while (a && a->op == Op::Resize && !a->kids.empty()) a = a->kids[0];
+        int sig = -1, bit = 0;
+        if (a && a->op == Op::Ref && !isRel(a->sig) && !a->at) sig = a->sig;
+        else if (a && a->op == Op::Slice && a->hi == a->lo && !a->kids.empty() && a->kids[0] &&
+                 a->kids[0]->op == Op::Ref && !isRel(a->kids[0]->sig) && !a->kids[0]->at) {
+            sig = a->kids[0]->sig; bit = a->lo;
+        }
+        int v = bitAt(eval(a0, rd), 0);   // 0, 1, 2 = x, 3 = z
+        SBit sb;
+        bool have = false;
+        if (sig >= 0 && self) {
+            const Sig& g = self->sigs[sig];
+            if (!g.drv.empty() && g.kind == NR_WIRE) {
+                for (const Drv& d : g.drv) {
+                    int t = bitAt(d.v, bit);
+                    SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
+                    sb = sbit_resolv(sb, cur);
+                }
+                have = true;
+            } else if (g.net) {
+                unsigned st = g.kind == NR_SUPPLY0 || g.kind == NR_SUPPLY1 ? STR_SUPPLY
+                            : g.kind == NR_TRIREG && g.drv.empty() ? STR_MEDIUM
+                            : (g.kind == NR_TRI0 || g.kind == NR_TRI1) && v == (g.kind == NR_TRI1 ? 1 : 0) ? STR_PULL
+                            : STR_STRONG;
+                if (v == 3) sb = SBit{};
+                else if (g.kind == NR_TRIREG && !g.drv.empty()) {   // a driven trireg: its drivers, else its charge
+                    for (const Drv& d : g.drv) {
+                        int t = bitAt(d.v, bit);
+                        SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
+                        sb = sbit_resolv(sb, cur);
+                    }
+                    if (sbit_z(sb)) sb = v == 1 ? sbit_1(STR_MEDIUM) : v == 0 ? sbit_0(STR_MEDIUM) : sbit_x(STR_MEDIUM, STR_MEDIUM);
+                } else sb = v == 1 ? sbit_1(st) : v == 0 ? sbit_0(st) : sbit_x(st, st);
+                have = true;
+            }
+        }
+        if (!have) sb = v == 3 ? SBit{} : v == 1 ? sbit_1(STR_STRONG) : v == 0 ? sbit_0(STR_STRONG) : sbit_x(STR_STRONG, STR_STRONG);
+        if (sbit_z(sb)) return "HiZ";
+        int lg = sbit_logic(sb);
+        if (lg == 0 || lg == 1) return string(MN[sb.s0]) + (lg ? "1" : "0");
+        // x: one strength on both sides, else the two levels as digits
+        if (sb.s0 == sb.s1) return string(MN[sb.s0]) + "X";
+        return std::to_string(sb.s0) + std::to_string(sb.s1) + "X";
+    }
     // The text of a format and its arguments ($display, $sformatf).
     static string sformat(const string& fmt, const vector<E>& args, const Reader& rd) {
         std::ostringstream cout;
@@ -1088,6 +1236,10 @@ struct Sim {
             }
             char lc = (char)tolower((unsigned char)c);
             if (lc == 'm') { cout << "top"; continue; }
+            if (lc == 'v' && ai < args.size()) {   // %v (21.2.1.4): strength of a scalar net
+                cout << strengthText(args[ai++], rd);
+                continue;
+            }
             bool known = string_view("bohxdcstfeg").find(lc) != string_view::npos;
             if (!known || ai >= args.size()) { cout << fmt.substr(start, i - start + 1); continue; }
             Val v = eval(args[ai++], rd);

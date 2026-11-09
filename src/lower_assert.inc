@@ -845,6 +845,24 @@ int seqEventSig(const slang::ast::Expression& x) {
 }
 
 // assert / assume / cover property, cover sequence (16.14).
+// The leading clock written inside a sequence or property operand, if any:
+// `cover property (s)` with s's own @(posedge clk) is clocked by it (16.16).
+const slang::ast::TimingControl* leadingClock(const slang::ast::AssertionExpr& a) {
+    using namespace slang::ast;
+    if (const auto* ai = instanceOf(a)) return leadingClock(ai->body);
+    switch (a.kind) {
+        case AssertionExprKind::Clocking: return &a.as<ClockingAssertionExpr>().clocking;
+        case AssertionExprKind::SequenceConcat: {
+            const auto& c = a.as<SequenceConcatExpr>();
+            return c.elements.empty() ? nullptr : leadingClock(*c.elements[0].sequence);
+        }
+        case AssertionExprKind::SequenceWithMatch: return leadingClock(a.as<SequenceWithMatchExpr>().expr);
+        case AssertionExprKind::FirstMatch: return leadingClock(a.as<FirstMatchAssertionExpr>().seq);
+        case AssertionExprKind::Unary: return leadingClock(a.as<UnaryAssertionExpr>().expr);
+        case AssertionExprKind::Binary: return leadingClock(a.as<BinaryAssertionExpr>().left);
+        default: return nullptr;
+    }
+}
 void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     using namespace slang::ast;
     if (s.assertionKind == AssertionKind::Restrict) return;   // for formal tools only (16.14.4)
@@ -877,6 +895,8 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
             a = &a->as<DisableIffAssertionExpr>().expr;
         } else break;
     }
+    if (b.clk.empty())
+        if (const auto* tc = leadingClock(*a)) clockOf(*tc, b.clk, b.clkIff);
     if (b.clk.empty()) {   // inferred from the procedure, else the default clocking (16.16)
         if (!sampleEv.empty()) b.clk = sampleEv;
         else if (const auto* cb = defaultClockingBlock()) clockOf(cb->getEvent(), b.clk, b.clkIff);

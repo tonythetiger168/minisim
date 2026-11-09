@@ -1,5 +1,6 @@
 // IEEE 1800-2023 24.6: an anonymous program in a package declares tasks
 // and functions in the package's name space, for programs to call.
+//! icarus-skip: Icarus 13 does not parse anonymous programs
 package pkg;
   program;
     function automatic int twice(int x);
