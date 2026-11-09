@@ -1357,8 +1357,12 @@ enum SysFnId : int {
     SF_FSEEK,        // $fseek(fd, offset, whence), $rewind(fd) is fseek(fd, 0, 0)
     SF_FERROR,       // $ferror(fd, str): 0, no error text kept
     SF_SR2BITS,      // $shortrealtobits (20.5)
-    SF_BITS2SR       // $bitstoshortreal
+    SF_BITS2SR,      // $bitstoshortreal
+    SF_CG            // a covergroup operation (19): lo is the CgOp, run by g_cgHook
 };
+// Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
+enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
+inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
 // suffix, and a minimum width of 20.
@@ -1853,6 +1857,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         }
         case SF_FERROR: return sint(0);
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
+        case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
         case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();
