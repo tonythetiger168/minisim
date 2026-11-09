@@ -8066,14 +8066,16 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             } else rv.off = ps.off;
                             if (dt->isAssociativeArray()) {   // its values (18.4); the keys stay
                                 const auto* ix = dt->as<AssociativeArrayType>().indexType;
-                                if (!ix || !ix->getCanonicalType().isIntegral()) Lowerer::unsupported("rand associative array without an integral index");
+                                if (!ix || !(ix->getCanonicalType().isIntegral() || ix->getCanonicalType().isString()))
+                                    Lowerer::unsupported("rand associative array with a wildcard or class index");
                             }
                             rv.dyn = true;
                             et = &dt->getArrayElementType()->getCanonicalType();
                             while (Lowerer::isDynType(*et)) {   // int m[][] (7.5, 18.4): every level
                                 if (et->isAssociativeArray()) {
                                     const auto* ix = et->as<AssociativeArrayType>().indexType;
-                                    if (!ix || !ix->getCanonicalType().isIntegral()) Lowerer::unsupported("rand associative array without an integral index");
+                                    if (!ix || !(ix->getCanonicalType().isIntegral() || ix->getCanonicalType().isString()))
+                                        Lowerer::unsupported("rand associative array with a wildcard or class index");
                                 }
                                 rv.depth++;
                                 et = &et->getArrayElementType()->getCanonicalType();

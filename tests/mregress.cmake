@@ -45,3 +45,15 @@ endif()
 if(NOT EXISTS ${OUT}/spec/chapters.md)
   message(FATAL_ERROR "missing chapters.md")
 endif()
+
+# mbug reads results.json: the failure becomes one issue (dry run, no server).
+execute_process(COMMAND ${PY} ${SRC}/tools/mbug.py regress ${OUT}/results.json -project you/repo -dry-run
+                        -o ${OUT}/bugs.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "create .*\\[mregress\\] no line matches @pass=this text is never printed")
+  message(FATAL_ERROR "mbug dry run: rc=${rc}\n${out}${err}")
+endif()
+file(READ ${OUT}/bugs.json bugs)
+if(NOT bugs MATCHES "-filter '\\^wrong_expect\\$' -seed 7 -seeds 1")
+  message(FATAL_ERROR "mbug repro command:\n${bugs}")
+endif()
