@@ -205,14 +205,15 @@ inline BlockIds& blockIds() { static BlockIds b; return b; }
 // all start at bit 0. -1: a member that cannot be laid out this way.
 inline int uWidth(const slang::ast::Type& t0);
 // A string is a 64-bit pool id; a shortreal is kept as a double, rounded to
-// single precision whenever a shortreal value is made (6.12).
+// single precision whenever a shortreal value is made (6.12); a chandle is a
+// 64-bit pointer (6.14).
 inline bool isHandleType(const slang::ast::Type& t);
 inline int storeW(const slang::ast::Type& t0) {
     const auto& t = t0.getCanonicalType();
     if (t.kind == slang::ast::SymbolKind::CovergroupType) return 32;   // a covergroup handle (19.3)
     if (t.isUntypedType()) return 64;   // a typeless mailbox's message (15.4.9): the value as it is
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) return uWidth(t);
-    return t.isString() || t.isFloating() || isHandleType(t) ? 64 : (int)t.getBitWidth();
+    return t.isString() || t.isFloating() || t.isCHandle() || isHandleType(t) ? 64 : (int)t.getBitWidth();
 }
 // Tag bits of a tagged union (7.3.2): enough to number its members. The tag
 // is at the top; a member's value is right-justified below it.
@@ -361,6 +362,49 @@ struct Subr {
     std::vector<Subr*> calls;
 };
 
+// DPI imports by symbol (35); filled before any process is lowered.
+inline std::unordered_map<const slang::ast::SubroutineSymbol*, DpiFunc*>& dpiMap() {
+    static std::unordered_map<const slang::ast::SubroutineSymbol*, DpiFunc*> m;
+    return m;
+}
+// The hierarchical name of the instance, generate block or package a
+// subroutine is declared in: its DPI scope (35.5.3).
+inline std::string dpiScopeName(const slang::ast::Symbol& sub) {
+    using namespace slang::ast;
+    const Scope* sc = sub.getParentScope();
+    if (!sc) return "";
+    const Symbol& s = sc->asSymbol();
+    if (s.kind == SymbolKind::InstanceBody) {
+        const auto* inst = s.as<InstanceBodySymbol>().parentInstance;
+        return inst ? inst->getHierarchicalPath() : std::string(s.name);
+    }
+    return s.getHierarchicalPath();
+}
+// How a value of type t0 goes to C (35.5.6, H.7). w and sgn describe the
+// SV value. An enum is passed as its base type.
+inline DpiType dpiType(const slang::ast::Type& t0, int& w, bool& sgn) {
+    using namespace slang::ast;
+    const Type& t = t0.getCanonicalType();
+    if (t.kind == SymbolKind::EnumType) return dpiType(t.as<EnumType>().baseType, w, sgn);
+    sgn = t.isSigned();
+    if (t.isVoid()) { w = 0; return DT_VOID; }
+    if (t.isString()) { w = 64; return DT_STRING; }
+    if (t.isCHandle()) { w = 64; return DT_CHANDLE; }
+    if (t.isFloating()) { w = (int)t.getBitWidth(); return w == 32 ? DT_SHORTREAL : DT_REAL; }
+    if (!t.isIntegral()) throw std::runtime_error("lower: unsupported DPI argument type " + t0.toString());
+    w = (int)t.getBitWidth();
+    if (t.kind == SymbolKind::PredefinedIntegerType) {
+        switch (t.as<PredefinedIntegerType>().integerKind) {
+            case PredefinedIntegerType::Byte: return DT_BYTE;
+            case PredefinedIntegerType::ShortInt: return DT_SHORT;
+            case PredefinedIntegerType::Int: return DT_INT;
+            case PredefinedIntegerType::LongInt: return DT_LONG;
+            default: return DT_LOGICVEC;   // integer, time: 4-state packed
+        }
+    }
+    if (t.kind == SymbolKind::ScalarType) return t.isFourState() ? DT_LOGIC : DT_BIT;
+    return t.isFourState() ? DT_LOGICVEC : DT_BITVEC;
+}
 // ---------- classes (8) ----------
 // An object is a block of signals laid out like a frame: slot 0 holds its
 // class id, then the base class's properties, then its own. A non-static
@@ -432,6 +476,9 @@ inline ClassInfo* classInfo(const slang::ast::Type& t) {
 }
 
 struct LowerResult {
+    std::vector<std::unique_ptr<DpiFunc>> dpi;   // DPI imports and exports (35)
+    std::vector<std::string> scopes;             // every instance and package, for svGetScopeFromName
+    std::unordered_map<const slang::ast::Symbol*, int> sigOf;   // variable / net -> signal (VPI, 37)
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
@@ -1422,7 +1469,7 @@ struct Lowerer {
         if (vifTarget) { sym = vifTarget; vifTarget = nullptr; viaVif = true; }
         else if (call.thisClass() && call.thisClass()->type->isVirtualInterface()) return vifCall(call, *sym, wantValue);
         if (!sym || !subs) unsupported("subroutine call");
-        if (sym->flags.has(MethodFlags::DPIImport)) unsupported("DPI import");
+        if (sym->flags.has(MethodFlags::DPIImport)) return emitDpiCall(call, *sym, wantValue);
         if (sym->flags.has(MethodFlags::Randomize)) return randomizeCall(call);
         if (!sym->getSyntax() && isClassMethod(*sym)) {   // built-in methods of every class (18.8, 18.9, 18.13.3)
             if (sym->name == "rand_mode" || sym->name == "constraint_mode") {
@@ -1547,6 +1594,196 @@ struct Lowerer {
         i.e = ref(sub->retSig, sub->retSgn);
         prog.emit(i);
         return ref(tmp, sub->retSgn);
+    }
+
+    // A DPI import call (35): inputs are copied into the formals' signals,
+    // IK::Dpi calls C, and outputs are copied back, as for an SV subroutine.
+    // An unpacked array argument is passed in place: the call records the
+    // actual array (a fixed array or a container) instead of a signal.
+    E emitDpiCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym, bool wantValue) {
+        using namespace slang::ast;
+        auto fit = dpiMap().find(&sym);
+        if (fit == dpiMap().end()) unsupported("DPI import");
+        const DpiFunc* f = fit->second;
+        auto args = call.arguments();
+        if (args.size() != f->args.size()) unsupported("DPI argument count");
+        Instr c;
+        c.k = IK::Dpi;
+        c.dpi = f;
+        c.dact.resize(args.size());
+        for (size_t n = 0; n < args.size(); n++) {
+            const DpiArg& formal = f->args[n];
+            const Expression& a = *args[n];
+            if (formal.uarr) {
+                const Expression* x = &a;
+                if (formal.dir != 0) {
+                    if (a.kind != ExpressionKind::Assignment) unsupported("DPI array argument");
+                    x = &a.as<AssignmentExpression>().left();
+                }
+                x = &peel(*x);
+                if (!ValueExpressionBase::isKind(x->kind)) unsupported("DPI array argument that is not a variable");
+                const Symbol* as = &x->as<ValueExpressionBase>().symbol;
+                if (auto it = arrMap().find(as); it != arrMap().end()) c.dact[n].arr = it->second;
+                else if (int d = dynSig(*x); d >= 0) c.dact[n].dyn = d;
+                else unsupported("DPI array argument of this kind");
+                continue;
+            }
+            if (formal.dir == 0) {
+                if (a.kind == ExpressionKind::EmptyArgument) unsupported("empty argument");
+                Instr i;
+                i.k = IK::Assign;
+                i.sig = formal.sig;
+                i.e = expr(a);
+                if (formal.t == DT_REAL || formal.t == DT_SHORTREAL) i.e = realOf(a);
+                prog.emit(i);
+            } else if (formal.dir == 2) {
+                if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
+                Instr i;
+                i.k = IK::Assign;
+                i.sig = formal.sig;
+                const Expression& l = a.as<AssignmentExpression>().left();
+                i.e = (formal.t == DT_REAL || formal.t == DT_SHORTREAL) ? realOf(l) : expr(l);
+                prog.emit(i);
+            } else if (a.kind != ExpressionKind::Assignment && a.kind != ExpressionKind::EmptyArgument) {
+                unsupported("output argument");
+            }
+        }
+        if (srcMgr()) {
+            auto loc = call.sourceRange.start();
+            c.fmt = std::string(srcMgr()->getFileName(loc));
+            c.dline = (int)srcMgr()->getLineNumber(loc);
+        }
+        prog.emit(c);
+        for (size_t n = 0; n < args.size(); n++) {
+            const DpiArg& formal = f->args[n];
+            if (formal.dir == 0 || formal.uarr) continue;
+            const Expression& a = *args[n];
+            if (a.kind == ExpressionKind::EmptyArgument) continue;
+            const auto& as = a.as<AssignmentExpression>();
+            Instr i;
+            i.k = IK::Assign;
+            lhs(as.left(), i);
+            OutSlot slot{formal.sig, formal.w, formal.sgn};
+            const OutSlot* saved = outSlot;
+            outSlot = &slot;
+            i.e = expr(as.right());
+            outSlot = saved;
+            prog.emit(i);
+        }
+        if (!wantValue) return {};
+        if (f->retSig < 0) unsupported("DPI call has no return value");
+        int tmp = fresh(f->retW);
+        Instr i;
+        i.k = IK::Assign;
+        i.sig = tmp;
+        i.e = ref(f->retSig, f->retSgn);
+        prog.emit(i);
+        return ref(tmp, f->retSgn);
+    }
+
+    // A call of a user system task or function registered through VPI
+    // (38.37). A variable or net argument is passed as itself (the C side
+    // reads and writes it); any other expression is evaluated into a
+    // temporary just before the call. A function's result is whatever the
+    // calltf puts on the call handle (vpi_put_value), read right after it.
+    static std::vector<std::unique_ptr<VpiSite>>& vpiSites() {
+        static std::vector<std::unique_ptr<VpiSite>> v;
+        return v;
+    }
+    E emitVpiCall(const slang::ast::CallExpression& call, const VpiSystfInfo& info, bool wantValue) {
+        using namespace slang::ast;
+        auto site = std::make_unique<VpiSite>();
+        site->systf = info.idx;
+        site->func = info.func;
+        for (const Expression* a0 : call.arguments()) {
+            VpiArg va;
+            const Expression& a = *a0;
+            if (a.kind == ExpressionKind::EmptyArgument) { site->args.push_back(va); continue; }
+            if (a.kind == ExpressionKind::ArbitrarySymbol) {
+                const Symbol* sym = a.as<ArbitrarySymbolExpression>().symbol;
+                if (sym && sym->kind == SymbolKind::Instance) {
+                    va.kind = VpiArg::Scope;
+                    va.sym = sym;
+                    site->args.push_back(va);
+                    continue;
+                }
+                unsupported("this argument of a VPI system task");
+            }
+            va.vtype = a.getConstant() || a.kind == ExpressionKind::StringLiteral ? 7 : 39;   // vpiConstant, vpiOperation
+            if (a.kind == ExpressionKind::StringLiteral) {
+                va.kind = VpiArg::String;
+                va.text = std::string(a.as<StringLiteral>().getValue());
+                site->args.push_back(va);
+                continue;
+            }
+            const Type& t = *a.type;
+            if (ValueExpressionBase::isKind(a.kind) && t.isIntegral()) {
+                const Symbol* sym = &a.as<ValueExpressionBase>().symbol;
+                if (auto it = sigmap.find(sym); it != sigmap.end() && !symOverride.count(sym) && !localMap().count(sym)) {
+                    va.kind = VpiArg::Signal;
+                    va.sig = it->second;
+                    va.w = (int)t.getBitWidth();
+                    va.sgn = t.isSigned();
+                    va.sym = sym;
+                    site->args.push_back(va);
+                    continue;
+                }
+            }
+            va.kind = VpiArg::Value;
+            Instr i;
+            i.k = IK::Assign;
+            if (t.isFloating()) {
+                va.real = true;
+                va.w = 64;
+                i.e = realOf(a);
+            } else if (t.isString()) {
+                va.str = true;
+                va.w = 64;
+                i.e = expr(a);
+            } else if (t.isIntegral()) {
+                va.w = (int)t.getBitWidth();
+                va.sgn = t.isSigned();
+                i.e = expr(a);
+            } else {
+                unsupported("an argument of this type to a VPI system task");
+            }
+            va.sig = i.sig = fresh(va.w);
+            prog.emit(i);
+            site->args.push_back(va);
+        }
+        if (info.func) {
+            site->retReal = info.ftype == 2;   // vpiRealFunc
+            site->retW = site->retReal || info.ftype == 3 ? 64 : info.ftype == 1 ? 32 : info.size;
+            site->retSgn = info.ftype == 1 || info.ftype == 5;
+            site->ret = fresh(site->retW);
+        }
+        if (srcMgr()) {
+            auto loc = call.sourceRange.start();
+            site->file = std::string(srcMgr()->getFileName(loc));
+            site->line = (int)srcMgr()->getLineNumber(loc);
+        }
+        for (const Scope* sc = scope; sc; sc = sc->asSymbol().getParentScope()) {
+            const Symbol& sy = sc->asSymbol();
+            if (sy.kind == SymbolKind::InstanceBody) {
+                site->scope = sy.as<InstanceBodySymbol>().parentInstance;
+                break;
+            }
+        }
+        Instr c;
+        c.k = IK::Vpi;
+        c.vpi = site.get();
+        prog.emit(c);
+        int ret = site->ret, retW = site->retW;
+        bool sgn = site->retSgn;
+        vpiSites().push_back(std::move(site));
+        if (!wantValue) return {};
+        int tmp = fresh(retW);
+        Instr i;
+        i.k = IK::Assign;
+        i.sig = tmp;
+        i.e = ref(ret, sgn);
+        prog.emit(i);
+        return ref(tmp, sgn);
     }
 
     // A call of an automatic subroutine (13.3.2): its arguments go straight
@@ -2117,6 +2354,8 @@ struct Lowerer {
                 }
                 std::string_view n = call.getSubroutineName();
                 auto args = call.arguments();
+                if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end() && vi->second.ftype == 2)
+                    return un(Op::AsReal, emitVpiCall(call, vi->second, true));   // a VPI real function (38.37)
                 if (n == "$get_coverage") return sysFnNode(SF_CG, {}, CG_GLOBAL);   // 19.9
                 if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));   // s.atoreal()
                 if (n == "$realtime") { E t = node(Op::RealTime); t->k = mk(ticksPerUnit(), 64); return t; }
@@ -2293,6 +2532,10 @@ struct Lowerer {
         switch (e.kind) {
             case ExpressionKind::IntegerLiteral:
                 return svLit(e.as<IntegerLiteral>().getValue(), e.type->isSigned(), ctx);
+            case ExpressionKind::NullLiteral: {     // a chandle's null (6.14)
+                Val z = make(0, 0, ctx.live && ctx.w > 0 ? ctx.w : 64);
+                return konst(z);
+            }
             case ExpressionKind::UnbasedUnsizedIntegerLiteral: {   // '0 '1 'x 'z fill their context (5.7.1)
                 auto b = e.as<UnbasedUnsizedIntegerLiteral>().getLiteralValue();
                 int w = ctx.w > 0 ? ctx.w : (int)e.type->getBitWidth();
@@ -3565,6 +3808,10 @@ struct Lowerer {
                     return sized(std::move(v), w, e.type->isSigned(), ctx);
                 }
                 std::string_view n = call.getSubroutineName();
+                if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end()) {   // VPI (38.37)
+                    if (vi->second.func && vi->second.ftype == 2) unsupported("a VPI real function as an integral value");
+                    return sized(emitVpiCall(call, vi->second, true), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                }
                 if (n == "randomize") return sized(randomizeCall(call), 32, true, ctx);
                 if (n == "rand_mode" || n == "constraint_mode") return sized(randModeCall(call, true), 32, true, ctx);
                 if ((n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor") && !call.arguments().empty() &&
@@ -5243,6 +5490,10 @@ struct Lowerer {
     void sysCall(const slang::ast::CallExpression& call) {
         using namespace slang::ast;
         std::string_view n = call.getSubroutineName();
+        if (auto vi = vpiSystfNames().find(std::string(n)); vi != vpiSystfNames().end()) {   // VPI (38.37)
+            emitVpiCall(call, vi->second, false);
+            return;
+        }
         if (n == "randomize") { randomizeCall(call); return; }
         if (n == "rand_mode" || n == "constraint_mode") { randModeCall(call, false); return; }
         if (n == "$cast" && call.arguments().size() == 2 && isHandleType(*outArg(*call.arguments()[0]).type)) {
@@ -6844,7 +7095,17 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         reg(v, false);
     }
     void handle(const slang::ast::FormalArgumentSymbol& v) {
-        if (!inMethod && v.direction != slang::ast::ArgumentDirection::Ref) reg(v, false);   // a ref formal gets an address slot later
+        // A DPI import's array formal has no signal: the call passes the actual array (35.5.6.1).
+        using namespace slang::ast;
+        const auto& t = v.getType().getCanonicalType();
+        if (t.kind == SymbolKind::DPIOpenArrayType) return;
+        if (t.isUnpackedArray()) {
+            const Scope* sc = v.getParentScope();
+            if (sc && sc->asSymbol().kind == SymbolKind::Subroutine &&
+                sc->asSymbol().as<SubroutineSymbol>().flags.has(MethodFlags::DPIImport))
+                return;
+        }
+        if (!inMethod && v.direction != ArgumentDirection::Ref) reg(v, false);   // a ref formal gets an address slot later
     }
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) reg(p, false);
@@ -7174,8 +7435,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             return;
         }
         // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
-        // A class handle starts as null (8.4).
-        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || isHandleType(t));
+        // A chandle (6.14) or a class handle (8.4) starts as null.
+        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || t.isCHandle() || isHandleType(t));
         if (!e && !zero) return;
         if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
@@ -7936,6 +8197,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     Lowerer::svaLocalSigs().clear();
     Lowerer::svaLiveSigs().clear();
     sigInfo().clear();
+    Lowerer::vpiSites().clear();
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
     Lowerer::compilation() = &comp;
@@ -8084,10 +8346,66 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*> subMap;
     std::vector<std::unique_ptr<Subr>> owned;
     std::vector<Subr*> order;
+    dpiMap().clear();
+    auto dpiArgs = [&](const slang::ast::SubroutineSymbol& sym, DpiFunc& f) {
+        using namespace slang::ast;
+        for (const FormalArgumentSymbol* formal : sym.getArguments()) {
+            DpiArg a;
+            a.name = std::string(formal->name);
+            a.dir = formal->direction == ArgumentDirection::Out ? 1 : formal->direction == ArgumentDirection::InOut ? 2 : 0;
+            const Type* t = &formal->getType().getCanonicalType();
+            while (t->kind == SymbolKind::FixedSizeUnpackedArrayType || t->kind == SymbolKind::DPIOpenArrayType) {
+                if (t->kind == SymbolKind::DPIOpenArrayType) {
+                    const auto& o = t->as<DPIOpenArrayType>();
+                    if (o.isPacked) Lowerer::unsupported("DPI packed open array argument (bit [])");
+                    a.open = true;
+                    a.udims.push_back({0, 0});
+                    a.uopen.push_back(true);
+                    t = &o.elementType.getCanonicalType();
+                } else {
+                    const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+                    a.udims.push_back({ft.range.left, ft.range.right});
+                    a.uopen.push_back(false);
+                    t = &ft.elementType.getCanonicalType();
+                }
+                a.uarr = true;
+            }
+            if (t->isUnpackedStruct()) Lowerer::unsupported("DPI unpacked struct argument");
+            a.t = dpiType(*t, a.w, a.sgn);
+            if (!a.uarr) {
+                auto it = sigmap.find(formal);
+                if (it == sigmap.end()) Lowerer::unsupported("DPI argument");
+                a.sig = it->second;
+            } else if (f.isExport) Lowerer::unsupported("unpacked array argument of a DPI export");
+            f.args.push_back(std::move(a));
+        }
+    };
     Lowerer setup(sigmap);
     auto framed = framedSubroutines(finder.found);
     for (const slang::ast::SubroutineSymbol* sym : finder.found) {
-        if (subMap.count(sym)) continue;
+        if (!sym->flags.has(slang::ast::MethodFlags::DPIImport) || dpiMap().count(sym)) continue;
+        using namespace slang::ast;
+        auto f = std::make_unique<DpiFunc>();
+        f->svName = std::string(sym->name);
+        f->cName = f->svName;
+        if (auto* syn = sym->getSyntax(); syn && syn->kind == slang::syntax::SyntaxKind::DPIImport) {
+            auto cid = syn->as<slang::syntax::DPIImportSyntax>().c_identifier.valueText();
+            if (!cid.empty()) f->cName = std::string(cid);
+        }
+        f->scope = dpiScopeName(*sym);
+        f->task = sym->subroutineKind == SubroutineKind::Task;
+        f->context = sym->flags.has(MethodFlags::DPIContext);
+        f->pure = sym->flags.has(MethodFlags::Pure);
+        dpiArgs(*sym, *f);
+        if (!f->task) {
+            f->ret = dpiType(sym->getReturnType(), f->retW, f->retSgn);
+            if (f->ret != DT_VOID) f->retSig = mkSig("_dpi_ret$" + f->cName, f->retW, false);
+        }
+        dpiMap()[sym] = f.get();
+        out.dpi.push_back(std::move(f));
+    }
+    for (const slang::ast::SubroutineSymbol* sym : finder.found) {
+        if (subMap.count(sym) || sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
         if (sym->returnValVar && sym->getReturnType().isUnpackedArray()) {
             // Returning an unpacked array is only supported when every call
             // is constant (13.4.3) and slang evaluates it; a call that needs
@@ -8211,6 +8529,44 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         *sub->prog = std::move(lw.prog);
     }
     for (Subr* sub : order) patchImplicit(*sub->prog);
+    for (const auto& ex : comp.getDPIExports()) {   // export "DPI-C" (35.5.4)
+        using namespace slang::ast;
+        auto it = subMap.find(ex.subroutine);
+        if (it == subMap.end()) Lowerer::unsupported("DPI export of this subroutine");
+        Subr* sub = it->second;
+        if (sub->lay) Lowerer::unsupported("DPI export of an automatic task, or of a function that recurses");
+        auto f = std::make_unique<DpiFunc>();
+        f->isExport = true;
+        f->svName = std::string(ex.subroutine->name);
+        f->cName = ex.cIdentifier;
+        f->scope = dpiScopeName(*ex.subroutine);
+        f->task = ex.subroutine->subroutineKind == SubroutineKind::Task;
+        f->prog = sub->prog;
+        dpiArgs(*ex.subroutine, *f);
+        if (!f->task) {
+            f->ret = dpiType(ex.subroutine->getReturnType(), f->retW, f->retSgn);
+            f->retSig = sub->retSig;
+        }
+        out.dpi.push_back(std::move(f));
+    }
+    {   // DPI scope names (35.5.3): every instance and package
+        struct Scopes : slang::ast::ASTVisitor<Scopes> {
+            std::vector<std::string>* out;
+            void handle(const slang::ast::InstanceSymbol& inst) {
+                if (!enterInstance(inst)) return;
+                out->push_back(inst.getHierarchicalPath());
+                visitDefault(inst);
+            }
+            void handle(const slang::ast::PackageSymbol& p) { out->push_back(std::string(p.name)); }
+            void handle(const slang::ast::GenerateBlockSymbol& g) {
+                if (g.isUninstantiated) return;
+                out->push_back(g.getHierarchicalPath());
+                visitDefault(g);
+            }
+        } sv;
+        sv.out = &out.scopes;
+        comp.getRoot().visit(sv);
+    }
 
     // Randomization (18): each class's rand variables, constraint blocks
     // (an override by name replaces the base block), pre/post_randomize.
@@ -8396,5 +8752,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (!blockIds().roots.count(blockIds().of(b)))
             Lowerer::unsupported(("disable of block '" + std::string(b->name) +
                                   "' from outside it, unless it is a whole initial or fork branch").c_str());
+    out.sigOf = sigmap;
     return out;
 }

@@ -149,6 +149,7 @@ def spec_tests(directory):
     for sv in sorted(glob.glob(os.path.join(directory, "*.sv"))):
         name = os.path.splitext(os.path.basename(sv))[0]
         opts = {"expect": "inline"}
+        extra = []
         # Markers shared with tests/spec/run_spec.cmake and the spec suite:
         # icarus-skip, and (msim only) xfail: <known gap> and exit: <status>.
         with open(sv, encoding="utf-8", errors="replace") as f:
@@ -156,13 +157,17 @@ def spec_tests(directory):
                 m = re.match(r"//! ([a-z-]+): ?(.*)", l.rstrip("\n"))
                 if not m:
                     continue
-                if m.group(1) == "icarus-skip":
+                if m.group(1) in ("icarus-skip", "icarus-vpi"):
+                    # icarus-vpi tests need a VPI module built with
+                    # iverilog-vpi; run_spec.cmake does that, mregress doesn't.
                     opts["skip"] = "iverilog"
                 elif m.group(1) == "xfail":
                     opts["xfail"], opts["xfail-sims"] = m.group(2) or "known gap", "msim"
                 elif m.group(1) == "exit":
                     opts["exit"], opts["exit-sims"] = m.group(2), "msim"
-        tests.append(Test(name, [os.path.abspath(sv)], opts, os.path.dirname(sv)))
+                elif m.group(1) == "args":   # more arguments, e.g. a DPI C file
+                    extra = shlex.split(m.group(2))
+        tests.append(Test(name, [os.path.abspath(sv)] + resolve(extra, os.path.dirname(os.path.abspath(sv))), opts, os.path.dirname(sv)))
     return tests
 
 
