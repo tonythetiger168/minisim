@@ -528,12 +528,15 @@ def main(argv=None):
     groups = {}
     for r in results:
         if r["status"] in ("fail", "xpass"):
-            groups.setdefault(signature(r["reason"]), []).append(r)
+            # Stored with the run so mbug files one issue per group.
+            r["signature"] = signature(r["reason"])
+            groups.setdefault(r["signature"], []).append(r)
     npass = sum(r["status"] == "pass" for r in results)
     nskip = sum(r["status"] == "skip" for r in results)
     nxfail = sum(r["status"] == "xfail" for r in results)
     nfail = len(results) - npass - nskip - nxfail
-    summary = {"simulator": sim, "passed": npass, "failed": nfail, "skipped": nskip, "xfail": nxfail,
+    summary = {"simulator": sim, "lists": [os.path.abspath(l) for l in a.lists],
+               "spec": os.path.abspath(a.spec) if a.spec else None, "passed": npass, "failed": nfail, "skipped": nskip, "xfail": nxfail,
                "seconds": round(time.time() - start, 3), "runs": sorted(results, key=lambda r: (r["test"], r["seed"]))}
     with open(os.path.join(outdir, "results.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1)

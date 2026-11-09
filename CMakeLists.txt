@@ -38,6 +38,13 @@ foreach(t test_expr test_z test_sched test_net test_sys test_cpu)
 endforeach()
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
+# mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+  add_test(NAME mbug
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
+                   ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
+endif()
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -219,7 +226,7 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump
+#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
@@ -229,6 +236,7 @@ if(MINISIM_WITH_SLANG)
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
+install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
