@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `unique` constraints over dynamic arrays, queues and associative arrays
+  (18.5.5), alone or with scalars, under implications and on `m[i]`.
 - Rand containers of containers (18.4, 7.5): `rand int m[][]`, queues of
   queues, associative arrays of queues, with constraints on `m.size()`,
   `m[i].size()`, `m[i].sum()` and `m[i][j]` in nested foreach loops. Sizes

@@ -180,6 +180,11 @@ struct RandItem {
     // constraint uses for it, and the DynElemRef that names it, resolved at
     // solve time with the loop indices of that moment.
     std::vector<std::pair<int, E>> refs;
+    // unique {q, x} with a dynamic array, queue or associative array in it
+    // (18.5.5): every element of those containers and every uniqElems value
+    // differ, pairwise, made at solve time when the sizes are known.
+    std::vector<int> uniqConts;
+    std::vector<E> uniqElems;
 };
 // A constraint block (18.5): its constraint_mode slot in the object.
 struct RandBlock {

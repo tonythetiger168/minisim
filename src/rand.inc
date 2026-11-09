@@ -1099,6 +1099,37 @@ static int doRandomize(int obj, const RandCall* rc) {
                     }
                     continue;
                 }
+                if (!it.uniqConts.empty()) {   // unique {q, ...}: pairwise differences now
+                    std::vector<E> el;
+                    bool wait = false;
+                    rw.dropped = false;
+                    for (int cs : it.uniqConts) {
+                        if (const E* r = rw.refOf(cs)) { cs = rw.resolveRef(*r); if (cs < 0) { wait = true; break; } }
+                        if (RCont* c = rw.contOf(cs)) {
+                            if (pass == 1) { wait = true; break; }   // elements not known yet
+                            for (int64_t k = 0; k < c->n; k++) el.push_back(rw.elem(*c, k));
+                        } else {
+                            const DynObj& d = dynStore()[R(cs)];
+                            for (auto& v : d.vec) el.push_back(konst(v));
+                            for (auto& kv : d.map) el.push_back(konst(kv.second));
+                        }
+                    }
+                    if (wait) continue;
+                    for (const E& x : it.uniqElems) el.push_back(rw(x));
+                    E g = rw(it.guard);
+                    if (rw.dropped) continue;
+                    for (size_t a = 0; a < el.size(); a++)
+                        for (size_t b = a + 1; b < el.size(); b++) {
+                            RandItem x;
+                            E ne = bin(Op::Ne, el[a], el[b]);
+                            x.e = g ? bin(Op::LogOr, un(Op::LogNot, g), ne) : ne;
+                            owned.push_back(std::move(x));
+                            Item k;
+                            k.it = &owned.back(); k.fr = fr;
+                            ctx.items.push_back(k);
+                        }
+                    continue;
+                }
                 const RandItem* use = &it;
                 {
                     rw.dropped = false;

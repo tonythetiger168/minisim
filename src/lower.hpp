@@ -4646,7 +4646,7 @@ struct Lowerer {
     // The values of x: one, or every element of a fixed-size array.
     void randElems(const slang::ast::Expression& x, std::vector<E>& out) {
         if (x.type->isUnpackedArray()) {
-            if (isDynType(*x.type)) unsupported("a dynamic array or queue in unique or solve-before");
+            if (isDynType(*x.type)) unsupported("a dynamic array or queue in solve-before");
             arrayElems(*x.type, x, out);
         } else out.push_back(expr(x));
     }
@@ -4729,7 +4729,23 @@ struct Lowerer {
             }
             case ConstraintKind::Uniqueness: {   // 18.5.5
                 std::vector<E> el;
-                for (const Expression* x : c.as<UniquenessConstraint>().items) randElems(*x, el);
+                std::vector<int> conts;
+                for (const Expression* x : c.as<UniquenessConstraint>().items) {
+                    if (isDynType(*x->type)) {   // unique {q}: q's elements, known at solve time
+                        if (dynDepth(*x->type) > 1) unsupported("a container of containers in unique");
+                        int d = dynSig(*x);
+                        if (d < 0) unsupported("this container in unique");
+                        conts.push_back(d);
+                    } else randElems(*x, el);
+                }
+                if (!conts.empty()) {
+                    RandItem it;
+                    it.uniqConts = std::move(conts);
+                    it.uniqElems = std::move(el);
+                    it.guard = guard;
+                    items.push_back(std::move(it));
+                    break;
+                }
                 for (size_t a = 0; a < el.size(); a++)
                     for (size_t b = a + 1; b < el.size(); b++) {
                         RandItem it;
