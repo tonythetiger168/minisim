@@ -64,8 +64,12 @@ if(MINISIM_WITH_SLANG)
     set(FST_SRC ${libfst_SOURCE_DIR}/src)
     add_library(fst STATIC ${FST_SRC}/fstapi.c ${FST_SRC}/fastlz.c ${FST_SRC}/lz4.c)
     target_include_directories(fst PUBLIC ${FST_SRC})
-    target_link_libraries(fst PUBLIC ZLIB::ZLIB)
-    target_compile_definitions(fst PRIVATE _GNU_SOURCE HAVE_FSEEKO HAVE_REALPATH)
+    # FST_WRITER_PARALLEL: libfst compresses and writes each finished block on
+    # a background thread while the simulation goes on (msim turns it on).
+    find_package(Threads REQUIRED)
+    target_link_libraries(fst PUBLIC ZLIB::ZLIB Threads::Threads)
+    target_compile_definitions(fst PRIVATE _GNU_SOURCE HAVE_FSEEKO HAVE_REALPATH
+                               HAVE_LIBPTHREAD FST_WRITER_PARALLEL)
     set_target_properties(fst PROPERTIES POSITION_INDEPENDENT_CODE ON)
   endif()
 
@@ -81,7 +85,7 @@ if(MINISIM_WITH_SLANG)
   target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
   if(MINISIM_WITH_FST)
     target_link_libraries(msim PRIVATE fst)
-    target_compile_definitions(msim PRIVATE MINISIM_FST MINISIM_FST_DIR="${FST_SRC}")
+    target_compile_definitions(msim PRIVATE MINISIM_FST MINISIM_FST_PARALLEL MINISIM_FST_DIR="${FST_SRC}")
   endif()
 
   # Lint and clock-domain checks on the same front end: mlint design.sv

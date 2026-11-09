@@ -31,6 +31,12 @@ directory with ``cmd.sh`` and ``sim.log``. Results go to ``results.json``,
 ``junit.xml`` and ``report.html`` in the output directory, and failures are
 grouped by their first error line. Exit status: 0 all passed, 1 some failed,
 2 bad usage.
+
+Speed: ``-j`` defaults to every logical CPU (hyper-threads included) and each
+msim run gets ``-threads`` = physical cores / runs, so parallel runs do not
+oversubscribe the machine. Runs start longest first, by the times in the
+last results.json. ``-compile`` runs every test with msim -compile in its own
+build directory under <o>/build, so the seeds of a test share one C++ build.
 """
 
 import argparse
@@ -47,6 +53,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 
 VERSION = "0.1.0"
 
@@ -61,6 +68,30 @@ ERROR_PATTERNS = [
     r"\$fatal\b",
     r"^msim: .*(error|cannot)",
 ]
+ERROR_RX = re.compile("|".join(f"(?:{p})" for p in ERROR_PATTERNS))
+
+
+def cpu_topology():
+    """(logical, physical) CPUs this process may use: the affinity mask
+    (taskset, cgroup cpusets, a container's CPU limit) and, on Linux, the
+    sibling map, so two hyper-threads of one core count as one physical core."""
+    try:
+        cpus = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+        return n, n
+    cores = set()
+    for c in cpus:
+        sib = None
+        for name in ("core_cpus_list", "thread_siblings_list"):
+            try:
+                with open(f"/sys/devices/system/cpu/cpu{c}/topology/{name}") as f:
+                    sib = f.read().strip()
+                break
+            except OSError:
+                continue
+        cores.add(sib if sib is not None else str(c))
+    return len(cpus), max(1, len(cores))
 
 
 class Test:
@@ -155,11 +186,13 @@ def resolve(args, base):
     return out
 
 
-def command(sim, exe, args, seed, rundir):
-    """Shell command for one run, per simulator."""
+def command(sim, exe, args, seed, rundir, threads=0):
+    """Shell command for one run, per simulator. `threads` (msim): the run's
+    share of the cores, unless the test sets -threads itself."""
     q = " ".join(shlex.quote(a) for a in args)
     if sim == "msim":
-        return f"{shlex.quote(exe or 'msim')} {q} +ntb_random_seed={seed}"
+        th = f" -threads {threads}" if threads and "-threads" not in args else ""
+        return f"{shlex.quote(exe or 'msim')} {q}{th} +ntb_random_seed={seed}"
     if sim == "vcs":
         return f"{shlex.quote(exe or 'vcs')} -sverilog -R -l /dev/null {q} +ntb_random_seed={seed}"
     if sim == "xrun":
@@ -193,9 +226,30 @@ def command(sim, exe, args, seed, rundir):
 
 # Simulator chatter that is not the design's output (for @expect).
 NOISE = [r"\$finish called", r"^VCD info:", r"^WARNING: ", r"^msim: "]
+NOISE_RX = re.compile("|".join(f"(?:{p})" for p in NOISE))
+
+
+@lru_cache(maxsize=None)
+def _inline_expect(src):
+    lines = []
+    with open(src, encoding="utf-8", errors="replace") as f:
+        for l in f:
+            l = l.rstrip("\n")
+            if l.startswith("//> "):
+                lines.append(l[4:])
+            elif l == "//>":
+                lines.append("")
+    return tuple(lines)
+
+
+@lru_cache(maxsize=None)
+def _file_expect(path):
+    with open(path, encoding="utf-8") as f:
+        return tuple(f.read().splitlines())
 
 
 def expected_lines(test, args):
+    """The expected stdout, read once per file however many seeds run it."""
     exp = test.opts.get("expect")
     if not exp:
         return None
@@ -203,19 +257,9 @@ def expected_lines(test, args):
         svs = [a for a in args if a.endswith((".sv", ".v"))]
         if not svs:
             return None
-        src = svs[0]
-        lines = []
-        with open(src, encoding="utf-8", errors="replace") as f:
-            for l in f:
-                l = l.rstrip("\n")
-                if l.startswith("//> "):
-                    lines.append(l[4:])
-                elif l == "//>":
-                    lines.append("")
-        return lines
+        return list(_inline_expect(svs[0]))
     path = exp if os.path.isabs(exp) else os.path.join(test.base, exp)
-    with open(path, encoding="utf-8") as f:
-        return f.read().splitlines()
+    return list(_file_expect(path))
 
 
 def applies(test, key, sim):
@@ -229,22 +273,26 @@ def check(test, args, rc, out_lines, err_lines, timed_out, sim="msim"):
         return "fail", "timeout"
     # With @expect the expected output is the oracle, so the built-in error
     # patterns (which would flag an expected "Error:" line) are not used.
-    fail_pats = [] if "expect" in test.opts else list(ERROR_PATTERNS)
+    # One compiled alternation instead of a search per pattern per line: a
+    # long UVM log was most of mregress's own time.
+    fail_pats = [] if "expect" in test.opts else [ERROR_RX.pattern]
     if "fail" in test.opts:
         fail_pats.append(test.opts["fail"])
-    for l in out_lines + err_lines:
-        for p in fail_pats:
-            if re.search(p, l):
+    if fail_pats:
+        rx = fail_pats[0] if len(fail_pats) == 1 else "|".join(f"(?:{p})" for p in fail_pats)
+        search = re.compile(rx).search
+        for l in out_lines + err_lines:
+            if search(l):
                 return "fail", l.strip()
     want = int(test.opts["exit"]) if applies(test, "exit", sim) else 0
     if rc != want:
         last = next((l.strip() for l in reversed(err_lines) if l.strip()), "")
         return "fail", f"exit status {rc}" + (f" (expected {want})" if want else "") + (f": {last}" if last else "")
-    if "pass" in test.opts and not any(re.search(test.opts["pass"], l) for l in out_lines):
+    if "pass" in test.opts and not any(map(re.compile(test.opts["pass"]).search, out_lines)):
         return "fail", f"no line matches @pass={test.opts['pass']}"
     exp = expected_lines(test, args)
     if exp is not None:
-        got = [l for l in out_lines if not any(re.search(n, l) for n in NOISE)]
+        got = [l for l in out_lines if not NOISE_RX.search(l)]
         if got != exp:
             for i, (e, g) in enumerate(zip(exp + [None] * len(got), got + [None] * len(exp))):
                 if e != g:
@@ -260,7 +308,7 @@ def signature(reason):
     return s[:160]
 
 
-def run_one(job, sim, exe, outdir, timeout_default, common, cov=False):
+def run_one(job, sim, exe, outdir, timeout_default, common, cov=False, threads=0, compiled=False):
     test, seed = job
     if sim in test.opts.get("skip", "").split(","):
         return {"test": test.name, "seed": seed, "status": "skip", "reason": f"@skip={test.opts['skip']}",
@@ -270,7 +318,13 @@ def run_one(job, sim, exe, outdir, timeout_default, common, cov=False):
     os.makedirs(rundir, exist_ok=True)
     if cov:
         args = args + ["-cov", os.path.join(rundir, "cov.json")]
-    cmd = command(sim, exe, args, seed, rundir)
+    if sim == "msim" and compiled and "-compile" not in args:
+        args = args + ["-compile"]
+    if sim == "msim" and "-compile" in args and "-o" not in args:
+        # One build directory per test: its seeds reuse one simv (msim
+        # caches the build and serializes it), and tests do not share one.
+        args = args + ["-o", os.path.join(outdir, "build", test.name.replace("/", "_"))]
+    cmd = command(sim, exe, args, seed, rundir, threads)
     with open(os.path.join(rundir, "cmd.sh"), "w") as f:
         f.write(f"#!/bin/sh\ncd {shlex.quote(test.base)}\n{cmd}\n")
     timeout = float(test.opts.get("timeout", timeout_default))
@@ -280,7 +334,8 @@ def run_one(job, sim, exe, outdir, timeout_default, common, cov=False):
     # data files ($readmemh) resolve.
     # stdout and stderr are kept apart: @expect compares stdout only (the
     # design's output), while error patterns are searched in both.
-    p = subprocess.Popen(cmd, shell=True, cwd=test.base, stdout=subprocess.PIPE,
+    # A single command replaces the shell (exec) instead of forking under it.
+    p = subprocess.Popen(cmd if "&&" in cmd else "exec " + cmd, shell=True, cwd=test.base, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, start_new_session=True)
     try:
         out, err = p.communicate(timeout=timeout)
@@ -379,7 +434,11 @@ def main(argv=None):
     ap.add_argument("-spec", metavar="DIR", help="run every DIR/*.sv as a test with @expect=inline")
     ap.add_argument("-sim", help="msim (default), vcs, xrun, questa, or iverilog")
     ap.add_argument("-exe", help="simulator executable (default: found on PATH)")
-    ap.add_argument("-j", type=int, default=os.cpu_count() or 1, help="parallel runs (default: CPU count)")
+    ap.add_argument("-j", type=int, default=0,
+                    help="parallel runs (default: every logical CPU this process may use, hyper-threads included)")
+    ap.add_argument("-threads", type=int, default=0,
+                    help="msim -threads per run (default: physical cores / -j, at least 1, so parallel "
+                         "runs do not oversubscribe the machine)")
     ap.add_argument("-seeds", type=int, help="seeds per test (overrides @seeds)")
     ap.add_argument("-seed", type=int, help="first seed (default: random); seeds are seed, seed+1, ...")
     ap.add_argument("-o", default="regress.d", help="output directory (default regress.d)")
@@ -390,6 +449,8 @@ def main(argv=None):
     ap.add_argument("-chapters", action="store_true",
                     help="print a pass table per chapter (leading number of the test name; on by default with -spec)")
     ap.add_argument("-md", metavar="FILE", help="also write the chapter table as Markdown")
+    ap.add_argument("-compile", action="store_true",
+                    help="msim only: run every test with msim -compile (one C++ build per test, reused by its seeds)")
     ap.add_argument("-cov", action="store_true",
                     help="msim only: collect coverage per run and merge it into <o>/cov.json (see mcov)")
     ap.add_argument("-version", action="version", version=f"mregress {VERSION}")
@@ -412,6 +473,12 @@ def main(argv=None):
     if not shutil.which(tool):
         ap.error(f"{tool} not found (put it on PATH or pass -exe)")
 
+    logical, physical = cpu_topology()
+    if a.j <= 0:
+        a.j = logical
+    # Each msim run may start its own worker threads. Give each run its share
+    # of the physical cores: two busy threads on the hyper-threads of one
+    # core slow each other down, and more threads than cores only wait.
     outdir = os.path.abspath(a.o)
     jobs, previous = [], []
     if a.rerun:
@@ -428,13 +495,25 @@ def main(argv=None):
                 continue
             n = a.seeds if a.seeds is not None else int(t.opts.get("seeds", 1))
             jobs += [(t, first + i) for i in range(n)]
+    # Longest runs first (times from the last results.json in this directory),
+    # so a slow test does not start last and hold up the end of the regression.
+    # New tests count as long and go first, in list order.
+    try:
+        with open(os.path.join(outdir, "results.json"), encoding="utf-8") as f:
+            last = {r["test"]: r["seconds"] for r in json.load(f)["runs"]}
+    except (OSError, ValueError, KeyError):
+        last = {}
+    if last:
+        jobs.sort(key=lambda j: -last.get(j[0].name, float("inf")))
+    threads = a.threads or max(1, physical // max(1, min(a.j, len(jobs))))
     os.makedirs(outdir, exist_ok=True)
 
     results, start = [], time.time()
     with cf.ThreadPoolExecutor(max_workers=max(1, a.j)) as pool:
         if a.cov and sim != "msim":
             ap.error("-cov needs -sim msim")
-        futs = [pool.submit(run_one, j, sim, exe, outdir, a.timeout, settings.get("common", []), a.cov) for j in jobs]
+        futs = [pool.submit(run_one, j, sim, exe, outdir, a.timeout, settings.get("common", []), a.cov,
+                            threads if sim == "msim" else 0, a.compile) for j in jobs]
         for fut in cf.as_completed(futs):
             r = fut.result()
             results.append(r)
@@ -466,9 +545,22 @@ def main(argv=None):
         here = os.path.dirname(os.path.abspath(__file__))
         mcov = next((c for c in (os.path.join(here, "mcov"), os.path.join(here, "mcov.py")) if os.path.exists(c)), None)
         if dbs and mcov:
+            # One load of the run databases (in parallel), then save and report
+            # from memory, instead of a merge pass and a second load to report.
             merged = os.path.join(outdir, "cov.json")
-            subprocess.run([sys.executable, mcov, "merge", *dbs, "-o", merged], stdout=subprocess.DEVNULL, check=False)
-            subprocess.run([sys.executable, mcov, "report", merged, "-html", os.path.join(outdir, "cov_html")], check=False)
+            try:
+                import importlib.machinery, importlib.util
+                sys.path.insert(0, here)
+                spec = importlib.util.spec_from_loader("mcov", importlib.machinery.SourceFileLoader("mcov", mcov))
+                mc = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mc)
+                sys.modules.setdefault("mcov", mc)   # worker processes unpickle mcov functions
+                db = mc.load_all(dbs, a.j)
+                mc.save(db, merged)
+                mc.main(["report", merged, "-html", os.path.join(outdir, "cov_html")])
+            except (AttributeError, ImportError, SyntaxError):   # an older mcov
+                subprocess.run([sys.executable, mcov, "merge", *dbs, "-o", merged], stdout=subprocess.DEVNULL, check=False)
+                subprocess.run([sys.executable, mcov, "report", merged, "-html", os.path.join(outdir, "cov_html")], check=False)
     if a.spec or a.chapters:
         print_chapters(summary["runs"], a.md)
     print(f"\nmregress: {npass} passed, {nfail} failed, {nskip} skipped" + (f", {nxfail} known gaps (xfail)" if nxfail else "")
