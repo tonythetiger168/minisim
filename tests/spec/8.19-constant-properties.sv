@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.19: const class properties. A global constant has an
 // initial value; an instance constant is assigned once in the constructor.
+//! icarus-skip: Icarus 13 does not support const class properties
 module top;
   class Jumbo;
     const int max_size = 9 * 1024;

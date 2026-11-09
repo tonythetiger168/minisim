@@ -1,6 +1,7 @@
 // IEEE 1800-2023 8.28 / 8.29: Class handles can be stored in arrays, queues,
 // associative arrays and structs, and passed to and returned from tasks.
 // Objects stay alive while any handle refers to them.
+//! icarus-skip: Icarus 13 does not support associative arrays of class handles
 module top;
   class Node;
     int v;

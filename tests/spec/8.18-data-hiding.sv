@@ -1,6 +1,7 @@
 // IEEE 1800-2023 8.18: local members are visible only inside the class;
 // protected members also inside subclasses. Methods of the class can use
 // them, including through another object of the same class.
+//! icarus-skip: Icarus 13 does not find inherited methods called without this.
 module top;
   class Account;
     local int balance;

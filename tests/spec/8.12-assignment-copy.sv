@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.12: Assigning a handle shares the object; "new h" makes a
 // shallow copy: properties are copied, nested object handles are shared.
+//! icarus-skip: Icarus 13 does not support nested member paths or comparing class handles
 module top;
   class A; int j = 5; endclass
   class B;

@@ -2,6 +2,7 @@
 // parameters; a class implements one or more of them and can be used through
 // a handle of each interface class type. Interface classes can extend
 // other interface classes.
+//! icarus-skip: Icarus 13 does not support interface classes
 module top;
   interface class PutImp #(type PUT_T = logic);
     pure virtual function void put(PUT_T a);

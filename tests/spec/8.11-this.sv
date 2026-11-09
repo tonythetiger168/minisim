@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.11: "this" refers to the current instance, so a property
 // shadowed by an argument of the same name is still reachable.
+//! icarus-skip: Icarus 13 does not support a method call on a method result (d.self().x)
 module top;
   class Demo;
     integer x;

@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.8: Typed constructor calls. "base_h = D::new(...)" creates
 // an object of the derived class D and assigns it to a base-class handle.
+//! icarus-skip: Icarus 13 does not support typed constructor calls D::new
 module top;
   class C;
     int c = 1;

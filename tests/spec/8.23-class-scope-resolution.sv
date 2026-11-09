@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.23: The class scope operator :: names static members,
 // typedefs and enums declared inside a class.
+//! icarus-skip: Icarus 13 does not support typedefs inside classes
 module top;
   class Base;
     typedef enum {BIN, OCT, DEC, HEX} radix;

@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.20: A virtual method is chosen by the object's class, not
 // the handle's type; an override stays virtual further down the hierarchy.
+//! icarus-skip: Icarus 13 does not support arrays of class handles
 module top;
   class BasePacket;
     int A = 1;

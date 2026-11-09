@@ -1,6 +1,7 @@
 // IEEE 1800-2023 8.16: $cast assigns a base handle to a subclass handle only
 // when the object really is of that subclass; the task form reports an
 // error on failure, the function form returns 0.
+//! icarus-skip: Icarus 13 does not support $cast on class handles
 module top;
   class Base; int b = 1; endclass
   class Sub extends Base; int s = 2; endclass

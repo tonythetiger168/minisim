@@ -1,6 +1,7 @@
 // IEEE 1800-2023 8.22: Polymorphism. An array of base-class handles holds
 // objects of different subclasses; a virtual call runs each object's own
 // method.
+//! icarus-skip: Icarus 13 does not support pure virtual methods
 module top;
   virtual class BasePacket;
     pure virtual function string name();

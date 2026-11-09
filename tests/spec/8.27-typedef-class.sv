@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.27: typedef class forward-declares a class so two
 // classes can refer to each other.
+//! icarus-skip: Icarus 13 resolves a forward-declared class property wrongly
 module top;
   typedef class C2;
   class C1;

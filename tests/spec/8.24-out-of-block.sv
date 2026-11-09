@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.24: extern methods are prototyped in the class and
 // defined outside it with Class::name.
+//! icarus-skip: Icarus 13 does not support extern methods
 module top;
   class Packet;
     int v;

@@ -1,6 +1,7 @@
 // IEEE 1800-2023 8.9 / 8.10: Static class properties are shared by every
 // instance; static methods can be called through the class scope or a
 // handle and cannot touch non-static members.
+//! icarus-skip: Icarus 13 does not support calling a static method through a handle
 module top;
   class Counter;
     static int count = 0;

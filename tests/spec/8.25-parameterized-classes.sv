@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.25: Parameterized classes. Each specialization is its own
 // type with its own static members.
+//! icarus-skip: Icarus 13 does not support parameterized classes
 module top;
   class vector #(int size = 1);
     bit [size-1:0] a;

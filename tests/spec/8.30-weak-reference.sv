@@ -2,6 +2,7 @@
 // keeping it alive. get() returns the referent until clear() is called;
 // get_id() gives a stable nonzero id per object (0 for null), the same
 // through any handle type.
+//! icarus-skip: Icarus 13 does not support std::weak_reference
 module top;
   class Obj; int v; endclass
   class ExObj extends Obj; endclass

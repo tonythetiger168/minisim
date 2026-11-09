@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.21: A virtual class cannot be constructed; its pure
 // virtual methods are implemented by the concrete subclasses.
+//! icarus-skip: Icarus 13 does not support pure virtual methods
 module top;
   virtual class Shape;
     int id;

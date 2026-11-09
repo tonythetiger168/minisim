@@ -1,5 +1,6 @@
 // IEEE 1800-2023 8.13: A subclass inherits the properties and methods of its
 // base class and can add its own.
+//! icarus-skip: Icarus 13 does not support a method call on a method result
 module top;
   class Packet;
     int addr = 1;
