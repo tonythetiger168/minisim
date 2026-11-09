@@ -1360,7 +1360,8 @@ enum class Op {
     AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
     DynEq,     // containers sig and hi have the same size and equal elements (=== when lo)
     DynStrJoin, // the strings in container sig, joined ({>>{q}} of a string queue, 11.4.14)
-    DynSub     // id + 1 of the inner container at key kids[0] of container of containers sig
+    DynSub,    // id + 1 of the inner container at key kids[0] of container of containers sig
+    VifSig     // 1 + the signal id of member hi of the interface instance the virtual interface kids[0] names, or 0 (25.9)
 };
 // System functions computed by Op::SysFn.
 enum SysFnId : int {
@@ -2204,6 +2205,9 @@ inline int R(int s) { return s < kRel ? s : relSlow(s); }
 // Every signal `e` reads, resolved now (a wait on automatic variables).
 inline void collectAddrs(const std::shared_ptr<struct Expr>& e, std::vector<int>& out);
 
+// Virtual interfaces (25.9): vifTab()[k][m] is the signal id of member m
+// of interface instance k (k = 0: null), or -1.
+inline std::vector<std::vector<int>>& vifTab() { static std::vector<std::vector<int>> t; return t; }
 inline Val eval(const E& e, const Reader& rd) {
     auto k = [&](int i) { return eval(e->kids[i], rd); };
     switch (e->op) {
@@ -2231,6 +2235,13 @@ inline Val eval(const E& e, const Reader& rd) {
             return mk(g_isA ? g_isA((int)h.v, e->hi) : 0, 1);
         }
         case Op::AddrOf: return make((uint64_t)R(e->sig) + 1, 0, 64);
+        case Op::VifSig: {
+            Val h = k(0);
+            const auto& tab = vifTab();
+            if (h.x || !h.v || h.v >= tab.size() || (size_t)e->hi >= tab[h.v].size() || tab[h.v][(size_t)e->hi] < 0)
+                return make(0, 0, 64);
+            return make((uint64_t)tab[h.v][(size_t)e->hi] + 1, 0, 64);
+        }
         case Op::Addr: {
             g_nullOk++;
             Val h = k(0);
