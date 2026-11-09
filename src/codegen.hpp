@@ -115,6 +115,7 @@ public:
              "    for (int i = 1; i < argc; i++) {\n"
              "        if (!std::strcmp(argv[i], \"-maxtime\") && i + 1 < argc) maxTime = std::strtoull(argv[++i], nullptr, 10);\n"
              "        else if (!std::strcmp(argv[i], \"-vcd\") && i + 1 < argc) S.vcdPath = argv[++i];\n"
+             "        else if (!std::strcmp(argv[i], \"-vcdtop\") && i + 1 < argc) S.vcdTop = argv[++i];\n"
              "        else if (!std::strcmp(argv[i], \"-threads\") && i + 1 < argc) S.threads = std::max(1, std::atoi(argv[++i]));\n"
              "    }\n"
              "    if (std::thread::hardware_concurrency() > 0) S.threads = std::min<int>(S.threads, (int)std::thread::hardware_concurrency());\n";

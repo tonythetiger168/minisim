@@ -51,6 +51,24 @@ if(MINISIM_WITH_SLANG)
     GIT_TAG v12.1
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(slang)
+  # FST waveforms (msim -vcd x.fst / -fst): GTKWave's libfst (MIT), pinned
+  # to a commit. Needs zlib. -DMINISIM_WITH_FST=OFF builds VCD only.
+  option(MINISIM_WITH_FST "FST waveform output (fetches libfst)" ON)
+  if(MINISIM_WITH_FST)
+    enable_language(C)
+    find_package(ZLIB REQUIRED)
+    FetchContent_Declare(libfst
+      GIT_REPOSITORY https://github.com/gtkwave/libfst.git
+      GIT_TAG d3cc801ba980dc1bf9c2e00b8ed91556a78ef271)
+    FetchContent_Populate(libfst)
+    set(FST_SRC ${libfst_SOURCE_DIR}/src)
+    add_library(fst STATIC ${FST_SRC}/fstapi.c ${FST_SRC}/fastlz.c ${FST_SRC}/lz4.c)
+    target_include_directories(fst PUBLIC ${FST_SRC})
+    target_link_libraries(fst PUBLIC ZLIB::ZLIB)
+    target_compile_definitions(fst PRIVATE _GNU_SOURCE HAVE_FSEEKO HAVE_REALPATH)
+    set_target_properties(fst PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  endif()
+
   add_executable(slang_dump src/slang_dump.cpp)
   target_include_directories(slang_dump PRIVATE src)
   target_link_libraries(slang_dump PRIVATE slang::slang)
@@ -61,6 +79,10 @@ if(MINISIM_WITH_SLANG)
   target_link_libraries(msim PRIVATE slang::slang)
   # -compile builds generated C++ against the kernel headers in src/.
   target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
+  if(MINISIM_WITH_FST)
+    target_link_libraries(msim PRIVATE fst)
+    target_compile_definitions(msim PRIVATE MINISIM_FST MINISIM_FST_DIR="${FST_SRC}")
+  endif()
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -108,6 +130,14 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_smoke
                      -P ${CMAKE_SOURCE_DIR}/tests/mregress.cmake)
+  endif()
+  if(MINISIM_WITH_FST)
+    add_executable(test_fst tests/test_fst.cpp)
+    target_link_libraries(test_fst PRIVATE fst)
+    add_test(NAME msim_fst
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DCHK=$<TARGET_FILE:test_fst>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
   endif()
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
@@ -163,6 +193,12 @@ endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
+if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
+  # msim -compile with an FST waveform builds these into simv.
+  install(FILES ${FST_SRC}/fstapi.c ${FST_SRC}/fstapi.h ${FST_SRC}/fastlz.c ${FST_SRC}/fastlz.h
+                ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
+endif()
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
