@@ -92,8 +92,14 @@ enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT };
 // often the jump was taken: the condition was false).
 struct SrcLoc { uint32_t file = 0, line = 0; };
 inline SrcLoc g_emitLoc;
+inline SrcLoc g_runLoc;   // the statement running now, for run-time error messages
+inline std::string runLocStr();
 inline std::vector<std::string> g_covFiles{""};   // file id -> path; 0 = unknown
 inline bool g_cov = false;
+inline std::string runLocStr() {
+    if (!g_runLoc.line || g_runLoc.file >= g_covFiles.size()) return "";
+    return " (" + g_covFiles[g_runLoc.file] + ":" + std::to_string(g_runLoc.line) + ")";
+}
 inline uint32_t covFileId(const std::string& path) {
     static std::unordered_map<std::string, uint32_t> ids;
     auto [it, fresh] = ids.try_emplace(path, (uint32_t)g_covFiles.size());

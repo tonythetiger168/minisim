@@ -297,6 +297,8 @@ inline void dynExec(const Instr& i) {
     // Container ids may be relative (automatic variables): resolve them once.
     const int sig = R(i.sig), dsrc = i.dsrc >= 0 ? R(i.dsrc) : -1;
     const int dres = i.dres >= 0 ? R(i.dres) : -1, dkey = i.dkey >= 0 ? R(i.dkey) : -1;
+    if (i.dcmd != D_DELETE && i.dcmd != D_DELETE_AT && i.dcmd != D_FIRST && i.dcmd != D_LAST && i.dcmd != D_NEXT && i.dcmd != D_PREV)
+        dynAttach(sig);   // a write to an element container made by a read: it joins its array now
     auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
@@ -1183,6 +1185,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             continue;
         }
         const Instr& i = p->code[pc];
+        g_runLoc = {i.file, i.line};
         if (g_cov) covHit(i.hits);
         switch (i.k) {
             case IK::Assign:
@@ -1426,14 +1429,20 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                                 exit(1);
                             }
                         }
+                        if ((size_t)vs >= cr.vt.size()) {
+                            cerr << "internal error: virtual slot " << vs << " past the methods of class " << cr.name << runLocStr() << "\n";
+                            exit(1);
+                        }
                         const auto& ve = cr.vt[(size_t)vs];
                         if (!ve.first) {
-                            cerr << "error: call of a pure virtual method at time " << S.now << "\n";
+                            cerr << "error: call of a pure virtual method at time " << S.now << runLocStr() << "\n";
                             exit(1);
                         }
                         callee = ve.first;
                         lay = ve.second;
                     }
+                    static const bool callTrace = getenv("MSIM_CALLTRACE") != nullptr;
+                    if (callTrace) cerr << "call " << (lay ? lay->name : "?") << " self=" << self << runLocStr() << "\n";
                     FrameP nf = newFrame(lay, nullptr, self);
                     for (auto& [off, e] : i.init) {   // arguments, read in the caller's frame
                         Val v = eval(e, rd);
