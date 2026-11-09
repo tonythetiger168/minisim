@@ -177,6 +177,13 @@ if(MINISIM_WITH_SLANG)
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
   endif()
+  # The virtual prototype layer: the design reaching C models over AXI4-Lite.
+  add_test(NAME msim_mvp
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_mvp
+                   -P ${CMAKE_SOURCE_DIR}/tests/mvp.cmake)
+  set_tests_properties(msim_mvp PROPERTIES ENVIRONMENT MINISIM_MVP=${CMAKE_SOURCE_DIR}/mvp)
+
   # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
   add_test(NAME msim_dpi
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -262,7 +269,12 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES include/svdpi.h include/vpi_user.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES include/svdpi.h include/vpi_user.h include/mvp.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+# The virtual prototype layer: msim -mvp looks for these next to itself.
+install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
+install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
+install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 

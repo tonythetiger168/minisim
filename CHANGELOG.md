@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Virtual prototypes: `msim -mvp` adds an AXI4-Lite bridge (`mvp_axil_slave`,
+  `mvp_irq_slave`, `mvp_clock`) from the design to models written in C, C++ or
+  SystemC/TLM-2.0, with a memory map, 32 interrupt lines, timed callbacks and
+  a master path for a model that drives the bus itself (`include/mvp.h`,
+  `mvp_tlm.h`). A memory and a 16550-style UART are bundled in `mvp/models/`.
+  See `docs/VPROTO.md`.
 - Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
   `always_ff` on sampled values, checker variables and free variables, all
   in the reactive region set. Before this, checker instances were ignored.

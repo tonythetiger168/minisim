@@ -46,6 +46,10 @@
 //   -sv_root <dir>   directory for relative -sv_lib names
 //   -sv_liblist <f>  a bootstrap file of library names (J.4)
 //   -dpiheader <f>   write the C prototypes of every import and export to f
+//   -mvp             add the virtual prototype layer: mvp.sv (mvp_axil_slave,
+//                    mvp_irq_slave, mvp_clock) and the runtime its models use.
+//                    Give your model C files on the command line as well; the
+//                    bundled examples are in <prefix>/share/minisim/mvp/models
 //   -CFLAGS <s>      extra flags for compiling the C files
 //   -LDFLAGS <s>     extra flags for linking them (e.g. -lm)
 //
@@ -159,6 +163,19 @@ static std::string dpiIncludeDir() {
     }
     return std::string(MINISIM_SRC_DIR) + "/../include";
 }
+// The virtual prototype layer (mvp/): mvp.sv for the design and mvp.c for the
+// model library, found next to an installed msim or in the source tree.
+static std::string mvpDir() {
+    if (const char* e = std::getenv("MINISIM_MVP")) return e;
+    std::error_code ec;
+    auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        auto inst = exe.parent_path().parent_path() / "share" / "minisim" / "mvp";
+        if (std::filesystem::exists(inst / "mvp.c", ec)) return inst.string();
+    }
+    return std::string(MINISIM_SRC_DIR) + "/../mvp";
+}
+
 static bool hasExt(const std::string& a, std::initializer_list<const char*> exts) {
     for (const char* e : exts)
         if (a.size() > strlen(e) && a.compare(a.size() - strlen(e), strlen(e), e) == 0) return true;
@@ -499,6 +516,9 @@ static void usage() {
                  "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
+                 "  <file>.c       C or C++ for DPI-C imports; also -sv_lib / -sv_root / -dpiheader\n"
+                 "  -mvp           add the virtual prototype layer (mvp_axil_slave and its runtime)\n"
+                 "  -load <lib>    load a VPI library before elaboration\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  -version       print the msim version\n"
                  "  --help-slang   list every front-end option\n";
@@ -620,6 +640,18 @@ int main(int argc, char** argv) {
             std::string lib = c == std::string::npos ? l : l.substr(0, c), boot = c == std::string::npos ? "" : l.substr(c + 1);
             if (lib.find('/') == std::string::npos) lib = "./" + lib;
             vpiLibs.push_back({lib, boot});
+            continue;
+        }
+        if (a == "-mvp") {   // the virtual prototype layer: mvp.sv and its runtime
+            std::string d = mvpDir();
+            std::error_code ec;
+            if (!std::filesystem::exists(d + "/mvp.c", ec)) {
+                std::cerr << "msim: -mvp cannot find the mvp runtime in " << d
+                          << " (set $MINISIM_MVP)\n";
+                return 2;
+            }
+            fwd.push_back(d + "/sv/mvp.sv");
+            cFiles.push_back(d + "/mvp.c");
             continue;
         }
         if (a == "-CFLAGS") { cflags += " " + next("flags"); continue; }
