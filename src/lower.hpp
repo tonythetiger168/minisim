@@ -591,6 +591,7 @@ struct Lowerer {
                 if (n == "$sformatf" || n == "$psprintf") {
                     auto args = call.arguments();
                     auto f = node(Op::SFormat);
+                    hierName = scopeName(call);
                     formatInto(args, 'd', f->fmt, f->kids);
                     return f;
                 }
@@ -1227,6 +1228,12 @@ struct Lowerer {
                     default: unsupported("unary operator");
                 }
                 if (!bw) return sized(out, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                // Already at the context width; a cast such as unsigned'(-a) can
+                // still change the sign the parent sees (6.24.1).
+                if (ctx.live && ctx.w > 0 && ctx.tag != e.type->isSigned()) {
+                    int w = ctx.w;
+                    return resize(std::move(out), w, false, ctx.tag);
+                }
                 return out;
             }
             case ExpressionKind::BinaryOp: {
@@ -1532,6 +1539,33 @@ struct Lowerer {
     // Each string-literal argument is format text; any other argument
     // fills the next specifier, or prints with the default if none is
     // waiting ($display(a, b) prints both in decimal).
+    // The hierarchical name %m prints (21.2.1.1): the scope of the call, such
+    // as top.u1 or top.u1.blk.
+    static std::string scopeName(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        const auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine);
+        if (!sci || !sci->scope) return "top";
+        const Symbol* s = &sci->scope->asSymbol();
+        if (s->kind == SymbolKind::InstanceBody) {
+            const auto* inst = s->as<InstanceBodySymbol>().parentInstance;
+            if (inst) return inst->getHierarchicalPath();
+        }
+        return s->getHierarchicalPath();
+    }
+    std::string hierName = "top";   // what %m prints for the call being lowered
+    static std::string substM(const std::string& f, const std::string& name) {
+        std::string esc, r;
+        for (char c : name) { esc += c; if (c == '%') esc += '%'; }
+        for (size_t p = 0; p < f.size(); p++) {
+            if (f[p] != '%') { r += f[p]; continue; }
+            if (p + 1 < f.size() && f[p + 1] == '%') { r += "%%"; p++; continue; }
+            size_t q = p + 1;
+            while (q < f.size() && (isdigit((unsigned char)f[q]) || f[q] == '.' || f[q] == '-')) q++;
+            if (q < f.size() && (f[q] == 'm' || f[q] == 'M')) { r += esc; p = q; continue; }
+            r += f[p];
+        }
+        return r;
+    }
     template <typename Args>
     void formatInto(const Args& argv, char dflt, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
@@ -1551,7 +1585,7 @@ struct Lowerer {
             if (a->kind == ExpressionKind::EmptyArgument) { fmt += ' '; continue; }
             const Expression& pe = peel(*a);
             if (pe.kind == ExpressionKind::StringLiteral && pending == 0) {
-                std::string f(pe.as<StringLiteral>().getValue());
+                std::string f = substM(std::string(pe.as<StringLiteral>().getValue()), hierName);
                 fmt += f;
                 pending = countSpecs(f);
                 continue;
@@ -1592,6 +1626,7 @@ struct Lowerer {
             Instr i; i.k = IK::Assign;
             lhs(*dst, i);
             auto f = node(Op::SFormat);
+            hierName = scopeName(call);
             formatInto(args.subspan(1), 'd', f->fmt, f->kids);
             i.e = dst->type->isString() ? f : E(node(Op::StrToInt, {f}));
             if (!dst->type->isString()) i.e->hi = (int)dst->type->getBitWidth();
@@ -1644,6 +1679,7 @@ struct Lowerer {
             return;
         }
         Instr i; i.k = k; i.nonl = nonl;
+        hierName = scopeName(call);
         formatInto(call.arguments(), dflt, i.fmt, i.args);
         prog.emit(i);
     }
