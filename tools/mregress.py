@@ -236,7 +236,7 @@ def signature(reason):
     return s[:160]
 
 
-def run_one(job, sim, exe, outdir, timeout_default, common):
+def run_one(job, sim, exe, outdir, timeout_default, common, cov=False):
     test, seed = job
     if sim in test.opts.get("skip", "").split(","):
         return {"test": test.name, "seed": seed, "status": "skip", "reason": f"@skip={test.opts['skip']}",
@@ -244,6 +244,8 @@ def run_one(job, sim, exe, outdir, timeout_default, common):
     args = resolve(common + test.args, test.base)
     rundir = os.path.join(outdir, "runs", f"{test.name.replace('/', '_')}_s{seed}")
     os.makedirs(rundir, exist_ok=True)
+    if cov:
+        args = args + ["-cov", os.path.join(rundir, "cov.json")]
     cmd = command(sim, exe, args, seed, rundir)
     with open(os.path.join(rundir, "cmd.sh"), "w") as f:
         f.write(f"#!/bin/sh\ncd {shlex.quote(test.base)}\n{cmd}\n")
@@ -330,6 +332,8 @@ def main(argv=None):
     ap.add_argument("-filter", help="only tests whose name matches this regex")
     ap.add_argument("-rerun", action="store_true", help="rerun the failures recorded in <o>/results.json")
     ap.add_argument("-q", action="store_true", help="print only the summary")
+    ap.add_argument("-cov", action="store_true",
+                    help="msim only: collect coverage per run and merge it into <o>/cov.json (see mcov)")
     ap.add_argument("-version", action="version", version=f"mregress {VERSION}")
     a = ap.parse_args(argv)
 
@@ -370,7 +374,9 @@ def main(argv=None):
 
     results, start = [], time.time()
     with cf.ThreadPoolExecutor(max_workers=max(1, a.j)) as pool:
-        futs = [pool.submit(run_one, j, sim, exe, outdir, a.timeout, settings.get("common", [])) for j in jobs]
+        if a.cov and sim != "msim":
+            ap.error("-cov needs -sim msim")
+        futs = [pool.submit(run_one, j, sim, exe, outdir, a.timeout, settings.get("common", []), a.cov) for j in jobs]
         for fut in cf.as_completed(futs):
             r = fut.result()
             results.append(r)
@@ -396,6 +402,14 @@ def main(argv=None):
     write_junit(summary["runs"], os.path.join(outdir, "junit.xml"), sim)
     write_html(summary["runs"], groups, os.path.join(outdir, "report.html"), sim)
 
+    if a.cov:
+        dbs = sorted(glob.glob(os.path.join(outdir, "runs", "*", "cov.json")))
+        here = os.path.dirname(os.path.abspath(__file__))
+        mcov = next((c for c in (os.path.join(here, "mcov"), os.path.join(here, "mcov.py")) if os.path.exists(c)), None)
+        if dbs and mcov:
+            merged = os.path.join(outdir, "cov.json")
+            subprocess.run([sys.executable, mcov, "merge", *dbs, "-o", merged], stdout=subprocess.DEVNULL, check=False)
+            subprocess.run([sys.executable, mcov, "report", merged, "-html", os.path.join(outdir, "cov_html")], check=False)
     print(f"\nmregress: {npass} passed, {nfail} failed, {nskip} skipped on {sim} in {summary['seconds']:.1f}s"
           f"  ({os.path.relpath(outdir)}/report.html)")
     for sig, rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):

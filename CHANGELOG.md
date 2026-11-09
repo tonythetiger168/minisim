@@ -16,6 +16,10 @@ Spec references are IEEE 1800-2023 clauses.
 - FST waveforms: `msim -fst [file]`, `+fst`, or `-vcd file.fst`, in the
   interpreter and in `-compile` (libfst from GTKWave, MIT, fetched at build;
   `-DMINISIM_WITH_FST=OFF` builds VCD only).
+- Code coverage: `msim -cov` writes line, branch and toggle coverage; `mcov`
+  merges databases and reports text, HTML and LCOV, with `-min-line` /
+  `-min-branch` / `-min-toggle` gates; `mregress -cov` merges a whole
+  regression.
 
 ### Changed
 - Waveforms nest the instance hierarchy as scopes under the top module
