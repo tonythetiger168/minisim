@@ -1050,7 +1050,7 @@ struct Sim {
                     if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
                     return fmtVal('d', v, 0, true);
                 };
-                const DynObj& o = dynStore()[h->sig];
+                const DynObj& o = dynStore()[R(h->sig)];   // R: a property through a handle, or an automatic container
                 cout << "'{";
                 if (o.kind == 2) {
                     bool first = true;
