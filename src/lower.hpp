@@ -7545,8 +7545,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             if (Lowerer::isDynType(*et) || et->isUnpackedArray()) Lowerer::unsupported("rand array of arrays");
                         }
                         if (isHandleType(*et)) {
-                            if (rv.dyn) Lowerer::unsupported("rand dynamic array or queue of class handles");
-                            rv.obj = true; rv.w = 64;
+                            rv.obj = true; rv.w = 64;   // a dynamic array or queue of them too: each object
                         }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();

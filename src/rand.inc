@@ -607,6 +607,13 @@ static void randObjects(int obj, std::vector<int>& out) {
     if (!cr.rand) return;
     for (const RandVar& rv : cr.rand->vars) {
         if (!rv.obj || (S.get(obj + rv.mode).v & 1) == 0) continue;
+        if (rv.dyn) {   // a rand dynamic array or queue of handles: each element's object
+            std::vector<int> hs;
+            for (const Val& h : dynStore()[obj + rv.off].vec)
+                if (!h.x && h.v) hs.push_back((int)h.v);
+            for (int h : hs) randObjects(h, out);
+            continue;
+        }
         for (int k = 0; k < rv.count; k++) {
             Val h = S.get(obj + rv.off + k);
             if (!h.x && h.v) randObjects((int)h.v, out);

@@ -11,7 +11,8 @@ Spec references are IEEE 1800-2023 clauses.
 - rand dynamic arrays and queues (18.4): `size()` constraints, `foreach`
   over the elements and array reductions (`sum`, `product`, `and`, `or`,
   `xor`, with or without `with`) in constraints (18.5.8). Sizes are solved
-  first, then the elements.
+  first, then the elements. Rand arrays and queues of class handles
+  randomize each element's object.
 - Virtual interfaces (25.9): variables, properties and arguments of
   `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
   clocking blocks reached through them.
