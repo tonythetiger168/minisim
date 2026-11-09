@@ -66,7 +66,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 11.4.12 | Concatenation, replication | ✅ | `11.4.12.1-replication` |
 | 11.4.6 | Wildcard equality `==?` `!=?` | ✅ | `11.4.2-incdec-in-expr` |
 | 11.4.13 | inside | ✅ | values and `[lo:hi]` ranges. Not yet: unpacked arrays as items, tolerance ranges. `11.4.13-inside` |
-| 11.4.14 | Streaming operators | ✅ | `{>>{...}}`, `{<<n{...}}`, `{<<type{...}}` of integral operands and fixed-size arrays, nested streams, a wider target left-aligned, and unpacking `{>>{a, b}} = v` (11.4.14.3). Not yet: queues and dynamic arrays as operands or targets, structs as operands, `with [...]`. `11.4.14-streaming` |
+| 11.4.14 | Streaming operators | ✅ | `{>>{...}}`, `{<<n{...}}`, `{<<type{...}}` of integral operands and fixed-size arrays, nested streams, a wider target left-aligned, and unpacking `{>>{a, b}} = v` (11.4.14.3). Queues and dynamic arrays of integral elements as operands, and as the target of `q = {>>{...}}` (resized to hold the stream). Not yet: a container inside an unpacking target list, structs as operands, `with [...]`. `11.4.14-streaming`, `11.4.14-streaming-containers` |
 | 11.5.1 | Bit-select with a variable index | ✅ | read and write. `11.5.1-variable-bit-select` |
 | 11.5.1 | Indexed part-select `+:` `-:` | ✅ | constant or variable start, read and write; out-of-range bits read x and are not written. `11.5.1-indexed-part-select` |
 | 11.6–11.8 | Expression width and sign rules | ✅ | context-determined widths, signed extension |

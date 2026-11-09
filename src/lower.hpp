@@ -1325,6 +1325,15 @@ struct Lowerer {
     void assignContainer(int dst, const slang::ast::Expression& rhs0) {
         using namespace slang::ast;
         const Expression& rhs = peel(rhs0);
+        if (rhs.kind == ExpressionKind::Streaming) {   // q = {>>8{v}} (11.4.14.3): unpack into elements
+            const auto& sc = rhs.as<StreamingConcatenationExpression>();
+            if (dynShape(dst).kind == 2) unsupported("streaming into an associative array");
+            Instr i = dynCmd(dst, D_UNPACK);
+            if (streamIsDyn(sc)) i.e = streamDyn(sc);
+            else { int w = 0; i.e = streamBits(sc, w); }
+            prog.emit(i);
+            return;
+        }
         if (rhs.kind == ExpressionKind::NewArray) {   // 7.5.1
             const auto& na = rhs.as<NewArrayExpression>();
             Instr i = dynCmd(dst, D_NEW);
@@ -3123,7 +3132,53 @@ struct Lowerer {
         E v = parts.size() == 1 ? parts[0] : concat(std::move(parts));
         return reverseSlices(v, w, (int)sc.getSliceSize());
     }
+    // Whether a stream has a container operand, so its width is known only
+    // at run time.
+    bool streamIsDyn(const slang::ast::StreamingConcatenationExpression& sc) const {
+        using namespace slang::ast;
+        for (auto& st : sc.streams()) {
+            const Expression& op = peel(*st.operand);
+            if (op.kind == ExpressionKind::Streaming && streamIsDyn(op.as<StreamingConcatenationExpression>())) return true;
+            if (dynSig(op) >= 0) return true;
+        }
+        return false;
+    }
+    // A stream with containers in it, as a StreamPack of its natural width.
+    E streamDyn(const slang::ast::StreamingConcatenationExpression& sc) {
+        using namespace slang::ast;
+        std::vector<E> kids;
+        for (auto& st : sc.streams()) {
+            if (st.withExpr) unsupported("with [] in a streaming concatenation");
+            const Expression& op = peel(*st.operand);
+            if (op.kind == ExpressionKind::Streaming) {
+                const auto& in = op.as<StreamingConcatenationExpression>();
+                if (streamIsDyn(in)) kids.push_back(streamDyn(in));
+                else { int w = 0; kids.push_back(streamBits(in, w)); }
+            } else if (int d = dynSig(op); d >= 0) {
+                const DynObj& o = dynShape(d);
+                if (o.dflt.real || o.dflt.str || !op.type->getArrayElementType() ||
+                    !op.type->getArrayElementType()->isIntegral())
+                    unsupported("a container of non-integral elements in a streaming concatenation");
+                auto n = node(Op::DynBits);
+                n->sig = d;
+                kids.push_back(n);
+            } else if (op.type->isIntegral()) {
+                kids.push_back(expr(op));
+            } else {
+                unsupported("this operand in a streaming concatenation with a container");
+            }
+        }
+        auto n = node(Op::StreamPack, std::move(kids));
+        n->hi = -1;
+        n->lo = (int)sc.getSliceSize();
+        return n;
+    }
     E streamTo(const slang::ast::StreamingConcatenationExpression& sc, int w) {
+        if (streamIsDyn(sc)) {
+            E n = streamDyn(sc);
+            n->hi = w;
+            return n;
+        }
         int sw = 0;
         E v = streamBits(sc, sw);
         if (w == sw) return v;

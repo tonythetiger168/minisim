@@ -24,7 +24,8 @@ enum Edge { ANY, POS, NEG };
 enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_INSERT, D_POP_FRONT,
               D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
               D_SORT, D_RSORT, D_SHUFFLE,
-              D_SORT_BY, D_RSORT_BY };   // sort / rsort with (7.12.2): keys in dsrc
+              D_SORT_BY, D_RSORT_BY,     // sort / rsort with (7.12.2): keys in dsrc
+              D_UNPACK };                // q = {>>{v}} (11.4.14.3): e cut into elements
 enum class IK {
     Assign,     // sig = e            (blocking)
     Nba,        // sig <= e           (non-blocking)
@@ -149,7 +150,7 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     if (e->op == Op::Ref) add(e->sig);
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) add(e->sig);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits) add(e->sig);
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 // Does e read an automatic variable (a relative id)?

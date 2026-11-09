@@ -278,6 +278,19 @@ inline void dynExec(const Instr& i) {
             });
             break;
         }
+        case D_UNPACK: {   // the stream e, cut into elements from the left; the last is padded on the right
+            Val v = eval(i.e, rd);
+            int ew = d.dflt.w, W = v.w;
+            d.vec.clear();
+            for (int hi = W - 1; hi >= 0; hi -= ew) {
+                int lo = hi - ew + 1;
+                Val el = lo >= 0 ? v_slice(v, hi, lo) : v_concat({v_slice(v, hi, 0), make(0, 0, -lo, 0)});
+                el.sgn = d.dflt.sgn;
+                d.vec.push_back(el);
+                if (full()) { d.vec.pop_back(); break; }
+            }
+            break;
+        }
         case D_SORT_BY:
         case D_RSORT_BY: {   // order d by the keys in dsrc, one per element
             bool down = i.dcmd == D_RSORT_BY;
