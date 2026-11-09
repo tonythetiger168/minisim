@@ -36,3 +36,33 @@ execute_process(COMMAND ${PY} ${SRC}/tools/mregress.py ${SRC}/tests/cov/cov.list
 if(NOT rc EQUAL 0 OR NOT out MATCHES "Total +100\\.0% +9/9" OR NOT EXISTS ${OUT}/rg/cov.json)
   message(FATAL_ERROR "mregress -cov (rc ${rc})\n${out}${err}")
 endif()
+
+# msim -compile -cov: the generated code counts the same hits, so the
+# database reports the same as the interpreter's (s1.json above). A second
+# run reuses the build (the build cache in -o) and gets another seed.
+foreach(run 1 2)
+  execute_process(COMMAND ${MSIM} -compile -o cdir ${SV} +define+SEL=1 -cov c${run}.json -seed ${run}
+                  WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_QUIET ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0 OR NOT EXISTS ${OUT}/c${run}.json)
+    message(FATAL_ERROR "msim -compile -cov exited ${rc}: ${err}")
+  endif()
+endforeach()
+execute_process(COMMAND ${MCOV} report s1.json WORKING_DIRECTORY ${OUT} OUTPUT_VARIABLE interp)
+execute_process(COMMAND ${MCOV} report c2.json WORKING_DIRECTORY ${OUT} OUTPUT_VARIABLE comp)
+string(REGEX REPLACE "[^\n]*run\\(s\\)\n" "" interp "${interp}")
+string(REGEX REPLACE "[^\n]*run\\(s\\)\n" "" comp "${comp}")
+if(NOT interp STREQUAL comp)
+  message(FATAL_ERROR "-compile coverage differs from the interpreter's\n--- interpreter\n${interp}--- compiled\n${comp}")
+endif()
+
+# mcov loads many databases in parallel worker processes; the result is the
+# same as one at a time.
+execute_process(COMMAND ${MCOV} merge s1.json s3.json s1.json s3.json s1.json s3.json s1.json s3.json -j 4 -o par.json
+                WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_QUIET)
+execute_process(COMMAND ${MCOV} merge s1.json s3.json s1.json s3.json s1.json s3.json s1.json s3.json -j 1 -o ser.json
+                WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc2 OUTPUT_QUIET)
+file(READ ${OUT}/par.json par)
+file(READ ${OUT}/ser.json ser)
+if(NOT rc EQUAL 0 OR NOT rc2 EQUAL 0 OR NOT par STREQUAL ser)
+  message(FATAL_ERROR "mcov merge -j 4 differs from -j 1")
+endif()
