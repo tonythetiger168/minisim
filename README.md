@@ -27,6 +27,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches; see [`docs/UVM.md`](docs/UVM.md)
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
+- **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
 ## Layout
@@ -358,6 +359,24 @@ mdft: 5 flops in 3 clock domains
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
 boundaries.
+
+### Virtual prototypes: `-mvp`
+
+A memory, a peripheral, or a whole subsystem can be a program instead of RTL,
+so software and design meet before the RTL is finished. The design drives an
+AXI4-Lite port and the model answers in C or C++:
+
+```sh
+msim -mvp soc_tb.sv my_model.c -top soc_tb
+```
+
+`-mvp` adds `mvp.sv` (`mvp_axil_slave`, `mvp_irq_slave`, `mvp_clock`) and the
+runtime that keeps the memory map, the interrupt lines and the models' time.
+A model is ordinary C against [`include/mvp.h`](include/mvp.h):
+`mvp_add_device` to join the map, `mvp_after_ps` to take time, `mvp_set_irq`
+to interrupt, `mvp_bus_read` / `mvp_bus_write` to be a master. A TLM-2.0
+target goes behind the same bridge with `mvp_tlm.h`. A memory and a 16550-style
+UART are bundled in `mvp/models/`. See [docs/VPROTO.md](docs/VPROTO.md).
 
 ## Known limits
 
