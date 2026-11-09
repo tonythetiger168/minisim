@@ -85,6 +85,7 @@ struct Item {
     std::vector<int> vars;    // the variables it reads
     bool on = true;
     int prio = 0;             // soft: higher wins (18.5.13.1)
+    std::vector<int> fnVars;  // the variables its function calls read (18.5.12)
 };
 
 struct Ctx {
@@ -318,8 +319,57 @@ inline AV aeval(const E& e, bool& exact) {
     }
 }
 
+// The signals an expression of a constraint's function call reads, except
+// the callee's result (in the frame the call returned from, gone by now).
+inline void fnAddrs(const E& e, std::vector<int>& out) {
+    if (!e) return;
+    auto ret = [](int s) { return isRel(s) && (s >> kRelOffBits & 15) == kRelRet; };
+    if (e->op == Op::Ref && !e->at) { if (!ret(e->sig)) out.push_back(R(e->sig)); }
+    else if (e->op == Op::Ref) { collectAddrs(e, out); return; }
+    else if (e->op == Op::ArrRead) { if (!ret(e->arr->base)) for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base) + i); }
+    for (auto& k : e->kids) fnAddrs(k, out);
+}
+
+// Run item k's function calls (18.5.12) with the values its variables have
+// now. False, running nothing, while one of them has no single value yet.
+inline bool runFns(Item& k) {
+    for (int vi : k.fnVars) {
+        const Var& v = g_ctx->vars[(size_t)vi];
+        if (!v.set && v.lo != v.hi) return false;
+    }
+    std::vector<std::pair<int, Val>> old;
+    for (int vi : k.fnVars) {
+        const Var& v = g_ctx->vars[(size_t)vi];
+        i128 x = v.set ? v.val : v.lo;
+        old.push_back({v.addr, S.get(v.addr)});
+        S.set(v.addr, make(v.w >= 64 ? (uint64_t)x : (uint64_t)x & ((1ULL << v.w) - 1), 0, v.w, 0, v.sgn));
+    }
+    Frame* sf = g_fr;
+    Frame* sr = g_ret;
+    g_fr = k.fr;
+    FrameP fp(k.fr, [](Frame*) {});   // the item's frame, owned by randomize()
+    for (const auto& p : k.it->fns) {
+        auto ctl = std::make_shared<ProcCtl>();
+        Task t = exec(p.get(), ctl, fp);
+        t.h.resume();
+        if (!t.h.done()) {
+            cerr << "error: a function called in a constraint waited (time " << S.now << ")\n";
+            exit(1);
+        }
+        t.h.destroy();
+    }
+    g_fr = sf;
+    g_ret = sr;
+    for (auto& [a, v] : old) S.set(a, v);
+    return true;
+}
+
 // Can item k still be true (and must it be: *sure)?
 inline bool itemOk(Item& k, bool* sure = nullptr) {
+    if (!k.it->fns.empty() && !runFns(k)) {   // not known until its calls run
+        if (sure) *sure = false;
+        return true;
+    }
     Frame* saved = g_fr;
     g_fr = k.fr;
     bool ok = true;
@@ -853,6 +903,16 @@ static int doRandomize(int obj, const RandCall* rc) {
                     x.e = rw(it.e);
                     x.guard = rw(it.guard);
                     for (auto& d : x.dist) { d.lo = rw(d.lo); d.hi = rw(d.hi); d.weight = rw(d.weight); }
+                    for (auto& fp : x.fns) {   // function arguments: loop indices, rand array elements
+                        auto q = std::make_shared<Prog>(*fp);
+                        for (Instr& ins : q->code) {
+                            ins.e = rw(ins.e);
+                            for (E& y : ins.args) y = rw(y);
+                            for (auto& in : ins.init) in.second = rw(in.second);
+                            ins.self = rw(ins.self);
+                        }
+                        fp = std::move(q);
+                    }
                     if (rw.dropped) continue;
                     owned.push_back(std::move(x));
                     use = &owned.back();
@@ -880,6 +940,20 @@ static int doRandomize(int obj, const RandCall* rc) {
                 collectAddrs(d.lo, a);
                 if (d.hi) collectAddrs(d.hi, a);
             }
+            // What its function calls read: their arguments (18.5.12).
+            std::vector<int> fa;
+            for (const auto& p : it.it->fns)
+                for (const Instr& ins : p->code) {
+                    if (ins.e) fnAddrs(ins.e, fa);
+                    for (const E& x : ins.args) fnAddrs(x, fa);
+                    for (const auto& in : ins.init) fnAddrs(in.second, fa);
+                    fnAddrs(ins.self, fa);
+                }
+            for (int s : fa)
+                if (auto f = ctx.idx.find(s); f != ctx.idx.end()) it.fnVars.push_back(f->second);
+            std::sort(it.fnVars.begin(), it.fnVars.end());
+            it.fnVars.erase(std::unique(it.fnVars.begin(), it.fnVars.end()), it.fnVars.end());
+            a.insert(a.end(), fa.begin(), fa.end());
             std::sort(a.begin(), a.end());
             a.erase(std::unique(a.begin(), a.end()), a.end());
             for (int s : a)
@@ -917,6 +991,9 @@ static int doRandomize(int obj, const RandCall* rc) {
                 }
             }
         }
+        // Function arguments before the other variables of their constraint (18.5.12).
+        for (auto& it : ctx.items)
+            for (int v : it.fnVars) rank[(size_t)v] = std::min(rank[(size_t)v], 0);
         if (pass == 1)   // sizes before everything else (18.4)
             for (int ci : sizeVars) rank[(size_t)ctx.idx.at(conts[(size_t)ci].sizeFr->base)] = -1;
         for (int r = -1; r <= 2; r++)
