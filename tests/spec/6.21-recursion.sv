@@ -1,6 +1,5 @@
 // IEEE 1800-2023 6.21: An automatic function can call itself; each call has
 // its own variables (6.21, 13.4.2).
-//! xfail: recursion is an error
 module top;
   function automatic int fact(int n);
     if (n <= 1) return 1;
