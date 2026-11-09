@@ -24,6 +24,8 @@
 #include <array>
 #include <bit>
 #include <charconv>
+#include <chrono>
+#include <climits>
 #include <functional>
 #include <map>
 #include <queue>
@@ -40,6 +42,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
+#include "cpu.hpp"
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
@@ -70,10 +73,20 @@ struct Task {
 // 20 was slower than 8, and 24 or more was 5-50x slower, because one
 // descheduled thread holds up every batch. -threads N still picks any count
 // up to the hardware threads.
+// Counting physical cores, not hardware threads: an SMT sibling shares its
+// core's execution units, and on a hybrid part the E cores are slower and
+// hold up every batch (cpu.hpp). So the default is one thread per P core
+// (every core when not hybrid), at most 8; -threads N goes up to every
+// logical CPU, siblings last.
 inline int defaultThreads() {
-    int hw = (int)thread::hardware_concurrency();
-    return hw < 1 ? 1 : (hw > 8 ? 8 : hw);
+    int n = cpuTopo().fastCores();
+    return n < 1 ? 1 : (n > 8 ? 8 : n);
 }
+inline int maxThreads() { return std::max(1, cpuTopo().logical()); }
+// Pin pool thread k to cpuTopo().order[k] (msim -no-pin turns it off): the
+// same items of a batch then stay in the same core's cache, and N threads sit
+// on N distinct physical cores.
+inline bool g_pin = true;
 
 struct Pool {
     // Each thread starts on its own contiguous range of a batch (so the same
@@ -101,12 +114,20 @@ struct Pool {
     Job job = nullptr;             // written before a batch is published, read after a claim
     void* ctx = nullptr;
     atomic<bool> stop{false};
+    atomic<int> active{1};         // threads taking part in the current batch
     int size() const { return (int)ts.size() + 1; }
+    bool pinned = false;
+    static void pinSelf(int id) {
+        const auto& o = cpuTopo().order;
+        if (!o.empty()) pinToCpu(o[(size_t)id % o.size()]);
+    }
     void ensure(int n) {
         n = std::min(n, kMaxThreads);
+        if (g_pin && n > 1 && !pinned) { pinned = true; pinSelf(0); }
         while ((int)ts.size() < n - 1) {
             int id = (int)ts.size() + 1;
-            ts.emplace_back([this, id] { worker(id); });
+            bool pin = pinned;
+            ts.emplace_back([this, id, pin] { if (pin) pinSelf(id); worker(id); });
         }
     }
     ~Pool() {
@@ -136,7 +157,8 @@ struct Pool {
         }
     }
     void work(int id, uint32_t b) {
-        int T = size();
+        int T = active.load(memory_order_relaxed);
+        if (id >= T) return;
         for (int k = 0; k < T; k++)
             if (!drain(slots[(id + k) % T], b)) return;
     }
@@ -148,7 +170,10 @@ struct Pool {
             while ((g = gen.load(memory_order_acquire)) == seen) {
                 // Spin for the next batch; yield, which lets any other
                 // runnable thread have the CPU; then sleep.
-                if (++spins < 4000) relax();
+                // A thread left out of the last batch sleeps at once, so it
+                // does not spin on an SMT sibling of a thread that is working.
+                if (id >= active.load(memory_order_relaxed)) gen.wait(seen);
+                else if (++spins < 4000) relax();
                 else if (spins < 20000) this_thread::yield();
                 else gen.wait(seen);
             }
@@ -162,9 +187,11 @@ struct Pool {
         __builtin_ia32_pause();
 #endif
     }
-    void run(size_t n, Job j, void* c) {
+    // Run items [0, n) on the first `use` threads (0: all of them).
+    void run(size_t n, Job j, void* c, int use = 0) {
         uint32_t b = (uint32_t)(gen.load(memory_order_relaxed) + 1);
-        size_t T = (size_t)size();
+        size_t T = (size_t)(use > 0 && use < size() ? use : size());
+        active.store((int)T, memory_order_relaxed);
         job = j;
         ctx = c;
         total.store(n, memory_order_relaxed);
@@ -276,16 +303,52 @@ struct Sim {
     static constexpr size_t kMinParallel = 32;
     static inline thread_local bool tlInPar = false;   // inside a parallelFor task
     Pool pool;
+    // `use`: run on at most this many threads (0: `threads`).
     template <class F>
-    void parallelFor(size_t n, F&& f) {
+    void parallelFor(size_t n, F&& f, int use = 0) {
         // A small batch is cheaper on this thread than a wake-up of the pool.
         // Nested (a task that calls parallelFor) runs on its own thread.
-        if (threads <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
+        int T = use > 0 ? std::min(use, threads) : threads;
+        if (T <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
         pool.ensure(threads);
         tlInPar = true;
-        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f);
+        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f, T);
         tlInPar = false;
     }
+
+    // Picks the thread count of one repeated parallel step by measuring it:
+    // each candidate (1, 2, 4, ... up to `threads`) runs kTry steps, the
+    // fastest is used for the next kKeep, then they are measured again. A
+    // step of a few microseconds is slower on 8 threads than on 2 (the batch
+    // hand-off costs more than the work), and the best count depends on the
+    // machine (cores, SMT, P/E cores) and the design, so no fixed default
+    // fits. Results never depend on it: only the speed does.
+    struct Tuner {
+        static constexpr int kTry = 256, kKeep = 1 << 16;
+        int cand = 0, n = 0, best = 1;   // cand: index into 1, 2, 4, ...; -1 = exploiting
+        int64_t sum = 0, bestNs = INT64_MAX;
+        std::chrono::steady_clock::time_point t0;
+        int pick(int maxT) {
+            if (maxT <= 1) return 1;
+            if (cand < 0) {
+                if (++n < kKeep) return best;
+                cand = 0; n = 0; sum = 0; bestNs = INT64_MAX;   // re-measure
+            }
+            t0 = std::chrono::steady_clock::now();
+            return std::min(1 << cand, maxT);
+        }
+        void done(int maxT) {
+            if (maxT <= 1 || cand < 0) return;
+            sum += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (++n < kTry) return;
+            int t = std::min(1 << cand, maxT);
+            if (sum < bestNs) { bestNs = sum; best = t; }
+            n = 0; sum = 0;
+            if (t >= maxT) { cand = -1; return; }
+            cand++;
+        }
+    };
+    Tuner domainTune[3];   // cycle domain (codegen.hpp): fused step, NBA compute, commit
 
     // ---- static combinational schedule (prog.hpp: combShape / combSchedule) ----
     // combs[r] is the process of rank r. Ranks are in topological order and

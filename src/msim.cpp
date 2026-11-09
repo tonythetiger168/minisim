@@ -25,8 +25,12 @@
 //   -no-partition    apply every NBA on the main thread (no partition tasks)
 //   -no-2state       -compile without the 2-state fast path (codegen.hpp fast())
 //   -no-cycle        -compile without the cycle domain (codegen.hpp cycleDomain())
-//   -threads <n>     worker threads (default: every hardware thread). Results
-//                    are the same for any n; -threads 1 is single-threaded.
+//   -threads <n>     worker threads (default: one per physical P core, at most
+//                    8; cpu.hpp). `-threads all` uses every logical CPU, SMT
+//                    siblings included. Results are the same for any n.
+//   -no-pin          let the OS place the worker threads (default: thread k is
+//                    pinned to a distinct physical core, SMT siblings last)
+//   -cpuinfo         print the detected CPU topology and exit
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
 //   -O<n>            optimization level for -compile (default -O2)
 //
@@ -244,6 +248,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
     run += " -threads " + std::to_string(threads);
+    if (!g_pin) run += " -no-pin";
     std::cout.flush();
     int st = std::system(run.c_str());
     if (st == -1) return 1;
@@ -340,7 +345,9 @@ static void usage() {
                  "  -compile       generate C++, build it (<dir>/simv) and run it\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
-                 "  -threads <n>   worker threads (default: all hardware threads)\n"
+                 "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
+                 "  -no-pin        do not pin worker threads to cores\n"
+                 "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  -version       print the msim version\n"
                  "  --help-slang   list every front-end option\n";
@@ -375,14 +382,23 @@ int main(int argc, char** argv) {
         if (a == "-no-partition") { staticPart = false; continue; }
         if (a == "-no-2state") { twoState = false; continue; }
         if (a == "-no-cycle") { cycle = false; continue; }
+        if (a == "-no-pin") { g_pin = false; continue; }
+        if (a == "-cpuinfo") {
+            const CpuTopo& t = cpuTopo();
+            std::cout << t.describe() << "\ndefault -threads " << defaultThreads() << "\nplacement:";
+            for (int c : t.order) std::cout << ' ' << c;
+            std::cout << "\n";
+            return 0;
+        }
         if (a == "-threads") {
             std::string n = next("a thread count");
+            if (n == "all") { threads = maxThreads(); continue; }
             try { threads = std::stoi(n); }
             catch (...) { std::cerr << "msim: bad -threads " << n << "\n"; return 2; }
             if (threads < 1) { std::cerr << "msim: -threads must be at least 1\n"; return 2; }
             // More threads than hardware threads only adds waiting: a batch
             // cannot finish until a descheduled worker runs again.
-            int hw = (int)std::thread::hardware_concurrency();
+            int hw = maxThreads();
             if (hw > 0 && threads > hw) {
                 std::cerr << "msim: -threads " << threads << " is more than the " << hw
                           << " hardware threads; using " << hw << "\n";
