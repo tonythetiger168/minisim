@@ -300,7 +300,13 @@ struct Sim {
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
     // Postponed region, after NBA and before time advances. `mon` marks the
     // single $monitor slot; anything else is a $strobe, in schedule order.
-    struct Post { bool mon = false; string fmt; vector<E> args; };
+    // A postponed print: $strobe, $monitor (mon), or to a file with $fstrobe /
+    // $fmonitor (file, fd; fmon is the $fmonitor's index).
+    struct Post { bool mon = false; string fmt; vector<E> args; bool file = false; uint32_t fd = 0; int fmon = -1; };
+    // $fmonitor (21.3.2): any number can be active at once; $fclose of the
+    // descriptor ends one (on = false).
+    struct FMon { bool on = true, queued = false; uint32_t fd; string fmt; vector<E> args; vector<int> watch; };
+    vector<FMon> fmons;
     deque<Post> postq;
     // The reactive region set (4.4.2.6-4.4.2.8): reactive, re-inactive
     // (#0 from the reactive region) and re-NBA. Assertion action blocks run
@@ -354,8 +360,23 @@ struct Sim {
     vector<uint32_t> fstH;                           // FST handle per signal (0: not dumped)
     string fstBuf;
     bool waving() const { return vcd.is_open() || fst != nullptr; }
+    // VCD tasks (21.7.1). msim -vcd dumps every signal from time 0 and the
+    // design's $dumpfile / $dumpvars are ignored; without -vcd, $dumpvars
+    // opens $dumpfile's file (default dump.vcd) at the end of its time slot,
+    // with the selected signals. $dumpoff / $dumpon / $dumpall / $dumpflush /
+    // $dumplimit work on either.
+    bool dumpCli = false, dumpPend = false, dumpOff = false, dumpStopped = false;
+    string dumpFile = "dump.vcd";
+    vector<char> dumpSel;                            // empty: every signal
+    uint64_t dumpLimit = 0;                          // bytes; 0: no limit
+    bool dumped(size_t i) const {
+        return !sigs[i].hide && (dumpSel.empty() || (i < dumpSel.size() && dumpSel[i]));
+    }
 
-    Sim() { g_sformat = &Sim::sformat; }
+    Sim() {
+        g_sformat = &Sim::sformat;
+        g_fcloseHook = &Sim::closeHook;
+    }
 
     // ---- multi-core: deterministic parallel batches ----
     // `threads` workers (default: defaultThreads(); msim -threads N).
@@ -592,7 +613,7 @@ struct Sim {
             }
             return;
         }
-        if (parts.empty() || waving() || mon.on || g_cov) {
+        if (parts.empty() || waving() || mon.on || !fmons.empty() || g_cov) {
             // Partial writes merge into the value as it is *now*, so two NBAs to
             // different bits of one reg in the same slot both take effect.
             for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
@@ -680,6 +701,7 @@ struct Sim {
         quiet.assign(sigs.size(), 1);
         for (size_t s = 0; s < sigs.size(); s++) {
             if (sigs[s].w > 64 || sigs[s].net && sigs[s].drv.empty()) quiet[s] = 0;
+            if (s < tranOf.size() && !tranOf[s].empty()) quiet[s] = 0;   // a tran net: drive() resolves its group
             if (s < seqOf.size())
                 if (!seqOf[s].empty()) quiet[s] = 0;   // a clock: set() detects its edges
             if (s < combOf.size())
@@ -804,6 +826,7 @@ struct Sim {
         g.drv[d].v = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
+        if (__builtin_expect(!tranOf.empty(), 0) && (size_t)s < tranOf.size() && !tranOf[(size_t)s].empty()) { tranResolve(s); return; }
         // One driver that drives both 0 and 1 resolves to its own value
         // (X stays X, Z stays Z). Skip the per-bit strength walk.
         Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
@@ -814,6 +837,87 @@ struct Sim {
             if (nd != netDelay.end()) { schedule(s, -1, r, g.val, nd->second, STR_STRONG, STR_STRONG); return; }
         }
         set(s, r);
+    }
+    // Bidirectional switches (28.8). Nets joined by switches that are on form
+    // one group; every net in it takes the resolution of all the group's
+    // drivers. A driver seen through a switch is reduced (28.13.1): supply
+    // becomes strong through a tran, and each rtran lowers it one more step.
+    // A switch with an X or Z control is resolved both ways: bits that
+    // differ become X.
+    struct TranSw { int a, b; bool resist; int state = -1; };   // state: 0 off, 1 on, 2 unknown
+    vector<TranSw> trans;
+    vector<vector<int>> tranOf;   // net -> its switches
+    void addTran(int a, int b, bool resist) {
+        if (tranOf.size() != sigs.size()) tranOf.resize(sigs.size());
+        tranOf[(size_t)a].push_back((int)trans.size());
+        tranOf[(size_t)b].push_back((int)trans.size());
+        trans.push_back({a, b, resist});
+    }
+    void tranCtl(int id, int st) {
+        if (trans[(size_t)id].state == st) return;
+        trans[(size_t)id].state = st;
+        tranResolve(trans[(size_t)id].a);
+        tranResolve(trans[(size_t)id].b);
+    }
+    static uint8_t tranReduce(uint8_t s, bool resist) {
+        static const uint8_t r[8] = {STR_HIZ, STR_SMALL, STR_SMALL, STR_MEDIUM, STR_MEDIUM, STR_WEAK, STR_PULL, STR_PULL};
+        if (resist) return r[s & 7];
+        return s == STR_SUPPLY ? STR_STRONG : s;
+    }
+    // The value net n sees: the drivers of every net it reaches through
+    // switches that are on (and, when unkOn, those with an unknown control).
+    Val tranValue(int n, bool unkOn, vector<int>& seen) {
+        // Best path to each net: the fewest resistive steps, then any switch at all.
+        map<int, pair<int, bool>> best;   // net -> (resistive steps, crossed a switch)
+        deque<int> q{n};
+        best[n] = {0, false};
+        while (!q.empty()) {
+            int m = q.front(); q.pop_front();
+            auto [k, crossed] = best[m];
+            for (int id : tranOf[(size_t)m]) {
+                const TranSw& t = trans[(size_t)id];
+                if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
+                int o = t.a == m ? t.b : t.a;
+                pair<int, bool> nb{k + (t.resist ? 1 : 0), true};
+                auto it = best.find(o);
+                if (it != best.end() && it->second.first <= nb.first) continue;
+                best[o] = nb;
+                q.push_back(o);
+            }
+        }
+        vector<Drv> all;
+        for (auto& [m, kc] : best) {
+            seen.push_back(m);
+            for (Drv d : sigs[(size_t)m].drv) {
+                if (kc.second) {
+                    d.s0 = tranReduce(d.s0, false);
+                    d.s1 = tranReduce(d.s1, false);
+                }
+                for (int r = 0; r < kc.first; r++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                all.push_back(d);
+            }
+        }
+        const Sig& g = sigs[(size_t)n];
+        return g.kind != NR_WIRE ? resolveNet(g.kind, all.data(), all.size(), g.w, g.val)
+                                 : resolveDrives(all.data(), all.size(), g.w);
+    }
+    void tranResolve(int s) {
+        vector<int> group, scratch;
+        Val v = tranValue(s, true, group);
+        bool unknown = false;
+        for (int m : group)
+            for (int id : tranOf[(size_t)m]) if (trans[(size_t)id].state == 2) unknown = true;
+        vector<pair<int, Val>> vals;
+        for (int m : group) {
+            Val on = m == s ? v : tranValue(m, true, scratch);
+            if (unknown) {
+                Val off = tranValue(m, false, scratch);
+                for (int b = 0; b < sigs[(size_t)m].w; b++)
+                    if (bitAt(on, b) != bitAt(off, b)) setBit(on, b, 2);
+            }
+            vals.push_back({m, on});
+        }
+        for (auto& [m, val] : vals) set(m, val);
     }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
@@ -1212,19 +1316,28 @@ struct Sim {
                     if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
                     return fmtVal('d', v, 0, true);
                 };
-                const DynObj& o = dynStore()[h->sig];
-                cout << "'{";
-                if (o.kind == 2) {
-                    bool first = true;
-                    for (const auto& [k, v] : o.map) {
-                        if (!first) cout << ", ";
-                        first = false;
-                        cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':' << one(v, style);
+                // A container of containers prints each element container nested.
+                std::function<void(const DynObj&)> show = [&](const DynObj& o) {
+                    auto el = [&](const Val& v) {
+                        if (!o.elem) { cout << one(v, style); return; }
+                        if (v.x || !v.v) { cout << "'{}"; return; }
+                        show(dynStore()[(int)v.v]);
+                    };
+                    cout << "'{";
+                    if (o.kind == 2) {
+                        bool first = true;
+                        for (const auto& [k, v] : o.map) {
+                            if (!first) cout << ", ";
+                            first = false;
+                            cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':';
+                            el(v);
+                        }
+                    } else {
+                        for (size_t k = 0; k < o.vec.size(); k++) { if (k) cout << ", "; el(o.vec[k]); }
                     }
-                } else {
-                    for (size_t k = 0; k < o.vec.size(); k++) cout << (k ? ", " : "") << one(o.vec[k], style);
-                }
-                cout << '}';
+                    cout << '}';
+                };
+                show(dynStore()[R(h->sig)]);   // R: a property through a handle, or an automatic container
                 continue;
             }
             if ((c == 't' || c == 'T') && ai < args.size()) {   // %t (20.4.3): ticks, printed per $timeformat
@@ -1276,7 +1389,49 @@ struct Sim {
         for (const auto& a : args) collectRefs(a, mon.watch);
         queueMon();
     }
+    static void closeHook(uint32_t fd);
+    void strobeF(uint32_t fd, const string& fmt, const vector<E>& args) {
+        Post p{false, fmt, args, true, fd};
+        postq.push_back(std::move(p));
+    }
+    void queueFMon(size_t k) {
+        FMon& m = fmons[k];
+        if (!m.on || m.queued) return;
+        Post p{false, m.fmt, m.args, true, m.fd, (int)k};
+        postq.push_back(std::move(p));
+        m.queued = true;
+    }
+    void armFMon(uint32_t fd, const string& fmt, const vector<E>& args) {
+        FMon m;
+        m.fd = fd;
+        m.fmt = fmt;
+        m.args = args;
+        for (const auto& a : args) collectRefs(a, m.watch);
+        fmons.push_back(std::move(m));
+        observed = true;
+        queueFMon(fmons.size() - 1);
+    }
+    // $fclose: the closed descriptor's pending $fstrobe / $fmonitor lines and
+    // its $fmonitors end. Closing channels of a multichannel descriptor drops
+    // them from it.
+    void fileClosed(uint32_t fd) {
+        auto left = [&](uint32_t d) -> uint32_t {
+            if ((fd & 0x80000000u) || (d & 0x80000000u)) return d == fd ? 0 : d;
+            return d & ~(fd & ~1u);   // channel 0 (stdout) is never closed
+        };
+        for (auto& m : fmons) if (m.on && !(m.fd = left(m.fd))) m.on = false;
+        for (auto it = postq.begin(); it != postq.end();) {
+            if (it->file && !(it->fd = left(it->fd))) {
+                if (it->fmon >= 0) fmons[(size_t)it->fmon].queued = false;
+                it = postq.erase(it);
+            } else ++it;
+        }
+    }
     void noteChange(int s) {
+        if (__builtin_expect(!fmons.empty(), 0))
+            for (size_t k = 0; k < fmons.size(); k++)
+                if (fmons[k].on && !fmons[k].queued)
+                    for (int w : fmons[k].watch) if (w == s) { queueFMon(k); break; }
         if (!mon.on || mon.queued) return;
         for (int w : mon.watch) if (w == s) { queueMon(); return; }
     }
@@ -1285,6 +1440,11 @@ struct Sim {
             Post p = move(postq.front());
             postq.pop_front();
             if (p.mon) mon.queued = false;
+            if (p.file) {
+                if (p.fmon >= 0) fmons[(size_t)p.fmon].queued = false;
+                fileWrite(p.fd, sformat(p.fmt, p.args, [&](int s) { return get(s); }) + "\n");
+                continue;
+            }
             printSys(p.fmt, p.args);
         }
     }
@@ -1331,14 +1491,128 @@ struct Sim {
         if (sigs[s].hide) return;
 #ifdef MINISIM_FST
         if (fst) {
+            if (dumpOff || !dumped((size_t)s)) return;
             if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; }
             writeVal(s);
             return;
         }
 #endif
         if (!vcd.is_open() || !vcd) return;
-        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
+        if (dumpOff || dumpStopped || !dumped((size_t)s)) return;
+        stamp();
         writeVal(s);
+        if (dumpLimit && (uint64_t)vcd.tellp() >= dumpLimit) {
+            vcd << "$comment Note: $dumplimit reached; dumping stops $end\n";
+            dumpStopped = true;
+        }
+    }
+    void stamp() {
+#ifdef MINISIM_FST
+        if (fst) { if (lastDump != now) { fstWriterEmitTimeChange((fstWriterContext*)fst, now); lastDump = now; } return; }
+#endif
+        if (lastDump != now) { vcd << "#" << now << "\n"; lastDump = now; }
+    }
+    // Every dumped signal, as X ($dumpoff) or its value ($dumpon, $dumpall).
+    void dumpBlock(const char* kw, bool asX) {
+        stamp();
+        if (!fst) vcd << kw << "\n";
+        for (size_t i = 0; i < sigs.size(); i++) {
+            if (!dumped(i)) continue;
+            if (!asX) { writeVal((int)i); continue; }
+            Val keep = sigs[i].val;
+            sigs[i].val = allx(sigs[i].w);
+            writeVal((int)i);
+            sigs[i].val = keep;
+        }
+        if (!fst) vcd << "$end\n";
+    }
+    // Selects signals for $dumpvars: sel holds name prefixes of scopes
+    // (levels deep, 0 = all below) and exact names of variables.
+    void dumpSelect(int64_t levels, const vector<pair<string, bool>>& sel) {
+        if (dumpSel.size() != sigs.size()) dumpSel.assign(sigs.size(), 0);
+        vector<pair<string, bool>> all;
+        if (sel.empty()) all.push_back({"", false});
+        const auto& use = sel.empty() ? all : sel;
+        if (levels < 0) levels = 0;
+        for (size_t i = 0; i < sigs.size(); i++) {
+            const string& n = sigs[i].name;
+            for (const auto& [p, var] : use) {
+                if (n.compare(0, p.size(), p) != 0) continue;
+                if (var) {
+                    if (n.size() == p.size() || n[p.size()] == '[') { dumpSel[i] = 1; break; }
+                    continue;
+                }
+                if (p.find("::") == string::npos && n.find("::") != string::npos && !sel.empty()) continue;
+                int depth = 0, br = 0;
+                for (size_t k = p.size(); k < n.size(); k++) {
+                    if (n[k] == '[') br++;
+                    else if (n[k] == ']') br--;
+                    else if (n[k] == '.' && !br) depth++;
+                }
+                if (levels == 0 || depth < levels) { dumpSel[i] = 1; break; }
+            }
+        }
+    }
+    void dumpTask(int cmd, const string& str, int64_t num, const vector<pair<string, bool>>& sel) {
+        switch (cmd) {
+            case DC_FILE:
+                if (dumpCli || waving() || dumpPend) return;
+                if (!str.empty()) dumpFile = str;
+                return;
+            case DC_VARS:
+                if (dumpCli) return;
+                if (waving()) { cerr << "msim: $dumpvars after the dump has started is ignored (21.7.1.2)\n"; return; }
+                dumpPend = true;
+                rare = true;   // slotTail() opens the file at the end of this slot
+                if (sel.empty() && num < 0) { dumpSel.assign(sigs.size(), 1); return; }
+                dumpSelect(num, sel);
+                return;
+            case DC_OFF:
+                if (dumpOff) return;
+                dumpOff = true;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+                dumpBlock("$dumpoff", true);
+                return;
+            case DC_ON:
+                if (!dumpOff) return;
+                dumpOff = false;
+                if (!waving() || dumpStopped) return;
+#ifdef MINISIM_FST
+                if (fst) { stamp(); fstWriterEmitDumpActive((fstWriterContext*)fst, 1); }
+#endif
+                dumpBlock("$dumpon", false);
+                return;
+            case DC_ALL:
+                if (waving() && !dumpOff && !dumpStopped) dumpBlock("$dumpall", false);
+                return;
+            case DC_FLUSH:
+#ifdef MINISIM_FST
+                if (fst) { fstWriterFlushContext((fstWriterContext*)fst); return; }
+#endif
+                if (vcd.is_open()) vcd.flush();
+                return;
+            case DC_LIMIT:
+                dumpLimit = num > 0 ? (uint64_t)num : 0;
+                return;
+        }
+    }
+    // $dumpvars without -vcd: the header and the values at the end of the slot.
+    void startDump() {
+        dumpPend = false;
+        vcdPath = dumpFile;
+        header();
+        if (!waving()) return;
+        if (!fst) { vcd << "#" << now << "\n"; lastDump = now; }
+        dumpvars();
+        if (dumpOff) {
+#ifdef MINISIM_FST
+            if (fst) { fstWriterEmitDumpActive((fstWriterContext*)fst, 0); return; }
+#endif
+            dumpBlock("$dumpoff", true);
+        }
     }
     // set() only writes a line when a value changes, so a signal still holding
     // its starting value (cnt stays X until the first clock) never appears.
@@ -1349,14 +1623,14 @@ struct Sim {
         if (fst) {
             // FST has no $dumpvars block: the time-0 values are ordinary changes.
             fstWriterEmitTimeChange((fstWriterContext*)fst, now);
-            for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+            for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
             lastDump = now;
             return;
         }
 #endif
         if (!vcd.is_open() || !vcd) return;
         vcd << "$dumpvars\n";
-        for (size_t i = 0; i < sigs.size(); i++) if (!sigs[i].hide) writeVal((int)i);
+        for (size_t i = 0; i < sigs.size(); i++) if (dumped(i)) writeVal((int)i);
         vcd << "$end\n";
     }
 
@@ -1367,7 +1641,7 @@ struct Sim {
     // again; a variable keeps its value until it is next written.
     // force v[3:0] = e holds those bits only (SF_PART): other writes still
     // change the other bits.
-    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4 };
+    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8 };   // SF_VPI: a VPI value-change callback watches it
     struct PartHold { int hi, lo; E fe, ae; };
     struct Hold { E fe, ae; vector<PartHold> parts; };
     unordered_map<int, Hold> holds;
@@ -1482,6 +1756,14 @@ struct Sim {
         }
     }
 
+    // VPI (36-38): hooks set by vpi.inc. vpiChange runs the value-change
+    // callbacks of a signal; vpiRegion runs the callbacks of a point in the
+    // time slot (VR_*) and says whether any ran. vpiAt counts the
+    // cbAfterDelay callbacks due at each time, so that slot is not skipped.
+    enum { VR_START, VR_RW, VR_RO };
+    void (*vpiChange)(int) = nullptr;
+    bool (*vpiRegion)(int) = nullptr;
+    std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         if (__builtin_expect(sigs[s].fl & (SF_HELD | SF_PART), 0)) {
             if (sigs[s].fl & SF_HELD) return;   // forced: other writes are ignored
@@ -1499,6 +1781,7 @@ struct Sim {
         sigs[s].val = nv;
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
+        if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);
         bool neg = (o != 0 && n == 0) || (o == 1 && n != 1);
         // Wake matching waiters and compact the rest in place (no allocation).
@@ -1536,6 +1819,7 @@ struct Sim {
     // queued for any of them but postponed, so a design without assertions
     // or programs pays one flag test per pass.
     bool slotTail() {
+        if (vpiRegion && vpiRegion(VR_RW)) return true;   // cbReadWriteSynch (38.36.2)
         if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) { runObserved(); return true; }   // observed (4.4.2.5)
         if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
             // Once the reactive set starts, it runs until it is empty, and
@@ -1564,6 +1848,8 @@ struct Sim {
             drainPost();
             return true;
         }
+        if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
+        if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
         rare = false;
         return false;
@@ -1612,7 +1898,7 @@ struct Sim {
         struct Scope { string name; vector<size_t> vars; vector<Scope> kids; };
         Scope root{vcdTop.empty() ? string("top") : vcdTop, {}, {}};
         for (size_t i = 0; i < sigs.size(); i++) {
-            if (sigs[i].hide) continue;
+            if (!dumped(i)) continue;
             Scope* sc = &root;
             const string& n = sigs[i].name;
             size_t b = 0, e;
@@ -1669,13 +1955,13 @@ struct Sim {
         run(~0ULL, false);
     }
     void run(uint64_t end, bool start = true) {
-        if (start) { header(); dumpvars(); }
+        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); }
         if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty();
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t));
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
@@ -1683,6 +1969,7 @@ struct Sim {
             now = t;
             g_simTime = now;
             if (!freeVars.empty() && now && now != freeAt) { freeStep(); freeAt = now; }   // active free checker variables (17.7.2)
+            if (vpiRegion) vpiRegion(VR_START);   // cbNextSimTime, cbAtStartOfSimTime, cbAfterDelay
             if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
                 for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
                 sampledAt = now;
@@ -1717,6 +2004,7 @@ struct Sim {
 };
 
 Sim S;
+inline void Sim::closeHook(uint32_t fd) { S.fileClosed(fd); }
 
 // Frames and objects (expr.hpp): blocks of hidden signals made at run time.
 static int allocFrameSigs(const FrameLayout& L) {

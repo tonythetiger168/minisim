@@ -52,6 +52,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <iostream>
+#include <sys/wait.h>
 
 // One 64-bit limb of a wide value. v/x/z use the same encoding as Val.
 struct Limb {
@@ -821,6 +823,7 @@ struct DynObj {
     std::vector<Val> vec;
     std::map<DynKey, Val> map;
     Val dflt;                   // what a missing element reads as
+    std::shared_ptr<DynObj> elem;   // elements that are containers: their empty shape (an element holds the id)
     int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
     bool strKey = false;        // associative: string index
     int keyW = 64;
@@ -1247,6 +1250,37 @@ inline Val resolveNet(uint8_t k, const Drv* d, size_t n, int w, const Val& prev)
     return r;
 }
 inline Val resolveDrives(const Drv* d, size_t n, int w) {
+    // Every driver at one and the same strength for 0 and 1 (the usual case:
+    // several continuous assigns to parts of one net). Then per bit: no
+    // driver -> z; drivers that agree -> their value; disagreeing or x -> x.
+    // That is word-parallel, with no per-bit strength walk.
+    bool same = n > 0 && d[0].s0 == d[0].s1 && d[0].s0 != STR_HIZ;
+    for (size_t i = 1; i < n && same; i++) same = d[i].s0 == d[0].s0 && d[i].s1 == d[0].s0;
+    if (same) {
+        int L = w > 64 ? limbCount(w) : 1;
+        Val r = make(0, 0, w);
+        for (int j = 0; j < L; j++) {
+            uint64_t any0 = 0, any1 = 0, anyx = 0;
+            for (size_t i = 0; i < n; i++) {
+                const Val& a = d[i].v;
+                uint64_t v, x, z;
+                if (j == 0) { v = a.v; x = a.x; z = a.z; }
+                else if ((size_t)(j - 1) < a.hi.size()) { v = a.hi[j - 1].v; x = a.hi[j - 1].x; z = a.hi[j - 1].z; }
+                else { v = 0; x = ~0ULL; z = ~0ULL; }   // no bits here: undriven
+                any1 |= v & ~x & ~z;
+                any0 |= ~v & ~x & ~z;
+                anyx |= x & ~z;
+            }
+            int top = w - 64 * j;
+            uint64_t m = top >= 64 ? ~0ULL : (1ULL << top) - 1;
+            uint64_t bad = (anyx | (any0 & any1)) & m;
+            uint64_t none = ~(any0 | any1 | anyx) & m;
+            uint64_t rv = any1 & ~bad & m, rx = bad | none;
+            if (j == 0) { r.v = rv; r.x = rx; r.z = none; }
+            else { r.hi[j - 1].v = rv; r.hi[j - 1].x = rx; r.hi[j - 1].z = none; }
+        }
+        return finish(r);
+    }
     if (w > 64) {
         Val r = make(0, 0, w);
         for (int b = 0; b < w; b++) {
@@ -1327,11 +1361,14 @@ enum class Op {
     // reversed when lo > 0, then left-aligned into hi bits (hi < 0: as is).
     DynBits, StreamPack,
     DynHas,    // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
+    DynElemRef,   // element kids[0] of container sig, itself a container (7.5, 7.10): its id + 1, made if missing
+    ArrAddr,   // the signal id + 1 of element kids of array arr (0 when an index is outside it)
     // Classes (8). A handle is the first signal id of its object (0: null).
     This,      // the running method's `this`
     IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
     Addr,      // the signal id of slot `sig` of the object kids[0] names, or 0 for null
-    AddrOf     // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    VifSig     // 1 + the signal id of member hi of the interface instance the virtual interface kids[0] names, or 0 (25.9)
 };
 // System functions computed by Op::SysFn.
 enum SysFnId : int {
@@ -1368,7 +1405,19 @@ enum SysFnId : int {
     SF_OBJ_SRANDOM,  // obj.srandom(seed) (18.13.3): kid0 the object
     SF_OBJ_GETSTATE, // obj.get_randstate(): the generator state as a string
     SF_OBJ_SETSTATE, // obj.set_randstate(state)
-    SF_CG            // a covergroup operation (19): lo is the CgOp, run by g_cgHook
+    SF_CG,           // a covergroup operation (19): lo is the CgOp, run by g_cgHook
+    // ---- DPI / remaining-chapters thread ----
+    // $dist_* (20.14, Annex N): {new seed, value}, 64 bits, like SF_DIST_UNIFORM.
+    SF_DIST_NORMAL,      // (seed, mean, standard deviation)
+    SF_DIST_EXPONENTIAL, // (seed, mean)
+    SF_DIST_POISSON,     // (seed, mean)
+    SF_DIST_CHI_SQUARE,  // (seed, degrees of freedom)
+    SF_DIST_T,           // (seed, degrees of freedom)
+    SF_DIST_ERLANG,      // (seed, k, mean)
+    SF_SYSTEM,           // $system(command) (20.17): the shell's exit status
+    SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
+    SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
+    SF_FREAD_GET         // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
 };
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
 enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
@@ -1584,6 +1633,50 @@ inline int32_t rtlDistUniform(int32_t& seed, int32_t start, int32_t end) {
     return (int32_t)i;
 }
 inline int32_t& globalRandomSeed() { static int32_t s = 0; return s; }
+// The other Annex N distributions, in the same 32-bit arithmetic.
+inline double rtlNormal(int32_t& seed, int32_t mean, int32_t dev) {
+    double v1 = 0, v2 = 0, s = 1.0;
+    while (s >= 1.0 || s == 0.0) {
+        v1 = rtlUniform(seed, -1, 1);
+        v2 = rtlUniform(seed, -1, 1);
+        s = v1 * v1 + v2 * v2;
+    }
+    s = v1 * std::sqrt(-2.0 * std::log(s) / s);
+    return s * (double)dev + (double)mean;
+}
+inline double rtlExponential(int32_t& seed, int32_t mean) {
+    double n = rtlUniform(seed, 0, 1);
+    if (n != 0) n = -std::log(n) * mean;
+    return n;
+}
+inline int32_t rtlPoisson(int32_t& seed, int32_t mean) {
+    int32_t n = 0;
+    double p = std::exp(-(double)mean), q = rtlUniform(seed, 0, 1);
+    while (p < q) {
+        n++;
+        q = rtlUniform(seed, 0, 1) * q;
+    }
+    return n;
+}
+inline double rtlChiSquare(int32_t& seed, int32_t df) {
+    double x = 0.0;
+    if (df % 2) { x = rtlNormal(seed, 0, 1); x = x * x; }
+    for (int32_t k = 2; k <= df; k += 2) x = x + 2 * rtlExponential(seed, 1);
+    return x;
+}
+inline double rtlT(int32_t& seed, int32_t df) {
+    double chi2 = rtlChiSquare(seed, df);
+    double root = std::sqrt(chi2 / (double)df);
+    return rtlNormal(seed, 0, 1) / root;
+}
+inline double rtlErlang(int32_t& seed, int32_t k, int32_t mean) {
+    double x = 1.0;
+    for (int32_t i = 1; i <= k; i++) x = x * rtlUniform(seed, 0, 1);
+    return -(double)mean * std::log(x) / (double)k;
+}
+// Round half away from zero, as the rtl_dist_* wrappers do.
+inline int32_t rtlRound(double r) { return r >= 0 ? (int32_t)(r + 0.5) : -(int32_t)(-r + 0.5); }
+inline void rtlWarn(const char* what) { std::cerr << "WARNING: " << what << "\n"; }
 // $urandom: the generator is implementation-defined (18.13). minisim uses
 // one 64-bit xorshift* stream, seeded by -seed (default 1), so a run repeats.
 inline uint64_t& urandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
@@ -1633,6 +1726,20 @@ inline void fileWrite(uint32_t fd, const std::string& t) {
         if ((fd >> b) & 1 && files().mcd[b]) fwrite(t.data(), 1, t.size(), files().mcd[b]);
 }
 inline std::string& scanText() { static std::string s; return s; }
+inline std::string& freadBuf() { static std::string s; return s; }
+// $fclose cancels the $fstrobe / $fmonitor output to the closed descriptor (21.3.1).
+inline void (*g_fcloseHook)(uint32_t fd) = nullptr;
+// The first n bytes of `b` (zero past its end) as an unsigned big-endian value of w bits.
+inline Val bytesValue(const std::string& b, size_t n, int w) {
+    int bw = (int)n * 8;
+    Val v = make(0, 0, std::max(bw, 1), 0, false);
+    if (bw > 64) v = maskWidth(v, bw);
+    for (size_t k = 0; k < n; k++) {
+        unsigned char c = k < b.size() ? (unsigned char)b[k] : 0;
+        for (int j = 0; j < 8; j++) setBit(v, bw - 8 * (int)(k + 1) + j, (c >> j) & 1);
+    }
+    return v_resize(v, w, false);
+}
 inline std::vector<Val>& scanOut() { static std::vector<Val> v; return v; }
 // $fscanf / $sscanf (21.3.4) from a character source: next() gives a char or
 // EOF, back() returns the last one. The values read go to scanOut(); returns
@@ -1753,6 +1860,44 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
                                              : rtlDistUniform(seed, i32(a[1]), i32(a[2]));
             return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
         }
+        case SF_DIST_NORMAL: case SF_DIST_EXPONENTIAL: case SF_DIST_POISSON:
+        case SF_DIST_CHI_SQUARE: case SF_DIST_T: case SF_DIST_ERLANG: {
+            int32_t seed = i32(a[0]), r = 0;
+            int32_t p1 = a.size() > 1 ? i32(a[1]) : 0, p2 = a.size() > 2 ? i32(a[2]) : 0;
+            switch (id) {
+                case SF_DIST_NORMAL: r = rtlRound(rtlNormal(seed, p1, p2)); break;
+                case SF_DIST_EXPONENTIAL:
+                    if (p1 > 0) r = rtlRound(rtlExponential(seed, p1));
+                    else rtlWarn("Exponential distribution must have a positive mean");
+                    break;
+                case SF_DIST_POISSON:
+                    if (p1 > 0) r = rtlPoisson(seed, p1);
+                    else rtlWarn("Poisson distribution must have a positive mean");
+                    break;
+                case SF_DIST_CHI_SQUARE:
+                    if (p1 > 0) r = rtlRound(rtlChiSquare(seed, p1));
+                    else rtlWarn("Chi_square distribution must have positive degree of freedom");
+                    break;
+                case SF_DIST_T:
+                    if (p1 > 0) r = rtlRound(rtlT(seed, p1));
+                    else rtlWarn("t distribution must have positive degree of freedom");
+                    break;
+                default:
+                    if (p1 > 0) r = rtlRound(rtlErlang(seed, p1, p2));
+                    else rtlWarn("k-stage erlangian distribution must have positive k");
+                    break;
+            }
+            return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
+        }
+        case SF_SYSTEM: {   // 20.17: run the command in a shell; the result is its exit status
+            Val c = a.empty() ? mkstr("") : a[0];
+            c.str = true;
+            std::cout.flush();
+            fflush(stdout);
+            int st = std::system(v_str(c).c_str());
+            if (a.empty()) return sint(st != 0);   // $system() with no command: is a shell there
+            return sint(st == -1 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+        }
         case SF_URANDOM: return make(urandomNext(urandomState()), 0, 32, 0);
         case SF_OBJ_SRANDOM:
             objRng()[(int)u64(a[0])] = seedState(u64(a[1]));
@@ -1806,6 +1951,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         }
         case SF_FCLOSE: {
             uint32_t fd = (uint32_t)u64(a[0]);
+            if (g_fcloseHook) g_fcloseHook(fd);
             if (fd & 0x80000000u) {
                 uint32_t i = fd & 0x7fffffffu;
                 if (i >= 3 && i < files().fds.size() && files().fds[i]) { fclose(files().fds[i]); files().fds[i] = nullptr; }
@@ -1815,6 +1961,16 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             }
             return make(0, 0, 1, 0);
         }
+        case SF_FREAD: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            size_t n = (size_t)u64(a[1]);
+            std::string& b = freadBuf();
+            b.assign(n, '\0');
+            size_t got = f && n ? fread(b.data(), 1, n, f) : 0;
+            b.resize(got);
+            return sint((int64_t)got);
+        }
+        case SF_FREAD_GET: return bytesValue(freadBuf(), (size_t)(ctl + 7) / 8, ctl);
         case SF_FWRITE: {
             Val t = a[1]; t.str = true;
             fileWrite((uint32_t)u64(a[0]), v_str(t) + (ctl ? "\n" : ""));
@@ -1973,6 +2129,51 @@ inline int (*g_allocSigs)(const FrameLayout&) = nullptr;
 inline void (*g_initSigs)(const FrameLayout&, int base) = nullptr;
 inline void (*g_nullAccess)() = nullptr;
 inline Val (*g_getSig)(int) = nullptr;
+
+// Containers of containers (7.5, 7.10): an element holds the id of a
+// container of its own, which is a signal too (its change count).
+inline const FrameLayout& dynElemLay() {
+    static FrameLayout l = [] { FrameLayout x; x.add(64, make(0, 0, 64)); return x; }();
+    return l;
+}
+// A new element of d: an empty container when d holds containers.
+inline Val dynNewElem(const DynObj& d) {
+    if (!d.elem) return d.dflt;
+    int id = g_allocSigs(dynElemLay());
+    if (g_initSigs) g_initSigs(dynElemLay(), id);
+    DynObj o = *d.elem;
+    o.vec.clear();
+    o.map.clear();
+    dynStore()[id] = std::move(o);
+    return make((uint64_t)id, 0, 64);
+}
+// A copy of element v of d: a new container with copies of its elements.
+inline Val dynCopyElem(const DynObj& d, const Val& v) {
+    if (!d.elem) return v;
+    Val n = dynNewElem(d);
+    if (v.x || !v.v) return n;
+    DynObj s = dynStore()[(int)v.v];   // a copy: making elements may add to the store
+    DynObj& t = dynStore()[(int)n.v];
+    for (const Val& e : s.vec) t.vec.push_back(dynCopyElem(s, e));
+    for (const auto& [k, e] : s.map) t.map[k] = dynCopyElem(s, e);
+    return n;
+}
+// d = s: the elements of s (none from an associative array into a list),
+// within d's bound, each copied.
+inline void dynAssign(DynObj& d, const DynObj& s0) {
+    DynObj s = s0;   // s0 may be d itself, or move as elements are made
+    if (d.kind == 2) {
+        d.map.clear();
+        for (const auto& [k, e] : s.map) d.map[k] = dynCopyElem(s, e);
+        return;
+    }
+    d.vec.clear();
+    if (s.kind == 2) return;
+    for (const Val& e : s.vec) {
+        if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound) break;
+        d.vec.push_back(dynCopyElem(s, e));
+    }
+}
 inline bool (*g_isA)(int obj, int cls) = nullptr;   // is object obj of class cls or one derived from it
 // > 0 while an Op::Addr computes an address: reading through a null handle
 // there gives null (the access that uses the address reports it, if it runs).
@@ -2045,6 +2246,9 @@ inline int R(int s) { return s < kRel ? s : relSlow(s); }
 // Every signal `e` reads, resolved now (a wait on automatic variables).
 inline void collectAddrs(const std::shared_ptr<struct Expr>& e, std::vector<int>& out);
 
+// Virtual interfaces (25.9): vifTab()[k][m] is the signal id of member m
+// of interface instance k (k = 0: null), or -1.
+inline std::vector<std::vector<int>>& vifTab() { static std::vector<std::vector<int>> t; return t; }
 inline Val eval(const E& e, const Reader& rd) {
     auto k = [&](int i) { return eval(e->kids[i], rd); };
     switch (e->op) {
@@ -2072,6 +2276,13 @@ inline Val eval(const E& e, const Reader& rd) {
             return mk(g_isA ? g_isA((int)h.v, e->hi) : 0, 1);
         }
         case Op::AddrOf: return make((uint64_t)R(e->sig) + 1, 0, 64);
+        case Op::VifSig: {
+            Val h = k(0);
+            const auto& tab = vifTab();
+            if (h.x || !h.v || h.v >= tab.size() || (size_t)e->hi >= tab[h.v].size() || tab[h.v][(size_t)e->hi] < 0)
+                return make(0, 0, 64);
+            return make((uint64_t)tab[h.v][(size_t)e->hi] + 1, 0, 64);
+        }
         case Op::Addr: {
             g_nullOk++;
             Val h = k(0);
@@ -2208,6 +2419,34 @@ inline Val eval(const E& e, const Reader& rd) {
             return mkstr(s);
         }
         case Op::DynGet: return dynStore()[R(e->sig)].get(k(0));
+        case Op::ArrAddr: {
+            std::vector<int64_t> idx;
+            for (size_t n = 0; n < e->kids.size(); n++) {
+                Val v = k(n);
+                if (v.x) return make(0, 0, 64);
+                idx.push_back(v_to_i64(v));
+            }
+            int64_t off = e->arr->offset(idx);
+            return make(off < 0 ? 0 : (uint64_t)(R(e->arr->base) + off + 1), 0, 64);
+        }
+        case Op::DynElemRef: {
+            const int c = R(e->sig);
+            Val key = k(0);
+            DynObj& d = dynStore()[c];
+            if (!d.elem) relFail("element of a container that holds no containers");
+            if (d.kind == 2) {
+                if (key.x && !d.strKey) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
+                auto it = d.map.find(d.key(key));
+                if (it == d.map.end()) it = d.map.emplace(d.key(key), dynNewElem(d)).first;   // made on first use
+                return make(it->second.v + 1, 0, 64);
+            }
+            int64_t i = key.x ? -1 : v_to_i64(key);
+            // Out of range: an empty container of its own (writes to it are lost).
+            if (i < 0 || i >= (int64_t)d.vec.size()) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
+            Val& el = d.vec[(size_t)i];
+            if (el.x || !el.v) el = dynNewElem(d);
+            return make(el.v + 1, 0, 64);
+        }
         case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {
             auto& d = dynStore()[R(e->sig)];
@@ -2306,6 +2545,15 @@ inline Val eval(const E& e, const Reader& rd) {
             return make((g_simTime + d / 2) / d, 0, 64, 0);
         }
         case Op::SysFn: {
+            if (e->hi == SF_ASSOC_BOUND) {
+                auto& d = dynStore()[e->sig];
+                if (d.map.empty()) return xfill(32, true);
+                const DynKey& key = e->lo ? std::prev(d.map.end())->first : d.map.begin()->first;
+                Val kv = d.keyVal(key);
+                Val r = make((uint64_t)(uint32_t)v_to_i64(kv), 0, 32, 0);
+                r.sgn = true;
+                return r;
+            }
             std::vector<Val> a;
             for (size_t i = 0; i < e->kids.size(); i++) a.push_back(k((int)i));
             return v_sysfn(e->hi, e->lo, a);
@@ -2348,7 +2596,7 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
     if (e->op == Op::Ref) out.push_back(R(e->sig));
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base) + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) out.push_back(R(e->sig));
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef) out.push_back(R(e->sig));
     for (auto& k : e->kids) collectAddrs(k, out);
 }
 // A copy of `e` with every relative id resolved now: a $strobe / $monitor
@@ -2356,7 +2604,7 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
 // process may be running.
 inline E bindRel(const E& e) {
     if (!e) return e;
-    bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynSize ||
+    bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynElemRef || e->op == Op::DynSize ||
                                             e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas);
     if (e->op == Op::This) return konst(make(g_fr ? (uint64_t)g_fr->self : 0, 0, 64));
     bool arel = e->op == Op::ArrRead && e->arr && isRel(e->arr->base);

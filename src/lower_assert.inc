@@ -249,7 +249,7 @@ E sampledE(const E& e) {
         return c;
     }
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
-        e->op == Op::DynSlice)
+        e->op == Op::DynSlice || e->op == Op::DynElemRef)
         return e;   // containers are read as they are now
     auto c = std::make_shared<Expr>(*e);
     if (e->op == Op::ArrRead) {

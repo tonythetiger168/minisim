@@ -1,5 +1,4 @@
 // IEEE 1800-2023 7.11: Array query functions (7.11, 20.7).
-//! xfail: array query functions are errors
 module top;
   int a[3:0];
   logic [7:0] m[1:4][2];
