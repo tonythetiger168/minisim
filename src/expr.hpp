@@ -704,7 +704,8 @@ inline Val v_rtoi(const Val& a, int w, bool sgn, bool trunc) {
     return out;
 }
 enum MathFn { M_LN, M_LOG10, M_EXP, M_SQRT, M_POW, M_FLOOR, M_CEIL, M_SIN, M_COS, M_TAN, M_ASIN, M_ACOS,
-              M_ATAN, M_ATAN2, M_HYPOT, M_SINH, M_COSH, M_TANH, M_ASINH, M_ACOSH, M_ATANH };
+              M_ATAN, M_ATAN2, M_HYPOT, M_SINH, M_COSH, M_TANH, M_ASINH, M_ACOSH, M_ATANH,
+              M_F32 };   // M_F32: round to shortreal (6.12), not a user function
 inline double mathFn(int f, double a, double b) {
     switch (f) {
         case M_LN: return std::log(a);       case M_LOG10: return std::log10(a);
@@ -718,6 +719,7 @@ inline double mathFn(int f, double a, double b) {
         case M_COSH: return std::cosh(a);    case M_TANH: return std::tanh(a);
         case M_ASINH: return std::asinh(a);  case M_ACOSH: return std::acosh(a);
         case M_ATANH: return std::atanh(a);
+        case M_F32: return (double)(float)a;
     }
     return 0;
 }
@@ -1348,7 +1350,9 @@ enum SysFnId : int {
     SF_SCAN_TEXT,    // scanText() as a string
     SF_FTELL,        // $ftell(fd)
     SF_FSEEK,        // $fseek(fd, offset, whence), $rewind(fd) is fseek(fd, 0, 0)
-    SF_FERROR        // $ferror(fd, str): 0, no error text kept
+    SF_FERROR,       // $ferror(fd, str): 0, no error text kept
+    SF_SR2BITS,      // $shortrealtobits (20.5)
+    SF_BITS2SR       // $bitstoshortreal
 };
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
@@ -1839,6 +1843,8 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             return sint(r == 0 ? 0 : -1);
         }
         case SF_FERROR: return sint(0);
+        case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
+        case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();
             auto i64 = [&](const Val& v) { return v_to_i64(v); };
