@@ -457,8 +457,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             }
             case IK::ReadMem: readMem(i); pc++; break;
             case IK::WriteMem: writeMem(i); pc++; break;
-            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0); pc++; break;
-            case IK::Release: S.holdOff(i.sig, i.hi != 0); pc++; break;
+            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
+            case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;

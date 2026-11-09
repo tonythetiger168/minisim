@@ -3930,16 +3930,35 @@ struct Lowerer {
                     force = pd.isRelease;
                     tgt = &pd.lvalue;
                 }
-                Instr i;
-                lhs(*tgt, i);
-                if (i.arr || i.bidx || i.hi >= 0 || i.dyn >= 0 || i.drv >= 0)
-                    unsupported("force / assign of a bit, part, or array element (only whole signals)");
-                i.k = assign ? IK::Force : IK::Release;
-                i.hi = force ? 1 : 0;
-                i.lo = 0;
-                if (val) i.e = expr(*val);
-                usesForce() = true;
-                prog.emit(i);
+                // force {a, w[3]} = v: each part takes its slice of v (10.6.2).
+                std::vector<std::tuple<const Expression*, int, int>> parts;
+                int tw = (int)tgt->type->getBitWidth();
+                if (peel(*tgt).kind == ExpressionKind::Concatenation) concatParts(*tgt, tw - 1, parts);
+                else parts.push_back({tgt, -1, -1});
+                E whole;
+                if (val) {
+                    whole = expr(*val);
+                    if (parts.size() > 1) {   // evaluated as one value, sliced per part
+                        needWidth(tw);
+                        whole = resize(whole, tw, false, false);
+                    }
+                }
+                for (auto& [x, phi, plo] : parts) {
+                    Instr i;
+                    lhs(*x, i);
+                    if (i.arr || i.bidx || i.dyn >= 0 || i.drv >= 0)
+                        unsupported("force / assign of a variable bit, part, or array element");
+                    if (i.hi >= 0 && !force) unsupported("assign / deassign of a bit or part (only force can, 10.6.2)");
+                    // A constant bit or part: pw is its width and dkey its low bit.
+                    i.pw = i.hi >= 0 ? i.hi - i.lo + 1 : 0;
+                    i.dkey = i.hi >= 0 ? i.lo : -1;
+                    i.k = assign ? IK::Force : IK::Release;
+                    i.hi = force ? 1 : 0;
+                    i.lo = 0;
+                    if (whole) i.e = phi >= 0 ? slice(whole, phi, plo) : whole;
+                    usesForce() = true;
+                    prog.emit(i);
+                }
                 break;
             }
             case StatementKind::Disable: {   // disable blk (9.6.2)
