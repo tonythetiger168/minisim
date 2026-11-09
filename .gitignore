@@ -4,3 +4,4 @@ build/
 .vscode/
 .idea/
 tests/spec/_regress_*
+__pycache__/
