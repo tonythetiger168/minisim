@@ -20,7 +20,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 5.7.1 | Integer literals | ✅ | sized, unsized, x/z digits, signed (`'s`), and `'0` `'1` `'x` `'z` in any context. `5.7.1-unbased-unsized` |
 | 5.9 | String literals | 🟡 | up to 8 characters (64 bits). `5.9-string-literal` |
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |
-| 6.6.3–6.6.8 | wand/triand, wor/trior, tri0, tri1, trireg, supply0/supply1 | ✅ | wired AND/OR resolution, pull to 0/1 when undriven, trireg holds its last value (starts at x). Not yet: arrays of these nets, `interconnect`. `6.6.3-wired-nets`, `6.6.4-trireg` |
+| 6.6.3–6.6.8 | wand/triand, wor/trior, tri0, tri1, trireg, supply0/supply1 | ✅ | wired AND/OR resolution, pull to 0/1 when undriven, trireg holds its last value (starts at x). `interconnect` nets take the width of the ports they connect (6.6.8). Not yet: arrays of these nets. `6.6.3-wired-nets`, `6.6.4-trireg`, `6.6.8-interconnect` |
 | 6.11 | Integer types | ✅ | int, byte, shortint, longint, integer, bit. `6.11-integer-types` |
 | 6.8 | Default values | ✅ | 2-state variables (int, bit, real, string) and unpacked arrays of them start at 0 / 0.0 / ""; 4-state at x. `6.8-default-values` |
 | 6.12 | real, realtime | ✅ | arithmetic, compare, `**`, conversion both ways (rounded, 6.12.1), real arrays and function results, `$itor` `$rtoi` `$realtobits` `$bitstoreal`, 20.8 math functions. `shortreal` (rounded to single precision, `$shortrealtobits` `$bitstoshortreal`). Not yet: reals in the VCD. `6.12-real`, `6.12.1-real-conversions`, `6.12-shortreal` |
@@ -75,13 +75,13 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 11.4.11 | Conditional `?:` | ✅ | |
 | 11.4.12 | Concatenation, replication | ✅ | `11.4.12.1-replication` |
 | 11.4.6 | Wildcard equality `==?` `!=?` | ✅ | `11.4.2-incdec-in-expr` |
-| 11.4.13 | inside | ✅ | values and `[lo:hi]` ranges. Not yet: unpacked arrays as items, tolerance ranges. `11.4.13-inside` |
-| 11.4.14 | Streaming operators | ✅ | `{>>{...}}`, `{<<n{...}}`, `{<<type{...}}` of integral operands and fixed-size arrays, nested streams, a wider target left-aligned, and unpacking `{>>{a, b}} = v` (11.4.14.3). Not yet: queues and dynamic arrays as operands or targets, structs as operands, `with [...]`. `11.4.14-streaming` |
+| 11.4.13 | inside | ✅ | values, `[lo:hi]` ranges, real values and ranges, fixed-size arrays and queues as items, and the 2023 tolerance ranges `[A +/- B]`, `[A +%- B]` (with `--std=1800-2023`). `11.4.13-inside`, `11.4.13-inside-arrays` |
+| 11.4.14 | Streaming operators | ✅ | `{>>{...}}`, `{<<n{...}}`, `{<<type{...}}` of integral operands and fixed-size arrays, nested streams, a wider target left-aligned, and unpacking `{>>{a, b}} = v` (11.4.14.3). Queues and dynamic arrays of integral elements as operands, and as the target of `q = {>>{...}}` (resized to hold the stream). Not yet: a container inside an unpacking target list, structs as operands, `with [...]`. `11.4.14-streaming`, `11.4.14-streaming-containers` |
 | 11.5.1 | Bit-select with a variable index | ✅ | read and write. `11.5.1-variable-bit-select` |
 | 11.5.1 | Indexed part-select `+:` `-:` | ✅ | constant or variable start, read and write; out-of-range bits read x and are not written. `11.5.1-indexed-part-select` |
 | 11.6–11.8 | Expression width and sign rules | ✅ | context-determined widths, signed extension |
-| 12.4 | if / else; 12.4.2 unique / priority if | ✅ | the unique/priority violation itself is not reported |
-| 12.5 | case, casez, casex; 12.5.3 unique case; 12.5.4 case inside | ✅ | `12.5-unique-case`, `12.5.4-case-inside` |
+| 12.4 | if / else; 12.4.2 unique / unique0 / priority if | ✅ | violations (no condition true, more than one true) are warnings, reported in the Observed region; a process that resumes, or an always_comb that re-runs, first flushes them, so a zero-delay glitch is not reported (12.4.2.1); `$assertcontrol` with types 32/64/128 turns them off and on. `12.4.2-unique-priority-violations` |
+| 12.5 | case, casez, casex; 12.5.3 unique case; 12.5.4 case inside | ✅ | unique / unique0 / priority violations are warnings, as for if; constant labels that cannot overlap cost nothing at run time. `12.5-unique-case`, `12.5.4-case-inside`, `12.4.2-unique-priority-violations` |
 | 12.6 | Pattern matching | ✅ | `if (x matches p)` with `&&&` guards, `case`/`casez`/`casex (x) matches` with `&&&` filters; tagged, variable (`.v`), wildcard (`.*`), constant and structure (`'{.a, 4}`) patterns. Not yet: `matches` in a `?:` expression, real or string constant patterns. `7.3.2-tagged-unions` |
 | 12.7 | for, while, do-while, repeat, forever | ✅ | |
 | 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue; dynamic arrays and queues by index, associative arrays in key order. `12.7.3-foreach`, `12.7.3-foreach-order`, `12.7.3-foreach-containers` |

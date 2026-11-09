@@ -168,9 +168,11 @@ static void readMem(const Instr& i) {
         addr += step;
         words++;
     }
-    // A file with no @address whose word count differs from the range warns.
+    // A file with no @address whose word count differs from the range warns
+    // (21.4): the range given by start and finish addresses, or, with no
+    // finish address, a file with more words than the memory has room for.
     int64_t range = (step > 0 ? finish - start : start - finish) + 1;
-    if (!sawAddr && words != range)
+    if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
 }
 
@@ -276,6 +278,19 @@ inline void dynExec(const Instr& i) {
                 Val lt = down ? v_lt(b, a) : v_lt(a, b);
                 return !lt.x && lt.v;
             });
+            break;
+        }
+        case D_UNPACK: {   // the stream e, cut into elements from the left; the last is padded on the right
+            Val v = eval(i.e, rd);
+            int ew = d.dflt.w, W = v.w;
+            d.vec.clear();
+            for (int hi = W - 1; hi >= 0; hi -= ew) {
+                int lo = hi - ew + 1;
+                Val el = lo >= 0 ? v_slice(v, hi, lo) : v_concat({v_slice(v, hi, 0), make(0, 0, -lo, 0)});
+                el.sgn = d.dflt.sgn;
+                d.vec.push_back(el);
+                if (full()) { d.vec.pop_back(); break; }
+            }
             break;
         }
         case D_SORT_BY:
