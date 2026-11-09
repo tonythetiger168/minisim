@@ -821,6 +821,24 @@ private:
         for (int s : privs)
             o << "    S.set(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
         o << "}\n";
+        // Comb statements first: their reads are part of `ext`, which twoNow checks.
+        std::vector<std::string> combStmts, combStmts2, commitStmts;
+        for (int i : byRank)
+            for (const Instr& in : procs[i].prog->code) {
+                if (in.k != IK::Assign) break;
+                combStmts.push_back("   " + fassign(in));
+                noteRefs(in.e);
+                std::string g, u, sl;
+                if (in.hi >= 0 || !split(in.e, g, u, sl)) { two = false; continue; }
+                std::string S_ = std::to_string(in.sig);
+                if (isPriv(in.sig))   // x and z are already 0 in 2-state mode
+                    combStmts2.push_back("    P" + S_ + ".v = (" + u + ") & " + M(sigW_[in.sig]) + ";\n");
+                else if (in.drv >= 0)
+                    combStmts2.push_back("    S.fwdv(" + S_ + ", " + std::to_string(in.drv) + ", " + u + ", " +
+                                         std::to_string((int)in.s0) + ", " + std::to_string((int)in.s1) + ");\n");
+                else
+                    combStmts2.push_back("    " + regWrite(in.sig, u) + "\n");
+            }
         o << fns.str();
         if (two) o << fns2.str();
         // 2-state mode holds when every private signal is known (pclean, kept
@@ -849,23 +867,6 @@ private:
         // Both are split into functions of at most kChunk statements: one huge
         // function takes the C++ compiler minutes and is no faster.
         const int kChunk = 64;
-        std::vector<std::string> combStmts, combStmts2, commitStmts;
-        for (int i : byRank)
-            for (const Instr& in : procs[i].prog->code) {
-                if (in.k != IK::Assign) break;
-                combStmts.push_back("   " + fassign(in));
-                noteRefs(in.e);
-                std::string g, u, sl;
-                if (in.hi >= 0 || !split(in.e, g, u, sl)) { two = false; continue; }
-                std::string S_ = std::to_string(in.sig);
-                if (isPriv(in.sig))   // x and z are already 0 in 2-state mode
-                    combStmts2.push_back("    P" + S_ + ".v = (" + u + ") & " + M(sigW_[in.sig]) + ";\n");
-                else if (in.drv >= 0)
-                    combStmts2.push_back("    S.fwdv(" + S_ + ", " + std::to_string(in.drv) + ", " + u + ", " +
-                                         std::to_string((int)in.s0) + ", " + std::to_string((int)in.s1) + ");\n");
-                else
-                    combStmts2.push_back("    " + regWrite(in.sig, u) + "\n");
-            }
         for (size_t k = 0; k < slots.size(); k++) {
             const Slot& sl = slots[k];
             std::string K = std::to_string(k), sg = std::to_string(sl.sig);
