@@ -1,0 +1,7 @@
+# mregress self-test: two passing tests, one with seeds, one expected to fail.
+%common -sv
+adder_w8: ../../examples/cli/adder.sv ../../examples/cli/adder_tb.sv -top adder_tb +define+WIDTH=8 @pass=sum= *44
+adder_seeds: ../../examples/cli/adder.sv ../../examples/cli/adder_tb.sv -top adder_tb @seeds=3
+unique_case: ../spec/12.5-unique-case.sv @expect=inline
+wrong_expect: ../../examples/cli/init.sv @pass=this text is never printed
+known_gap: ../../examples/cli/init.sv @pass=never printed either @xfail=demo of a known gap

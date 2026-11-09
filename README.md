@@ -23,7 +23,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`case` / `casez` / `casex`**, part-selects, bit-selects, `for` / `while` / `do` / `forever` / `repeat`, `break` / `continue`
 - **Tasks and functions** at module scope, called from procedural code in that module. A `function` used in an expression returns a value (`return` or an assignment to the function name). A `task` is a statement. `input` is copied in. `output` and `inout` are copied back when the call returns. A `#delay` inside a task suspends that process.
 - **Module instances.** A parent instantiates a child. Named (`.a(x)`) and positional port connections carry an `input` into the child and an `output` back to the parent. The output may be a continuous assign or a procedural write. An `inout` net is connected in both directions. A grandchild uses the same connection. A `#(.W(8))` override changes the port width. Child signals are named on the instance path (`u.y`).
-- **VCD output** (`dump.vcd`, or any file with `msim -vcd`) for GTKWave
+- **Waveforms**: VCD (`msim -vcd`) or compressed FST (`msim -fst`), with the instance hierarchy as scopes, for GTKWave or Surfer
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 
 ## Layout
@@ -83,7 +83,8 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-top <name>` | Top-level module (repeatable). Without it, slang picks uninstantiated modules |
 | `+define+N[=V]`, `-D N[=V]` | Preprocessor define |
 | `+incdir+<dir>`, `-I <dir>` | Include directory |
-| `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No VCD is written without it |
+| `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
+| `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
 | `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
 | `+<arg>` | Any other plusarg is accepted (not yet visible to `$test$plusargs`) |
@@ -96,6 +97,34 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |
+
+### Regressions: `mregress`
+
+`mregress` (installed next to `msim`; in the source tree `tools/mregress.py`)
+runs a test list on msim, VCS, Xcelium, Questa, or Icarus, in parallel, with
+seeds, and writes `results.json`, `junit.xml` (for CI) and `report.html`, with
+failures grouped by their first error line:
+
+```sh
+mregress tests.list -sim msim -j 8 -seeds 3     # or -sim vcs / xrun / questa / iverilog
+mregress tests.list -rerun                      # repeat only the failures
+mregress -spec tests/spec -sim iverilog         # the spec suite on another simulator
+```
+
+A test list line is `name: <simulator arguments>` with optional settings
+(`@seeds=N`, `@timeout=SEC`, `@pass=<regex>`, `@fail=<regex>`,
+`@expect=inline` for `//> ` expected output, `@skip=<sim>`, `@exit=N`,
+`@xfail=<reason>` for a known gap); `%common` and
+`%sim` set shared arguments and the default simulator, and `-f` includes
+another list. A run fails on a non-zero exit, a UVM_ERROR / UVM_FATAL count
+above zero, a simulator error line (`Error-[`, `*E,`, `** Error`), `$fatal`,
+or a failed `@pass` / `@expect` check. An `@xfail` test that fails counts as
+a known gap; one that passes (XPASS) fails the regression so the marker gets
+removed. With `-spec`, a test's `//! xfail: <reason>` and `//! exit: <n>`
+lines mean the same on msim, and a per-chapter pass table is printed
+(`-md FILE` also writes it as Markdown). See `tests/regress/smoke.list` and
+`mregress -h`. For Jenkins and other CI, see [`ci/README.md`](ci/README.md)
+and the pipeline in [`ci/Jenkinsfile`](ci/Jenkinsfile).
 
 ### Compiled mode
 
