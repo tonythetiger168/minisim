@@ -20,6 +20,10 @@
 
 enum Edge { ANY, POS, NEG };
 
+// IK::Dyn commands (7.5, 7.8, 7.10).
+enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_INSERT, D_POP_FRONT,
+              D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
+              D_SORT, D_RSORT, D_SHUFFLE };
 enum class IK {
     Assign,     // sig = e            (blocking)
     Nba,        // sig <= e           (non-blocking)
@@ -37,6 +41,7 @@ enum class IK {
     Disable,    // disable <block> run by other processes: end every process whose root is block `sig`
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
+    Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
     Ret         // pop that address; an empty stack ends the process
 };
 
@@ -73,6 +78,10 @@ struct Instr {
     // Nba with nbaLater: the update happens `delay` / `de` ticks later (9.4.5).
     E de;
     bool nbaLater = false;
+    // Dyn: the command, its operands in args, the value in e, another
+    // container dsrc, a result signal dres, and the key variable dkey.
+    // Assign with dyn >= 0 writes element args[0] of container dyn.
+    int dcmd = 0, dsrc = -1, dres = -1, dkey = -1, dyn = -1;
     int pw = 0;
     bool pdown = false;
     bool hex = false;
@@ -97,6 +106,7 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     if (e->op == Op::Ref) add(e->sig);
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) add(e->sig);
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 inline void collectRefs(const E& e, std::vector<int>& out) {
@@ -114,6 +124,8 @@ inline void collectProgRefsInto(const Prog& p, std::vector<int>& sigs, std::unor
         collectRefsInto(i.e, sigs, have);
         for (auto& a : i.args) collectRefsInto(a, sigs, have);  // $display / $strobe / $monitor
         for (auto& a : i.aidx) collectRefsInto(a, sigs, have);  // a[i] = ... reads i
+        if (i.k == IK::Dyn || i.dyn >= 0)
+            for (auto& a : i.args) collectRefsInto(a, sigs, have);
         collectRefsInto(i.bidx, sigs, have);
         if (i.k == IK::Call && i.callee) collectProgRefsInto(*i.callee, sigs, have, seen);
         for (const Prog* b : i.branches) collectProgRefsInto(*b, sigs, have, seen);

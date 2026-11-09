@@ -25,7 +25,11 @@ wrong result, that is a bug: please add a spec test for it.
 | 7.2 | Unpacked structures | ❌ | |
 | 7.4.1 | Packed arrays and ranges | ✅ | any declared range ([7:0], [8:1], [0:7]) and multidimensional packed arrays, element and part selects. `7.4.1-packed-ranges`, `7.4.1-packed-nested-write` |
 | 7.4 | Unpacked arrays | 🟡 | fixed-size unpacked arrays of any number of dimensions (up to 2^20 elements), constant or variable index, read and write; out-of-range read gives X (7.4.6). Not yet: slices, whole-array assignment or compare, arrays as ports or arguments. `7.4-unpacked-arrays`, `7.4-array-sensitivity` |
-| 7.5–7.10 | Dynamic, associative arrays, queues | ❌ | |
+| 7.5 | Dynamic arrays | ✅ | `new[n]`, `new[n](old)`, `size()`, `delete()`, element read and write (a read past the end gives the element default), assignment from `'{...}`, another container, or a fixed-size array. `7.5-dynamic-arrays` |
+| 7.8, 7.9 | Associative arrays | 🟡 | integral keys (signed or unsigned, any width up to 64), string keys, `[*]`; `num`/`size`, `exists`, `delete`, `delete(k)`, `first`/`last`/`next`/`prev`, `'{k: v}` patterns, a missing key reads the default. Not yet: class keys, `default:` in a pattern. `7.8-associative-arrays` |
+| 7.10 | Queues | ✅ | `push_back`/`push_front`/`pop_back`/`pop_front`/`insert`/`delete(i)`, `$` as the last index, `q[a:b]` slices, concatenation `{q, x, r}`, `{}`, bounded queues `[$:N]`, a write at `q.size()` appends. `7.10-queues`, `7.10.1-queue-slices`, `7.10-string-real-elements` |
+| 7.12 | Array methods | 🟡 | on dynamic arrays and queues: `reverse`, `sort`, `rsort`, `shuffle`, `sum`, `product`, `and`, `or`, `xor`. Not yet: a `with` clause, locator methods (`find`, `min`, `unique`, ...). `7.12-array-methods`, `7.12.3-reduction-methods` |
+| 7.5–7.10 | Container limits | 🟡 | elements are integral (up to 64 bits), real, or string; no nested containers, no containers as ports or task arguments, no `%p`, no whole-container compare, no NBA to an element. `-compile` falls back to the interpreter. |
 | 8 | Classes | ❌ | blocks UVM |
 | 9.2 | initial, always, always_comb/ff/latch | ✅ | |
 | 9.2.3 | Final procedures | ✅ | run once after the last time slot, also after `$finish`. `9.2.3-final` |
@@ -56,7 +60,7 @@ wrong result, that is a bug: please add a spec test for it.
 | 12.4 | if / else; 12.4.2 unique / priority if | ✅ | the unique/priority violation itself is not reported |
 | 12.5 | case, casez, casex; 12.5.3 unique case | ✅ | `12.5-unique-case` |
 | 12.7 | for, while, do-while, repeat, forever | ✅ | |
-| 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue. `12.7.3-foreach`, `12.7.3-foreach-order` |
+| 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue; dynamic arrays and queues by index, associative arrays in key order. `12.7.3-foreach`, `12.7.3-foreach-order`, `12.7.3-foreach-containers` |
 | 12.8 | break, continue, return | ✅ | |
 | 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`, no DPI. `13.4-function-automatic` |
 | 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
@@ -86,6 +90,6 @@ In order of how often typical testbenches hit them:
 3. ~~`` `timescale `` (22.7), delay expressions (9.4.1), named events (15.5), disable / wait fork (9.6), final (9.2.3)~~ done
 4. `$urandom` (18.13), immediate assertions (16.3)
 5. ~~Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2), real (6.12), string (6.16)~~ done
-6. Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8), unpacked structs (7.2)
+6. ~~Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8)~~ done; unpacked structs (7.2) next
 
 Classes (8), randomization (18), and interfaces (25) are what UVM needs.

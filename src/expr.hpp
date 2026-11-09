@@ -43,7 +43,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -749,6 +751,57 @@ using Reader = std::function<Val(int)>;
 struct Expr;
 using E = std::shared_ptr<Expr>;
 inline std::string (*g_sformat)(const std::string&, const std::vector<E>&, const Reader&) = nullptr;
+// The contents of every dynamic container, by handle signal. A change bumps
+// the handle's value, so a process waiting on the container wakes.
+inline int64_t v_to_i64(Val v);
+struct DynKey {
+    int64_t i = 0;     // integral key (unsigned keys have the top bit flipped, so order holds)
+    std::string s;     // string key
+    bool operator<(const DynKey& o) const { return s != o.s ? s < o.s : i < o.i; }
+};
+struct DynObj {
+    int kind = 0;               // 0 dynamic array, 1 queue, 2 associative array
+    std::vector<Val> vec;
+    std::map<DynKey, Val> map;
+    Val dflt;                   // what a missing element reads as
+    int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
+    bool strKey = false;        // associative: string index
+    int keyW = 64;
+    bool keySgn = true;
+    DynKey key(const Val& k) const {
+        DynKey d;
+        if (strKey) {   // a signal holds a string as its pool id, without the flag
+            Val t = k;
+            t.str = true;
+            d.s = v_str(t);
+            return d;
+        }
+        uint64_t u = k.v & ~k.x & mask(keyW);
+        if (keySgn && keyW < 64 && ((u >> (keyW - 1)) & 1)) u |= ~mask(keyW);
+        d.i = keySgn ? (int64_t)u : (int64_t)(u ^ (1ULL << 63));
+        return d;
+    }
+    Val keyVal(const DynKey& d) const {
+        if (strKey) return mkstr(d.s);
+        uint64_t u = keySgn ? (uint64_t)d.i : ((uint64_t)d.i ^ (1ULL << 63));
+        Val v = make(u, 0, keyW);
+        v.sgn = keySgn;
+        return v;
+    }
+    size_t size() const { return kind == 2 ? map.size() : vec.size(); }
+    Val get(const Val& k) const {
+        if (kind == 2) {
+            if (k.x && !strKey) return dflt;
+            auto it = map.find(key(k));
+            return it == map.end() ? dflt : it->second;
+        }
+        if (k.x) return dflt;
+        int64_t i = v_to_i64(k);
+        if (i < 0 || i >= (int64_t)vec.size()) return dflt;
+        return vec[(size_t)i];
+    }
+};
+inline std::unordered_map<int, DynObj>& dynStore() { static std::unordered_map<int, DynObj> m; return m; }
 inline int ucmp(const Val& a, const Val& b) {
     int n = limbCount(a.w > b.w ? a.w : b.w);
     for (int i = n - 1; i >= 0; i--) {
@@ -1173,6 +1226,12 @@ enum class Op {
     StrCmp,    // hi as FCmp: <, <=, >, >=, ==, !=
     StrMethod, // hi: StrFn; kid 0 is the string
     SFormat,   // $sformatf: fmt, then kids as the arguments
+    // Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8). sig is the
+    // container's handle signal; its contents live in dynStore().
+    DynGet,    // element kids[0] (index or key); a missing one reads the default
+    DynSize,   // size() / num()
+    DynExists, // exists(kids[0])
+    DynReduce, // hi: 0 sum, 1 product, 2 and, 3 or, 4 xor (7.12.3), at k.w bits
     ArrRead,   // element of an unpacked array; kids are one index per dimension
     DynSlice   // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
 };
@@ -1472,6 +1531,33 @@ inline Val eval(const E& e, const Reader& rd) {
                 case S_REALTOA: { char b[64]; snprintf(b, sizeof b, "%g", v_real(k(1))); return mkstr(b); }
             }
             return mkstr(s);
+        }
+        case Op::DynGet: return dynStore()[e->sig].get(k(0));
+        case Op::DynSize: { Val r = make(dynStore()[e->sig].size(), 0, 32); r.sgn = true; return r; }
+        case Op::DynExists: {
+            auto& d = dynStore()[e->sig];
+            Val key = k(0);
+            if (d.kind != 2) { int64_t i = v_to_i64(key); return mk(!key.x && i >= 0 && i < (int64_t)d.vec.size()); }
+            return mk(d.map.count(d.key(key)) > 0);
+        }
+        case Op::DynReduce: {
+            auto& d = dynStore()[e->sig];
+            int w = e->k.w;
+            Val acc = make(e->hi == 1 ? 1 : e->hi == 2 ? ~0ULL : 0, 0, w);
+            auto one = [&](const Val& x) {
+                Val v = v_resize(x, w, x.sgn);
+                switch (e->hi) {
+                    case 0: acc = v_add(acc, v); break;
+                    case 1: acc = v_mul(acc, v); break;
+                    case 2: acc = v_and(acc, v); break;
+                    case 3: acc = v_or(acc, v); break;
+                    default: acc = v_xor(acc, v); break;
+                }
+            };
+            if (d.kind == 2) for (auto& [key, v] : d.map) one(v);
+            else for (auto& v : d.vec) one(v);
+            acc.sgn = e->k.sgn;
+            return acc;
         }
         case Op::SFormat: return mkstr(g_sformat ? g_sformat(e->fmt, std::vector<E>(e->kids.begin(), e->kids.end()), rd) : "");
         case Op::Le: return v_le(k(0), k(1));
