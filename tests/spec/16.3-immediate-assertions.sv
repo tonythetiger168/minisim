@@ -1,6 +1,5 @@
 // IEEE 1800-2023 16.3: Immediate assert, assume and cover with pass and
 // fail actions (16.3).
-//! xfail: immediate assertions are errors
 //! icarus-skip: Icarus 13 ignores cover statements
 module top;
   int a = 1;
