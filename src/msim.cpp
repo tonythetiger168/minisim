@@ -197,7 +197,11 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
-                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
+                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
+                    : !asserts().empty() ? "an assertion"
+                    : !clockings().empty() ? "a clocking block"
+                    : !cgDefs().empty() ? "a covergroup"
+                    : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -444,6 +448,10 @@ int main(int argc, char** argv) {
         fwd.push_back(a);
     }
     plusArgs() = plusargs;
+    // The language is IEEE 1800-2023 unless --std says otherwise (slang's
+    // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (std::none_of(fwd.begin(), fwd.end(), [](const std::string& s) { return startsWith(s, "--std"); }))
+        fwd.push_back("--std=1800-2023");
     if (seed) {   // the $urandom stream (18.13); $random keeps its own seed (Annex N)
         uint64_t st = (seed + 1) * 0x9E3779B97F4A7C15ull;
         urandomState() = st ? st : 1;
@@ -496,8 +504,9 @@ int main(int argc, char** argv) {
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
     if (usesForce()) staticPart = false;   // a forced signal must see every write (10.6)
     if (lowered.procs.empty()) {
-        std::cerr << "msim: design has no processes to run\n";
-        return 1;
+        // Nothing to schedule: the simulation ends at time 0 (4.4.1).
+        std::cerr << "msim: note: design has no processes; simulation ends at time 0\n";
+        return 0;
     }
 
     Plan pl = plan(lowered, staticComb, staticSeq);
@@ -551,6 +560,15 @@ int main(int argc, char** argv) {
         if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
         else S.spawn(process(&lowered.procs[i].prog));
     }
+    // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
+    // the start of a slot, which the static partitions do not keep current.
+    S.shadows = shadowPairs();
+    S.sclocks = sampleClocks();
+    for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
+    startConcAsserts();
+    startClockings();
+    startCovergroups();
+    if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
         std::vector<int> pt;
@@ -558,7 +576,7 @@ int main(int argc, char** argv) {
         S.buildPartitions(po, pi, pt);
     }
     S.run(maxTime);
-    std::vector<Task> finals;
+    std::vector<Task> finals = concEnd();   // strong obligations still pending fail (16.12.21)
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
     std::cout.flush();

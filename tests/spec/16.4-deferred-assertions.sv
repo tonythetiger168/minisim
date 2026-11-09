@@ -1,6 +1,5 @@
 // IEEE 1800-2023 16.4: A deferred assertion reports once, after glitches in
 // the time slot settle (16.4).
-//! xfail: deferred assertions are errors
 //! icarus-skip: Icarus 13 does not support deferred assertions
 module top;
   logic a = 0;

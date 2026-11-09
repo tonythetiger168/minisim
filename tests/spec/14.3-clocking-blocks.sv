@@ -1,6 +1,5 @@
 // IEEE 1800-2023 14.3: A clocking block samples inputs at the clock and
 // drives outputs after it (14.3, 14.13, 14.16).
-//! xfail: clocking blocks are errors
 //! icarus-skip: Icarus 13 does not support clocking blocks
 module top;
   logic clk = 0, d = 0, q;
