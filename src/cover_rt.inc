@@ -168,6 +168,14 @@ inline int64_t optOr(const std::vector<CgOptSet>& opts, int which, int64_t dflt)
         }
     return dflt;
 }
+// A class's covergroup reads its object's properties: `this` is the object
+// it was created for, whatever process samples it.
+inline void (*g_cgInstStart)(int id) = nullptr;   // a class covergroup's own sampling process
+struct SelfScope {
+    Frame* saved;
+    explicit SelfScope(const CgInst& in) : saved(g_fr) { if (in.self) g_fr = in.self.get(); }
+    ~SelfScope() { g_fr = saved; }
+};
 inline void setArgs(const CgInst& in) {
     const CgDef& d = cgDefs()[in.def];
     for (size_t k = 0; k < d.argSigs.size(); k++)
@@ -563,6 +571,8 @@ inline Val cgNew(const std::vector<Val>& a) {
     CgInst in;
     in.def = d;
     in.name = def.name + "#" + std::to_string(def.insts.size());
+    if (def.inClass) in.self = newFrame(nullptr, nullptr, (int)a.back().v);
+    SelfScope ss(in);
     for (size_t k = 0; k < def.argSigs.size(); k++) {
         if (def.argRef[k]) { in.refSigs.push_back((int)a[k + 1].v); in.args.push_back(Val{}); }
         else { in.refSigs.push_back(-1); in.args.push_back(a[k + 1]); }
@@ -599,6 +609,7 @@ inline Val cgNew(const std::vector<Val>& a) {
     cgInsts().push_back(std::move(in));
     int id = (int)cgInsts().size() - 1;
     cgDefs()[d].insts.push_back(id);
+    if (def.inClass && !def.ev.empty()) g_cgInstStart(id);
     return make((uint64_t)id + 1, 0, 32, 0);
 }
 inline void report(const CgInst& in, const std::string& what, const std::string& bin, const std::string& value) {
@@ -608,6 +619,7 @@ inline void report(const CgInst& in, const std::string& what, const std::string&
 // One sample of an instance (19.3, 19.5).
 inline void sampleInst(CgInst& in) {
     if (!in.on) return;
+    SelfScope ss(in);
     const CgDef& d = cgDefs()[in.def];
     setArgs(in);
     for (size_t ci = 0; ci < d.cps.size(); ci++) {
@@ -866,8 +878,31 @@ inline Task cgProc(int d) {
         for (int id : def.insts) cg::sampleInst(cgInsts()[id]);
     }
 }
+// A class's covergroup (19.4): each instance waits on its own object's
+// event, resolved when the instance is created (the event may name a
+// property or another object's member: it has to exist by then).
+inline Task cgInstProc(int id, std::vector<std::pair<int, Edge>> ev) {
+    for (;;) {
+        if (ev.size() > 1) co_await WaitAny{&ev};
+        else co_await Wait{ev[0].first, ev[0].second};
+        CgInst& in = cgInsts()[id];
+        const CgDef& def = cgDefs()[in.def];
+        if (def.evIff) {
+            cg::SelfScope ss(in);
+            if (truth(eval(def.evIff, rd)) != 1) continue;
+        }
+        cg::sampleInst(in);
+    }
+}
 inline void startCovergroups() {
     g_cgHook = cg::hook;
+    cg::g_cgInstStart = [](int id) {
+        const CgInst& in = cgInsts()[id];
+        cg::SelfScope ss(in);
+        std::vector<std::pair<int, Edge>> ev;
+        for (auto& [s, e] : cgDefs()[in.def].ev) ev.push_back({R(s), e});
+        S.spawn(cgInstProc(id, std::move(ev)));
+    };
     for (size_t d = 0; d < cgDefs().size(); d++)
-        if (!cgDefs()[d].ev.empty()) S.spawn(cgProc((int)d));
+        if (!cgDefs()[d].ev.empty() && !cgDefs()[d].inClass) S.spawn(cgProc((int)d));
 }
