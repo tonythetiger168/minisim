@@ -40,6 +40,43 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
     return true;
 }
 
+// $writememh / $writememb (21.5): one word per line, every digit written
+// (x and z as x and z), no @ addresses. The default range is the whole
+// memory, lowest address first; start and finish pick a range and order.
+static void writeMem(const Instr& i) {
+    const ArrShape& a = *i.arr;
+    auto [l, r] = a.dims[0];
+    int64_t lowA = std::min(l, r), highA = std::max(l, r);
+    int64_t start = lowA, finish = highA;
+    if (i.args.size() > 0) { Val v = eval(i.args[0], rd); if (!v.x) start = v_to_i64(v); }
+    if (i.args.size() > 1) { Val v = eval(i.args[1], rd); if (!v.x) finish = v_to_i64(v); }
+    std::ofstream out(i.fmt);
+    if (!out) { std::cerr << "$writemem: cannot open " << i.fmt << "\n"; return; }
+    int64_t step = finish < start ? -1 : 1;
+    for (int64_t ad = start;; ad += step) {
+        int64_t off = a.offset({ad});
+        if (off >= 0) {
+            Val v = S.get(a.base + (int)off);
+            v.sgn = false;
+            int bits = i.hex ? 4 : 1;
+            int n = (a.elemW + bits - 1) / bits;
+            std::string s(n, '0');
+            for (int d = 0; d < n; d++) {
+                int val = 0, xs = 0, zs = 0, cnt = 0;
+                for (int b = 0; b < bits && d * bits + b < a.elemW; b++, cnt++) {
+                    int t = bitAt(v, d * bits + b);
+                    if (t == 1) val |= 1 << b;
+                    else if (t == 2) xs++;
+                    else if (t == 3) zs++;
+                }
+                s[n - 1 - d] = zs == cnt ? 'z' : (xs || zs) ? 'x' : "0123456789abcdef"[val];
+            }
+            out << s << "\n";
+        }
+        if (ad == finish) break;
+    }
+}
+
 // $readmemh / $readmemb (21.4) into a one-dimensional memory. Addresses are
 // index values. Without a range, loading starts at the lowest address and goes
 // up; with start and finish it goes from start toward finish. "@hex" in the
@@ -138,6 +175,117 @@ static void readMem(const Instr& i) {
 
 // One fork...join. Each branch reports when it ends; the parent resumes when
 // every branch has ended (join) or the first one has (join_any).
+inline void dynBump(int sig) { Val v = S.get(sig); S.set(sig, make((v.x ? 0 : v.v) + 1, 0, 64)); }
+inline void dynWarn(const char* what) { std::cerr << "warning: " << what << "\n"; }
+inline void dynExec(const Instr& i) {
+    auto& d = dynStore()[i.sig];
+    auto arg = [&](size_t n) { return eval(i.args[n], rd); };
+    auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
+    auto full = [&]() {   // a bounded queue drops what does not fit (7.10)
+        bool f = d.kind == 1 && d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1;
+        if (f) dynWarn("write past the bound of a bounded queue is ignored");
+        return f;
+    };
+    switch (i.dcmd) {
+        case D_SET: {
+            Val v = eval(i.e, rd);
+            if (d.kind == 2) { d.map[d.key(arg(0))] = v; break; }
+            int64_t k = idx(0);
+            if (k >= 0 && k < (int64_t)d.vec.size()) d.vec[(size_t)k] = v;
+            else if (d.kind == 1 && k == (int64_t)d.vec.size()) { d.vec.push_back(v); if (full()) d.vec.pop_back(); }
+            else { dynWarn("write to an index outside the array is ignored (7.4.6)"); return; }
+            break;
+        }
+        case D_NEW: {   // new[n] or new[n](src) (7.5.1)
+            int64_t n = idx(0);
+            if (n < 0) { dynWarn("new[] with a negative or unknown size"); n = 0; }
+            std::vector<Val> nv((size_t)n, d.dflt);
+            if (i.dsrc >= 0) {
+                auto src = dynStore()[i.dsrc].vec;
+                for (size_t k = 0; k < nv.size() && k < src.size(); k++) nv[k] = src[k];
+            }
+            d.vec = std::move(nv);
+            break;
+        }
+        case D_DELETE: d.vec.clear(); d.map.clear(); break;
+        case D_DELETE_AT: {
+            if (d.kind == 2) { d.map.erase(d.key(arg(0))); break; }
+            int64_t k = idx(0);
+            if (k < 0 || k >= (int64_t)d.vec.size()) { dynWarn("delete(i) outside the queue"); return; }
+            d.vec.erase(d.vec.begin() + k);
+            break;
+        }
+        case D_PUSH_BACK: d.vec.push_back(eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
+        case D_PUSH_FRONT: d.vec.insert(d.vec.begin(), eval(i.e, rd)); if (full()) d.vec.pop_back(); break;
+        case D_INSERT: {
+            int64_t k = idx(0);
+            if (k < 0 || k > (int64_t)d.vec.size()) { dynWarn("insert(i) outside the queue"); return; }
+            d.vec.insert(d.vec.begin() + k, eval(i.e, rd));
+            if (full()) d.vec.pop_back();
+            break;
+        }
+        case D_POP_FRONT:
+        case D_POP_BACK: {
+            Val v = d.dflt;
+            if (d.vec.empty()) dynWarn("pop from an empty queue");
+            else if (i.dcmd == D_POP_FRONT) { v = d.vec.front(); d.vec.erase(d.vec.begin()); }
+            else { v = d.vec.back(); d.vec.pop_back(); }
+            if (i.dres >= 0) S.set(i.dres, v);
+            break;
+        }
+        case D_FIRST: case D_LAST: case D_NEXT: case D_PREV: {   // 7.9.4-7.9.7
+            bool ok = false;
+            DynKey cur = d.key(S.get(i.dkey));
+            std::map<DynKey, Val>::iterator it = d.map.end();
+            if (i.dcmd == D_FIRST) it = d.map.begin();
+            else if (i.dcmd == D_LAST) { if (!d.map.empty()) it = std::prev(d.map.end()); }
+            else if (i.dcmd == D_NEXT) it = d.map.upper_bound(cur);
+            else { it = d.map.lower_bound(cur); it = it == d.map.begin() ? d.map.end() : std::prev(it); }
+            if (it != d.map.end()) { ok = true; S.set(i.dkey, d.keyVal(it->first)); }
+            if (i.dres >= 0) { Val r = make(ok, 0, 32); r.sgn = true; S.set(i.dres, r); }
+            return;   // the container did not change
+        }
+        case D_COPY: {
+            auto& s = dynStore()[i.dsrc];
+            if (d.kind == 2) d.map = s.map;
+            else { d.vec = s.kind == 2 ? std::vector<Val>{} : s.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
+            break;
+        }
+        case D_APPEND: {   // {q, r}: every element of r
+            auto s = dynStore()[i.dsrc].vec;
+            d.vec.insert(d.vec.end(), s.begin(), s.end());
+            break;
+        }
+        case D_APPEND_SLICE: {   // q[a:b] (7.10.1): out-of-range parts are left out
+            auto s = dynStore()[i.dsrc].vec;
+            int64_t a = std::max<int64_t>(idx(0), 0), b = std::min<int64_t>(idx(1), (int64_t)s.size() - 1);
+            for (int64_t k = a; k <= b; k++) d.vec.push_back(s[(size_t)k]);
+            break;
+        }
+        case D_REVERSE: std::reverse(d.vec.begin(), d.vec.end()); break;
+        case D_SORT:
+        case D_RSORT: {
+            bool down = i.dcmd == D_RSORT;
+            std::stable_sort(d.vec.begin(), d.vec.end(), [&](const Val& a, const Val& b) {
+                if (a.str || b.str) return down ? v_str(b) < v_str(a) : v_str(a) < v_str(b);
+                if (a.real || b.real) return down ? v_real(b) < v_real(a) : v_real(a) < v_real(b);
+                Val lt = down ? v_lt(b, a) : v_lt(a, b);
+                return !lt.x && lt.v;
+            });
+            break;
+        }
+        case D_SHUFFLE: {
+            static uint64_t seed = 0x9e3779b97f4a7c15ULL;
+            for (size_t k = d.vec.size(); k > 1; k--) {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                std::swap(d.vec[k - 1], d.vec[seed % k]);
+            }
+            break;
+        }
+    }
+    dynBump(i.sig);
+}
+
 struct JoinState {
     int left = 0;          // branches still running
     int join = 0;          // 0 join, 1 join_any, 2 join_none
@@ -229,7 +377,14 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 Val v = eval(i.e, rd);
                 if (i.drv >= 0) {
                     if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
-                    S.drive(i.sig, i.drv, v, i.s0, i.s1);
+                    if (!i.dly.empty()) S.driveLater(i.sig, i.drv, v, i.s0, i.s1, i.dly);   // assign #d (10.3.3)
+                    else S.drive(i.sig, i.drv, v, i.s0, i.s1);
+                    pc++; break;
+                }
+                if (i.dyn >= 0) {   // q[i] = v, aa[key] = v
+                    Instr set = i;
+                    set.k = IK::Dyn; set.sig = i.dyn; set.dcmd = D_SET;
+                    dynExec(set);
                     pc++; break;
                 }
                 int sig = i.sig, hi = i.hi, lo = i.lo;
@@ -245,6 +400,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 pc++; break;
             }
             case IK::ReadMem: readMem(i); pc++; break;
+            case IK::WriteMem: writeMem(i); pc++; break;
+            case IK::Dyn: dynExec(i); pc++; break;
             case IK::JmpIfNot:  pc = (truth(eval(i.e, rd)) == 1) ? pc + 1 : i.target; break;
             case IK::Jmp:       pc = i.target; break;
             case IK::WaitEdge:
@@ -279,6 +436,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
                 // process already queued runs until its next system task;
                 // that task itself runs (Icarus 13).
                 S.finished = true;
+                if (i.hi > S.exitCode) S.exitCode = i.hi;   // $fatal
                 goto done;
             case IK::Call: {
                 const Prog* callee = i.callee;

@@ -37,7 +37,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
-struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; };  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
+struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; };  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
 struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
@@ -236,6 +236,7 @@ struct Sim {
     Wheel wheel;                                     // time wheel
     uint64_t now = 0, lastDump = ~0ULL;
     bool finished = false;
+    int exitCode = 0;                                // the process exit status ($fatal sets 1)
     string vcdPath = "dump.vcd";                     // empty: no waveform
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
@@ -621,14 +622,94 @@ struct Sim {
         g.drv[d].s1 = (uint8_t)s1;
         // One driver that drives both 0 and 1 resolves to its own value
         // (X stays X, Z stays Z). Skip the per-bit strength walk.
-        if (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) { set(s, g.drv[0].v); return; }
-        set(s, resolveDrives(g.drv.data(), g.drv.size(), g.w));
+        Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
+              : (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) ? g.drv[0].v
+                                                                       : resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        if (!netDelay.empty()) {   // wire #d w (28.16): the resolved value arrives d later
+            auto nd = netDelay.find(s);
+            if (nd != netDelay.end()) { schedule(s, -1, r, g.val, nd->second, STR_STRONG, STR_STRONG); return; }
+        }
+        set(s, r);
     }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
                                : clipRead(sigs[s].val, sigs[s].w);
     }
     void nba(int s, Val v, int hi = -1, int lo = 0) { nbaq.push_back({s, v, hi, lo}); }
+
+    // Delayed drivers and net delays (10.3.3, 28.16). Each (signal, driver)
+    // has at most one update in flight; d = -1 is the net delay of signal s,
+    // applied to its resolved value. A new value that differs from the one in
+    // flight cancels it, and one equal to the current value schedules nothing.
+    unordered_map<int, vector<uint64_t>> netDelay;   // signal -> rise, fall, turn-off ticks
+    struct Pend { Val v; uint64_t gen = 0; bool live = false; };
+    map<pair<int, int>, Pend> pend;
+    struct LaterDrv { int s, d; uint64_t gen; uint8_t s0, s1; };
+    map<uint64_t, vector<LaterDrv>> laterDrv;
+    uint64_t pendGen = 0;
+    static bool sameVal(const Val& a, const Val& b) {
+        return a.w == b.w && a == b;
+    }
+    // Table 28-9 for one bit (0, 1, x = 2, z = 3); 10.3.3 for vectors.
+    static uint64_t pickDelay(const vector<uint64_t>& dl, const Val& from, const Val& to) {
+        size_t n = dl.size();
+        if (n == 1) return dl[0];
+        uint64_t rise = dl[0], fall = dl[1];
+        uint64_t off = n == 3 ? dl[2] : std::min(rise, fall);
+        uint64_t lo = std::min({rise, fall, off});
+        if (to.w == 1) {
+            int b = (to.x & 1) ? ((to.z & 1) ? 3 : 2) : (int)(to.v & 1);
+            return b == 1 ? rise : b == 0 ? fall : b == 3 ? off : lo;
+        }
+        bool allZ = true, zero = true, fromZero = true;
+        for (int k = 0; k < to.w; k++) {
+            int t = bitAt(to, k), f = bitAt(from, k);   // 0, 1, 2 = x, 3 = z
+            if (t != 3) allZ = false;
+            if (t != 0) zero = false;
+            if (f != 0) fromZero = false;
+        }
+        if (allZ) return off;
+        if (zero && !fromZero) return fall;
+        return rise;
+    }
+    void schedule(int s, int d, Val v, const Val& cur, const vector<uint64_t>& dl, uint8_t s0, uint8_t s1) {
+        auto& p = pend[{s, d}];
+        if (p.live) {
+            if (sameVal(v, p.v)) return;   // already on its way
+            p.live = false;
+        }
+        if (sameVal(v, cur)) return;
+        uint64_t t = pickDelay(dl, cur, v);
+        if (t == 0) { apply(s, d, v, s0, s1); return; }
+        p.v = v;
+        p.gen = ++pendGen;
+        p.live = true;
+        laterDrv[now + t].push_back({s, d, p.gen, s0, s1});
+        wheel[now + t];
+    }
+    void apply(int s, int d, const Val& v, uint8_t s0, uint8_t s1) {
+        if (d >= 0) drive(s, d, v, s0, s1);
+        else set(s, v);
+    }
+    // A driver with a delay: schedule its new value.
+    void driveLater(int s, int d, Val v, uint8_t s0, uint8_t s1, const vector<uint64_t>& dl) {
+        auto& g = sigs[s];
+        Val nv = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
+        schedule(s, d, nv, g.drv[d].v, dl, s0, s1);
+    }
+    void runLaterDrv() {
+        auto it = laterDrv.find(now);
+        if (it == laterDrv.end()) return;
+        auto batch = std::move(it->second);
+        laterDrv.erase(it);
+        for (auto& l : batch) {
+            auto pi = pend.find({l.s, l.d});
+            if (pi == pend.end() || !pi->second.live || pi->second.gen != l.gen) continue;   // cancelled
+            Val v = pi->second.v;
+            pi->second.live = false;
+            apply(l.s, l.d, v, l.s0, l.s1);
+        }
+    }
     // a <= #d b: an NBA in the slot d ticks from now (9.4.5). The empty wheel
     // entry makes the kernel stop at that time even if nothing else does.
     map<uint64_t, vector<NbaItem>> laterNba;
@@ -817,6 +898,44 @@ struct Sim {
         if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
         return body;
     }
+    // A time in kernel ticks, in the units, precision and suffix $timeformat
+    // set (20.4.3), right-justified to its minimum width (or minW if given).
+    static string fmtTime(Val v, int minW) {
+        const TimeFmt& tf = timeFmt();
+        string body;
+        if (v.real) {
+            double d = v_real(v) * std::pow(10.0, tf.tickExp - tf.units);
+            char buf[512];
+            snprintf(buf, sizeof buf, "%.*f", std::max(0, tf.prec), d);
+            body = buf;
+        } else if (anyX(v)) {
+            body = fmtVal('d', v, 0, true);
+        } else {
+            unsigned __int128 t = (unsigned __int128)(v.v & mask(std::min(64, v.w)));
+            auto p10 = [](int n) { unsigned __int128 r = 1; while (n-- > 0) r *= 10; return r; };
+            int sh = tf.tickExp - tf.units;   // ticks -> units: * 10^sh
+            int pr = std::max(0, tf.prec);
+            // value * 10^pr, rounded to an integer
+            unsigned __int128 q;
+            if (sh + pr >= 0) q = t * p10(sh + pr);
+            else { unsigned __int128 d = p10(-(sh + pr)); q = (t + d / 2) / d; }
+            auto u128 = [](unsigned __int128 x) {
+                string r;
+                do { r += char('0' + (int)(x % 10)); x /= 10; } while (x);
+                return string(r.rbegin(), r.rend());
+            };
+            unsigned __int128 P = p10(pr);
+            body = u128(q / P);
+            if (pr > 0) {
+                string f = u128(q % P);
+                body += "." + string(pr - f.size(), '0') + f;
+            }
+        }
+        body += tf.suffix;
+        int w = minW >= 0 ? minW : tf.width;
+        if ((int)body.size() < w) body = string(w - body.size(), ' ') + body;
+        return body;
+    }
     // The text of a format and its arguments ($display, $sformatf).
     static string sformat(const string& fmt, const vector<E>& args, const Reader& rd) {
         std::ostringstream cout;
@@ -842,6 +961,37 @@ struct Sim {
                 if (ai >= args.size()) continue;
                 Val v = eval(args[ai++], rd);
                 cout << fmtReal('R', v_real(v), 0, -1, false);
+                continue;
+            }
+            if (c == 'Q' && i + 1 < fmt.size()) {   // internal: %p of a container (21.2.1.6)
+                char style = fmt[++i];
+                if (ai >= args.size()) continue;
+                const E& h = args[ai++];
+                auto one = [&](Val v, char st) {
+                    if (st == 's') { v.str = true; return "\"" + v_str(v) + "\""; }
+                    if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
+                    return fmtVal('d', v, 0, true);
+                };
+                const DynObj& o = dynStore()[h->sig];
+                cout << "'{";
+                if (o.kind == 2) {
+                    bool first = true;
+                    for (const auto& [k, v] : o.map) {
+                        if (!first) cout << ", ";
+                        first = false;
+                        cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':' << one(v, style);
+                    }
+                } else {
+                    for (size_t k = 0; k < o.vec.size(); k++) cout << (k ? ", " : "") << one(o.vec[k], style);
+                }
+                cout << '}';
+                continue;
+            }
+            if ((c == 't' || c == 'T') && ai < args.size()) {   // %t (20.4.3): ticks, printed per $timeformat
+                Val v = eval(args[ai++], rd);
+                string out = fmtTime(v, (zero || minW > 0) ? minW : -1);
+                if (left && (int)out.size() < minW) out += string(minW - out.size(), ' ');
+                cout << out;
                 continue;
             }
             char lc = (char)tolower((unsigned char)c);
@@ -989,7 +1139,7 @@ struct Sim {
     // final blocks run in the same time, in one pass (9.2.3).
     void runFinal(const vector<Task>& ts) {
         if (ts.empty()) return;
-        wheel.clear(); laterNba.clear(); active.clear(); inactive.clear(); nbaq.clear();
+        wheel.clear(); laterNba.clear(); laterDrv.clear(); active.clear(); inactive.clear(); nbaq.clear();
         for (int id : seqq) seqPend[id] = 0;
         seqq.clear();
         finished = false;
@@ -1003,13 +1153,14 @@ struct Sim {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || !combq.empty();
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty();
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
             if (!any) continue;   // only disabled processes were waiting here
             now = t;
             g_simTime = now;
+            runLaterDrv();   // delayed continuous assignments and net delays due now (active region)
             if (auto ln = laterNba.find(now); ln != laterNba.end()) {
                 for (auto& n : ln->second) nbaq.push_back(n);
                 laterNba.erase(ln);

@@ -41,6 +41,15 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
+## Install
+
+Release packages for Linux x86_64 (`.deb` and `.tar.gz`) are on the
+[Releases](https://github.com/tonythetiger168/minisim/releases) page; see
+[`docs/RELEASING.md`](docs/RELEASING.md) for installing and for how releases
+are made, [`CHANGELOG.md`](CHANGELOG.md) for what changed, and
+[`docs/PRODUCT.md`](docs/PRODUCT.md) for the product line and roadmap.
+`msim -version` prints the installed version.
+
 ## Build and run
 
 ```sh
@@ -86,7 +95,36 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
+| `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |
+
+### Regressions: `mregress`
+
+`mregress` (installed next to `msim`; in the source tree `tools/mregress.py`)
+runs a test list on msim, VCS, Xcelium, Questa, or Icarus, in parallel, with
+seeds, and writes `results.json`, `junit.xml` (for CI) and `report.html`, with
+failures grouped by their first error line:
+
+```sh
+mregress tests.list -sim msim -j 8 -seeds 3     # or -sim vcs / xrun / questa / iverilog
+mregress tests.list -rerun                      # repeat only the failures
+mregress -spec tests/spec -sim iverilog         # the spec suite on another simulator
+```
+
+A test list line is `name: <simulator arguments>` with optional settings
+(`@seeds=N`, `@timeout=SEC`, `@pass=<regex>`, `@fail=<regex>`,
+`@expect=inline` for `//> ` expected output, `@skip=<sim>`, `@exit=N`,
+`@xfail=<reason>` for a known gap); `%common` and
+`%sim` set shared arguments and the default simulator, and `-f` includes
+another list. A run fails on a non-zero exit, a UVM_ERROR / UVM_FATAL count
+above zero, a simulator error line (`Error-[`, `*E,`, `** Error`), `$fatal`,
+or a failed `@pass` / `@expect` check. An `@xfail` test that fails counts as
+a known gap; one that passes (XPASS) fails the regression so the marker gets
+removed. With `-spec`, a test's `//! xfail: <reason>` and `//! exit: <n>`
+lines mean the same on msim, and a per-chapter pass table is printed
+(`-md FILE` also writes it as Markdown). See `tests/regress/smoke.list` and
+`mregress -h`. For Jenkins and other CI, see [`ci/README.md`](ci/README.md)
+and the pipeline in [`ci/Jenkinsfile`](ci/Jenkinsfile).
 
 ### Compiled mode
 
