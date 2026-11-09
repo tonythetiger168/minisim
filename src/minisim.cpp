@@ -23,6 +23,7 @@
 #include <iostream>
 #include <atomic>
 #include <array>
+#include <set>
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -876,21 +877,191 @@ struct Sim {
         g.drv[d].v = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
+        if (__builtin_expect(!loadsOf.empty(), 0)) shadowDrive(s, d);   // 32.4.4: loads that see each source's delay
         if (__builtin_expect(!tranOf.empty(), 0) && (size_t)s < tranOf.size() && !tranOf[(size_t)s].empty()) { tranResolve(s); return; }
         // One driver that drives both 0 and 1 resolves to its own value
         // (X stays X, Z stays Z). Skip the per-bit strength walk.
         Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
               : (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) ? g.drv[0].v
                                                                        : resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        if (!timedOut.empty() && (size_t)s < timedOut.size() && timedOut[s]) {   // 30.5.3, 30.7, 32.4.4
+            if (shadowed(s)) return;   // its value comes from the delayed sources (shadowOf)
+            Val from = projected(s, PQ_PATH, g.val);
+            if (sameVal(from, r)) return;   // already on its way, or there
+            Lim L = pathLim(s, from, r);
+            if (!netDelay.empty()) {   // a net delay on a path output is a distributed delay too (30.6)
+                auto nd = netDelay.find(s);
+                if (nd != netDelay.end()) L.d = std::max<uint64_t>(L.d, pickDelay(nd->second, from, r));
+            }
+            pulseSchedule(s, PQ_PATH, g.val, r, L, styleOf(s), STR_STRONG, STR_STRONG);
+            return;
+        }
         if (!netDelay.empty()) {   // wire #d w (28.16): the resolved value arrives d later
             auto nd = netDelay.find(s);
             if (nd != netDelay.end()) { schedule(s, -1, r, g.val, nd->second, STR_STRONG, STR_STRONG); return; }
         }
-        if (!timedOut.empty() && (size_t)s < timedOut.size() && timedOut[s]) {   // 30.5.3, 32.4.4
-            scheduleIn(s, -1, r, g.val, pathDelay(s, g.val, r), STR_STRONG, STR_STRONG);
+        set(s, r);
+    }
+
+    // Pulse filtering (30.7): the changes on their way to a path output
+    // (slot PQ_PATH), or of one source's driver as a load sees it through an
+    // interconnect delay (slot PQ_SRC - driver, 32.4.4). Each entry is one
+    // future change; an unlimited number may be pending.
+    enum { PQ_PATH = -2, PQ_SRC = -10 };
+    struct PEv { uint64_t t, gen; Val v; uint8_t s0, s1; };
+    map<pair<int, int>, vector<PEv>> pq;
+    struct Lim { uint64_t d = 0, rj = 0, er = 0; };
+    Val projected(int s, int slot, const Val& cur) {
+        auto it = pq.find({s, slot});
+        return it == pq.end() || it->second.empty() ? cur : it->second.back().v;
+    }
+    uint8_t styleOf(int s) const {
+        uint8_t st = 0;
+        if (auto it = pulseStyles().find(s); it != pulseStyles().end()) st = it->second;
+        const PulseOpts& o = pulseOpts();
+        if (o.detect >= 0) st = (uint8_t)(o.detect ? st | PS_DETECT : st & ~PS_DETECT);
+        if (o.showCancelled >= 0) st = (uint8_t)(o.showCancelled ? st | PS_SHOWCANCELLED : st & ~PS_SHOWCANCELLED);
+        return st;
+    }
+    void pqPush(int s, int slot, uint64_t t, const Val& v, uint8_t s0, uint8_t s1) {
+        uint64_t gen = ++pendGen;
+        auto& q = pq[{s, slot}];
+        auto at = q.end();   // keep the queue in time order
+        while (at != q.begin() && (at - 1)->t > t) --at;
+        q.insert(at, PEv{t, gen, v, s0, s1});
+        laterDrv[t].push_back({s, slot, gen, s0, s1});
+        wheel[t];
+    }
+    // The bits of `lead` that differ from `before`, as x: a pulse filtered to x.
+    static Val pulseX(const Val& before, const Val& lead) {
+        Val x = lead;
+        for (int b = 0; b < lead.w; b++)
+            if (bitAt(before, b) != bitAt(lead, b)) setBit(x, b, 2);
+        return x;
+    }
+    // A new change v of signal s (slot), with the delay and pulse limits of
+    // its transition. The last pending change is the pulse's leading edge
+    // and v its trailing edge: a pulse at least as wide as the error limit
+    // passes, one at least as wide as the reject limit becomes x (from the
+    // leading edge, or at once with on-detect), a narrower one disappears.
+    // A trailing edge due before its leading edge cancels it, or with
+    // showcancelled makes x between the two (from now with on-detect)
+    // (30.7.4).
+    void pulseSchedule(int s, int slot, const Val& cur, const Val& v, Lim L, uint8_t style, uint8_t s0, uint8_t s1) {
+        L.rj = std::min(L.rj, L.d);
+        L.er = std::min(std::max(L.er, L.rj), L.d);
+        auto& q = pq[{s, slot}];
+        uint64_t tB = now + L.d;
+        if (q.empty()) {
+            if (L.d == 0) { applySlot(s, slot, v, s0, s1); return; }
+            pqPush(s, slot, tB, v, s0, s1);
             return;
         }
+        PEv lead = q.back();
+        Val before = q.size() > 1 ? q[q.size() - 2].v : cur;
+        bool detect = style & PS_DETECT;
+        if (tB < lead.t) {   // a negative pulse (30.7.4.2)
+            q.pop_back();
+            if (style & PS_SHOWCANCELLED) {
+                Val x = pulseX(before, lead.v);
+                if (detect) applyOrPush(s, slot, now, x, lead.s0, lead.s1);
+                else pqPush(s, slot, tB, x, lead.s0, lead.s1);
+                pqPush(s, slot, lead.t, v, s0, s1);
+                return;
+            }
+            if (!sameVal(v, before)) pqPush(s, slot, tB, v, s0, s1);
+            return;
+        }
+        uint64_t width = tB - lead.t;
+        if (width >= L.er) { pqPush(s, slot, tB, v, s0, s1); return; }
+        if (width >= L.rj) {   // filtered to x
+            Val x = pulseX(before, lead.v);
+            q.pop_back();
+            if (detect) applyOrPush(s, slot, now, x, lead.s0, lead.s1);
+            else pqPush(s, slot, lead.t, x, lead.s0, lead.s1);
+            pqPush(s, slot, tB, v, s0, s1);
+            return;
+        }
+        q.pop_back();   // rejected
+        if (!sameVal(v, before)) pqPush(s, slot, tB, v, s0, s1);
+    }
+    void applyOrPush(int s, int slot, uint64_t t, const Val& v, uint8_t s0, uint8_t s1) {
+        if (t == now) applySlot(s, slot, v, s0, s1);
+        else pqPush(s, slot, t, v, s0, s1);
+    }
+    void applySlot(int s, int slot, const Val& v, uint8_t s0, uint8_t s1) {
+        if (slot == PQ_PATH) { set(s, v); return; }
+        auto& sh = shadowOf[s];
+        int d = PQ_SRC - slot;
+        if ((size_t)d >= sh.drv.size()) return;
+        sh.drv[(size_t)d] = Drv{v, s0, s1};
+        const Sig& net = sigs[(size_t)sh.net];
+        Val r = net.kind != NR_WIRE ? resolveNet(net.kind, sh.drv.data(), sh.drv.size(), sigs[(size_t)s].w, sigs[(size_t)s].val)
+                                    : resolveDrives(sh.drv.data(), sh.drv.size(), sigs[(size_t)s].w);
         set(s, r);
+    }
+    // A pending change (laterDrv) of a pulse queue is due: apply it unless
+    // it was cancelled.
+    bool runPulse(int s, int slot, uint64_t gen) {
+        auto it = pq.find({s, slot});
+        if (it == pq.end()) return true;
+        auto& q = it->second;
+        for (size_t k = 0; k < q.size(); k++) {
+            if (q[k].gen != gen) continue;
+            PEv e = q[k];
+            q.erase(q.begin() + (long)k);
+            applySlot(s, slot, e.v, e.s0, e.s1);
+            break;
+        }
+        return true;
+    }
+
+    // Interconnect delays from each source of a net with several sources to
+    // one load (32.4.4): the load's value is the resolution of the net's
+    // drivers, each seen through its own delay. shadowOf[load] keeps those
+    // delayed drivers; loadsOf[net] lists the loads.
+    struct Shadow {
+        int net = -1;
+        vector<Drv> drv;
+        Delay12 all;                        // PORT / NETDELAY: from every source
+        map<int, Delay12> from;             // INTERCONNECT: from one driver of the net
+    };
+    unordered_map<int, Shadow> shadowOf;
+    unordered_map<int, vector<int>> loadsOf;
+    bool shadowed(int s) const { return !shadowOf.empty() && shadowOf.count(s); }
+    Shadow& addShadow(int load, int net) {
+        auto [it, fresh] = shadowOf.try_emplace(load);
+        if (fresh) {
+            it->second.net = net;
+            it->second.drv = sigs[(size_t)net].drv;
+            loadsOf[net].push_back(load);
+            if ((size_t)load < timedOut.size()) timedOut[(size_t)load] = 1;
+        }
+        return it->second;
+    }
+    void shadowDrive(int net, int d) {
+        auto li = loadsOf.find(net);
+        if (li == loadsOf.end()) return;
+        const Drv& now_ = sigs[(size_t)net].drv[(size_t)d];
+        for (int load : li->second) {
+            Shadow& sh = shadowOf[load];
+            if ((size_t)d >= sh.drv.size()) continue;
+            auto fi = sh.from.find(d);
+            const Delay12& D = fi != sh.from.end() ? fi->second : sh.all;
+            int slot = PQ_SRC - d;
+            Val from = projected(load, slot, sh.drv[(size_t)d].v);
+            if (sameVal(from, now_.v)) continue;
+            Lim L = lim12(D, from, now_.v);
+            pulseSchedule(load, slot, sh.drv[(size_t)d].v, now_.v, L, 0, now_.s0, now_.s1);
+        }
+    }
+    // A gate or UDP driver with SDF DEVICE delays (32.4.1): inertial, by
+    // the transition's delay.
+    void driveGate(int s, int d, Val v, uint8_t s0, uint8_t s1, const uint64_t* dl) {
+        auto& g = sigs[s];
+        Val nv = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
+        const Val& cur = g.drv[(size_t)d].v;
+        scheduleIn(s, d, nv, cur, delay12(dl, cur, nv), s0, s1);
     }
 
     // Specify path outputs and interconnect loads (30.4, 32.4.4). timedOut[s]
@@ -899,7 +1070,7 @@ struct Sim {
     vector<uint8_t> timedOut, pathIn;
     vector<uint64_t> lastChg;
     unordered_map<int, vector<int>> pathsTo;               // output -> pathRecs() indices
-    unordered_map<int, array<uint64_t, 12>> icDelay;       // load port -> interconnect delay
+    unordered_map<int, Delay12> icDelay;                   // load port -> interconnect delay (every source)
     bool (*pathCond)(const E&) = nullptr;                  // a path condition holds (x counts)
     // Sizes the tables once the design is lowered and annotated.
     void setupPaths() {
@@ -914,6 +1085,7 @@ struct Sim {
             pathIn[(size_t)P[k].src] = 1;
         }
         for (auto& [sg, d] : icDelay) timedOut[(size_t)sg] = 1;
+        for (auto& [sg, sh] : shadowOf) timedOut[(size_t)sg] = 1;
         // Like a net delay, a delayed net with drivers is x until its first
         // value arrives (28.16).
         for (size_t k = 0; k < timedOut.size(); k++)
@@ -931,13 +1103,26 @@ struct Sim {
         }
         return best == ~0ULL ? 0 : best;
     }
+    // Delay and pulse limits of a change: a vector takes the transition
+    // with the smallest delay among its changed bits.
+    template <class D> static Lim lim12(const D& x, const Val& from, const Val& to) {
+        Lim L;
+        bool any = false;
+        for (int k = 0; k < to.w; k++) {
+            int f = bitAt(from, k), t = bitAt(to, k);
+            if (f == t) continue;
+            int i = transIdx(f, t);
+            if (!any || x.d[i] < L.d) { L = {x.d[i], x.rj[i], x.er[i]}; any = true; }
+        }
+        return L;
+    }
     // 30.5.3: the paths to s whose input changed most recently and whose
     // condition holds (an ifnone path when no conditional path between the
     // same ports holds) are active; the delay is the smallest of theirs.
     // With no active path there is no path delay. An interconnect delay to
     // a load port comes after the path delay of a path ending there.
-    uint64_t pathDelay(int s, const Val& from, const Val& to) {
-        uint64_t t = 0;
+    Lim pathLim(int s, const Val& from, const Val& to) {
+        Lim t;
         auto pt = pathsTo.find(s);
         if (pt != pathsTo.end()) {
             auto& P = pathRecs();
@@ -951,21 +1136,26 @@ struct Sim {
                 }
                 return true;
             };
-            uint64_t latest = 0, best = ~0ULL;
+            uint64_t latest = 0;
             bool any = false;
             for (int j : ids) {
                 const PathRec& p = P[(size_t)j];
                 if (!on(p)) continue;
                 uint64_t lc = lastChg[(size_t)p.src];
-                uint64_t d = delay12(p.d, from, to);
-                if (!any || lc > latest) { latest = lc; best = d; any = true; }
-                else if (lc == latest) best = std::min(best, d);
+                Lim d = lim12(p, from, to);
+                // 30.6: delays inside the module (gates, assignments) that
+                // already passed count toward the path delay; the larger of
+                // the two applies.
+                d.d = lc + d.d > now ? lc + d.d - now : 0;
+                if (!any || lc > latest || (lc == latest && d.d < t.d)) { latest = lc; t = d; any = true; }
             }
-            if (any) t = best;
         }
         if (!icDelay.empty()) {
             auto ic = icDelay.find(s);
-            if (ic != icDelay.end()) t += delay12(ic->second, from, to);
+            if (ic != icDelay.end()) {
+                Lim d = lim12(ic->second, from, to);
+                t.d += d.d; t.rj += d.rj; t.er += d.er;
+            }
         }
         return t;
     }
@@ -1130,6 +1320,7 @@ struct Sim {
         auto batch = std::move(it->second);
         laterDrv.erase(it);
         for (auto& l : batch) {
+            if (l.d <= PQ_PATH) { runPulse(l.s, l.d, l.gen); continue; }   // 30.7, 32.4.4
             auto pi = pend.find({l.s, l.d});
             if (pi == pend.end() || !pi->second.live || pi->second.gen != l.gen) continue;   // cancelled
             Val v = pi->second.v;
