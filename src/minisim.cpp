@@ -20,10 +20,14 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <atomic>
+#include <functional>
 #include <map>
+#include <queue>
 #include <sstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -48,6 +52,135 @@ struct Task {
         void unhandled_exception() { terminate(); }
     };
     coroutine_handle<promise_type> h;
+};
+
+// A small thread pool for Sim::parallelFor. Each batch is split into one
+// contiguous range per thread (thread k takes items [n*k/T, n*(k+1)/T)), so a
+// batch costs one wake-up and one counter update per thread, not per item,
+// and neighbouring result slots are written by the same thread. Workers spin
+// briefly between batches, then sleep on an atomic wait.
+// Default worker count: the hardware threads, but at most 8. Measured on a
+// 20-core / 28-thread i7-14700 (bench/wide.sv): 4 to 12 threads were fastest,
+// 20 was slower than 8, and 24 or more was 5-50x slower, because one
+// descheduled thread holds up every batch. -threads N still picks any count
+// up to the hardware threads.
+inline int defaultThreads() {
+    int hw = (int)thread::hardware_concurrency();
+    return hw < 1 ? 1 : (hw > 8 ? 8 : hw);
+}
+
+struct Pool {
+    // Each thread starts on its own contiguous range of a batch (so the same
+    // items keep landing on the same core's cache), takes it in chunks, and
+    // then steals unclaimed chunks from the other ranges. A thread the OS has
+    // descheduled (a busy desktop, a VM with as many threads as CPUs) then
+    // holds up a batch only for the chunk it is in the middle of. With fixed
+    // ranges and no stealing, a batch waited for every descheduled worker,
+    // which made a loaded run 10x or more slower than one thread.
+    //
+    // A slot's claim packs the batch number (high 32 bits) with its next item
+    // (low 32 bits), so a worker that wakes up late can never take an item of
+    // a batch it did not see published.
+    static constexpr int kMaxThreads = 64;
+    using Job = void (*)(void*, size_t);
+    struct alignas(64) Slot {
+        atomic<uint64_t> claim{0};
+        atomic<size_t> end{0}, chunk{1};
+    };
+    Slot slots[kMaxThreads];
+    vector<thread> ts;
+    atomic<uint64_t> gen{0};       // bumped once per batch; idle workers sleep on it
+    alignas(64) atomic<size_t> finished{0};   // items of the current batch that are done
+    atomic<size_t> total{0};       // items in the current batch
+    Job job = nullptr;             // written before a batch is published, read after a claim
+    void* ctx = nullptr;
+    atomic<bool> stop{false};
+    int size() const { return (int)ts.size() + 1; }
+    void ensure(int n) {
+        n = std::min(n, kMaxThreads);
+        while ((int)ts.size() < n - 1) {
+            int id = (int)ts.size() + 1;
+            ts.emplace_back([this, id] { worker(id); });
+        }
+    }
+    ~Pool() {
+        stop = true;
+        gen.fetch_add(1);
+        gen.notify_all();
+        for (auto& t : ts) t.join();
+    }
+    // Take chunks of slot s in batch b until it is empty. False once the
+    // batch is over, so stealing can stop early.
+    bool drain(Slot& s, uint32_t b) {
+        uint64_t c = s.claim.load(memory_order_acquire);
+        for (;;) {
+            if ((uint32_t)(c >> 32) != b) return false;
+            // Read after a claim of batch b was seen: a successful CAS below
+            // proves batch b was still open, so these are b's values.
+            size_t lo = (size_t)(uint32_t)c, n = s.end.load(memory_order_relaxed);
+            if (lo >= n) return true;
+            size_t hi = std::min(n, lo + s.chunk.load(memory_order_relaxed));
+            if (!s.claim.compare_exchange_weak(c, ((uint64_t)b << 32) | hi,
+                                               memory_order_acq_rel, memory_order_acquire)) continue;
+            for (size_t i = lo; i < hi; i++) job(ctx, i);
+            // The chunk that completes the batch wakes run() if it sleeps.
+            if (finished.fetch_add(hi - lo, memory_order_acq_rel) + (hi - lo) == total.load(memory_order_relaxed))
+                finished.notify_one();
+            c = s.claim.load(memory_order_acquire);
+        }
+    }
+    void work(int id, uint32_t b) {
+        int T = size();
+        for (int k = 0; k < T; k++)
+            if (!drain(slots[(id + k) % T], b)) return;
+    }
+    void worker(int id) {
+        uint64_t seen = 0;
+        for (;;) {
+            uint64_t g;
+            int spins = 0;
+            while ((g = gen.load(memory_order_acquire)) == seen) {
+                // Spin for the next batch; yield, which lets any other
+                // runnable thread have the CPU; then sleep.
+                if (++spins < 4000) relax();
+                else if (spins < 20000) this_thread::yield();
+                else gen.wait(seen);
+            }
+            seen = g;
+            if (stop) return;
+            work(id, (uint32_t)g);
+        }
+    }
+    static void relax() {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    }
+    void run(size_t n, Job j, void* c) {
+        uint32_t b = (uint32_t)(gen.load(memory_order_relaxed) + 1);
+        size_t T = (size_t)size();
+        job = j;
+        ctx = c;
+        total.store(n, memory_order_relaxed);
+        finished.store(0, memory_order_relaxed);
+        for (size_t t = 0; t < T; t++) {
+            size_t lo = n * t / T, hi = n * (t + 1) / T;
+            slots[t].end.store(hi, memory_order_relaxed);
+            slots[t].chunk.store(std::max<size_t>(1, (hi - lo) / 4), memory_order_relaxed);
+            slots[t].claim.store(((uint64_t)b << 32) | lo, memory_order_release);
+        }
+        gen.store(b, memory_order_release);   // the only writer while the pool runs
+        gen.notify_all();
+        work(0, b);
+        // Wait for chunks other threads are still running: spin, yield, then sleep.
+        for (int spins = 0;; spins++) {
+            size_t d = finished.load(memory_order_acquire);
+            if (d >= n) break;
+            if (spins < 4000) relax();
+            else if (spins < 20000) this_thread::yield();
+            else finished.wait(d, memory_order_acquire);
+        }
+    }
 };
 
 struct Sim {
@@ -75,6 +208,250 @@ struct Sim {
     ofstream vcd;
 
     Sim() { g_sformat = &Sim::sformat; }
+
+    // ---- multi-core: deterministic parallel batches ----
+    // `threads` workers (default: defaultThreads(); msim -threads N).
+    // Only work that reads signals and writes into its own buffer runs in
+    // parallel: the value of a combinational process, or the NBAs of a
+    // clocked process. Results are committed afterwards on this thread in a
+    // fixed order (rank, process index), so the output does not depend on the
+    // thread count or on timing. -threads 1 runs the same code serially.
+    int threads = 1;
+    static constexpr size_t kMinParallel = 32;
+    Pool pool;
+    template <class F>
+    void parallelFor(size_t n, F&& f) {
+        // A small batch is cheaper on this thread than a wake-up of the pool.
+        if (threads <= 1 || n < kMinParallel) { for (size_t i = 0; i < n; i++) f(i); return; }
+        pool.ensure(threads);
+        pool.run(n, [](void* c, size_t i) { (*static_cast<F*>(c))(i); }, &f);
+    }
+
+    // ---- static combinational schedule (prog.hpp: combShape / combSchedule) ----
+    // combs[r] is the process of rank r. Ranks are in topological order and
+    // sorted by level (longest path from a non-combinational input), so two
+    // ranks of one level never feed each other. A change on a signal marks
+    // the ranks that read it; when the active region is empty the kernel takes
+    // the lowest pending level, computes every marked rank of it (in parallel
+    // when `compute` is set), and commits them in rank order. Each rank runs
+    // at most once per wave. `curComb` is the committing one: its own writes
+    // do not mark it again (a process is not woken by itself).
+    struct Comb {
+        void (*fn)(const void*);            // whole body, serial
+        Val (*compute)(const void*);        // optional: the value of a one-assign body (no side effects)
+        void (*commit)(const void*, Val);   // ...and its write
+        const void* ctx;
+        int level;
+    };
+    vector<Comb> combs;
+    vector<vector<int>> combOf;                      // signal -> ranks that read it
+    vector<char> combPend;
+    priority_queue<int, vector<int>, greater<int>> combq;
+    int curComb = -1;
+    vector<int> combBatch;
+    vector<Val> combVals;
+    // Register the next rank. `ins` is the process's wait list.
+    void addComb(void (*fn)(const void*), const void* ctx, const vector<int>& ins, int level = 0,
+                 Val (*compute)(const void*) = nullptr, void (*commit)(const void*, Val) = nullptr) {
+        int r = (int)combs.size();
+        combs.push_back({fn, compute, commit, ctx, level});
+        combPend.push_back(0);
+        if (combOf.size() < sigs.size()) combOf.resize(sigs.size());
+        for (int s : ins) combOf[s].push_back(r);
+        markComb(r);  // runs once at time 0, as the process would have
+    }
+    void markComb(int r) {
+        if (combPend[r]) return;
+        combPend[r] = 1;
+        combq.push(r);
+    }
+    void runCombs() {
+        while (!combq.empty()) {
+            int level = combs[combq.top()].level;
+            combBatch.clear();
+            while (!combq.empty() && combs[combq.top()].level == level) {
+                int r = combq.top();
+                combq.pop();
+                combPend[r] = 0;
+                combBatch.push_back(r);
+            }
+            combVals.resize(combBatch.size());
+            parallelFor(combBatch.size(), [&](size_t k) {
+                const Comb& c = combs[combBatch[k]];
+                if (c.compute) combVals[k] = c.compute(c.ctx);
+            });
+            for (size_t k = 0; k < combBatch.size(); k++) {
+                int r = combBatch[k];
+                curComb = r;
+                if (combs[r].compute) combs[r].commit(combs[r].ctx, combVals[k]);
+                else combs[r].fn(combs[r].ctx);
+                curComb = -1;
+            }
+        }
+    }
+
+    // ---- partitions: independent islands of logic, updated in parallel ----
+    // Like Verilator's macro-tasks. Signals written by combinational processes
+    // or by a clocked process's NBAs are grouped with every combinational
+    // process that reads them (union-find), so two partitions share no written
+    // signal and no combinational process. In the NBA region, the NBAs that
+    // land in a partition are applied, and its combinational processes
+    // re-evaluated in rank order, by one thread, one partition per task.
+    // A partition is used only when nothing outside it can observe its
+    // signals mid-region: no VCD, no $monitor, no coroutine waiting on one of
+    // its signals, and no clocked process triggered by one. Otherwise its NBAs
+    // go through the ordinary serial path, which gives the same values.
+    struct Part {
+        vector<int> combs;     // ranks, ascending
+        vector<int> written;   // signals owned by this partition
+        bool edgeSource = false;  // some clocked process is triggered by one of `written`
+        vector<NbaItem> items; // this region's NBAs, in queue order
+        vector<char> pend;     // per entry of `combs`
+        int cur = -1;          // entry being evaluated
+    };
+    vector<Part> parts;
+    vector<int> sigPart;       // signal -> partition, or -1
+    vector<int> combLocal;     // rank -> index in its partition's `combs`
+    vector<int> partsBusy;
+    vector<NbaItem> nbaSerial;
+    static inline thread_local Part* tlPart = nullptr;
+    // `seqTargets`: the fixed NBA targets of each clocked process (an NBA whose
+    // target is chosen at run time falls back to the serial path by itself).
+    void buildPartitions(const vector<vector<int>>& combOuts, const vector<vector<int>>& combIns,
+                         const vector<int>& seqTargets) {
+        size_t ns = sigs.size();
+        combOf.resize(ns);
+        seqOf.resize(ns);
+        vector<int> up(ns);
+        for (size_t i = 0; i < ns; i++) up[i] = (int)i;
+        auto find = [&](int x) { while (up[x] != x) x = up[x] = up[up[x]]; return x; };
+        auto unite = [&](int a, int b) { a = find(a); b = find(b); if (a != b) up[max(a, b)] = min(a, b); };
+        vector<char> owned(ns, 0);
+        for (auto& o : combOuts) for (int x : o) owned[x] = 1;
+        for (int x : seqTargets) owned[x] = 1;
+        for (size_t r = 0; r < combOuts.size(); r++) {
+            int first = -1;
+            for (int x : combOuts[r]) { if (first < 0) first = x; else unite(first, x); }
+            for (int x : combIns[r])
+                if (owned[x]) { if (first < 0) first = x; else unite(first, x); }
+        }
+        vector<int> id(ns, -1);
+        parts.clear();
+        sigPart.assign(ns, -1);
+        for (size_t x = 0; x < ns; x++) {
+            if (!owned[x]) continue;
+            int root = find((int)x);
+            if (id[root] < 0) { id[root] = (int)parts.size(); parts.emplace_back(); }
+            sigPart[x] = id[root];
+            parts[id[root]].written.push_back((int)x);
+        }
+        combLocal.assign(combs.size(), -1);
+        for (size_t r = 0; r < combOuts.size(); r++) {
+            if (combOuts[r].empty()) continue;
+            Part& pt = parts[sigPart[combOuts[r][0]]];
+            combLocal[r] = (int)pt.combs.size();
+            pt.combs.push_back((int)r);
+        }
+        for (auto& pt : parts) {
+            pt.pend.assign(pt.combs.size(), 0);
+            for (int x : pt.written)
+                if ((size_t)x < seqOf.size() && !seqOf[x].empty()) pt.edgeSource = true;
+        }
+    }
+    // set() inside a partition task: only this partition reads the signal.
+    void setLocal(int s, Val nv) {
+        Sig& g = sigs[s];
+        if (nv == g.val) return;
+        g.val = nv;
+        Part& pt = *tlPart;
+        for (int r : combOf[s]) {
+            int k = combLocal[r];
+            if (k != pt.cur) pt.pend[k] = 1;
+        }
+    }
+    void runPart(Part& pt) {
+        tlPart = &pt;
+        for (auto& n : pt.items) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
+        pt.items.clear();
+        // A partition's ranks only feed higher ranks: one forward sweep.
+        for (size_t k = 0; k < pt.combs.size(); k++) {
+            if (!pt.pend[k]) continue;
+            pt.pend[k] = 0;
+            pt.cur = (int)k;
+            const Comb& c = combs[pt.combs[k]];
+            c.fn(c.ctx);
+        }
+        pt.cur = -1;
+        tlPart = nullptr;
+    }
+    bool partUsable(const Part& pt) const {
+        if (pt.edgeSource) return false;
+        for (int x : pt.written)
+            if (!waiters[x].empty()) return false;
+        return true;
+    }
+    void applyNba() {
+        if (parts.empty() || vcd.is_open() || mon.on) {
+            // Partial writes merge into the value as it is *now*, so two NBAs to
+            // different bits of one reg in the same slot both take effect.
+            for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
+            return;
+        }
+        nbaSerial.clear();
+        partsBusy.clear();
+        for (auto& n : nbaRun) {
+            int p = sigPart[n.s];
+            if (p >= 0) {
+                if (parts[p].items.empty()) partsBusy.push_back(p);
+                parts[p].items.push_back(n);
+            } else
+                nbaSerial.push_back(n);
+        }
+        // A partition that something outside could observe goes serial, keeping queue order.
+        size_t keep = 0;
+        for (int p : partsBusy) {
+            if (partUsable(parts[p])) { partsBusy[keep++] = p; continue; }
+            for (auto& n : parts[p].items) nbaSerial.push_back(n);
+            parts[p].items.clear();
+        }
+        partsBusy.resize(keep);
+        for (auto& n : nbaSerial) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
+        if (!std::is_sorted(partsBusy.begin(), partsBusy.end())) std::sort(partsBusy.begin(), partsBusy.end());
+        parallelFor(partsBusy.size(), [&](size_t k) { runPart(parts[partsBusy[k]]); });
+    }
+
+    // ---- clocked processes as functions (prog.hpp: seqShape) ----
+    // A process that waits on fixed events and then only schedules NBAs
+    // (always @(posedge clk) RTL) runs as a function that writes its NBAs into
+    // its own buffer. All triggered ones in a slot run as one batch, in
+    // parallel, and their NBAs join the queue in process order.
+    struct Seq { void (*fn)(const void*, vector<NbaItem>&); const void* ctx; };
+    vector<Seq> seqs;
+    vector<vector<pair<int, Edge>>> seqOf;           // signal -> (process, edge)
+    vector<char> seqPend;
+    vector<int> seqq;
+    vector<vector<NbaItem>> seqBufs;
+    void addSeq(void (*fn)(const void*, vector<NbaItem>&), const void* ctx, const vector<pair<int, Edge>>& ev) {
+        int id = (int)seqs.size();
+        seqs.push_back({fn, ctx});
+        seqPend.push_back(0);
+        if (seqOf.size() < sigs.size()) seqOf.resize(sigs.size());
+        for (auto& [sg, e] : ev) seqOf[sg].push_back({id, e});
+    }
+    void runSeqs() {
+        if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
+        if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
+        parallelFor(seqq.size(), [&](size_t k) {
+            seqBufs[k].clear();
+            seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+        });
+        for (size_t k = 0; k < seqq.size(); k++) {
+            seqPend[seqq[k]] = 0;
+            nbaq.insert(nbaq.end(), seqBufs[k].begin(), seqBufs[k].end());
+        }
+        seqq.clear();
+    }
+
     ~Sim() { for (auto h : all) h.destroy(); }
 
     // A wire (`net`) starts as Z, including before the first drive().
@@ -423,6 +800,7 @@ struct Sim {
             nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;
             nv.hi.clear();
         } else nv = maskWidth(nv, sigs[s].w);
+        if (tlPart) { setLocal(s, nv); return; }
         if (nv == sigs[s].val) return;
         int o = bit0(sigs[s].val), n = bit0(nv);
         sigs[s].val = nv;
@@ -445,6 +823,15 @@ struct Sim {
             }
         }
         ws.erase(ws.begin() + (ptrdiff_t)keep, ws.end());
+        if ((size_t)s < combOf.size())
+            for (int r : combOf[s])
+                if (r != curComb) markComb(r);
+        if ((size_t)s < seqOf.size())
+            for (auto& [id, e] : seqOf[s])
+                if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
+                    seqPend[id] = 1;
+                    seqq.push_back(id);
+                }
     }
 
     void header() {
@@ -463,17 +850,20 @@ struct Sim {
     void runFinal(const vector<Task>& ts) {
         if (ts.empty()) return;
         wheel.clear(); laterNba.clear(); active.clear(); inactive.clear(); nbaq.clear();
+        for (int id : seqq) seqPend[id] = 0;
+        seqq.clear();
         finished = false;
         for (auto& t : ts) spawn(t);
         run(~0ULL, false);
     }
     void run(uint64_t end, bool start = true) {
         if (start) { header(); dumpvars(); }
+        if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0;
+            bool any = laterNba.count(t) > 0 || !combq.empty();
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
@@ -488,6 +878,10 @@ struct Sim {
                 if (!active.empty()) {                         // active
                     Handle h = active.front(); active.pop_front();
                     if (!h.done()) h.resume();
+                } else if (!seqq.empty()) {                    // clocked processes, one parallel batch
+                    runSeqs();
+                } else if (!combq.empty()) {                   // levelized combinational logic
+                    runCombs();
                 } else if (!inactive.empty()) {                // inactive (#0)
                     for (auto h : inactive) active.push_back(h);
                     inactive.clear();
@@ -495,9 +889,7 @@ struct Sim {
                     // Swap, not move: both buffers keep their capacity across slots.
                     nbaRun.clear();
                     nbaRun.swap(nbaq);
-                    // Partial writes merge into the value as it is *now*, so two NBAs to
-                    // different bits of one reg in the same slot both take effect.
-                    for (auto& n : nbaRun) set(n.s, n.hi >= 0 ? v_insert(get(n.s), n.v, n.hi, n.lo) : n.v);
+                    applyNba();
                 } else if (!postq.empty()) {                   // postponed ($strobe/$monitor)
                     drainPost();                               // then, and only then, time advances
                 } else break;
