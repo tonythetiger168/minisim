@@ -31,6 +31,9 @@ Spec references are IEEE 1800-2023 clauses.
 ### Fixed
 - Signals inside generate blocks (`blk[2].x`) were left out of the waveform as
   if they were array elements.
+- CI recipes: `ci/Jenkinsfile`, a declarative Jenkins pipeline (JUnit, HTML
+  reports, LCOV coverage, `-rerun` on failure), and `ci/README.md` on the
+  files mregress and mcov write for a CI job.
 
 ## [0.1.0] - unreleased
 

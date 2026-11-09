@@ -1,0 +1,75 @@
+// A Jenkins pipeline for a minisim regression. Copy it into your own repo and
+// change the test list, the agent label, and the msim location.
+//
+// Plugins used: JUnit (test results), HTML Publisher (mregress and coverage
+// reports), and Coverage (the LCOV file mcov writes). Each is optional: drop
+// the matching post step if you do not have it installed.
+pipeline {
+  agent { label 'linux' }
+
+  parameters {
+    string(name: 'TESTS', defaultValue: 'tests/regress/smoke.list', description: 'mregress test list')
+    string(name: 'SEEDS', defaultValue: '1', description: 'random seeds per test')
+    booleanParam(name: 'COVERAGE', defaultValue: true, description: 'collect coverage (msim only)')
+  }
+
+  options {
+    timeout(time: 2, unit: 'HOURS')
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  environment {
+    // Where msim and mregress are installed (the minisim .deb installs into /usr).
+    PATH = "/opt/minisim/bin:${env.PATH}"
+    OUT = 'regress'
+  }
+
+  stages {
+    stage('Version') {
+      steps {
+        sh 'msim -version && mregress -version'
+      }
+    }
+
+    stage('Regression') {
+      steps {
+        // mregress exits 1 when a test fails unexpectedly (an @xfail known gap
+        // does not count), so the stage goes red on a real failure. A known gap
+        // is written to junit.xml as skipped, so Jenkins shows it as skipped.
+        // -cov needs a minisim with mcov; drop it if you only want results.
+        sh """
+          mregress '${params.TESTS}' -sim msim -j "\$(nproc)" -seeds '${params.SEEDS}' \
+                   -o "\$OUT"${params.COVERAGE ? ' -cov' : ''}
+        """
+      }
+    }
+  }
+
+  post {
+    always {
+      junit testResults: "${env.OUT}/junit.xml", allowEmptyResults: true,
+            skipPublishingChecks: true
+      archiveArtifacts artifacts: "${env.OUT}/**", allowEmptyArchive: true,
+                       fingerprint: false
+      publishHTML target: [reportName: 'mregress', reportDir: env.OUT,
+                           reportFiles: 'report.html', keepAll: true,
+                           alwaysLinkToLastBuild: true, allowMissing: true]
+      script {
+        // Coverage: mcov writes an HTML report and an LCOV file the Coverage
+        // plugin reads. Guarded so the build still works without -cov.
+        if (fileExists("${env.OUT}/cov.json")) {
+          sh "mcov report ${env.OUT}/cov.json -lcov ${env.OUT}/cov.info -html ${env.OUT}/cov_html"
+          publishHTML target: [reportName: 'Coverage', reportDir: "${env.OUT}/cov_html",
+                               reportFiles: 'index.html', keepAll: true,
+                               alwaysLinkToLastBuild: true, allowMissing: true]
+          recordCoverage tools: [[parser: 'LCOV', pattern: "${env.OUT}/cov.info"]]
+        }
+      }
+    }
+    unstable {
+      // A failed regression: repeat only the failures, so the log of the next
+      // build holds just them.
+      sh "mregress '${params.TESTS}' -o \$OUT -rerun || true"
+    }
+  }
+}
