@@ -1072,9 +1072,8 @@ struct Lowerer {
     // super.f() (8.15) calls the base class's body, never a derived override.
     static bool superCall(const slang::ast::CallExpression& call) {
         if (!call.syntax) return false;
-        std::string t = call.syntax->toString();
-        size_t k = t.find_first_not_of(" \t\r\n");
-        return k != std::string::npos && t.compare(k, 5, "super") == 0;
+        // the first token (its leading comments and spaces are trivia, not text)
+        return call.syntax->getFirstToken().rawText() == "super";
     }
     // A task or function of an interface called through a virtual
     // interface (25.9): the same subroutine of whichever instance v names.

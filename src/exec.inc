@@ -1174,6 +1174,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         callee = ve.first;
                         lay = ve.second;
                     }
+                    static const bool callTrace = getenv("MSIM_CALLTRACE") != nullptr;
+                    if (callTrace) cerr << "call " << (lay ? lay->name : "?") << " self=" << self << runLocStr() << "\n";
                     FrameP nf = newFrame(lay, nullptr, self);
                     for (auto& [off, e] : i.init) {   // arguments, read in the caller's frame
                         Val v = eval(e, rd);

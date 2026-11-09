@@ -192,6 +192,21 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  # UVM (IEEE 1800.2-2020) tests: tests/uvm/*.sv run against the Accellera
+  # UVM library when -DUVM_HOME=<uvm-core checkout> is given (CI fetches
+  # uvm-core 2020.3.1).
+  set(UVM_HOME "$ENV{UVM_HOME}" CACHE PATH "Accellera uvm-core checkout for the UVM tests")
+  if(UVM_HOME AND EXISTS ${UVM_HOME}/src/uvm_pkg.sv)
+    file(GLOB UVM_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/uvm/*.sv)
+    foreach(sv IN LISTS UVM_TESTS)
+      get_filename_component(name ${sv} NAME_WE)
+      add_test(NAME uvm/${name}
+               COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DUVM=${UVM_HOME}/src -DSV=${sv}
+                       -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
+      set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
+    endforeach()
+  endif()
+
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)

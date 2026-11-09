@@ -25,6 +25,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Module instances.** A parent instantiates a child. Named (`.a(x)`) and positional port connections carry an `input` into the child and an `output` back to the parent. The output may be a continuous assign or a procedural write. An `inout` net is connected in both directions. A grandchild uses the same connection. A `#(.W(8))` override changes the port width. Child signals are named on the instance path (`u.y`).
 - **Waveforms**: VCD (`msim -vcd`) or compressed FST (`msim -fst`), with the instance hierarchy as scopes, for GTKWave or Surfer
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
+- **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches; see [`docs/UVM.md`](docs/UVM.md)
 
 ## Layout
 

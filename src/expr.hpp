@@ -2506,7 +2506,13 @@ inline Val eval(const E& e, const Reader& rd) {
             for (size_t i = 0; i < e->kids.size(); i++) parts.push_back(k((int)i));
             return v_concat(parts);
         }
-        case Op::Mux: return v_mux(k(0), k(1), k(2));
+        case Op::Mux: {   // only the selected operand is evaluated (11.4.11); an unknown condition merges both
+            Val c = k(0);
+            int t = truth(c);
+            if (t == 1) return k(1);
+            if (t == 0) return k(2);
+            return v_mux(c, k(1), k(2));
+        }
         case Op::Pow: return v_pow(k(0), k(1));
         case Op::Time: {   // k.v ticks per time unit of the calling module
             uint64_t d = e->k.v ? e->k.v : 1;

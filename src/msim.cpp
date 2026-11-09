@@ -353,11 +353,12 @@ static void usage() {
 
 int main(int argc, char** argv) {
     std::atexit([] { g_framesDead = true; });   // before the kernel's waiting processes are destroyed
-    std::signal(SIGSEGV, [](int) {   // say where, then stop
-        std::string w = "internal error: crash" + runLocStr() + "\n";
-        (void)!write(2, w.data(), w.size());
-        _exit(139);
-    });
+    for (int sg : {SIGSEGV, SIGABRT})
+        std::signal(sg, [](int) {   // say where, then stop
+            std::string w = "internal error: crash" + runLocStr() + "\n";
+            (void)!write(2, w.data(), w.size());
+            _exit(139);
+        });
     // Pass 1: take msim's own options out; translate VCS spellings for slang.
     std::vector<std::string> fwd{argv[0]};
     std::vector<std::string> plusargs;

@@ -8,6 +8,44 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- UVM (IEEE 1800.2-2020): the Accellera UVM library (uvm-core 2020.3.1)
+  compiles and runs with `+define+UVM_NO_DPI` (see `docs/UVM.md`): run_test,
+  the factory and overrides, phases and objections, sequences, sequencers and
+  drivers, TLM ports and FIFOs, analysis ports, `uvm_config_db`, field
+  macros (print, clone, compare, pack), report catchers. `tests/uvm` runs
+  three testbenches in CI.
+- Language features that UVM needs: containers of containers
+  (`int q[string][$]`, `bit m[C][C]`, foreach over several of their
+  dimensions), class-handle, packed-struct and wide associative array keys,
+  struct elements and writes to part of an element (`q[i][3:0] = v`,
+  `aa[k].f = v`), unpacked structs in classes and automatic variables,
+  functions that return queues and associative arrays, static containers in
+  functions, `==` / `!=` on whole containers, string indexing (`s[i]`,
+  `s[i] = c`, `foreach (s[i])`), `{n{s}}` with a run-time `n`, string
+  parameters, `{>>{q}}` of a string queue, `{<<bit{q}} = v` into a dynamic
+  array, a stream as the source of a streaming assignment, `inside` on
+  strings and handles, `wait (0)`, `%p` of class handles.
+- A run-time error (null object access, a crash) names the statement that
+  was running; `MSIM_CALLTRACE=1` prints every method and automatic
+  subroutine call.
+
+### Fixed
+- `super.f()` with a comment just before `super` called the override (and
+  recursed) instead of the base method.
+- An extern method that overrides a pure virtual method, or a virtual
+  method without repeating `virtual`, did not get its vtable slot.
+- A default argument that calls a method (`trigger(T d = get_default())`)
+  called it on the caller's object instead of the callee's.
+- A static property read by another static initializer before its own
+  initializer ran was x; defaults (null, 0) are now set before any
+  initializer.
+- `&&`, `||` and `?:` evaluated the operand they skip, so
+  `h != null && h.q.exists(k)` failed on a null `h`.
+- A fork in a class method lost `this`.
+- `wait (cond)` on automatic variables inside a subroutine could be turned
+  into an `@*` wait.
+- A process still waiting at the end of the simulation could corrupt the
+  heap when it was freed.
 - Virtual interfaces (25.9): variables, properties and arguments of
   `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
   clocking blocks reached through them.
