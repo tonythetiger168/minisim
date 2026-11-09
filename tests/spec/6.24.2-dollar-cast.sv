@@ -1,6 +1,5 @@
 // IEEE 1800-2023 6.24.2: $cast checks an enum value at run time; as a task
 // it is an error to fail (6.24.2).
-//! xfail: $cast is an error
 //! icarus-skip: Icarus 13 does not support $cast
 module top;
   typedef enum {A, B, C} e_t;

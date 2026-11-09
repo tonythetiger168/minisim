@@ -402,6 +402,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
             }
             case IK::ReadMem: readMem(i); pc++; break;
             case IK::WriteMem: writeMem(i); pc++; break;
+            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0); pc++; break;
+            case IK::Release: S.holdOff(i.sig, i.hi != 0); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::Dump: {
                 Val a = i.args.empty() ? Val{} : eval(i.args[0], rd);
