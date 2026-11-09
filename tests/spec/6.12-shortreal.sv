@@ -1,5 +1,4 @@
 // IEEE 1800-2023 6.12: shortreal is a 32-bit IEEE float (6.12).
-//! xfail: shortreal is an error
 //! icarus-skip: Icarus 13 gives $bits(shortreal) as 1
 module top;
   shortreal r;
