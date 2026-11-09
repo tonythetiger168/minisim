@@ -49,6 +49,8 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    Udp,        // a user-defined primitive (29): udp's table, inputs in args, state `sig`, last inputs `dres`
+    Tran,       // bidirectional switch `sig` (28.8): its control is e (null: always on), active low if pdown
     Dump,       // a VCD task (21.7.1): dcmd is a DumpCmd; args / dsel hold the operands
     Dpi,        // call the C function of DPI import `dpi` (35); see DpiFunc
     Vpi,        // call the calltf of a VPI user system task or function (36-38); see VpiSite
@@ -75,6 +77,11 @@ enum class IK {
 
 struct Prog;
 
+// A user-defined primitive's table (29.3.4). Each row has one field per
+// input: a level ('0' '1' 'x' '?' 'b'), an edge symbol ('r' 'f' 'p' 'n' '*'),
+// or an edge pair "(01)". `edge` is the input with the edge, or -1.
+struct UdpRow { std::vector<std::string> in; char state = 0, out = 'x'; int edge = -1; };
+struct UdpTable { int nin = 0; bool seq = false; bool edges = false; std::vector<UdpRow> rows; };
 // IK::Dump commands, one per VCD task (21.7.1).
 enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT };
 
@@ -214,6 +221,7 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    const UdpTable* udp = nullptr;   // Udp
     // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
     // signal-name prefixes relative to the top ("" is the top, "u1." an
     // instance); `second` is true for a variable (an exact name).

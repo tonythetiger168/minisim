@@ -798,6 +798,7 @@ int main(int argc, char** argv) {
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
     for (auto& [s, d] : lowered.netDelays) S.netDelay[s] = d;
+    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
