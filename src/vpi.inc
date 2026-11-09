@@ -23,6 +23,7 @@
 #include "slang/ast/SystemSubroutine.h"
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
+#include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/symbols/BlockSymbols.h"
@@ -1221,6 +1222,26 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
         case vpiDefName:
             if (o->kind == Obj::Module) return vpi::retStr(std::string(o->sym->as<slang::ast::InstanceSymbol>().getDefinition().name));
             return nullptr;
+        // 33.7: the library and cell an instance is bound to, and the
+        // library.cell of the config that bound it ("" without one).
+        case vpiLibrary:
+        case vpiCell:
+        case vpiConfig: {
+            if (o->kind != Obj::Module) return nullptr;
+            const auto& inst = o->sym->as<slang::ast::InstanceSymbol>();
+            const auto& def = inst.getDefinition();
+            if (prop == vpiLibrary) return vpi::retStr(def.sourceLibrary.name);
+            if (prop == vpiCell) return vpi::retStr(std::string(def.name));
+            if (!inst.resolvedConfig) return vpi::retStr(std::string());
+            const auto& cfg = inst.resolvedConfig->useConfig;
+            std::string lib = "work";
+            for (const slang::ast::Scope* sc = cfg.getParentScope(); sc; sc = sc->asSymbol().getParentScope())
+                if (sc->asSymbol().kind == slang::ast::SymbolKind::CompilationUnit) {
+                    lib = sc->asSymbol().as<slang::ast::CompilationUnitSymbol>().sourceLibrary.name;
+                    break;
+                }
+            return vpi::retStr(lib + "." + std::string(cfg.name));
+        }
         case vpiFile:
             if (o->kind == Obj::Call) return vpi::retStr(o->site->file);
             if (o->sym && srcMgr()) return vpi::retStr(std::string(srcMgr()->getFileName(o->sym->location)));
