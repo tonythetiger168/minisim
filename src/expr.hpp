@@ -40,6 +40,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <iostream>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -1276,7 +1277,24 @@ enum SysFnId : int {
     SF_URANDOM_RANGE, // $urandom_range(max, min) (18.13.2)
     SF_PLUS_TEST,    // $test$plusargs(prefix) (21.6); also "is there a match" for $value$plusargs
     SF_PLUS_VALUE,   // the text after prefix kid0, read with format letter lo
-    SF_TIMEFORMAT    // $timeformat(units, precision, suffix, width) (20.4.3); returns 0
+    SF_TIMEFORMAT,   // $timeformat(units, precision, suffix, width) (20.4.3); returns 0
+    // File I/O (21.3). A descriptor with bit 31 set is a file (0x80000000-2 are
+    // stdin, stdout, stderr); otherwise each set bit is a channel (bit 0 stdout).
+    SF_FOPEN,        // $fopen(name [, mode]): lo = 1 when a mode is given
+    SF_FCLOSE,       // $fclose(fd)
+    SF_FWRITE,       // write string kid1 to fd kid0
+    SF_FFLUSH,       // $fflush([fd])
+    SF_FGETC,        // $fgetc(fd): a byte, or -1 at the end
+    SF_UNGETC,       // $ungetc(c, fd)
+    SF_FEOF,         // $feof(fd)
+    SF_FGETS,        // $fgets: reads a line into scanText(), returns its length
+    SF_SCAN,         // $fscanf (lo = 1) / $sscanf (lo = 0): kid0 source, kid1 format;
+                     // the values go to scanOut(), returns how many were read
+    SF_SCAN_GET,     // scanOut()[kid0]
+    SF_SCAN_TEXT,    // scanText() as a string
+    SF_FTELL,        // $ftell(fd)
+    SF_FSEEK,        // $fseek(fd, offset, whence), $rewind(fd) is fseek(fd, 0, 0)
+    SF_FERROR        // $ferror(fd, str): 0, no error text kept
 };
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
@@ -1499,6 +1517,128 @@ inline const std::string* findPlusArg(const std::string& prefix) {
         if (p.compare(0, prefix.size(), prefix) == 0) return &p;
     return nullptr;
 }
+// Open files for $fopen (21.3.1): 32-bit descriptors and multichannel bits.
+struct FileTab {
+    std::vector<FILE*> fds{nullptr, nullptr, nullptr};   // fd 0x80000000 + i
+    std::vector<FILE*> mcd = std::vector<FILE*>(31, nullptr);   // channel bit i (bit 0 is stdout)
+};
+inline FileTab& files() { static FileTab t; return t; }
+inline FILE* fdFile(uint32_t fd) {
+    if (!(fd & 0x80000000u)) return nullptr;
+    uint32_t i = fd & 0x7fffffffu;
+    if (i == 0) return stdin;
+    if (i == 1) return stdout;
+    if (i == 2) return stderr;
+    return i < files().fds.size() ? files().fds[i] : nullptr;
+}
+inline void fileWrite(uint32_t fd, const std::string& t) {
+    if (fd & 0x80000000u) {
+        uint32_t i = fd & 0x7fffffffu;
+        if (i == 1) { std::cout << t; return; }
+        if (i == 2) { std::cout.flush(); std::cerr << t; return; }
+        if (FILE* f = fdFile(fd)) fwrite(t.data(), 1, t.size(), f);
+        return;
+    }
+    if (fd & 1) std::cout << t;
+    for (int b = 1; b < 31; b++)
+        if ((fd >> b) & 1 && files().mcd[b]) fwrite(t.data(), 1, t.size(), files().mcd[b]);
+}
+inline std::string& scanText() { static std::string s; return s; }
+inline std::vector<Val>& scanOut() { static std::vector<Val> v; return v; }
+// $fscanf / $sscanf (21.3.4) from a character source: next() gives a char or
+// EOF, back() returns the last one. The values read go to scanOut(); returns
+// the number of conversions, or -1 if the input ended before the first.
+template <typename Next, typename Back>
+inline int scanFormat(const std::string& fmt, Next next, Back back) {
+    scanOut().clear();
+    int n = 0;
+    bool any = false, eof = false;
+    auto skipWs = [&] {
+        int c;
+        while ((c = next()) != EOF && isspace(c)) {}
+        if (c == EOF) eof = true; else back(c);
+    };
+    for (size_t i = 0; i < fmt.size(); i++) {
+        char f = fmt[i];
+        if (isspace((unsigned char)f)) { skipWs(); continue; }
+        if (f != '%' || i + 1 >= fmt.size()) {
+            int c = next();
+            if (c != (unsigned char)f) { if (c == EOF) eof = true; else back(c); break; }
+            continue;
+        }
+        i++;
+        if (fmt[i] == '%') {
+            skipWs();
+            int c = next();
+            if (c != '%') { if (c != EOF) back(c); break; }
+            continue;
+        }
+        bool skip = false;
+        if (fmt[i] == '*') { skip = true; i++; }
+        int width = 0;
+        while (i < fmt.size() && isdigit((unsigned char)fmt[i])) width = width * 10 + (fmt[i++] - '0');
+        if (i >= fmt.size()) break;
+        char cv = (char)tolower((unsigned char)fmt[i]);
+        if (cv == 'm') { if (!skip) { scanOut().push_back(mkstr("")); n++; } continue; }
+        if (cv != 'c') skipWs();
+        if (eof) break;
+        std::string tok;
+        int lim = width > 0 ? width : (cv == 'c' ? 1 : 1 << 30);
+        auto ok = [&](int c) {
+            switch (cv) {
+                case 'c': return true;
+                case 's': return !isspace(c);
+                case 'd': case 'u': case 't': return isdigit(c) || ((c == '-' || c == '+') && tok.empty()) || c == '_' ||
+                                           strchr("xXzZ?", c) != nullptr;
+                case 'h': case 'x': return isxdigit(c) || c == '_' || strchr("xXzZ?", c) != nullptr;
+                case 'o': return (c >= '0' && c <= '7') || c == '_' || strchr("xXzZ?", c) != nullptr;
+                case 'b': return c == '0' || c == '1' || c == '_' || strchr("xXzZ?", c) != nullptr;
+                case 'f': case 'e': case 'g': return isdigit(c) || strchr("+-.eE", c) != nullptr;
+                default: return false;
+            }
+        };
+        int c;
+        while ((int)tok.size() < lim && (c = next()) != EOF) {
+            if (!ok(c)) { back(c); break; }
+            tok += (char)c;
+        }
+        if (tok.empty()) { if (!any && c == EOF) eof = true; break; }
+        any = true;
+        if (skip) continue;
+        Val v;
+        if (cv == 's') v = mkstr(tok);
+        else if (cv == 'c') v = make((unsigned char)tok[0], 0, 8, 0);
+        else if (cv == 'f' || cv == 'e' || cv == 'g') v = mkreal(atof(tok.c_str()));
+        else {
+            int bits = cv == 'h' || cv == 'x' ? 4 : cv == 'o' ? 3 : cv == 'b' ? 1 : 0;
+            uint64_t val = 0, x = 0, z = 0;
+            bool neg = false;
+            size_t k = 0;
+            if (!bits && (tok[0] == '-' || tok[0] == '+')) { neg = tok[0] == '-'; k = 1; }
+            bool unk = false;
+            for (; k < tok.size(); k++) {
+                char d = (char)tolower((unsigned char)tok[k]);
+                if (d == '_') continue;
+                if (!bits) {
+                    if (d == 'x' || d == 'z' || d == '?') { unk = true; continue; }
+                    val = val * 10 + (d - '0');
+                    continue;
+                }
+                uint64_t m = (1ull << bits) - 1;
+                val <<= bits; x <<= bits; z <<= bits;
+                if (d == 'x') x |= m;
+                else if (d == 'z' || d == '?') { x |= m; z |= m; }
+                else val |= (uint64_t)(isdigit((unsigned char)d) ? d - '0' : d - 'a' + 10);
+            }
+            if (neg) val = ~val + 1;
+            v = unk ? allx(64) : make(val, x, 64, z);
+            v.sgn = !bits;
+        }
+        scanOut().push_back(v);
+        n++;
+    }
+    return (n == 0 && eof) ? -1 : n;
+}
 inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
     auto u64 = [](const Val& v) { return v.v & ~v.x & mask(std::min(64, v.w)); };
     auto i32 = [&](const Val& v) { return (int32_t)(uint32_t)u64(v); };
@@ -1542,6 +1682,109 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             Val p = a[0]; p.str = true;
             return make(findPlusArg(v_str(p)) ? 1 : 0, 0, 32, 0, true);
         }
+        case SF_FOPEN: {
+            Val nm = a[0]; nm.str = true;
+            std::string name = v_str(nm), mode = "w";
+            if (ctl) { Val m = a[1]; m.str = true; mode = v_str(m); }
+            for (char& ch : mode) if (ch == 'b') ch = 'b';
+            FILE* f = fopen(name.c_str(), mode.c_str());
+            if (!f) return make(0, 0, 32, 0, true);
+            if (ctl) {   // a file descriptor
+                auto& fds = files().fds;
+                size_t i = 3;
+                while (i < fds.size() && fds[i]) i++;
+                if (i == fds.size()) fds.push_back(nullptr);
+                fds[i] = f;
+                return make(0x80000000u | (uint32_t)i, 0, 32, 0, true);
+            }
+            for (int b = 1; b < 31; b++)   // a multichannel descriptor
+                if (!files().mcd[b]) { files().mcd[b] = f; return make(1u << b, 0, 32, 0, true); }
+            fclose(f);
+            return make(0, 0, 32, 0, true);
+        }
+        case SF_FCLOSE: {
+            uint32_t fd = (uint32_t)u64(a[0]);
+            if (fd & 0x80000000u) {
+                uint32_t i = fd & 0x7fffffffu;
+                if (i >= 3 && i < files().fds.size() && files().fds[i]) { fclose(files().fds[i]); files().fds[i] = nullptr; }
+            } else {
+                for (int b = 1; b < 31; b++)
+                    if ((fd >> b) & 1 && files().mcd[b]) { fclose(files().mcd[b]); files().mcd[b] = nullptr; }
+            }
+            return make(0, 0, 1, 0);
+        }
+        case SF_FWRITE: {
+            Val t = a[1]; t.str = true;
+            fileWrite((uint32_t)u64(a[0]), v_str(t) + (ctl ? "\n" : ""));
+            return make(0, 0, 1, 0);
+        }
+        case SF_FFLUSH: {
+            std::cout.flush();
+            if (a.empty()) { fflush(nullptr); return make(0, 0, 1, 0); }
+            uint32_t fd = (uint32_t)u64(a[0]);
+            if (FILE* f = fdFile(fd)) fflush(f);
+            else for (int b = 1; b < 31; b++) if ((fd >> b) & 1 && files().mcd[b]) fflush(files().mcd[b]);
+            return make(0, 0, 1, 0);
+        }
+        case SF_FGETC: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            int c = f ? fgetc(f) : EOF;
+            return sint(c == EOF ? -1 : c);
+        }
+        case SF_UNGETC: {
+            FILE* f = fdFile((uint32_t)u64(a[1]));
+            int c = f ? ungetc((int)(u64(a[0]) & 0xff), f) : EOF;
+            return sint(c == EOF ? -1 : 0);
+        }
+        case SF_FEOF: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            if (!f) return sint(1);
+            int c = fgetc(f);
+            if (c == EOF) return sint(1);
+            ungetc(c, f);
+            return sint(0);
+        }
+        case SF_FGETS: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            scanText().clear();
+            int c;
+            while (f && (c = fgetc(f)) != EOF) {
+                scanText() += (char)c;
+                if (c == '\n') break;
+            }
+            return sint((int)scanText().size());
+        }
+        case SF_SCAN: {
+            Val fm = a[1]; fm.str = true;
+            std::string fmt = v_str(fm);
+            if (ctl) {
+                FILE* f = fdFile((uint32_t)u64(a[0]));
+                if (!f) return sint(-1);
+                return sint(scanFormat(fmt, [&] { return fgetc(f); }, [&](int c) { ungetc(c, f); }));
+            }
+            Val sv = a[0]; sv.str = true;
+            std::string src = v_str(sv);
+            size_t p = 0;
+            return sint(scanFormat(fmt, [&] { return p < src.size() ? (int)(unsigned char)src[p++] : (p++, EOF); },
+                                   [&](int) { p--; }));
+        }
+        case SF_SCAN_GET: {
+            size_t k = (size_t)u64(a[0]);
+            return k < scanOut().size() ? scanOut()[k] : xfill(64, false);
+        }
+        case SF_SCAN_TEXT: return mkstr(scanText());
+        case SF_FTELL: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            return sint(f ? (int)ftell(f) : -1);
+        }
+        case SF_FSEEK: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            int wh = a.size() > 2 ? (int)u64(a[2]) : 0;
+            int64_t off = a.size() > 1 ? (int64_t)(int32_t)(uint32_t)u64(a[1]) : 0;
+            int r = f ? fseek(f, off, wh == 1 ? SEEK_CUR : wh == 2 ? SEEK_END : SEEK_SET) : -1;
+            return sint(r == 0 ? 0 : -1);
+        }
+        case SF_FERROR: return sint(0);
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();
             auto i64 = [&](const Val& v) { return v_to_i64(v); };

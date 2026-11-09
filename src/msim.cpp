@@ -323,6 +323,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (usesForce()) staticPart = false;   // a forced signal must see every write (10.6)
     if (lowered.procs.empty()) {
         std::cerr << "msim: design has no processes to run\n";
         return 1;

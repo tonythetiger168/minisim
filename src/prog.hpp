@@ -39,6 +39,8 @@ enum class IK {
     Fork,       // start each of `branches` as a process; join 0 = all, 1 = any, 2 = none
     ReadMem,    // $readmemh / $readmemb into `arr` (fmt is the file name)
     WriteMem,   // $writememh / $writememb of `arr` (21.5), the same fields as ReadMem
+    Force,      // force (hi = 1) or assign (hi = 0) sig = e until released (10.6)
+    Release,    // release (hi = 1) or deassign (hi = 0) sig (10.6)
     Disable,    // disable <block> run by other processes: end every process whose root is block `sig`
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)

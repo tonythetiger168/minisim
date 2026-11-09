@@ -401,6 +401,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl) {
             }
             case IK::ReadMem: readMem(i); pc++; break;
             case IK::WriteMem: writeMem(i); pc++; break;
+            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0); pc++; break;
+            case IK::Release: S.holdOff(i.sig, i.hi != 0); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::JmpIfNot:  pc = (truth(eval(i.e, rd)) == 1) ? pc + 1 : i.target; break;
             case IK::Jmp:       pc = i.target; break;
