@@ -97,6 +97,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-threads <n>` | Worker threads (default: hardware threads, at most 8; capped at the hardware threads) |
 | `-no-static-seq`, `-no-partition` | Turn off clocked-process functions / partition tasks |
 | `-no-2state` | `-compile` without the 2-state fast path |
+| `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `<file>.c`, `.cpp`, `.o`, `.a` | DPI-C code: msim builds it (with `svdpi.h` on the include path) and loads it |
 | `<file>.so`, `-sv_lib <name>`, `-sv_root <dir>`, `-sv_liblist <file>` | DPI-C libraries to load (IEEE 1800-2023 annex J) |
@@ -219,6 +220,32 @@ Results are committed in a fixed order, so the output is the same for every
 thread count (`ctest -R msim_threads` checks it). Small batches stay on one
 thread. `-no-static-seq` and `-no-partition` turn the two parts off.
 
+### Cycle domain (`-compile`)
+
+Like Verilator's `eval()`. The largest group of clocked processes that wait
+on the same events (usually every `always @(posedge clk)`) runs as one
+function. Their NBAs go into fixed slots, and in the NBA region the slots are
+written and every static combinational process is re-evaluated once, in rank
+order. Writes skip `set()` when nothing else can see the signal (no process
+waits on it, no VCD, no `$monitor`), and a signal that only the domain touches
+lives in a plain C++ variable instead of the kernel's signal table. The time
+wheel also no longer allocates per time step. `-no-cycle` turns the domain off.
+
+Signals the testbench only initializes and `$display`s can be private too:
+those writes and reads are compiled to use the variable. When every signal
+the domain reads is known (no X or Z), a second copy of the domain without
+the per-expression X checks runs instead, and the rare 4-state code is kept
+out of the hot path.
+
+On a 4-core VM, run seconds, 1 thread (bench/run.sh):
+
+| design | before (main) | cycle domain | Verilator -O3 |
+|---|---|---|---|
+| lanes | 0.34 | 0.07 | 0.09 |
+| chain | 0.35 | 0.08 | 0.28 |
+| counter | 0.16 | 0.08 | 0.28 |
+| wide | 1.2 (4 threads) | 0.18 | 0.10 |
+
 ### 2-state fast path (`-compile`)
 
 Most of the time no signal holds X or Z. For each expression, `-compile`
@@ -234,6 +261,62 @@ can make X from known inputs. `-no-2state` turns the fast path off, and
 command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
+
+### Lint and clock-domain checks: `mlint`
+
+`mlint` runs the same front end as `msim` and then checks the elaborated
+design, so it needs no separate build setup:
+
+```sh
+mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
+mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any finding (for CI)
+mlint rtl/*.sv -disable L004 -disable CDC002
+mlint -list                                 # the rules
+```
+
+| Rule | What it finds |
+|---|---|
+| `L001` | A value is assigned on some paths of an `always_comb` but not all, so it holds its old value: an unintended latch (an `if` with no `else`, a `case` with no `default`) |
+| `L002` | A blocking assignment to a non-local variable in an `always_ff` |
+| `L003` | A non-blocking assignment in an `always_comb` |
+| `L004` | One value is assigned by more than one process |
+| `CDC001` | A flop reads another clock domain with no synchronizer, or through one flop only |
+| `CDC002` | A multi-bit bus crosses domains through a two-flop synchronizer, which does not keep its bits together |
+
+Clock domains come from the clock of every edge-triggered block, with signals
+joined across port connections, so one clock passed down through several
+modules stays one domain. Findings print as
+`file:line:col: warning: [RULE] text`, sorted by file and line.
+
+### Design for test: `mdft`
+
+`mdft` checks that a design can be scan-tested, and prints the flop count per
+clock domain, which is what a chain plan is built from:
+
+```sh
+mdft rtl/*.sv -top soc_top
+mdft rtl/*.sv -top soc_top -Werror      # exit 1 on any finding (for CI)
+mdft -list
+```
+
+| Rule | What it finds |
+|---|---|
+| `DFT001` | A gated or unreachable clock: the tester cannot drive the flop in shift mode |
+| `DFT002` | An asynchronous set or reset built from logic, which scan shift cannot hold inactive |
+| `DFT003` | A latch: not scannable without a transparency control |
+| `DFT004` | Both edges of one clock, so the two halves need separate chains with a lockup latch |
+| `DFT005` | A combinational loop |
+| `DFT006` | A ripple or divided clock (a flop drives the clock) |
+
+```
+mdft: 5 flops in 3 clock domains
+  t.clk: 3 flops (2 rising, 1 falling)
+```
+
+`mlint` and `mdft` share one model of the elaborated design
+(`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
+every path, and the union-find that makes one clock one domain across module
+boundaries.
 
 ## Known limits
 

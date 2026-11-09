@@ -92,6 +92,16 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(msim PRIVATE MINISIM_FST MINISIM_FST_DIR="${FST_SRC}")
   endif()
 
+  # Lint and clock-domain checks on the same front end: mlint design.sv
+  add_executable(mlint src/mlint.cpp)
+  target_include_directories(mlint PRIVATE src)
+  target_link_libraries(mlint PRIVATE slang::slang)
+
+  # Design-for-test checks and a scan chain plan: mdft design.sv
+  add_executable(mdft src/mdft.cpp)
+  target_include_directories(mdft PRIVATE src)
+  target_link_libraries(mdft PRIVATE slang::slang)
+
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
   target_link_libraries(test_lower PRIVATE slang::slang)
@@ -175,7 +185,7 @@ if(MINISIM_WITH_SLANG)
                      -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
     # A known gap says so on a line "//! xfail: <what is missing>". The test
     # still runs; it is expected to fail, and passing it is an error, so the
-    # marker comes off as soon as the gap is fixed (tests/regress.py lists them).
+    # marker comes off as soon as the gap is fixed (tools/mregress.py -spec tests/spec lists them).
     file(STRINGS ${sv} xfail REGEX "^//! xfail")
     if(xfail)
       set_tests_properties(spec/${name} PROPERTIES WILL_FAIL TRUE LABELS "spec;xfail")
@@ -190,6 +200,14 @@ if(MINISIM_WITH_SLANG)
                        -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
     endif()
   endforeach()
+
+  add_test(NAME mlint
+           COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
+                   -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+
+  add_test(NAME mdft
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
+                   -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
 
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
@@ -216,7 +234,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
