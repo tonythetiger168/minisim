@@ -55,6 +55,7 @@ enum class IK {
     // std::process (9.7): hi is the ProcOp, e the process object (its slot
     // `dkey` holds the process number), lo the class id, sig the result.
     ProcOp,
+    Dump,       // a VCD task (21.7.1): dcmd is a DumpCmd; args / dsel hold the operands
     // An immediate assertion (16.3, 16.4) of asserts()[sig] on condition e.
     // join 0, simple: pass falls through to the pass action, a fail jumps to
     // target, and an assertion that is off or whose action is off jumps to hi.
@@ -71,6 +72,9 @@ enum class IK {
 };
 
 struct Prog;
+
+// IK::Dump commands, one per VCD task (21.7.1).
+enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT };
 
 // Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
 // is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
@@ -130,6 +134,10 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
+    // signal-name prefixes relative to the top ("" is the top, "u1." an
+    // instance); `second` is true for a variable (an exact name).
+    std::vector<std::pair<std::string, bool>> dsel;
     // Frames (expr.hpp). Call: when `lay` is set the callee is automatic and
     // runs in a new frame of that shape; `init` gives each argument slot its
     // value, evaluated in the caller before the switch. Fork: `blays` is the
@@ -251,6 +259,8 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) add(e->sig);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) add(e->sig);
+    if (e->op == Op::SysFn && e->sig >= 0) add(e->sig);   // a query of a container (SF_ASSOC_BOUND)
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 // Does e read an automatic variable (a relative id)?

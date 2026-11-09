@@ -11,6 +11,12 @@ Spec references are IEEE 1800-2023 clauses.
 - `std::semaphore` (15.3), `std::mailbox` (15.4, parameterized, typeless and
   bounded) and `std::process` (9.7: self, status, kill, await, suspend,
   resume).
+- System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),
+  `$system`, the array query functions on every kind of dimension,
+  `$typename`, and the VCD tasks (`$dumpfile`, `$dumpvars` with a level and
+  scope selection, `$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` /
+  `$dumplimit`). A design's `$dumpvars` now writes its dump file without
+  `-vcd`.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
