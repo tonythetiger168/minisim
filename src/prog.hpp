@@ -23,7 +23,8 @@ enum Edge { ANY, POS, NEG };
 // IK::Dyn commands (7.5, 7.8, 7.10).
 enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_INSERT, D_POP_FRONT,
               D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
-              D_SORT, D_RSORT, D_SHUFFLE };
+              D_SORT, D_RSORT, D_SHUFFLE,
+              D_SORT_BY, D_RSORT_BY };   // sort / rsort with (7.12.2): keys in dsrc
 enum class IK {
     Assign,     // sig = e            (blocking)
     Nba,        // sig <= e           (non-blocking)
@@ -46,6 +47,18 @@ enum class IK {
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
     New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
+    // An immediate assertion (16.3, 16.4) of asserts()[sig] on condition e.
+    // join 0, simple: pass falls through to the pass action, a fail jumps to
+    // target, and an assertion that is off or whose action is off jumps to hi.
+    // join 1 (#0) or 2 (final), deferred: queue a report and go on.
+    Assert,
+    // ##n (14.11): wait for n events of clockings()[dkey] (its event is
+    // signal sig); ##0 waits only if that event has not happened in this step.
+    CycleWait,
+    // A synchronous drive (14.16): bits [hi:lo] of clockvar sig, output dres
+    // of clockings()[dkey], take e at the clocking event `de` cycles on.
+    CbDrive,
+    AssertCtl,  // $assertcontrol (20.11): args are control, assertion and directive type, levels; fmt the targets
     Ret         // pop that address; an empty stack ends the process
 };
 
