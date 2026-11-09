@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI (clauses 36-38): `vpi_user.h`, VPI libraries loaded before
+  elaboration (`-load`, `-loadvpi`, or C files on the command line), user
+  system tasks and functions, the module / net / variable / memory /
+  parameter / port object model, `vpi_get_value` and `vpi_put_value` in all
+  the common formats, and callbacks. The tests match Icarus 13 VPI output.
 - DPI-C (clause 35): `import "DPI-C"` functions and tasks (`pure`, `context`,
   C names), `export "DPI-C"` functions and tasks, every argument type
   including packed vectors and open arrays, context scopes, exported tasks

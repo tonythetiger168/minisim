@@ -26,6 +26,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Waveforms**: VCD (`msim -vcd`) or compressed FST (`msim -fst`), with the instance hierarchy as scopes, for GTKWave or Surfer
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
+- **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
 ## Layout
 
@@ -40,6 +41,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
+| `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -102,6 +104,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `<file>.c`, `.cpp`, `.o`, `.a` | DPI-C code: msim builds it (with `svdpi.h` on the include path) and loads it |
 | `<file>.so`, `-sv_lib <name>`, `-sv_root <dir>`, `-sv_liblist <file>` | DPI-C libraries to load (IEEE 1800-2023 annex J) |
 | `-dpiheader <file>` | Write the C prototypes of every DPI import and export |
+| `-load <lib>[:<boot>]`, `-loadvpi <lib>:<boot>` | Load a VPI library before elaboration; its `vlog_startup_routines` run (the C files and `.so` files above are VPI libraries too) |
 | `-CFLAGS <s>`, `-LDFLAGS <s>` | Extra flags for building the DPI C files |
 | `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |

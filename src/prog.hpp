@@ -50,6 +50,7 @@ enum class IK {
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
     Dpi,        // call the C function of DPI import `dpi` (35); see DpiFunc
+    Vpi,        // call the calltf of a VPI user system task or function (36-38); see VpiSite
     New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
     Randomize,  // sig = randomize the object e (null e: std::randomize), with rc (18.6, 18.12)
     RandMode,   // obj e: every rand variable (hi = 0) or constraint block (hi = 1) on or off by de (18.8, 18.9)
@@ -127,6 +128,40 @@ struct DpiFunc {
     const Prog* prog = nullptr;   // export: the SV body
     void* rt = nullptr;           // run-time data (resolved C function)
 };
+// A user system task or function registered with vpi_register_systf
+// (38.37). The names are known before elaboration, so slang accepts calls.
+struct VpiSystfInfo {
+    int idx = 0;          // into vpi::st().systfs
+    bool func = false;
+    int ftype = 1;        // vpiIntFunc, vpiRealFunc, vpiTimeFunc, vpiSizedFunc, vpiSizedSignedFunc
+    int size = 32;        // result width (sizetf for a sized function)
+};
+inline std::unordered_map<std::string, VpiSystfInfo>& vpiSystfNames() {
+    static std::unordered_map<std::string, VpiSystfInfo> m;
+    return m;
+}
+// One argument of a call of a user system task or function, as VPI sees it.
+struct VpiArg {
+    enum Kind { Empty, Signal, Value, String, Scope } kind = Empty;
+    int sig = -1;               // Signal: the variable or net; Value: a temporary holding the value
+    int w = 0;
+    bool sgn = false, real = false, str = false;
+    std::string text;           // String: the literal
+    const void* sym = nullptr;  // Signal: its slang symbol; Scope: the instance
+    int vtype = 0;              // Value / String: the object type VPI reports (vpiConstant, vpiOperation, ...)
+};
+// One call site of a user system task or function (an IK::Vpi).
+struct VpiSite {
+    int systf = 0;
+    bool func = false;
+    std::vector<VpiArg> args;
+    int ret = -1, retW = 32;    // function: the result signal
+    bool retSgn = false, retReal = false;
+    std::string file;
+    int line = 0;
+    const void* scope = nullptr;   // the instance the call is in (slang InstanceSymbol)
+    mutable void* userdata = nullptr;   // vpi_put_userdata (38.40)
+};
 // An unpacked array actual of a DPI call: a fixed array or a container.
 struct DpiActual {
     std::shared_ptr<const ArrShape> arr;
@@ -193,6 +228,7 @@ struct Instr {
     // Dpi: the import, one entry per argument (arrays only), and the call's
     // source location for svGetCallerInfo (file in fmt).
     const DpiFunc* dpi = nullptr;
+    const VpiSite* vpi = nullptr;   // Vpi: the call site
     std::vector<DpiActual> dact;
     int dline = 0;
     // Call of a class method (8): `self` is the object (null: the caller's

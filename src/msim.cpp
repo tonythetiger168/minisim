@@ -46,6 +46,14 @@
 //   -CFLAGS <s>      extra flags for compiling the C files
 //   -LDFLAGS <s>     extra flags for linking them (e.g. -lm)
 //
+// VPI (IEEE 1800-2023 clauses 36-38):
+//   -load <lib>[:<boot>]     load a VPI library before elaboration and run
+//                    its vlog_startup_routines, and <boot> if given (VCS form)
+//   -loadvpi <lib>:<boot>    the same (Xcelium form)
+//   The C files and .so libraries above are VPI libraries too: a library
+//   with vlog_startup_routines has them run. A design that uses VPI runs on
+//   one thread in the interpreter.
+//
 // Exit status: 0 when the simulation ran, 1 on a compile or lowering error,
 // 2 on a bad command line.
 #include <cctype>
@@ -75,6 +83,7 @@
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
 #include "dpi.inc"
+#include "vpi.inc"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -431,6 +440,7 @@ int main(int argc, char** argv) {
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     std::vector<std::string> svLibs, cFiles, soFiles;
+    std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
     bool buildDirGiven = false;
     for (int i = 1; i < argc; i++) {
@@ -525,6 +535,14 @@ int main(int argc, char** argv) {
             continue;
         }
         if (a == "-dpiheader") { dpiHeader = next("a file name"); continue; }
+        if (a == "-load" || a == "-loadvpi") {   // VPI (36.9.1)
+            std::string l = next("a VPI library");
+            size_t c = l.rfind(':');
+            std::string lib = c == std::string::npos ? l : l.substr(0, c), boot = c == std::string::npos ? "" : l.substr(c + 1);
+            if (lib.find('/') == std::string::npos) lib = "./" + lib;
+            vpiLibs.push_back({lib, boot});
+            continue;
+        }
         if (a == "-CFLAGS") { cflags += " " + next("flags"); continue; }
         if (a == "-LDFLAGS") { ldflags += " " + next("flags"); continue; }
         if (a.size() && a[0] != '-' && hasExt(a, {".c", ".cc", ".cpp", ".cxx", ".C", ".o", ".a"})) { cFiles.push_back(a); continue; }
@@ -569,7 +587,39 @@ int main(int argc, char** argv) {
         }
     }
 
+    // VPI (36.9.1): libraries load before elaboration, so the system tasks
+    // and functions they register are known to it. The C files are built now
+    // for that, unless -dpiheader asks for prototypes they may include.
+    std::string userSo, earlyDir;
+    bool earlyTmp = false;
+    if (!cFiles.empty() && dpiHeader.empty()) {
+        earlyDir = buildDir;
+        if (!buildDirGiven) {
+            std::string t = (std::filesystem::temp_directory_path() / "msim-dpi-XXXXXX").string();
+            if (!mkdtemp(t.data())) { std::cerr << "msim: cannot create a temporary directory\n"; return 1; }
+            earlyDir = t;
+            earlyTmp = true;
+        }
+        if (std::system(("mkdir -p " + shq(earlyDir)).c_str()) != 0) {
+            std::cerr << "msim: cannot create " << earlyDir << "\n";
+            return 1;
+        }
+        userSo = std::filesystem::absolute(earlyDir + "/dpi_user.so").string();
+        if (!buildShared(cFiles, userSo, cflags, ldflags)) return 1;
+    }
+    vpi::st().argv.assign(argv, argv + argc);
+    {
+        std::vector<std::pair<std::string, std::string>> all = vpiLibs;
+        if (!userSo.empty()) all.push_back({userSo, ""});
+        for (auto& s : soFiles) all.push_back({s.find('/') == std::string::npos ? "./" + s : s, ""});
+        for (auto& [lib, boot] : all) {
+            std::string err;
+            if (!vpi::load(lib, boot, err)) { std::cerr << "msim: VPI: " << err << "\n"; return 1; }
+        }
+    }
+
     auto comp = driver.createCompilation();
+    if (vpi::st().active) vpi::declare(*comp);
     driver.reportCompilation(*comp, /*quiet*/ true);
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
 
@@ -628,7 +678,9 @@ int main(int argc, char** argv) {
             if (!buildShared({c}, so, "", "")) return 1;
             libs.push_back(std::filesystem::absolute(so).string());
         }
-        if (!cFiles.empty()) {
+        if (!userSo.empty()) {
+            libs.push_back(userSo);
+        } else if (!cFiles.empty()) {
             std::string so = buildDir + "/dpi_user.so";
             if (!buildShared(cFiles, so, cflags, ldflags)) return 1;
             libs.push_back(std::filesystem::absolute(so).string());
@@ -640,7 +692,17 @@ int main(int argc, char** argv) {
         if (!ok) { std::cerr << "msim: DPI: " << err << "\n"; return 1; }
         compiled = false;   // -compile does not run DPI calls yet
     }
+    if (earlyTmp) { std::error_code ec; std::filesystem::remove_all(earlyDir, ec); }   // the library stays mapped
 
+    // VPI: callbacks and calltf routines may touch any signal at any time,
+    // so the design runs on one thread in the interpreter, every process
+    // scheduled the plain way.
+    if (vpi::st().active) {
+        if (compiled) std::cerr << "msim: -compile: VPI is not compiled yet; using the interpreter\n";
+        compiled = false;
+        staticComb = staticSeq = staticPart = false;
+        threads = 1;
+    }
     Plan pl = plan(lowered, staticComb, staticSeq);
     if (compiled && g_cov) {
         std::cerr << "msim: -compile: coverage is not compiled yet; using the interpreter\n";
@@ -689,6 +751,14 @@ int main(int argc, char** argv) {
     }
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
+        if (vpi::st().active && lowered.procs[i].kind == "init") {
+            // Declaration initializers take effect before the simulation
+            // starts, so they are not value changes VPI callbacks see (6.8).
+            Task t = process(&lowered.procs[i].prog);
+            S.all.push_back(t.h);
+            t.h.resume();
+            continue;
+        }
         if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
         else S.spawn(process(&lowered.procs[i].prog));
     }
@@ -701,6 +771,7 @@ int main(int argc, char** argv) {
     startClockings();
     startCovergroups();
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
+    if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
         std::vector<int> pt;
@@ -711,6 +782,7 @@ int main(int argc, char** argv) {
     std::vector<Task> finals = concEnd();   // strong obligations still pending fail (16.12.21)
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
+    if (vpi::st().active) vpi::end();   // cbEndOfSimulation
     std::cout.flush();
     if (g_cov && !writeCoverage(covPath, lowered, S.vcdTop)) {
         std::cerr << "msim: cannot write " << covPath << "\n";
