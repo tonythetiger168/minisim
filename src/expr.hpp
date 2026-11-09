@@ -821,6 +821,7 @@ struct DynObj {
     std::vector<Val> vec;
     std::map<DynKey, Val> map;
     Val dflt;                   // what a missing element reads as
+    std::shared_ptr<DynObj> elem;   // elements that are containers: their empty shape (an element holds the id)
     int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
     bool strKey = false;        // associative: string index
     int keyW = 64;
@@ -1319,7 +1320,22 @@ enum class Op {
     DynReduce, // hi: 0 sum, 1 product, 2 and, 3 or, 4 xor (7.12.3), at k.w bits
     ArrRead,   // element of an unpacked array; kids are one index per dimension
     DynSlice,  // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
-    SysFn      // hi: a SysFnId; kids are its arguments
+    SysFn,     // hi: a SysFnId; kids are its arguments
+    // Streaming with containers (11.4.14). DynBits: the elements of container
+    // sig packed, the first on top; its width is known only at run time, and
+    // it only appears inside StreamPack. StreamPack: kids concatenated at
+    // their run-time widths, then cut into lo-bit slices from the right and
+    // reversed when lo > 0, then left-aligned into hi bits (hi < 0: as is).
+    DynBits, StreamPack,
+    DynHas,    // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
+    DynElemRef,   // element kids[0] of container sig, itself a container (7.5, 7.10): its id + 1, made if missing
+    ArrAddr,   // the signal id + 1 of element kids of array arr (0 when an index is outside it)
+    // Classes (8). A handle is the first signal id of its object (0: null).
+    This,      // the running method's `this`
+    IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
+    Addr,      // the signal id of slot `sig` of the object kids[0] names, or 0 for null
+    AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    VifSig     // 1 + the signal id of member hi of the interface instance the virtual interface kids[0] names, or 0 (25.9)
 };
 // System functions computed by Op::SysFn.
 enum SysFnId : int {
@@ -1352,8 +1368,15 @@ enum SysFnId : int {
     SF_FSEEK,        // $fseek(fd, offset, whence), $rewind(fd) is fseek(fd, 0, 0)
     SF_FERROR,       // $ferror(fd, str): 0, no error text kept
     SF_SR2BITS,      // $shortrealtobits (20.5)
-    SF_BITS2SR       // $bitstoshortreal
+    SF_BITS2SR,      // $bitstoshortreal
+    SF_OBJ_SRANDOM,  // obj.srandom(seed) (18.13.3): kid0 the object
+    SF_OBJ_GETSTATE, // obj.get_randstate(): the generator state as a string
+    SF_OBJ_SETSTATE, // obj.set_randstate(state)
+    SF_CG            // a covergroup operation (19): lo is the CgOp, run by g_cgHook
 };
+// Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
+enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
+inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
 // suffix, and a minimum width of 20.
@@ -1400,6 +1423,10 @@ struct Expr {
     bool sgn = false;    // Ref result, or Resize result
     std::vector<E> kids;
     std::shared_ptr<const ArrShape> arr;   // ArrRead
+    // Ref of a class property through a handle (h.x): the object is at[0]'s
+    // value, and sig is the property's slot in it. Read only when evaluated,
+    // so `h != null && h.x` never touches a null h.
+    std::shared_ptr<Expr> at;
 };
 
 inline E node(Op op, std::vector<E> kids = {}) {
@@ -1568,6 +1595,14 @@ inline uint32_t urandomNext(uint64_t& s) {
     s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
     return (uint32_t)((s * 0x2545F4914F6CDD1Dull) >> 32);
 }
+// Random stability (18.14.3): every object has its own generator, seeded
+// from the $urandom stream when the object is made; its randomize() and
+// srandom() use that one.
+inline std::unordered_map<int, uint64_t>& objRng() { static std::unordered_map<int, uint64_t> m; return m; }
+inline uint64_t seedState(uint64_t seed) {
+    uint64_t s = (seed + 1) * 0x9E3779B97F4A7C15ull;
+    return s ? s : 1;
+}
 // Runtime plusargs (21.6): every +arg on the command line, without the +.
 inline std::vector<std::string>& plusArgs() { static std::vector<std::string> v; return v; }
 inline const std::string* findPlusArg(const std::string& prefix) {
@@ -1723,6 +1758,19 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
         }
         case SF_URANDOM: return make(urandomNext(urandomState()), 0, 32, 0);
+        case SF_OBJ_SRANDOM:
+            objRng()[(int)u64(a[0])] = seedState(u64(a[1]));
+            return make(0, 0, 32, 0);
+        case SF_OBJ_GETSTATE: {
+            char b[32];
+            snprintf(b, sizeof b, "MS%016llx", (unsigned long long)objRng()[(int)u64(a[0])]);
+            return mkstr(b);
+        }
+        case SF_OBJ_SETSTATE: {
+            const std::string& t = v_str(a[1]);
+            if (t.size() == 18 && t[0] == 'M' && t[1] == 'S') objRng()[(int)u64(a[0])] = std::stoull(t.substr(2), nullptr, 16);
+            return make(0, 0, 32, 0);
+        }
         case SF_URANDOM_SEED: {
             uint64_t s = (u64(a[0]) + 1) * 0x9E3779B97F4A7C15ull;
             if (!s) s = 1;
@@ -1844,6 +1892,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         }
         case SF_FERROR: return sint(0);
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
+        case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
         case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();
@@ -1896,13 +1945,18 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
 //            reaches its parent's locals at depth 1),
 // mode 8:    a property of `this` (the running method's object),
 // mode 9:    a slot of the frame that the last call returned from (the
-//            caller copies a function result and output arguments from it).
+//            caller copies a function result and output arguments from it),
+// mode 10:   indirect: signal `offset` holds the signal id,
+// mode 11+d: indirect: slot `offset` of the frame d levels up (d < 5) holds
+//            the signal id. Op::Addr makes such an id for a property reached
+//            through a handle (h.q, h.a[i]); a `ref` argument (13.5.2)
+//            holds its actual's id. The slot holds id + 1, so 0 is null.
 // An object is a block of signals too; a handle holds its first signal id
 // (0 is null). Every relative id stays inside its mode as long as the
 // offset is below 2^26, so arr->base + k still resolves correctly.
 constexpr int kRel = 1 << 30;
 constexpr int kRelOffBits = 26;
-constexpr int kRelThis = 8, kRelRet = 9;
+constexpr int kRelThis = 8, kRelRet = 9, kRelIndSig = 10, kRelIndFrame = 11;   // kRelIndFrame + depth, up to 15
 inline int relSig(int mode, int off) { return kRel | (mode << kRelOffBits) | off; }
 inline bool isRel(int s) { return s >= kRel; }
 inline int relMode(int s) { return (s >> kRelOffBits) & 15; }
@@ -1913,6 +1967,7 @@ struct FrameLayout {
     std::vector<int> w;              // width of each slot
     std::vector<Val> init;           // its value when the frame is allocated
     std::vector<std::pair<int, DynObj>> dyn;   // container slots and their empty shape
+    std::vector<int> noCopy;         // slots a shallow copy leaves at their initial value
     std::string name;                // for messages
     mutable std::vector<int> pool;   // first signal of each free frame
     int add(int width, Val v) { w.push_back(width); init.push_back(v); return (int)w.size() - 1; }
@@ -1921,6 +1976,57 @@ struct FrameLayout {
 inline int (*g_allocSigs)(const FrameLayout&) = nullptr;
 inline void (*g_initSigs)(const FrameLayout&, int base) = nullptr;
 inline void (*g_nullAccess)() = nullptr;
+inline Val (*g_getSig)(int) = nullptr;
+
+// Containers of containers (7.5, 7.10): an element holds the id of a
+// container of its own, which is a signal too (its change count).
+inline const FrameLayout& dynElemLay() {
+    static FrameLayout l = [] { FrameLayout x; x.add(64, make(0, 0, 64)); return x; }();
+    return l;
+}
+// A new element of d: an empty container when d holds containers.
+inline Val dynNewElem(const DynObj& d) {
+    if (!d.elem) return d.dflt;
+    int id = g_allocSigs(dynElemLay());
+    if (g_initSigs) g_initSigs(dynElemLay(), id);
+    DynObj o = *d.elem;
+    o.vec.clear();
+    o.map.clear();
+    dynStore()[id] = std::move(o);
+    return make((uint64_t)id, 0, 64);
+}
+// A copy of element v of d: a new container with copies of its elements.
+inline Val dynCopyElem(const DynObj& d, const Val& v) {
+    if (!d.elem) return v;
+    Val n = dynNewElem(d);
+    if (v.x || !v.v) return n;
+    DynObj s = dynStore()[(int)v.v];   // a copy: making elements may add to the store
+    DynObj& t = dynStore()[(int)n.v];
+    for (const Val& e : s.vec) t.vec.push_back(dynCopyElem(s, e));
+    for (const auto& [k, e] : s.map) t.map[k] = dynCopyElem(s, e);
+    return n;
+}
+// d = s: the elements of s (none from an associative array into a list),
+// within d's bound, each copied.
+inline void dynAssign(DynObj& d, const DynObj& s0) {
+    DynObj s = s0;   // s0 may be d itself, or move as elements are made
+    if (d.kind == 2) {
+        d.map.clear();
+        for (const auto& [k, e] : s.map) d.map[k] = dynCopyElem(s, e);
+        return;
+    }
+    d.vec.clear();
+    if (s.kind == 2) return;
+    for (const Val& e : s.vec) {
+        if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound) break;
+        d.vec.push_back(dynCopyElem(s, e));
+    }
+}
+inline bool (*g_isA)(int obj, int cls) = nullptr;   // is object obj of class cls or one derived from it
+// > 0 while an Op::Addr computes an address: reading through a null handle
+// there gives null (the access that uses the address reports it, if it runs).
+inline int g_nullOk = 0;
+inline int g_nullSig = 0;   // a signal that always holds 0, read in place of a null object's slot
 struct Frame {
     int base = 0;                    // first signal of this frame's slots
     int self = 0;                    // `this` (a handle), 0 outside methods
@@ -1962,6 +2068,22 @@ inline int relSlow(int s) {
         if (!g_ret) relFail("no returned frame");
         return g_ret->base + off;
     }
+    if (m >= kRelIndSig) {
+        int at = off;
+        if (m >= kRelIndFrame) {
+            Frame* f = g_fr;
+            for (int d = 0; d < m - kRelIndFrame && f; d++) f = f->up.get();
+            if (!f) relFail("indirect id outside a frame");
+            at = f->base + off;
+        }
+        Val a = g_getSig(at);   // the signal id + 1; 0 is a null handle
+        if (a.x || !a.v) {
+            if (g_nullOk) return g_nullSig;
+            if (g_nullAccess) g_nullAccess();
+            relFail("null object access");
+        }
+        return (int)a.v - 1;
+    }
     Frame* f = g_fr;
     for (int d = 0; d < m && f; d++) f = f->up.get();
     if (!f) relFail("automatic variable outside its frame");
@@ -1972,14 +2094,48 @@ inline int R(int s) { return s < kRel ? s : relSlow(s); }
 // Every signal `e` reads, resolved now (a wait on automatic variables).
 inline void collectAddrs(const std::shared_ptr<struct Expr>& e, std::vector<int>& out);
 
+// Virtual interfaces (25.9): vifTab()[k][m] is the signal id of member m
+// of interface instance k (k = 0: null), or -1.
+inline std::vector<std::vector<int>>& vifTab() { static std::vector<std::vector<int>> t; return t; }
 inline Val eval(const E& e, const Reader& rd) {
     auto k = [&](int i) { return eval(e->kids[i], rd); };
     switch (e->op) {
         case Op::Const: return e->k;
         case Op::Ref: {
+            if (e->at) {   // h.x
+                Val h = eval(e->at, rd);
+                if (h.x || !h.v) {
+                    if (g_nullOk) return make(0, 0, 64);
+                    if (g_nullAccess) g_nullAccess();
+                    relFail("null object access");
+                }
+                Val v = rd((int)h.v + e->sig);
+                v.sgn = e->sgn;
+                return v;
+            }
             Val v = rd(R(e->sig));
             v.sgn = e->sgn;
             return v;
+        }
+        case Op::This: return make(g_fr ? (uint64_t)g_fr->self : 0, 0, 64);
+        case Op::IsA: {
+            Val h = k(0);
+            if (h.x || !h.v) return mk(1, 1);
+            return mk(g_isA ? g_isA((int)h.v, e->hi) : 0, 1);
+        }
+        case Op::AddrOf: return make((uint64_t)R(e->sig) + 1, 0, 64);
+        case Op::VifSig: {
+            Val h = k(0);
+            const auto& tab = vifTab();
+            if (h.x || !h.v || h.v >= tab.size() || (size_t)e->hi >= tab[h.v].size() || tab[h.v][(size_t)e->hi] < 0)
+                return make(0, 0, 64);
+            return make((uint64_t)tab[h.v][(size_t)e->hi] + 1, 0, 64);
+        }
+        case Op::Addr: {
+            g_nullOk++;
+            Val h = k(0);
+            g_nullOk--;
+            return make(h.x || !h.v ? 0 : h.v + (uint64_t)e->sig + 1, 0, 64);
         }
         case Op::Not: return v_not(k(0));
         case Op::And: return v_and(k(0), k(1));
@@ -2111,12 +2267,78 @@ inline Val eval(const E& e, const Reader& rd) {
             return mkstr(s);
         }
         case Op::DynGet: return dynStore()[R(e->sig)].get(k(0));
+        case Op::ArrAddr: {
+            std::vector<int64_t> idx;
+            for (size_t n = 0; n < e->kids.size(); n++) {
+                Val v = k(n);
+                if (v.x) return make(0, 0, 64);
+                idx.push_back(v_to_i64(v));
+            }
+            int64_t off = e->arr->offset(idx);
+            return make(off < 0 ? 0 : (uint64_t)(R(e->arr->base) + off + 1), 0, 64);
+        }
+        case Op::DynElemRef: {
+            const int c = R(e->sig);
+            Val key = k(0);
+            DynObj& d = dynStore()[c];
+            if (!d.elem) relFail("element of a container that holds no containers");
+            if (d.kind == 2) {
+                if (key.x && !d.strKey) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
+                auto it = d.map.find(d.key(key));
+                if (it == d.map.end()) it = d.map.emplace(d.key(key), dynNewElem(d)).first;   // made on first use
+                return make(it->second.v + 1, 0, 64);
+            }
+            int64_t i = key.x ? -1 : v_to_i64(key);
+            // Out of range: an empty container of its own (writes to it are lost).
+            if (i < 0 || i >= (int64_t)d.vec.size()) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
+            Val& el = d.vec[(size_t)i];
+            if (el.x || !el.v) el = dynNewElem(d);
+            return make(el.v + 1, 0, 64);
+        }
         case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {
             auto& d = dynStore()[R(e->sig)];
             Val key = k(0);
             if (d.kind != 2) { int64_t i = v_to_i64(key); return mk(!key.x && i >= 0 && i < (int64_t)d.vec.size()); }
             return mk(d.map.count(d.key(key)) > 0);
+        }
+        case Op::DynHas: {
+            auto& d = dynStore()[R(e->sig)];
+            Val x = k(0);
+            bool unk = false;
+            for (auto& el : d.vec) {
+                int w = std::max(x.w, el.w);
+                Val r = v_wild_eq(v_resize(x, w, x.sgn && el.sgn), v_resize(el, w, x.sgn && el.sgn));
+                if (r.x) unk = true;
+                else if (r.v & 1) return mk(1);
+            }
+            return unk ? allx(1) : mk(0);
+        }
+        case Op::DynBits: {
+            auto& d = dynStore()[R(e->sig)];
+            std::vector<Val> parts;
+            int ew = d.dflt.w;
+            if (d.kind == 2) for (auto& [key, v] : d.map) parts.push_back(v_resize(v, ew, false));
+            else for (auto& v : d.vec) parts.push_back(v_resize(v, ew, false));
+            if (parts.empty()) { Val z = make(0, 0, 1, 0); z.w = 0; return z; }
+            return v_concat(parts);
+        }
+        case Op::StreamPack: {
+            std::vector<Val> parts;
+            for (auto& kid : e->kids) { Val v = eval(kid, rd); if (v.w > 0) parts.push_back(v); }
+            int W = 0;
+            for (auto& p : parts) W += p.w;
+            Val v = W > 0 ? v_concat(parts) : make(0, 0, 1, 0);
+            if (W > 0 && e->lo > 0 && e->lo < W) {
+                std::vector<Val> sl;
+                for (int lo = 0; lo < W; lo += e->lo) sl.push_back(v_slice(v, std::min(lo + e->lo, W) - 1, lo));
+                v = v_concat(sl);
+            }
+            if (e->hi < 0) return v;
+            if (W == 0) return make(0, 0, e->hi, 0);
+            if (e->hi > W) return v_concat({v, make(0, 0, e->hi - W, 0)});
+            if (e->hi < W) return v_slice(v, W - 1, W - e->hi);
+            return v;
         }
         case Op::DynReduce: {
             auto& d = dynStore()[R(e->sig)];
@@ -2194,7 +2416,7 @@ inline Val eval(const E& e, const Reader& rd) {
             }
             int64_t off = a.offset(idx);
             if (off < 0) return bad;
-            Val r = rd(R(a.base + (int)off));
+            Val r = rd(R(a.base) + (int)off);
             r.sgn = a.sgn;
             return r;
         }
@@ -2204,10 +2426,16 @@ inline Val eval(const E& e, const Reader& rd) {
 
 inline void collectAddrs(const E& e, std::vector<int>& out) {
     if (!e) return;
+    if (e->op == Op::Ref && e->at) {   // h.x: the slot of the object h names now
+        Val h = eval(e->at, [](int s) { return g_getSig(s); });
+        if (!h.x && h.v) out.push_back((int)h.v + e->sig);
+        collectAddrs(e->at, out);
+        return;
+    }
     if (e->op == Op::Ref) out.push_back(R(e->sig));
     if (e->op == Op::ArrRead)
-        for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base + i));
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) out.push_back(R(e->sig));
+        for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base) + i);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas || e->op == Op::DynElemRef) out.push_back(R(e->sig));
     for (auto& k : e->kids) collectAddrs(k, out);
 }
 // A copy of `e` with every relative id resolved now: a $strobe / $monitor
@@ -2215,15 +2443,18 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
 // process may be running.
 inline E bindRel(const E& e) {
     if (!e) return e;
-    bool rel = isRel(e->sig) && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynSize ||
-                                 e->op == Op::DynExists || e->op == Op::DynReduce);
+    bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynElemRef || e->op == Op::DynSize ||
+                                            e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas);
+    if (e->op == Op::This) return konst(make(g_fr ? (uint64_t)g_fr->self : 0, 0, 64));
     bool arel = e->op == Op::ArrRead && e->arr && isRel(e->arr->base);
     std::vector<E> kids;
     bool kch = false;
     for (auto& k : e->kids) { kids.push_back(bindRel(k)); kch |= kids.back() != k; }
-    if (!rel && !arel && !kch) return e;
+    E at = bindRel(e->at);
+    if (!rel && !arel && !kch && at == e->at) return e;
     auto c = std::make_shared<Expr>(*e);
     c->kids = std::move(kids);
+    c->at = at;
     if (rel) c->sig = R(e->sig);
     if (arel) { auto a = std::make_shared<ArrShape>(*e->arr); a->base = R(a->base); c->arr = a; }
     return c;

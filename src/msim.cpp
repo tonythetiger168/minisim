@@ -25,8 +25,12 @@
 //   -no-partition    apply every NBA on the main thread (no partition tasks)
 //   -no-2state       -compile without the 2-state fast path (codegen.hpp fast())
 //   -no-cycle        -compile without the cycle domain (codegen.hpp cycleDomain())
-//   -threads <n>     worker threads (default: every hardware thread). Results
-//                    are the same for any n; -threads 1 is single-threaded.
+//   -threads <n>     worker threads (default: one per physical P core, at most
+//                    8; cpu.hpp). `-threads all` uses every logical CPU, SMT
+//                    siblings included. Results are the same for any n.
+//   -pin / -no-pin   pin worker thread k to a distinct physical core, SMT
+//                    siblings last (default: pin, except under a hypervisor)
+//   -cpuinfo         print the detected CPU topology and exit
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
 //   -O<n>            optimization level for -compile (default -O2)
 //
@@ -196,6 +200,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                     : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
                     : !asserts().empty() ? "an assertion"
                     : !clockings().empty() ? "a clocking block"
+                    : !cgDefs().empty() ? "a covergroup"
                     : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -246,6 +251,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
     run += " -threads " + std::to_string(threads);
+    if (g_pin >= 0) run += g_pin ? " -pin" : " -no-pin";
     std::cout.flush();
     int st = std::system(run.c_str());
     if (st == -1) return 1;
@@ -342,7 +348,9 @@ static void usage() {
                  "  -compile       generate C++, build it (<dir>/simv) and run it\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
-                 "  -threads <n>   worker threads (default: all hardware threads)\n"
+                 "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
+                 "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
+                 "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  -version       print the msim version\n"
                  "  --help-slang   list every front-end option\n";
@@ -377,14 +385,24 @@ int main(int argc, char** argv) {
         if (a == "-no-partition") { staticPart = false; continue; }
         if (a == "-no-2state") { twoState = false; continue; }
         if (a == "-no-cycle") { cycle = false; continue; }
+        if (a == "-no-pin") { g_pin = 0; continue; }
+        if (a == "-pin") { g_pin = 1; continue; }
+        if (a == "-cpuinfo") {
+            const CpuTopo& t = cpuTopo();
+            std::cout << t.describe() << "\ndefault -threads " << defaultThreads() << "\nplacement:";
+            for (int c : t.order) std::cout << ' ' << c;
+            std::cout << "\n";
+            return 0;
+        }
         if (a == "-threads") {
             std::string n = next("a thread count");
+            if (n == "all") { threads = maxThreads(); continue; }
             try { threads = std::stoi(n); }
             catch (...) { std::cerr << "msim: bad -threads " << n << "\n"; return 2; }
             if (threads < 1) { std::cerr << "msim: -threads must be at least 1\n"; return 2; }
             // More threads than hardware threads only adds waiting: a batch
             // cannot finish until a descheduled worker runs again.
-            int hw = (int)std::thread::hardware_concurrency();
+            int hw = maxThreads();
             if (hw > 0 && threads > hw) {
                 std::cerr << "msim: -threads " << threads << " is more than the " << hw
                           << " hardware threads; using " << hw << "\n";
@@ -430,6 +448,10 @@ int main(int argc, char** argv) {
         fwd.push_back(a);
     }
     plusArgs() = plusargs;
+    // The language is IEEE 1800-2023 unless --std says otherwise (slang's
+    // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (std::none_of(fwd.begin(), fwd.end(), [](const std::string& s) { return startsWith(s, "--std"); }))
+        fwd.push_back("--std=1800-2023");
     if (seed) {   // the $urandom stream (18.13); $random keeps its own seed (Annex N)
         uint64_t st = (seed + 1) * 0x9E3779B97F4A7C15ull;
         urandomState() = st ? st : 1;
@@ -482,8 +504,9 @@ int main(int argc, char** argv) {
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
     if (usesForce()) staticPart = false;   // a forced signal must see every write (10.6)
     if (lowered.procs.empty()) {
-        std::cerr << "msim: design has no processes to run\n";
-        return 1;
+        // Nothing to schedule: the simulation ends at time 0 (4.4.1).
+        std::cerr << "msim: note: design has no processes; simulation ends at time 0\n";
+        return 0;
     }
 
     Plan pl = plan(lowered, staticComb, staticSeq);
@@ -544,6 +567,7 @@ int main(int argc, char** argv) {
     for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
     startConcAsserts();
     startClockings();
+    startCovergroups();
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
