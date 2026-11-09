@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Foreach constraints with several loop variables over containers of
+  containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
+  over a fixed-size array of queues and associative arrays with string keys.
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor

@@ -5641,9 +5641,73 @@ struct Lowerer {
                     items.push_back(std::move(loop));
                     break;
                 }
+                size_t nd = fc.loopDims.size(), nf = 0;
+                while (nf < nd && fc.loopDims[nf].range) nf++;
+                if (nf < nd) {   // foreach (q[i, j]) over containers of containers, maybe inside a fixed-size array
+                    for (size_t k = nf; k < nd; k++)
+                        if (fc.loopDims[k].range) unsupported("foreach constraint over a fixed-size array inside a container");
+                    // One loop per container level; the inner container is
+                    // the element the outer loop variable names, at solve time.
+                    std::function<void(size_t, int, std::vector<RandItem>&)> nest = [&](size_t k, int cont, std::vector<RandItem>& out) {
+                        if (k == nd) { constraintItems(fc.body, guard, out, before); return; }
+                        RandItem loop;
+                        loop.loopCont = cont;
+                        loop.loopVar = fresh(32);
+                        const Symbol* lv = fc.loopDims[k].loopVar;
+                        if (lv) symOverride[lv] = loop.loopVar;
+                        if (k + 1 < nd) {
+                            if (!dynShape(cont).elem) unsupported("foreach constraint: more dimensions than the container has");
+                            size_t r0 = consRefs.size();
+                            auto n = node(Op::DynElemRef, {ref(loop.loopVar, true)});
+                            n->sig = cont;
+                            int inner = elemRef(cont, n);
+                            loop.refs.insert(loop.refs.end(), consRefs.begin() + (long)r0, consRefs.end());
+                            consRefs.resize(r0);
+                            nest(k + 1, inner, loop.body);
+                        } else constraintItems(fc.body, guard, loop.body, before);
+                        if (lv) symOverride.erase(lv);
+                        out.push_back(std::move(loop));
+                    };
+                    if (nf == 0) {
+                        int d = dynSig(fc.arrayRef);
+                        if (d < 0) unsupported("foreach constraint over this array");
+                        nest(0, d, items);
+                        break;
+                    }
+                    auto fa = contArr(fc.arrayRef);   // int f[2][$]: each container of the fixed-size part
+                    if (!fa || fa->dims.size() != nf) unsupported("foreach constraint over this array");
+                    std::vector<int32_t> idx(nf);
+                    std::function<void(size_t)> fix = [&](size_t k) {
+                        if (k == nf) {
+                            std::vector<E> ks;
+                            for (int32_t v : idx) { Val cv = mk((uint64_t)(int64_t)v, 32); cv.sgn = true; ks.push_back(konst(cv)); }
+                            auto n = node(Op::ArrAddr, std::move(ks));
+                            n->arr = fa;
+                            size_t r0 = consRefs.size();
+                            int c = bindCont(std::move(n), *fa->dynElem);
+                            std::vector<std::pair<int, E>> refs(consRefs.begin() + (long)r0, consRefs.end());
+                            consRefs.resize(r0);
+                            size_t i0 = items.size();
+                            nest(nf, c, items);
+                            for (size_t q = i0; q < items.size(); q++) items[q].refs.insert(items[q].refs.end(), refs.begin(), refs.end());
+                            return;
+                        }
+                        const slang::ConstantRange& r = *fc.loopDims[k].range;
+                        const Symbol* lv = fc.loopDims[k].loopVar;
+                        int step = r.left <= r.right ? 1 : -1;
+                        for (int32_t v = r.left;; v += step) {
+                            idx[k] = v;
+                            if (lv) { Val cv = mk((uint64_t)(int64_t)v, 32); cv.sgn = true; constVals[lv] = cv; }
+                            fix(k + 1);
+                            if (v == r.right) break;
+                        }
+                        if (lv) constVals.erase(lv);
+                    };
+                    fix(0);
+                    break;
+                }
                 std::vector<std::pair<const Symbol*, slang::ConstantRange>> dims;
                 for (const auto& d : fc.loopDims) {
-                    if (!d.range) unsupported("foreach constraint over a dynamic array or queue inside more dimensions");
                     if (d.loopVar) dims.push_back({d.loopVar, *d.range});
                 }
                 std::function<void(size_t)> loop = [&](size_t k) {
