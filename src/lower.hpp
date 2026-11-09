@@ -2546,13 +2546,51 @@ struct Lowerer {
             ExprCtx c{w, sg, sg, true};
             return std::pair<E, E>{expr(x, c), expr(y, c)};
         };
+        auto isReal = [](const Expression& x) { return x.type->isFloating(); };
         if (it.kind == ExpressionKind::ValueRange) {
             const auto& vr = it.as<ValueRangeExpression>();
-            if (vr.rangeKind != ValueRangeKind::Simple) unsupported("tolerance range in inside");
-            auto [l1, lo] = pair(l, vr.left());
-            auto [l2, hi] = pair(l, vr.right());
-            return bin(Op::LogAnd, bin(Op::Ge, l1, lo), bin(Op::Le, l2, hi));
+            if (vr.rangeKind == ValueRangeKind::Simple) {
+                if (isReal(l) || isReal(vr.left()) || isReal(vr.right()))
+                    return bin(Op::LogAnd, fcmp(3, realOf(l), realOf(vr.left())), fcmp(1, realOf(l), realOf(vr.right())));
+                auto [l1, lo] = pair(l, vr.left());
+                auto [l2, hi] = pair(l, vr.right());
+                return bin(Op::LogAnd, bin(Op::Ge, l1, lo), bin(Op::Le, l2, hi));
+            }
+            // [A +/- B] is [A-B : A+B]; [A +%- B] is [A - A*B/100.0 : A + A*B/100.0]
+            // (11.4.13), compared as reals.
+            E a = realOf(vr.left()), b = realOf(vr.right());
+            if (vr.rangeKind == ValueRangeKind::RelativeTolerance) {
+                Val h = mkreal(100.0);
+                b = bin(Op::FDiv, bin(Op::FMul, a, b), konst(h));
+            }
+            E x = realOf(l);
+            return bin(Op::LogAnd, fcmp(3, x, bin(Op::FSub, a, b)), fcmp(1, x, bin(Op::FAdd, a, b)));
         }
+        if (it.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            // an unpacked array as an item: any of its elements (11.4.13)
+            std::vector<E> els;
+            arrayElems(*it.type, it, els);
+            const Type& et = *it.type->getCanonicalType().getArrayElementType();
+            if (!et.isIntegral() || !l.type->isIntegral()) unsupported("inside an array of non-integral elements");
+            int w = std::max((int)l.type->getBitWidth(), (int)et.getBitWidth());
+            bool sg = l.type->isSigned() && et.isSigned();
+            ExprCtx c{w, sg, sg, true};
+            E lv = expr(l, c);
+            E acc;
+            for (auto& el : els) {
+                E m = bin(Op::WildEq, lv, resize(el, w, et.isSigned(), sg));
+                acc = acc ? bin(Op::LogOr, acc, m) : m;
+            }
+            return acc ? acc : konst(mk(0, 1));
+        }
+        if (int d = dynSig(it); d >= 0) {   // a queue or dynamic array as an item
+            if (dynShape(d).kind == 2) unsupported("an associative array inside an inside list");
+            if (!l.type->isIntegral()) unsupported("inside a container with a non-integral value");
+            auto n = node(Op::DynHas, {expr(l)});
+            n->sig = d;
+            return n;
+        }
+        if (isReal(l) || isReal(it)) return fcmp(4, realOf(l), realOf(it));
         if (!it.type->isIntegral() || !l.type->isIntegral()) unsupported("inside on a non-integral item");
         auto [a, b] = pair(l, it);
         return bin(Op::WildEq, a, b);

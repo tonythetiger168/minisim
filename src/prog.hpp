@@ -156,7 +156,7 @@ inline void collectRefsInto(const E& e, std::vector<int>& out, std::unordered_se
     if (e->op == Op::Ref) add(e->sig);
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) add(e->arr->base + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits) add(e->sig);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) add(e->sig);
     for (auto& k : e->kids) collectRefsInto(k, out, seen);
 }
 // Does e read an automatic variable (a relative id)?
