@@ -1425,7 +1425,15 @@ struct WaitAny {
     bool await_ready() const { return false; }
     void await_suspend(Handle h) const {
         auto token = make_shared<bool>(false);
-        for (auto& [sg, e] : *ev) S.waiters[sg].push_back({h, e, token});
+        for (auto& [sg, e] : *ev) {
+            auto& ws = S.waiters[sg];
+            // A sibling event that keeps firing leaves stale entries on a signal
+            // that never changes (always @(posedge clk or negedge rst_n)): drop
+            // them whenever the list doubles, so it stays bounded.
+            if (ws.size() >= 16 && (ws.size() & (ws.size() - 1)) == 0)
+                std::erase_if(ws, [](const Waiter& w) { return w.fired && *w.fired; });
+            ws.push_back({h, e, token});
+        }
     }
     void await_resume() const {}
 };
