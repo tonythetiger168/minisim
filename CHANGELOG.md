@@ -46,6 +46,21 @@ Spec references are IEEE 1800-2023 clauses.
   into an `@*` wait.
 - A process still waiting at the end of the simulation could corrupt the
   heap when it was freed.
+- `%p` of containers of unpacked structs, unions, enums and packed structs
+  (21.2.1.6), at any nesting depth.
+- Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
+  `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
+  Negative `$setuphold` / `$recrem` limits with delayed signals under
+  `+neg_tchk` (31.9).
+- Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
+  `always_ff` on sampled values, checker variables and free variables, all
+  in the reactive region set. Before this, checker instances were ignored.
+- Programs (24): program code runs in the reactive region set, programs end
+  with an implicit `$finish`, `$exit`, nested and anonymous programs.
+- Gate-level switches (28): `bufif0/1`, `notif0/1` with L/H strength
+  resolution, `nmos`/`pmos`/`cmos` and their resistive forms, and the
+  bidirectional `tran`/`rtran`/`tranif0/1`/`rtranif0/1`.
+- User-defined primitives (29): combinational, level- and edge-sensitive.
 - Arrays of instances and of interfaces (23.3.3, 25.3), including
   multidimensional instance arrays and per-element port slicing.
 - System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),

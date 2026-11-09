@@ -28,6 +28,7 @@
 #include <climits>
 #include <functional>
 #include <map>
+#include <set>
 #include <queue>
 #include <sstream>
 #include <memory>
@@ -47,6 +48,7 @@ using Handle = coroutine_handle<>;
 #include "sva_engine.hpp"
 #include "clocking.hpp"
 #include "cover.hpp"
+#include "tchk.hpp"
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
@@ -325,6 +327,20 @@ struct Sim {
     // the signal's value from the preponed region of this time slot. At time
     // 0 it keeps the default sampled value (the declaration's initial value).
     vector<pair<int, int>> shadows;
+    // Free checker variables (17.7.2): signal, and whether it takes a new
+    // random value in every time step (an active one).
+    vector<pair<int, bool>> freeVars;
+    Val freeValue(int s) {
+        int w = sigs[s].w;
+        uint64_t r = urandomNext(urandomState());
+        if (w > 32) r |= (uint64_t)urandomNext(urandomState()) << 32;
+        return make(w >= 64 ? r : (r & ((1ull << w) - 1)), 0, w, 0);
+    }
+    uint64_t freeAt = 0;   // the time step freeStep last ran in
+    void freeStep() {
+        for (auto [s, every] : freeVars)
+            if (every) set(s, freeValue(s));
+    }
     // Clocks of $past / $rose / ... (sva.hpp SampleClock); ticked: the ones
     // that ticked in this slot, shifted at the end of the slot.
     vector<SampleClock> sclocks;
@@ -717,6 +733,7 @@ struct Sim {
         quiet.assign(sigs.size(), 1);
         for (size_t s = 0; s < sigs.size(); s++) {
             if (sigs[s].w > 64 || sigs[s].net && sigs[s].drv.empty()) quiet[s] = 0;
+            if (s < tranOf.size() && !tranOf[s].empty()) quiet[s] = 0;   // a tran net: drive() resolves its group
             if (s < seqOf.size())
                 if (!seqOf[s].empty()) quiet[s] = 0;   // a clock: set() detects its edges
             if (s < combOf.size())
@@ -856,6 +873,7 @@ struct Sim {
         g.drv[d].v = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
+        if (__builtin_expect(!tranOf.empty(), 0) && (size_t)s < tranOf.size() && !tranOf[(size_t)s].empty()) { tranResolve(s); return; }
         // One driver that drives both 0 and 1 resolves to its own value
         // (X stays X, Z stays Z). Skip the per-bit strength walk.
         Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
@@ -866,6 +884,87 @@ struct Sim {
             if (nd != netDelay.end()) { schedule(s, -1, r, g.val, nd->second, STR_STRONG, STR_STRONG); return; }
         }
         set(s, r);
+    }
+    // Bidirectional switches (28.8). Nets joined by switches that are on form
+    // one group; every net in it takes the resolution of all the group's
+    // drivers. A driver seen through a switch is reduced (28.13.1): supply
+    // becomes strong through a tran, and each rtran lowers it one more step.
+    // A switch with an X or Z control is resolved both ways: bits that
+    // differ become X.
+    struct TranSw { int a, b; bool resist; int state = -1; };   // state: 0 off, 1 on, 2 unknown
+    vector<TranSw> trans;
+    vector<vector<int>> tranOf;   // net -> its switches
+    void addTran(int a, int b, bool resist) {
+        if (tranOf.size() != sigs.size()) tranOf.resize(sigs.size());
+        tranOf[(size_t)a].push_back((int)trans.size());
+        tranOf[(size_t)b].push_back((int)trans.size());
+        trans.push_back({a, b, resist});
+    }
+    void tranCtl(int id, int st) {
+        if (trans[(size_t)id].state == st) return;
+        trans[(size_t)id].state = st;
+        tranResolve(trans[(size_t)id].a);
+        tranResolve(trans[(size_t)id].b);
+    }
+    static uint8_t tranReduce(uint8_t s, bool resist) {
+        static const uint8_t r[8] = {STR_HIZ, STR_SMALL, STR_SMALL, STR_MEDIUM, STR_MEDIUM, STR_WEAK, STR_PULL, STR_PULL};
+        if (resist) return r[s & 7];
+        return s == STR_SUPPLY ? STR_STRONG : s;
+    }
+    // The value net n sees: the drivers of every net it reaches through
+    // switches that are on (and, when unkOn, those with an unknown control).
+    Val tranValue(int n, bool unkOn, vector<int>& seen) {
+        // Best path to each net: the fewest resistive steps, then any switch at all.
+        map<int, pair<int, bool>> best;   // net -> (resistive steps, crossed a switch)
+        deque<int> q{n};
+        best[n] = {0, false};
+        while (!q.empty()) {
+            int m = q.front(); q.pop_front();
+            auto [k, crossed] = best[m];
+            for (int id : tranOf[(size_t)m]) {
+                const TranSw& t = trans[(size_t)id];
+                if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
+                int o = t.a == m ? t.b : t.a;
+                pair<int, bool> nb{k + (t.resist ? 1 : 0), true};
+                auto it = best.find(o);
+                if (it != best.end() && it->second.first <= nb.first) continue;
+                best[o] = nb;
+                q.push_back(o);
+            }
+        }
+        vector<Drv> all;
+        for (auto& [m, kc] : best) {
+            seen.push_back(m);
+            for (Drv d : sigs[(size_t)m].drv) {
+                if (kc.second) {
+                    d.s0 = tranReduce(d.s0, false);
+                    d.s1 = tranReduce(d.s1, false);
+                }
+                for (int r = 0; r < kc.first; r++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                all.push_back(d);
+            }
+        }
+        const Sig& g = sigs[(size_t)n];
+        return g.kind != NR_WIRE ? resolveNet(g.kind, all.data(), all.size(), g.w, g.val)
+                                 : resolveDrives(all.data(), all.size(), g.w);
+    }
+    void tranResolve(int s) {
+        vector<int> group, scratch;
+        Val v = tranValue(s, true, group);
+        bool unknown = false;
+        for (int m : group)
+            for (int id : tranOf[(size_t)m]) if (trans[(size_t)id].state == 2) unknown = true;
+        vector<pair<int, Val>> vals;
+        for (int m : group) {
+            Val on = m == s ? v : tranValue(m, true, scratch);
+            if (unknown) {
+                Val off = tranValue(m, false, scratch);
+                for (int b = 0; b < sigs[(size_t)m].w; b++)
+                    if (bitAt(on, b) != bitAt(off, b)) setBit(on, b, 2);
+            }
+            vals.push_back({m, on});
+        }
+        for (auto& [m, val] : vals) set(m, val);
     }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
@@ -1259,7 +1358,31 @@ struct Sim {
                 char style = fmt[++i];
                 if (ai >= args.size()) continue;
                 const E& h = args[ai++];
-                auto one = [&](Val v, char st) {
+                E slot, sub;   // %QF: each element set into slot, printed by sub
+                if (style == 'F') {
+                    if (ai + 2 > args.size()) continue;
+                    slot = args[ai++];
+                    sub = args[ai++];
+                }
+                auto one = [&](Val v, char st) -> string {
+                    if (st == 'F') {   // the element in place of the slot
+                        std::function<E(const E&)> put = [&](const E& e) -> E {
+                            if (!e) return e;
+                            if (e->op == Op::Ref && !e->at && e->sig == slot->sig) {
+                                Val k = v;
+                                k.sgn = e->sgn;
+                                return konst(k);
+                            }
+                            bool ch = false;
+                            std::vector<E> kids;
+                            for (auto& kd : e->kids) { kids.push_back(put(kd)); ch |= kids.back() != kd; }
+                            if (!ch) return e;
+                            auto c = std::make_shared<Expr>(*e);
+                            c->kids = std::move(kids);
+                            return c;
+                        };
+                        return v_str(eval(put(sub), rd));
+                    }
                     if (st == 's') { v.str = true; return "\"" + v_str(v) + "\""; }
                     if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
                     return fmtVal('d', v, 0, true);
@@ -1964,6 +2087,7 @@ struct Sim {
             if (!any) continue;   // only disabled processes were waiting here
             now = t;
             g_simTime = now;
+            if (!freeVars.empty() && now && now != freeAt) { freeStep(); freeAt = now; }   // active free checker variables (17.7.2)
             if (vpiRegion) vpiRegion(VR_START);   // cbNextSimTime, cbAtStartOfSimTime, cbAfterDelay
             if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
                 for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
@@ -2042,6 +2166,13 @@ struct Delay {
         }
         else S.wheel[S.now + n].push_back(h);
     }
+    void await_resume() const {}
+};
+// A program process (24.3.1) woken in the active region set moves to the
+// reactive region, and runs there once the design is quiet.
+struct ToReactive {
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { S.reactive.push_back(h); S.rare = true; }
     void await_resume() const {}
 };
 struct Wait {

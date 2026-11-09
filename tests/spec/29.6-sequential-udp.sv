@@ -1,6 +1,5 @@
 // IEEE 1800-2023 29.6: An edge-sensitive sequential UDP: a D flip-flop with
 // an initial value (29.6, 29.7).
-//! xfail: UDPs are errors
 //! icarus-skip: Icarus 13 does not parse UDPs inside this file layout
 primitive dff(output reg q, input c, d);
   initial q = 0;

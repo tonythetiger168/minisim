@@ -82,6 +82,89 @@ static void writeMem(const Instr& i) {
 // index values. Without a range, loading starts at the lowest address and goes
 // up; with start and finish it goes from start toward finish. "@hex" in the
 // file moves the address. 2-state elements read x/z digits as 0 (21.4.2).
+// A user-defined primitive (29). Values are 0, 1, 2 (x); z inputs read as x
+// (29.3.5). `last` holds each input's previous value in two bits (all X
+// before the first evaluation). Inputs that changed are taken one at a time, in port order; for
+// each, a matching level row wins over a matching edge row (29.9, 29.10),
+// and a change no row covers gives x (29.6). '-' keeps the state.
+static bool udpLevel(char c, int v) {
+    switch (c) {
+        case '0': return v == 0;
+        case '1': return v == 1;
+        case 'x': return v == 2;
+        case 'b': return v < 2;
+        case '?': return true;
+        default: return false;
+    }
+}
+static bool udpEdge(const std::string& f, int a, int b) {
+    if (f.size() == 4) return udpLevel(f[1], a) && udpLevel(f[2], b);
+    switch (f[0]) {
+        case 'r': return a == 0 && b == 1;
+        case 'f': return a == 1 && b == 0;
+        case 'p': return (a == 0 && b != 0) || (a == 2 && b == 1);
+        case 'n': return (a == 1 && b != 1) || (a == 2 && b == 0);
+        case '*': return true;
+        default: return false;
+    }
+}
+static char udpMatch(const UdpTable& t, const std::vector<int>& in, int q, int edgeAt, int from) {
+    for (const UdpRow& r : t.rows) {
+        if (r.edge != edgeAt) continue;
+        if (t.seq && !udpLevel(r.state, q)) continue;
+        bool ok = true;
+        for (int k = 0; k < t.nin && ok; k++)
+            ok = k == edgeAt ? udpEdge(r.in[(size_t)k], from, in[(size_t)k]) : udpLevel(r.in[(size_t)k][0], in[(size_t)k]);
+        if (ok) return r.out;
+    }
+    return 0;
+}
+static void udpExec(const Instr& i) {
+    const UdpTable& t = *i.udp;
+    Val qv = S.get(i.sig), lv = S.get(i.dres);
+    int q = (qv.x & 1) ? 2 : (int)(qv.v & 1);
+    std::vector<int> prev((size_t)t.nin), cur((size_t)t.nin);
+    for (int k = 0; k < t.nin; k++) {
+        Val a = eval(i.args[(size_t)k], rd);
+        cur[(size_t)k] = (a.x & 1) ? 2 : (int)(a.v & 1);
+        int code = bitAt(lv, 2 * k) | (bitAt(lv, 2 * k + 1) == 1 ? 2 : 0);
+        prev[(size_t)k] = bitAt(lv, 2 * k) >= 2 ? 2 : code;
+    }
+    // The first evaluation (time 0) takes the inputs as they are: their
+    // starting values are not transitions.
+    bool first = t.nin > 0 && bitAt(lv, 0) >= 2;
+    if (first) prev = cur;
+    auto apply = [&](char r) { if (r == '0') q = 0; else if (r == '1') q = 1; else if (r != '-') q = 2; };
+    if (!t.seq) {
+        char r = udpMatch(t, cur, q, -1, 0);
+        apply(r ? r : 'x');
+    } else {
+        std::vector<int> now = prev;
+        bool any = false;
+        for (int k = 0; k < t.nin; k++) {
+            if (cur[(size_t)k] == prev[(size_t)k]) continue;
+            any = true;
+            now[(size_t)k] = cur[(size_t)k];
+            char r = udpMatch(t, now, q, -1, 0);
+            if (!r && t.edges) r = udpMatch(t, now, q, k, prev[(size_t)k]);
+            apply(r ? r : 'x');
+        }
+        if (!any && first) {   // a sequential UDP's first evaluation: its level rows only
+            char r = udpMatch(t, cur, q, -1, 0);
+            if (r) apply(r);
+        }
+    }
+    Val nl = make(0, 0, 2 * t.nin);
+    if (2 * t.nin > 64) nl = maskWidth(nl, 2 * t.nin);
+    for (int k = 0; k < t.nin; k++) {
+        int v = cur[(size_t)k];
+        setBit(nl, 2 * k, v == 2 ? 0 : v);
+        setBit(nl, 2 * k + 1, v == 2 ? 1 : 0);
+    }
+    S.set(i.dres, nl);
+    S.set(i.sig, q == 2 ? allx(1) : make((uint64_t)q, 0, 1));
+}
+
 // $fread into a memory (21.3.4.4): args are fd, start, count (either may be
 // unset). Elements load from start toward the highest address; dres gets
 // the number of bytes read.
@@ -453,6 +536,12 @@ struct ProcCtl {
     // Written before the process starts: a deferred assertion action's
     // captured arguments, written into their slots (16.4.1).
     vector<pair<Expr*, Val>> init;
+    // A program thread (24.3.1): the program instance, or -1. It and every
+    // thread it forks run in the reactive region set. progRoot: one of the
+    // program's initial procedures.
+    int program = -1;
+    bool progRoot = false;
+    bool reactive = false;   // a program or checker thread: runs in the reactive region set
     bool kidsDone() const {
         for (auto& k : kids) if (!k->ended) return false;
         return true;
@@ -462,9 +551,11 @@ inline unordered_map<int, vector<weak_ptr<ProcCtl>>>& rootProcs() {
     static unordered_map<int, vector<weak_ptr<ProcCtl>>> m;
     return m;
 }
+inline void programRootEnded(int p);
 inline void procEnd(ProcCtl& c) {
     if (c.ended) return;
     c.ended = true;
+    if (c.progRoot) programRootEnded(c.program);
     for (Handle h : c.awaiters) S.active.push_back(h);
     c.awaiters.clear();
     if (c.join) c.join->branchEnded();
@@ -492,6 +583,33 @@ struct WaitFork {
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
 
+// ---- programs (24.3, 24.7) ----
+// When every initial procedure of a program has ended, the program ends:
+// the threads they forked are killed. When every program with an initial
+// procedure has ended, the run ends with an implicit $finish.
+struct ProgramRun { vector<shared_ptr<ProcCtl>> roots; int live = 0; bool ended = false; };
+inline vector<ProgramRun>& programRuns() { static vector<ProgramRun> v; return v; }
+inline int& programsLive() { static int n = 0; return n; }
+inline void programRootEnded(int p) {
+    ProgramRun& r = programRuns()[p];
+    if (--r.live > 0 || r.ended) return;
+    r.ended = true;
+    for (auto& c : r.roots) {
+        auto kids = c->kids;
+        for (auto& k : kids) procKill(k);
+    }
+    if (--programsLive() == 0) S.finished = true;
+}
+// $exit (24.7): end the calling thread's program. Outside a program it is
+// ignored, with a warning.
+inline void programExit(const shared_ptr<ProcCtl>& ctl) {
+    if (ctl->program < 0) {
+        std::cerr << "msim: warning: $exit outside a program is ignored (24.7)\n";
+        return;
+    }
+    auto roots = programRuns()[ctl->program].roots;
+    for (auto& c : roots) procKill(c);
+}
 // std::process (9.7): process objects index this table.
 inline vector<shared_ptr<ProcCtl>>& procTable() { static vector<shared_ptr<ProcCtl>> v; return v; }
 struct ProcAwait {   // p.await(): until p ends
@@ -532,12 +650,33 @@ inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr)
     return t;
 }
 // A top-level process (initial, always, final).
-inline Task process(const Prog* p) {
-    auto c = make_shared<ProcCtl>();
+// A new top-level process's generator (18.14.2), seeded in start order.
+inline void seedProc(ProcCtl& c) {
     uint64_t& g = globalRandomState();   // seeded in the order the processes start
     uint64_t a = urandomNext(g), b = urandomNext(g);
-    c->rng = seedState(a << 32 | b);
+    c.rng = seedState(a << 32 | b);
+}
+inline Task process(const Prog* p) {
+    auto c = make_shared<ProcCtl>();
+    seedProc(*c);
     return startProc(p, std::move(c), nullptr);
+}
+// A process of a program (24.3): an initial procedure, or a continuous assign.
+inline Task programProc(const Prog* prog, int program, bool initial) {
+    auto c = make_shared<ProcCtl>();
+    seedProc(*c);
+    c->program = program;
+    c->reactive = true;
+    if (initial && program >= 0) {
+        auto& runs = programRuns();
+        if ((size_t)program >= runs.size()) runs.resize(program + 1);
+        ProgramRun& r = runs[program];
+        if (r.roots.empty()) programsLive()++;
+        r.roots.push_back(c);
+        r.live++;
+        c->progRoot = true;
+    }
+    return startProc(prog, c, nullptr);
 }
 inline Task exec(const Prog* p) { return process(p); }
 
@@ -1027,6 +1166,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         if (f.fr != fr) { lastRet = std::move(fr); fr = std::move(f.fr); }
     };
     for (auto& [slot, v] : ctl->init) slot->k = v;
+    // A program thread runs in the reactive region set (24.3.1): it starts
+    // there, and goes back there after every wait.
+#define TO_REACTIVE if (__builtin_expect(ctl->reactive, 0) && S.region != R_REACTIVE) co_await ToReactive{}
+    TO_REACTIVE;
     while (p) {
         g_fr = fr.get();
         g_ret = lastRet.get();
@@ -1104,6 +1247,16 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
+            case IK::Udp: udpExec(i); pc++; break;
+            case IK::Tran: {   // 28.8: 1 on, 0 off, 2 an X or Z control
+                int st = 1;
+                if (i.e) {
+                    Val c = eval(i.e, rd);
+                    st = (c.x & 1) ? 2 : (int)((c.v & 1) ^ (i.pdown ? 1 : 0));
+                }
+                S.tranCtl(i.sig, st);
+                pc++; break;
+            }
             case IK::Dump: {
                 Val a = i.args.empty() ? Val{} : eval(i.args[0], rd);
                 std::string str;
@@ -1203,12 +1356,14 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     else co_await Wait{evbuf[0].first, evbuf[0].second};
                 } else if (i.events.size() > 1) co_await WaitAny{&i.events};
                 else co_await Wait{i.sig, i.edge};
+                TO_REACTIVE;
                 ctl->epoch++;   // a deferred assertion flush point (16.4.2)
                 pc++; break;
             case IK::WaitDelay: {
                 uint64_t d = i.delay;
                 if (i.de) { Val v = eval(i.de, rd); d = v_time(v); }
                 co_await Delay{d};
+                TO_REACTIVE;
                 pc++; break;
             }
             case IK::Display:
@@ -1238,6 +1393,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 if (S.finished) goto done;
                 pc++;
                 break;
+            case IK::Exit:
+                programExit(ctl);
+                if (ctl->killed) goto done;
+                pc++; break;
             case IK::Finish:
                 // Stop this process. The rest of this time slot still runs,
                 // including NBA and postponed, so a $strobe/$monitor already
@@ -1316,6 +1475,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     auto c = make_shared<ProcCtl>();
                     c->parent = ctl;
                     c->join = js;
+                    c->program = ctl->program;
+                    c->reactive = ctl->reactive;
                     {   // 18.14.2: a forked process's generator is seeded from its parent's
                         uint64_t a = urandomNext(*ctl->rngp), b = urandomNext(*ctl->rngp);
                         c->rng = seedState(a << 32 | b);
@@ -1327,7 +1488,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     S.active.push_back(t.h);
                 }
                 pc++;
-                if (i.join != 2) co_await JoinWait{js};
+                if (i.join != 2) { co_await JoinWait{js}; TO_REACTIVE; }
                 if (S.finished) goto done;
                 break;
             }
@@ -1343,6 +1504,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::WaitFork:
                 pc++;
                 co_await WaitFork{ctl};
+                TO_REACTIVE;
                 break;
             case IK::DisableFork:
                 for (auto& k : ctl->kids) procKill(k);
@@ -1369,6 +1531,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     if (t.x || t.v != S.now + 1) co_await Wait{i.sig, ANY};
                 } else
                     for (uint64_t k = 0; k < n; k++) co_await Wait{i.sig, ANY};
+                TO_REACTIVE;
                 ctl->epoch++;
                 pc++; break;
             }
@@ -1387,6 +1550,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
 done:
     procEnd(*ctl);
 }
+#undef TO_REACTIVE
 
 // The value of a one-assign combinational process, and its write
 // (Sim::Comb compute / commit). compute only reads signals.
@@ -1588,3 +1752,4 @@ inline void startClockings() {
     }
 }
 #include "cover_rt.inc"
+#include "tchk.inc"

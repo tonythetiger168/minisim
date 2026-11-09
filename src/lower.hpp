@@ -26,8 +26,7 @@
 // Automatic tasks, class methods, and automatic functions that recurse or
 // fork run each call in a frame (expr.hpp: Frame); their variables are
 // relative ids. Everything else is a static signal.
-// Not yet:  nmos/pmos/cmos/tran, bufif/notif, trireg, a[i +: w],
-//           ref arguments, DPI, class methods,
+// Not yet:  ref arguments, DPI, class methods,
 //           hierarchical calls, instance arrays, interfaces, hierarchical
 //           references into a child. Arguments are one static copy per subroutine.
 //
@@ -55,6 +54,7 @@
 #include "sva_engine.hpp"
 #include "clocking.hpp"
 #include "cover.hpp"
+#include "tchk.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
@@ -335,7 +335,12 @@ inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return 
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
 
-struct LoweredProc { Prog prog; bool loops; std::string kind; };
+// program: the index of the program instance (24) the process belongs to,
+// or -1. A program's initial procedures and continuous assigns run in the
+// reactive region set (24.3.1).
+// reactive: a process of a checker (17.7.3), which also runs in the
+// reactive region set but takes no part in ending the run.
+struct LoweredProc { Prog prog; bool loops; std::string kind; int program = -1; bool reactive = false; };
 
 // One module-level task or function. Arguments and the function result are
 // signals (the formal and slang's returnValVar), shared by every call.
@@ -484,9 +489,17 @@ struct LowerResult {
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
+    int programs = 0;                 // program instances (24.3)
     LayoutList layouts;   // frame shapes of automatic subroutines and fork branches
     std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
     std::vector<std::pair<int, uint8_t>> netKinds;                   // wand, wor, tri0, ... (6.6): signal, NetResolve
+    // Free checker variables (17.7) with no initializer: each starts random;
+    // an active one (never assigned, not const) takes a new random value
+    // in every time step (17.7.2). Signal, every step.
+    std::vector<std::pair<int, bool>> freeVars;
+    std::vector<std::unique_ptr<UdpTable>> udps;   // tables of the user-defined primitives (29)
+    struct TranDecl { int a, b; bool resist; };
+    std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
     std::string timescale() const {
@@ -4475,6 +4488,11 @@ struct Lowerer {
                 collectEvents(globalClocking()->getEvent(), ev);
                 return;
             }
+            if (const auto* cb = inferredClock(s.expr)) {   // @($inferred_clock) (16.14.7)
+                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $inferred_clock");
+                collectEvents(cb->getEvent(), ev);
+                return;
+            }
             if (const auto* cb = clockingRef(s.expr)) {   // @(cb): the clocking block event (14.10)
                 if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a clocking block event");
                 ev.push_back({clockings()[clockingIdx(*cb)].evSig, ANY});
@@ -5144,6 +5162,28 @@ struct Lowerer {
         }
         fmt += "}";
     }
+    // %p of container h whose innermost elements have type ec: %Q with d, s
+    // or R; other elements (enums, structs) %QF with a temporary that holds
+    // each element in turn and the format that prints it.
+    void pfmtCont(const slang::ast::Type& ec, E h, std::string& fmt, std::vector<E>& out) {
+        fmt += "%Q";
+        if (ec.isString()) { fmt += 's'; out.push_back(h); return; }
+        if (ec.isFloating()) { fmt += 'R'; out.push_back(h); return; }
+        if (ec.isIntegral() && ec.kind != slang::ast::SymbolKind::EnumType && !ec.isStruct()) { fmt += 'd'; out.push_back(h); return; }
+        int w = storeW(ec);
+        if (w <= 0) unsupported("%p of a container of this element type");
+        int tmp = fresh(w);
+        std::string sub;
+        std::vector<E> subArgs;
+        if (ec.isUnpackedStruct() || ec.isUnpackedUnion()) pfmtStruct(ec, ref(tmp), sub, subArgs);
+        else pfmtSingular(ec, ref(tmp, ec.isSigned()), sub, subArgs);
+        auto sf = node(Op::SFormat, std::move(subArgs));
+        sf->fmt = sub;
+        fmt += 'F';
+        out.push_back(h);
+        out.push_back(ref(tmp));
+        out.push_back(sf);
+    }
     // A value held as the bits of an unpacked struct member (uWidth).
     void pfmtBits(const slang::ast::Type& t0, E part, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
@@ -5171,11 +5211,7 @@ struct Lowerer {
         if (int d = dynSig(x); d >= 0) {
             const Type* et = x.type->getCanonicalType().getArrayElementType();
             while (isDynType(*et)) et = et->getCanonicalType().getArrayElementType();   // a container of containers: the innermost elements
-            const Type& ec = et->getCanonicalType();
-            // (handles, enums, structs: their stored bits as a number, for now)
-            fmt += "%Q";
-            fmt += ec.isString() ? 's' : ec.isFloating() ? 'R' : 'd';
-            out.push_back(ref(d));
+            pfmtCont(et->getCanonicalType(), ref(d), fmt, out);
             return;
         }
         if (auto ca = x.type->isUnpackedArray() ? contArr(x) : nullptr) {   // int f[2][$]: each element container by %Q
@@ -5196,12 +5232,7 @@ struct Lowerer {
                     addr->arr = ca;
                     const Type* it = et;
                     while (isDynType(*it)) it = it->getCanonicalType().getArrayElementType();
-                    const Type& ec = it->getCanonicalType();
-                    if (!(ec.isIntegral() && ec.kind != SymbolKind::EnumType && !ec.isStruct()) && !ec.isString() && !ec.isFloating())
-                        unsupported("%p of a container of this element type");
-                    fmt += "%Q";
-                    fmt += ec.isString() ? 's' : ec.isFloating() ? 'R' : 'd';
-                    out.push_back(ref(bindCont(std::move(addr), *ca->dynElem)));
+                    pfmtCont(it->getCanonicalType(), ref(bindCont(std::move(addr), *ca->dynElem)), fmt, out);
                 }
                 fmt += "}";
             };
@@ -5780,6 +5811,7 @@ struct Lowerer {
         if (n == "$finish" || n == "$stop") {
             Instr i; i.k = IK::Finish; prog.emit(i); return;
         }
+        if (n == "$exit") { Instr i; i.k = IK::Exit; prog.emit(i); return; }
         if (n == "$fatal" || n == "$error" || n == "$warning" || n == "$info") { severity(call, n); return; }
         if (assertCtlCall(call, n)) return;   // $asserton, $assertcontrol, ... (20.11)
         if (!call.arguments().empty() && dynSig(*call.arguments()[0]) >= 0) {   // q.push_back(x), aa.delete(k) ...
@@ -7401,7 +7433,11 @@ inline bool enterInstance(const slang::ast::InstanceSymbol& inst) {
     if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return false;
     // An interface instance (25.3) is lowered like a module instance: its
     // signals are named "bus.data", and its processes and tasks run as usual.
-    if (!inst.isTopLevel() && !inst.isModule() && !inst.isInterface()) Lowerer::unsupported("non-module instance");
+    // A program (24.3) is lowered like a module; its processes are marked
+    // and run in the reactive region set.
+    if (!inst.isTopLevel() && !inst.isModule() && !inst.isInterface() &&
+        inst.getDefinition().definitionKind != slang::ast::DefinitionKind::Program)
+        Lowerer::unsupported("non-module instance");
     return true;
 }
 
@@ -7615,6 +7651,15 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         if (n.getType().isUnpackedArray()) Lowerer::unsupported("an array of wand/wor/tri0/tri1/trireg/supply nets");
         netKinds().push_back({sigmap.at(&n), k});
     }
+    // A checker instance (17.3): its variables and output formals are named
+    // like an instance's, "chk.v". Its input formals are not signals: slang
+    // puts each actual in place of the formal.
+    void handle(const slang::ast::CheckerInstanceSymbol& ci) {
+        std::string saved = prefix;
+        prefix += std::string(ci.name) + ".";
+        visitDefault(ci);
+        prefix = std::move(saved);
+    }
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
         std::string saved = prefix;
@@ -7790,7 +7835,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             lw.prog.emit(waitInstr(rs));
             Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
         }
-        out.procs.push_back({std::move(lw.prog), loops, "assign"});
+        out.procs.push_back({std::move(lw.prog), loops, "assign", program, checkerDepth > 0});
     }
 
     // Module-level `logic x = v;` (IEEE 1800-2023 10.5): a static variable's
@@ -7822,7 +7867,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (!sc) return;
         auto pk = sc->asSymbol().kind;
         if (pk != slang::ast::SymbolKind::InstanceBody && pk != slang::ast::SymbolKind::GenerateBlock &&
-            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit) {   // package variables too (26.2)
+            pk != slang::ast::SymbolKind::Package && pk != slang::ast::SymbolKind::CompilationUnit &&
+            pk != slang::ast::SymbolKind::CheckerInstanceBody) {   // package (26.2) and checker (17.7) variables too
             // A static local of a task, function or block with no
             // initializer: a 2-state one starts at 0 like a module variable
             // (6.8, 6.21). One with an initializer takes it on the first call.
@@ -7830,6 +7876,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 initStatic(v);
             return;
         }
+        if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
         initStatic(v);
     }
     // A class's static property (8.9) starts like a module variable.
@@ -7911,6 +7958,138 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             auto [it, fresh] = pathDelays.emplace(sg, dl);
             if (!fresh && it->second != dl) Lowerer::unsupported("paths with different delays to one output");
         }
+    }
+    // A timing check (31): its events, limits in ticks and notifier, for
+    // the kernel's check process (tchk.inc).
+    void handle(const slang::ast::SystemTimingCheckSymbol& sc) {
+        using namespace slang::ast;
+        using K = SystemTimingCheckKind;
+        Lowerer::lastLoc() = sc.location;
+        Lowerer lw(sigmap);
+        prep(lw);
+        lw.setScope(sc.getParentScope());
+        TimingCheck t;
+        static const std::pair<K, int> kinds[] = {
+            {K::Setup, TC_SETUP}, {K::Hold, TC_HOLD}, {K::SetupHold, TC_SETUPHOLD},
+            {K::Recovery, TC_RECOVERY}, {K::Removal, TC_REMOVAL}, {K::RecRem, TC_RECREM},
+            {K::Skew, TC_SKEW}, {K::TimeSkew, TC_TIMESKEW}, {K::FullSkew, TC_FULLSKEW},
+            {K::Period, TC_PERIOD}, {K::Width, TC_WIDTH}, {K::NoChange, TC_NOCHANGE}};
+        bool known = false;
+        for (auto [k, v] : kinds) if (k == sc.timingCheckKind) { t.kind = v; known = true; }
+        if (!known) Lowerer::unsupported("this timing check");
+        const auto* syn = sc.getSyntax() ? &sc.getSyntax()->as<slang::syntax::SystemTimingCheckSyntax>() : nullptr;
+        if (!syn) Lowerer::unsupported("a timing check with no syntax");
+        t.name = std::string(syn->name.valueText());
+        auto args = sc.getArguments();
+        auto text = [&](size_t k) {
+            if (k >= syn->args.size()) return std::string();
+            std::string x = syn->args[k]->toString();
+            size_t a = x.find_first_not_of(" \t\r\n"), b = x.find_last_not_of(" \t\r\n");
+            return a == std::string::npos ? std::string() : x.substr(a, b - a + 1);
+        };
+        t.nev = (t.kind == TC_PERIOD || t.kind == TC_WIDTH) ? 1 : 2;
+        if (t.kind == TC_SETUP) { t.data = 0; t.ref = 1; }
+        if (t.nev == 1) t.data = 0;
+        for (int k = 0; k < t.nev; k++) {
+            const auto& a = args[(size_t)k];
+            TcEvent& ev = t.ev[k];
+            if (!a.expr) Lowerer::unsupported("a timing check with an empty event");
+            ev.e = lw.expr(*a.expr);
+            ev.text = text((size_t)k);
+            if (a.condition) {
+                ev.cond = lw.expr(*a.condition);
+                const Expression& c = Lowerer::peel(*a.condition);
+                if (c.kind == ExpressionKind::BinaryOp) {
+                    auto op = c.as<BinaryExpression>().op;
+                    ev.nondet = op == BinaryOperator::Equality || op == BinaryOperator::Inequality;
+                }
+            }
+            if (!a.edgeDescriptors.empty()) {
+                auto lv = [](char c) { return c == '0' ? 0 : c == '1' ? 1 : 2; };
+                static const uint8_t bit[3][3] = {{0, TE_01, TE_0X}, {TE_10, 0, TE_1X}, {TE_X0, TE_X1, 0}};
+                for (auto d : a.edgeDescriptors) ev.edges |= bit[lv(d[0])][lv(d[1])];
+            } else if (a.edge == EdgeKind::PosEdge) ev.edges = TE_POS;
+            else if (a.edge == EdgeKind::NegEdge) ev.edges = TE_NEG;
+            else if (a.edge == EdgeKind::BothEdges) ev.edges = TE_ALL;
+            std::vector<int> sigs;
+            collectRefs(ev.e, sigs);
+            if (sigs.size() == 1) ev.sig = sigs[0];
+            for (int sg : sigs) {
+                bool have = false;
+                for (auto& w : t.watch) have |= w.first == sg;
+                if (!have) t.watch.push_back({sg, ANY});
+            }
+        }
+        if ((t.kind == TC_PERIOD || t.kind == TC_WIDTH || t.kind == TC_NOCHANGE) && !t.ev[0].edges)
+            Lowerer::unsupported("a $period, $width or $nochange reference event without an edge");
+        // The limits: constants in the module's time unit.
+        auto ticks = [&](size_t k) -> int64_t {
+            if (k >= args.size() || !args[k].expr) return 0;
+            ASTContext ctx(*sc.getParentScope(), LookupLocation::max);
+            slang::ConstantValue cv = ctx.tryEval(*args[k].expr);
+            double u;
+            if (cv.isInteger() && !cv.integer().hasUnknown()) u = (double)*cv.integer().as<int64_t>();
+            else if (cv.isReal()) u = cv.real();
+            else Lowerer::unsupported("a timing check limit that is not constant");
+            return (int64_t)std::llround(u * (double)lw.ticksPerUnit());
+        };
+        auto flag = [&](size_t k) {
+            if (k >= args.size() || !args[k].expr) return false;
+            ASTContext ctx(*sc.getParentScope(), LookupLocation::max);
+            slang::ConstantValue cv = ctx.tryEval(*args[k].expr);
+            return cv.isTrue();
+        };
+        size_t first = (size_t)t.nev, nlim = 1, nIdx;
+        if (t.kind == TC_SETUPHOLD || t.kind == TC_RECREM || t.kind == TC_FULLSKEW || t.kind == TC_NOCHANGE ||
+            t.kind == TC_WIDTH)
+            nlim = 2;
+        t.lim1 = ticks(first);
+        if (nlim == 2) {
+            if (t.kind == TC_WIDTH) t.thresh = ticks(first + 1);
+            else t.lim2 = ticks(first + 1);
+        }
+        nIdx = first + nlim;
+        for (size_t k = first; k < first + nlim && k < syn->args.size(); k++) {
+            std::string x = text(k);
+            if (x.empty()) continue;
+            if (!t.limText.empty()) t.limText += ", ";
+            t.limText += x;
+        }
+        if (nIdx < args.size() && args[nIdx].expr) {
+            const Expression& n = Lowerer::peel(*args[nIdx].expr);
+            const Symbol* sym = n.getSymbolReference();
+            auto it = sym ? sigmap.find(sym) : sigmap.end();
+            if (it == sigmap.end()) Lowerer::unsupported("this timing check notifier");
+            t.notifier = it->second;
+        }
+        if (t.kind == TC_TIMESKEW || t.kind == TC_FULLSKEW) {
+            t.eventBased = flag(nIdx + 1);
+            t.remainActive = flag(nIdx + 2);
+        }
+        if (t.kind == TC_SETUPHOLD || t.kind == TC_RECREM) {
+            // 31.9: timestamp and timecheck conditions, delayed reference and data.
+            if (nIdx + 1 < args.size() && args[nIdx + 1].expr) t.tsCond = lw.expr(*args[nIdx + 1].expr);
+            if (nIdx + 2 < args.size() && args[nIdx + 2].expr) t.tcCond = lw.expr(*args[nIdx + 2].expr);
+            for (int k = 0; k < 2; k++) {
+                size_t ix = nIdx + 3 + (size_t)k;
+                if (ix >= args.size() || !args[ix].expr) continue;
+                const Expression* dx = args[ix].expr;   // bound as an output: an assignment to it
+                if (dx->kind == ExpressionKind::Assignment) dx = &dx->as<AssignmentExpression>().left();
+                const Expression& x = Lowerer::peel(*dx);
+                const Symbol* sym = x.getSymbolReference();
+                if (x.kind != ExpressionKind::NamedValue || !sym || !sigmap.count(sym))
+                    Lowerer::unsupported("a delayed signal that is not a whole net or variable");
+                t.ev[k].delayed = sigmap.at(sym);
+            }
+        }
+        t.inst = Lowerer::instPath(sc.getParentScope());
+        if (const auto* sm = srcMgr()) {
+            auto ol = sm->getFullyOriginalLoc(sc.location);
+            t.file = std::string(sm->getFileName(ol));
+            t.line = (int)sm->getLineNumber(ol);
+        }
+        t.unit = lw.ticksPerUnit();
+        timingChecks().push_back(std::move(t));
     }
     void finishPaths() {
         for (auto& [sg, dl] : pathDelays) {
@@ -8075,6 +8254,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         std::string_view name = g.primitiveType.name;
         auto ports = g.getPortConnections();
         auto [ds0, ds1] = g.getDriveStrength();
+        if (g.primitiveType.primitiveKind == PrimitiveSymbol::UserDefined) {
+            lowerUdp(g, ports, ds0 ? strengthOf(*ds0) : STR_STRONG, ds1 ? strengthOf(*ds1) : STR_STRONG);
+            return;
+        }
         uint8_t fb0 = STR_STRONG, fb1 = STR_STRONG;
         bool pull = name == "pullup" || name == "pulldown";
         if (name == "pullup") { fb0 = STR_HIZ; fb1 = STR_PULL; }
@@ -8085,8 +8268,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         bool ninput = name == "and" || name == "nand" || name == "or" || name == "nor" ||
                       name == "xor" || name == "xnor";
         bool noutput = name == "buf" || name == "not";
-        if (!pull && !ninput && !noutput)
+        bool tri = name == "bufif0" || name == "bufif1" || name == "notif0" || name == "notif1";
+        bool mos = name == "nmos" || name == "pmos" || name == "rnmos" || name == "rpmos";
+        bool cmos = name == "cmos" || name == "rcmos";
+        if (name.find("tran") != std::string_view::npos) { lowerTran(name, ports); return; }
+        if (!pull && !ninput && !noutput && !tri && !mos && !cmos)
             throw std::runtime_error("lower: unsupported gate " + std::string(name));
+        if (tri || mos || cmos) { lowerSwitchGate(name, ports, s0, s1); return; }
 
         if (pull) {
             if (ports.size() != 1 || !ports[0]) Lowerer::unsupported("pull gate port");
@@ -8121,6 +8309,164 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         if (name == "nand" || name == "nor" || name == "xnor") acc = un(Op::Not, acc);
         driveOut(*ports[0], acc, s0, s1);
+    }
+
+    // Three-state gates and MOS switches (28.5, 28.7): out = data (inverted
+    // for notif) while the control enables it and Z while it disables it. An
+    // X or Z control gives L or H (28.12.1): the value might be the data or
+    // Z. Each gate is two drivers, one with only its 0 strength and one with
+    // only its 1 strength, so an X on the first is L and on the second is H,
+    // and the net resolves them by strength like any other driver. A MOS
+    // switch passes Z. cmos is an nmos and a pmos on one output. The r forms
+    // are resistive (28.13.1): minisim drives them at pull, the strength a
+    // strong data gets through them.
+    template <class Ports>
+    void lowerSwitchGate(std::string_view name, const Ports& ports, uint8_t s0, uint8_t s1) {
+        size_t need = name.ends_with("cmos") ? 4 : 3;
+        if (ports.size() != need) Lowerer::unsupported("gate ports");
+        for (auto* p : ports) if (!p) Lowerer::unsupported("gate ports");
+        Lowerer lw(sigmap);
+        prep(lw);
+        int w = (int)ports[0]->type->getBitWidth();
+        if (w != 1) Lowerer::unsupported("a three-state gate or switch wider than one bit");
+        bool resist = name[0] == 'r';
+        if (resist) {
+            s0 = std::min<uint8_t>(s0, STR_PULL);
+            s1 = std::min<uint8_t>(s1, STR_PULL);
+        }
+        auto bit = [&](const slang::ast::Expression& x) { return resize(lw.expr(x), 1, false, false); };
+        auto is = [](E v, Val k) { return node(Op::CaseEq, {v, konst(k)}); };
+        auto mux = [](E c, E a, E b) { return node(Op::Mux, {c, a, b}); };
+        E d = bit(*ports[1]);
+        E Z = konst(allz(1)), X = konst(allx(1));
+        auto drive = [&](E ctl, bool activeHigh, bool invert, bool passZ) {
+            E val = invert ? un(Op::Not, d) : passZ ? d : un(Op::Not, un(Op::Not, d));
+            E on = is(ctl, make(activeHigh ? 1 : 0, 0, 1)), off = is(ctl, make(activeHigh ? 0 : 1, 0, 1));
+            for (int part = 0; part < 2; part++) {   // 0: the 0-strength driver, 1: the 1-strength driver
+                // With an unknown control this driver may drive unless the value is the other level or Z.
+                E unk = mux(is(val, make(part ? 0 : 1, 0, 1)), Z, mux(is(val, allz(1)), Z, X));
+                driveOut(*ports[0], mux(on, val, mux(off, Z, unk)), part ? STR_HIZ : s0, part ? s1 : STR_HIZ);
+            }
+        };
+        if (name.starts_with("bufif") || name.starts_with("notif")) {
+            drive(bit(*ports[2]), name.back() == '1', name[0] == 'n', false);
+            return;
+        }
+        std::string_view base = resist ? name.substr(1) : name;
+        if (base == "nmos" || base == "pmos") {
+            drive(bit(*ports[2]), base == "nmos", false, true);
+            return;
+        }
+        drive(bit(*ports[2]), true, false, true);    // cmos: the n control
+        drive(bit(*ports[3]), false, false, true);   // and the p control
+    }
+
+    // A user-defined primitive instance (29). One process evaluates the table
+    // whenever an input changes and keeps the UDP's state in a signal of its
+    // own; a driver (with the instance's strength and delay) copies the state
+    // to the output net.
+    template <class Ports>
+    void lowerUdp(const slang::ast::PrimitiveInstanceSymbol& g, const Ports& ports, uint8_t s0, uint8_t s1) {
+        using namespace slang::ast;
+        const PrimitiveSymbol& p = g.primitiveType;
+        auto tab = std::make_unique<UdpTable>();
+        tab->nin = (int)p.ports.size() - 1;
+        tab->seq = p.isSequential;
+        for (const auto& e : p.table) {
+            UdpRow r;
+            r.state = e.state;
+            r.out = e.output;
+            for (size_t k = 0; k < e.inputs.size(); k++) {
+                char c = e.inputs[k];
+                if (c == '(') {
+                    if (k + 3 >= e.inputs.size()) Lowerer::unsupported("UDP table edge");
+                    r.in.push_back(std::string(e.inputs.substr(k, 4)));
+                    k += 3;
+                } else r.in.push_back(std::string(1, c));
+                const std::string& f = r.in.back();
+                if (f[0] == '(' || f == "r" || f == "f" || f == "p" || f == "n" || f == "*") {
+                    r.edge = (int)r.in.size() - 1;
+                    tab->edges = true;
+                }
+            }
+            if ((int)r.in.size() != tab->nin) Lowerer::unsupported("UDP table row");
+            tab->rows.push_back(std::move(r));
+        }
+        if (ports.size() != p.ports.size()) Lowerer::unsupported("UDP instance ports");
+        for (auto* x : ports) if (!x) Lowerer::unsupported("UDP instance ports");
+        Lowerer lw(sigmap);
+        prep(lw);
+        int state = lw.fresh(1), last = lw.fresh(2 * tab->nin);
+        Instr init; init.k = IK::Assign; init.sig = state;
+        int iv = 2;   // x unless the UDP has an initial statement (29.7)
+        if (p.initVal && p.initVal->isInteger()) {
+            const auto& ci = p.initVal->integer();
+            iv = ci.hasUnknown() ? 2 : (int)(ci.as<uint64_t>().value_or(0) & 1);
+        }
+        init.e = konst(iv == 2 ? allx(1) : make((uint64_t)iv, 0, 1));
+        lw.prog.emit(init);
+        Instr li; li.k = IK::Assign; li.sig = last; li.e = konst(allx(2 * tab->nin));   // inputs start at x
+        lw.prog.emit(li);
+        size_t top = lw.prog.here();
+        Instr u; u.k = IK::Udp; u.udp = tab.get(); u.sig = state; u.dres = last;
+        for (int k = 0; k < tab->nin; k++) u.args.push_back(resize(lw.expr(*ports[(size_t)k + 1]), 1, false, false));
+        lw.prog.emit(u);
+        auto rs = readSet(lw.prog);
+        rs.erase(std::remove_if(rs.begin(), rs.end(), [&](const std::pair<int, Edge>& r) { return r.first == state || r.first == last; }), rs.end());
+        bool loops = !rs.empty();
+        if (loops) {
+            lw.prog.emit(waitInstr(rs));
+            Instr j; j.k = IK::Jmp; j.target = top; lw.prog.emit(j);
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "udp"});
+        out.udps.push_back(std::move(tab));
+        driveOut(*ports[0], ref(state), s0, s1);
+    }
+
+    // tran, rtran, tranif0/1, rtranif0/1 (28.8): the two terminals become one
+    // switch the kernel resolves with the drivers of both nets. A process
+    // feeds it the control's value whenever the control changes.
+    template <class Ports>
+    void lowerTran(std::string_view name, const Ports& ports) {
+        using namespace slang::ast;
+        bool ctl = name.find("tranif") != std::string_view::npos;
+        if (ports.size() != (ctl ? 3u : 2u)) Lowerer::unsupported("tran ports");
+        int t[2];
+        for (int k = 0; k < 2; k++) {
+            if (!ports[k]) Lowerer::unsupported("tran ports");
+            const Expression* x = ports[k];
+            if (x->kind == ExpressionKind::Assignment) x = &x->as<AssignmentExpression>().left();
+            x = &Lowerer::peel(*x);
+            const Symbol* sym = ValueExpressionBase::isKind(x->kind) ? &x->as<ValueExpressionBase>().symbol : nullptr;
+            auto it = sym ? sigmap.find(sym) : sigmap.end();
+            if (!sym || sym->kind != SymbolKind::Net || it == sigmap.end())
+                Lowerer::unsupported("a tran terminal that is not a whole net");
+            t[k] = it->second;
+        }
+        if (ports[0]->type->getBitWidth() != ports[1]->type->getBitWidth()) Lowerer::unsupported("tran terminals of different widths");
+        int id = (int)out.trans.size();
+        out.trans.push_back({t[0], t[1], name[0] == 'r'});
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i;
+        i.k = IK::Tran;
+        i.sig = id;
+        if (ctl) {
+            if (!ports[2]) Lowerer::unsupported("tran ports");
+            i.e = resize(lw.expr(*ports[2]), 1, false, false);
+            i.pdown = name.back() == '0';
+        }
+        lw.prog.emit(i);
+        bool loops = false;
+        if (ctl) {
+            auto rs = readSet(lw.prog);
+            if (!rs.empty()) {
+                lw.prog.emit(waitInstr(rs));
+                Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+                loops = true;
+            }
+        }
+        out.procs.push_back({std::move(lw.prog), loops, "tran"});
     }
 
     // The child's formal signal. A null port (no internal connection) is skipped.
@@ -8312,10 +8658,91 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
     }
 
+    // A checker instance (17.3): its body is lowered like an instance's,
+    // with its processes in the reactive region set (17.7.3). Each output
+    // formal is continuously assigned to its actual in the reactive region.
+    int checkerDepth = 0;
+    std::unordered_set<const slang::ast::Symbol*> freeAssigned;
+    bool checkerAssumes = false;
+    // A free checker variable (17.7): random from the start, unless it has
+    // an initializer; an active one gets a new random value every time step.
+    void freeVar(const slang::ast::VariableSymbol& v) {
+        using namespace slang::ast;
+        int w = storeW(v.getType());
+        if (w > 64 || !v.getType().isIntegral()) Lowerer::unsupported("a free checker variable wider than 64 bits or not integral");
+        bool isConst = v.flags.has(VariableFlags::Const);
+        bool active = !isConst && !freeAssigned.count(&v);
+        if (active && checkerAssumes)
+            Lowerer::unsupported("free checker variables constrained by assume statements (17.7.2)");
+        out.freeVars.push_back({sigmap.at(&v), active});
+    }
+    void handle(const slang::ast::CheckerInstanceSymbol& ci) {
+        using namespace slang::ast;
+        if (ci.body.isProcedural) Lowerer::unsupported("a checker instance in procedural code (17.3)");
+        // Which variables the checker assigns, and whether it has assume
+        // statements (17.7.2): an active free variable is one it never assigns.
+        struct Scan : ASTVisitor<Scan, VisitFlags::Statements | VisitFlags::Expressions> {
+            std::unordered_set<const Symbol*> assigned;
+            bool assumes = false;
+            void handle(const AssignmentExpression& a) {
+                const Expression* l = &a.left();
+                for (;;) {
+                    if (l->kind == ExpressionKind::ElementSelect) l = &l->as<ElementSelectExpression>().value();
+                    else if (l->kind == ExpressionKind::RangeSelect) l = &l->as<RangeSelectExpression>().value();
+                    else if (l->kind == ExpressionKind::MemberAccess) l = &l->as<MemberAccessExpression>().value();
+                    else break;
+                }
+                if (const Symbol* sym = l->getSymbolReference()) assigned.insert(sym);
+                visitDefault(a);
+            }
+            void handle(const ConcurrentAssertionStatement& c) {
+                if (c.assertionKind == AssertionKind::Assume) assumes = true;
+                visitDefault(c);
+            }
+        } scan;
+        ci.body.visit(scan);
+        std::swap(freeAssigned, scan.assigned);
+        bool savedAssumes = checkerAssumes;
+        checkerAssumes = scan.assumes;
+        checkerDepth++;
+        visitDefault(ci);
+        checkerDepth--;
+        checkerAssumes = savedAssumes;
+        for (const auto& c : ci.getPortConnections()) {
+            if (c.formal.kind != SymbolKind::FormalArgument) continue;
+            const auto& f = c.formal.as<FormalArgumentSymbol>();
+            if (f.direction != ArgumentDirection::Out) continue;
+            int fs = sigmap.at(&f);
+            int w = storeW(f.getType());
+            if (const Expression* ie = c.getOutputInitialExpr()) {   // output int ctr = 0 (17.2)
+                if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+                Instr i; i.k = IK::Assign; i.sig = fs;
+                i.e = resize(init->expr(*ie), w, f.getType().isSigned(), ie->type->isSigned());
+                init->prog.emit(i);
+            }
+            const auto* ap = std::get_if<const Expression*>(&c.actual);
+            if (!ap || !*ap) continue;
+            const Expression* a = *ap;
+            if (a->kind == ExpressionKind::Assignment) a = &a->as<AssignmentExpression>().left();
+            Lowerer lw(sigmap);
+            prep(lw);
+            lw.setScope(ci.getParentScope());
+            Instr i; i.k = IK::Assign;
+            lw.lhs(*a, i);
+            int tw = storeW(*a->type);
+            i.e = resize(ref(fs, f.getType().isSigned()), tw, f.getType().isSigned(), f.getType().isSigned());
+            finishAssign(lw, i);
+            out.procs.back().reactive = true;
+        }
+    }
+    int program = -1;   // the program instance being visited (24.3), or -1
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
         connectInstance(inst);
+        int saved = program;
+        if (inst.getDefinition().definitionKind == slang::ast::DefinitionKind::Program) program = out.programs++;
         visitDefault(inst);
+        program = saved;
     }
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
@@ -8380,8 +8807,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (const auto* t = leadingEvent(p.getBody())) {
                 try { E iff; lw.clockOf(*t, lw.sampleEv, iff); } catch (const std::runtime_error&) { lw.sampleEv.clear(); }
             }
+        int below = checkerDepth > 0 && p.procedureKind == ProceduralBlockKind::AlwaysFF ? lw.fresh(1) : -1;
         lw.stmt(p.getBody());
         lw.finishImplicit();
+        // 17.5: in a checker's always_ff, every expression but the event
+        // control reads sampled values. Signals made while lowering the body
+        // (temporaries) are read as they are.
+        if (below >= 0) lw.sampleProg(below);
         if (p.procedureKind == ProceduralBlockKind::Initial)
             if (const auto* nb = Lowerer::namedSeq(p.getBody())) lw.prog.roots.push_back(Lowerer::rootId(nb));
         // A final block (9.2.3) runs once, after the last time slot. slang
@@ -8400,7 +8832,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             else lw.prog.emit(waitInstr(rs));
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
-        out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind))});
+        out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind)),
+                             p.procedureKind == ProceduralBlockKind::Initial ? program : -1, checkerDepth > 0});
     }
 };
 
@@ -8682,6 +9115,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     LowerResult out;
     asserts().clear();
     concAsserts().clear();
+    timingChecks().clear();
     sva::store().clear();
     shadowPairs().clear();
     sampleClocks().clear();
