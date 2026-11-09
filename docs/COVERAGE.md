@@ -30,7 +30,8 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 6.24.2 | $cast | 🟡 | integral, real and enum destinations: an enum value that is not a member fails (0, or an error as a task). Class handles come with classes (8). `6.24.2-dollar-cast` |
 | 6.20 | parameter / localparam | ✅ | incl. overrides at instantiation. `6.20-parameters` |
 | 7.2.1, 7.3.1 | Packed structures and unions | ✅ | member read and write, nested members. `7.2.1-packed-struct` |
-| 7.2, 7.3 | Unpacked structures and unions | ✅ | members of any type including real and string, nested structs, arrays of structs, default and named patterns, struct function results, `%p`. Not yet: tagged unions (7.3.2). `7.2-unpacked-struct`, `7.2-unpacked-struct-members`, `7.3-unpacked-union` |
+| 7.2, 7.3 | Unpacked structures and unions | ✅ | members of any type including real and string, nested structs, arrays of structs, default and named patterns, struct function results, `%p`. `7.2-unpacked-struct`, `7.2-unpacked-struct-members`, `7.3-unpacked-union` |
+| 7.3.2, 11.9 | Tagged unions | ✅ | unpacked and packed, `void` members, `tagged M v` expressions, the packed layout of 7.3.2 (tag on top, member right-justified), `.member` reads. Not yet: the run-time check that a member read matches the tag. `7.3.2-tagged-unions` |
 | 7.4.1 | Packed arrays and ranges | ✅ | any declared range ([7:0], [8:1], [0:7]) and multidimensional packed arrays, element and part selects. `7.4.1-packed-ranges`, `7.4.1-packed-nested-write` |
 | 7.4 | Unpacked arrays | 🟡 | fixed-size unpacked arrays of any number of dimensions (up to 2^20 elements), constant or variable index, read and write; out-of-range read gives X (7.4.6); whole-array assignment from `'{...}`, `'{n{...}}`, `'{i: v, default: v}` (also nested, and in a declaration) or another array. Slices `a[1:2]`, whole-array `==` `!=` `===` `!==`, unpacked concatenation as a value. Not yet: arrays as ports or arguments. `7.4-unpacked-arrays`, `7.4-array-sensitivity` |
 | 7.5 | Dynamic arrays | ✅ | `new[n]`, `new[n](old)`, `size()`, `delete()`, element read and write (a read past the end gives the element default), assignment from `'{...}`, another container, or a fixed-size array. `7.5-dynamic-arrays` |
@@ -71,6 +72,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 11.6–11.8 | Expression width and sign rules | ✅ | context-determined widths, signed extension |
 | 12.4 | if / else; 12.4.2 unique / priority if | ✅ | the unique/priority violation itself is not reported |
 | 12.5 | case, casez, casex; 12.5.3 unique case; 12.5.4 case inside | ✅ | `12.5-unique-case`, `12.5.4-case-inside` |
+| 12.6 | Pattern matching | ✅ | `if (x matches p)` with `&&&` guards, `case`/`casez`/`casex (x) matches` with `&&&` filters; tagged, variable (`.v`), wildcard (`.*`), constant and structure (`'{.a, 4}`) patterns. Not yet: `matches` in a `?:` expression, real or string constant patterns. `7.3.2-tagged-unions` |
 | 12.7 | for, while, do-while, repeat, forever | ✅ | |
 | 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue; dynamic arrays and queues by index, associative arrays in key order. `12.7.3-foreach`, `12.7.3-foreach-order`, `12.7.3-foreach-containers` |
 | 12.8 | break, continue, return | ✅ | |

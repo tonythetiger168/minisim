@@ -137,9 +137,46 @@ inline int storeW(const slang::ast::Type& t0) {
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) return uWidth(t);
     return t.isString() || t.isFloating() ? 64 : (int)t.getBitWidth();
 }
+// Tag bits of a tagged union (7.3.2): enough to number its members. The tag
+// is at the top; a member's value is right-justified below it.
+inline int tagBitsOf(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (t.kind == SymbolKind::PackedUnionType) return (int)t.as<PackedUnionType>().tagBits;
+    size_t n = t.as<UnpackedUnionType>().fields.size();
+    int b = 1;
+    while (((size_t)1 << b) < n) b++;
+    return b;
+}
+inline bool isTaggedUnion(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (t.kind == SymbolKind::PackedUnionType) return t.as<PackedUnionType>().isTagged;
+    if (t.kind == SymbolKind::UnpackedUnionType) return t.as<UnpackedUnionType>().isTagged;
+    return false;
+}
+inline int tagIndexOf(const slang::ast::Type& t0, const slang::ast::Symbol& f) {
+    using namespace slang::ast;
+    int k = 0;
+    for (const auto& g : t0.getCanonicalType().as<Scope>().membersOfType<FieldSymbol>()) {
+        if (&g == &f) return k;
+        k++;
+    }
+    return -1;
+}
 inline int uWidth(const slang::ast::Type& t0) {
     using namespace slang::ast;
     const auto& t = t0.getCanonicalType();
+    if (isTaggedUnion(t) && t.isUnpackedUnion()) {
+        int w = 0;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+            if (f.getType().isVoid()) continue;
+            int fw = uWidth(f.getType());
+            if (fw <= 0) return -1;
+            w = std::max(w, fw);
+        }
+        return w + tagBitsOf(t);
+    }
     if (t.isUnpackedStruct() || t.isUnpackedUnion()) {
         int w = 0;
         bool u = t.isUnpackedUnion();
@@ -1558,6 +1595,8 @@ struct Lowerer {
                 if (!lvalue) unsupported("lvalue reference");
                 return expr(*lvalue, ctx);
             }
+            case ExpressionKind::TaggedUnion:
+                return sized(taggedValue(e.as<TaggedUnionExpression>()), storeW(*e.type), false, ctx);
             case ExpressionKind::Streaming: {
                 const auto& sc = e.as<StreamingConcatenationExpression>();
                 int w = 0;
@@ -2852,6 +2891,91 @@ struct Lowerer {
         return concat({v, konst(mk(0, w - sw))});
     }
 
+    // x matches p (12.6): x is held in a temporary, so pattern variables
+    // bound along the way read a stable value.
+    E matchExpr(const slang::ast::Expression& x, const slang::ast::Pattern& p,
+                slang::ast::CaseStatementCondition cc) {
+        int w = storeW(*x.type);
+        needWidth(w);
+        int v = fresh(w);
+        Instr h; h.k = IK::Assign; h.sig = v; h.e = storageOf(*x.type, x); prog.emit(h);
+        return matchP(p, ref(v), *x.type, w, cc);
+    }
+    // Whether v (w bits, the storage of a value of type t) matches p. A
+    // pattern variable is bound here, whether or not the match succeeds.
+    E matchP(const slang::ast::Pattern& p, E v, const slang::ast::Type& t0, int w,
+             slang::ast::CaseStatementCondition cc) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        Op eqOp = cc == CaseStatementCondition::Normal ? Op::CaseEq
+                  : cc == CaseStatementCondition::WildcardJustZ ? Op::CaseZEq : Op::CaseXEq;
+        switch (p.kind) {
+            case PatternKind::Wildcard: return konst(mk(1, 1));
+            case PatternKind::Variable: {
+                const auto& var = p.as<VariablePattern>().variable;
+                int sig = fresh(w);
+                sigmap[&var] = sig;
+                Instr a; a.k = IK::Assign; a.sig = sig; a.e = v; prog.emit(a);
+                return konst(mk(1, 1));
+            }
+            case PatternKind::Constant: {
+                const Expression& ce = p.as<ConstantPattern>().expr;
+                if (t.isFloating() || t.isString()) unsupported("constant pattern of a real or string");
+                return bin(eqOp, v, resize(storageOf(t, ce), w, ce.type->isSigned(), false));
+            }
+            case PatternKind::Tagged: {
+                const auto& tp = p.as<TaggedPattern>();
+                if (!isTaggedUnion(t)) unsupported("tagged pattern");
+                int tb = tagBitsOf(t);
+                int idx = tagIndexOf(t, tp.member);
+                E cond = tb > 0 ? bin(Op::CaseEq, slice(v, w - 1, w - tb), konst(mk((uint64_t)idx, tb)))
+                                : konst(mk(1, 1));
+                if (tp.valuePattern) {
+                    const Type& mt = tp.member.getType();
+                    int fw = t.isUnpackedUnion() ? uWidth(mt) : (int)mt.getBitWidth();
+                    if (fw > 0) cond = bin(Op::LogAnd, cond, matchP(*tp.valuePattern, slice(v, fw - 1, 0), mt, fw, cc));
+                }
+                return cond;
+            }
+            case PatternKind::Structure: {
+                const auto& sp = p.as<StructurePattern>();
+                E cond = konst(mk(1, 1));
+                for (auto& fp : sp.patterns) {
+                    const Type& ft = fp.field->getType();
+                    int off, fw;
+                    if (t.isUnpackedStruct()) std::tie(off, fw) = uField(t, *fp.field);
+                    else { off = (int)fp.field->bitOffset; fw = (int)ft.getBitWidth(); }
+                    if (fw <= 0) unsupported("structure pattern member");
+                    cond = bin(Op::LogAnd, cond, matchP(*fp.pattern, slice(v, off + fw - 1, off), ft, fw, cc));
+                }
+                return cond;
+            }
+            default: unsupported("pattern");
+        }
+    }
+    // tagged M v (11.9): the tag on top, the member value right-justified.
+    E taggedValue(const slang::ast::TaggedUnionExpression& te) {
+        using namespace slang::ast;
+        const Type& t = te.type->getCanonicalType();
+        int w = t.isUnpackedUnion() ? uWidth(t) : (int)t.getBitWidth();
+        needWidth(w);
+        int tb = tagBitsOf(t);
+        int idx = tagIndexOf(t, te.member);
+        const Type& mt = te.member.as<FieldSymbol>().getType();
+        int fw = 0;
+        E val;
+        if (te.valueExpr && !mt.isVoid()) {
+            fw = t.isUnpackedUnion() ? uWidth(mt) : (int)mt.getBitWidth();
+            val = t.isUnpackedUnion() ? storageOf(mt, *te.valueExpr)
+                                      : resize(expr(*te.valueExpr), fw, te.valueExpr->type->isSigned(), false);
+        }
+        std::vector<E> parts;
+        if (tb > 0) parts.push_back(konst(mk((uint64_t)idx, tb)));
+        if (w - tb - fw > 0) parts.push_back(konst(mk(0, w - tb - fw)));
+        if (val) parts.push_back(val);
+        return parts.size() == 1 ? parts[0] : concat(std::move(parts));
+    }
+
     // The parts of a concatenation assignment target, first (most
     // significant) first, with their offsets in the whole (11.4.12, 10.4).
     static void concatParts(const slang::ast::Expression& e, int hi,
@@ -3192,20 +3316,50 @@ struct Lowerer {
                 break;
             }
             case StatementKind::Conditional: {
+                // if (a &&& b matches p &&& c) (12.6.2): each condition in
+                // turn; a pattern binds its variables for the ones after it.
                 const auto& c = s.as<ConditionalStatement>();
-                if (c.conditions.size() != 1) unsupported("pattern if");
-                Instr j; j.k = IK::JmpIfNot; j.e = expr(*c.conditions[0].expr);
-                size_t jf = prog.emit(j);
+                std::vector<size_t> jfs;
+                for (auto& cd : c.conditions) {
+                    Instr j; j.k = IK::JmpIfNot;
+                    j.e = cd.pattern ? matchExpr(*cd.expr, *cd.pattern, CaseStatementCondition::Normal)
+                                     : expr(*cd.expr);
+                    jfs.push_back(prog.emit(j));
+                }
                 stmt(c.ifTrue);
                 if (c.ifFalse) {
                     Instr skip; skip.k = IK::Jmp;
                     size_t js = prog.emit(skip);
-                    prog.code[jf].target = prog.here();
+                    for (size_t jf : jfs) prog.code[jf].target = prog.here();
                     stmt(*c.ifFalse);
                     prog.code[js].target = prog.here();
                 } else {
-                    prog.code[jf].target = prog.here();
+                    for (size_t jf : jfs) prog.code[jf].target = prog.here();
                 }
+                break;
+            }
+            case StatementKind::PatternCase: {   // case (x) matches (12.6.1)
+                const auto& c = s.as<PatternCaseStatement>();
+                int w = storeW(*c.expr.type);
+                needWidth(w);
+                int v = fresh(w);
+                Instr h; h.k = IK::Assign; h.sig = v; h.e = storageOf(*c.expr.type, c.expr); prog.emit(h);
+                std::vector<size_t> toEnd;
+                for (auto& it : c.items) {
+                    std::vector<size_t> next;
+                    Instr j; j.k = IK::JmpIfNot; j.e = matchP(*it.pattern, ref(v), *c.expr.type, w, c.condition);
+                    next.push_back(prog.emit(j));
+                    if (it.filter) {
+                        Instr g; g.k = IK::JmpIfNot; g.e = expr(*it.filter);
+                        next.push_back(prog.emit(g));
+                    }
+                    stmt(*it.stmt);
+                    Instr skip; skip.k = IK::Jmp;
+                    toEnd.push_back(prog.emit(skip));
+                    for (size_t x : next) prog.code[x].target = prog.here();
+                }
+                if (c.defaultCase) stmt(*c.defaultCase);
+                for (size_t x : toEnd) prog.code[x].target = prog.here();
                 break;
             }
             case StatementKind::ExpressionStatement:
