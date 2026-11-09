@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
+  `always_ff` on sampled values, checker variables and free variables, all
+  in the reactive region set. Before this, checker instances were ignored.
+- Programs (24): program code runs in the reactive region set, programs end
+  with an implicit `$finish`, `$exit`, nested and anonymous programs.
 - Gate-level switches (28): `bufif0/1`, `notif0/1` with L/H strength
   resolution, `nmos`/`pmos`/`cmos` and their resistive forms, and the
   bidirectional `tran`/`rtran`/`tranif0/1`/`rtranif0/1`.

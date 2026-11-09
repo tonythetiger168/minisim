@@ -219,7 +219,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
         std::vector<size_t> procOf;
         for (size_t i = 0; i < n; i++) {
             CombShape c;
-            if (combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
+            if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
         std::vector<size_t> order = combSchedule(shapes, &lv);
@@ -234,7 +234,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     }
     if (staticSeq)
         for (size_t i = 0; i < n; i++)
-            if (p.rank[i] < 0 && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
+            if (p.rank[i] < 0 && lowered.procs[i].program < 0 && !lowered.procs[i].reactive && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
     return p;
 }
 
@@ -783,6 +783,12 @@ int main(int argc, char** argv) {
         threads = 1;
     }
     Plan pl = plan(lowered, staticComb, staticSeq);
+    bool anyReactive = false;
+    for (auto& lp : lowered.procs) anyReactive |= lp.reactive;
+    if (compiled && (lowered.programs || anyReactive)) {
+        std::cerr << "msim: -compile: programs and checkers are not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
     if (compiled) {
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle,
                              seed, covPath);
@@ -846,10 +852,14 @@ int main(int argc, char** argv) {
             continue;
         }
         if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
+        else if (lowered.procs[i].program >= 0 || lowered.procs[i].reactive)
+            S.spawn(programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial"));
         else S.spawn(process(&lowered.procs[i].prog));
     }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
+    S.freeVars = lowered.freeVars;   // free checker variables start random (17.7.2)
+    for (auto [s, every] : S.freeVars) S.sigs[s].val = S.freeValue(s);
     S.shadows = shadowPairs();
     S.sclocks = sampleClocks();
     for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));

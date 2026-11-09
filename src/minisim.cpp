@@ -325,6 +325,20 @@ struct Sim {
     // the signal's value from the preponed region of this time slot. At time
     // 0 it keeps the default sampled value (the declaration's initial value).
     vector<pair<int, int>> shadows;
+    // Free checker variables (17.7.2): signal, and whether it takes a new
+    // random value in every time step (an active one).
+    vector<pair<int, bool>> freeVars;
+    Val freeValue(int s) {
+        int w = sigs[s].w;
+        uint64_t r = urandomNext(urandomState());
+        if (w > 32) r |= (uint64_t)urandomNext(urandomState()) << 32;
+        return make(w >= 64 ? r : (r & ((1ull << w) - 1)), 0, w, 0);
+    }
+    uint64_t freeAt = 0;   // the time step freeStep last ran in
+    void freeStep() {
+        for (auto [s, every] : freeVars)
+            if (every) set(s, freeValue(s));
+    }
     // Clocks of $past / $rose / ... (sva.hpp SampleClock); ticked: the ones
     // that ticked in this slot, shifted at the end of the slot.
     vector<SampleClock> sclocks;
@@ -2047,6 +2061,7 @@ struct Sim {
             if (!any) continue;   // only disabled processes were waiting here
             now = t;
             g_simTime = now;
+            if (!freeVars.empty() && now && now != freeAt) { freeStep(); freeAt = now; }   // active free checker variables (17.7.2)
             if (vpiRegion) vpiRegion(VR_START);   // cbNextSimTime, cbAtStartOfSimTime, cbAfterDelay
             if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
                 for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
@@ -2125,6 +2140,13 @@ struct Delay {
         }
         else S.wheel[S.now + n].push_back(h);
     }
+    void await_resume() const {}
+};
+// A program process (24.3.1) woken in the active region set moves to the
+// reactive region, and runs there once the design is quiet.
+struct ToReactive {
+    bool await_ready() const { return false; }
+    void await_suspend(Handle h) const { S.reactive.push_back(h); S.rare = true; }
     void await_resume() const {}
 };
 struct Wait {
