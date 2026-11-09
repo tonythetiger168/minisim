@@ -1572,11 +1572,14 @@ static void initFrameSigs(const FrameLayout& L, int base) {
     }
     for (auto& [off, o] : L.dyn) dynStore()[base + off] = o;
 }
-static void nullAccess() {
+[[noreturn]] static void nullAccess() {
     cerr << "error: null object access at time " << S.now << "\n";
     exit(1);
 }
-static const bool frameHooks = (g_allocSigs = allocFrameSigs, g_initSigs = initFrameSigs, g_nullAccess = nullAccess, true);
+static Val getSig(int s) { return S.get(s); }
+static bool isA(int obj, int cls);
+static const bool frameHooks = (g_allocSigs = allocFrameSigs, g_initSigs = initFrameSigs, g_nullAccess = nullAccess,
+                                g_getSig = getSig, g_isA = isA, true);
 
 // ---- awaiters ----
 struct Delay {
@@ -1618,6 +1621,8 @@ struct WaitAny {
 };
 
 #include "exec.inc"
+#include "rand.inc"
+static bool isA(int obj, int cls) { return classIsA((int)S.sigs[obj].val.v, cls); }
 
 // ---- the design + testbench ----
 int clk, rst, cnt;

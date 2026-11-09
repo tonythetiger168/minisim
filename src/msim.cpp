@@ -431,6 +431,10 @@ int main(int argc, char** argv) {
         fwd.push_back(a);
     }
     plusArgs() = plusargs;
+    // The language is IEEE 1800-2023 unless --std says otherwise (slang's
+    // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (std::none_of(fwd.begin(), fwd.end(), [](const std::string& s) { return startsWith(s, "--std"); }))
+        fwd.push_back("--std=1800-2023");
     if (seed) {   // the $urandom stream (18.13); $random keeps its own seed (Annex N)
         uint64_t st = (seed + 1) * 0x9E3779B97F4A7C15ull;
         urandomState() = st ? st : 1;
@@ -483,8 +487,9 @@ int main(int argc, char** argv) {
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
     if (usesForce()) staticPart = false;   // a forced signal must see every write (10.6)
     if (lowered.procs.empty()) {
-        std::cerr << "msim: design has no processes to run\n";
-        return 1;
+        // Nothing to schedule: the simulation ends at time 0 (4.4.1).
+        std::cerr << "msim: note: design has no processes; simulation ends at time 0\n";
+        return 0;
     }
 
     Plan pl = plan(lowered, staticComb, staticSeq);
