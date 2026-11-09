@@ -546,8 +546,17 @@ struct Lowerer {
         return mkSig("_tf" + std::to_string(n), w, false);
     }
 
+    // The statement or construct being lowered, so an error can say where.
+    static slang::SourceLocation& lastLoc() { static slang::SourceLocation l; return l; }
+    static std::string whereStr() {
+        const auto* sm = srcMgr();
+        slang::SourceLocation l = lastLoc();
+        if (!sm || !l.valid()) return "";
+        auto ol = sm->getFullyOriginalLoc(l);
+        return std::string(sm->getFileName(ol)) + ":" + std::to_string(sm->getLineNumber(ol)) + ": ";
+    }
     [[noreturn]] static void unsupported(const char* what) {
-        throw std::runtime_error(std::string("lower: unsupported ") + what);
+        throw std::runtime_error(whereStr() + "lower: unsupported " + what);
     }
 
     size_t emitJmp() {
@@ -3464,8 +3473,10 @@ struct Lowerer {
         // instructions keep the line of the statement around them.
         SrcLoc savedLoc = g_emitLoc;
         struct RestoreLoc { SrcLoc& l; SrcLoc v; ~RestoreLoc() { g_emitLoc = v; } } restoreLoc{g_emitLoc, savedLoc};
-        if (s.kind != slang::ast::StatementKind::List && s.kind != slang::ast::StatementKind::Block)
+        if (s.kind != slang::ast::StatementKind::List && s.kind != slang::ast::StatementKind::Block) {
             covLoc(s.sourceRange.start());
+            lastLoc() = s.sourceRange.start();
+        }
         using namespace slang::ast;
         switch (s.kind) {
             case StatementKind::Empty: break;
@@ -4430,9 +4441,35 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         using namespace slang::ast;
         const auto& a = ca.getAssignment().as<AssignmentExpression>();
         Lowerer::covLoc(ca.location);
+        Lowerer::lastLoc() = ca.location;
         Lowerer lw(sigmap);
         prep(lw);
         auto [ds0, ds1] = ca.getDriveStrength();
+        if (a.left().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            // assign arr = other_arr / '{...}: one assign per element (10.3, 7.6)
+            const Expression& l = Lowerer::peel(a.left());
+            if (l.kind != ExpressionKind::NamedValue && l.kind != ExpressionKind::HierarchicalValue)
+                Lowerer::unsupported("continuous assign to part of an unpacked array");
+            auto it = arrMap().find(&l.as<ValueExpressionBase>().symbol);
+            if (it == arrMap().end()) Lowerer::unsupported("continuous assign to this array");
+            std::vector<E> els;
+            lw.arrayElems(*a.left().type, a.right(), els);
+            if ((int)els.size() != it->second->count || !lw.prog.code.empty())
+                Lowerer::unsupported("continuous assign of an unpacked array from this value");
+            for (int k = 0; k < it->second->count; k++) {
+                Lowerer L(sigmap);
+                prep(L);
+                Instr i; i.k = IK::Assign;
+                applyStrength(i, ds0, ds1, STR_STRONG, STR_STRONG);
+                i.sig = it->second->base + k;
+                i.e = els[(size_t)k];
+                L.setScope(ca.getParentScope());
+                i.dly = L.delays3(ca.getDelay());
+                finishAssign(L, i);
+            }
+            g_emitLoc = {};
+            return;
+        }
         if (Lowerer::peel(a.left()).kind == ExpressionKind::Concatenation) {
             // assign {c, s} = x + y: one driver per part, each driving its
             // slice of the right-hand side.
@@ -4551,6 +4588,45 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         return Formal{it->second, w, ps.getType().isSigned()};
     }
 
+    // An unpacked array port (23.3.3.4 via 7.6): element by element, each
+    // a continuous assignment, leftmost element to leftmost element.
+    void connectArrayPort(const slang::ast::PortSymbol& ps, const slang::ast::Expression& ext) {
+        using namespace slang::ast;
+        const Symbol* sym = ps.internalSymbol;
+        if (!sym) Lowerer::unsupported("array port with an internal expression");
+        auto fit = arrMap().find(sym);
+        if (fit == arrMap().end()) throw std::runtime_error("lower: array port '" + std::string(ps.name) + "' is not an array");
+        const ArrShape& f = *fit->second;
+        if (ps.direction == ArgumentDirection::In) {
+            Lowerer lw(sigmap);
+            prep(lw);
+            std::vector<E> els;
+            lw.arrayElems(ps.getType(), ext, els);
+            if ((int)els.size() != f.count) Lowerer::unsupported("array port connection of another size");
+            if (!lw.prog.code.empty()) Lowerer::unsupported("array port connection that needs statements");
+            for (int k = 0; k < f.count; k++) {
+                Lowerer L(sigmap);
+                prep(L);
+                Instr i; i.k = IK::Assign; i.sig = f.base + k; i.e = els[(size_t)k];
+                finishAssign(L, i);
+            }
+            return;
+        }
+        if (ps.direction != ArgumentDirection::Out) Lowerer::unsupported("inout or ref array port");
+        if (ext.kind != ExpressionKind::Assignment) Lowerer::unsupported("output port connection");
+        const Expression& act = Lowerer::peel(ext.as<AssignmentExpression>().left());
+        if (act.kind != ExpressionKind::NamedValue && act.kind != ExpressionKind::HierarchicalValue)
+            Lowerer::unsupported("array output port connected to an expression");
+        auto ait = arrMap().find(&act.as<ValueExpressionBase>().symbol);
+        if (ait == arrMap().end() || ait->second->count != f.count) Lowerer::unsupported("array output port connection");
+        for (int k = 0; k < f.count; k++) {
+            Lowerer L(sigmap);
+            prep(L);
+            Instr i; i.k = IK::Assign; i.sig = ait->second->base + k; i.e = ref(f.base + k, f.sgn);
+            finishAssign(L, i);
+        }
+    }
+
     void driveSig(int sig, const slang::ast::Expression& rhs) {
         Lowerer lw(sigmap);
         prep(lw);
@@ -4582,6 +4658,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             const auto& ps = conn->port.as<PortSymbol>();
             const Expression* ext = conn->getExpression();
             if (!ext || ps.isNullPort) continue;
+            Lowerer::lastLoc() = ext->sourceRange.start().valid() ? ext->sourceRange.start() : inst.location;
+            if (ps.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                connectArrayPort(ps, *ext);
+                continue;
+            }
             auto formal = portFormal(ps);
             if (!formal) continue;
             if (ps.direction == ArgumentDirection::In) {
