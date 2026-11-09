@@ -12,6 +12,56 @@ Spec references are IEEE 1800-2023 clauses.
   `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
   Negative `$setuphold` / `$recrem` limits with delayed signals under
   `+neg_tchk` (31.9).
+- Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
+  `always_ff` on sampled values, checker variables and free variables, all
+  in the reactive region set. Before this, checker instances were ignored.
+- Programs (24): program code runs in the reactive region set, programs end
+  with an implicit `$finish`, `$exit`, nested and anonymous programs.
+- Gate-level switches (28): `bufif0/1`, `notif0/1` with L/H strength
+  resolution, `nmos`/`pmos`/`cmos` and their resistive forms, and the
+  bidirectional `tran`/`rtran`/`tranif0/1`/`rtranif0/1`.
+- User-defined primitives (29): combinational, level- and edge-sensitive.
+- Arrays of instances and of interfaces (23.3.3, 25.3), including
+  multidimensional instance arrays and per-element port slicing.
+- System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),
+  `$system`, the array query functions on every kind of dimension,
+  `$typename`, and the VCD tasks (`$dumpfile`, `$dumpvars` with a level and
+  scope selection, `$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` /
+  `$dumplimit`). A design's `$dumpvars` now writes its dump file without
+  `-vcd`.
+- `$fstrobe`, `$fmonitor` (several at once, cancelled by `$fclose`) and
+  `$fread` (21.3.2, 21.3.4.4).
+- VPI (clauses 36-38): `vpi_user.h`, VPI libraries loaded before
+  elaboration (`-load`, `-loadvpi`, or C files on the command line), user
+  system tasks and functions, the module / net / variable / memory /
+  parameter / port object model, `vpi_get_value` and `vpi_put_value` in all
+  the common formats, and callbacks. The tests match Icarus 13 VPI output.
+- DPI-C (clause 35): `import "DPI-C"` functions and tasks (`pure`, `context`,
+  C names), `export "DPI-C"` functions and tasks, every argument type
+  including packed vectors and open arrays, context scopes, exported tasks
+  that wait on time, and the 35.9 disable protocol. `include/svdpi.h` is
+  installed. msim builds C/C++ files given on its command line, loads
+  libraries with `-sv_lib` / `-sv_root` / `-sv_liblist` (annex J), and writes
+  prototypes with `-dpiheader`. msim now links libffi.
+- `chandle` variables (6.14).
+- `repeat (n)` with a count known only at run time (12.7.2).
+- Containers of containers (7.5, 7.8, 7.10): `int m[][]`, `int q[$][$]`,
+  associative arrays of queues, and fixed-size arrays of containers
+  (`int f[2][]`); containers of unpacked structs and of vectors wider than
+  64 bits.
+- `rand join` in randsequence (18.17.5), with a constant bias, and production
+  arguments and return values (18.17.7).
+- `dist` default weights (`default :/ w`, 18.5.3) and rand associative
+  arrays with integral keys (18.4); foreach constraints over associative
+  arrays bind the index to each key.
+- Function calls in constraints (18.5.12): methods, static and package
+  functions, nested calls, in guards, foreach bodies and inline `with`. The
+  rand variables a call reads are solved first.
+- rand dynamic arrays and queues (18.4): `size()` constraints, `foreach`
+  over the elements and array reductions (`sum`, `product`, `and`, `or`,
+  `xor`, with or without `with`) in constraints (18.5.8). Sizes are solved
+  first, then the elements. Rand arrays and queues of class handles
+  randomize each element's object.
 - Virtual interfaces (25.9): variables, properties and arguments of
   `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
   clocking blocks reached through them.
@@ -58,6 +108,9 @@ Spec references are IEEE 1800-2023 clauses.
   scope with `u.sum`).
 
 ### Fixed
+- `s[i]` on a string read X and could not be written (6.16).
+- The constraint solver re-evaluated known subexpressions at every node,
+  so a long `sum()` constraint cost O(n^2) per check.
 - msim could crash at exit when a process with an automatic frame (a
   forked automatic task, a class method) was still suspended: its frame went
   back to a frame shape that was already freed.

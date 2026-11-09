@@ -36,11 +36,33 @@
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
 //   -O<n>            optimization level for -compile (default -O2)
 //
+// DPI-C (IEEE 1800-2023 clause 35, annex J):
+//   <file>.c / .cc / .cpp / .cxx, .o, .a   C or C++ for DPI imports; msim builds
+//                    them, with svdpi.h on the include path, into one library
+//                    (in -o <dir> if given, else a temporary directory)
+//   <file>.so        a DPI library to load
+//   -sv_lib <name>   load <name>.so (annex J.3), relative to -sv_root
+//   -sv_root <dir>   directory for relative -sv_lib names
+//   -sv_liblist <f>  a bootstrap file of library names (J.4)
+//   -dpiheader <f>   write the C prototypes of every import and export to f
+//   -CFLAGS <s>      extra flags for compiling the C files
+//   -LDFLAGS <s>     extra flags for linking them (e.g. -lm)
+//
+// VPI (IEEE 1800-2023 clauses 36-38):
+//   -load <lib>[:<boot>]     load a VPI library before elaboration and run
+//                    its vlog_startup_routines, and <boot> if given (VCS form)
+//   -loadvpi <lib>:<boot>    the same (Xcelium form)
+//   The C files and .so libraries above are VPI libraries too: a library
+//   with vlog_startup_routines has them run. A design that uses VPI runs on
+//   one thread in the interpreter.
+//
 // Exit status: 0 when the simulation ran, 1 on a compile or lowering error,
 // 2 on a bad command line.
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <initializer_list>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -62,6 +84,8 @@
 
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
+#include "dpi.inc"
+#include "vpi.inc"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -119,6 +143,53 @@ static std::string kernelIncludeDir() {
     return MINISIM_SRC_DIR;
 }
 
+// svdpi.h for compiling DPI C code. An installed msim finds it in
+// ../include next to itself; a build-tree msim uses the source tree.
+static std::string dpiIncludeDir() {
+    if (const char* e = std::getenv("MINISIM_DPI_INCLUDE")) return e;
+    std::error_code ec;
+    auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        auto inst = exe.parent_path().parent_path() / "include";
+        if (std::filesystem::exists(inst / "svdpi.h", ec)) return inst.string();
+    }
+    return std::string(MINISIM_SRC_DIR) + "/../include";
+}
+static bool hasExt(const std::string& a, std::initializer_list<const char*> exts) {
+    for (const char* e : exts)
+        if (a.size() > strlen(e) && a.compare(a.size() - strlen(e), strlen(e), e) == 0) return true;
+    return false;
+}
+// Annex J: -sv_lib names a library without its extension.
+static std::string svLibPath(const std::string& root, std::string name) {
+    if (!hasExt(name, {".so"})) name += ".so";
+    if (!root.empty() && !name.empty() && name[0] != '/') name = root + "/" + name;
+    return name;
+}
+// Build C files into one shared library. Returns false on a build error.
+static bool buildShared(const std::vector<std::string>& files, const std::string& out, const std::string& cflags,
+                        const std::string& ldflags) {
+    std::string inc = dpiIncludeDir();
+    std::vector<std::string> objs;
+    bool cxx = false;
+    for (auto& f : files) {
+        if (hasExt(f, {".o", ".a"})) { objs.push_back(shq(f)); continue; }
+        bool isC = hasExt(f, {".c"});
+        cxx |= !isC;
+        const char* cc = isC ? (std::getenv("CC") ? std::getenv("CC") : "cc") : (std::getenv("CXX") ? std::getenv("CXX") : "c++");
+        std::string obj = out + "." + std::to_string(objs.size()) + ".o";
+        std::string cmd = shq(cc) + " -c -fPIC -O2 -I" + shq(inc) + " " + cflags + " " + shq(f) + " -o " + shq(obj);
+        if (std::system(cmd.c_str()) != 0) { std::cerr << "msim: DPI: C build failed: " << cmd << "\n"; return false; }
+        objs.push_back(shq(obj));
+    }
+    const char* ld = cxx ? (std::getenv("CXX") ? std::getenv("CXX") : "c++") : (std::getenv("CC") ? std::getenv("CC") : "cc");
+    std::string cmd = shq(ld) + " -shared -o " + shq(out);
+    for (auto& o : objs) cmd += " " + o;
+    cmd += " " + ldflags;
+    if (std::system(cmd.c_str()) != 0) { std::cerr << "msim: DPI: link failed: " << cmd << "\n"; return false; }
+    return true;
+}
+
 // How each process runs: on the static combinational schedule (rank and
 // level), as a clocked function (seq), or as an ordinary coroutine.
 struct Plan {
@@ -144,7 +215,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
         std::vector<size_t> procOf;
         for (size_t i = 0; i < n; i++) {
             CombShape c;
-            if (combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
+            if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
         std::vector<size_t> order = combSchedule(shapes, &lv);
@@ -159,7 +230,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     }
     if (staticSeq)
         for (size_t i = 0; i < n; i++)
-            if (p.rank[i] < 0 && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
+            if (p.rank[i] < 0 && lowered.procs[i].program < 0 && !lowered.procs[i].reactive && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
     return p;
 }
 
@@ -372,6 +443,10 @@ int main(int argc, char** argv) {
     int threads = defaultThreads();
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
+    std::vector<std::string> svLibs, cFiles, soFiles;
+    std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
+    std::string svRoot, dpiHeader, cflags, ldflags;
+    bool buildDirGiven = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -414,7 +489,7 @@ int main(int argc, char** argv) {
             }
             continue;
         }
-        if (a == "-o") { buildDir = next("a directory"); continue; }
+        if (a == "-o") { buildDir = next("a directory"); buildDirGiven = true; continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
@@ -451,8 +526,36 @@ int main(int argc, char** argv) {
             continue;
         }
         if (a.size() > 1 && a[0] == '+' && !slangPlus(a)) { plusargs.push_back(a.substr(1)); continue; }
+        if (a == "-sv_lib") { svLibs.push_back(next("a library name")); continue; }
+        if (a == "-sv_root") { svRoot = next("a directory"); continue; }
+        if (a == "-sv_liblist") {   // J.4: "#!SV_LIBRARIES" then one library per line
+            std::string f = next("a bootstrap file");
+            std::ifstream in(f);
+            if (!in) { std::cerr << "msim: cannot read " << f << "\n"; return 2; }
+            std::string line;
+            while (std::getline(in, line)) {
+                size_t b = line.find_first_not_of(" \t\r"), e = line.find_last_not_of(" \t\r");
+                if (b == std::string::npos || line[b] == '#') continue;
+                svLibs.push_back(line.substr(b, e - b + 1));
+            }
+            continue;
+        }
+        if (a == "-dpiheader") { dpiHeader = next("a file name"); continue; }
+        if (a == "-load" || a == "-loadvpi") {   // VPI (36.9.1)
+            std::string l = next("a VPI library");
+            size_t c = l.rfind(':');
+            std::string lib = c == std::string::npos ? l : l.substr(0, c), boot = c == std::string::npos ? "" : l.substr(c + 1);
+            if (lib.find('/') == std::string::npos) lib = "./" + lib;
+            vpiLibs.push_back({lib, boot});
+            continue;
+        }
+        if (a == "-CFLAGS") { cflags += " " + next("flags"); continue; }
+        if (a == "-LDFLAGS") { ldflags += " " + next("flags"); continue; }
+        if (a.size() && a[0] != '-' && hasExt(a, {".c", ".cc", ".cpp", ".cxx", ".C", ".o", ".a"})) { cFiles.push_back(a); continue; }
+        if (a.size() && a[0] != '-' && hasExt(a, {".so"})) { soFiles.push_back(a); continue; }
         fwd.push_back(a);
     }
+    for (auto& l : svLibs) soFiles.push_back(svLibPath(svRoot, l));
     plusArgs() = plusargs;
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
@@ -490,7 +593,39 @@ int main(int argc, char** argv) {
         }
     }
 
+    // VPI (36.9.1): libraries load before elaboration, so the system tasks
+    // and functions they register are known to it. The C files are built now
+    // for that, unless -dpiheader asks for prototypes they may include.
+    std::string userSo, earlyDir;
+    bool earlyTmp = false;
+    if (!cFiles.empty() && dpiHeader.empty()) {
+        earlyDir = buildDir;
+        if (!buildDirGiven) {
+            std::string t = (std::filesystem::temp_directory_path() / "msim-dpi-XXXXXX").string();
+            if (!mkdtemp(t.data())) { std::cerr << "msim: cannot create a temporary directory\n"; return 1; }
+            earlyDir = t;
+            earlyTmp = true;
+        }
+        if (std::system(("mkdir -p " + shq(earlyDir)).c_str()) != 0) {
+            std::cerr << "msim: cannot create " << earlyDir << "\n";
+            return 1;
+        }
+        userSo = std::filesystem::absolute(earlyDir + "/dpi_user.so").string();
+        if (!buildShared(cFiles, userSo, cflags, ldflags)) return 1;
+    }
+    vpi::st().argv.assign(argv, argv + argc);
+    {
+        std::vector<std::pair<std::string, std::string>> all = vpiLibs;
+        if (!userSo.empty()) all.push_back({userSo, ""});
+        for (auto& s : soFiles) all.push_back({s.find('/') == std::string::npos ? "./" + s : s, ""});
+        for (auto& [lib, boot] : all) {
+            std::string err;
+            if (!vpi::load(lib, boot, err)) { std::cerr << "msim: VPI: " << err << "\n"; return 1; }
+        }
+    }
+
     auto comp = driver.createCompilation();
+    if (vpi::st().active) vpi::declare(*comp);
     driver.reportCompilation(*comp, /*quiet*/ true);
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
 
@@ -515,6 +650,65 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // DPI-C (35): write the header, build the C code and the export stubs,
+    // load the libraries, and resolve the imports.
+    if (!lowered.dpi.empty() || !cFiles.empty() || !soFiles.empty()) {
+        dpi::collectExports(lowered);
+        if (!dpiHeader.empty()) {
+            std::ofstream h(dpiHeader);
+            h << dpi::header(lowered.dpi);
+            if (!h) { std::cerr << "msim: cannot write " << dpiHeader << "\n"; return 1; }
+        }
+        std::vector<std::string> libs;
+        bool needDir = !dpi::st().exports.empty() || !cFiles.empty();
+        // Without -o the C build goes to a private temporary directory, so
+        // runs in the same directory do not share (or race on) one library.
+        std::string dpiDir = buildDir;
+        bool tmpDir = false;
+        if (needDir && !buildDirGiven) {
+            std::string t = (std::filesystem::temp_directory_path() / "msim-dpi-XXXXXX").string();
+            if (!mkdtemp(t.data())) { std::cerr << "msim: cannot create a temporary directory\n"; return 1; }
+            dpiDir = t;
+            tmpDir = true;
+        }
+        const std::string& buildDir = dpiDir;
+        if (needDir && std::system(("mkdir -p " + shq(buildDir)).c_str()) != 0) {
+            std::cerr << "msim: cannot create " << buildDir << "\n";
+            return 1;
+        }
+        if (!dpi::st().exports.empty()) {   // C calls these, so they load first
+            std::string c = buildDir + "/dpi_exports.c", so = buildDir + "/dpi_exports.so";
+            std::ofstream f(c);
+            f << dpi::exportStubs(dpi::st().exports);
+            f.close();
+            if (!buildShared({c}, so, "", "")) return 1;
+            libs.push_back(std::filesystem::absolute(so).string());
+        }
+        if (!userSo.empty()) {
+            libs.push_back(userSo);
+        } else if (!cFiles.empty()) {
+            std::string so = buildDir + "/dpi_user.so";
+            if (!buildShared(cFiles, so, cflags, ldflags)) return 1;
+            libs.push_back(std::filesystem::absolute(so).string());
+        }
+        for (auto& s : soFiles) libs.push_back(s.find('/') == std::string::npos ? "./" + s : s);
+        std::string err;
+        bool ok = dpi::setup(lowered, libs, err);
+        if (tmpDir) { std::error_code ec; std::filesystem::remove_all(dpiDir, ec); }   // the libraries stay mapped
+        if (!ok) { std::cerr << "msim: DPI: " << err << "\n"; return 1; }
+        compiled = false;   // -compile does not run DPI calls yet
+    }
+    if (earlyTmp) { std::error_code ec; std::filesystem::remove_all(earlyDir, ec); }   // the library stays mapped
+
+    // VPI: callbacks and calltf routines may touch any signal at any time,
+    // so the design runs on one thread in the interpreter, every process
+    // scheduled the plain way.
+    if (vpi::st().active) {
+        if (compiled) std::cerr << "msim: -compile: VPI is not compiled yet; using the interpreter\n";
+        compiled = false;
+        staticComb = staticSeq = staticPart = false;
+        threads = 1;
+    }
     Plan pl = plan(lowered, staticComb, staticSeq);
     if (compiled && g_cov) {
         std::cerr << "msim: -compile: coverage is not compiled yet; using the interpreter\n";
@@ -522,6 +716,12 @@ int main(int argc, char** argv) {
     }
     if (compiled && timingChecksOn() && !timingChecks().empty()) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
+    bool anyReactive = false;
+    for (auto& lp : lowered.procs) anyReactive |= lp.reactive;
+    if (compiled && (lowered.programs || anyReactive)) {
+        std::cerr << "msim: -compile: programs and checkers are not compiled yet; using the interpreter\n";
         compiled = false;
     }
     if (compiled) {
@@ -532,6 +732,7 @@ int main(int argc, char** argv) {
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
     for (auto& [s, d] : lowered.netDelays) S.netDelay[s] = d;
+    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
@@ -567,11 +768,23 @@ int main(int argc, char** argv) {
     }
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
+        if (vpi::st().active && lowered.procs[i].kind == "init") {
+            // Declaration initializers take effect before the simulation
+            // starts, so they are not value changes VPI callbacks see (6.8).
+            Task t = process(&lowered.procs[i].prog);
+            S.all.push_back(t.h);
+            t.h.resume();
+            continue;
+        }
         if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
+        else if (lowered.procs[i].program >= 0 || lowered.procs[i].reactive)
+            S.spawn(programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial"));
         else S.spawn(process(&lowered.procs[i].prog));
     }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
+    S.freeVars = lowered.freeVars;   // free checker variables start random (17.7.2)
+    for (auto [s, every] : S.freeVars) S.sigs[s].val = S.freeValue(s);
     S.shadows = shadowPairs();
     S.sclocks = sampleClocks();
     for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
@@ -580,6 +793,7 @@ int main(int argc, char** argv) {
     startCovergroups();
     startTimingChecks();
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
+    if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
         std::vector<int> pt;
@@ -590,6 +804,7 @@ int main(int argc, char** argv) {
     std::vector<Task> finals = concEnd();   // strong obligations still pending fail (16.12.21)
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
+    if (vpi::st().active) vpi::end();   // cbEndOfSimulation
     std::cout.flush();
     if (g_cov && !writeCoverage(covPath, lowered, S.vcdTop)) {
         std::cerr << "msim: cannot write " << covPath << "\n";
