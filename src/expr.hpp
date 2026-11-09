@@ -1439,11 +1439,13 @@ enum SysFnId : int {
     SF_SYSTEM,           // $system(command) (20.17): the shell's exit status
     SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
     SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
-    SF_FREAD_GET         // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
+    SF_FREAD_GET,        // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
+    SF_SDF               // $sdf_annotate (32.9) with arguments known only at run time: g_sdfHook
 };
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
 enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
 inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
+inline void (*g_sdfHook)(const std::vector<std::string>& a) = nullptr;
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
 // suffix, and a minimum width of 20.
@@ -2072,6 +2074,12 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         case SF_FERROR: return sint(0);
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
         case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
+        case SF_SDF: {
+            std::vector<std::string> args;
+            for (const Val& x : a) { Val t = x; t.str = true; args.push_back(v_str(t)); }
+            if (g_sdfHook) g_sdfHook(args);
+            return sint(0);
+        }
         case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();

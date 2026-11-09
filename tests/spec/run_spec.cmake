@@ -1,6 +1,8 @@
 # Run one spec test: simulate SV with SIM and compare stdout with the file's
 # expected lines. An expected line is a comment that starts with "//> ".
 #   cmake -DSIM=<msim|iverilog> -DSV=<file.sv> [-DVVP=<vvp>] -P run_spec.cmake
+# "//! args: <words>" adds msim command-line arguments (more source files,
+# -libmap, -sdf ...), relative to the test's directory.
 # With -DVVP set, SIM is iverilog: compile with -g2012, then run under vvp and
 # drop vvp's own "$finish called" / "VCD info" lines.
 # Each test runs in its own directory, so a data file is a relative path.

@@ -1,0 +1,7 @@
+// Annotated with top.u2 as its scope: the CELL's empty INSTANCE is u2.
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 100ps)
+  (CELL (CELLTYPE "bufp") (INSTANCE)
+    (DELAY (INCREMENT (IOPATH A Z (5)))))
+)

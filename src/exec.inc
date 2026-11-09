@@ -1753,3 +1753,4 @@ inline void startClockings() {
 }
 #include "cover_rt.inc"
 #include "tchk.inc"
+#include "sdf_annotate.inc"
