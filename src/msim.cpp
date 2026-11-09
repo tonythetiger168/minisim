@@ -436,8 +436,25 @@ int main(int argc, char** argv) {
     for (auto& s : fwd) cargv.push_back(s.c_str());
     if (!driver.parseCommandLine((int)cargv.size(), cargv.data())) return 2;
     for (auto& s : fwd) if (s == "--help") { std::cout << driver.cmdLine.getHelpText("msim front end") << "\n"; return 0; }
+    // Like VCS and Xcelium, a name may be used before its declaration
+    // (--allow-use-before-declare=false turns this off).
+    if (auto& f = driver.options.compilationFlags[slang::ast::CompilationFlags::AllowUseBeforeDeclare]; !f)
+        f = true;
     if (!driver.processOptions()) return 2;
     if (!driver.parseAllSources()) return 1;
+    // A design element with no `timescale or timeunit, in a design where
+    // others have one, gets 1ns/1ps instead of an error (--timescale sets
+    // another default). A design with no timescale at all keeps 1ns/1ns.
+    if (!driver.options.timeScale) {
+        for (auto b : driver.sourceManager.getAllBuffers()) {
+            std::string_view t = driver.sourceManager.getSourceText(b);
+            if (t.find("`timescale") != t.npos || t.find("timeunit") != t.npos ||
+                t.find("timeprecision") != t.npos) {
+                driver.options.timeScale = "1ns/1ps";
+                break;
+            }
+        }
+    }
 
     auto comp = driver.createCompilation();
     driver.reportCompilation(*comp, /*quiet*/ true);

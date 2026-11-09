@@ -2540,6 +2540,65 @@ struct Lowerer {
         prog.emit(i);
     }
 
+    // The parts of a concatenation assignment target, first (most
+    // significant) first, with their offsets in the whole (11.4.12, 10.4).
+    static void concatParts(const slang::ast::Expression& e, int hi,
+                            std::vector<std::tuple<const slang::ast::Expression*, int, int>>& out) {
+        using namespace slang::ast;
+        const Expression& x = peel(e);
+        if (x.kind != ExpressionKind::Concatenation) {
+            int w = (int)x.type->getBitWidth();
+            needWidth(w);
+            out.push_back({&x, hi, hi - w + 1});
+            return;
+        }
+        for (auto* op : x.as<ConcatenationExpression>().operands()) {
+            int w = (int)op->type->getBitWidth();
+            concatParts(*op, hi, out);
+            hi -= w;
+        }
+    }
+
+    // {a, b} = v; {a, b} <= v; {a, b} = #d v: v is evaluated once, into a
+    // temporary as wide as the target, and each part takes its slice.
+    void concatAssign(const slang::ast::AssignmentExpression& a) {
+        using namespace slang::ast;
+        int w = (int)a.left().type->getBitWidth();
+        needWidth(w);
+        std::vector<std::tuple<const Expression*, int, int>> parts;
+        concatParts(a.left(), w - 1, parts);
+        int tmp = fresh(w);
+        Instr hold; hold.k = IK::Assign; hold.sig = tmp;
+        const Expression* saved = lvalue;
+        if (a.isCompound()) lvalue = &a.left();
+        hold.e = resize(expr(a.right()), w, false, false);
+        lvalue = saved;
+        prog.emit(hold);
+        Instr d;   // the delay of a <= #d v
+        bool later = false;
+        if (const TimingControl* tc = a.timingControl) {
+            if (tc->kind == TimingControlKind::Delay && a.isNonBlocking()) {
+                delayInto(tc->as<DelayControl>().expr, d);
+                later = true;
+            } else if (a.isNonBlocking()) {
+                unsupported("nonblocking assignment with an intra-assignment event control");
+            } else if (tc->kind == TimingControlKind::RepeatedEvent) {
+                unsupported("repeat event control on a concatenation assignment");
+            } else {
+                timing(*tc);
+            }
+        }
+        for (auto& [x, hi, lo] : parts) {
+            Instr i;
+            i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
+            lhs(*x, i);
+            if (i.dyn >= 0 && a.isNonBlocking()) unsupported("nonblocking write to a container element");
+            i.e = slice(ref(tmp), hi, lo);
+            if (later) { i.delay = d.delay; i.de = d.de; i.nbaLater = true; }
+            prog.emit(i);
+        }
+    }
+
     // Assignments, ++/--, and system calls used as statements.
     void exprStmt(const slang::ast::Expression& ex) {
         using namespace slang::ast;
@@ -2553,6 +2612,10 @@ struct Lowerer {
             if (a.left().type->isUnpackedArray() && !a.timingControl && !a.isCompound() &&
                 assignWholeArray(a.left(), a.right(), a.isNonBlocking()))
                 return;
+            if (peel(a.left()).kind == ExpressionKind::Concatenation) {
+                concatAssign(a);
+                return;
+            }
             Instr i;
             i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
             lhs(a.left(), i);
@@ -3469,8 +3532,31 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         Lowerer::covLoc(ca.location);
         Lowerer lw(sigmap);
         prep(lw);
-        Instr i; i.k = IK::Assign;
         auto [ds0, ds1] = ca.getDriveStrength();
+        if (Lowerer::peel(a.left()).kind == ExpressionKind::Concatenation) {
+            // assign {c, s} = x + y: one driver per part, each driving its
+            // slice of the right-hand side.
+            int w = (int)a.left().type->getBitWidth();
+            std::vector<std::tuple<const Expression*, int, int>> parts;
+            Lowerer::concatParts(a.left(), w - 1, parts);
+            bool first = true;
+            for (auto& [x, hi, lo] : parts) {
+                Lowerer pw(sigmap);
+                if (!first) prep(pw);
+                Lowerer& L = first ? lw : pw;
+                first = false;
+                Instr i; i.k = IK::Assign;
+                applyStrength(i, ds0, ds1, STR_STRONG, STR_STRONG);
+                L.lhs(*x, i);
+                i.e = slice(resize(L.expr(a.right()), w, false, false), hi, lo);
+                L.setScope(ca.getParentScope());
+                i.dly = L.delays3(ca.getDelay());
+                finishAssign(L, i);
+            }
+            g_emitLoc = {};
+            return;
+        }
+        Instr i; i.k = IK::Assign;
         applyStrength(i, ds0, ds1, STR_STRONG, STR_STRONG);
         lw.lhs(a.left(), i);
         i.e = lw.expr(a.right());
