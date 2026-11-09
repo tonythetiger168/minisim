@@ -1,0 +1,13 @@
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (DIVIDER /)
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "top") (INSTANCE)
+    (DELAY
+      (ABSOLUTE
+        (INTERCONNECT u1/y u2/a (2))
+        (PORT u3/a (3) (3.5))
+        (NETDELAY u4/a (4))
+        (INTERCONNECT u9/y u5/a (5))
+        (INTERCONNECT u1/y u6/b/a (6)))))
+)

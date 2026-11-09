@@ -27,6 +27,8 @@ struct TcEvent {
     bool nondet = false;   // the condition is == or !=: x enables the check
     uint8_t edges = 0;
     std::string text;      // the argument as written, for messages
+    std::string port;      // the terminal ("d", "d[3]"), for SDF matching (32.4.2)
+    std::string condText;  // the &&& condition, spaces removed
     int sig = -1;          // the signal the terminal reads (31.9 delays it), or -1
     int delayed = -1;      // an explicit delayed signal of it (31.9), or -1
 };
@@ -45,7 +47,7 @@ struct TimingCheck {
     // first (the timestamp) and the one that comes second (the timecheck).
     E tsCond, tcCond;
     int64_t dly[2] = {0, 0};     // the delay of each event's signal (31.9), set at the start
-    std::string limText;         // the limits as written
+    std::string limText;         // the limits as written (SDF annotation rewrites them)
     std::string inst, file;
     int line = 0;
     uint64_t unit = 1;           // ticks per time unit of the module, for messages
