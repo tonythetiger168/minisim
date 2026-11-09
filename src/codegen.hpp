@@ -134,9 +134,14 @@ public:
              "        if (!std::strcmp(argv[i], \"-maxtime\") && i + 1 < argc) maxTime = std::strtoull(argv[++i], nullptr, 10);\n"
              "        else if (!std::strcmp(argv[i], \"-vcd\") && i + 1 < argc) S.vcdPath = argv[++i];\n"
              "        else if (!std::strcmp(argv[i], \"-vcdtop\") && i + 1 < argc) S.vcdTop = argv[++i];\n"
-             "        else if (!std::strcmp(argv[i], \"-threads\") && i + 1 < argc) S.threads = std::max(1, std::atoi(argv[++i]));\n"
+             "        else if (!std::strcmp(argv[i], \"-threads\") && i + 1 < argc) {\n"
+             "            ++i;\n"
+             "            S.threads = !std::strcmp(argv[i], \"all\") ? maxThreads() : std::max(1, std::atoi(argv[i]));\n"
+             "        }\n"
+             "        else if (!std::strcmp(argv[i], \"-no-pin\")) g_pin = 0;\n"
+             "        else if (!std::strcmp(argv[i], \"-pin\")) g_pin = 1;\n"
              "    }\n"
-             "    if (std::thread::hardware_concurrency() > 0) S.threads = std::min<int>(S.threads, (int)std::thread::hardware_concurrency());\n";
+             "    S.threads = std::min(S.threads, maxThreads());\n";
         for (size_t s = 0; s < sigs.size(); s++) {
             o << "    S.sig(" << quote(sigs[s].name) << ", " << sigs[s].w << ", " << (sigs[s].net ? "true" : "false") << ");";
             for (int d = 0; d < sigs[s].drivers; d++) o << " S.newDriver(" << s << ");";
@@ -942,11 +947,14 @@ private:
             // computes, commits and settles its islands in one parallel pass.
             o << "    if (S.fuseOk()) {\n"
                  "        const bool t = twoNow();\n"
-                 "        S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); CMG[g](t); });\n"
+                 "        const int use = S.domainTune[0].pick(S.threads);\n"
+                 "        S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); CMG[g](t); }, use);\n"
+                 "        S.domainTune[0].done(S.threads);\n"
                  "        if (!t) scanP();\n"
                  "        if (S.observed) syncP();\n"
                  "        return;\n    }\n"
-                 "    { const bool t = twoNow(); S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); }); }\n";
+                 "    { const bool t = twoNow(); const int use = S.domainTune[1].pick(S.threads);\n"
+                 "      S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); }, use); S.domainTune[1].done(S.threads); }\n";
         else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
         if (!par) o << "    for (auto f : DS) f();\n";
         o << "    nb.push_back({-1, Val{}, -1, 0});\n}\n";
@@ -1005,7 +1013,9 @@ private:
             // known value, so the commits keep every private signal known.
             o << "static void fcommit() {\n"
                  "    const bool t = twoNow();\n"
-                 "    S.parallelFor(" << G << ", [t](size_t g) { CMG[g](t); });\n"
+                 "    const int use = S.domainTune[2].pick(S.threads);\n"
+                 "    S.parallelFor(" << G << ", [t](size_t g) { CMG[g](t); }, use);\n"
+                 "    S.domainTune[2].done(S.threads);\n"
                  "    if (!t) scanP();\n"
                  "    if (S.observed) syncP();\n}\n\n";
             return;
