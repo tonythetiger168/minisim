@@ -173,7 +173,7 @@ if(MINISIM_WITH_SLANG)
                      -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
     # A known gap says so on a line "//! xfail: <what is missing>". The test
     # still runs; it is expected to fail, and passing it is an error, so the
-    # marker comes off as soon as the gap is fixed (tests/regress.py lists them).
+    # marker comes off as soon as the gap is fixed (tools/mregress.py -spec tests/spec lists them).
     file(STRINGS ${sv} xfail REGEX "^//! xfail")
     if(xfail)
       set_tests_properties(spec/${name} PROPERTIES WILL_FAIL TRUE LABELS "spec;xfail")
