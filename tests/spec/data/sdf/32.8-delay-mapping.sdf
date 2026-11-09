@@ -1,0 +1,13 @@
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "tribuf") (INSTANCE u1) (DELAY (ABSOLUTE (IOPATH a y (3) (5)) (IOPATH en y (3) (5)))))
+  (CELL (CELLTYPE "tribuf") (INSTANCE u2) (DELAY (ABSOLUTE (IOPATH a y (3) (5) (7)) (IOPATH en y (3) (5) (7)))))
+  (CELL (CELLTYPE "tribuf") (INSTANCE u3)
+    (DELAY (ABSOLUTE (IOPATH a y (3) (5) (7) (9) (11) (13)) (IOPATH en y (3) (5) (7) (9) (11) (13)))))
+  (CELL (CELLTYPE "tribuf") (INSTANCE u4)
+    (DELAY (ABSOLUTE
+      (IOPATH a y (1) (2) (3) (4) (5) (6) (7) (8) (9) (10) (11) (12))
+      (IOPATH en y (1) (2) (3) (4) (5) (6) (7) (8) (9) (10) (11) (12)))))
+  (CELL (CELLTYPE "tribuf") (INSTANCE u5) (DELAY (ABSOLUTE (IOPATH a y () (9)) (IOPATH en y () (9)))))
+)

@@ -1,0 +1,11 @@
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "chk") (INSTANCE u)
+    (TIMINGCHECK
+      (SETUPHOLD d1 (posedge c1) (5) (1) (SCOND en) (CCOND en))
+      (SETUPHOLD d2 (posedge c2) (5) (1) (SCOND en))
+      (SETUPHOLD d3 (posedge c3) (5) (1) (CCOND en))
+      (SETUPHOLD d4 (posedge c4) (5) (1))
+      (SETUP d5 (posedge c5) (5) (SCOND en))))
+)

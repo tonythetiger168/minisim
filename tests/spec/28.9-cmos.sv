@@ -1,6 +1,5 @@
 // IEEE 1800-2023 28.9: A cmos switch is an nmos and a pmos in parallel
 // (28.9).
-//! xfail: cmos is an error
 module top;
   logic d = 1, n = 1, p = 0;
   wire o;

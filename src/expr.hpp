@@ -52,6 +52,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <iostream>
+#include <sys/wait.h>
 
 // One 64-bit limb of a wide value. v/x/z use the same encoding as Val.
 struct Limb {
@@ -824,6 +826,7 @@ struct DynObj {
     std::shared_ptr<DynObj> elem;   // elements that are containers: their empty shape (an element holds the id)
     int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
     bool strKey = false;        // associative: string index
+    bool wideKey = false;       // associative: an integral index wider than 64 bits, kept as big-endian bytes in DynKey::s
     int keyW = 64;
     bool keySgn = true;
     DynKey key(const Val& k) const {
@@ -834,6 +837,15 @@ struct DynObj {
             d.s = v_str(t);
             return d;
         }
+        if (wideKey) {
+            Val t = v_resize(k, keyW, false);
+            for (int b = (keyW + 7) / 8 - 1; b >= 0; b--) {
+                unsigned char c = 0;
+                for (int j = 0; j < 8 && 8 * b + j < keyW; j++) if (bitAt(t, 8 * b + j) == 1) c |= (unsigned char)(1u << j);
+                d.s += (char)c;
+            }
+            return d;
+        }
         uint64_t u = k.v & ~k.x & mask(keyW);
         if (keySgn && keyW < 64 && ((u >> (keyW - 1)) & 1)) u |= ~mask(keyW);
         d.i = keySgn ? (int64_t)u : (int64_t)(u ^ (1ULL << 63));
@@ -841,6 +853,16 @@ struct DynObj {
     }
     Val keyVal(const DynKey& d) const {
         if (strKey) return mkstr(d.s);
+        if (wideKey) {
+            Val v = make(0, 0, keyW);
+            int nb = (int)d.s.size();
+            for (int i = 0; i < nb; i++) {
+                int b = nb - 1 - i;
+                unsigned char c = (unsigned char)d.s[(size_t)i];
+                for (int j = 0; j < 8 && 8 * b + j < keyW; j++) if ((c >> j) & 1) setBit(v, 8 * b + j, 1);
+            }
+            return finish(v);
+        }
         uint64_t u = keySgn ? (uint64_t)d.i : ((uint64_t)d.i ^ (1ULL << 63));
         Val v = make(u, 0, keyW);
         v.sgn = keySgn;
@@ -1366,6 +1388,8 @@ enum class Op {
     IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
     Addr,      // the signal id of slot `sig` of the object kids[0] names, or 0 for null
     AddrOf,    // the signal id that sig (maybe relative) names now: a `ref` argument (13.5.2)
+    DynEq,     // containers sig and hi have the same size and equal elements (=== when lo)
+    DynStrJoin, // the strings in container sig, joined ({>>{q}} of a string queue, 11.4.14)
     VifSig     // 1 + the signal id of member hi of the interface instance the virtual interface kids[0] names, or 0 (25.9)
 };
 // System functions computed by Op::SysFn.
@@ -1407,7 +1431,20 @@ enum SysFnId : int {
     // Power-aware simulation (IEEE 1801-2024), run by g_upfHook: a function of
     // package UPF (lo = UpfOp), or a strategy cell on a port connection
     // (lo = UPF_ISO / UPF_LS with the cell's index above the low 8 bits).
-    SF_UPF
+    SF_UPF,
+    // ---- DPI / remaining-chapters thread ----
+    // $dist_* (20.14, Annex N): {new seed, value}, 64 bits, like SF_DIST_UNIFORM.
+    SF_DIST_NORMAL,      // (seed, mean, standard deviation)
+    SF_DIST_EXPONENTIAL, // (seed, mean)
+    SF_DIST_POISSON,     // (seed, mean)
+    SF_DIST_CHI_SQUARE,  // (seed, degrees of freedom)
+    SF_DIST_T,           // (seed, degrees of freedom)
+    SF_DIST_ERLANG,      // (seed, k, mean)
+    SF_SYSTEM,           // $system(command) (20.17): the shell's exit status
+    SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
+    SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
+    SF_FREAD_GET,        // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
+    SF_SDF               // $sdf_annotate (32.9) with arguments known only at run time: g_sdfHook
 };
 enum UpfOp : int { UPF_SUPPLY_ON, UPF_SUPPLY_OFF, UPF_SUPPLY_PARTIAL_ON, UPF_SET_SUPPLY_STATE, UPF_SET_POWER_STATE,
                    UPF_GET_SUPPLY_VALUE, UPF_ISO, UPF_LS };
@@ -1415,6 +1452,7 @@ inline Val (*g_upfHook)(int op, const std::vector<Val>& a) = nullptr;
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
 enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
 inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
+inline void (*g_sdfHook)(const std::vector<std::string>& a) = nullptr;
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
 // suffix, and a minimum width of 20.
@@ -1437,6 +1475,7 @@ struct ArrShape {
     bool sgn = false;
     bool twoState = false;   // bit / int elements: an invalid read is 0, not X (7.4.6)
     std::vector<std::pair<int64_t, int64_t>> dims;   // [left, right]
+    std::shared_ptr<const DynObj> dynElem;   // int f[2][$]: each element a container of this shape (last: -compile writes the others in order)
     // Flat element offset, or -1 when an index is outside its dimension.
     int64_t offset(const std::vector<int64_t>& idx) const {
         int64_t off = 0;
@@ -1626,9 +1665,57 @@ inline int32_t rtlDistUniform(int32_t& seed, int32_t start, int32_t end) {
     return (int32_t)i;
 }
 inline int32_t& globalRandomSeed() { static int32_t s = 0; return s; }
+// The other Annex N distributions, in the same 32-bit arithmetic.
+inline double rtlNormal(int32_t& seed, int32_t mean, int32_t dev) {
+    double v1 = 0, v2 = 0, s = 1.0;
+    while (s >= 1.0 || s == 0.0) {
+        v1 = rtlUniform(seed, -1, 1);
+        v2 = rtlUniform(seed, -1, 1);
+        s = v1 * v1 + v2 * v2;
+    }
+    s = v1 * std::sqrt(-2.0 * std::log(s) / s);
+    return s * (double)dev + (double)mean;
+}
+inline double rtlExponential(int32_t& seed, int32_t mean) {
+    double n = rtlUniform(seed, 0, 1);
+    if (n != 0) n = -std::log(n) * mean;
+    return n;
+}
+inline int32_t rtlPoisson(int32_t& seed, int32_t mean) {
+    int32_t n = 0;
+    double p = std::exp(-(double)mean), q = rtlUniform(seed, 0, 1);
+    while (p < q) {
+        n++;
+        q = rtlUniform(seed, 0, 1) * q;
+    }
+    return n;
+}
+inline double rtlChiSquare(int32_t& seed, int32_t df) {
+    double x = 0.0;
+    if (df % 2) { x = rtlNormal(seed, 0, 1); x = x * x; }
+    for (int32_t k = 2; k <= df; k += 2) x = x + 2 * rtlExponential(seed, 1);
+    return x;
+}
+inline double rtlT(int32_t& seed, int32_t df) {
+    double chi2 = rtlChiSquare(seed, df);
+    double root = std::sqrt(chi2 / (double)df);
+    return rtlNormal(seed, 0, 1) / root;
+}
+inline double rtlErlang(int32_t& seed, int32_t k, int32_t mean) {
+    double x = 1.0;
+    for (int32_t i = 1; i <= k; i++) x = x * rtlUniform(seed, 0, 1);
+    return -(double)mean * std::log(x) / (double)k;
+}
+// Round half away from zero, as the rtl_dist_* wrappers do.
+inline int32_t rtlRound(double r) { return r >= 0 ? (int32_t)(r + 0.5) : -(int32_t)(-r + 0.5); }
+inline void rtlWarn(const char* what) { std::cerr << "WARNING: " << what << "\n"; }
 // $urandom: the generator is implementation-defined (18.13). minisim uses
 // one 64-bit xorshift* stream, seeded by -seed (default 1), so a run repeats.
-inline uint64_t& urandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
+// Random stability (18.14.2): every process (thread) has its own generator.
+// g_threadRng is the running process's; with none running, the global one.
+inline uint64_t& globalRandomState() { static uint64_t s = 0x9E3779B97F4A7C15ull; return s; }
+inline uint64_t* g_threadRng = nullptr;
+inline uint64_t& urandomState() { return g_threadRng ? *g_threadRng : globalRandomState(); }
 inline uint32_t urandomNext(uint64_t& s) {
     s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
     return (uint32_t)((s * 0x2545F4914F6CDD1Dull) >> 32);
@@ -1675,6 +1762,20 @@ inline void fileWrite(uint32_t fd, const std::string& t) {
         if ((fd >> b) & 1 && files().mcd[b]) fwrite(t.data(), 1, t.size(), files().mcd[b]);
 }
 inline std::string& scanText() { static std::string s; return s; }
+inline std::string& freadBuf() { static std::string s; return s; }
+// $fclose cancels the $fstrobe / $fmonitor output to the closed descriptor (21.3.1).
+inline void (*g_fcloseHook)(uint32_t fd) = nullptr;
+// The first n bytes of `b` (zero past its end) as an unsigned big-endian value of w bits.
+inline Val bytesValue(const std::string& b, size_t n, int w) {
+    int bw = (int)n * 8;
+    Val v = make(0, 0, std::max(bw, 1), 0, false);
+    if (bw > 64) v = maskWidth(v, bw);
+    for (size_t k = 0; k < n; k++) {
+        unsigned char c = k < b.size() ? (unsigned char)b[k] : 0;
+        for (int j = 0; j < 8; j++) setBit(v, bw - 8 * (int)(k + 1) + j, (c >> j) & 1);
+    }
+    return v_resize(v, w, false);
+}
 inline std::vector<Val>& scanOut() { static std::vector<Val> v; return v; }
 // $fscanf / $sscanf (21.3.4) from a character source: next() gives a char or
 // EOF, back() returns the last one. The values read go to scanOut(); returns
@@ -1795,6 +1896,44 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
                                              : rtlDistUniform(seed, i32(a[1]), i32(a[2]));
             return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
         }
+        case SF_DIST_NORMAL: case SF_DIST_EXPONENTIAL: case SF_DIST_POISSON:
+        case SF_DIST_CHI_SQUARE: case SF_DIST_T: case SF_DIST_ERLANG: {
+            int32_t seed = i32(a[0]), r = 0;
+            int32_t p1 = a.size() > 1 ? i32(a[1]) : 0, p2 = a.size() > 2 ? i32(a[2]) : 0;
+            switch (id) {
+                case SF_DIST_NORMAL: r = rtlRound(rtlNormal(seed, p1, p2)); break;
+                case SF_DIST_EXPONENTIAL:
+                    if (p1 > 0) r = rtlRound(rtlExponential(seed, p1));
+                    else rtlWarn("Exponential distribution must have a positive mean");
+                    break;
+                case SF_DIST_POISSON:
+                    if (p1 > 0) r = rtlPoisson(seed, p1);
+                    else rtlWarn("Poisson distribution must have a positive mean");
+                    break;
+                case SF_DIST_CHI_SQUARE:
+                    if (p1 > 0) r = rtlRound(rtlChiSquare(seed, p1));
+                    else rtlWarn("Chi_square distribution must have positive degree of freedom");
+                    break;
+                case SF_DIST_T:
+                    if (p1 > 0) r = rtlRound(rtlT(seed, p1));
+                    else rtlWarn("t distribution must have positive degree of freedom");
+                    break;
+                default:
+                    if (p1 > 0) r = rtlRound(rtlErlang(seed, p1, p2));
+                    else rtlWarn("k-stage erlangian distribution must have positive k");
+                    break;
+            }
+            return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
+        }
+        case SF_SYSTEM: {   // 20.17: run the command in a shell; the result is its exit status
+            Val c = a.empty() ? mkstr("") : a[0];
+            c.str = true;
+            std::cout.flush();
+            fflush(stdout);
+            int st = std::system(v_str(c).c_str());
+            if (a.empty()) return sint(st != 0);   // $system() with no command: is a shell there
+            return sint(st == -1 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+        }
         case SF_URANDOM: return make(urandomNext(urandomState()), 0, 32, 0);
         case SF_OBJ_SRANDOM:
             objRng()[(int)u64(a[0])] = seedState(u64(a[1]));
@@ -1848,6 +1987,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         }
         case SF_FCLOSE: {
             uint32_t fd = (uint32_t)u64(a[0]);
+            if (g_fcloseHook) g_fcloseHook(fd);
             if (fd & 0x80000000u) {
                 uint32_t i = fd & 0x7fffffffu;
                 if (i >= 3 && i < files().fds.size() && files().fds[i]) { fclose(files().fds[i]); files().fds[i] = nullptr; }
@@ -1857,6 +1997,16 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             }
             return make(0, 0, 1, 0);
         }
+        case SF_FREAD: {
+            FILE* f = fdFile((uint32_t)u64(a[0]));
+            size_t n = (size_t)u64(a[1]);
+            std::string& b = freadBuf();
+            b.assign(n, '\0');
+            size_t got = f && n ? fread(b.data(), 1, n, f) : 0;
+            b.resize(got);
+            return sint((int64_t)got);
+        }
+        case SF_FREAD_GET: return bytesValue(freadBuf(), (size_t)(ctl + 7) / 8, ctl);
         case SF_FWRITE: {
             Val t = a[1]; t.str = true;
             fileWrite((uint32_t)u64(a[0]), v_str(t) + (ctl ? "\n" : ""));
@@ -1932,6 +2082,12 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
         case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
         case SF_UPF: return g_upfHook ? g_upfHook(ctl, a) : make(0, 0, 1, 0);
+        case SF_SDF: {
+            std::vector<std::string> args;
+            for (const Val& x : a) { Val t = x; t.str = true; args.push_back(v_str(t)); }
+            if (g_sdfHook) g_sdfHook(args);
+            return sint(0);
+        }
         case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();
@@ -2024,6 +2180,22 @@ inline const FrameLayout& dynElemLay() {
     return l;
 }
 // A new element of d: an empty container when d holds containers.
+// Element containers of an associative array made by a read of a missing key:
+// not in the array until a write to them (dynAttach).
+struct DynPending { int outer; Val key; };
+inline std::unordered_map<int, DynPending>& dynPending() { static std::unordered_map<int, DynPending> m; return m; }
+inline std::map<std::pair<int, DynKey>, int>& dynPendingAt() { static std::map<std::pair<int, DynKey>, int> m; return m; }
+inline void dynAttach(int sig) {
+    if (dynPending().empty()) return;
+    auto it = dynPending().find(sig);
+    if (it == dynPending().end()) return;
+    DynPending p = it->second;
+    dynPending().erase(it);
+    DynObj& d = dynStore()[p.outer];
+    DynKey k = d.key(p.key);
+    dynPendingAt().erase(std::make_pair(p.outer, k));
+    d.map.emplace(k, make((uint64_t)sig, 0, 64));
+}
 inline Val dynNewElem(const DynObj& d) {
     if (!d.elem) return d.dflt;
     int id = g_allocSigs(dynElemLay());
@@ -2066,6 +2238,9 @@ inline bool (*g_isA)(int obj, int cls) = nullptr;   // is object obj of class cl
 // there gives null (the access that uses the address reports it, if it runs).
 inline int g_nullOk = 0;
 inline int g_nullSig = 0;   // a signal that always holds 0, read in place of a null object's slot
+// Set at exit: processes still waiting are destroyed after the lowered
+// design (and its frame layouts) is gone, so their frames are not recycled.
+inline bool g_framesDead = false;
 struct Frame {
     int base = 0;                    // first signal of this frame's slots
     int self = 0;                    // `this` (a handle), 0 outside methods
@@ -2073,7 +2248,7 @@ struct Frame {
     std::shared_ptr<Frame> up;       // the lexically enclosing frame (fork branches)
     Frame() = default;
     Frame(const Frame&) = delete;
-    ~Frame() { if (lay && !lay->w.empty()) lay->pool.push_back(base); }
+    ~Frame() { if (lay && !lay->w.empty() && !g_framesDead) lay->pool.push_back(base); }
 };
 using FrameP = std::shared_ptr<Frame>;
 inline FrameP newFrame(const FrameLayout* lay, FrameP up, int self) {
@@ -2228,7 +2403,9 @@ inline Val eval(const E& e, const Reader& rd) {
         }
         case Op::StrRep: {
             std::string one = v_str(k(0)), s;
-            for (int i = 0; i < e->hi; i++) s += one;
+            int64_t n = e->hi;
+            if (e->kids.size() > 1) { Val c = k(1); n = c.x ? 0 : v_to_i64(c); }   // a count known at run time
+            for (int64_t i = 0; i < n; i++) s += one;
             return mkstr(s);
         }
         case Op::StrCmp: {
@@ -2306,6 +2483,32 @@ inline Val eval(const E& e, const Reader& rd) {
             return mkstr(s);
         }
         case Op::DynGet: return dynStore()[R(e->sig)].get(k(0));
+        case Op::DynEq: {
+            const DynObj& a = dynStore()[R(e->sig)];
+            const DynObj& b = dynStore()[R(e->hi)];
+            if (a.size() != b.size()) return mk(0, 1);
+            bool unk = false;
+            auto one = [&](const Val& x, const Val& y) {
+                if (x.str || y.str) return v_str(x) == v_str(y);
+                Val r = e->lo ? v_case_eq(x, y) : v_eq(x, y);
+                if (r.x) { unk = true; return true; }
+                return (r.v & 1) != 0;
+            };
+            if (a.kind == 2 && b.kind == 2) {
+                for (auto ia = a.map.begin(), ib = b.map.begin(); ia != a.map.end(); ++ia, ++ib)
+                    if (ia->first.i != ib->first.i || ia->first.s != ib->first.s || !one(ia->second, ib->second)) return mk(0, 1);
+            } else if (a.kind != 2 && b.kind != 2) {
+                for (size_t k = 0; k < a.vec.size(); k++) if (!one(a.vec[k], b.vec[k])) return mk(0, 1);
+            } else return mk(0, 1);
+            return unk ? allx(1) : mk(1, 1);
+        }
+        case Op::DynStrJoin: {
+            auto& d = dynStore()[R(e->sig)];
+            std::string r;
+            if (d.kind == 2) for (auto& [key, v] : d.map) { Val t = v; t.str = true; r += v_str(t); }
+            else for (auto& v : d.vec) { Val t = v; t.str = true; r += v_str(t); }
+            return mkstr(r);
+        }
         case Op::ArrAddr: {
             std::vector<int64_t> idx;
             for (size_t n = 0; n < e->kids.size(); n++) {
@@ -2324,8 +2527,15 @@ inline Val eval(const E& e, const Reader& rd) {
             if (d.kind == 2) {
                 if (key.x && !d.strKey) return make((uint64_t)dynNewElem(d).v + 1, 0, 64);
                 auto it = d.map.find(d.key(key));
-                if (it == d.map.end()) it = d.map.emplace(d.key(key), dynNewElem(d)).first;   // made on first use
-                return make(it->second.v + 1, 0, 64);
+                if (it != d.map.end()) return make(it->second.v + 1, 0, 64);
+                // Missing: a new empty container that joins d only when written
+                // (dynAttach), so reading aa[k].size() does not add aa[k] (7.8.6).
+                auto at = std::make_pair(c, d.key(key));
+                if (auto p = dynPendingAt().find(at); p != dynPendingAt().end()) return make((uint64_t)p->second + 1, 0, 64);
+                int id = (int)dynNewElem(d).v;
+                dynPendingAt()[at] = id;
+                dynPending()[id] = {c, key};
+                return make((uint64_t)id + 1, 0, 64);
             }
             int64_t i = key.x ? -1 : v_to_i64(key);
             // Out of range: an empty container of its own (writes to it are lost).
@@ -2413,8 +2623,16 @@ inline Val eval(const E& e, const Reader& rd) {
             return r;
         }
         case Op::LogNot: return v_lnot(k(0));
-        case Op::LogAnd: return v_land(k(0), k(1));
-        case Op::LogOr: return v_lor(k(0), k(1));
+        case Op::LogAnd: {   // the right operand is not evaluated when the left is false (11.4.7)
+            Val a = k(0);
+            if (truth(a) == 0) return mk(0);
+            return v_land(a, k(1));
+        }
+        case Op::LogOr: {
+            Val a = k(0);
+            if (truth(a) == 1) return mk(1);
+            return v_lor(a, k(1));
+        }
         case Op::RedAnd: return v_red_and(k(0));
         case Op::RedOr: return v_red_or(k(0));
         case Op::RedXor: return v_red_xor(k(0));
@@ -2425,13 +2643,28 @@ inline Val eval(const E& e, const Reader& rd) {
             for (size_t i = 0; i < e->kids.size(); i++) parts.push_back(k((int)i));
             return v_concat(parts);
         }
-        case Op::Mux: return v_mux(k(0), k(1), k(2));
+        case Op::Mux: {   // only the selected operand is evaluated (11.4.11); an unknown condition merges both
+            Val c = k(0);
+            int t = truth(c);
+            if (t == 1) return k(1);
+            if (t == 0) return k(2);
+            return v_mux(c, k(1), k(2));
+        }
         case Op::Pow: return v_pow(k(0), k(1));
         case Op::Time: {   // k.v ticks per time unit of the calling module
             uint64_t d = e->k.v ? e->k.v : 1;
             return make((g_simTime + d / 2) / d, 0, 64, 0);
         }
         case Op::SysFn: {
+            if (e->hi == SF_ASSOC_BOUND) {
+                auto& d = dynStore()[e->sig];
+                if (d.map.empty()) return xfill(32, true);
+                const DynKey& key = e->lo ? std::prev(d.map.end())->first : d.map.begin()->first;
+                Val kv = d.keyVal(key);
+                Val r = make((uint64_t)(uint32_t)v_to_i64(kv), 0, 32, 0);
+                r.sgn = true;
+                return r;
+            }
             std::vector<Val> a;
             for (size_t i = 0; i < e->kids.size(); i++) a.push_back(k((int)i));
             return v_sysfn(e->hi, e->lo, a);

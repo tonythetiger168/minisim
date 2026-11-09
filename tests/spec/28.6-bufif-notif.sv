@@ -1,6 +1,5 @@
 // IEEE 1800-2023 28.6: Three-state gates bufif0, bufif1, notif0, notif1
 // (28.6).
-//! xfail: bufif/notif are errors
 module top;
   logic d = 1, e = 1;
   wire o1, o2, o3, o4;
