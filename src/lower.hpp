@@ -264,8 +264,19 @@ inline int uWidth(const slang::ast::Type& t0) {
         }
         return w;
     }
+    if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {   // a struct member that is an array: its elements, left one highest
+        const auto& a = t.as<FixedSizeUnpackedArrayType>();
+        int ew = uWidth(a.elementType);
+        if (ew <= 0 || (int64_t)ew * (int64_t)a.range.width() > (1 << 24)) return -1;
+        return ew * (int)a.range.width();
+    }
     if (t.isUnpackedArray() || t.isClass() || t.isEvent() || t.isCHandle() || t.isVirtualInterface()) return -1;
     return storeW(t);
+}
+// The bits a value of type t takes inside an unpacked struct or array (uWidth),
+// or its storage width (storeW).
+inline int bitsOf(const slang::ast::Type& t) {
+    return t.getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType ? uWidth(t) : storeW(t);
 }
 // Offset and width of field f inside unpacked struct or union t.
 inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::FieldSymbol& f) {
@@ -2448,6 +2459,8 @@ struct Lowerer {
                 shape = a;
             }
         } else {
+            if (cur->kind == ExpressionKind::MemberAccess || cur->kind == ExpressionKind::ElementSelect)
+                return std::nullopt;   // s.arr[i]: an array inside an unpacked struct is bits of it (7.2)
             if (cur->kind != ExpressionKind::NamedValue) unsupported("array select on a non-variable");
             shape = arrFind(&cur->as<NamedValueExpression>().symbol);
         }
@@ -3247,7 +3260,7 @@ struct Lowerer {
     PSel packedSel(const slang::ast::Type& vt, const slang::ast::Expression* idx,
                    const slang::ast::Expression* idx2, int64_t count, PSel::Kind kind) {
         using namespace slang::ast;
-        int W = (int)vt.getBitWidth();
+        int W = vt.getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType ? uWidth(vt) : (int)vt.getBitWidth();
         int64_t left = W - 1, right = 0;
         if (vt.hasFixedRange()) { auto fr = vt.getFixedRange(); left = fr.left; right = fr.right; }
         bool desc = left >= right;
@@ -3796,7 +3809,7 @@ struct Lowerer {
                     return sized(std::move(m), 8, false, ctx);
                 }
                 PSel ps = packedSel(*sel.value().type, &sel.selector(), nullptr, 1, PSel::Index);
-                return sized(readPSel(expr(sel.value()), ps), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                return sized(readPSel(expr(sel.value()), ps), sel.value().type->isUnpackedArray() ? bitsOf(*e.type) : (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
             case ExpressionKind::RangeSelect: {     // a[hi:lo], a[i +: w], a[i -: w]
                 if (E k = paramSelect(e, ctx)) return k;
@@ -3845,12 +3858,14 @@ struct Lowerer {
                     int src = storeW(*e.type);
                     return sized(r, src, e.type->isSigned(), ctx);
                 }
-                                return sized(readPSel(expr(m.value()), memberPSel(m)), storeW(*e.type), e.type->isSigned(), ctx);
+                                return sized(readPSel(expr(m.value()), memberPSel(m)), bitsOf(*e.type), e.type->isSigned(), ctx);
             }
             case ExpressionKind::SimpleAssignmentPattern:
             case ExpressionKind::StructuredAssignmentPattern:
             case ExpressionKind::ReplicatedAssignmentPattern: {   // '{a, b}, '{f: x}, '{n{a}} (10.9)
                 if (e.type->isUnpackedStruct() || e.type->isUnpackedUnion()) return sized(structValue(e), storeW(*e.type), false, ctx);
+                if (e.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType && uWidth(*e.type) > 0)
+                    return sized(arrayBitsValue(e), uWidth(*e.type), false, ctx);   // s.arr = '{...} (7.2)
                 if (!e.type->isIntegral()) unsupported("assignment pattern of an unpacked type");
                 const auto& ap = static_cast<const AssignmentPatternExpressionBase&>(e);
                 std::vector<E> parts;
@@ -4282,9 +4297,22 @@ struct Lowerer {
         const auto& t = t0.getCanonicalType();
         if (t.isFloating()) { auto b = node(Op::Resize, {realOf(x)}); b->hi = 64; return b; }
         if (t.isString()) return resize(strOf(x), 64, false, false);
-        int w = storeW(t);
+        int w = bitsOf(t);
         if (t.isIntegral()) return resize(expr(x), w, x.type->isSigned(), false);
         return resize(expr(x), w, false, false);
+    }
+    // '{a, b} or '{n{a}} for an array held as bits of an unpacked struct (7.2): the left element highest.
+    E arrayBitsValue(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        const auto& a = e.type->getCanonicalType().as<FixedSizeUnpackedArrayType>();
+        const auto& ap = static_cast<const AssignmentPatternExpressionBase&>(e);
+        int64_t reps = e.kind == ExpressionKind::ReplicatedAssignmentPattern
+                           ? constInt(e.as<ReplicatedAssignmentPatternExpression>().count()) : 1;
+        std::vector<E> parts;
+        for (int64_t r = 0; r < reps; r++)
+            for (auto* el : ap.elements()) parts.push_back(storageOf(a.elementType, *el));
+        if ((int64_t)parts.size() != (int64_t)a.range.width()) unsupported("array pattern with the wrong number of elements");
+        return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
     }
     // '{a, b, c} or '{f: v, default: d} for an unpacked struct (10.9.2): slang
     // gives one element per member, in member order.
@@ -4307,11 +4335,22 @@ struct Lowerer {
     E structDefault(const slang::ast::Type& t0) {
         using namespace slang::ast;
         const auto& t = t0.getCanonicalType();
+        if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {   // an array member: each element's default
+            const auto& a = t.as<FixedSizeUnpackedArrayType>();
+            const Type& et = a.elementType.getCanonicalType();
+            E one;
+            if (et.isUnpackedStruct() || et.isUnpackedUnion() || et.kind == SymbolKind::FixedSizeUnpackedArrayType) one = structDefault(et);
+            else if (et.isIntegral() && et.isFourState()) one = konst(xfill(uWidth(et)));
+            else if (et.isString()) one = konst(make(mkstr("").v, 0, 64, 0));
+            else one = konst(make(0, 0, uWidth(et), 0));
+            std::vector<E> parts((size_t)a.range.width(), one);
+            return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+        }
         std::vector<E> parts;
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
             const Type& ft = f.getType().getCanonicalType();
             int w = uWidth(ft);
-            if (ft.isUnpackedStruct()) parts.push_back(structDefault(ft));
+            if (ft.isUnpackedStruct() || ft.kind == SymbolKind::FixedSizeUnpackedArrayType) parts.push_back(structDefault(ft));
             else if (ft.isIntegral() && ft.isFourState()) parts.push_back(konst(xfill(w)));
             else if (ft.isString()) parts.push_back(konst(make(mkstr("").v, 0, 64, 0)));
             else parts.push_back(konst(make(0, 0, w, 0)));
@@ -4509,14 +4548,31 @@ struct Lowerer {
             fmt += escPct(std::string(f.name)) + ":";
             auto [off, w] = uField(t, f);
             E part = slice(v, off + w - 1, off);
-            const Type& ft = f.getType().getCanonicalType();
-            if (ft.isUnpackedStruct() || ft.isUnpackedUnion()) pfmtStruct(ft, part, fmt, out);
-            else if (ft.isString()) pfmtSingular(ft, un(Op::AsStr, part), fmt, out);
-            else if (ft.isFloating()) pfmtSingular(ft, un(Op::AsReal, part), fmt, out);
-            else pfmtSingular(ft, ft.isSigned() ? resize(part, w, false, true) : part, fmt, out);
+            pfmtBits(f.getType(), part, fmt, out);
             if (t.isUnpackedUnion()) break;
         }
         fmt += "}";
+    }
+    // A value held as the bits of an unpacked struct member (uWidth).
+    void pfmtBits(const slang::ast::Type& t0, E part, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        const Type& ft = t0.getCanonicalType();
+        int w = uWidth(ft);
+        if (ft.kind == SymbolKind::FixedSizeUnpackedArrayType) {   // '{e0, e1, ...}, the left element first
+            const auto& a = ft.as<FixedSizeUnpackedArrayType>();
+            int ew = uWidth(a.elementType), n = (int)a.range.width();
+            fmt += "'{";
+            for (int k = 0; k < n; k++) {
+                if (k) fmt += ", ";
+                int hi = w - 1 - k * ew;
+                pfmtBits(a.elementType, slice(part, hi, hi - ew + 1), fmt, out);
+            }
+            fmt += "}";
+        }
+        else if (ft.isUnpackedStruct() || ft.isUnpackedUnion()) pfmtStruct(ft, part, fmt, out);
+        else if (ft.isString()) pfmtSingular(ft, un(Op::AsStr, part), fmt, out);
+        else if (ft.isFloating()) pfmtSingular(ft, un(Op::AsReal, part), fmt, out);
+        else pfmtSingular(ft, ft.isSigned() ? resize(part, w, false, true) : part, fmt, out);
     }
     void pfmt(const slang::ast::Expression& a, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
