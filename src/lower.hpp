@@ -124,7 +124,9 @@ struct BlockIds {
 };
 inline BlockIds& blockIds() { static BlockIds b; return b; }
 // Bits a value of this type takes in a signal: a string is a 64-bit id (6.16).
-inline int storeW(const slang::ast::Type& t) { return t.isString() ? 64 : (int)t.getBitWidth(); }
+// A string is a 64-bit pool id; a shortreal is kept as a double, rounded to
+// single precision whenever a shortreal value is made (6.12).
+inline int storeW(const slang::ast::Type& t) { return t.isString() || t.isFloating() ? 64 : (int)t.getBitWidth(); }
 inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return r; }
 
 // name, width, and whether the signal is a net. A net starts at Z.
@@ -517,8 +519,17 @@ struct Lowerer {
         return -1;
     }
     E exprReal(const slang::ast::Expression& e) {
+        if (e.type->getBitWidth() == 32) {   // shortreal (6.12): computed as a real, then rounded
+            E r = exprReal64(e);
+            if (r->op == Op::FMath && r->hi == M_F32) return r;
+            auto m = node(Op::FMath, {r});
+            m->hi = M_F32;
+            return m;
+        }
+        return exprReal64(e);
+    }
+    E exprReal64(const slang::ast::Expression& e) {
         using namespace slang::ast;
-        if (e.type->getBitWidth() != 64) unsupported("shortreal");
         switch (e.kind) {
             case ExpressionKind::RealLiteral: return realK(e.as<RealLiteral>().getValue());
             case ExpressionKind::TimeLiteral: return realK(e.as<TimeLiteral>().getValue());
@@ -559,6 +570,7 @@ struct Lowerer {
                 if (n == "$realtime") { E t = node(Op::RealTime); t->k = mk(ticksPerUnit(), 64); return t; }
                 if (n == "$itor" && args.size() == 1) return un(Op::IToR, expr(*args[0]));
                 if (n == "$bitstoreal" && args.size() == 1) return un(Op::AsReal, expr(*args[0]));
+                if (n == "$bitstoshortreal" && args.size() == 1) return sysFnNode(SF_BITS2SR, {expr(*args[0])});
                 if (int id = mathId(n); id >= 0) {
                     std::vector<E> ks;
                     for (auto* a : args) ks.push_back(realOf(*a));
@@ -2020,6 +2032,7 @@ struct Lowerer {
         if (E r = enumMethod(call)) return r;
         auto args = call.arguments();
         auto a = [&](size_t i) { return expr(*args[i]); };
+        if (n == "$shortrealtobits" && args.size() == 1) return sysFnNode(SF_SR2BITS, {realOf(*args[0])});
         if (n == "$clog2" && args.size() == 1) return sysFnNode(SF_CLOG2, {a(0)});
         if (n == "$countones" && args.size() == 1) return sysFnNode(SF_COUNTBITS, {a(0)}, 2);
         if (n == "$countbits" && args.size() >= 2) return sysFnNode(SF_COUNTBITS, {a(0)}, countCtl(args.subspan(1)));
