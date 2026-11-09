@@ -176,6 +176,10 @@ struct RandItem {
     // call's result into the temporary that e reads. They run at solve time
     // once the rand variables they read have values.
     std::vector<std::shared_ptr<Prog>> fns;
+    // m[i] of a container of containers (7.5, 18.4): the indirect id the
+    // constraint uses for it, and the DynElemRef that names it, resolved at
+    // solve time with the loop indices of that moment.
+    std::vector<std::pair<int, E>> refs;
 };
 // A constraint block (18.5): its constraint_mode slot in the object.
 struct RandBlock {
@@ -193,6 +197,7 @@ struct RandVar {
     int off = 0, count = 1, w = 1, mode = -1;
     bool sgn = false, randc = false, obj = false;
     bool dyn = false;   // a dynamic array or queue: off is its container slot, w / sgn its elements'
+    int depth = 1;      // containers of containers (int m[][]): how many levels
 };
 struct RandSpec {
     std::vector<RandVar> vars;

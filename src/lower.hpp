@@ -2662,6 +2662,12 @@ struct Lowerer {
     int elemRef(int outer, E ref0) {
         DynObj shape = *dynShape(outer).elem;
         int tmp = fresh(64);
+        if (consDepth) {   // in a constraint: resolved at solve time (RandItem::refs)
+            int d = indThrough(tmp);
+            indShape[d] = std::move(shape);
+            consRefs.push_back({d, std::move(ref0)});
+            return d;
+        }
         Instr i; i.k = IK::Assign; i.sig = tmp; i.e = std::move(ref0);
         prog.emit(i);
         int d = indThrough(tmp);
@@ -4648,11 +4654,18 @@ struct Lowerer {
     // if-else bodies), as items.
     int consDepth = 0;   // > 0 while lowering constraints
     std::vector<std::shared_ptr<Prog>> consFns;   // function calls lowered in the current constraint (18.5.12)
+    std::vector<std::pair<int, E>> consRefs;      // m[i] containers named in the current constraint
     void constraintItems(const slang::ast::Constraint& c, E guard, std::vector<RandItem>& items, BeforeList& before) {
         consDepth++;
         struct Out { int& d; ~Out() { d--; } } out{consDepth};
-        size_t f0 = consFns.size(), i0 = items.size();
+        size_t f0 = consFns.size(), i0 = items.size(), r0 = consRefs.size();
         constraintItems1(c, guard, items, before);
+        // Containers named here go with every item this constraint made.
+        if (consRefs.size() > r0) {
+            for (size_t k = i0; k < items.size(); k++)
+                items[k].refs.insert(items[k].refs.end(), consRefs.begin() + (long)r0, consRefs.end());
+            consRefs.resize(r0);
+        }
         // Calls lowered here (in a guard or an expression) go with every item
         // this constraint made, after those of its parts.
         if (consFns.size() > f0) {
@@ -7970,7 +7983,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             }
                             rv.off = ps.off; rv.dyn = true;
                             et = &t.getArrayElementType()->getCanonicalType();
-                            if (Lowerer::isDynType(*et) || et->isUnpackedArray()) Lowerer::unsupported("rand array of arrays");
+                            while (Lowerer::isDynType(*et)) {   // int m[][] (7.5, 18.4): every level
+                                if (et->isAssociativeArray()) {
+                                    const auto* ix = et->as<AssociativeArrayType>().indexType;
+                                    if (!ix || !ix->getCanonicalType().isIntegral()) Lowerer::unsupported("rand associative array without an integral index");
+                                }
+                                rv.depth++;
+                                et = &et->getArrayElementType()->getCanonicalType();
+                            }
+                            if (et->isUnpackedArray()) Lowerer::unsupported("rand container of fixed-size arrays");
                         }
                         if (isHandleType(*et)) {
                             rv.obj = true; rv.w = 64;   // a dynamic array or queue of them too: each object
@@ -7983,6 +8004,18 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             RandItem loop;
                             loop.loopCont = lw.thisRel(rv.off);
                             loop.loopVar = lw.fresh(32);
+                            // Containers of containers: a loop per level, over m[i] then m[i][j].
+                            std::vector<RandItem> outer;
+                            for (int lv = 1; lv < rv.depth; lv++) {
+                                RandItem in;
+                                in.loopCont = Lowerer::indThrough(lw.fresh(64));
+                                in.loopVar = lw.fresh(32);
+                                auto r = node(Op::DynElemRef, {ref(loop.loopVar, true)});
+                                r->sig = loop.loopCont;
+                                in.refs.push_back({in.loopCont, r});
+                                outer.push_back(std::move(loop));
+                                loop = std::move(in);
+                            }
                             E any;
                             for (const auto& ev : et->as<EnumType>().values()) {
                                 const auto& cv = ev.getValue();
@@ -7993,7 +8026,16 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                                 E eq = bin(Op::Eq, g, konst(mk(u ? *u : 0, rv.w)));
                                 any = any ? bin(Op::LogOr, any, eq) : eq;
                             }
-                            if (any) { RandItem it; it.e = any; loop.body.push_back(std::move(it)); enumBlock->items.push_back(std::move(loop)); }
+                            if (any) {
+                                RandItem it; it.e = any; loop.body.push_back(std::move(it));
+                                while (!outer.empty()) {
+                                    RandItem up = std::move(outer.back());
+                                    outer.pop_back();
+                                    up.body.push_back(std::move(loop));
+                                    loop = std::move(up);
+                                }
+                                enumBlock->items.push_back(std::move(loop));
+                            }
                         } else if (et->isEnum()) {   // an enum takes only its named values (18.4)
                             for (int k = 0; k < rv.count; k++) {
                                 E any;
