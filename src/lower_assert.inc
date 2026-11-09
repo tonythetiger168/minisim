@@ -233,7 +233,7 @@ int shadowOf(int s) {
 E sampledE(const E& e) {
     if (!e) return e;
     if (e->op == Op::Ref) {
-        if (automaticSigs().count(e->sig)) return e;
+        if (isRel(e->sig) || automaticSigs().count(e->sig)) return e;   // automatic: read as it is
         auto c = std::make_shared<Expr>(*e);
         c->sig = shadowOf(e->sig);
         return c;
