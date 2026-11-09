@@ -4,9 +4,14 @@
 // is its own Prog. Call pushes a return address in that same coroutine, so a
 // #delay inside the callee suspends the process and keeps the address.
 #pragma once
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <queue>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -146,4 +151,131 @@ inline Instr waitInstr(const std::vector<std::pair<int, Edge>>& ev) {
     i.sig = ev[0].first;
     i.edge = ev[0].second;
     return i;
+}
+
+// ---- static combinational schedule ----
+// A process with this shape is pure combinational logic:
+//     Assign ... Assign ; WaitEdge (every event ANY) ; Jmp 0
+// i.e. a continuous assign, a gate, or a straight-line always_comb / always @*.
+// Such a process can run as a plain function, levelized like Verilator and
+// VCS do: the kernel keeps the functions in one topological order and, when a
+// signal changes, runs the dependent ones in that order once each, without a
+// coroutine, a waiter list, or an event per process. `ins` is the wait list
+// (exactly what the process would have waited on); `outs` are the signals it
+// assigns.
+struct CombShape {
+    std::vector<int> ins, outs;
+    size_t body = 0;  // number of leading Assign instructions
+};
+inline bool combShape(const Prog& p, CombShape& c) {
+    size_t n = p.code.size();
+    if (n < 3) return false;
+    const Instr& w = p.code[n - 2];
+    const Instr& j = p.code[n - 1];
+    if (j.k != IK::Jmp || j.target != 0 || w.k != IK::WaitEdge) return false;
+    if (!p.roots.empty()) return false;  // another process can `disable` it
+    c = CombShape{};
+    for (size_t i = 0; i + 2 < n; i++) {
+        if (p.code[i].k != IK::Assign) return false;
+        // A target chosen at run time (a[i] = ..., v[i] = ...) has no fixed output signal.
+        if (p.code[i].arr || !p.code[i].aidx.empty() || p.code[i].bidx) return false;
+        if (p.code[i].de || p.code[i].delay) return false;
+        bool seen = false;
+        for (int o : c.outs) seen |= o == p.code[i].sig;
+        if (!seen) c.outs.push_back(p.code[i].sig);
+    }
+    c.body = n - 2;
+    if (w.events.size() > 1) {
+        for (auto& [s, e] : w.events) {
+            if (e != ANY) return false;
+            c.ins.push_back(s);
+        }
+    } else {
+        if (w.edge != ANY) return false;
+        c.ins.push_back(w.sig);
+    }
+    return true;
+}
+// Topological order of the given combinational processes (indices into cs).
+// A process is never woken by its own writes (it is running, not waiting),
+// so a self-dependency is not an edge. Processes on a cycle, or fed by one,
+// are left out and stay ordinary event-driven processes.
+// The order is sorted by level (longest path from an input that no process
+// in the set drives), stable within a level, so ranks of one level never
+// feed each other and can be computed in parallel. `levels` (optional)
+// receives the level of each entry of the returned order.
+inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::vector<int>* levels = nullptr) {
+    size_t n = cs.size();
+    std::vector<std::vector<size_t>> succ(n);
+    std::vector<size_t> indeg(n, 0);
+    std::unordered_map<int, std::vector<size_t>> readers;  // signal -> processes waiting on it
+    for (size_t b = 0; b < n; b++)
+        for (int i : cs[b].ins) readers[i].push_back(b);
+    for (size_t a = 0; a < n; a++) {
+        std::vector<size_t> to;
+        for (int o : cs[a].outs) {
+            auto it = readers.find(o);
+            if (it == readers.end()) continue;
+            for (size_t b : it->second)
+                if (b != a) to.push_back(b);
+        }
+        std::sort(to.begin(), to.end());
+        to.erase(std::unique(to.begin(), to.end()), to.end());
+        for (size_t b : to) { succ[a].push_back(b); indeg[b]++; }
+    }
+    std::vector<size_t> order;
+    // Smallest index first among the ready ones keeps the order stable.
+    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> ready;
+    for (size_t i = 0; i < n; i++)
+        if (!indeg[i]) ready.push(i);
+    while (!ready.empty()) {
+        size_t a = ready.top();
+        ready.pop();
+        order.push_back(a);
+        for (size_t b : succ[a])
+            if (--indeg[b] == 0) ready.push(b);
+    }
+    std::vector<int> lv(n, 0);
+    for (size_t a : order)
+        for (size_t b : succ[a])
+            if (lv[b] < lv[a] + 1) lv[b] = lv[a] + 1;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return lv[a] < lv[b]; });
+    if (levels) {
+        levels->clear();
+        for (size_t a : order) levels->push_back(lv[a]);
+    }
+    return order;
+}
+
+// A clocked process that only schedules nonblocking assignments:
+//     WaitEdge (fixed events) ; { Nba | JmpIfNot | Jmp } ... ; Jmp 0
+// with every jump inside the body. Typical always @(posedge clk) RTL. It
+// reads signals and writes nothing until the NBA region, so all such
+// processes triggered in one slot can run at the same time.
+inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
+    size_t n = p.code.size();
+    if (n < 3) return false;
+    const Instr& w = p.code[0];
+    const Instr& j = p.code[n - 1];
+    if (w.k != IK::WaitEdge || j.k != IK::Jmp || j.target != 0) return false;
+    if (!p.roots.empty()) return false;  // another process can `disable` it
+    for (size_t i = 1; i + 1 < n; i++) {
+        const Instr& x = p.code[i];
+        if (x.k == IK::Nba) {
+            if (x.drv >= 0 || x.nbaLater || x.de || x.delay) return false;  // a <= #d b goes through the kernel
+        } else if (x.k == IK::JmpIfNot || x.k == IK::Jmp) {
+            if (x.target < 1 || x.target > n - 1) return false;
+        } else
+            return false;
+    }
+    ev.clear();
+    if (w.events.size() > 1) ev = w.events;
+    else ev.push_back({w.sig, w.edge});
+    return true;
+}
+
+// The NBA targets of a seqShape process that are fixed at compile time.
+inline void seqTargets(const Prog& p, std::vector<int>& out) {
+    for (const Instr& i : p.code)
+        if (i.k == IK::Nba && !i.arr && i.aidx.empty() && !i.bidx) out.push_back(i.sig);
 }
