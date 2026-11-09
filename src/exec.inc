@@ -340,6 +340,12 @@ struct ProcCtl {
     weak_ptr<ProcCtl> parent;
     vector<shared_ptr<ProcCtl>> kids;
     shared_ptr<JoinState> join;
+    // Deferred assertions (16.4.2): a resume after an event control is a
+    // flush point; it bumps `epoch`, and reports queued before it are dropped.
+    uint64_t epoch = 0;
+    // Written before the process starts: a deferred assertion action's
+    // captured arguments, written into their slots (16.4.1).
+    vector<pair<Expr*, Val>> init;
     bool kidsDone() const {
         for (auto& k : kids) if (!k->ended) return false;
         return true;
@@ -381,6 +387,100 @@ inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr)
 inline Task process(const Prog* p) { return startProc(p, make_shared<ProcCtl>(), nullptr); }
 inline Task exec(const Prog* p) { return process(p); }
 
+// ---- assertions (16.3, 16.4, 20.11) ----
+// An immediate assertion. Returns the next pc. A simple one picks its
+// action by jumping; a deferred one queues a report on this process with
+// the action's arguments evaluated now (16.4).
+static size_t runAssert(const Instr& i, const shared_ptr<ProcCtl>& ctl, size_t pc) {
+    AssertInfo& a = asserts()[i.sig];
+    if (!a.on) return i.join ? pc + 1 : i.hi;
+    bool ok = truth(eval(i.e, rd)) == 1;
+    a.evals++;
+    (ok ? a.passes : a.fails)++;
+    if (!i.join) {
+        if (ok) return a.passOn ? pc + 1 : i.hi;
+        return a.failOn ? i.target : i.hi;
+    }
+    if (ok ? (!a.pass || !a.passOn) : (!a.fail || !a.failOn)) return pc + 1;
+    DeferRep r{i.sig, ok, ctl, ctl->epoch, a.killGen, {}};
+    const auto& cap = ok ? a.passCap : a.failCap;
+    const auto& sl = ok ? a.passSlot : a.failSlot;
+    for (size_t k = 0; k < cap.size(); k++) r.caps.push_back({sl[k].get(), eval(cap[k], rd)});
+    (i.join == 2 ? S.defFin : S.defObs).push_back(std::move(r));
+    S.rare = true;
+    return pc + 1;
+}
+// Reports still standing when they mature: not flushed by their process
+// (a later flush point or a disable), and not killed by $assertkill.
+static bool reportLive(const DeferRep& r) {
+    return !r.ctl->killed && r.ctl->epoch == r.epoch && asserts()[r.id].killGen == r.killGen;
+}
+static Task startReport(DeferRep& r) {
+    const AssertInfo& a = asserts()[r.id];
+    auto c = make_shared<ProcCtl>();
+    c->init = std::move(r.caps);
+    return startProc(r.pass ? a.pass : a.fail, c);
+}
+// Observed region: concurrent assertions waiting here run, then observed
+// deferred reports mature and their actions go to the reactive region (16.4.1).
+void Sim::runObserved() {
+    region = R_OBSERVED;
+    while (!observedQ.empty()) {
+        Handle h = observedQ.front();
+        observedQ.pop_front();
+        if (!h.done()) h.resume();
+    }
+    vector<DeferRep> reps;
+    reps.swap(defObs);
+    for (auto& r : reps)
+        if (reportLive(r)) {
+            Task t = startReport(r);
+            all.push_back(t.h);
+            reactive.push_back(t.h);
+            rare = true;
+        }
+    region = R_ACTIVE;
+}
+// Postponed region: final deferred reports mature and their actions run now.
+void Sim::matureFinal() {
+    vector<DeferRep> reps;
+    reps.swap(defFin);
+    for (auto& r : reps)
+        if (reportLive(r)) {
+            Task t = startReport(r);
+            all.push_back(t.h);
+            t.h.resume();
+        }
+}
+// $assertcontrol and friends (20.11). args: control, assertion type,
+// directive type, levels; fmt: the target scopes and assertions, one per line.
+static void assertCtl(const Instr& i) {
+    int v[4];
+    for (int k = 0; k < 4; k++) v[k] = (int)v_to_i64(eval(i.args[k], rd));
+    vector<string> targets;
+    size_t b = 0;
+    while (b < i.fmt.size()) {
+        size_t e = i.fmt.find('\n', b);
+        if (e == string::npos) e = i.fmt.size();
+        if (e > b) targets.push_back(i.fmt.substr(b, e - b));
+        b = e + 1;
+    }
+    assertControl(v[0], v[1], v[2], v[3], targets);
+    if (v[0] == AC_KILL)   // pending deferred reports of killed assertions are flushed
+        for (auto* q : {&S.defObs, &S.defFin})
+            std::erase_if(*q, [](const DeferRep& r) { return asserts()[r.id].killGen != r.killGen; });
+}
+// A sample clock (sva.hpp): marks the slots where it ticks.
+inline Task sampleClockProc(int c) {
+    const auto* ev = &S.sclocks[c].ev;
+    for (;;) {
+        if (ev->size() > 1) co_await WaitAny{ev};
+        else co_await Wait{(*ev)[0].first, (*ev)[0].second};
+        if (std::find(S.ticked.begin(), S.ticked.end(), c) == S.ticked.end()) S.ticked.push_back(c);
+        S.rare = true;
+    }
+}
+
 // A wait on signals named by relative ids (automatic variables): the ids
 // are resolved when the wait starts.
 static vector<pair<int, Edge>> resolveEvents(const Instr& i) {
@@ -416,6 +516,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         pc = f.pc;
         if (f.fr != fr) { lastRet = std::move(fr); fr = std::move(f.fr); }
     };
+    for (auto& [slot, v] : ctl->init) slot->k = v;
     while (p) {
         g_fr = fr.get();
         g_ret = lastRet.get();
@@ -481,6 +582,7 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     else co_await Wait{evbuf[0].first, evbuf[0].second};
                 } else if (i.events.size() > 1) co_await WaitAny{&i.events};
                 else co_await Wait{i.sig, i.edge};
+                ctl->epoch++;   // a deferred assertion flush point (16.4.2)
                 pc++; break;
             case IK::WaitDelay: {
                 uint64_t d = i.delay;
@@ -575,6 +677,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 ctl->kids.clear();
                 pc++;
                 break;
+            case IK::Assert: pc = runAssert(i, ctl, pc); break;
+            case IK::AssertCtl: assertCtl(i); pc++; break;
             case IK::Ret:
                 if (rets.empty()) goto done;
                 ret();

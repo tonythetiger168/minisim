@@ -16,7 +16,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 
 | Clause | Topic | Status | Notes / test |
 |---|---|---|---|
-| 4.4–4.9 | Scheduling regions | ✅ | active, inactive (`#0`), NBA, postponed. `4.9.4-nba-strobe` |
+| 4.4–4.9 | Scheduling regions | ✅ | preponed (sampled values), active, inactive (`#0`), NBA, observed, reactive, re-inactive, re-NBA, postponed; once the reactive set starts it runs until it is empty (4.5). Programs, which also run in the reactive set, are not supported yet (24). `4.9.4-nba-strobe`, `16.4-observed-final` |
 | 5.7.1 | Integer literals | ✅ | sized, unsized, x/z digits, signed (`'s`), and `'0` `'1` `'x` `'z` in any context. `5.7.1-unbased-unsized` |
 | 5.9 | String literals | 🟡 | up to 8 characters (64 bits). `5.9-string-literal` |
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |
@@ -78,7 +78,10 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 12.8 | break, continue, return | ✅ | |
 | 13 | Tasks and functions | 🟡 | module scope. Automatic tasks, and automatic functions that recurse or fork, run each call in its own frame (13.3.2, 13.4.2): recursion, overlapping calls from several processes. An automatic local starts at its default on every call (6.21). Not yet: `ref`, DPI, arrays or containers as arguments of an automatic task. `13.4-function-automatic`, `6.21-recursion`, `13.3.2-automatic-tasks`, `13.4.2-recursive-task` |
 | 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. `wait_order` with pass and fail actions (15.5.4). Not yet: event aliasing (`e1 = e2`). `15.5-events`, `15.5.3-triggered`, `15.5.4-wait-order` |
-| 16 | Assertions | ❌ | immediate and concurrent |
+| 16.3 | Immediate assertions | ✅ | `assert`, `assume`, `cover` with pass and fail actions; an assert or assume with no `else` calls `$error`, named by its label (`top.a1`). `16.3-immediate-assertions` |
+| 16.4 | Deferred assertions | ✅ | `#0` (observed) and `final`, in procedures and as module items (an implied `always_comb`, 16.4.3). Reports wait on a per-process queue; a resume after an event control, or a `disable`, flushes it (16.4.2). Action arguments are evaluated when the assertion runs; observed actions run in the reactive region, final ones in the postponed region. `16.4-deferred-assertions`, `16.4.2-deferred-flush`, `16.4-observed-final` |
+| 16.5.1, 16.9.3 | Sampled values, sampled value functions | ✅ | `$sampled`, `$rose`, `$fell`, `$stable`, `$changed`, `$past(e, n, gate, clk)`. The clock is the explicit one, else the procedure's leading event control (16.14.6), else the default clocking. Values at time 0 are the default sampled values; automatic variables are read as they are. Not yet: the global clocking functions (16.9.4). `20.12-sampled-values`, `16.9.3-past` |
+| 16.5–16.18 | Concurrent assertions | ❌ | sequences, properties, `assert property` |
 | 18 | Randomization (constraints) | ❌ | classes, `randomize()`, `std::randomize`, randcase, randsequence |
 | 18.13 | $urandom, $urandom_range | ✅ | one deterministic stream per run, seeded by `-seed <n>` or `+ntb_random_seed=<n>` (the generator is implementation-defined). `18.13-random-functions` |
 | 20.3 | $time, $stime, $realtime | 🟡 | in the calling module's time unit, rounded. `$realtime` is a real. `20.3-time` |
@@ -86,6 +89,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 20.4 | $timeformat, $printtimescale | ✅ | `%t` prints in the `$timeformat` units, precision, suffix and width; the default is the simulation precision, width 20. `$printtimescale` with no argument, `$root`, or an instance. `20.4-timeformat`, `20.4-printtimescale` |
 | 20.8.1 | $clog2 | ✅ | `20.8-clog2` |
 | 20.9 | Bit vector functions | ✅ | `$countones`, `$countbits`, `$onehot`, `$onehot0`, `$isunknown`. `20.9-bit-vector-functions` |
+| 20.11 | Assertion control | ✅ | `$asserton`, `$assertoff`, `$assertkill`, `$assertpasson/off`, `$assertfailon/off`, `$assertnonvacuouson`, `$assertvacuousoff`, `$assertcontrol` with control, assertion and directive types, levels, scopes and assertion names, lock and unlock. Not yet: control of unique/priority violation reports. `20.11-assertion-control` |
 | 20.10 | Severity tasks | ✅ | `$fatal` / `$error` / `$warning` / `$info` print the severity, file, line, scope and time, then the message; `$fatal` ends the run with exit status 1. `20.10-severity-tasks` |
 | 20.14 | $random, $dist_uniform | ✅ | the Annex N algorithm, so a seed gives the same values as other simulators. Not yet: the other `$dist_*` functions. `20.14-distribution` |
 | 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m %f %e %g %p, `%0`, widths, `%-8d`, `%.3f`. `%m` is the scope of the call. `21.2.1-display-formats` |
@@ -115,7 +119,7 @@ In order of how often typical testbenches hit them:
 1. ~~Unpacked arrays and memories (7.4), `foreach` (12.7.3), `$readmemh` (21.4)~~ done
 2. ~~Generate blocks (27), `+:` / `-:` part-selects (11.5.1)~~ done; values wider than 64 bits next
 3. ~~`` `timescale `` (22.7), delay expressions (9.4.1), named events (15.5), disable / wait fork (9.6), final (9.2.3)~~ done
-4. ~~`$urandom` (18.13)~~ done; immediate assertions (16.3)
+4. ~~`$urandom` (18.13), immediate and deferred assertions (16.3, 16.4)~~ done; concurrent assertions (16.5) next
 5. ~~Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2), real (6.12), string (6.16)~~ done
 6. ~~Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8)~~ done; unpacked structs (7.2) next
 

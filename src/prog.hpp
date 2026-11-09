@@ -46,6 +46,12 @@ enum class IK {
     WaitFork,   // wait until every child process of this one has ended (9.6.1)
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
+    // An immediate assertion (16.3, 16.4) of asserts()[sig] on condition e.
+    // join 0, simple: pass falls through to the pass action, a fail jumps to
+    // target, and an assertion that is off or whose action is off jumps to hi.
+    // join 1 (#0) or 2 (final), deferred: queue a report and go on.
+    Assert,
+    AssertCtl,  // $assertcontrol (20.11): args are control, assertion and directive type, levels; fmt the targets
     Ret         // pop that address; an empty stack ends the process
 };
 

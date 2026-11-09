@@ -193,7 +193,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
-                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
+                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
+                    : !asserts().empty() ? "an assertion"
+                    : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -534,6 +536,12 @@ int main(int argc, char** argv) {
         if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
         else S.spawn(process(&lowered.procs[i].prog));
     }
+    // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
+    // the start of a slot, which the static partitions do not keep current.
+    S.shadows = shadowPairs();
+    S.sclocks = sampleClocks();
+    for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
+    if (!S.shadows.empty() || !asserts().empty()) staticPart = false;
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
         std::vector<int> pt;
