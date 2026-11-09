@@ -36,10 +36,11 @@ pipeline {
         // mregress exits 1 when a test fails unexpectedly (an @xfail known gap
         // does not count), so the stage goes red on a real failure. A known gap
         // is written to junit.xml as skipped, so Jenkins shows it as skipped.
-        sh '''
-          mregress "$TESTS" -sim msim -j "$(nproc)" -seeds "$SEEDS" \
-                   -o "$OUT" ${COVERAGE:+-cov}
-        '''
+        // -cov needs a minisim with mcov; drop it if you only want results.
+        sh """
+          mregress '${params.TESTS}' -sim msim -j "\$(nproc)" -seeds '${params.SEEDS}' \
+                   -o "\$OUT"${params.COVERAGE ? ' -cov' : ''}
+        """
       }
     }
   }
@@ -68,7 +69,7 @@ pipeline {
     unstable {
       // A failed regression: repeat only the failures, so the log of the next
       // build holds just them.
-      sh "mregress \"$TESTS\" -o \"$OUT\" -rerun || true"
+      sh "mregress '${params.TESTS}' -o \$OUT -rerun || true"
     }
   }
 }
