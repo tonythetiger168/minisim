@@ -494,7 +494,9 @@ struct Deriv {
             }
             case IMPL: {
                 const Node* r = d(k[0]);
-                const Node* later = r->k == NUL ? st.ptrue() : st.impl(r, k[1], n->flags & NONOVERLAP);
+                // No later match: an antecedent that can only end now (EMPTY) has no more.
+                bool over = r->k == NUL || r->k == EMPTY || (r->k == ENV && r->kids[0]->k == EMPTY);
+                const Node* later = over ? st.ptrue() : st.impl(r, k[1], n->flags & NONOVERLAP);
                 if (!r->nullable) return later;
                 nonvac = true;
                 // s |=> p is s ##1 1 |-> p: with no later tick there is no match (16.12.7).
@@ -652,6 +654,12 @@ struct ConcAssert {
     struct Item { int k = -1; E rhs; const Prog* call = nullptr; std::vector<E> caps, slots; };
     std::vector<int> localSig;
     std::vector<std::vector<Item>> acts;
+    // A sequence's end point tracker (16.13.6): at a tick where the sequence
+    // matches, endSig (a count, for @(s)) and endSig + 1 (the time + 1, for
+    // .triggered) are set, and so is each flag in matchFlags (.matched).
+    int endSig = -1;
+    std::vector<int> matchFlags;
+    std::vector<int> clearFlags;   // .matched flags this assertion reads: cleared after each of its ticks
 };
 inline std::vector<ConcAssert>& concAsserts() { static std::vector<ConcAssert> v; return v; }
 inline std::vector<int>& concPending() { static std::vector<int> v; return v; }   // procedural ones with pending instances
