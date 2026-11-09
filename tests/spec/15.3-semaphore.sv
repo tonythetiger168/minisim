@@ -1,5 +1,4 @@
 // IEEE 1800-2023 15.3: A semaphore: new, get, put, try_get (15.3).
-//! xfail: semaphores are errors
 //! icarus-skip: Icarus 13 does not support semaphores
 module top;
   semaphore s;
