@@ -48,6 +48,18 @@ enum class IK {
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
     Udp,        // a user-defined primitive (29): udp's table, inputs in args, state `sig`, last inputs `dres`
     Tran,       // bidirectional switch `sig` (28.8): its control is e (null: always on), active low if pdown
+    // An immediate assertion (16.3, 16.4) of asserts()[sig] on condition e.
+    // join 0, simple: pass falls through to the pass action, a fail jumps to
+    // target, and an assertion that is off or whose action is off jumps to hi.
+    // join 1 (#0) or 2 (final), deferred: queue a report and go on.
+    Assert,
+    // ##n (14.11): wait for n events of clockings()[dkey] (its event is
+    // signal sig); ##0 waits only if that event has not happened in this step.
+    CycleWait,
+    // A synchronous drive (14.16): bits [hi:lo] of clockvar sig, output dres
+    // of clockings()[dkey], take e at the clocking event `de` cycles on.
+    CbDrive,
+    AssertCtl,  // $assertcontrol (20.11): args are control, assertion and directive type, levels; fmt the targets
     Ret         // pop that address; an empty stack ends the process
 };
 
@@ -203,6 +215,30 @@ inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
     std::vector<std::pair<int, Edge>> ev;
     for (int s : sigs) ev.push_back({s, ANY});
     return ev;
+}
+// Signals a process (or a subroutine it calls) writes whole: an assignment
+// without a part select, or any element of an array written at a run-time
+// index. always_comb leaves these out of its sensitivity (9.2.2.2.1 b).
+inline void collectProgWrites(const Prog& p, std::unordered_set<int>& out, std::vector<const Prog*>& seen) {
+    for (const Prog* s : seen)
+        if (s == &p) return;
+    seen.push_back(&p);
+    for (auto& i : p.code) {
+        if ((i.k == IK::Assign || i.k == IK::Nba) && i.sig >= 0 && i.drv < 0 && i.dyn < 0) {
+            if (i.arr) for (int k = 0; k < i.arr->count; k++) out.insert(i.arr->base + k);
+            else if (i.hi < 0 && !i.bidx) out.insert(i.sig);
+        }
+        if (i.k == IK::Call && i.callee) collectProgWrites(*i.callee, out, seen);
+        for (const Prog* b : i.branches) collectProgWrites(*b, out, seen);
+    }
+}
+inline std::vector<std::pair<int, Edge>> combReadSet(const Prog& p) {
+    auto rs = readSet(p);
+    std::unordered_set<int> wr;
+    std::vector<const Prog*> seen;
+    collectProgWrites(p, wr, seen);
+    std::erase_if(rs, [&](const std::pair<int, Edge>& e) { return wr.count(e.first) > 0; });
+    return rs;
 }
 // A WaitEdge on one or more events (ev must be non-empty).
 inline Instr waitInstr(const std::vector<std::pair<int, Edge>>& ev) {

@@ -1,6 +1,5 @@
 // IEEE 1800-2023 20.12: $rose, $fell, $stable, $past use values sampled at
 // the clock (20.12).
-//! xfail: sampled value functions are errors
 //! icarus-skip: Icarus 13 does not support sampled value functions
 module top;
   logic clk = 0, a = 0;
