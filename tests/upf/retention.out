@@ -1,0 +1,6 @@
+43 running: a=4/4 b=8/4 c=12/4
+55 saved: a=4/5 b=8/4 c=12/5
+65 off: a=x/x b=x/x c=x/x
+76 power up: a=4/x b=x/x c=x/x
+78 b restored: a=4/x b=8/x c=x/x
+98 running again: a=6/x b=14/x c=x/x

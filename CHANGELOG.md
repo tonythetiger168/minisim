@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
+  (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
+  sets, power switches, isolation, level-shifter and retention strategies,
+  power states and legacy PSTs; powered-off logic stops and is corrupted,
+  isolation clamps, retention saves and restores, illegal power states and
+  PST violations are reported. Package `UPF` (`supply_on`, `supply_off`,
+  `set_power_state`, `get_supply_value`, ...) is added for the testbench.
+  `mlint -upf` checks the power intent: UPF001 to UPF006. See
+  `docs/LOWPOWER.md`.
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
