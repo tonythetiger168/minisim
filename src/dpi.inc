@@ -19,9 +19,10 @@
 
 namespace dpi {
 
-// An open array argument (35.5.6.1) as C sees it: the elements in C layout,
-// leftmost unpacked dimension outermost, each dimension running from its
-// left bound to its right bound.
+// An unpacked array argument (35.5.6.1, H.7.6) as C sees it: the elements
+// in C layout, row-major, and in each dimension the lowest index first.
+// dims are the formal's view: an open dimension has the actual's range, a
+// sized one the formal's.
 struct OpenArr {
     char* data = nullptr;
     size_t elemSize = 0, count = 0;
@@ -34,7 +35,7 @@ struct OpenArr {
         for (size_t d = 0; d < dims.size(); d++) {
             auto [l, r] = dims[d];
             int64_t n = (l > r ? l - r : r - l) + 1;
-            int64_t o = l <= r ? idx[d] - l : l - idx[d];
+            int64_t o = idx[d] - std::min(l, r);
             if (o < 0 || o >= n) return -1;
             off = off * n + o;
         }
@@ -230,35 +231,56 @@ struct ArrBuf {
     OpenArr oa;
     std::vector<char> bytes;
 };
-inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::vector<std::string>& strs) {
+// C element k of the buffer is actual element map[k] (a flat offset in the
+// actual's own order: row-major, each dimension from its left bound).
+inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::vector<std::string>& strs,
+                  std::vector<size_t>& map) {
     b.oa.t = f.t;
     b.oa.w = f.w;
     b.oa.elemSize = elemBytes(f.t, f.w);
     std::vector<Val> vals;
+    std::vector<std::pair<int64_t, int64_t>> act;
     if (a.arr) {
-        b.oa.dims = a.arr->dims;
-        b.oa.count = (size_t)a.arr->count;
+        act = a.arr->dims;
         for (int k = 0; k < a.arr->count; k++) vals.push_back(S.get(a.arr->base + k));
     } else {
-        auto& d = dynStore()[a.dyn];
-        vals = d.vec;
-        b.oa.count = vals.size();
-        b.oa.dims = {{0, (int64_t)vals.size() - 1}};
+        vals = dynStore()[a.dyn].vec;
+        act = {{0, (int64_t)vals.size() - 1}};
+    }
+    b.oa.dims.clear();
+    for (size_t d = 0; d < act.size(); d++) {
+        bool open = d >= f.uopen.size() || f.uopen[d];
+        b.oa.dims.push_back(open ? act[d] : f.udims[d]);
+    }
+    b.oa.count = vals.size();
+    map.assign(vals.size(), 0);
+    for (size_t c = 0; c < vals.size(); c++) {   // C order -> the actual's order
+        size_t rem = c, flat = 0, mul = 1;
+        for (size_t d = b.oa.dims.size(); d-- > 0;) {
+            auto [l, r] = b.oa.dims[d];
+            size_t n = (size_t)((l > r ? l - r : r - l) + 1);
+            size_t cd = rem % n;
+            rem /= n;
+            size_t o = l > r ? n - 1 - cd : cd;   // offset from the left bound
+            flat += o * mul;
+            mul *= n;
+        }
+        map[c] = flat < vals.size() ? flat : 0;
     }
     b.bytes.assign(b.oa.count * b.oa.elemSize + 8, 0);
     b.oa.data = b.bytes.data();
     if (f.t == DT_STRING) strs.reserve(strs.size() + vals.size());
-    for (size_t k = 0; k < vals.size(); k++) toC(b.oa.data + k * b.oa.elemSize, f.t, f.w, vals[k], strs);
+    for (size_t k = 0; k < vals.size(); k++) toC(b.oa.data + k * b.oa.elemSize, f.t, f.w, vals[map[k]], strs);
 }
-inline void arrOut(const ArrBuf& b, const DpiArg& f, const DpiActual& a) {
+inline void arrOut(const ArrBuf& b, const DpiArg& f, const DpiActual& a, const std::vector<size_t>& map) {
     for (size_t k = 0; k < b.oa.count; k++) {
         Val v = fromC(b.oa.data + k * b.oa.elemSize, f.t, f.w, f.sgn);
         if (a.arr) {
             if (a.arr->twoState) { v.x = 0; v.z = 0; for (auto& h : v.hi) { h.x = h.z = 0; } }
-            S.set(a.arr->base + (int)k, v);
+            S.set(a.arr->base + (int)map[k], v);
         } else {
             auto& d = dynStore()[a.dyn];
-            if (k < d.vec.size()) d.vec[k] = v;
+            if (map[k] < d.vec.size()) d.vec[map[k]] = v;
         }
     }
     if (!a.arr) dynBump(a.dyn);
@@ -275,6 +297,7 @@ inline void invoke(const Instr& ins) {
     struct Slot { alignas(16) unsigned char val[16]; void* ptr; std::vector<unsigned char> vec; };
     std::vector<Slot> slots(n);
     std::vector<ArrBuf> arrs(n);
+    std::vector<std::vector<size_t>> maps(n);
     std::vector<void*> argv(n);
     std::vector<std::string> strs;
     strs.reserve(2 * n + 1);
@@ -283,7 +306,7 @@ inline void invoke(const Instr& ins) {
         Slot& s = slots[k];
         memset(s.val, 0, sizeof s.val);
         if (a.uarr) {
-            arrIn(arrs[k], a, ins.dact[k], strs);
+            arrIn(arrs[k], a, ins.dact[k], strs, maps[k]);
             s.ptr = a.open ? (void*)&arrs[k].oa : (void*)arrs[k].oa.data;
             argv[k] = &s.ptr;
             continue;
@@ -314,7 +337,7 @@ inline void invoke(const Instr& ins) {
     for (size_t k = 0; k < n; k++) {
         const DpiArg& a = f.args[k];
         if (a.dir == 0) continue;
-        if (a.uarr) { arrOut(arrs[k], a, ins.dact[k]); continue; }
+        if (a.uarr) { arrOut(arrs[k], a, ins.dact[k], maps[k]); continue; }
         const void* p = (a.t == DT_BITVEC || a.t == DT_LOGICVEC) ? (const void*)slots[k].vec.data() : (const void*)slots[k].val;
         S.set(a.sig, fromC(p, a.t, a.w, a.sgn));
     }
@@ -658,8 +681,13 @@ void svAckDisabledState(void) { if (dpi::st().fiber) dpi::st().fiber->acked = tr
 namespace dpi {
 
 // ---- set-up: libraries, symbols, export stubs ----
-inline std::string cType(DpiType t, bool ptr, bool isConst) {
+inline std::string cType(DpiType t, bool ptr, bool isConst, bool sgn = true) {
     std::string b;
+    // byte unsigned is unsigned char, and so on (H.7.4)
+    if (!sgn && (t == DT_BYTE || t == DT_SHORT || t == DT_INT || t == DT_LONG)) {
+        b = t == DT_BYTE ? "unsigned char" : t == DT_SHORT ? "unsigned short" : t == DT_INT ? "unsigned int" : "unsigned long long";
+        return ptr ? std::string(isConst ? "const " : "") + b + "*" : b;
+    }
     switch (t) {
         case DT_VOID: return "void";
         case DT_BYTE: b = "char"; break;
@@ -682,11 +710,11 @@ inline std::string cType(DpiType t, bool ptr, bool isConst) {
 // and what an export stub defines.
 inline std::string cArgType(const DpiArg& a) {
     if (a.uarr && a.open) return a.dir == 0 ? "const svOpenArrayHandle" : "svOpenArrayHandle";
-    if (a.uarr) return cType(a.t, true, a.dir == 0);
-    if (a.dir == 0) return cType(a.t, false, true);
-    return cType(a.t, true, false);
+    if (a.uarr) return a.t == DT_STRING ? "const char**" : cType(a.t, true, a.dir == 0, a.sgn);
+    if (a.dir == 0) return cType(a.t, false, true, a.sgn);
+    return cType(a.t, true, false, a.sgn);
 }
-inline std::string cRetType(const DpiFunc& f) { return f.task ? "int" : cType(f.ret, false, true); }
+inline std::string cRetType(const DpiFunc& f) { return f.task ? "int" : cType(f.ret, false, true, f.retSgn); }
 inline std::string prototype(const DpiFunc& f) {
     std::string s = cRetType(f) + " " + f.cName + "(";
     for (size_t k = 0; k < f.args.size(); k++) {

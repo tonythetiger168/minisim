@@ -3466,11 +3466,13 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     const auto& o = t->as<DPIOpenArrayType>();
                     if (o.isPacked) Lowerer::unsupported("DPI packed open array argument (bit [])");
                     a.open = true;
-                    a.udims.push_back({0, -1});
+                    a.udims.push_back({0, 0});
+                    a.uopen.push_back(true);
                     t = &o.elementType.getCanonicalType();
                 } else {
                     const auto& ft = t->as<FixedSizeUnpackedArrayType>();
                     a.udims.push_back({ft.range.left, ft.range.right});
+                    a.uopen.push_back(false);
                     t = &ft.elementType.getCanonicalType();
                 }
                 a.uarr = true;

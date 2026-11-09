@@ -2,7 +2,7 @@
 // array of any size, fixed or dynamic; C reads its shape with svLeft, svRight,
 // svLow, svHigh, svIncrement, svSize and svDimensions and its elements with
 // svGetArrElemPtr and the element copy functions (H.12). A sized array formal
-// is a plain C array (35.5.6).
+// is a plain C array with its lowest index first (35.5.6, H.7.6).
 //! args: data/dpi/arrays.c
 //! icarus-skip: Icarus 13 does not support DPI
 module top;
@@ -15,6 +15,9 @@ module top;
   import "DPI-C" function int dot4(input int a[4], input int b[4]);
   import "DPI-C" function void iota4(output int a[4]);
   import "DPI-C" function int total_len(input string s[]);
+  import "DPI-C" first_c = function int first_up(input int a[0:3]);
+  import "DPI-C" first_c = function int first_down(input int a[3:0]);
+  import "DPI-C" function int first_raw(input int a[]);
 
   int up[0:3] = '{1, 2, 3, 4};
   int down[7:5] = '{10, 20, 30};
@@ -52,6 +55,8 @@ module top;
     $display("%0d %0d", a4[0], a4[3]);
     names = '{"ab", "cde", ""};
     $display("%0d", total_len(names));
+    // H.7.6: element 0 in C is the formal's lowest index; up[0:3] = 1 2 3 4
+    $display("%0d %0d %0d %0d", first_up(up), first_down(up), first_raw(up), first_raw(down));
   end
 endmodule
 
@@ -68,3 +73,4 @@ endmodule
 //> 70
 //> 100 103
 //> 5
+//> 1 4 1 30

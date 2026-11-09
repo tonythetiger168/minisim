@@ -57,3 +57,6 @@ int total_len(const svOpenArrayHandle h) {
     }
     return n;
 }
+/* layout (H.7.6): C index 0 is the lowest SV index of each dimension */
+int first_c(const int* a) { return a[0]; }
+int first_raw(const svOpenArrayHandle h) { return *(const int*)svGetArrayPtr(h); }

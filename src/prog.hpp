@@ -86,6 +86,8 @@ struct DpiArg {
     // dimension `[]` (35.5.6.1) has open = true, and C gets an svOpenArrayHandle.
     bool uarr = false, open = false;
     std::vector<std::pair<int64_t, int64_t>> udims;
+    std::vector<bool> uopen;   // per dimension: open
+
     std::string name;
 };
 // One DPI import or export. An import is called by IK::Dpi; an export is an
