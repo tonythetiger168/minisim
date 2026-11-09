@@ -1,0 +1,5 @@
+// IEEE 1800-2023 33.6: file lib.map
+library rtlLib top.v;
+library aLib adder.*;
+library gateLib
+      adder.vg;

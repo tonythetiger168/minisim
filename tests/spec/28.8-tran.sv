@@ -1,6 +1,5 @@
 // IEEE 1800-2023 28.8: A bidirectional pass switch connects two nets
 // (28.8).
-//! xfail: tran switches are errors
 module top;
   logic d = 1, en = 1;
   wire a, b, c;

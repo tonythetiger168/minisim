@@ -17,6 +17,140 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
+  library from `$UVM_HOME` with its C code, so regular expressions, the full
+  command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
+  access (`uvm_hdl_*`, register backdoor reads and writes) work.
+  `uvm/uvm_dpi_minisim.cc` builds uvm-core's `src/dpi` with a backdoor over
+  plain VPI.
+- VPI: `vpi_put_value` with `vpiForceFlag` and `vpiReleaseFlag` (38.35);
+  `tf_dofinish` / `tf_dostop` (`veriuser.h`) and `sv_vpi_user.h`; VPI calls
+  from DPI context imports (35.5.3).
+- Specify paths to outputs declared as variables (30.4): the port
+  connection takes the path delay.
+- Two cells with one name in one library are a warning, and the last one is
+  used (33.3.1.1). VPI `vpiLibrary`, `vpiCell` and `vpiConfig` (33.7).
+- Pulse filtering at path outputs (30.7): `PATHPULSE$` limits, `+pulse_r/N`
+  and `+pulse_e/N`, pulses to x, pulse styles (`pulsestyle_ondetect`,
+  `showcancelled` and the `+pulse_on_detect` / `+showcancelled` options).
+  Path delays now combine with gate and net delays inside the module by
+  taking the larger (30.6).
+- SDF: pulse limits (`((d) (r) (e))`, PATHPULSE, PATHPULSEPERCENT, 32.7),
+  DEVICE on gates and UDPs, INTERCONNECT from one source of a net with
+  several sources (32.4.4, 32.5), and SCOND / CCOND.
+- UVM (IEEE 1800.2-2020): the Accellera UVM library (uvm-core 2020.3.1)
+  compiles and runs with `+define+UVM_NO_DPI` (see `docs/UVM.md`): run_test,
+  the factory and overrides, phases and objections, sequences, sequencers and
+  drivers, TLM ports and FIFOs, analysis ports, `uvm_config_db`, field
+  macros (print, clone, compare, pack), report catchers. `tests/uvm` runs
+  three testbenches in CI.
+- Language features that UVM needs: containers of containers
+  (`int q[string][$]`, `bit m[C][C]`, foreach over several of their
+  dimensions), class-handle, packed-struct and wide associative array keys,
+  struct elements and writes to part of an element (`q[i][3:0] = v`,
+  `aa[k].f = v`), unpacked structs in classes and automatic variables,
+  functions that return queues and associative arrays, static containers in
+  functions, `==` / `!=` on whole containers, string indexing (`s[i]`,
+  `s[i] = c`, `foreach (s[i])`), `{n{s}}` with a run-time `n`, string
+  parameters, `{>>{q}}` of a string queue, `{<<bit{q}} = v` into a dynamic
+  array, a stream as the source of a streaming assignment, `inside` on
+  strings and handles, `wait (0)`, `%p` of class handles.
+- A run-time error (null object access, a crash) names the statement that
+  was running; `MSIM_CALLTRACE=1` prints every method and automatic
+  subroutine call.
+
+### Fixed
+- A signed member of an unpacked struct (`int`, `byte`) read as unsigned, so
+  `s.f < 0` was false for a negative member (7.2).
+- `super.f()` with a comment just before `super` called the override (and
+  recursed) instead of the base method.
+- An extern method that overrides a pure virtual method, or a virtual
+  method without repeating `virtual`, did not get its vtable slot.
+- A default argument that calls a method (`trigger(T d = get_default())`)
+  called it on the caller's object instead of the callee's.
+- A static property read by another static initializer before its own
+  initializer ran was x; defaults (null, 0) are now set before any
+  initializer.
+- `&&`, `||` and `?:` evaluated the operand they skip, so
+  `h != null && h.q.exists(k)` failed on a null `h`.
+- A fork in a class method lost `this`.
+- `wait (cond)` on automatic variables inside a subroutine could be turned
+  into an `@*` wait.
+- A process still waiting at the end of the simulation could corrupt the
+  heap when it was freed.
+- Virtual prototypes: `msim -mvp` adds an AXI4-Lite bridge (`mvp_axil_slave`,
+  `mvp_irq_slave`, `mvp_clock`) from the design to models written in C, C++ or
+  SystemC/TLM-2.0, with a memory map, 32 interrupt lines, timed callbacks and
+  a master path for a model that drives the bus itself (`include/mvp.h`,
+  `mvp_tlm.h`). A memory and a 16550-style UART are bundled in `mvp/models/`.
+  See `docs/VPROTO.md`.
+- SDF back-annotation (32): `$sdf_annotate` and `msim -sdf` read SDF 3.0
+  files and annotate specify paths (IOPATH, COND, CONDELSE, DEVICE),
+  interconnect delays (PORT, NETDELAY, INTERCONNECT), timing check limits
+  (Table 32-2) and specparams (LABEL), with ABSOLUTE / INCREMENT, min:typ:max
+  selection, scale factors, a config file and a log file. `+mindelays`,
+  `+typdelays` and `+maxdelays` pick from min:typ:max (11.11).
+- Specify path delays pick the delay of the paths whose input changed last
+  and whose condition holds (30.5.3), so paths to one output may differ;
+  6- and 12-value path delays (30.5.1, 30.5.2).
+- Configurations and libraries (33): `msim -libmap`, configs as the top
+  (with or without `-top`), library tops, `-L`, and `%l` / `%L`.
+- Spec tests can pass msim arguments with a `//! args:` line.
+- `%p` of containers of unpacked structs, unions, enums and packed structs
+  (21.2.1.6), at any nesting depth.
+- Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
+  `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
+  Negative `$setuphold` / `$recrem` limits with delayed signals under
+  `+neg_tchk` (31.9).
+- Checkers (17): formals and defaults, `$inferred_clock`, outputs, assertions,
+  `always_ff` on sampled values, checker variables and free variables, all
+  in the reactive region set. Before this, checker instances were ignored.
+- Programs (24): program code runs in the reactive region set, programs end
+  with an implicit `$finish`, `$exit`, nested and anonymous programs.
+- Gate-level switches (28): `bufif0/1`, `notif0/1` with L/H strength
+  resolution, `nmos`/`pmos`/`cmos` and their resistive forms, and the
+  bidirectional `tran`/`rtran`/`tranif0/1`/`rtranif0/1`.
+- User-defined primitives (29): combinational, level- and edge-sensitive.
+- Arrays of instances and of interfaces (23.3.3, 25.3), including
+  multidimensional instance arrays and per-element port slicing.
+- System tasks and functions (20, 21): the other `$dist_*` functions (Annex N),
+  `$system`, the array query functions on every kind of dimension,
+  `$typename`, and the VCD tasks (`$dumpfile`, `$dumpvars` with a level and
+  scope selection, `$dumpoff` / `$dumpon` / `$dumpall` / `$dumpflush` /
+  `$dumplimit`). A design's `$dumpvars` now writes its dump file without
+  `-vcd`.
+- `$fstrobe`, `$fmonitor` (several at once, cancelled by `$fclose`) and
+  `$fread` (21.3.2, 21.3.4.4).
+- VPI (clauses 36-38): `vpi_user.h`, VPI libraries loaded before
+  elaboration (`-load`, `-loadvpi`, or C files on the command line), user
+  system tasks and functions, the module / net / variable / memory /
+  parameter / port object model, `vpi_get_value` and `vpi_put_value` in all
+  the common formats, and callbacks. The tests match Icarus 13 VPI output.
+- DPI-C (clause 35): `import "DPI-C"` functions and tasks (`pure`, `context`,
+  C names), `export "DPI-C"` functions and tasks, every argument type
+  including packed vectors and open arrays, context scopes, exported tasks
+  that wait on time, and the 35.9 disable protocol. `include/svdpi.h` is
+  installed. msim builds C/C++ files given on its command line, loads
+  libraries with `-sv_lib` / `-sv_root` / `-sv_liblist` (annex J), and writes
+  prototypes with `-dpiheader`. msim now links libffi.
+- `chandle` variables (6.14).
+- `repeat (n)` with a count known only at run time (12.7.2).
+- randomize() arguments that are arrays or containers (18.11), and whole
+  fixed-size array properties through a handle: `h.a = '{...}` and `%p`
+  of `h.a` (8.4).
+- Fixed-size arrays of containers (`int q[4][$]`) as class properties,
+  rand properties and automatic variables (7.4, 18.4), with `%p`, foreach,
+  object copies and access through a handle.
+- `unique` constraints over dynamic arrays, queues and associative arrays
+  (18.5.5), alone or with scalars, under implications and on `m[i]`.
+- Rand containers of containers (18.4, 7.5): `rand int m[][]`, queues of
+  queues, associative arrays of queues, with constraints on `m.size()`,
+  `m[i].size()`, `m[i].sum()` and `m[i][j]` in nested foreach loops. Sizes
+  are solved level by level and picked again when the elements have no
+  solution; a failed randomize() leaves the arrays unchanged.
+- rand associative arrays with string keys (18.4).
+- Per-process random generators (18.14.2): a forked process is seeded from
+  its parent, so values one process draws do not depend on other processes.
 - `mbug`: files regression (mregress `results.json`), lint (mlint) and DFT
   (mdft) failures as issues in GitHub Issues (default), Redmine or Jira, one
   issue per failure signature. A repeat of an open failure becomes a comment,

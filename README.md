@@ -25,6 +25,10 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Module instances.** A parent instantiates a child. Named (`.a(x)`) and positional port connections carry an `input` into the child and an `output` back to the parent. The output may be a continuous assign or a procedural write. An `inout` net is connected in both directions. A grandchild uses the same connection. A `#(.W(8))` override changes the port width. Child signals are named on the instance path (`u.y`).
 - **Waveforms**: VCD (`msim -vcd`) or compressed FST (`msim -fst`), with the instance hierarchy as scopes, for GTKWave or Surfer
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
+- **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches, with its C code (regular expressions, command line, HDL backdoor) via `msim -uvm`; see [`docs/UVM.md`](docs/UVM.md)
+- **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
+- **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
+- **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
 ## Layout
 
@@ -38,6 +42,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
+| `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
+| `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -99,8 +105,28 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `-upf <file>` | Power-aware simulation with this UPF (IEEE 1801) power intent; see [`docs/LOWPOWER.md`](docs/LOWPOWER.md) |
 | `-power_top <inst>`, `-upf_verbose` | The instance the UPF describes; print supply, power state and simstate changes |
+| `<file>.c`, `.cpp`, `.o`, `.a` | DPI-C code: msim builds it (with `svdpi.h` on the include path) and loads it |
+| `<file>.so`, `-sv_lib <name>`, `-sv_root <dir>`, `-sv_liblist <file>` | DPI-C libraries to load (IEEE 1800-2023 annex J) |
+| `-dpiheader <file>` | Write the C prototypes of every DPI import and export |
+| `-load <lib>[:<boot>]`, `-loadvpi <lib>:<boot>` | Load a VPI library before elaboration; its `vlog_startup_routines` run (the C files and `.so` files above are VPI libraries too) |
+| `-CFLAGS <s>`, `-LDFLAGS <s>` | Extra flags for building the DPI C files |
 | `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |
+
+### C code: DPI-C
+
+`import "DPI-C"` and `export "DPI-C"` work as in IEEE 1800-2023 clause 35.
+Give the C files on the command line, or a prebuilt library with `-sv_lib`:
+
+```sh
+./build/msim tb.sv model.c                     # builds model.c, then runs
+./build/msim tb.sv -sv_lib libmodel            # loads libmodel.so
+./build/msim tb.sv model.c -dpiheader dpi.h    # also writes the C prototypes
+```
+
+C code includes `svdpi.h` (installed in `include/`, and in `include/` of the
+source tree). Import tasks may call exported tasks that wait on simulation
+time. A DPI call runs on the interpreter: `-compile` falls back to it.
 
 ### Regressions: `mregress`
 
@@ -351,13 +377,31 @@ mdft: 5 flops in 3 clock domains
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
+### Virtual prototypes: `-mvp`
+
+A memory, a peripheral, or a whole subsystem can be a program instead of RTL,
+so software and design meet before the RTL is finished. The design drives an
+AXI4-Lite port and the model answers in C or C++:
+
+```sh
+msim -mvp soc_tb.sv my_model.c -top soc_tb
+```
+
+`-mvp` adds `mvp.sv` (`mvp_axil_slave`, `mvp_irq_slave`, `mvp_clock`) and the
+runtime that keeps the memory map, the interrupt lines and the models' time.
+A model is ordinary C against [`include/mvp.h`](include/mvp.h):
+`mvp_add_device` to join the map, `mvp_after_ps` to take time, `mvp_set_irq`
+to interrupt, `mvp_bus_read` / `mvp_bus_write` to be a master. A TLM-2.0
+target goes behind the same bridge with `mvp_tlm.h`. A memory and a 16550-style
+UART are bundled in `mvp/models/`. See [docs/VPROTO.md](docs/VPROTO.md).
+
 ## Known limits
 
 - `nmos`, `pmos`, `cmos`, `tran` (and the resistive forms), `bufif` / `notif`, and `trireg` charge storage are an error. Strength is resolved when a net is driven, and a read of the net is 0, 1, X, or Z.
 - Instance arrays and interface or modport ports are an error
 - An `inout` variable is an error. An `inout` net is connected. An `inout` whose two sides differ in width is an error
 - Declaration initializers (`logic x = 0;`, `wire y = a & b;`) are lowered. A module variable's initializer runs before every `initial` / `always`
-- Tasks and functions have no recursion, no `ref` arguments, no DPI, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
+- Tasks and functions have no recursion, no `ref` arguments, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
 - System tasks other than the display family, `$finish`, and `$stop` are ignored with a warning
 - Unpacked arrays: fixed size only, at most 2^20 elements; no slices or whole-array operations. Array elements are left out of the VCD. See `docs/COVERAGE.md` for the full list
 

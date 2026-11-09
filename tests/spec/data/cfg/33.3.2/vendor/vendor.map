@@ -1,0 +1,2 @@
+// The library provider's own map (33.3.2): paths are relative to this file.
+library vendorLib cells/*.v -incdir inc;
