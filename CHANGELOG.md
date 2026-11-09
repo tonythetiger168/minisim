@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- The constraint solver weights each choice by how many ways the other
+  variables can still be completed, so values are close to uniform over the
+  joint solution space (18.5.10): `s -> d == 0` gives s = 0, and `x < y`
+  is no longer biased toward a large x.
 - Containers of containers (7.5, 7.8, 7.10): `int m[][]`, `int q[$][$]`,
   associative arrays of queues, and fixed-size arrays of containers
   (`int f[2][]`); containers of unpacked structs and of vectors wider than
