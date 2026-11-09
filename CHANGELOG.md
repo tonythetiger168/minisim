@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- rand dynamic arrays and queues (18.4): `size()` constraints, `foreach`
+  over the elements and array reductions (`sum`, `product`, `and`, `or`,
+  `xor`, with or without `with`) in constraints (18.5.8). Sizes are solved
+  first, then the elements. Rand arrays and queues of class handles
+  randomize each element's object.
 - Virtual interfaces (25.9): variables, properties and arguments of
   `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
   clocking blocks reached through them.
@@ -54,6 +59,8 @@ Spec references are IEEE 1800-2023 clauses.
   scope with `u.sum`).
 
 ### Fixed
+- The constraint solver re-evaluated known subexpressions at every node,
+  so a long `sum()` constraint cost O(n^2) per check.
 - msim could crash at exit when a process with an automatic frame (a
   forked automatic task, a class method) was still suspended: its frame went
   back to a frame shape that was already freed.

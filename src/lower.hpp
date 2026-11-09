@@ -2773,6 +2773,24 @@ struct Lowerer {
         const ValueSymbol* itSym = nullptr;
         if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
             std::tie(withE, itSym) = sci->getIteratorInfo();
+        if (withE && consDepth && o.kind != 2) {   // in a constraint: sum() with (...) and the like, folded at solve time (18.5.8.2)
+            static const std::pair<const char*, int> red[] = {{"sum", 0}, {"product", 1}, {"and", 2}, {"or", 3}, {"xor", 4}};
+            for (auto& [s, id] : red)
+                if (n == s) {
+                    if (!call.type->isIntegral()) unsupported("reduction with a non-integral with clause");
+                    int ph = fresh(itSym ? std::max(1, storeW(itSym->getType())) : 64);
+                    if (itSym) symOverride[itSym] = ph;
+                    E body = expr(*withE);
+                    if (itSym) symOverride.erase(itSym);
+                    auto x = node(Op::DynReduce, {resize(body, (int)call.type->getBitWidth(), withE->type->isSigned(), false)});
+                    x->sig = d;
+                    x->hi = id;
+                    x->lo = ph;
+                    x->k = mk(0, (int)call.type->getBitWidth());
+                    x->k.sgn = call.type->isSigned();
+                    return x;
+                }
+        }
         if (withE || isLocator(n)) {
             if (!stmtDepth) unsupported("array method with a `with` clause outside a procedural statement");
             if (o.kind == 2) unsupported("locator or with method of an associative array");
@@ -4300,7 +4318,13 @@ struct Lowerer {
     }
     // The constraints of c (18.5), each guarded by `guard` (implication and
     // if-else bodies), as items.
+    int consDepth = 0;   // > 0 while lowering constraints
     void constraintItems(const slang::ast::Constraint& c, E guard, std::vector<RandItem>& items, BeforeList& before) {
+        consDepth++;
+        struct Out { int& d; ~Out() { d--; } } out{consDepth};
+        constraintItems1(c, guard, items, before);
+    }
+    void constraintItems1(const slang::ast::Constraint& c, E guard, std::vector<RandItem>& items, BeforeList& before) {
         using namespace slang::ast;
         size_t code = prog.code.size();
         auto andG = [&](E p) { return guard ? bin(Op::LogAnd, guard, p) : p; };
@@ -4372,9 +4396,22 @@ struct Lowerer {
             }
             case ConstraintKind::Foreach: {   // 18.5.8.1: unrolled over a fixed-size array
                 const auto& fc = c.as<ForeachConstraint>();
+                if (fc.loopDims.size() == 1 && !fc.loopDims[0].range) {   // over a dynamic array or queue: expanded at solve time
+                    int d = dynSig(fc.arrayRef);
+                    if (d < 0) unsupported("foreach constraint over this array");
+                    RandItem loop;
+                    loop.loopCont = d;
+                    loop.loopVar = fresh(32);
+                    const Symbol* lv = fc.loopDims[0].loopVar;
+                    if (lv) symOverride[lv] = loop.loopVar;
+                    constraintItems(fc.body, guard, loop.body, before);
+                    if (lv) symOverride.erase(lv);
+                    items.push_back(std::move(loop));
+                    break;
+                }
                 std::vector<std::pair<const Symbol*, slang::ConstantRange>> dims;
                 for (const auto& d : fc.loopDims) {
-                    if (!d.range) unsupported("foreach constraint over a dynamic array or queue");
+                    if (!d.range) unsupported("foreach constraint over a dynamic array or queue inside more dimensions");
                     if (d.loopVar) dims.push_back({d.loopVar, *d.range});
                 }
                 std::function<void(size_t)> loop = [&](size_t k) {
@@ -7501,13 +7538,35 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             rv.off = ps.arr->base; rv.count = ps.arr->count;
                             while (et->isUnpackedArray()) et = &et->getArrayElementType()->getCanonicalType();
                         } else if (ps.kind == 0) rv.off = ps.off;
-                        else Lowerer::unsupported("rand dynamic array or queue");
-                        if (isHandleType(*et)) { rv.obj = true; rv.w = 64; }
+                        else {   // a dynamic array or queue (18.4): its size and elements
+                            if (t.isAssociativeArray()) Lowerer::unsupported("rand associative array");
+                            rv.off = ps.off; rv.dyn = true;
+                            et = &t.getArrayElementType()->getCanonicalType();
+                            if (Lowerer::isDynType(*et) || et->isUnpackedArray()) Lowerer::unsupported("rand array of arrays");
+                        }
+                        if (isHandleType(*et)) {
+                            rv.obj = true; rv.w = 64;   // a dynamic array or queue of them too: each object
+                        }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
                             if (rv.w > 64) Lowerer::unsupported("rand variable wider than 64 bits");
                         } else Lowerer::unsupported("rand property of this type");
-                        if (et->isEnum()) {   // an enum takes only its named values (18.4)
+                        if (et->isEnum() && rv.dyn) {   // each element: one of the named values
+                            RandItem loop;
+                            loop.loopCont = lw.thisRel(rv.off);
+                            loop.loopVar = lw.fresh(32);
+                            E any;
+                            for (const auto& ev : et->as<EnumType>().values()) {
+                                const auto& cv = ev.getValue();
+                                if (!cv.isInteger()) continue;
+                                auto u = cv.integer().as<uint64_t>();
+                                auto g = node(Op::DynGet, {ref(loop.loopVar, true)});
+                                g->sig = loop.loopCont;
+                                E eq = bin(Op::Eq, g, konst(mk(u ? *u : 0, rv.w)));
+                                any = any ? bin(Op::LogOr, any, eq) : eq;
+                            }
+                            if (any) { RandItem it; it.e = any; loop.body.push_back(std::move(it)); enumBlock->items.push_back(std::move(loop)); }
+                        } else if (et->isEnum()) {   // an enum takes only its named values (18.4)
                             for (int k = 0; k < rv.count; k++) {
                                 E any;
                                 for (const auto& ev : et->as<EnumType>().values()) {
