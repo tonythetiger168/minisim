@@ -1,6 +1,5 @@
 // IEEE 1800-2023 15.4: A mailbox: put, get, try_get, num, and a bounded
 // mailbox that blocks (15.4).
-//! xfail: mailboxes are errors
 //! icarus-skip: Icarus 13 does not support mailboxes
 module top;
   mailbox #(int) m;

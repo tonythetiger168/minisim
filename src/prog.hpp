@@ -25,6 +25,8 @@ enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_
               D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
               D_SORT, D_RSORT, D_SHUFFLE,
               D_SORT_BY, D_RSORT_BY };   // sort / rsort with (7.12.2): keys in dsrc
+// IK::ProcOp operations (9.7).
+enum ProcOpKind { PO_SELF, PO_STATUS, PO_KILL, PO_AWAIT, PO_SUSPEND, PO_RESUME };
 enum class IK {
     Assign,     // sig = e            (blocking)
     Nba,        // sig <= e           (non-blocking)
@@ -49,6 +51,9 @@ enum class IK {
     New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
     Randomize,  // sig = randomize the object e (null e: std::randomize), with rc (18.6, 18.12)
     RandMode,   // obj e: every rand variable (hi = 0) or constraint block (hi = 1) on or off by de (18.8, 18.9)
+    // std::process (9.7): hi is the ProcOp, e the process object (its slot
+    // `dkey` holds the process number), lo the class id, sig the result.
+    ProcOp,
     // An immediate assertion (16.3, 16.4) of asserts()[sig] on condition e.
     // join 0, simple: pass falls through to the pass action, a fail jumps to
     // target, and an assertion that is off or whose action is off jumps to hi.
