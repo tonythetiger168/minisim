@@ -2671,6 +2671,12 @@ struct Lowerer {
         if (sym.kind == SymbolKind::Parameter) cv = &sym.as<ParameterSymbol>().getValue();
         else if (sym.kind == SymbolKind::EnumValue) cv = &sym.as<EnumValueSymbol>().getValue();
         else if (const auto* c = e.getConstant()) cv = c;
+        if (cv && (cv->isReal() || cv->isShortReal())) {   // a real parameter: its 64 bits, which AsReal reads (6.12)
+            double d = cv->isReal() ? (double)cv->real() : (double)(float)cv->shortReal();
+            uint64_t bits;
+            std::memcpy(&bits, &d, 8);
+            return konst(mk(bits, 64));
+        }
         if (!cv || !cv->isInteger()) unsupported("reference to non-signal symbol");
         return svLit(cv->integer(), e.type->isSigned(), ctx);
     }
