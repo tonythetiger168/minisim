@@ -2942,7 +2942,26 @@ struct Lowerer {
             auto args = call.arguments();
             if (args.size() < 2) unsupported("$readmem arguments");
             const Expression& fn = peel(*args[0]);
-            if (fn.kind != ExpressionKind::StringLiteral) unsupported("$readmem file name that is not a string literal");
+            // The file name: a literal, a constant such as a string parameter,
+            // or an expression evaluated when the task runs.
+            std::optional<std::string> fname;
+            if (fn.kind == ExpressionKind::StringLiteral) fname = std::string(fn.as<StringLiteral>().getValue());
+            else if (const slang::ConstantValue* cv = fn.kind == ExpressionKind::NamedValue &&
+                                                     fn.as<NamedValueExpression>().symbol.kind == SymbolKind::Parameter
+                                                 ? &fn.as<NamedValueExpression>().symbol.as<ParameterSymbol>().getValue()
+                                                 : args[0]->getConstant();
+                     cv && !cv->bad()) {
+                if (cv->isString()) fname = cv->str();
+                else if (cv->isInteger()) {   // a string literal held in an integral parameter
+                    auto sv = cv->integer();
+                    std::string t;
+                    for (int b = (int)sv.getBitWidth() - 8; b >= 0; b -= 8) {
+                        char ch = (char)sv.slice(b + 7, b).as<uint8_t>().value_or(0);
+                        if (ch) t += ch;
+                    }
+                    fname = t;
+                }
+            }
             // slang binds the memory as an output argument: an assignment to it.
             const Expression* mp = &peel(*args[1]);
             if (mp->kind == ExpressionKind::Assignment) mp = &peel(mp->as<AssignmentExpression>().left());
@@ -2955,7 +2974,8 @@ struct Lowerer {
             if (!ap) unsupported("$readmem target that is not an unpacked array");
             if (ap->dims.size() != 1) unsupported("$readmem into a multidimensional array");
             Instr i; i.k = n[1] == 'r' ? IK::ReadMem : IK::WriteMem;
-            i.fmt = std::string(fn.as<StringLiteral>().getValue());
+            if (fname) i.fmt = *fname;
+            else i.e = strOf(*args[0]);
             i.arr = ap;
             i.hex = n.ends_with('h');
             for (size_t a = 2; a < args.size() && a < 4; a++) i.args.push_back(expr(*args[a]));
@@ -4610,8 +4630,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         bool loops = p.procedureKind != ProceduralBlockKind::Initial;
         if (p.procedureKind == ProceduralBlockKind::AlwaysComb ||
             p.procedureKind == ProceduralBlockKind::AlwaysLatch) {
-            // runs once at t=0, then re-runs whenever any signal it reads changes
-            auto rs = readSet(lw.prog);
+            // runs once at t=0, then re-runs whenever any signal it reads,
+            // and does not itself write, changes (9.2.2.2.1)
+            auto rs = combReadSet(lw.prog);
             if (rs.empty()) loops = false;
             else lw.prog.emit(waitInstr(rs));
         }
