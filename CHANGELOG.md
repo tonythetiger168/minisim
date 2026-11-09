@@ -8,7 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `rand join` in randsequence (18.17.5), with a constant bias.
+- `rand join` in randsequence (18.17.5), with a constant bias, and production
+  arguments and return values (18.17.7).
 - `dist` default weights (`default :/ w`, 18.5.3) and rand associative
   arrays with integral keys (18.4); foreach constraints over associative
   arrays bind the index to each key.

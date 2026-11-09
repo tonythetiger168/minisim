@@ -875,6 +875,16 @@ struct Lowerer {
     // break ends the whole sequence (a flag every caller checks).
     int rsBreak = -1;
     std::unordered_map<const slang::ast::RandSeqProductionSymbol*, Prog*> rsProds;
+    // Arguments and values (18.17.7): each production's arguments and return
+    // value live in signals of their own; each use of a production with a
+    // value keeps it in a temporary. A production saves its own signals on a
+    // stack around every call it makes, so recursion keeps them.
+    struct RsSig { std::vector<int> args; int ret = -1; };
+    std::unordered_map<const slang::ast::RandSeqProductionSymbol*, RsSig> rsSigs;
+    std::unordered_map<const void*, int> rsItemVal;   // a ProdItem -> its value's temporary
+    std::unordered_map<const slang::ast::Symbol*, std::vector<int>> rsVals;   // slang's variable for a production's values, in the rule being lowered
+    std::vector<int> rsState;   // the signals the production being lowered saves around calls
+    int rsStack = -1;
     void randSequence(const slang::ast::RandSequenceStatement& rs) {
         using namespace slang::ast;
         if (!rs.firstProduction) return;
@@ -882,11 +892,30 @@ struct Lowerer {
         int savedBreak = rsBreak;
         auto savedProds = rsProds;
         rsBreak = fresh(1);
+        auto savedSigs = rsSigs;
+        int savedStack = rsStack;
+        bool any = false;
         for (const RandSeqProductionSymbol* p : rs.productions) {
-            if (!p->arguments.empty() || !p->getReturnType().isVoid()) unsupported("randsequence production with arguments or a value");
             store->push_back(std::make_unique<Prog>());
             rsProds[p] = store->back().get();
+            RsSig& rsg = rsSigs[p];
+            for (const FormalArgumentSymbol* a : p->arguments) {
+                if (a->direction != ArgumentDirection::In) unsupported("randsequence production argument that is not input");
+                int w = storeW(a->getType());
+                needWidth(w);
+                int sg = fresh(w);
+                rsg.args.push_back(sg);
+                symOverride[a] = sg;
+                any = true;
+            }
+            if (!p->getReturnType().isVoid()) {
+                int w = storeW(p->getReturnType());
+                needWidth(w);
+                rsg.ret = fresh(w);
+                any = true;
+            }
         }
+        if (any) { DynObj st; st.kind = 1; rsStack = dynTemp(std::move(st)); }
         for (const RandSeqProductionSymbol* p : rs.productions) {
             Prog body;
             std::swap(prog, body);
@@ -894,7 +923,13 @@ struct Lowerer {
             loops.clear();
             auto savedNamed = std::move(named);
             named.clear();
+            int savedRet = retSig;
+            retSig = rsSigs[p].ret;   // return in a code block: this production's value
+            auto savedState = std::move(rsState);
+            rsState = rsSigs[p].args;
             rsProduction(*p);
+            rsState = std::move(savedState);
+            retSig = savedRet;
             loops = std::move(savedLoops);
             named = std::move(savedNamed);
             std::swap(prog, body);
@@ -905,11 +940,42 @@ struct Lowerer {
         rsCall(rs.firstProduction, false);
         rsBreak = savedBreak;
         rsProds = std::move(savedProds);
+        rsSigs = std::move(savedSigs);
+        rsStack = savedStack;
     }
     // Call production p; inside a production, return at once after a break.
-    void rsCall(const slang::ast::RandSeqProductionSymbol* p, bool inProd) {
+    void rsCall(const slang::ast::RandSeqProductionSymbol* p, bool inProd,
+                const slang::ast::RandSeqProductionSymbol::ProdItem* item = nullptr) {
+        const RsSig& callee = rsSigs[p];
+        // The arguments, all evaluated before any is set (the callee may be this production).
+        std::vector<int> av;
+        if (item) {
+            if (item->args.size() > callee.args.size()) unsupported("randsequence production argument count");
+            for (size_t k = 0; k < item->args.size(); k++) {
+                int t = fresh(storeW(*item->args[k]->type) > 0 ? storeW(*item->args[k]->type) : 1);
+                Instr i; i.k = IK::Assign; i.sig = t; i.e = expr(*item->args[k]);
+                prog.emit(i);
+                av.push_back(t);
+            }
+        }
+        bool save = inProd && !rsState.empty();
+        if (save)
+            for (int sg : rsState) { Instr i = dynCmd(rsStack, D_PUSH_BACK); i.e = ref(sg); prog.emit(i); }
+        for (size_t k = 0; k < av.size(); k++) {
+            Instr i; i.k = IK::Assign; i.sig = callee.args[k]; i.e = ref(av[k]);
+            prog.emit(i);
+        }
         Instr c; c.k = IK::Call; c.callee = rsProds.at(p);
         prog.emit(c);
+        int got = -1;
+        if (callee.ret >= 0 && item && rsItemVal.count(item)) {
+            got = fresh(storeW(p->getReturnType()));
+            Instr i; i.k = IK::Assign; i.sig = got; i.e = ref(callee.ret);
+            prog.emit(i);
+        }
+        if (save)
+            for (size_t k = rsState.size(); k-- > 0;) { Instr i = dynCmd(rsStack, D_POP_BACK); i.dres = rsState[k]; prog.emit(i); }
+        if (got >= 0) { Instr i; i.k = IK::Assign; i.sig = rsItemVal.at(item); i.e = ref(got); prog.emit(i); }
         if (!inProd) return;
         size_t go = emitJmpIfNot(ref(rsBreak));
         Instr r; r.k = IK::Ret; prog.emit(r);
@@ -917,8 +983,7 @@ struct Lowerer {
     }
     void rsItem(const slang::ast::RandSeqProductionSymbol::ProdItem& it) {
         if (!it.target) unsupported("randsequence production");
-        if (!it.args.empty()) unsupported("randsequence production arguments");
-        rsCall(it.target, true);
+        rsCall(it.target, true, &it);
     }
     void rsProduction(const slang::ast::RandSeqProductionSymbol& p) {
         using namespace slang::ast;
@@ -943,8 +1008,51 @@ struct Lowerer {
             Instr d; d.k = IK::Assign; d.sig = pick; d.e = weightedPick(total);
             prog.emit(d);
         }
+        // Each use of a production with a value: a temporary, named in the
+        // rule's code as the production (or production[i], from 1).
+        std::vector<std::unordered_map<const RS*, std::vector<int>>> ruleVals(rules.size());
+        for (size_t k = 0; k < rules.size(); k++) {
+            std::function<void(const RS::ProdItem&)> use = [&](const RS::ProdItem& it) {
+                if (!it.target || rsSigs[it.target].ret < 0) return;
+                int t = fresh(storeW(it.target->getReturnType()));
+                rsItemVal[&it] = t;
+                ruleVals[k][it.target].push_back(t);
+                rsState.push_back(t);
+            };
+            for (const RS::ProdBase* pb : rules[k].prods) {
+                switch (pb->kind) {
+                    case RS::ProdKind::Item: use(pb->as<RS::ProdItem>()); break;
+                    case RS::ProdKind::IfElse: {
+                        const auto& ie = pb->as<RS::IfElseProd>();
+                        use(ie.ifItem);
+                        if (ie.elseItem) use(*ie.elseItem);
+                        break;
+                    }
+                    case RS::ProdKind::Repeat: use(pb->as<RS::RepeatProd>().item); break;
+                    case RS::ProdKind::Case: {
+                        const auto& cp = pb->as<RS::CaseProd>();
+                        for (const auto& ci : cp.items) use(ci.item);
+                        if (cp.defaultItem) use(*cp.defaultItem);
+                        break;
+                    }
+                    default: break;
+                }
+            }
+        }
         for (size_t k = 0; k < rules.size(); k++) {
             const auto& r = rules[k];
+            // slang declares, in the rule's block, a variable per production
+            // with a value: an int, or int[1:n] when it is used n times.
+            auto savedVals = std::move(rsVals);
+            rsVals.clear();
+            for (const auto& m : r.ruleBlock->members()) {
+                if (m.kind != SymbolKind::Variable || !m.as<VariableSymbol>().flags.has(VariableFlags::CompilerGenerated)) continue;
+                for (auto& [ps, ts] : ruleVals[k])
+                    if (ps->name == m.name) {
+                        if (m.as<VariableSymbol>().getType().isUnpackedArray()) rsVals[&m] = ts;
+                        else symOverride[&m] = ts.back();
+                    }
+            }
             size_t skip = 0;
             if (pick >= 0) skip = emitJmpIfNot(bin(Op::Lt, ref(pick), ref(w[k])));
             if (r.isRandJoin) { rsJoin(r); }
@@ -952,6 +1060,8 @@ struct Lowerer {
             if (r.codeBlock) {
                 if (const Statement* st = r.codeBlock->block->tryGetStatement()) stmt(*st);
             }
+            for (const auto& m : r.ruleBlock->members()) symOverride.erase(&m);
+            rsVals = std::move(savedVals);
             if (pick >= 0) {
                 ends.push_back(emitJmp());
                 prog.code[skip].target = prog.here();
@@ -3540,6 +3650,15 @@ struct Lowerer {
             }
             case ExpressionKind::ElementSelect: {   // a[i]
                 if (E k = paramSelect(e, ctx)) return k;
+                if (const auto& sv = e.as<ElementSelectExpression>().value();
+                    ValueExpressionBase::isKind(sv.kind) && rsVals.count(&sv.as<ValueExpressionBase>().symbol)) {   // P[i] (18.17.7)
+                    const auto& ts = rsVals.at(&sv.as<ValueExpressionBase>().symbol);
+                    auto cv = tryConst(e.as<ElementSelectExpression>().selector());
+                    if (!cv.isInteger()) unsupported("a production value with an index that is not constant");
+                    int64_t n = cv.integer().as<int64_t>().value_or(0);
+                    if (n < 1 || n > (int64_t)ts.size()) unsupported("production value index out of range");
+                    return sized(ref(ts[(size_t)n - 1], e.type->isSigned()), storeW(*e.type), e.type->isSigned(), ctx);
+                }
                 if (int d = dynSig(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key]
                     int w = storeW(*e.type);
                     needWidth(w);
