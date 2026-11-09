@@ -8,6 +8,7 @@ get_filename_component(dir ${SV} DIRECTORY)
 get_filename_component(base ${SV} NAME)   # run as a relative name, so `__FILE__ and messages are stable
 file(STRINGS ${SV} lines)
 set(expected "")
+set(extra "")
 set(want_rc 0)   # "//! exit: <n>": the exit code msim should return (e.g. 1 after $fatal)
 foreach(l IN LISTS lines)
   if(l MATCHES "^//> (.*)$")
@@ -16,6 +17,8 @@ foreach(l IN LISTS lines)
     string(APPEND expected "\n")
   elseif(l MATCHES "^//! exit: ([0-9]+)")
     set(want_rc ${CMAKE_MATCH_1})
+  elseif(l MATCHES "^//! args: (.*)$")   # more msim arguments, e.g. a DPI C file
+    separate_arguments(extra UNIX_COMMAND "${CMAKE_MATCH_1}")
   endif()
 endforeach()
 
@@ -33,7 +36,7 @@ if(VVP)
   string(REGEX REPLACE "VCD info:[^\n]*\n" "" got "${got}")
   string(REGEX REPLACE "WARNING: [^\n]*\n" "" got "${got}")   # vvp's warnings go to stdout
 else()
-  execute_process(COMMAND ${SIM} ${base} OUTPUT_VARIABLE got ERROR_VARIABLE err
+  execute_process(COMMAND ${SIM} ${base} ${extra} OUTPUT_VARIABLE got ERROR_VARIABLE err
                   RESULT_VARIABLE rc TIMEOUT 20 WORKING_DIRECTORY ${dir})
   if(NOT rc STREQUAL want_rc)
     message(FATAL_ERROR "msim exited ${rc} (expected ${want_rc}) on ${SV}:\n${err}")

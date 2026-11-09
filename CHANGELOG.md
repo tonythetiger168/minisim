@@ -10,6 +10,8 @@ Spec references are IEEE 1800-2023 clauses.
 ### Added
 - Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
   `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
+  Negative `$setuphold` / `$recrem` limits with delayed signals under
+  `+neg_tchk` (31.9).
 - Virtual interfaces (25.9): variables, properties and arguments of
   `virtual ifc` / `virtual ifc.mp` type; signals, events, tasks, functions and
   clocking blocks reached through them.

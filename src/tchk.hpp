@@ -27,6 +27,8 @@ struct TcEvent {
     bool nondet = false;   // the condition is == or !=: x enables the check
     uint8_t edges = 0;
     std::string text;      // the argument as written, for messages
+    int sig = -1;          // the signal the terminal reads (31.9 delays it), or -1
+    int delayed = -1;      // an explicit delayed signal of it (31.9), or -1
 };
 
 struct TimingCheck {
@@ -39,6 +41,10 @@ struct TimingCheck {
     int64_t thresh = 0;          // $width
     bool eventBased = false, remainActive = false;   // $timeskew, $fullskew
     int notifier = -1;           // signal, or -1
+    // $setuphold / $recrem (31.9.2): conditions on the event that comes
+    // first (the timestamp) and the one that comes second (the timecheck).
+    E tsCond, tcCond;
+    int64_t dly[2] = {0, 0};     // the delay of each event's signal (31.9), set at the start
     std::string limText;         // the limits as written
     std::string inst, file;
     int line = 0;
@@ -48,3 +54,6 @@ struct TimingCheck {
 inline std::vector<TimingCheck>& timingChecks() { static std::vector<TimingCheck> v; return v; }
 // +notimingcheck turns every timing check off.
 inline bool& timingChecksOn() { static bool on = true; return on; }
+// +neg_tchk: negative $setuphold / $recrem limits shift the window with
+// delayed signals (31.9). Without it they count as 0 (31.9.4).
+inline bool& negTimingChecks() { static bool on = false; return on; }
