@@ -5685,6 +5685,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             else if (a.edge == EdgeKind::BothEdges) ev.edges = TE_ALL;
             std::vector<int> sigs;
             collectRefs(ev.e, sigs);
+            if (sigs.size() == 1) ev.sig = sigs[0];
             for (int sg : sigs) {
                 bool have = false;
                 for (auto& w : t.watch) have |= w.first == sg;
@@ -5737,9 +5738,22 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             t.eventBased = flag(nIdx + 1);
             t.remainActive = flag(nIdx + 2);
         }
-        if ((t.kind == TC_SETUPHOLD || t.kind == TC_RECREM) && nIdx + 1 < args.size())
-            for (size_t k = nIdx + 1; k < args.size(); k++)
-                if (args[k].expr) Lowerer::unsupported("negative timing check conditions and delayed signals (31.9)");
+        if (t.kind == TC_SETUPHOLD || t.kind == TC_RECREM) {
+            // 31.9: timestamp and timecheck conditions, delayed reference and data.
+            if (nIdx + 1 < args.size() && args[nIdx + 1].expr) t.tsCond = lw.expr(*args[nIdx + 1].expr);
+            if (nIdx + 2 < args.size() && args[nIdx + 2].expr) t.tcCond = lw.expr(*args[nIdx + 2].expr);
+            for (int k = 0; k < 2; k++) {
+                size_t ix = nIdx + 3 + (size_t)k;
+                if (ix >= args.size() || !args[ix].expr) continue;
+                const Expression* dx = args[ix].expr;   // bound as an output: an assignment to it
+                if (dx->kind == ExpressionKind::Assignment) dx = &dx->as<AssignmentExpression>().left();
+                const Expression& x = Lowerer::peel(*dx);
+                const Symbol* sym = x.getSymbolReference();
+                if (x.kind != ExpressionKind::NamedValue || !sym || !sigmap.count(sym))
+                    Lowerer::unsupported("a delayed signal that is not a whole net or variable");
+                t.ev[k].delayed = sigmap.at(sym);
+            }
+        }
         t.inst = Lowerer::instPath(sc.getParentScope());
         if (const auto* sm = srcMgr()) {
             auto ol = sm->getFullyOriginalLoc(sc.location);

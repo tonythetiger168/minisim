@@ -11,6 +11,7 @@
 //   -vcd [<file>]    write a VCD waveform (default file dump.vcd)
 //   +vcd             same as -vcd dump.vcd
 //   +notimingcheck   turn off the specify block timing checks (31)
+//   +neg_tchk        allow negative $setuphold / $recrem limits (31.9)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
@@ -339,6 +340,7 @@ static void usage() {
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
+                 "  +neg_tchk      allow negative $setuphold / $recrem limits, with delayed signals\n"
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
                  "  -maxtime <n>   stop after simulation time n\n"
@@ -400,6 +402,7 @@ int main(int argc, char** argv) {
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
         if (a == "+notimingcheck" || a == "+notimingchecks") { timingChecksOn() = false; continue; }
+        if (a == "+neg_tchk") { negTimingChecks() = true; continue; }
         if (a == "+fst") { vcdPath = "dump.fst"; continue; }
         if (a == "-cov") {
             g_cov = true;

@@ -23,6 +23,7 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <set>
 #include <queue>
 #include <sstream>
 #include <memory>

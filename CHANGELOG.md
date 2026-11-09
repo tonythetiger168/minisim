@@ -10,6 +10,8 @@ Spec references are IEEE 1800-2023 clauses.
 ### Added
 - Timing checks (31): all twelve checks, edge-control specifiers, notifiers,
   `&&&` conditions and vector terminals; `+notimingcheck` turns them off.
+  Negative `$setuphold` / `$recrem` limits with delayed signals under
+  `+neg_tchk` (31.9).
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
