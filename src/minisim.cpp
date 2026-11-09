@@ -296,13 +296,17 @@ struct Sim {
     // thread count or on timing. -threads 1 runs the same code serially.
     int threads = 1;
     static constexpr size_t kMinParallel = 32;
+    static inline thread_local bool tlInPar = false;   // inside a parallelFor task
     Pool pool;
     template <class F>
     void parallelFor(size_t n, F&& f) {
         // A small batch is cheaper on this thread than a wake-up of the pool.
-        if (threads <= 1 || n < kMinParallel) { for (size_t i = 0; i < n; i++) f(i); return; }
+        // Nested (a task that calls parallelFor) runs on its own thread.
+        if (threads <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
         pool.ensure(threads);
-        pool.run(n, [](void* c, size_t i) { (*static_cast<F*>(c))(i); }, &f);
+        tlInPar = true;
+        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f);
+        tlInPar = false;
     }
 
     // ---- static combinational schedule (prog.hpp: combShape / combSchedule) ----
@@ -548,6 +552,18 @@ struct Sim {
     // directly when nothing else can see the signal change; otherwise it is
     // an ordinary set(), so VCD, $monitor and waiting processes still work.
     void (*fastCommit)() = nullptr;
+    // Called from a clocked batch: true when nothing but the domain's own
+    // comb rank can run before the NBA region (processes woken by the same
+    // edge already ran in the active region). The domain then commits and
+    // settles its logic at once, which also covers that pending comb rank.
+    bool fuseOk() {
+        if (!inactive.empty()) return false;
+        if (combq.empty()) return true;
+        if (combq.size() != 1 || combq.top() != fastComb) return false;
+        combq.pop();
+        combPend[fastComb] = 0;
+        return true;
+    }
     int fastSeqId = -1, fastComb = -1;
     vector<char> quiet;   // signal -> at most 64 bits, and only the cycle domain reacts to it
     void fastInit() {
@@ -1540,7 +1556,15 @@ struct WaitAny {
     bool await_ready() const { return false; }
     void await_suspend(Handle h) const {
         auto token = make_shared<bool>(false);
-        for (auto& [sg, e] : *ev) S.waiters[sg].push_back({h, e, token});
+        for (auto& [sg, e] : *ev) {
+            auto& ws = S.waiters[sg];
+            // A sibling event that keeps firing leaves stale entries on a signal
+            // that never changes (always @(posedge clk or negedge rst_n)): drop
+            // them whenever the list doubles, so it stays bounded.
+            if (ws.size() >= 16 && (ws.size() & (ws.size() - 1)) == 0)
+                std::erase_if(ws, [](const Waiter& w) { return w.fired && *w.fired; });
+            ws.push_back({h, e, token});
+        }
     }
     void await_resume() const {}
 };
