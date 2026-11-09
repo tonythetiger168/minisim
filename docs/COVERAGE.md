@@ -5,8 +5,14 @@ Clause numbers were checked against the 2023 text; most are unchanged from 1800-
 A ✅ row has a test in `tests/spec/` named after its clause. Each of those tests
 is also checked against Icarus Verilog 13 when `iverilog` is installed.
 🟡 works with the limits listed, ❌ is an error at lowering time ("lower: unsupported ..."),
+including any system task msim does not know (only the waveform tasks such as `$dumpvars` are skipped),
 never a silent wrong answer. If you find a construct that runs but gives the
 wrong result, that is a bug: please add a spec test for it.
+
+`tests/regress.py` runs every spec test and prints a per-chapter table. A test
+marked `//! xfail: <reason>` is a known gap (ctest expects it to fail); the
+script fails if any other test fails or if an xfail test starts passing.
+`python3 tests/regress.py --icarus` also compares each test with Icarus.
 
 | Clause | Topic | Status | Notes / test |
 |---|---|---|---|
@@ -14,6 +20,7 @@ wrong result, that is a bug: please add a spec test for it.
 | 5.7.1 | Integer literals | ✅ | sized, unsized, x/z digits, signed (`'s`) |
 | 5.9 | String literals | 🟡 | up to 8 characters (64 bits). `5.9-string-literal` |
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |
+| 6.6.3–6.6.8 | wand/triand, wor/trior, tri0, tri1, trireg, supply0/supply1 | ✅ | wired AND/OR resolution, pull to 0/1 when undriven, trireg holds its last value (starts at x). Not yet: arrays of these nets, `interconnect`. `6.6.3-wired-nets`, `6.6.4-trireg` |
 | 6.11 | Integer types | ✅ | int, byte, shortint, longint, integer, bit. `6.11-integer-types` |
 | 6.8 | Default values | ✅ | 2-state variables (int, bit, real, string) start at 0 / 0.0 / ""; 4-state at x. `6.8-default-values` |
 | 6.12 | real, realtime | ✅ | arithmetic, compare, `**`, conversion both ways (rounded, 6.12.1), real arrays and function results, `$itor` `$rtoi` `$realtobits` `$bitstoreal`, 20.8 math functions. Not yet: `shortreal` (an error), reals in the VCD. `6.12-real`, `6.12.1-real-conversions` |
@@ -24,12 +31,12 @@ wrong result, that is a bug: please add a spec test for it.
 | 7.2.1, 7.3.1 | Packed structures and unions | ✅ | member read and write, nested members. `7.2.1-packed-struct` |
 | 7.2 | Unpacked structures | ❌ | |
 | 7.4.1 | Packed arrays and ranges | ✅ | any declared range ([7:0], [8:1], [0:7]) and multidimensional packed arrays, element and part selects. `7.4.1-packed-ranges`, `7.4.1-packed-nested-write` |
-| 7.4 | Unpacked arrays | 🟡 | fixed-size unpacked arrays of any number of dimensions (up to 2^20 elements), constant or variable index, read and write; out-of-range read gives X (7.4.6). Not yet: slices, whole-array assignment or compare, arrays as ports or arguments. `7.4-unpacked-arrays`, `7.4-array-sensitivity` |
+| 7.4 | Unpacked arrays | 🟡 | fixed-size unpacked arrays of any number of dimensions (up to 2^20 elements), constant or variable index, read and write; out-of-range read gives X (7.4.6); whole-array assignment from `'{...}`, `'{n{...}}`, `'{i: v, default: v}` (also nested, and in a declaration) or another array. Not yet: slices, whole-array compare, arrays as ports or arguments. `7.4-unpacked-arrays`, `7.4-array-sensitivity` |
 | 7.5 | Dynamic arrays | ✅ | `new[n]`, `new[n](old)`, `size()`, `delete()`, element read and write (a read past the end gives the element default), assignment from `'{...}`, another container, or a fixed-size array. `7.5-dynamic-arrays` |
 | 7.8, 7.9 | Associative arrays | 🟡 | integral keys (signed or unsigned, any width up to 64), string keys, `[*]`; `num`/`size`, `exists`, `delete`, `delete(k)`, `first`/`last`/`next`/`prev`, `'{k: v}` patterns, a missing key reads the default. Not yet: class keys, `default:` in a pattern. `7.8-associative-arrays` |
 | 7.10 | Queues | ✅ | `push_back`/`push_front`/`pop_back`/`pop_front`/`insert`/`delete(i)`, `$` as the last index, `q[a:b]` slices, concatenation `{q, x, r}`, `{}`, bounded queues `[$:N]`, a write at `q.size()` appends. `7.10-queues`, `7.10.1-queue-slices`, `7.10-string-real-elements` |
 | 7.12 | Array methods | 🟡 | on dynamic arrays and queues: `reverse`, `sort`, `rsort`, `shuffle`, `sum`, `product`, `and`, `or`, `xor`. Not yet: a `with` clause, locator methods (`find`, `min`, `unique`, ...). `7.12-array-methods`, `7.12.3-reduction-methods` |
-| 7.5–7.10 | Container limits | 🟡 | elements are integral (up to 64 bits), real, or string; no nested containers, no containers as ports or task arguments, no `%p`, no whole-container compare, no NBA to an element. `-compile` falls back to the interpreter. |
+| 7.5–7.10 | Container limits | 🟡 | elements are integral (up to 64 bits), real, or string; no nested containers, no containers as ports or task arguments, no whole-container compare, no NBA to an element. `-compile` falls back to the interpreter. |
 | 8 | Classes | ❌ | blocks UVM |
 | 9.2 | initial, always, always_comb/ff/latch | ✅ | |
 | 9.2.3 | Final procedures | ✅ | run once after the last time slot, also after `$finish`. `9.2.3-final` |
@@ -44,8 +51,10 @@ wrong result, that is a bug: please add a spec test for it.
 | 9.6.3 | disable fork | ✅ | `9.6.3-disable-fork` |
 | 10.3 | Continuous assignment | ✅ | with drive strength; to a whole signal or a constant bit / part select |
 | 10.3.1 | Net declaration assignment | ✅ | `10.3.1-net-decl-assign` |
+| 10.3.3 | Continuous assignment delays | ✅ | `assign #(r, f, z)`, `wire #d w = a`, net delays `wire #d w;`, gate delays; inertial, rise/fall/turn-off picked per Table 28-9, min:typ:max uses typ. `10.3.3-assign-delay`, `28.16-gate-delays` |
 | 10.4 | Blocking / nonblocking | ✅ | whole signal, bit-select, part-select |
 | 10.5 | Variable declaration assignment | ✅ | runs before every initial/always. `10.5-var-decl-init` |
+| 10.11 | Net aliasing | ✅ | `alias a = b = c;` makes one net. `10.11-net-alias` |
 | 11.3.6 | Assignment inside an expression | ✅ | `if ((a = b) == 0)`, blocking only |
 | 11.4.2 | Increment / decrement | ✅ | also inside expressions (`x = i++ + 1`, `while (j++ < 3)`). `11.4.2-incdec-in-expr` |
 | 11.4.3 | Arithmetic incl. unary −/+, ** | ✅ | `11.4.3-arith-unary` |
@@ -65,14 +74,23 @@ wrong result, that is a bug: please add a spec test for it.
 | 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`, no DPI. `13.4-function-automatic` |
 | 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
 | 16 | Assertions | ❌ | immediate and concurrent |
-| 18 | Randomization | ❌ | incl. `$urandom` |
+| 18 | Randomization (constraints) | ❌ | classes, `randomize()`, `std::randomize`, randcase, randsequence |
+| 18.13 | $urandom, $urandom_range | ✅ | one deterministic stream per run, seeded by `-seed <n>` or `+ntb_random_seed=<n>` (the generator is implementation-defined). `18.13-random-functions` |
 | 20.3 | $time, $stime, $realtime | 🟡 | in the calling module's time unit, rounded. `$realtime` is a real. `20.3-time` |
 | 20.2 | $finish, $stop | ✅ | `$stop` ends the run like `$finish` |
-| 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m %f %e %g, `%0`, widths, `%-8d`, `%.3f`. `21.2.1-display-formats` |
+| 20.4 | $timeformat, $printtimescale | ✅ | `%t` prints in the `$timeformat` units, precision, suffix and width; the default is the simulation precision, width 20. `$printtimescale` with no argument, `$root`, or an instance. `20.4-timeformat`, `20.4-printtimescale` |
+| 20.8.1 | $clog2 | ✅ | `20.8-clog2` |
+| 20.9 | Bit vector functions | ✅ | `$countones`, `$countbits`, `$onehot`, `$onehot0`, `$isunknown`. `20.9-bit-vector-functions` |
+| 20.10 | Severity tasks | ✅ | `$fatal` / `$error` / `$warning` / `$info` print the severity, file, line, scope and time, then the message; `$fatal` ends the run with exit status 1. `20.10-severity-tasks` |
+| 20.14 | $random, $dist_uniform | ✅ | the Annex N algorithm, so a seed gives the same values as other simulators. Not yet: the other `$dist_*` functions. `20.14-distribution` |
+| 21.2.1 | $display, $write and b/o/h variants | ✅ | %b %o %h %x %d %c %s %t %m %f %e %g %p, `%0`, widths, `%-8d`, `%.3f`. `%m` is the scope of the call. `21.2.1-display-formats` |
+| 21.2.1.6 | %p assignment pattern format | 🟡 | fixed-size arrays (any dimensions), dynamic arrays, queues, associative arrays, packed structs with member names, enums by name, strings in quotes. Not yet: unpacked structs (7.2). `21.2.1.6-assignment-pattern-format` |
 | 21.2.2–21.2.3 | $strobe, $monitor | ✅ | |
-| 21.3 | File I/O ($fopen, $fwrite, ...) | ❌ | ignored with a warning |
+| 21.3 | File I/O ($fopen, $fwrite, ...) | ❌ | |
 | 21.3.3 | $sformatf, $sformat, $swrite | ✅ | the same formats as $display |
 | 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
+| 21.5 | $writememh, $writememb | ✅ | 1-D memories, optional start/finish. `21.5-writemem` |
+| 21.6 | $test$plusargs, $value$plusargs | ✅ | `msim t.sv +N=5`; formats %d %h %o %b %s %f. `21.6-plusargs` |
 | 20.6.2 | $bits | ✅ | of any fixed-size expression or type |
 | 21.7 | VCD ($dumpfile, $dumpvars) | 🟡 | `msim -vcd` dumps every signal; the tasks are ignored |
 | 22.7 | `` `timescale `` | ✅ | per-module unit and precision; one kernel tick is the finest precision in the design, also used as the VCD `$timescale`. `22.7-timescale` |
@@ -83,6 +101,7 @@ wrong result, that is a bug: please add a spec test for it.
 | 26 | Packages | ✅ | parameters, localparams, typedefs, enums, structs, variables (named `pkg::x` in the VCD), functions and tasks; wildcard and explicit import, `pkg::name`. `26.3-package-import`, `26.2-package-items` |
 | 27 | Generate | ✅ | loop, if, and case generate; named and unnamed blocks (`genblkN`); instances and continuous assigns to separate bits inside. `27-generate` |
 | 28 | Gate primitives | 🟡 | and/or/xor families, buf/not, pullup/pulldown |
+| 30.4 | Module path delays | 🟡 | `(a => b) = d` and `(a *> b) = (r, f)` with constant or specparam delays, to an output net. Every path to one output must have the same delays (minisim does not pick the path by which input changed last). Not yet: 6- and 12-value delays, outputs declared as variables, `$sdf_annotate` (an error), timing checks (`$setup`, `$hold`, ... are accepted and never report). `30.4-path-delays` |
 
 ## Next up
 
@@ -91,7 +110,7 @@ In order of how often typical testbenches hit them:
 1. ~~Unpacked arrays and memories (7.4), `foreach` (12.7.3), `$readmemh` (21.4)~~ done
 2. ~~Generate blocks (27), `+:` / `-:` part-selects (11.5.1)~~ done; values wider than 64 bits next
 3. ~~`` `timescale `` (22.7), delay expressions (9.4.1), named events (15.5), disable / wait fork (9.6), final (9.2.3)~~ done
-4. `$urandom` (18.13), immediate assertions (16.3)
+4. ~~`$urandom` (18.13)~~ done; immediate assertions (16.3)
 5. ~~Packed structs (7.2.1), `inside` (11.4.13), `++` inside expressions (11.4.2), real (6.12), string (6.16)~~ done
 6. ~~Dynamic arrays, queues, associative arrays (7.5, 7.10, 7.8)~~ done; unpacked structs (7.2) next
 
