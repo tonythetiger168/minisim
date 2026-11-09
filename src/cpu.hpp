@@ -34,6 +34,9 @@ struct CpuTopo {
     int physical = 0;          // distinct (package, core) pairs
     int pCores = 0, eCores = 0;
     bool hybrid = false, known = false;
+    // Under a hypervisor (WSL2, a cloud VM) the topology is made up and each
+    // virtual CPU can run on any real core; pinning to one then waits for it.
+    bool hypervisor = false;
 
     static int readInt(const std::string& path, int dflt) {
         std::ifstream f(path);
@@ -66,6 +69,10 @@ struct CpuTopo {
     }
 #endif
     void detect() {
+#if defined(__x86_64__) || defined(__i386__)
+        unsigned a, b, c, d;
+        if (__get_cpuid(1, &a, &b, &c, &d)) hypervisor = (c >> 31) & 1;
+#endif
 #if defined(__linux__)
         cpu_set_t mask;
         CPU_ZERO(&mask);
@@ -152,6 +159,7 @@ struct CpuTopo {
         o << logical() << " logical CPUs, " << physical << " physical cores";
         if (hybrid) o << " (" << pCores << " P + " << eCores << " E)";
         if (logical() > physical) o << ", SMT on";
+        if (hypervisor) o << ", under a hypervisor";
         if (!known) o << " (topology unknown)";
         return o.str();
     }
