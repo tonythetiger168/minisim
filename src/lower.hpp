@@ -3407,6 +3407,55 @@ struct Lowerer {
                 for (size_t k : toEnd) prog.code[k].target = prog.here();
                 break;
             }
+            case StatementKind::WaitOrder: {   // wait_order (a, b, c) pass; else fail (15.5.4)
+                // For each event in turn, wait for it or any later one. A
+                // later one triggering first is out of order and fails.
+                const auto& w = s.as<WaitOrderStatement>();
+                std::vector<int> ev;
+                for (auto* x : w.events) ev.push_back(eventSig(*x));
+                std::vector<size_t> toFail;
+                for (size_t k = 0; k < ev.size(); k++) {
+                    std::vector<int> snap;
+                    std::vector<std::pair<int, Edge>> on;
+                    for (size_t j = k; j < ev.size(); j++) {
+                        int sn = fresh(32);
+                        Instr c; c.k = IK::Assign; c.sig = sn; c.e = ref(ev[j]); prog.emit(c);
+                        snap.push_back(sn);
+                        on.push_back({ev[j], ANY});
+                    }
+                    size_t top = prog.here();
+                    prog.emit(waitInstr(on));
+                    for (size_t j = k + 1; j < ev.size(); j++) {
+                        Instr f; f.k = IK::JmpIfNot; f.e = bin(Op::CaseEq, ref(ev[j]), ref(snap[j - k]));
+                        toFail.push_back(prog.emit(f));
+                    }
+                    Instr again; again.k = IK::JmpIfNot; again.e = un(Op::LogNot, bin(Op::CaseEq, ref(ev[k]), ref(snap[0])));
+                    again.target = top;
+                    prog.emit(again);
+                }
+                if (w.ifTrue) stmt(*w.ifTrue);
+                Instr skip; skip.k = IK::Jmp;
+                size_t js = prog.emit(skip);
+                for (size_t f : toFail) prog.code[f].target = prog.here();
+                if (w.ifFalse) stmt(*w.ifFalse);
+                else {   // no else: the failure is an error (15.5.4)
+                    std::string file = "?";
+                    size_t line = 0;
+                    if (const auto* sm = srcMgr()) {
+                        auto loc = sm->getFullyOriginalLoc(s.sourceRange.start());
+                        file = std::string(sm->getFileName(loc));
+                        line = sm->getLineNumber(loc);
+                    }
+                    Instr i; i.k = IK::Display;
+                    i.fmt = "Error: \"" + file + "\", " + std::to_string(line) +
+                            ": wait_order: events triggered out of order at time %0t";
+                    E t = node(Op::Time); t->k = mk(1, 64);
+                    i.args.push_back(t);
+                    prog.emit(i);
+                }
+                prog.code[js].target = prog.here();
+                break;
+            }
             case StatementKind::EventTrigger: {   // -> e, ->> e (15.5.1)
                 const auto& t = s.as<EventTriggerStatement>();
                 int sig = eventSig(t.target);

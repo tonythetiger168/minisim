@@ -75,7 +75,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 12.7.3 | foreach | ✅ | fixed-size arrays, left-to-right per dimension, skipped dimensions, break/continue; dynamic arrays and queues by index, associative arrays in key order. `12.7.3-foreach`, `12.7.3-foreach-order`, `12.7.3-foreach-containers` |
 | 12.8 | break, continue, return | ✅ | |
 | 13 | Tasks and functions | 🟡 | module scope; no recursion, no `ref`, no DPI. `13.4-function-automatic` |
-| 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
+| 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. `wait_order` with pass and fail actions (15.5.4). Not yet: event aliasing (`e1 = e2`). `15.5-events`, `15.5.3-triggered`, `15.5.4-wait-order` |
 | 16 | Assertions | ❌ | immediate and concurrent |
 | 18 | Randomization (constraints) | ❌ | classes, `randomize()`, `std::randomize`, randcase, randsequence |
 | 18.13 | $urandom, $urandom_range | ✅ | one deterministic stream per run, seeded by `-seed <n>` or `+ntb_random_seed=<n>` (the generator is implementation-defined). `18.13-random-functions` |
