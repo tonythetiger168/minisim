@@ -1162,6 +1162,10 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                                 exit(1);
                             }
                         }
+                        if ((size_t)vs >= cr.vt.size()) {
+                            cerr << "internal error: virtual slot " << vs << " past the methods of class " << cr.name << runLocStr() << "\n";
+                            exit(1);
+                        }
                         const auto& ve = cr.vt[(size_t)vs];
                         if (!ve.first) {
                             cerr << "error: call of a pure virtual method at time " << S.now << runLocStr() << "\n";

@@ -561,6 +561,7 @@ struct Lowerer {
     // static code, where every variable is a signal.
     std::vector<FrameLayout*> frames;
     ClassInfo* curClass = nullptr;   // the class whose method is being lowered
+    E defaultSelf;                   // while lowering a method's default argument: the object it is called on
     // Containers reached through a handle (indirect ids): their shapes.
     mutable std::unordered_map<int, DynObj> indShape;
     static bool isInd(int s) { return isRel(s) && relMode(s) >= kRelIndSig; }
@@ -1156,7 +1157,8 @@ struct Lowerer {
             bool isStatic = sym->flags.has(MethodFlags::Static);
             E self;
             if (!isStatic && call.thisClass()) self = exprH(*call.thisClass());
-            if (!isStatic && !call.thisClass() && !curClass) unsupported("method call without an object");
+            else if (!isStatic && defaultSelf) self = defaultSelf;   // in a default argument: the callee's object
+            if (!isStatic && !call.thisClass() && !curClass && !defaultSelf) unsupported("method call without an object");
             int vslot = -1;
             if (!isStatic && sym->isVirtual() && !superCall(call)) {
                 auto vs = vslotMap().find(sym);
@@ -1282,6 +1284,16 @@ struct Lowerer {
             }
             if (formal.dir == ArgumentDirection::In) {
                 if (a.kind == ExpressionKind::EmptyArgument) unsupported("empty argument");
+                // A default argument (13.5.3) is evaluated for the callee: a
+                // method it calls without an object runs on the callee's object.
+                const auto* fs = sub.sym && n < sub.sym->getArguments().size() ? sub.sym->getArguments()[n] : nullptr;
+                if (fs && fs->getDefaultValue() == &a && isClassMethod(*sub.sym) && !noSelf) {
+                    E saved = defaultSelf;
+                    defaultSelf = c.self ? c.self : node(Op::This);
+                    c.init.push_back({formal.sig, expr(a)});
+                    defaultSelf = saved;
+                    continue;
+                }
                 c.init.push_back({formal.sig, expr(a)});
             } else if (formal.dir == ArgumentDirection::InOut) {
                 if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
@@ -6677,14 +6689,14 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         // 6.8: with no initializer, a 2-state variable (int, bit, real) starts at 0.
         // A class handle starts as null (8.4).
-        bool zero = !e && !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || isHandleType(t));
+        bool zero = !t.isFourState() && (t.isIntegral() || t.isFloating() || t.isString() || isHandleType(t));
         if (!e && !zero) return;
-        if (!e) {   // defaults go first, so no initializer (which may call any function) sees an unset variable
+        if (zero) {   // defaults go first, so no initializer (which may call any function) sees an unset variable
             if (!init0) { init0 = std::make_unique<Lowerer>(sigmap); prep(*init0); }
             Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
             i.e = konst(mk(0, storeW(t)));
             init0->prog.emit(i);
-            return;
+            if (!e) return;
         }
         if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);

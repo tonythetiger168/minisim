@@ -2486,8 +2486,16 @@ inline Val eval(const E& e, const Reader& rd) {
             return r;
         }
         case Op::LogNot: return v_lnot(k(0));
-        case Op::LogAnd: return v_land(k(0), k(1));
-        case Op::LogOr: return v_lor(k(0), k(1));
+        case Op::LogAnd: {   // the right operand is not evaluated when the left is false (11.4.7)
+            Val a = k(0);
+            if (truth(a) == 0) return mk(0);
+            return v_land(a, k(1));
+        }
+        case Op::LogOr: {
+            Val a = k(0);
+            if (truth(a) == 1) return mk(1);
+            return v_lor(a, k(1));
+        }
         case Op::RedAnd: return v_red_and(k(0));
         case Op::RedOr: return v_red_or(k(0));
         case Op::RedXor: return v_red_xor(k(0));
