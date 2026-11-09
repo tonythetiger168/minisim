@@ -26,42 +26,107 @@ import sys
 VERSION = "0.1.0"
 
 
-def load(path):
-    with open(path, encoding="utf-8") as f:
-        d = json.load(f)
+def popcount(v):
+    return bin(v).count("1")
+
+
+if hasattr(int, "bit_count"):           # Python 3.10+
+    popcount = int.bit_count
+
+
+def load_into(db, path):
+    """Add one database file into db (as merge() would), without a copy."""
+    with open(path, "rb") as f:
+        d = json.loads(f.read())
     if d.get("format") != "msim-cov":
         raise SystemExit(f"mcov: {path} is not an msim coverage database")
     files = d["files"]
-    db = {"lines": {}, "branches": {}, "toggles": {}, "tests": d.get("tests", [os.path.basename(path)])}
+    lines, branches, toggles = db["lines"], db["branches"], db["toggles"]
+    db["tests"] += d.get("tests", [os.path.basename(path)])
+    get = lines.get
     for fi, ln, hits in d["lines"]:
         k = (files[fi], ln)
-        db["lines"][k] = db["lines"].get(k, 0) + hits
+        lines[k] = get(k, 0) + hits
     for fi, ln, n, t, fl in d["branches"]:
         k = (files[fi], ln, n)
-        a, b = db["branches"].get(k, (0, 0))
-        db["branches"][k] = (a + t, b + fl)
+        old = branches.get(k)
+        branches[k] = (old[0] + t, old[1] + fl) if old else (t, fl)
     for name, w, rise, fall in d["toggles"]:
         r, f = int(rise or "0", 16), int(fall or "0", 16)
-        if name in db["toggles"]:
-            w0, r0, f0 = db["toggles"][name]
-            db["toggles"][name] = (max(w, w0), r | r0, f | f0)
-        else:
-            db["toggles"][name] = (w, r, f)
+        old = toggles.get(name)
+        toggles[name] = (max(w, old[0]), r | old[1], f | old[2]) if old else (w, r, f)
     return db
 
 
+def empty():
+    return {"lines": {}, "branches": {}, "toggles": {}, "tests": []}
+
+
+def load(path):
+    return load_into(empty(), path)
+
+
 def merge(dbs):
-    out = {"lines": {}, "branches": {}, "toggles": {}, "tests": []}
+    out = empty()
     for db in dbs:
-        out["tests"] += db["tests"]
-        for k, h in db["lines"].items():
-            out["lines"][k] = out["lines"].get(k, 0) + h
-        for k, (t, f) in db["branches"].items():
-            a, b = out["branches"].get(k, (0, 0))
-            out["branches"][k] = (a + t, b + f)
-        for k, (w, r, f) in db["toggles"].items():
-            w0, r0, f0 = out["toggles"].get(k, (w, 0, 0))
-            out["toggles"][k] = (max(w, w0), r | r0, f | f0)
+        merge_into(out, db)
+    return out
+
+
+def merge_into(out, db):
+    out["tests"] += db["tests"]
+    lines, branches, toggles = out["lines"], out["branches"], out["toggles"]
+    if not lines and not branches and not toggles:
+        lines.update(db["lines"]); branches.update(db["branches"]); toggles.update(db["toggles"])
+        return out
+    get = lines.get
+    for k, h in db["lines"].items():
+        lines[k] = get(k, 0) + h
+    for k, (t, f) in db["branches"].items():
+        old = branches.get(k)
+        branches[k] = (old[0] + t, old[1] + f) if old else (t, f)
+    for k, (w, r, f) in db["toggles"].items():
+        old = toggles.get(k)
+        toggles[k] = (max(w, old[0]), r | old[1], f | old[2]) if old else (w, r, f)
+    return out
+
+
+def _load_chunk(paths):
+    db = empty()
+    for p in paths:
+        load_into(db, p)
+    return db
+
+
+def cpu_count():
+    """CPUs this process may run on (taskset / cgroup aware), logical threads included."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def load_all(paths, jobs=0):
+    """Load and merge databases; with many files, in parallel worker processes.
+    JSON decoding is CPU bound, so each worker merges its own share and the
+    partial results are merged here, in input order (sums and ORs commute)."""
+    jobs = jobs or cpu_count()
+    jobs = max(1, min(jobs, len(paths) // 4))
+    if jobs <= 1:
+        return _load_chunk(paths)
+    import concurrent.futures as cf
+    size = (len(paths) + jobs - 1) // jobs
+    chunks = [paths[i:i + size] for i in range(0, len(paths), size)]
+    try:
+        with cf.ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+            parts = list(pool.map(_load_chunk, chunks))
+    except SystemExit:
+        raise
+    except Exception:   # no worker processes here (or they cannot import mcov): load serially
+        return _load_chunk(paths)
+    out = empty()
+    for part in parts:
+        merge_into(out, part)
     return out
 
 
@@ -69,68 +134,84 @@ def save(db, path):
     files = sorted({k[0] for k in db["lines"]} | {k[0] for k in db["branches"]})
     idx = {f: i for i, f in enumerate(files)}
     hexw = lambda v, w: format(v, "x").rjust((w + 3) // 4, "0")
-    d = {
-        "format": "msim-cov", "version": 1, "tool": f"mcov {VERSION}", "tests": db["tests"],
-        "files": files,
-        "lines": [[idx[f], ln, h] for (f, ln), h in sorted(db["lines"].items())],
-        "branches": [[idx[f], ln, n, t, fl] for (f, ln, n), (t, fl) in sorted(db["branches"].items())],
-        "toggles": [[name, w, hexw(r, w), hexw(fl, w)] for name, (w, r, fl) in sorted(db["toggles"].items())],
-    }
+    # One entry per line, like msim writes it. Built with json.dumps per row:
+    # json.dump(indent=...) uses the pure-Python encoder, which was most of
+    # the time of a large merge.
+    dumps = json.dumps
+    rows = lambda items: ",\n".join(dumps(r) for r in items)
+    head = {"format": "msim-cov", "version": 1, "tool": f"mcov {VERSION}"}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(d, f, indent=0)
+        f.write("{\n" + "".join(f"{dumps(k)}: {dumps(v)},\n" for k, v in head.items()))
+        f.write(f'"tests": {dumps(db["tests"])},\n"files": {dumps(files)},\n')
+        f.write('"lines": [\n' + rows([idx[fl], ln, h] for (fl, ln), h in sorted(db["lines"].items())) + "\n],\n")
+        f.write('"branches": [\n' + rows([idx[fl], ln, n, t, fa] for (fl, ln, n), (t, fa)
+                                         in sorted(db["branches"].items())) + "\n],\n")
+        f.write('"toggles": [\n' + rows([name, w, hexw(r, w), hexw(fa, w)] for name, (w, r, fa)
+                                        in sorted(db["toggles"].items())) + "\n]\n}\n")
+
+
+def by_file(db):
+    """file -> ({line: hits}, {line: [(n, taken, not taken)]}), one pass over the database."""
+    out = {}
+    for (f, ln), h in db["lines"].items():
+        out.setdefault(f, ({}, {}))[0][ln] = h
+    for (f, ln, n), tf in db["branches"].items():
+        out.setdefault(f, ({}, {}))[1].setdefault(ln, []).append((n,) + tuple(tf))
+    return out
 
 
 def pct(a, b):
     return 100.0 * a / b if b else 100.0
 
 
-def summarize(db, exclude):
+def summarize(db, exclude, files=None):
     """Per file: (lines hit, lines, branch outcomes hit, outcomes); toggles in total."""
+    files = files if files is not None else by_file(db)
+    rx = re.compile(exclude) if exclude else None
     per = {}
-    for (f, ln), h in db["lines"].items():
-        if exclude and re.search(exclude, f):
+    for f, (hits, br) in files.items():
+        if rx and rx.search(f):
             continue
-        s = per.setdefault(f, [0, 0, 0, 0])
-        s[1] += 1
-        s[0] += h > 0
-    for (f, ln, n), (t, fl) in db["branches"].items():
-        if exclude and re.search(exclude, f):
-            continue
-        s = per.setdefault(f, [0, 0, 0, 0])
-        s[3] += 2
-        s[2] += (t > 0) + (fl > 0)
+        s = [sum(1 for h in hits.values() if h > 0), len(hits), 0, 0]
+        for arms in br.values():
+            for _, t, fl in arms:
+                s[3] += 2
+                s[2] += (t > 0) + (fl > 0)
+        per[f] = s
     tog_hit = tog_all = 0
     for name, (w, r, fl) in db["toggles"].items():
-        if exclude and re.search(exclude, name):
+        if rx and rx.search(name):
             continue
-        both = r & fl
-        tog_hit += bin(both).count("1")
+        tog_hit += popcount(r & fl)
         tog_all += w
     return per, tog_hit, tog_all
 
 
-def write_lcov(db, path, exclude):
+def write_lcov(db, path, exclude, files=None):
+    files = files if files is not None else by_file(db)
+    rx = re.compile(exclude) if exclude else None
+    out = ["TN:msim\n"]
+    for src in sorted(f for f, (hits, _) in files.items() if hits):
+        if rx and rx.search(src):
+            continue
+        hits, br = files[src]
+        out.append(f"SF:{src}\n")
+        brs = sorted((ln, n, t, fl) for ln, arms in br.items() for n, t, fl in arms)
+        for ln, n, t, fl in brs:
+            out.append(f"BRDA:{ln},{n},0,{t}\nBRDA:{ln},{n},1,{fl}\n")
+        if brs:
+            out.append(f"BRF:{2 * len(brs)}\nBRH:{sum((t > 0) + (fl > 0) for _, _, t, fl in brs)}\n")
+        lines = sorted(hits.items())
+        out.extend(f"DA:{ln},{h}\n" for ln, h in lines)
+        out.append(f"LF:{len(lines)}\nLH:{sum(h > 0 for _, h in lines)}\nend_of_record\n")
     with open(path, "w", encoding="utf-8") as f:
-        f.write("TN:msim\n")
-        files = sorted({k[0] for k in db["lines"]})
-        for src in files:
-            if exclude and re.search(exclude, src):
-                continue
-            f.write(f"SF:{src}\n")
-            brs = sorted((k, v) for k, v in db["branches"].items() if k[0] == src)
-            for (_, ln, n), (t, fl) in brs:
-                f.write(f"BRDA:{ln},{n},0,{t}\nBRDA:{ln},{n},1,{fl}\n")
-            if brs:
-                f.write(f"BRF:{2 * len(brs)}\nBRH:{sum((t > 0) + (fl > 0) for _, (t, fl) in brs)}\n")
-            lines = sorted((ln, h) for (s, ln), h in db["lines"].items() if s == src)
-            for ln, h in lines:
-                f.write(f"DA:{ln},{h}\n")
-            f.write(f"LF:{len(lines)}\nLH:{sum(h > 0 for _, h in lines)}\nend_of_record\n")
+        f.write("".join(out))
 
 
-def write_html(db, outdir, exclude):
+def write_html(db, outdir, exclude, files=None):
     os.makedirs(outdir, exist_ok=True)
-    per, th, ta = summarize(db, exclude)
+    files = files if files is not None else by_file(db)
+    per, th, ta = summarize(db, exclude, files)
     style = ("body{font:14px system-ui,sans-serif;margin:24px}table{border-collapse:collapse}"
              "td,th{border:1px solid #ccc;padding:3px 8px}pre{margin:0}.hit{background:#e5f4e4}"
              ".miss{background:#fbebeb}.part{background:#f9eeda}.src td{border:none;padding:0 8px;"
@@ -140,11 +221,8 @@ def write_html(db, outdir, exclude):
         page = f"f{i}.html"
         rows.append(f"<tr><td><a href='{page}'>{html.escape(src)}</a></td><td>{pct(lh, lt):.1f}% ({lh}/{lt})</td>"
                     f"<td>{pct(bh, bt):.1f}% ({bh}/{bt})</td></tr>")
-        hits = {ln: h for (s, ln), h in db["lines"].items() if s == src}
-        br = {}
-        for (s, ln, n), (t, fl) in db["branches"].items():
-            if s == src:
-                br.setdefault(ln, []).append((t, fl))
+        hits, arms = files[src]
+        br = {ln: [(t, fl) for _, t, fl in a] for ln, a in arms.items()}
         try:
             with open(src, encoding="utf-8", errors="replace") as f:
                 text = f.read().splitlines()
@@ -170,11 +248,12 @@ def write_html(db, outdir, exclude):
                     f"[TF] both seen, [T-] never false, [-F] never true.</p>"
                     f"<table class='src'>{''.join(body)}</table></body></html>")
     togs = []
+    rx = re.compile(exclude) if exclude else None
     for name, (w, r, fl) in sorted(db["toggles"].items()):
-        if exclude and re.search(exclude, name):
+        if rx and rx.search(name):
             continue
         both = r & fl
-        n = bin(both).count("1")
+        n = popcount(both)
         if n < w:
             missing = [str(b) for b in range(w) if not (both >> b) & 1]
             togs.append(f"<tr><td>{html.escape(name)}</td><td>{n}/{w}</td><td>{', '.join(missing[:32])}"
@@ -197,21 +276,24 @@ def main(argv=None):
     m = sub.add_parser("merge", help="merge databases")
     m.add_argument("dbs", nargs="+")
     m.add_argument("-o", required=True, help="merged database")
+    m.add_argument("-j", type=int, default=0, help="worker processes for loading (default: available CPUs)")
     r = sub.add_parser("report", help="print a summary; optionally HTML / LCOV")
     r.add_argument("dbs", nargs="+", help="databases (merged first if several)")
     r.add_argument("-html", metavar="DIR")
     r.add_argument("-lcov", metavar="FILE")
     r.add_argument("-exclude", metavar="REGEX", help="leave out files / signals matching this")
+    r.add_argument("-j", type=int, default=0, help="worker processes for loading (default: available CPUs)")
     for k in ("line", "branch", "toggle"):
         r.add_argument(f"-min-{k}", type=float, metavar="PCT", help=f"exit 1 if {k} coverage is below PCT")
     a = ap.parse_args(argv)
 
-    db = merge([load(p) for p in a.dbs])
+    db = load_all(a.dbs, a.j)
     if a.cmd == "merge":
         save(db, a.o)
         print(f"mcov: merged {len(a.dbs)} database(s) ({len(db['tests'])} run(s)) into {a.o}")
         return 0
-    per, th, ta = summarize(db, a.exclude)
+    files = by_file(db)
+    per, th, ta = summarize(db, a.exclude, files)
     lh = sum(v[0] for v in per.values()); lt = sum(v[1] for v in per.values())
     bh = sum(v[2] for v in per.values()); bt = sum(v[3] for v in per.values())
     w = max([len(f) for f in per] + [4])
@@ -221,10 +303,10 @@ def main(argv=None):
     print(f"{'Total':<{w}}  {pct(lh, lt):6.1f}% {lh:>4}/{lt:<4}  {pct(bh, bt):6.1f}% {bh:>4}/{bt:<4}")
     print(f"Toggle: {pct(th, ta):.1f}% ({th}/{ta} bits toggled both ways), {len(db['tests'])} run(s)")
     if a.html:
-        write_html(db, a.html, a.exclude)
+        write_html(db, a.html, a.exclude, files)
         print(f"HTML: {os.path.join(a.html, 'index.html')}")
     if a.lcov:
-        write_lcov(db, a.lcov, a.exclude)
+        write_lcov(db, a.lcov, a.exclude, files)
         print(f"LCOV: {a.lcov}")
     rc = 0
     for k, (hit, tot) in {"line": (lh, lt), "branch": (bh, bt), "toggle": (th, ta)}.items():

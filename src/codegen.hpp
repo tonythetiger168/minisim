@@ -77,7 +77,22 @@ public:
         for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); }
         std::ostringstream body;
         std::vector<int> byRank;
-        std::vector<int> dom = cycle ? cycleDomain(procs) : std::vector<int>{};
+        std::vector<int> dom = cycle && !cov ? cycleDomain(procs) : std::vector<int>{};
+        {
+            // The domain re-evaluates every static combinational statement on
+            // each commit (and whenever any input changes). That pays when the
+            // registers feed most of the logic every cycle (bench/: at most 6
+            // statements per NBA), not for a CPU whose decoder and datapath far
+            // outnumber the registers that change: Ibex has 1400 statements for
+            // 62 NBAs, and ran 6x faster with only the changed ranks evaluated.
+            size_t nba = 0, comb = 0;
+            for (int i : dom)
+                for (auto& in : procs[i].prog->code) nba += in.k == IK::Nba;
+            for (auto& p : procs)
+                if (p.combRank >= 0)
+                    for (auto& in : p.prog->code) { if (in.k != IK::Assign) break; comb++; }
+            if (comb > 64 && comb > 8 * nba) dom.clear();
+        }
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
         for (size_t i = 0; i < procs.size(); i++) {
             bool inDom = std::find(dom.begin(), dom.end(), (int)i) != dom.end();
@@ -114,9 +129,74 @@ public:
              "template <class... T> static inline Val CAT(T... p) { Val r{0, 0, 0}; ((r = cat1(r, p)), ...); return r; }\n"
              "static E X(Op op, Val k, int sig, int hi, int lo, bool sg, std::vector<E> kids) {\n"
              "    E e = node(op, std::move(kids)); e->k = k; e->sig = sig; e->hi = hi; e->lo = lo; e->sgn = sg; return e;\n"
+             "}\n"
+             "static E XF(E e, const char* f) { e->fmt = f; return e; }\n"
+             "static E XA(E e, const ArrShape& a) { e->arr = std::shared_ptr<const ArrShape>(std::shared_ptr<void>{}, &a); return e; }\n"
+             "// Unpacked arrays (eval() Op::ArrRead, target() in exec.inc): the element signal, or -1.\n"
+             "static inline int AOFF(const ArrShape& a, std::initializer_list<Val> ix) {\n"
+             "    int64_t off = 0; size_t d = 0;\n"
+             "    for (const Val& v : ix) {\n"
+             "        if (shiftUnknown(v)) return -1;\n"
+             "        auto [l, r] = a.dims[d++];\n"
+             "        int64_t n = (l > r ? l - r : r - l) + 1, i = v_to_i64(v), o = l <= r ? i - l : l - i;\n"
+             "        if (o < 0 || o >= n) return -1;\n"
+             "        off = off * n + o;\n"
+             "    }\n"
+             "    return a.base + (int)off;\n"
+             "}\n"
+             "static inline Val AREAD(const ArrShape& a, std::initializer_list<Val> ix) {\n"
+             "    int s = AOFF(a, ix);\n"
+             "    if (s < 0) return a.twoState ? make(0, 0, a.elemW, 0, a.sgn) : xfill(a.elemW, a.sgn);\n"
+             "    Val r = S.get(s); r.sgn = a.sgn; return r;\n"
+             "}\n"
+             "static inline Val DSL(const Val& a, const Val& i, int w, bool down) {\n"
+             "    if (shiftUnknown(i)) return allx(w);\n"
+             "    int64_t s = v_to_i64(i);\n"
+             "    return v_dynslice(a, down ? s - w + 1 : s, w);\n"
+             "}\n"
+             "static inline bool BIT(const Val& iv, int vlo, int pw, bool pdown, int w, int& hi, int& lo, Val& val) {\n"
+             "    if (iv.x) return false;\n"
+             "    int64_t b = v_to_i64(iv) - vlo;\n"
+             "    if (!pw) { if (b < 0 || b >= w) return false; hi = lo = (int)b; return true; }\n"
+             "    int64_t l = pdown ? b - pw + 1 : b, h = l + pw - 1;\n"
+             "    int64_t cl = std::max<int64_t>(l, 0), ch = std::min<int64_t>(h, w - 1);\n"
+             "    if (cl > ch) return false;\n"
+             "    val = v_slice(val, (int)(ch - l), (int)(cl - l)); hi = (int)ch; lo = (int)cl; return true;\n"
              "}\n\n";
+        // Trees rebuilt at startup, made now: they may name arrays (AS<k>).
+        std::vector<std::string> sysTrees;
+        for (auto& args : sysArgs_) {
+            std::string t;
+            for (size_t j = 0; j < args.size(); j++) t += (j ? ", " : "") + tree(args[j]);
+            sysTrees.push_back(t);
+        }
+        std::vector<std::string> evTrees;
+        for (auto& e : evals_) evTrees.push_back(tree(e));
+        std::vector<std::string> memInit;
+        for (size_t k = 0; k < mems_.size(); k++) {
+            const Instr& i = *mems_[k];
+            std::string t = "    MI" + std::to_string(k) + ".k = IK::" + (i.k == IK::ReadMem ? "ReadMem" : "WriteMem") +
+                            "; MI" + std::to_string(k) + ".fmt = " + quote(i.fmt) + "; MI" + std::to_string(k) +
+                            ".hex = " + (i.hex ? "true" : "false") + "; MI" + std::to_string(k) +
+                            ".arr = std::shared_ptr<const ArrShape>(std::shared_ptr<void>{}, &" + arrName(i.arr.get()) + ");";
+            std::string args;
+            for (size_t j = 0; j < i.args.size(); j++) args += (j ? ", " : "") + tree(i.args[j]);
+            t += " MI" + std::to_string(k) + ".args = {" + args + "};\n";
+            memInit.push_back(t);
+        }
+        for (size_t k = 0; k < arrs_.size(); k++) {
+            const ArrShape& a = *arrs_[k];
+            o << "static const ArrShape AS" << k << "{" << a.base << ", " << a.count << ", " << a.elemW << ", "
+              << (a.sgn ? "true" : "false") << ", " << (a.twoState ? "true" : "false") << ", {";
+            for (size_t d = 0; d < a.dims.size(); d++)
+                o << (d ? ", " : "") << "{" << a.dims[d].first << "LL, " << a.dims[d].second << "LL}";
+            o << "}};\n";
+        }
         for (size_t i = 0; i < sysArgs_.size(); i++) o << "static std::vector<E> A" << i << ";\n";
+        for (size_t i = 0; i < evals_.size(); i++) o << "static E T" << i << ";\n";
+        for (size_t i = 0; i < mems_.size(); i++) o << "static Instr MI" << i << ";\n";
         for (size_t i = 0; i < events_.size(); i++) o << "static std::vector<std::pair<int, Edge>> EV" << i << ";\n";
+        if (cov) o << "uint64_t CV[" << std::max<size_t>(2, 2 * covSlots.size()) << "];\n";
         o << "static std::atomic<bool> pclean{false};   // every private signal is known (no X or Z bit)\n";
         // Private signals start as their S.sigs counterparts do: a variable X, a net Z.
         for (size_t s = 0; s < priv_.size(); s++)
@@ -126,8 +206,25 @@ public:
             }
         o << "\n" << body.str();
 
+        if (cov)
+            o << "// Counters, then per signal its toggle masks (Sim::togRise / togFall), for msim.\n"
+                 "static bool writeCov(const char* path) {\n"
+                 "    FILE* f = std::fopen(path, \"wb\");\n"
+                 "    if (!f) return false;\n"
+                 "    uint64_t n = sizeof CV / sizeof CV[0], ns = S.sigs.size();\n"
+                 "    std::fwrite(&n, 8, 1, f); std::fwrite(CV, 8, n, f); std::fwrite(&ns, 8, 1, f);\n"
+                 "    for (size_t s = 0; s < ns; s++) {\n"
+                 "        static const std::vector<uint64_t> none;\n"
+                 "        const auto& R = s < S.togRise.size() ? S.togRise[s] : none;\n"
+                 "        const auto& F = s < S.togFall.size() ? S.togFall[s] : none;\n"
+                 "        uint64_t k = R.size();\n"
+                 "        std::fwrite(&k, 8, 1, f); std::fwrite(R.data(), 8, k, f); std::fwrite(F.data(), 8, k, f);\n"
+                 "    }\n"
+                 "    return std::fclose(f) == 0;\n"
+                 "}\n\n";
         o << "int main(int argc, char** argv) {\n"
              "    uint64_t maxTime = ~0ULL;\n"
+             "    const char* covOut = nullptr;\n"
              "    S.vcdPath = \"\";\n"
              "    S.threads = defaultThreads();\n"
              "    for (int i = 1; i < argc; i++) {\n"
@@ -140,6 +237,12 @@ public:
              "        }\n"
              "        else if (!std::strcmp(argv[i], \"-no-pin\")) g_pin = 0;\n"
              "        else if (!std::strcmp(argv[i], \"-pin\")) g_pin = 1;\n"
+             "        else if (!std::strcmp(argv[i], \"-cov\") && i + 1 < argc) { g_cov = true; covOut = argv[++i]; }\n"
+             "        else if (!std::strcmp(argv[i], \"-seed\") && i + 1 < argc) {   // as msim -seed\n"
+             "            uint64_t st = (std::strtoull(argv[++i], nullptr, 10) + 1) * 0x9E3779B97F4A7C15ull;\n"
+             "            urandomState() = st ? st : 1;\n"
+             "        }\n"
+             "        else if (argv[i][0] == '+') plusArgs().push_back(argv[i] + 1);\n"
              "    }\n"
              "    S.threads = std::min(S.threads, maxThreads());\n";
         for (size_t s = 0; s < sigs.size(); s++) {
@@ -147,11 +250,9 @@ public:
             for (int d = 0; d < sigs[s].drivers; d++) o << " S.newDriver(" << s << ");";
             o << "\n";
         }
-        for (size_t i = 0; i < sysArgs_.size(); i++) {
-            o << "    A" << i << " = {";
-            for (size_t j = 0; j < sysArgs_[i].size(); j++) o << (j ? ", " : "") << tree(sysArgs_[i][j]);
-            o << "};\n";
-        }
+        for (size_t i = 0; i < sysArgs_.size(); i++) o << "    A" << i << " = {" << sysTrees[i] << "};\n";
+        for (size_t i = 0; i < evals_.size(); i++) o << "    T" << i << " = " << evTrees[i] << ";\n";
+        for (auto& m : memInit) o << m;
         for (size_t i = 0; i < events_.size(); i++) {
             o << "    EV" << i << " = {";
             for (size_t j = 0; j < events_[i].size(); j++)
@@ -209,8 +310,9 @@ public:
             o << "}, " << list(parts.targets) << ");\n";
         }
         o << "    S.run(maxTime);\n"
-             "    std::cout.flush();\n"
-             "    return 0;\n"
+             "    std::cout.flush();\n";
+        if (cov) o << "    if (covOut && !writeCov(covOut)) { std::cerr << \"simv: cannot write \" << covOut << \"\\n\"; return 1; }\n";
+        o << "    return 0;\n"
              "}\n";
         return o.str();
     }
@@ -219,6 +321,27 @@ public:
     bool twoState = true;  // emit the 2-state fast path (see fast())
     bool cycle = true;     // emit the cycle domain (see cycleDomain())
     bool privates = true;  // ...with its private signals in static variables (no VCD planned)
+    // msim -compile -cov: count executions in CV[2k] and taken jumps in
+    // CV[2k+1] for instruction covSlots[k], as exec.inc's covHit does. simv
+    // writes the counters and toggle masks to its -cov file and msim turns
+    // them into the coverage database. The cycle domain is off with it.
+    bool cov = false;
+    std::vector<std::pair<const Prog*, size_t>> covSlots;
+    std::map<std::pair<const Prog*, size_t>, size_t> covIdx_;
+    size_t covSlot(const Prog* p, size_t pc) {
+        auto [it, fresh] = covIdx_.try_emplace({p, pc}, covSlots.size());
+        if (fresh) covSlots.push_back({p, pc});
+        return it->second;
+    }
+    std::string CH(const Prog* p, size_t pc) {   // instruction pc of p runs
+        return cov ? " ++CV[" + std::to_string(2 * covSlot(p, pc)) + "];" : std::string();
+    }
+    std::string CT(const Prog* p, size_t pc) {   // ...and its JmpIfNot jumps
+        return cov ? " ++CV[" + std::to_string(2 * covSlot(p, pc) + 1) + "];" : std::string();
+    }
+    std::string jumpTo(const Prog* p, size_t pc, const std::string& label) {
+        return cov ? "{" + CT(p, pc) + " goto " + label + "; }" : "goto " + label + ";";
+    }
 
 private:
     std::vector<int> sigW_;
@@ -240,6 +363,41 @@ private:
     std::string xRef(int s) const { return isPriv(s) ? "P" + std::to_string(s) + ".x" : "S.sigs[" + std::to_string(s) + "].val.x"; }
     std::vector<std::vector<E>> sysArgs_;
     std::vector<std::vector<std::pair<int, Edge>>> events_;
+    std::vector<const ArrShape*> arrs_;   // unpacked arrays, emitted as AS<k>
+    std::vector<E> evals_;                // operators without C++ yet: interpreted (T<k>)
+    std::vector<const Instr*> mems_;      // $readmem / $writemem instructions, rebuilt as MI<k>
+    bool readsPriv(const E& e) const {
+        if (!e) return false;
+        if (e->op == Op::Ref && isPriv(e->sig)) return true;
+        for (auto& k : e->kids) if (readsPriv(k)) return true;
+        return false;
+    }
+    std::string arrName(const ArrShape* a) {
+        for (size_t k = 0; k < arrs_.size(); k++)
+            if (arrs_[k] == a || (arrs_[k]->base == a->base && arrs_[k]->count == a->count && arrs_[k]->dims == a->dims &&
+                                  arrs_[k]->elemW == a->elemW && arrs_[k]->sgn == a->sgn && arrs_[k]->twoState == a->twoState))
+                return "AS" + std::to_string(k);
+        arrs_.push_back(a);
+        return "AS" + std::to_string(arrs_.size() - 1);
+    }
+    // An element write chosen at run time (a[i] = v, v[i] = v, v[i +: w] = v):
+    // the code that sets s, hi, lo and v, then runs `then` unless the index is
+    // invalid (7.4.6, 11.5.1). Mirrors target() in exec.inc.
+    std::string dynTarget(const Instr& i, const std::string& val, const std::string& then) {
+        if (isPriv(i.sig)) throw CodegenUnsupported("variable-index write to a private signal");
+        std::ostringstream o;
+        o << " { Val v = " << val << "; int s = " << i.sig << ", hi = " << i.hi << ", lo = " << i.lo << ";";
+        if (i.arr) {
+            o << " s = AOFF(" << arrName(i.arr.get()) << ", {";
+            for (size_t k = 0; k < i.aidx.size(); k++) o << (k ? ", " : "") << fast(i.aidx[k]);
+            o << "}); if (s >= 0)";
+        }
+        if (i.bidx)
+            o << " if (BIT(" << fast(i.bidx) << ", " << i.lo << ", " << i.pw << ", " << (i.pdown ? "true" : "false")
+              << ", S.sigs[s].w, hi, lo, v))";
+        o << " {" << then << "} }\n";
+        return o.str();
+    }
 
     static std::string quote(const std::string& s) {
         std::string r = "\"";
@@ -274,37 +432,17 @@ private:
     }
     static const char* edge(Edge e) { return e == POS ? "POS" : e == NEG ? "NEG" : "ANY"; }
 
-    static const char* opName(Op op) {
-        switch (op) {
-            case Op::Const: return "Const";   case Op::Ref: return "Ref";
-            case Op::Not: return "Not";       case Op::And: return "And";
-            case Op::Or: return "Or";         case Op::Xor: return "Xor";
-            case Op::Add: return "Add";       case Op::Sub: return "Sub";
-            case Op::Mul: return "Mul";       case Op::Div: return "Div";
-            case Op::Mod: return "Mod";       case Op::Eq: return "Eq";
-            case Op::Ne: return "Ne";         case Op::CaseEq: return "CaseEq";
-            case Op::CaseZEq: return "CaseZEq"; case Op::CaseXEq: return "CaseXEq";
-            case Op::Lt: return "Lt";         case Op::Le: return "Le";
-            case Op::Gt: return "Gt";         case Op::Ge: return "Ge";
-            case Op::Shl: return "Shl";       case Op::Shr: return "Shr";
-            case Op::Asr: return "Asr";       case Op::Resize: return "Resize";
-            case Op::LogNot: return "LogNot"; case Op::LogAnd: return "LogAnd";
-            case Op::LogOr: return "LogOr";   case Op::RedAnd: return "RedAnd";
-            case Op::RedOr: return "RedOr";   case Op::RedXor: return "RedXor";
-            case Op::Slice: return "Slice";   case Op::Index: return "Index";
-            case Op::Concat: return "Concat"; case Op::Mux: return "Mux";
-        }
-        throw CodegenUnsupported("operator " + std::to_string((int)op));
-    }
-
     // The tree itself, rebuilt at startup (for the printing system tasks).
     std::string tree(const E& e) {
         if (!e) return "E{}";
         std::string kids;
         for (size_t i = 0; i < e->kids.size(); i++) kids += (i ? ", " : "") + tree(e->kids[i]);
-        return std::string("X(Op::") + opName(e->op) + ", " + val(e->k) + ", " + std::to_string(e->sig) + ", " +
-               std::to_string(e->hi) + ", " + std::to_string(e->lo) + ", " + (e->sgn ? "true" : "false") + ", {" +
-               kids + "})";
+        if (e->op == Op::ArrRead)
+            return "XA(X(Op::ArrRead, Val{}, -1, 0, 0, false, {" + kids + "}), " + arrName(e->arr.get()) + ")";
+        std::string x = std::string("X(Op(") + std::to_string((int)e->op) + "), " + val(e->k) + ", " + std::to_string(e->sig) + ", " +
+               std::to_string(e->hi) + ", " + std::to_string(e->lo) + ", " + (e->sgn ? "true" : "false") + ", {" + kids + "})";
+        if (!e->fmt.empty()) x = "XF(" + x + ", " + quote(e->fmt) + ")";
+        return x;
     }
 
     // The expression as C++. Mirrors eval() in expr.hpp case by case.
@@ -319,6 +457,13 @@ private:
                 if (isPriv(e->sig))
                     return "PR(P" + std::to_string(e->sig) + ", " + std::to_string(sigW_[e->sig]) + ", " + (e->sgn ? "true" : "false") + ")";
                 return "R(" + std::to_string(e->sig) + ", " + (e->sgn ? "true" : "false") + ")";
+            case Op::DynSlice:   // a[i +: w] / a[i -: w] read (11.5.1)
+                return "DSL(" + k(0) + ", " + k(1) + ", " + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ")";
+            case Op::ArrRead: {
+                std::string ix;
+                for (size_t i = 0; i < e->kids.size(); i++) ix += (i ? ", " : "") + k((int)i);
+                return "AREAD(" + arrName(e->arr.get()) + ", {" + ix + "})";
+            }
             case Op::Not: return f1("v_not");
             case Op::And: return f2("v_and");
             case Op::Or: return f2("v_or");
@@ -358,8 +503,14 @@ private:
                 return r + ")";
             }
             case Op::Mux: return "v_mux(" + k(0) + ", " + k(1) + ", " + k(2) + ")";
+            default: break;
         }
-        throw CodegenUnsupported("operator " + std::to_string((int)e->op));
+        // Any other operator (==?, real math, strings, system functions, ...):
+        // the interpreter's eval() on the subtree, rebuilt at startup.
+        if (readsPriv(e)) throw CodegenUnsupported("operator " + std::to_string((int)e->op) + " on a private signal");
+        val(e->k);   // throws for a real or string constant
+        evals_.push_back(e);
+        return "eval(T" + std::to_string(evals_.size() - 1) + ", rd)";
     }
 
     // ---- 2-state fast path ----
@@ -593,8 +744,10 @@ private:
             if (!procs[i].seq || procs[i].combRank >= 0) continue;
             bool forward = true;
             const auto& code = procs[i].prog->code;
-            for (size_t pc = 1; pc + 1 < code.size(); pc++)
+            for (size_t pc = 1; pc + 1 < code.size(); pc++) {
                 if ((code[pc].k == IK::Jmp || code[pc].k == IK::JmpIfNot) && code[pc].target <= pc) forward = false;
+                if (code[pc].arr || code[pc].bidx) forward = false;   // no fixed slot: an ordinary clocked function
+            }
             if (!forward) continue;
             bool placed = false;
             for (auto& g : groups)
@@ -826,7 +979,7 @@ private:
         // Only when something watches every change (a VCD opened at run time).
         o << "static void syncP() {\n";
         for (int s : privs)
-            o << "    S.set(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
+            o << "    S.fw(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
         o << "}\n";
         // Comb statements first: their reads are part of `ext`, which twoNow checks.
         std::vector<std::string> combStmts, combStmts2, commitStmts;
@@ -1030,16 +1183,17 @@ private:
         size_t end = p.code.size() - 1;
         auto L = [](size_t pc) { return "s_" + std::to_string(pc); };
         o << "// process " << n << " (" << kind << ", clocked)\n";
-        o << "static void seq" << n << "(const void*, std::vector<Sim::NbaItem>& nb) {\n";
+        o << "static void seq" << n << "(const void*, std::vector<Sim::NbaItem>& nb) {" << CH(&p, 0) << "\n";
         for (size_t pc = 1; pc < end; pc++) {
             const Instr& i = p.code[pc];
-            o << L(pc) << ":";
+            o << L(pc) << ":" << CH(&p, pc);
             switch (i.k) {
                 case IK::Nba:
-                    if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
-                    o << " nb.push_back({" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
+                    if (i.drv >= 0 || i.dyn >= 0 || i.nbaLater) throw CodegenUnsupported("NBA kind in a clocked process");
+                    if (i.arr || i.bidx) o << dynTarget(i, fast(i.e), " nb.push_back({s, v, hi, lo});");
+                    else o << " nb.push_back({" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
                     break;
-                case IK::JmpIfNot: o << " if (truth(" << fast(i.e) << ") != 1) goto " << L(i.target) << ";\n"; break;
+                case IK::JmpIfNot: o << " if (truth(" << fast(i.e) << ") != 1) " << jumpTo(&p, pc, L(i.target)) << "\n"; break;
                 case IK::Jmp: o << " goto " << L(i.target) << ";\n"; break;
                 default: throw CodegenUnsupported("instruction in a clocked process");
             }
@@ -1051,13 +1205,15 @@ private:
     void emitComb(std::ostream& o, int n, const Prog& p, const std::string& kind) {
         o << "// process " << n << " (" << kind << ", combinational)\n";
         o << "static void comb" << n << "(const void*) {\n";
-        for (const Instr& i : p.code) {
+        for (size_t pc = 0; pc < p.code.size(); pc++) {
+            const Instr& i = p.code[pc];
             if (i.k != IK::Assign) break;
-            o << "   " << assign(i);
+            if (i.arr || i.bidx) throw CodegenUnsupported("variable-index write in a static combinational process");
+            o << "  " << CH(&p, pc) << " " << assign(i);
         }
         o << "}\n";
         if (oneAssign(p)) {
-            o << "static Val combv" << n << "(const void*) { return " << fast(p.code[0].e) << "; }\n";
+            o << "static Val combv" << n << "(const void*) {" << CH(&p, 0) << " return " << fast(p.code[0].e) << "; }\n";
             o << "static void combc" << n << "(const void*, Val v) {" << assign(p.code[0], "v") << "}\n";
         }
         o << "\n";
@@ -1107,22 +1263,43 @@ private:
             if (pi) o << "    // subroutine body\n";
             for (size_t pc = 0; pc < p.code.size(); pc++) {
                 const Instr& i = p.code[pc];
-                o << L(P, pc) << ":";
+                o << L(P, pc) << ":" << CH(&p, pc);
                 auto tgt = [&](size_t t) { return L(P, t > p.code.size() ? p.code.size() : t); };
-                // A write chosen at run time (a[i] = ..., v[i] = ...) is not compiled yet.
-                if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
+                // A write chosen at run time (a[i] = ..., v[i] = ...): Assign and Nba only.
+                bool dynW = (i.k == IK::Assign || i.k == IK::Nba) && (i.arr || i.bidx);
+                if (dynW && ((i.k != IK::Assign && i.k != IK::Nba) || i.drv >= 0))
+                    throw CodegenUnsupported(std::string("array or variable-index ") + (i.drv >= 0 ? "continuous assign" : "write (instruction " + std::to_string((int)i.k) + ")"));
                 if (i.de || i.nbaLater) throw CodegenUnsupported("delay expression or intra-assignment delay");
                 if (i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) throw CodegenUnsupported("dynamic array");
                 if (!p.roots.empty()) throw CodegenUnsupported("disable of a named block");
                 if (i.k == IK::Finish && i.hi > 0) throw CodegenUnsupported("$fatal exit status");
                 if (!i.dly.empty()) throw CodegenUnsupported("delayed continuous assignment");
+                if (i.k == IK::ReadMem || i.k == IK::WriteMem) {   // $readmem / $writemem (21.4, 21.5)
+                    if (!i.arr || readsPriv(i.e)) throw CodegenUnsupported("$readmem form");
+                    for (auto& a : i.args) if (readsPriv(a)) throw CodegenUnsupported("$readmem form");
+                    mems_.push_back(&i);
+                    std::string M_ = "MI" + std::to_string(mems_.size() - 1);
+                    arrName(i.arr.get());
+                    if (i.e) {   // a file name known only at run time
+                        evals_.push_back(i.e);
+                        o << " { Instr n = " << M_ << "; n.fmt = v_str(eval(T" << evals_.size() - 1 << ", rd)); "
+                          << (i.k == IK::ReadMem ? "readMem" : "writeMem") << "(n); }\n";
+                    } else
+                        o << " " << (i.k == IK::ReadMem ? "readMem" : "writeMem") << "(" << M_ << ");\n";
+                    continue;
+                }
+                if (dynW) {
+                    o << dynTarget(i, fast(i.e), i.k == IK::Nba ? " S.nba(s, v, hi, lo);"
+                                                                : " S.set(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
+                    continue;
+                }
                 switch (i.k) {
                     case IK::Assign: o << assign(i); break;
                     case IK::Nba:
                         o << " S.nba(" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
                         break;
                     case IK::JmpIfNot:
-                        o << " if (truth(" << fast(i.e) << ") != 1) goto " << tgt(i.target) << ";\n";
+                        o << " if (truth(" << fast(i.e) << ") != 1) " << jumpTo(&p, pc, tgt(i.target)) << "\n";
                         break;
                     case IK::Jmp: o << " goto " << tgt(i.target) << ";\n"; break;
                     case IK::WaitEdge:
@@ -1181,10 +1358,14 @@ private:
 
 inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                            const CodegenParts& parts = {}, bool twoState = true, bool cycle = true,
-                           bool privates = true) {
+                           bool privates = true,
+                           std::vector<std::pair<const Prog*, size_t>>* covSlots = nullptr) {
     Codegen g;
     g.twoState = twoState;
     g.cycle = cycle;
     g.privates = privates;
-    return g.run(sigs, procs, parts);
+    g.cov = covSlots != nullptr;
+    std::string src = g.run(sigs, procs, parts);
+    if (covSlots) *covSlots = std::move(g.covSlots);
+    return src;
 }
