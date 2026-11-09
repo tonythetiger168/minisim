@@ -20,7 +20,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 5.7.1 | Integer literals | ✅ | sized, unsized, x/z digits, signed (`'s`), and `'0` `'1` `'x` `'z` in any context. `5.7.1-unbased-unsized` |
 | 5.9 | String literals | 🟡 | up to 8 characters (64 bits). `5.9-string-literal` |
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |
-| 6.6.3–6.6.8 | wand/triand, wor/trior, tri0, tri1, trireg, supply0/supply1 | ✅ | wired AND/OR resolution, pull to 0/1 when undriven, trireg holds its last value (starts at x). Not yet: arrays of these nets, `interconnect`. `6.6.3-wired-nets`, `6.6.4-trireg` |
+| 6.6.3–6.6.8 | wand/triand, wor/trior, tri0, tri1, trireg, supply0/supply1 | ✅ | wired AND/OR resolution, pull to 0/1 when undriven, trireg holds its last value (starts at x). `interconnect` nets take the width of the ports they connect (6.6.8). Not yet: arrays of these nets. `6.6.3-wired-nets`, `6.6.4-trireg`, `6.6.8-interconnect` |
 | 6.11 | Integer types | ✅ | int, byte, shortint, longint, integer, bit. `6.11-integer-types` |
 | 6.8 | Default values | ✅ | 2-state variables (int, bit, real, string) start at 0 / 0.0 / ""; 4-state at x. `6.8-default-values` |
 | 6.12 | real, realtime | ✅ | arithmetic, compare, `**`, conversion both ways (rounded, 6.12.1), real arrays and function results, `$itor` `$rtoi` `$realtobits` `$bitstoreal`, 20.8 math functions. `shortreal` (rounded to single precision, `$shortrealtobits` `$bitstoshortreal`). Not yet: reals in the VCD. `6.12-real`, `6.12.1-real-conversions`, `6.12-shortreal` |

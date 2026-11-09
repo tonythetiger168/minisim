@@ -86,6 +86,10 @@ inline const slang::SourceManager*& srcMgr() { static const slang::SourceManager
 // Net types that resolve differently from wire (6.6): signal -> kind.
 // alias a = b = c; (10.11): every net in an alias maps to one of them, which
 // is the only one that gets a signal.
+inline std::unordered_map<const slang::ast::Symbol*, int>& interconnectW() {
+    static std::unordered_map<const slang::ast::Symbol*, int> m;
+    return m;
+}
 inline std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*>& aliasOf() {
     static std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> m;
     return m;
@@ -4110,6 +4114,8 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             return;
         }
         int w = storeW(s.getType());
+        if (w <= 0)
+            if (auto it = interconnectW().find(&s); it != interconnectW().end()) w = it->second;
         if (w <= 0) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
     }
@@ -4210,7 +4216,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             case NK::TriReg: k = NR_TRIREG; break;
             case NK::Supply0: k = NR_SUPPLY0; break;
             case NK::Supply1: k = NR_SUPPLY1; break;
-            case NK::Interconnect: Lowerer::unsupported("interconnect net (6.6.8)");
+            case NK::Interconnect: break;   // resolves as a wire (6.6.8)
             default: break;
         }
         if (k == NR_WIRE) return;
@@ -4826,13 +4832,33 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     Lowerer::covSM() = g_cov ? comp.getSourceManager() : nullptr;
     {   // alias statements (10.11), before any signal is made
         aliasOf().clear();
+        interconnectW().clear();
         struct AliasFinder : slang::ast::ASTVisitor<AliasFinder> {
             std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> up;
             const slang::ast::Symbol* root(const slang::ast::Symbol* s) {
                 while (up.count(s) && up[s] != s) s = up[s];
                 return s;
             }
-            void handle(const slang::ast::InstanceSymbol& inst) { if (enterInstance(inst)) visitDefault(inst); }
+            void handle(const slang::ast::InstanceSymbol& inst) {
+                using namespace slang::ast;
+                if (!enterInstance(inst)) return;
+                // An interconnect net (6.6.8) takes its width from the ports
+                // it connects: the widest of them.
+                for (const PortConnection* c : inst.getPortConnections()) {
+                    if (!c || c->port.kind != SymbolKind::Port) continue;
+                    const Expression* x = c->getExpression();
+                    if (!x) continue;
+                    const Expression* y = &Lowerer::peel(*x);
+                    if (y->kind == ExpressionKind::Assignment) y = &Lowerer::peel(y->as<AssignmentExpression>().left());
+                    if (y->kind != ExpressionKind::NamedValue && y->kind != ExpressionKind::HierarchicalValue) continue;
+                    const Symbol& ns = y->as<ValueExpressionBase>().symbol;
+                    if (ns.kind != SymbolKind::Net || ns.as<NetSymbol>().netType.netKind != NetType::Interconnect) continue;
+                    int w = (int)c->port.as<PortSymbol>().getType().getBitWidth();
+                    int& cur = interconnectW()[&ns];
+                    cur = std::max(cur, w);
+                }
+                visitDefault(inst);
+            }
             void handle(const slang::ast::NetAliasSymbol& a) {
                 using namespace slang::ast;
                 const Symbol* first = nullptr;
