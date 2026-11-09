@@ -153,14 +153,20 @@ waits on it, no VCD, no `$monitor`), and a signal that only the domain touches
 lives in a plain C++ variable instead of the kernel's signal table. The time
 wheel also no longer allocates per time step. `-no-cycle` turns the domain off.
 
+Signals the testbench only initializes and `$display`s can be private too:
+those writes and reads are compiled to use the variable. When every signal
+the domain reads is known (no X or Z), a second copy of the domain without
+the per-expression X checks runs instead, and the rare 4-state code is kept
+out of the hot path.
+
 On a 4-core VM, run seconds, 1 thread (bench/run.sh):
 
 | design | before (main) | cycle domain | Verilator -O3 |
 |---|---|---|---|
-| lanes | 0.34 | 0.09 | 0.09 |
+| lanes | 0.34 | 0.07 | 0.09 |
 | chain | 0.35 | 0.08 | 0.28 |
 | counter | 0.16 | 0.08 | 0.28 |
-| wide | 1.2 (4 threads) | 0.29 | 0.10 |
+| wide | 1.2 (4 threads) | 0.18 | 0.10 |
 
 ### 2-state fast path (`-compile`)
 

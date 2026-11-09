@@ -580,6 +580,8 @@ struct Sim {
         }
         drive(s, d, v, s0, s1);
     }
+    // A testbench wrote a private signal: re-evaluate the domain's comb logic.
+    void markFast() { if (fastComb >= 0) markComb(fastComb); }
     // fastCommit's own comb pass: its writes must not queue the pass again.
     void fastCombs(void (*all)(const void*)) {
         int saved = curComb;
