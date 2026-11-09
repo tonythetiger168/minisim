@@ -717,6 +717,11 @@ struct Lowerer {
         static std::unordered_map<const slang::ast::SubroutineSymbol*, std::string> m;
         return m;
     }
+    // Makes a signal driven by an event expression; set while lowering a design.
+    static std::function<int(const slang::ast::Expression&)>& eventExprHook() {
+        static std::function<int(const slang::ast::Expression&)> h;
+        return h;
+    }
     [[noreturn]] static void unsupported(const char* what) {
         throw std::runtime_error(whereStr() + "lower: unsupported " + what);
     }
@@ -2971,9 +2976,14 @@ struct Lowerer {
             }
             int sig;
             if (classMember(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x)
-            else {
-                if (!ValueExpressionBase::isKind(s.expr.kind)) unsupported("event on non-signal");
+            else if (ValueExpressionBase::isKind(s.expr.kind)) {
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
+            } else {
+                // @(posedge clk[i]), @(a & b): wait on a signal that a
+                // continuous assignment keeps equal to the expression; an
+                // edge is that value's least significant bit (9.4.2).
+                if (!eventExprHook()) unsupported("event on non-signal");
+                sig = eventExprHook()(s.expr);
             }
             Edge e = s.edge == EdgeKind::PosEdge ? POS : s.edge == EdgeKind::NegEdge ? NEG : ANY;
             ev.push_back({sig, e});
@@ -5310,7 +5320,37 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                   std::function<int(int)> nd,
                   std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* s,
                   MkSig mk, int* seq)
-        : sigmap(m), out(o), newDriver(std::move(nd)), subs(s), mkSig(std::move(mk)), tempSeq(seq) {}
+        : sigmap(m), out(o), newDriver(std::move(nd)), subs(s), mkSig(std::move(mk)), tempSeq(seq) {
+        Lowerer::eventExprHook() = [this](const slang::ast::Expression& x) { return eventSignal(x); };
+    }
+    ~ProcCollector() { Lowerer::eventExprHook() = nullptr; }
+
+    // One signal per distinct event expression, driven by a continuous
+    // assignment of that expression.
+    std::unordered_map<const slang::ast::Expression*, int> evSigs;
+    int eventSignal(const slang::ast::Expression& x) {
+        if (auto it = evSigs.find(&x); it != evSigs.end()) return it->second;
+        int w = (int)x.type->getBitWidth();
+        if (w <= 0 || !x.type->isIntegral()) Lowerer::unsupported("event on an expression of this type");
+        int sg = mkSig("__event" + std::to_string((*tempSeq)++), w, false);
+        // Start equal to the expression, before any procedure waits, so
+        // variables that start with a value give no event at time 0.
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        {
+            Instr i0; i0.k = IK::Assign; i0.sig = sg;
+            i0.e = init->expr(x);
+            init->prog.emit(i0);
+        }
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i; i.k = IK::Assign;
+        i.sig = sg;
+        i.e = lw.expr(x);
+        if (!lw.prog.code.empty()) Lowerer::unsupported("event expression with a call");
+        finishAssign(lw, i);
+        evSigs[&x] = sg;
+        return sg;
+    }
 
     void prep(Lowerer& lw) { lw.bind(subs, mkSig, tempSeq, &out.subs); }
 

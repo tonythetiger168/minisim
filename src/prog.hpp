@@ -260,12 +260,90 @@ inline void collectProgWrites(const Prog& p, std::unordered_set<int>& out, std::
         for (const Prog* b : i.branches) collectProgWrites(*b, out, seen);
     }
 }
+// Bits of a signal: ranges [lo, hi], or every bit.
+struct BitSet {
+    bool all = false;
+    std::vector<std::pair<int, int>> r;
+    bool covers(int lo, int hi) const {   // is every bit of [lo, hi] in r?
+        if (all) return true;
+        for (int b = lo; b <= hi; b++) {
+            bool in = false;
+            for (auto& [l, h] : r) if (b >= l && b <= h) { in = true; break; }
+            if (!in) return false;
+        }
+        return true;
+    }
+};
+// The bits of each signal that e reads: a constant part select of a signal
+// reads only those bits, any other reference reads all of it.
+inline void collectReadBits(const E& e, std::unordered_map<int, BitSet>& m) {
+    if (!e) return;
+    if (e->op == Op::Slice && e->kids.size() == 1 && e->kids[0] && e->kids[0]->op == Op::Ref &&
+        !e->kids[0]->at && !isRel(e->kids[0]->sig)) {
+        m[e->kids[0]->sig].r.push_back({e->lo, e->hi});
+        return;
+    }
+    if (e->op == Op::Ref && !e->at && !isRel(e->sig)) m[e->sig].all = true;
+    if (e->op == Op::ArrRead)
+        for (int i = 0; i < e->arr->count; i++) m[e->arr->base + i].all = true;
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
+        e->op == Op::DynBits || e->op == Op::DynHas)
+        m[e->sig].all = true;
+    collectReadBits(e->at, m);
+    for (auto& k : e->kids) collectReadBits(k, m);
+}
+inline void collectProgReadBits(const Prog& p, std::unordered_map<int, BitSet>& m, std::vector<const Prog*>& seen) {
+    for (const Prog* s : seen)
+        if (s == &p) return;
+    seen.push_back(&p);
+    for (auto& i : p.code) {
+        collectReadBits(i.e, m);
+        for (auto& a : i.args) collectReadBits(a, m);
+        for (auto& a : i.aidx) collectReadBits(a, m);
+        collectReadBits(i.bidx, m);
+        for (auto& a : i.init) collectReadBits(a.second, m);
+        if (i.k == IK::Call && i.callee) collectProgReadBits(*i.callee, m, seen);
+        for (const Prog* b : i.branches) collectProgReadBits(*b, m, seen);
+    }
+}
+// Bits written at a constant part select (v[3] = ..., v[7:4] = ...).
+inline void collectProgPartWrites(const Prog& p, std::unordered_map<int, BitSet>& out, std::vector<const Prog*>& seen) {
+    for (const Prog* s : seen)
+        if (s == &p) return;
+    seen.push_back(&p);
+    for (auto& i : p.code) {
+        if ((i.k == IK::Assign || i.k == IK::Nba) && i.sig >= 0 && i.drv < 0 && i.dyn < 0 && !i.arr &&
+            i.hi >= 0 && !i.bidx)
+            out[i.sig].r.push_back({i.lo, i.hi});
+        if (i.k == IK::Call && i.callee) collectProgPartWrites(*i.callee, out, seen);
+        for (const Prog* b : i.branches) collectProgPartWrites(*b, out, seen);
+    }
+}
+// always_comb / always_latch sensitivity (9.2.2.2.1): what the block reads,
+// less what it also writes. A signal written only in part stays in the list
+// unless every read of it is of bits the block writes, so two blocks that
+// each own a bit of one vector do not wake each other.
 inline std::vector<std::pair<int, Edge>> combReadSet(const Prog& p) {
     auto rs = readSet(p);
     std::unordered_set<int> wr;
     std::vector<const Prog*> seen;
     collectProgWrites(p, wr, seen);
     std::erase_if(rs, [&](const std::pair<int, Edge>& e) { return wr.count(e.first) > 0; });
+    std::unordered_map<int, BitSet> pw;
+    seen.clear();
+    collectProgPartWrites(p, pw, seen);
+    if (pw.empty()) return rs;
+    std::unordered_map<int, BitSet> rd;
+    seen.clear();
+    collectProgReadBits(p, rd, seen);
+    std::erase_if(rs, [&](const std::pair<int, Edge>& e) {
+        auto w = pw.find(e.first);
+        if (w == pw.end()) return false;
+        auto r = rd.find(e.first);
+        if (r == rd.end() || r->second.all) return false;
+        for (auto& [l, h] : r->second.r) if (!w->second.covers(l, h)) return false;
+        return true;
+    });
     return rs;
 }
 // A WaitEdge on one or more events (ev must be non-empty).

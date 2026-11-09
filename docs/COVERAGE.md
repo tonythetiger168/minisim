@@ -50,12 +50,12 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 8.26 | Interface classes | ✅ | `implements`, interface classes extending others, parameters, calls and `$cast` through interface handles. `8.26-interface-classes` |
 | 8.27 | typedef class | ✅ | `8.27-typedef-class` |
 | 8.30 | std::weak_reference | ✅ | `get`, `clear`, `get_id`. Objects are never collected, so `get` returns the referent until `clear`. `8.30-weak-reference` |
-| 9.2 | initial, always, always_comb/ff/latch | ✅ | |
+| 9.2 | initial, always, always_comb/ff/latch | ✅ | always_comb sensitivity leaves out what the block writes, bit by bit for constant part selects (9.2.2.2.1). `9.2.2.2.1-always-comb-sensitivity`, `9.2.2.2.1-always-comb-part-writes` |
 | 9.2.3 | Final procedures | ✅ | run once after the last time slot, also after `$finish`. `9.2.3-final` |
 | 9.3.1 | begin…end | ✅ | |
 | 9.3.2 | fork…join / join_any / join_none | ✅ | automatic variables in a fork block get one copy per execution of the fork (`fork automatic int j = i; ... join_none` in a loop). `9.3.2-fork-join`, `9.3.2-fork-automatic` |
 | 9.4.1 | Delay control | ✅ | constant, real, time literal, or any integral expression (evaluated when reached; x or z waits 0). `9.4.5-intra-assign-delay` |
-| 9.4.2 | Event control | ✅ | posedge / negedge / any change, `or`, `@*`, named events |
+| 9.4.2 | Event control | ✅ | posedge / negedge / any change, `or`, `@*`, named events; on any expression, such as `@(posedge clk[i])` (an edge on its least significant bit). `9.4.2-edge-on-expression` |
 | 9.4.3 | wait | ✅ | `9.4.3-wait` |
 | 9.4.5 | Intra-assignment delay | ✅ | `a = #d b` and `a <= #d b`. Blocking intra-assignment event controls `a = @(e) b` and `a = repeat (n) @(e) b`. Not yet: the nonblocking form `a <= @(e) b`. `9.4.5-intra-assign-delay`, `9.4.5-repeat-event-assign` |
 | 9.6.1 | wait fork | ✅ | `9.6.1-wait-fork` |
