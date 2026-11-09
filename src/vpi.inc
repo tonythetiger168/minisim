@@ -23,6 +23,7 @@
 #include "slang/ast/SystemSubroutine.h"
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
+#include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/symbols/BlockSymbols.h"
@@ -1221,6 +1222,26 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
         case vpiDefName:
             if (o->kind == Obj::Module) return vpi::retStr(std::string(o->sym->as<slang::ast::InstanceSymbol>().getDefinition().name));
             return nullptr;
+        // 33.7: the library and cell an instance is bound to, and the
+        // library.cell of the config that bound it ("" without one).
+        case vpiLibrary:
+        case vpiCell:
+        case vpiConfig: {
+            if (o->kind != Obj::Module) return nullptr;
+            const auto& inst = o->sym->as<slang::ast::InstanceSymbol>();
+            const auto& def = inst.getDefinition();
+            if (prop == vpiLibrary) return vpi::retStr(def.sourceLibrary.name);
+            if (prop == vpiCell) return vpi::retStr(std::string(def.name));
+            if (!inst.resolvedConfig) return vpi::retStr(std::string());
+            const auto& cfg = inst.resolvedConfig->useConfig;
+            std::string lib = "work";
+            for (const slang::ast::Scope* sc = cfg.getParentScope(); sc; sc = sc->asSymbol().getParentScope())
+                if (sc->asSymbol().kind == slang::ast::SymbolKind::CompilationUnit) {
+                    lib = sc->asSymbol().as<slang::ast::CompilationUnitSymbol>().sourceLibrary.name;
+                    break;
+                }
+            return vpi::retStr(lib + "." + std::string(cfg.name));
+        }
         case vpiFile:
             if (o->kind == Obj::Call) return vpi::retStr(o->site->file);
             if (o->sym && srcMgr()) return vpi::retStr(std::string(srcMgr()->getFileName(o->sym->location)));
@@ -1292,8 +1313,19 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
     if (!vpi::fromValue(o, v, val)) return nullptr;
     int mode = flags & 0xfff;
     if (o->kind == Obj::Call) { S.set(o->sig, val); return nullptr; }   // the function's result
-    if (mode == vpiForceFlag || mode == vpiReleaseFlag || mode == vpiCancelEvent) {
-        vpi::error(vpiWarning, "vpi_put_value: force, release and cancel are not supported");
+    if (mode == vpiForceFlag || mode == vpiReleaseFlag) {   // like force / release (10.6.2, 38.35)
+        if (o->kind == Obj::Call) { vpi::error(vpiError, "vpi_put_value: a function result cannot be forced"); return nullptr; }
+        int hi = -1, lo = 0;
+        if (o->kind == Obj::Bit) { hi = lo = o->off; Val one = make(0, 0, 1); ::setBit(one, 0, ::bitAt(val, 0)); val = one; }
+        if (mode == vpiForceFlag) S.holdOn(o->sig, konst(val), true, hi, lo);
+        else {
+            S.holdOff(o->sig, true, hi, lo);
+            vpi_get_value(h, v);   // the value it has now (38.35)
+        }
+        return nullptr;
+    }
+    if (mode == vpiCancelEvent) {
+        vpi::error(vpiWarning, "vpi_put_value: cancel is not supported");
         return nullptr;
     }
     int64_t d = mode == vpiNoDelay || mode == 0 ? 0 : vpi::sigTicks(t, o);
@@ -1478,5 +1510,9 @@ PLI_INT32 vpi_control(PLI_INT32 op, ...) {
     vpi::error(vpiWarning, "vpi_control: operation " + std::to_string(op) + " is not supported");
     return 0;
 }
+
+// IEEE 1364 TF routines that VPI code from other simulators still calls (veriuser.h).
+int tf_dofinish(void) { return vpi_control(vpiFinish, 0); }
+int tf_dostop(void) { return vpi_control(vpiStop, 0); }
 
 }   // extern "C"

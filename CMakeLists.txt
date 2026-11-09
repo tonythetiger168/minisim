@@ -282,7 +282,7 @@ if(MINISIM_WITH_SLANG)
     foreach(sv IN LISTS UVM_TESTS)
       get_filename_component(name ${sv} NAME_WE)
       add_test(NAME uvm/${name}
-               COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DUVM=${UVM_HOME}/src -DSV=${sv}
+               COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DUVM_HOME=${UVM_HOME} -DSV=${sv}
                        -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
       set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
     endforeach()
@@ -338,13 +338,15 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES include/svdpi.h include/vpi_user.h include/mvp.h
+install(FILES include/svdpi.h include/vpi_user.h include/sv_vpi_user.h include/veriuser.h include/mvp.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+# UVM's C code for minisim: msim -uvm looks for it next to itself.
+install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/uvm)
 # The virtual prototype layer: msim -mvp looks for these next to itself.
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/PROTECT.md
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)

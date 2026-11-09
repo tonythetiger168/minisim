@@ -877,6 +877,18 @@ struct Sim {
         g.drv[d].v = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
+        if (__builtin_expect(!varPathDrv.empty(), 0) && !applyingVar) {   // a variable path output's port (30.4)
+            auto vp = varPathDrv.find({s, d});
+            if (vp != varPathDrv.end()) {
+                Val nv = g.drv[d].v, cur = vp->second.second;
+                g.drv[d].v = cur;   // the port keeps its old value until the path delay passes
+                Val from = projected(s, PQ_VAR - d, cur);
+                if (sameVal(from, nv)) return;
+                Lim L = pathLim(vp->second.first, from, nv);
+                pulseSchedule(s, PQ_VAR - d, cur, nv, L, styleOf(vp->second.first), (uint8_t)s0, (uint8_t)s1);
+                return;
+            }
+        }
         if (__builtin_expect(!loadsOf.empty(), 0)) shadowDrive(s, d);   // 32.4.4: loads that see each source's delay
         if (__builtin_expect(!tranOf.empty(), 0) && (size_t)s < tranOf.size() && !tranOf[(size_t)s].empty()) { tranResolve(s); return; }
         // One driver that drives both 0 and 1 resolves to its own value
@@ -907,7 +919,11 @@ struct Sim {
     // (slot PQ_PATH), or of one source's driver as a load sees it through an
     // interconnect delay (slot PQ_SRC - driver, 32.4.4). Each entry is one
     // future change; an unlimited number may be pending.
-    enum { PQ_PATH = -2, PQ_SRC = -10 };
+    enum { PQ_PATH = -2, PQ_SRC = -10, PQ_VAR = -1000000 };
+    // The port connections of variable path outputs: (net, driver) -> the
+    // variable and the value the driver last passed on.
+    map<pair<int, int>, pair<int, Val>> varPathDrv;
+    bool applyingVar = false;
     struct PEv { uint64_t t, gen; Val v; uint8_t s0, s1; };
     map<pair<int, int>, vector<PEv>> pq;
     struct Lim { uint64_t d = 0, rj = 0, er = 0; };
@@ -991,6 +1007,15 @@ struct Sim {
     }
     void applySlot(int s, int slot, const Val& v, uint8_t s0, uint8_t s1) {
         if (slot == PQ_PATH) { set(s, v); return; }
+        if (slot <= PQ_VAR) {
+            int d = PQ_VAR - slot;
+            auto vp = varPathDrv.find({s, d});
+            if (vp != varPathDrv.end()) vp->second.second = v;
+            applyingVar = true;
+            drive(s, d, v, s0, s1);
+            applyingVar = false;
+            return;
+        }
         auto& sh = shadowOf[s];
         int d = PQ_SRC - slot;
         if ((size_t)d >= sh.drv.size()) return;
@@ -1079,10 +1104,16 @@ struct Sim {
         lastChg.assign(sigs.size(), 0);
         pathsTo.clear();
         auto& P = pathRecs();
+        varPathDrv.clear();
         for (size_t k = 0; k < P.size(); k++) {
             pathsTo[P[k].dst].push_back((int)k);
-            timedOut[(size_t)P[k].dst] = 1;
             pathIn[(size_t)P[k].src] = 1;
+            if (!P[k].dstVar) { timedOut[(size_t)P[k].dst] = 1; continue; }
+            for (const PortLink& l : outLinks())
+                if (l.formal == P[k].dst) {
+                    varPathDrv[{l.net, l.drv}] = {P[k].dst, sigs[(size_t)l.net].drv[(size_t)l.drv].v};
+                    if (now == 0) sigs[(size_t)l.net].val = allx(sigs[(size_t)l.net].w);   // x until the first value arrives
+                }
         }
         for (auto& [sg, d] : icDelay) timedOut[(size_t)sg] = 1;
         for (auto& [sg, sh] : shadowOf) timedOut[(size_t)sg] = 1;
