@@ -7,6 +7,18 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Added
+- `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
+  VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
+  UVM and simulator error lines, `@pass`, `@expect`), failure grouping,
+  `-rerun`, `results.json` / `junit.xml` / `report.html`, `@xfail` known gaps
+  (XPASS is an error) and `@exit`, and `-spec` to run the spec suite on any
+  of them, honouring `//! xfail:` / `//! exit:` and printing a per-chapter
+  pass table.
+- CI recipes: `ci/Jenkinsfile`, a declarative Jenkins pipeline (JUnit, HTML
+  reports, LCOV coverage, `-rerun` on failure), and `ci/README.md` on the
+  files mregress and mcov write for a CI job.
+
 ## [0.1.0] - unreleased
 
 First tagged release: everything merged up to spec round 5.

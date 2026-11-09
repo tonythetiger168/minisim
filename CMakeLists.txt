@@ -101,6 +101,14 @@ if(MINISIM_WITH_SLANG)
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR} -DPY=${Python3_EXECUTABLE}
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fuzz.cmake)
   endif()
+  # mregress: test lists, seeds, pass/fail checks, reports, -rerun. With
+  # Icarus installed it also runs the spec suite through the iverilog backend.
+  if(Python3_FOUND)
+    add_test(NAME mregress_smoke
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_smoke
+                     -P ${CMAKE_SOURCE_DIR}/tests/mregress.cmake)
+  endif()
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
@@ -135,6 +143,12 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  if(Python3_FOUND AND IVERILOG AND VVP)
+    add_test(NAME mregress_spec_icarus
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec
+                     -sim iverilog -exe ${IVERILOG} -q -o ${CMAKE_CURRENT_BINARY_DIR}/mregress_icarus)
+  endif()
+
   add_test(NAME slang_dump_counter
            COMMAND slang_dump ${CMAKE_SOURCE_DIR}/examples/counter.sv)
   set_tests_properties(slang_dump_counter PROPERTIES
@@ -155,6 +169,7 @@ install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
+install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md

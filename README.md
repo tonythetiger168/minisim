@@ -97,6 +97,34 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-version` | Print the version and git commit |
 | `--help-slang` | Every front-end option slang accepts |
 
+### Regressions: `mregress`
+
+`mregress` (installed next to `msim`; in the source tree `tools/mregress.py`)
+runs a test list on msim, VCS, Xcelium, Questa, or Icarus, in parallel, with
+seeds, and writes `results.json`, `junit.xml` (for CI) and `report.html`, with
+failures grouped by their first error line:
+
+```sh
+mregress tests.list -sim msim -j 8 -seeds 3     # or -sim vcs / xrun / questa / iverilog
+mregress tests.list -rerun                      # repeat only the failures
+mregress -spec tests/spec -sim iverilog         # the spec suite on another simulator
+```
+
+A test list line is `name: <simulator arguments>` with optional settings
+(`@seeds=N`, `@timeout=SEC`, `@pass=<regex>`, `@fail=<regex>`,
+`@expect=inline` for `//> ` expected output, `@skip=<sim>`, `@exit=N`,
+`@xfail=<reason>` for a known gap); `%common` and
+`%sim` set shared arguments and the default simulator, and `-f` includes
+another list. A run fails on a non-zero exit, a UVM_ERROR / UVM_FATAL count
+above zero, a simulator error line (`Error-[`, `*E,`, `** Error`), `$fatal`,
+or a failed `@pass` / `@expect` check. An `@xfail` test that fails counts as
+a known gap; one that passes (XPASS) fails the regression so the marker gets
+removed. With `-spec`, a test's `//! xfail: <reason>` and `//! exit: <n>`
+lines mean the same on msim, and a per-chapter pass table is printed
+(`-md FILE` also writes it as Markdown). See `tests/regress/smoke.list` and
+`mregress -h`. For Jenkins and other CI, see [`ci/README.md`](ci/README.md)
+and the pipeline in [`ci/Jenkinsfile`](ci/Jenkinsfile).
+
 ### Compiled mode
 
 By default `msim` interprets: each process is a flat instruction list that a
