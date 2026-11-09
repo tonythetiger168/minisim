@@ -46,7 +46,7 @@ jobs:
         run: echo "$HOME/iverilog13/bin" >> "$GITHUB_PATH" && ("$HOME/iverilog13/bin/iverilog" -V 2>&1 || true) | head -1
 
       - name: Install zlib (FST waveforms)
-        run: sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get install -y zlib1g-dev libssl-dev openssl
 
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang

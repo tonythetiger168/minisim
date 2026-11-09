@@ -50,6 +50,7 @@
 #include "slang/ast/types/Type.h"
 #include "slang/driver/Driver.h"
 #include "slang/text/SourceManager.h"
+#include "protect_front.hpp"
 
 using namespace slang;
 using namespace slang::ast;
@@ -75,9 +76,12 @@ struct Rules {
 
 struct Report {
     const SourceManager* sm = nullptr;
+    const protfront::ProtectedCode* pc = nullptr;   // findings in hidden protected code are only counted
+    int hiddenCount = 0;
     Rules rules;
     std::vector<Finding> out;
     std::set<std::pair<std::string, std::string>> seen;  // rule + place, so one cause is reported once
+    std::set<std::pair<std::string, SourceLocation>> hiddenSeen;
 
     // One finding per line: "file:line:col: warning: [RULE] text", sorted.
     void print(std::ostream& os, bool quiet, const char* tool) {
@@ -85,6 +89,9 @@ struct Report {
         for (const Finding& f : out)
             os << f.file << ":" << f.line << ":" << f.col << ": warning: [" << f.rule << "] "
                << f.text << "\n";
+        if (hiddenCount)
+            os << tool << ": " << hiddenCount << (hiddenCount == 1 ? " finding" : " findings")
+               << " in protected code (details hidden)\n";
         if (quiet) return;
         std::map<std::string, int> per;
         for (const Finding& f : out) per[f.rule]++;
@@ -99,6 +106,10 @@ struct Report {
 
     void add(std::string_view rule, SourceLocation loc, std::string text) {
         if (!rules.enabled(rule)) return;
+        if (pc && pc->hidden(loc)) {
+            if (hiddenSeen.insert({std::string(rule), loc}).second) hiddenCount++;
+            return;
+        }
         Finding f;
         f.rule = std::string(rule);
         f.text = std::move(text);
@@ -117,7 +128,14 @@ struct Report {
 };
 
 // Where a symbol is in the design, for a message: a.b.clk
+// Protected code the tool read, if any: names of objects it hides print as
+// "<protected>" (IEEE 1735 clause 9).
+inline const protfront::ProtectedCode*& namePC() {
+    static const protfront::ProtectedCode* pc = nullptr;
+    return pc;
+}
 inline std::string path(const Symbol& s) {
+    if (namePC() && !namePC()->visible(s)) return "<protected>";
     std::string p = s.getHierarchicalPath();
     return p.empty() ? std::string(s.name) : p;
 }
@@ -417,6 +435,9 @@ struct Gather : ASTVisitor<Gather> {
 struct FrontEnd {
     driver::Driver driver;
     std::unique_ptr<Compilation> comp;
+    protfront::Options prot;        // -keyfile / -keyring / -license, filled by the tool
+    protfront::ProtectedCode pc;
+    const char* tool = "mlint";
 
     // `own` holds the options the tool itself took out of the command line.
     int run(const std::vector<std::string>& fwd, const char* helpTitle) {
@@ -430,6 +451,8 @@ struct FrontEnd {
                 return -1;  // handled, nothing to check
             }
         if (!driver.processOptions()) return 2;
+        if (!protfront::preload(driver, prot, pc, tool)) return 1;
+        protfront::redact(driver, pc);
         if (!driver.parseAllSources()) return 1;
         comp = driver.createCompilation();
         driver.reportCompilation(*comp, /*quiet*/ true);

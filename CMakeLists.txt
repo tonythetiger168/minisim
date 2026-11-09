@@ -118,11 +118,19 @@ if(MINISIM_WITH_SLANG)
   add_executable(mlint src/mlint.cpp)
   target_include_directories(mlint PRIVATE src)
   target_link_libraries(mlint PRIVATE slang::slang)
+  if(OPENSSL_FOUND)
+    target_link_libraries(mlint PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(mlint PRIVATE MINISIM_HAVE_OPENSSL)
+  endif()
 
   # Design-for-test checks and a scan chain plan: mdft design.sv
   add_executable(mdft src/mdft.cpp)
   target_include_directories(mdft PRIVATE src)
   target_link_libraries(mdft PRIVATE slang::slang)
+  if(OPENSSL_FOUND)
+    target_link_libraries(mdft PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
+  endif()
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -190,6 +198,7 @@ if(MINISIM_WITH_SLANG)
   if(OPENSSL_FOUND AND OPENSSL_CLI)
     add_test(NAME msim_protect
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DPROTECT=$<TARGET_FILE:msimprotect>
+                     -DMLINT=$<TARGET_FILE:mlint> -DMDFT=$<TARGET_FILE:mdft>
                      -DOPENSSL=${OPENSSL_CLI} -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_protect
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_protect.cmake)
@@ -254,13 +263,16 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump
+#   bin/msim, bin/minisim, bin/slang_dump, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+if(OPENSSL_FOUND)
+  install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
@@ -272,7 +284,7 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/PROTECT.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)

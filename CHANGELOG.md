@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
+  writes version 3 envelopes (RSA no-padding root key per tool block,
+  AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
+  command-line keys, a `-keyring` in the 1735 key exchange format, or a
+  recipe in the source, with rights (`-control`). `msim`, `mlint` and `mdft`
+  take `-keyfile` / `-keyring` / `-license`, check the signature before
+  decrypting, honour the `decryption`, `visibility`, `coverage` and
+  `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
+  protected code out of diagnostics, assertion messages, VCD / FST, coverage,
+  lint findings and the DFT chain plan. See `docs/PROTECT.md`.
 - `mregress`, a regression runner: test lists, seeds, parallel runs, msim /
   VCS / Xcelium / Questa / Icarus backends, pass/fail checks (exit status,
   UVM and simulator error lines, `@pass`, `@expect`), failure grouping,

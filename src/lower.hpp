@@ -288,6 +288,18 @@ inline std::function<bool(const slang::ast::Symbol&)>& hideSigIf() {
     return f;
 }
 inline std::vector<int>& hiddenSigs() { static std::vector<int> v; return v; }
+// Protected code whose lines may not show in coverage (-cov): statements
+// there get no line, so no line or branch coverage is recorded for them.
+inline std::function<bool(slang::SourceLocation)>& hideLocIf() {
+    static std::function<bool(slang::SourceLocation)> f;
+    return f;
+}
+// Protected code the tool's own messages may not describe (IEEE 1735 9.2.1):
+// a default assertion failure there names neither the line nor the label.
+inline std::function<bool(slang::SourceLocation)>& hideMsgIf() {
+    static std::function<bool(slang::SourceLocation)> f;
+    return f;
+}
 inline void noteHidden(const slang::ast::Symbol& s, int first, int count) {
     if (hideSigIf() && hideSigIf()(s))
         for (int i = 0; i < count; i++) hiddenSigs().push_back(first + i);
@@ -5033,6 +5045,7 @@ struct Lowerer {
     static void covLoc(slang::SourceLocation loc) {
         auto* sm = covSM();
         if (!sm || !loc.valid()) return;
+        if (hideLocIf() && hideLocIf()(loc)) { g_emitLoc = {}; return; }
         auto ol = sm->getFullyOriginalLoc(loc);
         g_emitLoc = {covFileId(std::string(sm->getFullPath(ol.buffer()).string())), (uint32_t)sm->getLineNumber(ol)};
     }

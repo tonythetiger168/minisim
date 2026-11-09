@@ -14,7 +14,7 @@ endfunction()
 
 run(${OPENSSL} genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out priv.pem)
 run(${OPENSSL} pkey -in priv.pem -pubout -out pub.pem)
-run(${PROTECT} -key pub.pem -keyowner Acme -keyname acme-1 -digest none
+run(${PROTECT} -v1 -key pub.pem -keyowner Acme -keyname acme-1 -digest none
     ${SRC}/examples/protect/secret_alu.sv -o alu.svp)
 
 file(READ ${OUT}/alu.svp env)

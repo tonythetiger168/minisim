@@ -1,130 +1,271 @@
-# Protected IP (IEEE 1800-2023 clause 34, IEEE 1735)
+# Protected IP (IEEE 1735-2023, IEEE 1800-2023 clause 34)
 
 An IP vendor can ship a SystemVerilog model whose source is encrypted, so a
-customer can simulate it without reading it. minisim implements the protected
-envelopes of IEEE 1800-2023 clause 34, the `` `pragma protect `` format that
-IEEE 1735 also uses:
+customer can simulate, lint and test it without reading it. minisim
+implements the IEEE 1735-2023 recommended practice (version 3 envelopes)
+and the older envelopes of IEEE 1800-2023 clause 34:
 
 - `msimprotect` turns each `` `pragma protect begin `` … `` `pragma protect end ``
-  region into a `begin_protected` … `end_protected` decryption envelope
-  (34.3.1, like `xmprotect` or `vcs +protect`).
-- `msim -keyfile <private.pem>` replaces each envelope with its cleartext
-  before compiling (34.3.2), in memory only.
+  region into a `begin_protected` … `end_protected` decryption envelope, like
+  `xmprotect` or `vcs +protect`. Version 3 is the default; `-v1` writes the
+  clause 34 form.
+- `msim`, `mlint` and `mdft` take `-keyfile` / `-keyring`, verify and decrypt
+  each envelope in memory before compiling, and keep the protected code out
+  of what they print and write: diagnostics, waveforms, coverage, lint
+  findings, the DFT chain plan.
 
-Both use OpenSSL's libcrypto; nothing in minisim implements a cipher itself.
-They are built when cmake finds OpenSSL (`libssl-dev` on Debian / Ubuntu).
+All cryptography is OpenSSL's libcrypto (RSA, AES, HMAC, the random
+generator); nothing in minisim implements a cipher. The tools are built when
+cmake finds OpenSSL (`libssl-dev` on Debian / Ubuntu).
 
-## How an envelope is made
+## Quick start
 
-For each `begin`/`end` region, `msimprotect`:
+```sh
+# The IP vendor's key pair (the private key stays with the tool that decrypts).
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out acme.pem
+openssl pkey -in acme.pem -pubout -out acme_pub.pem
 
-1. draws a fresh random session key for the `data_method` (default
-   `aes256-cbc`, so 32 bytes);
-2. encrypts the region with it in CBC mode, with a random IV as the first
-   cipher block (34.5.15): the `data_block`;
-3. encrypts the session key with each recipient's RSA public key (key_method
-   `rsa`, PKCS#1 v1.5 padding): one `key_block` per `-key`;
-4. adds a `digest_block` after each key_block and data_block (34.5.22): the
-   SHA-256 of the cleartext, encrypted with the session key, so a modified
-   envelope is refused instead of decrypting to garbage;
-5. writes the recipient's public key as `key_public_key` (DER, so a decrypting
-   tool can pick the matching private key without trying every one), and base64
-   encodes every block, with its decoded length in `encoding=(… bytes=N)`.
+# Encrypt: one tool block for the key, rights in it.
+msimprotect -key acme_pub.pem -keyowner Acme -keyname acme-1 \
+            -control visibility=interface examples/protect/secret_core.sv    # -> secret_core.svp
 
-```systemverilog
-module secret_alu(input logic clk, input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
-`pragma protect begin_protected
-`pragma protect encrypt_agent="msimprotect", encrypt_agent_info="minisim"
-`pragma protect digest_method="sha256"
-`pragma protect key_keyowner="Acme", key_keyname="acme-1", key_method="rsa"
-`pragma protect encoding=(enctype="base64", line_length=76, bytes=294)
-`pragma protect key_public_key
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...
-`pragma protect encoding=(enctype="base64", line_length=76, bytes=256)
-`pragma protect key_block
-...
-`pragma protect data_method="aes256-cbc"
-`pragma protect encoding=(enctype="base64", line_length=76, bytes=208)
-`pragma protect data_block
-...
-`pragma protect end_protected
-`pragma reset protect
-endmodule
+# Simulate, lint, check DFT.
+msim  -keyfile Acme:acme-1=acme.pem secret_core.svp examples/protect/core_tb.sv -vcd waves.vcd
+mlint -keyfile Acme:acme-1=acme.pem secret_core.svp examples/protect/core_tb.sv
 ```
 
-Text outside the regions, including the module header and ports in this
-example, is copied unchanged. Envelopes that are already `begin_protected`
-are copied too, or encrypted again as plain bytes when they sit inside a
-`begin`/`end` region (34.5.1); msim then decrypts both layers.
+## The version 3 envelope
+
+```systemverilog
+`pragma protect begin_protected
+`pragma protect version=3
+`pragma protect encrypt_agent="msimprotect"
+`pragma protect encrypt_agent_info="minisim 0.1.0"
+`pragma protect data_method="aes256-cbc-hmac-sha512"
+`pragma protect begin_toolblock
+`pragma protect key_keyowner="Acme", key_keyname="acme-1"
+`pragma protect key_method="rsa_no_padding"
+`pragma protect key_block
+<base64: the root key, RSA encrypted for this tool>
+`pragma protect control visibility = "interface"
+`pragma protect end_toolblock
+`pragma protect data_block
+<base64: IV + AES-256-CBC of the source>
+`pragma protect end_protected="<base64 HMAC-SHA512 signature>"
+```
+
+For each envelope `msimprotect` draws a fresh random 64-byte root key and a
+fresh IV. Its first 32 bytes are the AES-256-CBC key of the `data_block`; its
+last 32 bytes are the HMAC-SHA512 key of the signature. For every tool block
+the root key goes in the low 64 bytes of a random number below the RSA
+modulus, encrypted without padding (`rsa_no_padding`); a key needs a public
+exponent of at least 65537 and more than 512 bits, and `msimprotect` warns
+below 3072. The signature covers the envelope text from the
+`begin_protected` line to `end_protected`, with carriage returns removed, so
+CR LF line ends do not matter and any other change does.
+
+On decryption the tool picks the first tool block whose `key_keyowner` /
+`key_keyname` it has a key for, checks the signature, and only then
+decrypts. A changed envelope (a right, a name, one base64 character) gives
+one error, `signature verification failed`, and nothing else. Envelopes may
+not nest in version 3. Version 1 and 2 envelopes are refused with a message;
+clause 34 envelopes (no `version`) still open.
+
+minisim's decryptor and encryptor were checked against the test vector of
+IEEE 1735-2023 Annex B (its RSA block, key split, AES and HMAC all match).
+The vector is copyrighted with the standard, so it is not in this
+repository; `tests/msim_protect.cmake` instead builds a version 3 envelope
+with the `openssl` command line tool alone and runs it, and checks the
+signature of `msimprotect`'s output with `openssl dgst`.
 
 ## msimprotect
 
 ```sh
-msimprotect -key acme_pub.pem -keyowner Acme -keyname acme-1 secret_alu.sv      # -> secret_alu.svp
-msimprotect -key acme_pub.pem -key other_pub.pem -o out/alu.svp secret_alu.sv   # two recipients
-msimprotect -key acme_pub.pem -all whole_file.svh -o inc/whole_file.svh         # no begin/end needed
+msimprotect -key acme_pub.pem -keyowner Acme -keyname acme-1 secret.sv        # -> secret.svp
+msimprotect -key acme_pub.pem -keyowner Acme -keyname acme-1 \
+            -key xyz_pub.pem  -keyowner XYZ  -keyname sim-2026 secret.sv       # two tool blocks
+msimprotect -keyring vendors.keys secret.sv                                    # every key in the file
+msimprotect -key acme_pub.pem -all whole_file.svh -o inc/whole_file.svh        # no begin/end needed
+msimprotect -export-key acme_pub.pem -keyowner Acme -keyname acme-1 > acme.keys
 ```
 
 | Option | Meaning |
 |---|---|
-| `-key <public.pem>` | Add a recipient: one key_block encrypted with this RSA key. A private key PEM also works; only its public half is used. Repeatable |
-| `-keyowner <name>`, `-keyname <name>` | `key_keyowner` / `key_keyname` of the `-key` before it (defaults `minisim` and the PEM file name) |
-| `-data_method <m>` | `aes256-cbc` (default), `aes192-cbc`, `aes128-cbc`, `3des-cbc`; `des-cbc`, `blowfish-cbc`, `cast128-cbc` with OpenSSL's legacy provider |
-| `-digest <m>` | `sha256` (default), `sha1`, `md5`, `sha384`, `sha512`, `ripemd-160`, or `none` |
-| `-encoding <e>` | `base64` (default) or `uuencode` |
-| `-o <file>` | Output file for a single input. Default: the input name plus `p` (`x.sv` → `x.svp`) |
-| `-all` | Encrypt a file that has no `begin` as one whole region |
+| `-key <public.pem>` | Add a tool block for this RSA key (a private key PEM works too: only its public half is used). Repeatable |
+| `-keyowner <o>`, `-keyname <n>` | `key_keyowner` / `key_keyname` of the `-key` before it (defaults `minisim` and the file name) |
+| `-keyring <file>` | Public keys by owner and name (below). With no `-key` and no tool block in the source, every key in it gets a tool block |
+| `-control <right>=<value>` | A right in the tool block of the `-key` before it; before any `-key`, in every command-line tool block |
+| `-author <s>`, `-author_info <s>` | Author pragmas when the source has none |
+| `-o <file>` | Output for a single input. Default: the input name plus `p` (`x.sv` → `x.svp`) |
+| `-all` | Encrypt a file that has no `begin` as one region |
+| `-export-key <pem>` | Print the public key in the IEEE 1735 key exchange format, for IP authors |
+| `-v1` | Write IEEE 1800-2023 clause 34 envelopes; then `-data_method`, `-digest`, `-encoding` apply |
 
-Keywords written in the source apply too, in the lexical order of 34.4:
-`key_keyowner`, `key_keyname`, `key_public_key` (adds a recipient),
-`data_method`, `encoding`, `digest_method`, `digest_block` (asks for digests),
-`author`, `author_info`.
+### Recipes in the source
 
-## msim -keyfile
+The encryption recipe can also be written in the source, as IEEE 1735
+describes; it applies to every `begin` / `end` region after it, each of
+which gets its own envelope with its own root key. Recipe pragmas are
+removed from the output; comments around them stay (they are HDL).
 
-```sh
-msim -keyfile acme.pem secret_alu.svp alu_tb.sv
-msim -keyfile acme-1=acme.pem -keyfile other.pem ...
+```systemverilog
+`pragma protect version=3
+`pragma protect author="Acme IP", author_info="core rev 4"
+`pragma protect data_method="aes256-cbc-hmac-sha512"
+`pragma protect begin_toolblock
+`pragma protect key_keyowner="Acme", key_keyname="acme-1"
+`pragma protect key_method="rsa_no_padding"
+`pragma protect control visibility = license("acme_debug") ? "full" : "none"
+`pragma protect key_public_key
+MIIBigKCAYEA...            (DER RSAPublicKey; or leave it out and give -key / -keyring)
+`pragma protect end_toolblock
+`pragma protect begin
+module core(...);
+  `pragma protect viewport
+  logic [7:0] status;      // visible in waves and coverage
+  ...
+endmodule
+`pragma protect end
 ```
 
-A key given as `name=file` only opens key_blocks whose `key_keyname` is
-`name`, or whose `key_public_key` is that key. A plain file is tried on every
-key_block; a wrong guess is rejected by the digest or the CBC padding. Keys
-must be unencrypted PEM RSA private keys (msim does not prompt for a
-passphrase). Envelopes from another tool open when they use the methods
-above; `tests/msim_protect.cmake` runs one built with the `openssl` command
-line tool alone.
+A `version` pragma resets the recipe. Between `begin` and `end` only
+`viewport` / `interface_viewport` pragmas may appear; a nested `begin` or
+`begin_protected` is an error. `begin_commonblock` … `end_commonblock`
+(license_proxyenv, license_certificate) is copied into the envelope.
 
-msim finds envelopes in the source files, and in files with a Verilog
+## Keyrings
+
+Two files, both plain text:
+
+- **Public keys** (`msimprotect -keyring`): the IEEE 1735 pragma exchange
+  format, which is how a tool vendor hands its public key to IP authors
+  (`msimprotect -export-key` writes it), and table lines.
+
+  ```
+  `protect key_keyowner = "Acme"
+  `protect key_method = "rsa_no_padding"
+  `protect key_keyname = "acme-1"
+  `protect key_public_key
+  MIIBigKCAYEA...
+  "XYZ Corp"  sim-2026  xyz_pub.pem
+  ```
+
+- **Private keys** (`msim -keyring`, also mlint and mdft): one key per line,
+  `<key_keyowner> <key_keyname> <private.pem>`, the path relative to the
+  keyring; quote names with spaces. Keep this file and the PEMs private.
+
+  ```
+  # owner   name      key
+  "Acme"    acme-1    keys/acme.pem
+  XYZ       sim-2026  keys/xyz.pem
+  ```
+
+Two keys with the same owner and name are an error. `-keyfile` adds one key:
+`Acme:acme-1=acme.pem` (owner and name), `acme-1=acme.pem` (name, any owner),
+or `acme.pem` (tried on every tool block; only a valid signature accepts it).
+Keys must be unencrypted PEM RSA private keys.
+
+## Rights
+
+Rights are `control` pragmas in a tool block (IEEE 1735 clause 7); each tool
+defines its own. minisim reads these from the tool block it opened:
+
+| Right | Values | Effect |
+|---|---|---|
+| `decryption` | `"allow"` (default), `"deny"` | `deny`: msim, mlint and mdft refuse the IP |
+| `visibility` | `"none"` (default), `"interface"`, `"full"` | What the tools show of protected objects: only viewports; also the ports of protected modules; everything, including diagnostics |
+| `coverage` | `"off"` (default), `"on"` | Line and branch coverage inside the protected code (toggle coverage follows `visibility`) |
+| `min_version` | `"0.2"`, … | The oldest minisim that may open the IP |
+
+Other rights are ignored with a warning. A right may depend on a license:
+`right = license("feature") ? "a" : "b"` or `right = license_string("feature")`.
+IEEE 1735 clause 8 checks licenses through a license proxy server; minisim
+does not implement that protocol. Instead `-license <feature>[=<string>]`
+says a feature is licensed, which is enough to test licensed rights but is
+not a license check: anyone can pass the option. Without it a licensed right
+takes its unlicensed value.
+
+## Viewports
+
+`` `pragma protect viewport `` inside protected text makes objects visible
+whatever the rights (IEEE 1735 9.5):
+
+- with no name, the declaration after it (`logic [7:0] a, b;`) or, before a
+  `module`, the whole module;
+- with a name, that object in the code after it: `sig`, `mod.sig`,
+  `mod.genblk.sig`, or `mod` for a whole module;
+- `interface_viewport [mod]`: the ports of the next (or named) module.
+
+The pragmas are encrypted with the source; msim blanks their lines before
+the compiler sees them.
+
+## What the tools hide
+
+Unless `visibility = "full"`:
+
+- **msim diagnostics**: an error or warning whose location, macro expansion,
+  range or note points into protected code prints as
+  `file: error: in protected code (details hidden)`. A construct msim cannot
+  simulate yet is reported without its details.
+- **Assertion failures**: the default `$error` of an assertion in protected
+  code prints `"file", protected code: tb.u.<protected assertion>`, with no
+  label or line. The IP's own `$display` and `%m` print as written: that is
+  the model's behavior, not the tool's.
+- **Waveforms (VCD / FST)**: signals declared in protected code are left out,
+  except viewport objects (and ports with `visibility = "interface"`).
+  Signals declared in the clear stay.
+- **Coverage (`-cov`, mcov)**: no line or branch entries for protected code
+  (unless `coverage = "on"`), and no toggle entries for hidden signals.
+- **mlint / mdft**: findings located in protected code are counted, not
+  shown (`mlint: 1 finding in protected code (details hidden)`), and hidden
+  objects in other findings and in the chain plan print as `<protected>`.
+- **-compile** runs the interpreter, because the generated C++ would hold the
+  design in the clear.
+- The cleartext only exists in memory. Line numbers after an envelope are
+  those of the encrypted file (msim inserts a `` `line `` directive).
+
+msim finds envelopes in the source files and in files with a Verilog
 extension (`.v .sv .vh .svh .vp .svp .inc .svi .vg`) in their directories and
-in `+incdir+` / `-I` / `-y` directories given on the msim command line, so a
-protected `` `include `` file works when its directory is given that way.
+in `+incdir+` / `-I` / `-y` directories, so protected `` `include `` files and
+library cells work. An envelope in such an extra file that does not open is
+only an error if the design reads it.
 
-What msim does to keep protected text from leaking:
+## Commercial tools
 
-- The cleartext only exists in memory; nothing is written to disk.
-- A diagnostic whose location, macro expansion, range, or note points into
-  protected code prints as `file: error: in protected code (details hidden)`,
-  with no message, names, or source line.
-- Signals declared in protected code are left out of the VCD. Ports declared
-  in the clear stay in it.
-- A lowering error ("construct not supported yet") in a design with protected
-  code is reported without its details, since it may name a protected signal.
-- `-compile` runs the interpreter instead, because the generated C++ would
-  hold the design in the clear.
-- Line numbers after an envelope are those of the encrypted file (msim
-  inserts a `` `line `` directive), so errors in the clear parts point to the
-  right line.
+A version 3 envelope opens in any IEEE 1735 tool that holds the private key
+of one of its tool blocks. To encrypt for a commercial simulator, get that
+vendor's public key (in the key exchange format above) and add it with
+`-keyring`; each tool block carries its own rights. The reverse, opening an
+envelope encrypted only for a commercial tool, needs that vendor's private
+key, which minisim does not have and does not try to obtain.
 
-Protected code still runs: its `$display` output and `%m` names print as the
-vendor wrote them.
+## IEEE 1735-2023 coverage
 
-## Not yet
+| Clause | Topic | Status |
+|---|---|---|
+| 5.3–5.4 | Version 3 cryptography: RSA no-padding root key, AES-256-CBC, HMAC-SHA512, base64 | ✅ |
+| 5.4.9 | version=3 second and alone; one version per envelope | ✅ |
+| 5.5 | Envelope anatomy: author / agent pragmas, common block, tool blocks, data_block | ✅ |
+| 5.6 | eTool input: recipes, reset on version, no nesting, viewports verbatim, one root key per region | ✅ |
+| 5.6.2, 6.3 | DER RSAPublicKey, pragma key exchange format | ✅ |
+| 5.7 | Transform tools (re-encryption with the same root key) | — (minisim is not a tTool) |
+| 5.8 | Signature over the canonical envelope text, checked before decryption | ✅ |
+| 6.2.1 | Keys named by owner and name, duplicates refused | ✅ |
+| 7 | Rights in tool blocks, licensed rights syntax | ✅ (minisim rights above) |
+| 8 | License proxy protocol | ❌ (`-license` stands in for testing) |
+| 9.2 | Error handling and model fidelity | ✅ msim, mlint, mdft |
+| 9.5–9.6 | viewport / interface_viewport | ✅ named and unnamed; named ones match by lexical name |
+| 9.7 | VPI / DPI visibility | ❌ minisim has no VPI; DPI calls are the IP author's |
+| Annex B | Test vector | ✅ checked locally (not redistributable) |
 
-- `decrypt_license`, `runtime_license`, and `viewport` are read and ignored.
-- `key_method` other than `rsa` (a symmetric key_block, `pgp-rsa`, `elgamal`),
-  and `data_decrypt_key` / `digest_decrypt_key`.
-- The IEEE 1735 version 2 "rights" (`control` pragmas) and the vendor key
-  rings of commercial tools: an envelope encrypted for a commercial
-  simulator's key only opens with that vendor's private key, which minisim
-  does not have.
+## IEEE 1800-2023 clause 34 envelopes (`-v1`)
+
+The older format: a session key for the `data_method` (default
+`aes256-cbc`), RSA PKCS#1 v1.5 `key_block`s (key_method `rsa`), a
+`digest_block` after each key_block and data_block (default SHA-256), the
+recipient's `key_public_key`, and `encoding=(enctype=..., bytes=...)`
+directives. `msim` opens these with the same `-keyfile` options, including
+envelopes nested in decrypted text and envelopes made with the `openssl` tool
+alone. Not supported there: `decrypt_license`, `runtime_license`, the 1800
+`viewport = (object=..., access=...)` form, `key_method` other than `rsa`,
+and `data_decrypt_key` / `digest_decrypt_key`.
