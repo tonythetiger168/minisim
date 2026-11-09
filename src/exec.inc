@@ -20,7 +20,7 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
         }
         int64_t off = i.arr->offset(idx);
         if (off < 0) return false;
-        sig = R(i.arr->base + (int)off);
+        sig = R(i.arr->base) + (int)off;
     }
     if (i.bidx) {
         Val v = eval(i.bidx, rd);
@@ -57,7 +57,7 @@ static void writeMem(const Instr& i) {
     for (int64_t ad = start;; ad += step) {
         int64_t off = a.offset({ad});
         if (off >= 0) {
-            Val v = S.get(R(a.base + (int)off));
+            Val v = S.get(R(a.base) + (int)off);
             v.sgn = false;
             int bits = i.hex ? 4 : 1;
             int n = (a.elemW + bits - 1) / bits;
@@ -144,7 +144,7 @@ static void readMem(const Instr& i) {
                 acc.v &= ~acc.x; acc.x = acc.z = 0;
                 for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
             }
-            S.set(R(a.base + (int)off), acc);
+            S.set(R(a.base) + (int)off, acc);
             addr += step;
             words++;
             continue;
@@ -164,13 +164,15 @@ static void readMem(const Instr& i) {
         int64_t off = a.offset({addr});
         if (off < 0) break;
         if (a.twoState) { v &= ~x; x = z = 0; }
-        S.set(R(a.base + (int)off), make(v, x, a.elemW, z));
+        S.set(R(a.base) + (int)off, make(v, x, a.elemW, z));
         addr += step;
         words++;
     }
-    // A file with no @address whose word count differs from the range warns.
+    // A file with no @address whose word count differs from the range warns
+    // (21.4): the range given by start and finish addresses, or, with no
+    // finish address, a file with more words than the memory has room for.
     int64_t range = (step > 0 ? finish - start : start - finish) + 1;
-    if (!sawAddr && words != range)
+    if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
 }
 
@@ -278,6 +280,19 @@ inline void dynExec(const Instr& i) {
             });
             break;
         }
+        case D_UNPACK: {   // the stream e, cut into elements from the left; the last is padded on the right
+            Val v = eval(i.e, rd);
+            int ew = d.dflt.w, W = v.w;
+            d.vec.clear();
+            for (int hi = W - 1; hi >= 0; hi -= ew) {
+                int lo = hi - ew + 1;
+                Val el = lo >= 0 ? v_slice(v, hi, lo) : v_concat({v_slice(v, hi, 0), make(0, 0, -lo, 0)});
+                el.sgn = d.dflt.sgn;
+                d.vec.push_back(el);
+                if (full()) { d.vec.pop_back(); break; }
+            }
+            break;
+        }
         case D_SORT_BY:
         case D_RSORT_BY: {   // order d by the keys in dsrc, one per element
             bool down = i.dcmd == D_RSORT_BY;
@@ -309,6 +324,29 @@ inline void dynExec(const Instr& i) {
         }
     }
     dynBump(sig);
+}
+
+// new (8.7) and a shallow copy `new h` (8.12). Objects are never freed.
+inline void newObject(const Instr& i) {
+    int src = 0, cls = i.hi;
+    if (i.e) {
+        Val h = eval(i.e, rd);
+        if (h.x || !h.v) nullAccess();
+        src = (int)h.v;
+        cls = (int)S.sigs[src].val.v;
+    }
+    const FrameLayout& L = *classRt()[(size_t)cls].lay;
+    int obj = g_allocSigs(L);
+    g_initSigs(L, obj);
+    if (src)
+        for (size_t k = 0; k < L.w.size(); k++) S.sigs[obj + (int)k].val = S.sigs[src + (int)k].val;
+    if (src)
+        for (auto& [off, o] : L.dyn) dynStore()[obj + off] = dynStore()[src + off];
+    // Its own random generator (18.14.3): seeded from the $urandom stream, or
+    // the source's state for a copy.
+    if (src) objRng()[obj] = objRng()[src];
+    else { uint64_t a = urandomNext(urandomState()), b = urandomNext(urandomState()); objRng()[obj] = seedState(a << 32 | b); }
+    S.set(R(i.sig), make((uint64_t)obj, 0, 64));
 }
 
 struct JoinState {
@@ -377,6 +415,8 @@ struct WaitFork {
 };
 
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+static int doRandomize(int obj, const RandCall* rc);   // rand.inc
+static void randModeAll(int obj, bool blocks, bool on);
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
     Task t = exec(p, c, std::move(fr));
     c->h = t.h;
@@ -504,6 +544,96 @@ static void runAction(const Prog* p, uint64_t n, const vector<E>* slots = nullpt
     }
     S.rare = true;
 }
+// Local variables of a concurrent assertion (16.10): environments are
+// interned value vectors; an atom or a match item that reads local variables
+// is evaluated with their hidden signals set (without events) from an environment.
+struct LocalEnv final : sva::LocalHook {
+    ConcAssert& c;
+    int loaded = -1;
+    vector<vector<Val>> tbl;                    // this attempt's environments
+    uint64_t count = 1;                         // the attempts merged into this one
+    std::unordered_map<uint64_t, bool> cache;   // (env, atom) -> value, for one attempt
+    explicit LocalEnv(ConcAssert& c) : c(c) {}
+    static void poke(int s, Val v) {
+        int w = S.sigs[s].w;
+        if (w <= 64) {
+            uint64_t m = w >= 64 ? ~0ULL : ((1ULL << w) - 1);
+            v.v &= m; v.x &= m; v.z &= m; v.sgn = false;
+            v.hi.clear();
+        } else v = maskWidth(v, w);
+        S.sigs[s].val = v;
+    }
+    void start(const ConcAssert::Envs& e) {
+        if (e) tbl = *e;
+        else {   // the initial environment: every local variable unassigned (x)
+            tbl.assign(1, {});
+            for (int s : c.localSig) tbl[0].push_back(allx(S.sigs[s].w));
+        }
+        loaded = -1;
+        cache.clear();
+    }
+    void load(int e) {
+        if (loaded == e) return;
+        for (size_t k = 0; k < c.localSig.size(); k++) poke(c.localSig[k], tbl[e][k]);
+        loaded = e;
+    }
+    int intern(vector<Val> v) {
+        for (size_t i = 0; i < tbl.size(); i++)
+            if (tbl[i] == v) return (int)i;
+        tbl.push_back(std::move(v));
+        return (int)tbl.size() - 1;
+    }
+    bool atom(int a, int e) override {
+        uint64_t key = (uint64_t)(uint32_t)e << 32 | (uint32_t)a;
+        if (auto it = cache.find(key); it != cache.end()) return it->second;
+        load(e);
+        bool v = truth(eval(c.atoms[a], rd)) == 1;
+        cache[key] = v;
+        return v;
+    }
+    int apply(int act, int e) override {
+        load(e);
+        for (auto& item : c.acts[act]) {   // in order: later items see earlier ones
+            if (item.k >= 0) { poke(c.localSig[item.k], eval(item.rhs, rd)); continue; }
+            vector<Val> args;   // a subroutine call (16.11): its arguments now, the call in the reactive region
+            for (const E& x : item.caps) args.push_back(eval(x, rd));
+            runAction(item.call, count, &item.slots, &args);
+        }
+        vector<Val> v;
+        for (int s : c.localSig) v.push_back(S.get(s));
+        int id = intern(std::move(v));
+        loaded = id;
+        return id;
+    }
+    int merge(int ctx, int a, int b) override {
+        if (a == b || b == ctx) return a;
+        if (a == ctx) return b;
+        vector<Val> v = tbl[a];
+        for (size_t k = 0; k < v.size(); k++)
+            if (!(tbl[b][k] == tbl[ctx][k])) v[k] = tbl[b][k];
+        return intern(std::move(v));
+    }
+    // The stepped term with its environments numbered in order of use.
+    std::pair<const sva::Node*, ConcAssert::Envs> finish(const sva::Node* t) {
+        if (!t->envDep) return {t, nullptr};
+        vector<int> used{0};
+        std::unordered_set<const sva::Node*> seen;
+        sva::Store::envsUsed(t, used, seen);
+        std::unordered_map<int, int> to;
+        auto out = make_shared<vector<vector<Val>>>();
+        bool same = true;
+        for (size_t i = 0; i < used.size(); i++) {
+            to[used[i]] = (int)i;
+            same = same && used[i] == (int)i;
+            out->push_back(tbl[used[i]]);
+        }
+        if (!same) {
+            std::unordered_map<const sva::Node*, const sva::Node*> memo;
+            t = sva::store().renumber(t, to, memo);
+        }
+        return {t, out};
+    }
+};
 // One clock tick of a concurrent assertion, in the observed region: start an
 // attempt, then step every attempt on the sampled values of the atoms.
 static void concTick(ConcAssert& c) {
@@ -544,13 +674,22 @@ static void concTick(ConcAssert& c) {
         for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
     };
     sva::Deriv dv{sva::store(), val};
+    std::optional<LocalEnv> lenv;
+    if (!c.acts.empty()) {   // local variables or subroutine calls in match items
+        lenv.emplace(c);
+        dv.lh = &*lenv;
+    }
     vector<ConcAssert::Attempt> next;
     for (auto& at : c.att) {
         values(at.caps);
+        if (lenv) { lenv->start(at.envs); lenv->count = at.count; }
+        dv.env = 0;
         dv.memo.clear();
         dv.nonvac = at.nonvac;
         dv.matches = 0;
         const sva::Node* t = dv.d(at.t);
+        ConcAssert::Envs envs;
+        if (lenv) std::tie(t, envs) = lenv->finish(t);
         if (c.coverSeq) {   // every match counts (16.14.3)
             if (dv.matches) {
                 a.passes += at.count * dv.matches;
@@ -568,12 +707,13 @@ static void concTick(ConcAssert& c) {
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps))) {
+            if (n.t == t && n.nonvac == dv.nonvac && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+                (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs)});
     }
     c.att.swap(next);
 }
@@ -741,6 +881,28 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
+            case IK::New: newObject(i); pc++; break;
+            case IK::Randomize: {   // 18.6, 18.12
+                int obj = 0;
+                if (i.e) {
+                    Val h = eval(i.e, rd);
+                    if (h.x || !h.v) nullAccess();
+                    obj = (int)h.v;
+                    if (i.rc && i.rc->objTmp >= 0) S.set(R(i.rc->objTmp), make((uint64_t)obj, 0, 64));
+                }
+                int r = doRandomize(obj, i.rc.get());
+                g_fr = fr.get();
+                g_ret = lastRet.get();
+                if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true));
+                pc++; break;
+            }
+            case IK::RandMode: {   // obj.rand_mode(v) / obj.constraint_mode(v) (18.8, 18.9)
+                Val h = eval(i.e, rd);
+                if (h.x || !h.v) nullAccess();
+                Val on = eval(i.de, rd);   // the on / off value
+                randModeAll((int)h.v, i.hi != 0, truth(on) == 1);
+                pc++; break;
+            }
             case IK::JmpIfNot:
                 if (truth(eval(i.e, rd)) == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = i.target; }
@@ -791,10 +953,44 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Call: {
                 const Prog* callee = i.callee;
                 if (i.lay) {   // an automatic subroutine: a new frame (13.3.2)
-                    FrameP nf = newFrame(i.lay, nullptr, fr ? fr->self : 0);
+                    int self = fr ? fr->self : 0;
+                    const FrameLayout* lay = i.lay;
+                    if (i.noSelf) self = 0;
+                    else if (i.self) {
+                        Val h = eval(i.self, rd);
+                        if (h.x || !h.v) nullAccess();
+                        self = (int)h.v;
+                    }
+                    if (i.vslot >= 0 || i.vslot <= -2) {   // virtual (8.20): the body of the object's own class
+                        if (!self) nullAccess();
+                        const ClassRt& cr = classRt()[(size_t)S.sigs[self].val.v];
+                        int vs = i.vslot;
+                        if (vs <= -2) {   // an interface class method (8.26): k = -2 - vslot
+                            size_t k = (size_t)(-2 - vs);
+                            vs = k < cr.imap.size() ? cr.imap[k] : -1;
+                            if (vs < 0) {
+                                cerr << "error: class " << cr.name << " has no implementation of an interface method\n";
+                                exit(1);
+                            }
+                        }
+                        const auto& ve = cr.vt[(size_t)vs];
+                        if (!ve.first) {
+                            cerr << "error: call of a pure virtual method at time " << S.now << "\n";
+                            exit(1);
+                        }
+                        callee = ve.first;
+                        lay = ve.second;
+                    }
+                    FrameP nf = newFrame(lay, nullptr, self);
                     for (auto& [off, e] : i.init) {   // arguments, read in the caller's frame
                         Val v = eval(e, rd);
                         S.set(nf->base + off, v);
+                    }
+                    for (auto [off, src] : i.dinit) {   // container arguments (7.7)
+                        auto& d = dynStore()[nf->base + off];
+                        const auto& sv = dynStore()[R(src)];
+                        if (d.kind == 2) d.map = sv.map;
+                        else { d.vec = sv.kind == 2 ? std::vector<Val>{} : sv.vec; if (d.bound >= 0 && (int64_t)d.vec.size() > d.bound + 1) d.vec.resize((size_t)d.bound + 1); }
                     }
                     rets.push_back({p, pc + 1, fr});
                     fr = std::move(nf);
