@@ -1,5 +1,4 @@
 // IEEE 1800-2023 18.17: randsequence runs productions in order (18.17).
-//! xfail: randsequence is an error
 //! icarus-skip: Icarus 13 does not support randsequence
 module top;
   initial randsequence (main)
