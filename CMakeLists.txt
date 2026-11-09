@@ -141,6 +141,12 @@ if(MINISIM_WITH_SLANG)
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_smoke
                      -P ${CMAKE_SOURCE_DIR}/tests/mregress.cmake)
   endif()
+  if(Python3_FOUND)
+    add_test(NAME msim_cov
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_cov.cmake)
+  endif()
   if(MINISIM_WITH_FST)
     add_executable(test_fst tests/test_fst.cpp)
     target_link_libraries(test_fst PRIVATE fst)
@@ -218,6 +224,7 @@ if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
+install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
