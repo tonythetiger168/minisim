@@ -1320,6 +1320,13 @@ enum class Op {
     ArrRead,   // element of an unpacked array; kids are one index per dimension
     DynSlice,  // a[i +: w] / a[i -: w] with i known at run time: hi = w, lo = 1 for -:
     SysFn,     // hi: a SysFnId; kids are its arguments
+    // Streaming with containers (11.4.14). DynBits: the elements of container
+    // sig packed, the first on top; its width is known only at run time, and
+    // it only appears inside StreamPack. StreamPack: kids concatenated at
+    // their run-time widths, then cut into lo-bit slices from the right and
+    // reversed when lo > 0, then left-aligned into hi bits (hi < 0: as is).
+    DynBits, StreamPack,
+    DynHas,    // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
     // Classes (8). A handle is the first signal id of its object (0: null).
     This,      // the running method's `this`
     IsA,       // 1 if kids[0] is null or an object of class hi or a class derived from it ($cast, 8.16)
@@ -2218,6 +2225,44 @@ inline Val eval(const E& e, const Reader& rd) {
             if (d.kind != 2) { int64_t i = v_to_i64(key); return mk(!key.x && i >= 0 && i < (int64_t)d.vec.size()); }
             return mk(d.map.count(d.key(key)) > 0);
         }
+        case Op::DynHas: {
+            auto& d = dynStore()[R(e->sig)];
+            Val x = k(0);
+            bool unk = false;
+            for (auto& el : d.vec) {
+                int w = std::max(x.w, el.w);
+                Val r = v_wild_eq(v_resize(x, w, x.sgn && el.sgn), v_resize(el, w, x.sgn && el.sgn));
+                if (r.x) unk = true;
+                else if (r.v & 1) return mk(1);
+            }
+            return unk ? allx(1) : mk(0);
+        }
+        case Op::DynBits: {
+            auto& d = dynStore()[R(e->sig)];
+            std::vector<Val> parts;
+            int ew = d.dflt.w;
+            if (d.kind == 2) for (auto& [key, v] : d.map) parts.push_back(v_resize(v, ew, false));
+            else for (auto& v : d.vec) parts.push_back(v_resize(v, ew, false));
+            if (parts.empty()) { Val z = make(0, 0, 1, 0); z.w = 0; return z; }
+            return v_concat(parts);
+        }
+        case Op::StreamPack: {
+            std::vector<Val> parts;
+            for (auto& kid : e->kids) { Val v = eval(kid, rd); if (v.w > 0) parts.push_back(v); }
+            int W = 0;
+            for (auto& p : parts) W += p.w;
+            Val v = W > 0 ? v_concat(parts) : make(0, 0, 1, 0);
+            if (W > 0 && e->lo > 0 && e->lo < W) {
+                std::vector<Val> sl;
+                for (int lo = 0; lo < W; lo += e->lo) sl.push_back(v_slice(v, std::min(lo + e->lo, W) - 1, lo));
+                v = v_concat(sl);
+            }
+            if (e->hi < 0) return v;
+            if (W == 0) return make(0, 0, e->hi, 0);
+            if (e->hi > W) return v_concat({v, make(0, 0, e->hi - W, 0)});
+            if (e->hi < W) return v_slice(v, W - 1, W - e->hi);
+            return v;
+        }
         case Op::DynReduce: {
             auto& d = dynStore()[R(e->sig)];
             int w = e->k.w;
@@ -2313,7 +2358,7 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
     if (e->op == Op::Ref) out.push_back(R(e->sig));
     if (e->op == Op::ArrRead)
         for (int i = 0; i < e->arr->count; i++) out.push_back(R(e->arr->base) + i);
-    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce) out.push_back(R(e->sig));
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas) out.push_back(R(e->sig));
     for (auto& k : e->kids) collectAddrs(k, out);
 }
 // A copy of `e` with every relative id resolved now: a $strobe / $monitor
@@ -2322,7 +2367,7 @@ inline void collectAddrs(const E& e, std::vector<int>& out) {
 inline E bindRel(const E& e) {
     if (!e) return e;
     bool rel = isRel(e->sig) && !e->at && (e->op == Op::Ref || e->op == Op::DynGet || e->op == Op::DynSize ||
-                                            e->op == Op::DynExists || e->op == Op::DynReduce);
+                                            e->op == Op::DynExists || e->op == Op::DynReduce || e->op == Op::DynBits || e->op == Op::DynHas);
     if (e->op == Op::This) return konst(make(g_fr ? (uint64_t)g_fr->self : 0, 0, 64));
     bool arel = e->op == Op::ArrRead && e->arr && isRel(e->arr->base);
     std::vector<E> kids;
