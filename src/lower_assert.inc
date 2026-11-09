@@ -269,7 +269,8 @@ std::vector<std::pair<int, Edge>> clockArg(const slang::ast::CallExpression& cal
     std::vector<std::pair<int, Edge>> ev;
     auto args = call.arguments();
     if (idx < args.size() && args[idx]->kind == ExpressionKind::ClockingEvent) {
-        collectEvents(args[idx]->as<ClockingEventExpression>().timingControl, ev);
+        E iff;
+        clockOf(args[idx]->as<ClockingEventExpression>().timingControl, ev, iff);
         return ev;
     }
     if (!sampleEv.empty()) return sampleEv;
@@ -362,6 +363,10 @@ void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge
     using namespace slang::ast;
     if (t.kind == TimingControlKind::SignalEvent) {
         const auto& s = t.as<SignalEventControl>();
+        if (const auto* cb = isGlobalClock(s.expr) ? globalClocking() : clockingRef(s.expr)) {
+            clockOf(cb->getEvent(), ev, iff);   // @(cb) or @($global_clock) as a clock (14.10, 14.14, 16.16)
+            return;
+        }
         if (s.iffCondition) {
             if (iff) unsupported("a clock with more than one iff");
             iff = expr(*s.iffCondition);

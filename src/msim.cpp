@@ -195,6 +195,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
                     : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
                     : !asserts().empty() ? "an assertion"
+                    : !clockings().empty() ? "a clocking block"
                     : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -542,7 +543,8 @@ int main(int argc, char** argv) {
     S.sclocks = sampleClocks();
     for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
     startConcAsserts();
-    if (!S.shadows.empty() || !asserts().empty()) staticPart = false;
+    startClockings();
+    if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
         std::vector<int> pt;

@@ -392,6 +392,7 @@ inline Task exec(const Prog* p) { return process(p); }
 // action by jumping; a deferred one queues a report on this process with
 // the action's arguments evaluated now (16.4).
 static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl);
+static void cbDrive(const Instr& i, Val v, int hi, int lo);
 static size_t runAssert(const Instr& i, const shared_ptr<ProcCtl>& ctl, size_t pc) {
     if (i.join == 3) { queueConc(i, ctl); return pc + 1; }   // a procedural concurrent assertion
     AssertInfo& a = asserts()[i.sig];
@@ -842,6 +843,23 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 break;
             case IK::Assert: pc = runAssert(i, ctl, pc); break;
             case IK::AssertCtl: assertCtl(i); pc++; break;
+            case IK::CycleWait: {   // ##n (14.11)
+                Val nv = eval(i.e, rd);
+                uint64_t n = nv.x ? 0 : nv.v;
+                if (n == 0) {   // ##0: only if the clocking block event has not happened in this step
+                    Val t = S.get(i.sig + 1);
+                    if (t.x || t.v != S.now + 1) co_await Wait{i.sig, ANY};
+                } else
+                    for (uint64_t k = 0; k < n; k++) co_await Wait{i.sig, ANY};
+                ctl->epoch++;
+                pc++; break;
+            }
+            case IK::CbDrive: {   // cb.v <= ##n e (14.16)
+                Val v = eval(i.e, rd);
+                int sig = i.sig, hi = i.hi, lo = i.lo;
+                if (target(i, sig, hi, lo, v)) cbDrive(i, v, hi, lo);
+                pc++; break;
+            }
             case IK::Ret:
                 if (rets.empty()) goto done;
                 ret();
@@ -908,5 +926,146 @@ static void execComb(const void* ctx) {
             S.drive(i.sig, i.drv, v, i.s0, i.s1);
         } else
             S.set(i.sig, i.hi >= 0 ? v_insert(S.get(i.sig), v, i.hi, i.lo) : v);
+    }
+}
+
+// ---- clocking blocks (IEEE 1800-2023 clause 14) ----
+// A synchronous drive maturing: bits [hi:lo] of output `out` (hi < 0: all)
+// take v, in the re-NBA region, `skew` ticks after the clocking event (14.16).
+inline Task cbLater(int s, Val v, int hi, int lo, uint64_t d) {
+    co_await Delay{d};
+    S.reNbaq.push_back({s, v, hi, lo});
+    S.rare = true;
+}
+static void cbSchedule(ClockingRT& c, int out, const Val& v, int hi, int lo) {
+    const ClockingRT::Out& o = c.outs[out];
+    if (hi < 0) { hi = o.w - 1; lo = 0; }
+    int pl = 0;   // the clockvar bit where this piece starts
+    for (const auto& p : o.pieces) {
+        int a = std::max(lo, pl), b = std::min(hi, pl + p.w - 1);
+        if (a <= b) {
+            Val part = v_slice(v, b - lo, a - lo);
+            int dhi = p.lo + (b - pl), dlo = p.lo + (a - pl);
+            if (dlo == 0 && dhi == S.sigs[p.sig].w - 1) dhi = -1;
+            if (o.skew == 0) { S.reNbaq.push_back({p.sig, part, dhi, dlo}); S.rare = true; }
+            else S.spawn(cbLater(p.sig, part, dhi, dlo, o.skew));
+        }
+        pl += p.w;
+    }
+}
+// Did the clocking event happen in this time step? Each event signal is
+// compared with its value from before the step.
+static bool cbEdgeNow(const ClockingRT& c) {
+    auto bit = [](const Val& v) { return (v.x & 1) ? 2 : (int)(v.v & 1); };
+    bool hit = false;
+    for (size_t k = 0; k < c.ev.size() && !hit; k++) {
+        Val cur = S.get(c.ev[k].first), pre = S.get(c.evShadow[k]);
+        int a = bit(pre), b = bit(cur);
+        switch (c.ev[k].second) {
+            case POS: hit = (a == 0 && b != 0) || (a == 2 && b == 1); break;
+            case NEG: hit = (a == 1 && b != 1) || (a == 2 && b == 0); break;
+            default: hit = !(cur == pre) || cur.x != pre.x; break;
+        }
+    }
+    return hit && (!c.iff || truth(eval(c.iff, rd)) == 1);
+}
+// cb.v[hi:lo] <= ##n e: at the clocking event n cycles on. A drive at a time
+// with no clocking event (yet) in it counts the next event as cycle 1 (14.16).
+static void cbDrive(const Instr& i, Val v, int hi, int lo) {
+    ClockingRT& c = clockings()[i.dkey];
+    uint64_t n = 0;
+    if (i.de) { Val d = eval(i.de, rd); n = d.x ? 0 : d.v; }
+    uint64_t tick;
+    if (c.lastTick == S.now) tick = c.ticks + n;   // after the clocking event
+    else if (cbEdgeNow(c)) tick = c.ticks + 1 + n;   // its event is in this step, not processed yet
+    else tick = c.ticks + std::max<uint64_t>(n, 1);
+    if (tick == c.ticks) cbSchedule(c, i.dres, v, hi, lo);
+    else c.drives.push_back({tick, i.dres, v, hi, lo});
+}
+// An input with skew #N: its value at the end of time t (14.13).
+static Val cbHistAt(ClockingRT::In& in, uint64_t t) {
+    auto& h = in.hist;
+    size_t k = 0;
+    while (k + 1 < h.size() && h[k + 1].first <= t) k++;
+    h.erase(h.begin(), h.begin() + (ptrdiff_t)k);   // later ticks look at later times
+    return h.front().second;
+}
+inline Task cbHist(int k, int j, shared_ptr<vector<pair<int, Edge>>> ev) {
+    for (bool first = true;; first = false) {
+        if (!first) {
+            if (ev->size() > 1) co_await WaitAny{ev.get()};
+            else co_await Wait{(*ev)[0].first, (*ev)[0].second};
+        }
+        auto& in = clockings()[k].ins[j];
+        Val v = eval(in.src, rd);
+        if (!in.hist.empty() && in.hist.back().first == S.now) in.hist.back().second = v;
+        else in.hist.push_back({S.now, v});
+    }
+}
+// A net output is driven from its hidden variable (14.16).
+inline Task cbNetDriver(int var, int net, int drv, int lo) {
+    for (;;) {
+        co_await Wait{var, ANY};
+        Val v = S.get(var);
+        S.drive(net, drv, v_insert(allz(S.sigs[net].w), v, lo + v.w - 1, lo));
+    }
+}
+inline Task cbProc(int k) {
+    ClockingRT& c = clockings()[k];
+    vector<Val> early(c.ins.size());
+    for (;;) {
+        if (c.ev.size() > 1) co_await WaitAny{&c.ev};
+        else co_await Wait{c.ev[0].first, c.ev[0].second};
+        if (c.iff && truth(eval(c.iff, rd)) != 1) continue;
+        c.ticks++;
+        c.lastTick = S.now;
+        // Inputs: #1step reads the values from before this time step, #N
+        // the values N ticks back. They are updated now (14.13).
+        for (size_t j = 0; j < c.ins.size(); j++) {
+            auto& in = c.ins[j];
+            if (in.kind == 0) S.set(in.cv, eval(in.src, rd));
+            else if (in.kind == 2) S.set(in.cv, S.now >= in.skew ? cbHistAt(in, S.now - in.skew) : in.hist.front().second);
+        }
+        // Drives due at this clocking event.
+        if (!c.drives.empty()) {
+            vector<ClockingRT::Drive> due;
+            std::erase_if(c.drives, [&](const ClockingRT::Drive& d) {
+                if (d.tick != c.ticks) return false;
+                due.push_back(d);
+                return true;
+            });
+            for (auto& d : due) cbSchedule(c, d.out, d.v, d.hi, d.lo);
+        }
+        // #0 inputs are sampled in the observed region, and then the
+        // clocking block event is triggered (14.10, 14.13).
+        co_await ToObserved{};
+        for (auto& in : c.ins)
+            if (in.kind == 1) S.set(in.cv, eval(in.src, rd));
+        Val n = S.get(c.evSig);
+        S.set(c.evSig, mk((n.x ? 0 : n.v) + 1, 32));
+        S.set(c.evSig + 1, mk(S.now + 1, 64));
+    }
+}
+inline void startClockings() {
+    for (size_t k = 0; k < clockings().size(); k++) {
+        auto& c = clockings()[k];
+        S.set(c.evSig, mk(0, 32));
+        S.set(c.evSig + 1, mk(0, 64));
+        for (size_t j = 0; j < c.ins.size(); j++) {
+            auto& in = c.ins[j];
+            if (in.kind != 2) continue;
+            in.hist.push_back({0, eval(in.src, rd)});   // cbHist updates it once the initializers have run
+            if (in.refs.empty()) continue;
+            auto ev = make_shared<vector<pair<int, Edge>>>();
+            for (int s : in.refs) ev->push_back({s, ANY});
+            S.spawn(cbHist((int)k, (int)j, ev));
+        }
+        for (auto& o : c.outs)
+            for (auto& p : o.pieces)
+                if (p.net >= 0) {
+                    S.set(p.sig, allz(p.w));
+                    S.spawn(cbNetDriver(p.sig, p.net, S.newDriver(p.net), p.netLo));
+                }
+        S.spawn(cbProc((int)k));
     }
 }

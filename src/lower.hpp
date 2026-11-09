@@ -53,6 +53,7 @@
 #include "prog.hpp"
 #include "sva.hpp"
 #include "sva_engine.hpp"
+#include "clocking.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Expression.h"
@@ -528,6 +529,7 @@ struct Lowerer {
     }
 
 #include "lower_assert.inc"
+#include "lower_clocking.inc"
 
     // Owns the Prog of each fork branch, so Fork's pointers outlive lower().
     std::vector<std::unique_ptr<Prog>>* store = nullptr;
@@ -2262,6 +2264,16 @@ struct Lowerer {
         using namespace slang::ast;
         if (t.kind == TimingControlKind::SignalEvent) {
             const auto& s = t.as<SignalEventControl>();
+            if (isGlobalClock(s.expr)) {   // @($global_clock): the global clocking's event (14.14)
+                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $global_clock");
+                collectEvents(globalClocking()->getEvent(), ev);
+                return;
+            }
+            if (const auto* cb = clockingRef(s.expr)) {   // @(cb): the clocking block event (14.10)
+                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a clocking block event");
+                ev.push_back({clockings()[clockingIdx(*cb)].evSig, ANY});
+                return;
+            }
             if (!ValueExpressionBase::isKind(s.expr.kind)) unsupported("event on non-signal");
             int sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
             Edge e = s.edge == EdgeKind::PosEdge ? POS : s.edge == EdgeKind::NegEdge ? NEG : ANY;
@@ -2283,6 +2295,9 @@ struct Lowerer {
                 prog.emit(i);
                 break;
             }
+            case TimingControlKind::CycleDelay:   // ##n (14.11)
+                cycleDelay(t.as<CycleDelayControl>());
+                break;
             case TimingControlKind::ImplicitEvent: {   // @*  -> patched once the whole block is lowered
                 Instr i; i.k = IK::WaitEdge;
                 implicitWaits.push_back(prog.emit(i));
@@ -3290,6 +3305,7 @@ struct Lowerer {
         using namespace slang::ast;
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
+            if (syncDrive(a)) return;   // cb.v <= e (14.16)
             if (int d = dynSig(a.left()); d >= 0) {   // q = '{1, 2}; d = new[8]; aa = other;
                 if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this container assignment");
                 assignContainer(d, a.right());
@@ -4134,6 +4150,18 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     void handle(const slang::ast::VariableSymbol& v) { reg(v, false); }
     void handle(const slang::ast::FormalArgumentSymbol& v) { reg(v, false); }
+    // A clocking block (14): its event is a pair of signals like a named
+    // event's, and its clockvars are named cb.x.
+    void handle(const slang::ast::ClockingBlockSymbol& cb) {
+        std::string name = prefix + std::string(cb.name.empty() ? "$cb" : cb.name);
+        int id = mkSig(name, 32, false);
+        if (mkSig(name + "$trig", 64, false) != id + 1) Lowerer::unsupported("event signals that are not consecutive");
+        sigmap[&cb] = id;
+        std::string saved = prefix;
+        prefix = name + ".";
+        visitDefault(cb);
+        prefix = std::move(saved);
+    }
     // A modport port (25.5) is another name for a signal of its interface.
     // They are aliased after every signal is registered.
     std::vector<const slang::ast::ModportPortSymbol*> modportPorts;
@@ -4586,6 +4614,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::GenerateBlockSymbol& g) {
         if (!g.isUninstantiated) visitDefault(g);
     }
+    void handle(const slang::ast::ClockingBlockSymbol& cb) {   // 14: runs on its clocking event
+        Lowerer lw(sigmap);
+        prep(lw);
+        lw.setScope(cb.getParentScope());
+        lw.clockingIdx(cb);
+    }
     // The clock a procedure infers for its sampled value functions and
     // assertions (16.14.6): an event control at its start.
     static const slang::ast::TimingControl* leadingEvent(const slang::ast::Statement& st) {
@@ -4637,7 +4671,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         lw.setScope(p.getParentScope());
         if (p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final)
             if (const auto* t = leadingEvent(p.getBody())) {
-                try { lw.collectEvents(*t, lw.sampleEv); } catch (const std::runtime_error&) { lw.sampleEv.clear(); }
+                try { E iff; lw.clockOf(*t, lw.sampleEv, iff); } catch (const std::runtime_error&) { lw.sampleEv.clear(); }
             }
         lw.stmt(p.getBody());
         lw.finishImplicit();
@@ -4779,6 +4813,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     sva::store().clear();
     shadowPairs().clear();
     sampleClocks().clear();
+    clockings().clear();
+    Lowerer::clockingIdxMap().clear();
     sigInfo().clear();
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
