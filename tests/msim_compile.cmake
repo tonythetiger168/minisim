@@ -15,6 +15,7 @@ set(CASES
   "examples/comb.sv"
   "examples/cycle.sv"
   "examples/memories.sv"
+  "examples/assertions.sv"
   "examples/islands.sv"
   "bench/chain.sv +define+END_TIME=2000"
   "examples/cli/init.sv"

@@ -320,7 +320,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                     : !lowered.netDelays.empty() ? "a net delay"
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
                     : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
-                    : !asserts().empty() ? "an assertion"
+                    : std::any_of(asserts().begin(), asserts().end(), [](const AssertInfo& a) {
+                          return a.hidden || (a.type & (AT_CONCURRENT | AT_FINAL | AT_EXPECT));
+                      }) ? "a concurrent, final or expect assertion"
                     : !clockings().empty() ? "a clocking block"
                     : !cgDefs().empty() ? "a covergroup"
                     : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
