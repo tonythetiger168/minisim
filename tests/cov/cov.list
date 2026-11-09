@@ -1,0 +1,3 @@
+# mregress -cov self-test: together the two runs reach every line and branch.
+sel1: cov.sv +define+SEL=1 @pass=two
+sel3: cov.sv +define+SEL=3 @pass=other
