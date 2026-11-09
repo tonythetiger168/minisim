@@ -22,7 +22,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |
 | 6.6.3–6.6.8 | wand/triand, wor/trior, tri0, tri1, trireg, supply0/supply1 | ✅ | wired AND/OR resolution, pull to 0/1 when undriven, trireg holds its last value (starts at x). Not yet: arrays of these nets, `interconnect`. `6.6.3-wired-nets`, `6.6.4-trireg` |
 | 6.11 | Integer types | ✅ | int, byte, shortint, longint, integer, bit. `6.11-integer-types` |
-| 6.8 | Default values | ✅ | 2-state variables (int, bit, real, string) start at 0 / 0.0 / ""; 4-state at x. `6.8-default-values` |
+| 6.8 | Default values | ✅ | 2-state variables (int, bit, real, string) and unpacked arrays of them start at 0 / 0.0 / ""; 4-state at x. `6.8-default-values` |
 | 6.12 | real, realtime | ✅ | arithmetic, compare, `**`, conversion both ways (rounded, 6.12.1), real arrays and function results, `$itor` `$rtoi` `$realtobits` `$bitstoreal`, 20.8 math functions. `shortreal` (rounded to single precision, `$shortrealtobits` `$bitstoshortreal`). Not yet: reals in the VCD. `6.12-real`, `6.12.1-real-conversions`, `6.12-shortreal` |
 | 6.16 | string type | ✅ | concatenation, replication, compare, all 6.16 methods, string arrays and function arguments, conversion to and from integral types, `case` on strings. `6.16-string`, `6.16-string-methods` |
 | 6.18 | typedef | ✅ | for the types listed here |
@@ -86,7 +86,14 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 13 | Tasks and functions | 🟡 | module scope. Automatic tasks, and automatic functions that recurse or fork, run each call in its own frame (13.3.2, 13.4.2): recursion, overlapping calls from several processes. An automatic local starts at its default on every call (6.21). Not yet: `ref`, DPI, arrays or containers as arguments of an automatic task. `13.4-function-automatic`, `6.21-recursion`, `13.3.2-automatic-tasks`, `13.4.2-recursive-task` |
 | 15.5 | Named events | ✅ | `->`, `->>` (also with a delay), `@e`, `.triggered`, hierarchical `@u.e`. Not yet: event aliasing (`e1 = e2`), `wait_order`. `15.5-events`, `15.5.3-triggered` |
 | 16 | Assertions | ❌ | immediate and concurrent |
-| 18 | Randomization (constraints) | ❌ | classes, `randomize()`, `std::randomize`, randcase, randsequence |
+| 18.4 | rand / randc | ✅ | integral and enum properties (up to 64 bits), fixed-size arrays of them, rand class handles (randomized with the parent, 18.5.8); randc cycles through its range (up to 16 bits; wider randc acts as rand). Not yet: rand dynamic arrays and queues. `18.4-random-variables` |
+| 18.5 | Constraint blocks | ✅ | relational and arithmetic constraints, `inside`, `dist` (`:=`, `:/`), `unique`, `->`, if-else, `foreach` over fixed-size arrays, array reduction with `with`, `solve before`, soft constraints with priorities and `disable soft`, extern and static blocks, inheritance by name. Not yet: function calls in constraints, `dist` default weight, foreach over dynamic arrays. `18.5-constraint-blocks`, `18.5.2-constraint-inheritance`, `18.5.3-distribution`, `18.5.4-uniqueness`, `18.5.5-implication`, `18.5.7-iterative-constraints`, `18.5.8-global-constraints`, `18.5.9-variable-ordering`, `18.5.10-static-constraints`, `18.5.13-soft-constraints` |
+| 18.5 | Solver | 🟡 | variables are picked one at a time (solve-before, randc, then declaration order) by splitting their range and pruning with interval arithmetic, with bounds propagation and retries. Every solution meets every constraint, but the values are not uniform over the joint solution space (e.g. `s -> d == 0` without `solve s before d` gives s = 1 about half the time). |
+| 18.6–18.11 | randomize(), pre/post_randomize, with {...}, rand_mode, constraint_mode, randomize(args), randomize(null) | ✅ | `with` names resolve in the object first, then the caller; `local::`. `18.6-randomize-methods`, `18.7-inline-constraints`, `18.8-rand-mode`, `18.9-constraint-mode`, `18.11-inline-random-variable-control` |
+| 18.12 | std::randomize | ✅ | `18.12-std-randomize` |
+| 18.14, 18.15 | Random stability, srandom, get/set_randstate | 🟡 | each object has its own generator, seeded from the $urandom stream when made; processes share one stream (no per-thread generators yet). `18.14-random-stability` |
+| 18.16 | randcase | ✅ | `18.16-randcase` |
+| 18.17 | randsequence | 🟡 | weights, if-else, case, repeat, recursion, break and return. Not yet: `rand join`, production arguments and values. `18.17-randsequence`, `18.17.1-randsequence-features` |
 | 18.13 | $urandom, $urandom_range | ✅ | one deterministic stream per run, seeded by `-seed <n>` or `+ntb_random_seed=<n>` (the generator is implementation-defined). `18.13-random-functions` |
 | 20.3 | $time, $stime, $realtime | 🟡 | in the calling module's time unit, rounded. `$realtime` is a real. `20.3-time` |
 | 20.2 | $finish, $stop | ✅ | `$stop` ends the run like `$finish` |

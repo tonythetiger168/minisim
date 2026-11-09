@@ -46,6 +46,8 @@ enum class IK {
     DisableFork,// end every descendant process of this one (9.6.3)
     Dyn,        // a dynamic array / queue / associative array command: dcmd on handle `sig`
     New,        // a new object of class hi (8.7), or a copy of object e (8.12); its handle to `sig`
+    Randomize,  // sig = randomize the object e (null e: std::randomize), with rc (18.6, 18.12)
+    RandMode,   // obj e: every rand variable (hi = 0) or constraint block (hi = 1) on or off by de (18.8, 18.9)
     Ret         // pop that address; an empty stack ends the process
 };
 
@@ -131,8 +133,53 @@ struct Instr {
     E self;
     bool noSelf = false;
     int vslot = -1;
+    std::shared_ptr<const struct RandCall> rc;   // Randomize
 };
 
+// ---------- constrained randomization (18) ----------
+// One range of a dist (18.5.3): [lo, hi] (hi null: the single value lo),
+// with its weight, := per value or :/ shared by the range.
+struct RandDist { E lo, hi, weight; bool perRange = false; };
+// One constraint, a truth value; or, when isDist, `e dist {...}`.
+struct RandItem {
+    E e;
+    bool soft = false;           // 18.5.13
+    bool disableSoft = false;    // disable soft e (18.5.13.2): drops the earlier soft constraints on e
+    bool isDist = false;
+    E guard;                     // dist under an implication: holds when guard is false
+    std::vector<RandDist> dist;
+};
+// A constraint block (18.5): its constraint_mode slot in the object.
+struct RandBlock {
+    std::string name;
+    int mode = -1;
+    bool staticMode = false;   // a static block (18.5.10): mode is a signal holding "off" as 0 (x or 1: on)
+    std::vector<RandItem> items;
+    std::vector<std::pair<std::vector<E>, std::vector<E>>> before;   // solve a before b (18.5.9)
+};
+// A rand / randc property (18.4): `count` slots from `off`, each w bits;
+// `mode` is its rand_mode slot. obj: a rand class handle, whose object is
+// randomized with this one.
+struct RandVar {
+    std::string name;
+    int off = 0, count = 1, w = 1, mode = -1;
+    bool sgn = false, randc = false, obj = false;
+};
+struct RandSpec {
+    std::vector<RandVar> vars;
+    std::vector<std::shared_ptr<const RandBlock>> blocks;   // own and inherited; an override by name replaces the base block
+    const Prog* pre = nullptr; const FrameLayout* preLay = nullptr;     // pre_randomize (18.6.2)
+    const Prog* post = nullptr; const FrameLayout* postLay = nullptr;   // post_randomize
+};
+// A randomize() call: with {...} constraints, read in the caller's frame
+// (the object's members through objTmp), and randomize(a, b) arguments.
+struct RandCall {
+    std::vector<RandItem> items;
+    std::vector<std::pair<std::vector<E>, std::vector<E>>> before;
+    std::vector<E> args;        // the variables to randomize, as Refs
+    bool argsGiven = false;     // randomize(...) with arguments (18.11): only those
+    int objTmp = -1;
+};
 struct Prog;
 // A class at run time (8): its object shape (slot 0 holds the class id),
 // its virtual method table, and its base class.
@@ -146,6 +193,7 @@ struct ClassRt {
     // implementation (-1: none).
     std::vector<int> ifs;
     std::vector<int> imap;
+    std::shared_ptr<RandSpec> rand;   // 18
 };
 inline std::vector<ClassRt>& classRt() { static std::vector<ClassRt> v; return v; }
 inline bool classIsA(int cls, int want) {

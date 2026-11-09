@@ -1445,6 +1445,7 @@ struct WaitAny {
 };
 
 #include "exec.inc"
+#include "rand.inc"
 static bool isA(int obj, int cls) { return classIsA((int)S.sigs[obj].val.v, cls); }
 
 // ---- the design + testbench ----

@@ -1,6 +1,5 @@
 // IEEE 1800-2023 18.16: randcase picks a branch by weight; a zero weight is
 // never chosen (18.16).
-//! xfail: randcase is an error
 //! icarus-skip: Icarus 13 does not support randcase
 module top;
   int n[3] = '{0, 0, 0};
