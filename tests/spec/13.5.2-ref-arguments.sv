@@ -1,6 +1,5 @@
 // IEEE 1800-2023 13.5.2: ref and const ref arguments see the caller's
 // variable (13.5.2).
-//! xfail: ref arguments are errors
 //! icarus-skip: Icarus 13 does not support const ref
 module top;
   int v = 1;

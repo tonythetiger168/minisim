@@ -1,6 +1,5 @@
 // IEEE 1800-2023 6.14: A chandle starts as null and compares with null
 // (6.14).
-//! xfail: chandle is an error
 //! icarus-skip: Icarus 13 does not support chandle
 module top;
   chandle h;
