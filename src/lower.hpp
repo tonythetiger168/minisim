@@ -35,6 +35,7 @@
 //   for (auto& pr : r.procs) S.spawn(exec(&pr.prog));
 #pragma once
 #include <cmath>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -76,6 +77,14 @@ inline ArrMap& arrMap() { static ArrMap m; return m; }
 constexpr int64_t kMaxArrayElems = 1 << 20;
 // The design's source manager, for file names and line numbers in messages.
 inline const slang::SourceManager*& srcMgr() { static const slang::SourceManager* m = nullptr; return m; }
+// Net types that resolve differently from wire (6.6): signal -> kind.
+// alias a = b = c; (10.11): every net in an alias maps to one of them, which
+// is the only one that gets a signal.
+inline std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*>& aliasOf() {
+    static std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> m;
+    return m;
+}
+inline std::vector<std::pair<int, uint8_t>>& netKinds() { static std::vector<std::pair<int, uint8_t>> v; return v; }
 // Dynamic arrays, queues, and associative arrays: symbol -> handle signal.
 inline std::unordered_map<const slang::ast::Symbol*, int>& dynMap() {
     static std::unordered_map<const slang::ast::Symbol*, int> m;
@@ -145,6 +154,7 @@ struct LowerResult {
     std::vector<std::unique_ptr<Prog>> subs;
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
     std::vector<std::pair<int, std::vector<uint64_t>>> netDelays;   // wire #d w (28.16): signal, ticks
+    std::vector<std::pair<int, uint8_t>> netKinds;                   // wand, wor, tri0, ... (6.6): signal, NetResolve
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
     std::string timescale() const {
@@ -734,6 +744,106 @@ struct Lowerer {
         for (auto* x : s.idx)
             if (!(x->kind == ExpressionKind::IntegerLiteral || x->getConstant())) s.constant = false;
         return s;
+    }
+    // The element values of an unpacked-array value of type t, flattened in
+    // row-major order (7.4, 10.9.1): an assignment pattern ('{a, b},
+    // '{n{a}}, '{0: a, default: b}), or another fixed-size array.
+    void arrayElems(const slang::ast::Type& t0, const slang::ast::Expression& x0, std::vector<E>& out) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        if (t.kind != SymbolKind::FixedSizeUnpackedArrayType) {
+            if (t.isUnpackedArray()) unsupported("a container inside a fixed-size array");
+            if (!t.isIntegral() && !t.isFloating() && !t.isString()) unsupported("array of this element type");
+            int w = (int)t.getBitWidth();
+            const Expression& x = peel(x0);
+            E v = expr(x0);
+            if (t.isIntegral() && x.type->isIntegral()) v = resize(expr(x), w, x.type->isSigned(), t.isSigned());
+            out.push_back(v);
+            return;
+        }
+        const auto& ft = t.as<FixedSizeUnpackedArrayType>();
+        const Type& et = ft.elementType;
+        int64_t n = (int64_t)ft.range.width();
+        const Expression& x = peel(x0);
+        switch (x.kind) {
+            case ExpressionKind::SimpleAssignmentPattern:
+                for (auto* el : x.as<SimpleAssignmentPatternExpression>().elements()) arrayElems(et, *el, out);
+                return;
+            case ExpressionKind::ReplicatedAssignmentPattern: {
+                const auto& r = x.as<ReplicatedAssignmentPatternExpression>();
+                int64_t c = constInt(r.count());
+                for (int64_t k = 0; k < c; k++)
+                    for (auto* el : r.elements()) arrayElems(et, *el, out);
+                return;
+            }
+            case ExpressionKind::StructuredAssignmentPattern: {
+                const auto& sp = x.as<StructuredAssignmentPatternExpression>();
+                if (!sp.typeSetters.empty()) unsupported("type: key in an array pattern");
+                for (int64_t k = 0; k < n; k++) {
+                    int64_t idx = ft.range.left >= ft.range.right ? ft.range.left - k : ft.range.left + k;
+                    const Expression* v = nullptr;
+                    for (const auto& is : sp.indexSetters)
+                        if (constInt(*is.index) == idx) v = is.expr;
+                    if (v) { arrayElems(et, *v, out); continue; }
+                    if (!sp.defaultSetter) unsupported("array pattern without a value for every index");
+                    fillElems(et, *sp.defaultSetter, out);
+                }
+                return;
+            }
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue: {
+                auto it = arrMap().find(&x.as<ValueExpressionBase>().symbol);
+                if (it == arrMap().end()) unsupported("array value");
+                for (int k = 0; k < it->second->count; k++) out.push_back(ref(it->second->base + k, it->second->sgn));
+                return;
+            }
+            default: unsupported("fixed-size array value of this kind");
+        }
+    }
+    // default: v fills every element below type t (10.9.1), unless v is
+    // itself an array value of type t.
+    void fillElems(const slang::ast::Type& t0, const slang::ast::Expression& v, std::vector<E>& out) {
+        const auto& t = t0.getCanonicalType();
+        if (t.kind != slang::ast::SymbolKind::FixedSizeUnpackedArrayType || v.type->isUnpackedArray()) {
+            arrayElems(t, v, out);
+            return;
+        }
+        const auto& ft = t.as<slang::ast::FixedSizeUnpackedArrayType>();
+        for (int64_t k = 0; k < (int64_t)ft.range.width(); k++) fillElems(ft.elementType, v, out);
+    }
+    // a = <array value>; for a whole fixed-size array. The values are taken
+    // before any element is written, so a = '{a[1], a[0]} swaps.
+    bool assignWholeArray(const slang::ast::Expression& l0, const slang::ast::Expression& rhs, bool nba) {
+        using namespace slang::ast;
+        const Expression& l = peel(l0);
+        if (l.kind != ExpressionKind::NamedValue && l.kind != ExpressionKind::HierarchicalValue) return false;
+        return assignWholeArray(l.as<ValueExpressionBase>().symbol, *l.type, rhs, nba);
+    }
+    bool assignWholeArray(const slang::ast::Symbol& sym, const slang::ast::Type& lt, const slang::ast::Expression& rhs, bool nba) {
+        auto it = arrMap().find(&sym);
+        if (it == arrMap().end()) return false;
+        const ArrShape& A = *it->second;
+        std::vector<E> vals;
+        arrayElems(lt, rhs, vals);
+        if ((int)vals.size() != A.count) unsupported("array value with the wrong number of elements");
+        bool direct = nba || A.count == 1;
+        if (!direct) {
+            direct = true;
+            for (auto& v : vals) if (v->op != Op::Const) { direct = false; break; }
+        }
+        if (!direct) {
+            for (auto& v : vals) {
+                int tmp = fresh(A.elemW);
+                Instr h; h.k = IK::Assign; h.sig = tmp; h.e = v;
+                prog.emit(h);
+                v = ref(tmp, A.sgn);
+            }
+        }
+        for (int k = 0; k < A.count; k++) {
+            Instr i; i.k = nba ? IK::Nba : IK::Assign; i.sig = A.base + k; i.e = vals[k];
+            prog.emit(i);
+        }
+        return true;
     }
     int64_t constOffset(const ArrSel& s) {
         std::vector<int64_t> v;
@@ -1600,32 +1710,135 @@ struct Lowerer {
         }
         return r;
     }
+    // %p (21.2.1.6): the format text and arguments that print value v of
+    // type t as an assignment pattern. Integral values print in decimal (as
+    // unformatted), enums by name, strings in quotes, packed structs and
+    // arrays as '{...}. A fixed-size array is expanded here, element by
+    // element; a dynamic container is printed at run time by %Q.
+    static std::string escPct(const std::string& s) {
+        std::string r;
+        for (char c : s) { r += c; if (c == '%') r += '%'; }
+        return r;
+    }
+    void pfmtSingular(const slang::ast::Type& t0, E v, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        if (t.isString()) { fmt += "\"%s\""; out.push_back(v); return; }
+        if (t.isFloating()) { fmt += "%R"; out.push_back(v); return; }
+        if (t.kind == SymbolKind::EnumType) {
+            // The name of a valid value, else the value as its base type.
+            auto fb = node(Op::SFormat, {v});
+            fb->fmt = "%0d";
+            E name = fb;
+            std::vector<const EnumValueSymbol*> vals;
+            for (const auto& ev : t.as<EnumType>().values()) vals.push_back(&ev);
+            for (size_t k = vals.size(); k-- > 0;) {
+                const auto& cv = vals[k]->getValue();
+                if (!cv.isInteger()) continue;
+                E eq = bin(Op::CaseEq, v, svLit(cv.integer(), t.isSigned(), {}));
+                name = mux(eq, konst(mkstr(std::string(vals[k]->name))), name);
+            }
+            fmt += "%s";
+            out.push_back(name);
+            return;
+        }
+        if (t.kind == SymbolKind::PackedStructType || t.kind == SymbolKind::PackedUnionType) {
+            fmt += "'{";
+            bool first = true;
+            for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+                if (!first) fmt += ", ";
+                first = false;
+                fmt += escPct(std::string(f.name)) + ":";
+                int w = (int)f.getType().getBitWidth();
+                E part = slice(v, (int)f.bitOffset + w - 1, (int)f.bitOffset);
+                if (f.getType().isSigned()) part = resize(part, w, false, true);
+                pfmtSingular(f.getType(), part, fmt, out);
+                if (t.kind == SymbolKind::PackedUnionType) break;   // only the first member
+            }
+            fmt += "}";
+            return;
+        }
+        if (t.isIntegral()) { fmt += "%0d"; out.push_back(v); return; }
+        unsupported("%p of this type");
+    }
+    void pfmt(const slang::ast::Expression& a, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        const Expression& x = peel(a);
+        if (int d = dynSig(x); d >= 0) {
+            const Type* et = x.type->getCanonicalType().getArrayElementType();
+            const Type& ec = et->getCanonicalType();
+            if (!(ec.isIntegral() && ec.kind != SymbolKind::EnumType && !ec.isStruct()) && !ec.isString() && !ec.isFloating())
+                unsupported("%p of a container of this element type");
+            fmt += "%Q";
+            fmt += ec.isString() ? 's' : ec.isFloating() ? 'R' : 'd';
+            out.push_back(ref(d));
+            return;
+        }
+        if (x.type->isUnpackedArray()) {
+            const Symbol* sym = (x.kind == ExpressionKind::NamedValue || x.kind == ExpressionKind::HierarchicalValue)
+                                    ? &x.as<ValueExpressionBase>().symbol : nullptr;
+            auto it = sym ? arrMap().find(sym) : arrMap().end();
+            if (it == arrMap().end()) unsupported("%p of an unpacked array expression");
+            const ArrShape& A = *it->second;
+            const Type* et = x.type;
+            for (size_t k = 0; k < A.dims.size(); k++) et = et->getCanonicalType().getArrayElementType();
+            int flat = 0;
+            std::function<void(size_t)> walk = [&](size_t dim) {
+                auto [l, r] = A.dims[dim];
+                int64_t n = (l > r ? l - r : r - l) + 1;
+                fmt += "'{";
+                for (int64_t k = 0; k < n; k++) {
+                    if (k) fmt += ", ";
+                    if (dim + 1 < A.dims.size()) walk(dim + 1);
+                    else pfmtSingular(*et, ref(A.base + flat++, A.sgn), fmt, out);
+                }
+                fmt += "}";
+            };
+            walk(0);
+            return;
+        }
+        if (x.type->isUnpackedStruct() || x.type->isUnpackedUnion()) unsupported("%p of an unpacked struct");
+        pfmtSingular(*x.type, expr(x), fmt, out);
+    }
     template <typename Args>
     void formatInto(const Args& argv, char dflt, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
-        int pending = 0;
-        auto countSpecs = [](const std::string& f) {
-            int c = 0;
+        // The specifiers still waiting for an argument: where each one sits
+        // in fmt, its length, and its letter. A %p is replaced by its
+        // expansion once its argument is known.
+        struct Spec { size_t pos, len; char c; };
+        std::deque<Spec> pending;
+        auto addSpecs = [&](const std::string& f, size_t at) {
             for (size_t p = 0; p < f.size(); p++) {
                 if (f[p] != '%') continue;
                 if (p + 1 < f.size() && f[p + 1] == '%') { p++; continue; }
                 size_t q = p + 1;
                 while (q < f.size() && (isdigit((unsigned char)f[q]) || f[q] == '.' || f[q] == '-')) q++;
-                if (q < f.size() && f[q] != 'm' && f[q] != 'M') c++;
+                if (q < f.size() && f[q] != 'm' && f[q] != 'M')
+                    pending.push_back({at + p, q - p + 1, (char)tolower((unsigned char)f[q])});
             }
-            return c;
         };
         for (const Expression* a : argv) {
             if (a->kind == ExpressionKind::EmptyArgument) { fmt += ' '; continue; }
             const Expression& pe = peel(*a);
-            if (pe.kind == ExpressionKind::StringLiteral && pending == 0) {
+            if (pe.kind == ExpressionKind::StringLiteral && pending.empty()) {
                 std::string f = substM(std::string(pe.as<StringLiteral>().getValue()), hierName);
+                size_t at = fmt.size();
                 fmt += f;
-                pending = countSpecs(f);
+                addSpecs(f, at);
                 continue;
             }
-            if (pending > 0) pending--;
-            else { fmt += '%'; fmt += a->type->isFloating() ? 'R' : a->type->isString() ? 's' : dflt; }
+            if (!pending.empty()) {
+                Spec sp = pending.front();
+                pending.pop_front();
+                if (sp.c == 'p') {
+                    std::string x;
+                    pfmt(*a, x, out);
+                    fmt.replace(sp.pos, sp.len, x);
+                    for (auto& o : pending) o.pos += x.size() - sp.len;
+                    continue;
+                }
+            } else { fmt += '%'; fmt += a->type->isFloating() ? 'R' : a->type->isString() ? 's' : dflt; }
             out.push_back(expr(*a));
         }
     }
@@ -1767,6 +1980,9 @@ struct Lowerer {
                 assignContainer(d, a.right());
                 return;
             }
+            if (a.left().type->isUnpackedArray() && !a.timingControl && !a.isCompound() &&
+                assignWholeArray(a.left(), a.right(), a.isNonBlocking()))
+                return;
             Instr i;
             i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
             lhs(a.left(), i);
@@ -2231,7 +2447,9 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     std::string prefix;
     SigCollector(MkSig f, std::unordered_map<const slang::ast::Symbol*, int>& m)
         : mkSig(std::move(f)), sigmap(m) {}
+    std::vector<const slang::ast::Symbol*> aliased;   // nets that share another net's signal
     template <typename T> void reg(const T& s, bool net) {
+        if (auto a = aliasOf().find(&s); a != aliasOf().end() && a->second != &s) { aliased.push_back(&s); return; }
         if (Lowerer::isDynType(s.getType())) { regDyn(s); return; }
         if (s.getType().isUnpackedArray()) { regArray(s, net); return; }
         if (s.getType().isEvent()) {
@@ -2345,6 +2563,13 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         visitDefault(p);
         prefix = std::move(saved);
     }
+    void finishAliases() {
+        for (const auto* s : aliased) {
+            auto it = sigmap.find(aliasOf().at(s));
+            if (it == sigmap.end()) Lowerer::unsupported("alias of a net that has no signal");
+            sigmap[s] = it->second;
+        }
+    }
     void aliasModports() {
         for (const auto* m : modportPorts) {
             if (m->explicitConnection) Lowerer::unsupported("modport expression (25.5.4)");
@@ -2355,7 +2580,26 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             if (auto it = dynMap().find(in); it != dynMap().end()) dynMap()[m] = it->second;
         }
     }
-    void handle(const slang::ast::NetSymbol& n) { reg(n, true); }
+    void handle(const slang::ast::NetSymbol& n) {
+        reg(n, true);
+        if (auto a = aliasOf().find(&n); a != aliasOf().end() && a->second != &n) return;
+        using NK = slang::ast::NetType::NetKind;
+        uint8_t k = NR_WIRE;
+        switch (n.netType.netKind) {
+            case NK::WAnd: case NK::TriAnd: k = NR_WAND; break;
+            case NK::WOr: case NK::TriOr: k = NR_WOR; break;
+            case NK::Tri0: k = NR_TRI0; break;
+            case NK::Tri1: k = NR_TRI1; break;
+            case NK::TriReg: k = NR_TRIREG; break;
+            case NK::Supply0: k = NR_SUPPLY0; break;
+            case NK::Supply1: k = NR_SUPPLY1; break;
+            case NK::Interconnect: Lowerer::unsupported("interconnect net (6.6.8)");
+            default: break;
+        }
+        if (k == NR_WIRE) return;
+        if (n.getType().isUnpackedArray()) Lowerer::unsupported("an array of wand/wor/tri0/tri1/trireg/supply nets");
+        netKinds().push_back({sigmap.at(&n), k});
+    }
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
         std::string saved = prefix;
@@ -2446,6 +2690,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (!e) return;
             if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
             init->assignContainer(it->second, *e);
+            return;
+        }
+        if (e && arrMap().count(&v)) {   // int a[3] = '{1, 2, 3};
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            init->assignWholeArray(v, v.getType(), *e, false);
             return;
         }
         const auto& t = v.getType();
@@ -2750,13 +2999,43 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     std::unordered_map<const slang::ast::Symbol*, int> sigmap;
     LowerResult out;
     arrMap().clear();
+    netKinds().clear();
     srcMgr() = comp.getSourceManager();
     dynMap().clear();
     dynStore().clear();
     blockIds() = BlockIds{};
+    {   // alias statements (10.11), before any signal is made
+        aliasOf().clear();
+        struct AliasFinder : slang::ast::ASTVisitor<AliasFinder> {
+            std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> up;
+            const slang::ast::Symbol* root(const slang::ast::Symbol* s) {
+                while (up.count(s) && up[s] != s) s = up[s];
+                return s;
+            }
+            void handle(const slang::ast::InstanceSymbol& inst) { if (enterInstance(inst)) visitDefault(inst); }
+            void handle(const slang::ast::NetAliasSymbol& a) {
+                using namespace slang::ast;
+                const Symbol* first = nullptr;
+                for (const Expression* e : a.getNetReferences()) {
+                    const Expression& x = Lowerer::peel(*e);
+                    if (x.kind != ExpressionKind::NamedValue && x.kind != ExpressionKind::HierarchicalValue)
+                        Lowerer::unsupported("alias of part of a net");
+                    const Symbol* s = &x.as<ValueExpressionBase>().symbol;
+                    if (!up.count(s)) up[s] = s;
+                    if (!first) { first = s; continue; }
+                    const Symbol* ra = root(first), *rb = root(s);
+                    if (ra != rb) up[rb] = ra;
+                }
+            }
+        } af;
+        comp.getRoot().visit(af);
+        for (auto& [s, p] : af.up) aliasOf()[s] = af.root(s);
+    }
     SigCollector sc(mkSig, sigmap);
     comp.getRoot().visit(sc);
+    sc.finishAliases();
     sc.aliasModports();
+    out.netKinds = netKinds();
 
     struct Finder : slang::ast::ASTVisitor<Finder> {
         std::vector<const slang::ast::SubroutineSymbol*> found;

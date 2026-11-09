@@ -37,7 +37,7 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
-struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; };  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
+struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; };  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
 struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
@@ -484,7 +484,8 @@ struct Sim {
         g.drv[d].s1 = (uint8_t)s1;
         // One driver that drives both 0 and 1 resolves to its own value
         // (X stays X, Z stays Z). Skip the per-bit strength walk.
-        Val r = (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) ? g.drv[0].v
+        Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
+              : (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) ? g.drv[0].v
                                                                        : resolveDrives(g.drv.data(), g.drv.size(), g.w);
         if (!netDelay.empty()) {   // wire #d w (28.16): the resolved value arrives d later
             auto nd = netDelay.find(s);
@@ -784,6 +785,30 @@ struct Sim {
                 if (ai >= args.size()) continue;
                 Val v = eval(args[ai++], rd);
                 cout << fmtReal('R', v_real(v), 0, -1, false);
+                continue;
+            }
+            if (c == 'Q' && i + 1 < fmt.size()) {   // internal: %p of a container (21.2.1.6)
+                char style = fmt[++i];
+                if (ai >= args.size()) continue;
+                const E& h = args[ai++];
+                auto one = [&](Val v, char st) {
+                    if (st == 's') { v.str = true; return "\"" + v_str(v) + "\""; }
+                    if (st == 'R') return fmtReal('R', v_real(v), 0, -1, false);
+                    return fmtVal('d', v, 0, true);
+                };
+                const DynObj& o = dynStore()[h->sig];
+                cout << "'{";
+                if (o.kind == 2) {
+                    bool first = true;
+                    for (const auto& [k, v] : o.map) {
+                        if (!first) cout << ", ";
+                        first = false;
+                        cout << one(o.keyVal(k), o.strKey ? 's' : 'd') << ':' << one(v, style);
+                    }
+                } else {
+                    for (size_t k = 0; k < o.vec.size(); k++) cout << (k ? ", " : "") << one(o.vec[k], style);
+                }
+                cout << '}';
                 continue;
             }
             char lc = (char)tolower((unsigned char)c);

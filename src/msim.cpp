@@ -147,6 +147,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
+                    : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
                     : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -292,6 +293,11 @@ int main(int argc, char** argv) {
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
     for (auto& [s, d] : lowered.netDelays) S.netDelay[s] = d;
+    for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
+        auto& g = S.sigs[s];
+        g.kind = k;
+        g.val = resolveNet(k, g.drv.data(), g.drv.size(), g.w, allx(g.w));
+    }
     // A delayed driver is x until its first update arrives (10.3.3, 28.16),
     // and so is a net with a net delay that has drivers.
     {

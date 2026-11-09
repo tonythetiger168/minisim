@@ -1161,6 +1161,34 @@ inline SBit sbit_resolv(SBit a, SBit b) {
     return r;
 }
 
+// Net types that resolve differently from wire and tri (6.6.3-6.6.6).
+enum NetResolve : uint8_t { NR_WIRE, NR_WAND, NR_WOR, NR_TRI0, NR_TRI1, NR_TRIREG, NR_SUPPLY0, NR_SUPPLY1 };
+// The value of a net of kind k from its drivers; `prev` is its current value,
+// which a trireg keeps on bits no driver drives (charge storage, 6.6.4).
+inline Val resolveDrives(const Drv* d, size_t n, int w);
+inline Val resolveNet(uint8_t k, const Drv* d, size_t n, int w, const Val& prev) {
+    Val r = make(0, 0, w);
+    for (int b = 0; b < w; b++) {
+        int t = 3;
+        if (k == NR_SUPPLY0) t = 0;
+        else if (k == NR_SUPPLY1) t = 1;
+        else if (k == NR_WAND || k == NR_WOR) {   // wired AND / OR (6.6.3): z drivers do not take part
+            bool any0 = false, any1 = false, anyx = false;
+            for (size_t i = 0; i < n; i++) {
+                int v = bitAt(d[i].v, b);
+                if (v == 0) any0 = true; else if (v == 1) any1 = true; else if (v == 2) anyx = true;
+            }
+            if (k == NR_WAND) t = any0 ? 0 : anyx ? 2 : any1 ? 1 : 3;
+            else t = any1 ? 1 : anyx ? 2 : any0 ? 0 : 3;
+        } else {
+            t = 3;
+            if (n) t = bitAt(resolveDrives(d, n, w), b);
+            if (t == 3) t = k == NR_TRI0 ? 0 : k == NR_TRI1 ? 1 : k == NR_TRIREG ? bitAt(prev, b) : 3;
+        }
+        setBit(r, b, t);
+    }
+    return r;
+}
 inline Val resolveDrives(const Drv* d, size_t n, int w) {
     if (w > 64) {
         Val r = make(0, 0, w);

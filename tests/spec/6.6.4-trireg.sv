@@ -1,6 +1,5 @@
 // IEEE 1800-2023 6.6.4: A trireg net starts at x and holds its last driven
 // value when its drivers go to z (6.6.4, 28.15).
-//! xfail: trireg starts at z and does not hold charge
 //! icarus-skip: Icarus 13 does not support trireg
 module top;
   logic en = 0, d = 1;

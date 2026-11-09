@@ -1,6 +1,5 @@
 // IEEE 1800-2023 6.6.3: wand/triand resolve with AND, wor/trior with OR
 // (6.6.3); tri0/tri1 pull an undriven net (6.6.5); supply0/supply1 (6.6.6).
-//! xfail: wand/wor resolve like wire
 module top;
   logic a = 1, b = 0;
   wand wa; triand ta; wor wo; trior to;

@@ -1,6 +1,5 @@
 // IEEE 1800-2023 5.11: Array literals: positional, replicated and default:
 // (5.11, 10.9.1).
-//! xfail: assignment patterns to a fixed-size unpacked array
 //! icarus-skip: Icarus 13 does not parse nested array patterns
 module top;
   int a[3];

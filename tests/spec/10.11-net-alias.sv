@@ -1,5 +1,4 @@
 // IEEE 1800-2023 10.11: alias makes two nets the same net (10.11).
-//! xfail: alias is ignored
 //! icarus-skip: Icarus 13 does not support alias
 module top;
   wire [3:0] a, b;
