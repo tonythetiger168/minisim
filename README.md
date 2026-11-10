@@ -27,6 +27,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches, with its C code (regular expressions, command line, HDL backdoor) via `msim -uvm`; see [`docs/UVM.md`](docs/UVM.md)
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
+- **Emulation and FPGA prototyping**: `memu` puts a gate-level netlist on a board of FPGAs (clock conversion, memory mapping, partitioning, pin multiplexing, probes, transactors to `msim -mvp` models and to testbench classes) and writes a testbench that checks the emulation against the netlist; see [docs/EMULATION.md](docs/EMULATION.md)
 - **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
@@ -507,6 +508,20 @@ Properties are checked in parallel on every core (`-threads N`), with the
 same result for any thread count. See `docs/FORMAL.md` for the model (clock,
 reset, two-state values, what is cut) and the supported property operators.
 
+### Equivalence checking: `mequiv`
+
+`mequiv` proves that a netlist is the same circuit as the RTL it came from
+(or as another netlist, or one RTL revision as the next), the way Formality
+and Conformal do: flops are matched by name and cut, and every output and
+next-state function is proved equal. A failing point comes with the input
+values that show the difference.
+
+```sh
+mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
+```
+
+See [docs/EQUIV.md](docs/EQUIV.md).
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per
@@ -550,6 +565,29 @@ mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v 
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
+### Emulation and FPGA prototyping: `memu`
+
+`memu` is the step between synthesis and FPGA place and route that makes a
+design fit a board of several FPGAs and run there at all: every flop moves
+onto one free-running clock, memories become FPGA RAM, the cells are split
+over the FPGAs, and signals share wires where the board has too few.
+
+```sh
+memu soc.gv -lib cells.lib -mem mems.txt -fpgas 4 -lut 200000 -pins 240 -probe 'u_core.pc*' -o out
+msim cells.v mems.v soc.gv out/soc_fpga*.v out/soc_emu_lib.v out/soc_emu.v out/soc_emu_tb.sv -top soc_emu_tb
+```
+```
+memu: PASS, 2000 events (2000 with a clock edge), 80856 output bits compared, netlist and emulation agree
+```
+
+The second command needs no hardware: it runs the netlist `memu` was given
+next to the emulation it wrote, on the same random inputs, and compares every
+output at every clock event. Transactors (`memu -xtor-sv`) connect the
+emulated design to the C models of a virtual prototype or to a testbench
+class, with the design's clock stopped while the host answers. It uses every
+logical CPU by default (`-threads N`), with the same result on any number.
+[docs/EMULATION.md](docs/EMULATION.md) has the timing model, the file formats
+and the transactors.
 ### Parasitic extraction: `mrcx`
 
 `mrcx` reads a routed DEF and its LEF and writes every net's resistance and
