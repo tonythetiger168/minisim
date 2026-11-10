@@ -156,10 +156,29 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(mlint PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
+  # Formal property checking on the same lowering: mformal design.sv
+  # The SAT solver is CaDiCaL (MIT), pinned to a release.
+  FetchContent_Declare(cadical
+    GIT_REPOSITORY https://github.com/arminbiere/cadical.git
+    GIT_TAG rel-2.1.3
+    GIT_SHALLOW TRUE)
+  FetchContent_Populate(cadical)
+  file(GLOB CADICAL_SRC ${cadical_SOURCE_DIR}/src/*.cpp)
+  list(FILTER CADICAL_SRC EXCLUDE REGEX "/(cadical|mobical)\\.cpp$")
+  add_library(cadical STATIC ${CADICAL_SRC})
+  target_include_directories(cadical PUBLIC ${cadical_SOURCE_DIR}/src)
+  target_compile_definitions(cadical PRIVATE NBUILD NDEBUG NCLOSEFROM)
+  target_compile_options(cadical PRIVATE -O3 -w)
+  find_package(Threads REQUIRED)
+  add_executable(mformal src/mformal.cpp)
+  target_include_directories(mformal PRIVATE src)
+  target_link_libraries(mformal PRIVATE slang::slang cadical Threads::Threads)
+
   # Design-for-test checks and a scan chain plan: mdft design.sv
   add_executable(mdft src/mdft.cpp)
   target_include_directories(mdft PRIVATE src)
-  target_link_libraries(mdft PRIVATE slang::slang)
+  find_package(Threads REQUIRED)
+  target_link_libraries(mdft PRIVATE slang::slang Threads::Threads)
   if(OPENSSL_FOUND)
     target_link_libraries(mdft PRIVATE OpenSSL::Crypto)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
@@ -170,6 +189,10 @@ if(MINISIM_WITH_SLANG)
   target_include_directories(mdebug PRIVATE src)
   find_package(Threads REQUIRED)
   target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
+  if(MINISIM_WITH_FST)
+    target_link_libraries(mdebug PRIVATE fst)
+    target_compile_definitions(mdebug PRIVATE MINISIM_FST)
+  endif()
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -203,6 +226,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_compile.cmake)
+  # X-propagation (msim -xprop): tests/xprop in every execution mode.
+  add_test(NAME msim_xprop
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xprop
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_xprop.cmake)
   # Multi-core: 256 independent lanes run as parallel partitions. Every
   # thread count must print what the single-threaded event-driven run prints.
   add_test(NAME msim_threads
@@ -223,6 +251,13 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_smoke
                      -P ${CMAKE_SOURCE_DIR}/tests/mregress.cmake)
+  endif()
+  # mplan: a verification plan scored against a regression (tests/plan).
+  if(Python3_FOUND)
+    add_test(NAME mplan
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mplan_test
+                     -P ${CMAKE_SOURCE_DIR}/tests/mplan.cmake)
   endif()
   if(Python3_FOUND)
     add_test(NAME msim_cov
@@ -327,13 +362,35 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
+  # Formal property checking: verdicts, thread-count independence, and each
+  # counterexample replayed in msim.
+  add_test(NAME mformal
+           COMMAND ${CMAKE_COMMAND} -DMFORMAL=$<TARGET_FILE:mformal> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mformal_test
+                   -P ${CMAKE_SOURCE_DIR}/tests/mformal.cmake)
+  # mformal against msim on random designs (tests/formal/fuzz.py).
+  if(Python3_FOUND)
+    add_test(NAME mformal_fuzz
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/formal/fuzz.py ${CMAKE_CURRENT_BINARY_DIR}
+                     0 40 ${CMAKE_CURRENT_BINARY_DIR}/mformal_fuzz)
+  endif()
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
+                   -DFST=${MINISIM_WITH_FST}
                    -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
+  # Scan insertion and memory BIST: the results are simulated with msim.
+  add_test(NAME mdft_insert_scan
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/dft_scan
+                   -P ${CMAKE_SOURCE_DIR}/tests/dft_scan.cmake)
+  add_test(NAME mdft_mbist
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DIVERILOG=${IVERILOG} -DVVP=${VVP} -DOUT=${CMAKE_BINARY_DIR}/dft_mbist
+                   -P ${CMAKE_SOURCE_DIR}/tests/dft_mbist.cmake)
 
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
@@ -356,7 +413,7 @@ endif()
 include(cmake/tools/mhls.cmake)
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/msimprotect (with OpenSSL)
+#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)
@@ -364,7 +421,7 @@ include(cmake/tools/mhls.cmake)
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mdebug mformal slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -372,6 +429,7 @@ endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
 install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
+install(PROGRAMS tools/mplan.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
@@ -390,7 +448,7 @@ install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 # The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
