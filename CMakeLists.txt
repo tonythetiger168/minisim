@@ -72,6 +72,9 @@ add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
+# The mini45 cell library: generator check and install rules.
+include(cmake/tools/mini45.cmake)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -355,6 +358,12 @@ if(MINISIM_WITH_SLANG)
       set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
     endforeach()
   endif()
+
+  # mini45's Verilog models against the functions in its Liberty files.
+  add_test(NAME mini45_models
+           COMMAND msim ${CMAKE_SOURCE_DIR}/lib/mini45/mini45.v ${CMAKE_SOURCE_DIR}/lib/mini45/mini45_tb.sv
+                   -top mini45_tb)
+  set_tests_properties(mini45_models PROPERTIES PASS_REGULAR_EXPRESSION "mini45: 84 cells checked, 0 errors")
 
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>

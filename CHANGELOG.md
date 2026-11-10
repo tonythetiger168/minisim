@@ -81,6 +81,14 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `lib/mini45`: a generic 45 nm-class standard cell library for the tool
+  line, written from scratch (not a foundry library): 88 cells (inverters,
+  buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,
+  flops with reset, set, enable and scan, latches, clock gates, tristate, tie
+  and filler cells, several drive strengths) as Liberty at three corners
+  (`mini45_tt.lib`, `_ss`, `_ff`: NLDM 7x7 delay tables, constraints,
+  internal power, state-dependent leakage, wire loads), Verilog models
+  (`mini45.v`), and technology and cell LEF. See `docs/MINI45.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
