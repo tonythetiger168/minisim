@@ -334,6 +334,20 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
+### Datapath library: `dw/`
+
+`dw/` is a library of synthesizable, parameterized building blocks
+(`MW_add`, `MW_mult`, `MW_div`, `MW_shifter`, `MW_fifo_sync`,
+`MW_fifo_async`, `MW_crc`, `MW_ecc` and 39 more), each with selectable
+architectures where that matters (ripple, lookahead, Kogge-Stone, Brent-Kung
+and carry-select adders; array and Booth/Wallace multipliers):
+
+```sh
+msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
+```
+
+`docs/DATAPATH.md` lists every module and its ports.
+
 ### Lint and clock-domain checks: `mlint`
 
 `mlint` runs the same front end as `msim` and then checks the elaborated
