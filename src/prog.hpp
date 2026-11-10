@@ -117,7 +117,7 @@ struct CondDef {
     size_t base = 0;
 };
 inline std::vector<CondDef>& condDefs() { static std::vector<CondDef> d; return d; }
-// FSM coverage: a state register found by the lowerer (lower_fsm.inc), its
+// FSM coverage: a state register found by the lowerer (fsm_extract.hpp), its
 // states and the transitions its next-state logic can make. The kernel
 // records the values the register takes and each change (Sim::covFsm).
 struct FsmDef {

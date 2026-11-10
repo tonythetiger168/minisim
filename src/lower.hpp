@@ -57,6 +57,7 @@
 #include "tchk.hpp"
 #include "specify.hpp"
 #include "sdf.hpp"
+#include "fsm_extract.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
@@ -9465,7 +9466,6 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
 };
 
-#include "lower_fsm.inc"
 
 // @* lowered inside a subroutine is a WaitEdge with no events yet. Patch it
 // after every callee body is installed, so the wait sees those reads too.
@@ -10425,8 +10425,26 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             Lowerer::unsupported(("disable of block '" + std::string(b->name) +
                                   "' from outside it, unless it is a whole initial or fork branch").c_str());
     if (g_cov) {   // FSM coverage: the state registers and their transitions
-        FsmExtractor fx;
-        fx.run(comp.getRoot(), sigmap, comp.getSourceManager());
+        const slang::SourceManager* sm = comp.getSourceManager();
+        for (ExtractedFsm& x : extractFsms(comp.getRoot())) {
+            auto sit = sigmap.find(x.var);
+            if (sit == sigmap.end()) continue;
+            FsmDef d;
+            d.module = std::move(x.module);
+            d.inst = std::move(x.inst);
+            d.name = std::move(x.name);
+            if (sm && x.var->location.valid()) {
+                auto ol = sm->getFullyOriginalLoc(x.var->location);
+                d.file = covFileId(std::string(sm->getFullPath(ol.buffer()).string()));
+                d.line = (uint32_t)sm->getLineNumber(ol);
+            }
+            d.sig = sit->second;
+            d.w = x.w;
+            d.onehot = x.onehot;
+            d.states = std::move(x.states);
+            for (auto& t : x.trans) d.trans.push_back({t.from, t.to, t.reset});
+            fsmDefs().push_back(std::move(d));
+        }
     }
     out.sigOf = sigmap;
     return out;
