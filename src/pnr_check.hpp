@@ -10,12 +10,15 @@ namespace pnr {
 struct CheckResult {
   int nets = 0, opens = 0, shorts = 0, spacing = 0;
   std::vector<std::string> messages;      // the first few of each kind
+  std::vector<std::pair<std::string, int>> supplies;   // special net, separate pieces of its wiring
   bool clean() const { return !opens && !shorts && !spacing; }
 };
 
 inline void printCheck(std::ostream& o, const CheckResult& c) {
   o << "check: " << c.nets << " nets, " << c.opens << " open, " << c.shorts << " shorts, " << c.spacing << " spacing violations\n";
   for (auto& m : c.messages) o << "  " << m << "\n";
+  for (auto& [name, pieces] : c.supplies)
+    if (pieces > 1) o << "  note: supply " << name << " is in " << pieces << " separate pieces (rails not tied by straps)\n";
 }
 
 inline CheckResult checkDesign(const phys::Tech& tech, const phys::Design& d, par::Pool& pool) {
@@ -241,6 +244,32 @@ inline CheckResult checkDesign(const phys::Tech& tech, const phys::Design& d, pa
     if (d.nets[ni].conns.size() < 2) continue;
     res.nets++;
     if (open[ni]) { res.opens++; if (res.messages.size() < 16) res.messages.push_back("open: net " + d.nets[ni].name); }
+  }
+  // ---- supplies: how many separate pieces the wiring of each special net is in ----
+  for (size_t si = 0; si < d.specialNets.size(); si++) {
+    std::vector<int> v;
+    for (size_t i = 0; i < shapes.size(); i++) if (shapes[i].net == nNets + (int)si && shapes[i].wire && shapes[i].layer >= 0) v.push_back((int)i);
+    if (v.empty()) continue;
+    std::sort(v.begin(), v.end(), [&](int a, int b) {
+      if (shapes[a].layer != shapes[b].layer) return shapes[a].layer < shapes[b].layer;
+      return shapes[a].r.x0 != shapes[b].r.x0 ? shapes[a].r.x0 < shapes[b].r.x0 : a < b;
+    });
+    std::vector<int> parent(v.size());
+    std::iota(parent.begin(), parent.end(), 0);
+    auto find = [&](int a) { while (parent[a] != a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; };
+    std::unordered_map<int, int> groupRep;
+    for (size_t i = 0; i < v.size(); i++) {
+      const Shape& a = shapes[v[i]];
+      if (a.group >= 0) { auto [it, fresh] = groupRep.emplace(a.group, (int)i); if (!fresh) parent[find((int)i)] = find(it->second); }
+      for (size_t j = i + 1; j < v.size(); j++) {
+        const Shape& b = shapes[v[j]];
+        if (b.layer != a.layer || b.r.x0 > a.r.x1) break;
+        if (b.r.y0 <= a.r.y1 && a.r.y0 <= b.r.y1) parent[find((int)j)] = find((int)i);
+      }
+    }
+    int pieces = 0;
+    for (size_t i = 0; i < v.size(); i++) pieces += find((int)i) == (int)i;
+    res.supplies.push_back({d.specialNets[si].name, pieces});
   }
   return res;
 }

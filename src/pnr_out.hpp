@@ -6,11 +6,11 @@ namespace pnr {
 
 // Power rails along every row, taken from the POWER and GROUND pin shapes of
 // the cells (SHAPE FOLLOWPIN special wires on the pins' layer).
-inline void makeRails(DB& db) {
-  if (!db.specialNets.empty()) return;
+inline bool makeRails(DB& db) {
+  if (!db.specialNets.empty()) return false;
   const phys::Macro* ref = nullptr;
   for (auto& in : db.insts) if (in.m->isCore()) { ref = in.m; break; }
-  if (!ref) return;
+  if (!ref) return false;
   std::map<std::string, phys::Net> nets;
   for (auto& p : ref->pins) {
     if (p.use != "POWER" && p.use != "GROUND") continue;
@@ -33,6 +33,91 @@ inline void makeRails(DB& db) {
     }
   }
   for (auto& [name, n] : nets) db.specialNets.push_back(n);
+  return !db.specialNets.empty();
+}
+
+struct StrapOptions {
+  bool on = true;
+  int layer = 0;                // routing level of the straps; 0: the top vertical layer
+  double widthUm = 0;           // 0: four wire widths of the layer
+  double pitchUm = 0;           // between straps of one net; 0: 32 row heights
+};
+
+// Vertical straps that tie the rails of the rows together: per supply net one
+// strap every pitch across the core, with a stack of vias down to each of its
+// rails. Returns the number of straps; `why` says why there are none.
+inline int makeStraps(DB& db, const StrapOptions& o, int maxLayer, std::string& why) {
+  std::vector<const phys::Layer*> rl = db.tech.routing();
+  int top = maxLayer > 0 ? std::min<int>(maxLayer, (int)rl.size()) : (int)rl.size();
+  // The rails: FOLLOWPIN wires, all on one horizontal layer.
+  const phys::Layer* railLayer = nullptr;
+  int64_t railW = 0;
+  for (auto& n : db.specialNets)
+    for (auto& s : n.segs) if (s.shape == "FOLLOWPIN" && s.y0 == s.y1) { railLayer = db.tech.layer(s.layer); railW = s.width; }
+  if (!railLayer || railLayer->type != phys::Layer::Routing) { why = "no horizontal rails"; return 0; }
+  int ri = railLayer->routingLevel;
+  int si = o.layer;
+  if (!si) for (int l = top; l > ri; l--) if (rl[l - 1]->dir == 'V') { si = l; break; }
+  if (si <= ri || si > top || rl[si - 1]->dir != 'V') { why = "no vertical routing layer above the rails"; return 0; }
+  // Lower straps would sit on the tracks the cells' pins are reached from.
+  if (!o.layer && si < ri + 3) { why = "the top vertical layer, " + rl[si - 1]->name + ", is needed for pin access (force one with -strap_layer)"; return 0; }
+  const phys::Layer* S = rl[si - 1];
+  // One via per layer pair, the smallest; the lowest must fit inside the rail.
+  std::vector<const phys::ViaDef*> stack;
+  for (int l = ri; l < si; l++) {
+    const phys::Layer* lo = rl[l - 1];
+    const phys::Layer* hi = rl[l];
+    const phys::ViaDef* best = nullptr;
+    int64_t bestArea = INT64_MAX;
+    for (auto& v : db.tech.vias) {
+      bool a = false, b = false, fits = true;
+      int64_t area = 0;
+      for (auto& sh : v.shapes) {
+        if (sh.layer == lo->name) { a = true; if (l == ri && (sh.r.y0 < -railW / 2 || sh.r.y1 > railW / 2)) fits = false; }
+        else if (sh.layer == hi->name) b = true;
+        area += sh.r.w() * sh.r.h();
+      }
+      if (!a || !b || !fits) continue;
+      if (!v.isDefault) area += INT64_MAX / 4;
+      if (area < bestArea) { bestArea = area; best = &v; }
+    }
+    if (!best) { why = "the LEF has no via from " + lo->name + " to " + hi->name + (l == ri ? " that fits inside a rail" : ""); return 0; }
+    stack.push_back(best);
+  }
+  int64_t width = o.widthUm > 0 ? (int64_t)std::llround(o.widthUm * db.tech.dbu) : 4 * S->width;
+  int64_t rowH = db.tech.coreSite() ? db.tech.coreSite()->h : 0;
+  int64_t pitch = o.pitchUm > 0 ? (int64_t)std::llround(o.pitchUm * db.tech.dbu) : 32 * rowH;
+  if (pitch <= 0 || width <= 0) { why = "no strap pitch"; return 0; }
+  int nets = 0;
+  for (auto& n : db.specialNets) for (auto& s : n.segs) if (s.shape == "FOLLOWPIN") { nets++; break; }
+  int64_t coreW = db.core.w();
+  int groups = (int)std::max<int64_t>(1, (coreW + pitch / 2) / pitch);
+  int made = 0, k = 0;
+  for (auto& n : db.specialNets) {
+    int64_t ylo = INT64_MAX, yhi = INT64_MIN;
+    for (auto& s : n.segs) if (s.shape == "FOLLOWPIN") { ylo = std::min(ylo, s.y0); yhi = std::max(yhi, s.y0); }
+    if (ylo > yhi) continue;
+    std::vector<phys::Seg> rails;
+    for (auto& s : n.segs) if (s.shape == "FOLLOWPIN") rails.push_back(s);
+    for (int g = 0; g < groups; g++) {
+      // The nets' straps share each group's width evenly.
+      int64_t x = db.core.x0 + coreW * (2 * (g * nets + k) + 1) / (2 * (int64_t)groups * nets);
+      if (S->pitch() > 0) x = S->offset() + (x - S->offset() + S->pitch() / 2) / S->pitch() * S->pitch();
+      if (x - width / 2 < db.core.x0 || x + width / 2 > db.core.x1) continue;
+      phys::Seg st;
+      st.layer = S->name; st.width = width; st.shape = "STRIPE";
+      st.x0 = st.x1 = x; st.y0 = ylo - railW / 2; st.y1 = yhi + railW / 2;
+      n.segs.push_back(st);
+      made++;
+      for (auto& r : rails) {
+        if (x - width / 2 < std::min(r.x0, r.x1) || x + width / 2 > std::max(r.x0, r.x1)) continue;
+        for (int l = ri; l < si; l++) n.vias.push_back({stack[l - ri]->name, rl[l - 1]->name, x, r.y0});
+      }
+    }
+    k++;
+  }
+  if (!made) why = "the core is narrower than a strap";
+  return made;
 }
 
 inline phys::Design Router::toDef(bool routed) const {

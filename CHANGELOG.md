@@ -73,7 +73,9 @@ Spec references are IEEE 1800-2023 clauses.
   shorts and spacing (`-check FILE.def` checks any routed DEF). Multithreaded
   with identical results for any `-threads`. `-gds` writes the layout as GDSII
   (LEF cell abstracts or real cells from `-gds_cells`, layer map with
-  `-gds_map`). See `docs/PNR.md`.
+  `-gds_map`). Vertical power straps with via stacks tie the rows' rails
+  together (`-no_straps`, `-strap_layer`, `-strap_width`, `-strap_pitch`).
+  See `docs/PNR.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
