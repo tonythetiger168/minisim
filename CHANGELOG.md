@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `src/tcl.hpp`: the one Tcl interpreter of the tool line (`tcl::Interp`),
+  split out of the SDC reader. A tool adds its own commands (`addCommand`),
+  runs scripts (`load`, `parse`) or a prompt (`shell`), and gets every error
+  as a diagnostic with file and line instead of a stop. `sdc::Reader` is now
+  an `Interp` with the SDC commands added.
 - `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
   the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
   `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed
