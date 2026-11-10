@@ -46,6 +46,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
+| `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
+| `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -358,6 +360,7 @@ design, so it needs no separate build setup:
 mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
 mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any finding (for CI)
 mlint rtl/*.sv -disable L004 -disable CDC002
+mlint rtl/*.sv -top soc_top -cdc-report     # clock domains, resets, every crossing
 mlint -list                                 # the rules
 ```
 
@@ -367,13 +370,26 @@ mlint -list                                 # the rules
 | `L002` | A blocking assignment to a non-local variable in an `always_ff` |
 | `L003` | A non-blocking assignment in an `always_comb` |
 | `L004` | One value is assigned by more than one process |
-| `CDC001` | A flop reads another clock domain with no synchronizer, or through one flop only |
-| `CDC002` | A multi-bit bus crosses domains through a two-flop synchronizer, which does not keep its bits together |
+| `CDC001` | A flop depends on another clock domain with no synchronizer, or through one flop only |
+| `CDC002` | A multi-bit bus crosses domains through a synchronizer and is not Gray coded |
+| `CDC003` | Combinational logic in front of a synchronizer: a glitch can be captured |
+| `CDC004` | Reconvergence: separately synchronized signals of one domain meet again |
+| `CDC005` | One signal is synchronized more than once into the same domain |
+| `RDC001` | An asynchronous reset generated in another clock domain |
+| `RDC002` | One asynchronous reset used directly in several clock domains |
+| `RDC003` | A flop feeds a flop with a different asynchronous reset, in one clock domain |
+| `RDC004` | A reset flop feeds a flop with no asynchronous reset (off by default: `-enable RDC004`) |
 
-Clock domains come from the clock of every edge-triggered block, with signals
-joined across port connections, so one clock passed down through several
-modules stays one domain. Findings print as
-`file:line:col: warning: [RULE] text`, sorted by file and line.
+Clock and reset domains are found from the RTL: the clock of every
+edge-triggered block, followed through ports, buffers and clock gates, so one
+clock passed down through several modules stays one domain. Multi-flop
+synchronizers (also shift registers and synchronizer cells), enable-qualified
+buses and Gray-coded pointers are recognized as safe. `-cdc-report` lists
+every domain and crossing, `-clock-group a,b` declares related clocks,
+`-static sig` waives a quasi-static signal, and `-threads N` sets the worker
+threads (default: every logical CPU). See [docs/CDC.md](docs/CDC.md).
+Findings print as `file:line:col: warning: [RULE] text`, sorted by file and
+line.
 
 ### Source-level debug: `mdebug`
 
@@ -468,6 +484,26 @@ patterns to the word, on every core, the same result for any `-threads N`),
 compacts, and writes STIL, a self-checking Verilog testbench that `msim`
 replays, and a fault list with each fault's class. See
 [docs/ATPG.md](docs/ATPG.md).
+
+### Parasitic extraction: `mrcx`
+
+`mrcx` reads a routed DEF and its LEF and writes every net's resistance and
+capacitance, coupling included, as SPEF for timing and power analysis:
+
+```sh
+mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef
+mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o slow.spef
+```
+
+```
+mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5086 coupling capacitors
+mrcx: capacitance 2238 fF to ground, 288.8 fF between nets (sky130 stack, 25 C)
+```
+
+It runs on every core (`-threads N`), writes the same file for any thread
+count, and reports open and shorted nets. On the OpenROAD `gcd` test design
+its total net capacitance is within 1% of OpenRCX's. See
+[`docs/RCX.md`](docs/RCX.md).
 
 ### Virtual prototypes: `-mvp`
 
