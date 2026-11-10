@@ -18,6 +18,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mspice** | SPICE circuit simulator: DC, AC and transient analysis, diodes, level-1 MOSFETs and bipolar transistors, subcircuits and parameters, `.measure`, `.step`, CSV and VCD output, multi-threaded; see [`SPICE.md`](SPICE.md). BSIM models and mixed-signal co-simulation with msim come next | Shipping next |
 | **mvp** | Virtual prototypes: an AXI4-Lite bridge from the design to C, C++ or SystemC/TLM-2.0 models, with a memory map, interrupt lines and timed callbacks; a memory and a UART bundled | Shipping next |
 | **mdft** | Design-for-test: scan-readiness checks (gated clocks, logic-driven resets, latches, mixed edges, combinational loops) and a per-domain flop count for chain planning | Shipping next |
+| **mdebug** | Source-level debug: drivers and loads with their conditions, fan-in cones, the active driver at a time in a waveform traced back through time, and a one-file viewer (hierarchy, source, schematic, waves) | Shipping next |
 | **mcov** | Code coverage (line, branch, toggle) merged across a regression, text / HTML / LCOV reports and gates; covergroups with the spec work | Code coverage shipping in 0.2 |
 | **mwave** | Waveforms for GTKWave / Surfer: hierarchical VCD and compressed FST (shipping in 0.2); `$dumpfile` / `$dumpvars` scoping and transaction views next | Partly shipping in 0.2 |
 
