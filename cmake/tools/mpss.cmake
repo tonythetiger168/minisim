@@ -2,6 +2,7 @@
 # writes each as a UVM sequence and as a C test (docs/MPSS.md).
 #   mpss model.pss -n 20 -sv seqs.sv -c tests.c
 # Plain C++20 and threads: no slang, so it builds in every configuration.
+include_guard(GLOBAL)
 find_package(Threads REQUIRED)
 add_executable(mpss src/mpss.cpp)
 target_include_directories(mpss PRIVATE src)

@@ -87,7 +87,6 @@ endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
 include(cmake/tools/memu.cmake)
-include(cmake/tools/mpss.cmake)
 include(cmake/tools/mrcx.cmake)
 include(cmake/tools/shared_par_wave.cmake)
 include(cmake/tools/mequiv.cmake)
