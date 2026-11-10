@@ -26,6 +26,9 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal`: fairness. A strong obligation in an `assume`
+  (`assume property (req |-> s_eventually !req)`) restricts the loops a
+  liveness counterexample may use.
 - `mformal` is faster on larger designs: PDR lifts each state to the bits
   that matter, and a short induction with a small PDR budget runs before the
   deep search (8-way arbiter liveness 24 s to 4 s, a failure 300 cycles deep
@@ -271,6 +274,12 @@ Spec references are IEEE 1800-2023 clauses.
   once, so large designs with thousands of queries read in seconds.
 
 ### Fixed
+- `mformal` could report a liveness assertion proven when it fails:
+  `s_eventually` of a sequence longer than one cycle (`s_eventually (a ##1 a)`
+  with `a` alternating), and could have reported a loop for obligations that
+  are met and renewed. Liveness now follows single obligations round the
+  loop; what it does not decide (`s_eventually always q`) is reported
+  `bounded`, not proven.
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes
   the clock-domain union-find quadratic (path compression).
 - A concurrent assertion read the current value, not the sampled one, of a

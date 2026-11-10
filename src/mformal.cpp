@@ -317,8 +317,13 @@ struct Property {
     std::string name;
     int dir = AD_ASSERT;   // AD_ASSERT, AD_COVER, AD_ASSUME
     int bad = 0;           // assert / assume: fails in this cycle. cover: hit in this cycle.
-    bool liveness = false; // has a strong obligation: also checked for a loop where one attempt stays pending
-    int pending = 0;       // the tracked attempt is pending with a strong obligation
+    bool liveness = false; // has a strong unbounded obligation: also checked for a loop that never meets it
+    int liveMark = 0;      // free input: follow the open obligations from this cycle (see buildMonitor)
+    int liveBack = 0;      // assert: the obligation picked then is open again. assume: one followed since then is still open
+    std::vector<int> liveState;   // the monitor's latches: part of the state a loop must repeat
+    std::vector<int> liveOwn;     // the state bits that follow the chain: they need not repeat
+    std::string liveInexact;      // assert: why the liveness part is not decided
+    std::string fairInexact;      // assume: why its liveness part is not used
     int live = 0;          // the liveness part of `bad`: such a loop closes in this cycle
     int saved = 0;         // the loop's first state has been saved
     std::string skipped;   // not modelled: why
@@ -1381,48 +1386,191 @@ struct Model {
                 stateBits[(size_t)firstBit[i]].next = g.And(kill ^ 1, g.Mux(tick, nextAct[i], latch[i]));
             if (pr.dir == AD_COVER) pr.bad = g.And(live, c.coverSeq ? hit : pass);
             else pr.bad = g.And(live, fail);
-            // Liveness. An attempt whose term keeps a strong obligation forever
-            // (s_eventually, s_until, strong(), the negation of a weak sequence)
-            // fails. One attempt, picked by a free input, is tracked on its own
-            // one-hot copy of the automaton; addLiveness() then looks for a loop
-            // on which it stays pending.
-            std::vector<char> pend(ns, 0);
-            bool anyPend = false;
-            for (size_t i = 0; i < ns; i++) {
-                pend[i] = !sva::endValue(states[i].t);
-                anyPend = anyPend || pend[i];
-            }
-            if (pr.dir == AD_ASSERT && anyPend) {
-                pr.liveness = true;
-                std::vector<int> pk;
-                newInputs(1, pk, pr.name + "$pick", 0);
-                std::vector<int> trk(ns), cur(ns), bit(ns);
-                int tracking = 0;
-                for (size_t i = 0; i < ns; i++) {
-                    std::vector<int> l;
-                    newInputs(1, l, pr.name + "$track" + std::to_string(i), 1);
-                    trk[i] = l[0];
-                    StateBit sb;
-                    sb.in = l[0];
-                    sb.init = 0;
-                    sb.aux = true;
-                    stateBitOfInput[sb.in >> 1] = (int)stateBits.size();
-                    bit[i] = (int)stateBits.size();
-                    stateBits.push_back(sb);
-                    tracking = g.Or(tracking, trk[i]);
+            // Liveness. A property is a conjunction of obligations: the
+            // conjuncts of the terms its attempts are at. One step turns an
+            // obligation into the conjuncts of its derivative. The property
+            // fails without a failing step when one chain of obligations goes
+            // on forever, each of them held open by a strong unbounded
+            // operator (s_eventually, s_until, a strong unbounded sequence)
+            // that nothing weak can satisfy in its place. addLiveness() looks
+            // for a loop of the design with such a chain all the way round,
+            // back to the obligation it began with.
+            // Where a weak unbounded alternative could satisfy the term
+            // instead (s_eventually always q), or under `not` / accept_on,
+            // this does not decide the property: liveInexact.
+            struct Ob { const sva::Node* t; std::vector<int> atoms; std::vector<std::vector<int>> to; };
+            std::vector<Ob> obs;
+            std::map<const sva::Node*, int> obIdx;
+            std::string inexact;
+            std::function<bool(const sva::Node*)> seqUnbounded = [&](const sva::Node* n) {
+                if (n->k == sva::REP && n->hi < 0) return true;
+                for (auto* k : n->kids)
+                    if (seqUnbounded(k)) return true;
+                return false;
+            };
+            std::function<bool(const sva::Node*)> unboundedIn = [&](const sva::Node* n) {
+                if ((n->k == sva::REP || n->k == sva::ALWAYS || n->k == sva::EVENT) && n->hi < 0) return true;
+                if (n->k == sva::UNTIL) return true;
+                for (auto* k : n->kids)
+                    if (unboundedIn(k)) return true;
+                return false;
+            };
+            // strong unbounded: nothing but its own fulfilment ends it
+            auto isSU = [&](const sva::Node* n) {
+                bool strong = n->flags & sva::STRONG;
+                return (n->k == sva::EVENT && strong && n->hi < 0) || (n->k == sva::UNTIL && strong) ||
+                       (n->k == sva::PSEQ && strong && seqUnbounded(n->kids[0]));
+            };
+            // The value of a term if nothing more happened: strong unbounded
+            // operators fail, weak unbounded ones hold, and what ends by itself
+            // in bounded time counts as failing (it cannot keep a term true forever).
+            std::function<bool(const sva::Node*)> holds = [&](const sva::Node* n) -> bool {
+                switch (n->k) {
+                    case sva::PTRUE: case sva::DONE: case sva::COVSEQ: return true;
+                    case sva::PFALSE: return false;
+                    case sva::PSEQ: return !(n->flags & sva::STRONG) && seqUnbounded(n->kids[0]);
+                    case sva::NEXT: return false;
+                    case sva::EVENT: return !(n->flags & sva::STRONG) && n->hi < 0;
+                    case sva::ALWAYS: return n->hi < 0;
+                    case sva::UNTIL: return !(n->flags & sva::STRONG);
+                    case sva::IMPL: return true;
+                    case sva::IF: return holds(n->kids[0]) && (n->kids.size() < 2 || holds(n->kids[1]));
+                    case sva::PNOT:   // of something that ends by itself: so does the negation
+                        if (!unboundedIn(n->kids[0])) return false;
+                        inexact = "the negation of an unbounded property";
+                        return true;
+                    case sva::ACCEPT: case sva::REJECT: inexact = "accept_on or reject_on"; return holds(n->kids[0]);
+                    case sva::ENV: case sva::INIT: return holds(n->kids[0]);
+                    case sva::PAND: { bool r = true; for (auto* k : n->kids) r = holds(k) && r; return r; }
+                    case sva::POR: { bool r = false; for (auto* k : n->kids) r = holds(k) || r; return r; }
+                    default: return true;
                 }
-                int startTrack = g.And(g.And(pk[0], startLit), g.And(live, tracking ^ 1));
-                std::vector<int> nxt(ns, 0);
-                for (size_t i = 0; i < ns; i++) {
-                    cur[i] = i == 0 ? g.Or(trk[i], startTrack) : trk[i];
-                    const Tr& tr = trs[i];
-                    std::set<int> targets(tr.to.begin(), tr.to.end());
-                    for (int to : targets)
-                        if (to >= 0) nxt[(size_t)to] = g.Or(nxt[(size_t)to], g.And(cur[i], guard(i, [&](size_t mv) { return tr.to[mv] == to; })));
+            };
+            std::function<bool(const sva::Node*)> exposed = [&](const sva::Node* n) -> bool {
+                if (isSU(n)) return true;
+                if (n->k != sva::PAND && n->k != sva::POR) return false;
+                for (auto* k : n->kids)
+                    if (exposed(k)) return true;
+                return false;
+            };
+            auto conjuncts = [](const sva::Node* t) {
+                return t->k == sva::PAND ? t->kids : std::vector<const sva::Node*>{t};
+            };
+            // an open obligation's index, or -1 when it is not one
+            auto obOf = [&](const sva::Node* t) -> int {
+                if (t->k == sva::PTRUE || t->k == sva::PFALSE || t->k == sva::DONE) return -1;
+                if (holds(t)) {
+                    if (exposed(t)) inexact = "a strong operator next to a weak unbounded alternative";
+                    return -1;
                 }
-                for (size_t i = 0; i < ns; i++) {
-                    stateBits[(size_t)bit[i]].next = g.And(kill ^ 1, g.Mux(tick, nxt[i], trk[i]));
-                    if (pend[i]) pr.pending = g.Or(pr.pending, trk[i]);
+                auto [it, fresh] = obIdx.try_emplace(t, (int)obs.size());
+                if (fresh) obs.push_back({t, {}, {}});
+                return it->second;
+            };
+            std::vector<std::vector<int>> stateObs(ns);
+            bool wantLive = pr.dir == AD_ASSERT || pr.dir == AD_ASSUME;
+            if (wantLive) {
+                for (size_t i = 0; i < ns; i++)
+                    for (auto* cj : conjuncts(states[i].t)) {
+                        int o = obOf(cj);
+                        if (o >= 0) stateObs[i].push_back(o);
+                    }
+                for (size_t oi = 0; oi < obs.size() && inexact.empty(); oi++) {
+                    if (obs.size() > 2000) { inexact = "more than 2000 open obligations"; break; }
+                    std::set<int> as;
+                    std::unordered_set<const sva::Node*> seen;
+                    atomsIn(obs[oi].t, as, seen);
+                    std::vector<int> atomsOf(as.begin(), as.end());
+                    if (atomsOf.size() > 14) { inexact = "a step that reads more than 14 boolean expressions"; break; }
+                    size_t nv = (size_t)1 << atomsOf.size();
+                    std::vector<std::vector<int>> to(nv);
+                    for (size_t mv = 0; mv < nv; mv++) {
+                        for (size_t b = 0; b < atomsOf.size(); b++) val[(size_t)atomsOf[b]] = (mv >> b) & 1;
+                        sva::Deriv dv{sva::store(), val};
+                        const sva::Node* d = dv.d(obs[oi].t);
+                        for (auto* cj : conjuncts(d)) {
+                            int o = obOf(cj);
+                            if (o >= 0) to[mv].push_back(o);
+                        }
+                    }
+                    obs[oi].atoms = std::move(atomsOf);
+                    obs[oi].to = std::move(to);
+                }
+                // an obligation matters only if a chain through it can go on forever
+                bool anySU = false;
+                for (auto& o : obs) anySU = anySU || exposed(o.t);
+                if (!inexact.empty()) {
+                    if (pr.dir == AD_ASSERT) pr.liveInexact = inexact;
+                    else pr.fairInexact = inexact;
+                } else if (anySU) {
+                    size_t no = obs.size();
+                    auto obGuard = [&](size_t o, const std::function<bool(size_t)>& pred) {
+                        const Ob& ob = obs[o];
+                        std::function<int(int, size_t)> tree = [&](int level, size_t mv) -> int {
+                            if (level < 0) return pred(mv) ? 1 : 0;
+                            int hi = tree(level - 1, mv | ((size_t)1 << level)), lo = tree(level - 1, mv);
+                            return g.Mux(atom[(size_t)ob.atoms[(size_t)level]], hi, lo);
+                        };
+                        return tree((int)ob.atoms.size() - 1, 0);
+                    };
+                    auto newLatch = [&](const std::string& name, int8_t init) {
+                        std::vector<int> l;
+                        newInputs(1, l, pr.name + name, 1);
+                        StateBit sb;
+                        sb.in = l[0];
+                        sb.init = init;
+                        sb.aux = true;
+                        stateBitOfInput[sb.in >> 1] = (int)stateBits.size();
+                        stateBits.push_back(sb);
+                        return (int)stateBits.size() - 1;
+                    };
+                    // open now: a conjunct of a term some attempt is at
+                    std::vector<int> open(no, 0);
+                    for (size_t i = 0; i < ns; i++)
+                        for (int o : stateObs[i]) open[(size_t)o] = g.Or(open[(size_t)o], act[i]);
+                    // `mark`: a free input, the cycle the chains are followed from
+                    std::vector<int> mk;
+                    newInputs(1, mk, pr.name + "$mark", 0);
+                    pr.liveMark = mk[0];
+                    // which obligations to follow: one, picked by free inputs (assert: one
+                    // failing chain is enough), or all of them (assume: none may go on)
+                    std::vector<int> pick(no, 1);
+                    if (pr.dir == AD_ASSERT) {
+                        int bits = 0;
+                        while (((size_t)1 << bits) < no) bits++;
+                        std::vector<int> ix;
+                        if (bits) newInputs(bits, ix, pr.name + "$pick", 0);
+                        for (size_t o = 0; o < no; o++)
+                            for (int b = 0; b < bits; b++) pick[o] = g.And(pick[o], ((o >> b) & 1) ? ix[(size_t)b] : (ix[(size_t)b] ^ 1));
+                    }
+                    std::vector<int> B(no), P(no), bBit(no), pBit(no), curB(no), nxtB(no, 0);
+                    for (size_t o = 0; o < no; o++) {
+                        bBit[o] = newLatch("$open" + std::to_string(o), 0);
+                        pr.liveOwn.push_back(bBit[o]);
+                        B[o] = stateBits[(size_t)bBit[o]].in;
+                        int first = g.And(g.And(pick[o], open[o]), startLit);
+                        curB[o] = g.Mux(pr.liveMark, first, B[o]);
+                        if (pr.dir == AD_ASSERT) {
+                            pBit[o] = newLatch("$first" + std::to_string(o), 0);
+                            pr.liveOwn.push_back(pBit[o]);
+                            P[o] = stateBits[(size_t)pBit[o]].in;
+                            stateBits[(size_t)pBit[o]].next = g.Mux(pr.liveMark, first, P[o]);
+                            pr.liveBack = g.Or(pr.liveBack, g.And(P[o], B[o]));
+                        } else
+                            pr.liveBack = g.Or(pr.liveBack, B[o]);
+                    }
+                    for (size_t o = 0; o < no; o++) {
+                        std::set<int> targets;
+                        for (auto& v : obs[o].to) targets.insert(v.begin(), v.end());
+                        for (int to : targets)
+                            nxtB[(size_t)to] = g.Or(nxtB[(size_t)to], g.And(curB[o], obGuard(o, [&](size_t mv) {
+                                auto& v = obs[o].to[mv];
+                                return std::find(v.begin(), v.end(), to) != v.end();
+                            })));
+                    }
+                    for (size_t o = 0; o < no; o++) stateBits[(size_t)bBit[o]].next = g.And(kill ^ 1, g.Mux(tick, nxtB[o], curB[o]));
+                    for (size_t i = 0; i < ns; i++) pr.liveState.push_back(latch[i]);
+                    if (pr.dir == AD_ASSERT) pr.liveness = true;
                 }
             }
         } catch (const Unsupported& u) {
@@ -1533,19 +1681,26 @@ Cone coneOf(const Model& m, const std::vector<int>& roots) {
     return c;
 }
 
-// Liveness to safety. For each property with a strong obligation: a free
-// input saves the state once, and the property fails when the same state
-// comes back with the tracked attempt pending in every cycle between (a loop
-// the design can go round forever). The saved copy covers the state bits in
-// the cone of the pending signal and the assumptions.
+// Liveness to safety. For each assertion with a strong obligation: a free
+// input saves the state once, and the assertion fails when the same state
+// comes back with the obligation picked at that moment open again, down a
+// chain of open obligations (a loop the design can go round forever without
+// meeting it). The loop must be fair: of an assumption's obligations open
+// when the state was saved, none is still open when the loop closes. (A fair
+// loop that needs more rounds to close them all is found as the longer loop.)
+// The saved copy covers the state bits in the cone of the monitors and the
+// assumptions.
 void addLiveness(Model& m) {
     std::vector<int> constraints;
     for (auto& p : m.props)
         if (p.dir == AD_ASSUME && p.skipped.empty()) constraints.push_back(p.bad);
     for (auto& pr : m.props) {
-        if (pr.pending == 0 || !pr.skipped.empty()) continue;
-        std::vector<int> roots{pr.pending};
+        if (!pr.liveness || !pr.skipped.empty()) continue;
+        std::vector<int> roots{pr.liveBack};
+        roots.insert(roots.end(), pr.liveState.begin(), pr.liveState.end());
         roots.insert(roots.end(), constraints.begin(), constraints.end());
+        for (auto& f : m.props)
+            if (f.dir == AD_ASSUME && f.liveMark && f.skipped.empty()) roots.insert(roots.end(), f.liveState.begin(), f.liveState.end());
         Cone cone = coneOf(m, roots);
         Aig& g = m.g;
         auto latch = [&](const std::string& name, int8_t init) {
@@ -1559,23 +1714,31 @@ void addLiveness(Model& m) {
             m.stateBits.push_back(sb);
             return (int)m.stateBits.size() - 1;
         };
-        std::vector<int> sv;
-        m.newInputs(1, sv, pr.name + "$save", 0);
-        int savedB = latch("$saved", 0), okB = latch("$pending_since", 1);
-        int saved = m.stateBits[(size_t)savedB].in, ok = m.stateBits[(size_t)okB].in;
-        int saveNow = g.And(g.And(sv[0], m.startLit), saved ^ 1);
-        int inLoop = g.Or(saved, saveNow);
+        int savedB = latch("$saved", 0);
+        int saved = m.stateBits[(size_t)savedB].in;
+        // the mark is the save: once, after reset
+        int saveNow = pr.liveMark;
+        int okB = latch("$marks", 1);
+        int ok = m.stateBits[(size_t)okB].in;
+        int marksOk = g.And(g.Or(saveNow ^ 1, g.And(m.startLit, saved ^ 1)), 1);
+        // every fair assumption is marked in the same cycle, and never again
+        for (auto& f : m.props)
+            if (f.dir == AD_ASSUME && f.liveMark && f.skipped.empty()) marksOk = g.And(marksOk, g.Xor(f.liveMark, saveNow) ^ 1);
+        m.stateBits[(size_t)okB].next = g.And(ok, marksOk);
+        std::set<int> own(pr.liveOwn.begin(), pr.liveOwn.end());   // the chain's own latches change round the loop
         int eq = 1;
         for (int b : cone.stateBits) {
+            if (b == savedB || b == okB || own.count(b)) continue;
             int cur = m.stateBits[(size_t)b].in;
             int sh = latch("$loop" + std::to_string(b), -1);
             int shl = m.stateBits[(size_t)sh].in;
             m.stateBits[(size_t)sh].next = g.Mux(saveNow, cur, shl);
             eq = g.And(eq, g.Xor(cur, shl) ^ 1);
         }
-        m.stateBits[(size_t)savedB].next = inLoop;
-        m.stateBits[(size_t)okB].next = g.Mux(inLoop, g.And(g.Mux(saved, ok, 1), pr.pending), 1);
-        pr.live = g.And(g.And(saved, ok), g.And(eq, pr.pending));
+        m.stateBits[(size_t)savedB].next = g.Or(saved, saveNow);
+        pr.live = g.And(g.And(saved, g.And(ok, marksOk)), g.And(eq, pr.liveBack));
+        for (auto& f : m.props)
+            if (f.dir == AD_ASSUME && f.liveMark && f.skipped.empty()) pr.live = g.And(pr.live, f.liveBack ^ 1);
         pr.saved = saved;
         pr.bad = g.Or(pr.bad, pr.live);
     }
@@ -2402,6 +2565,21 @@ int main(int argc, char** argv) {
         }
     }
     }
+    // Liveness that this engine does not decide: only the safety part was checked.
+    for (size_t i : todo) {
+        Result& r = results[i];
+        const Property& p = m.props[i];
+        if (p.liveInexact.empty()) continue;
+        if (r.v == V_PROVEN) {
+            r.v = V_BOUNDED;
+            r.bound = std::max(r.bound, opt.depth);
+            r.note = "the safety part is proven; liveness not decided (" + p.liveInexact + ")";
+        } else if (r.v == V_BOUNDED)
+            r.note = "liveness not decided (" + p.liveInexact + ")";
+    }
+    for (auto& p : m.props)
+        if (!p.fairInexact.empty() && !opt.quiet)
+            std::cerr << "mformal: warning: " << p.name << ": the liveness part of this assumption is not used (" << p.fairInexact << ")\n";
     // a liveness counterexample: where its loop starts
     for (size_t i : todo) {
         Result& r = results[i];
