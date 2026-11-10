@@ -16,6 +16,13 @@ Spec references are IEEE 1800-2023 clauses.
   (`mini45_tt.lib`, `_ss`, `_ff`: NLDM 7x7 delay tables, constraints,
   internal power, state-dependent leakage, wire loads), Verilog models
   (`mini45.v`), and technology and cell LEF. See `docs/MINI45.md`.
+- `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
+  of a signal with the `if` / `case` conditions on each assignment, `-trace`
+  for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
+  assignment that gave a signal its value at a time and its causes back
+  through time, and `-html` for a one-file viewer (hierarchy, clickable
+  source, drivers and loads, schematic, waves with values annotated in the
+  source). See `docs/DEBUG.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
