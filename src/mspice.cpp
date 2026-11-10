@@ -38,6 +38,8 @@ struct Args {
     int threads = 0;
     bool quiet = false, stats = false;
     std::map<std::string, double> defines;
+    bool flatten = false;
+    std::string top;
 };
 
 void usage() {
@@ -48,6 +50,8 @@ void usage() {
                  "  -D name=value  set a .param (overrides the netlist)\n"
                  "  -q             print measurements and errors only\n"
                  "  -stats         print iteration and time step counts\n"
+                 "  -flatten       print the elements with flat names and stop (no simulation)\n"
+                 "  -top <name>    with -flatten: the subcircuit to flatten (default: the top level)\n"
                  "  -version       print the version\n";
 }
 
@@ -202,6 +206,8 @@ int main(int argc, char** argv) {
         else if (s == "-vcd") a.vcd = next();
         else if (s == "-q") a.quiet = true;
         else if (s == "-stats") a.stats = true;
+        else if (s == "-flatten") a.flatten = true;
+        else if (s == "-top") a.top = next();
         else if (s == "-threads") {
             std::string n = next();
             if (n == "all") a.threads = 0;
@@ -217,14 +223,31 @@ int main(int argc, char** argv) {
     }
     if (a.file.empty()) { usage(); return 2; }
     int hw = std::max(1, cpuTopo().logical());
-    int threads = a.threads > 0 ? std::min(a.threads, hw) : hw;
+    int threads = a.threads > 0 ? std::min(a.threads, hw) : (int)par::defaultThreads();
 
     try {
         auto t0 = std::chrono::steady_clock::now();
         Netlist nl = Reader().read(a.file);
+        if (a.flatten) {
+            Flat f = flatten(nl, a.top);
+            if (!a.top.empty()) {
+                std::printf(".ports");
+                for (auto& p : f.ports) std::printf(" %s", p.c_str());
+                std::printf("\n");
+            }
+            for (const Primitive& p : f.prims) {
+                std::printf("%s", p.path.c_str());
+                for (auto& n : p.nodes) std::printf(" %s", n.c_str());
+                if (!p.model.empty()) std::printf(" %s", p.model.c_str());
+                for (auto& [k, v] : p.params) std::printf(" %s=%s", k.c_str(), num(v).c_str());
+                std::printf("\n");
+            }
+            return 0;
+        }
         StepPlan plan = stepPlan(nl, a.defines);
         std::vector<RunOutput> runs(plan.sets.size());
         Pool pool(threads);
+        pool.spin(20000);   // about 0.1 ms: one batch per Newton iteration, back to back
         auto overridesOf = [&](size_t k) {
             std::map<std::string, double> o = a.defines;
             for (size_t i = 0; i < plan.names.size(); i++) o[plan.names[i]] = plan.sets[k][i];
@@ -234,7 +257,7 @@ int main(int argc, char** argv) {
             runs[0] = runNetlist(nl, overridesOf(0), &pool);
         } else {
             // Each run builds its own circuit, so runs share nothing.
-            pool.parallelFor(runs.size(), [&](size_t k, int) { runs[k] = runNetlist(nl, overridesOf(k), nullptr); });
+            pool.run(runs.size(), [&](size_t k) { runs[k] = runNetlist(nl, overridesOf(k), nullptr); });
         }
         if (!a.quiet) {
             std::printf("mspice %s: %s\n", MINISIM_VERSION, nl.title.c_str());

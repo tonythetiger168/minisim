@@ -8,16 +8,6 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
-  of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
-  bus, logic in front of a synchronizer, reconvergence, a signal synchronized
-  twice) and `RDC001` to `RDC004` (a reset from another clock domain, one
-  reset used raw in several domains, a flop feeding a flop with another reset
-  or with none). Synchronizers in one block, with a reset, as shift registers
-  or as per-bit synchronizer cells, enable-qualified buses and Gray-coded
-  pointers are recognized; clock gates stay in their clock's domain and bits
-  of a clock bus are separate clocks. New options: `-cdc-report`,
-  `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
@@ -28,6 +18,25 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, with identical output at any `-threads`. Every test netlist is
   checked against hand-worked values and against ngspice. See
   `docs/SPICE.md`.
+- `mspice`: MOSFET evaluation and matrix assembly run in parallel (a
+  2,000-inverter chain goes from 1.14 s to 0.70 s on four threads, with the
+  same output bit for bit); `parmin` now defaults to 1024. The reader gains
+  `spice::flatten()`, a flat list of primitive elements for LVS and cell
+  characterization, printed by `mspice -flatten [-top name]`.
+- `mspice`: `.option chgtol=` (needed for accurate edges on femtofarad
+  nodes) and `spice::Reader::readText()` for netlists held in memory.
+  mspice now runs on the shared thread pool of `src/parallel.hpp`, which
+  gains `Pool::spin()` for short batches that come one after the other.
+- `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
+  of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
+  bus, logic in front of a synchronizer, reconvergence, a signal synchronized
+  twice) and `RDC001` to `RDC004` (a reset from another clock domain, one
+  reset used raw in several domains, a flop feeding a flop with another reset
+  or with none). Synchronizers in one block, with a reset, as shift registers
+  or as per-bit synchronizer cells, enable-qualified buses and Gray-coded
+  pointers are recognized; clock gates stay in their clock's domain and bits
+  of a clock bus are separate clocks. New options: `-cdc-report`,
+  `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the

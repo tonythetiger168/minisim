@@ -95,14 +95,15 @@ def main():
             bad.append("output differs between -threads 1, 3 and all")
 
     if ngspice and use_ng:
-        kinds = [k for k in ("op", "dc", "ac", "tran") if any(l.lower().startswith("." + k) for l in lines)]
+        word = lambda l: (l.lower().split() or [""])[0]   # ".op" is not ".option"
+        kinds = [k for k in ("op", "dc", "ac", "tran") if any(word(l) == "." + k for l in lines)]
         for kind in kinds:
             deck = []
             for l in lines:
                 lo = l.lower()
                 if lo.startswith(".print") or lo.startswith(".end") and not lo.startswith(".ends"):
                     continue
-                if any(lo.startswith("." + k) for k in kinds if k != kind):
+                if any(word(l) == "." + k for k in kinds if k != kind):
                     continue
                 if lo.startswith(".meas") and lo.split()[1] != kind:
                     continue

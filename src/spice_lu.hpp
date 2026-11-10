@@ -1,4 +1,4 @@
-// spice_lu.hpp - the sparse linear solver and the thread pool of mspice.
+// spice_lu.hpp - the sparse linear solver of mspice.
 //
 // Pattern   the structure of the circuit matrix: every (row, column) a device
 //           stamps gets a slot once, at setup, and a load is then
@@ -12,23 +12,21 @@
 //                         structure, so nearly every factorization is this.
 //           A refactor that meets a pivot that has become too small reports
 //           it and the caller analyzes again.
-// Pool      parallelFor over an index range. Work is handed out by index and
-//           results are stored by index, so a result never depends on how
-//           many threads ran.
+// Pool      the tool line's shared pool (parallel.hpp). Work is handed out by
+//           index and results are stored by index, so a result never depends
+//           on how many threads ran.
 #pragma once
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <complex>
-#include <condition_variable>
 #include <functional>
 #include <map>
-#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
+
+#include "parallel.hpp"
 
 namespace spice {
 
@@ -270,81 +268,7 @@ struct SparseLU {
     }
 };
 
-// A fixed set of workers. parallelFor(n, f) calls f(i, worker) for every i in
-// [0, n); the calling thread is worker 0.
-class Pool {
-public:
-    explicit Pool(int threads) : nthreads_(std::max(1, threads)) {
-        for (int t = 1; t < nthreads_; t++) workers_.emplace_back([this, t] { work(t); });
-    }
-    ~Pool() {
-        {
-            std::lock_guard<std::mutex> g(m_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& t : workers_) t.join();
-    }
-    int threads() const { return nthreads_; }
-
-    void parallelFor(size_t n, const std::function<void(size_t, int)>& f, size_t chunk = 1) {
-        if (nthreads_ == 1 || n <= chunk) {
-            for (size_t i = 0; i < n; i++) f(i, 0);
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> g(m_);
-            fn_ = &f; n_ = n; chunk_ = chunk; next_ = 0; busy_ = nthreads_ - 1; gen_++;
-            error_ = nullptr;
-        }
-        cv_.notify_all();
-        run(0);
-        std::unique_lock<std::mutex> g(m_);
-        done_.wait(g, [this] { return busy_ == 0; });
-        fn_ = nullptr;
-        if (error_) std::rethrow_exception(error_);
-    }
-
-private:
-    void run(int tid) {
-        for (;;) {
-            size_t a = next_.fetch_add(chunk_);
-            if (a >= n_) break;
-            size_t b = std::min(n_, a + chunk_);
-            try {
-                for (size_t i = a; i < b; i++) (*fn_)(i, tid);
-            } catch (...) {
-                std::lock_guard<std::mutex> g(m_);
-                if (!error_) error_ = std::current_exception();
-                next_ = n_;
-            }
-        }
-    }
-    void work(int tid) {
-        unsigned seen = 0;
-        for (;;) {
-            {
-                std::unique_lock<std::mutex> g(m_);
-                cv_.wait(g, [&] { return stop_ || gen_ != seen; });
-                if (stop_) return;
-                seen = gen_;
-            }
-            run(tid);
-            std::lock_guard<std::mutex> g(m_);
-            if (--busy_ == 0) done_.notify_one();
-        }
-    }
-    int nthreads_;
-    std::vector<std::thread> workers_;
-    std::mutex m_;
-    std::condition_variable cv_, done_;
-    const std::function<void(size_t, int)>* fn_ = nullptr;
-    size_t n_ = 0, chunk_ = 1;
-    std::atomic<size_t> next_{0};
-    int busy_ = 0;
-    unsigned gen_ = 0;
-    bool stop_ = false;
-    std::exception_ptr error_;
-};
+// The threads are the tool line's shared pool (parallel.hpp).
+using Pool = par::Pool;
 
 }  // namespace spice

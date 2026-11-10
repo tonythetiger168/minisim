@@ -21,11 +21,12 @@ constexpr double kEpsOx = 3.9 * 8.854187817e-12; // F/m
 
 struct Options {
     double reltol = 1e-3, abstol = 1e-12, vntol = 1e-6, gmin = 1e-12, trtol = 7;
+    double chgtol = 1e-14;   // the smallest charge the step control resolves
     double temp = 27, tnom = 27, gshunt = 0;
     int itl1 = 100, itl4 = 10;
     bool euler = false;   // method=euler: backward Euler only
     bool bypass = true;
-    int parMin = 4096;    // evaluate a device type in parallel from this many instances
+    int parMin = 1024;    // evaluate a device type in parallel from this many instances
 };
 
 struct Ctx {
@@ -85,7 +86,7 @@ struct Charge {
     // SPICE's truncation error test. Returns the largest step this charge
     // allows (order 1, backward Euler) or its square (order 2, trapezoidal).
     // h[0] is the step just taken, h[1] and h[2] the ones before.
-    double maxStep(const double* h, int order, double reltol, double abstol, double trtol) const {
+    double maxStep(const double* h, int order, double reltol, double abstol, double trtol, double chgtol) const {
         if (q == q0 && q0 == q1 && q1 == q2) return 1e300;   // at rest
         double diff[4] = {q, q0, q1, q2}, del[3] = {h[0], h[1], h[2]};
         for (int j = order;; ) {
@@ -94,7 +95,7 @@ struct Charge {
             for (int k = 0; k <= j; k++) del[k] = del[k + 1] + h[k];
         }
         double tol = std::max(abstol + reltol * std::max(std::fabs(i), std::fabs(i0)),
-                              reltol * std::max({std::fabs(q), std::fabs(q0), 1e-14}) / h[0]);
+                              reltol * std::max({std::fabs(q), std::fabs(q0), chgtol}) / h[0]);
         double lte = std::max(abstol, (order == 1 ? 0.5 : 1.0 / 12) * std::fabs(diff[0]));
         return trtol * tol / lte;
     }
@@ -681,24 +682,35 @@ struct Mosfet final : Device {
         evgs = egs; evds = eds; evbs = ebs;
     }
 
+    // The linearized device as a 4 x 4 block and a right-hand side, by terminal.
+    [[gnu::always_inline]] inline void stamp(double m[4][4], double r[4]) const {
+        // The channel current runs from the drain to the source of the
+        // moment (they swap when vds < 0); the junctions and the gate
+        // capacitances sit on the terminals as drawn.
+        bool fwd = mode > 0;
+        double sg = fwd ? 1.0 : -1.0, sum = gm + gds + gmbs;
+        m[D][D] = (fwd ? gds : sum) + gbdT + geqgd;
+        m[D][S] = fwd ? -sum : -gds;
+        m[D][G] = sg * gm - geqgd;
+        m[D][B] = sg * gmbs - gbdT;
+        m[S][S] = (fwd ? sum : gds) + gbsT + geqgs;
+        m[S][D] = fwd ? -gds : -sum;
+        m[S][G] = -sg * gm - geqgs;
+        m[S][B] = -sg * gmbs - gbsT;
+        m[G][G] = geqgs + geqgd + geqgb;
+        m[G][D] = -geqgd; m[G][S] = -geqgs; m[G][B] = -geqgb;
+        m[B][B] = gbdT + gbsT + geqgb;
+        m[B][D] = -gbdT; m[B][S] = -gbsT; m[B][G] = -geqgb;
+        r[D] = -sg * ieqds + ieqbd + ieqgd;
+        r[S] = sg * ieqds + ieqbs + ieqgs;
+        r[G] = -(ieqgs + ieqgd + ieqgb);
+        r[B] = -(ieqbd + ieqbs) + ieqgb;
+    }
     void load(const Ctx&, double* val, double* rhs) override {
-        int dp = mode > 0 ? D : S, sp = mode > 0 ? S : D;
-        // Every matrix entry of the device, each written once.
-        double m[4][4] = {};
-        auto g2 = [&](int a, int b, double y) { m[a][a] += y; m[a][b] -= y; m[b][a] -= y; m[b][b] += y; };
-        auto vc = [&](int a, int b, int cc, int d, double y) { m[a][cc] += y; m[a][d] -= y; m[b][cc] -= y; m[b][d] += y; };
-        vc(dp, sp, G, sp, gm);
-        g2(dp, sp, gds);
-        vc(dp, sp, B, sp, gmbs);
-        g2(B, D, gbdT);
-        g2(B, S, gbsT);
-        g2(G, S, geqgs); g2(G, D, geqgd); g2(G, B, geqgb);
+        double m[4][4], r[4];
+        stamp(m, r);
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++) val[sl.s[i][j]] += m[i][j];
-        double r[4] = {};
-        r[dp] -= ieqds; r[sp] += ieqds;
-        r[B] -= ieqbd + ieqbs; r[D] += ieqbd; r[S] += ieqbs;
-        r[G] -= ieqgs + ieqgd + ieqgb; r[S] += ieqgs; r[D] += ieqgd; r[B] += ieqgb;
         for (int i = 0; i < 4; i++) rhs[node[i]] += r[i];
     }
     void loadAC(double w, cplx* val, cplx*) const override {

@@ -119,11 +119,14 @@ for an analysis, `-o` holds every node voltage and source current.
 
 ### Options
 
-`.option reltol= abstol= vntol= gmin= trtol= itl1= itl4= temp= tnom=
+`.option reltol= abstol= vntol= gmin= trtol= chgtol= itl1= itl4= temp= tnom=
 gshunt=`, `method=trap|euler`, `bypass=0|1` (reuse the linearization of
 devices whose voltages have not moved; on by default) and `parmin=` (the
 number of instances of a device type from which its models are evaluated in
-parallel; default 4096).
+parallel; default 1024). `chgtol` (default 1e-14 C) is the smallest charge the
+time step control resolves: with femtofarad nodes, as in standard cells, the
+charges are below the default and the steps are then set by `tstep` alone, so
+give `chgtol=1e-17` or so there.
 
 ## How it works
 
@@ -154,7 +157,11 @@ mspice uses every logical CPU by default; `-threads N` sets the count and
 - the runs of a `.step` (each builds its own circuit),
 - the frequency points of an `.ac` (one pivot order, found at the first
   frequency, is shared by every worker),
-- model evaluation, for a device type with at least `parmin` instances.
+- model evaluation, for a device type with at least `parmin` instances; for
+  MOSFETs the matrix is assembled in parallel as well. The devices are cut
+  into chunks; a matrix entry that only one chunk touches is summed by that
+  chunk's thread, and the entries chunks share (a supply node, say) are
+  summed afterwards on one thread, in device order.
 
 Results are stored by index and matrices are summed in a fixed order, so
 the output is identical, bit for bit, at any thread count. The test suite
@@ -178,14 +185,27 @@ ngspice. On a 4-CPU cloud machine, ngspice 42, best of three, seconds:
 |---|---|---|---|
 | 20,000-section RC ladder, transient | 0.81 | 0.82 | 1.45 |
 | 60 x 60 RC mesh, 401-point AC | 2.04 | 0.73 | 6.75 |
-| 2,000 inverters in a chain (4,000 MOSFETs), transient | 1.29 | 1.29 | 1.83 |
-| 101-stage ring oscillator, transient | 0.48 | 0.47 | 0.58 |
+| 2,000 inverters in a chain (4,000 MOSFETs), transient | 1.14 | 0.70 | 1.83 |
+| 101-stage ring oscillator, transient | 0.37 | 0.39 | 0.58 |
 | 3 inverters with RC load, 64-value `.step`, transient | 0.69 | 0.20 | no `.step` |
 
-Both simulators give the same measurements on these. The transients do not
-get faster with threads yet: once latent devices are bypassed, most of the
-time goes into adding stamps to the matrix and into the LU, which are
-serial. Parallel assembly is the next step.
+Both simulators give the same measurements on these. The ladder is linear
+(one factorization, then solves), and the ring is under `parmin`, so
+neither uses threads. On the chain, MOSFET evaluation and assembly take
+0.81 s of the run on one thread and 0.36 s on four; what is left is the LU,
+the convergence and step-size checks and the output, which are serial.
+
+## Flat netlists for other tools
+
+`src/spice_netlist.hpp` is the one SPICE reader of the tool line. Besides
+the cards, it offers `spice::flatten(netlist, top)`: the elements of the top
+level (or of the subcircuit `top`, with its ports) as primitives with flat
+instance paths (`x1.x2.m1`) and flat net names, parameters evaluated to SI
+numbers, `.global` nets and ground merged across the hierarchy, and
+instances of subcircuits the netlist does not define (PDK device cells)
+kept as they are. The comment above `flatten` states the rules.
+`mspice -flatten [-top name] file.cir` prints the result, one element per
+line: path, nodes, model, parameters.
 
 ## Not there yet
 
