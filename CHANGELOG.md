@@ -119,6 +119,15 @@ Spec references are IEEE 1800-2023 clauses.
   NLDM tables. A generic cell library is built in. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
+- `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
+  types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
+  functions, all control flow but `goto`) is scheduled into clock cycles
+  under `-clock`, `-mul` and `-div`, with operator chaining, multi-cycle
+  operators, register and multiplier/divider sharing, and comes out as an
+  FSM with datapath or (`-pipeline`) a pipeline taking one input per cycle.
+  `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
+  calls with the host C++ compiler, `-explore` sweeps the clock period.
+  See `docs/HLS.md`.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
