@@ -146,3 +146,24 @@ file(READ ${OUT}/blk.html page)
 if(NOT page MATCHES "function blocks\\(\\)")
   message(FATAL_ERROR "the page has no block view")
 endif()
+
+# Struct fields: a condition on a field is evaluated, each field has its own
+# driver, and a whole assignment the fields overwrite is not reported.
+set(SV ${SRC}/tests/debug/struct.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top st -vcd ${OUT}/struct.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "s=83 t=0")
+  message(FATAL_ERROR "msim struct.sv: ${rc}\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top st -vcd ${OUT}/struct.vcd -active st.s -at 50 -depth 2
+                        -active st.t -at 50 -depth 2 -json ${OUT}/struct.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("<- tests/debug/struct.sv:13: s = {p.hi, p.lo}  [always_comb]  when p.lo == 4'd3"
+     "p.hi = q[3:0]" "p.lo = 4'd3" "q <= q + 8'd4"
+     "t = r.b ? r.a : 4'd0" "st.r = 5'h09 @45" "r.a = p.hi" "r.b = idx[0]")
+if(out MATCHES "\\?\\?|p = '0|s = 0")
+  message(FATAL_ERROR "struct trace: an undecided or overwritten driver was reported:\n${out}")
+endif()
+file(READ ${OUT}/struct.json page)
+if(NOT page MATCHES "\"fld\"" OR NOT page MATCHES "\"lo\":4,\"w\":4")
+  message(FATAL_ERROR "the database has no field expressions or bit ranges")
+endif()
