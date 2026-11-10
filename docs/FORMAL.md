@@ -37,11 +37,17 @@ Supported in properties: boolean expressions, `##n`, `##[m:n]`, `[*m:n]`,
 with arguments, `$past`, `$rose`, `$fell`, `$stable`, `$changed`, `$sampled`,
 `$countones`, `$onehot`, `$onehot0`.
 
+Liveness: a property with a strong obligation (`s_eventually`, `s_until`,
+`s_until_with`, `s_nexttime`, `strong(...)`, `always s_eventually`, the
+negation of a weak sequence) is also checked for a loop the design can go
+round forever with one evaluation attempt still pending. Such a
+counterexample is reported with the cycles that repeat. Liveness in an
+`assume` (a fairness constraint) is not used yet: only its safety part
+constrains the inputs.
+
 Reported as `skipped`, with the reason: local variables and match items,
 multiclock properties, `.triggered` / `.matched`, concurrent assertions inside
-procedures, `expect`. A property with a strong operator (`s_eventually`,
-`s_until`, `strong(...)`) has its safety part checked and is reported
-`bounded`, with a note: liveness is not proven yet.
+procedures, `expect`.
 
 ## The model
 
@@ -74,14 +80,21 @@ procedures, `expect`. A property with a strong operator (`s_eventually`,
    time, here for every valuation of the property's boolean expressions),
    with one latch per term.
 3. Per property, the cone of influence is unrolled into the SAT solver
-   CaDiCaL. Bounded model checking from the reset state finds
-   counterexamples and cover traces. k-induction with simple-path
-   constraints proves; what it cannot prove alone is tried again with the
-   assertions already proven as lemmas.
+   CaDiCaL. Three engines run in turn:
+   * bounded model checking from the reset state finds counterexamples and
+     cover traces up to `-depth`;
+   * k-induction with simple-path constraints proves; what it cannot prove
+     alone is tried again with the assertions already proven as lemmas;
+   * PDR (IC3) takes what is left. It builds the invariant the proof needs,
+     clause by clause, or finds a failure deeper than `-depth` (the trace
+     then comes from a bounded check that deep). `-no-pdr` turns it off.
+   Liveness is reduced to safety first: a free input saves the state once,
+   and the property fails when that state comes back with the tracked
+   attempt pending all the way round.
 4. Properties are independent jobs on `-threads N` threads (default: every
    logical core). The output is the same for any N. The solver stops at
    `-conflicts N` conflicts per call (a deterministic limit, not a
-   timeout) and the property is then `inconclusive`.
+   timeout) and the property is then `inconclusive` or `bounded`.
 
 ## Traces
 
