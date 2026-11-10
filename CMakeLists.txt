@@ -189,6 +189,10 @@ if(MINISIM_WITH_SLANG)
   target_include_directories(mdebug PRIVATE src)
   find_package(Threads REQUIRED)
   target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
+  if(MINISIM_WITH_FST)
+    target_link_libraries(mdebug PRIVATE fst)
+    target_compile_definitions(mdebug PRIVATE MINISIM_FST)
+  endif()
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -373,6 +377,7 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
+                   -DFST=${MINISIM_WITH_FST}
                    -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
