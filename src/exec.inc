@@ -1627,12 +1627,21 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
     }
 }
 
-// A combinational process (prog.hpp: combShape) run as a function: its
-// leading Assign instructions, exactly as exec() would run them.
+// A combinational process (prog.hpp: combShape) run as a function: its body
+// (assignments and forward jumps) up to the wait, exactly as exec() would.
 static void execComb(const void* ctx) {
     const Prog* p = static_cast<const Prog*>(ctx);
-    for (const Instr& i : p->code) {
+    for (size_t pc = 0; pc < p->code.size();) {
+        const Instr& i = p->code[pc];
+        if (i.k == IK::JmpIfNot) {
+            if (g_cov) covHit(i.hits);
+            if (truth(eval(i.e, rd)) == 1) pc++;
+            else { if (g_cov) covHit(i.taken); pc = i.target; }
+            continue;
+        }
+        if (i.k == IK::Jmp) { if (g_cov) covHit(i.hits); pc = i.target; continue; }
         if (i.k != IK::Assign) return;
+        pc++;
         if (g_cov) covHit(i.hits);
         Val v = eval(i.e, rd);
         if (i.drv >= 0) {

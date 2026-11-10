@@ -272,6 +272,53 @@ struct Plan {
     std::vector<char> seq;
     std::vector<std::vector<std::pair<int, Edge>>> ev;
 };
+// A wire or variable whose drivers are all strong continuous assigns to
+// fixed, disjoint bit ranges that cover it (assign w[k] = ... in a generate
+// loop, one field of a packed struct per assign) resolves to those values
+// side by side. Its assigns then write their bits directly, without driver
+// resolution: Ibex's ALU drives a 32-bit net bit by bit, and resolving 32
+// drivers on each of 32 writes was a tenth of its run time.
+static void mergePartialDrivers(LowerResult& lowered) {
+    if (!S.varPathDrv.empty() || !S.loadsOf.empty() || !lowered.netDelays.empty()) return;
+    for (auto& t : S.tranOf) if (!t.empty()) return;
+    for (uint8_t b : S.pathIn) if (b) return;
+    size_t ns = S.sigs.size();
+    std::vector<std::vector<Instr*>> by(ns);
+    std::vector<char> bad(ns, 0);
+    for (auto& lp : lowered.procs)
+        for (auto& i : lp.prog.code)
+            if (i.k == IK::Force) return;   // release goes back to the drivers (10.6.2)
+    for (auto& lp : lowered.procs) {
+        auto& code = lp.prog.code;
+        // Only a continuous assign: Assign, wait, jump back.
+        bool contAssign = code.size() == 3 && code[0].k == IK::Assign && code[1].k == IK::WaitEdge;
+        for (auto& i : code) {
+            if (i.k != IK::Assign || i.drv < 0 || i.sig < 0 || (size_t)i.sig >= ns) continue;
+            bool ok = contAssign && i.hi >= 0 && i.dyn < 0 && i.gate < 0 && !i.arr && i.aidx.empty() && !i.bidx && !i.de && !i.delay && i.dly.empty() &&
+                      i.s0 == STR_STRONG && i.s1 == STR_STRONG;
+            if (ok) by[i.sig].push_back(&i); else bad[i.sig] = 1;
+        }
+    }
+    for (size_t s = 0; s < ns; s++) {
+        auto& g = S.sigs[s];
+        if (bad[s] || by[s].size() < 2 || by[s].size() != g.drv.size() || g.kind != NR_WIRE) continue;
+        if (s < S.tranOf.size() && !S.tranOf[s].empty()) continue;
+        std::vector<char> used(g.w, 0);
+        bool disjoint = true;
+        for (Instr* i : by[s])
+            for (int b = i->lo; b <= i->hi && disjoint; b++) {
+                if (b < 0 || b >= g.w || used[b]) disjoint = false;
+                else used[b] = 1;
+            }
+        // Every bit has its one driver, so no bit resolves to Z (or keeps
+        // a variable's initial value) for want of one.
+        for (char u : used) disjoint &= u != 0;
+        if (!disjoint) continue;
+        for (Instr* i : by[s]) i->drv = -1;
+        g.drv.clear();
+    }
+}
+
 static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     size_t n = lowered.procs.size();
     Plan p;
@@ -1170,6 +1217,7 @@ int main(int argc, char** argv) {
     // SDF DEVICE may give gates new delays (32.4.1): their drivers then
     // run the plain way.
     if ((!sdfRequests().empty() || sdfAtRunTime()) && !gateRecs().empty()) staticComb = staticSeq = false;
+    if (staticComb && !vpi::st().active && !g_upf) mergePartialDrivers(lowered);   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     if (compiled && timingChecksOn() && !timingChecks().empty()) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
@@ -1230,7 +1278,7 @@ int main(int argc, char** argv) {
     for (int i : byRank) {
         if (i < 0) continue;
         const Prog* pr = &lowered.procs[i].prog;
-        if (pl.body[i] == 1) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
+        if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
     for (size_t i = 0; i < lowered.procs.size(); i++) {
