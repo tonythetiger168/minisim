@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
+  1481) out. Per net a distributed RC network with capacitance to ground and
+  coupling capacitance to same-layer neighbours and to crossings, from an
+  ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
+  factors, decoupled output, per-net report, open and short checks
+  (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
+  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  See `docs/RCX.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
