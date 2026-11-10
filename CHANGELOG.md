@@ -8,11 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `mformal` is faster on larger designs: PDR lifts each state to the bits
-  that matter, and a short induction with a small PDR budget runs before the
-  deep search (8-way arbiter liveness 24 s to 4 s, a failure 300 cycles deep
-  6.6 s to 1.7 s, one thread). It solves through `src/sat.hpp` and takes its
-  threads from `src/parallel.hpp`. Benchmark designs are in `bench/formal`.
+- `mdebug -blocks INST`, and a block diagram in the viewer: the instances
+  inside a scope, their port connections and which instance feeds which.
+- `mdebug`: tasks and functions in a module, call output arguments, `force`,
+  procedural `assign` and net declaration assignments are drivers and loads;
+  the fan-in cone follows a task argument to its calls.
 - `memu`, emulation and FPGA prototyping: puts a gate-level netlist
   (structural Verilog over a Liberty library) on a board of FPGAs. Clock
   conversion onto one free-running clock (strobes for clean clocks, edge
@@ -26,6 +26,11 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal` is faster on larger designs: PDR lifts each state to the bits
+  that matter, and a short induction with a small PDR budget runs before the
+  deep search (8-way arbiter liveness 24 s to 4 s, a failure 300 cycles deep
+  6.6 s to 1.7 s, one thread). It solves through `src/sat.hpp` and takes its
+  threads from `src/parallel.hpp`. Benchmark designs are in `bench/formal`.
 - `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
   failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
   `strong()`, `always s_eventually`) is proven or falsified with a loop
