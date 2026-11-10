@@ -1,5 +1,6 @@
 // Layout check on a routed DEF: every net connected (opens), no metal of two
-// nets touching (shorts) or closer than the layer's SPACING. It works on the
+// nets touching (shorts) or closer than the layer's SPACING, and no two cuts
+// closer than the cut layer's SPACING even within a net. It works on the
 // shapes of the DEF and LEF alone, so it checks what mpnr wrote, not what the
 // router believes. Included by pnr_route.hpp.
 #pragma once
@@ -152,7 +153,11 @@ inline CheckResult checkDesign(const phys::Tech& tech, const phys::Design& d, pa
     std::vector<Hit>& out = hits[ti];
     auto pair = [&](int ia, int ib, int cx, int cy) {
       const Shape& a = shapes[ia]; const Shape& b = shapes[ib];
-      if (a.net == b.net) return;
+      if (a.net == b.net) {
+        // Cuts keep their distance within a net too (unless they are one cut drawn twice).
+        if (L.type != phys::Layer::Cut || a.net < 0 || a.group == b.group) return;
+        if (b.r.x0 < a.r.x1 && a.r.x0 < b.r.x1 && b.r.y0 < a.r.y1 && a.r.y0 < b.r.y1) return;
+      }
       // Seen only in the bucket of the lower left corner of the grown overlap.
       int64_t ox = std::max(a.r.x0, b.r.x0) - sp, oy = std::max(a.r.y0, b.r.y0) - sp;
       if (std::max<int64_t>(0, (ox - g.x0) / g.cell) != cx || std::max<int64_t>(0, (oy - g.y0) / g.cell) != cy) return;

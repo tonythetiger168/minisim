@@ -18,6 +18,7 @@
 // different threads. The grouping depends only on the design, never on the
 // thread count, so the result is identical for any -threads value.
 #pragma once
+#include <unordered_set>
 #include "pnr_place.hpp"
 #include <array>
 #include <queue>
@@ -64,6 +65,7 @@ class Router {
     std::vector<int> hlo, hhi;             // claim window along the track, per position
     const phys::ViaDef* viaUp = nullptr;
     int64_t reach = 0;                     // how far metal of a node extends along the track
+    int64_t cutW = 0, cutSp = 0;           // the cut of viaUp: its size and the cut layer's SPACING
   };
   struct NetRoute {
     std::vector<int> nodes;                          // unique grid nodes
@@ -171,6 +173,10 @@ class Router {
         for (int t = 0; t < l.nT; t++) l.upP[t] = idxOf(gl[g + 1].pos, l.trk[t]);
         l.viaUp = pickVia(*l.L, *gl[g + 1].L);
         if (!l.viaUp) throw std::runtime_error("the LEF has no via between " + l.L->name + " and " + gl[g + 1].L->name);
+        for (auto& s : l.viaUp->shapes) {
+          const phys::Layer* cl = db.tech.layer(s.layer);
+          if (cl && cl->type == phys::Layer::Cut) { l.cutW = std::max(s.r.x1 - s.r.x0, s.r.y1 - s.r.y0); l.cutSp = cl->spacing; }
+        }
       }
       if (g > 0) {
         l.dnT.resize(l.nP); l.dnP.resize(l.nT);
@@ -384,6 +390,8 @@ class Router {
     std::vector<int64_t> dist;
     std::vector<int32_t> from, stamp, tstamp;
     int32_t cur = 0;
+    std::unordered_set<int> cuts;          // the net being routed: lower nodes too close to one of its vias
+    std::vector<int> banned;               // lower nodes no via may use in this search
     void reset(size_t n) {
       if (dist.size() < n) { dist.resize(n); from.resize(n); stamp.assign(n, 0); tstamp.assign(n, 0); cur = 0; }
       if (++cur == INT32_MAX) { std::fill(stamp.begin(), stamp.end(), 0); std::fill(tstamp.begin(), tstamp.end(), 0); cur = 1; }
@@ -421,6 +429,70 @@ class Router {
     while (lid >= w.off[g + 1]) g++;
     int r = lid - w.off[g], np = w.p1[g] - w.p0[g] + 1;
     t = w.t0[g] + r / np; p = w.p0[g] + r % np;
+  }
+
+  // Two cuts of the layer above grid layer g, at (t, p) and (t2, p2) of g:
+  // closer than the cut layer's SPACING?
+  bool cutClash(int g, int t, int p, int t2, int p2) const {
+    const GLayer& l = gl[g];
+    int64_t a = std::llabs(l.trk[t] - l.trk[t2]) - l.cutW, b = std::llabs(l.pos[p] - l.pos[p2]) - l.cutW;
+    if (a < 0 && b < 0) return false;                  // the same cut
+    a = std::max<int64_t>(a, 0); b = std::max<int64_t>(b, 0);
+    return a < l.cutSp && b < l.cutSp && (!a || !b || a * a + b * b < l.cutSp * l.cutSp);
+  }
+  // The net has a via up from `lo`: no other via of it may use the lower
+  // nodes too close to that cut.
+  void blockAround(int lo, Scratch& sc) const {
+    int g, t, p;
+    decode(lo, g, t, p);
+    const GLayer& l = gl[g];
+    if (!l.cutSp) return;
+    int64_t need = l.cutW + l.cutSp;
+    int t0 = t, t1 = t, p0 = p, p1 = p;
+    while (t0 > 0 && l.trk[t] - l.trk[t0 - 1] < need) t0--;
+    while (t1 + 1 < l.nT && l.trk[t1 + 1] - l.trk[t] < need) t1++;
+    while (p0 > 0 && l.pos[p] - l.pos[p0 - 1] < need) p0--;
+    while (p1 + 1 < l.nP && l.pos[p1 + 1] - l.pos[p] < need) p1++;
+    for (int tt = t0; tt <= t1; tt++)
+      for (int pp = p0; pp <= p1; pp++)
+        if (cutClash(g, t, p, tt, pp)) sc.cuts.insert(node(g, tt, pp));
+  }
+  // A via from the node (g, t, p) at local id `lid` towards layer gd, when the
+  // path came out of gd a step or two back along this track: are the two cuts
+  // too close? (Other shapes of the same mistake are caught by pathCutClash.)
+  bool jogBlocked(int g, int p, int gd, int lid, const Window& w, const Scratch& sc) const {
+    const GLayer& c = gl[std::min(g, gd)];
+    if (!c.cutSp) return false;
+    const GLayer& l = gl[g];
+    int at = lid;
+    for (int k = 0; k < 4; k++) {
+      int prev = sc.from[at];
+      if (prev < 0) return false;
+      if (prev < w.off[g] || prev >= w.off[g + 1]) return false;      // came in by a via here: the same cut or another layer
+      int pp = p + (prev - lid);
+      if (std::llabs(l.pos[p] - l.pos[pp]) - c.cutW >= c.cutSp) return false;
+      int f = sc.from[prev];
+      if (f >= 0 && f >= w.off[gd] && f < w.off[gd + 1]) return true;
+      at = prev;
+    }
+    return false;
+  }
+
+  // The lower node of a via of the path that is too close to an earlier via
+  // of the same path, or -1.
+  int pathCutClash(const std::vector<int>& path) const {
+    struct V { int g, t, p, n; };
+    std::vector<V> vs;
+    int g, t, p;
+    for (size_t i = 0; i + 1 < path.size(); i++) {
+      int lo = std::min(path[i], path[i + 1]), hi = std::max(path[i], path[i + 1]);
+      decode(lo, g, t, p);
+      if (g + 1 >= (int)gl.size() || hi < gl[g + 1].base) continue;
+      for (size_t k = vs.size(); k-- > 0 && vs.size() - k <= 6;)
+        if (vs[k].g == g && gl[g].cutSp && cutClash(g, t, p, vs[k].t, vs[k].p)) return lo;
+      vs.push_back({g, t, p, lo});
+    }
+    return -1;
   }
 
   // A* from the given source nodes to any of the target nodes, inside the
@@ -478,7 +550,7 @@ class Router {
         return true;
       }
       const GLayer& l = gl[g];
-      auto relax = [&](int g2, int t2, int p2, int64_t step) {
+      auto relax = [&](int g2, int t2, int p2, int64_t step, int cutLow = -1) {
         int l2 = local(w, g2, t2, p2);
         if (l2 < 0) return;
         int n2 = node(g2, t2, p2);
@@ -487,14 +559,15 @@ class Router {
         int32_t po = pinOwner[n2];
         int64_t nd = d + step + (claim[n2] ? pres : 0) + (int64_t)hist[n2] * unit / 4 + (po != -1 && po != net ? pinCost : 0);
         if (sc.stamp[l2] == sc.cur && sc.dist[l2] <= nd) return;
+        if (cutLow >= 0 && ((!sc.cuts.empty() && sc.cuts.count(cutLow)) || (!sc.banned.empty() && std::find(sc.banned.begin(), sc.banned.end(), cutLow) != sc.banned.end()))) return;
         sc.stamp[l2] = sc.cur; sc.dist[l2] = nd; sc.from[l2] = lid;
         int64_t h = heur(g2, t2, p2);
         heap.push({((nd + h * hw / 8) << 24) | std::min<int64_t>(h, 0xffffff), l2});
       };
       if (p > 0) relax(g, t, p - 1, l.pos[p] - l.pos[p - 1]);
       if (p + 1 < l.nP) relax(g, t, p + 1, l.pos[p + 1] - l.pos[p]);
-      if (g + 1 < (int)gl.size() && l.upT[p] >= 0) relax(g + 1, l.upT[p], l.upP[t], viaCost);
-      if (g > 0 && l.dnT[p] >= 0) relax(g - 1, l.dnT[p], l.dnP[t], viaCost);
+      if (g + 1 < (int)gl.size() && l.upT[p] >= 0 && !jogBlocked(g, p, g + 1, lid, w, sc)) relax(g + 1, l.upT[p], l.upP[t], viaCost, node(g, t, p));
+      if (g > 0 && l.dnT[p] >= 0 && !jogBlocked(g, p, g - 1, lid, w, sc)) relax(g - 1, l.dnT[p], l.dnP[t], viaCost, node(g - 1, l.dnT[p], l.dnP[t]));
     }
     return false;
   }
@@ -566,6 +639,7 @@ class Router {
     const Net& nt = db.nets[net];
     out = NetRoute{};
     out.pinNode.assign(nt.pins.size(), -1);
+    if (sc.cuts.bucket_count() > 512) sc.cuts = {}; else sc.cuts.clear();      // clear() walks every bucket
     for (int pid : nt.pins) if (accStart[pid] == accStart[pid + 1]) return false;      // a pin nothing can reach
     std::vector<std::pair<int, int>> ord;
     pinOrder(nt, ord);
@@ -604,10 +678,20 @@ class Router {
         }
       Window w;
       if (!makeWindow(wb, w)) return false;
-      path.clear();
       // The first rounds lean on the distance estimate (10/8 of it): far fewer
       // nodes searched for slightly longer wires. Later rounds search exactly.
-      if (!search(net, sources, targets, w, pres, iter < 2 ? 10 : 8, sc, path)) return false;
+      // The search keeps one way into each node, so now and then the path it
+      // returns has two of its own vias too close; that via is banned and the
+      // search run again.
+      sc.banned.clear();
+      for (int tries = 0;; tries++) {
+        path.clear();
+        if (!search(net, sources, targets, w, pres, iter < 2 ? 10 : 8, sc, path)) return false;
+        int bad = pathCutClash(path);
+        if (bad < 0) break;
+        if (tries == 8) return false;
+        sc.banned.push_back(bad);
+      }
       // path: target ... source.
       out.pinNode[pi] = path.front();
       if (k == 1) out.pinNode[ord[0].first] = path.back();
@@ -621,7 +705,14 @@ class Router {
         xy(g, t, p, x, y);
         pc.box.add(x, y);
       }
-      for (size_t i = 0; i + 1 < path.size(); i++) out.edges.push_back({path[i], path[i + 1]});
+      for (size_t i = 0; i + 1 < path.size(); i++) {
+        out.edges.push_back({path[i], path[i + 1]});
+        // Wire steps stay inside a layer's node range; a via crosses it.
+        int lo = std::min(path[i], path[i + 1]), hi = std::max(path[i], path[i + 1]);
+        int lg = 0;
+        while (lg + 1 < (int)gl.size() && lo >= gl[lg + 1].base) lg++;
+        if (lg + 1 < (int)gl.size() && hi >= gl[lg + 1].base) blockAround(lo, sc);
+      }
       pc.end = out.nodes.size();
       if (pc.end > pc.begin) pieces.push_back(pc);
     }
