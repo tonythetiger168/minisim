@@ -111,6 +111,13 @@ void parallelFor(size_t n, unsigned threads, F&& f) {
 // A batch of one index runs inline, with no lock taken; a small batch wakes
 // only the workers it has work for. run() is not reentrant: do not call it
 // from inside f.
+//
+// A tool whose batches are short and come one right after the other (a
+// circuit solver: one batch of about 0.1 ms per Newton iteration) loses the
+// whole gain to the cost of waking sleeping threads. For those, spin(n)
+// makes a worker look for the next batch n times (about 5 ns each) before it
+// sleeps, and the caller do the same for the end of the batch. The default
+// is 0: sleep at once.
 class Pool {
 public:
     // 0 threads means the default: every logical CPU.
@@ -123,12 +130,15 @@ public:
         {
             std::lock_guard<std::mutex> g(mu_);
             stop_ = true;
+            quit_ = true;
         }
         wake_.notify_all();
         for (auto& w : workers_) w.join();
     }
     Pool(const Pool&) = delete;
     Pool& operator=(const Pool&) = delete;
+
+    void spin(unsigned n) { spin_.store(n, std::memory_order_relaxed); }
 
     unsigned size() const { return (unsigned)workers_.size() + 1; }
     unsigned threads() const { return size(); }
@@ -171,10 +181,13 @@ public:
             std::lock_guard<std::mutex> g(mu_);
             job_ = &job;
             slots_ = busy_ = k;
+            open_.store(k, std::memory_order_release);
+            left_.store(k, std::memory_order_release);
         }
         if (k == workers_.size()) wake_.notify_all();
         else for (unsigned i = 0; i < k; i++) wake_.notify_one();
         b.work(f);
+        for (unsigned i = spin_.load(std::memory_order_relaxed); i && left_.load(std::memory_order_acquire); i--) relax();
         std::unique_lock<std::mutex> g(mu_);
         done_.wait(g, [&] { return busy_ == 0; });
         job_ = nullptr;
@@ -186,15 +199,22 @@ private:
     void loop() {
         for (;;) {
             std::function<void()>* job;
+            // open_ and left_ only say when it is worth taking the lock;
+            // what is true is decided under it.
+            for (unsigned i = spin_.load(std::memory_order_relaxed);
+                 i && !open_.load(std::memory_order_acquire) && !quit_.load(std::memory_order_relaxed); i--)
+                relax();
             {
                 std::unique_lock<std::mutex> g(mu_);
                 wake_.wait(g, [&] { return stop_ || slots_ > 0; });
                 if (stop_) return;
                 slots_--;   // this worker takes one place in the batch
+                open_.store(slots_, std::memory_order_release);
                 job = job_;
             }
             (*job)();
             std::lock_guard<std::mutex> g(mu_);
+            left_.store(busy_ - 1, std::memory_order_release);
             if (--busy_ == 0) done_.notify_one();
         }
     }
@@ -206,6 +226,16 @@ private:
     unsigned slots_ = 0;   // places in the current batch not yet taken
     unsigned busy_ = 0;    // workers the batch still waits for
     bool stop_ = false;
+    // Copies of slots_, busy_ and stop_ a spinning thread may read without the lock.
+    std::atomic<unsigned> open_{0}, left_{0}, spin_{0};
+    std::atomic<bool> quit_{false};
+    static void relax() {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
 };
 
 }  // namespace par

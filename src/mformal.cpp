@@ -42,6 +42,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -306,13 +308,17 @@ struct StateBit {
     int in = 0;        // AIG literal (an input)
     int next = -1;     // AIG literal
     int8_t init = -1;  // 0, 1, or -1: any
+    bool aux = false;  // a latch of a property's monitor, not of the design
 };
 
 struct Property {
     std::string name;
     int dir = AD_ASSERT;   // AD_ASSERT, AD_COVER, AD_ASSUME
     int bad = 0;           // assert / assume: fails in this cycle. cover: hit in this cycle.
-    bool liveness = false; // has a strong operator whose obligation is not checked
+    bool liveness = false; // has a strong obligation: also checked for a loop where one attempt stays pending
+    int pending = 0;       // the tracked attempt is pending with a strong obligation
+    int live = 0;          // the liveness part of `bad`: such a loop closes in this cycle
+    int saved = 0;         // the loop's first state has been saved
     std::string skipped;   // not modelled: why
     std::string file;
     int line = 0;
@@ -330,6 +336,9 @@ struct Options {
     std::vector<std::string> only;
     bool quiet = false, verbose = false, noTrace = false, dumpIr = false, werror = false;
     bool bmcOnly = false;
+    long long pdrCalls = 2000000;   // PDR: solver calls per property
+    int pdrFrames = 500;
+    bool noPdr = false;
     bool tb = false;   // also write a testbench that replays each trace in a simulator
 };
 
@@ -365,8 +374,8 @@ struct Model {
     std::unordered_map<int, Stage> stageOf;   // $past stage signal
 
     int clockSig = -1;
-    int resetNode = -1;   // AIG node of the reset input (bit 0), or -1
-    int startLit = 0;     // input: assertions are being checked (0 during reset)
+    bool hasReset = false;
+    int startLit = 1;     // assertions are being checked: 0 while the reset is held
     std::vector<int8_t> piKind;   // per AIG input: 0 free, 1 state
 
     std::vector<std::optional<SV>> curMemo;
@@ -959,9 +968,26 @@ struct Model {
         if (!writers[(size_t)rs].empty()) throw std::runtime_error("the reset '" + sigs[(size_t)rs].name + "' is driven inside the design; it must be an input");
         opt.reset = sigs[(size_t)rs].name;
         opt.resetLow = low;
-        initVal[(size_t)rs].clear();   // a testbench's initial value does not hold it
-        SV v = cur(rs);
-        resetNode = v.b[0] >> 1;
+        // The reset sequence is part of the model, so the model is the same in
+        // every cycle: a chain of flops counts the reset cycles, the reset is
+        // active until the last one is set, and assertions are checked after.
+        int done = 1;
+        for (int k = 0; k < opt.resetCycles; k++) {
+            std::vector<int> l;
+            newInputs(1, l, "$reset_done" + std::to_string(k), 1);
+            StateBit sb;
+            sb.in = l[0];
+            sb.init = 0;
+            sb.next = k == 0 ? 1 : done;
+            stateBitOfInput[sb.in >> 1] = (int)stateBits.size();
+            stateBits.push_back(sb);
+            done = l[0];
+        }
+        SV v;
+        v.b = {low ? done : done ^ 1};
+        curMemo[(size_t)rs] = v;
+        startLit = done;
+        hasReset = true;
     }
 
     // ---- initial values: declaration initializers and initial blocks ----
@@ -1098,6 +1124,7 @@ struct Model {
             sb.in = v.b[(size_t)b];
             auto& iv = initVal[(size_t)s];
             sb.init = b < (int)iv.size() ? iv[(size_t)b] : -1;
+            sb.aux = stageOf.count(s) > 0;   // a $past stage belongs to the properties
             stateBitOfInput[sb.in >> 1] = (int)stateBits.size();
             stateBits.push_back(sb);
         }
@@ -1246,14 +1273,6 @@ struct Model {
         if (t->atom >= 0) out.insert(t->atom);
         for (auto* k : t->kids) atomsIn(k, out, seen);
     }
-    static bool hasStrong(const sva::Node* t, std::unordered_set<const sva::Node*>& seen) {
-        if (!seen.insert(t).second) return false;
-        if (t->prop && (t->flags & sva::STRONG) && t->k != sva::PTRUE && t->k != sva::PFALSE) return true;
-        if (t->k == sva::EVENT && t->hi < 0) return true;
-        for (auto* k : t->kids)
-            if (hasStrong(k, seen)) return true;
-        return false;
-    }
     void buildMonitor(ConcAssert& c) {
         AssertInfo& a = asserts()[(size_t)c.id];
         if (a.hidden) return;
@@ -1313,11 +1332,6 @@ struct Model {
                 }
                 trs.push_back(std::move(tr));
             }
-            {
-                std::unordered_set<const sva::Node*> seen;
-                for (auto& ms : states)
-                    if (hasStrong(ms.t, seen)) pr.liveness = true;
-            }
             // one latch per state: an attempt is at that term
             size_t ns = states.size();
             std::vector<int> latch(ns), act(ns);
@@ -1329,6 +1343,7 @@ struct Model {
                 StateBit sb;
                 sb.in = l[0];
                 sb.init = 0;
+                sb.aux = true;
                 stateBitOfInput[sb.in >> 1] = (int)stateBits.size();
                 firstBit[i] = (int)stateBits.size();
                 stateBits.push_back(sb);
@@ -1364,6 +1379,50 @@ struct Model {
                 stateBits[(size_t)firstBit[i]].next = g.And(kill ^ 1, g.Mux(tick, nextAct[i], latch[i]));
             if (pr.dir == AD_COVER) pr.bad = g.And(live, c.coverSeq ? hit : pass);
             else pr.bad = g.And(live, fail);
+            // Liveness. An attempt whose term keeps a strong obligation forever
+            // (s_eventually, s_until, strong(), the negation of a weak sequence)
+            // fails. One attempt, picked by a free input, is tracked on its own
+            // one-hot copy of the automaton; addLiveness() then looks for a loop
+            // on which it stays pending.
+            std::vector<char> pend(ns, 0);
+            bool anyPend = false;
+            for (size_t i = 0; i < ns; i++) {
+                pend[i] = !sva::endValue(states[i].t);
+                anyPend = anyPend || pend[i];
+            }
+            if (pr.dir == AD_ASSERT && anyPend) {
+                pr.liveness = true;
+                std::vector<int> pk;
+                newInputs(1, pk, pr.name + "$pick", 0);
+                std::vector<int> trk(ns), cur(ns), bit(ns);
+                int tracking = 0;
+                for (size_t i = 0; i < ns; i++) {
+                    std::vector<int> l;
+                    newInputs(1, l, pr.name + "$track" + std::to_string(i), 1);
+                    trk[i] = l[0];
+                    StateBit sb;
+                    sb.in = l[0];
+                    sb.init = 0;
+                    sb.aux = true;
+                    stateBitOfInput[sb.in >> 1] = (int)stateBits.size();
+                    bit[i] = (int)stateBits.size();
+                    stateBits.push_back(sb);
+                    tracking = g.Or(tracking, trk[i]);
+                }
+                int startTrack = g.And(g.And(pk[0], startLit), g.And(live, tracking ^ 1));
+                std::vector<int> nxt(ns, 0);
+                for (size_t i = 0; i < ns; i++) {
+                    cur[i] = i == 0 ? g.Or(trk[i], startTrack) : trk[i];
+                    const Tr& tr = trs[i];
+                    std::set<int> targets(tr.to.begin(), tr.to.end());
+                    for (int to : targets)
+                        if (to >= 0) nxt[(size_t)to] = g.Or(nxt[(size_t)to], g.And(cur[i], guard(i, [&](size_t mv) { return tr.to[mv] == to; })));
+                }
+                for (size_t i = 0; i < ns; i++) {
+                    stateBits[(size_t)bit[i]].next = g.And(kill ^ 1, g.Mux(tick, nxt[i], trk[i]));
+                    if (pend[i]) pr.pending = g.Or(pr.pending, trk[i]);
+                }
+            }
         } catch (const Unsupported& u) {
             pr.skipped = u.what();
         }
@@ -1382,11 +1441,6 @@ struct Model {
         classify();
         findClock();
         runInits();
-        {
-            std::vector<int> l;
-            newInputs(1, l, "$checking", 0);
-            startLit = l[0];
-        }
         findReset();
         for (auto& c : concAsserts()) buildMonitor(c);
         // immediate assertions: run every process that has one
@@ -1477,6 +1531,73 @@ Cone coneOf(const Model& m, const std::vector<int>& roots) {
     return c;
 }
 
+// Liveness to safety. For each property with a strong obligation: a free
+// input saves the state once, and the property fails when the same state
+// comes back with the tracked attempt pending in every cycle between (a loop
+// the design can go round forever). The saved copy covers the state bits in
+// the cone of the pending signal and the assumptions.
+void addLiveness(Model& m) {
+    std::vector<int> constraints;
+    for (auto& p : m.props)
+        if (p.dir == AD_ASSUME && p.skipped.empty()) constraints.push_back(p.bad);
+    for (auto& pr : m.props) {
+        if (pr.pending == 0 || !pr.skipped.empty()) continue;
+        std::vector<int> roots{pr.pending};
+        roots.insert(roots.end(), constraints.begin(), constraints.end());
+        Cone cone = coneOf(m, roots);
+        Aig& g = m.g;
+        auto latch = [&](const std::string& name, int8_t init) {
+            std::vector<int> l;
+            m.newInputs(1, l, pr.name + name, 1);
+            StateBit sb;
+            sb.in = l[0];
+            sb.init = init;
+            sb.aux = true;
+            m.stateBitOfInput[sb.in >> 1] = (int)m.stateBits.size();
+            m.stateBits.push_back(sb);
+            return (int)m.stateBits.size() - 1;
+        };
+        std::vector<int> sv;
+        m.newInputs(1, sv, pr.name + "$save", 0);
+        int savedB = latch("$saved", 0), okB = latch("$pending_since", 1);
+        int saved = m.stateBits[(size_t)savedB].in, ok = m.stateBits[(size_t)okB].in;
+        int saveNow = g.And(g.And(sv[0], m.startLit), saved ^ 1);
+        int inLoop = g.Or(saved, saveNow);
+        int eq = 1;
+        for (int b : cone.stateBits) {
+            int cur = m.stateBits[(size_t)b].in;
+            int sh = latch("$loop" + std::to_string(b), -1);
+            int shl = m.stateBits[(size_t)sh].in;
+            m.stateBits[(size_t)sh].next = g.Mux(saveNow, cur, shl);
+            eq = g.And(eq, g.Xor(cur, shl) ^ 1);
+        }
+        m.stateBits[(size_t)savedB].next = inLoop;
+        m.stateBits[(size_t)okB].next = g.Mux(inLoop, g.And(g.Mux(saved, ok, 1), pr.pending), 1);
+        pr.live = g.And(g.And(saved, ok), g.And(eq, pr.pending));
+        pr.saved = saved;
+        pr.bad = g.Or(pr.bad, pr.live);
+    }
+}
+
+// The lemmas that say something about a property's own state: those whose
+// cone lies inside the property's cone. The others would only make the
+// problem larger.
+std::vector<int> usefulLemmas(const Model& m, int bad, const std::vector<int>& constraints, const std::vector<int>& lemmas) {
+    std::vector<int> roots{bad};
+    roots.insert(roots.end(), constraints.begin(), constraints.end());
+    Cone own = coneOf(m, roots);
+    std::vector<int> out;
+    for (int l : lemmas) {
+        if (l == bad) continue;
+        Cone c = coneOf(m, {l});
+        std::vector<int> design;   // the lemma's own monitor always comes with it
+        for (int b : c.stateBits)
+            if (!m.stateBits[(size_t)b].aux) design.push_back(b);
+        if (std::includes(own.stateBits.begin(), own.stateBits.end(), design.begin(), design.end())) out.push_back(l);
+    }
+    return out;
+}
+
 // One unrolling of a cone in a SAT solver.
 struct Unroll {
     const Model& m;
@@ -1505,18 +1626,13 @@ struct Unroll {
         int f = frames();
         map.emplace_back(c.nodes.size(), 0);
         auto& mp = map.back();
-        int rc = m.opt.resetCycles;
         for (size_t p = 0; p < c.nodes.size(); p++) {
             int n = c.nodes[p];
             auto& nd = m.g.n[(size_t)n];
             if (nd[0] < 0) {
                 auto it = m.stateBitOfInput.find(n);
                 if (it == m.stateBitOfInput.end()) {
-                    int v = ++nv;
-                    mp[p] = v;
-                    bool inReset = fromReset && m.resetNode >= 0 && f < rc;
-                    if (n == m.resetNode) unit(inReset == !m.opt.resetLow ? v : -v);
-                    else if (2 * n == m.startLit) unit(inReset ? -v : v);
+                    mp[p] = ++nv;
                 } else {
                     const StateBit& sb = m.stateBits[(size_t)it->second];
                     if (f == 0) {
@@ -1542,14 +1658,17 @@ struct Unroll {
 // With `lemmas` (the fail literals of assertions already proven): the bounded
 // check has been done, so only the induction runs, with every lemma holding
 // in every frame.
-Result checkProperty(const Model& m, const Property& pr, const std::vector<int>& constraints, const std::vector<int>* lemmas = nullptr) {
+Result checkProperty(const Model& m, const Property& pr, const std::vector<int>& constraints, const std::vector<int>* lemmas = nullptr, int frames = -1) {
     auto t0 = std::chrono::steady_clock::now();
     Result r;
     std::vector<int> roots{pr.bad};
     roots.insert(roots.end(), constraints.begin(), constraints.end());
-    if (lemmas) roots.insert(roots.end(), lemmas->begin(), lemmas->end());
-    if (m.resetNode >= 0) roots.push_back(2 * m.resetNode);
-    roots.push_back(m.startLit);
+    std::vector<int> lem;
+    if (lemmas) {
+        lem = usefulLemmas(m, pr.bad, constraints, *lemmas);
+        if (lem.empty()) return r;   // nothing new to try
+        roots.insert(roots.end(), lem.begin(), lem.end());
+    }
     Cone cone = coneOf(m, roots);
     r.coneState = (int)cone.stateBits.size();
     for (int n : cone.nodes) r.coneAnd += m.g.n[(size_t)n][0] >= 0;
@@ -1567,15 +1686,16 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
         return done(cover ? V_UNREACHABLE : V_PROVEN);
     }
     Unroll bmc(m, cone, true, posOf), step(m, cone, false, posOf);
-    int rc = m.resetNode >= 0 ? m.opt.resetCycles : 0;
+    int rc = m.hasReset ? m.opt.resetCycles : 0;
     bool stepAlive = !m.opt.bmcOnly;
     int distinctUpTo = 0;   // simple-path constraints cover every pair of step frames below this
     auto limit = [&](CaDiCaL::Solver& s) { if (m.opt.conflicts > 0) s.limit("conflicts", (int)std::min<long long>(m.opt.conflicts, INT32_MAX)); };
-    for (int k = 0; k < rc + m.opt.depth; k++) {
+    // frames > 0: a bounded check of exactly that many frames (PDR found a failure that deep)
+    if (frames > 0) stepAlive = false;
+    for (int k = 0; k < (frames > 0 ? frames : rc + m.opt.depth); k++) {
         if (!lemmas) bmc.addFrame();
         if (!lemmas)
             for (int cst : constraints) bmc.unit(-bmc.lit(k, cst));
-        if (k < rc) continue;
         int res = 20;
         if (!lemmas) {
             bmc.s.assume(bmc.lit(k, pr.bad));
@@ -1602,15 +1722,14 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
             return done(V_INCONCLUSIVE);
         }
         if (!lemmas) bmc.unit(-bmc.lit(k, pr.bad));
-        r.bound = k - rc + 1;
+        r.bound = std::max(0, k - rc + 1);
         if (!stepAlive) continue;
         // k-induction: no failure in j consecutive cycles from any state, then none in the next
-        int j = k - rc;
+        int j = k;
         step.addFrame();
         for (int cst : constraints) step.unit(-step.lit(j, cst));
         if (lemmas)
-            for (int l : *lemmas)
-                if (l != pr.bad) step.unit(-step.lit(j, l));
+            for (int l : lem) step.unit(-step.lit(j, l));
         if (j > 0) step.unit(-step.lit(j - 1, pr.bad));
         for (;;) {
             step.s.assume(step.lit(j, pr.bad));
@@ -1657,12 +1776,211 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
     return done(V_BOUNDED);
 }
 
+// ------------------------------------------------------------- PDR
+// Property-directed reachability (IC3), for what k-induction cannot prove:
+// it finds the invariant itself, as clauses over the state bits of the cone.
+// F[0] is the initial states; F[i] over-approximates the states reachable in
+// at most i steps and excludes every state that reaches a failure. A cube is
+// a list of state literals: +(n+1) is cone state bit n true, -(n+1) false.
+struct Pdr {
+    const Model& m;
+    const Cone& cone;
+    int bad;
+    const std::vector<int>& never;   // literals that never hold: assumptions' and lemmas' fail literals
+    const std::vector<int>& posOf;
+    using Cube = std::vector<int>;
+    std::vector<std::unique_ptr<Unroll>> F;
+    std::vector<std::vector<Cube>> blocked;   // per level: the cubes blocked up to exactly that level
+    long long budget;                          // solver calls left
+    int cexSteps = -1;
+    int invariantClauses = 0;
+
+    Pdr(const Model& m_, const Cone& c_, int bad_, const std::vector<int>& never_, const std::vector<int>& posOf_, long long budget_)
+        : m(m_), cone(c_), bad(bad_), never(never_), posOf(posOf_), budget(budget_) {}
+    size_t n() const { return cone.stateBits.size(); }
+    const StateBit& sb(int lit) const { return m.stateBits[(size_t)cone.stateBits[(size_t)(std::abs(lit) - 1)]]; }
+    int at(Unroll& u, int f, int lit) const {
+        int l = u.lit(f, sb(lit).in);
+        return lit > 0 ? l : -l;
+    }
+    bool meetsInit(const Cube& c) const {
+        for (int l : c) {
+            int8_t iv = sb(l).init;
+            if (iv >= 0 && (iv == 1) != (l > 0)) return false;
+        }
+        return true;
+    }
+    void newFrame() {
+        auto u = std::make_unique<Unroll>(m, cone, F.empty(), posOf);
+        u->addFrame();
+        u->addFrame();
+        for (int l : never) u->unit(-u->lit(0, l));
+        if (m.opt.conflicts > 0) u->s.set("quiet", 1);
+        F.push_back(std::move(u));
+        blocked.emplace_back();
+    }
+    int solve(Unroll& u) {
+        if (--budget < 0) throw Unsupported("budget");
+        if (m.opt.conflicts > 0) u.s.limit("conflicts", (int)std::min<long long>(m.opt.conflicts, INT32_MAX));
+        int r = u.s.solve();
+        if (r != 10 && r != 20) throw Unsupported("conflicts");
+        return r;
+    }
+    Cube stateOf(Unroll& u) {
+        Cube c;
+        for (size_t i = 0; i < n(); i++) c.push_back(u.val(u.lit(0, m.stateBits[(size_t)cone.stateBits[i]].in)) ? (int)i + 1 : -((int)i + 1));
+        return c;
+    }
+    void addClause(Unroll& u, const Cube& c) {
+        for (int l : c) u.s.add(-at(u, 0, l));
+        u.s.add(0);
+    }
+    // Is c unreachable in one step from F[level] minus c itself? If so, `core`
+    // is a part of c that already is; if not, `pred` is a state that reaches it.
+    bool inductive(const Cube& c, int level, bool minusSelf, Cube* core, Cube* pred) {
+        Unroll& u = *F[(size_t)level];
+        int act = 0;
+        if (minusSelf) {
+            act = ++u.nv;
+            u.s.add(-act);
+            for (int l : c) u.s.add(-at(u, 0, l));
+            u.s.add(0);
+            u.s.assume(act);
+        }
+        for (int l : c) u.s.assume(at(u, 1, l));
+        int r = solve(u);
+        bool unsat = r == 20;
+        if (unsat && core) {
+            core->clear();
+            for (int l : c)
+                if (u.s.failed(at(u, 1, l))) core->push_back(l);
+        }
+        if (!unsat && pred) *pred = stateOf(u);
+        if (act) u.unit(-act);
+        return unsat;
+    }
+    // A cube must exclude the initial states: put back a literal that does.
+    void keepOffInit(Cube& g, const Cube& from) {
+        if (!meetsInit(g)) return;
+        for (int l : from) {
+            int8_t iv = sb(l).init;
+            if (iv >= 0 && (iv == 1) != (l > 0)) { g.push_back(l); std::sort(g.begin(), g.end(), [](int a, int b) { return std::abs(a) < std::abs(b); }); return; }
+        }
+    }
+    void generalize(Cube& g, int level) {
+        int fails = 0;
+        for (size_t i = 0; i < g.size() && g.size() > 1 && fails < 8;) {
+            Cube t = g;
+            t.erase(t.begin() + (ptrdiff_t)i);
+            Cube core;
+            if (!meetsInit(t) && inductive(t, level - 1, true, &core, nullptr)) {
+                keepOffInit(core, t);
+                g = core;
+                fails = 0;
+            } else {
+                i++;
+                fails++;
+            }
+        }
+    }
+    void block(const Cube& g, int level) {
+        for (int j = 1; j <= level; j++) addClause(*F[(size_t)j], g);
+        blocked[(size_t)level].push_back(g);
+    }
+    // false: the failure is reachable from an initial state.
+    bool blockAll(Cube s, int k) {
+        struct Ob { int level; long seq; int dist; Cube c; };
+        auto later = [](const Ob& a, const Ob& b) { return a.level != b.level ? a.level > b.level : a.seq > b.seq; };
+        std::priority_queue<Ob, std::vector<Ob>, decltype(later)> q(later);
+        long seq = 0;
+        q.push({k, seq++, 0, std::move(s)});
+        while (!q.empty()) {
+            Ob ob = q.top();
+            q.pop();
+            if (ob.level == 0 || meetsInit(ob.c)) { cexSteps = ob.dist; return false; }
+            Cube core, pred;
+            if (inductive(ob.c, ob.level - 1, true, &core, &pred)) {
+                keepOffInit(core, ob.c);
+                generalize(core, ob.level);
+                int lv = ob.level;
+                while (lv < k && inductive(core, lv, true, nullptr, nullptr)) lv++;   // as far forward as it holds
+                block(core, lv);
+                if (lv < k) q.push({lv + 1, seq++, ob.dist, std::move(ob.c)});
+            } else {
+                q.push({ob.level - 1, seq++, ob.dist + 1, std::move(pred)});
+                q.push(std::move(ob));
+            }
+        }
+        return true;
+    }
+    // 1: proven. 0: a counterexample of cexSteps transitions exists. -1: gave up.
+    int run(int maxFrames) {
+        try {
+            newFrame();
+            {   // a failure in an initial state
+                Unroll& u = *F[0];
+                u.s.assume(u.lit(0, bad));
+                if (solve(u) == 10) { cexSteps = 0; return 0; }
+            }
+            newFrame();
+            for (int k = 1; k < maxFrames; k++) {
+                for (;;) {
+                    Unroll& u = *F[(size_t)k];
+                    u.s.assume(u.lit(0, bad));
+                    if (solve(u) == 20) break;
+                    if (!blockAll(stateOf(u), k)) return 0;
+                }
+                newFrame();
+                for (int i = 1; i <= k; i++) {
+                    std::vector<Cube> keep;
+                    for (auto& c : blocked[(size_t)i]) {
+                        if (inductive(c, i, false, nullptr, nullptr)) {
+                            addClause(*F[(size_t)i + 1], c);
+                            blocked[(size_t)i + 1].push_back(c);
+                        } else
+                            keep.push_back(c);
+                    }
+                    blocked[(size_t)i].swap(keep);
+                    if (blocked[(size_t)i].empty()) {   // F[i] = F[i+1]: an inductive invariant
+                        for (size_t j = (size_t)i + 1; j < blocked.size(); j++) invariantClauses += (int)blocked[j].size();
+                        return 1;
+                    }
+                }
+            }
+        } catch (const Unsupported&) {
+        }
+        return -1;
+    }
+};
+
+// PDR on one property. `never`: the assumptions' and proven lemmas' fail literals.
+Result checkPdr(const Model& m, const Property& pr, const std::vector<int>& constraints, const std::vector<int>& lemmas) {
+    auto t0 = std::chrono::steady_clock::now();
+    Result r;
+    std::vector<int> never = constraints;
+    for (int l : usefulLemmas(m, pr.bad, constraints, lemmas)) never.push_back(l);
+    std::vector<int> roots{pr.bad};
+    roots.insert(roots.end(), never.begin(), never.end());
+    Cone cone = coneOf(m, roots);
+    std::vector<int> posOf(m.g.n.size(), -1);
+    for (size_t p = 0; p < cone.nodes.size(); p++) posOf[(size_t)cone.nodes[p]] = (int)p;
+    Pdr pdr(m, cone, pr.bad, never, posOf, m.opt.pdrCalls);
+    int res = pdr.run(m.opt.pdrFrames);
+    r.v = V_BOUNDED;
+    if (res == 1) {
+        r.v = pr.dir == AD_COVER ? V_UNREACHABLE : V_PROVEN;
+        r.note = "pdr, " + std::to_string(pdr.invariantClauses) + (pdr.invariantClauses == 1 ? " clause" : " clauses");
+    } else if (res == 0)
+        r.depth = pdr.cexSteps;   // the caller gets the trace from a bounded check this deep
+    r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return r;
+}
+
 // ------------------------------------------------------------- traces
 // Replay a counterexample on the AIG: the value of every node in every frame.
 std::vector<std::vector<char>> replay(const Model& m, const Result& r) {
     size_t nf = r.inputs.size();
     std::vector<std::vector<char>> val(nf, std::vector<char>(m.g.n.size(), 0));
-    int rc = m.resetNode >= 0 ? m.opt.resetCycles : 0;
     for (size_t f = 0; f < nf; f++) {
         auto& v = val[f];
         for (size_t n = 1; n < m.g.n.size(); n++) {
@@ -1673,9 +1991,7 @@ std::vector<std::vector<char>> replay(const Model& m, const Result& r) {
                     const StateBit& sb = m.stateBits[(size_t)it->second];
                     if (f == 0) v[n] = sb.init >= 0 ? sb.init : r.inputs[0][(size_t)nd[1]];
                     else v[n] = sb.next < 0 ? 0 : (val[f - 1][(size_t)(sb.next >> 1)] ^ (sb.next & 1));
-                } else if ((int)n == m.resetNode) v[n] = ((int)f < rc) == !m.opt.resetLow;
-                else if (2 * (int)n == m.startLit) v[n] = (int)f >= rc;
-                else v[n] = r.inputs[f][(size_t)nd[1]];
+                } else v[n] = r.inputs[f][(size_t)nd[1]];
             } else
                 v[n] = (v[(size_t)(nd[0] >> 1)] ^ (nd[0] & 1)) & (v[(size_t)(nd[1] >> 1)] ^ (nd[1] & 1));
         }
@@ -1837,7 +2153,8 @@ void usage() {
                  "  -no-reset         start from the declared initial values only\n"
                  "  -reset-cycles N   cycles the reset is held (default 1)\n"
                  "  -depth N          cycles to check after reset (default 20)\n"
-                 "  -bmc              bounded check only: no induction proof\n"
+                 "  -bmc              bounded check only: no proof\n"
+                 "  -no-pdr           prove by k-induction only\n"
                  "  -prop NAME        check only this property (repeatable; a name or its suffix)\n"
                  "  -threads N        worker threads (default: every logical core; the result does not depend on N)\n"
                  "  -conflicts N      SAT conflict limit per solver call (default 2000000; 0: none)\n"
@@ -1884,6 +2201,7 @@ int main(int argc, char** argv) {
         if (a == "-reset-cycles") { opt.resetCycles = (int)std::max<long long>(1, num("a number of cycles")); continue; }
         if (a == "-depth") { opt.depth = (int)num("a number of cycles"); continue; }
         if (a == "-bmc") { opt.bmcOnly = true; continue; }
+        if (a == "-no-pdr") { opt.noPdr = true; continue; }
         if (a == "-prop") { opt.only.push_back(next("a property name")); continue; }
         if (a == "-threads") { opt.threads = (int)num("a number of threads"); continue; }
         if (a == "-conflicts") { opt.conflicts = num("a number of conflicts"); continue; }
@@ -1940,6 +2258,7 @@ int main(int argc, char** argv) {
             }
         }
         m.build();
+        addLiveness(m);
     } catch (const std::exception& ex) {
         std::cerr << "mformal: " << ex.what() << "\n";
         return 2;
@@ -1983,12 +2302,6 @@ int main(int argc, char** argv) {
         if (!p.skipped.empty()) { r.v = V_SKIPPED; r.note = p.skipped; return; }
         if (p.dir == AD_ASSUME) { r.v = V_ASSUMED; return; }
         r = checkProperty(m, p, constraints);
-        if (p.liveness && r.v == V_PROVEN) {
-            r.v = V_BOUNDED;
-            safetyOnly[todo[j]] = 1;
-            r.bound = opt.depth;
-            r.note = "the safety part is proven; the liveness part (a strong or unbounded eventuality) is not checked";
-        }
     });
     // What induction alone could not prove: again, with everything proven so
     // far as lemmas, until a round proves nothing new.
@@ -2009,14 +2322,49 @@ int main(int argc, char** argv) {
             Result& r = results[open[j]];
             again[j].seconds += r.seconds;
             r = again[j];
-            r.note = "induction with " + std::to_string(lemmas.size()) + (lemmas.size() == 1 ? " lemma" : " lemmas") + ", k=" + std::to_string(r.depth + 1);
-            if (m.props[open[j]].liveness) {
-                r.v = V_BOUNDED;
-                safetyOnly[open[j]] = 1;
-                r.bound = opt.depth;
-                r.note = "the safety part is proven; the liveness part (a strong or unbounded eventuality) is not checked";
-            }
+            r.note = "induction with lemmas, k=" + std::to_string(r.depth + 1);
         }
+    }
+    // What is still open: PDR, which finds the invariant a proof needs. When it
+    // finds a failure deeper than -depth instead, a bounded check that deep gives the trace.
+    if (!opt.bmcOnly && !opt.noPdr) {
+        std::vector<int> lemmas;
+        std::vector<size_t> open;
+        for (size_t i : todo) {
+            const Result& r = results[i];
+            if ((r.v == V_PROVEN || r.v == V_UNREACHABLE || safetyOnly[i]) && m.props[i].bad != 0) lemmas.push_back(m.props[i].bad);
+            if (r.v == V_BOUNDED && !safetyOnly[i]) open.push_back(i);
+        }
+        std::vector<Result> again(open.size());
+        parallel(open.size(), [&](size_t j) {
+            const Property& p = m.props[open[j]];
+            Result pr = checkPdr(m, p, constraints, lemmas);
+            if (pr.v == V_BOUNDED && pr.depth >= 0) {
+                Result br = checkProperty(m, p, constraints, nullptr, pr.depth + 1);
+                br.seconds += pr.seconds;
+                pr = br;
+            }
+            again[j] = pr;
+        });
+        for (size_t j = 0; j < open.size(); j++) {
+            Result& r = results[open[j]];
+            if (again[j].v == V_BOUNDED && again[j].depth < 0 && again[j].inputs.empty()) { r.seconds += again[j].seconds; continue; }
+            again[j].seconds += r.seconds;
+            if (again[j].v == V_BOUNDED) again[j].bound = std::max(again[j].bound, r.bound);
+            r = again[j];
+        }
+    }
+    // a liveness counterexample: where its loop starts
+    for (size_t i : todo) {
+        Result& r = results[i];
+        const Property& p = m.props[i];
+        if (r.v != V_FALSIFIED || p.live == 0) continue;
+        auto val = replay(m, r);
+        auto at = [&](size_t f, int l) { return (val[f][(size_t)(l >> 1)] ^ (l & 1)) != 0; };
+        if (!at(val.size() - 1, p.live)) continue;
+        int rc = m.hasReset ? opt.resetCycles : 0;
+        for (size_t f = 0; f + 1 < val.size(); f++)
+            if (!at(f, p.saved) && at(f + 1, p.saved)) r.note = "liveness: from here the design can repeat cycles " + std::to_string((int)f - rc) + " to " + std::to_string(r.depth - 1) + " forever";
     }
     // traces, in property order
     if (!opt.noTrace) {
@@ -2047,7 +2395,7 @@ int main(int argc, char** argv) {
     for (size_t i : todo) nameW = std::max(nameW, m.props[i].name.size());
     if (!opt.quiet) {
         std::cout << "mformal: clock " << (m.clockSig >= 0 ? m.sigs[(size_t)m.clockSig].name : std::string("(none)"));
-        if (m.resetNode >= 0) std::cout << ", reset " << opt.reset << (opt.resetLow ? " (active low" : " (active high") << ", " << opt.resetCycles << (opt.resetCycles == 1 ? " cycle)" : " cycles)");
+        if (m.hasReset) std::cout << ", reset " << opt.reset << (opt.resetLow ? " (active low" : " (active high") << ", " << opt.resetCycles << (opt.resetCycles == 1 ? " cycle)" : " cycles)");
         else std::cout << ", no reset";
         int ands = 0;
         for (auto& nd : m.g.n) ands += nd[0] >= 0;
@@ -2067,6 +2415,7 @@ int main(int argc, char** argv) {
             case V_FALSIFIED: case V_COVERED:
                 std::cout << "  at cycle " << r.depth;
                 if (!r.trace.empty()) std::cout << "  " << r.trace;
+                if (!r.note.empty()) std::cout << "  (" << r.note << ")";
                 break;
             case V_BOUNDED:
                 std::cout << "  no " << (p.dir == AD_COVER ? "hit" : "counterexample") << " in " << r.bound << " cycles";
@@ -2096,7 +2445,7 @@ int main(int argc, char** argv) {
     if (!opt.json.empty()) {
         std::ofstream js(opt.json);
         js << "{\n  \"tool\": \"mformal\",\n  \"version\": " << jsonStr(MINISIM_VERSION) << ",\n  \"clock\": "
-           << jsonStr(m.clockSig >= 0 ? m.sigs[(size_t)m.clockSig].name : "") << ",\n  \"reset\": " << jsonStr(m.resetNode >= 0 ? opt.reset : "")
+           << jsonStr(m.clockSig >= 0 ? m.sigs[(size_t)m.clockSig].name : "") << ",\n  \"reset\": " << jsonStr(m.hasReset ? opt.reset : "")
            << ",\n  \"depth\": " << opt.depth << ",\n  \"state_bits\": " << m.stateBits.size() << ",\n  \"properties\": [\n";
         for (size_t k = 0; k < todo.size(); k++) {
             const Property& p = m.props[todo[k]];
