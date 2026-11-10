@@ -30,6 +30,8 @@ static void usage() {
     "  -clock NAME   name of the clock input added for AIGER latches (default: clk)\n"
     "  -cuts N       cuts kept per node, 2..16 (default: 8)\n"
     "  -threads N    worker threads (default: every logical core; the output does not depend on N)\n"
+    "  -nocarry      adders and comparators as LUTs, not carry chains\n"
+    "  -noce         clock enables and synchronous resets stay in the D logic\n"
     "  -verify       simulate the mapped netlist against the input on random patterns\n"
     "  -q            no report\n";
 }
@@ -39,7 +41,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> files, slang_args;
   fpga::MapOptions mo;
   int K = 0;
-  bool verify = false, quiet = false;
+  bool verify = false, quiet = false, carry = true, ce = true;
   try {
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -58,6 +60,8 @@ int main(int argc, char** argv) {
       else if (a == "-cuts") mo.cuts = std::stoi(val());
       else if (a == "-threads") mo.threads = std::stoi(val());
       else if (a == "-verify") verify = true;
+      else if (a == "-nocarry") carry = false;
+      else if (a == "-noce") ce = false;
       else if (a == "-q") quiet = true;
       else if (a == "-D" || a == "-I" || a == "-G") { slang_args.push_back(a); slang_args.push_back(val()); }
       else if (a.rfind("+define+", 0) == 0) slang_args.push_back("-D" + a.substr(8));
@@ -103,7 +107,11 @@ int main(int argc, char** argv) {
     }
     size_t raw_ands = 0;
     for (auto& nd : des.g.nodes) raw_ands += nd.k == aig::NK::And;
-    fpga::Aig g = fpga::from_design(des, init, fpga::family_invert(fam, init));
+    fpga::FrontOptions fo = fpga::family_front(fam);
+    fo.carry = fo.carry && carry;
+    fo.enable = fo.enable && ce;
+    fo.sync_reset = fo.sync_reset && ce;
+    fpga::Aig g = fpga::from_design(des, init, fpga::family_invert(fam, init), fo);
     auto t1 = clk::now();
     fpga::Mapped m = fpga::map_luts(g, mo);
     auto t2 = clk::now();
@@ -124,10 +132,15 @@ int main(int argc, char** argv) {
     if (!quiet) {
       auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
       size_t hist[fpga::kMaxK + 1] = {};
+      uint32_t box_outs = 0;   // chain outputs are inputs of the graph, not of the design
+      for (auto& bx : g.boxes) bx.for_each_out([&](uint32_t) { ++box_outs; });
       for (auto& l : m.luts) hist[l.n]++;
       printf("design   %s: %u inputs, %zu flops, %zu ANDs (%zu after cleanup)\n", g.top.c_str(),
-             g.nin, g.flops.size(), raw_ands, g.ands.size());
+             g.nin - box_outs, g.flops.size(), raw_ands, g.ands.size());
       printf("mapped   %s LUT%d: %zu LUTs, %zu flops, depth %u\n", family.c_str(), mo.K, n.luts, n.ffs, m.depth);
+      if (n.carry_bits || n.ffs_en || n.ffs_srst)
+        printf("         %zu carry chains (%zu bits), %zu flops with clock enable, %zu with synchronous reset\n",
+               g.boxes.size(), n.carry_bits, n.ffs_en, n.ffs_srst);
       printf("by size ");
       for (int k = 1; k <= mo.K; ++k) printf(" LUT%d %zu", k, hist[k]);
       printf("\n");

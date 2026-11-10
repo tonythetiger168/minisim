@@ -47,3 +47,15 @@ module FDPE #(parameter [0:0] INIT = 0, IS_C_INVERTED = 0) (input C, CE, D, PRE,
   wire clk = C ^ IS_C_INVERTED;
   always @(posedge clk or posedge PRE) if (PRE) Q <= 1; else if (CE) Q <= D;
 endmodule
+module FDSE #(parameter [0:0] INIT = 1, IS_C_INVERTED = 0) (input C, CE, D, S, output reg Q = INIT);
+  wire clk = C ^ IS_C_INVERTED;
+  always @(posedge clk) if (S) Q <= 1; else if (CE) Q <= D;
+endmodule
+module CARRY4 (input CI, CYINIT, input [3:0] DI, S, output [3:0] O, CO);
+  wire c0 = CI | CYINIT;
+  assign CO[0] = S[0] ? c0 : DI[0];
+  assign CO[1] = S[1] ? CO[0] : DI[1];
+  assign CO[2] = S[2] ? CO[1] : DI[2];
+  assign CO[3] = S[3] ? CO[2] : DI[3];
+  assign O = S ^ {CO[2:0], c0};
+endmodule

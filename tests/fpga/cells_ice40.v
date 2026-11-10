@@ -20,3 +20,19 @@ endmodule
 module SB_DFFNS (input C, D, S, output reg Q = 0);
   always @(negedge C or posedge S) if (S) Q <= 1; else Q <= D;
 endmodule
+// The enable gates the synchronous reset too (SB_DFFESR), as in the vendor's models.
+module SB_DFFE (input C, D, E, output reg Q = 0); always @(posedge C) if (E) Q <= D; endmodule
+module SB_DFFER (input C, D, E, R, output reg Q = 0); always @(posedge C or posedge R) if (R) Q <= 0; else if (E) Q <= D; endmodule
+module SB_DFFSR (input C, D, R, output reg Q = 0); always @(posedge C) if (R) Q <= 0; else Q <= D; endmodule
+module SB_DFFESR (input C, D, E, R, output reg Q = 0); always @(posedge C) if (E) begin if (R) Q <= 0; else Q <= D; end endmodule
+module SB_DFFES (input C, D, E, S, output reg Q = 0); always @(posedge C or posedge S) if (S) Q <= 1; else if (E) Q <= D; endmodule
+module SB_DFFSS (input C, D, S, output reg Q = 0); always @(posedge C) if (S) Q <= 1; else Q <= D; endmodule
+module SB_DFFESS (input C, D, E, S, output reg Q = 0); always @(posedge C) if (E) begin if (S) Q <= 1; else Q <= D; end endmodule
+module SB_DFFNE (input C, D, E, output reg Q = 0); always @(negedge C) if (E) Q <= D; endmodule
+module SB_DFFNER (input C, D, E, R, output reg Q = 0); always @(negedge C or posedge R) if (R) Q <= 0; else if (E) Q <= D; endmodule
+module SB_DFFNSR (input C, D, R, output reg Q = 0); always @(negedge C) if (R) Q <= 0; else Q <= D; endmodule
+module SB_DFFNESR (input C, D, E, R, output reg Q = 0); always @(negedge C) if (E) begin if (R) Q <= 0; else Q <= D; end endmodule
+module SB_DFFNES (input C, D, E, S, output reg Q = 0); always @(negedge C or posedge S) if (S) Q <= 1; else if (E) Q <= D; endmodule
+module SB_DFFNSS (input C, D, S, output reg Q = 0); always @(negedge C) if (S) Q <= 1; else Q <= D; endmodule
+module SB_DFFNESS (input C, D, E, S, output reg Q = 0); always @(negedge C) if (E) begin if (S) Q <= 1; else Q <= D; end endmodule
+module SB_CARRY (input CI, I0, I1, output CO); assign CO = (I0 & I1) | ((I0 | I1) & CI); endmodule

@@ -33,6 +33,8 @@ cuts and an exact-area pass so it scales to large designs.
 | `-clock NAME` | AIGER input: name of the clock port added for the latches (default `clk`) |
 | `-cuts N` | cuts kept per node, 2 to 16 (default 8). More cuts: slightly fewer LUTs, more time |
 | `-threads N` | worker threads. Default: every logical core. The output does not depend on N |
+| `-nocarry` | adders, subtractors and comparators as LUTs, not carry chains |
+| `-noce` | clock enables and synchronous resets stay in the D logic |
 | `-verify` | simulate the mapped netlist against the graph on random patterns |
 | `-q` | no report |
 
@@ -40,10 +42,10 @@ cuts and an exact-area pass so it scales to large designs.
 
 | Family | LUT | Flip-flops | Other |
 |---|---|---|---|
-| `generic` | `$lut` (`WIDTH`, `LUT`) | `$_DFF_P_`, `$_DFF_N_`, `$_DFF_PP0_`, ... (Yosys gate cells); power-up value as the net's `init` attribute | |
-| `ice40` | `SB_LUT4` | `SB_DFF`, `SB_DFFR`, `SB_DFFS` and the `SB_DFFN*` falling-edge ones | |
-| `ecp5` | `LUT4` | `TRELLIS_FF` (`REGSET`, `SRMODE=ASYNC` for an asynchronous reset, `CLKMUX=INV` for the falling edge) | |
-| `xc7` | `LUT1` to `LUT6` | `FDRE`, `FDCE`, `FDPE` (`INIT`, `IS_C_INVERTED`) | `IBUF` and `OBUF` on every port |
+| `generic` | `$lut` (`WIDTH`, `LUT`) | `$_DFF_P_`, `$_DFF_PP0_`, `$_DFFE_PP_`, `$_DFFE_PP0P_`, `$_SDFF_PP0_`, `$_SDFFE_PP0P_`, ... (Yosys gate cells); power-up value as the net's `init` attribute | no carry cells |
+| `ice40` | `SB_LUT4` | `SB_DFF` with `E` (enable), `R`/`S` (asynchronous) or `SR`/`SS` (synchronous) reset, and the `SB_DFFN*` falling-edge ones | `SB_CARRY`, one per bit, beside the `SB_LUT4` of the sum |
+| `ecp5` | `LUT4` | `TRELLIS_FF` (`REGSET`, `SRMODE=ASYNC` or `LSR_OVER_CE`, `CEMUX=CE` with an enable, `CLKMUX=INV` for the falling edge) | `CCU2C`, two bits each |
+| `xc7` | `LUT1` to `LUT6` | `FDRE`, `FDSE`, `FDCE`, `FDPE` with `CE` (`INIT`, `IS_C_INVERTED`) | `CARRY4`, four bits each; `IBUF` and `OBUF` on every port |
 
 Inverters cost nothing: they are folded into LUT tables. An iCE40 flop always
 powers up 0, so a flop that must power up 1 is mapped inverted (D, Q and reset
@@ -65,6 +67,39 @@ value inverted). In EDIF, constants come from `GND` (pin `G`) and `VCC` (pin
 5. Truth tables are computed, inputs a function ignores are removed, and the
    cells of the family are written.
 
+## Carry chains, clock enables and synchronous resets
+
+The elaborator records every `+`, `-` and `<` of the RTL with its operand and
+result bits (`aig::Design::ops`, shared with `msynth`). For a family with
+carry cells, `mfpga` cuts each one of three bits or more out of the graph and
+writes the family's chain instead; `-`, `<`, `<=`, `>` and `>=` are `a + ~b + 1`
+and its carry out, signed compares flip the two sign bits. The LUT mapper sees
+a chain as a box: its operands are roots like outputs, its sum bits arrive one
+level after the latest operand. ECP5 and 7-series chains invert `b` inside for
+a subtraction; iCE40's `SB_CARRY` cannot, so there `~b` costs a LUT per bit
+unless the driving LUT absorbs it. A chain nothing reads, or one in a
+combinational loop with its own operands, goes back to LUTs.
+
+A register that holds its value (`if (en) q <= d`, also through nested
+`if`/`else`) gets the condition on the flop's enable pin, and a reset shared
+by three or more flops (`if (rst) q <= 0`) on its synchronous set/reset pin,
+so neither costs a LUT input. Reset over enable and enable over reset are
+both recognized; where the family's flop has the other priority (iCE40's
+enable gates its reset) one shared gate fixes it.
+
+A 64-bit registered adder with a compare, placed and routed by nextpnr:
+
+| | LUTs | Fmax |
+|---|---|---|
+| iCE40 HX8K, carry chains | 129 (64 are the chain's sum LUTs) | 74 MHz |
+| iCE40 HX8K, `-nocarry` | 430 | 112 MHz |
+| iCE40 HX8K, Yosys `synth_ice40` | 310 logic cells with the flops | 80 MHz |
+| ECP5-85F, carry chains | 1 + 66 `CCU2C` | 179 MHz |
+| ECP5-85F, `-nocarry` | 430 | 125 MHz |
+
+A chain is always the smaller choice. On iCE40 a long ripple is slower than
+the LUT tree, as it is for Yosys; `-nocarry` trades area for that speed.
+
 ## Speed
 
 A 128x128 multiplier (166,252 AND nodes) on a 4-core machine, LUT6: 32,344
@@ -75,8 +110,9 @@ on four, with byte-identical output. On a 32x32 multiplier the LUT count is
 
 ## Checks
 
-`tests/fpga/run_test.py` maps the designs `msynth` is tested with for every
-family, and for each one:
+`tests/fpga/run_test.py` maps the designs `msynth` is tested with, and a
+datapath with synchronous reset, enable, add/subtract and signed and unsigned
+compares (`tests/fpga/dp.sv`), for every family, and for each one:
 
 - `-verify` simulates the netlist against the graph on random patterns;
 - one and four threads must write the same bytes;
@@ -85,17 +121,22 @@ family, and for each one:
   both must print the same lines;
 - with Yosys installed, the JSON netlist on the vendor's own simulation
   models is proven equal to the RTL by a bounded SAT check that shares no code
-  with `mfpga` (the counter; Yosys 0.33 cannot read the other designs);
+  with `mfpga` (the counter and the datapath; Yosys 0.33 cannot read the
+  other designs). This is what checks the carry cells and flop pins against
+  the vendors' models;
 - with nextpnr installed, the iCE40 and ECP5 netlists are placed and routed.
 
 CI installs Yosys and nextpnr.
 
 ## Limits
 
-- LUTs and flip-flops only. Adders become LUTs, not carry chains; multipliers
-  become LUTs, not DSP blocks; memories become flops, not block RAM. These need
-  the word-level operator table the elaborator will record, and come next.
-- No clock enable or synchronous reset pins yet: both are in the D logic.
+- Multipliers become LUTs, not DSP blocks; memories become flops, not block
+  RAM. DSP mapping comes next; block RAM needs the memory table the
+  elaborator will record.
+- Chains are not split or sped up (carry-select, carry-lookahead) by timing,
+  and an adder is not merged with a mux or an AND in front of it into the
+  chain's LUTs.
+- AIGER input has no word operators, so it maps to LUTs and flops only.
 - The `xc7` netlist is checked by simulation and by Yosys equivalence on its
   JSON form. The EDIF itself has not been through a Vivado run.
 - A flop's power-up value is known for AIGER input only; the elaborator does

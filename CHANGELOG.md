@@ -290,6 +290,9 @@ Spec references are IEEE 1800-2023 clauses.
   `src/aig.hpp`, and writes Yosys JSON for nextpnr, EDIF or Verilog.
   Depth-optimal priority-cut mapping with area recovery; multithreaded, with
   the same output for any `-threads N`. See `docs/FPGA.md`.
+- `mfpga`: adders, subtractors and comparators map to the family's carry
+  chain (`SB_CARRY`, `CCU2C`, `CARRY4`), and clock enables and synchronous
+  resets to flop pins. `-nocarry` and `-noce` turn each off.
 
 ### Fixed
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes
