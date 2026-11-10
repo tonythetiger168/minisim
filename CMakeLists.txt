@@ -189,8 +189,6 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
-  # Tools on the slang front end: one file each in cmake/tools.
-  include(cmake/tools/msynth.cmake)
 
   # Source-level debug: drivers, loads, active-driver trace, viewer: mdebug design.sv
   add_executable(mdebug src/mdebug.cpp)
