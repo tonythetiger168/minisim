@@ -15,7 +15,10 @@
 // (related_pin, timing_sense, timing_type, when, the NLDM tables cell_rise,
 // cell_fall, rise_transition, fall_transition, rise_constraint,
 // fall_constraint), internal_power and leakage_power groups, wire_load,
-// test_cell pins (signal_type). Pin functions parse to an expression tree
+// test_cell pins (signal_type), operating_conditions, voltage_map, the
+// voltage / current / resistance / leakage units and the slew and delay
+// thresholds. write() turns a Group tree back into Liberty source.
+// Pin functions parse to an expression tree
 // (parseFunction, Expr::eval, Expr::truthTable). CCS and noise groups are
 // parsed (they stay in the Group tree) but not modeled.
 #pragma once
@@ -609,6 +612,78 @@ struct Cell {
     }
 };
 
+// ------------------------------------------------------------------ writer
+
+namespace detail {
+// A value is written bare when it is a number or a plain name, and in
+// quotes otherwise ("1ns", "!A", "0.1, 0.2").
+inline bool bareValue(const std::string& v) {
+    if (v.empty()) return false;
+    char* e = nullptr;
+    std::strtod(v.c_str(), &e);
+    if (e && *e == 0 && e != v.c_str()) return true;
+    if (!(isalpha((unsigned char)v[0]) || v[0] == '_')) return false;
+    for (char c : v)
+        if (!(isalnum((unsigned char)c) || c == '_')) return false;
+    return true;
+}
+inline std::string quoted(const std::string& v) { return bareValue(v) ? v : "\"" + v + "\""; }
+
+inline void writeGroup(std::string& out, const Group& g, int depth) {
+    std::string ind((size_t)depth * 2, ' ');
+    out += ind + g.type + " (";
+    for (size_t i = 0; i < g.names.size(); i++) out += (i ? ", " : "") + quoted(g.names[i]);
+    out += ") {\n";
+    std::string in = ind + "  ";
+    for (auto& a : g.attrs) {
+        if (!a.complex) {
+            out += in + a.name + " : " + quoted(a.vals.empty() ? "" : a.vals[0]) + ";\n";
+            continue;
+        }
+        out += in + a.name + " (";
+        // A table's rows go one to a line.
+        bool rows = a.vals.size() > 1 && a.vals[0].find(',') != std::string::npos;
+        std::string pad(in.size() + a.name.size() + 2, ' ');
+        for (size_t i = 0; i < a.vals.size(); i++) {
+            if (i) out += rows ? ", \\\n" + pad : ", ";
+            out += quoted(a.vals[i]);
+        }
+        out += ");\n";
+    }
+    for (auto& k : g.groups) writeGroup(out, k, depth + 1);
+    out += ind + "}\n";
+}
+}  // namespace detail
+
+// Writes a group tree back as Liberty source. parse(write(g)) gives the same
+// tree as g: every group, attribute and value, in the same order. Comments
+// and the original spacing and quoting are not kept.
+inline std::string write(const Group& g) {
+    std::string out;
+    detail::writeGroup(out, g, 0);
+    return out;
+}
+
+// True when two trees hold the same groups, attributes and values in the
+// same order (line numbers aside).
+inline bool sameTree(const Group& a, const Group& b) {
+    if (a.type != b.type || a.names != b.names || a.attrs.size() != b.attrs.size() || a.groups.size() != b.groups.size())
+        return false;
+    for (size_t i = 0; i < a.attrs.size(); i++)
+        if (a.attrs[i].name != b.attrs[i].name || a.attrs[i].complex != b.attrs[i].complex || a.attrs[i].vals != b.attrs[i].vals)
+            return false;
+    for (size_t i = 0; i < a.groups.size(); i++)
+        if (!sameTree(a.groups[i], b.groups[i])) return false;
+    return true;
+}
+
+// One operating_conditions group: process, voltage (V after voltageScale)
+// and temperature (C).
+struct OperatingConditions {
+    std::string name;
+    double process = 1, voltage = 0, temperature = 25;
+};
+
 struct Library {
     std::string name, file;
     double timeScale = 1;  // multiply a library time by this to get ns
@@ -616,6 +691,55 @@ struct Library {
     double defaultMaxTransition = -1;
     double nomVoltage = 0, nomTemperature = 0;
     std::string leakagePowerUnit, defaultWireLoad;
+    // Units other than time and capacitance: multiply a library value by
+    // the scale to get volts, mA, kohm or nW. The unit strings are as written.
+    std::string voltageUnit, currentUnit, resistanceUnit;
+    double voltageScale = 1, currentScale = 1, resistanceScale = 1, leakageScale = 1;
+    double nomProcess = 1;
+    std::vector<OperatingConditions> operatingConditions;
+    std::string defaultOperatingConditions;
+    std::map<std::string, double> voltageMap;   // voltage_map (VDD, 1.1): supply name -> volts
+    // Measurement thresholds, in percent of the supply (Liberty's defaults).
+    double slewLowerRise = 20, slewUpperRise = 80, slewLowerFall = 20, slewUpperFall = 80;
+    double inputThresholdRise = 50, inputThresholdFall = 50, outputThresholdRise = 50, outputThresholdFall = 50;
+    double slewDerate = 1;   // slew_derate_from_library
+
+    const OperatingConditions* conditions(const std::string& n) const {
+        for (auto& o : operatingConditions) if (o.name == n) return &o;
+        return nullptr;
+    }
+    // The default_operating_conditions group, else the first one, else null.
+    const OperatingConditions* conditions() const {
+        if (auto* o = conditions(defaultOperatingConditions)) return o;
+        return operatingConditions.empty() ? nullptr : &operatingConditions[0];
+    }
+    // "1V", "10mV", "1mA", "1kohm", "1nW": the number times the SI prefix,
+    // relative to `base` (the prefix the scale is expressed in: 1 for V,
+    // 1e-3 for mA, 1e3 for kohm, 1e-9 for nW).
+    static double unitScale(const std::string& s, double base) {
+        char* e = nullptr;
+        double v = std::strtod(s.c_str(), &e);
+        if (e == s.c_str() || v == 0) v = 1;
+        while (*e && isspace((unsigned char)*e)) e++;
+        double p = 1;
+        std::string u = e;
+        // "mV" and "MV" differ, so the prefix is case-sensitive; "ohm" has none.
+        std::string low = u;
+        for (auto& c : low) c = (char)tolower((unsigned char)c);
+        if (low.rfind("ohm", 0) != 0 && u.size() > 1) {
+            switch (u[0]) {
+                case 'f': p = 1e-15; break;
+                case 'p': p = 1e-12; break;
+                case 'n': p = 1e-9; break;
+                case 'u': p = 1e-6; break;
+                case 'm': p = 1e-3; break;
+                case 'k': case 'K': p = 1e3; break;
+                case 'M': p = 1e6; break;
+                default: break;
+            }
+        }
+        return v * p / base;
+    }
     std::vector<WireLoad> wireLoads;
     std::vector<Cell> cells;
     std::map<std::string, size_t> byName;
@@ -661,6 +785,36 @@ struct Library {
             L.defaultMaxTransition = r.num("default_max_transition", -1) * L.timeScale;
 
         L.leakagePowerUnit = r.str("leakage_power_unit");
+        L.voltageUnit = r.str("voltage_unit");
+        L.currentUnit = r.str("current_unit");
+        L.resistanceUnit = r.str("pulling_resistance_unit");
+        if (!L.voltageUnit.empty()) L.voltageScale = unitScale(L.voltageUnit, 1);
+        if (!L.currentUnit.empty()) L.currentScale = unitScale(L.currentUnit, 1e-3);
+        if (!L.resistanceUnit.empty()) L.resistanceScale = unitScale(L.resistanceUnit, 1e3);
+        if (!L.leakagePowerUnit.empty()) L.leakageScale = unitScale(L.leakagePowerUnit, 1e-9);
+        L.nomVoltage *= L.voltageScale;
+        L.nomProcess = r.num("nom_process", 1);
+        for (auto* og : r.all("operating_conditions")) {
+            OperatingConditions o;
+            o.name = og->name();
+            o.process = og->num("process", 1);
+            o.voltage = og->num("voltage", 0) * L.voltageScale;
+            o.temperature = og->num("temperature", 25);
+            L.operatingConditions.push_back(o);
+        }
+        L.defaultOperatingConditions = r.str("default_operating_conditions");
+        for (auto& a : r.attrs)
+            if (a.name == "voltage_map" && a.complex && a.vals.size() >= 2)
+                L.voltageMap[a.vals[0]] = std::atof(a.vals[1].c_str()) * L.voltageScale;
+        L.slewLowerRise = r.num("slew_lower_threshold_pct_rise", 20);
+        L.slewUpperRise = r.num("slew_upper_threshold_pct_rise", 80);
+        L.slewLowerFall = r.num("slew_lower_threshold_pct_fall", 20);
+        L.slewUpperFall = r.num("slew_upper_threshold_pct_fall", 80);
+        L.inputThresholdRise = r.num("input_threshold_pct_rise", 50);
+        L.inputThresholdFall = r.num("input_threshold_pct_fall", 50);
+        L.outputThresholdRise = r.num("output_threshold_pct_rise", 50);
+        L.outputThresholdFall = r.num("output_threshold_pct_fall", 50);
+        L.slewDerate = r.num("slew_derate_from_library", 1);
         L.defaultWireLoad = r.str("default_wire_load");
         for (auto* wg : r.all("wire_load")) {
             WireLoad w;
