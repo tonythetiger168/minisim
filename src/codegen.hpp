@@ -369,6 +369,7 @@ public:
                  "        uint64_t k = R.size();\n"
                  "        std::fwrite(&k, 8, 1, f); std::fwrite(R.data(), 8, k, f); std::fwrite(F.data(), 8, k, f);\n"
                  "    }\n"
+                 "    { std::ofstream fc(std::string(path) + \".fcov\"); writeFuncCov(fc); }   // covergroups, assertions\n"
                  "    return std::fclose(f) == 0;\n"
                  "}\n\n";
         o << "int main(int argc, char** argv) {\n"
@@ -1020,7 +1021,12 @@ private:
                 for (auto& in : procs[i].prog->code) {
                     if (in.k != IK::Assign) break;
                     if (in.sig < 0 || (size_t)in.sig >= ns) continue;
-                    if (in.drv >= 0 && in.hi < 0 && sigs[in.sig].drivers == 1 && in.s0 != STR_HIZ && in.s1 != STR_HIZ)
+                    // The one driver of a net, or (drv < 0) the continuous assign msim
+                    // merged into a plain write (mergePartialDrivers).
+                    bool whole = in.hi < 0 && !in.arr && in.aidx.empty() && !in.bidx;
+                    if (whole && in.drv >= 0 && sigs[in.sig].drivers == 1 && in.s0 != STR_HIZ && in.s1 != STR_HIZ)
+                        cand[in.sig] = 1;
+                    else if (whole && in.drv < 0 && sigs[in.sig].drivers == 0 && oneAssign(*procs[i].prog) && !cand[in.sig])
                         cand[in.sig] = 1;
                     else bad[in.sig] = 1;
                 }
