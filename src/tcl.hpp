@@ -171,6 +171,9 @@ public:
     std::function<bool(const std::vector<std::string>&, std::string& result)> onUnknown;
     // Where the command being run is, for a host command's own messages.
     Loc where() const { return Loc{file_, line_}; }
+    // When set, [3], [7:0] and [*] are kept as text (a bus index in a name)
+    // instead of being run as a command. The netlist formats turn this on.
+    bool busBrackets = false;
     // Set by the exit / quit command; parse() and shell() stop there.
     bool exited = false;
     int exitCode = 0;
@@ -397,13 +400,19 @@ protected:
         if (q >= s.size()) fail("missing close-bracket");
         std::string inner = s.substr(p + 1, q - p - 1);
         p = q + 1;
+        // A bus index, as in get_ports data[3] or q_reg[*]: the netlist tools
+        // read it as part of the name, not as a command.
+        if (busBrackets && !inner.empty() && inner.find_first_not_of("0123456789*:") == std::string::npos) {
+            out += "[" + inner + "]";
+            return;
+        }
         int savedLine = line_;
         out += eval(inner, startLine, /*nested*/ true);
         line_ = savedLine;
     }
 
     // One command's words from s at p. False at the end of the script.
-    bool nextCommand(const std::string& s, size_t& p, int& line, std::vector<std::string>& words, int& cmdLine) {
+    bool nextCommand(const std::string& s, size_t& p, int& line, std::vector<std::string>& words, int& cmdLine, size_t& startP) {
         words.clear();
         size_t n = s.size();
         for (;;) {  // blank lines, separators and comments
@@ -422,6 +431,7 @@ protected:
         }
         if (p >= n) return false;
         cmdLine = line;
+        startP = p;
         line_ = line;
         while (p < n) {
             while (p < n && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r')) p++;
@@ -517,8 +527,11 @@ protected:
         if (++depth_ > 200) { depth_--; fail("too many nested evaluations"); }
         struct Pop { int& d; ~Pop() { d--; } } pop{depth_};
         for (;;) {
+            bool parsed = false;
+            size_t start = p;
             try {
-                if (!nextCommand(script, p, line, words, cmdLine)) break;
+                if (!nextCommand(script, p, line, words, cmdLine, start)) break;
+                parsed = true;
                 if (words.empty()) continue;
                 line_ = cmdLine;
                 result = run(words);
@@ -526,7 +539,12 @@ protected:
                 // Inside [ ] the error belongs to the command around it.
                 if (nested) throw;
                 diag(Diag::ErrorSev, "syntax", Loc{file_, cmdLine}, e.what());
-                if (p < script.size() && words.empty()) resync(script, p, line);
+                // The command did not parse to its end: skip the rest of it.
+                if (!parsed) {
+                    line = cmdLine;
+                    p = start;
+                    resync(script, p, line);
+                }
                 result.clear();
             }
         }

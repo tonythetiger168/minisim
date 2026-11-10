@@ -37,6 +37,16 @@ int main() {
         t.onUnknown = [](const std::vector<std::string>& w, std::string& res) { res = "handled " + w[0]; return w[0] == "legacy"; };
         assert(t.parse("legacy x") == "handled legacy" && t.diags.empty());
     }
+    // A command that does not parse is skipped whole, and reported once.
+    {
+        Interp t;
+        t.parse("set a [expr 1 +\nset b 2\nset c {open\n", "e.tcl");
+        assert(t.diags.size() == 2 && t.diags[0].loc.line == 1 && t.diags[1].loc.line == 3);
+        // Bus indexes are text when the format asks for it.
+        Interp u;
+        u.busBrackets = true;
+        assert(u.parse("set x d[3]/q[*] ; set y [expr 1+2]") == "3" && *u.get("x") == "d[3]/q[*]");
+    }
     // complete(): what a prompt needs to know before it runs a line.
     {
         assert(Interp::complete("set a 1\n"));
