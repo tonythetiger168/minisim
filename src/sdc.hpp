@@ -272,6 +272,11 @@ public:
     unsigned threads = par::defaultThreads();
     Reader() { busBrackets = true; }  // get_ports data[3] needs no braces
 
+    // Call when the design behind `design` has changed (elaborated again,
+    // cells added or renamed): the name indexes are built again on next use.
+    // Collections made before the change keep the objects they held.
+    void designChanged() { index_.clear(); }
+
     // The objects behind a word: collection handles and bare names.
     ObjList objects(const std::string& word, const std::string& kinds = "kpicn") {
         return toObjs(word, kinds, here(), false);
