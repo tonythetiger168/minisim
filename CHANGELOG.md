@@ -69,6 +69,12 @@ Spec references are IEEE 1800-2023 clauses.
   SAT on all cores, with a counterexample for each failing point. X in the
   reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
   `-report`. See `docs/EQUIV.md`.
+- `mpnr`, place and route for gate-level netlists: an automatic floorplan or
+  one from a DEF (`-floorplan`), analytic global placement, Abacus
+  legalization, refinement and filler cells, a negotiated-congestion detailed
+  router on the LEF track grid, and DEF out with a built-in check for opens,
+  shorts and spacing (`-check FILE.def` checks any routed DEF). Multithreaded
+  with identical results for any `-threads`. See `docs/PNR.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
