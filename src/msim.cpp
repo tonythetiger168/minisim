@@ -291,6 +291,7 @@ struct Plan {
     std::vector<std::vector<int>> outs;             // comb process outputs
     std::vector<char> seq;
     std::vector<std::vector<std::pair<int, Edge>>> ev;
+    bool cyclic = false;   // some comb processes feed each other: no single forward sweep
 };
 // A wire or variable whose drivers are all strong continuous assigns to
 // fixed, disjoint bit ranges that cover it (assign w = ..., or assign w[k]
@@ -360,7 +361,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
             if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
-        std::vector<size_t> order = combSchedule(shapes, &lv);
+        std::vector<size_t> order = combSchedule(shapes, &lv, &p.cyclic);
         for (size_t r = 0; r < order.size(); r++) {
             size_t i = procOf[order[r]];
             p.rank[i] = (int)r;
@@ -416,6 +417,24 @@ static bool readCompiledCov(const std::string& path, const std::vector<std::pair
         S.togFall[s].resize(w);
         ok = rd(S.togRise[s].data(), w) && rd(S.togFall[s].data(), w);
     }
+    // condition counters, then per FSM its states and transitions
+    uint64_t nc = 0, nfsm = 0;
+    ok = ok && rd(&nc, 1) && nc == g_condHits.size();
+    for (size_t k = 0; ok && k < nc; k++) {
+        uint64_t c = 0;
+        ok = rd(&c, 1);
+        g_condHits[k] += c;
+    }
+    ok = ok && rd(&nfsm, 1) && nfsm == S.fsmSigs.size();
+    for (size_t k = 0; ok && k < nfsm; k++) {
+        uint64_t a = 0, b = 0, r[3];
+        ok = rd(&a, 1);
+        for (uint64_t j = 0; ok && j < a; j++)
+            if ((ok = rd(r, 2))) S.fsmSeen[k][r[0]] += r[1];
+        ok = ok && rd(&b, 1);
+        for (uint64_t j = 0; ok && j < b; j++)
+            if ((ok = rd(r, 3))) S.fsmTrans[k][{r[0], r[1]}] += r[2];
+    }
     std::fclose(f);
     return ok;
 }
@@ -436,7 +455,12 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         procs.push_back(std::move(c));
     }
     CodegenParts parts;
-    parts.on = staticPart;
+    bool combAssert = false;   // a deferred report is queued by one thread
+    for (size_t i = 0; i < lowered.procs.size(); i++)
+        if (pl.rank[i] >= 0)
+            for (auto& in : lowered.procs[i].prog.code) combAssert |= in.k == IK::Assert;
+    parts.on = staticPart && !combAssert && !pl.cyclic;
+    cycle = cycle && !pl.cyclic;   // the domain evaluates every comb statement once, in rank order
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
     std::vector<std::pair<const Prog*, size_t>> covSlots;
@@ -681,6 +705,59 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         f << (first ? "\n  " : ",\n  ") << "[" << jstr(top + "." + g.name) << ", " << g.w << ", \"" << hex(R, g.w) << "\", \"" << hex(F, g.w) << "\"]";
         first = false;
     }
+    // Conditions (a && b, a || b, the condition of ?:): per source position,
+    // the hits of each vector, summed over the instances of the module.
+    struct CondSum { const CondDef* d; std::vector<uint64_t> hits; };
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, std::string>, CondSum> conds;
+    for (auto& d : condDefs()) {
+        auto& c = conds[{d.file, d.line, d.col, d.text}];
+        if (!c.d) { c.d = &d; c.hits.assign(d.terms.size() + 1, 0); }
+        if (c.d->terms.size() != d.terms.size()) continue;
+        for (size_t k = 0; k <= d.terms.size(); k++) c.hits[k] += g_condHits[d.base + k];
+    }
+    f << "\n ],\n \"conditions\": [";
+    first = true;
+    for (auto& [key, c] : conds) {
+        f << (first ? "\n  " : ",\n  ") << "[" << c.d->file << ", " << c.d->line << ", " << c.d->col << ", "
+          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? "\"||\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
+        for (size_t k = 0; k < c.d->terms.size(); k++) f << (k ? ", " : "") << jstr(c.d->terms[k]);
+        f << "], [";
+        for (size_t k = 0; k < c.hits.size(); k++) f << (k ? ", " : "") << c.hits[k];
+        f << "]]";
+        first = false;
+    }
+    // FSMs: per state register, its states and transitions with their hits;
+    // "extra" lists changes seen that the next-state logic does not show.
+    S.fsmFinish();
+    f << "\n ],\n \"fsms\": [";
+    first = true;
+    for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++) {
+        const FsmDef& d = fsmDefs()[k];
+        const auto& seen = S.fsmSeen[k];
+        auto trans = S.fsmTrans[k];
+        f << (first ? "\n  " : ",\n  ") << "{\"module\": " << jstr(d.module) << ", \"inst\": " << jstr(d.inst) << ", \"name\": "
+          << jstr(d.name) << ", \"file\": " << d.file << ", \"line\": " << d.line << ", \"width\": " << d.w << ",\n   \"states\": [";
+        for (size_t j = 0; j < d.states.size(); j++) {
+            auto it = seen.find(d.states[j].first);
+            f << (j ? ", " : "") << "[" << d.states[j].first << ", " << jstr(d.states[j].second) << ", "
+              << (it == seen.end() ? 0 : it->second) << "]";
+        }
+        f << "],\n   \"trans\": [";
+        for (size_t j = 0; j < d.trans.size(); j++) {
+            auto it = trans.find({d.trans[j].from, d.trans[j].to});
+            f << (j ? ", " : "") << "[" << d.trans[j].from << ", " << d.trans[j].to << ", " << (it == trans.end() ? 0 : it->second)
+              << ", " << (d.trans[j].reset ? 1 : 0) << "]";
+            if (it != trans.end()) trans.erase(it);
+        }
+        f << "],\n   \"extra\": [";
+        bool f2 = true;
+        for (auto& [t, c] : trans) {
+            f << (f2 ? "" : ", ") << "[" << t.first << ", " << t.second << ", " << c << "]";
+            f2 = false;
+        }
+        f << "]}";
+        first = false;
+    }
     f << "\n ],\n";
     // Functional coverage: covergroup bins and assertion statistics. A
     // compiled run's simv wrote them next to its counters.
@@ -771,7 +848,8 @@ static void usage() {
                  "  +pulse_r/<n> +pulse_e/<n>  pulse reject / error limits as n% of path delays\n"
                  "  +pulse_on_event / +pulse_on_detect, +showcancelled / +noshowcancelled  pulse styles\n"
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
-                 "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
+                 "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
+                 "                 see mcov. -cm <metrics> (as VCS) does the same\n"
                  "  -maxtime <n>   stop after simulation time n\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
                  "                 and reuses <dir>/simv while the design is unchanged\n"
@@ -782,6 +860,9 @@ static void usage() {
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
               << protfront::Options::help() <<
+                 "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
+                 "                 merges the branches instead of picking one (docs/XPROP.md)\n"
+                 "  -xprop-report <file>  list every if / case / edge and whether it is merged\n"
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  -upf_verbose   print supply, power state and simstate changes\n"
@@ -817,6 +898,7 @@ int main(int argc, char** argv) {
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     protfront::Options prot;
     std::string upfPath, powerTop;
+    std::string xpropReport;
     bool powerTopSet = false, upfVerbose = false;
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
@@ -841,6 +923,11 @@ int main(int argc, char** argv) {
         if (a == "-no-partition") { staticPart = false; continue; }
         if (a == "-no-2state") { twoState = false; continue; }
         if (a == "-no-cycle") { cycle = false; continue; }
+        if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
+        if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
+        if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }
+        if (a.rfind("-xprop=", 0) == 0) { std::cerr << "msim: bad " << a << " (tmerge, xmerge or off)\n"; return 2; }
+        if (a == "-xprop-report") { xpropReport = next("a file name"); continue; }
         if (a == "-no-pin") { g_pin = 0; continue; }
         if (a == "-pin") { g_pin = 1; continue; }
         if (a == "-cpuinfo") {
@@ -920,6 +1007,11 @@ int main(int argc, char** argv) {
         if (a == "-cov") {
             g_cov = true;
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
+            continue;
+        }
+        if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
+            g_cov = true;
+            ++i;
             continue;
         }
         // -vcd x.fst writes FST too: the file name picks the format.
@@ -1146,6 +1238,21 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (g_cov) {   // FSM coverage: the kernel records the state registers' values
+        std::vector<int> watch;
+        for (auto& d : fsmDefs()) watch.push_back(d.sig);
+        S.fsmWatch(watch);
+    }
+    if (!xpropReport.empty()) {   // -xprop-report: what is merged, what is not and why
+        std::ofstream f(xpropReport);
+        if (!f) { std::cerr << "msim: cannot write " << xpropReport << "\n"; return 1; }
+        size_t ok = 0;
+        for (auto& r : Lowerer::xpReport()) ok += r.ok;
+        f << "xprop " << (Lowerer::xpropMode() == 2 ? "xmerge" : Lowerer::xpropMode() == 1 ? "tmerge" : "off") << ": "
+          << ok << " of " << Lowerer::xpReport().size() << " if / case / edge constructs merged\n";
+        for (auto& r : Lowerer::xpReport())
+            f << r.where << r.what << (r.ok ? ": merged" : ": not merged, it holds " + r.why) << "\n";
+    }
     if (!upfPath.empty()) {   // power-aware simulation (IEEE 1801-2024 9)
         auto& rt = upfrt::rt();
         rt.verbose = upfVerbose;
@@ -1336,6 +1443,8 @@ int main(int argc, char** argv) {
     for (int i : byRank) {
         if (i < 0) continue;
         const Prog* pr = &lowered.procs[i].prog;
+        for (auto& in : pr->code)
+            if (in.k == IK::Assert && !pr->combCtl) pr->combCtl = std::make_shared<ProcCtl>();
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
@@ -1368,7 +1477,7 @@ int main(int argc, char** argv) {
     if (startSdf()) return 1;   // SDF timing first, so the checks start with the annotated limits
     startTimingChecks();
     if (!pathRecs().empty() || !S.icDelay.empty() || !S.shadowOf.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
-    if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
+    if (!S.shadows.empty() || !asserts().empty() || !clockings().empty() || pl.cyclic) staticPart = false;
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;

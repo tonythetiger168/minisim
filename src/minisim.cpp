@@ -56,7 +56,7 @@ using Handle = coroutine_handle<>;
 #ifdef MINISIM_FST
 #include "fstapi.h"
 #endif
-struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; uint8_t fl = 0; };  // fl: SF_HELD / SF_LISTEN (force, 10.6)  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
+struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; uint8_t fl = 0; uint8_t p0 = 2; uint64_t at = ~0ULL; };  // p0, at: bit 0 before the last change and its time (msim -xprop edges)  // fl: SF_HELD / SF_LISTEN (force, 10.6)  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
 struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
@@ -886,6 +886,9 @@ struct Sim {
     // A wire (`net`) starts as Z, including before the first drive().
     // A variable (reg/logic) starts as X. The flag is stored so the VCD
     // header can emit `$var wire` or `$var reg`.
+    // msim -xprop (SF_XPROP_EDGE): set() keeps each signal's bit 0 from
+    // before its last change and the time of that change (Sig::p0, at).
+    bool edgeTrack = false;
     int sig(const string& n, int w, bool net = false) {
         self = this;
         // An unpacked array element is named "m[3]". The VCD leaves memories
@@ -899,6 +902,7 @@ struct Sim {
         size_t dot = n.rfind('.');
         bool elem = n.find('[', dot == string::npos ? 0 : dot + 1) != string::npos;
         sigs.push_back({n, w, init, {}, net, elem || n.find('$') != string::npos});
+        if (n.starts_with("_xp$")) edgeTrack = true;   // a temporary of msim -xprop: the design asks about edges
         waiters.emplace_back();
         return (int)sigs.size() - 1;
     }
@@ -2194,7 +2198,36 @@ struct Sim {
     // Toggle coverage (msim -cov): per signal, the bits seen rising 0->1 and
     // falling 1->0 (X and Z do not count), one 64-bit word per 64 bits.
     vector<vector<uint64_t>> togRise, togFall;
+    // FSM coverage (msim -cov): for each watched state register, how often
+    // it entered each value and made each change. A signal is written by one
+    // thread at a time, so its two maps need no lock.
+    vector<int> fsmSigs, fsmOf;   // watched signals; signal -> index in fsmSigs, or -1
+    vector<std::map<uint64_t, uint64_t>> fsmSeen;
+    vector<std::map<std::pair<uint64_t, uint64_t>, uint64_t>> fsmTrans;
+    void fsmWatch(const vector<int>& watch) {
+        fsmSigs = watch;
+        fsmOf.assign(sigs.size(), -1);
+        for (size_t i = 0; i < watch.size(); i++) fsmOf[watch[i]] = (int)i;
+        fsmSeen.assign(watch.size(), {});
+        fsmTrans.assign(watch.size(), {});
+    }
+    void covFsm(int f, const Val& o, const Val& n) {
+        if (n.x | n.z) return;
+        if (!(o.x | o.z)) {
+            fsmSeen[f].try_emplace(o.v, 1);   // the value it started with
+            fsmTrans[f][{o.v, n.v}]++;
+        }
+        fsmSeen[f][n.v]++;
+    }
+    // A register that never changed is in the state it started in.
+    void fsmFinish() {
+        for (size_t f = 0; f < fsmSigs.size(); f++) {
+            const Val& v = sigs[fsmSigs[f]].val;
+            if (fsmSeen[f].empty() && !(v.x | v.z)) fsmSeen[f][v.v] = 1;
+        }
+    }
     void covToggle(int s, const Val& o, const Val& n) {
+        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0) covFsm(fsmOf[s], o, n);
         if (togRise.size() <= (size_t)s) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
         int w = sigs[s].w;
         auto& R = togRise[s];
@@ -2250,6 +2283,7 @@ struct Sim {
             g.val = nv;
         }
         if (__builtin_expect(!pathIn.empty(), 0) && (size_t)s < pathIn.size() && pathIn[s]) lastChg[s] = now;
+        if (__builtin_expect(edgeTrack, 0)) { g.p0 = (uint8_t)o; g.at = now; }   // msim -xprop
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
         if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)
@@ -2485,6 +2519,20 @@ struct Sim {
 };
 
 inline Sim S;
+// msim -xprop (SF_XPROP_EDGE): how signal s changed in this time step, seen
+// as a posedge (or negedge). With `level` the process tests the signal's
+// level, as for an asynchronous reset: once the level is known it does not
+// matter whether the edge happened, so x -> active is a certain edge.
+inline int edgeClassNow(int s, bool neg, bool level) {
+    if (s < 0 || (size_t)s >= S.sigs.size()) return 0;
+    const Sig& g = S.sigs[s];
+    if (g.at != S.now) return 0;
+    int o = g.p0, n = Sim::bit0(g.val), from = neg ? 1 : 0, to = 1 - from;
+    if (level) return n == to && o != to ? 1 : o == from && n == 2 ? 2 : 0;
+    if (o == from && n == to) return 1;
+    return (o == 2 && n == to) || (o == from && n == 2) ? 2 : 0;
+}
+inline const bool g_edgeClassSet = (g_edgeClass = edgeClassNow, true);
 inline void Sim::closeHook(uint32_t fd) { S.fileClosed(fd); }
 
 // Frames and objects (expr.hpp): blocks of hidden signals made at run time.

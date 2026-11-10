@@ -1,5 +1,6 @@
 # mchar: cell library characterization on mspice (docs/CHAR.md). Reads and
 # writes Liberty with src/liberty.hpp, simulates with src/spice.hpp.
+include_guard(GLOBAL)
 find_package(Threads REQUIRED)
 add_executable(mchar src/mchar.cpp)
 target_include_directories(mchar PRIVATE src)
