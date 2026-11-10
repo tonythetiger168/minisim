@@ -147,6 +147,67 @@ library (u) {
             "cell_rise (t) { values (\"1, 2\"); } } } } }", "e.lib"), "e.lib");
     } catch (liberty::Error& e) { threw = std::string(e.what()).find("table has 2 values") != std::string::npos; }
     assert(threw);
+    // Writer: the text parses back to the same tree, for the whole test
+    // library and for the awkward values (quotes, expressions, bus bits,
+    // multi-row tables, empty argument lists).
+    {
+        liberty::Library W = liberty::load(argv[1]);
+        std::string text = liberty::write(*W.root);
+        liberty::Group back = liberty::parse(text, "written.lib");
+        assert(liberty::sameTree(*W.root, back));
+        assert(liberty::write(back) == text);
+        liberty::Library W2 = liberty::Library::load(back, "written.lib");
+        assert(W2.cells.size() == W.cells.size());
+        for (size_t i = 0; i < W.cells.size(); i++)
+            assert(W2.cells[i].name == W.cells[i].name && W2.cells[i].arcs.size() == W.cells[i].arcs.size());
+
+        liberty::Group g = liberty::parse(
+            "library (w) {\n  time_unit : \"1ns\";\n  capacitive_load_unit (1, ff);\n  nom_voltage : 1.1;\n"
+            "  cell (\"A[1]\") {\n    pin (Y) { direction : output; function : \"!(A*B)\"; x_expr : 1.2 * VDD;\n"
+            "      timing () { related_pin : \"A\"; values (\"1, 2\", \\\n \"3, 4\"); index_1 (\"0.1, 0.2\"); }\n    }\n  }\n}\n");
+        std::string t = liberty::write(g);
+        assert(t.find("time_unit : \"1ns\";") != std::string::npos);
+        assert(t.find("capacitive_load_unit (1, ff);") != std::string::npos);
+        assert(t.find("nom_voltage : 1.1;") != std::string::npos);
+        assert(t.find("cell (\"A[1]\") {") != std::string::npos);
+        assert(t.find("direction : output;") != std::string::npos);
+        assert(t.find("function : \"!(A*B)\";") != std::string::npos);
+        assert(t.find("x_expr : \"1.2 * VDD\";") != std::string::npos);
+        assert(t.find("timing () {") != std::string::npos);
+        assert(t.find("values (\"1, 2\", \\\n") != std::string::npos);
+        assert(t.find("index_1 (\"0.1, 0.2\");") != std::string::npos);
+        assert(liberty::sameTree(g, liberty::parse(t)));
+        liberty::Group other = g;
+        other.groups[0].groups[0].attrs[1].vals[0] = "A*B";
+        assert(!liberty::sameTree(g, other));
+    }
+    // Units, operating conditions, supplies and thresholds.
+    {
+        liberty::Library O = liberty::Library::load(liberty::parse(
+            "library (o) {\n  voltage_unit : \"10mV\";\n  current_unit : \"1uA\";\n  pulling_resistance_unit : \"1ohm\";\n"
+            "  leakage_power_unit : \"1pW\";\n  nom_voltage : 110;\n  nom_process : 1.2;\n"
+            "  voltage_map (VDD, 110);\n  voltage_map (VSS, 0);\n"
+            "  operating_conditions (slow) { process : 1.2; voltage : 95; temperature : 125; }\n"
+            "  operating_conditions (fast) { process : 0.8; voltage : 125; temperature : -40; }\n"
+            "  default_operating_conditions : fast;\n"
+            "  slew_lower_threshold_pct_rise : 10;\n  slew_upper_threshold_pct_fall : 90;\n  input_threshold_pct_fall : 40;\n"
+            "  slew_derate_from_library : 0.5;\n}\n"), "o.lib");
+        assert(near(O.voltageScale, 0.01) && near(O.currentScale, 1e-3) && near(O.resistanceScale, 1e-3) && near(O.leakageScale, 1e-3));
+        assert(near(O.nomVoltage, 1.1) && near(O.nomProcess, 1.2));
+        assert(O.voltageMap.size() == 2 && near(O.voltageMap.at("VDD"), 1.1) && near(O.voltageMap.at("VSS"), 0));
+        assert(O.operatingConditions.size() == 2 && O.conditions("slow") && near(O.conditions("slow")->voltage, 0.95));
+        assert(near(O.conditions("slow")->temperature, 125) && near(O.conditions("slow")->process, 1.2));
+        assert(O.conditions() == O.conditions("fast") && near(O.conditions()->temperature, -40));
+        assert(O.conditions("none") == nullptr);
+        assert(near(O.slewLowerRise, 10) && near(O.slewUpperRise, 80) && near(O.slewLowerFall, 20) && near(O.slewUpperFall, 90));
+        assert(near(O.inputThresholdRise, 50) && near(O.inputThresholdFall, 40) && near(O.outputThresholdRise, 50));
+        assert(near(O.slewDerate, 0.5));
+        assert(near(liberty::Library::unitScale("1kohm", 1e3), 1) && near(liberty::Library::unitScale("1V", 1), 1));
+        assert(near(liberty::Library::unitScale("1mW", 1e-9), 1e6) && near(liberty::Library::unitScale("1nW", 1e-9), 1));
+        // Nothing given: defaults, and no conditions.
+        liberty::Library D = liberty::Library::load(liberty::parse("library (d) { }"), "d.lib");
+        assert(D.conditions() == nullptr && near(D.voltageScale, 1) && near(D.slewLowerRise, 20) && near(D.slewUpperFall, 80));
+    }
     std::puts("test_liberty: ok");
     return 0;
 }
