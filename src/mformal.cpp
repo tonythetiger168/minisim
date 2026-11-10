@@ -1666,7 +1666,8 @@ struct Unroll {
 // With `lemmas` (the fail literals of assertions already proven): the bounded
 // check has been done, so only the induction runs, with every lemma holding
 // in every frame.
-Result checkProperty(const Model& m, const Property& pr, const std::vector<int>& constraints, const std::vector<int>* lemmas = nullptr, int frames = -1) {
+Result checkProperty(const Model& m, const Property& pr, const std::vector<int>& constraints, const std::vector<int>* lemmas = nullptr, int frames = -1,
+                     bool lastFrameOnly = false) {
     auto t0 = std::chrono::steady_clock::now();
     Result r;
     std::vector<int> roots{pr.bad};
@@ -1704,7 +1705,8 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
         if (!lemmas)
             for (int cst : constraints) bmc.unit(-bmc.lit(k, cst));
         int res = 20;
-        if (!lemmas) {
+        // lastFrameOnly: PDR found a failure exactly frames - 1 steps deep, so the earlier frames need no call
+        if (!lemmas && !(lastFrameOnly && k < frames - 1)) {
             bmc.assume(bmc.lit(k, pr.bad));
             res = bmc.solve(m.opt.conflicts);
         }
@@ -2374,7 +2376,8 @@ int main(int argc, char** argv) {
             const Property& p = m.props[open[j]];
             Result pr = checkPdr(m, p, constraints, lemmas);
             if (pr.v == V_BOUNDED && pr.depth >= 0) {
-                Result br = checkProperty(m, p, constraints, nullptr, pr.depth + 1);
+                Result br = checkProperty(m, p, constraints, nullptr, pr.depth + 1, true);
+                if (br.v != V_FALSIFIED && br.v != V_COVERED) br = checkProperty(m, p, constraints, nullptr, pr.depth + 1);
                 br.seconds += pr.seconds;
                 pr = br;
             }
