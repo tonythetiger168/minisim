@@ -1,4 +1,4 @@
-// The SAT solver behind mequiv, against brute force and known-hard formulas.
+// The shared SAT interface (src/sat.hpp) and mequiv's encoding, against brute force and known-hard formulas.
 #include <cassert>
 #include <cstdio>
 #include <random>
@@ -6,9 +6,31 @@
 #include "equiv/aig.hpp"
 #include "equiv/bv.hpp"
 #include "equiv/cnf.hpp"
-#include "equiv/sat.hpp"
+#include "sat.hpp"
 
-using equiv::Sat;
+// The tests number variables from 0 and write literals as var*2+neg.
+struct Sat {
+    using L = uint32_t;
+    using Result = sat::Result;
+    static constexpr Result Unsat = sat::Unsat, SatResult = sat::Sat, Unknown = sat::Unknown;
+    static L mk(uint32_t v, bool negated = false) { return v * 2 + (negated ? 1 : 0); }
+    static int dimacs(L l) { return (l & 1) ? -int(l >> 1) - 1 : int(l >> 1) + 1; }
+    sat::Solver s;
+    uint32_t newVar() { return uint32_t(s.newVar() - 1); }
+    void addClause(const std::vector<L>& c) {
+        std::vector<int> d;
+        for (L l : c) d.push_back(dimacs(l));
+        s.addClause(d);
+    }
+    void addClause(L a, L b) { addClause(std::vector<L>{a, b}); }
+    Result solve(const std::vector<L>& assumptions, int64_t budget = -1) {
+        std::vector<int> d;
+        for (L l : assumptions) d.push_back(dimacs(l));
+        return s.solve(d, budget);
+    }
+    bool modelValue(uint32_t v) { return s.value(int(v) + 1); }
+    long long conflicts() const { return s.conflicts(); }
+};
 
 static bool brute(int n, const std::vector<std::vector<Sat::L>>& cls, uint32_t fixMask = 0, uint32_t fixVal = 0) {
     for (uint32_t m = 0; m < (1u << n); ++m) {
@@ -62,19 +84,27 @@ int main() {
     // restarts and clause deletion.
     {
         const int P = 8, H = 7;
-        Sat s;
-        for (int i = 0; i < P * H; ++i) s.newVar();
-        for (int p = 0; p < P; ++p) {
-            std::vector<Sat::L> c;
-            for (int h = 0; h < H; ++h) c.push_back(Sat::mk(p * H + h));
-            s.addClause(c);
-        }
-        for (int h = 0; h < H; ++h)
-            for (int p = 0; p < P; ++p)
-                for (int q = p + 1; q < P; ++q) s.addClause(Sat::mk(p * H + h, true), Sat::mk(q * H + h, true));
-        Sat t = s;
+        auto build = [&](Sat& s) {
+            for (int i = 0; i < P * H; ++i) s.newVar();
+            for (int p = 0; p < P; ++p) {
+                std::vector<Sat::L> c;
+                for (int h = 0; h < H; ++h) c.push_back(Sat::mk(p * H + h));
+                s.addClause(c);
+            }
+            for (int h = 0; h < H; ++h)
+                for (int p = 0; p < P; ++p)
+                    for (int q = p + 1; q < P; ++q) s.addClause(Sat::mk(p * H + h, true), Sat::mk(q * H + h, true));
+        };
+        Sat t, s;
+        build(t), build(s);
         assert(t.solve({}, 50) == Sat::Unknown);  // a budget is honoured
         assert(s.solve({}) == Sat::Unsat);
+        // An unsatisfiable set of assumptions names its culprits.
+        Sat u;
+        uint32_t x = u.newVar(), y = u.newVar(), z = u.newVar();
+        u.addClause(Sat::mk(x, true), Sat::mk(y, true));
+        assert(u.solve({Sat::mk(x), Sat::mk(y), Sat::mk(z)}) == Sat::Unsat);
+        assert(u.s.failed(1) && u.s.failed(2) && !u.s.failed(3));
         std::printf("pigeonhole 8/7: %llu conflicts\n", static_cast<unsigned long long>(s.conflicts()));
     }
     // Two 6-bit adders built differently are equal; break one and they are not.
