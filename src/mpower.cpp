@@ -55,6 +55,7 @@ void usage() {
                  "  -voltage <V>           supply voltage (default: the library's nom_voltage)\n"
                  "  -input_transition <ns> transition time at the primary inputs (0.05)\n"
                  "  -wire_cap <fF>         wire capacitance per fanout (default: the library's wire load, or 0)\n"
+                 "  -spef <file>           extracted wire capacitance per net (SPEF); other nets keep the estimate\n"
                  "  -upf <file>            IEEE 1801 power intent: per-domain power, voltages, switched domains\n"
                  "  -power_top <inst>      the instance the UPF is written for (default: the top)\n"
                  "  -peak                  time-based analysis: peak power (needs .vcd or .fst activity)\n"
@@ -105,6 +106,7 @@ int main(int argc, char** argv) {
         if (a == "-voltage") { o.voltage = std::atof(next("a voltage").c_str()); continue; }
         if (a == "-input_transition") { o.inSlew = std::atof(next("a time in ns").c_str()); continue; }
         if (a == "-wire_cap") { o.wireCap = std::atof(next("a capacitance in fF").c_str()); continue; }
+        if (a == "-spef") { o.spef = next("a SPEF file"); continue; }
         if (a == "-upf") { o.upfPath = next("a UPF file"); continue; }
         if (a == "-power_top") { o.powerTop = next("an instance path"); continue; }
         if (a == "-peak") { o.peak = true; continue; }

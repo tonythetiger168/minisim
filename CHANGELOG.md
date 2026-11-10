@@ -14,7 +14,8 @@ Spec references are IEEE 1800-2023 clauses.
   the file does not name (RTL activity on a gate netlist, or `-clock` with no
   activity); an RTL estimate (register bits as the library's flop, logic as
   reference gates); `-peak` with `-waveform` for power over time; `-upf` for
-  power per domain with domain voltages and switched domains; `-json`.
+  power per domain with domain voltages and switched domains; `-spef` for
+  extracted wire capacitance; `-json`.
   Multithreaded, with the same report on any thread count. `msim -saif`
   writes SAIF from a simulation, and `mpower -write_saif` converts a
   waveform. `src/saif.hpp` (SAIF reader and writer) and `src/power.hpp` (the
@@ -31,6 +32,14 @@ Spec references are IEEE 1800-2023 clauses.
   source, drivers and loads, schematic, waves with values annotated in the
   source). `-vcd` reads VCD and FST; the page traces the active driver at the
   cursor itself. See `docs/DEBUG.md`.
+- `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
+  1481) out. Per net a distributed RC network with capacitance to ground and
+  coupling capacitance to same-layer neighbours and to crossings, from an
+  ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
+  factors, decoupled output, per-net report, open and short checks
+  (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
+  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  See `docs/RCX.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from

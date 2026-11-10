@@ -45,6 +45,7 @@
 #include "lintir.hpp"
 #include "parallel.hpp"
 #include "saif.hpp"
+#include "spef.hpp"
 #include "upf.hpp"
 #include "version.hpp"
 #include "wave_reader.hpp"
@@ -368,7 +369,7 @@ struct SymRec {
 };
 
 struct Options {
-    std::string top, activity, strip, upfPath, powerTop, json, waveform, writeSaif, rtlFf, rtlGate, unit;
+    std::string top, activity, strip, upfPath, powerTop, json, waveform, writeSaif, rtlFf, rtlGate, unit, spef;
     std::vector<std::string> libs;
     std::vector<std::pair<std::string, double>> clocks;   // name, period in ns
     double voltage = 0, inSlew = 0.05, wireCap = -1, toggle = 0.1, interval = 0;
@@ -1835,6 +1836,41 @@ inline int analyze(Options& o, std::vector<std::string> fwd, unsigned threads, R
             if (o.wireCap >= 0) n.wire = o.wireCap * 1e-3 * n.fan;
             else if (wl) n.wire = wl->capacitance * wl->length(n.fan) * lib0.capScale;
             n.slew = o.inSlew;
+        }
+        // Extracted wires (SPEF): a net's total capacitance replaces the estimate.
+        if (!o.spef.empty()) {
+            spef::File sf;
+            try {
+                sf = spef::read(o.spef, (int)threads);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "mpower: %s\n", e.what());
+                return 1;
+            }
+            size_t hit = 0;
+            for (const spef::Net& sn : sf.nets) {
+                std::string nm = sn.name;
+                if (sf.h.divider != '.')
+                    for (char& c : nm)
+                        if (c == sf.h.divider) c = '.';
+                if (sf.h.busOpen != '[' || sf.h.busClose != ']')
+                    for (char& c : nm) {
+                        if (c == sf.h.busOpen) c = '[';
+                        else if (c == sf.h.busClose) c = ']';
+                    }
+                int n = findNet(nm);
+                if (n < 0) continue;
+                double c = sn.total;
+                if (c <= 0)
+                    for (const spef::Cap& k : sn.caps) c += k.c;
+                nets[(size_t)n].wire = c * sf.cScale * 1e12;
+                hit++;
+            }
+            d.notes.push_back("SPEF: " + std::to_string(hit) + " of " + std::to_string(sf.nets.size()) +
+                              " nets in " + o.spef + " matched the design");
+            if (!hit && !sf.nets.empty()) {
+                std::fprintf(stderr, "mpower: no net of %s is in the design\n", o.spef.c_str());
+                return 1;
+            }
         }
         for (int pass = 0; pass < 3; pass++) {
             std::vector<std::vector<std::pair<int, double>>> per(insts.size());

@@ -74,6 +74,10 @@ want("total power 3.785 uW (internal 3.474, switching 0.2965, leakage 0.01422)")
 # Wire capacitance per fanout: 1 fF on each of the 5 loaded nets' sinks.
 run_tool(${MPOWER} ${P}/gates.v -top dut -lib ${P}/pw.lib -saif ${P}/gates.saif -wire_cap 1 -q)
 want("switching 0.499,")
+# The same wires from a SPEF file (name map, pF units): the same answer.
+run_tool(${MPOWER} ${P}/gates.v -top dut -lib ${P}/pw.lib -saif ${P}/gates.saif -spef ${P}/gates.spef)
+want("switching 0.499,")
+want("SPEF: 5 of 5 nets")
 
 # 2. Simulate, and take the activity as VCD, as SAIF (msim -saif) and as FST: one answer.
 run_tool(${MSIM} ${P}/cells.v ${P}/gates.v ${P}/tb.sv -top tb -vcd ${OUT}/g.vcd)

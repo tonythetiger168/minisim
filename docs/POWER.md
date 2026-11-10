@@ -57,7 +57,9 @@ rate (toggles per second):
 
 - **Switching** `0.5 * C * V^2 * r` for each net, counted at the cell that
   drives it. C is the `capacitance` of every pin on the net plus the wire:
-  `-wire_cap <fF>` per fanout, else the library's `default_wire_load`, else 0.
+  the net's total capacitance in a `-spef` file (IEEE 1481, as `mrcx` writes
+  it), else `-wire_cap <fF>` per fanout, else the library's
+  `default_wire_load`, else 0.
 - **Internal**, from the `internal_power` tables. For an output pin: the
   energy of a rise and of a fall, looked up by input transition and output
   load, averaged over the groups by how often each is the cause (the toggle
@@ -143,6 +145,7 @@ netlist does not yet contain are not added.
 -clock <net> <ns>        a clock and its period, for nets without activity
 -default_toggle_rate <r> toggles per clock cycle where nothing else is known (0.1)
 -voltage <V>   -input_transition <ns>   -wire_cap <fF per fanout>
+-spef <file>            extracted wire capacitance (nets not in it keep the estimate)
 -upf <file>  -power_top <inst>
 -peak  -interval <ns>  -waveform <file.csv>
 -hier <n>                power per instance, n levels deep
@@ -189,8 +192,6 @@ gives T0, T1, TX and the toggle count). Waveforms come through
 
 ## Not yet
 
-- Wire capacitance from SPEF (the extraction tool's `src/spef.hpp`); today
-  it is `-wire_cap` or the library wire load.
 - SDC clocks (`create_clock`) for the clock network and vectorless rates.
 - Glitch power (SAIF `IG`), state-dependent path-dependent SAIF, and
   per-arc exact evaluation from the waveform instead of probabilities.
