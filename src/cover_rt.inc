@@ -923,3 +923,94 @@ inline void startCovergroups() {
     for (size_t d = 0; d < cgDefs().size(); d++)
         if (!cgDefs()[d].ev.empty() && !cgDefs()[d].inClass) S.spawn(cgProc((int)d));
 }
+
+// Functional coverage for the coverage database (msim -cov; mcov and mplan
+// read it): two JSON members, written after the code coverage sections.
+//   "covergroups": one entry per covergroup type that was instantiated,
+//     [type, weight, goal, [[item, "point" | "cross", weight, goal,
+//     at_least, bins in total, [[bin, hits], ...]], ...]]. The bins of all
+//     instances are joined by name, as merge_instances does (19.11.3). A
+//     coverpoint lists every counted bin; a cross lists the bins that were
+//     hit (its total says how many there are).
+//   "assertions": [name, "assert" | "assume" | "cover", evaluations,
+//     passes, failures] per assertion (16.3 statistics).
+// Covergroups and assertions declared in protected code (34) are left out,
+// unless its coverage right is on, as for line and branch coverage.
+inline void writeFuncCov(std::ostream& f) {
+    auto js = [](const std::string& x) {
+        std::string r = "\"";
+        for (char c : x) {
+            if (c == '"' || c == '\\') { r += '\\'; r += c; }
+            else if ((unsigned char)c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); r += b; }
+            else r += c;
+        }
+        return r + "\"";
+    };
+    f << " \"covergroups\": [";
+    bool firstG = true;
+    for (const CgDef& d : cgDefs()) {
+        if (d.insts.empty() || d.prot) continue;
+        const CgInst& first = cgInsts()[d.insts[0]];
+        f << (firstG ? "\n  " : ",\n  ") << "[" << js(d.name) << ", " << first.opt[CO_TYPE_WEIGHT] << ", "
+          << first.opt[CO_TYPE_GOAL] << ", [";
+        firstG = false;
+        int nc = (int)d.cps.size(), n = nc + (int)d.crosses.size();
+        for (int item = 0; item < n; item++) {
+            bool cross = item >= nc;
+            // Bins in declaration order; a name seen again in a later instance adds to it.
+            std::vector<std::pair<std::string, uint64_t>> bins;
+            std::unordered_map<std::string, size_t> at;
+            auto add = [&](const std::string& name, uint64_t hits) {
+                auto [it, fresh] = at.emplace(name, bins.size());
+                if (fresh) bins.push_back({name, hits});
+                else bins[it->second].second += hits;
+            };
+            int64_t al = 1;
+            for (int id : d.insts) {
+                const CgInst& in = cgInsts()[id];
+                if (!cross) {
+                    al = std::max(al, in.cpOpt[item][2]);
+                    for (auto& b : in.cps[item].bins)
+                        if (b.kind == 0 && !b.empty) add(b.name, b.hits);
+                } else {
+                    const CgCrossInst& x = in.crosses[item - nc];
+                    const CgCrossDef& xd = d.crosses[item - nc];
+                    al = std::max(al, in.crOpt[item - nc][2]);
+                    for (size_t t = 0; t < x.cls.size(); t++) {
+                        if (x.cls[t] != -1) continue;
+                        std::string name = "<";
+                        size_t r = t;
+                        std::vector<int> tuple(xd.cps.size());
+                        for (size_t j = xd.cps.size(); j-- > 0;) { tuple[j] = (int)(r % x.dims[j].size()); r /= x.dims[j].size(); }
+                        for (size_t j = 0; j < xd.cps.size(); j++)
+                            name += (j ? "," : "") + in.cps[xd.cps[j]].bins[x.dims[j][tuple[j]]].name;
+                        add(name + ">", x.autoHits[t]);
+                    }
+                    for (auto& u : x.ubins)
+                        if (u.kind == 0 && u.size) add(u.name, u.hits);
+                }
+            }
+            const auto& o = cross ? first.crOpt[item - nc] : first.cpOpt[item];
+            f << (item ? ",\n   " : "\n   ") << "[" << js(cross ? d.crosses[item - nc].name : d.cps[item].name) << ", "
+              << (cross ? "\"cross\"" : "\"point\"") << ", " << o[0] << ", " << o[1] << ", " << al << ", " << bins.size() << ", [";
+            bool firstB = true;
+            for (auto& [name, hits] : bins) {
+                if (cross && !hits) continue;
+                f << (firstB ? "" : ", ") << "[" << js(name) << ", " << hits << "]";
+                firstB = false;
+            }
+            f << "]]";
+        }
+        f << "]]";
+    }
+    f << "\n ],\n \"assertions\": [";
+    bool firstA = true;
+    for (const AssertInfo& a : asserts()) {
+        if (a.hidden || a.prot) continue;
+        f << (firstA ? "\n  " : ",\n  ") << "[" << js(a.name) << ", "
+          << (a.dir == AD_COVER ? "\"cover\"" : a.dir == AD_ASSUME ? "\"assume\"" : "\"assert\"") << ", "
+          << a.evals << ", " << a.passes << ", " << a.fails << "]";
+        firstA = false;
+    }
+    f << "\n ]";
+}

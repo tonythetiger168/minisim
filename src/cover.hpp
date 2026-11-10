@@ -91,6 +91,7 @@ struct CgCrossDef {
 };
 struct CgDef {
     std::string name;               // the covergroup type, e.g. top.cg
+    bool prot = false;              // declared in protected code (34): kept out of the coverage database
     std::vector<int> argSigs;       // constructor arguments: hidden signals
     std::vector<char> argRef;       // ref arguments: bound to a signal per instance
     std::vector<int> sampleSigs;    // `with function sample(...)` arguments

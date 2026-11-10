@@ -34,6 +34,7 @@ struct AssertInfo {
     bool passOn = true, failOn = true;   // PassOn/PassOff, FailOn/FailOff
     bool vacOn = true;                   // VacuousOff clears it, PassOn sets it
     bool hidden = false;                 // tracks a sequence's end points (16.13.6): not an assertion
+    bool prot = false;                   // declared in protected code (34): kept out of the coverage database
     uint64_t killGen = 0;                // Kill: pending deferred reports and attempts made before it die
     // Deferred assertions (16.4): the action subroutine call as a process,
     // and the argument expressions captured when the assertion is evaluated.
