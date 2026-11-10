@@ -347,6 +347,24 @@ msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 
+### Portable stimulus: `mpss`
+
+`mpss` reads a test model in the Accellera PSS language, solves scenarios
+from it, and writes each one as a UVM sequence and as a C test function, so
+the same test runs in simulation and on the processor:
+
+```sh
+mpss examples/pss/dma.pss -n 20 -seed 1 -print      # show the solved scenarios
+mpss examples/pss/dma.pss -n 20 -sv dma_tests_pkg.sv -c dma_tests.c
+msim -uvm dma_tests_pkg.sv my_tb.sv -top top        # run the sequences
+```
+
+It picks the random fields, gives each action a free resource instance, and
+adds the actions a scenario needs but the test did not name (the write
+before a read). Scenarios are solved on all cores, and the output is the
+same for every `-threads` value. `docs/MPSS.md` has the supported subset of
+the language and the shape of the generated code.
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per

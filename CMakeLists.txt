@@ -46,6 +46,19 @@ if(Python3_FOUND)
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
 
+# Portable stimulus (Accellera PSS): mpss model.pss -n 20 -sv seqs.sv -c tests.c
+# No dependencies. The test builds and runs the generated C when a C compiler
+# is found; the slang build below also runs the generated UVM under msim.
+add_executable(mpss src/mpss.cpp)
+target_include_directories(mpss PRIVATE src)
+find_package(Threads REQUIRED)
+target_link_libraries(mpss PRIVATE Threads::Threads)
+find_program(MPSS_CC NAMES cc gcc clang)
+add_test(NAME mpss
+         COMMAND ${CMAKE_COMMAND} -DMPSS=$<TARGET_FILE:mpss> -DSRC=${CMAKE_SOURCE_DIR}
+                 -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mpss_test -DCC=${MPSS_CC}
+                 -P ${CMAKE_SOURCE_DIR}/tests/mpss.cmake)
+
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
 # default is off; -DSLANG_USE_MIMALLOC=ON still overrides it.
@@ -238,6 +251,13 @@ if(MINISIM_WITH_SLANG)
                        -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
       set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
     endforeach()
+    # mpss: the generated sequences under msim -uvm print what the C tests print.
+    add_test(NAME mpss_uvm
+             COMMAND ${CMAKE_COMMAND} -DMPSS=$<TARGET_FILE:mpss> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mpss_uvm_test -DCC=${MPSS_CC}
+                     -DMSIM=$<TARGET_FILE:msim> -DUVM_HOME=${UVM_HOME}
+                     -P ${CMAKE_SOURCE_DIR}/tests/mpss.cmake)
+    set_tests_properties(mpss_uvm PROPERTIES LABELS "uvm")
   endif()
 
   add_test(NAME mlint
@@ -276,7 +296,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minisim mpss RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -299,7 +319,7 @@ install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisi
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/MPSS.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)

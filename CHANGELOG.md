@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpss`, portable stimulus: reads a model in the Accellera PSS language
+  (components, actions, buffers, streams, resources and pools, constraints,
+  activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
+  and functions), solves scenarios (field values, resource instances, and
+  the actions inferred to feed unbound inputs), and writes each scenario as
+  a UVM sequence class (`-sv`, runs under `msim -uvm`) and as a C test
+  function (`-c`), plus `-print` and `-json`. Scenarios are solved on all
+  cores (`-threads N`) with the same output for every thread count. See
+  `docs/MPSS.md` and `examples/pss/dma.pss`.
+- `src/interval.hpp`: the interval arithmetic of the `randomize()` solver,
+  moved out of `rand.inc` so that `mpss` uses the same rules.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
