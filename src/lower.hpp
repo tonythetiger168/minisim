@@ -2849,11 +2849,13 @@ struct Lowerer {
         bool andOp = top.kind == ExpressionKind::BinaryOp && top.as<BinaryExpression>().op == BinaryOperator::LogicalAnd;
         bool orOp = top.kind == ExpressionKind::BinaryOp && top.as<BinaryExpression>().op == BinaryOperator::LogicalOr;
         if (&top != &e && (andOp || orOp)) return nullptr;   // c of c ? a : b is itself a && b: covered as that
-        if (e.getConstant() || sideEffects(e)) return nullptr;
+        if (e.getConstant()) return nullptr;
         std::vector<const Expression*> terms;
+        // (a && f()) && b: the inner && is lowered as jumps (lazyExpr), so it stays one term
         auto flat = [&](auto&& self, const Expression& x) -> void {
             if (x.kind == ExpressionKind::BinaryOp && (andOp || orOp) &&
-                x.as<BinaryExpression>().op == (andOp ? BinaryOperator::LogicalAnd : BinaryOperator::LogicalOr)) {
+                x.as<BinaryExpression>().op == (andOp ? BinaryOperator::LogicalAnd : BinaryOperator::LogicalOr) &&
+                !sideEffects(x.as<BinaryExpression>().right())) {
                 self(self, x.as<BinaryExpression>().left());
                 self(self, x.as<BinaryExpression>().right());
             } else terms.push_back(&x);
@@ -2868,12 +2870,18 @@ struct Lowerer {
             kids.push_back(expr(*t));
             pure = pure && condPure(kids.back());
         }
-        if (!pure) {   // as written: the terms in order, with && and || skipping
-            E acc = kids[0];
-            if (terms.size() == 1) return acc;
-            for (size_t i = 1; i < kids.size(); i++) acc = bin(andOp ? Op::LogAnd : Op::LogOr, acc, kids[i]);
-            return acc;
-        }
+        // A term that is not safe to evaluate when && or || would skip it:
+        // the terms in order, and the vectors of condCovLazyEnd.
+        bool lazy = !pure && terms.size() > 1;
+        std::vector<std::string> texts;
+        for (const Expression* t : terms) texts.push_back(condText(*t));
+        auto n = node(Op::CondCov, std::move(kids));
+        n->hi = (int)condDef(e, orOp, lazy, std::move(texts));
+        n->lo = (orOp ? 1 : 0) | (lazy ? 2 : 0);
+        return n;
+    }
+    // Registers a condition; returns the index of its first counter.
+    size_t condDef(const slang::ast::Expression& e, bool orOp, bool lazy, std::vector<std::string> terms) {
         CondDef d;
         auto loc = e.sourceRange.start();
         if (loc.valid()) {
@@ -2883,15 +2891,13 @@ struct Lowerer {
             d.col = (uint32_t)covSM()->getColumnNumber(ol);
         }
         d.isOr = orOp;
+        d.lazy = lazy;
         d.text = condText(e);
-        for (const Expression* t : terms) d.terms.push_back(condText(*t));
+        d.terms = std::move(terms);
         d.base = g_condHits.size();
-        g_condHits.resize(d.base + terms.size() + 1, 0);
-        auto n = node(Op::CondCov, std::move(kids));
-        n->hi = (int)d.base;
-        n->lo = orOp ? 1 : 0;
+        g_condHits.resize(d.base + d.terms.size() + 1, 0);
         condDefs().push_back(std::move(d));
-        return n;
+        return condDefs().back().base;
     }
     E lazyExpr(const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
@@ -2903,7 +2909,8 @@ struct Lowerer {
             needWidth(w);
             bool sg = ctx.live ? ctx.tag : e.type->isSigned();
             int tmp = fresh(w);
-            Instr j; j.k = IK::JmpIfNot; j.e = expr(*c.conditions[0].expr);
+            Instr j; j.k = IK::JmpIfNot; j.e = condCovExpr(*c.conditions[0].expr);
+            if (!j.e) j.e = expr(*c.conditions[0].expr);
             size_t jf = prog.emit(j);
             Instr a; a.k = IK::Assign; a.sig = tmp; a.e = lowerAs(c.left(), *e.type, ctx); prog.emit(a);
             size_t je = emitJmp();
@@ -2922,11 +2929,27 @@ struct Lowerer {
             };
             int tmp = fresh(1);
             Instr l; l.k = IK::Assign; l.sig = tmp; l.e = truthE(b.left()); prog.emit(l);
+            // Condition coverage: the left term is kept, and after the right
+            // one ran (or was skipped) the pair is counted as a lazy
+            // condition of (left, result), which has the same vectors.
+            bool cover = g_cov && condCov && condCovOff == 0 && covSM() && b.left().type->isIntegral() &&
+                         b.right().type->isIntegral() && !isHandleType(*b.left().type) && !isHandleType(*b.right().type);
+            int left = -1;
+            if (cover) {
+                left = fresh(1);
+                Instr s; s.k = IK::Assign; s.sig = left; s.e = ref(tmp); prog.emit(s);
+            }
             Instr j; j.k = IK::JmpIfNot; j.e = andOp ? ref(tmp) : un(Op::LogNot, ref(tmp));
             size_t jf = prog.emit(j);
             Instr r; r.k = IK::Assign; r.sig = tmp; r.e = bin(andOp ? Op::LogAnd : Op::LogOr, ref(tmp), truthE(b.right()));
             prog.emit(r);
             prog.code[jf].target = prog.here();
+            if (cover) {
+                auto n = node(Op::CondCov, {ref(left), ref(tmp)});
+                n->hi = (int)condDef(e, orOp, true, {condText(b.left()), condText(b.right())});
+                n->lo = (orOp ? 1 : 0) | 2;
+                Instr c; c.k = IK::Assign; c.sig = tmp; c.e = n; prog.emit(c);
+            }
             return sized(ref(tmp), 1, false, ctx);
         }
         return nullptr;

@@ -12,9 +12,14 @@
 // taken as a reset: its transitions are marked so mcov can filter them
 // (VCS -cm_fsmresetfilter).
 //
-// Anything else (a state computed by arithmetic, a one-hot register tested
-// bit by bit, a register written by a task or a part select) is not an FSM
-// here, and is left to line, branch and toggle coverage.
+// A one-hot register tested bit by bit is followed too: case (1'b1) with
+// items V[K], if (V[K]), and next-state logic that clears the vector and
+// sets one bit (N = '0; ... N[K] = 1'b1). Its states are the values 1 << K,
+// named after the index.
+//
+// Anything else (a state computed by arithmetic, a register written by a
+// task or a part select) is not an FSM here, and is left to line, branch and
+// toggle coverage.
 struct FsmExtractor {
     using Sym = const slang::ast::Symbol*;
     struct AV {   // an abstract next value
@@ -93,7 +98,7 @@ struct FsmExtractor {
     };
     struct WriteInfo {
         std::set<int> blocks;
-        bool partial = false, other = false;   // a part of it is written; written outside a procedure
+        bool other = false;   // written outside a procedure
     };
     std::vector<Block> blocks;
     std::unordered_map<Sym, WriteInfo> written;
@@ -143,7 +148,6 @@ struct FsmExtractor {
                 auto [it, fresh] = x.written.try_emplace(s);
                 if (fresh) x.order.push_back(s);
                 it->second.blocks.insert(id);
-                if (!whole) it->second.partial = true;
             }
         }
     };
@@ -156,7 +160,32 @@ struct FsmExtractor {
         bool resets;   // T is V in its clocked procedure: a constant under an if is a reset
         std::map<uint64_t, std::string>& names;
         int ifDepth = 0, splitDepth = 0;
-        bool split = false, bad = false;
+        bool split = false, bad = false, onehot = false;
+
+        // e is X[K] with a constant K: the value with only that bit set.
+        std::optional<uint64_t> bitOf(const slang::ast::Expression& e, Sym x) {
+            using namespace slang::ast;
+            const Expression& s = Lowerer::peel(e);
+            if (s.kind != ExpressionKind::ElementSelect) return std::nullopt;
+            const auto& es = s.as<ElementSelectExpression>();
+            if (symOf(es.value()) != x || !es.value().type->isIntegral() || !es.value().type->hasFixedRange()) return std::nullopt;
+            slang::ConstantValue cv;
+            if (const auto* c = es.selector().getConstant()) cv = *c;
+            else {
+                EvalContext ec(ASTContext(*scope, LookupLocation::max));
+                cv = es.selector().eval(ec);
+            }
+            if (!cv.isInteger() || cv.integer().hasUnknown()) return std::nullopt;
+            auto idx = cv.integer().as<int32_t>();
+            auto range = es.value().type->getFixedRange();
+            if (!idx || !range.containsPoint(*idx)) return std::nullopt;
+            int bit = range.isDescending() ? *idx - range.lower() : range.upper() - *idx;
+            if (bit < 0 || bit >= w) return std::nullopt;
+            uint64_t v = 1ULL << bit;
+            Sym named = symOf(es.selector());
+            names.try_emplace(v, named ? std::string(named->name) : std::string(V->name) + "[" + std::to_string(*idx) + "]");
+            return v;
+        }
 
         static Sym symOf(const slang::ast::Expression& e) {
             const auto& x = Lowerer::peel(e);
@@ -204,6 +233,11 @@ struct FsmExtractor {
         bool stateCmp(const slang::ast::Expression& c, uint64_t& k, bool& neq) {
             using namespace slang::ast;
             const Expression& x = Lowerer::peel(c);
+            neq = false;
+            if (auto bit = bitOf(x, V)) { k = *bit; onehot = true; return true; }   // if (V[K])
+            if (x.kind == ExpressionKind::UnaryOp && (x.as<UnaryExpression>().op == UnaryOperator::LogicalNot ||
+                                                      x.as<UnaryExpression>().op == UnaryOperator::BitwiseNot))
+                if (auto bit = bitOf(x.as<UnaryExpression>().operand(), V)) { k = *bit; neq = true; onehot = true; return true; }
             if (x.kind != ExpressionKind::BinaryOp) return false;
             const auto& b = x.as<BinaryExpression>();
             bool eq = b.op == BinaryOperator::Equality || b.op == BinaryOperator::CaseEquality;
@@ -235,6 +269,22 @@ struct FsmExtractor {
                             assign(in, a.isCompound() || writes(a.right(), T) ? Set{{AV{}, false}} : rhs(a.right()));
                             return in;
                         }
+                        // T[K] = 0 or 1: one bit of every constant T can hold
+                        if (auto bit = bitOf(a.left(), T); bit && !a.isCompound()) {
+                            auto v = constOf(a.right());
+                            if (v && *v <= 1) {
+                                auto upd = [&](Set& s) {
+                                    Set r;
+                                    for (auto& [av, f] : s)
+                                        if (av.kind == 0) add(r, AV{0, *v ? (av.c | *bit) : (av.c & ~*bit), nullptr}, f);
+                                        else add(r, AV{}, false);   // a bit of the old value: not followed
+                                    s = std::move(r);
+                                };
+                                for (auto& [k, s2] : in.spec) upd(s2);
+                                upd(in.any);
+                                return in;
+                            }
+                        }
                     }
                     break;
                 }
@@ -263,7 +313,16 @@ struct FsmExtractor {
                 case StatementKind::Case: {
                     const auto& c = s.as<CaseStatement>();
                     if (writes(c.expr, T)) break;
-                    if (symOf(c.expr) != V || c.condition == CaseStatementCondition::Inside) {
+                    // case (1'b1) V[A]: ... V[B]: ... : the one-hot form
+                    bool hot = false;
+                    if (c.condition != CaseStatementCondition::Inside && !c.items.empty() && symOf(c.expr) != V) {
+                        auto one = constOf(c.expr);
+                        hot = one && *one == 1 && c.expr.type->getBitWidth() == 1;
+                        for (auto& item : c.items)
+                            for (const Expression* x : item.expressions) hot = hot && bitOf(*x, V).has_value();
+                        if (hot) onehot = true;
+                    }
+                    if (!hot && (symOf(c.expr) != V || c.condition == CaseStatementCondition::Inside)) {
                         ifDepth++;
                         Map out = c.defaultCase ? run(*c.defaultCase, in) : in;
                         for (auto& item : c.items) out = unite(out, run(*item.stmt, in));
@@ -277,7 +336,7 @@ struct FsmExtractor {
                     for (auto& item : c.items) {
                         std::vector<uint64_t> ks;
                         for (const Expression* x : item.expressions) {
-                            auto k = constOf(*x);
+                            auto k = hot ? bitOf(*x, V) : constOf(*x);
                             if (!k) { bad = true; splitDepth--; return in; }   // a wildcard or computed label
                             ks.push_back(*k);
                         }
@@ -320,7 +379,7 @@ struct FsmExtractor {
         root.visit(col);
         for (Sym vs : order) {
             const WriteInfo& wi = written[vs];
-            if (wi.partial || wi.other || wi.blocks.size() != 1 || !blocks[*wi.blocks.begin()].clocked) continue;
+            if (wi.other || wi.blocks.size() != 1 || !blocks[*wi.blocks.begin()].clocked) continue;
             if (vs->kind != SymbolKind::Variable) continue;
             const Type& ty = vs->as<VariableSymbol>().getType();
             if (!ty.isIntegral() || ty.getBitWidth() < 1 || ty.getBitWidth() > 64) continue;
@@ -350,13 +409,14 @@ struct FsmExtractor {
             Map fin = mv;
             if (nx) {
                 auto wn = written.find(nx);
-                if (wn == written.end() || wn->second.partial || wn->second.other || wn->second.blocks.size() != 1) continue;
+                if (wn == written.end() || wn->second.other || wn->second.blocks.size() != 1) continue;
                 const Block& nb = blocks[*wn->second.blocks.begin()];
                 if (nb.clocked) continue;
                 Interp in{nx, vs, w, nb.p->getParentScope(), false, names};
                 Map mn = in.run(nb.p->getBody(), start);
                 if (in.bad) continue;
                 split = split || in.split;
+                iv.onehot = iv.onehot || in.onehot;
                 auto subst = [&](const Set& sv, const Set& sn) {
                     Set r;
                     for (auto& [v, f] : sv) {
@@ -374,14 +434,17 @@ struct FsmExtractor {
             if (!split || !known(fin.any)) continue;
             for (auto& [k, s] : fin.spec) ok = ok && known(s);
             if (!ok) continue;
+            // A one-hot register's states have one bit set; the all-zero
+            // default of its next-state logic is not one of them.
+            auto isState = [&](uint64_t c) { return !iv.onehot || (c && !(c & (c - 1))); };
             std::set<uint64_t> states;
             for (auto& [k, s] : fin.spec) {
                 states.insert(k);
-                for (auto& [v, f] : s) if (v.kind == 0) states.insert(v.c);
+                for (auto& [v, f] : s) if (v.kind == 0 && isState(v.c)) states.insert(v.c);
             }
-            for (auto& [v, f] : fin.any) if (v.kind == 0) states.insert(v.c);
+            for (auto& [v, f] : fin.any) if (v.kind == 0 && isState(v.c)) states.insert(v.c);
             if (states.size() < 2 || states.size() > 1024) continue;
-            if (ty.getCanonicalType().kind == SymbolKind::EnumType)
+            if (!iv.onehot && ty.getCanonicalType().kind == SymbolKind::EnumType)
                 for (const auto& ev : ty.getCanonicalType().as<EnumType>().values()) {
                     const auto& cv = ev.getValue();
                     if (!cv.isInteger() || cv.integer().hasUnknown()) continue;
@@ -401,6 +464,7 @@ struct FsmExtractor {
             }
             d.sig = sit->second;
             d.w = w;
+            d.onehot = iv.onehot;
             for (uint64_t st : states) {
                 auto nm = names.find(st);
                 char b[40];
@@ -409,7 +473,7 @@ struct FsmExtractor {
             }
             for (uint64_t st : states)
                 for (auto& [v, f] : fin.lookup(st))
-                    if (v.kind == 0 && v.c != st) d.trans.push_back({st, v.c, f});
+                    if (v.kind == 0 && v.c != st && isState(v.c)) d.trans.push_back({st, v.c, f});
             fsmDefs().push_back(std::move(d));
         }
     }
