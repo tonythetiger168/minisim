@@ -424,9 +424,6 @@ if(MINISIM_WITH_SLANG)
     PASS_REGULAR_EXPRESSION "module child")
 endif()
 
-# High-level synthesis: mhls, its install rule and its tests.
-include(cmake/tools/mhls.cmake)
-
 # Install layout (cmake --install, and the cpack packages below):
 #   bin/msim, bin/minisim, bin/memu, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
