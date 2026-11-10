@@ -20,6 +20,12 @@ Spec references are IEEE 1800-2023 clauses.
   run at each clock tick on the sampled values of its arguments; its result
   was garbage before.
 - `pop_front()` / `pop_back()` of a queue of queues (7.10.2).
+- A queue or dynamic array reached through handles in a coverpoint or its
+  `iff` guard, `coverpoint tr.txn.data[0] iff (tr.txn.data.size() > 0)`
+  (19.5): it was a null object access.
+- Constraints on part-selects (18.5): `addr[1:0] == 0; addr[31:12] == 0;`
+  with a range on `addr` failed nearly every `randomize()`; the solver now
+  narrows a variable's range through a part-select.
 - A parameter or localparam of a class read through a handle, `h.N` (8.25).
 - VPI: `vpi_get_vlog_info` gives a `-f` file's arguments as the nested
   array 38.36 describes, so `msim -uvm -f files.f` no longer crashes in
