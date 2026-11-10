@@ -1833,6 +1833,45 @@ struct Pdr {
         for (size_t i = 0; i < n(); i++) c.push_back(u.val(u.lit(0, m.stateBits[(size_t)cone.stateBits[i]].in)) ? (int)i + 1 : -((int)i + 1));
         return c;
     }
+    // Lifting: the state the solver found, with the inputs it chose, reaches
+    // the target (a cube in the next state, or the failure now). Most state
+    // bits do not matter for that; the ones that do are the reason
+    // "state and inputs and not target" has no solution.
+    std::unique_ptr<Unroll> lifter;
+    std::vector<size_t> inputPos;
+    Cube lift(Unroll& u, const Cube* target) {
+        Cube full = stateOf(u);
+        if (!lifter) {
+            lifter = std::make_unique<Unroll>(m, cone, false, posOf);
+            lifter->addFrame();
+            lifter->addFrame();
+            for (size_t p = 0; p < cone.nodes.size(); p++) {
+                int nd = cone.nodes[p];
+                if (m.g.n[(size_t)nd][0] < 0 && !m.stateBitOfInput.count(nd)) inputPos.push_back(p);
+            }
+        }
+        Unroll& L = *lifter;
+        int act = L.newVar();
+        std::vector<int> cl{-act};
+        if (target)
+            for (int l : *target) cl.push_back(-at(L, 1, l));
+        else
+            cl.push_back(-L.lit(0, bad));
+        for (int l : never) cl.push_back(L.lit(0, l));
+        L.s.addClause(cl);
+        L.assume(act);
+        for (size_t p : inputPos) L.assume(u.val(u.map[0][p]) ? L.map[0][p] : -L.map[0][p]);
+        for (int l : full) L.assume(at(L, 0, l));
+        int r = L.solve(m.opt.conflicts);
+        Cube c;
+        if (r == 20) {
+            for (int l : full)
+                if (L.s.failed(at(L, 0, l))) c.push_back(l);
+        } else
+            c = full;
+        L.unit(-act);
+        return c;
+    }
     void addClause(Unroll& u, const Cube& c) {
         std::vector<int> cl;
         for (int l : c) cl.push_back(-at(u, 0, l));
@@ -1858,7 +1897,7 @@ struct Pdr {
             for (int l : c)
                 if (u.s.failed(at(u, 1, l))) core->push_back(l);
         }
-        if (!unsat && pred) *pred = stateOf(u);
+        if (!unsat && pred) *pred = lift(u, &c);
         if (act) u.unit(-act);
         return unsat;
     }
@@ -1931,7 +1970,7 @@ struct Pdr {
                     Unroll& u = *F[(size_t)k];
                     u.assume(u.lit(0, bad));
                     if (solve(u) == 20) break;
-                    if (!blockAll(stateOf(u), k)) return 0;
+                    if (!blockAll(lift(u, nullptr), k)) return 0;
                 }
                 newFrame();
                 for (int i = 1; i <= k; i++) {
