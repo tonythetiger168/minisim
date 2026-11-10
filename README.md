@@ -41,6 +41,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/lower.hpp` | slang AST to `Prog`, including module instances and port connections |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
+| `src/parallel.hpp` | Shared by the tools: default thread count, `-threads N`, `par::parallelFor`, `par::Pool` |
+| `src/wave_reader.hpp` | Shared by the tools: `wave::Reader`, VCD (parallel, mapped) and FST into memory |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
@@ -331,6 +333,22 @@ Clock domains come from the clock of every edge-triggered block, with signals
 joined across port connections, so one clock passed down through several
 modules stays one domain. Findings print as
 `file:line:col: warning: [RULE] text`, sorted by file and line.
+
+### Source-level debug: `mdebug`
+
+`mdebug` lists the drivers and loads of a signal with the conditions on each
+assignment, prints fan-in cones, and with a VCD finds the assignment that
+gave a signal its value at a time and what caused it:
+
+```sh
+mdebug tb.sv dut.sv -top tb -drivers tb.u0.y
+mdebug tb.sv dut.sv -top tb -vcd waves.vcd -active tb.sum -at 70
+mdebug tb.sv dut.sv -top tb -vcd waves.vcd -html debug.html   # one-file viewer
+```
+
+The viewer page has the hierarchy, clickable source, drivers and loads, a
+schematic of the selected signal, and waves with the values annotated in the
+source. See [`docs/DEBUG.md`](docs/DEBUG.md).
 
 ### Low-power simulation: UPF (IEEE 1801)
 

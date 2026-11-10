@@ -30,7 +30,7 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_parallel)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -42,6 +42,8 @@ add_executable(test_liberty tests/test_liberty.cpp)
 target_include_directories(test_liberty PRIVATE src)
 add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
 
+find_package(Threads REQUIRED)
+target_link_libraries(test_parallel PRIVATE Threads::Threads)
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -119,14 +121,14 @@ if(MINISIM_WITH_SLANG)
   target_include_directories(mdft PRIVATE src)
   target_link_libraries(mdft PRIVATE slang::slang)
 
-  # Power analysis (average, peak, RTL estimate, UPF domains): mpower design.v -lib x.lib -activity x.saif
-  add_executable(mpower src/mpower.cpp)
-  target_include_directories(mpower PRIVATE src)
+  # Source-level debug: drivers, loads, active-driver trace, viewer: mdebug design.sv
+  add_executable(mdebug src/mdebug.cpp)
+  target_include_directories(mdebug PRIVATE src)
   find_package(Threads REQUIRED)
-  target_link_libraries(mpower PRIVATE slang::slang Threads::Threads)
+  target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
   if(MINISIM_WITH_FST)
-    target_link_libraries(mpower PRIVATE fst)
-    target_compile_definitions(mpower PRIVATE MINISIM_FST)
+    target_link_libraries(mdebug PRIVATE fst)
+    target_compile_definitions(mdebug PRIVATE MINISIM_FST)
   endif()
 
   add_executable(test_lower tests/test_lower.cpp)
@@ -264,6 +266,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
+  add_test(NAME mdebug
+           COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
+                   -DFST=${MINISIM_WITH_FST}
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
@@ -294,7 +301,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim mlint mdft mpower slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
