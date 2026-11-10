@@ -52,6 +52,8 @@ struct Flop {
 // inputs; a and b are outputs of the mapped logic.
 struct Box {
   std::vector<Lit> a, b;        // LSB first, same width
+  bool mul = false;             // a multiplier: sum is the product, 2's complement operands where sa, sb
+  bool sa = false, sb = false;
   bool cin = false;
   bool binv = false;            // b is an operand inverted (a - b): a chain that can invert inside takes b ^ 1
   std::vector<uint32_t> sum;    // variable driven by each sum bit, 0 = not used
@@ -182,6 +184,10 @@ struct FrontOptions {
   bool sync_reset = false;     // d = rst ? v : x becomes the flop's synchronous reset
   bool ce_over_reset = false;  // the family's enable gates its synchronous reset (ice40)
   int sync_reset_min = 3;      // flops one reset signal must control to be used as a reset
+  bool dsp = false;            // multipliers onto DSP blocks
+  int dsp_a = 0, dsp_b = 0;    // widest operands of one block, as it multiplies signed numbers
+  bool dsp_unsigned = false;   // the block also multiplies unsigned numbers of that width
+  int dsp_min = 10;            // fewest operand bits (both together) worth a block; narrower stay LUTs
 };
 
 namespace detail {
@@ -360,6 +366,38 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
       sel[k] = (op.kind == aig::WordOp::Add || op.kind == aig::WordOp::Sub || op.kind == aig::WordOp::Lt) &&
                op.a.size() == op.b.size() && (int)op.a.size() >= fo.carry_min;
     }
+  // A multiplier fits a DSP block by the width its operands really have:
+  // the elaborator extends both to the width of the result first.
+  struct MulFit { aig::Bits a, b; bool sa = false, sb = false; };
+  std::map<int, MulFit> fits;
+  if (fo.dsp)
+    for (size_t k = 0; k < d.ops.size(); ++k) {
+      const aig::WordOp& op = d.ops[k];
+      if (op.kind != aig::WordOp::Mul) continue;
+      MulFit m;
+      auto trim = [&](aig::Bits v, bool& sg) {
+        sg = op.sgn;
+        if (sg) while (v.size() > 1 && v.back() == v[v.size() - 2]) v.pop_back();
+        else while (v.size() > 1 && v.back() == aig::L0) v.pop_back();
+        if (sg && v.size() > 1 && v.back() == aig::L0) { v.pop_back(); sg = false; }   // never negative
+        return v;
+      };
+      m.a = trim(op.a, m.sa);
+      m.b = trim(op.b, m.sb);
+      if (m.a.size() < m.b.size()) { std::swap(m.a, m.b); std::swap(m.sa, m.sb); }
+      // an unsigned operand on a block that only does signed, or beside a signed one, gets a 0 sign bit
+      if (!fo.dsp_unsigned || m.sa != m.sb)
+        for (int side = 0; side < 2; ++side) {
+          aig::Bits& v = side ? m.b : m.a;
+          bool& sg = side ? m.sb : m.sa;
+          if (!sg) { v.push_back(aig::L0); sg = true; }
+        }
+      if (m.a.size() < m.b.size()) { std::swap(m.a, m.b); std::swap(m.sa, m.sb); }
+      if ((int)m.a.size() > fo.dsp_a || (int)m.b.size() > fo.dsp_b) continue;
+      if ((int)(m.a.size() + m.b.size()) < fo.dsp_min || m.b.size() < 2) continue;
+      sel[k] = 1;
+      fits[(int)k] = std::move(m);
+    }
   for (int round = 0;; ++round) {
     if (round == 16) std::fill(sel.begin(), sel.end(), 0);   // give up on chains rather than loop
     if (std::find(sel.begin(), sel.end(), 1) == sel.end()) return detail::flatten(d, init, invert, sval, {});
@@ -373,12 +411,17 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
       Box bx;
       aig::Bits a = op.a, b = op.b;
       const bool lt = op.kind == aig::WordOp::Lt;
-      if (op.kind != aig::WordOp::Add) {      // a - b = a + ~b + 1; a < b is its missing carry
+      const bool mul = op.kind == aig::WordOp::Mul;
+      if (mul) {
+        const MulFit& m = fits[(int)k];
+        a = m.a; b = m.b;
+        bx.mul = true; bx.sa = m.sa; bx.sb = m.sb;
+      } else if (op.kind != aig::WordOp::Add) {      // a - b = a + ~b + 1; a < b is its missing carry
         for (Lit& l : b) l ^= 1;
         bx.cin = bx.binv = true;
       }
       if (lt && op.sgn) { a.back() ^= 1; b.back() ^= 1; }   // signed: compare with the sign bits flipped
-      bx.sum.assign(a.size(), 0);
+      bx.sum.assign(mul ? std::min(op.y.size(), a.size() + b.size()) : a.size(), 0);
       const std::string base = std::string("\x01") + "b" + std::to_string(k);
       bool any = false;
       // The node behind y becomes a wire from a new input the box will drive.
@@ -395,8 +438,20 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
       };
       if (lt) take(op.y[0], base + "c", true);   // carry out = !(a < b)
       else
-        for (size_t i = 0; i < op.y.size() && i < a.size(); ++i) take(op.y[i], base + "s" + std::to_string(i), false);
+        for (size_t i = 0; i < op.y.size() && i < bx.sum.size(); ++i) take(op.y[i], base + "s" + std::to_string(i), false);
       if (!any) { sel[k] = 0; continue; }
+      // result bits past the product: its sign, or 0
+      for (size_t i = bx.sum.size(); mul && i < op.y.size(); ++i) {
+        uint32_t n = aig::lnode(op.y[i]), top = aig::lnode(op.y[bx.sum.size() - 1]);
+        if (n >= cut.size() || cut[n] || c.g.nodes[n].k != aig::NK::And) continue;
+        aig::Node w;
+        w.k = aig::NK::Wire;
+        w.a = bx.sa ? aig::mklit(top, aig::lisneg(op.y[i]) != aig::lisneg(op.y[bx.sum.size() - 1]))
+                    : (aig::lisneg(op.y[i]) ? aig::L1 : aig::L0);
+        if (bx.sa && !cut[top]) continue;
+        c.g.nodes[n] = w;
+        cut[n] = 1;
+      }
       for (int side = 0; side < 2; ++side) {
         aig::Port p;
         p.name = base + (side ? "b" : "a");
@@ -877,7 +932,7 @@ struct Netlist {
   std::vector<std::string> warnings;
   std::vector<std::pair<int, int>> inits;  // net, power-up value (generic family)
   int nbits = 2;
-  size_t luts = 0, ffs = 0, ffs_en = 0, ffs_srst = 0, carry_bits = 0;
+  size_t luts = 0, ffs = 0, ffs_en = 0, ffs_srst = 0, carry_bits = 0, chains = 0, dsps = 0;
   // where the Aig's signals ended up (for checking)
   std::vector<int> ci_bit;                 // per variable below first_and()
   std::vector<std::array<int, 5>> ff_bits; // D, clock, async reset, enable, sync reset pin nets per flop
@@ -901,6 +956,14 @@ inline FrontOptions family_front(Family f) {
   o.carry = f != Family::Generic;
   o.enable = o.sync_reset = true;
   o.ce_over_reset = f == Family::Ice40;
+  // MULT18X18D and SB_MAC16 have a signed/unsigned switch per operand;
+  // DSP48E1 multiplies 25 x 18 signed. iCE40 has DSPs on UltraPlus parts
+  // only, so there the caller turns them on.
+  o.dsp = f == Family::Ecp5 || f == Family::Xc7;
+  o.dsp_a = f == Family::Xc7 ? 25 : f == Family::Ice40 ? 16 : 18;
+  o.dsp_b = f == Family::Ice40 ? 16 : 18;
+  o.dsp_unsigned = f != Family::Xc7;
+  if (f == Family::Generic) o.dsp_a = o.dsp_b = 0;
   return o;
 }
 
@@ -1135,9 +1198,92 @@ class NetlistBuilder {
     }
   }
 
+  // One multiplier on the family's DSP block.
+  void emit_mul(size_t k) {
+    const Box& B = g_.boxes[k];
+    ++n_.dsps;
+    n_.box_pins.emplace_back();
+    // operands padded to the block's width: by the sign, or by 0
+    auto operand = [&](const std::vector<Lit>& v, bool sg, size_t w) {
+      std::vector<int> r;
+      for (Lit l : v) { r.push_back(bit_of(l)); n_.box_pins.back().push_back({r.back(), l}); }
+      const int ext = sg ? r.back() : 0;
+      while (r.size() < w) r.push_back(ext);
+      return r;
+    };
+    auto product = [&](size_t w) {
+      std::vector<int> r;
+      for (size_t i = 0; i < w; ++i) r.push_back(i < B.sum.size() && B.sum[i] ? pos_[B.sum[i]] : fresh());
+      return r;
+    };
+    const std::string name = "mul" + std::to_string(k);
+    auto num = [](unsigned v, int w) { return bitstr(v, w); };
+    switch (fam_) {
+      case Family::Ice40: {
+        std::vector<Param> p;
+        for (const char* z : {"NEG_TRIGGER", "C_REG", "A_REG", "B_REG", "D_REG", "TOP_8x8_MULT_REG", "BOT_8x8_MULT_REG",
+                              "PIPELINE_16x16_MULT_REG1", "PIPELINE_16x16_MULT_REG2", "TOPADDSUB_UPPERINPUT",
+                              "BOTADDSUB_UPPERINPUT", "MODE_8x8"})
+          p.push_back({z, "0", false});
+        for (const char* z : {"TOPADDSUB_LOWERINPUT", "TOPADDSUB_CARRYSELECT", "BOTADDSUB_LOWERINPUT", "BOTADDSUB_CARRYSELECT"})
+          p.push_back({z, "00", false});
+        p.push_back({"TOPOUTPUT_SELECT", "11", false});
+        p.push_back({"BOTOUTPUT_SELECT", "11", false});
+        p.push_back({"A_SIGNED", B.sa ? "1" : "0", false});
+        p.push_back({"B_SIGNED", B.sb ? "1" : "0", false});
+        add_cell("SB_MAC16", name, std::move(p),
+                 {{"A", false, operand(B.a, B.sa, 16)}, {"B", false, operand(B.b, B.sb, 16)}, {"O", true, product(32)}});
+        break;
+      }
+      case Family::Ecp5: {
+        std::vector<Conn> c;
+        auto bus = [&](const char* pre, const std::vector<int>& v, bool out) {
+          for (size_t i = 0; i < v.size(); ++i) c.push_back({pre + std::to_string(i), out, {v[i]}});
+        };
+        bus("A", operand(B.a, B.sa, 18), false);
+        bus("B", operand(B.b, B.sb, 18), false);
+        bus("C", std::vector<int>(18, 0), false);
+        c.push_back({"SIGNEDA", false, {B.sa ? 1 : 0}});
+        c.push_back({"SIGNEDB", false, {B.sb ? 1 : 0}});
+        c.push_back({"SOURCEA", false, {0}});
+        c.push_back({"SOURCEB", false, {0}});
+        bus("P", product(36), true);
+        add_cell("MULT18X18D", name,
+                 {{"REG_INPUTA_CLK", "NONE", true}, {"REG_INPUTB_CLK", "NONE", true}, {"REG_INPUTC_CLK", "NONE", true},
+                  {"REG_PIPELINE_CLK", "NONE", true}, {"REG_OUTPUT_CLK", "NONE", true}, {"SOURCEB_MODE", "B_SHIFT", true},
+                  {"MULT_BYPASS", "DISABLED", true}, {"RESETMODE", "SYNC", true}, {"GSR", "DISABLED", true}},
+                 std::move(c));
+        break;
+      }
+      case Family::Xc7: {
+        std::vector<Param> p;
+        for (const char* z : {"ACASCREG", "ADREG", "ALUMODEREG", "AREG", "BCASCREG", "BREG", "CARRYINREG", "CARRYINSELREG",
+                              "CREG", "DREG", "INMODEREG", "MREG", "OPMODEREG", "PREG"})
+          p.push_back({z, num(0, 32), false});
+        p.push_back({"A_INPUT", "DIRECT", true});
+        p.push_back({"B_INPUT", "DIRECT", true});
+        p.push_back({"USE_MULT", "MULTIPLY", true});
+        p.push_back({"USE_SIMD", "ONE48", true});
+        p.push_back({"USE_DPORT", "FALSE", true});
+        const std::vector<int> z48(48, 0);
+        auto zeros = [](size_t w) { return std::vector<int>(w, 0); };
+        std::vector<int> opmode = {1, 0, 1, 0, 0, 0, 0};   // 7'b0000101: P = M
+        add_cell("DSP48E1", name, std::move(p),
+                 {{"A", false, operand(B.a, true, 30)}, {"B", false, operand(B.b, true, 18)}, {"C", false, zeros(48)},
+                  {"D", false, zeros(25)}, {"CARRYIN", false, {0}}, {"INMODE", false, zeros(5)}, {"ALUMODE", false, zeros(4)},
+                  {"OPMODE", false, opmode}, {"CARRYINSEL", false, zeros(3)}, {"ACIN", false, zeros(30)},
+                  {"BCIN", false, zeros(18)}, {"PCIN", false, zeros(48)}, {"P", true, product(48)}});
+        break;
+      }
+      case Family::Generic:
+        throw std::runtime_error("fpga: the generic family has no DSP cells");
+    }
+  }
+
   // The carry chain of one box.
   void emit_box(size_t k) {
     const Box& B = g_.boxes[k];
+    if (B.mul) { emit_mul(k); return; }
     // ecp5 and xc7 chains have a LUT per bit: it takes b as it is and inverts
     // inside. ice40's SB_CARRY has none, so a subtraction needs b inverted outside.
     const bool inv = B.binv && fam_ != Family::Ice40;
@@ -1157,6 +1303,7 @@ class NetlistBuilder {
     size_t w = A.size();
     if (cout < 0) while (w > 0 && S[w - 1] < 0) --w;   // bits above the last used sum
     n_.carry_bits += w;
+    ++n_.chains;
     int c = B.cin ? 1 : 0;
     switch (fam_) {
       case Family::Ice40:

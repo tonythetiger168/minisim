@@ -293,6 +293,8 @@ Spec references are IEEE 1800-2023 clauses.
 - `mfpga`: adders, subtractors and comparators map to the family's carry
   chain (`SB_CARRY`, `CCU2C`, `CARRY4`), and clock enables and synchronous
   resets to flop pins. `-nocarry` and `-noce` turn each off.
+- `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
+  `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
 
 ### Fixed
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes

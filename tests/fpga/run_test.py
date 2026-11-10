@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mfpga test: map one design for every device family and check the result.
 
-  run_test.py MFPGA MSIM SRC_DIR OUT_DIR DESIGN [seq-depth [reset-input]]
+  run_test.py MFPGA MSIM SRC_DIR OUT_DIR DESIGN [seq-depth [reset-input [mfpga-option...]]]
 
 DESIGN is tests/synth/DESIGN.sv (the designs msynth is tested with),
 tests/fpga/DESIGN.sv or tests/fpga/DESIGN.aag. Checks:
@@ -21,13 +21,14 @@ import os, shutil, subprocess, sys
 
 mfpga, msim, src, out, design = sys.argv[1:6]
 depth = int(sys.argv[6]) if len(sys.argv) > 6 else 0
-reset = sys.argv[7] if len(sys.argv) > 7 else None
+reset = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] != "-" else None
+extra = sys.argv[8:]
 os.makedirs(out, exist_ok=True)
 rtl = os.path.join(src, "tests", "synth", design + ".sv")
 if not os.path.exists(rtl):
     rtl = os.path.join(src, "tests", "fpga", design + ".sv")
 aag = os.path.join(src, "tests", "fpga", design + ".aag")
-inp = [rtl, "-top", design] if os.path.exists(rtl) else [aag, "-top", design]
+inp = ([rtl, "-top", design] if os.path.exists(rtl) else [aag, "-top", design]) + extra
 
 def run(cmd, **kw):
     r = subprocess.run(cmd, capture_output=True, text=True, **kw)
@@ -53,15 +54,19 @@ for fam in ("generic", "ice40", "ecp5", "xc7"):
         sys.exit("malformed EDIF " + base + ".edf")
     if os.path.exists(rtl):
         tb = rtl[:-3] + "_tb.sv"
-        cells = os.path.join(src, "tests", "fpga", "cells_%s.v" % fam)
+        cells = [os.path.join(src, "tests", "fpga", "cells_%s.v" % fam)]
+        if fam == "ecp5":
+            cells.append(os.path.join(src, "tests", "fpga", "cells_ecp5_dsp.v"))
         want = run([msim, rtl, tb, "-top", design + "_tb"])
-        got = run([msim, base + ".v", cells, tb, "-top", design + "_tb"])
+        got = run([msim, base + ".v"] + cells + [tb, "-top", design + "_tb"])
         if want != got or len(want.splitlines()) < 50:
             sys.exit("%s: the netlist simulates differently from the RTL (%d lines)" % (fam, len(want.splitlines())))
     if yosys:
         ys = ["read_verilog -sv " + rtl, "prep -top " + design, "design -stash gold"]
         if SIM[fam]:
             ys.append("read_verilog " + SIM[fam])
+        if fam == "ecp5":   # a black box in Yosys 0.33's library
+            ys.append("read_verilog " + os.path.join(src, "tests", "fpga", "cells_ecp5_dsp.v"))
         ys += ["read_json %s.json" % base, "hierarchy -top " + design, "proc", "flatten", "design -stash gate",
                "design -copy-from gold -as gold " + design, "design -copy-from gate -as gate " + design,
                "miter -equiv -flatten -make_outputs gold gate miter", "hierarchy -top miter", "flatten", "opt",

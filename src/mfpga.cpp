@@ -31,6 +31,9 @@ static void usage() {
     "  -cuts N       cuts kept per node, 2..16 (default: 8)\n"
     "  -threads N    worker threads (default: every logical core; the output does not depend on N)\n"
     "  -nocarry      adders and comparators as LUTs, not carry chains\n"
+    "  -dsp          ice40: multipliers onto SB_MAC16 (UltraPlus parts)\n"
+    "  -nodsp        multipliers as LUTs, not DSP blocks\n"
+    "  -dsp-min N    fewest operand bits, both together, worth a DSP block (default 10)\n"
     "  -noce         clock enables and synchronous resets stay in the D logic\n"
     "  -verify       simulate the mapped netlist against the input on random patterns\n"
     "  -q            no report\n";
@@ -41,7 +44,8 @@ int main(int argc, char** argv) {
   std::vector<std::string> files, slang_args;
   fpga::MapOptions mo;
   int K = 0;
-  bool verify = false, quiet = false, carry = true, ce = true;
+  bool verify = false, quiet = false, carry = true, ce = true, nodsp = false, dsp = false;
+  int dsp_min = 0;
   try {
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -62,6 +66,9 @@ int main(int argc, char** argv) {
       else if (a == "-verify") verify = true;
       else if (a == "-nocarry") carry = false;
       else if (a == "-noce") ce = false;
+      else if (a == "-dsp") dsp = true;
+      else if (a == "-nodsp") nodsp = true;
+      else if (a == "-dsp-min" && i + 1 < argc) dsp_min = atoi(argv[++i]);
       else if (a == "-q") quiet = true;
       else if (a == "-D" || a == "-I" || a == "-G") { slang_args.push_back(a); slang_args.push_back(val()); }
       else if (a.rfind("+define+", 0) == 0) slang_args.push_back("-D" + a.substr(8));
@@ -109,6 +116,8 @@ int main(int argc, char** argv) {
     for (auto& nd : des.g.nodes) raw_ands += nd.k == aig::NK::And;
     fpga::FrontOptions fo = fpga::family_front(fam);
     fo.carry = fo.carry && carry;
+    fo.dsp = (fo.dsp || (dsp && fam == fpga::Family::Ice40)) && !nodsp;
+    if (dsp_min > 0) fo.dsp_min = dsp_min;
     fo.enable = fo.enable && ce;
     fo.sync_reset = fo.sync_reset && ce;
     fpga::Aig g = fpga::from_design(des, init, fpga::family_invert(fam, init), fo);
@@ -138,9 +147,9 @@ int main(int argc, char** argv) {
       printf("design   %s: %u inputs, %zu flops, %zu ANDs (%zu after cleanup)\n", g.top.c_str(),
              g.nin - box_outs, g.flops.size(), raw_ands, g.ands.size());
       printf("mapped   %s LUT%d: %zu LUTs, %zu flops, depth %u\n", family.c_str(), mo.K, n.luts, n.ffs, m.depth);
-      if (n.carry_bits || n.ffs_en || n.ffs_srst)
-        printf("         %zu carry chains (%zu bits), %zu flops with clock enable, %zu with synchronous reset\n",
-               g.boxes.size(), n.carry_bits, n.ffs_en, n.ffs_srst);
+      if (n.carry_bits || n.dsps || n.ffs_en || n.ffs_srst)
+        printf("         %zu carry chains (%zu bits), %zu DSP blocks, %zu flops with clock enable, %zu with synchronous reset\n",
+               n.chains, n.carry_bits, n.dsps, n.ffs_en, n.ffs_srst);
       printf("by size ");
       for (int k = 1; k <= mo.K; ++k) printf(" LUT%d %zu", k, hist[k]);
       printf("\n");

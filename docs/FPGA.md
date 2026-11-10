@@ -34,6 +34,9 @@ cuts and an exact-area pass so it scales to large designs.
 | `-cuts N` | cuts kept per node, 2 to 16 (default 8). More cuts: slightly fewer LUTs, more time |
 | `-threads N` | worker threads. Default: every logical core. The output does not depend on N |
 | `-nocarry` | adders, subtractors and comparators as LUTs, not carry chains |
+| `-nodsp` | multipliers as LUTs, not DSP blocks |
+| `-dsp` | `ice40`: multipliers onto `SB_MAC16`. Off by default: only UltraPlus parts (UP5K) have them |
+| `-dsp-min N` | fewest operand bits, both operands together, worth a DSP block (default 10) |
 | `-noce` | clock enables and synchronous resets stay in the D logic |
 | `-verify` | simulate the mapped netlist against the graph on random patterns |
 | `-q` | no report |
@@ -43,9 +46,9 @@ cuts and an exact-area pass so it scales to large designs.
 | Family | LUT | Flip-flops | Other |
 |---|---|---|---|
 | `generic` | `$lut` (`WIDTH`, `LUT`) | `$_DFF_P_`, `$_DFF_PP0_`, `$_DFFE_PP_`, `$_DFFE_PP0P_`, `$_SDFF_PP0_`, `$_SDFFE_PP0P_`, ... (Yosys gate cells); power-up value as the net's `init` attribute | no carry cells |
-| `ice40` | `SB_LUT4` | `SB_DFF` with `E` (enable), `R`/`S` (asynchronous) or `SR`/`SS` (synchronous) reset, and the `SB_DFFN*` falling-edge ones | `SB_CARRY`, one per bit, beside the `SB_LUT4` of the sum |
-| `ecp5` | `LUT4` | `TRELLIS_FF` (`REGSET`, `SRMODE=ASYNC` or `LSR_OVER_CE`, `CEMUX=CE` with an enable, `CLKMUX=INV` for the falling edge) | `CCU2C`, two bits each |
-| `xc7` | `LUT1` to `LUT6` | `FDRE`, `FDSE`, `FDCE`, `FDPE` with `CE` (`INIT`, `IS_C_INVERTED`) | `CARRY4`, four bits each; `IBUF` and `OBUF` on every port |
+| `ice40` | `SB_LUT4` | `SB_DFF` with `E` (enable), `R`/`S` (asynchronous) or `SR`/`SS` (synchronous) reset, and the `SB_DFFN*` falling-edge ones | `SB_CARRY`, one per bit, beside the `SB_LUT4` of the sum; `SB_MAC16` with `-dsp` |
+| `ecp5` | `LUT4` | `TRELLIS_FF` (`REGSET`, `SRMODE=ASYNC` or `LSR_OVER_CE`, `CEMUX=CE` with an enable, `CLKMUX=INV` for the falling edge) | `CCU2C`, two bits each; `MULT18X18D` |
+| `xc7` | `LUT1` to `LUT6` | `FDRE`, `FDSE`, `FDCE`, `FDPE` with `CE` (`INIT`, `IS_C_INVERTED`) | `CARRY4`, four bits each; `DSP48E1`; `IBUF` and `OBUF` on every port |
 
 Inverters cost nothing: they are folded into LUT tables. An iCE40 flop always
 powers up 0, so a flop that must power up 1 is mapped inverted (D, Q and reset
@@ -100,6 +103,18 @@ A 64-bit registered adder with a compare, placed and routed by nextpnr:
 A chain is always the smaller choice. On iCE40 a long ripple is slower than
 the LUT tree, as it is for Yosys; `-nocarry` trades area for that speed.
 
+## DSP blocks
+
+Every `*` is in the same operator table. The elaborator extends both operands
+to the width of the result, so `mfpga` first finds the width each really has
+(leading zeros, or copies of the sign), and a multiplier that fits one block
+becomes that block, unregistered: `MULT18X18D` (18 x 18, signed or unsigned
+per operand), `DSP48E1` (25 x 18 signed, so 24 x 17 unsigned), `SB_MAC16`
+(16 x 16). Result bits above the product are its sign or 0; unused product
+bits are left open. `tests/fpga/mul.sv` (8x8, signed 9x6, 11x8 truncated, a
+multiply-accumulate and a 28x28) takes 4 blocks and 1,758 LUT4, all of them
+the 28x28; without blocks it is 2,647.
+
 ## Speed
 
 A 128x128 multiplier (166,252 AND nodes) on a 4-core machine, LUT6: 32,344
@@ -112,7 +127,8 @@ on four, with byte-identical output. On a 32x32 multiplier the LUT count is
 
 `tests/fpga/run_test.py` maps the designs `msynth` is tested with, and a
 datapath with synchronous reset, enable, add/subtract and signed and unsigned
-compares (`tests/fpga/dp.sv`), for every family, and for each one:
+compares (`tests/fpga/dp.sv`), and multipliers (`mul.sv`, `mulp.sv`), for
+every family, and for each one:
 
 - `-verify` simulates the netlist against the graph on random patterns;
 - one and four threads must write the same bytes;
@@ -121,8 +137,8 @@ compares (`tests/fpga/dp.sv`), for every family, and for each one:
   both must print the same lines;
 - with Yosys installed, the JSON netlist on the vendor's own simulation
   models is proven equal to the RTL by a bounded SAT check that shares no code
-  with `mfpga` (the counter and the datapath; Yosys 0.33 cannot read the
-  other designs). This is what checks the carry cells and flop pins against
+  with `mfpga` (the counter, the datapath and the small multipliers; Yosys
+  0.33 cannot read the other designs). This is what checks the carry cells and flop pins against
   the vendors' models;
 - with nextpnr installed, the iCE40 and ECP5 netlists are placed and routed.
 
@@ -130,8 +146,14 @@ CI installs Yosys and nextpnr.
 
 ## Limits
 
-- Multipliers become LUTs, not DSP blocks; memories become flops, not block
-  RAM. DSP mapping comes next; block RAM needs the memory table the
+- A multiplier wider than one DSP block stays LUTs: it is not split over
+  several blocks yet. The blocks' input, pipeline and output registers and
+  their adders (multiply-accumulate) are not used. `MULT18X18D` is a black
+  box in Yosys 0.33, so its proof runs on the model in
+  `tests/fpga/cells_ecp5_dsp.v`; `DSP48E1` is proven on Yosys' own model, and
+  `SB_MAC16` was (by hand, with place and route on a UP5K), since the CI
+  tests place iCE40 netlists on an HX8K, which has no DSPs.
+- Memories become flops, not block RAM: that needs the memory table the
   elaborator will record.
 - Chains are not split or sped up (carry-select, carry-lookahead) by timing,
   and an adder is not merged with a mux or an AND in front of it into the

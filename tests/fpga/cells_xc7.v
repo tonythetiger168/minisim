@@ -59,3 +59,13 @@ module CARRY4 (input CI, CYINIT, input [3:0] DI, S, output [3:0] O, CO);
   assign CO[3] = S[3] ? CO[2] : DI[3];
   assign O = S ^ {CO[2:0], c0};
 endmodule
+// The multiply of DSP48E1 as mfpga configures it: P = A[24:0] * B, signed, no registers.
+module DSP48E1 #(parameter ACASCREG = 0, ADREG = 0, ALUMODEREG = 0, AREG = 0, BCASCREG = 0, BREG = 0, CARRYINREG = 0,
+                 CARRYINSELREG = 0, CREG = 0, DREG = 0, INMODEREG = 0, MREG = 0, OPMODEREG = 0, PREG = 0,
+                 A_INPUT = "DIRECT", B_INPUT = "DIRECT", USE_MULT = "MULTIPLY", USE_SIMD = "ONE48", USE_DPORT = "FALSE")
+  (input [29:0] A, ACIN, input [17:0] B, BCIN, input [47:0] C, PCIN, input [24:0] D, input CARRYIN,
+   input [4:0] INMODE, input [3:0] ALUMODE, input [6:0] OPMODE, input [2:0] CARRYINSEL, output [47:0] P);
+  wire [47:0] ea = {{23{A[24]}}, A[24:0]};
+  wire [47:0] eb = {{30{B[17]}}, B};
+  assign P = ea * eb;
+endmodule
