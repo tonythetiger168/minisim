@@ -2207,7 +2207,36 @@ struct Sim {
     // Toggle coverage (msim -cov): per signal, the bits seen rising 0->1 and
     // falling 1->0 (X and Z do not count), one 64-bit word per 64 bits.
     vector<vector<uint64_t>> togRise, togFall;
+    // FSM coverage (msim -cov): for each watched state register, how often
+    // it entered each value and made each change. A signal is written by one
+    // thread at a time, so its two maps need no lock.
+    vector<int> fsmSigs, fsmOf;   // watched signals; signal -> index in fsmSigs, or -1
+    vector<std::map<uint64_t, uint64_t>> fsmSeen;
+    vector<std::map<std::pair<uint64_t, uint64_t>, uint64_t>> fsmTrans;
+    void fsmWatch(const vector<int>& watch) {
+        fsmSigs = watch;
+        fsmOf.assign(sigs.size(), -1);
+        for (size_t i = 0; i < watch.size(); i++) fsmOf[watch[i]] = (int)i;
+        fsmSeen.assign(watch.size(), {});
+        fsmTrans.assign(watch.size(), {});
+    }
+    void covFsm(int f, const Val& o, const Val& n) {
+        if (n.x | n.z) return;
+        if (!(o.x | o.z)) {
+            fsmSeen[f].try_emplace(o.v, 1);   // the value it started with
+            fsmTrans[f][{o.v, n.v}]++;
+        }
+        fsmSeen[f][n.v]++;
+    }
+    // A register that never changed is in the state it started in.
+    void fsmFinish() {
+        for (size_t f = 0; f < fsmSigs.size(); f++) {
+            const Val& v = sigs[fsmSigs[f]].val;
+            if (fsmSeen[f].empty() && !(v.x | v.z)) fsmSeen[f][v.v] = 1;
+        }
+    }
     void covToggle(int s, const Val& o, const Val& n) {
+        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0) covFsm(fsmOf[s], o, n);
         if (togRise.size() <= (size_t)s) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
         int w = sigs[s].w;
         auto& R = togRise[s];
