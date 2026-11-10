@@ -1,5 +1,5 @@
 #pragma once
-// dft_scan.hpp - scan insertion on a gate netlist: mdft -insert_scan.
+// dft/scan.hpp - scan insertion on a gate netlist: mdft -insert_scan.
 //
 // Reads a structural netlist (gnetlist.hpp), finds the flops through the
 // Liberty library (liberty.hpp) or a cell map, checks that the tester can
@@ -17,7 +17,6 @@
 // for ATPG, logic BIST and compression, and a chain flush testbench that
 // shifts a pattern through every chain.
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <fstream>
 #include <iostream>
@@ -26,13 +25,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "gnetlist.hpp"
 #include "liberty.hpp"
+#include "parallel.hpp"
 
 namespace scan {
 
@@ -40,31 +39,16 @@ struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// Run fn(i) for i in [0, n) on up to `threads` threads, in chunks. fn must
-// only write to slot i, so the result does not depend on the thread count.
+// Run fn(i) for i in [0, n) on up to `threads` threads, a chunk of indices
+// at a time. fn must only write to slot i, so the result does not depend on
+// the thread count.
 template <class F>
 void forEach(size_t n, int threads, size_t chunk, F fn) {
-    std::atomic<size_t> next{0};
-    std::atomic<bool> failed{false};
-    std::string failure;
-    auto work = [&]() {
-        try {
-            for (;;) {
-                size_t at = next.fetch_add(chunk);
-                if (at >= n || failed) return;
-                size_t end = std::min(n, at + chunk);
-                for (size_t i = at; i < end; i++) fn(i);
-            }
-        } catch (const std::exception& e) {
-            if (!failed.exchange(true)) failure = e.what();
-        }
-    };
-    int nt = std::max(1, std::min<int>(threads, int((n + chunk - 1) / chunk)));
-    std::vector<std::thread> pool;
-    for (int t = 1; t < nt; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
-    if (failed) throw Error(failure);
+    size_t chunks = (n + chunk - 1) / chunk;
+    par::parallelFor(chunks, unsigned(std::max(1, threads)), [&](size_t c) {
+        size_t end = std::min(n, (c + 1) * chunk);
+        for (size_t i = c * chunk; i < end; i++) fn(i);
+    });
 }
 
 // ------------------------------------------------------------------ cell map
@@ -1202,7 +1186,7 @@ inline int main(const std::vector<std::string>& args) {
         else o.files.push_back(a);
     }
     if (o.files.empty()) throw Error("no netlist given (see mdft -insert_scan -help)");
-    if (o.threads <= 0) o.threads = std::max(1u, std::thread::hardware_concurrency());
+    if (o.threads <= 0) o.threads = int(par::defaultThreads());
 
     CellMap cm;
     if (o.libs.empty()) cm = CellMap::builtin();

@@ -8,6 +8,19 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `memu`, emulation and FPGA prototyping: puts a gate-level netlist
+  (structural Verilog over a Liberty library) on a board of FPGAs. Clock
+  conversion onto one free-running clock (strobes for clean clocks, edge
+  detection for gated, divided and data-read clocks, any number of unrelated
+  clocks), memory mapping to block RAM and LUT RAM, multilevel partitioning
+  under each FPGA's capacity on a board file, routing through FPGAs and
+  time-division multiplexing where wires are short, probes with a trigger
+  and `memu -trace` to a VCD, and a generated testbench that runs the
+  netlist against the emulation. Transactors (`emu/sv`): an AXI4-Lite slave
+  that carries the design's accesses to `msim -mvp` models and an AXI4-Lite
+  master driven by a testbench class through a virtual interface, both
+  stopping the design's clock while the host answers. Multi-threaded with
+  thread-independent results. See `docs/EMULATION.md`.
 - `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
   failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
   `strong()`, `always s_eventually`) is proven or falsified with a loop
@@ -39,13 +52,26 @@ Spec references are IEEE 1800-2023 clauses.
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
+- Shared headers for the tools: `src/parallel.hpp` (default thread count,
+  the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
+  `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
+  (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
+- `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
+  netlist, RTL against RTL): both designs become one and-inverter graph,
+  flops and latches are matched by name (or by the net on their output, also
+  when stored inverted) and cut, and every output, next-state function and
+  clock/reset is proved equal by structural hashing, random simulation and
+  SAT on all cores, with a counterexample for each failing point. X in the
+  reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
+  `-report`. See `docs/EQUIV.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
   assignment that gave a signal its value at a time and its causes back
   through time, and `-html` for a one-file viewer (hierarchy, clickable
   source, drivers and loads, schematic, waves with values annotated in the
-  source). See `docs/DEBUG.md`.
+  source). `-vcd` reads VCD and FST; the page traces the active driver at the
+  cursor itself. See `docs/DEBUG.md`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
   coupling capacitance to same-layer neighbours (who also take over part of
@@ -55,6 +81,14 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `lib/mini45`: a generic 45 nm-class standard cell library for the tool
+  line, written from scratch (not a foundry library): 88 cells (inverters,
+  buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,
+  flops with reset, set, enable and scan, latches, clock gates, tristate, tie
+  and filler cells, several drive strengths) as Liberty at three corners
+  (`mini45_tt.lib`, `_ss`, `_ff`: NLDM 7x7 delay tables, constraints,
+  internal power, state-dependent leakage, wire loads), Verilog models
+  (`mini45.v`), and technology and cell LEF. See `docs/MINI45.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
@@ -155,6 +189,28 @@ Spec references are IEEE 1800-2023 clauses.
 - A run-time error (null object access, a crash) names the statement that
   was running; `MSIM_CALLTRACE=1` prints every method and automatic
   subroutine call.
+- `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
+  the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
+  `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed
+  model (clocks, generated clocks, I/O delays, clock groups, exceptions,
+  uncertainty, latency, case analysis) and keeps every command with its file
+  and line. Object queries (`get_ports`, `get_pins`, `get_cells`, `get_nets`,
+  `get_clocks`, `all_inputs`, `all_registers`, `-hierarchical`, `-regexp`,
+  `-filter`, `-of_objects`) resolve through `sdc::Design`, which a tool
+  implements for its own netlist; a host can add its own commands.
+- `src/tcl.hpp`: the one Tcl interpreter of the tool line (`tcl::Interp`),
+  split out of the SDC reader. A tool adds its own commands (`addCommand`),
+  runs scripts (`load`, `parse`) or a prompt (`shell`), and gets every error
+  as a diagnostic with file and line instead of a stop. `sdc::Reader` is now
+  an `Interp` with the SDC commands added.
+- `msdc`: timing constraint checks. Reads the design (same front end as
+  `msim`) and its SDC file and reports what is wrong or missing: 32 rules
+  from syntax (SDC001) through clocks, I/O delays and exceptions to paths
+  between clocks with no declared relationship (SDC040). Multithreaded
+  (`-threads N`, same report for any N), `-json`, `-Werror`, `-stats`. See
+  `docs/CONSTRAINTS.md`.
+- SDC reader: object lookups use sorted name indexes and `-filter` is parsed
+  once, so large designs with thousands of queries read in seconds.
 - `msta`: static timing analysis of gate-level netlists in the style of
   PrimeTime. Liberty (NLDM) delay calculation, ideal and propagated clocks,
   generated clocks, setup / hold / recovery / removal and output delay
@@ -166,17 +222,10 @@ Spec references are IEEE 1800-2023 clauses.
 - `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
   Verilog netlist reader / flattener / writer, shared by the timing,
   synthesis, power, equivalence and physical tools.
-- `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
-  the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
-  `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed
-  model (clocks, generated clocks, I/O delays, clock groups, exceptions,
-  uncertainty, latency, case analysis) and keeps every command with its file
-  and line. Object queries (`get_ports`, `get_pins`, `get_cells`, `get_nets`,
-  `get_clocks`, `all_inputs`, `all_registers`, `-hierarchical`, `-regexp`,
-  `-filter`, `-of_objects`) resolve through `sdc::Design`, which a tool
-  implements for its own netlist; a host can add its own commands.
 
 ### Fixed
+- `mlint`, `mdft`: a net connected to thousands of instances no longer makes
+  the clock-domain union-find quadratic (path compression).
 - A concurrent assertion read the current value, not the sampled one, of a
   bit select or indexed part select with a variable index (`r[k]`,
   `r[k -: 2]`, 16.5.1).
