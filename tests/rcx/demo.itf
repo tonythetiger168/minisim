@@ -1,0 +1,9 @@
+$ A small two-metal stack for the mrcx tests.
+TECHNOLOGY = demo2m
+GLOBAL_TEMPERATURE = 25
+DIELECTRIC top   { THICKNESS = 0.50 ER = 3.9 }
+CONDUCTOR metal2 { THICKNESS = 0.20 WMIN = 0.10 SMIN = 0.10 RPSQ = 0.30 CRT1 = 0.003 }
+DIELECTRIC ild1  { THICKNESS = 0.35 ER = 2.9 }
+CONDUCTOR metal1 { THICKNESS = 0.15 WMIN = 0.10 SMIN = 0.10 RPSQ = 0.40 CRT1 = 0.003 }
+DIELECTRIC pmd   { THICKNESS = 0.40 ER = 3.9 }
+VIA via1 { FROM = metal1 TO = metal2 AREA = 0.0049 RPV = 6 CRT1 = 0.001 }

@@ -72,20 +72,6 @@ add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
-# memu: a gate-level netlist onto one or more FPGAs for emulation and
-# prototyping (docs/EMULATION.md). No external dependencies; the test that
-# runs the emulation needs msim and is added with it below.
-find_package(Threads REQUIRED)
-add_executable(memu src/memu.cpp)
-target_include_directories(memu PRIVATE src)
-target_compile_definitions(memu PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
-target_link_libraries(memu PRIVATE Threads::Threads)
-if(NOT MINISIM_WITH_SLANG)
-  add_test(NAME memu
-           COMMAND ${CMAKE_COMMAND} -DMEMU=$<TARGET_FILE:memu> -DSRC=${CMAKE_SOURCE_DIR}
-                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/memu_test -P ${CMAKE_SOURCE_DIR}/tests/memu.cmake)
-endif()
-
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -95,6 +81,10 @@ if(Python3_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
+
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/memu.cmake)
+include(cmake/tools/mrcx.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -258,12 +248,6 @@ if(MINISIM_WITH_SLANG)
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_protect
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_protect.cmake)
   endif()
-  # Emulation: netlists on FPGAs against the netlists themselves, and the
-  # transactors against plain simulation.
-  add_test(NAME memu
-           COMMAND ${CMAKE_COMMAND} -DMEMU=$<TARGET_FILE:memu> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/memu_test
-                   -P ${CMAKE_SOURCE_DIR}/tests/memu.cmake)
   # The virtual prototype layer: the design reaching C models over AXI4-Lite.
   add_test(NAME msim_mvp
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -375,9 +359,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim memu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-# The transactors: memu -xtor-sv looks for these next to itself.
-install(FILES emu/sv/memu_xtor.sv emu/sv/memu_mvp_host.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/emu/sv)
+install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
