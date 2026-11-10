@@ -375,6 +375,29 @@ msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 
+### Formal property checking: `mformal`
+
+`mformal` proves or falsifies the design's assertions for every input
+sequence, on the same front end and lowering as `msim`. Assertions are
+proven or falsified, assumptions constrain the inputs, covers are reached or
+proven unreachable. A failure comes with a VCD of the whole design and, with
+`-tb`, a testbench that replays it in `msim`.
+
+```sh
+mformal rtl/*.sv -top fifo                  # every assert / assume / cover
+mformal rtl/*.sv -top fifo -depth 40 -tb    # deeper, with replay testbenches
+```
+
+```
+  assert  top.u.a_count        proven  (induction, k=2)
+  assert  top.u.a_push_counts  falsified  at cycle 5  mformal_out/top.u.a_push_counts.vcd
+  cover   top.u.c_full         covered  at cycle 4  mformal_out/top.u.c_full.vcd
+```
+
+Properties are checked in parallel on every core (`-threads N`), with the
+same result for any thread count. See `docs/FORMAL.md` for the model (clock,
+reset, two-state values, what is cut) and the supported property operators.
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per
