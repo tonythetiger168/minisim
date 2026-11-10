@@ -18,8 +18,10 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mvp** | Virtual prototypes: an AXI4-Lite bridge from the design to C, C++ or SystemC/TLM-2.0 models, with a memory map, interrupt lines and timed callbacks; a memory and a UART bundled | Shipping next |
 | **mdft** | Design-for-test: scan-readiness checks (gated clocks, logic-driven resets, latches, mixed edges, combinational loops) and a per-domain flop count for chain planning | Shipping next |
 | **mformal** | Formal property checking: proves or falsifies `assert`, constrains with `assume`, reaches `cover`, for every input sequence; bounded model checking and k-induction on CaDiCaL, counterexample waveforms and replay testbenches, one job per property on every core (`docs/FORMAL.md`) | Shipping next |
+| **mdft** | Design-for-test: scan-readiness checks (gated clocks, logic-driven resets, latches, mixed edges, combinational loops) and a per-domain flop count for chain planning; scan insertion on gate netlists (`-insert_scan`) and March memory BIST generation with fault coverage (`-mbist`) | Shipping next |
 | **mdebug** | Source-level debug: drivers and loads with their conditions, fan-in cones, the active driver at a time in a waveform traced back through time, and a one-file viewer (hierarchy, source, schematic, waves) | Shipping next |
-| **mcov** | Code coverage (line, branch, toggle) merged across a regression, text / HTML / LCOV reports and gates; covergroups with the spec work | Code coverage shipping in 0.2 |
+| **mcov** | Coverage merged across a regression: code coverage (line, branch, toggle), covergroups and assertion statistics; text / HTML / LCOV reports and gates | Shipping in 0.2 |
+| **mplan** | Verification planning and tracking: a plan maps features to tests, coverage and assertions; scores per feature, history and trend, failure triage (new / recurring / flaky / fixed), HTML report and CI gates | Shipping next |
 | **mrcx** | Parasitic extraction: routed DEF + LEF in, SPEF out. Distributed RC per net with coupling capacitance, process stack and temperature, open and short checks, multi-core | Shipping next |
 | **mwave** | Waveforms for GTKWave / Surfer: hierarchical VCD and compressed FST (shipping in 0.2); `$dumpfile` / `$dumpvars` scoping and transaction views next | Partly shipping in 0.2 |
 
