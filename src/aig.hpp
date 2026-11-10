@@ -457,4 +457,106 @@ inline std::vector<uint8_t> liveNodes(const Design& d) {
     return live;
 }
 
+// ---- cone copies (used by the equivalence checker)
+//
+// rebuild: copy the cone of `root` with some nodes replaced. memo[n] is the
+// literal that stands for node n (NOLIT: not visited yet). Seed it with the
+// substitutions; it must be sized to at least lnode(root)+1. Nodes this call
+// creates are appended past that and never revisited. Only And nodes are
+// followed; every other kind stands for itself.
+inline Lit rebuild(Graph& g, Lit root, std::vector<Lit>& memo) {
+    uint32_t rn = lnode(root);
+    if (rn == 0) return root;
+    std::vector<uint32_t> st{rn};
+    while (!st.empty()) {
+        uint32_t n = st.back();
+        if (memo[n] != NOLIT) { st.pop_back(); continue; }
+        Node nd = g.nodes[n];
+        if (nd.k != NK::And) { memo[n] = mklit(n); st.pop_back(); continue; }
+        uint32_t na = lnode(nd.a), nb = lnode(nd.b);
+        bool ready = true;
+        if (na && memo[na] == NOLIT) { st.push_back(na); ready = false; }
+        if (nb && memo[nb] == NOLIT) { st.push_back(nb); ready = false; }
+        if (!ready) continue;
+        Lit a = na ? memo[na] ^ (nd.a & 1u) : nd.a;
+        Lit b = nb ? memo[nb] ^ (nd.b & 1u) : nd.b;
+        Lit r = g.andl(a, b);
+        memo[n] = r;
+        st.pop_back();
+    }
+    return memo[rn] ^ (root & 1u);
+}
+
+// The same with a sparse memo (any map from node to literal): for small
+// cones of a large graph.
+template<typename Map>
+Lit rebuildSparse(Graph& g, Lit root, Map& memo) {
+    uint32_t rn = lnode(root);
+    if (rn == 0) return root;
+    std::vector<uint32_t> st{rn};
+    while (!st.empty()) {
+        uint32_t n = st.back();
+        if (memo.count(n)) { st.pop_back(); continue; }
+        Node nd = g.nodes[n];
+        if (nd.k != NK::And) { memo[n] = mklit(n); st.pop_back(); continue; }
+        uint32_t na = lnode(nd.a), nb = lnode(nd.b);
+        auto ia = memo.find(na), ib = memo.find(nb);
+        bool ready = true;
+        if (na && ia == memo.end()) { st.push_back(na); ready = false; }
+        if (nb && ib == memo.end()) { st.push_back(nb); ready = false; }
+        if (!ready) continue;
+        Lit a = na ? ia->second ^ (nd.a & 1u) : nd.a;
+        Lit b = nb ? ib->second ^ (nd.b & 1u) : nd.b;
+        Lit r = g.andl(a, b);
+        memo[n] = r;
+        st.pop_back();
+    }
+    return memo[rn] ^ (root & 1u);
+}
+
+// resolve: copy the cone of `root`, replacing each placeholder node by the
+// logic it stands for (defs: node -> literal), which may itself contain
+// placeholders. Unlike Wire nodes and cleanup(), the definitions live
+// outside the graph, so a loop through placeholders that is false for the
+// cone asked about is not an error. Returns NOLIT if the definitions are
+// circular; *culprit is then a placeholder on the cycle. memo and active
+// are sized to g.size() by the caller (NOLIT and 0).
+template<typename Defs>
+Lit resolve(Graph& g, Lit root, std::vector<Lit>& memo, const Defs& defs, std::vector<uint8_t>& active,
+            uint32_t* culprit = nullptr) {
+    uint32_t rn = lnode(root);
+    if (rn == 0) return root;
+    std::vector<uint32_t> st{rn};
+    while (!st.empty()) {
+        uint32_t n = st.back();
+        if (memo[n] != NOLIT) { st.pop_back(); continue; }
+        Node nd = g.nodes[n];
+        if (nd.k != NK::And) {
+            auto it = defs.find(n);
+            if (it == defs.end()) { memo[n] = mklit(n); st.pop_back(); continue; }
+            uint32_t dn = lnode(it->second);
+            if (dn == 0) { memo[n] = it->second; st.pop_back(); continue; }
+            if (memo[dn] != NOLIT) { memo[n] = memo[dn] ^ (it->second & 1u); st.pop_back(); continue; }
+            if (active[n]) {
+                if (culprit) *culprit = n;
+                return NOLIT;
+            }
+            active[n] = 1;
+            st.push_back(dn);
+            continue;
+        }
+        uint32_t na = lnode(nd.a), nb = lnode(nd.b);
+        bool ready = true;
+        if (na && memo[na] == NOLIT) { st.push_back(na); ready = false; }
+        if (nb && memo[nb] == NOLIT) { st.push_back(nb); ready = false; }
+        if (!ready) continue;
+        Lit a = na ? memo[na] ^ (nd.a & 1u) : nd.a;
+        Lit b = nb ? memo[nb] ^ (nd.b & 1u) : nd.b;
+        Lit r = g.andl(a, b);
+        memo[n] = r;
+        st.pop_back();
+    }
+    return memo[rn] ^ (root & 1u);
+}
+
 }  // namespace aig
