@@ -395,6 +395,10 @@ struct Prog {
     // fork branch that is a named block, every branch of a named fork).
     // `disable` of one of them from another process ends the process.
     std::vector<int> roots;
+    // A static combinational process with deferred assertions (a unique
+    // case's violation check): the ProcCtl its reports are queued under.
+    // Each evaluation is a flush point (16.4.2), as the wait of the process is.
+    mutable std::shared_ptr<void> combCtl;
     size_t emit(Instr i) {
         if (!i.line) { i.file = g_emitLoc.file; i.line = g_emitLoc.line; }
         code.push_back(i);
@@ -590,6 +594,7 @@ struct CombShape {
     std::vector<int> ins, outs;
     size_t body = 0;  // instructions before the wait: Assigns, and jumps within them when `branches`
     bool branches = false;
+    bool asserts = false;   // deferred immediate assertions in the body
 };
 inline bool combShape(const Prog& p, CombShape& c) {
     size_t n = p.code.size();
@@ -604,6 +609,12 @@ inline bool combShape(const Prog& p, CombShape& c) {
         if (p.code[i].k == IK::JmpIfNot || p.code[i].k == IK::Jmp) {
             if (p.code[i].target > n - 2) return false;
             c.branches = true;
+            continue;
+        }
+        // A deferred immediate assertion (assert #0 / final, a unique or
+        // priority case's check): queues a report and goes on.
+        if (p.code[i].k == IK::Assert && (p.code[i].join == 1 || p.code[i].join == 2)) {
+            c.asserts = c.branches = true;
             continue;
         }
         if (p.code[i].k != IK::Assign) return false;
@@ -628,13 +639,13 @@ inline bool combShape(const Prog& p, CombShape& c) {
 }
 // Topological order of the given combinational processes (indices into cs).
 // A process is never woken by its own writes (it is running, not waiting),
-// so a self-dependency is not an edge. Processes on a cycle, or fed by one,
-// are left out and stay ordinary event-driven processes.
+// so a self-dependency is not an edge. Processes on a cycle are kept
+// together (see the components below; *cyclic says there are some).
 // The order is sorted by level (longest path from an input that no process
 // in the set drives), stable within a level, so ranks of one level never
 // feed each other and can be computed in parallel. `levels` (optional)
 // receives the level of each entry of the returned order.
-inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::vector<int>* levels = nullptr) {
+inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::vector<int>* levels = nullptr, bool* cyclic = nullptr) {
     size_t n = cs.size();
     std::vector<std::vector<size_t>> succ(n);
     std::vector<size_t> indeg(n, 0);
@@ -653,22 +664,78 @@ inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::v
         to.erase(std::unique(to.begin(), to.end()), to.end());
         for (size_t b : to) { succ[a].push_back(b); indeg[b]++; }
     }
-    std::vector<size_t> order;
-    // Smallest index first among the ready ones keeps the order stable.
-    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> ready;
-    for (size_t i = 0; i < n; i++)
-        if (!indeg[i]) ready.push(i);
-    while (!ready.empty()) {
-        size_t a = ready.top();
-        ready.pop();
-        order.push_back(a);
-        for (size_t b : succ[a])
-            if (--indeg[b] == 0) ready.push(b);
+    // Strongly connected components (Tarjan, without recursion). Processes
+    // on a cycle (block A reads what block B writes and the other way round,
+    // usually through different bits or branches) are scheduled as one unit:
+    // consecutive ranks, each on a level of its own. A write marks the ranks
+    // that read the signal, lower ones too, and the kernel always runs the
+    // lowest pending rank, so the unit is evaluated until it is stable, as
+    // the event-driven processes would be.
+    std::vector<int> idx(n, -1), low(n, 0), comp(n, -1);
+    std::vector<size_t> rep(n, 0);
+    std::vector<std::vector<size_t>> members;
+    {
+        std::vector<char> on(n, 0);
+        std::vector<size_t> st;
+        std::vector<std::pair<size_t, size_t>> call;   // node, next successor
+        int next = 0;
+        for (size_t r = 0; r < n; r++) {
+            if (idx[r] >= 0) continue;
+            call.push_back({r, 0});
+            while (!call.empty()) {
+                size_t v = call.back().first;
+                if (call.back().second == 0) { idx[v] = low[v] = next++; st.push_back(v); on[v] = 1; }
+                if (call.back().second < succ[v].size()) {
+                    size_t w = succ[v][call.back().second++];
+                    if (idx[w] < 0) call.push_back({w, 0});
+                    else if (on[w]) low[v] = std::min(low[v], idx[w]);
+                    continue;
+                }
+                if (low[v] == idx[v]) {
+                    members.emplace_back();
+                    for (;;) {
+                        size_t w = st.back(); st.pop_back(); on[w] = 0;
+                        comp[w] = (int)members.size() - 1;
+                        members.back().push_back(w);
+                        if (w == v) break;
+                    }
+                    std::sort(members.back().begin(), members.back().end());
+                }
+                call.pop_back();
+                if (!call.empty()) low[call.back().first] = std::min(low[call.back().first], low[v]);
+            }
+        }
     }
-    std::vector<int> lv(n, 0);
-    for (size_t a : order)
+    for (size_t a = 0; a < n; a++) rep[a] = members[(size_t)comp[a]][0];
+    if (cyclic) {
+        *cyclic = false;
+        for (auto& m : members) *cyclic |= m.size() > 1;
+    }
+    // Kahn's order over the components; the smallest first index among the
+    // ready ones keeps the order stable (and, without cycles, what it was).
+    std::vector<size_t> cdeg(members.size(), 0);
+    for (size_t a = 0; a < n; a++)
         for (size_t b : succ[a])
-            if (lv[b] < lv[a] + 1) lv[b] = lv[a] + 1;
+            if (comp[a] != comp[b]) cdeg[(size_t)comp[b]]++;
+    std::vector<size_t> order;
+    std::vector<int> lv(n, 0);
+    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> ready;
+    for (size_t c = 0; c < members.size(); c++)
+        if (!cdeg[c]) ready.push(members[c][0]);
+    while (!ready.empty()) {
+        size_t r = ready.top();
+        ready.pop();
+        const auto& m = members[(size_t)comp[r]];
+        int base = 0;
+        for (size_t a : m) base = std::max(base, lv[a]);
+        for (size_t k = 0; k < m.size(); k++) { lv[m[k]] = base + (int)k; order.push_back(m[k]); }
+        for (size_t a : m)
+            for (size_t b : succ[a]) {
+                if (comp[a] == comp[b]) continue;
+                if (lv[b] < lv[a] + 1) lv[b] = lv[a] + 1;
+                if (--cdeg[(size_t)comp[b]] == 0) ready.push(rep[b]);
+            }
+    }
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return lv[a] < lv[b]; });
     if (levels) {
         levels->clear();

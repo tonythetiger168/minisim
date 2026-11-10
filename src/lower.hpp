@@ -969,6 +969,7 @@ struct Lowerer {
 #include "lower_assert.inc"
 #include "lower_clocking.inc"
 #include "lower_cover.inc"
+#include "lower_xprop.inc"
 
     // Owns the Prog of each fork branch, so Fork's pointers outlive lower().
     std::vector<std::unique_ptr<Prog>>* store = nullptr;
@@ -3309,7 +3310,7 @@ struct Lowerer {
                 Instr i; i.k = nba ? IK::Nba : IK::Assign;
                 i.sig = A->base; i.arr = A; i.e = vals[(size_t)k];
                 for (int64_t x : idx) i.aidx.push_back(konst(make((uint64_t)x, 0, 32, 0, true)));
-                prog.emit(i);
+                xpDirect(i);
             }
             return true;
         }
@@ -3338,7 +3339,7 @@ struct Lowerer {
         }
         for (int k = 0; k < A.count; k++) {
             Instr i; i.k = nba ? IK::Nba : IK::Assign; i.sig = A.base + k; i.e = vals[k];
-            prog.emit(i);
+            xpDirect(i);
         }
         return true;
     }
@@ -6781,7 +6782,7 @@ struct Lowerer {
             if (i.dyn >= 0 && a.isNonBlocking()) unsupported("nonblocking write to a container element");
             i.e = slice(ref(tmp), hi, lo);
             if (later) { i.delay = d.delay; i.de = d.de; i.nbaLater = true; }
-            prog.emit(i);
+            xpEmit(i, *x);
         }
     }
 
@@ -6835,7 +6836,7 @@ struct Lowerer {
             i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
             lhs(*x, i);
             i.e = slice(ref(tmp), hi, hi - w + 1);
-            prog.emit(i);
+            xpEmit(i, *x);
             hi -= w;
         }
     }
@@ -6927,7 +6928,7 @@ struct Lowerer {
                     i.delay = d.delay;
                     i.de = d.de;
                     i.nbaLater = true;
-                    prog.emit(i);
+                    xpEmit(i, a.left());
                     return;
                 }
                 // Blocking: the value is taken now, written after the wait.
@@ -6942,7 +6943,7 @@ struct Lowerer {
                 prog.emit(i);
                 return;
             }
-            prog.emit(i);
+            xpEmit(i, a.left());
         } else if (ex.kind == ExpressionKind::UnaryOp) {   // i++ / ++i / i-- / --i
             const auto& u = ex.as<UnaryExpression>();
             bool inc = u.op == UnaryOperator::Preincrement || u.op == UnaryOperator::Postincrement;
@@ -7181,6 +7182,7 @@ struct Lowerer {
                 // if (a &&& b matches p &&& c) (12.6.2): each condition in
                 // turn; a pattern binds its variables for the ones after it.
                 const auto& c = s.as<ConditionalStatement>();
+                if (xp.on && xpIf(c)) break;   // -xprop
                 if (c.check != UniquePriorityCheck::None) { checkedIf(c); break; }
                 std::vector<size_t> jfs;
                 for (auto& cd : c.conditions) {
@@ -7226,7 +7228,7 @@ struct Lowerer {
                 break;
             }
             case StatementKind::ExpressionStatement:
-                exprStmt(s.as<ExpressionStatement>().expr);
+                xpExprStmt(s.as<ExpressionStatement>().expr);
                 break;
             case StatementKind::VariableDeclaration: {   // int x = 5;  inside a block
                 const auto& vd = s.as<VariableDeclStatement>();
@@ -7505,6 +7507,7 @@ struct Lowerer {
             }
             case StatementKind::Case: {
                 const auto& c = s.as<CaseStatement>();
+                if (xp.on && xpCase(s, c)) break;   // -xprop
                 Op cmp = c.condition == CaseStatementCondition::Normal        ? Op::CaseEq
                          : c.condition == CaseStatementCondition::WildcardJustZ ? Op::CaseZEq
                                                                                 : Op::CaseXEq;
@@ -7694,7 +7697,9 @@ struct Lowerer {
                 break;
             }
             case StatementKind::WaitFork: { Instr i; i.k = IK::WaitFork; prog.emit(i); break; }
-            case StatementKind::ImmediateAssertion: immAssert(s.as<ImmediateAssertionStatement>()); break;
+            case StatementKind::ImmediateAssertion:
+                xpGuard([&] { immAssert(s.as<ImmediateAssertionStatement>()); });
+                break;
             case StatementKind::ConcurrentAssertion:
 {
                 NoCondCov off(condCovOff);
@@ -9403,7 +9408,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 try { E iff; lw.clockOf(*t, lw.sampleEv, iff); } catch (const std::runtime_error&) { lw.sampleEv.clear(); }
             }
         int below = checkerDepth > 0 && p.procedureKind == ProceduralBlockKind::AlwaysFF ? lw.fresh(1) : -1;
-        lw.stmt(p.getBody());
+        if (Lowerer::xpropMode() && checkerDepth == 0 && program < 0 && lw.frames.empty() &&
+            p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final)
+            lw.xpProc(p.getBody());   // -xprop
+        else
+            lw.stmt(p.getBody());
         lw.finishImplicit();
         // 17.5: in a checker's always_ff, every expression but the event
         // control reads sampled values. Signals made while lowering the body
@@ -9815,6 +9824,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     Lowerer::vpiSites().clear();
     Lowerer::shadowMap().clear();
     Lowerer::shadowArrs().clear();
+    Lowerer::xpReport().clear();
     Lowerer::compilation() = &comp;
     pathRecs().clear();
     portRecs().clear();
