@@ -22,7 +22,7 @@
 // shift clocks. Channel bit (k, u) is what channel k carries in shift cycle u.
 #pragma once
 #include <atomic>
-#include <thread>
+#include "../parallel.hpp"
 
 #include "lbist.hpp"
 
@@ -249,32 +249,22 @@ struct EdtStats {
 inline std::vector<EdtEncoder::Result> encodeAll(const EdtPlan& p, const CubeSet& cs, const EdtOpts& o, EdtStats& st) {
     EdtEncoder enc(p);
     std::vector<EdtEncoder::Result> out(cs.cubes.size());
-    int hw = (int)std::thread::hardware_concurrency();
-    int nt = o.threads > 0 ? o.threads : std::max(1, hw);
+    int nt = o.threads > 0 ? o.threads : (int)par::defaultThreads();
     nt = std::max(1, std::min<int>(nt, (int)cs.cubes.size()));
     bool rnd = o.fill != "0" && o.fill != "zero";
     auto t0 = std::chrono::steady_clock::now();
-    std::atomic<size_t> next{0};
-    std::string failure;
     std::atomic<bool> bad{false};
-    auto work = [&]() {
-        for (;;) {
-            size_t i = next.fetch_add(1);
-            if (i >= cs.cubes.size() || bad) return;
-            // The fill depends on the pattern alone, so any thread count gives the same answer.
-            out[i] = enc.encode(cs.cubes[i], 0x51ED270B9F3A1C47ull ^ ((uint64_t)cs.ids[i] * 0x9E3779B97F4A7C15ull), rnd);
-            if (out[i].ok) {
-                std::vector<std::string> ld = p.loads(out[i].channels);
-                for (int ch = 0; ch < p.n && !bad; ch++)
-                    for (size_t j = 0; j < ld[ch].size(); j++)
-                        if (cs.cubes[i][ch][j] != 'x' && cs.cubes[i][ch][j] != ld[ch][j]) bad = true;
-            }
+    par::parallelFor(cs.cubes.size(), (unsigned)nt, [&](size_t i) {
+        if (bad) return;
+        // The fill depends on the pattern alone, so any thread count gives the same answer.
+        out[i] = enc.encode(cs.cubes[i], 0x51ED270B9F3A1C47ull ^ ((uint64_t)cs.ids[i] * 0x9E3779B97F4A7C15ull), rnd);
+        if (out[i].ok) {
+            std::vector<std::string> ld = p.loads(out[i].channels);
+            for (int ch = 0; ch < p.n && !bad; ch++)
+                for (size_t j = 0; j < ld[ch].size(); j++)
+                    if (cs.cubes[i][ch][j] != 'x' && cs.cubes[i][ch][j] != ld[ch][j]) bad = true;
         }
-    };
-    std::vector<std::thread> pool;
-    for (int t = 1; t < nt; t++) pool.emplace_back(work);
-    work();
-    for (std::thread& t : pool) t.join();
+    });
     if (bad) throw Error("internal error: a decompressed pattern does not match its cube");
     st.total = (int)cs.cubes.size(), st.threads = nt;
     for (const auto& r : out) {
