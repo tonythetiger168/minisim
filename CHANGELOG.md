@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
+  netlist, RTL against RTL): both designs become one and-inverter graph,
+  flops and latches are matched by name (or by the net on their output, also
+  when stored inverted) and cut, and every output, next-state function and
+  clock/reset is proved equal by structural hashing, random simulation and
+  SAT on all cores, with a counterexample for each failing point. X in the
+  reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
+  `-report`. See `docs/EQUIV.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.

@@ -116,6 +116,48 @@ public:
         return memo[rn] ^ (root & 1u);
     }
 
+    // Copy the cone of `root`, replacing each placeholder input by the logic
+    // it stands for (defs: input node -> literal), which may itself contain
+    // placeholders. Returns kNoLit if the definitions are circular; *culprit
+    // is then a placeholder on the cycle.
+    template<typename Defs>
+    Lit resolve(Lit root, std::vector<Lit>& memo, const Defs& defs, std::vector<uint8_t>& active,
+                uint32_t* culprit = nullptr) {
+        uint32_t rn = nodeOf(root);
+        if (rn == 0) return root;
+        std::vector<uint32_t> st{rn};
+        while (!st.empty()) {
+            uint32_t n = st.back();
+            if (memo[n] != kNoLit) { st.pop_back(); continue; }
+            Node nd = nodes_[n];
+            if (nd.a == kNoLit) {
+                auto it = defs.find(n);
+                if (it == defs.end()) { memo[n] = Lit(n << 1); st.pop_back(); continue; }
+                uint32_t dn = nodeOf(it->second);
+                if (dn == 0) { memo[n] = it->second; st.pop_back(); continue; }
+                if (memo[dn] != kNoLit) { memo[n] = memo[dn] ^ (it->second & 1u); st.pop_back(); continue; }
+                if (active[n]) {
+                    if (culprit) *culprit = n;
+                    return kNoLit;
+                }
+                active[n] = 1;
+                st.push_back(dn);
+                continue;
+            }
+            uint32_t na = nodeOf(nd.a), nb = nodeOf(nd.b);
+            bool ready = true;
+            if (na && memo[na] == kNoLit) { st.push_back(na); ready = false; }
+            if (nb && memo[nb] == kNoLit) { st.push_back(nb); ready = false; }
+            if (!ready) continue;
+            Lit a = na ? memo[na] ^ (nd.a & 1u) : nd.a;
+            Lit b = nb ? memo[nb] ^ (nd.b & 1u) : nd.b;
+            Lit r = and_(a, b);
+            memo[n] = r;
+            st.pop_back();
+        }
+        return memo[rn] ^ (root & 1u);
+    }
+
     // The same, with a sparse memo: for small cones of a large graph.
     template<typename Map>
     Lit rebuildSparse(Lit root, Map& memo) {

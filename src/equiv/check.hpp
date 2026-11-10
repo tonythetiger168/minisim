@@ -60,7 +60,7 @@ struct Result {
     std::vector<Point> points;
     std::vector<std::string> refOnlyInputs, implOnlyInputs, refOnlyOutputs, implOnlyOutputs;
     std::vector<std::string> refOnlyStates, implOnlyStates;
-    size_t matchedInputs = 0, matchedStates = 0, matchedOutputs = 0;
+    size_t matchedInputs = 0, matchedStates = 0, matchedOutputs = 0, invertedStates = 0;
     size_t passed = 0, failed = 0, aborted = 0;
     bool equivalent() const { return failed == 0 && aborted == 0 && refOnlyOutputs.empty(); }
 };
@@ -164,6 +164,47 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
     };
     std::vector<int> stMap = detail::matchNames(stateKeys(ref.states), stateKeys(impl.states),
                                                 forcedPairs(ref.states, impl.states, stName));
+    // Still unmatched: by the nets that carry Q (a flop cell is known by the
+    // net on its output pin), then by nets that carry !Q: synthesis stores a
+    // register inverted when the library's reset polarity suits it better. A
+    // name must point at one state per side.
+    std::vector<char> stInv(impl.states.size(), 0);
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<char> refUsed(ref.states.size(), 0);
+        for (int r : stMap) if (r >= 0) refUsed[r] = 1;
+        auto keysOf = [](const State& s, bool inv) {
+            std::vector<std::string> k;
+            if (!inv) k.push_back(normalize(s.name));
+            for (auto& a : inv ? s.invAliases : s.aliases) k.push_back(normalize(a));
+            return k;
+        };
+        std::unordered_map<std::string, int> table;
+        for (size_t r = 0; r < ref.states.size(); ++r) {
+            if (refUsed[r]) continue;
+            for (auto& k : keysOf(ref.states[r], false)) {
+                auto [it, fresh] = table.try_emplace(k, int(r));
+                if (!fresh && it->second != int(r)) it->second = -1;
+            }
+        }
+        std::unordered_map<int, int> claim;  // ref -> impl, -1 when two impl states want it
+        std::vector<int> want(impl.states.size(), -1);
+        for (size_t i = 0; i < impl.states.size(); ++i) {
+            if (stMap[i] >= 0) continue;
+            int found = -1;
+            for (auto& k : keysOf(impl.states[i], pass == 1)) {
+                auto it = table.find(k);
+                if (it == table.end() || it->second < 0) continue;
+                if (found >= 0 && found != it->second) { found = -2; break; }
+                found = it->second;
+            }
+            if (found < 0) continue;
+            want[i] = found;
+            auto [it, fresh] = claim.try_emplace(found, int(i));
+            if (!fresh) it->second = -1;
+        }
+        for (size_t i = 0; i < impl.states.size(); ++i)
+            if (want[i] >= 0 && claim[want[i]] == int(i)) stMap[i] = want[i], stInv[i] = pass == 1;
+    }
 
     // ---- match outputs
     rk.clear(), ik.clear();
@@ -182,7 +223,7 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
     }
     for (size_t i = 0; i < impl.states.size(); ++i) {
         if (stMap[i] < 0) { res.implOnlyStates.push_back(impl.states[i].name); continue; }
-        memo[nodeOf(impl.states[i].q)] = ref.states[stMap[i]].q;
+        memo[nodeOf(impl.states[i].q)] = stInv[i] ? neg(ref.states[stMap[i]].q) : ref.states[stMap[i]].q;
         refSt[stMap[i]] = 1;
         ++res.matchedStates;
     }
@@ -227,7 +268,9 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
             res.points.push_back(std::move(p));
             continue;
         }
-        add(Point::Next, rs.name, is.name, rs.next, move(is.next));
+        Bit inext = move(is.next);
+        if (stInv[i]) inext.v = neg(inext.v), ++res.invertedStates;
+        add(Point::Next, rs.name, is.name, rs.next, inext);
         if (!rs.latch) add(Point::Trigger, rs.name, is.name, rs.trig, move(is.trig));
     }
 

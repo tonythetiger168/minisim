@@ -29,6 +29,7 @@
 // This elaborator is deliberately independent of the synthesizer's
 // (src/synth): an equivalence checker that read RTL through the code it is
 // checking could not see that code's mistakes.
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <map>
@@ -87,6 +88,8 @@ struct State {
     std::string name;  // hierarchical bit name, e.g. u_core.cnt[3]
     std::string inst;  // path of the instance that holds it ("" at the top)
     std::string cell;  // that instance's module name
+    std::vector<std::string> aliases;     // other signals that carry Q unchanged (the net on a flop cell's Q pin)
+    std::vector<std::string> invAliases;  // signals that carry !Q
     Lit q = kFalse;    // the AIG input standing for the stored value
     Bit next;          // value stored at the next trigger
     Bit trig;          // flop: OR of the event list's active levels. latch: unused
@@ -153,6 +156,8 @@ public:
                 d.outputs.push_back({bb.names[i], b[i]});
         }
         cur = nullptr;
+        resolvePlaceholders();
+        findAliases();
     }
 
 private:
@@ -186,14 +191,39 @@ private:
         std::unordered_map<const Symbol*, std::vector<bool>> claims;
         std::vector<Claim> claimList;
         int state = 0;  // 0 not run, 1 running, 2 done
+        struct Placeholder {
+            const Symbol* sym;
+            uint32_t bit;
+            Bit p;
+        };
+        std::vector<Placeholder> placeholders;  // bits asked for while running
+    };
+    // Storage a process writes while it executes. Each if/case branch runs in
+    // its own layer on top of the enclosing one; when the branches are done
+    // their layers are merged into muxes on the branch condition.
+    struct Key {
+        const Symbol* sym;
+        uint32_t frame;  // 0: the process itself; else one call of a subroutine
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const { return std::hash<const void*>()(k.sym) * 31 + k.frame; }
+    };
+    struct Layer {
+        std::unordered_map<Key, Bits, KeyHash> env;         // blocking view
+        std::unordered_map<const Symbol*, Bits> nba;        // pending non-blocking writes
+    };
+    struct Flags {
+        Bit ret = kB0, brk = kB0, cont = kB0;
     };
     struct Proc {
         enum Kind { Global, Comb, FF } kind = Global;
         Driver* drv = nullptr;
-        std::unordered_map<const Symbol*, Bits> env, nba;
-        std::vector<std::unordered_map<const Symbol*, Bits>> frames{1};
+        std::vector<Layer> layers{1};
+        std::vector<uint32_t> frames{0};
+        uint32_t nextFrame = 1;
         std::map<std::pair<const Symbol*, uint32_t>, Lit> holds;
-        Bit ret = kB0, brk = kB0, cont = kB0;
+        Flags f;
     };
     struct BBoxIn {
         const Expression* expr;
@@ -212,6 +242,8 @@ private:
     std::unordered_map<const Symbol*, bool> localCache;
     std::deque<Driver> drivers;
     std::vector<BBoxIn> bboxIns;
+    std::unordered_map<uint32_t, Lit> defs;             // placeholder node -> its logic
+    std::unordered_map<uint32_t, std::string> defName;  // for the loop message
     Proc* cur = nullptr;
     Bit guard = kB1;
     Bits emptyArg;
@@ -720,7 +752,18 @@ private:
         if (isSet(si->val[i])) return si->val[i];
         int32_t id = si->drv[i];
         if (id >= 0) {
-            runDriver(drivers[id]);
+            Driver& D = drivers[id];
+            if (D.state == 1) {
+                // The driver of this bit is running and (through some other
+                // logic) asks for its own output. Usually that is one bit of
+                // a bus or one output of a block feeding another: hand out a
+                // placeholder and tie it to the real value when the driver is
+                // done. A true loop is found when placeholders are resolved.
+                Bit p{g.input(), g.input()};
+                D.placeholders.push_back({&s, i, p});
+                return si->val[i] = p;
+            }
+            runDriver(D);
             si = &info(s);
             if (!isSet(si->val[i])) si->val[i] = kBX;
             return si->val[i];
@@ -767,34 +810,48 @@ private:
         return it != cur->drv->claims.end() && it->second[i];
     }
 
-    // What a read of bit i of s sees right now in the executing process.
-    Bit readBit(const Symbol& s, uint32_t i) {
-        if (isLocal(s)) {
-            auto& f = cur->frames.back();
-            auto it = f.find(&s);
-            return it != f.end() && isSet(it->second[i]) ? it->second[i] : kBX;
+    Key keyOf(const Symbol& s) { return {&s, isLocal(s) ? cur->frames.back() : 0}; }
+    bool findEnv(const Key& k, uint32_t i, Bit& out) {
+        for (size_t L = cur->layers.size(); L-- > 0;) {
+            auto it = cur->layers[L].env.find(k);
+            if (it != cur->layers[L].env.end() && isSet(it->second[i])) { out = it->second[i]; return true; }
         }
-        if (cur->kind != Proc::Global) {
-            auto it = cur->env.find(&s);
-            if (it != cur->env.end() && isSet(it->second[i])) return it->second[i];
-            if (cur->kind == Proc::Comb && claimed(s, i)) return {hold(s, i), kFalse};
-        }
-        return getBit(s, i);
+        return false;
     }
-    // The value a write leaves in place when its guard is false.
+    bool findNba(const Symbol& s, uint32_t i, Bit& out) {
+        for (size_t L = cur->layers.size(); L-- > 0;) {
+            auto it = cur->layers[L].nba.find(&s);
+            if (it != cur->layers[L].nba.end() && isSet(it->second[i])) { out = it->second[i]; return true; }
+        }
+        return false;
+    }
+    Bit readKey(const Key& k, uint32_t i) {
+        Bit b;
+        if (k.frame || isLocal(*k.sym)) return findEnv(k, i, b) ? b : kBX;
+        if (cur->kind != Proc::Global) {
+            if (findEnv(k, i, b)) return b;
+            if (cur->kind == Proc::Comb && claimed(*k.sym, i)) return {hold(*k.sym, i), kFalse};
+        }
+        return getBit(*k.sym, i);
+    }
+    // What a read of bit i of s sees right now in the executing process.
+    Bit readBit(const Symbol& s, uint32_t i) { return readKey(keyOf(s), i); }
+    // The value a write leaves in place when it does not happen.
     Bit pending(const Symbol& s, uint32_t i, bool nb) {
         if (nb) {
-            auto it = cur->nba.find(&s);
-            if (it != cur->nba.end() && isSet(it->second[i])) return it->second[i];
+            Bit b;
+            if (findNba(s, i, b)) return b;
             if (cur->kind == Proc::FF) return getBit(s, i);
         }
         return readBit(s, i);
     }
     void writeBit(const Symbol& s, uint32_t i, Bit val, Bit gd, bool nb) {
-        if (isLocal(s)) {
-            auto& vec = cur->frames.back()[&s];
+        Key k = keyOf(s);
+        if (k.frame || isLocal(s)) {
+            if (!isTrue(gd)) val = bv.mux(gd, val, readKey(k, i));
+            auto& vec = cur->layers.back().env[k];
             if (vec.empty()) vec.assign(info(s).width, kUnset);
-            vec[i] = isTrue(gd) ? val : bv.mux(gd, val, isSet(vec[i]) ? vec[i] : kBX);
+            vec[i] = val;
             return;
         }
         if (cur->kind == Proc::Global) {
@@ -803,10 +860,74 @@ private:
         }
         if (!claimed(s, i))
             throw Unsupported("'" + bitNames(s)[i] + "' is assigned from a place the block's analysis did not see");
-        Bit old = isTrue(gd) ? kB0 : pending(s, i, nb);
-        auto& vec = (nb ? cur->nba : cur->env)[&s];
+        if (!isTrue(gd)) val = bv.mux(gd, val, pending(s, i, nb));
+        auto& vec = nb ? cur->layers.back().nba[&s] : cur->layers.back().env[k];
         if (vec.empty()) vec.assign(info(s).width, kUnset);
-        vec[i] = bv.mux(gd, val, old);
+        vec[i] = val;
+    }
+
+    // Run one branch in a layer of its own and hand the layer back.
+    template<typename F>
+    Layer branch(Flags& flags, F&& body) {
+        Flags saved = cur->f;
+        cur->layers.emplace_back();
+        body();
+        Layer L = std::move(cur->layers.back());
+        cur->layers.pop_back();
+        flags = cur->f;
+        cur->f = saved;
+        return L;
+    }
+    // c ? T : E, bit by bit; a bit only one side wrote keeps, on the other
+    // side, what it had before the branch.
+    Layer mergeLayers(Bit c, Layer&& T, Layer&& E) {
+        Layer out;
+        auto one = [&](Bits* t, Bits* e, Bits& o, auto&& below) {
+            size_t w = t ? t->size() : e->size();
+            o.assign(w, kUnset);
+            for (uint32_t i = 0; i < w; ++i) {
+                bool ts = t && isSet((*t)[i]), es = e && isSet((*e)[i]);
+                if (!ts && !es) continue;
+                Bit tv = ts ? (*t)[i] : below(i), ev = es ? (*e)[i] : below(i);
+                o[i] = bv.mux(c, tv, ev);
+            }
+        };
+        for (auto& [k, tb] : T.env) {
+            if (k.frame && k.frame != cur->frames.back()) continue;  // a finished call's locals
+            auto ie = E.env.find(k);
+            one(&tb, ie == E.env.end() ? nullptr : &ie->second, out.env[k], [&](uint32_t i) { return readKey(k, i); });
+        }
+        for (auto& [k, eb] : E.env) {
+            if (T.env.count(k) || (k.frame && k.frame != cur->frames.back())) continue;
+            one(nullptr, &eb, out.env[k], [&](uint32_t i) { return readKey(k, i); });
+        }
+        for (auto& [sym, tb] : T.nba) {
+            auto ie = E.nba.find(sym);
+            const Symbol* sp = sym;
+            one(&tb, ie == E.nba.end() ? nullptr : &ie->second, out.nba[sym], [&](uint32_t i) { return pending(*sp, i, true); });
+        }
+        for (auto& [sym, eb] : E.nba) {
+            if (T.nba.count(sym)) continue;
+            const Symbol* sp = sym;
+            one(nullptr, &eb, out.nba[sym], [&](uint32_t i) { return pending(*sp, i, true); });
+        }
+        return out;
+    }
+    Flags mergeFlags(Bit c, const Flags& t, const Flags& e) {
+        return {bv.mux(c, t.ret, e.ret), bv.mux(c, t.brk, e.brk), bv.mux(c, t.cont, e.cont)};
+    }
+    void absorb(Layer&& L) {
+        Layer& top = cur->layers.back();
+        for (auto& [k, b] : L.env) {
+            auto& vec = top.env[k];
+            if (vec.empty()) { vec = std::move(b); continue; }
+            for (size_t i = 0; i < b.size(); ++i) if (isSet(b[i])) vec[i] = b[i];
+        }
+        for (auto& [sym, b] : L.nba) {
+            auto& vec = top.nba[sym];
+            if (vec.empty()) { vec = std::move(b); continue; }
+            for (size_t i = 0; i < b.size(); ++i) if (isSet(b[i])) vec[i] = b[i];
+        }
     }
 
     Bits readRange(const Claim& c) {
@@ -1212,33 +1333,40 @@ private:
         if (++callDepth > 512) fail("function recursion is too deep (or not bounded by constants)", c);
         auto formals = sub.getArguments();
         auto args = c.arguments();
-        std::unordered_map<const Symbol*, Bits> frame;
+        std::vector<std::pair<const Symbol*, Bits>> bind;
         for (size_t i = 0; i < formals.size() && i < args.size(); ++i) {
             if (formals[i]->direction == ArgumentDirection::Out) continue;
             const Expression* a = args[i];
             if (a->kind == ExpressionKind::Assignment) a = &a->as<AssignmentExpression>().left();
-            frame[formals[i]] = Bv::resize(evalExpr(*a), widthOf(formals[i]->getType()), a->type->isSigned());
+            bind.push_back({formals[i], Bv::resize(evalExpr(*a), widthOf(formals[i]->getType()), a->type->isSigned())});
         }
-        Bit sRet = cur->ret, sBrk = cur->brk, sCont = cur->cont, sGuard = guard;
-        cur->ret = cur->brk = cur->cont = kB0;
-        cur->frames.push_back(std::move(frame));
+        Flags sFlags = cur->f;
+        Bit sGuard = guard;
+        cur->f = {};
+        uint32_t fid = cur->nextFrame++;
+        cur->frames.push_back(fid);
+        for (auto& [sym, b] : bind) cur->layers.back().env[Key{sym, fid}] = std::move(b);
         retVars.push_back(sub.returnValVar);
         execStmt(sub.getBody(), sGuard);
         retVars.pop_back();
-        auto done = std::move(cur->frames.back());
-        cur->frames.pop_back();
-        cur->ret = sRet, cur->brk = sBrk, cur->cont = sCont, guard = sGuard;
         auto local = [&](const Symbol* s) {
             Bits r(widthOf(s->as<ValueSymbol>().getType()), kBX);
-            auto it = done.find(s);
-            if (it != done.end())
-                for (size_t i = 0; i < r.size(); ++i)
-                    if (isSet(it->second[i])) r[i] = it->second[i];
+            Bit b;
+            for (uint32_t i = 0; i < r.size(); ++i)
+                if (findEnv(Key{s, fid}, i, b)) r[i] = b;
             return r;
         };
+        std::vector<Bits> outs(formals.size());
+        for (size_t i = 0; i < formals.size() && i < args.size(); ++i)
+            if (formals[i]->direction != ArgumentDirection::In) outs[i] = local(formals[i]);
+        Bits result;
+        if (sub.returnValVar) result = local(sub.returnValVar);
+        cur->frames.pop_back();
+        cur->f = sFlags;
+        guard = sGuard;
         for (size_t i = 0; i < formals.size() && i < args.size(); ++i) {
             if (formals[i]->direction == ArgumentDirection::In) continue;
-            Bits v = local(formals[i]);
+            Bits v = outs[i];
             const Expression* a = args[i];
             if (a->kind == ExpressionKind::Assignment) {
                 auto& as = a->as<AssignmentExpression>();
@@ -1249,13 +1377,12 @@ private:
             assign(*a, Bv::resize(v, widthOf(*a->type), false), guard, false);
         }
         --callDepth;
-        if (!sub.returnValVar) return {};
-        return local(sub.returnValVar);
+        return result;
     }
 
     // ---------------------------------------------------------- statements
     Bit live(Bit gd) {
-        Bit dead = bv.or_(cur->ret, bv.or_(cur->brk, cur->cont));
+        Bit dead = bv.or_(cur->f.ret, bv.or_(cur->f.brk, cur->f.cont));
         return isFalse(dead) ? gd : bv.and_(gd, bv.not_(dead));
     }
 
@@ -1291,14 +1418,25 @@ private:
                     if (cc.pattern) fail("pattern in an if", s);
                     cond = bv.and_(cond, truth(*cc.expr));
                 }
-                execStmt(c.ifTrue, bv.and_(gd, cond));
-                if (c.ifFalse) execStmt(*c.ifFalse, bv.and_(gd, bv.not_(cond)));
+                if (isTrue(cond)) { execStmt(c.ifTrue, gd); break; }
+                if (isFalse(cond)) { if (c.ifFalse) execStmt(*c.ifFalse, gd); break; }
+                Flags ft, fe;
+                Layer T = branch(ft, [&] { execStmt(c.ifTrue, gd); });
+                Layer E = branch(fe, [&] { if (c.ifFalse) execStmt(*c.ifFalse, gd); });
+                absorb(mergeLayers(cond, std::move(T), std::move(E)));
+                cur->f = mergeFlags(cond, ft, fe);
                 break;
             }
             case StatementKind::Case: {
                 auto& c = s.as<CaseStatement>();
                 Bits sel = evalExpr(c.expr);
-                Bit matched = kB0;
+                struct Arm {
+                    Bit m;
+                    Layer L;
+                    Flags f;
+                };
+                std::vector<Arm> arms;
+                bool closed = false;  // an arm that always matches ends the list
                 for (auto& item : c.items) {
                     Bit m = kB0;
                     for (auto* ie : item.expressions) {
@@ -1314,10 +1452,43 @@ private:
                         }
                         m = bv.or_(m, one);
                     }
-                    execStmt(*item.stmt, bv.and_(gd, bv.and_(bv.not_(matched), m)));
-                    matched = bv.or_(matched, m);
+                    if (isFalse(m)) continue;
+                    Arm a;
+                    a.m = m;
+                    a.L = branch(a.f, [&] { execStmt(*item.stmt, gd); });
+                    arms.push_back(std::move(a));
+                    if (isTrue(m)) { closed = true; break; }
                 }
-                if (c.defaultCase) execStmt(*c.defaultCase, bv.and_(gd, bv.not_(matched)));
+                Flags accF = cur->f;
+                Layer acc;
+                if (closed) {
+                    acc = std::move(arms.back().L);
+                    accF = arms.back().f;
+                    arms.pop_back();
+                } else if (c.defaultCase) {
+                    acc = branch(accF, [&] { execStmt(*c.defaultCase, gd); });
+                } else if (c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Priority) {
+                    // unique/priority with no default: no arm matching is an
+                    // error in the design, so those values are don't-cares.
+                    for (auto& a : arms) {
+                        for (auto& [k, b] : a.L.env) {
+                            auto& v = acc.env[k];
+                            if (v.empty()) v.assign(b.size(), kUnset);
+                            for (size_t i = 0; i < b.size(); ++i) if (isSet(b[i])) v[i] = kBX;
+                        }
+                        for (auto& [sym, b] : a.L.nba) {
+                            auto& v = acc.nba[sym];
+                            if (v.empty()) v.assign(b.size(), kUnset);
+                            for (size_t i = 0; i < b.size(); ++i) if (isSet(b[i])) v[i] = kBX;
+                        }
+                    }
+                }
+                for (size_t k = arms.size(); k-- > 0;) {
+                    acc = mergeLayers(arms[k].m, std::move(arms[k].L), std::move(acc));
+                    accF = mergeFlags(arms[k].m, arms[k].f, accF);
+                }
+                absorb(std::move(acc));
+                cur->f = accF;
                 break;
             }
             case StatementKind::ForLoop: {
@@ -1326,7 +1497,11 @@ private:
                 // meaningful inside the loop, and it must stay a constant.
                 guard = kB1;
                 for (auto* v : f.loopVars) declare(*v);
-                for (auto* init : f.initializers) evalExpr(*init);
+                for (auto* init : f.initializers) {
+                    if (init->kind == ExpressionKind::Assignment)
+                        if (const Symbol* lv = valueSym(init->as<AssignmentExpression>().left())) loopCounters.insert(lv);
+                    evalExpr(*init);
+                }
                 loop(s, f.stopExpr, &f.body, f.steps, gd, false);
                 break;
             }
@@ -1344,13 +1519,13 @@ private:
                 auto& r = s.as<RepeatLoopStatement>();
                 auto n = constInt(r.count, true);
                 if (!n) fail("repeat count is not constant", s);
-                Bit sBrk = cur->brk, sCont = cur->cont;
-                cur->brk = kB0;
-                for (int64_t i = 0; i < *n && !isTrue(cur->brk); ++i) {
-                    cur->cont = kB0;
+                Bit sBrk = cur->f.brk, sCont = cur->f.cont;
+                cur->f.brk = kB0;
+                for (int64_t i = 0; i < *n && !isTrue(cur->f.brk); ++i) {
+                    cur->f.cont = kB0;
                     execStmt(r.body, gd);
                 }
-                cur->brk = sBrk, cur->cont = sCont;
+                cur->f.brk = sBrk, cur->f.cont = sCont;
                 break;
             }
             case StatementKind::Return: {
@@ -1361,32 +1536,30 @@ private:
                     if (!rv) fail("return with a value outside a function", s);
                     for (uint32_t i = 0; i < v.size() && i < info(*rv).width; ++i) writeBit(*rv, i, v[i], gd, false);
                 }
-                cur->ret = bv.or_(cur->ret, gd);
+                cur->f.ret = bv.or_(cur->f.ret, gd);
                 break;
             }
-            case StatementKind::Break: cur->brk = bv.or_(cur->brk, gd); break;
-            case StatementKind::Continue: cur->cont = bv.or_(cur->cont, gd); break;
+            case StatementKind::Break: cur->f.brk = bv.or_(cur->f.brk, gd); break;
+            case StatementKind::Continue: cur->f.cont = bv.or_(cur->f.cont, gd); break;
             default: fail("unsupported statement (" + std::string(toString(s.kind)) + ")", s);
         }
         guard = saved;
     }
 
     std::vector<const Symbol*> retVars;
+    std::unordered_set<const Symbol*> loopCounters;
 
     void declare(const VariableSymbol& v) {
-        auto& vec = cur->frames.back()[&v];
-        vec.assign(info(v).width, kUnset);
-        if (const Expression* init = v.getInitializer()) {
-            Bits b = Bv::resize(evalExpr(*init), vec.size(), init->type->isSigned());
-            auto& vec2 = cur->frames.back()[&v];
-            for (size_t i = 0; i < b.size(); ++i) vec2[i] = b[i];
-        }
+        Bits b(info(v).width, kBX);
+        if (const Expression* init = v.getInitializer())
+            b = Bv::resize(evalExpr(*init), b.size(), init->type->isSigned());
+        cur->layers.back().env[keyOf(v)] = std::move(b);
     }
 
     void loop(const Statement& s, const Expression* cond, const Statement* body,
               std::span<const Expression* const> steps, Bit gd, bool bodyFirst) {
-        Bit sBrk = cur->brk, sCont = cur->cont;
-        cur->brk = kB0;
+        Bit sBrk = cur->f.brk, sCont = cur->f.cont;
+        cur->f.brk = kB0;
         for (size_t iter = 0;; ++iter) {
             if (iter > opt.maxLoop) fail("loop does not end within " + std::to_string(opt.maxLoop) + " iterations", s);
             if (cond && !(bodyFirst && iter == 0)) {
@@ -1395,23 +1568,19 @@ private:
                 if (!isConst(c)) fail("loop condition is not a constant when the loop is unrolled", s);
                 if (isFalse(c)) break;
             }
-            if (isTrue(cur->brk) || isTrue(cur->ret)) break;
-            cur->cont = kB0;
+            if (isTrue(cur->f.brk) || isTrue(cur->f.ret)) break;
+            cur->f.cont = kB0;
             execStmt(*body, gd);
-            cur->cont = kB0;
+            cur->f.cont = kB0;
             guard = kB1;
             for (auto* st : steps) evalExpr(*st);
         }
-        cur->brk = sBrk, cur->cont = sCont;
+        cur->f.brk = sBrk, cur->f.cont = sCont;
     }
 
     // -------------------------------------------------------------- drivers
     void runDriver(Driver& dr) {
         if (dr.state == 2) return;
-        if (dr.state == 1) {
-            std::string at = dr.owner ? pathOf(*dr.owner) : std::string("?");
-            throw Unsupported("combinational loop through '" + (dr.claimList.empty() ? at : bitNames(*dr.claimList[0].sym)[dr.claimList[0].lo]) + "'");
-        }
         dr.state = 1;
         Proc proc;
         Proc* savedCur = cur;
@@ -1459,6 +1628,60 @@ private:
         guard = savedGuard;
         lvalStack = std::move(savedLv);
         dr.state = 2;
+        for (auto& ph : dr.placeholders) {
+            SymInfo& si = info(*ph.sym);
+            if (si.val[ph.bit] == ph.p) si.val[ph.bit] = kBX;  // claimed, never assigned
+            defs[nodeOf(ph.p.v)] = si.val[ph.bit].v;
+            defs[nodeOf(ph.p.x)] = si.val[ph.bit].x;
+            defName[nodeOf(ph.p.v)] = defName[nodeOf(ph.p.x)] = bitNames(*ph.sym)[ph.bit];
+        }
+        dr.placeholders.clear();
+    }
+
+    // A flop inside a library cell is called whatever the cell calls it (Q);
+    // what identifies it is the net on its output. Record every signal whose
+    // value is exactly a state element's Q.
+    void findAliases() {
+        std::unordered_map<Lit, size_t> byQ;
+        // A latch is seen through its transparent output, not its stored value.
+        for (size_t i = 0; i < d.states.size(); ++i) byQ[d.states[i].latch ? d.states[i].next.v : d.states[i].q] = i;
+        for (auto& [sym, si] : syms) {
+            if (isLocal(*sym)) continue;
+            const std::vector<std::string>* nm = nullptr;
+            for (uint32_t i = 0; i < si.width; ++i) {
+                if (!isSet(si.val[i]) || si.val[i].x != kFalse) continue;
+                bool inv = false;
+                auto it = byQ.find(si.val[i].v);
+                if (it == byQ.end()) it = byQ.find(neg(si.val[i].v)), inv = true;
+                if (it == byQ.end()) continue;
+                if (!nm) nm = &bitNames(*sym);
+                State& st = d.states[it->second];
+                if ((*nm)[i] != st.name) (inv ? st.invAliases : st.aliases).push_back((*nm)[i]);
+            }
+        }
+        for (auto& st : d.states)
+            for (auto* v : {&st.aliases, &st.invAliases}) {
+                std::sort(v->begin(), v->end(), [](const std::string& a, const std::string& b) {
+                    return a.size() != b.size() ? a.size() < b.size() : a < b;
+                });
+                if (v->size() > 8) v->resize(8);
+            }
+    }
+
+    void resolvePlaceholders() {
+        if (defs.empty()) return;
+        std::vector<Lit> memo(g.size(), kNoLit);
+        std::vector<uint8_t> active(g.size(), 0);
+        auto fix = [&](Bit& b) {
+            for (Lit* l : {&b.v, &b.x}) {
+                uint32_t culprit = 0;
+                Lit r = g.resolve(*l, memo, defs, active, &culprit);
+                if (r == kNoLit) throw Unsupported("combinational loop through '" + defName[culprit] + "'");
+                *l = r;
+            }
+        };
+        for (auto& o : d.outputs) fix(o.second);
+        for (auto& st : d.states) fix(st.next), fix(st.trig);
     }
 
     void runPrim(Driver& dr) {
@@ -1536,12 +1759,14 @@ private:
         };
         std::vector<Res> res;
         for (auto& [sym, mask] : dr.claims) {
-            auto ie = proc.env.find(sym), in = proc.nba.find(sym);
+            auto& base = proc.layers[0];
+            auto ie = base.env.find(Key{sym, 0});
+            auto in = base.nba.find(sym);
             for (uint32_t i = 0; i < mask.size(); ++i) {
                 if (!mask[i]) continue;
                 Bit v = kBX;
-                if (in != proc.nba.end() && isSet(in->second[i])) v = in->second[i];
-                else if (ie != proc.env.end() && isSet(ie->second[i])) v = ie->second[i];
+                if (in != base.nba.end() && isSet(in->second[i])) v = in->second[i];
+                else if (ie != base.env.end() && isSet(ie->second[i])) v = ie->second[i];
                 res.push_back({sym, i, v});
             }
         }
@@ -1563,8 +1788,12 @@ private:
             m1[nodeOf(h)] = kTrue;
             Lit diff = kFalse;
             for (auto& r : res) {
-                diff = g.or_(diff, g.xor_(g.rebuildSparse(r.v.v, m0), g.rebuildSparse(r.v.v, m1)));
-                diff = g.or_(diff, g.xor_(g.rebuildSparse(r.v.x, m0), g.rebuildSparse(r.v.x, m1)));
+                // Only definite values count: an X result is a don't-care
+                // whatever the held value was.
+                Lit v0 = g.rebuildSparse(r.v.v, m0), v1 = g.rebuildSparse(r.v.v, m1);
+                if (v0 == v1) continue;
+                Lit x0 = g.rebuildSparse(r.v.x, m0), x1 = g.rebuildSparse(r.v.x, m1);
+                diff = g.or_(diff, g.and_(g.xor_(v0, v1), g.and_(neg(x0), neg(x1))));
             }
             bool depends = false;
             if (diff != kFalse) {
@@ -1625,7 +1854,9 @@ private:
             if (std::find(order.begin(), order.end(), c.sym) == order.end()) order.push_back(c.sym);
         for (const Symbol* sym : order) {
             auto& mask = dr.claims[sym];
-            auto ie = proc.env.find(sym), in = proc.nba.find(sym);
+            auto& base = proc.layers[0];
+            auto ie = base.env.find(Key{sym, 0});
+            auto in = base.nba.find(sym);
             const auto& nm = bitNames(*sym);
             for (uint32_t i = 0; i < mask.size(); ++i) {
                 if (!mask[i]) continue;
@@ -1634,9 +1865,11 @@ private:
                 owner(*sym, st);
                 st.q = info(*sym).val[i].v;
                 st.next = {st.q, kFalse};
-                if (in != proc.nba.end() && isSet(in->second[i])) st.next = in->second[i];
-                else if (ie != proc.env.end() && isSet(ie->second[i])) st.next = ie->second[i];
+                if (in != base.nba.end() && isSet(in->second[i])) st.next = in->second[i];
+                else if (ie != base.env.end() && isSet(ie->second[i])) st.next = ie->second[i];
                 st.trig = trig;
+                // A loop counter in a clocked block is not a register anyone built.
+                if (loopCounters.count(sym)) continue;
                 d.states.push_back(std::move(st));
             }
         }

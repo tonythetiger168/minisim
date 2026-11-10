@@ -269,8 +269,14 @@ int main(int argc, char** argv) {
                 printf("  warning: %s\n", w.c_str());
             }
         }
-        printf("Matched:        %zu inputs, %zu outputs, %zu state elements\n", res.matchedInputs,
+        if (verbose)
+            for (Side* s : {&ref, &impl})
+                for (auto& st : s->design.states)
+                    if (st.latch) printf("  %s latch: %s\n", s->label, st.name.c_str());
+        printf("Matched:        %zu inputs, %zu outputs, %zu state elements", res.matchedInputs,
                res.matchedOutputs, res.matchedStates);
+        if (res.invertedStates) printf(" (%zu stored inverted)", res.invertedStates);
+        printf("\n");
         auto list = [&](const char* what, const std::vector<std::string>& v) {
             if (v.empty()) return;
             printf("Unmatched %s: %zu", what, v.size());
