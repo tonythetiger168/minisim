@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `meco`, a functional ECO tool: given the implemented gate netlist and a
+  netlist of the revised design, it writes the smallest patch it can find
+  (patched netlist plus a Tcl edit script) and proves the result equivalent.
+  It looks for the gate or pin to change before copying any logic, reuses old
+  nets proved to have the same function, handles added, removed and replaced
+  registers, scan flops (`-tie se=0`) and black boxes, and gives the same
+  patch for any `-threads`. See `docs/ECO.md`.
 - `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
   netlist, RTL against RTL): both designs become one and-inverter graph,
   flops and latches are matched by name (or by the net on their output, also
