@@ -369,6 +369,7 @@ public:
                  "        uint64_t k = R.size();\n"
                  "        std::fwrite(&k, 8, 1, f); std::fwrite(R.data(), 8, k, f); std::fwrite(F.data(), 8, k, f);\n"
                  "    }\n"
+                 "    { std::ofstream fc(std::string(path) + \".fcov\"); writeFuncCov(fc); }   // covergroups, assertions\n"
                  "    return std::fclose(f) == 0;\n"
                  "}\n\n";
         o << "int main(int argc, char** argv) {\n"

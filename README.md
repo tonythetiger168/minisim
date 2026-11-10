@@ -197,8 +197,11 @@ mregress tests.list -cov            # regress.d/cov.json + regress.d/cov_html/
 ```
 
 The LCOV file works with `genhtml` and with editor and CI coverage plugins.
-Covergroups (functional coverage, 19) come with the spec work. `-compile`
-with `-cov` runs in the interpreter for now.
+
+The database also holds functional coverage: the bins of every covergroup
+type (19) and the evaluations, passes and failures of every assertion (16).
+`mcov report` prints both, lists uncovered bins and failed or idle
+assertions in the HTML, and gates them with `-min-func` and `-min-assert`.
 
 ### Protected IP: `msimprotect` and `msim -keyfile`
 
