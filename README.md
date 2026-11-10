@@ -486,6 +486,21 @@ The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
 (`src/tcl.hpp`) are shared with the timing and synthesis tools. See
 [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
 
+### Static timing analysis: `msta`
+
+`msta` times a gate-level netlist against SDC constraints with Liberty
+libraries, PrimeTime style, and builds without the slang front end:
+
+```sh
+msta -lib cells.lib netlist.v -top top -sdc top.sdc      # check_timing, worst setup and hold paths, summary
+msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf  # delays and timing checks for msim -sdf
+msta -f run.tcl                                          # report_timing, report_constraint, ... in a Tcl script
+```
+
+It runs on every core by default (`-threads N`), with the same results at any
+thread count. Commands, what is modeled and the current limits are in
+[docs/STA.md](docs/STA.md).
+
 ### Lint and clock-domain checks: `mlint`
 
 `mlint` runs the same front end as `msim` and then checks the elaborated
@@ -556,6 +571,19 @@ isolation or level shifters, names not in the design, ...). See
 msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
+
+### Logic synthesis: `msynth`
+
+`msynth` synthesizes RTL to a gate netlist of Liberty library cells, with a
+Tcl shell whose commands follow dc_shell:
+
+```sh
+msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the built-in generic library
+msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
+```
+
+See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
 
 ### Formal property checking: `mformal`
 

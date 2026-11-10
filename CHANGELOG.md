@@ -120,6 +120,16 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Logic synthesis: `msynth`, a dc_shell-style Tcl shell (`analyze`,
+  `elaborate`, `create_clock`, `compile`, `report_timing`, `report_area`,
+  `report_qor`, `write -format verilog` ...) on the slang front end. RTL is
+  flattened into an and-inverter graph with flops (`src/aig.hpp`,
+  `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
+  mapped onto any Liberty library by cut matching for area or delay,
+  high-fanout nets are buffered, and the result is timed with the library's
+  NLDM tables. A generic cell library is built in. Mapping runs on every
+  core (`-threads N`) with the same netlist for any thread count. See
+  `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
@@ -270,6 +280,17 @@ Spec references are IEEE 1800-2023 clauses.
   `docs/CONSTRAINTS.md`.
 - SDC reader: object lookups use sorted name indexes and `-filter` is parsed
   once, so large designs with thousands of queries read in seconds.
+- `msta`: static timing analysis of gate-level netlists in the style of
+  PrimeTime. Liberty (NLDM) delay calculation, ideal and propagated clocks,
+  generated clocks, setup / hold / recovery / removal and output delay
+  checks, false paths, multicycle paths, max and min delay, clock groups,
+  `max_transition` and `max_capacitance`; `check_timing`, `report_timing`,
+  `report_constraint`, `report_clocks`, `report_qor`, SDF and JSON output;
+  Tcl scripts on the shared SDC reader. Multithreaded, with the same results
+  at any thread count. See `docs/STA.md`.
+- `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
+  Verilog netlist reader / flattener / writer, shared by the timing,
+  synthesis, power, equivalence and physical tools.
 
 ### Fixed
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes
