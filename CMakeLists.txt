@@ -82,22 +82,10 @@ if(Python3_FOUND)
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
 
-# Cell library checks and reports on the shared Liberty and LEF readers:
-# mlibc check lib.lib -lef cells.lef. No external dependencies.
-find_package(Threads REQUIRED)
-add_executable(mlibc src/mlibc.cpp)
-target_include_directories(mlibc PRIVATE src)
-target_link_libraries(mlibc PRIVATE Threads::Threads)
-add_test(NAME mlibc
-         COMMAND ${CMAKE_COMMAND} -DMLIBC=$<TARGET_FILE:mlibc> -DSRC=${CMAKE_SOURCE_DIR}
-                 -P ${CMAKE_SOURCE_DIR}/tests/mlibc.cmake)
-
-# The mini45 cell library (lib/mini45) is generated; the files in the tree
-# must be what the generator writes.
-if(Python3_FOUND)
-  add_test(NAME mini45_gen
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/lib/mini45/gen_mini45.py --check)
-endif()
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/mrcx.cmake)
+include(cmake/tools/mini45.cmake)
+include(cmake/tools/mlibc.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -378,7 +366,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim mlibc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -404,13 +392,9 @@ install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisi
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-# The generic cell library: Liberty corners, Verilog models, LEF.
-install(DIRECTORY lib/mini45 DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/lib
-        FILES_MATCHING PATTERN "*.lib" PATTERN "*.lef" PATTERN "mini45.v")
 # The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
-              docs/MINI45.md docs/LIBCHECK.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)

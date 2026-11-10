@@ -29,6 +29,14 @@ Spec references are IEEE 1800-2023 clauses.
   through time, and `-html` for a one-file viewer (hierarchy, clickable
   source, drivers and loads, schematic, waves with values annotated in the
   source). See `docs/DEBUG.md`.
+- `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
+  1481) out. Per net a distributed RC network with capacitance to ground and
+  coupling capacitance to same-layer neighbours and to crossings, from an
+  ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
+  factors, decoupled output, per-net report, open and short checks
+  (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
+  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  See `docs/RCX.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
