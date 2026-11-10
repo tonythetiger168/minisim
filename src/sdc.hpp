@@ -34,6 +34,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -265,6 +266,9 @@ public:
     // extra["set_dont_touch"] = "| objects=o:cn value=s?".
     std::map<std::string, std::string> extra;
 
+    // Threads for the name indexes of a large design (every logical core by
+    // default; the result does not depend on it).
+    int threads = std::max(1u, std::thread::hardware_concurrency());
     Reader() { busBrackets = true; }  // get_ports data[3] needs no braces
 
     // The objects behind a word: collection handles and bare names.
@@ -297,70 +301,142 @@ private:
         return &cols_[i];
     }
 
-    std::map<Kind, std::unordered_set<std::string>> exact_;
-    bool exists(Kind k, const std::string& n) {
-        auto it = exact_.find(k);
-        if (it == exact_.end()) {
-            auto& set = exact_[k];
-            for (auto& s : design->names(k)) set.insert(s);
-            it = exact_.find(k);
+    struct Clause { std::string attr, want; int op = 0; };  // op: 0 ==, 1 !=, 2 =~, 3 !~
+    using Filter = std::vector<std::vector<Clause>>;         // any of (all of)
+    // Name indexes per kind, built on first use: sorted by full name and by
+    // leaf name (the part after the last '/'), so a pattern with a literal
+    // start is a range lookup and not a scan of the design.
+    struct Index { std::vector<uint32_t> byName, byLeaf; };
+    std::map<Kind, Index> index_;
+    static std::string_view leafOf(const std::string& s) {
+        size_t p = s.rfind('/');
+        return p == std::string::npos ? std::string_view(s) : std::string_view(s).substr(p + 1);
+    }
+    // Sorts on `threads` threads: each sorts a slice, then the slices are
+    // merged pairwise. The result is the same for any thread count.
+    template <typename Less>
+    void sortIndex(std::vector<uint32_t>& v, Less less) {
+        size_t n = v.size();
+        int t = std::max(1, std::min(threads, 64));
+        if (t == 1 || n < 50000) { std::sort(v.begin(), v.end(), less); return; }
+        std::vector<size_t> cut(t + 1);
+        for (int i = 0; i <= t; i++) cut[i] = n * i / t;
+        std::vector<std::thread> pool;
+        for (int i = 1; i < t; i++) pool.emplace_back([&, i] { std::sort(v.begin() + cut[i], v.begin() + cut[i + 1], less); });
+        std::sort(v.begin(), v.begin() + cut[1], less);
+        for (auto& th : pool) th.join();
+        for (int step = 1; step < t; step *= 2) {
+            pool.clear();
+            for (int i = 0; i + step < t; i += 2 * step)
+                pool.emplace_back([&, i, step] {
+                    std::inplace_merge(v.begin() + cut[i], v.begin() + cut[i + step], v.begin() + cut[std::min(t, i + 2 * step)], less);
+                });
+            for (auto& th : pool) th.join();
         }
-        return it->second.count(n) != 0;
+    }
+    const std::vector<uint32_t>& indexOf(Kind k, bool leaf) {
+        const auto& names = design->names(k);
+        Index& ix = index_[k];
+        auto& v = leaf ? ix.byLeaf : ix.byName;
+        if (v.size() == names.size()) return v;
+        v.resize(names.size());
+        for (uint32_t i = 0; i < names.size(); i++) v[i] = i;
+        if (leaf)
+            sortIndex(v, [&](uint32_t a, uint32_t b) {
+                auto la = leafOf(names[a]), lb = leafOf(names[b]);
+                return la != lb ? la < lb : a < b;
+            });
+        else
+            sortIndex(v, [&](uint32_t a, uint32_t b) { return names[a] != names[b] ? names[a] < names[b] : a < b; });
+        return v;
     }
 
     struct Query {
         bool hier = false, regexp = false, nocase = false;
     };
     // Design objects of a kind matching one pattern.
-    void findIn(Kind k, const std::string& pat, const Query& q, ObjList& out) {
+    void findIn(Kind k, const std::string& pat, const Query& q, ObjList& out, const Filter* flt = nullptr) {
+        auto keep = [&](const std::string& n) { return !flt || filterOne(k, n, *flt); };
         if (k == Kind::Clock) {
             std::set<std::string> seen;
             for (auto& c : sdc.clocks)
-                if (matchName(pat, c.name, q) && seen.insert(c.name).second) out.push_back({Kind::Clock, c.name, true});
+                if (matchName(pat, c.name, q) && seen.insert(c.name).second && keep(c.name)) out.push_back({Kind::Clock, c.name, true});
             return;
         }
         if (k == Kind::LibCell || !design) return;
-        if (!q.hier && !q.regexp && !q.nocase && !hasWild(pat) && pat.find('\\') == std::string::npos) {
-            if (exists(k, pat)) { out.push_back({k, pat, true}); return; }
-            if (pat.find('[') != std::string::npos) return;
+        const auto& names = design->names(k);
+        if (q.regexp || q.nocase) {
+            for (auto& n : names)
+                if (matchName(pat, n, q) && keep(n)) out.push_back({k, n, true});
+            return;
         }
-        for (auto& n : design->names(k))
-            if (matchName(pat, n, q)) out.push_back({k, n, true});
+        std::string p = normalized(pat);
+        bool leaf = q.hier && p.find('/') == std::string::npos;
+        if (q.hier && !leaf) {
+            for (auto& n : names)
+                if (globName(p, n.c_str(), true) && keep(n)) out.push_back({k, n, true});
+            return;
+        }
+        // The names (or leaves) that start with the literal start of the pattern.
+        std::string lit = p.substr(0, p.find_first_of("*?\\"));
+        const auto& order = indexOf(k, leaf);
+        auto key = [&](uint32_t i) { return leaf ? leafOf(names[i]) : std::string_view(names[i]); };
+        auto lo = std::lower_bound(order.begin(), order.end(), std::string_view(lit),
+                                   [&](uint32_t i, std::string_view v) { return key(i).substr(0, v.size()) < v; });
+        std::vector<uint32_t> hits;
+        for (auto it = lo; it != order.end() && key(*it).substr(0, lit.size()) == lit; ++it)
+            if (globName(p, leaf ? key(*it).data() : names[*it].c_str(), false) && keep(names[*it])) hits.push_back(*it);
+        std::sort(hits.begin(), hits.end());  // the design's own order
+        for (uint32_t i : hits) out.push_back({k, names[i], true});
     }
-    bool matchName(const std::string& pat, const std::string& name, const Query& q) {
-        if (q.regexp) {
-            try {
-                std::regex re(pat, q.nocase ? std::regex::icase | std::regex::ECMAScript : std::regex::ECMAScript);
-                return std::regex_match(name, re);
-            } catch (const std::regex_error&) {
-                fail("bad regular expression \"" + pat + "\"");
-            }
-        }
-        std::string p = pat, n = name;
-        if (q.nocase) {
-            for (char& c : p) c = (char)tolower((unsigned char)c);
-            for (char& c : n) c = (char)tolower((unsigned char)c);
-        }
+    // The pattern with the file's hierarchy separator turned into '/'.
+    std::string normalized(const std::string& pat) const {
+        std::string p = pat;
         char sep = sdc.hierSep.empty() ? '/' : sdc.hierSep[0];
         if (sep != '/')
             for (char& c : p) if (c == sep) c = '/';
+        return p;
+    }
+    std::string busBase_;
+    bool globName(const std::string& p, const char* n, bool hier) {
         auto one = [&](const char* s) {
             if (globMatch(p.c_str(), s, false)) return true;
             // "d" names every bit of the bus d[7:0].
             if (p.find('[') == std::string::npos) {
                 const char* b = strrchr(s, '[');
                 if (b && s[strlen(s) - 1] == ']' && !strchr(b, '/')) {
-                    std::string base(s, b - s);
-                    return globMatch(p.c_str(), base.c_str(), false);
+                    busBase_.assign(s, b - s);
+                    return globMatch(p.c_str(), busBase_.c_str(), false);
                 }
             }
             return false;
         };
-        if (one(n.c_str())) return true;
-        if (q.hier)  // the pattern names the last levels, at any depth
-            for (size_t i = 0; i < n.size(); i++)
-                if (n[i] == '/' && one(n.c_str() + i + 1)) return true;
+        if (one(n)) return true;
+        if (hier)  // the pattern names the last levels, at any depth
+            for (const char* c = n; *c; c++)
+                if (*c == '/' && one(c + 1)) return true;
         return false;
+    }
+    std::map<std::pair<std::string, bool>, std::regex> regexes_;
+    bool matchName(const std::string& pat, const std::string& name, const Query& q) {
+        if (q.regexp) {
+            auto it = regexes_.find({pat, q.nocase});
+            if (it == regexes_.end()) {
+                try {
+                    it = regexes_.emplace(std::make_pair(pat, q.nocase),
+                                          std::regex(pat, q.nocase ? std::regex::icase | std::regex::ECMAScript : std::regex::ECMAScript)).first;
+                } catch (const std::regex_error&) {
+                    fail("bad regular expression \"" + pat + "\"");
+                }
+            }
+            return std::regex_match(name, it->second);
+        }
+        std::string p = normalized(pat), n = name;
+        if (q.nocase) {
+            for (char& c : p) c = (char)tolower((unsigned char)c);
+            for (char& c : n) c = (char)tolower((unsigned char)c);
+        }
+        return globName(p, n.c_str(), q.hier);
     }
 
     // A word given where objects are expected: handles, and bare names looked
@@ -409,9 +485,11 @@ private:
         return out;
     }
 
-    // -filter {a == b && c =~ d*}
-    bool filterOne(const Obj& o, const std::string& expr) {
-        // split on || then &&
+    // -filter {a == b && c =~ d*}: parsed once, then run on each object.
+    std::map<std::string, Filter> filters_;
+    const Filter& filterOf(const std::string& expr) {
+        auto it = filters_.find(expr);
+        if (it != filters_.end()) return it->second;
         auto splitOn = [](const std::string& s, const char* op) {
             std::vector<std::string> out;
             size_t i = 0;
@@ -427,8 +505,9 @@ private:
             size_t a = s.find_first_not_of(" \t\n\"{}"), b = s.find_last_not_of(" \t\n\"{}");
             return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
         };
+        Filter f;
         for (auto& orTerm : splitOn(expr, "||")) {
-            bool all = true;
+            std::vector<Clause> all;
             for (auto& term : splitOn(orTerm, "&&")) {
                 std::string t = trim(term);
                 while (!t.empty() && t[0] == '(') t = trim(t.substr(1));
@@ -441,32 +520,44 @@ private:
                     size_t j = t.find(ops[k]);
                     if (j != std::string::npos && j < at) { at = j; which = k; }
                 }
-                std::string attr = trim(which < 0 ? t : t.substr(0, at));
-                std::string want = which < 0 ? "true" : trim(t.substr(at + 2));
-                if (which < 0) which = 0;
+                Clause c;
+                c.attr = trim(which < 0 ? t : t.substr(0, at));
+                c.want = which < 0 ? "true" : trim(t.substr(at + 2));
+                c.op = which < 0 ? 0 : which;
+                all.push_back(std::move(c));
+            }
+            f.push_back(std::move(all));
+        }
+        return filters_[expr] = std::move(f);
+    }
+    bool filterOne(const Obj& o, const std::string& expr) { return filterOne(o.kind, o.name, filterOf(expr)); }
+    bool filterOne(Kind kind, const std::string& name, const Filter& f) {
+        for (auto& all : f) {
+            bool ok = true;
+            for (auto& c : all) {
                 std::optional<std::string> have;
-                if (attr == "name" || attr == "full_name") {
-                    have = o.name;
-                    if (attr == "name") {
-                        size_t sl = o.name.rfind('/');
-                        if (sl != std::string::npos) have = o.name.substr(sl + 1);
-                    }
-                } else if (attr == "object_class") have = kindName(o.kind);
-                else if (attr == "direction" && o.kind == Kind::Port && design) {
-                    int d = design->portDir(o.name);
-                    if (d >= 0) have = d == 0 ? "in" : d == 1 ? "out" : "inout";
+                const char* h = nullptr;
+                if (c.attr == "full_name") h = name.c_str();
+                else if (c.attr == "name") { size_t sl = name.rfind('/'); h = name.c_str() + (sl == std::string::npos ? 0 : sl + 1); }
+                else if (c.attr == "object_class") h = kindName(kind);
+                else if (c.attr == "direction" && kind == Kind::Port && design) {
+                    int d = design->portDir(name);
+                    if (d >= 0) h = d == 0 ? "in" : d == 1 ? "out" : "inout";
                 }
-                if (!have && design) have = design->attribute(o, attr);
-                if (!have) {
-                    if (warnedFilter_.insert(attr).second)
-                        diag(Diag::Warning, "unsupported", here(), "-filter: the attribute '" + attr + "' is not known for this design; the filter keeps every object");
+                if (!h && design) {
+                    have = design->attribute(Obj{kind, name, true}, c.attr);
+                    if (have) h = have->c_str();
+                }
+                if (!h) {
+                    if (warnedFilter_.insert(c.attr).second)
+                        diag(Diag::Warning, "unsupported", here(), "-filter: the attribute '" + c.attr + "' is not known for this design; the filter keeps every object");
                     continue;
                 }
-                bool m = which >= 2 ? globMatch(want.c_str(), have->c_str(), true) : *have == want;
-                if (which == 1 || which == 3) m = !m;
-                if (!m) { all = false; break; }
+                bool m = c.op >= 2 ? globMatch(c.want.c_str(), h, true) : c.want == h;
+                if (c.op == 1 || c.op == 3) m = !m;
+                if (!m) { ok = false; break; }
             }
-            if (all) return true;
+            if (ok) return true;
         }
         return false;
     }
@@ -518,6 +609,8 @@ private:
             }
         } else {
             if (pats.empty()) pats.push_back("*");
+            const Filter* flt = filter.empty() ? nullptr : &filterOf(filter);
+            bool single = pats.size() == 1;  // one pattern cannot name an object twice
             std::set<Obj> seen;
             for (auto& p : pats) {
                 if (const ObjList* c = colOf(p)) {  // get_ports [get_ports x]
@@ -526,8 +619,18 @@ private:
                     continue;
                 }
                 ObjList found;
-                findIn(k, p, q, found);
-                if (found.empty()) {
+                bool any = false;
+                if (flt) {  // an empty result after the filter is not "no match"
+                    ObjList probe;
+                    findIn(k, p, q, found, flt);
+                    any = !found.empty();
+                    if (!any) { findIn(k, p, q, probe); any = !probe.empty(); }
+                } else {
+                    findIn(k, p, q, found);
+                    any = !found.empty();
+                }
+                if (single && any) { out = std::move(found); break; }
+                if (!any) {
                     if (!design && k != Kind::Clock) found.push_back({k, p, false});
                     else if (k == Kind::LibCell) found.push_back({k, p, false});
                     else if (!quiet)
@@ -538,7 +641,7 @@ private:
                     if (seen.insert(o).second) out.push_back(o);
             }
         }
-        if (!filter.empty()) {
+        if (!filter.empty() && hasOf) {
             ObjList keep;
             for (auto& o : out)
                 if (!o.resolved || filterOne(o, filter)) keep.push_back(o);

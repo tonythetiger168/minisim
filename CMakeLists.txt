@@ -254,6 +254,9 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
+  add_test(NAME msdc
+           COMMAND ${CMAKE_COMMAND} -DMSDC=$<TARGET_FILE:msdc> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR} -P ${CMAKE_SOURCE_DIR}/tests/msdc.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)

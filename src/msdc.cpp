@@ -18,6 +18,7 @@
 // exception, port fan-out) run on every logical core; -threads N sets the
 // count and the report is the same for any N.
 #include <atomic>
+#include <chrono>
 #include <fstream>
 #include <thread>
 
@@ -438,14 +439,18 @@ struct Builder {
     std::vector<std::pair<std::string, const Symbol*>> netSyms;
     std::vector<PinSym> pinSyms;
 
+    std::function<void(const char*)> lap = [](const char*) {};
     bool build(std::string& err) {
         auto tops = comp.getRoot().topInstances;
         if (tops.empty()) { err = "no top module"; return false; }
         const InstanceSymbol& top = *tops[0];
         d.gather(comp, dummy);
+        lap("  elaborate, find blocks");
         Extra ex(*this);
         comp.getRoot().visit(ex);
+        lap("  assignments");
         walk(top.body, "");
+        lap("  names");
 
         // ports of the top
         for (const Symbol* ps : top.body.getPortList()) {
@@ -520,6 +525,7 @@ struct Builder {
             if (a != b) edges.push_back({a, b});
         }
 
+        lap("  registers");
         // CSR, both ways
         r.n = (int)r.nodeName.size();
         std::sort(edges.begin(), edges.end());
@@ -643,6 +649,28 @@ struct Checker {
             if (it == clkIdx.end()) { clkIdx[k.name] = (int)clk.size(); clk.push_back(&k); }
             else clk[it->second] = &k;
         }
+        // A later clock on the same source, without -add, removes the earlier one.
+        {
+            std::map<sdc::Obj, size_t> owner;
+            std::set<const sdc::Clock*> gone;
+            for (auto& k : c.clocks) {
+                if (c.clock(k.name) != &k) continue;
+                for (auto& s : k.sources) {
+                    auto [it, fresh] = owner.try_emplace(s, size_t(&k - c.clocks.data()));
+                    if (fresh) continue;
+                    if (!k.add) gone.insert(&c.clocks[it->second]);
+                    it->second = size_t(&k - c.clocks.data());
+                }
+            }
+            if (!gone.empty()) {
+                std::vector<const sdc::Clock*> keep;
+                for (auto k : clk)
+                    if (!gone.count(k)) keep.push_back(k);
+                clk = keep;
+                clkIdx.clear();
+                for (size_t i = 0; i < clk.size(); i++) clkIdx[clk[i]->name] = (int)i;
+            }
+        }
         W = std::max(1, ((int)clk.size() + 63) / 64);
         if (rtl) reach = propagate(*rtl, clk, W, [&](const sdc::Obj& o) { return nodeOfSource(o); });
         // The source clocks each clock derives from.
@@ -677,6 +705,17 @@ struct Checker {
         masters_ = std::move(master);
     }
     std::vector<std::vector<int>> masters_;
+    // The period of a clock; of a generated clock, from its master. 0: unknown.
+    double periodOf(int i, int depth = 0) const {
+        const sdc::Clock& k = *clk[i];
+        if (!k.generated) return k.period;
+        if (masters_[i].empty() || depth > 16) return 0;
+        double p = periodOf(masters_[i][0], depth + 1);
+        if (k.divideBy > 0) p *= k.divideBy;
+        if (k.multiplyBy > 0) p /= k.multiplyBy;
+        if (k.edges.size() == 3 && k.divideBy == 0 && k.multiplyBy == 0) p *= (k.edges[2] - k.edges[0]) / 2.0;
+        return p;
+    }
     bool related(int a, int b) const {
         for (int x : roots[a])
             for (int y : roots[b])
@@ -787,12 +826,14 @@ struct Checker {
         // Which clocks clock something, and the registers nobody clocks.
         std::vector<char> used(clk.size(), 0);
         std::map<int, std::pair<int, const Seq*>> unclocked;       // clock node -> count, first block
+        std::vector<char> counted(rtl->regs.size(), 0);
         std::map<std::pair<int, std::vector<int>>, std::pair<int, const Seq*>> multi;
         for (auto& s : rtl->seqs) {
             auto here = list(at(reach, s.clk));
             for (int k : here) used[k] = 1;
             int nreg = 0;
-            for (int rg : s.regs) nreg += rtl->regs[rg].width;
+            for (int rg : s.regs)
+                if (!counted[rg]) { counted[rg] = 1; nreg += rtl->regs[rg].width; }
             if (here.empty()) {
                 auto& u = unclocked[s.clk];
                 if (!u.second) u.second = &s;
@@ -802,7 +843,7 @@ struct Checker {
                 for (size_t a = 0; a < here.size() && !open; a++)
                     for (size_t b = a + 1; b < here.size(); b++)
                         if (!grouped(here[a], here[b])) { open = true; break; }
-                if (open && !caseOnAnything()) {
+                if (open && !caseSelects(s.clk)) {
                     auto& u = multi[{s.clk, here}];
                     if (!u.second) u.second = &s;
                     u.first += nreg;
@@ -818,7 +859,7 @@ struct Checker {
             for (int k : key.second) names += (names.empty() ? "" : ", ") + clk[k]->name;
             rep.add("SDC016", u.second->file, u.second->line,
                     "clocks " + names + " all reach '" + rtl->nodeName[key.first] + "' (" + std::to_string(u.first) +
-                        " register bits) and are not declared exclusive; every pair is timed against every other. "
+                        (u.first == 1 ? " register bit" : " register bits") + ") and are not declared exclusive; every pair is timed against every other. "
                         "Use set_clock_groups -logically_exclusive or -physically_exclusive, or set_case_analysis on the select");
         }
         for (size_t i = 0; i < clk.size(); i++) {
@@ -846,9 +887,16 @@ struct Checker {
             for (auto& n : u.from) if (clkIdx.count(n)) unc[clkIdx[n]] = 1;
             for (auto& n : u.to) if (clkIdx.count(n)) unc[clkIdx[n]] = 1;
         }
+        std::vector<int> bare;
         for (size_t i = 0; i < clk.size(); i++)
-            if (!unc[i] && !clk[i]->isVirtual())
-                rep.add("SDC018", clk[i]->loc, "clock '" + clk[i]->name + "' has no set_clock_uncertainty, so jitter and skew margin are zero");
+            if (!unc[i] && !clk[i]->isVirtual()) bare.push_back((int)i);
+        if (!bare.empty()) {
+            std::string names;
+            for (size_t i = 0; i < bare.size() && i < 8; i++) names += (i ? ", " : "") + clk[bare[i]]->name;
+            if (bare.size() > 8) names += ", ...";
+            rep.add("SDC018", clk[bare[0]]->loc, (bare.size() == 1 ? "clock '" + names + "' has" : std::to_string(bare.size()) + " clocks (" + names + ") have") +
+                                                     " no set_clock_uncertainty, so jitter and skew margin are zero");
+        }
     }
     bool cmdHasZero(const sdc::Clock& k) const {
         for (auto& x : c.commands)
@@ -856,7 +904,30 @@ struct Checker {
                 return (x.has("-divide_by") && x.num("-divide_by") < 1) || (x.has("-multiply_by") && x.num("-multiply_by") < 1);
         return false;
     }
-    bool caseOnAnything() const { return !c.caseAnalysis.empty(); }
+    // Is there a set_case_analysis on the logic in front of this clock net
+    // (the select of a clock mux)?
+    bool caseSelects(int clkNode) const {
+        if (c.caseAnalysis.empty()) return false;
+        std::unordered_set<int> cased;
+        for (auto& ca : c.caseAnalysis)
+            for (auto& o : ca.objects) {
+                int nd = nodeOfSource(o);
+                if (nd >= 0) cased.insert(nd);
+            }
+        Marks seen;
+        seen.begin(rtl->n);
+        std::vector<int> st{clkNode};
+        seen.set(clkNode);
+        while (!st.empty()) {
+            int u = st.back();
+            st.pop_back();
+            if (cased.count(u)) return true;
+            if (rtl->nodeReg[u] >= 0) continue;
+            for (int e = rtl->revAt[u]; e < rtl->revAt[u + 1]; e++)
+                if (seen.set(rtl->rev[e])) st.push_back(rtl->rev[e]);
+        }
+        return false;
+    }
 
     // ---- clock groups
     std::vector<std::vector<char>> group_;  // 0 none, 1 async, 2 exclusive
@@ -1381,6 +1452,18 @@ struct Checker {
                 }
         // For the open pairs, find the paths: from each capture point back
         // through the logic to the registers and ports that launch.
+        // Exceptions by endpoint, so a path is checked against the few that
+        // can cover it and not against all of them.
+        std::unordered_map<int, std::vector<int>> exTo;  // register index or ~port -> exceptions
+        std::vector<int> exToWide;                       // -to a clock, or no -to
+        for (size_t i = 0; i < c.exceptions.size(); i++) {
+            const sdc::Exception& e = c.exceptions[i];
+            if (e.type == sdc::Exception::GroupPath || e.type == sdc::Exception::MinDelay || e.emptyEndpoint) continue;
+            const ExInfo& x = ex_[i];
+            if (x.from.all && x.to.all && x.through.empty()) continue;
+            if (x.to.all || any(x.to.clocks.data())) exToWide.push_back((int)i);
+            for (int t : x.to.nodes) exTo[t].push_back((int)i);
+        }
         struct Hit { int count = 0; std::string from, to; };
         std::vector<std::map<std::pair<int, int>, Hit>> found(caps.size());
         parallelFor(caps.size(), threads, [&](size_t ci) {
@@ -1401,6 +1484,14 @@ struct Checker {
             }
             std::sort(srcs.begin(), srcs.end());
             auto capList = list(cp.clocks.data());
+            std::vector<int> cand = exToWide;
+            if (cp.port >= 0) {
+                if (auto it = exTo.find(~cp.port); it != exTo.end()) cand.insert(cand.end(), it->second.begin(), it->second.end());
+            }
+            for (int rg : cp.regs)
+                if (auto it = exTo.find(rg); it != exTo.end()) cand.insert(cand.end(), it->second.begin(), it->second.end());
+            std::sort(cand.begin(), cand.end());
+            cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
             for (int s : srcs) {
                 const uint64_t* lm = rtl->nodeReg[s] >= 0 || inSeed[s] ? at(launchSeed_, s) : nullptr;
                 if (!lm) continue;
@@ -1409,16 +1500,14 @@ struct Checker {
                         if (a == b || !open[a * nc + b]) continue;
                         // An exception on these very points covers the path.
                         bool covered = false;
-                        for (size_t i = 0; i < c.exceptions.size() && !covered; i++) {
-                            const sdc::Exception& e = c.exceptions[i];
-                            if (e.type == sdc::Exception::GroupPath || e.type == sdc::Exception::MinDelay || e.emptyEndpoint) continue;
+                        for (int i : cand) {
                             const ExInfo& x = ex_[i];
                             bool f = x.from.all || x.fromSet.count(s) || bit(x.from.clocks.data(), a);
                             if (!f) continue;
                             bool t = x.to.all || bit(x.to.clocks.data(), b);
                             if (!t && cp.port >= 0) t = x.toSet.count(~cp.port) != 0;
                             for (size_t k = 0; k < cp.regs.size() && !t; k++) t = x.toSet.count(cp.regs[k]) != 0;
-                            if (t && !(x.from.all && x.to.all && x.through.empty())) covered = true;
+                            if (t) { covered = true; break; }
                         }
                         if (covered) continue;
                         Hit& h = found[ci][{a, b}];
@@ -1441,8 +1530,9 @@ struct Checker {
             rep.add("SDC040", b.loc,
                     "clock '" + a.name + "' launches data that clock '" + b.name + "' captures (" + std::to_string(h.count) +
                         (h.count == 1 ? " path" : " paths") + ", such as " + h.from + " to " + h.to +
-                        "), and nothing says how the two relate. They are timed as synchronous (periods " + num(a.period) + " and " + num(b.period) +
-                        "). If they are asynchronous, add set_clock_groups -asynchronous or constrain the crossing with set_max_delay or set_false_path");
+                        "), and nothing says how the two relate. They are timed as synchronous" +
+                        (periodOf(k.first) > 0 && periodOf(k.second) > 0 ? " (periods " + num(periodOf(k.first)) + " and " + num(periodOf(k.second)) + ")" : std::string()) +
+                        ". If they are asynchronous, add set_clock_groups -asynchronous or constrain the crossing with set_max_delay or set_false_path");
         }
     }
     std::vector<uint64_t> launchSeed_;  // launch clocks of the startpoints alone
@@ -1553,17 +1643,24 @@ struct Checker {
         }
     }
 
-    void run() {
+    template <typename Lap>
+    void run(Lap* lap) {
+        auto mark = [&](const char* w) { if (lap) (*lap)(w); };
         checkDiags();
         setupClocks();
         setupGroups();
+        mark("  clock propagation");
         checkClocks();
         checkIo();
+        mark("  clocks and I/O");
         checkExceptions();
+        mark("  exceptions");
         seedLaunch();
         checkCrossings();
+        mark("  clock crossings");
         checkPorts();
         checkCase();
+        mark("  ports");
     }
 
     // What the constraints cover, for the summary and -json.
@@ -1605,6 +1702,7 @@ void usage() {
                  "  -list          list the rules\n"
                  "  -Werror        exit non-zero on any finding (the default is errors only)\n"
                  "  -quiet         print findings only, no summary\n"
+                 "  -stats         print the size of the design and the time of each step\n"
                  "  -json <file>   also write the findings as JSON\n"
                  "  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
                  "  -version       print the version\n"
@@ -1628,7 +1726,7 @@ std::string jsonStr(const std::string& s) {
 int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]};
     Rep rep;
-    bool werror = false, quiet = false, haveDesign = false;
+    bool werror = false, quiet = false, haveDesign = false, stats = false;
     std::vector<std::string> sdcFiles;
     std::string jsonPath;
     int threads = (int)std::thread::hardware_concurrency();
@@ -1661,6 +1759,7 @@ int main(int argc, char** argv) {
             continue;
         }
         if (a == "-quiet" || a == "-q") { quiet = true; continue; }
+        if (a == "-stats") { stats = true; continue; }
         if (a == "--help-slang") { fwd.push_back("--help"); haveDesign = true; continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
@@ -1676,17 +1775,27 @@ int main(int argc, char** argv) {
     for (size_t i = 1; i < fwd.size(); i++)
         if (fwd[i] == "-f" || fwd[i] == "-F" || fwd[i] == "--help" || (fwd[i][0] != '-' && fwd[i][0] != '+' && (i == 1 || fwd[i - 1] != "--top"))) haveDesign = true;
 
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::pair<const char*, double>> phases;
+    auto lap = [&](const char* what) {
+        auto t1 = std::chrono::steady_clock::now();
+        phases.push_back({what, std::chrono::duration<double>(t1 - t0).count()});
+        t0 = t1;
+    };
     FrontEnd fe;
     Rtl rtl;
     sdc::Reader reader;
     if (haveDesign) {
         if (int rc = fe.run(fwd, "msdc front end")) return rc < 0 ? 0 : rc;
+        lap("parse and elaborate");
         Builder b(rtl, *fe.comp);
         std::string err;
+        if (stats) b.lap = lap;
         if (!b.build(err)) {
             std::cerr << "msdc: " << err << "\n";
             return 1;
         }
+        lap("build the graph");
         reader.design = &rtl;
         rtl.reader = &reader;
         rtl.clockMasks = [&](const sdc::Constraints& cs, int& words) {
@@ -1703,6 +1812,8 @@ int main(int argc, char** argv) {
             return Checker::propagate(rtl, clk, words, [&](const sdc::Obj& o) { return tmp.nodeOfSource(o); });
         };
     }
+    reader.threads = threads;
+    reader.onPuts = [](const std::string& t) { std::cout << t << "\n"; };
     for (auto& f : sdcFiles) {
         try {
             reader.load(f);
@@ -1712,8 +1823,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    lap("read sdc");
     Checker ck(reader, haveDesign ? &rtl : nullptr, rep, threads);
-    ck.run();
+    ck.run(stats ? &lap : nullptr);
+    lap("check");
 
     std::sort(rep.out.begin(), rep.out.end());
     rep.out.erase(std::unique(rep.out.begin(), rep.out.end()), rep.out.end());
@@ -1735,6 +1848,16 @@ int main(int argc, char** argv) {
             first = false;
         }
         std::cout << (first ? "" : ")") << "\n";
+    }
+    if (stats) {
+        std::cerr << "msdc: " << threads << " threads";
+        if (haveDesign) std::cerr << ", " << rtl.n << " signals, " << rtl.fwd.size() << " logic edges, " << rtl.regs.size() << " registers, " << rtl.seqs.size() << " clocked blocks";
+        std::cerr << "\n";
+        for (auto& [w, t] : phases) {
+            char b[96];
+            snprintf(b, sizeof b, "msdc: %-22s %8.3f s\n", w, t);
+            std::cerr << b;
+        }
     }
     if (!jsonPath.empty()) {
         std::ofstream js(jsonPath);

@@ -131,12 +131,20 @@ struct Join {
     const Symbol* find(const Symbol* s) {
         auto it = up.find(s);
         if (it == up.end()) return up[s] = s;
-        while (it->second != s) {
-            s = it->second;
-            it = up.find(s);
-            if (it == up.end()) return up[s] = s;
+        const Symbol* root = s;
+        while (it->second != root) {
+            root = it->second;
+            it = up.find(root);
+            if (it == up.end()) { up[root] = root; break; }
         }
-        return s;
+        // Point everything on the way at the root: a net passed to thousands
+        // of instances is otherwise a chain that long, walked on every find.
+        while (s != root) {
+            auto& next = up[s];
+            s = next;
+            next = root;
+        }
+        return root;
     }
     void join(const Symbol* a, const Symbol* b) {
         a = find(a);
