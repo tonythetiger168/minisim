@@ -30,12 +30,17 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_lefdef)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# The Liberty (.lib) reader shared by the timing, synthesis, power and
+# equivalence tools (src/liberty.hpp); no external dependencies.
+add_executable(test_liberty tests/test_liberty.cpp)
+target_include_directories(test_liberty PRIVATE src)
+add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
 # Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
 # libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
 find_package(OpenSSL COMPONENTS Crypto)
@@ -61,6 +66,11 @@ if(OPENSSL_FOUND)
 else()
   message(STATUS "OpenSSL not found: building without protected envelope support")
 endif()
+
+# The gate-level Verilog netlist reader and writer (src/gnetlist.hpp).
+add_executable(test_gnetlist tests/test_gnetlist.cpp)
+target_include_directories(test_gnetlist PRIVATE src)
+add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
@@ -150,6 +160,12 @@ if(MINISIM_WITH_SLANG)
     target_link_libraries(mdft PRIVATE OpenSSL::Crypto)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
+
+  # Source-level debug: drivers, loads, active-driver trace, viewer: mdebug design.sv
+  add_executable(mdebug src/mdebug.cpp)
+  target_include_directories(mdebug PRIVATE src)
+  find_package(Threads REQUIRED)
+  target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -273,6 +289,17 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  # Datapath library (dw/MW_*.sv, docs/DATAPATH.md): self-checking benches in
+  # tests/dw compare every module with the SystemVerilog operators.
+  file(GLOB DW_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/dw/*.sv)
+  foreach(sv IN LISTS DW_TESTS)
+    get_filename_component(name ${sv} NAME_WE)
+    add_test(NAME dw/${name}
+             COMMAND ${CMAKE_COMMAND} -DSIM=$<TARGET_FILE:msim> -DSV=${sv}
+                     -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
+    set_tests_properties(dw/${name} PROPERTIES LABELS "dw")
+  endforeach()
+
   # UVM (IEEE 1800.2-2020) tests: tests/uvm/*.sv run against the Accellera
   # UVM library when -DUVM_HOME=<uvm-core checkout> is given (CI fetches
   # uvm-core 2020.3.1).
@@ -296,6 +323,10 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
+  add_test(NAME mdebug
+           COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
@@ -342,7 +373,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -366,7 +397,9 @@ install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisi
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md
+# The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
+install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
