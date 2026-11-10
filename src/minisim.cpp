@@ -479,7 +479,33 @@ struct Sim {
     vector<Comb> combs;
     vector<vector<int>> combOf;                      // signal -> ranks that read it
     vector<char> combPend;
-    priority_queue<int, vector<int>, greater<int>> combq;
+    // The pending combinational processes, lowest rank first: one bit per
+    // rank. A heap push and pop per wake was a tenth of Ibex's run time.
+    struct RankQ {
+        vector<uint64_t> bits;
+        size_t n = 0, lo = 0;   // count; no bit is set below word `lo`
+        bool empty() const { return n == 0; }
+        size_t size() const { return n; }
+        void push(int r) {
+            size_t w = (size_t)r >> 6;
+            if (w >= bits.size()) bits.resize(w + 1, 0);
+            uint64_t b = 1ULL << (r & 63);
+            if (bits[w] & b) return;
+            bits[w] |= b;
+            n++;
+            if (w < lo) lo = w;
+        }
+        int top() {
+            while (!bits[lo]) lo++;
+            return (int)(lo * 64 + (size_t)__builtin_ctzll(bits[lo]));
+        }
+        void pop() {
+            int r = top();
+            bits[(size_t)r >> 6] &= bits[(size_t)r >> 6] - 1;
+            if (--n == 0) lo = 0;
+        }
+    };
+    RankQ combq;
     int curComb = -1;
     vector<int> combBatch;
     vector<Val> combVals;
@@ -2184,20 +2210,33 @@ struct Sim {
     bool (*vpiRegion)(int) = nullptr;
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
-        if (__builtin_expect(sigs[s].fl & (SF_HELD | SF_PART), 0)) {
-            if (sigs[s].fl & SF_HELD) return;   // forced: other writes are ignored
-            nv = keepHeld(s, nv);               // only some bits are held
+        Sig& g = sigs[s];
+        if (__builtin_expect(g.fl & (SF_HELD | SF_PART), 0)) {
+            if (g.fl & SF_HELD) return;   // forced: other writes are ignored
+            nv = keepHeld(s, nv);         // only some bits are held
         }
-        if (sigs[s].w <= 64) {
-            uint64_t m = sigs[s].w >= 64 ? ~0ULL : ((1ULL << sigs[s].w) - 1);
+        int o, n;
+        if (g.w <= 64) {
+            uint64_t m = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
             nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;
             nv.hi.clear();
-        } else nv = maskWidth(nv, sigs[s].w);
-        if (tlPart) { setLocal(s, nv); return; }
-        if (nv == sigs[s].val) return;
-        int o = bit0(sigs[s].val), n = bit0(nv);
-        if (g_cov) covToggle(s, sigs[s].val, nv);
-        sigs[s].val = nv;
+            if (tlPart) { setLocal(s, nv); return; }
+            Val& cur = g.val;   // no limbs: compare and copy the words, as == and = would
+            if (cur.hi.empty() ? nv.v == cur.v && nv.x == cur.x && nv.z == cur.z : nv == cur) return;
+            o = bit0(cur); n = bit0(nv);
+            if (g_cov) covToggle(s, cur, nv);
+            if (cur.hi.empty()) {
+                cur.v = nv.v; cur.x = nv.x; cur.z = nv.z; cur.w = nv.w;
+                cur.sgn = false; cur.real = nv.real; cur.str = nv.str;
+            } else cur = nv;
+        } else {
+            nv = maskWidth(nv, g.w);
+            if (tlPart) { setLocal(s, nv); return; }
+            if (nv == g.val) return;
+            o = bit0(g.val); n = bit0(nv);
+            if (g_cov) covToggle(s, g.val, nv);
+            g.val = nv;
+        }
         if (__builtin_expect(!pathIn.empty(), 0) && (size_t)s < pathIn.size() && pathIn[s]) lastChg[s] = now;
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
