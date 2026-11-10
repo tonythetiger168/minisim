@@ -41,6 +41,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/lower.hpp` | slang AST to `Prog`, including module instances and port connections |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
+| `src/protect.hpp`, `src/msimprotect.cpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): encrypt and decrypt with OpenSSL |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
@@ -111,6 +112,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-load <lib>[:<boot>]`, `-loadvpi <lib>:<boot>` | Load a VPI library before elaboration; its `vlog_startup_routines` run (the C files and `.so` files above are VPI libraries too) |
 | `-CFLAGS <s>`, `-LDFLAGS <s>` | Extra flags for building the DPI C files |
 | `-version` | Print the version and git commit |
+| `-keyfile [[<owner>:]<keyname>=]<priv.pem>` | RSA private key for protected envelopes (repeatable); `-keyring <file>` reads several, `-license <feature>` grants a licensed right; see below |
 | `--help-slang` | Every front-end option slang accepts |
 
 ### C code: DPI-C
@@ -242,6 +244,32 @@ FSM tb.u.state  (module ctrl, tb.sv:8)  states 3/4, transitions 3/6
     RUN -> IDLE                Not covered  (reset)
     RUN -> FAIL                Not covered
 ```
+
+### Protected IP: `msimprotect` and `msim -keyfile`
+
+minisim reads and writes IEEE 1735-2023 version 3 envelopes, the format
+commercial simulators exchange encrypted IP in: a random root key, RSA
+encrypted for each tool's key (a tool block, with the IP author's rights for
+that tool), AES-256-CBC for the source, and an HMAC-SHA512 signature that is
+checked before anything is decrypted. The older IEEE 1800-2023 clause 34
+envelopes work too (`msimprotect -v1`). The crypto is OpenSSL's libcrypto.
+Mark the region to hide and encrypt it:
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out acme.pem
+openssl pkey -in acme.pem -pubout -out acme_pub.pem
+./build/msimprotect -key acme_pub.pem -keyowner Acme -keyname acme-1 \
+                    -control visibility=interface examples/protect/secret_core.sv -o core.svp
+./build/msim  -keyfile Acme:acme-1=acme.pem core.svp examples/protect/core_tb.sv -vcd waves.vcd
+./build/mlint -keyfile Acme:acme-1=acme.pem core.svp examples/protect/core_tb.sv
+```
+
+msim, mlint and mdft keep the protected code out of diagnostics, waveforms,
+coverage, lint findings and the DFT chain plan, except what the rights
+(`visibility`, `coverage`) and `viewport` pragmas allow.
+[`docs/PROTECT.md`](docs/PROTECT.md) has the format, recipes, keyrings
+(`-keyring`, IEEE 1735 key exchange format), the rights, and a clause by
+clause status.
 
 ### Compiled mode
 
