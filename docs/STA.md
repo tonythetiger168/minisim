@@ -134,6 +134,6 @@ These are not done yet, and each is either reported or documented here:
 | `src/sta.hpp` | The engine: graph, delay calculation, arrivals, checks |
 | `src/sta_report.hpp` | Reports, SDF and JSON |
 | `src/sta_spef.hpp` | SPEF back-annotation (the reader is the shared `src/spef.hpp`) |
-| `src/parfor.hpp` | The thread pool |
+| `src/parallel.hpp` | The thread pool shared by the tools |
 | `src/msta.cpp` | The command line and the script commands |
 | `tests/sta/`, `tests/msta.cmake` | A small library with linear tables and designs whose expected numbers are worked out by hand |

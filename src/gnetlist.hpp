@@ -19,7 +19,6 @@
 // instantiated but not defined is a leaf (a library cell).
 #pragma once
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -31,9 +30,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "parallel.hpp"
 
 namespace gnl {
 
@@ -535,25 +535,16 @@ inline bool parseItemsParallel(Lexer& L, Module& m, int threads) {
         fromLine = c.line;
     }
     pieces.push_back({from, endPos, fromLine, {}, {}});
-    std::atomic<size_t> next{0};
-    auto work = [&] {
-        for (;;) {
-            size_t i = next.fetch_add(1);
-            if (i >= pieces.size()) return;
-            Piece& pc = pieces[i];
-            try {
-                Lexer sub(s, L.file, pc.from, pc.to, pc.line);
-                pc.m.name = m.name;
-                parseItems(sub, pc.m, true);
-            } catch (Error& e) {
-                pc.err = e.what();
-            }
+    par::parallelFor(pieces.size(), (unsigned)threads, [&](size_t i) {
+        Piece& pc = pieces[i];
+        try {
+            Lexer sub(s, L.file, pc.from, pc.to, pc.line);
+            pc.m.name = m.name;
+            parseItems(sub, pc.m, true);
+        } catch (Error& e) {
+            pc.err = e.what();
         }
-    };
-    std::vector<std::thread> pool;
-    for (int t = 1; t < threads; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
+    });
     for (auto& pc : pieces)
         if (!pc.err.empty()) throw Error(pc.err);
     size_t ni = m.insts.size(), na = m.assigns.size();

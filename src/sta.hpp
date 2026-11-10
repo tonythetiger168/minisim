@@ -29,7 +29,7 @@
 //     borrowing).
 //
 // Everything that walks the whole graph runs level by level on a thread pool
-// (parfor.hpp); each node only writes its own data, so the results do not
+// (parallel.hpp); each node only writes its own data, so the results do not
 // depend on the number of threads.
 #pragma once
 #include <algorithm>
@@ -52,7 +52,7 @@
 
 #include "gnetlist.hpp"
 #include "liberty.hpp"
-#include "parfor.hpp"
+#include "parallel.hpp"
 #include "sdc.hpp"
 
 namespace sta {
@@ -1449,13 +1449,13 @@ public:
 
     template <class F>
     void forRange(size_t n, size_t grain, F&& f) {
-        if (pool) pool->run(n, grain, f);
+        if (pool) pool->chunks(n, grain, [&](size_t b, size_t e, size_t) { f(b, e); });
         else f((size_t)0, n);
     }
     template <class F>
     void runLevel(const std::vector<int>& lv, F&& f) {
         if (pool && lv.size() >= 512) {
-            pool->run(lv.size(), 128, [&](size_t b, size_t e) {
+            pool->chunks(lv.size(), 128, [&](size_t b, size_t e, size_t) {
                 for (size_t i = b; i < e; i++) f(lv[i]);
             });
         } else {
@@ -1850,7 +1850,7 @@ public:
             }
         };
         if (pool && nChecks >= 1024) {
-            pool->run(nChecks, 256, [&](size_t b, size_t e) { for (size_t i = b; i < e; i++) doCheck(i); });
+            pool->chunks(nChecks, 256, [&](size_t b, size_t e, size_t) { for (size_t i = b; i < e; i++) doCheck(i); });
         } else {
             for (size_t i = 0; i < nChecks; i++) doCheck(i);
         }

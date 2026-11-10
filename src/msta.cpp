@@ -78,13 +78,13 @@ struct Shell {
                              s.warnings.end());
             s.phase("constrain", [&] { s.constrain(reader.sdc); });
         }
-        if (!pool || pool->threads() != wantThreads()) pool = std::make_unique<par::Pool>(threads);
+        if (!pool || (int)pool->threads() != wantThreads()) pool = std::make_unique<par::Pool>((unsigned)wantThreads());
         s.pool = pool.get();
         s.update();
         return s;
     }
     int wantThreads() const {
-        int n = threads > 0 ? threads : (int)std::thread::hardware_concurrency();
+        int n = threads > 0 ? threads : (int)par::defaultThreads();
         return n > 0 ? n : 1;
     }
 
@@ -127,7 +127,7 @@ struct Shell {
         }
         for (auto& w : netlist.warnings) std::cerr << "Warning: " << w << "\n";
         engine->phases.push_back({"flatten", secs()});
-        if (!pool || pool->threads() != wantThreads()) pool = std::make_unique<par::Pool>(threads);
+        if (!pool || (int)pool->threads() != wantThreads()) pool = std::make_unique<par::Pool>((unsigned)wantThreads());
         engine->pool = pool.get();
         engine->build(netlist);
         engine->phases.push_back({"build graph", secs()});
@@ -237,7 +237,7 @@ struct Shell {
             Args a = args(w, {"-corner", "-path"}, {"-quiet", "-keep_capacitive_coupling"});
             if (a.pos.size() != 1) fail(w[0] + " FILE");
             sta::Sta& s = sta();
-            if (!pool || pool->threads() != wantThreads()) pool = std::make_unique<par::Pool>(threads);
+            if (!pool || (int)pool->threads() != wantThreads()) pool = std::make_unique<par::Pool>((unsigned)wantThreads());
             s.pool = pool.get();
             std::string cn = a.get("-corner", "typ");
             int corner = cn == "min" ? 0 : cn == "max" ? 2 : 1;

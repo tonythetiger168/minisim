@@ -135,7 +135,7 @@ inline SpefResult annotateSpef(Sta& s, const spef::File& f) {
             }
         }
     };
-    if (s.pool) s.pool->run(f.nets.size(), 256, [&](size_t b, size_t e) { for (size_t i = b; i < e; i++) doNet(i); });
+    if (s.pool) s.pool->chunks(f.nets.size(), 256, [&](size_t b, size_t e, size_t) { for (size_t i = b; i < e; i++) doNet(i); });
     else for (size_t i = 0; i < f.nets.size(); i++) doNet(i);
     for (char st : status) {
         if ((st & 3) == 1) res.annotated++;
