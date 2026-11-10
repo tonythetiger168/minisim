@@ -50,7 +50,19 @@ check("no violators", "no violated constraints" in out, out)
 check("qor", re.search(r"Sequential Cell Count:\s+8\b", out) is not None, out)
 check("flop cell", re.search(r"DFFR_X1\s+[\d.]+\s+8\b", out) is not None, out)
 sdc = open(os.path.join(work, "c.sdc")).read()
-check("write_sdc", "create_clock -name clk -period 5" in sdc and "set_output_delay 0.5 -clock clk [get_ports {q[7]}]" in sdc, sdc)
+check("write_sdc", "create_clock -name clk -period 5" in sdc and "set_output_delay 0.5 -clock clk [get_ports {{q[0]}" in sdc and "set_load 0.01 [get_ports" in sdc, sdc)
+
+# The written constraints read back through read_sdc give the same timing;
+# an exception is accepted and reported as not used by the estimate.
+rc2, out2 = run(head + """
+elaborate counter
+read_sdc %s/c.sdc
+set_false_path -from [get_ports rst_n]
+compile
+report_timing
+""" % work)
+slack = lambda t: re.findall(r"slack \(MET\)\s+([\d.]+)", t)
+check("read_sdc", rc2 == 0 and slack(out2) and slack(out2) == slack(out) and "timing exceptions" in out2, out2)
 
 # A clock that cannot be met: reported as violated, and the delay-driven
 # mapping is tried (its critical path is no longer than the area one's).
@@ -66,7 +78,7 @@ report_constraint -all_violators
 check("tight clock", rc == 0 and "slack (VIOLATED)" in out and "(VIOLATED)" in out.split("report_constraint")[-1], out)
 
 # Parameters: a 16-bit counter has 16 flops; names accept N=>V and N=V.
-rc, out = run(head + 'elaborate counter -parameters "W=>16"\ncompile\nputs "flops [llength [all_registers]]"\n', ["-q"])
+rc, out = run(head + 'elaborate counter -parameters "W=>16"\ncompile\nputs "flops [sizeof_collection [all_registers]]"\n', ["-q"])
 check("parameters", rc == 0 and "flops 16" in out, out)
 
 # Redirection, Tcl control flow, and a library where cells are excluded.
@@ -77,11 +89,11 @@ set_dont_use {XOR2* XNOR2* MUX2*}
 compile
 report_area > %s
 redirect -append %s {report_reference}
-foreach p [get_ports q*] { puts "port $p" }
+foreach_in_collection p [get_ports q*] { puts "port [get_object_name $p]" }
 if {[file exists %s]} { echo "report written" }
 """ % (rpt, rpt, rpt), ["-q"])
 text = open(rpt).read() if os.path.exists(rpt) else ""
-check("redirect", rc == 0 and "Total cell area" in text and "Reference" in text and "report written" in out and "port q" in out, out + text)
+check("redirect", rc == 0 and "Total cell area" in text and "Reference" in text and "report written" in out and "port {q[0]}" in out, out + text)
 check("set_dont_use", "XOR2" not in text and "MUX2" not in text and "NAND2" in text, text)
 
 # Errors: a latch, a missing module, an unknown command; the exit code is 1.

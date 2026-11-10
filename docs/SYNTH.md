@@ -61,8 +61,8 @@ off). The netlist is the same for any thread count.
 |---|---|
 | Read | `analyze`, `read_verilog`, `read_sverilog`, `read_file`, `elaborate top [-parameters "N=8,W=4"]`, `current_design`, `check_design` |
 | Library | `set target_library {a.lib}`, `read_lib`, `set_dont_use`, `report_lib`, `write_lib_models cells.v` |
-| Constraints | `create_clock`, `set_input_delay`, `set_output_delay`, `set_load`, `set_clock_uncertainty`, `set_input_transition`, `set_max_fanout`, `set_max_area` |
-| Objects | `get_ports`, `all_inputs`, `all_outputs`, `get_clocks`, `all_clocks`, `get_cells`, `all_registers`, `remove_from_collection`, `sizeof_collection` |
+| Constraints | `read_sdc file.sdc` and every SDC 2.1 command directly, read by the shared reader (`src/sdc.hpp`). The timing estimate uses `create_clock`, `set_input_delay`, `set_output_delay`, `set_load`, `set_clock_uncertainty`, `set_input_transition`, `set_max_fanout`, `set_max_area`; the rest (exceptions, generated clocks, latencies) is checked, kept and written by `write_sdc` |
+| Objects | `get_ports`, `get_cells`, `get_clocks`, `all_inputs`, `all_outputs`, `all_clocks`, `all_registers`, with `-filter` and wildcards; collections: `sizeof_collection`, `foreach_in_collection`, `get_object_name`, `add_to_collection`, `remove_from_collection`, `filter_collection` |
 | Synthesis | `compile [-map_effort high]`, `compile_ultra` |
 | Reports | `report_resources` (word-level operators, before `compile`), `report_area`, `report_timing [-max_paths N]`, `report_qor`, `report_cell`, `report_reference`, `report_constraint -all_violators` |
 | Write | `write -format verilog -output f`, `write_verilog f`, `write_sdc f` |
