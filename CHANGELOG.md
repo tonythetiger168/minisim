@@ -272,6 +272,17 @@ Spec references are IEEE 1800-2023 clauses.
   `docs/CONSTRAINTS.md`.
 - SDC reader: object lookups use sorted name indexes and `-filter` is parsed
   once, so large designs with thousands of queries read in seconds.
+- `msta`: static timing analysis of gate-level netlists in the style of
+  PrimeTime. Liberty (NLDM) delay calculation, ideal and propagated clocks,
+  generated clocks, setup / hold / recovery / removal and output delay
+  checks, false paths, multicycle paths, max and min delay, clock groups,
+  `max_transition` and `max_capacitance`; `check_timing`, `report_timing`,
+  `report_constraint`, `report_clocks`, `report_qor`, SDF and JSON output;
+  Tcl scripts on the shared SDC reader. Multithreaded, with the same results
+  at any thread count. See `docs/STA.md`.
+- `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
+  Verilog netlist reader / flattener / writer, shared by the timing,
+  synthesis, power, equivalence and physical tools.
 
 ### Fixed
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes
