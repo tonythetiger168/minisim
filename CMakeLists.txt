@@ -30,7 +30,7 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_parallel)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_parallel test_wave)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -38,6 +38,7 @@ foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_p
 endforeach()
 find_package(Threads REQUIRED)
 target_link_libraries(test_parallel PRIVATE Threads::Threads)
+target_link_libraries(test_wave PRIVATE Threads::Threads)
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
