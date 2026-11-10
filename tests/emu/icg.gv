@@ -1,0 +1,17 @@
+// Written by hand: a latch-based clock gate (the latch is open while clk is
+// low, so the enable cannot glitch the gated clock), a register on the gated
+// clock, and one on the falling edge.
+module icg (clk, en, d, q, nq);
+  input clk, en;
+  input [1:0] d;
+  output [1:0] q;
+  output nq;
+  wire clkn, en_l, gclk, x;
+  INV_X1 u_inv (.A(clk), .Y(clkn));
+  LATCH_X1 u_lat (.G(clkn), .D(en), .Q(en_l));
+  AND2_X1 u_and (.A(clk), .B(en_l), .Y(gclk));
+  DFF_X1 r0 (.CK(gclk), .D(d[0]), .Q(q[0]));
+  DFF_X1 r1 (.CK(gclk), .D(d[1]), .Q(q[1]));
+  XOR2_X1 u_x (.A(q[0]), .B(q[1]), .Y(x));
+  DFFN_X1 r2 (.CK(clk), .D(x), .Q(nq));
+endmodule

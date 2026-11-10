@@ -17,17 +17,10 @@
 // other way. The active-driver trace evaluates the guards against the values
 // in a VCD: a flop's guards are sampled just before the time its output
 // changed, combinational logic at that time.
-#include <atomic>
 #include <cstdint>
-#include <cstring>
-#include <fcntl.h>
 #include <fstream>
 #include <optional>
 #include <sstream>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <thread>
-#include <unistd.h>
 
 #include "lintir.hpp"
 #include "slang/ast/expressions/ConversionExpression.h"
@@ -38,7 +31,9 @@
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/types/AllTypes.h"
+#include "parallel.hpp"
 #include "version.hpp"
+#include "wave_reader.hpp"
 
 using namespace lintir;
 
@@ -408,293 +403,10 @@ struct Collect : ASTVisitor<Collect> {
 
 // --------------------------------------------------------------- waveforms
 
-// One value change: when, and where its bits are in the mapped file.
-struct Change {
-    uint64_t t;
-    uint64_t off : 40;
-    uint64_t len : 24;
-};
-
-struct Wave {
-    int width = 1;
-    const char* base = nullptr;
-    std::vector<Change> ch;
-
-    // The last change at or before t, or -1.
-    int at(uint64_t t) const {
-        int lo = 0, hi = (int)ch.size();
-        while (lo < hi) {
-            int mid = (lo + hi) / 2;
-            if (ch[mid].t <= t) lo = mid + 1; else hi = mid;
-        }
-        return lo - 1;
-    }
-
-    // The bits of change i, msb first, lower case, at the full width.
-    std::string bits(int i) const {
-        std::string b(base + ch[i].off, ch[i].len);
-        for (char& c : b) if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
-        // A VCD drops leading bits: 0 unless the first bit is x or z.
-        if ((int)b.size() < width) {
-            char pad = (b[0] == 'x' || b[0] == 'z') ? b[0] : '0';
-            b.insert(0, width - b.size(), pad);
-        }
-        return b;
-    }
-};
-
-// Run f(0..n-1) on up to `threads` threads. The work is split by index, so
-// the result does not depend on the thread count.
-template<typename F>
-void parallelFor(size_t n, unsigned threads, F&& f) {
-    if (threads <= 1 || n <= 1) {
-        for (size_t i = 0; i < n; i++) f(i);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    std::vector<std::thread> pool;
-    unsigned k = (unsigned)std::min<size_t>(threads, n);
-    for (unsigned t = 0; t < k; t++)
-        pool.emplace_back([&] {
-            for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < n;) f(i);
-        });
-    for (auto& th : pool) th.join();
-}
-
-// A VCD reader built for large dumps: the file is mapped, the body is cut at
-// time stamps into one piece per thread, and every piece is scanned twice,
-// once to count each signal's changes and once to write them in place. No
-// value is copied: a change points at its bits in the mapping.
-struct Vcd {
-    std::vector<Wave> waves;
-    std::map<std::string, int> byName;
-    uint64_t end = 0;
-    std::string timescale;
-    const char* data = nullptr;
-    size_t size = 0;
-
-    ~Vcd() { if (data && size) munmap((void*)data, size); }
-
-    static bool space(char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; }
-
-    // Identifier codes are short printable strings: a number, then a table.
-    static uint64_t code(const char* p, size_t n) {
-        uint64_t c = 0;
-        for (size_t i = 0; i < n; i++) c = c * 95 + (uint64_t)((unsigned char)p[i] - 32);
-        return c;
-    }
-
-    struct Ids {
-        std::vector<int> dense;
-        std::unordered_map<uint64_t, int> sparse;
-        static constexpr uint64_t kDense = 1u << 22;
-        void put(uint64_t c, int ix) {
-            if (c < kDense) {
-                if (dense.size() <= c) dense.resize(c + 1, -1);
-                dense[c] = ix;
-            } else sparse[c] = ix;
-        }
-        int get(uint64_t c) const {
-            if (c < dense.size()) return dense[c];
-            if (c < kDense) return -1;
-            auto it = sparse.find(c);
-            return it == sparse.end() ? -1 : it->second;
-        }
-    };
-
-    // Scan [p, e) of the body. `emit(wave, time, bits, len)` for each change.
-    template<typename F>
-    static uint64_t scan(const char* base, const char* p, const char* e, const Ids& ids, F&& emit) {
-        uint64_t now = 0, last = 0;
-        auto tokEnd = [&](const char* q) { while (q < e && !space(*q)) q++; return q; };
-        while (p < e) {
-            while (p < e && space(*p)) p++;
-            if (p >= e) break;
-            const char* q = tokEnd(p);
-            char c = *p;
-            if (c == '#') {
-                now = 0;
-                for (const char* d = p + 1; d < q && *d >= '0' && *d <= '9'; d++) now = now * 10 + (uint64_t)(*d - '0');
-                last = std::max(last, now);
-            } else if (c == 'b' || c == 'B') {
-                const char* i0 = q;
-                while (i0 < e && space(*i0)) i0++;
-                const char* i1 = tokEnd(i0);
-                int w = ids.get(code(i0, (size_t)(i1 - i0)));
-                if (w >= 0) emit(w, now, (uint64_t)(p + 1 - base), (uint64_t)(q - p - 1));
-                q = i1;
-            } else if (c == 'r' || c == 'R' || c == 's' || c == 'S') {
-                const char* i0 = q;
-                while (i0 < e && space(*i0)) i0++;
-                q = tokEnd(i0);
-            } else if (c == '$') {
-                // $dumpvars / $end bracket ordinary changes; a comment is skipped.
-                if (q - p == 8 && !std::memcmp(p, "$comment", 8)) {
-                    const char* x = (const char*)memmem(q, (size_t)(e - q), "$end", 4);
-                    q = x ? x + 4 : e;
-                }
-            } else if (q - p >= 2) {
-                int w = ids.get(code(p + 1, (size_t)(q - p - 1)));
-                if (w >= 0) emit(w, now, (uint64_t)(p - base), 1);
-            }
-            p = q;
-        }
-        return last;
-    }
-
-    bool load(const std::string& file, unsigned threads, std::string& err) {
-        int fd = open(file.c_str(), O_RDONLY);
-        struct stat sb;
-        if (fd < 0 || fstat(fd, &sb) != 0) { err = "cannot open " + file; if (fd >= 0) close(fd); return false; }
-        size = (size_t)sb.st_size;
-        if (size == 0) { close(fd); err = file + " is empty"; return false; }
-        void* m = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (m == MAP_FAILED) { size = 0; err = "cannot map " + file; return false; }
-        data = (const char*)m;
-        madvise(m, size, MADV_SEQUENTIAL);
-        if (size >= (1ull << 40)) { err = file + " is larger than mdebug reads (1 TB)"; return false; }
-
-        // The header: scopes and variables, up to $enddefinitions.
-        Ids ids;
-        std::unordered_map<uint64_t, int> seen;
-        std::vector<std::string> scope;
-        const char* p = data;
-        const char* e = data + size;
-        auto tok = [&]() -> std::string_view {
-            while (p < e && space(*p)) p++;
-            const char* q = p;
-            while (q < e && !space(*q)) q++;
-            std::string_view t(p, (size_t)(q - p));
-            p = q;
-            return t;
-        };
-        auto skipToEnd = [&] { for (std::string_view t = tok(); !t.empty() && t != "$end"; t = tok()) {} };
-        for (;;) {
-            std::string_view t = tok();
-            if (t.empty()) break;
-            if (t == "$scope") {
-                tok();
-                scope.emplace_back(tok());
-                skipToEnd();
-            } else if (t == "$upscope") {
-                if (!scope.empty()) scope.pop_back();
-                skipToEnd();
-            } else if (t == "$var") {
-                std::string type(tok());
-                int width = std::atoi(std::string(tok()).c_str());
-                std::string_view id = tok();
-                std::string name(tok()), rest;
-                // "q [7:0]" is the vector q; "mem[3]" keeps its index.
-                for (std::string_view r = tok(); !r.empty() && r != "$end"; r = tok()) rest += r;
-                if (type != "real" && type != "event" && type != "string") {
-                    std::string full;
-                    for (auto& sc : scope) full += sc + ".";
-                    full += name;
-                    if (!rest.empty() && rest.find(':') == std::string::npos) full += rest;
-                    uint64_t c = code(id.data(), id.size());
-                    auto it = seen.find(c);
-                    if (it == seen.end()) {
-                        it = seen.emplace(c, (int)waves.size()).first;
-                        ids.put(c, it->second);
-                        waves.emplace_back().width = width;
-                        waves.back().base = data;
-                    }
-                    byName[full] = it->second;
-                }
-            } else if (t == "$timescale") {
-                for (std::string_view r = tok(); !r.empty() && r != "$end"; r = tok()) timescale += r;
-            } else if (t == "$enddefinitions") {
-                skipToEnd();
-                break;
-            } else if (t[0] == '$') {
-                skipToEnd();
-            }
-        }
-
-        // The body, cut at time stamps so every piece knows what time it is.
-        const char* body = p;
-        size_t left = (size_t)(e - body);
-        size_t pieces = std::max<size_t>(1, std::min<size_t>(threads, left / (4u << 20)));
-        std::vector<const char*> cut{body};
-        for (size_t i = 1; i < pieces; i++) {
-            const char* guess = body + left / pieces * i;
-            const char* x = (const char*)memmem(guess, (size_t)(e - guess), "\n#", 2);
-            if (!x) break;
-            if (x + 1 > cut.back()) cut.push_back(x + 1);
-        }
-        cut.push_back(e);
-        pieces = cut.size() - 1;
-        size_t nw = waves.size();
-        std::vector<std::vector<uint32_t>> count(pieces, std::vector<uint32_t>(nw, 0));
-        std::vector<uint64_t> lastT(pieces, 0);
-        parallelFor(pieces, threads, [&](size_t k) {
-            auto& c = count[k];
-            lastT[k] = scan(data, cut[k], cut[k + 1], ids, [&](int w, uint64_t, uint64_t, uint64_t) { c[w]++; });
-        });
-        for (uint64_t t : lastT) end = std::max(end, t);
-        // Where each piece writes each signal: the pieces before it, in order.
-        for (size_t w = 0; w < nw; w++) {
-            uint64_t total = 0;
-            for (size_t k = 0; k < pieces; k++) {
-                uint32_t n = count[k][w];
-                count[k][w] = (uint32_t)total;
-                total += n;
-            }
-            waves[w].ch.resize(total);
-        }
-        parallelFor(pieces, threads, [&](size_t k) {
-            auto& c = count[k];
-            scan(data, cut[k], cut[k + 1], ids, [&](int w, uint64_t t, uint64_t off, uint64_t len) {
-                waves[w].ch[c[w]++] = Change{t, off, len};
-            });
-        });
-        // One entry per change: the later of two at one time, and no entry
-        // that repeats the value before it ($dumpvars, then the same at #0).
-        parallelFor(nw, threads, [&](size_t w) {
-            auto& ch = waves[w].ch;
-            size_t n = 0;
-            for (size_t i = 0; i < ch.size(); i++) {
-                if (n && ch[n - 1].t == ch[i].t) { ch[n - 1] = ch[i]; continue; }
-                if (n && ch[n - 1].len == ch[i].len &&
-                    !std::memcmp(data + ch[n - 1].off, data + ch[i].off, ch[i].len))
-                    continue;
-                ch[n++] = ch[i];
-            }
-            // Replacing at one time can leave a repeat behind it.
-            size_t m = 0;
-            for (size_t i = 0; i < n; i++) {
-                if (m && ch[m - 1].len == ch[i].len &&
-                    !std::memcmp(data + ch[m - 1].off, data + ch[i].off, ch[i].len))
-                    continue;
-                ch[m++] = ch[i];
-            }
-            ch.resize(m);
-        });
-        return true;
-    }
-
-    const Wave* find(const std::string& name) const {
-        auto it = byName.find(name);
-        return it == byName.end() ? nullptr : &waves[it->second];
-    }
-};
-
-std::string showBits(const std::string& bits) {
-    if (bits.size() == 1) return bits;
-    bool unk = bits.find_first_of("xz") != std::string::npos;
-    if (unk) return std::to_string(bits.size()) + "'b" + bits;
-    std::string hex;
-    size_t n = bits.size();
-    for (size_t i = 0; i < n;) {
-        size_t take = (n - i) % 4 ? (n - i) % 4 : 4;
-        int v = 0;
-        for (size_t k = 0; k < take; k++) v = v * 2 + (bits[i + k] == '1');
-        hex += "0123456789abcdef"[v];
-        i += take;
-    }
-    return std::to_string(n) + "'h" + hex;
-}
+using wave::Wave;
+using wave::showBits;
+using par::parallelFor;
+using Vcd = wave::Reader;
 
 // --------------------------------------------------------------- evaluator
 
@@ -1175,6 +887,160 @@ struct Tool {
 
     static constexpr size_t kPageChanges = 2000000;
 
+    // An expression for the viewer's own evaluator (the active-driver trace
+    // in the page): nested arrays, "null" for what it does not follow.
+    static std::string bitsOf(const SVInt& v) {
+        std::string b;
+        for (int i = (int)v.getBitWidth() - 1; i >= 0; i--) {
+            logic_t l = v[i];
+            b += l.isUnknown() ? (exactlyEqual(l, logic_t::z) ? 'z' : 'x') : (bool(l) ? '1' : '0');
+        }
+        return b;
+    }
+    static std::string constJson(const SVInt& v) {
+        if (v.getBitWidth() > 4096) return "null";
+        return "[\"c\",\"" + bitsOf(v) + "\"," + (v.isSigned() ? "1" : "0") + "]";
+    }
+    std::string symJson(const Symbol& sym, const Type& type) {
+        if (sym.kind == SymbolKind::Parameter) {
+            const ConstantValue& cv = sym.as<ParameterSymbol>().getValue();
+            return cv.isInteger() ? constJson(cv.integer()) : "null";
+        }
+        if (sym.kind == SymbolKind::EnumValue) {
+            const ConstantValue& cv = sym.as<EnumValueSymbol>().getValue();
+            return cv.isInteger() ? constJson(cv.integer()) : "null";
+        }
+        auto it = db.sigIx.find(&sym);
+        if (it == db.sigIx.end() || !type.isIntegral()) return "null";
+        return "[\"s\"," + std::to_string(it->second) + "," + (type.isSigned() ? "1" : "0") + "]";
+    }
+    std::string exprJson(const Expression& e) {
+        auto bad = [](const std::string& x) { return x == "null"; };
+        switch (e.kind) {
+            case ExpressionKind::NamedValue: return symJson(e.as<NamedValueExpression>().symbol, *e.type);
+            case ExpressionKind::HierarchicalValue: return symJson(e.as<HierarchicalValueExpression>().symbol, *e.type);
+            case ExpressionKind::IntegerLiteral: return constJson(e.as<IntegerLiteral>().getValue());
+            case ExpressionKind::UnbasedUnsizedIntegerLiteral: {
+                if (!e.type->isIntegral() || e.type->getBitWidth() > 4096) return "null";
+                logic_t l = e.as<UnbasedUnsizedIntegerLiteral>().getLiteralValue();
+                char c = l.isUnknown() ? (exactlyEqual(l, logic_t::z) ? 'z' : 'x') : (bool(l) ? '1' : '0');
+                return "[\"c\",\"" + std::string(e.type->getBitWidth(), c) + "\",0]";
+            }
+            case ExpressionKind::Conversion: {
+                const auto& c = e.as<ConversionExpression>();
+                std::string v = exprJson(c.operand());
+                if (bad(v) || !e.type->isIntegral() || !c.operand().type->isIntegral()) return "null";
+                return "[\"cv\"," + v + "," + std::to_string(e.type->getBitWidth()) + "," +
+                       (c.operand().type->isSigned() ? "1" : "0") + "," + (e.type->isSigned() ? "1" : "0") + "]";
+            }
+            case ExpressionKind::UnaryOp: {
+                const auto& u = e.as<UnaryExpression>();
+                std::string v = exprJson(u.operand());
+                if (bad(v)) return "null";
+                return "[\"u\",\"" + std::string(toString(u.op)) + "\"," + v + "]";
+            }
+            case ExpressionKind::BinaryOp: {
+                const auto& b = e.as<BinaryExpression>();
+                std::string l = exprJson(b.left()), r = exprJson(b.right());
+                if (bad(l) || bad(r)) return "null";
+                return "[\"b\",\"" + std::string(toString(b.op)) + "\"," + l + "," + r + "]";
+            }
+            case ExpressionKind::ConditionalOp: {
+                const auto& c = e.as<ConditionalExpression>();
+                if (c.conditions.size() != 1 || c.conditions[0].pattern) return "null";
+                std::string p = exprJson(*c.conditions[0].expr), l = exprJson(c.left()), r = exprJson(c.right());
+                if (bad(p) || bad(l) || bad(r)) return "null";
+                return "[\"?:\"," + p + "," + l + "," + r + "]";
+            }
+            case ExpressionKind::ElementSelect: {
+                const auto& x = e.as<ElementSelectExpression>();
+                const Type& vt = *x.value().type;
+                if (!vt.isIntegral() || e.type->getBitWidth() != 1) return "null";
+                std::string v = exprJson(x.value()), i = exprJson(x.selector());
+                if (bad(v) || bad(i)) return "null";
+                ConstantRange r = vt.getFixedRange();
+                return "[\"bit\"," + v + "," + i + "," + std::to_string(r.left) + "," + std::to_string(r.right) + "]";
+            }
+            case ExpressionKind::RangeSelect: {
+                const auto& x = e.as<RangeSelectExpression>();
+                const Type& vt = *x.value().type;
+                if (!vt.isIntegral()) return "null";
+                std::string v = exprJson(x.value()), l = exprJson(x.left()), r = exprJson(x.right());
+                if (bad(v) || bad(l) || bad(r)) return "null";
+                ConstantRange rg = vt.getFixedRange();
+                int kind = x.getSelectionKind() == RangeSelectionKind::Simple ? 0
+                         : x.getSelectionKind() == RangeSelectionKind::IndexedUp ? 1 : 2;
+                return "[\"rng\"," + v + "," + l + "," + r + "," + std::to_string(kind) + "," +
+                       std::to_string(rg.left) + "," + std::to_string(rg.right) + "]";
+            }
+            case ExpressionKind::Concatenation: {
+                std::string o = "[\"cat\",[";
+                bool first = true;
+                for (const Expression* op : e.as<ConcatenationExpression>().operands()) {
+                    std::string v = exprJson(*op);
+                    if (bad(v)) return "null";
+                    o += (first ? "" : ",") + v;
+                    first = false;
+                }
+                return first ? "null" : o + "]]";
+            }
+            case ExpressionKind::Replication: {
+                const auto& r = e.as<ReplicationExpression>();
+                std::string n = exprJson(r.count()), v = exprJson(r.concat());
+                if (bad(n) || bad(v)) return "null";
+                return "[\"rep\"," + n + "," + v + "]";
+            }
+            default: return "null";
+        }
+    }
+    // Case statements are shared by the drivers under them: one table.
+    std::map<const CaseStatement*, int> caseIx;
+    std::vector<const CaseStatement*> cases;
+    std::string guardsJson(const Driver& d) {
+        std::string o = "[";
+        for (const Guard& g : d.guards) {
+            if (o.size() > 1) o += ",";
+            switch (g.kind) {
+                case Guard::If: o += "[\"if\"," + exprJson(*g.cond) + "]"; break;
+                case Guard::Else: o += "[\"else\"," + exprJson(*g.cond) + "]"; break;
+                case Guard::CaseItem:
+                case Guard::CaseDefault: {
+                    auto it = caseIx.find(g.cs);
+                    if (it == caseIx.end()) {
+                        it = caseIx.emplace(g.cs, (int)cases.size()).first;
+                        cases.push_back(g.cs);
+                    }
+                    o += "[\"case\"," + std::to_string(it->second) + "," +
+                         (g.kind == Guard::CaseDefault ? "-1" : std::to_string(g.item)) + "]";
+                    break;
+                }
+                default: o += "[\"?\"]"; break;
+            }
+        }
+        return o + "]";
+    }
+    std::string casesJson() {
+        std::string o = "[";
+        for (size_t i = 0; i < cases.size(); i++) {
+            const CaseStatement& c = *cases[i];
+            const char* k = c.condition == CaseStatementCondition::Normal ? "n"
+                          : c.condition == CaseStatementCondition::WildcardJustZ ? "z"
+                          : c.condition == CaseStatementCondition::WildcardXOrZ ? "x" : "?";
+            o += std::string(i ? ",\n" : "") + "{\"k\":\"" + k + "\",\"sel\":" + exprJson(c.expr) + ",\"items\":[";
+            for (size_t j = 0; j < c.items.size(); j++) {
+                o += j ? ",[" : "[";
+                bool first = true;
+                for (const Expression* e : c.items[j].expressions) {
+                    o += (first ? "" : ",") + exprJson(*e);
+                    first = false;
+                }
+                o += "]";
+            }
+            o += "]}";
+        }
+        return o + "]";
+    }
+
     std::optional<uint64_t> center;   // -at T
 
     void json(std::ostream& os, size_t maxChanges) {
@@ -1218,10 +1084,11 @@ struct Tool {
             os << (first ? "" : ",\n") << "{\"sig\":" << it->second << ",\"kind\":" << js(label(d))
                << ",\"file\":" << dw[i].file << ",\"line\":" << dw[i].line << ",\"text\":" << js(text(d))
                << ",\"when\":" << js(when(d)) << ",\"seq\":" << (d.seq ? 1 : 0) << ",\"reads\":" << ids(d.reads)
-               << ",\"ctl\":" << ids(d.creads) << "}";
+               << ",\"ctl\":" << ids(d.creads) << ",\"blk\":" << d.block << ",\"whole\":" << (d.whole ? 1 : 0)
+               << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
-        os << "]";
+        os << "],\n\"cases\":" << casesJson();
         if (haveVcd) {
             os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale) << ",\"waves\":{";
             first = true;
@@ -1280,7 +1147,7 @@ void usage() {
                  "  -active SIG      with -vcd: the assignment that gave SIG its value at\n"
                  "                   -at T (default: the end), then what caused it,\n"
                  "                   -depth N steps back through time\n"
-                 "  -vcd <file>      the waveform msim -vcd wrote\n"
+                 "  -vcd <file>      the waveform msim wrote: VCD or FST (-fst, -wave are the same)\n"
                  "  -at T            a time, in the VCD's time unit\n"
                  "  -threads N       threads for parsing and for reading the waveform\n"
                  "                   (default: every logical core; the output is the same for any N)\n"
@@ -1306,7 +1173,7 @@ int main(int argc, char** argv) {
     std::optional<uint64_t> at;
     size_t maxChanges = 20000;
     // Every logical core by default (hyper-threads included); -threads 1 for one.
-    unsigned threads = std::max(1u, std::min(64u, std::thread::hardware_concurrency()));
+    unsigned threads = par::defaultThreads();
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -1328,13 +1195,10 @@ int main(int argc, char** argv) {
         if (a == "-scopes" || a == "-signals") { queries.push_back({a.substr(1), "", -1, std::nullopt}); continue; }
         if (a == "-depth") { depth = std::atoi(next("a number").c_str()); continue; }
         if (a == "-at") { at = std::strtoull(next("a time").c_str(), nullptr, 10); continue; }
-        if (a == "-vcd") { vcdPath = next("a VCD file"); continue; }
+        if (a == "-vcd" || a == "-fst" || a == "-wave") { vcdPath = next("a VCD file"); continue; }
         if (a == "-html") { htmlPath = next("a file"); continue; }
         if (a == "-json") { jsonPath = next("a file"); continue; }
-        if (a == "-threads" || a == "-j") {
-            threads = (unsigned)std::max(1, std::atoi(next("a number").c_str()));
-            continue;
-        }
+        if (par::threadsArg(argc, argv, i, threads, "mdebug")) continue;
         if (a == "-max-changes") { maxChanges = std::strtoull(next("a number").c_str(), nullptr, 10); continue; }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
@@ -1359,7 +1223,7 @@ int main(int argc, char** argv) {
 
     if (!vcdPath.empty()) {
         std::string err;
-        if (!tool.vcd.load(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
+        if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
         tool.haveVcd = true;
     }
 
