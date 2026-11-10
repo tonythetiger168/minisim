@@ -456,6 +456,16 @@ msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
 
 `docs/DATAPATH.md` lists every module and its ports.
 
+### Cell library checks: `mlibc`
+
+`mlibc check lib.lib -lef cells.lef` checks a Liberty library and its LEF for
+the mistakes that break the tools downstream (a function that disagrees with
+its timing arcs, tables that shrink with load, a flop without setup or hold,
+a macro of the wrong size, pins off the routing grid); `mlibc report` and
+`mlibc compare slow.lib fast.lib` summarize a library and check a pair of
+corners. See `docs/LIBCHECK.md`. The generic cell library it is tested on is
+`lib/mini45` (`docs/MINI45.md`).
+
 ### Timing constraint checks: `msdc`
 
 `msdc` reads the design and its SDC file and reports what is wrong or missing
@@ -561,6 +571,19 @@ isolation or level shifters, names not in the design, ...). See
 msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
+
+### Logic synthesis: `msynth`
+
+`msynth` synthesizes RTL to a gate netlist of Liberty library cells, with a
+Tcl shell whose commands follow dc_shell:
+
+```sh
+msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the built-in generic library
+msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
+```
+
+See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
 
 ### Formal property checking: `mformal`
 

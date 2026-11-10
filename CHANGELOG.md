@@ -104,6 +104,12 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `mlibc`, cell library checks and reports on the shared Liberty and LEF
+  readers: `mlibc check` (23 rules: function against timing arcs and
+  `timing_sense`, tables that shrink with load, missing setup or hold,
+  leakage states, drive strengths out of order, and Liberty against LEF),
+  `mlibc report` and `mlibc compare slow.lib fast.lib`. Multithreaded, with
+  the same output for any `-threads`. See `docs/LIBCHECK.md`.
 - `lib/mini45`: a generic 45 nm-class standard cell library for the tool
   line, written from scratch (not a foundry library): 88 cells (inverters,
   buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,
@@ -122,6 +128,16 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Logic synthesis: `msynth`, a dc_shell-style Tcl shell (`analyze`,
+  `elaborate`, `create_clock`, `compile`, `report_timing`, `report_area`,
+  `report_qor`, `write -format verilog` ...) on the slang front end. RTL is
+  flattened into an and-inverter graph with flops (`src/aig.hpp`,
+  `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
+  mapped onto any Liberty library by cut matching for area or delay,
+  high-fanout nets are buffered, and the result is timed with the library's
+  NLDM tables. A generic cell library is built in. Mapping runs on every
+  core (`-threads N`) with the same netlist for any thread count. See
+  `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
