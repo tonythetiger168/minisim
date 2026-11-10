@@ -21,10 +21,9 @@
 // own solver, which makes every answer and counterexample the same whatever
 // the thread count.
 #include <algorithm>
-#include <atomic>
+#include "../parallel.hpp"
 #include <map>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -499,39 +498,27 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
     sim.shrink_to_fit();
 
     // ---- SAT, in parallel: a quick pass, then (after sweeping) the full effort
-    unsigned nt0 = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
+    unsigned nt0 = opt.threads ? opt.threads : par::defaultThreads();
     auto satPass = [&](uint64_t budget, bool last, const char* how) {
         std::vector<size_t> work;
         for (size_t k = 0; k < res.points.size(); ++k) if (open[k]) work.push_back(k);
-        unsigned nt = unsigned(std::min<size_t>(nt0, std::max<size_t>(work.size(), 1)));
-        std::atomic<size_t> nextJob{0};
-        auto worker = [&] {
-            for (;;) {
-                size_t j = nextJob.fetch_add(1);
-                if (j >= work.size()) return;
-                Point& p = res.points[work[j]];
-                Cnf cnf(g);
-                int r = cnf.solve(p.miter, budget);
-                p.conflicts += cnf.sat.conflicts();
-                if (r < 0) {
-                    if (last) p.status = Point::Abort, p.how = how;
-                    continue;
-                }
-                p.how = how;
-                open[work[j]] = 0;
-                if (r == 0) p.status = Point::Pass;
-                else {
-                    p.status = Point::Fail;
-                    finishCex(p, [&](uint32_t n) { return cnf.model(n); });
-                }
+        par::parallelFor(work.size(), nt0, [&](size_t j) {
+            Point& p = res.points[work[j]];
+            Cnf cnf(g);
+            int r = cnf.solve(p.miter, budget);
+            p.conflicts += cnf.sat.conflicts();
+            if (r < 0) {
+                if (last) p.status = Point::Abort, p.how = how;
+                return;
             }
-        };
-        if (nt <= 1) worker();
-        else {
-            std::vector<std::thread> pool;
-            for (unsigned t = 0; t < nt; ++t) pool.emplace_back(worker);
-            for (auto& t : pool) t.join();
-        }
+            p.how = how;
+            open[work[j]] = 0;
+            if (r == 0) p.status = Point::Pass;
+            else {
+                p.status = Point::Fail;
+                finishCex(p, [&](uint32_t n) { return cnf.model(n); });
+            }
+        });
     };
     uint64_t quick = std::min<uint64_t>(opt.effort, 2000);
     satPass(quick, quick == opt.effort, "sat");

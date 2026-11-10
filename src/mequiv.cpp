@@ -168,7 +168,7 @@ int main(int argc, char** argv) {
         if (a == "-top") { ref.top = impl.top = need(i); continue; }
         if (a == "-reftop") { ref.top = need(i); continue; }
         if (a == "-impltop") { impl.top = need(i); continue; }
-        if (a == "-threads") { copt.threads = unsigned(std::stoul(need(i))); continue; }
+        if (par::threadsArg(argc, argv, i, copt.threads, "mequiv")) continue;
         if (a == "-effort") { copt.effort = std::stoull(need(i)); continue; }
         if (a == "-maxfail") { maxFail = std::stoul(need(i)); continue; }
         if (a == "-report") { reportPath = need(i); continue; }
@@ -219,14 +219,7 @@ int main(int argc, char** argv) {
 
     ref.haveLibs = impl.haveLibs = !libs.empty();
     // Read both designs at once.
-    if (copt.threads == 1) {
-        ref.compile();
-        impl.compile();
-    } else {
-        std::thread t([&] { ref.compile(); });
-        impl.compile();
-        t.join();
-    }
+    par::parallelFor(2, copt.threads == 1 ? 1 : 2, [&](size_t i) { (i ? impl : ref).compile(); });
     // A side with several unused modules (a netlist read with its whole cell
     // library) takes the top the other side has.
     for (Side* s : {&ref, &impl}) {
