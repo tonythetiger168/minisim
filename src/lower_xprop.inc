@@ -46,7 +46,8 @@ struct Xp {
     std::unordered_map<int, XpShadow> shadow;   // by target signal
     std::unordered_map<int, int> shadowOf;      // shadow value or mask -> target signal
     std::unordered_set<int> bad;                // targets that cannot be merged (real, string, ...)
-    std::unordered_set<size_t> okNba, oolJmp;
+    std::unordered_set<size_t> okNba, okArr, oolJmp;
+    std::unordered_set<const slang::ast::Symbol*> once;   // nonblocking targets assigned at most once a pass
     std::vector<std::pair<size_t, size_t>> guarded, badRanges;
     std::vector<std::function<void()>> ool;
 } xp;
@@ -274,10 +275,37 @@ void xpDirect(Instr i) {
 }
 // Emits assignment i, whose target expression is `target`.
 void xpEmit(Instr i, const slang::ast::Expression& target) {
-    if (xp.on && i.k == IK::Assign && i.sig >= 0 && !target.type->isIntegral()) xp.bad.insert(i.sig);
-    if (!xp.on || i.k != IK::Nba) { prog.emit(i); return; }
+    if (xp.on && i.k == IK::Assign && i.sig >= 0 && !i.arr && !target.type->isIntegral()) xp.bad.insert(i.sig);
+    if (!xp.on || (i.k != IK::Nba && i.k != IK::Assign)) { prog.emit(i); return; }
     bool simple = true;
     const slang::ast::Symbol* root = xpRootOf(target, simple);
+    // An element chosen at run time (mem[a] = d, mem[a] <= d). In an unknown
+    // region the write still happens, but it stores the merge of the element's
+    // present value and the new one: right for one write, pessimistic when
+    // several branches write the same element. A nonblocking write merges with
+    // the present value only when no other one to that array can be pending.
+    if (i.arr && i.dyn < 0 && !i.arr->dynElem && !i.nbaLater && i.drv < 0 && target.type->isIntegral()
+        && (i.k == IK::Assign || (root && xp.once.count(root)))) {
+        int w = i.bidx && i.pw <= 0 ? 1 : i.pw > 0 ? i.pw : i.hi >= 0 ? i.hi - i.lo + 1 : i.arr->elemW;
+        Instr m = i;
+        if (xpropMode() == 2 || i.bidx || i.pw > 0) {
+            m.e = xpX(w);
+        } else {
+            auto rd = node(Op::ArrRead);
+            rd->arr = i.arr;
+            rd->kids = i.aidx;
+            E oldv = i.hi >= 0 ? slice(rd, i.hi, i.lo) : E(rd);
+            m.e = node(Op::Mux, {konst(allx(1)), oldv, i.e});
+        }
+        size_t jf = emitJmpIfNot(ref(xp.xm));
+        xp.okArr.insert(prog.emit(m));
+        size_t js = xpJmp();
+        prog.code[jf].target = prog.here();
+        xp.okArr.insert(prog.emit(i));
+        prog.code[js].target = prog.here();
+        return;
+    }
+    if (i.k != IK::Nba) { prog.emit(i); return; }
     int cls = XC_DIRECT;
     if (root && simple)
         if (auto it = xp.cls.find(root); it != xp.cls.end()) cls = it->second;
@@ -322,7 +350,10 @@ bool xpScan(size_t a, size_t b, std::map<int, XpBits>& tg, std::string& why) {
         switch (i.k) {
             case IK::Assign: {
                 if (i.dyn >= 0) { why = "an assignment to a queue, dynamic or associative array element"; return false; }
-                if (i.arr) { why = "an assignment to an array element chosen at run time"; return false; }
+                if (i.arr) {
+                    if (xp.okArr.count(pc)) break;
+                    why = "an assignment to an array element chosen at run time"; return false;
+                }
                 if (i.sig < 0 || isRel(i.sig)) { why = "an assignment to an automatic variable or class property"; return false; }
                 if (i.drv >= 0) { why = "a net driver"; return false; }
                 if (xp.bad.count(i.sig)) { why = "an assignment to a real, string, handle or container variable"; return false; }
@@ -332,7 +363,7 @@ bool xpScan(size_t a, size_t b, std::map<int, XpBits>& tg, std::string& why) {
                 break;
             }
             case IK::Nba:
-                if (!xp.okNba.count(pc)) { why = "a nonblocking assignment in a form that cannot be merged"; return false; }
+                if (!xp.okNba.count(pc) && !xp.okArr.count(pc)) { why = "a nonblocking assignment in a form that cannot be merged"; return false; }
                 break;
             case IK::Jmp:
             case IK::JmpIfNot:
@@ -768,6 +799,7 @@ void xpProc(const slang::ast::Statement& body) {
         int cls = pre.unknown || pre.direct.count(sym) ? XC_DIRECT
                   : n <= 1 ? XC_LAZY : (pre.waits ? XC_DIRECT : XC_EAGER);
         xp.cls[sym] = cls;
+        if (n <= 1 && !pre.unknown && !pre.waits) xp.once.insert(sym);
         anyEager |= cls == XC_EAGER;
     }
     xp.on = true;
