@@ -98,7 +98,7 @@ public:
             for (auto& p : procs)
                 if (p.combRank >= 0)
                     for (auto& in : p.prog->code) { if (in.k == IK::WaitEdge) break; comb += in.k == IK::Assign; }
-            if (comb > 64 && comb > 8 * nba) dom.clear();
+            if (comb > 64 && comb > 8 * nba && !getenv("MSIM_XCYC")) dom.clear();
         }
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
         for (size_t i = 0; i < procs.size(); i++) {
@@ -1054,6 +1054,7 @@ private:
         size_t ns = sigs.size();
         bool anyArr = false;
         std::vector<char> cand(ns, 0), bad(ns, 0);
+        std::vector<int> owner(ns, -1);   // the branching comb process that writes a candidate
         std::vector<char> mine(procs.size(), 0);
         for (int i : dom) mine[i] = 1;
         for (size_t i = 0; i < procs.size(); i++) if (procs[i].combRank >= 0) mine[i] = 1;
@@ -1076,7 +1077,13 @@ private:
                         cand[in.sig] = 1;
                     else if (whole && in.drv < 0 && sigs[in.sig].drivers == 0 && oneAssign(*procs[i].prog) && !cand[in.sig])
                         cand[in.sig] = 1;
-                    else bad[in.sig] = 1;
+                    // The outputs of one always_comb with if / case: any
+                    // number of whole or part writes, all from this process.
+                    else if (in.drv < 0 && sigs[in.sig].drivers == 0 && !in.arr && in.aidx.empty() && !in.bidx &&
+                             (!cand[in.sig] || owner[in.sig] == (int)i)) {
+                        cand[in.sig] = 1;
+                        owner[in.sig] = (int)i;
+                    } else bad[in.sig] = 1;
                 }
                 continue;
             }
@@ -1172,6 +1179,19 @@ private:
     std::string fassign(const Instr& i) {
         std::ostringstream o;
         std::string g, u, sl;
+        if (i.bidx)   // v[i] = ...: the bits are chosen at run time
+            return dynTarget(i, fast(i.e), " S.fw(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
+        if (isPriv(i.sig) && i.hi >= 0) {   // some bits of a private signal
+            std::string P_ = "P" + std::to_string(i.sig), m = M(i.hi - i.lo + 1) + " << " + std::to_string(i.lo);
+            std::string slowW = "PW(" + P_ + ", " + std::to_string(sigW_[i.sig]) + ", v_insert(PR(" + P_ + ", " +
+                                std::to_string(sigW_[i.sig]) + ", false), " + ex(i.e) + ", " + std::to_string(i.hi) + ", " +
+                                std::to_string(i.lo) + "));";
+            if (!split(i.e, g, u, sl)) return " " + slowW + "\n";
+            std::string fastW = "{ const uint64_t m = " + m + "; " + P_ + ".v = (" + P_ + ".v & ~m) | (((uint64_t)(" + u + ") << " +
+                                std::to_string(i.lo) + ") & m); " + P_ + ".x &= ~m; " + P_ + ".z &= ~m; }";
+            if (g.empty()) return " " + fastW + "\n";
+            return " if (__builtin_expect(" + g + ", 1)) " + fastW + " else " + cold(slowW) + "\n";
+        }
         if (isPriv(i.sig)) {
             if (split(i.e, g, u, sl)) {
                 if (g.empty()) return " " + pwv(i.sig, u) + "\n";
@@ -1302,7 +1322,12 @@ private:
         // so the ones already done compute the same values.
         auto stmt2 = [&](const Instr& in) -> std::string {
             std::string g, u, sl;
-            if (in.hi >= 0 || !split(in.e, g, u, sl)) {
+            if (in.hi >= 0 && isPriv(in.sig) && split(in.e, g, u, sl)) {   // x and z are already 0
+                std::string P_ = "P" + std::to_string(in.sig), L_ = std::to_string(in.lo);
+                return "    { const uint64_t m = " + M(in.hi - in.lo + 1) + " << " + L_ + "; " + P_ + ".v = (" + P_ +
+                       ".v & ~m) | (((uint64_t)(" + u + ") << " + L_ + ") & m); }\n";
+            }
+            if (in.hi >= 0 || in.bidx || !split(in.e, g, u, sl)) {
                 std::string S_ = std::to_string(in.sig);
                 std::string unk = isPriv(in.sig) ? "P" + S_ + ".x"
                                 : sigW_[in.sig] <= 64 ? "S.sigs[" + S_ + "].val.x" : "anyX(S.sigs[" + S_ + "].val)";
@@ -1385,6 +1410,7 @@ private:
                     }
                     if (in.k != IK::Assign) break;
                     noteRefs(in.e);
+                    noteRefs(in.bidx);
                     combIns.push_back(&in);
                     unitIns.back().push_back(&in);
                     c4 += L4(pc) + ":" + fassign(in);
@@ -1643,7 +1669,11 @@ private:
             if (i.k == IK::Jmp) { o << L(pc) << ":" << CH(&p, pc) << " goto " << L(i.target) << ";\n"; continue; }
             if (i.k == IK::Assert) { o << L(pc) << ":" << CH(&p, pc) << combAssert(n, i); continue; }
             if (i.k != IK::Assign) break;
-            if (i.arr || i.bidx) throw CodegenUnsupported("variable-index write in a static combinational process");
+            if (i.arr) throw CodegenUnsupported("array write in a static combinational process");
+            if (i.bidx) {
+                o << L(pc) << ":" << CH(&p, pc) << dynTarget(i, fast(i.e), " S.set(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
+                continue;
+            }
             o << L(pc) << ":" << CH(&p, pc) << " " << assign(i);
         }
         o << L(pc) << ": ;\n}\n";

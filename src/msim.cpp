@@ -412,6 +412,7 @@ static void splitCombBlocks(LowerResult& lowered) {
         for (size_t pc = 0; pc < end; pc++) {
             const Instr& i = code[pc];
             if ((i.k == IK::Jmp || i.k == IK::JmpIfNot) && i.target <= pc) { ok = false; why = "loop"; }   // a loop
+            if (i.bidx) { ok = false; why = "variable bit select"; }
             if (i.k == IK::Assert) {
                 const AssertInfo& a = asserts().at(i.sig);
                 for (auto* cs : {&a.passCap, &a.failCap})
@@ -470,7 +471,7 @@ static void splitCombBlocks(LowerResult& lowered) {
                 for (size_t pc = 0; pc < end; pc++) {
                     if (!keep[pc]) continue;
                     refs(code[pc].e, rd);
-                    if (code[pc].k == IK::Assign && code[pc].hi >= 0) rd.insert(code[pc].sig);   // a part write keeps the other bits
+                    if (code[pc].k == IK::Assign && (code[pc].hi >= 0 || code[pc].bidx)) rd.insert(code[pc].sig);   // a part write keeps the other bits
                 }
                 for (size_t j = 0; j < sh.outs.size(); j++)
                     if (rd.count(sh.outs[j]) && !isTemp(sh.outs[j]) && find((int)j) != (int)k) { grp[find((int)j)] = (int)k; again = true; }
@@ -586,6 +587,32 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     if (staticSeq)
         for (size_t i = 0; i < n; i++)
             if (p.rank[i] < 0 && lowered.procs[i].program < 0 && !lowered.procs[i].reactive && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
+    // MSIM_WHYCORO=1: the processes left as coroutines, with the kinds of
+    // instruction that are neither an assign nor a jump.
+    if (std::getenv("MSIM_WHYCORO"))
+        for (size_t i = 0; i < n; i++) {
+            if (p.rank[i] >= 0 || p.seq[i]) continue;
+            const Prog& q = lowered.procs[i].prog;
+            std::string w;
+            int waits = 0, blk = 0, nba = 0, arr = 0, back = 0;
+            std::set<int> ks;
+            for (size_t pc = 0; pc < q.code.size(); pc++) {
+                const Instr& x = q.code[pc];
+                if (x.k == IK::WaitEdge) waits++;
+                else if (x.k == IK::Assign) { blk++; if (x.arr || !x.aidx.empty() || x.bidx) arr++;
+                    if (x.arr) w += " arrW(" + S.sigs[x.arr->base].name + " n=" + std::to_string(x.arr->count) + ")";
+                    else if (x.bidx) w += " bidx(" + S.sigs[x.sig].name + ")";
+                    if (x.dyn >= 0) w += " dyn"; if (x.de || x.delay || !x.dly.empty()) w += " dly"; }
+                else if (x.k == IK::Assert) w += " assert.join" + std::to_string(x.join);
+                else if (x.k == IK::Call) w += " call(n=" + std::to_string(x.callee ? x.callee->code.size() : 0) + ")";
+                else if (x.k == IK::Nba) { nba++; if (x.arr || !x.aidx.empty() || x.bidx) arr++; }
+                else if (x.k == IK::Jmp || x.k == IK::JmpIfNot) { if (x.target <= pc && !(x.k == IK::Jmp && pc + 1 == q.code.size())) back++; }
+                else ks.insert((int)x.k);
+            }
+            for (int k : ks) w += " ik" + std::to_string(k);
+            std::cerr << "coro " << lowered.procs[i].kind << " n=" << q.code.size() << " waits=" << waits << " blk=" << blk << " nba=" << nba
+                      << " arr=" << arr << " back=" << back << " roots=" << q.roots.size() << w << " : " << (q.code.size() > 2 && q.code[q.code.size() - 2].k == IK::WaitEdge ? S.sigs[q.code[q.code.size() - 2].sig].name : std::string("?")) << "\n";
+        }
     return p;
 }
 

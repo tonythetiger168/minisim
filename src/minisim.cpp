@@ -830,7 +830,14 @@ struct Sim {
         // and record the change. A full set() would also queue the domain's
         // comb pass and scan for waiters, which made -vcd runs 20x slower.
         bool waveOnly = !mon.on && !g.fl;
-        if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) { set(s, in); return; }
+        if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) {
+#ifdef MSIM_FWSTAT
+            { static struct St { std::map<std::string, long> m; ~St() { std::vector<std::pair<long, std::string>> v; for (auto& [k, c] : m) v.push_back({c, k});
+                std::sort(v.rbegin(), v.rend()); for (size_t i = 0; i < v.size() && i < 400; i++) std::fprintf(stderr, "FW %ld %s\n", v[i].first, v[i].second.c_str()); } } st;
+              std::string why = !quiet[s] ? (!seqOf[s].empty() ? "seq " : "comb ") : !waiters[s].empty() ? "wait " : "obs ";
+              st.m[why + sigs[s].name]++; }
+#endif
+            set(s, in); return; }
         if (g.w <= 64 && g.val.hi.empty()) {   // the common case, without copying a Val
             uint64_t m = mask(g.w), v = in.v & m, x = in.x & m, z = in.z & m;
             if (v == g.val.v && x == g.val.x && z == g.val.z) return;

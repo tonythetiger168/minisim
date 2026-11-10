@@ -597,7 +597,10 @@ inline bool combShape(const Prog& p, CombShape& c) {
         }
         if (p.code[i].k != IK::Assign) return false;
         // A target chosen at run time (a[i] = ..., v[i] = ...) has no fixed output signal.
-        if (p.code[i].arr || !p.code[i].aidx.empty() || p.code[i].bidx) return false;
+        // A bit or part select chosen at run time (v[i] = ..., v[i +: 4] = ...)
+        // still writes one known signal; an array element (a[i] = ...) does not.
+        if (p.code[i].arr || !p.code[i].aidx.empty()) return false;
+        if (p.code[i].bidx && p.code[i].drv >= 0) return false;
         if (p.code[i].de || p.code[i].delay || !p.code[i].dly.empty()) return false;
         bool seen = false;
         for (int o : c.outs) seen |= o == p.code[i].sig;
