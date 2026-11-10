@@ -375,6 +375,19 @@ msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 
+### Logic synthesis: `msynth`
+
+`msynth` synthesizes RTL to a gate netlist of Liberty library cells, with a
+Tcl shell whose commands follow dc_shell:
+
+```sh
+msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the built-in generic library
+msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
+```
+
+See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per

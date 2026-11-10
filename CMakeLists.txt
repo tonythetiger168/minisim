@@ -151,6 +151,13 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
+  # One file per tool of the line (msynth, ...): cmake/tools/<tool>.cmake.
+  include(GNUInstallDirs)
+  file(GLOB MINISIM_TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
+  foreach(tool_cmake ${MINISIM_TOOL_CMAKE})
+    include(${tool_cmake})
+  endforeach()
+
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
   target_link_libraries(test_lower PRIVATE slang::slang)
