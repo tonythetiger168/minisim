@@ -186,3 +186,58 @@ bits`, scan-in cell first), the input a fault simulator needs to grade the
 BIST. Fault coverage and test points are not reported yet: they wait for the
 fault simulator of the ATPG work, which this will call instead of bringing a
 second one. Primary outputs are not observed during BIST.
+
+## Scan compression: `mdft -edt`
+
+```sh
+mdft -edt design_scan.v cells.v -top chip -scandef chains.json [-edt_channels N] [-edt_ring N]
+     [-edt_cubes cubes.txt -edt_patterns patterns.txt] [-edt_fill random|0] [-threads N]
+mdft -edt_encode -scandef chains.json -edt_cubes cubes.txt -edt_patterns patterns.txt
+```
+
+A few tester channels feed all the scan chains, so the tester stores and
+shifts far less data. `-edt` reads the same chain description as `-lbist` and
+writes `chip_edt.sv`:
+
+- `chip_edt_decomp`: a ring generator (an LFSR on a primitive polynomial that
+  the input channels are XORed into at evenly spaced bits every shift cycle)
+  and a phase shifter (a distinct XOR of three generator bits per chain);
+- `chip_edt_comp`: an XOR compactor, chain i to output channel i mod N;
+- `chip_edt`: the design with both, and `edt_mode`, `edt_update`,
+  `edt_channels_in`, `edt_channels_out`. With `edt_mode` low the scan pins
+  work as before (bypass).
+
+One pattern is one clock with `edt_update` high (the generator clears; this
+is the capture cycle), then `longest chain + init` shift clocks, where the
+init cycles (`ring width / channels`) let the generator reach any state
+before the bits that stay in the chains are produced.
+
+**Encoding.** A test cube is a pattern in which ATPG fixed only the cells it
+needs (`x` elsewhere). Every scan cell is a linear function over GF(2) of the
+channel bits, so a cube is one linear equation per care bit; mdft solves it by
+Gaussian elimination and fills the free channel bits at random (or with 0).
+Each result is decompressed again and compared with its cube before it is
+written. A cube with too many care bits, or too many in the same few shift
+cycles (the decompressor gains only one free bit per channel per cycle), is
+reported as `unencodable`, for ATPG to split.
+
+Cube file: `<pattern> <chain> <bits>`, the scan-in cell first, `x` for free;
+chains not listed are all free. Pattern file: `<pattern> in <channel> <bits>`
+(first shifted first) and `<pattern> load <chain> <bits>` (the full pattern
+the chains receive, which is what a fault simulator grades).
+
+Cubes are encoded in parallel on every core (`-threads N` to choose), and the
+output is identical for any thread count. 2000 cubes for 400 chains of 250
+cells on 16 channels (100,000 cells, 378 care bits on average, 3000 at most,
+24.6x less tester data): 6.7 s on one thread, 1.6 s on four.
+
+`chip_edt_tb.sv` plays the first encoded patterns (or random channel data)
+through the wrapper in shift mode and checks every output channel bit: a
+chain in shift mode is a shift register, so what leaves it is what the
+decompressor put in `length` cycles before. That checks the decompressor, the
+compactor, the wiring and the chain lengths against the encoder's model.
+
+Not there yet: X masking in the compactor (an unknown response bit spoils its
+output channel for that cycle), expected compacted responses (they need the
+good-machine responses from fault simulation), and reading the ATPG tool's
+own pattern format directly.

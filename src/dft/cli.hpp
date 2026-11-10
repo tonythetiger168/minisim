@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "bscan.hpp"
+#include "edt.hpp"
 #include "lbist.hpp"
 #include "pdl.hpp"
 
@@ -21,6 +22,8 @@ struct Cli {
     bool bscan = false, lbist = false, werror = false, quiet = false, ijtagTap = false;
     BscanOpts bo;
     LbistOpts lo;
+    EdtOpts eo;
+    bool edt = false, edtEncode = false;
     std::string lbistDump, self;
     std::string bsdlFile, svf, tb, iclTop, iclScanOut, iclRtl, iproc;
     std::vector<std::string> icl, pdl;
@@ -54,6 +57,16 @@ struct Cli {
               "  -lbist_sign            simulate with msim and write the golden signature into the RTL\n"
               "  -lbist_msim PATH       the msim to run (default: next to mdft, then PATH)\n"
               "  -lbist_dump FILE       the pattern loads, one line per chain, scan-in first\n"
+              "scan compression:\n"
+              "  -edt                   add a decompressor and a compactor around the chains of -scandef\n"
+              "  -edt_encode            encode cubes only: needs -scandef and -edt_cubes, no design\n"
+              "  -edt_channels N        tester channels each way (default: one per ten chains)\n"
+              "  -edt_ring N            ring generator width, 8..64 (default 32; 64 above 8 channels)\n"
+              "  -edt_cubes FILE        test cubes: '<pattern> <chain> <bits>', scan-in cell first, x = free\n"
+              "  -edt_patterns FILE     the compressed patterns and what they load\n"
+              "  -edt_fill random|0     the free channel bits (default random)\n"
+              "  -edt_out DIR           where <top>_edt.sv and its testbench go (default .)\n"
+              "  -threads N             encode on N threads (default: every core; the result is the same)\n"
               "IJTAG (IEEE 1687):\n"
               "  -icl FILE              read ICL (repeatable)     -icl_top M   the top ICL module\n"
               "  -icl_scan_out PORT     the ScanOutPort to use when the top module has several\n"
@@ -109,6 +122,14 @@ struct Cli {
                 else if (a == "-lbist_sign") lo.sign = true;
                 else if (a == "-lbist_msim") lo.msim = next();
                 else if (a == "-lbist_dump") lbistDump = next();
+                else if (a == "-edt") edt = mine = true;
+                else if (a == "-edt_encode") edtEncode = mine = true;
+                else if (a == "-edt_channels") eo.channels = std::stoi(next());
+                else if (a == "-edt_ring") eo.ring = std::stoi(next());
+                else if (a == "-edt_cubes") eo.cubes = next();
+                else if (a == "-edt_patterns") eo.patterns = next();
+                else if (a == "-edt_fill") eo.fill = next();
+                else if (a == "-edt_out") eo.outDir = next();
                 else if (a == "-bsdl") bsdlFile = next(), mine = true;
                 else if (a == "-icl") icl.push_back(next()), mine = true;
                 else if (a == "-icl_top") iclTop = next();
@@ -123,8 +144,7 @@ struct Cli {
                     if (a == "-Werror") werror = true;
                     if (a == "-quiet" || a == "-q") quiet = true;
                     if (a == "-threads" && i + 1 < argc) {
-                        // Accepted for uniformity; these flows are single passes over small inputs.
-                        threads = std::atoi(argv[++i]);
+                        threads = std::atoi(argv[++i]);  // used by the cube encoder
                         continue;
                     }
                     rest.push_back(argv[i]);
@@ -135,7 +155,17 @@ struct Cli {
                 if (!svf.empty() || !tb.empty()) throw Error("-svf and -tb need -bscan, -bsdl or -pdl");
                 return -1;
             }
-            if (lbist && bscan) throw Error("-lbist and -bscan are separate runs");
+            if ((int)lbist + (int)bscan + (int)edt + (int)edtEncode > 1) throw Error("-bscan, -lbist, -edt and -edt_encode are separate runs");
+            if ((edt || edtEncode) && lo.scandef.empty()) throw Error("-edt needs -scandef FILE");
+            eo.scandef = lo.scandef, eo.threads = threads;
+            if (edtEncode) {
+                if (eo.cubes.empty()) throw Error("-edt_encode needs -edt_cubes FILE");
+                EdtPlan p;
+                p.sd = readScanDef(eo.scandef);
+                p.plan(eo);
+                runEncode(p, nullptr);
+                return 0;
+            }
             if (lbist && lo.scandef.empty()) throw Error("-lbist needs -scandef FILE");
             if (!bsdlFile.empty()) return runBsdl(bsdlFile, true);
             if (!icl.empty()) return runIjtag();
@@ -227,6 +257,57 @@ struct Cli {
                 std::cout << "mdft: boundary scan for " << top << ": " << r.cells << " cells, " << r.irLen
                           << "-bit instruction register\n  " << r.rtlPath << "\n  " << r.bsdlPath << "\n";
             if (!svf.empty() || !tb.empty()) return runBsdl(r.bsdlPath, false);
+            return 0;
+        } catch (const Error& e) {
+            std::cerr << "mdft: " << e.what() << "\n";
+            return 2;
+        }
+    }
+
+    // Encodes -edt_cubes; returns the channel data of the first few patterns for the testbench.
+    void runEncode(const EdtPlan& p, std::vector<std::vector<std::string>>* tbCh) {
+        if (!quiet)
+            std::cout << "mdft: scan compression: " << p.n << " chains (longest " << p.len << ") on " << p.c
+                      << (p.c == 1 ? " channel, " : " channels, ") << p.r << "-bit ring generator, " << p.T
+                      << " shift cycles per pattern\n";
+        if (eo.cubes.empty()) return;
+        CubeSet cs = readCubes(eo.cubes, p);
+        EdtStats st;
+        std::vector<EdtEncoder::Result> res = encodeAll(p, cs, eo, st);
+        if (!eo.patterns.empty()) writeEdtPatterns(eo.patterns, p, cs, res);
+        if (tbCh)
+            for (size_t i = 0; i < res.size() && (int)tbCh->size() < eo.tbPatterns; i++)
+                if (res[i].ok) tbCh->push_back(res[i].channels);
+        if (!quiet) {
+            long cells = 0;
+            for (const ScanChain& c : p.sd.chains) cells += c.length;
+            char buf[256];
+            std::snprintf(buf, sizeof buf,
+                          "mdft: %d of %d cubes encoded (%d unencodable), %.1f care bits on average, %ld at most\n"
+                          "  %ld scan cells from %d channel bits per pattern: %.1fx less tester data\n"
+                          "  %.2f s on %d thread%s\n",
+                          st.encoded, st.total, st.failed, st.total ? (double)st.care / st.total : 0.0, st.maxCare, cells,
+                          p.c * p.T, (double)cells / (p.c * p.T), st.seconds, st.threads, st.threads == 1 ? "" : "s");
+            std::cout << buf;
+        }
+    }
+    int runEdt(std::vector<Port> ports, const std::string& top) {
+        try {
+            EdtPlan p;
+            p.sd = readScanDef(eo.scandef);
+            p.plan(eo);
+            std::vector<std::vector<std::string>> tbCh;
+            runEncode(p, &tbCh);
+            if (tbCh.empty()) {  // no cubes: random channel data exercises the hardware
+                std::mt19937_64 rng(0xEDEDEDED);
+                for (int k = 0; k < 4; k++) {
+                    tbCh.emplace_back(p.c, std::string(p.T, '0'));
+                    for (std::string& ch : tbCh.back())
+                        for (char& b : ch) b = (rng() & 1) ? '1' : '0';
+                }
+            }
+            EdtResult r = insertEdt(ports, top, eo, p, tbCh);
+            if (!quiet) std::cout << "  " << r.rtlPath << "\n  " << r.tbPath << "\n";
             return 0;
         } catch (const Error& e) {
             std::cerr << "mdft: " << e.what() << "\n";
