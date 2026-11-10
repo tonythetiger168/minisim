@@ -207,6 +207,42 @@ type (19) and the evaluations, passes and failures of every assertion (16).
 `mcov report` prints both, lists uncovered bins and failed or idle
 assertions in the HTML, and gates them with `-min-func` and `-min-assert`.
 
+### Verification planning: `mplan`
+
+`mplan` (in the source tree `tools/mplan.py`) tracks a verification plan
+against the regressions: which features are proven, by which tests,
+coverage and assertions, how that moves over time, and what the failures
+are. A plan is a small indented text file:
+
+```
+plan uart "UART verification plan"
+  owner: tony
+  feature tx "Transmit path" weight=2 owner=alice
+    test   uart_tx_*                # mregress tests
+    line   rtl/uart_tx.sv goal=95   # code coverage
+    cover  tb.cg_tx                 # a covergroup type, or type.item
+    assert tb.dut.u_tx              # the assertions in that scope
+    feature parity "Parity"
+      test uart_parity_*
+```
+
+```sh
+mregress tests.list -cov -plan uart.vplan   # regress, then score the plan into regress.d/plan/
+mplan report uart.vplan -results regress.d -label $GIT_COMMIT -rules triage.rules -gate
+mplan triage -results regress.d -plan uart.vplan   # only the failure buckets
+mplan trend  plan.d/history.jsonl                  # score, tests and coverage per snapshot
+mplan init   -results regress.d -o draft.vplan     # a starting plan from an existing regression
+```
+
+`mplan report` scores every feature (weighted, with a goal per metric),
+writes `plan.json` and one self-contained `plan.html` (feature tree, trend
+chart, failure triage, results that no plan line points at), and appends a
+snapshot to `history.jsonl`. Failures are bucketed by signature and marked
+new, recurring (since which snapshot), flaky or fixed, with the features and
+owners each bucket blocks; a rules file marks buckets known or waived and
+attaches a bug id. `-gate`, `-min-score` and `-fail-on-new` turn it into a
+CI gate. Full reference: [`docs/MPLAN.md`](docs/MPLAN.md) and `mplan -h`.
+
 ### Protected IP: `msimprotect` and `msim -keyfile`
 
 minisim reads and writes IEEE 1735-2023 version 3 envelopes, the format

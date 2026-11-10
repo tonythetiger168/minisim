@@ -37,6 +37,9 @@ msim run gets ``-threads`` = physical cores / runs, so parallel runs do not
 oversubscribe the machine. Runs start longest first, by the times in the
 last results.json. ``-compile`` runs every test with msim -compile in its own
 build directory under <o>/build, so the seeds of a test share one C++ build.
+
+``-plan FILE`` scores a verification plan against the regression when it is
+done (mplan report: features, history, failure triage) into ``<o>/plan``.
 """
 
 import argparse
@@ -458,6 +461,8 @@ def main(argv=None):
                     help="msim only: run every test with msim -compile (one C++ build per test, reused by its seeds)")
     ap.add_argument("-cov", action="store_true",
                     help="msim only: collect coverage per run and merge it into <o>/cov.json (see mcov)")
+    ap.add_argument("-plan", metavar="FILE",
+                    help="score this verification plan against the results (mplan report) into <o>/plan")
     ap.add_argument("-version", action="version", version=f"mregress {VERSION}")
     a = ap.parse_args(argv)
 
@@ -569,6 +574,15 @@ def main(argv=None):
             except (AttributeError, ImportError, SyntaxError):   # an older mcov
                 subprocess.run([sys.executable, mcov, "merge", *dbs, "-o", merged], stdout=subprocess.DEVNULL, check=False)
                 subprocess.run([sys.executable, mcov, "report", merged, "-html", os.path.join(outdir, "cov_html")], check=False)
+    if a.plan:
+        here = os.path.dirname(os.path.abspath(__file__))
+        mplan = next((c for c in (os.path.join(here, "mplan"), os.path.join(here, "mplan.py")) if os.path.exists(c)), None)
+        if not mplan:
+            print("mregress: -plan: mplan not found next to mregress", file=sys.stderr)
+        else:
+            # The plan's own gates are mplan's to run; here it only reports.
+            subprocess.run([sys.executable, mplan, "report", a.plan, "-results", outdir, "-o", os.path.join(outdir, "plan"),
+                            "-threads", str(a.j)], check=False)
     if a.spec or a.chapters:
         print_chapters(summary["runs"], a.md)
     print(f"\nmregress: {npass} passed, {nfail} failed, {nskip} skipped" + (f", {nxfail} known gaps (xfail)" if nxfail else "")

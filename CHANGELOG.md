@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mplan`: verification planning and tracking. A plan file maps features to
+  tests, code coverage, covergroups and assertions; `mplan report` scores it
+  against mregress results and the coverage database, keeps a history of
+  snapshots (trend chart, regressions per feature), sorts failures into
+  buckets (new / recurring / flaky / fixed, features and owners blocked,
+  rules for known and waived failures) and writes `plan.json` and
+  `plan.html`. Also `mplan check`, `triage`, `trend`, `init`, the gates
+  `-gate` / `-min-score` / `-fail-on-new`, and `mregress -plan`. See
+  `docs/MPLAN.md`.
 - `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
   of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
   bus, logic in front of a synchronizer, reconvergence, a signal synchronized
