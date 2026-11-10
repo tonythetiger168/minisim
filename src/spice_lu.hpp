@@ -294,11 +294,13 @@ public:
         }
         {
             std::lock_guard<std::mutex> g(m_);
-            fn_ = &f; n_ = n; chunk_ = chunk; next_ = 0; busy_ = nthreads_ - 1; gen_++;
+            fn_ = &f; n_ = n; chunk_ = chunk; next_ = 0; busy_ = nthreads_ - 1;
             error_ = nullptr;
+            gen_++;
         }
         cv_.notify_all();
         run(0);
+        for (int i = 0; i < kSpin && busy_ != 0; i++) relax();
         std::unique_lock<std::mutex> g(m_);
         done_.wait(g, [this] { return busy_ == 0; });
         fn_ = nullptr;
@@ -323,6 +325,9 @@ private:
     void work(int tid) {
         unsigned seen = 0;
         for (;;) {
+            // A circuit asks for many short loops in a row (one per Newton
+            // iteration), so wait a moment for the next one before sleeping.
+            for (int i = 0; i < kSpin && gen_ == seen && !stop_; i++) relax();
             {
                 std::unique_lock<std::mutex> g(m_);
                 cv_.wait(g, [&] { return stop_ || gen_ != seen; });
@@ -330,9 +335,19 @@ private:
                 seen = gen_;
             }
             run(tid);
-            std::lock_guard<std::mutex> g(m_);
-            if (--busy_ == 0) done_.notify_one();
+            if (--busy_ == 0) {
+                std::lock_guard<std::mutex> g(m_);
+                done_.notify_one();
+            }
         }
+    }
+    static constexpr int kSpin = 20000;   // about 0.1 ms
+    static void relax() {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
     }
     int nthreads_;
     std::vector<std::thread> workers_;
@@ -341,9 +356,9 @@ private:
     const std::function<void(size_t, int)>* fn_ = nullptr;
     size_t n_ = 0, chunk_ = 1;
     std::atomic<size_t> next_{0};
-    int busy_ = 0;
-    unsigned gen_ = 0;
-    bool stop_ = false;
+    std::atomic<int> busy_{0};
+    std::atomic<unsigned> gen_{0};
+    std::atomic<bool> stop_{false};
     std::exception_ptr error_;
 };
 

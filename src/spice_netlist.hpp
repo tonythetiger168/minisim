@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -444,5 +445,230 @@ private:
         return c;
     }
 };
+
+// ------------------------------------------------------------------ flatten
+//
+// The netlist as a list of primitive elements with flat names, for tools
+// that want the devices and their connections rather than a simulation
+// (layout versus schematic, cell characterization).
+
+struct Primitive {
+    std::string path;                 // "x1.x2.m1"
+    char kind = 0;                    // first letter of the element: 'm', 'r', 'c', 'd', 'q', ..., 'x'
+    std::vector<std::string> nodes;   // flat net names in card order; ground is "0"
+    std::string model;                // model name ("" when the element has none)
+    std::map<std::string, double> params;
+    std::string where;                // file:line of the card
+};
+
+struct Flat {
+    std::vector<std::string> ports;   // of the top subcircuit, in .subckt order; empty for the top level
+    std::vector<Primitive> prims;     // in netlist order, depth first
+};
+
+// Flattens the top level of the netlist, or the subcircuit `top` when one is
+// named. What a caller can rely on:
+//
+// - Net names. A net of the top block keeps its name; a net inside instance
+//   x1 is "x1.net". A net connected through a port has the name it has in
+//   the highest block that sees it. "0" and "gnd" are "0" everywhere, and a
+//   .global net has its bare name at every level.
+// - Nodes. R, C, L, D, V, I: two. M: four (d g s b). Q: three, or four when
+//   a substrate node comes before the model. E, G: four (out+, out-, in+,
+//   in-). F, H: two, and `model` is the flat name of the controlling source.
+//   K: none, and `nodes` holds the flat names of the two inductors.
+// - Parameters are numbers in SI units, expressions evaluated in the scope
+//   of the instance ("w=650000u" gives 0.65). The value of an R, C, L, E, G,
+//   F, H or K is "value"; a plain DC value of a V or I is "dc"; the area
+//   written after a D or Q model is "area". An R, C or L written with a
+//   model in place of a value ("r1 a b rpoly w=1u l=10u") has that model.
+// - X of a subcircuit the netlist defines is expanded. Its m= multiplies the
+//   m of everything inside (unless the subcircuit has its own parameter m).
+// - X of a subcircuit the netlist does not define is kept as kind 'x': the
+//   last word before the name=value pairs is `model`, the words before it
+//   are `nodes`, and the pairs are `params`.
+inline Flat flatten(const Netlist& nl, const std::string& top = "") {
+    struct Env {
+        Scope sc;
+        const Block* blk = nullptr;
+        std::string prefix;
+        std::map<std::string, std::string> ports;
+        double mult = 1;
+    };
+    std::set<std::string> globals;
+    for (const Card& k : nl.control)
+        if (k.tok[0] == ".global") globals.insert(k.tok.begin() + 1, k.tok.end());
+    Flat out;
+    auto declare = [](Env& e) {
+        for (const Card& k : e.blk->cards)
+            if (k.tok[0] == ".param" || k.tok[0] == ".params")
+                for (size_t i = 1; i < k.tok.size(); i++) {
+                    auto eq = k.tok[i].find('=');
+                    if (eq == std::string::npos) throw Error(k.where + ": .param needs name=value");
+                    e.sc.set(k.tok[i].substr(0, eq), k.tok[i].substr(eq + 1));
+                }
+    };
+    auto net = [&](Env& e, const std::string& t) -> std::string {
+        if (t == "0" || t == "gnd") return "0";
+        if (auto it = e.ports.find(t); it != e.ports.end()) return it->second;
+        if (globals.count(t)) return t;
+        return e.prefix + t;
+    };
+    auto isKV = [](const std::string& t) { return t.find('=') != std::string::npos; };
+    int depth = 0;
+    std::function<void(Env&)> walk = [&](Env& e) {
+        for (const Card& k : e.blk->cards) {
+            const auto& t = k.tok;
+            if (t.empty() || t[0][0] == '.') continue;
+            try {
+                // Positional words, then name=value pairs.
+                size_t last = t.size();
+                while (last > 1 && (isKV(t[last - 1]) || t[last - 1] == "params:")) last--;
+                Primitive p;
+                p.kind = t[0][0];
+                p.path = e.prefix + t[0];
+                p.where = k.where;
+                auto pairs = [&](Scope& into, bool evaluate) {
+                    for (size_t i = last; i < t.size(); i++) {
+                        auto eq = t[i].find('=');
+                        if (eq == std::string::npos) continue;
+                        double v = value(t[i].substr(eq + 1), &e.sc);
+                        if (evaluate) p.params[t[i].substr(0, eq)] = v;
+                        else into.set(t[i].substr(0, eq), v);
+                    }
+                };
+                auto nodes = [&](size_t n) {
+                    if (last < 1 + n) throw Error("expected " + std::to_string(n) + " nodes");
+                    for (size_t i = 1; i <= n; i++) p.nodes.push_back(net(e, t[i]));
+                };
+                // A word that is a number or an expression of known parameters.
+                auto number = [&](const std::string& w, double& v) {
+                    try { v = value(w, &e.sc); return true; }
+                    catch (const Error&) { return false; }
+                };
+                if (p.kind == 'x') {
+                    if (last < 2) throw Error("expected Xname nodes... subcircuit");
+                    const std::string& sub = t[last - 1];
+                    const Block* b = e.blk->findSubckt(sub);
+                    if (!b) {
+                        for (size_t i = 1; i + 1 < last; i++) p.nodes.push_back(net(e, t[i]));
+                        p.model = sub;
+                        pairs(e.sc, true);
+                        if (e.mult != 1) p.params["m"] = e.mult * (p.params.count("m") ? p.params["m"] : 1.0);
+                        out.prims.push_back(std::move(p));
+                        continue;
+                    }
+                    if (last - 2 != b->ports.size())
+                        throw Error("'" + sub + "' has " + std::to_string(b->ports.size()) + " ports, " +
+                                    std::to_string(last - 2) + " given");
+                    if (++depth > 64) throw Error("subcircuits nested too deep (is '" + sub + "' inside itself?)");
+                    Env child;
+                    child.blk = b;
+                    child.prefix = p.path + ".";
+                    child.sc.parent = &e.sc;
+                    child.mult = e.mult;
+                    for (size_t i = 0; i < b->ports.size(); i++) child.ports[b->ports[i]] = net(e, t[1 + i]);
+                    bool ownM = false;
+                    for (auto& [pn, pe] : b->defaults) { child.sc.set(pn, pe); ownM |= pn == "m"; }
+                    pairs(child.sc, false);
+                    if (double m; !ownM && child.sc.expr.count("m") && child.sc.lookup("m", m)) child.mult *= m;
+                    declare(child);
+                    walk(child);
+                    depth--;
+                    continue;
+                }
+                size_t at = 1;   // the next positional word
+                double v;
+                switch (p.kind) {
+                case 'r': case 'c': case 'l':
+                    nodes(2); at = 3;
+                    if (at < last) {
+                        if (number(t[at], v)) p.params["value"] = v;
+                        else p.model = t[at];
+                        at++;
+                        // "r1 a b 1k rmodel" and "r1 a b rmodel 1k"
+                        if (at < last) {
+                            if (number(t[at], v)) p.params["value"] = v;
+                            else if (p.model.empty()) p.model = t[at];
+                        }
+                    }
+                    break;
+                case 'd':
+                    nodes(2);
+                    if (last > 3) p.model = t[3];
+                    if (last > 4 && number(t[4], v)) p.params["area"] = v;
+                    break;
+                case 'q': {
+                    double unused;
+                    bool four = last > 5 && !number(t[5], unused);
+                    nodes(four ? 4 : 3);
+                    at = four ? 5 : 4;
+                    if (at >= last) throw Error("expected a model name");
+                    p.model = t[at];
+                    if (at + 1 < last && number(t[at + 1], v)) p.params["area"] = v;
+                    break;
+                }
+                case 'm':
+                    nodes(4);
+                    if (last < 6) throw Error("expected Mname d g s b model");
+                    p.model = t[5];
+                    break;
+                case 'v': case 'i':
+                    nodes(2);
+                    if (last > 3 && t[3] == "dc" && last > 4) { if (number(t[4], v)) p.params["dc"] = v; }
+                    else if (last > 3 && number(t[3], v)) p.params["dc"] = v;
+                    break;
+                case 'e': case 'g':
+                    nodes(4);
+                    if (last > 5 && number(t[5], v)) p.params["value"] = v;
+                    break;
+                case 'f': case 'h':
+                    nodes(2);
+                    if (last < 5) throw Error("expected a controlling source and a gain");
+                    p.model = e.prefix + t[3];
+                    if (number(t[4], v)) p.params["value"] = v;
+                    break;
+                case 'k':
+                    if (last < 4) throw Error("expected Kname L1 L2 coupling");
+                    p.nodes = {e.prefix + t[1], e.prefix + t[2]};
+                    if (number(t[3], v)) p.params["value"] = v;
+                    break;
+                default:
+                    // An element kind this reader has no rule for: every
+                    // positional word is a node.
+                    for (size_t i = 1; i < last; i++) p.nodes.push_back(net(e, t[i]));
+                    break;
+                }
+                pairs(e.sc, true);
+                if (e.mult != 1) p.params["m"] = e.mult * (p.params.count("m") ? p.params["m"] : 1.0);
+                out.prims.push_back(std::move(p));
+            } catch (const Error& x) {
+                std::string w = x.what();
+                throw Error(w.rfind(k.where, 0) == 0 ? w : k.where + ": " + w);
+            }
+        }
+    };
+    Env root;
+    root.blk = &nl.top;
+    declare(root);
+    if (top.empty()) {
+        walk(root);
+        return out;
+    }
+    const Block* b = nl.top.findSubckt(lower(top));
+    if (!b) throw Error("no .subckt named '" + top + "'");
+    Env e;
+    e.blk = b;
+    e.sc.parent = &root.sc;
+    for (const std::string& port : b->ports) {
+        std::string name = port == "gnd" ? "0" : port;
+        e.ports[port] = name;
+        out.ports.push_back(name);
+    }
+    for (auto& [pn, pe] : b->defaults) e.sc.set(pn, pe);
+    declare(e);
+    walk(e);
+    return out;
+}
 
 }  // namespace spice

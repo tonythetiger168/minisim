@@ -25,7 +25,7 @@ struct Options {
     int itl1 = 100, itl4 = 10;
     bool euler = false;   // method=euler: backward Euler only
     bool bypass = true;
-    int parMin = 4096;    // evaluate a device type in parallel from this many instances
+    int parMin = 1024;    // evaluate a device type in parallel from this many instances
 };
 
 struct Ctx {
@@ -681,24 +681,35 @@ struct Mosfet final : Device {
         evgs = egs; evds = eds; evbs = ebs;
     }
 
+    // The linearized device as a 4 x 4 block and a right-hand side, by terminal.
+    [[gnu::always_inline]] inline void stamp(double m[4][4], double r[4]) const {
+        // The channel current runs from the drain to the source of the
+        // moment (they swap when vds < 0); the junctions and the gate
+        // capacitances sit on the terminals as drawn.
+        bool fwd = mode > 0;
+        double sg = fwd ? 1.0 : -1.0, sum = gm + gds + gmbs;
+        m[D][D] = (fwd ? gds : sum) + gbdT + geqgd;
+        m[D][S] = fwd ? -sum : -gds;
+        m[D][G] = sg * gm - geqgd;
+        m[D][B] = sg * gmbs - gbdT;
+        m[S][S] = (fwd ? sum : gds) + gbsT + geqgs;
+        m[S][D] = fwd ? -gds : -sum;
+        m[S][G] = -sg * gm - geqgs;
+        m[S][B] = -sg * gmbs - gbsT;
+        m[G][G] = geqgs + geqgd + geqgb;
+        m[G][D] = -geqgd; m[G][S] = -geqgs; m[G][B] = -geqgb;
+        m[B][B] = gbdT + gbsT + geqgb;
+        m[B][D] = -gbdT; m[B][S] = -gbsT; m[B][G] = -geqgb;
+        r[D] = -sg * ieqds + ieqbd + ieqgd;
+        r[S] = sg * ieqds + ieqbs + ieqgs;
+        r[G] = -(ieqgs + ieqgd + ieqgb);
+        r[B] = -(ieqbd + ieqbs) + ieqgb;
+    }
     void load(const Ctx&, double* val, double* rhs) override {
-        int dp = mode > 0 ? D : S, sp = mode > 0 ? S : D;
-        // Every matrix entry of the device, each written once.
-        double m[4][4] = {};
-        auto g2 = [&](int a, int b, double y) { m[a][a] += y; m[a][b] -= y; m[b][a] -= y; m[b][b] += y; };
-        auto vc = [&](int a, int b, int cc, int d, double y) { m[a][cc] += y; m[a][d] -= y; m[b][cc] -= y; m[b][d] += y; };
-        vc(dp, sp, G, sp, gm);
-        g2(dp, sp, gds);
-        vc(dp, sp, B, sp, gmbs);
-        g2(B, D, gbdT);
-        g2(B, S, gbsT);
-        g2(G, S, geqgs); g2(G, D, geqgd); g2(G, B, geqgb);
+        double m[4][4], r[4];
+        stamp(m, r);
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++) val[sl.s[i][j]] += m[i][j];
-        double r[4] = {};
-        r[dp] -= ieqds; r[sp] += ieqds;
-        r[B] -= ieqbd + ieqbs; r[D] += ieqbd; r[S] += ieqbs;
-        r[G] -= ieqgs + ieqgd + ieqgb; r[S] += ieqgs; r[D] += ieqgd; r[B] += ieqgb;
         for (int i = 0; i < 4; i++) rhs[node[i]] += r[i];
     }
     void loadAC(double w, cplx* val, cplx*) const override {

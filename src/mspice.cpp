@@ -38,6 +38,8 @@ struct Args {
     int threads = 0;
     bool quiet = false, stats = false;
     std::map<std::string, double> defines;
+    bool flatten = false;
+    std::string top;
 };
 
 void usage() {
@@ -48,6 +50,8 @@ void usage() {
                  "  -D name=value  set a .param (overrides the netlist)\n"
                  "  -q             print measurements and errors only\n"
                  "  -stats         print iteration and time step counts\n"
+                 "  -flatten       print the elements with flat names and stop (no simulation)\n"
+                 "  -top <name>    with -flatten: the subcircuit to flatten (default: the top level)\n"
                  "  -version       print the version\n";
 }
 
@@ -202,6 +206,8 @@ int main(int argc, char** argv) {
         else if (s == "-vcd") a.vcd = next();
         else if (s == "-q") a.quiet = true;
         else if (s == "-stats") a.stats = true;
+        else if (s == "-flatten") a.flatten = true;
+        else if (s == "-top") a.top = next();
         else if (s == "-threads") {
             std::string n = next();
             if (n == "all") a.threads = 0;
@@ -222,6 +228,22 @@ int main(int argc, char** argv) {
     try {
         auto t0 = std::chrono::steady_clock::now();
         Netlist nl = Reader().read(a.file);
+        if (a.flatten) {
+            Flat f = flatten(nl, a.top);
+            if (!a.top.empty()) {
+                std::printf(".ports");
+                for (auto& p : f.ports) std::printf(" %s", p.c_str());
+                std::printf("\n");
+            }
+            for (const Primitive& p : f.prims) {
+                std::printf("%s", p.path.c_str());
+                for (auto& n : p.nodes) std::printf(" %s", n.c_str());
+                if (!p.model.empty()) std::printf(" %s", p.model.c_str());
+                for (auto& [k, v] : p.params) std::printf(" %s=%s", k.c_str(), num(v).c_str());
+                std::printf("\n");
+            }
+            return 0;
+        }
         StepPlan plan = stepPlan(nl, a.defines);
         std::vector<RunOutput> runs(plan.sets.size());
         Pool pool(threads);

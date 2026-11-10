@@ -19,4 +19,11 @@ if(Python3_FOUND)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/spice/check.py $<TARGET_FILE:mspice> ${f}
                      $<$<BOOL:${NGSPICE}>:${NGSPICE}>)
   endforeach()
+  # spice::flatten(), the reader's view for LVS and characterization.
+  set(flat ${CMAKE_SOURCE_DIR}/tests/spice/flat)
+  add_test(NAME spice/flatten
+           COMMAND ${Python3_EXECUTABLE} ${flat}/check.py $<TARGET_FILE:mspice> ${flat}/flat.cir ${flat}/flat.expected -flatten)
+  add_test(NAME spice/flatten_top
+           COMMAND ${Python3_EXECUTABLE} ${flat}/check.py $<TARGET_FILE:mspice> ${flat}/flat.cir ${flat}/flat_top.expected
+                   -flatten -top TOP)
 endif()

@@ -18,6 +18,11 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, with identical output at any `-threads`. Every test netlist is
   checked against hand-worked values and against ngspice. See
   `docs/SPICE.md`.
+- `mspice`: MOSFET evaluation and matrix assembly run in parallel (a
+  2,000-inverter chain goes from 1.14 s to 0.70 s on four threads, with the
+  same output bit for bit); `parmin` now defaults to 1024. The reader gains
+  `spice::flatten()`, a flat list of primitive elements for LVS and cell
+  characterization, printed by `mspice -flatten [-top name]`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the

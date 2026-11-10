@@ -169,6 +169,88 @@ struct Circuit {
         else
             for (D& d : p) d.eval(c);
     }
+    // Parallel evaluation and assembly of the MOSFETs.
+    //
+    // The MOSFETs are cut into chunks of consecutive devices. A matrix entry
+    // or right-hand-side row that only one chunk touches is "private": that
+    // chunk's worker adds to it directly. The others ("shared": a supply
+    // node, a node on a chunk boundary) are added afterwards on one thread.
+    // Either way an entry receives its MOSFET terms in device order, after
+    // the element types loaded before and ahead of those loaded after, so
+    // the sums are those of the serial loop, bit for bit, whatever the chunk
+    // size or thread count.
+    struct MosPlan {
+        size_t chunk = 0, count = 0;
+        std::vector<uint32_t> priv;      // per device; bit 4i+j: matrix entry (i, j), bit 16+i: row i
+        std::vector<uint32_t> first;     // per device: its first shared term
+        std::vector<uint8_t> bit;        // per shared term: which entry of the device
+        std::vector<int> to;             // per shared term: the matrix entry or row it is added to
+        std::vector<double> term;        // per shared term: its value this iteration
+    } mosPlan_;
+
+    void planMosfets(size_t chunk) {
+        auto& p = pool<Mosfet>();
+        MosPlan& pl = mosPlan_;
+        pl.chunk = chunk; pl.count = p.size();
+        std::vector<int> slotOwner(pat.slots.size(), -1), rowOwner(n, -1);
+        auto claim = [](int& owner, int k) { owner = owner == -1 || owner == k ? k : -2; };
+        for (size_t i = 0; i < p.size(); i++) {
+            int k = (int)(i / chunk);
+            for (int a = 0; a < 4; a++) {
+                if (p[i].node[a] >= 0) claim(rowOwner[p[i].node[a]], k);
+                for (int b = 0; b < 4; b++)
+                    if (p[i].sl.s[a][b]) claim(slotOwner[p[i].sl.s[a][b]], k);
+            }
+        }
+        pl.priv.assign(p.size(), 0);
+        pl.first.clear(); pl.bit.clear(); pl.to.clear();
+        for (size_t i = 0; i < p.size(); i++) {
+            pl.first.push_back((uint32_t)pl.bit.size());
+            auto shared = [&](int bit, int to) { pl.bit.push_back((uint8_t)bit); pl.to.push_back(to); };
+            // Matrix entries first, then rows: the order of the serial loop.
+            for (int a = 0; a < 4; a++)
+                for (int b = 0; b < 4; b++)
+                    if (int s = p[i].sl.s[a][b]) {
+                        if (slotOwner[s] >= 0) pl.priv[i] |= 1u << (4 * a + b);
+                        else shared(4 * a + b, s);
+                    }
+            for (int a = 0; a < 4; a++)
+                if (int nd = p[i].node[a]; nd >= 0) {
+                    if (rowOwner[nd] >= 0) pl.priv[i] |= 1u << (16 + a);
+                    else shared(16 + a, nd);
+                }
+        }
+        pl.first.push_back((uint32_t)pl.bit.size());
+        pl.term.assign(pl.bit.size(), 0);
+    }
+
+    void loadMosfets(const Ctx& c) {
+        auto& p = pool<Mosfet>();
+        size_t chunk = std::clamp<size_t>(p.size() / (8 * pool_->threads()), 4, 256);
+        if (mosPlan_.count != p.size() || mosPlan_.chunk != chunk) planMosfets(chunk);
+        MosPlan& pl = mosPlan_;
+        double* v = val.data();
+        size_t chunks = (p.size() + chunk - 1) / chunk;
+        pool_->parallelFor(chunks, [&](size_t k, int) {
+            size_t end = std::min(p.size(), (k + 1) * chunk);
+            for (size_t i = k * chunk; i < end; i++) {
+                Mosfet& d = p[i];
+                d.eval(c);
+                double m[4][4], r[4];
+                d.stamp(m, r);
+                uint32_t bits = pl.priv[i];
+                for (int a = 0; a < 4; a++) {
+                    if (bits >> (16 + a) & 1) rhs[d.node[a]] += r[a];
+                    for (int b = 0; b < 4; b++)
+                        if (bits >> (4 * a + b) & 1) v[d.sl.s[a][b]] += m[a][b];
+                }
+                for (uint32_t t = pl.first[i]; t < pl.first[i + 1]; t++)
+                    pl.term[t] = pl.bit[t] < 16 ? m[pl.bit[t] / 4][pl.bit[t] % 4] : r[pl.bit[t] - 16];
+            }
+        });
+        for (size_t t = 0; t < pl.term.size(); t++) (pl.bit[t] < 16 ? v[pl.to[t]] : rhs[pl.to[t]]) += pl.term[t];
+    }
+
     template <class D> bool anyLimited() {
         for (D& d : pool<D>())
             if (d.limited) return true;
@@ -187,11 +269,17 @@ struct Circuit {
             for (auto& d : pool<ISource>()) d.rhsOnly(c, rhs);
         } else {
             std::fill(val.begin(), val.end(), 0.0);
+            bool parMos = pool_ && pool_->threads() > 1 && pool<Mosfet>().size() >= (size_t)opt.parMin;
             evalPool<Diode>(c);
-            evalPool<Mosfet>(c);
+            if (!parMos) evalPool<Mosfet>(c);
             evalPool<Bjt>(c);
             double* v = val.data();
-            eachPool([&](auto& p) { for (auto& d : p) d.load(c, v, rhs); });
+            eachPool([&](auto& p) {
+                if constexpr (std::is_same_v<std::decay_t<decltype(p)>, std::deque<Mosfet>>) {
+                    if (parMos) { loadMosfets(c); return; }
+                }
+                for (auto& d : p) d.load(c, v, rhs);
+            });
             if (gdiag != 0)
                 for (int i = 0; i < numNodes; i++) val[diag[i]] += gdiag;
         }
