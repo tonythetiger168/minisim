@@ -39,6 +39,13 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- X-propagation: `msim -xprop` (`-xprop=tmerge`, `-xprop=xmerge`,
+  `-xprop-report <file>`). In `always` blocks an unknown `if` condition,
+  `case` selector or clock / reset edge no longer picks one branch: every
+  branch that may be taken runs and the assigned variables get the merge of
+  the results, for blocking and nonblocking assignments. Same results in
+  the interpreter, with `-compile` and for every `-threads` count. See
+  `docs/XPROP.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
