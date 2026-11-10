@@ -48,7 +48,7 @@ write_sdc %s/c.sdc
 check("loose clock", rc == 0 and "slack (MET)" in out and "Startpoint:" in out and "output external delay" in out, out)
 check("no violators", "no violated constraints" in out, out)
 check("qor", re.search(r"Sequential Cell Count:\s+8\b", out) is not None, out)
-check("flop cell", re.search(r"DFFR\s+7\.0000\s+8\b", out) is not None, out)
+check("flop cell", re.search(r"DFFR_X1\s+[\d.]+\s+8\b", out) is not None, out)
 sdc = open(os.path.join(work, "c.sdc")).read()
 check("write_sdc", "create_clock -name clk -period 5" in sdc and "set_output_delay 0.5 -clock clk [get_ports {q[7]}]" in sdc, sdc)
 
@@ -73,7 +73,7 @@ check("parameters", rc == 0 and "flops 16" in out, out)
 rpt = os.path.join(work, "area.rpt")
 rc, out = run(head + """
 elaborate counter
-set_dont_use {XOR2 XNOR2 MUX2}
+set_dont_use {XOR2* XNOR2* MUX2*}
 compile
 report_area > %s
 redirect -append %s {report_reference}

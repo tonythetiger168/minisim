@@ -121,7 +121,7 @@ Spec references are IEEE 1800-2023 clauses.
   `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
   mapped onto any Liberty library by cut matching for area or delay,
   high-fanout nets are buffered, and the result is timed with the library's
-  NLDM tables. A generic cell library is built in. Mapping runs on every
+  NLDM tables. The default library is mini45. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer

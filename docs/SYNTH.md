@@ -13,7 +13,7 @@ msynth rtl/*.sv -top core -period 2 -o core_net.v    # one step
 ## A script
 
 ```tcl
-set target_library my_cells.lib            ;# Liberty (.lib). None: the built-in generic library
+set target_library my_cells.lib            ;# Liberty (.lib). None: mini45 (lib/mini45)
 analyze -format sverilog {rtl/alu.sv rtl/core.sv}
 elaborate core -parameters "XLEN=32"
 
@@ -87,14 +87,15 @@ their Liberty functions, so the netlist can be simulated:
 msim core_net.v cells.v tb.sv -top tb
 ```
 
-## The generic library
+## The default library
 
-With no target library, msynth maps to a built-in one
-(`lib/msynth_generic.lib`): INV, BUF, AND/OR/NAND/NOR with 2 to 4 inputs,
-XOR2, XNOR2, MUX2, AOI21/22, OAI21/22, TIE0/1, and the flops DFF, DFFR
-(asynchronous reset, active low) and DFFS (asynchronous set). Its timing
-tables are linear and its area unit is one inverter; use it to compare
-designs, not to predict silicon.
+With no target library, msynth maps to mini45, the tool line's cell library
+(`lib/mini45/mini45_tt.lib`, see `docs/MINI45.md`), so that a netlist goes
+on to timing, power, place and route and extraction with the same cells.
+msynth finds it next to an installed `msynth`
+(`share/minisim/lib/mini45`), in the source tree of a build-tree `msynth`,
+or in the directory named by `$MINISIM_MINI45`. For simulation use
+`lib/mini45/mini45.v`, or `write_lib_models`.
 
 ## Limits
 
@@ -115,5 +116,5 @@ designs, not to predict silicon.
 
 `tests/synth`: each design is synthesized and its testbench is simulated
 with `msim` on the RTL and on the netlist with random stimulus; both runs
-must print the same lines. This is done with the generic library and with a
+must print the same lines. This is done with the default library and with a
 library of only an inverter, a NAND and one flop.

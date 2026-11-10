@@ -7,7 +7,7 @@
 //
 // A script reads like a Design Compiler script:
 //
-//   set target_library my.lib            ;# Liberty; none: the built-in generic library
+//   set target_library my.lib            ;# Liberty; none: mini45 (lib/mini45)
 //   analyze -format sverilog {a.sv b.sv}
 //   elaborate top
 //   create_clock -period 2.0 [get_ports clk]
@@ -38,7 +38,6 @@
 #include "synth/map.hpp"
 #include "synth/sta.hpp"
 #include "tcl.hpp"
-#include "msynth_generic_lib.hpp"
 #include "version.hpp"
 
 using namespace synth;
@@ -130,12 +129,31 @@ struct Shell {
     }
 
     // ---------------------------------------------------------- library
+    // mini45 (typical corner), the default target: $MINISIM_MINI45, else next
+    // to an installed msynth, else in the source tree this msynth was built from.
+    static std::string defaultLib() {
+        namespace fs = std::filesystem;
+        const char* file = "mini45_tt.lib";
+        std::error_code ec;
+        if (const char* e = std::getenv("MINISIM_MINI45")) return (fs::path(e) / file).string();
+        auto exe = fs::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            auto inst = exe.parent_path().parent_path() / "share" / "minisim" / "lib" / "mini45" / file;
+            if (fs::exists(inst, ec)) return inst.string();
+        }
+        auto src = fs::path(MSYNTH_ROOT_DIR) / "lib" / "mini45" / file;
+        if (fs::exists(src, ec)) return src.string();
+        throw tcl::Error("the default library mini45_tt.lib was not found; set target_library, or MINISIM_MINI45 to the directory that holds it");
+    }
     void loadLibs(const std::vector<std::string>& paths) {
         lib.libs.clear();
         for (auto& p : paths) {
             if (p == "<generic>") {
-                lib.libs.push_back(std::make_shared<liberty::Library>(
-                    liberty::Library::load(liberty::parse(kGenericLib, "msynth_generic.lib"), "msynth_generic.lib")));
+                try {
+                    lib.libs.push_back(std::make_shared<liberty::Library>(liberty::load(defaultLib())));
+                } catch (liberty::Error& e) {
+                    throw tcl::Error(e.what());
+                }
                 continue;
             }
             if (p.size() > 3 && p.compare(p.size() - 3, 3, ".db") == 0)
@@ -160,7 +178,7 @@ struct Shell {
         if (want.empty()) want.push_back("<generic>");
         if (want != libFiles || lib.libs.empty()) {
             loadLibs(want);
-            if (want[0] == "<generic>") out("Information: no target library set; using the built-in generic library (msynth_generic).\n");
+            if (want[0] == "<generic>") out("Information: no target library set; using the mini45 library (mini45_tt).\n");
         }
     }
 
@@ -514,7 +532,7 @@ struct Shell {
                             body += std::string("    ") + (body.empty() ? "" : "else ") + "if (" + (neg ? "!" : "") + v + ") IQ__ <= 1'b" + (k == 0 ? "0" : "1") + ";\n";
                         }
                         m << ")\n" << body << "    " << (body.empty() ? "" : "else ") << "IQ__ <= "
-                          << verilogExpr(liberty::parseFunction(ff.nextState), {}) << ";\n";
+                          << verilogExpr(liberty::parseFunction(ff.nextState), ren) << ";\n";
                     }
                     for (auto* p : outs) {
                         if (!p->hasFunction() || !p->threeState.empty()) throw liberty::Error("no function");
