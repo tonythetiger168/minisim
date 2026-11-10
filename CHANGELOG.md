@@ -8,6 +8,40 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `memu`, emulation and FPGA prototyping: puts a gate-level netlist
+  (structural Verilog over a Liberty library) on a board of FPGAs. Clock
+  conversion onto one free-running clock (strobes for clean clocks, edge
+  detection for gated, divided and data-read clocks, any number of unrelated
+  clocks), memory mapping to block RAM and LUT RAM, multilevel partitioning
+  under each FPGA's capacity on a board file, routing through FPGAs and
+  time-division multiplexing where wires are short, probes with a trigger
+  and `memu -trace` to a VCD, and a generated testbench that runs the
+  netlist against the emulation. Transactors (`emu/sv`): an AXI4-Lite slave
+  that carries the design's accesses to `msim -mvp` models and an AXI4-Lite
+  master driven by a testbench class through a virtual interface, both
+  stopping the design's clock while the host answers. Multi-threaded with
+  thread-independent results. See `docs/EMULATION.md`.
+- `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
+  failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
+  `strong()`, `always s_eventually`) is proven or falsified with a loop
+  counterexample.
+- `mformal`: formal property checking on the msim front end. Proves or
+  falsifies concurrent and immediate `assert`, takes `assume` as input
+  constraints, reaches `cover` or proves it unreachable. Bounded model
+  checking and k-induction (simple path, proven assertions as lemmas) on
+  CaDiCaL; a VCD of the whole design for every counterexample and cover
+  trace, `-tb` for a testbench that replays it in msim, `-json`; one job per
+  property on every core (`-threads N`), same result for any thread count.
+  See `docs/FORMAL.md`.
+- `mplan`: verification planning and tracking. A plan file maps features to
+  tests, code coverage, covergroups and assertions; `mplan report` scores it
+  against mregress results and the coverage database, keeps a history of
+  snapshots (trend chart, regressions per feature), sorts failures into
+  buckets (new / recurring / flaky / fixed, features and owners blocked,
+  rules for known and waived failures) and writes `plan.json` and
+  `plan.html`. Also `mplan check`, `triage`, `trend`, `init`, the gates
+  `-gate` / `-min-score` / `-fail-on-new`, and `mregress -plan`. See
+  `docs/MPLAN.md`.
 - `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
   of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
   bus, logic in front of a synchronizer, reconvergence, a signal synchronized
@@ -18,16 +52,30 @@ Spec references are IEEE 1800-2023 clauses.
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
+- Shared headers for the tools: `src/parallel.hpp` (default thread count,
+  the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
+  `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
+  (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
+- `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
+  netlist, RTL against RTL): both designs become one and-inverter graph,
+  flops and latches are matched by name (or by the net on their output, also
+  when stored inverted) and cut, and every output, next-state function and
+  clock/reset is proved equal by structural hashing, random simulation and
+  SAT on all cores, with a counterexample for each failing point. X in the
+  reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
+  `-report`. See `docs/EQUIV.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
   assignment that gave a signal its value at a time and its causes back
   through time, and `-html` for a one-file viewer (hierarchy, clickable
   source, drivers and loads, schematic, waves with values annotated in the
-  source). See `docs/DEBUG.md`.
+  source). `-vcd` reads VCD and FST; the page traces the active driver at the
+  cursor itself. See `docs/DEBUG.md`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
-  coupling capacitance to same-layer neighbours and to crossings, from an
+  coupling capacitance to same-layer neighbours (who also take over part of
+  the ground fringe) and to crossings one and two layers away, from an
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
@@ -66,12 +114,37 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- `-xprop`: an assignment to an array element chosen at run time
+  (`if (we) mem[addr] <= d;`) is merged with the element's present value
+  instead of blocking the merge or giving `x`.
+- X-propagation: `msim -xprop` (`-xprop=tmerge`, `-xprop=xmerge`,
+  `-xprop-report <file>`). In `always` blocks an unknown `if` condition,
+  `case` selector or clock / reset edge no longer picks one branch: every
+  branch that may be taken runs and the assigned variables get the merge of
+  the results, for blocking and nonblocking assignments. Same results in
+  the interpreter, with `-compile` and for every `-threads` count. See
+  `docs/XPROP.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
+  through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
+  gates) or a cell map, checked for a controllable clock and asynchronous
+  set/reset, and stitched into balanced mux-D chains: scan cell swap or a
+  library mux before D, one clock domain per chain or `-mix_clocks` with
+  lockup latches, clock-gate test enables tied to `scan_en`. Writes the
+  netlist, a JSON chain description for ATPG (`-scandef`) and a chain flush
+  testbench (`-tb`). Multithreaded, same output for any `-threads N`.
+- `mdft -mbist`: memory BIST generation for a synchronous single-port RAM:
+  an at-speed March controller and a collar, eight built-in algorithms
+  (MATS+, March X, Y, C-, A, B, LR, SS) or `-march`, data backgrounds, read
+  latency 0 to 16, first-fail address and data. A built-in memory fault
+  simulator reports stuck-at, transition, coupling and address-decoder
+  coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
+  expected results come from that simulator. See `docs/DFT.md`.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
@@ -122,8 +195,35 @@ Spec references are IEEE 1800-2023 clauses.
 - A run-time error (null object access, a crash) names the statement that
   was running; `MSIM_CALLTRACE=1` prints every method and automatic
   subroutine call.
+- `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
+  the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
+  `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed
+  model (clocks, generated clocks, I/O delays, clock groups, exceptions,
+  uncertainty, latency, case analysis) and keeps every command with its file
+  and line. Object queries (`get_ports`, `get_pins`, `get_cells`, `get_nets`,
+  `get_clocks`, `all_inputs`, `all_registers`, `-hierarchical`, `-regexp`,
+  `-filter`, `-of_objects`) resolve through `sdc::Design`, which a tool
+  implements for its own netlist; a host can add its own commands.
+- `src/tcl.hpp`: the one Tcl interpreter of the tool line (`tcl::Interp`),
+  split out of the SDC reader. A tool adds its own commands (`addCommand`),
+  runs scripts (`load`, `parse`) or a prompt (`shell`), and gets every error
+  as a diagnostic with file and line instead of a stop. `sdc::Reader` is now
+  an `Interp` with the SDC commands added.
+- `msdc`: timing constraint checks. Reads the design (same front end as
+  `msim`) and its SDC file and reports what is wrong or missing: 32 rules
+  from syntax (SDC001) through clocks, I/O delays and exceptions to paths
+  between clocks with no declared relationship (SDC040). Multithreaded
+  (`-threads N`, same report for any N), `-json`, `-Werror`, `-stats`. See
+  `docs/CONSTRAINTS.md`.
+- SDC reader: object lookups use sorted name indexes and `-filter` is parsed
+  once, so large designs with thousands of queries read in seconds.
 
 ### Fixed
+- `mlint`, `mdft`: a net connected to thousands of instances no longer makes
+  the clock-domain union-find quadratic (path compression).
+- A concurrent assertion read the current value, not the sampled one, of a
+  bit select or indexed part select with a variable index (`r[k]`,
+  `r[k -: 2]`, 16.5.1).
 - A cast of a narrow unsigned operand inside a signed expression,
   `int'(u3) % 5`, sign-extended the operand: 6 became -2. The operand is now
   extended with its own signedness, as an assignment to the cast type

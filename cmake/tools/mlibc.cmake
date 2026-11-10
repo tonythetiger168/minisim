@@ -1,5 +1,6 @@
 # mlibc: cell library checks and reports on the shared Liberty and LEF
 # readers (docs/LIBCHECK.md). Plain C++20 and threads: no slang.
+include_guard(GLOBAL)
 find_package(Threads REQUIRED)
 add_executable(mlibc src/mlibc.cpp)
 target_include_directories(mlibc PRIVATE src)
