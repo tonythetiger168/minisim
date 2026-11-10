@@ -157,6 +157,11 @@ if(MINISIM_WITH_SLANG)
   find_package(Threads REQUIRED)
   target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
 
+  # RTL power optimization: clock gating, memory gating, operand isolation: mpopt design.sv -o out
+  add_executable(mpopt src/mpopt.cpp)
+  target_include_directories(mpopt PRIVATE src)
+  target_link_libraries(mpopt PRIVATE slang::slang Threads::Threads)
+
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
   target_link_libraries(test_lower PRIVATE slang::slang)
@@ -317,6 +322,16 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
                    -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
+  # RTL power optimization: found, rewritten, co-simulated against the original (uses msim).
+  add_test(NAME mpopt
+           COMMAND ${CMAKE_COMMAND} -DMPOPT=$<TARGET_FILE:mpopt> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mpopt_test -P ${CMAKE_SOURCE_DIR}/tests/mpopt.cmake)
+  if(Python3_FOUND)
+    # Random RTL through mpopt -verify: every rewrite must simulate like its original.
+    add_test(NAME mpopt_fuzz
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/popt/fuzz_popt.py $<TARGET_FILE:mpopt>
+                     ${CMAKE_CURRENT_BINARY_DIR}/mpopt_fuzz 40)
+  endif()
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
@@ -347,7 +362,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mdebug mpopt slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

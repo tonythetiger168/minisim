@@ -406,6 +406,33 @@ msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 
+### RTL power optimization: `mpopt`
+
+`mpopt` finds clock gating, memory gating and operand isolation in RTL,
+rewrites the source in place (comments and formatting kept), and checks the
+result against the original:
+
+```
+mpopt rtl/*.sv -top soc_top                    # what can be gated, and what cannot (-v: why)
+mpopt rtl/*.sv -top soc_top -o out             # rewritten RTL, clock-gate cell and files.f in out/
+mpopt rtl/*.sv -top soc_top -o out -verify     # co-simulate original and rewritten RTL in msim
+```
+
+```
+rtl/pipe.sv:25: [CG] pipe: a_q, b_q (32 bits) gated by in_valid
+rtl/pipe.sv:36: [SCG] pipe: prod_d (32 bits) gated by mpopt_st_L36; stable unless in_valid held in the cycle before
+rtl/pipe.sv:60: [MG] pipe: mem (256 bits) gated by we
+rtl/iso.sv:30: [OI] iso: operator * (24 bits) isolated by use_mul
+```
+
+CG gates a register by the enable written in the RTL. SCG (sequential clock
+gating) finds enables that are not written: a pipeline stage does not load
+when the stage before it did not. MG does both for memories. OI forces the
+operands of a multiplier or divider to zero when its result is not used. On
+Ibex it gates 90% of the register bits in 0.07 s. Runs on every logical CPU
+(`-threads N`), with the same output for any thread count. See
+[docs/POWEROPT.md](docs/POWEROPT.md).
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per

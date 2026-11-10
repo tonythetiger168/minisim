@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpopt`: RTL power optimization. Finds clock gating from enables (CG),
+  sequential clock gating from registers whose sources did not load in the
+  cycle before (SCG), memory gating (MG) and operand isolation of multipliers
+  and dividers (OI); rewrites the RTL source in place (`-o dir`, with the
+  `mpopt_icg` clock-gate model or a library cell via `-icg_cell`), and
+  `-verify` co-simulates original and rewritten RTL in msim on random
+  stimulus, comparing every output and register every cycle. Multithreaded
+  (`-threads N`), same result for any thread count. See `docs/POWEROPT.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
