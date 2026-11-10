@@ -1,5 +1,6 @@
-# mlint self-test: the rules fire on tests/lint/lint.sv and tests/lint/cdc.sv,
-# and nothing fires on tests/lint/clean.sv.
+# mlint self-test: the first rules fire on tests/lint/lint.sv and
+# tests/lint/cdc.sv, and nothing fires on tests/lint/clean.sv. The rest of the
+# rules, the configuration and the waivers are in tests/lint/check_rules.py.
 #   cmake -DMLINT=<mlint> -DSRC=<source dir> -P mlint.cmake
 function(run file args)
   execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/${file} ${args}
@@ -10,9 +11,9 @@ function(run file args)
   endif()
 endfunction()
 
-run(lint.sv "-top;t")
+run(lint.sv "-top;t;-only;L001,L002,L003,L004")
 foreach(want
-    "[L001] 't.y' is not assigned on every path"
+    "[L001] 'y' is not assigned on every path"
     "[L002] blocking assignment to 't.r' in an always_ff"
     "[L003] non-blocking assignment to 't.z' in an always_comb"
     "[L004] 't.z' is assigned by 2 processes")
@@ -26,13 +27,13 @@ if(NOT out MATCHES "4 findings")
 endif()
 
 # -disable turns one rule off.
-run(lint.sv "-top;t;-disable;L001;-disable;L004")
+run(lint.sv "-top;t;-only;L001,L002,L003,L004;-disable;L001;-disable;L004")
 if(NOT out MATCHES "2 findings" OR out MATCHES "L001|L004")
   message(FATAL_ERROR "-disable did not take:\n${out}")
 endif()
 
 # CDC: one flop is not a synchronizer, and a wide bus needs more than flops.
-run(cdc.sv "-top;t")
+run(cdc.sv "-top;t;-only;cdc")
 if(NOT out MATCHES "\\[CDC001\\] 't.rq'.*through one flop only")
   message(FATAL_ERROR "cdc.sv: the single-flop crossing was not reported:\n${out}")
 endif()
@@ -44,8 +45,9 @@ if(out MATCHES "t.s1|t.s2|t.b1")
   message(FATAL_ERROR "cdc.sv: a clean crossing was reported:\n${out}")
 endif()
 
-# Nothing to report, and -Werror still exits 0.
-run(clean.sv "-top;clean;-Werror")
+# Nothing to report with every default rule on, and -Werror still exits 0.
+# (STY001: the file holds its submodule too.)
+run(clean.sv "-top;clean;-Werror;-disable;STY001")
 if(NOT out MATCHES "0 findings")
   message(FATAL_ERROR "clean.sv is not clean:\n${out}")
 endif()

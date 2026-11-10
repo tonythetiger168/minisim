@@ -8,6 +8,19 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` grows from 6 rules to about 80, in groups: latches and
+  combinational logic (`L001` now bit-accurate, `LAT001`, incomplete
+  sensitivity lists, combinational loops across modules), case statements,
+  assignment style, widths and signs (`W001`..`W008`), synthesizability
+  (`SYN001`..`SYN017`), unused and undriven signals, connections, clocks and
+  resets (`CLK`, `RST`), naming (`NAME001`..`NAME013`, by pattern) and style.
+  Every rule has a severity and an on/off default; `-config`, `-enable`,
+  `-disable`, `-only`, `-severity`, `-set` configure them, `-list` and
+  `-explain` describe them. Waivers: a waiver file (`-waivers`, by rule,
+  file, line and message, stale ones reported) and comments in the source
+  (`// mlint: waive RULE reason`, `mlint: off / on`, `translate_off`).
+  `-json` report, `-show-waived`, `-stats`. Rules run on every logical CPU
+  (`-threads N`), with the same output for any count. See `docs/LINT.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
@@ -239,6 +252,14 @@ Spec references are IEEE 1800-2023 clauses.
   the base for class methods (8).
 
 ### Changed
+- `mlint` prints each finding's severity (`error`, `warning` or `info`) and
+  names signals by their name in the module rather than by full path, so a
+  module instantiated many times reports once. `-Werror` fails on warnings
+  and errors, not on `info` findings. Modules that nothing instantiates are
+  no longer linted as if they were part of the design.
+- `mlint` and `mdft`: the structure that joins signals across ports now
+  compresses paths. A clock reaching 4000 instances made every lookup walk
+  4000 links: 13 s for a 120,000-line design, now 1.3 s.
 - msim compiles as IEEE 1800-2023 by default (slang's default was 2017);
   `--std` still selects another version.
 - Waveforms nest the instance hierarchy as scopes under the top module

@@ -146,15 +146,26 @@ inline std::string path(const Symbol& s) {
 // clock passed down through three modules is still one domain.
 struct Join {
     std::unordered_map<const Symbol*, const Symbol*> up;
+    // With path compression: a clock that reaches thousands of instances is
+    // one long chain otherwise, and every lookup walked all of it.
     const Symbol* find(const Symbol* s) {
-        auto it = up.find(s);
-        if (it == up.end()) return up[s] = s;
-        while (it->second != s) {
-            s = it->second;
-            it = up.find(s);
-            if (it == up.end()) return up[s] = s;
+        const Symbol* root = s;
+        for (;;) {
+            auto it = up.find(root);
+            if (it == up.end()) {
+                up[root] = root;
+                break;
+            }
+            if (it->second == root) break;
+            root = it->second;
         }
-        return s;
+        while (s != root) {
+            auto it = up.find(s);
+            const Symbol* next = it->second;
+            it->second = root;
+            s = next;
+        }
+        return root;
     }
     void join(const Symbol* a, const Symbol* b) {
         a = find(a);
@@ -385,6 +396,9 @@ struct Gather : ASTVisitor<Gather> {
     Gather(Report& r, Join& j, std::vector<Block>& b) : rep(r), join(j), blocks(b) {}
 
     void handle(const InstanceSymbol& inst) {
+        // A module nobody instantiates is elaborated only so that it can be
+        // checked; it is not part of the design.
+        if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return;
         for (const PortConnection* conn : inst.getPortConnections()) {
             if (!conn || conn->port.kind != SymbolKind::Port) continue;
             const Expression* ext = conn->getExpression();

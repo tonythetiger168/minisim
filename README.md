@@ -341,24 +341,41 @@ design, so it needs no separate build setup:
 
 ```sh
 mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
-mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any finding (for CI)
+mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any warning (for CI)
 mlint rtl/*.sv -disable L004 -disable CDC002
 mlint -list                                 # the rules
 ```
 
-| Rule | What it finds |
-|---|---|
-| `L001` | A value is assigned on some paths of an `always_comb` but not all, so it holds its old value: an unintended latch (an `if` with no `else`, a `case` with no `default`) |
-| `L002` | A blocking assignment to a non-local variable in an `always_ff` |
-| `L003` | A non-blocking assignment in an `always_comb` |
-| `L004` | One value is assigned by more than one process |
-| `CDC001` | A flop reads another clock domain with no synchronizer, or through one flop only |
-| `CDC002` | A multi-bit bus crosses domains through a two-flop synchronizer, which does not keep its bits together |
+About 80 rules in groups, each with a severity and an on/off default:
+
+| Group | Rules | Examples |
+|---|---|---|
+| `latch`, `comb`, `case` | `L001`, `LAT001`, `COMB001`, `COMB002`, `CASE001`..`CASE004` | unintended latches (bit-accurate), incomplete sensitivity lists, combinational loops across modules, case without default, casex, duplicate items |
+| `assign`, `driver` | `L002`..`L004`, `SEQ001`..`SEQ003`, `EXP001` | blocking in a flop, non-blocking in logic, both on one variable, multiple drivers |
+| `width` | `W001`..`W008` | truncating assignments, port width mismatches, comparisons of unequal widths, signed against unsigned |
+| `synth` | `SYN001`..`SYN017` | initial blocks, delays, `$random`, force, fork, real and dynamic types, `===`, defparam, internal tri-states, hierarchical references |
+| `unused`, `connect` | `UNU001`..`UNU005`, `CON001`..`CON004` | never read, never driven, floating inputs, positional connections, implicit nets |
+| `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
+| `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
+| `cdc` | `CDC001`, `CDC002` | crossings with no synchronizer, multi-bit buses through flops |
+
+```sh
+mlint rtl/*.sv -config mlint.cfg -waivers waivers.cfg -json lint.json
+mlint rtl/*.sv -enable naming -severity W001=error -set name.module='^[a-z][a-z0-9_]*$'
+mlint -explain RST003
+```
+
+Rules are configured in a file or on the command line (enable, disable,
+severity, name patterns) and waived in a waiver file or in the source
+(`// mlint: waive W001 reason`); `// synthesis translate_off` regions are
+honoured. Stale waivers are reported. mlint runs on every logical CPU
+(`-threads N`), with the same output for any count. The full rule table,
+the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 
 Clock domains come from the clock of every edge-triggered block, with signals
 joined across port connections, so one clock passed down through several
 modules stays one domain. Findings print as
-`file:line:col: warning: [RULE] text`, sorted by file and line.
+`file:line:col: severity: [RULE] text`, sorted by file and line.
 
 ### Low-power simulation: UPF (IEEE 1801)
 
