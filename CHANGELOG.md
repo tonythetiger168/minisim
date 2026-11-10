@@ -114,6 +114,9 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- `-xprop` is faster: an `if` evaluates its condition once, and clocked
+  blocks with merged branches run in parallel again. Ibex with `-xprop`:
+  42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
 - `-xprop`: an assignment to an array element chosen at run time
   (`if (we) mem[addr] <= d;`) is merged with the element's present value
   instead of blocking the merge or giving `x`.
@@ -165,6 +168,21 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -lef tech.lef routed.def`: design rule checking of a routed DEF,
+  with the rules taken from the LEF technology when no `-deck` is given
+  (`-write-deck` shows them).
+- `mpv lvs`: extracts the transistor netlist of a layout (nets from `connect`
+  statements, names and ports from `label`, MOS devices with W and L from
+  `device mos`) and writes it as SPICE. `src/lvs.hpp` also holds the netlist
+  comparison (partition refinement, parallel merging, source/drain
+  exchange). `tests/pv/sky130.lvs` is the SKY130 deck.
+- `mpv drc`: design rule checking on GDSII layouts. A rule deck defines drawn
+  and derived layers (`&`, `|`, `-`, `^`, `grow`, `shrink`, `interact`,
+  `inside`, `outside`, `holes`, ...) and width, spacing, enclosure, overhang,
+  area and density checks; violations are written as markers. Multithreaded
+  by default (`-threads N`) with the same report for every thread count. A
+  35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
+  is the shared GDSII reader and writer. See `docs/MPV.md`.
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor

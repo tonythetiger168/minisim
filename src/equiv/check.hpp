@@ -203,9 +203,9 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
         Lit late = nx > ny ? x : y, early = nx > ny ? y : x;
         if (!g.isAnd(nodeOf(late)) || rep[nodeOf(late)] != kNoLit) continue;
         rep[nodeOf(late)] = early ^ (late & 1u);
-        Sat::L a = cnf.lit(x), b = cnf.lit(y);
-        cnf.sat.addClause(Sat::no(a), b);
-        cnf.sat.addClause(a, Sat::no(b));
+        int a = cnf.lit(x), b = cnf.lit(y);
+        cnf.sat.addClause({-a, b});
+        cnf.sat.addClause({a, -b});
     }
     for (uint32_t n : cone) {
         if (rep[n] != kNoLit) continue;  // settled by a lemma
@@ -219,19 +219,19 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
             if (!same(n, r, inv)) continue;
             ++tries;
             // Is n != r possible?
-            Sat::L a = cnf.lit(Lit(n << 1)), b = cnf.lit(Lit(r << 1) ^ (inv ? 1u : 0u));
-            uint32_t t = cnf.sat.newVar();
-            cnf.sat.addClause(Sat::mk(t, true), a, b);
-            cnf.sat.addClause(Sat::mk(t, true), Sat::no(a), Sat::no(b));
-            Sat::Result res = cnf.sat.solve({Sat::mk(t)}, effort);
-            if (res == Sat::Unsat) {
-                cnf.sat.addClause(Sat::mk(t, true));
-                cnf.sat.addClause(Sat::no(a), b);
-                cnf.sat.addClause(a, Sat::no(b));
+            int a = cnf.lit(Lit(n << 1)), b = cnf.lit(Lit(r << 1) ^ (inv ? 1u : 0u));
+            int t = cnf.sat.newVar();
+            cnf.sat.addClause({-t, a, b});
+            cnf.sat.addClause({-t, -a, -b});
+            sat::Result res = cnf.sat.solve({t}, int64_t(effort));
+            if (res == sat::Unsat) {
+                cnf.sat.addClause({-t});
+                cnf.sat.addClause({-a, b});
+                cnf.sat.addClause({a, -b});
                 rep[n] = Lit(r << 1) ^ (inv ? 1u : 0u);
                 ++merged;
                 done = true;
-            } else if (res == Sat::SatResult) {
+            } else if (res == sat::Sat) {
                 // A pattern that tells them apart, and 63 neighbours of it.
                 if (sig.size() < maxWords) {
                     sig.emplace_back(N, 0);
@@ -244,9 +244,9 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
                     }
                     simWord(w);
                 }
-                cnf.sat.addClause(Sat::mk(t, true));
+                cnf.sat.addClause({-t});
             } else {
-                cnf.sat.addClause(Sat::mk(t, true));
+                cnf.sat.addClause({-t});
             }
         }
         if (!done) bucket.push_back(n);
