@@ -36,7 +36,8 @@ Spec references are IEEE 1800-2023 clauses.
   source). See `docs/DEBUG.md`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
-  coupling capacitance to same-layer neighbours and to crossings, from an
+  coupling capacitance to same-layer neighbours (who also take over part of
+  the ground fringe) and to crossings one and two layers away, from an
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread

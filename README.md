@@ -516,13 +516,14 @@ mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o 
 ```
 
 ```
-mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5086 coupling capacitors
-mrcx: capacitance 2238 fF to ground, 288.8 fF between nets (sky130 stack, 25 C)
+mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5134 coupling capacitors
+mrcx: capacitance 2029 fF to ground, 409.5 fF between nets (sky130 stack, 25 C)
 ```
 
 It runs on every core (`-threads N`), writes the same file for any thread
 count, and reports open and shorted nets. On the OpenROAD `gcd` test design
-its total net capacitance is within 1% of OpenRCX's. See
+its total net capacitance is within 2% of OpenRCX's, and the ground and
+coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
 
 ### Virtual prototypes: `-mvp`
