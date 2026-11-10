@@ -1,0 +1,31 @@
+create_supply_port VDD
+create_supply_port VSS
+create_supply_port VRET
+create_supply_net VDD
+create_supply_net VSS
+create_supply_net VRET
+connect_supply_net VDD -ports VDD
+connect_supply_net VSS -ports VSS
+connect_supply_net VRET -ports VRET
+create_supply_set SS_RET -function {power VRET} -function {ground VSS}
+
+create_power_domain PD_A -elements {u_a}
+create_power_domain PD_B -elements {u_b}
+create_power_domain PD_C -elements {u_c}
+create_supply_net VA
+create_supply_net VB
+create_supply_net VC
+create_power_switch SW_A -output_supply_port {o VA} -input_supply_port {i VDD} -control_port {c en_a} -on_state {on i {c}}
+create_power_switch SW_B -output_supply_port {o VB} -input_supply_port {i VDD} -control_port {c en_b} -on_state {on i {c}}
+create_power_switch SW_C -output_supply_port {o VC} -input_supply_port {i VDD} -control_port {c en_c} -on_state {on i {c}}
+set_domain_supply_net PD_A -primary_power_net VA -primary_ground_net VSS
+set_domain_supply_net PD_B -primary_power_net VB -primary_ground_net VSS
+set_domain_supply_net PD_C -primary_power_net VC -primary_ground_net VSS
+
+set_retention RET_A -domain PD_A -elements {u_a/keep} \
+    -save_signal {ret high} -restore_signal {ret low}
+set_retention RET_B -domain PD_B -elements {u_b/keep} \
+    -save_signal {save high} -restore_signal {restore posedge} \
+    -save_event_condition {!gclk}
+set_retention RET_C -domain PD_C -elements {u_c/keep} -retention_supply SS_RET \
+    -save_signal {ret high} -restore_signal {ret low}

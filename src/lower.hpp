@@ -368,12 +368,22 @@ inline void noteHidden(const slang::ast::Symbol& s, int first, int count) {
         for (int i = 0; i < count; i++) hiddenSigs().push_back(first + i);
 }
 
+// scope: the instance the process is in, as a signal name prefix without
+// the final '.' ("" = the top). A port connection's process is in the
+// parent; port names the child's port it carries ("u_core.out"), with
+// portDir 0 input, 1 output, 2 inout (UPF boundaries, upf_rt.inc).
 // program: the index of the program instance (24) the process belongs to,
 // or -1. A program's initial procedures and continuous assigns run in the
 // reactive region set (24.3.1).
 // reactive: a process of a checker (17.7.3), which also runs in the
 // reactive region set but takes no part in ending the run.
-struct LoweredProc { Prog prog; bool loops; std::string kind; int program = -1; bool reactive = false; };
+struct LoweredProc {
+    Prog prog; bool loops; std::string kind;
+    std::string scope, port;
+    int portDir = -1;
+    int program = -1;
+    bool reactive = false;
+};
 
 // One module-level task or function. Arguments and the function result are
 // signals (the formal and slang's returnValVar), shared by every call.
@@ -1525,6 +1535,43 @@ struct Lowerer {
         // the first token (its leading comments and spaces are trivia, not text)
         return call.syntax->getFirstToken().rawText() == "super";
     }
+    // Package UPF (IEEE 1801-2024 11.2.4), added by msim -upf: the functions
+    // that change or read supplies run in the power-aware runtime
+    // (upf_rt.inc) as SF_UPF with lo = the UpfOp.
+    static int upfOp(const slang::ast::SubroutineSymbol& sym) {
+        const auto* sc = sym.getParentScope();
+        if (!sc || sc->asSymbol().kind != slang::ast::SymbolKind::Package || sc->asSymbol().name != "UPF") return -1;
+        std::string_view n = sym.name;
+        if (n == "supply_on") return UPF_SUPPLY_ON;
+        if (n == "supply_off") return UPF_SUPPLY_OFF;
+        if (n == "supply_partial_on") return UPF_SUPPLY_PARTIAL_ON;
+        if (n == "set_supply_state") return UPF_SET_SUPPLY_STATE;
+        if (n == "set_power_state") return UPF_SET_POWER_STATE;
+        if (n == "get_supply_value") return UPF_GET_SUPPLY_VALUE;
+        return -1;
+    }
+    E upfCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym, bool wantValue) {
+        int op = upfOp(sym);
+        if (op < 0) return nullptr;
+        auto args = call.arguments();
+        std::vector<E> k;
+        if (args.empty()) unsupported("UPF function without arguments");
+        k.push_back(exprStr(*args[0]));
+        if (op == UPF_SUPPLY_ON || op == UPF_SUPPLY_PARTIAL_ON)
+            k.push_back(args.size() > 1 ? realOf(*args[1]) : konst(mkreal(1.0)));
+        else if (op == UPF_SET_SUPPLY_STATE) {
+            if (args.size() < 2) unsupported("set_supply_state without a state");
+            k.push_back(resize(expr(*args[1]), 32, false, false));
+        } else if (op == UPF_SET_POWER_STATE) {
+            if (args.size() < 2) unsupported("set_power_state without a state");
+            k.push_back(exprStr(*args[1]));
+        }
+        E r = sysFnNode(SF_UPF, k, op);
+        if (wantValue) return r;
+        Instr i; i.k = IK::Assign; i.sig = fresh(op == UPF_GET_SUPPLY_VALUE ? 64 : 1); i.e = r;
+        prog.emit(i);
+        return nullptr;
+    }
     // A task or function of an interface called through a virtual
     // interface (25.9): the same subroutine of whichever instance v names.
     E vifCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym, bool wantValue) {
@@ -1571,6 +1618,7 @@ struct Lowerer {
         if (!sym || !subs) unsupported("subroutine call");
         if (sym->flags.has(MethodFlags::DPIImport)) return emitDpiCall(call, *sym, wantValue);
         if (sym->flags.has(MethodFlags::Randomize)) return randomizeCall(call);
+        if (E r = upfCall(call, *sym, wantValue); r || upfOp(*sym) >= 0) return r;
         if (!sym->getSyntax() && isClassMethod(*sym)) {   // built-in methods of every class (18.8, 18.9, 18.13.3)
             if (sym->name == "rand_mode" || sym->name == "constraint_mode") {
                 Instr i; i.k = IK::RandMode;
@@ -7984,7 +8032,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             lw.prog.emit(waitInstr(rs));
             Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
         }
-        out.procs.push_back({std::move(lw.prog), loops, "assign", program, checkerDepth > 0});
+        out.procs.push_back({std::move(lw.prog), loops, "assign", curScope, curPort, curPortDir,
+                             program, checkerDepth > 0});
     }
 
     // Module-level `logic x = v;` (IEEE 1800-2023 10.5): a static variable's
@@ -8871,10 +8920,19 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         return true;
     }
 
-    void connectInstance(const slang::ast::InstanceSymbol& inst) {
+    void connectInstance(const slang::ast::InstanceSymbol& inst, const std::string& self) {
         using namespace slang::ast;
         if (inst.isTopLevel()) return;
+        struct PortTag {
+            ProcCollector& pc;
+            ~PortTag() { pc.curPort.clear(); pc.curPortDir = -1; }
+        } tag{*this};
         for (const PortConnection* conn : inst.getPortConnections()) {
+            if (conn && conn->port.kind == SymbolKind::Port) {
+                const auto& ps0 = conn->port.as<PortSymbol>();
+                curPort = self + "." + std::string(ps0.name);
+                curPortDir = ps0.direction == ArgumentDirection::In ? 0 : ps0.direction == ArgumentDirection::Out ? 1 : 2;
+            }
             if (conn && conn->port.kind == SymbolKind::InterfacePort) continue;   // b.x names the instance's own signal (25.3)
             if (!conn || conn->port.kind != SymbolKind::Port)
                 Lowerer::unsupported("port kind");
@@ -8933,6 +8991,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
     }
 
+    // The instance being visited, named like signals (see the signal
+    // naming visitor): "" for the top, "u_core", "gen[1].u".
+    std::string curScope, curPort;
+    int curPortDir = -1;
+    static std::string inScope(const std::string& sc, const std::string& n) { return sc.empty() ? n : sc + "." + n; }
     // A checker instance (17.3): its body is lowered like an instance's,
     // with its processes in the reactive region set (17.7.3). Each output
     // formal is continuously assigned to its actual in the reactive region.
@@ -9014,11 +9077,15 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::InstanceSymbol& inst) {
         if (!enterInstance(inst)) return;
         noteInstance(inst);
-        connectInstance(inst);
+        std::string savedScope = curScope;
+        std::string self = inst.isTopLevel() ? curScope : inScope(curScope, std::string(inst.name));
+        connectInstance(inst, self);
+        curScope = self;
         int saved = program;
         if (inst.getDefinition().definitionKind == slang::ast::DefinitionKind::Program) program = out.programs++;
         visitDefault(inst);
         program = saved;
+        curScope = std::move(savedScope);
     }
     // What SDF annotation (32) looks up: each instance's cell, and the
     // formal signal of each of its ports.
@@ -9040,7 +9107,17 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
     }
     void handle(const slang::ast::GenerateBlockSymbol& g) {
-        if (!g.isUninstantiated) visitDefault(g);
+        if (g.isUninstantiated) return;
+        std::string saved = curScope;
+        const auto* parent = g.getParentScope() ? &g.getParentScope()->asSymbol() : nullptr;
+        if (parent && parent->kind == slang::ast::SymbolKind::GenerateBlockArray) {
+            std::string an = parent->name.empty() ? std::string("genblk") : std::string(parent->name);
+            curScope = inScope(curScope, an + "[" + (g.getArrayIndex() ? g.getArrayIndex()->toString() : std::string("?")) + "]");
+        } else {
+            curScope = inScope(curScope, g.getExternalName());
+        }
+        visitDefault(g);
+        curScope = std::move(saved);
     }
     void handle(const slang::ast::CovergroupType&) {}   // built when used (lower_cover.inc)
     void handle(const slang::ast::ClockingBlockSymbol& cb) {   // 14: runs on its clocking event
@@ -9088,7 +9165,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             lw.prog.emit(waitInstr(rs));
             Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
         }
-        out.procs.push_back({std::move(lw.prog), loops, "always_comb"});
+        out.procs.push_back({std::move(lw.prog), loops, "always_comb", curScope});
     }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
@@ -9128,6 +9205,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
         out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind)),
+                             curScope, {}, -1,
                              p.procedureKind == ProceduralBlockKind::Initial ? program : -1, checkerDepth > 0});
     }
 };

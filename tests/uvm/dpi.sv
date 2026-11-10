@@ -74,6 +74,16 @@ module top;
       void'(uvm_hdl_force("top.u.w", 8'hee)); #1 $display("force net %h", u.w);
       void'(uvm_hdl_release("top.u.w")); #1 $display("release net %h", u.w);
       void'(uvm_hdl_release_and_read("top.u.r", v)); $display("release %h", v[7:0]);
+      // part selects and a bit
+      void'(uvm_hdl_read("top.u.r[3:0]", v)); $display("part read %h", v[7:0]);
+      void'(uvm_hdl_deposit("top.u.r[7:4]", 4'h9)); #1 $display("part deposit %h", u.r);
+      void'(uvm_hdl_deposit("top.u.r[0]", 1'b1)); #1 $display("bit deposit %h", u.r);
+      void'(uvm_hdl_force("top.u.w[3:0]", 4'h0)); #1 $display("part force %h", u.w);
+      void'(uvm_hdl_release("top.u.w[3:0]")); #1 $display("part release %h", u.w);
+      // a force for a while
+      fork uvm_hdl_force_time("top.u.w", 8'h77, 20); join_none
+      #10 $display("force_time %h", u.w);
+      #15 $display("force_time over %h", u.w);
       // register model backdoor
       rm.ctrl.read(st, d, UVM_BACKDOOR);
       $display("reg read %s %h", st.name(), d[15:0]);
@@ -98,6 +108,13 @@ endmodule
 //> force net ee
 //> release net 23
 //> release 22
+//> part read 02
+//> part deposit 92
+//> bit deposit 93
+//> part force 90
+//> part release 94
+//> force_time 77
+//> force_time over 94
 //> reg read UVM_IS_OK 00c3
 //> reg write UVM_IS_OK beef
 //> UVM_ERROR :    0

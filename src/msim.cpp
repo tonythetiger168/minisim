@@ -65,6 +65,13 @@
 // Protected code is decrypted in memory only. Diagnostics located in it are
 // reported without their text, its signals are left out of the VCD, and
 // -compile falls back to the interpreter so no generated C++ holds it.
+//   -upf <file>      power-aware simulation with this IEEE 1801 (UPF) power
+//                    intent (upf.hpp, upf_rt.inc). Adds package UPF for the
+//                    testbench (supply_on, supply_off, ...).
+//   -power_top <inst> the instance the UPF file describes, as a path from
+//                    the simulation top (u_dut, or tb/u_dut); default: the
+//                    UPF's set_design_top, else the simulation top
+//   -upf_verbose     print supply, power state and simstate changes
 //
 // DPI-C (IEEE 1800-2023 clause 35, annex J):
 //   <file>.c / .cc / .cpp / .cxx, .o, .a   C or C++ for DPI imports; msim builds
@@ -139,6 +146,7 @@
 
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
+#include "upf_rt.inc"
 #include "dpi.inc"
 #include "vpi.inc"
 
@@ -650,6 +658,9 @@ static void usage() {
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
               << protfront::Options::help() <<
+                 "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
+                 "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
+                 "  -upf_verbose   print supply, power state and simstate changes\n"
                  "  <file>.c       C or C++ for DPI-C imports; also -sv_lib / -sv_root / -dpiheader\n"
                  "  -mvp           add the virtual prototype layer (mvp_axil_slave and its runtime)\n"
                  "  -uvm           compile the Accellera UVM library from $UVM_HOME, with its C code\n"
@@ -681,6 +692,8 @@ int main(int argc, char** argv) {
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     protfront::Options prot;
+    std::string upfPath, powerTop;
+    bool powerTopSet = false, upfVerbose = false;
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
@@ -731,6 +744,9 @@ int main(int argc, char** argv) {
             continue;
         }
         if (a == "-o") { buildDir = next("a directory"); buildDirGiven = true; continue; }
+        if (a == "-upf") { upfPath = next("a UPF file"); continue; }
+        if (a == "-power_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
+        if (a == "-upf_verbose" || a == "+upf_verbose") { upfVerbose = true; continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (prot.take(argc, argv, i)) continue;
@@ -874,6 +890,19 @@ int main(int argc, char** argv) {
     }
     for (auto& l : svLibs) soFiles.push_back(svLibPath(svRoot, l));
     plusArgs() = plusargs;
+    // -upf: package UPF (IEEE 1801-2024 11.2.4) goes in as one more source.
+    std::string upfPkgFile;
+    if (!upfPath.empty()) {
+        char tmpl[] = "/tmp/msim_upf_pkgXXXXXX.sv";
+        int fd = mkstemps(tmpl, 3);
+        if (fd < 0) { std::cerr << "msim: cannot write the UPF package\n"; return 1; }
+        std::string pkg = upf::svPackage();
+        if (write(fd, pkg.data(), pkg.size()) != (ssize_t)pkg.size()) { std::cerr << "msim: cannot write the UPF package\n"; return 1; }
+        close(fd);
+        upfPkgFile = tmpl;
+        fwd.insert(fwd.begin() + 1, upfPkgFile);
+    }
+    struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
     if (std::none_of(fwd.begin(), fwd.end(), [](const std::string& s) { return startsWith(s, "--std"); }))
@@ -992,6 +1021,47 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (!upfPath.empty()) {   // power-aware simulation (IEEE 1801-2024 9)
+        auto& rt = upfrt::rt();
+        rt.verbose = upfVerbose;
+        try {
+            rt.m.load(upfPath, "");
+            std::string top = powerTopSet ? powerTop : rt.m.designTop;
+            for (char& c : top) if (c == '/') c = '.';
+            while (!top.empty() && top[0] == '.') top.erase(0, 1);
+            // a path may start with the simulation top's own name (tb.u_dut)
+            if (!S.vcdTop.empty() && (top == S.vcdTop || top.starts_with(S.vcdTop + "."))) top = top.substr(std::min(top.size(), S.vcdTop.size() + 1));
+            // set_design_top may name the module the UPF was written for
+            if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {
+                std::string found;
+                std::function<void(const slang::ast::InstanceSymbol&, const std::string&)> walk =
+                    [&](const slang::ast::InstanceSymbol& in, const std::string& path) {
+                        if (!found.empty()) return;
+                        if (in.getDefinition().name == top && !path.empty()) { found = path; return; }
+                        for (auto& m : in.body.members())
+                            if (m.kind == slang::ast::SymbolKind::Instance) {
+                                auto& ch = m.as<slang::ast::InstanceSymbol>();
+                                walk(ch, path.empty() ? std::string(ch.name) : path + "." + std::string(ch.name));
+                            }
+                    };
+                for (auto* t : comp->getRoot().topInstances) {
+                    if (t->getDefinition().name == top) { found = "."; break; }
+                    walk(*t, "");
+                }
+                if (found == ".") top.clear();
+                else if (!found.empty()) top = found;
+            }
+            rt.m.top = top;
+            rt.bind(lowered);
+        } catch (const std::exception& ex) {
+            std::cerr << "msim: UPF: " << ex.what() << "\n";
+            return 1;
+        }
+        // Power gating needs every process on the interpreter, one thread.
+        staticComb = staticSeq = staticPart = false;
+        threads = 1;
+        if (compiled) { std::cerr << "msim: -compile: power-aware simulation is not compiled yet; using the interpreter\n"; compiled = false; }
+    }
     if (usesForce()) staticPart = false;   // a forced signal must see every write (10.6)
     if (lowered.procs.empty()) {
         // Nothing to schedule: the simulation ends at time 0 (4.4.1).
@@ -1161,6 +1231,7 @@ int main(int argc, char** argv) {
     S.shadows = shadowPairs();
     S.sclocks = sampleClocks();
     for (size_t c = 0; c < S.sclocks.size(); c++) S.spawn(sampleClockProc((int)c));
+    if (upfrt::rt().on) upfrt::rt().start();
     startConcAsserts();
     startClockings();
     startCovergroups();
