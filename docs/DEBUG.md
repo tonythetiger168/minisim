@@ -6,7 +6,7 @@ time. It runs the same front end as `msim`, so it takes the same files and
 options.
 
 ```sh
-msim tb.sv dut.sv -top tb -vcd waves.vcd                 # a run to debug
+msim tb.sv dut.sv -top tb -vcd waves.vcd                 # a run to debug (or -fst waves.fst)
 mdebug tb.sv dut.sv -top tb -drivers tb.u0.y             # who assigns it
 mdebug tb.sv dut.sv -top tb -loads tb.y0                 # who reads it
 mdebug tb.sv dut.sv -top tb -trace tb.y0 -depth 4        # the fan-in cone
@@ -17,6 +17,9 @@ mdebug tb.sv dut.sv -top tb -vcd waves.vcd -html debug.html
 A signal is a hierarchical path (`tb.u0.y`). A tail that names one signal is
 enough (`u0.y`). Every instance has its own signals: `tb.u0.r` and `tb.u1.r`
 are answered separately.
+
+`-vcd` takes a VCD or an FST (`msim -fst`); `-fst` and `-wave` are the same
+option.
 
 ## Drivers and loads
 
@@ -82,6 +85,9 @@ end of the waveform is used.
 - a schematic of the selected signal: inputs, the assignments that drive it,
   the assignments that read it and what they drive. Clicking a signal moves
   the view there, so a cone is walked one step at a time;
+- with `-vcd`: the active driver at the cursor, traced back four steps, in
+  the page itself. Clicking a line of the trace moves to that signal and
+  that time; the driver that ran is outlined in the driver list;
 - with `-vcd`: waveforms, a time cursor, steps to the previous and next change,
   and the value of every signal at the cursor written next to its name in the
   source.
@@ -114,7 +120,8 @@ ones), and mdebug says so.
 
 ## Limits
 
-- Waveforms are read from VCD. For FST, convert with `fst2vcd` for now.
+- In the page, a condition that reads an `x` or `z` value is undecided
+  (`??`); the command line evaluates all four states.
 - Unpacked arrays, structs and class objects are not in msim's VCD, so the
   active-driver trace stops at them with `(not in the waveform)`.
 - Assignments made through task or function output arguments, and `force`,

@@ -39,6 +39,9 @@
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/types/AllTypes.h"
 #include "version.hpp"
+#ifdef MINISIM_FST
+#include "fstapi.h"
+#endif
 
 using namespace lintir;
 
@@ -649,10 +652,16 @@ struct Vcd {
                 waves[w].ch[c[w]++] = Change{t, off, len};
             });
         });
-        // One entry per change: the later of two at one time, and no entry
-        // that repeats the value before it ($dumpvars, then the same at #0).
-        parallelFor(nw, threads, [&](size_t w) {
+        compact(threads);
+        return true;
+    }
+
+    // One entry per change: the later of two at one time, and no entry
+    // that repeats the value before it ($dumpvars, then the same at #0).
+    void compact(unsigned threads) {
+        parallelFor(waves.size(), threads, [&](size_t w) {
             auto& ch = waves[w].ch;
+            const char* data = waves[w].base;
             size_t n = 0;
             for (size_t i = 0; i < ch.size(); i++) {
                 if (n && ch[n - 1].t == ch[i].t) { ch[n - 1] = ch[i]; continue; }
@@ -671,7 +680,85 @@ struct Vcd {
             }
             ch.resize(m);
         });
+    }
+
+#ifdef MINISIM_FST
+    // An FST (msim -fst): libfst unpacks the blocks; each signal's values go
+    // into a buffer of its own.
+    std::vector<std::string> pools;
+
+    bool loadFst(const std::string& file, unsigned threads, std::string& err) {
+        fstReaderContext* ctx = fstReaderOpen(file.c_str());
+        if (!ctx) { err = "cannot open " + file; return false; }
+        std::vector<int> byHandle;   // FST handle -> wave
+        std::vector<std::string> scope;
+        while (struct fstHier* h = fstReaderIterateHier(ctx)) {
+            if (h->htyp == FST_HT_SCOPE) scope.emplace_back(h->u.scope.name);
+            else if (h->htyp == FST_HT_UPSCOPE) { if (!scope.empty()) scope.pop_back(); }
+            else if (h->htyp == FST_HT_VAR) {
+                unsigned char ty = h->u.var.typ;
+                if (ty == FST_VT_VCD_REAL || ty == FST_VT_VCD_EVENT || ty == FST_VT_GEN_STRING ||
+                    ty == FST_VT_VCD_REAL_PARAMETER || ty == FST_VT_VCD_REALTIME || ty == FST_VT_SV_SHORTREAL)
+                    continue;
+                std::string name(h->u.var.name), full;
+                // "q [7:0]" is the vector q; "mem[3]" keeps its index.
+                if (size_t sp = name.find(' '); sp != std::string::npos) {
+                    std::string rest = name.substr(sp + 1);
+                    name.resize(sp);
+                    if (rest.find(':') == std::string::npos) name += rest;
+                }
+                for (auto& sc : scope) full += sc + ".";
+                full += name;
+                fstHandle hd = h->u.var.handle;
+                if (byHandle.size() <= hd) byHandle.resize(hd + 1, -1);
+                if (byHandle[hd] < 0) {
+                    byHandle[hd] = (int)waves.size();
+                    waves.emplace_back().width = (int)h->u.var.length;
+                }
+                byName[full] = byHandle[hd];
+            }
+        }
+        pools.resize(waves.size());
+        struct Ctx { Vcd* v; std::vector<int>* byHandle; } cx{this, &byHandle};
+        fstReaderSetFacProcessMaskAll(ctx);
+        fstReaderIterBlocks(ctx, [](void* u, uint64_t t, fstHandle hd, const unsigned char* val) {
+            Ctx& c = *(Ctx*)u;
+            if (hd >= c.byHandle->size()) return;
+            int w = (*c.byHandle)[hd];
+            if (w < 0) return;
+            std::string& pool = c.v->pools[w];
+            size_t len = (size_t)c.v->waves[w].width;
+            if (pool.size() + len >= (1ull << 40) || len >= (1u << 24)) return;
+            c.v->waves[w].ch.push_back(Change{t, pool.size(), len});
+            pool.append((const char*)val, len);
+        }, &cx, nullptr);
+        end = fstReaderGetEndTime(ctx);
+        int ts = fstReaderGetTimescale(ctx);
+        static const char* unit[] = {"s", "ms", "us", "ns", "ps", "fs"};
+        if (int k = -ts; k >= 0 && k <= 15) {   // 10^ts seconds
+            int idx = (k + 2) / 3, pw = 3 * idx - k;
+            timescale = std::string(pw == 0 ? "1" : pw == 1 ? "10" : "100") + unit[idx];
+        }
+        fstReaderClose(ctx);
+        for (size_t w = 0; w < waves.size(); w++) waves[w].base = pools[w].data();
+        compact(threads);
         return true;
+    }
+#endif
+
+    // By what the file is, not by its name.
+    bool loadAny(const std::string& file, unsigned threads, std::string& err) {
+        std::ifstream in(file, std::ios::binary);
+        if (!in) { err = "cannot open " + file; return false; }
+        int c = in.get();
+        in.close();
+        if (c == '$' || c == '#' || c == ' ' || c == '\n' || c == '\t' || c == '\r') return load(file, threads, err);
+#ifdef MINISIM_FST
+        return loadFst(file, threads, err);
+#else
+        err = file + " is not a VCD (this mdebug was built without FST)";
+        return false;
+#endif
     }
 
     const Wave* find(const std::string& name) const {
@@ -1175,6 +1262,160 @@ struct Tool {
 
     static constexpr size_t kPageChanges = 2000000;
 
+    // An expression for the viewer's own evaluator (the active-driver trace
+    // in the page): nested arrays, "null" for what it does not follow.
+    static std::string bitsOf(const SVInt& v) {
+        std::string b;
+        for (int i = (int)v.getBitWidth() - 1; i >= 0; i--) {
+            logic_t l = v[i];
+            b += l.isUnknown() ? (exactlyEqual(l, logic_t::z) ? 'z' : 'x') : (bool(l) ? '1' : '0');
+        }
+        return b;
+    }
+    static std::string constJson(const SVInt& v) {
+        if (v.getBitWidth() > 4096) return "null";
+        return "[\"c\",\"" + bitsOf(v) + "\"," + (v.isSigned() ? "1" : "0") + "]";
+    }
+    std::string symJson(const Symbol& sym, const Type& type) {
+        if (sym.kind == SymbolKind::Parameter) {
+            const ConstantValue& cv = sym.as<ParameterSymbol>().getValue();
+            return cv.isInteger() ? constJson(cv.integer()) : "null";
+        }
+        if (sym.kind == SymbolKind::EnumValue) {
+            const ConstantValue& cv = sym.as<EnumValueSymbol>().getValue();
+            return cv.isInteger() ? constJson(cv.integer()) : "null";
+        }
+        auto it = db.sigIx.find(&sym);
+        if (it == db.sigIx.end() || !type.isIntegral()) return "null";
+        return "[\"s\"," + std::to_string(it->second) + "," + (type.isSigned() ? "1" : "0") + "]";
+    }
+    std::string exprJson(const Expression& e) {
+        auto bad = [](const std::string& x) { return x == "null"; };
+        switch (e.kind) {
+            case ExpressionKind::NamedValue: return symJson(e.as<NamedValueExpression>().symbol, *e.type);
+            case ExpressionKind::HierarchicalValue: return symJson(e.as<HierarchicalValueExpression>().symbol, *e.type);
+            case ExpressionKind::IntegerLiteral: return constJson(e.as<IntegerLiteral>().getValue());
+            case ExpressionKind::UnbasedUnsizedIntegerLiteral: {
+                if (!e.type->isIntegral() || e.type->getBitWidth() > 4096) return "null";
+                logic_t l = e.as<UnbasedUnsizedIntegerLiteral>().getLiteralValue();
+                char c = l.isUnknown() ? (exactlyEqual(l, logic_t::z) ? 'z' : 'x') : (bool(l) ? '1' : '0');
+                return "[\"c\",\"" + std::string(e.type->getBitWidth(), c) + "\",0]";
+            }
+            case ExpressionKind::Conversion: {
+                const auto& c = e.as<ConversionExpression>();
+                std::string v = exprJson(c.operand());
+                if (bad(v) || !e.type->isIntegral() || !c.operand().type->isIntegral()) return "null";
+                return "[\"cv\"," + v + "," + std::to_string(e.type->getBitWidth()) + "," +
+                       (c.operand().type->isSigned() ? "1" : "0") + "," + (e.type->isSigned() ? "1" : "0") + "]";
+            }
+            case ExpressionKind::UnaryOp: {
+                const auto& u = e.as<UnaryExpression>();
+                std::string v = exprJson(u.operand());
+                if (bad(v)) return "null";
+                return "[\"u\",\"" + std::string(toString(u.op)) + "\"," + v + "]";
+            }
+            case ExpressionKind::BinaryOp: {
+                const auto& b = e.as<BinaryExpression>();
+                std::string l = exprJson(b.left()), r = exprJson(b.right());
+                if (bad(l) || bad(r)) return "null";
+                return "[\"b\",\"" + std::string(toString(b.op)) + "\"," + l + "," + r + "]";
+            }
+            case ExpressionKind::ConditionalOp: {
+                const auto& c = e.as<ConditionalExpression>();
+                if (c.conditions.size() != 1 || c.conditions[0].pattern) return "null";
+                std::string p = exprJson(*c.conditions[0].expr), l = exprJson(c.left()), r = exprJson(c.right());
+                if (bad(p) || bad(l) || bad(r)) return "null";
+                return "[\"?:\"," + p + "," + l + "," + r + "]";
+            }
+            case ExpressionKind::ElementSelect: {
+                const auto& x = e.as<ElementSelectExpression>();
+                const Type& vt = *x.value().type;
+                if (!vt.isIntegral() || e.type->getBitWidth() != 1) return "null";
+                std::string v = exprJson(x.value()), i = exprJson(x.selector());
+                if (bad(v) || bad(i)) return "null";
+                ConstantRange r = vt.getFixedRange();
+                return "[\"bit\"," + v + "," + i + "," + std::to_string(r.left) + "," + std::to_string(r.right) + "]";
+            }
+            case ExpressionKind::RangeSelect: {
+                const auto& x = e.as<RangeSelectExpression>();
+                const Type& vt = *x.value().type;
+                if (!vt.isIntegral()) return "null";
+                std::string v = exprJson(x.value()), l = exprJson(x.left()), r = exprJson(x.right());
+                if (bad(v) || bad(l) || bad(r)) return "null";
+                ConstantRange rg = vt.getFixedRange();
+                int kind = x.getSelectionKind() == RangeSelectionKind::Simple ? 0
+                         : x.getSelectionKind() == RangeSelectionKind::IndexedUp ? 1 : 2;
+                return "[\"rng\"," + v + "," + l + "," + r + "," + std::to_string(kind) + "," +
+                       std::to_string(rg.left) + "," + std::to_string(rg.right) + "]";
+            }
+            case ExpressionKind::Concatenation: {
+                std::string o = "[\"cat\",[";
+                bool first = true;
+                for (const Expression* op : e.as<ConcatenationExpression>().operands()) {
+                    std::string v = exprJson(*op);
+                    if (bad(v)) return "null";
+                    o += (first ? "" : ",") + v;
+                    first = false;
+                }
+                return first ? "null" : o + "]]";
+            }
+            case ExpressionKind::Replication: {
+                const auto& r = e.as<ReplicationExpression>();
+                std::string n = exprJson(r.count()), v = exprJson(r.concat());
+                if (bad(n) || bad(v)) return "null";
+                return "[\"rep\"," + n + "," + v + "]";
+            }
+            default: return "null";
+        }
+    }
+    // Case statements are shared by the drivers under them: one table.
+    std::map<const CaseStatement*, int> caseIx;
+    std::vector<const CaseStatement*> cases;
+    std::string guardsJson(const Driver& d) {
+        std::string o = "[";
+        for (const Guard& g : d.guards) {
+            if (o.size() > 1) o += ",";
+            switch (g.kind) {
+                case Guard::If: o += "[\"if\"," + exprJson(*g.cond) + "]"; break;
+                case Guard::Else: o += "[\"else\"," + exprJson(*g.cond) + "]"; break;
+                case Guard::CaseItem:
+                case Guard::CaseDefault: {
+                    auto it = caseIx.find(g.cs);
+                    if (it == caseIx.end()) {
+                        it = caseIx.emplace(g.cs, (int)cases.size()).first;
+                        cases.push_back(g.cs);
+                    }
+                    o += "[\"case\"," + std::to_string(it->second) + "," +
+                         (g.kind == Guard::CaseDefault ? "-1" : std::to_string(g.item)) + "]";
+                    break;
+                }
+                default: o += "[\"?\"]"; break;
+            }
+        }
+        return o + "]";
+    }
+    std::string casesJson() {
+        std::string o = "[";
+        for (size_t i = 0; i < cases.size(); i++) {
+            const CaseStatement& c = *cases[i];
+            const char* k = c.condition == CaseStatementCondition::Normal ? "n"
+                          : c.condition == CaseStatementCondition::WildcardJustZ ? "z"
+                          : c.condition == CaseStatementCondition::WildcardXOrZ ? "x" : "?";
+            o += std::string(i ? ",\n" : "") + "{\"k\":\"" + k + "\",\"sel\":" + exprJson(c.expr) + ",\"items\":[";
+            for (size_t j = 0; j < c.items.size(); j++) {
+                o += j ? ",[" : "[";
+                bool first = true;
+                for (const Expression* e : c.items[j].expressions) {
+                    o += (first ? "" : ",") + exprJson(*e);
+                    first = false;
+                }
+                o += "]";
+            }
+            o += "]}";
+        }
+        return o + "]";
+    }
+
     std::optional<uint64_t> center;   // -at T
 
     void json(std::ostream& os, size_t maxChanges) {
@@ -1218,10 +1459,11 @@ struct Tool {
             os << (first ? "" : ",\n") << "{\"sig\":" << it->second << ",\"kind\":" << js(label(d))
                << ",\"file\":" << dw[i].file << ",\"line\":" << dw[i].line << ",\"text\":" << js(text(d))
                << ",\"when\":" << js(when(d)) << ",\"seq\":" << (d.seq ? 1 : 0) << ",\"reads\":" << ids(d.reads)
-               << ",\"ctl\":" << ids(d.creads) << "}";
+               << ",\"ctl\":" << ids(d.creads) << ",\"blk\":" << d.block << ",\"whole\":" << (d.whole ? 1 : 0)
+               << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
-        os << "]";
+        os << "],\n\"cases\":" << casesJson();
         if (haveVcd) {
             os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale) << ",\"waves\":{";
             first = true;
@@ -1280,7 +1522,7 @@ void usage() {
                  "  -active SIG      with -vcd: the assignment that gave SIG its value at\n"
                  "                   -at T (default: the end), then what caused it,\n"
                  "                   -depth N steps back through time\n"
-                 "  -vcd <file>      the waveform msim -vcd wrote\n"
+                 "  -vcd <file>      the waveform msim wrote: VCD or FST (-fst, -wave are the same)\n"
                  "  -at T            a time, in the VCD's time unit\n"
                  "  -threads N       threads for parsing and for reading the waveform\n"
                  "                   (default: every logical core; the output is the same for any N)\n"
@@ -1328,7 +1570,7 @@ int main(int argc, char** argv) {
         if (a == "-scopes" || a == "-signals") { queries.push_back({a.substr(1), "", -1, std::nullopt}); continue; }
         if (a == "-depth") { depth = std::atoi(next("a number").c_str()); continue; }
         if (a == "-at") { at = std::strtoull(next("a time").c_str(), nullptr, 10); continue; }
-        if (a == "-vcd") { vcdPath = next("a VCD file"); continue; }
+        if (a == "-vcd" || a == "-fst" || a == "-wave") { vcdPath = next("a VCD file"); continue; }
         if (a == "-html") { htmlPath = next("a file"); continue; }
         if (a == "-json") { jsonPath = next("a file"); continue; }
         if (a == "-threads" || a == "-j") {
@@ -1359,7 +1601,7 @@ int main(int argc, char** argv) {
 
     if (!vcdPath.empty()) {
         std::string err;
-        if (!tool.vcd.load(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
+        if (!tool.vcd.loadAny(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
         tool.haveVcd = true;
     }
 

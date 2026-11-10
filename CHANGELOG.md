@@ -14,7 +14,8 @@ Spec references are IEEE 1800-2023 clauses.
   assignment that gave a signal its value at a time and its causes back
   through time, and `-html` for a one-file viewer (hierarchy, clickable
   source, drivers and loads, schematic, waves with values annotated in the
-  source). See `docs/DEBUG.md`.
+  source). `-vcd` reads VCD and FST; the page traces the active driver at the
+  cursor itself. See `docs/DEBUG.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
