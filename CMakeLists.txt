@@ -38,6 +38,24 @@ foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
 endforeach()
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
+
+# Physical verification: mpv drc (GDSII in, rule deck, violation markers out).
+# test_pv checks the polygon engine, the GDSII reader and writer and every
+# check; the mpv test runs the command on SKY130 standard cells (clean) and
+# on a layout with known violations.
+find_package(Threads REQUIRED)
+add_executable(mpv src/mpv.cpp)
+target_include_directories(mpv PRIVATE src)
+target_link_libraries(mpv PRIVATE Threads::Threads)
+add_executable(test_pv tests/test_pv.cpp)
+target_include_directories(test_pv PRIVATE src)
+target_compile_options(test_pv PRIVATE -UNDEBUG)
+target_link_libraries(test_pv PRIVATE Threads::Threads)
+add_test(NAME test_pv COMMAND test_pv)
+add_test(NAME mpv
+         COMMAND ${CMAKE_COMMAND} -DMPV=$<TARGET_FILE:mpv> -DGEN=$<TARGET_FILE:test_pv>
+                 -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mpv_test
+                 -P ${CMAKE_SOURCE_DIR}/tests/mpv.cmake)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
@@ -276,7 +294,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minisim mpv RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -299,7 +317,7 @@ install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisi
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/MPV.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
