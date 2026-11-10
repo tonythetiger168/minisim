@@ -124,7 +124,7 @@
 
 #include "codegen.hpp"
 #include "lower.hpp"
-#include "activity.hpp"
+#include "saif.hpp"
 #include "slang/diagnostics/LookupDiags.h"
 #include "slang/driver/Driver.h"
 #include "slang/syntax/AllSyntax.h"
@@ -1025,11 +1025,11 @@ int main(int argc, char** argv) {
         if (saifPath.empty()) return true;
         S.closeWaves();
         try {
-            act::Db db;
-            act::load(*vcdPath, db);
+            saif::Db db;
+            saif::load(*vcdPath, db, par::defaultThreads());
             std::ofstream f(saifPath);
-            if (!f) throw act::Error("cannot write " + saifPath);
-            act::writeSaif(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            if (!f) throw saif::Error("cannot write " + saifPath);
+            saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
         } catch (const std::exception& e) {
             std::cerr << "msim: -saif: " << e.what() << "\n";
             return false;
