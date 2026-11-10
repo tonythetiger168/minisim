@@ -89,7 +89,6 @@ endif()
 include(cmake/tools/memu.cmake)
 include(cmake/tools/mrcx.cmake)
 include(cmake/tools/shared_par_wave.cmake)
-include(cmake/tools/mformal.cmake)
 include(cmake/tools/mequiv.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
