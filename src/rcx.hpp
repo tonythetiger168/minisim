@@ -41,6 +41,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -48,6 +50,7 @@
 #include <utility>
 #include <vector>
 
+#include "parallel.hpp"
 #include "spef.hpp"
 
 namespace rcx {
@@ -365,40 +368,10 @@ struct Result {
 
 namespace detail {
 
-// Runs f(block, worker) for block = 0..nblocks-1 on the given number of
-// threads; worker is 0..threads-1 and names the calling thread.
-template <class F>
-void parWorkers(size_t nblocks, int threads, F&& f) {
-    if (threads <= 1 || nblocks <= 1) {
-        for (size_t b = 0; b < nblocks; b++) f(b, 0);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    std::vector<std::string> err(static_cast<size_t>(threads));
-    auto work = [&](int t) {
-        try {
-            for (;;) {
-                size_t b = next.fetch_add(1, std::memory_order_relaxed);
-                if (b >= nblocks) break;
-                f(b, t);
-            }
-        } catch (const std::exception& e) {
-            err[static_cast<size_t>(t)] = e.what();
-            if (err[static_cast<size_t>(t)].empty()) err[static_cast<size_t>(t)] = "error";
-            next.store(nblocks);
-        }
-    };
-    std::vector<std::thread> pool;
-    int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(threads), nblocks));
-    for (int t = 1; t < n; t++) pool.emplace_back(work, t);
-    work(0);
-    for (auto& th : pool) th.join();
-    for (auto& e : err)
-        if (!e.empty()) throw std::runtime_error(e);
-}
+// Runs f(block) for block = 0..nblocks-1 on the shared thread helper.
 template <class F>
 void parBlocks(size_t nblocks, int threads, F&& f) {
-    parWorkers(nblocks, threads, [&](size_t b, int) { f(b); });
+    par::parallelFor(nblocks, static_cast<unsigned>(std::max(threads, 1)), f);
 }
 
 struct Piece {
@@ -785,8 +758,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
     const double temp = opt.tempGiven ? opt.temp : stack.tnom;
     R.temp = temp;
     const double dT = temp - stack.tnom;
-    int threads = opt.threads > 0 ? opt.threads : static_cast<int>(std::thread::hardware_concurrency());
-    if (threads < 1) threads = 1;
+    int threads = opt.threads > 0 ? opt.threads : static_cast<int>(par::defaultThreads());
     R.threads = threads;
 
     std::vector<double> rsheet(nl);
@@ -925,9 +897,23 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
         std::vector<i64> cuts;
         std::vector<Rect> between;
     };
-    std::vector<Scratch> scratch(static_cast<size_t>(threads));
-    parWorkers(nblk, threads, [&](size_t b, int worker) {
-        Scratch& sc = scratch[static_cast<size_t>(worker)];
+    // Scratch space is handed out per block and taken back, so a thread
+    // reuses what an earlier block left (the `seen` array is as long as the
+    // piece list).
+    std::vector<std::unique_ptr<Scratch>> spare;
+    std::mutex spareMu;
+    parBlocks(nblk, threads, [&](size_t b) {
+        std::unique_ptr<Scratch> held;
+        {
+            std::lock_guard<std::mutex> g(spareMu);
+            if (!spare.empty()) { held = std::move(spare.back()); spare.pop_back(); }
+        }
+        if (!held) held = std::make_unique<Scratch>();
+        struct Return {
+            std::unique_ptr<Scratch>& h; std::vector<std::unique_ptr<Scratch>>& pool; std::mutex& mu;
+            ~Return() { std::lock_guard<std::mutex> g(mu); pool.push_back(std::move(h)); }
+        } giveBack{held, spare, spareMu};
+        Scratch& sc = *held;
         if (sc.seen.size() != pieces.size()) sc.seen.assign(pieces.size(), 0);
         auto& cand = sc.cand;
         auto& seen = sc.seen;

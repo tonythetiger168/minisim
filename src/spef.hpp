@@ -33,9 +33,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "parallel.hpp"
 
 namespace spef {
 
@@ -440,27 +441,15 @@ inline File parse(const std::string& text, const std::string& fname, int threads
     }
     f.nets.resize(starts.size());
     std::vector<char> keep(starts.size(), 1);
-    if (threads <= 0) threads = static_cast<int>(std::thread::hardware_concurrency());
-    if (threads < 1) threads = 1;
-    size_t nt = std::min<size_t>(static_cast<size_t>(threads), std::max<size_t>(1, starts.size() / 64));
-    std::vector<std::string> err(nt);
-    auto work = [&](size_t t) {
-        try {
-            for (size_t i = starts.size() * t / nt; i < starts.size() * (t + 1) / nt; i++) {
-                Scan sc{starts[i] + 6, i + 1 < starts.size() ? starts[i + 1] : s.end, &fname, text.data()};
-                if (starts[i][1] == 'R') { keep[i] = 0; continue; }
-                parseNet(sc, names, corner, f.nets[i]);
-            }
-        } catch (const std::exception& e) {
-            err[t] = e.what();
+    unsigned nthreads = threads > 0 ? static_cast<unsigned>(threads) : par::defaultThreads();
+    const size_t grain = 64;   // nets per block
+    par::parallelFor((starts.size() + grain - 1) / grain, nthreads, [&](size_t blk) {
+        for (size_t i = blk * grain; i < std::min(starts.size(), (blk + 1) * grain); i++) {
+            Scan sc{starts[i] + 6, i + 1 < starts.size() ? starts[i + 1] : s.end, &fname, text.data()};
+            if (starts[i][1] == 'R') { keep[i] = 0; continue; }
+            parseNet(sc, names, corner, f.nets[i]);
         }
-    };
-    std::vector<std::thread> pool;
-    for (size_t t = 1; t < nt; t++) pool.emplace_back(work, t);
-    work(0);
-    for (auto& th : pool) th.join();
-    for (auto& e : err)
-        if (!e.empty()) throw std::runtime_error(e);
+    });
     size_t o = 0;
     for (size_t i = 0; i < f.nets.size(); i++)
         if (keep[i]) {
