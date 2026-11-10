@@ -1,0 +1,3 @@
+// IEEE 1800-2023 33.3.1.1: foover.v matches lib1 and lib4 the same way.
+library lib1 "../xlib/foo*.v";
+library lib4 "../xlib/*ver.v";

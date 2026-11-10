@@ -1,0 +1,9 @@
+// IEEE 1800-2023 33.6: file adder.vg (gate-level)
+module adder();
+  m f1();
+  m f2();
+  initial $display("%m: %l (adder.vg)");
+endmodule
+module m();   // gate-level
+  initial $display("%m: %l (adder.vg)");
+endmodule

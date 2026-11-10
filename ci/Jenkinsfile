@@ -1,0 +1,104 @@
+// A Jenkins pipeline for a minisim regression. Copy it into your own repo and
+// change the test list, the agent label, and the msim location.
+//
+// Plugins used: JUnit (test results), HTML Publisher (mregress and coverage
+// reports), Coverage (the LCOV file mcov writes), and Credentials Binding (the
+// tracker token for mbug). Each is optional: drop the matching step if you do
+// not have it installed.
+//
+// Bug reports: with BUGS on, mbug files every distinct failure as one issue
+// (or a comment on the open one), linked to this build. ci/mbug.json picks the
+// tracker and project. Add the token as a Jenkins "Secret text" credential
+// with the id 'mbug-token'; it is bound to the variable the tracker reads:
+//   github   GITHUB_TOKEN  (a fine-grained token with Issues: read and write)
+//   redmine  REDMINE_KEY   (and set REDMINE_URL below)
+//   jira     JIRA_TOKEN    (and set JIRA_URL and JIRA_USER below; Server / DC: JIRA_PAT)
+// The token never goes in the repo.
+pipeline {
+  agent { label 'linux' }
+
+  parameters {
+    string(name: 'TESTS', defaultValue: 'tests/regress/smoke.list', description: 'mregress test list')
+    string(name: 'SEEDS', defaultValue: '1', description: 'random seeds per test')
+    booleanParam(name: 'COVERAGE', defaultValue: true, description: 'collect coverage (msim only)')
+    booleanParam(name: 'BUGS', defaultValue: false, description: 'file failures as issues (mbug)')
+    choice(name: 'TRACKER', choices: ['github', 'redmine', 'jira'], description: 'where mbug files them')
+  }
+
+  options {
+    timeout(time: 2, unit: 'HOURS')
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  environment {
+    // Where msim and mregress are installed (the minisim .deb installs into /usr).
+    PATH = "/opt/minisim/bin:${env.PATH}"
+    OUT = 'regress'
+    // Only the tracker you use needs its URL.
+    REDMINE_URL = 'https://redmine.example.com'
+    JIRA_URL = 'https://yourcompany.atlassian.net'
+    JIRA_USER = 'ci@example.com'
+  }
+
+  stages {
+    stage('Version') {
+      steps {
+        sh 'msim -version && mregress -version'
+      }
+    }
+
+    stage('Regression') {
+      steps {
+        // mregress exits 1 when a test fails unexpectedly (an @xfail known gap
+        // does not count), so the stage goes red on a real failure. A known gap
+        // is written to junit.xml as skipped, so Jenkins shows it as skipped.
+        // -cov needs a minisim with mcov; drop it if you only want results.
+        sh """
+          mregress '${params.TESTS}' -sim msim -j "\$(nproc)" -seeds '${params.SEEDS}' \
+                   -o "\$OUT"${params.COVERAGE ? ' -cov' : ''}
+        """
+      }
+    }
+  }
+
+  post {
+    always {
+      junit testResults: "${env.OUT}/junit.xml", allowEmptyResults: true,
+            skipPublishingChecks: true
+      archiveArtifacts artifacts: "${env.OUT}/**", allowEmptyArchive: true,
+                       fingerprint: false
+      publishHTML target: [reportName: 'mregress', reportDir: env.OUT,
+                           reportFiles: 'report.html', keepAll: true,
+                           alwaysLinkToLastBuild: true, allowMissing: true]
+      script {
+        // Coverage: mcov writes an HTML report and an LCOV file the Coverage
+        // plugin reads. Guarded so the build still works without -cov.
+        if (fileExists("${env.OUT}/cov.json")) {
+          sh "mcov report ${env.OUT}/cov.json -lcov ${env.OUT}/cov.info -html ${env.OUT}/cov_html"
+          publishHTML target: [reportName: 'Coverage', reportDir: "${env.OUT}/cov_html",
+                               reportFiles: 'index.html', keepAll: true,
+                               alwaysLinkToLastBuild: true, allowMissing: true]
+          recordCoverage tools: [[parser: 'LCOV', pattern: "${env.OUT}/cov.info"]]
+        }
+      }
+    }
+    failure {
+      script {
+        // mregress exits 1 on a failure, which fails the Regression stage, so
+        // the failures are filed here.
+        if (params.BUGS && fileExists("${env.OUT}/results.json")) {
+          def tokenVar = [github: 'GITHUB_TOKEN', redmine: 'REDMINE_KEY', jira: 'JIRA_TOKEN'][params.TRACKER]
+          withCredentials([string(credentialsId: 'mbug-token', variable: tokenVar)]) {
+            sh "mbug regress ${env.OUT}/results.json -tracker ${params.TRACKER} -config ci/mbug.json -o ${env.OUT}/bugs.json"
+          }
+          archiveArtifacts artifacts: "${env.OUT}/bugs.json", allowEmptyArchive: true
+        }
+      }
+    }
+    unstable {
+      // A failed regression: repeat only the failures, so the log of the next
+      // build holds just them.
+      sh "mregress '${params.TESTS}' -o \$OUT -rerun || true"
+    }
+  }
+}

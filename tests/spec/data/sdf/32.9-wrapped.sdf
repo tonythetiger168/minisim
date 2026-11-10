@@ -1,0 +1,6 @@
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "bufp") (INSTANCE b)
+    (DELAY (ABSOLUTE (IOPATH A Z (2.5)))))
+)
