@@ -200,11 +200,13 @@ mdft -lbist_coverage -scandef chains.json -lbist_patterns 4096 chip_scan.v -lib 
 ```
 
 ```
-mdft: logic BIST coverage of chip: 4096 patterns, 16 chains, 6000 scan cells observed, port inputs at 0
-  detected                          DT       231870
+mdft: logic BIST coverage of big: 4096 patterns, 16 chains, 6000 scan cells observed, port inputs at 0
   ...
-  test coverage                              91.42%
-  coverage by pattern count:  64: 61.20%  128: 70.11%  ...  4096: 91.42%
+  total faults                               494544
+  test coverage                              91.61%
+  fault coverage                             72.61%
+  coverage by pattern count:  64: 71.80%  128: 77.18%  256: 81.75%  512: 85.15%  1024: 87.81%  2048: 89.90%  4096: 91.61%
+  2.09 s on 4 threads
 ```
 
 It grades under the conditions the wrapper creates: port inputs are 0,
@@ -214,7 +216,8 @@ stop paying. `-lbist_faults FILE` lists every fault with its class (`ND`
 faults are where test points would help), `-lbist_json FILE` writes the
 numbers, and `-lbist_min_coverage P` fails the run under P percent. A scan
 cell that captures an unknown value is reported, because it makes the
-signature unrepeatable. The run uses every core (`-threads N`) and gives the
+signature unrepeatable. That run (60,000 gates, 6,000 flops) takes 5.4 s on
+one thread. The run uses every core (`-threads N`) and gives the
 same result for any thread count.
 
 The grade is checked in the test suite against the real wrapper: faults
