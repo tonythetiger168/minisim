@@ -449,6 +449,9 @@ struct Engine {
     std::vector<Sim::Work> work;
     std::vector<int> active;
     std::vector<uint64_t> masks;
+    // The test cube behind each pattern generate() returned: 2 where the bit
+    // was free and filled at random (a random pattern is its own cube).
+    std::vector<Pattern> cubes;
     Rng rng;
 
     Engine(const Circuit& cc, std::vector<Fault>& fl, const Options& o, Pool& p)
@@ -480,6 +483,7 @@ struct Engine {
 
     std::vector<Pattern> generate() {
         std::vector<Pattern> pats;
+        cubes.clear();
         size_t ni = c.inputs.size();
         for (size_t i = 0; i < faults.size(); i++) {
             Fault& f = faults[i];
@@ -502,7 +506,7 @@ struct Engine {
                 hit++;
             }
             for (int b = 0; b < 64; b++)
-                if (keep >> b & 1) { pats.push_back(column(words, b)); st.randomPatterns++; }
+                if (keep >> b & 1) { pats.push_back(column(words, b)); cubes.push_back(pats.back()); st.randomPatterns++; }
             int before = (int)active.size();
             prune();
             if (hit * 200 < before) break;
@@ -597,6 +601,7 @@ struct Engine {
                         faults[active[i]].cls = DS;
                     }
                 pats.push_back(column(words, best));
+                cubes.push_back(j.cube);
                 st.podemPatterns++;
             }
         }
@@ -615,7 +620,7 @@ struct Engine {
             if (faults[i].node >= 0 && faults[i].rep == (int)i && faults[i].cls == DS)
                 active.push_back((int)i);
         std::vector<uint8_t> found(faults.size(), 0);
-        std::vector<Pattern> out;
+        std::vector<Pattern> out, keptCubes;
         std::vector<uint64_t> words(c.inputs.size());
         for (int end = (int)pats.size(); end > 0 && !active.empty(); end -= 64) {
             int n = std::min(64, end);
@@ -633,13 +638,15 @@ struct Engine {
                 found[active[i]] = 1;
             }
             for (int b = 0; b < n; b++)
-                if (keep >> b & 1) out.push_back(pats[end - 1 - b]);
+                if (keep >> b & 1) { out.push_back(pats[end - 1 - b]); keptCubes.push_back(cubes[end - 1 - b]); }
             size_t k = 0;
             for (int i : active)
                 if (!found[i]) active[k++] = i;
             active.resize(k);
         }
         std::reverse(out.begin(), out.end());
+        std::reverse(keptCubes.begin(), keptCubes.end());
+        cubes = keptCubes;
         return out;
     }
 

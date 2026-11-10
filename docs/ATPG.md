@@ -115,6 +115,13 @@ a netlist with a detected fault wired in (they fail).
   mismatching cycles.
 - `-patterns FILE`: the patterns as text, one line each (input bits, then
   scan cell bits in chain order); `-faultsim` reads it back.
+- `-cubes FILE`: every test before the random fill, for test compression
+  (an EDT encoder needs to know which bits it is free to choose). A line is
+  `<pattern> <chain> <bits>`: the pattern's number from 0 in pattern file
+  order, the chain's number from 0 in the order matpg lists the chains, and
+  the value each cell of that chain is loaded with, the cell nearest scan-in
+  first, `x` for a bit ATPG did not need. `<pattern> pi <bits>` gives the
+  port inputs the same way. A random pattern has no free bits.
 - `-json FILE`: the summary, for dashboards and CI.
 
 ## Threads

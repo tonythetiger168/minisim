@@ -31,7 +31,7 @@ namespace {
 
 struct Args {
     std::vector<std::string> files;
-    std::string top, se, stil, tb, patOut, faultOut, faultsim, json;
+    std::string top, se, stil, tb, patOut, faultOut, faultsim, json, cubeOut;
     std::vector<std::string> libs;
     std::string fault = "stuck";
     Options opt;
@@ -59,6 +59,8 @@ void usage() {
         "  -stil FILE        write the patterns as STIL (IEEE 1450)\n"
         "  -tb FILE          write a self-checking Verilog testbench\n"
         "  -patterns FILE    write the patterns as text (what -faultsim reads)\n"
+        "  -cubes FILE       write the tests before random fill, x for a free bit, for\n"
+        "                    test compression (mdft -edt_encode)\n"
         "  -faults FILE      write the fault list with each fault's class\n"
         "  -json FILE        write the summary as JSON\n"
         "  -faultsim FILE    do not generate: grade the patterns in FILE\n"
@@ -70,7 +72,7 @@ void usage() {
 
 struct PatSet {
     bool transition = false;
-    std::vector<Pattern> pats;
+    std::vector<Pattern> pats, cubes;
     std::vector<std::vector<uint8_t>> po, cap;   // expected values, 2 = X
 };
 
@@ -537,6 +539,7 @@ int main(int argc, char** argv) {
         else if (s == "-tb") a.tb = next("a file");
         else if (s == "-lib") a.libs.push_back(next("a file"));
         else if (s == "-patterns") a.patOut = next("a file");
+        else if (s == "-cubes") a.cubeOut = next("a file");
         else if (s == "-faults") a.faultOut = next("a file");
         else if (s == "-json") a.json = next("a file");
         else if (s == "-faultsim") a.faultsim = next("a file");
@@ -620,6 +623,7 @@ int main(int argc, char** argv) {
                 eng.grade(ps.pats);
             } else {
                 ps.pats = eng.generate();
+                ps.cubes = eng.cubes;
             }
             ps.po = eng.respond(ps.pats, m.poNodes);
             ps.cap = eng.respond(ps.pats, m.capNodes);
@@ -675,6 +679,32 @@ int main(int argc, char** argv) {
             std::ofstream f(a.patOut);
             if (!f) throw ModelError("cannot write " + a.patOut);
             writePatterns(nl, first, sets, f);
+        }
+        if (!a.cubeOut.empty()) {
+            // "<pattern> <chain> <bits>": the load of one chain, the cell
+            // nearest scan-in first; "<pattern> pi <bits>": the port inputs
+            // in the order of the pattern file. Patterns count from 0 in
+            // pattern file order, chains from 0 in the order printed.
+            std::ofstream f(a.cubeOut);
+            if (!f) throw ModelError("cannot write " + a.cubeOut);
+            f << "# matpg test cubes for " << nl.top << ": x is a bit left free\n";
+            size_t nPI = first.piNets.size();
+            int id = 0;
+            const char* ch = "01x";
+            for (const PatSet& ps : sets)
+                for (const Pattern& cu : ps.cubes.empty() ? ps.pats : ps.cubes) {
+                    f << id << " pi ";
+                    for (size_t i = 0; i < nPI; i++)
+                        f << (first.c.fixed[first.c.inputs[i]] >= 0 ? ch[first.c.fixed[first.c.inputs[i]]] : ch[cu[i]]);
+                    f << "\n";
+                    size_t k = nPI;
+                    for (size_t ci = 0; ci < scan.chains.size(); ci++) {
+                        f << id << " " << ci << " ";
+                        for (size_t i = 0; i < scan.chains[ci].cells.size(); i++) f << ch[cu[k++]];
+                        f << "\n";
+                    }
+                    id++;
+                }
         }
         if (!a.json.empty()) {
             std::ofstream f(a.json);

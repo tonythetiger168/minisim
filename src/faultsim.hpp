@@ -10,7 +10,8 @@
 //             which is how a transition fault is posed on a two-frame model.
 //   Sim       good(words) simulates 64 patterns at once (one word per circuit
 //             input, three-valued); detect(work, fault) returns the mask of
-//             those patterns that detect the fault. One Work per thread.
+//             those patterns that detect the fault, and on request where each
+//             pattern fails (observe node and mask). One Work per thread.
 //   collapse  fault equivalence classes (Fault::rep).
 #pragma once
 #include <algorithm>
@@ -212,7 +213,11 @@ struct Sim {
     }
 
     // The patterns (as a bit mask) that detect the fault.
-    uint64_t detect(Work& w, const Fault& f) const {
+    // `at`, when given, receives each observe node the fault effect reaches
+    // with the mask of patterns that differ there (what a tester would see
+    // fail), for diagnosis.
+    uint64_t detect(Work& w, const Fault& f, std::vector<std::pair<int, uint64_t>>* at = nullptr) const {
+        if (at) at->clear();
         uint64_t cm = ~0ull;
         if (f.cond >= 0) cm = f.condv ? g1[f.cond] : g0[f.cond];
         int line = f.fi < 0 ? f.node : c.in(f.node)[f.fi];
@@ -233,7 +238,11 @@ struct Sim {
         };
         auto set = [&](int n, uint64_t v0, uint64_t v1) {
             w.f0[n] = v0; w.f1[n] = v1; w.stamp[n] = ep;
-            if (c.obs[n]) det |= (g0[n] & v1) | (g1[n] & v0);
+            if (c.obs[n]) {
+                uint64_t d = ((g0[n] & v1) | (g1[n] & v0)) & cm;
+                det |= d;
+                if (at && d) at->push_back({n, d});
+            }
             for (int k = c.foStart[n]; k < c.foStart[n + 1]; k++) {
                 int m = c.fo[k];
                 if (w.qstamp[m] != ep) {

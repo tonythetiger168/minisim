@@ -148,7 +148,24 @@ int main() {
         for (auto& x : words) x = rng.next();
         sim.good(words);
         for (const Fault& f : fl) {
-            uint64_t m = sim.detect(w, f);
+            std::vector<std::pair<int, uint64_t>> at;
+            uint64_t m = sim.detect(w, f, &at);
+            // Where it fails: the union over the observe nodes is the mask,
+            // and each node named really differs in the scalar simulation.
+            uint64_t all = 0;
+            for (auto& [node, mask] : at) {
+                all |= mask;
+                assert(c.obs[node] && mask);
+                int b = __builtin_ctzll(mask);
+                std::vector<int> pi(ni);
+                for (size_t i = 0; i < ni; i++) pi[i] = (int)(words[i] >> b & 1);
+                std::vector<int> g = run(c, pi, nullptr), bad = run(c, pi, &f);
+                if (g[node] == 2 || bad[node] == 2 || g[node] == bad[node]) {
+                    std::printf("round %d: observe node %d does not fail in pattern %d\n", round, node, b);
+                    return 1;
+                }
+            }
+            if (all != m) { std::printf("round %d: fail masks do not add up\n", round); return 1; }
             for (int b = 0; b < 64; b += 7) {
                 std::vector<int> pi(ni);
                 for (size_t i = 0; i < ni; i++) pi[i] = (int)(words[i] >> b & 1);
