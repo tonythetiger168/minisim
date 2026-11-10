@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Condition and FSM coverage (as VCS `-cm cond+fsm`): `msim -cov` (or
+  `-cm <metrics>`) also records, for every `&&` / `||` / `?:` condition, the
+  vectors in which each term decides the result, and, for every state
+  register it extracts (two-process, one-process and `if (state == S)`
+  styles; enum, parameter and literal states), the states entered and the
+  transitions made out of those the next-state logic allows. Works in the
+  interpreter and with `-compile`, with any `-threads`, with the same
+  database. `mcov report` adds `Condition:` and `FSM:` lines, `-detail`,
+  `-uncovered`, `-fsm-reset-filter`, `-min-cond`, `-min-fsm-state`,
+  `-min-fsm-trans`, and FSM and condition sections in the HTML report;
+  `mcov merge` merges both.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.

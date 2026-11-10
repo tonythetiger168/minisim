@@ -297,6 +297,7 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
 // new(args) of a covergroup (19.3): the instance's handle. A ref argument
 // passes the signal it names; the others pass their values.
 E cgNew(const slang::ast::Expression& e, std::span<const slang::ast::Expression* const> args) {
+    NoCondCov off(condCovOff);
     using namespace slang::ast;
     const auto& t = e.type->getCanonicalType().as<CovergroupType>();
     int d = cgDefOf(t);

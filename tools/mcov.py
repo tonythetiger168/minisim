@@ -7,11 +7,22 @@
     mcov report all.json -html cov_html       # annotated sources
     mcov report all.json -lcov all.info       # for genhtml, IDEs, CI services
     mcov report all.json -min-line 90         # exit 1 below 90% line coverage
+    mcov report all.json -detail              # every condition vector, FSM state and transition
 
 A database holds line hits, branch outcomes (each if / case arm / loop test
-taken true and false), and toggle masks (each signal bit seen rising 0->1 and
-falling 1->0). Merging adds hit counts and ORs the toggle masks, matched by
-file path and line, and by signal name.
+taken true and false), toggle masks (each signal bit seen rising 0->1 and
+falling 1->0), condition vectors and FSMs. Merging adds hit counts and ORs
+the toggle masks, matched by file path and line, and by signal name.
+
+Condition coverage (as VCS -cm cond): a condition a && b && c, a || b || c,
+or the condition of ?: with n terms has n + 1 vectors: the one where no term
+decides alone (all 1 for &&, all 0 for ||), and for each term the one where
+only that term has the deciding value (0 for &&, 1 for ||).
+
+FSM coverage (as VCS -cm fsm): for each state register msim extracted, the
+states entered and the transitions made, out of those its next-state logic
+can make. Transitions into a state the register's reset branch assigns are
+marked; -fsm-reset-filter leaves them out of the score.
 
 Exit status: 0, or 1 when a -min-* threshold is not met, 2 on bad usage.
 """
@@ -43,6 +54,16 @@ def load_into(db, path):
     files = d["files"]
     lines, branches, toggles = db["lines"], db["branches"], db["toggles"]
     db["tests"] += d.get("tests", [os.path.basename(path)])
+    conds = db["conds"]
+    for fi, ln, col, op, text, terms, hits in d.get("conditions", ()):
+        add_cond(conds, (files[fi], ln, col, text), op, tuple(terms), hits)
+    fsms = db["fsms"]
+    for m in d.get("fsms", ()):
+        add_fsm(fsms, (m["module"], m["inst"], m["name"]),
+                {"file": files[m["file"]], "line": m["line"], "width": m["width"],
+                 "states": {v: [name, h] for v, name, h in m["states"]},
+                 "trans": {(a, b): [h, r] for a, b, h, r in m["trans"]},
+                 "extra": {(a, b): h for a, b, h in m.get("extra", ())}})
     get = lines.get
     for fi, ln, hits in d["lines"]:
         k = (files[fi], ln)
@@ -58,8 +79,39 @@ def load_into(db, path):
     return db
 
 
+def add_cond(conds, key, op, terms, hits):
+    old = conds.get(key)
+    if old is None or len(old[2]) != len(hits):
+        conds[key] = (op, terms, list(hits))
+    else:
+        h = old[2]
+        for i, v in enumerate(hits):
+            h[i] += v
+
+
+def add_fsm(fsms, key, m):
+    old = fsms.get(key)
+    if old is None:
+        fsms[key] = {"file": m["file"], "line": m["line"], "width": m["width"],
+                     "states": {v: list(x) for v, x in m["states"].items()},
+                     "trans": {t: list(x) for t, x in m["trans"].items()},
+                     "extra": dict(m["extra"])}
+        return
+    for v, (name, h) in m["states"].items():
+        st = old["states"].setdefault(v, [name, 0])
+        st[1] += h
+    for t, (h, r) in m["trans"].items():
+        tr = old["trans"].setdefault(t, [0, r])
+        tr[0] += h
+        tr[1] = tr[1] and r
+    for t, h in m["extra"].items():
+        old["extra"][t] = old["extra"].get(t, 0) + h
+    for t in [t for t in old["extra"] if t in old["trans"]]:   # listed by another run's database
+        old["trans"][t][0] += old["extra"].pop(t)
+
+
 def empty():
-    return {"lines": {}, "branches": {}, "toggles": {}, "tests": []}
+    return {"lines": {}, "branches": {}, "toggles": {}, "conds": {}, "fsms": {}, "tests": []}
 
 
 def load(path):
@@ -76,6 +128,10 @@ def merge(dbs):
 def merge_into(out, db):
     out["tests"] += db["tests"]
     lines, branches, toggles = out["lines"], out["branches"], out["toggles"]
+    for k, (op, terms, hits) in db["conds"].items():
+        add_cond(out["conds"], k, op, terms, hits)
+    for k, m in db["fsms"].items():
+        add_fsm(out["fsms"], k, m)
     if not lines and not branches and not toggles:
         lines.update(db["lines"]); branches.update(db["branches"]); toggles.update(db["toggles"])
         return out
@@ -131,7 +187,8 @@ def load_all(paths, jobs=0):
 
 
 def save(db, path):
-    files = sorted({k[0] for k in db["lines"]} | {k[0] for k in db["branches"]})
+    files = sorted({k[0] for k in db["lines"]} | {k[0] for k in db["branches"]} | {k[0] for k in db["conds"]} |
+                   {m["file"] for m in db["fsms"].values()})
     idx = {f: i for i, f in enumerate(files)}
     hexw = lambda v, w: format(v, "x").rjust((w + 3) // 4, "0")
     # One entry per line, like msim writes it. Built with json.dumps per row:
@@ -147,7 +204,16 @@ def save(db, path):
         f.write('"branches": [\n' + rows([idx[fl], ln, n, t, fa] for (fl, ln, n), (t, fa)
                                          in sorted(db["branches"].items())) + "\n],\n")
         f.write('"toggles": [\n' + rows([name, w, hexw(r, w), hexw(fa, w)] for name, (w, r, fa)
-                                        in sorted(db["toggles"].items())) + "\n]\n}\n")
+                                        in sorted(db["toggles"].items())) + "\n],\n")
+        f.write('"conditions": [\n' + rows([idx[fl], ln, col, op, text, list(terms), hits]
+                                           for (fl, ln, col, text), (op, terms, hits) in sorted(db["conds"].items()))
+                + "\n],\n")
+        f.write('"fsms": [\n' + rows({"module": mod, "inst": inst, "name": name, "file": idx[m["file"]],
+                                      "line": m["line"], "width": m["width"],
+                                      "states": [[v, n, h] for v, (n, h) in sorted(m["states"].items())],
+                                      "trans": [[a, b, h, r] for (a, b), (h, r) in sorted(m["trans"].items())],
+                                      "extra": [[a, b, h] for (a, b), h in sorted(m["extra"].items())]}
+                                     for (mod, inst, name), m in sorted(db["fsms"].items())) + "\n]\n}\n")
 
 
 def by_file(db):
@@ -187,6 +253,88 @@ def summarize(db, exclude, files=None):
     return per, tog_hit, tog_all
 
 
+def cond_summary(db, exclude):
+    """(vectors hit, vectors, conditions) of the conditions not excluded."""
+    rx = re.compile(exclude) if exclude else None
+    hit = tot = n = 0
+    for (f, _, _, _), (_, _, hits) in db["conds"].items():
+        if rx and rx.search(f):
+            continue
+        n += 1
+        tot += len(hits)
+        hit += sum(1 for h in hits if h > 0)
+    return hit, tot, n
+
+
+def fsm_score(m, reset_filter):
+    """(states hit, states, transitions hit, transitions) of one FSM."""
+    sh = sum(1 for _, h in m["states"].values() if h > 0)
+    tr = [h for h, r in m["trans"].values() if not (reset_filter and r)]
+    return sh, len(m["states"]), sum(1 for h in tr if h > 0), len(tr)
+
+
+def fsm_summary(db, exclude, reset_filter):
+    rx = re.compile(exclude) if exclude else None
+    tot = [0, 0, 0, 0]
+    n = 0
+    for (mod, inst, name), m in db["fsms"].items():
+        if rx and (rx.search(m["file"]) or rx.search(f"{inst}.{name}")):
+            continue
+        n += 1
+        for i, v in enumerate(fsm_score(m, reset_filter)):
+            tot[i] += v
+    return tot, n
+
+
+def cond_rows(op, terms, hits):
+    """One (values per term, hits) row per vector of a condition, in report order."""
+    n = len(terms)
+    if op == "?:":
+        return [(("1",), hits[0]), (("0",), hits[1])]
+    base, dec = ("0", "1") if op == "||" else ("1", "0")
+    rows = [((base,) * n, hits[0])]
+    for i in range(n):
+        rows.append((tuple(dec if j == i else base for j in range(n)), hits[i + 1]))
+    return rows
+
+
+def detail_text(db, exclude, reset_filter, uncovered_only):
+    rx = re.compile(exclude) if exclude else None
+    out = []
+    for (f, ln, col, text), (op, terms, hits) in sorted(db["conds"].items()):
+        if rx and rx.search(f):
+            continue
+        if uncovered_only and all(h > 0 for h in hits):
+            continue
+        out.append(f"\nCondition {f}:{ln}:{col}  {text}")
+        for i, t in enumerate(terms, 1):
+            out.append(f"    -{i}- {t}")
+        out.append("    " + " ".join(f"-{i}-" for i in range(1, len(terms) + 1)) + "  Hits")
+        for vals, h in cond_rows(op, terms, hits):
+            out.append("    " + " ".join(f"{v:^{len(str(i)) + 2}}" for i, v in enumerate(vals, 1)) +
+                       f"  {h if h else 'Not covered'}")
+    for (mod, inst, name), m in sorted(db["fsms"].items()):
+        if rx and (rx.search(m["file"]) or rx.search(f"{inst}.{name}")):
+            continue
+        sh, st, th, tt = fsm_score(m, reset_filter)
+        if uncovered_only and sh == st and th == tt and not m["extra"]:
+            continue
+        nm = lambda v: m["states"][v][0] if v in m["states"] else f"{m['width']}'h{v:x}"
+        out.append(f"\nFSM {inst}.{name}  (module {mod}, {m['file']}:{m['line']})  "
+                   f"states {sh}/{st}, transitions {th}/{tt}")
+        for v, (n, h) in sorted(m["states"].items()):
+            if not uncovered_only or not h:
+                out.append(f"    state {n:<20} {h if h else 'Not covered'}")
+        for (a, b), (h, r) in sorted(m["trans"].items()):
+            if reset_filter and r:
+                continue
+            if not uncovered_only or not h:
+                out.append(f"    {nm(a) + ' -> ' + nm(b):<26} {h if h else 'Not covered'}{'  (reset)' if r else ''}")
+        for (a, b), h in sorted(m["extra"].items()):
+            out.append(f"    {nm(a) + ' -> ' + nm(b):<26} {h}  (not in the next-state logic)")
+    return "\n".join(out)
+
+
 def write_lcov(db, path, exclude, files=None):
     files = files if files is not None else by_file(db)
     rx = re.compile(exclude) if exclude else None
@@ -208,7 +356,7 @@ def write_lcov(db, path, exclude, files=None):
         f.write("".join(out))
 
 
-def write_html(db, outdir, exclude, files=None):
+def write_html(db, outdir, exclude, files=None, reset_filter=False):
     os.makedirs(outdir, exist_ok=True)
     files = files if files is not None else by_file(db)
     per, th, ta = summarize(db, exclude, files)
@@ -260,11 +408,44 @@ def write_html(db, outdir, exclude, files=None):
                         f"{' ...' if len(missing) > 32 else ''}</td></tr>")
     lh = sum(v[0] for v in per.values()); lt = sum(v[1] for v in per.values())
     bh = sum(v[2] for v in per.values()); bt = sum(v[3] for v in per.values())
+    esc = html.escape
+    cell = lambda h: f"<td class='{'hit' if h else 'miss'}'>{h if h else 'Not covered'}</td>"
+    ch, ct, cn = cond_summary(db, exclude)
+    (sh, st, xh, xt), fn = fsm_summary(db, exclude, reset_filter)
+    conds = []
+    for (src, ln, col, text), (op, terms, hits) in sorted(db["conds"].items()):
+        if rx and rx.search(src):
+            continue
+        head = "".join(f"<th>{esc(t)}</th>" for t in terms)
+        body = "".join("<tr>" + "".join(f"<td>{v}</td>" for v in vals) + cell(h) + "</tr>"
+                       for vals, h in cond_rows(op, terms, hits))
+        conds.append(f"<h3>{esc(src)}:{ln} &nbsp; <code>{esc(text)}</code></h3>"
+                     f"<table><tr>{head}<th>Hits</th></tr>{body}</table>")
+    fsms = []
+    for (mod, inst, name), m in sorted(db["fsms"].items()):
+        if rx and (rx.search(m["file"]) or rx.search(f"{inst}.{name}")):
+            continue
+        nm = lambda v: m["states"][v][0] if v in m["states"] else f"{m['width']}'h{v:x}"
+        a, b, c, d = fsm_score(m, reset_filter)
+        srow = "".join(f"<tr><td>{esc(n)}</td><td>{m['width']}'h{v:x}</td>{cell(h)}</tr>"
+                       for v, (n, h) in sorted(m["states"].items()))
+        trow = "".join(f"<tr><td>{esc(nm(x))} &rarr; {esc(nm(y))}</td><td>{'reset' if r else ''}</td>{cell(h)}</tr>"
+                       for (x, y), (h, r) in sorted(m["trans"].items()) if not (reset_filter and r))
+        trow += "".join(f"<tr class='part'><td>{esc(nm(x))} &rarr; {esc(nm(y))}</td><td>not in the next-state logic</td>"
+                        f"<td>{h}</td></tr>" for (x, y), h in sorted(m["extra"].items()))
+        fsms.append(f"<h3>{esc(inst)}.{esc(name)} &nbsp; (module {esc(mod)}, {esc(m['file'])}:{m['line']})</h3>"
+                    f"<p>States {a}/{b}, transitions {c}/{d}</p>"
+                    f"<table><tr><th>State</th><th>Value</th><th>Hits</th></tr>{srow}</table><br>"
+                    f"<table><tr><th>Transition</th><th></th><th>Hits</th></tr>{trow}</table>")
     with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
         f.write(f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>mcov</title><style>{style}</style>"
                 f"</head><body><h1>Coverage</h1><p>{len(db['tests'])} run(s). Line {pct(lh, lt):.1f}% ({lh}/{lt}), "
-                f"branch {pct(bh, bt):.1f}% ({bh}/{bt}), toggle {pct(th, ta):.1f}% ({th}/{ta} bits)</p>"
+                f"branch {pct(bh, bt):.1f}% ({bh}/{bt}), toggle {pct(th, ta):.1f}% ({th}/{ta} bits), "
+                f"condition {pct(ch, ct):.1f}% ({ch}/{ct} vectors), FSM states {pct(sh, st):.1f}% ({sh}/{st}), "
+                f"FSM transitions {pct(xh, xt):.1f}% ({xh}/{xt})</p>"
                 f"<table><tr><th>File</th><th>Line</th><th>Branch</th></tr>{''.join(rows)}</table>"
+                f"<h2>FSMs</h2>{''.join(fsms) or '<p>None found.</p>'}"
+                f"<h2>Conditions</h2>{''.join(conds) or '<p>None.</p>'}"
                 f"<h2>Signals not fully toggled</h2><table><tr><th>Signal</th><th>Bits toggled both ways</th>"
                 f"<th>Missing bits</th></tr>{''.join(togs)}</table></body></html>")
 
@@ -283,7 +464,11 @@ def main(argv=None):
     r.add_argument("-lcov", metavar="FILE")
     r.add_argument("-exclude", metavar="REGEX", help="leave out files / signals matching this")
     r.add_argument("-j", type=int, default=0, help="worker processes for loading (default: available CPUs)")
-    for k in ("line", "branch", "toggle"):
+    r.add_argument("-detail", action="store_true", help="list every condition vector, FSM state and transition")
+    r.add_argument("-uncovered", action="store_true", help="as -detail, only what is not covered")
+    r.add_argument("-fsm-reset-filter", action="store_true",
+                   help="leave transitions into reset states out of FSM coverage")
+    for k in ("line", "branch", "toggle", "cond", "fsm-state", "fsm-trans"):
         r.add_argument(f"-min-{k}", type=float, metavar="PCT", help=f"exit 1 if {k} coverage is below PCT")
     a = ap.parse_args(argv)
 
@@ -302,15 +487,24 @@ def main(argv=None):
         print(f"{f:<{w}}  {pct(a1, a2):6.1f}% {a1:>4}/{a2:<4}  {pct(b1, b2):6.1f}% {b1:>4}/{b2:<4}")
     print(f"{'Total':<{w}}  {pct(lh, lt):6.1f}% {lh:>4}/{lt:<4}  {pct(bh, bt):6.1f}% {bh:>4}/{bt:<4}")
     print(f"Toggle: {pct(th, ta):.1f}% ({th}/{ta} bits toggled both ways), {len(db['tests'])} run(s)")
+    ch, ct, cn = cond_summary(db, a.exclude)
+    (sh, st, xh, xt), fn = fsm_summary(db, a.exclude, a.fsm_reset_filter)
+    print(f"Condition: {pct(ch, ct):.1f}% ({ch}/{ct} vectors of {cn} condition(s))")
+    print(f"FSM: states {pct(sh, st):.1f}% ({sh}/{st}), transitions {pct(xh, xt):.1f}% ({xh}/{xt}) of {fn} FSM(s)")
+    if a.detail or a.uncovered:
+        text = detail_text(db, a.exclude, a.fsm_reset_filter, a.uncovered)
+        if text:
+            print(text)
     if a.html:
-        write_html(db, a.html, a.exclude, files)
+        write_html(db, a.html, a.exclude, files, a.fsm_reset_filter)
         print(f"HTML: {os.path.join(a.html, 'index.html')}")
     if a.lcov:
         write_lcov(db, a.lcov, a.exclude, files)
         print(f"LCOV: {a.lcov}")
     rc = 0
-    for k, (hit, tot) in {"line": (lh, lt), "branch": (bh, bt), "toggle": (th, ta)}.items():
-        lim = getattr(a, f"min_{k}")
+    for k, (hit, tot) in {"line": (lh, lt), "branch": (bh, bt), "toggle": (th, ta), "cond": (ch, ct),
+                          "fsm-state": (sh, st), "fsm-trans": (xh, xt)}.items():
+        lim = getattr(a, "min_" + k.replace("-", "_"))
         if lim is not None and pct(hit, tot) < lim:
             print(f"mcov: {k} coverage {pct(hit, tot):.1f}% is below {lim}%")
             rc = 1

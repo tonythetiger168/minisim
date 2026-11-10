@@ -106,6 +106,28 @@ inline uint32_t covFileId(const std::string& path) {
     if (fresh) g_covFiles.push_back(path);
     return it->second;
 }
+// Condition coverage: one entry per instrumented condition (see
+// Op::CondCov). Its counters are g_condHits[base .. base + terms.size()].
+struct CondDef {
+    uint32_t file = 0, line = 0, col = 0;
+    bool isOr = false;
+    std::string text;                 // the whole condition, as written
+    std::vector<std::string> terms;   // each term, as written
+    size_t base = 0;
+};
+inline std::vector<CondDef>& condDefs() { static std::vector<CondDef> d; return d; }
+// FSM coverage: a state register found by the lowerer (lower_fsm.inc), its
+// states and the transitions its next-state logic can make. The kernel
+// records the values the register takes and each change (Sim::covFsm).
+struct FsmDef {
+    std::string module, inst, name;   // definition, instance path, register
+    uint32_t file = 0, line = 0;
+    int sig = -1, w = 0;
+    std::vector<std::pair<uint64_t, std::string>> states;   // value, name
+    struct Tr { uint64_t from, to; bool reset; };            // reset: to a state the block's reset branch assigns
+    std::vector<Tr> trans;
+};
+inline std::vector<FsmDef>& fsmDefs() { static std::vector<FsmDef> d; return d; }
 // Relaxed atomic add: a task body can run on two worker threads at once.
 inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
 

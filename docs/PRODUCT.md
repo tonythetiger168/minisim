@@ -17,7 +17,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mlint** | Lint and clock-domain checks on the elaborated design: latches, assignment kind, multiple drivers, missing synchronizers, multi-bit crossings | Shipping next |
 | **mvp** | Virtual prototypes: an AXI4-Lite bridge from the design to C, C++ or SystemC/TLM-2.0 models, with a memory map, interrupt lines and timed callbacks; a memory and a UART bundled | Shipping next |
 | **mdft** | Design-for-test: scan-readiness checks (gated clocks, logic-driven resets, latches, mixed edges, combinational loops) and a per-domain flop count for chain planning | Shipping next |
-| **mcov** | Code coverage (line, branch, toggle) merged across a regression, text / HTML / LCOV reports and gates; covergroups with the spec work | Code coverage shipping in 0.2 |
+| **mcov** | Code coverage (line, branch, toggle, condition, FSM) merged across a regression, text / HTML / LCOV reports and gates; covergroups with the spec work | Code coverage shipping in 0.2 |
 | **mwave** | Waveforms for GTKWave / Surfer: hierarchical VCD and compressed FST (shipping in 0.2); `$dumpfile` / `$dumpvars` scoping and transaction views next | Partly shipping in 0.2 |
 
 All of them install from one package (`minisim_x.y.z_amd64.deb` /
