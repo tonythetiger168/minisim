@@ -808,6 +808,24 @@ struct Shell {
             return std::string("1");
         });
 
+        cmd("report_resources", "report_resources: the word-level operators of the design (adders, multipliers, comparators, shifters) and flops with an enable", [this](Words&) {
+            if (!des) throw tcl::Error("no design; run elaborate first");
+            header("resources");
+            static const char* names[] = {"add", "sub", "mult", "less-than", "equal", "shift-left", "shift-right", "arith-shift-right"};
+            std::map<std::pair<int, size_t>, int> count;
+            for (auto& op : des->ops) count[{(int)op.kind, op.a.size()}]++;
+            outf("%-20s %8s %8s\n", "Operator", "Width", "Count");
+            out(std::string(38, '-') + "\n");
+            for (auto& [k, n] : count) outf("%-20s %8zu %8d\n", names[k.first], k.second, n);
+            size_t en = 0;
+            for (auto& f : des->g.flops) {
+                Lit e, d;
+                en += flopEnable(des->g, f, e, d);
+            }
+            outf("\nFlip-flops: %zu, of which %zu load under an enable.\n", des->g.flops.size(), en);
+            return std::string();
+        });
+
         // ---- reports
         cmd("report_area", "report_area: cell counts and area", [this](Words&) { reportArea(); return std::string(); });
         cmd("report_timing", "report_timing [-max_paths N]: the worst paths", [this](Words& w) {

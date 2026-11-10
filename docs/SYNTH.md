@@ -64,7 +64,7 @@ off). The netlist is the same for any thread count.
 | Constraints | `create_clock`, `set_input_delay`, `set_output_delay`, `set_load`, `set_clock_uncertainty`, `set_input_transition`, `set_max_fanout`, `set_max_area` |
 | Objects | `get_ports`, `all_inputs`, `all_outputs`, `get_clocks`, `all_clocks`, `get_cells`, `all_registers`, `remove_from_collection`, `sizeof_collection` |
 | Synthesis | `compile [-map_effort high]`, `compile_ultra` |
-| Reports | `report_area`, `report_timing [-max_paths N]`, `report_qor`, `report_cell`, `report_reference`, `report_constraint -all_violators` |
+| Reports | `report_resources` (word-level operators, before `compile`), `report_area`, `report_timing [-max_paths N]`, `report_qor`, `report_cell`, `report_reference`, `report_constraint -all_violators` |
 | Write | `write -format verilog -output f`, `write_verilog f`, `write_sdc f` |
 | Shell | `redirect file {cmd}`, `cmd > file`, `cmd >> file`, `set_app_var`, `set_host_options -max_cores N`, `source`, `help`, `exit`, and Tcl (`set`, `expr`, `if`, `foreach`, `for`, `while`, `proc`, lists, strings, `format`) |
 

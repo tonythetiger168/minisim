@@ -94,6 +94,10 @@ check("unknown command", rc == 1 and "frobnicate" in out and "Mapped design" in 
 rc, out = run(head + "report_area\n")
 check("no design", rc == 1 and "compile first" in out, out)
 
+# Word-level operators are kept beside the bits (Design::ops).
+rc, out = run("analyze {%s/alu.sv}\nelaborate alu\nreport_resources\n" % src, ["-q"])
+check("resources", rc == 0 and re.search(r"mult\s+16\s+1\b", out) is not None and re.search(r"sub\s+16\s+1\b", out) is not None, out)
+
 # One step from the command line.
 net = os.path.join(work, "one.v")
 r = subprocess.run([msynth, os.path.join(src, "counter.sv"), "-top", "counter", "-period", "2", "-o", net, "-threads", "2"],
