@@ -956,6 +956,16 @@ private:
                 fi = {w, false};
                 return true;
             }
+            case Op::DynSlice: {   // a[i +: w]: X when any of it is outside a
+                if (e->lo || e->kids.size() != 2) return false;
+                if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
+                int w = e->hi;
+                if (w < 1 || w > fa.w) return false;
+                out = "((" + A + " >> ((" + B + ") & 63)) & " + M(w) + ")";
+                fxOor_.push_back("(uint64_t)(" + B + ") > " + std::to_string(fa.w - w));
+                fi = {w, false};
+                return true;
+            }
             case Op::Mux:
                 if (!kid(0, C, fc) || !kid(1, A, fa) || !kid(2, B, fb)) return false;
                 // v_mux returns the chosen arm as is: its own width and signedness.
@@ -975,28 +985,38 @@ private:
         if (!twoState) return false;
         FastInfo fi{};
         std::vector<int> refs;
+        fxOor_.clear();
         if (!fx(e, u64, fi, refs)) return false;
+        // A run-time select that may fall outside its vector (the result is
+        // then X): only where the caller tests the guard (dynOk_).
+        if (!fxOor_.empty() && !dynOk_) return false;
         std::sort(refs.begin(), refs.end());
         refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
         std::string g;
         for (int r : refs) g += (g.empty() ? "" : " | ") + xRef(r);
         guard = g.empty() ? "" : "(" + g + ") == 0";
+        for (auto& c : fxOor_) guard += (guard.empty() ? "" : " && ") + ("!(" + c + ")");
         return true;
     }
+    std::vector<std::string> fxOor_;   // fx: conditions under which the 2-state value does not hold
+    bool dynOk_ = false;
     std::string fast(const E& e) {
         std::string slow = ex(e);
         if (!twoState) return slow;
         std::string f;
         FastInfo fi{};
         std::vector<int> refs;
+        fxOor_.clear();
         if (!fx(e, f, fi, refs)) return slow;
         std::sort(refs.begin(), refs.end());
         refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
         std::string g;
         for (int r : refs) g += (g.empty() ? "" : " | ") + xRef(r);
+        if (!g.empty()) g = "(" + g + ") == 0";
+        for (auto& c : fxOor_) g += (g.empty() ? "" : " && ") + ("!(" + c + ")");
         std::string val = "Val{" + f + ", 0, " + std::to_string(fi.w) + ", 0, " + (fi.sgn ? "true" : "false") + "}";
         if (g.empty()) return val;
-        return "((" + g + ") == 0 ? " + val + " : " + slow + ")";
+        return "(" + g + " ? " + val + " : " + slow + ")";
     }
 
     // The write of an Assign, with `val` as the value (default: its expression).
@@ -1233,6 +1253,7 @@ private:
     std::string fassign(const Instr& i) {
         std::ostringstream o;
         std::string g, u, sl;
+        struct Dyn { bool& f; Dyn(bool& x) : f(x) { f = true; } ~Dyn() { f = false; } } dyn(dynOk_);   // every split below is guarded
         if (i.bidx) {   // v[i] = ...: the bits are chosen at run time
             bool pv = isPriv(i.sig);
             int W = sigW_[i.sig];
