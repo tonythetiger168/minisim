@@ -27,11 +27,11 @@ def run(args, ok=(0,)):
     return p
 
 def cells(path):
-    """cell -> list of (table name, [numbers]) in file order; plus pin capacitances."""
+    """cell -> list of (table name, [numbers]) in file order; plus pin capacitances and pulse widths."""
     text = re.sub(r"/\*.*?\*/", "", open(path).read(), flags=re.S)
     out = {}
     cur = None
-    pat = re.compile(r"cell \((\w+)\)|(\w+) \(\w+\) \{[^{}]*?values \((.*?)\);|capacitance : ([-\d.e]+);", re.S)
+    pat = re.compile(r"cell \((\w+)\)|(\w+) \(\w+\) \{[^{}]*?values \((.*?)\);|capacitance : ([-\d.e]+);|(min_pulse_width_\w+) : ([-\d.e]+);", re.S)
     for m in pat.finditer(text):
         if m.group(1):
             cur = out.setdefault(m.group(1), [])
@@ -39,8 +39,10 @@ def cells(path):
             continue
         elif m.group(2):
             cur.append((m.group(2), [float(x) for x in re.findall(r"-?\d+\.?\d*(?:e-?\d+)?", m.group(3))]))
-        else:
+        elif m.group(4):
             cur.append(("capacitance", [float(m.group(4))]))
+        else:
+            cur.append((m.group(5), [float(m.group(6))]))
     return out
 
 # 1. the RC inverter
@@ -61,7 +63,7 @@ if os.path.exists(rc):
 
 # 2. mini45 again, from the tree
 lib = os.path.join(src, "lib/mini45")
-names = ["INV_X1", "NAND2_X2", "DFFR_X1"]
+names = ["INV_X1", "NAND2_X2", "DFFR_X1", "TBUF_X1"]
 common = ["-lib", os.path.join(lib, "mini45_tt.lib"), "-spice", os.path.join(lib, "mini45.sp"),
           "-models", os.path.join(lib, "mini45_models_tt.sp"), "-keep", "leakage", "-q"]
 for n in names:

@@ -85,8 +85,9 @@ saturation or subthreshold current, so:
 
 - **Leakage is analytic**, not measured: a per-cell value by input state,
   scaled by corner (a level-1 transistor does not leak when it is off).
-- **Tristate enable and disable arcs** (`TBUF`) and **minimum pulse widths**
-  are analytic too: `mchar` does not measure them yet.
+- **Tristate disable arcs** (`TBUF`) are analytic too: `mchar` does not
+  measure them yet. The enable arcs and the minimum pulse widths are
+  measured.
 
 The generator still holds the analytic model (logical effort for delay,
 simple energy and leakage rules) these come from; it also writes the

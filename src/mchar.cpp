@@ -76,6 +76,7 @@ struct Logic {
     bool ff = false, latch = false;
     Expr clockedOn, nextState, enable, dataIn, clear, preset;
     bool hasClear = false, hasPreset = false;
+    int track = -1;                               // the output whose held level a State follows
 
     int in(const std::string& n) const {
         for (size_t i = 0; i < ins.size(); i++) if (ins[i] == n) return (int)i;
@@ -142,14 +143,23 @@ Logic logicOf(const Group& cell) {
 struct State {
     uint32_t v = 0;
     bool a = false, b = true;
-    uint32_t key() const { return v << 2 | (a ? 2u : 0u) | (b ? 1u : 0u); }
+    int held = 2;                     // Logic::track's level, kept on its load while undriven: 0, 1, 2 unknown
+    uint32_t key() const { return v << 4 | (uint32_t)held << 2 | (a ? 2u : 0u) | (b ? 1u : 0u); }
 };
+
+int heldAfter(const Logic& L, const State& n, int before) {
+    if (L.track < 0) return 2;
+    if (!L.driven(L.track, n.v, n.a) && !L.driven(L.track, n.v, n.b)) return before;
+    if (n.a != n.b || !L.driven(L.track, n.v, n.a)) return 2;
+    return L.outv(L.track, n.v, n.a) ? 1 : 0;
+}
 
 State flip(const Logic& L, State s, int pin) {
     State n;
     n.v = s.v ^ (1u << pin);
     n.a = L.step(s.v, n.v, s.a);
     n.b = L.step(s.v, n.v, s.b);
+    n.held = heldAfter(L, n, s.held);
     return n;
 }
 
@@ -161,6 +171,7 @@ bool plan(const Logic& L, Goal&& goal, std::vector<int>& flips, State& at) {
     State s0;
     s0.a = L.step(0, 0, false);
     s0.b = L.ff || L.latch ? L.step(0, 0, true) : s0.a;   // no state: one copy
+    s0.held = heldAfter(L, s0, 2);
     std::map<uint32_t, std::pair<uint32_t, int>> from;   // key -> (previous key, pin)
     std::map<uint32_t, State> seen;
     std::vector<State> q{s0};
@@ -427,6 +438,12 @@ struct ConsJob {      // one constraint table
     std::string err;
 };
 
+struct PulseJob {     // min_pulse_width_high or _low of a pin
+    Group* pin = nullptr;
+    bool high = false;
+    Point pt;
+};
+
 struct CapJob {
     Group* pin = nullptr;
     Point pt;
@@ -442,6 +459,7 @@ struct CellWork {
     Logic L;
     std::vector<ArcJob> arcs;
     std::vector<ConsJob> cons;
+    std::vector<PulseJob> pulses;
     std::vector<CapJob> caps;
     std::vector<LeakJob> leaks;
     int kept = 0;                           // timing groups left as the template has them
@@ -468,12 +486,26 @@ struct Char {
     // ------------------------------------------------------ delay arcs
     // Input direction pd (true: rising) for output edge `rise` of this arc.
     bool arcPlan(const CellWork& w, const ArcJob& j, bool pd, std::vector<int>& flips, State& at) const {
-        const Logic& L = w.L;
-        int p = L.in(j.related), o = L.out(j.out);
-        if (p < 0 || o < 0 || !L.hasFn[o]) return false;
+        int p = w.L.in(j.related), o = w.L.out(j.out);
+        if (p < 0 || o < 0 || !w.L.hasFn[o]) return false;
         Expr when;
         bool hasWhen = !j.when.empty();
         if (hasWhen) when = liberty::parseFunction(j.when);
+        if (j.type == "three_state_enable") {
+            // The output starts undriven with the other level left on its
+            // load, and the pin's edge makes the cell drive it.
+            Logic L = w.L;
+            L.track = o;
+            return plan(L, [&](const State& s) {
+                if ((((s.v >> p) & 1) != 0) == pd) return false;
+                State n = flip(L, s, p);
+                if (s.a != s.b || n.a != n.b) return false;
+                if (L.driven(o, s.v, s.a) || !L.driven(o, n.v, n.a)) return false;
+                if (hasWhen && (!L.eval(when, s.v, s.a) || !L.eval(when, n.v, n.a))) return false;
+                return s.held == (j.rise ? 0 : 1) && L.outv(o, n.v, n.a) == j.rise;
+            }, flips, at);
+        }
+        const Logic& L = w.L;
         return plan(L, [&](const State& s) {
             if ((((s.v >> p) & 1) != 0) == pd) return false;        // the pin must be at its old level
             State n = flip(L, s, p);
@@ -520,7 +552,8 @@ struct Char {
                 double tin = t0 + tr * (pd ? tech.inR : 1 - tech.inF);
                 double lo = (j.rise ? tech.sLoR : tech.sLoF) * V, hi = (j.rise ? tech.sHiR : tech.sHiF) * V;
                 double start = t.at(co, t0);
-                if (j.rise ? start > 0.001 * V : start < 0.999 * V) {
+                double rest = j.type == "three_state_enable" ? 0.05 : 0.001;   // an undriven load drifts
+                if (j.rise ? start > rest * V : start < (1 - rest) * V) {
                     if (attempt >= 7) throw std::runtime_error("the output did not settle before the edge");
                     tpre = 3 * tpre + 0.2e-9;
                     continue;
@@ -677,6 +710,91 @@ struct Char {
             pt.value = hi / tech.tUnit;
         } catch (const std::exception& e) {
             pt.err = e.what();
+        }
+    }
+
+    // ------------------------------------------------ min pulse width
+    struct PulsePlan {
+        std::vector<int> flips;
+        int out = -1;
+        bool expect = false;      // the output's value after the pulse
+        bool leading = false;     // it moves at the pulse's first edge
+    };
+
+    bool pulsePlan(const CellWork& w, const PulseJob& j, PulsePlan& pp) const {
+        const Logic& L = w.L;
+        int p = L.in(j.pin->name());
+        if (p < 0) return false;
+        State at;
+        return plan(L, [&](const State& s) {
+            if ((((s.v >> p) & 1) != 0) == j.high) return false;      // the pin idles at the other level
+            State s1 = flip(L, s, p), s2 = flip(L, s1, p);
+            if (s.a != s.b || s1.a != s1.b || s2.a != s2.b) return false;
+            for (int o = 0; o < (int)L.outs.size(); o++) {
+                if (!L.hasFn[o] || L.hasTri[o]) continue;
+                bool v0 = L.outv(o, s.v, s.a), v1 = L.outv(o, s1.v, s1.a), v2 = L.outv(o, s2.v, s2.a);
+                if (v2 == v0) continue;                               // the pulse leaves no mark here
+                pp.out = o;
+                pp.expect = v2;
+                pp.leading = v1 == v2;
+                return true;
+            }
+            return false;
+        }, pp.flips, at);
+    }
+
+    // The narrowest pulse (between the input thresholds) after which the
+    // cell ends where a wide pulse leaves it, no more than `degrade` later.
+    void pulsePoint(const CellWork& w, PulseJob& j, size_t deckId) const {
+        try {
+            PulsePlan pp;
+            if (!pulsePlan(w, j, pp)) throw std::runtime_error("no stimulus");
+            const Logic& L = w.L;
+            std::string pin = j.pin->name();
+            Deck d = deck(w);
+            std::string te = stimulus(L, pp.flips, d);
+            const char* idle = j.high ? "0" : "vdd";
+            const char* active = j.high ? "vdd" : "0";
+            auto& wv = d.wave[pin].pts;
+            wv.push_back({te, idle});
+            wv.push_back({te + "+tr", active});
+            wv.push_back({te + "+pw", active});
+            wv.push_back({te + "+pw+tr", idle});
+            d.params["pw"] = opt.range;
+            d.tstop = te + "+pw+tr+2*ts";
+            spice::Netlist nl = runner.read(d, deckId);
+            double tr = tech.ramp(4 * minSlew * tech.tUnit, true);
+            double t0 = (double)(pp.flips.size() + 1) * opt.settle;
+            double V = tech.vdd;
+            std::map<std::string, double> over = {{"tr", tr}, {"tmax", stepFor(tr)}};
+            const std::string outName = L.outs[pp.out];
+            double ref = NAN;
+            auto met = [&](double pw) {
+                over["pw"] = pw;
+                Trace t = run(nl, over);
+                int co = t.v(outName);
+                double end = t.last(co);
+                if (pp.expect ? end < 0.95 * V : end > 0.05 * V) return false;
+                double edge = t0 + 0.5 * tr + (pp.leading ? 0 : pw);
+                double tx = t.cross(co, 0.5 * V, pp.expect, t0);
+                if (!std::isfinite(tx)) return false;
+                if (!std::isfinite(ref)) ref = tx - edge;
+                return tx - edge <= ref * (1 + opt.degrade) + 1e-13;
+            };
+            double hi = std::max(opt.range, 2 * tr), lo = 1.02 * tr;   // at `tr` the pulse just reaches the rail
+            if (!met(hi)) throw std::runtime_error("no effect even with a pulse of " + num(hi / tech.tUnit));
+            if (met(lo)) {
+                j.pt.value = lo / tech.tUnit;
+                return;
+            }
+            double tol = std::max(2e-13, 1e-3 * tr);
+            while (hi - lo > tol) {
+                double mid = 0.5 * (hi + lo);
+                (met(mid) ? hi : lo) = mid;
+            }
+            j.pt.value = hi / tech.tUnit;
+        } catch (const std::exception& e) {
+            j.pt.err = e.what();
         }
     }
 
@@ -859,6 +977,9 @@ int main(int argc, char** argv) {
                 if (p.type != "pin") continue;
                 bool isOut = w.L.out(p.name()) >= 0;
                 if (!isOut && !opt.keep.count("caps") && p.has("capacitance")) w.caps.push_back({&p, {}});
+                if (!isOut && !opt.keep.count("constraints"))
+                    for (bool high : {true, false})
+                        if (p.has(high ? "min_pulse_width_high" : "min_pulse_width_low")) w.pulses.push_back({&p, high, {}});
                 for (auto& t : p.groups) {
                     if (t.type != "timing") continue;
                     std::string type = t.str("timing_type", "combinational");
@@ -866,7 +987,8 @@ int main(int argc, char** argv) {
                     bool cons = type.rfind("setup", 0) == 0 || type.rfind("hold", 0) == 0 ||
                                 type.rfind("recovery", 0) == 0 || type.rfind("removal", 0) == 0;
                     bool delay = type == "combinational" || type == "combinational_rise" || type == "combinational_fall" ||
-                                 type == "rising_edge" || type == "falling_edge" || type == "preset" || type == "clear";
+                                 type == "rising_edge" || type == "falling_edge" || type == "preset" || type == "clear" ||
+                                 type == "three_state_enable";
                     if (rel.find(' ') != std::string::npos || (!cons && !delay)) { w.kept++; continue; }
                     if (cons) {
                         if (opt.keep.count("constraints")) continue;
@@ -890,7 +1012,8 @@ int main(int argc, char** argv) {
                         j.when = t.str("when");
                         std::string sense = t.str("timing_sense", "non_unate");
                         // The related pin's edge: 1 rising, 0 falling.
-                        if (type == "rising_edge") j.tried[1] = true;
+                        if (type == "three_state_enable") j.tried[0] = j.tried[1] = true;   // whichever edge enables
+                        else if (type == "rising_edge") j.tried[1] = true;
                         else if (type == "falling_edge") j.tried[0] = true;
                         else if (sense == "positive_unate") j.tried[rise ? 1 : 0] = true;
                         else if (sense == "negative_unate") j.tried[rise ? 0 : 1] = true;
@@ -953,6 +1076,7 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < w.cons[j].pts.size(); k++) tasks.push_back({1, c, j, 0, k});
             for (size_t j = 0; j < w.caps.size(); j++) tasks.push_back({2, c, j, 0, 0});
             for (size_t j = 0; j < w.leaks.size(); j++) tasks.push_back({3, c, j, 0, 0});
+            for (size_t j = 0; j < w.pulses.size(); j++) tasks.push_back({4, c, j, 0, 0});
         }
         if (!opt.quiet)
             std::cout << "mchar " << MINISIM_VERSION << ": " << work.size() << " cells, " << tasks.size()
@@ -965,12 +1089,13 @@ int main(int argc, char** argv) {
             case 0: ch.arcPoint(w, w.arcs[t.job], (int)t.dir, t.idx, i); break;
             case 1: ch.consPoint(w, w.cons[t.job], t.idx, i); break;
             case 2: ch.capPoint(w, w.caps[t.job], i); break;
+            case 4: ch.pulsePoint(w, w.pulses[t.job], i); break;
             default: ch.leakPoint(w, w.leaks[t.job], i); break;
             }
         });
 
         // ---- write the numbers back, in order
-        int nArc = 0, nCons = 0, nCap = 0, nLeak = 0, nPower = 0, failed = 0, kept = 0;
+        int nArc = 0, nCons = 0, nCap = 0, nLeak = 0, nPower = 0, nPulse = 0, failed = 0, kept = 0;
         std::vector<std::string> problems;
         for (auto& w : work) {
             const std::string cn = w.g->name();
@@ -1035,6 +1160,16 @@ int main(int argc, char** argv) {
                 setValues(j.tab, v);
                 nCons++;
             }
+            for (auto& j : w.pulses) {
+                const char* attr = j.high ? "min_pulse_width_high" : "min_pulse_width_low";
+                if (!j.pt.err.empty()) {
+                    problems.push_back(cn + ": " + attr + " of " + j.pin->name() + ": " + j.pt.err + " (template value kept)");
+                    failed++;
+                    continue;
+                }
+                setAttr(*j.pin, attr, num(j.pt.value));
+                nPulse++;
+            }
             for (auto& j : w.caps) {
                 if (!j.pt.err.empty()) {
                     problems.push_back(cn + ": capacitance of " + j.pin->name() + ": " + j.pt.err + " (template value kept)");
@@ -1065,8 +1200,8 @@ int main(int argc, char** argv) {
         for (auto& p : problems) std::cerr << "mchar: " << p << "\n";
         if (!opt.quiet) {
             double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            std::printf("%d delay tables, %d constraint tables, %d power tables, %d pin capacitances, %d leakage values\n",
-                        nArc, nCons, nPower, nCap, nLeak);
+            std::printf("%d delay tables, %d constraint tables, %d pulse widths, %d power tables, %d pin capacitances, %d leakage values\n",
+                        nArc, nCons, nPulse, nPower, nCap, nLeak);
             if (kept) std::printf("%d timing groups of other kinds kept from the template\n", kept);
             if (noNetlist) std::printf("%d cell%s without a netlist: the template's numbers are kept\n", noNetlist, noNetlist == 1 ? "" : "s");
             std::printf("%d failed; wrote %s in %.1f s\n", failed, opt.out.c_str(), s);

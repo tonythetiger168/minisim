@@ -83,8 +83,9 @@ Spec references are IEEE 1800-2023 clauses.
   See `docs/RCX.md`.
 - `mchar`, cell library characterization on `mspice`: from a Liberty
   template and one transistor `.subckt` per cell it measures delay and
-  transition tables (combinational, clock-to-output, set and reset arcs),
-  setup, hold, recovery and removal tables by bisection, internal energy,
+  transition tables (combinational, clock-to-output, set and reset arcs,
+  tristate enable), setup, hold, recovery and removal tables and minimum
+  pulse widths by bisection, internal energy,
   pin capacitance and leakage, and writes Liberty with the shared writer.
   The stimulus for each arc is found from the Liberty functions and `ff` /
   `latch` groups. Every table point runs as its own task on all logical

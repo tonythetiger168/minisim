@@ -38,6 +38,8 @@ corner). A cell without a subcircuit keeps the template's numbers.
 | `cell_rise`, `cell_fall`, `rise_transition`, `fall_transition` of `combinational`, `rising_edge`, `falling_edge`, `preset` and `clear` arcs | one transient per table point: the related pin ramps with the index slew into the cell loaded with the index capacitance; delay between the input and output thresholds, transition between the slew thresholds |
 | `rise_constraint`, `fall_constraint` of `setup_*`, `hold_*`, `recovery_*`, `removal_*` | a bisection per table point on the offset between the pin's edge and the clock's: the smallest offset at which the cell still captures the right value and its clock-to-output delay is no more than 10% longer (`-degrade`) than with the pin far away (`-range`, 1 ns) |
 | `rise_power`, `fall_power` of `internal_power` | from the same transient as the delay: the energy drawn from the supply during the event, less leakage, less the energy delivered to the loads of the outputs that rose; shared equally by the outputs that move together and have a group for that pin |
+| `cell_rise`, `cell_fall` and the transitions of a `three_state_enable` arc | the output starts undriven, with the other level left on its load by an earlier step of the stimulus, and the enable pin's edge makes the cell drive it; either edge of the pin is tried |
+| `min_pulse_width_high`, `min_pulse_width_low` of a pin | bisection on the width of a pulse (between the input thresholds, edges of four times the smallest table slew): the narrowest one after which the cell ends where a wide pulse leaves it, with the output no more than 10% later; never less than the edge time, where the pulse just reaches the rail |
 | `capacitance` (and `rise_capacitance`, `fall_capacitance` where the template has them) | the charge a ramp on the pin delivers, over the supply voltage; the mean of rising and falling |
 | `leakage_power`, `cell_leakage_power` | the supply current at rest, averaged over the input states each `when` allows |
 
@@ -45,8 +47,8 @@ A `non_unate` arc is measured for both edges of the related pin and each
 table point takes the slower one. Outputs other than the one measured carry
 the smallest load of the table.
 
-Kept from the template, and counted in the summary: `three_state_enable`
-and `three_state_disable` arcs, `min_pulse_width` and other timing types,
+Kept from the template, and counted in the summary: `three_state_disable`
+arcs, `min_pulse_width` timing groups and other timing types,
 timing groups with several related pins, and everything that is not a
 number mchar measures (areas, functions, wire loads, `max_capacitance`).
 
@@ -62,7 +64,11 @@ the shortest sequence that ends in the wanted event:
   right way (and the arc's `when` holds);
 - for a constraint, a state where the clock edge captures something that
   depends on whether the constrained pin changed first, preferring one where
-  meeting the constraint shows as an output edge to time.
+  meeting the constraint shows as an output edge to time;
+- for a tristate enable arc, a state where the output is undriven and still
+  holds the level opposite to the one the cell is about to drive;
+- for a pulse width, a state where a pulse on the pin leaves an output
+  changed.
 
 The search runs on both power-up values of the state at once and accepts a
 sequence only when both give the same result, so the first steps of a
@@ -87,7 +93,8 @@ AOI, say) the first state found is used.
 
 ## Not there yet
 
-- Tristate enable and disable arcs, minimum pulse width, minimum period.
+- Tristate disable arcs (they need a resistive load and a threshold the
+  template does not give), minimum period.
 - State-dependent tables that the template does not ask for with `when`
   (the worst case over side inputs); CCS and ECSM current-source models;
   on-chip variation (LVF) tables.
