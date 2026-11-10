@@ -14,8 +14,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **nocgen** | UVM testbench and memory-profile generator for AXI NoC meshes ([SoC-tb-regress-builder](https://github.com/tonythetiger168/SoC-tb-regress-builder)) | Separate repo; runs on msim once classes and UVM land |
 | **mregress** | Regression runner: test lists, seeds, parallel jobs on msim / VCS / Xcelium / Questa / Icarus, failure grouping, JUnit and HTML reports | Shipping in 0.2 |
 | **mbug** | Bug reports: each distinct mregress / mlint / mdft failure becomes one issue in GitHub Issues, Redmine or Jira (deduplicated by signature, a comment per repeat), with repro command, logs and the CI build link; syncs GitHub issues into Jira / Redmine | Shipping in 0.2 |
-| **mlint** | Lint, clock-domain (CDC) and reset-domain (RDC) checks on the elaborated design: latches, assignment kind, multiple drivers, missing synchronizers, multi-bit crossings, glitches, reconvergence, reset crossings (`docs/CDC.md`) | Shipping next |
-| **mlint** | Lint and clock-domain checks on the elaborated design: latches, assignment kind, multiple drivers, missing synchronizers, multi-bit crossings | Shipping next |
+| **mlint** | Lint and clock-domain checks on the elaborated design: about 80 rules (latches, combinational loops, widths, synthesizability, unused signals, connections, clocks, resets, naming, clock- and reset-domain crossings), each with a severity; configuration files, waivers in files and in the source, JSON report, multi-core. See `docs/LINT.md`, `docs/CDC.md` | Shipping next |
 | **msdc** | Timing constraint checks: reads the design and its SDC file and reports bad or missing constraints (clocks, I/O delays, exceptions with no path, undeclared clock crossings), 32 rules, multithreaded. Shares the SDC reader and Tcl interpreter with timing and synthesis | Shipping next |
 | **mvp** | Virtual prototypes: an AXI4-Lite bridge from the design to C, C++ or SystemC/TLM-2.0 models, with a memory map, interrupt lines and timed callbacks; a memory and a UART bundled | Shipping next |
 | **mdft** | Design-for-test: scan-readiness checks (gated clocks, logic-driven resets, latches, mixed edges, combinational loops) and a per-domain flop count for chain planning | Shipping next |
@@ -25,10 +24,12 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mdebug** | Source-level debug: drivers and loads with their conditions, fan-in cones, the active driver at a time in a waveform traced back through time, and a one-file viewer (hierarchy, source, schematic, waves) | Shipping next |
 | **memu** | Emulation and FPGA prototyping: a gate-level netlist onto a board of FPGAs (clock conversion, memory mapping, partitioning, pin multiplexing, probes), transactors to `msim -mvp` models and testbench classes, and a testbench that checks the emulation against the netlist in simulation | Shipping next |
 | **mcov** | Code coverage (line, branch, toggle) merged across a regression, text / HTML / LCOV reports and gates; covergroups with the spec work | Code coverage shipping in 0.2 |
+| **mpnr** | Place and route: gate netlist + LEF to placed and routed DEF (floorplan, analytic placement, legalization, negotiated detailed routing), with a built-in opens / shorts / spacing check; multithreaded, deterministic | Shipping next |
 | **mcov** | Coverage merged across a regression: code coverage (line, branch, toggle), covergroups and assertion statistics; text / HTML / LCOV reports and gates | Shipping in 0.2 |
 | **mplan** | Verification planning and tracking: a plan maps features to tests, coverage and assertions; scores per feature, history and trend, failure triage (new / recurring / flaky / fixed), HTML report and CI gates | Shipping next |
 | **mrcx** | Parasitic extraction: routed DEF + LEF in, SPEF out. Distributed RC per net with coupling capacitance, process stack and temperature, open and short checks, multi-core | Shipping next |
 | **mwave** | Waveforms for GTKWave / Surfer: hierarchical VCD and compressed FST (shipping in 0.2); `$dumpfile` / `$dumpvars` scoping and transaction views next | Partly shipping in 0.2 |
+| **mhls** | High-level synthesis: C/C++ functions to SystemVerilog (FSM with datapath or pipeline), with a self-checking testbench and a host-compiler check of the same vectors | Shipping next |
 
 All of them install from one package (`minisim_x.y.z_amd64.deb` /
 `.tar.gz`) and share one version number.

@@ -632,6 +632,15 @@ struct Sim {
         }
     }
     // set() inside a partition task: only this partition reads the signal.
+    // Stores a value nothing watches (Instr::tmp): no change detection, no
+    // wake-ups, safe from a clocked batch running in parallel.
+    void poke(int s, Val nv, int hi, int lo) {
+        Sig& g = sigs[s];
+        if (hi >= 0) nv = v_insert(g.val, nv, hi, lo);
+        nv = maskWidth(nv, g.w);
+        nv.sgn = false;
+        g.val = nv;
+    }
     void setLocal(int s, Val nv) {
         Sig& g = sigs[s];
         if (nv == g.val) return;
