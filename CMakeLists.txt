@@ -84,8 +84,6 @@ if(Python3_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
-# Physical verification (mpv): GDSII in, DRC and LVS.
-include(cmake/tools/mpv.cmake)
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
 include(cmake/tools/memu.cmake)

@@ -2,6 +2,7 @@
 # test_pv checks the polygon engine, the GDSII reader and writer and every
 # check; the mpv test runs the command on SKY130 standard cells (clean) and
 # on a layout with known violations.
+include_guard(GLOBAL)
 find_package(Threads REQUIRED)
 add_executable(mpv src/mpv.cpp)
 target_include_directories(mpv PRIVATE src)
