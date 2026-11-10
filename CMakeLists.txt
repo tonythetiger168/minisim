@@ -74,25 +74,6 @@ add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
-
-# Physical verification: mpv drc (GDSII in, rule deck, violation markers out).
-# test_pv checks the polygon engine, the GDSII reader and writer and every
-# check; the mpv test runs the command on SKY130 standard cells (clean) and
-# on a layout with known violations.
-find_package(Threads REQUIRED)
-add_executable(mpv src/mpv.cpp)
-target_include_directories(mpv PRIVATE src)
-target_link_libraries(mpv PRIVATE Threads::Threads)
-add_executable(test_pv tests/test_pv.cpp)
-target_include_directories(test_pv PRIVATE src)
-target_compile_options(test_pv PRIVATE -UNDEBUG)
-target_compile_definitions(test_pv PRIVATE MINISIM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(test_pv PRIVATE Threads::Threads)
-add_test(NAME test_pv COMMAND test_pv)
-add_test(NAME mpv
-         COMMAND ${CMAKE_COMMAND} -DMPV=$<TARGET_FILE:mpv> -DGEN=$<TARGET_FILE:test_pv>
-                 -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mpv_test
-                 -P ${CMAKE_SOURCE_DIR}/tests/mpv.cmake)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
@@ -100,6 +81,10 @@ if(Python3_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
+
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/mrcx.cmake)
+include(cmake/tools/mpv.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -374,7 +359,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim mpv RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -402,7 +387,7 @@ install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 # The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPV.md
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
