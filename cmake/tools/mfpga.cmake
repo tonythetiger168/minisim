@@ -1,6 +1,12 @@
 # mfpga: FPGA synthesis (LUT mapping, nextpnr JSON and EDIF output).
 #   mfpga design.sv -top core -family ice40 -o core.json
-# Included from the top CMakeLists.txt inside the slang block.
+# Needs the slang front end; included by the cmake/tools glob.
+include_guard(GLOBAL)
+if(NOT MINISIM_WITH_SLANG)
+  return()
+endif()
+include(GNUInstallDirs)
+find_package(Python3 COMPONENTS Interpreter)
 add_executable(mfpga src/mfpga.cpp)
 target_include_directories(mfpga PRIVATE src)
 find_package(Threads REQUIRED)

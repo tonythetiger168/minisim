@@ -72,6 +72,9 @@ add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
+# The mini45 cell library: generator check and install rules.
+include(cmake/tools/mini45.cmake)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -83,8 +86,10 @@ if(Python3_FOUND)
 endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/memu.cmake)
 include(cmake/tools/mrcx.cmake)
 include(cmake/tools/shared_par_wave.cmake)
+include(cmake/tools/mequiv.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -184,15 +189,16 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
-  # Tools on the slang front end: one file each in cmake/tools.
-  include(cmake/tools/msynth.cmake)
-  include(cmake/tools/mfpga.cmake)
 
   # Source-level debug: drivers, loads, active-driver trace, viewer: mdebug design.sv
   add_executable(mdebug src/mdebug.cpp)
   target_include_directories(mdebug PRIVATE src)
   find_package(Threads REQUIRED)
   target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
+  if(MINISIM_WITH_FST)
+    target_link_libraries(mdebug PRIVATE fst)
+    target_compile_definitions(mdebug PRIVATE MINISIM_FST)
+  endif()
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -354,6 +360,12 @@ if(MINISIM_WITH_SLANG)
     endforeach()
   endif()
 
+  # mini45's Verilog models against the functions in its Liberty files.
+  add_test(NAME mini45_models
+           COMMAND msim ${CMAKE_SOURCE_DIR}/lib/mini45/mini45.v ${CMAKE_SOURCE_DIR}/lib/mini45/mini45_tb.sv
+                   -top mini45_tb)
+  set_tests_properties(mini45_models PROPERTIES PASS_REGULAR_EXPRESSION "mini45: 84 cells checked, 0 errors")
+
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
@@ -377,6 +389,7 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
+                   -DFST=${MINISIM_WITH_FST}
                    -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
@@ -409,7 +422,7 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
+#   bin/msim, bin/minisim, bin/memu, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)
@@ -446,6 +459,16 @@ install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+# The tools: one file each in cmake/tools, all included here, after the core
+# targets, the slang front end, FST and the install directories, so a tool
+# file can test if(MINISIM_WITH_SLANG), if(TARGET msim) and MINISIM_WITH_FST.
+# Add a file, not a line: every *.cmake there is included. Start each file
+# with include_guard(GLOBAL).
+file(GLOB TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
+foreach(f ${TOOL_CMAKE})
+  include(${f})
+endforeach()
 
 set(CPACK_PACKAGE_NAME minisim)
 set(CPACK_PACKAGE_VENDOR "minisim")
