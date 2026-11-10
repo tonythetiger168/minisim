@@ -443,6 +443,14 @@ public:
             for (int i : byRank) ins.insert(ins.end(), procs[i].combIns.begin(), procs[i].combIns.end());
             std::sort(ins.begin(), ins.end());
             ins.erase(std::unique(ins.begin(), ins.end()), ins.end());
+            if (!coneIns_.empty()) {   // the clock cone runs first, on the clocks alone
+                o << "    S.addComb(combCone, nullptr, {";
+                for (size_t j = 0; j < coneIns_.size(); j++) o << (j ? ", " : "") << coneIns_[j];
+                o << "});\n";
+                std::erase_if(ins, [&](int x) {
+                    return std::binary_search(coneIns_.begin(), coneIns_.end(), x) || std::binary_search(coneOuts_.begin(), coneOuts_.end(), x);
+                });
+            }
             o << "    S.fastComb = (int)S.combs.size();\n    S.addComb(combAll, nullptr, {";
             for (size_t j = 0; j < ins.size(); j++) o << (j ? ", " : "") << ins[j];
             o << "});\n";
@@ -1163,6 +1171,8 @@ private:
     // -DMSIM_COLDSTAT counts each one and prints the busiest at exit (COLD in
     // the preamble): the statements that keep running the 4-state way.
     int colds_ = 0;
+    std::vector<int> coneOuts_;
+    std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
     std::string cold(const std::string& stmt) {
         return "[&]() __attribute__((noinline, cold)) { COLD(" + std::to_string(colds_++) + ") " + stmt + " }();";
     }
@@ -1315,6 +1325,7 @@ private:
         std::vector<const Instr*> combIns;
         bool serialOnly = false;
         std::vector<std::vector<const Instr*>> unitIns;
+        std::vector<int> unitProc;   // the comb process of each unit
         std::vector<std::vector<E>> unitConds;
         // In the 2-state copy a statement without a 2-state path runs as it
         // is; if what it wrote is not known, the pass is abandoned (@BAIL@)
@@ -1383,6 +1394,7 @@ private:
                     serialOnly = true;
                 }
                 unitIns.emplace_back();
+                unitProc.push_back(i);
                 unitConds.emplace_back();
                 size_t pc = 0;
                 for (; pc < cp.code.size(); pc++) {
@@ -1425,6 +1437,7 @@ private:
                 combStmts.push_back("   " + fassign(in));
                 combIns.push_back(&in);
                 unitIns.push_back({&in});
+                unitProc.push_back(i);
                 unitConds.emplace_back();
                 noteRefs(in.e);
                 combStmts2.push_back(stmt2(in));
@@ -1588,6 +1601,96 @@ private:
         for (auto& st : combStmts2) combStmtsQ.push_back(bail(st, "{ cdirty = true; return; }"));
         int nc = chunks("combP", combStmts), nm = chunks("commitP", commitStmts);
         int nq = two ? chunks("combQ", combStmtsQ) : 0;
+        // The clock cone: the comb processes downstream of the outside signals
+        // that reach a clock or reset of a clocked process (the top clock and
+        // its copies down the hierarchy, gated clocks). When only such a
+        // signal changed, which is every clock edge, combCone evaluates that
+        // cone instead of the whole domain. Nothing outside the cone reads
+        // what the cone writes: the cone is closed downstream.
+        coneIns_.clear();
+        {
+            std::vector<char> wr(sigW_.size(), 0), inCone(procs.size(), 0), coneSig(sigW_.size(), 0);
+            for (int i : byRank)
+                for (auto& in : procs[i].prog->code) {
+                    if (in.k == IK::WaitEdge) break;
+                    if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < wr.size()) wr[in.sig] = 1;
+                }
+            for (auto& sl : slots) wr[sl.sig] = 1;
+            auto outs = [&](int i, auto&& f) {
+                for (auto& in : procs[i].prog->code) {
+                    if (in.k == IK::WaitEdge) break;
+                    if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < wr.size()) f(in.sig);
+                }
+            };
+            // Backward from the clocks: the outside signals that feed them.
+            std::vector<char> need(sigW_.size(), 0);
+            for (size_t x = 0; x < need.size(); x++) need[x] = clock_[x];
+            for (bool again = true; again;) {
+                again = false;
+                for (int i : byRank) {
+                    bool feeds = false;
+                    outs(i, [&](int sg) { feeds |= need[sg] != 0; });
+                    if (!feeds) continue;
+                    for (int x : procs[i].combIns)
+                        if (x >= 0 && (size_t)x < need.size() && !need[x]) { need[x] = 1; again = true; }
+                }
+            }
+            for (int i : byRank)
+                for (int x : procs[i].combIns)
+                    if (x >= 0 && (size_t)x < need.size() && need[x] && !wr[x] && !coneSig[x]) { coneSig[x] = 1; coneIns_.push_back(x); }
+            // Forward from each of those: everything that depends on it. Only
+            // a signal with a small cone is worth a pass of its own (a reset
+            // that the data logic reads is not).
+            std::vector<int> cands;
+            cands.swap(coneIns_);
+            std::fill(coneSig.begin(), coneSig.end(), 0);
+            size_t nCone = 0;
+            for (int c : cands) {
+                std::vector<char> in1(procs.size(), 0), sg1(sigW_.size(), 0);
+                sg1[c] = 1;
+                size_t n1 = 0;
+                bool asserts = false;
+                for (bool again = true; again;) {
+                    again = false;
+                    for (int i : byRank) {
+                        if (in1[i]) continue;
+                        bool reads = false;
+                        for (int x : procs[i].combIns) reads |= x >= 0 && (size_t)x < sg1.size() && sg1[x];
+                        if (!reads) continue;
+                        in1[i] = 1;
+                        n1++;
+                        again = true;
+                        asserts |= combAsserts(*procs[i].prog);
+                        outs(i, [&](int sg) { sg1[sg] = 1; });
+                    }
+                }
+                if (std::getenv("MSIM_WHYCONE"))
+                    std::fprintf(stderr, "cone of signal %d: %zu of %zu processes%s\n", c, n1, byRank.size(), asserts ? ", asserts" : "");
+                if (!n1 || asserts || n1 * 8 > byRank.size() + 512) continue;
+                coneIns_.push_back(c);
+                for (int i : byRank)
+                    if (in1[i] && !inCone[i]) { inCone[i] = 1; nCone++; }
+            }
+            if (nCone == 0) coneIns_.clear();
+            // What the cone writes, only the cone reads: those signals do not wake combAll either.
+            coneOuts_.clear();
+            if (!coneIns_.empty())
+                for (int i : byRank)
+                    if (inCone[i]) outs(i, [&](int sg) { coneOuts_.push_back(sg); });
+            std::sort(coneOuts_.begin(), coneOuts_.end());
+            if (!coneIns_.empty()) {
+                std::sort(coneIns_.begin(), coneIns_.end());
+                bool privW = false;
+                o << "static void combCone(const void*) {\n    const bool obs = S.observed; (void)obs;\n";
+                for (size_t j = 0; j < unitIns.size(); j++) {
+                    if (!inCone[unitProc[j]]) continue;
+                    o << combStmts[j];
+                    for (auto* in : unitIns[j]) privW |= isPriv(in->sig);
+                }
+                if (privW) o << "    scanP();\n";
+                o << "    if (S.observed) syncP();\n}\n";
+            }
+        }
         o << "static void combAll(const void*) {\n";
         if (two) {
             o << "    if (twoNow()) {\n        cdirty = false;\n";

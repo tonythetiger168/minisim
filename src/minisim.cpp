@@ -2284,7 +2284,12 @@ struct Sim {
         ws.erase(ws.begin() + (ptrdiff_t)keep, ws.end());
         if ((size_t)s < combOf.size())
             for (int r : combOf[s])
-                if (r != curComb) markComb(r);
+                if (r != curComb) {
+#ifdef MSIM_FWSTAT
+                    if (r == fastComb) { static struct St { std::map<std::string, long> m; ~St() { for (auto& [k, c] : m) std::fprintf(stderr, "MARK %ld %s\n", c, k.c_str()); } } st; st.m[sigs[s].name]++; }
+#endif
+                    markComb(r);
+                }
         if ((size_t)s < seqOf.size())
             for (auto& [id, e] : seqOf[s])
                 if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
