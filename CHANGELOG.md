@@ -8,19 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `mlint` grows from 6 rules to about 80, in groups: latches and
-  combinational logic (`L001` now bit-accurate, `LAT001`, incomplete
-  sensitivity lists, combinational loops across modules), case statements,
-  assignment style, widths and signs (`W001`..`W008`), synthesizability
-  (`SYN001`..`SYN017`), unused and undriven signals, connections, clocks and
-  resets (`CLK`, `RST`), naming (`NAME001`..`NAME013`, by pattern) and style.
-  Every rule has a severity and an on/off default; `-config`, `-enable`,
-  `-disable`, `-only`, `-severity`, `-set` configure them, `-list` and
-  `-explain` describe them. Waivers: a waiver file (`-waivers`, by rule,
-  file, line and message, stale ones reported) and comments in the source
-  (`// mlint: waive RULE reason`, `mlint: off / on`, `translate_off`).
-  `-json` report, `-show-waived`, `-stats`. Rules run on every logical CPU
-  (`-threads N`), with the same output for any count. See `docs/LINT.md`.
+- `mdebug -blocks INST`, and a block diagram in the viewer: the instances
+  inside a scope, their port connections and which instance feeds which.
+- `mdebug`: tasks and functions in a module, call output arguments, `force`,
+  procedural `assign` and net declaration assignments are drivers and loads;
+  the fan-in cone follows a task argument to its calls.
 - `memu`, emulation and FPGA prototyping: puts a gate-level netlist
   (structural Verilog over a Liberty library) on a board of FPGAs. Clock
   conversion onto one free-running clock (strobes for clean clocks, edge
@@ -273,6 +265,19 @@ Spec references are IEEE 1800-2023 clauses.
   `docs/CONSTRAINTS.md`.
 - SDC reader: object lookups use sorted name indexes and `-filter` is parsed
   once, so large designs with thousands of queries read in seconds.
+- `mlint` grows from 6 rules to about 80, in groups: latches and
+  combinational logic (`L001` now bit-accurate, `LAT001`, incomplete
+  sensitivity lists, combinational loops across modules), case statements,
+  assignment style, widths and signs (`W001`..`W008`), synthesizability
+  (`SYN001`..`SYN017`), unused and undriven signals, connections, clocks and
+  resets (`CLK`, `RST`), naming (`NAME001`..`NAME013`, by pattern) and style.
+  Every rule has a severity and an on/off default; `-config`, `-enable`,
+  `-disable`, `-only`, `-severity`, `-set` configure them, `-list` and
+  `-explain` describe them. Waivers: a waiver file (`-waivers`, by rule,
+  file, line and message, stale ones reported) and comments in the source
+  (`// mlint: waive RULE reason`, `mlint: off / on`, `translate_off`).
+  `-json` report, `-show-waived`, `-stats`. Rules run on every logical CPU
+  (`-threads N`), with the same output for any count. See `docs/LINT.md`.
 
 ### Fixed
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes
