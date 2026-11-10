@@ -456,6 +456,16 @@ msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
 
 `docs/DATAPATH.md` lists every module and its ports.
 
+### Cell library checks: `mlibc`
+
+`mlibc check lib.lib -lef cells.lef` checks a Liberty library and its LEF for
+the mistakes that break the tools downstream (a function that disagrees with
+its timing arcs, tables that shrink with load, a flop without setup or hold,
+a macro of the wrong size, pins off the routing grid); `mlibc report` and
+`mlibc compare slow.lib fast.lib` summarize a library and check a pair of
+corners. See `docs/LIBCHECK.md`. The generic cell library it is tested on is
+`lib/mini45` (`docs/MINI45.md`).
+
 ### Timing constraint checks: `msdc`
 
 `msdc` reads the design and its SDC file and reports what is wrong or missing
@@ -476,6 +486,21 @@ The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
 (`src/tcl.hpp`) are shared with the timing and synthesis tools. See
 [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
 
+### Static timing analysis: `msta`
+
+`msta` times a gate-level netlist against SDC constraints with Liberty
+libraries, PrimeTime style, and builds without the slang front end:
+
+```sh
+msta -lib cells.lib netlist.v -top top -sdc top.sdc      # check_timing, worst setup and hold paths, summary
+msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf  # delays and timing checks for msim -sdf
+msta -f run.tcl                                          # report_timing, report_constraint, ... in a Tcl script
+```
+
+It runs on every core by default (`-threads N`), with the same results at any
+thread count. Commands, what is modeled and the current limits are in
+[docs/STA.md](docs/STA.md).
+
 ### Lint and clock-domain checks: `mlint`
 
 `mlint` runs the same front end as `msim` and then checks the elaborated
@@ -483,38 +508,44 @@ design, so it needs no separate build setup:
 
 ```sh
 mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
-mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any finding (for CI)
+mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any warning (for CI)
 mlint rtl/*.sv -disable L004 -disable CDC002
 mlint rtl/*.sv -top soc_top -cdc-report     # clock domains, resets, every crossing
 mlint -list                                 # the rules
 ```
 
-| Rule | What it finds |
-|---|---|
-| `L001` | A value is assigned on some paths of an `always_comb` but not all, so it holds its old value: an unintended latch (an `if` with no `else`, a `case` with no `default`) |
-| `L002` | A blocking assignment to a non-local variable in an `always_ff` |
-| `L003` | A non-blocking assignment in an `always_comb` |
-| `L004` | One value is assigned by more than one process |
-| `CDC001` | A flop depends on another clock domain with no synchronizer, or through one flop only |
-| `CDC002` | A multi-bit bus crosses domains through a synchronizer and is not Gray coded |
-| `CDC003` | Combinational logic in front of a synchronizer: a glitch can be captured |
-| `CDC004` | Reconvergence: separately synchronized signals of one domain meet again |
-| `CDC005` | One signal is synchronized more than once into the same domain |
-| `RDC001` | An asynchronous reset generated in another clock domain |
-| `RDC002` | One asynchronous reset used directly in several clock domains |
-| `RDC003` | A flop feeds a flop with a different asynchronous reset, in one clock domain |
-| `RDC004` | A reset flop feeds a flop with no asynchronous reset (off by default: `-enable RDC004`) |
+About 80 rules in groups, each with a severity and an on/off default:
+
+| Group | Rules | Examples |
+|---|---|---|
+| `latch`, `comb`, `case` | `L001`, `LAT001`, `COMB001`, `COMB002`, `CASE001`..`CASE004` | unintended latches (bit-accurate), incomplete sensitivity lists, combinational loops across modules, case without default, casex, duplicate items |
+| `assign`, `driver` | `L002`..`L004`, `SEQ001`..`SEQ003`, `EXP001` | blocking in a flop, non-blocking in logic, both on one variable, multiple drivers |
+| `width` | `W001`..`W008` | truncating assignments, port width mismatches, comparisons of unequal widths, signed against unsigned |
+| `synth` | `SYN001`..`SYN017` | initial blocks, delays, `$random`, force, fork, real and dynamic types, `===`, defparam, internal tri-states, hierarchical references |
+| `unused`, `connect` | `UNU001`..`UNU005`, `CON001`..`CON004` | never read, never driven, floating inputs, positional connections, implicit nets |
+| `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
+| `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
+| `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
+
+```sh
+mlint rtl/*.sv -config mlint.cfg -waivers waivers.cfg -json lint.json
+mlint rtl/*.sv -enable naming -severity W001=error -set name.module='^[a-z][a-z0-9_]*$'
+mlint -explain RST003
+```
+
+Rules are configured in a file or on the command line (enable, disable,
+severity, name patterns) and waived in a waiver file or in the source
+(`// mlint: waive W001 reason`); `// synthesis translate_off` regions are
+honoured. Stale waivers are reported. mlint runs on every logical CPU
+(`-threads N`), with the same output for any count. The full rule table,
+the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 
 Clock and reset domains are found from the RTL: the clock of every
 edge-triggered block, followed through ports, buffers and clock gates, so one
-clock passed down through several modules stays one domain. Multi-flop
-synchronizers (also shift registers and synchronizer cells), enable-qualified
-buses and Gray-coded pointers are recognized as safe. `-cdc-report` lists
-every domain and crossing, `-clock-group a,b` declares related clocks,
-`-static sig` waives a quasi-static signal, and `-threads N` sets the worker
-threads (default: every logical CPU). See [docs/CDC.md](docs/CDC.md).
-Findings print as `file:line:col: warning: [RULE] text`, sorted by file and
-line.
+clock passed down through several modules stays one domain. `-cdc-report`
+lists every domain and crossing, `-clock-group a,b` declares related clocks
+and `-static sig` waives a quasi-static signal. Findings print as
+`file:line:col: severity: [RULE] text`, sorted by file and line.
 
 ### Source-level debug: `mdebug`
 
@@ -546,6 +577,19 @@ isolation or level shifters, names not in the design, ...). See
 msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
+
+### Logic synthesis: `msynth`
+
+`msynth` synthesizes RTL to a gate netlist of Liberty library cells, with a
+Tcl shell whose commands follow dc_shell:
+
+```sh
+msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the built-in generic library
+msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
+```
+
+See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
 
 ### Formal property checking: `mformal`
 
