@@ -85,6 +85,7 @@ endif()
 # Tools that need nothing but the compiler: one file each in cmake/tools.
 include(cmake/tools/mrcx.cmake)
 include(cmake/tools/mpv.cmake)
+include(cmake/tools/shared_par_wave.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
