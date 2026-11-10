@@ -290,6 +290,16 @@ class Router {
         Rect r{std::min(s.x0, s.x1) - hw, std::min(s.y0, s.y1) - hw, std::max(s.x0, s.x1) + hw, std::max(s.y0, s.y1) + hw};
         mark(g, r, -2);
       }
+    // The via stacks under the straps.
+    for (auto& sn : db.specialNets)
+      for (auto& v : sn.vias) {
+        const phys::ViaDef* vd = db.tech.via(v.via);
+        if (!vd) continue;
+        for (auto& sh : vd->shapes) {
+          int g = gridLayer(sh.layer);
+          if (g >= 0) mark(g, {sh.r.x0 + v.x, sh.r.y0 + v.y, sh.r.x1 + v.x, sh.r.y1 + v.y}, -2);
+        }
+      }
   }
 
   // The grid nodes from which a pin can be reached.
