@@ -4,6 +4,7 @@
 #include <random>
 
 #include "equiv/aig.hpp"
+#include "equiv/bv.hpp"
 #include "equiv/cnf.hpp"
 #include "equiv/sat.hpp"
 
@@ -94,6 +95,44 @@ int main() {
         equiv::Cnf cnf(g);
         assert(cnf.solve(diff, 0) == 0);
         assert(cnf.solve(diffBad, 0) == 1);
+    }
+    // The multiplier lemmas mequiv takes on trust (the product built in both
+    // row orders) are true, and the multiplier itself is right: checked
+    // exhaustively by simulation at 6 bits, and the lemmas by SAT at 7.
+    {
+        equiv::Aig g;
+        equiv::Bv bv(g);
+        std::vector<std::pair<equiv::Lit, equiv::Lit>> lemmas;
+        bv.lemmas = &lemmas;
+        for (int w : {6, 7}) {
+            lemmas.clear();
+            equiv::Bits a(w), b(w);
+            for (auto& x : a) x = {g.input(), equiv::kFalse};
+            for (auto& x : b) x = {g.input(), equiv::kFalse};
+            equiv::Bits p = bv.mul(a, b);
+            assert(!lemmas.empty());
+            equiv::Lit diff = equiv::kFalse;
+            for (auto& [x, y] : lemmas) diff = g.or_(diff, g.xor_(x, y));
+            equiv::Cnf cnf(g);
+            assert(cnf.solve(diff, 0) == 0);
+            if (w != 6) continue;
+            for (unsigned va = 0; va < 64; ++va)
+                for (unsigned vb = 0; vb < 64; ++vb) {
+                    std::vector<char> val(g.size(), 0);
+                    for (int i = 0; i < w; ++i) {
+                        val[equiv::nodeOf(a[i].v)] = va >> i & 1;
+                        val[equiv::nodeOf(b[i].v)] = vb >> i & 1;
+                    }
+                    for (uint32_t n = 1; n < g.size(); ++n)
+                        if (g.isAnd(n)) {
+                            auto nd = g.node(n);
+                            val[n] = (val[equiv::nodeOf(nd.a)] ^ equiv::isNeg(nd.a)) && (val[equiv::nodeOf(nd.b)] ^ equiv::isNeg(nd.b));
+                        }
+                    unsigned got = 0;
+                    for (int i = 0; i < w; ++i) got |= unsigned(val[equiv::nodeOf(p[i].v)] ^ equiv::isNeg(p[i].v)) << i;
+                    assert(got == ((va * vb) & 63));
+                }
+        }
     }
     std::puts("test_sat: ok");
     return 0;

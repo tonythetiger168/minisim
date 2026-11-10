@@ -117,6 +117,19 @@ thread count.
 | `-verbose` | unmatched signals, latches, and every compare point |
 | `-q` | only the verdict |
 
+### Datapaths
+
+Two adders or multipliers built differently share no internal structure, and
+SAT alone does not prove wide multipliers equal. So points that survive a
+quick SAT pass go through SAT sweeping: internal nodes that simulate alike
+are proved equal one at a time, smallest first, and merged, after which the
+outputs usually fall out. For `a * b` mequiv also builds the product with the
+rows in the other order and uses the fact that both are the same number, so a
+netlist that adds partial products row by row is proved whichever operand it
+walks (a 16x16 multiplier in under a second). A netlist with a different
+multiplier architecture (Wallace tree, Booth) can still exhaust `-effort` and
+report those outputs as aborted, which is inconclusive, never a pass.
+
 ## Not yet
 
 - Liberty (`.lib`) cell functions read directly, sequential UDPs.

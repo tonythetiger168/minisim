@@ -102,6 +102,7 @@ struct Design {
     std::vector<std::pair<std::string, Bit>> outputs;
     std::vector<State> states;
     std::vector<std::string> warnings;
+    std::vector<std::pair<Lit, Lit>> lemmas;  // literals equal by construction (bv.hpp)
 };
 
 struct ElabOptions {
@@ -117,6 +118,7 @@ public:
 
     void run(const InstanceSymbol& top) {
         d.top = std::string(top.name);
+        bv.lemmas = &d.lemmas;
         topPrefix = d.top + ".";
         Proc global;
         global.kind = Proc::Global;

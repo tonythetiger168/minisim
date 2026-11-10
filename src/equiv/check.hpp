@@ -53,6 +53,7 @@ struct CheckOptions {
     unsigned threads = 0;           // 0: all logical cores
     uint64_t effort = 2'000'000;    // SAT conflicts per compare point
     unsigned simRounds = 8;         // 64 patterns each
+    uint64_t sweepEffort = 300;     // SAT conflicts per internal equivalence tried
     std::vector<std::pair<std::string, std::string>> matches;  // ref name, impl name
 };
 
@@ -62,6 +63,7 @@ struct Result {
     std::vector<std::string> refOnlyStates, implOnlyStates;
     size_t matchedInputs = 0, matchedStates = 0, matchedOutputs = 0, invertedStates = 0;
     size_t passed = 0, failed = 0, aborted = 0;
+    size_t merged = 0;  // internal nodes SAT sweeping proved equal
     bool equivalent() const { return failed == 0 && aborted == 0 && refOnlyOutputs.empty(); }
 };
 
@@ -125,6 +127,143 @@ inline uint64_t mix(uint64_t x) {
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
     return x ^ (x >> 31);
+}
+
+// SAT sweeping (fraiging) over the cones of `roots`: nodes that simulate alike
+// are proved equal one by one, smallest first, each proof using the ones
+// before it; then the roots are rebuilt on the merged graph. Returns the
+// number of nodes merged. Single solver, fixed order: deterministic.
+inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
+                    const std::vector<std::pair<Lit, Lit>>& lemmas = {}) {
+    const size_t N = g.size();
+    const size_t K = 4;  // base signature words
+    std::vector<char> in(N, 0);
+    {
+        std::vector<uint32_t> st;
+        auto flood = [&] {
+            while (!st.empty()) {
+                uint32_t n = st.back();
+                st.pop_back();
+                if (n == 0 || in[n]) continue;
+                in[n] = 1;
+                if (g.isAnd(n)) st.push_back(nodeOf(g.node(n).a)), st.push_back(nodeOf(g.node(n).b));
+            }
+        };
+        for (Lit* r : roots) st.push_back(nodeOf(*r));
+        flood();
+        // A lemma that touches the cone brings its other side in.
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (auto& [x, y] : lemmas)
+                if (in[nodeOf(x)] != in[nodeOf(y)]) {
+                    st.push_back(nodeOf(x)), st.push_back(nodeOf(y));
+                    flood();
+                    grew = true;
+                }
+        }
+    }
+    std::vector<uint32_t> cone;
+    for (uint32_t n = 1; n < N; ++n) if (in[n]) cone.push_back(n);
+    size_t maxWords = std::max<size_t>(K, std::min<size_t>(1024, (size_t(256) << 20) / (8 * (cone.size() + 1))));
+    std::vector<std::vector<uint64_t>> sig(1, std::vector<uint64_t>(N, 0));  // sig[word][node]
+    auto simWord = [&](size_t w) {
+        auto& s = sig[w];
+        for (uint32_t n : cone) {
+            if (!g.isAnd(n)) continue;
+            Aig::Node nd = g.node(n);
+            s[n] = (isNeg(nd.a) ? ~s[nodeOf(nd.a)] : s[nodeOf(nd.a)]) & (isNeg(nd.b) ? ~s[nodeOf(nd.b)] : s[nodeOf(nd.b)]);
+        }
+    };
+    sig.assign(K, std::vector<uint64_t>(N, 0));
+    for (size_t w = 0; w < K; ++w) {
+        for (uint32_t n : cone)
+            if (!g.isAnd(n)) sig[w][n] = mix(uint64_t(n) * 0x9E3779B1ULL + w * 0x51ED27ULL + 77);
+        simWord(w);
+    }
+    auto phaseOf = [&](uint32_t n) { return bool(sig[0][n] & 1); };
+    auto keyOf = [&](uint32_t n) {
+        uint64_t h = 0, flip = phaseOf(n) ? ~0ull : 0;
+        for (size_t w = 0; w < K; ++w) h = mix(h ^ (sig[w][n] ^ flip));
+        return h;
+    };
+    auto same = [&](uint32_t a, uint32_t b, bool inv) {
+        uint64_t flip = inv ? ~0ull : 0;
+        for (size_t w = 0; w < sig.size(); ++w)
+            if (sig[w][a] != (sig[w][b] ^ flip)) return false;
+        return true;
+    };
+
+    Cnf cnf(g);
+    std::unordered_map<uint64_t, std::vector<uint32_t>> table;
+    table[keyOf(0)].push_back(0);
+    std::vector<Lit> rep(N, kNoLit);  // node -> an equal, earlier literal
+    size_t merged = 0;
+    for (auto& [x, y] : lemmas) {
+        uint32_t nx = nodeOf(x), ny = nodeOf(y);
+        if (nx == ny || !in[nx] || !in[ny]) continue;
+        Lit late = nx > ny ? x : y, early = nx > ny ? y : x;
+        if (!g.isAnd(nodeOf(late)) || rep[nodeOf(late)] != kNoLit) continue;
+        rep[nodeOf(late)] = early ^ (late & 1u);
+        Sat::L a = cnf.lit(x), b = cnf.lit(y);
+        cnf.sat.addClause(Sat::no(a), b);
+        cnf.sat.addClause(a, Sat::no(b));
+    }
+    for (uint32_t n : cone) {
+        if (rep[n] != kNoLit) continue;  // settled by a lemma
+        auto& bucket = table[keyOf(n)];
+        if (!g.isAnd(n)) { bucket.push_back(n); continue; }
+        bool done = false;
+        int tries = 0;
+        for (size_t c = 0; c < bucket.size() && !done && tries < 3; ++c) {
+            uint32_t r = bucket[c];
+            bool inv = phaseOf(n) != phaseOf(r);
+            if (!same(n, r, inv)) continue;
+            ++tries;
+            // Is n != r possible?
+            Sat::L a = cnf.lit(Lit(n << 1)), b = cnf.lit(Lit(r << 1) ^ (inv ? 1u : 0u));
+            uint32_t t = cnf.sat.newVar();
+            cnf.sat.addClause(Sat::mk(t, true), a, b);
+            cnf.sat.addClause(Sat::mk(t, true), Sat::no(a), Sat::no(b));
+            Sat::Result res = cnf.sat.solve({Sat::mk(t)}, effort);
+            if (res == Sat::Unsat) {
+                cnf.sat.addClause(Sat::mk(t, true));
+                cnf.sat.addClause(Sat::no(a), b);
+                cnf.sat.addClause(a, Sat::no(b));
+                rep[n] = Lit(r << 1) ^ (inv ? 1u : 0u);
+                ++merged;
+                done = true;
+            } else if (res == Sat::SatResult) {
+                // A pattern that tells them apart, and 63 neighbours of it.
+                if (sig.size() < maxWords) {
+                    sig.emplace_back(N, 0);
+                    auto& s = sig.back();
+                    size_t w = sig.size() - 1;
+                    for (uint32_t m : cone) {
+                        if (g.isAnd(m)) continue;
+                        uint64_t r1 = mix(uint64_t(m) * 1315423911ULL + w), r2 = mix(r1), r3 = mix(r2);
+                        s[m] = (cnf.model(m) ? ~0ull : 0) ^ (r1 & r2 & r3 & ~1ull);
+                    }
+                    simWord(w);
+                }
+                cnf.sat.addClause(Sat::mk(t, true));
+            } else {
+                cnf.sat.addClause(Sat::mk(t, true));
+            }
+        }
+        if (!done) bucket.push_back(n);
+    }
+    if (!merged) return 0;
+    // Rebuild the cone on the merged graph.
+    std::vector<Lit> now(N, kNoLit);
+    now[0] = kFalse;
+    for (uint32_t n : cone) {
+        if (!g.isAnd(n)) { now[n] = Lit(n << 1); continue; }
+        if (rep[n] != kNoLit) { now[n] = now[nodeOf(rep[n])] ^ (rep[n] & 1u); continue; }
+        Aig::Node nd = g.node(n);
+        now[n] = g.and_(now[nodeOf(nd.a)] ^ (nd.a & 1u), now[nodeOf(nd.b)] ^ (nd.b & 1u));
+    }
+    for (Lit* r : roots) *r = now[nodeOf(*r)] ^ (*r & 1u);
+    return merged;
 }
 
 }  // namespace detail
@@ -359,34 +498,60 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
     sim.clear();
     sim.shrink_to_fit();
 
-    // ---- SAT, in parallel
-    std::vector<size_t> work;
-    for (size_t k = 0; k < res.points.size(); ++k) if (open[k]) work.push_back(k);
-    unsigned nt = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
-    nt = unsigned(std::min<size_t>(nt, std::max<size_t>(work.size(), 1)));
-    std::atomic<size_t> nextJob{0};
-    auto worker = [&] {
-        for (;;) {
-            size_t j = nextJob.fetch_add(1);
-            if (j >= work.size()) return;
-            Point& p = res.points[work[j]];
-            Cnf cnf(g);
-            int r = cnf.solve(p.miter, opt.effort);
-            p.conflicts = cnf.sat.conflicts();
-            p.how = "sat";
-            if (r == 0) p.status = Point::Pass;
-            else if (r < 0) p.status = Point::Abort;
-            else {
-                p.status = Point::Fail;
-                finishCex(p, [&](uint32_t n) { return cnf.model(n); });
+    // ---- SAT, in parallel: a quick pass, then (after sweeping) the full effort
+    unsigned nt0 = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
+    auto satPass = [&](uint64_t budget, bool last, const char* how) {
+        std::vector<size_t> work;
+        for (size_t k = 0; k < res.points.size(); ++k) if (open[k]) work.push_back(k);
+        unsigned nt = unsigned(std::min<size_t>(nt0, std::max<size_t>(work.size(), 1)));
+        std::atomic<size_t> nextJob{0};
+        auto worker = [&] {
+            for (;;) {
+                size_t j = nextJob.fetch_add(1);
+                if (j >= work.size()) return;
+                Point& p = res.points[work[j]];
+                Cnf cnf(g);
+                int r = cnf.solve(p.miter, budget);
+                p.conflicts += cnf.sat.conflicts();
+                if (r < 0) {
+                    if (last) p.status = Point::Abort, p.how = how;
+                    continue;
+                }
+                p.how = how;
+                open[work[j]] = 0;
+                if (r == 0) p.status = Point::Pass;
+                else {
+                    p.status = Point::Fail;
+                    finishCex(p, [&](uint32_t n) { return cnf.model(n); });
+                }
             }
+        };
+        if (nt <= 1) worker();
+        else {
+            std::vector<std::thread> pool;
+            for (unsigned t = 0; t < nt; ++t) pool.emplace_back(worker);
+            for (auto& t : pool) t.join();
         }
     };
-    if (nt <= 1) worker();
-    else {
-        std::vector<std::thread> pool;
-        for (unsigned t = 0; t < nt; ++t) pool.emplace_back(worker);
-        for (auto& t : pool) t.join();
+    uint64_t quick = std::min<uint64_t>(opt.effort, 2000);
+    satPass(quick, quick == opt.effort, "sat");
+    bool anyOpen = false;
+    for (char o : open) anyOpen |= bool(o);
+    if (anyOpen && quick < opt.effort) {
+        // The hard points are datapaths built differently on the two sides.
+        // Find internal nodes that are equal, merge them, and try again.
+        std::vector<Lit*> roots;
+        for (size_t k = 0; k < res.points.size(); ++k) if (open[k]) roots.push_back(&res.points[k].miter);
+        std::vector<std::pair<Lit, Lit>> lemmas = ref.lemmas;
+        for (auto& [x, y] : impl.lemmas) lemmas.push_back({g.rebuild(x, memo), g.rebuild(y, memo)});
+        res.merged = detail::sweep(g, roots, opt.sweepEffort, lemmas);
+        for (size_t k = 0; k < res.points.size(); ++k)
+            if (open[k] && res.points[k].miter == kFalse) {
+                open[k] = 0;
+                res.points[k].status = Point::Pass;
+                res.points[k].how = "sweep";
+            }
+        satPass(opt.effort, true, "sweep+sat");
     }
 
     for (auto& p : res.points) {

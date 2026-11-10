@@ -29,6 +29,9 @@ using Bits = std::vector<Bit>;
 
 struct Bv {
     Aig& g;
+    // Pairs of literals that are equal by construction (the same product
+    // built two ways). The checker may use them without proving them.
+    std::vector<std::pair<Lit, Lit>>* lemmas = nullptr;
     explicit Bv(Aig& g) : g(g) {}
 
     Bit not_(Bit a) { return {neg(a.v), a.x}; }
@@ -148,7 +151,8 @@ struct Bv {
         return r;
     }
     Bits negate(const Bits& a) { return sub(Bits(a.size(), kB0), a); }
-    Bits mul(const Bits& a, const Bits& b) {
+    // Shift-and-add, one row per bit of b.
+    Bits mulV(const Bits& a, const Bits& b) {
         size_t w = a.size();
         Bits acc(w, kB0);
         for (size_t i = 0; i < w; ++i) {
@@ -156,6 +160,20 @@ struct Bv {
             Bits pp(w, kB0);
             for (size_t j = i; j < w; ++j) pp[j] = {g.and_(a[j - i].v, b[i].v), kFalse};
             acc = addV(acc, pp, kFalse);
+        }
+        return acc;
+    }
+    Bits mul(const Bits& a, const Bits& b) {
+        Bits acc = mulV(a, b);
+        // A netlist may add the rows in the other order (one per bit of a).
+        // Its internal sums then match nothing in ours, and proving two
+        // multipliers equal from their outputs alone is hopeless for SAT. So
+        // build that order too and record that the two products are equal.
+        uint64_t ca, cb;
+        if (lemmas && a.size() >= 6 && !constValue(a, ca) && !constValue(b, cb)) {
+            Bits alt = mulV(b, a);
+            for (size_t i = 0; i < acc.size(); ++i)
+                if (alt[i].v != acc[i].v) lemmas->push_back({acc[i].v, alt[i].v});
         }
         poison(acc, a, b);
         return acc;

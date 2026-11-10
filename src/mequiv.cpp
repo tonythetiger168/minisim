@@ -293,10 +293,11 @@ int main(int argc, char** argv) {
         size_t byStruct = 0, bySim = 0, bySat = 0;
         for (auto& p : res.points) {
             std::string how = p.how;
-            byStruct += how == "structural", bySim += how == "simulation", bySat += how == "sat";
+            byStruct += how == "structural", bySim += how == "simulation", bySat += how.find("s") == 0 && how != "structural" && how != "simulation";
         }
         printf("Compare points: %zu (%zu settled structurally, %zu by simulation, %zu by SAT)\n",
                res.points.size(), byStruct, bySim, bySat);
+        if (res.merged) printf("  SAT sweeping merged %zu internal nodes\n", res.merged);
         printf("  passed %zu, failed %zu, aborted %zu\n", res.passed, res.failed, res.aborted);
 
         size_t shown = 0;
