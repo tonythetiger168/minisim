@@ -8,6 +8,19 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `memu`, emulation and FPGA prototyping: puts a gate-level netlist
+  (structural Verilog over a Liberty library) on a board of FPGAs. Clock
+  conversion onto one free-running clock (strobes for clean clocks, edge
+  detection for gated, divided and data-read clocks, any number of unrelated
+  clocks), memory mapping to block RAM and LUT RAM, multilevel partitioning
+  under each FPGA's capacity on a board file, routing through FPGAs and
+  time-division multiplexing where wires are short, probes with a trigger
+  and `memu -trace` to a VCD, and a generated testbench that runs the
+  netlist against the emulation. Transactors (`emu/sv`): an AXI4-Lite slave
+  that carries the design's accesses to `msim -mvp` models and an AXI4-Lite
+  master driven by a testbench class through a virtual interface, both
+  stopping the design's clock while the host answers. Multi-threaded with
+  thread-independent results. See `docs/EMULATION.md`.
 - `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
   failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
   `strong()`, `always s_eventually`) is proven or falsified with a loop
