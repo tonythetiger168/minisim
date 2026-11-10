@@ -100,6 +100,8 @@ public:
                     for (auto& in : p.prog->code) { if (in.k != IK::Assign) break; comb++; }
             if (comb > 64 && comb > 8 * nba) dom.clear();
         }
+        for (auto& p : procs)   // the domain inlines straight-line comb statements only
+            if (p.combRank >= 0 && combBranches(*p.prog)) dom.clear();
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
         for (size_t i = 0; i < procs.size(); i++) {
             bool inDom = std::find(dom.begin(), dom.end(), (int)i) != dom.end();
@@ -940,7 +942,15 @@ private:
         return o.str();
     }
     static bool oneAssign(const Prog& p) {
-        return p.code.size() >= 2 && p.code[0].k == IK::Assign && p.code[1].k != IK::Assign;
+        return p.code.size() >= 2 && p.code[0].k == IK::Assign && p.code[1].k == IK::WaitEdge;
+    }
+    // A static combinational process with if / case (prog.hpp: combShape).
+    static bool combBranches(const Prog& p) {
+        for (auto& i : p.code) {
+            if (i.k == IK::WaitEdge) return false;
+            if (i.k == IK::JmpIfNot || i.k == IK::Jmp) return true;
+        }
+        return false;
     }
 
     // The cycle domain: the largest group of clocked processes that wait on
@@ -1415,13 +1425,20 @@ private:
     void emitComb(std::ostream& o, int n, const Prog& p, const std::string& kind) {
         o << "// process " << n << " (" << kind << ", combinational)\n";
         o << "static void comb" << n << "(const void*) {\n";
-        for (size_t pc = 0; pc < p.code.size(); pc++) {
+        auto L = [&](size_t pc) { return "c" + std::to_string(n) + "_" + std::to_string(pc); };
+        size_t pc = 0;
+        for (; pc < p.code.size(); pc++) {
             const Instr& i = p.code[pc];
+            if (i.k == IK::JmpIfNot) {
+                o << L(pc) << ":" << CH(&p, pc) << " if (truth(" << fast(i.e) << ") != 1) " << jumpTo(&p, pc, L(i.target)) << "\n";
+                continue;
+            }
+            if (i.k == IK::Jmp) { o << L(pc) << ":" << CH(&p, pc) << " goto " << L(i.target) << ";\n"; continue; }
             if (i.k != IK::Assign) break;
             if (i.arr || i.bidx) throw CodegenUnsupported("variable-index write in a static combinational process");
-            o << "  " << CH(&p, pc) << " " << assign(i);
+            o << L(pc) << ":" << CH(&p, pc) << " " << assign(i);
         }
-        o << "}\n";
+        o << L(pc) << ": ;\n}\n";
         if (oneAssign(p)) {
             o << "static Val combv" << n << "(const void*) {" << CH(&p, 0) << " return " << fast(p.code[0].e) << "; }\n";
             o << "static void combc" << n << "(const void*, Val v) {" << assign(p.code[0], "v") << "}\n";
