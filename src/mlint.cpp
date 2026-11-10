@@ -27,6 +27,7 @@
 #include "cpu.hpp"
 #include "lintir.hpp"
 #include "lintrules.hpp"
+#include "parallel.hpp"
 #include "upf.hpp"
 #include "version.hpp"
 
@@ -320,7 +321,7 @@ int main(int argc, char** argv) {
     lintcfg::Config cfg;
     bool werror = false, quiet = false, powerTopSet = false, showWaived = false, list = false, stats = false;
     std::string upfPath, powerTop, jsonPath, explainRule;
-    unsigned threads = (unsigned)std::max<size_t>(1, cpuTopo().cpus.size());
+    unsigned threads = par::defaultThreads();
     FrontEnd fe;
     cdc::Options cdcOpt;
     for (int i = 1; i < argc; i++) {
@@ -368,7 +369,7 @@ int main(int argc, char** argv) {
         if (a == "-json") { jsonPath = next("a file"); continue; }
         if (a == "-threads") {
             std::string n = next("a count");
-            if (n == "all") { threads = (unsigned)std::max<size_t>(1, cpuTopo().cpus.size()); continue; }
+            if (n == "all") { threads = par::defaultThreads(); continue; }
             int v = std::atoi(n.c_str());
             if (v < 1) { std::cerr << "mlint: -threads needs a count of 1 or more, or all\n"; return 2; }
             threads = (unsigned)v;
@@ -471,7 +472,7 @@ int main(int argc, char** argv) {
     const size_t fixed = 4, nb = bodies.out.size();
     std::vector<Report> reps(fixed + nb, rep);
     std::vector<lintrules::BodyOut> outs(nb);
-    lintrules::parallelFor(fixed + nb, threads, [&](size_t i) {
+    par::parallelFor(fixed + nb, threads, [&](size_t i) {
         Report& r = reps[i];
         if (i == 0) {
             for (const Block& b : d.blocks) checkBlock(b, r);

@@ -15,9 +15,7 @@
 //                connections.
 //   * the definitions (files and module names), and the unused-signal rules,
 //     which need every body's reads and writes merged.
-#include <atomic>
 #include <regex>
-#include <thread>
 
 #include "lintcfg.hpp"
 #include "lintir.hpp"
@@ -1849,29 +1847,6 @@ inline void checkUnused(std::vector<BodyOut>& outs, Report& rep) {
                 else if (!w) rep.add("UNU003", c.loc, q + " is read but never driven");
             }
         }
-}
-
-// ------------------------------------------------------------------- the pool
-
-// Runs tasks 0..n-1 on `threads` threads. Each task writes only its own
-// slot, so the result does not depend on which thread ran what.
-template<typename F>
-void parallelFor(size_t n, unsigned threads, F&& fn) {
-    if (threads <= 1 || n <= 1) {
-        for (size_t i = 0; i < n; i++) fn(i);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    auto work = [&] {
-        for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < n;
-             i = next.fetch_add(1, std::memory_order_relaxed))
-            fn(i);
-    };
-    std::vector<std::thread> pool;
-    unsigned k = (unsigned)std::min<size_t>(threads, n);
-    for (unsigned t = 1; t < k; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
 }
 
 }  // namespace lintrules
