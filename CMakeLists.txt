@@ -36,11 +36,6 @@ foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_l
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
-# The SAT solver and bit-vector logic behind mequiv (src/equiv); no dependencies.
-add_executable(test_sat tests/test_sat.cpp)
-target_include_directories(test_sat PRIVATE src)
-target_compile_options(test_sat PRIVATE -UNDEBUG)
-add_test(NAME test_sat COMMAND test_sat)
 # The Liberty (.lib) reader shared by the timing, synthesis, power and
 # equivalence tools (src/liberty.hpp); no external dependencies.
 add_executable(test_liberty tests/test_liberty.cpp)
@@ -89,6 +84,7 @@ endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
 include(cmake/tools/mrcx.cmake)
+include(cmake/tools/mequiv.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -174,13 +170,6 @@ if(MINISIM_WITH_SLANG)
   target_include_directories(mdebug PRIVATE src)
   find_package(Threads REQUIRED)
   target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
-
-  # Logic equivalence checking (RTL vs netlist, netlist vs netlist):
-  # mequiv -ref rtl.sv -impl netlist.v cells.v
-  find_package(Threads REQUIRED)
-  add_executable(mequiv src/mequiv.cpp)
-  target_include_directories(mequiv PRIVATE src)
-  target_link_libraries(mequiv PRIVATE slang::slang Threads::Threads)
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -346,10 +335,6 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
 
-  add_test(NAME mequiv
-           COMMAND ${CMAKE_COMMAND} -DMEQUIV=$<TARGET_FILE:mequiv>
-                   -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mequiv.cmake)
-
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec
@@ -377,7 +362,6 @@ include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-  install(TARGETS mequiv RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
