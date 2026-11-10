@@ -66,7 +66,7 @@ for name in sorted(os.listdir(rules_dir)):
 # Every rule in the table is exercised by some file (CDC has its own test).
 rc, out, _ = run(["-list"])
 listed = [l.split()[0] for l in out.splitlines() if l.strip()]
-untested = [r for r in listed if r not in tested and not r.startswith(("CDC", "UPF"))]
+untested = [r for r in listed if r not in tested and not r.startswith(("CDC", "RDC", "UPF"))]
 if untested:
     fail(f"rules with no test: {untested}")
 for l in out.splitlines():

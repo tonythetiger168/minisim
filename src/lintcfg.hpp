@@ -223,7 +223,14 @@ inline const std::vector<RuleInfo>& table() {
 
         // --------------------------------------------------------------------- cdc
         {"CDC001", "cdc", Sev::Warning, true, "a clock-domain crossing with no synchronizer, or only one flop", ""},
-        {"CDC002", "cdc", Sev::Warning, true, "a multi-bit bus crossing through a two-flop synchronizer", ""},
+        {"CDC002", "cdc", Sev::Warning, true, "a multi-bit bus crossing through a synchronizer, not Gray coded", ""},
+        {"CDC003", "cdc", Sev::Warning, true, "combinational logic in front of a synchronizer (a glitch can be captured)", ""},
+        {"CDC004", "cdc", Sev::Warning, true, "separately synchronized signals of one domain meet again (reconvergence)", ""},
+        {"CDC005", "cdc", Sev::Warning, true, "one signal synchronized more than once into the same domain", ""},
+        {"RDC001", "rdc", Sev::Warning, true, "an asynchronous reset generated in another clock domain", ""},
+        {"RDC002", "rdc", Sev::Warning, true, "one asynchronous reset used directly in several clock domains", ""},
+        {"RDC003", "rdc", Sev::Warning, true, "a flop feeds a flop with a different asynchronous reset, in one clock domain", ""},
+        {"RDC004", "rdc", Sev::Warning, false, "a reset flop feeds a flop with no asynchronous reset", ""},
     };
     return t;
 }

@@ -46,6 +46,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
+| `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
+| `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -358,6 +360,7 @@ design, so it needs no separate build setup:
 mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
 mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any warning (for CI)
 mlint rtl/*.sv -disable L004 -disable CDC002
+mlint rtl/*.sv -top soc_top -cdc-report     # clock domains, resets, every crossing
 mlint -list                                 # the rules
 ```
 
@@ -372,7 +375,7 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `unused`, `connect` | `UNU001`..`UNU005`, `CON001`..`CON004` | never read, never driven, floating inputs, positional connections, implicit nets |
 | `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
 | `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
-| `cdc` | `CDC001`, `CDC002` | crossings with no synchronizer, multi-bit buses through flops |
+| `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
 mlint rtl/*.sv -config mlint.cfg -waivers waivers.cfg -json lint.json
@@ -387,9 +390,11 @@ honoured. Stale waivers are reported. mlint runs on every logical CPU
 (`-threads N`), with the same output for any count. The full rule table,
 the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 
-Clock domains come from the clock of every edge-triggered block, with signals
-joined across port connections, so one clock passed down through several
-modules stays one domain. Findings print as
+Clock and reset domains are found from the RTL: the clock of every
+edge-triggered block, followed through ports, buffers and clock gates, so one
+clock passed down through several modules stays one domain. `-cdc-report`
+lists every domain and crossing, `-clock-group a,b` declares related clocks
+and `-static sig` waives a quasi-static signal. Findings print as
 `file:line:col: severity: [RULE] text`, sorted by file and line.
 
 ### Source-level debug: `mdebug`
@@ -452,6 +457,26 @@ mdft: 5 flops in 3 clock domains
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
 boundaries.
+
+### Parasitic extraction: `mrcx`
+
+`mrcx` reads a routed DEF and its LEF and writes every net's resistance and
+capacitance, coupling included, as SPEF for timing and power analysis:
+
+```sh
+mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef
+mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o slow.spef
+```
+
+```
+mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5086 coupling capacitors
+mrcx: capacitance 2238 fF to ground, 288.8 fF between nets (sky130 stack, 25 C)
+```
+
+It runs on every core (`-threads N`), writes the same file for any thread
+count, and reports open and shorted nets. On the OpenROAD `gcd` test design
+its total net capacitance is within 1% of OpenRCX's. See
+[`docs/RCX.md`](docs/RCX.md).
 
 ### Virtual prototypes: `-mvp`
 

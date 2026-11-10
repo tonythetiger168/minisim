@@ -45,6 +45,90 @@ if(out MATCHES "t.s1|t.s2|t.b1")
   message(FATAL_ERROR "cdc.sv: a clean crossing was reported:\n${out}")
 endif()
 
+# Every crossing rule fires once on cdc_bad.sv (CDC003 names both sources).
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003")
+foreach(want
+    "[CDC001] 'cdc_bad.a1' (clocked by cdc_bad.aclk) is read by logic clocked by cdc_bad.bclk with no synchronizer"
+    "[CDC002] 'cdc_bad.abus' (clocked by cdc_bad.aclk) is read by logic clocked by cdc_bad.bclk through 2 flops, but it is 4 bits wide"
+    "[CDC003] 'cdc_bad.a1' (clocked by cdc_bad.aclk) is read by logic clocked by cdc_bad.bclk through combinational logic in front of the synchronizer 'cdc_bad.g1'"
+    "[CDC003] 'cdc_bad.a2'"
+    "[CDC004] 'cdc_bad.a3', 'cdc_bad.a4' (clocked by cdc_bad.aclk) are synchronized separately and meet again at 'cdc_bad.o_recon'"
+    "[CDC005] 'cdc_bad.a3' (clocked by cdc_bad.aclk) is synchronized 2 times into the domain of cdc_bad.bclk ('cdc_bad.s3', 'cdc_bad.f1')"
+    "[RDC002] asynchronous reset 'cdc_bad.rst_n' is used directly by flops in 2 clock domains (cdc_bad.aclk, cdc_bad.bclk)"
+    "7 findings (CDC001 1, CDC002 1, CDC003 2, CDC004 1, CDC005 1, RDC002 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_bad.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
+# The safe schemes: a shift-register synchronizer in a module, an
+# enable-qualified bus, a Gray pointer, reset synchronizers, a gated clock.
+# The divided clock is a domain of its own until -clock-group says otherwise.
+run(cdc_clean.sv "-top;cdc_clean;-only;cdc,RDC001,RDC002,RDC003")
+if(NOT out MATCHES "\\[CDC001\\] 'cdc_clean.req' \\(clocked by cdc_clean.aclk\\) is read by logic clocked by cdc_clean.div"
+   OR NOT out MATCHES "\\[RDC001\\] asynchronous reset 'cdc_clean.a_rst_n' \\(clocked by cdc_clean.aclk\\) resets 1 flop clocked by cdc_clean.div"
+   OR NOT out MATCHES "2 findings")
+  message(FATAL_ERROR "cdc_clean.sv: expected the divided clock's two findings only:\n${out}")
+endif()
+run(cdc_clean.sv "-top;cdc_clean;-only;cdc,RDC001,RDC002,RDC003;-clock-group;aclk,div;-Werror;-cdc-report")
+foreach(want
+    "clock domains: 2"
+    "cdc_clean.req (cdc_clean.aclk) -> cdc_clean.u_req.s (cdc_clean.bclk)  4-flop synchronizer"
+    "cdc_clean.hold (cdc_clean.aclk) -> cdc_clean.dout (cdc_clean.bclk)  enable-qualified"
+    "cdc_clean.gray (cdc_clean.bclk) -> cdc_clean.gsync (cdc_clean.aclk)  2-flop synchronizer, Gray coded"
+    "mlint: 0 findings")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_clean.sv -cdc-report missing: ${want}\n${out}")
+  endif()
+endforeach()
+# -static: a1 is said not to change while it is read, so its two findings go.
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-static;cdc_bad.a1")
+if(out MATCHES "cdc_bad.a1'" OR NOT out MATCHES "5 findings \\(CDC002 1, CDC003 1, CDC004 1, CDC005 1, RDC002 1\\)")
+  message(FATAL_ERROR "cdc_bad.sv -static did not take:\n${out}")
+endif()
+
+# Bits of one bus are separate clocks, and a bus synchronized bit by bit is
+# one Gray-coded crossing, not four synchronizers of one signal.
+run(cdc_bits.sv "-top;cdc_bits;-only;cdc,RDC001,RDC002,RDC003;-cdc-report")
+foreach(want
+    "clock domains: 2"
+    "cdc_bits.clk[0]  1 flop"
+    "cdc_bits.clk[1]  4 flops"
+    "cdc_bits.u.w (cdc_bits.clk[0]) -> cdc_bits.g[3].i_s.r (cdc_bits.clk[1])  2-flop synchronizer, Gray coded"
+    "mlint: 0 findings")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_bits.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
+# Reset crossings; RDC004 is off until -enable.
+run(rdc.sv "-top;rdc;-only;cdc,RDC001,RDC002,RDC003")
+foreach(want
+    "[RDC001] asynchronous reset 'rdc.wd_rst_n' (clocked by rdc.aclk) resets 1 flop clocked by rdc.bclk"
+    "[RDC002] asynchronous reset 'rdc.por_n' is used directly by flops in 2 clock domains (rdc.aclk, rdc.bclk)"
+    "[RDC003] 'rdc.s', reset by 'rdc.soft_n', feeds 'rdc.q3', reset by 'rdc.por_n', in the domain of rdc.aclk"
+    "3 findings")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "rdc.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+run(rdc.sv "-top;rdc;-only;cdc,RDC001,RDC002,RDC003;-enable;RDC004")
+if(NOT out MATCHES "\\[RDC004\\] 'rdc.s', reset by 'rdc.soft_n', feeds 'rdc.q4', which has no asynchronous reset" OR NOT out MATCHES "4 findings")
+  message(FATAL_ERROR "rdc.sv -enable RDC004:\n${out}")
+endif()
+
+# The findings do not depend on the thread count.
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
+set(one "${out}")
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;8")
+if(NOT one STREQUAL out)
+  message(FATAL_ERROR "-threads 1 and -threads 8 differ:\n${one}\n---\n${out}")
+endif()
+
 # Nothing to report with every default rule on, and -Werror still exits 0.
 # (STY001: the file holds its submodule too.)
 run(clean.sv "-top;clean;-Werror;-disable;STY001")

@@ -170,7 +170,22 @@ a module with no ports, or a module named in `tb.modules`.
 | Rule | Severity | Default | What it finds |
 |---|---|---|---|
 | `CDC001` | warning | on | A clock-domain crossing with no synchronizer, or only one flop |
-| `CDC002` | warning | on | A multi-bit bus crossing through a two-flop synchronizer |
+| `CDC002` | warning | on | A multi-bit bus crossing through a synchronizer, not Gray coded |
+| `CDC003` | warning | on | Combinational logic in front of a synchronizer (a glitch can be captured) |
+| `CDC004` | warning | on | Separately synchronized signals of one domain meet again (reconvergence) |
+| `CDC005` | warning | on | One signal synchronized more than once into the same domain |
+
+### Reset-domain crossings (`rdc`)
+
+| Rule | Severity | Default | What it finds |
+|---|---|---|---|
+| `RDC001` | warning | on | An asynchronous reset generated in another clock domain |
+| `RDC002` | warning | on | One asynchronous reset used directly in several clock domains |
+| `RDC003` | warning | on | A flop feeds a flop with a different asynchronous reset, in one clock domain |
+| `RDC004` | warning | off | A reset flop feeds a flop with no asynchronous reset |
+
+How domains and synchronizers are recognized, and the options `-cdc-report`,
+`-clock-group` and `-static`, are in [CDC.md](CDC.md).
 
 The UPF rules (`UPF001`..`UPF006`, with `-upf`) are in `docs/LOWPOWER.md`.
 Design-for-test rules (gated clocks, logic-driven resets, divided clocks,
