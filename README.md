@@ -51,6 +51,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
 | `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
 | `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
+| `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
+| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck and design rule checks |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -670,6 +672,27 @@ count, and reports open and shorted nets. On the OpenROAD `gcd` test design
 its total net capacitance is within 2% of OpenRCX's, and the ground and
 coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
+### Physical verification: `mpv`
+
+`mpv drc` checks a GDSII layout against a rule deck: width, spacing,
+enclosure, overhang, area and density checks on drawn and derived layers
+(`&`, `|`, `-`, `grow`, `interact`, ...). It needs no slang and builds with
+the default configuration.
+
+```sh
+mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
+mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
+```
+
+```
+rule poly.1a  width(poly) < 0.15            "poly width"
+rule poly.8   overhang(poly, diff) < 0.13   "poly end cap beyond diff"
+rule licon.5a enclosure(licon & diff, diff | tap) < 0.04  "diff enclosure of licon"
+```
+
+It runs on every hardware thread by default (`-threads N`), with the same
+report for every thread count. The deck format, the results file and the
+limits are in [docs/MPV.md](docs/MPV.md).
 
 ### Virtual prototypes: `-mvp`
 
