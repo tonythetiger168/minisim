@@ -1,0 +1,5 @@
+# mplan self-test regression (tests/mplan.cmake).
+count_up:    ../cov/counter.sv -top tb +define+MODE=0
+count_wrap:  ../cov/counter.sv -top tb +define+MODE=1
+count_down:  ../cov/counter.sv -top tb +define+MODE=2
+sb_check:    ../cov/counter.sv -top tb +define+MODE=3

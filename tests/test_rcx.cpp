@@ -75,6 +75,10 @@ int main() {
         double epsG = kEps0 * 3.9, epsL = kEps0 * 2.9;
         double cg = epsG * (1.15 * w / h + 2.80 * std::pow(t / h, 0.222)) * len;
         double cc = epsL * (0.03 * w / h + 0.83 * t / h - 0.07 * std::pow(t / h, 0.222)) * std::pow(s / h, -1.34) * len;
+        // the neighbour takes 0.2h / (s + 0.2h) of the fringe on its side from ground
+        double moved = epsG * 1.40 * std::pow(t / h, 0.222) * len * (0.2 * h / (s + 0.2 * h));
+        cg -= moved;
+        cc += moved;
         assert(near(R.nets[0].cgTotal, cg) && near(R.nets[1].cgTotal, cg));
         assert(near(coupling(R, 0, 1), cc) && near(coupling(R, 1, 0), cc));
         assert(near(R.nets[0].wirelen, 10.0) && R.nets[0].opens == 0 && R.shorts.empty());
@@ -116,9 +120,14 @@ int main() {
         Result R = extract(L, makeStack(L, &itf), opt);
         const double w = 0.1, t = 0.15, h = 0.4;
         double k = kEps0 * 2.9 * (0.03 * w / h + 0.83 * t / h - 0.07 * std::pow(t / h, 0.222));
+        double fr = kEps0 * 3.9 * 1.40 * std::pow(t / h, 0.222);
         // a sees c only over the 4 um that mid does not cover, at 0.3 um
-        assert(near(coupling(R, 0, 2), k * std::pow(0.3 / h, -1.34) * 4.0));
-        assert(near(coupling(R, 0, 1), k * std::pow(0.1 / h, -1.34) * 6.0));
+        assert(near(coupling(R, 0, 2), (k * std::pow(0.3 / h, -1.34) + fr * 0.2 * h / (0.3 + 0.2 * h)) * 4.0));
+        assert(near(coupling(R, 0, 1), (k * std::pow(0.1 / h, -1.34) + fr * 0.2 * h / (0.1 + 0.2 * h)) * 6.0));
+        // moving fringe from ground to coupling leaves a's total as it was
+        double total = kEps0 * 3.9 * (1.15 * w / h + 2.80 * std::pow(t / h, 0.222)) * 10 +
+                       k * (std::pow(0.3 / h, -1.34) * 4.0 + std::pow(0.1 / h, -1.34) * 6.0);
+        assert(near(R.nets[0].cgTotal + R.nets[0].ccTotal, total));
     }
 
     // --- power metal next to a wire loads it to ground
@@ -167,6 +176,33 @@ int main() {
             else rwire += r.r;
         }
         assert(near(rvia, 3.0) && rpin > 0 && near(rwire, 0.4 * 20 + 0.3 * 30));
+    }
+
+    // --- two layers apart: coupling through what the layer between leaves open
+    {
+        Stack three = Stack::parseItf(
+            "DIELECTRIC d3 { THICKNESS = 0.5 ER = 3.9 }\n"
+            "CONDUCTOR m3 { THICKNESS = 0.2 RPSQ = 0.1 }\n"
+            "DIELECTRIC d2 { THICKNESS = 0.4 ER = 3.9 }\n"
+            "CONDUCTOR m2 { THICKNESS = 0.2 RPSQ = 0.3 }\n"
+            "DIELECTRIC d1 { THICKNESS = 0.35 ER = 3.9 }\n"
+            "CONDUCTOR m1 { THICKNESS = 0.15 RPSQ = 0.4 }\n"
+            "DIELECTRIC d0 { THICKNESS = 0.4 ER = 3.9 }\n", "three.itf");
+        Layout L = base();
+        L.layers.push_back({"m3", 0.1, 0.1, 0.1, -1, -1, -1, -1});
+        L.nets.push_back(wire("lo", 0, 0, 0, 10000, 0));
+        L.nets.push_back(wire("hi", 2, 0, 0, 10000, 0));
+        Stack st = makeStack(L, &three);
+        Result R = extract(L, st, opt);
+        // m1 top 0.55, m3 bottom 1.15: 0.6 um; the wires overlap over 10 x 0.1 um
+        double d = 0.6, tbar = 0.175;
+        double c2 = kEps0 * 3.9 * (1.15 * 1.0 / d + 0.70 * 2 * 10.1 * std::pow(tbar / d, 0.222));
+        assert(near(coupling(R, 1, 0), c2) && near(coupling(R, 0, 1), c2));
+        // a wire of a third net on m2 over 4 um of the 10 hides that part
+        L.nets.push_back(wire("mid", 1, 3000, 0, 7000, 0));
+        Result S = extract(L, makeStack(L, &three), opt);
+        assert(near(coupling(S, 1, 0), 0.6 * c2));
+        assert(coupling(S, 2, 0) > 0 && coupling(S, 1, 2) > 0);
     }
 
     // --- opens and shorts
