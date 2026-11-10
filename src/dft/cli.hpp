@@ -3,6 +3,7 @@
 //   mdft -bscan [options] design.sv -top M     insert boundary scan, write BSDL
 //   mdft -bsdl chip.bsdl [-svf F] [-tb F]      check a BSDL file, write its tests
 //   mdft -icl net.icl [-pdl t.pdl] [...]       IJTAG: network RTL and retargeted PDL
+//   mdft -diagnose fails.log -patterns P net.v   failure diagnosis on a gate netlist
 //
 // parse() runs the flows that need no design and returns their exit code; it
 // returns -1 when mdft should go on (with the options of this file removed
@@ -12,6 +13,7 @@
 #include <thread>
 
 #include "bscan.hpp"
+#include "diag.hpp"
 #include "edt.hpp"
 #include "lbist.hpp"
 #include "pdl.hpp"
@@ -29,6 +31,8 @@ struct Cli {
     std::vector<std::string> icl, pdl;
     std::vector<char*> rest;
     int threads = 0;
+    DiagOpts dg;
+    bool diag = false;
 
     static void usage(std::ostream& os) {
         os << "boundary scan (IEEE 1149.1):\n"
@@ -67,6 +71,16 @@ struct Cli {
               "  -edt_fill random|0     the free channel bits (default random)\n"
               "  -edt_out DIR           where <top>_edt.sv and its testbench go (default .)\n"
               "  -threads N             encode on N threads (default: every core; the result is the same)\n"
+              "failure diagnosis (gate netlist, no SystemVerilog front end):\n"
+              "  -diagnose FAILLOG      rank the faults that explain a tester fail log; needs the netlist,\n"
+              "                         -patterns, and -lib / -top / -se as given to matpg\n"
+              "  -patterns FILE         the patterns that were applied (matpg -patterns)\n"
+              "  -diag_fault stuck|transition   the fault model and pattern set (default stuck)\n"
+              "  -diag_defects N        diagnose up to N defects (default 4)\n"
+              "  -diag_suspects N       list up to N suspects per defect (default 10)\n"
+              "  -diag_json FILE        the report as JSON\n"
+              "  -diag_inject 'sa0 PIN' simulate this fault instead of reading a log (repeatable)\n"
+              "  -diag_log FILE         with -diag_inject: write the fail log it produces\n"
               "IJTAG (IEEE 1687):\n"
               "  -icl FILE              read ICL (repeatable)     -icl_top M   the top ICL module\n"
               "  -icl_scan_out PORT     the ScanOutPort to use when the top module has several\n"
@@ -130,6 +144,14 @@ struct Cli {
                 else if (a == "-edt_patterns") eo.patterns = next();
                 else if (a == "-edt_fill") eo.fill = next();
                 else if (a == "-edt_out") eo.outDir = next();
+                else if (a == "-diagnose") dg.failLog = next(), diag = mine = true;
+                else if (a == "-diag_inject") dg.inject.push_back(next()), diag = mine = true;
+                else if (a == "-patterns") dg.patterns = next();
+                else if (a == "-diag_fault") dg.fault = next();
+                else if (a == "-diag_defects") dg.maxDefects = std::stoi(next());
+                else if (a == "-diag_suspects") dg.maxSuspects = std::stoi(next());
+                else if (a == "-diag_json") dg.json = next();
+                else if (a == "-diag_log") dg.writeLog = next();
                 else if (a == "-bsdl") bsdlFile = next(), mine = true;
                 else if (a == "-icl") icl.push_back(next()), mine = true;
                 else if (a == "-icl_top") iclTop = next();
@@ -155,6 +177,24 @@ struct Cli {
                 if (!svf.empty() || !tb.empty()) throw Error("-svf and -tb need -bscan, -bsdl or -pdl");
                 return -1;
             }
+            if (diag) {
+                // The rest of the line is the netlist and how to read it.
+                for (size_t k = 1; k < rest.size(); k++) {
+                    std::string a = rest[k];
+                    auto val = [&]() -> std::string {
+                        if (k + 1 >= rest.size()) throw Error(a + " needs a value");
+                        return rest[++k];
+                    };
+                    if (a == "-top") dg.top = val();
+                    else if (a == "-lib") dg.libs.push_back(val());
+                    else if (a == "-se") dg.se = val();
+                    else if (a == "-quiet" || a == "-q" || a == "-Werror") continue;
+                    else if (a[0] == '-') throw Error("-diagnose does not take " + a);
+                    else dg.files.push_back(a);
+                }
+                dg.threads = threads, dg.quiet = quiet;
+                return runDiagnose(dg);
+            }
             if ((int)lbist + (int)bscan + (int)edt + (int)edtEncode > 1) throw Error("-bscan, -lbist, -edt and -edt_encode are separate runs");
             if ((edt || edtEncode) && lo.scandef.empty()) throw Error("-edt needs -scandef FILE");
             eo.scandef = lo.scandef, eo.threads = threads;
@@ -170,6 +210,9 @@ struct Cli {
             if (!bsdlFile.empty()) return runBsdl(bsdlFile, true);
             if (!icl.empty()) return runIjtag();
         } catch (const Error& e) {
+            std::cerr << "mdft: " << e.what() << "\n";
+            return 2;
+        } catch (const DiagError& e) {
             std::cerr << "mdft: " << e.what() << "\n";
             return 2;
         } catch (const std::exception& e) {

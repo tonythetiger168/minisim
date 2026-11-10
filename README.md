@@ -441,6 +441,7 @@ mdft -bsdl chip.bsdl -svf chip.svf               # check a BSDL file (BSD001..00
 mdft -icl net.icl -icl_rtl net.sv -pdl t.pdl -iproc all -svf t.svf   # IJTAG network RTL, PDL retargeting
 mdft -lbist chip_scan.v -top chip -scandef chains.json -lbist_sign    # logic BIST wrapper, golden signature
 mdft -edt chip_scan.v -top chip -scandef chains.json -edt_cubes cubes.txt -edt_patterns p.txt   # scan compression
+mdft -diagnose fails.log -patterns pats.txt chip_scan.v -top chip   # which faults explain a tester fail log
 ```
 
 `mlint` and `mdft` share one model of the elaborated design

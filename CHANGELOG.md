@@ -18,6 +18,12 @@ Spec references are IEEE 1800-2023 clauses.
   polynomial, phase shifter, space compactor, MISR, controller and wrapper),
   the golden signature by simulation (`-lbist_sign`), a check for X sources,
   and ICL / PDL to run it over IJTAG.
+- `mdft -diagnose`: scan failure diagnosis. Reads a tester fail log (pattern,
+  chain, cell or output) with matpg's patterns and the gate netlist, and ranks
+  the stuck-at or transition faults that explain it, with equivalent faults
+  and a second, third... defect when one does not explain everything. Uses
+  the shared fault simulator; multithreaded with the same report on any
+  thread count. See docs/JTAG.md.
 - `mdft -edt`: scan test compression. A ring-generator decompressor and an
   XOR compactor around the scan chains, and an encoder that solves test
   cubes into channel data over GF(2), in parallel and deterministically.

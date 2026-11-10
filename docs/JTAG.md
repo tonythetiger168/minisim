@@ -18,7 +18,7 @@ msim rtl/chip.sv chip_bscan.sv chip_tb.sv -top chip_tb      # prints "chip_tb: P
 ```
 
 The code is in `src/dft/`: `jtag.hpp` (patterns, SVF, testbench, TAP RTL),
-`bscan.hpp`, `icl.hpp`, `pdl.hpp`, `cli.hpp`.
+`bscan.hpp`, `icl.hpp`, `pdl.hpp`, `lbist.hpp`, `edt.hpp`, `diag.hpp`, `cli.hpp`.
 
 ## Boundary scan insertion: `mdft -bscan`
 
@@ -241,3 +241,88 @@ Not there yet: X masking in the compactor (an unknown response bit spoils its
 output channel for that cycle), expected compacted responses (they need the
 good-machine responses from fault simulation), and reading the ATPG tool's
 own pattern format directly.
+
+## Failure diagnosis: `mdft -diagnose`
+
+When a part fails scan test, the tester's fail log says which scan cells and
+outputs came back wrong in which patterns. Diagnosis works back from that to
+the faults that would produce exactly those failures.
+
+```
+matpg chip_scan.v -lib cells.lib -top chip -patterns pats.txt
+mdft -diagnose fails.log -patterns pats.txt chip_scan.v -lib cells.lib -top chip
+```
+
+It reads the gate netlist the way `matpg` does (`-lib`, `-top`, `-se`) and
+uses the same fault simulator (`src/faultsim.hpp`), so a fault means the same
+thing in both tools. No SystemVerilog front end is involved.
+
+The fail log has one failing observation per line:
+
+```
+# comment
+top chip              optional, checked against the netlist
+last 412              optional: the tester stopped after pattern 412
+17 3 250              pattern 17, chain 3, cell 250 unloaded the wrong value
+17 po done            pattern 17, output port bit `done` was wrong
+```
+
+Patterns count from 0 in pattern file order (the stuck-at set first, then the
+transition set). Chains count from 0 in the order `matpg` prints them. Cells
+count from 0 at the scan-in end, and a failure refers to the value the cell
+captured, so inversions along the chain are already taken out.
+
+The report ranks the suspects:
+
+```
+mdft: diagnosis of chip: 2856 failing bits in 1396 of 4677 stuck patterns, 75 candidate faults
+  defect 1: explains 2738 of 2856 failing bits
+    rank   score   tfsf   tfsp   tpsf  fault
+       1   95.9%   2738    118      0  sa0 U6609/A
+                                         = sa0 U6609/B
+                                         = sa1 U6609/Y
+       2   95.4%   2738    118     14  sa0 U4040/Y
+  defect 2: explains 118 of 118 failing bits
+       1  100.0%    118      0      0  sa1 U14941/A
+```
+
+- `tfsf`: bits that fail on the tester and with this fault (explained).
+- `tfsp`: bits that fail on the tester but not with this fault.
+- `tpsf`: bits that pass on the tester but would fail with this fault.
+- `score` is `tfsf / (tfsf + tfsp + tpsf)`. Lines with `=` are faults no test
+  can tell apart from the one above (the same equivalence class).
+
+When the best suspect leaves failures unexplained, what it explains is taken
+out of the log and the rest is diagnosed as a further defect, up to
+`-diag_defects` (default 4). The exit code is 1 when failures remain that no
+reported fault explains, 2 on bad input.
+
+| Option | Meaning |
+| --- | --- |
+| `-diagnose FILE` | the fail log |
+| `-patterns FILE` | the patterns that were applied (`matpg -patterns`) |
+| `-diag_fault stuck\|transition` | fault model and pattern set (default `stuck`) |
+| `-diag_defects N` | diagnose up to N defects (default 4) |
+| `-diag_suspects N` | list up to N suspects per defect (default 10) |
+| `-diag_json FILE` | the report as JSON |
+| `-diag_inject 'sa0 PIN'` | simulate this fault instead of reading a log (repeatable); `str`/`stf` with `-diag_fault transition` |
+| `-diag_log FILE` | with `-diag_inject`: write the fail log and stop |
+| `-threads N` | default every core; the report is the same for any N |
+
+How it works: only a fault in the fan-in of every failing point of a pattern
+can explain that pattern alone, which gives the candidates. All of them are
+simulated on the first 64 patterns that hold failures; the 256 that score
+best there are simulated on every pattern. Blocks of 64 patterns run in
+parallel, one fault simulator per thread.
+
+Limits: one fault at a time is simulated, so two defects whose effects meet
+at the same observation point in the same pattern are only partly explained.
+`-diag_inject` with several faults makes the union of their separate logs,
+not the log of a part with both. Stuck-at diagnosis uses the stuck-at
+patterns and transition diagnosis the transition patterns; failures in the
+other set are counted and left out. Bridges, opens and chain (shift)
+failures are not modeled yet. Logs from compressed patterns need the
+compactor mapped back to cells first, which `-edt` does not do yet.
+
+Speed: a 60,000-gate, 6,000-flop netlist with 4,677 patterns and two
+injected defects diagnoses in 2.3 s on one thread and 0.6 s on four.
