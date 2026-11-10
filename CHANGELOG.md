@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdebug -blocks INST`, and a block diagram in the viewer: the instances
+  inside a scope, their port connections and which instance feeds which.
+- `mdebug`: tasks and functions in a module, call output arguments, `force`,
+  procedural `assign` and net declaration assignments are drivers and loads;
+  the fan-in cone follows a task argument to its calls.
 - `memu`, emulation and FPGA prototyping: puts a gate-level netlist
   (structural Verilog over a Liberty library) on a board of FPGAs. Clock
   conversion onto one free-running clock (strobes for clean clocks, edge
@@ -64,6 +69,16 @@ Spec references are IEEE 1800-2023 clauses.
   SAT on all cores, with a counterexample for each failing point. X in the
   reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
   `-report`. See `docs/EQUIV.md`.
+- `mpnr`, place and route for gate-level netlists: an automatic floorplan or
+  one from a DEF (`-floorplan`), analytic global placement, Abacus
+  legalization, refinement and filler cells, a negotiated-congestion detailed
+  router on the LEF track grid, and DEF out with a built-in check for opens,
+  shorts and spacing (`-check FILE.def` checks any routed DEF). Multithreaded
+  with identical results for any `-threads`. `-gds` writes the layout as GDSII
+  (LEF cell abstracts or real cells from `-gds_cells`, layer map with
+  `-gds_map`). Vertical power straps with via stacks tie the rows' rails
+  together (`-no_straps`, `-strap_layer`, `-strap_width`, `-strap_pitch`).
+  See `docs/PNR.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -99,6 +114,25 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Logic synthesis: `msynth`, a dc_shell-style Tcl shell (`analyze`,
+  `elaborate`, `create_clock`, `compile`, `report_timing`, `report_area`,
+  `report_qor`, `write -format verilog` ...) on the slang front end. RTL is
+  flattened into an and-inverter graph with flops (`src/aig.hpp`,
+  `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
+  mapped onto any Liberty library by cut matching for area or delay,
+  high-fanout nets are buffered, and the result is timed with the library's
+  NLDM tables. A generic cell library is built in. Mapping runs on every
+  core (`-threads N`) with the same netlist for any thread count. See
+  `docs/SYNTH.md`.
+- `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
+  types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
+  functions, all control flow but `goto`) is scheduled into clock cycles
+  under `-clock`, `-mul` and `-div`, with operator chaining, multi-cycle
+  operators, register and multiplier/divider sharing, and comes out as an
+  FSM with datapath or (`-pipeline`) a pipeline taking one input per cycle.
+  `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
+  calls with the host C++ compiler, `-explore` sweeps the clock period.
+  See `docs/HLS.md`.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -108,6 +142,9 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- `-xprop` is faster: an `if` evaluates its condition once, and clocked
+  blocks with merged branches run in parallel again. Ibex with `-xprop`:
+  42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
 - `-xprop`: an assignment to an array element chosen at run time
   (`if (we) mem[addr] <= d;`) is merged with the element's present value
   instead of blocking the merge or giving `x`.
@@ -159,6 +196,21 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -lef tech.lef routed.def`: design rule checking of a routed DEF,
+  with the rules taken from the LEF technology when no `-deck` is given
+  (`-write-deck` shows them).
+- `mpv lvs`: extracts the transistor netlist of a layout (nets from `connect`
+  statements, names and ports from `label`, MOS devices with W and L from
+  `device mos`) and writes it as SPICE. `src/lvs.hpp` also holds the netlist
+  comparison (partition refinement, parallel merging, source/drain
+  exchange). `tests/pv/sky130.lvs` is the SKY130 deck.
+- `mpv drc`: design rule checking on GDSII layouts. A rule deck defines drawn
+  and derived layers (`&`, `|`, `-`, `^`, `grow`, `shrink`, `interact`,
+  `inside`, `outside`, `holes`, ...) and width, spacing, enclosure, overhang,
+  area and density checks; violations are written as markers. Multithreaded
+  by default (`-threads N`) with the same report for every thread count. A
+  35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
+  is the shared GDSII reader and writer. See `docs/MPV.md`.
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
@@ -222,6 +274,17 @@ Spec references are IEEE 1800-2023 clauses.
   `docs/CONSTRAINTS.md`.
 - SDC reader: object lookups use sorted name indexes and `-filter` is parsed
   once, so large designs with thousands of queries read in seconds.
+- `msta`: static timing analysis of gate-level netlists in the style of
+  PrimeTime. Liberty (NLDM) delay calculation, ideal and propagated clocks,
+  generated clocks, setup / hold / recovery / removal and output delay
+  checks, false paths, multicycle paths, max and min delay, clock groups,
+  `max_transition` and `max_capacitance`; `check_timing`, `report_timing`,
+  `report_constraint`, `report_clocks`, `report_qor`, SDF and JSON output;
+  Tcl scripts on the shared SDC reader. Multithreaded, with the same results
+  at any thread count. See `docs/STA.md`.
+- `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
+  Verilog netlist reader / flattener / writer, shared by the timing,
+  synthesis, power, equivalence and physical tools.
 
 ### Fixed
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes

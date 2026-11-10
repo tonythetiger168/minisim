@@ -49,8 +49,11 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
+| `src/mpnr.cpp`, `src/pnr_*.hpp` | `mpnr` place and route: netlist database, placement, detailed router, DEF out, layout check ([docs/PNR.md](docs/PNR.md)) |
 | `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
 | `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
+| `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
+| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck and design rule checks |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -427,6 +430,18 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
+### High-level synthesis: `mhls`
+
+`mhls` turns a C/C++ function into SystemVerilog: an FSM with datapath, or
+with `-pipeline` a pipeline that takes one input per cycle. It also writes
+a self-checking testbench, so the result is one `msim` run away from proven
+against the C. See [docs/HLS.md](docs/HLS.md).
+
+```sh
+mhls fir.c -top fir -clock 5 -o fir.sv -tb fir_tb.sv
+msim fir.sv fir_tb.sv -top fir_tb          # PASS: fir 20 calls, latency 2..2 cycles
+```
+
 ### Datapath library: `dw/`
 
 `dw/` is a library of synthesizable, parameterized building blocks
@@ -460,6 +475,21 @@ msdc -list                                  # the rules
 The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
 (`src/tcl.hpp`) are shared with the timing and synthesis tools. See
 [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
+
+### Static timing analysis: `msta`
+
+`msta` times a gate-level netlist against SDC constraints with Liberty
+libraries, PrimeTime style, and builds without the slang front end:
+
+```sh
+msta -lib cells.lib netlist.v -top top -sdc top.sdc      # check_timing, worst setup and hold paths, summary
+msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf  # delays and timing checks for msim -sdf
+msta -f run.tcl                                          # report_timing, report_constraint, ... in a Tcl script
+```
+
+It runs on every core by default (`-threads N`), with the same results at any
+thread count. Commands, what is modeled and the current limits are in
+[docs/STA.md](docs/STA.md).
 
 ### Lint and clock-domain checks: `mlint`
 
@@ -531,6 +561,19 @@ isolation or level shifters, names not in the design, ...). See
 msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
+
+### Logic synthesis: `msynth`
+
+`msynth` synthesizes RTL to a gate netlist of Liberty library cells, with a
+Tcl shell whose commands follow dc_shell:
+
+```sh
+msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the built-in generic library
+msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
+```
+
+See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
 
 ### Formal property checking: `mformal`
 
@@ -655,6 +698,27 @@ count, and reports open and shorted nets. On the OpenROAD `gcd` test design
 its total net capacitance is within 2% of OpenRCX's, and the ground and
 coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
+### Physical verification: `mpv`
+
+`mpv drc` checks a GDSII layout against a rule deck: width, spacing,
+enclosure, overhang, area and density checks on drawn and derived layers
+(`&`, `|`, `-`, `grow`, `interact`, ...). It needs no slang and builds with
+the default configuration.
+
+```sh
+mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
+mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
+```
+
+```
+rule poly.1a  width(poly) < 0.15            "poly width"
+rule poly.8   overhang(poly, diff) < 0.13   "poly end cap beyond diff"
+rule licon.5a enclosure(licon & diff, diff | tap) < 0.04  "diff enclosure of licon"
+```
+
+It runs on every hardware thread by default (`-threads N`), with the same
+report for every thread count. The deck format, the results file and the
+limits are in [docs/MPV.md](docs/MPV.md).
 
 ### Virtual prototypes: `-mvp`
 
