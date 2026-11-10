@@ -66,4 +66,4 @@ check(0 "(3 stored inverted)" -ref invreg.sv -impl invreg_gates.v -lib cells.lib
 check(0 "1 flops, 4 latches" -top misc -blackbox ram -ref misc.sv -impl misc_gates.v -lib cells.lib)
 # Verilog models against Liberty for the same netlist: the two views agree.
 check(0 "passed 13" -lib cells.lib -ref alu_gates.v cells.v -impl alu_gates.v)
-check(2 "has no definition" -ref alu_rtl.sv -impl alu_gates.v)
+check(2 "unknown module" -ref alu_rtl.sv -impl alu_gates.v)
