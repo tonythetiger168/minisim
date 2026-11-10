@@ -52,6 +52,10 @@ jobs:
       - name: Fetch Accellera UVM (uvm-core 2020.3.1)
         run: git clone --depth 1 --branch 2020.3.1 https://github.com/accellera-official/uvm-core $HOME/uvm-core
 
+      # memu's test also runs its output through Yosys when there is one.
+      - name: Install Yosys (optional)
+        run: pip install --user yowasp-yosys && echo "$HOME/.local/bin" >> "$GITHUB_PATH" || true
+
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang
         run: sudo apt-get install -y libffi-dev && CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON -DUVM_HOME=$HOME/uvm-core && cmake --build build -j2 && ctest --test-dir build --output-on-failure
