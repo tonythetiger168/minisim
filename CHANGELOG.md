@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- FPGA synthesis: `mfpga` maps RTL or AIGER to K-input LUTs and flip-flops
+  (iCE40, ECP5, Xilinx 7-series, generic cells) on the shared graph of
+  `src/aig.hpp`, and writes Yosys JSON for nextpnr or EDIF. Depth-optimal
+  priority-cut mapping with area recovery; multithreaded, with the same output
+  for any `-threads N`. `docs/FPGA.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from

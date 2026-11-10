@@ -388,6 +388,18 @@ msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cell
 
 See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
 
+### FPGA synthesis: `mfpga`
+
+`mfpga` maps RTL (through the same elaborator as `msynth`) or an AIGER graph
+to the LUTs and flip-flops of an FPGA family (iCE40, ECP5, Xilinx 7-series,
+generic) and writes Yosys JSON for nextpnr or EDIF.
+
+```sh
+mfpga rtl/*.sv -top core -family ice40 -o core.json   # then: nextpnr-ice40 --json core.json ...
+```
+
+See [docs/FPGA.md](docs/FPGA.md).
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per
