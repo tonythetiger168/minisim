@@ -16,9 +16,8 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
-#include <thread>
 
-#include "cpu.hpp"
+#include "parallel.hpp"
 #include "pss/gen.hpp"
 #include "version.hpp"
 
@@ -37,7 +36,7 @@ void usage() {
         "  -json <file>        write the solved scenarios as JSON\n"
         "  -print              print the solved scenarios\n"
         "  -check              read and elaborate the model only\n"
-        "  -threads <n>        worker threads, or all (default: every logical CPU)\n"
+        "  -threads <n>        worker threads (also -j; default: every logical CPU, or $MINISIM_THREADS)\n"
         "  -q                  no summary line\n"
         "  -version, -h\n";
 }
@@ -67,7 +66,7 @@ int main(int argc, char** argv) {
     std::string top = "pss_top", rootName, base, svOut, cOut, jsonOut;
     long count = 1;
     uint64_t seed = 1;
-    int threads = 0;
+    unsigned threads = par::defaultThreads();
     bool print = false, check = false, quiet = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -98,10 +97,8 @@ int main(int argc, char** argv) {
         else if (a == "-json") jsonOut = next("a file name");
         else if (a == "-n") { count = number("a count"); if (count < 1) { std::cerr << "mpss: -n must be at least 1\n"; return 2; } }
         else if (a == "-seed") seed = (uint64_t)number("a number");
-        else if (a == "-threads") {
-            if (i + 1 < argc && std::string(argv[i + 1]) == "all") { i++; threads = 0; }
-            else { threads = (int)number("a count"); if (threads < 1) { std::cerr << "mpss: -threads must be at least 1\n"; return 2; } }
-        }
+        else if (a == "-threads" && i + 1 < argc && std::string(argv[i + 1]) == "all") { i++; threads = par::defaultThreads(); }
+        else if (par::threadsArg(argc, argv, i, threads, "mpss")) {}
         else if (a == "-print") print = true;
         else if (a == "-check") check = true;
         else if (a == "-q") quiet = true;
@@ -131,40 +128,29 @@ int main(int argc, char** argv) {
     }
 
     pss::FuncInfo fi(model);
-    int hw = std::max(1, cpuTopo().logical());
-    if (threads == 0 || threads > hw) threads = hw;
-    threads = (int)std::min<long>(threads, count);
+    threads = (unsigned)std::min<long>(threads, count);
 
     std::vector<Result> res((size_t)count);
-    std::atomic<long> nextJob{0};
+    // Scenario i writes only res[i]; the output is put together in order below.
     std::atomic<bool> stop{false};
-    auto work = [&] {
-        for (;;) {
-            long i = nextJob.fetch_add(1, std::memory_order_relaxed);
-            if (i >= count || stop.load(std::memory_order_relaxed)) return;
-            Result& r = res[(size_t)i];
-            try {
-                auto s = pss::generate(design, seed, (int)i, r.err);
-                if (!s) { stop = true; continue; }
-                r.actions = s->ais.size();
-                r.attempts = s->attempt + 1;
-                if (print) r.text = pss::listing(*s);
-                if (!jsonOut.empty()) r.json = pss::json(*s);
-                if (!cOut.empty()) r.c = pss::cScenario(*s, fi, base);
-                if (!svOut.empty()) r.sv = pss::svScenario(*s, fi, base);
-                r.ok = true;
-            } catch (pss::Error& e) {
-                r.err = e.what();
-                stop = true;
-            }
+    par::parallelFor((size_t)count, threads, [&](size_t i) {
+        if (stop.load(std::memory_order_relaxed)) return;
+        Result& r = res[i];
+        try {
+            auto s = pss::generate(design, seed, (int)i, r.err);
+            if (!s) { stop = true; return; }
+            r.actions = s->ais.size();
+            r.attempts = s->attempt + 1;
+            if (print) r.text = pss::listing(*s);
+            if (!jsonOut.empty()) r.json = pss::json(*s);
+            if (!cOut.empty()) r.c = pss::cScenario(*s, fi, base);
+            if (!svOut.empty()) r.sv = pss::svScenario(*s, fi, base);
+            r.ok = true;
+        } catch (pss::Error& e) {
+            r.err = e.what();
+            stop = true;
         }
-    };
-    // The tool line's shared pool (src/parallel.hpp, namespace par) is not on
-    // main yet; this loop moves onto it when it is.
-    std::vector<std::thread> pool;
-    for (int t = 1; t < threads; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
+    });
 
     for (long i = 0; i < count; i++)
         if (!res[(size_t)i].ok && !res[(size_t)i].err.empty()) {

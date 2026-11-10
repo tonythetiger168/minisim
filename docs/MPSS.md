@@ -31,7 +31,7 @@ that initializes a memory region before a copy reads it.
 | `-json <file>` | Write the solved scenarios as JSON (the action tree, every field, every object). |
 | `-print` | Print the solved scenarios. |
 | `-check` | Read and elaborate the model, then stop. |
-| `-threads <n>` | Worker threads, or `all`. Default: every logical CPU. |
+| `-threads <n>` | Worker threads (also `-j`). Default: every logical CPU, or `$MINISIM_THREADS`. |
 | `-q` | No summary line. |
 
 Scenario *i* depends only on the model, `-seed` and *i*. Scenarios are
