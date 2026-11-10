@@ -49,7 +49,7 @@ void usage() {
         "  -no_name_map       write names in full instead of a *NAME_MAP\n"
         "  -report FILE       per-net table: length, resistance, capacitance\n"
         "  -date TEXT         the SPEF *DATE (default: now), for files that compare equal\n"
-        "  -threads N         worker threads (default: all logical cores; 1: single thread)\n"
+        "  -threads N         worker threads, also -j N (default: all logical cores; 1: single thread)\n"
         "  -Werror            exit 1 when a net is open or two nets are shorted\n"
         "  -q                 no summary on stdout\n"
         "  -version           print the version\n";
@@ -257,6 +257,7 @@ double secondsSince(std::chrono::steady_clock::time_point t) {
 int main(int argc, char** argv) {
     Args a;
     std::string date;
+    unsigned threadsOpt = 0;
     try {
         for (int i = 1; i < argc; i++) {
             std::string s = argv[i];
@@ -293,7 +294,7 @@ int main(int argc, char** argv) {
             else if (s == "-max_seg") a.opt.maxSeg = numv();
             else if (s == "-no_name_map") a.nameMap = false;
             else if (s == "-date") date = val();   // fixed *DATE, for reproducible files
-            else if (s == "-threads") a.opt.threads = static_cast<int>(numv());
+            else if (par::threadsArg(argc, argv, i, threadsOpt, "mrcx")) a.opt.threads = static_cast<int>(threadsOpt);
             else if (s == "-Werror") a.werror = true;
             else if (s == "-q") a.quiet = true;
             else throw std::runtime_error("unknown option " + s + " (see mrcx -help)");
@@ -302,30 +303,17 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
-        if (a.opt.threads < 0) throw std::runtime_error("-threads must be 1 or more");
-        int threads = a.opt.threads > 0 ? a.opt.threads : static_cast<int>(std::thread::hardware_concurrency());
-        if (threads < 1) threads = 1;
+        int threads = a.opt.threads > 0 ? a.opt.threads : static_cast<int>(par::defaultThreads());
         a.opt.threads = threads;
 
         auto t0 = std::chrono::steady_clock::now();
         phys::Tech tech;
         phys::Design design;
         // The DEF is the big file: read it while the LEFs are read.
-        std::string defErr;
-        std::thread defReader;
-        if (threads > 1)
-            defReader = std::thread([&] {
-                try { phys::readDef(a.def, design); } catch (const std::exception& e) { defErr = e.what(); if (defErr.empty()) defErr = "error"; }
-            });
-        try {
-            for (auto& l : a.lefs) phys::readLef(l, tech);
-        } catch (...) {
-            if (defReader.joinable()) defReader.join();
-            throw;
-        }
-        if (defReader.joinable()) defReader.join();
-        else phys::readDef(a.def, design);
-        if (!defErr.empty()) throw std::runtime_error(defErr);
+        par::parallelFor(2, static_cast<unsigned>(threads), [&](size_t job) {
+            if (job == 0) phys::readDef(a.def, design);
+            else for (auto& l : a.lefs) phys::readLef(l, tech);
+        });
         double tRead = secondsSince(t0);
 
         std::vector<std::string> warnings;
