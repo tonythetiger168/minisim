@@ -38,17 +38,15 @@
 // Constraints: -clock-group a,b says clocks are synchronous to each other
 // (one domain); -static s says a signal does not change while it is read.
 //
-// Threads: the graph is built on one thread (the front end's AST is lazy and
+// Threads (src/parallel.hpp): the graph is built on one thread (the front end's AST is lazy and
 // not thread safe). The fan-in cone of every flop, which is where the time
 // goes on a large design, is traced on all the threads, each flop its own
 // task with its own result slot; the rules then read the results in flop
 // order, so the findings are the same whatever the thread count.
-#include <atomic>
 #include <chrono>
-#include <thread>
 
-#include "cpu.hpp"
 #include "lintir.hpp"
+#include "parallel.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/ConversionExpression.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
@@ -857,26 +855,20 @@ struct Cone {
     std::vector<Root> all, from;  // data and control together; the plain source alone
 };
 
-// Runs fn(i) for i in [0, n) on `threads` threads. Every i writes its own
-// slot, so the result does not depend on the schedule.
+// Runs fn(begin, end) over [0, n) in chunks on the shared pool
+// (parallel.hpp). Every index writes its own slot, so the result does not
+// depend on the chunks or the schedule. A chunk is large enough to be worth
+// a thread, and a small design runs on one.
 template<typename F>
-void parallelFor(size_t n, int threads, F&& fn) {
-    threads = (int)std::min<size_t>(std::max(1, threads), std::max<size_t>(1, n / 256));
-    if (threads <= 1) {
-        for (size_t i = 0; i < n; i++) fn(0, i);
+void chunked(size_t n, int threads, F&& fn) {
+    size_t k = std::min<size_t>(std::max(1, threads), std::max<size_t>(1, n / 256));
+    if (k <= 1) {
+        if (n) fn(size_t(0), n);
         return;
     }
-    std::atomic<size_t> next{0};
-    std::vector<std::thread> pool;
-    for (int t = 0; t < threads; t++)
-        pool.emplace_back([&, t] {
-            for (;;) {
-                size_t lo = next.fetch_add(64);
-                if (lo >= n) return;
-                for (size_t i = lo; i < std::min(n, lo + 64); i++) fn(t, i);
-            }
-        });
-    for (auto& th : pool) th.join();
+    size_t grain = std::max<size_t>(64, n / (k * 4));
+    size_t count = (n + grain - 1) / grain;
+    par::parallelFor(count, (unsigned)k, [&](size_t c) { fn(c * grain, std::min(n, (c + 1) * grain)); });
 }
 
 // MLINT_PROFILE=1 prints where the time went, to stderr.
@@ -965,15 +957,16 @@ struct Checker {
         const size_t n = m.flops.size();
         cones.resize(n);
         {
-            int threads = std::max(1, opt.threads);
-            std::vector<std::unique_ptr<Tracer>> tr;
-            for (int t = 0; t < threads; t++) tr.push_back(std::make_unique<Tracer>(m));
-            parallelFor(n, threads, [&](int t, size_t i) {
-                const Flop& f = m.flops[i];
-                SymSet in = f.data;
-                in.insert(in.end(), f.ctrl.begin(), f.ctrl.end());
-                cones[i].all = tr[t]->rootsOf(in);
-                if (f.plain && f.from) cones[i].from = tr[t]->roots(f.from);
+            // One tracer, with its own memo, per chunk of flops.
+            chunked(n, opt.threads, [&](size_t lo, size_t hi) {
+                Tracer tr(m);
+                for (size_t i = lo; i < hi; i++) {
+                    const Flop& f = m.flops[i];
+                    SymSet in = f.data;
+                    in.insert(in.end(), f.ctrl.begin(), f.ctrl.end());
+                    cones[i].all = tr.rootsOf(in);
+                    if (f.plain && f.from) cones[i].from = tr.roots(f.from);
+                }
             });
         }
 
@@ -1037,36 +1030,38 @@ struct Checker {
         };
         const size_t n = m.flops.size();
         std::vector<std::vector<Rec>> recs(n);
-        parallelFor(n, opt.threads, [&](int, size_t i) {
-            const Flop& f = m.flops[i];
-            if (!f.dom) return;
-            const std::vector<Root>& all = cones[i].all;
-            auto inFrom = [&](Sym s) {
-                for (const Root& r : cones[i].from)
-                    if (r.sym == s) return true;
-                return false;
-            };
-            // A bus may cross with no synchronizer of its own when a synchronized
-            // control from its own domain says when to take it: the domains
-            // this flop has such a control from.
-            SymSet quals;
-            for (const Root& q : all) {
-                const Flop* qf = m.flopOf(q.sym);
-                if (!qf || qf->dom != f.dom) continue;
-                const Member& mem = member[qf - m.flops.data()];
-                if (mem.pos >= 2) quals.push_back(mem.srcDom);
-            }
-            for (const Root& r : all) {
-                const Flop* s = foreign(f, r.sym);
-                if (!s) continue;
-                bool qualified = std::find(quals.begin(), quals.end(), s->dom) != quals.end();
-                if (qualified)
-                    recs[i].push_back({r.sym, Qualified, r.logic, 0});
-                else if (first[i] && inFrom(r.sym)) {
-                    int len = chainLen((int)i);
-                    recs[i].push_back({r.sym, len < 2 ? OneFlop : Synced, r.logic, len});
-                } else
-                    recs[i].push_back({r.sym, Bare, r.logic, 0});
+        chunked(n, opt.threads, [&](size_t lo, size_t hi) {
+            for (size_t i = lo; i < hi; i++) {
+                const Flop& f = m.flops[i];
+                if (!f.dom) continue;
+                const std::vector<Root>& all = cones[i].all;
+                auto inFrom = [&](Sym s) {
+                    for (const Root& r : cones[i].from)
+                        if (r.sym == s) return true;
+                    return false;
+                };
+                // A bus may cross with no synchronizer of its own when a synchronized
+                // control from its own domain says when to take it: the domains
+                // this flop has such a control from.
+                SymSet quals;
+                for (const Root& q : all) {
+                    const Flop* qf = m.flopOf(q.sym);
+                    if (!qf || qf->dom != f.dom) continue;
+                    const Member& mem = member[qf - m.flops.data()];
+                    if (mem.pos >= 2) quals.push_back(mem.srcDom);
+                }
+                for (const Root& r : all) {
+                    const Flop* s = foreign(f, r.sym);
+                    if (!s) continue;
+                    bool qualified = std::find(quals.begin(), quals.end(), s->dom) != quals.end();
+                    if (qualified)
+                        recs[i].push_back({r.sym, Qualified, r.logic, 0});
+                    else if (first[i] && inFrom(r.sym)) {
+                        int len = chainLen((int)i);
+                        recs[i].push_back({r.sym, len < 2 ? OneFlop : Synced, r.logic, len});
+                    } else
+                        recs[i].push_back({r.sym, Bare, r.logic, 0});
+                }
             }
         });
         prof.lap("  classify");
@@ -1076,8 +1071,9 @@ struct Checker {
             std::vector<char> need(n, 0);
             for (size_t i = 0; i < n; i++)
                 for (const Rec& r : recs[i]) need[i] = need[m.flopIx.at(r.src)] = 1;
-            parallelFor(n, opt.threads, [&](int, size_t i) {
-                if (need[i]) m.name(m.flops[i]);
+            chunked(n, opt.threads, [&](size_t lo, size_t hi) {
+                for (size_t i = lo; i < hi; i++)
+                    if (need[i]) m.name(m.flops[i]);
             });
         }
         prof.lap("  names");
