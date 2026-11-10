@@ -47,6 +47,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
+| `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -335,6 +336,20 @@ can make X from known inputs. `-no-2state` turns the fast path off, and
 command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
+
+### Datapath library: `dw/`
+
+`dw/` is a library of synthesizable, parameterized building blocks
+(`MW_add`, `MW_mult`, `MW_div`, `MW_shifter`, `MW_fifo_sync`,
+`MW_fifo_async`, `MW_crc`, `MW_ecc` and 39 more), each with selectable
+architectures where that matters (ripple, lookahead, Kogge-Stone, Brent-Kung
+and carry-select adders; array and Booth/Wallace multipliers):
+
+```sh
+msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
+```
+
+`docs/DATAPATH.md` lists every module and its ports.
 
 ### Lint and clock-domain checks: `mlint`
 
