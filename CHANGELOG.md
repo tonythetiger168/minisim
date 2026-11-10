@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
+  types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
+  functions, all control flow but `switch`) is scheduled into clock cycles
+  under `-clock`, `-mul` and `-div`, with operator chaining, multi-cycle
+  operators, register and multiplier/divider sharing, and comes out as an
+  FSM with datapath or (`-pipeline`) a pipeline taking one input per cycle.
+  `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
+  calls with the host C++ compiler, `-explore` sweeps the clock period.
+  See `docs/HLS.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
