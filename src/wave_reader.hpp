@@ -21,6 +21,7 @@
 // result does not depend on the thread count. FST needs MINISIM_FST and
 // libfst (the `fst` CMake target).
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -98,6 +99,7 @@ struct Reader {
     }
     const char* data = nullptr;
     size_t size = 0;
+    size_t minPieceFst = 1u << 20;               // ...and of an FST (it is compressed)
     size_t minPiece = 4u << 20;                  // a thread is not worth less of a VCD than this
 
     ~Reader() { if (data && size) munmap((void*)data, size); }
@@ -347,20 +349,83 @@ struct Reader {
             }
         }
         pools.resize(waves.size());
-        struct Ctx { Reader* v; std::vector<int>* byHandle; } cx{this, &byHandle};
-        fstReaderSetFacProcessMaskAll(ctx);
-        fstReaderIterBlocks(ctx, [](void* u, uint64_t t, fstHandle hd, const unsigned char* val) {
-            Ctx& c = *(Ctx*)u;
-            if (hd >= c.byHandle->size()) return;
-            int w = (*c.byHandle)[hd];
-            if (w < 0) return;
-            std::string& pool = c.v->pools[w];
-            size_t len = (size_t)c.v->waves[w].width;
-            if (pool.size() + len >= (1ull << 40) || len >= (1u << 24)) return;
-            c.v->waves[w].ch.push_back(Change{t, pool.size(), len});
-            pool.append((const char*)val, len);
-        }, &cx, nullptr);
         end = fstReaderGetEndTime(ctx);
+        uint64_t start = fstReaderGetStartTime(ctx);
+        // Decode in time slices, one libfst reader each: a reader with a time
+        // limit gives every signal's value at the start of its slice, then
+        // the changes inside it. A value equal to the one before it is not
+        // kept (FST repeats every signal at each block start).
+        struct stat sb;
+        size_t bytes = stat(file.c_str(), &sb) == 0 ? (size_t)sb.st_size : 0;
+        size_t slices = std::max<size_t>(1, std::min<size_t>({(size_t)threads, bytes / std::max<size_t>(minPieceFst, 16),
+                                                              (size_t)(end - start + 1)}));
+        struct Slice {
+            Reader* v;
+            const std::vector<int>* byHandle;
+            uint64_t lo, hi;
+            std::vector<std::vector<Change>> ch;
+            std::vector<std::string> pool;
+        };
+        std::vector<Slice> sl(slices);
+        std::atomic<bool> failed{false};
+        par::parallelFor(slices, threads, [&](size_t k) {
+            Slice& S = sl[k];
+            S.v = this;
+            S.byHandle = &byHandle;
+            uint64_t span = end - start + 1;
+            S.lo = start + span / slices * k;
+            S.hi = k + 1 == slices ? end : start + span / slices * (k + 1) - 1;
+            S.ch.resize(waves.size());
+            S.pool.resize(waves.size());
+            fstReaderContext* c = k == 0 ? ctx : fstReaderOpen(file.c_str());
+            if (!c) { failed = true; return; }
+            if (slices > 1) fstReaderSetLimitTimeRange(c, S.lo, S.hi);
+            fstReaderSetFacProcessMaskAll(c);
+            fstReaderIterBlocks(c, [](void* u, uint64_t t, fstHandle hd, const unsigned char* val) {
+                Slice& S = *(Slice*)u;
+                if (hd >= S.byHandle->size()) return;
+                int w = (*S.byHandle)[hd];
+                if (w < 0 || t > S.hi) return;
+                if (t < S.lo) t = S.lo;
+                std::string& pool = S.pool[w];
+                auto& ch = S.ch[w];
+                size_t len = (size_t)S.v->waves[w].width;
+                if (len >= (1u << 24)) return;
+                if (!ch.empty()) {
+                    const char* lastv = pool.data() + pool.size() - len;
+                    if (!std::memcmp(lastv, val, len)) return;
+                    if (ch.back().t == t) {   // again at one time: the later value stands
+                        std::memcpy(pool.data() + pool.size() - len, val, len);
+                        return;
+                    }
+                }
+                ch.push_back(Change{t, pool.size(), len});
+                pool.append((const char*)val, len);
+            }, &S, nullptr);
+            if (k != 0) fstReaderClose(c);
+        });
+        if (failed) { fstReaderClose(ctx); err = "cannot open " + file; return false; }
+        // Each signal's slices, in time order, into one buffer.
+        par::parallelFor(waves.size(), threads, [&](size_t w) {
+            if (sl.size() == 1) {
+                waves[w].ch = std::move(sl[0].ch[w]);
+                pools[w] = std::move(sl[0].pool[w]);
+                return;
+            }
+            size_t n = 0, sz = 0;
+            for (Slice& S : sl) { n += S.ch[w].size(); sz += S.pool[w].size(); }
+            if (sz >= (1ull << 40)) return;
+            auto& ch = waves[w].ch;
+            ch.reserve(n);
+            pools[w].reserve(sz);
+            for (Slice& S : sl) {
+                uint64_t base = pools[w].size();
+                for (Change c : S.ch[w]) { c.off += base; ch.push_back(c); }
+                pools[w] += S.pool[w];
+                std::vector<Change>().swap(S.ch[w]);
+                std::string().swap(S.pool[w]);
+            }
+        });
         int ts = fstReaderGetTimescale(ctx);
         static const char* unit[] = {"s", "ms", "us", "ns", "ps", "fs"};
         if (int k = -ts; k >= 0 && k <= 15) {   // 10^ts seconds

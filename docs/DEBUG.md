@@ -114,6 +114,10 @@ machine, for `-active` end to end:
 | `-threads 2` | 1.3 |
 | `-threads 4` | 0.9 |
 
+An FST is decoded in time slices, one libfst reader per thread: a 19 MB FST
+of the same run (14.7 million changes) reads in about 3 s on one thread and 1.1 s
+on four.
+
 The page from `-html` holds a budget of two million value changes. When the
 waveform has more, each signal keeps the changes around `-at T` (or its first
 ones), and mdebug says so.

@@ -20,6 +20,22 @@ Spec references are IEEE 1800-2023 clauses.
   source, drivers and loads, schematic, waves with values annotated in the
   source). `-vcd` reads VCD and FST; the page traces the active driver at the
   cursor itself. See `docs/DEBUG.md`.
+- Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
+  writes version 3 envelopes (RSA no-padding root key per tool block,
+  AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
+  command-line keys, a `-keyring` in the 1735 key exchange format, or a
+  recipe in the source, with rights (`-control`). `msim`, `mlint` and `mdft`
+  take `-keyfile` / `-keyring` / `-license`, check the signature before
+  decrypting, honour the `decryption`, `visibility`, `coverage` and
+  `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
+  protected code out of diagnostics, assertion messages, VCD / FST, coverage,
+  lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Datapath library `dw/`: 47 synthesizable, parameterized SystemVerilog
+  building blocks named `MW_*` (adders with five carry architectures,
+  Booth/Wallace and array multipliers, multiply-accumulate, dividers, square
+  root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
+  CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
+  `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
@@ -78,6 +94,10 @@ Spec references are IEEE 1800-2023 clauses.
   subroutine call.
 
 ### Fixed
+- A cast of a narrow unsigned operand inside a signed expression,
+  `int'(u3) % 5`, sign-extended the operand: 6 became -2. The operand is now
+  extended with its own signedness, as an assignment to the cast type
+  (6.24.1).
 - A signed member of an unpacked struct (`int`, `byte`) read as unsigned, so
   `s.f < 0` was false for a negative member (7.2).
 - `super.f()` with a comment just before `super` called the override (and

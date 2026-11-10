@@ -58,6 +58,18 @@
 //   -cfiles <n>      -compile: build the design as up to n C++ files in parallel
 //                    (default: one per core, 16 at most, for a large design)
 //   -O<n>            optimization level for -compile (default -O2)
+//   -keyfile [[<owner>:]<key_keyname>=]<private.pem>
+//                    an RSA private key for protected envelopes (`pragma
+//                    protect begin_protected: IEEE 1735-2023 version 3, or
+//                    IEEE 1800-2023 clause 34). Repeatable. With a name the
+//                    key only opens tool blocks / key_blocks of that
+//                    key_keyname (and key_keyowner). Encrypt with msimprotect.
+//   -keyring <file>  private keys, `<owner> <name> <private.pem>` per line
+//   -license <feature>[=<string>]  a licensed feature for licensed rights
+//
+// Protected code is decrypted in memory only. Diagnostics located in it are
+// reported without their text, its signals are left out of the VCD, and
+// -compile falls back to the interpreter so no generated C++ holds it.
 //   -upf <file>      power-aware simulation with this IEEE 1801 (UPF) power
 //                    intent (upf.hpp, upf_rt.inc). Adds package UPF for the
 //                    testbench (supply_on, supply_off, ...).
@@ -117,6 +129,10 @@
 #include <thread>
 #include <vector>
 
+#include <filesystem>
+#include <map>
+#include <set>
+
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/wait.h>
@@ -125,8 +141,12 @@
 #include "codegen.hpp"
 #include "lower.hpp"
 #include "saif.hpp"
+#include "slang/diagnostics/DiagnosticClient.h"
+#include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/diagnostics/LookupDiags.h"
 #include "slang/driver/Driver.h"
+#include "slang/text/SourceManager.h"
+#include "protect_front.hpp"
 #include "slang/syntax/AllSyntax.h"
 #include "slang/syntax/SyntaxTree.h"
 #include "slang/syntax/SyntaxVisitor.h"
@@ -758,6 +778,7 @@ static void usage() {
                  "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
+              << protfront::Options::help() <<
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  -upf_verbose   print supply, power state and simstate changes\n"
@@ -793,6 +814,7 @@ int main(int argc, char** argv) {
     bool threadsGiven = false;
     std::string buildDir = "msim.d", opt = "-O2";
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
+    protfront::Options prot;
     std::string upfPath, powerTop;
     bool powerTopSet = false, upfVerbose = false;
     std::vector<std::string> svLibs, cFiles, soFiles;
@@ -851,6 +873,7 @@ int main(int argc, char** argv) {
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a == "-cfiles") { g_cfiles = std::max(1, std::atoi(next("a file count").c_str())); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
+        if (prot.take(argc, argv, i)) continue;
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
         if (a == "+notimingcheck" || a == "+notimingchecks") { timingChecksOn() = false; continue; }
         if (a == "+mindelays" || a == "+typdelays" || a == "+maxdelays") {
@@ -1065,6 +1088,17 @@ int main(int argc, char** argv) {
         for (auto& s : fwd) userSet |= s.find("duplicate-definition") != std::string::npos;
         if (!userSet) driver.diagEngine.setSeverity(slang::diag::DuplicateDefinition, slang::DiagnosticSeverity::Warning);
     }
+
+    // Protected envelopes (34): decrypt before slang reads the files, and
+    // route diagnostics through the redacting client.
+    protfront::ProtectedCode pc;
+    if (!protfront::preload(driver, prot, pc, "msim")) return 1;
+    if (pc.any()) {
+        protfront::redact(driver, pc);
+        hideSigIf() = [&pc](const slang::ast::Symbol& s) { return !pc.visible(s); };
+        hideLocIf() = [&pc](slang::SourceLocation l) { return !pc.coverable(l); };
+        hideMsgIf() = [&pc](slang::SourceLocation l) { return pc.hidden(l); };
+    }
     if (!driver.parseAllSources()) return 1;
     // A design element with no `timescale or timeunit, in a design where
     // others have one, gets 1ns/1ps instead of an error (--timescale sets
@@ -1136,7 +1170,9 @@ int main(int argc, char** argv) {
                         [](const std::string& n, int w, bool net) { return S.sig(n, w, net); },
                         [](int s) { return S.newDriver(s); });
     } catch (const std::exception& ex) {
-        std::cerr << "msim: " << ex.what() << "\n";
+        // The message may name something declared in protected code.
+        if (pc.any()) std::cerr << "msim: the design (which has protected code) uses a construct msim cannot simulate yet; details hidden\n";
+        else std::cerr << "msim: " << ex.what() << "\n";
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
@@ -1187,6 +1223,8 @@ int main(int argc, char** argv) {
         std::cerr << "msim: note: design has no processes; simulation ends at time 0\n";
         return 0;
     }
+
+    for (int id : hiddenSigs()) S.sigs[(size_t)id].hide = true;
 
     // DPI-C (35): write the header, build the C code and the export stubs,
     // load the libraries, and resolve the imports.
@@ -1264,6 +1302,11 @@ int main(int argc, char** argv) {
         gateRecs().empty())
         mergePartialDrivers(lowered);   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
+    // Generated C++ would hold the protected design in the clear.
+    if (compiled && pc.any()) {
+        std::cerr << "msim: -compile: the design has protected code; using the interpreter\n";
+        compiled = false;
+    }
     if (compiled && timingChecksOn() && !timingChecks().empty()) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
         compiled = false;
