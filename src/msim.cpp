@@ -343,6 +343,206 @@ static void mergePartialDrivers(LowerResult& lowered) {
     }
 }
 
+// An always_comb with if / case that writes several signals, as one slice per
+// group of outputs: the block's control flow with only the assignments to
+// that group, minus the branches that no longer choose anything, waiting on
+// just the signals the slice reads. A controller that sets thirty outputs in
+// one case statement otherwise makes everything it reads feed everything it
+// writes; on Ibex that tied 106 blocks into one cycle of whole-block
+// dependencies, and every change in it re-ran the whole controller.
+// Outputs are grouped when one's slice reads the other (an intermediate
+// value inside the block), so a slice only reads final values from outside
+// its group. The block's deferred assertions form a group of their own.
+static void splitCombBlocks(LowerResult& lowered) {
+    size_t np = lowered.procs.size();
+    // Temporaries of the lowering (_tf<n>: a unique case's "which item
+    // matched") that only one process names: a slice that reads one carries
+    // the assignments to it, so they do not tie the outputs together.
+    std::vector<int> users(S.sigs.size(), 0);
+    {
+        std::function<void(const E&, std::set<int>&)> all = [&](const E& e, std::set<int>& out) {
+            if (!e) return;
+            if (e->sig >= 0) out.insert(e->sig);
+            for (auto& k : e->kids) all(k, out);
+        };
+        std::vector<const Prog*> seen;
+        std::function<void(const Prog*, std::set<int>&)> walk = [&](const Prog* p, std::set<int>& out) {
+            if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) return;
+            seen.push_back(p);
+            for (auto& in : p->code) {
+                if (in.sig >= 0) out.insert(in.sig);
+                all(in.e, out); all(in.bidx, out); all(in.de, out);
+                for (auto& a : in.args) all(a, out);
+                for (auto& a : in.aidx) all(a, out);
+                for (auto& [sg, ed] : in.events) out.insert(sg);
+                walk(in.callee, out);
+                for (auto* b : in.branches) walk(b, out);
+            }
+        };
+        for (auto& lp : lowered.procs) {
+            std::set<int> m;
+            seen.clear();
+            walk(&lp.prog, m);
+            for (int x : m) if ((size_t)x < users.size()) users[(size_t)x]++;
+        }
+    }
+    auto isTemp = [&](int sg) {
+        return sg >= 0 && (size_t)sg < users.size() && users[(size_t)sg] == 1 && S.sigs[(size_t)sg].name.rfind("_tf", 0) == 0;
+    };
+    for (size_t pi = 0; pi < np; pi++) {
+        if (lowered.procs[pi].program >= 0 || lowered.procs[pi].reactive) continue;
+        CombShape sh;
+        {
+            const Prog& p = lowered.procs[pi].prog;
+            if (!combShape(p, sh) || !sh.branches || sh.outs.size() + (sh.asserts ? 1 : 0) < 2) continue;
+        }
+        const Prog orig = lowered.procs[pi].prog;
+        const auto& code = orig.code;
+        size_t n = code.size(), end = n - 2;   // code[end] is the wait
+        bool ok = true;
+        const char* why = "";
+        struct Rep { const char*& w; bool& ok; const LoweredProc& lp; size_t no; ~Rep() { if (std::getenv("MSIM_WHYSPLIT")) std::cerr << "split " << lp.kind << " line " << (lp.prog.code.empty() ? 0 : lp.prog.code[0].line) << " outs " << no << ": " << (*w ? w : "split") << "\n"; } } rep{why, ok, lowered.procs[pi], sh.outs.size()};
+        std::set<int> refAll;
+        std::function<void(const E&, std::set<int>&)> refs = [&](const E& e, std::set<int>& out) {
+            if (!e) return;
+            if (e->arr) { ok = false; why = "arr"; }   // an element chosen at run time: no fixed set of signals
+            if (e->op == Op::Ref && e->sig >= 0) out.insert(e->sig);
+            for (auto& k : e->kids) refs(k, out);
+        };
+        for (size_t pc = 0; pc < end; pc++) {
+            const Instr& i = code[pc];
+            if ((i.k == IK::Jmp || i.k == IK::JmpIfNot) && i.target <= pc) { ok = false; why = "loop"; }   // a loop
+            if (i.k == IK::Assert) {
+                const AssertInfo& a = asserts().at(i.sig);
+                for (auto* cs : {&a.passCap, &a.failCap})
+                    for (auto& c : *cs) refs(c, refAll);
+            }
+            refs(i.e, refAll);
+        }
+        const Instr& w = code[end];
+        std::vector<std::pair<int, Edge>> ev = w.events;
+        if (ev.size() <= 1) ev = {{w.sig, w.edge}};
+        for (auto& [sg, ed] : ev) if (!refAll.count(sg)) { ok = false; if (!*why) why = "waits on a signal the body does not name"; }
+        if (!ok) continue;
+        // Output index of each instruction: its signal's, or the assertions' (last).
+        size_t no = sh.outs.size() + (sh.asserts ? 1 : 0);
+        auto outOf = [&](const Instr& i) -> int {
+            if (i.k == IK::Assert) return (int)sh.outs.size();
+            if (i.k != IK::Assign || isTemp(i.sig)) return -1;
+            for (size_t k = 0; k < sh.outs.size(); k++) if (sh.outs[k] == i.sig) return (int)k;
+            return -1;
+        };
+        std::vector<int> grp(no);
+        for (size_t k = 0; k < no; k++) grp[k] = (int)k;
+        std::function<int(int)> find = [&](int x) { while (grp[x] != x) x = grp[x] = grp[grp[x]]; return x; };
+        // The slice of one group: nxt[pc] is the first instruction it keeps
+        // at or after pc (end: none). A branch is kept when its two ways differ.
+        std::vector<size_t> nxt(n);
+        std::vector<char> keep(n);
+        auto slice = [&](int g) {
+            std::set<int> temps;   // the temporaries the slice reads: their assignments stay too
+            for (;;) {
+                nxt[end] = end;
+                for (size_t pc = end; pc-- > 0;) {
+                    const Instr& i = code[pc];
+                    keep[pc] = 0;
+                    if (i.k == IK::Jmp) nxt[pc] = nxt[i.target];
+                    else if (i.k == IK::JmpIfNot) {
+                        size_t a = nxt[pc + 1], b = nxt[i.target];
+                        if (a == b) nxt[pc] = a;
+                        else { nxt[pc] = pc; keep[pc] = 1; }
+                    } else if ((outOf(i) >= 0 && find(outOf(i)) == g) || (i.k == IK::Assign && temps.count(i.sig))) { nxt[pc] = pc; keep[pc] = 1; }
+                    else nxt[pc] = nxt[pc + 1];
+                }
+                size_t before = temps.size();
+                std::set<int> rd;
+                for (size_t pc = 0; pc < end; pc++) if (keep[pc]) refs(code[pc].e, rd);
+                for (int x : rd) if (isTemp(x)) temps.insert(x);
+                if (temps.size() == before) break;
+            }
+        };
+        for (bool again = true; again;) {
+            again = false;
+            for (size_t k = 0; k < no && !again; k++) {
+                if (find((int)k) != (int)k || (k < sh.outs.size() && isTemp(sh.outs[k]))) continue;
+                slice((int)k);
+                std::set<int> rd;
+                for (size_t pc = 0; pc < end; pc++) {
+                    if (!keep[pc]) continue;
+                    refs(code[pc].e, rd);
+                    if (code[pc].k == IK::Assign && code[pc].hi >= 0) rd.insert(code[pc].sig);   // a part write keeps the other bits
+                }
+                for (size_t j = 0; j < sh.outs.size(); j++)
+                    if (rd.count(sh.outs[j]) && !isTemp(sh.outs[j]) && find((int)j) != (int)k) { grp[find((int)j)] = (int)k; again = true; }
+            }
+        }
+        std::vector<int> roots;
+        for (size_t k = 0; k < no; k++)
+            if (find((int)k) == (int)k && !(k < sh.outs.size() && isTemp(sh.outs[k]))) roots.push_back((int)k);
+        if (roots.size() < 2) { why = "one group"; continue; }
+        std::vector<Prog> progs;
+        for (int g : roots) {
+            slice(g);
+            Prog q;
+            q.pd = orig.pd; q.pstate = orig.pstate;
+            std::vector<size_t> at(n, 0);       // old pc -> new index
+            std::vector<std::pair<size_t, size_t>> fix;   // new index of a jump, old target pc
+            std::set<int> rd;
+            for (size_t pc = 0; pc < end; pc++) {
+                if (!keep[pc]) continue;
+                at[pc] = q.code.size();
+                Instr i = code[pc];
+                refs(i.e, rd);
+                if (i.k == IK::Assert) {
+                    const AssertInfo& a = asserts().at(i.sig);
+                    for (auto* cs : {&a.passCap, &a.failCap})
+                        for (auto& c : *cs) refs(c, rd);
+                }
+                q.code.push_back(i);
+                if (i.k == IK::JmpIfNot) fix.push_back({q.code.size() - 1, nxt[i.target]});
+                // Falls through to the next kept instruction, or jumps to where it went.
+                size_t to = nxt[pc + 1], nextKept = pc + 1;
+                while (nextKept < end && !keep[nextKept]) nextKept++;
+                if (to != nextKept) {
+                    Instr j; j.k = IK::Jmp; j.file = i.file; j.line = i.line;
+                    q.code.push_back(j);
+                    fix.push_back({q.code.size() - 1, to});
+                }
+            }
+            size_t first = nxt[0];
+            if (first != end) {
+                size_t fk = 0;
+                while (fk < end && !keep[fk]) fk++;
+                if (first != fk) { ok = false; why = "entry"; break; }   // cannot happen: the first kept instruction is nxt[0]
+            }
+            at[end] = q.code.size();
+            for (auto& [ni, old] : fix) q.code[ni].target = at[old];
+            Instr wt = w;
+            wt.events.clear();
+            for (auto& e : ev) if (rd.count(e.first)) wt.events.push_back(e);
+            if (wt.events.empty()) { ok = false; why = "a slice waits on nothing"; break; }   // reads nothing it waits on: leave the block whole
+            if (wt.events.size() == 1) { wt.sig = wt.events[0].first; wt.edge = wt.events[0].second; wt.events.clear(); }
+            q.code.push_back(wt);
+            Instr back = code[n - 1];
+            q.code.push_back(back);
+            progs.push_back(std::move(q));
+        }
+        if (!ok) continue;
+        for (auto& q : progs) {
+            CombShape c;
+            if (!combShape(q, c)) { ok = false; why = "slice shape"; break; }
+        }
+        if (!ok) continue;
+        LoweredProc tmpl = lowered.procs[pi];
+        lowered.procs[pi].prog = std::move(progs[0]);
+        for (size_t k = 1; k < progs.size(); k++) {
+            LoweredProc lp = tmpl;
+            lp.prog = std::move(progs[k]);
+            lowered.procs.push_back(std::move(lp));
+        }
+    }
+}
+
 static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     size_t n = lowered.procs.size();
     Plan p;
@@ -361,7 +561,19 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
             if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
+        // MSIM_WHYCYCLE=1: the blocks that feed each other (they keep the
+        // design out of the partitions and the cycle domain).
+        std::vector<int> cyc;
+        if (std::getenv("MSIM_WHYCYCLE")) g_combCycles = &cyc;
         std::vector<size_t> order = combSchedule(shapes, &lv, &p.cyclic);
+        g_combCycles = nullptr;
+        for (size_t a = 0; a < cyc.size(); a++) {
+            if (cyc[a] < 0) continue;
+            std::string o, in;
+            for (int x : shapes[a].outs) o += S.sigs[x].name + " ";
+            for (int x : shapes[a].ins) in += S.sigs[x].name + " ";
+            std::cerr << "cycle " << cyc[a] << ": " << lowered.procs[procOf[a]].kind << " writes " << o << "| reads " << in << "\n";
+        }
         for (size_t r = 0; r < order.size(); r++) {
             size_t i = procOf[order[r]];
             p.rank[i] = (int)r;
@@ -1295,7 +1507,8 @@ int main(int argc, char** argv) {
     // resolve them: those designs keep every driver.
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty())
-        mergePartialDrivers(lowered);   // -no-static-comb keeps them, as the reference
+        mergePartialDrivers(lowered);
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
