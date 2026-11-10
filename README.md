@@ -45,6 +45,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
+| `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -373,6 +374,22 @@ Clock domains come from the clock of every edge-triggered block, with signals
 joined across port connections, so one clock passed down through several
 modules stays one domain. Findings print as
 `file:line:col: warning: [RULE] text`, sorted by file and line.
+
+### Source-level debug: `mdebug`
+
+`mdebug` lists the drivers and loads of a signal with the conditions on each
+assignment, prints fan-in cones, and with a VCD finds the assignment that
+gave a signal its value at a time and what caused it:
+
+```sh
+mdebug tb.sv dut.sv -top tb -drivers tb.u0.y
+mdebug tb.sv dut.sv -top tb -vcd waves.vcd -active tb.sum -at 70
+mdebug tb.sv dut.sv -top tb -vcd waves.vcd -html debug.html   # one-file viewer
+```
+
+The viewer page has the hierarchy, clickable source, drivers and loads, a
+schematic of the selected signal, and waves with the values annotated in the
+source. See [`docs/DEBUG.md`](docs/DEBUG.md).
 
 ### Low-power simulation: UPF (IEEE 1801)
 
