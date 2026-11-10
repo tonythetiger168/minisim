@@ -659,6 +659,10 @@ int main(int argc, char** argv) {
             std::ofstream f(a.cubeOut);
             if (!f) throw ModelError("cannot write " + a.cubeOut);
             f << "# matpg test cubes for " << nl.top << ": x is a bit left free\n";
+            // Which chain a number means, for a reader with its own chain list.
+            f << "chains";
+            for (const Chain& ch : scan.chains) f << " " << ch.siName;
+            f << "\n";
             size_t nPI = first.piNets.size();
             int id = 0;
             const char* ch = "01x";

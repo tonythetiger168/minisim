@@ -78,6 +78,9 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: an assignment to an array element chosen at run time
+  (`if (we) mem[addr] <= d;`) is merged with the element's present value
+  instead of blocking the merge or giving `x`.
 - X-propagation: `msim -xprop` (`-xprop=tmerge`, `-xprop=xmerge`,
   `-xprop-report <file>`). In `always` blocks an unknown `if` condition,
   `case` selector or clock / reset edge no longer picks one branch: every

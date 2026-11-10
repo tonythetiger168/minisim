@@ -99,21 +99,31 @@ dut.sv:32: case: merged
 - a delay, event control, `wait` or `fork` in a branch;
 - a call of a task or of a function as a statement;
 - `break`, `continue`, `return` or `disable` that leaves the branch;
-- a blocking assignment to an array element chosen at run time, to a queue,
-  dynamic or associative array, a real, a string or a class property;
+- a blocking assignment to a queue, dynamic or associative array, a real, a
+  string or a class property;
 - `case ... inside`, `case ... matches`, `if ... matches`, and `casez` /
   `casex` with a label that is not constant.
 
 Some assignments are merged pessimistically: in a possible branch they
 make their target `x` instead of merging values.
 
-- a nonblocking assignment to an array element (`mem[addr] <= d`), to a bit
-  or part chosen at run time (`q[i] <= d`), or with a delay (`q <= #1 d`);
+- a nonblocking assignment to a bit or part chosen at run time
+  (`q[i] <= d`), or with a delay (`q <= #1 d`);
+- a nonblocking assignment to an array element (`mem[addr] <= d`) when one
+  pass over the block can assign that array more than once;
 - a nonblocking assignment to a variable that one pass over the block can
   assign more than once, when the block also has a delay or an event
   control past the first;
 - every nonblocking assignment of a block that calls a task or has a
   `fork`.
+
+An assignment to an array element chosen at run time (`mem[addr] = d`,
+`mem[addr] <= d`) in a possible branch stores the merge of the element's
+present value and the new one. That is exact for one write, such as
+`if (we) mem[addr] <= d;`. When several possible branches write the same
+element, or a branch reads back an element it wrote, the result has x
+where the present value differs, even if every branch agrees. A write
+whose index is unknown is skipped, as the standard says (7.4.6).
 
 Known limits: two signals of one event list that change in the same time
 step but in different delta cycles, the first with a clean edge and the

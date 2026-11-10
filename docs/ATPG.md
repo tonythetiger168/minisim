@@ -127,7 +127,8 @@ a netlist with a detected fault wired in (they fail).
   order, the chain's number from 0 in the order matpg lists the chains, and
   the value each cell of that chain is loaded with, the cell nearest scan-in
   first, `x` for a bit ATPG did not need. `<pattern> pi <bits>` gives the
-  port inputs the same way. A random pattern has no free bits.
+  port inputs the same way. A random pattern has no free bits. A header
+  line `chains <port> <port> ...` names the scan-in port of chain 0, 1, ...
 - `-json FILE`: the summary, for dashboards and CI.
 
 ## Threads
