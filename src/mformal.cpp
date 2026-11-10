@@ -21,7 +21,8 @@
 //   3. Each assertion becomes a monitor automaton whose states are the terms
 //      its attempts can become (the Brzozowski derivatives the simulator
 //      computes, here for every valuation of the atoms), one latch per term.
-//   4. Per property, the cone of influence is unrolled into CaDiCaL:
+//   4. Per property, the cone of influence is unrolled into the shared SAT
+//      solver (src/sat.hpp, CaDiCaL):
 //      bounded model checking from the reset state finds counterexamples and
 //      cover traces; k-induction with simple-path constraints proves.
 //   5. A counterexample is replayed on the AIG and written as a VCD of the
@@ -52,9 +53,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include "cadical.hpp"
 #include "lower.hpp"
 #include "parallel.hpp"
+#include "sat.hpp"
 #include "slang/driver/Driver.h"
 #include "version.hpp"
 
@@ -1604,17 +1605,23 @@ struct Unroll {
     const Model& m;
     const Cone& c;
     bool fromReset;   // frame 0 is the initial state, with the reset sequence; else any state, after reset
-    CaDiCaL::Solver s;
-    int nv = 0;
+    sat::Solver s;   // the solver every tool shares (CaDiCaL behind src/sat.hpp)
+    std::vector<int> assumed;
     int T;
     std::vector<std::vector<int>> map;   // frame -> cone position -> SAT literal
     std::vector<int> posOf;              // AIG node -> cone position, or -1
 
     Unroll(const Model& m_, const Cone& c_, bool fromReset_, const std::vector<int>& posOf_) : m(m_), c(c_), fromReset(fromReset_), posOf(posOf_) {
-        s.set("quiet", 1);
-        T = ++nv;
-        s.add(T);
-        s.add(0);
+        T = s.newVar();
+        s.addClause({T});
+    }
+    int newVar() { return s.newVar(); }
+    void assume(int l) { assumed.push_back(l); }
+    // 10: satisfiable, 20: unsatisfiable, 0: the conflict limit was reached
+    int solve(long long conflicts) {
+        sat::Result r = s.solve(assumed, conflicts > 0 ? conflicts : -1);
+        assumed.clear();
+        return r == sat::Sat ? 10 : r == sat::Unsat ? 20 : 0;
     }
     int frames() const { return (int)map.size(); }
     int lit(int f, int a) const {
@@ -1622,7 +1629,7 @@ struct Unroll {
         int l = n == 0 ? -T : map[(size_t)f][(size_t)posOf[(size_t)n]];
         return (a & 1) ? -l : l;
     }
-    void unit(int l) { s.add(l); s.add(0); }
+    void unit(int l) { s.addClause({l}); }
     void addFrame() {
         int f = frames();
         map.emplace_back(c.nodes.size(), 0);
@@ -1633,11 +1640,11 @@ struct Unroll {
             if (nd[0] < 0) {
                 auto it = m.stateBitOfInput.find(n);
                 if (it == m.stateBitOfInput.end()) {
-                    mp[p] = ++nv;
+                    mp[p] = newVar();
                 } else {
                     const StateBit& sb = m.stateBits[(size_t)it->second];
                     if (f == 0) {
-                        int v = ++nv;
+                        int v = newVar();
                         mp[p] = v;
                         if (fromReset && sb.init >= 0) unit(sb.init ? v : -v);
                     } else
@@ -1645,15 +1652,15 @@ struct Unroll {
                 }
             } else {
                 int a = lit(f, nd[0]), b = lit(f, nd[1]);
-                int v = ++nv;
+                int v = newVar();
                 mp[p] = v;
-                s.add(-v); s.add(a); s.add(0);
-                s.add(-v); s.add(b); s.add(0);
-                s.add(v); s.add(-a); s.add(-b); s.add(0);
+                s.addClause({-v, a});
+                s.addClause({-v, b});
+                s.addClause({v, -a, -b});
             }
         }
     }
-    bool val(int l) { return s.val(l) > 0; }
+    bool val(int l) { return l > 0 ? s.value(l) : !s.value(-l); }
 };
 
 // With `lemmas` (the fail literals of assertions already proven): the bounded
@@ -1690,7 +1697,6 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
     int rc = m.hasReset ? m.opt.resetCycles : 0;
     bool stepAlive = !m.opt.bmcOnly;
     int distinctUpTo = 0;   // simple-path constraints cover every pair of step frames below this
-    auto limit = [&](CaDiCaL::Solver& s) { if (m.opt.conflicts > 0) s.limit("conflicts", (int)std::min<long long>(m.opt.conflicts, INT32_MAX)); };
     // frames > 0: a bounded check of exactly that many frames (PDR found a failure that deep)
     if (frames > 0) stepAlive = false;
     for (int k = 0; k < (frames > 0 ? frames : rc + m.opt.depth); k++) {
@@ -1699,9 +1705,8 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
             for (int cst : constraints) bmc.unit(-bmc.lit(k, cst));
         int res = 20;
         if (!lemmas) {
-            bmc.s.assume(bmc.lit(k, pr.bad));
-            limit(bmc.s);
-            res = bmc.s.solve();
+            bmc.assume(bmc.lit(k, pr.bad));
+            res = bmc.solve(m.opt.conflicts);
         }
         if (res == 10) {
             r.depth = k - rc;
@@ -1733,9 +1738,8 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
             for (int l : lem) step.unit(-step.lit(j, l));
         if (j > 0) step.unit(-step.lit(j - 1, pr.bad));
         for (;;) {
-            step.s.assume(step.lit(j, pr.bad));
-            limit(step.s);
-            int sr = step.s.solve();
+            step.assume(step.lit(j, pr.bad));
+            int sr = step.solve(m.opt.conflicts);
             if (sr == 20) {
                 r.depth = j;
                 return done(cover ? V_UNREACHABLE : V_PROVEN);
@@ -1760,13 +1764,12 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
                                 int x = step.lit(a, m.stateBits[(size_t)sbi].in), y = step.lit(b, m.stateBits[(size_t)sbi].in);
                                 if (x == y) continue;
                                 if (x == -y) { diff.clear(); diff.push_back(step.T); break; }
-                                int d = ++step.nv;
-                                step.s.add(-d); step.s.add(x); step.s.add(y); step.s.add(0);
-                                step.s.add(-d); step.s.add(-x); step.s.add(-y); step.s.add(0);
+                                int d = step.newVar();
+                                step.s.addClause({-d, x, y});
+                                step.s.addClause({-d, -x, -y});
                                 diff.push_back(d);
                             }
-                            for (int d : diff) step.s.add(d);
-                            step.s.add(0);
+                            step.s.addClause(diff);
                             added = true;
                         }
                 if (added) distinctUpTo = j + 1;
@@ -1816,14 +1819,12 @@ struct Pdr {
         u->addFrame();
         u->addFrame();
         for (int l : never) u->unit(-u->lit(0, l));
-        if (m.opt.conflicts > 0) u->s.set("quiet", 1);
         F.push_back(std::move(u));
         blocked.emplace_back();
     }
     int solve(Unroll& u) {
         if (--budget < 0) throw Unsupported("budget");
-        if (m.opt.conflicts > 0) u.s.limit("conflicts", (int)std::min<long long>(m.opt.conflicts, INT32_MAX));
-        int r = u.s.solve();
+        int r = u.solve(m.opt.conflicts);
         if (r != 10 && r != 20) throw Unsupported("conflicts");
         return r;
     }
@@ -1833,8 +1834,9 @@ struct Pdr {
         return c;
     }
     void addClause(Unroll& u, const Cube& c) {
-        for (int l : c) u.s.add(-at(u, 0, l));
-        u.s.add(0);
+        std::vector<int> cl;
+        for (int l : c) cl.push_back(-at(u, 0, l));
+        u.s.addClause(cl);
     }
     // Is c unreachable in one step from F[level] minus c itself? If so, `core`
     // is a part of c that already is; if not, `pred` is a state that reaches it.
@@ -1842,13 +1844,13 @@ struct Pdr {
         Unroll& u = *F[(size_t)level];
         int act = 0;
         if (minusSelf) {
-            act = ++u.nv;
-            u.s.add(-act);
-            for (int l : c) u.s.add(-at(u, 0, l));
-            u.s.add(0);
-            u.s.assume(act);
+            act = u.newVar();
+            std::vector<int> cl{-act};
+            for (int l : c) cl.push_back(-at(u, 0, l));
+            u.s.addClause(cl);
+            u.assume(act);
         }
-        for (int l : c) u.s.assume(at(u, 1, l));
+        for (int l : c) u.assume(at(u, 1, l));
         int r = solve(u);
         bool unsat = r == 20;
         if (unsat && core) {
@@ -1920,14 +1922,14 @@ struct Pdr {
             newFrame();
             {   // a failure in an initial state
                 Unroll& u = *F[0];
-                u.s.assume(u.lit(0, bad));
+                u.assume(u.lit(0, bad));
                 if (solve(u) == 10) { cexSteps = 0; return 0; }
             }
             newFrame();
             for (int k = 1; k < maxFrames; k++) {
                 for (;;) {
                     Unroll& u = *F[(size_t)k];
-                    u.s.assume(u.lit(0, bad));
+                    u.assume(u.lit(0, bad));
                     if (solve(u) == 20) break;
                     if (!blockAll(stateOf(u), k)) return 0;
                 }
