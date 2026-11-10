@@ -1,0 +1,826 @@
+// lower_xprop.inc - X-propagation (msim -xprop), included in struct Lowerer.
+//
+// Standard Verilog is optimistic about an unknown control value: if (x)
+// takes the else branch, a case with an x selector takes the default, and
+// a clock going 0 -> x counts as a rising edge. With -xprop an always
+// block treats such a control as "either could have happened": every
+// branch that might be taken runs, and each variable they assign gets the
+// merge of the results.
+//   tmerge  bits on which all the branches agree keep their value, the
+//           others become x (what a real mux or flop could output)
+//   xmerge  every bit assigned in one of the branches becomes x
+//
+// All of it is done here, in lowering, with ordinary instructions, so the
+// interpreter, -compile and every thread count run the same program. For
+//     if (c) S1 else S2
+// the code is
+//         JmpIfNot (c is x) -> N ;  Jmp PRE
+//     N:  JmpIfNot c -> E
+//     T:  S1
+//         JmpIfNot t -> Z ;  Jmp MID
+//     E:  S2
+//         JmpIfNot t -> Z ;  Jmp MID
+//     Z:
+// and, out of line (reached only with an unknown control):
+//     PRE   t = 1; save every variable S1 or S2 assigns; go to T
+//     MID   fold the variables into the merge, restore them, and go on to
+//           the next branch that may be taken (or to POST after the last)
+//     POST  write the merge to the variables; t = 0; go to Z
+// A case statement and an else-if chain are one such region with more
+// branches. A nonblocking assignment cannot be merged after it is
+// scheduled, so in an unknown branch it is written to a shadow variable
+// (value and assigned-bits mask) that is merged like any other variable
+// and scheduled when the outermost unknown region ends.
+
+enum { XC_DIRECT, XC_LAZY, XC_EAGER };
+struct XpShadow { int n = -1, m = -1, w = 1, cls = XC_DIRECT; };
+struct XpUnit { int sig = -1, hi = -1, lo = 0, w = 1; };   // hi < 0: the whole signal
+struct XpRegionRec { std::string where, what, why; bool ok = false; };
+static int& xpropMode() { static int m = 0; return m; }   // 0 off, 1 tmerge, 2 xmerge
+static std::vector<XpRegionRec>& xpReport() { static std::vector<XpRegionRec> v; return v; }
+struct Xp {
+    bool on = false;
+    int xm = -1;   // 1 while an unknown region is running
+    int guardDepth = 0;
+    std::unordered_map<const slang::ast::Symbol*, int> cls;
+    std::unordered_map<int, XpShadow> shadow;   // by target signal
+    std::unordered_map<int, int> shadowOf;      // shadow value or mask -> target signal
+    std::unordered_set<int> bad;                // targets that cannot be merged (real, string, ...)
+    std::unordered_set<size_t> okNba, oolJmp;
+    std::vector<std::pair<size_t, size_t>> guarded, badRanges;
+    std::vector<std::function<void()>> ool;
+} xp;
+
+// A temporary of the merge. A name with '$' stays out of waveforms and toggle coverage.
+int xpTemp(int w) {
+    if (!mkSig) unsupported("temporary");
+    int n = tempSeq ? (*tempSeq)++ : 0;
+    return mkSig("_xp$" + std::to_string(n), w, false);
+}
+static int xpSigW(int s) { return (size_t)s < sigInfo().size() && sigInfo()[s].second > 0 ? sigInfo()[s].second : 1; }
+static E xpX(int w) { return konst(allx(w)); }
+static E xpOnes(int w) { return konst(v_not(make(0, 0, w))); }
+static E xpZero(int w) { return konst(make(0, 0, w)); }
+static E xpIsX(E e) { return bin(Op::CaseEq, std::move(e), konst(allx(1))); }
+static E xpIs(E e, int v) { return bin(Op::CaseEq, std::move(e), konst(mk((uint64_t)v, 1))); }
+static E xpNot(E e) { return un(Op::LogNot, std::move(e)); }
+static E xpUnk1(E e) { return bin(Op::LogAnd, xpNot(xpIs(e, 0)), xpNot(xpIs(e, 1))); }
+static E xpRd(const XpUnit& u) { return u.hi < 0 ? ref(u.sig) : slice(ref(u.sig), u.hi, u.lo); }
+void xpSet(int sig, E e) { Instr a; a.k = IK::Assign; a.sig = sig; a.e = std::move(e); prog.emit(a); }
+void xpWr(const XpUnit& u, E e) {
+    Instr a; a.k = IK::Assign; a.sig = u.sig; a.e = std::move(e);
+    if (u.hi >= 0) { a.hi = u.hi; a.lo = u.lo; }
+    prog.emit(a);
+}
+size_t xpJmp(size_t target = 0) { Instr j; j.k = IK::Jmp; j.target = target; return prog.emit(j); }
+
+// Statements whose only effect is a message or the end of the run are
+// skipped while an unknown region runs: it is not known that they execute.
+template <class F> void xpGuard(F&& f) {
+    if (!xp.on || xp.guardDepth) { f(); return; }
+    size_t jf = emitJmpIfNot(xpNot(xpIs(ref(xp.xm), 1)));
+    xp.guardDepth++;
+    f();
+    xp.guardDepth--;
+    xp.guarded.push_back({jf, prog.here()});
+    prog.code[jf].target = prog.here();
+}
+static bool xpMessageTask(std::string_view n) {
+    return n.starts_with("$display") || n.starts_with("$write") || n.starts_with("$strobe") ||
+           n.starts_with("$monitor") || n.starts_with("$fdisplay") || n.starts_with("$fwrite") ||
+           n.starts_with("$fstrobe") || n.starts_with("$fmonitor") || n == "$fatal" || n == "$error" ||
+           n == "$warning" || n == "$info" || n == "$finish" || n == "$stop";
+}
+// An expression statement: a message task is guarded, a call of a user
+// task or function makes the regions around it unmergeable.
+void xpExprStmt(const slang::ast::Expression& ex) {
+    using namespace slang::ast;
+    if (xp.on && ex.kind == ExpressionKind::Call) {
+        const auto& call = ex.as<CallExpression>();
+        if (call.isSystemCall() && xpMessageTask(call.getSubroutineName())) {
+            xpGuard([&] { exprStmt(ex); });
+            return;
+        }
+        size_t a = prog.here();
+        exprStmt(ex);
+        xp.badRanges.push_back({a, prog.here()});
+        return;
+    }
+    exprStmt(ex);
+}
+
+// ---- which nonblocking targets need which treatment ----
+// The variable a target expression writes; `simple` is cleared unless the
+// target is a whole packed variable or a constant part of one.
+bool xpConstInt(const slang::ast::Expression& x, slang::SVInt* out = nullptr) const {
+    slang::ConstantValue cv = x.getConstant() ? *x.getConstant() : tryConst(x);
+    if (cv.bad() || !cv.isInteger()) return false;
+    if (out) *out = cv.integer();
+    return true;
+}
+const slang::ast::Symbol* xpRootOf(const slang::ast::Expression& e0, bool& simple) const {
+    using namespace slang::ast;
+    const Expression* e = &peel(e0);
+    for (;;) {
+        switch (e->kind) {
+            case ExpressionKind::NamedValue:
+                if (!e->type->isIntegral()) simple = false;
+                return &e->as<ValueExpressionBase>().symbol;
+            case ExpressionKind::HierarchicalValue:
+                simple = false;
+                return &e->as<ValueExpressionBase>().symbol;
+            case ExpressionKind::ElementSelect: {
+                const auto& s = e->as<ElementSelectExpression>();
+                if (!s.value().type->isIntegral() || !xpConstInt(s.selector())) simple = false;
+                e = &peel(s.value());
+                break;
+            }
+            case ExpressionKind::RangeSelect: {
+                const auto& s = e->as<RangeSelectExpression>();
+                if (!s.value().type->isIntegral() || !xpConstInt(s.left()) || !xpConstInt(s.right())) simple = false;
+                e = &peel(s.value());
+                break;
+            }
+            case ExpressionKind::MemberAccess: {
+                const auto& s = e->as<MemberAccessExpression>();
+                if (!s.value().type->isIntegral()) simple = false;
+                e = &peel(s.value());
+                break;
+            }
+            default:
+                simple = false;
+                return nullptr;
+        }
+    }
+}
+struct XpPre {
+    std::unordered_set<const slang::ast::Symbol*> direct;
+    bool waits = false, unknown = false;
+};
+using XpCounts = std::unordered_map<const slang::ast::Symbol*, int>;
+static void xpAdd(XpCounts& a, const XpCounts& b) { for (auto& [s, n] : b) a[s] = std::min(2, a[s] + n); }
+static void xpMax(XpCounts& a, const XpCounts& b) { for (auto& [s, n] : b) a[s] = std::max(a[s], n); }
+void xpTargets(const slang::ast::Expression& l0, bool delayed, XpCounts& out, XpPre& pre) {
+    using namespace slang::ast;
+    const Expression& l = peel(l0);
+    if (l.kind == ExpressionKind::Concatenation) {
+        for (auto* op : l.as<ConcatenationExpression>().operands()) xpTargets(*op, delayed, out, pre);
+        return;
+    }
+    if (l.kind == ExpressionKind::Streaming) { pre.unknown = true; return; }
+    bool simple = true;
+    const Symbol* s = xpRootOf(l, simple);
+    if (!s) { pre.unknown = true; return; }
+    out[s] = std::min(2, out[s] + 1);
+    if (!simple || delayed) pre.direct.insert(s);
+}
+// How many times one pass over s can assign each variable with <=
+// (0, 1, or 2 for more).
+void xpCount(const slang::ast::Statement& s, XpCounts& out, XpPre& pre) {
+    using namespace slang::ast;
+    auto loop = [&](const Statement& body) {
+        XpCounts c;
+        xpCount(body, c, pre);
+        for (auto& [sym, n] : c) if (n) out[sym] = 2;
+    };
+    switch (s.kind) {
+        case StatementKind::Empty:
+        case StatementKind::VariableDeclaration:
+        case StatementKind::Break:
+        case StatementKind::Continue:
+        case StatementKind::Return:
+        case StatementKind::Disable:
+            break;
+        case StatementKind::List:
+            for (auto* st : s.as<StatementList>().list) xpCount(*st, out, pre);
+            break;
+        case StatementKind::Block: {
+            const auto& b = s.as<BlockStatement>();
+            if (b.blockKind != StatementBlockKind::Sequential) { pre.unknown = true; break; }
+            xpCount(b.body, out, pre);
+            break;
+        }
+        case StatementKind::ExpressionStatement: {
+            const Expression& ex = s.as<ExpressionStatement>().expr;
+            if (ex.kind == ExpressionKind::Assignment) {
+                const auto& a = ex.as<AssignmentExpression>();
+                if (a.isNonBlocking()) xpTargets(a.left(), a.timingControl != nullptr, out, pre);
+                else if (a.timingControl) pre.waits = true;
+            } else if (ex.kind == ExpressionKind::Call && !ex.as<CallExpression>().isSystemCall()) {
+                pre.unknown = true;   // a task can wait and assign
+            }
+            break;
+        }
+        case StatementKind::Conditional: {
+            const auto& c = s.as<ConditionalStatement>();
+            XpCounts a, b;
+            xpCount(c.ifTrue, a, pre);
+            if (c.ifFalse) xpCount(*c.ifFalse, b, pre);
+            xpMax(a, b);
+            xpAdd(out, a);
+            break;
+        }
+        case StatementKind::Case: {
+            const auto& c = s.as<CaseStatement>();
+            XpCounts a;
+            for (auto& item : c.items) { XpCounts b; xpCount(*item.stmt, b, pre); xpMax(a, b); }
+            if (c.defaultCase) { XpCounts b; xpCount(*c.defaultCase, b, pre); xpMax(a, b); }
+            xpAdd(out, a);
+            break;
+        }
+        case StatementKind::ImmediateAssertion: {
+            const auto& c = s.as<ImmediateAssertionStatement>();
+            XpCounts a, b;
+            if (c.ifTrue) xpCount(*c.ifTrue, a, pre);
+            if (c.ifFalse) xpCount(*c.ifFalse, b, pre);
+            xpMax(a, b);
+            xpAdd(out, a);
+            break;
+        }
+        case StatementKind::ForLoop: loop(s.as<ForLoopStatement>().body); break;
+        case StatementKind::RepeatLoop: loop(s.as<RepeatLoopStatement>().body); break;
+        case StatementKind::ForeachLoop: loop(s.as<ForeachLoopStatement>().body); break;
+        case StatementKind::WhileLoop: loop(s.as<WhileLoopStatement>().body); break;
+        case StatementKind::DoWhileLoop: loop(s.as<DoWhileLoopStatement>().body); break;
+        case StatementKind::ForeverLoop: loop(s.as<ForeverLoopStatement>().body); break;
+        case StatementKind::Timed:
+            pre.waits = true;
+            xpCount(s.as<TimedStatement>().stmt, out, pre);
+            break;
+        case StatementKind::Wait:
+            pre.waits = true;
+            xpCount(s.as<WaitStatement>().stmt, out, pre);
+            break;
+        default:
+            pre.unknown = true;
+    }
+}
+
+// ---- nonblocking assignments ----
+// A nonblocking assignment with no shadow: in an unknown region its target becomes x.
+void xpDirect(Instr i) {
+    if (!xp.on || i.k != IK::Nba) { prog.emit(i); return; }
+    int w = i.bidx && i.pw <= 0 ? 1 : i.pw > 0 ? i.pw : i.hi >= 0 ? i.hi - i.lo + 1
+            : i.arr ? i.arr->elemW : (i.sig >= 0 && !isRel(i.sig) ? xpSigW(i.sig) : 0);
+    if (w <= 0 || i.dyn >= 0) { prog.emit(i); return; }   // left as it is: the region is refused
+    size_t jf = emitJmpIfNot(ref(xp.xm));
+    Instr x = i;
+    x.e = xpX(w);
+    xp.okNba.insert(prog.emit(x));
+    size_t js = xpJmp();
+    prog.code[jf].target = prog.here();
+    xp.okNba.insert(prog.emit(i));
+    prog.code[js].target = prog.here();
+}
+// Emits assignment i, whose target expression is `target`.
+void xpEmit(Instr i, const slang::ast::Expression& target) {
+    if (xp.on && i.k == IK::Assign && i.sig >= 0 && !target.type->isIntegral()) xp.bad.insert(i.sig);
+    if (!xp.on || i.k != IK::Nba) { prog.emit(i); return; }
+    bool simple = true;
+    const slang::ast::Symbol* root = xpRootOf(target, simple);
+    int cls = XC_DIRECT;
+    if (root && simple)
+        if (auto it = xp.cls.find(root); it != xp.cls.end()) cls = it->second;
+    if (i.nbaLater || i.arr || i.dyn >= 0 || i.bidx || i.pw > 0 || i.sig < 0 || isRel(i.sig) || i.drv >= 0) cls = XC_DIRECT;
+    if (cls == XC_DIRECT) { xpDirect(i); return; }
+    auto [it, isNew] = xp.shadow.try_emplace(i.sig);
+    XpShadow& sh = it->second;
+    if (isNew) {
+        sh.w = xpSigW(i.sig);
+        sh.n = xpTemp(sh.w);
+        sh.m = xpTemp(sh.w);
+        sh.cls = cls;
+        xp.shadowOf[sh.n] = i.sig;
+        xp.shadowOf[sh.m] = i.sig;
+    }
+    Instr n = i, m = i;
+    n.k = m.k = IK::Assign;
+    n.sig = sh.n;
+    m.sig = sh.m;
+    m.e = xpOnes(i.hi >= 0 ? i.hi - i.lo + 1 : sh.w);
+    if (sh.cls == XC_EAGER) { prog.emit(n); prog.emit(m); return; }
+    size_t jf = emitJmpIfNot(ref(xp.xm));
+    prog.emit(n);
+    prog.emit(m);
+    size_t js = xpJmp();
+    prog.code[jf].target = prog.here();
+    xp.okNba.insert(prog.emit(i));
+    prog.code[js].target = prog.here();
+}
+
+// ---- a region ----
+// What instructions [a, b) assign, or why they cannot run speculatively.
+struct XpBits { bool all = false; std::vector<std::pair<int, int>> r; };
+bool xpScan(size_t a, size_t b, std::map<int, XpBits>& tg, std::string& why) {
+    for (auto& [s, e] : xp.badRanges)
+        if (s < b && e > a && s < e) { why = "a task or function call statement"; return false; }
+    size_t g = 0;
+    for (size_t pc = a; pc < b; pc++) {
+        while (g < xp.guarded.size() && xp.guarded[g].second <= pc) g++;
+        if (g < xp.guarded.size() && xp.guarded[g].first <= pc) { pc = xp.guarded[g].second - 1; continue; }
+        const Instr& i = prog.code[pc];
+        switch (i.k) {
+            case IK::Assign: {
+                if (i.dyn >= 0) { why = "an assignment to a queue, dynamic or associative array element"; return false; }
+                if (i.arr) { why = "an assignment to an array element chosen at run time"; return false; }
+                if (i.sig < 0 || isRel(i.sig)) { why = "an assignment to an automatic variable or class property"; return false; }
+                if (i.drv >= 0) { why = "a net driver"; return false; }
+                if (xp.bad.count(i.sig)) { why = "an assignment to a real, string, handle or container variable"; return false; }
+                XpBits& t = tg[i.sig];
+                if (i.hi < 0 || i.bidx || i.pw > 0) t.all = true;
+                else t.r.push_back({i.lo, i.hi});
+                break;
+            }
+            case IK::Nba:
+                if (!xp.okNba.count(pc)) { why = "a nonblocking assignment in a form that cannot be merged"; return false; }
+                break;
+            case IK::Jmp:
+            case IK::JmpIfNot:
+                if (xp.oolJmp.count(pc)) break;
+                if (i.target < a || i.target > b) { why = "a jump out of the branch (break, continue, return or disable)"; return false; }
+                break;
+            case IK::Call:
+                break;   // a function in an expression
+            case IK::WaitEdge: case IK::WaitDelay: case IK::CycleWait: case IK::WaitFork:
+                why = "a delay or event control"; return false;
+            case IK::Display: case IK::Strobe: case IK::Monitor: case IK::Finish: case IK::Assert:
+                why = "a system task with a side effect"; return false;
+            default:
+                why = "a statement that cannot run speculatively"; return false;
+        }
+    }
+    return true;
+}
+static std::vector<XpUnit> xpUnits(const std::map<int, XpBits>& tg) {
+    std::vector<XpUnit> out;
+    for (auto& [sig, b] : tg) {
+        int w = xpSigW(sig);
+        bool all = b.all;
+        std::vector<std::pair<int, int>> r = b.r;
+        if (!all) {
+            std::sort(r.begin(), r.end());
+            std::vector<std::pair<int, int>> m;
+            for (auto& x : r) {
+                if (!m.empty() && x.first <= m.back().second + 1) m.back().second = std::max(m.back().second, x.second);
+                else m.push_back(x);
+            }
+            r = std::move(m);
+            if (r.size() > 4 || (r.size() == 1 && r[0].first <= 0 && r[0].second >= w - 1)) all = true;
+        }
+        if (all) out.push_back({sig, -1, 0, w});
+        else for (auto& [lo, hi] : r) out.push_back({sig, hi, lo, hi - lo + 1});
+    }
+    return out;
+}
+// Schedules the shadow of target q: the parts in `units` that were assigned.
+void xpFlush(int q, const XpShadow& sh, const std::vector<XpUnit>& units) {
+    for (const XpUnit& u : units) {
+        if (u.sig != sh.n) continue;
+        XpUnit mu = u;
+        mu.sig = sh.m;
+        size_t jf = emitJmpIfNot(xpNot(xpIs(un(Op::RedOr, xpRd(mu)), 0)));
+        Instr a; a.k = IK::Nba; a.sig = q; a.e = xpRd(u);
+        if (u.hi >= 0) { a.hi = u.hi; a.lo = u.lo; }
+        prog.emit(a);
+        prog.code[jf].target = prog.here();
+    }
+}
+
+// One region: nCond branches tried in order, then the default branch
+// (k == nCond). cond(k) returns {gx, g}: gx is true when it is unknown
+// whether branch k is taken, g when it is taken (null: taken whenever gx
+// is false). body(k) lowers the branch. T, when given, gets the first
+// instruction of each branch. With `total`, weight(k) is how many of the
+// `total` possible control values branch k stands for when it is unknown;
+// once the unknown branches that ran add up to total, the default branch
+// cannot be reached and does not run. False when the branches cannot be
+// merged: then an unknown condition counts as false, as without -xprop.
+bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
+             const std::function<void(size_t)>& body, const char* what, std::vector<size_t>* T = nullptr,
+             const std::function<E(size_t)>& weight = nullptr, E total = nullptr) {
+    struct Alt { E gx; size_t jpre = 0, N = 0, T = 0, bs = 0, be = 0, jmid = 0, next = 0; };
+    std::vector<Alt> R(nCond + 1);
+    std::string where = whereStr();
+    int t = xpTemp(1);
+    std::vector<size_t> toZ;
+    size_t jfull = (size_t)-1;
+    for (size_t k = 0; k <= nCond; k++) {
+        Alt& r = R[k];
+        size_t jn = (size_t)-1;
+        if (k < nCond) {
+            auto [gx, g] = cond(k);
+            r.gx = gx;
+            size_t jx = emitJmpIfNot(gx);
+            r.jpre = xpJmp();
+            xp.oolJmp.insert(r.jpre);
+            prog.code[jx].target = prog.here();
+            r.N = prog.here();
+            if (g) jn = emitJmpIfNot(g);
+        }
+        if (k == nCond && total) {   // in an unknown region: is the default still reachable?
+            size_t jf = emitJmpIfNot(ref(t));
+            jfull = xpJmp();
+            xp.oolJmp.insert(jfull);
+            prog.code[jf].target = prog.here();
+        }
+        r.T = r.bs = prog.here();
+        body(k);
+        r.be = prog.here();
+        toZ.push_back(emitJmpIfNot(ref(t)));
+        r.jmid = xpJmp();
+        xp.oolJmp.insert(r.jmid);
+        if (jn != (size_t)-1) prog.code[jn].target = prog.here();
+        r.next = prog.here();
+    }
+    size_t Z = prog.here();
+    for (size_t j : toZ) prog.code[j].target = Z;
+    if (T) for (auto& r : R) T->push_back(r.T);
+
+    std::map<int, XpBits> tg;
+    std::string why;
+    bool ok = true;
+    for (auto& r : R)
+        if (!xpScan(r.bs, r.be, tg, why)) { ok = false; break; }
+    xpReport().push_back({where, what, why, ok});
+    if (!ok) {
+        for (size_t k = 0; k <= nCond; k++) {
+            if (k < nCond) prog.code[R[k].jpre].target = R[k].N;
+            prog.code[R[k].jmid].target = Z;
+        }
+        if (jfull != (size_t)-1) prog.code[jfull].target = R[nCond].T;
+        return false;
+    }
+    std::vector<XpUnit> units = xpUnits(tg);
+    std::vector<int> lazy;   // targets whose shadows this region starts and schedules when it is outermost
+    for (auto& [sig, b] : tg)
+        if (auto it = xp.shadowOf.find(sig); it != xp.shadowOf.end()) {
+            const XpShadow& sh = xp.shadow.at(it->second);
+            if (sh.cls == XC_LAZY && sig == sh.n) lazy.push_back(it->second);
+        }
+    bool tm = xpropMode() == 1;
+    int root = xpTemp(1), first = xpTemp(1), which = xpTemp(32);
+    int cnt = total ? xpTemp(32) : -1;
+    std::vector<E> wt;
+    if (total) for (size_t k = 0; k < nCond; k++) wt.push_back(weight(k));
+    std::vector<int> snap, acc;
+    for (const XpUnit& u : units) {
+        snap.push_back(xpTemp(u.w));
+        acc.push_back(tm ? xpTemp(u.w) : -1);
+    }
+    xp.ool.push_back([=, this] {
+        auto num = [](size_t k) { return konst(make(k, 0, 32)); };
+        std::vector<size_t> toSetup, toMid, toPost;
+        for (size_t k = 0; k < nCond; k++) {   // PRE k
+            prog.code[R[k].jpre].target = prog.here();
+            size_t jf = emitJmpIfNot(ref(t));
+            xpJmp(R[k].T);
+            prog.code[jf].target = prog.here();
+            xpSet(which, num(k));
+            toSetup.push_back(xpJmp());
+        }
+        for (size_t k = 0; k <= nCond; k++) {   // MID k
+            prog.code[R[k].jmid].target = prog.here();
+            xpSet(which, num(k));
+            toMid.push_back(xpJmp());
+        }
+        // Entering the region: save what the branches assign.
+        for (size_t j : toSetup) prog.code[j].target = prog.here();
+        xpSet(root, xpNot(xpIs(ref(xp.xm), 1)));
+        {
+            size_t jr = emitJmpIfNot(ref(root));
+            xpSet(xp.xm, konst(mk(1, 1)));
+            for (int q : lazy) {
+                const XpShadow& sh = xp.shadow.at(q);
+                xpSet(sh.n, ref(q));
+                xpSet(sh.m, xpZero(sh.w));
+            }
+            prog.code[jr].target = prog.here();
+        }
+        for (size_t u = 0; u < units.size(); u++) xpSet(snap[u], xpRd(units[u]));
+        xpSet(first, konst(mk(1, 1)));
+        xpSet(t, konst(mk(1, 1)));
+        if (total) xpSet(cnt, konst(mk(0, 32)));
+        for (size_t k = 0; k < nCond; k++) {
+            size_t jf = emitJmpIfNot(bin(Op::CaseEq, ref(which), num(k)));
+            xpJmp(R[k].T);
+            prog.code[jf].target = prog.here();
+        }
+        xpJmp(Z);   // not reached
+        // A branch has run: fold its results into the merge and undo them.
+        for (size_t j : toMid) prog.code[j].target = prog.here();
+        if (tm) {
+            size_t jf = emitJmpIfNot(ref(first));
+            for (size_t u = 0; u < units.size(); u++) xpSet(acc[u], xpRd(units[u]));
+            xpSet(first, konst(mk(0, 1)));
+            size_t js = xpJmp();
+            prog.code[jf].target = prog.here();
+            for (size_t u = 0; u < units.size(); u++)
+                xpSet(acc[u], mux(konst(allx(1)), ref(acc[u]), xpRd(units[u])));
+            prog.code[js].target = prog.here();
+        }
+        for (size_t u = 0; u < units.size(); u++) xpWr(units[u], ref(snap[u]));
+        for (size_t k = 0; k < nCond; k++) {
+            size_t jf = emitJmpIfNot(bin(Op::CaseEq, ref(which), num(k)));
+            size_t jd = emitJmpIfNot(R[k].gx);   // taken for sure: no later branch runs
+            if (total) {   // every possible value is covered: the default cannot be reached
+                xpSet(cnt, bin(Op::Add, ref(cnt), wt[k]));
+            }
+            xpJmp(R[k].next);
+            prog.code[jd].target = prog.here();
+            toPost.push_back(xpJmp());
+            prog.code[jf].target = prog.here();
+        }
+        if (jfull != (size_t)-1) {
+            toPost.push_back(xpJmp());   // the default branch has run
+            prog.code[jfull].target = prog.here();
+            size_t jf = emitJmpIfNot(bin(Op::CaseEq, ref(cnt), total));
+            toPost.push_back(xpJmp());
+            prog.code[jf].target = prog.here();
+            xpJmp(R[nCond].T);
+        }
+        // Leaving the region.
+        for (size_t j : toPost) prog.code[j].target = prog.here();
+        for (size_t u = 0; u < units.size(); u++) xpWr(units[u], tm ? ref(acc[u]) : xpX(units[u].w));
+        xpSet(t, konst(mk(0, 1)));
+        size_t jr = emitJmpIfNot(ref(root));
+        for (int q : lazy) xpFlush(q, xp.shadow.at(q), units);
+        xpSet(xp.xm, konst(mk(0, 1)));
+        prog.code[jr].target = prog.here();
+        xpJmp(Z);
+    });
+    return true;
+}
+
+// if / else if / else (12.4), with or without unique / priority.
+bool xpIf(const slang::ast::ConditionalStatement& top) {
+    using namespace slang::ast;
+    if (!xp.on) return false;
+    std::vector<const ConditionalStatement*> chain{&top};
+    while (chain.back()->ifFalse && chain.back()->ifFalse->kind == StatementKind::Conditional &&
+           chain.back()->ifFalse->as<ConditionalStatement>().check == UniquePriorityCheck::None)
+        chain.push_back(&chain.back()->ifFalse->as<ConditionalStatement>());
+    for (auto* c : chain)
+        if (c->conditions.size() != 1 || c->conditions[0].pattern || !c->conditions[0].expr->type->isIntegral()) {
+            if (c == &top || top.check != UniquePriorityCheck::None) return false;
+            chain.resize((size_t)(std::find(chain.begin(), chain.end(), c) - chain.begin()));
+            break;
+        }
+    size_t n = chain.size();
+    bool uniq = top.check == UniquePriorityCheck::Unique || top.check == UniquePriorityCheck::Unique0;
+    bool needAll = top.check == UniquePriorityCheck::Unique || top.check == UniquePriorityCheck::Priority;
+    const Statement* last = chain.back()->ifFalse;
+    if (uniq)   // more than one condition true (12.4.2): checked before any branch runs
+        xpGuard([&] {
+            std::vector<size_t> toEnd;
+            for (size_t k = 0; k + 1 < n; k++) {
+                size_t jf = emitJmpIfNot(expr(*chain[k]->conditions[0].expr));
+                E more;
+                for (size_t m = k + 1; m < n; m++) {
+                    E x = expr(*chain[m]->conditions[0].expr);
+                    more = more ? bin(Op::LogOr, more, x) : x;
+                }
+                size_t jo = emitJmpIfNot(more);
+                violation(top, checkName(top.check) + " if: more than one condition is true", top.check);
+                prog.code[jo].target = prog.here();
+                toEnd.push_back(xpJmp());
+                prog.code[jf].target = prog.here();
+            }
+            for (size_t j : toEnd) prog.code[j].target = prog.here();
+        });
+    xpChain(n,
+        [&](size_t k) {
+            E c = expr(*chain[k]->conditions[0].expr);
+            return std::pair<E, E>{xpIsX(un(Op::RedOr, c)), c};
+        },
+        [&](size_t k) {
+            if (k < n) stmt(chain[k]->ifTrue);
+            else if (last) stmt(*last);
+            else if (needAll)
+                xpGuard([&] { violation(top, checkName(top.check) + " if: no condition is true", top.check); });
+        }, "if");
+    return true;
+}
+
+// case / casez / casex (12.5). A selector with no x or z bit is matched
+// as always. Otherwise an item may match unless a bit known in both
+// differs, and every item that may match before the first that does runs.
+bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) {
+    using namespace slang::ast;
+    if (!xp.on || c.condition == CaseStatementCondition::Inside) return false;
+    if (!c.expr.type->isIntegral()) return false;
+    bool wz = c.condition == CaseStatementCondition::WildcardJustZ;
+    bool wx = c.condition == CaseStatementCondition::WildcardXOrZ;
+    for (const auto& item : c.items)
+        for (const Expression* x : item.expressions) {
+            if (!x->type->isIntegral()) return false;
+            if ((wz || wx) && !xpConstInt(*x)) return false;
+        }
+    Op cmp = wz ? Op::CaseZEq : wx ? Op::CaseXEq : Op::CaseEq;
+    size_t n = c.items.size();
+    std::vector<E> conds;   // the standard match of each item
+    for (const auto& item : c.items) {
+        E cond;
+        for (const Expression* x : item.expressions) {
+            E m = bin(cmp, expr(c.expr), expr(*x));
+            cond = cond ? bin(Op::LogOr, cond, m) : m;
+        }
+        conds.push_back(cond);
+    }
+    bool uniq = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Unique0;
+    bool needAll = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Priority;
+    int ov = uniq ? caseMayOverlap(c) : 0;
+    if (ov > 0 && n > 1)   // more than one item matches (12.5.3): checked before any item runs
+        xpGuard([&] {
+            E selUnknown;
+            if (ov == 1) selUnknown = bin(Op::Ne, sysFnNode(SF_COUNTBITS, {expr(c.expr)}, 12), konst(make(0, 0, 32, 0, true)));
+            int hit = xpTemp(32);
+            auto num = [](size_t k) { return konst(make(k, 0, 32)); };
+            std::vector<size_t> toCheck, toEnd;
+            for (size_t k = 0; k + 1 < n; k++) {
+                size_t jf = emitJmpIfNot(conds[k]);
+                xpSet(hit, num(k));
+                toCheck.push_back(xpJmp());
+                prog.code[jf].target = prog.here();
+            }
+            toEnd.push_back(xpJmp());
+            for (size_t j : toCheck) prog.code[j].target = prog.here();
+            for (size_t m = 1; m < n; m++) {
+                E later = bin(Op::LogAnd, bin(Op::Lt, ref(hit), num(m)), conds[m]);
+                if (selUnknown) later = bin(Op::LogAnd, selUnknown, later);
+                size_t jf = emitJmpIfNot(later);
+                violation(s, checkName(c.check) + " case: more than one case item matches", c.check);
+                toEnd.push_back(xpJmp());
+                prog.code[jf].target = prog.here();
+            }
+            for (size_t j : toEnd) prog.code[j].target = prog.here();
+        });
+    // Selector fully known: the standard matches pick the item (out of line).
+    size_t jfast = emitJmpIfNot(xpIsX(un(Op::RedXor, expr(c.expr))));
+    xp.oolJmp.insert(jfast);
+    auto T = std::make_shared<std::vector<size_t>>();
+    // A plain case whose labels are distinct known constants: an unknown
+    // selector with k unknown bits stands for 2^k values and each label
+    // that may match is one of them.
+    bool countable = !wz && !wx;
+    {
+        std::vector<slang::SVInt> seen;
+        for (const auto& item : c.items)
+            for (const Expression* x : item.expressions) {
+                slang::SVInt v;
+                if (!xpConstInt(*x, &v) || v.hasUnknown()) { countable = false; continue; }
+                for (auto& o : seen)
+                    if (o.getBitWidth() != v.getBitWidth() || exactlyEqual(o, v)) countable = false;
+                seen.push_back(v);
+            }
+    }
+    auto label = [&](const Expression* x) { return un(Op::RedAnd, un(Op::Not, bin(Op::Xor, expr(c.expr), expr(*x)))); };
+    E total;
+    if (countable)   // 2^k, or 0 (never reached) when k is 32 or more
+        total = bin(Op::Shl, konst(mk(1, 32)), resize(sysFnNode(SF_COUNTBITS, {expr(c.expr)}, 12), 32, false, false));
+    bool ok = xpChain(n,
+        [&](size_t k) {
+            E g;
+            for (const Expression* x : c.items[k].expressions) {
+                E m = un(Op::Not, bin(Op::Xor, expr(c.expr), expr(*x)));
+                if (wz || wx) {   // wildcard bits of the item match anything
+                    slang::SVInt v;
+                    xpConstInt(*x, &v);
+                    int w = (int)v.getBitWidth();
+                    Val mask = make(0, 0, w);
+                    bool any = false;
+                    for (int b = 0; b < w; b++) {
+                        slang::logic_t bit = v[(int32_t)b];
+                        if (wx ? bit.isUnknown() : bit.value == slang::logic_t::Z_VALUE) {
+                            mask = v_insert(mask, mk(1, 1), b, b);
+                            any = true;
+                        }
+                    }
+                    if (any) m = bin(Op::Or, m, konst(mask));
+                }
+                m = un(Op::RedAnd, m);
+                g = g ? bin(Op::LogOr, g, m) : m;
+            }
+            return std::pair<E, E>{xpIsX(g), g};
+        },
+        [&](size_t k) {
+            if (k < n) stmt(*c.items[k].stmt);
+            else if (c.defaultCase) stmt(*c.defaultCase);
+            else if (needAll)
+                xpGuard([&] { violation(s, checkName(c.check) + " case: no case item matches", c.check); });
+        }, "case", T.get(),
+        [&](size_t k) {
+            E sum;
+            for (const Expression* x : c.items[k].expressions) {
+                E one = resize(xpIsX(label(x)), 32, false, false);
+                sum = sum ? bin(Op::Add, sum, one) : one;
+            }
+            return sum;
+        }, total);
+    xp.ool.push_back([=, this] {
+        if (!ok) { Instr j; j.k = IK::Jmp; j.line = prog.code[jfast].line; j.file = prog.code[jfast].file; prog.code[jfast] = j; }
+        prog.code[jfast].target = prog.here();
+        for (size_t k = 0; k < n; k++) {
+            Instr j; j.k = IK::JmpIfNot; j.e = xpNot(conds[k]); j.target = (*T)[k];
+            prog.emit(j);
+        }
+        xpJmp((*T)[n]);
+    });
+    return true;
+}
+
+// ---- an always procedure ----
+// After @(posedge clk or negedge rst_n ...): true when the edge that woke
+// the process went from or to x or z and no listed edge certainly happened
+// (expr.hpp: SF_XPROP_EDGE). `level` holds the event signals the body reads.
+// The kernel keeps each signal's value before its last change and when it
+// changed. (Two listed signals changing in one time step but in different
+// delta cycles, the first cleanly and the second from or to x, is taken as
+// a clean edge.)
+E xpAmbiguousEdge(const std::vector<std::pair<int, Edge>>& ev, const std::unordered_set<int>& level) {
+    std::vector<E> kids;
+    for (auto& [sig, edge] : ev)
+        kids.push_back(konst(mk(((uint64_t)sig << 2) | (edge == NEG ? 2 : 0) | (level.count(sig) ? 1 : 0), 64)));
+    return sysFnNode(SF_XPROP_EDGE, std::move(kids));
+}
+// The body of an always, always_comb, always_ff or always_latch.
+void xpProc(const slang::ast::Statement& body) {
+    using namespace slang::ast;
+    const Statement* b = &body;
+    std::vector<std::pair<int, Edge>> ev;
+    if (b->kind == StatementKind::Timed) {
+        const auto& t = b->as<TimedStatement>();
+        covLoc(b->sourceRange.start());
+        lastLoc() = b->sourceRange.start();
+        timing(t.timing);
+        if ((t.timing.kind == TimingControlKind::SignalEvent || t.timing.kind == TimingControlKind::EventList) &&
+            prog.code.back().k == IK::WaitEdge && !prog.code.back().dynWait) {
+            ev = prog.code.back().events;
+            for (auto& [sig, edge] : ev)
+                if (edge == ANY || sig < 0 || isRel(sig)) { ev.clear(); break; }
+        }
+        b = &t.stmt;
+    }
+    XpCounts counts;
+    XpPre pre;
+    xpCount(*b, counts, pre);
+    bool anyEager = false;
+    for (auto& [sym, n] : counts) {
+        int cls = pre.unknown || pre.direct.count(sym) ? XC_DIRECT
+                  : n <= 1 ? XC_LAZY : (pre.waits ? XC_DIRECT : XC_EAGER);
+        xp.cls[sym] = cls;
+        anyEager |= cls == XC_EAGER;
+    }
+    xp.on = true;
+    xp.xm = xpTemp(1);
+    size_t start = prog.here();
+    size_t jinit = anyEager ? xpJmp() : (size_t)-1;
+    if (!ev.empty()) {
+        std::unordered_set<int> level;   // event signals the body reads
+        if (ev.size() > 1) {
+            struct Reads : ASTVisitor<Reads, VisitFlags::Statements | VisitFlags::Expressions> {
+                std::unordered_set<const Symbol*> syms;
+                void handle(const NamedValueExpression& e) { syms.insert(&e.symbol); }
+            } rd;
+            b->visit(rd);
+            for (const Symbol* sym : rd.syms)
+                if (int sg = sigFind(sym); sg >= 0)
+                    for (auto& e : ev) if (e.first == sg) level.insert(sg);
+        }
+        E amb = xpAmbiguousEdge(ev, level);
+        xpChain(1, [&](size_t) { return std::pair<E, E>{amb, nullptr}; },
+                [&](size_t k) { if (k == 0) stmt(*b); }, "edge");
+    } else {
+        stmt(*b);
+    }
+    // Shadows kept for the whole pass are scheduled at its end.
+    std::vector<int> eager;
+    for (auto& [q, sh] : xp.shadow) if (sh.cls == XC_EAGER) eager.push_back(q);
+    std::sort(eager.begin(), eager.end());
+    if (!eager.empty()) {
+        std::map<int, XpBits> tg;
+        for (size_t pc = start; pc < prog.here(); pc++) {
+            const Instr& i = prog.code[pc];
+            if (i.k != IK::Assign || !xp.shadowOf.count(i.sig)) continue;
+            XpBits& t = tg[i.sig];
+            if (i.hi < 0) t.all = true; else t.r.push_back({i.lo, i.hi});
+        }
+        std::vector<XpUnit> units = xpUnits(tg);
+        for (int q : eager) xpFlush(q, xp.shadow.at(q), units);
+    }
+    if (!xp.ool.empty() || jinit != (size_t)-1) {
+        size_t over = xpJmp();
+        // A region made while another's out-of-line code is emitted cannot happen: all are made by now.
+        for (size_t k = 0; k < xp.ool.size(); k++) xp.ool[k]();
+        if (jinit != (size_t)-1) {
+            prog.code[jinit].target = prog.here();
+            for (int q : eager) {
+                const XpShadow& sh = xp.shadow.at(q);
+                xpSet(sh.n, ref(q));
+                xpSet(sh.m, xpZero(sh.w));
+            }
+            xpJmp(jinit + 1);
+        }
+        prog.code[over].target = prog.here();
+    }
+    xp.on = false;
+}

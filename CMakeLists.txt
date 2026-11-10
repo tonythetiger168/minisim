@@ -204,6 +204,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_compile.cmake)
+  # X-propagation (msim -xprop): tests/xprop in every execution mode.
+  add_test(NAME msim_xprop
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xprop
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_xprop.cmake)
   # Multi-core: 256 independent lanes run as parallel partitions. Every
   # thread count must print what the single-threaded event-driven run prints.
   add_test(NAME msim_threads

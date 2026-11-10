@@ -788,6 +788,9 @@ static void usage() {
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
               << protfront::Options::help() <<
+                 "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
+                 "                 merges the branches instead of picking one (docs/XPROP.md)\n"
+                 "  -xprop-report <file>  list every if / case / edge and whether it is merged\n"
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  -upf_verbose   print supply, power state and simstate changes\n"
@@ -823,6 +826,7 @@ int main(int argc, char** argv) {
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     protfront::Options prot;
     std::string upfPath, powerTop;
+    std::string xpropReport;
     bool powerTopSet = false, upfVerbose = false;
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
@@ -847,6 +851,11 @@ int main(int argc, char** argv) {
         if (a == "-no-partition") { staticPart = false; continue; }
         if (a == "-no-2state") { twoState = false; continue; }
         if (a == "-no-cycle") { cycle = false; continue; }
+        if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
+        if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
+        if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }
+        if (a.rfind("-xprop=", 0) == 0) { std::cerr << "msim: bad " << a << " (tmerge, xmerge or off)\n"; return 2; }
+        if (a == "-xprop-report") { xpropReport = next("a file name"); continue; }
         if (a == "-no-pin") { g_pin = 0; continue; }
         if (a == "-pin") { g_pin = 1; continue; }
         if (a == "-cpuinfo") {
@@ -1152,6 +1161,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (!xpropReport.empty()) {   // -xprop-report: what is merged, what is not and why
+        std::ofstream f(xpropReport);
+        if (!f) { std::cerr << "msim: cannot write " << xpropReport << "\n"; return 1; }
+        size_t ok = 0;
+        for (auto& r : Lowerer::xpReport()) ok += r.ok;
+        f << "xprop " << (Lowerer::xpropMode() == 2 ? "xmerge" : Lowerer::xpropMode() == 1 ? "tmerge" : "off") << ": "
+          << ok << " of " << Lowerer::xpReport().size() << " if / case / edge constructs merged\n";
+        for (auto& r : Lowerer::xpReport())
+            f << r.where << r.what << (r.ok ? ": merged" : ": not merged, it holds " + r.why) << "\n";
+    }
     if (!upfPath.empty()) {   // power-aware simulation (IEEE 1801-2024 9)
         auto& rt = upfrt::rt();
         rt.verbose = upfVerbose;
