@@ -27,6 +27,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches, with its C code (regular expressions, command line, HDL backdoor) via `msim -uvm`; see [`docs/UVM.md`](docs/UVM.md)
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
+- **Emulation and FPGA prototyping**: `memu` puts a gate-level netlist on a board of FPGAs (clock conversion, memory mapping, partitioning, pin multiplexing, probes, transactors to `msim -mvp` models and to testbench classes) and writes a testbench that checks the emulation against the netlist; see [docs/EMULATION.md](docs/EMULATION.md)
 - **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
@@ -41,6 +42,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/lower.hpp` | slang AST to `Prog`, including module instances and port connections |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
+| `src/parallel.hpp` | Shared by the tools: default thread count, `-threads N`, `par::parallelFor`, `par::Pool` |
+| `src/wave_reader.hpp` | Shared by the tools: `wave::Reader`, VCD (parallel, mapped) and FST into memory |
 | `src/protect.hpp`, `src/msimprotect.cpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): encrypt and decrypt with OpenSSL |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
@@ -462,6 +465,43 @@ msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 
+### Formal property checking: `mformal`
+
+`mformal` proves or falsifies the design's assertions for every input
+sequence, on the same front end and lowering as `msim`. Assertions are
+proven or falsified, assumptions constrain the inputs, covers are reached or
+proven unreachable. A failure comes with a VCD of the whole design and, with
+`-tb`, a testbench that replays it in `msim`.
+
+```sh
+mformal rtl/*.sv -top fifo                  # every assert / assume / cover
+mformal rtl/*.sv -top fifo -depth 40 -tb    # deeper, with replay testbenches
+```
+
+```
+  assert  top.u.a_count        proven  (induction, k=2)
+  assert  top.u.a_push_counts  falsified  at cycle 5  mformal_out/top.u.a_push_counts.vcd
+  cover   top.u.c_full         covered  at cycle 4  mformal_out/top.u.c_full.vcd
+```
+
+Properties are checked in parallel on every core (`-threads N`), with the
+same result for any thread count. See `docs/FORMAL.md` for the model (clock,
+reset, two-state values, what is cut) and the supported property operators.
+
+### Equivalence checking: `mequiv`
+
+`mequiv` proves that a netlist is the same circuit as the RTL it came from
+(or as another netlist, or one RTL revision as the next), the way Formality
+and Conformal do: flops are matched by name and cut, and every output and
+next-state function is proved equal. A failing point comes with the input
+values that show the difference.
+
+```sh
+mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
+```
+
+See [docs/EQUIV.md](docs/EQUIV.md).
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per
@@ -524,6 +564,30 @@ patterns to the word, on every core, the same result for any `-threads N`),
 compacts, and writes STIL, a self-checking Verilog testbench that `msim`
 replays, and a fault list with each fault's class. See
 [docs/ATPG.md](docs/ATPG.md).
+
+### Emulation and FPGA prototyping: `memu`
+
+`memu` is the step between synthesis and FPGA place and route that makes a
+design fit a board of several FPGAs and run there at all: every flop moves
+onto one free-running clock, memories become FPGA RAM, the cells are split
+over the FPGAs, and signals share wires where the board has too few.
+
+```sh
+memu soc.gv -lib cells.lib -mem mems.txt -fpgas 4 -lut 200000 -pins 240 -probe 'u_core.pc*' -o out
+msim cells.v mems.v soc.gv out/soc_fpga*.v out/soc_emu_lib.v out/soc_emu.v out/soc_emu_tb.sv -top soc_emu_tb
+```
+```
+memu: PASS, 2000 events (2000 with a clock edge), 80856 output bits compared, netlist and emulation agree
+```
+
+The second command needs no hardware: it runs the netlist `memu` was given
+next to the emulation it wrote, on the same random inputs, and compares every
+output at every clock event. Transactors (`memu -xtor-sv`) connect the
+emulated design to the C models of a virtual prototype or to a testbench
+class, with the design's clock stopped while the host answers. It uses every
+logical CPU by default (`-threads N`), with the same result on any number.
+[docs/EMULATION.md](docs/EMULATION.md) has the timing model, the file formats
+and the transactors.
 ### Parasitic extraction: `mrcx`
 
 `mrcx` reads a routed DEF and its LEF and writes every net's resistance and
@@ -535,13 +599,14 @@ mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o 
 ```
 
 ```
-mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5086 coupling capacitors
-mrcx: capacitance 2238 fF to ground, 288.8 fF between nets (sky130 stack, 25 C)
+mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5134 coupling capacitors
+mrcx: capacitance 2029 fF to ground, 409.5 fF between nets (sky130 stack, 25 C)
 ```
 
 It runs on every core (`-threads N`), writes the same file for any thread
 count, and reports open and shorted nets. On the OpenROAD `gcd` test design
-its total net capacitance is within 1% of OpenRCX's. See
+its total net capacitance is within 2% of OpenRCX's, and the ground and
+coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
 
 ### Virtual prototypes: `-mvp`
