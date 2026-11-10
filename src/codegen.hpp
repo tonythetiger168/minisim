@@ -159,6 +159,14 @@ public:
              "    return v_concat({r, p});\n"
              "}\n"
              "template <class... T> static inline Val CAT(const T&... p) { Val r{0, 0, 0}; ((r = cat1(r, p)), ...); return r; }\n"
+             "static inline Val REP(const Val& a, int n) {   // {n{a}}\n"
+             "    if (a.w > 0 && n > 1 && a.w * n <= 64) {\n"
+             "        uint64_t v = 0, x = 0, z = 0;\n"
+             "        for (int i = 0; i < n; i++) { v = (v << a.w) | a.v; x = (x << a.w) | a.x; z = (z << a.w) | a.z; }\n"
+             "        return make(v, x, a.w * n, z);\n"
+             "    }\n"
+             "    Val r{0, 0, 0}; for (int i = 0; i < n; i++) r = cat1(r, a); return r;\n"
+             "}\n"
              "static E X(Op op, Val k, int sig, int hi, int lo, bool sg, std::vector<E> kids) {\n"
              "    E e = node(op, std::move(kids)); e->k = k; e->sig = sig; e->hi = hi; e->lo = lo; e->sgn = sg; return e;\n"
              "}\n"
@@ -611,8 +619,8 @@ private:
     // An element write chosen at run time (a[i] = v, v[i] = v, v[i +: w] = v):
     // the code that sets s, hi, lo and v, then runs `then` unless the index is
     // invalid (7.4.6, 11.5.1). Mirrors target() in exec.inc.
-    std::string dynTarget(const Instr& i, const std::string& val, const std::string& then) {
-        if (isPriv(i.sig)) privHits_.insert(i.sig);
+    std::string dynTarget(const Instr& i, const std::string& val, const std::string& then, bool privOk = false) {
+        if (isPriv(i.sig) && !privOk) privHits_.insert(i.sig);
         std::ostringstream o;
         o << " { Val v = " << val << "; int s = " << i.sig << ", hi = " << i.hi << ", lo = " << i.lo << ";";
         if (i.arr) {
@@ -746,11 +754,19 @@ private:
             case Op::Index: return f2("v_index");
             case Op::Concat: {
                 if (e->kids.empty()) return "Val{0, 0, 0}";
+                // A run of the same operand ({32{a[0]}} lowered bit by bit) is computed once.
                 std::string r = "CAT(";
-                for (size_t i = 0; i < e->kids.size(); i++) r += (i ? ", " : "") + ex(e->kids[i]);
+                for (size_t i = 0; i < e->kids.size();) {
+                    size_t j = i + 1;
+                    while (j < e->kids.size() && pureEq(e->kids[i], e->kids[j])) j++;
+                    std::string t = ex(e->kids[i]);
+                    r += (i ? ", " : "") + (j - i > 1 ? "REP(" + t + ", " + std::to_string(j - i) + ")" : t);
+                    i = j;
+                }
                 return r + ")";
             }
             case Op::Mux: return "v_mux(" + k(0) + ", " + k(1) + ", " + k(2) + ")";
+            case Op::WildEq: return f2("v_wild_eq");
             default: break;
         }
         // Any other operator (==?, real math, strings, system functions, ...):
@@ -780,6 +796,20 @@ private:
     static std::string ext(const std::string& a, int wa, int w, bool s) {
         if (!s || wa >= w) return a;
         return "(" + sx(a, wa) + " & " + M(w) + ")";
+    }
+    // The same side-effect-free expression twice (signals, constants, selects, concatenations).
+    static bool pureEq(const E& a, const E& b) {
+        if (!a || !b) return false;
+        if (a->op != b->op || a->kids.size() != b->kids.size()) return false;
+        switch (a->op) {
+            case Op::Ref: if (a->sig != b->sig || a->sgn != b->sgn || a->at || b->at) return false; break;
+            case Op::Const: if (!(a->k == b->k) || a->k.w != b->k.w || a->k.sgn != b->k.sgn || a->k.real || a->k.str) return false; break;
+            case Op::Slice: if (a->hi != b->hi || a->lo != b->lo) return false; break;
+            case Op::Concat: break;
+            default: return false;
+        }
+        for (size_t i = 0; i < a->kids.size(); i++) if (!pureEq(a->kids[i], b->kids[i])) return false;
+        return true;
     }
     bool fx(const E& e, std::string& out, FastInfo& fi, std::vector<int>& refs) {
         if (!e) return false;
@@ -828,6 +858,15 @@ private:
                 const char* o = e->op == Op::Eq ? " == " : e->op == Op::Ne ? " != " : e->op == Op::Lt ? " < "
                               : e->op == Op::Le ? " <= " : e->op == Op::Gt ? " > " : " >= ";
                 out = "(uint64_t)(" + a + o + b + ")";
+                fi = {1, false};
+                return true;
+            }
+            case Op::WildEq: {   // a ==? pattern: the pattern's X and Z bits match anything
+                if (e->kids.size() != 2 || !e->kids[1] || e->kids[1]->op != Op::Const) return false;
+                const Val& pk = e->kids[1]->k;
+                if (pk.w > 64 || pk.w < 1 || pk.real || pk.str || !pk.hi.empty()) return false;
+                if (!kid(0, A, fa) || fa.w != pk.w) return false;
+                out = "(uint64_t)(((" + A + " ^ " + hex(pk.v) + ") & " + hex(~pk.x & mask(pk.w)) + ") == 0)";
                 fi = {1, false};
                 return true;
             }
@@ -900,13 +939,18 @@ private:
                 if (e->kids.empty()) return false;
                 std::string r;
                 int w = 0;
-                for (size_t i = 0; i < e->kids.size(); i++) {
+                for (size_t i = 0; i < e->kids.size();) {
                     std::string P;
                     FastInfo fp{};
                     if (!fx(e->kids[i], P, fp, refs)) return false;
-                    w += fp.w;
+                    size_t j = i + 1;   // a run of the same one-bit operand: all ones or all zeros
+                    if (fp.w == 1) while (j < e->kids.size() && pureEq(e->kids[i], e->kids[j])) j++;
+                    int pw = fp.w * (int)(j - i);
+                    if (j - i > 1) P = "(((uint64_t)0 - (" + P + ")) & " + M(pw) + ")";
+                    w += pw;
                     if (w > 64) return false;
-                    r = i ? "((" + r + " << " + std::to_string(fp.w) + ") | " + P + ")" : P;
+                    r = i ? "((" + r + " << " + std::to_string(pw) + ") | " + P + ")" : P;
+                    i = j;
                 }
                 out = r;
                 fi = {w, false};
@@ -1087,7 +1131,7 @@ private:
                         cand[in.sig] = 1;
                     // The outputs of one always_comb with if / case: any
                     // number of whole or part writes, all from this process.
-                    else if (in.drv < 0 && sigs[in.sig].drivers == 0 && !in.arr && in.aidx.empty() && !in.bidx &&
+                    else if (in.drv < 0 && sigs[in.sig].drivers == 0 && !in.arr && in.aidx.empty() &&
                              (!cand[in.sig] || owner[in.sig] == (int)i)) {
                         cand[in.sig] = 1;
                         owner[in.sig] = (int)i;
@@ -1189,8 +1233,31 @@ private:
     std::string fassign(const Instr& i) {
         std::ostringstream o;
         std::string g, u, sl;
-        if (i.bidx)   // v[i] = ...: the bits are chosen at run time
-            return dynTarget(i, fast(i.e), " S.fw(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
+        if (i.bidx) {   // v[i] = ...: the bits are chosen at run time
+            bool pv = isPriv(i.sig);
+            int W = sigW_[i.sig];
+            std::string P_ = "P" + std::to_string(i.sig), S_ = std::to_string(i.sig), W_ = std::to_string(W);
+            std::string slowW = pv
+                ? dynTarget(i, ex(i.e), " PW(" + P_ + ", " + W_ + ", hi >= 0 ? v_insert(PR(" + P_ + ", " + W_ + ", false), v, hi, lo) : v);", true)
+                : dynTarget(i, pv ? ex(i.e) : fast(i.e), " S.fw(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
+            std::string gb, ub, sb;
+            // One bit, index and value known: set or clear it in place.
+            // v[i] or v[i +: n], index and value known: the bits change in place.
+            // A select that is partly outside the vector takes the general path.
+            int n = i.pw ? i.pw : 1;
+            if (!i.pdown && !i.arr && W <= 64 && n <= W && i.lo >= 0 && split(i.bidx, gb, ub, sb) && split(i.e, g, u, sl)) {
+                std::string cond = gb.empty() ? g : g.empty() ? gb : gb + " && " + g;
+                std::string wr = pv
+                    ? P_ + ".v = (" + P_ + ".v & ~m) | (((uint64_t)(" + u + ") << b) & m); " + P_ + ".x &= ~m; " + P_ + ".z &= ~m;"
+                    : "const Val& c = S.sigs[" + S_ + "].val; S.fw(" + S_ + ", Val{(c.v & ~m) | (((uint64_t)(" + u + ") << b) & m), c.x & ~m, " +
+                      W_ + ", c.z & ~m, false});";
+                std::string fastW = "{ const uint64_t b = (uint64_t)(" + ub + ") - " + std::to_string(i.lo) + "; if (b <= " +
+                                    std::to_string(W - n) + ") { const uint64_t m = " + M(n) + " << b; " + wr + " } else " + cold(slowW) + " }";
+                if (cond.empty()) return " " + fastW + "\n";
+                return " if (__builtin_expect(" + cond + ", 1)) " + fastW + " else " + cold(slowW) + "\n";
+            }
+            return slowW;
+        }
         if (isPriv(i.sig) && i.hi >= 0) {   // some bits of a private signal
             std::string P_ = "P" + std::to_string(i.sig), m = M(i.hi - i.lo + 1) + " << " + std::to_string(i.lo);
             std::string slowW = "PW(" + P_ + ", " + std::to_string(sigW_[i.sig]) + ", v_insert(PR(" + P_ + ", " +
@@ -1333,7 +1400,7 @@ private:
         // so the ones already done compute the same values.
         auto stmt2 = [&](const Instr& in) -> std::string {
             std::string g, u, sl;
-            if (in.hi >= 0 && isPriv(in.sig) && split(in.e, g, u, sl)) {   // x and z are already 0
+            if (in.hi >= 0 && !in.bidx && isPriv(in.sig) && split(in.e, g, u, sl)) {   // x and z are already 0
                 std::string P_ = "P" + std::to_string(in.sig), L_ = std::to_string(in.lo);
                 return "    { const uint64_t m = " + M(in.hi - in.lo + 1) + " << " + L_ + "; " + P_ + ".v = (" + P_ +
                        ".v & ~m) | (((uint64_t)(" + u + ") << " + L_ + ") & m); }\n";
