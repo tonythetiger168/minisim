@@ -101,4 +101,7 @@ expect("rule v1.above v1 - m2 \"v1 without m2\"\n")
 # The written deck gives the same result when passed back with -deck.
 run(1 drc -lef ${SRC}/tests/pv/def/tiny.lef -deck ${OUT}/tiny.drc ${SRC}/tests/pv/def/counter.def -q)
 expect("2 violations in 1 of 27 rules")
+# The same block after the router learned the cut spacing rule is clean.
+run(0 drc -lef ${SRC}/tests/pv/def/tiny.lef ${SRC}/tests/pv/def/counter_clean.def -q)
+expect("0 violations in 0 of 27 rules")
 run(2 drc -deck ${OUT}/tiny.drc ${SRC}/tests/pv/def/counter.def)
