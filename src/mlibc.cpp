@@ -12,11 +12,10 @@
 // prints one line per cell. "compare" checks a slow corner against a fast one.
 //
 // Files are checked on separate threads and the cells of a file in parallel
-// chunks (-threads N, default all hardware threads). Findings are collected
+// chunks (-threads N, default every logical CPU). Findings are collected
 // per cell and printed in file and cell order, so the output is the same for
 // any thread count.
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -24,11 +23,11 @@
 #include <set>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "lef.hpp"
 #include "liberty.hpp"
+#include "parallel.hpp"
 #include "version.hpp"
 
 using namespace liberty;
@@ -75,33 +74,9 @@ struct Options {
     bool werror = false;
 };
 
-int hwThreads() {
-    unsigned n = std::thread::hardware_concurrency();
-    return n ? (int)n : 1;
-}
+int hwThreads() { return (int)par::defaultThreads(); }
 
-// Runs fn(i) for i in [0, n) on up to `threads` threads. Each i writes
-// only its own slot, so the result does not depend on the thread count.
-template <class F>
-void parallelFor(size_t n, int threads, F fn) {
-    if (threads <= 1 || n < 2) {
-        for (size_t i = 0; i < n; i++) fn(i);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    auto work = [&] {
-        for (;;) {
-            size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= n) return;
-            fn(i);
-        }
-    };
-    std::vector<std::thread> pool;
-    size_t k = std::min<size_t>(threads, n);
-    for (size_t t = 1; t < k; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
-}
+using par::parallelFor;
 
 std::string fmt(double v) {
     char b[64];
@@ -424,7 +399,7 @@ void usage() {
         "  mlibc report lib.lib [-cell NAME]                        one line per cell, or one cell in full\n"
         "  mlibc compare slow.lib fast.lib                          a slow corner against a fast one\n"
         "options:\n"
-        "  -threads N      worker threads (default: all hardware threads; 1 for none)\n"
+        "  -threads N      worker threads (default: every logical CPU; 1 for none)\n"
         "  -disable RULE   leave a rule out (repeatable)\n"
         "  -Werror         exit 1 when anything is found\n"
         "  -list           list the rules\n"
@@ -568,10 +543,9 @@ int doReport(const std::string& path, const std::string& only) {
 int doCompare(const std::string& slowPath, const std::string& fastPath, const Options& opt) {
     Library S, F;
     try {
-        std::thread t([&] { try { S = liberty::load(slowPath); } catch (...) {} });
-        F = liberty::load(fastPath);
-        t.join();
-        if (S.cells.empty()) S = liberty::load(slowPath);   // rethrows the reader's error
+        parallelFor(2, opt.threads > 0 ? opt.threads : hwThreads(), [&](size_t i) {
+            (i ? F : S) = liberty::load(i ? fastPath : slowPath);
+        });
     } catch (const std::exception& e) {
         std::cerr << "mlibc: " << e.what() << "\n";
         return 2;
@@ -664,12 +638,12 @@ int main(int argc, char** argv) {
         if (a == "-cell") { cell = next("a cell name"); continue; }
         if (a == "-disable") { opt.disabled.insert(next("a rule")); continue; }
         if (a == "-Werror") { opt.werror = true; continue; }
-        if (a == "-threads") {
-            std::string n = next("a thread count");
-            opt.threads = n == "all" ? hwThreads() : std::atoi(n.c_str());
-            if (opt.threads < 1) { std::cerr << "mlibc: -threads must be at least 1\n"; return 2; }
+        if (a == "-threads" && i + 1 < argc && std::string(argv[i + 1]) == "all") {
+            opt.threads = hwThreads();
+            i++;
             continue;
         }
+        if (unsigned t = 0; par::threadsArg(argc, argv, i, t, "mlibc")) { opt.threads = (int)t; continue; }
         if (!a.empty() && a[0] == '-') { std::cerr << "mlibc: unknown option " << a << "\n"; return 2; }
         pos.push_back(a);
     }
