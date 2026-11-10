@@ -140,12 +140,15 @@ Two adders or multipliers built differently share no internal structure, and
 SAT alone does not prove wide multipliers equal. So points that survive a
 quick SAT pass go through SAT sweeping: internal nodes that simulate alike
 are proved equal one at a time, smallest first, and merged, after which the
-outputs usually fall out. For `a * b` mequiv also builds the product with the
-rows in the other order and uses the fact that both are the same number, so a
-netlist that adds partial products row by row is proved whichever operand it
-walks (a 16x16 multiplier in under a second). A netlist with a different
-multiplier architecture (Wallace tree, Booth) can still exhaust `-effort` and
-report those outputs as aborted, which is inconclusive, never a pass.
+outputs usually fall out. For `a * b` mequiv also builds the product
+three more ways (rows in the other order, and a carry-save tree with a
+parallel-prefix final adder in both operand orders, the form `msynth` emits)
+and uses the fact that all are the same number. A netlist built either way
+then shares internal functions with the reference: an `msynth` 16x16
+multiplier is proved in about 3 seconds and a 32x32 in under a minute. A
+netlist with yet another architecture (Booth recoding) can still exhaust
+`-effort` and report those outputs as aborted, which is inconclusive, never a
+pass.
 
 ## Not yet
 
