@@ -191,6 +191,64 @@ if mpv:
         bad = [l for l in (p.stdout + p.stderr).splitlines() if re.match(r"\S+ +\d+ +\S", l) and not l.startswith("metal1.area")]
         assert not bad and "violations in" in p.stdout + p.stderr, "mini45: mpv drc finds\n" + p.stdout + p.stderr
 
+# 7. GDS out: one reference per component, the cells as abstracts, the same
+# bytes for any thread count, a layer map file, and the conversion of a DEF.
+def gds_records(path):
+    data = open(path, "rb").read()
+    at = 0
+    while at < len(data):
+        size, kind = struct.unpack(">HH", data[at:at + 4])
+        yield kind >> 8, data[at + 4:at + size]
+        at += size
+
+
+def gds_summary(path):
+    cells, refs, layers = [], 0, set()
+    for kind, body in gds_records(path):
+        if kind == 0x06:
+            cells.append(body.rstrip(b"\0").decode())
+        elif kind == 0x0A:
+            refs += 1
+        elif kind == 0x0D:
+            layers.add(struct.unpack(">h", body)[0])
+    return cells, refs, layers
+
+
+log = run("-lef", lef, counter, "-def", out("g.def"), "-gds", out("g1.gds"), "-threads", "1")
+need(log, r"0 open, 0 shorts, 0 spacing violations")
+run("-lef", lef, counter, "-gds", out("g4.gds"), "-threads", "4")
+assert open(out("g1.gds"), "rb").read() == open(out("g4.gds"), "rb").read(), "GDS: -threads 4 differs from -threads 1"
+cells, refs, layers = gds_summary(out("g1.gds"))
+comps = int(re.search(r"\nCOMPONENTS (\d+)", open(out("g.def")).read()).group(1))
+assert refs == comps, f"GDS has {refs} cell references, the DEF {comps} components"
+assert cells[-1] == "counter" and "DFFR" in cells and "TIE0" in cells, cells
+assert {0, 1, 2, 3, 4, 5} <= layers, layers            # outline, m1, v1, m2, v2, m3
+# A DEF converted on its own gives the same file.
+run("-lef", lef, "-check", out("g.def"), "-gds", out("g_def.gds"))
+assert open(out("g1.gds"), "rb").read() == open(out("g_def.gds"), "rb").read(), "GDS from -check differs"
+# A layer map: only the layers it names, with its numbers.
+open(out("map.txt"), "w").write("# metal only\nm1 31\nm2 32/7\nm3 33 0\nOUTLINE 99\n")
+run("-lef", lef, counter, "-gds", out("gm.gds"), "-gds_map", out("map.txt"))
+assert gds_summary(out("gm.gds"))[2] == {31, 32, 33, 99}, gds_summary(out("gm.gds"))[2]
+open(out("badmap.txt"), "w").write("m9 5\n")
+need(run("-lef", lef, counter, "-gds", out("x.gds"), "-gds_map", out("badmap.txt"), rc=2), r"badmap.txt:1: the LEF has no layer 'm9'")
+# The cells' real layouts from a GDS (here: the abstracts of the run before).
+need(run("-lef", lef, counter, "-gds", out("gc.gds"), "-gds_cells", out("g1.gds"), rc=2), r"already has a cell named like the design")
+# Without its top cell that file is a cell library: the cells are copied, not rebuilt.
+raw = open(out("g1.gds"), "rb").read()
+at, starts = 0, []
+while at < len(raw):
+    size, kind = struct.unpack(">HH", raw[at:at + 4])
+    if kind >> 8 == 0x05:
+        starts.append(at)
+    if kind >> 8 == 0x04:
+        endlib = at
+    at += size
+open(out("cells.gds"), "wb").write(raw[:starts[-1]] + raw[endlib:])
+run("-lef", lef, counter, "-gds", out("gc.gds"), "-gds_cells", out("cells.gds"))
+assert open(out("gc.gds"), "rb").read() == raw, "GDS with -gds_cells differs from the one with abstracts"
+need(run("-lef", lef, out("rand.v"), "-gds", out("x.gds"), "-gds_cells", out("cells.gds"), rc=2), r"cells.gds: no cell '")
+run("-lef", lef, out("rand.v"), "-gds", out("rand.gds"))
 if mpv:
     # DRC on the GDS with the rules made from the LEF: clean, and it sees the
     # cells' pins under the vias (a wrong orientation would leave vias bare).
