@@ -1346,6 +1346,8 @@ enum class Op {
     LogNot, LogAnd, LogOr, RedAnd, RedOr, RedXor,
     Slice, Index, Concat, Mux,
     Pow, Time,
+    CondCov,   // condition coverage (msim -cov): the && (lo = 0) or || (lo = 1) of the kids' truth
+               // values, counted in g_condHits from hi on (see condCovHit)
     WildEq,    // a ==? b: x / z bits of b match anything (11.4.6)
     // real (6.12). Values are doubles in v, with Val::real set.
     FAdd, FSub, FMul, FDiv, FPow, FNeg,
@@ -1546,6 +1548,37 @@ inline E bin(Op op, E a, E b) { return node(op, {a, b}); }
 inline E slice(E a, int hi, int lo) { auto e = node(Op::Slice, {a}); e->hi = hi; e->lo = lo; return e; }
 inline E concat(std::vector<E> parts) { return node(Op::Concat, std::move(parts)); }
 inline E mux(E c, E a, E b) { return node(Op::Mux, {c, a, b}); }
+
+// Condition coverage (msim -cov), as VCS -cm cond reports it: a condition
+// a && b && c (or a || b || c, or the condition of ?:) with n terms has n + 1
+// vectors. Vector 0 is the one where no term decides alone (all 1 for &&,
+// all 0 for ||); vector i is the one where only term i - 1 has the deciding
+// value (0 for &&, 1 for ||). A vector with an x term counts for none.
+// g_condHits holds the counters of every condition, one after another.
+inline std::vector<uint64_t> g_condHits;
+// t[i] is truth() of term i. Returns the truth of the whole condition.
+inline int condCovHit(size_t base, bool isOr, const int* t, size_t n) {
+    int deciding = isOr ? 1 : 0, at = -1, count = 0;
+    bool unknown = false;
+    for (size_t i = 0; i < n; i++) {
+        if (t[i] == 2) unknown = true;
+        else if (t[i] == deciding) { count++; at = (int)i; }
+    }
+    if (!unknown && count <= 1) __atomic_fetch_add(&g_condHits[base + (size_t)(at + 1)], 1, __ATOMIC_RELAXED);
+    return count ? deciding : unknown ? 2 : 1 - deciding;
+}
+
+// The same for generated code (msim -compile): terms as values, or as the
+// 0 / 1 of the 2-state path.
+inline Val condCovVal(size_t base, bool isOr, std::initializer_list<Val> terms) {
+    int ts[64];
+    size_t n = 0;
+    for (const Val& v : terms) ts[n++] = truth(v);
+    return from_truth(condCovHit(base, isOr, ts, n));
+}
+inline uint64_t condCovFast(size_t base, bool isOr, std::initializer_list<int> terms) {
+    return (uint64_t)condCovHit(base, isOr, terms.begin(), terms.size());
+}
 
 // Current simulation time, for $time / $stime / $realtime (IEEE 1800 20.3).
 // The kernel sets it when time advances.
@@ -2649,6 +2682,12 @@ inline Val eval(const E& e, const Reader& rd) {
             Val a = k(0);
             if (truth(a) == 1) return mk(1);
             return v_lor(a, k(1));
+        }
+        case Op::CondCov: {   // every term is evaluated: the lowerer wraps only terms without side effects
+            int ts[64];
+            size_t n = e->kids.size();
+            for (size_t i = 0; i < n; i++) ts[i] = truth(k((int)i));
+            return from_truth(condCovHit((size_t)e->hi, e->lo != 0, ts, n));
         }
         case Op::RedAnd: return v_red_and(k(0));
         case Op::RedOr: return v_red_or(k(0));

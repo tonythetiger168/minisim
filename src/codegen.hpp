@@ -385,6 +385,18 @@ public:
                  "        uint64_t k = R.size();\n"
                  "        std::fwrite(&k, 8, 1, f); std::fwrite(R.data(), 8, k, f); std::fwrite(F.data(), 8, k, f);\n"
                  "    }\n"
+                 "    // condition counters, then per FSM its states and transitions\n"
+                 "    uint64_t nc = g_condHits.size(), nfsm = S.fsmSigs.size();\n"
+                 "    std::fwrite(&nc, 8, 1, f); std::fwrite(g_condHits.data(), 8, nc, f);\n"
+                 "    S.fsmFinish();\n"
+                 "    std::fwrite(&nfsm, 8, 1, f);\n"
+                 "    for (size_t k = 0; k < nfsm; k++) {\n"
+                 "        uint64_t a = S.fsmSeen[k].size(), b = S.fsmTrans[k].size();\n"
+                 "        std::fwrite(&a, 8, 1, f);\n"
+                 "        for (auto& [v, c] : S.fsmSeen[k]) { uint64_t r[2] = {v, c}; std::fwrite(r, 8, 2, f); }\n"
+                 "        std::fwrite(&b, 8, 1, f);\n"
+                 "        for (auto& [t, c] : S.fsmTrans[k]) { uint64_t r[3] = {t.first, t.second, c}; std::fwrite(r, 8, 3, f); }\n"
+                 "    }\n"
                  "    { std::ofstream fc(std::string(path) + \".fcov\"); writeFuncCov(fc); }   // covergroups, assertions\n"
                  "    return std::fclose(f) == 0;\n"
                  "}\n\n";
@@ -506,6 +518,11 @@ public:
             o << "}, {";
             for (size_t r = 0; r < parts.ins.size(); r++) o << (r ? ", " : "") << list(parts.ins[r]);
             o << "}, " << list(parts.targets) << ");\n";
+        }
+        if (cov) {
+            o << "    g_condHits.assign(" << g_condHits.size() << ", 0);\n    S.fsmWatch({";
+            for (size_t k = 0; k < fsmDefs().size(); k++) o << (k ? ", " : "") << fsmDefs()[k].sig;
+            o << "});\n";
         }
         o << "    S.run(maxTime);\n"
              "    std::cout.flush();\n";
@@ -731,6 +748,11 @@ private:
             case Op::LogNot: return f1("v_lnot");
             case Op::LogAnd: return f2("v_land");
             case Op::LogOr: return f2("v_lor");
+            case Op::CondCov: {   // condition coverage: every term, then the counters (expr.hpp)
+                std::string r = "condCovVal(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
+                for (size_t i = 0; i < e->kids.size(); i++) r += (i ? ", " : "") + ex(e->kids[i]);
+                return r + "})";
+            }
             case Op::RedAnd: return f1("v_red_and");
             case Op::RedOr: return f1("v_red_or");
             case Op::RedXor: return f1("v_red_xor");
@@ -865,6 +887,18 @@ private:
                 out = "(uint64_t)((" + A + " != 0)" + (e->op == Op::LogAnd ? " & " : " | ") + "(" + B + " != 0))";
                 fi = {1, false};
                 return true;
+            case Op::CondCov: {
+                std::string r = "condCovFast(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
+                for (size_t i = 0; i < e->kids.size(); i++) {
+                    std::string P;
+                    FastInfo fp{};
+                    if (!fx(e->kids[i], P, fp, refs)) return false;
+                    r += (i ? ", " : "") + ("(int)(" + P + " != 0)");
+                }
+                out = r + "})";
+                fi = {1, false};
+                return true;
+            }
             case Op::RedAnd:
                 if (!kid(0, A, fa)) return false;
                 out = "(uint64_t)(" + A + " == " + M(fa.w) + ")";
