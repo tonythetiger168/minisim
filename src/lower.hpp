@@ -344,6 +344,30 @@ inline uint64_t pow10u(int n) { uint64_t r = 1; while (n-- > 0) r *= 10; return 
 // name, width, and whether the signal is a net. A net starts at Z.
 using MkSig = std::function<int(const std::string&, int, bool)>;
 
+// Protected code (34): when set, signals whose declaration this accepts are
+// listed in hiddenSigs() so the caller can keep them out of the waveform.
+inline std::function<bool(const slang::ast::Symbol&)>& hideSigIf() {
+    static std::function<bool(const slang::ast::Symbol&)> f;
+    return f;
+}
+inline std::vector<int>& hiddenSigs() { static std::vector<int> v; return v; }
+// Protected code whose lines may not show in coverage (-cov): statements
+// there get no line, so no line or branch coverage is recorded for them.
+inline std::function<bool(slang::SourceLocation)>& hideLocIf() {
+    static std::function<bool(slang::SourceLocation)> f;
+    return f;
+}
+// Protected code the tool's own messages may not describe (IEEE 1735 9.2.1):
+// a default assertion failure there names neither the line nor the label.
+inline std::function<bool(slang::SourceLocation)>& hideMsgIf() {
+    static std::function<bool(slang::SourceLocation)> f;
+    return f;
+}
+inline void noteHidden(const slang::ast::Symbol& s, int first, int count) {
+    if (hideSigIf() && hideSigIf()(s))
+        for (int i = 0; i < count; i++) hiddenSigs().push_back(first + i);
+}
+
 // scope: the instance the process is in, as a signal name prefix without
 // the final '.' ("" = the top). A port connection's process is in the
 // parent; port names the child's port it carries ("u_core.out"), with
@@ -4075,6 +4099,16 @@ struct Lowerer {
                     return sized(rtoi(exprReal(c.operand()), w, c.type->isSigned(), false), w, c.type->isSigned(), ctx);
                 }
                 int dst = (int)c.type->getBitWidth();
+                if (c.conversionKind == ConversionKind::Explicit && c.type->isIntegral() &&
+                    c.operand().type->isIntegral() && ctx.live && (int)c.operand().type->getBitWidth() < dst) {
+                    // A cast (6.24.1) is an assignment to the cast type: the
+                    // operand is extended to that width with its own
+                    // signedness first, whatever the context wants after.
+                    // int'(u3) in a signed 32-bit sum is 0..7, not -4..3.
+                    needWidth(dst);
+                    E v = expr(c.operand(), ExprCtx{dst, c.operand().type->isSigned(), c.type->isSigned(), true});
+                    return sized(std::move(v), dst, c.type->isSigned(), ctx);
+                }
                 bool fill, tag;
                 if (ctx.live && ctx.w > 0) {
                     dst = ctx.w;
@@ -6914,6 +6948,7 @@ struct Lowerer {
     static void covLoc(slang::SourceLocation loc) {
         auto* sm = covSM();
         if (!sm || !loc.valid()) return;
+        if (hideLocIf() && hideLocIf()(loc)) { g_emitLoc = {}; return; }
         auto ol = sm->getFullyOriginalLoc(loc);
         g_emitLoc = {covFileId(std::string(sm->getFullPath(ol.buffer()).string())), (uint32_t)sm->getLineNumber(ol)};
     }
@@ -7745,8 +7780,12 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             if (mkSig(prefix + std::string(s.name) + "$trig", 64, false) != id + 1)
                 Lowerer::unsupported("event signals that are not consecutive");
             sigmap[&s] = id;
-            if (assignedEvents().count(&s))
-                eventPtr()[&s] = mkSig(prefix + std::string(s.name) + "$ptr", 64, false);
+            noteHidden(s, id, 2);
+            if (assignedEvents().count(&s)) {
+                int ptr = mkSig(prefix + std::string(s.name) + "$ptr", 64, false);
+                eventPtr()[&s] = ptr;
+                noteHidden(s, ptr, 1);
+            }
             return;
         }
         int w = storeW(s.getType());
@@ -7754,6 +7793,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             if (auto it = interconnectW().find(&s); it != interconnectW().end()) w = it->second;
         if (w <= 0) unsupported_width(s.name);
         sigmap[&s] = mkSig(prefix + std::string(s.name), w, net);
+        noteHidden(s, sigmap[&s], 1);
     }
     // A dynamic array, queue, or associative array: a hidden handle signal
     // (its name has '$') and its store entry.
@@ -7827,6 +7867,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             else if (id != shape->base + n) Lowerer::unsupported("array elements that are not consecutive signals");
         }
         arrMap()[&s] = shape;
+        noteHidden(s, shape->base, shape->count);
     }
     static void unsupported_width(std::string_view n) {
         throw std::runtime_error("lower: signal has a non-positive width: " + std::string(n));
@@ -8096,7 +8137,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             i.s0 = i.s1 = STR_STRONG;
             i.dly.clear();
             lw.prog.emit(i);
-            auto rs = readSet(lw.prog);
+            auto rs = combReadSet(lw.prog);
             if (!rs.empty()) {
                 lw.prog.emit(waitInstr(rs));
                 Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
@@ -8107,7 +8148,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.drv = newDriver(i.sig);
         if (linkFormal >= 0 && i.hi < 0) outLinks().push_back({linkFormal, i.sig, i.drv});
         lw.prog.emit(i);
-        auto rs = readSet(lw.prog);
+        auto rs = combReadSet(lw.prog);
         bool loops = !rs.empty();
         if (loops) {
             lw.prog.emit(waitInstr(rs));
@@ -9711,6 +9752,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     srcMgr() = comp.getSourceManager();
     dynMap().clear();
     dynStore().clear();
+    hiddenSigs().clear();
     dynPending().clear();
     dynPendingAt().clear();
     blockIds() = BlockIds{};

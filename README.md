@@ -41,9 +41,13 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/lower.hpp` | slang AST to `Prog`, including module instances and port connections |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
+| `src/protect.hpp`, `src/msimprotect.cpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): encrypt and decrypt with OpenSSL |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
+| `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
+| `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
+| `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -111,6 +115,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-load <lib>[:<boot>]`, `-loadvpi <lib>:<boot>` | Load a VPI library before elaboration; its `vlog_startup_routines` run (the C files and `.so` files above are VPI libraries too) |
 | `-CFLAGS <s>`, `-LDFLAGS <s>` | Extra flags for building the DPI C files |
 | `-version` | Print the version and git commit |
+| `-keyfile [[<owner>:]<keyname>=]<priv.pem>` | RSA private key for protected envelopes (repeatable); `-keyring <file>` reads several, `-license <feature>` grants a licensed right; see below |
 | `--help-slang` | Every front-end option slang accepts |
 
 ### C code: DPI-C
@@ -197,6 +202,32 @@ mregress tests.list -cov            # regress.d/cov.json + regress.d/cov_html/
 The LCOV file works with `genhtml` and with editor and CI coverage plugins.
 Covergroups (functional coverage, 19) come with the spec work. `-compile`
 with `-cov` runs in the interpreter for now.
+
+### Protected IP: `msimprotect` and `msim -keyfile`
+
+minisim reads and writes IEEE 1735-2023 version 3 envelopes, the format
+commercial simulators exchange encrypted IP in: a random root key, RSA
+encrypted for each tool's key (a tool block, with the IP author's rights for
+that tool), AES-256-CBC for the source, and an HMAC-SHA512 signature that is
+checked before anything is decrypted. The older IEEE 1800-2023 clause 34
+envelopes work too (`msimprotect -v1`). The crypto is OpenSSL's libcrypto.
+Mark the region to hide and encrypt it:
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out acme.pem
+openssl pkey -in acme.pem -pubout -out acme_pub.pem
+./build/msimprotect -key acme_pub.pem -keyowner Acme -keyname acme-1 \
+                    -control visibility=interface examples/protect/secret_core.sv -o core.svp
+./build/msim  -keyfile Acme:acme-1=acme.pem core.svp examples/protect/core_tb.sv -vcd waves.vcd
+./build/mlint -keyfile Acme:acme-1=acme.pem core.svp examples/protect/core_tb.sv
+```
+
+msim, mlint and mdft keep the protected code out of diagnostics, waveforms,
+coverage, lint findings and the DFT chain plan, except what the rights
+(`visibility`, `coverage`) and `viewport` pragmas allow.
+[`docs/PROTECT.md`](docs/PROTECT.md) has the format, recipes, keyrings
+(`-keyring`, IEEE 1735 key exchange format), the rights, and a clause by
+clause status.
 
 ### Compiled mode
 
@@ -306,6 +337,20 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
+### Datapath library: `dw/`
+
+`dw/` is a library of synthesizable, parameterized building blocks
+(`MW_add`, `MW_mult`, `MW_div`, `MW_shifter`, `MW_fifo_sync`,
+`MW_fifo_async`, `MW_crc`, `MW_ecc` and 39 more), each with selectable
+architectures where that matters (ripple, lookahead, Kogge-Stone, Brent-Kung
+and carry-select adders; array and Booth/Wallace multipliers):
+
+```sh
+msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
+```
+
+`docs/DATAPATH.md` lists every module and its ports.
+
 ### Lint and clock-domain checks: `mlint`
 
 `mlint` runs the same front end as `msim` and then checks the elaborated
@@ -315,6 +360,7 @@ design, so it needs no separate build setup:
 mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
 mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any finding (for CI)
 mlint rtl/*.sv -disable L004 -disable CDC002
+mlint rtl/*.sv -top soc_top -cdc-report     # clock domains, resets, every crossing
 mlint -list                                 # the rules
 ```
 
@@ -324,13 +370,42 @@ mlint -list                                 # the rules
 | `L002` | A blocking assignment to a non-local variable in an `always_ff` |
 | `L003` | A non-blocking assignment in an `always_comb` |
 | `L004` | One value is assigned by more than one process |
-| `CDC001` | A flop reads another clock domain with no synchronizer, or through one flop only |
-| `CDC002` | A multi-bit bus crosses domains through a two-flop synchronizer, which does not keep its bits together |
+| `CDC001` | A flop depends on another clock domain with no synchronizer, or through one flop only |
+| `CDC002` | A multi-bit bus crosses domains through a synchronizer and is not Gray coded |
+| `CDC003` | Combinational logic in front of a synchronizer: a glitch can be captured |
+| `CDC004` | Reconvergence: separately synchronized signals of one domain meet again |
+| `CDC005` | One signal is synchronized more than once into the same domain |
+| `RDC001` | An asynchronous reset generated in another clock domain |
+| `RDC002` | One asynchronous reset used directly in several clock domains |
+| `RDC003` | A flop feeds a flop with a different asynchronous reset, in one clock domain |
+| `RDC004` | A reset flop feeds a flop with no asynchronous reset (off by default: `-enable RDC004`) |
 
-Clock domains come from the clock of every edge-triggered block, with signals
-joined across port connections, so one clock passed down through several
-modules stays one domain. Findings print as
-`file:line:col: warning: [RULE] text`, sorted by file and line.
+Clock and reset domains are found from the RTL: the clock of every
+edge-triggered block, followed through ports, buffers and clock gates, so one
+clock passed down through several modules stays one domain. Multi-flop
+synchronizers (also shift registers and synchronizer cells), enable-qualified
+buses and Gray-coded pointers are recognized as safe. `-cdc-report` lists
+every domain and crossing, `-clock-group a,b` declares related clocks,
+`-static sig` waives a quasi-static signal, and `-threads N` sets the worker
+threads (default: every logical CPU). See [docs/CDC.md](docs/CDC.md).
+Findings print as `file:line:col: warning: [RULE] text`, sorted by file and
+line.
+
+### Source-level debug: `mdebug`
+
+`mdebug` lists the drivers and loads of a signal with the conditions on each
+assignment, prints fan-in cones, and with a VCD finds the assignment that
+gave a signal its value at a time and what caused it:
+
+```sh
+mdebug tb.sv dut.sv -top tb -drivers tb.u0.y
+mdebug tb.sv dut.sv -top tb -vcd waves.vcd -active tb.sum -at 70
+mdebug tb.sv dut.sv -top tb -vcd waves.vcd -html debug.html   # one-file viewer
+```
+
+The viewer page has the hierarchy, clickable source, drivers and loads, a
+schematic of the selected signal, and waves with the values annotated in the
+source. See [`docs/DEBUG.md`](docs/DEBUG.md).
 
 ### Low-power simulation: UPF (IEEE 1801)
 
@@ -376,6 +451,26 @@ mdft: 5 flops in 3 clock domains
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
 boundaries.
+
+### Parasitic extraction: `mrcx`
+
+`mrcx` reads a routed DEF and its LEF and writes every net's resistance and
+capacitance, coupling included, as SPEF for timing and power analysis:
+
+```sh
+mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef
+mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o slow.spef
+```
+
+```
+mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5086 coupling capacitors
+mrcx: capacitance 2238 fF to ground, 288.8 fF between nets (sky130 stack, 25 C)
+```
+
+It runs on every core (`-threads N`), writes the same file for any thread
+count, and reports open and shorted nets. On the OpenROAD `gcd` test design
+its total net capacitance is within 1% of OpenRCX's. See
+[`docs/RCX.md`](docs/RCX.md).
 
 ### Virtual prototypes: `-mvp`
 

@@ -30,12 +30,48 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_lefdef)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# The Liberty (.lib) reader shared by the timing, synthesis, power and
+# equivalence tools (src/liberty.hpp); no external dependencies.
+add_executable(test_liberty tests/test_liberty.cpp)
+target_include_directories(test_liberty PRIVATE src)
+add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
+# Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
+# libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
+find_package(OpenSSL COMPONENTS Crypto)
+if(OPENSSL_FOUND)
+  add_executable(msimprotect src/msimprotect.cpp)
+  target_include_directories(msimprotect PRIVATE src)
+  target_link_libraries(msimprotect PRIVATE OpenSSL::Crypto)
+  add_executable(test_protect tests/test_protect.cpp)
+  target_include_directories(test_protect PRIVATE src)
+  target_link_libraries(test_protect PRIVATE OpenSSL::Crypto)
+  target_compile_options(test_protect PRIVATE -UNDEBUG)
+  add_test(NAME test_protect COMMAND test_protect)
+  # Interop: envelopes made by msimprotect open with the openssl command line
+  # tool, and an envelope built with the openssl tool opens in msimprotect's
+  # decryptor (checked by msim in the slang build below).
+  find_program(OPENSSL_CLI openssl)
+  if(OPENSSL_CLI)
+    add_test(NAME protect_openssl_cli
+             COMMAND ${CMAKE_COMMAND} -DOPENSSL=${OPENSSL_CLI} -DPROTECT=$<TARGET_FILE:msimprotect>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/protect_openssl
+                     -P ${CMAKE_SOURCE_DIR}/tests/protect_openssl.cmake)
+  endif()
+else()
+  message(STATUS "OpenSSL not found: building without protected envelope support")
+endif()
+
+# The gate-level Verilog netlist reader and writer (src/gnetlist.hpp).
+add_executable(test_gnetlist tests/test_gnetlist.cpp)
+target_include_directories(test_gnetlist PRIVATE src)
+add_test(NAME test_gnetlist COMMAND test_gnetlist)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -45,6 +81,9 @@ if(Python3_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
+
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/mrcx.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -96,6 +135,10 @@ if(MINISIM_WITH_SLANG)
     target_include_directories(msim PRIVATE ${FFI_INCLUDE})
   endif()
   set_target_properties(msim PROPERTIES ENABLE_EXPORTS ON)
+  if(OPENSSL_FOUND)
+    target_link_libraries(msim PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(msim PRIVATE MINISIM_HAVE_OPENSSL)
+  endif()
   # -compile builds generated C++ against the kernel headers in src/.
   target_compile_definitions(msim PRIVATE MINISIM_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
   if(MINISIM_WITH_FST)
@@ -107,11 +150,25 @@ if(MINISIM_WITH_SLANG)
   add_executable(mlint src/mlint.cpp)
   target_include_directories(mlint PRIVATE src)
   target_link_libraries(mlint PRIVATE slang::slang)
+  if(OPENSSL_FOUND)
+    target_link_libraries(mlint PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(mlint PRIVATE MINISIM_HAVE_OPENSSL)
+  endif()
 
   # Design-for-test checks and a scan chain plan: mdft design.sv
   add_executable(mdft src/mdft.cpp)
   target_include_directories(mdft PRIVATE src)
   target_link_libraries(mdft PRIVATE slang::slang)
+  if(OPENSSL_FOUND)
+    target_link_libraries(mdft PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
+  endif()
+
+  # Source-level debug: drivers, loads, active-driver trace, viewer: mdebug design.sv
+  add_executable(mdebug src/mdebug.cpp)
+  target_include_directories(mdebug PRIVATE src)
+  find_package(Threads REQUIRED)
+  target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -180,6 +237,16 @@ if(MINISIM_WITH_SLANG)
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
   endif()
+  # Protected envelopes end to end: msimprotect, then msim -keyfile; no key,
+  # the wrong key, redacted diagnostics, and a VCD without protected signals.
+  if(OPENSSL_FOUND AND OPENSSL_CLI)
+    add_test(NAME msim_protect
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DPROTECT=$<TARGET_FILE:msimprotect>
+                     -DMLINT=$<TARGET_FILE:mlint> -DMDFT=$<TARGET_FILE:mdft>
+                     -DOPENSSL=${OPENSSL_CLI} -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_protect
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_protect.cmake)
+  endif()
   # The virtual prototype layer: the design reaching C models over AXI4-Lite.
   add_test(NAME msim_mvp
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -225,6 +292,17 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  # Datapath library (dw/MW_*.sv, docs/DATAPATH.md): self-checking benches in
+  # tests/dw compare every module with the SystemVerilog operators.
+  file(GLOB DW_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/dw/*.sv)
+  foreach(sv IN LISTS DW_TESTS)
+    get_filename_component(name ${sv} NAME_WE)
+    add_test(NAME dw/${name}
+             COMMAND ${CMAKE_COMMAND} -DSIM=$<TARGET_FILE:msim> -DSV=${sv}
+                     -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
+    set_tests_properties(dw/${name} PROPERTIES LABELS "dw")
+  endforeach()
+
   # UVM (IEEE 1800.2-2020) tests: tests/uvm/*.sv run against the Accellera
   # UVM library when -DUVM_HOME=<uvm-core checkout> is given (CI fetches
   # uvm-core 2020.3.1).
@@ -248,6 +326,10 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
+  add_test(NAME mdebug
+           COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
@@ -270,7 +352,7 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug
+#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)
@@ -278,7 +360,10 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+if(OPENSSL_FOUND)
+  install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
@@ -299,7 +384,9 @@ install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisi
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md
+# The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
+install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
