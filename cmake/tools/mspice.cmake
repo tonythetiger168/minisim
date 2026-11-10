@@ -1,4 +1,5 @@
 # mspice: the SPICE circuit simulator. No dependencies beyond the C++ library.
+include_guard(GLOBAL)
 add_executable(mspice src/mspice.cpp)
 target_include_directories(mspice PRIVATE src)
 find_package(Threads REQUIRED)
