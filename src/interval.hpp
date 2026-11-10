@@ -3,6 +3,8 @@
 // (pss/solve.hpp). Nothing here knows about the simulator.
 //
 // Two layers:
+//   ival::lowBound, highBound the feasible ends of a variable's range (bounds
+//                             propagation), given a "can it hold in [a, b]" test;
 //   ival::IV and ival::ivOp   an interval [lo, hi] of plain integers and the
 //                             rule of each operator over intervals: the
 //                             result holds every value the operator can give
@@ -126,6 +128,32 @@ inline IV ivOp(Op op, const IV& a, const IV& b, i128 x = 0) {
         return {-kSat, kSat};
     default: return ivEmpty();
     }
+}
+
+// Bounds propagation: the feasible ends of a range [lo, hi], by binary
+// search. ok(a, b) says whether the variable's constraints can hold with it
+// in [a, b] (never false while [a, b] holds a solution).
+// The smallest m with ok(lo, m): nothing below it can hold.
+template <class Ok>
+inline i128 lowBound(i128 lo, i128 hi, Ok&& ok) {
+    i128 a = lo, b = hi;
+    if (a < b && ok(a, a)) b = a;
+    while (a < b) {
+        i128 m = a + (b - a) / 2;
+        if (ok(lo, m)) b = m; else a = m + 1;
+    }
+    return a;
+}
+// The largest m >= from with ok(m, hi): nothing above it can hold.
+template <class Ok>
+inline i128 highBound(i128 from, i128 hi, Ok&& ok) {
+    i128 a = from, b = hi;
+    if (a < b && ok(b, b)) a = b;
+    while (a < b) {
+        i128 m = a + (b - a + 1) / 2;
+        if (ok(m, hi)) a = m; else b = m - 1;
+    }
+    return a;
 }
 
 } // namespace ival

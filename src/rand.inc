@@ -431,21 +431,10 @@ inline int narrowVar(Var& v) {
     if (v.set || v.items.empty()) return 0;
     if (--g_ctx->budget < 0) return -1;
     if (!feasibleIn(v, v.lo, v.hi)) return -1;
-    // smallest m with [lo, m] feasible (lo itself, most of the time)
-    i128 a = v.lo, b = v.hi;
-    if (a < b && feasibleIn(v, a, a)) b = a;
-    while (a < b) {
-        i128 m = a + (b - a) / 2;
-        if (feasibleIn(v, v.lo, m)) b = m; else a = m + 1;
-    }
-    i128 nlo = a;
-    a = nlo; b = v.hi;
-    if (a < b && feasibleIn(v, b, b)) a = b;
-    while (a < b) {
-        i128 m = a + (b - a + 1) / 2;
-        if (feasibleIn(v, m, v.hi)) a = m; else b = m - 1;
-    }
-    i128 nhi = a;
+    // The feasible ends, by the binary search shared with mpss (interval.hpp).
+    auto ok = [&](i128 a, i128 b) { return feasibleIn(v, a, b); };
+    i128 nlo = ival::lowBound(v.lo, v.hi, ok);
+    i128 nhi = ival::highBound(nlo, v.hi, ok);
     if (nlo == v.lo && nhi == v.hi) return 0;
     v.lo = nlo; v.hi = nhi;
     return 1;

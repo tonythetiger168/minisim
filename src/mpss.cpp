@@ -159,7 +159,8 @@ int main(int argc, char** argv) {
             }
         }
     };
-    // TODO(parallel.hpp): move to the tool line's shared pool once it is on main.
+    // The tool line's shared pool (src/parallel.hpp, namespace par) is not on
+    // main yet; this loop moves onto it when it is.
     std::vector<std::thread> pool;
     for (int t = 1; t < threads; t++) pool.emplace_back(work);
     work();

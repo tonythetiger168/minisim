@@ -1199,22 +1199,12 @@ struct Scenario {
             i128 lo = hull[v].lo, hi = hull[v].hi;
             if (!feasibleIn(v, lo, hi)) return -1;
             if (lo == hi) return 0;
-            i128 a = lo, b = hi;
-            if (feasibleIn(v, a, a)) b = a;
-            while (a < b) {
-                i128 m = a + (b - a) / 2;
-                if (feasibleIn(v, lo, m)) b = m; else a = m + 1;
-            }
-            i128 nlo = ceilDom(l, a);
-            a = nlo;
-            b = hi;
-            if (a > b) return -1;
-            if (a < b && feasibleIn(v, b, b)) a = b;
-            while (a < b) {
-                i128 m = a + (b - a + 1) / 2;
-                if (feasibleIn(v, m, hi)) a = m; else b = m - 1;
-            }
-            i128 nhi = floorDom(l, a);
+            // The feasible ends (the binary search msim's solver uses), then
+            // onto values the field's domain has.
+            auto ok = [&](i128 a, i128 b) { return feasibleIn(v, a, b); };
+            i128 nlo = ceilDom(l, ival::lowBound(lo, hi, ok));
+            if (nlo > hi) return -1;
+            i128 nhi = floorDom(l, ival::highBound(nlo, hi, ok));
             if (nlo > nhi) return -1;
             if (nlo == lo && nhi == hi) return 0;
             set(v, {nlo, nhi});
