@@ -569,7 +569,7 @@ Tcl shell whose commands follow dc_shell:
 
 ```sh
 msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
-msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the built-in generic library
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the mini45 library
 msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
 ```
 
