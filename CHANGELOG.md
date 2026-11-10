@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
+  `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
+  bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
