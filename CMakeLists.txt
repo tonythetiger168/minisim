@@ -72,6 +72,9 @@ add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
+# The mini45 cell library: generator check and install rules.
+include(cmake/tools/mini45.cmake)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -84,7 +87,7 @@ endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
 include(cmake/tools/mrcx.cmake)
-include(cmake/tools/mini45.cmake)
+include(cmake/tools/shared_par_wave.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
