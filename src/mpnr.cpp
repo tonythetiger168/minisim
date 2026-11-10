@@ -1,6 +1,7 @@
 // mpnr: place and route. Reads a gate-level Verilog netlist and LEF, makes a
 // floorplan, places the cells, routes the nets, and writes DEF.
 #include "pnr_route.hpp"
+#include "pnr_gds.hpp"
 #include "version.hpp"
 #include <chrono>
 #include <iostream>
@@ -24,9 +25,12 @@ static void usage() {
     "  -place_only       stop after placement\n"
     "  -def FILE         write the placed and routed design as DEF\n"
     "  -netlist FILE     write the final flat netlist (with tie and filler cells)\n"
+    "  -gds FILE         write the layout as GDSII (cells are abstracts made from the LEF)\n"
+    "  -gds_map FILE     GDS layers: lines of LEFLAYER GDSLAYER [DATATYPE] (default: LEF order from 1)\n"
+    "  -gds_cells FILE   GDS with the cells' real layouts, copied into the output\n"
     "  -svg FILE         write a picture of the layout\n"
     "  -report FILE      write the summary as JSON\n"
-    "  -check FILE.def   only check a routed DEF: opens, shorts, spacing\n"
+    "  -check FILE.def   only check a routed DEF: opens, shorts, spacing (with -gds: also convert it)\n"
     "  -threads N        worker threads (default: all logical cores; results do not depend on N)\n"
     "  -v                progress on stderr\n"
     "  -version, -help\n";
@@ -34,7 +38,8 @@ static void usage() {
 
 int main(int argc, char** argv) {
   std::vector<std::string> lefs, netlists;
-  std::string defOut, floorplanDef, svgOut, reportOut, netlistOut, checkDef;
+  std::string defOut, floorplanDef, svgOut, reportOut, netlistOut, checkDef, gdsOut;
+  GdsOptions gopt;
   NetlistOptions nopt;
   PlaceOptions popt;
   RouteOptions ropt;
@@ -62,6 +67,9 @@ int main(int argc, char** argv) {
       else if (a == "-def" || a == "-o") defOut = val();
       else if (a == "-netlist") netlistOut = val();
       else if (a == "-svg") svgOut = val();
+      else if (a == "-gds") gdsOut = val();
+      else if (a == "-gds_map") gopt.mapFile = val();
+      else if (a == "-gds_cells") gopt.cellsFile = val();
       else if (a == "-report") reportOut = val();
       else if (a == "-check") checkDef = val();
       else if (a == "-threads") threads = atoi(val().c_str());
@@ -87,6 +95,7 @@ int main(int argc, char** argv) {
       phys::readDef(checkDef, d);
       CheckResult c = checkDesign(db.tech, d, pool);
       printCheck(std::cout, c);
+      if (!gdsOut.empty()) writeGds(db.tech, d, gdsOut, gopt);
       return c.clean() ? 0 : 1;
     }
 
@@ -150,6 +159,7 @@ int main(int argc, char** argv) {
     if (!defOut.empty()) phys::writeDef(defOut, out);
     if (!netlistOut.empty()) writeNetlist(db, netlistOut);
     if (!svgOut.empty()) writeSvg(db, out, svgOut);
+    if (!gdsOut.empty()) writeGds(db.tech, out, gdsOut, gopt);
     if (!reportOut.empty()) {
       std::ofstream r(reportOut);
       r << "{\n  \"design\": \"" << db.top << "\",\n  \"cells\": " << db.insts.size() - fillers << ",\n  \"fillers\": " << fillers
