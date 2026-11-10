@@ -39,6 +39,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "parallel.hpp"
 #include "tcl.hpp"
 
 namespace sdc {
@@ -268,7 +269,7 @@ public:
 
     // Threads for the name indexes of a large design (every logical core by
     // default; the result does not depend on it).
-    int threads = std::max(1u, std::thread::hardware_concurrency());
+    unsigned threads = par::defaultThreads();
     Reader() { busBrackets = true; }  // get_ports data[3] needs no braces
 
     // The objects behind a word: collection handles and bare names.
@@ -317,22 +318,17 @@ private:
     template <typename Less>
     void sortIndex(std::vector<uint32_t>& v, Less less) {
         size_t n = v.size();
-        int t = std::max(1, std::min(threads, 64));
+        size_t t = std::max(1u, std::min(threads, 64u));
         if (t == 1 || n < 50000) { std::sort(v.begin(), v.end(), less); return; }
         std::vector<size_t> cut(t + 1);
-        for (int i = 0; i <= t; i++) cut[i] = n * i / t;
-        std::vector<std::thread> pool;
-        for (int i = 1; i < t; i++) pool.emplace_back([&, i] { std::sort(v.begin() + cut[i], v.begin() + cut[i + 1], less); });
-        std::sort(v.begin(), v.begin() + cut[1], less);
-        for (auto& th : pool) th.join();
-        for (int step = 1; step < t; step *= 2) {
-            pool.clear();
-            for (int i = 0; i + step < t; i += 2 * step)
-                pool.emplace_back([&, i, step] {
+        for (size_t i = 0; i <= t; i++) cut[i] = n * i / t;
+        par::parallelFor(t, threads, [&](size_t i) { std::sort(v.begin() + cut[i], v.begin() + cut[i + 1], less); });
+        for (size_t step = 1; step < t; step *= 2)
+            par::parallelFor((t + 2 * step - 1) / (2 * step), threads, [&](size_t k) {
+                size_t i = k * 2 * step;
+                if (i + step < t)
                     std::inplace_merge(v.begin() + cut[i], v.begin() + cut[i + step], v.begin() + cut[std::min(t, i + 2 * step)], less);
-                });
-            for (auto& th : pool) th.join();
-        }
+            });
     }
     const std::vector<uint32_t>& indexOf(Kind k, bool leaf) {
         const auto& names = design->names(k);

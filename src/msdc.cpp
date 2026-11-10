@@ -23,6 +23,7 @@
 #include <thread>
 
 #include "lintir.hpp"
+#include "parallel.hpp"
 #include "sdc.hpp"
 #include "version.hpp"
 
@@ -91,28 +92,7 @@ struct Rep {
     }
 };
 
-// Runs f(0..n-1) on `threads` threads. Each call writes only its own slot, so
-// the result does not depend on the thread count.
-template <typename F>
-void parallelFor(size_t n, int threads, F f) {
-    if (threads <= 1 || n < 2) {
-        for (size_t i = 0; i < n; i++) f(i);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    size_t chunk = std::max<size_t>(1, n / (size_t(threads) * 8));
-    auto work = [&] {
-        for (;;) {
-            size_t b = next.fetch_add(chunk);
-            if (b >= n) return;
-            for (size_t i = b; i < std::min(n, b + chunk); i++) f(i);
-        }
-    };
-    std::vector<std::thread> pool;
-    for (int t = 1; t < threads && size_t(t) < n; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
-}
+using par::parallelFor;   // each call writes only its own slot: same result on any thread count
 
 // A visited set that is cleared in O(1), one per thread.
 struct Marks {
@@ -557,7 +537,7 @@ struct Checker {
     const sdc::Constraints& c;
     const Rtl* rtl;  // null: the SDC file alone
     Rep& rep;
-    int threads;
+    unsigned threads;
 
     // The clocks that stand: one per name, the last definition.
     std::vector<const sdc::Clock*> clk;
@@ -567,7 +547,7 @@ struct Checker {
     std::vector<uint64_t> launch;     // per node: the clocks that launch its data
     std::vector<std::vector<int>> roots;  // per clock: the source clocks it derives from
 
-    Checker(const sdc::Reader& reader, const Rtl* r, Rep& rp, int th) : rd(reader), c(reader.sdc), rtl(r), rep(rp), threads(th) {}
+    Checker(const sdc::Reader& reader, const Rtl* r, Rep& rp, unsigned th) : rd(reader), c(reader.sdc), rtl(r), rep(rp), threads(th) {}
 
     using Mask = std::vector<uint64_t>;
     bool bit(const uint64_t* m, int i) const { return m[i / 64] >> (i % 64) & 1; }
@@ -1729,8 +1709,7 @@ int main(int argc, char** argv) {
     bool werror = false, quiet = false, haveDesign = false, stats = false;
     std::vector<std::string> sdcFiles;
     std::string jsonPath;
-    int threads = (int)std::thread::hardware_concurrency();
-    if (threads < 1) threads = 1;
+    unsigned threads = par::defaultThreads();
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -1753,11 +1732,7 @@ int main(int argc, char** argv) {
         if (a == "-Werror") { werror = true; continue; }
         if (a == "-sdc") { sdcFiles.push_back(next("an SDC file")); continue; }
         if (a == "-json") { jsonPath = next("a file name"); continue; }
-        if (a == "-threads" || a == "-j") {
-            threads = std::atoi(next("a number").c_str());
-            if (threads < 1) { std::cerr << "msdc: -threads needs a number of 1 or more\n"; return 2; }
-            continue;
-        }
+        if (par::threadsArg(argc, argv, i, threads, "msdc")) continue;
         if (a == "-quiet" || a == "-q") { quiet = true; continue; }
         if (a == "-stats") { stats = true; continue; }
         if (a == "--help-slang") { fwd.push_back("--help"); haveDesign = true; continue; }
