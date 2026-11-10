@@ -83,7 +83,7 @@ endmodule
 //> sel=00x0 cnt=00000xxx
 //>   write a5
 //> mem1=a5  q2=a5 q3=11 q4=xxxx0101
-//> we=x: mem1=xxxxxxxx q2=x0x00xx0 q3=11 q4=xxxxx11x
+//> we=x: mem1=101001xx q2=x0x00xx0 q3=11 q4=xxxxx11x
 //> ad=1x: q2=00000000 q3=0001001x q4=xxxx1111
 //>   write 55
-//> ad=xx: mem=xx xx xx xx q3=000100xx
+//> ad=xx: mem=xx aX xx xx q3=000100xx
