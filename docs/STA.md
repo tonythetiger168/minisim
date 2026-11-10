@@ -7,6 +7,7 @@ builds in the plain CMake build.
 
 ```sh
 msta -lib cells.lib netlist.v -top top -sdc top.sdc     # the default reports
+msta -lib cells.lib netlist.v -sdc top.sdc -spef top.spef   # with parasitics
 msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf -json top.json
 msta -f run.tcl                                          # a script
 ```
@@ -38,6 +39,7 @@ write_sdf top.sdf
 | `read_verilog FILE` | Reads a structural Verilog netlist. |
 | `link_design [TOP]` (`link`) | Flattens the hierarchy below `TOP` and binds cells to the libraries. |
 | `read_sdc FILE` | Reads constraints. |
+| `read_spef FILE [-corner min\|typ\|max]` (`read_parasitics`) | Back-annotates parasitics: wire capacitance and Elmore wire delays. |
 | `check_timing [-verbose]` | Unclocked registers, unconstrained endpoints, inputs with no delay, combinational loops, registers with several clocks, ignored exceptions, cells with no library. Returns the count. |
 | `report_timing` (`report_checks`) | Paths. `-delay_type max\|min`, `-max_paths N` (per path group), `-group CLOCK`, `-from`, `-through`, `-to`, `-slack_lesser_than X`, `-path full\|end`, `-input_pins`, `-transition`, `-capacitance`, `-significant_digits N`. |
 | `report_constraint [-all_violators]` | WNS, TNS and violation counts per clock for setup and hold, `max_transition` and `max_capacitance` violations. Returns the count. |
@@ -56,6 +58,11 @@ A report command takes `> FILE` or `>> FILE` at the end.
   capacitances, `set_load` on ports and nets), with linear interpolation and
   extrapolation. Of several `when` variants of an arc the slowest is used for
   late analysis and the fastest for early. Slews are merged per pin.
+- **Parasitics**: `read_spef` (through the shared `src/spef.hpp`) gives each
+  annotated net its wire capacitance and each driver to load arc the Elmore
+  delay of the RC network, load pin capacitances included; the slew at the
+  load is the driver's slew and ln 9 times the wire delay, root sum of
+  squares.
 - **Clocks**: `create_clock` (waveforms, virtual clocks),
   `create_generated_clock` (`-divide_by`, `-multiply_by`, `-edges`,
   `-edge_shift`, `-invert`, `-duty_cycle`), ideal by default with
@@ -99,8 +106,11 @@ at 1, 2 and 8 threads.
 
 These are not done yet, and each is either reported or documented here:
 
-- Wire delay and wire capacitance: nets are ideal apart from `set_load`.
-  SPEF and wire load models come next.
+- With SPEF the driver is still timed into the total capacitance (no
+  effective capacitance), coupling capacitors count once to ground (no
+  crosstalk delay), and an RC network with loops is timed along a tree.
+  Without SPEF nets are ideal apart from `set_load`; there are no wire load
+  models.
 - Latches are timed as registers at the edge of their timing arcs: a latch's
   `D` is an endpoint and its `D` to `Q` arc is not a path (no time borrowing).
 - On-chip variation: no `set_timing_derate`, no clock reconvergence pessimism
@@ -123,6 +133,7 @@ These are not done yet, and each is either reported or documented here:
 | `src/sdc.hpp` | SDC / Tcl reader (shared) |
 | `src/sta.hpp` | The engine: graph, delay calculation, arrivals, checks |
 | `src/sta_report.hpp` | Reports, SDF and JSON |
+| `src/sta_spef.hpp` | SPEF back-annotation (the reader is the shared `src/spef.hpp`) |
 | `src/parfor.hpp` | The thread pool |
 | `src/msta.cpp` | The command line and the script commands |
 | `tests/sta/`, `tests/msta.cmake` | A small library with linear tables and designs whose expected numbers are worked out by hand |

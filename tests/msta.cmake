@@ -103,6 +103,15 @@ want("rc/D (DFF_X1)         1.944       0.592       1.352"
      "slack (MET)                                              1.409"
      "rc/D (DFF_X1)         1.944       0.519       1.425")
 
+# --- SPEF: net q1 has 6 fF of wire, so r1/Q drives 0.010 pF: 0.15 + 2*0.010 = 0.170.
+# Elmore delay to u1/A: 100 ohm * (2 + 3 + 4 fF behind it) + 50 ohm * 3 fF = 1.05 fs*1000.
+run(0 -lib ${LIB} pipe.v -sdc pipe.sdc -spef pipe.spef
+    -e "report_timing -to [get_pins r2/D] -input_pins -capacitance -transition -significant_digits 4")
+want("read_spef: 2 of 7 nets annotated"
+     "r1/Q (DFF_X1)                                 0.0100      0.0500      0.1700      0.1700 r"
+     "u1/A (INV_X1)                                             0.0501      0.0010      0.1710 r"
+     "slack (MET)                                                                       1.6338")
+
 # --- SDF and JSON.
 run(0 -lib ${LIB} soc.v -q -e "create_clock -name clk -period 4 [get_ports clk]" -sdf ${OUT}/soc.sdf -json ${OUT}/soc.json)
 file(READ ${OUT}/soc.sdf out)

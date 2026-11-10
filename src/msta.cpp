@@ -14,6 +14,7 @@
 //   read_verilog FILE
 //   link_design [TOP]            (also link)
 //   read_sdc FILE                and every SDC command directly
+//   read_spef FILE [-corner min|typ|max]
 //   check_timing [-verbose]
 //   report_timing [-delay_type max|min] [-max_paths N] [-group CLOCK]
 //                 [-from OBJS] [-through OBJS] [-to OBJS]
@@ -33,6 +34,7 @@
 #include <memory>
 
 #include "sta_report.hpp"
+#include "sta_spef.hpp"
 #include "version.hpp"
 
 namespace {
@@ -231,6 +233,32 @@ struct Shell {
             reader.load(a.pos[0]);
             return "";
         });
+        auto readSpef = [this](const std::vector<std::string>& w) -> std::string {
+            Args a = args(w, {"-corner", "-path"}, {"-quiet", "-keep_capacitive_coupling"});
+            if (a.pos.size() != 1) fail(w[0] + " FILE");
+            sta::Sta& s = sta();
+            if (!pool || pool->threads() != wantThreads()) pool = std::make_unique<par::Pool>(threads);
+            s.pool = pool.get();
+            std::string cn = a.get("-corner", "typ");
+            int corner = cn == "min" ? 0 : cn == "max" ? 2 : 1;
+            sta::SpefResult r;
+            try {
+                spef::File f = spef::read(a.pos[0], wantThreads(), corner);
+                r = sta::annotateSpef(s, f);
+            } catch (std::exception& e) {
+                fail(e.what());
+            }
+            if (!a.has("-quiet")) {
+                std::cout << "read_spef: " << r.annotated << " of " << s.nl->nets.size() << " nets annotated";
+                if (r.unknown) std::cout << ", " << r.unknown << " SPEF nets are not in the design";
+                if (r.noDriver) std::cout << ", " << r.noDriver << " with no driver in their RC network (capacitance only)";
+                if (r.loops) std::cout << ", " << r.loops << " with resistor loops (timed along a tree)";
+                std::cout << "\n";
+            }
+            return std::to_string(r.annotated);
+        };
+        reader.addCommand("read_spef", readSpef);
+        reader.addCommand("read_parasitics", readSpef);
         reader.addCommand("set_threads", [this](const std::vector<std::string>& w) -> std::string {
             if (w.size() != 2) fail("set_threads N");
             threads = std::atoi(w[1].c_str());
@@ -377,6 +405,7 @@ void usage() {
         "  -lib FILE            a Liberty library (repeat for more)\n"
         "  -top NAME            the top module (default: the one nothing instantiates)\n"
         "  -sdc FILE            constraints (repeat for more)\n"
+        "  -spef FILE           parasitics: wire capacitance and Elmore wire delay\n"
         "  -f FILE              run a Tcl script instead of the default reports\n"
         "  -e COMMAND           run one command after the design is read\n"
         "  -max_paths N         paths per clock in the default reports (1)\n"
@@ -391,7 +420,7 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::vector<std::string> libs, netlists, sdcs, scripts, cmds;
+    std::vector<std::string> libs, netlists, sdcs, scripts, cmds, spefs;
     std::string top, sdf, json;
     int maxPaths = 1;
     bool failOnViolation = false, stats = false;
@@ -408,6 +437,7 @@ int main(int argc, char** argv) {
         if (a == "-lib" || a == "-liberty") libs.push_back(val());
         else if (a == "-top") top = val();
         else if (a == "-sdc") sdcs.push_back(val());
+        else if (a == "-spef") spefs.push_back(val());
         else if (a == "-f" || a == "-file") scripts.push_back(val());
         else if (a == "-e") cmds.push_back(val());
         else if (a == "-max_paths") maxPaths = std::atoi(val().c_str());
@@ -440,6 +470,7 @@ int main(int argc, char** argv) {
         if (!pre.empty()) sh.run(pre, "<command line>");
         if (sh.errors) return 1;
         for (auto& f : sdcs) sh.run("read_sdc " + tclWord(f) + "\n", "<command line>");
+        for (auto& f : spefs) sh.run("read_spef " + tclWord(f) + "\n", "<command line>");
         if (scripts.empty() && cmds.empty() && sh.engine) {
             std::string mp = std::to_string(maxPaths < 1 ? 1 : maxPaths);
             sh.run("check_timing\nputs {}\nreport_timing -delay_type max -max_paths " + mp +

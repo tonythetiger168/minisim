@@ -275,7 +275,12 @@ public:
     std::vector<int> instNodeOff;              // per instance: its nodes are [off, next off)
     std::vector<Check> checks;
     std::vector<std::vector<int>> levels;
-    std::vector<double> netWireCap;            // set_load on nets, SPEF totals
+    std::vector<double> netWireCap;            // set_load on nets
+    // Parasitics (read_spef, sta_spef.hpp): the wire capacitance of each
+    // annotated net (-1: none) and the wire delay of each net arc.
+    std::vector<double> spefCap;
+    std::vector<float> wireDelay;              // per edge, empty when nothing is annotated
+    size_t spefNets = 0;
     std::vector<double> portLoad;
     // Name lookups. Pins are found through their instance, and the lists of
     // every pin, cell and net name are only built when a constraint asks for
@@ -1331,7 +1336,12 @@ public:
         }
         for (size_t n = 0; n < nodes.size(); n++) {
             Node& x = nodes[n];
-            x.load = x.driver && x.net >= 0 ? netCap[x.net] + netWireCap[x.net] : 0;
+            if (!x.driver || x.net < 0) {
+                x.load = 0;
+                continue;
+            }
+            bool annotated = !spefCap.empty() && spefCap[x.net] >= 0;
+            x.load = netCap[x.net] + (annotated ? spefCap[x.net] : netWireCap[x.net]);
         }
     }
 
@@ -1352,12 +1362,16 @@ public:
                 if (e.disabled || e.loopBreak) continue;
                 const Node& f = nodes[e.from];
                 if (e.kind == NetEdge) {
+                    // A wire: its Elmore delay, and the slew it adds
+                    // (root sum of squares with ln 9 times the delay).
+                    double wd = wireDelay.empty() ? 0 : wireDelay[finIdx[k]];
                     for (int m = 0; m < 2; m++)
                         for (int rf = 0; rf < 2; rf++) {
                             double v = f.slew[m][rf];
+                            if (wd > 0) v = std::sqrt(v * v + 4.8278 * wd * wd);
                             if (m == LATE ? v > s[m][rf] : v < s[m][rf]) s[m][rf] = v;
                             any[m][rf] = true;
-                            e.d[m][rf][rf] = 0;
+                            e.d[m][rf][rf] = wd;
                         }
                     continue;
                 }
