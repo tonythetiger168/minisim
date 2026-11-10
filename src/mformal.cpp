@@ -1667,7 +1667,7 @@ struct Unroll {
 // check has been done, so only the induction runs, with every lemma holding
 // in every frame.
 Result checkProperty(const Model& m, const Property& pr, const std::vector<int>& constraints, const std::vector<int>* lemmas = nullptr, int frames = -1,
-                     bool lastFrameOnly = false) {
+                     bool lastFrameOnly = false, int stepLimit = -1) {
     auto t0 = std::chrono::steady_clock::now();
     Result r;
     std::vector<int> roots{pr.bad};
@@ -1732,6 +1732,7 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
         if (!lemmas) bmc.unit(-bmc.lit(k, pr.bad));
         r.bound = std::max(0, k - rc + 1);
         if (!stepAlive) continue;
+        if (stepLimit >= 0 && k >= stepLimit) { stepAlive = false; continue; }
         // k-induction: no failure in j consecutive cycles from any state, then none in the next
         int j = k;
         step.addFrame();
@@ -1998,7 +1999,7 @@ struct Pdr {
 };
 
 // PDR on one property. `never`: the assumptions' and proven lemmas' fail literals.
-Result checkPdr(const Model& m, const Property& pr, const std::vector<int>& constraints, const std::vector<int>& lemmas) {
+Result checkPdr(const Model& m, const Property& pr, const std::vector<int>& constraints, const std::vector<int>& lemmas, long long calls) {
     auto t0 = std::chrono::steady_clock::now();
     Result r;
     std::vector<int> never = constraints;
@@ -2008,7 +2009,7 @@ Result checkPdr(const Model& m, const Property& pr, const std::vector<int>& cons
     Cone cone = coneOf(m, roots);
     std::vector<int> posOf(m.g.n.size(), -1);
     for (size_t p = 0; p < cone.nodes.size(); p++) posOf[(size_t)cone.nodes[p]] = (int)p;
-    Pdr pdr(m, cone, pr.bad, never, posOf, m.opt.pdrCalls);
+    Pdr pdr(m, cone, pr.bad, never, posOf, calls);
     int res = pdr.run(m.opt.pdrFrames);
     r.v = V_BOUNDED;
     if (res == 1) {
@@ -2332,16 +2333,25 @@ int main(int argc, char** argv) {
     par::Pool pool(threads);
     auto parallel = [&](size_t n, const std::function<void(size_t)>& job) { pool.run(n, job); };
     std::vector<char> safetyOnly(m.props.size(), 0);
+    // Induction over many cycles is expensive and PDR often proves the same
+    // thing at once, so the first pass keeps both short: induction up to
+    // quickSteps cycles, then PDR with a small budget. What is still open gets
+    // induction up to -depth and PDR with its whole budget.
+    const int quickSteps = 10;
+    const long long quickPdrCalls = 3000;
+    bool quick = !opt.bmcOnly && !opt.noPdr && opt.depth > quickSteps;
     parallel(todo.size(), [&](size_t j) {
         const Property& p = m.props[todo[j]];
         Result& r = results[todo[j]];
         if (!p.skipped.empty()) { r.v = V_SKIPPED; r.note = p.skipped; return; }
         if (p.dir == AD_ASSUME) { r.v = V_ASSUMED; return; }
-        r = checkProperty(m, p, constraints);
+        r = checkProperty(m, p, constraints, nullptr, -1, false, quick ? quickSteps : -1);
     });
     // What induction alone could not prove: again, with everything proven so
     // far as lemmas, until a round proves nothing new.
-    for (size_t had = 0;;) {
+    for (int stage = 0; stage < (quick ? 2 : 1); stage++) {
+    bool deep = quick && stage == 1;
+    for (size_t had = deep ? (size_t)-1 : 0;;) {
         std::vector<int> lemmas;
         std::vector<size_t> open;
         for (size_t i : todo) {
@@ -2352,13 +2362,13 @@ int main(int argc, char** argv) {
         if (opt.bmcOnly || open.empty() || lemmas.size() == had) break;
         had = lemmas.size();
         std::vector<Result> again(open.size());
-        parallel(open.size(), [&](size_t j) { again[j] = checkProperty(m, m.props[open[j]], constraints, &lemmas); });
+        parallel(open.size(), [&](size_t j) { again[j] = checkProperty(m, m.props[open[j]], constraints, &lemmas, -1, false, quick && !deep ? quickSteps : -1); });
         for (size_t j = 0; j < open.size(); j++) {
             if (again[j].v != V_PROVEN && again[j].v != V_UNREACHABLE) continue;
             Result& r = results[open[j]];
             again[j].seconds += r.seconds;
             r = again[j];
-            r.note = "induction with lemmas, k=" + std::to_string(r.depth + 1);
+            r.note = (lemmas.empty() ? "induction, k=" : "induction with lemmas, k=") + std::to_string(r.depth + 1);
         }
     }
     // What is still open: PDR, which finds the invariant a proof needs. When it
@@ -2374,7 +2384,7 @@ int main(int argc, char** argv) {
         std::vector<Result> again(open.size());
         parallel(open.size(), [&](size_t j) {
             const Property& p = m.props[open[j]];
-            Result pr = checkPdr(m, p, constraints, lemmas);
+            Result pr = checkPdr(m, p, constraints, lemmas, quick && !deep ? quickPdrCalls : opt.pdrCalls);
             if (pr.v == V_BOUNDED && pr.depth >= 0) {
                 Result br = checkProperty(m, p, constraints, nullptr, pr.depth + 1, true);
                 if (br.v != V_FALSIFIED && br.v != V_COVERED) br = checkProperty(m, p, constraints, nullptr, pr.depth + 1);
@@ -2390,6 +2400,7 @@ int main(int argc, char** argv) {
             if (again[j].v == V_BOUNDED) again[j].bound = std::max(again[j].bound, r.bound);
             r = again[j];
         }
+    }
     }
     // a liveness counterexample: where its loop starts
     for (size_t i : todo) {
