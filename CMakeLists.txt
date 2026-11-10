@@ -329,13 +329,19 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/msimprotect (with OpenSSL)
+#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/msimprotect (with OpenSSL), bin/mspice
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# Tools that need nothing from the blocks above keep their targets, tests and
+# install rules in a file of their own: cmake/tools/<tool>.cmake.
+file(GLOB TOOL_CMAKE ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
+foreach(t ${TOOL_CMAKE})
+  include(${t})
+endforeach()
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

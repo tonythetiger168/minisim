@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
+  netlists with R, C, L, coupled inductors, independent and controlled
+  sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
+  transistors; `.model`, `.param` with expressions, nested `.subckt`,
+  `.include`, `.ic`, `.nodeset`, `.option`, `.print`, `.measure` and `.step`;
+  CSV (`-o`) and VCD (`-vcd`) output. Sparse LU with pivot reuse, latent
+  device bypass, and threads for `.step` runs, AC points and model
+  evaluation, with identical output at any `-threads`. Every test netlist is
+  checked against hand-worked values and against ngspice. See
+  `docs/SPICE.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
