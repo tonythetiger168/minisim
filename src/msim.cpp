@@ -291,6 +291,7 @@ struct Plan {
     std::vector<std::vector<int>> outs;             // comb process outputs
     std::vector<char> seq;
     std::vector<std::vector<std::pair<int, Edge>>> ev;
+    bool cyclic = false;   // some comb processes feed each other: no single forward sweep
 };
 // A wire or variable whose drivers are all strong continuous assigns to
 // fixed, disjoint bit ranges that cover it (assign w = ..., or assign w[k]
@@ -360,7 +361,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
             if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
-        std::vector<size_t> order = combSchedule(shapes, &lv);
+        std::vector<size_t> order = combSchedule(shapes, &lv, &p.cyclic);
         for (size_t r = 0; r < order.size(); r++) {
             size_t i = procOf[order[r]];
             p.rank[i] = (int)r;
@@ -436,7 +437,12 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         procs.push_back(std::move(c));
     }
     CodegenParts parts;
-    parts.on = staticPart;
+    bool combAssert = false;   // a deferred report is queued by one thread
+    for (size_t i = 0; i < lowered.procs.size(); i++)
+        if (pl.rank[i] >= 0)
+            for (auto& in : lowered.procs[i].prog.code) combAssert |= in.k == IK::Assert;
+    parts.on = staticPart && !combAssert && !pl.cyclic;
+    cycle = cycle && !pl.cyclic;   // the domain evaluates every comb statement once, in rank order
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
     std::vector<std::pair<const Prog*, size_t>> covSlots;
@@ -782,6 +788,9 @@ static void usage() {
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
               << protfront::Options::help() <<
+                 "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
+                 "                 merges the branches instead of picking one (docs/XPROP.md)\n"
+                 "  -xprop-report <file>  list every if / case / edge and whether it is merged\n"
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  -upf_verbose   print supply, power state and simstate changes\n"
@@ -817,6 +826,7 @@ int main(int argc, char** argv) {
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     protfront::Options prot;
     std::string upfPath, powerTop;
+    std::string xpropReport;
     bool powerTopSet = false, upfVerbose = false;
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
@@ -841,6 +851,11 @@ int main(int argc, char** argv) {
         if (a == "-no-partition") { staticPart = false; continue; }
         if (a == "-no-2state") { twoState = false; continue; }
         if (a == "-no-cycle") { cycle = false; continue; }
+        if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
+        if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
+        if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }
+        if (a.rfind("-xprop=", 0) == 0) { std::cerr << "msim: bad " << a << " (tmerge, xmerge or off)\n"; return 2; }
+        if (a == "-xprop-report") { xpropReport = next("a file name"); continue; }
         if (a == "-no-pin") { g_pin = 0; continue; }
         if (a == "-pin") { g_pin = 1; continue; }
         if (a == "-cpuinfo") {
@@ -1146,6 +1161,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (!xpropReport.empty()) {   // -xprop-report: what is merged, what is not and why
+        std::ofstream f(xpropReport);
+        if (!f) { std::cerr << "msim: cannot write " << xpropReport << "\n"; return 1; }
+        size_t ok = 0;
+        for (auto& r : Lowerer::xpReport()) ok += r.ok;
+        f << "xprop " << (Lowerer::xpropMode() == 2 ? "xmerge" : Lowerer::xpropMode() == 1 ? "tmerge" : "off") << ": "
+          << ok << " of " << Lowerer::xpReport().size() << " if / case / edge constructs merged\n";
+        for (auto& r : Lowerer::xpReport())
+            f << r.where << r.what << (r.ok ? ": merged" : ": not merged, it holds " + r.why) << "\n";
+    }
     if (!upfPath.empty()) {   // power-aware simulation (IEEE 1801-2024 9)
         auto& rt = upfrt::rt();
         rt.verbose = upfVerbose;
@@ -1336,6 +1361,8 @@ int main(int argc, char** argv) {
     for (int i : byRank) {
         if (i < 0) continue;
         const Prog* pr = &lowered.procs[i].prog;
+        for (auto& in : pr->code)
+            if (in.k == IK::Assert && !pr->combCtl) pr->combCtl = std::make_shared<ProcCtl>();
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
@@ -1368,7 +1395,7 @@ int main(int argc, char** argv) {
     if (startSdf()) return 1;   // SDF timing first, so the checks start with the annotated limits
     startTimingChecks();
     if (!pathRecs().empty() || !S.icDelay.empty() || !S.shadowOf.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
-    if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
+    if (!S.shadows.empty() || !asserts().empty() || !clockings().empty() || pl.cyclic) staticPart = false;
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
