@@ -18,7 +18,7 @@
 // Extracts the transistor netlist of the layout from the connect, label and
 // device statements of the deck and writes it as a SPICE subcircuit.
 //
-// The checks run on all hardware threads by default (-threads N to choose);
+// The checks run on every logical CPU by default (-threads N to choose);
 // the report is the same for every thread count.
 #include <chrono>
 #include <cinttypes>
@@ -26,10 +26,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
-#include <thread>
 
 #include "layout_def.hpp"
 #include "lvs.hpp"
+#include "parallel.hpp"
 #include "version.hpp"
 
 namespace {
@@ -46,7 +46,7 @@ int usage(FILE* f) {
         "  -top <cell>      cell to check (default: the one top cell)\n"
         "  -o <file>        write the violation markers here\n"
         "  -max <n>         markers written per rule (default 1000; counts stay exact)\n"
-        "  -threads <n>     worker threads (default: every hardware thread)\n"
+        "  -threads <n>     worker threads (default: every logical CPU)\n"
         "  -q               print only rules with violations and the summary\n"
         "  -version\n", f);
     return f == stderr ? 2 : 0;
@@ -64,8 +64,7 @@ std::string um(double v) {
 int drcMain(int argc, char** argv) {
     std::string deckFile, gdsFile, top, outFile, writeDeck;
     std::vector<std::string> lefs;
-    unsigned threads = std::thread::hardware_concurrency();
-    if (!threads) threads = 1;
+    unsigned threads = par::defaultThreads();
     size_t maxMarkers = 1000;
     bool quiet = false, withObs = false;
     for (int i = 0; i < argc; ++i) {
@@ -76,6 +75,7 @@ int drcMain(int argc, char** argv) {
             return true;
         };
         std::string v;
+        if (par::threadsArg(argc, argv, i, threads, "mpv")) continue;
         if (a == "-deck") { if (!val(deckFile)) return 2; }
         else if (a == "-top") { if (!val(top)) return 2; }
         else if (a == "-o") { if (!val(outFile)) return 2; }
@@ -83,12 +83,12 @@ int drcMain(int argc, char** argv) {
         else if (a == "-obs") withObs = true;
         else if (a == "-lef") { if (!val(v)) return 2; lefs.push_back(v); }
         else if (a == "-write-deck") { if (!val(writeDeck)) return 2; }
-        else if (a == "-threads" || a == "-max") {
+        else if (a == "-max") {
             if (!val(v)) return 2;
             char* end = nullptr;
             long n = std::strtol(v.c_str(), &end, 10);
-            if (*end || n < (a == "-max" ? 0 : 1)) { std::fprintf(stderr, "mpv: bad %s %s\n", a.c_str(), v.c_str()); return 2; }
-            if (a == "-max") maxMarkers = size_t(n); else threads = unsigned(n);
+            if (*end || n < 0) { std::fprintf(stderr, "mpv: bad -max %s\n", v.c_str()); return 2; }
+            maxMarkers = size_t(n);
         }
         else if (a == "-h" || a == "-help" || a == "--help") return usage(stdout);
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "mpv: unknown option %s\n", a.c_str()); return 2; }
@@ -178,8 +178,7 @@ int drcMain(int argc, char** argv) {
 
 int lvsMain(int argc, char** argv) {
     std::string deckFile, gdsFile, top, outFile;
-    unsigned threads = std::thread::hardware_concurrency();
-    if (!threads) threads = 1;
+    unsigned threads = par::defaultThreads();
     for (int i = 0; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&](std::string& dst) {
@@ -188,16 +187,10 @@ int lvsMain(int argc, char** argv) {
             return true;
         };
         std::string v;
+        if (par::threadsArg(argc, argv, i, threads, "mpv")) continue;
         if (a == "-deck") { if (!val(deckFile)) return 2; }
         else if (a == "-top") { if (!val(top)) return 2; }
         else if (a == "-o") { if (!val(outFile)) return 2; }
-        else if (a == "-threads") {
-            if (!val(v)) return 2;
-            char* end = nullptr;
-            long n = std::strtol(v.c_str(), &end, 10);
-            if (*end || n < 1) { std::fprintf(stderr, "mpv: bad -threads %s\n", v.c_str()); return 2; }
-            threads = unsigned(n);
-        }
         else if (a == "-h" || a == "-help" || a == "--help") return usage(stdout);
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "mpv: unknown option %s\n", a.c_str()); return 2; }
         else if (gdsFile.empty()) gdsFile = a;

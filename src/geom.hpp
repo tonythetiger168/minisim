@@ -24,9 +24,10 @@
 #include <map>
 #include <memory_resource>
 #include <numeric>
-#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "parallel.hpp"
 
 namespace geom {
 
@@ -67,10 +68,11 @@ struct Region {
 enum class Op { Or, And, Sub, Xor };
 
 // ---------------------------------------------------------------------------
-// Threads. Stand-in for the shared src/parallel.hpp (same call shape): runs
-// f(i) for every i in [0, n) on up to `threads` threads, the caller included.
-// Calls may nest: all of them share one budget of `threads` running threads,
-// so an inner loop uses the threads that the outer loop has finished with.
+// Threads. The loops run on the shared par::parallelFor (src/parallel.hpp).
+// What this adds is one budget for nested loops: the rules of a deck, the
+// directions of a check and the strips of a scan all call parallelFor, and
+// together they never run more than `threads` threads. An inner loop gets
+// the threads that are free when it starts, and runs inline when none are.
 // ---------------------------------------------------------------------------
 inline std::atomic<int>& extraThreads() {
     static std::atomic<int> n{0};
@@ -88,23 +90,11 @@ void parallelFor(size_t n, unsigned threads, F&& f) {
         if (cur + 1 >= int(threads)) break;
         if (busy.compare_exchange_weak(cur, cur + 1)) ++got;
     }
-    if (got == 0) {
-        for (size_t i = 0; i < n; ++i) f(i);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    auto run = [&] {
-        for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < n;) f(i);
-    };
-    std::vector<std::thread> pool;
-    pool.reserve(size_t(got));
-    for (int t = 0; t < got; ++t)
-        pool.emplace_back([&] {
-            run();
-            busy.fetch_sub(1);   // free for other loops as soon as this one has no more work
-        });
-    run();
-    for (std::thread& t : pool) t.join();
+    struct Release {
+        std::atomic<int>& busy; int got;
+        ~Release() { busy.fetch_sub(got); }
+    } release{busy, got};
+    par::parallelFor(n, unsigned(got) + 1, f);
 }
 
 namespace detail {

@@ -30,7 +30,7 @@ Exit status: 0 clean, 1 violations, 2 a usage or input error.
 | `-top <cell>` | cell to check; default is the one cell nothing references |
 | `-o <file>` | results file with the markers |
 | `-max <n>` | markers written per rule (default 1000); the counts stay exact |
-| `-threads <n>` | worker threads; default is every hardware thread |
+| `-threads <n>` | worker threads; default is every logical CPU (`$MINISIM_THREADS` overrides) |
 | `-q` | print only the rules with violations |
 
 ## A routed DEF as the layout
