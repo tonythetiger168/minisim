@@ -20,6 +20,8 @@ Spec references are IEEE 1800-2023 clauses.
   run at each clock tick on the sampled values of its arguments; its result
   was garbage before.
 - `pop_front()` / `pop_back()` of a queue of queues (7.10.2).
+- An array declared with an initializer in a non-recursive function,
+  `bit [5:0] t[4] = '{...};` (6.21), was an unsupported reference.
 - A queue or dynamic array reached through handles in a coverpoint or its
   `iff` guard, `coverpoint tr.txn.data[0] iff (tr.txn.data.size() > 0)`
   (19.5): it was a null object access.

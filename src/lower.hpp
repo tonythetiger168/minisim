@@ -7184,6 +7184,12 @@ struct Lowerer {
                     for (int k = 0; k < a->count; k++) { Instr i; i.k = IK::Assign; i.sig = a->base + k; i.e = konst(iv); prog.emit(i); }
                     break;
                 }
+                // An array with an initializer in a function that keeps static
+                // signals: assigned at each entry, as an automatic one is.
+                if (init && vd.symbol.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType &&
+                    !(current && vd.symbol.lifetime == VariableLifetime::Static) && arrFind(&vd.symbol) &&
+                    assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false))
+                    break;
                 if (localMap().count(&vd.symbol)) {   // an automatic variable starts over at each entry (6.21)
                     if (vd.symbol.getType().isEvent()) break;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol);
