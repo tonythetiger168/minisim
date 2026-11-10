@@ -72,18 +72,6 @@ add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
-# Static timing analysis of gate netlists: msta -lib cells.lib netlist.v -sdc top.sdc
-# (docs/STA.md). No front-end dependency.
-find_package(Threads REQUIRED)
-find_package(Python3 COMPONENTS Interpreter QUIET)
-add_executable(msta src/msta.cpp)
-target_include_directories(msta PRIVATE src)
-target_link_libraries(msta PRIVATE Threads::Threads)
-add_test(NAME msta
-         COMMAND ${CMAKE_COMMAND} -DMSTA=$<TARGET_FILE:msta> -DSRC=${CMAKE_SOURCE_DIR}
-                 -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msta_test -DPYTHON=${Python3_EXECUTABLE}
-                 -P ${CMAKE_SOURCE_DIR}/tests/msta.cmake)
-
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -93,6 +81,10 @@ if(Python3_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
+
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/mrcx.cmake)
+include(cmake/tools/msta.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -367,7 +359,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim msta RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
