@@ -32,6 +32,8 @@ struct Circuit {
     std::vector<uint8_t> obs;       // observed by the tester
     std::vector<int> inputs;        // the IN nodes, in pattern order
     std::vector<int> dist;          // gates to the nearest observe point
+    std::vector<int> level;         // gates from the inputs: above every fanin's
+    int levels = 0;
     std::vector<int> cc0, cc1;      // SCOAP controllability
     bool hasX = false;              // an X source or a held input exists
 
@@ -64,6 +66,12 @@ struct Circuit {
         std::vector<int> pos(foStart.begin(), foStart.end() - 1);
         for (int n = 0; n < N; n++)
             for (int k = 0; k < fiN[n]; k++) fo[pos[in(n)[k]]++] = n;
+        level.assign(N, 0);
+        levels = 1;
+        for (int n = 0; n < N; n++) {
+            for (int k = 0; k < fiN[n]; k++) level[n] = std::max(level[n], level[in(n)[k]] + 1);
+            levels = std::max(levels, level[n] + 1);
+        }
         dist.assign(N, INT_MAX);
         for (int n = N - 1; n >= 0; n--) {
             if (obs[n]) { dist[n] = 0; continue; }
@@ -110,6 +118,9 @@ struct Circuit {
     }
 };
 
+// A pattern or a test cube: one value per circuit input, 2 = free.
+using Pattern = std::vector<uint8_t>;
+
 enum Cls : uint8_t { NC, DS, DI, UU, UR, AU, ND };
 
 struct Fault {
@@ -133,7 +144,7 @@ struct Sim {
     struct Work {
         std::vector<uint64_t> f0, f1;
         std::vector<uint32_t> stamp, qstamp;
-        std::vector<int> heap;
+        std::vector<std::vector<int>> queue;   // the events waiting, by level
         uint32_t ep = 0;
         void init(int n) {
             f0.assign(n, 0);
@@ -230,8 +241,10 @@ struct Sim {
         }
         uint32_t ep = w.ep;
         uint64_t det = 0;
-        auto& heap = w.heap;
-        heap.clear();
+        // Events wait in one list per level and levels run in order, so a
+        // node is evaluated once, after everything it reads.
+        if ((int)w.queue.size() < c.levels) w.queue.resize(c.levels);
+        int top = 0;
         auto get = [&](int m, uint64_t& x0, uint64_t& x1) {
             if (w.stamp[m] == ep) { x0 = w.f0[m]; x1 = w.f1[m]; }
             else { x0 = g0[m]; x1 = g1[m]; }
@@ -247,8 +260,9 @@ struct Sim {
                 int m = c.fo[k];
                 if (w.qstamp[m] != ep) {
                     w.qstamp[m] = ep;
-                    heap.push_back(m);
-                    std::push_heap(heap.begin(), heap.end(), std::greater<int>());
+                    int lv = c.level[m];
+                    w.queue[lv].push_back(m);
+                    if (lv > top) top = lv;
                 }
             }
         };
@@ -261,14 +275,16 @@ struct Sim {
             if (o0 == g0[f.node] && o1 == g1[f.node]) return 0;
             set(f.node, o0, o1);
         }
-        while (!heap.empty()) {
-            std::pop_heap(heap.begin(), heap.end(), std::greater<int>());
-            int n = heap.back();
-            heap.pop_back();
-            uint64_t o0, o1;
-            eval(c, n, get, -1, 0, 0, o0, o1);
-            if (o0 == g0[n] && o1 == g1[n]) continue;
-            set(n, o0, o1);
+        for (int lv = c.level[f.node] + 1; lv <= top; lv++) {
+            auto& q = w.queue[lv];
+            for (size_t i = 0; i < q.size(); i++) {
+                int n = q[i];
+                uint64_t o0, o1;
+                eval(c, n, get, -1, 0, 0, o0, o1);
+                if (o0 == g0[n] && o1 == g1[n]) continue;
+                set(n, o0, o1);
+            }
+            q.clear();
         }
         return det & cm;
     }

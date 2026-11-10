@@ -16,7 +16,9 @@
 //   makeFaults() two faults per site.
 #pragma once
 #include <deque>
+#include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1075,6 +1077,79 @@ inline std::vector<Fault> makeFaults(const Model& m, bool transition) {
         }
     }
     return out;
+}
+
+// ------------------------------------------------------- pattern file ----
+struct PatSet {
+    bool transition = false;
+    std::vector<Pattern> pats, cubes;
+    std::vector<std::vector<uint8_t>> po, cap;   // expected values, 2 = X
+};
+
+// The pattern file ("matpg-patterns 1"): the inputs and scan cells by name,
+// then one line per pattern, "p stuck|transition <input bits> <cell bits>".
+inline void writePatterns(const Design& nl, const Model& m, const std::vector<PatSet>& sets, std::ostream& os) {
+    auto inName = portNames(nl, true);
+    os << "matpg-patterns 1\ndesign " << nl.top << "\ninputs " << m.piNets.size();
+    for (int n : m.piNets) os << " " << inName[n];
+    os << "\nscan " << m.scanCells.size();
+    for (int c : m.scanCells) os << " " << nl.cells[c].name;
+    os << "\n";
+    size_t nPI = m.piNets.size();
+    for (const PatSet& ps : sets)
+        for (const Pattern& p : ps.pats) {
+            os << "p " << (ps.transition ? "transition" : "stuck") << " ";
+            for (size_t i = 0; i < nPI; i++) os << (char)('0' + p[i]);
+            os << " ";
+            for (size_t i = nPI; i < p.size(); i++) os << (char)('0' + p[i]);
+            if (p.size() == nPI) os << "-";
+            os << "\n";
+        }
+}
+
+// Both sets come back (stuck-at, then transition); the names in the file must
+// be this design's.
+inline std::vector<PatSet> readPatterns(const std::string& path, const Design& nl, const Model& m) {
+    std::ifstream f(path);
+    if (!f) throw ModelError("cannot open " + path);
+    std::vector<PatSet> sets(2);
+    sets[1].transition = true;
+    std::string line;
+    size_t nPI = m.piNets.size(), nSC = m.scanCells.size();
+    auto inName = portNames(nl, true);
+    int ln = 0;
+    while (std::getline(f, line)) {
+        ln++;
+        std::istringstream is(line);
+        std::string w;
+        if (!(is >> w)) continue;
+        auto bad = [&](const std::string& why) {
+            throw ModelError(path + ":" + std::to_string(ln) + ": " + why);
+        };
+        if (w == "inputs" || w == "scan") {
+            size_t n;
+            is >> n;
+            if (n != (w == "inputs" ? nPI : nSC)) bad("the " + w + " count does not match this design");
+            for (size_t i = 0; i < n; i++) {
+                std::string name;
+                is >> name;
+                const std::string& want = w == "inputs" ? inName[m.piNets[i]] : nl.cells[m.scanCells[i]].name;
+                if (name != want) bad("expected '" + want + "' but the file has '" + name + "'");
+            }
+        } else if (w == "p") {
+            std::string kind, a, b;
+            is >> kind >> a >> b;
+            if (b == "-") b.clear();
+            if (a.size() != nPI || b.size() != nSC) bad("a pattern of the wrong length");
+            Pattern p;
+            for (char ch : a + b) {
+                if (ch != '0' && ch != '1') bad("a pattern bit that is not 0 or 1");
+                p.push_back((uint8_t)(ch - '0'));
+            }
+            sets[kind == "transition"].pats.push_back(p);
+        }
+    }
+    return sets;
 }
 
 }  // namespace atpg

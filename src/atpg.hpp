@@ -395,7 +395,6 @@ struct Rng {
     }
 };
 
-using Pattern = std::vector<uint8_t>;   // one 0/1 per circuit input
 
 struct Engine {
     const Circuit& c;
