@@ -66,3 +66,42 @@ file(READ ${OUT}/ser.json ser)
 if(NOT rc EQUAL 0 OR NOT rc2 EQUAL 0 OR NOT par STREQUAL ser)
   message(FATAL_ERROR "mcov merge -j 4 differs from -j 1")
 endif()
+
+# Functional coverage in the database: covergroup bins and assertion
+# statistics (tests/cov/counter.sv). One run leaves holes; merged with the
+# other modes every bin is covered and every assertion passed or was hit.
+set(CSV ${SRC}/tests/cov/counter.sv)
+foreach(mode 0 1 2)
+  execute_process(COMMAND ${MSIM} ${CSV} -top tb +define+MODE=${mode} -cov f${mode}.json WORKING_DIRECTORY ${OUT}
+                  RESULT_VARIABLE rc OUTPUT_QUIET ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "msim -cov (counter, mode ${mode}) exited ${rc}: ${err}")
+  endif()
+endforeach()
+file(READ ${OUT}/f1.json db)
+if(NOT db MATCHES "\\[\"cp_q\", \"point\", 1, 100, 1, 2, \\[\\[\"lo\", 10\\], \\[\"hi\", 4\\]\\]\\]"
+   OR NOT db MATCHES "\\[\"x_q_dir\", \"cross\", 1, 100, 1, 4, \\[\\[\"<lo,up>\", 6\\], \\[\"<hi,up>\", 4\\]\\]\\]"
+   OR NOT db MATCHES "\\[\"tb.dut.c_wrap\", \"cover\", 15, 1, 14\\]")
+  message(FATAL_ERROR "covergroups / assertions missing from the database:\n${db}")
+endif()
+execute_process(COMMAND ${MCOV} report f0.json -min-func 80 -min-assert 100 -html fhtml WORKING_DIRECTORY ${OUT}
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 1 OR NOT out MATCHES "tb\\.cg +41\\.7% +3/8 +bins" OR NOT out MATCHES "Functional: 41\\.7%"
+   OR NOT out MATCHES "Assertions: 66\\.7% \\(2/3 passed or hit, 1 never passed or hit\\)"
+   OR NOT out MATCHES "func coverage 41\\.7% is below 80" OR NOT out MATCHES "assert coverage 66\\.7% is below 100")
+  message(FATAL_ERROR "functional coverage of one run wrong (rc ${rc})\n${out}")
+endif()
+file(READ ${OUT}/fhtml/index.html page)
+if(NOT page MATCHES "Functional coverage: 41\\.7%" OR NOT page MATCHES "tb\\.dut\\.c_wrap</td><td>cover</td><td>never hit")
+  message(FATAL_ERROR "functional coverage missing from the HTML report")
+endif()
+execute_process(COMMAND ${MCOV} merge f0.json f1.json f2.json -o fall.json WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_QUIET)
+execute_process(COMMAND ${MCOV} report fall.json -min-func 100 -min-assert 100 WORKING_DIRECTORY ${OUT}
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "Functional: 100\\.0%" OR NOT out MATCHES "Assertions: 100\\.0% \\(3/3")
+  message(FATAL_ERROR "merged functional coverage wrong (rc ${rc})\n${out}")
+endif()
+file(READ ${OUT}/fall.json db)
+if(NOT db MATCHES "\\[\"tb.dut.a_rst\", \"assert\", [0-9]+, [0-9]+, 0\\]" OR NOT db MATCHES "\"<lo,down>\", [1-9]")
+  message(FATAL_ERROR "merged database lost the functional sections:\n${db}")
+endif()
