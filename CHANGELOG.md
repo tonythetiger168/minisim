@@ -8,7 +8,6 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-<<<<<<< HEAD
 - `mlint` grows from 6 rules to about 80, in groups: latches and
   combinational logic (`L001` now bit-accurate, `LAT001`, incomplete
   sensitivity lists, combinational loops across modules), case statements,
@@ -22,7 +21,6 @@ Spec references are IEEE 1800-2023 clauses.
   (`// mlint: waive RULE reason`, `mlint: off / on`, `translate_off`).
   `-json` report, `-show-waived`, `-stats`. Rules run on every logical CPU
   (`-threads N`), with the same output for any count. See `docs/LINT.md`.
-=======
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -30,7 +28,6 @@ Spec references are IEEE 1800-2023 clauses.
   through time, and `-html` for a one-file viewer (hierarchy, clickable
   source, drivers and loads, schematic, waves with values annotated in the
   source). See `docs/DEBUG.md`.
->>>>>>> origin/main
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
