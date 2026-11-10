@@ -8,6 +8,7 @@ foreach(t test_sdc test_tcl)
 endforeach()
 
 if(MINISIM_WITH_SLANG)
+  include(GNUInstallDirs)
   # msdc design.sv -top top -sdc top.sdc
   find_package(Threads REQUIRED)
   add_executable(msdc src/msdc.cpp)

@@ -83,7 +83,12 @@ if(Python3_FOUND)
 endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
-include(cmake/tools/mrcx.cmake)
+# Every *.cmake there is included: add a file, not a line here, so that tool
+# changes do not all edit the same lines.
+file(GLOB TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
+foreach(f ${TOOL_CMAKE})
+  include(${f})
+endforeach()
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -388,13 +393,6 @@ install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
-
-# One file per tool in cmake/tools, so that tool changes do not all edit the
-# same lines of this file.
-file(GLOB TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
-foreach(f ${TOOL_CMAKE})
-  include(${f})
-endforeach()
 
 set(CPACK_PACKAGE_NAME minisim)
 set(CPACK_PACKAGE_VENDOR "minisim")
