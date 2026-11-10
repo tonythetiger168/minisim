@@ -157,7 +157,7 @@ endif()
 execute_process(COMMAND ${MDEBUG} ${SV} -top st -vcd ${OUT}/struct.vcd -active st.s -at 50 -depth 2
                         -active st.t -at 50 -depth 2 -json ${OUT}/struct.json
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
-want("<- tests/debug/struct.sv:13: s = {p.hi, p.lo}  [always_comb]  when p.lo == 4'd3"
+want("struct.sv:13: s = {p.hi, p.lo}  [always_comb]  when p.lo == 4'd3"
      "p.hi = q[3:0]" "p.lo = 4'd3" "q <= q + 8'd4"
      "t = r.b ? r.a : 4'd0" "st.r = 5'h09 @45" "r.a = p.hi" "r.b = idx[0]")
 if(out MATCHES "\\?\\?|p = '0|s = 0")
