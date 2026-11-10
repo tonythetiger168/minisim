@@ -167,6 +167,7 @@ if(MINISIM_WITH_SLANG)
 
   # Tools on the slang front end: one file each in cmake/tools.
   include(cmake/tools/msynth.cmake)
+  include(cmake/tools/mfpga.cmake)
 
   # Source-level debug: drivers, loads, active-driver trace, viewer: mdebug design.sv
   add_executable(mdebug src/mdebug.cpp)

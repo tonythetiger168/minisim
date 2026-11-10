@@ -29,7 +29,7 @@ static void usage() {
     "  -G NAME=VALUE        top-level parameter\n"
     "  -clock NAME   name of the clock input added for AIGER latches (default: clk)\n"
     "  -cuts N       cuts kept per node, 2..16 (default: 8)\n"
-    "  -threads N    worker threads (default: all logical cores; results do not depend on N)\n"
+    "  -threads N    worker threads (default: every logical core; the output does not depend on N)\n"
     "  -verify       simulate the mapped netlist against the input on random patterns\n"
     "  -q            no report\n";
 }

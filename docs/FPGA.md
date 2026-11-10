@@ -98,7 +98,5 @@ CI installs Yosys and nextpnr.
 - No clock enable or synchronous reset pins yet: both are in the D logic.
 - The `xc7` netlist is checked by simulation and by Yosys equivalence on its
   JSON form. The EDIF itself has not been through a Vivado run.
-- The thread pool is local to `src/fpga.hpp` until the shared
-  `src/parallel.hpp` lands.
 - A flop's power-up value is known for AIGER input only; the elaborator does
   not record `initial` values.

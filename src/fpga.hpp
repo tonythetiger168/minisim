@@ -8,28 +8,25 @@
 //   build    LUTs and flops as cells of a device family (generic, ice40,
 //            ecp5, xc7)
 //
-// Cut enumeration runs level by level on a thread pool. A node's cuts depend
+// Cut enumeration runs level by level on the shared pool (src/parallel.hpp). A node's cuts depend
 // only on lower levels, so the result is the same for every thread count.
 #pragma once
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "aig.hpp"
+#include "parallel.hpp"
 
 namespace fpga {
 
@@ -70,83 +67,6 @@ struct Aig {
       if (p.output) for (Lit l : p.bits) f(l);
     for (auto& fl : flops) { f(fl.d); f(fl.clk); f(fl.arst); }
   }
-};
-
-// ---------------------------------------------------------------- thread pool
-
-inline int default_threads() {
-  unsigned n = std::thread::hardware_concurrency();
-  return n ? (int)n : 1;
-}
-
-class Pool {
- public:
-  explicit Pool(int n) : n_(n < 1 ? 1 : n) {
-    for (int t = 1; t < n_; ++t) workers_.emplace_back([this, t] { loop(t); });
-  }
-  ~Pool() {
-    { std::lock_guard<std::mutex> g(m_); stop_ = true; ++gen_; }
-    cv_.notify_all();
-    for (auto& w : workers_) w.join();
-  }
-  int size() const { return n_; }
-
-  // f(i, thread) for i in [0, n); small ranges run on the calling thread.
-  template <class F> void run(size_t n, size_t grain, F&& f) {
-    if (n_ == 1 || n <= grain) {
-      for (size_t i = 0; i < n; ++i) f(i, 0);
-      return;
-    }
-    std::atomic<size_t> next{0};
-    auto body = [&](int tid) {
-      for (;;) {
-        size_t b = next.fetch_add(grain, std::memory_order_relaxed);
-        if (b >= n) break;
-        size_t e = std::min(n, b + grain);
-        for (size_t i = b; i < e; ++i) f(i, tid);
-      }
-    };
-    {
-      std::lock_guard<std::mutex> g(m_);
-      job_ = body;
-      pending_ = n_ - 1;
-      ++gen_;
-    }
-    cv_.notify_all();
-    body(0);
-    std::unique_lock<std::mutex> g(m_);
-    done_.wait(g, [&] { return pending_ == 0; });
-    job_ = nullptr;
-  }
-
- private:
-  void loop(int tid) {
-    uint64_t seen = 0;
-    for (;;) {
-      std::function<void(int)> job;
-      {
-        std::unique_lock<std::mutex> g(m_);
-        cv_.wait(g, [&] { return gen_ != seen; });
-        seen = gen_;
-        if (stop_) return;
-        job = job_;
-      }
-      job(tid);
-      {
-        std::lock_guard<std::mutex> g(m_);
-        --pending_;
-      }
-      done_.notify_one();
-    }
-  }
-  int n_;
-  std::vector<std::thread> workers_;
-  std::mutex m_;
-  std::condition_variable cv_, done_;
-  std::function<void(int)> job_;
-  uint64_t gen_ = 0;
-  int pending_ = 0;
-  bool stop_ = false;
 };
 
 // ------------------------------------------------------------ from aig.hpp
@@ -284,11 +204,11 @@ class LutMapper {
     if (o_.K < 2 || o_.K > kMaxK) throw std::runtime_error("LUT size must be 2..6");
     if (o_.cuts < 2) o_.cuts = 2;
     if (o_.cuts > 16) o_.cuts = 16;
-    if (o_.threads <= 0) o_.threads = default_threads();
+    if (o_.threads <= 0) o_.threads = (int)par::defaultThreads();
   }
 
   Mapped run() {
-    Pool pool(o_.threads);
+    par::Pool pool((unsigned)o_.threads);
     const uint32_t nv = g_.nvars(), fa = g_.first_and();
     const int C = o_.cuts;
     cuts_.resize((size_t)g_.ands.size() * C);
@@ -322,7 +242,9 @@ class LutMapper {
     auto sweep = [&](int mode) {
       for (uint32_t l = 1; l <= maxl; ++l) {
         uint32_t b = lstart[l], n = lstart[l + 1] - b;
-        pool.run(n, 64, [&](size_t i, int) { enumerate(order[b + i], mode); });
+        pool.chunks(n, 64, [&](size_t lo, size_t hi, size_t) {
+          for (size_t i = lo; i < hi; ++i) enumerate(order[b + i], mode);
+        });
       }
     };
     sweep(0);
@@ -482,17 +404,17 @@ class LutMapper {
   }
 
   // Truth tables of the chosen LUTs, inputs the function ignores removed.
-  Mapped extract(Pool& pool) {
+  Mapped extract(par::Pool& pool) {
     const uint32_t fa = g_.first_and(), nv = g_.nvars();
     std::vector<uint32_t> roots;
     for (uint32_t v = fa; v < nv; ++v)
       if (ref_[v]) roots.push_back(v);
     std::vector<Lut> luts(roots.size());
     struct Scratch { std::vector<uint64_t> tt; std::vector<uint32_t> stamp, stack; uint32_t now = 0; };
-    std::vector<Scratch> scr(pool.size());
-    pool.run(roots.size(), 256, [&](size_t i, int tid) {
-      Scratch& s = scr[tid];
-      if (s.tt.empty()) { s.tt.resize(nv); s.stamp.assign(nv, 0); }
+    pool.chunks(roots.size(), 256, [&](size_t lo, size_t hi, size_t) {
+     thread_local Scratch s;   // one per worker, reused across chunks
+     if (s.tt.size() != nv) { s.tt.assign(nv, 0); s.stamp.assign(nv, 0); s.now = 0; }
+     for (size_t i = lo; i < hi; ++i) {
       const uint32_t v = roots[i];
       const Cut& c = best_[v - fa];
       ++s.now;
@@ -544,6 +466,7 @@ class LutMapper {
       for (int w = 1 << nk; w < 64; w <<= 1) r |= r << w;
       L.n = (uint8_t)n;
       L.tt = r;
+     }
     });
     // liveness after input removal, and depth
     Mapped out;
