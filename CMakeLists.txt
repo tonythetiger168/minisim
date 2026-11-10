@@ -30,7 +30,7 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_parallel test_wave)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_lefdef test_parallel test_wave)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -286,6 +286,17 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  # Datapath library (dw/MW_*.sv, docs/DATAPATH.md): self-checking benches in
+  # tests/dw compare every module with the SystemVerilog operators.
+  file(GLOB DW_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/dw/*.sv)
+  foreach(sv IN LISTS DW_TESTS)
+    get_filename_component(name ${sv} NAME_WE)
+    add_test(NAME dw/${name}
+             COMMAND ${CMAKE_COMMAND} -DSIM=$<TARGET_FILE:msim> -DSV=${sv}
+                     -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
+    set_tests_properties(dw/${name} PROPERTIES LABELS "dw")
+  endforeach()
+
   # UVM (IEEE 1800.2-2020) tests: tests/uvm/*.sv run against the Accellera
   # UVM library when -DUVM_HOME=<uvm-core checkout> is given (CI fetches
   # uvm-core 2020.3.1).
@@ -368,7 +379,9 @@ install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisi
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md
+# The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
+install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
