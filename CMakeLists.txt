@@ -459,6 +459,16 @@ install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
+# The tools: one file each in cmake/tools, all included here, after the core
+# targets, the slang front end, FST and the install directories, so a tool
+# file can test if(MINISIM_WITH_SLANG), if(TARGET msim) and MINISIM_WITH_FST.
+# Add a file, not a line: every *.cmake there is included. Start each file
+# with include_guard(GLOBAL).
+file(GLOB TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
+foreach(f ${TOOL_CMAKE})
+  include(${f})
+endforeach()
+
 set(CPACK_PACKAGE_NAME minisim)
 set(CPACK_PACKAGE_VENDOR "minisim")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SystemVerilog simulator (IEEE 1800-2023) with an irun/vcs-style command line")
