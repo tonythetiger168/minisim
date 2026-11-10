@@ -339,6 +339,16 @@ int main(int argc, char** argv) {
 
     Dft dft(d, rep);
     dft.run();
+    if (jtag.lbist) {  // logic BIST around a scan-inserted design
+        try {
+            std::string top;
+            std::vector<dft::Port> ports = dft::topPorts(*fe.comp, top);
+            return jtag.runLbist(ports, top);
+        } catch (const dft::Error& e) {
+            std::cerr << "mdft: " << e.what() << "\n";
+            return 2;
+        }
+    }
     if (jtag.bscan) {  // the wrapper needs the top module's ports and its clocks
         std::set<std::string> clocks;
         for (auto& [c, info] : dft.domains)

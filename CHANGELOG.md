@@ -14,6 +14,10 @@ Spec references are IEEE 1800-2023 clauses.
   and the BSDL file; `mdft -bsdl` checks a BSDL file (rules BSD001..009) and
   writes its device tests as SVF and a self-checking testbench
   (`docs/JTAG.md`).
+- `mdft -lbist`: logic BIST for a scan-inserted design (PRPG on a primitive
+  polynomial, phase shifter, space compactor, MISR, controller and wrapper),
+  the golden signature by simulation (`-lbist_sign`), a check for X sources,
+  and ICL / PDL to run it over IJTAG.
 - `mdft -icl`: IEEE 1687 IJTAG. Reads ICL, writes the scan network as RTL
   (optionally behind a TAP), and retargets PDL (`iWrite`, `iRead`, `iApply`,
   `iCall`, ...) through SIBs and scan muxes to SVF and a testbench.

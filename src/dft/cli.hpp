@@ -12,13 +12,16 @@
 #include <thread>
 
 #include "bscan.hpp"
+#include "lbist.hpp"
 #include "pdl.hpp"
 
 namespace dft {
 
 struct Cli {
-    bool bscan = false, werror = false, quiet = false, ijtagTap = false;
+    bool bscan = false, lbist = false, werror = false, quiet = false, ijtagTap = false;
     BscanOpts bo;
+    LbistOpts lo;
+    std::string lbistDump, self;
     std::string bsdlFile, svf, tb, iclTop, iclScanOut, iclRtl, iproc;
     std::vector<std::string> icl, pdl;
     std::vector<char*> rest;
@@ -40,6 +43,17 @@ struct Cli {
               "  -bscan_intest          add INTEST\n"
               "  -bscan_user NAME       an instruction that selects an external register (IJTAG host)\n"
               "  -bsdl FILE             check a BSDL file (rules BSD001..BSD009)\n"
+              "logic BIST:\n"
+              "  -lbist                 wrap a scan-inserted design with a PRPG, a MISR and a controller\n"
+              "  -scandef FILE          the scan chains (JSON from mdft -insert_scan -scandef)\n"
+              "  -lbist_out DIR         where <top>_lbist.sv, its testbench, ICL and PDL go (default .)\n"
+              "  -lbist_patterns N      patterns to apply (default 1024)\n"
+              "  -lbist_prpg N          PRPG width, 8..64 (default 32, more for many chains)\n"
+              "  -lbist_misr N          MISR width, 8..64 (default 32)\n"
+              "  -lbist_seed HEX        PRPG seed          -lbist_clock PORT  the BIST clock\n"
+              "  -lbist_sign            simulate with msim and write the golden signature into the RTL\n"
+              "  -lbist_msim PATH       the msim to run (default: next to mdft, then PATH)\n"
+              "  -lbist_dump FILE       the pattern loads, one line per chain, scan-in first\n"
               "IJTAG (IEEE 1687):\n"
               "  -icl FILE              read ICL (repeatable)     -icl_top M   the top ICL module\n"
               "  -icl_scan_out PORT     the ScanOutPort to use when the top module has several\n"
@@ -56,6 +70,7 @@ struct Cli {
     int parse(int& argc, char**& argv) {
         bool mine = false;
         rest.push_back(argv[0]);
+        self = argv[0];
         try {
             for (int i = 1; i < argc; i++) {
                 std::string a = argv[i];
@@ -83,7 +98,18 @@ struct Cli {
                     if (!g.oe.empty() && g.oe[0] == '!') g.oeLow = true, g.oe.erase(0, 1);
                     if (f.size() == 3) g.in = f[2];
                     bo.tri.push_back(g);
-                } else if (a == "-bsdl") bsdlFile = next(), mine = true;
+                } else if (a == "-lbist") lbist = mine = true;
+                else if (a == "-scandef") lo.scandef = next();
+                else if (a == "-lbist_out") lo.outDir = next();
+                else if (a == "-lbist_patterns") lo.patterns = std::stoi(next());
+                else if (a == "-lbist_prpg") lo.prpg = std::stoi(next());
+                else if (a == "-lbist_misr") lo.misr = std::stoi(next());
+                else if (a == "-lbist_seed") lo.seed = std::stoull(next(), nullptr, 16);
+                else if (a == "-lbist_clock") lo.clock = next();
+                else if (a == "-lbist_sign") lo.sign = true;
+                else if (a == "-lbist_msim") lo.msim = next();
+                else if (a == "-lbist_dump") lbistDump = next();
+                else if (a == "-bsdl") bsdlFile = next(), mine = true;
                 else if (a == "-icl") icl.push_back(next()), mine = true;
                 else if (a == "-icl_top") iclTop = next();
                 else if (a == "-icl_scan_out") iclScanOut = next();
@@ -109,6 +135,8 @@ struct Cli {
                 if (!svf.empty() || !tb.empty()) throw Error("-svf and -tb need -bscan, -bsdl or -pdl");
                 return -1;
             }
+            if (lbist && bscan) throw Error("-lbist and -bscan are separate runs");
+            if (lbist && lo.scandef.empty()) throw Error("-lbist needs -scandef FILE");
             if (!bsdlFile.empty()) return runBsdl(bsdlFile, true);
             if (!icl.empty()) return runIjtag();
         } catch (const Error& e) {
@@ -199,6 +227,82 @@ struct Cli {
                 std::cout << "mdft: boundary scan for " << top << ": " << r.cells << " cells, " << r.irLen
                           << "-bit instruction register\n  " << r.rtlPath << "\n  " << r.bsdlPath << "\n";
             if (!svf.empty() || !tb.empty()) return runBsdl(r.bsdlPath, false);
+            return 0;
+        } catch (const Error& e) {
+            std::cerr << "mdft: " << e.what() << "\n";
+            return 2;
+        }
+    }
+
+    // Runs `cmd`, returns its output.
+    static std::string capture(const std::string& cmd, int& rc) {
+        std::string out;
+        FILE* f = popen((cmd + " 2>&1").c_str(), "r");
+        if (!f) throw Error("cannot run " + cmd);
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+        rc = pclose(f);
+        return out;
+    }
+    static std::string quote(const std::string& a) {
+        std::string q = "'";
+        for (char c : a) q += c == '\'' ? std::string("'\\''") : std::string(1, c);
+        return q + "'";
+    }
+
+    // After the front end: wrap the scan-inserted top module with logic BIST.
+    int runLbist(std::vector<Port> ports, const std::string& top) {
+        try {
+            std::string zero = std::to_string(lo.misr) + "'h0";
+            LbistResult r = insertLbist(ports, top, lo, zero);
+            const LbistPlan& p = r.plan;
+            if (!quiet) {
+                std::cout << "mdft: logic BIST for " << top << ": " << p.n << (p.n == 1 ? " chain" : " chains") << ", longest "
+                          << p.len << ", " << p.patterns << " patterns, " << p.cycles() << " clock cycles\n"
+                          << "  PRPG " << p.pw << " bits, MISR " << p.mw << " bits, BIST clock " << p.clock << "\n";
+                for (const std::string& u : p.sd.unscanned)
+                    std::cout << "  warning: " << u << " is not scanned; if it reaches a scan cell the signature is unknown\n";
+            }
+            if (!lbistDump.empty()) {
+                std::ostringstream os;
+                auto loads = p.loads(p.patterns);
+                for (size_t k = 0; k < loads.size(); k++)
+                    for (int c = 0; c < p.n; c++) os << k << " " << p.sd.chains[c].name << " " << loads[k][c] << "\n";
+                writeFile(lbistDump, os.str());
+            }
+            if (lo.sign) {
+                std::string msim = lo.msim;
+                if (msim.empty()) {
+                    size_t slash = self.find_last_of('/');
+                    std::string beside = slash == std::string::npos ? "" : self.substr(0, slash + 1) + "msim";
+                    msim = !beside.empty() && std::ifstream(beside).good() ? beside : "msim";
+                }
+                std::string cmd = quote(msim);
+                for (size_t i = 1; i < rest.size() && rest[i]; i++) {
+                    std::string a = rest[i];
+                    if (a == "-Werror" || a == "-quiet" || a == "-q") continue;
+                    if (a == "-top" || a == "--top" || a == "-disable") { i++; continue; }
+                    cmd += " " + quote(a);
+                }
+                cmd += " " + quote(r.rtlPath) + " " + quote(r.tbPath) + " -top " + r.wrap + "_tb";
+                int rc = 0;
+                std::string out = capture(cmd, rc);
+                size_t at = out.find("LBIST signature = ");
+                if (at == std::string::npos) {
+                    std::cerr << "mdft: -lbist_sign: the simulation printed no signature\n  " << cmd << "\n" << out;
+                    return 1;
+                }
+                std::string sig = out.substr(at + 18, out.find('\n', at) - at - 18);
+                if (sig.find_first_of("xXzZ") != std::string::npos) {
+                    std::cerr << "mdft: the signature is unknown (" << sig << "): an X source reaches the scan chains\n"
+                              << "  (an unscanned flop, a memory, an undriven input, or a chain shorter than the JSON says)\n";
+                    return 1;
+                }
+                r = insertLbist(ports, top, lo, std::to_string(lo.misr) + "'h" + sig);
+                if (!quiet) std::cout << "  golden signature " << sig << " (simulated with " << msim << ")\n";
+            } else if (!quiet) std::cout << "  no golden signature yet: run with -lbist_sign, or simulate " << r.tbPath << "\n";
+            if (!quiet) std::cout << "  " << r.rtlPath << "\n  " << r.tbPath << "\n  " << r.iclPath << "\n  " << r.pdlPath << "\n";
             return 0;
         } catch (const Error& e) {
             std::cerr << "mdft: " << e.what() << "\n";

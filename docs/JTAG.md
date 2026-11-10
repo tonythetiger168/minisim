@@ -141,3 +141,48 @@ A network of 3000 SIBs with 3000 32-bit registers (99,000 scan bits) and
 1001 `iApply` retargets to 99 million scan bits of SVF in about 5 s on one
 core. These flows are single passes over small inputs; `-threads` is accepted
 and has nothing to parallelize here.
+
+## Logic BIST: `mdft -lbist`
+
+```sh
+mdft -lbist design_scan.v cells.v -top chip -scandef chains.json -lbist_sign
+     [-lbist_patterns 1024] [-lbist_prpg 32] [-lbist_misr 32] [-lbist_seed HEX]
+     [-lbist_clock PORT] [-lbist_out DIR] [-lbist_dump loads.txt]
+```
+
+takes a scan-inserted design and its chain description (the JSON that
+`mdft -insert_scan -scandef` writes: scan enable, clocks, resets, and each
+chain's `scan_in`, `scan_out` and `length`) and writes a STUMPS logic BIST:
+
+- `chip_lbist_ctrl`: a PRPG (an LFSR on a primitive polynomial), a phase
+  shifter (one XOR of three PRPG bits per chain, a distinct set each), a space
+  compactor and a MISR, and the controller. It fills the chains, then for each
+  pattern captures for one clock and shifts the response into the MISR while
+  the next pattern shifts in: `(patterns + 1) * longest chain + patterns + 1`
+  clocks in all.
+- `chip_lbist`: the design with the controller around it, and five more
+  ports: `lbist_start` (a level: hold it until done), `lbist_rst_n`,
+  `lbist_busy`, `lbist_done`, `lbist_pass`, `lbist_signature`. While
+  `lbist_start` is high every clock of the scan description is the BIST
+  clock, the resets are held off, the scan enable and scan inputs come from
+  the controller, and every other input is held at 0. With `lbist_start` low
+  the design is untouched, so tester scan still works.
+- `chip_lbist_tb.sv`: runs the BIST once and prints the signature.
+- `chip_lbist.icl` and `chip_lbist.pdl`: IJTAG access (a register with start,
+  done, pass and the signature, and an `iProc run`), for `mdft -icl`.
+
+`-lbist_sign` simulates the wrapper with `msim` and writes the signature into
+the RTL as the `GOLDEN` parameter. A signature with unknown bits is an error:
+an X source (an unscanned flop, a memory, an undriven input) reaches a scan
+cell, and it has to be scanned or blocked first.
+
+The polynomials are found at run time, not tabulated: a candidate with the
+fewest terms is kept when x has order 2^n - 1 modulo it, which makes it
+primitive (2^n - 1 is factored with Pollard's rho). Any width from 8 to 64
+works; the same options always give the same hardware.
+
+`-lbist_dump` writes what each pattern loads into each chain (`pattern chain
+bits`, scan-in cell first), the input a fault simulator needs to grade the
+BIST. Fault coverage and test points are not reported yet: they wait for the
+fault simulator of the ATPG work, which this will call instead of bringing a
+second one. Primary outputs are not observed during BIST.
