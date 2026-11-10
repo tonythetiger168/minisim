@@ -24,6 +24,15 @@ states entered and the transitions made, out of those its next-state logic
 can make. Transitions into a state the register's reset branch assigns are
 marked; -fsm-reset-filter leaves them out of the score.
 
+It also holds functional coverage: the bins of every covergroup type (the
+instances joined by bin name, IEEE 1800-2023 19.11.3) and the statistics of
+every assertion (evaluations, passes, failures). Merging adds the counts by
+name. A covergroup item's coverage is its bins hit at_least times over its
+bins; a type's coverage weighs its items, and the total weighs the types
+(19.11, 19.9). ``-min-func`` gates the total, ``-min-assert`` the share of
+assert / assume directives that passed at least once and never failed plus
+cover directives that were hit.
+
 Exit status: 0, or 1 when a -min-* threshold is not met, 2 on bad usage.
 """
 
@@ -76,6 +85,11 @@ def load_into(db, path):
         r, f = int(rise or "0", 16), int(fall or "0", 16)
         old = toggles.get(name)
         toggles[name] = (max(w, old[0]), r | old[1], f | old[2]) if old else (w, r, f)
+    if d.get("covergroups"):
+        merge_cgs(db["cgs"], {g[0]: [g[1], g[2], {i[0]: [i[1], i[2], i[3], i[4], i[5], dict(map(tuple, i[6]))]
+                                                  for i in g[3]}] for g in d["covergroups"]})
+    if d.get("assertions"):
+        merge_asserts(db["asserts"], {a[0]: a[1:] for a in d["assertions"]})
     return db
 
 
@@ -110,8 +124,35 @@ def add_fsm(fsms, key, m):
         old["trans"][t][0] += old["extra"].pop(t)
 
 
+def merge_cgs(out, cgs):
+    """Covergroup types by name: {type: [weight, goal, {item: [kind, weight,
+    goal, at_least, bins in total, {bin: hits}]}]}. Hits add; a cross lists
+    only the bins that were hit, so its total is kept beside them."""
+    for name, (w, goal, items) in cgs.items():
+        old = out.get(name)
+        if old is None:
+            out[name] = [w, goal, {k: v[:5] + [dict(v[5])] for k, v in items.items()}]
+            continue
+        for iname, it in items.items():
+            o = old[2].get(iname)
+            if o is None:
+                old[2][iname] = it[:5] + [dict(it[5])]
+                continue
+            o[3] = max(o[3], it[3])
+            bins, get = o[5], o[5].get
+            for b, h in it[5].items():
+                bins[b] = get(b, 0) + h
+            o[4] = max(o[4], it[4], len(bins))
+
+
+def merge_asserts(out, asserts):
+    for name, a in asserts.items():
+        old = out.get(name)
+        out[name] = [a[0], old[1] + a[1], old[2] + a[2], old[3] + a[3]] if old else list(a)
+
+
 def empty():
-    return {"lines": {}, "branches": {}, "toggles": {}, "conds": {}, "fsms": {}, "tests": []}
+    return {"lines": {}, "branches": {}, "toggles": {}, "conds": {}, "fsms": {}, "tests": [], "cgs": {}, "asserts": {}}
 
 
 def load(path):
@@ -127,6 +168,8 @@ def merge(dbs):
 
 def merge_into(out, db):
     out["tests"] += db["tests"]
+    merge_cgs(out["cgs"], db["cgs"])
+    merge_asserts(out["asserts"], db["asserts"])
     lines, branches, toggles = out["lines"], out["branches"], out["toggles"]
     for k, (op, terms, hits) in db["conds"].items():
         add_cond(out["conds"], k, op, terms, hits)
@@ -213,7 +256,12 @@ def save(db, path):
                                       "states": [[v, n, h] for v, (n, h) in sorted(m["states"].items())],
                                       "trans": [[a, b, h, r] for (a, b), (h, r) in sorted(m["trans"].items())],
                                       "extra": [[a, b, h] for (a, b), h in sorted(m["extra"].items())]}
-                                     for (mod, inst, name), m in sorted(db["fsms"].items())) + "\n]\n}\n")
+                                     for (mod, inst, name), m in sorted(db["fsms"].items())) + "\n],\n")
+        f.write('"covergroups": [\n' + rows(
+            [name, w, goal, [[i, v[0], v[1], v[2], v[3], v[4],
+                              [[b, h] for b, h in v[5].items() if h or v[0] != "cross"]] for i, v in items.items()]]
+            for name, (w, goal, items) in sorted(db["cgs"].items())) + "\n],\n")
+        f.write('"assertions": [\n' + rows([name] + list(a) for name, a in sorted(db["asserts"].items())) + "\n]\n}\n")
 
 
 def by_file(db):
@@ -333,6 +381,49 @@ def detail_text(db, exclude, reset_filter, uncovered_only):
         for (a, b), h in sorted(m["extra"].items()):
             out.append(f"    {nm(a) + ' -> ' + nm(b):<26} {h}  (not in the next-state logic)")
     return "\n".join(out)
+def item_count(item):
+    """(bins covered, bins) of a covergroup item [kind, weight, goal, at_least, total, {bin: hits}]."""
+    al = max(1, item[3])
+    return sum(1 for h in item[5].values() if h >= al), item[4]
+
+
+def cg_pct(items):
+    """A covergroup type's coverage: its items by weight; an item without bins is left out (19.11)."""
+    num = den = 0.0
+    for it in items.values():
+        c, t = item_count(it)
+        if t:
+            num += it[1] * c / t
+            den += it[1]
+    return 100.0 * num / den if den else 100.0
+
+
+def summarize_func(db, exclude=None):
+    """Functional coverage: ({type: (percent, bins covered, bins)}, total percent
+    over the types by weight), and the assertions: (directives that count as
+    covered, directives, [failed], [never passed])."""
+    rx = re.compile(exclude) if exclude else None
+    per, num, den = {}, 0.0, 0.0
+    for name, (w, _goal, items) in db["cgs"].items():
+        if rx and rx.search(name):
+            continue
+        counts = [item_count(it) for it in items.values()]
+        p = cg_pct(items)
+        per[name] = (p, sum(c for c, _ in counts), sum(t for _, t in counts))
+        num += w * p
+        den += w
+    failed, idle, ok, n = [], [], 0, 0
+    for name, (kind, _evals, passes, fails) in db["asserts"].items():
+        if rx and rx.search(name):
+            continue
+        n += 1
+        if fails and kind != "cover":
+            failed.append(name)
+        elif not passes:
+            idle.append(name)
+        else:
+            ok += 1
+    return per, (num / den if den else 100.0), (ok, n, sorted(failed), sorted(idle))
 
 
 def write_lcov(db, path, exclude, files=None):
@@ -447,7 +538,42 @@ def write_html(db, outdir, exclude, files=None, reset_filter=False):
                 f"<h2>FSMs</h2>{''.join(fsms) or '<p>None found.</p>'}"
                 f"<h2>Conditions</h2>{''.join(conds) or '<p>None.</p>'}"
                 f"<h2>Signals not fully toggled</h2><table><tr><th>Signal</th><th>Bits toggled both ways</th>"
-                f"<th>Missing bits</th></tr>{''.join(togs)}</table></body></html>")
+                f"<th>Missing bits</th></tr>{''.join(togs)}</table>{func_html(db, exclude)}</body></html>")
+
+
+def func_html(db, exclude):
+    """Covergroups (items with their uncovered bins) and assertions, for index.html."""
+    per, total, (ok, n, failed, idle) = summarize_func(db, exclude)
+    if not per and not n:
+        return ""
+    esc = html.escape
+    rows = []
+    for name in sorted(per):
+        p, c, t = per[name]
+        rows.append(f"<tr class='{'hit' if c == t else 'part'}'><td><b>{esc(name)}</b></td><td>{p:.1f}% ({c}/{t})</td><td></td></tr>")
+        for iname, it in db["cgs"][name][2].items():
+            ic, itot = item_count(it)
+            al = max(1, it[3])
+            holes = [b for b, h in it[5].items() if h < al]
+            miss = ", ".join(holes[:24]) + (" ..." if len(holes) > 24 else "")
+            if it[0] == "cross" and ic < itot and not holes:
+                miss = f"{itot - ic} cross bins never hit"
+            rows.append(f"<tr class='{'hit' if ic == itot else 'miss' if not ic else 'part'}'><td>&nbsp;&nbsp;{esc(iname)}"
+                        f" ({it[0]})</td><td>{pct(ic, itot):.1f}% ({ic}/{itot})</td><td>{esc(miss)}</td></tr>")
+    arows = []
+    for name, (kind, evals, passes, fails) in sorted(db["asserts"].items()):
+        if name in failed or name in idle:
+            state = "failed" if name in failed else "never passed" if kind != "cover" else "never hit"
+            arows.append(f"<tr class='{'miss' if name in failed else 'part'}'><td>{esc(name)}</td><td>{kind}</td>"
+                         f"<td>{state}</td><td>{evals}</td><td>{passes}</td><td>{fails}</td></tr>")
+    out = ""
+    if per:
+        out += (f"<h2>Functional coverage: {total:.1f}%</h2><table><tr><th>Covergroup / item</th><th>Coverage</th>"
+                f"<th>Bins not covered</th></tr>{''.join(rows)}</table>")
+    if n:
+        out += (f"<h2>Assertions: {ok}/{n} passed or hit</h2><table><tr><th>Assertion</th><th>Kind</th><th>State</th>"
+                f"<th>Evaluations</th><th>Passes</th><th>Failures</th></tr>{''.join(arows)}</table>")
+    return out
 
 
 def main(argv=None):
@@ -468,7 +594,7 @@ def main(argv=None):
     r.add_argument("-uncovered", action="store_true", help="as -detail, only what is not covered")
     r.add_argument("-fsm-reset-filter", action="store_true",
                    help="leave transitions into reset states out of FSM coverage")
-    for k in ("line", "branch", "toggle", "cond", "fsm-state", "fsm-trans"):
+    for k in ("line", "branch", "toggle", "cond", "fsm-state", "fsm-trans", "func", "assert"):
         r.add_argument(f"-min-{k}", type=float, metavar="PCT", help=f"exit 1 if {k} coverage is below PCT")
     a = ap.parse_args(argv)
 
@@ -495,6 +621,17 @@ def main(argv=None):
         text = detail_text(db, a.exclude, a.fsm_reset_filter, a.uncovered)
         if text:
             print(text)
+    cgs, ftotal, (aok, an, afailed, aidle) = summarize_func(db, a.exclude)
+    if cgs:
+        gw = max(len(g) for g in cgs)
+        for g, (p, c, t) in sorted(cgs.items()):
+            print(f"{g:<{gw}}  {p:6.1f}% {c:>4}/{t:<4} bins")
+        print(f"Functional: {ftotal:.1f}% ({len(cgs)} covergroup type(s))")
+    if an:
+        print(f"Assertions: {pct(aok, an):.1f}% ({aok}/{an} passed or hit"
+              + (f", {len(afailed)} failed" if afailed else "") + (f", {len(aidle)} never passed or hit" if aidle else "") + ")")
+        for name in afailed:
+            print(f"  failed: {name}")
     if a.html:
         write_html(db, a.html, a.exclude, files, a.fsm_reset_filter)
         print(f"HTML: {os.path.join(a.html, 'index.html')}")
@@ -503,7 +640,8 @@ def main(argv=None):
         print(f"LCOV: {a.lcov}")
     rc = 0
     for k, (hit, tot) in {"line": (lh, lt), "branch": (bh, bt), "toggle": (th, ta), "cond": (ch, ct),
-                          "fsm-state": (sh, st), "fsm-trans": (xh, xt)}.items():
+                          "fsm-state": (sh, st), "fsm-trans": (xh, xt),
+                          "func": (ftotal, 100.0), "assert": (aok, an)}.items():
         lim = getattr(a, "min_" + k.replace("-", "_"))
         if lim is not None and pct(hit, tot) < lim:
             print(f"mcov: {k} coverage {pct(hit, tot):.1f}% is below {lim}%")

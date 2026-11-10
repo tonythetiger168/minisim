@@ -248,6 +248,11 @@ FSM tb.u.state  (module ctrl, tb.sv:8)  states 3/4, transitions 3/6
     RUN -> FAIL                Not covered
 ```
 
+The database also holds functional coverage: the bins of every covergroup
+type (19) and the evaluations, passes and failures of every assertion (16).
+`mcov report` prints both, lists uncovered bins and failed or idle
+assertions in the HTML, and gates them with `-min-func` and `-min-assert`.
+
 ### Protected IP: `msimprotect` and `msim -keyfile`
 
 minisim reads and writes IEEE 1735-2023 version 3 envelopes, the format

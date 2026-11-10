@@ -155,6 +155,7 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         d.inClass = true;
     }
     d.name = t.getParentScope()->asSymbol().getHierarchicalPath() + "." + std::string(t.name);
+    d.prot = hideLocIf() && hideLocIf()(t.location);   // the coverage right (1735)
     auto hidden = [&](const Symbol& s, const Type& ty) {
         int w = storeW(ty);
         if (w <= 0) unsupported("a covergroup argument of this type");
