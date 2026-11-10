@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mformal` is faster on larger designs: PDR lifts each state to the bits
+  that matter, and a short induction with a small PDR budget runs before the
+  deep search (8-way arbiter liveness 24 s to 4 s, a failure 300 cycles deep
+  6.6 s to 1.7 s, one thread). It solves through `src/sat.hpp` and takes its
+  threads from `src/parallel.hpp`. Benchmark designs are in `bench/formal`.
 - `memu`, emulation and FPGA prototyping: puts a gate-level netlist
   (structural Verilog over a Liberty library) on a board of FPGAs. Clock
   conversion onto one free-running clock (strobes for clean clocks, edge

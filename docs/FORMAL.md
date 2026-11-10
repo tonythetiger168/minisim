@@ -88,6 +88,10 @@ procedures, `expect`.
    * PDR (IC3) takes what is left. It builds the invariant the proof needs,
      clause by clause, or finds a failure deeper than `-depth` (the trace
      then comes from a bounded check that deep). `-no-pdr` turns it off.
+   The first pass is short (induction over at most 10 cycles, a small PDR
+   budget), because PDR often proves at once what induction needs many
+   cycles for; what is still open gets induction up to `-depth` and PDR's
+   whole budget.
    Liveness is reduced to safety first: a free input saves the state once,
    and the property fails when that state comes back with the tracked
    attempt pending all the way round.
