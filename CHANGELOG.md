@@ -125,6 +125,9 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop` is faster: an `if` evaluates its condition once, and clocked
+  blocks with merged branches run in parallel again. Ibex with `-xprop`:
+  42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
 - `-xprop`: an assignment to an array element chosen at run time
   (`if (we) mem[addr] <= d;`) is merged with the element's present value
   instead of blocking the merge or giving `x`.
