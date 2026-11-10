@@ -101,7 +101,7 @@ capacitance to ground, `THICKNESS` and `HEIGHT` for coupling.
 | `-no_name_map` | full names instead of a `*NAME_MAP` |
 | `-report FILE` | per-net table |
 | `-date TEXT` | fixed `*DATE`, for files that compare equal |
-| `-threads N` | worker threads (default: all logical cores) |
+| `-threads N`, `-j N` | worker threads (default: all logical cores, `$MINISIM_THREADS` overrides) |
 | `-Werror` | exit 1 on an open or a short |
 
 ## Accuracy

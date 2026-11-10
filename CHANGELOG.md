@@ -118,6 +118,9 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- `-xprop` is faster: an `if` evaluates its condition once, and clocked
+  blocks with merged branches run in parallel again. Ibex with `-xprop`:
+  42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
 - `-xprop`: an assignment to an array element chosen at run time
   (`if (we) mem[addr] <= d;`) is merged with the element's present value
   instead of blocking the merge or giving `x`.
@@ -134,6 +137,17 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- Condition and FSM coverage (as VCS `-cm cond+fsm`): `msim -cov` (or
+  `-cm <metrics>`) also records, for every `&&` / `||` / `?:` condition, the
+  vectors in which each term decides the result, and, for every state
+  register it extracts (two-process, one-process and `if (state == S)`
+  styles; enum, parameter and literal states), the states entered and the
+  transitions made out of those the next-state logic allows. Works in the
+  interpreter and with `-compile`, with any `-threads`, with the same
+  database. `mcov report` adds `Condition:` and `FSM:` lines, `-detail`,
+  `-uncovered`, `-fsm-reset-filter`, `-min-cond`, `-min-fsm-state`,
+  `-min-fsm-trans`, and FSM and condition sections in the HTML report;
+  `mcov merge` merges both.
 - `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
   through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
   gates) or a cell map, checked for a controllable clock and asynchronous
