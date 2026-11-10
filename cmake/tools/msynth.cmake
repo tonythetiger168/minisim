@@ -1,6 +1,13 @@
 # msynth: logic synthesis with a dc_shell-style Tcl shell (docs/SYNTH.md).
 #   msynth -f run.tcl
-# Included from the top CMakeLists.txt inside the slang block.
+# Needs the slang front end; included from the top CMakeLists.txt, once
+# (a second include, for instance from a glob of this directory, does nothing).
+include_guard(GLOBAL)
+if(NOT MINISIM_WITH_SLANG)
+  return()
+endif()
+include(GNUInstallDirs)
+find_package(Python3 COMPONENTS Interpreter)
 
 # The built-in generic cell library is compiled in from lib/msynth_generic.lib.
 file(READ ${CMAKE_SOURCE_DIR}/lib/msynth_generic.lib MSYNTH_GENERIC_LIB)
