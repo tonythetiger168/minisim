@@ -46,6 +46,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
+| `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
+| `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -450,6 +452,26 @@ mdft: 5 flops in 3 clock domains
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
 boundaries.
+
+### Parasitic extraction: `mrcx`
+
+`mrcx` reads a routed DEF and its LEF and writes every net's resistance and
+capacitance, coupling included, as SPEF for timing and power analysis:
+
+```sh
+mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef
+mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o slow.spef
+```
+
+```
+mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5086 coupling capacitors
+mrcx: capacitance 2238 fF to ground, 288.8 fF between nets (sky130 stack, 25 C)
+```
+
+It runs on every core (`-threads N`), writes the same file for any thread
+count, and reports open and shorted nets. On the OpenROAD `gcd` test design
+its total net capacitance is within 1% of OpenRCX's. See
+[`docs/RCX.md`](docs/RCX.md).
 
 ### Virtual prototypes: `-mvp`
 
