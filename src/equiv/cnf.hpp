@@ -4,23 +4,23 @@
 #include <vector>
 
 #include "aig.hpp"
-#include "sat.hpp"
+#include "../sat.hpp"
 
 namespace equiv {
 
 struct Cnf {
     const Aig& g;
-    Sat sat;
-    std::unordered_map<uint32_t, uint32_t> var;  // AIG node -> solver variable
+    sat::Solver sat;
+    std::unordered_map<uint32_t, int> var;  // AIG node -> solver variable
     std::vector<uint32_t> stack;
 
     explicit Cnf(const Aig& g) : g(g) {
-        uint32_t f = sat.newVar();  // node 0: constant false
+        int f = sat.newVar();  // node 0: constant false
         var[0] = f;
-        sat.addClause(Sat::mk(f, true));
+        sat.addClause({-f});
     }
 
-    Sat::L lit(Lit l) {
+    int lit(Lit l) {
         uint32_t root = nodeOf(l);
         if (!var.count(root)) {
             stack.assign(1, root);
@@ -35,28 +35,27 @@ struct Cnf {
                     if (ib == var.end()) stack.push_back(nodeOf(nd.b));
                     continue;
                 }
-                Sat::L a = Sat::mk(ia->second, isNeg(nd.a)), b = Sat::mk(ib->second, isNeg(nd.b));
-                uint32_t v = sat.newVar();
+                int a = isNeg(nd.a) ? -ia->second : ia->second, b = isNeg(nd.b) ? -ib->second : ib->second;
+                int v = sat.newVar();
                 var[n] = v;
-                Sat::L o = Sat::mk(v);
-                sat.addClause(Sat::no(o), a);
-                sat.addClause(Sat::no(o), b);
-                sat.addClause(o, Sat::no(a), Sat::no(b));
+                sat.addClause({-v, a});
+                sat.addClause({-v, b});
+                sat.addClause({v, -a, -b});
                 stack.pop_back();
             }
         }
-        return Sat::mk(var[root], isNeg(l));
+        return isNeg(l) ? -var[root] : var[root];
     }
 
     // Is `l` satisfiable? 1 yes (model available), 0 no, -1 budget exhausted.
     int solve(Lit l, uint64_t budget) {
         if (l == kFalse) return 0;
-        Sat::L s = lit(l);
-        return int(sat.solve({s}, budget));
+        int s = lit(l);
+        return int(sat.solve({s}, budget ? int64_t(budget) : -1));
     }
-    bool model(uint32_t node) const {
+    bool model(uint32_t node) {
         auto it = var.find(node);
-        return it != var.end() && sat.modelValue(it->second);
+        return it != var.end() && sat.value(it->second);
     }
 };
 

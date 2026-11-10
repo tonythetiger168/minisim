@@ -81,6 +81,14 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `lib/mini45`: a generic 45 nm-class standard cell library for the tool
+  line, written from scratch (not a foundry library): 88 cells (inverters,
+  buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,
+  flops with reset, set, enable and scan, latches, clock gates, tristate, tie
+  and filler cells, several drive strengths) as Liberty at three corners
+  (`mini45_tt.lib`, `_ss`, `_ff`: NLDM 7x7 delay tables, constraints,
+  internal power, state-dependent leakage, wire loads), Verilog models
+  (`mini45.v`), and technology and cell LEF. See `docs/MINI45.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
@@ -116,6 +124,17 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- Condition and FSM coverage (as VCS `-cm cond+fsm`): `msim -cov` (or
+  `-cm <metrics>`) also records, for every `&&` / `||` / `?:` condition, the
+  vectors in which each term decides the result, and, for every state
+  register it extracts (two-process, one-process and `if (state == S)`
+  styles; enum, parameter and literal states), the states entered and the
+  transitions made out of those the next-state logic allows. Works in the
+  interpreter and with `-compile`, with any `-threads`, with the same
+  database. `mcov report` adds `Condition:` and `FSM:` lines, `-detail`,
+  `-uncovered`, `-fsm-reset-filter`, `-min-cond`, `-min-fsm-state`,
+  `-min-fsm-trans`, and FSM and condition sections in the HTML report;
+  `mcov merge` merges both.
 - `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
   through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
   gates) or a cell map, checked for a controllable clock and asynchronous
@@ -193,8 +212,32 @@ Spec references are IEEE 1800-2023 clauses.
 - A run-time error (null object access, a crash) names the statement that
   was running; `MSIM_CALLTRACE=1` prints every method and automatic
   subroutine call.
+- `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
+  the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
+  `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed
+  model (clocks, generated clocks, I/O delays, clock groups, exceptions,
+  uncertainty, latency, case analysis) and keeps every command with its file
+  and line. Object queries (`get_ports`, `get_pins`, `get_cells`, `get_nets`,
+  `get_clocks`, `all_inputs`, `all_registers`, `-hierarchical`, `-regexp`,
+  `-filter`, `-of_objects`) resolve through `sdc::Design`, which a tool
+  implements for its own netlist; a host can add its own commands.
+- `src/tcl.hpp`: the one Tcl interpreter of the tool line (`tcl::Interp`),
+  split out of the SDC reader. A tool adds its own commands (`addCommand`),
+  runs scripts (`load`, `parse`) or a prompt (`shell`), and gets every error
+  as a diagnostic with file and line instead of a stop. `sdc::Reader` is now
+  an `Interp` with the SDC commands added.
+- `msdc`: timing constraint checks. Reads the design (same front end as
+  `msim`) and its SDC file and reports what is wrong or missing: 32 rules
+  from syntax (SDC001) through clocks, I/O delays and exceptions to paths
+  between clocks with no declared relationship (SDC040). Multithreaded
+  (`-threads N`, same report for any N), `-json`, `-Werror`, `-stats`. See
+  `docs/CONSTRAINTS.md`.
+- SDC reader: object lookups use sorted name indexes and `-filter` is parsed
+  once, so large designs with thousands of queries read in seconds.
 
 ### Fixed
+- `mlint`, `mdft`: a net connected to thousands of instances no longer makes
+  the clock-domain union-find quadratic (path compression).
 - A concurrent assertion read the current value, not the sampled one, of a
   bit select or indexed part select with a variable index (`r[k]`,
   `r[k -: 2]`, 16.5.1).

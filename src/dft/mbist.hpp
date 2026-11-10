@@ -1,5 +1,5 @@
 #pragma once
-// mbist.hpp - memory built-in self-test generation: mdft -mbist.
+// dft/mbist.hpp - memory built-in self-test generation: mdft -mbist.
 //
 // For one synchronous single-port RAM (en, we, addr, wdata, rdata) this
 // writes synthesizable Verilog:
@@ -22,7 +22,6 @@
 // behavioural RAM of the self-checking testbench (-tb), so the generated
 // hardware is checked against the simulator's predictions.
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
@@ -31,8 +30,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
+
+#include "parallel.hpp"
 
 namespace mbist {
 
@@ -264,22 +264,12 @@ inline Coverage coverage(const March& m, const Geometry& real, int threads) {
     // Each fault is independent: split the list over the threads. The result
     // is a flag per fault, so it does not depend on how the list was split.
     std::vector<char> hit(faults.size(), 0);
-    int nt = std::max(1, std::min<int>(threads, int(faults.size() / 256) + 1));
-    std::atomic<size_t> nextChunk{0};
     const size_t chunk = 256;
-    auto work = [&]() {
-        for (;;) {
-            size_t at = nextChunk.fetch_add(chunk);
-            if (at >= faults.size()) return;
-            size_t end = std::min(faults.size(), at + chunk);
-            for (size_t i = at; i < end; i++)
-                hit[i] = simulate(m, g, faults[i], false).detected && simulate(m, g, faults[i], true).detected;
-        }
-    };
-    std::vector<std::thread> pool;
-    for (int t = 1; t < nt; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
+    par::parallelFor((faults.size() + chunk - 1) / chunk, unsigned(std::max(1, threads)), [&](size_t c) {
+        size_t end = std::min(faults.size(), (c + 1) * chunk);
+        for (size_t i = c * chunk; i < end; i++)
+            hit[i] = simulate(m, g, faults[i], false).detected && simulate(m, g, faults[i], true).detected;
+    });
 
     Coverage cov;
     cov.geom = g;
@@ -685,7 +675,7 @@ inline int main(const std::vector<std::string>& args) {
             if (name == want) m = parseMarch(text);
         if (m.empty()) throw Error("unknown algorithm '" + o.algo + "' (see mdft -mbist -list)");
     }
-    if (o.threads <= 0) o.threads = std::max(1u, std::thread::hardware_concurrency());
+    if (o.threads <= 0) o.threads = int(par::defaultThreads());
 
     auto put = [&](const std::string& file, const std::string& text) {
         std::ofstream f(file);
