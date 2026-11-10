@@ -162,6 +162,28 @@ need(log, r"0 open, 0 shorts, 0 spacing violations")
 assert open(out("straps4.def")).read().count("NEW m4 400 + SHAPE STRIPE") + open(out("straps4.def")).read().count("ROUTED m4 400 + SHAPE STRIPE") == 4
 
 
+# 6c. The project's own cell library, lib/mini45: pins smaller than the LEF's
+# via pad get a via made for them (written to the DEF's VIAS), tracks follow
+# OFFSET 0, and short pieces of wire are made long enough for the AREA rule.
+m45 = ["-lef", os.path.join(src, "lib/mini45/mini45_tech.lef"), "-lef", os.path.join(src, "lib/mini45/mini45.lef")]
+gen = subprocess.run([sys.executable, os.path.join(src, "bench/gen_pnr.py"), "2000", "3", "--mini45"], capture_output=True, text=True, check=True)
+open(out("m45.v"), "w").write(gen.stdout)
+log = run(*m45, out("m45.v"), "-def", out("m45.def"), "-threads", "1")
+need(log, r"0 nets unrouted")
+need(log, r"0 open, 0 shorts, 0 spacing violations")
+run(*m45, out("m45.v"), "-def", out("m45_4.def"), "-threads", "4")
+text = open(out("m45.def")).read()
+assert text == open(out("m45_4.def")).read(), "mini45: -threads 4 differs from -threads 1"
+need(text, r"VIAS 1 ;\n- mpnr_via1_0_rl\n")
+need(text, r"TRACKS Y 280 DO \d+ STEP 280 LAYER metal1 ;")
+need(run(*m45, "-check", out("m45.def")), r"0 open, 0 shorts, 0 spacing violations")
+if mpv:
+    # DRC with the rules of the LEF. The one rule left is the area of the
+    # cells' own unconnected pins, which the library draws below its AREA.
+    p = subprocess.run([mpv, "drc", *m45, out("m45.def"), "-q"], capture_output=True, text=True)
+    bad = [l for l in (p.stdout + p.stderr).splitlines() if re.match(r"\S+ +\d+ +\S", l) and not l.startswith("metal1.area")]
+    assert not bad and "violations in" in p.stdout + p.stderr, "mini45: mpv drc finds\n" + p.stdout + p.stderr
+
 # 7. GDS out: one reference per component, the cells as abstracts, the same
 # bytes for any thread count, a layer map file, and the conversion of a DEF.
 def gds_records(path):

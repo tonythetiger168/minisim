@@ -35,7 +35,7 @@ inline std::vector<int64_t> layerTracks(const phys::Layer& l, const Rect& die) {
   std::vector<int64_t> t;
   int64_t pitch = l.pitch(), lo = l.dir == 'H' ? die.y0 : die.x0, hi = l.dir == 'H' ? die.y1 : die.x1;
   if (pitch <= 0) return t;
-  int64_t off = l.offset() ? l.offset() : pitch / 2;
+  int64_t off = l.hasOffset ? l.offset() : pitch / 2;
   int64_t first = lo + ((off - lo) % pitch + pitch) % pitch;
   // Keep a wire's half width inside the die.
   for (int64_t c = first; c + l.width / 2 <= hi; c += pitch)
