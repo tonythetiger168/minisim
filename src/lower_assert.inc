@@ -250,8 +250,9 @@ E sampledE(const E& e) {
         c->sig = shadowOf(e->sig);
         return c;
     }
+    // DynSlice is not a container: v[i] and v[i +: w] with a variable i read the sampled v and i.
     if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
-        e->op == Op::DynSlice || e->op == Op::DynElemRef)
+        e->op == Op::DynElemRef)
         return e;   // containers are read as they are now
     auto c = std::make_shared<Expr>(*e);
     if (e->op == Op::ArrRead) {
