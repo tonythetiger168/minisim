@@ -118,6 +118,9 @@ Spec references are IEEE 1800-2023 clauses.
   `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
   calls with the host C++ compiler, `-explore` sweeps the clock period.
   See `docs/HLS.md`.
+- `mhls`: structs. Nested structs, arrays of structs, array members and
+  bit-fields; structs copied, passed by value, pointer or reference, and
+  returned. Each member becomes its own register, memory or port.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).

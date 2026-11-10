@@ -65,6 +65,11 @@ design(matmul matmul)
 design(matmul matmul -unroll-all -mul 2 -clock 4)
 design(alu alu)                                  # switch as multiplexers, fall-through, break in a loop
 design(alu alu -clock 2 -unroll-all)
+design(structs cmac)                             # structs by value, struct returned
+design(structs grade)                            # struct by pointer, nested members, bit-fields
+design(structs track)                            # array of structs, struct with an array member
+design(structs track -clock 20 -max-reg-array 2)
+design(structs rot)                              # structs through a pipeline
 design(apint blend NOCREF)
 design(apint blend -pipeline -clock 2 NOCREF)
 
@@ -80,6 +85,9 @@ refuses(gcd gcd "cannot be pipelined" -pipeline)
 refuses(arith arith "takes more than one clock period" -pipeline -clock 3)
 refuses(mac mac "static 'total' is read in stage" -pipeline -clock 4)
 refuses(bad_recursion fact "recursion")
+refuses(bad_struct_byvalue byvalue "pass 'x' by pointer or reference")
+refuses(bad_struct_dropped dropped "must be assigned to a variable")
+refuses(bad_struct_scalar scalar "a struct cannot be used as a value")
 refuses(gcd nosuch "is not defined")
 
 # Threads: the same files whatever -threads says (two tops at once, and the clock sweep).

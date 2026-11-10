@@ -24,6 +24,7 @@ class Gen:
         self.vars = []      # (name, type) assignable scalars
         self.ro = []        # read-only names
         self.arrs = []      # (name, size, writable)
+        self.pts = []       # lvalues of struct type pt_t
         self.depth = 0
         self.loop = 0
         self.n = 0
@@ -130,6 +131,12 @@ class Gen:
             self.emit("}")
         elif k < 0.93 and not self.pipe and self.depth > 0 and self.loop == 0:
             self.emit("if (%s) return %s;" % (self.expr(2), self.expr(1)))
+        elif k < 0.955 and self.pts:
+            d = r.choice(self.pts)
+            if r.random() < 0.6:
+                self.emit("%s = hmix(%s, %s);" % (d, r.choice(self.pts), r.choice(self.pts)))
+            else:
+                self.emit("%s = %s;" % (d, r.choice(self.pts)))
         elif [v for v in self.vars if v[1] != "bool"]:
             n, _ = r.choice([v for v in self.vars if v[1] != "bool"])
             self.emit("(%s)%s;" % (n, r.choice(["++", "--"])))
@@ -159,6 +166,34 @@ class Gen:
             t = r.choice(TYPES[:8])
             out.append("static %s gstate = %d;" % (t, r.randint(0, 50)))
             self.vars.append(("gstate", t))
+        structs = r.random() < 0.4
+        late = []
+        if structs:
+            ta, tb, tk, tarr = self.ty(), self.ty(), self.ty(), r.choice(TYPES[:8])
+            out.append("typedef struct { %s a; %s b; } pt_t;" % (ta, tb))
+            out.append("typedef struct { pt_t p; %s k; %s arr[4]; } rec_t;" % (tk, tarr))
+            out.append("static pt_t hmix(pt_t x, pt_t y) {\n  pt_t r;\n  r.a = x.a + y.b;\n  r.b = x.b ^ y.a;\n"
+                       "  if (x.a > y.a) r.a = x.b;\n  return r;\n}")
+
+            def pt(n):
+                self.pts.append(n)
+                self.vars += [(n + ".a", ta), (n + ".b", tb)]
+
+            if r.random() < 0.6:
+                params.append("pt_t q0")
+                pt("q0")
+            if not self.pipe and r.random() < 0.5:
+                params.append("rec_t %sr0" % r.choice(["*", "&"]))
+                acc = "r0->" if params[-1].startswith("rec_t *") else "r0."
+                pt(acc + "p")
+                self.vars.append((acc + "k", tk))
+                self.arrs.append((acc + "arr", 4, True))
+            if r.random() < 0.7:
+                late.append("pt_t l0 = {%s, %s};" % (self.expr(2), self.expr(2)))
+                late.append(("pt", "l0"))
+            if r.random() < 0.5:
+                late.append("rec_t l1 = {{%s, %s}, %s, {%s, %s}};" % tuple(self.expr(2) for _ in range(5)))
+                late.append(("rec", "l1", tk))
         outp = None
         if r.random() < 0.5:
             t = self.ty()
@@ -171,6 +206,16 @@ class Gen:
             self.arrs.append(("m0", 16, True))
         ret = self.ty()
         out.append("%s f(%s) {" % (ret, ", ".join(params)))
+        for x in late:
+            if isinstance(x, str):
+                self.emit(x)
+            elif x[0] == "pt":
+                self.pts.append(x[1])
+                self.vars += [(x[1] + ".a", ta), (x[1] + ".b", tb)]
+            else:
+                self.pts.append(x[1] + ".p")
+                self.vars += [(x[1] + ".p.a", ta), (x[1] + ".p.b", tb), (x[1] + ".k", x[2])]
+                self.arrs.append((x[1] + ".arr", 4, True))
         if r.random() < 0.5:
             t = r.choice(TYPES[:8])
             size = r.choice([4, 8]) if self.pipe else r.choice([4, 8, 16])

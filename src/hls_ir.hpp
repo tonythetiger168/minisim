@@ -854,6 +854,7 @@ class Lowerer {
         return {read(lv, e->line), lv.ty};
       }
       case Expr::Cast: return conv(rv(e->a), e->ty);
+      case Expr::Agg: fail(P.file, e->line, "a struct cannot be used as a value here");
       case Expr::Un: {
         if (e->op == "*") {
           LV lv = lvalue(e->a);

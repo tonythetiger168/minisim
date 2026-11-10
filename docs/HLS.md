@@ -45,12 +45,19 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
 | every C operator, casts, `?:`, short-circuit `&&` `\|\|`, `++`/`--`, compound assignment | `sizeof`, string literals |
 | `if`, `switch` (with fall-through), `for`, `while`, `do`, `break`, `continue`, `return` anywhere | `goto` |
 | fixed-size arrays of any dimension, initializer lists | pointers other than scalar output parameters, dynamic memory |
-| functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion, structs, classes, templates |
+| functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion, classes, templates |
+| structs: nested, in arrays, with array members and bit-fields; copied, passed by value, pointer or reference, and returned | unions, pointer members, member functions, structs defined inside a function |
 
 `ap_`/`sc_` operands are widened to 64 bits in arithmetic, so a product of
 two 20-bit values keeps its 40 bits; the result is cut to the declared width
 on assignment. Division by zero gives all ones (remainder: the dividend),
 and a shift by the width or more gives 0, in the RTL and in the reference.
+
+A struct is taken apart: each member is its own register, memory or port,
+named `<variable>__<member>` (`s.px.r` is `s__px__r`), so only the members
+that are used cost anything. An array of structs is one memory per member.
+A returned struct comes out as `ap_return__<member>`. A struct with an
+array member is passed by pointer or reference, not by value.
 
 Pragmas: `#pragma hls unroll` (before a loop or first in its body),
 `#pragma hls pipeline` (in a function), `#pragma hls top`.
@@ -67,6 +74,7 @@ FSM architecture:
 | `ap_idle` | high while waiting for `ap_start` |
 | `<arg>` | scalar parameter: input. Pointer/reference parameter: output, or `<arg>_i` and `<arg>_o` when the function also reads it |
 | `ap_return` | the return value |
+| `<arg>__<member>` | one port (or memory interface) per member of a struct parameter, following the rules above |
 | `<arr>_addr`, `_ce`, `_we`, `_wdata`, `_rdata` | array parameter: a single-port memory with synchronous read (data one cycle after `_ce`) |
 
 Pipeline architecture: `ap_vld_in` marks an input, `ap_vld_out` its result
@@ -115,5 +123,5 @@ need multicycle constraints.
 ## Not yet
 
 Loop pipelining, dual-port memories, AXI-Stream/handshake interfaces,
-structs, SystemC modules (`SC_MODULE`, clocked threads), and
+unions, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

@@ -38,7 +38,7 @@ struct Type {
 };
 
 struct Expr {
-  enum K { Num, Var, Un, Post, Bin, Asg, Cond, Idx, Call, Cast } k = Num;
+  enum K { Num, Var, Un, Post, Bin, Asg, Cond, Idx, Call, Cast, Agg } k = Num;   // Agg: a struct, parser only
   std::string op, name;
   Expr *a = nullptr, *b = nullptr, *c = nullptr;
   std::vector<Expr*> args;
@@ -57,6 +57,14 @@ struct Decl {
   std::vector<Expr*> initList;
   bool hasInitList = false;
   int line = 0;
+  // Structs are flattened by the parser, one Decl per scalar or array member.
+  // For a parameter: its position in the C signature (-2: a member of the
+  // returned struct), the member's path in C with "[]" for each array level
+  // (empty when the parameter is not a struct), and how many leading
+  // dimensions index an array of structs.
+  int origParam = -1;
+  std::string cpath;
+  int outer = 0;
 };
 
 struct Stmt {
@@ -72,6 +80,7 @@ struct Stmt {
   Stmt *init = nullptr, *body = nullptr, *els = nullptr;
   std::vector<Stmt*> kids;
   bool unroll = false;
+  bool splice = false;   // a Blk that stands for several statements of its parent
   int line = 0;
 };
 
@@ -82,6 +91,8 @@ struct Func {
   Stmt* body = nullptr;
   bool pipeline = false, top = false;
   int line = 0;
+  std::vector<int> origKind;   // per C parameter: 0 scalar or array, 1 struct, 2 pointer to struct
+  bool retStruct = false;      // returns a struct: the members are reference parameters ap_return__<member>
 };
 
 struct Program {
@@ -336,6 +347,327 @@ class Parser {
   std::vector<Tok> t_;
   size_t i_ = 0;
   std::map<std::string, Type> typedefs_;
+
+  struct Spec {
+    Type ty;
+    bool isConst = false, isStatic = false;
+    int sid = -1;   // a struct type
+  };
+
+  // ---- structs -----------------------------------------------------------
+  // A struct never reaches the IR. A variable of struct type is one variable
+  // (or array) per member, named <var>__<member>; member access, copies,
+  // arguments and returned structs are rewritten here in terms of those.
+  struct Field {
+    std::string name;
+    Type ty;
+    int sid = -1;
+    std::vector<int> dims;
+  };
+  struct StructDef {
+    std::string name;
+    std::vector<Field> fields;
+  };
+  struct Leaf {
+    std::string suffix, cpath;
+    Type ty;
+    std::vector<int> dims;
+  };
+  struct VarInfo {
+    int sid = -1;
+    int ndims = 0;
+  };
+  struct AggInfo {
+    std::string prefix;
+    int sid = -1;
+    std::vector<Expr*> idx;
+    int need = 0;   // dimensions of an array of structs still to be indexed
+  };
+  std::vector<StructDef> structs_;
+  std::map<std::string, int> structTags_, structNames_;
+  std::vector<std::map<std::string, VarInfo>> scopes_{1};
+  std::map<const Expr*, AggInfo> agg_;
+  std::map<const Expr*, int> callRet_;      // calls whose struct result is not yet stored
+  std::map<std::string, int> funcRet_;
+  int curRetSid_ = -1;
+
+  const VarInfo* lookupVar(const std::string& n) const {
+    for (size_t i = scopes_.size(); i-- > 0;) {
+      auto it = scopes_[i].find(n);
+      if (it != scopes_[i].end()) return &it->second;
+    }
+    return nullptr;
+  }
+  static long prod(const std::vector<int>& d) {
+    long n = 1;
+    for (int x : d) n *= x;
+    return n;
+  }
+  void leaves(int sid, const std::string& suf, const std::string& cp, const std::vector<int>& dims, std::vector<Leaf>& out) const {
+    for (auto& f : structs_[sid].fields) {
+      std::vector<int> d = dims;
+      d.insert(d.end(), f.dims.begin(), f.dims.end());
+      std::string c = cp + "." + f.name;
+      for (size_t i = 0; i < f.dims.size(); i++) c += "[]";
+      if (f.sid >= 0) leaves(f.sid, suf + "__" + f.name, c, d, out);
+      else out.push_back({suf + "__" + f.name, c, f.ty, d});
+    }
+  }
+  std::vector<Leaf> leaves(int sid) const {
+    std::vector<Leaf> L;
+    leaves(sid, "", "", {}, L);
+    return L;
+  }
+  Expr* num(uint64_t v, int line) {
+    Expr* e = mk(Expr::Num, line);
+    e->v = v;
+    e->ty = {32, true};
+    return e;
+  }
+  Expr* mkAgg(const std::string& prefix, int sid, std::vector<Expr*> idx, int need, int line) {
+    Expr* e = mk(Expr::Agg, line);
+    e->name = prefix;
+    agg_[e] = {prefix, sid, std::move(idx), need};
+    return e;
+  }
+  Expr* indexed(const std::string& name, const std::vector<Expr*>& idx, int line) {
+    Expr* e = mk(Expr::Var, line);
+    e->name = name;
+    for (auto* i : idx) {
+      Expr* x = mk(Expr::Idx, line);
+      x->a = e;
+      x->b = i;
+      e = x;
+    }
+    return e;
+  }
+  static bool sideEffect(const Expr* e) {
+    if (!e) return false;
+    if (e->k == Expr::Asg || e->k == Expr::Post || e->k == Expr::Call) return true;
+    if (e->k == Expr::Un && (e->op == "++" || e->op == "--")) return true;
+    for (auto* a : e->args)
+      if (sideEffect(a)) return true;
+    return sideEffect(e->a) || sideEffect(e->b) || sideEffect(e->c);
+  }
+  // The members of a struct value as expressions: scalars one by one, array
+  // members element by element (`elementwise`) or as the array itself.
+  std::vector<Expr*> expand(Expr* e, bool elementwise) {
+    const AggInfo a = agg_.at(e);
+    const std::string& sn = structs_[a.sid].name;
+    if (a.need && (elementwise || !a.idx.empty())) fail(P.file, e->line, "an array of struct '" + sn + "' cannot be used as one value");
+    std::vector<Leaf> L = leaves(a.sid);
+    if (L.size() > 1 || elementwise)
+      for (auto* i : a.idx)
+        if (sideEffect(i)) fail(P.file, e->line, "an index with a side effect cannot select a whole struct");
+    std::vector<Expr*> out;
+    for (auto& l : L) {
+      if (!elementwise || l.dims.empty()) {
+        out.push_back(indexed(a.prefix + l.suffix, a.idx, e->line));
+        continue;
+      }
+      long n = prod(l.dims);
+      if (n > 4096) fail(P.file, e->line, "struct '" + sn + "' is too large to copy as a value; copy the array members in a loop");
+      for (long k = 0; k < n; k++) {
+        std::vector<Expr*> idx = a.idx;
+        long div = n;
+        for (int d : l.dims) {
+          div /= d;
+          idx.push_back(num((uint64_t)((k / div) % d), e->line));
+        }
+        out.push_back(indexed(a.prefix + l.suffix, idx, e->line));
+      }
+    }
+    return out;
+  }
+  // dst = src for a struct destination: a member-wise copy, or the call that
+  // returns the struct, given the destination's members as its last arguments.
+  Expr* aggAssign(Expr* dst, Expr* src, int line) {
+    const AggInfo d = agg_.at(dst);
+    const std::string& sn = structs_[d.sid].name;
+    if (src->k == Expr::Call && callRet_.count(src)) {
+      if (callRet_[src] != d.sid) fail(P.file, line, "'" + src->name + "' does not return struct '" + sn + "'");
+      if (d.need || !d.idx.empty()) fail(P.file, line, "assign the struct returned by '" + src->name + "' to a variable first");
+      for (auto& l : leaves(d.sid)) src->args.push_back(indexed(d.prefix + l.suffix, {}, line));
+      callRet_.erase(src);
+      return src;
+    }
+    if (src->k != Expr::Agg) fail(P.file, line, "struct '" + sn + "' can only be assigned another '" + sn + "'");
+    if (agg_.at(src).sid != d.sid) fail(P.file, line, "assignment between different struct types");
+    std::vector<Expr*> l = expand(dst, true), r = expand(src, true);
+    Expr* chain = nullptr;
+    for (size_t i = 0; i < l.size(); i++) {
+      Expr* x = mk(Expr::Asg, line);
+      x->op = "=";
+      x->a = l[i];
+      x->b = r[i];
+      if (!chain) {
+        chain = x;
+      } else {
+        Expr* c = mk(Expr::Bin, line);
+        c->op = ",";
+        c->a = chain;
+        c->b = x;
+        chain = c;
+      }
+    }
+    if (!chain) fail(P.file, line, "struct '" + sn + "' has no members");
+    return chain;
+  }
+  std::vector<int> constDims() {
+    std::vector<int> dims;
+    while (accept("[")) {
+      if (isP("]")) err("an array needs a constant size");
+      uint64_t n = constEval(ternary());
+      if (n < 1 || n > (1u << 24)) err("bad array size");
+      dims.push_back((int)n);
+      expect("]");
+    }
+    return dims;
+  }
+  std::vector<Expr*> dimExprs(const std::vector<int>& dims, int line) {
+    std::vector<Expr*> r;
+    for (int d : dims) r.push_back(num((uint64_t)d, line));
+    return r;
+  }
+  int parseStructDef() {
+    i_++;   // struct
+    StructDef sd;
+    if (cur().k == Tok::Id) sd.name = ident();
+    int sid = (int)structs_.size();
+    structs_.push_back(sd);
+    if (!sd.name.empty()) structTags_[sd.name] = structNames_[sd.name] = sid;
+    expect("{");
+    while (!isP("}")) {
+      if (cur().k == Tok::End) err("missing '}'");
+      Spec fs = typeSpec();
+      if (fs.sid == sid) err("a struct cannot contain itself");
+      do {
+        Field f;
+        f.ty = fs.ty;
+        f.sid = fs.sid;
+        if (isP("*") || isP("&")) err("pointer members are not supported");
+        f.name = ident();
+        if (isP("(")) err("member functions are not supported");
+        f.dims = constDims();
+        if (accept(":")) {
+          uint64_t w = constEval(ternary());
+          if (fs.sid >= 0 || !f.dims.empty() || w < 1 || w > (uint64_t)fs.ty.w) err("bad bit-field '" + f.name + "'");
+          f.ty.w = (int)w;
+          if (w == 1 && !f.ty.s) f.ty.native = false;   // one bit that truncates, not a bool
+        }
+        if (isP("=")) err("default member values are not supported");
+        if (f.ty.w == 0) err("member '" + f.name + "' declared void");
+        for (auto& g : structs_[sid].fields)
+          if (g.name == f.name) err("duplicate member '" + f.name + "'");
+        structs_[sid].fields.push_back(f);
+      } while (accept(","));
+      expect(";");
+    }
+    expect("}");
+    if (structs_[sid].fields.empty()) err("empty structs are not supported");
+    return sid;
+  }
+  // Initializers in C order (member by member, element by element) go to the
+  // per-member lists.
+  void distribute(int sid, size_t base, const std::vector<Expr*>& items, size_t& pos, std::vector<std::vector<Expr*>>& lists, int line) {
+    size_t li = base;
+    for (auto& f : structs_[sid].fields) {
+      long n = prod(f.dims);
+      if (f.sid >= 0) {
+        for (long k = 0; k < n; k++) distribute(f.sid, li, items, pos, lists, line);
+        li += leaves(f.sid).size();
+      } else {
+        for (long k = 0; k < n; k++) lists[li].push_back(pos < items.size() ? items[pos++] : num(0, line));
+        li++;
+      }
+    }
+  }
+  // The declarators after a struct type, up to the ';': one Decl per member.
+  void structVars(const Spec& sp, std::vector<Decl>& out, std::vector<Stmt*>* extra, bool global) {
+    const std::string sn = structs_[sp.sid].name;
+    do {
+      int line = cur().line;
+      if (isP("*") || isP("&")) err("local and global pointers to structs are not supported");
+      std::string name = ident();
+      std::vector<int> dims = constDims();
+      scopes_.back()[name] = VarInfo{sp.sid, (int)dims.size()};
+      std::vector<Leaf> L = leaves(sp.sid);
+      std::vector<std::vector<Expr*>> lists(L.size());
+      bool hasList = false;
+      Expr* from = nullptr;
+      if (accept("=")) {
+        if (isP("{")) {
+          Decl tmp;
+          initList(tmp);
+          hasList = true;
+          size_t pos = 0;
+          for (long el = 0, n = prod(dims); el < n; el++) distribute(sp.sid, 0, tmp.initList, pos, lists, line);
+          if (pos < tmp.initList.size()) err("too many initializers for '" + name + "'");
+        } else {
+          from = assign();
+          if (!extra || sp.isStatic || !dims.empty()) err("'" + name + "' can only be initialized with a list here");
+        }
+      }
+      for (size_t i = 0; i < L.size(); i++) {
+        Decl d;
+        d.name = name + L[i].suffix;
+        d.ty = L[i].ty;
+        d.isConst = sp.isConst;
+        d.isStatic = sp.isStatic || global;
+        d.line = line;
+        std::vector<int> all = dims;
+        all.insert(all.end(), L[i].dims.begin(), L[i].dims.end());
+        if (!all.empty()) {
+          d.isArray = true;
+          d.dims = dimExprs(all, line);
+          d.hasInitList = hasList;
+          if (hasList) d.initList = lists[i];
+        } else if (hasList) {
+          d.init = lists[i][0];
+        }
+        out.push_back(d);
+      }
+      if (from) {
+        Stmt* es = mkS(Stmt::ExprS);
+        es->e = aggAssign(mkAgg(name, sp.sid, {}, 0, line), from, line);
+        extra->push_back(es);
+      }
+    } while (accept(","));
+  }
+  // A struct parameter: by value, by pointer or reference, or an array of structs.
+  void structParam(Func& f, const Spec& ps, int j) {
+    int line = cur().line;
+    bool ptr = accept("*");
+    bool ref = !ptr && accept("&");
+    acceptId("const");
+    std::string name = ident();
+    std::vector<int> dims = constDims();
+    if ((ptr || ref) && !dims.empty()) err("arrays of pointers are not supported");
+    scopes_.back()[name] = VarInfo{ps.sid, (int)dims.size()};
+    f.origKind.push_back(ptr ? 2 : 1);
+    for (auto& l : leaves(ps.sid)) {
+      Decl d;
+      d.name = name + l.suffix;
+      d.ty = l.ty;
+      d.line = line;
+      d.origParam = j;
+      d.outer = (int)dims.size();
+      for (size_t i = 0; i < dims.size(); i++) d.cpath += "[]";
+      d.cpath += l.cpath;
+      std::vector<int> all = dims;
+      all.insert(all.end(), l.dims.begin(), l.dims.end());
+      if (!all.empty()) {
+        if (!ptr && !ref && dims.empty())
+          err("struct '" + structs_[ps.sid].name + "' has an array member; pass '" + name + "' by pointer or reference");
+        d.isArray = true;
+        d.dims = dimExprs(all, line);
+      } else if ((ptr || ref) && !ps.isConst) {
+        d.isRef = true;
+      }
+      f.params.push_back(d);
+    }
+  }
+
   bool pendUnroll_ = false, pendPipeline_ = false, pendTop_ = false;
 
   const Tok& cur() const { return t_[i_]; }
@@ -393,14 +725,9 @@ class Parser {
         "const", "static", "volatile", "unsigned", "signed", "char", "short", "int", "long",
         "bool", "void", "_Bool", "inline", "register", "extern", "constexpr",
         "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-        "size_t", "ap_int", "ap_uint", "sc_int", "sc_uint", "sc_bigint", "sc_biguint"};
-    return kw.count(cur().s) || typedefs_.count(cur().s);
+        "size_t", "ap_int", "ap_uint", "sc_int", "sc_uint", "sc_bigint", "sc_biguint", "struct"};
+    return kw.count(cur().s) || typedefs_.count(cur().s) || structNames_.count(cur().s);
   }
-
-  struct Spec {
-    Type ty;
-    bool isConst = false, isStatic = false;
-  };
 
   Spec typeSpec() {
     Spec sp;
@@ -416,6 +743,18 @@ class Parser {
       else if (s == "unsigned") { sawUns = true; i_++; }
       else if (s == "signed") { sawSig = true; i_++; }
       else if (s == "long") { longs++; i_++; }
+      else if (!sawBase && !longs && !sawUns && !sawSig && (s == "struct" || structNames_.count(s))) {
+        if (s == "struct") {
+          i_++;
+          if (cur().k != Tok::Id || !structTags_.count(cur().s)) err("unknown struct '" + cur().s + "'");
+          sp.sid = structTags_[cur().s];
+        } else {
+          sp.sid = structNames_[s];
+        }
+        i_++;
+        sawBase = true;
+        base = "td";
+      }
       else if (s == "char" || s == "short" || s == "int" || s == "bool" || s == "_Bool" || s == "void") {
         if (base.empty() || s != "int") base = base.empty() ? s : base;
         sawBase = true;
@@ -535,6 +874,7 @@ class Parser {
     if (accept("(")) {
       if (typeStart()) {
         Spec sp = typeSpec();
+        if (sp.sid >= 0) err("casts to a struct are not supported");
         expect(")");
         Expr* e = mk(Expr::Cast, line);
         e->ty = sp.ty;
@@ -556,6 +896,7 @@ class Parser {
       if (isId("sizeof")) err("sizeof is not supported");
       if (typeStart()) {   // functional cast: int(x), ap_uint<4>(x)
         Spec sp = typeSpec();
+        if (sp.sid >= 0) err("casts to a struct are not supported");
         expect("(");
         Expr* e = mk(Expr::Cast, line);
         e->ty = sp.ty;
@@ -568,11 +909,19 @@ class Parser {
         Expr* e = mk(Expr::Call, line);
         e->name = n;
         if (!isP(")"))
-          do e->args.push_back(assign());
-          while (accept(","));
+          do {
+            Expr* a = assign();
+            if (a->k == Expr::Agg) {
+              for (auto* x : expand(a, false)) e->args.push_back(x);
+            } else {
+              e->args.push_back(a);
+            }
+          } while (accept(","));
         expect(")");
+        if (funcRet_.count(n)) callRet_[e] = funcRet_[n];
         return e;
       }
+      if (const VarInfo* vi = lookupVar(n); vi && vi->sid >= 0) return mkAgg(n, vi->sid, {}, vi->ndims, line);
       Expr* e = mk(Expr::Var, line);
       e->name = n;
       return e;
@@ -584,7 +933,14 @@ class Parser {
     Expr* e = primary();
     for (;;) {
       int line = cur().line;
-      if (accept("[")) {
+      if (e->k == Expr::Agg && isP("[")) {
+        AggInfo a = agg_.at(e);
+        if (!a.need) err("'" + a.prefix + "' is a struct, not an array");
+        i_++;
+        a.idx.push_back(expr());
+        expect("]");
+        e = mkAgg(a.prefix, a.sid, a.idx, a.need - 1, line);
+      } else if (accept("[")) {
         Expr* x = mk(Expr::Idx, line);
         x->a = e;
         x->b = expr();
@@ -597,7 +953,17 @@ class Parser {
         i_++;
         e = x;
       } else if (isP(".") || isP("->")) {
-        err("structs and member access are not supported");
+        if (e->k != Expr::Agg) err("'" + cur().s + "' needs a struct on its left");
+        const AggInfo a = agg_.at(e);
+        if (a.need) err("index the array of structs before selecting a member");
+        i_++;
+        std::string m = ident();
+        const Field* f = nullptr;
+        for (auto& g : structs_[a.sid].fields)
+          if (g.name == m) f = &g;
+        if (!f) err("struct '" + structs_[a.sid].name + "' has no member '" + m + "'");
+        if (f->sid >= 0) e = mkAgg(a.prefix + "__" + m, f->sid, a.idx, (int)f->dims.size(), line);
+        else e = indexed(a.prefix + "__" + m, a.idx, line);
       } else {
         return e;
       }
@@ -612,6 +978,8 @@ class Parser {
         Expr* e = mk(Expr::Un, line);
         e->op = o;
         e->a = unary();
+        // A struct and its address are the same thing here: both name the members.
+        if (e->a->k == Expr::Agg && (e->op == "*" || e->op == "&")) return e->a;
         return e;
       }
     return postfix();
@@ -667,10 +1035,15 @@ class Parser {
     for (const char* o : {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="})
       if (isP(o)) {
         i_++;
+        if (l->k == Expr::Agg) {
+          if (std::string(o) != "=") err("operator '" + std::string(o) + "' does not apply to a struct");
+          return aggAssign(l, assign(), line);
+        }
         Expr* e = mk(Expr::Asg, line);
         e->op = o;
         e->a = l;
         e->b = assign();
+        if (e->b->k == Expr::Agg) err("a struct cannot be assigned to a scalar");
         return e;
       }
     return l;
@@ -730,25 +1103,44 @@ class Parser {
       }
     }
     if (d.ty.w == 0 && !param) err("variable '" + d.name + "' declared void");
+    if (!d.name.empty()) scopes_.back()[d.name] = VarInfo{};
     return d;
   }
 
   Stmt* declStmt() {
     Stmt* s = mkS(Stmt::DeclS);
     Spec sp = typeSpec();
+    if (sp.sid >= 0) {
+      std::vector<Stmt*> extra;
+      structVars(sp, s->decls, &extra, false);
+      expect(";");
+      if (extra.empty()) return s;
+      Stmt* b = mkS(Stmt::Blk);
+      b->splice = true;
+      b->kids.push_back(s);
+      for (auto* x : extra) b->kids.push_back(x);
+      return b;
+    }
     do s->decls.push_back(declarator(sp, false));
     while (accept(","));
     expect(";");
     return s;
   }
 
+  static void push(std::vector<Stmt*>& to, Stmt* s) {
+    if (s->k == Stmt::Blk && s->splice) to.insert(to.end(), s->kids.begin(), s->kids.end());
+    else to.push_back(s);
+  }
+
   Stmt* block() {
     Stmt* s = mkS(Stmt::Blk);
     expect("{");
+    scopes_.emplace_back();
     while (!isP("}")) {
       if (cur().k == Tok::End) err("missing '}'");
-      s->kids.push_back(stmt());
+      push(s->kids, stmt());
     }
+    scopes_.pop_back();
     expect("}");
     return s;
   }
@@ -777,6 +1169,7 @@ class Parser {
       pendUnroll_ = false;
       i_++;
       expect("(");
+      scopes_.emplace_back();
       if (accept(";")) {
       } else if (typeStart()) {
         s->init = declStmt();
@@ -790,6 +1183,7 @@ class Parser {
       if (!isP(")")) s->inc = expr();
       expect(")");
       innerUnroll(s);
+      scopes_.pop_back();
       return s;
     }
     if (isId("while")) {
@@ -817,8 +1211,22 @@ class Parser {
     if (isId("return")) {
       Stmt* s = mkS(Stmt::Ret);
       i_++;
+      int line = cur().line;
       if (!isP(";")) s->e = expr();
       expect(";");
+      if (curRetSid_ >= 0) {
+        if (!s->e) fail(P.file, line, "this function returns a struct");
+        Stmt* es = mkS(Stmt::ExprS);
+        es->line = line;
+        es->e = aggAssign(mkAgg("ap_return", curRetSid_, {}, 0, line), s->e, line);
+        s->e = nullptr;
+        Stmt* b = mkS(Stmt::Blk);
+        b->line = line;
+        b->splice = true;
+        b->kids = {es, s};
+        return b;
+      }
+      if (s->e && (s->e->k == Expr::Agg || callRet_.count(s->e))) fail(P.file, line, "this function does not return a struct");
       return s;
     }
     if (isId("break") || isId("continue")) {
@@ -847,17 +1255,20 @@ class Parser {
           expect(":");
         } else {
           if (s->cases.empty()) err("statement before the first case label");
-          s->cases.back().body.push_back(stmt());
+          push(s->cases.back().body, stmt());
         }
       }
       expect("}");
       return s;
     }
-    for (const char* k : {"goto", "struct", "union", "class", "try", "throw", "new", "delete"})
+    for (const char* k : {"goto", "union", "class", "try", "throw", "new", "delete"})
       if (isId(k)) err(std::string("'") + k + "' is not supported");
+    if (isId("struct") && (peek().s == "{" || peek(2).s == "{")) err("define structs outside functions");
     if (typeStart()) return declStmt();
     Stmt* s = mkS(Stmt::ExprS);
     s->e = expr();
+    if (callRet_.count(s->e)) err("the struct returned by '" + s->e->name + "' must be assigned to a variable");
+    if (s->e->k == Expr::Agg) err("a struct is not a statement");
     expect(";");
     return s;
   }
@@ -873,10 +1284,12 @@ class Parser {
         pendUnroll_ = false;
       }
       Stmt* b = mkS(Stmt::Blk);
+      scopes_.emplace_back();
       while (!isP("}")) {
         if (cur().k == Tok::End) err("missing '}'");
-        b->kids.push_back(stmt());
+        push(b->kids, stmt());
       }
+      scopes_.pop_back();
       expect("}");
       loop->body = b;
       (void)save;
@@ -897,11 +1310,26 @@ class Parser {
       expect(";");
       return;
     }
+    if (isId("typedef") && peek().s == "struct" && (peek(2).s == "{" || peek(3).s == "{")) {
+      i_++;
+      int sid = parseStructDef();
+      std::string n = ident();
+      expect(";");
+      structNames_[n] = sid;
+      if (structs_[sid].name.empty()) structs_[sid].name = n;
+      return;
+    }
     if (acceptId("typedef")) {
       Spec sp = typeSpec();
       std::string n = ident();
       expect(";");
-      typedefs_[n] = sp.ty;
+      if (sp.sid >= 0) structNames_[n] = sp.sid;
+      else typedefs_[n] = sp.ty;
+      return;
+    }
+    if (isId("struct") && (peek().s == "{" || peek(2).s == "{")) {
+      parseStructDef();
+      expect(";");
       return;
     }
     if (isId("enum")) {
@@ -920,7 +1348,7 @@ class Parser {
       expect(";");
       return;
     }
-    for (const char* k : {"struct", "union", "class", "template"})
+    for (const char* k : {"union", "class", "template"})
       if (isId(k)) err(std::string("'") + k + "' is not supported");
     Spec sp = typeSpec();
     bool ref = false;
@@ -933,6 +1361,12 @@ class Parser {
       Func f;
       f.name = n;
       f.ret = sp.ty;
+      if (sp.sid >= 0) {
+        f.ret = {0, false};
+        f.retStruct = true;
+        funcRet_[n] = sp.sid;
+      }
+      scopes_.emplace_back();
       f.line = cur().line;
       f.top = pendTop_;
       f.pipeline = pendPipeline_;
@@ -941,21 +1375,71 @@ class Parser {
       if (!isP(")"))
         do {
           Spec ps = typeSpec();
+          int j = (int)f.origKind.size();
+          if (ps.sid >= 0) {
+            structParam(f, ps, j);
+            continue;
+          }
           Decl d = declarator(ps, true);
           if (d.ty.w == 0) err("parameter '" + d.name + "' declared void");
+          d.origParam = j;
+          f.origKind.push_back(0);
           f.params.push_back(d);
         } while (accept(","));
       expect(")");
-      if (accept(";")) return;   // prototype
+      if (sp.sid >= 0)
+        for (auto& l : leaves(sp.sid)) {
+          Decl d;
+          d.name = "ap_return" + l.suffix;
+          d.ty = l.ty;
+          d.line = f.line;
+          d.origParam = -2;
+          d.cpath = l.cpath;
+          if (l.dims.empty()) {
+            d.isRef = true;
+          } else {
+            d.isArray = true;
+            d.dims = dimExprs(l.dims, f.line);
+          }
+          f.params.push_back(d);
+        }
+      if (accept(";")) {   // prototype
+        scopes_.pop_back();
+        return;
+      }
       P.funcs.push_back(f);
       curFunc_ = &P.funcs.back();
+      curRetSid_ = sp.sid;
       Stmt* body = block();
+      curRetSid_ = -1;
+      scopes_.pop_back();
       P.funcs.back().body = body;
       curFunc_ = nullptr;
       pendUnroll_ = false;
       return;
     }
     i_ = save;
+    if (sp.sid >= 0) {
+      std::vector<Decl> ds;
+      structVars(sp, ds, nullptr, true);
+      expect(";");
+      for (auto& d : ds) {
+        if (d.isConst && !d.isArray) {
+          if (!d.init) err("const '" + d.name + "' needs a value");
+          uint64_t v = constEval(d.init);
+          if (d.ty.w < 64) {
+            uint64_t m = (1ull << d.ty.w) - 1;
+            v &= m;
+            if (d.ty.s && (v >> (d.ty.w - 1))) v |= ~m;
+          }
+          P.consts[d.name] = v;
+          P.constTypes[d.name] = d.ty;
+        } else {
+          P.globals.push_back(d);
+        }
+      }
+      return;
+    }
     do {
       Decl d = declarator(sp, false);
       if (d.isRef) err("global pointers are not supported");
