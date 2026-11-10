@@ -46,7 +46,7 @@ jobs:
         run: echo "$HOME/iverilog13/bin" >> "$GITHUB_PATH" && ("$HOME/iverilog13/bin/iverilog" -V 2>&1 || true) | head -1
 
       - name: Install zlib (FST waveforms)
-        run: sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get install -y zlib1g-dev libssl-dev openssl
 
       # The UVM tests (tests/uvm) run against the Accellera UVM library.
       - name: Fetch Accellera UVM (uvm-core 2020.3.1)
