@@ -14,6 +14,11 @@ Spec references are IEEE 1800-2023 clauses.
   the layer's `AREA`, and a layer's `OFFSET 0` is taken as given (it used to
   mean half a pitch). `bench/gen_pnr.py --mini45` writes netlists over the
   library's cells; the `mpnr` test places, routes and DRC-checks one.
+- `mdebug -blocks INST`, and a block diagram in the viewer: the instances
+  inside a scope, their port connections and which instance feeds which.
+- `mdebug`: tasks and functions in a module, call output arguments, `force`,
+  procedural `assign` and net declaration assignments are drivers and loads;
+  the fan-in cone follows a task argument to its calls.
 - `memu`, emulation and FPGA prototyping: puts a gate-level netlist
   (structural Verilog over a Liberty library) on a board of FPGAs. Clock
   conversion onto one free-running clock (strobes for clean clocks, edge
@@ -115,6 +120,15 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
+  types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
+  functions, all control flow but `goto`) is scheduled into clock cycles
+  under `-clock`, `-mul` and `-div`, with operator chaining, multi-cycle
+  operators, register and multiplier/divider sharing, and comes out as an
+  FSM with datapath or (`-pipeline`) a pipeline taking one input per cycle.
+  `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
+  calls with the host C++ compiler, `-explore` sweeps the clock period.
+  See `docs/HLS.md`.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -256,6 +270,17 @@ Spec references are IEEE 1800-2023 clauses.
   `docs/CONSTRAINTS.md`.
 - SDC reader: object lookups use sorted name indexes and `-filter` is parsed
   once, so large designs with thousands of queries read in seconds.
+- `msta`: static timing analysis of gate-level netlists in the style of
+  PrimeTime. Liberty (NLDM) delay calculation, ideal and propagated clocks,
+  generated clocks, setup / hold / recovery / removal and output delay
+  checks, false paths, multicycle paths, max and min delay, clock groups,
+  `max_transition` and `max_capacitance`; `check_timing`, `report_timing`,
+  `report_constraint`, `report_clocks`, `report_qor`, SDF and JSON output;
+  Tcl scripts on the shared SDC reader. Multithreaded, with the same results
+  at any thread count. See `docs/STA.md`.
+- `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
+  Verilog netlist reader / flattener / writer, shared by the timing,
+  synthesis, power, equivalence and physical tools.
 
 ### Fixed
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes

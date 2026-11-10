@@ -30,6 +30,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mplan** | Verification planning and tracking: a plan maps features to tests, coverage and assertions; scores per feature, history and trend, failure triage (new / recurring / flaky / fixed), HTML report and CI gates | Shipping next |
 | **mrcx** | Parasitic extraction: routed DEF + LEF in, SPEF out. Distributed RC per net with coupling capacitance, process stack and temperature, open and short checks, multi-core | Shipping next |
 | **mwave** | Waveforms for GTKWave / Surfer: hierarchical VCD and compressed FST (shipping in 0.2); `$dumpfile` / `$dumpvars` scoping and transaction views next | Partly shipping in 0.2 |
+| **mhls** | High-level synthesis: C/C++ functions to SystemVerilog (FSM with datapath or pipeline), with a self-checking testbench and a host-compiler check of the same vectors | Shipping next |
 
 All of them install from one package (`minisim_x.y.z_amd64.deb` /
 `.tar.gz`) and share one version number.
