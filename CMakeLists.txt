@@ -350,6 +350,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_edt
                    -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt.cmake)
+  # Logic BIST coverage, checked against the wrapper's signature in simulation.
+  add_test(NAME mdft_lbist_cov
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist_cov
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist_cov.cmake)
   # Failure diagnosis: injected faults come back as the first suspect.
   add_test(NAME mdft_diag
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMATPG=$<TARGET_FILE:matpg> -DMSIM=$<TARGET_FILE:msim>

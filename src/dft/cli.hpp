@@ -16,6 +16,7 @@
 #include "diag.hpp"
 #include "edt.hpp"
 #include "lbist.hpp"
+#include "lbist_cov.hpp"
 #include "pdl.hpp"
 
 namespace dft {
@@ -33,6 +34,8 @@ struct Cli {
     int threads = 0;
     DiagOpts dg;
     bool diag = false;
+    LbistCovOpts lc;
+    bool lbistCov = false;
 
     static void usage(std::ostream& os) {
         os << "boundary scan (IEEE 1149.1):\n"
@@ -61,6 +64,11 @@ struct Cli {
               "  -lbist_sign            simulate with msim and write the golden signature into the RTL\n"
               "  -lbist_msim PATH       the msim to run (default: next to mdft, then PATH)\n"
               "  -lbist_dump FILE       the pattern loads, one line per chain, scan-in first\n"
+              "  -lbist_coverage        grade the BIST patterns on the gate netlist (no wrapper is written):\n"
+              "                         needs -scandef, the netlist and -lib / -top / -se as given to matpg\n"
+              "  -lbist_faults FILE     with -lbist_coverage: every fault and its class\n"
+              "  -lbist_json FILE       with -lbist_coverage: the report as JSON\n"
+              "  -lbist_min_coverage P  with -lbist_coverage: exit 1 under P percent test coverage\n"
               "scan compression:\n"
               "  -edt                   add a decompressor and a compactor around the chains of -scandef\n"
               "  -edt_encode            encode cubes only: needs -scandef and -edt_cubes, no design\n"
@@ -136,6 +144,10 @@ struct Cli {
                 else if (a == "-lbist_sign") lo.sign = true;
                 else if (a == "-lbist_msim") lo.msim = next();
                 else if (a == "-lbist_dump") lbistDump = next();
+                else if (a == "-lbist_coverage") lbistCov = mine = true;
+                else if (a == "-lbist_faults") lc.faultOut = next();
+                else if (a == "-lbist_json") lc.json = next();
+                else if (a == "-lbist_min_coverage") lc.minCoverage = std::stod(next());
                 else if (a == "-edt") edt = mine = true;
                 else if (a == "-edt_encode") edtEncode = mine = true;
                 else if (a == "-edt_channels") eo.channels = std::stoi(next());
@@ -177,23 +189,38 @@ struct Cli {
                 if (!svf.empty() || !tb.empty()) throw Error("-svf and -tb need -bscan, -bsdl or -pdl");
                 return -1;
             }
-            if (diag) {
-                // The rest of the line is the netlist and how to read it.
+            if (diag || lbistCov) {
+                // The rest of the line is the gate netlist and how to read it.
+                const char* who = diag ? "-diagnose" : "-lbist_coverage";
+                std::vector<std::string> files, libs;
+                std::string top, se;
                 for (size_t k = 1; k < rest.size(); k++) {
                     std::string a = rest[k];
                     auto val = [&]() -> std::string {
                         if (k + 1 >= rest.size()) throw Error(a + " needs a value");
                         return rest[++k];
                     };
-                    if (a == "-top") dg.top = val();
-                    else if (a == "-lib") dg.libs.push_back(val());
-                    else if (a == "-se") dg.se = val();
+                    if (a == "-top") top = val();
+                    else if (a == "-lib") libs.push_back(val());
+                    else if (a == "-se") se = val();
                     else if (a == "-quiet" || a == "-q" || a == "-Werror") continue;
-                    else if (a[0] == '-') throw Error("-diagnose does not take " + a);
-                    else dg.files.push_back(a);
+                    else if (a[0] == '-') throw Error(std::string(who) + " does not take " + a);
+                    else files.push_back(a);
                 }
-                dg.threads = threads, dg.quiet = quiet;
-                return runDiagnose(dg);
+                if (diag && (lbistCov || lbist || bscan || edt || edtEncode)) throw Error("-diagnose is a separate run");
+                if (diag) {
+                    dg.files = files, dg.libs = libs, dg.top = top, dg.se = se;
+                    dg.threads = threads, dg.quiet = quiet;
+                    return runDiagnose(dg);
+                }
+                if (lbist || bscan || edt || edtEncode) throw Error("-lbist_coverage is a separate run");
+                if (lo.scandef.empty()) throw Error("-lbist_coverage needs -scandef FILE");
+                LbistPlan p;
+                p.sd = readScanDef(lo.scandef);
+                p.plan(lo);
+                lc.files = files, lc.libs = libs, lc.top = top, lc.se = se;
+                lc.threads = threads, lc.quiet = quiet;
+                return runLbistCoverage(p, lc);
             }
             if ((int)lbist + (int)bscan + (int)edt + (int)edtEncode > 1) throw Error("-bscan, -lbist, -edt and -edt_encode are separate runs");
             if ((edt || edtEncode) && lo.scandef.empty()) throw Error("-edt needs -scandef FILE");

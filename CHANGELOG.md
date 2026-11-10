@@ -28,6 +28,10 @@ Spec references are IEEE 1800-2023 clauses.
   polynomial, phase shifter, space compactor, MISR, controller and wrapper),
   the golden signature by simulation (`-lbist_sign`), a check for X sources,
   and ICL / PDL to run it over IJTAG.
+- `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
+  on the gate netlist (port inputs at 0, scan cells observed), with the
+  coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
+  `-lbist_min_coverage` gate. Uses the shared fault simulator.
 - `mdft -diagnose`: scan failure diagnosis. Reads a tester fail log (pattern,
   chain, cell or output) with matpg's patterns and the gate netlist, and ranks
   the stuck-at or transition faults that explain it, with equivalent faults

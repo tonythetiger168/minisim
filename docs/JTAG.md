@@ -187,6 +187,40 @@ BIST. Fault coverage and test points are not reported yet: they wait for the
 fault simulator of the ATPG work, which this will call instead of bringing a
 second one. Primary outputs are not observed during BIST.
 
+### Fault coverage: `mdft -lbist_coverage`
+
+How much of the design do the pseudo-random patterns test? `-lbist_coverage`
+takes the same options as `-lbist` (so the PRPG, seed and pattern count are
+the same), works out what every scan cell holds before each capture, and
+grades those patterns on the scan-inserted gate netlist with the shared
+fault simulator:
+
+```
+mdft -lbist_coverage -scandef chains.json -lbist_patterns 4096 chip_scan.v -lib cells.lib -top chip
+```
+
+```
+mdft: logic BIST coverage of chip: 4096 patterns, 16 chains, 6000 scan cells observed, port inputs at 0
+  detected                          DT       231870
+  ...
+  test coverage                              91.42%
+  coverage by pattern count:  64: 61.20%  128: 70.11%  ...  4096: 91.42%
+```
+
+It grades under the conditions the wrapper creates: port inputs are 0,
+resets are off, and only scan cells are observed, so logic that only drives
+port outputs counts as not observed. The curve shows where more patterns
+stop paying. `-lbist_faults FILE` lists every fault with its class (`ND`
+faults are where test points would help), `-lbist_json FILE` writes the
+numbers, and `-lbist_min_coverage P` fails the run under P percent. A scan
+cell that captures an unknown value is reported, because it makes the
+signature unrepeatable. The run uses every core (`-threads N`) and gives the
+same result for any thread count.
+
+The grade is checked in the test suite against the real wrapper: faults
+graded detected change the simulated signature, faults graded not detected
+do not.
+
 ## Scan compression: `mdft -edt`
 
 ```sh
