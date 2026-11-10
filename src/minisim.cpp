@@ -2433,7 +2433,7 @@ struct Sim {
     }
 };
 
-Sim S;
+inline Sim S;
 inline void Sim::closeHook(uint32_t fd) { S.fileClosed(fd); }
 
 // Frames and objects (expr.hpp): blocks of hidden signals made at run time.
@@ -2517,17 +2517,17 @@ struct WaitAny {
 static bool isA(int obj, int cls) { return classIsA((int)S.sigs[obj].val.v, cls); }
 
 // ---- the design + testbench ----
-int clk, rst, cnt;
+inline int clk, rst, cnt;
 
 // always #5 clk = ~clk;
-Task clockgen() {
+inline Task clockgen() {
     for (;;) {
         co_await Delay{5};
         S.set(clk, mk(!(S.get(clk).v & 1)));
     }
 }
 // always @(cnt) $display(...)
-Task monitor() {
+inline Task monitor() {
     for (;;) {
         co_await Wait{cnt, ANY};
         Val c = S.get(cnt);
@@ -2537,7 +2537,7 @@ Task monitor() {
     }
 }
 // initial begin clk=0; rst=1; #22 rst=0; #100 $finish; end
-Task stimulus() {
+inline Task stimulus() {
     S.set(clk, mk(0));
     S.set(rst, mk(1));
     co_await Delay{22};

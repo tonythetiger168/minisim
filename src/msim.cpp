@@ -52,6 +52,8 @@
 //                    siblings last (default: pin, except under a hypervisor)
 //   -cpuinfo         print the detected CPU topology and exit
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
+//   -cfiles <n>      -compile: build the design as up to n C++ files in parallel
+//                    (default: one per core, 16 at most, for a large design)
 //   -O<n>            optimization level for -compile (default -O2)
 //   -upf <file>      power-aware simulation with this IEEE 1801 (UPF) power
 //                    intent (upf.hpp, upf_rt.inc). Adds package UPF for the
@@ -93,6 +95,7 @@
 //
 // Exit status: 0 when the simulation ran, 1 on a compile or lowering error,
 // 2 on a bad command line.
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -347,6 +350,7 @@ static bool readCompiledCov(const std::string& path, const std::vector<std::pair
     return ok;
 }
 
+static int g_cfiles = 0;   // -cfiles: 0 = automatic
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
@@ -383,7 +387,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     }
     try {
         // With a VCD every signal must live in S.sigs, so no private signals.
-        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr);
+        // A large design is built as several files at once, one per core (16 at most).
+        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr,
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()));
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -397,6 +403,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (lockFd >= 0) ::flock(lockFd, LOCK_EX);
     struct Unlock { int fd; ~Unlock() { if (fd >= 0) ::close(fd); } } unlock{lockFd};
     std::string build = shq(cc) + " -std=c++20 " + opt + " -I" + shq(inc) + " " + shq(cpp) + " -o " + shq(exe);
+    std::string fstC, fstL;   // FST: extra compile and link arguments
     // An FST waveform: build simv with libfst too. Its C sources are compiled
     // once into <dir>/fst/*.o with $CC (default cc).
     if (vcdPath && vcdPath->ends_with(".fst")) {
@@ -418,6 +425,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             if (std::system(c.c_str()) != 0) { std::cerr << "msim: -compile: libfst build failed: " << c << "\n"; return 1; }
         }
         build += " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fd) + objs + " -lz -pthread";
+        fstC = " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fd);
+        fstL = objs + " -lz -pthread";
     }
     // Build cache: the same generated source, compiler command and kernel
     // sources as the simv already in `dir` reuse it. A rebuild of a large
@@ -435,7 +444,63 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                  std::to_string(ec ? 0 : (long long)t.time_since_epoch().count()) + "\n";
     }
     std::error_code ec;
-    bool fresh = std::filesystem::exists(exe, ec) && slurp(dir + "/simv.stamp") == stamp && slurp(cpp) == src;
+    // Several files (codegen split a large design): each compiles on its own
+    // core, and a file the same as last time keeps its object.
+    std::vector<std::pair<std::string, std::string>> files;
+    for (size_t at = src.rfind(kFileMark, 0) == 0 ? 0 : std::string::npos; at != std::string::npos;) {
+        size_t nl = src.find('\n', at), next = src.find(std::string("\n") + kFileMark, nl);
+        std::string name = src.substr(at + std::strlen(kFileMark), nl - at - std::strlen(kFileMark));
+        files.push_back({name, src.substr(nl + 1, next == std::string::npos ? std::string::npos : next + 1 - (nl + 1))});
+        at = next == std::string::npos ? next : next + 1;
+    }
+    if (!files.empty()) {
+        std::string cflags = " -std=c++20 " + opt + " -I" + shq(inc) + fstC;
+        stamp = cflags + fstL + "\n" + stamp;
+        bool sameFlags = slurp(dir + "/simv.stamp") == stamp;
+        bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
+        std::filesystem::remove(dir + "/simv.stamp", ec);
+        std::vector<std::string> jobs, objs;
+        for (auto& [name, text] : files) {
+            std::string path = dir + "/" + name;
+            bool same = slurp(path) == text;
+            if (!same) {
+                std::ofstream f(path, std::ios::binary);
+                f << text;
+                if (!f) { std::cerr << "msim: cannot write " << path << "\n"; return 1; }
+            }
+            if (!name.ends_with(".cpp")) continue;
+            std::string obj = path.substr(0, path.size() - 4) + ".o";
+            objs.push_back(obj);
+            if (same && hdrSame && sameFlags && std::filesystem::exists(obj, ec)) continue;
+            std::filesystem::remove(obj, ec);
+            jobs.push_back(shq(cc) + cflags + " -c " + shq(path) + " -o " + shq(obj));
+        }
+        // Remove parts left from an earlier, larger split.
+        for (int k = (int)files.size() - 2;; k++) {
+            std::string old = dir + "/part" + std::to_string(k);
+            if (!std::filesystem::exists(old + ".cpp", ec)) break;
+            std::filesystem::remove(old + ".cpp", ec);
+            std::filesystem::remove(old + ".o", ec);
+        }
+        std::atomic<size_t> next{0};
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> pool;
+        for (int t = 0; t < std::min<int>(maxThreads(), (int)jobs.size()); t++)
+            pool.emplace_back([&] {
+                for (size_t j; (j = next++) < jobs.size();)
+                    if (std::system(jobs[j].c_str()) != 0) { failed = true; std::cerr << "msim: -compile: C++ build failed: " << jobs[j] << "\n"; }
+            });
+        for (auto& t : pool) t.join();
+        if (failed) return 1;
+        if (!jobs.empty() || !std::filesystem::exists(exe, ec)) {
+            std::string link = shq(cc) + " " + opt;
+            for (auto& o : objs) link += " " + shq(o);
+            link += fstL + " -o " + shq(exe);
+            if (std::system(link.c_str()) != 0) { std::cerr << "msim: -compile: link failed: " << link << "\n"; return 1; }
+        }
+        std::ofstream(dir + "/simv.stamp") << stamp;
+    }
+    bool fresh = !files.empty() || (std::filesystem::exists(exe, ec) && slurp(dir + "/simv.stamp") == stamp && slurp(cpp) == src);
     if (!fresh) {
         std::filesystem::remove(dir + "/simv.stamp", ec);
         {
@@ -634,6 +699,7 @@ static void usage() {
                  "                 and reuses <dir>/simv while the design is unchanged\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
+                 "  -cfiles <n>    -compile: build in up to n C++ files at once (default: one per core, 16 at most)\n"
                  "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
@@ -726,6 +792,7 @@ int main(int argc, char** argv) {
         if (a == "-power_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
         if (a == "-upf_verbose" || a == "+upf_verbose") { upfVerbose = true; continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
+        if (a == "-cfiles") { g_cfiles = std::max(1, std::atoi(next("a file count").c_str())); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
         if (a == "+notimingcheck" || a == "+notimingchecks") { timingChecksOn() = false; continue; }

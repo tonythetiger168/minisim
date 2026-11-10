@@ -6399,6 +6399,50 @@ struct Lowerer {
     // Whether two items of a unique case can match the same selector value:
     // 0 never, 1 only when the selector has x or z bits, 2 maybe. Only
     // constant labels are checked here; anything else is checked at run time.
+    // A unique / unique0 case with many items that may overlap. Checking
+    // "no later item matches" right after each match costs O(n^2) code (for
+    // Ibex's CSR decoder that made a 1.3 MB C++ function under -compile). So
+    // the first matching item k is recorded in `hit`, one shared pass looks
+    // for a later match (and reports once), then `hit` picks the statement.
+    // The items' conditions are evaluated in the same order as before.
+    void uniqueCaseLinear(const slang::ast::Statement& s, const slang::ast::CaseStatement& c,
+                          const std::vector<E>& conds, const E& selUnknown) {
+        size_t n = c.items.size();
+        int hit = fresh(32);
+        auto num = [](size_t k) { return konst(make(k, 0, 32)); };
+        std::vector<size_t> toCheck, toEnd;
+        for (size_t k = 0; k < n; k++) {
+            size_t jf = emitJmpIfNot(conds[k]);
+            Instr a; a.k = IK::Assign; a.sig = hit; a.e = num(k); prog.emit(a);
+            Instr j; j.k = IK::Jmp; toCheck.push_back(prog.emit(j));
+            prog.code[jf].target = prog.here();
+        }
+        // No item matched.
+        bool needAll = c.check == slang::ast::UniquePriorityCheck::Unique;
+        if (c.defaultCase) stmt(*c.defaultCase);
+        else if (needAll) violation(s, checkName(c.check) + " case: no case item matches", c.check);
+        { Instr j; j.k = IK::Jmp; toEnd.push_back(prog.emit(j)); }
+        // A later item that also matches.
+        for (size_t k : toCheck) prog.code[k].target = prog.here();
+        std::vector<size_t> toPick;
+        for (size_t m = 1; m < n; m++) {
+            E later = bin(Op::LogAnd, bin(Op::Lt, ref(hit), num(m)), conds[m]);
+            if (selUnknown) later = bin(Op::LogAnd, selUnknown, later);
+            size_t jf = emitJmpIfNot(later);
+            violation(s, checkName(c.check) + " case: more than one case item matches", c.check);
+            Instr j; j.k = IK::Jmp; toPick.push_back(prog.emit(j));
+            prog.code[jf].target = prog.here();
+        }
+        for (size_t k : toPick) prog.code[k].target = prog.here();
+        // Run the matched item.
+        for (size_t k = 0; k < n; k++) {
+            size_t jf = emitJmpIfNot(bin(Op::Eq, ref(hit), num(k)));
+            stmt(*c.items[k].stmt);
+            Instr j; j.k = IK::Jmp; toEnd.push_back(prog.emit(j));
+            prog.code[jf].target = prog.here();
+        }
+        for (size_t k : toEnd) prog.code[k].target = prog.here();
+    }
     static int caseMayOverlap(const slang::ast::CaseStatement& c) {
         using namespace slang::ast;
         using slang::logic_t;
@@ -7355,6 +7399,10 @@ struct Lowerer {
                 if (ov == 1)
                     selUnknown = bin(Op::Ne, sysFnNode(SF_COUNTBITS, {expr(c.expr)}, 12), konst(make(0, 0, 32, 0, true)));
                 std::vector<size_t> toEnd;
+                if (mayOverlap && c.items.size() > 8) {   // many items: a check of linear size
+                    uniqueCaseLinear(s, c, conds, selUnknown);
+                    break;
+                }
                 for (size_t k = 0; k < c.items.size(); k++) {
                     Instr j; j.k = IK::JmpIfNot; j.e = conds[k];
                     size_t jf = prog.emit(j);

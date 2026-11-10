@@ -581,7 +581,7 @@ struct WaitFork {
     void await_resume() const {}
 };
 
-Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
+inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr);
 
 // ---- programs (24.3, 24.7) ----
 // When every initial procedure of a program has ended, the program ends:
@@ -719,7 +719,7 @@ static Task startReport(DeferRep& r) {
 }
 // Observed region: concurrent assertions waiting here run, then observed
 // deferred reports mature and their actions go to the reactive region (16.4.1).
-void Sim::runObserved() {
+inline void Sim::runObserved() {
     region = R_OBSERVED;
     while (!observedQ.empty()) {
         Handle h = observedQ.front();
@@ -749,7 +749,7 @@ void Sim::runObserved() {
     region = R_ACTIVE;
 }
 // Postponed region: final deferred reports mature and their actions run now.
-void Sim::matureFinal() {
+inline void Sim::matureFinal() {
     vector<DeferRep> reps;
     reps.swap(defFin);
     for (auto& r : reps)
@@ -1167,7 +1167,7 @@ static Val upfWrite(const Prog* e, int sig, int hi, int lo, const Val& v) {
     return allx(v.w);
 }
 
-Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
+inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
     const Prog* p = entry;
     const FrameP fr0 = fr;
     size_t pc = 0;
