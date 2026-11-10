@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Foreach constraints with several loop variables over containers of
+  containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
+  over a fixed-size array of queues and associative arrays with string keys.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
