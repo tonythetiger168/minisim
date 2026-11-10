@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpower`, power analysis on the msim front end: average power by group,
+  instance and cell from SAIF, VCD or FST activity and Liberty
+  `internal_power` / `leakage_power` tables; activity propagation for nets
+  the file does not name (RTL activity on a gate netlist, or `-clock` with no
+  activity); an RTL estimate (register bits as the library's flop, logic as
+  reference gates); `-peak` with `-waveform` for power over time; `-upf` for
+  power per domain with domain voltages and switched domains; `-json`.
+  Multithreaded, with the same report on any thread count. `msim -saif`
+  writes SAIF from a simulation, and `mpower -write_saif` converts a
+  waveform. `src/saif.hpp` (SAIF reader and writer) and `src/power.hpp` (the
+  computation) are shared headers. See `docs/POWER.md`.
 - Shared headers for the tools: `src/parallel.hpp` (default thread count,
   the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
   `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`

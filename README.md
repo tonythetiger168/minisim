@@ -377,6 +377,19 @@ joined across port connections, so one clock passed down through several
 modules stays one domain. Findings print as
 `file:line:col: warning: [RULE] text`, sorted by file and line.
 
+### Power analysis: `mpower`
+
+`mpower` reports average and peak power from a simulation's switching
+activity (SAIF, VCD or FST) and a Liberty library, for a gate netlist or as
+an estimate for RTL, by group, instance, cell and UPF power domain
+([docs/POWER.md](docs/POWER.md)):
+
+```sh
+msim cells.v netlist.v tb.sv -top tb -saif run.saif
+mpower netlist.v -top dut -lib cells.lib -activity run.saif -strip_path tb.dut
+mpower rtl.sv -top dut -activity run.fst -peak -waveform power.csv   # RTL estimate, power over time
+```
+
 ### Source-level debug: `mdebug`
 
 `mdebug` lists the drivers and loads of a signal with the conditions on each

@@ -1143,10 +1143,6 @@ struct PDesign {
                 for (auto* s : lg.writes) bitsOfSym(s, outs);
                 cl.io.insert(cl.io.end(), outs.begin(), outs.end());
             }
-            if (std::getenv("MPOWER_DEBUG_GE") && cl.ge > 200)
-                std::cerr << "ge " << cl.ge << " " << cl.name << " reads " << lg.reads.size() << " regs " << lg.regs.size()
-                          << " writes " << lg.writes.size() << (lg.writes.empty() ? "" : " " + std::string(lg.writes[0]->name))
-                          << (lg.regs.empty() ? "" : " " + std::string(lg.regs[0]->name)) << "\n";
             if (cl.ge > 0 || !cl.io.empty()) insts.push_back(std::move(cl));
         }
         logic.clear();
@@ -1557,14 +1553,6 @@ inline int analyze(Options& o, std::vector<std::string> fwd, unsigned threads, R
                     if (bi >= 0) apply(in.net[p], bi, so == 2);
                 }
             }
-        }
-        if (std::getenv("MPOWER_DEBUG_ANN")) {
-            int shown = 0;
-            for (size_t n = 0; n < nets.size() && shown < 60; n++)
-                if (!nets[n].ann && !nets[n].konst && nets[n].used && netSym[n] >= 0 && (n % 37) == 0) {
-                    std::cerr << "unannotated " << netName((int)n) << "\n";
-                    shown++;
-                }
         }
         lap("annotate");
         // ---- clocks: the nets on clock pins, and what drives them
