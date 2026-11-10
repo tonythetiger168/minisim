@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
+  of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
+  bus, logic in front of a synchronizer, reconvergence, a signal synchronized
+  twice) and `RDC001` to `RDC004` (a reset from another clock domain, one
+  reset used raw in several domains, a flop feeding a flop with another reset
+  or with none). Synchronizers in one block, with a reset, as shift registers
+  or as per-bit synchronizer cells, enable-qualified buses and Gray-coded
+  pointers are recognized; clock gates stay in their clock's domain and bits
+  of a clock bus are separate clocks. New options: `-cdc-report`,
+  `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
 - `mpopt`: RTL power optimization. Finds clock gating from enables (CG),
   sequential clock gating from registers whose sources did not load in the
   cycle before (SCG), memory gating (MG) and operand isolation of multipliers
