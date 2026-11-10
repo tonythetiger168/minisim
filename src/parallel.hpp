@@ -108,7 +108,9 @@ void parallelFor(size_t n, unsigned threads, F&& f) {
 
 // The same, with threads that stay: for a tool that runs many batches (a
 // solver's iterations, one batch per clock). Workers sleep between batches.
-// run() is not reentrant: do not call it from inside f.
+// A batch of one index runs inline, with no lock taken; a small batch wakes
+// only the workers it has work for. run() is not reentrant: do not call it
+// from inside f.
 class Pool {
 public:
     // 0 threads means the default: every logical CPU.
@@ -161,14 +163,17 @@ public:
         }
         detail::Batch b;
         b.n = n;
-        std::function<void()> job = [&] { b.work(f); };
+        std::function<void()> job = [&] { b.work(f); };   // two references: no allocation
+        // Only as many workers as there is work for are woken: a batch of
+        // three indices on a 64-thread pool wakes two.
+        unsigned k = (unsigned)std::min<size_t>(workers_.size(), n - 1);
         {
             std::lock_guard<std::mutex> g(mu_);
             job_ = &job;
-            gen_++;
-            busy_ = (unsigned)workers_.size();
+            slots_ = busy_ = k;
         }
-        wake_.notify_all();
+        if (k == workers_.size()) wake_.notify_all();
+        else for (unsigned i = 0; i < k; i++) wake_.notify_one();
         b.work(f);
         std::unique_lock<std::mutex> g(mu_);
         done_.wait(g, [&] { return busy_ == 0; });
@@ -179,14 +184,13 @@ public:
 
 private:
     void loop() {
-        uint64_t seen = 0;
         for (;;) {
             std::function<void()>* job;
             {
                 std::unique_lock<std::mutex> g(mu_);
-                wake_.wait(g, [&] { return stop_ || gen_ != seen; });
+                wake_.wait(g, [&] { return stop_ || slots_ > 0; });
                 if (stop_) return;
-                seen = gen_;
+                slots_--;   // this worker takes one place in the batch
                 job = job_;
             }
             (*job)();
@@ -199,8 +203,8 @@ private:
     std::mutex mu_;
     std::condition_variable wake_, done_;
     std::function<void()>* job_ = nullptr;
-    uint64_t gen_ = 0;
-    unsigned busy_ = 0;
+    unsigned slots_ = 0;   // places in the current batch not yet taken
+    unsigned busy_ = 0;    // workers the batch still waits for
     bool stop_ = false;
 };
 
