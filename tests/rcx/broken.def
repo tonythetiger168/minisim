@@ -1,0 +1,16 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN broken ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 12000 4200 ) ;
+NETS 3 ;
+  - gap + USE SIGNAL
+    + ROUTED metal1 ( 0 2000 ) ( 1000 * )
+      NEW metal1 ( 3000 2000 ) ( 4000 * ) ;
+  - s1 + USE SIGNAL
+    + ROUTED metal1 ( 0 3000 ) ( 5000 * ) ;
+  - s2 + USE SIGNAL
+    + ROUTED metal1 ( 2000 2600 ) ( * 3400 ) ;
+END NETS
+END DESIGN
