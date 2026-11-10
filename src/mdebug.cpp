@@ -837,6 +837,69 @@ struct Tool {
         onPath.erase(s);
     }
 
+    // The block view of one scope: its instances, what each port connects
+    // to, and which instance feeds which.
+    bool blocks(const std::string& name) {
+        auto parent = [](const std::string& p) { size_t d = p.rfind('.'); return d == std::string::npos ? std::string() : p.substr(0, d); };
+        auto leaf = [](const std::string& p) { size_t d = p.rfind('.'); return d == std::string::npos ? p : p.substr(d + 1); };
+        const ScopeRec* sc = nullptr;
+        int n = 0;
+        for (auto& r : db.scopes) {
+            if (r.path == name) { sc = &r; n = 1; break; }
+            if (r.path.size() > name.size() && r.path.compare(r.path.size() - name.size() - 1, std::string::npos, "." + name) == 0) { sc = &r; n++; }
+        }
+        if (n != 1) {
+            std::cerr << "mdebug: " << (n ? "more than one instance ends in '" : "no instance '") << name << "'\n";
+            return false;
+        }
+        struct Blk { const ScopeRec* r; std::vector<std::string> in, out; };
+        std::vector<Blk> bs;
+        std::map<std::string, size_t> ix;
+        for (auto& r : db.scopes)
+            if (parent(r.path) == sc->path) { ix[r.path] = bs.size(); bs.push_back({&r, {}, {}}); }
+        // net in this scope -> the ports that drive it, and the ports it feeds
+        std::map<std::string, std::vector<std::string>> from, to;
+        for (const Driver& d : db.drivers) {
+            if (d.kind != "port" || !db.sigIx.count(d.target)) continue;
+            std::string tp = path(*d.target), ts = parent(tp);
+            if (auto it = ix.find(ts); it != ix.end()) {
+                if (!d.rhs) continue;   // an output of an instance one level further down
+                std::string nets;
+                for (const Symbol* r : d.reads) {
+                    if (!db.sigIx.count(r)) continue;
+                    std::string rp = path(*r);
+                    nets += (nets.empty() ? "" : ", ") + rp;
+                    to[rp].push_back(leaf(ts) + "." + leaf(tp));
+                }
+                if (nets.empty()) nets = d.rhs ? db.src.text(d.rhs->sourceRange) : "?";
+                bs[it->second].in.push_back(leaf(tp) + " <- " + nets);
+            }
+            else if (ts == sc->path) {
+                for (const Symbol* r : d.reads) {
+                    if (!db.sigIx.count(r)) continue;
+                    std::string rp = path(*r);
+                    auto jt = ix.find(parent(rp));
+                    if (jt == ix.end()) continue;
+                    bs[jt->second].out.push_back(leaf(rp) + " -> " + tp);
+                    from[tp].push_back(leaf(parent(rp)) + "." + leaf(rp));
+                }
+            }
+        }
+        std::cout << "blocks of " << sc->path << ": " << bs.size() << "\n";
+        for (auto& b : bs) {
+            std::cout << "  " << leaf(b.r->path) << " (" << b.r->def << ")\n";
+            for (auto& l : b.in) std::cout << "    in  " << l << "\n";
+            for (auto& l : b.out) std::cout << "    out " << l << "\n";
+        }
+        for (auto& [net, srcs] : from) {
+            auto it = to.find(net);
+            if (it == to.end()) continue;
+            for (auto& a : srcs)
+                for (auto& b : it->second) std::cout << "  " << a << " -> " << b << "  (" << net << ")\n";
+        }
+        return true;
+    }
+
     bool trace(const std::string& name, int depth) {
         const Symbol* s = find(name);
         if (!s) return false;
@@ -1246,6 +1309,7 @@ void usage() {
                  "  -threads N       threads for parsing and for reading the waveform\n"
                  "                   (default: every logical core; the output is the same for any N)\n"
                  "  -scopes          list the instances    -signals  list the signals\n"
+                 "  -blocks INST     the instances inside INST, their port connections and what feeds what\n"
                  "  -html <file>     write a one-file viewer: hierarchy, source, drivers and\n"
                  "                   loads, a schematic of the cone, and waves when -vcd is given\n"
                  "  -json <file>     write the debug database the viewer reads\n"
@@ -1282,6 +1346,7 @@ int main(int argc, char** argv) {
             std::cout << "mdebug " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
             return 0;
         }
+        if (a == "-blocks") { queries.push_back({"blocks", next("an instance"), -1, std::nullopt}); continue; }
         if (a == "-drivers" || a == "-loads" || a == "-trace" || a == "-active") {
             queries.push_back({a.substr(1), next("a signal"), -1, std::nullopt});
             continue;
@@ -1325,6 +1390,7 @@ int main(int argc, char** argv) {
     for (const Query& q : queries) {
         if (q.what == "drivers") ok &= tool.drivers(q.arg);
         else if (q.what == "loads") ok &= tool.loads(q.arg);
+        else if (q.what == "blocks") ok &= tool.blocks(q.arg);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")

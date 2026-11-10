@@ -122,6 +122,16 @@ The page from `-html` holds a budget of two million value changes. When the
 waveform has more, each signal keeps the changes around `-at T` (or its first
 ones), and mdebug says so.
 
+## Block view
+
+`-blocks INST` lists the instances inside INST: each port with the net it
+connects to (or the expression, for a constant), and which instance output
+feeds which instance input. In the page, selecting an instance in the
+hierarchy draws the same as a block diagram: instances are placed left to
+right in the order data flows, wires join an output to the inputs it feeds,
+and nets that come from the scope's own logic are labelled at the port.
+Click a block to go into it, a net name to select the signal.
+
 ## Tasks, calls and force
 
 A task or function declared in a module drives the signals it assigns, as
