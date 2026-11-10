@@ -487,6 +487,20 @@ Properties are checked in parallel on every core (`-threads N`), with the
 same result for any thread count. See `docs/FORMAL.md` for the model (clock,
 reset, two-state values, what is cut) and the supported property operators.
 
+### Equivalence checking: `mequiv`
+
+`mequiv` proves that a netlist is the same circuit as the RTL it came from
+(or as another netlist, or one RTL revision as the next), the way Formality
+and Conformal do: flops are matched by name and cut, and every output and
+next-state function is proved equal. A failing point comes with the input
+values that show the difference.
+
+```sh
+mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
+```
+
+See [docs/EQUIV.md](docs/EQUIV.md).
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per
