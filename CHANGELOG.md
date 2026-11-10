@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msdc`: timing constraint checks. Reads the design (same front end as
+  `msim`) and its SDC file and reports what is wrong or missing: 32 rules
+  from syntax (SDC001) through clocks, I/O delays and exceptions to paths
+  between clocks with no declared relationship (SDC040). Multithreaded
+  (`-threads N`, same report for any N), `-json`, `-Werror`, `-stats`. See
+  `docs/CONSTRAINTS.md`.
+- SDC reader: object lookups use sorted name indexes and `-filter` is parsed
+  once, so large designs with thousands of queries read in seconds.
 - `src/tcl.hpp`: the one Tcl interpreter of the tool line (`tcl::Interp`),
   split out of the SDC reader. A tool adds its own commands (`addCommand`),
   runs scripts (`load`, `parse`) or a prompt (`shell`), and gets every error
@@ -103,6 +111,8 @@ Spec references are IEEE 1800-2023 clauses.
   subroutine call.
 
 ### Fixed
+- `mlint`, `mdft`: a net connected to thousands of instances no longer makes
+  the clock-domain union-find quadratic (path compression).
 - A cast of a narrow unsigned operand inside a signed expression,
   `int'(u3) % 5`, sign-extended the operand: 6 became -2. The operand is now
   extended with its own signedness, as an assignment to the cast type
