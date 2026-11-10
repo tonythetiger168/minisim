@@ -47,6 +47,20 @@ if(broken STREQUAL rtl)
 endif()
 file(WRITE ${OUT}/broken.sv "${broken}")
 simulate("sdut_edt_tb: FAIL" ${T}/lbist/sdut.sv broken.sv sdut_edt_tb.sv -top sdut_edt_tb)
+# Cubes as matpg -cubes writes them: chains by number, mapped through the
+# "chains" line by scan-in port, and port input lines passed through.
+file(WRITE ${OUT}/num.txt "# cubes\nchains scan_in[1] scan_in[0]\n0 pi 0101\n0 0 1xx0x\n0 1 x01x\n")
+run_ok(${MDFT} -edt_encode -scandef ${T}/lbist/chains.json -edt_cubes num.txt -edt_patterns num_pat.txt)
+file(READ ${OUT}/num_pat.txt np)
+if(NOT np MATCHES "0 pi 0101\n" OR NOT np MATCHES "0 load chain1 1[01][01]0[01]\n" OR NOT np MATCHES "0 load chain0 [01]01[01]\n")
+  message(FATAL_ERROR "numbered chains: num_pat.txt:\n${np}")
+endif()
+file(WRITE ${OUT}/num2.txt "0 0 1xx0\n")
+run_ok(${MDFT} -edt_encode -scandef ${T}/lbist/chains.json -edt_cubes num2.txt)
+if(NOT out MATCHES "there is no 'chains' line")
+  message(FATAL_ERROR "numbered chains without a chains line: no note:\n${out}")
+endif()
+
 # Without cubes the testbench plays random channel data.
 run_ok(${MDFT} -edt ${T}/lbist/sdut.sv -top sdut -scandef ${T}/lbist/chains.json -edt_out . -quiet)
 simulate("sdut_edt_tb: PASS" ${T}/lbist/sdut.sv sdut_edt.sv sdut_edt_tb.sv -top sdut_edt_tb)

@@ -99,6 +99,8 @@ struct EdtPlan {
 struct CubeSet {
     std::vector<std::vector<std::string>> cubes;
     std::vector<long> ids;
+    std::map<long, std::string> pi;   // port input bits of a pattern, passed through
+    bool numbered = false;            // chains were given by number without a "chains" line
 };
 inline CubeSet readCubes(const std::string& path, const EdtPlan& p) {
     std::ifstream f(path);
@@ -107,6 +109,9 @@ inline CubeSet readCubes(const std::string& path, const EdtPlan& p) {
     for (int i = 0; i < p.n; i++) chainIdx[p.sd.chains[i].name] = i;
     CubeSet cs;
     std::map<long, int> where;
+    // matpg -cubes numbers the chains in its own order and says which is
+    // which in a "chains <scan-in port> ..." line.
+    std::vector<int> byNumber;
     std::string line;
     int ln = 0;
     while (std::getline(f, line)) {
@@ -114,12 +119,46 @@ inline CubeSet readCubes(const std::string& path, const EdtPlan& p) {
         size_t h = line.find('#');
         if (h != std::string::npos) line.resize(h);
         std::istringstream is(line);
-        long id;
-        std::string chain, bits;
-        if (!(is >> id)) continue;
-        if (!(is >> chain >> bits)) throw Error(path + ":" + std::to_string(ln) + ": expected '<pattern> <chain> <bits>'");
+        std::string first, chain, bits;
+        if (!(is >> first)) continue;
+        auto bad = [&](const std::string& why) { throw Error(path + ":" + std::to_string(ln) + ": " + why); };
+        if (first == "chains") {
+            while (is >> chain) {
+                int at = -1;
+                for (int i = 0; i < p.n; i++)
+                    if (p.sd.chains[i].scanIn == chain) at = i;
+                if (at < 0) bad("no chain starts at port '" + chain + "' in the scan description");
+                byNumber.push_back(at);
+            }
+            continue;
+        }
+        long id = 0;
+        try {
+            size_t used = 0;
+            id = std::stol(first, &used);
+            if (used != first.size()) throw 0;
+        } catch (...) {
+            bad("expected '<pattern> <chain> <bits>'");
+        }
+        if (!(is >> chain >> bits)) bad("expected '<pattern> <chain> <bits>'");
+        if (chain == "pi") {
+            cs.pi[id] = bits;
+            continue;
+        }
         auto it = chainIdx.find(chain);
-        if (it == chainIdx.end()) throw Error(path + ":" + std::to_string(ln) + ": no chain '" + chain + "'");
+        if (it == chainIdx.end() && !chain.empty() && chain.find_first_not_of("0123456789") == std::string::npos) {
+            // A number: through the "chains" line, else the order of the scan description.
+            size_t k = std::stoul(chain);
+            if (!byNumber.empty() && k < byNumber.size()) it = chainIdx.find(p.sd.chains[byNumber[k]].name);
+            else if (byNumber.empty() && k < (size_t)p.n) {
+                if (!cs.numbered)
+                    std::cerr << "mdft: " << path << ": chains are numbered and there is no 'chains' line; "
+                              << "taking the order of the scan description\n";
+                cs.numbered = true;
+                it = chainIdx.find(p.sd.chains[k].name);
+            }
+        }
+        if (it == chainIdx.end()) bad("no chain '" + chain + "'");
         int want = p.sd.chains[it->second].length;
         if ((int)bits.size() != want)
             throw Error(path + ":" + std::to_string(ln) + ": chain " + chain + " has " + std::to_string(want) + " cells, the line has " +
@@ -281,12 +320,13 @@ inline void writeEdtPatterns(const std::string& path, const EdtPlan& p, const Cu
     std::ostringstream os;
     os << "# mdft EDT patterns: " << p.c << " channels, " << p.T << " shift cycles per pattern (" << p.init
        << " init + " << p.len << ")\n# <pattern> in <channel> <bits, first shifted first>\n"
-       << "# <pattern> load <chain> <bits, scan-in cell first>\n";
+       << "# <pattern> load <chain> <bits, scan-in cell first>\n# <pattern> pi <port input bits, as given with the cubes>\n";
     for (size_t i = 0; i < res.size(); i++) {
         if (!res[i].ok) {
             os << cs.ids[i] << " unencodable\n";
             continue;
         }
+        if (auto pi = cs.pi.find(cs.ids[i]); pi != cs.pi.end()) os << cs.ids[i] << " pi " << pi->second << "\n";
         for (int k = 0; k < p.c; k++) os << cs.ids[i] << " in " << k << " " << res[i].channels[k] << "\n";
         std::vector<std::string> ld = p.loads(res[i].channels);
         for (int ch = 0; ch < p.n; ch++) os << cs.ids[i] << " load " << p.sd.chains[ch].name << " " << ld[ch] << "\n";
