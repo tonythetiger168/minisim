@@ -265,6 +265,8 @@ public:
     // extra["set_dont_touch"] = "| objects=o:cn value=s?".
     std::map<std::string, std::string> extra;
 
+    Reader() { busBrackets = true; }  // get_ports data[3] needs no braces
+
     // The objects behind a word: collection handles and bare names.
     ObjList objects(const std::string& word, const std::string& kinds = "kpicn") {
         return toObjs(word, kinds, here(), false);
