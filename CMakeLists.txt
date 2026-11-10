@@ -83,8 +83,10 @@ if(Python3_FOUND)
 endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/memu.cmake)
 include(cmake/tools/mrcx.cmake)
 include(cmake/tools/shared_par_wave.cmake)
+include(cmake/tools/mequiv.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -155,6 +157,24 @@ if(MINISIM_WITH_SLANG)
     target_link_libraries(mlint PRIVATE OpenSSL::Crypto)
     target_compile_definitions(mlint PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
+
+  # Formal property checking on the same lowering: mformal design.sv
+  # The SAT solver is CaDiCaL (MIT), pinned to a release.
+  FetchContent_Declare(cadical
+    GIT_REPOSITORY https://github.com/arminbiere/cadical.git
+    GIT_TAG rel-2.1.3
+    GIT_SHALLOW TRUE)
+  FetchContent_Populate(cadical)
+  file(GLOB CADICAL_SRC ${cadical_SOURCE_DIR}/src/*.cpp)
+  list(FILTER CADICAL_SRC EXCLUDE REGEX "/(cadical|mobical)\\.cpp$")
+  add_library(cadical STATIC ${CADICAL_SRC})
+  target_include_directories(cadical PUBLIC ${cadical_SOURCE_DIR}/src)
+  target_compile_definitions(cadical PRIVATE NBUILD NDEBUG NCLOSEFROM)
+  target_compile_options(cadical PRIVATE -O3 -w)
+  find_package(Threads REQUIRED)
+  add_executable(mformal src/mformal.cpp)
+  target_include_directories(mformal PRIVATE src)
+  target_link_libraries(mformal PRIVATE slang::slang cadical Threads::Threads)
 
   # Design-for-test checks and a scan chain plan: mdft design.sv
   add_executable(mdft src/mdft.cpp)
@@ -344,6 +364,18 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
+  # Formal property checking: verdicts, thread-count independence, and each
+  # counterexample replayed in msim.
+  add_test(NAME mformal
+           COMMAND ${CMAKE_COMMAND} -DMFORMAL=$<TARGET_FILE:mformal> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mformal_test
+                   -P ${CMAKE_SOURCE_DIR}/tests/mformal.cmake)
+  # mformal against msim on random designs (tests/formal/fuzz.py).
+  if(Python3_FOUND)
+    add_test(NAME mformal_fuzz
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/formal/fuzz.py ${CMAKE_CURRENT_BINARY_DIR}
+                     0 40 ${CMAKE_CURRENT_BINARY_DIR}/mformal_fuzz)
+  endif()
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
@@ -380,7 +412,7 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
+#   bin/msim, bin/minisim, bin/memu, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)
@@ -390,7 +422,7 @@ install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   # Power analysis: mpower (targets, tests and install in its own file)
   include(${CMAKE_SOURCE_DIR}/cmake/tools/mpower.cmake)
-  install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mdebug mformal slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

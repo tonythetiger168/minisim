@@ -20,10 +20,31 @@ Spec references are IEEE 1800-2023 clauses.
   writes SAIF from a simulation, and `mpower -write_saif` converts a
   waveform. `src/saif.hpp` (SAIF reader and writer) and `src/power.hpp` (the
   computation) are shared headers. See `docs/POWER.md`.
-- Shared headers for the tools: `src/parallel.hpp` (default thread count,
-  the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
-  `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
-  (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
+- `memu`, emulation and FPGA prototyping: puts a gate-level netlist
+  (structural Verilog over a Liberty library) on a board of FPGAs. Clock
+  conversion onto one free-running clock (strobes for clean clocks, edge
+  detection for gated, divided and data-read clocks, any number of unrelated
+  clocks), memory mapping to block RAM and LUT RAM, multilevel partitioning
+  under each FPGA's capacity on a board file, routing through FPGAs and
+  time-division multiplexing where wires are short, probes with a trigger
+  and `memu -trace` to a VCD, and a generated testbench that runs the
+  netlist against the emulation. Transactors (`emu/sv`): an AXI4-Lite slave
+  that carries the design's accesses to `msim -mvp` models and an AXI4-Lite
+  master driven by a testbench class through a virtual interface, both
+  stopping the design's clock while the host answers. Multi-threaded with
+  thread-independent results. See `docs/EMULATION.md`.
+- `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
+  failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
+  `strong()`, `always s_eventually`) is proven or falsified with a loop
+  counterexample.
+- `mformal`: formal property checking on the msim front end. Proves or
+  falsifies concurrent and immediate `assert`, takes `assume` as input
+  constraints, reaches `cover` or proves it unreachable. Bounded model
+  checking and k-induction (simple path, proven assertions as lemmas) on
+  CaDiCaL; a VCD of the whole design for every counterexample and cover
+  trace, `-tb` for a testbench that replays it in msim, `-json`; one job per
+  property on every core (`-threads N`), same result for any thread count.
+  See `docs/FORMAL.md`.
 - `mplan`: verification planning and tracking. A plan file maps features to
   tests, code coverage, covergroups and assertions; `mplan report` scores it
   against mregress results and the coverage database, keeps a history of
@@ -43,6 +64,18 @@ Spec references are IEEE 1800-2023 clauses.
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
+- Shared headers for the tools: `src/parallel.hpp` (default thread count,
+  the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
+  `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
+  (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
+- `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
+  netlist, RTL against RTL): both designs become one and-inverter graph,
+  flops and latches are matched by name (or by the net on their output, also
+  when stored inverted) and cut, and every output, next-state function and
+  clock/reset is proved equal by structural hashing, random simulation and
+  SAT on all cores, with a counterexample for each failing point. X in the
+  reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
+  `-report`. See `docs/EQUIV.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -53,7 +86,8 @@ Spec references are IEEE 1800-2023 clauses.
   cursor itself. See `docs/DEBUG.md`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
-  coupling capacitance to same-layer neighbours and to crossings, from an
+  coupling capacitance to same-layer neighbours (who also take over part of
+  the ground fringe) and to crossings one and two layers away, from an
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
@@ -78,6 +112,9 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- `-xprop`: an assignment to an array element chosen at run time
+  (`if (we) mem[addr] <= d;`) is merged with the element's present value
+  instead of blocking the merge or giving `x`.
 - X-propagation: `msim -xprop` (`-xprop=tmerge`, `-xprop=xmerge`,
   `-xprop-report <file>`). In `always` blocks an unknown `if` condition,
   `case` selector or clock / reset edge no longer picks one branch: every
@@ -158,6 +195,9 @@ Spec references are IEEE 1800-2023 clauses.
   subroutine call.
 
 ### Fixed
+- A concurrent assertion read the current value, not the sampled one, of a
+  bit select or indexed part select with a variable index (`r[k]`,
+  `r[k -: 2]`, 16.5.1).
 - A cast of a narrow unsigned operand inside a signed expression,
   `int'(u3) % 5`, sign-extended the operand: 6 became -2. The operand is now
   extended with its own signedness, as an assignment to the cast type
