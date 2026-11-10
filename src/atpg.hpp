@@ -13,92 +13,50 @@
 // any thread count.
 #pragma once
 #include <algorithm>
-#include <atomic>
 #include <climits>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 #include "faultsim.hpp"
+#include "parallel.hpp"
 
 namespace atpg {
 
-// A small fork-join pool: run(fn) calls fn(thread) on every thread.
+// The shared pool (src/parallel.hpp) with a scratch slot per thread: each
+// chunk of a batch borrows a slot number, so a worker's scratch (a Sim::Work,
+// a Podem engine) is found by index and never shared.
 class Pool {
 public:
-    explicit Pool(int n) : n_(std::max(1, n)) {
-        for (int i = 1; i < n_; i++) th_.emplace_back([this, i] { loop(i); });
+    explicit Pool(unsigned n) : pool_(n) {
+        for (int t = (int)pool_.threads() - 1; t >= 0; t--) free_.push_back(t);
     }
-    ~Pool() {
-        {
-            std::lock_guard<std::mutex> l(m_);
-            stop_ = true;
-            gen_++;
-        }
-        cv_.notify_all();
-        for (auto& t : th_) t.join();
-    }
-    int threads() const { return n_; }
-    void run(const std::function<void(int)>& fn) {
-        if (n_ == 1) { fn(0); return; }
-        {
-            std::lock_guard<std::mutex> l(m_);
-            job_ = &fn;
-            pending_ = n_ - 1;
-            gen_++;
-        }
-        cv_.notify_all();
-        fn(0);
-        std::unique_lock<std::mutex> l(m_);
-        done_.wait(l, [this] { return pending_ == 0; });
-    }
-    // fn(thread, index) for index in [0, count), in chunks.
-    void each(int count, int chunk, const std::function<void(int, int)>& fn) {
-        if (n_ == 1 || count <= chunk) {
+    int threads() const { return (int)pool_.threads(); }
+    // fn(slot, index) for index in [0, count), in chunks.
+    template <class F>
+    void each(int count, int chunk, F&& fn) {
+        if (threads() == 1 || count <= chunk) {
             for (int i = 0; i < count; i++) fn(0, i);
             return;
         }
-        std::atomic<int> next{0};
-        run([&](int t) {
-            for (;;) {
-                int b = next.fetch_add(chunk);
-                if (b >= count) return;
-                int e = std::min(count, b + chunk);
-                for (int i = b; i < e; i++) fn(t, i);
+        pool_.chunks((size_t)count, (size_t)chunk, [&](size_t b, size_t e, size_t) {
+            int t;
+            {
+                std::lock_guard<std::mutex> l(m_);
+                t = free_.back();
+                free_.pop_back();
             }
+            for (size_t i = b; i < e; i++) fn(t, (int)i);
+            std::lock_guard<std::mutex> l(m_);
+            free_.push_back(t);
         });
     }
 
 private:
-    void loop(int id) {
-        int seen = 0;
-        for (;;) {
-            const std::function<void(int)>* job;
-            {
-                std::unique_lock<std::mutex> l(m_);
-                cv_.wait(l, [&] { return gen_ != seen; });
-                seen = gen_;
-                if (stop_) return;
-                job = job_;
-            }
-            (*job)(id);
-            {
-                std::lock_guard<std::mutex> l(m_);
-                pending_--;
-            }
-            done_.notify_one();
-        }
-    }
-    int n_;
-    std::vector<std::thread> th_;
+    par::Pool pool_;
     std::mutex m_;
-    std::condition_variable cv_, done_;
-    const std::function<void(int)>* job_ = nullptr;
-    int gen_ = 0, pending_ = 0;
-    bool stop_ = false;
+    std::vector<int> free_;
 };
 
 // ----------------------------------------------------------------- PODEM ----

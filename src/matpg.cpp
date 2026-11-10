@@ -22,7 +22,6 @@
 
 #include "atpg.hpp"
 #include "atpg_model.hpp"
-#include "cpu.hpp"
 #include "version.hpp"
 
 using namespace atpg;
@@ -35,7 +34,7 @@ struct Args {
     std::vector<std::string> libs;
     std::string fault = "stuck";
     Options opt;
-    int threads = 0;
+    unsigned threads = par::defaultThreads();
     double minCoverage = -1;
     bool quiet = false, drc = false;
 };
@@ -532,7 +531,7 @@ int main(int argc, char** argv) {
         else if (s == "-random") a.opt.randomMax = std::stoi(next("a number"));
         else if (s == "-seed") a.opt.seed = std::stoull(next("a number"));
         else if (s == "-no_compact") a.opt.compact = false;
-        else if (s == "-threads") a.threads = std::stoi(next("a number"));
+        else if (par::threadsArg(argc, argv, i, a.threads, "matpg")) continue;
         else if (s == "-stil") a.stil = next("a file");
         else if (s == "-tb") a.tb = next("a file");
         else if (s == "-lib") a.libs.push_back(next("a file"));
@@ -562,7 +561,7 @@ int main(int argc, char** argv) {
         auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
         Design nl = readDesign(a.files, a.libs, a.top);
         Scan scan = traceScan(nl, a.se);
-        int threads = a.threads > 0 ? a.threads : std::max(1, cpuTopo().logical());
+        unsigned threads = a.threads;
         Pool pool(threads);
         if (!a.quiet) {
             int comb = 0;
