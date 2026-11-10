@@ -47,6 +47,22 @@ add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
+# Test pattern generation and fault simulation on a gate netlist (matpg): the
+# fault simulator (src/faultsim.hpp) and PODEM (src/atpg.hpp) against brute
+# force, then the tool on small scan designs.
+find_package(Threads REQUIRED)
+add_executable(matpg src/matpg.cpp)
+target_include_directories(matpg PRIVATE src)
+target_link_libraries(matpg PRIVATE Threads::Threads)
+add_executable(test_faultsim tests/test_faultsim.cpp)
+target_include_directories(test_faultsim PRIVATE src)
+target_link_libraries(test_faultsim PRIVATE Threads::Threads)
+target_compile_options(test_faultsim PRIVATE -UNDEBUG)
+add_test(NAME test_faultsim COMMAND test_faultsim)
+add_test(NAME matpg
+         COMMAND ${CMAKE_COMMAND} -DMATPG=$<TARGET_FILE:matpg> -DSRC=${CMAKE_SOURCE_DIR}
+                 -DOUT=${CMAKE_CURRENT_BINARY_DIR}/matpg_test -P ${CMAKE_SOURCE_DIR}/tests/matpg.cmake)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -262,6 +278,12 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
+  # matpg's patterns replayed in msim (and Icarus when present): they pass on
+  # the design and fail on a copy with a detected fault wired in.
+  add_test(NAME matpg_sim
+           COMMAND ${CMAKE_COMMAND} -DMATPG=$<TARGET_FILE:matpg> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/matpg_sim -DMSIM=$<TARGET_FILE:msim>
+                   -DIVERILOG=${IVERILOG} -DVVP=${VVP} -P ${CMAKE_SOURCE_DIR}/tests/matpg.cmake)
 
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
@@ -287,7 +309,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minisim matpg RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -310,7 +332,7 @@ install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisi
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/ATPG.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
