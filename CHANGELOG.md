@@ -162,6 +162,11 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv lvs -lef tech.lef routed.def -netlist block.v`: LVS of a placed and
+  routed block against its gate netlist. The nets come from the geometry
+  (cell pins from the LEF, wires, vias and block pins from the DEF), not from
+  the DEF's connection lists; opens, shorts, missing or different cells and
+  pins are reported, and `-o` writes the extracted netlist as Verilog.
 - `mpv drc -lef tech.lef routed.def`: design rule checking of a routed DEF,
   with the rules taken from the LEF technology when no `-deck` is given
   (`-write-deck` shows them).

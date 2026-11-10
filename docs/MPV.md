@@ -1,8 +1,8 @@
 # mpv: physical verification
 
-`mpv` checks a layout against a rule deck. This first version does design
-rule checking (DRC) on GDSII; layout versus schematic (LVS) and OASIS input
-are next.
+`mpv` checks a layout: design rule checking (DRC) against a rule deck, on
+GDSII or on a routed DEF, and layout versus schematic (LVS): transistor
+netlist extraction from GDSII, and a routed block against its gate netlist.
 
 ```sh
 mpv drc -deck rules.drc chip.gds                 # every rule, one line each
@@ -149,6 +149,48 @@ parallel transistors merged and source and drain interchangeable. It reports
 unmatched devices and nets and size differences. The command line option to
 compare against a SPICE schematic comes with the shared SPICE reader.
 
+## LVS of a routed block
+
+```sh
+mpv lvs -lef tech.lef -lef cells.lef routed.def -netlist block.v
+mpv lvs -lef tech.lef routed.def -o extracted.v          # extraction only
+```
+
+```
+mpv lvs: block counter, 49 instances, 150 pins, 27 nets, 9 ports
+note: net VDD of the DEF is 3 separate nets in the layout
+open: net s[0] is in 2 pieces in the layout: [ha0/u_s/Y] [m0/A]
+MISMATCH: 49 instances, 21 nets and 9 ports compared, 1 opens, 0 shorts
+```
+
+Here the cells are the devices. The layout's nets are found from the
+geometry alone: the pin shapes of the placed cells (from the LEF), the wires
+and vias of the DEF and the shapes of the block's pins. Shapes of one metal
+layer that overlap or share part of a side are one net, a cut joins the
+metal under and over it, and all shapes of one cell pin are one node. The
+net names and connection lists in the DEF are not trusted; they only name
+the extracted nets in messages.
+
+The netlist is structural Verilog (read by `src/gnetlist.hpp`, hierarchy
+flattened to the leaf cells; `-top` picks the module, by default the one
+named like the DEF design). Instances and ports pair by name, as place and
+route keeps them. Then:
+
+- a net of the netlist whose pins are on several nets of the layout is an
+  **open**, listed with its pieces;
+- a net of the layout that holds pins of several nets of the netlist is a
+  **short**;
+- an instance on one side only, a different cell, a pin the cell does not
+  have, and a pin the netlist leaves open that is wired in the layout are
+  reported too.
+
+Supply pins are compared only when the netlist connects them. Cells with
+nothing but supply pins (fillers, taps) need not be in the netlist. A net of
+the DEF that is several nets in the layout and is not compared (supply rails
+that nothing ties together) is a note, as are pieces of wire that reach no
+pin. Exit status: 0 match, 1 mismatch, 2 error. `-o` writes the extracted
+netlist as Verilog, supply pins included.
+
 ## SKY130 example
 
 `tests/pv/sky130.drc` holds 35 SKY130 rules from diffusion to metal 2. The
@@ -182,4 +224,5 @@ in a canonical form, so the report is identical for every thread count.
 | `src/layout_def.hpp` | a routed DEF with its LEF as a flat layout; a deck from the LEF technology |
 | `src/drc.hpp` | the deck parser and the checks |
 | `src/lvs.hpp` | netlist extraction and netlist comparison |
+| `src/lvs_block.hpp` | block LVS: nets of a routed DEF from its geometry, comparison with a gate netlist |
 | `src/mpv.cpp` | the command line |

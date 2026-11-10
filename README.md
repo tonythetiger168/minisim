@@ -52,7 +52,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
 | `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
 | `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
-| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck and design rule checks |
+| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/lvs.hpp`, `src/lvs_block.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck, design rule checks and LVS |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -675,9 +675,17 @@ rule poly.8   overhang(poly, diff) < 0.13   "poly end cap beyond diff"
 rule licon.5a enclosure(licon & diff, diff | tap) < 0.04  "diff enclosure of licon"
 ```
 
-It runs on every hardware thread by default (`-threads N`), with the same
-report for every thread count. The deck format, the results file and the
-limits are in [docs/MPV.md](docs/MPV.md).
+`mpv lvs` compares a routed block with its gate netlist. The nets are found
+from the geometry of the DEF and LEF, so a missing via is an open and a
+stray wire is a short:
+
+```sh
+mpv lvs -lef tech.lef routed.def -netlist block.v      # exit 1 on a mismatch
+```
+
+It runs on every logical CPU by default (`-threads N`), with the same
+report for every thread count. The deck format, the results file, LVS and
+the limits are in [docs/MPV.md](docs/MPV.md).
 
 ### Virtual prototypes: `-mvp`
 
