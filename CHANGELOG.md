@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mplan`: verification planning and tracking. A plan file maps features to
+  tests, code coverage, covergroups and assertions; `mplan report` scores it
+  against mregress results and the coverage database, keeps a history of
+  snapshots (trend chart, regressions per feature), sorts failures into
+  buckets (new / recurring / flaky / fixed, features and owners blocked,
+  rules for known and waived failures) and writes `plan.json` and
+  `plan.html`. Also `mplan check`, `triage`, `trend`, `init`, the gates
+  `-gate` / `-min-score` / `-fail-on-new`, and `mregress -plan`. See
+  `docs/MPLAN.md`.
 - `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
   of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
   bus, logic in front of a synchronizer, reconvergence, a signal synchronized
@@ -18,32 +27,6 @@ Spec references are IEEE 1800-2023 clauses.
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
-- `mdft -bscan`: IEEE 1149.1 boundary-scan insertion (TAP controller,
-  instruction, BYPASS, IDCODE and boundary registers, 2-state, 3-state and
-  bidirectional pads, EXTEST / SAMPLE / PRELOAD / CLAMP / HIGHZ / INTEST)
-  and the BSDL file; `mdft -bsdl` checks a BSDL file (rules BSD001..009) and
-  writes its device tests as SVF and a self-checking testbench
-  (`docs/JTAG.md`).
-- `mdft -lbist`: logic BIST for a scan-inserted design (PRPG on a primitive
-  polynomial, phase shifter, space compactor, MISR, controller and wrapper),
-  the golden signature by simulation (`-lbist_sign`), a check for X sources,
-  and ICL / PDL to run it over IJTAG.
-- `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
-  on the gate netlist (port inputs at 0, scan cells observed), with the
-  coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
-  `-lbist_min_coverage` gate. Uses the shared fault simulator.
-- `mdft -diagnose`: scan failure diagnosis. Reads a tester fail log (pattern,
-  chain, cell or output) with matpg's patterns and the gate netlist, and ranks
-  the stuck-at or transition faults that explain it, with equivalent faults
-  and a second, third... defect when one does not explain everything. Uses
-  the shared fault simulator; multithreaded with the same report on any
-  thread count. See docs/JTAG.md.
-- `mdft -edt`: scan test compression. A ring-generator decompressor and an
-  XOR compactor around the scan chains, and an encoder that solves test
-  cubes into channel data over GF(2), in parallel and deterministically.
-- `mdft -icl`: IEEE 1687 IJTAG. Reads ICL, writes the scan network as RTL
-  (optionally behind a TAP), and retargets PDL (`iWrite`, `iRead`, `iApply`,
-  `iCall`, ...) through SIBs and scan muxes to SVF and a testbench.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -69,6 +52,9 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Functional coverage in the coverage database: `msim -cov` records the bins
+  of every covergroup type (19.11) and the statistics of every assertion
+  (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
 - Datapath library `dw/`: 47 synthesizable, parameterized SystemVerilog
   building blocks named `MW_*` (adders with five carry architectures,
   Booth/Wallace and array multipliers, multiply-accumulate, dividers, square
@@ -92,12 +78,34 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- X-propagation: `msim -xprop` (`-xprop=tmerge`, `-xprop=xmerge`,
+  `-xprop-report <file>`). In `always` blocks an unknown `if` condition,
+  `case` selector or clock / reset edge no longer picks one branch: every
+  branch that may be taken runs and the assigned variables get the merge of
+  the results, for blocking and nonblocking assignments. Same results in
+  the interpreter, with `-compile` and for every `-threads` count. See
+  `docs/XPROP.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
+  through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
+  gates) or a cell map, checked for a controllable clock and asynchronous
+  set/reset, and stitched into balanced mux-D chains: scan cell swap or a
+  library mux before D, one clock domain per chain or `-mix_clocks` with
+  lockup latches, clock-gate test enables tied to `scan_en`. Writes the
+  netlist, a JSON chain description for ATPG (`-scandef`) and a chain flush
+  testbench (`-tb`). Multithreaded, same output for any `-threads N`.
+- `mdft -mbist`: memory BIST generation for a synchronous single-port RAM:
+  an at-speed March controller and a collar, eight built-in algorithms
+  (MATS+, March X, Y, C-, A, B, LR, SS) or `-march`, data backgrounds, read
+  latency 0 to 16, first-fail address and data. A built-in memory fault
+  simulator reports stuck-at, transition, coupling and address-decoder
+  coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
+  expected results come from that simulator. See `docs/DFT.md`.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
@@ -148,6 +156,32 @@ Spec references are IEEE 1800-2023 clauses.
 - A run-time error (null object access, a crash) names the statement that
   was running; `MSIM_CALLTRACE=1` prints every method and automatic
   subroutine call.
+- `mdft -bscan`: IEEE 1149.1 boundary-scan insertion (TAP controller,
+  instruction, BYPASS, IDCODE and boundary registers, 2-state, 3-state and
+  bidirectional pads, EXTEST / SAMPLE / PRELOAD / CLAMP / HIGHZ / INTEST)
+  and the BSDL file; `mdft -bsdl` checks a BSDL file (rules BSD001..009) and
+  writes its device tests as SVF and a self-checking testbench
+  (`docs/JTAG.md`).
+- `mdft -icl`: IEEE 1687 IJTAG. Reads ICL, writes the scan network as RTL
+  (optionally behind a TAP), and retargets PDL (`iWrite`, `iRead`, `iApply`,
+  `iCall`, ...) through SIBs and scan muxes to SVF and a testbench.
+- `mdft -lbist`: logic BIST for a scan-inserted design (PRPG on a primitive
+  polynomial, phase shifter, space compactor, MISR, controller and wrapper),
+  the golden signature by simulation (`-lbist_sign`), a check for X sources,
+  and ICL / PDL to run it over IJTAG.
+- `mdft -edt`: scan test compression. A ring-generator decompressor and an
+  XOR compactor around the scan chains, and an encoder that solves test
+  cubes into channel data over GF(2), in parallel and deterministically.
+- `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
+  on the gate netlist (port inputs at 0, scan cells observed), with the
+  coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
+  `-lbist_min_coverage` gate. Uses the shared fault simulator.
+- `mdft -diagnose`: scan failure diagnosis. Reads a tester fail log (pattern,
+  chain, cell or output) with matpg's patterns and the gate netlist, and ranks
+  the stuck-at or transition faults that explain it, with equivalent faults
+  and a second, third... defect when one does not explain everything. Uses
+  the shared fault simulator; multithreaded with the same report on any
+  thread count. See docs/JTAG.md.
 
 ### Fixed
 - An inout port connected to a whole net is now that net (23.3.3.1). It was
