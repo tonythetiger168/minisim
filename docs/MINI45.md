@@ -15,12 +15,16 @@ from another library, and it must not be used for a real chip.
 | `mini45_tech.lef` | technology LEF: site, six metal layers, vias |
 | `mini45.lef` | cell LEF: one macro per cell with pin shapes |
 | `mini45_tb.sv` | self-checking bench of the Verilog models |
-| `gen_mini45.py` | the generator: every file above comes from it |
+| `mini45.sp` | transistor netlists: one `.subckt` per cell |
+| `mini45_models_tt.sp`, `_ss`, `_ff` | level-1 MOSFET models per corner |
+| `gen_mini45.py` | the generator: every file above but the Liberty files comes from it |
+| `characterize.sh` | measures the Liberty files from the netlists with `mchar` |
 
 ```sh
 msim netlist.v lib/mini45/mini45.v -top top       # gate-level simulation
 python3 lib/mini45/gen_mini45.py                  # regenerate after editing the generator
-ctest -R mini45                                   # files up to date, models correct
+lib/mini45/characterize.sh build/mchar            # measure the Liberty files again (minutes)
+ctest -R 'mini45|mchar'                           # files up to date, models correct, tables as measured
 ```
 
 ## Cells
@@ -60,14 +64,33 @@ Units are ns, fF, V, kohm, nW. Each corner has:
 - `function`, `three_state`, `max_capacitance`, pin capacitances,
   `pg_pin`s, three `wire_load` models and `operating_conditions`.
 
-The numbers come from a small analytic model in the generator: logical
-effort for delay (a pull-up and pull-down resistance per unit drive, a
-parasitic term per cell, a slew term), switched internal capacitance plus a
-short-circuit term for energy, and a per-cell leakage scaled by corner. That
-gives tables with the right shape and ordering: a stronger drive is faster
-and bigger, a stack is slower, the slow corner is slower and the hot one
-leaks more. They are not measured from transistors; the characterizer will
-replace them with simulated values.
+## Where the numbers come from
+
+The timing, power and capacitance numbers are measured. Each cell has a
+static CMOS transistor netlist in `mini45.sp` (complex gates, transmission
+gate flops and latches, sized by drive strength), and `mchar`
+([CHAR.md](CHAR.md)) simulates every arc on `mspice` at each corner's supply
+and temperature with that corner's device models:
+
+- delay and transition tables, clock-to-output, reset and set arcs;
+- setup, hold, recovery and removal tables (the offset at which the
+  clock-to-output delay is 10% longer);
+- internal energy per transition and pin capacitance.
+
+The devices are level-1 MOSFETs with made-up parameters (50 nm gate, an
+inverter of 0.2 um over 0.3 um), chosen to land near a 45 nm process: a
+fanout-of-4 inverter delay of about 20 ps at the typical corner. They are
+not a foundry model, and a level-1 device knows nothing of velocity
+saturation or subthreshold current, so:
+
+- **Leakage is analytic**, not measured: a per-cell value by input state,
+  scaled by corner (a level-1 transistor does not leak when it is off).
+- **Tristate enable and disable arcs** (`TBUF`) and **minimum pulse widths**
+  are analytic too: `mchar` does not measure them yet.
+
+The generator still holds the analytic model (logical effort for delay,
+simple energy and leakage rules) these come from; it also writes the
+templates that tell `mchar` what to measure.
 
 ## Physical view
 

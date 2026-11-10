@@ -33,8 +33,6 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 #include "liberty.hpp"
 #include "parallel.hpp"
 #include "spice.hpp"
@@ -282,7 +280,7 @@ struct Tech {
 
 // The largest time step for an event with this ramp: mspice's own step
 // control does not see the charge on femtofarad nodes.
-inline double stepFor(double ramp) { return std::clamp(0.1 * ramp + 1e-12, 1e-12, 8e-12); }
+inline double stepFor(double ramp) { return std::clamp(0.25 * ramp + 1e-12, 1e-12, 20e-12); }
 
 struct Wave {
     std::vector<std::pair<std::string, std::string>> pts;   // time and value expressions
@@ -304,16 +302,14 @@ struct Deck {
 struct Runner {
     const Options& opt;
     const Tech& tech;
-    std::string dir;
 
     spice::Netlist read(const Deck& d, size_t id) const {
-        std::string path = dir + "/d" + std::to_string(id) + ".cir";
+        std::ostringstream f;
         {
-            std::ofstream f(path);
             f << "mchar " << d.cell << "\n";
             for (auto& m : opt.models) f << ".include \"" << m << "\"\n";
             f << ".include \"" << opt.spiceFile << "\"\n";
-            f << ".temp " << tech.temp << "\n.option reltol=" << opt.reltol << (d.euler ? " method=euler" : "") << "\n";
+            f << ".temp " << tech.temp << "\n.option reltol=" << opt.reltol << " chgtol=1e-17 trtol=1" << (d.euler ? " method=euler" : "") << "\n";
             for (auto& [k, v] : d.params) {
                 char b[64];
                 std::snprintf(b, sizeof b, "%.12g", v);
@@ -336,9 +332,7 @@ struct Runner {
             for (auto& o : d.outs) f << " v(" << lowerOf(o) << ")";
             f << "\n.end\n";
         }
-        spice::Netlist nl = spice::Reader().read(path);
-        std::remove(path.c_str());
-        return nl;
+        return spice::Reader().readText(f.str(), "mchar deck " + std::to_string(id) + " (" + d.cell + ")");
     }
 };
 
@@ -402,7 +396,7 @@ std::string stimulus(const Logic& L, const std::vector<int>& flips, Deck& d) {
         lvl[p] = !lvl[p];
         w.push_back({t + "+tedge", lvl[p] ? "vdd" : "0"});
     }
-    return std::to_string(k + 1) + "*ts";
+    return std::to_string(k + 1) + "*ts+tpre";
 }
 
 // ------------------------------------------------------------------ jobs
@@ -467,7 +461,7 @@ struct Char {
         d.outs = w.L.outs;
         for (auto& o : d.outs) d.load[o] = "cmin";
         d.params = {{"vdd", tech.vdd}, {"ts", opt.settle}, {"tedge", 20e-12}, {"cmin", minLoad * tech.cUnit},
-                    {"cl", minLoad * tech.cUnit}, {"tr", 20e-12}, {"tstop", 1e-9}, {"trc", 20e-12}, {"off", 0}, {"tmax", 5e-12}};
+                    {"cl", minLoad * tech.cUnit}, {"tr", 20e-12}, {"tstop", 1e-9}, {"trc", 20e-12}, {"off", 0}, {"tmax", 5e-12}, {"tpre", 0}};
         return d;
     }
 
@@ -498,7 +492,6 @@ struct Char {
             State at;
             if (!arcPlan(w, j, pd, flips, at)) throw std::runtime_error("no stimulus");
             const Logic& L = w.L;
-            int p = L.in(j.related);
             Deck d = deck(w);
             std::string te = stimulus(L, flips, d);
             auto& wv = d.wave[j.related].pts;
@@ -513,23 +506,31 @@ struct Char {
             double slew = (j.delay.v1 == liberty::Var::Load ? j.delay.i2[k] : j.delay.i1[i]) * tech.tUnit;
             double load = (j.delay.v1 == liberty::Var::Load ? j.delay.i1[i] : j.delay.i2[k]) * tech.cUnit;
             double tr = tech.ramp(slew, pd);
-            double t0 = (double)(flips.size() + 1) * opt.settle;
+            // The loaded output has to be at rest before the edge: wait for it.
+            double tpre = 3e4 * load;
             double twin = 4 * tr + 0.2e-9 + 2e4 * load;       // a first guess: 20 kohm into the load
             std::map<std::string, double> over = {{"tr", tr}, {"cl", load}, {"tmax", stepFor(tr)}};
-            State after = flip(L, at, p);
             for (int attempt = 0;; attempt++) {
+                double t0 = (double)(flips.size() + 1) * opt.settle + tpre;
                 over["twin"] = twin;
+                over["tpre"] = tpre;
                 Trace t = run(nl, over);
                 int co = t.v(j.out);
                 double V = tech.vdd;
                 double tin = t0 + tr * (pd ? tech.inR : 1 - tech.inF);
                 double lo = (j.rise ? tech.sLoR : tech.sLoF) * V, hi = (j.rise ? tech.sHiR : tech.sHiF) * V;
+                double start = t.at(co, t0);
+                if (j.rise ? start > 0.001 * V : start < 0.999 * V) {
+                    if (attempt >= 7) throw std::runtime_error("the output did not settle before the edge");
+                    tpre = 3 * tpre + 0.2e-9;
+                    continue;
+                }
                 double tout = t.cross(co, (j.rise ? tech.outR : tech.outF) * V, j.rise, t0);
                 double ta = t.cross(co, j.rise ? lo : hi, j.rise, t0);
                 double tb = t.cross(co, j.rise ? hi : lo, j.rise, t0);
                 double end = t.last(co);
                 bool done = std::isfinite(tout) && std::isfinite(ta) && std::isfinite(tb) &&
-                            (j.rise ? end > 0.98 * V : end < 0.02 * V) && tb < t0 + tr + 0.7 * twin;
+                            (j.rise ? end > 0.995 * V : end < 0.005 * V);
                 if (!done) {
                     if (attempt >= 7) throw std::runtime_error("the output did not switch");
                     twin *= 3;
@@ -834,9 +835,7 @@ int main(int argc, char** argv) {
         tech.outR = lib.outputThresholdRise / 100; tech.outF = lib.outputThresholdFall / 100;
         tech.derate = lib.slewDerate > 0 ? lib.slewDerate : 1;
 
-        std::string dir = (fs::temp_directory_path() / ("mchar-" + std::to_string((long)getpid()))).string();
-        fs::create_directories(dir);
-        Char ch{opt, tech, Runner{opt, tech, dir}};
+        Char ch{opt, tech, Runner{opt, tech}};
 
         // The subcircuits there are, to tell "no netlist" from a failure.
         std::set<std::string> subckts;
@@ -969,8 +968,6 @@ int main(int argc, char** argv) {
             default: ch.leakPoint(w, w.leaks[t.job], i); break;
             }
         });
-        std::error_code ec;
-        fs::remove_all(dir, ec);
 
         // ---- write the numbers back, in order
         int nArc = 0, nCons = 0, nCap = 0, nLeak = 0, nPower = 0, failed = 0, kept = 0;
@@ -1071,7 +1068,7 @@ int main(int argc, char** argv) {
             std::printf("%d delay tables, %d constraint tables, %d power tables, %d pin capacitances, %d leakage values\n",
                         nArc, nCons, nPower, nCap, nLeak);
             if (kept) std::printf("%d timing groups of other kinds kept from the template\n", kept);
-            if (noNetlist) std::printf("%d cells have no netlist and keep the template's numbers\n", noNetlist);
+            if (noNetlist) std::printf("%d cell%s without a netlist: the template's numbers are kept\n", noNetlist, noNetlist == 1 ? "" : "s");
             std::printf("%d failed; wrote %s in %.1f s\n", failed, opt.out.c_str(), s);
         }
         return failed ? 1 : 0;

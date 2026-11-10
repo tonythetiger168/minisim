@@ -74,6 +74,7 @@ add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
 # The mini45 cell library: generator check and install rules.
 include(cmake/tools/mini45.cmake)
+include(cmake/tools/mchar.cmake)
 
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)

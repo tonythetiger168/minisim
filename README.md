@@ -30,6 +30,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 - **SPICE**: `mspice` runs DC, AC and transient analyses of a SPICE netlist (R, C, L, coupled inductors, sources, diodes, level-1 MOSFETs, bipolar transistors, subcircuits, `.measure`, `.step`), multi-threaded, checked against ngspice; see [docs/SPICE.md](docs/SPICE.md)
+- **Cell characterization**: `mchar` measures a cell library from its transistor netlists on `mspice` and writes Liberty: delay and transition tables, setup, hold, recovery and removal, internal power, pin capacitance; multi-threaded with identical output on any thread count. The mini45 library is measured with it; see [docs/CHAR.md](docs/CHAR.md)
 
 ## Layout
 

@@ -4,23 +4,31 @@
 mini45 is a made-up 45 nm-class library for testing the tool line: synthesis
 maps to it, timing and power read it, place and route uses its LEF, and the
 gate-level netlists simulate against its Verilog models. Nothing in it comes
-from a foundry or from another library; the numbers come from the small
-analytic model below (logical effort for delay, simple energy and leakage
-rules), which gives tables with the right shape and ordering:
-a stronger drive is faster and bigger, a stack is slower, a slow corner is
-slower and a hot one leaks more. Do not use it for a real chip.
+from a foundry or from another library. Do not use it for a real chip.
+
+This script writes everything but the Liberty files:
 
     python3 gen_mini45.py            # rewrite the files next to this script
     python3 gen_mini45.py --check    # exit 1 if a file on disk is out of date
 
-Files written:
-    mini45_tt.lib   typical  1.10 V   25 C
-    mini45_ss.lib   slow     0.95 V  125 C
-    mini45_ff.lib   fast     1.25 V  -40 C
     mini45.v        Verilog models (functional, specify paths for SDF)
     mini45_tech.lef technology LEF (site, 6 metal layers, vias)
     mini45.lef      cell LEF (macros with pin shapes)
     mini45_tb.sv    self-checking bench: Verilog models against the functions
+    mini45.sp       transistor netlists, one .subckt per cell
+    mini45_models_{tt,ss,ff}.sp   level-1 MOSFET models per corner
+
+The Liberty files (mini45_tt.lib 1.10 V 25 C, mini45_ss.lib 0.95 V 125 C,
+mini45_ff.lib 1.25 V -40 C) are measured: characterize.sh runs mchar on the
+transistor netlists. What to measure comes from templates this script
+writes with
+
+    python3 gen_mini45.py --templates DIR
+
+The templates carry numbers from a small analytic model (logical effort for
+delay, simple energy and leakage rules). mchar replaces them, except the
+leakage values, the tristate enable and disable arcs and the minimum pulse
+widths, which stay analytic (docs/MINI45.md says why).
 """
 import itertools
 import math
@@ -892,9 +900,12 @@ DIFF = 0.10              # um, source/drain length
 
 MODELS = {
     # corner: (nmos vto, nmos kp, pmos vto, pmos kp)
+    # A level-1 device's mobility falls as T^-1.5, far more than a short
+    # channel's current does, so kp leans the other way at the hot and cold
+    # corners: slow over fast comes out near 2.5, not 5.
     "tt": (0.35, 105e-6, -0.35, 54e-6),
-    "ss": (0.40, 88e-6, -0.40, 45e-6),
-    "ff": (0.30, 124e-6, -0.30, 64e-6),
+    "ss": (0.37, 136e-6, -0.37, 70e-6),
+    "ff": (0.33, 84e-6, -0.33, 43e-6),
 }
 
 def spice_models(corner):
@@ -1116,8 +1127,15 @@ def main():
     }
     for corner in CORNERS:
         files["mini45_models_%s.sp" % corner] = spice_models(corner)
-    for corner in CORNERS:
-        files["mini45_%s.lib" % corner] = liberty(corner)
+    if "--templates" in sys.argv:
+        # The analytic Liberty files: what to measure, for characterize.sh.
+        out = sys.argv[sys.argv.index("--templates") + 1]
+        os.makedirs(out, exist_ok=True)
+        for corner in CORNERS:
+            with open(os.path.join(out, "mini45_%s.lib" % corner), "w") as f:
+                f.write(liberty(corner))
+        print("mini45: %d template libraries in %s" % (len(CORNERS), out))
+        return
     check = "--check" in sys.argv
     stale = 0
     for name, text in sorted(files.items()):
