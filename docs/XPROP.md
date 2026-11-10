@@ -133,7 +133,10 @@ outside the function are not merged.
 
 ## Cost
 
-A run with `-xprop` does more work per `if` and `case`, and clocked blocks
-with merged branches run as ordinary processes instead of as parallel
-clocked functions. On Ibex (lowRISC, 118 745 cycles, interpreter, one
-thread) a run takes 50 s with `-xprop` and 25 s without.
+A run with `-xprop` does more work per `if` and `case`. An `if` tests its
+condition once, with a jump that has a third target for an unknown value.
+The temporaries of the merge are stored without going through the
+scheduler, so clocked blocks still run as parallel clocked functions and
+combinational blocks stay in the static schedule. On Ibex (lowRISC,
+118 745 cycles) the interpreter takes 26 s with `-xprop` and 19 s without
+(31 s with `-threads 1`); with `-compile` a run with `-xprop` takes 7 s.
