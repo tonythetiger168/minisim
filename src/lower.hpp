@@ -4190,6 +4190,16 @@ struct Lowerer {
                     return sized(rtoi(exprReal(c.operand()), w, c.type->isSigned(), false), w, c.type->isSigned(), ctx);
                 }
                 int dst = (int)c.type->getBitWidth();
+                if (c.conversionKind == ConversionKind::Explicit && c.type->isIntegral() &&
+                    c.operand().type->isIntegral() && ctx.live && (int)c.operand().type->getBitWidth() < dst) {
+                    // A cast (6.24.1) is an assignment to the cast type: the
+                    // operand is extended to that width with its own
+                    // signedness first, whatever the context wants after.
+                    // int'(u3) in a signed 32-bit sum is 0..7, not -4..3.
+                    needWidth(dst);
+                    E v = expr(c.operand(), ExprCtx{dst, c.operand().type->isSigned(), c.type->isSigned(), true});
+                    return sized(std::move(v), dst, c.type->isSigned(), ctx);
+                }
                 bool fill, tag;
                 if (ctx.live && ctx.w > 0) {
                     dst = ctx.w;
