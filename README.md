@@ -28,6 +28,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches, with its C code (regular expressions, command line, HDL backdoor) via `msim -uvm`; see [`docs/UVM.md`](docs/UVM.md)
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
 - **Verification IP**: AXI4, AXI4-Lite, APB4 and memory UVM VIPs in `vip/`, and `tools/mvip.py` to run the 146 VIPs of open-vip-portfolio on msim; see [`docs/VIP.md`](docs/VIP.md)
+- **Emulation and FPGA prototyping**: `memu` puts a gate-level netlist on a board of FPGAs (clock conversion, memory mapping, partitioning, pin multiplexing, probes, transactors to `msim -mvp` models and to testbench classes) and writes a testbench that checks the emulation against the netlist; see [docs/EMULATION.md](docs/EMULATION.md)
 - **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
@@ -42,6 +43,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/lower.hpp` | slang AST to `Prog`, including module instances and port connections |
 | `src/slang_dump.cpp` | Small slang front-end probe: lists variables, nets, processes |
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
+| `src/parallel.hpp` | Shared by the tools: default thread count, `-threads N`, `par::parallelFor`, `par::Pool` |
+| `src/wave_reader.hpp` | Shared by the tools: `wave::Reader`, VCD (parallel, mapped) and FST into memory |
 | `src/protect.hpp`, `src/msimprotect.cpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): encrypt and decrypt with OpenSSL |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
@@ -95,7 +98,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `+define+N[=V]`, `-D N[=V]` | Preprocessor define |
 | `+incdir+<dir>`, `-I <dir>` | Include directory |
 | `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
-| `-cov [<file>]` | Write line / branch / toggle coverage (default `cov.json`); see `mcov` |
+| `-cov [<file>]` | Write line / branch / toggle / condition / FSM coverage (default `cov.json`); see `mcov`. `-cm line+cond+fsm+tgl` (as VCS) does the same |
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
 | `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
@@ -108,6 +111,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
+| `-xprop[=tmerge\|xmerge]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
 | `-upf <file>` | Power-aware simulation with this UPF (IEEE 1801) power intent; see [`docs/LOWPOWER.md`](docs/LOWPOWER.md) |
 | `-power_top <inst>`, `-upf_verbose` | The instance the UPF describes; print supply, power state and simstate changes |
 | `<file>.c`, `.cpp`, `.o`, `.a` | DPI-C code: msim builds it (with `svdpi.h` on the include path) and loads it |
@@ -189,8 +193,8 @@ and `mbug -h`.
 ### Coverage: `msim -cov` and `mcov`
 
 `msim -cov [file.json]` records line coverage, branch coverage (both outcomes
-of every `if`, `case` arm, and loop test), and toggle coverage (every signal
-bit seen rising and falling) into `cov.json`. `mcov` merges databases and
+of every `if`, `case` arm, and loop test), toggle coverage (every signal
+bit seen rising and falling), condition coverage and FSM coverage into `cov.json`. `mcov` merges databases and
 reports them; `mregress -cov` does both for a whole regression:
 
 ```sh
@@ -201,11 +205,94 @@ mregress tests.list -cov            # regress.d/cov.json + regress.d/cov_html/
 ```
 
 The LCOV file works with `genhtml` and with editor and CI coverage plugins.
+`-cov` works in the interpreter and with `-compile`, with any `-threads`;
+the database is the same in each.
+
+**Condition coverage** (as VCS `-cm cond`). A condition `a && b && c`,
+`a || b || c`, or the condition of `?:`, with n terms has n + 1 vectors: the
+one where no term decides alone (all 1 for `&&`, all 0 for `||`) and, for each
+term, the one where only that term has the deciding value. A vector with an
+x term counts for none. Conditions in procedures, continuous assignments,
+functions and tasks are covered; not those in constraints, assertions and
+covergroups, constant ones, or ones whose terms call a function or read
+through a class handle or a container (every term is evaluated to tell the
+vectors apart, so a term must be safe to evaluate).
+
+**FSM coverage** (as VCS `-cm fsm`). msim finds the state registers itself: a
+variable that one clocked procedure assigns, whose next value is always a
+constant (literal, parameter or enum name), itself, or a next-state variable
+assigned that way by one combinational procedure, where that logic branches
+on the register with `case (state)` or `if (state == S)`. The states are the
+constants compared with or assigned to the register; the transitions are the
+ones the next-state logic can make. A constant assigned under an `if` outside
+any branch on the state is taken as the reset, and transitions that only the
+reset makes are marked `(reset)`; `mcov report -fsm-reset-filter` leaves them
+out (VCS `-cm_fsmresetfilter`). A change the logic does not show (a forced
+value, say) is listed as "not in the next-state logic". Not extracted: one-hot
+registers tested bit by bit, states computed by arithmetic, registers written
+through a part select or by a task.
+
+```sh
+mcov report all.json -detail              # every vector, state and transition
+mcov report all.json -uncovered           # only what is missing
+mcov report all.json -min-cond 80 -min-fsm-state 100 -min-fsm-trans 90
+```
+
+```
+Condition tb.sv:30:15  a && b
+    -1- a
+    -2- b
+    -1- -2-  Hits
+     1   1   3
+     0   1   Not covered
+     1   0   Not covered
+
+FSM tb.u.state  (module ctrl, tb.sv:8)  states 3/4, transitions 3/6
+    state FAIL                 Not covered
+    RUN -> IDLE                Not covered  (reset)
+    RUN -> FAIL                Not covered
+```
 
 The database also holds functional coverage: the bins of every covergroup
 type (19) and the evaluations, passes and failures of every assertion (16).
 `mcov report` prints both, lists uncovered bins and failed or idle
 assertions in the HTML, and gates them with `-min-func` and `-min-assert`.
+
+### Verification planning: `mplan`
+
+`mplan` (in the source tree `tools/mplan.py`) tracks a verification plan
+against the regressions: which features are proven, by which tests,
+coverage and assertions, how that moves over time, and what the failures
+are. A plan is a small indented text file:
+
+```
+plan uart "UART verification plan"
+  owner: tony
+  feature tx "Transmit path" weight=2 owner=alice
+    test   uart_tx_*                # mregress tests
+    line   rtl/uart_tx.sv goal=95   # code coverage
+    cover  tb.cg_tx                 # a covergroup type, or type.item
+    assert tb.dut.u_tx              # the assertions in that scope
+    feature parity "Parity"
+      test uart_parity_*
+```
+
+```sh
+mregress tests.list -cov -plan uart.vplan   # regress, then score the plan into regress.d/plan/
+mplan report uart.vplan -results regress.d -label $GIT_COMMIT -rules triage.rules -gate
+mplan triage -results regress.d -plan uart.vplan   # only the failure buckets
+mplan trend  plan.d/history.jsonl                  # score, tests and coverage per snapshot
+mplan init   -results regress.d -o draft.vplan     # a starting plan from an existing regression
+```
+
+`mplan report` scores every feature (weighted, with a goal per metric),
+writes `plan.json` and one self-contained `plan.html` (feature tree, trend
+chart, failure triage, results that no plan line points at), and appends a
+snapshot to `history.jsonl`. Failures are bucketed by signature and marked
+new, recurring (since which snapshot), flaky or fixed, with the features and
+owners each bucket blocks; a rules file marks buckets known or waived and
+attaches a bug id. `-gate`, `-min-score` and `-fail-on-new` turn it into a
+CI gate. Full reference: [`docs/MPLAN.md`](docs/MPLAN.md) and `mplan -h`.
 
 ### Protected IP: `msimprotect` and `msim -keyfile`
 
@@ -355,6 +442,26 @@ msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
 
 `docs/DATAPATH.md` lists every module and its ports.
 
+### Timing constraint checks: `msdc`
+
+`msdc` reads the design and its SDC file and reports what is wrong or missing
+in the constraints: syntax and names that match nothing, clocks that clock
+nothing, registers no clock reaches, ports with no I/O delay, exceptions that
+are not startpoint-to-endpoint or have no path in the design, a setup
+multicycle with no hold, and paths between clocks whose relationship nobody
+declared. 32 rules, multithreaded, same report for any `-threads N`.
+
+```sh
+msdc rtl/*.sv -top soc -sdc soc.sdc         # the report, then a summary
+msdc rtl/*.sv -top soc -sdc soc.sdc -Werror # exit 1 on any finding (for CI)
+msdc -sdc soc.sdc                           # the file alone
+msdc -list                                  # the rules
+```
+
+The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
+(`src/tcl.hpp`) are shared with the timing and synthesis tools. See
+[docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
+
 ### Lint and clock-domain checks: `mlint`
 
 `mlint` runs the same front end as `msim` and then checks the elaborated
@@ -426,6 +533,43 @@ msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 
+### Formal property checking: `mformal`
+
+`mformal` proves or falsifies the design's assertions for every input
+sequence, on the same front end and lowering as `msim`. Assertions are
+proven or falsified, assumptions constrain the inputs, covers are reached or
+proven unreachable. A failure comes with a VCD of the whole design and, with
+`-tb`, a testbench that replays it in `msim`.
+
+```sh
+mformal rtl/*.sv -top fifo                  # every assert / assume / cover
+mformal rtl/*.sv -top fifo -depth 40 -tb    # deeper, with replay testbenches
+```
+
+```
+  assert  top.u.a_count        proven  (induction, k=2)
+  assert  top.u.a_push_counts  falsified  at cycle 5  mformal_out/top.u.a_push_counts.vcd
+  cover   top.u.c_full         covered  at cycle 4  mformal_out/top.u.c_full.vcd
+```
+
+Properties are checked in parallel on every core (`-threads N`), with the
+same result for any thread count. See `docs/FORMAL.md` for the model (clock,
+reset, two-state values, what is cut) and the supported property operators.
+
+### Equivalence checking: `mequiv`
+
+`mequiv` proves that a netlist is the same circuit as the RTL it came from
+(or as another netlist, or one RTL revision as the next), the way Formality
+and Conformal do: flops are matched by name and cut, and every output and
+next-state function is proved equal. A failing point comes with the input
+values that show the difference.
+
+```sh
+mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
+```
+
+See [docs/EQUIV.md](docs/EQUIV.md).
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per
@@ -451,11 +595,47 @@ mdft: 5 flops in 3 clock domains
   t.clk: 3 flops (2 rising, 1 falling)
 ```
 
+On a gate netlist `mdft -insert_scan` stitches the flops into scan chains
+(scan cells from the Liberty library or a mux in front of D, balanced chains
+per clock domain, lockup latches, clock gates held open) and writes the
+netlist, a chain description for ATPG and a chain flush testbench.
+`mdft -mbist` generates a March memory BIST controller and collar for a RAM
+and reports the fault coverage of the chosen algorithm. See
+[docs/DFT.md](docs/DFT.md).
+
+```sh
+mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
+mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
+```
+
 `mlint` and `mdft` share one model of the elaborated design
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
+### Emulation and FPGA prototyping: `memu`
+
+`memu` is the step between synthesis and FPGA place and route that makes a
+design fit a board of several FPGAs and run there at all: every flop moves
+onto one free-running clock, memories become FPGA RAM, the cells are split
+over the FPGAs, and signals share wires where the board has too few.
+
+```sh
+memu soc.gv -lib cells.lib -mem mems.txt -fpgas 4 -lut 200000 -pins 240 -probe 'u_core.pc*' -o out
+msim cells.v mems.v soc.gv out/soc_fpga*.v out/soc_emu_lib.v out/soc_emu.v out/soc_emu_tb.sv -top soc_emu_tb
+```
+```
+memu: PASS, 2000 events (2000 with a clock edge), 80856 output bits compared, netlist and emulation agree
+```
+
+The second command needs no hardware: it runs the netlist `memu` was given
+next to the emulation it wrote, on the same random inputs, and compares every
+output at every clock event. Transactors (`memu -xtor-sv`) connect the
+emulated design to the C models of a virtual prototype or to a testbench
+class, with the design's clock stopped while the host answers. It uses every
+logical CPU by default (`-threads N`), with the same result on any number.
+[docs/EMULATION.md](docs/EMULATION.md) has the timing model, the file formats
+and the transactors.
 ### Parasitic extraction: `mrcx`
 
 `mrcx` reads a routed DEF and its LEF and writes every net's resistance and
@@ -467,13 +647,14 @@ mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o 
 ```
 
 ```
-mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5086 coupling capacitors
-mrcx: capacitance 2238 fF to ground, 288.8 fF between nets (sky130 stack, 25 C)
+mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5134 coupling capacitors
+mrcx: capacitance 2029 fF to ground, 409.5 fF between nets (sky130 stack, 25 C)
 ```
 
 It runs on every core (`-threads N`), writes the same file for any thread
 count, and reports open and shorted nets. On the OpenROAD `gcd` test design
-its total net capacitance is within 1% of OpenRCX's. See
+its total net capacitance is within 2% of OpenRCX's, and the ground and
+coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
 
 ### Virtual prototypes: `-mvp`

@@ -1,5 +1,6 @@
 # mrcx: parasitic RC extraction, routed DEF + LEF in, SPEF out (docs/RCX.md).
 # Plain C++20 and threads: no slang, so it builds in every configuration.
+include_guard(GLOBAL)
 find_package(Threads REQUIRED)
 add_executable(mrcx src/mrcx.cpp)
 target_include_directories(mrcx PRIVATE src)

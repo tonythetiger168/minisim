@@ -1346,6 +1346,8 @@ enum class Op {
     LogNot, LogAnd, LogOr, RedAnd, RedOr, RedXor,
     Slice, Index, Concat, Mux,
     Pow, Time,
+    CondCov,   // condition coverage (msim -cov): the && (lo = 0) or || (lo = 1) of the kids' truth
+               // values, counted in g_condHits from hi on (see condCovHit)
     WildEq,    // a ==? b: x / z bits of b match anything (11.4.6)
     // real (6.12). Values are doubles in v, with Val::real set.
     FAdd, FSub, FMul, FDiv, FPow, FNeg,
@@ -1444,8 +1446,16 @@ enum SysFnId : int {
     SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
     SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
     SF_FREAD_GET,        // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
-    SF_SDF               // $sdf_annotate (32.9) with arguments known only at run time: g_sdfHook
+    SF_SDF,              // $sdf_annotate (32.9) with arguments known only at run time: g_sdfHook
+    // msim -xprop: was the edge that woke this process ambiguous? Each kid
+    // is a constant naming one event of its event control: signal << 2 |
+    // negedge << 1 | level (the body tests the signal's level). 1 when an
+    // edge that happened in this time step went from or to x / z and none
+    // certainly happened.
+    SF_XPROP_EDGE
 };
+// The kernel's answer for one event (0 no edge now, 1 a certain edge, 2 an ambiguous one).
+inline int (*g_edgeClass)(int sig, bool neg, bool level) = nullptr;
 enum UpfOp : int { UPF_SUPPLY_ON, UPF_SUPPLY_OFF, UPF_SUPPLY_PARTIAL_ON, UPF_SET_SUPPLY_STATE, UPF_SET_POWER_STATE,
                    UPF_GET_SUPPLY_VALUE, UPF_ISO, UPF_LS };
 inline Val (*g_upfHook)(int op, const std::vector<Val>& a) = nullptr;
@@ -1538,6 +1548,37 @@ inline E bin(Op op, E a, E b) { return node(op, {a, b}); }
 inline E slice(E a, int hi, int lo) { auto e = node(Op::Slice, {a}); e->hi = hi; e->lo = lo; return e; }
 inline E concat(std::vector<E> parts) { return node(Op::Concat, std::move(parts)); }
 inline E mux(E c, E a, E b) { return node(Op::Mux, {c, a, b}); }
+
+// Condition coverage (msim -cov), as VCS -cm cond reports it: a condition
+// a && b && c (or a || b || c, or the condition of ?:) with n terms has n + 1
+// vectors. Vector 0 is the one where no term decides alone (all 1 for &&,
+// all 0 for ||); vector i is the one where only term i - 1 has the deciding
+// value (0 for &&, 1 for ||). A vector with an x term counts for none.
+// g_condHits holds the counters of every condition, one after another.
+inline std::vector<uint64_t> g_condHits;
+// t[i] is truth() of term i. Returns the truth of the whole condition.
+inline int condCovHit(size_t base, bool isOr, const int* t, size_t n) {
+    int deciding = isOr ? 1 : 0, at = -1, count = 0;
+    bool unknown = false;
+    for (size_t i = 0; i < n; i++) {
+        if (t[i] == 2) unknown = true;
+        else if (t[i] == deciding) { count++; at = (int)i; }
+    }
+    if (!unknown && count <= 1) __atomic_fetch_add(&g_condHits[base + (size_t)(at + 1)], 1, __ATOMIC_RELAXED);
+    return count ? deciding : unknown ? 2 : 1 - deciding;
+}
+
+// The same for generated code (msim -compile): terms as values, or as the
+// 0 / 1 of the 2-state path.
+inline Val condCovVal(size_t base, bool isOr, std::initializer_list<Val> terms) {
+    int ts[64];
+    size_t n = 0;
+    for (const Val& v : terms) ts[n++] = truth(v);
+    return from_truth(condCovHit(base, isOr, ts, n));
+}
+inline uint64_t condCovFast(size_t base, bool isOr, std::initializer_list<int> terms) {
+    return (uint64_t)condCovHit(base, isOr, terms.begin(), terms.size());
+}
 
 // Current simulation time, for $time / $stime / $realtime (IEEE 1800 20.3).
 // The kernel sets it when time advances.
@@ -1876,6 +1917,15 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
     auto i32 = [&](const Val& v) { return (int32_t)(uint32_t)u64(v); };
     auto sint = [](int64_t x) { Val r = make((uint64_t)(uint32_t)x, 0, 32, 0); r.sgn = true; return r; };
     switch (id) {
+        case SF_XPROP_EDGE: {
+            bool def = false, amb = false;
+            for (const Val& x : a) {
+                int c = g_edgeClass ? g_edgeClass((int)(x.v >> 2), (x.v >> 1) & 1, x.v & 1) : 0;
+                def |= c == 1;
+                amb |= c == 2;
+            }
+            return mk(!def && amb, 1);
+        }
         case SF_CLOG2: {
             if (anyX(a[0])) return xfill(32, true);
             // the ceiling of log2, for a value up to its full width
@@ -2633,6 +2683,12 @@ inline Val eval(const E& e, const Reader& rd) {
             if (truth(a) == 1) return mk(1);
             return v_lor(a, k(1));
         }
+        case Op::CondCov: {   // every term is evaluated: the lowerer wraps only terms without side effects
+            int ts[64];
+            size_t n = e->kids.size();
+            for (size_t i = 0; i < n; i++) ts[i] = truth(k((int)i));
+            return from_truth(condCovHit((size_t)e->hi, e->lo != 0, ts, n));
+        }
         case Op::RedAnd: return v_red_and(k(0));
         case Op::RedOr: return v_red_or(k(0));
         case Op::RedXor: return v_red_xor(k(0));
@@ -2664,6 +2720,16 @@ inline Val eval(const E& e, const Reader& rd) {
                 Val r = make((uint64_t)(uint32_t)v_to_i64(kv), 0, 32, 0);
                 r.sgn = true;
                 return r;
+            }
+            if (e->hi == SF_XPROP_EDGE) {   // once per clocked activation: no argument vector
+                bool def = false, amb = false;
+                for (const E& kid : e->kids) {
+                    uint64_t x = kid->k.v;
+                    int c = g_edgeClass ? g_edgeClass((int)(x >> 2), (x >> 1) & 1, x & 1) : 0;
+                    def |= c == 1;
+                    amb |= c == 2;
+                }
+                return mk(!def && amb, 1);
             }
             std::vector<Val> a;
             for (size_t i = 0; i < e->kids.size(); i++) a.push_back(k((int)i));

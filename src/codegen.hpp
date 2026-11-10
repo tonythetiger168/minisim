@@ -97,11 +97,9 @@ public:
                 for (auto& in : procs[i].prog->code) nba += in.k == IK::Nba;
             for (auto& p : procs)
                 if (p.combRank >= 0)
-                    for (auto& in : p.prog->code) { if (in.k != IK::Assign) break; comb++; }
+                    for (auto& in : p.prog->code) { if (in.k == IK::WaitEdge) break; comb += in.k == IK::Assign; }
             if (comb > 64 && comb > 8 * nba) dom.clear();
         }
-        for (auto& p : procs)   // the domain inlines straight-line comb statements only
-            if (p.combRank >= 0 && combBranches(*p.prog)) dom.clear();
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
         for (size_t i = 0; i < procs.size(); i++) {
             bool inDom = std::find(dom.begin(), dom.end(), (int)i) != dom.end();
@@ -139,6 +137,17 @@ public:
              "static inline Val RS(Val v, int w, bool fill, bool sg) {\n"
              "    Val r = v_resize(v, w, fill && w > v.w); r.sgn = sg; return r;\n"
              "}\n"
+             "#ifdef MSIM_COLDSTAT\n"
+             "inline long coldN[1 << 16];\n"
+             "struct ColdDump { ~ColdDump() { for (int r = 0; r < 40; r++) { int b = 0; for (int k = 1; k < (1 << 16); k++) if (coldN[k] > coldN[b]) b = k;\n"
+             "    if (!coldN[b]) break; std::fprintf(stderr, \"COLD(%d) %ld\\n\", b, coldN[b]); coldN[b] = 0; } } };\n"
+             "inline ColdDump coldDump;\n"
+             "#define COLD(k) coldN[k]++;\n"
+             "#else\n"
+             "#define COLD(k)\n"
+             "#endif\n"
+             "static inline bool UPD(uint64_t& a, uint64_t b) { bool c = a != b; a = b; return c; }\n"
+             "static inline bool UPDV(Val& a, const Val& b) { if (a == b && a.w == b.w) return false; a = b; return true; }\n"
              "struct PSig { uint64_t v, x, z; };\n"
              "static inline Val PR(const PSig& p, int w, bool sg) { return Val{p.v & ~p.x, p.x, w, p.z, sg}; }\n"
              "static inline void PW(PSig& p, int w, const Val& a) { uint64_t m = mask(w); p.v = a.v & m; p.x = a.x & m; p.z = a.z & m; }\n"
@@ -304,7 +313,8 @@ public:
         }
         for (size_t i = 0; i < events_.size(); i++) o << SV << "std::vector<std::pair<int, Edge>> EV" << i << ";\n";
         if (cov) o << (nf > 1 ? "inline " : "") << "uint64_t CV[" << std::max<size_t>(2, 2 * covSlots.size()) << "];\n";
-        o << SV << "std::atomic<bool> pclean{false};   // every private signal is known (no X or Z bit)\n";
+        o << SV << "std::atomic<bool> pclean{false};   // every private signal is known (no X or Z bit)\n";        o << SV << "std::atomic<bool> cdirty{false};   // a 2-state comb pass met an unknown value: run the 4-state one\n";
+
         // Private signals start as their S.sigs counterparts do: a variable X, a net Z.
         for (size_t s = 0; s < priv_.size(); s++)
             if (priv_[s]) {
@@ -368,6 +378,18 @@ public:
                  "        const auto& F = s < S.togFall.size() ? S.togFall[s] : none;\n"
                  "        uint64_t k = R.size();\n"
                  "        std::fwrite(&k, 8, 1, f); std::fwrite(R.data(), 8, k, f); std::fwrite(F.data(), 8, k, f);\n"
+                 "    }\n"
+                 "    // condition counters, then per FSM its states and transitions\n"
+                 "    uint64_t nc = g_condHits.size(), nfsm = S.fsmSigs.size();\n"
+                 "    std::fwrite(&nc, 8, 1, f); std::fwrite(g_condHits.data(), 8, nc, f);\n"
+                 "    S.fsmFinish();\n"
+                 "    std::fwrite(&nfsm, 8, 1, f);\n"
+                 "    for (size_t k = 0; k < nfsm; k++) {\n"
+                 "        uint64_t a = S.fsmSeen[k].size(), b = S.fsmTrans[k].size();\n"
+                 "        std::fwrite(&a, 8, 1, f);\n"
+                 "        for (auto& [v, c] : S.fsmSeen[k]) { uint64_t r[2] = {v, c}; std::fwrite(r, 8, 2, f); }\n"
+                 "        std::fwrite(&b, 8, 1, f);\n"
+                 "        for (auto& [t, c] : S.fsmTrans[k]) { uint64_t r[3] = {t.first, t.second, c}; std::fwrite(r, 8, 3, f); }\n"
                  "    }\n"
                  "    { std::ofstream fc(std::string(path) + \".fcov\"); writeFuncCov(fc); }   // covergroups, assertions\n"
                  "    return std::fclose(f) == 0;\n"
@@ -491,6 +513,11 @@ public:
             for (size_t r = 0; r < parts.ins.size(); r++) o << (r ? ", " : "") << list(parts.ins[r]);
             o << "}, " << list(parts.targets) << ");\n";
         }
+        if (cov) {
+            o << "    g_condHits.assign(" << g_condHits.size() << ", 0);\n    S.fsmWatch({";
+            for (size_t k = 0; k < fsmDefs().size(); k++) o << (k ? ", " : "") << fsmDefs()[k].sig;
+            o << "});\n";
+        }
         o << "    S.run(maxTime);\n"
              "    std::cout.flush();\n";
         if (cov) o << "    if (covOut && !writeCov(covOut)) { std::cerr << \"simv: cannot write \" << covOut << \"\\n\"; return 1; }\n";
@@ -550,6 +577,17 @@ private:
                ") & " + m + ", 0, " + std::to_string(sigW_[s]) + ")); }";
     }
     bool isPriv(int s) const { return s >= 0 && s < (int)priv_.size() && priv_[s]; }
+    // Found while emitting: a private signal used where only S.sigs works (an
+    // interpreted operator, an assertion). run() ends with CodegenRetry and
+    // the next pass keeps these in S.sigs (noPriv).
+public:
+    std::set<int> noPriv, privHits_;
+private:
+    void hitPriv(const E& e) {
+        if (!e) return;
+        if (e->op == Op::Ref && isPriv(e->sig)) privHits_.insert(e->sig);
+        for (auto& k : e->kids) hitPriv(k);
+    }
     std::string vRef(int s) const { return isPriv(s) ? "P" + std::to_string(s) + ".v" : "S.sigs[" + std::to_string(s) + "].val.v"; }
     std::string xRef(int s) const { return isPriv(s) ? "P" + std::to_string(s) + ".x" : "S.sigs[" + std::to_string(s) + "].val.x"; }
     std::vector<std::vector<E>> sysArgs_;
@@ -577,7 +615,7 @@ private:
     // the code that sets s, hi, lo and v, then runs `then` unless the index is
     // invalid (7.4.6, 11.5.1). Mirrors target() in exec.inc.
     std::string dynTarget(const Instr& i, const std::string& val, const std::string& then) {
-        if (isPriv(i.sig)) throw CodegenUnsupported("variable-index write to a private signal");
+        if (isPriv(i.sig)) privHits_.insert(i.sig);
         std::ostringstream o;
         o << " { Val v = " << val << "; int s = " << i.sig << ", hi = " << i.hi << ", lo = " << i.lo << ";";
         if (i.arr) {
@@ -704,6 +742,11 @@ private:
             case Op::LogNot: return f1("v_lnot");
             case Op::LogAnd: return f2("v_land");
             case Op::LogOr: return f2("v_lor");
+            case Op::CondCov: {   // condition coverage: every term, then the counters (expr.hpp)
+                std::string r = "condCovVal(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
+                for (size_t i = 0; i < e->kids.size(); i++) r += (i ? ", " : "") + ex(e->kids[i]);
+                return r + "})";
+            }
             case Op::RedAnd: return f1("v_red_and");
             case Op::RedOr: return f1("v_red_or");
             case Op::RedXor: return f1("v_red_xor");
@@ -720,7 +763,7 @@ private:
         }
         // Any other operator (==?, real math, strings, system functions, ...):
         // the interpreter's eval() on the subtree, rebuilt at startup.
-        if (readsPriv(e)) throw CodegenUnsupported("operator " + std::to_string((int)e->op) + " on a private signal");
+        hitPriv(e);
         val(e->k);   // throws for a real or string constant
         evals_.push_back(e);
         return "eval(ET" + std::to_string(evals_.size() - 1) + ", rd)";
@@ -838,6 +881,18 @@ private:
                 out = "(uint64_t)((" + A + " != 0)" + (e->op == Op::LogAnd ? " & " : " | ") + "(" + B + " != 0))";
                 fi = {1, false};
                 return true;
+            case Op::CondCov: {
+                std::string r = "condCovFast(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
+                for (size_t i = 0; i < e->kids.size(); i++) {
+                    std::string P;
+                    FastInfo fp{};
+                    if (!fx(e->kids[i], P, fp, refs)) return false;
+                    r += (i ? ", " : "") + ("(int)(" + P + " != 0)");
+                }
+                out = r + "})";
+                fi = {1, false};
+                return true;
+            }
             case Op::RedAnd:
                 if (!kid(0, A, fa)) return false;
                 out = "(uint64_t)(" + A + " == " + M(fa.w) + ")";
@@ -925,7 +980,7 @@ private:
         if (val.empty()) val = fast(i.e);
         std::ostringstream o;
         if (isPriv(i.sig)) {   // a testbench write to a private reg: the comb logic may read it
-            if (i.drv >= 0 || i.hi >= 0) throw CodegenUnsupported("partial or driven write to a private signal");
+            if (i.drv >= 0 || i.hi >= 0) { privHits_.insert(i.sig); return " ;\n"; }
             o << " " << pw(i.sig, val) << " pclean = false; S.markFast();\n";
             return o.str();
         }
@@ -942,6 +997,26 @@ private:
             o << " S.set(" << i.sig << ", " << val << ");\n";
         return o.str();
     }
+    // A deferred assertion inside a static combinational process: its
+    // report is queued under the process's own ProcCtl (CC<n>).
+    std::string combAssert(int n, const Instr& i) {
+        const AssertInfo& a = asserts().at(i.sig);
+        hitPriv(i.e);
+        for (auto* cs : {&a.passCap, &a.failCap})
+            for (auto& c : *cs) hitPriv(c);
+        asrts_.push_back(&i);
+        return " runAssert(AI" + std::to_string(asrts_.size() - 1) + ", CC" + std::to_string(n) + ", 0);\n";
+    }
+    static bool combAsserts(const Prog& p) {
+        for (auto& i : p.code) {
+            if (i.k == IK::WaitEdge) return false;
+            if (i.k == IK::Assert) return true;
+        }
+        return false;
+    }
+    static std::string combCtlDecl(int n) {
+        return "static const std::shared_ptr<ProcCtl> CC" + std::to_string(n) + " = std::make_shared<ProcCtl>();\n";
+    }
     static bool oneAssign(const Prog& p) {
         return p.code.size() >= 2 && p.code[0].k == IK::Assign && p.code[1].k == IK::WaitEdge;
     }
@@ -949,7 +1024,7 @@ private:
     static bool combBranches(const Prog& p) {
         for (auto& i : p.code) {
             if (i.k == IK::WaitEdge) return false;
-            if (i.k == IK::JmpIfNot || i.k == IK::Jmp) return true;
+            if (i.k == IK::JmpIfNot || i.k == IK::Jmp || i.k == IK::Assert) return true;
         }
         return false;
     }
@@ -1019,7 +1094,8 @@ private:
             for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns) bad[sg] = 1;
             if (procs[i].combRank >= 0) {
                 for (auto& in : procs[i].prog->code) {
-                    if (in.k != IK::Assign) break;
+                    if (in.k == IK::WaitEdge) break;
+                    if (in.k != IK::Assign) continue;   // a jump or an assertion of an if / case body
                     if (in.sig < 0 || (size_t)in.sig >= ns) continue;
                     // The one driver of a net, or (drv < 0) the continuous assign msim
                     // merged into a plain write (mergePartialDrivers).
@@ -1066,8 +1142,37 @@ private:
                     for (auto& a : in.args) arr(a);
                     if (in.arr) anyArr = true;
                 }
-            if (anyArr) { priv_.assign(ns, 0); return; }   // run-time array access: keep everything in S.sigs
         }
+        // Run-time array access reads and writes S.sigs[base + index]: the
+        // elements of every array any process names stay there.
+        (void)anyArr;
+        {
+            auto range = [&](const ArrShape* a) {
+                if (!a) return;
+                for (int64_t k = 0; k < a->count; k++)
+                    if (a->base + k >= 0 && (size_t)(a->base + k) < ns) bad[(size_t)(a->base + k)] = 1;
+            };
+            std::function<void(const E&)> ea = [&](const E& e) {
+                if (!e) return;
+                range(e->arr.get());
+                for (auto& k : e->kids) ea(k);
+            };
+            std::vector<const Prog*> seen;
+            std::function<void(const Prog*)> walk = [&](const Prog* p) {
+                if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) return;
+                seen.push_back(p);
+                for (auto& in : p->code) {
+                    range(in.arr.get());
+                    ea(in.e); ea(in.bidx); ea(in.de);
+                    for (auto& a : in.args) ea(a);
+                    for (auto& a : in.aidx) ea(a);
+                    walk(in.callee);
+                    for (auto* b : in.branches) walk(b);
+                }
+            };
+            for (auto& pr : procs) walk(pr.prog);
+        }
+        for (int s : noPriv) if (s >= 0 && (size_t)s < ns) bad[(size_t)s] = 1;
         priv_.assign(ns, 0);
         for (size_t s = 0; s < ns; s++)
             priv_[s] = cand[s] && !bad[s] && sigs[s].w >= 1 && sigs[s].w <= 64 &&
@@ -1076,8 +1181,11 @@ private:
 
     // The 4-state branch, out of the hot code: a domain of thousands of
     // statements otherwise misses the instruction cache all the time.
-    static std::string cold(const std::string& stmt) {
-        return "[&]() __attribute__((noinline, cold)) { " + stmt + " }();";
+    // -DMSIM_COLDSTAT counts each one and prints the busiest at exit (COLD in
+    // the preamble): the statements that keep running the 4-state way.
+    int colds_ = 0;
+    std::string cold(const std::string& stmt) {
+        return "[&]() __attribute__((noinline, cold)) { COLD(" + std::to_string(colds_++) + ") " + stmt + " }();";
     }
     // Writes to a private signal: a known value, or any Val.
     std::string pwv(int s, const std::string& u) const {
@@ -1168,7 +1276,7 @@ private:
                         std::string g, u, sl;
                         bool sp = i.hi < 0 && split(i.e, g, u, sl);
                         if (sp) fns2 << " V" << k << " = " << u << "; H" << k << " = 1;\n";
-                        else two = false;
+                        else fns2 << " F" << k << " = " << fast(i.e) << "; H" << k << " = 2;\n";   // no 2-state path: as it is
                         // H: 1 = the 2-state value in V<k>, 2 = the Val in F<k>.
                         if (sp) {
                             if (g.empty()) fns << " V" << k << " = " << u << "; H" << k << " = 1;\n";
@@ -1187,7 +1295,7 @@ private:
                                 << ") goto " << L(i.target) << ";\n";
                         } else {
                             fns << " if (truth(" << sl << ") != 1) goto " << L(i.target) << ";\n";
-                            two = false;
+                            fns2 << " if (truth(" << sl << ") != 1) goto " << L(i.target) << ";\n";
                         }
                         break;
                     }
@@ -1208,25 +1316,122 @@ private:
             o << "    S.fw(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
         o << "}\n";
         // Comb statements first: their reads are part of `ext`, which twoNow checks.
+        // One unit per straight-line assign, or per process with if / case
+        // (its jumps stay inside the unit). unitIns: the unit's writes, then
+        // unitRefs: the signals its conditions read.
         std::vector<std::string> combStmts, combStmts2, commitStmts;
         std::vector<const Instr*> combIns;
-        for (int i : byRank)
-            for (const Instr& in : procs[i].prog->code) {
+        bool serialOnly = false;
+        std::vector<std::vector<const Instr*>> unitIns;
+        std::vector<std::vector<E>> unitConds;
+        // In the 2-state copy a statement without a 2-state path runs as it
+        // is; if what it wrote is not known, the pass is abandoned (@BAIL@)
+        // and everything runs again the 4-state way: the statements are pure,
+        // so the ones already done compute the same values.
+        auto stmt2 = [&](const Instr& in) -> std::string {
+            std::string g, u, sl;
+            if (in.hi >= 0 || !split(in.e, g, u, sl)) {
+                std::string S_ = std::to_string(in.sig);
+                std::string unk = isPriv(in.sig) ? "P" + S_ + ".x"
+                                : sigW_[in.sig] <= 64 ? "S.sigs[" + S_ + "].val.x" : "anyX(S.sigs[" + S_ + "].val)";
+                return "    {" + fassign(in) + "    if (__builtin_expect(" + unk + " != 0, 0)) @BAIL@ }\n";
+            }
+            std::string S_ = std::to_string(in.sig);
+            if (isPriv(in.sig))   // x and z are already 0 in 2-state mode
+                return "    P" + S_ + ".v = (" + u + ") & " + M(sigW_[in.sig]) + ";\n";
+            if (in.drv >= 0)
+                return "    S.fwdv(" + S_ + ", " + std::to_string(in.drv) + ", " + u + ", " + std::to_string((int)in.s0) +
+                       ", " + std::to_string((int)in.s1) + ");\n";
+            return "    " + regWrite(in.sig, u) + "\n";
+        };
+        for (int i : byRank) {
+            const Prog& cp = *procs[i].prog;
+            if (combBranches(cp)) {
+                std::string c4 = "    {\n", c2 = "    {\n";
+                auto L4 = [&](size_t pc) { return "cb" + std::to_string(i) + "_" + std::to_string(pc); };
+                auto L2 = [&](size_t pc) { return "cq" + std::to_string(i) + "_" + std::to_string(pc); };
+                if (combAsserts(cp)) {   // reports go through the kernel's queues: one thread
+                    // The domain evaluates every unit on each pass, but the
+                    // process only runs (and reports again) when a signal it
+                    // waits on changed: skip the unit otherwise.
+                    o << combCtlDecl(i);
+                    const Instr& w = cp.code[cp.code.size() - 2];
+                    std::vector<int> ins;
+                    if (w.events.size() > 1) for (auto& [sg, ed] : w.events) ins.push_back(sg);
+                    else ins.push_back(w.sig);
+                    std::string I_ = std::to_string(i), chk = "    { bool ch = !CIV" + I_ + "; CIV" + I_ + " = true;\n";
+                    size_t nw = 0;
+                    for (int sg : ins) {
+                        std::string G_ = std::to_string(sg);
+                        if (isPriv(sg)) {
+                            for (const char* f : {".v", ".x", ".z"})
+                                chk += "      ch |= UPD(CI" + I_ + "[" + std::to_string(nw++) + "], P" + G_ + f + ");\n";
+                        } else if (sigW_[sg] <= 64) {
+                            for (const char* f : {".v", ".x", ".z"})
+                                chk += "      ch |= UPD(CI" + I_ + "[" + std::to_string(nw++) + "], S.sigs[" + G_ + "].val" + f + ");\n";
+                        } else {
+                            o << "static Val CW" << I_ << "_" << G_ << ";\n";
+                            chk += "      ch |= UPDV(CW" + I_ + "_" + G_ + ", S.sigs[" + G_ + "].val);\n";
+                        }
+                        ext.insert(sg);
+                    }
+                    o << "static uint64_t CI" << I_ << "[" << std::max<size_t>(nw, 1) << "]; static bool CIV" << I_ << ";\n";
+                    chk += "      if (!ch) goto @END@; }\n    CC" + I_ + "->epoch++;\n";
+                    auto withEnd = [&](std::string c, const std::string& lab) {
+                        c.replace(c.find("@END@"), 5, lab);
+                        return c;
+                    };
+                    c4 += withEnd(chk, L4(cp.code.size() - 2));
+                    c2 += withEnd(chk, L2(cp.code.size() - 2));
+                    serialOnly = true;
+                }
+                unitIns.emplace_back();
+                unitConds.emplace_back();
+                size_t pc = 0;
+                for (; pc < cp.code.size(); pc++) {
+                    const Instr& in = cp.code[pc];
+                    if (in.k == IK::JmpIfNot) {
+                        noteRefs(in.e);
+                        unitConds.back().push_back(in.e);
+                        c4 += L4(pc) + ": if (truth(" + fast(in.e) + ") != 1) goto " + L4(in.target) + ";\n";
+                        std::string g, u, sl;
+                        // Every signal read is known here (twoNow, and no bail so far).
+                        if (split(in.e, g, u, sl)) c2 += L2(pc) + ": if (!(" + u + ")) goto " + L2(in.target) + ";\n";
+                        else c2 += L2(pc) + ": if (truth(" + sl + ") != 1) goto " + L2(in.target) + ";\n";
+                        continue;
+                    }
+                    if (in.k == IK::Jmp) {
+                        c4 += L4(pc) + ": goto " + L4(in.target) + ";\n";
+                        c2 += L2(pc) + ": goto " + L2(in.target) + ";\n";
+                        continue;
+                    }
+                    if (in.k == IK::Assert) {
+                        std::string a = combAssert(i, in);
+                        c4 += L4(pc) + ":" + a;
+                        c2 += L2(pc) + ":" + a;
+                        continue;
+                    }
+                    if (in.k != IK::Assign) break;
+                    noteRefs(in.e);
+                    combIns.push_back(&in);
+                    unitIns.back().push_back(&in);
+                    c4 += L4(pc) + ":" + fassign(in);
+                    c2 += L2(pc) + ":" + stmt2(in);
+                }
+                combStmts.push_back(c4 + L4(pc) + ": ;\n    }\n");
+                combStmts2.push_back(c2 + L2(pc) + ": ;\n    }\n");
+                continue;
+            }
+            for (const Instr& in : cp.code) {
                 if (in.k != IK::Assign) break;
                 combStmts.push_back("   " + fassign(in));
                 combIns.push_back(&in);
+                unitIns.push_back({&in});
+                unitConds.emplace_back();
                 noteRefs(in.e);
-                std::string g, u, sl;
-                if (in.hi >= 0 || !split(in.e, g, u, sl)) { two = false; continue; }
-                std::string S_ = std::to_string(in.sig);
-                if (isPriv(in.sig))   // x and z are already 0 in 2-state mode
-                    combStmts2.push_back("    P" + S_ + ".v = (" + u + ") & " + M(sigW_[in.sig]) + ";\n");
-                else if (in.drv >= 0)
-                    combStmts2.push_back("    S.fwdv(" + S_ + ", " + std::to_string(in.drv) + ", " + u + ", " +
-                                         std::to_string((int)in.s0) + ", " + std::to_string((int)in.s1) + ");\n");
-                else
-                    combStmts2.push_back("    " + regWrite(in.sig, u) + "\n");
+                combStmts2.push_back(stmt2(in));
             }
+        }
         o << fns.str();
         if (two) o << fns2.str();
         // 2-state mode holds when every private signal is known (pclean, kept
@@ -1237,6 +1442,16 @@ private:
             o << ") == 0";
         }
         o << ";\n}\n";
+        // MSIM_WHY4=<n>: on the n-th 4-state comb pass, name the signals that
+        // keep the domain out of 2-state mode.
+        o << "static void why4() {\n    static long n = 0; static const char* w = std::getenv(\"MSIM_WHY4\");\n"
+             "    if (!w || ++n != std::atol(w)) return;\n";
+        if (two)
+            for (int e : ext)
+                o << "    if (S.sigs[" << e << "].val.x) std::fprintf(stderr, \"4-state: %s\\n\", S.sigs[" << e << "].name.c_str());\n";
+        for (int s : privs)
+            o << "    if (P" << s << ".x) std::fprintf(stderr, \"4-state (private): %s\\n\", S.sigs[" << s << "].name.c_str());\n";
+        o << "}\n";
         o << "static void scanP() {\n    uint64_t x = 0;\n";
         for (int s : privs) o << "    x |= P" << s << ".x;\n";
         o << "    pclean = x == 0;\n}\n";
@@ -1281,10 +1496,13 @@ private:
             for (auto& in : procs[n].prog->code) refsOf(in.e, rs);
             for (int r : rs) unite(procSig[n], r);
         }
-        for (auto* in : combIns) {
+        for (size_t j = 0; j < unitIns.size(); j++) {
+            int s0 = unitIns[j].empty() ? -1 : unitIns[j][0]->sig;
+            if (s0 < 0) continue;
             std::vector<int> rs;
-            refsOf(in->e, rs);
-            for (int r : rs) unite(in->sig, r);
+            for (auto* in : unitIns[j]) { refsOf(in->e, rs); rs.push_back(in->sig); }
+            for (auto& e : unitConds[j]) refsOf(e, rs);
+            for (int r : rs) unite(s0, r);
         }
         std::map<int, int> islandId;
         auto islandOf = [&](int sig) {
@@ -1299,7 +1517,7 @@ private:
         for (auto* in : combIns) islandOf(in->sig);
         int nIsl = (int)islandId.size();
         const int kGroups = 64;
-        bool par = allPriv && nIsl >= 32;
+        bool par = allPriv && nIsl >= 32 && !serialOnly;
         int G = par ? std::min(nIsl, kGroups) : 0;
         auto groupOf = [&](int sig) { return (int)((int64_t)islandOf(sig) * G / nIsl); };
         if (par) {
@@ -1329,7 +1547,7 @@ private:
                  "        const int use = S.domainTune[0].pick(S.threads);\n"
                  "        S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); CMG[g](t); }, use);\n"
                  "        S.domainTune[0].done(S.threads);\n"
-                 "        if (!t) scanP();\n"
+                 "        if (!t || cdirty.exchange(false)) scanP();\n"
                  "        if (S.observed) syncP();\n"
                  "        return;\n    }\n"
                  "    { const bool t = twoNow(); const int use = S.domainTune[1].pick(S.threads);\n"
@@ -1364,15 +1582,21 @@ private:
             }
             return n;
         };
+        auto bail = [](std::string st, const std::string& with) {
+            for (size_t at; (at = st.find("@BAIL@")) != std::string::npos;) st.replace(at, 6, with);
+            return st;
+        };
+        std::vector<std::string> combStmtsQ;
+        for (auto& st : combStmts2) combStmtsQ.push_back(bail(st, "{ cdirty = true; return; }"));
         int nc = chunks("combP", combStmts), nm = chunks("commitP", commitStmts);
-        int nq = two ? chunks("combQ", combStmts2) : 0;
+        int nq = two ? chunks("combQ", combStmtsQ) : 0;
         o << "static void combAll(const void*) {\n";
         if (two) {
-            o << "    if (twoNow()) {";
-            for (int j = 0; j < nq; j++) o << " combQ" << j << "();";
-            o << " } else {";
-            for (int j = 0; j < nc; j++) o << " combP" << j << "();";
-            o << " scanP(); }\n";
+            o << "    if (twoNow()) {\n        cdirty = false;\n";
+            for (int j = 0; j < nq; j++) o << "        combQ" << j << "(); if (cdirty) goto slow;\n";
+            o << "        goto done;\n    }\n    slow: ;\n";
+            for (int j = 0; j < nc; j++) o << "    combP" << j << "();\n";
+            o << "    scanP(); why4();\n    done: ;\n";
         } else
             for (int j = 0; j < nc; j++) o << "    combP" << j << "();\n";
         o << "    if (S.observed) syncP();\n}\n";
@@ -1380,14 +1604,16 @@ private:
             // Per group: its slots' commits, then its comb statements in rank order.
             std::vector<std::string> gCommit(G), gComb(G), gComb2(G);
             for (size_t k = 0; k < slots.size(); k++) gCommit[groupOf(slots[k].sig)] += commitStmts[k];
-            for (size_t j = 0; j < combIns.size(); j++) {
-                int g = groupOf(combIns[j]->sig);
+            for (size_t j = 0; j < unitIns.size(); j++) {
+                if (unitIns[j].empty()) continue;
+                int g = groupOf(unitIns[j][0]->sig);
                 gComb[g] += combStmts[j];
                 gComb2[g] += combStmts2[j];
             }
             for (int g = 0; g < G; g++)
                 o << "static void cmG" << g << "(bool two) {\n    const bool obs = false; (void)obs;\n" << gCommit[g]
-                  << "    if (two) {\n" << gComb2[g] << "    } else {\n" << gComb[g] << "    }\n}\n";
+                  << "    if (two) {\n" << bail(gComb2[g], "{ cdirty = true; goto slow; }") << "        return;\n    }\n    slow: ;\n"
+                  << gComb[g] << "}\n";
             // twoNow() before the commits: in 2-state mode every slot holds a
             // known value, so the commits keep every private signal known.
             o << "static void fcommit() {\n"
@@ -1395,7 +1621,7 @@ private:
                  "    const int use = S.domainTune[2].pick(S.threads);\n"
                  "    S.parallelFor(" << G << ", [t](size_t g) { CMG[g](t); }, use);\n"
                  "    S.domainTune[2].done(S.threads);\n"
-                 "    if (!t) scanP();\n"
+                 "    if (!t || cdirty.exchange(false)) scanP();\n"
                  "    if (S.observed) syncP();\n}\n\n";
             return;
         }
@@ -1430,7 +1656,10 @@ private:
     // A combinational process: its leading Assign instructions as a function.
     void emitComb(std::ostream& o, int n, const Prog& p, const std::string& kind) {
         o << "// process " << n << " (" << kind << ", combinational)\n";
+        const bool as = combAsserts(p);
+        if (as) o << combCtlDecl(n);
         o << "static void comb" << n << "(const void*) {\n";
+        if (as) o << "    CC" << n << "->epoch++;\n";
         auto L = [&](size_t pc) { return "c" + std::to_string(n) + "_" + std::to_string(pc); };
         size_t pc = 0;
         for (; pc < p.code.size(); pc++) {
@@ -1440,6 +1669,7 @@ private:
                 continue;
             }
             if (i.k == IK::Jmp) { o << L(pc) << ":" << CH(&p, pc) << " goto " << L(i.target) << ";\n"; continue; }
+            if (i.k == IK::Assert) { o << L(pc) << ":" << CH(&p, pc) << combAssert(n, i); continue; }
             if (i.k != IK::Assign) break;
             if (i.arr || i.bidx) throw CodegenUnsupported("variable-index write in a static combinational process");
             o << L(pc) << ":" << CH(&p, pc) << " " << assign(i);
@@ -1578,7 +1808,7 @@ private:
                         bool priv = readsPriv(i.e);
                         for (auto* cs : {&a.passCap, &a.failCap})
                             for (auto& c : *cs) priv |= readsPriv(c);
-                        if (priv) throw CodegenUnsupported("an assertion on a private signal");
+                        if (priv) { hitPriv(i.e); for (auto* cs : {&a.passCap, &a.failCap}) for (auto& c : *cs) hitPriv(c); }
                         asrts_.push_back(&i);
                         std::string A_ = "AI" + std::to_string(asrts_.size() - 1);
                         if (i.join)   // deferred: queues its report and goes on
@@ -1590,7 +1820,7 @@ private:
                     }
                     case IK::AssertCtl:   // $assertcontrol and friends (20.11)
                         for (auto& a : i.args)
-                            if (readsPriv(a)) throw CodegenUnsupported("$assertcontrol on a private signal");
+                            hitPriv(a);
                         asrts_.push_back(&i);
                         o << " assertCtl(AI" << asrts_.size() - 1 << ");\n";
                         break;
@@ -1621,13 +1851,22 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
                            const CodegenParts& parts = {}, bool twoState = true, bool cycle = true,
                            bool privates = true,
                            std::vector<std::pair<const Prog*, size_t>>* covSlots = nullptr, int split = 1) {
-    Codegen g;
-    g.files = split;
-    g.twoState = twoState;
-    g.cycle = cycle;
-    g.privates = privates;
-    g.cov = covSlots != nullptr;
-    std::string src = g.run(sigs, procs, parts);
-    if (covSlots) *covSlots = std::move(g.covSlots);
-    return src;
+    std::set<int> noPriv;
+    for (int pass = 0;; pass++) {
+        Codegen g;
+        g.files = split;
+        g.twoState = twoState;
+        g.cycle = cycle;
+        g.privates = privates && pass < 8;   // each pass keeps the signals the last one tripped on in S.sigs
+        g.noPriv = noPriv;
+        g.cov = covSlots != nullptr;
+        std::string src = g.run(sigs, procs, parts);
+        if (!g.privHits_.empty()) {
+            if (!g.privates) throw CodegenUnsupported("a private signal");
+            noPriv.insert(g.privHits_.begin(), g.privHits_.end());
+            continue;
+        }
+        if (covSlots) *covSlots = std::move(g.covSlots);
+        return src;
+    }
 }
