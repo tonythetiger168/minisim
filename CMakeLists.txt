@@ -67,6 +67,11 @@ else()
   message(STATUS "OpenSSL not found: building without protected envelope support")
 endif()
 
+# The gate-level Verilog netlist reader and writer (src/gnetlist.hpp).
+add_executable(test_gnetlist tests/test_gnetlist.cpp)
+target_include_directories(test_gnetlist PRIVATE src)
+add_test(NAME test_gnetlist COMMAND test_gnetlist)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
