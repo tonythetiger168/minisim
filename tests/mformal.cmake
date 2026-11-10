@@ -66,7 +66,7 @@ expect(fsm.sv
   "assert  fsm.a_gnt_run +proven"
   "assert  fsm.a_imm +proven"
   "assert  fsm.a_imm_bad +falsified  at cycle 2"
-  "assert  fsm.a_live +bounded .*liveness"
+  "assert  fsm.a_live +proven"
   "assert  fsm.a_no_skip +proven"
   "assert  fsm.a_until +proven"
   "cover   fsm.c_fin +covered  at cycle 3"
@@ -84,7 +84,7 @@ expect(fifo.sv
   "assert  top.u.a_count +proven"
   "assert  top.u.a_full_stays +proven"
   "assert  top.u.a_not_both +proven"
-  "assert  top.u.a_push_fills +proven  \\(induction with [0-9]+ lemmas"
+  "assert  top.u.a_push_fills +proven  \\(induction with lemmas"
   "assert  top.u.a_push_counts +falsified  at cycle 5"
   "cover   top.u.c_full +covered  at cycle 4"
   "cover   top.u.c_full_then_empty +covered  at cycle 8")
@@ -119,3 +119,27 @@ expect(cut.sv
   "assert  cut.a_n +falsified"
   "n: a process on another clock or edge"
   "slow: a process that is not combinational or clocked")
+
+# Proofs that need an invariant (PDR), and a failure deeper than -depth.
+run(inv.sv 1 "-top;inv;-depth;10;-tb")
+expect(inv.sv
+  "assert  inv.a_acc +proven  \\(pdr"
+  "assert  inv.a_c +proven"
+  "assert  inv.a_ring +proven"
+  "assert  inv.a_same +proven"
+  "assert  inv.a_deep +falsified  at cycle 35")
+replay(inv.sv inv.a_deep 365)
+run(inv.sv 0 "-top;inv;-depth;10;-no-pdr;-prop;a_deep;-prop;a_acc")
+expect(inv.sv "assert  inv.a_deep +bounded  no counterexample in 10 cycles" "assert  inv.a_acc +bounded")
+
+# Liveness: proofs, and counterexamples that are loops.
+run(live.sv 1 "-top;live")
+expect(live.sv
+  "assert  live.a_prio0 +proven"
+  "assert  live.a_prio1 +falsified  at cycle [0-9]+ .*liveness: from here the design can repeat cycles"
+  "assert  live.a_rr0 +proven"
+  "assert  live.a_rr1 +proven"
+  "assert  live.a_rr1_fast +falsified"
+  "assert  live.a_until +proven"
+  "assert  live.a_always_ev +proven"
+  "assert  live.a_idle +falsified  at cycle [0-9]+ .*liveness")

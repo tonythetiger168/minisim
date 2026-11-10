@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
+  failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
+  `strong()`, `always s_eventually`) is proven or falsified with a loop
+  counterexample.
 - `mformal`: formal property checking on the msim front end. Proves or
   falsifies concurrent and immediate `assert`, takes `assume` as input
   constraints, reaches `cover` or proves it unreachable. Bounded model
@@ -153,6 +157,9 @@ Spec references are IEEE 1800-2023 clauses.
   subroutine call.
 
 ### Fixed
+- A concurrent assertion read the current value, not the sampled one, of a
+  bit select or indexed part select with a variable index (`r[k]`,
+  `r[k -: 2]`, 16.5.1).
 - A cast of a narrow unsigned operand inside a signed expression,
   `int'(u3) % 5`, sign-extended the operand: 6 became -2. The operand is now
   extended with its own signedness, as an assignment to the cast type
