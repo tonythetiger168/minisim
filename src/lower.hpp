@@ -8137,7 +8137,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             i.s0 = i.s1 = STR_STRONG;
             i.dly.clear();
             lw.prog.emit(i);
-            auto rs = readSet(lw.prog);
+            auto rs = combReadSet(lw.prog);
             if (!rs.empty()) {
                 lw.prog.emit(waitInstr(rs));
                 Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
@@ -8148,7 +8148,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.drv = newDriver(i.sig);
         if (linkFormal >= 0 && i.hi < 0) outLinks().push_back({linkFormal, i.sig, i.drv});
         lw.prog.emit(i);
-        auto rs = readSet(lw.prog);
+        auto rs = combReadSet(lw.prog);
         bool loops = !rs.empty();
         if (loops) {
             lw.prog.emit(waitInstr(rs));

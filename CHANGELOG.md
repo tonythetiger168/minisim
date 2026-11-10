@@ -8,20 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `mlibc`, cell library checks and reports on the shared Liberty and LEF
-  readers: `mlibc check` (23 rules: function against timing arcs and
-  `timing_sense`, tables that shrink with load, missing setup or hold,
-  leakage states, drive strengths out of order, and Liberty against LEF),
-  `mlibc report` and `mlibc compare slow.lib fast.lib`. Multithreaded, with
-  the same output for any `-threads`. See `docs/LIBCHECK.md`.
-- `lib/mini45`: a generic 45 nm-class standard cell library for the tool
-  line, written from scratch (not a foundry library): 88 cells (inverters,
-  buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,
-  flops with reset, set, enable and scan, latches, clock gates, tristate, tie
-  and filler cells, several drive strengths) as Liberty at three corners
-  (`mini45_tt.lib`, `_ss`, `_ff`: NLDM 7x7 delay tables, constraints,
-  internal power, state-dependent leakage, wire loads), Verilog models
-  (`mini45.v`), and technology and cell LEF. See `docs/MINI45.md`.
+- `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
+  of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
+  bus, logic in front of a synchronizer, reconvergence, a signal synchronized
+  twice) and `RDC001` to `RDC004` (a reset from another clock domain, one
+  reset used raw in several domains, a flop feeding a flop with another reset
+  or with none). Synchronizers in one block, with a reset, as shift registers
+  or as per-bit synchronizer cells, enable-qualified buses and Gray-coded
+  pointers are recognized; clock gates stay in their clock's domain and bits
+  of a clock bus are separate clocks. New options: `-cdc-report`,
+  `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -37,6 +33,20 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `mlibc`, cell library checks and reports on the shared Liberty and LEF
+  readers: `mlibc check` (23 rules: function against timing arcs and
+  `timing_sense`, tables that shrink with load, missing setup or hold,
+  leakage states, drive strengths out of order, and Liberty against LEF),
+  `mlibc report` and `mlibc compare slow.lib fast.lib`. Multithreaded, with
+  the same output for any `-threads`. See `docs/LIBCHECK.md`.
+- `lib/mini45`: a generic 45 nm-class standard cell library for the tool
+  line, written from scratch (not a foundry library): 88 cells (inverters,
+  buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,
+  flops with reset, set, enable and scan, latches, clock gates, tristate, tie
+  and filler cells, several drive strengths) as Liberty at three corners
+  (`mini45_tt.lib`, `_ss`, `_ff`: NLDM 7x7 delay tables, constraints,
+  internal power, state-dependent leakage, wire loads), Verilog models
+  (`mini45.v`), and technology and cell LEF. See `docs/MINI45.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
@@ -47,6 +57,9 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Functional coverage in the coverage database: `msim -cov` records the bins
+  of every covergroup type (19.11) and the statistics of every assertion
+  (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
 - Datapath library `dw/`: 47 synthesizable, parameterized SystemVerilog
   building blocks named `MW_*` (adders with five carry architectures,
   Booth/Wallace and array multipliers, multiply-accumulate, dividers, square
