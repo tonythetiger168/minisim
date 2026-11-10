@@ -96,6 +96,42 @@ the box `x1 y1 x2 y2` in microns and the measured value (a distance, an area,
 or a density). For a distance the box is the gap between the two edges or
 corners. Markers are sorted, so two runs can be compared with `diff`.
 
+## LVS: netlist extraction
+
+```sh
+mpv lvs -deck tests/pv/sky130.lvs tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds -o inv.spice
+```
+
+```
+.subckt sky130_fd_sc_hd__inv_1 A VGND VNB VPB VPWR Y
+M0 Y A VGND VNB sky130_fd_pr__nfet_01v8 w=0.65 l=0.15
+M1 Y A VPWR VPB sky130_fd_pr__pfet_01v8_hvt w=1 l=0.15
+.ends
+```
+
+The deck says what conducts, what names a net, and what a transistor is:
+
+```
+connect licon li                 # one net where the two overlap
+connect li met1 by mcon          # ... where mcon overlaps both
+label li 67/5 67/16              # text on these GDS layers names the li net under it
+device mos sky130_fd_pr__nfet_01v8 gate=ngate poly=poly sd=nsd bulk=pwell
+```
+
+Every polygon of the `gate` layer is one transistor: its gate terminal is the
+`poly` polygon over it, source and drain are the two `sd` polygons beside it,
+the body is the `bulk` polygon under it. The width is half the length of the
+gate's sides shared with source and drain; the length is the gate area over
+the width. Labelled nets are the ports. A gate without exactly two
+source/drain regions, two labels on one net (a short) and one label on two
+nets (an open) are reported and give exit status 1.
+
+The comparison engine (`lvs::compare` in `src/lvs.hpp`) matches two netlists
+by partition refinement: ports by name, everything else by structure, with
+parallel transistors merged and source and drain interchangeable. It reports
+unmatched devices and nets and size differences. The command line option to
+compare against a SPICE schematic comes with the shared SPICE reader.
+
 ## SKY130 example
 
 `tests/pv/sky130.drc` holds 35 SKY130 rules from diffusion to metal 2. The
@@ -127,4 +163,5 @@ in a canonical form, so the report is identical for every thread count.
 | `src/geom.hpp` | regions of rectangles: booleans, sizing, boundary edges, connected polygons |
 | `src/layout.hpp` | a GDS library flattened to rectangles per layer |
 | `src/drc.hpp` | the deck parser and the checks |
+| `src/lvs.hpp` | netlist extraction and netlist comparison |
 | `src/mpv.cpp` | the command line |

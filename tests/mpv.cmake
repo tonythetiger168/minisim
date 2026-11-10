@@ -77,3 +77,12 @@ run(2 drc -deck ${OUT}/broken.drc ${OUT}/pv_bad.gds)
 if(NOT err MATCHES "broken.drc: line 2: expected \\) in width")
   message(FATAL_ERROR "deck error: ${err}")
 endif()
+
+# LVS extraction: the flop has 24 transistors, as in the PDK netlist.
+run(0 lvs -deck ${SRC}/tests/pv/sky130.lvs ${SRC}/tests/pv/sky130/sky130_fd_sc_hd__dfxtp_1.gds -o ${OUT}/dfxtp.spice)
+expect("cell sky130_fd_sc_hd__dfxtp_1, 24 devices, 18 nets, 7 ports")
+expect("sky130_fd_pr__nfet_01v8          12")
+file(READ ${OUT}/dfxtp.spice out)
+expect(".subckt sky130_fd_sc_hd__dfxtp_1 CLK D Q VGND VNB VPB VPWR\n")
+expect("M22 VPWR n14 n16 VPB sky130_fd_pr__pfet_01v8_hvt w=1 l=0.15\n")
+run(2 lvs -deck ${SRC}/tests/pv/mini.drc ${OUT}/pv_bad.gds)

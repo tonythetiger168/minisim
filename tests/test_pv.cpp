@@ -9,7 +9,7 @@
 #include <random>
 #include <sstream>
 
-#include "drc.hpp"
+#include "lvs.hpp"
 
 using geom::C;
 using geom::Op;
@@ -415,6 +415,111 @@ void testCheckThreads() {
     std::printf("  %zu markers, the same on 1, 2 and 8 threads\n", total);
 }
 
+// --- LVS -------------------------------------------------------------------
+
+#ifndef MINISIM_SOURCE_DIR
+#define MINISIM_SOURCE_DIR "."
+#endif
+
+lvs::Netlist extractCell(const std::string& cell, std::vector<std::string>& problems) {
+    std::string dir = std::string(MINISIM_SOURCE_DIR) + "/tests/pv/", err;
+    drc::Deck deck;
+    gds::Library lib;
+    layout::Flat flat;
+    if (!drc::readDeck(dir + "sky130.lvs", deck, err) || !gds::read(dir + "sky130/sky130_fd_sc_hd__" + cell + ".gds", lib, err) ||
+        !layout::flatten(lib, "", flat, err, 2)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        assert(false);
+    }
+    drc::Engine eng(deck, flat, 2);
+    lvs::Netlist n;
+    lvs::extract(deck, eng, flat, n, problems);
+    return n;
+}
+
+// A schematic from rows of "drain gate source body model w l".
+lvs::Netlist schematic(const std::vector<std::string>& ports, const std::vector<std::string>& rows) {
+    lvs::Netlist n;
+    for (const std::string& p : ports) n.ports.push_back(n.net(p));
+    for (const std::string& r : rows) {
+        std::istringstream ss(r);
+        std::string d, g, s, b;
+        lvs::Device dev;
+        ss >> d >> g >> s >> b >> dev.model >> dev.w >> dev.l;
+        dev.d = n.net(d); dev.g = n.net(g); dev.s = n.net(s); dev.b = n.net(b);
+        dev.name = "X" + std::to_string(n.devices.size());
+        n.devices.push_back(dev);
+    }
+    return n;
+}
+
+void testLvs() {
+    const char* N = " sky130_fd_pr__nfet_01v8 ";
+    const char* P = " sky130_fd_pr__pfet_01v8_hvt ";
+    std::vector<std::string> problems;
+    // The inverter, as in the PDK's sky130_fd_sc_hd__inv_1.spice.
+    lvs::Netlist inv = extractCell("inv_1", problems);
+    assert(problems.empty() && inv.devices.size() == 2 && inv.ports.size() == 6);
+    assert(lvs::toSpice(inv) ==
+           ".subckt sky130_fd_sc_hd__inv_1 A VGND VNB VPB VPWR Y\n"
+           "M0 Y A VGND VNB sky130_fd_pr__nfet_01v8 w=0.65 l=0.15\n"
+           "M1 Y A VPWR VPB sky130_fd_pr__pfet_01v8_hvt w=1 l=0.15\n.ends\n");
+    std::vector<std::string> ports = {"A", "VGND", "VNB", "VPB", "VPWR", "Y"};
+    lvs::Netlist invS = schematic(ports, {std::string("VGND A Y VNB") + N + "0.65 0.15", std::string("VPWR A Y VPB") + P + "1 0.15"});
+    lvs::CompareResult r = lvs::compare(inv, invS);
+    assert(r.match && r.matchedDevices == 2 && r.matchedNets == 6);
+    // A wrong width, a wrong connection, a missing device, a missing port.
+    r = lvs::compare(inv, schematic(ports, {std::string("VGND A Y VNB") + N + "0.65 0.15", std::string("VPWR A Y VPB") + P + "2 0.15"}));
+    assert(!r.match && r.messages.size() == 1 && r.messages[0].rfind("size: ", 0) == 0);
+    r = lvs::compare(inv, schematic(ports, {std::string("VGND A Y VNB") + N + "0.65 0.15", std::string("VPWR A Y VPWR") + P + "1 0.15"}));
+    assert(!r.match);
+    r = lvs::compare(inv, schematic(ports, {std::string("VGND A Y VNB") + N + "0.65 0.15"}));
+    assert(!r.match && r.messages[0] == "the layout has 2 devices, the schematic 1");
+    r = lvs::compare(inv, schematic({"IN", "VGND", "VNB", "VPB", "VPWR", "Y"},
+                                    {std::string("VGND IN Y VNB") + N + "0.65 0.15", std::string("VPWR IN Y VPB") + P + "1 0.15"}));
+    assert(!r.match && r.messages[0] == "port A is in the layout but not in the schematic");
+
+    // The NAND: the PDK netlist lists source and drain either way round, and
+    // the two inputs are not interchangeable (A is next to the output).
+    lvs::Netlist nand = extractCell("nand2_1", problems);
+    assert(problems.empty() && nand.devices.size() == 4);
+    std::vector<std::string> np = {"A", "B", "VGND", "VNB", "VPB", "VPWR", "Y"};
+    std::vector<std::string> rows = {std::string("Y A VPWR VPB") + P + "1 0.15", std::string("VPWR B Y VPB") + P + "1 0.15",
+                                     std::string("VGND B mid VNB") + N + "0.65 0.15", std::string("mid A Y VNB") + N + "0.65 0.15"};
+    assert(lvs::compare(nand, schematic(np, rows)).match);
+    std::vector<std::string> swapped = rows;
+    swapped[2] = std::string("VGND A mid VNB") + N + "0.65 0.15";
+    swapped[3] = std::string("mid B Y VNB") + N + "0.65 0.15";
+    assert(!lvs::compare(nand, schematic(np, swapped)).match);
+
+    // The flop (24 transistors): against itself with the devices reversed,
+    // source and drain exchanged and the internal nets renamed; then with two
+    // internal nets exchanged on one device.
+    lvs::Netlist ff = extractCell("dfxtp_1", problems);
+    assert(problems.empty() && ff.devices.size() == 24 && ff.nets.size() == 18);
+    lvs::Netlist other = ff;
+    std::reverse(other.devices.begin(), other.devices.end());
+    for (lvs::Device& d : other.devices) std::swap(d.s, d.d);
+    for (size_t i = 0; i < other.nets.size(); ++i)
+        if (other.nets[i][0] == 'n') other.nets[i] = "net_" + std::to_string(100 - i);
+    r = lvs::compare(ff, other);
+    assert(r.match && r.matchedDevices == 24 && r.matchedNets == 18);
+    lvs::Netlist broken = other;
+    for (lvs::Device& d : broken.devices)
+        if (other.nets[d.g][0] == 'n' && other.nets[d.d][0] == 'n') { std::swap(d.g, d.d); break; }
+    r = lvs::compare(ff, broken);
+    assert(!r.match && !r.messages.empty());
+
+    // Fingers in parallel are one device: the 4x mux has the same circuit as
+    // a schematic with single wide transistors.
+    lvs::Netlist a = schematic({"G", "D", "S", "B"}, {std::string("D G S B") + N + "0.5 0.15", std::string("S G D B") + N + "0.5 0.15"});
+    lvs::Netlist b = schematic({"G", "D", "S", "B"}, {std::string("D G S B") + N + "1 0.15"});
+    assert(lvs::compare(a, b).match);
+    lvs::CompareOptions keep;
+    keep.mergeParallel = false;
+    assert(!lvs::compare(a, b, keep).match);
+}
+
 // A small layout on the layers of tests/pv/mini.drc with one violation for most rules.
 void writeBad(const std::string& dir) {
     gds::Library lib;
@@ -457,6 +562,7 @@ int main(int argc, char** argv) {
     testGds();
     testChecks();
     testCheckThreads();
+    testLvs();
     std::puts("test_pv: ok");
     return 0;
 }

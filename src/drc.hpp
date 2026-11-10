@@ -32,6 +32,15 @@
 //                                     window in each row and column is moved back to end on the extent
 //   <layer expression>                any polygon is a violation
 //
+// Connectivity and devices (used by mpv lvs, see lvs.hpp)
+//   connect a b                       a and b are one net where they overlap
+//   connect a b by v                  ... where v overlaps both
+//   label a 67/5                      text on GDS layer 67, type 5 names the net of a under it
+//   device mos MODEL gate=g poly=p sd=d bulk=b
+//                                     every polygon of g is a transistor: gate terminal
+//                                     on p, source and drain on the two polygons of d
+//                                     beside it, body on b
+//
 // Distances across corners are Euclidean. Results do not depend on the
 // number of threads.
 #pragma once
@@ -78,6 +87,14 @@ struct Deck {
     std::vector<Drawn> drawn;
     std::vector<Derived> derived;
     std::vector<Rule> rules;
+
+    // Connectivity and devices, for LVS (lvs.hpp).
+    struct Connect { std::string a, b; int line; };
+    struct Label { std::string layer; std::vector<layout::LayerKey> keys; int line; };
+    struct Device { std::string kind, model, gate, poly, sd, bulk; int line; };
+    std::vector<Connect> connects;
+    std::vector<Label> labels;
+    std::vector<Device> devices;
 };
 
 // ---------------------------------------------------------------------------
@@ -239,7 +256,7 @@ inline bool parseDeck(std::istream& in, Deck& deck, std::string& err) {
         Lexer lx(line);
         if (!lx.err.empty()) return fail(lx.err);
         if (lx.cur.kind == Tok::End) continue;
-        if (lx.cur.kind != Tok::Name) return fail("expected layer, rule, or a name");
+        if (lx.cur.kind != Tok::Name) return fail("expected layer, rule, connect, label, device, or a name");
         std::string head = lx.cur.text;
         std::string bad;
         if (head == "layer") {
@@ -267,6 +284,66 @@ inline bool parseDeck(std::istream& in, Deck& deck, std::string& err) {
             if (d.keys.empty()) return fail("layer " + name + " needs a GDS layer number, as in 66/20");
             known[name] = true;
             deck.drawn.push_back(std::move(d));
+            continue;
+        }
+        if (head == "connect" || head == "label" || head == "device") {
+            std::istringstream ss(line.substr(0, line.find('#')));
+            std::vector<std::string> w;
+            for (std::string t; ss >> t;) w.push_back(t);
+            auto need = [&](const std::string& n) {
+                if (known.count(n)) return true;
+                bad = n;
+                return false;
+            };
+            if (head == "connect") {
+                // connect A B            A and B are joined where they overlap
+                // connect A B by V       ... through V
+                bool by = w.size() == 5 && w[3] == "by";
+                if (w.size() != 3 && !by) return fail("expected: connect A B, or connect A B by V");
+                if (!need(w[1]) || !need(w[2]) || (by && !need(w[4]))) return fail("layer " + bad + " is not defined");
+                if (by) {
+                    deck.connects.push_back({w[1], w[4], no});
+                    deck.connects.push_back({w[4], w[2], no});
+                } else {
+                    deck.connects.push_back({w[1], w[2], no});
+                }
+            } else if (head == "label") {
+                // label LAYER L/T [L/T ...]   text on these GDS layers names the net of LAYER under it
+                if (w.size() < 3) return fail("expected: label LAYER gds/texttype");
+                if (!need(w[1])) return fail("layer " + bad + " is not defined");
+                Deck::Label l{w[1], {}, no};
+                for (size_t k = 2; k < w.size(); ++k) {
+                    layout::LayerKey key;
+                    char* end = nullptr;
+                    key.layer = int(std::strtol(w[k].c_str(), &end, 10));
+                    if (end == w[k].c_str()) return fail("bad layer number " + w[k]);
+                    if (*end == '/') key.datatype = int(std::strtol(end + 1, &end, 10));
+                    if (*end) return fail("bad layer number " + w[k]);
+                    l.keys.push_back(key);
+                }
+                deck.labels.push_back(std::move(l));
+            } else {
+                // device mos MODEL gate=L poly=L sd=L bulk=L
+                if (w.size() < 3 || w[1] != "mos") return fail("expected: device mos MODEL gate=L poly=L sd=L bulk=L");
+                Deck::Device d;
+                d.kind = w[1];
+                d.model = w[2];
+                d.line = no;
+                for (size_t k = 3; k < w.size(); ++k) {
+                    size_t eq = w[k].find('=');
+                    if (eq == std::string::npos) return fail("expected name=layer, got " + w[k]);
+                    std::string key = w[k].substr(0, eq), val = w[k].substr(eq + 1);
+                    if (!need(val)) return fail("layer " + bad + " is not defined");
+                    if (key == "gate") d.gate = val;
+                    else if (key == "poly") d.poly = val;
+                    else if (key == "sd") d.sd = val;
+                    else if (key == "bulk") d.bulk = val;
+                    else return fail("unknown device terminal " + key);
+                }
+                if (d.gate.empty() || d.poly.empty() || d.sd.empty() || d.bulk.empty())
+                    return fail("device mos needs gate=, poly=, sd= and bulk=");
+                deck.devices.push_back(std::move(d));
+            }
             continue;
         }
         Parser ps{lx, err};

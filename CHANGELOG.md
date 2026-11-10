@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpv lvs`: extracts the transistor netlist of a layout (nets from `connect`
+  statements, names and ports from `label`, MOS devices with W and L from
+  `device mos`) and writes it as SPICE. `src/lvs.hpp` also holds the netlist
+  comparison (partition refinement, parallel merging, source/drain
+  exchange). `tests/pv/sky130.lvs` is the SKY130 deck.
 - `mpv drc`: design rule checking on GDSII layouts. A rule deck defines drawn
   and derived layers (`&`, `|`, `-`, `^`, `grow`, `shrink`, `interact`,
   `inside`, `outside`, `holes`, ...) and width, spacing, enclosure, overhang,
