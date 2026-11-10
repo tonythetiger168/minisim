@@ -55,7 +55,12 @@ struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// The logic engine is the equivalence checker's. These are the only names
+// taken from it besides Cnf/Sat in Prover::prove, so a move of the AIG to a
+// shared header changes this block and nothing else.
+using Aig = equiv::Aig;
 using Lit = equiv::Lit;
+inline constexpr Lit kFalse = equiv::kFalse, kTrue = equiv::kTrue;
 
 // ------------------------------------------------------------------ library
 
@@ -669,7 +674,7 @@ inline gnl::Module flatModule(const gnl::Source& src, const std::string& top, co
 
 // The variables both designs are functions of.
 struct Vars {
-    equiv::Aig g;
+    Aig g;
     std::unordered_map<std::string, Lit> byKey;
     std::map<std::string, int> ties;
     Lit var(const std::string& key) {
@@ -681,20 +686,20 @@ struct Vars {
     }
     Lit input(const std::string& port) {
         auto it = ties.find(port);
-        if (it != ties.end()) return it->second ? equiv::kTrue : equiv::kFalse;
+        if (it != ties.end()) return it->second ? kTrue : kFalse;
         return var("pi:" + port);
     }
 };
 
 template <class PinLit>
-inline Lit evalProg(equiv::Aig& g, const Prog& p, PinLit&& pinLit, Lit iq) {
+inline Lit evalProg(Aig& g, const Prog& p, PinLit&& pinLit, Lit iq) {
     Lit st[64];
     int sp = 0;
     for (int c : p.code) {
         if (c >= 0) st[sp++] = pinLit(c);
         else if (c == Prog::Not) st[sp - 1] ^= 1;
-        else if (c == Prog::C0) st[sp++] = equiv::kFalse;
-        else if (c == Prog::C1) st[sp++] = equiv::kTrue;
+        else if (c == Prog::C0) st[sp++] = kFalse;
+        else if (c == Prog::C1) st[sp++] = kTrue;
         else if (c == Prog::Iq) st[sp++] = iq;
         else if (c == Prog::Iqn) st[sp++] = iq ^ 1;
         else {
@@ -703,7 +708,7 @@ inline Lit evalProg(equiv::Aig& g, const Prog& p, PinLit&& pinLit, Lit iq) {
         }
         if (sp >= 63) throw Error("a cell function is too deep");
     }
-    return sp ? st[sp - 1] : equiv::kFalse;
+    return sp ? st[sp - 1] : kFalse;
 }
 
 struct Model {
@@ -712,8 +717,8 @@ struct Model {
     std::vector<Lit> lit;  // per net
     std::vector<std::string> warnings;
 
-    Lit pinLit(const Inst& x, int pin) const { return x.pin[(size_t)pin] < 0 ? equiv::kFalse : lit[(size_t)x.pin[(size_t)pin]]; }
-    Lit stateLit(const Inst& x) const { return x.ci->kind == Kind::State ? v->var("st:" + x.name) : equiv::kFalse; }
+    Lit pinLit(const Inst& x, int pin) const { return x.pin[(size_t)pin] < 0 ? kFalse : lit[(size_t)x.pin[(size_t)pin]]; }
+    Lit stateLit(const Inst& x) const { return x.ci->kind == Kind::State ? v->var("st:" + x.name) : kFalse; }
     // What output pin `pin` of x computes, connected or not.
     Lit outLit(const Inst& x, int pin) const {
         if (x.ci->kind == Kind::Box) return v->var("bx:" + x.name + "/" + x.ci->pins[(size_t)pin]);
@@ -721,7 +726,7 @@ struct Model {
     }
     // A state function (next, clock, clear, preset) with one pin optionally replaced.
     Lit comp(const Inst& x, const Prog& p, int overPin = -1, Lit over = 0) const {
-        if (p.empty()) return equiv::kFalse;
+        if (p.empty()) return kFalse;
         return evalProg(v->g, p, [&](int q) { return q == overPin ? over : pinLit(x, q); }, stateLit(x));
     }
 
@@ -763,7 +768,7 @@ struct Model {
                     if (wait) continue;
                     lit[(size_t)net] = outLit(x, nn.drvPin);
                 } else if (nn.cval >= 0) {
-                    lit[(size_t)net] = nn.cval ? equiv::kTrue : equiv::kFalse;
+                    lit[(size_t)net] = nn.cval ? kTrue : kFalse;
                 } else if (nn.inPort >= 0) {
                     lit[(size_t)net] = vars.input(des.ports[(size_t)nn.inPort].name);
                 } else if (nn.drvInst >= 0) {
@@ -813,7 +818,7 @@ inline Sig evalProgSig(const Prog& p, PinSig&& pinSig, const Sig& iq, int words)
 
 // Simulation signatures and SAT proofs over the shared graph.
 struct Prover {
-    equiv::Aig& g;
+    Aig& g;
     int words;  // at most Sig::Max
     long budget;
     std::vector<uint64_t> sig;  // node * words
@@ -827,7 +832,7 @@ struct Prover {
         lemma.emplace(a >> 1, b ^ (a & 1));
     }
 
-    Prover(equiv::Aig& a, int w, long b) : g(a), words(w), budget(b) {}
+    Prover(Aig& a, int w, long b) : g(a), words(w), budget(b) {}
 
     static uint64_t mix(uint64_t x) {
         x += 0x9e3779b97f4a7c15ull;
@@ -1498,7 +1503,7 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
         n.ref = constRef(v);
         n.name = v ? "1'b1" : "1'b0";
         O.nets.push_back(std::move(n));
-        om.lit.push_back(v ? equiv::kTrue : equiv::kFalse);
+        om.lit.push_back(v ? kTrue : kFalse);
         sinks.emplace_back();
         return (int)O.nets.size() - 1;
     };
@@ -2054,7 +2059,7 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
                     if (x.ci->kind == Kind::Comb) {
                         for (size_t k = 0; k < x.pin.size(); k++) {
                             if (!x.ci->isOut[k] || x.pin[k] < 0) continue;
-                            Lit l = evalProg(V.g, x.ci->fn[k], [&](int p) { return p == pin ? vl : om.pinLit(x, p); }, equiv::kFalse);
+                            Lit l = evalProg(V.g, x.ci->fn[k], [&](int p) { return p == pin ? vl : om.pinLit(x, p); }, kFalse);
                             Need nd;
                             nd.held = nLits.count(l) > 0;
                             if (!nd.held)

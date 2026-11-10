@@ -46,16 +46,6 @@ add_test(NAME test_sat COMMAND test_sat)
 add_executable(test_liberty tests/test_liberty.cpp)
 target_include_directories(test_liberty PRIVATE src)
 add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
-# Functional ECO (Conformal ECO style): meco -old old.v -new new.v -lib cells.lib -o patched.v
-# Netlists in, so no slang; it uses the shared netlist and Liberty readers,
-# the equivalence checker's AIG and SAT, and the shared thread pool.
-find_package(Threads REQUIRED)
-add_executable(meco src/meco.cpp)
-target_include_directories(meco PRIVATE src)
-target_link_libraries(meco PRIVATE Threads::Threads)
-add_test(NAME meco
-         COMMAND ${CMAKE_COMMAND} -DMECO=$<TARGET_FILE:meco> -DSRC=${CMAKE_SOURCE_DIR}
-                 -DOUT=${CMAKE_CURRENT_BINARY_DIR}/meco_test -P ${CMAKE_SOURCE_DIR}/tests/meco.cmake)
 # Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
 # libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
 find_package(OpenSSL COMPONENTS Crypto)
@@ -92,17 +82,13 @@ add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
-  # Random ECOs, proved by meco itself (the slang build also simulates them in msim).
-  add_test(NAME meco_fuzz_prove
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/eco/fuzz.py $<TARGET_FILE:meco> -
-                   ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib,${CMAKE_SOURCE_DIR}/tests/eco/eco_cells.lib
-                   ${CMAKE_SOURCE_DIR}/tests/eco/cells.v 100 200 ${CMAKE_CURRENT_BINARY_DIR}/meco_fuzz_prove)
-endif()
-if(Python3_FOUND)
   add_test(NAME mbug
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
+
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/meco.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -364,14 +350,6 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMEQUIV=$<TARGET_FILE:mequiv>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mequiv.cmake)
 
-  # Random ECOs: patched netlist proved by meco and simulated against the new one in msim.
-  if(Python3_FOUND)
-    add_test(NAME meco_fuzz
-             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/eco/fuzz.py $<TARGET_FILE:meco> $<TARGET_FILE:msim>
-                     ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib,${CMAKE_SOURCE_DIR}/tests/eco/eco_cells.lib
-                     ${CMAKE_SOURCE_DIR}/tests/eco/cells.v 0 40 ${CMAKE_CURRENT_BINARY_DIR}/meco_fuzz)
-  endif()
-
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec
@@ -397,7 +375,6 @@ endif()
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(TARGETS meco RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   install(TARGETS mequiv RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
