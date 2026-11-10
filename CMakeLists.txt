@@ -36,6 +36,11 @@ foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_l
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# The Liberty (.lib) reader shared by the timing, synthesis, power and
+# equivalence tools (src/liberty.hpp); no external dependencies.
+add_executable(test_liberty tests/test_liberty.cpp)
+target_include_directories(test_liberty PRIVATE src)
+add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
 # Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
 # libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
 find_package(OpenSSL COMPONENTS Crypto)
