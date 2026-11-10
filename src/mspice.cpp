@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
     }
     if (a.file.empty()) { usage(); return 2; }
     int hw = std::max(1, cpuTopo().logical());
-    int threads = a.threads > 0 ? std::min(a.threads, hw) : hw;
+    int threads = a.threads > 0 ? std::min(a.threads, hw) : (int)par::defaultThreads();
 
     try {
         auto t0 = std::chrono::steady_clock::now();
@@ -247,6 +247,7 @@ int main(int argc, char** argv) {
         StepPlan plan = stepPlan(nl, a.defines);
         std::vector<RunOutput> runs(plan.sets.size());
         Pool pool(threads);
+        pool.spin(20000);   // about 0.1 ms: one batch per Newton iteration, back to back
         auto overridesOf = [&](size_t k) {
             std::map<std::string, double> o = a.defines;
             for (size_t i = 0; i < plan.names.size(); i++) o[plan.names[i]] = plan.sets[k][i];
@@ -256,7 +257,7 @@ int main(int argc, char** argv) {
             runs[0] = runNetlist(nl, overridesOf(0), &pool);
         } else {
             // Each run builds its own circuit, so runs share nothing.
-            pool.parallelFor(runs.size(), [&](size_t k, int) { runs[k] = runNetlist(nl, overridesOf(k), nullptr); });
+            pool.run(runs.size(), [&](size_t k) { runs[k] = runNetlist(nl, overridesOf(k), nullptr); });
         }
         if (!a.quiet) {
             std::printf("mspice %s: %s\n", MINISIM_VERSION, nl.title.c_str());

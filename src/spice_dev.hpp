@@ -21,6 +21,7 @@ constexpr double kEpsOx = 3.9 * 8.854187817e-12; // F/m
 
 struct Options {
     double reltol = 1e-3, abstol = 1e-12, vntol = 1e-6, gmin = 1e-12, trtol = 7;
+    double chgtol = 1e-14;   // the smallest charge the step control resolves
     double temp = 27, tnom = 27, gshunt = 0;
     int itl1 = 100, itl4 = 10;
     bool euler = false;   // method=euler: backward Euler only
@@ -85,7 +86,7 @@ struct Charge {
     // SPICE's truncation error test. Returns the largest step this charge
     // allows (order 1, backward Euler) or its square (order 2, trapezoidal).
     // h[0] is the step just taken, h[1] and h[2] the ones before.
-    double maxStep(const double* h, int order, double reltol, double abstol, double trtol) const {
+    double maxStep(const double* h, int order, double reltol, double abstol, double trtol, double chgtol) const {
         if (q == q0 && q0 == q1 && q1 == q2) return 1e300;   // at rest
         double diff[4] = {q, q0, q1, q2}, del[3] = {h[0], h[1], h[2]};
         for (int j = order;; ) {
@@ -94,7 +95,7 @@ struct Charge {
             for (int k = 0; k <= j; k++) del[k] = del[k + 1] + h[k];
         }
         double tol = std::max(abstol + reltol * std::max(std::fabs(i), std::fabs(i0)),
-                              reltol * std::max({std::fabs(q), std::fabs(q0), 1e-14}) / h[0]);
+                              reltol * std::max({std::fabs(q), std::fabs(q0), chgtol}) / h[0]);
         double lte = std::max(abstol, (order == 1 ? 0.5 : 1.0 / 12) * std::fabs(diff[0]));
         return trtol * tol / lte;
     }

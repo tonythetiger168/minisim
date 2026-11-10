@@ -23,6 +23,10 @@ Spec references are IEEE 1800-2023 clauses.
   same output bit for bit); `parmin` now defaults to 1024. The reader gains
   `spice::flatten()`, a flat list of primitive elements for LVS and cell
   characterization, printed by `mspice -flatten [-top name]`.
+- `mspice`: `.option chgtol=` (needed for accurate edges on femtofarad
+  nodes) and `spice::Reader::readText()` for netlists held in memory.
+  mspice now runs on the shared thread pool of `src/parallel.hpp`, which
+  gains `Pool::spin()` for short batches that come one after the other.
 - `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
   of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
   bus, logic in front of a synchronizer, reconvergence, a signal synchronized

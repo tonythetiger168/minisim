@@ -119,11 +119,14 @@ for an analysis, `-o` holds every node voltage and source current.
 
 ### Options
 
-`.option reltol= abstol= vntol= gmin= trtol= itl1= itl4= temp= tnom=
+`.option reltol= abstol= vntol= gmin= trtol= chgtol= itl1= itl4= temp= tnom=
 gshunt=`, `method=trap|euler`, `bypass=0|1` (reuse the linearization of
 devices whose voltages have not moved; on by default) and `parmin=` (the
 number of instances of a device type from which its models are evaluated in
-parallel; default 1024).
+parallel; default 1024). `chgtol` (default 1e-14 C) is the smallest charge the
+time step control resolves: with femtofarad nodes, as in standard cells, the
+charges are below the default and the steps are then set by `tstep` alone, so
+give `chgtol=1e-17` or so there.
 
 ## How it works
 

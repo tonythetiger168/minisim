@@ -164,8 +164,8 @@ struct Circuit {
     template <class D> void evalPool(const Ctx& c) {
         auto& p = pool<D>();
         if (pool_ && pool_->threads() > 1 && p.size() >= (size_t)opt.parMin)
-            pool_->parallelFor(p.size(), [&](size_t i, int) { p[i].eval(c); },
-                               std::clamp<size_t>(p.size() / (8 * pool_->threads()), 1, 256));
+            pool_->chunks(p.size(), std::clamp<size_t>(p.size() / (8 * pool_->threads()), 1, 256),
+                          [&](size_t b, size_t e, size_t) { for (size_t i = b; i < e; i++) p[i].eval(c); });
         else
             for (D& d : p) d.eval(c);
     }
@@ -231,7 +231,7 @@ struct Circuit {
         MosPlan& pl = mosPlan_;
         double* v = val.data();
         size_t chunks = (p.size() + chunk - 1) / chunk;
-        pool_->parallelFor(chunks, [&](size_t k, int) {
+        pool_->run(chunks, [&](size_t k) {
             size_t end = std::min(p.size(), (k + 1) * chunk);
             for (size_t i = k * chunk; i < end; i++) {
                 Mosfet& d = p[i];
@@ -525,13 +525,14 @@ struct Circuit {
         loadAt(base, f[0]);
         try { base.lu.factor(base.val.data()); }
         catch (const SingularMatrix& e) { singular(e); }
-        int nt = pool_ ? pool_->threads() : 1;
+        // One piece of the sweep per thread, each with its own matrix.
+        size_t nt = std::min<size_t>(pool_ ? pool_->threads() : 1, f.size());
         std::vector<Work> work(nt);
         for (auto& w : work) { fresh(w); w.lu.adopt(base.lu); }
         r.x = f;
         r.y.assign(f.size(), {});
-        auto point = [&](size_t i, int tid) {
-            Work& w = work[tid];
+        auto point = [&](size_t i, size_t piece) {
+            Work& w = work[piece];
             loadAt(w, f[i]);
             if (w.lu.refactor(w.val.data())) {
                 w.lu.solve(w.rhs.data() + 1, w.x.data() + 1);
@@ -551,8 +552,11 @@ struct Circuit {
             r.y[i] = std::move(row);
         };
         try {
-            if (pool_) pool_->parallelFor(f.size(), point, 4);
-            else for (size_t i = 0; i < f.size(); i++) point(i, 0);
+            auto piece = [&](size_t k) {
+                for (size_t i = k * f.size() / nt; i < (k + 1) * f.size() / nt; i++) point(i, k);
+            };
+            if (pool_) pool_->run(nt, piece);
+            else for (size_t k = 0; k < nt; k++) piece(k);
         } catch (const SingularMatrix& e) { singular(e); }
     }
 
@@ -621,7 +625,7 @@ struct Circuit {
             hist[0] = h;
             double room = 1e300;
             for (Charge* q : charges)
-                room = std::min(room, q->maxStep(hist, euler ? 1 : 2, opt.reltol, opt.abstol, opt.trtol));
+                room = std::min(room, q->maxStep(hist, euler ? 1 : 2, opt.reltol, opt.abstol, opt.trtol, opt.chgtol));
             double hnew = std::min(2 * h, euler ? room : std::sqrt(room));
             if (hnew < 0.9 * h && h > 4 * hmin) {
                 std::copy(x0.begin(), x0.end(), x);
@@ -1079,6 +1083,7 @@ private:
             else if (key == "vntol") o.vntol = num();
             else if (key == "gmin") o.gmin = num();
             else if (key == "trtol") o.trtol = num();
+            else if (key == "chgtol") o.chgtol = num();
             else if (key == "itl1") o.itl1 = (int)num();
             else if (key == "itl4") o.itl4 = (int)num();
             else if (key == "temp") o.temp = num();

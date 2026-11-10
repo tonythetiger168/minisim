@@ -288,9 +288,20 @@ inline std::vector<std::pair<std::string, std::string>> splitAssignments(const s
 class Reader {
 public:
     Netlist read(const std::string& path) {
+        std::ifstream f(path);
+        if (!f) throw Error("cannot open " + path);
+        return read(f, path);
+    }
+    // A netlist held in memory. `name` stands for the file in messages, and
+    // an .include with a relative path is looked for next to it.
+    Netlist readText(const std::string& text, const std::string& name = "<text>") {
+        std::istringstream f(text);
+        return read(f, name);
+    }
+    Netlist read(std::istream& f, const std::string& path) {
         Netlist nl;
         std::vector<Line> lines;
-        load(path, lines, true, nl.title, 0);
+        load(f, path, lines, true, nl.title, 0);
         Block* cur = &nl.top;
         for (Line& ln : lines) {
             Card c = card(ln);
@@ -336,10 +347,8 @@ private:
         return s == std::string::npos ? "" : p.substr(0, s + 1);
     }
 
-    void load(const std::string& path, std::vector<Line>& out, bool top, std::string& title, int depth) {
-        if (depth > 32) throw Error(path + ": .include nested too deep");
-        std::ifstream f(path);
-        if (!f) throw Error("cannot open " + path);
+    void load(std::istream& f, const std::string& path, std::vector<Line>& out, bool top, std::string& title,
+              int depth) {
         std::string raw;
         int no = 0;
         bool control = false;
@@ -375,7 +384,10 @@ private:
                 name = name.substr(s, e - s + 1);
                 if (name[0] != '/') name = dirOf(path) + name;
                 std::string ignored;
-                load(name, out, false, ignored, depth + 1);
+                if (depth >= 32) throw Error(path + ": .include nested too deep");
+                std::ifstream inc(name);
+                if (!inc) throw Error(path + ":" + std::to_string(no) + ": cannot open " + name);
+                load(inc, name, out, false, ignored, depth + 1);
                 continue;
             }
             out.push_back({lo, path + ":" + std::to_string(no)});
