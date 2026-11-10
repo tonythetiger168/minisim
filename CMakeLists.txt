@@ -189,7 +189,6 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
-
   # Source-level debug: drivers, loads, active-driver trace, viewer: mdebug design.sv
   add_executable(mdebug src/mdebug.cpp)
   target_include_directories(mdebug PRIVATE src)

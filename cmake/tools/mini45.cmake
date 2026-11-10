@@ -1,4 +1,3 @@
-include_guard(GLOBAL)
 # mini45, the generic cell library (lib/mini45, docs/MINI45.md), is
 # generated: the files in the tree must be what the generator writes.
 # Its Verilog models are checked with msim (mini45_models, in the slang build).
