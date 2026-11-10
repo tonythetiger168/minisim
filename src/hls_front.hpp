@@ -80,6 +80,7 @@ struct Stmt {
   Stmt *init = nullptr, *body = nullptr, *els = nullptr;
   std::vector<Stmt*> kids;
   bool unroll = false;
+  bool pipeline = false;   // a loop with "#pragma hls pipeline" first in its body
   bool splice = false;   // a Blk that stands for several statements of its parent
   int line = 0;
 };
@@ -1282,6 +1283,10 @@ class Parser {
       if (pendUnroll_) {
         loop->unroll = true;
         pendUnroll_ = false;
+      }
+      if (pendPipeline_) {
+        loop->pipeline = true;
+        pendPipeline_ = false;
       }
       Stmt* b = mkS(Stmt::Blk);
       scopes_.emplace_back();

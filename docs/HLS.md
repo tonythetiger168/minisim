@@ -60,7 +60,47 @@ A returned struct comes out as `ap_return__<member>`. A struct with an
 array member is passed by pointer or reference, not by value.
 
 Pragmas: `#pragma hls unroll` (before a loop or first in its body),
-`#pragma hls pipeline` (in a function), `#pragma hls top`.
+`#pragma hls pipeline` (in a function: the whole function is a pipeline;
+first in a loop body: that loop is pipelined), `#pragma hls top`.
+
+## Pipelined loops
+
+A loop normally runs one iteration at a time, each taking as many states as
+its body needs: two for a body that reads a memory (address, then data),
+more when the logic does not fit in one clock period. A pipelined loop
+starts a new iteration every cycle while the earlier ones are still in
+their later stages, so `n` iterations of an `L`-stage body take `n + L - 1`
+cycles instead of `n * L`.
+
+```c
+for (int i = 0; i < n; i++) {
+#pragma hls pipeline
+  int32_t y = (in[i] * gain) >> 6;
+  out[i] = y;
+  if (y > peak) peak = y;
+}
+```
+
+In `tests/hls/looppipe.c` this halves the latency of three loops (for
+example 129 to 67 cycles for a 63-element sum) at the same area.
+
+The pragma insists: when the loop cannot run one iteration per cycle,
+`mhls` stops and says which rule fails. `-pipeline-loops` tries every loop
+instead, leaves the others as they are, and the summary lists what happened
+to each. The rules:
+
+- the body is straight-line code after if-conversion and unrolling of inner
+  loops (no `break`, `continue`, `return`, or inner loop that stays a loop);
+- each memory is accessed at most once per iteration (one port), so
+  `a[i] = a[i] + 1` does not qualify but `b[i] = a[i] + 1` does;
+- a value carried from one iteration to the next (an accumulator, the loop
+  counter) is updated within one clock period of being read, so not
+  through a memory read (`p = next[p]`) or a multi-cycle operator;
+- the loop condition is known in the first stage, so it does not depend on
+  memory data (`while (s[n] != 0)`).
+
+A pipelined loop is one FSM state; the summary and the generated testbench
+count its `n + L - 1` cycles.
 
 ## Interfaces
 
@@ -105,6 +145,7 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 | `-clock <ns>` | clock period used for scheduling (default 10) |
 | `-pipeline` | pipeline architecture |
 | `-unroll-all`, `-unroll-max <n>` | unroll every constant-trip loop; most iterations (default 4096) |
+| `-pipeline-loops` | pipeline every loop that allows it (see Pipelined loops) |
 | `-mul <n>`, `-div <n>` | multipliers / dividers working in one cycle |
 | `-no-share` | no register or unit sharing |
 | `-max-reg-array <n>` | largest local array kept in registers (default 64) |
@@ -122,6 +163,7 @@ need multicycle constraints.
 
 ## Not yet
 
-Loop pipelining, dual-port memories, AXI-Stream/handshake interfaces,
+Dual-port memories, pipelined loops that start an iteration every second
+cycle, AXI-Stream/handshake interfaces,
 unions, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

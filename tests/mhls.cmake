@@ -70,6 +70,14 @@ design(structs grade)                            # struct by pointer, nested mem
 design(structs track)                            # array of structs, struct with an array member
 design(structs track -clock 20 -max-reg-array 2)
 design(structs rot)                              # structs through a pipeline
+design(looppipe sum)                             # pipelined loops: a memory read per iteration
+design(looppipe scale)                           # read one memory, write another, carried maximum
+design(looppipe scale -clock 2.5)                # more stages
+design(looppipe mix)                             # pipelined inner loop, entered once per outer iteration
+design(fir fir -pipeline-loops -clock 3)         # best effort: loops that cannot be pipelined stay as they are
+design(matmul matmul -pipeline-loops -clock 3)
+design(sqrt hist -pipeline-loops)
+design(structs track -pipeline-loops -clock 3)
 design(apint blend NOCREF)
 design(apint blend -pipeline -clock 2 NOCREF)
 
@@ -85,6 +93,9 @@ refuses(gcd gcd "cannot be pipelined" -pipeline)
 refuses(arith arith "takes more than one clock period" -pipeline -clock 3)
 refuses(mac mac "static 'total' is read in stage" -pipeline -clock 4)
 refuses(bad_recursion fact "recursion")
+refuses(bad_looppipe_port bump "accessed more than once per iteration")
+refuses(bad_looppipe_cond length "condition is not known in the first stage")
+refuses(bad_looppipe_chain chase "updated from its own previous value")
 refuses(bad_struct_byvalue byvalue "pass 'x' by pointer or reference")
 refuses(bad_struct_dropped dropped "must be assigned to a variable")
 refuses(bad_struct_scalar scalar "a struct cannot be used as a value")

@@ -77,6 +77,13 @@ struct Block {
   Term term;
   int len = 1, base = 0;                     // schedule: states, first global state
   std::vector<int> wst;                      // state of each write
+  // A loop body to pipeline: the source line of the loop (0: not asked),
+  // whether a pragma asked (then failing is an error), and once scheduled
+  // the number of stages. A pipelined loop is one FSM state: a new
+  // iteration enters stage 0 every cycle.
+  int pipeLine = 0;
+  bool pipeMust = false;
+  int pipeL = 0;
 };
 
 struct Param {
@@ -149,6 +156,7 @@ inline uint64_t evalOp(OpK k, int w, int wa, uint64_t a, uint64_t b, uint64_t c)
 
 struct Options {
   bool unrollAll = false;
+  bool pipelineLoops = false;   // pipeline every loop that allows it
   int unrollMax = 4096;      // most iterations a loop may unroll to
   int maxRegArray = 64;      // local arrays up to this many elements become registers
   bool pipeline = false;
@@ -1137,11 +1145,27 @@ class Lowerer {
     return mayFail(s->init) || mayFail(s->body) || mayFail(s->els);
   }
 
+  // Leaving a scope: what was declared in it is dead, so its pending values
+  // need no register and no multiplexer at the next join.
+  void popScope() {
+    for (auto& [name, sym] : S.scopes.back()) {
+      if (sym.k == Sym::Scalar) {
+        const Var& v = S.fn.vars[sym.id];
+        if (!v.isStatic && v.port == Var::None) S.env.erase(sym.id);
+      } else if (sym.k == Sym::Array) {
+        const Arr& a = S.fn.arrs[sym.id];
+        if (a.mode == Arr::Reg && !a.isStatic && !a.isParam)
+          for (int e : a.elems) S.env.erase(e);
+      }
+    }
+    S.scopes.pop_back();
+  }
+
   void scoped(const Stmt* s) {
     if (!s) return;
     S.scopes.emplace_back();
     lowerStmt(s);
-    S.scopes.pop_back();
+    popScope();
   }
 
   // Inside a loop of the function being lowered (a switch is not a loop).
@@ -1211,7 +1235,7 @@ class Lowerer {
     auto body = [&](size_t i) {
       S.scopes.emplace_back();
       lowerSeq(caseBody(s, i), 0);
-      S.scopes.pop_back();
+      popScope();
     };
     std::function<void(size_t)> chain = [&](size_t n) {
       if (n == order.size()) {
@@ -1255,7 +1279,7 @@ class Lowerer {
           if (s->inc) rv(s->inc);
         }
         S.loops.pop_back();
-        S.scopes.pop_back();
+        popScope();
         return;
       } catch (NoConv&) {
         S = std::move(snap);
@@ -1274,6 +1298,10 @@ class Lowerer {
       branch(c, body, exit);
     }
     start(body);
+    if (s->pipeline || opt.pipelineLoops) {
+      S.fn.blocks[body].pipeLine = s->line;
+      S.fn.blocks[body].pipeMust = s->pipeline;
+    }
     LoopCtx lc;
     lc.brk = exit;
     S.loops.push_back(lc);
@@ -1288,7 +1316,7 @@ class Lowerer {
     int c = s->cond ? toBool(rv(s->cond)) : konst(1, 1);
     branch(c, body, exit);
     start(exit);
-    S.scopes.pop_back();
+    popScope();
   }
 
   // A statement list. After a statement that may have returned under a
@@ -1335,7 +1363,7 @@ class Lowerer {
       case Stmt::Blk:
         S.scopes.emplace_back();
         lowerSeq(s->kids, 0);
-        S.scopes.pop_back();
+        popScope();
         break;
       case Stmt::If: lowerIf(s); break;
       case Stmt::Switch: lowerSwitch(s); break;
@@ -1701,8 +1729,10 @@ inline long interpret(const Function& f, Machine& m, long maxSteps = 50'000'000)
     for (auto& [v, x] : B.writes) wr.push_back({v, maskW(val[x], f.vars[v].ty.w)});
     for (auto& [v, x] : wr) m.vars[v] = x;
     if (B.term.k == Term::Ret) return states;
+    int from = b;
     if (B.term.k == Term::Jump) b = B.term.t;
     else b = (val[B.term.cond] & 1) ? B.term.t : B.term.f;
+    if (B.pipeL > 1 && b != from) states += B.pipeL - 1;   // the last iterations drain
     if (++steps > maxSteps) throw Error("mhls: the reference run of '" + f.name + "' does not terminate");
   }
 }

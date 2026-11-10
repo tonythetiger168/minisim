@@ -19,6 +19,8 @@
 //   -clock <ns>       clock period for scheduling (default 10)
 //   -pipeline         pipeline the function, one new input per cycle (also "#pragma hls pipeline")
 //   -unroll-all       unroll every loop with a constant trip count (also "#pragma hls unroll")
+//   -pipeline-loops   start a new iteration every cycle in every loop that allows it
+//                     (also "#pragma hls pipeline" first in a loop body, which insists)
 //   -unroll-max <n>   most iterations a loop may unroll to (default 4096)
 //   -mul <n>, -div <n>  at most n multipliers / dividers working in one cycle (default: no limit)
 //   -no-share         one multiplier/divider per operation, one register per value
@@ -131,11 +133,14 @@ struct Sched {
   long latMin = -1, latMax = -1;   // -1: depends on the data
   double area = 0;
   int regBits = 0, regs = 0, pipeRegBits = 0;
+  int pipedLoops = 0;
+  std::vector<std::string> loopNotes;   // what became of each loop that was to be pipelined
   std::map<std::string, int> opCount;
 };
 
 int availSt(const Op& o) {
-  if (o.k == OpK::Const || o.k == OpK::ReadVar) return 0;
+  if (o.k == OpK::Const) return 0;
+  if (o.k == OpK::ReadVar) return o.st;   // 0, but for a variable a pipelined loop updates
   if (o.k == OpK::Load) return o.st + 1;
   return o.st + o.cyc - 1;
 }
@@ -143,7 +148,13 @@ int availSt(const Op& o) {
 // List scheduling in dependence order: every operator goes into the earliest
 // state where its operands are available, chained after them when the
 // combinational path still fits in the clock period.
-void scheduleBlock(Function& f, Block& B, const Cfg& cfg, bool pipeline, std::map<int, int>& temps) {
+//
+// mode 0: an FSM block. mode 1: the one block of a pipelined function.
+// mode 2: the body of a pipelined loop; readStage gives the stage in which
+// each variable the loop updates is read (and so must be written).
+void scheduleBlock(Function& f, Block& B, const Cfg& cfg, int mode, std::map<int, int>& temps,
+                   const std::map<int, int>* readStage = nullptr) {
+  const bool pipeline = mode != 0;
   const double budget = cfg.clock - kTsu * cfg.scale, tcq = kTcq * cfg.scale;
   std::map<int, int> lastAcc;                       // array -> state of its last access
   std::map<std::pair<int, int>, int> used;          // (class, state) -> operators
@@ -156,7 +167,12 @@ void scheduleBlock(Function& f, Block& B, const Cfg& cfg, bool pipeline, std::ma
     o.hold = -1;
     o.fu = -1;
     if (o.k == OpK::Const) { o.st = 0; o.tout = 0; continue; }
-    if (o.k == OpK::ReadVar) { o.st = 0; o.tout = (float)tcq; continue; }
+    if (o.k == OpK::ReadVar) {
+      auto rs = readStage ? readStage->find(o.ref) : std::map<int, int>::const_iterator{};
+      o.st = readStage && rs != readStage->end() ? rs->second : 0;
+      o.tout = (float)tcq;
+      continue;
+    }
     int s = 0;
     double tin = 0;
     bool fromReg = false;
@@ -265,7 +281,7 @@ void scheduleBlock(Function& f, Block& B, const Cfg& cfg, bool pipeline, std::ma
       }
     }
   }
-  use(B.term.cond, L - 1);
+  if (B.term.cond >= 0) use(B.term.cond, mode == 2 ? availSt(f.ops[B.term.cond]) : L - 1);
   // A variable is written no earlier than the last read of its old value.
   std::map<int, int> entryRead;
   for (int id : B.ops)
@@ -277,9 +293,9 @@ void scheduleBlock(Function& f, Block& B, const Cfg& cfg, bool pipeline, std::ma
       auto [v, x] = B.writes[i];
       int ws = availSt(f.ops[x]);
       bool out = f.vars[v].port == Var::Ref || f.vars[v].port == Var::Ret;
-      if (pipeline && !f.vars[v].isStatic && out) ws = L - 1;
+      if (mode == 1 && !f.vars[v].isStatic && out) ws = L - 1;
       auto it = entryRead.find(v);
-      if (it != entryRead.end()) ws = std::max(ws, f.ops[it->second].lastUse);
+      if (it != entryRead.end() && mode != 2) ws = std::max(ws, f.ops[it->second].lastUse);
       ws = std::max(ws, B.wst[i]);
       if (ws != B.wst[i]) { B.wst[i] = ws; changed = true; }
       if (f.ops[x].lastUse < ws) { f.ops[x].lastUse = ws; changed = true; }
@@ -320,10 +336,76 @@ void scheduleBlock(Function& f, Block& B, const Cfg& cfg, bool pipeline, std::ma
   }
 }
 
+// A loop body as a pipeline with a new iteration every cycle. Returns why
+// not when the loop does not allow it; the block is then left unscheduled.
+std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg) {
+  if (B.term.k != Term::Br || (B.term.t != bi && B.term.f != bi))
+    return "its body is not straight-line code (break, continue, return, or an inner loop that is not unrolled)";
+  std::map<int, int> none, rs;
+  std::set<int> readVars;
+  for (int id : B.ops)
+    if (f.ops[id].k == OpK::ReadVar) readVars.insert(f.ops[id].ref);
+  // A variable the loop updates from its old value is read and written in
+  // the same stage, so that the next iteration, one cycle behind, sees it.
+  for (int round = 0;; round++) {
+    scheduleBlock(f, B, cfg, 2, none, &rs);
+    int moved = -1;
+    for (size_t i = 0; i < B.writes.size(); i++) {
+      int v = B.writes[i].first;
+      if (readVars.count(v) && B.wst[i] > rs[v]) {
+        rs[v] = B.wst[i];
+        moved = v;
+      }
+    }
+    if (moved < 0) break;
+    if (round > 96 || rs[moved] > 64)
+      return "'" + f.vars[moved].name + "' is updated from its own previous value through logic or a memory read "
+             "that takes more than one clock period";
+  }
+  std::map<int, int> acc;
+  for (int id : B.ops) {
+    const Op& o = f.ops[id];
+    if (o.cyc > 1) return std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)";
+    if ((o.k == OpK::Load || o.k == OpK::Store) && ++acc[o.ref] > 1)
+      return "array '" + f.arrs[o.ref].name + "' is accessed more than once per iteration, and a memory has one port";
+  }
+  if (availSt(f.ops[B.term.cond]) != 0)
+    return "the loop condition is not known in the first stage (it depends on a memory read or on a long path)";
+  return "";
+}
+
 Sched schedule(Function& f, const Cfg& cfg) {
   Sched sc;
   std::vector<std::map<int, int>> temps(f.blocks.size());
-  parallelFor(f.blocks.size(), [&](size_t b) { scheduleBlock(f, f.blocks[b], cfg, f.pipeline, temps[b]); });
+  std::vector<std::string> refused(f.blocks.size());
+  parallelFor(f.blocks.size(), [&](size_t b) {
+    Block& B = f.blocks[b];
+    B.pipeL = 0;
+    if (B.pipeLine && !f.pipeline) {
+      refused[b] = schedulePipeLoop(f, B, (int)b, cfg);
+      if (refused[b].empty() && B.len > 1) {
+        B.pipeL = B.len;
+        B.len = 1;
+        return;
+      }
+    }
+    scheduleBlock(f, B, cfg, f.pipeline ? 1 : 0, temps[b]);
+  });
+  for (size_t b = 0; b < f.blocks.size(); b++) {
+    const Block& B = f.blocks[b];
+    if (B.pipeL) sc.pipedLoops++;
+    if (B.pipeLine && !f.pipeline) {
+      std::string n = "loop at line " + std::to_string(B.pipeLine) + ": ";
+      if (B.pipeL) n += "pipelined, " + std::to_string(B.pipeL) + " stages, one iteration per cycle";
+      else if (refused[b].empty()) n += "one iteration per cycle without pipelining";
+      else n += "not pipelined: " + refused[b];
+      // With -pipeline-loops an outer loop is not news.
+      if (B.pipeMust || B.pipeL || refused[b].rfind("its body", 0) != 0) sc.loopNotes.push_back(n);
+    }
+    if (!refused[b].empty() && f.blocks[b].pipeMust)
+      throw Error("mhls: " + f.name + ": the loop at line " + std::to_string(f.blocks[b].pipeLine) +
+                  " cannot be pipelined: " + refused[b]);
+  }
   for (auto& t : temps)
     for (auto& [w, n] : t) sc.temps[w] = std::max(sc.temps[w], n);
 
@@ -344,6 +426,7 @@ Sched schedule(Function& f, const Cfg& cfg) {
   if (!f.pipeline && cfg.share) {
     std::map<std::pair<int, int>, std::vector<int>> unitsOf;   // (kind,width) -> fu ids
     for (auto& B : f.blocks) {
+      if (B.pipeL) continue;   // every stage of a pipelined loop is busy every cycle
       std::map<std::pair<int, int>, std::vector<std::vector<bool>>> busy;
       for (int id : B.ops) {
         Op& o = f.ops[id];
@@ -667,6 +750,10 @@ struct Emitter {
     std::map<int, std::vector<std::string>> memAct;   // array -> case arms
     for (size_t bi = 0; bi < f.blocks.size(); bi++) {
       const Block& B = f.blocks[bi];
+      if (B.pipeL) {
+        pipeLoop((int)bi, act, memAct);
+        continue;
+      }
       for (int id : B.ops) {
         const Op& p = f.ops[id];
         if (p.k == OpK::Const || p.k == OpK::ReadVar) continue;
@@ -758,6 +845,7 @@ struct Emitter {
     // Control and registers.
     o << "  always_ff @(posedge ap_clk) begin\n    if (ap_rst) begin\n      state <= " << st(0)
       << ";\n      ap_done <= 1'b0;\n";
+    for (auto& r : resets) o << "      " << r << "\n";
     for (size_t v = 0; v < f.vars.size(); v++) {
       const Var& x = f.vars[v];
       bool maybeUninit = x.port == Var::None && !x.isStatic && sc.entryLive[v];
@@ -779,6 +867,87 @@ struct Emitter {
     }
     o << "        default: state <= " << st(0) << ";\n      endcase\n    end\n  end\nendmodule\n";
     return o.str();
+  }
+
+  // A pipelined loop: one FSM state. While the state is held, a new
+  // iteration enters stage 0 every cycle until one says the loop is over;
+  // the state is left when that last iteration has passed the last stage.
+  std::vector<std::string> resets;
+  void pipeLoop(int bi, std::vector<std::vector<std::string>>& act, std::map<int, std::vector<std::string>>& memAct) {
+    const Block& B = f.blocks[bi];
+    const int L = B.pipeL;
+    const std::string P = "lp" + std::to_string(bi);
+    std::set<int> written;
+    for (auto& [v, x] : B.writes) written.insert(v);
+    auto pname = [&](int x, int s) { return P + "_p" + std::to_string(s) + "_" + wire(x); };
+    auto vld = [&](int s) { return s == 0 ? "!" + P + "_stop" : P + "_v" + std::to_string(s); };
+    auto ref2 = [&](int x, int s, int want) -> std::string {
+      const Op& q = f.ops[x];
+      if (q.k == OpK::Const) return hexLit(q.imm, want);
+      if (q.k == OpK::ReadVar && (!written.count(q.ref) || s <= q.st)) return slice(vreg(q.ref), q.w, want);
+      if (q.k != OpK::ReadVar && s <= availSt(q)) return slice(wire(x), q.w, want);
+      return slice(pname(x, s), q.w, want);
+    };
+    o << "  // Loop at line " << B.pipeLine << ": " << L << " stages, one iteration per cycle.\n";
+    o << "  logic " << P << "_stop;\n";
+    resets.push_back(P + "_stop <= 1'b0;");
+    for (int s = 1; s < L; s++) {
+      o << "  logic " << P << "_v" << s << ", " << P << "_last" << s << ";\n";
+      resets.push_back(P + "_v" + std::to_string(s) + " <= 1'b0;");
+      resets.push_back(P + "_last" + std::to_string(s) + " <= 1'b0;");
+    }
+    std::vector<std::string> regs;
+    for (int id : B.ops) {
+      const Op& q = f.ops[id];
+      if (q.k == OpK::Const) continue;
+      if (q.k == OpK::ReadVar && !written.count(q.ref)) continue;   // steady for the whole loop
+      auto R = [&](int x, int want) { return ref2(x, q.st, want); };
+      if (q.k == OpK::Store || q.k == OpK::Load) {
+        const Arr& a = f.arrs[q.ref];
+        std::string n = a.isParam ? svName(a.name) : a.name;
+        std::string arm = "      " + st(B.base) + ": begin " + n + "_addr = " + R(q.a, a.aw()) + "; ";
+        if (q.k == OpK::Load) {
+          arm += n + "_ce = " + vld(q.st) + "; end\n";
+        } else {
+          std::string en = vld(q.st) + (q.c >= 0 ? " && " + R(q.c, 1) : "");
+          arm += n + "_ce = " + en + "; " + n + "_we = " + en + "; " + n + "_wdata = " + R(q.b, a.ety.w) + "; end\n";
+        }
+        memAct[q.ref].push_back(arm);
+        if (q.k == OpK::Store) continue;
+      }
+      if (q.k == OpK::RomRd) {
+        o << romRead(id, R(q.a, f.ops[q.a].w));
+      } else if (q.k != OpK::ReadVar) {
+        std::string pre;
+        std::string e = expr(id, R, pre);
+        o << pre << "  logic " << rng(q.w) << wire(id) << ";\n  assign " << wire(id) << " = " << e << ";\n";
+      }
+      for (int s = availSt(q) + 1; s <= q.lastUse; s++) {
+        o << "  logic " << rng(q.w) << pname(id, s) << ";\n";
+        regs.push_back(pname(id, s) + " <= " + ref2(id, s - 1, q.w) + ";");
+      }
+    }
+    if (!regs.empty()) {
+      o << "  always_ff @(posedge ap_clk) begin\n";
+      for (auto& r : regs) o << "    " << r << "\n";
+      o << "  end\n";
+    }
+    auto& a = act[B.base];
+    std::string c = ref2(B.term.cond, 0, 1);
+    std::string over = B.term.t == bi ? "!" + c : c;
+    int next = B.term.t == bi ? B.term.f : B.term.t;
+    for (int s = 1; s < L; s++) {
+      a.push_back(P + "_v" + std::to_string(s) + " <= " + vld(s - 1) + ";");
+      a.push_back(P + "_last" + std::to_string(s) + " <= " +
+                  (s == 1 ? "!" + P + "_stop && (" + over + ")" : P + "_last" + std::to_string(s - 1)) + ";");
+    }
+    a.push_back("if (!" + P + "_stop && (" + over + ")) " + P + "_stop <= 1'b1;");
+    for (size_t i = 0; i < B.writes.size(); i++) {
+      auto [v, x] = B.writes[i];
+      a.push_back("if (" + vld(B.wst[i]) + ") " + vreg(v) + " <= " + ref2(x, B.wst[i], f.vars[v].ty.w) + ";");
+    }
+    std::string l = std::to_string(L - 1);
+    a.push_back("if (" + P + "_v" + l + " && " + P + "_last" + l + ") begin " + go(next) + " " + P + "_stop <= 1'b0; end");
   }
 
   // ---- pipeline ----
@@ -1298,6 +1467,20 @@ void summarize(Job& j, const Cfg& cfg) {
   for (auto& v : f.vars)
     if (v.reg) { sc.regs++; sc.regBits += v.ty.w; }
   for (auto& [w, n] : sc.temps) { sc.regs += n; sc.regBits += w * n; }
+  for (auto& B : f.blocks) {
+    if (!B.pipeL) continue;
+    std::set<int> written;
+    for (auto& [v, x] : B.writes) written.insert(v);
+    for (int id : B.ops) {
+      const Op& o = f.ops[id];
+      if (o.k == OpK::Const || (o.k == OpK::ReadVar && !written.count(o.ref))) continue;
+      int n = std::max(0, o.lastUse - availSt(o));
+      sc.regs += n;
+      sc.regBits += n * o.w;
+    }
+    sc.regs += 2 * B.pipeL - 1;
+    sc.regBits += 2 * B.pipeL - 1;
+  }
   if (f.pipeline) {
     sc.regs = 0;
     sc.regBits = 0;
@@ -1324,13 +1507,14 @@ void summarize(Job& j, const Cfg& cfg) {
   for (auto& [k, n] : sc.opCount) s << " " << n << " " << k;
   if (shared) s << " (" << shared << " shared unit" << (shared == 1 ? "" : "s") << ")";
   if (sc.multicycle) s << "\n  multi-cycle operators: " << sc.multicycle << " (constrain them as multicycle paths)";
+  for (auto& n : sc.loopNotes) s << "\n  " << n;
   s << "\n  estimated area: " << (long)std::llround(sc.area) << " gate equivalents\n";
   j.summary = s.str();
   std::ostringstream js;
   js << "{\"top\": \"" << f.name << "\", \"architecture\": \"" << (f.pipeline ? "pipeline" : "fsm") << "\", \"clock_ns\": "
      << cfg.clock << ", \"states\": " << (f.pipeline ? f.blocks[0].len : sc.nStates) << ", \"latency_min\": " << sc.latMin
      << ", \"latency_max\": " << sc.latMax << ", \"registers\": " << sc.regs << ", \"register_bits\": " << sc.regBits
-     << ", \"shared_units\": " << shared << ", \"multicycle\": " << sc.multicycle << ", \"area_ge\": "
+     << ", \"shared_units\": " << shared << ", \"multicycle\": " << sc.multicycle << ", \"pipelined_loops\": " << sc.pipedLoops << ", \"area_ge\": "
      << (long)std::llround(sc.area) << ", \"operators\": {";
   bool first = true;
   for (auto& [k, n] : sc.opCount) {
@@ -1343,7 +1527,7 @@ void summarize(Job& j, const Cfg& cfg) {
 
 int usage() {
   std::cerr << "usage: mhls <file.c>... [-top <f>[,<g>]] [-o <out.sv|dir>] [-clock <ns>] [-pipeline]\n"
-               "            [-unroll-all] [-unroll-max <n>] [-mul <n>] [-div <n>] [-no-share]\n"
+               "            [-unroll-all] [-unroll-max <n>] [-pipeline-loops] [-mul <n>] [-div <n>] [-no-share]\n"
                "            [-max-reg-array <n>] [-delay-scale <x>] [-tb <file>] [-cref <file>]\n"
                "            [-vectors <n>] [-seed <n>] [-explore <ns,...>] [-report <file>]\n"
                "            [-D<name>[=<v>]] [-threads <n>|all] [-q]\n";
@@ -1382,6 +1566,7 @@ int main(int argc, char** argv) {
       else if (a == "-clock") cfg.clock = std::stod(val());
       else if (a == "-pipeline") opt.pipeline = true;
       else if (a == "-unroll-all") opt.unrollAll = true;
+      else if (a == "-pipeline-loops") opt.pipelineLoops = true;
       else if (a == "-unroll-max") opt.unrollMax = std::stoi(val());
       else if (a == "-mul") cfg.mulLimit = std::stoi(val());
       else if (a == "-div") cfg.divLimit = std::stoi(val());

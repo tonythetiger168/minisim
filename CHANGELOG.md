@@ -121,6 +121,11 @@ Spec references are IEEE 1800-2023 clauses.
 - `mhls`: structs. Nested structs, arrays of structs, array members and
   bit-fields; structs copied, passed by value, pointer or reference, and
   returned. Each member becomes its own register, memory or port.
+- `mhls`: pipelined loops. `#pragma hls pipeline` first in a loop body, or
+  `-pipeline-loops` for every loop that allows it, starts a new iteration
+  every cycle: `n` iterations of an `L`-stage body take `n + L - 1` cycles
+  instead of `n * L`. A loop that cannot be pipelined is refused with the
+  rule it breaks.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
