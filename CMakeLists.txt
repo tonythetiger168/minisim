@@ -36,6 +36,12 @@ foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# The Liberty (.lib) reader shared by the timing, synthesis, power and
+# equivalence tools (src/liberty.hpp); no external dependencies.
+add_executable(test_liberty tests/test_liberty.cpp)
+target_include_directories(test_liberty PRIVATE src)
+add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
