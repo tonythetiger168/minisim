@@ -18,6 +18,7 @@
 #include <regex>
 
 #include "lintcfg.hpp"
+#include "fsm_extract.hpp"
 #include "lintir.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/AssertionExpr.h"
@@ -1847,6 +1848,48 @@ inline void checkUnused(std::vector<BodyOut>& outs, Report& rep) {
                 else if (!w) rep.add("UNU003", c.loc, q + " is read but never driven");
             }
         }
+}
+
+// -------------------------------------------------------------------- FSMs
+
+// FSM001..FSM004, on the state machines the shared extractor finds
+// (fsm_extract.hpp, the one FSM coverage uses). One finding per register of
+// a module, whatever the number of instances: the text names no instance.
+inline void checkFsms(const std::vector<ExtractedFsm>& fsms, Report& rep) {
+    for (const ExtractedFsm& f : fsms) {
+        if (!f.var || f.states.empty()) continue;
+        SourceLocation loc = f.var->location;
+        std::string reg = "'" + std::string(shown(*f.var)) + "'";
+        auto label = [&](uint64_t v, const std::string& n) {
+            return n.empty() ? std::to_string(v) : n;
+        };
+        std::set<uint64_t> in, out, reset(f.resetStates.begin(), f.resetStates.end());
+        for (auto& t : f.trans) {
+            if (t.reset) continue;   // the reset branch leaves every state
+            in.insert(t.to);
+            out.insert(t.from);
+        }
+        for (auto& [v, n] : f.states) {
+            if (!in.count(v) && !reset.count(v))
+                rep.add("FSM001", loc,
+                        "state " + label(v, n) + " of " + reg + " is never entered: no transition and no reset leads to it");
+            // A machine of one state is a flag, not a trap.
+            if (!out.count(v) && f.states.size() > 1 && (in.count(v) || reset.count(v)))
+                rep.add("FSM002", loc,
+                        "state " + label(v, n) + " of " + reg + " has no way out: once entered it is left only by reset");
+        }
+        if (f.caseOnState && !f.caseDefault) {
+            // Every encoding a state: nothing for a default to catch.
+            bool full = !f.onehot && f.w < 63 && f.states.size() == (uint64_t(1) << f.w);
+            if (!full)
+                rep.add("FSM003", loc,
+                        "the case on state register " + reg + " has no default, and " + std::to_string(f.states.size()) +
+                            " of its " + (f.w < 63 ? std::to_string(uint64_t(1) << f.w) : std::string("many")) +
+                            " encodings are states: any other value is held forever");
+        }
+        if (f.resetStates.empty())
+            rep.add("FSM004", loc, "state register " + reg + " has no reset state: the machine starts in an unknown state");
+    }
 }
 
 }  // namespace lintrules
