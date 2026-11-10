@@ -11,13 +11,11 @@
 //   L002  a blocking assignment to a non-local variable in an always_ff.
 //   L003  a non-blocking assignment in an always_comb.
 //   L004  one variable or net is assigned by more than one process.
-//   CDC001  a flop reads a signal from another clock domain with no
-//           synchronizer in between.
-//   CDC002  a multi-bit bus crosses clock domains through a two-flop
-//           synchronizer, which does not keep its bits together.
+//   CDC001..CDC005, RDC001..RDC004  clock- and reset-domain crossings (cdc.hpp).
 //   UPF001..UPF006  with -upf: power intent checks (upf.hpp check()).
 #include <unistd.h>
 
+#include "cdc.hpp"
 #include "lintir.hpp"
 #include "upf.hpp"
 #include "version.hpp"
@@ -73,86 +71,6 @@ void checkDrivers(const std::map<const Symbol*, std::vector<SourceLocation>>& dr
                 "'" + path(*sym) + "' is assigned by " + std::to_string(locs.size()) +
                     " processes; in simulation the last write wins and in synthesis this is a "
                     "multiple-driver error");
-    }
-}
-
-// Clock-domain crossings. For every sequential block, the signals it reads
-// that a flop in another domain drives must come through a synchronizer: two
-// plain flop stages in the reading domain before any logic uses the value.
-void checkCdc(std::vector<Block>& blocks, Join& join, Report& rep) {
-    auto dom = [&](const Symbol* clk) { return clk ? join.find(clk) : nullptr; };
-
-    // Which domain drives each signal, and whether more than one does.
-    std::unordered_map<const Symbol*, const Symbol*> driverDom;
-    std::unordered_set<const Symbol*> multi;
-    for (Block& b : blocks) {
-        if (!b.seq) continue;
-        const Symbol* d = dom(b.clk);
-        if (!d) continue;
-        for (const Symbol* t : b.nba) {
-            const Symbol* c = join.find(t);
-            auto it = driverDom.find(c);
-            if (it == driverDom.end())
-                driverDom[c] = d;
-            else if (it->second != d)
-                multi.insert(c);
-        }
-    }
-
-    // A flop whose whole body is "dst <= src" is one stage of a synchronizer.
-    auto isStage = [](const Block& b) {
-        return b.seq && b.chainTo && b.chainFrom && b.nba.size() == 1 && b.blocking.empty() &&
-               !b.rst;
-    };
-    // The stages that read a given signal, per domain, so a chain can be
-    // followed forward: rq -> s1 -> s2.
-    std::map<std::pair<const Symbol*, const Symbol*>, const Block*> nextStage;
-    for (Block& b : blocks)
-        if (isStage(b)) nextStage[{join.find(b.chainFrom), dom(b.clk)}] = &b;
-
-    // How many plain stages follow this one, itself counted.
-    std::function<int(const Block&, const Symbol*, int)> chainLen =
-        [&](const Block& b, const Symbol* d, int guard) -> int {
-        if (guard > 8) return guard;
-        auto it = nextStage.find({join.find(b.chainTo), d});
-        if (it == nextStage.end()) return 1;
-        return 1 + chainLen(*it->second, d, guard + 1);
-    };
-
-    for (Block& b : blocks) {
-        if (!b.seq) continue;
-        const Symbol* d = dom(b.clk);
-        if (!d) continue;
-        const Symbol* rstDom = b.rst ? join.find(b.rst) : nullptr;
-        for (const Symbol* r : b.reads) {
-            const Symbol* c = join.find(r);
-            if (c == join.find(b.clk) || (rstDom && c == rstDom)) continue;
-            auto src = driverDom.find(c);
-            if (src == driverDom.end() || src->second == d) continue;  // same domain, or not a flop
-            if (multi.count(c)) continue;  // two domains drive it: L004 first
-
-            int width = 1;
-            if (auto* v = r->as_if<ValueSymbol>()) width = (int)v->getType().getBitWidth();
-            // Stages in front of the crossing: this block, if it is a plain
-            // stage, plus the stages that read it.
-            int n = isStage(b) && join.find(b.chainFrom) == c ? chainLen(b, d, 0) : 0;
-            std::string where = "'" + path(*r) + "' (clocked by " + path(*src->second) +
-                                ") is read by logic clocked by " + path(*b.clk);
-            if (n == 0)
-                rep.add("CDC001", b.sym->location,
-                        where + " with no synchronizer; two flops in the reading domain are the "
-                                "minimum for a one-bit signal");
-            else if (n == 1)
-                rep.add("CDC001", b.sym->location,
-                        where + " through one flop only; a single stage still settles too late, "
-                                "so use two");
-            else if (width > 1)
-                rep.add("CDC002", b.sym->location,
-                        where + " through " + std::to_string(n) + " flops, but it is " +
-                            std::to_string(width) +
-                            " bits wide: the bits settle in different cycles, so use a handshake, "
-                            "a FIFO, or Gray coding");
-        }
     }
 }
 
@@ -256,7 +174,8 @@ void usage() {
                  "  -list          list the rules\n"
                  "  -Werror        exit non-zero on any finding (the default is errors only)\n"
                  "  -quiet         print findings only, no summary\n"
-                 "  -top M         the top module    -f <file>  an argument file\n"
+              << cdc::usage()
+              << "  -top M         the top module    -f <file>  an argument file\n"
                  "  -upf <file>    check IEEE 1801 (UPF) power intent against the design (UPF rules)\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
@@ -269,8 +188,7 @@ void listRules() {
                  "L002    a blocking assignment in an always_ff\n"
                  "L003    a non-blocking assignment in an always_comb\n"
                  "L004    one value is assigned by more than one process\n"
-                 "CDC001  a clock-domain crossing with no synchronizer, or only one flop\n"
-                 "CDC002  a multi-bit bus crossing through a two-flop synchronizer\n";
+              << cdc::rules();
     for (auto& [r, t] : upf::rules()) std::cout << r << "  " << t << "\n";
 }
 
@@ -281,6 +199,8 @@ int main(int argc, char** argv) {
     Rules rules;
     bool werror = false, quiet = false, powerTopSet = false;
     std::string upfPath, powerTop;
+    cdc::Options cdcOpt;
+    cdcOpt.defaults(rules.disabled);
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -298,6 +218,7 @@ int main(int argc, char** argv) {
         }
         if (a == "-disable") { rules.disabled.insert(next("a rule name")); continue; }
         if (a == "-Werror") { werror = true; continue; }
+        if (cdcOpt.take(a, next, rules.disabled, fwd)) continue;
         if (a == "-upf") { upfPath = next("a UPF file"); continue; }
         if (a == "-power_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
         if (a == "-quiet" || a == "-q") { quiet = true; continue; }
@@ -336,7 +257,7 @@ int main(int argc, char** argv) {
 
     for (const Block& b : d.blocks) checkBlock(b, rep);
     checkDrivers(d.drivers, d.wholeDriven, rep);
-    checkCdc(d.blocks, d.join, rep);
+    cdc::check(*fe.comp, rep, cdcOpt);
     if (!upfPath.empty()) {
         try {
             checkUpf(*fe.comp, upfPath, powerTop, powerTopSet, rep);
