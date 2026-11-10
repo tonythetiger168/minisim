@@ -94,6 +94,15 @@ want("Warning: 1 register clock pins with no clock (no_clock)"
      "max_capacitance: 1 violation"
      "ra1/Q            0.004       0.005      -0.001  (VIOLATED)")
 
+# --- constants: with sel = 0 the mux no longer passes its B input (the slow
+# path through two buffers), and with en = 1 the XOR only inverts, so a rise
+# of ra/Q arrives at x1/Y as a fall. The tied AND input is never a path.
+run(0 -lib ${LIB} case.v -f case.tcl)
+want("rc/D (DFF_X1)         1.944       0.592       1.352"
+     "x1/Y (XOR2_X1)                                0.130      0.286 r"
+     "slack (MET)                                              1.409"
+     "rc/D (DFF_X1)         1.944       0.519       1.425")
+
 # --- SDF and JSON.
 run(0 -lib ${LIB} soc.v -q -e "create_clock -name clk -period 4 [get_ports clk]" -sdf ${OUT}/soc.sdf -json ${OUT}/soc.json)
 file(READ ${OUT}/soc.sdf out)

@@ -80,6 +80,11 @@ A report command takes `> FILE` or `>> FILE` at the end.
 - **Design rules**: `max_transition` and `max_capacitance` from the library
   pins, `default_max_transition`, and `set_max_transition` /
   `set_max_capacitance`.
+- **Constants**: pins tied to `1'b0` / `1'b1`, `set_case_analysis` and
+  `set_logic_zero` / `set_logic_one` are propagated through the cell
+  functions. A constant pin has no arcs, an arc that the constants on the
+  other inputs block is removed, and one they make unate (an XOR with one
+  input constant) keeps only that direction.
 - `set_disable_timing` on cells (`-from`, `-to`), library cells, pins and ports.
 
 ## Threads
@@ -98,8 +103,6 @@ These are not done yet, and each is either reported or documented here:
   SPEF and wire load models come next.
 - Latches are timed as registers at the edge of their timing arcs: a latch's
   `D` is an endpoint and its `D` to `Q` arc is not a path (no time borrowing).
-- `set_case_analysis` is read but constants do not disable arcs yet
-  (`check_timing` says so).
 - On-chip variation: no `set_timing_derate`, no clock reconvergence pessimism
   removal. One library corner per run.
 - `report_timing` shows the single worst path into each endpoint; `-nworst`

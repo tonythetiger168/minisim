@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -128,6 +129,7 @@ struct Edge {
     uint8_t kind = NetEdge;
     bool disabled = false, loopBreak = false;
     uint8_t ok = 0;          // bit (irf*2+orf): the transition pair exists
+    uint8_t ok0 = 0;         // ok before constants narrowed it
     int group = -1;          // the arc group of the cell (CellInfo::groups)
     double d[2][2][2] = {};  // [LATE/EARLY][irf][orf]
     bool has(int irf, int orf) const { return (ok >> (irf * 2 + orf)) & 1; }
@@ -149,7 +151,38 @@ struct CellInfo {
     std::vector<Chk> checks;
     std::unordered_map<std::string, int> pinIdx;
     bool latch = false;
+    // The function of each output pin with one, for constant propagation.
+    std::vector<std::unique_ptr<liberty::Expr>> fn;
 };
+
+// Three-valued evaluation: 0, 1, or -1 for unknown.
+template <class Get>
+int eval3(const liberty::Expr& e, Get&& get) {
+    using E = liberty::Expr;
+    switch (e.kind) {
+        case E::Const: return e.value ? 1 : 0;
+        case E::Var: return get(e.var);
+        case E::Not: {
+            int a = eval3(e.kids[0], get);
+            return a < 0 ? -1 : !a;
+        }
+        case E::And: {
+            int a = eval3(e.kids[0], get), b = eval3(e.kids[1], get);
+            if (a == 0 || b == 0) return 0;
+            return a == 1 && b == 1 ? 1 : -1;
+        }
+        case E::Or: {
+            int a = eval3(e.kids[0], get), b = eval3(e.kids[1], get);
+            if (a == 1 || b == 1) return 1;
+            return a == 0 && b == 0 ? 0 : -1;
+        }
+        case E::Xor: {
+            int a = eval3(e.kids[0], get), b = eval3(e.kids[1], get);
+            return a < 0 || b < 0 ? -1 : a != b;
+        }
+    }
+    return -1;
+}
 
 struct Check {
     int data = -1, clk = -1, inst = -1;
@@ -375,7 +408,15 @@ public:
         CellInfo ci;
         ci.cell = c;
         ci.latch = !c->latches.empty();
-        for (size_t i = 0; i < c->pins.size(); i++) ci.pinIdx[c->pins[i].name] = (int)i;
+        ci.fn.resize(c->pins.size());
+        for (size_t i = 0; i < c->pins.size(); i++) {
+            ci.pinIdx[c->pins[i].name] = (int)i;
+            if (c->pins[i].dir != liberty::Dir::In && !c->pins[i].function.empty())
+                try {
+                    ci.fn[i] = std::make_unique<liberty::Expr>(liberty::parseFunction(c->pins[i].function));
+                } catch (liberty::Error&) {
+                }
+        }
         std::set<std::string> latchData;
         for (auto& l : c->latches)
             if (!l.dataIn.empty())
@@ -518,7 +559,7 @@ public:
                     e.from = d;
                     e.to = l;
                     e.kind = NetEdge;
-                    e.ok = 0b1001;  // rise to rise, fall to fall
+                    e.ok = e.ok0 = 0b1001;  // rise to rise, fall to fall
                     edges.push_back(e);
                 }
         }
@@ -536,6 +577,7 @@ public:
                 e.kind = grp.launch ? LaunchEdge : CombEdge;
                 e.group = (int)g;
                 for (auto* a : grp.arcs) e.ok |= arcPairs(*a);
+                e.ok0 = e.ok;
                 edges.push_back(e);
             }
             for (auto& ck : ci->checks) {
@@ -747,7 +789,10 @@ public:
         std::fill(netWireCap.begin(), netWireCap.end(), 0.0);
         std::fill(portLoad.begin(), portLoad.end(), 0.0);
         for (auto& n : nodes) n.clockSrc = n.genSrc = n.idealClk = n.hasThrough = n.hasLaunch = n.hasSeed = false;
-        for (auto& e : edges) e.disabled = false;
+        for (auto& e : edges) {
+            e.disabled = false;
+            e.ok = e.ok0;
+        }
         const double T = timeUnit, C = capUnit;
 
         // Clocks: the last definition of a name wins.
@@ -1039,8 +1084,25 @@ public:
                 }
             }
         }
-        if (!s.caseAnalysis.empty())
-            warn("unsupported", "set_case_analysis is read but not applied yet: constants do not disable arcs");
+        // Constants: tied pins, set_case_analysis, set_logic_zero / _one.
+        std::vector<std::pair<int, int>> consts;
+        for (auto& ca : s.caseAnalysis) {
+            int v = ca.value == "0" || ca.value == "zero" ? 0 : ca.value == "1" || ca.value == "one" ? 1 : -1;
+            if (v < 0) {
+                warn("unsupported", "set_case_analysis " + ca.value + " is not supported (" + ca.loc.str() + ")");
+                continue;
+            }
+            std::vector<int> ns;
+            for (auto& o : ca.objects) nodesOf(o, ns);
+            for (int n : ns) consts.push_back({n, v});
+        }
+        for (const char* cmd : {"set_logic_zero", "set_logic_one"})
+            for (auto* c : s.of(cmd)) {
+                std::vector<int> ns;
+                for (auto& o : c->objs("objects")) nodesOf(o, ns);
+                for (int n : ns) consts.push_back({n, cmd[10] == 'o'});
+            }
+        applyConstants(consts);
 
         // Clock seeds.
         for (size_t k = 0; k < clocks.size(); k++) {
@@ -1150,6 +1212,106 @@ public:
                     if (seen.insert(e.to).second) stack.push_back(e.to);
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------- constants
+
+    std::vector<int8_t> constVal;  // per node: 0, 1, or -1 when it can switch
+
+    // Propagates constants through the cell functions, then removes what
+    // cannot happen: arcs at a constant pin, and arcs (or one direction of an
+    // arc) that the constants on the other inputs block.
+    void applyConstants(const std::vector<std::pair<int, int>>& set) {
+        constVal.assign(nodes.size(), -1);
+        std::vector<int> work;
+        auto give = [&](int n, int v) {
+            if (constVal[n] >= 0) return;
+            constVal[n] = (int8_t)v;
+            work.push_back(n);
+        };
+        for (size_t n = 0; n < nodes.size(); n++) {
+            if (nodes[n].net < 0) continue;
+            if (nodes[n].net == nl->const0) give((int)n, 0);
+            else if (nodes[n].net == nl->const1) give((int)n, 1);
+        }
+        for (auto& [n, v] : set) give(n, v);
+        if (work.empty()) return;
+        std::vector<int> touched;  // instances with a constant pin
+        auto pinValue = [&](int inst, const CellInfo* ci, const std::string& name) {
+            auto it = ci->pinIdx.find(name);
+            if (it == ci->pinIdx.end()) return -1;  // an internal variable
+            int n = pinNode(inst, it->second);
+            return n < 0 ? -1 : (int)constVal[n];
+        };
+        while (!work.empty()) {
+            int n = work.back();
+            work.pop_back();
+            const Node& x = nodes[n];
+            if (x.driver || x.inst < 0) {
+                // A constant driver: its loads are constant.
+                for (int k = foutOff[n]; k < foutOff[n + 1]; k++) {
+                    const Edge& e = edges[foutIdx[k]];
+                    if (e.kind == NetEdge) give(e.to, constVal[n]);
+                }
+            }
+            if (x.inst < 0) continue;
+            const CellInfo* ci = instInfo[x.inst];
+            if (!ci) continue;
+            touched.push_back(x.inst);
+            if (x.driver && !(x.pin && x.pin->dir == liberty::Dir::InOut)) continue;
+            for (size_t p = 0; p < ci->fn.size(); p++) {
+                if (!ci->fn[p]) continue;
+                int o = pinNode(x.inst, (int)p);
+                if (o < 0 || constVal[o] >= 0) continue;
+                int inst = x.inst;
+                int v = eval3(*ci->fn[p], [&](const std::string& name) { return pinValue(inst, ci, name); });
+                if (v >= 0) give(o, v);
+            }
+        }
+        std::sort(touched.begin(), touched.end());
+        touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+        for (size_t n = 0; n < nodes.size(); n++) {
+            if (constVal[n] < 0) continue;
+            for (int k = finOff[n]; k < finOff[n + 1]; k++) edges[finIdx[k]].disabled = true;
+            for (int k = foutOff[n]; k < foutOff[n + 1]; k++) edges[foutIdx[k]].disabled = true;
+        }
+        // Arcs the constants on the other inputs block or make unate.
+        for (int inst : touched) {
+            const CellInfo* ci = instInfo[inst];
+            for (int n = instNodeOff[inst]; n < instNodeOff[inst + 1]; n++)
+                for (int k = finOff[n]; k < finOff[n + 1]; k++) {
+                    Edge& e = edges[finIdx[k]];
+                    if (e.kind != CombEdge || e.disabled) continue;
+                    const CellInfo::Group& g = ci->groups[e.group];
+                    const liberty::Expr* fn = ci->fn[g.to].get();
+                    if (!fn) continue;
+                    const std::string& from = ci->cell->pins[g.from].name;
+                    std::vector<std::string> free;
+                    bool uses = false;
+                    for (auto& v : fn->vars()) {
+                        if (v == from) { uses = true; continue; }
+                        if (pinValue(inst, ci, v) < 0) free.push_back(v);
+                    }
+                    if (!uses || free.size() > 12) continue;
+                    bool pos = false, neg = false;
+                    for (uint32_t a = 0; a < (1u << free.size()); a++) {
+                        auto at = [&](int fv) {
+                            return eval3(*fn, [&](const std::string& name) -> int {
+                                if (name == from) return fv;
+                                for (size_t i = 0; i < free.size(); i++)
+                                    if (free[i] == name) return (a >> i) & 1;
+                                return pinValue(inst, ci, name);
+                            });
+                        };
+                        int lo = at(0), hi = at(1);
+                        if (lo == 0 && hi == 1) pos = true;
+                        if (lo == 1 && hi == 0) neg = true;
+                    }
+                    uint8_t keep = (pos ? 0b1001 : 0) | (neg ? 0b0110 : 0);
+                    e.ok &= keep;
+                    if (!e.ok) e.disabled = true;
+                }
         }
     }
 
