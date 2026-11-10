@@ -361,10 +361,7 @@ include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # Tools that need nothing from the blocks above keep their targets, tests and
 # install rules in a file of their own: cmake/tools/<tool>.cmake.
-file(GLOB TOOL_CMAKE ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
-foreach(t ${TOOL_CMAKE})
-  include(${t})
-endforeach()
+include(cmake/tools/mspice.cmake)
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
