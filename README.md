@@ -394,6 +394,26 @@ msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
 
 `docs/DATAPATH.md` lists every module and its ports.
 
+### Timing constraint checks: `msdc`
+
+`msdc` reads the design and its SDC file and reports what is wrong or missing
+in the constraints: syntax and names that match nothing, clocks that clock
+nothing, registers no clock reaches, ports with no I/O delay, exceptions that
+are not startpoint-to-endpoint or have no path in the design, a setup
+multicycle with no hold, and paths between clocks whose relationship nobody
+declared. 32 rules, multithreaded, same report for any `-threads N`.
+
+```sh
+msdc rtl/*.sv -top soc -sdc soc.sdc         # the report, then a summary
+msdc rtl/*.sv -top soc -sdc soc.sdc -Werror # exit 1 on any finding (for CI)
+msdc -sdc soc.sdc                           # the file alone
+msdc -list                                  # the rules
+```
+
+The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
+(`src/tcl.hpp`) are shared with the timing and synthesis tools. See
+[docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
+
 ### Lint and clock-domain checks: `mlint`
 
 `mlint` runs the same front end as `msim` and then checks the elaborated
