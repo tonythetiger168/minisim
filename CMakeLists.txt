@@ -72,6 +72,13 @@ if(Python3_FOUND)
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
 
+# The mini45 cell library (lib/mini45) is generated; the files in the tree
+# must be what the generator writes.
+if(Python3_FOUND)
+  add_test(NAME mini45_gen
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/lib/mini45/gen_mini45.py --check)
+endif()
+
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
 # default is off; -DSLANG_USE_MIMALLOC=ON still overrides it.
@@ -288,6 +295,12 @@ if(MINISIM_WITH_SLANG)
     endforeach()
   endif()
 
+  # mini45's Verilog models against the functions in its Liberty files.
+  add_test(NAME mini45_models
+           COMMAND msim ${CMAKE_SOURCE_DIR}/lib/mini45/mini45.v ${CMAKE_SOURCE_DIR}/lib/mini45/mini45_tb.sv
+                   -top mini45_tb)
+  set_tests_properties(mini45_models PROPERTIES PASS_REGULAR_EXPRESSION "mini45: 84 cells checked, 0 errors")
+
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
@@ -350,7 +363,10 @@ install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisi
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md
+# The generic cell library: Liberty corners, Verilog models, LEF.
+install(DIRECTORY lib/mini45 DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/lib
+        FILES_MATCHING PATTERN "*.lib" PATTERN "*.lef" PATTERN "mini45.v")
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/MINI45.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
