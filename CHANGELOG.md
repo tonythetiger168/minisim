@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
+  of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
+  bus, logic in front of a synchronizer, reconvergence, a signal synchronized
+  twice) and `RDC001` to `RDC004` (a reset from another clock domain, one
+  reset used raw in several domains, a flop feeding a flop with another reset
+  or with none). Synchronizers in one block, with a reset, as shift registers
+  or as per-bit synchronizer cells, enable-qualified buses and Gray-coded
+  pointers are recognized; clock gates stay in their clock's domain and bits
+  of a clock bus are separate clocks. New options: `-cdc-report`,
+  `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
 - `mpss`, portable stimulus: reads a model in the Accellera PSS language
   (components, actions, buffers, streams, resources and pools, constraints,
   activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
@@ -44,6 +54,9 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Functional coverage in the coverage database: `msim -cov` records the bins
+  of every covergroup type (19.11) and the statistics of every assertion
+  (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
 - Datapath library `dw/`: 47 synthesizable, parameterized SystemVerilog
   building blocks named `MW_*` (adders with five carry architectures,
   Booth/Wallace and array multipliers, multiply-accumulate, dividers, square
