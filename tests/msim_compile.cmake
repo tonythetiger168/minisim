@@ -58,6 +58,17 @@ foreach(c IN LISTS CASES)
   if(NOT want STREQUAL got)
     message(FATAL_ERROR "${c}: -compile output differs\n--- interpreter\n${want}--- compiled\n${got}")
   endif()
+  # The benchmark's registers and wires must stay plain variables of the
+  # cycle domain (codegen.hpp privateSigs): without them it runs 10x slower
+  # and prints the same.
+  if(c MATCHES "^bench/lanes")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    string(REGEX MATCHALL "PSig P[0-9]+" hits "${gen}")
+    list(LENGTH hits nh)
+    if(nh LESS 48)
+      message(FATAL_ERROR "${c}: only ${nh} signals private to the cycle domain (expected 48)")
+    endif()
+  endif()
   math(EXPR n "${n} + 1")
 endforeach()
 message(STATUS "${n} designs match")
