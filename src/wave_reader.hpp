@@ -11,7 +11,10 @@
 //
 // Names are scope.scope.name; a vector "q [7:0]" is "q", an array element
 // keeps its index ("mem[3]"). Reals, events and strings are skipped.
-// r.end is the last time, r.timescale the unit ("1ns").
+// r.byName lists every name (aliases share one Wave); r.range[name] is the
+// declared range text ("[7:0]") where the file has one. r.end is the last
+// time, r.timescale the unit ("1ns") and r.unit the same in seconds.
+// No slang needed: the header stands alone.
 //
 // The VCD reader is built for large dumps: the file is mapped, the body is
 // cut at time stamps into one piece per thread, and no value is copied. The
@@ -81,10 +84,21 @@ struct Wave {
 struct Reader {
     std::vector<Wave> waves;
     std::map<std::string, int> byName;
+    std::map<std::string, std::string> range;   // name -> "[7:0]", where the file declares one
     uint64_t end = 0;
-    std::string timescale;
+    std::string timescale;                       // "1ns"
+    double unit = 0;                             // one time step in seconds (0: not given)
+
+    static double seconds(const std::string& ts) {
+        char* e = nullptr;
+        double n = std::strtod(ts.c_str(), &e);
+        std::string u = e ? e : "";
+        double m = u == "s" ? 1 : u == "ms" ? 1e-3 : u == "us" ? 1e-6 : u == "ns" ? 1e-9 : u == "ps" ? 1e-12 : u == "fs" ? 1e-15 : 0;
+        return n * m;
+    }
     const char* data = nullptr;
     size_t size = 0;
+    size_t minPiece = 4u << 20;                  // a thread is not worth less of a VCD than this
 
     ~Reader() { if (data && size) munmap((void*)data, size); }
 
@@ -205,6 +219,7 @@ struct Reader {
                     for (auto& sc : scope) full += sc + ".";
                     full += name;
                     if (!rest.empty() && rest.find(':') == std::string::npos) full += rest;
+                    else if (!rest.empty()) range[full] = rest;
                     uint64_t c = code(id.data(), id.size());
                     auto it = seen.find(c);
                     if (it == seen.end()) {
@@ -217,6 +232,7 @@ struct Reader {
                 }
             } else if (t == "$timescale") {
                 for (std::string_view r = tok(); !r.empty() && r != "$end"; r = tok()) timescale += r;
+                unit = seconds(timescale);
             } else if (t == "$enddefinitions") {
                 skipToEnd();
                 break;
@@ -228,7 +244,7 @@ struct Reader {
         // The body, cut at time stamps so every piece knows what time it is.
         const char* body = p;
         size_t left = (size_t)(e - body);
-        size_t pieces = std::max<size_t>(1, std::min<size_t>(threads, left / (4u << 20)));
+        size_t pieces = std::max<size_t>(1, std::min<size_t>(threads, left / std::max<size_t>(minPiece, 16)));
         std::vector<const char*> cut{body};
         for (size_t i = 1; i < pieces; i++) {
             const char* guess = body + left / pieces * i;
@@ -310,15 +326,17 @@ struct Reader {
                 if (ty == FST_VT_VCD_REAL || ty == FST_VT_VCD_EVENT || ty == FST_VT_GEN_STRING ||
                     ty == FST_VT_VCD_REAL_PARAMETER || ty == FST_VT_VCD_REALTIME || ty == FST_VT_SV_SHORTREAL)
                     continue;
-                std::string name(h->u.var.name), full;
+                std::string name(h->u.var.name), full, rng;
                 // "q [7:0]" is the vector q; "mem[3]" keeps its index.
                 if (size_t sp = name.find(' '); sp != std::string::npos) {
                     std::string rest = name.substr(sp + 1);
                     name.resize(sp);
                     if (rest.find(':') == std::string::npos) name += rest;
+                    else rng = rest;
                 }
                 for (auto& sc : scope) full += sc + ".";
                 full += name;
+                if (!rng.empty()) range[full] = rng;
                 fstHandle hd = h->u.var.handle;
                 if (byHandle.size() <= hd) byHandle.resize(hd + 1, -1);
                 if (byHandle[hd] < 0) {
@@ -348,6 +366,7 @@ struct Reader {
         if (int k = -ts; k >= 0 && k <= 15) {   // 10^ts seconds
             int idx = (k + 2) / 3, pw = 3 * idx - k;
             timescale = std::string(pw == 0 ? "1" : pw == 1 ? "10" : "100") + unit[idx];
+            this->unit = seconds(timescale);
         }
         fstReaderClose(ctx);
         for (size_t w = 0; w < waves.size(); w++) waves[w].base = pools[w].data();
