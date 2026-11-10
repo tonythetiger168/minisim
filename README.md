@@ -377,6 +377,22 @@ joined across port connections, so one clock passed down through several
 modules stays one domain. Findings print as
 `file:line:col: warning: [RULE] text`, sorted by file and line.
 
+### Source-level debug: `mdebug`
+
+`mdebug` lists the drivers and loads of a signal with the conditions on each
+assignment, prints fan-in cones, and with a VCD finds the assignment that
+gave a signal its value at a time and what caused it:
+
+```sh
+mdebug tb.sv dut.sv -top tb -drivers tb.u0.y
+mdebug tb.sv dut.sv -top tb -vcd waves.vcd -active tb.sum -at 70
+mdebug tb.sv dut.sv -top tb -vcd waves.vcd -html debug.html   # one-file viewer
+```
+
+The viewer page has the hierarchy, clickable source, drivers and loads, a
+schematic of the selected signal, and waves with the values annotated in the
+source. See [`docs/DEBUG.md`](docs/DEBUG.md).
+
 ### Low-power simulation: UPF (IEEE 1801)
 
 `msim -upf dut.upf` simulates with the design's power intent: power domains,

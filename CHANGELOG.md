@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
+  of a signal with the `if` / `case` conditions on each assignment, `-trace`
+  for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
+  assignment that gave a signal its value at a time and its causes back
+  through time, and `-html` for a one-file viewer (hierarchy, clickable
+  source, drivers and loads, schematic, waves with values annotated in the
+  source). See `docs/DEBUG.md`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
   coupling capacitance to same-layer neighbours and to crossings, from an
