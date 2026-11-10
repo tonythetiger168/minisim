@@ -1,10 +1,9 @@
 # mpower: power analysis (average, peak, RTL estimate, UPF domains).
 #   mpower design.v -top dut -lib cells.lib -activity run.saif -strip_path tb.dut
-# Needs the slang front end, msim (for its test) and the FST option, which the
-# top CMakeLists.txt sets up inside if(MINISIM_WITH_SLANG): that block includes
-# this file. An earlier include of every cmake/tools/*.cmake (before those
-# exist) is skipped here, and so is a second include.
-if(TARGET mpower OR NOT TARGET msim)
+# Needs the slang front end, msim (for its test) and the FST option; the top
+# CMakeLists.txt includes every cmake/tools/*.cmake after those are set up.
+include_guard(GLOBAL)
+if(NOT TARGET msim)
   return()
 endif()
 include(GNUInstallDirs)
