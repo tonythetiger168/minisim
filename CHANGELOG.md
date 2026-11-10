@@ -8,17 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- Condition and FSM coverage (as VCS `-cm cond+fsm`): `msim -cov` (or
-  `-cm <metrics>`) also records, for every `&&` / `||` / `?:` condition, the
-  vectors in which each term decides the result, and, for every state
-  register it extracts (two-process, one-process and `if (state == S)`
-  styles; enum, parameter and literal states), the states entered and the
-  transitions made out of those the next-state logic allows. Works in the
-  interpreter and with `-compile`, with any `-threads`, with the same
-  database. `mcov report` adds `Condition:` and `FSM:` lines, `-detail`,
-  `-uncovered`, `-fsm-reset-filter`, `-min-cond`, `-min-fsm-state`,
-  `-min-fsm-trans`, and FSM and condition sections in the HTML report;
-  `mcov merge` merges both.
+- `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
+  of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
+  bus, logic in front of a synchronizer, reconvergence, a signal synchronized
+  twice) and `RDC001` to `RDC004` (a reset from another clock domain, one
+  reset used raw in several domains, a flop feeding a flop with another reset
+  or with none). Synchronizers in one block, with a reset, as shift registers
+  or as per-bit synchronizer cells, enable-qualified buses and Gray-coded
+  pointers are recognized; clock gates stay in their clock's domain and bits
+  of a clock bus are separate clocks. New options: `-cdc-report`,
+  `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -26,6 +25,14 @@ Spec references are IEEE 1800-2023 clauses.
   through time, and `-html` for a one-file viewer (hierarchy, clickable
   source, drivers and loads, schematic, waves with values annotated in the
   source). See `docs/DEBUG.md`.
+- `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
+  1481) out. Per net a distributed RC network with capacitance to ground and
+  coupling capacitance to same-layer neighbours and to crossings, from an
+  ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
+  factors, decoupled output, per-net report, open and short checks
+  (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
+  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  See `docs/RCX.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
@@ -48,6 +55,17 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- Condition and FSM coverage (as VCS `-cm cond+fsm`): `msim -cov` (or
+  `-cm <metrics>`) also records, for every `&&` / `||` / `?:` condition, the
+  vectors in which each term decides the result, and, for every state
+  register it extracts (two-process, one-process and `if (state == S)`
+  styles; enum, parameter and literal states), the states entered and the
+  transitions made out of those the next-state logic allows. Works in the
+  interpreter and with `-compile`, with any `-threads`, with the same
+  database. `mcov report` adds `Condition:` and `FSM:` lines, `-detail`,
+  `-uncovered`, `-fsm-reset-filter`, `-min-cond`, `-min-fsm-state`,
+  `-min-fsm-trans`, and FSM and condition sections in the HTML report;
+  `mcov merge` merges both.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
