@@ -288,7 +288,7 @@ def regress_groups(path):
     return groups
 
 
-FINDING = re.compile(r"^(?P<file>.*?):(?P<line>\d+):(?P<col>\d+): (?:warning|error): \[(?P<rule>[A-Z]+\d+)\] (?P<text>.*)$")
+FINDING = re.compile(r"^(?P<file>.*?):(?P<line>\d+):(?P<col>\d+): (?:warning|error|info): \[(?P<rule>[A-Z]+\d+)\] (?P<text>.*)$")
 
 
 def lint_groups(text, tool, group_by, source):

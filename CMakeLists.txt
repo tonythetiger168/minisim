@@ -354,6 +354,13 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+  # Every mlint rule on a marked source file (tests/lint/rules), the
+  # configuration, the waivers, and -threads 1 against -threads 4.
+  if(Python3_FOUND)
+    add_test(NAME mlint_rules
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_rules.py
+                     $<TARGET_FILE:mlint> ${CMAKE_SOURCE_DIR}/tests/lint)
+  endif()
   # Power-aware simulation and UPF checks (IEEE 1801-2024): msim -upf, mlint -upf.
   add_test(NAME upf
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
