@@ -36,6 +36,11 @@ foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_l
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# The Liberty (.lib) reader shared by the timing, synthesis, power and
+# equivalence tools (src/liberty.hpp); no external dependencies.
+add_executable(test_liberty tests/test_liberty.cpp)
+target_include_directories(test_liberty PRIVATE src)
+add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
 # Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
 # libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
 find_package(OpenSSL COMPONENTS Crypto)
@@ -62,6 +67,11 @@ else()
   message(STATUS "OpenSSL not found: building without protected envelope support")
 endif()
 
+# The gate-level Verilog netlist reader and writer (src/gnetlist.hpp).
+add_executable(test_gnetlist tests/test_gnetlist.cpp)
+target_include_directories(test_gnetlist PRIVATE src)
+add_test(NAME test_gnetlist COMMAND test_gnetlist)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -71,6 +81,9 @@ if(Python3_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mbug_test.py ${CMAKE_SOURCE_DIR}
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
+
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/mrcx.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
