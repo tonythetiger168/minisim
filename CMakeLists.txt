@@ -145,7 +145,8 @@ if(MINISIM_WITH_SLANG)
   # Design-for-test checks and a scan chain plan: mdft design.sv
   add_executable(mdft src/mdft.cpp)
   target_include_directories(mdft PRIVATE src)
-  target_link_libraries(mdft PRIVATE slang::slang)
+  find_package(Threads REQUIRED)
+  target_link_libraries(mdft PRIVATE slang::slang Threads::Threads)
   if(OPENSSL_FOUND)
     target_link_libraries(mdft PRIVATE OpenSSL::Crypto)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
@@ -299,6 +300,15 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
+  # Scan insertion and memory BIST: the results are simulated with msim.
+  add_test(NAME mdft_insert_scan
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/dft_scan
+                   -P ${CMAKE_SOURCE_DIR}/tests/dft_scan.cmake)
+  add_test(NAME mdft_mbist
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DIVERILOG=${IVERILOG} -DVVP=${VVP} -DOUT=${CMAKE_BINARY_DIR}/dft_mbist
+                   -P ${CMAKE_SOURCE_DIR}/tests/dft_mbist.cmake)
 
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus

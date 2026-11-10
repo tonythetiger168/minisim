@@ -8,6 +8,21 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
+  through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
+  gates) or a cell map, checked for a controllable clock and asynchronous
+  set/reset, and stitched into balanced mux-D chains: scan cell swap or a
+  library mux before D, one clock domain per chain or `-mix_clocks` with
+  lockup latches, clock-gate test enables tied to `scan_en`. Writes the
+  netlist, a JSON chain description for ATPG (`-scandef`) and a chain flush
+  testbench (`-tb`). Multithreaded, same output for any `-threads N`.
+- `mdft -mbist`: memory BIST generation for a synchronous single-port RAM:
+  an at-speed March controller and a collar, eight built-in algorithms
+  (MATS+, March X, Y, C-, A, B, LR, SS) or `-march`, data backgrounds, read
+  latency 0 to 16, first-fail address and data. A built-in memory fault
+  simulator reports stuck-at, transition, coupling and address-decoder
+  coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
+  expected results come from that simulator. See `docs/DFT.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
   AES-256-CBC, HMAC-SHA512 signature; `-v1` for clause 34 envelopes), from
