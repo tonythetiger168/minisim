@@ -25,6 +25,8 @@
 // plan is built from.
 #include <functional>
 
+#include "dft_mbist.hpp"
+#include "dft_scan.hpp"
 #include "lintir.hpp"
 #include "version.hpp"
 #include "dft/cli.hpp"          // boundary scan and IJTAG (-bscan, -bsdl, -icl, -pdl)
@@ -270,7 +272,9 @@ struct Dft {
 
 void usage() {
     std::cout << "usage: mdft [options] file.sv ...\n"
-                 "  design-for-test checks and a scan chain plan\n\n"
+                 "  design-for-test checks and a scan chain plan\n"
+                 "       mdft -insert_scan netlist.v -o scanned.v ...   (see mdft -insert_scan -help)\n"
+                 "       mdft -mbist -name N -words W -width B ...      (see mdft -mbist -help)\n\n"
                  "  -disable RULE  turn one rule off (repeatable)\n"
                  "  -list          list the rules\n"
                  "  -Werror        exit non-zero on any finding\n"
@@ -295,6 +299,17 @@ void listRules() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Scan insertion and memory BIST work on a gate netlist or on numbers,
+    // not on the elaborated design: they have their own option sets.
+    if (argc > 1 && (std::string(argv[1]) == "-insert_scan" || std::string(argv[1]) == "-mbist")) {
+        std::vector<std::string> rest(argv + 2, argv + argc);
+        try {
+            return std::string(argv[1]) == "-mbist" ? mbist::main(rest) : scan::main(rest);
+        } catch (const std::exception& e) {
+            std::cerr << "mdft: " << e.what() << "\n";
+            return 2;
+        }
+    }
     // Boundary scan and IJTAG (src/dft/): -bsdl and -icl run here and return.
     dft::Cli jtag;
     if (int rc = jtag.parse(argc, argv); rc >= 0) return rc;
