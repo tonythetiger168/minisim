@@ -671,6 +671,26 @@ mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v 
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
+### Test patterns: `matpg`
+
+`matpg` generates manufacturing test patterns for a scan-inserted gate
+netlist and reports the fault coverage: stuck-at faults, and transition
+faults by launch-on-capture. It builds with the core, without slang.
+
+```sh
+matpg scan.v                                   # stuck-at patterns and coverage
+matpg scan.v -fault all -stil p.stil -tb p_tb.v
+matpg scan.v -lib cells.lib -min_coverage 98   # Liberty cells; gate for CI
+matpg scan.v -faultsim p.pat                   # grade existing patterns
+```
+
+It traces the scan chains from the ports, runs random patterns and then
+PODEM, fault-simulates every pattern against every remaining fault (64
+patterns to the word, on every core, the same result for any `-threads N`),
+compacts, and writes STIL, a self-checking Verilog testbench that `msim`
+replays, and a fault list with each fault's class. See
+[docs/ATPG.md](docs/ATPG.md).
+
 ### Emulation and FPGA prototyping: `memu`
 
 `memu` is the step between synthesis and FPGA place and route that makes a
