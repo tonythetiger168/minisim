@@ -430,20 +430,17 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
-### Static timing analysis: `msta`
+### High-level synthesis: `mhls`
 
-`msta` times a gate-level netlist against SDC constraints with Liberty
-libraries, PrimeTime style, and builds without the slang front end:
+`mhls` turns a C/C++ function into SystemVerilog: an FSM with datapath, or
+with `-pipeline` a pipeline that takes one input per cycle. It also writes
+a self-checking testbench, so the result is one `msim` run away from proven
+against the C. See [docs/HLS.md](docs/HLS.md).
 
 ```sh
-msta -lib cells.lib netlist.v -top top -sdc top.sdc      # check_timing, worst setup and hold paths, summary
-msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf  # delays and timing checks for msim -sdf
-msta -f run.tcl                                          # report_timing, report_constraint, ... in a Tcl script
+mhls fir.c -top fir -clock 5 -o fir.sv -tb fir_tb.sv
+msim fir.sv fir_tb.sv -top fir_tb          # PASS: fir 20 calls, latency 2..2 cycles
 ```
-
-It runs on every core by default (`-threads N`), with the same results at any
-thread count. Commands, what is modeled and the current limits are in
-[docs/STA.md](docs/STA.md).
 
 ### Datapath library: `dw/`
 
@@ -478,6 +475,21 @@ msdc -list                                  # the rules
 The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
 (`src/tcl.hpp`) are shared with the timing and synthesis tools. See
 [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
+
+### Static timing analysis: `msta`
+
+`msta` times a gate-level netlist against SDC constraints with Liberty
+libraries, PrimeTime style, and builds without the slang front end:
+
+```sh
+msta -lib cells.lib netlist.v -top top -sdc top.sdc      # check_timing, worst setup and hold paths, summary
+msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf  # delays and timing checks for msim -sdf
+msta -f run.tcl                                          # report_timing, report_constraint, ... in a Tcl script
+```
+
+It runs on every core by default (`-threads N`), with the same results at any
+thread count. Commands, what is modeled and the current limits are in
+[docs/STA.md](docs/STA.md).
 
 ### Lint and clock-domain checks: `mlint`
 
