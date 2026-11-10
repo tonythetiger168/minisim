@@ -463,11 +463,17 @@ install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/U
 # The tools: one file each in cmake/tools, all included here, after the core
 # targets, the slang front end, FST and the install directories, so a tool
 # file can test if(MINISIM_WITH_SLANG), if(TARGET msim) and MINISIM_WITH_FST.
-# Add a file, not a line: every *.cmake there is included. Start each file
-# with include_guard(GLOBAL).
+# Add a file, not a line: every *.cmake there is included. A file that is
+# also named in an include() line above is skipped here, so a missing
+# include_guard(GLOBAL) cannot define its targets twice.
 file(GLOB TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
+file(READ ${CMAKE_CURRENT_LIST_FILE} TOOL_CMAKE_SELF)
 foreach(f ${TOOL_CMAKE})
-  include(${f})
+  get_filename_component(n ${f} NAME)
+  string(FIND "${TOOL_CMAKE_SELF}" "include(cmake/tools/${n})" explicit)
+  if(explicit EQUAL -1)
+    include(${f})
+  endif()
 endforeach()
 
 set(CPACK_PACKAGE_NAME minisim)
