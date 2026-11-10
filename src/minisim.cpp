@@ -411,14 +411,16 @@ struct Sim {
     Pool pool;
     // `use`: run on at most this many threads (0: `threads`).
     template <class F>
-    void parallelFor(size_t n, F&& f, int use = 0) {
+    void parallelFor(size_t n, F&& f0, int use = 0) {
+        auto& f = f0;
+        using FF = std::remove_reference_t<F>;
         // A small batch is cheaper on this thread than a wake-up of the pool.
         // Nested (a task that calls parallelFor) runs on its own thread.
         int T = use > 0 ? std::min(use, threads) : threads;
         if (T <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
         pool.ensure(threads);
         tlInPar = true;
-        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f, T);
+        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<FF*>(c))(i); }, &f, T);
         tlInPar = false;
     }
 
@@ -459,6 +461,16 @@ struct Sim {
         }
     };
     Tuner domainTune[3];   // cycle domain (codegen.hpp): fused step, NBA compute, commit
+    Tuner combTune, partTune, seqTune;   // the event-driven batches: comb levels, partitions, clocked processes
+    // parallelFor with the thread count `t` picks. A batch too small for the
+    // pool runs here and is not measured.
+    template <class F>
+    void parallelTuned(Tuner& t, size_t n, F&& f) {
+        if (threads <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
+        int use = t.pick(threads);
+        parallelFor(n, std::forward<F>(f), use);
+        t.done(threads);
+    }
 
     // ---- static combinational schedule (prog.hpp: combShape / combSchedule) ----
     // combs[r] is the process of rank r. Ranks are in topological order and
@@ -479,7 +491,33 @@ struct Sim {
     vector<Comb> combs;
     vector<vector<int>> combOf;                      // signal -> ranks that read it
     vector<char> combPend;
-    priority_queue<int, vector<int>, greater<int>> combq;
+    // The pending combinational processes, lowest rank first: one bit per
+    // rank. A heap push and pop per wake was a tenth of Ibex's run time.
+    struct RankQ {
+        vector<uint64_t> bits;
+        size_t n = 0, lo = 0;   // count; no bit is set below word `lo`
+        bool empty() const { return n == 0; }
+        size_t size() const { return n; }
+        void push(int r) {
+            size_t w = (size_t)r >> 6;
+            if (w >= bits.size()) bits.resize(w + 1, 0);
+            uint64_t b = 1ULL << (r & 63);
+            if (bits[w] & b) return;
+            bits[w] |= b;
+            n++;
+            if (w < lo) lo = w;
+        }
+        int top() {
+            while (!bits[lo]) lo++;
+            return (int)(lo * 64 + (size_t)__builtin_ctzll(bits[lo]));
+        }
+        void pop() {
+            int r = top();
+            bits[(size_t)r >> 6] &= bits[(size_t)r >> 6] - 1;
+            if (--n == 0) lo = 0;
+        }
+    };
+    RankQ combq;
     int curComb = -1;
     vector<int> combBatch;
     vector<Val> combVals;
@@ -509,7 +547,7 @@ struct Sim {
                 combBatch.push_back(r);
             }
             combVals.resize(combBatch.size());
-            parallelFor(combBatch.size(), [&](size_t k) {
+            parallelTuned(combTune, combBatch.size(), [&](size_t k) {
                 const Comb& c = combs[combBatch[k]];
                 if (c.compute) combVals[k] = c.compute(c.ctx);
             });
@@ -670,7 +708,7 @@ struct Sim {
         bool wave = waving();
         if (g_cov && togRise.size() < sigs.size()) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
         for (int p : partsBusy) parts[p].wave = wave;
-        parallelFor(partsBusy.size(), [&](size_t k) { runPart(parts[partsBusy[k]]); });
+        parallelTuned(partTune, partsBusy.size(), [&](size_t k) { runPart(parts[partsBusy[k]]); });
         if (wave)
             for (int p : partsBusy) {
                 for (auto& [sg, v] : parts[p].changed) dump(sg, v);
@@ -699,7 +737,7 @@ struct Sim {
     void runSeqs() {
         if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
-        parallelFor(seqq.size(), [&](size_t k) {
+        parallelTuned(seqTune, seqq.size(), [&](size_t k) {
             seqBufs[k].clear();
             seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
         });
@@ -2184,20 +2222,33 @@ struct Sim {
     bool (*vpiRegion)(int) = nullptr;
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
-        if (__builtin_expect(sigs[s].fl & (SF_HELD | SF_PART), 0)) {
-            if (sigs[s].fl & SF_HELD) return;   // forced: other writes are ignored
-            nv = keepHeld(s, nv);               // only some bits are held
+        Sig& g = sigs[s];
+        if (__builtin_expect(g.fl & (SF_HELD | SF_PART), 0)) {
+            if (g.fl & SF_HELD) return;   // forced: other writes are ignored
+            nv = keepHeld(s, nv);         // only some bits are held
         }
-        if (sigs[s].w <= 64) {
-            uint64_t m = sigs[s].w >= 64 ? ~0ULL : ((1ULL << sigs[s].w) - 1);
+        int o, n;
+        if (g.w <= 64) {
+            uint64_t m = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
             nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;
             nv.hi.clear();
-        } else nv = maskWidth(nv, sigs[s].w);
-        if (tlPart) { setLocal(s, nv); return; }
-        if (nv == sigs[s].val) return;
-        int o = bit0(sigs[s].val), n = bit0(nv);
-        if (g_cov) covToggle(s, sigs[s].val, nv);
-        sigs[s].val = nv;
+            if (tlPart) { setLocal(s, nv); return; }
+            Val& cur = g.val;   // no limbs: compare and copy the words, as == and = would
+            if (cur.hi.empty() ? nv.v == cur.v && nv.x == cur.x && nv.z == cur.z : nv == cur) return;
+            o = bit0(cur); n = bit0(nv);
+            if (g_cov) covToggle(s, cur, nv);
+            if (cur.hi.empty()) {
+                cur.v = nv.v; cur.x = nv.x; cur.z = nv.z; cur.w = nv.w;
+                cur.sgn = false; cur.real = nv.real; cur.str = nv.str;
+            } else cur = nv;
+        } else {
+            nv = maskWidth(nv, g.w);
+            if (tlPart) { setLocal(s, nv); return; }
+            if (nv == g.val) return;
+            o = bit0(g.val); n = bit0(nv);
+            if (g_cov) covToggle(s, g.val, nv);
+            g.val = nv;
+        }
         if (__builtin_expect(!pathIn.empty(), 0) && (size_t)s < pathIn.size() && pathIn[s]) lastChg[s] = now;
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
@@ -2433,7 +2484,7 @@ struct Sim {
     }
 };
 
-Sim S;
+inline Sim S;
 inline void Sim::closeHook(uint32_t fd) { S.fileClosed(fd); }
 
 // Frames and objects (expr.hpp): blocks of hidden signals made at run time.
@@ -2517,17 +2568,17 @@ struct WaitAny {
 static bool isA(int obj, int cls) { return classIsA((int)S.sigs[obj].val.v, cls); }
 
 // ---- the design + testbench ----
-int clk, rst, cnt;
+inline int clk, rst, cnt;
 
 // always #5 clk = ~clk;
-Task clockgen() {
+inline Task clockgen() {
     for (;;) {
         co_await Delay{5};
         S.set(clk, mk(!(S.get(clk).v & 1)));
     }
 }
 // always @(cnt) $display(...)
-Task monitor() {
+inline Task monitor() {
     for (;;) {
         co_await Wait{cnt, ANY};
         Val c = S.get(cnt);
@@ -2537,7 +2588,7 @@ Task monitor() {
     }
 }
 // initial begin clk=0; rst=1; #22 rst=0; #100 $finish; end
-Task stimulus() {
+inline Task stimulus() {
     S.set(clk, mk(0));
     S.set(rst, mk(1));
     co_await Delay{22};

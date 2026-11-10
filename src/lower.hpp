@@ -5713,9 +5713,73 @@ struct Lowerer {
                     items.push_back(std::move(loop));
                     break;
                 }
+                size_t nd = fc.loopDims.size(), nf = 0;
+                while (nf < nd && fc.loopDims[nf].range) nf++;
+                if (nf < nd) {   // foreach (q[i, j]) over containers of containers, maybe inside a fixed-size array
+                    for (size_t k = nf; k < nd; k++)
+                        if (fc.loopDims[k].range) unsupported("foreach constraint over a fixed-size array inside a container");
+                    // One loop per container level; the inner container is
+                    // the element the outer loop variable names, at solve time.
+                    std::function<void(size_t, int, std::vector<RandItem>&)> nest = [&](size_t k, int cont, std::vector<RandItem>& out) {
+                        if (k == nd) { constraintItems(fc.body, guard, out, before); return; }
+                        RandItem loop;
+                        loop.loopCont = cont;
+                        loop.loopVar = fresh(32);
+                        const Symbol* lv = fc.loopDims[k].loopVar;
+                        if (lv) symOverride[lv] = loop.loopVar;
+                        if (k + 1 < nd) {
+                            if (!dynShape(cont).elem) unsupported("foreach constraint: more dimensions than the container has");
+                            size_t r0 = consRefs.size();
+                            auto n = node(Op::DynElemRef, {ref(loop.loopVar, true)});
+                            n->sig = cont;
+                            int inner = elemRef(cont, n);
+                            loop.refs.insert(loop.refs.end(), consRefs.begin() + (long)r0, consRefs.end());
+                            consRefs.resize(r0);
+                            nest(k + 1, inner, loop.body);
+                        } else constraintItems(fc.body, guard, loop.body, before);
+                        if (lv) symOverride.erase(lv);
+                        out.push_back(std::move(loop));
+                    };
+                    if (nf == 0) {
+                        int d = dynSig(fc.arrayRef);
+                        if (d < 0) unsupported("foreach constraint over this array");
+                        nest(0, d, items);
+                        break;
+                    }
+                    auto fa = contArr(fc.arrayRef);   // int f[2][$]: each container of the fixed-size part
+                    if (!fa || fa->dims.size() != nf) unsupported("foreach constraint over this array");
+                    std::vector<int32_t> idx(nf);
+                    std::function<void(size_t)> fix = [&](size_t k) {
+                        if (k == nf) {
+                            std::vector<E> ks;
+                            for (int32_t v : idx) { Val cv = mk((uint64_t)(int64_t)v, 32); cv.sgn = true; ks.push_back(konst(cv)); }
+                            auto n = node(Op::ArrAddr, std::move(ks));
+                            n->arr = fa;
+                            size_t r0 = consRefs.size();
+                            int c = bindCont(std::move(n), *fa->dynElem);
+                            std::vector<std::pair<int, E>> refs(consRefs.begin() + (long)r0, consRefs.end());
+                            consRefs.resize(r0);
+                            size_t i0 = items.size();
+                            nest(nf, c, items);
+                            for (size_t q = i0; q < items.size(); q++) items[q].refs.insert(items[q].refs.end(), refs.begin(), refs.end());
+                            return;
+                        }
+                        const slang::ConstantRange& r = *fc.loopDims[k].range;
+                        const Symbol* lv = fc.loopDims[k].loopVar;
+                        int step = r.left <= r.right ? 1 : -1;
+                        for (int32_t v = r.left;; v += step) {
+                            idx[k] = v;
+                            if (lv) { Val cv = mk((uint64_t)(int64_t)v, 32); cv.sgn = true; constVals[lv] = cv; }
+                            fix(k + 1);
+                            if (v == r.right) break;
+                        }
+                        if (lv) constVals.erase(lv);
+                    };
+                    fix(0);
+                    break;
+                }
                 std::vector<std::pair<const Symbol*, slang::ConstantRange>> dims;
                 for (const auto& d : fc.loopDims) {
-                    if (!d.range) unsupported("foreach constraint over a dynamic array or queue inside more dimensions");
                     if (d.loopVar) dims.push_back({d.loopVar, *d.range});
                 }
                 std::function<void(size_t)> loop = [&](size_t k) {
@@ -6359,6 +6423,50 @@ struct Lowerer {
     // Whether two items of a unique case can match the same selector value:
     // 0 never, 1 only when the selector has x or z bits, 2 maybe. Only
     // constant labels are checked here; anything else is checked at run time.
+    // A unique / unique0 case with many items that may overlap. Checking
+    // "no later item matches" right after each match costs O(n^2) code (for
+    // Ibex's CSR decoder that made a 1.3 MB C++ function under -compile). So
+    // the first matching item k is recorded in `hit`, one shared pass looks
+    // for a later match (and reports once), then `hit` picks the statement.
+    // The items' conditions are evaluated in the same order as before.
+    void uniqueCaseLinear(const slang::ast::Statement& s, const slang::ast::CaseStatement& c,
+                          const std::vector<E>& conds, const E& selUnknown) {
+        size_t n = c.items.size();
+        int hit = fresh(32);
+        auto num = [](size_t k) { return konst(make(k, 0, 32)); };
+        std::vector<size_t> toCheck, toEnd;
+        for (size_t k = 0; k < n; k++) {
+            size_t jf = emitJmpIfNot(conds[k]);
+            Instr a; a.k = IK::Assign; a.sig = hit; a.e = num(k); prog.emit(a);
+            Instr j; j.k = IK::Jmp; toCheck.push_back(prog.emit(j));
+            prog.code[jf].target = prog.here();
+        }
+        // No item matched.
+        bool needAll = c.check == slang::ast::UniquePriorityCheck::Unique;
+        if (c.defaultCase) stmt(*c.defaultCase);
+        else if (needAll) violation(s, checkName(c.check) + " case: no case item matches", c.check);
+        { Instr j; j.k = IK::Jmp; toEnd.push_back(prog.emit(j)); }
+        // A later item that also matches.
+        for (size_t k : toCheck) prog.code[k].target = prog.here();
+        std::vector<size_t> toPick;
+        for (size_t m = 1; m < n; m++) {
+            E later = bin(Op::LogAnd, bin(Op::Lt, ref(hit), num(m)), conds[m]);
+            if (selUnknown) later = bin(Op::LogAnd, selUnknown, later);
+            size_t jf = emitJmpIfNot(later);
+            violation(s, checkName(c.check) + " case: more than one case item matches", c.check);
+            Instr j; j.k = IK::Jmp; toPick.push_back(prog.emit(j));
+            prog.code[jf].target = prog.here();
+        }
+        for (size_t k : toPick) prog.code[k].target = prog.here();
+        // Run the matched item.
+        for (size_t k = 0; k < n; k++) {
+            size_t jf = emitJmpIfNot(bin(Op::Eq, ref(hit), num(k)));
+            stmt(*c.items[k].stmt);
+            Instr j; j.k = IK::Jmp; toEnd.push_back(prog.emit(j));
+            prog.code[jf].target = prog.here();
+        }
+        for (size_t k : toEnd) prog.code[k].target = prog.here();
+    }
     static int caseMayOverlap(const slang::ast::CaseStatement& c) {
         using namespace slang::ast;
         using slang::logic_t;
@@ -7316,6 +7424,10 @@ struct Lowerer {
                 if (ov == 1)
                     selUnknown = bin(Op::Ne, sysFnNode(SF_COUNTBITS, {expr(c.expr)}, 12), konst(make(0, 0, 32, 0, true)));
                 std::vector<size_t> toEnd;
+                if (mayOverlap && c.items.size() > 8) {   // many items: a check of linear size
+                    uniqueCaseLinear(s, c, conds, selUnknown);
+                    break;
+                }
                 for (size_t k = 0; k < c.items.size(); k++) {
                     Instr j; j.k = IK::JmpIfNot; j.e = conds[k];
                     size_t jf = prog.emit(j);

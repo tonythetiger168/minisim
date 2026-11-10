@@ -52,6 +52,8 @@
 //                    siblings last (default: pin, except under a hypervisor)
 //   -cpuinfo         print the detected CPU topology and exit
 //   -cc <compiler>   C++ compiler for -compile (default $CXX, else c++)
+//   -cfiles <n>      -compile: build the design as up to n C++ files in parallel
+//                    (default: one per core, 16 at most, for a large design)
 //   -O<n>            optimization level for -compile (default -O2)
 //   -keyfile [[<owner>:]<key_keyname>=]<private.pem>
 //                    an RSA private key for protected envelopes (`pragma
@@ -105,6 +107,7 @@
 //
 // Exit status: 0 when the simulation ran, 1 on a compile or lowering error,
 // 2 on a bad command line.
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -289,6 +292,56 @@ struct Plan {
     std::vector<char> seq;
     std::vector<std::vector<std::pair<int, Edge>>> ev;
 };
+// A wire or variable whose drivers are all strong continuous assigns to
+// fixed, disjoint bit ranges that cover it (assign w = ..., or assign w[k]
+// = ... in a generate loop, one field of a packed struct per assign)
+// resolves to those values side by side. Its assigns then write their bits
+// directly, without driver resolution: Ibex's ALU drives a 32-bit net bit
+// by bit, and resolving 32 drivers on each of 32 writes was a tenth of its
+// run time; the drive of its ~1700 single-driver nets was another quarter.
+static void mergePartialDrivers(LowerResult& lowered) {
+    if (!S.varPathDrv.empty() || !S.loadsOf.empty() || !lowered.netDelays.empty()) return;
+    for (auto& t : S.tranOf) if (!t.empty()) return;
+    for (uint8_t b : S.pathIn) if (b) return;
+    size_t ns = S.sigs.size();
+    std::vector<std::vector<Instr*>> by(ns);
+    std::vector<char> bad(ns, 0);
+    for (auto& [s, k] : lowered.netKinds)
+        if ((size_t)s < ns) bad[(size_t)s] = 1;   // wand, trireg, ...: not set on S yet
+    for (auto& lp : lowered.procs)
+        for (auto& i : lp.prog.code)
+            if (i.k == IK::Force) return;   // release goes back to the drivers (10.6.2)
+    for (auto& lp : lowered.procs) {
+        auto& code = lp.prog.code;
+        // Only a continuous assign: Assign, wait, jump back.
+        bool contAssign = code.size() == 3 && code[0].k == IK::Assign && code[1].k == IK::WaitEdge;
+        for (auto& i : code) {
+            if (i.k != IK::Assign || i.drv < 0 || i.sig < 0 || (size_t)i.sig >= ns) continue;
+            bool ok = contAssign && i.dyn < 0 && i.gate < 0 && !i.arr && i.aidx.empty() && !i.bidx && !i.de && !i.delay && i.dly.empty() &&
+                      i.s0 == STR_STRONG && i.s1 == STR_STRONG;
+            if (ok) by[i.sig].push_back(&i); else bad[i.sig] = 1;
+        }
+    }
+    for (size_t s = 0; s < ns; s++) {
+        auto& g = S.sigs[s];
+        if (bad[s] || by[s].empty() || by[s].size() != g.drv.size() || g.kind != NR_WIRE) continue;
+        if (s < S.tranOf.size() && !S.tranOf[s].empty()) continue;
+        std::vector<char> used(g.w, 0);
+        bool disjoint = true;
+        for (Instr* i : by[s])
+            for (int b = i->hi < 0 ? 0 : i->lo, h = i->hi < 0 ? g.w - 1 : i->hi; b <= h && disjoint; b++) {
+                if (b < 0 || b >= g.w || used[b]) disjoint = false;
+                else used[b] = 1;
+            }
+        // Every bit has its one driver, so no bit resolves to Z (or keeps
+        // a variable's initial value) for want of one.
+        for (char u : used) disjoint &= u != 0;
+        if (!disjoint) continue;
+        for (Instr* i : by[s]) i->drv = -1;
+        g.drv.clear();
+    }
+}
+
 static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     size_t n = lowered.procs.size();
     Plan p;
@@ -367,6 +420,7 @@ static bool readCompiledCov(const std::string& path, const std::vector<std::pair
     return ok;
 }
 
+static int g_cfiles = 0;   // -cfiles: 0 = automatic
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
@@ -403,7 +457,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     }
     try {
         // With a VCD every signal must live in S.sigs, so no private signals.
-        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr);
+        // A large design is built as several files at once, one per core (16 at most).
+        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr,
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()));
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -417,6 +473,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (lockFd >= 0) ::flock(lockFd, LOCK_EX);
     struct Unlock { int fd; ~Unlock() { if (fd >= 0) ::close(fd); } } unlock{lockFd};
     std::string build = shq(cc) + " -std=c++20 " + opt + " -I" + shq(inc) + " " + shq(cpp) + " -o " + shq(exe);
+    std::string fstC, fstL;   // FST: extra compile and link arguments
     // An FST waveform: build simv with libfst too. Its C sources are compiled
     // once into <dir>/fst/*.o with $CC (default cc).
     if (vcdPath && vcdPath->ends_with(".fst")) {
@@ -438,6 +495,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             if (std::system(c.c_str()) != 0) { std::cerr << "msim: -compile: libfst build failed: " << c << "\n"; return 1; }
         }
         build += " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fd) + objs + " -lz -pthread";
+        fstC = " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fd);
+        fstL = objs + " -lz -pthread";
     }
     // Build cache: the same generated source, compiler command and kernel
     // sources as the simv already in `dir` reuse it. A rebuild of a large
@@ -455,7 +514,63 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                  std::to_string(ec ? 0 : (long long)t.time_since_epoch().count()) + "\n";
     }
     std::error_code ec;
-    bool fresh = std::filesystem::exists(exe, ec) && slurp(dir + "/simv.stamp") == stamp && slurp(cpp) == src;
+    // Several files (codegen split a large design): each compiles on its own
+    // core, and a file the same as last time keeps its object.
+    std::vector<std::pair<std::string, std::string>> files;
+    for (size_t at = src.rfind(kFileMark, 0) == 0 ? 0 : std::string::npos; at != std::string::npos;) {
+        size_t nl = src.find('\n', at), next = src.find(std::string("\n") + kFileMark, nl);
+        std::string name = src.substr(at + std::strlen(kFileMark), nl - at - std::strlen(kFileMark));
+        files.push_back({name, src.substr(nl + 1, next == std::string::npos ? std::string::npos : next + 1 - (nl + 1))});
+        at = next == std::string::npos ? next : next + 1;
+    }
+    if (!files.empty()) {
+        std::string cflags = " -std=c++20 " + opt + " -I" + shq(inc) + fstC;
+        stamp = cflags + fstL + "\n" + stamp;
+        bool sameFlags = slurp(dir + "/simv.stamp") == stamp;
+        bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
+        std::filesystem::remove(dir + "/simv.stamp", ec);
+        std::vector<std::string> jobs, objs;
+        for (auto& [name, text] : files) {
+            std::string path = dir + "/" + name;
+            bool same = slurp(path) == text;
+            if (!same) {
+                std::ofstream f(path, std::ios::binary);
+                f << text;
+                if (!f) { std::cerr << "msim: cannot write " << path << "\n"; return 1; }
+            }
+            if (!name.ends_with(".cpp")) continue;
+            std::string obj = path.substr(0, path.size() - 4) + ".o";
+            objs.push_back(obj);
+            if (same && hdrSame && sameFlags && std::filesystem::exists(obj, ec)) continue;
+            std::filesystem::remove(obj, ec);
+            jobs.push_back(shq(cc) + cflags + " -c " + shq(path) + " -o " + shq(obj));
+        }
+        // Remove parts left from an earlier, larger split.
+        for (int k = (int)files.size() - 2;; k++) {
+            std::string old = dir + "/part" + std::to_string(k);
+            if (!std::filesystem::exists(old + ".cpp", ec)) break;
+            std::filesystem::remove(old + ".cpp", ec);
+            std::filesystem::remove(old + ".o", ec);
+        }
+        std::atomic<size_t> next{0};
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> pool;
+        for (int t = 0; t < std::min<int>(maxThreads(), (int)jobs.size()); t++)
+            pool.emplace_back([&] {
+                for (size_t j; (j = next++) < jobs.size();)
+                    if (std::system(jobs[j].c_str()) != 0) { failed = true; std::cerr << "msim: -compile: C++ build failed: " << jobs[j] << "\n"; }
+            });
+        for (auto& t : pool) t.join();
+        if (failed) return 1;
+        if (!jobs.empty() || !std::filesystem::exists(exe, ec)) {
+            std::string link = shq(cc) + " " + opt;
+            for (auto& o : objs) link += " " + shq(o);
+            link += fstL + " -o " + shq(exe);
+            if (std::system(link.c_str()) != 0) { std::cerr << "msim: -compile: link failed: " << link << "\n"; return 1; }
+        }
+        std::ofstream(dir + "/simv.stamp") << stamp;
+    }
+    bool fresh = !files.empty() || (std::filesystem::exists(exe, ec) && slurp(dir + "/simv.stamp") == stamp && slurp(cpp) == src);
     if (!fresh) {
         std::filesystem::remove(dir + "/simv.stamp", ec);
         {
@@ -654,6 +769,7 @@ static void usage() {
                  "                 and reuses <dir>/simv while the design is unchanged\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
                  "  -cc <cxx>      C++ compiler for -compile (default $CXX, else c++)\n"
+                 "  -cfiles <n>    -compile: build in up to n C++ files at once (default: one per core, 16 at most)\n"
                  "  -threads <n>   worker threads, or all (default: one per physical P core, max 8)\n"
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
@@ -748,6 +864,7 @@ int main(int argc, char** argv) {
         if (a == "-power_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
         if (a == "-upf_verbose" || a == "+upf_verbose") { upfVerbose = true; continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
+        if (a == "-cfiles") { g_cfiles = std::max(1, std::atoi(next("a file count").c_str())); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (prot.take(argc, argv, i)) continue;
         if (a == "+vcd") { vcdPath = "dump.vcd"; continue; }
@@ -1141,6 +1258,11 @@ int main(int argc, char** argv) {
     // SDF DEVICE may give gates new delays (32.4.1): their drivers then
     // run the plain way.
     if ((!sdfRequests().empty() || sdfAtRunTime()) && !gateRecs().empty()) staticComb = staticSeq = false;
+    // Paths, SDF and gate delays (30-32) act on drivers; tran and net kinds
+    // resolve them: those designs keep every driver.
+    if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
+        gateRecs().empty())
+        mergePartialDrivers(lowered);   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
@@ -1206,7 +1328,7 @@ int main(int argc, char** argv) {
     for (int i : byRank) {
         if (i < 0) continue;
         const Prog* pr = &lowered.procs[i].prog;
-        if (pl.body[i] == 1) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
+        if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
     for (size_t i = 0; i < lowered.procs.size(); i++) {

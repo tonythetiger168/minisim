@@ -556,7 +556,8 @@ inline Instr waitInstr(const std::vector<std::pair<int, Edge>>& ev) {
 // ---- static combinational schedule ----
 // A process with this shape is pure combinational logic:
 //     Assign ... Assign ; WaitEdge (every event ANY) ; Jmp 0
-// i.e. a continuous assign, a gate, or a straight-line always_comb / always @*.
+// i.e. a continuous assign, a gate, or an always_comb / always @* whose body
+// is assignments and jumps within it (if, case, for).
 // Such a process can run as a plain function, levelized like Verilator and
 // VCS do: the kernel keeps the functions in one topological order and, when a
 // signal changes, runs the dependent ones in that order once each, without a
@@ -565,7 +566,8 @@ inline Instr waitInstr(const std::vector<std::pair<int, Edge>>& ev) {
 // assigns.
 struct CombShape {
     std::vector<int> ins, outs;
-    size_t body = 0;  // number of leading Assign instructions
+    size_t body = 0;  // instructions before the wait: Assigns, and jumps within them when `branches`
+    bool branches = false;
 };
 inline bool combShape(const Prog& p, CombShape& c) {
     size_t n = p.code.size();
@@ -576,6 +578,12 @@ inline bool combShape(const Prog& p, CombShape& c) {
     if (!p.roots.empty()) return false;  // another process can `disable` it
     c = CombShape{};
     for (size_t i = 0; i + 2 < n; i++) {
+        // An always_comb with if / case / loops: jumps that stay in the body.
+        if (p.code[i].k == IK::JmpIfNot || p.code[i].k == IK::Jmp) {
+            if (p.code[i].target > n - 2) return false;
+            c.branches = true;
+            continue;
+        }
         if (p.code[i].k != IK::Assign) return false;
         // A target chosen at run time (a[i] = ..., v[i] = ...) has no fixed output signal.
         if (p.code[i].arr || !p.code[i].aidx.empty() || p.code[i].bidx) return false;

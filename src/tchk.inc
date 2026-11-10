@@ -94,7 +94,7 @@ inline void report(const TimingCheck& tc, int k0, int64_t tk0, int64_t tk1) {
     else violation(tc, tk1, tk0);
 }
 
-Task timer(int id, uint64_t gen, uint64_t d);
+inline Task timer(int id, uint64_t gen, uint64_t d);
 inline void startTimer(int id, State& st, int64_t lim) {
     Task t = timer(id, st.gen, (uint64_t)lim);
     S.all.push_back(t.h);
@@ -147,7 +147,7 @@ inline void timeout(int id, uint64_t gen) {
     st.active = false;
     st.gen++;
 }
-Task timer(int id, uint64_t gen, uint64_t d) {
+inline Task timer(int id, uint64_t gen, uint64_t d) {
     co_await Delay{d};
     co_await Delay{0};   // after a timestamp event at the same time (31.4.2)
     timeout(id, gen);
@@ -287,7 +287,7 @@ inline void deliver(int id, const bool changed[2], const uint8_t tr[2]) {
     }
 }
 
-Task deliverLater(int id, int k, uint8_t tr, uint64_t d) {
+inline Task deliverLater(int id, int k, uint8_t tr, uint64_t d) {
     co_await Delay{d};
     bool ch[2] = {false, false};
     uint8_t t2[2] = {0, 0};
@@ -322,7 +322,7 @@ inline void step(int id) {
     if (now0[0] || now0[1]) deliver(id, now0, tr);
 }
 
-Task proc(int id) {
+inline Task proc(int id) {
     const TimingCheck& tc = timingChecks()[(size_t)id];
     State& st = states()[(size_t)id];
     for (int k = 0; k < tc.nev; k++) st.prev[k] = eval(tc.ev[k].e, rd);
@@ -341,11 +341,11 @@ namespace tchk {
 // A delayed signal (31.9): dst follows src, each change d later. Every
 // change is kept (a transport delay), so a pulse shorter than d still
 // arrives.
-Task copyLater(int dst, Val v, uint64_t d) {
+inline Task copyLater(int dst, Val v, uint64_t d) {
     co_await Delay{d};
     S.set(dst, v);
 }
-Task copyProc(int src, int dst, uint64_t d) {
+inline Task copyProc(int src, int dst, uint64_t d) {
     S.set(dst, S.get(src));
     for (;;) {
         co_await Wait{src, ANY};

@@ -18,6 +18,9 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Foreach constraints with several loop variables over containers of
+  containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
+  over a fixed-size array of queues and associative arrays with string keys.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
