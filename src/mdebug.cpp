@@ -128,7 +128,7 @@ struct Guard {
 
 struct Driver {
     const Symbol* target = nullptr;
-    std::string kind;                     // assign, always_ff, always_comb, always, initial, final, port
+    std::string kind;                     // assign, always_ff, always_comb, always, initial, final, port, "task name"
     SourceLocation loc;
     SourceRange range;                    // the assignment as written; empty for a port
     const Expression* rhs = nullptr;      // null for an output port
@@ -136,6 +136,7 @@ struct Driver {
     bool seq = false;
     bool whole = false;                   // assigns the whole target, not a select of it
     std::string clock;                    // the event control as written, when seq
+    std::string how;                      // "", or force, assign (procedural), call (an output argument)
     int block = -1;                       // which process; -1 outside one
     std::vector<const Symbol*> reads;     // data: the right-hand side
     std::vector<const Symbol*> creads;    // control: guards and select indices
@@ -210,28 +211,80 @@ struct Walker {
     Driver proto;               // kind, seq, clock, block
     std::vector<Guard> gs;
 
-    void assign(const AssignmentExpression& a) {
+    void controls(Driver& d) {
+        d.guards = gs;
+        for (const Guard& g : gs) {
+            if (g.cond) namesIn(*g.cond, d.creads);
+            if (g.cs) {
+                namesIn(g.cs->expr, d.creads);
+                if (g.kind == Guard::CaseItem)
+                    for (const Expression* e : g.cs->items[g.item].expressions) namesIn(*e, d.creads);
+            }
+        }
+    }
+
+    // A task or function call: each output, inout or ref argument is driven
+    // by the call, from the arguments that go in.
+    void call(const CallExpression& c) {
+        std::vector<const Expression*> outs;
+        std::vector<const Symbol*> ins;
+        for (const Expression* a : c.arguments()) {
+            if (a->kind == ExpressionKind::Assignment &&
+                a->as<AssignmentExpression>().right().kind == ExpressionKind::EmptyArgument)
+                outs.push_back(&a->as<AssignmentExpression>().left());
+            else
+                namesIn(*a, ins);
+        }
+        // What goes in reaches the task's own assignments through its formals.
+        if (c.subroutine.index() == 0) {
+            auto formals = std::get<0>(c.subroutine)->getArguments();
+            auto args = c.arguments();
+            for (size_t i = 0; i < formals.size() && i < args.size(); i++) {
+                if (args[i]->kind == ExpressionKind::Assignment || args[i]->kind == ExpressionKind::EmptyArgument) continue;
+                Driver d = proto;
+                d.how = "call";
+                d.target = formals[i];
+                d.loc = c.sourceRange.start();
+                d.range = c.sourceRange;
+                namesIn(*args[i], d.reads);
+                controls(d);
+                db.add(std::move(d));
+            }
+        }
+        for (const Expression* o : outs) {
+            std::vector<const Symbol*> targets, idx;
+            lhsTargets(*o, targets, idx);
+            for (const Symbol* t : targets) {
+                Driver d = proto;
+                d.how = "call";
+                d.target = t;
+                d.loc = c.sourceRange.start();
+                d.range = c.sourceRange;
+                d.reads = ins;
+                d.creads = idx;
+                controls(d);
+                db.add(std::move(d));
+            }
+        }
+    }
+
+    // how: "" for a plain assignment, "force" or "assign" for the procedural
+    // continuous forms, which override the other drivers while they hold.
+    void assign(const AssignmentExpression& a, const char* how = "") {
         std::vector<const Symbol*> targets, idx;
         lhsTargets(a.left(), targets, idx);
         for (const Symbol* t : targets) {
             Driver d = proto;
+            d.how = how;
             d.target = t;
             d.loc = a.sourceRange.start();
             d.range = a.sourceRange;
             d.rhs = &a.right();
             d.whole = a.left().kind == ExpressionKind::NamedValue ||
                       a.left().kind == ExpressionKind::HierarchicalValue;
-            d.guards = gs;
             namesIn(a.right(), d.reads);
             d.creads = idx;
-            for (const Guard& g : gs) {
-                if (g.cond) namesIn(*g.cond, d.creads);
-                if (g.cs) {
-                    namesIn(g.cs->expr, d.creads);
-                    if (g.kind == Guard::CaseItem)
-                        for (const Expression* e : g.cs->items[g.item].expressions) namesIn(*e, d.creads);
-                }
-            }
+            controls(d);
             db.add(std::move(d));
         }
     }
@@ -252,6 +305,13 @@ struct Walker {
             case StatementKind::ExpressionStatement: {
                 const Expression& e = s.as<ExpressionStatement>().expr;
                 if (e.kind == ExpressionKind::Assignment) assign(e.as<AssignmentExpression>());
+                else if (e.kind == ExpressionKind::Call) call(e.as<CallExpression>());
+                break;
+            }
+            case StatementKind::ProceduralAssign: {
+                const auto& pa = s.as<ProceduralAssignStatement>();
+                if (pa.assignment.kind == ExpressionKind::Assignment)
+                    assign(pa.assignment.as<AssignmentExpression>(), pa.isForce ? "force" : "assign");
                 break;
             }
             case StatementKind::Conditional: {
@@ -295,7 +355,13 @@ struct Walker {
                 gs.push_back(Guard{});
                 s.visit(makeVisitor(
                     [&](auto& v, std::derived_from<Statement> auto& inner) { v.visitDefault(inner); },
-                    [&](auto&, const AssignmentExpression& a) { assign(a); }));
+                    [&](auto&, const AssignmentExpression& a) {
+                        if (a.right().kind != ExpressionKind::EmptyArgument) assign(a);
+                    },
+                    [&](auto& v, const CallExpression& c) {
+                        call(c);
+                        v.visitDefault(c);
+                    }));
                 gs.pop_back();
                 break;
             }
@@ -320,7 +386,20 @@ struct Collect : ASTVisitor<Collect> {
         db.byPath[path(v)] = &v;
     }
     void handle(const VariableSymbol& v) { signal(v); }
-    void handle(const NetSymbol& v) { signal(v); }
+    void handle(const NetSymbol& v) {
+        signal(v);
+        // wire n = a + b; is a continuous assignment.
+        if (const Expression* init = v.getInitializer(); init && db.sigIx.count(&v)) {
+            Driver d;
+            d.kind = "assign";
+            d.target = &v;
+            d.loc = v.location;
+            d.rhs = init;
+            d.whole = true;
+            namesIn(*init, d.reads);
+            db.add(std::move(d));
+        }
+    }
 
     void handle(const GenerateBlockSymbol& g) {
         if (g.isUninstantiated) return;
@@ -375,6 +454,20 @@ struct Collect : ASTVisitor<Collect> {
         Walker w{db, {}, {}};
         w.proto.kind = "assign";
         w.assign(e.as<AssignmentExpression>());
+    }
+
+    // A task or function declared in the design writes its signals like any
+    // process does; the body is one block.
+    void handle(const SubroutineSymbol& sub) {
+        const Scope* sc = sub.getParentScope();
+        if (!sc) return;
+        SymbolKind k = sc->asSymbol().kind;
+        if (k != SymbolKind::InstanceBody && k != SymbolKind::GenerateBlock) return;
+        if (sub.flags.has(MethodFlags::DPIImport) || sub.flags.has(MethodFlags::Pure)) return;
+        Walker w{db, {}, {}};
+        w.proto.kind = (sub.subroutineKind == SubroutineKind::Task ? "task " : "function ") + std::string(sub.name);
+        w.proto.block = nblock++;
+        w.walk(sub.getBody());
     }
 
     void handle(const ProceduralBlockSymbol& p) {
@@ -661,6 +754,7 @@ struct Tool {
     std::string label(const Driver& d) {
         std::string s = d.kind;
         if (!d.clock.empty()) s += " " + d.clock;
+        if (!d.how.empty()) s += ", " + d.how;
         return s;
     }
 
@@ -738,9 +832,72 @@ struct Tool {
             for (const Symbol* c : d.creads)
                 if (std::find(in.begin(), in.end(), c) == in.end()) in.push_back(c);
             for (const Symbol* r : in)
-                if (db.sigIx.count(r)) cone(r, depth - 1, indent + 2, onPath);
+                if (db.sigIx.count(r) || db.driversOf.count(r)) cone(r, depth - 1, indent + 2, onPath);
         }
         onPath.erase(s);
+    }
+
+    // The block view of one scope: its instances, what each port connects
+    // to, and which instance feeds which.
+    bool blocks(const std::string& name) {
+        auto parent = [](const std::string& p) { size_t d = p.rfind('.'); return d == std::string::npos ? std::string() : p.substr(0, d); };
+        auto leaf = [](const std::string& p) { size_t d = p.rfind('.'); return d == std::string::npos ? p : p.substr(d + 1); };
+        const ScopeRec* sc = nullptr;
+        int n = 0;
+        for (auto& r : db.scopes) {
+            if (r.path == name) { sc = &r; n = 1; break; }
+            if (r.path.size() > name.size() && r.path.compare(r.path.size() - name.size() - 1, std::string::npos, "." + name) == 0) { sc = &r; n++; }
+        }
+        if (n != 1) {
+            std::cerr << "mdebug: " << (n ? "more than one instance ends in '" : "no instance '") << name << "'\n";
+            return false;
+        }
+        struct Blk { const ScopeRec* r; std::vector<std::string> in, out; };
+        std::vector<Blk> bs;
+        std::map<std::string, size_t> ix;
+        for (auto& r : db.scopes)
+            if (parent(r.path) == sc->path) { ix[r.path] = bs.size(); bs.push_back({&r, {}, {}}); }
+        // net in this scope -> the ports that drive it, and the ports it feeds
+        std::map<std::string, std::vector<std::string>> from, to;
+        for (const Driver& d : db.drivers) {
+            if (d.kind != "port" || !db.sigIx.count(d.target)) continue;
+            std::string tp = path(*d.target), ts = parent(tp);
+            if (auto it = ix.find(ts); it != ix.end()) {
+                if (!d.rhs) continue;   // an output of an instance one level further down
+                std::string nets;
+                for (const Symbol* r : d.reads) {
+                    if (!db.sigIx.count(r)) continue;
+                    std::string rp = path(*r);
+                    nets += (nets.empty() ? "" : ", ") + rp;
+                    to[rp].push_back(leaf(ts) + "." + leaf(tp));
+                }
+                if (nets.empty()) nets = d.rhs ? db.src.text(d.rhs->sourceRange) : "?";
+                bs[it->second].in.push_back(leaf(tp) + " <- " + nets);
+            }
+            else if (ts == sc->path) {
+                for (const Symbol* r : d.reads) {
+                    if (!db.sigIx.count(r)) continue;
+                    std::string rp = path(*r);
+                    auto jt = ix.find(parent(rp));
+                    if (jt == ix.end()) continue;
+                    bs[jt->second].out.push_back(leaf(rp) + " -> " + tp);
+                    from[tp].push_back(leaf(parent(rp)) + "." + leaf(rp));
+                }
+            }
+        }
+        std::cout << "blocks of " << sc->path << ": " << bs.size() << "\n";
+        for (auto& b : bs) {
+            std::cout << "  " << leaf(b.r->path) << " (" << b.r->def << ")\n";
+            for (auto& l : b.in) std::cout << "    in  " << l << "\n";
+            for (auto& l : b.out) std::cout << "    out " << l << "\n";
+        }
+        for (auto& [net, srcs] : from) {
+            auto it = to.find(net);
+            if (it == to.end()) continue;
+            for (auto& a : srcs)
+                for (auto& b : it->second) std::cout << "  " << a << " -> " << b << "  (" << net << ")\n";
+        }
+        return true;
     }
 
     bool trace(const std::string& name, int depth) {
@@ -1152,6 +1309,7 @@ void usage() {
                  "  -threads N       threads for parsing and for reading the waveform\n"
                  "                   (default: every logical core; the output is the same for any N)\n"
                  "  -scopes          list the instances    -signals  list the signals\n"
+                 "  -blocks INST     the instances inside INST, their port connections and what feeds what\n"
                  "  -html <file>     write a one-file viewer: hierarchy, source, drivers and\n"
                  "                   loads, a schematic of the cone, and waves when -vcd is given\n"
                  "  -json <file>     write the debug database the viewer reads\n"
@@ -1188,6 +1346,7 @@ int main(int argc, char** argv) {
             std::cout << "mdebug " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
             return 0;
         }
+        if (a == "-blocks") { queries.push_back({"blocks", next("an instance"), -1, std::nullopt}); continue; }
         if (a == "-drivers" || a == "-loads" || a == "-trace" || a == "-active") {
             queries.push_back({a.substr(1), next("a signal"), -1, std::nullopt});
             continue;
@@ -1231,6 +1390,7 @@ int main(int argc, char** argv) {
     for (const Query& q : queries) {
         if (q.what == "drivers") ok &= tool.drivers(q.arg);
         else if (q.what == "loads") ok &= tool.loads(q.arg);
+        else if (q.what == "blocks") ok &= tool.blocks(q.arg);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")

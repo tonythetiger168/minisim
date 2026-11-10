@@ -10,6 +10,11 @@ Spec references are IEEE 1800-2023 clauses.
 ### Added
 - `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
   and transitions of FSMs), in the totals, the history and `mplan init`.
+- `mdebug -blocks INST`, and a block diagram in the viewer: the instances
+  inside a scope, their port connections and which instance feeds which.
+- `mdebug`: tasks and functions in a module, call output arguments, `force`,
+  procedural `assign` and net declaration assignments are drivers and loads;
+  the fan-in cone follows a task argument to its calls.
 - `memu`, emulation and FPGA prototyping: puts a gate-level netlist
   (structural Verilog over a Liberty library) on a board of FPGAs. Clock
   conversion onto one free-running clock (strobes for clean clocks, edge
