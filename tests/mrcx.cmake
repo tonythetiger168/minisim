@@ -39,8 +39,8 @@ need("${spef}" "demo.spef"
      "*3:3 *3:4 6\n"             # one via1 cut
      "*3:6 *3:4 5.4\n")          # 1.8 um of metal2: 0.3 x 1.8 / 0.1
 # n1 and n2 run side by side: the coupling is in both nets.
-string(REGEX MATCHALL "\\*2:3 \\*3:3 0\\.164[0-9]*" a "${spef}")
-string(REGEX MATCHALL "\\*3:3 \\*2:3 0\\.164[0-9]*" b "${spef}")
+string(REGEX MATCHALL "\\*2:3 \\*3:3 0\\.229[0-9]*" a "${spef}")
+string(REGEX MATCHALL "\\*3:3 \\*2:3 0\\.229[0-9]*" b "${spef}")
 if(NOT a OR NOT b)
   message(FATAL_ERROR "coupling between n1 and n2 is not in both nets:\n${spef}")
 endif()

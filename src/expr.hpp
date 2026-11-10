@@ -1444,8 +1444,16 @@ enum SysFnId : int {
     SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
     SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
     SF_FREAD_GET,        // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
-    SF_SDF               // $sdf_annotate (32.9) with arguments known only at run time: g_sdfHook
+    SF_SDF,              // $sdf_annotate (32.9) with arguments known only at run time: g_sdfHook
+    // msim -xprop: was the edge that woke this process ambiguous? Each kid
+    // is a constant naming one event of its event control: signal << 2 |
+    // negedge << 1 | level (the body tests the signal's level). 1 when an
+    // edge that happened in this time step went from or to x / z and none
+    // certainly happened.
+    SF_XPROP_EDGE
 };
+// The kernel's answer for one event (0 no edge now, 1 a certain edge, 2 an ambiguous one).
+inline int (*g_edgeClass)(int sig, bool neg, bool level) = nullptr;
 enum UpfOp : int { UPF_SUPPLY_ON, UPF_SUPPLY_OFF, UPF_SUPPLY_PARTIAL_ON, UPF_SET_SUPPLY_STATE, UPF_SET_POWER_STATE,
                    UPF_GET_SUPPLY_VALUE, UPF_ISO, UPF_LS };
 inline Val (*g_upfHook)(int op, const std::vector<Val>& a) = nullptr;
@@ -1876,6 +1884,15 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
     auto i32 = [&](const Val& v) { return (int32_t)(uint32_t)u64(v); };
     auto sint = [](int64_t x) { Val r = make((uint64_t)(uint32_t)x, 0, 32, 0); r.sgn = true; return r; };
     switch (id) {
+        case SF_XPROP_EDGE: {
+            bool def = false, amb = false;
+            for (const Val& x : a) {
+                int c = g_edgeClass ? g_edgeClass((int)(x.v >> 2), (x.v >> 1) & 1, x.v & 1) : 0;
+                def |= c == 1;
+                amb |= c == 2;
+            }
+            return mk(!def && amb, 1);
+        }
         case SF_CLOG2: {
             if (anyX(a[0])) return xfill(32, true);
             // the ceiling of log2, for a value up to its full width
@@ -2664,6 +2681,16 @@ inline Val eval(const E& e, const Reader& rd) {
                 Val r = make((uint64_t)(uint32_t)v_to_i64(kv), 0, 32, 0);
                 r.sgn = true;
                 return r;
+            }
+            if (e->hi == SF_XPROP_EDGE) {   // once per clocked activation: no argument vector
+                bool def = false, amb = false;
+                for (const E& kid : e->kids) {
+                    uint64_t x = kid->k.v;
+                    int c = g_edgeClass ? g_edgeClass((int)(x >> 2), (x >> 1) & 1, x & 1) : 0;
+                    def |= c == 1;
+                    amb |= c == 2;
+                }
+                return mk(!def && amb, 1);
             }
             std::vector<Val> a;
             for (size_t i = 0; i < e->kids.size(); i++) a.push_back(k((int)i));
