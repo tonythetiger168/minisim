@@ -8,12 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `mpnr`, place and route for gate-level netlists: an automatic floorplan or
-  one from a DEF (`-floorplan`), analytic global placement, Abacus
-  legalization, refinement and filler cells, a negotiated-congestion detailed
-  router on the LEF track grid, and DEF out with a built-in check for opens,
-  shorts and spacing (`-check FILE.def` checks any routed DEF). Multithreaded
-  with identical results for any `-threads`. See `docs/PNR.md`.
+- `mformal`: formal property checking on the msim front end. Proves or
+  falsifies concurrent and immediate `assert`, takes `assume` as input
+  constraints, reaches `cover` or proves it unreachable. Bounded model
+  checking and k-induction (simple path, proven assertions as lemmas) on
+  CaDiCaL; a VCD of the whole design for every counterexample and cover
+  trace, `-tb` for a testbench that replays it in msim, `-json`; one job per
+  property on every core (`-threads N`), same result for any thread count.
+  See `docs/FORMAL.md`.
 - `mplan`: verification planning and tracking. A plan file maps features to
   tests, code coverage, covergroups and assertions; `mplan report` scores it
   against mregress results and the coverage database, keeps a history of
@@ -33,6 +35,12 @@ Spec references are IEEE 1800-2023 clauses.
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
+- `mpnr`, place and route for gate-level netlists: an automatic floorplan or
+  one from a DEF (`-floorplan`), analytic global placement, Abacus
+  legalization, refinement and filler cells, a negotiated-congestion detailed
+  router on the LEF track grid, and DEF out with a built-in check for opens,
+  shorts and spacing (`-check FILE.def` checks any routed DEF). Multithreaded
+  with identical results for any `-threads`. See `docs/PNR.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -42,7 +50,8 @@ Spec references are IEEE 1800-2023 clauses.
   source). See `docs/DEBUG.md`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
-  coupling capacitance to same-layer neighbours and to crossings, from an
+  coupling capacitance to same-layer neighbours (who also take over part of
+  the ground fringe) and to crossings one and two layers away, from an
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
