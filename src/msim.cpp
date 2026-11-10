@@ -594,7 +594,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (seed) run += " -seed " + std::to_string(seed);
     for (auto& a : plusArgs()) run += " " + shq("+" + a);
     std::string covBin = covPath + ".bin";   // per run: parallel runs share the build directory
-    if (g_cov) { std::filesystem::remove(covBin); run += " -cov " + shq(covBin); }
+    if (g_cov) { std::filesystem::remove(covBin); std::filesystem::remove(covBin + ".fcov"); run += " -cov " + shq(covBin); }
     std::cout.flush();
     int st = std::system(run.c_str());
     if (st == -1) return 1;
@@ -681,7 +681,15 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         f << (first ? "\n  " : ",\n  ") << "[" << jstr(top + "." + g.name) << ", " << g.w << ", \"" << hex(R, g.w) << "\", \"" << hex(F, g.w) << "\"]";
         first = false;
     }
-    f << "\n ]\n}\n";
+    f << "\n ],\n";
+    // Functional coverage: covergroup bins and assertion statistics. A
+    // compiled run's simv wrote them next to its counters.
+    std::ifstream fc(path + ".bin.fcov");
+    if (fc) f << fc.rdbuf();
+    else writeFuncCov(f);
+    fc.close();
+    std::filesystem::remove(path + ".bin.fcov");
+    f << "\n}\n";
     return (bool)f;
 }
 
