@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
+  the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
+  `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed
+  model (clocks, generated clocks, I/O delays, clock groups, exceptions,
+  uncertainty, latency, case analysis) and keeps every command with its file
+  and line. Object queries (`get_ports`, `get_pins`, `get_cells`, `get_nets`,
+  `get_clocks`, `all_inputs`, `all_registers`, `-hierarchical`, `-regexp`,
+  `-filter`, `-of_objects`) resolve through `sdc::Design`, which a tool
+  implements for its own netlist; a host can add its own commands.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
