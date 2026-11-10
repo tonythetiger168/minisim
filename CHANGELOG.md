@@ -8,11 +8,27 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `mpv lvs`: extracts the transistor netlist of a layout (nets from `connect`
-  statements, names and ports from `label`, MOS devices with W and L from
-  `device mos`) and writes it as SPICE. `src/lvs.hpp` also holds the netlist
-  comparison (partition refinement, parallel merging, source/drain
-  exchange). `tests/pv/sky130.lvs` is the SKY130 deck.
+- `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
+  failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
+  `strong()`, `always s_eventually`) is proven or falsified with a loop
+  counterexample.
+- `mformal`: formal property checking on the msim front end. Proves or
+  falsifies concurrent and immediate `assert`, takes `assume` as input
+  constraints, reaches `cover` or proves it unreachable. Bounded model
+  checking and k-induction (simple path, proven assertions as lemmas) on
+  CaDiCaL; a VCD of the whole design for every counterexample and cover
+  trace, `-tb` for a testbench that replays it in msim, `-json`; one job per
+  property on every core (`-threads N`), same result for any thread count.
+  See `docs/FORMAL.md`.
+- `mplan`: verification planning and tracking. A plan file maps features to
+  tests, code coverage, covergroups and assertions; `mplan report` scores it
+  against mregress results and the coverage database, keeps a history of
+  snapshots (trend chart, regressions per feature), sorts failures into
+  buckets (new / recurring / flaky / fixed, features and owners blocked,
+  rules for known and waived failures) and writes `plan.json` and
+  `plan.html`. Also `mplan check`, `triage`, `trend`, `init`, the gates
+  `-gate` / `-min-score` / `-fail-on-new`, and `mregress -plan`. See
+  `docs/MPLAN.md`.
 - `mlint` clock- and reset-domain crossing checks, rebuilt on a signal graph
   of the elaborated design: `CDC001` to `CDC005` (no synchronizer, multi-bit
   bus, logic in front of a synchronizer, reconvergence, a signal synchronized
@@ -23,16 +39,22 @@ Spec references are IEEE 1800-2023 clauses.
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
+- Shared headers for the tools: `src/parallel.hpp` (default thread count,
+  the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
+  `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
+  (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
   assignment that gave a signal its value at a time and its causes back
   through time, and `-html` for a one-file viewer (hierarchy, clickable
   source, drivers and loads, schematic, waves with values annotated in the
-  source). See `docs/DEBUG.md`.
+  source). `-vcd` reads VCD and FST; the page traces the active driver at the
+  cursor itself. See `docs/DEBUG.md`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
-  coupling capacitance to same-layer neighbours and to crossings, from an
+  coupling capacitance to same-layer neighbours (who also take over part of
+  the ground fringe) and to crossings one and two layers away, from an
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
@@ -57,19 +79,37 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
-- `mpv drc`: design rule checking on GDSII layouts. A rule deck defines drawn
-  and derived layers (`&`, `|`, `-`, `^`, `grow`, `shrink`, `interact`,
-  `inside`, `outside`, `holes`, ...) and width, spacing, enclosure, overhang,
-  area and density checks; violations are written as markers. Multithreaded
-  by default (`-threads N`) with the same report for every thread count. A
-  35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
-  is the shared GDSII reader and writer. See `docs/MPV.md`.
+- `-xprop`: an assignment to an array element chosen at run time
+  (`if (we) mem[addr] <= d;`) is merged with the element's present value
+  instead of blocking the merge or giving `x`.
+- X-propagation: `msim -xprop` (`-xprop=tmerge`, `-xprop=xmerge`,
+  `-xprop-report <file>`). In `always` blocks an unknown `if` condition,
+  `case` selector or clock / reset edge no longer picks one branch: every
+  branch that may be taken runs and the assigned variables get the merge of
+  the results, for blocking and nonblocking assignments. Same results in
+  the interpreter, with `-compile` and for every `-threads` count. See
+  `docs/XPROP.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
+  through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
+  gates) or a cell map, checked for a controllable clock and asynchronous
+  set/reset, and stitched into balanced mux-D chains: scan cell swap or a
+  library mux before D, one clock domain per chain or `-mix_clocks` with
+  lockup latches, clock-gate test enables tied to `scan_en`. Writes the
+  netlist, a JSON chain description for ATPG (`-scandef`) and a chain flush
+  testbench (`-tb`). Multithreaded, same output for any `-threads N`.
+- `mdft -mbist`: memory BIST generation for a synchronous single-port RAM:
+  an at-speed March controller and a collar, eight built-in algorithms
+  (MATS+, March X, Y, C-, A, B, LR, SS) or `-march`, data backgrounds, read
+  latency 0 to 16, first-fail address and data. A built-in memory fault
+  simulator reports stuck-at, transition, coupling and address-decoder
+  coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
+  expected results come from that simulator. See `docs/DFT.md`.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
@@ -79,6 +119,18 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv lvs`: extracts the transistor netlist of a layout (nets from `connect`
+  statements, names and ports from `label`, MOS devices with W and L from
+  `device mos`) and writes it as SPICE. `src/lvs.hpp` also holds the netlist
+  comparison (partition refinement, parallel merging, source/drain
+  exchange). `tests/pv/sky130.lvs` is the SKY130 deck.
+- `mpv drc`: design rule checking on GDSII layouts. A rule deck defines drawn
+  and derived layers (`&`, `|`, `-`, `^`, `grow`, `shrink`, `interact`,
+  `inside`, `outside`, `holes`, ...) and width, spacing, enclosure, overhang,
+  area and density checks; violations are written as markers. Multithreaded
+  by default (`-threads N`) with the same report for every thread count. A
+  35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
+  is the shared GDSII reader and writer. See `docs/MPV.md`.
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
@@ -122,6 +174,9 @@ Spec references are IEEE 1800-2023 clauses.
   subroutine call.
 
 ### Fixed
+- A concurrent assertion read the current value, not the sampled one, of a
+  bit select or indexed part select with a variable index (`r[k]`,
+  `r[k -: 2]`, 16.5.1).
 - A cast of a narrow unsigned operand inside a signed expression,
   `int'(u3) % 5`, sign-extended the operand: 6 became -2. The operand is now
   extended with its own signedness, as an assignment to the cast type

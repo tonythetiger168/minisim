@@ -1631,8 +1631,15 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
 // (assignments and forward jumps) up to the wait, exactly as exec() would.
 static void execComb(const void* ctx) {
     const Prog* p = static_cast<const Prog*>(ctx);
+    if (p->combCtl) static_cast<ProcCtl*>(p->combCtl.get())->epoch++;   // a flush point for its deferred reports
     for (size_t pc = 0; pc < p->code.size();) {
         const Instr& i = p->code[pc];
+        if (i.k == IK::Assert) {
+            if (g_cov) covHit(i.hits);
+            runAssert(i, std::static_pointer_cast<ProcCtl>(p->combCtl), pc);
+            pc++;
+            continue;
+        }
         if (i.k == IK::JmpIfNot) {
             if (g_cov) covHit(i.hits);
             if (truth(eval(i.e, rd)) == 1) pc++;
