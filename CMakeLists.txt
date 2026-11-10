@@ -82,6 +82,9 @@ if(Python3_FOUND)
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
 
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/mrcx.cmake)
+
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
 # default is off; -DSLANG_USE_MIMALLOC=ON still overrides it.
@@ -358,10 +361,7 @@ include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # Tools that need nothing from the blocks above keep their targets, tests and
 # install rules in a file of their own: cmake/tools/<tool>.cmake.
-file(GLOB TOOL_CMAKE ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
-foreach(t ${TOOL_CMAKE})
-  include(${t})
-endforeach()
+include(cmake/tools/mspice.cmake)
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
