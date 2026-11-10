@@ -75,6 +75,10 @@ DIELECTRIC pmd   { THICKNESS = 0.40 ER = 3.9 }
 VIA via1 { FROM = metal1 TO = metal2 AREA = 0.0049 RPV = 6 CRT1 = 0.001 }
 ```
 
+`ETCH = e` on a conductor says each edge of a wire loses `e` um when it is
+made: resistance and capacitance use the width `drawn - 2e` and the spacing
+`drawn + 2e`.
+
 `$` starts a comment. Properties the model does not use are skipped. When the
 LEF and the process file name a layer differently, `-map FILE` holds lines of
 `LEF-layer process-conductor`. `tests/rcx/sky130.itf` is the stack of the open
@@ -119,8 +123,12 @@ test suite (`src/rcx/test/gcd.def`, reference `gcd.spefok`), with
 
 The one fitted number in the model is how much of the ground fringe a
 neighbour takes over (`kShield` in `src/rcx.hpp`); it was set on this design.
-Resistance is lower than OpenRCX's by about 10% per net; the reference lumps
-vias into wire segments, so the two cannot be compared resistor by resistor.
+The resistance difference is input data, not method. A fit over the 411 nets
+reproduces OpenRCX's totals to 1% as 1.33 x mrcx's wire resistance plus a
+resistance per via: OpenRCX's rules file for this design carries 1.21 ohm/um
+for a 0.14 um met1 wire (0.169 ohm/sq), where the LEF and `sky130.itf` say
+0.125 ohm/sq, and its via values differ too. Give mrcx the same sheet and via
+resistances, or an `ETCH`, and the two agree.
 
 ## Speed
 

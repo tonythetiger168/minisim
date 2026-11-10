@@ -41,7 +41,8 @@ Spec references are IEEE 1800-2023 clauses.
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
-  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  count. `ETCH` on a conductor gives the width as made. `src/spef.hpp` is the
+  SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
 - Protected IP (IEEE 1735-2023 and 1800-2023 clause 34): `msimprotect`
   writes version 3 envelopes (RSA no-padding root key per tool block,
