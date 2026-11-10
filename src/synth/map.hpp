@@ -20,29 +20,29 @@
 // Levels of the graph are mapped in parallel; the result does not depend on
 // the number of threads.
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <limits>
 #include <memory>
-#include <thread>
 
 #include "../liberty.hpp"
+#include "../parallel.hpp"
 #include "../aig.hpp"
 
 namespace synth {
 
 using namespace aig;
 
+// The thread count: 0 is the shared default (every logical CPU, see parallel.hpp).
 inline int& threadCount() {
     static int n = 0;
     return n;
 }
 inline int threads() {
     int n = threadCount();
-    if (n <= 0) n = (int)std::thread::hardware_concurrency();
-    return std::max(1, n);
+    return n > 0 ? n : (int)par::defaultThreads();
 }
-// Calls fn(i) for i in [0, n) on all threads. fn must only write state of its own i.
+// Calls fn(i) for i in [0, n) on all threads, in chunks so that small nodes
+// do not fight over the shared counter. fn must only write state of its own i.
 template <class F>
 void parallelFor(size_t n, size_t minPerThread, F fn) {
     size_t nt = std::min<size_t>(threads(), n / std::max<size_t>(1, minPerThread));
@@ -50,20 +50,11 @@ void parallelFor(size_t n, size_t minPerThread, F fn) {
         for (size_t i = 0; i < n; i++) fn(i);
         return;
     }
-    std::atomic<size_t> next{0};
     const size_t chunk = std::max<size_t>(16, n / (nt * 8));
-    std::vector<std::thread> pool;
-    auto work = [&] {
-        for (;;) {
-            size_t b = next.fetch_add(chunk);
-            if (b >= n) return;
-            size_t e = std::min(n, b + chunk);
-            for (size_t i = b; i < e; i++) fn(i);
-        }
-    };
-    for (size_t t = 1; t < nt; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
+    par::parallelFor((n + chunk - 1) / chunk, (unsigned)nt, [&](size_t c) {
+        size_t e = std::min(n, (c + 1) * chunk);
+        for (size_t i = c * chunk; i < e; i++) fn(i);
+    });
 }
 
 struct MapError : std::runtime_error {
