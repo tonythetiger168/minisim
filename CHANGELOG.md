@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mrcx`: coupling between wires two layers apart (through what the layer
+  between leaves open), and a close neighbour now takes over part of a wire's
+  fringe capacitance to ground as coupling. Against OpenRCX on the sky130
+  `gcd` design, coupling capacitance goes from 0.73 to 1.04 of the reference
+  and capacitance to ground from 1.11 to 1.01; totals are unchanged.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the

@@ -34,6 +34,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -411,6 +412,9 @@ struct Piece {
 // Sakurai's fits, per unit length, as multiples of the permittivity.
 inline double groundPlate(double w, double h) { return 1.15 * w / h; }
 inline double groundFringe(double t, double h) { return 2.80 * std::pow(t / h, 0.222); }
+// How strongly a neighbour at spacing s takes over the fringe field to the
+// substrate: the share is kShield*h / (s + kShield*h).
+inline constexpr double kShield = 0.2;
 inline double lateral(double w, double t, double h, double s) {
     double k = 0.03 * w / h + 0.83 * t / h - 0.07 * std::pow(t / h, 0.222);
     return k > 0 ? k * std::pow(s / h, -1.34) : 0;
@@ -876,7 +880,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
     }
 
     // Per-layer constants (permittivity folded in), in fF and um.
-    struct LC { double t, h, epsG, epsL, epsDown, gapDown; };
+    struct LC { double t, h, epsG, epsL; };
     std::vector<LC> lc(nl);
     for (size_t l = 0; l < nl; l++) {
         const Conductor& c = stack.cond[l];
@@ -885,13 +889,19 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
         k.h = c.zbot > 0 ? c.zbot : c.thickness;   // height above the substrate
         k.epsG = kEps0 * stack.erBetween(0, k.h);
         k.epsL = kEps0 * stack.erAt(c.zbot + c.thickness / 2);
-        if (l > 0) {
-            const Conductor& b = stack.cond[l - 1];
-            k.gapDown = std::max(c.zbot - (b.zbot + b.thickness), 0.01 * c.thickness);
-            k.epsDown = kEps0 * stack.erBetween(b.zbot + b.thickness, b.zbot + b.thickness + k.gapDown);
-        }
         lc[l] = k;
     }
+
+    // Dielectric gap and permittivity between layer l and layer l+1, l+2.
+    std::vector<std::array<double, 3>> pairGap(nl), pairEps(nl);
+    for (size_t l = 0; l < nl; l++)
+        for (size_t d = 1; d <= 2 && l + d < nl; d++) {
+            const Conductor& lo = stack.cond[l];
+            const Conductor& hi = stack.cond[l + d];
+            double top = lo.zbot + lo.thickness;
+            pairGap[l][d] = std::max(hi.zbot - top, 0.01 * hi.thickness);
+            pairEps[l][d] = kEps0 * stack.erBetween(top, top + pairGap[l][d]);
+        }
 
     // --- capacitance, in fixed blocks of pieces
     struct CcRec { std::uint64_t a, b; double c; };   // a < b: global node keys
@@ -913,6 +923,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
         std::uint32_t epoch = 0;
         std::vector<Nb> side;
         std::vector<i64> cuts;
+        std::vector<Rect> between;
     };
     std::vector<Scratch> scratch(static_cast<size_t>(threads));
     parWorkers(nblk, threads, [&](size_t b, int worker) {
@@ -923,6 +934,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
         auto& epoch = sc.epoch;
         auto& side = sc.side;
         auto& cuts = sc.cuts;
+        auto& between = sc.between;
         BlockOut& out = bo[b];
         for (size_t i = b * blk; i < std::min(pieces.size(), (b + 1) * blk); i++) {
             const Piece& A = pieces[i];
@@ -934,6 +946,9 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
             const double w = static_cast<double>(A.r.hi(py) - A.r.lo(py)) / dbu;
             const i64 mid = A.r.lo(ax) + A.r.hi(ax);   // twice the middle
             double ga = 0, gb = 0;   // ground capacitance at n0, n1
+            // Fringe capacitance to the substrate per unit length, one side.
+            const double fringeSide = cd.areaCap >= 0 || cd.edgeCap >= 0 ? std::max(cd.edgeCap, 0.0)
+                                                                         : 0.5 * k.epsG * groundFringe(k.t, k.h);
             auto addCc = [&](int nodeA, const Piece& B, int nodeB, double c) {
                 std::uint64_t ka = key(A.net, nodeA), kb = key(B.net, nodeB);
                 if (ka > kb) std::swap(ka, kb);
@@ -980,9 +995,22 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
                     double cc = k.epsL * lateral(w, k.t, k.h, s) * l * opt.cscale * opt.ccscale;
                     i64 m2 = cuts[c] + cuts[c + 1];
                     int na = m2 < mid ? A.n0 : A.n1;
+                    // Where along the piece this stretch sits: 0 at n0, 1 at n1.
+                    const double f = A.r.hi(ax) > A.r.lo(ax)
+                        ? static_cast<double>(m2 - 2 * A.r.lo(ax)) / static_cast<double>(2 * (A.r.hi(ax) - A.r.lo(ax)))
+                        : 0.5;
                     if (B.power) {
-                        (na == A.n0 ? ga : gb) += cc;
+                        ga += cc * (1 - f);
+                        gb += cc * f;
                     } else {
+                        // A close neighbour takes part of the fringe field
+                        // that would have gone to the substrate on this side:
+                        // that part is coupling, not ground. Both wires give
+                        // up the same amount, so each net's total is unchanged.
+                        double moved = fringeSide * l * (kShield * k.h / (s + kShield * k.h)) * opt.cscale;
+                        ga -= moved * (1 - f);
+                        gb -= moved * f;
+                        cc += moved * opt.ccscale;
                         // Each side sees this pair once; half from each view.
                         i64 mx = ax ? 0 : m2 / 2, my = ax ? m2 / 2 : 0;
                         addCc(na, B, nearNode(B, B.axis == ax ? mx : (B.r.x0 + B.r.x1) / 2,
@@ -991,44 +1019,55 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
                 }
             }
 
-            // Layer below: what it hides from the substrate, and crossings.
-            double covered = 0;
-            if (A.layer > 0) {
-                const LC& kb = lc[A.layer - 1];
-                grid[A.layer - 1].query(A.r, cand, seen, ++epoch);
+            // Other layers. A wire couples to what it crosses one and two
+            // layers away; for two layers, only through the part of the
+            // crossing that metal on the layer between does not cover. Each
+            // pair of signal wires is handled once, from the upper wire;
+            // power metal is handled from the signal wire, above or below.
+            double covered = 0;   // area hidden from the substrate
+            auto crossing = [&](int ol, bool below) {
+                const int mlayer = std::abs(ol - A.layer) == 2 ? (ol + A.layer) / 2 : -1;
+                const int up = std::max<int>(ol, A.layer), dn = std::min<int>(ol, A.layer);
+                const double gap = pairGap[static_cast<size_t>(dn)][static_cast<size_t>(up - dn)];
+                const double eps = pairEps[static_cast<size_t>(dn)][static_cast<size_t>(up - dn)];
+                const double tbar = 0.5 * (k.t + lc[static_cast<size_t>(ol)].t);
+                if (mlayer >= 0) {
+                    between.clear();
+                    grid[static_cast<size_t>(mlayer)].query(A.r, cand, seen, ++epoch);
+                    for (auto id : cand)
+                        if (A.r.overlaps(pieces[id].r)) between.push_back(A.r.meet(pieces[id].r));
+                }
+                grid[static_cast<size_t>(ol)].query(A.r, cand, seen, ++epoch);
                 for (auto id : cand) {
                     const Piece& B = pieces[id];
                     if (!A.r.overlaps(B.r)) continue;
+                    if (!below && !B.power) continue;
                     Rect m = A.r.meet(B.r);
                     double mw = static_cast<double>(m.x1 - m.x0) / dbu, mh = static_cast<double>(m.y1 - m.y0) / dbu;
-                    covered += mw * mh;
-                    if (B.net == A.net) continue;
-                    double tbar = 0.5 * (k.t + kb.t);
-                    double cc = k.epsDown * (1.15 * mw * mh / k.gapDown +
-                                             0.70 * 2 * (mw + mh) * std::pow(tbar / k.gapDown, 0.222)) *
-                                opt.cscale * opt.ccscale;
+                    double seenFrac = 1;
+                    if (mlayer >= 0 && !between.empty()) {
+                        double hid = 0;
+                        for (const Rect& q : between)
+                            if (q.overlaps(m)) {
+                                Rect z = q.meet(m);
+                                hid += static_cast<double>(z.x1 - z.x0) * static_cast<double>(z.y1 - z.y0);
+                            }
+                        seenFrac = std::clamp(1.0 - hid / (static_cast<double>(m.x1 - m.x0) * static_cast<double>(m.y1 - m.y0)), 0.0, 1.0);
+                    }
+                    if (below) covered += mw * mh * seenFrac;
+                    if (B.net == A.net || seenFrac <= 0) continue;
+                    double cc = eps * (1.15 * mw * mh / gap + 0.70 * 2 * (mw + mh) * std::pow(tbar / gap, 0.222)) *
+                                seenFrac * opt.cscale * opt.ccscale;
                     i64 cx = (m.x0 + m.x1) / 2, cy = (m.y0 + m.y1) / 2;
                     int na = nearNode(A, cx, cy);
                     if (B.power) (na == A.n0 ? ga : gb) += cc;
                     else addCc(na, B, nearNode(B, cx, cy), cc);
                 }
-            }
-            // Layer above, power only: signal pieces above do this from their side.
-            if (static_cast<size_t>(A.layer) + 1 < nl) {
-                const LC& ku = lc[A.layer + 1];
-                grid[A.layer + 1].query(A.r, cand, seen, ++epoch);
-                for (auto id : cand) {
-                    const Piece& B = pieces[id];
-                    if (!B.power || !A.r.overlaps(B.r)) continue;
-                    Rect m = A.r.meet(B.r);
-                    double mw = static_cast<double>(m.x1 - m.x0) / dbu, mh = static_cast<double>(m.y1 - m.y0) / dbu;
-                    double tbar = 0.5 * (k.t + ku.t);
-                    double cc = ku.epsDown * (1.15 * mw * mh / ku.gapDown +
-                                              0.70 * 2 * (mw + mh) * std::pow(tbar / ku.gapDown, 0.222)) *
-                                opt.cscale * opt.ccscale;
-                    (nearNode(A, (m.x0 + m.x1) / 2, (m.y0 + m.y1) / 2) == A.n0 ? ga : gb) += cc;
-                }
-            }
+            };
+            if (A.layer > 0) crossing(A.layer - 1, true);
+            if (A.layer > 1) crossing(A.layer - 2, true);
+            if (static_cast<size_t>(A.layer) + 1 < nl) crossing(A.layer + 1, false);
+            if (static_cast<size_t>(A.layer) + 2 < nl) crossing(A.layer + 2, false);
 
             // Ground.
             double open = len * w > 0 ? std::clamp(1.0 - covered / (len * w), 0.0, 1.0) : 1.0;
