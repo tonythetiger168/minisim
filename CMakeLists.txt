@@ -30,7 +30,7 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_sat)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -112,6 +112,13 @@ if(MINISIM_WITH_SLANG)
   add_executable(mdft src/mdft.cpp)
   target_include_directories(mdft PRIVATE src)
   target_link_libraries(mdft PRIVATE slang::slang)
+
+  # Logic equivalence checking (RTL vs netlist, netlist vs netlist):
+  # mequiv -ref rtl.sv -impl netlist.v cells.v
+  find_package(Threads REQUIRED)
+  add_executable(mequiv src/mequiv.cpp)
+  target_include_directories(mequiv PRIVATE src)
+  target_link_libraries(mequiv PRIVATE slang::slang Threads::Threads)
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -252,6 +259,10 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
 
+  add_test(NAME mequiv
+           COMMAND ${CMAKE_COMMAND} -DMEQUIV=$<TARGET_FILE:mequiv>
+                   -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mequiv.cmake)
+
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec
@@ -278,7 +289,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim mlint mdft slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mequiv slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
