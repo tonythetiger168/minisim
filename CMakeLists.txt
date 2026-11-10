@@ -165,12 +165,8 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
-  # One file per tool of the line (msynth, ...): cmake/tools/<tool>.cmake.
-  include(GNUInstallDirs)
-  file(GLOB MINISIM_TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
-  foreach(tool_cmake ${MINISIM_TOOL_CMAKE})
-    include(${tool_cmake})
-  endforeach()
+  # Tools on the slang front end: one file each in cmake/tools.
+  include(cmake/tools/msynth.cmake)
 
   # Source-level debug: drivers, loads, active-driver trace, viewer: mdebug design.sv
   add_executable(mdebug src/mdebug.cpp)
