@@ -17,6 +17,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../parallel.hpp"
+
 namespace emu {
 
 struct Error : std::runtime_error {
@@ -41,38 +43,10 @@ struct Rng {
     }
 };
 
-// Runs f(0..n-1) on up to `threads` threads. Each index is its own piece of
-// work with its own output, so the result does not depend on the thread
-// count. (Moves to src/parallel.hpp, the tool line's shared pool, when that
-// header is on main.)
-template <class F>
-void parallelFor(size_t n, unsigned threads, F&& f) {
-    if (threads <= 1 || n <= 1) {
-        for (size_t i = 0; i < n; i++) f(i);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    std::vector<std::string> errs(n);
-    auto work = [&] {
-        for (;;) {
-            size_t i = next.fetch_add(1);
-            if (i >= n) return;
-            try {
-                f(i);
-            } catch (const std::exception& e) {
-                errs[i] = e.what();
-                if (errs[i].empty()) errs[i] = "error";
-            }
-        }
-    };
-    unsigned k = (unsigned)std::min<size_t>(threads, n);
-    std::vector<std::thread> pool;
-    for (unsigned t = 1; t < k; t++) pool.emplace_back(work);
-    work();
-    for (auto& t : pool) t.join();
-    for (auto& e : errs)
-        if (!e.empty()) throw Error(e);
-}
+// The tool line's shared parallel-for (src/parallel.hpp). Each index is its
+// own piece of work with its own output, so the result does not depend on
+// the thread count.
+using par::parallelFor;
 
 inline std::string readFile(const std::string& path) {
     std::ifstream f(path, std::ios::binary);

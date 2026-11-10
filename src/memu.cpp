@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
     std::string top, boardFile, outDir = "memu.d", ioFpga, trigger, hgrFile;
     int nFpgas = 0, pins = 100, starts = 16, traceDepth = 1024, tdmMax = -1;
     double lut = 0, ff = 0, bramKb = 0, util = -1, fmax = 50;
-    unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+    unsigned threads = par::defaultThreads();
     bool quiet = false;
     Options opt;
     std::vector<std::string> trace;
@@ -315,7 +315,7 @@ int main(int argc, char** argv) {
             else if (a == "-lutram-max") opt.lutramMaxBits = std::atol(next("a number").c_str());
             else if (a == "-fmax") fmax = std::atof(next("MHz").c_str());
             else if (a == "-starts") starts = std::max(1, std::atoi(next("a number").c_str()));
-            else if (a == "-threads" || a == "-j") threads = (unsigned)std::max(1, std::atoi(next("a number").c_str()));
+            else if (par::threadsArg(argc, argv, i, threads, "memu")) continue;
             else if (a == "-o") outDir = next("a path"), outGiven = true;
             else if (a == "-q") quiet = true;
             else if (a == "-dump-hgr") hgrFile = next("a file");
