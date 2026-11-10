@@ -114,6 +114,16 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Logic synthesis: `msynth`, a dc_shell-style Tcl shell (`analyze`,
+  `elaborate`, `create_clock`, `compile`, `report_timing`, `report_area`,
+  `report_qor`, `write -format verilog` ...) on the slang front end. RTL is
+  flattened into an and-inverter graph with flops (`src/aig.hpp`,
+  `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
+  mapped onto any Liberty library by cut matching for area or delay,
+  high-fanout nets are buffered, and the result is timed with the library's
+  NLDM tables. A generic cell library is built in. Mapping runs on every
+  core (`-threads N`) with the same netlist for any thread count. See
+  `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
