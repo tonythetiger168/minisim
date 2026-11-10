@@ -102,3 +102,30 @@ string(JSON n LENGTH "${json}" signals)
 if(NOT n EQUAL 25)
   message(FATAL_ERROR "expected 25 signals in the database, got ${n}")
 endif()
+
+# Tasks, call outputs, force and a net's declaration assignment are drivers.
+set(SV ${SRC}/tests/debug/task.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tk -vcd ${OUT}/task.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "w=5 q=7 f=170")
+  message(FATAL_ERROR "msim task.sv: ${rc}\n${out}")
+endif()
+function(runtk args)
+  execute_process(COMMAND ${MDEBUG} ${SV} -top tk ${args}
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  set(out "${out}" PARENT_SCOPE)
+  set(err "${err}" PARENT_SCOPE)
+endfunction()
+runtk("-drivers;tk.q;-drivers;tk.w;-drivers;tk.f;-drivers;tk.n;-loads;tk.a")
+want("task.sv:10: q = v  [task set_q]  when v != 0"
+     "task.sv:13: bump(a, w)  [always @posedge clk, call]"
+     "drivers of tk.f: 2" "task.sv:18: f = 8'haa  [initial, force]"
+     "drivers of tk.n: 1" "loads of tk.a: 3" "-> tk.bump.x" "-> tk.w")
+runtk("-trace;tk.q")
+want("tk.set_q.v" "task.sv:17: set_q(8'd7)  [initial, call]")
+runtk("-vcd;${OUT}/task.vcd;-active;tk.f;-at;40")
+want("tk.f = 8'haa @40  (since 32)" "f = 8'haa  [initial, force]")
+if(out MATCHES "f = n")
+  message(FATAL_ERROR "the forced value was traced to the overridden driver:\n${out}")
+endif()
+runtk("-vcd;${OUT}/task.vcd;-active;tk.w;-at;30")
+want("tk.w = 8'h05 @30  (since 15)" "bump(a, w)" "a = 8'd3  [initial]")

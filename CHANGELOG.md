@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdebug`: tasks and functions in a module, call output arguments, `force`,
+  procedural `assign` and net declaration assignments are drivers and loads;
+  the fan-in cone follows a task argument to its calls.
 - `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
   failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
   `strong()`, `always s_eventually`) is proven or falsified with a loop

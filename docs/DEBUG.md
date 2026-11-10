@@ -122,14 +122,26 @@ The page from `-html` holds a budget of two million value changes. When the
 waveform has more, each signal keeps the changes around `-at T` (or its first
 ones), and mdebug says so.
 
+## Tasks, calls and force
+
+A task or function declared in a module drives the signals it assigns, as
+`[task name]`. A call drives each output, inout and ref argument from the
+arguments that go in, as `[..., call]`, and the arguments that go in drive
+the task's formals, so the fan-in cone crosses the call. `force` and the
+procedural `assign` are listed as `[..., force]` and `[..., assign]`. A net
+declared with a value (`wire n = a + b;`) is a continuous assignment.
+
 ## Limits
 
 - In the page, a condition that reads an `x` or `z` value is undecided
   (`??`); the command line evaluates all four states.
 - Unpacked arrays, structs and class objects are not in msim's VCD, so the
   active-driver trace stops at them with `(not in the waveform)`.
-- Assignments made through task or function output arguments, and `force`,
-  are not listed as drivers.
+- A task's formal arguments are not in the waveform, so the active-driver
+  trace shows an assignment inside a task that depends on one as undecided
+  (`??`); `-trace` follows the argument to every call.
+- `release` is not a driver: after it the trace goes back to the ordinary
+  drivers by value.
 - Conditions inside loops, `fork` blocks and pattern matches are shown as
   `...` and are not evaluated.
 - `-html` embeds at most 20000 value changes per signal (`-max-changes N`),
