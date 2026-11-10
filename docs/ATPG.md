@@ -113,8 +113,22 @@ a netlist with a detected fault wired in (they fail).
   inputs, compares the outputs, then pulses the clocks. It starts with a
   chain test (0011 through every chain) and prints `ATPG PASS` or the
   mismatching cycles.
+  Run with `+faillog` it also writes `<top>.faillog` (define `MATPG_FAILLOG`
+  as a quoted string for another name): `top <name>`, then one line per
+  wrong bit. `<pattern> <chain> <cell>` is a scan cell that captured the
+  wrong value (cell 0 nearest scan-in) and `<pattern> po <port>` a port
+  that was wrong at capture; patterns and chains are numbered as in
+  `-cubes`. This is what a diagnosis tool reads.
 - `-patterns FILE`: the patterns as text, one line each (input bits, then
   scan cell bits in chain order); `-faultsim` reads it back.
+- `-cubes FILE`: every test before the random fill, for test compression
+  (an EDT encoder needs to know which bits it is free to choose). A line is
+  `<pattern> <chain> <bits>`: the pattern's number from 0 in pattern file
+  order, the chain's number from 0 in the order matpg lists the chains, and
+  the value each cell of that chain is loaded with, the cell nearest scan-in
+  first, `x` for a bit ATPG did not need. `<pattern> pi <bits>` gives the
+  port inputs the same way. A random pattern has no free bits. A header
+  line `chains <port> <port> ...` names the scan-in port of chain 0, 1, ...
 - `-json FILE`: the summary, for dashboards and CI.
 
 ## Threads

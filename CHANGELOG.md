@@ -108,6 +108,13 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- The `matpg -tb` testbench writes a fail log with `+faillog` (pattern, chain
+  and cell of every wrong bit) for diagnosis; the fault simulator queues
+  events by level and is up to twice as fast on deep logic; the pattern file
+  reader and writer are in `src/atpg_model.hpp` for other tools.
+- `matpg -cubes FILE` writes each test before the random fill (x for a free
+  bit) for test compression, and the fault simulator can report where each
+  pattern fails (`Sim::detect` with a third argument) for diagnosis.
 - `matpg`: test pattern generation and fault simulation on a scan-inserted
   gate netlist. Stuck-at faults and launch-on-capture transition faults on
   every cell pin; scan chains traced from the ports (library scan flops or a

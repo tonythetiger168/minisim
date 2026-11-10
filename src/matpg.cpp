@@ -30,7 +30,7 @@ namespace {
 
 struct Args {
     std::vector<std::string> files;
-    std::string top, se, stil, tb, patOut, faultOut, faultsim, json;
+    std::string top, se, stil, tb, patOut, faultOut, faultsim, json, cubeOut;
     std::vector<std::string> libs;
     std::string fault = "stuck";
     Options opt;
@@ -58,6 +58,8 @@ void usage() {
         "  -stil FILE        write the patterns as STIL (IEEE 1450)\n"
         "  -tb FILE          write a self-checking Verilog testbench\n"
         "  -patterns FILE    write the patterns as text (what -faultsim reads)\n"
+        "  -cubes FILE       write the tests before random fill, x for a free bit, for\n"
+        "                    test compression (mdft -edt_encode)\n"
         "  -faults FILE      write the fault list with each fault's class\n"
         "  -json FILE        write the summary as JSON\n"
         "  -faultsim FILE    do not generate: grade the patterns in FILE\n"
@@ -66,12 +68,6 @@ void usage() {
         "  -quiet            print the summary only\n"
         "  -version          print the version\n";
 }
-
-struct PatSet {
-    bool transition = false;
-    std::vector<Pattern> pats;
-    std::vector<std::vector<uint8_t>> po, cap;   // expected values, 2 = X
-};
 
 struct Summary {
     std::string kind;
@@ -185,11 +181,14 @@ void writeTb(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os)
     std::string top = nl.top;
     os << "// Self-checking scan test of " << top << ", written by matpg " << MINISIM_VERSION << ".\n"
        << "// Each cycle drives the inputs, compares the outputs, then pulses the clocks.\n"
+       << "// +faillog writes one line per wrong bit to " << top << ".faillog, or to the file\n"
+       << "// MATPG_FAILLOG is defined as (see docs/ATPG.md).\n"
+       << "`ifndef MATPG_FAILLOG\n`define MATPG_FAILLOG \"" << top << ".faillog\"\n`endif\n"
        << "`timescale 1ns/1ps\nmodule " << gnl::vname(top + "_atpg_tb") << ";\n";
     if (NI) os << "  reg [" << NI - 1 << ":0] in_v;\n";
     if (NK) os << "  reg [" << NK - 1 << ":0] ck_v;\n";
     if (NO) os << "  wire [" << NO - 1 << ":0] out_v;\n";
-    os << "  integer errors, cycles;\n  " << gnl::vname(top) << " dut (";
+    os << "  integer errors, cycles, flog, b;\n  " << gnl::vname(top) << " dut (";
     // A bus is connected once, as the concatenation of its bits (msb first,
     // the order the flattener lists them).
     for (size_t i = 0; i < nl.ports.size();) {
@@ -206,7 +205,9 @@ void writeTb(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os)
     os << "  task c;\n";
     if (NI) os << "    input [" << NI - 1 << ":0] i;\n";
     os << "    input pulse;\n";
-    if (NO) os << "    input [" << NO - 1 << ":0] e;\n    input [" << NO - 1 << ":0] m;\n";
+    if (NO)
+        os << "    input [" << NO - 1 << ":0] e;\n    input [" << NO - 1 << ":0] m;\n"
+           << "    input integer pt;\n    input integer sh;\n    reg [" << NO - 1 << ":0] d;\n";
     os << "    begin\n";
     if (NI) os << "      in_v = i;\n";
     os << "      #40; cycles = cycles + 1;\n";
@@ -214,12 +215,40 @@ void writeTb(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os)
         os << "      if (((out_v ^ e) & m) !== " << NO << "'d0) begin\n"
            << "        errors = errors + 1;\n"
            << "        if (errors <= 10) $display(\"MISMATCH cycle %0d: got %b expected %b mask %b\", cycles, out_v, e, m);\n"
+           << "        d = (out_v ^ e) & m;\n"
+           << "        if (flog != 0 && pt >= 0)\n"
+           << "          for (b = 0; b < " << NO << "; b = b + 1)\n"
+           << "            if (d[b] !== 1'b0) faillog(pt, sh, b);\n"
            << "      end\n";
     os << "      #10;";
     if (NK) os << " if (pulse) ck_v = {" << NK << "{1'b1}};";
     os << "\n      #30;";
     if (NK) os << " ck_v = " << NK << "'d0;";
     os << "\n      #20;\n    end\n  endtask\n";
+
+    // +faillog: one line per wrong bit, for diagnosis. A bit unloaded
+    // from a chain is "<pattern> <chain> <cell>" (cell 0 nearest scan-in), a
+    // port compared at capture is "<pattern> po <port>".
+    if (NO) {
+        auto outName = portNames(nl, false);
+        auto str = [](const std::string& n) {
+            std::string r;
+            for (char ch : n) {
+                if (ch == '\\' || ch == '"') r += '\\';
+                r += ch;
+            }
+            return r;
+        };
+        os << "  task faillog;\n    input integer pt;\n    input integer sh;\n    input integer ob;\n    begin\n"
+           << "      if (sh < 0)\n        case (ob)\n";
+        for (size_t i = 0; i < NO; i++)
+            os << "          " << i << ": $fdisplay(flog, \"%0d po %s\", pt, \"" << str(outName[t.outNets[i]]) << "\");\n";
+        os << "          default: ;\n        endcase\n      else\n        case (ob)\n";
+        for (size_t ci = 0; ci < t.scan.chains.size(); ci++)
+            os << "          " << t.outIdx.at(t.scan.chains[ci].soNet) << ": $fdisplay(flog, \"%0d " << ci
+               << " %0d\", pt, " << t.scan.chains[ci].cells.size() - 1 << " - sh);\n";
+        os << "          default: ;\n        endcase\n    end\n  endtask\n";
+    }
 
     std::string idle(NI, '0');
     for (size_t i = 0; i < t.m.piNets.size(); i++) {
@@ -228,11 +257,14 @@ void writeTb(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os)
     }
     long cycles = 0;
     std::ostringstream body;
-    auto cyc = [&](const std::string& in, bool pulse, const std::string& e, const std::string& mk) {
+    // pt and sh say what the cycle compares: pattern pt's response, at
+    // capture (sh < 0) or in shift cycle sh of its unload.
+    auto cyc = [&](const std::string& in, bool pulse, const std::string& e, const std::string& mk, int pt = -1,
+                   int sh = -1) {
         body << "    c(";
         if (NI) body << lit(in) << ", ";
         body << (pulse && NK ? "1'b1" : "1'b0");
-        if (NO) body << ", " << lit(e) << ", " << lit(mk);
+        if (NO) body << ", " << lit(e) << ", " << lit(mk) << ", " << pt << ", " << sh;
         body << ");\n";
         cycles++;
     };
@@ -245,6 +277,7 @@ void writeTb(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os)
     size_t nPI = t.m.piNets.size();
     std::vector<uint8_t> prev;   // what the chains hold to unload, 2 = do not compare
     // L shift cycles: load `load` (per scan cell, empty = zeros), unload prev.
+    int prevId = -1;             // the pattern prev is the response of (-1: the chain test)
     auto shift = [&](std::string in, const std::vector<uint8_t>& load) {
         if (t.scan.chains.empty()) return;
         in[t.inIdx.at(t.scan.seNet)] = (char)('0' + t.scan.seActive);
@@ -268,7 +301,7 @@ void writeTb(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os)
                     }
                 }
             }
-            cyc(in, true, e, mk);
+            cyc(in, true, e, mk, prevId, (int)cy);
         }
     };
     int total = 0;
@@ -295,8 +328,9 @@ void writeTb(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os)
                 if (v != 2) { e[idx] = (char)('0' + v); mk[idx] = '1'; }
             }
             if (ps.transition) cyc(in, true, std::string(NO, '0'), std::string(NO, '0'));
-            cyc(in, true, e, mk);
+            cyc(in, true, e, mk, total, -1);
             prev = ps.cap[p];
+            prevId = total;
             lastBase = in;
             total++;
         }
@@ -304,13 +338,15 @@ void writeTb(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os)
         body << "    // unload the last response\n";
         shift(lastBase, {});
     }
-    os << "  initial begin\n    errors = 0; cycles = 0;\n";
+    os << "  initial begin\n    errors = 0; cycles = 0; flog = 0;\n"
+       << "    if ($test$plusargs(\"faillog\")) begin\n      flog = $fopen(`MATPG_FAILLOG, \"w\");\n"
+       << "      $fdisplay(flog, \"top " << top << "\");\n    end\n";
     if (NK) os << "    ck_v = " << NK << "'d0;\n";
     if (NI) os << "    in_v = " << lit(idle) << ";\n";
     os << body.str();
     os << "    if (errors == 0) $display(\"ATPG PASS: " << total << " patterns, %0d cycles\", cycles);\n"
        << "    else $display(\"ATPG FAIL: %0d mismatching cycles of %0d\", errors, cycles);\n"
-       << "    $finish;\n  end\nendmodule\n";
+       << "    if (flog != 0) $fclose(flog);\n    $finish;\n  end\nendmodule\n";
 }
 
 void writeStil(const Tester& t, const std::vector<PatSet>& sets, std::ostream& os) {
@@ -444,68 +480,6 @@ void writeStil(const Tester& t, const std::vector<PatSet>& sets, std::ostream& o
     os << "}\n";
 }
 
-void writePatterns(const Design& nl, const Model& m, const std::vector<PatSet>& sets, std::ostream& os) {
-    auto inName = portNames(nl, true);
-    os << "matpg-patterns 1\ndesign " << nl.top << "\ninputs " << m.piNets.size();
-    for (int n : m.piNets) os << " " << inName[n];
-    os << "\nscan " << m.scanCells.size();
-    for (int c : m.scanCells) os << " " << nl.cells[c].name;
-    os << "\n";
-    size_t nPI = m.piNets.size();
-    for (const PatSet& ps : sets)
-        for (const Pattern& p : ps.pats) {
-            os << "p " << (ps.transition ? "transition" : "stuck") << " ";
-            for (size_t i = 0; i < nPI; i++) os << (char)('0' + p[i]);
-            os << " ";
-            for (size_t i = nPI; i < p.size(); i++) os << (char)('0' + p[i]);
-            if (p.size() == nPI) os << "-";
-            os << "\n";
-        }
-}
-
-std::vector<PatSet> readPatterns(const std::string& path, const Design& nl, const Model& m) {
-    std::ifstream f(path);
-    if (!f) throw ModelError("cannot open " + path);
-    std::vector<PatSet> sets(2);
-    sets[1].transition = true;
-    std::string line;
-    size_t nPI = m.piNets.size(), nSC = m.scanCells.size();
-    auto inName = portNames(nl, true);
-    int ln = 0;
-    while (std::getline(f, line)) {
-        ln++;
-        std::istringstream is(line);
-        std::string w;
-        if (!(is >> w)) continue;
-        auto bad = [&](const std::string& why) {
-            throw ModelError(path + ":" + std::to_string(ln) + ": " + why);
-        };
-        if (w == "inputs" || w == "scan") {
-            size_t n;
-            is >> n;
-            if (n != (w == "inputs" ? nPI : nSC)) bad("the " + w + " count does not match this design");
-            for (size_t i = 0; i < n; i++) {
-                std::string name;
-                is >> name;
-                const std::string& want = w == "inputs" ? inName[m.piNets[i]] : nl.cells[m.scanCells[i]].name;
-                if (name != want) bad("expected '" + want + "' but the file has '" + name + "'");
-            }
-        } else if (w == "p") {
-            std::string kind, a, b;
-            is >> kind >> a >> b;
-            if (b == "-") b.clear();
-            if (a.size() != nPI || b.size() != nSC) bad("a pattern of the wrong length");
-            Pattern p;
-            for (char ch : a + b) {
-                if (ch != '0' && ch != '1') bad("a pattern bit that is not 0 or 1");
-                p.push_back((uint8_t)(ch - '0'));
-            }
-            sets[kind == "transition"].pats.push_back(p);
-        }
-    }
-    return sets;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -536,6 +510,7 @@ int main(int argc, char** argv) {
         else if (s == "-tb") a.tb = next("a file");
         else if (s == "-lib") a.libs.push_back(next("a file"));
         else if (s == "-patterns") a.patOut = next("a file");
+        else if (s == "-cubes") a.cubeOut = next("a file");
         else if (s == "-faults") a.faultOut = next("a file");
         else if (s == "-json") a.json = next("a file");
         else if (s == "-faultsim") a.faultsim = next("a file");
@@ -619,6 +594,7 @@ int main(int argc, char** argv) {
                 eng.grade(ps.pats);
             } else {
                 ps.pats = eng.generate();
+                ps.cubes = eng.cubes;
             }
             ps.po = eng.respond(ps.pats, m.poNodes);
             ps.cap = eng.respond(ps.pats, m.capNodes);
@@ -674,6 +650,36 @@ int main(int argc, char** argv) {
             std::ofstream f(a.patOut);
             if (!f) throw ModelError("cannot write " + a.patOut);
             writePatterns(nl, first, sets, f);
+        }
+        if (!a.cubeOut.empty()) {
+            // "<pattern> <chain> <bits>": the load of one chain, the cell
+            // nearest scan-in first; "<pattern> pi <bits>": the port inputs
+            // in the order of the pattern file. Patterns count from 0 in
+            // pattern file order, chains from 0 in the order printed.
+            std::ofstream f(a.cubeOut);
+            if (!f) throw ModelError("cannot write " + a.cubeOut);
+            f << "# matpg test cubes for " << nl.top << ": x is a bit left free\n";
+            // Which chain a number means, for a reader with its own chain list.
+            f << "chains";
+            for (const Chain& ch : scan.chains) f << " " << ch.siName;
+            f << "\n";
+            size_t nPI = first.piNets.size();
+            int id = 0;
+            const char* ch = "01x";
+            for (const PatSet& ps : sets)
+                for (const Pattern& cu : ps.cubes.empty() ? ps.pats : ps.cubes) {
+                    f << id << " pi ";
+                    for (size_t i = 0; i < nPI; i++)
+                        f << (first.c.fixed[first.c.inputs[i]] >= 0 ? ch[first.c.fixed[first.c.inputs[i]]] : ch[cu[i]]);
+                    f << "\n";
+                    size_t k = nPI;
+                    for (size_t ci = 0; ci < scan.chains.size(); ci++) {
+                        f << id << " " << ci << " ";
+                        for (size_t i = 0; i < scan.chains[ci].cells.size(); i++) f << ch[cu[k++]];
+                        f << "\n";
+                    }
+                    id++;
+                }
         }
         if (!a.json.empty()) {
             std::ofstream f(a.json);
