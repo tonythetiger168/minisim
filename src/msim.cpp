@@ -291,6 +291,7 @@ struct Plan {
     std::vector<std::vector<int>> outs;             // comb process outputs
     std::vector<char> seq;
     std::vector<std::vector<std::pair<int, Edge>>> ev;
+    bool cyclic = false;   // some comb processes feed each other: no single forward sweep
 };
 // A wire or variable whose drivers are all strong continuous assigns to
 // fixed, disjoint bit ranges that cover it (assign w = ..., or assign w[k]
@@ -360,7 +361,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
             if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
-        std::vector<size_t> order = combSchedule(shapes, &lv);
+        std::vector<size_t> order = combSchedule(shapes, &lv, &p.cyclic);
         for (size_t r = 0; r < order.size(); r++) {
             size_t i = procOf[order[r]];
             p.rank[i] = (int)r;
@@ -436,7 +437,12 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         procs.push_back(std::move(c));
     }
     CodegenParts parts;
-    parts.on = staticPart;
+    bool combAssert = false;   // a deferred report is queued by one thread
+    for (size_t i = 0; i < lowered.procs.size(); i++)
+        if (pl.rank[i] >= 0)
+            for (auto& in : lowered.procs[i].prog.code) combAssert |= in.k == IK::Assert;
+    parts.on = staticPart && !combAssert && !pl.cyclic;
+    cycle = cycle && !pl.cyclic;   // the domain evaluates every comb statement once, in rank order
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
     std::vector<std::pair<const Prog*, size_t>> covSlots;
@@ -1336,6 +1342,8 @@ int main(int argc, char** argv) {
     for (int i : byRank) {
         if (i < 0) continue;
         const Prog* pr = &lowered.procs[i].prog;
+        for (auto& in : pr->code)
+            if (in.k == IK::Assert && !pr->combCtl) pr->combCtl = std::make_shared<ProcCtl>();
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
@@ -1368,7 +1376,7 @@ int main(int argc, char** argv) {
     if (startSdf()) return 1;   // SDF timing first, so the checks start with the annotated limits
     startTimingChecks();
     if (!pathRecs().empty() || !S.icDelay.empty() || !S.shadowOf.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
-    if (!S.shadows.empty() || !asserts().empty() || !clockings().empty()) staticPart = false;
+    if (!S.shadows.empty() || !asserts().empty() || !clockings().empty() || pl.cyclic) staticPart = false;
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
