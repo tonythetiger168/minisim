@@ -30,7 +30,7 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_sdc test_lefdef)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_lefdef)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -88,7 +88,6 @@ endif()
 # Tools that need nothing but the compiler: one file each in cmake/tools.
 include(cmake/tools/memu.cmake)
 include(cmake/tools/mrcx.cmake)
-include(cmake/tools/msta.cmake)
 include(cmake/tools/shared_par_wave.cmake)
 include(cmake/tools/mequiv.cmake)
 
@@ -459,6 +458,16 @@ install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+# The tools: one file each in cmake/tools, all included here, after the core
+# targets, the slang front end, FST and the install directories, so a tool
+# file can test if(MINISIM_WITH_SLANG), if(TARGET msim) and MINISIM_WITH_FST.
+# Add a file, not a line: every *.cmake there is included. Start each file
+# with include_guard(GLOBAL).
+file(GLOB TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
+foreach(f ${TOOL_CMAKE})
+  include(${f})
+endforeach()
 
 set(CPACK_PACKAGE_NAME minisim)
 set(CPACK_PACKAGE_VENDOR "minisim")
