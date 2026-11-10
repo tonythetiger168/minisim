@@ -54,6 +54,7 @@
 
 #include "cadical.hpp"
 #include "lower.hpp"
+#include "parallel.hpp"
 #include "slang/driver/Driver.h"
 #include "version.hpp"
 
@@ -2203,7 +2204,7 @@ int main(int argc, char** argv) {
         if (a == "-bmc") { opt.bmcOnly = true; continue; }
         if (a == "-no-pdr") { opt.noPdr = true; continue; }
         if (a == "-prop") { opt.only.push_back(next("a property name")); continue; }
-        if (a == "-threads") { opt.threads = (int)num("a number of threads"); continue; }
+        if (a == "-threads" || a == "-j") { opt.threads = (int)num("a number of threads"); continue; }
         if (a == "-conflicts") { opt.conflicts = num("a number of conflicts"); continue; }
         if (a == "-o") { opt.outDir = next("a directory"); continue; }
         if (a == "-no-trace") { opt.noTrace = true; continue; }
@@ -2282,19 +2283,11 @@ int main(int argc, char** argv) {
         todo.push_back(i);
     }
     std::vector<Result> results(m.props.size());
-    int threads = opt.threads > 0 ? opt.threads : (int)std::max(1u, std::thread::hardware_concurrency());
-    threads = std::max(1, std::min<int>(threads, (int)todo.size()));
+    unsigned threads = opt.threads > 0 ? (unsigned)opt.threads : par::defaultThreads();
     // Each job writes only its own result, so the outcome is the same for any thread count.
-    auto parallel = [&](size_t n, const std::function<void(size_t)>& job) {
-        std::atomic<size_t> nextJob{0};
-        auto work = [&] {
-            for (size_t j; (j = nextJob.fetch_add(1)) < n;) job(j);
-        };
-        std::vector<std::thread> pool;
-        for (int t = 1; t < threads && (size_t)t < n; t++) pool.emplace_back(work);
-        work();
-        for (auto& t : pool) t.join();
-    };
+    threads = (unsigned)std::max<size_t>(1, std::min<size_t>(threads, todo.size()));
+    par::Pool pool(threads);
+    auto parallel = [&](size_t n, const std::function<void(size_t)>& job) { pool.run(n, job); };
     std::vector<char> safetyOnly(m.props.size(), 0);
     parallel(todo.size(), [&](size_t j) {
         const Property& p = m.props[todo[j]];
