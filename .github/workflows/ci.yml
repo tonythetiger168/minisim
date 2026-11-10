@@ -11,6 +11,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # mspice's tests compare every measurement with ngspice when it is installed.
+      - name: Install ngspice
+        run: sudo apt-get update && sudo apt-get install -y ngspice
+
       - name: Configure, build, and test
         run: CXX=g++ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 
