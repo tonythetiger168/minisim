@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlibc`, cell library checks and reports on the shared Liberty and LEF
+  readers: `mlibc check` (23 rules: function against timing arcs and
+  `timing_sense`, tables that shrink with load, missing setup or hold,
+  leakage states, drive strengths out of order, and Liberty against LEF),
+  `mlibc report` and `mlibc compare slow.lib fast.lib`. Multithreaded, with
+  the same output for any `-threads`. See `docs/LIBCHECK.md`.
 - `lib/mini45`: a generic 45 nm-class standard cell library for the tool
   line, written from scratch (not a foundry library): 88 cells (inverters,
   buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,

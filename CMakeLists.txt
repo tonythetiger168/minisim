@@ -82,6 +82,16 @@ if(Python3_FOUND)
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
 
+# Cell library checks and reports on the shared Liberty and LEF readers:
+# mlibc check lib.lib -lef cells.lef. No external dependencies.
+find_package(Threads REQUIRED)
+add_executable(mlibc src/mlibc.cpp)
+target_include_directories(mlibc PRIVATE src)
+target_link_libraries(mlibc PRIVATE Threads::Threads)
+add_test(NAME mlibc
+         COMMAND ${CMAKE_COMMAND} -DMLIBC=$<TARGET_FILE:mlibc> -DSRC=${CMAKE_SOURCE_DIR}
+                 -P ${CMAKE_SOURCE_DIR}/tests/mlibc.cmake)
+
 # The mini45 cell library (lib/mini45) is generated; the files in the tree
 # must be what the generator writes.
 if(Python3_FOUND)
@@ -368,7 +378,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minisim mlibc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -400,7 +410,7 @@ install(DIRECTORY lib/mini45 DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/lib
 # The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
-              docs/MINI45.md
+              docs/MINI45.md docs/LIBCHECK.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)

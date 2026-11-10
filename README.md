@@ -349,6 +349,16 @@ msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
 
 `docs/DATAPATH.md` lists every module and its ports.
 
+### Cell library checks: `mlibc`
+
+`mlibc check lib.lib -lef cells.lef` checks a Liberty library and its LEF for
+the mistakes that break the tools downstream (a function that disagrees with
+its timing arcs, tables that shrink with load, a flop without setup or hold,
+a macro of the wrong size, pins off the routing grid); `mlibc report` and
+`mlibc compare slow.lib fast.lib` summarize a library and check a pair of
+corners. See `docs/LIBCHECK.md`. The generic cell library it is tested on is
+`lib/mini45` (`docs/MINI45.md`).
+
 ### Lint and clock-domain checks: `mlint`
 
 `mlint` runs the same front end as `msim` and then checks the elaborated
