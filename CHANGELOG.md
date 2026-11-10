@@ -113,6 +113,9 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- `-xprop` is faster: an `if` evaluates its condition once, and clocked
+  blocks with merged branches run in parallel again. Ibex with `-xprop`:
+  42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
 - `-xprop`: an assignment to an array element chosen at run time
   (`if (we) mem[addr] <= d;`) is merged with the element's present value
   instead of blocking the merge or giving `x`.
