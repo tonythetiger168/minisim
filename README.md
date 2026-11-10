@@ -450,6 +450,19 @@ mdft: 5 flops in 3 clock domains
   t.clk: 3 flops (2 rising, 1 falling)
 ```
 
+On a gate netlist `mdft -insert_scan` stitches the flops into scan chains
+(scan cells from the Liberty library or a mux in front of D, balanced chains
+per clock domain, lockup latches, clock gates held open) and writes the
+netlist, a chain description for ATPG and a chain flush testbench.
+`mdft -mbist` generates a March memory BIST controller and collar for a RAM
+and reports the fault coverage of the chosen algorithm. See
+[docs/DFT.md](docs/DFT.md).
+
+```sh
+mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
+mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
+```
+
 `mlint` and `mdft` share one model of the elaborated design
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
