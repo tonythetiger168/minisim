@@ -30,7 +30,7 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_lefdef test_parallel test_wave)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_lefdef)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -41,10 +41,6 @@ endforeach()
 add_executable(test_liberty tests/test_liberty.cpp)
 target_include_directories(test_liberty PRIVATE src)
 add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
-
-find_package(Threads REQUIRED)
-target_link_libraries(test_parallel PRIVATE Threads::Threads)
-target_link_libraries(test_wave PRIVATE Threads::Threads)
 # Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
 # libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
 find_package(OpenSSL COMPONENTS Crypto)
@@ -78,6 +74,16 @@ add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
+# Shared by the tools: the thread pool (src/parallel.hpp) and the VCD / FST
+# waveform reader (src/wave_reader.hpp). No external dependencies.
+find_package(Threads REQUIRED)
+foreach(t test_parallel test_wave)
+  add_executable(${t} tests/${t}.cpp)
+  target_include_directories(${t} PRIVATE src)
+  target_compile_options(${t} PRIVATE -UNDEBUG)
+  target_link_libraries(${t} PRIVATE Threads::Threads)
+  add_test(NAME ${t} COMMAND ${t})
+endforeach()
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
