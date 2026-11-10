@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Shared headers for the tools: `src/parallel.hpp` (default thread count,
+  the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
+  `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
+  (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
