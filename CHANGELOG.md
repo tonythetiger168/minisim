@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdft -bscan`: IEEE 1149.1 boundary-scan insertion (TAP controller,
+  instruction, BYPASS, IDCODE and boundary registers, 2-state, 3-state and
+  bidirectional pads, EXTEST / SAMPLE / PRELOAD / CLAMP / HIGHZ / INTEST)
+  and the BSDL file; `mdft -bsdl` checks a BSDL file (rules BSD001..009) and
+  writes its device tests as SVF and a self-checking testbench
+  (`docs/JTAG.md`).
+- `mdft -icl`: IEEE 1687 IJTAG. Reads ICL, writes the scan network as RTL
+  (optionally behind a TAP), and retargets PDL (`iWrite`, `iRead`, `iApply`,
+  `iCall`, ...) through SIBs and scan muxes to SVF and a testbench.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
@@ -66,6 +75,9 @@ Spec references are IEEE 1800-2023 clauses.
   subroutine call.
 
 ### Fixed
+- An inout port connected to a whole net is now that net (23.3.3.1). It was
+  two continuous assignments, one each way, so the net kept the last value
+  driven after every driver had gone to z.
 - A signed member of an unpacked struct (`int`, `byte`) read as unsigned, so
   `s.f < 0` was false for a negative member (7.2).
 - `super.f()` with a comment just before `super` called the override (and

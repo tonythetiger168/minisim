@@ -27,6 +27,8 @@
 
 #include "lintir.hpp"
 #include "version.hpp"
+#include "dft/cli.hpp"          // boundary scan and IJTAG (-bscan, -bsdl, -icl, -pdl)
+#include "dft/slang_ports.hpp"
 
 using namespace lintir;
 
@@ -276,7 +278,8 @@ void usage() {
                  "  -top M         the top module    -f <file>  an argument file\n"
                  "  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
                  "  -version       print the version\n"
-                 "  --help-slang   list every front-end option\n";
+                 "  --help-slang   list every front-end option\n\n";
+    dft::Cli::usage(std::cout);
 }
 
 void listRules() {
@@ -291,6 +294,9 @@ void listRules() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Boundary scan and IJTAG (src/dft/): -bsdl and -icl run here and return.
+    dft::Cli jtag;
+    if (int rc = jtag.parse(argc, argv); rc >= 0) return rc;
     std::vector<std::string> fwd{argv[0]};
     Rules rules;
     bool werror = false, quiet = false;
@@ -329,6 +335,19 @@ int main(int argc, char** argv) {
 
     Dft dft(d, rep);
     dft.run();
+    if (jtag.bscan) {  // the wrapper needs the top module's ports and its clocks
+        std::set<std::string> clocks;
+        for (auto& [c, info] : dft.domains)
+            if (primaryInput(*c) && inTop(*c)) clocks.insert(std::string(c->name));
+        try {
+            std::string top;
+            std::vector<dft::Port> ports = dft::topPorts(*fe.comp, top);
+            return jtag.runBscan(ports, top, clocks);
+        } catch (const dft::Error& e) {
+            std::cerr << "mdft: " << e.what() << "\n";
+            return 2;
+        }
+    }
     rep.print(std::cout, /*quiet*/ true, "mdft");
     if (!quiet) {
         std::map<std::string, int> per;

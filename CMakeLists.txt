@@ -252,6 +252,12 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
 
+  # Boundary scan and IJTAG: generated RTL and testbenches run on msim.
+  add_test(NAME mdft_jtag
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_jtag
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_jtag.cmake)
+
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec

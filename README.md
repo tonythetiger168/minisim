@@ -372,6 +372,16 @@ mdft: 5 flops in 3 clock domains
   t.clk: 3 flops (2 rising, 1 falling)
 ```
 
+`mdft` also does IEEE 1149.1 boundary scan and IEEE 1687 IJTAG
+([docs/JTAG.md](docs/JTAG.md)); every flow can write SVF and a self-checking
+testbench that `msim` runs:
+
+```sh
+mdft -bscan rtl/*.sv -top chip -tb chip_tb.sv    # chip_bscan.sv (TAP + boundary register), chip_bscan.bsdl
+mdft -bsdl chip.bsdl -svf chip.svf               # check a BSDL file (BSD001..009), write its device tests
+mdft -icl net.icl -icl_rtl net.sv -pdl t.pdl -iproc all -svf t.svf   # IJTAG network RTL, PDL retargeting
+```
+
 `mlint` and `mdft` share one model of the elaborated design
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
