@@ -137,47 +137,17 @@ struct Diagnoser {
         readPatterns(tr);
     }
 
-    // matpg's pattern file ("p stuck|transition <port bits> <scan bits>").
+    // matpg's pattern file; the file numbers the stuck-at set first.
     void readPatterns(bool tr) {
-        std::ifstream f(o.patterns);
-        if (!f) throw DiagError("cannot open " + o.patterns);
-        size_t nPI = m.piNets.size(), nSC = m.scanCells.size();
-        std::string line;
-        int ln = 0, nStuck = 0, nTrans = 0;
-        while (std::getline(f, line)) {
-            ln++;
-            std::istringstream is(line);
-            std::string w, kind, a, b;
-            if (!(is >> w)) continue;
-            auto bad = [&](const std::string& why) {
-                throw DiagError(o.patterns + ":" + std::to_string(ln) + ": " + why);
-            };
-            if (w == "design") {
-                is >> a;
-                if (a != ds.top) bad("the patterns are for '" + a + "', the netlist is '" + ds.top + "'");
-            } else if (w == "inputs" || w == "scan") {
-                size_t n = 0;
-                is >> n;
-                if (n != (w == "inputs" ? nPI : nSC)) bad("the " + w + " count does not match this netlist");
-            } else if (w == "p") {
-                is >> kind >> a >> b;
-                if (b == "-") b.clear();
-                if (a.size() != nPI || b.size() != nSC) bad("a pattern of the wrong length");
-                bool t = kind == "transition";
-                (t ? nTrans : nStuck)++;
-                if (t != tr) continue;
-                Pattern p;
-                p.reserve(nPI + nSC);
-                for (char ch : a + b) {
-                    if (ch != '0' && ch != '1') bad("a pattern bit that is not 0 or 1");
-                    p.push_back((uint8_t)(ch - '0'));
-                }
-                pats.push_back(std::move(p));
-            }
+        std::vector<atpg::PatSet> sets;
+        try {
+            sets = atpg::readPatterns(o.patterns, ds, m);
+        } catch (const atpg::ModelError& e) {
+            throw DiagError(e.what());
         }
-        // The file numbers the stuck-at set first.
-        firstId = tr ? nStuck : 0;
-        otherPatterns = tr ? nStuck : nTrans;
+        firstId = tr ? (int)sets[0].pats.size() : 0;
+        otherPatterns = (int)sets[tr ? 0 : 1].pats.size();
+        pats = std::move(sets[tr ? 1 : 0].pats);
         if (pats.empty()) throw DiagError(o.patterns + ": no " + o.fault + " patterns");
     }
 

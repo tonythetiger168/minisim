@@ -267,6 +267,16 @@ last 412              optional: the tester stopped after pattern 412
 17 po done            pattern 17, output port bit `done` was wrong
 ```
 
+`matpg`'s testbench writes this format when it is run with `+faillog`
+(`<top>.faillog`), so a simulated faulty netlist can be diagnosed the same way
+as a tester log:
+
+```
+matpg chip_scan.v -top chip -patterns pats.txt -tb chip_tb.v
+msim chip_tb.v chip_faulty.v cells.v +faillog
+mdft -diagnose chip.faillog -patterns pats.txt chip_scan.v -top chip
+```
+
 Patterns count from 0 in pattern file order (the stuck-at set first, then the
 transition set). Chains count from 0 in the order `matpg` prints them. Cells
 count from 0 at the scan-in end, and a failure refers to the value the cell

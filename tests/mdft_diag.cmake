@@ -1,7 +1,7 @@
 # mdft failure diagnosis self-test: faults are injected with the shared fault
 # simulator, the fail log they produce is diagnosed, and the injected fault
 # must come back first.
-#   cmake -DMDFT=<mdft> -DMATPG=<matpg> -DSRC=<source dir> -DOUT=<scratch dir> -P mdft_diag.cmake
+#   cmake -DMDFT=<mdft> -DMATPG=<matpg> [-DMSIM=<msim>] -DSRC=<source dir> -DOUT=<scratch dir> -P mdft_diag.cmake
 set(T ${SRC}/tests/atpg)
 file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT})
@@ -123,5 +123,25 @@ endif()
 run(${MDFT} -diagnose one.log ${T}/scan.v)
 if(NOT rc EQUAL 2 OR NOT out MATCHES "needs -patterns")
   message(FATAL_ERROR "no patterns: exit ${rc}\n${out}")
+endif()
+
+# End to end: the netlist with a gate output tied low is simulated against
+# matpg's testbench, and the fail log the testbench writes is diagnosed.
+if(MSIM)
+  run_ok(${MATPG} ${T}/scan.v -fault all -faultsim pats.txt -tb scan_tb.v -quiet)
+  file(READ ${T}/scan.v net)
+  string(REPLACE ".Y(n12));" ".Y(n12_cut));\n  assign n12 = 1'b0;" net "${net}")
+  string(REPLACE "  wire q0;" "  wire n12_cut;\n  wire q0;" net "${net}")
+  file(WRITE ${OUT}/scan_bad.v "${net}")
+  run(${MSIM} scan_tb.v scan_bad.v ${T}/generic_cells.v +faillog)
+  expect(sim "ATPG FAIL")
+  run_ok(${D} -diagnose scan.faillog)
+  expect(e2e "defect 1: explains" "   1  100.0%[ 0-9]+ 0      0  sa1 U12/A" "= sa0 U12/Y")
+  if(out MATCHES "defect 2" OR out MATCHES "not explained")
+    message(FATAL_ERROR "the simulated fail log is not explained by one fault:\n${out}")
+  endif()
+  # The same part under the transition patterns: a stuck line is a slow one.
+  run(${D} -diagnose scan.faillog -diag_fault transition)
+  expect(e2e_tr "U12/")
 endif()
 message(STATUS "mdft_diag: ok (${n} injected faults)")

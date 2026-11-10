@@ -352,7 +352,7 @@ if(MINISIM_WITH_SLANG)
                    -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt.cmake)
   # Failure diagnosis: injected faults come back as the first suspect.
   add_test(NAME mdft_diag
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMATPG=$<TARGET_FILE:matpg>
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMATPG=$<TARGET_FILE:matpg> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_diag
                    -P ${CMAKE_SOURCE_DIR}/tests/mdft_diag.cmake)
 
