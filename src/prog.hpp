@@ -214,6 +214,9 @@ struct Instr {
     E e;
     Edge edge = ANY;
     size_t target = 0;
+    // JmpIfNot: where to go when the condition is unknown (x), if not `target` (msim -xprop).
+    static constexpr size_t NOX = (size_t)-1;
+    size_t xt = NOX;
     uint64_t delay = 0;
     int drv = -1;         // Assign from a continuous driver: driver id on a resolved net
     int gate = -1;        // a gate or UDP output driver: its gateRecs() entry (SDF DEVICE, 32.4.1)
@@ -251,6 +254,9 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    // Assign to a temporary only this process uses (msim -xprop): nothing
+    // watches it, so the value is stored at once (Sim::poke).
+    bool tmp = false;
     const UdpTable* udp = nullptr;   // Udp
     // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
     // signal-name prefixes relative to the top ("" is the top, "u1." an
@@ -608,6 +614,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
         // An always_comb with if / case / loops: jumps that stay in the body.
         if (p.code[i].k == IK::JmpIfNot || p.code[i].k == IK::Jmp) {
             if (p.code[i].target > n - 2) return false;
+            if (p.code[i].xt != Instr::NOX && p.code[i].xt > n - 2) return false;
             c.branches = true;
             continue;
         }
@@ -621,6 +628,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
         // A target chosen at run time (a[i] = ..., v[i] = ...) has no fixed output signal.
         if (p.code[i].arr || !p.code[i].aidx.empty() || p.code[i].bidx) return false;
         if (p.code[i].de || p.code[i].delay || !p.code[i].dly.empty()) return false;
+        if (p.code[i].tmp) continue;   // a temporary of its own: not an output
         bool seen = false;
         for (int o : c.outs) seen |= o == p.code[i].sig;
         if (!seen) c.outs.push_back(p.code[i].sig);
@@ -746,7 +754,8 @@ inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::v
 
 // A clocked process that only schedules nonblocking assignments:
 //     WaitEdge (fixed events) ; { Nba | JmpIfNot | Jmp } ... ; Jmp 0
-// with every jump inside the body. Typical always @(posedge clk) RTL. It
+// with every jump inside the body. It may also assign temporaries of its
+// own (Instr::tmp, msim -xprop). Typical always @(posedge clk) RTL. It
 // reads signals and writes nothing until the NBA region, so all such
 // processes triggered in one slot can run at the same time.
 inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
@@ -762,6 +771,8 @@ inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
             if (x.drv >= 0 || x.nbaLater || x.de || x.delay) return false;  // a <= #d b goes through the kernel
         } else if (x.k == IK::JmpIfNot || x.k == IK::Jmp) {
             if (x.target < 1 || x.target > n - 1) return false;
+            if (x.xt != Instr::NOX && (x.xt < 1 || x.xt > n - 1)) return false;
+        } else if (x.k == IK::Assign && x.tmp) {
         } else
             return false;
     }
