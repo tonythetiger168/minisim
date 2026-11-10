@@ -480,9 +480,9 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
             uint8_t d = ps.direction == ArgumentDirection::In ? 1 : ps.direction == ArgumentDirection::Out ? 2 : 3;
             if (ps.internalSymbol) portDir[ps.internalSymbol] = d;
             if (d == 1 && on("NAME008") && !P.portIn.ok(ps.name))
-                rep.add("NAME008", ps.location, "input port '" + std::string(ps.name) + "' does not match " + P.portIn.src);
+                rep.add("NAME008", ps.location, "input port '" + shown(ps) + "' does not match " + P.portIn.src);
             if (d == 2 && on("NAME008") && !P.portOut.ok(ps.name))
-                rep.add("NAME008", ps.location, "output port '" + std::string(ps.name) + "' does not match " + P.portOut.src);
+                rep.add("NAME008", ps.location, "output port '" + shown(ps) + "' does not match " + P.portOut.src);
         }
         visitDefault(body);
         finish();
@@ -558,7 +558,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         if (b && b->getDefinition().definitionKind == DefinitionKind::Interface) return;  // u_if.sig
         if (n.symbol.kind == SymbolKind::Parameter) return;
         rep.add("SYN017", at(n, body.location),
-                "hierarchical reference to '" + std::string(n.symbol.name) + "' in design code; pass it through a port");
+                "hierarchical reference to '" + shown(n.symbol) + "' in design code; pass it through a port");
     }
 
     // ------------------------------------------------------------- declarations
@@ -566,15 +566,15 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
     void clash(const Symbol& s) {
         if (s.name.empty() || !on("NAME009")) return;
         std::string lo = lintcfg::lower(s.name);
-        auto [it, fresh] = lowerNames.try_emplace({s.getParentScope(), lo}, std::string(s.name));
+        auto [it, fresh] = lowerNames.try_emplace({s.getParentScope(), lo}, shown(s));
         if (!fresh && it->second != s.name)
             rep.add("NAME009", s.location,
-                    "'" + std::string(s.name) + "' and '" + it->second + "' differ only in case");
+                    "'" + shown(s) + "' and '" + it->second + "' differ only in case");
     }
 
     void declCheck(const ValueSymbol& s, bool isNet) {
         if (!moduleLevel(s) || s.name.empty()) return;
-        std::string name(s.name);
+        std::string name = shown(s);
         const Type& ty = s.getType().getCanonicalType();
         bool isPort = portDir.count(&s) != 0;
         clash(s);
@@ -612,13 +612,13 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
 
     void handle(const ParameterSymbol& p) {
         if (on("NAME003") && !p.isFromGenvar() && !P.param.ok(p.name))
-            rep.add("NAME003", p.location, "parameter '" + std::string(p.name) + "' does not match " + P.param.src);
+            rep.add("NAME003", p.location, "parameter '" + shown(p) + "' does not match " + P.param.src);
         visitDefault(p);
     }
 
     void handle(const TypeAliasType& t) {
         if (on("NAME013") && !P.typedefName.ok(t.name))
-            rep.add("NAME013", t.location, "typedef '" + std::string(t.name) + "' does not match " + P.typedefName.src);
+            rep.add("NAME013", t.location, "typedef '" + shown(t) + "' does not match " + P.typedefName.src);
     }
 
     void handle(const DefParamSymbol& d) {
@@ -649,7 +649,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
             if (m.kind == SymbolKind::Variable || m.kind == SymbolKind::Net || m.kind == SymbolKind::Instance ||
                 m.kind == SymbolKind::InstanceArray) {
                 rep.add("NAME011", loc,
-                        "this generate block has no label, so '" + std::string(m.name) +
+                        "this generate block has no label, so '" + shown(m) +
                             "' inside it is reached through a generated name (genblk1...); add ': label'");
                 return;
             }
@@ -661,11 +661,11 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
     }
 
     void handle(const InstanceSymbol& inst) {
-        std::string iname(inst.name);
+        std::string iname = shown(inst);
         clash(inst);
         if (on("NAME007") && inst.isModule() && !iname.empty() && !P.instance.ok(iname))
             rep.add("NAME007", inst.location, "instance '" + iname + "' does not match " + P.instance.src);
-        std::string mod(inst.getDefinition().name);
+        std::string mod = shown(inst.getDefinition());
 
         if (on("CON003") && inst.getSyntax() && inst.getSyntax()->kind == syntax::SyntaxKind::HierarchicalInstance) {
             int ordered = 0;
@@ -685,7 +685,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                 continue;
             }
             const auto& ps = conn->port.as<PortSymbol>();
-            std::string pn(ps.name);
+            std::string pn = shown(ps);
             if (!x) {
                 if (ps.direction == ArgumentDirection::In && !ps.getInitializer())
                     rep.add("CON001", inst.location,
@@ -738,7 +738,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
             std::vector<std::string> outside;
             f.getBody().visit(makeVisitor([&](auto&, const NamedValueExpression& n) {
                 if (!isSignal(n.symbol) || !moduleLevel(n.symbol)) return;
-                std::string nm(n.symbol.name);
+                std::string nm = shown(n.symbol);
                 if (std::find(outside.begin(), outside.end(), nm) == outside.end()) outside.push_back(nm);
             }));
             if (!outside.empty()) {
@@ -746,7 +746,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                 for (size_t i = 0; i < outside.size() && i < 3; i++) list += (i ? ", '" : "'") + outside[i] + "'";
                 if (outside.size() > 3) list += ", ...";
                 rep.add("FUNC001", f.location,
-                        "function '" + std::string(f.name) + "' uses " + list +
+                        "function '" + shown(f) + "' uses " + list +
                             " from the module around it; pass it as an argument");
             }
         }
@@ -771,7 +771,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                 auto pd = t ? portDir.find(t) : portDir.end();
                 if (z && t && (pd == portDir.end() || pd->second != 3))
                     rep.add("SYN016", ca.location,
-                            "'" + std::string(t->name) + "' is driven to Z, but it is not an inout port: an internal "
+                            "'" + shown(*t) + "' is driven to Z, but it is not an inout port: an internal "
                             "tri-state; use a mux");
             }
         }
@@ -803,7 +803,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                 // Not the loop index of "for (i = 0; ...) mem[i] = 0".
                 bool index = t && isSignal(*t) && t->as<ValueSymbol>().getType().isPredefinedInteger();
                 if (t && !index && moduleLevel(*t) && std::find(names.begin(), names.end(), t->name) == names.end())
-                    names.push_back(std::string(t->name));
+                    names.push_back(shown(*t));
                 v.visitDefault(a);
             }));
             if (!names.empty())
@@ -822,7 +822,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
 
     static std::string exprName(const Expression& e) {
         const Symbol* s = oneName(e);
-        return s ? std::string(s->name) : std::string("?");
+        return s ? shown(*s) : std::string("?");
     }
 
     // always @* and always @(a or b): latches, the sensitivity list, <=.
@@ -835,13 +835,13 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         for (const Symbol* t : targets) {
             if (tmp.locals.count(t) || def.count(t) || !tmp.whole.count(t) || !moduleLevel(*t)) continue;
             rep.add("LAT001", p.location,
-                    "'" + std::string(t->name) +
+                    "'" + shown(*t) +
                         "' is not assigned on every path of this combinational block, so it holds its old value "
                         "(a latch); add an else or a default");
         }
         for (const Symbol* t : tmp.nba)
             rep.add("SEQ003", p.location,
-                    "non-blocking assignment to '" + std::string(t->name) + "' in a combinational always; use =");
+                    "non-blocking assignment to '" + shown(*t) + "' in a combinational always; use =");
         if (!s.implicit && on("COMB001")) {
             std::set<const Symbol*> listed;
             for (auto* e : s.levels) {
@@ -852,7 +852,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
             std::vector<std::string> missing;
             for (const Symbol* r : tmp.reads) {
                 if (!isSignal(*r) || !moduleLevel(*r) || listed.count(r) || targets.count(r)) continue;
-                missing.push_back(std::string(r->name));
+                missing.push_back(shown(*r));
             }
             std::sort(missing.begin(), missing.end());
             if (!missing.empty()) {
@@ -879,9 +879,9 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         SourceLocation loc = p.location;
         if (f.clk) {
             if (f.clkEdge == EdgeKind::NegEdge)
-                rep.add("CLK002", loc, "this flop is clocked on the falling edge of '" + std::string(f.clk->name) + "'");
+                rep.add("CLK002", loc, "this flop is clocked on the falling edge of '" + shown(*f.clk) + "'");
             if (on("NAME004") && !P.clock.ok(f.clk->name))
-                rep.add("NAME004", f.clk->location, "clock '" + std::string(f.clk->name) + "' does not match " + P.clock.src);
+                rep.add("NAME004", f.clk->location, "clock '" + shown(*f.clk) + "' does not match " + P.clock.src);
         }
         if (s.edges.size() >= 2 && !f.tmplOk) {
             rep.add("RST007", loc,
@@ -894,10 +894,10 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
             if (!named) rep.add("RST004", loc, "this flop has no reset");
             if (named && on("NAME006") && f.srstLow && !P.activeLow.ok(f.srst->name))
                 rep.add("NAME006", f.srst->location,
-                        "reset '" + std::string(f.srst->name) + "' is active low but does not match " + P.activeLow.src);
+                        "reset '" + shown(*f.srst) + "' is active low but does not match " + P.activeLow.src);
             return;
         }
-        std::string rn(f.arst->name);
+        std::string rn = shown(*f.arst);
         if (on("NAME005") && !P.reset.ok(rn))
             rep.add("NAME005", f.arst->location, "reset '" + rn + "' does not match " + P.reset.src);
         if (on("NAME006") && f.arstLow && !P.activeLow.ok(rn))
@@ -912,7 +912,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                 if (!isConstExpr(a.right())) {
                     const Symbol* t = firstTarget(a.left());
                     rep.add("RST006", at(a, loc),
-                            "'" + std::string(t ? t->name : "?") +
+                            "'" + (t ? shown(*t) : std::string("?")) +
                                 "' is reset asynchronously to a value that is not constant");
                 }
                 v.visitDefault(a);
@@ -926,7 +926,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                     if (inRst.count(t) || !moduleLevel(*t)) continue;
                     if (auto* v = t->as_if<ValueSymbol>(); v && v->getType().isUnpackedArray()) continue;  // a memory
                     rep.add("RST003", loc,
-                            "'" + std::string(t->name) + "' is assigned in this block but not in its reset branch, so '" +
+                            "'" + shown(*t) + "' is assigned in this block but not in its reset branch, so '" +
                                 rn + "' becomes its enable; reset it, or move it to a block without reset");
                 }
         }
@@ -1102,12 +1102,12 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         bool arg = rhs.kind == ExpressionKind::EmptyArgument;
         if (!arg && !a.isCompound()) {
             if (isName(lhs) && isName(rhs) && nameOf(lhs) == nameOf(rhs))
-                rep.add("EXP001", loc, "'" + std::string(nameOf(lhs)->name) + "' is assigned to itself");
+                rep.add("EXP001", loc, "'" + shown(*nameOf(lhs)) + "' is assigned to itself");
             if (!inPort && lhs.type->isIntegral() && rhs.type->isIntegral()) {
                 bitwidth_t lw = lhs.type->getBitWidth();
                 bitwidth_t rw = bitsOf(rhs, body);
                 const Symbol* t = firstTarget(lhs);
-                std::string tn = t ? std::string(t->name) : std::string("the target");
+                std::string tn = t ? shown(*t) : std::string("the target");
                 if (rw > lw && !litXZ(rhs))  // 'bx is 32 bits of X by the book; nobody means that
                     rep.add("W001", loc,
                             std::to_string(rw) + " bits are assigned to '" + tn + "', which is " + std::to_string(lw) +
@@ -1251,14 +1251,14 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         for (auto& [s, u] : use)
             if ((u.bits & UseBlk) && (u.bits & UseNba))
                 rep.add("SEQ001", s->location,
-                        "'" + std::string(s->name) + "' has both blocking and non-blocking assignments");
+                        "'" + shown(*s) + "' has both blocking and non-blocking assignments");
         for (auto& [s, blk] : seqBlocking) {
             const Use& u = use[s];
             auto pd = portDir.find(s);
             bool elsewhere = u.multi || (u.reader && u.reader != blk) || (pd != portDir.end() && pd->second != 1);
             if (elsewhere)
                 rep.add("SEQ002", blk->location,
-                        "blocking assignment to '" + std::string(s->name) +
+                        "blocking assignment to '" + shown(*s) +
                             "' in an edge-triggered always, and it is read outside the block; use <=");
         }
         // For the unused rules: every symbol's use, by where it is declared,
@@ -1268,7 +1268,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         for (const Symbol* s : decls) {
             if (!s->location || P.unusedOk.ok(s->name)) continue;
             auto pd = portDir.find(s);
-            outp.cands.push_back({locKey(s->location), std::string(s->name), s->location,
+            outp.cands.push_back({locKey(s->location), shown(*s), s->location,
                                   pd == portDir.end() ? uint8_t(0) : pd->second});
         }
     }
@@ -1605,7 +1605,7 @@ struct Global : ASTVisitor<Global, VisitFlags::Symbols> {
 
     // ----------------------------------------------------------------- results
 
-    static std::string nameIn(const Symbol& s, bool local) { return local ? std::string(s.name) : path(s); }
+    static std::string nameIn(const Symbol& s, bool local) { return local ? shown(s) : path(s); }
 
     void analyze(Report& rep) {
         // Clocks and resets, by joined signal.
@@ -1654,7 +1654,7 @@ struct Global : ASTVisitor<Global, VisitFlags::Symbols> {
         for (const Symbol* s : dataOrder)
             if (clocks.count(find(s)))
                 rep.add("CLK001", dataRead[s],
-                        "clock '" + std::string(s->name) + "' is used as data; keep clock gating and muxing in dedicated cells");
+                        "clock '" + shown(*s) + "' is used as data; keep clock gating and muxing in dedicated cells");
         loops(rep);
     }
 
@@ -1801,7 +1801,7 @@ inline void checkDefinitions(Compilation& comp, const Params& P, Report& rep) {
         if (s->kind != SymbolKind::Definition) continue;
         const auto& d = s->as<DefinitionSymbol>();
         if (d.definitionKind != DefinitionKind::Module || !d.location) continue;
-        std::string name(d.name);
+        std::string name = shown(d);
         if (rep.rules.enabled("NAME001") && !P.module.ok(name))
             rep.add("NAME001", d.location, "module '" + name + "' does not match " + P.module.src);
         if (rep.rules.enabled("NAME010") && name.size() > P.maxLen)

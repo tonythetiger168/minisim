@@ -134,6 +134,11 @@ inline const protfront::ProtectedCode*& namePC() {
     static const protfront::ProtectedCode* pc = nullptr;
     return pc;
 }
+// A symbol's own name, for a message.
+inline std::string shown(const Symbol& s) {
+    if (namePC() && !namePC()->visible(s)) return "<protected>";
+    return std::string(s.name);
+}
 inline std::string path(const Symbol& s) {
     if (namePC() && !namePC()->visible(s)) return "<protected>";
     std::string p = s.getHierarchicalPath();

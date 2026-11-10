@@ -266,6 +266,7 @@ void usage() {
                  "  -upf <file>      check IEEE 1801 (UPF) power intent against the design (UPF rules)\n"
                  "  -power_top <i>   the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
+              << protfront::Options::help() <<
                  "  -version         print the version\n"
                  "  --help-slang     list every front-end option\n\n"
                  "  In the source: // mlint: waive RULE reason   (this line, or the next if alone on its line)\n"
@@ -401,6 +402,7 @@ int main(int argc, char** argv) {
     bool werror = false, quiet = false, powerTopSet = false, showWaived = false, list = false, stats = false;
     std::string upfPath, powerTop, jsonPath, explainRule;
     unsigned threads = (unsigned)std::max<size_t>(1, cpuTopo().cpus.size());
+    FrontEnd fe;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -461,6 +463,7 @@ int main(int argc, char** argv) {
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
+        if (fe.prot.take(argc, argv, i)) continue;
         fwd.push_back(a);
     }
     lintrules::Params params = lintrules::Params::from(cfg, cfg.errors);
@@ -505,7 +508,6 @@ int main(int argc, char** argv) {
     };
 
     // Pass 1: the front end, with its own warnings and errors.
-    FrontEnd fe;
     if (int rc = fe.run(fwd, "mlint front end")) return rc < 0 ? 0 : rc;
 
     // Pass 2: our rules. Two walks of the whole hierarchy on this thread (they
@@ -516,6 +518,7 @@ int main(int argc, char** argv) {
     Report rep;
     rep.sm = fe.comp->getSourceManager();
     rep.rules = rules;
+    if (fe.pc.any()) { rep.pc = &fe.pc; namePC() = &fe.pc; }
     Design d;
     d.gather(*fe.comp, rep);
     lap("design model");
@@ -572,6 +575,9 @@ int main(int argc, char** argv) {
     });
     if (upfFailed) return 1;
     lintrules::checkUnused(outs, rep);
+    // Findings in protected code are counted, never shown (IEEE 1735).
+    for (Report& r : reps) rep.hiddenSeen.insert(r.hiddenSeen.begin(), r.hiddenSeen.end());
+    size_t hidden = rep.hiddenSeen.size();
     for (Report& r : reps)
         for (Finding& f : r.out)
             if (rep.seen.insert({f.rule, f.file + ":" + std::to_string(f.line) + ":" + std::to_string(f.col) + ":" + f.text}).second)
@@ -580,6 +586,9 @@ int main(int argc, char** argv) {
     lap("rules");
     std::vector<Final> fs = resolve(rep.out, cfg);
     printText(std::cout, fs, cfg, quiet, showWaived);
+    if (hidden)
+        std::cout << "mlint: " << hidden << (hidden == 1 ? " finding" : " findings")
+                  << " in protected code (details hidden)\n";
     if (!jsonPath.empty() && !writeJson(jsonPath, fs)) {
         std::cerr << "mlint: cannot write '" << jsonPath << "'\n";
         return 2;
