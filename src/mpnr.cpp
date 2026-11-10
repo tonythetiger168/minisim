@@ -22,6 +22,10 @@ static void usage() {
     "  -tiehi CELL/PIN   tie cell for constant 1 (default: found by name)\n"
     "  -tielo CELL/PIN   tie cell for constant 0\n"
     "  -no_fill          do not add filler cells\n"
+    "  -no_straps        no vertical power straps over the rows' rails\n"
+    "  -strap_layer N    routing layer of the straps (default: the top vertical layer)\n"
+    "  -strap_width UM   strap width (four wire widths)\n"
+    "  -strap_pitch UM   distance between straps of one supply (32 row heights)\n"
     "  -place_only       stop after placement\n"
     "  -def FILE         write the placed and routed design as DEF\n"
     "  -netlist FILE     write the final flat netlist (with tie and filler cells)\n"
@@ -40,6 +44,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> lefs, netlists;
   std::string defOut, floorplanDef, svgOut, reportOut, netlistOut, checkDef, gdsOut;
   GdsOptions gopt;
+  StrapOptions sopt;
   NetlistOptions nopt;
   PlaceOptions popt;
   RouteOptions ropt;
@@ -63,6 +68,10 @@ int main(int argc, char** argv) {
       else if (a == "-tiehi") nopt.tieHi = val();
       else if (a == "-tielo") nopt.tieLo = val();
       else if (a == "-no_fill") popt.fillers = false;
+      else if (a == "-no_straps") sopt.on = false;
+      else if (a == "-strap_layer") sopt.layer = atoi(val().c_str());
+      else if (a == "-strap_width") sopt.widthUm = atof(val().c_str());
+      else if (a == "-strap_pitch") sopt.pitchUm = atof(val().c_str());
       else if (a == "-place_only") placeOnly = true;
       else if (a == "-def" || a == "-o") defOut = val();
       else if (a == "-netlist") netlistOut = val();
@@ -126,13 +135,17 @@ int main(int argc, char** argv) {
     if (verbose) fprintf(stderr, "  refinement %.2f s\n", secs(tl));
     tl = clk::now();
     int fillers = popt.fillers ? addFillers(db) : 0;
-    makeRails(db);
+    int straps = 0;
+    std::string noStraps;
+    if (makeRails(db) && sopt.on) straps = makeStraps(db, sopt, ropt.maxLayer, noStraps);
     if (verbose) fprintf(stderr, "  fillers %.2f s\n", secs(tl));
     double placeSecs = secs(t1);
     printf("floorplan: die %.2f x %.2f um, core %.2f x %.2f um, %zu rows, utilization %.1f%%\n", db.um(db.die.w()), db.um(db.die.h()),
            db.um(db.core.w()), db.um(db.core.h()), db.rows.size(), 100 * cellArea / (db.um(db.core.w()) * db.um(db.core.h())));
     printf("placement: wire length (half perimeter) %.1f um global, %.1f legal, %.1f refined (%d changes); mean move %.2f um; %d fillers; %.2f s\n",
            db.um(gpLen), db.um(lgLen), db.um(dpLen), swaps, db.um((int64_t)moved), fillers, placeSecs);
+    if (straps) printf("power: %d straps over the rails\n", straps);
+    else if (sopt.on && !noStraps.empty()) printf("power: no straps: %s\n", noStraps.c_str());
 
     RouteResult rr;
     double routeSecs = 0;

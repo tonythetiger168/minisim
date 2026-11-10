@@ -41,6 +41,10 @@ with `-tielo CELL/PIN` and `-tiehi CELL/PIN`.
 | `-margin UM` | Space between the core and the die edge (default four rows) |
 | `-min_layer N`, `-max_layer N` | Routing layers used for wires, 1 = the first routing layer in the LEF (default 2 to the top). Pins on layer `min_layer - 1` are reached with a via. |
 | `-no_fill` | Do not add filler cells |
+| `-no_straps` | No vertical power straps |
+| `-strap_layer N` | Routing layer of the straps (the top vertical layer) |
+| `-strap_width UM` | Strap width (four wire widths of the layer) |
+| `-strap_pitch UM` | Distance between straps of one supply (32 row heights) |
 | `-place_only` | Stop after placement |
 | `-def FILE` | The placed and routed design |
 | `-netlist FILE` | The final flat netlist, with the tie and filler cells, for LVS and timing |
@@ -81,6 +85,19 @@ with `-tielo CELL/PIN` and `-tiehi CELL/PIN`.
    every net one connected piece (opens), no metal of two nets touching
    (shorts) or closer than `SPACING`. The same check runs on any DEF with
    `-check`.
+
+## Power
+
+Every row gets its VDD and VSS rail from the cells' supply pins (`SHAPE
+FOLLOWPIN` special wires). Vertical straps (`SHAPE STRIPE`) on the top
+vertical routing layer then tie the rails of each supply together: one strap
+per supply every `-strap_pitch`, spread evenly over the core, with a stack of
+single-cut vias down to each of its rails. The router treats straps and
+stacks as obstructions. Straps are left out, with a note, when the top
+vertical layer is one the cells' pins are reached from (fewer than three
+layers above the rails) unless `-strap_layer` names it, and when a floorplan
+DEF brings its own special nets. The check reports a supply whose wiring is
+in more than one piece.
 
 ## GDS out
 
@@ -146,7 +163,8 @@ The same flow routes 5,000 Nangate45 cells clean on the real Nangate45 LEF
 - No global-routing stage: a design too dense for its layers (above about
   85% utilization on three routing layers) leaves nets unrouted and takes
   long to say so.
-- Power: rails only, no straps or rings.
+- Power: rails and vertical straps with single-cut via stacks; no rings, no
+  horizontal straps, no check of current or voltage drop.
 
 ## Files
 
@@ -156,7 +174,7 @@ The same flow routes 5,000 Nangate45 cells clean on the real Nangate45 LEF
 | `src/pnr_db.hpp` | Netlist bound to LEF macros, floorplan and placement state |
 | `src/pnr_place.hpp` | Floorplan, global placement, legalization, refinement, fillers |
 | `src/pnr_route.hpp` | Routing grid, pin access, A* search, negotiation |
-| `src/pnr_out.hpp` | DEF, netlist and SVG output, floorplan DEF input |
+| `src/pnr_out.hpp` | Rails and straps, DEF, netlist and SVG output, floorplan DEF input |
 | `src/pnr_gds.hpp` | GDS out: layer map, cell abstracts, the top cell |
 | `src/pnr_check.hpp` | Opens, shorts and spacing on a routed DEF |
 | `src/lef.hpp`, `src/def.hpp` | LEF and DEF readers, DEF writer (shared) |
