@@ -86,3 +86,19 @@ file(READ ${OUT}/dfxtp.spice out)
 expect(".subckt sky130_fd_sc_hd__dfxtp_1 CLK D Q VGND VNB VPB VPWR\n")
 expect("M22 VPWR n14 n16 VPB sky130_fd_pr__pfet_01v8_hvt w=1 l=0.15\n")
 run(2 lvs -deck ${SRC}/tests/pv/mini.drc ${OUT}/pv_bad.gds)
+
+# A routed DEF with its LEF, rules from the LEF technology: the metal is
+# clean, and two pairs of v2 cuts are closer than the cut spacing.
+run(1 drc -lef ${SRC}/tests/pv/def/tiny.lef ${SRC}/tests/pv/def/counter.def -write-deck ${OUT}/tiny.drc -o ${OUT}/counter.txt)
+expect("cell counter, 607 shapes on 7 layers, 17.1 x 18.2 um, 1 unit = 0.0005 um")
+expect("m2.space        0  m2 spacing")
+expect("v2.space        2  v2 spacing")
+expect("2 violations in 1 of 27 rules")
+file(READ ${OUT}/tiny.drc out)
+expect("layer m1 1/0\n")
+expect("rule m1.width width(m1) < 0.07 \"m1 width\"\n")
+expect("rule v1.above v1 - m2 \"v1 without m2\"\n")
+# The written deck gives the same result when passed back with -deck.
+run(1 drc -lef ${SRC}/tests/pv/def/tiny.lef -deck ${OUT}/tiny.drc ${SRC}/tests/pv/def/counter.def -q)
+expect("2 violations in 1 of 27 rules")
+run(2 drc -deck ${OUT}/tiny.drc ${SRC}/tests/pv/def/counter.def)

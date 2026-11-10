@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpv drc -lef tech.lef routed.def`: design rule checking of a routed DEF,
+  with the rules taken from the LEF technology when no `-deck` is given
+  (`-write-deck` shows them).
 - `mpv lvs`: extracts the transistor netlist of a layout (nets from `connect`
   statements, names and ports from `label`, MOS devices with W and L from
   `device mos`) and writes it as SPICE. `src/lvs.hpp` also holds the netlist

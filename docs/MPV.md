@@ -33,6 +33,23 @@ Exit status: 0 clean, 1 violations, 2 a usage or input error.
 | `-threads <n>` | worker threads; default is every hardware thread |
 | `-q` | print only the rules with violations |
 
+## A routed DEF as the layout
+
+```sh
+mpv drc -lef tech.lef -lef cells.lef routed.def                  # rules from the LEF
+mpv drc -lef tech.lef -deck rules.drc routed.def -o drc.txt      # your own deck
+mpv drc -lef tech.lef routed.def -write-deck tech.drc            # see the rules it made
+```
+
+The pins of every placed cell, the wires and vias of the nets and special
+nets and the design's pins become shapes; `-obs` adds the cells'
+obstructions. LEF layers get GDS numbers by their position in the LEF (the
+first layer is `1/0`). Without `-deck` the rules are made from the LEF
+technology: width, spacing and minimum area of each routing layer, spacing
+of each cut layer, and every cut covered by the metal below and above. The
+extent for density rules is the die area. The LEF and DEF readers are the
+shared `src/lef.hpp` and `src/def.hpp`.
+
 ## Rule deck
 
 One statement per line; `#` starts a comment. Lengths are in microns, areas
@@ -162,6 +179,7 @@ in a canonical form, so the report is identical for every thread count.
 | `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared with the other physical tools |
 | `src/geom.hpp` | regions of rectangles: booleans, sizing, boundary edges, connected polygons |
 | `src/layout.hpp` | a GDS library flattened to rectangles per layer |
+| `src/layout_def.hpp` | a routed DEF with its LEF as a flat layout; a deck from the LEF technology |
 | `src/drc.hpp` | the deck parser and the checks |
 | `src/lvs.hpp` | netlist extraction and netlist comparison |
 | `src/mpv.cpp` | the command line |

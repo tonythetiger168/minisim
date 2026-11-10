@@ -2,6 +2,12 @@
 //
 //   mpv drc -deck rules.drc chip.gds [-top CELL] [-o results.txt] [-threads N]
 //
+//   mpv drc -lef tech.lef [-lef cells.lef] [-deck rules.drc] routed.def
+//
+// A routed DEF is checked the same way: cell pins, wires and vias become
+// shapes (layout_def.hpp). Without -deck the rules are the widths, spacings
+// and areas of the LEF technology.
+//
 // Reads the layout (gds.hpp), flattens the top cell (layout.hpp), runs every
 // rule of the deck (drc.hpp), prints one line per rule and writes the
 // violation markers to the results file. Exit status: 0 clean, 1 violations,
@@ -22,6 +28,7 @@
 #include <string>
 #include <thread>
 
+#include "layout_def.hpp"
 #include "lvs.hpp"
 #include "version.hpp"
 
@@ -31,7 +38,11 @@ int usage(FILE* f) {
     std::fputs(
         "usage: mpv drc -deck <rules> <layout.gds> [options]\n"
         "       mpv lvs -deck <rules> <layout.gds> [-top <cell>] [-o <extracted.spice>] [-threads <n>]\n"
+        "       mpv drc -lef <tech.lef> [-lef <cells.lef>] [-deck <rules>] <routed.def> [options]\n"
         "  -deck <file>     rule deck (see docs/MPV.md)\n"
+        "  -lef <file>      LEF for a DEF layout; without -deck the rules come from it\n"
+        "  -obs             with a DEF: also place the cells' obstructions\n"
+        "  -write-deck <f>  write the deck made from the LEF\n"
         "  -top <cell>      cell to check (default: the one top cell)\n"
         "  -o <file>        write the violation markers here\n"
         "  -max <n>         markers written per rule (default 1000; counts stay exact)\n"
@@ -51,11 +62,12 @@ std::string um(double v) {
 }
 
 int drcMain(int argc, char** argv) {
-    std::string deckFile, gdsFile, top, outFile;
+    std::string deckFile, gdsFile, top, outFile, writeDeck;
+    std::vector<std::string> lefs;
     unsigned threads = std::thread::hardware_concurrency();
     if (!threads) threads = 1;
     size_t maxMarkers = 1000;
-    bool quiet = false;
+    bool quiet = false, withObs = false;
     for (int i = 0; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&](std::string& dst) {
@@ -68,6 +80,9 @@ int drcMain(int argc, char** argv) {
         else if (a == "-top") { if (!val(top)) return 2; }
         else if (a == "-o") { if (!val(outFile)) return 2; }
         else if (a == "-q") quiet = true;
+        else if (a == "-obs") withObs = true;
+        else if (a == "-lef") { if (!val(v)) return 2; lefs.push_back(v); }
+        else if (a == "-write-deck") { if (!val(writeDeck)) return 2; }
         else if (a == "-threads" || a == "-max") {
             if (!val(v)) return 2;
             char* end = nullptr;
@@ -80,16 +95,43 @@ int drcMain(int argc, char** argv) {
         else if (gdsFile.empty()) gdsFile = a;
         else { std::fprintf(stderr, "mpv: more than one layout given (%s, %s)\n", gdsFile.c_str(), a.c_str()); return 2; }
     }
-    if (deckFile.empty() || gdsFile.empty()) return usage(stderr);
+    bool isDef = gdsFile.size() > 4 && gdsFile.compare(gdsFile.size() - 4, 4, ".def") == 0;
+    if (gdsFile.empty() || (deckFile.empty() && !(isDef && !lefs.empty()))) return usage(stderr);
+    if (isDef && lefs.empty()) { std::fprintf(stderr, "mpv: a DEF layout needs its LEF (-lef)\n"); return 2; }
 
     auto t0 = std::chrono::steady_clock::now();
     std::string err;
     drc::Deck deck;
-    if (!drc::readDeck(deckFile, deck, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
-    gds::Library lib;
-    if (!gds::read(gdsFile, lib, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
     layout::Flat flat;
-    if (!layout::flatten(lib, top, flat, err, threads)) { std::fprintf(stderr, "mpv: %s: %s\n", gdsFile.c_str(), err.c_str()); return 2; }
+    if (isDef) {
+        phys::Tech tech;
+        phys::Design design;
+        try {
+            for (const std::string& l : lefs) phys::readLef(l, tech);
+            phys::readDef(gdsFile, design);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "mpv: %s\n", e.what());
+            return 2;
+        }
+        layout::LayerMap map = layout::defaultLayerMap(tech);
+        if (!layout::fromDef(tech, design, map, withObs, flat, err)) { std::fprintf(stderr, "mpv: %s: %s\n", gdsFile.c_str(), err.c_str()); return 2; }
+        if (deckFile.empty() || !writeDeck.empty()) {
+            std::string text = layout::deckFromLef(tech, map);
+            if (!writeDeck.empty()) {
+                std::ofstream f(writeDeck);
+                if (!(f << text)) { std::fprintf(stderr, "mpv: cannot write %s\n", writeDeck.c_str()); return 2; }
+            }
+            if (deckFile.empty()) {
+                std::istringstream in(text);
+                if (!drc::parseDeck(in, deck, err)) { std::fprintf(stderr, "mpv: rules from the LEF: %s\n", err.c_str()); return 2; }
+            }
+        }
+    } else {
+        gds::Library lib;
+        if (!gds::read(gdsFile, lib, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
+        if (!layout::flatten(lib, top, flat, err, threads)) { std::fprintf(stderr, "mpv: %s: %s\n", gdsFile.c_str(), err.c_str()); return 2; }
+    }
+    if (!deckFile.empty() && !drc::readDeck(deckFile, deck, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
 
     drc::Engine eng(deck, flat, threads);
     std::vector<drc::RuleResult> res = eng.run();
