@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mformal`: formal property checking on the msim front end. Proves or
+  falsifies concurrent and immediate `assert`, takes `assume` as input
+  constraints, reaches `cover` or proves it unreachable. Bounded model
+  checking and k-induction (simple path, proven assertions as lemmas) on
+  CaDiCaL; a VCD of the whole design for every counterexample and cover
+  trace, `-tb` for a testbench that replays it in msim, `-json`; one job per
+  property on every core (`-threads N`), same result for any thread count.
+  See `docs/FORMAL.md`.
 - `mplan`: verification planning and tracking. A plan file maps features to
   tests, code coverage, covergroups and assertions; `mplan report` scores it
   against mregress results and the coverage database, keeps a history of
