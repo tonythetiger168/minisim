@@ -30,15 +30,13 @@
 //   -explore <ns,...> schedule at each clock period and print a table instead of writing RTL
 //   -report <file>    write the summary as JSON
 //   -D<name>[=<v>]    define a macro
-//   -threads <n>      worker threads, or all (default: one per physical core, at most 8)
+//   -threads <n>      worker threads, or all (default: every hardware thread)
 //   -q                no summary on stdout
-#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
-#include <thread>
 
-#include "cpu.hpp"
+#include "parallel.hpp"
 #include "hls_ir.hpp"
 
 using namespace hls;
@@ -51,31 +49,20 @@ struct Cfg {
   bool share = true;
 };
 
-// Threads. TODO: move to the shared src/parallel.hpp once it is on main.
-int g_threads = 1;
+// Threads come from the shared src/parallel.hpp. The wrapper only makes a
+// failure deterministic: the first error in index order is the one reported.
+unsigned g_threads = 1;
 template <class F>
 void parallelFor(size_t n, F fn) {
-  size_t nt = std::min<size_t>(g_threads, n);
-  if (nt <= 1) {
-    for (size_t i = 0; i < n; i++) fn(i);
-    return;
-  }
-  std::atomic<size_t> next{0};
   std::vector<std::exception_ptr> errs(n);
-  auto work = [&] {
-    for (size_t i; (i = next.fetch_add(1)) < n;) {
-      try {
-        fn(i);
-      } catch (...) {
-        errs[i] = std::current_exception();
-      }
+  par::parallelFor(n, g_threads, [&](size_t i) {
+    try {
+      fn(i);
+    } catch (...) {
+      errs[i] = std::current_exception();
     }
-  };
-  std::vector<std::thread> th;
-  for (size_t t = 1; t < nt; t++) th.emplace_back(work);
-  work();
-  for (auto& t : th) t.join();
-  for (auto& e : errs)   // the first error in index order, so a failure is reported the same way every run
+  });
+  for (auto& e : errs)
     if (e) std::rethrow_exception(e);
 }
 
@@ -1318,7 +1305,7 @@ int main(int argc, char** argv) {
   int nvec = 20;
   uint64_t seed = 1;
   bool quiet = false, dump = false;
-  g_threads = std::max(1, std::min(cpuTopo().fastCores(), 8));
+  g_threads = par::defaultThreads();
   auto split = [](const std::string& s) {
     std::vector<std::string> r;
     std::stringstream ss(s);
@@ -1352,8 +1339,9 @@ int main(int argc, char** argv) {
       else if (a == "-report") report = val();
       else if (a == "-threads") {
         std::string n = val();
-        g_threads = n == "all" ? std::max(1, cpuTopo().logical()) : std::stoi(n);
-        if (g_threads < 1) throw Error("mhls: -threads must be at least 1");
+        int k = n == "all" ? (int)par::defaultThreads() : std::stoi(n);
+        if (k < 1) throw Error("mhls: -threads must be at least 1");
+        g_threads = (unsigned)k;
       }
       else if (a == "-q") quiet = true;
       else if (a == "-dump-ir") dump = true;
@@ -1394,8 +1382,6 @@ int main(int argc, char** argv) {
         j.src = &src;
         std::vector<bool> live;
         j.fn = lowerAndClean(P, src, opt, live);
-        int saved = g_threads;
-        (void)saved;
         j.sc = schedule(j.fn, c);
         j.sc.entryLive = live;
         char buf[200];

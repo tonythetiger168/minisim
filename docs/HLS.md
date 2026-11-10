@@ -104,7 +104,7 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 | `-tb <file>`, `-cref <file>`, `-vectors <n>`, `-seed <n>` | verification collateral |
 | `-explore <ns,...>` | schedule at each clock period, print states, latency, register bits, area |
 | `-report <file>` | the summary as JSON |
-| `-threads <n>\|all` | worker threads (default: one per physical core, at most 8); the output is the same for every count |
+| `-threads <n>\|all` | worker threads (default: every hardware thread, hyper-threads included); the output is the same for every count |
 | `-dump-ir` | print the scheduled graph |
 
 The operator delays are a generic 28 nm-class model and only decide where
