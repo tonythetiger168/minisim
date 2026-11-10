@@ -40,7 +40,7 @@ h3{margin:0;padding:5px 10px;font-size:11px;letter-spacing:.06em;text-transform:
 #schp{grid-area:sch;border-top:1px solid var(--line);border-left:1px solid var(--line);overflow:auto;min-height:0;min-width:0}#sch{padding:6px 10px}
 svg{display:block}svg text{font:11px ui-monospace,monospace;fill:var(--fg)}
 svg .n rect{fill:var(--bg);stroke:var(--dim)}svg .n.me rect{stroke:var(--acc);stroke-width:2}svg .n{cursor:pointer}
-svg .b rect{fill:var(--panel);stroke:var(--fg)}svg .b text{fill:var(--dim)}svg .b{cursor:pointer}
+svg .b rect{fill:var(--panel);stroke:var(--fg)}svg .b text.bn{fill:var(--fg);font-weight:600}svg text.net{cursor:pointer;fill:var(--acc)}svg .b text{fill:var(--dim)}svg .b{cursor:pointer}
 svg path{fill:none;stroke:var(--dim)}svg path.c{stroke-dasharray:3 3}svg .tri{fill:none;stroke:var(--fg)}
 #wbar{display:flex;gap:8px;align-items:center;padding:3px 10px;border-bottom:1px solid var(--line);color:var(--dim)}
 #wc{flex:1;min-height:0;position:relative;overflow-y:auto}canvas{display:block;width:100%}
@@ -172,6 +172,23 @@ function schematic(){const me=st.sig,dv=drvOf[me].slice(0,12),ld=loadOf[me].slic
   ld.forEach((i,k)=>{const yb=y(k,ld.length);o+=wire(X[2]+WN,ym,X[3],yb,!D[i].reads.includes(me))+wire(X[3]+WB,yb,X[4],y(outs.indexOf(D[i].sig),outs.length))+box(i,X[3],yb)});
   ins.forEach((s,k)=>o+=node(s,X[0],y(k,ins.length)));outs.forEach((s,k)=>o+=node(s,X[4],y(k,outs.length)));o+=node(me,X[2],ym,'me');
   $('sch').innerHTML=`<svg viewBox="0 0 ${X[4]+WN+4} ${ht}" width="${X[4]+WN+4}">${o}</svg><div class="none">Solid: data. Dashed: a condition. Click a signal to move the view.</div>`}
+function blocks(){const P=st.scope,ch=DB.scopes.filter(s=>s.path.includes('.')&&scopeOf(s.path)==P);
+  if(!ch.length){$('sch').innerHTML='<div class="none">No instances inside '+esc(P)+'. Select a signal to draw its drivers and loads.</div>';return}
+  const ix=new Map(ch.map((s,k)=>[s.path,k])),B=ch.map(s=>({s,ins:[],outs:[],lv:0})),src=new Map,use=new Map;
+  D.forEach(d=>{if(d.kind!='port')return;const ts=scopeOf(S[d.sig].path);
+    if(ix.has(ts)){if(d.reads.some(r=>S[r].path.startsWith(ts+'.')))return;const nets=d.reads.filter(r=>scopeOf(S[r].path)==P);B[ix.get(ts)].ins.push({p:d.sig,nets});nets.forEach(n=>(use.get(n)||use.set(n,[]).get(n)).push(ix.get(ts)))}
+    else if(ts==P)d.reads.forEach(r=>{const b=ix.get(scopeOf(S[r].path));if(b===undefined)return;let o=B[b].outs.find(o=>o.p==r);if(!o)B[b].outs.push(o={p:r,nets:[]});o.nets.push(d.sig);src.set(d.sig,{b,p:r})})});
+  for(let pass=0;pass<B.length;pass++){let ch2=0;B.forEach((b,k)=>b.ins.forEach(i=>i.nets.forEach(n=>{const f=src.get(n);if(f&&f.b!=k&&B[f.b].lv+1>b.lv&&B[f.b].lv+1<B.length){b.lv=B[f.b].lv+1;ch2=1}})));if(!ch2)break}
+  const BW=120,GX=150,PH=15,LM=130,top=[],pos=new Map;let o='',H=0,Wd=0;
+  B.forEach((b,k)=>{const h=Math.max(b.ins.length,b.outs.length,1)*PH+24,x=LM+b.lv*(BW+GX),y=(top[b.lv]||8);top[b.lv]=y+h+14;b.x=x;b.y=y;b.h=h;H=Math.max(H,y+h+8);Wd=Math.max(Wd,x+BW+LM);
+    b.ins.forEach((i,n)=>pos.set(i.p,[x,y+26+n*PH]));b.outs.forEach((q,n)=>pos.set(q.p,[x+BW,y+26+n*PH]))});
+  const cut=(t,n)=>t.length>n?t.slice(0,n-1)+'…':t,lab=(s,x,y,a)=>`<text class="net" data-s="${s}" x="${x}" y="${y+3}" text-anchor="${a}"><title>${esc(S[s].path)}</title>${esc(cut(leaf(S[s].path),17))}</text>`;
+  B.forEach((b,k)=>{b.ins.forEach(i=>{const[x,y]=pos.get(i.p);let lone=!i.nets.length;i.nets.forEach(n=>{const f=src.get(n);if(f){const[a,c]=pos.get(f.p);o+=`<path d="M${a} ${c}C${a+GX/2} ${c} ${x-GX/2} ${y} ${x} ${y}"><title>${esc(S[n].path)}</title></path>`}else lone=n+1});
+      if(lone)o+=`<path d="M${x-10} ${y}H${x}"/>`+(lone===true?'':lab(lone-1,x-13,y,'end'))});
+    b.outs.forEach(q=>{const[x,y]=pos.get(q.p),n=q.nets.find(n=>!(use.get(n)||[]).length);o+=n===undefined?(q.nets.length?lab(q.nets[0],x+4,y-5,'start'):''):`<path d="M${x} ${y}h10"/>`+lab(n,x+13,y,'start')});
+    o+=`<g class="b" data-p="${esc(b.s.path)}"><rect x="${b.x}" y="${b.y}" width="${BW}" height="${b.h}"/><text class="bn" x="${b.x+BW/2}" y="${b.y+13}" text-anchor="middle">${esc(cut(leaf(b.s.path)+' : '+b.s.def,19))}</text>`+
+      b.ins.map(i=>`<text x="${b.x+4}" y="${pos.get(i.p)[1]+3}">${esc(cut(leaf(S[i.p].path),8))}</text>`).join('')+b.outs.map(q=>`<text x="${b.x+BW-4}" y="${pos.get(q.p)[1]+3}" text-anchor="end">${esc(cut(leaf(S[q.p].path),8))}</text>`).join('')+'</g>'});
+  $('sch').innerHTML=`<svg viewBox="0 0 ${Wd} ${H}" width="${Wd}">${o}</svg><div class="none">Instances inside ${esc(P)}. Click a block to go in, a net to select it.</div>`}
 function waves(){const cv=$('cv'),RH=22,NW=200,dpr=window.devicePixelRatio||1,w=$('wc').clientWidth,h=Math.max(st.rows.length*RH+20,40);
   cv.width=w*dpr;cv.height=h*dpr;cv.style.height=h+'px';const g=cv.getContext('2d');g.scale(dpr,dpr);
   const css=n=>getComputedStyle(document.body).getPropertyValue(n).trim();g.font='11px ui-monospace,monospace';g.textBaseline='middle';
@@ -197,7 +214,7 @@ function goDriver(i){const d=D[i],own=scopeOf(S[d.sig].path);
   if(sc)st.scope=sc.path;st.file=d.file;tree();sigList();source(d.line)}
 document.body.addEventListener('click',e=>{const t=e.target.closest('[data-s],[data-d],[data-p]');if(!t)return;
   if(t.dataset.s!==undefined){if(t.dataset.t!==undefined&&W){st.t=Math.max(0,Math.min(END,+t.dataset.t));$('tcur').textContent='t = '+st.t+' '+(DB.timescale||'')}pick(+t.dataset.s)}else if(t.dataset.d!==undefined)goDriver(+t.dataset.d);
-  else{st.scope=t.dataset.p;st.file=-1;tree();sigList();const sc=DB.scopes.find(s=>s.path==st.scope);source(sc?sc.line:0)}});
+  else{st.scope=t.dataset.p;st.file=-1;tree();sigList();const sc=DB.scopes.find(s=>s.path==st.scope);source(sc?sc.line:0);blocks()}});
 $('q').addEventListener('change',e=>{const v=e.target.value.trim();let i=byPath.get(v);
   if(i===undefined)i=S.findIndex(s=>s.path.endsWith('.'+v));if(i===undefined||i<0)i=S.findIndex(s=>s.path.includes(v));e.target.value='';if(i>=0)pick(i)});
 $('q').addEventListener('input',e=>{const v=e.target.value;if(v.length<2)return;let n=0,h='';for(const s of S){if(s.path.includes(v)){h+=`<option value="${esc(s.path)}">`;if(++n>40)break}}$('ql').innerHTML=h});
@@ -210,6 +227,6 @@ $('prev').onclick=()=>step(-1);$('next').onclick=()=>step(1);$('clr').onclick=()
 $('cone').onclick=()=>{if(st.sig<0)return;drvOf[st.sig].forEach(i=>[...D[i].reads,...D[i].ctl].forEach(s=>W&&W[s]&&!st.rows.includes(s)&&st.rows.push(s)));waves()};
 window.addEventListener('resize',waves);
 $('stat').textContent=DB.scopes.length+' instances · '+S.length+' signals · '+D.length+' drivers';
-tree();sigList();source();setT(DB.at===undefined?END:DB.at);
+tree();sigList();source();setT(DB.at===undefined?END:DB.at);blocks();
 </script></body></html>
 )MDV";

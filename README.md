@@ -49,8 +49,11 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
+| `src/mpnr.cpp`, `src/pnr_*.hpp` | `mpnr` place and route: netlist database, placement, detailed router, DEF out, layout check ([docs/PNR.md](docs/PNR.md)) |
 | `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
 | `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
+| `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
+| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck and design rule checks |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -97,7 +100,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `+define+N[=V]`, `-D N[=V]` | Preprocessor define |
 | `+incdir+<dir>`, `-I <dir>` | Include directory |
 | `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
-| `-cov [<file>]` | Write line / branch / toggle coverage (default `cov.json`); see `mcov` |
+| `-cov [<file>]` | Write line / branch / toggle / condition / FSM coverage (default `cov.json`); see `mcov`. `-cm line+cond+fsm+tgl` (as VCS) does the same |
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
 | `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
@@ -192,8 +195,8 @@ and `mbug -h`.
 ### Coverage: `msim -cov` and `mcov`
 
 `msim -cov [file.json]` records line coverage, branch coverage (both outcomes
-of every `if`, `case` arm, and loop test), and toggle coverage (every signal
-bit seen rising and falling) into `cov.json`. `mcov` merges databases and
+of every `if`, `case` arm, and loop test), toggle coverage (every signal
+bit seen rising and falling), condition coverage and FSM coverage into `cov.json`. `mcov` merges databases and
 reports them; `mregress -cov` does both for a whole regression:
 
 ```sh
@@ -204,6 +207,53 @@ mregress tests.list -cov            # regress.d/cov.json + regress.d/cov_html/
 ```
 
 The LCOV file works with `genhtml` and with editor and CI coverage plugins.
+`-cov` works in the interpreter and with `-compile`, with any `-threads`;
+the database is the same in each.
+
+**Condition coverage** (as VCS `-cm cond`). A condition `a && b && c`,
+`a || b || c`, or the condition of `?:`, with n terms has n + 1 vectors: the
+one where no term decides alone (all 1 for `&&`, all 0 for `||`) and, for each
+term, the one where only that term has the deciding value. A vector with an
+x term counts for none. Conditions in procedures, continuous assignments,
+functions and tasks are covered; not those in constraints, assertions and
+covergroups, constant ones, or ones whose terms call a function or read
+through a class handle or a container (every term is evaluated to tell the
+vectors apart, so a term must be safe to evaluate).
+
+**FSM coverage** (as VCS `-cm fsm`). msim finds the state registers itself: a
+variable that one clocked procedure assigns, whose next value is always a
+constant (literal, parameter or enum name), itself, or a next-state variable
+assigned that way by one combinational procedure, where that logic branches
+on the register with `case (state)` or `if (state == S)`. The states are the
+constants compared with or assigned to the register; the transitions are the
+ones the next-state logic can make. A constant assigned under an `if` outside
+any branch on the state is taken as the reset, and transitions that only the
+reset makes are marked `(reset)`; `mcov report -fsm-reset-filter` leaves them
+out (VCS `-cm_fsmresetfilter`). A change the logic does not show (a forced
+value, say) is listed as "not in the next-state logic". Not extracted: one-hot
+registers tested bit by bit, states computed by arithmetic, registers written
+through a part select or by a task.
+
+```sh
+mcov report all.json -detail              # every vector, state and transition
+mcov report all.json -uncovered           # only what is missing
+mcov report all.json -min-cond 80 -min-fsm-state 100 -min-fsm-trans 90
+```
+
+```
+Condition tb.sv:30:15  a && b
+    -1- a
+    -2- b
+    -1- -2-  Hits
+     1   1   3
+     0   1   Not covered
+     1   0   Not covered
+
+FSM tb.u.state  (module ctrl, tb.sv:8)  states 3/4, transitions 3/6
+    state FAIL                 Not covered
+    RUN -> IDLE                Not covered  (reset)
+    RUN -> FAIL                Not covered
+```
 
 The database also holds functional coverage: the bins of every covergroup
 type (19) and the evaluations, passes and failures of every assertion (16).
@@ -380,6 +430,18 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
+### High-level synthesis: `mhls`
+
+`mhls` turns a C/C++ function into SystemVerilog: an FSM with datapath, or
+with `-pipeline` a pipeline that takes one input per cycle. It also writes
+a self-checking testbench, so the result is one `msim` run away from proven
+against the C. See [docs/HLS.md](docs/HLS.md).
+
+```sh
+mhls fir.c -top fir -clock 5 -o fir.sv -tb fir_tb.sv
+msim fir.sv fir_tb.sv -top fir_tb          # PASS: fir 20 calls, latency 2..2 cycles
+```
+
 ### Datapath library: `dw/`
 
 `dw/` is a library of synthesizable, parameterized building blocks
@@ -413,6 +475,21 @@ msdc -list                                  # the rules
 The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
 (`src/tcl.hpp`) are shared with the timing and synthesis tools. See
 [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
+
+### Static timing analysis: `msta`
+
+`msta` times a gate-level netlist against SDC constraints with Liberty
+libraries, PrimeTime style, and builds without the slang front end:
+
+```sh
+msta -lib cells.lib netlist.v -top top -sdc top.sdc      # check_timing, worst setup and hold paths, summary
+msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf  # delays and timing checks for msim -sdf
+msta -f run.tcl                                          # report_timing, report_constraint, ... in a Tcl script
+```
+
+It runs on every core by default (`-threads N`), with the same results at any
+thread count. Commands, what is modeled and the current limits are in
+[docs/STA.md](docs/STA.md).
 
 ### Lint and clock-domain checks: `mlint`
 
@@ -633,6 +710,27 @@ count, and reports open and shorted nets. On the OpenROAD `gcd` test design
 its total net capacitance is within 2% of OpenRCX's, and the ground and
 coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
+### Physical verification: `mpv`
+
+`mpv drc` checks a GDSII layout against a rule deck: width, spacing,
+enclosure, overhang, area and density checks on drawn and derived layers
+(`&`, `|`, `-`, `grow`, `interact`, ...). It needs no slang and builds with
+the default configuration.
+
+```sh
+mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
+mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
+```
+
+```
+rule poly.1a  width(poly) < 0.15            "poly width"
+rule poly.8   overhang(poly, diff) < 0.13   "poly end cap beyond diff"
+rule licon.5a enclosure(licon & diff, diff | tap) < 0.04  "diff enclosure of licon"
+```
+
+It runs on every hardware thread by default (`-threads N`), with the same
+report for every thread count. The deck format, the results file and the
+limits are in [docs/MPV.md](docs/MPV.md).
 
 ### Virtual prototypes: `-mvp`
 

@@ -1220,6 +1220,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Assign:
             case IK::Nba: {
                 Val v = eval(i.e, rd);
+                if (i.tmp) { S.poke(i.sig, v, i.hi, i.lo); pc++; break; }   // a temporary of its own (msim -xprop)
                 if (__builtin_expect(g_upf, 0) && entry->pd >= 0 && g_pdMode[(size_t)entry->pd] > 0 && i.sig >= 0 && !isRel(i.sig) && !i.arr)
                     v = upfWrite(entry, i.sig, i.hi, i.lo, v);
                 if (i.drv >= 0) {
@@ -1377,8 +1378,8 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++; break;
             }
             case IK::JmpIfNot:
-                if (truth(eval(i.e, rd)) == 1) pc++;
-                else { if (g_cov) covHit(i.taken); pc = i.target; }
+                if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
+                else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
                 break;
             case IK::Jmp:       pc = i.target; break;
             case IK::WaitEdge:
@@ -1618,10 +1619,11 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
                 break;
             }
             case IK::JmpIfNot:
-                if (truth(eval(i.e, rd)) == 1) pc++;
-                else { if (g_cov) covHit(i.taken); pc = i.target; }
+                if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
+                else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
                 break;
             case IK::Jmp: pc = i.target; break;
+            case IK::Assign: S.poke(i.sig, eval(i.e, rd), i.hi, i.lo); pc++; break;   // a temporary of its own
             default: pc++; break;  // seqShape admits nothing else
         }
     }
@@ -1642,8 +1644,8 @@ static void execComb(const void* ctx) {
         }
         if (i.k == IK::JmpIfNot) {
             if (g_cov) covHit(i.hits);
-            if (truth(eval(i.e, rd)) == 1) pc++;
-            else { if (g_cov) covHit(i.taken); pc = i.target; }
+            if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
+            else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
             continue;
         }
         if (i.k == IK::Jmp) { if (g_cov) covHit(i.hits); pc = i.target; continue; }
@@ -1651,6 +1653,7 @@ static void execComb(const void* ctx) {
         pc++;
         if (g_cov) covHit(i.hits);
         Val v = eval(i.e, rd);
+        if (i.tmp) { S.poke(i.sig, v, i.hi, i.lo); continue; }   // a temporary of its own
         if (i.drv >= 0) {
             // A driver of part of a net drives Z on the other bits, as in exec().
             if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
