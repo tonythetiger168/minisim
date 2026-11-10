@@ -125,6 +125,29 @@ if(NOT rc EQUAL 2 OR NOT out MATCHES "needs -patterns")
   message(FATAL_ERROR "no patterns: exit ${rc}\n${out}")
 endif()
 
+# matpg's test cubes go straight into the scan compression encoder: its
+# chain numbers are mapped by the "chains" line of the cube file.
+run_ok(${MATPG} ${T}/scan.v -cubes cubes.txt -quiet)
+run_ok(${MDFT} -edt_encode -scandef ${SRC}/tests/dft/lbist/scan_chains.json -edt_cubes cubes.txt -edt_patterns edt.txt)
+expect(cubes "[0-9]+ of [0-9]+ cubes encoded")
+if(out MATCHES "there is no 'chains' line")
+  message(FATAL_ERROR "matpg -cubes has no chains line:\n${out}")
+endif()
+file(STRINGS ${OUT}/cubes.txt c0 REGEX "^0 0 ")
+file(STRINGS ${OUT}/cubes.txt hdr REGEX "^chains ")
+file(STRINGS ${OUT}/edt.txt l1 REGEX "^0 load chain1 ")
+file(STRINGS ${OUT}/edt.txt l0 REGEX "^0 load chain0 ")
+string(REGEX REPLACE "^0 0 " "" c0 "${c0}")
+string(REPLACE "x" "[01]" c0 "${c0}")
+if(hdr MATCHES "^chains scan_in\\[1\\]")
+  set(got "${l1}")
+else()
+  set(got "${l0}")
+endif()
+if(NOT got MATCHES " ${c0}$")
+  message(FATAL_ERROR "cube 0 of matpg's chain 0 (${c0}) is not what the encoder loads: ${got}")
+endif()
+
 # End to end: the netlist with a gate output tied low is simulated against
 # matpg's testbench, and the fail log the testbench writes is diagnosed.
 if(MSIM)

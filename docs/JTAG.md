@@ -279,6 +279,12 @@ output channel for that cycle), expected compacted responses (they need the
 good-machine responses from fault simulation), and reading the ATPG tool's
 own pattern format directly.
 
+`matpg -cubes FILE` writes cubes the encoder reads as they are: it numbers
+the chains in its own order and names their scan-in ports in a `chains` line,
+which the encoder uses to find each chain in the scan description, and its
+`<pattern> pi <bits>` lines (the port inputs) are copied to the compressed
+pattern file.
+
 ## Failure diagnosis: `mdft -diagnose`
 
 When a part fails scan test, the tester's fail log says which scan cells and
