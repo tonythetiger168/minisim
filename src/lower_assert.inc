@@ -63,11 +63,13 @@ int newAssert(int type, int dir, const slang::ast::Statement& st) {
 // 20.10 prints it, with the assertion's name for %m.
 void emitAssertError(const slang::ast::Statement& st, const std::string& name) {
     auto [file, line] = fileLine(st.sourceRange.start());
+    bool hidden = hideMsgIf() && hideMsgIf()(st.sourceRange.start());
     std::string escFile, escName;
     for (char c : file) { escFile += c; if (c == '%') escFile += '%'; }
-    for (char c : name) { escName += c; if (c == '%') escName += '%'; }
+    for (char c : hidden ? instPath(scope) + ".<protected assertion>" : name) { escName += c; if (c == '%') escName += '%'; }
     Instr i; i.k = IK::Display;
-    i.fmt = "Error: \"" + escFile + "\", " + std::to_string(line) + ": " + escName + ": at time %0t";
+    i.fmt = "Error: \"" + escFile + "\", " + (hidden ? std::string("protected code") : std::to_string(line)) + ": " +
+            escName + ": at time %0t";
     E t = node(Op::Time);
     t->k = mk(1, 64);
     i.args.push_back(t);
