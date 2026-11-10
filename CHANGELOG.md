@@ -26,6 +26,14 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal`: fairness. A strong obligation in an `assume`
+  (`assume property (req |-> s_eventually !req)`) restricts the loops a
+  liveness counterexample may use.
+- `mformal` is faster on larger designs: PDR lifts each state to the bits
+  that matter, and a short induction with a small PDR budget runs before the
+  deep search (8-way arbiter liveness 24 s to 4 s, a failure 300 cycles deep
+  6.6 s to 1.7 s, one thread). It solves through `src/sat.hpp` and takes its
+  threads from `src/parallel.hpp`. Benchmark designs are in `bench/formal`.
 - `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
   failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
   `strong()`, `always s_eventually`) is proven or falsified with a loop
@@ -56,6 +64,7 @@ Spec references are IEEE 1800-2023 clauses.
   or as per-bit synchronizer cells, enable-qualified buses and Gray-coded
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
+  `-clock-group`, `-static`. See `docs/CDC.md`.
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
 - Shared headers for the tools: `src/parallel.hpp` (default thread count,
   the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
@@ -96,6 +105,12 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `mlibc`, cell library checks and reports on the shared Liberty and LEF
+  readers: `mlibc check` (23 rules: function against timing arcs and
+  `timing_sense`, tables that shrink with load, missing setup or hold,
+  leakage states, drive strengths out of order, and Liberty against LEF),
+  `mlibc report` and `mlibc compare slow.lib fast.lib`. Multithreaded, with
+  the same output for any `-threads`. See `docs/LIBCHECK.md`.
 - `lib/mini45`: a generic 45 nm-class standard cell library for the tool
   line, written from scratch (not a foundry library): 88 cells (inverters,
   buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,
@@ -142,6 +157,23 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- The `matpg -tb` testbench writes a fail log with `+faillog` (pattern, chain
+  and cell of every wrong bit) for diagnosis; the fault simulator queues
+  events by level and is up to twice as fast on deep logic; the pattern file
+  reader and writer are in `src/atpg_model.hpp` for other tools.
+- `matpg -cubes FILE` writes each test before the random fill (x for a free
+  bit) for test compression, and the fault simulator can report where each
+  pattern fails (`Sim::detect` with a third argument) for diagnosis.
+- `matpg`: test pattern generation and fault simulation on a scan-inserted
+  gate netlist. Stuck-at faults and launch-on-capture transition faults on
+  every cell pin; scan chains traced from the ports (library scan flops or a
+  mux on D); random patterns, PODEM, a 64-pattern parallel fault simulator
+  and reverse-order compaction; fault classes (DS, DI, UU, UR, AU, ND) with
+  test and fault coverage; patterns as STIL (IEEE 1450), as a self-checking
+  Verilog testbench and as text; `-faultsim` grades existing patterns;
+  `-lib` takes cell functions from Liberty; `-threads N` with the same
+  result for any N. The fault simulator is `src/faultsim.hpp` for the other
+  test tools. See `docs/ATPG.md`.
 - `-xprop` is faster: an `if` evaluates its condition once, and clocked
   blocks with merged branches run in parallel again. Ibex with `-xprop`:
   42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
@@ -274,6 +306,19 @@ Spec references are IEEE 1800-2023 clauses.
   `docs/CONSTRAINTS.md`.
 - SDC reader: object lookups use sorted name indexes and `-filter` is parsed
   once, so large designs with thousands of queries read in seconds.
+- `mlint` grows from 6 rules to about 80, in groups: latches and
+  combinational logic (`L001` now bit-accurate, `LAT001`, incomplete
+  sensitivity lists, combinational loops across modules), case statements,
+  assignment style, widths and signs (`W001`..`W008`), synthesizability
+  (`SYN001`..`SYN017`), unused and undriven signals, connections, clocks and
+  resets (`CLK`, `RST`), naming (`NAME001`..`NAME013`, by pattern) and style.
+  Every rule has a severity and an on/off default; `-config`, `-enable`,
+  `-disable`, `-only`, `-severity`, `-set` configure them, `-list` and
+  `-explain` describe them. Waivers: a waiver file (`-waivers`, by rule,
+  file, line and message, stale ones reported) and comments in the source
+  (`// mlint: waive RULE reason`, `mlint: off / on`, `translate_off`).
+  `-json` report, `-show-waived`, `-stats`. Rules run on every logical CPU
+  (`-threads N`), with the same output for any count. See `docs/LINT.md`.
 - `msta`: static timing analysis of gate-level netlists in the style of
   PrimeTime. Liberty (NLDM) delay calculation, ideal and propagated clocks,
   generated clocks, setup / hold / recovery / removal and output delay
@@ -292,6 +337,12 @@ Spec references are IEEE 1800-2023 clauses.
   the same output for any `-threads N`. See `docs/FPGA.md`.
 
 ### Fixed
+- `mformal` could report a liveness assertion proven when it fails:
+  `s_eventually` of a sequence longer than one cycle (`s_eventually (a ##1 a)`
+  with `a` alternating), and could have reported a loop for obligations that
+  are met and renewed. Liveness now follows single obligations round the
+  loop; what it does not decide (`s_eventually always q`) is reported
+  `bounded`, not proven.
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes
   the clock-domain union-find quadratic (path compression).
 - A concurrent assertion read the current value, not the sampled one, of a
@@ -464,6 +515,14 @@ Spec references are IEEE 1800-2023 clauses.
   the base for class methods (8).
 
 ### Changed
+- `mlint` prints each finding's severity (`error`, `warning` or `info`) and
+  names signals by their name in the module rather than by full path, so a
+  module instantiated many times reports once. `-Werror` fails on warnings
+  and errors, not on `info` findings. Modules that nothing instantiates are
+  no longer linted as if they were part of the design.
+- `mlint` and `mdft`: the structure that joins signals across ports now
+  compresses paths. A clock reaching 4000 instances made every lookup walk
+  4000 links: 13 s for a 120,000-line design, now 1.3 s.
 - msim compiles as IEEE 1800-2023 by default (slang's default was 2017);
   `--std` still selects another version.
 - Waveforms nest the instance hierarchy as scopes under the top module
