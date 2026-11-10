@@ -83,9 +83,11 @@ if(Python3_FOUND)
 endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/memu.cmake)
+include(cmake/tools/mpss.cmake)
 include(cmake/tools/mrcx.cmake)
 include(cmake/tools/shared_par_wave.cmake)
-include(cmake/tools/mpss.cmake)
+include(cmake/tools/mequiv.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -190,6 +192,10 @@ if(MINISIM_WITH_SLANG)
   target_include_directories(mdebug PRIVATE src)
   find_package(Threads REQUIRED)
   target_link_libraries(mdebug PRIVATE slang::slang Threads::Threads)
+  if(MINISIM_WITH_FST)
+    target_link_libraries(mdebug PRIVATE fst)
+    target_compile_definitions(mdebug PRIVATE MINISIM_FST)
+  endif()
 
   add_executable(test_lower tests/test_lower.cpp)
   target_include_directories(test_lower PRIVATE src)
@@ -374,6 +380,7 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
+                   -DFST=${MINISIM_WITH_FST}
                    -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
@@ -406,7 +413,7 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
+#   bin/msim, bin/minisim, bin/memu, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)

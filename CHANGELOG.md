@@ -8,6 +8,19 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `memu`, emulation and FPGA prototyping: puts a gate-level netlist
+  (structural Verilog over a Liberty library) on a board of FPGAs. Clock
+  conversion onto one free-running clock (strobes for clean clocks, edge
+  detection for gated, divided and data-read clocks, any number of unrelated
+  clocks), memory mapping to block RAM and LUT RAM, multilevel partitioning
+  under each FPGA's capacity on a board file, routing through FPGAs and
+  time-division multiplexing where wires are short, probes with a trigger
+  and `memu -trace` to a VCD, and a generated testbench that runs the
+  netlist against the emulation. Transactors (`emu/sv`): an AXI4-Lite slave
+  that carries the design's accesses to `msim -mvp` models and an AXI4-Lite
+  master driven by a testbench class through a virtual interface, both
+  stopping the design's clock while the host answers. Multi-threaded with
+  thread-independent results. See `docs/EMULATION.md`.
 - `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
   failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
   `strong()`, `always s_eventually`) is proven or falsified with a loop
@@ -39,24 +52,26 @@ Spec references are IEEE 1800-2023 clauses.
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
-- `mpss`, portable stimulus: reads a model in the Accellera PSS language
-  (components, actions, buffers, streams, resources and pools, constraints,
-  activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
-  and functions), solves scenarios (field values, resource instances, and
-  the actions inferred to feed unbound inputs), and writes each scenario as
-  a UVM sequence class (`-sv`, runs under `msim -uvm`) and as a C test
-  function (`-c`), plus `-print` and `-json`. Scenarios are solved on all
-  cores (`-threads N`) with the same output for every thread count. See
-  `docs/MPSS.md` and `examples/pss/dma.pss`.
-- `src/interval.hpp`: the interval arithmetic of the `randomize()` solver,
-  moved out of `rand.inc` so that `mpss` uses the same rules.
+- Shared headers for the tools: `src/parallel.hpp` (default thread count,
+  the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
+  `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
+  (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
+- `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
+  netlist, RTL against RTL): both designs become one and-inverter graph,
+  flops and latches are matched by name (or by the net on their output, also
+  when stored inverted) and cut, and every output, next-state function and
+  clock/reset is proved equal by structural hashing, random simulation and
+  SAT on all cores, with a counterexample for each failing point. X in the
+  reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
+  `-report`. See `docs/EQUIV.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
   assignment that gave a signal its value at a time and its causes back
   through time, and `-html` for a one-file viewer (hierarchy, clickable
   source, drivers and loads, schematic, waves with values annotated in the
-  source). See `docs/DEBUG.md`.
+  source). `-vcd` reads VCD and FST; the page traces the active driver at the
+  cursor itself. See `docs/DEBUG.md`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
   coupling capacitance to same-layer neighbours (who also take over part of
@@ -116,6 +131,18 @@ Spec references are IEEE 1800-2023 clauses.
   simulator reports stuck-at, transition, coupling and address-decoder
   coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
   expected results come from that simulator. See `docs/DFT.md`.
+- `mpss`, portable stimulus: reads a model in the Accellera PSS language
+  (components, actions, buffers, streams, resources and pools, constraints,
+  activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
+  and functions), solves scenarios (field values, resource instances, and
+  the actions inferred to feed unbound inputs), and writes each scenario as
+  a UVM sequence class (`-sv`, runs under `msim -uvm`) and as a C test
+  function (`-c`), plus `-print` and `-json`. Scenarios are solved on all
+  cores (`-threads N`) with the same output for every thread count. See
+  `docs/MPSS.md` and `examples/pss/dma.pss`.
+- `src/interval.hpp`: the interval arithmetic and bounds propagation of the
+  `randomize()` solver, moved out of `rand.inc` so that `mpss` uses the same
+  rules.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
