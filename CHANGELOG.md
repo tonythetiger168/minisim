@@ -13,7 +13,6 @@ Spec references are IEEE 1800-2023 clauses.
   `src/aig.hpp`, and writes Yosys JSON for nextpnr or EDIF. Depth-optimal
   priority-cut mapping with area recovery; multithreaded, with the same output
   for any `-threads N`. `docs/FPGA.md`.
-=======
 - `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
   failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
   `strong()`, `always s_eventually`) is proven or falsified with a loop
