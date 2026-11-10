@@ -162,6 +162,13 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv` reads OASIS layouts (SEMI P39) as well as GDSII, told apart by the
+  file's first bytes: every record, repetition and point-list form, compact
+  trapezoids, name tables, strict mode and compressed blocks (built-in
+  DEFLATE). `src/oasis.hpp`; `oasis::readLayout` reads either format into a
+  `gds::Library`. Checked against KLayout on random files and SKY130 cells.
+- Fixed: the GDSII writer (`gds::write`) wrote STRANS as an integer record;
+  it is a bit array, and KLayout refused files with mirrored references.
 - `mpv lvs -lef tech.lef routed.def -netlist block.v`: LVS of a placed and
   routed block against its gate netlist. The nets come from the geometry
   (cell pins from the LEF, wires, vias and block pins from the DEF), not from

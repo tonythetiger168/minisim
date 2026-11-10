@@ -87,6 +87,23 @@ expect(".subckt sky130_fd_sc_hd__dfxtp_1 CLK D Q VGND VNB VPB VPWR\n")
 expect("M22 VPWR n14 n16 VPB sky130_fd_pr__pfet_01v8_hvt w=1 l=0.15\n")
 run(2 lvs -deck ${SRC}/tests/pv/mini.drc ${OUT}/pv_bad.gds)
 
+# OASIS layouts (plain and with compressed blocks): the same answers as GDSII.
+run(0 drc -deck ${SRC}/tests/pv/sky130.drc ${SRC}/tests/pv/oasis/sky130_fd_sc_hd__inv_1.oas)
+expect("cell sky130_fd_sc_hd__inv_1")
+expect("0 violations in 0 of 35 rules")
+run(0 lvs -deck ${SRC}/tests/pv/sky130.lvs ${SRC}/tests/pv/oasis/sky130_fd_sc_hd__dfxtp_1.oas -o ${OUT}/dfxtp_oas.spice)
+expect("cell sky130_fd_sc_hd__dfxtp_1, 24 devices, 18 nets, 7 ports")
+file(READ ${OUT}/dfxtp_oas.spice oas)
+file(READ ${OUT}/dfxtp.spice out)
+if(NOT oas STREQUAL out)
+  message(FATAL_ERROR "the netlist from OASIS differs from the one from GDSII")
+endif()
+file(WRITE ${OUT}/cut.oas "%SEMI-OASIS\r\nnot a record")
+run(2 drc -deck ${SRC}/tests/pv/sky130.drc ${OUT}/cut.oas)
+if(NOT err MATCHES "cut.oas")
+  message(FATAL_ERROR "a bad OASIS file: ${err}")
+endif()
+
 # A routed DEF with its LEF, rules from the LEF technology: the metal is
 # clean, and two pairs of v2 cuts are closer than the cut spacing.
 run(1 drc -lef ${SRC}/tests/pv/def/tiny.lef ${SRC}/tests/pv/def/counter.def -write-deck ${OUT}/tiny.drc -o ${OUT}/counter.txt)

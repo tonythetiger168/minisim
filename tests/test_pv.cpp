@@ -4,12 +4,16 @@
 //   test_pv              runs the checks
 //   test_pv -gen <dir>   only writes <dir>/pv_bad.gds, a layout with known
 //                        violations, for the mpv command line test
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <fstream>
 #include <random>
+#include <set>
 #include <sstream>
 
 #include "lvs.hpp"
+#include "oasis.hpp"
 
 using geom::C;
 using geom::Op;
@@ -200,6 +204,9 @@ void testGds() {
     assert(back.name == "T" && back.cells.size() == 2);
     assert(std::fabs(back.dbu - 0.001) < 1e-12 && std::fabs(back.userUnit - 0.001) < 1e-12);
     assert(gds::serialize(back) == bytes);
+    // STRANS is a bit array record (type 1), which other readers insist on.
+    assert(bytes.find(std::string("\x00\x06\x1A\x01\x80\x00", 6)) != std::string::npos);
+    assert(bytes.find(std::string("\x1A\x02", 2)) == std::string::npos);
     const gds::Cell& l2 = back.cells[0];
     assert(l2.polygons[0].pts.size() == 6 && l2.polygons[0].layer == 5 && l2.polygons[0].datatype == 2);
     assert(l2.paths[0].width == 20 && l2.paths[0].pathtype == 2 && l2.paths[0].pts.size() == 3);
@@ -521,6 +528,128 @@ void testLvs() {
 }
 
 // A small layout on the layers of tests/pv/mini.drc with one violation for most rules.
+// What the OASIS reader made of a file, in the form of tests/pv/oasis/*.txt
+// (KLayout's reading of the same file).
+std::vector<gds::Point> canonical(std::vector<gds::Point> p) {
+    // Without repeated and collinear points, counter-clockwise, from the smallest point.
+    bool changed = true;
+    while (changed && p.size() >= 3) {
+        changed = false;
+        for (size_t i = 0; i < p.size(); ++i) {
+            const gds::Point &a = p[(i + p.size() - 1) % p.size()], &b = p[i], &c = p[(i + 1) % p.size()];
+            long long cr = (long long)(b.x - a.x) * (c.y - b.y) - (long long)(b.y - a.y) * (c.x - b.x);
+            if ((b.x == c.x && b.y == c.y) || cr == 0) { p.erase(p.begin() + i); changed = true; break; }
+        }
+    }
+    if (p.size() < 3) return {};
+    long long area = 0;
+    for (size_t i = 0; i < p.size(); ++i) {
+        const gds::Point &a = p[i], &b = p[(i + 1) % p.size()];
+        area += (long long)a.x * b.y - (long long)b.x * a.y;
+    }
+    if (area < 0) std::reverse(p.begin(), p.end());
+    size_t m = 0;
+    for (size_t i = 1; i < p.size(); ++i)
+        if (p[i].x < p[m].x || (p[i].x == p[m].x && p[i].y < p[m].y)) m = i;
+    std::rotate(p.begin(), p.begin() + m, p.end());
+    return p;
+}
+
+std::set<std::string> dumpLibrary(const gds::Library& lib) {
+    std::set<std::string> lines;
+    char b[256];
+    std::snprintf(b, sizeof b, "dbu %.9g", lib.dbu);
+    lines.insert(b);
+    for (const gds::Cell& c : lib.cells) {
+        for (const gds::Polygon& p : c.polygons) {
+            std::string lay = std::to_string(p.layer) + "/" + std::to_string(p.datatype);
+            if (p.pts.size() == 64) { lines.insert(c.name + " circle " + lay); continue; }
+            std::string s = c.name + " poly " + lay;
+            for (const gds::Point& v : canonical(p.pts)) s += " " + std::to_string(v.x) + "," + std::to_string(v.y);
+            lines.insert(s);
+        }
+        for (const gds::Path& p : c.paths) {
+            int e0 = p.pathtype == 2 ? p.width / 2 : p.pathtype == 4 ? p.bgnextn : 0;
+            int e1 = p.pathtype == 2 ? p.width / 2 : p.pathtype == 4 ? p.endextn : 0;
+            std::string s = c.name + " path " + std::to_string(p.layer) + "/" + std::to_string(p.datatype) + " w" +
+                            std::to_string(p.width) + " e" + std::to_string(e0) + "," + std::to_string(e1);
+            for (const gds::Point& v : p.pts) s += " " + std::to_string(v.x) + "," + std::to_string(v.y);
+            lines.insert(s);
+        }
+        for (const gds::Text& t : c.texts)
+            lines.insert(c.name + " text " + std::to_string(t.layer) + "/" + std::to_string(t.texttype) + " " +
+                         std::to_string(t.at.x) + "," + std::to_string(t.at.y) + " " + t.str);
+        for (const gds::Ref& r : c.refs)
+            for (int j = 0; j < std::max(1, r.rows); ++j)
+                for (int i = 0; i < std::max(1, r.cols); ++i) {
+                    std::snprintf(b, sizeof b, "%s ref %s %lld,%lld a%.6g m%d x%.6g", c.name.c_str(), r.cell.c_str(),
+                                  (long long)r.origin.x + (long long)i * r.colStep.x + (long long)j * r.rowStep.x,
+                                  (long long)r.origin.y + (long long)i * r.colStep.y + (long long)j * r.rowStep.y, r.angle,
+                                  r.mirror ? 1 : 0, r.mag);
+                    lines.insert(b);
+                }
+    }
+    return lines;
+}
+
+std::string slurp(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    assert(in && "cannot open a test file");
+    std::ostringstream o;
+    o << in.rdbuf();
+    return o.str();
+}
+
+void testOasis() {
+    std::string dir = std::string(MINISIM_SOURCE_DIR) + "/tests/pv/", err;
+    // Random files with every record type read as KLayout reads them.
+    for (int i = 1; i <= 12; ++i) {
+        std::string base = dir + "oasis/rnd" + std::to_string(i);
+        std::string bytes = slurp(base + ".oas");
+        assert(oasis::isOasis(bytes));
+        gds::Library lib;
+        if (!oasis::readLayout(base + ".oas", lib, err)) { std::fprintf(stderr, "%s: %s\n", base.c_str(), err.c_str()); assert(false); }
+        std::set<std::string> want;
+        std::istringstream in(slurp(base + ".txt"));
+        for (std::string l; std::getline(in, l);)
+            if (!l.empty()) want.insert(l);
+        std::set<std::string> got = dumpLibrary(lib);
+        if (got != want) {
+            for (const std::string& l : got) if (!want.count(l)) std::fprintf(stderr, "rnd%d only here:    %s\n", i, l.c_str());
+            for (const std::string& l : want) if (!got.count(l)) std::fprintf(stderr, "rnd%d only KLayout: %s\n", i, l.c_str());
+            assert(false);
+        }
+        // A cut or damaged file is an error or another layout, never a crash.
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(bytes.data());
+        for (size_t n = 0; n < bytes.size(); n += 1 + bytes.size() / 400) {
+            gds::Library cut;
+            oasis::parse(p, n, cut, err);
+        }
+        for (size_t n = 13; n < bytes.size(); n += 1 + bytes.size() / 400)
+            for (uint8_t flip : {uint8_t(0x01), uint8_t(0x80), uint8_t(0xFF)}) {
+                std::string bad = bytes;
+                bad[n] = char(uint8_t(bad[n]) ^ flip);
+                gds::Library l2;
+                oasis::parse(reinterpret_cast<const uint8_t*>(bad.data()), bad.size(), l2, err);
+            }
+    }
+    // The SKY130 cells as OASIS (plain and with compressed blocks) hold the
+    // shapes of the GDSII files, and the tools take either.
+    for (const char* cell : {"inv_1", "dfxtp_1"}) {
+        std::string name = std::string("sky130_fd_sc_hd__") + cell;
+        gds::Library a, b;
+        assert(oasis::readLayout(dir + "sky130/" + name + ".gds", a, err));
+        if (!oasis::readLayout(dir + "oasis/" + name + ".oas", b, err)) { std::fprintf(stderr, "%s\n", err.c_str()); assert(false); }
+        assert(dumpLibrary(a) == dumpLibrary(b));
+        layout::Flat fa, fb;
+        assert(layout::flatten(a, "", fa, err) && layout::flatten(b, "", fb, err));
+        assert(fa.top == fb.top && fa.layers.size() == fb.layers.size() && fa.labels.size() == fb.labels.size());
+        for (auto& [key, rs] : fa.layers) assert(geom::merge(rs).area() == geom::merge(fb.layers[key]).area());
+    }
+    gds::Library none;
+    assert(!oasis::readLayout(dir + "oasis/missing.oas", none, err) && !err.empty());
+}
+
 void writeBad(const std::string& dir) {
     gds::Library lib;
     lib.cells.resize(2);
@@ -560,6 +689,7 @@ int main(int argc, char** argv) {
     testThreads();
     testTopology();
     testGds();
+    testOasis();
     testChecks();
     testCheckThreads();
     testLvs();

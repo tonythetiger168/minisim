@@ -52,6 +52,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
 | `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
 | `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
+| `src/oasis.hpp` | OASIS reader into the same library; `oasis::readLayout` takes GDSII or OASIS |
 | `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/lvs.hpp`, `src/lvs_block.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck, design rule checks and LVS |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
@@ -659,7 +660,7 @@ coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
 ### Physical verification: `mpv`
 
-`mpv drc` checks a GDSII layout against a rule deck: width, spacing,
+`mpv drc` checks a GDSII or OASIS layout against a rule deck: width, spacing,
 enclosure, overhang, area and density checks on drawn and derived layers
 (`&`, `|`, `-`, `grow`, `interact`, ...). It needs no slang and builds with
 the default configuration.

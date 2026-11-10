@@ -1,4 +1,5 @@
-// mpv.cpp - physical verification: design rule checking on a GDSII layout.
+// mpv.cpp - physical verification: design rule checking on a GDSII or OASIS
+// layout.
 //
 //   mpv drc -deck rules.drc chip.gds [-top CELL] [-o results.txt] [-threads N]
 //
@@ -9,7 +10,8 @@
 // shapes (layout_def.hpp). Without -deck the rules are the widths, spacings
 // and areas of the LEF technology.
 //
-// Reads the layout (gds.hpp), flattens the top cell (layout.hpp), runs every
+// Reads the layout (gds.hpp, or oasis.hpp when the file is OASIS; the file's
+// first bytes tell), flattens the top cell (layout.hpp), runs every
 // rule of the deck (drc.hpp), prints one line per rule and writes the
 // violation markers to the results file. Exit status: 0 clean, 1 violations,
 // 2 a usage or input error.
@@ -31,6 +33,7 @@
 #include "layout_def.hpp"
 #include "lvs.hpp"
 #include "lvs_block.hpp"
+#include "oasis.hpp"
 #include "parallel.hpp"
 #include "version.hpp"
 
@@ -38,8 +41,8 @@ namespace {
 
 int usage(FILE* f) {
     std::fputs(
-        "usage: mpv drc -deck <rules> <layout.gds> [options]\n"
-        "       mpv lvs -deck <rules> <layout.gds> [-top <cell>] [-o <extracted.spice>] [-threads <n>]\n"
+        "usage: mpv drc -deck <rules> <layout.gds|.oas> [options]\n"
+        "       mpv lvs -deck <rules> <layout.gds|.oas> [-top <cell>] [-o <extracted.spice>] [-threads <n>]\n"
         "       mpv drc -lef <tech.lef> [-lef <cells.lef>] [-deck <rules>] <routed.def> [options]\n"
         "       mpv lvs -lef <tech.lef> [-lef <cells.lef>] <routed.def> -netlist <gates.v> [-top <module>] [-o <extracted.v>]\n"
         "  -deck <file>     rule deck (see docs/MPV.md)\n"
@@ -134,7 +137,7 @@ int drcMain(int argc, char** argv) {
         }
     } else {
         gds::Library lib;
-        if (!gds::read(gdsFile, lib, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
+        if (!oasis::readLayout(gdsFile, lib, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
         if (!layout::flatten(lib, top, flat, err, threads)) { std::fprintf(stderr, "mpv: %s: %s\n", gdsFile.c_str(), err.c_str()); return 2; }
     }
     if (!deckFile.empty() && !drc::readDeck(deckFile, deck, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
@@ -289,7 +292,7 @@ int lvsMain(int argc, char** argv) {
         return 2;
     }
     gds::Library lib;
-    if (!gds::read(gdsFile, lib, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
+    if (!oasis::readLayout(gdsFile, lib, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
     layout::Flat flat;
     if (!layout::flatten(lib, top, flat, err, threads)) { std::fprintf(stderr, "mpv: %s: %s\n", gdsFile.c_str(), err.c_str()); return 2; }
     drc::Engine eng(deck, flat, threads);

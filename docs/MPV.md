@@ -1,15 +1,31 @@
 # mpv: physical verification
 
 `mpv` checks a layout: design rule checking (DRC) against a rule deck, on
-GDSII or on a routed DEF, and layout versus schematic (LVS): transistor
-netlist extraction from GDSII, and a routed block against its gate netlist.
+GDSII, OASIS or a routed DEF, and layout versus schematic (LVS): transistor
+netlist extraction from GDSII or OASIS, and a routed block against its gate
+netlist.
 
 ```sh
 mpv drc -deck rules.drc chip.gds                 # every rule, one line each
 mpv drc -deck rules.drc chip.gds -top core -q    # one cell; only rules with violations
 mpv drc -deck rules.drc chip.gds -o drc.txt      # also write the markers
 mpv drc -deck rules.drc chip.gds -threads 8
+mpv drc -deck rules.drc chip.oas                 # OASIS, told from the file's first bytes
 ```
+
+## Layout files
+
+A layout is GDSII or OASIS (SEMI P39); `mpv` looks at the first bytes of the
+file, not at its name. The OASIS reader takes every record of the standard:
+rectangles, polygons and paths with all point-list forms, trapezoids and the
+25 compact trapezoids, circles (as 64-sided polygons), texts, placements
+with rotation, mirroring and magnification, the eleven repetition forms,
+modal variables, relative and absolute coordinates, name tables by reference
+(before or after their use, strict mode included) and compressed blocks
+(the DEFLATE decoder is built in; no zlib is needed). Properties and
+extension records are skipped. A repetition on a regular grid becomes an
+array reference; other repetitions are expanded. The reader is tested
+against KLayout's reading of the same files (`tests/pv/oasis`).
 
 ```
 mpv drc: cell bad, 6 shapes on 3 layers, 5 x 5 um, 1 unit = 0.001 um
@@ -219,6 +235,7 @@ in a canonical form, so the report is identical for every thread count.
 | File | |
 |---|---|
 | `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared with the other physical tools |
+| `src/oasis.hpp` | OASIS reader into the same library (namespace `oasis`); `oasis::readLayout` takes either format |
 | `src/geom.hpp` | regions of rectangles: booleans, sizing, boundary edges, connected polygons |
 | `src/layout.hpp` | a GDS library flattened to rectangles per layer |
 | `src/layout_def.hpp` | a routed DEF with its LEF as a flat layout; a deck from the LEF technology |
