@@ -61,6 +61,9 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- `-xprop`: an assignment to an array element chosen at run time
+  (`if (we) mem[addr] <= d;`) is merged with the element's present value
+  instead of blocking the merge or giving `x`.
 - X-propagation: `msim -xprop` (`-xprop=tmerge`, `-xprop=xmerge`,
   `-xprop-report <file>`). In `always` blocks an unknown `if` condition,
   `case` selector or clock / reset edge no longer picks one branch: every
