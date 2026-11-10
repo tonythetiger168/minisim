@@ -47,6 +47,19 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- `matpg -cubes FILE` writes each test before the random fill (x for a free
+  bit) for test compression, and the fault simulator can report where each
+  pattern fails (`Sim::detect` with a third argument) for diagnosis.
+- `matpg`: test pattern generation and fault simulation on a scan-inserted
+  gate netlist. Stuck-at faults and launch-on-capture transition faults on
+  every cell pin; scan chains traced from the ports (library scan flops or a
+  mux on D); random patterns, PODEM, a 64-pattern parallel fault simulator
+  and reverse-order compaction; fault classes (DS, DI, UU, UR, AU, ND) with
+  test and fault coverage; patterns as STIL (IEEE 1450), as a self-checking
+  Verilog testbench and as text; `-faultsim` grades existing patterns;
+  `-lib` takes cell functions from Liberty; `-threads N` with the same
+  result for any N. The fault simulator is `src/faultsim.hpp` for the other
+  test tools. See `docs/ATPG.md`.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
