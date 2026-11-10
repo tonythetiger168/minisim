@@ -82,6 +82,10 @@ if(Python3_FOUND)
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
 
+# Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/mrcx.cmake)
+include(cmake/tools/mpnr.cmake)
+
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
 # default is off; -DSLANG_USE_MIMALLOC=ON still overrides it.
@@ -348,18 +352,6 @@ if(MINISIM_WITH_SLANG)
     PASS_REGULAR_EXPRESSION "module child")
 endif()
 
-# mpnr: place and route (gate netlist + LEF -> placed and routed DEF). No slang
-# needed. The self-test places and routes small netlists on tests/pnr/tiny.lef.
-find_package(Threads REQUIRED)
-add_executable(mpnr src/mpnr.cpp)
-target_include_directories(mpnr PRIVATE src)
-target_link_libraries(mpnr PRIVATE Threads::Threads)
-if(Python3_FOUND)
-  add_test(NAME mpnr
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/pnr_test.py $<TARGET_FILE:mpnr> ${CMAKE_SOURCE_DIR}
-                   ${CMAKE_CURRENT_BINARY_DIR}/pnr_test)
-endif()
-
 # Install layout (cmake --install, and the cpack packages below):
 #   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
@@ -367,7 +359,7 @@ endif()
 #   include/vpi_user.h       the VPI header (clauses 36-38)
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
-install(TARGETS minisim mpnr RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

@@ -20,6 +20,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mdebug** | Source-level debug: drivers and loads with their conditions, fan-in cones, the active driver at a time in a waveform traced back through time, and a one-file viewer (hierarchy, source, schematic, waves) | Shipping next |
 | **mpnr** | Place and route: gate netlist + LEF to placed and routed DEF (floorplan, analytic placement, legalization, negotiated detailed routing), with a built-in opens / shorts / spacing check; multithreaded, deterministic | Shipping next |
 | **mcov** | Code coverage (line, branch, toggle) merged across a regression, text / HTML / LCOV reports and gates; covergroups with the spec work | Code coverage shipping in 0.2 |
+| **mrcx** | Parasitic extraction: routed DEF + LEF in, SPEF out. Distributed RC per net with coupling capacitance, process stack and temperature, open and short checks, multi-core | Shipping next |
 | **mwave** | Waveforms for GTKWave / Surfer: hierarchical VCD and compressed FST (shipping in 0.2); `$dumpfile` / `$dumpvars` scoping and transaction views next | Partly shipping in 0.2 |
 
 All of them install from one package (`minisim_x.y.z_amd64.deb` /

@@ -71,6 +71,7 @@ class Router {
     std::vector<int> nodes;                          // unique grid nodes
     std::vector<std::pair<int, int>> edges;          // wire steps and vias
     std::vector<int> pinNode;                        // per pin of the net: its access node, or -1
+    std::vector<int> cuts;                           // lower node of each via
     bool ok = false;
   };
   struct Window { int t0[16], t1[16], p0[16], p1[16], off[17]; };
@@ -82,6 +83,7 @@ class Router {
   const phys::Layer* accessLayer = nullptr;          // pins here get a via from layer 0
   std::vector<int32_t> owner;                        // -1 free, -2 blocked, else the only net allowed
   std::vector<uint16_t> claim;
+  std::vector<uint16_t> cutClaim;                    // per lower node: vias of nets whose cut is too close to a via here
   std::vector<uint16_t> hist;
   std::vector<int32_t> pinOwner;                     // net whose pin is reached at or next to this node, or -1
   std::vector<int> accStart, accNode;                // per pin: candidate access nodes
@@ -89,6 +91,7 @@ class Router {
   std::vector<int> order;                            // nets to route
   int64_t viaCost = 0, unit = 0, pinCost = 0;
   int iterations = 0;
+  std::vector<uint16_t> variant;                     // per net: which pin its tree starts from
 
   static int idxOf(const std::vector<int64_t>& v, int64_t c) {
     auto it = std::lower_bound(v.begin(), v.end(), c);
@@ -207,6 +210,7 @@ class Router {
     }
     owner.assign(base, -1);
     claim.assign(base, 0);
+    cutClaim.assign(base, 0);
     hist.assign(base, 0);
     viaCost = 2 * gl[0].L->pitch();
     unit = 4 * viaCost;
@@ -383,6 +387,7 @@ class Router {
       int b = l.base + t * l.nP;
       for (int q = l.hlo[p]; q <= l.hhi[p]; q++) claim[b + q] = (uint16_t)(claim[b + q] + delta);
     }
+    for (int c : r.cuts) cutNear(c, [&](int n) { cutClaim[n] = (uint16_t)(cutClaim[n] + delta); });
   }
 
   // ---- search ----
@@ -440,9 +445,9 @@ class Router {
     a = std::max<int64_t>(a, 0); b = std::max<int64_t>(b, 0);
     return a < l.cutSp && b < l.cutSp && (!a || !b || a * a + b * b < l.cutSp * l.cutSp);
   }
-  // The net has a via up from `lo`: no other via of it may use the lower
-  // nodes too close to that cut.
-  void blockAround(int lo, Scratch& sc) const {
+  // Calls fn(node) for the lower nodes where a via would be too close to
+  // the cut of a via up from `lo`.
+  template <class F> void cutNear(int lo, F&& fn) const {
     int g, t, p;
     decode(lo, g, t, p);
     const GLayer& l = gl[g];
@@ -455,7 +460,7 @@ class Router {
     while (p1 + 1 < l.nP && l.pos[p1 + 1] - l.pos[p] < need) p1++;
     for (int tt = t0; tt <= t1; tt++)
       for (int pp = p0; pp <= p1; pp++)
-        if (cutClash(g, t, p, tt, pp)) sc.cuts.insert(node(g, tt, pp));
+        if (cutClash(g, t, p, tt, pp)) fn(node(g, tt, pp));
   }
   // A via from the node (g, t, p) at local id `lid` towards layer gd, when the
   // path came out of gd a step or two back along this track: are the two cuts
@@ -566,15 +571,15 @@ class Router {
       };
       if (p > 0) relax(g, t, p - 1, l.pos[p] - l.pos[p - 1]);
       if (p + 1 < l.nP) relax(g, t, p + 1, l.pos[p + 1] - l.pos[p]);
-      if (g + 1 < (int)gl.size() && l.upT[p] >= 0 && !jogBlocked(g, p, g + 1, lid, w, sc)) relax(g + 1, l.upT[p], l.upP[t], viaCost, node(g, t, p));
-      if (g > 0 && l.dnT[p] >= 0 && !jogBlocked(g, p, g - 1, lid, w, sc)) relax(g - 1, l.dnT[p], l.dnP[t], viaCost, node(g - 1, l.dnT[p], l.dnP[t]));
+      if (g + 1 < (int)gl.size() && l.upT[p] >= 0 && !jogBlocked(g, p, g + 1, lid, w, sc)) { int lo = node(g, t, p); relax(g + 1, l.upT[p], l.upP[t], viaCost + (cutClaim[lo] ? pres : 0), lo); }
+      if (g > 0 && l.dnT[p] >= 0 && !jogBlocked(g, p, g - 1, lid, w, sc)) { int lo = node(g - 1, l.dnT[p], l.dnP[t]); relax(g - 1, l.dnT[p], l.dnP[t], viaCost + (cutClaim[lo] ? pres : 0), lo); }
     }
     return false;
   }
 
   // The order in which a net's pins join the tree, with the pin each one is
   // closest to (Prim's algorithm on pin positions; a sweep for huge nets).
-  void pinOrder(const Net& nt, std::vector<std::pair<int, int>>& out) const {
+  void pinOrder(const Net& nt, int start, std::vector<std::pair<int, int>>& out) const {
     size_t n = nt.pins.size();
     std::vector<int64_t> px(n), py(n);
     for (size_t i = 0; i < n; i++) db.pinPos(nt.pins[i], px[i], py[i]);
@@ -597,9 +602,9 @@ class Router {
     std::vector<int64_t> best(n, INT64_MAX);
     std::vector<int> par(n, -1);
     std::vector<char> in(n, 0);
-    int cur = 0;
-    in[0] = 1;
-    out.push_back({0, -1});
+    int cur = start % (int)n;
+    in[cur] = 1;
+    out.push_back({cur, -1});
     for (size_t k = 1; k < n; k++) {
       int nxt = -1;
       for (size_t i = 0; i < n; i++) {
@@ -630,7 +635,7 @@ class Router {
   int64_t margin(int iter) const { return (int64_t)(6 + 4 * std::min(iter, 12)) * gl[0].L->pitch() * 2; }
   int64_t haloReach() const {
     int64_t m = 0;
-    for (auto& l : gl) m = std::max(m, 2 * l.reach + l.L->spacing);
+    for (auto& l : gl) m = std::max({m, 2 * l.reach + l.L->spacing, l.cutW + l.cutSp});
     return m;
   }
 
@@ -642,7 +647,7 @@ class Router {
     if (sc.cuts.bucket_count() > 512) sc.cuts = {}; else sc.cuts.clear();      // clear() walks every bucket
     for (int pid : nt.pins) if (accStart[pid] == accStart[pid + 1]) return false;      // a pin nothing can reach
     std::vector<std::pair<int, int>> ord;
-    pinOrder(nt, ord);
+    pinOrder(nt, variant[net], ord);
     Box limit = netBox(net);
     limit.grow(margin(iter));
     struct Piece { size_t begin, end; Box box; };
@@ -711,7 +716,7 @@ class Router {
         int lo = std::min(path[i], path[i + 1]), hi = std::max(path[i], path[i + 1]);
         int lg = 0;
         while (lg + 1 < (int)gl.size() && lo >= gl[lg + 1].base) lg++;
-        if (lg + 1 < (int)gl.size() && hi >= gl[lg + 1].base) blockAround(lo, sc);
+        if (lg + 1 < (int)gl.size() && hi >= gl[lg + 1].base) { out.cuts.push_back(lo); cutNear(lo, [&](int n) { sc.cuts.insert(n); }); }
       }
       pc.end = out.nodes.size();
       if (pc.end > pc.begin) pieces.push_back(pc);
@@ -719,6 +724,8 @@ class Router {
     // A pin whose access node another pin's path already crossed shares it.
     std::sort(out.nodes.begin(), out.nodes.end());
     out.nodes.erase(std::unique(out.nodes.begin(), out.nodes.end()), out.nodes.end());
+    std::sort(out.cuts.begin(), out.cuts.end());
+    out.cuts.erase(std::unique(out.cuts.begin(), out.cuts.end()), out.cuts.end());
     out.ok = true;
     return true;
   }
@@ -729,6 +736,7 @@ class Router {
     addClaims(r, -1);
     bool bad = false;
     for (int n : r.nodes) if (claim[n]) { bad = true; if (hist[n] < 60000) hist[n]++; }
+    for (int n : r.cuts) if (cutClaim[n]) { bad = true; if (hist[n] < 60000) hist[n]++; }
     addClaims(r, +1);
     return bad;
   }
@@ -740,12 +748,14 @@ class Router {
     if (!r.ok) return out;
     addClaims(r, -1);
     for (int n : r.nodes) if (claim[n]) out.push_back(n);
+    for (int n : r.cuts) if (cutClaim[n]) out.push_back(n);
     addClaims(r, +1);
     return out;
   }
 
   void negotiate() {
     routes.assign(db.nets.size(), NetRoute{});
+    variant.assign(db.nets.size(), 0);
     for (size_t i = 0; i < db.nets.size(); i++) if (db.nets[i].pins.size() >= 2) order.push_back((int)i);
     // Short nets first.
     std::vector<Box> box(db.nets.size());
@@ -860,6 +870,9 @@ class Router {
       }
       // Stop when the contested nets have not become fewer for a while.
       if (contested < bestLeft) { bestLeft = contested; bestIter = iter; }
+      // A net builds its tree pin by pin, and its own earlier vias can shut
+      // the clean way into a later pin: start it from another pin.
+      if (iter - bestIter >= 2) for (size_t i = 0; i < contested; i++) variant[next[i]]++;
       todo.swap(next);
       if (iter - bestIter >= 8) break;
       pres = std::min<int64_t>(pres * 2, unit * 4096);

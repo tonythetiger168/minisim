@@ -95,19 +95,19 @@ layers), utilization 0.6, 4 cores of a cloud VM. Every run ends with 0 open,
 
 | Cells | Nets routed | Place | Route | Total, 4 threads | Total, 1 thread |
 |---|---|---|---|---|---|
-| 5,000 | 4,426 | 0.5 s | 0.2 s | 0.9 s | 1.5 s |
-| 20,000 | 17,688 | 2.8 s | 1.4 s | 4.7 s | 7.6 s |
-| 50,000 | 44,052 | 8.1 s | 4.6 s | 14.1 s | 24.0 s |
-| 100,000 | 88,093 | 17.1 s | 6.7 s | 26.7 s | 48.2 s |
+| 5,000 | 4,426 | 0.5 s | 0.4 s | 0.9 s | 1.4 s |
+| 20,000 | 17,688 | 2.8 s | 1.5 s | 4.9 s | 8.3 s |
+| 50,000 | 44,052 | 8.2 s | 3.3 s | 12.9 s | 23.3 s |
+| 100,000 | 88,093 | 17.6 s | 6.3 s | 26.7 s | 48.7 s |
 
 The same flow routes 5,000 Nangate45 cells clean on the real Nangate45 LEF
-(ten metal layers) in 2.2 s.
+(ten metal layers) in 1.9 s.
 
 ## Limits
 
 - Design rules are those the grid enforces: width, spacing, via pads, track
-  alignment. Minimum area, same-net cut spacing, antenna and density rules
-  are not checked; run a DRC tool on the result.
+  alignment, and cut spacing (between nets and inside a net). Minimum area,
+  antenna and density rules are not checked; run a DRC tool on the result.
 - Standard cells one row high. Larger macros can be fixed in a floorplan DEF
   (their pins and obstructions are honoured) but mpnr does not place them.
 - The clock is routed as an ordinary net: no clock tree, no buffering, no
