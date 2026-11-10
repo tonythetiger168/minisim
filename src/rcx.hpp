@@ -18,7 +18,7 @@
 //          hidden by metal on the layer below;
 //        - coupling to the nearest wire on each side on the same layer, with
 //          nearer wires shielding farther ones;
-//        - coupling to wires of other nets it crosses on the layer below.
+//        - coupling to wires of other nets it crosses one and two layers away.
 //      Coupling to power and ground nets counts as capacitance to ground.
 //
 // The capacitance model is closed-form (Sakurai, "Closed-form expressions for
