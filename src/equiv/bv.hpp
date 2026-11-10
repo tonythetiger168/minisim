@@ -163,6 +163,54 @@ struct Bv {
         }
         return acc;
     }
+    Lit maj(Lit a, Lit b, Lit c) { return g.or_(g.and_(a, b), g.and_(c, g.or_(a, b))); }
+    // a + b with a Sklansky parallel-prefix carry network (values only).
+    Bits addPrefixV(const Bits& a, const Bits& b) {
+        size_t w = a.size();
+        std::vector<Lit> gn(w), pr(w), x(w);
+        for (size_t i = 0; i < w; ++i) {
+            x[i] = g.xor_(a[i].v, b[i].v);
+            gn[i] = g.and_(a[i].v, b[i].v);
+            pr[i] = x[i];
+        }
+        for (size_t l = 1; l < w; l <<= 1)
+            for (size_t i = 0; i < w; ++i)
+                if (i & l) {
+                    size_t j = (i / (2 * l)) * (2 * l) + l - 1;
+                    gn[i] = g.or_(gn[i], g.and_(pr[i], gn[j]));
+                    pr[i] = g.and_(pr[i], pr[j]);
+                }
+        Bits r(w, kB0);
+        if (w) r[0] = {x[0], kFalse};
+        for (size_t i = 1; i < w; ++i) r[i] = {g.xor_(x[i], gn[i - 1]), kFalse};
+        return r;
+    }
+    // Partial products reduced column by column with 3:2 counters down to
+    // two rows, then one adder. The order follows msynth (src/aig.hpp) so
+    // that its netlists share internal functions with this graph.
+    Bits mulCsaV(const Bits& a, const Bits& b) {
+        size_t w = a.size();
+        std::vector<std::vector<Lit>> cols(w);
+        for (size_t j = 0; j < w && j < b.size(); ++j)
+            for (size_t i = 0; i + j < w; ++i) {
+                Lit pp = g.and_(a[i].v, b[j].v);
+                if (pp != kFalse) cols[i + j].push_back(pp);
+            }
+        for (size_t c = 0; c < w; ++c)
+            while (cols[c].size() > 2) {
+                Lit x = cols[c].back(); cols[c].pop_back();
+                Lit y = cols[c].back(); cols[c].pop_back();
+                Lit z = cols[c].back(); cols[c].pop_back();
+                cols[c].insert(cols[c].begin(), g.xor_(g.xor_(x, y), z));
+                if (c + 1 < w) cols[c + 1].push_back(maj(x, y, z));
+            }
+        Bits r0(w, kB0), r1(w, kB0);
+        for (size_t c = 0; c < w; ++c) {
+            if (cols[c].size() > 0) r0[c] = {cols[c][0], kFalse};
+            if (cols[c].size() > 1) r1[c] = {cols[c][1], kFalse};
+        }
+        return w < 8 ? addV(r0, r1, kFalse) : addPrefixV(r0, r1);
+    }
     Bits mul(const Bits& a, const Bits& b) {
         Bits acc = mulV(a, b);
         // A netlist may add the rows in the other order (one per bit of a).
@@ -171,9 +219,11 @@ struct Bv {
         // build that order too and record that the two products are equal.
         uint64_t ca, cb;
         if (lemmas && a.size() >= 6 && !constValue(a, ca) && !constValue(b, cb)) {
-            Bits alt = mulV(b, a);
-            for (size_t i = 0; i < acc.size(); ++i)
-                if (alt[i].v != acc[i].v) lemmas->push_back({acc[i].v, alt[i].v});
+            // Likewise a carry-save tree with a parallel-prefix final adder,
+            // which is what msynth and most synthesis tools emit.
+            for (const Bits& alt : {mulV(b, a), mulCsaV(a, b), mulCsaV(b, a)})
+                for (size_t i = 0; i < acc.size(); ++i)
+                    if (alt[i].v != acc[i].v) lemmas->push_back({acc[i].v, alt[i].v});
         }
         poison(acc, a, b);
         return acc;
