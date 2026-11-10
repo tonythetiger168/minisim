@@ -274,6 +274,7 @@ void usage() {
                  "  -Werror        exit non-zero on any finding\n"
                  "  -quiet         print findings only, no summary\n"
                  "  -top M         the top module    -f <file>  an argument file\n"
+              << protfront::Options::help() <<
                  "  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
                  "  -version       print the version\n"
                  "  --help-slang   list every front-end option\n";
@@ -291,6 +292,7 @@ void listRules() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    FrontEnd fe;
     std::vector<std::string> fwd{argv[0]};
     Rules rules;
     bool werror = false, quiet = false;
@@ -315,14 +317,16 @@ int main(int argc, char** argv) {
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
+        if (fe.prot.take(argc, argv, i)) continue;
         fwd.push_back(a);
     }
 
-    FrontEnd fe;
+    fe.tool = "mdft";
     if (int rc = fe.run(fwd, "mdft front end")) return rc < 0 ? 0 : rc;
 
     Report rep;
     rep.sm = fe.comp->getSourceManager();
+    if (fe.pc.any()) { rep.pc = &fe.pc; namePC() = &fe.pc; }
     rep.rules = rules;
     Design d;
     d.gather(*fe.comp, rep);
