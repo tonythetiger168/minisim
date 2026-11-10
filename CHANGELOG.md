@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
+  and transitions of FSMs), in the totals, the history and `mplan init`.
 - `memu`, emulation and FPGA prototyping: puts a gate-level netlist
   (structural Verilog over a Liberty library) on a board of FPGAs. Clock
   conversion onto one free-running clock (strobes for clean clocks, edge
