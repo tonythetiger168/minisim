@@ -26,6 +26,16 @@ int main() {
         for (int round = 0; round < 5000; round++)
             pool.run(1 + round % 3, [&](size_t i) { small[i]++; });
         assert(small[0] == 5000 && small[1] == 3333 && small[2] == 1666);
+        // The same with workers that look for the next batch before they sleep.
+        pool.spin(2000);
+        for (int round = 0; round < 5000; round++)
+            pool.run(1 + round % 3, [&](size_t i) { small[i]++; });
+        assert(small[0] == 10000 && small[1] == 6666 && small[2] == 3332);
+        for (int round = 0; round < 50; round++) {
+            pool.run(out.size(), [&](size_t i) { out[i] = (long)i * round; });
+            assert(std::accumulate(out.begin(), out.end(), 0L) == 256L * 257 / 2 * round);
+        }
+        pool.spin(0);
 
         // Chunks cover [0, n) once; a sum is the same bits on any thread count.
         std::vector<int> cover(1003, 0);
