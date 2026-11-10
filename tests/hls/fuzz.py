@@ -115,6 +115,19 @@ class Gen:
             self.loop -= 1
             self.ro.remove(i)
             self.emit("}")
+        elif k < 0.915 and self.depth < 2:
+            self.emit("switch (%s & 3) {" % self.expr(2))
+            for c in r.sample([0, 1, 2, 3], r.randint(1, 3)):
+                self.emit("  case %d: {" % c)
+                self.block(r.randint(1, 2))
+                self.emit("  }")
+                if r.random() < 0.75:
+                    self.emit("    break;")
+            if r.random() < 0.6:
+                self.emit("  default: {")
+                self.block(1)
+                self.emit("  }")
+            self.emit("}")
         elif k < 0.93 and not self.pipe and self.depth > 0 and self.loop == 0:
             self.emit("if (%s) return %s;" % (self.expr(2), self.expr(1)))
         elif [v for v in self.vars if v[1] != "bool"]:

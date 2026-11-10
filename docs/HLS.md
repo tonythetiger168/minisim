@@ -19,8 +19,8 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
 1. **Front end** (`src/hls_front.hpp`): lexer, a small preprocessor
    (`#define` without arguments, `#if/#ifdef/#else/#endif`, `-D`), parser.
 2. **Lowering** (`src/hls_ir.hpp`) to a control/data-flow graph: every call
-   is inlined; `if`/`?:`/`&&`/`||` without loops or jumps become multiplexers
-   (if-conversion); loops with a constant trip count unroll on request;
+   is inlined; `if`/`switch`/`?:`/`&&`/`||` without loops become multiplexers
+   (if-conversion), including early returns such as `if (x < lo) return lo;`; loops with a constant trip count unroll on request;
    small arrays become registers, large ones RAMs, `const` ones ROMs.
    Dead code goes, and every operator is narrowed to the bits its readers
    look at, so `uint8_t c = a + b` is an 8-bit adder although C adds as `int`.
@@ -43,7 +43,7 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
 |---|---|
 | `bool`, `char` .. `long long`, `intN_t`/`uintN_t`, `ap_int<N>`/`ap_uint<N>`, `sc_int<N>`/`sc_uint<N>`, N up to 64 | floating point, wider than 64 bits |
 | every C operator, casts, `?:`, short-circuit `&&` `\|\|`, `++`/`--`, compound assignment | `sizeof`, string literals |
-| `if`, `for`, `while`, `do`, `break`, `continue`, `return` anywhere | `switch`, `goto` |
+| `if`, `switch` (with fall-through), `for`, `while`, `do`, `break`, `continue`, `return` anywhere | `goto` |
 | fixed-size arrays of any dimension, initializer lists | pointers other than scalar output parameters, dynamic memory |
 | functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion, structs, classes, templates |
 
@@ -115,5 +115,5 @@ need multicycle constraints.
 ## Not yet
 
 Loop pipelining, dual-port memories, AXI-Stream/handshake interfaces,
-`switch`, structs, SystemC modules (`SC_MODULE`, clocked threads), and
+structs, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

@@ -217,6 +217,10 @@ class Lowerer {
     }
     cc.last = f.body->kids.empty() ? nullptr : f.body->kids.back();
     cc.loopBase = 0;
+    if (earlyRet(f.body, cc.last)) {
+      cc.flagVar = newVar("returned", boolT(), false);
+      setVar(cc.flagVar, konst(0, 1));
+    }
     S.calls.push_back(cc);
     S.callStack.push_back(f.name);
     try {
@@ -249,10 +253,12 @@ class Lowerer {
   };
   struct LoopCtx {
     int brk = -1, cont = -1;
-    bool unrolled = false;
+    bool unrolled = false, isSwitch = false;
   };
   struct CallCtx {
     int retVar = -1, retBlock = -1;
+    int flagVar = -1;        // 1 once a return under a condition has been taken
+    bool predRet = false;    // such a return has been lowered
     const Stmt* last = nullptr;
     Type retTy;
     size_t loopBase = 0;
@@ -265,6 +271,7 @@ class Lowerer {
     std::map<Key, int> cse;
     std::vector<std::map<std::string, Sym>> scopes;
     int pred = -1;
+    int noPredRet = 0;       // returns under a condition must branch, not predicate
     std::vector<LoopCtx> loops;
     std::vector<CallCtx> calls;
     std::vector<std::string> callStack;
@@ -1024,6 +1031,10 @@ class Lowerer {
     if (f->ret.w) cc.retVar = newVar(f->name + "_ret", f->ret, false);
     cc.last = f->body->kids.empty() ? nullptr : f->body->kids.back();
     cc.loopBase = S.loops.size();
+    if (earlyRet(f->body, cc.last)) {
+      cc.flagVar = newVar("returned", boolT(), false);
+      setVar(cc.flagVar, konst(0, 1));
+    }
     S.calls.push_back(cc);
     S.callStack.push_back(f->name);
     lowerStmt(f->body);
@@ -1048,9 +1059,16 @@ class Lowerer {
   bool simple(const Stmt* s) const {
     if (!s) return true;
     switch (s->k) {
-      case Stmt::Ret: case Stmt::Brk: case Stmt::Cont: case Stmt::Do: return false;
-      case Stmt::While: case Stmt::For: return wantUnroll(s) && simple(s->body);
+      case Stmt::Brk: case Stmt::Cont: case Stmt::Do: return false;
+      case Stmt::Ret: return true;   // a return under a condition sets a flag; lowering decides
+      case Stmt::While: case Stmt::For: return wantUnroll(s) && simple(s->body) && !hasRet(s->body);
       case Stmt::If: return simple(s->body) && simple(s->els);
+      case Stmt::Switch: {
+        for (size_t i = 0; i < s->cases.size(); i++)
+          for (auto* k : caseBody(s, i))
+            if (!simple(k)) return false;
+        return true;
+      }
       case Stmt::Blk:
         for (auto* k : s->kids)
           if (!simple(k)) return false;
@@ -1065,9 +1083,48 @@ class Lowerer {
       if (hasCall(a)) return true;
     return hasCall(e->a) || hasCall(e->b) || hasCall(e->c);
   }
+  // The statements case i runs: its own and, falling through, the next
+  // cases', up to the first break or return at the top level.
+  static std::vector<const Stmt*> caseBody(const Stmt* sw, size_t i) {
+    std::vector<const Stmt*> r;
+    for (size_t j = i; j < sw->cases.size(); j++)
+      for (auto* k : sw->cases[j].body) {
+        if (k->k == Stmt::Brk) return r;
+        r.push_back(k);
+        if (k->k == Stmt::Ret) return r;
+      }
+    return r;
+  }
+  static bool hasRet(const Stmt* s) {
+    if (!s) return false;
+    if (s->k == Stmt::Ret) return true;
+    for (auto* k : s->kids)
+      if (hasRet(k)) return true;
+    for (auto& c : s->cases)
+      for (auto* k : c.body)
+        if (hasRet(k)) return true;
+    return hasRet(s->init) || hasRet(s->body) || hasRet(s->els);
+  }
+  // A return other than the function's last statement.
+  static bool earlyRet(const Stmt* s, const Stmt* last) {
+    if (!s) return false;
+    if (s->k == Stmt::Ret) return s != last;
+    for (auto* k : s->kids)
+      if (earlyRet(k, last)) return true;
+    for (auto& c : s->cases)
+      for (auto* k : c.body)
+        if (earlyRet(k, last)) return true;
+    return earlyRet(s->init, last) || earlyRet(s->body, last) || earlyRet(s->els, last);
+  }
   static bool mayFail(const Stmt* s) {
     if (!s) return false;
-    if (s->k == Stmt::For || s->k == Stmt::While) return true;
+    if (s->k == Stmt::For || s->k == Stmt::While || s->k == Stmt::Ret) return true;
+    for (auto& c : s->cases) {
+      for (auto* l : c.labels)
+        if (hasCall(l)) return true;
+      for (auto* k : c.body)
+        if (mayFail(k)) return true;
+    }
     if (hasCall(s->e) || hasCall(s->cond) || hasCall(s->inc)) return true;
     for (auto& d : s->decls) {
       if (hasCall(d.init)) return true;
@@ -1086,25 +1143,31 @@ class Lowerer {
     S.scopes.pop_back();
   }
 
+  // Inside a loop of the function being lowered (a switch is not a loop).
+  bool inLoop() const {
+    for (size_t i = S.calls.back().loopBase; i < S.loops.size(); i++)
+      if (!S.loops[i].isSwitch) return true;
+    return false;
+  }
   bool inUnrolled() const {
     for (size_t i = S.calls.back().loopBase; i < S.loops.size(); i++)
       if (S.loops[i].unrolled) return true;
     return false;
   }
 
-  void lowerIf(const Stmt* s) {
-    int c = toBool(rv(s->cond));
+  // if (c) T else E: multiplexers when both sides can be predicated,
+  // otherwise a branch in the control flow.
+  void lowerBranch(int c, const std::function<void()>& T, const std::function<void()>& E, bool convert, bool risky) {
     if (isC(c)) {
-      scoped(cv(c) ? s->body : s->els);
+      (cv(c) ? T : E)();
       return;
     }
-    if (simple(s->body) && simple(s->els)) {
-      bool risky = mayFail(s->body) || mayFail(s->els);
+    if (convert) {
       std::unique_ptr<State> snap;
       if (risky) snap = std::make_unique<State>(S);
       try {
-        auto envT = predicated(c, [&] { scoped(s->body); });
-        auto envE = predicated(notB(c), [&] { scoped(s->els); });
+        auto envT = predicated(c, T);
+        auto envE = predicated(notB(c), E);
         merge(c, envT, envE);
         return;
       } catch (NoConv&) {
@@ -1113,17 +1176,63 @@ class Lowerer {
       }
     }
     if (S.pred >= 0) throw NoConv{};
-    int T = newBlock(), E = s->els ? newBlock() : -1, J = newBlock();
-    branch(c, T, s->els ? E : J);
-    start(T);
-    scoped(s->body);
-    jumpTo(J);
-    if (s->els) {
-      start(E);
-      scoped(s->els);
-      jumpTo(J);
+    int tb = newBlock(), eb = newBlock(), jb = newBlock();
+    branch(c, tb, eb);
+    start(tb);
+    T();
+    jumpTo(jb);
+    start(eb);
+    E();
+    jumpTo(jb);
+    start(jb);
+  }
+
+  void lowerIf(const Stmt* s) {
+    int c = toBool(rv(s->cond));
+    lowerBranch(c, [&] { scoped(s->body); }, [&] { scoped(s->els); }, simple(s->body) && simple(s->els),
+                mayFail(s->body) || mayFail(s->els));
+  }
+
+  void lowerSwitch(const Stmt* s) {
+    TV sel = rv(s->cond);
+    int selVar = spill(sel);
+    bool convert = simple(s), risky = mayFail(s);
+    LoopCtx lc;
+    lc.isSwitch = true;
+    S.loops.push_back(lc);
+    size_t depth = S.loops.size();
+    std::vector<size_t> order;   // cases with labels in source order, the default last
+    for (size_t i = 0; i < s->cases.size(); i++)
+      if (!s->cases[i].labels.empty()) order.push_back(i);
+    int dflt = -1;
+    for (size_t i = 0; i < s->cases.size(); i++)
+      if (s->cases[i].isDefault) dflt = (int)i;
+    auto body = [&](size_t i) {
+      S.scopes.emplace_back();
+      lowerSeq(caseBody(s, i), 0);
+      S.scopes.pop_back();
+    };
+    std::function<void(size_t)> chain = [&](size_t n) {
+      if (n == order.size()) {
+        if (dflt >= 0) body((size_t)dflt);
+        return;
+      }
+      size_t i = order[n];
+      int c = konst(0, 1);
+      for (auto* l : s->cases[i].labels) {
+        TV lab = rv(l);
+        c = bin(OpK::Or, c, arith("==", TV{getVar(selVar), sel.ty}, lab, l->line).v);
+      }
+      // A default that sits on this case's fall-through path is part of body(i) already.
+      lowerBranch(c, [&] { body(i); }, [&] { chain(n + 1); }, convert, risky);
+    };
+    chain(0);
+    lc = S.loops[depth - 1];
+    S.loops.resize(depth - 1);
+    if (lc.brk >= 0) {
+      jumpTo(lc.brk);
+      start(lc.brk);
     }
-    start(J);
   }
 
   void lowerLoop(const Stmt* s) {
@@ -1181,6 +1290,39 @@ class Lowerer {
     S.scopes.pop_back();
   }
 
+  // A statement list. After a statement that may have returned under a
+  // condition, the rest runs under "not returned"; when the rest cannot be
+  // predicated (it has a loop), that statement is lowered again with real
+  // branches instead.
+  template <class Vec>
+  void lowerSeq(const Vec& kids, size_t from) {
+    for (size_t i = from; i < kids.size(); i++) {
+      bool watch = i + 1 < kids.size() && hasRet(kids[i]) && kids[i]->k != Stmt::Ret &&
+                   S.calls.back().flagVar >= 0 && !S.noPredRet;
+      if (!watch) {
+        lowerStmt(kids[i]);
+        continue;
+      }
+      State snap = S;
+      lowerStmt(kids[i]);
+      if (!S.calls.back().predRet) continue;
+      int fl = getVar(S.calls.back().flagVar);
+      if (isC(fl) && !cv(fl)) continue;
+      try {
+        std::map<int, int> env0 = S.env;
+        int go = notB(fl);
+        auto envT = predicated(go, [&] { lowerSeq(kids, i + 1); });
+        merge(go, envT, env0);
+        return;
+      } catch (NoConv&) {
+        S = std::move(snap);
+        S.noPredRet++;
+        lowerStmt(kids[i]);
+        S.noPredRet--;
+      }
+    }
+  }
+
   void lowerStmt(const Stmt* s) {
     if (!s) return;
     switch (s->k) {
@@ -1191,21 +1333,31 @@ class Lowerer {
       case Stmt::ExprS: rv(s->e); break;
       case Stmt::Blk:
         S.scopes.emplace_back();
-        for (auto* k : s->kids) lowerStmt(k);
+        lowerSeq(s->kids, 0);
         S.scopes.pop_back();
         break;
       case Stmt::If: lowerIf(s); break;
+      case Stmt::Switch: lowerSwitch(s); break;
       case Stmt::For: case Stmt::While: case Stmt::Do: lowerLoop(s); break;
       case Stmt::Brk: case Stmt::Cont: {
-        if (S.loops.size() <= S.calls.back().loopBase)
-          fail(P.file, s->line, "break/continue outside a loop");
-        if (S.pred >= 0 || S.loops.back().unrolled) throw NoConv{};
-        LoopCtx& lc = S.loops.back();
+        // break leaves the innermost loop or switch, continue the innermost loop.
+        size_t i = S.loops.size(), base = S.calls.back().loopBase;
+        while (i > base && s->k == Stmt::Cont && S.loops[i - 1].isSwitch) i--;
+        if (i <= base) fail(P.file, s->line, "break/continue outside a loop");
+        i--;
+        if (S.pred >= 0 || S.loops[i].unrolled) throw NoConv{};
         if (s->k == Stmt::Brk) {
-          jumpTo(lc.brk);
+          if (S.loops[i].brk < 0) {
+            int b = newBlock();
+            S.loops[i].brk = b;
+          }
+          jumpTo(S.loops[i].brk);
         } else {
-          if (lc.cont < 0) lc.cont = newBlock();
-          jumpTo(lc.cont);
+          if (S.loops[i].cont < 0) {
+            int b = newBlock();
+            S.loops[i].cont = b;
+          }
+          jumpTo(S.loops[i].cont);
         }
         start(newBlock());
         break;
@@ -1221,7 +1373,15 @@ class Lowerer {
           fail(P.file, s->line, "return needs a value");
         }
         if (s == cc.last) break;
-        if (S.pred >= 0 || inUnrolled()) throw NoConv{};
+        if (S.pred >= 0) {
+          // Under a condition: note that the function has returned, and
+          // lowerSeq runs what follows only when it has not.
+          if (S.noPredRet || inLoop() || cc.flagVar < 0) throw NoConv{};
+          setVar(cc.flagVar, konst(1, 1));
+          S.calls.back().predRet = true;
+          break;
+        }
+        if (inUnrolled()) throw NoConv{};
         if (cc.retBlock < 0) {
           int rb = newBlock();
           S.calls.back().retBlock = rb;

@@ -63,6 +63,8 @@ design(calls calls)
 design(calls calls -clock 2 -mul 1)
 design(matmul matmul)
 design(matmul matmul -unroll-all -mul 2 -clock 4)
+design(alu alu)                                  # switch as multiplexers, fall-through, break in a loop
+design(alu alu -clock 2 -unroll-all)
 design(apint blend NOCREF)
 design(apint blend -pipeline -clock 2 NOCREF)
 

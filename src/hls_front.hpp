@@ -60,7 +60,13 @@ struct Decl {
 };
 
 struct Stmt {
-  enum K { DeclS, ExprS, If, For, While, Do, Ret, Brk, Cont, Blk, Empty } k = Empty;
+  enum K { DeclS, ExprS, If, For, While, Do, Ret, Brk, Cont, Blk, Switch, Empty } k = Empty;
+  struct Case {
+    std::vector<Expr*> labels;
+    bool isDefault = false;
+    std::vector<Stmt*> body;
+  };
+  std::vector<Case> cases;
   std::vector<Decl> decls;
   Expr *e = nullptr, *cond = nullptr, *inc = nullptr;
   Stmt *init = nullptr, *body = nullptr, *els = nullptr;
@@ -821,7 +827,33 @@ class Parser {
       expect(";");
       return s;
     }
-    for (const char* k : {"switch", "goto", "struct", "union", "class", "try", "throw", "new", "delete"})
+    if (isId("switch")) {
+      Stmt* s = mkS(Stmt::Switch);
+      i_++;
+      expect("(");
+      s->cond = expr();
+      expect(")");
+      expect("{");
+      while (!isP("}")) {
+        if (cur().k == Tok::End) err("missing '}'");
+        if (isId("case") || isId("default")) {
+          if (s->cases.empty() || !s->cases.back().body.empty()) s->cases.emplace_back();
+          if (acceptId("default")) {
+            s->cases.back().isDefault = true;
+          } else {
+            i_++;
+            s->cases.back().labels.push_back(ternary());
+          }
+          expect(":");
+        } else {
+          if (s->cases.empty()) err("statement before the first case label");
+          s->cases.back().body.push_back(stmt());
+        }
+      }
+      expect("}");
+      return s;
+    }
+    for (const char* k : {"goto", "struct", "union", "class", "try", "throw", "new", "delete"})
       if (isId(k)) err(std::string("'") + k + "' is not supported");
     if (typeStart()) return declStmt();
     Stmt* s = mkS(Stmt::ExprS);

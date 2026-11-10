@@ -10,7 +10,7 @@ Spec references are IEEE 1800-2023 clauses.
 ### Added
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
-  functions, all control flow but `switch`) is scheduled into clock cycles
+  functions, all control flow but `goto`) is scheduled into clock cycles
   under `-clock`, `-mul` and `-div`, with operator chaining, multi-cycle
   operators, register and multiplier/divider sharing, and comes out as an
   FSM with datapath or (`-pipeline`) a pipeline taking one input per cycle.
