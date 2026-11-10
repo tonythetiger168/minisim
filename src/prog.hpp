@@ -358,7 +358,16 @@ inline bool classIsA(int cls, int want) {
     return false;
 }
 
+// Power-aware simulation (IEEE 1801-2024 9.5): per power domain, the
+// simstate its primary supply set applies (upf::Simstate: 0 NORMAL ... 5
+// CORRUPT), and a signal that changes when the domain powers up. A process
+// with Prog::pd >= 0 is in that domain (upf_rt.inc).
+inline bool g_upf = false;
+inline std::vector<int> g_pdMode, g_pdSig;
+
 struct Prog {
+    int pd = -1;           // UPF power domain, -1 for none (initial blocks are never gated, 9.2.1)
+    bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
     std::vector<Instr> code;
     // Named blocks this process runs as a whole (an initial's named body, a
     // fork branch that is a named block, every branch of a named fork).

@@ -1,0 +1,24 @@
+create_power_domain PD_B -elements {u_b}
+create_supply_port VDD_B
+create_supply_port VSS
+create_supply_net VDD_B
+create_supply_net VSS
+connect_supply_net VDD_B -ports {VDD_B}
+connect_supply_net VSS -ports {VSS}
+create_supply_set PD_B.primary -update -function {power VDD_B} -function {ground VSS}
+add_power_state PD_B.primary \
+    -state {HV -supply_expr {power == {FULL_ON 0.9} && ground == FULL_ON} -simstate NORMAL} \
+    -state {RV -supply_expr {power == {FULL_ON 0.75} && ground == FULL_ON} -simstate CORRUPT_STATE_ON_CHANGE} \
+    -state {LV -supply_expr {power == {FULL_ON 0.6} && ground == FULL_ON} -simstate CORRUPT_ON_ACTIVITY} \
+    -state {OFF -supply_expr {power == OFF}}
+add_power_state PD_B -domain \
+    -state {RUN -logic_expr {PD_B.primary == HV && mode == 0}} \
+    -state {SLEEP -logic_expr {PD_B.primary != HV && mode == 0}} \
+    -state {BAD -logic_expr {mode == 1} -illegal}
+add_port_state VDD_B -state {HV 0.9} -state {RV 0.75} -state {LV 0.6} -state {OFF off}
+add_port_state VSS -state {GND 0.0}
+create_pst T -supplies {VDD_B VSS}
+add_pst_state run -pst T -state {HV GND}
+add_pst_state ret -pst T -state {RV GND}
+add_pst_state low -pst T -state {LV GND}
+add_pst_state off -pst T -state {OFF GND}

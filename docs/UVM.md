@@ -25,8 +25,9 @@ backdoor through plain VPI in place of uvm-core's per-vendor files. With it:
   `+uvm_set_type_override`, `uvm_cmdline_processor::get_args` and the
   rest;
 - HDL backdoor access works: `uvm_hdl_check_path`, `uvm_hdl_read`,
-  `uvm_hdl_deposit`, `uvm_hdl_force`, `uvm_hdl_release` on variables and
-  nets by hierarchical name, and so register model backdoor reads and
+  `uvm_hdl_deposit`, `uvm_hdl_force`, `uvm_hdl_release`,
+  `uvm_hdl_force_time` on variables and nets by hierarchical name, and on a
+  bit or part select of one (`top.u.r[3:0]`), and so register model backdoor reads and
   writes (`UVM_BACKDOOR`) through `add_hdl_path` / `configure(..., "path")`.
 
 The C code calls VPI from context imports, so the design runs on one thread.
@@ -51,16 +52,15 @@ test runs with `msim -uvmhome`, so with UVM's C code, unless it says
 |---|---|
 | `hello.sv` | `run_test`, the factory, a task phase, objections, `` `uvm_info `` |
 | `agent.sv` | sequence, sequencer, driver, monitor, scoreboard around a DUT; a virtual interface through `uvm_config_db`; analysis port and imp |
-| `dpi.sv` | UVM's C code: `uvm_re_match`, `uvm_cmdline_processor`, `+uvm_set_config_int`, `uvm_hdl_*` read / deposit / force / release on variables and nets, a register read and written through its backdoor |
+| `dpi.sv` | UVM's C code: `uvm_re_match`, `uvm_cmdline_processor`, `+uvm_set_config_int`, `uvm_hdl_*` read / deposit / force / release on variables, nets and part selects, `uvm_hdl_force_time`, a register read and written through its backdoor |
 | `hello_nodpi.sv` | `hello.sv` with the library built without its C code |
 | `features.sv` | field macros (print, clone, compare, sprint, pack), a factory type override, a TLM FIFO between put and get ports, a report catcher, `print_topology`, `randomize() with`, `+UVM_TESTNAME` |
 
 ## Not yet
 
-- `uvm_hdl_force_time` and the backdoor on VHDL objects (minisim simulates
-  SystemVerilog only); `uvm_hdl_*` on a part select path (`top.r[3:0]`).
-- Rand associative arrays and rand arrays of
-  arrays.
+- The backdoor on VHDL objects (minisim simulates SystemVerilog only).
+- Rand arrays of arrays (`rand int q[$][]` with `foreach (q[i, j])`
+  constraints); uvm-core itself does not use them.
 
 ## Debugging
 

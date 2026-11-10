@@ -1,0 +1,13 @@
+1 all off: cnt=xx q=xx hi=x lat=xx ack=0 core.cnt=xx
+2 switch off: cnt=xx q=xx hi=x lat=xx ack=0 core.cnt=xx
+3 switch on, not reset: cnt=xx q=ff hi=0 lat=xx ack=1 core.cnt=xx
+35 core: cnt is 3
+44 running: cnt=04 q=ff hi=0 lat=04 ack=1 core.cnt=04
+45 isolated: cnt=00 q=00 hi=1 lat=04 ack=1 core.cnt=04
+65 core off: cnt=00 q=00 hi=1 lat=04 ack=0 core.cnt=xx
+66 input changed while off: cnt=00 q=00 hi=1 lat=04 ack=0 core.cnt=xx
+67 core on, still isolated: cnt=00 q=00 hi=1 lat=04 ack=1 core.cnt=xx
+68 isolation off: cnt=xx q=cc hi=0 lat=xx ack=1 core.cnt=xx
+69 isolation control x: cnt=xx q=xx hi=x lat=xx ack=1 core.cnt=xx
+90 reset again: cnt=02 q=cc hi=0 lat=02 ack=1 core.cnt=02
+91 VDD off: cnt=xx q=xx hi=x lat=xx ack=1 core.cnt=xx

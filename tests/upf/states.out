@@ -1,0 +1,16 @@
+11 HV: y=c r=3
+VDD_B: FULL_ON 900000 uV on=1
+12 LV, no activity: y=c r=3
+13 LV, input changed: y=x r=3
+14 RV: y=x r=3
+24 RV, a flop that changes is corrupted: y=x r=x
+34 HV again: y=9 r=6
+UPF error: 34: supplies are in no state of PST T: VDD_B=FULL_ON 1.2V VSS=GND
+UPF error: 35: power domain PD_B is in illegal power state BAD
+37 set_power_state OFF: y=x r=x
+38 set_power_state HV: y=9 r=x
+PD_B.primary.power: FULL_ON 900000 uV
+39 partial on: y=x r=x
+40 set_supply_state FULL_ON: y=9 r=x
+UPF error: 40: no supply port, net or supply set function 'NO_SUCH'
+supply_on of an unknown supply returns 0

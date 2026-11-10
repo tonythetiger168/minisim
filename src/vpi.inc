@@ -45,7 +45,8 @@ struct Obj {
     const Symbol* sym = nullptr;          // Module: InstanceSymbol; Signal / Param / Port / Word: the symbol
     const Obj* parent = nullptr;          // Word, Bit: the memory or vector; Arg: the call
     int sig = -1, w = 0;                  // the signal and its width (Word: element, Bit: the vector's signal)
-    int off = 0;                          // Bit: bit offset in the vector
+    int off = 0;                          // Bit: bit offset in the vector (a part select: its lowest bit)
+    int lidx = 0;                         // a part select v[idx:lidx]: its right index
     bool sgn = false, real = false, str = false;
     std::vector<vpiHandle> items;         // Iter
     size_t pos = 0;
@@ -210,6 +211,25 @@ inline Obj* bitObj(const Obj* vec, int64_t i) {
     }
     return b;
 }
+// v[a:b] (a vpiPartSelect, 38.27): bits a down to b of a vector, by its declared range.
+inline Obj* partObj(const Obj* vec, int64_t a, int64_t b) {
+    auto [l, r] = rangeOf(vec);
+    int64_t oa = l >= r ? a - r : r - a, ob = l >= r ? b - r : r - b;
+    int64_t lo = std::min(oa, ob), hi = std::max(oa, ob);
+    if (lo < 0 || hi >= vec->w) return nullptr;
+    if (lo == hi) return bitObj(vec, a);
+    auto& b2 = st().subObj[{vec, (int)(lo + ((hi + 1) << 20))}];
+    if (!b2) {
+        b2 = mkObj(Obj::Bit, vpiPartSelect);
+        b2->parent = vec;
+        b2->sig = vec->sig;
+        b2->off = (int)lo;
+        b2->idx = (int)a;
+        b2->lidx = (int)b;
+        b2->w = (int)(hi - lo + 1);
+    }
+    return b2;
+}
 inline Obj* wordObj(const Obj* mem, int64_t i) {
     auto am = arrMap().find(mem->sym);
     if (am == arrMap().end()) return nullptr;
@@ -293,11 +313,9 @@ inline int64_t sigTicks(const p_vpi_time t, const Obj* o);
 inline Val readObj(const Obj* o) {
     if (o->kind == Obj::Arg && o->site->args[(size_t)o->idx].kind == VpiArg::String) return mkstr(o->site->args[(size_t)o->idx].text);
     if (o->kind == Obj::Arg && o->site->args[(size_t)o->idx].kind == VpiArg::Empty) return make(0, ~0ULL, 1);
-    if (o->kind == Obj::Bit) {
+    if (o->kind == Obj::Bit) {   // a bit or a part select
         Val v = S.get(o->sig);
-        Val r = make(0, 0, 1);
-        setBit(r, 0, bitAt(v, o->off));
-        return r;
+        return v_slice(v, o->off + o->w - 1, o->off);
     }
     if (o->sig < 0) return make(0, ~0ULL, std::max(1, o->w));
     Val v = S.get(o->sig);
@@ -558,8 +576,7 @@ inline bool fromValue(const Obj* o, p_vpi_value vp, Val& out) {
 inline void write(const Obj* o, const Val& v) {
     if (o->kind == Obj::Bit) {
         Val cur = S.get(o->sig);
-        setBit(cur, o->off, bitAt(v, 0));
-        S.set(o->sig, cur);
+        S.set(o->sig, v_insert(cur, v_resize(v, o->w, false), o->off + o->w - 1, o->off));
         return;
     }
     S.set(o->sig, v);
@@ -1109,7 +1126,10 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* name, vpiHandle scope) {
         if (!v) return nullptr;
         const std::string& last = parts.back();
         if (size_t p = last.find('['); p != std::string::npos) {
-            int64_t idx = std::strtoll(last.c_str() + p + 1, nullptr, 10);
+            char* end = nullptr;
+            int64_t idx = std::strtoll(last.c_str() + p + 1, &end, 10);
+            if (end && *end == ':' && v->type != vpiMemory)   // v[a:b]
+                return H(vpi::partObj(v, idx, std::strtoll(end + 1, nullptr, 10)));
             return H(v->type == vpiMemory ? vpi::wordObj(v, idx) : vpi::bitObj(v, idx));
         }
         return H(v);
@@ -1208,6 +1228,7 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
             case Obj::Word:
             case Obj::Bit: {
                 std::string b = full ? vpi::fullName(*o->parent->sym) : std::string(o->parent->sym->name);
+                if (o->type == vpiPartSelect) return b + "[" + std::to_string(o->idx) + ":" + std::to_string(o->lidx) + "]";
                 return b + "[" + std::to_string(o->idx) + "]";
             }
             case Obj::Arg: return "";
@@ -1316,7 +1337,7 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
     if (mode == vpiForceFlag || mode == vpiReleaseFlag) {   // like force / release (10.6.2, 38.35)
         if (o->kind == Obj::Call) { vpi::error(vpiError, "vpi_put_value: a function result cannot be forced"); return nullptr; }
         int hi = -1, lo = 0;
-        if (o->kind == Obj::Bit) { hi = lo = o->off; Val one = make(0, 0, 1); ::setBit(one, 0, ::bitAt(val, 0)); val = one; }
+        if (o->kind == Obj::Bit) { lo = o->off; hi = o->off + o->w - 1; val = v_resize(val, o->w, false); }
         if (mode == vpiForceFlag) S.holdOn(o->sig, konst(val), true, hi, lo);
         else {
             S.holdOff(o->sig, true, hi, lo);
@@ -1332,17 +1353,13 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
     if (mode == vpiNoDelay || mode == 0) {
         vpi::write(o, val);
     } else if (d <= 0) {   // like a nonblocking assignment (38.35)
-        if (o->kind == Obj::Bit) {
-            Val one = make(0, 0, 1);
-            ::setBit(one, 0, ::bitAt(val, 0));
-            S.nba(o->sig, one, o->off, o->off);
-        } else S.nba(o->sig, val);
+        if (o->kind == Obj::Bit) S.nba(o->sig, v_resize(val, o->w, false), o->off + o->w - 1, o->off);
+        else S.nba(o->sig, val);
     } else {
         uint64_t when = S.now + (uint64_t)d;
         if (o->kind == Obj::Bit) {   // read-modify-write when it lands
             Val cur = S.get(o->sig);
-            ::setBit(cur, o->off, ::bitAt(val, 0));
-            val = cur;
+            val = v_insert(cur, v_resize(val, o->w, false), o->off + o->w - 1, o->off);
         }
         vpi::st().puts.insert({when, {o->sig, val}});
         vpi::at(when);
