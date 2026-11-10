@@ -145,6 +145,23 @@ run("-lef", lef, out("rand.v"), "-def", out("rand4.def"), "-threads", "4")
 assert open(out("rand1.def")).read() == open(out("rand4.def")).read(), "random design: -threads 4 differs from -threads 1"
 
 
+# 6b. Power straps: on by default, they tie every rail of a supply together.
+log = run("-lef", lef, counter, "-def", out("straps.def"))
+need(log, r"power: 2 straps over the rails")
+need(log, r"0 open, 0 shorts, 0 spacing violations")
+assert "separate pieces" not in log, log
+special = open(out("straps.def")).read().split("\nSPECIALNETS ")[1]
+assert special.count("+ SHAPE STRIPE") == 2 and "via56" in special and "via12" in special, special
+log = run("-lef", lef, counter, "-no_straps", "-def", out("nostraps.def"))
+need(log, r"note: supply VDD is in 3 separate pieces")
+assert "STRIPE" not in open(out("nostraps.def")).read()
+need(run("-lef", lef, counter, "-max_layer", "3"), r"power: no straps: the top vertical layer, m2, is needed for pin access")
+log = run("-lef", lef, counter, "-strap_layer", "4", "-strap_pitch", "3", "-strap_width", "0.2", "-def", out("straps4.def"))
+need(log, r"power: 4 straps over the rails")
+need(log, r"0 open, 0 shorts, 0 spacing violations")
+assert open(out("straps4.def")).read().count("NEW m4 400 + SHAPE STRIPE") + open(out("straps4.def")).read().count("ROUTED m4 400 + SHAPE STRIPE") == 4
+
+
 # 7. GDS out: one reference per component, the cells as abstracts, the same
 # bytes for any thread count, a layer map file, and the conversion of a DEF.
 def gds_records(path):
