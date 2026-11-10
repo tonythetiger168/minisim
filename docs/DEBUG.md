@@ -6,7 +6,7 @@ time. It runs the same front end as `msim`, so it takes the same files and
 options.
 
 ```sh
-msim tb.sv dut.sv -top tb -vcd waves.vcd                 # a run to debug
+msim tb.sv dut.sv -top tb -vcd waves.vcd                 # a run to debug (or -fst waves.fst)
 mdebug tb.sv dut.sv -top tb -drivers tb.u0.y             # who assigns it
 mdebug tb.sv dut.sv -top tb -loads tb.y0                 # who reads it
 mdebug tb.sv dut.sv -top tb -trace tb.y0 -depth 4        # the fan-in cone
@@ -17,6 +17,9 @@ mdebug tb.sv dut.sv -top tb -vcd waves.vcd -html debug.html
 A signal is a hierarchical path (`tb.u0.y`). A tail that names one signal is
 enough (`u0.y`). Every instance has its own signals: `tb.u0.r` and `tb.u1.r`
 are answered separately.
+
+`-vcd` takes a VCD or an FST (`msim -fst`); `-fst` and `-wave` are the same
+option.
 
 ## Drivers and loads
 
@@ -82,6 +85,9 @@ end of the waveform is used.
 - a schematic of the selected signal: inputs, the assignments that drive it,
   the assignments that read it and what they drive. Clicking a signal moves
   the view there, so a cone is walked one step at a time;
+- with `-vcd`: the active driver at the cursor, traced back four steps, in
+  the page itself. Clicking a line of the trace moves to that signal and
+  that time; the driver that ran is outlined in the driver list;
 - with `-vcd`: waveforms, a time cursor, steps to the previous and next change,
   and the value of every signal at the cursor written next to its name in the
   source.
@@ -108,17 +114,44 @@ machine, for `-active` end to end:
 | `-threads 2` | 1.3 |
 | `-threads 4` | 0.9 |
 
+An FST is decoded in time slices, one libfst reader per thread: a 19 MB FST
+of the same run (14.7 million changes) reads in about 3 s on one thread and 1.1 s
+on four.
+
 The page from `-html` holds a budget of two million value changes. When the
 waveform has more, each signal keeps the changes around `-at T` (or its first
 ones), and mdebug says so.
 
+## Block view
+
+`-blocks INST` lists the instances inside INST: each port with the net it
+connects to (or the expression, for a constant), and which instance output
+feeds which instance input. In the page, selecting an instance in the
+hierarchy draws the same as a block diagram: instances are placed left to
+right in the order data flows, wires join an output to the inputs it feeds,
+and nets that come from the scope's own logic are labelled at the port.
+Click a block to go into it, a net name to select the signal.
+
+## Tasks, calls and force
+
+A task or function declared in a module drives the signals it assigns, as
+`[task name]`. A call drives each output, inout and ref argument from the
+arguments that go in, as `[..., call]`, and the arguments that go in drive
+the task's formals, so the fan-in cone crosses the call. `force` and the
+procedural `assign` are listed as `[..., force]` and `[..., assign]`. A net
+declared with a value (`wire n = a + b;`) is a continuous assignment.
+
 ## Limits
 
-- Waveforms are read from VCD. For FST, convert with `fst2vcd` for now.
+- In the page, a condition that reads an `x` or `z` value is undecided
+  (`??`); the command line evaluates all four states.
 - Unpacked arrays, structs and class objects are not in msim's VCD, so the
   active-driver trace stops at them with `(not in the waveform)`.
-- Assignments made through task or function output arguments, and `force`,
-  are not listed as drivers.
+- A task's formal arguments are not in the waveform, so the active-driver
+  trace shows an assignment inside a task that depends on one as undecided
+  (`??`); `-trace` follows the argument to every call.
+- `release` is not a driver: after it the trace goes back to the ordinary
+  drivers by value.
 - Conditions inside loops, `fork` blocks and pattern matches are shown as
   `...` and are not evaluated.
 - `-html` embeds at most 20000 value changes per signal (`-max-changes N`),

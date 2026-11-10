@@ -1,0 +1,2 @@
+# mplan self-test triage rules.
+/scoreboard mismatch/  status=known owner=carol bug=BUG-7 note="reference model is off by one"

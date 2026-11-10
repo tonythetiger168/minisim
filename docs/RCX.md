@@ -42,10 +42,14 @@ Both go to stderr, and `-Werror` makes them exit 1.
    `-max_seg` (20 um) are cut again, so a long wire is a distributed RC line.
 3. **Capacitance**, for every wire piece:
    - to ground: plate and fringe terms to the substrate, less the part of the
-     plate that metal on the layer below hides;
+     plate that metal on the two layers below hides;
    - to the nearest wire on each side on the same layer, interval by
-     interval, so a wire in between shields the ones behind it;
-   - to each wire of another net it crosses on the layer below.
+     interval, so a wire in between shields the ones behind it. A close
+     neighbour also takes over part of the fringe field that would have gone
+     to the substrate; that part moves from ground to coupling, and the net's
+     total stays the same;
+   - to each wire of another net it crosses one layer away, and two layers
+     away through whatever the layer between leaves open.
 
    Coupling to power and ground metal (the DEF's SPECIALNETS) counts as
    capacitance to ground.
@@ -97,7 +101,7 @@ capacitance to ground, `THICKNESS` and `HEIGHT` for coupling.
 | `-no_name_map` | full names instead of a `*NAME_MAP` |
 | `-report FILE` | per-net table |
 | `-date TEXT` | fixed `*DATE`, for files that compare equal |
-| `-threads N` | worker threads (default: all logical cores) |
+| `-threads N`, `-j N` | worker threads (default: all logical cores, `$MINISIM_THREADS` overrides) |
 | `-Werror` | exit 1 on an open or a short |
 
 ## Accuracy
@@ -108,13 +112,15 @@ test suite (`src/rcx/test/gcd.def`, reference `gcd.spefok`), with
 
 | | mrcx / OpenRCX, all nets | per net: median | 10% to 90% of nets |
 |---|---|---|---|
-| Total capacitance | 1.005 | 1.02 | 0.98 to 1.06 |
+| Total capacitance | 1.017 | 1.02 | 0.98 to 1.07 |
+| Capacitance to ground | 1.010 | 1.02 | 0.95 to 1.13 |
+| Coupling capacitance | 1.036 | 1.04 | 0.92 to 1.44 |
 | Total resistance | 0.84 | 0.90 | 0.78 to 0.95 |
 
-The split differs: mrcx puts 73% as much into coupling as OpenRCX and 11% more
-into ground, because it couples a wire only to its same-layer neighbours and to
-crossings on the next layer down, where OpenRCX also couples across two layers
-and diagonally. That is the next thing to add.
+The one fitted number in the model is how much of the ground fringe a
+neighbour takes over (`kShield` in `src/rcx.hpp`); it was set on this design.
+Resistance is lower than OpenRCX's by about 10% per net; the reference lumps
+vias into wire segments, so the two cannot be compared resistor by resistor.
 
 ## Speed
 
@@ -125,7 +131,7 @@ wire, 1.7 million nodes, 2.9 million coupling capacitors, a 270 MB SPEF) on a
 | | 1 thread | 4 threads |
 |---|---|---|
 | Read LEF and DEF | 1.0 s | 1.0 s |
-| Extract | 4.6 s | 1.8 s |
+| Extract | 5.5 s | 2.0 s |
 | Write SPEF | 1.9 s | 0.8 s |
 
 ## For other tools
@@ -143,7 +149,8 @@ wire, 1.7 million nodes, 2.9 million coupling capacitors, a 270 MB SPEF) on a
 
 - Wires are axis-parallel; a diagonal wire is skipped with a warning.
 - Metal inside cells (pins, obstructions) connects but adds no capacitance.
-- No coupling across two or more layers, no via capacitance, no inductance.
+- No coupling across three or more layers or to wires that pass nearby on
+  another layer without overlapping, no via capacitance, no inductance.
 - One corner per run; use `-temp` and the scale options for the others.
 - Dielectrics are planar layers: no conformal layers, no width-dependent
   etch or thickness.
