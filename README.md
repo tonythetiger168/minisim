@@ -431,6 +431,18 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
+### High-level synthesis: `mhls`
+
+`mhls` turns a C/C++ function into SystemVerilog: an FSM with datapath, or
+with `-pipeline` a pipeline that takes one input per cycle. It also writes
+a self-checking testbench, so the result is one `msim` run away from proven
+against the C. See [docs/HLS.md](docs/HLS.md).
+
+```sh
+mhls fir.c -top fir -clock 5 -o fir.sv -tb fir_tb.sv
+msim fir.sv fir_tb.sv -top fir_tb          # PASS: fir 20 calls, latency 2..2 cycles
+```
+
 ### Datapath library: `dw/`
 
 `dw/` is a library of synthesizable, parameterized building blocks
