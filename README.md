@@ -46,6 +46,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
+| `src/mpnr.cpp`, `src/pnr_*.hpp` | `mpnr` place and route: netlist database, placement, detailed router, DEF out, layout check ([docs/PNR.md](docs/PNR.md)) |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
