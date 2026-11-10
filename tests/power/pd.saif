@@ -1,0 +1,19 @@
+(SAIFILE
+(SAIFVERSION "2.0")
+(DIRECTION "backward")
+(DESIGN "pd")
+(DIVIDER / )
+(TIMESCALE 1 ns)
+(DURATION 1000)
+(INSTANCE pd
+ (NET
+  (clk (T0 500) (T1 500) (TX 0) (TC 200) (IG 0))
+  (d (T0 500) (T1 500) (TX 0) (TC 20) (IG 0))
+  (sw_en (T0 700) (T1 300) (TX 0) (TC 2) (IG 0))
+  (q0 (T0 500) (T1 500) (TX 0) (TC 20) (IG 0))
+  (q1 (T0 500) (T1 200) (TX 300) (TC 6) (IG 0))
+ )
+ (INSTANCE u_aon (NET (n (T0 500) (T1 500) (TX 0) (TC 20) (IG 0))))
+ (INSTANCE u_core (NET (n (T0 150) (T1 150) (TX 700) (TC 6) (IG 0))))
+)
+)

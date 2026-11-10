@@ -332,7 +332,7 @@ struct VcdReader : Reader {
 
 #ifdef MINISIM_FST
 struct FstReader : Reader {
-    void* ctx = nullptr;
+    fstReaderContext* ctx = nullptr;
     struct Var { uint32_t base; int width; };
     std::vector<Var> vars;   // by handle
     Wave w;
