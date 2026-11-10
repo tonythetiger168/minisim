@@ -257,6 +257,7 @@ void usage() {
                  "  -Werror        exit non-zero on any finding (the default is errors only)\n"
                  "  -quiet         print findings only, no summary\n"
                  "  -top M         the top module    -f <file>  an argument file\n"
+              << protfront::Options::help() <<
                  "  -upf <file>    check IEEE 1801 (UPF) power intent against the design (UPF rules)\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
@@ -277,6 +278,7 @@ void listRules() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    FrontEnd fe;
     std::vector<std::string> fwd{argv[0]};
     Rules rules;
     bool werror = false, quiet = false, powerTopSet = false;
@@ -304,6 +306,7 @@ int main(int argc, char** argv) {
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
+        if (fe.prot.take(argc, argv, i)) continue;
         fwd.push_back(a);
     }
 
@@ -324,12 +327,13 @@ int main(int argc, char** argv) {
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{pkgFile};
 
     // Pass 1: the front end, with its own warnings and errors.
-    FrontEnd fe;
+    fe.tool = "mlint";
     if (int rc = fe.run(fwd, "mlint front end")) return rc < 0 ? 0 : rc;
 
     // Pass 2: our rules.
     Report rep;
     rep.sm = fe.comp->getSourceManager();
+    if (fe.pc.any()) { rep.pc = &fe.pc; namePC() = &fe.pc; }
     rep.rules = rules;
     Design d;
     d.gather(*fe.comp, rep);
