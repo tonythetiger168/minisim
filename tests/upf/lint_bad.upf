@@ -1,0 +1,29 @@
+# gating.upf with mistakes, for mlint's UPF rules: no isolation on the core's
+# outputs, a domain on an instance that does not exist, a level shifter
+# missing between two voltages, a PST state that is not defined, and an
+# isolation control signal that is not in the design.
+set_design_top dut
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_CORE -elements {u_core}
+create_power_domain PD_GONE -elements {u_gone}
+create_supply_port VDD
+create_supply_port VDDL
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VDDL
+create_supply_net VSS
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VDDL -ports {VDDL}
+connect_supply_net VSS -ports {VSS}
+create_supply_set SS_AON -function {power VDD} -function {ground VSS}
+create_supply_set SS_CORE -function {power VDDL} -function {ground VSS}
+associate_supply_set SS_AON -handle PD_TOP.primary
+associate_supply_set SS_CORE -handle PD_CORE.primary
+add_port_state VDD -state {HV 1.0}
+add_port_state VDDL -state {LV 0.8} -state {OFF off}
+create_pst P -supplies {VDD VDDL}
+add_pst_state run -pst P -state {HV LV}
+add_pst_state sleep -pst P -state {HV OFF}
+add_pst_state odd -pst P -state {HV MID}
+set_isolation ISO_IN -domain PD_CORE -applies_to inputs -isolation_supply SS_AON \
+    -isolation_signal no_such_signal -clamp_value 0

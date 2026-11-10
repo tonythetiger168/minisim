@@ -1152,8 +1152,24 @@ static bool relEvents(const Instr& i) {
     return isRel(i.sig);
 }
 
+// A write by a process of a domain whose simstate corrupts on activity or
+// on change (IEEE 1801-2024 9.5.4 to 9.5.7) stores a corrupt value instead.
+static Val upfWrite(const Prog* e, int sig, int hi, int lo, const Val& v) {
+    int m = g_pdMode[(size_t)e->pd];
+    bool stateOnly = m == 1 || m == 2;    // CORRUPT_STATE_ON_CHANGE / _ON_ACTIVITY
+    bool onChange = m == 1 || m == 3;     // ..._ON_CHANGE
+    if (stateOnly && !e->pstate) return v;
+    if (onChange) {
+        Val cur = S.get(sig);
+        if (hi >= 0) cur = v_slice(cur, hi, lo);
+        if (cur.w == v.w && cur == v) return v;
+    }
+    return allx(v.w);
+}
+
 Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
     const Prog* p = entry;
+    const FrameP fr0 = fr;
     size_t pc = 0;
     vector<RetFrame> rets;
     FrameP lastRet;   // the frame the last call returned from (mode kRelRet)
@@ -1175,6 +1191,19 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         g_ret = lastRet.get();
         g_threadRng = ctl->rngp;
         if (ctl->killed) goto done;
+        // A process of a powered-off domain is inactive (1801 9.5.3): it
+        // sleeps until the domain powers up, then starts over from its top,
+        // so combinational logic re-evaluates and edge-triggered logic waits
+        // for its next edge (9.6.7).
+        if (__builtin_expect(g_upf, 0) && entry->pd >= 0 && g_pdMode[(size_t)entry->pd] == 5) {
+            while (g_pdMode[(size_t)entry->pd] == 5) co_await Wait{g_pdSig[(size_t)entry->pd], ANY};
+            p = entry;
+            pc = 0;
+            rets.clear();
+            fr = fr0;
+            lastRet = nullptr;
+            continue;
+        }
         if (ctl->suspended) [[unlikely]] {   // 9.7: stop here until resume()
             co_await ProcPark{ctl.get()};
             if (ctl->killed) goto done;
@@ -1191,6 +1220,8 @@ Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Assign:
             case IK::Nba: {
                 Val v = eval(i.e, rd);
+                if (__builtin_expect(g_upf, 0) && entry->pd >= 0 && g_pdMode[(size_t)entry->pd] > 0 && i.sig >= 0 && !isRel(i.sig) && !i.arr)
+                    v = upfWrite(entry, i.sig, i.hi, i.lo, v);
                 if (i.drv >= 0) {
                     if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
                     if (i.gate >= 0 && gateRecs()[(size_t)i.gate].annotated)   // SDF DEVICE delays (32.4.1)
