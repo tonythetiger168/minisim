@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -246,7 +247,9 @@ public:
     // Name lookups. Pins are found through their instance, and the lists of
     // every pin, cell and net name are only built when a constraint asks for
     // them (a wildcard query), since they cost more than the analysis.
-    std::unordered_map<std::string, int> portByName, instByName;
+    std::unordered_map<std::string, int> portByName;
+    mutable std::unordered_map<std::string, int> instByName_;
+    mutable bool haveInstNames_ = false;
     std::vector<std::string> portNames;
     mutable std::vector<std::string> pinNames_, cellNames_;
     mutable std::unordered_map<std::string, int> netByName_;
@@ -277,8 +280,13 @@ public:
         return it == netByName_.end() ? -1 : it->second;
     }
     int findInst(const std::string& n) const {
-        auto it = instByName.find(n);
-        return it == instByName.end() ? -1 : it->second;
+        if (!haveInstNames_) {
+            instByName_.reserve(nl->insts.size());
+            for (size_t i = 0; i < nl->insts.size(); i++) instByName_[nl->insts[i].name] = (int)i;
+            haveInstNames_ = true;
+        }
+        auto it = instByName_.find(n);
+        return it == instByName_.end() ? -1 : it->second;
     }
     // A port, or an instance pin "inst/PIN".
     int findNode(const std::string& n) const {
@@ -416,38 +424,72 @@ public:
         instInfo.assign(nInst, nullptr);
         instPinOff.assign(nInst + 1, 0);
         instNodeOff.assign(nInst + 1, 0);
-        instByName.reserve(nInst);
-        for (size_t i = 0; i < nInst; i++) {
-            const gnl::FlatInst& fi = nl->insts[i];
-            instByName[fi.name] = (int)i;
-            auto c = cellByName.find(fi.cell);
-            const CellInfo* ci = c == cellByName.end() ? nullptr : infoOf(c->second);
-            instInfo[i] = ci;
-            instPinOff[i] = (int)instPinNode.size();
-            instNodeOff[i] = (int)nodes.size();
-            if (!ci) unknown.insert(fi.cell);
-            if (ci) instPinNode.resize(instPinNode.size() + ci->cell->pins.size(), -1);
-            for (auto& cn : fi.conns) {
-                Node n;
-                n.inst = (int)i;
-                n.net = cn.net;
-                if (ci) {
-                    auto p = ci->pinIdx.find(cn.pin);
-                    if (p == ci->pinIdx.end()) {
-                        warn("no-pin", "instance " + fi.name + ": cell " + fi.cell + " has no pin " + cn.pin);
-                    } else {
-                        n.pin = &ci->cell->pins[p->second];
-                        n.driver = n.pin->dir == liberty::Dir::Out || n.pin->dir == liberty::Dir::InOut;
-                        n.cap = n.pin->cap;
-                        instPinNode[instPinOff[i] + p->second] = (int)nodes.size();
-                    }
-                }
-                nodePin.push_back(&cn.pin);
-                nodes.push_back(n);
+        // Bind cells (in parallel: the library map is only read), lay out the
+        // node and pin tables, then fill in each instance's nodes in parallel.
+        std::vector<const liberty::Cell*> bound(nInst, nullptr);
+        forRange(nInst, 4096, [&](size_t b0, size_t e0) {
+            for (size_t i = b0; i < e0; i++) {
+                auto c = cellByName.find(nl->insts[i].cell);
+                if (c != cellByName.end()) bound[i] = c->second;
             }
+        });
+        {
+            const liberty::Cell* lastCell = nullptr;
+            const CellInfo* lastInfo = nullptr;
+            size_t pinOff = 0, nodeOff = nPorts;
+            for (size_t i = 0; i < nInst; i++) {
+                if (bound[i] != lastCell) {
+                    lastCell = bound[i];
+                    lastInfo = lastCell ? infoOf(lastCell) : nullptr;
+                }
+                instInfo[i] = lastInfo;
+                instPinOff[i] = (int)pinOff;
+                instNodeOff[i] = (int)nodeOff;
+                if (lastInfo) pinOff += lastInfo->cell->pins.size();
+                else unknown.insert(nl->insts[i].cell);
+                nodeOff += nl->insts[i].conns.size();
+            }
+            instPinOff[nInst] = (int)pinOff;
+            instNodeOff[nInst] = (int)nodeOff;
+            instPinNode.assign(pinOff, -1);
+            nodes.resize(nodeOff);
+            nodePin.resize(nodeOff, nullptr);
         }
-        instPinOff[nInst] = (int)instPinNode.size();
-        instNodeOff[nInst] = (int)nodes.size();
+        std::mutex warnMutex;
+        forRange(nInst, 2048, [&](size_t b0, size_t e0) {
+            for (size_t i = b0; i < e0; i++) {
+                const gnl::FlatInst& fi = nl->insts[i];
+                const CellInfo* ci = instInfo[i];
+                int n = instNodeOff[i];
+                for (auto& cn : fi.conns) {
+                    Node& x = nodes[n];
+                    x.inst = (int)i;
+                    x.net = cn.net;
+                    if (ci) {
+                        int pi = -1;
+                        auto& pins = ci->cell->pins;
+                        if (pins.size() <= 8) {
+                            for (size_t k = 0; k < pins.size(); k++)
+                                if (pins[k].name == cn.pin) { pi = (int)k; break; }
+                        } else {
+                            auto pit = ci->pinIdx.find(cn.pin);
+                            if (pit != ci->pinIdx.end()) pi = pit->second;
+                        }
+                        if (pi < 0) {
+                            std::lock_guard<std::mutex> lk(warnMutex);
+                            warn("no-pin", "instance " + fi.name + ": cell " + fi.cell + " has no pin " + cn.pin);
+                        } else {
+                            x.pin = &pins[pi];
+                            x.driver = x.pin->dir == liberty::Dir::Out || x.pin->dir == liberty::Dir::InOut;
+                            x.cap = x.pin->cap;
+                            instPinNode[instPinOff[i] + pi] = n;
+                        }
+                    }
+                    nodePin[n] = &cn.pin;
+                    n++;
+                }
+            }
+        });
         for (auto& u : unknown) warn("no-cell", "cell " + u + " is not in any library: its instances are not timed");
 
         // Net arcs: every driver to every load of the net.
@@ -1229,6 +1271,11 @@ public:
         return dt.lookup(dr->second.inSlew[irf], nodes[n].load) - dt.lookup(dr->second.inSlew[irf], 0);
     }
 
+    template <class F>
+    void forRange(size_t n, size_t grain, F&& f) {
+        if (pool) pool->run(n, grain, f);
+        else f((size_t)0, n);
+    }
     template <class F>
     void runLevel(const std::vector<int>& lv, F&& f) {
         if (pool && lv.size() >= 512) {

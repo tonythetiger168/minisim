@@ -19,6 +19,7 @@
 // instantiated but not defined is a leaf (a library cell).
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -30,6 +31,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +49,9 @@ struct Ref {
     std::string name;
     int msb = 0, lsb = 0;       // Bit: msb == lsb
     std::vector<uint8_t> bits;  // Const: msb first, values 0, 1, 2 (x), 3 (z)
+    // The index of `name` in its module's decls, remembered by flatten() (and
+    // checked against the name each time, so edits cannot make it wrong).
+    mutable int decl = -1;
 };
 
 struct Conn {
@@ -118,39 +123,45 @@ struct Lexer {
     std::string tok;
     int tokLine = 1;
 
-    Lexer(const std::string& src, std::string f) : s(src), file(std::move(f)) { next(); }
+    size_t end;         // lexing stops here
+    size_t tokPos = 0;  // where the current token starts
+
+    Lexer(const std::string& src, std::string f) : s(src), file(std::move(f)), end(src.size()) { next(); }
+    // A piece of the text: [from, to), starting on line `ln`.
+    Lexer(const std::string& src, std::string f, size_t from, size_t to, int ln)
+        : s(src), file(std::move(f)), p(from), line(ln), end(to) { next(); }
     [[noreturn]] void fail(const std::string& m) const {
         throw Error(file + ":" + std::to_string(tokLine) + ": " + m);
     }
     void skip() {
         for (;;) {
-            while (p < s.size() && isspace((unsigned char)s[p])) {
+            while (p < end && isspace((unsigned char)s[p])) {
                 if (s[p] == '\n') line++;
                 p++;
             }
-            if (p + 1 < s.size() && s[p] == '/' && s[p + 1] == '/') {
-                while (p < s.size() && s[p] != '\n') p++;
+            if (p + 1 < end && s[p] == '/' && s[p + 1] == '/') {
+                while (p < end && s[p] != '\n') p++;
                 continue;
             }
-            if (p + 1 < s.size() && s[p] == '/' && s[p + 1] == '*') {
+            if (p + 1 < end && s[p] == '/' && s[p + 1] == '*') {
                 p += 2;
-                while (p + 1 < s.size() && !(s[p] == '*' && s[p + 1] == '/')) {
+                while (p + 1 < end && !(s[p] == '*' && s[p + 1] == '/')) {
                     if (s[p] == '\n') line++;
                     p++;
                 }
                 p += 2;
                 continue;
             }
-            if (p + 1 < s.size() && s[p] == '(' && s[p + 1] == '*' && !(p + 2 < s.size() && s[p + 2] == ')')) {
+            if (p + 1 < end && s[p] == '(' && s[p + 1] == '*' && !(p + 2 < end && s[p + 2] == ')')) {
                 // (* attribute *)
                 size_t e = s.find("*)", p + 2);
-                if (e == std::string::npos) { p = s.size(); break; }
+                if (e == std::string::npos || e >= end) { p = end; break; }
                 for (size_t k = p; k < e; k++) if (s[k] == '\n') line++;
                 p = e + 2;
                 continue;
             }
-            if (p < s.size() && s[p] == '`') {  // compiler directive: skip the line
-                while (p < s.size() && s[p] != '\n') p++;
+            if (p < end && s[p] == '`') {  // compiler directive: skip the line
+                while (p < end && s[p] != '\n') p++;
                 continue;
             }
             break;
@@ -159,30 +170,31 @@ struct Lexer {
     void next() {
         skip();
         tokLine = line;
+        tokPos = p;
         tok.clear();
-        if (p >= s.size()) { kind = 0; return; }
+        if (p >= end) { kind = 0; return; }
         char c = s[p];
         if (c == '\\') {  // escaped identifier: up to white space
             p++;
-            while (p < s.size() && !isspace((unsigned char)s[p])) tok += s[p++];
+            while (p < end && !isspace((unsigned char)s[p])) tok += s[p++];
             kind = 'i';
             return;
         }
         if (isalpha((unsigned char)c) || c == '_' || c == '$') {
-            while (p < s.size() && (isalnum((unsigned char)s[p]) || s[p] == '_' || s[p] == '$')) tok += s[p++];
+            while (p < end && (isalnum((unsigned char)s[p]) || s[p] == '_' || s[p] == '$')) tok += s[p++];
             kind = 'i';
             return;
         }
         if (isdigit((unsigned char)c) || c == '\'') {
-            while (p < s.size() && (isalnum((unsigned char)s[p]) || s[p] == '\'' || s[p] == '_' || s[p] == '?')) tok += s[p++];
+            while (p < end && (isalnum((unsigned char)s[p]) || s[p] == '\'' || s[p] == '_' || s[p] == '?')) tok += s[p++];
             kind = 'n';
             return;
         }
         if (c == '"') {
             p++;
-            while (p < s.size() && s[p] != '"') {
+            while (p < end && s[p] != '"') {
                 if (s[p] == '\\') p++;
-                if (p < s.size()) tok += s[p++];
+                if (p < end) tok += s[p++];
             }
             p++;
             kind = 's';
@@ -296,7 +308,7 @@ inline void parseExpr(Lexer& L, std::vector<Ref>& out) {
                 for (int i = 0; i < n; i++) out.insert(out.end(), inner.begin(), inner.end());
                 return;
             }
-            L.p = save.p; L.line = save.line; L.kind = save.kind; L.tok = save.tok; L.tokLine = save.tokLine;
+            L.p = save.p; L.line = save.line; L.kind = save.kind; L.tok = save.tok; L.tokLine = save.tokLine; L.tokPos = save.tokPos;
         }
         for (;;) {
             parseExpr(L, out);
@@ -319,77 +331,62 @@ inline void skipParens(Lexer& L) {
     } while (depth > 0);
 }
 
-inline void parseModule(Lexer& L, Source& src) {
-    Module m;
-    m.line = L.tokLine;
-    m.name = L.ident();
-    if (L.is('#')) {  // parameter port list
+// One declaration: kw is input / output / inout / wire / tri / supply0 ...
+inline void declare(Lexer& L, Module& m, const std::string& kw, bool inHeader) {
+    // kw: input/output/inout/wire/tri/supply0/...
+    bool port = kw == "input" || kw == "output" || kw == "inout";
+    Dir dir = kw == "output" ? Dir::Out : kw == "inout" ? Dir::InOut : Dir::In;
+    int tie = kw == "supply0" || kw == "tri0" ? 0 : kw == "supply1" || kw == "tri1" ? 1 : -1;
+    while (L.isWord("wire") || L.isWord("reg") || L.isWord("logic") || L.isWord("signed") || L.isWord("tri") ||
+           L.isWord("wand") || L.isWord("wor"))
         L.next();
-        skipParens(L);
+    bool ranged = false;
+    int msb = 0, lsb = 0;
+    if (L.is('[')) {
+        L.next();
+        msb = constInt(L);
+        L.expect(':');
+        lsb = constInt(L);
+        L.expect(']');
+        ranged = true;
     }
-    auto declare = [&](const std::string& kw, bool inHeader) {
-        // kw: input/output/inout/wire/tri/supply0/...
-        bool port = kw == "input" || kw == "output" || kw == "inout";
-        Dir dir = kw == "output" ? Dir::Out : kw == "inout" ? Dir::InOut : Dir::In;
-        int tie = kw == "supply0" || kw == "tri0" ? 0 : kw == "supply1" || kw == "tri1" ? 1 : -1;
-        while (L.isWord("wire") || L.isWord("reg") || L.isWord("logic") || L.isWord("signed") || L.isWord("tri") ||
-               L.isWord("wand") || L.isWord("wor"))
-            L.next();
-        bool ranged = false;
-        int msb = 0, lsb = 0;
-        if (L.is('[')) {
-            L.next();
-            msb = constInt(L);
-            L.expect(':');
-            lsb = constInt(L);
-            L.expect(']');
-            ranged = true;
+    for (;;) {
+        std::string n = L.ident();
+        Decl& d = m.decl(n);
+        if (port) {
+            d.isPort = true;
+            d.dir = dir;
+            if (inHeader) m.portOrder.push_back(n);
         }
-        for (;;) {
-            std::string n = L.ident();
-            Decl& d = m.decl(n);
-            if (port) {
-                d.isPort = true;
-                d.dir = dir;
-                if (inHeader) m.portOrder.push_back(n);
-            }
-            if (ranged) { d.ranged = true; d.msb = msb; d.lsb = lsb; }
-            if (tie >= 0) d.tie = tie;
-            if (L.is('=')) {  // wire a = b;
-                L.next();
-                std::vector<Ref> lhs, rhs;
-                Ref r;
-                r.kind = Ref::Net;
-                r.name = n;
-                lhs.push_back(r);
-                parseExpr(L, rhs);
-                m.body.push_back({'a', (int)m.assigns.size()});
-                m.assigns.push_back({lhs, rhs});
-            }
-            if (!L.is(',')) break;
+        if (ranged) { d.ranged = true; d.msb = msb; d.lsb = lsb; }
+        if (tie >= 0) d.tie = tie;
+        if (L.is('=')) {  // wire a = b;
             L.next();
-            if (inHeader && (L.isWord("input") || L.isWord("output") || L.isWord("inout"))) break;
+            std::vector<Ref> lhs, rhs;
+            Ref r;
+            r.kind = Ref::Net;
+            r.name = n;
+            lhs.push_back(r);
+            parseExpr(L, rhs);
+            m.body.push_back({'a', (int)m.assigns.size()});
+            m.assigns.push_back({lhs, rhs});
         }
-    };
-    if (L.is('(')) {
+        if (!L.is(',')) break;
         L.next();
-        while (!L.is(')')) {
-            if (L.isWord("input") || L.isWord("output") || L.isWord("inout")) {
-                std::string kw = L.tok;
-                L.next();
-                declare(kw, true);
-            } else {
-                m.portOrder.push_back(L.ident());
-                if (L.is(',')) L.next();
-            }
-        }
-        L.next();
+        if (inHeader && (L.isWord("input") || L.isWord("output") || L.isWord("inout"))) break;
     }
-    L.expect(';');
+}
+
+// The items of a module body, up to endmodule (or, for a piece of a body
+// parsed on its own, to the end of the piece).
+inline void parseItems(Lexer& L, Module& m, bool piece) {
     static const char* declKw[] = {"input", "output", "inout", "wire", "tri", "supply0", "supply1", "tri0", "tri1",
                                    "wand", "wor", "reg", "logic"};
     while (!L.isWord("endmodule")) {
-        if (L.kind == 0) L.fail("missing endmodule for module " + m.name);
+        if (L.kind == 0) {
+            if (piece) return;
+            L.fail("missing endmodule for module " + m.name);
+        }
         if (L.is(';')) { L.next(); continue; }
         if (L.kind != 'i') L.fail("unexpected '" + L.tok + "'");
         std::string kw = L.tok;
@@ -397,7 +394,7 @@ inline void parseModule(Lexer& L, Source& src) {
         for (auto* k : declKw) if (kw == k) isDecl = true;
         if (isDecl) {
             L.next();
-            declare(kw, false);
+            declare(L, m, kw, false);
             L.expect(';');
             continue;
         }
@@ -469,6 +466,143 @@ inline void parseModule(Lexer& L, Source& src) {
         }
         L.expect(';');
     }
+}
+
+// Splits a large module body at statement ends and parses the pieces on
+// several threads. Returns false, having done nothing, when the body is small
+// or holds something that cannot be split (a specify block, a function);
+// otherwise the items are in m and L is at endmodule.
+inline bool parseItemsParallel(Lexer& L, Module& m, int threads) {
+    const std::string& s = L.s;
+    size_t start = L.tokPos;
+    if (threads < 2 || L.end - start < (1u << 20)) return false;
+    // One pass for the statement ends and the endmodule, skipping comments,
+    // strings and escaped names.
+    struct Cut { size_t pos; int line; };
+    std::vector<Cut> cuts;
+    size_t p = start, endPos = std::string::npos;
+    int line = L.tokLine, endLine = 0;
+    size_t want = (L.end - start) / (size_t)(threads * 4) + 1, last = start;
+    while (p < L.end) {
+        char c = s[p];
+        if (c == '\n') { line++; p++; continue; }
+        if (c == '/' && p + 1 < L.end && s[p + 1] == '/') {
+            while (p < L.end && s[p] != '\n') p++;
+            continue;
+        }
+        if (c == '/' && p + 1 < L.end && s[p + 1] == '*') {
+            p += 2;
+            while (p + 1 < L.end && !(s[p] == '*' && s[p + 1] == '/')) { if (s[p] == '\n') line++; p++; }
+            p += 2;
+            continue;
+        }
+        if (c == '"') {
+            p++;
+            while (p < L.end && s[p] != '"') { if (s[p] == '\\') p++; p++; }
+            p++;
+            continue;
+        }
+        if (c == '\\') {
+            while (p < L.end && !isspace((unsigned char)s[p])) p++;
+            continue;
+        }
+        if (c == ';') {
+            p++;
+            if (p - last >= want) { cuts.push_back({p, line}); last = p; }
+            continue;
+        }
+        if (isalpha((unsigned char)c) || c == '_') {
+            size_t b = p;
+            while (p < L.end && (isalnum((unsigned char)s[p]) || s[p] == '_' || s[p] == '$')) p++;
+            size_t n = p - b;
+            if (n == 9 && s.compare(b, n, "endmodule") == 0) { endPos = b; endLine = line; break; }
+            if ((n == 7 && s.compare(b, n, "specify") == 0) || (n == 8 && s.compare(b, n, "function") == 0) ||
+                (n == 4 && s.compare(b, n, "task") == 0) || (n == 8 && s.compare(b, n, "generate") == 0))
+                return false;
+            continue;
+        }
+        p++;
+    }
+    if (endPos == std::string::npos || cuts.size() < 2) return false;
+    // Pieces: [start, cut0), [cut0, cut1), ..., [cutN, endPos).
+    struct Piece { size_t from, to; int line; Module m; std::string err; };
+    std::vector<Piece> pieces;
+    size_t from = start;
+    int fromLine = L.tokLine;
+    for (auto& c : cuts) {
+        pieces.push_back({from, c.pos, fromLine, {}, {}});
+        from = c.pos;
+        fromLine = c.line;
+    }
+    pieces.push_back({from, endPos, fromLine, {}, {}});
+    std::atomic<size_t> next{0};
+    auto work = [&] {
+        for (;;) {
+            size_t i = next.fetch_add(1);
+            if (i >= pieces.size()) return;
+            Piece& pc = pieces[i];
+            try {
+                Lexer sub(s, L.file, pc.from, pc.to, pc.line);
+                pc.m.name = m.name;
+                parseItems(sub, pc.m, true);
+            } catch (Error& e) {
+                pc.err = e.what();
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int t = 1; t < threads; t++) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+    for (auto& pc : pieces)
+        if (!pc.err.empty()) throw Error(pc.err);
+    size_t ni = m.insts.size(), na = m.assigns.size();
+    for (auto& pc : pieces) { ni += pc.m.insts.size(); na += pc.m.assigns.size(); }
+    m.insts.reserve(ni);
+    m.assigns.reserve(na);
+    m.body.reserve(ni + na);
+    for (auto& pc : pieces) {
+        for (auto& d : pc.m.decls) {
+            Decl& t = m.decl(d.name);
+            if (d.isPort) { t.isPort = true; t.dir = d.dir; }
+            if (d.ranged) { t.ranged = true; t.msb = d.msb; t.lsb = d.lsb; }
+            if (d.tie >= 0) t.tie = d.tie;
+        }
+        int ia = (int)m.assigns.size(), ii = (int)m.insts.size();
+        for (auto& [k, i] : pc.m.body) m.body.push_back({k, i + (k == 'a' ? ia : ii)});
+        for (auto& a : pc.m.assigns) m.assigns.push_back(std::move(a));
+        for (auto& i : pc.m.insts) m.insts.push_back(std::move(i));
+    }
+    L.p = endPos;
+    L.line = endLine;
+    L.next();
+    return true;
+}
+
+inline void parseModule(Lexer& L, Source& src, int threads) {
+    Module m;
+    m.line = L.tokLine;
+    m.name = L.ident();
+    if (L.is('#')) {  // parameter port list
+        L.next();
+        skipParens(L);
+    }
+    if (L.is('(')) {
+        L.next();
+        while (!L.is(')')) {
+            if (L.isWord("input") || L.isWord("output") || L.isWord("inout")) {
+                std::string kw = L.tok;
+                L.next();
+                declare(L, m, kw, true);
+            } else {
+                m.portOrder.push_back(L.ident());
+                if (L.is(',')) L.next();
+            }
+        }
+        L.next();
+    }
+    L.expect(';');
+    if (!parseItemsParallel(L, m, threads)) parseItems(L, m, false);
     L.next();
     if (src.byName.count(m.name)) L.fail("module " + m.name + " is defined twice");
     src.byName[m.name] = (int)src.modules.size();
@@ -478,12 +612,14 @@ inline void parseModule(Lexer& L, Source& src) {
 }  // namespace detail
 
 // Parses one file's text into src (several files can be read into one Source).
-inline void parse(const std::string& text, const std::string& file, Source& src) {
+// With threads > 1 the body of a large module is parsed in pieces on that many
+// threads; the result is the same.
+inline void parse(const std::string& text, const std::string& file, Source& src, int threads = 1) {
     detail::Lexer L(text, file);
     while (L.kind != 0) {
         if (L.isWord("module") || L.isWord("macromodule")) {
             L.next();
-            detail::parseModule(L, src);
+            detail::parseModule(L, src, threads);
         } else if (L.isWord("primitive")) {
             while (!L.isWord("endprimitive") && L.kind != 0) L.next();
             L.next();
@@ -495,12 +631,16 @@ inline void parse(const std::string& text, const std::string& file, Source& src)
     }
 }
 
-inline void read(const std::string& path, Source& src) {
+inline void read(const std::string& path, Source& src, int threads = 1) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw Error("cannot open " + path);
-    std::stringstream ss;
-    ss << in.rdbuf();
-    parse(ss.str(), path, src);
+    std::string text;
+    in.seekg(0, std::ios::end);
+    std::streamoff n = in.tellg();
+    in.seekg(0);
+    text.resize(n > 0 ? (size_t)n : 0);
+    in.read(text.data(), (std::streamsize)text.size());
+    parse(text, path, src, threads);
 }
 
 // ------------------------------------------------------------------ writer
@@ -665,16 +805,37 @@ struct Flattener {
     struct Scope {
         const Module* m;
         std::string prefix;
-        std::unordered_map<std::string, std::vector<int>> nets;  // name -> bits, msb first
+        std::vector<int> base;                          // the first net of each decl; its bits follow, msb first
+        std::unordered_map<std::string, int> implicit;  // undeclared scalar nets
+    };
+    struct Bits {
+        int first, n;
     };
 
-    std::vector<int>& bitsOf(Scope& sc, const std::string& n) {
-        auto it = sc.nets.find(n);
-        if (it != sc.nets.end()) return it->second;
-        // An implicit scalar net.
-        auto& v = sc.nets[n];
-        v.push_back(newNet(sc.prefix + n));
-        return v;
+    Bits implicitNet(Scope& sc, const std::string& n) {
+        auto it = sc.implicit.find(n);
+        if (it != sc.implicit.end()) return {it->second, 1};
+        int id = newNet(sc.prefix + n);
+        sc.implicit[n] = id;
+        return {id, 1};
+    }
+    Bits bitsOf(Scope& sc, const std::string& n) {
+        auto it = sc.m->declIdx.find(n);
+        if (it == sc.m->declIdx.end()) return implicitNet(sc, n);
+        return {sc.base[it->second], sc.m->decls[it->second].width()};
+    }
+    Bits bitsOf(Scope& sc, const Ref& r, const Decl*& d) {
+        const auto& decls = sc.m->decls;
+        if (r.decl < 0 || r.decl >= (int)decls.size() || decls[r.decl].name != r.name) {
+            auto it = sc.m->declIdx.find(r.name);
+            r.decl = it == sc.m->declIdx.end() ? -1 : it->second;
+        }
+        if (r.decl < 0) {
+            d = nullptr;
+            return implicitNet(sc, r.name);
+        }
+        d = &decls[r.decl];
+        return {sc.base[r.decl], d->width()};
     }
     void resolve(Scope& sc, const std::vector<Ref>& refs, std::vector<int>& bits) {
         for (auto& r : refs) {
@@ -682,19 +843,19 @@ struct Flattener {
                 for (auto b : r.bits) bits.push_back(constNet(b));
                 continue;
             }
-            auto& v = bitsOf(sc, r.name);
+            const Decl* d = nullptr;
+            Bits v = bitsOf(sc, r, d);
             if (r.kind == Ref::Net) {
-                bits.insert(bits.end(), v.begin(), v.end());
+                for (int k = 0; k < v.n; k++) bits.push_back(v.first + k);
                 continue;
             }
-            const Decl* d = sc.m->find(r.name);
-            int msb = d && d->ranged ? d->msb : (int)v.size() - 1;
+            int msb = d && d->ranged ? d->msb : v.n - 1;
             int lsb = d && d->ranged ? d->lsb : 0;
             auto at = [&](int i) {
                 int k = msb >= lsb ? msb - i : i - msb;
-                if (k < 0 || k >= (int)v.size())
+                if (k < 0 || k >= v.n)
                     throw Error("module " + sc.m->name + ": index " + std::to_string(i) + " is outside " + r.name);
-                return v[k];
+                return v.first + k;
             };
             int step = r.msb >= r.lsb ? -1 : 1;
             for (int i = r.msb;; i += step) {
@@ -706,48 +867,48 @@ struct Flattener {
 
     void expand(const Module& m, const std::string& prefix, const std::vector<std::vector<int>>* portBits, int depth) {
         if (depth > 200) throw Error("module " + m.name + " instantiates itself");
-        Scope sc{&m, prefix, {}};
+        Scope sc{&m, prefix, {}, {}};
+        sc.base.reserve(m.decls.size());
         for (auto& d : m.decls) {
-            auto& v = sc.nets[d.name];
+            sc.base.push_back((int)parent.size());
             int w = d.width();
             for (int k = 0; k < w; k++) {
                 std::string n = prefix + d.name;
                 if (d.ranged) n += "[" + std::to_string(d.msb >= d.lsb ? d.msb - k : d.msb + k) + "]";
                 int id = newNet(n);
-                v.push_back(id);
                 if (d.tie >= 0) unite(constNet(d.tie), id);
             }
         }
         // Tie this module's port nets to the nets the parent connected.
         if (portBits) {
             for (size_t i = 0; i < m.portOrder.size(); i++) {
-                auto& mine = bitsOf(sc, m.portOrder[i]);
+                Bits mine = bitsOf(sc, m.portOrder[i]);
                 auto& theirs = (*portBits)[i];
                 if (theirs.empty()) continue;
-                if (theirs.size() != mine.size())
+                if ((int)theirs.size() != mine.n)
                     out.warnings.push_back("instance " + prefix.substr(0, prefix.size() - 1) + ": port " +
-                                           m.portOrder[i] + " is " + std::to_string(mine.size()) +
+                                           m.portOrder[i] + " is " + std::to_string(mine.n) +
                                            " bits, connected to " + std::to_string(theirs.size()));
                 // Align at the lsb.
-                size_t n = std::min(mine.size(), theirs.size());
+                size_t n = std::min((size_t)mine.n, theirs.size());
                 for (size_t k = 0; k < n; k++) {
                     int t = theirs[theirs.size() - 1 - k];
                     // The parent's name wins: unite(parent, child).
-                    if (t >= 0) unite(t, mine[mine.size() - 1 - k]);
+                    if (t >= 0) unite(t, mine.first + mine.n - 1 - (int)k);
                 }
             }
         } else {
             out.top = m.name;
             for (auto& pn : m.portOrder) {
                 const Decl* d = m.find(pn);
-                auto& v = bitsOf(sc, pn);
-                for (size_t k = 0; k < v.size(); k++) {
+                Bits v = bitsOf(sc, pn);
+                for (int k = 0; k < v.n; k++) {
                     FlatPort fp;
                     fp.dir = d ? d->dir : Dir::In;
-                    fp.net = v[k];
+                    fp.net = v.first + k;
                     if (d && d->ranged) {
                         fp.bus = pn;
-                        fp.bit = d->msb >= d->lsb ? d->msb - (int)k : d->msb + (int)k;
+                        fp.bit = d->msb >= d->lsb ? d->msb - k : d->msb + k;
                         fp.name = pn + "[" + std::to_string(fp.bit) + "]";
                     } else {
                         fp.name = pn;
@@ -805,7 +966,7 @@ struct Flattener {
                 resolve(sc, c.refs, bits);
                 if (bits.empty()) continue;
                 std::vector<std::string> pins;
-                if (busPins) pins = busPins(in.cell, pin, (int)bits.size());
+                if (busPins && bits.size() > 1) pins = busPins(in.cell, pin, (int)bits.size());
                 if (pins.empty()) {
                     if (bits.size() == 1) pins.push_back(pin);
                     else for (int k = (int)bits.size() - 1; k >= 0; k--) pins.push_back(pin + "[" + std::to_string(k) + "]");

@@ -125,6 +125,8 @@ struct Shell {
         }
         for (auto& w : netlist.warnings) std::cerr << "Warning: " << w << "\n";
         engine->phases.push_back({"flatten", secs()});
+        if (!pool || pool->threads() != wantThreads()) pool = std::make_unique<par::Pool>(threads);
+        engine->pool = pool.get();
         engine->build(netlist);
         engine->phases.push_back({"build graph", secs()});
         design = std::make_unique<sta::SdcDesign>(*engine);
@@ -209,7 +211,7 @@ struct Shell {
             Args a = args(w, {}, {});
             if (a.pos.empty()) fail("read_verilog FILE");
             try {
-                for (auto& f : a.pos) gnl::read(f, source);
+                for (auto& f : a.pos) gnl::read(f, source, wantThreads());
             } catch (gnl::Error& e) {
                 fail(e.what());
             }
