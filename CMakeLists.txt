@@ -280,6 +280,17 @@ if(MINISIM_WITH_SLANG)
     endif()
   endforeach()
 
+  # Datapath library (dw/MW_*.sv, docs/DATAPATH.md): self-checking benches in
+  # tests/dw compare every module with the SystemVerilog operators.
+  file(GLOB DW_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/dw/*.sv)
+  foreach(sv IN LISTS DW_TESTS)
+    get_filename_component(name ${sv} NAME_WE)
+    add_test(NAME dw/${name}
+             COMMAND ${CMAKE_COMMAND} -DSIM=$<TARGET_FILE:msim> -DSV=${sv}
+                     -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
+    set_tests_properties(dw/${name} PROPERTIES LABELS "dw")
+  endforeach()
+
   # UVM (IEEE 1800.2-2020) tests: tests/uvm/*.sv run against the Accellera
   # UVM library when -DUVM_HOME=<uvm-core checkout> is given (CI fetches
   # uvm-core 2020.3.1).
@@ -366,7 +377,10 @@ install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 # The generic cell library: Liberty corners, Verilog models, LEF.
 install(DIRECTORY lib/mini45 DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/lib
         FILES_MATCHING PATTERN "*.lib" PATTERN "*.lef" PATTERN "mini45.v")
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/MINI45.md
+# The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
+install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md
+              docs/MINI45.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)
