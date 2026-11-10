@@ -1,0 +1,7 @@
+# The memory cells of tests/emu/mems.v, for memu -mem.
+memory SRAM16X8 depth=16 width=8
+port clk=CLK addr=A din=D dout=Q we=WE cs=CS
+
+memory RF16X8 depth=16 width=8
+port clk=WCLK addr=WA din=D we=WE
+port addr=RA dout=Q
