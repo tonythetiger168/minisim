@@ -21,6 +21,11 @@ int main() {
             assert(std::accumulate(out.begin(), out.end(), 0L) == 256L * 257 / 2 * round);
         }
         pool.run(0, [&](size_t) { assert(false); });
+        // Thousands of small batches (a timing graph's levels): each index once.
+        std::vector<int> small(3, 0);
+        for (int round = 0; round < 5000; round++)
+            pool.run(1 + round % 3, [&](size_t i) { small[i]++; });
+        assert(small[0] == 5000 && small[1] == 3333 && small[2] == 1666);
 
         // Chunks cover [0, n) once; a sum is the same bits on any thread count.
         std::vector<int> cover(1003, 0);

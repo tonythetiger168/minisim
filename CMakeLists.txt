@@ -74,16 +74,6 @@ add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
-# Shared by the tools: the thread pool (src/parallel.hpp) and the VCD / FST
-# waveform reader (src/wave_reader.hpp). No external dependencies.
-find_package(Threads REQUIRED)
-foreach(t test_parallel test_wave)
-  add_executable(${t} tests/${t}.cpp)
-  target_include_directories(${t} PRIVATE src)
-  target_compile_options(${t} PRIVATE -UNDEBUG)
-  target_link_libraries(${t} PRIVATE Threads::Threads)
-  add_test(NAME ${t} COMMAND ${t})
-endforeach()
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
@@ -94,6 +84,7 @@ endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
 include(cmake/tools/mrcx.cmake)
+include(cmake/tools/shared_par_wave.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
