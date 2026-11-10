@@ -411,14 +411,16 @@ struct Sim {
     Pool pool;
     // `use`: run on at most this many threads (0: `threads`).
     template <class F>
-    void parallelFor(size_t n, F&& f, int use = 0) {
+    void parallelFor(size_t n, F&& f0, int use = 0) {
+        auto& f = f0;
+        using FF = std::remove_reference_t<F>;
         // A small batch is cheaper on this thread than a wake-up of the pool.
         // Nested (a task that calls parallelFor) runs on its own thread.
         int T = use > 0 ? std::min(use, threads) : threads;
         if (T <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
         pool.ensure(threads);
         tlInPar = true;
-        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<F*>(c))(i); }, &f, T);
+        pool.run(n, [](void* c, size_t i) { tlInPar = true; (*static_cast<FF*>(c))(i); }, &f, T);
         tlInPar = false;
     }
 
@@ -459,6 +461,16 @@ struct Sim {
         }
     };
     Tuner domainTune[3];   // cycle domain (codegen.hpp): fused step, NBA compute, commit
+    Tuner combTune, partTune, seqTune;   // the event-driven batches: comb levels, partitions, clocked processes
+    // parallelFor with the thread count `t` picks. A batch too small for the
+    // pool runs here and is not measured.
+    template <class F>
+    void parallelTuned(Tuner& t, size_t n, F&& f) {
+        if (threads <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
+        int use = t.pick(threads);
+        parallelFor(n, std::forward<F>(f), use);
+        t.done(threads);
+    }
 
     // ---- static combinational schedule (prog.hpp: combShape / combSchedule) ----
     // combs[r] is the process of rank r. Ranks are in topological order and
@@ -535,7 +547,7 @@ struct Sim {
                 combBatch.push_back(r);
             }
             combVals.resize(combBatch.size());
-            parallelFor(combBatch.size(), [&](size_t k) {
+            parallelTuned(combTune, combBatch.size(), [&](size_t k) {
                 const Comb& c = combs[combBatch[k]];
                 if (c.compute) combVals[k] = c.compute(c.ctx);
             });
@@ -696,7 +708,7 @@ struct Sim {
         bool wave = waving();
         if (g_cov && togRise.size() < sigs.size()) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
         for (int p : partsBusy) parts[p].wave = wave;
-        parallelFor(partsBusy.size(), [&](size_t k) { runPart(parts[partsBusy[k]]); });
+        parallelTuned(partTune, partsBusy.size(), [&](size_t k) { runPart(parts[partsBusy[k]]); });
         if (wave)
             for (int p : partsBusy) {
                 for (auto& [sg, v] : parts[p].changed) dump(sg, v);
@@ -725,7 +737,7 @@ struct Sim {
     void runSeqs() {
         if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
-        parallelFor(seqq.size(), [&](size_t k) {
+        parallelTuned(seqTune, seqq.size(), [&](size_t k) {
             seqBufs[k].clear();
             seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
         });
