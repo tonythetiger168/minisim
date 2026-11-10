@@ -159,7 +159,8 @@ pass.
 ## The pieces
 
 `src/equiv/` is header-only and usable as a library (namespace `equiv`):
-`aig.hpp` (the graph), `bv.hpp` (bit vectors with X), `sat.hpp` and `cnf.hpp`
-(the solver and the encoding), `elab.hpp` (a slang compilation to a `Design`),
+`aig.hpp` (the graph), `bv.hpp` (bit vectors with X), `cnf.hpp`
+(the encoding), `elab.hpp` (a slang compilation to a `Design`),
 `check.hpp` (`equiv::check(aig, ref, impl, options)` returns every compare
-point with its status and counterexample).
+point with its status and counterexample). The SAT solver is CaDiCaL behind
+`src/sat.hpp`, the interface the other minisim tools share.
