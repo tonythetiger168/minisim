@@ -171,6 +171,7 @@ inline int64_t optOr(const std::vector<CgOptSet>& opts, int which, int64_t dflt)
 // A class's covergroup reads its object's properties: `this` is the object
 // it was created for, whatever process samples it.
 inline void (*g_cgInstStart)(int id) = nullptr;   // a class covergroup's own sampling process
+inline void (*g_cgRun)(const Prog* p, const CgInst& in) = nullptr;   // run a coverpoint's code to its end
 struct SelfScope {
     Frame* saved;
     explicit SelfScope(const CgInst& in) : saved(g_fr) { if (in.self) g_fr = in.self.get(); }
@@ -627,7 +628,9 @@ inline void sampleInst(CgInst& in) {
         CgCpInst& cp = in.cps[ci];
         cp.hit.clear();
         cp.sampled = false;
+        if (c.preIff) g_cgRun(c.preIff.get(), in);
         if (c.iff && truth(eval(c.iff, rd)) != 1) continue;
+        if (c.pre) g_cgRun(c.pre.get(), in);
         Val v = eval(c.expr, rd);
         bool hasX = !c.isReal && (v.x & kmask(c.w)) != 0;
         uint64_t k = keyOf(c, v);
@@ -896,6 +899,20 @@ inline Task cgInstProc(int id, std::vector<std::pair<int, Edge>> ev) {
 }
 inline void startCovergroups() {
     g_cgHook = cg::hook;
+    cg::g_cgRun = [](const Prog* p, const CgInst& in) {
+        Frame* sf = g_fr;
+        Frame* sr = g_ret;
+        auto ctl = make_shared<ProcCtl>();
+        Task t = exec(p, ctl, in.self ? in.self : newFrame(nullptr, nullptr, 0));
+        t.h.resume();
+        if (!t.h.done()) {
+            cerr << "error: a coverpoint expression waited (time " << S.now << ")\n";
+            exit(1);
+        }
+        t.h.destroy();
+        g_fr = sf;
+        g_ret = sr;
+    };
     cg::g_cgInstStart = [](int id) {
         const CgInst& in = cgInsts()[id];
         cg::SelfScope ss(in);

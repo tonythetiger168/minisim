@@ -8,6 +8,22 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VIP library: `vip/` holds UVM verification IP that runs on `msim -uvm`:
+  AXI4, APB4 and a memory model (from SoC-tb-regress-builder) and a new
+  AXI4-Lite VIP, each with agents, monitor, coverage, protocol assertions
+  and sequences, and self-test benches in `tests/vip` (`ctest -L vip`).
+  `tools/mvip.py` runs the 146 VIPs of open-vip-portfolio on msim. See
+  `docs/VIP.md`.
+- `@(event iff expr)` in procedures (9.4.2.3): the condition was ignored, so
+  `@(posedge clk iff rst_n)` woke on the first edge.
+- A user function called in the boolean of a concurrent assertion (16.6) is
+  run at each clock tick on the sampled values of its arguments; its result
+  was garbage before.
+- `pop_front()` / `pop_back()` of a queue of queues (7.10.2).
+- A parameter or localparam of a class read through a handle, `h.N` (8.25).
+- VPI: `vpi_get_vlog_info` gives a `-f` file's arguments as the nested
+  array 38.36 describes, so `msim -uvm -f files.f` no longer crashes in
+  UVM's command line reader.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.

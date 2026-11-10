@@ -238,6 +238,28 @@ if(MINISIM_WITH_SLANG)
                        -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
       set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
     endforeach()
+
+    # The VIP library (vip/): each tests/vip/<name>/files.f is a self-test
+    # bench; its "//! top:" line names the top module and each "//! test:"
+    # line a UVM test to run.
+    file(GLOB VIP_BENCHES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/vip/*/files.f)
+    foreach(f IN LISTS VIP_BENCHES)
+      get_filename_component(dir ${f} DIRECTORY)
+      get_filename_component(bench ${dir} NAME)
+      file(STRINGS ${f} flines)
+      set(vtop "")
+      foreach(l IN LISTS flines)
+        if(l MATCHES "^//! top: *([A-Za-z0-9_]+)")
+          set(vtop ${CMAKE_MATCH_1})
+        elseif(l MATCHES "^//! test: *([A-Za-z0-9_]+)")
+          add_test(NAME vip/${bench}/${CMAKE_MATCH_1}
+                   COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DUVM_HOME=${UVM_HOME}
+                           -DROOT=${CMAKE_SOURCE_DIR} -DF=${f} -DTOP=${vtop} -DTEST=${CMAKE_MATCH_1}
+                           -P ${CMAKE_SOURCE_DIR}/tests/vip/run_vip.cmake)
+          set_tests_properties(vip/${bench}/${CMAKE_MATCH_1} PROPERTIES LABELS "vip")
+        endif()
+      endforeach()
+    endforeach()
   endif()
 
   add_test(NAME mlint
@@ -283,6 +305,7 @@ endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
 install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
+install(PROGRAMS tools/mvip.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mvip)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
@@ -296,10 +319,11 @@ install(FILES include/svdpi.h include/vpi_user.h include/sv_vpi_user.h include/v
 # UVM's C code for minisim: msim -uvm looks for it next to itself.
 install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/uvm)
 # The virtual prototype layer: msim -mvp looks for these next to itself.
+install(DIRECTORY vip DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim)
 install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md
+install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/VIP.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME minisim)

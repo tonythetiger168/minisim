@@ -646,6 +646,7 @@ struct ConcAssert {
     E clkIff;                                   // @(posedge clk iff c): c, current value
     E disable;                                  // disable iff, current values (16.12); null: none
     std::vector<E> atoms;                       // boolean atoms, on sampled values
+    std::vector<const Prog*> pre;               // their function calls: run at each tick before the atoms are read
     const sva::Node* root = nullptr;
     bool coverSeq = false;
     const Prog* pass = nullptr;

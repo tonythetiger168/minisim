@@ -3275,6 +3275,25 @@ struct Lowerer {
             Instr i = dynCmd(t, D_COPY); i.dsrc = relSig(kRelRet, it->second->retSig); prog.emit(i);
             return t;
         }
+        if (e.kind == ExpressionKind::Call && isDynType(*e.type) && e.as<CallExpression>().isSystemCall()) {
+            // qq.pop_front() / qq.pop_back() of a queue of containers (7.10.2.4, 7.10.2.5):
+            // a copy of the end element, which is then removed
+            const auto& call = e.as<CallExpression>();
+            auto nm = call.getSubroutineName();
+            if ((nm == "pop_front" || nm == "pop_back") && call.arguments().size() == 1) {
+                int outer = dynSig(*call.arguments()[0]);
+                if (outer < 0 || !dynShape(outer).elem) return -1;
+                E key = nm == "pop_front" ? konst(mk(0, 64))
+                                          : bin(Op::Sub, resize(dynSize(outer), 64, false, false), konst(mk(1, 64)));
+                auto n = node(Op::DynElemRef, {key});
+                n->sig = outer;
+                int el = elemRef(outer, n);
+                int t = dynTemp(*dynShape(outer).elem);
+                Instr c = dynCmd(t, D_COPY); c.dsrc = el; prog.emit(c);
+                Instr d = dynCmd(outer, D_DELETE_AT); d.args = {key}; prog.emit(d);
+                return t;
+            }
+        }
         if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // m[i] of a container of containers
             const auto& sel = e.as<ElementSelectExpression>();
             // f[i][j] of a fixed-size array of containers: its element's id
@@ -4498,6 +4517,9 @@ struct Lowerer {
                     return sized(r, storeW(*e.type), e.type->isSigned(), ctx);
                 }
                 if (isHandleType(*m.value().type)) {   // h.x (8.4): read through the handle when evaluated
+                    // h.P, a parameter or enum value of the class (8.25): its constant
+                    if (m.member.kind == SymbolKind::Parameter || m.member.kind == SymbolKind::EnumValue)
+                        return constSym(m.member, e, ctx);
                     const PropSlot* ps = memberSlot(m);
                     E r;
                     if (!ps) {
@@ -4666,11 +4688,23 @@ struct Lowerer {
                 break;
             }
             default: {  // SignalEvent or EventList: @(posedge a or negedge b ...)
+                // @(ev iff c) (9.4.2.3): the event counts only when c is true
+                // as it happens, so wait again otherwise.
+                const Expression* iff = nullptr;
+                if (t.kind == TimingControlKind::SignalEvent) iff = t.as<SignalEventControl>().iffCondition;
+                else if (t.kind == TimingControlKind::EventList)
+                    for (auto* sub : t.as<EventListControl>().events)
+                        if (sub->kind == TimingControlKind::SignalEvent && sub->as<SignalEventControl>().iffCondition)
+                            unsupported("iff in an event list");
                 Instr i; i.k = IK::WaitEdge;
                 collectEvents(t, i.events);
                 i.sig = i.events[0].first;
                 i.edge = i.events[0].second;
-                prog.emit(i);
+                size_t top = prog.emit(i);
+                if (iff) {
+                    Instr j; j.k = IK::JmpIfNot; j.e = expr(*iff); j.target = top;
+                    prog.emit(j);
+                }
             }
         }
     }

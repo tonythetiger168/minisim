@@ -57,6 +57,9 @@ struct CgBinDef {
 struct CgCpDef {
     std::string name;
     E expr, iff;
+    // Code the expressions need run first (a container reached through
+    // handles, a function call): before iff, and before expr once iff holds.
+    std::shared_ptr<Prog> preIff, pre;
     int w = 1;
     bool sgn = false;
     std::vector<std::pair<std::string, uint64_t>> enumVals;   // an enum coverpoint's values

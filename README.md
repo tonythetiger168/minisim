@@ -27,6 +27,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches, with its C code (regular expressions, command line, HDL backdoor) via `msim -uvm`; see [`docs/UVM.md`](docs/UVM.md)
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
+- **Verification IP**: AXI4, AXI4-Lite, APB4 and memory UVM VIPs in `vip/`, and `tools/mvip.py` to run the 146 VIPs of open-vip-portfolio on msim; see [`docs/VIP.md`](docs/VIP.md)
 - **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
