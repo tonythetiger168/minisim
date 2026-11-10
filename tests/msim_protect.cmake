@@ -350,3 +350,33 @@ string(STRIP "${out}" sigcheck)
 if(NOT sigcheck STREQUAL sigm)
   message(FATAL_ERROR "openssl computes signature ${sigcheck}, msimprotect wrote ${sigm}")
 endif()
+
+# Functional coverage follows the same right: a protected module's
+# assertions and covergroups stay out of the database unless coverage=on.
+file(WRITE ${OUT}/fcov_core.sv "module fcov_core(input logic clk, input logic [1:0] d);
+`pragma protect begin
+  secret_chk: assert property (@(posedge clk) d != 2'd3);
+  covergroup secret_cg @(posedge clk); cp_d: coverpoint d; endgroup
+  secret_cg cg = new;
+`pragma protect end
+endmodule
+")
+file(WRITE ${OUT}/fcov_tb.sv "module fcov_tb;
+  logic clk = 0; logic [1:0] d = 0;
+  fcov_core u(.clk(clk), .d(d));
+  always #5 clk = ~clk;
+  open_chk: assert property (@(posedge clk) d != 2'd3);
+  initial begin repeat (3) @(posedge clk) d <= d + 2'd1; $finish; end
+endmodule
+")
+run(${PROTECT} -key acme_pub.pem -keyowner Acme -keyname acme-1 fcov_core.sv -o fcov_none.svp)
+run(${MSIM} -keyfile Acme:acme-1=acme.pem fcov_none.svp fcov_tb.sv -top fcov_tb -cov fcov_none.json)
+file(READ ${OUT}/fcov_none.json fn)
+expect("${fn}" "fcov_tb.open_chk")
+reject("${fn}" "secret_chk")
+reject("${fn}" "secret_cg")
+run(${PROTECT} -key acme_pub.pem -keyowner Acme -keyname acme-1 -control coverage=on fcov_core.sv -o fcov_on.svp)
+run(${MSIM} -keyfile Acme:acme-1=acme.pem fcov_on.svp fcov_tb.sv -top fcov_tb -cov fcov_on.json)
+file(READ ${OUT}/fcov_on.json fo)
+expect("${fo}" "secret_chk")
+expect("${fo}" "secret_cg")
