@@ -55,6 +55,9 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Functional coverage in the coverage database: `msim -cov` records the bins
+  of every covergroup type (19.11) and the statistics of every assertion
+  (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
 - Datapath library `dw/`: 47 synthesizable, parameterized SystemVerilog
   building blocks named `MW_*` (adders with five carry architectures,
   Booth/Wallace and array multipliers, multiply-accumulate, dividers, square
