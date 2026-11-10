@@ -78,6 +78,12 @@ Spec references are IEEE 1800-2023 clauses.
   SAT on all cores, with a counterexample for each failing point. X in the
   reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
   `-report`. See `docs/EQUIV.md`.
+- `mpnr`, place and route for gate-level netlists: an automatic floorplan or
+  one from a DEF (`-floorplan`), analytic global placement, Abacus
+  legalization, refinement and filler cells, a negotiated-congestion detailed
+  router on the LEF track grid, and DEF out with a built-in check for opens,
+  shorts and spacing (`-check FILE.def` checks any routed DEF). Multithreaded
+  with identical results for any `-threads`. See `docs/PNR.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -176,6 +182,21 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -lef tech.lef routed.def`: design rule checking of a routed DEF,
+  with the rules taken from the LEF technology when no `-deck` is given
+  (`-write-deck` shows them).
+- `mpv lvs`: extracts the transistor netlist of a layout (nets from `connect`
+  statements, names and ports from `label`, MOS devices with W and L from
+  `device mos`) and writes it as SPICE. `src/lvs.hpp` also holds the netlist
+  comparison (partition refinement, parallel merging, source/drain
+  exchange). `tests/pv/sky130.lvs` is the SKY130 deck.
+- `mpv drc`: design rule checking on GDSII layouts. A rule deck defines drawn
+  and derived layers (`&`, `|`, `-`, `^`, `grow`, `shrink`, `interact`,
+  `inside`, `outside`, `holes`, ...) and width, spacing, enclosure, overhang,
+  area and density checks; violations are written as markers. Multithreaded
+  by default (`-threads N`) with the same report for every thread count. A
+  35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
+  is the shared GDSII reader and writer. See `docs/MPV.md`.
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
