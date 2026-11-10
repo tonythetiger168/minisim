@@ -46,6 +46,8 @@ const char* kHelp =
     "  -impltop NAME    top module of the implementation only\n"
     "  -match R=I       pair reference signal R with implementation signal I\n"
     "  -matchfile FILE  the same, one 'R I' pair per line\n"
+    "  -lib FILE        Liberty (.lib) cell library: a module with no Verilog\n"
+    "                   definition is looked up there (functions, ff, latch)\n"
     "  -blackbox MOD    do not look inside module MOD on either side; its pins\n"
     "                   become compare points and free inputs\n"
     "  -threads N       worker threads (default: all logical cores; 1 disables)\n"
@@ -68,6 +70,7 @@ struct Side {
     Design design;
     std::string error;
     size_t ands = 0;
+    bool haveLibs = false;
 
     // Parse and elaborate with slang. Runs on its own thread.
     void compile() {
@@ -75,6 +78,7 @@ struct Side {
             driver.addStandardArgs();
             std::vector<std::string> a{"mequiv", "--disable-instance-caching", "-Wnone"};
             if (!top.empty()) a.push_back("--top"), a.push_back(top);
+            if (haveLibs) a.push_back("--ignore-unknown-modules");  // Liberty cells
             a.insert(a.end(), args.begin(), args.end());
             std::vector<const char*> cargv;
             for (auto& s : a) cargv.push_back(s.c_str());
@@ -138,6 +142,7 @@ int main(int argc, char** argv) {
     Side ref{"reference"}, impl{"implementation"};
     CheckOptions copt;
     ElabOptions eopt;
+    std::vector<std::unique_ptr<liberty::Library>> libs;
     std::string reportPath;
     bool verbose = false, quiet = false;
     size_t maxFail = 10;
@@ -167,6 +172,17 @@ int main(int argc, char** argv) {
         if (a == "-maxfail") { maxFail = std::stoul(need(i)); continue; }
         if (a == "-report") { reportPath = need(i); continue; }
         if (a == "-blackbox") { eopt.blackboxes.insert(need(i)); continue; }
+        if (a == "-lib") {
+            std::string path = need(i);
+            try {
+                libs.push_back(std::make_unique<liberty::Library>(liberty::load(path)));
+            } catch (const std::exception& e) {
+                std::cerr << "mequiv: " << path << ": " << e.what() << "\n";
+                return 2;
+            }
+            eopt.libs.push_back(libs.back().get());
+            continue;
+        }
         if (a == "-verbose") { verbose = true; continue; }
         if (a == "-q") { quiet = true; continue; }
         if (a == "-match") {
@@ -199,6 +215,7 @@ int main(int argc, char** argv) {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     };
 
+    ref.haveLibs = impl.haveLibs = !libs.empty();
     // Read both designs at once.
     if (copt.threads == 1) {
         ref.compile();

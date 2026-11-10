@@ -48,6 +48,7 @@
 #include "slang/ast/Expression.h"
 #include "slang/ast/Statement.h"
 #include "slang/ast/TimingControl.h"
+#include "slang/ast/expressions/AssertionExpr.h"
 #include "slang/ast/expressions/AssignmentExpressions.h"
 #include "slang/ast/expressions/CallExpression.h"
 #include "slang/ast/expressions/ConversionExpression.h"
@@ -71,6 +72,7 @@
 #include "slang/ast/types/Type.h"
 #include "slang/text/SourceManager.h"
 
+#include "../liberty.hpp"
 #include "aig.hpp"
 #include "bv.hpp"
 #include "cnf.hpp"
@@ -107,6 +109,7 @@ struct Design {
 
 struct ElabOptions {
     std::set<std::string> blackboxes;  // module names not to look inside
+    std::vector<const liberty::Library*> libs;  // cells for modules with no Verilog definition
     size_t maxLoop = 1u << 20;         // iterations before a loop is called unbounded
 };
 
@@ -150,8 +153,15 @@ public:
             Bits b = readGlobal(*p->internalSymbol, 0, info(*p->internalSymbol).width);
             for (size_t i = 0; i < b.size(); ++i) d.outputs.push_back({names[i], b[i]});
         }
-        for (size_t i = 0; i < drivers.size(); ++i)
+        for (size_t i = 0; i < drivers.size(); ++i) {
             if (drivers[i].kind == Driver::FF) runFF(drivers[i]);
+            if (drivers[i].kind == Driver::LibCell && !drivers[i].libQ.empty()) {
+                Proc proc;
+                cur = &proc;
+                evalLibCell(drivers[i], true);
+                cur = &global;
+            }
+        }
         for (auto& bb : bboxIns) {
             Bits b = evalExpr(*bb.expr);
             for (size_t i = 0; i < b.size(); ++i)
@@ -181,7 +191,10 @@ private:
         const Expression* expr;
     };
     struct Driver {
-        enum Kind { Assign, PortIn, PortOut, Comb, FF, Prim, BBoxOut } kind;
+        enum Kind { Assign, PortIn, PortOut, Comb, FF, Prim, BBoxOut, LibCell } kind;
+        const liberty::Cell* cell = nullptr;                // LibCell
+        std::map<std::string, const Expression*> pins;      // LibCell: pin -> connection
+        std::vector<Lit> libQ;                              // LibCell: stored value per ff, then per latch
         const Expression* lhs = nullptr;
         const Expression* rhs = nullptr;
         const Symbol* sym = nullptr;  // PortIn: the port's signal. PortOut: likewise
@@ -381,8 +394,9 @@ private:
                 case SymbolKind::ProceduralBlock: walkProc(m.as<ProceduralBlockSymbol>()); break;
                 case SymbolKind::PrimitiveInstance: walkPrim(m.as<PrimitiveInstanceSymbol>()); break;
                 case SymbolKind::UninstantiatedDef:
+                    if (walkLibCell(m.as<UninstantiatedDefSymbol>())) break;
                     throw Unsupported("module '" + std::string(m.as<UninstantiatedDefSymbol>().definitionName) +
-                                      "' (instance '" + pathOf(m) + "') has no definition; add its source or a cell library");
+                                      "' (instance '" + pathOf(m) + "') has no definition; add its source or a cell library (-lib)");
                 default: break;
             }
         }
@@ -440,6 +454,136 @@ private:
             }
         }
         if (!bbox) walkScope(inst.body);
+    }
+
+    // An instance of a Liberty cell: outputs are the pin functions, ff and
+    // latch groups are state elements.
+    bool walkLibCell(const UninstantiatedDefSymbol& u) {
+        const liberty::Cell* cell = nullptr;
+        for (auto* lib : opt.libs)
+            if ((cell = lib->cell(std::string(u.definitionName)))) break;
+        if (!cell) return false;
+        if (cell->group && !cell->group->all("statetable").empty())
+            throw Unsupported("Liberty cell '" + cell->name + "' is described by a statetable (instance '" + pathOf(u) + "')");
+        Driver dr;
+        dr.kind = Driver::LibCell;
+        dr.cell = cell;
+        dr.owner = &u;
+        auto conns = u.getPortConnections();
+        auto pnames = u.getPortNames();
+        std::vector<const Expression*> outs;
+        for (size_t i = 0; i < conns.size(); ++i) {
+            if (i >= pnames.size() || pnames[i].empty())
+                throw Unsupported("instance '" + pathOf(u) + "' of Liberty cell '" + cell->name +
+                                  "' connects ports by position; use named connections");
+            if (conns[i]->kind != AssertionExprKind::Simple) continue;
+            const Expression* e = &conns[i]->as<SimpleAssertionExpr>().expr;
+            const liberty::Pin* pin = cell->pin(std::string(pnames[i]));
+            if (!pin)
+                throw Unsupported("Liberty cell '" + cell->name + "' has no pin '" + std::string(pnames[i]) +
+                                  "' (instance '" + pathOf(u) + "')");
+            dr.pins[pin->name] = e;
+            if (pin->dir == liberty::Dir::Out) outs.push_back(e);
+            else if (pin->dir != liberty::Dir::In)
+                throw Unsupported("inout pin '" + pin->name + "' of Liberty cell '" + cell->name + "'");
+        }
+        for (size_t i = 0; i < cell->ffs.size() + cell->latches.size(); ++i) dr.libQ.push_back(g.input());
+        addDriver(std::move(dr), outs);
+        return true;
+    }
+
+    Bit libExpr(const liberty::Expr& e, const std::function<Bit(const std::string&)>& get) {
+        using K = liberty::Expr;
+        switch (e.kind) {
+            case K::Const: return e.value ? kB1 : kB0;
+            case K::Var: return get(e.var);
+            case K::Not: return bv.not_(libExpr(e.kids[0], get));
+            case K::And: return bv.and_(libExpr(e.kids[0], get), libExpr(e.kids[1], get));
+            case K::Or: return bv.or_(libExpr(e.kids[0], get), libExpr(e.kids[1], get));
+            default: return bv.xor_(libExpr(e.kids[0], get), libExpr(e.kids[1], get));
+        }
+    }
+    // Values inside one cell instance: its pins, and IQ/IQN of its state.
+    // `states`: also append the cell's state elements to the design.
+    void evalLibCell(Driver& dr, bool states) {
+        const liberty::Cell& c = *dr.cell;
+        std::map<std::string, Bit> val;
+        std::function<Bit(const std::string&)> get = [&](const std::string& n) -> Bit {
+            auto it = val.find(n);
+            if (it != val.end()) return it->second;
+            auto ip = dr.pins.find(n);
+            Bit b = kBX;  // an unconnected pin
+            if (ip != dr.pins.end()) {
+                Bits v = evalExpr(*ip->second);
+                if (!v.empty()) b = v[0];
+            } else if (!c.pin(n)) {
+                throw Unsupported("Liberty cell '" + c.name + "': unknown name '" + n + "' in a function");
+            }
+            return val[n] = b;
+        };
+        auto fn = [&](const std::string& text, Bit dflt) {
+            return text.empty() ? dflt : libExpr(liberty::parseFunction(text), get);
+        };
+        auto both = [&](const std::string& v, Bit q) {  // clear_preset_var1
+            if (v == "L") return kB0;
+            if (v == "H") return kB1;
+            if (v == "N") return q;
+            if (v == "T") return bv.not_(q);
+            return kBX;
+        };
+        auto state = [&](const std::string& iq, Lit q, Bit next, Bit trig, bool latch) {
+            if (!states) return;
+            State st;
+            st.name = pathOf(*dr.owner) + "." + iq;
+            st.inst = pathOf(*dr.owner);
+            st.cell = c.name;
+            st.q = q;
+            st.next = next;
+            st.trig = trig;
+            st.latch = latch;
+            d.states.push_back(std::move(st));
+        };
+        size_t k = 0;
+        for (auto& f : c.ffs) {
+            Bit q{dr.libQ[k++], kFalse};
+            val[f.iq] = q;
+            val[f.iqn] = bv.not_(q);
+        }
+        size_t kLatch = k;
+        for (auto& l : c.latches) {
+            // Transparent: what the latch shows is what it will store.
+            Bit q{dr.libQ[k++], kFalse};
+            Bit clr = fn(l.clear, kB0), pre = fn(l.preset, kB0);
+            Bit out = bv.mux(fn(l.enable, kB0), fn(l.dataIn, kBX), q);
+            out = bv.mux(pre, kB1, out);
+            out = bv.mux(clr, kB0, out);
+            if (!l.clear.empty() && !l.preset.empty()) out = bv.mux(bv.and_(clr, pre), both(l.cpv1, q), out);
+            val[l.iq] = out;
+            val[l.iqn] = bv.not_(out);
+            state(l.iq, q.v, out, kB0, true);
+        }
+        (void)kLatch;
+        if (states) {
+            k = 0;
+            for (auto& f : c.ffs) {
+                Bit q{dr.libQ[k++], kFalse};
+                Bit clr = fn(f.clear, kB0), pre = fn(f.preset, kB0);
+                Bit next = fn(f.nextState, kBX);
+                next = bv.mux(pre, kB1, next);
+                next = bv.mux(clr, kB0, next);
+                if (!f.clear.empty() && !f.preset.empty()) next = bv.mux(bv.and_(clr, pre), both(f.cpv1, q), next);
+                Bit trig = bv.or_(fn(f.clockedOn, kB0), bv.or_(clr, pre));
+                state(f.iq, q.v, next, trig, false);
+            }
+            return;
+        }
+        for (auto& p : c.pins) {
+            if (p.dir != liberty::Dir::Out || !p.hasFunction()) continue;
+            auto ip = dr.pins.find(p.name);
+            if (ip == dr.pins.end()) continue;
+            Bit v = libExpr(p.functionExpr(), get);
+            assign(*ip->second, Bv::resize({v}, widthOf(*ip->second->type), false), kB1, false);
+        }
     }
 
     void walkProc(const ProceduralBlockSymbol& p) {
@@ -1623,6 +1767,7 @@ private:
                 break;
             }
             case Driver::Prim: runPrim(dr); break;
+            case Driver::LibCell: evalLibCell(dr, false); break;
             case Driver::Comb: runComb(dr, proc); break;
             case Driver::FF: break;  // Q exists already; next state comes from runFF
         }

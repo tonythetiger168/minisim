@@ -57,3 +57,13 @@ file(READ ${CMAKE_CURRENT_BINARY_DIR}/mequiv_report.json rep)
 if(NOT rep MATCHES "\"name\": \"y\\[2\\]\", \"status\": \"fail\"")
   message(FATAL_ERROR "report does not show the failing point:\n${rep}")
 endif()
+
+# The same netlists with the cells read from a Liberty library instead of
+# Verilog models: functions, ff groups (clear, preset) and a latch group.
+check(0 "passed 13, failed 0" -ref alu_rtl.sv -impl alu_gates.v -lib cells.lib)
+check(1 "FAIL  next-state  y[2]" -ref alu_rtl.sv -impl alu_gates_bug.v -lib cells.lib)
+check(0 "(3 stored inverted)" -ref invreg.sv -impl invreg_gates.v -lib cells.lib)
+check(0 "1 flops, 4 latches" -top misc -blackbox ram -ref misc.sv -impl misc_gates.v -lib cells.lib)
+# Verilog models against Liberty for the same netlist: the two views agree.
+check(0 "passed 13" -lib cells.lib -ref alu_gates.v cells.v -impl alu_gates.v)
+check(2 "has no definition" -ref alu_rtl.sv -impl alu_gates.v)

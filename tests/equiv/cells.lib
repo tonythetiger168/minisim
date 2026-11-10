@@ -1,0 +1,43 @@
+/* The cells of cells.v as a Liberty library: functions only, no timing. */
+library (mequiv_test) {
+  cell (INV)   { area : 1; pin (A) { direction : input; } pin (Y) { direction : output; function : "!A"; } }
+  cell (BUF)   { area : 1; pin (A) { direction : input; } pin (Y) { direction : output; function : "A"; } }
+  cell (AND2)  { area : 2; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "A*B"; } }
+  cell (OR2)   { area : 2; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "A+B"; } }
+  cell (NAND2) { area : 2; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "!(A*B)"; } }
+  cell (NOR2)  { area : 2; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "!(A+B)"; } }
+  cell (XOR2)  { area : 3; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "A^B"; } }
+  cell (XNOR2) { area : 3; pin (A) { direction : input; } pin (B) { direction : input; } pin (Y) { direction : output; function : "!(A^B)"; } }
+  cell (MUX2)  { area : 3; pin (A) { direction : input; } pin (B) { direction : input; } pin (S) { direction : input; }
+                 pin (Y) { direction : output; function : "(S*B)+(!S*A)"; } }
+  cell (AOI21) { area : 3; pin (A) { direction : input; } pin (B) { direction : input; } pin (C) { direction : input; }
+                 pin (Y) { direction : output; function : "!((A*B)+C)"; } }
+  cell (OAI21) { area : 3; pin (A) { direction : input; } pin (B) { direction : input; } pin (C) { direction : input; }
+                 pin (Y) { direction : output; function : "!((A+B)*C)"; } }
+  cell (TIE0)  { area : 1; pin (Y) { direction : output; function : "0"; } }
+  cell (TIE1)  { area : 1; pin (Y) { direction : output; function : "1"; } }
+  cell (DFF) {
+    area : 5;
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
+    pin (D) { direction : input; } pin (CK) { direction : input; clock : true; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+  cell (DFFR) {
+    area : 6;
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; clear : "!RN"; }
+    pin (D) { direction : input; } pin (CK) { direction : input; clock : true; } pin (RN) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+  cell (DFFS) {
+    area : 6;
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; preset : "!SN"; }
+    pin (D) { direction : input; } pin (CK) { direction : input; clock : true; } pin (SN) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+  cell (LATCH) {
+    area : 4;
+    latch (IQ, IQN) { enable : "G"; data_in : "D"; }
+    pin (D) { direction : input; } pin (G) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+}

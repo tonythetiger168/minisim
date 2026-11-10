@@ -5,7 +5,8 @@ synthesis, scan insertion, an ECO or a hand edit always raises: is the netlist
 still the RTL?
 
 ```sh
-mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
+mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu      # Verilog cell models
+mequiv -ref rtl/*.sv -impl netlist.v -lib cells.lib -top alu # or a Liberty library
 ```
 
 ```
@@ -38,8 +39,12 @@ both sides. A side may be:
   / always_latch and their Verilog forms, functions and tasks, loops with
   constant bounds, generate, packed and unpacked arrays and structs, memories,
   signed arithmetic, multiply, divide, shifts, casez/casex, `unique`/`priority`);
-- a structural netlist plus Verilog models of its cells (continuous assigns,
-  gate primitives, combinational UDPs, behavioural flops and latches);
+- a structural netlist plus its cells, either as Verilog models (continuous
+  assigns, gate primitives, combinational UDPs, behavioural flops and
+  latches) or as a Liberty library: `-lib cells.lib` gives every module that
+  has no Verilog definition the pin functions and the `ff` / `latch` groups
+  of the cell of that name (clear, preset, and what happens when both are
+  active);
 - a mix of the two.
 
 So the same command checks RTL against a netlist, a netlist against a netlist
@@ -109,6 +114,7 @@ thread count.
 | `-ref ...` / `-impl ...` | the two sides: files and front-end options |
 | `-top NAME` | top module of both sides (`-reftop`, `-impltop` for one) |
 | `-match R=I`, `-matchfile FILE` | pair a reference signal with an implementation signal |
+| `-lib FILE` | Liberty library for cells with no Verilog definition |
 | `-blackbox MOD` | do not look inside MOD |
 | `-threads N` | worker threads (default: all logical cores) |
 | `-effort N` | SAT conflicts allowed per compare point (default 2000000) |
@@ -132,7 +138,7 @@ report those outputs as aborted, which is inconclusive, never a pass.
 
 ## Not yet
 
-- Liberty (`.lib`) cell functions read directly, sequential UDPs.
+- Sequential UDPs and Liberty `statetable` cells.
 - Clock-gating cells treated as enables; retimed or merged registers.
 - Tri-state buses and inout ports.
 
