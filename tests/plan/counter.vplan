@@ -1,0 +1,19 @@
+# mplan self-test plan (tests/mplan.cmake).
+plan counter "Counter verification plan"
+  owner: tony
+  feature count "Counting" weight=2
+    doc: counts up and down, wraps at 7
+    test count_*
+    cover tb.cg.cp_q
+    cover tb.cg.x_q_dir goal=75
+    feature wrap "Wrap around" owner=alice
+      test count_wrap
+      assert tb.dut.c_wrap
+  feature reset "Reset and hold"
+    assert tb.dut.a_*
+    line counter.sv goal=90
+    branch counter.sv goal=80
+    toggle tb.dut.q
+  feature scoreboard "Scoreboard" owner=bob
+    test sb_*
+  feature lowpower "Low power"        # planned, nothing mapped yet
