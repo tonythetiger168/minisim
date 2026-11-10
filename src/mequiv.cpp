@@ -50,6 +50,7 @@ const char* kHelp =
     "                   definition is looked up there (functions, ff, latch)\n"
     "  -blackbox MOD    do not look inside module MOD on either side; its pins\n"
     "                   become compare points and free inputs\n"
+    "  -noclockgate     do not read a gated clock (latch and AND) as a flop enable\n"
     "  -threads N       worker threads (default: all logical cores; 1 disables)\n"
     "  -effort N        SAT conflicts allowed per compare point (default 2000000)\n"
     "  -maxfail N       failing points to print in detail (default 10)\n"
@@ -184,6 +185,7 @@ int main(int argc, char** argv) {
             continue;
         }
         if (a == "-verbose") { verbose = true; continue; }
+        if (a == "-noclockgate") { eopt.clockGates = false; continue; }
         if (a == "-q") { quiet = true; continue; }
         if (a == "-match") {
             std::string m = need(i);
@@ -277,6 +279,8 @@ int main(int argc, char** argv) {
             printf("%-15s top '%s': %zu inputs, %zu outputs, %zu flops, %zu latches, %zu AND nodes\n",
                    (std::string(s->label) + ":").c_str(), s->design.top.c_str(), s->design.inputs.size(),
                    s->design.outputs.size(), count(s->design, false), count(s->design, true), s->ands);
+            if (s->design.gatedFlops)
+                printf("  %zu flops are behind clock gates and are read as flops with an enable\n", s->design.gatedFlops);
             size_t shown = 0;
             for (auto& w : s->design.warnings) {
                 if (!verbose && ++shown > 5) {

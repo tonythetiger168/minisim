@@ -40,4 +40,13 @@ library (mequiv_test) {
     pin (D) { direction : input; } pin (G) { direction : input; }
     pin (Q) { direction : output; function : "IQ"; }
   }
+  cell (CKGATE) {
+    area : 6;
+    clock_gating_integrated_cell : "latch_posedge_precontrol";
+    statetable ("CK E SE", "ENL") { table : "L L L : - : L, L L H : - : H, L H - : - : H, H - - : - : N"; }
+    pin (CK) { direction : input; clock : true; clock_gate_clock_pin : true; }
+    pin (E) { direction : input; clock_gate_enable_pin : true; }
+    pin (SE) { direction : input; clock_gate_test_pin : true; }
+    pin (GCK) { direction : output; clock_gate_out_pin : true; state_function : "CK*ENL"; }
+  }
 }

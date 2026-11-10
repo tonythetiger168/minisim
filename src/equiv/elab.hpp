@@ -105,12 +105,14 @@ struct Design {
     std::vector<State> states;
     std::vector<std::string> warnings;
     std::vector<std::pair<Lit, Lit>> lemmas;  // literals equal by construction (bv.hpp)
+    size_t gatedFlops = 0;  // flops behind a clock gate, read as flops with an enable
 };
 
 struct ElabOptions {
     std::set<std::string> blackboxes;  // module names not to look inside
     std::vector<const liberty::Library*> libs;  // cells for modules with no Verilog definition
     size_t maxLoop = 1u << 20;         // iterations before a loop is called unbounded
+    bool clockGates = true;            // read a latch-and-AND gated clock as an enable
 };
 
 class Elab {
@@ -169,6 +171,7 @@ public:
         }
         cur = nullptr;
         resolvePlaceholders();
+        if (opt.clockGates) absorbClockGates();
         findAliases();
     }
 
@@ -463,7 +466,8 @@ private:
         for (auto* lib : opt.libs)
             if ((cell = lib->cell(std::string(u.definitionName)))) break;
         if (!cell) return false;
-        if (cell->group && !cell->group->all("statetable").empty())
+        if (cell->group && cell->group->has("clock_gating_integrated_cell")) cell = icgCell(*cell, u);
+        else if (cell->group && !cell->group->all("statetable").empty())
             throw Unsupported("Liberty cell '" + cell->name + "' is described by a statetable (instance '" + pathOf(u) + "')");
         Driver dr;
         dr.kind = Driver::LibCell;
@@ -490,6 +494,42 @@ private:
         for (size_t i = 0; i < cell->ffs.size() + cell->latches.size(); ++i) dr.libQ.push_back(g.input());
         addDriver(std::move(dr), outs);
         return true;
+    }
+
+    // An integrated clock-gating cell is described by attributes (and often a
+    // statetable), not by ff/latch groups. Build the equivalent latch-and-AND.
+    std::deque<liberty::Cell> icgCells;
+    std::map<const liberty::Cell*, const liberty::Cell*> icgOf;
+    const liberty::Cell* icgCell(const liberty::Cell& c, const UninstantiatedDefSymbol& u) {
+        auto it = icgOf.find(&c);
+        if (it != icgOf.end()) return it->second;
+        std::string kind = c.group->str("clock_gating_integrated_cell");
+        if (!kind.starts_with("latch_posedge"))
+            throw Unsupported("clock-gating cell '" + c.name + "' of kind '" + kind + "' (instance '" + pathOf(u) +
+                              "'); only latch_posedge kinds are understood");
+        std::string ck, en, te, out;
+        for (auto* pg : c.group->all("pin")) {
+            auto yes = [&](const char* a) { return pg->str(a) == "true"; };
+            if (yes("clock_gate_clock_pin")) ck = pg->name();
+            if (yes("clock_gate_enable_pin")) en = pg->name();
+            if (yes("clock_gate_test_pin")) te = pg->name();
+            if (yes("clock_gate_out_pin")) out = pg->name();
+        }
+        if (ck.empty() || en.empty() || out.empty())
+            throw Unsupported("clock-gating cell '" + c.name + "' does not mark its clock, enable and output pins");
+        liberty::Cell n = c;
+        n.ffs.clear();
+        n.latches.clear();
+        liberty::Latch l;
+        l.iq = "__icg_q";
+        l.iqn = "__icg_qn";
+        l.enable = "!" + ck;
+        l.dataIn = te.empty() ? en : "(" + en + "+" + te + ")";
+        n.latches.push_back(l);
+        for (auto& p : n.pins)
+            if (p.dir == liberty::Dir::Out) p.function = p.name == out ? ck + "*__icg_q" : std::string();
+        icgCells.push_back(std::move(n));
+        return icgOf[&c] = &icgCells.back();
     }
 
     Bit libExpr(const liberty::Expr& e, const std::function<Bit(const std::string&)>& get) {
@@ -1783,6 +1823,94 @@ private:
             defName[nodeOf(ph.p.v)] = defName[nodeOf(ph.p.x)] = bitNames(*ph.sym)[ph.bit];
         }
         dr.placeholders.clear();
+    }
+
+    // Clock gating. A flop whose clock is clk & E, where E comes out of a
+    // latch that is transparent while clk is low, only sees a rising edge when
+    // the latch's input was high just before it: it is a flop on clk with an
+    // enable. Rewriting it that way (as sign-off checkers do in their clock-
+    // gating mode) lets a gated netlist match RTL written with `if (en)`, and
+    // the other way round. The pattern is confirmed by proof, not by shape.
+    void absorbClockGates() {
+        std::unordered_map<uint32_t, size_t> latchByOut;
+        for (size_t i = 0; i < d.states.size(); ++i) {
+            const State& l = d.states[i];
+            if (l.latch && l.next.x == kFalse && g.isAnd(nodeOf(l.next.v))) latchByOut[nodeOf(l.next.v)] = i;
+        }
+        if (latchByOut.empty()) return;
+        struct Gate {
+            bool ok = false;
+            Lit clk = kFalse, en = kFalse;
+        };
+        std::unordered_map<Lit, Gate> cache;
+        auto analyze = [&](Lit t) {
+            Gate gate;
+            // The latch output nearest the trigger.
+            std::vector<uint32_t> st{nodeOf(t)};
+            std::unordered_set<uint32_t> seen;
+            size_t li = SIZE_MAX;
+            while (!st.empty() && seen.size() < 256 && li == SIZE_MAX) {
+                uint32_t n = st.back();
+                st.pop_back();
+                if (!n || !seen.insert(n).second) continue;
+                auto it = latchByOut.find(n);
+                if (it != latchByOut.end()) { li = it->second; break; }
+                if (g.isAnd(n)) st.push_back(nodeOf(g.node(n).a)), st.push_back(nodeOf(g.node(n).b));
+            }
+            if (li == SIZE_MAX) return gate;
+            const State& l = d.states[li];
+            Lit e = l.next.v;
+            std::unordered_map<uint32_t, Lit> e0, e1, q0, q1;
+            e0[nodeOf(e)] = isNeg(e) ? kTrue : kFalse;
+            e1[nodeOf(e)] = isNeg(e) ? kFalse : kTrue;
+            // t = rest | (clk & E): E only ever raises the trigger, and only
+            // matters while the latch is closed (clock high), where it holds.
+            Lit t0 = g.rebuildSparse(t, e0), t1 = g.rebuildSparse(t, e1);
+            q0[nodeOf(l.q)] = kFalse;
+            q1[nodeOf(l.q)] = kTrue;
+            Lit n0 = g.rebuildSparse(e, q0), n1 = g.rebuildSparse(e, q1);
+            Lit closed = g.xor_(n0, n1);
+            Lit bad = g.or_(g.or_(g.and_(t0, neg(t1)), g.and_(g.and_(t1, neg(t0)), neg(closed))),
+                            g.and_(closed, g.or_(n0, neg(n1))));
+            Cnf cnf(g);
+            if (bad != kFalse && cnf.solve(bad, 100000) != 0) return gate;
+            if (t0 == t1) return gate;
+            // The clock is the signal that closes the latch; the enable is
+            // the latch's input seen with the clock low.
+            std::vector<uint32_t> ins;
+            st.assign(1, nodeOf(e));
+            seen.clear();
+            while (!st.empty() && seen.size() < 4096) {
+                uint32_t n = st.back();
+                st.pop_back();
+                if (!n || !seen.insert(n).second) continue;
+                if (g.isAnd(n)) st.push_back(nodeOf(g.node(n).a)), st.push_back(nodeOf(g.node(n).b));
+                else ins.push_back(n);
+            }
+            std::sort(ins.begin(), ins.end());
+            for (uint32_t v : ins)
+                for (Lit c : {Lit(v << 1), Lit(v << 1) ^ 1u}) {
+                    if (gate.ok) break;
+                    Lit differ = g.xor_(closed, c);
+                    if (differ != kFalse && cnf.solve(differ, 100000) != 0) continue;
+                    std::unordered_map<uint32_t, Lit> low;
+                    low[v] = isNeg(c) ? kTrue : kFalse;  // c == 0
+                    gate.ok = true;
+                    gate.clk = t1;
+                    // Triggers that do not pass the gate (an async reset) load regardless.
+                    gate.en = g.or_(t0, g.rebuildSparse(n0, low));
+                }
+            return gate;
+        };
+        for (State& f : d.states) {
+            if (f.latch || f.trig.x != kFalse || !g.isAnd(nodeOf(f.trig.v))) continue;
+            auto it = cache.find(f.trig.v);
+            if (it == cache.end()) it = cache.emplace(f.trig.v, analyze(f.trig.v)).first;
+            if (!it->second.ok) continue;
+            f.trig = {it->second.clk, kFalse};
+            f.next = bv.mux(Bit{it->second.en, kFalse}, f.next, Bit{f.q, kFalse});
+            ++d.gatedFlops;
+        }
     }
 
     // A flop inside a library cell is called whatever the cell calls it (Q);

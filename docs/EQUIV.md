@@ -99,6 +99,16 @@ don't-cares on the `-ref` side.
 block). Its output pins become free inputs and its input pins become compare
 points, so the logic around it is still checked.
 
+### Clock gating
+
+A netlist with inserted clock gates clocks its flops from `clk & latched_en`
+where the RTL has `if (en) q <= d`. When a flop's clock comes through a
+latch-and-AND gate (written out, or a Liberty `clock_gating_integrated_cell`),
+mequiv proves the pattern with SAT, then compares the flop as clocked by the
+plain clock with the latch's enable as a load enable. An asynchronous reset
+still acts regardless of the enable. `-noclockgate` turns this off, and then
+gated and ungated flops differ at their clock point.
+
 ## Speed and threads
 
 Reading the two designs runs on two threads; SAT runs on all logical cores
@@ -116,6 +126,7 @@ thread count.
 | `-match R=I`, `-matchfile FILE` | pair a reference signal with an implementation signal |
 | `-lib FILE` | Liberty library for cells with no Verilog definition |
 | `-blackbox MOD` | do not look inside MOD |
+| `-noclockgate` | compare gated clocks as they are, without turning them into enables |
 | `-threads N` | worker threads (default: all logical cores) |
 | `-effort N` | SAT conflicts allowed per compare point (default 2000000) |
 | `-maxfail N` | failing points printed in detail (default 10) |
@@ -139,7 +150,7 @@ report those outputs as aborted, which is inconclusive, never a pass.
 ## Not yet
 
 - Sequential UDPs and Liberty `statetable` cells.
-- Clock-gating cells treated as enables; retimed or merged registers.
+- Retimed or merged registers; sequential equivalence (k-induction).
 - Tri-state buses and inout ports.
 
 ## The pieces

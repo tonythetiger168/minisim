@@ -67,3 +67,11 @@ check(0 "1 flops, 4 latches" -top misc -blackbox ram -ref misc.sv -impl misc_gat
 # Verilog models against Liberty for the same netlist: the two views agree.
 check(0 "passed 13" -lib cells.lib -ref alu_gates.v cells.v -impl alu_gates.v)
 check(2 "unknown module" -ref alu_rtl.sv -impl alu_gates.v)
+
+# Clock gating: a latch-and-AND gate on the clock is an enable on the flops,
+# spelled out in gates or as a Liberty integrated clock-gating cell. Without
+# the latch it is not a clock gate, and with -noclockgate nothing is assumed.
+check(0 "4 flops are behind clock gates" -ref gated.sv -impl gated_gates.v cells.v)
+check(0 "4 flops are behind clock gates" -ref gated.sv -impl gated_gates.v -lib cells.lib +define+ICG_CELL)
+check(1 "FAIL  clock/reset q[0]" -ref gated.sv -impl gated_gates.v cells.v +define+BUG)
+check(1 "FAIL  clock/reset q[0]" -ref gated.sv -impl gated_gates.v cells.v -noclockgate)
