@@ -45,6 +45,10 @@ with `-tielo CELL/PIN` and `-tiehi CELL/PIN`.
 | `-strap_layer N` | Routing layer of the straps (the top vertical layer) |
 | `-strap_width UM` | Strap width (four wire widths of the layer) |
 | `-strap_pitch UM` | Distance between straps of one supply (32 row heights) |
+| `-no_cts` | No clock trees |
+| `-cts_fanout N` | Most loads on one clock buffer (16) |
+| `-cts_buf CELL` | Clock buffer cell (default: by name, a `CLKBUF` before a `BUF`) |
+| `-clock NET` | Build a tree on this net (repeat; default: nets on clock pins) |
 | `-place_only` | Stop after placement |
 | `-def FILE` | The placed and routed design |
 | `-netlist FILE` | The final flat netlist, with the tie and filler cells, for LVS and timing |
@@ -71,6 +75,8 @@ with `-tielo CELL/PIN` and `-tiehi CELL/PIN`.
 3. **Legalization.** Abacus: cells in x order, each to the row segment where it
    moves least; a row is packed by merging clusters at their least-squares
    position. Fixed cells and blockages split rows into segments.
+   After global placement the **clock trees** are built (see below), so
+   their buffers are legalized with the other cells.
 4. **Refinement.** Neighbours swap and cells mirror while the half-perimeter
    wire length drops. Then fillers close the gaps.
 5. **Routing.** One track set per layer from the LEF pitch and offset; wires
@@ -93,6 +99,32 @@ with `-tielo CELL/PIN` and `-tiehi CELL/PIN`.
    every net one connected piece (opens), no metal of two nets touching
    (shorts) or closer than `SPACING`. The same check runs on any DEF with
    `-check`.
+
+## Clock trees
+
+Every net on a cell's clock pin (LEF `USE CLOCK`, or a pin named `CK`, `CLK`,
+`CP`, `CKN`, `CLKN`, `GCK`) with more loads than `-cts_fanout` (16) gets a
+tree; `-clock NET` names the nets instead. The loads are clustered by
+position into groups of near-equal size, at most the fan-out each, and each
+group gets a buffer at its centre. The buffers are clustered the same way,
+level by level, down to one root buffer at the centre of the loads, which the
+net's own driver drives. So every load sits behind the same number of
+buffers, and the buffers of one level drive near-equal loads.
+
+The buffer is `-cts_buf CELL`, or found in the LEF by name: a `CLKBUF` before
+a `BUF`, the widest of its kind. Buffers are named `mpnr_cts_b<n>` and their
+nets `mpnr_cts_n<n>`; they are in the DEF and in the `-netlist` output. The
+floorplan leaves room for them. `-no_cts` routes clock nets as they are.
+
+```
+clock tree: clk: 2500 loads behind 168 CLKBUF_X4 in 3 levels; driver to load 298.4 to 468.3 um of wire
+```
+
+The last two numbers are the shortest and longest way from the driver to a
+load along the tree (Manhattan distance between pins), a measure of skew
+before any timing is known. Trees are balanced by level and by load, not by
+delay: there is no wire snaking, no sizing and no timing analysis yet, and
+a clock gate's output net gets its own tree, not balanced against the others.
 
 ## Power
 
@@ -167,8 +199,8 @@ The same flow routes 5,000 Nangate45 cells clean on the real Nangate45 LEF
   does not measure area; run a DRC tool on the result (`mpv drc -lef`).
 - Standard cells one row high. Larger macros can be fixed in a floorplan DEF
   (their pins and obstructions are honoured) but mpnr does not place them.
-- The clock is routed as an ordinary net: no clock tree, no buffering, no
-  timing-driven placement or routing yet.
+- Clock trees are balanced by level and load, not by delay, and are routed
+  as ordinary nets. No timing-driven placement or routing yet.
 - No global-routing stage: a design too dense for its layers (above about
   85% utilization on three routing layers) leaves nets unrouted and takes
   long to say so.

@@ -1,6 +1,7 @@
 // mpnr: place and route. Reads a gate-level Verilog netlist and LEF, makes a
 // floorplan, places the cells, routes the nets, and writes DEF.
 #include "pnr_route.hpp"
+#include "pnr_cts.hpp"
 #include "pnr_gds.hpp"
 #include "version.hpp"
 #include <chrono>
@@ -26,6 +27,10 @@ static void usage() {
     "  -strap_layer N    routing layer of the straps (default: the top vertical layer)\n"
     "  -strap_width UM   strap width (four wire widths)\n"
     "  -strap_pitch UM   distance between straps of one supply (32 row heights)\n"
+    "  -no_cts           no clock trees: clock nets are routed as they are in the netlist\n"
+    "  -cts_fanout N     most loads on one clock buffer (16)\n"
+    "  -cts_buf CELL     clock buffer cell (default: found by name, a CLKBUF before a BUF)\n"
+    "  -clock NET        build a tree on this net (repeat; default: every net on a cell's clock pin)\n"
     "  -place_only       stop after placement\n"
     "  -def FILE         write the placed and routed design as DEF\n"
     "  -netlist FILE     write the final flat netlist (with tie and filler cells)\n"
@@ -48,6 +53,7 @@ int main(int argc, char** argv) {
   NetlistOptions nopt;
   PlaceOptions popt;
   RouteOptions ropt;
+  CtsOptions copt;
   int threads = 0;
   bool placeOnly = false, verbose = false;
   try {
@@ -72,6 +78,10 @@ int main(int argc, char** argv) {
       else if (a == "-strap_layer") sopt.layer = atoi(val().c_str());
       else if (a == "-strap_width") sopt.widthUm = atof(val().c_str());
       else if (a == "-strap_pitch") sopt.pitchUm = atof(val().c_str());
+      else if (a == "-no_cts") copt.on = false;
+      else if (a == "-cts_fanout") copt.fanout = atoi(val().c_str());
+      else if (a == "-cts_buf") copt.buf = val();
+      else if (a == "-clock") copt.clocks.push_back(val());
       else if (a == "-place_only") placeOnly = true;
       else if (a == "-def" || a == "-o") defOut = val();
       else if (a == "-netlist") netlistOut = val();
@@ -114,6 +124,8 @@ int main(int argc, char** argv) {
               << " ports, " << pool.threads() << " threads\n";
 
     auto t1 = clk::now();
+    Cts cts(db, copt);
+    popt.reserve = cts.plan();
     if (!floorplanDef.empty()) loadFloorplan(db, floorplanDef, ropt.minLayer);
     else floorplan(db, popt, ropt.minLayer);
     double cellArea = 0;
@@ -122,6 +134,7 @@ int main(int argc, char** argv) {
       Placer pl(db, pool, popt);
       pl.globalPlace();
     }
+    cts.build();
     int64_t gpLen = db.hpwl();
     if (verbose) fprintf(stderr, "  global placement %.2f s\n", secs(t1));
     auto tl = clk::now();
@@ -144,6 +157,9 @@ int main(int argc, char** argv) {
            db.um(db.core.w()), db.um(db.core.h()), db.rows.size(), 100 * cellArea / (db.um(db.core.w()) * db.um(db.core.h())));
     printf("placement: wire length (half perimeter) %.1f um global, %.1f legal, %.1f refined (%d changes); mean move %.2f um; %d fillers; %.2f s\n",
            db.um(gpLen), db.um(lgLen), db.um(dpLen), swaps, db.um((int64_t)moved), fillers, placeSecs);
+    for (auto& t : cts.report())
+      printf("clock tree: %s: %d loads behind %d %s in %d level%s; driver to load %.1f to %.1f um of wire\n", t.net.c_str(), t.sinks, t.buffers,
+             cts.bufferCell()->name.c_str(), t.levels, t.levels == 1 ? "" : "s", db.um(t.minLen), db.um(t.maxLen));
     if (straps) printf("power: %d straps over the rails\n", straps);
     else if (sopt.on && !noStraps.empty()) printf("power: no straps: %s\n", noStraps.c_str());
 
@@ -175,7 +191,7 @@ int main(int argc, char** argv) {
     if (!gdsOut.empty()) writeGds(db.tech, out, gdsOut, gopt);
     if (!reportOut.empty()) {
       std::ofstream r(reportOut);
-      r << "{\n  \"design\": \"" << db.top << "\",\n  \"cells\": " << db.insts.size() - fillers << ",\n  \"fillers\": " << fillers
+      r << "{\n  \"design\": \"" << db.top << "\",\n  \"cells\": " << db.insts.size() - fillers << ",\n  \"fillers\": " << fillers << ",\n  \"clock_buffers\": " << cts.buffers()
         << ",\n  \"nets\": " << db.nets.size() << ",\n  \"die_um\": [" << db.um(db.die.w()) << ", " << db.um(db.die.h()) << "]"
         << ",\n  \"utilization\": " << cellArea / (db.um(db.core.w()) * db.um(db.core.h()))
         << ",\n  \"hpwl_um\": " << db.um(dpLen) << ",\n  \"routed_nets\": " << rr.nets << ",\n  \"wire_length_um\": " << db.um(rr.wireLength)

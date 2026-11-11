@@ -21,6 +21,7 @@ struct PlaceOptions {
   double aspect = 1.0;          // core height / width
   double marginUm = -1;         // core to die; -1: four row heights
   int maxIter = 60;
+  double reserve = 0;           // area kept free for cells added after the floorplan, dbu^2
   bool fillers = true;
   bool verbose = false;
 };
@@ -136,7 +137,7 @@ inline void floorplan(DB& db, const PlaceOptions& opt, int minLayer) {
     area += (double)in.m->w * in.m->h;
   }
   if (opt.util <= 0 || opt.util > 1) throw std::runtime_error("-util must be above 0 and at most 1");
-  double coreArea = area / opt.util;
+  double coreArea = (area + opt.reserve) / opt.util;
   int64_t h = snapUp((int64_t)std::ceil(std::sqrt(coreArea * opt.aspect)), site->h);
   if (h < site->h) h = site->h;
   int64_t w = snapUp((int64_t)std::ceil(coreArea / (double)h), site->w);

@@ -145,6 +145,42 @@ run("-lef", lef, out("rand.v"), "-def", out("rand4.def"), "-threads", "4")
 assert open(out("rand1.def")).read() == open(out("rand4.def")).read(), "random design: -threads 4 differs from -threads 1"
 
 
+# 6a. Clock trees: every flop sits behind the same number of buffers, no
+# buffer or clock driver has more than the fan-out limit, and the options work.
+def clock_depths(def_path, fanout):
+    text = open(def_path).read()
+    nets = text[text.index("\nNETS "):text.index("END NETS")]
+    driver, depth, flops = {}, {}, 0
+    for m in re.finditer(r"\n- (\S+)((?:\s+\( \S+ \S+ \))+)", nets):
+        conns = re.findall(r"\( (\S+) (\S+) \)", m.group(2))
+        loads = [c for c in conns if not (c[0].startswith("mpnr_cts_b") and c[1] == "Y") and c[0] != "PIN"]
+        if any(c[1] == "CK" for c in conns) or any(c[0].startswith("mpnr_cts_b") for c in conns):
+            assert len(loads) <= fanout, "net %s has %d loads" % (m.group(1), len(loads))
+        src = [c[0] for c in conns if c[0].startswith("mpnr_cts_b") and c[1] == "Y"]
+        for c in loads:
+            driver[c] = src[0] if src else None
+    def up(conn):
+        n = 0
+        while driver.get(conn):
+            conn = (driver[conn], "A")
+            n += 1
+        return n
+    return sorted({up(c) for c in driver if c[1] == "CK"})
+need(log, r"clock tree: clk: 375 loads behind 27 BUF in 3 levels; driver to load [\d.]+ to [\d.]+ um of wire")
+assert clock_depths(out("rand1.def"), 16) == [3], "clock tree depths: %s" % clock_depths(out("rand1.def"), 16)
+log = run("-lef", lef, out("rand.v"), "-def", out("rand_f4.def"), "-cts_fanout", "4", "-cts_buf", "BUF", "-clock", "clk", "-netlist", out("rand_f4.v"))
+need(log, r"clock tree: clk: 375 loads behind \d+ BUF in 5 levels")
+need(log, r"0 open, 0 shorts, 0 spacing violations")
+assert clock_depths(out("rand_f4.def"), 4) == [5]
+# The netlist written back has the buffers and gets no second tree.
+log = run("-lef", lef, out("rand_f4.v"), "-def", out("rand_f4b.def"), "-cts_fanout", "4")
+assert "clock tree" not in log and "mpnr_cts_b0 " in open(out("rand_f4.v")).read()
+log = run("-lef", lef, out("rand.v"), "-def", out("rand_nc.def"), "-no_cts")
+assert "clock tree" not in log and "mpnr_cts" not in open(out("rand_nc.def")).read()
+need(run("-lef", lef, out("rand.v"), "-cts_buf", "NAND2", rc=2), r"-cts_buf: NAND2 is not a buffer")
+need(run("-lef", lef, out("rand.v"), "-clock", "nosuch", rc=2), r"-clock: no net 'nosuch'")
+need(run("-lef", lef, out("rand.v"), "-cts_fanout", "1", rc=2), r"-cts_fanout must be 2 or more")
+
 # 6b. Power straps: on by default, they tie every rail of a supply together.
 log = run("-lef", lef, counter, "-def", out("straps.def"))
 need(log, r"power: 2 straps over the rails")
