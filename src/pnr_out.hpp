@@ -112,6 +112,19 @@ inline int makeStraps(DB& db, const StrapOptions& o, int maxLayer, std::string& 
       for (auto& r : rails) {
         if (x - width / 2 < std::min(r.x0, r.x1) || x + width / 2 > std::max(r.x0, r.x1)) continue;
         for (int l = ri; l < si; l++) n.vias.push_back({stack[l - ri]->name, rl[l - 1]->name, x, r.y0});
+        // The pads on the layers in between get a wire long enough for
+        // the layer's minimum area.
+        for (int l = ri; l + 1 < si; l++) {
+          const phys::Layer& L = *rl[l];
+          if (L.minArea <= 0 || L.width <= 0) continue;
+          int64_t grid = std::max<int64_t>(db.tech.mfgGrid, 1);
+          int64_t half = (((L.minArea + L.width - 1) / L.width + 1) / 2 + grid - 1) / grid * grid;
+          phys::Seg pt;
+          pt.layer = L.name; pt.width = L.width; pt.ext0 = pt.ext1 = 0;
+          if (L.dir == 'H') { pt.x0 = x - half; pt.x1 = x + half; pt.y0 = pt.y1 = r.y0; }
+          else { pt.y0 = r.y0 - half; pt.y1 = r.y0 + half; pt.x0 = pt.x1 = x; }
+          n.segs.push_back(pt);
+        }
       }
     }
     k++;
@@ -153,6 +166,7 @@ inline phys::Design Router::toDef(bool routed) const {
   d.blockages = db.blockages;
   d.specialNets = db.specialNets;
   std::vector<phys::LayerRect> shapes;
+  std::vector<char> usedGen(pinVias.size(), 0);
   for (size_t ni = 0; ni < db.nets.size(); ni++) {
     const Net& nt = db.nets[ni];
     if (nt.pins.empty()) continue;
@@ -190,6 +204,44 @@ inline phys::Design Router::toDef(bool routed) const {
         n.segs.push_back(s);
         i = j + 1;
       }
+      // A piece of metal below the layer's minimum area gets a longer wire
+      // over it (the router kept the room).
+      {
+        std::vector<std::array<int, 4>> runs;       // layer, track, from, to
+        for (size_t i = 0; i < steps.size();) {
+          size_t j = i;
+          int end = steps[i][3];
+          while (j + 1 < steps.size() && steps[j + 1][0] == steps[i][0] && steps[j + 1][1] == steps[i][1] && steps[j + 1][2] <= end) { j++; end = std::max(end, steps[j][3]); }
+          runs.push_back({steps[i][0], steps[i][1], steps[i][2], end});
+          i = j + 1;
+        }
+        size_t nRuns = runs.size();
+        std::vector<int> nodes = r.nodes;
+        std::sort(nodes.begin(), nodes.end());
+        nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+        for (int nd : nodes) {
+          int g, t, p;
+          decode(nd, g, t, p);
+          bool in = false;
+          for (size_t i = 0; i < nRuns && !in; i++) in = runs[i][0] == g && runs[i][1] == t && runs[i][2] <= p && p <= runs[i][3];
+          if (!in) runs.push_back({g, t, p, p});
+        }
+        for (auto& ru : runs) {
+          const GLayer& l = gl[ru[0]];
+          int64_t half = minHalf(*l.L);
+          if (!half) continue;
+          int64_t a = l.pos[ru[2]], b = l.pos[ru[3]], w = l.L->width;
+          if ((b - a + w) * w >= l.L->minArea) continue;
+          int64_t grid = std::max<int64_t>(db.tech.mfgGrid, 1);
+          int64_t x = ((2 * half - w - (b - a) + 1) / 2 + grid - 1) / grid * grid;
+          x = std::min(x, half - w / 2);
+          phys::Seg s;
+          s.layer = l.L->name;
+          int64_t c = l.trk[ru[1]];
+          if (l.horiz) { s.x0 = a - x; s.x1 = b + x; s.y0 = s.y1 = c; } else { s.y0 = a - x; s.y1 = b + x; s.x0 = s.x1 = c; }
+          n.segs.push_back(s);
+        }
+      }
       // A via down to each pin that sits on the layer below the first routing layer.
       if (accessLayer)
         for (size_t k = 0; k < nt.pins.size(); k++) {
@@ -210,11 +262,12 @@ inline phys::Design Router::toDef(bool routed) const {
           }
           if (direct || !on) continue;
           const phys::ViaDef* v = pinVia(*on, x, y);
-          if (v) n.vias.push_back({v->name, accessLayer->name, x, y});
+          if (v) { n.vias.push_back({v->name, accessLayer->name, x, y}); if ((size_t)(v - pinVias.data()) >= pinViasLef) usedGen[v - pinVias.data()] = 1; }
         }
     }
     d.nets.push_back(std::move(n));
   }
+  for (size_t i = pinViasLef; i < pinVias.size(); i++) if (usedGen[i]) d.vias.push_back(pinVias[i]);
   return d;
 }
 

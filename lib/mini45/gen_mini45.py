@@ -660,6 +660,7 @@ def verilog():
 
 # ------------------------------------------------------------ LEF
 M1_W = 0.07
+PIN_H = 0.21            # um: 0.07 x 0.21 is the metal1 minimum area
 
 def tech_lef():
     s = "# mini45 technology LEF: a made-up 45 nm-class stack for testing tools.\n"
@@ -708,6 +709,15 @@ def tech_lef():
         else:
             s += "  LAYER %s ;\n    RECT %.3f %.3f %.3f %.3f ;\n" % (hi[0], -hi[3] / 2 if hi[3] >= cw else -h, -e2 - 0.03, hi[3] / 2 if hi[3] >= cw else h, e2 + 0.03)
         s += "END via%d_0\n\n" % n
+        if n == 1:
+            # The same cut with a vertical metal1 pad, the shape of a cell
+            # pin: two of them fit on neighbouring metal2 tracks, where the
+            # horizontal pads of via1_0 would be closer than the spacing.
+            s += "VIA via1_1 DEFAULT\n  RESISTANCE %.1f ;\n" % hi[9][3]
+            s += "  LAYER %s ;\n    RECT %.3f %.3f %.3f %.3f ;\n" % (lo[0], -lo[3] / 2, -PIN_H / 2, lo[3] / 2, PIN_H / 2)
+            s += "  LAYER %s ;\n    RECT %.4f %.4f %.4f %.4f ;\n" % (cn, -h, -h, h, h)
+            s += "  LAYER %s ;\n    RECT %.3f %.3f %.3f %.3f ;\n" % (hi[0], -hi[3] / 2 if hi[3] >= cw else -h, -e2 - 0.03, hi[3] / 2 if hi[3] >= cw else h, e2 + 0.03)
+            s += "END via1_1\n\n"
     s += "END LIBRARY\n"
     return s
 
@@ -724,7 +734,8 @@ def cell_lef():
             raise SystemExit("%s: %d pins do not fit %d sites" % (c.name, len(pins), c.sites))
         # One metal2 track per pin, spread over the cell, on metal1 tracks 3..7
         # in a zigzag so neighbours keep their spacing. Each shape is a
-        # metal1 bar centred on a metal1 track, covering its metal2 track.
+        # vertical metal1 bar centred on a metal1 track, covering its metal2
+        # track, and tall enough to meet the metal1 area rule on its own.
         used = []
         for n, (p, d) in enumerate(pins):
             col = int(round((n + 0.5) * c.sites / len(pins) - 0.5))
@@ -737,7 +748,7 @@ def cell_lef():
                 p, d, " TRISTATE" if (c.tri and d == "OUTPUT") else "",
                 "CLOCK" if p == "CK" and c.seq else "SIGNAL")
             s += "    PORT\n      LAYER metal1 ;\n        RECT %.3f %.3f %.3f %.3f ;\n    END\n  END %s\n" % (
-                x - M1_W / 2, y - 0.07, x + M1_W / 2, y + 0.07, p)
+                x - M1_W / 2, y - PIN_H / 2, x + M1_W / 2, y + PIN_H / 2, p)
         for p, use, y in (("VDD", "POWER", ROW_H), ("VSS", "GROUND", 0.0)):
             s += "  PIN %s\n    DIRECTION INOUT ;\n    USE %s ;\n    SHAPE ABUTMENT ;\n" % (p, use)
             s += "    PORT\n      LAYER metal1 ;\n        RECT 0.000 %.3f %.3f %.3f ;\n    END\n  END %s\n" % (y - rail, w, y + rail, p)

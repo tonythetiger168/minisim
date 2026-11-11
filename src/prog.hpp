@@ -111,18 +111,20 @@ inline uint32_t covFileId(const std::string& path) {
 struct CondDef {
     uint32_t file = 0, line = 0, col = 0;
     bool isOr = false;
+    bool lazy = false;                // the terms run in order until one decides (see condCovLazyEnd)
     std::string text;                 // the whole condition, as written
     std::vector<std::string> terms;   // each term, as written
     size_t base = 0;
 };
 inline std::vector<CondDef>& condDefs() { static std::vector<CondDef> d; return d; }
-// FSM coverage: a state register found by the lowerer (lower_fsm.inc), its
+// FSM coverage: a state register found by the lowerer (fsm_extract.hpp), its
 // states and the transitions its next-state logic can make. The kernel
 // records the values the register takes and each change (Sim::covFsm).
 struct FsmDef {
     std::string module, inst, name;   // definition, instance path, register
     uint32_t file = 0, line = 0;
     int sig = -1, w = 0;
+    bool onehot = false;   // tested bit by bit: only values with one bit set are states
     std::vector<std::pair<uint64_t, std::string>> states;   // value, name
     struct Tr { uint64_t from, to; bool reset; };            // reset: to a state the block's reset branch assigns
     std::vector<Tr> trans;
