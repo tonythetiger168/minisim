@@ -1,7 +1,7 @@
-A MOSFET level mspice does not have
-.model n54 nmos level=54 vth0=0.4
+A MOSFET level mspice does not have (level 3)
+.model n3 nmos level=3 vto=0.4
 v1 d 0 1
-m1 d d 0 0 n54 w=1u l=0.1u
+m1 d d 0 0 n3 w=1u l=0.1u
 .op
-*> error "MOSFET level 54; mspice has level 1 only so far"
+*> error "MOSFET level 3; mspice has level 1 and BSIM4 (level 14 or 54)"
 .end
