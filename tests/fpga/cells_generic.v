@@ -18,3 +18,17 @@ module \$_DFF_PP0_ (input C, D, R, output reg Q); always @(posedge C or posedge 
 module \$_DFF_PP1_ (input C, D, R, output reg Q); always @(posedge C or posedge R) if (R) Q <= 1; else Q <= D; endmodule
 module \$_DFF_NP0_ (input C, D, R, output reg Q); always @(negedge C or posedge R) if (R) Q <= 0; else Q <= D; endmodule
 module \$_DFF_NP1_ (input C, D, R, output reg Q); always @(negedge C or posedge R) if (R) Q <= 1; else Q <= D; endmodule
+module \$_DFFE_PP_ (input C, D, E, output reg Q); always @(posedge C) if (E) Q <= D; endmodule
+module \$_DFFE_PP0P_ (input C, D, R, E, output reg Q); always @(posedge C or posedge R) if (R) Q <= 0; else if (E) Q <= D; endmodule
+module \$_SDFF_PP0_ (input C, D, R, output reg Q); always @(posedge C) if (R) Q <= 0; else Q <= D; endmodule
+module \$_SDFFE_PP0P_ (input C, D, R, E, output reg Q); always @(posedge C) if (R) Q <= 0; else if (E) Q <= D; endmodule
+module \$_DFFE_PP1P_ (input C, D, R, E, output reg Q); always @(posedge C or posedge R) if (R) Q <= 1; else if (E) Q <= D; endmodule
+module \$_SDFF_PP1_ (input C, D, R, output reg Q); always @(posedge C) if (R) Q <= 1; else Q <= D; endmodule
+module \$_SDFFE_PP1P_ (input C, D, R, E, output reg Q); always @(posedge C) if (R) Q <= 1; else if (E) Q <= D; endmodule
+module \$_DFFE_NP_ (input C, D, E, output reg Q); always @(negedge C) if (E) Q <= D; endmodule
+module \$_DFFE_NP0P_ (input C, D, R, E, output reg Q); always @(negedge C or posedge R) if (R) Q <= 0; else if (E) Q <= D; endmodule
+module \$_SDFF_NP0_ (input C, D, R, output reg Q); always @(negedge C) if (R) Q <= 0; else Q <= D; endmodule
+module \$_SDFFE_NP0P_ (input C, D, R, E, output reg Q); always @(negedge C) if (R) Q <= 0; else if (E) Q <= D; endmodule
+module \$_DFFE_NP1P_ (input C, D, R, E, output reg Q); always @(negedge C or posedge R) if (R) Q <= 1; else if (E) Q <= D; endmodule
+module \$_SDFF_NP1_ (input C, D, R, output reg Q); always @(negedge C) if (R) Q <= 1; else Q <= D; endmodule
+module \$_SDFFE_NP1P_ (input C, D, R, E, output reg Q); always @(negedge C) if (R) Q <= 1; else if (E) Q <= D; endmodule
