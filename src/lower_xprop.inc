@@ -48,6 +48,12 @@ struct Xp {
     std::unordered_set<int> temps;              // this process's temporaries
     std::unordered_set<int> bad;                // targets that cannot be merged (real, string, ...)
     std::unordered_set<size_t> okNba, okArr, oolJmp;
+    // The clean copy (see xpProc): `sites` holds, per region in the order
+    // the regions are lowered, where the merging copy takes over when
+    // condition k is unknown (empty: the region is not merged).
+    bool clean = false;
+    std::vector<std::vector<size_t>> sites;
+    size_t siteNext = 0, lastSite = 0;
     std::unordered_set<const slang::ast::Symbol*> once;   // nonblocking targets assigned at most once a pass
     std::vector<std::pair<size_t, size_t>> guarded, badRanges;
     std::vector<std::function<void()>> ool;
@@ -81,7 +87,7 @@ size_t xpJmp(size_t target = 0) { Instr j; j.k = IK::Jmp; j.target = target; ret
 // Statements whose only effect is a message or the end of the run are
 // skipped while an unknown region runs: it is not known that they execute.
 template <class F> void xpGuard(F&& f) {
-    if (!xp.on || xp.guardDepth) { f(); return; }
+    if (!xp.on || xp.guardDepth || xp.clean) { f(); return; }
     size_t jf = emitJmpIfNot(xpNot(xpIs(ref(xp.xm), 1)));
     xp.guardDepth++;
     f();
@@ -99,7 +105,7 @@ static bool xpMessageTask(std::string_view n) {
 // task or function makes the regions around it unmergeable.
 void xpExprStmt(const slang::ast::Expression& ex) {
     using namespace slang::ast;
-    if (xp.on && ex.kind == ExpressionKind::Call) {
+    if (xp.on && !xp.clean && ex.kind == ExpressionKind::Call) {
         const auto& call = ex.as<CallExpression>();
         if (call.isSystemCall() && xpMessageTask(call.getSubroutineName())) {
             xpGuard([&] { exprStmt(ex); });
@@ -263,7 +269,7 @@ void xpCount(const slang::ast::Statement& s, XpCounts& out, XpPre& pre) {
 // ---- nonblocking assignments ----
 // A nonblocking assignment with no shadow: in an unknown region its target becomes x.
 void xpDirect(Instr i) {
-    if (!xp.on || i.k != IK::Nba) { prog.emit(i); return; }
+    if (!xp.on || xp.clean || i.k != IK::Nba) { prog.emit(i); return; }
     int w = i.bidx && i.pw <= 0 ? 1 : i.pw > 0 ? i.pw : i.hi >= 0 ? i.hi - i.lo + 1
             : i.arr ? i.arr->elemW : (i.sig >= 0 && !isRel(i.sig) ? xpSigW(i.sig) : 0);
     if (w <= 0 || i.dyn >= 0) { prog.emit(i); return; }   // left as it is: the region is refused
@@ -279,7 +285,7 @@ void xpDirect(Instr i) {
 // Emits assignment i, whose target expression is `target`.
 void xpEmit(Instr i, const slang::ast::Expression& target) {
     if (xp.on && i.k == IK::Assign && i.sig >= 0 && !i.arr && !target.type->isIntegral()) xp.bad.insert(i.sig);
-    if (!xp.on || (i.k != IK::Nba && i.k != IK::Assign)) { prog.emit(i); return; }
+    if (!xp.on || xp.clean || (i.k != IK::Nba && i.k != IK::Assign)) { prog.emit(i); return; }
     bool simple = true;
     const slang::ast::Symbol* root = xpRootOf(target, simple);
     // An element chosen at run time (mem[a] = d, mem[a] <= d). In an unknown
@@ -432,6 +438,26 @@ void xpFlush(int q, const XpShadow& sh, const std::vector<XpUnit>& units) {
 bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
              const std::function<void(size_t)>& body, const char* what, std::vector<size_t>* T = nullptr,
              const std::function<E(size_t)>& weight = nullptr, E total = nullptr) {
+    if (xp.clean) {   // the clean copy of an if: an unknown condition goes to the merging copy
+        size_t id = xp.siteNext++;
+        std::vector<size_t> toEnd;
+        for (size_t k = 0; k <= nCond; k++) {
+            size_t jn = (size_t)-1;
+            if (k < nCond) {
+                jn = emitJmpIfNot(cond(k).second);
+                if (id < xp.sites.size() && k < xp.sites[id].size()) prog.code[jn].xt = xp.sites[id][k];
+            }
+            body(k);
+            if (k < nCond) {
+                toEnd.push_back(xpJmp());
+                prog.code[jn].target = prog.here();
+            }
+        }
+        for (size_t j : toEnd) prog.code[j].target = prog.here();
+        return true;
+    }
+    size_t site = xp.sites.size();
+    xp.sites.emplace_back();
     struct Alt { E gx; bool three = false; size_t jpre = 0, N = 0, T = 0, bs = 0, be = 0, jmid = 0, next = 0; };
     std::vector<Alt> R(nCond + 1);
     std::string where = whereStr();
@@ -489,6 +515,7 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
             prog.code[R[k].jmid].target = Z;
         }
         if (jfull != (size_t)-1) prog.code[jfull].target = R[nCond].T;
+        xp.lastSite = site;
         return false;
     }
     std::vector<XpUnit> units = xpUnits(tg);
@@ -589,6 +616,9 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
         prog.code[jr].target = prog.here();
         xpJmp(Z);
     });
+    for (size_t k = 0; k < nCond; k++)
+        if (R[k].three) xp.sites[site].push_back(R[k].jpre);
+    xp.lastSite = site;
     return true;
 }
 
@@ -658,6 +688,7 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
         }
     Op cmp = wz ? Op::CaseZEq : wx ? Op::CaseXEq : Op::CaseEq;
     size_t n = c.items.size();
+    size_t entry = prog.here();
     std::vector<E> conds;   // the standard match of each item
     for (const auto& item : c.items) {
         E cond;
@@ -695,6 +726,25 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
             }
             for (size_t j : toEnd) prog.code[j].target = prog.here();
         });
+    if (xp.clean) {   // the clean copy: the standard matches; an unknown selector goes to the merging copy
+        size_t id = xp.siteNext++;
+        if (id < xp.sites.size() && !xp.sites[id].empty()) {
+            size_t jx = emitJmpIfNot(un(Op::RedXor, expr(c.expr)));   // 0 or 1: go on
+            prog.code[jx].target = prog.here();
+            prog.code[jx].xt = xp.sites[id][0];
+        }
+        std::vector<size_t> toEnd;
+        for (size_t k = 0; k < n; k++) {
+            size_t jn = emitJmpIfNot(conds[k]);
+            stmt(*c.items[k].stmt);
+            toEnd.push_back(xpJmp());
+            prog.code[jn].target = prog.here();
+        }
+        if (c.defaultCase) stmt(*c.defaultCase);
+        else if (needAll) violation(s, checkName(c.check) + " case: no case item matches", c.check);
+        for (size_t j : toEnd) prog.code[j].target = prog.here();
+        return true;
+    }
     // Selector fully known: the standard matches pick the item (out of line).
     size_t jfast = emitJmpIfNot(xpIsX(un(Op::RedXor, expr(c.expr))));
     xp.oolJmp.insert(jfast);
@@ -757,6 +807,7 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
             }
             return sum;
         }, total);
+    if (ok) xp.sites[xp.lastSite] = {entry};
     xp.ool.push_back([=, this] {
         if (!ok) { Instr j; j.k = IK::Jmp; j.line = prog.code[jfast].line; j.file = prog.code[jfast].file; prog.code[jfast] = j; }
         prog.code[jfast].target = prog.here();
@@ -816,6 +867,9 @@ void xpProc(const slang::ast::Statement& body) {
     xp.xm = xpTemp(1);
     size_t start = prog.here();
     size_t jinit = anyEager ? xpJmp() : (size_t)-1;
+    // The way to the clean copy (below), when there is one.
+    size_t lead = anyEager || g_cov ? (size_t)-1 : xpJmp(prog.here() + 1);
+    E ambLead;
     if (!ev.empty()) {
         std::unordered_set<int> level;   // event signals the body reads
         if (ev.size() > 1) {
@@ -829,6 +883,7 @@ void xpProc(const slang::ast::Statement& body) {
                     for (auto& e : ev) if (e.first == sg) level.insert(sg);
         }
         E amb = xpAmbiguousEdge(ev, level);
+        ambLead = amb;
         xpChain(1, [&](size_t) { return std::pair<E, E>{amb, nullptr}; },
                 [&](size_t k) { if (k == 0) stmt(*b); }, "edge");
     } else {
@@ -863,6 +918,39 @@ void xpProc(const slang::ast::Statement& body) {
             xpJmp(jinit + 1);
         }
         prog.code[over].target = prog.here();
+    }
+    // The clean copy. While every condition is known, the checks of the
+    // merge only cost time: after each branch, before each nonblocking
+    // assignment. So a block of plain assignments and branches is lowered a
+    // second time as it is without -xprop, except that an unknown condition
+    // jumps (Instr::xt) to the same condition in the merging copy above,
+    // which finishes the pass. The clean copy runs first; an ambiguous
+    // clock edge starts in the merging copy.
+    if (lead != (size_t)-1) {
+        bool plain = false;
+        for (auto& st : xp.sites) plain |= !st.empty();
+        for (size_t pc = start; pc < prog.here() && plain; pc++) {
+            IK k = prog.code[pc].k;
+            plain = k == IK::Assign || k == IK::Nba || k == IK::Jmp || k == IK::JmpIfNot;
+            if (k == IK::Assert) {   // the report of a unique / priority violation
+                int ty = asserts().at(prog.code[pc].sig).type;
+                plain = ty == AT_UNIQUE || ty == AT_UNIQUE0 || ty == AT_PRIORITY;
+            }
+        }
+        if (plain) {
+            size_t jend = xpJmp();
+            if (ambLead) {
+                Instr j; j.k = IK::JmpIfNot; j.e = ambLead;
+                j.line = prog.code[lead].line; j.file = prog.code[lead].file;
+                prog.code[lead] = j;
+            }
+            prog.code[lead].target = prog.here();
+            xp.clean = true;
+            xp.siteNext = ambLead ? 1 : 0;
+            stmt(*b);
+            xp.clean = false;
+            prog.code[jend].target = prog.here();
+        }
     }
     // Only this process uses its temporaries: their writes need no kernel.
     for (size_t pc = start; pc < prog.here(); pc++) {
