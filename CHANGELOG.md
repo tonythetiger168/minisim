@@ -127,6 +127,19 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `mchar`, cell library characterization on `mspice`: from a Liberty
+  template and one transistor `.subckt` per cell it measures delay and
+  transition tables (combinational, clock-to-output, set and reset arcs,
+  tristate enable), setup, hold, recovery and removal tables and minimum
+  pulse widths by bisection, internal energy,
+  pin capacitance and leakage, and writes Liberty with the shared writer.
+  The stimulus for each arc is found from the Liberty functions and `ff` /
+  `latch` groups. Every table point runs as its own task on all logical
+  CPUs (`-threads N`) with byte-identical output. `lib/mini45` gains
+  transistor netlists (`mini45.sp`) and device models per corner, and its
+  timing, power and capacitance tables are now measured, not analytic
+  (leakage and tristate disable arcs stay analytic). See
+  `docs/CHAR.md`.
 - `mlibc`, cell library checks and reports on the shared Liberty and LEF
   readers: `mlibc check` (23 rules: function against timing arcs and
   `timing_sense`, tables that shrink with load, missing setup or hold,
