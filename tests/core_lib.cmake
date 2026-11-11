@@ -25,12 +25,14 @@ foreach(want lib/cmake/minisimCore/minisimCoreConfig.cmake
   endif()
 endforeach()
 
+# The driver joins slang's include list with | so it survives as one argument.
+string(REPLACE "|" ";" SLANG_INCLUDE_DIRS "${SLANG_INCLUDE_DIRS}")
+
 execute_process(COMMAND ${CMAKE_COMMAND} -S ${SRC}/tests/core_consumer -B ${OUT}/build
                         -DCMAKE_BUILD_TYPE=Release
                         -DCMAKE_PREFIX_PATH=${prefix}
                         -DSLANG_LIBRARY=${SLANG_LIBRARY}
-                        -DSLANG_INCLUDE_DIRS=${SLANG_INCLUDE_DIRS}
-                        -DSLANG_LINK_LIBRARIES=${SLANG_LINK_LIBRARIES}
+                        "-DSLANG_INCLUDE_DIRS=${SLANG_INCLUDE_DIRS}"
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "configuring the consumer against the package failed: ${rc}\n${out}${err}")

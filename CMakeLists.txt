@@ -465,8 +465,12 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DBUILD=${CMAKE_BINARY_DIR} -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/core_lib
                    -DSLANG_LIBRARY=$<TARGET_FILE:slang::slang>
-                   "-DSLANG_INCLUDE_DIRS=$<TARGET_PROPERTY:slang::slang,INTERFACE_INCLUDE_DIRECTORIES>"
-                   "-DSLANG_LINK_LIBRARIES=$<TARGET_PROPERTY:slang::slang,INTERFACE_LINK_LIBRARIES>"
+                   # A list would be split into separate arguments on its
+                   # semicolons, so it is joined and split again in the script.
+                   # slang's own link interface is left out: it names targets
+                   # (Boost, fmt, tomlplusplus) that are header-only and exist
+                   # only in this build.
+                   "-DSLANG_INCLUDE_DIRS=$<JOIN:$<TARGET_PROPERTY:slang::slang,INTERFACE_INCLUDE_DIRECTORIES>,|>"
                    -P ${CMAKE_SOURCE_DIR}/tests/core_lib.cmake)
   set_tests_properties(core_lib PROPERTIES TIMEOUT 900)
 endif()

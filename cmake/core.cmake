@@ -51,6 +51,9 @@ set(MINISIM_CORE_HEADERS
 
 add_library(minisim_core INTERFACE)
 add_library(minisim::core ALIAS minisim_core)
+# The alias above is the build tree's name; EXPORT_NAME is what a consumer of
+# the installed package sees, and the two have to agree.
+set_target_properties(minisim_core PROPERTIES EXPORT_NAME core)
 target_compile_features(minisim_core INTERFACE cxx_std_20)
 target_include_directories(minisim_core INTERFACE
                            $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
