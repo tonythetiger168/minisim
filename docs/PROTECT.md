@@ -179,11 +179,97 @@ defines its own. minisim reads these from the tool block it opened:
 
 Other rights are ignored with a warning. A right may depend on a license:
 `right = license("feature") ? "a" : "b"` or `right = license_string("feature")`.
-IEEE 1735 clause 8 checks licenses through a license proxy server; minisim
-does not implement that protocol. Instead `-license <feature>[=<string>]`
-says a feature is licensed, which is enough to test licensed rights but is
-not a license check: anyone can pass the option. Without it a licensed right
-takes its unlicensed value.
+
+## Licenses
+
+A licensed right is decided by the IP author's license proxy, not by the tool
+or its user (IEEE 1735-2023 clause 8). The envelope's common block names the
+proxy, and msim, mlint and mdft ask it over TLS each time they decrypt.
+
+The IP author, once:
+
+```sh
+# The proxy's certificate and key. 8.7.1 asks for RSA of 3072 bits or more, or a 256-bit curve.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+    -subj /CN=acme-license-proxy -keyout proxy_key.pem -out proxy_cert.pem
+# The common block for the IP source: the environment variable's name and the certificate.
+mlicproxy -cert proxy_cert.pem -pragmas ACME_PROXY > common.svh
+```
+
+```systemverilog
+`pragma protect version=3
+`pragma protect begin_commonblock
+`pragma protect license_proxyenv = "ACME_PROXY"
+`pragma protect license_certificate
+MIIBfTCCASOgAwIBAgIU...
+`pragma protect end_commonblock
+`pragma protect begin_toolblock
+`pragma protect key_keyowner="Acme", key_keyname="acme-1"
+`pragma protect key_method="rsa_no_padding"
+`pragma protect control visibility = license("acme_debug") ? "full" : "none"
+`pragma protect end_toolblock
+`pragma protect begin
+module secret_core ...
+```
+
+Where the IP is used, the proxy runs with a license file and the variable
+points at it:
+
+```sh
+mlicproxy -cert proxy_cert.pem -key proxy_key.pem -port 27100 -licenses acme.lic
+export ACME_PROXY="27100@licserver;27100@backup"     # port@host pairs, tried in order
+msim -keyfile Acme:acme-1=acme.pem secret_core.svp tb.sv
+```
+
+```
+# acme.lic: one feature per line
+acme_debug                          # granted
+acme_tier = "gold"                  # granted; license_string("acme_tier") gives gold
+acme_eval expires 2027-06-30        # granted through that day (UTC)
+```
+
+How the tool side behaves, by subclause:
+
+- **8.3, 8.7.** `$ACME_PROXY` is read when the call is evaluated: `port@host`
+  pairs separated by `;`, the host a name, a fully qualified name, or an IPv4
+  or IPv6 address. The first pair that gives a secure connection is used. A
+  later pair is tried only when the connection fails, never because the
+  answer was "denied".
+- **8.3.2, 8.7.1.** The connection is secure when TLS is up and the proxy's
+  certificate is byte for byte the envelope's `license_certificate`. No
+  certificate authority, validity period or revocation list is consulted.
+  TLS 1.2 is the oldest version accepted and TLS 1.3 is supported; the cipher
+  suites use 256-bit keys with SHA-384; sessions are never resumed. One
+  connection per proxy is kept open for the run.
+- **8.8.** Messages are DER: `SEQUENCE { INTEGER 3, INTEGER request id, ... }`
+  with IA5String arguments. Request ids count up from 1 on each connection.
+  A reply's third field is the `license` value, the fourth (optional) the
+  `license_string` value, the fifth (optional) an explanatory message, which
+  the tool prints as `license proxy: ...`. Messages with request id 0 are
+  printed and not answered. The standard's examples write the sequence
+  identifier as `0x10`, and X.690 writes it as `0x30`: both are read, `0x10`
+  is written, and `MINISIM_LICENSE_SEQTAG=30` writes `0x30` for a proxy that
+  insists on it.
+- **8.7.1.** A reply that is not a well-formed message, or that carries a
+  request id the tool did not send, closes the connection; a new one is
+  negotiated and the request sent again, once per pair.
+- **8.7.2.** A proxy that does not answer within 10 seconds
+  (`MINISIM_LICENSE_TIMEOUT=<seconds>`) is given up on and the next pair tried.
+- **8.6.** The same call on the same proxy is asked once per run.
+- **8.9.** With no secure connection (no `license_proxyenv` or
+  `license_certificate`, the variable unset or malformed, no pair reachable,
+  the wrong certificate), the tool warns and goes on as if `license` returned
+  false and `license_string` returned `""`. `-license_fail stop` makes it an
+  error instead.
+
+`mlicproxy` answers existence checks only (8.5): nothing is counted or
+checked out, and the answer depends on the license file and the date. It
+re-reads the file when it changes. `-banner <text>` sends a request-id-0
+message to each tool that connects, `-log` prints each request, and
+`-bind <address>` limits where it listens.
+
+The earlier `-license <feature>` option is gone. It let the IP user grant a
+licensed right to themselves.
 
 ## Viewports
 
@@ -280,7 +366,7 @@ key, which minisim does not have and does not try to obtain.
 | 5.8 | Signature over the canonical envelope text, checked before decryption | ✅ |
 | 6.2.1 | Keys named by owner and name, duplicates refused | ✅ |
 | 7 | Rights in tool blocks, licensed rights syntax | ✅ (minisim rights above) |
-| 8 | License proxy protocol | ❌ (`-license` stands in for testing) |
+| 8 | License system: license specification, licensing calls, TLS connection to the proxy, DER messages, request id 0, return value reuse, irregularities; `mlicproxy` is a proxy | ✅ `license_proxy`, `test_protect` |
 | 9.2 | Error handling and model fidelity | ✅ msim, mlint, mdft |
 | 9.5–9.6 | viewport / interface_viewport | ✅ named and unnamed; named ones match by lexical name |
 | 9.7 | VPI / DPI visibility | ✅ see "VPI and DPI"; `tests/pli_protect.sh` |

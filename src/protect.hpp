@@ -764,9 +764,25 @@ struct Envelope {
     }
 };
 
+// The license specification of an envelope's common block (1735 8.3).
+struct LicenseSpec {
+    std::string env;       // license_proxyenv: the environment variable that holds port@host
+    std::string certDer;   // license_certificate, decoded: the proxy's X.509 certificate
+};
+// What a licensing call gives: license(...) uses `granted`, license_string(...) uses `str`.
+struct LicenseValue {
+    bool granted = false;
+    std::string str;
+};
+
 struct DecryptOptions {
-    // A license or license_string call in a right (1735 clause 8): nullopt
-    // when the feature is not licensed, else the license_string value.
+    // The license system (1735 clause 8): asks the envelope's license proxy
+    // for the value of a license / license_string call. Used whenever it is
+    // set; a tool that supports licensing sets it (licproxy.hpp).
+    std::function<LicenseValue(const LicenseSpec&, const std::string& arg)> proxy;
+    // Without `proxy`: a caller-supplied table. nullopt when the feature is
+    // not licensed, else the license_string value. For embedding and tests;
+    // no command-line option reaches it.
     std::function<std::optional<std::string>(const std::string&)> license;
     std::function<void(const std::string&)> warn;
 };
@@ -903,7 +919,7 @@ public:
     explicit ControlParser(std::string_view a) : s(a) {}
     // name -> value expression; calls `license` for license / license_string.
     std::vector<std::pair<std::string, std::string>> parse(
-        const std::function<std::optional<std::string>(const std::string&)>& license) {
+        const std::function<LicenseValue(const std::string&)>& license) {
         std::vector<std::pair<std::string, std::string>> out;
         for (;;) {
             ControlTok id = tok();
@@ -917,17 +933,22 @@ public:
                 val = v.s;
             } else if (v.k == ControlTok::Ident && (v.s == "license" || v.s == "license_string")) {
                 std::string feature = arg();
-                auto lic = license ? license(feature) : std::nullopt;
-                if (v.s == "license_string") {
-                    val = lic.value_or("");
-                } else {
+                bool isString = v.s == "license_string";
+                // The call's form is checked before the proxy is asked.
+                ControlTok t, f;
+                if (!isString) {
                     expect("?");
-                    ControlTok t = tok();
+                    t = tok();
                     if (t.k != ControlTok::Str) throw Error("expected a string after ?");
                     expect(":");
-                    ControlTok f = tok();
+                    f = tok();
                     if (f.k != ControlTok::Str) throw Error("expected a string after :");
-                    val = lic ? t.s : f.s;
+                }
+                LicenseValue lic = license ? license(feature) : LicenseValue{};
+                if (isString) {
+                    val = lic.str;
+                } else {
+                    val = lic.granted ? t.s : f.s;
                 }
             } else {
                 throw Error("a right's value is a string, license(...) ? ... : ..., or license_string(...)");
@@ -1042,6 +1063,7 @@ inline std::string envelope(std::string_view text, size_t lineStart, Scanner& sc
     std::vector<ToolBlock> tbs;
     ToolBlock* cur = nullptr;
     bool inCommon = false, sawVersion = false, done = false, proxy = false;
+    LicenseSpec spec;
     std::string dataMethod, sigB64;
     std::optional<std::string> data;
     size_t signedEnd = 0;
@@ -1123,13 +1145,14 @@ inline std::string envelope(std::string_view text, size_t lineStart, Scanner& sc
             }
             if (k == "license_proxyenv") {
                 if (!inCommon) throw Error(where(d->line) + "license_proxyenv outside the common block");
-                str();
+                spec.env = str();
                 proxy = true;
                 continue;
             }
             if (k == "license_certificate") {
                 if (!inCommon) throw Error(where(d->line) + "license_certificate outside the common block");
-                strictBase64(sc.block("base64", -1), "license_certificate");
+                spec.certDer = strictBase64(sc.block("base64", -1), "license_certificate");
+                proxy = true;
                 continue;
             }
             if (k == "data_block") {
@@ -1215,13 +1238,18 @@ inline std::string envelope(std::string_view text, size_t lineStart, Scanner& sc
     info.keyname = used->name;
     DecryptOptions o = opt;
     bool warned = false;
-    auto license = [&](const std::string& f) -> std::optional<std::string> {
-        if (o.license) return o.license(f);
+    auto license = [&](const std::string& f) -> LicenseValue {
+        if (o.proxy) return o.proxy(spec, f);
+        if (o.license) {
+            auto v = o.license(f);
+            return v ? LicenseValue{true, *v} : LicenseValue{};
+        }
+        // A tool without the license system treats the call as false / "" (8.9).
         if (proxy && !warned && o.warn) {
             o.warn(where(beginLine) + "the envelope names a license proxy; license checks are not run, so licensed rights take their unlicensed value");
             warned = true;
         }
-        return std::nullopt;
+        return LicenseValue{};
     };
     for (auto& c : used->controls) {
         try {

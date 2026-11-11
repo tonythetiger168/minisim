@@ -43,14 +43,19 @@ target_include_directories(test_liberty PRIVATE src)
 add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
 # Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
 # libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
-find_package(OpenSSL COMPONENTS Crypto)
+find_package(OpenSSL COMPONENTS Crypto SSL)
+find_package(Threads)
 if(OPENSSL_FOUND)
   add_executable(msimprotect src/msimprotect.cpp)
   target_include_directories(msimprotect PRIVATE src)
   target_link_libraries(msimprotect PRIVATE OpenSSL::Crypto)
   add_executable(test_protect tests/test_protect.cpp)
   target_include_directories(test_protect PRIVATE src)
-  target_link_libraries(test_protect PRIVATE OpenSSL::Crypto)
+  target_link_libraries(test_protect PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+  # The license proxy an IP author runs for licensed rights (IEEE 1735 clause 8).
+  add_executable(mlicproxy src/mlicproxy.cpp)
+  target_include_directories(mlicproxy PRIVATE src)
+  target_link_libraries(mlicproxy PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
   target_compile_options(test_protect PRIVATE -UNDEBUG)
   add_test(NAME test_protect COMMAND test_protect)
   # Interop: envelopes made by msimprotect open with the openssl command line
@@ -142,7 +147,7 @@ if(MINISIM_WITH_SLANG)
   endif()
   set_target_properties(msim PROPERTIES ENABLE_EXPORTS ON)
   if(OPENSSL_FOUND)
-    target_link_libraries(msim PRIVATE OpenSSL::Crypto)
+    target_link_libraries(msim PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(msim PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
   # -compile builds generated C++ against the kernel headers in src/.
@@ -157,7 +162,7 @@ if(MINISIM_WITH_SLANG)
   target_include_directories(mlint PRIVATE src)
   target_link_libraries(mlint PRIVATE slang::slang)
   if(OPENSSL_FOUND)
-    target_link_libraries(mlint PRIVATE OpenSSL::Crypto)
+    target_link_libraries(mlint PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(mlint PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
@@ -167,7 +172,7 @@ if(MINISIM_WITH_SLANG)
   find_package(Threads REQUIRED)
   target_link_libraries(mdft PRIVATE slang::slang Threads::Threads)
   if(OPENSSL_FOUND)
-    target_link_libraries(mdft PRIVATE OpenSSL::Crypto)
+    target_link_libraries(mdft PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
@@ -281,10 +286,19 @@ if(MINISIM_WITH_SLANG)
   if(OPENSSL_FOUND AND OPENSSL_CLI)
     add_test(NAME msim_protect
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DPROTECT=$<TARGET_FILE:msimprotect>
+                     -DLICPROXY=$<TARGET_FILE:mlicproxy>
                      -DMLINT=$<TARGET_FILE:mlint> -DMDFT=$<TARGET_FILE:mdft>
                      -DOPENSSL=${OPENSSL_CLI} -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_protect
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_protect.cmake)
+  endif()
+  # The IEEE 1735 clause 8 license system: msim asking mlicproxy over TLS.
+  if(OPENSSL_FOUND AND OPENSSL_CLI)
+    add_test(NAME license_proxy
+             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/license_proxy.sh $<TARGET_FILE:msim> $<TARGET_FILE:msimprotect>
+                     $<TARGET_FILE:mlicproxy> ${OPENSSL_CLI} ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_CURRENT_BINARY_DIR}/license_proxy)
+    set_tests_properties(license_proxy PROPERTIES TIMEOUT 120)
   endif()
   # The virtual prototype layer: the design reaching C models over AXI4-Lite.
   add_test(NAME msim_mvp
@@ -462,7 +476,7 @@ if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
-  install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msimprotect mlicproxy RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
