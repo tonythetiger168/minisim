@@ -83,6 +83,36 @@ emulate(sync1 sync)
 expect_report(sync1 sync "strobes" "1 emu_clk cycle per event")
 emulate(sync2 sync -fpgas 2 -lut 70 -pins 16)
 emulate(syncedge sync -edge)
+# Fewer wires than signals, but enough for the ones on the longest paths to
+# keep a wire each: fewer emu_clk cycles per event than sharing them all.
+emulate(own sync -fpgas 2 -lut 60 -pins 10)
+expect_report(own sync "of their own" "4 emu_clk cycles per event (7 before")
+emulate(own4 xreg -fpgas 4 -lut 160 -pins 6)
+expect_report(own4 xreg "of their own")
+
+# Another partitioner's answer is polished and competes with memu's own. This
+# one is as bad as they come (cell i in FPGA i mod 3), so memu's wins, and the
+# emulation is right either way.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+  file(WRITE ${OUT}/stub.py "import sys\nn = int(open(sys.argv[1]).readline().split()[1])\n"
+       "open(sys.argv[3], 'w').write(''.join('%d\\n' % (i % int(sys.argv[2])) for i in range(n)))\n")
+  emulate(stub xreg -fpgas 3 -lut 220 -pins 16 -partitioner "${Python3_EXECUTABLE} ${OUT}/stub.py")
+  expect_report(stub xreg "the -partitioner's cut cost")
+  foreach(f part.hgr part.hgr.fix part.hgr.caps part.hgr.board part.out)
+    if(NOT EXISTS ${OUT}/stub/${f})
+      message(FATAL_ERROR "-partitioner: ${f} was not written")
+    endif()
+  endforeach()
+  # Mt-KaHyPar itself, where its Python module is installed.
+  execute_process(COMMAND ${Python3_EXECUTABLE} -c "import mtkahypar" RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
+  if(rc EQUAL 0)
+    emulate(mtk xreg -fpgas 3 -lut 220 -pins 16
+            -partitioner "${Python3_EXECUTABLE} ${SRC}/tools/memu_mtkahypar.py")
+    message(STATUS "memu: Mt-KaHyPar partitions for it")
+  endif()
+endif()
+
 # Two unrelated clocks; a clockless-read memory too big for LUT RAM.
 emulate(twoclk1 twoclk -clock clka:10 -clock clkb:14:3)
 emulate(twoclk2 twoclk -fpgas 2 -lut 20 -clock clka:10 -clock clkb:30 -lutram-max 64)
@@ -129,6 +159,28 @@ if(YOSYS)
   synth("the slave transactor" memu_axil_slave_xtor ${xtor})
   synth("the master transactor" memu_axil_master_xtor ${xtor})
   message(STATUS "memu: Yosys synthesizes the output")
+endif()
+
+# The whole way to FPGA cells: mfpga maps each FPGA of a split design to
+# iCE40 LUTs and flops, and the board made of those still matches the netlist.
+if(MSIM AND MFPGA AND EXISTS ${MFPGA})
+  set(mapped)
+  foreach(f 0 1 2)
+    execute_process(COMMAND ${MFPGA} ${T}/cells.v ${T}/mems.v ${OUT}/clocks3/clocks_fpga${f}.v
+                            ${OUT}/clocks3/clocks_emu_lib.v -top clocks_fpga${f} -family ice40 -q
+                            -verilog ${OUT}/clocks3/mapped${f}.v
+                    WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT rc EQUAL 0)
+      message(FATAL_ERROR "mfpga on FPGA ${f} of clocks3 exited ${rc}\n${out}${err}")
+    endif()
+    list(APPEND mapped ${OUT}/clocks3/mapped${f}.v)
+  endforeach()
+  msim("clocks3 mapped by mfpga" ${SRC}/tests/fpga/cells_ice40.v ${T}/cells.v ${T}/mems.v ${T}/clocks.gv ${mapped}
+       ${OUT}/clocks3/clocks_emu.v ${OUT}/clocks3/clocks_emu_tb.sv -top clocks_emu_tb)
+  if(NOT out MATCHES "memu: PASS, 2000 events")
+    message(FATAL_ERROR "clocks3 mapped by mfpga differs from the netlist\n${out}")
+  endif()
+  message(STATUS "memu: mfpga maps the FPGAs and the result still matches")
 endif()
 
 if(NOT MSIM)

@@ -89,6 +89,7 @@ struct Cli {
               "  -diagnose FAILLOG      rank the faults that explain a tester fail log; needs the netlist,\n"
               "                         -patterns, and -lib / -top / -se as given to matpg\n"
               "  -patterns FILE         the patterns that were applied (matpg -patterns)\n"
+              "  -edt_patterns FILE     with -diagnose: compressed patterns instead; the log is '<pattern> ch <channel> <cycle>'\n"
               "  -diag_fault stuck|transition   the fault model and pattern set (default stuck)\n"
               "  -diag_defects N        diagnose up to N defects (default 4)\n"
               "  -diag_suspects N       list up to N suspects per defect (default 10)\n"
@@ -219,6 +220,7 @@ struct Cli {
                 if (diag && (lbistCov || lbist || bscan || edt || edtEncode)) throw Error("-diagnose is a separate run");
                 if (diag) {
                     dg.files = files, dg.libs = libs, dg.top = top, dg.se = se;
+                    dg.edtPatterns = eo.patterns;
                     dg.threads = threads, dg.quiet = quiet;
                     return runDiagnose(dg);
                 }

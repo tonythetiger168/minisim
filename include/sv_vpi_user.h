@@ -460,7 +460,7 @@ typedef struct t_vpi_attempt_info {
 typedef PLI_INT32(vpi_assertion_callback_func)(PLI_INT32 reason, p_vpi_time cb_time, vpiHandle assertion,
                                                p_vpi_attempt_info info, PLI_BYTE8 *user_data);
 
-XXTERN vpiHandle vpi_register_assertion_cb(vpiHandle assertion, PLI_INT32 reason, vpi_assertion_callback_func *cb_rtn,
+PLI_EXTERN PLI_DLLISPEC vpiHandle vpi_register_assertion_cb(vpiHandle assertion, PLI_INT32 reason, vpi_assertion_callback_func *cb_rtn,
                                            PLI_BYTE8 *user_data);
 
 #ifdef __cplusplus

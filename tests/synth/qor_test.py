@@ -104,6 +104,26 @@ r5 = subprocess.run([msynth, "-f", tcl], stdout=subprocess.PIPE, stderr=subproce
 m5 = re.search(r"Mapped design 'hold': \d+ cells, area ([0-9.]+)", r5.stdout)
 check("gathered the hold" not in r5.stdout, "hold.sv: msynth_hold_enables false did not switch the pass off")
 check(bool(m4 and m5) and float(m4.group(1)) < 0.95 * float(m5.group(1)), "hold.sv: the pass should save over 5% area")
+
+# A case with distinct constant labels has no priority among its items:
+# AND-OR logic, not a chain of selects (35.1 before, 27.9 now).
+pc = os.path.join(work, "pc.sv")
+open(pc, "w").write("""module pc (input logic [2:0] k, input logic [3:0] a, b, c, d, e, output logic [3:0] o);
+    always_comb
+        case (k)
+            3'd0: o = a;
+            3'd1: o = b;
+            3'd2: o = c;
+            3'd5: o = d;
+            default: o = e;
+        endcase
+endmodule
+""")
+r6 = subprocess.run([msynth, "-top", "pc", "-o", os.path.join(work, "pc_qor.v"), pc],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+m6 = re.search(r"Mapped design 'pc': \d+ cells, area ([0-9.]+)", r6.stdout)
+check(r6.returncode == 0 and bool(m6), "msynth failed on pc.sv")
+check(bool(m6) and float(m6.group(1)) < 31.0, "pc.sv: expected area under 31, got %s" % (m6.group(1) if m6 else "none"))
 if fails:
     print(out)
     print(cells)

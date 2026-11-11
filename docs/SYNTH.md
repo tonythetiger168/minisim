@@ -38,6 +38,12 @@ write_sdc core.sdc
    functions and tasks inlined, memories become flops and multiplexers.
    Adders are ripple-carry below 8 bits and parallel-prefix (Sklansky) from
    8 bits up; multipliers are carry-save arrays; dividers are restoring.
+   A `case` whose items cannot match together (`unique case`, a
+   `parallel_case` attribute, or distinct constant labels) is built
+   without priority: a variable that every item and the default assign is
+   the OR of each item's hit ANDed with its value. Where an item keeps the
+   earlier value the chain of selects stays, so the hold condition is
+   still found.
    Structural hashing shares equal logic as it is built, and nested
    selects with a shared arm (`if (a) if (b) x <= d;`) fold into one
    select with a combined condition. An `'x` in the source is a
@@ -190,8 +196,8 @@ same RTL and the same library (mini45, typical corner), one machine:
 
 | design | msynth area | Yosys area | msynth time | Yosys time |
 |---|---|---|---|---|
-| PicoRV32 (default parameters) | 17534 | 15458 | 0.8 s | 5.4 s |
-| PicoRV32, `compile -map_effort high` (ABC) | 17166 | 15458 | 1.2 s | 5.4 s |
+| PicoRV32 (default parameters) | 17377 | 15458 | 0.8 s | 5.4 s |
+| PicoRV32, `compile -map_effort high` (ABC) | 16997 | 15458 | 1.2 s | 5.4 s |
 | tests/synth/mem.sv (three small memories) | 2131 | 2297 | 0.03 s | 0.4 s |
 | tests/synth/counter.sv | 92 | 85 | 0.03 s | 0.2 s |
 
@@ -212,8 +218,9 @@ RTL is turned into logic, and half is ABC's optimization on Yosys's side.
 Running Yosys's RTL passes one at a time in front of msynth shows where
 the first half is: `opt_dff`, which finds each register's enable and
 synchronous reset in its select tree, is worth 6% on its own. Gathering
-hold conditions (above) took 3% of that (18096 to 17534); the rest of
-what the pass finds, and `share`/`wreduce` (under 1%), are still open.
+hold conditions (above) took 3% of that (18096 to 17534), and cases
+without priority another 1% (17377); the rest of what `opt_dff` finds,
+and `share`/`wreduce` (under 1%), are still open.
 
 ## Tests
 
