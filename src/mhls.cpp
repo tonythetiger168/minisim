@@ -24,6 +24,7 @@
 //   -unroll-max <n>   most iterations a loop may unroll to (default 4096)
 //   -mul <n>, -div <n>  at most n multipliers / dividers working in one cycle (default: no limit)
 //   -no-share         one multiplier/divider per operation, one register per value
+//   -handshake        also write <top>_hs: the same block behind ready/valid ports
 //   -max-reg-array <n>  local arrays up to n elements become registers, larger ones RAMs (default 64)
 //   -delay-scale <x>  scale the built-in operator delays (default 1.0, a generic 28 nm-class library)
 //   -tb <file>        write a self-checking testbench with expected values from the reference run
@@ -49,6 +50,7 @@ struct Cfg {
   double clock = 10.0, scale = 1.0;
   int mulLimit = 0, divLimit = 0;
   bool share = true;
+  bool handshake = false;   // also emit <top>_hs with ready/valid ports
 };
 
 // Threads come from the shared src/parallel.hpp. The wrapper only makes a
@@ -591,7 +593,7 @@ std::string svName(const std::string& n) {
       "rand", "randc", "constraint", "solve", "before", "inside", "dist", "with", "matches",
       "tagged", "foreach", "break", "continue", "iff", "chandle", "context", "clocking", "global",
       "let", "checker", "ap_clk", "ap_rst", "ap_start", "ap_done", "ap_idle", "ap_ce", "ap_vld_in",
-      "ap_vld_out", "state"};
+      "ap_vld_out", "state", "in_valid", "in_ready", "out_valid", "out_ready"};
   return kw.count(n) ? n + "_" : n;
 }
 
@@ -887,6 +889,7 @@ struct Emitter {
       o << "        end\n";
     }
     o << "        default: state <= " << st(0) << ";\n      endcase\n    end\n  end\nendmodule\n";
+    if (cfg.handshake) wrapper(p, false);
     return o.str();
   }
 
@@ -996,6 +999,35 @@ struct Emitter {
                 (K > 1 ? " " + P + "_ph <= '0;" : "") + " end");
   }
 
+  // The block behind ready/valid ports: a transfer happens in a cycle where
+  // valid and ready are both high. p holds the port declarations of the
+  // block, the five (FSM: clock, reset, start, done, idle; pipeline: clock,
+  // reset, enable, valid in, valid out) control ports first.
+  void wrapper(const std::vector<std::string>& p, bool pipeline) {
+    auto name = [](const std::string& d) { return d.substr(d.rfind(' ') + 1); };
+    o << "\n// " << f.name << " with ready/valid handshakes: inputs are taken when in_valid and\n"
+         "// in_ready are high, the result waits with out_valid high until out_ready.\n";
+    o << "module " << f.name << "_hs (\n  input  logic ap_clk,\n  input  logic ap_rst,\n  input  logic in_valid,\n"
+         "  output logic in_ready,\n  output logic out_valid,\n  input  logic out_ready";
+    for (size_t i = 5; i < p.size(); i++) o << ",\n  " << p[i];
+    o << "\n);\n";
+    std::string conn = ".ap_clk(ap_clk), .ap_rst(ap_rst)";
+    if (pipeline) {
+      // A result nobody takes stalls every stage behind it.
+      o << "  logic ap_ce;\n  assign ap_ce = !out_valid || out_ready;\n  assign in_ready = ap_ce;\n";
+      conn += ", .ap_ce(ap_ce), .ap_vld_in(in_valid), .ap_vld_out(out_valid)";
+    } else {
+      // The outputs hold after ap_done; the next call starts when the
+      // result has been taken.
+      o << "  logic ap_start, ap_done, ap_idle, hold;\n  assign out_valid = ap_done || hold;\n"
+           "  assign in_ready = ap_idle && !out_valid;\n  assign ap_start = in_valid && in_ready;\n"
+           "  always_ff @(posedge ap_clk) hold <= !ap_rst && out_valid && !out_ready;\n";
+      conn += ", .ap_start(ap_start), .ap_done(ap_done), .ap_idle(ap_idle)";
+    }
+    for (size_t i = 5; i < p.size(); i++) conn += ", ." + name(p[i]) + "(" + name(p[i]) + ")";
+    o << "  " << f.name << " core (" << conn << ");\nendmodule\n";
+  }
+
   // ---- pipeline ----
   std::string pipe(const Cfg& cfg) {
     const Block& B = f.blocks[0];
@@ -1072,6 +1104,7 @@ struct Emitter {
       o << "    end\n  end\n";
     }
     o << "endmodule\n";
+    if (cfg.handshake) wrapper(p, true);
     return o.str();
   }
 };
@@ -1187,7 +1220,11 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
     << " calls with expected values from the C reference run.\n`timescale 1ns/1ps\nmodule " << f.name << "_tb;\n";
   o << "  logic ap_clk = 0, ap_rst = 1;\n  integer tb_errors = 0, tb_lat = 0, tb_latmin = 1 << 30, tb_latmax = 0, tb_n = 0;\n";
   std::string conn = ".ap_clk(ap_clk), .ap_rst(ap_rst)";
-  if (f.pipeline) {
+  const bool hs = cfg.handshake;
+  if (hs) {
+    o << "  logic in_valid = 0, out_ready = " << (f.pipeline ? 1 : 0) << ";\n  wire in_ready, out_valid;\n";
+    conn += ", .in_valid(in_valid), .in_ready(in_ready), .out_valid(out_valid), .out_ready(out_ready)";
+  } else if (f.pipeline) {
     o << "  logic ap_ce = 1, ap_vld_in = 0;\n  wire ap_vld_out;\n";
     conn += ", .ap_ce(ap_ce), .ap_vld_in(ap_vld_in), .ap_vld_out(ap_vld_out)";
   } else {
@@ -1230,7 +1267,7 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
     o << "  wire " << rng(f.vars[f.retVar].ty.w) << "ap_return;\n";
     conn += ", .ap_return(ap_return)";
   }
-  o << "  " << f.name << " dut (" << conn << ");\n  always #" << half << " ap_clk = ~ap_clk;\n";
+  o << "  " << f.name << (hs ? "_hs" : "") << " dut (" << conn << ");\n  always #" << half << " ap_clk = ~ap_clk;\n";
   auto setIn = [&](const Vec& vec) {
     std::string s;
     for (auto& [v, x] : vec.in) s += em.inPort(f.vars[v]) + " = " + hexLit(x, f.vars[v].ty.w) + "; ";
@@ -1244,10 +1281,21 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
     long limit = 0;
     for (auto& vec : V.v) limit = std::max(limit, vec.lat);
     limit = limit * 2 + 100;
-    o << "  task call;\n    begin\n      @(negedge ap_clk); ap_start = 1;\n      @(negedge ap_clk); ap_start = 0; tb_lat = 1;\n"
-         "      while (!ap_done) begin\n        @(negedge ap_clk); tb_lat = tb_lat + 1;\n        if (tb_lat > " << limit
+    // With handshakes: the result is left waiting for a few cycles, which
+    // must not change it, and is then taken.
+    o << "  task call;\n    begin\n"
+      << (hs ? "      @(negedge ap_clk); in_valid = 1;\n      while (!in_ready) @(negedge ap_clk);\n"
+               "      @(negedge ap_clk); in_valid = 0; tb_lat = 1;\n      while (!out_valid) begin\n"
+             : "      @(negedge ap_clk); ap_start = 1;\n      @(negedge ap_clk); ap_start = 0; tb_lat = 1;\n"
+               "      while (!ap_done) begin\n")
+      << "        @(negedge ap_clk); tb_lat = tb_lat + 1;\n        if (tb_lat > " << limit
       << ") begin $display(\"FAIL: no ap_done after %0d cycles\", tb_lat); $finish; end\n      end\n"
-         "      if (tb_lat < tb_latmin) tb_latmin = tb_lat;\n      if (tb_lat > tb_latmax) tb_latmax = tb_lat;\n    end\n  endtask\n";
+         "      if (tb_lat < tb_latmin) tb_latmin = tb_lat;\n      if (tb_lat > tb_latmax) tb_latmax = tb_lat;\n"
+      << (hs ? "      repeat (tb_n % 3) @(negedge ap_clk);\n      if (!out_valid || in_ready) begin $display(\"FAIL: the "
+               "result did not wait for out_ready\"); tb_errors = tb_errors + 1; end\n      out_ready = 1;\n"
+               "      @(negedge ap_clk); out_ready = 0; tb_n = tb_n + 1;\n"
+             : "")
+      << "    end\n  endtask\n";
     o << "  initial begin\n";
     for (auto& [ai, init] : V.memInit) {
       const Arr& a = f.arrs[ai];
@@ -1277,6 +1325,17 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
   } else {
     int L = f.blocks[0].len;
     o << "  integer tb_cyc = 0, tb_first_in = -1, tb_first_out = -1;\n  always @(posedge ap_clk) tb_cyc <= tb_cyc + 1;\n";
+    if (hs) {
+      // The sink refuses now and then; the source waits for each transfer.
+      o << "  logic tb_acc = 0;\n  always @(posedge ap_clk) tb_acc <= in_valid && in_ready;\n"
+           "  always @(negedge ap_clk) out_ready = (tb_cyc % 7 != 3) && (tb_cyc % 11 < 8);\n";
+      o << "  initial begin\n    repeat (3) @(negedge ap_clk);\n    ap_rst = 0;\n    @(negedge ap_clk);\n";
+      for (size_t i = 0; i < V.v.size(); i++) {
+        o << "    in_valid = 1; " << setIn(V.v[i]) << "\n    @(negedge ap_clk); while (!tb_acc) @(negedge ap_clk);\n";
+        if (i % 5 == 3) o << "    in_valid = 0; @(negedge ap_clk);\n";
+      }
+      o << "    in_valid = 0;\n    repeat (" << 3 * L + 40 << ") @(negedge ap_clk);\n";
+    } else {
     o << "  initial begin\n    repeat (3) @(negedge ap_clk);\n    ap_rst = 0;\n";
     for (size_t i = 0; i < V.v.size(); i++) {
       // A bubble every few inputs, and one stalled cycle, to exercise valid and ap_ce.
@@ -1285,13 +1344,15 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
       o << "    @(negedge ap_clk); ap_vld_in = 1; " << setIn(V.v[i]) << (i == 0 ? "tb_first_in = tb_cyc;" : "") << "\n";
     }
     o << "    @(negedge ap_clk); ap_vld_in = 0;\n    repeat (" << L + 4 << ") @(negedge ap_clk);\n";
+    }
     o << "    if (tb_n != " << V.v.size() << ") begin $display(\"FAIL: %0d results, expected " << V.v.size()
       << "\", tb_n); tb_errors = tb_errors + 1; end\n";
-    o << "    if (tb_first_out - tb_first_in != " << L << ") begin $display(\"FAIL: latency %0d, expected " << L
+    if (!hs)
+      o << "    if (tb_first_out - tb_first_in != " << L << ") begin $display(\"FAIL: latency %0d, expected " << L
       << "\", tb_first_out - tb_first_in); tb_errors = tb_errors + 1; end\n";
     o << "    if (tb_errors == 0) $display(\"PASS: " << f.name << " " << V.v.size() << " inputs, pipeline latency "
       << L << " cycles\");\n    else $display(\"FAIL: " << f.name << " %0d errors\", tb_errors);\n    $finish;\n  end\n";
-    o << "  always @(posedge ap_clk) if (!ap_rst && ap_ce && ap_vld_out) begin\n    if (tb_first_out < 0) tb_first_out = tb_cyc;\n    case (tb_n)\n";
+    o << "  always @(posedge ap_clk) if (!ap_rst && " << (hs ? "out_valid && out_ready" : "ap_ce && ap_vld_out") << ") begin\n    if (tb_first_out < 0) tb_first_out = tb_cyc;\n    case (tb_n)\n";
     for (size_t i = 0; i < V.v.size(); i++) {
       o << "      " << i << ": begin\n";
       for (auto& [v, x] : V.v[i].out) o << "        " << check(em.outPort(f.vars[v]), x, f.vars[v].ty.w, i) << "\n";
@@ -1577,7 +1638,7 @@ void summarize(Job& j, const Cfg& cfg) {
 
 int usage() {
   std::cerr << "usage: mhls <file.c>... [-top <f>[,<g>]] [-o <out.sv|dir>] [-clock <ns>] [-pipeline]\n"
-               "            [-unroll-all] [-unroll-max <n>] [-pipeline-loops] [-mul <n>] [-div <n>] [-no-share]\n"
+               "            [-unroll-all] [-unroll-max <n>] [-pipeline-loops] [-mul <n>] [-div <n>] [-no-share] [-handshake]\n"
                "            [-max-reg-array <n>] [-delay-scale <x>] [-tb <file>] [-cref <file>]\n"
                "            [-vectors <n>] [-seed <n>] [-explore <ns,...>] [-report <file>]\n"
                "            [-D<name>[=<v>]] [-threads <n>|all] [-q]\n";
@@ -1621,6 +1682,7 @@ int main(int argc, char** argv) {
       else if (a == "-mul") cfg.mulLimit = std::stoi(val());
       else if (a == "-div") cfg.divLimit = std::stoi(val());
       else if (a == "-no-share") cfg.share = false;
+      else if (a == "-handshake") cfg.handshake = true;
       else if (a == "-max-reg-array") opt.maxRegArray = std::stoi(val());
       else if (a == "-delay-scale") cfg.scale = std::stod(val());
       else if (a == "-tb") tb = val();

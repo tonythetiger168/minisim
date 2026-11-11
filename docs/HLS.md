@@ -132,6 +132,15 @@ stage. A pipeline needs a function that is straight-line after unrolling
 (no memories, no data-dependent loops), and a `static` must be read and
 updated in the same stage; `mhls` says which rule fails and why.
 
+`-handshake` adds a second module `<top>_hs` around the block with
+`in_valid`/`in_ready` for the scalar inputs and `out_valid`/`out_ready` for
+the results, in place of the `ap_` control ports. A transfer happens in a
+cycle where valid and ready are both high. Around an FSM the result waits
+with `out_valid` high until it is taken, and the next call is accepted
+after that; around a pipeline a result that is not taken stalls every
+stage, and `in_ready` goes low. Memory ports pass through unchanged. `-tb`
+then drives the wrapper, with a sink that refuses now and then.
+
 ## Checking the result
 
 `-tb` writes a testbench with random calls and the expected outputs, array
@@ -157,6 +166,7 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 | `-pipeline-loops` | pipeline every loop that allows it (see Pipelined loops) |
 | `-mul <n>`, `-div <n>` | multipliers / dividers working in one cycle |
 | `-no-share` | no register or unit sharing |
+| `-handshake` | also write `<top>_hs`, the block behind ready/valid ports |
 | `-max-reg-array <n>` | largest local array kept in registers (default 64) |
 | `-delay-scale <x>` | scale the built-in operator delays |
 | `-tb <file>`, `-cref <file>`, `-vectors <n>`, `-seed <n>` | verification collateral |
@@ -172,6 +182,6 @@ need multicycle constraints.
 
 ## Not yet
 
-Dual-port memories, AXI-Stream/handshake interfaces,
+Dual-port memories, array arguments as streams,
 unions, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

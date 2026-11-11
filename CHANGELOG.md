@@ -163,6 +163,9 @@ Spec references are IEEE 1800-2023 clauses.
   also works first in a `do` body.
 - `mhls`: a variable that only feeds itself (a counter or checksum nothing
   reads) is removed with its register and operators.
+- `mhls -handshake`: also writes `<top>_hs`, the block behind
+  `in_valid`/`in_ready` and `out_valid`/`out_ready` ports (FSM and pipeline);
+  the generated testbench drives it with a sink that refuses now and then.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).

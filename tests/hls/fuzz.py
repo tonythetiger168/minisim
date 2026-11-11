@@ -308,6 +308,8 @@ class Gen:
                 o += ["-pipeline-loops"]
             if self.loopy:
                 o[1] = r.choice(["1.5", "3", "5", "10"])
+        if r.random() < 0.15:
+            o += ["-handshake"]
         return o
 
 

@@ -78,6 +78,9 @@ design(looppipe2 hist)                           # one iteration every 2 cycles:
 design(looppipe2 walk)                           # pointer chase
 design(looppipe2 copyz -clock 2.5)               # the loop ends on a value read from memory
 design(faint faint)                              # variables that only feed themselves are removed
+design(mac mac -handshake)                       # ready/valid ports around the FSM: the result waits for out_ready
+design(fir fir -handshake -pipeline -clock 2.5)  # around the pipeline: a refused result stalls every stage
+design(looppipe2 hist -handshake)                # with memories
 design(fir fir -pipeline-loops -clock 3)         # best effort: loops that cannot be pipelined stay as they are
 design(matmul matmul -pipeline-loops -clock 3)
 design(sqrt hist -pipeline-loops)
