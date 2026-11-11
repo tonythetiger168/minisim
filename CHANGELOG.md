@@ -156,6 +156,24 @@ Spec references are IEEE 1800-2023 clauses.
   `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
   calls with the host C++ compiler, `-explore` sweeps the clock period.
   See `docs/HLS.md`.
+- `mhls`: structs. Nested structs, arrays of structs, array members and
+  bit-fields; structs copied, passed by value, pointer or reference, and
+  returned. Each member becomes its own register, memory or port.
+- `mhls`: pipelined loops. `#pragma hls pipeline` first in a loop body, or
+  `-pipeline-loops` for every loop that allows it, starts a new iteration
+  every cycle: `n` iterations of an `L`-stage body take `n + L - 1` cycles
+  instead of `n * L`. A loop that cannot be pipelined is refused with the
+  rule it breaks.
+- `mhls`: pipelined loops at slower rates. A loop that cannot start an
+  iteration every cycle (a memory updated in place, a pointer chase, an exit
+  that depends on memory data) is pipelined at one iteration every 2 or more
+  cycles when that beats running it unpipelined; `#pragma hls pipeline` now
+  also works first in a `do` body.
+- `mhls`: a variable that only feeds itself (a counter or checksum nothing
+  reads) is removed with its register and operators.
+- `mhls -handshake`: also writes `<top>_hs`, the block behind
+  `in_valid`/`in_ready` and `out_valid`/`out_ready` ports (FSM and pipeline);
+  the generated testbench drives it with a sink that refuses now and then.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).

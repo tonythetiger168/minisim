@@ -77,6 +77,14 @@ struct Block {
   Term term;
   int len = 1, base = 0;                     // schedule: states, first global state
   std::vector<int> wst;                      // state of each write
+  // A loop body to pipeline: the source line of the loop (0: not asked),
+  // whether a pragma asked (then failing is an error), and once scheduled
+  // the number of stages. A pipelined loop is one FSM state: a new
+  // iteration enters stage 0 every cycle.
+  int pipeLine = 0;
+  bool pipeMust = false;
+  int pipeL = 0;
+  int pipeII = 1;                            // cycles between two iterations entering
 };
 
 struct Param {
@@ -149,6 +157,7 @@ inline uint64_t evalOp(OpK k, int w, int wa, uint64_t a, uint64_t b, uint64_t c)
 
 struct Options {
   bool unrollAll = false;
+  bool pipelineLoops = false;   // pipeline every loop that allows it
   int unrollMax = 4096;      // most iterations a loop may unroll to
   int maxRegArray = 64;      // local arrays up to this many elements become registers
   bool pipeline = false;
@@ -854,6 +863,7 @@ class Lowerer {
         return {read(lv, e->line), lv.ty};
       }
       case Expr::Cast: return conv(rv(e->a), e->ty);
+      case Expr::Agg: fail(P.file, e->line, "a struct cannot be used as a value here");
       case Expr::Un: {
         if (e->op == "*") {
           LV lv = lvalue(e->a);
@@ -1136,11 +1146,27 @@ class Lowerer {
     return mayFail(s->init) || mayFail(s->body) || mayFail(s->els);
   }
 
+  // Leaving a scope: what was declared in it is dead, so its pending values
+  // need no register and no multiplexer at the next join.
+  void popScope() {
+    for (auto& [name, sym] : S.scopes.back()) {
+      if (sym.k == Sym::Scalar) {
+        const Var& v = S.fn.vars[sym.id];
+        if (!v.isStatic && v.port == Var::None) S.env.erase(sym.id);
+      } else if (sym.k == Sym::Array) {
+        const Arr& a = S.fn.arrs[sym.id];
+        if (a.mode == Arr::Reg && !a.isStatic && !a.isParam)
+          for (int e : a.elems) S.env.erase(e);
+      }
+    }
+    S.scopes.pop_back();
+  }
+
   void scoped(const Stmt* s) {
     if (!s) return;
     S.scopes.emplace_back();
     lowerStmt(s);
-    S.scopes.pop_back();
+    popScope();
   }
 
   // Inside a loop of the function being lowered (a switch is not a loop).
@@ -1210,7 +1236,7 @@ class Lowerer {
     auto body = [&](size_t i) {
       S.scopes.emplace_back();
       lowerSeq(caseBody(s, i), 0);
-      S.scopes.pop_back();
+      popScope();
     };
     std::function<void(size_t)> chain = [&](size_t n) {
       if (n == order.size()) {
@@ -1254,7 +1280,7 @@ class Lowerer {
           if (s->inc) rv(s->inc);
         }
         S.loops.pop_back();
-        S.scopes.pop_back();
+        popScope();
         return;
       } catch (NoConv&) {
         S = std::move(snap);
@@ -1273,6 +1299,10 @@ class Lowerer {
       branch(c, body, exit);
     }
     start(body);
+    if (s->pipeline || opt.pipelineLoops) {
+      S.fn.blocks[body].pipeLine = s->line;
+      S.fn.blocks[body].pipeMust = s->pipeline;
+    }
     LoopCtx lc;
     lc.brk = exit;
     S.loops.push_back(lc);
@@ -1287,7 +1317,7 @@ class Lowerer {
     int c = s->cond ? toBool(rv(s->cond)) : konst(1, 1);
     branch(c, body, exit);
     start(exit);
-    S.scopes.pop_back();
+    popScope();
   }
 
   // A statement list. After a statement that may have returned under a
@@ -1334,7 +1364,7 @@ class Lowerer {
       case Stmt::Blk:
         S.scopes.emplace_back();
         lowerSeq(s->kids, 0);
-        S.scopes.pop_back();
+        popScope();
         break;
       case Stmt::If: lowerIf(s); break;
       case Stmt::Switch: lowerSwitch(s); break;
@@ -1454,6 +1484,46 @@ inline std::vector<bool> deadCode(Function& f) {
   std::vector<bool> exitLive(nv, false);
   for (size_t v = 0; v < nv; v++)
     exitLive[v] = f.vars[v].isStatic || f.vars[v].port == Var::Ref || f.vars[v].port == Var::Ret;
+  // A variable matters when it reaches an output, a memory write or a
+  // branch, directly or through other variables that matter. One that only
+  // feeds itself (a counter nobody looks at) goes, with its register.
+  {
+    std::vector<bool> need = exitLive;
+    std::vector<int> stack;
+    std::vector<int> seen(f.ops.size(), -1);
+    int epoch = 0;
+    auto cone = [&](int root, bool& grew) {   // the variables read to compute root
+      if (root < 0) return;
+      epoch++;
+      stack.assign(1, root);
+      while (!stack.empty()) {
+        int x = stack.back();
+        stack.pop_back();
+        if (seen[x] == epoch) continue;
+        seen[x] = epoch;
+        const Op& o = f.ops[x];
+        if (o.k == OpK::ReadVar && !need[o.ref]) {
+          need[o.ref] = true;
+          grew = true;
+        }
+        for (int y : {o.a, o.b, o.c})
+          if (y >= 0) stack.push_back(y);
+      }
+    };
+    for (bool grew = true; grew;) {
+      grew = false;
+      for (auto& B : f.blocks) {
+        cone(B.term.cond, grew);
+        for (int id : B.ops)
+          if (f.ops[id].k == OpK::Store) cone(id, grew);
+        for (auto& [v, val] : B.writes)
+          if (need[v]) cone(val, grew);
+      }
+    }
+    for (auto& B : f.blocks)
+      B.writes.erase(std::remove_if(B.writes.begin(), B.writes.end(), [&](auto& w) { return !need[w.first]; }),
+                     B.writes.end());
+  }
   std::vector<std::vector<bool>> in(nb, std::vector<bool>(nv, false));
   for (;;) {
     // Mark operators reachable from the roots of each block.
@@ -1663,7 +1733,7 @@ inline long interpret(const Function& f, Machine& m, long maxSteps = 50'000'000)
   long states = 0, steps = 0;
   for (;;) {
     const Block& B = f.blocks[b];
-    states += B.len;
+    states += B.pipeL ? B.pipeII : B.len;
     for (int id : B.ops) {
       const Op& o = f.ops[id];
       switch (o.k) {
@@ -1700,8 +1770,10 @@ inline long interpret(const Function& f, Machine& m, long maxSteps = 50'000'000)
     for (auto& [v, x] : B.writes) wr.push_back({v, maskW(val[x], f.vars[v].ty.w)});
     for (auto& [v, x] : wr) m.vars[v] = x;
     if (B.term.k == Term::Ret) return states;
+    int from = b;
     if (B.term.k == Term::Jump) b = B.term.t;
     else b = (val[B.term.cond] & 1) ? B.term.t : B.term.f;
+    if (B.pipeL > 1 && b != from) states += B.pipeL - B.pipeII;   // the last iterations drain
     if (++steps > maxSteps) throw Error("mhls: the reference run of '" + f.name + "' does not terminate");
   }
 }
