@@ -522,6 +522,8 @@ public:
         if (cov) {
             o << "    g_condHits.assign(" << g_condHits.size() << ", 0);\n    S.fsmWatch({";
             for (size_t k = 0; k < fsmDefs().size(); k++) o << (k ? ", " : "") << fsmDefs()[k].sig;
+            o << "}, {";
+            for (size_t k = 0; k < fsmDefs().size(); k++) o << (k ? ", " : "") << (fsmDefs()[k].onehot ? 1 : 0);
             o << "});\n";
         }
         o << "    S.run(maxTime);\n"
@@ -565,6 +567,12 @@ public:
     }
     std::string jumpTo(const Prog* p, size_t pc, const std::string& label) {
         return cov ? "{" + CT(p, pc) + " goto " + label + "; }" : "goto " + label + ";";
+    }
+    // JmpIfNot on the Val expression `val`: `no` is the statement that jumps
+    // when it is not true, `unk` the one for an unknown value (Instr::xt).
+    static std::string jmpIfNot(const Instr& i, const std::string& val, const std::string& no, const std::string& unk) {
+        if (i.xt == Instr::NOX) return " if (truth(" + val + ") != 1) " + no + "\n";
+        return " switch (truth(" + val + ")) { case 1: break; case 2: " + unk + " default: " + no + " }\n";
     }
 
 private:
@@ -749,6 +757,11 @@ private:
             case Op::LogAnd: return f2("v_land");
             case Op::LogOr: return f2("v_lor");
             case Op::CondCov: {   // condition coverage: every term, then the counters (expr.hpp)
+                if (e->lo & 2) {   // lazy: each term a callable, run in order
+                    std::string r = "condCovLazy(" + std::to_string(e->hi) + ", " + (e->lo & 1 ? "true" : "false");
+                    for (size_t i = 0; i < e->kids.size(); i++) r += ", [&]() -> Val { return " + ex(e->kids[i]) + "; }";
+                    return r + ")";
+                }
                 std::string r = "condCovVal(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
                 for (size_t i = 0; i < e->kids.size(); i++) r += (i ? ", " : "") + ex(e->kids[i]);
                 return r + "})";
@@ -888,6 +901,7 @@ private:
                 fi = {1, false};
                 return true;
             case Op::CondCov: {
+                if (e->lo & 2) return false;   // lazy: the Val path
                 std::string r = "condCovFast(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
                 for (size_t i = 0; i < e->kids.size(); i++) {
                     std::string P;
@@ -985,6 +999,10 @@ private:
     std::string assign(const Instr& i, std::string val = "") {
         if (val.empty()) val = fast(i.e);
         std::ostringstream o;
+        if (i.tmp) {   // a temporary of the process: nothing watches it
+            o << " S.poke(" << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
+            return o.str();
+        }
         if (isPriv(i.sig)) {   // a testbench write to a private reg: the comb logic may read it
             if (i.drv >= 0 || i.hi >= 0) { privHits_.insert(i.sig); return " ;\n"; }
             o << " " << pw(i.sig, val) << " pclean = false; S.markFast();\n";
@@ -1048,6 +1066,8 @@ private:
             const auto& code = procs[i].prog->code;
             for (size_t pc = 1; pc + 1 < code.size(); pc++) {
                 if ((code[pc].k == IK::Jmp || code[pc].k == IK::JmpIfNot) && code[pc].target <= pc) forward = false;
+                if (code[pc].k == IK::JmpIfNot && code[pc].xt != Instr::NOX) forward = false;   // a three-way jump: an ordinary clocked function
+                if (code[pc].k == IK::Assign) forward = false;
                 if (code[pc].arr || code[pc].bidx) forward = false;   // no fixed slot: an ordinary clocked function
             }
             if (!forward) continue;
@@ -1293,6 +1313,7 @@ private:
                         break;
                     }
                     case IK::JmpIfNot: {
+                        if (i.xt != Instr::NOX) throw CodegenUnsupported("three-way jump in the cycle domain");
                         std::string g, u, sl;
                         if (split(i.e, g, u, sl)) {
                             fns2 << " if (!(" << u << ")) goto " << L(i.target) << ";\n";
@@ -1399,11 +1420,11 @@ private:
                     if (in.k == IK::JmpIfNot) {
                         noteRefs(in.e);
                         unitConds.back().push_back(in.e);
-                        c4 += L4(pc) + ": if (truth(" + fast(in.e) + ") != 1) goto " + L4(in.target) + ";\n";
+                        c4 += L4(pc) + ":" + jmpIfNot(in, fast(in.e), "goto " + L4(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L4(in.xt) + ";");
                         std::string g, u, sl;
                         // Every signal read is known here (twoNow, and no bail so far).
                         if (split(in.e, g, u, sl)) c2 += L2(pc) + ": if (!(" + u + ")) goto " + L2(in.target) + ";\n";
-                        else c2 += L2(pc) + ": if (truth(" + sl + ") != 1) goto " + L2(in.target) + ";\n";
+                        else c2 += L2(pc) + ":" + jmpIfNot(in, sl, "goto " + L2(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L2(in.xt) + ";");
                         continue;
                     }
                     if (in.k == IK::Jmp) {
@@ -1651,8 +1672,11 @@ private:
                     if (i.arr || i.bidx) o << dynTarget(i, fast(i.e), " nb.push_back({s, v, hi, lo});");
                     else o << " nb.push_back({" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
                     break;
-                case IK::JmpIfNot: o << " if (truth(" << fast(i.e) << ") != 1) " << jumpTo(&p, pc, L(i.target)) << "\n"; break;
+                case IK::JmpIfNot: o << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, L(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, L(i.xt))); break;
                 case IK::Jmp: o << " goto " << L(i.target) << ";\n"; break;
+                case IK::Assign:   // a temporary of its own (Instr::tmp)
+                    o << " S.poke(" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
+                    break;
                 default: throw CodegenUnsupported("instruction in a clocked process");
             }
         }
@@ -1671,7 +1695,7 @@ private:
         for (; pc < p.code.size(); pc++) {
             const Instr& i = p.code[pc];
             if (i.k == IK::JmpIfNot) {
-                o << L(pc) << ":" << CH(&p, pc) << " if (truth(" << fast(i.e) << ") != 1) " << jumpTo(&p, pc, L(i.target)) << "\n";
+                o << L(pc) << ":" << CH(&p, pc) << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, L(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, L(i.xt)));
                 continue;
             }
             if (i.k == IK::Jmp) { o << L(pc) << ":" << CH(&p, pc) << " goto " << L(i.target) << ";\n"; continue; }
@@ -1773,7 +1797,7 @@ private:
                         o << " S.nba(" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
                         break;
                     case IK::JmpIfNot:
-                        o << " if (truth(" << fast(i.e) << ") != 1) " << jumpTo(&p, pc, tgt(i.target)) << "\n";
+                        o << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, tgt(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, tgt(i.xt)));
                         break;
                     case IK::Jmp: o << " goto " << tgt(i.target) << ";\n"; break;
                     case IK::WaitEdge:

@@ -49,8 +49,12 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
 | `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
+| `src/mpnr.cpp`, `src/pnr_*.hpp` | `mpnr` place and route: netlist database, placement, detailed router, DEF out, layout check ([docs/PNR.md](docs/PNR.md)) |
 | `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
 | `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
+| `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
+| `src/oasis.hpp` | OASIS reader into the same library; `oasis::readLayout` takes GDSII or OASIS |
+| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/lvs.hpp`, `src/lvs_block.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck, design rule checks and LVS |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -213,9 +217,11 @@ one where no term decides alone (all 1 for `&&`, all 0 for `||`) and, for each
 term, the one where only that term has the deciding value. A vector with an
 x term counts for none. Conditions in procedures, continuous assignments,
 functions and tasks are covered; not those in constraints, assertions and
-covergroups, constant ones, or ones whose terms call a function or read
-through a class handle or a container (every term is evaluated to tell the
-vectors apart, so a term must be safe to evaluate).
+covergroups, or constant ones. To tell the vectors apart every term is
+evaluated, so a condition with a term that `&&` or `||` must be able to skip
+(it calls a function, or reads through a class handle or a container) is
+counted as it runs instead: vector i is "term i is the first that decides",
+and the report shows the terms after it as `-`.
 
 **FSM coverage** (as VCS `-cm fsm`). msim finds the state registers itself: a
 variable that one clocked procedure assigns, whose next value is always a
@@ -227,9 +233,11 @@ ones the next-state logic can make. A constant assigned under an `if` outside
 any branch on the state is taken as the reset, and transitions that only the
 reset makes are marked `(reset)`; `mcov report -fsm-reset-filter` leaves them
 out (VCS `-cm_fsmresetfilter`). A change the logic does not show (a forced
-value, say) is listed as "not in the next-state logic". Not extracted: one-hot
-registers tested bit by bit, states computed by arithmetic, registers written
-through a part select or by a task.
+value, say) is listed as "not in the next-state logic". One-hot registers
+tested bit by bit are extracted too (`case (1'b1)` with items `state[K]`,
+`if (state[K])`, next-state logic that clears the vector and sets
+`next[K]`); their states are named after the index. Not extracted: states
+computed by arithmetic, registers written through a part select or by a task.
 
 ```sh
 mcov report all.json -detail              # every vector, state and transition
@@ -269,7 +277,7 @@ plan uart "UART verification plan"
   owner: tony
   feature tx "Transmit path" weight=2 owner=alice
     test   uart_tx_*                # mregress tests
-    line   rtl/uart_tx.sv goal=95   # code coverage
+    line   rtl/uart_tx.sv goal=95   # code coverage (also branch, toggle, cond, fsm)
     cover  tb.cg_tx                 # a covergroup type, or type.item
     assert tb.dut.u_tx              # the assertions in that scope
     feature parity "Parity"
@@ -427,6 +435,18 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
+### High-level synthesis: `mhls`
+
+`mhls` turns a C/C++ function into SystemVerilog: an FSM with datapath, or
+with `-pipeline` a pipeline that takes one input per cycle. It also writes
+a self-checking testbench, so the result is one `msim` run away from proven
+against the C. See [docs/HLS.md](docs/HLS.md).
+
+```sh
+mhls fir.c -top fir -clock 5 -o fir.sv -tb fir_tb.sv
+msim fir.sv fir_tb.sv -top fir_tb          # PASS: fir 20 calls, latency 2..2 cycles
+```
+
 ### Datapath library: `dw/`
 
 `dw/` is a library of synthesizable, parameterized building blocks
@@ -440,6 +460,16 @@ msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
 ```
 
 `docs/DATAPATH.md` lists every module and its ports.
+
+### Cell library checks: `mlibc`
+
+`mlibc check lib.lib -lef cells.lef` checks a Liberty library and its LEF for
+the mistakes that break the tools downstream (a function that disagrees with
+its timing arcs, tables that shrink with load, a flop without setup or hold,
+a macro of the wrong size, pins off the routing grid); `mlibc report` and
+`mlibc compare slow.lib fast.lib` summarize a library and check a pair of
+corners. See `docs/LIBCHECK.md`. The generic cell library it is tested on is
+`lib/mini45` (`docs/MINI45.md`).
 
 ### Timing constraint checks: `msdc`
 
@@ -461,6 +491,21 @@ The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
 (`src/tcl.hpp`) are shared with the timing and synthesis tools. See
 [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
 
+### Static timing analysis: `msta`
+
+`msta` times a gate-level netlist against SDC constraints with Liberty
+libraries, PrimeTime style, and builds without the slang front end:
+
+```sh
+msta -lib cells.lib netlist.v -top top -sdc top.sdc      # check_timing, worst setup and hold paths, summary
+msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf  # delays and timing checks for msim -sdf
+msta -f run.tcl                                          # report_timing, report_constraint, ... in a Tcl script
+```
+
+It runs on every core by default (`-threads N`), with the same results at any
+thread count. Commands, what is modeled and the current limits are in
+[docs/STA.md](docs/STA.md).
+
 ### Lint and clock-domain checks: `mlint`
 
 `mlint` runs the same front end as `msim` and then checks the elaborated
@@ -468,38 +513,58 @@ design, so it needs no separate build setup:
 
 ```sh
 mlint rtl/*.sv -top soc_top                 # warnings, then the rules below
-mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any finding (for CI)
+mlint rtl/*.sv -top soc_top -Werror         # exit 1 on any warning (for CI)
 mlint rtl/*.sv -disable L004 -disable CDC002
 mlint rtl/*.sv -top soc_top -cdc-report     # clock domains, resets, every crossing
 mlint -list                                 # the rules
 ```
 
-| Rule | What it finds |
-|---|---|
-| `L001` | A value is assigned on some paths of an `always_comb` but not all, so it holds its old value: an unintended latch (an `if` with no `else`, a `case` with no `default`) |
-| `L002` | A blocking assignment to a non-local variable in an `always_ff` |
-| `L003` | A non-blocking assignment in an `always_comb` |
-| `L004` | One value is assigned by more than one process |
-| `CDC001` | A flop depends on another clock domain with no synchronizer, or through one flop only |
-| `CDC002` | A multi-bit bus crosses domains through a synchronizer and is not Gray coded |
-| `CDC003` | Combinational logic in front of a synchronizer: a glitch can be captured |
-| `CDC004` | Reconvergence: separately synchronized signals of one domain meet again |
-| `CDC005` | One signal is synchronized more than once into the same domain |
-| `RDC001` | An asynchronous reset generated in another clock domain |
-| `RDC002` | One asynchronous reset used directly in several clock domains |
-| `RDC003` | A flop feeds a flop with a different asynchronous reset, in one clock domain |
-| `RDC004` | A reset flop feeds a flop with no asynchronous reset (off by default: `-enable RDC004`) |
+About 80 rules in groups, each with a severity and an on/off default:
+
+| Group | Rules | Examples |
+|---|---|---|
+| `latch`, `comb`, `case` | `L001`, `LAT001`, `COMB001`, `COMB002`, `CASE001`..`CASE004` | unintended latches (bit-accurate), incomplete sensitivity lists, combinational loops across modules, case without default, casex, duplicate items |
+| `assign`, `driver` | `L002`..`L004`, `SEQ001`..`SEQ003`, `EXP001` | blocking in a flop, non-blocking in logic, both on one variable, multiple drivers |
+| `width` | `W001`..`W008` | truncating assignments, port width mismatches, comparisons of unequal widths, signed against unsigned |
+| `synth` | `SYN001`..`SYN017` | initial blocks, delays, `$random`, force, fork, real and dynamic types, `===`, defparam, internal tri-states, hierarchical references |
+| `unused`, `connect` | `UNU001`..`UNU005`, `CON001`..`CON004` | never read, never driven, floating inputs, positional connections, implicit nets |
+| `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
+| `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
+| `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
+| `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
+
+```sh
+mlint rtl/*.sv -config mlint.cfg -waivers waivers.cfg -json lint.json
+mlint rtl/*.sv -enable naming -severity W001=error -set name.module='^[a-z][a-z0-9_]*$'
+mlint -explain RST003
+```
+
+Rules are configured in a file or on the command line (enable, disable,
+severity, name patterns) and waived in a waiver file or in the source
+(`// mlint: waive W001 reason`); `// synthesis translate_off` regions are
+honoured. Stale waivers are reported. mlint runs on every logical CPU
+(`-threads N`), with the same output for any count. The full rule table,
+the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 
 Clock and reset domains are found from the RTL: the clock of every
 edge-triggered block, followed through ports, buffers and clock gates, so one
-clock passed down through several modules stays one domain. Multi-flop
-synchronizers (also shift registers and synchronizer cells), enable-qualified
-buses and Gray-coded pointers are recognized as safe. `-cdc-report` lists
-every domain and crossing, `-clock-group a,b` declares related clocks,
-`-static sig` waives a quasi-static signal, and `-threads N` sets the worker
-threads (default: every logical CPU). See [docs/CDC.md](docs/CDC.md).
-Findings print as `file:line:col: warning: [RULE] text`, sorted by file and
-line.
+clock passed down through several modules stays one domain. `-cdc-report`
+lists every domain and crossing, `-clock-group a,b` declares related clocks
+and `-static sig` waives a quasi-static signal. Findings print as
+`file:line:col: severity: [RULE] text`, sorted by file and line.
+
+### Power analysis: `mpower`
+
+`mpower` reports average and peak power from a simulation's switching
+activity (SAIF, VCD or FST) and a Liberty library, for a gate netlist or as
+an estimate for RTL, by group, instance, cell and UPF power domain
+([docs/POWER.md](docs/POWER.md)):
+
+```sh
+msim cells.v netlist.v tb.sv -top tb -saif run.saif
+mpower netlist.v -top dut -lib cells.lib -activity run.saif -strip_path tb.dut
+mpower rtl.sv -top dut -activity run.fst -peak -waveform power.csv   # RTL estimate, power over time
+```
 
 ### Source-level debug: `mdebug`
 
@@ -531,6 +596,31 @@ isolation or level shifters, names not in the design, ...). See
 msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
+
+### Logic synthesis: `msynth`
+
+`msynth` synthesizes RTL to a gate netlist of Liberty library cells, with a
+Tcl shell whose commands follow dc_shell:
+
+```sh
+msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the mini45 library
+msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
+```
+
+See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
+
+### FPGA synthesis: `mfpga`
+
+`mfpga` maps RTL (through the same elaborator as `msynth`) or an AIGER graph
+to the LUTs, carry chains and flip-flops of an FPGA family (iCE40, ECP5,
+Xilinx 7-series, generic) and writes Yosys JSON for nextpnr or EDIF.
+
+```sh
+mfpga rtl/*.sv -top core -family ice40 -o core.json   # then: nextpnr-ice40 --json core.json ...
+```
+
+See [docs/FPGA.md](docs/FPGA.md).
 
 ### Formal property checking: `mformal`
 
@@ -612,6 +702,26 @@ mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v 
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
+### Test patterns: `matpg`
+
+`matpg` generates manufacturing test patterns for a scan-inserted gate
+netlist and reports the fault coverage: stuck-at faults, and transition
+faults by launch-on-capture. It builds with the core, without slang.
+
+```sh
+matpg scan.v                                   # stuck-at patterns and coverage
+matpg scan.v -fault all -stil p.stil -tb p_tb.v
+matpg scan.v -lib cells.lib -min_coverage 98   # Liberty cells; gate for CI
+matpg scan.v -faultsim p.pat                   # grade existing patterns
+```
+
+It traces the scan chains from the ports, runs random patterns and then
+PODEM, fault-simulates every pattern against every remaining fault (64
+patterns to the word, on every core, the same result for any `-threads N`),
+compacts, and writes STIL, a self-checking Verilog testbench that `msim`
+replays, and a fault list with each fault's class. See
+[docs/ATPG.md](docs/ATPG.md).
+
 ### Emulation and FPGA prototyping: `memu`
 
 `memu` is the step between synthesis and FPGA place and route that makes a
@@ -655,6 +765,35 @@ count, and reports open and shorted nets. On the OpenROAD `gcd` test design
 its total net capacitance is within 2% of OpenRCX's, and the ground and
 coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
+### Physical verification: `mpv`
+
+`mpv drc` checks a GDSII or OASIS layout against a rule deck: width, spacing,
+enclosure, overhang, area and density checks on drawn and derived layers
+(`&`, `|`, `-`, `grow`, `interact`, ...). It needs no slang and builds with
+the default configuration.
+
+```sh
+mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
+mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
+```
+
+```
+rule poly.1a  width(poly) < 0.15            "poly width"
+rule poly.8   overhang(poly, diff) < 0.13   "poly end cap beyond diff"
+rule licon.5a enclosure(licon & diff, diff | tap) < 0.04  "diff enclosure of licon"
+```
+
+`mpv lvs` compares a routed block with its gate netlist. The nets are found
+from the geometry of the DEF and LEF, so a missing via is an open and a
+stray wire is a short:
+
+```sh
+mpv lvs -lef tech.lef routed.def -netlist block.v      # exit 1 on a mismatch
+```
+
+It runs on every logical CPU by default (`-threads N`), with the same
+report for every thread count. The deck format, the results file, LVS and
+the limits are in [docs/MPV.md](docs/MPV.md).
 
 ### Virtual prototypes: `-mvp`
 

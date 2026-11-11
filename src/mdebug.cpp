@@ -128,14 +128,16 @@ struct Guard {
 
 struct Driver {
     const Symbol* target = nullptr;
-    std::string kind;                     // assign, always_ff, always_comb, always, initial, final, port
+    std::string kind;                     // assign, always_ff, always_comb, always, initial, final, port, "task name"
     SourceLocation loc;
     SourceRange range;                    // the assignment as written; empty for a port
     const Expression* rhs = nullptr;      // null for an output port
     std::vector<Guard> guards;
     bool seq = false;
     bool whole = false;                   // assigns the whole target, not a select of it
+    int lo = -1, w = 0;                   // the bits written, when a field or a constant select; lo -1: not known
     std::string clock;                    // the event control as written, when seq
+    std::string how;                      // "", or force, assign (procedural), call (an output argument)
     int block = -1;                       // which process; -1 outside one
     std::vector<const Symbol*> reads;     // data: the right-hand side
     std::vector<const Symbol*> creads;    // control: guards and select indices
@@ -175,6 +177,83 @@ struct DB {
     }
 };
 
+// Where a struct field sits in its struct's flat vector (bit 0 is the LSB),
+// which is how msim writes a struct to the waveform: a packed struct as
+// declared, an unpacked one with its first field in the high bits.
+bool fieldRange(const MemberAccessExpression& m, int& lo, int& w) {
+    if (m.member.kind != SymbolKind::Field) return false;
+    const auto& f = m.member.as<FieldSymbol>();
+    const Type& st = m.value().type->getCanonicalType();
+    const Type& ft = f.getType();
+    if (!ft.isIntegral()) return false;
+    w = (int)ft.getBitWidth();
+    if (st.kind == SymbolKind::PackedStructType) { lo = (int)f.bitOffset; return true; }
+    if (st.kind != SymbolKind::UnpackedStructType) return false;
+    uint64_t total = 0;
+    for (const FieldSymbol* o : st.as<UnpackedStructType>().fields) {
+        if (!o->getType().isIntegral()) return false;
+        total += o->getType().getBitWidth();
+    }
+    lo = (int)(total - f.bitOffset - (uint64_t)w);
+    return lo >= 0;
+}
+
+// The bits of its base variable an lvalue writes, when that is fixed:
+// s.f, v[3], v[7:4], s.f[2] and so on.
+bool flatRange(const Expression& e, int& lo, int& w) {
+    switch (e.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue: {
+            const Type& t = e.type->getCanonicalType();
+            lo = 0;
+            if (t.isIntegral()) { w = (int)t.getBitWidth(); return true; }
+            if (t.kind != SymbolKind::UnpackedStructType) return false;
+            w = 0;
+            for (const FieldSymbol* o : t.as<UnpackedStructType>().fields) {
+                if (!o->getType().isIntegral()) return false;
+                w += (int)o->getType().getBitWidth();
+            }
+            return true;
+        }
+        case ExpressionKind::MemberAccess: {
+            const auto& m = e.as<MemberAccessExpression>();
+            int bl, bw, fl, fw;
+            if (!flatRange(m.value(), bl, bw) || !fieldRange(m, fl, fw)) return false;
+            lo = bl + fl; w = fw;
+            return true;
+        }
+        case ExpressionKind::ElementSelect: {
+            const auto& x = e.as<ElementSelectExpression>();
+            const Type& vt = *x.value().type;
+            int bl, bw;
+            if (!vt.isIntegral() || e.type->getBitWidth() != 1 || x.selector().kind != ExpressionKind::IntegerLiteral ||
+                !flatRange(x.value(), bl, bw)) return false;
+            auto ix = x.selector().as<IntegerLiteral>().getValue().as<int32_t>();
+            ConstantRange r = vt.getFixedRange();
+            if (!ix || !r.containsPoint(*ix)) return false;
+            lo = bl + r.translateIndex(*ix); w = 1;
+            return true;
+        }
+        case ExpressionKind::RangeSelect: {
+            const auto& x = e.as<RangeSelectExpression>();
+            const Type& vt = *x.value().type;
+            int bl, bw;
+            if (!vt.isIntegral() || x.getSelectionKind() != RangeSelectionKind::Simple ||
+                x.left().kind != ExpressionKind::IntegerLiteral || x.right().kind != ExpressionKind::IntegerLiteral ||
+                !flatRange(x.value(), bl, bw)) return false;
+            auto a = x.left().as<IntegerLiteral>().getValue().as<int32_t>();
+            auto b = x.right().as<IntegerLiteral>().getValue().as<int32_t>();
+            ConstantRange r = vt.getFixedRange();
+            if (!a || !b || !r.containsPoint(*a) || !r.containsPoint(*b)) return false;
+            int h = r.translateIndex(*a), l = r.translateIndex(*b);
+            if (h < l) std::swap(h, l);
+            lo = bl + l; w = h - l + 1;
+            return true;
+        }
+        default: return false;
+    }
+}
+
 // The symbols an assignment's left side writes; select indices are reads.
 void lhsTargets(const Expression& e, std::vector<const Symbol*>& targets, std::vector<const Symbol*>& idx) {
     switch (e.kind) {
@@ -210,28 +289,84 @@ struct Walker {
     Driver proto;               // kind, seq, clock, block
     std::vector<Guard> gs;
 
-    void assign(const AssignmentExpression& a) {
+    void controls(Driver& d) {
+        d.guards = gs;
+        for (const Guard& g : gs) {
+            if (g.cond) namesIn(*g.cond, d.creads);
+            if (g.cs) {
+                namesIn(g.cs->expr, d.creads);
+                if (g.kind == Guard::CaseItem)
+                    for (const Expression* e : g.cs->items[g.item].expressions) namesIn(*e, d.creads);
+            }
+        }
+    }
+
+    // A task or function call: each output, inout or ref argument is driven
+    // by the call, from the arguments that go in.
+    void call(const CallExpression& c) {
+        std::vector<const Expression*> outs;
+        std::vector<const Symbol*> ins;
+        for (const Expression* a : c.arguments()) {
+            if (a->kind == ExpressionKind::Assignment &&
+                a->as<AssignmentExpression>().right().kind == ExpressionKind::EmptyArgument)
+                outs.push_back(&a->as<AssignmentExpression>().left());
+            else
+                namesIn(*a, ins);
+        }
+        // What goes in reaches the task's own assignments through its formals.
+        if (c.subroutine.index() == 0) {
+            auto formals = std::get<0>(c.subroutine)->getArguments();
+            auto args = c.arguments();
+            for (size_t i = 0; i < formals.size() && i < args.size(); i++) {
+                if (args[i]->kind == ExpressionKind::Assignment || args[i]->kind == ExpressionKind::EmptyArgument) continue;
+                Driver d = proto;
+                d.how = "call";
+                d.target = formals[i];
+                d.loc = c.sourceRange.start();
+                d.range = c.sourceRange;
+                namesIn(*args[i], d.reads);
+                controls(d);
+                db.add(std::move(d));
+            }
+        }
+        for (const Expression* o : outs) {
+            std::vector<const Symbol*> targets, idx;
+            lhsTargets(*o, targets, idx);
+            for (const Symbol* t : targets) {
+                Driver d = proto;
+                d.how = "call";
+                d.target = t;
+                d.loc = c.sourceRange.start();
+                d.range = c.sourceRange;
+                d.reads = ins;
+                d.creads = idx;
+                controls(d);
+                db.add(std::move(d));
+            }
+        }
+    }
+
+    // how: "" for a plain assignment, "force" or "assign" for the procedural
+    // continuous forms, which override the other drivers while they hold.
+    void assign(const AssignmentExpression& a, const char* how = "") {
         std::vector<const Symbol*> targets, idx;
         lhsTargets(a.left(), targets, idx);
         for (const Symbol* t : targets) {
             Driver d = proto;
+            d.how = how;
             d.target = t;
             d.loc = a.sourceRange.start();
             d.range = a.sourceRange;
             d.rhs = &a.right();
             d.whole = a.left().kind == ExpressionKind::NamedValue ||
                       a.left().kind == ExpressionKind::HierarchicalValue;
-            d.guards = gs;
+            if (targets.size() == 1) {
+                int lo, w;
+                if (flatRange(a.left(), lo, w)) { d.lo = lo; d.w = w; }
+            }
             namesIn(a.right(), d.reads);
             d.creads = idx;
-            for (const Guard& g : gs) {
-                if (g.cond) namesIn(*g.cond, d.creads);
-                if (g.cs) {
-                    namesIn(g.cs->expr, d.creads);
-                    if (g.kind == Guard::CaseItem)
-                        for (const Expression* e : g.cs->items[g.item].expressions) namesIn(*e, d.creads);
-                }
-            }
+            controls(d);
             db.add(std::move(d));
         }
     }
@@ -252,6 +387,13 @@ struct Walker {
             case StatementKind::ExpressionStatement: {
                 const Expression& e = s.as<ExpressionStatement>().expr;
                 if (e.kind == ExpressionKind::Assignment) assign(e.as<AssignmentExpression>());
+                else if (e.kind == ExpressionKind::Call) call(e.as<CallExpression>());
+                break;
+            }
+            case StatementKind::ProceduralAssign: {
+                const auto& pa = s.as<ProceduralAssignStatement>();
+                if (pa.assignment.kind == ExpressionKind::Assignment)
+                    assign(pa.assignment.as<AssignmentExpression>(), pa.isForce ? "force" : "assign");
                 break;
             }
             case StatementKind::Conditional: {
@@ -295,7 +437,13 @@ struct Walker {
                 gs.push_back(Guard{});
                 s.visit(makeVisitor(
                     [&](auto& v, std::derived_from<Statement> auto& inner) { v.visitDefault(inner); },
-                    [&](auto&, const AssignmentExpression& a) { assign(a); }));
+                    [&](auto&, const AssignmentExpression& a) {
+                        if (a.right().kind != ExpressionKind::EmptyArgument) assign(a);
+                    },
+                    [&](auto& v, const CallExpression& c) {
+                        call(c);
+                        v.visitDefault(c);
+                    }));
                 gs.pop_back();
                 break;
             }
@@ -320,7 +468,20 @@ struct Collect : ASTVisitor<Collect> {
         db.byPath[path(v)] = &v;
     }
     void handle(const VariableSymbol& v) { signal(v); }
-    void handle(const NetSymbol& v) { signal(v); }
+    void handle(const NetSymbol& v) {
+        signal(v);
+        // wire n = a + b; is a continuous assignment.
+        if (const Expression* init = v.getInitializer(); init && db.sigIx.count(&v)) {
+            Driver d;
+            d.kind = "assign";
+            d.target = &v;
+            d.loc = v.location;
+            d.rhs = init;
+            d.whole = true;
+            namesIn(*init, d.reads);
+            db.add(std::move(d));
+        }
+    }
 
     void handle(const GenerateBlockSymbol& g) {
         if (g.isUninstantiated) return;
@@ -375,6 +536,20 @@ struct Collect : ASTVisitor<Collect> {
         Walker w{db, {}, {}};
         w.proto.kind = "assign";
         w.assign(e.as<AssignmentExpression>());
+    }
+
+    // A task or function declared in the design writes its signals like any
+    // process does; the body is one block.
+    void handle(const SubroutineSymbol& sub) {
+        const Scope* sc = sub.getParentScope();
+        if (!sc) return;
+        SymbolKind k = sc->asSymbol().kind;
+        if (k != SymbolKind::InstanceBody && k != SymbolKind::GenerateBlock) return;
+        if (sub.flags.has(MethodFlags::DPIImport) || sub.flags.has(MethodFlags::Pure)) return;
+        Walker w{db, {}, {}};
+        w.proto.kind = (sub.subroutineKind == SubroutineKind::Task ? "task " : "function ") + std::string(sub.name);
+        w.proto.block = nblock++;
+        w.walk(sub.getBody());
     }
 
     void handle(const ProceduralBlockSymbol& p) {
@@ -432,11 +607,12 @@ struct Eval {
 
     std::optional<SVInt> named(const std::string& name, const Type& type) {
         const Wave* w = vcd.find(name);
-        if (!w || !type.isIntegral()) return std::nullopt;
+        if (!w || !(type.isIntegral() || type.getCanonicalType().kind == SymbolKind::UnpackedStructType))
+            return std::nullopt;
         int i = w->at(t);
         std::string bits = i < 0 ? std::string(w->width, 'x') : w->bits(i);
         SVInt v = SVInt::fromString(std::to_string(bits.size()) + "'b" + bits);
-        v.setSigned(type.isSigned());
+        v.setSigned(type.isIntegral() && type.isSigned());
         return v;
     }
 
@@ -541,6 +717,17 @@ struct Eval {
                     sym && s.value().kind == ExpressionKind::NamedValue)
                     return named(path(*sym) + "[" + std::to_string(*ix) + "]", *e.type);
                 return std::nullopt;
+            }
+            case ExpressionKind::MemberAccess: {
+                // A struct is one vector in the waveform; a field is a slice.
+                const auto& m = e.as<MemberAccessExpression>();
+                int lo, w;
+                if (!fieldRange(m, lo, w)) return std::nullopt;
+                auto v = eval(m.value());
+                if (!v || lo + w > (int)v->getBitWidth()) return std::nullopt;
+                SVInt f = v->slice(lo + w - 1, lo);
+                f.setSigned(e.type->isSigned());
+                return f;
             }
             case ExpressionKind::RangeSelect: {
                 const auto& s = e.as<RangeSelectExpression>();
@@ -661,6 +848,7 @@ struct Tool {
     std::string label(const Driver& d) {
         std::string s = d.kind;
         if (!d.clock.empty()) s += " " + d.clock;
+        if (!d.how.empty()) s += ", " + d.how;
         return s;
     }
 
@@ -738,9 +926,72 @@ struct Tool {
             for (const Symbol* c : d.creads)
                 if (std::find(in.begin(), in.end(), c) == in.end()) in.push_back(c);
             for (const Symbol* r : in)
-                if (db.sigIx.count(r)) cone(r, depth - 1, indent + 2, onPath);
+                if (db.sigIx.count(r) || db.driversOf.count(r)) cone(r, depth - 1, indent + 2, onPath);
         }
         onPath.erase(s);
+    }
+
+    // The block view of one scope: its instances, what each port connects
+    // to, and which instance feeds which.
+    bool blocks(const std::string& name) {
+        auto parent = [](const std::string& p) { size_t d = p.rfind('.'); return d == std::string::npos ? std::string() : p.substr(0, d); };
+        auto leaf = [](const std::string& p) { size_t d = p.rfind('.'); return d == std::string::npos ? p : p.substr(d + 1); };
+        const ScopeRec* sc = nullptr;
+        int n = 0;
+        for (auto& r : db.scopes) {
+            if (r.path == name) { sc = &r; n = 1; break; }
+            if (r.path.size() > name.size() && r.path.compare(r.path.size() - name.size() - 1, std::string::npos, "." + name) == 0) { sc = &r; n++; }
+        }
+        if (n != 1) {
+            std::cerr << "mdebug: " << (n ? "more than one instance ends in '" : "no instance '") << name << "'\n";
+            return false;
+        }
+        struct Blk { const ScopeRec* r; std::vector<std::string> in, out; };
+        std::vector<Blk> bs;
+        std::map<std::string, size_t> ix;
+        for (auto& r : db.scopes)
+            if (parent(r.path) == sc->path) { ix[r.path] = bs.size(); bs.push_back({&r, {}, {}}); }
+        // net in this scope -> the ports that drive it, and the ports it feeds
+        std::map<std::string, std::vector<std::string>> from, to;
+        for (const Driver& d : db.drivers) {
+            if (d.kind != "port" || !db.sigIx.count(d.target)) continue;
+            std::string tp = path(*d.target), ts = parent(tp);
+            if (auto it = ix.find(ts); it != ix.end()) {
+                if (!d.rhs) continue;   // an output of an instance one level further down
+                std::string nets;
+                for (const Symbol* r : d.reads) {
+                    if (!db.sigIx.count(r)) continue;
+                    std::string rp = path(*r);
+                    nets += (nets.empty() ? "" : ", ") + rp;
+                    to[rp].push_back(leaf(ts) + "." + leaf(tp));
+                }
+                if (nets.empty()) nets = d.rhs ? db.src.text(d.rhs->sourceRange) : "?";
+                bs[it->second].in.push_back(leaf(tp) + " <- " + nets);
+            }
+            else if (ts == sc->path) {
+                for (const Symbol* r : d.reads) {
+                    if (!db.sigIx.count(r)) continue;
+                    std::string rp = path(*r);
+                    auto jt = ix.find(parent(rp));
+                    if (jt == ix.end()) continue;
+                    bs[jt->second].out.push_back(leaf(rp) + " -> " + tp);
+                    from[tp].push_back(leaf(parent(rp)) + "." + leaf(rp));
+                }
+            }
+        }
+        std::cout << "blocks of " << sc->path << ": " << bs.size() << "\n";
+        for (auto& b : bs) {
+            std::cout << "  " << leaf(b.r->path) << " (" << b.r->def << ")\n";
+            for (auto& l : b.in) std::cout << "    in  " << l << "\n";
+            for (auto& l : b.out) std::cout << "    out " << l << "\n";
+        }
+        for (auto& [net, srcs] : from) {
+            auto it = to.find(net);
+            if (it == to.end()) continue;
+            for (auto& a : srcs)
+                for (auto& b : it->second) std::cout << "  " << a << " -> " << b << "  (" << net << ")\n";
+        }
+        return true;
     }
 
     bool trace(const std::string& name, int depth) {
@@ -811,14 +1062,32 @@ struct Tool {
                     if (differs[k]) hits[k].state = 0;
         }
         // In one process the last assignment that ran is the one that counts.
-        std::map<int, int> last;
-        for (size_t k = 0; k < hits.size(); k++)
-            if (hits[k].state == 1 && db.drivers[hits[k].ix].block >= 0) last[db.drivers[hits[k].ix].block] = (int)k;
+        // A later assignment to other bits (another field) does not replace it.
+        auto covered = [&](size_t k) {
+            const Driver& a = db.drivers[hits[k].ix];
+            if (a.block < 0) return false;
+            std::vector<std::pair<int, int>> later;   // [lo, end) of the assignments after it
+            for (size_t j = k + 1; j < hits.size(); j++) {
+                const Driver& b = db.drivers[hits[j].ix];
+                if (hits[j].state != 1 || b.block != a.block) continue;
+                if (b.whole) return true;
+                if (b.lo >= 0) later.push_back({b.lo, b.lo + b.w});
+                else if (a.lo < 0 && !a.whole) return true;
+            }
+            if (a.lo < 0) return false;
+            std::sort(later.begin(), later.end());
+            int at = a.lo;
+            for (auto [l, e] : later) {
+                if (l > at) break;
+                at = std::max(at, e);
+            }
+            return at >= a.lo + a.w;
+        };
         bool any = false;
         for (size_t k = 0; k < hits.size(); k++) {
             const Driver& d = db.drivers[hits[k].ix];
             if (hits[k].state == 0) continue;
-            if (hits[k].state == 1 && d.block >= 0 && last[d.block] != (int)k) continue;
+            if (hits[k].state == 1 && covered(k)) continue;
             any = true;
             std::cout << pad << "  " << (hits[k].state == 1 ? "<- " : "?? ") << line(d) << "\n";
             if (depth <= 0) continue;
@@ -911,8 +1180,9 @@ struct Tool {
             return cv.isInteger() ? constJson(cv.integer()) : "null";
         }
         auto it = db.sigIx.find(&sym);
-        if (it == db.sigIx.end() || !type.isIntegral()) return "null";
-        return "[\"s\"," + std::to_string(it->second) + "," + (type.isSigned() ? "1" : "0") + "]";
+        bool flat = type.getCanonicalType().kind == SymbolKind::UnpackedStructType;
+        if (it == db.sigIx.end() || !(type.isIntegral() || flat)) return "null";
+        return "[\"s\"," + std::to_string(it->second) + "," + (!flat && type.isSigned() ? "1" : "0") + "]";
     }
     std::string exprJson(const Expression& e) {
         auto bad = [](const std::string& x) { return x == "null"; };
@@ -960,6 +1230,15 @@ struct Tool {
                 if (bad(v) || bad(i)) return "null";
                 ConstantRange r = vt.getFixedRange();
                 return "[\"bit\"," + v + "," + i + "," + std::to_string(r.left) + "," + std::to_string(r.right) + "]";
+            }
+            case ExpressionKind::MemberAccess: {
+                const auto& m = e.as<MemberAccessExpression>();
+                int lo, w;
+                if (!fieldRange(m, lo, w)) return "null";
+                std::string v = exprJson(m.value());
+                if (bad(v)) return "null";
+                return "[\"fld\"," + v + "," + std::to_string(lo) + "," + std::to_string(w) + "," +
+                       (e.type->isSigned() ? "1" : "0") + "]";
             }
             case ExpressionKind::RangeSelect: {
                 const auto& x = e.as<RangeSelectExpression>();
@@ -1084,7 +1363,7 @@ struct Tool {
             os << (first ? "" : ",\n") << "{\"sig\":" << it->second << ",\"kind\":" << js(label(d))
                << ",\"file\":" << dw[i].file << ",\"line\":" << dw[i].line << ",\"text\":" << js(text(d))
                << ",\"when\":" << js(when(d)) << ",\"seq\":" << (d.seq ? 1 : 0) << ",\"reads\":" << ids(d.reads)
-               << ",\"ctl\":" << ids(d.creads) << ",\"blk\":" << d.block << ",\"whole\":" << (d.whole ? 1 : 0)
+               << ",\"ctl\":" << ids(d.creads) << ",\"blk\":" << d.block << ",\"whole\":" << (d.whole ? 1 : 0) << ",\"lo\":" << d.lo << ",\"w\":" << d.w
                << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
@@ -1152,6 +1431,7 @@ void usage() {
                  "  -threads N       threads for parsing and for reading the waveform\n"
                  "                   (default: every logical core; the output is the same for any N)\n"
                  "  -scopes          list the instances    -signals  list the signals\n"
+                 "  -blocks INST     the instances inside INST, their port connections and what feeds what\n"
                  "  -html <file>     write a one-file viewer: hierarchy, source, drivers and\n"
                  "                   loads, a schematic of the cone, and waves when -vcd is given\n"
                  "  -json <file>     write the debug database the viewer reads\n"
@@ -1188,6 +1468,7 @@ int main(int argc, char** argv) {
             std::cout << "mdebug " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
             return 0;
         }
+        if (a == "-blocks") { queries.push_back({"blocks", next("an instance"), -1, std::nullopt}); continue; }
         if (a == "-drivers" || a == "-loads" || a == "-trace" || a == "-active") {
             queries.push_back({a.substr(1), next("a signal"), -1, std::nullopt});
             continue;
@@ -1231,6 +1512,7 @@ int main(int argc, char** argv) {
     for (const Query& q : queries) {
         if (q.what == "drivers") ok &= tool.drivers(q.arg);
         else if (q.what == "loads") ok &= tool.loads(q.arg);
+        else if (q.what == "blocks") ok &= tool.blocks(q.arg);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")

@@ -102,3 +102,68 @@ string(JSON n LENGTH "${json}" signals)
 if(NOT n EQUAL 25)
   message(FATAL_ERROR "expected 25 signals in the database, got ${n}")
 endif()
+
+# Tasks, call outputs, force and a net's declaration assignment are drivers.
+set(SV ${SRC}/tests/debug/task.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tk -vcd ${OUT}/task.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "w=5 q=7 f=170")
+  message(FATAL_ERROR "msim task.sv: ${rc}\n${out}")
+endif()
+function(runtk args)
+  execute_process(COMMAND ${MDEBUG} ${SV} -top tk ${args}
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  set(out "${out}" PARENT_SCOPE)
+  set(err "${err}" PARENT_SCOPE)
+endfunction()
+runtk("-drivers;tk.q;-drivers;tk.w;-drivers;tk.f;-drivers;tk.n;-loads;tk.a")
+want("task.sv:10: q = v  [task set_q]  when v != 0"
+     "task.sv:13: bump(a, w)  [always @posedge clk, call]"
+     "drivers of tk.f: 2" "task.sv:18: f = 8'haa  [initial, force]"
+     "drivers of tk.n: 1" "loads of tk.a: 3" "-> tk.bump.x" "-> tk.w")
+runtk("-trace;tk.q")
+want("tk.set_q.v" "task.sv:17: set_q(8'd7)  [initial, call]")
+runtk("-vcd;${OUT}/task.vcd;-active;tk.f;-at;40")
+want("tk.f = 8'haa @40  (since 32)" "f = 8'haa  [initial, force]")
+if(out MATCHES "f = n")
+  message(FATAL_ERROR "the forced value was traced to the overridden driver:\n${out}")
+endif()
+runtk("-vcd;${OUT}/task.vcd;-active;tk.w;-at;30")
+want("tk.w = 8'h05 @30  (since 15)" "bump(a, w)" "a = 8'd3  [initial]")
+
+# The block view: instances, their port connections, and what feeds what.
+set(SV ${SRC}/tests/debug/alu.sv)
+run("-blocks;tb")
+want("blocks of tb: 2" "u0 (alu)" "in  op <- tb.op" "in  op <- 2'd2" "in  b <- 8'h0f"
+     "out y -> tb.y1" "u0.y -> u1.a  (tb.y0)")
+run("-blocks;u0")
+want("blocks of tb.u0: 0")
+run("-blocks;nosuch")
+if(rc EQUAL 0 OR NOT err MATCHES "no instance 'nosuch'")
+  message(FATAL_ERROR "expected an error for an unknown instance: ${rc}\n${out}${err}")
+endif()
+run("-html;${OUT}/blk.html")
+file(READ ${OUT}/blk.html page)
+if(NOT page MATCHES "function blocks\\(\\)")
+  message(FATAL_ERROR "the page has no block view")
+endif()
+
+# Struct fields: a condition on a field is evaluated, each field has its own
+# driver, and a whole assignment the fields overwrite is not reported.
+set(SV ${SRC}/tests/debug/struct.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top st -vcd ${OUT}/struct.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "s=83 t=0")
+  message(FATAL_ERROR "msim struct.sv: ${rc}\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top st -vcd ${OUT}/struct.vcd -active st.s -at 50 -depth 2
+                        -active st.t -at 50 -depth 2 -json ${OUT}/struct.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("struct.sv:13: s = {p.hi, p.lo}  [always_comb]  when p.lo == 4'd3"
+     "p.hi = q[3:0]" "p.lo = 4'd3" "q <= q + 8'd4"
+     "t = r.b ? r.a : 4'd0" "st.r = 5'h09 @45" "r.a = p.hi" "r.b = idx[0]")
+if(out MATCHES "\\?\\?|p = '0|s = 0")
+  message(FATAL_ERROR "struct trace: an undecided or overwritten driver was reported:\n${out}")
+endif()
+file(READ ${OUT}/struct.json page)
+if(NOT page MATCHES "\"fld\"" OR NOT page MATCHES "\"lo\":4,\"w\":4")
+  message(FATAL_ERROR "the database has no field expressions or bit ranges")
+endif()
