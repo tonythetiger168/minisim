@@ -3,6 +3,7 @@
 // Nothing here knows about devices; spice.hpp turns the cards into a circuit.
 #pragma once
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -56,7 +57,26 @@ inline const char* parseNumber(const char* s, double& v) {
 
 // Parameters of one level of the hierarchy. Values are kept as text and
 // evaluated on first use, so a .param may refer to one defined later.
+// The random numbers of one Monte Carlo run: a counter-based generator, so
+// a run's samples depend on the seed and the run number only.
+struct Random {
+    uint64_t state;
+    Random(uint64_t seed, uint64_t run) : state(seed * 0x9E3779B97F4A7C15ull + run * 0xD1B54A32D192ED03ull + 0x632BE59BD9B4E019ull) {}
+    uint64_t next() {   // splitmix64
+        uint64_t z = (state += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+    double uniform() { return (double)(next() >> 11) * (1.0 / 9007199254740992.0); }   // [0, 1)
+    double normal() {   // Box-Muller
+        double u = 1 - uniform(), v = uniform();
+        return std::sqrt(-2 * std::log(u)) * std::cos(2 * M_PI * v);
+    }
+};
+
 struct Scope {
+    Random* random = nullptr;   // set on the top scope of a Monte Carlo run
     std::map<std::string, std::string> expr;
     std::map<std::string, double> cache;
     std::set<std::string> busy;
@@ -194,6 +214,21 @@ private:
         if (f == "sgn") { need(1); return (a[0] > 0) - (a[0] < 0); }
         if (f == "if") { need(3); return a[0] != 0 ? a[1] : a[2]; }
         if (f == "db") { need(1); return 20 * std::log10(std::fabs(a[0])); }
+        // Statistical parameters: the nominal value unless this is a Monte
+        // Carlo run. gauss/unif take a relative variation, agauss/aunif an
+        // absolute one; the third argument of the Gaussians is how many
+        // sigma that variation is.
+        if (f == "gauss" || f == "agauss" || f == "unif" || f == "aunif") {
+            bool g = f.back() == 's' , rel = f[0] != 'a';
+            if (g ? (a.size() < 2 || a.size() > 4) : (a.size() < 2 || a.size() > 3)) fail(f + "() takes nominal, variation" + (g ? ", sigma" : ""));
+            Random* r = nullptr;
+            for (Scope* s = sc_; s; s = s->parent) if (s->random) r = s->random;
+            if (!r) return a[0];
+            double var = rel ? a[1] * std::fabs(a[0]) : a[1];
+            if (!g) return a[0] + var * (2 * r->uniform() - 1);
+            double sigma = a.size() > 2 && a[2] != 0 ? a[2] : 1;
+            return a[0] + var / sigma * r->normal();
+        }
         fail("unknown function '" + f + "'");
     }
 };
@@ -250,6 +285,24 @@ struct Netlist {
     std::string title;
     Block top;
     std::vector<Card> control;   // .tran, .ac, .print, ... in file order
+    std::string alter;           // the .alter block this deck is the result of ("" for the deck itself)
+
+    // The top-level subcircuits point back at `top`, which moves with the netlist.
+    Netlist() = default;
+    Netlist(Netlist&& o) noexcept : title(std::move(o.title)), top(std::move(o.top)), control(std::move(o.control)), alter(std::move(o.alter)) { adopt(); }
+    Netlist& operator=(Netlist&& o) noexcept {
+        title = std::move(o.title);
+        top = std::move(o.top);
+        control = std::move(o.control);
+        alter = std::move(o.alter);
+        adopt();
+        return *this;
+    }
+
+private:
+    void adopt() {
+        for (auto& [n, b] : top.subckts) b->parent = &top;
+    }
 };
 
 // Split "a=1 b={x+1}" style text into name/expression pairs. An expression
@@ -298,12 +351,116 @@ public:
         std::istringstream f(text);
         return read(f, name);
     }
-    Netlist read(std::istream& f, const std::string& path) {
+    Netlist read(std::istream& f, const std::string& path) { return std::move(readAll(f, path)[0]); }
+
+    // The netlist and, after it, one more for every .alter block: the deck
+    // with that block's lines applied on top of the one before. In a block,
+    //   an element, .model or .subckt of a name already there replaces it;
+    //   an analysis (.op .dc .ac .tran ...) replaces those of its kind, a
+    //   .measure the one of its name;
+    //   .lib 'file' section replaces what an earlier .lib took from that file;
+    //   everything else (.param, .temp, .option, new elements) is added, and
+    //   a later .param or option wins.
+    std::vector<Netlist> readAll(const std::string& path) {
+        std::ifstream f(path);
+        if (!f) throw Error("cannot open " + path);
+        return readAll(f, path);
+    }
+    std::vector<Netlist> readAll(std::istream& f, const std::string& path) {
+        std::string title;
+        std::vector<Line> all;
+        load(f, path, all, true, title, 0, "", "");
+        std::vector<std::vector<Line>> parts(1);
+        std::vector<std::string> names{""};
+        for (Line& ln : all) {
+            if (ln.text.rfind(".alter", 0) == 0 && (ln.text.size() == 6 || std::isspace((unsigned char)ln.text[6]))) {
+                parts.emplace_back();
+                size_t b = ln.text.find_first_not_of(" \t", 6);
+                names.push_back(b == std::string::npos ? "" : ln.text.substr(b));
+            } else if (ln.text == ".end" || ln.text.rfind(".end ", 0) == 0) {
+                break;
+            } else {
+                parts.back().push_back(std::move(ln));
+            }
+        }
+        std::vector<Netlist> out;
+        std::vector<Line> deck = std::move(parts[0]);
+        out.push_back(parse(deck, path, title));
+        for (size_t k = 1; k < parts.size(); k++) {
+            deck = altered(deck, parts[k]);
+            out.push_back(parse(deck, path, title));
+            out.back().alter = names[k].empty() ? "alter " + std::to_string(k) : names[k];
+        }
+        return out;
+    }
+
+private:
+    struct Line { std::string text, where, lib; };
+
+    static std::string word(const std::string& s, size_t n) {
+        std::istringstream is(s);
+        std::string w;
+        for (size_t i = 0; i <= n; i++)
+            if (!(is >> w)) return "";
+        return w;
+    }
+    // What a line is, for replacement by an .alter block: "" when it is
+    // only ever added.
+    static std::string identity(const std::string& t) {
+        std::string w0 = word(t, 0);
+        if (w0.empty()) return "";
+        if (w0[0] != '.') return "e:" + w0;
+        if (w0 == ".model") return "m:" + word(t, 1);
+        if (w0 == ".meas" || w0 == ".measure") {
+            std::string a = word(t, 1);
+            bool kind = a == "tran" || a == "ac" || a == "dc" || a == "op";
+            return "s:" + word(t, kind ? 2 : 1);
+        }
+        for (const char* a : {".op", ".dc", ".ac", ".tran", ".noise", ".tf", ".sens", ".four"})
+            if (w0 == a) return std::string("a:") + a;
+        return "";
+    }
+
+    static std::vector<Line> altered(const std::vector<Line>& base, const std::vector<Line>& block) {
+        std::set<std::string> libs, ids, subs;
+        int depth = 0;
+        for (const Line& ln : block) {
+            if (!ln.lib.empty()) libs.insert(ln.lib);
+            std::string w0 = word(ln.text, 0);
+            if (w0 == ".subckt") { if (depth++ == 0) subs.insert(word(ln.text, 1)); continue; }
+            if (w0 == ".ends") { depth--; continue; }
+            if (depth == 0)
+                if (std::string id = identity(ln.text); !id.empty()) ids.insert(id);
+        }
+        std::vector<Line> out;
+        depth = 0;
+        bool dropping = false;
+        for (const Line& ln : base) {
+            std::string w0 = word(ln.text, 0);
+            if (w0 == ".subckt") {
+                if (depth++ == 0) dropping = subs.count(word(ln.text, 1)) != 0;
+                if (!dropping && !libs.count(ln.lib)) out.push_back(ln);
+                continue;
+            }
+            if (w0 == ".ends") {
+                depth--;
+                if (!dropping && !libs.count(ln.lib)) out.push_back(ln);
+                if (depth == 0) dropping = false;
+                continue;
+            }
+            if (dropping || (!ln.lib.empty() && libs.count(ln.lib))) continue;
+            if (depth == 0 && ids.count(identity(ln.text))) continue;
+            out.push_back(ln);
+        }
+        out.insert(out.end(), block.begin(), block.end());
+        return out;
+    }
+
+    Netlist parse(const std::vector<Line>& lines, const std::string& path, const std::string& title) {
         Netlist nl;
-        std::vector<Line> lines;
-        load(f, path, lines, true, nl.title, 0);
+        nl.title = title;
         Block* cur = &nl.top;
-        for (Line& ln : lines) {
+        for (const Line& ln : lines) {
             Card c = card(ln);
             if (c.tok.empty()) continue;
             const std::string& k = c.tok[0];
@@ -332,6 +489,18 @@ public:
             } else if (k == ".end") {
                 break;
             } else {
+                // HSPICE's "sweep monte=N" at the end of an analysis line is
+                // the same as a line ".step monte N".
+                for (size_t i = 1; i + 1 < c.tok.size(); i++)
+                    if (c.tok[i] == "sweep" && c.tok[i + 1].rfind("monte=", 0) == 0) {
+                        Card st;
+                        st.where = c.where;
+                        st.tok = {".step", "monte", c.tok[i + 1].substr(6)};
+                        st.text = ".step monte " + st.tok[2];
+                        c.tok.erase(c.tok.begin() + i, c.tok.begin() + i + 2);
+                        nl.control.push_back(std::move(st));
+                        break;
+                    }
                 nl.control.push_back(std::move(c));
             }
         }
@@ -339,20 +508,21 @@ public:
         return nl;
     }
 
-private:
-    struct Line { std::string text, where; };
-
     static std::string dirOf(const std::string& p) {
         auto s = p.find_last_of("/\\");
         return s == std::string::npos ? "" : p.substr(0, s + 1);
     }
 
+    // `want`: read only the section of that name (the file is a library:
+    // ".lib name" ... ".endl"). `tag` marks the lines as taken from a library
+    // file, so that an .alter block can take another section instead.
     void load(std::istream& f, const std::string& path, std::vector<Line>& out, bool top, std::string& title,
-              int depth) {
+              int depth, const std::string& want, const std::string& tag) {
         std::string raw;
         int no = 0;
         bool control = false;
-        while (std::getline(f, raw)) {
+        bool inside = want.empty(), found = want.empty(), fresh = true;
+while (std::getline(f, raw)) {
             no++;
             if (!raw.empty() && raw.back() == '\r') raw.pop_back();
             if (top && no == 1) { title = raw; continue; }   // SPICE: the first line is the title
@@ -371,11 +541,43 @@ private:
             if (lo.rfind(".control", 0) == 0) { control = true; continue; }
             if (lo.rfind(".endc", 0) == 0) { control = false; continue; }
             if (control) continue;
+            if (lo.rfind(".lib", 0) == 0 && (lo.size() == 4 || std::isspace((unsigned char)lo[4]))) {
+                std::istringstream is(t.substr(4));
+                std::string a, b;
+                is >> a >> b;
+                auto strip = [](std::string s) {
+                    while (!s.empty() && (s.front() == '\'' || s.front() == '"')) s.erase(0, 1);
+                    while (!s.empty() && (s.back() == '\'' || s.back() == '"')) s.pop_back();
+                    return s;
+                };
+                a = strip(a); b = strip(b);
+                if (a.empty()) throw Error(path + ":" + std::to_string(no) + ": .lib needs a section name, or a file and a section");
+                if (b.empty()) {
+                    // A section starts here; outside a library read it is skipped.
+                    inside = !want.empty() && lower(a) == want;
+                    if (inside) found = true;
+                    if (want.empty()) inside = false;
+                    fresh = true;
+                    continue;
+                }
+                if (!inside) continue;
+                if (a[0] != '/') a = dirOf(path) + a;
+                if (depth >= 32) throw Error(path + ": .lib nested too deep");
+                std::ifstream inc(a);
+                if (!inc) throw Error(path + ":" + std::to_string(no) + ": cannot open " + a);
+                std::string ignored;
+                load(inc, a, out, false, ignored, depth + 1, lower(b), tag.empty() ? a : tag);
+                fresh = true;
+                continue;
+            }
+            if (lo.rfind(".endl", 0) == 0) { inside = want.empty(); fresh = true; continue; }
+            if (!inside) continue;
             if (t[0] == '+') {
-                if (out.empty()) throw Error(path + ":" + std::to_string(no) + ": continuation with nothing to continue");
+                if (out.empty() || fresh) throw Error(path + ":" + std::to_string(no) + ": continuation with nothing to continue");
                 out.back().text += " " + lo.substr(1);
                 continue;
             }
+            fresh = false;
             if (lo.rfind(".include", 0) == 0 || lo.rfind(".inc ", 0) == 0) {
                 std::string name = t.substr(t.find_first_of(" \t") == std::string::npos ? t.size() : t.find_first_of(" \t"));
                 size_t s = name.find_first_not_of(" \t\"'");
@@ -387,16 +589,17 @@ private:
                 if (depth >= 32) throw Error(path + ": .include nested too deep");
                 std::ifstream inc(name);
                 if (!inc) throw Error(path + ":" + std::to_string(no) + ": cannot open " + name);
-                load(inc, name, out, false, ignored, depth + 1);
+                load(inc, name, out, false, ignored, depth + 1, "", tag);
                 continue;
             }
-            out.push_back({lo, path + ":" + std::to_string(no)});
+            out.push_back({lo, path + ":" + std::to_string(no), tag});
         }
+        if (!found) throw Error(path + ": no .lib section '" + want + "'");
     }
 
     // Lines whose arguments are written with parentheses that matter: v(out).
     static bool keepsParens(const std::string& s) {
-        for (const char* k : {".print", ".meas", ".ic", ".nodeset", ".save", ".probe", ".plot"})
+        for (const char* k : {".print", ".meas", ".ic", ".nodeset", ".save", ".probe", ".plot", ".noise", ".tf", ".sens", ".four"})
             if (s.rfind(k, 0) == 0) return true;
         return false;
     }

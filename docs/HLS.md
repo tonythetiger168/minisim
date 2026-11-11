@@ -250,6 +250,7 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 | `-handshake` | also write `<top>_hs`, the block behind ready/valid ports |
 | `-max-reg-array <n>` | largest local array kept in registers (default 64) |
 | `-delay-scale <x>` | scale the built-in operator delays |
+| `-lib <file.lib>` | take the delays from a Liberty library (see below) |
 | `-clang` | read the source with clang: C++ classes and templates (see C++ through Clang) |
 | `-emit-c <file>` | with `-clang`: write the plain C the source reduces to |
 | `-I<dir>`, `-D<name>[=<v>]` | include path (clang only) and macro definition |
@@ -261,11 +262,22 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 
 The operator delays are a generic 28 nm-class model and only decide where
 cycle boundaries fall; run the RTL through synthesis and timing for real
-numbers. Operators that take several cycles are counted in the summary and
+numbers.
+
+With `-lib cells.lib` the delays come from a Liberty library instead. mhls
+finds the smallest inverter, two-input NAND, XOR and multiplexer by their
+functions and a flip-flop, looks up each one driving four of itself, and
+counts every operator as gates on its longest path (a prefix adder, an array
+multiplier, a restoring divider). Clock-to-Q and setup come from the
+flip-flop. The slow corner of a library therefore gets more states than the
+fast one at the same clock, and the area line also gives the library's own
+units. No netlist is built: the counts were fitted to what `msynth` builds
+and `msta` times for single operators on `lib/mini45` (8 to 64 bits, within
+about 20%, both the typical and the slow corner);
+`tests/hls/calibrate.sh` repeats the measurement for any library. Operators that take several cycles are counted in the summary and
 need multicycle constraints.
 
 ## Not yet
 
 Dual-port memories, non-blocking stream access,
-unions, SystemC modules (`SC_MODULE`, clocked threads), and
-operator delays taken from a Liberty library.
+unions, SystemC modules (`SC_MODULE`, clocked threads).

@@ -227,6 +227,30 @@ if mpv:
         bad = [l for l in (p.stdout + p.stderr).splitlines() if re.match(r"\S+ +\d+ +\S", l) and not l.startswith("metal1.area")]
         assert not bad and "violations in" in p.stdout + p.stderr, "mini45: mpv drc finds\n" + p.stdout + p.stderr
 
+# 6e. The SkyWater 130 nm cells (lib/sky130), when the library is there:
+# pins on li1, below the first routing layer and off its tracks; via pads
+# wider than the wires; a minimum area longer than a track step; contacts
+# that must keep their spacing between pins of one net. Clean in mpnr's own
+# check and, with the fills between a net's own pads, in mpv drc.
+sky = [os.path.join(src, "lib/sky130", f) for f in ("sky130_hd.tlef", "sky130_hd_subset.lef")]
+if all(os.path.exists(f) for f in sky):
+    s130 = ["-lef", sky[0], "-lef", sky[1]]
+    gen = subprocess.run([sys.executable, os.path.join(src, "bench/gen_pnr.py"), "1000", "1", "--sky130"], capture_output=True, text=True, check=True)
+    open(out("s130.v"), "w").write(gen.stdout)
+    log = run(*s130, out("s130.v"), "-def", out("s130.def"), "-threads", "1")
+    need(log, r"0 nets unrouted")
+    need(log, r"0 open, 0 shorts, 0 spacing violations")
+    run(*s130, out("s130.v"), "-def", out("s130_4.def"), "-threads", "4")
+    text = open(out("s130.def")).read()
+    assert text == open(out("s130_4.def")).read(), "sky130: -threads 4 differs from -threads 1"
+    need(text, r"NEW li1 \( \d+ \d+ \) L1M1_PR")
+    need(text, r"NEW met1 \( \d+ \d+ \) RECT \(")
+    need(run(*s130, "-check", out("s130.def")), r"0 open, 0 shorts, 0 spacing violations")
+    if mpv:
+        p = subprocess.run([mpv, "drc", *s130, out("s130.def"), "-q"], capture_output=True, text=True)
+        need(p.stdout + p.stderr, r"\b0 violations in 0 of \d+ rules")
+
+
 # 6d. Timing with the shared timing engine: a report from the placement, the
 # clocks timed through their trees, and a second placement that weights the
 # nets on slow paths and ends with more slack than the first.
