@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
+  and transitions of FSMs), in the totals, the history and `mplan init`.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
   inside a scope, their port connections and which instance feeds which.
 - `mdebug`: tasks and functions in a module, call output arguments, `force`,
@@ -157,6 +159,23 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- The `matpg -tb` testbench writes a fail log with `+faillog` (pattern, chain
+  and cell of every wrong bit) for diagnosis; the fault simulator queues
+  events by level and is up to twice as fast on deep logic; the pattern file
+  reader and writer are in `src/atpg_model.hpp` for other tools.
+- `matpg -cubes FILE` writes each test before the random fill (x for a free
+  bit) for test compression, and the fault simulator can report where each
+  pattern fails (`Sim::detect` with a third argument) for diagnosis.
+- `matpg`: test pattern generation and fault simulation on a scan-inserted
+  gate netlist. Stuck-at faults and launch-on-capture transition faults on
+  every cell pin; scan chains traced from the ports (library scan flops or a
+  mux on D); random patterns, PODEM, a 64-pattern parallel fault simulator
+  and reverse-order compaction; fault classes (DS, DI, UU, UR, AU, ND) with
+  test and fault coverage; patterns as STIL (IEEE 1450), as a self-checking
+  Verilog testbench and as text; `-faultsim` grades existing patterns;
+  `-lib` takes cell functions from Liberty; `-threads N` with the same
+  result for any N. The fault simulator is `src/faultsim.hpp` for the other
+  test tools. See `docs/ATPG.md`.
 - `-xprop` is faster: an `if` evaluates its condition once, and clocked
   blocks with merged branches run in parallel again. Ibex with `-xprop`:
   42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
@@ -316,6 +335,23 @@ Spec references are IEEE 1800-2023 clauses.
 - `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
   Verilog netlist reader / flattener / writer, shared by the timing,
   synthesis, power, equivalence and physical tools.
+- `mpower`, power analysis on the msim front end: average power by group,
+  instance and cell from SAIF, VCD or FST activity and Liberty
+  `internal_power` / `leakage_power` tables; activity propagation for nets
+  the file does not name (RTL activity on a gate netlist, or `-clock` with no
+  activity); an RTL estimate (register bits as the library's flop, logic as
+  reference gates); `-peak` with `-waveform` for power over time; `-upf` for
+  power per domain with domain voltages and switched domains; `-spef` for
+  extracted wire capacitance; `-json`.
+  Multithreaded, with the same report on any thread count. `msim -saif`
+  writes SAIF from a simulation, and `mpower -write_saif` converts a
+  waveform. `src/saif.hpp` (SAIF reader and writer) and `src/power.hpp` (the
+  computation) are shared headers. See `docs/POWER.md`.
+- FPGA synthesis: `mfpga` maps RTL or AIGER to K-input LUTs and flip-flops
+  (iCE40, ECP5, Xilinx 7-series, generic cells) on the shared graph of
+  `src/aig.hpp`, and writes Yosys JSON for nextpnr, EDIF or Verilog.
+  Depth-optimal priority-cut mapping with area recovery; multithreaded, with
+  the same output for any `-threads N`. See `docs/FPGA.md`.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:
