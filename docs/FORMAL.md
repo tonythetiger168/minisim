@@ -130,6 +130,22 @@ inputs into the design, so the failure can be debugged in the simulator:
 msim rtl/*.sv mformal_out/top.u.a_push_counts_tb.sv -top mformal_replay
 ```
 
+## Other model checkers (AIGER)
+
+`mformal ... -aiger model.aig` writes the model and stops without checking
+(`.aig` is the binary format, any other name the ASCII one). The file is
+AIGER 1.9: one bad-state property per assertion and per cover, in the order
+of the report (`b0`, `b1`, ... in the symbol table carry the names; a cover
+is "covered" when its bad state is reachable), and one invariant constraint
+per assumption. Liveness is already turned into safety, and the reset
+sequence is part of the latches, so the checker needs no extra setup. Any
+checker that reads AIGER 1.9 with constraints can be used (ABC, rIC3 and
+others); they run as separate programs. Use `-only NAME` to export a single
+property for a checker that handles one at a time.
+
+`tests/formal/aiger_check.py` reads the file back with its own small reader,
+visits every reachable state and compares with mformal's verdicts.
+
 ## Exit status
 
 0: nothing falsified. 1: an assertion was falsified (with `-Werror`, also an
