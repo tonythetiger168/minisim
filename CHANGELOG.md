@@ -291,6 +291,12 @@ Spec references are IEEE 1800-2023 clauses.
   simulator reports stuck-at, transition, coupling and address-decoder
   coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
   expected results come from that simulator. See `docs/DFT.md`.
+- `mpss`: address spaces (`addr_reg_pkg`). A model declares a
+  `transparent_addr_space_c<>` with regions, and actions and buffers claim
+  memory from it with `transparent_addr_claim_s<>`; claims that are alive at
+  the same time never overlap, so `examples/pss/dma.pss` now checks the
+  copied data. Also `constraint default`, and `x.f()` calls and region
+  variables in `exec init`.
 - `mpss`, portable stimulus: reads a model in the Accellera PSS language
   (components, actions, buffers, streams, resources and pools, constraints,
   activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks

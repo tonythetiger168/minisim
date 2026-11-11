@@ -85,7 +85,32 @@ struct CompInst {
     std::map<std::string, std::string> sattrs;   // string fields
     std::vector<int> pools;
     int id = 0;
+    // An address space (addr_reg_pkg): its regions, from add_region().
+    struct Region {
+        i128 addr, size;
+        bool alloc;
+    };
+    bool isSpace = false;
+    std::vector<Region> regions;
 };
+
+// The address space library every model can use (PSS 24.x addr_reg_pkg):
+// the transparent kind, where the solver picks the addresses.
+inline const char* const kAddrRegPkg = R"(package addr_reg_pkg {
+  struct addr_region_s { bit[64] size; }
+  struct transparent_addr_region_s : addr_region_s { bit[64] addr; }
+  struct addr_claim_s {
+    rand bit[64] size;
+    rand bool permanent;
+    rand bit[64] alignment;
+    constraint default permanent == false;
+    constraint default alignment == 1;
+  }
+  struct transparent_addr_claim_s : addr_claim_s { rand bit[64] addr; }
+  component contiguous_addr_space_c { }
+  component transparent_addr_space_c : contiguous_addr_space_c { }
+}
+)";
 struct PoolInst {
     TypeDecl* type;
     i128 size;
@@ -130,6 +155,23 @@ struct Design {
                 if (t->qname.size() >= name.size() && t->qname.compare(t->qname.size() - name.size(), name.size(), name) == 0)
                     return t;
         }
+        return nullptr;
+    }
+    // Is t the type named q, or derived from it?
+    bool isA(const TypeDecl* t, const char* q) const {
+        for (int i = 0; t && i < 64; i++) {
+            if (t->qname == q) return true;
+            if (t->super.empty()) return false;
+            t = lookup(t->super, t->owner ? t->owner : t);
+        }
+        return false;
+    }
+    // The address space a claim made in component c takes its memory from:
+    // the nearest one, in c or a component above it.
+    const CompInst* spaceFor(const CompInst* c) const {
+        for (; c; c = c->parent)
+            for (auto& k : c->kids)
+                if (k.second->isSpace) return k.second;
         return nullptr;
     }
     TypeRef resolved(TypeRef t) const {
@@ -281,6 +323,7 @@ struct Design {
         auto up = std::make_unique<CompInst>();
         CompInst* c = up.get();
         c->type = t;
+        c->isSpace = isA(t, "addr_reg_pkg::contiguous_addr_space_c");
         c->parent = parent;
         c->path = parent ? parent->path + "." + name : name;
         c->id = (int)comps.size();
@@ -320,24 +363,69 @@ struct Design {
         return c;
     }
 
+    // The component (below c) and the attribute key a path leads to.
+    CompInst* walkComp(CompInst* c, const std::vector<PathElem>& path, std::string& key) const {
+        CompInst* t = c;
+        for (auto& pe : path) {
+            std::string k = pe.name;
+            if (pe.index) k += "[" + i128str(constEval(*pe.index, nullptr, c)) + "]";
+            CompInst* kid = nullptr;
+            if (key.empty())
+                for (auto& kv : t->kids)
+                    if (kv.first == k) kid = kv.second;
+            if (kid) { t = kid; continue; }
+            key += (key.empty() ? "" : ".") + k;
+        }
+        return t;
+    }
     void runInit(CompInst* c, const char* kind, const char* kind2) {
         for (auto& x : c->type->execs) {
             if (x.kind != kind && x.kind != kind2) continue;
+            std::map<std::string, std::map<std::string, i128>> regions;   // local address regions
             for (auto& s : x.stmts) {
-                if (s->k != Stmt::Assign || s->op != "=" || s->lhs->k != Expr::Ref)
-                    m.fail(s->loc, "an exec " + x.kind + " block may only hold assignments to component fields");
-                CompInst* t = c;
-                std::string key;
-                for (auto& pe : s->lhs->path) {
-                    std::string k = pe.name;
-                    if (pe.index) k += "[" + i128str(constEval(*pe.index, nullptr, c)) + "]";
-                    CompInst* kid = nullptr;
-                    if (key.empty())
-                        for (auto& kv : t->kids)
-                            if (kv.first == k) kid = kv.second;
-                    if (kid) { t = kid; continue; }
-                    key += (key.empty() ? "" : ".") + k;
+                if (s->k == Stmt::Var) {
+                    TypeRef tr = resolved(s->type);
+                    const TypeDecl* rt = tr.k == TypeRef::Named ? lookup(tr.name, c->type) : nullptr;
+                    if (!rt || !isA(rt, "addr_reg_pkg::addr_region_s") || s->e)
+                        m.fail(s->loc, "a variable of an exec " + x.kind + " block must be an address region");
+                    regions[s->name].clear();
+                    continue;
                 }
+                if (s->k == Stmt::Expr_ && s->e->k == Expr::Call && !s->e->path.empty()) {
+                    const Expr& e = *s->e;
+                    bool alloc = e.s == "add_region";
+                    if (!alloc && e.s != "add_nonallocatable_region") m.fail(s->loc, "unknown function '" + e.s + "'");
+                    std::string key;
+                    CompInst* sp = walkComp(c, e.path, key);
+                    if (!key.empty() || !sp->isSpace) m.fail(s->loc, e.s + "() needs an address space component");
+                    auto r = regions.end();
+                    if (e.a.size() == 1 && e.a[0]->k == Expr::Ref && e.a[0]->path.size() == 1)
+                        r = regions.find(e.a[0]->path[0].name);
+                    if (r == regions.end()) m.fail(s->loc, e.s + "() needs an address region variable of this block");
+                    i128 size = r->second.count("size") ? r->second["size"] : 0;
+                    if (size < 1) m.fail(s->loc, "the region's size is not set");
+                    i128 addr = 0;   // without an address: after the regions so far
+                    for (auto& o : sp->regions) addr = std::max(addr, o.addr + o.size);
+                    if (r->second.count("addr")) addr = r->second["addr"];
+                    if (addr < 0 || addr + size > ((i128)1 << 64)) m.fail(s->loc, "the region does not fit in 64 bits");
+                    for (auto& o : sp->regions)
+                        if (addr < o.addr + o.size && o.addr < addr + size)
+                            m.fail(s->loc, "the region overlaps another region of " + sp->path);
+                    sp->regions.push_back({addr, size, alloc});
+                    continue;
+                }
+                if (s->k != Stmt::Assign || s->op != "=" || s->lhs->k != Expr::Ref)
+                    m.fail(s->loc, "an exec " + x.kind + " block may only hold assignments to component fields and address regions");
+                auto r = regions.find(s->lhs->path[0].name);
+                if (r != regions.end() && s->lhs->scope.empty()) {
+                    const auto& lp = s->lhs->path;
+                    if (lp.size() != 2 || (lp[1].name != "size" && lp[1].name != "addr"))
+                        m.fail(s->loc, "an address region has a size and an addr");
+                    r->second[lp[1].name] = constEval(*s->e, nullptr, c);
+                    continue;
+                }
+                std::string key;
+                CompInst* t = walkComp(c, s->lhs->path, key);
                 if (!t->attrs.count(key)) m.fail(s->loc, "no component field '" + key + "' in " + t->path);
                 t->attrs[key] = constEval(*s->e, nullptr, c);
             }
@@ -401,7 +489,7 @@ struct Design {
                 }
             std::vector<TypeDecl*> roots;
             for (TypeDecl* t : cs)
-                if (!held.count(t)) roots.push_back(t);
+                if (!held.count(t) && t->qname.rfind("addr_reg_pkg::", 0) != 0) roots.push_back(t);
             if (top != "pss_top" || roots.size() != 1)
                 throw Error("no component '" + top + "' (name the root component with -top)");
             topT = roots[0];
@@ -522,6 +610,7 @@ struct Scenario {
     std::vector<CN> ar;
     std::vector<std::pair<int, const Act*>> binds;
     std::vector<Locals> bindLocals;
+    std::vector<int> defaults;   // "constraint default": held unless the model constrains the variable
     int root = -1;
     int index = 0, attempt = 0;
     uint64_t seed = 0;
@@ -931,6 +1020,14 @@ struct Scenario {
     // A constraint item into root nodes (each must be true). `guard` is the
     // condition it sits under (-1: none).
     void compileCons(const Cons& c, const Scope& sc, int guard, std::vector<int>& out) {
+        if (c.isDefault) {
+            Cons plain = c;
+            plain.isDefault = false;
+            std::vector<int> tmp;
+            compileCons(plain, sc, guard, tmp);
+            defaults.insert(defaults.end(), tmp.begin(), tmp.end());
+            return;
+        }
         auto emit = [&](int n) {
             if (guard >= 0) n = fold(Op::LOr, fold(Op::LNot, guard, -1), n);
             if (isConst(n) && ar[n].v) return;
@@ -1590,12 +1687,100 @@ struct Scenario {
         }
     }
 
+    // A default constraint holds when no other constraint of the scenario
+    // mentions its variables.
+    void applyDefaults(std::vector<int>& roots) {
+        if (defaults.empty()) return;
+        std::vector<char> used(vars.size(), 0);
+        std::vector<int> vs;
+        for (int r : roots) varsOf(r, vs);
+        for (int v : vs) used[v] = 1;
+        for (int dn : defaults) {
+            vs.clear();
+            varsOf(dn, vs);
+            bool free = true;
+            for (int v : vs) free &= !used[v];
+            if (free) roots.push_back(dn);
+        }
+    }
+
+    // Address claims (addr_reg_pkg): each lies in an allocatable region of
+    // its address space, aligned, and two claims that are alive at the same
+    // time do not overlap. A claim in an action lives as long as the action
+    // (for the rest of the test when permanent); one in a buffer or stream
+    // lives from the action that writes it to the end of the test.
+    void addressClaims(std::vector<int>& roots) {
+        struct Claim {
+            int addr, size, align, perm, tnode;
+            bool open;
+            const CompInst* space;
+        };
+        std::vector<Claim> cl;
+        auto collect = [&](const StructList& sl, const std::map<std::string, int>& vm, const CompInst* comp, int tnode, bool open,
+                           const std::string& owner, Loc l) {
+            for (auto& st : sl) {
+                if (!d.isA(st.first, "addr_reg_pkg::addr_claim_s")) continue;
+                std::string what = "address claim '" + owner + "." + st.second.substr(0, st.second.size() - 1) + "'";
+                auto a = vm.find(st.second + "addr");
+                if (a == vm.end()) d.m.fail(l, what + ": only transparent_addr_claim_s claims are supported yet");
+                Claim c{a->second, vm.at(st.second + "size"), vm.at(st.second + "alignment"), vm.at(st.second + "permanent"),
+                        tnode, open, d.spaceFor(comp)};
+                if (!vars[c.addr].isRand) d.m.fail(l, what + " must be rand");
+                if (!c.space) d.m.fail(l, what + ": no address space is visible from component " + comp->path);
+                if (c.space->regions.empty()) d.m.fail(l, what + ": address space " + c.space->path + " has no regions");
+                cl.push_back(c);
+            }
+        };
+        for (auto& a : ais) collect(a.structs, a.vars, a.comp, a.node, false, a.name, a.type->loc);
+        for (auto& o : objs) {
+            if (o.structs.empty()) continue;
+            int by = o.producer >= 0 ? o.producer : o.ai;
+            collect(o.structs, o.vars, d.pools[o.pool].owner, by >= 0 ? ais[by].node : root, o.producer >= 0 || by < 0, o.name,
+                    o.type->loc);
+        }
+        if (cl.empty()) return;
+        auto V = [&](int v) { return node(Op::Var, v); };
+        auto K = [&](i128 x) { return node(Op::Const, -1, -1, -1, x); };
+        std::vector<int> end(cl.size());
+        for (size_t i = 0; i < cl.size(); i++) {
+            const Claim& c = cl[i];
+            end[i] = node(Op::Add, V(c.addr), V(c.size));
+            roots.push_back(node(Op::Ge, V(c.size), K(1)));
+            roots.push_back(node(Op::Ge, V(c.align), K(1)));
+            roots.push_back(node(Op::Eq, node(Op::Mod, V(c.addr), V(c.align)), K(0)));
+            int in = -1;
+            for (auto& r : c.space->regions) {
+                if (r.alloc) {
+                    int x = node(Op::LAnd, node(Op::Ge, V(c.addr), K(r.addr)), node(Op::Le, end[i], K(r.addr + r.size)));
+                    in = in < 0 ? x : node(Op::LOr, in, x);
+                } else {
+                    roots.push_back(node(Op::LOr, node(Op::Le, end[i], K(r.addr)), node(Op::Ge, V(c.addr), K(r.addr + r.size))));
+                }
+            }
+            if (in < 0) d.m.fail(d.rootAction->loc, "address space " + c.space->path + " has no allocatable region");
+            roots.push_back(in);
+        }
+        for (size_t i = 0; i < cl.size(); i++)
+            for (size_t j = i + 1; j < cl.size(); j++) {
+                const Claim& x = cl[i];
+                const Claim& y = cl[j];
+                if (x.space != y.space) continue;
+                int apart = node(Op::LOr, node(Op::Le, end[i], V(y.addr)), node(Op::Le, end[j], V(x.addr)));
+                char r = relation(x.tnode, y.tnode);
+                const Claim* first = r == 'b' ? &x : r == 'a' ? &y : nullptr;
+                // The earlier claim is gone when the later one starts, unless it is permanent.
+                if (first && !first->open) apart = node(Op::LOr, node(Op::LNot, V(first->perm)), apart);
+                roots.push_back(apart);
+            }
+    }
+
     // ----------------------------------------------------------------- build
     void build() {
         int a = newAI(d.rootAction, -1, d.rootAction->name, nullptr, d.rootAction->loc);
         root = expandAction(a, -1, 0);
         bindAll();
         ar.clear();
+        defaults.clear();
         std::vector<int> roots;
         for (size_t i = 0; i < ais.size(); i++) actionCons((int)i, roots);
         for (size_t i = 0; i < objs.size(); i++) objectCons((int)i, roots);
@@ -1618,6 +1803,8 @@ struct Scenario {
                     roots.push_back(node(Op::Ne, node(Op::Var, x.idVar), node(Op::Var, y.idVar)));
                 }
         }
+        applyDefaults(roots);
+        addressClaims(roots);
         if (!solve(roots, 2000000)) throw Retry{"the constraints have no solution the solver could find"};
         for (size_t v = 0; v < vars.size(); v++) {
             if (!hull[v].single()) {
