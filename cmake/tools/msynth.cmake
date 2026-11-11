@@ -45,17 +45,31 @@ if(Python3_FOUND)
                      $<TARGET_FILE:msynth> $<TARGET_FILE:msim> ${CMAKE_SOURCE_DIR}/tests/synth
                      ${CMAKE_CURRENT_BINARY_DIR}/msynth_test_nand ${t} ${CMAKE_SOURCE_DIR}/tests/synth/nand.lib)
   endforeach()
+  # High effort hands the logic to ABC (src/synth/abc.hpp), a separate
+  # program; tested where one is installed (CI builds it from source).
+  find_program(MSYNTH_ABC_PROGRAM NAMES abc berkeley-abc yosys-abc)
+  if(MSYNTH_ABC_PROGRAM)
+    foreach(t counter alu fsm hier mem sweep)
+      add_test(NAME msynth_${t}_abc
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/run_test.py
+                       $<TARGET_FILE:msynth> $<TARGET_FILE:msim> ${CMAKE_SOURCE_DIR}/tests/synth
+                       ${CMAKE_CURRENT_BINARY_DIR}/msynth_test ${t} abc)
+      set_tests_properties(msynth_${t}_abc PROPERTIES ENVIRONMENT "MSYNTH_ABC=${MSYNTH_ABC_PROGRAM}")
+    endforeach()
+  endif()
   # The netlist is also proven equivalent to the RTL by mequiv, and a netlist
-  # with one gate swapped must be reported as different.
-  # (sweep is not in this list: its registers stuck at their reset value are
-  # constants in the netlist, which a combinational check with free state
-  # cannot know.)
+  # with one gate swapped must be reported as different. On the default
+  # library and on the inverter/NAND/flop one.
   if(TARGET mequiv)
-    foreach(t counter alu fsm hier)
+    foreach(t counter alu fsm hier mem sweep)
       add_test(NAME msynth_equiv_${t}
                COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/equiv_test.py
                        $<TARGET_FILE:msynth> $<TARGET_FILE:mequiv> ${CMAKE_SOURCE_DIR}/tests/synth
                        ${CMAKE_CURRENT_BINARY_DIR}/msynth_test ${t})
+      add_test(NAME msynth_equiv_${t}_nand
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/equiv_test.py
+                       $<TARGET_FILE:msynth> $<TARGET_FILE:mequiv> ${CMAKE_SOURCE_DIR}/tests/synth
+                       ${CMAKE_CURRENT_BINARY_DIR}/msynth_test ${t} ${CMAKE_SOURCE_DIR}/tests/synth/nand.lib)
     endforeach()
   endif()
   # The area steps (register sweep, enable flops, 4:1 muxes) show in the netlist.

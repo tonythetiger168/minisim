@@ -28,6 +28,7 @@
 #include "gnetlist.hpp"
 #include "synth/map.hpp"
 #include "synth/sta.hpp"
+#include "synth/abc.hpp"
 #ifdef MSYNTH_HAVE_SAT
 #include "synth/fraig.hpp"
 #endif
@@ -300,7 +301,7 @@ struct Shell {
     }
 
     // ---------------------------------------------------------- compile
-    void compile(bool forceDelay) {
+    void compile(bool forceDelay, bool highEffort = false) {
         if (!des) throw tcl::Error("no design; run elaborate first");
         needLib();
         digest();
@@ -310,13 +311,41 @@ struct Shell {
             mergeMux4(a, lib);
             bufferFanout(a, lib, sdc.maxFanout);
             Timing ta = analyze(a, sdc);
+            // High effort: ABC restructures the logic, and the result is kept
+            // when it maps smaller without losing slack.
+            std::string useAbc = var("msynth_abc", "auto");
+            if (useAbc == "true" || (useAbc != "false" && highEffort)) {
+                std::string prog = abcProgram();
+                if (prog.empty()) {
+                    if (useAbc == "true") out("Warning: msynth_abc is true but no abc program was found (MSYNTH_ABC, or abc, berkeley-abc, yosys-abc on PATH).\n");
+                } else {
+                    try {
+                        Design r = abcRestructure(*des, prog, var("msynth_abc_script", abcDefaultScript()));
+                        Netlist c = Mapper(r, lib, false).run();
+                        mergeMux4(c, lib);
+                        bufferFanout(c, lib, sdc.maxFanout);
+                        Timing tc = analyze(c, sdc);
+                        bool keep = c.area() < a.area() - 1e-9 && (!ta.constrained || tc.wns >= std::min(ta.wns, 0.0) - 1e-9);
+                        if (!quiet)
+                            outf("Information: ABC restructuring: area %.2f against %.2f, %s.\n", c.area(), a.area(), keep ? "kept" : "not kept");
+                        if (keep) {
+                            a = std::move(c);
+                            ta = std::move(tc);
+                        }
+                    } catch (AbcError& e) {
+                        out(std::string("Warning: ABC restructuring skipped: ") + e.what() + "\n");
+                    }
+                }
+            }
             bool viol = ta.constrained && ta.wns < 0;
-            if (viol || forceDelay) {
+            // The delay-driven mapping is for a clock that is not met (or, at
+            // high effort, to see whether it gives the same slack smaller);
+            // without constraints the smallest netlist stands.
+            if (viol || (forceDelay && ta.constrained)) {
                 Netlist b = Mapper(*des, lib, true).run();
                 bufferFanout(b, lib, sdc.maxFanout);
                 Timing tb = analyze(b, sdc);
-                bool pickB = ta.constrained ? (tb.wns > ta.wns + 1e-9 || (tb.wns >= ta.wns - 1e-9 && b.area() < a.area()))
-                                            : tb.critical < ta.critical;
+                bool pickB = tb.wns > ta.wns + 1e-9 || (tb.wns >= ta.wns - 1e-9 && b.area() < a.area());
                 if (pickB) {
                     a = std::move(b);
                     ta = std::move(tb);
@@ -818,11 +847,12 @@ struct Shell {
         // ---- synthesis
         auto doCompile = [this](Words& w) {
             Args a = parseArgs(w, {"-map_effort", "-area_effort", "-power_effort"});
-            compile(a.has("-timing_high_effort_script") || a.get("-map_effort") == "high" || w[0] == "compile_ultra");
+            bool high = a.get("-map_effort") == "high" || w[0] == "compile_ultra";
+            compile(a.has("-timing_high_effort_script") || high, high);
             return std::string("1");
         };
         cmd("compile", "compile [-map_effort low|medium|high]: optimize and map the design onto the target library", doCompile);
-        cmd("compile_ultra", "compile_ultra: compile with the delay-driven mapping always tried", doCompile);
+        cmd("compile_ultra", "compile_ultra: compile at high effort (ABC restructuring when an abc program is found; the delay-driven mapping always tried)", doCompile);
         cmd("check_design", "check_design: summary and warnings of the elaborated design", [this](Words&) {
             if (!des) throw tcl::Error("no design; run elaborate first");
             for (auto& x : des->warnings) out("Warning: " + x + "\n");

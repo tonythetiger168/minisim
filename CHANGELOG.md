@@ -7,7 +7,20 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Changed
+- License: the repository is Apache-2.0 (`LICENSE`, attribution in `NOTICE`)
+  instead of MIT. The MIT grant is not withdrawn: copies obtained under it
+  stay under it, and so does the git history. `docs/LICENSING.md` holds the
+  open-core policy, the proposed free / paid split per tool, and the rule
+  that no GPL or other copyleft code enters the tree.
+
 ### Added
+- `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
+  built from the spare cells of the old netlist and the cells the change
+  frees, by function (the same cell, or one with inputs tied or shared, or
+  the inverse plus a spare inverter); no cell is added or removed, and the
+  script holds only net connections. Exit status 3 when a cell had to be
+  added after all. See `docs/ECO.md`.
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
   changed, and the assignments that write them. The viewer page does the same.
@@ -157,6 +170,12 @@ Spec references are IEEE 1800-2023 clauses.
   count. `ETCH` on a conductor gives the width as made. `src/spef.hpp` is the
   SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `lib/sky130`: cells of the open SkyWater 130 nm library (Apache-2.0) as a
+  second test library: a 47-cell Liberty subset with its LEF and technology
+  LEF, `sky130.py fetch` for the whole library at three corners (pinned
+  commits, SHA-256 checked), and a `sky130` test that runs `mlibc`, `msynth`,
+  `msta` and `mpower` on it. `mlibc` no longer expects a LEF pin for a
+  Liberty `internal` pin, and `mlibc report` fits long cell names.
 - `mchar`, cell library characterization on `mspice`: from a Liberty
   template and one transistor `.subckt` per cell it measures delay and
   transition tables (combinational, clock-to-output, set and reset arcs,
@@ -216,6 +235,11 @@ Spec references are IEEE 1800-2023 clauses.
   constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
   ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
   See `docs/SYNTH.md`.
+- `msynth` high effort (`compile -map_effort high`, `compile_ultra`):
+  the logic is restructured by ABC, run as a separate program (`abc`,
+  `berkeley-abc` or `yosys-abc` on `PATH`, or `$MSYNTH_ABC`), and the
+  smaller of the two mapped results is kept. Without constraints the
+  smallest netlist now stands (high effort used to pick the faster one).
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
@@ -341,6 +365,12 @@ Spec references are IEEE 1800-2023 clauses.
   simulator reports stuck-at, transition, coupling and address-decoder
   coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
   expected results come from that simulator. See `docs/DFT.md`.
+- `mpss`: address spaces (`addr_reg_pkg`). A model declares a
+  `transparent_addr_space_c<>` with regions, and actions and buffers claim
+  memory from it with `transparent_addr_claim_s<>`; claims that are alive at
+  the same time never overlap, so `examples/pss/dma.pss` now checks the
+  copied data. Also `constraint default`, and `x.f()` calls and region
+  variables in `exec init`.
 - `mpss`, portable stimulus: reads a model in the Accellera PSS language
   (components, actions, buffers, streams, resources and pools, constraints,
   activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
@@ -362,6 +392,13 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -svrf rules.svrf` reads rule files in the SVRF style that foundry
+  decks use (`LAYER`, `LAYER MAP`, `AND`/`OR`/`NOT`/`XOR`, `INTERACT`,
+  `INSIDE`, `OUTSIDE`, `SIZE`, `HOLES`, `RECTANGLE`, rule blocks with `INT`,
+  `EXT`, `ENC`, `AREA`, `DENSITY`, `#IFDEF`, `INCLUDE`) and translates them
+  to the native deck (`-write-deck`). Options it does not apply are listed
+  in warnings; statements it cannot run are errors with their line. Decks
+  can now name every datatype of a layer (`layer m1 68/*`).
 - `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
   database, to step through them in KLayout's marker browser.
 - `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
@@ -452,6 +489,10 @@ Spec references are IEEE 1800-2023 clauses.
 - `mdft -edt`: scan test compression. A ring-generator decompressor and an
   XOR compactor around the scan chains, and an encoder that solves test
   cubes into channel data over GF(2), in parallel and deterministically.
+  With the gate netlist it simulates each compressed pattern and writes the
+  expected output channels and a load / capture / compare testbench;
+  `-edt_xmask` adds compactor X masking (one chain per channel observed,
+  mask chosen per pattern) so unknown captures do not hide known ones.
 - `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
   on the gate netlist (port inputs at 0, scan cells observed), with the
   coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
@@ -538,6 +579,16 @@ Spec references are IEEE 1800-2023 clauses.
   resets to flop pins. `-nocarry` and `-noce` turn each off.
 - `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
   `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mlint` runs slang-tidy's checks (the lint tool that ships with slang, MIT)
+  as rules `TIDY001`..`TIDY021`, with mlint's severities, waivers, JSON and
+  threads; the checks mlint already had a rule for are left out. See
+  `docs/LINT.md` and `THIRD_PARTY_NOTICES.md`.
+- `mlint` has 13 text and syntax rules that follow Verible's lint rules
+  (`FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009`):
+  line length, tabs, trailing spaces, stray semicolons, `` `endif ``
+  comments, package file names, explicit lifetimes and parameter types,
+  range direction, macro names, short binary literals. Off by default; one
+  task per file, same output at any `-threads`.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
@@ -557,6 +608,11 @@ Spec references are IEEE 1800-2023 clauses.
   nodes) and `spice::Reader::readText()` for netlists held in memory.
   mspice now runs on the shared thread pool of `src/parallel.hpp`, which
   gains `Pool::spin()` for short batches that come one after the other.
+- `mfpga`: a multiplier wider than one DSP block is split into block-sized
+  partial products summed on carry chains (32x32 on ECP5: 4 blocks, no LUTs).
+- `mfpga`: memories with registered reads map to block RAM on iCE40
+  (`SB_RAM40_4K`) and ECP5 (`DP16KD`), with a bypass that keeps the RTL's
+  read-during-write result. `-noram` keeps flops.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

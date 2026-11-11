@@ -477,6 +477,15 @@ a macro of the wrong size, pins off the routing grid); `mlibc report` and
 corners. See `docs/LIBCHECK.md`. The generic cell library it is tested on is
 `lib/mini45` (`docs/MINI45.md`).
 
+
+### A real PDK as test data: sky130
+
+`lib/sky130` holds 47 cells of the open SkyWater 130 nm library (Liberty,
+LEF and technology LEF, Apache-2.0, unmodified extracts) as a second test
+library beside `lib/mini45`, and `python3 lib/sky130/sky130.py fetch`
+downloads all 428 cells at three corners. The `sky130` test runs `mlibc`,
+`msynth`, `msta` and `mpower` on it. See `lib/sky130/README.md`.
+
 ### Timing constraint checks: `msdc`
 
 `msdc` reads the design and its SDC file and reports what is wrong or missing
@@ -537,6 +546,8 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
 | `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
 | `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
+| `format`, `suspicious` | `FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009` | Verible-style text and syntax rules (off until enabled): line length, tabs, trailing spaces, stray semicolons, `` `endif `` comments, explicit lifetimes and parameter types, range direction |
+| `tidy` | `TIDY001`..`TIDY021` | slang-tidy's checks, built in: registers assigned only in reset, undriven bit ranges, struct fields split over processes, port and typedef style |
 | `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
@@ -850,6 +861,7 @@ the default configuration.
 ```sh
 mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
 mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
+mpv drc -svrf rules.svrf chip.gds -rdb drc.lyrdb               # SVRF-style rules; markers for KLayout
 ```
 
 ```
@@ -911,4 +923,8 @@ cmake at another build with `-DIVERILOG=... -DVVP=...`. To add one, drop a `.sv`
 
 ## License
 
-MIT
+Apache License 2.0 (`LICENSE`, attribution in `NOTICE`). Until 2026-11-11 the
+repository was MIT; that grant is not withdrawn, and copies obtained under it
+stay under it. Paid tools are a separate, closed-source product; which tool is
+in which edition, and the rules on third-party code, are in
+[`docs/LICENSING.md`](docs/LICENSING.md).
