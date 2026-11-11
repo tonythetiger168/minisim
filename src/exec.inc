@@ -336,6 +336,10 @@ inline void dynExec(const Instr& i) {
             break;
         }
         case D_DELETE: d.vec.clear(); d.map.clear(); break;
+        case D_DEFAULT:   // with a value: the new default; without: back to the type's own
+            if (i.e) { if (!d.userDflt) d.typeDflt = d.dflt; d.dflt = eval(i.e, rd); d.userDflt = true; }
+            else if (d.userDflt) { d.dflt = d.typeDflt; d.userDflt = false; }
+            break;
         case D_DELETE_AT: {
             if (d.kind == 2) { d.map.erase(d.key(arg(0))); break; }
             int64_t k = idx(0);
@@ -375,6 +379,10 @@ inline void dynExec(const Instr& i) {
         }
         case D_COPY: {
             dynAssign(d, dynStore()[dsrc]);
+            if (const DynObj& so = dynStore()[dsrc]; so.userDflt && d.kind == 2) {   // the default travels with the array (7.9.11)
+                if (!d.userDflt) d.typeDflt = d.dflt;
+                d.dflt = so.dflt; d.userDflt = true;
+            }
             break;
         }
         case D_APPEND: {   // {q, r}: every element of r

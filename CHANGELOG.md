@@ -75,6 +75,14 @@ Spec references are IEEE 1800-2023 clauses.
   never hold is flagged.
 - `mformal -app toggle`: unreachable-coverage analysis. Reports every
   signal bit that can never be 0 or never be 1 after the reset.
+- `memu` is timing-aware between FPGAs: on a link with too few wires the
+  signals on the longest combinational paths keep a wire of their own and the
+  rest share what is left (40% fewer `emu_clk` cycles per event on a
+  910,000-cell netlist), and every partitioning attempt is routed and timed
+  so the fastest one is kept, not the smallest cut. `-partitioner CMD` lets
+  another partitioner compete (`tools/memu_mtkahypar.py` for Mt-KaHyPar). The
+  per-FPGA netlists now go through `mfpga` (the test maps a three-FPGA split
+  to iCE40 and checks it against the original netlist).
 - `mformal -aiger FILE` writes the model as AIGER 1.9 (bad-state
   properties for assertions and covers, invariant constraints for
   assumptions), so other model checkers can run on it or cross-check a
@@ -513,6 +521,14 @@ Spec references are IEEE 1800-2023 clauses.
   thread count. See docs/JTAG.md.
 
 ### Fixed
+- msim: four faults found by re-measuring the spec table with uvm-core.
+  `void'($cast(d, s))` no longer reports an error when the cast fails; only
+  the task form does (8.16). `'{default: v}` on an associative array sets
+  the value a missing element reads as (7.9.11); this lets
+  `uvm_sequence_library` compile. A hierarchical name can end in an element
+  of an unpacked array in an expression (`top.u.m[2]`, 23.6).
+  `pre_randomize` / `post_randomize` declared `extern` are called (18.6.2);
+  before, `uvm_reg::randomize()` left the fields' desired values unchanged.
 - An inout port connected to a whole net is now that net (23.3.3.1). It was
   two continuous assignments, one each way, so the net kept the last value
   driven after every driver had gone to z.
