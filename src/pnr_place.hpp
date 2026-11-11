@@ -21,6 +21,8 @@ struct PlaceOptions {
   double aspect = 1.0;          // core height / width
   double marginUm = -1;         // core to die; -1: four row heights
   int maxIter = 60;
+  const std::vector<double>* netWeight = nullptr;   // per net of the design, for timing-driven placement
+  double reserve = 0;           // area kept free for cells added after the floorplan, dbu^2
   bool fillers = true;
   bool verbose = false;
 };
@@ -136,7 +138,7 @@ inline void floorplan(DB& db, const PlaceOptions& opt, int minLayer) {
     area += (double)in.m->w * in.m->h;
   }
   if (opt.util <= 0 || opt.util > 1) throw std::runtime_error("-util must be above 0 and at most 1");
-  double coreArea = area / opt.util;
+  double coreArea = (area + opt.reserve) / opt.util;
   int64_t h = snapUp((int64_t)std::ceil(std::sqrt(coreArea * opt.aspect)), site->h);
   if (h < site->h) h = site->h;
   int64_t w = snapUp((int64_t)std::ceil(coreArea / (double)h), site->w);
@@ -258,6 +260,7 @@ class Placer {
   struct PinRef { int var; double ox, oy; };
   std::vector<PinRef> pref;
   std::vector<int> netStart, netPin;     // nets with 2+ pins, flattened
+  std::vector<double> netWt;             // weight of each of them
 
   void setup() {
     varOf.assign(db.insts.size(), -1);
@@ -280,13 +283,15 @@ class Placer {
       }
     }
     netStart.push_back(0);
-    for (auto& nt : db.nets) {
+    for (size_t ni = 0; ni < db.nets.size(); ni++) {
+      const Net& nt = db.nets[ni];
       if (nt.pins.size() < 2) continue;
       bool anyMov = false;
       for (int p : nt.pins) anyMov |= pref[p].var >= 0;
       if (!anyMov) continue;
       for (int p : nt.pins) netPin.push_back(p);
       netStart.push_back((int)netPin.size());
+      netWt.push_back(opt.netWeight && ni < opt.netWeight->size() ? (*opt.netWeight)[ni] : 1.0);
     }
   }
 
@@ -341,7 +346,7 @@ class Placer {
           const PinRef& a = pref[netPin[i]]; const PinRef& b = pref[netPin[j]];
           if (a.var < 0 && b.var < 0) return;
           double pa = pinCoord(netPin[i], axis, c), pb = pinCoord(netPin[j], axis, c);
-          double w = 2.0 / ((cnt - 1) * (std::fabs(pa - pb) + eps));
+          double w = netWt[k] * 2.0 / ((cnt - 1) * (std::fabs(pa - pb) + eps));
           double oa = axis ? a.oy : a.ox, ob = axis ? b.oy : b.ox;
           // w * (xa + oa - xb - ob)^2
           if (a.var >= 0 && b.var >= 0) {

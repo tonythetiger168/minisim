@@ -321,6 +321,30 @@ void testChecks() {
         assert((r[0].markers[2].box == Rect{900, 970, 1000, 1000}) && near(r[0].markers[2].value, 0.03));
         assert((r[0].markers[3].box == Rect{1000, 800, 1070, 970}) && near(r[0].markers[3].value, 0));
     }
+    {   // enclosure on two opposite sides: 60 left and right is enough, whatever is above and below
+        Shapes s;
+        s.add(2, {0, 0, 290, 170});          // b just covers the cut in y, 60 on each side in x
+        s.add(1, {60, 0, 230, 170});         // passes: left and right
+        s.add(2, {1000, 0, 1170, 290});
+        s.add(1, {1000, 60, 1170, 230});     // passes: bottom and top
+        s.add(2, {2000, 0, 2260, 260});
+        s.add(1, {2060, 60, 2230, 230});     // fails: 60 left and bottom, 30 right and top
+        s.add(2, {3000, 0, 3300, 300});
+        s.add(1, {3060, 60, 3230, 230});     // passes: 60 or more all round
+        s.add(2, {4000, 0, 4260, 290});
+        s.add(1, {4060, 60, 4230, 230});     // passes: 30 on the right only, bottom and top are 60
+        std::string deck = std::string(layers) + "rule e enclosure(a, b, opposite) < 0.06\nrule p enclosure(a, b) < 0.06\n";
+        auto r = runDeck(deck, s.flat);
+        assert(r[0].markers.size() == 2);
+        assert((r[0].markers[0].box == Rect{2060, 230, 2230, 260}) && near(r[0].markers[0].value, 0.03));
+        assert((r[0].markers[1].box == Rect{2230, 60, 2260, 230}) && near(r[0].markers[1].value, 0.03));
+        // The plain rule reports every short side: 2 + 2 flush, 2, 0, 1.
+        assert(r[1].markers.size() == 7);
+        drc::Deck bad;
+        std::string err;
+        std::istringstream in(std::string(layers) + "rule e enclosure(a, b, both) < 0.06\n");
+        assert(!drc::parseDeck(in, bad, err) && err.find("can only be opposite") != std::string::npos);
+    }
     {   // overhang: a gate whose end cap is 100 on one end and 130 on the other
         Shapes s;
         s.add(2, {0, 0, 1000, 500});         // diff

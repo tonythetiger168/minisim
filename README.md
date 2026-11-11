@@ -30,6 +30,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Emulation and FPGA prototyping**: `memu` puts a gate-level netlist on a board of FPGAs (clock conversion, memory mapping, partitioning, pin multiplexing, probes, transactors to `msim -mvp` models and to testbench classes) and writes a testbench that checks the emulation against the netlist; see [docs/EMULATION.md](docs/EMULATION.md)
 - **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
+- **SPICE**: `mspice` runs DC, AC and transient analyses of a SPICE netlist (R, C, L, coupled inductors, sources, diodes, level-1 MOSFETs, bipolar transistors, subcircuits, `.measure`, `.step`), multi-threaded, checked against ngspice; see [docs/SPICE.md](docs/SPICE.md)
+- **Cell characterization**: `mchar` measures a cell library from its transistor netlists on `mspice` and writes Liberty: delay and transition tables, setup, hold, recovery and removal, internal power, pin capacitance; multi-threaded with identical output on any thread count. The mini45 library is measured with it; see [docs/CHAR.md](docs/CHAR.md)
 
 ## Layout
 
@@ -446,6 +448,9 @@ against the C. See [docs/HLS.md](docs/HLS.md).
 mhls fir.c -top fir -clock 5 -o fir.sv -tb fir_tb.sv
 msim fir.sv fir_tb.sv -top fir_tb          # PASS: fir 20 calls, latency 2..2 cycles
 ```
+
+C++ classes and templates go through the installed clang:
+`mhls fir.cpp -clang -top fir4 -o fir4.sv`.
 
 ### Datapath library: `dw/`
 

@@ -8,6 +8,18 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpnr -lib FILE -sdc FILE`: timing of the placed design with the engine
+  behind `msta` (wires estimated from the placement), reported after global
+  placement and after legalization with the clocks propagated through
+  their trees (setup and hold WNS/TNS, skew per clock), and timing-driven
+  placement: nets on slow paths are weighted in a second placement pass
+  (`-no_timing_driven` to only report).
+- `mpnr` clock tree synthesis: every clock net with more loads than
+  `-cts_fanout` (16) gets a tree of buffers, clustered by position level by
+  level down to one root buffer, so every flop sits behind the same number
+  of buffers. On by default (`-no_cts`); `-cts_buf CELL`, `-clock NET`. The
+  buffers are in the DEF and the written netlist, and the run reports the
+  shortest and longest driver-to-load wire of each tree.
 - `mdebug`: struct fields in the active-driver trace (conditions on a field
   are evaluated; each field and constant part select has its own driver).
 - `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
@@ -115,6 +127,19 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `mchar`, cell library characterization on `mspice`: from a Liberty
+  template and one transistor `.subckt` per cell it measures delay and
+  transition tables (combinational, clock-to-output, set and reset arcs,
+  tristate enable), setup, hold, recovery and removal tables and minimum
+  pulse widths by bisection, internal energy,
+  pin capacitance and leakage, and writes Liberty with the shared writer.
+  The stimulus for each arc is found from the Liberty functions and `ff` /
+  `latch` groups. Every table point runs as its own task on all logical
+  CPUs (`-threads N`) with byte-identical output. `lib/mini45` gains
+  transistor netlists (`mini45.sp`) and device models per corner, and its
+  timing, power and capacitance tables are now measured, not analytic
+  (leakage and tristate disable arcs stay analytic). See
+  `docs/CHAR.md`.
 - `mlibc`, cell library checks and reports on the shared Liberty and LEF
   readers: `mlibc check` (23 rules: function against timing arcs and
   `timing_sense`, tables that shrink with load, missing setup or hold,
@@ -188,6 +213,18 @@ Spec references are IEEE 1800-2023 clauses.
 - `mhls -handshake`: also writes `<top>_hs`, the block behind
   `in_valid`/`in_ready` and `out_valid`/`out_ready` ports (FSM and pipeline);
   the generated testbench drives it with a sink that refuses now and then.
+- `mhls`: stream arguments. A `hls::stream<T>&` parameter becomes a
+  `tdata`/`tvalid`/`tready` port; `read()` and `write(x)` are transfers the
+  state machine waits for. `include/mhls_stream.h` runs the same source on
+  the host; the testbench source and sink hesitate on every other call. A
+  pipelined loop over streams moves one element per cycle and stalls as a
+  whole.
+- `mhls -clang`: C++ classes and templates. The installed clang (run as a
+  program) reads the source; mhls reduces its syntax tree to plain functions
+  over structs: member functions, constructors, operators, class and
+  function templates, default arguments, overloads, static members, scoped
+  enums, namespaces, and whatever the design uses from its headers
+  (`std::min`, `std::max` included). `-emit-c` shows the reduction.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -271,6 +308,12 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
+  database, to step through them in KLayout's marker browser.
+- `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
+  has the margin on two opposite sides (the foundry rule "on one of two
+  adjacent sides"). The SKY130 test deck gains li.5, licon.5c, m1.5,
+  via.5a and m2.5 (40 rules).
 - `mpv` reads OASIS layouts (SEMI P39) as well as GDSII, told apart by the
   file's first bytes: every record, repetition and point-list form, compact
   trapezoids, name tables, strict mode and compressed blocks (built-in
@@ -410,6 +453,25 @@ Spec references are IEEE 1800-2023 clauses.
   resets to flop pins. `-nocarry` and `-noce` turn each off.
 - `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
   `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
+  netlists with R, C, L, coupled inductors, independent and controlled
+  sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
+  transistors; `.model`, `.param` with expressions, nested `.subckt`,
+  `.include`, `.ic`, `.nodeset`, `.option`, `.print`, `.measure` and `.step`;
+  CSV (`-o`) and VCD (`-vcd`) output. Sparse LU with pivot reuse, latent
+  device bypass, and threads for `.step` runs, AC points and model
+  evaluation, with identical output at any `-threads`. Every test netlist is
+  checked against hand-worked values and against ngspice. See
+  `docs/SPICE.md`.
+- `mspice`: MOSFET evaluation and matrix assembly run in parallel (a
+  2,000-inverter chain goes from 1.14 s to 0.70 s on four threads, with the
+  same output bit for bit); `parmin` now defaults to 1024. The reader gains
+  `spice::flatten()`, a flat list of primitive elements for LVS and cell
+  characterization, printed by `mspice -flatten [-top name]`.
+- `mspice`: `.option chgtol=` (needed for accurate edges on femtofarad
+  nodes) and `spice::Reader::readText()` for netlists held in memory.
+  mspice now runs on the shared thread pool of `src/parallel.hpp`, which
+  gains `Pool::spin()` for short batches that come one after the other.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:
