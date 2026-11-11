@@ -258,6 +258,7 @@ it. One-hot registers tested bit by bit are followed too.
 | `CDC003` | warning | on | Combinational logic in front of a synchronizer (a glitch can be captured) |
 | `CDC004` | warning | on | Separately synchronized signals of one domain meet again (reconvergence) |
 | `CDC005` | warning | on | One signal synchronized more than once into the same domain |
+| `CDC006` | warning | on | With `-sdc`: a flop's clock is not a clock in the SDC file |
 
 ### Reset-domain crossings (`rdc`)
 

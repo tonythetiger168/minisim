@@ -121,6 +121,39 @@ if(NOT out MATCHES "\\[RDC004\\] 'rdc.s', reset by 'rdc.soft_n', feeds 'rdc.q4',
   message(FATAL_ERROR "rdc.sv -enable RDC004:\n${out}")
 endif()
 
+# -sdc: the file says which clocks are related. Clocks alone: primary clocks
+# are asynchronous, a generated clock goes with its master, and a clock the
+# file does not define is CDC006.
+run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_none.sdc;-cdc-report")
+foreach(want
+    "cdc_sdc.div2  1 flop  SDC clock DIV"
+    "cdc_sdc.mclk  1 flop  SDC clock C, T"
+    "cdc_sdc.uclk  1 flop  no SDC clock"
+    "[CDC001] 'cdc_sdc.a0' (clocked by cdc_sdc.aclk) is read by logic clocked by cdc_sdc.bclk"
+    "[CDC001] 'cdc_sdc.d0' (clocked by cdc_sdc.div2) is read by logic clocked by cdc_sdc.bclk"
+    "[CDC001] 'cdc_sdc.b0' (clocked by cdc_sdc.bclk) is read by logic clocked by cdc_sdc.cclk"
+    "[CDC001] 'cdc_sdc.c0' (clocked by cdc_sdc.cclk) is read by logic clocked by cdc_sdc.mclk"
+    "[CDC006] clock 'cdc_sdc.uclk' of 1 flop is not a clock in the SDC file"
+    "5 findings (CDC001 4, CDC006 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_none.sdc missing: ${want}\n${out}")
+  endif()
+endforeach()
+# set_clock_groups: A against B only; exclusive clocks are no crossing.
+run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_groups.sdc")
+if(NOT out MATCHES "'cdc_sdc.a0' \\(clocked by cdc_sdc.aclk\\) is read by logic clocked by cdc_sdc.bclk"
+   OR NOT out MATCHES "'cdc_sdc.d0' \\(clocked by cdc_sdc.div2\\) is read by logic clocked by cdc_sdc.bclk"
+   OR NOT out MATCHES "2 findings \\(CDC001 2\\)")
+  message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_groups.sdc:\n${out}")
+endif()
+# A false path between two clocks makes that pair asynchronous.
+run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_false.sdc")
+if(NOT out MATCHES "'cdc_sdc.b0' \\(clocked by cdc_sdc.bclk\\) is read by logic clocked by cdc_sdc.cclk"
+   OR NOT out MATCHES "1 finding \\(CDC001 1\\)")
+  message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_false.sdc:\n${out}")
+endif()
+
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
 set(one "${out}")

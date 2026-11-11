@@ -548,7 +548,7 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
 | `format`, `suspicious` | `FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009` | Verible-style text and syntax rules (off until enabled): line length, tabs, trailing spaces, stray semicolons, `` `endif `` comments, explicit lifetimes and parameter types, range direction |
 | `tidy` | `TIDY001`..`TIDY021` | slang-tidy's checks, built in: registers assigned only in reset, undriven bit ranges, struct fields split over processes, port and typedef style |
-| `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
+| `cdc`, `rdc` | `CDC001`..`CDC006`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
 mlint rtl/*.sv -config mlint.cfg -waivers waivers.cfg -json lint.json
@@ -566,7 +566,9 @@ the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 Clock and reset domains are found from the RTL: the clock of every
 edge-triggered block, followed through ports, buffers and clock gates, so one
 clock passed down through several modules stays one domain. `-cdc-report`
-lists every domain and crossing, `-clock-group a,b` declares related clocks
+lists every domain and crossing, `-sdc file.sdc` takes the clocks and their
+relations (generated clocks, `set_clock_groups`, false paths between clocks)
+from the timing constraints, `-clock-group a,b` declares related clocks
 and `-static sig` waives a quasi-static signal. Findings print as
 `file:line:col: severity: [RULE] text`, sorted by file and line.
 

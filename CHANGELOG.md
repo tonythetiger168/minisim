@@ -15,6 +15,13 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mlint -sdc file.sdc`: the CDC and RDC checks take the clocks and how they
+  are related from the timing constraints (shared SDC reader): generated
+  clocks are synchronous to their master, `set_clock_groups -asynchronous`
+  and a false path between two clocks make a pair a crossing, exclusive
+  groups are not checked, any other pair is synchronous. New rule `CDC006`:
+  a flop's clock is not a clock in the SDC file. `-cdc-report` lists the SDC
+  clocks of every domain (`docs/CDC.md`).
 - `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
   built from the spare cells of the old netlist and the cells the change
   frees, by function (the same cell, or one with inputs tied or shared, or
