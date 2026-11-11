@@ -3,6 +3,7 @@
 # variables, reads at their source (port copies) or does not compute unless a
 # waveform is open. Called with -DMSIM -DSRC -DOUT -DPY.
 set(CASES "examples/deadcopy.sv" "examples/cycle.sv" "examples/combbranch.sv")
+file(MAKE_DIRECTORY ${OUT})
 set(n 0)
 foreach(c IN LISTS CASES)
   execute_process(COMMAND ${MSIM} -threads 1 -no-static-comb -no-static-seq -no-partition ${SRC}/${c} -vcd ${OUT}/v${n}_ref.vcd
