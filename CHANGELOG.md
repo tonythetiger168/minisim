@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `memu` is timing-aware between FPGAs: on a link with too few wires the
+  signals on the longest combinational paths keep a wire of their own and the
+  rest share what is left (40% fewer `emu_clk` cycles per event on a
+  910,000-cell netlist), and every partitioning attempt is routed and timed
+  so the fastest one is kept, not the smallest cut. `-partitioner CMD` lets
+  another partitioner compete (`tools/memu_mtkahypar.py` for Mt-KaHyPar). The
+  per-FPGA netlists now go through `mfpga` (the test maps a three-FPGA split
+  to iCE40 and checks it against the original netlist).
 - `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
   elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
   the default waveform is unchanged. `mdebug -active` follows a memory read

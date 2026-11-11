@@ -124,7 +124,9 @@ jobs:
 
       # memu's test also runs its output through Yosys when there is one.
       - name: Install Yosys (optional)
-        run: pip install --user yowasp-yosys && echo "$HOME/.local/bin" >> "$GITHUB_PATH" || true
+        run: |
+          pip install --user yowasp-yosys && echo "$HOME/.local/bin" >> "$GITHUB_PATH" || true
+          pip install --user mtkahypar || true
 
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang
