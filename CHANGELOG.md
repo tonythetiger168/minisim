@@ -8,6 +8,20 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpnr -lib FILE -sdc FILE`: timing of the placed design with the engine
+  behind `msta` (wires estimated from the placement), reported after global
+  placement and after legalization with the clocks propagated through
+  their trees (setup and hold WNS/TNS, skew per clock), and timing-driven
+  placement: nets on slow paths are weighted in a second placement pass
+  (`-no_timing_driven` to only report).
+- `mpnr` clock tree synthesis: every clock net with more loads than
+  `-cts_fanout` (16) gets a tree of buffers, clustered by position level by
+  level down to one root buffer, so every flop sits behind the same number
+  of buffers. On by default (`-no_cts`); `-cts_buf CELL`, `-clock NET`. The
+  buffers are in the DEF and the written netlist, and the run reports the
+  shortest and longest driver-to-load wire of each tree.
+- `mdebug`: struct fields in the active-driver trace (conditions on a field
+  are evaluated; each field and constant part select has its own driver).
 - `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
   made for it (lower pad turned or lengthened, written to the DEF's `VIAS`),
   short pieces of wire and the pads of power via stacks are lengthened to
@@ -113,6 +127,19 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `mchar`, cell library characterization on `mspice`: from a Liberty
+  template and one transistor `.subckt` per cell it measures delay and
+  transition tables (combinational, clock-to-output, set and reset arcs,
+  tristate enable), setup, hold, recovery and removal tables and minimum
+  pulse widths by bisection, internal energy,
+  pin capacitance and leakage, and writes Liberty with the shared writer.
+  The stimulus for each arc is found from the Liberty functions and `ff` /
+  `latch` groups. Every table point runs as its own task on all logical
+  CPUs (`-threads N`) with byte-identical output. `lib/mini45` gains
+  transistor netlists (`mini45.sp`) and device models per corner, and its
+  timing, power and capacitance tables are now measured, not analytic
+  (leakage and tristate disable arcs stay analytic). See
+  `docs/CHAR.md`.
 - `mlibc`, cell library checks and reports on the shared Liberty and LEF
   readers: `mlibc check` (23 rules: function against timing arcs and
   `timing_sense`, tables that shrink with load, missing setup or hold,
@@ -144,7 +171,7 @@ Spec references are IEEE 1800-2023 clauses.
   `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
   mapped onto any Liberty library by cut matching for area or delay,
   high-fanout nets are buffered, and the result is timed with the library's
-  NLDM tables. A generic cell library is built in. Mapping runs on every
+  NLDM tables. The default library is mini45. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
@@ -269,6 +296,12 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
+  database, to step through them in KLayout's marker browser.
+- `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
+  has the margin on two opposite sides (the foundry rule "on one of two
+  adjacent sides"). The SKY130 test deck gains li.5, licon.5c, m1.5,
+  via.5a and m2.5 (40 rules).
 - `mpv` reads OASIS layouts (SEMI P39) as well as GDSII, told apart by the
   file's first bytes: every record, repetition and point-list form, compact
   trapezoids, name tables, strict mode and compressed blocks (built-in
@@ -383,6 +416,9 @@ Spec references are IEEE 1800-2023 clauses.
 - `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
   Verilog netlist reader / flattener / writer, shared by the timing,
   synthesis, power, equivalence and physical tools.
+- `mlint` state machine rules on the extractor FSM coverage uses: `FSM001` a
+  state never entered, `FSM002` a state with no way out, `FSM003` a state
+  case with no default that leaves encodings unused, `FSM004` no reset state.
 - `mpower`, power analysis on the msim front end: average power by group,
   instance and cell from SAIF, VCD or FST activity and Liberty
   `internal_power` / `leakage_power` tables; activity propagation for nets
@@ -400,6 +436,30 @@ Spec references are IEEE 1800-2023 clauses.
   `src/aig.hpp`, and writes Yosys JSON for nextpnr, EDIF or Verilog.
   Depth-optimal priority-cut mapping with area recovery; multithreaded, with
   the same output for any `-threads N`. See `docs/FPGA.md`.
+- `mfpga`: adders, subtractors and comparators map to the family's carry
+  chain (`SB_CARRY`, `CCU2C`, `CARRY4`), and clock enables and synchronous
+  resets to flop pins. `-nocarry` and `-noce` turn each off.
+- `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
+  `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
+  netlists with R, C, L, coupled inductors, independent and controlled
+  sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
+  transistors; `.model`, `.param` with expressions, nested `.subckt`,
+  `.include`, `.ic`, `.nodeset`, `.option`, `.print`, `.measure` and `.step`;
+  CSV (`-o`) and VCD (`-vcd`) output. Sparse LU with pivot reuse, latent
+  device bypass, and threads for `.step` runs, AC points and model
+  evaluation, with identical output at any `-threads`. Every test netlist is
+  checked against hand-worked values and against ngspice. See
+  `docs/SPICE.md`.
+- `mspice`: MOSFET evaluation and matrix assembly run in parallel (a
+  2,000-inverter chain goes from 1.14 s to 0.70 s on four threads, with the
+  same output bit for bit); `parmin` now defaults to 1024. The reader gains
+  `spice::flatten()`, a flat list of primitive elements for LVS and cell
+  characterization, printed by `mspice -flatten [-top name]`.
+- `mspice`: `.option chgtol=` (needed for accurate edges on femtofarad
+  nodes) and `spice::Reader::readText()` for netlists held in memory.
+  mspice now runs on the shared thread pool of `src/parallel.hpp`, which
+  gains `Pool::spin()` for short batches that come one after the other.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

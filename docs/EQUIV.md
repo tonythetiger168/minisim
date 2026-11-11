@@ -65,12 +65,17 @@ A netlist read together with its whole cell library has many unused modules;
    computes (asynchronous set/reset included, as written), and its trigger is
    the clock and async controls. A bit that a level-sensitive block does not
    assign on every path is a latch; that is decided by proof, so a full `case`
-   without a `default` is plain logic.
+   without a `default` is plain logic. An event that leaves a register
+   unchanged while it is active is left out of that register's trigger, so a
+   memory written in a block with an asynchronous reset that does not reset
+   it equals the plain clocked flops synthesis builds for it.
 3. **Matching.** Inputs, outputs and state elements are paired by name: exact,
    then normalized (`u_core.cnt[3]`, `u_core_cnt_reg_3_` and
    `\u_core/cnt_reg[3]` are one name), then by the cell instance that holds
    the state, then by the net on the flop's output pin, which also finds
-   registers that synthesis stored inverted. `-match REF=IMPL` and
+   registers that synthesis stored inverted. A struct or memory that
+   synthesis flattened is matched by bit position in the whole variable
+   (`item.valid` of a 12-bit struct is `item_reg_11_`). `-match REF=IMPL` and
    `-matchfile` add pairs by hand.
 4. **Proof.** Each matched pair of state elements is cut, which leaves a
    combinational question per compare point: every output, every next-state
@@ -178,7 +183,7 @@ under a second.
 ## The pieces
 
 `src/equiv/` is header-only and usable as a library (namespace `equiv`):
-`aig.hpp` (the graph), `bv.hpp` (bit vectors with X), `cnf.hpp`
+`aig.hpp` (mequiv's names on the shared graph in `src/aig.hpp`), `bv.hpp` (bit vectors with X), `cnf.hpp`
 (the encoding), `elab.hpp` (a slang compilation to a `Design`),
 `check.hpp` (`equiv::check(aig, ref, impl, options)` returns every compare
 point with its status and counterexample). The SAT solver is CaDiCaL behind
