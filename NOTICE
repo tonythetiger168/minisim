@@ -1,0 +1,27 @@
+minisim
+Copyright 2026 tonythetiger168
+
+This product includes software developed by tonythetiger168 and the minisim
+contributors, licensed under the Apache License, Version 2.0. A copy of the
+License is in the LICENSE file beside this one.
+
+Until 2026-11-11 this software was distributed under the MIT License. That
+grant is not withdrawn: a copy obtained under MIT stays under MIT, and the
+history in git remains available under it. Releases from 0.3 onward are under
+Apache-2.0.
+
+Third-party components are fetched at build time, not vendored in this
+repository, and keep their own licenses and copyright notices. Each one, with
+its license text, is listed in THIRD_PARTY_NOTICES.md; a short list is here so
+that a binary package carries it:
+
+  - slang (MIT) - SystemVerilog front end, github.com/MikePopoloski/slang
+  - {fmt} (MIT), tomlplusplus (MIT) and Boost.Regex (Boost Software License
+    1.0) - pulled in by slang
+  - libfst (MIT) - FST waveform writer, github.com/gtkwave/libfst
+  - CaDiCaL (MIT) - SAT solver, github.com/arminbiere/cadical
+  - OpenSSL (Apache-2.0) and zlib (zlib license), where the system provides
+    them
+
+None of these is under the GPL or another copyleft license, and no GPL or
+copyleft code may be added to this repository; see docs/LICENSING.md.

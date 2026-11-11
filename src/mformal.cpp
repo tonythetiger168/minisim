@@ -328,6 +328,7 @@ struct Options {
     long long conflicts = 2000000;
     std::string outDir = "mformal_out";
     std::string json;
+    std::string aiger;   // write the model here and stop
     std::vector<std::string> only;
     bool quiet = false, verbose = false, noTrace = false, dumpIr = false, werror = false;
     bool bmcOnly = false;
@@ -1735,6 +1736,81 @@ void addLiveness(Model& m) {
 // The lemmas that say something about a property's own state: those whose
 // cone lies inside the property's cone. The others would only make the
 // problem larger.
+// The model as an AIGER 1.9 file (binary for .aig, ASCII otherwise), so that
+// other model checkers can run on it: one bad-state property per assertion
+// (reachable = falsified) and per cover (reachable = covered), in the order
+// of the report, and one invariant constraint per assumption. Liveness is
+// already folded into the bad states (see addLiveness), and the reset
+// sequence is part of the latches.
+bool writeAiger(const Model& m, const std::vector<size_t>& todo, const std::vector<int>& constraints, const std::string& path) {
+    std::vector<int> roots = constraints;
+    std::vector<size_t> bads;
+    for (size_t i : todo) {
+        const Property& p = m.props[i];
+        if (p.dir == AD_ASSUME || !p.skipped.empty()) continue;
+        bads.push_back(i);
+        roots.push_back(p.bad);
+    }
+    Cone cone = coneOf(m, roots);
+    // AIGER order: inputs, latches, ANDs (children first: cone.nodes ascends).
+    std::vector<unsigned> var(m.g.n.size(), 0);
+    std::vector<int> ins, ands;
+    for (int n : cone.nodes) {
+        if (m.g.n[(size_t)n][0] >= 0) ands.push_back(n);
+        else if (!m.stateBitOfInput.count(n)) ins.push_back(n);
+    }
+    unsigned v = 0;
+    for (int n : ins) var[(size_t)n] = ++v;
+    for (int sb : cone.stateBits) var[(size_t)(m.stateBits[(size_t)sb].in >> 1)] = ++v;
+    for (int n : ands) var[(size_t)n] = ++v;
+    auto lit = [&](int l) -> unsigned { return l < 0 ? 0u : 2 * var[(size_t)(l >> 1)] + (unsigned)(l & 1); };
+    bool binary = path.size() > 4 && path.compare(path.size() - 4, 4, ".aig") == 0;
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    f << (binary ? "aig " : "aag ") << v << " " << ins.size() << " " << cone.stateBits.size() << " 0 " << ands.size() << " " << bads.size() << " "
+      << constraints.size() << "\n";
+    if (!binary)
+        for (int n : ins) f << 2 * var[(size_t)n] << "\n";
+    for (int sbi : cone.stateBits) {
+        const StateBit& sb = m.stateBits[(size_t)sbi];
+        unsigned self = lit(sb.in);
+        if (!binary) f << self << " ";
+        f << lit(sb.next);
+        if (sb.init == 1) f << " 1";
+        else if (sb.init < 0) f << " " << self;   // not initialized
+        f << "\n";
+    }
+    for (size_t i : bads) f << lit(m.props[i].bad) << "\n";
+    for (int c : constraints) f << (lit(c) ^ 1u) << "\n";
+    for (int n : ands) {
+        auto nd = m.g.n[(size_t)n];
+        unsigned lhs = 2 * var[(size_t)n], a = lit(nd[0]), b = lit(nd[1]);
+        if (a < b) std::swap(a, b);
+        if (!binary) {
+            f << lhs << " " << a << " " << b << "\n";
+            continue;
+        }
+        for (unsigned d : {lhs - a, a - b}) {
+            while (d & ~0x7fu) {
+                f.put((char)((d & 0x7f) | 0x80));
+                d >>= 7;
+            }
+            f.put((char)d);
+        }
+    }
+    for (size_t k = 0; k < ins.size(); k++) f << "i" << k << " " << m.inputName[(size_t)m.g.n[(size_t)ins[k]][1]] << "\n";
+    for (size_t k = 0; k < cone.stateBits.size(); k++)
+        f << "l" << k << " " << m.inputName[(size_t)m.g.n[(size_t)(m.stateBits[(size_t)cone.stateBits[k]].in >> 1)][1]] << "\n";
+    for (size_t k = 0; k < bads.size(); k++) f << "b" << k << " " << m.props[bads[k]].name << "\n";
+    size_t k = 0;
+    for (auto& p : m.props)
+        if (p.dir == AD_ASSUME && p.skipped.empty()) f << "c" << k++ << " " << p.name << "\n";
+    f << "c\nmformal " << m.topModule << "\n";
+    for (size_t j = 0; j < bads.size(); j++) f << "b" << j << " " << (m.props[bads[j]].dir == AD_COVER ? "cover " : "assert ") << m.props[bads[j]].name << "\n";
+    return (bool)f;
+}
+
+
 std::vector<int> usefulLemmas(const Model& m, int bad, const std::vector<int>& constraints, const std::vector<int>& lemmas) {
     std::vector<int> roots{bad};
     roots.insert(roots.end(), constraints.begin(), constraints.end());
@@ -2357,6 +2433,8 @@ void usage() {
                  "  -o DIR            where the traces go (default mformal_out); -no-trace: write none\n"
                  "  -tb               next to each trace, a testbench that replays it in msim (<property>_tb.sv)\n"
                  "  -json FILE        the results as JSON\n"
+                 "  -aiger FILE       write the model as AIGER 1.9 (.aig binary, else ASCII) for another\n"
+                 "                    model checker, and stop without checking\n"
                  "  -Werror           exit non-zero also for unreachable covers and inconclusive results\n"
                  "  -quiet            the result lines only         -v  what was cut and why\n"
                  "  -f <file>  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
@@ -2405,6 +2483,7 @@ int main(int argc, char** argv) {
         if (a == "-no-trace") { opt.noTrace = true; continue; }
         if (a == "-tb") { opt.tb = true; continue; }
         if (a == "-json") { opt.json = next("a file name"); continue; }
+        if (a == "-aiger") { opt.aiger = next("a file name"); continue; }
         if (a == "-Werror") { opt.werror = true; continue; }
         if (a == "-quiet" || a == "-q") { opt.quiet = true; continue; }
         if (a == "-v" || a == "-verbose") { opt.verbose = true; continue; }
@@ -2476,6 +2555,14 @@ int main(int argc, char** argv) {
             if (!hit) continue;
         }
         todo.push_back(i);
+    }
+    if (!opt.aiger.empty()) {
+        if (!writeAiger(m, todo, constraints, opt.aiger)) {
+            std::cerr << "mformal: cannot write " << opt.aiger << "\n";
+            return 2;
+        }
+        if (!opt.quiet) std::cout << "mformal: wrote " << opt.aiger << "\n";
+        return 0;
     }
     std::vector<Result> results(m.props.size());
     unsigned threads = opt.threads > 0 ? (unsigned)opt.threads : par::defaultThreads();
