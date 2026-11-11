@@ -122,6 +122,9 @@ Spec references are IEEE 1800-2023 clauses.
   source, drivers and loads, schematic, waves with values annotated in the
   source). `-vcd` reads VCD and FST; the page traces the active driver at the
   cursor itself. See `docs/DEBUG.md`.
+- `mrcx -corner NAME`: several extraction corners in one run. The options after a
+  `-corner` (`-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale`) are that corner's; the
+  design is read once and each corner goes to `design.NAME.spef`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
   coupling capacitance to same-layer neighbours (who also take over part of

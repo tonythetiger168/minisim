@@ -78,6 +78,35 @@ endif()
 run(0 -lef ${D}/demo.lef -def ${D}/demo.def -o ${OUT}/lef.spef)
 need("${out}" "LEF summary" "lef stack")
 
+# Corners: one read of the design, a file per corner, and each file is what a
+# run with only that corner's options writes.
+run(0 -lef ${D}/demo.lef -def ${D}/demo.def -o ${OUT}/mc.spef -report ${OUT}/mc.rpt -date fixed
+    -corner lef -corner hot -itf ${D}/demo.itf -temp 125 -corner cold -itf ${D}/demo.itf -temp -40 -cscale 0.9)
+need("${out}" "corners" "corner hot" "demo2m stack, 125 C" "corner cold" "demo2m stack, -40 C" "corner lef" "lef stack, 25 C"
+     "mc.hot.spef" "mc.cold.spef" "mc.lef.spef")
+run(0 -lef ${D}/demo.lef -def ${D}/demo.def -itf ${D}/demo.itf -o ${OUT}/hot.spef -date fixed -temp 125 -q)
+run(0 -lef ${D}/demo.lef -def ${D}/demo.def -itf ${D}/demo.itf -o ${OUT}/cold.spef -date fixed -temp -40 -cscale 0.9 -q)
+run(0 -lef ${D}/demo.lef -def ${D}/demo.def -o ${OUT}/lef1.spef -date fixed -q)
+foreach(c hot cold)
+  file(READ ${OUT}/mc.${c}.spef many)
+  file(READ ${OUT}/${c}.spef one)
+  if(NOT many STREQUAL one)
+    message(FATAL_ERROR "corner ${c} differs from a run of its own")
+  endif()
+endforeach()
+file(READ ${OUT}/mc.lef.spef many)
+file(READ ${OUT}/lef1.spef one)
+if(NOT many STREQUAL one)
+  message(FATAL_ERROR "corner lef differs from a run of its own")
+endif()
+file(READ ${OUT}/mc.cold.rpt rpt)
+need("${rpt}" "corner report" "corner cold, demo2m stack, -40 C")
+run(2 -lef ${D}/demo.lef -def ${D}/demo.def -corner a -corner a)
+run(2 -lef ${D}/demo.lef -def ${D}/demo.def -o ${OUT}/x.spef -corner a -corner b -itf ${D}/no_such.itf)
+if(EXISTS ${OUT}/x.a.spef)
+  message(FATAL_ERROR "a bad process file in the second corner must stop the run before the first is written")
+endif()
+
 # Opens and shorts are reported, and -Werror turns them into exit 1.
 run(0 -lef ${D}/demo.lef -def ${D}/broken.def -o ${OUT}/broken.spef)
 need("${err}" "broken" "open: net gap is in 2 parts" "short: nets s1 and s2 overlap on metal1")

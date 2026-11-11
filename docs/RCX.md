@@ -88,6 +88,25 @@ Without `-itf`, the LEF's own numbers are used: `RESISTANCE RPERSQ`, the cut
 layers' `RESISTANCE`, `CAPACITANCE CPERSQDIST` and `EDGECAPACITANCE` for the
 capacitance to ground, `THICKNESS` and `HEIGHT` for coupling.
 
+## Corners
+
+A sign-off run wants the same design at several corners. `-corner NAME` starts
+one, and the process file, temperature and scale options that follow belong to
+it; those given before the first `-corner` are the defaults of every corner.
+
+```
+mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef \
+     -corner cmax -itf cmax.itf -temp 125 \
+     -corner cmin -itf cmin.itf -temp -40 \
+     -corner typ  -itf typ.itf
+```
+
+This writes `design.cmax.spef`, `design.cmin.spef` and `design.typ.spef` (and a
+report per corner with `-report`). The LEF and DEF are read once, every process
+file is checked before the first extraction, and each file is byte for byte
+what a run with only that corner's options writes. Three corners of the 290k-net
+benchmark take 8.6 s on 4 cores against 10.9 s for three runs.
+
 ## Options
 
 | Option | Meaning |
@@ -97,6 +116,7 @@ capacitance to ground, `THICKNESS` and `HEIGHT` for coupling.
 | `-o FILE` | SPEF to write (default `<design>.spef`) |
 | `-itf FILE`, `-map FILE` | process stack, and layer names when they differ |
 | `-temp C` | temperature for resistance |
+| `-corner NAME` | start a corner; the `-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale` after it are its own, and it is written to `design.NAME.spef` |
 | `-rscale F`, `-cscale F`, `-ccscale F` | scale resistance, all capacitance, coupling only (corners) |
 | `-no_coupling` | ground every coupling capacitor (a decoupled SPEF); `-cc_factor F` multiplies it on the way |
 | `-cc_threshold FF` | ground coupling capacitors smaller than this |
@@ -159,6 +179,6 @@ wire, 1.7 million nodes, 2.9 million coupling capacitors, a 270 MB SPEF) on a
 - Metal inside cells (pins, obstructions) connects but adds no capacitance.
 - No coupling across three or more layers or to wires that pass nearby on
   another layer without overlapping, no via capacitance, no inductance.
-- One corner per run; use `-temp` and the scale options for the others.
+- Corners in one run share the read of the design, not the extraction: each corner is extracted again, since its stack changes every capacitance.
 - Dielectrics are planar layers: no conformal layers, no width-dependent
   etch or thickness.
