@@ -15,6 +15,9 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
+  signal's waves are sent when the page first shows it, so large waveforms
+  are not cut to the one-file page's budget.
 - `mdebug -upf FILE -power [DOMAIN]`: the power domains, their supplies and
   isolation, level-shifter and retention strategies; with the log of
   `msim -upf_verbose`, power states over time. The active trace says when a

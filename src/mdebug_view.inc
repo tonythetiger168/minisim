@@ -62,7 +62,10 @@ svg path.c{stroke-dasharray:3 3}svg .tri{fill:none;stroke:var(--fg)}
 <script>
 const DB=/*MDEBUG_DATA*/null;
 const $=id=>document.getElementById(id),esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const S=DB.signals,D=DB.drivers,W=DB.waves||null,END=DB.end||0;
+// Served live (mdebug -serve): a signal's waves are fetched the first time they are looked at.
+const LIVE=DB.live?new Proxy({},{get(t,k){if(typeof k!='string'||!/^\d+$/.test(k))return undefined;
+  if(!(k in t)){try{const x=new XMLHttpRequest;x.open('GET','wave?i='+k,false);x.send();t[k]=x.status==200?JSON.parse(x.responseText):null}catch(e){t[k]=null}}return t[k]||undefined}}):null;
+const S=DB.signals,D=DB.drivers,W=LIVE||DB.waves||null,END=DB.end||0;
 const byPath=new Map(S.map((s,i)=>[s.path,i])),drvOf=S.map(()=>[]),loadOf=S.map(()=>[]);
 D.forEach((d,i)=>{drvOf[d.sig].push(i);new Set([...d.reads,...d.ctl]).forEach(s=>loadOf[s].push(i))});
 const scopeOf=p=>p.slice(0,p.lastIndexOf('.')),leaf=p=>p.slice(p.lastIndexOf('.')+1);

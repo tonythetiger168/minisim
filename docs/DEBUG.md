@@ -257,6 +257,24 @@ value and the enable:
       power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF); isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)
       x because the domain has no power: no assignment made this value
 
+## Large designs: the served viewer
+
+    mdebug design.sv -top tb -fst run.fst -serve          # http://127.0.0.1:8765/
+    mdebug design.sv -top tb -fst run.fst -serve 0        # any free port; the address is printed
+
+The one-file page of `-html` carries its waves inside it, so it has a budget
+(2 million value changes over all signals; long waves are cut around
+`-at T`). `-serve` has no such budget: mdebug stays running as a web server
+on this machine, the page holds the design, and the waves of a signal are
+sent the first time the page shows that signal, whole (up to 4 million
+changes per signal, around `-at T` beyond that). Everything else in the page
+is the same: trace, schematic, state diagrams, coverage marks.
+
+The server listens on 127.0.0.1 only and answers only requests addressed to
+`127.0.0.1` or `localhost`, so another machine, or a web page from another
+site, cannot read the design through it. To look from another machine, use
+an SSH tunnel (`ssh -L 8765:127.0.0.1:8765 host`). Stop it with Ctrl-C.
+
 ## Scripts and other programs
 
     mdebug design.sv -top tb -vcd run.vcd -script queries.txt
