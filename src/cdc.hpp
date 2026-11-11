@@ -1556,13 +1556,16 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
     sdc::Reader rd;
     rd.design = &view;
     rd.threads = (unsigned)std::max(1, opt.threads);
+    size_t read = 0;
     for (auto& f : opt.sdcFiles) {
         try {
             rd.load(f);
+            read++;
         } catch (const std::exception& e) {
             std::cerr << "mlint: -sdc " << f << ": " << e.what() << "\n";
         }
     }
+    if (!read) return;  // nothing to go by: check as without -sdc
     for (auto& d : rd.diags)
         if (d.sev == sdc::Diag::ErrorSev || d.code == "no-match" || d.code == "unknown-command")
             std::cerr << "mlint: " << d.loc.str() << ": " << d.text << "\n";
