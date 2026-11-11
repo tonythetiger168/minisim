@@ -37,6 +37,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -362,6 +363,7 @@ struct Result {
     double temp = 25;
     size_t pieces = 0;
     int threads = 1;
+    std::vector<std::pair<const char*, double>> times;   // seconds per step, in order
 };
 
 // ---------------------------------------------------------------------------
@@ -783,6 +785,12 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
                     (stack.cond[a].name == v.to && stack.cond[b].name == v.from))
                     viaRes[a][b] = v.rpv * (1 + v.crt1 * dT + v.crt2 * dT * dT);
 
+    auto clock0 = std::chrono::steady_clock::now();
+    auto lap = [&](const char* what) {
+        auto now = std::chrono::steady_clock::now();
+        R.times.emplace_back(what, std::chrono::duration<double>(now - clock0).count());
+        clock0 = now;
+    };
     // --- nets -> nodes, resistors, pieces
     const size_t nn = L.nets.size();
     R.nets.resize(nn);
@@ -843,6 +851,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
                 R.layerLen[static_cast<size_t>(w.layer)] +=
                     static_cast<double>(std::llabs(w.x1 - w.x0) + std::llabs(w.y1 - w.y0)) / dbu;
 
+    lap("nodes and resistors");
     // --- one grid per layer
     std::vector<i64> reach(nl);
     std::vector<Grid> grid(nl);
@@ -858,6 +867,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
         parBlocks(nl, threads, [&](size_t l) { grid[l].build(pieces, ids[l], 2 * reach[l]); });
     }
 
+    lap("grids");
     // Per-layer constants (permittivity folded in), in fF and um.
     struct LC { double t, h, epsG, epsL; };
     std::vector<LC> lc(nl);
@@ -1076,6 +1086,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
         }
     });
 
+    lap("capacitance");
     // --- merge, in piece order
     for (size_t i = 0; i < pieces.size(); i++) {
         const Piece& p = pieces[i];
@@ -1084,64 +1095,86 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
         n.nodes[static_cast<size_t>(p.n0)].cg += g0[i];
         n.nodes[static_cast<size_t>(p.n1)].cg += g1[i];
     }
-    // Coupling records: group by the first net (a counting sort, in block
-    // order), then sort and add up each net's records in parallel.
-    std::vector<CcRec> all;
+    // Coupling records: group by the first net, then sort and add up each
+    // net's records, then hand them to both nets. The nets are split into
+    // ranges and every range has one worker that reads all the records and
+    // takes those of its nets: reading is cheap, and writing, which is what
+    // costs, runs in parallel. A net sees its records in the same order
+    // whatever the number of ranges, so the sums do not depend on it.
+    for (auto& b : bo)
+        for (auto& s : b.shorts) R.shorts.push_back(s);
+    const size_t nrange = std::clamp<size_t>(static_cast<size_t>(threads), 1, 16);
+    auto rangeLo = [&](size_t r) { return nn * r / nrange; };
     std::vector<size_t> first(nn + 1, 0);
-    {
-        for (auto& b : bo) {
-            for (auto& c : b.cc) first[(c.a >> 32) + 1]++;
-            for (auto& s : b.shorts) R.shorts.push_back(s);
-        }
-        for (size_t i = 0; i < nn; i++) first[i + 1] += first[i];
-        all.resize(first[nn]);
-        std::vector<size_t> fill(first.begin(), first.end() - 1);
-        for (auto& b : bo) {
-            for (auto& c : b.cc) all[fill[c.a >> 32]++] = c;
-            std::vector<CcRec>().swap(b.cc);
-        }
-    }
+    parBlocks(nrange, threads, [&](size_t r) {
+        const std::uint64_t lo = rangeLo(r), hi = rangeLo(r + 1);
+        for (auto& b : bo)
+            for (auto& c : b.cc) {
+                std::uint64_t n = c.a >> 32;
+                if (n >= lo && n < hi) first[n + 1]++;
+            }
+    });
+    for (size_t i = 0; i < nn; i++) first[i + 1] += first[i];
+    std::unique_ptr<CcRec[]> all(new CcRec[first[nn]]);
     std::vector<size_t> uniq(nn, 0);   // records left per net after adding up
-    parBlocks((nn + netBlock - 1) / netBlock, threads, [&](size_t b) {
-        for (size_t n = b * netBlock; n < std::min(nn, (b + 1) * netBlock); n++) {
-            CcRec* lo = all.data() + first[n];
-            CcRec* hi = all.data() + first[n + 1];
-            std::stable_sort(lo, hi, [](const CcRec& x, const CcRec& y) {
+    parBlocks(nrange, threads, [&](size_t r) {
+        const std::uint64_t lo = rangeLo(r), hi = rangeLo(r + 1);
+        if (lo == hi) return;
+        std::vector<size_t> fill(first.begin() + static_cast<std::ptrdiff_t>(lo), first.begin() + static_cast<std::ptrdiff_t>(hi));
+        for (auto& b : bo)
+            for (auto& c : b.cc) {
+                std::uint64_t n = c.a >> 32;
+                if (n >= lo && n < hi) all[fill[n - lo]++] = c;
+            }
+        for (size_t n = lo; n < hi; n++) {
+            CcRec* p0 = all.get() + first[n];
+            CcRec* p1 = all.get() + first[n + 1];
+            std::stable_sort(p0, p1, [](const CcRec& x, const CcRec& y) {
                 return x.a != y.a ? x.a < y.a : x.b < y.b;
             });
-            CcRec* o = lo;
-            for (CcRec* i = lo; i < hi;) {
-                CcRec r = *i++;
-                for (; i < hi && i->a == r.a && i->b == r.b; i++) r.c += i->c;
-                *o++ = r;
+            CcRec* o = p0;
+            for (CcRec* i = p0; i < p1;) {
+                CcRec rec = *i++;
+                for (; i < p1 && i->a == rec.a && i->b == rec.b; i++) rec.c += i->c;
+                *o++ = rec;
             }
-            uniq[n] = static_cast<size_t>(o - lo);
+            uniq[n] = static_cast<size_t>(o - p0);
         }
     });
-    {
-        std::vector<std::uint32_t> count(nn, 0);
-        for (size_t n = 0; n < nn; n++)
-            for (size_t i = first[n]; i < first[n] + uniq[n]; i++)
-                if (opt.coupled && all[i].c >= opt.ccThreshold) { count[n]++; count[all[i].b >> 32]++; }
-        for (size_t n = 0; n < nn; n++) R.nets[n].cc.reserve(count[n]);
-    }
-    for (size_t n = 0; n < nn; n++)
-        for (size_t i = first[n]; i < first[n] + uniq[n]; i++) {
-            const CcRec& r = all[i];
-            double c = r.c;
-            int na = static_cast<int>(r.a >> 32), xa = static_cast<int>(r.a & 0xffffffffu);
-            int nbn = static_cast<int>(r.b >> 32), xb = static_cast<int>(r.b & 0xffffffffu);
-            NetOut& A = R.nets[static_cast<size_t>(na)];
-            NetOut& B = R.nets[static_cast<size_t>(nbn)];
-            if (!opt.coupled || c < opt.ccThreshold) {
-                A.nodes[static_cast<size_t>(xa)].cg += c * opt.ccFactor;
-                B.nodes[static_cast<size_t>(xb)].cg += c * opt.ccFactor;
-            } else {
-                A.cc.push_back({xa, nbn, xb, c});
-                B.cc.push_back({xb, na, xa, c});
-            }
+    parBlocks(bo.size(), threads, [&](size_t b) { std::vector<CcRec>().swap(bo[b].cc); });
+    parBlocks(nrange, threads, [&](size_t r) {
+        const size_t lo = rangeLo(r), hi = rangeLo(r + 1);
+        auto mine = [&](int n) { return static_cast<size_t>(n) >= lo && static_cast<size_t>(n) < hi; };
+        const bool keepAll = opt.coupled;
+        for (int pass = 0; pass < 2; pass++) {   // count, then fill
+            std::vector<std::uint32_t> count;
+            if (pass == 0) count.assign(hi - lo, 0);
+            for (size_t n = 0; n < nn; n++)
+                for (size_t i = first[n]; i < first[n] + uniq[n]; i++) {
+                    const CcRec& rec = all[i];
+                    int na = static_cast<int>(n), nbn = static_cast<int>(rec.b >> 32);
+                    bool ma = mine(na), mb = mine(nbn);
+                    if (!ma && !mb) continue;
+                    bool keep = keepAll && rec.c >= opt.ccThreshold;
+                    if (pass == 0) {
+                        if (keep) { if (ma) count[n - lo]++; if (mb) count[static_cast<size_t>(nbn) - lo]++; }
+                        continue;
+                    }
+                    int xa = static_cast<int>(rec.a & 0xffffffffu), xb = static_cast<int>(rec.b & 0xffffffffu);
+                    if (!keep) {
+                        if (ma) R.nets[n].nodes[static_cast<size_t>(xa)].cg += rec.c * opt.ccFactor;
+                        if (mb) R.nets[static_cast<size_t>(nbn)].nodes[static_cast<size_t>(xb)].cg += rec.c * opt.ccFactor;
+                    } else {
+                        if (ma) R.nets[n].cc.push_back({xa, nbn, xb, rec.c});
+                        if (mb) R.nets[static_cast<size_t>(nbn)].cc.push_back({xb, na, xa, rec.c});
+                    }
+                }
+            if (pass == 0)
+                for (size_t n = lo; n < hi; n++) R.nets[n].cc.reserve(count[n - lo]);
         }
-    std::vector<CcRec>().swap(all);
+    });
+    all.reset();
+    lap("coupling merge");
     {   // one report per pair of shorted nets and layer
         std::sort(R.shorts.begin(), R.shorts.end(), [](const Short& x, const Short& y) {
             if (x.netA != y.netA) return x.netA < y.netA;
@@ -1166,6 +1199,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
             for (auto& c : n.cc) n.ccTotal += c.c;
         }
     });
+    lap("totals");
     return R;
 }
 

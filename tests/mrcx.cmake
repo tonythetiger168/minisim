@@ -107,6 +107,10 @@ if(EXISTS ${OUT}/x.a.spef)
   message(FATAL_ERROR "a bad process file in the second corner must stop the run before the first is written")
 endif()
 
+# -profile names the steps.
+run(0 -lef ${D}/demo.lef -def ${D}/demo.def -o ${OUT}/prof.spef -profile)
+need("${out}" "profile" "profile: nodes and resistors" "capacitance" "coupling merge" "wire pieces")
+
 # Opens and shorts are reported, and -Werror turns them into exit 1.
 run(0 -lef ${D}/demo.lef -def ${D}/broken.def -o ${OUT}/broken.spef)
 need("${err}" "broken" "open: net gap is in 2 parts" "short: nets s1 and s2 overlap on metal1")

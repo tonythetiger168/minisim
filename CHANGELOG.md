@@ -151,6 +151,9 @@ Spec references are IEEE 1800-2023 clauses.
   source, drivers and loads, schematic, waves with values annotated in the
   source). `-vcd` reads VCD and FST; the page traces the active driver at the
   cursor itself. See `docs/DEBUG.md`.
+- `mrcx -profile` prints the time of each extraction step. The step that collects the
+  coupling capacitors of each net now runs on all threads (extraction of 290k nets on
+  4 cores: 1.73 s to 1.48 s, the same SPEF).
 - `mrcx -corner NAME`: several extraction corners in one run. The options after a
   `-corner` (`-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale`) are that corner's; the
   design is read once and each corner goes to `design.NAME.spef`.

@@ -25,7 +25,7 @@ struct Args {
     std::vector<std::string> lefs;
     std::string def, itf, map, out, report;
     rcx::Options opt;
-    bool werror = false, quiet = false, nameMap = true;
+    bool werror = false, quiet = false, nameMap = true, profile = false;
 };
 
 // One extraction corner: a process file and the values that go with it.
@@ -75,6 +75,7 @@ void usage() {
         "  -threads N         worker threads, also -j N (default: all logical cores; 1: single thread)\n"
         "  -Werror            exit 1 when a net is open or two nets are shorted\n"
         "  -q                 no summary on stdout\n"
+        "  -profile           print the time of each extraction step\n"
         "  -version           print the version\n";
 }
 
@@ -332,6 +333,7 @@ int main(int argc, char** argv) {
             else if (par::threadsArg(argc, argv, i, threadsOpt, "mrcx")) a.opt.threads = static_cast<int>(threadsOpt);
             else if (s == "-Werror") a.werror = true;
             else if (s == "-q") a.quiet = true;
+            else if (s == "-profile") a.profile = true;
             else throw std::runtime_error("unknown option " + s + " (see mrcx -help)");
         }
         if (a.lefs.empty() || a.def.empty()) {
@@ -477,6 +479,11 @@ int main(int argc, char** argv) {
                             outPath.c_str(), tRead, tExtract, tWrite, threads);
             else
                 std::printf("mrcx: wrote %s (extract %.2f s, write %.2f s)\n", outPath.c_str(), tExtract, tWrite);
+        }
+        if (a.profile) {
+            std::printf("mrcx: profile:");
+            for (auto& [what, sec] : R.times) std::printf(" %s %.2f s,", what, sec);
+            std::printf(" %zu wire pieces\n", R.pieces);
         }
         if (opens || !R.shorts.empty()) bad = true;
       }

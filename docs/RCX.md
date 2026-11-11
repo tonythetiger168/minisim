@@ -116,6 +116,7 @@ benchmark take 8.6 s on 4 cores against 10.9 s for three runs.
 | `-o FILE` | SPEF to write (default `<design>.spef`) |
 | `-itf FILE`, `-map FILE` | process stack, and layer names when they differ |
 | `-temp C` | temperature for resistance |
+| `-profile` | print the time of each extraction step |
 | `-corner NAME` | start a corner; the `-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale` after it are its own, and it is written to `design.NAME.spef` |
 | `-rscale F`, `-cscale F`, `-ccscale F` | scale resistance, all capacitance, coupling only (corners) |
 | `-no_coupling` | ground every coupling capacitor (a decoupled SPEF); `-cc_factor F` multiplies it on the way |
@@ -159,8 +160,12 @@ wire, 1.7 million nodes, 2.9 million coupling capacitors, a 270 MB SPEF) on a
 | | 1 thread | 4 threads |
 |---|---|---|
 | Read LEF and DEF | 1.0 s | 1.0 s |
-| Extract | 5.5 s | 2.0 s |
-| Write SPEF | 1.9 s | 0.8 s |
+| Extract | 5.0 s | 1.5 s |
+| Write SPEF | 1.6 s | 0.6 s |
+
+`-profile` prints where the extraction time goes. With 4 threads: nodes and
+resistors 0.22 s, grids 0.05 s, capacitance 0.76 s, collecting each net's
+coupling capacitors 0.33 s, totals 0.05 s.
 
 ## For other tools
 
