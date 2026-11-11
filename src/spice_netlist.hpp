@@ -599,7 +599,7 @@ while (std::getline(f, raw)) {
 
     // Lines whose arguments are written with parentheses that matter: v(out).
     static bool keepsParens(const std::string& s) {
-        for (const char* k : {".print", ".meas", ".ic", ".nodeset", ".save", ".probe", ".plot"})
+        for (const char* k : {".print", ".meas", ".ic", ".nodeset", ".save", ".probe", ".plot", ".noise", ".tf", ".sens", ".four"})
             if (s.rfind(k, 0) == 0) return true;
         return false;
     }

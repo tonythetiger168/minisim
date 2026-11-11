@@ -119,13 +119,20 @@ void report(const RunOutput& out, const Args& a) {
             if (r.kind == "op") {
                 std::printf("operating point\n");
                 for (size_t i = 0; i < r.cols.size(); i++) std::printf("  %-20s = %s\n", r.cols[i].c_str(), num(r.y[0][i]).c_str());
+            } else if (r.kind == "tf" || r.kind == "sens") {
+                std::printf("%s %s\n", r.kind == "tf" ? "transfer function" : "dc sensitivity", r.text.empty() ? "" : r.text[0].c_str());
             } else if (!r.printed.empty()) {
                 std::printf("%s analysis\n", r.kind.c_str());
                 printTable(r);
             } else {
                 std::printf("%s analysis: %zu points\n", r.kind.c_str(), r.x.size());
             }
+            if (r.kind != "tf" && r.kind != "sens")
+                for (auto& l : r.text) std::printf("%s\n", l.c_str());
         }
+        // These few numbers are the whole result: printed with -q too, like measurements.
+        if (r.kind == "tf" || r.kind == "sens")
+            for (size_t i = 0; i < r.cols.size(); i++) std::printf("%s = %s\n", r.cols[i].c_str(), num(r.y[0][i]).c_str());
         if (a.stats)
             std::printf("  %s: %zu Newton iterations, %zu steps accepted, %zu rejected\n", r.kind.c_str(), r.iterations,
                         r.accepted, r.rejected);

@@ -49,6 +49,7 @@ struct Result {
     std::vector<std::string> printed;     // the .print columns, in order (empty: none asked)
     std::vector<std::pair<std::string, double>> meas;
     double tstep = 0;                     // tran: the print interval
+    std::vector<std::string> text;        // more to print: noise contributions, Fourier tables
     size_t iterations = 0, accepted = 0, rejected = 0;
 
     int col(const std::string& label) const {
@@ -70,7 +71,8 @@ struct Result {
 };
 
 struct AnalysisSpec {
-    enum Type { OP, DC, AC, TRAN } type = OP;
+    enum Type { OP, DC, AC, TRAN, NOISE, TF, SENS } type = OP;
+    std::string out;   // .noise, .tf, .sens: the output, v(node), v(a,b) or i(source)
     std::string where;
     std::string src1, src2;
     double a1 = 0, b1 = 0, s1 = 0, a2 = 0, b2 = 0, s2 = 0;
@@ -80,7 +82,7 @@ struct AnalysisSpec {
     double tstep = 0, tstop = 0, tstart = 0, tmax = 0;
     bool uic = false;
     const char* name() const {
-        static const char* n[] = {"op", "dc", "ac", "tran"};
+        static const char* n[] = {"op", "dc", "ac", "tran", "noise", "tf", "sens"};
         return n[type];
     }
 };
@@ -503,60 +505,81 @@ struct Circuit {
         }
     }
 
-    void runAC(const AnalysisSpec& a, Result& r, const std::vector<Probe>& probes) {
+    // The small-signal matrix at one frequency, and the room to solve it.
+    struct ACWork {
+        std::vector<cplx> val, rhs, x;
+        SparseLU<cplx> lu;
+    };
+    void loadACAt(ACWork& w, double freq) {
+        std::fill(w.val.begin(), w.val.end(), cplx());
+        std::fill(w.rhs.begin(), w.rhs.end(), cplx());
+        double om = 2 * M_PI * freq;
+        cplx* v = w.val.data();
+        cplx* r = w.rhs.data() + 1;
+        eachPool([&](auto& p) { for (const auto& d : p) d.loadAC(om, v, r); });
+        if (bsim4) bsim4->loadAC(om, v);
+        if (opt.gshunt != 0)
+            for (int i = 0; i < numNodes; i++) w.val[diag[i]] += opt.gshunt;
+    }
+
+    // The operating point that a small-signal analysis linearizes around.
+    void smallSignalPoint() {
         Ctx c = context();
         holdIC = !ic.empty();
         op(c);
         holdIC = false;
         if (bsim4) bsim4->prepareAC();
-        std::vector<double> f = frequencies(a);
-        struct Work {
-            std::vector<cplx> val, rhs, x;
-            SparseLU<cplx> lu;
-        };
-        auto loadAt = [&](Work& w, double freq) {
-            std::fill(w.val.begin(), w.val.end(), cplx());
-            std::fill(w.rhs.begin(), w.rhs.end(), cplx());
-            double om = 2 * M_PI * freq;
-            {
-                cplx* v = w.val.data();
-                cplx* r = w.rhs.data() + 1;
-                eachPool([&](auto& p) { for (const auto& d : p) d.loadAC(om, v, r); });
-                if (bsim4) bsim4->loadAC(om, v);
-            }
-            if (opt.gshunt != 0)
-                for (int i = 0; i < numNodes; i++) w.val[diag[i]] += opt.gshunt;
-        };
-        auto fresh = [&](Work& w) {
+    }
+
+    // point(i, w, lu) for every frequency, with the matrix of f[i] factored
+    // in lu and the sources' AC values in w.rhs. The sweep is cut in one
+    // piece per thread; point must write only to what belongs to i.
+    template <class F>
+    void sweepAC(const std::vector<double>& f, F&& point) {
+        auto fresh = [&](ACWork& w) {
             w.val.assign(pat.slots.size(), cplx());
             w.rhs.assign(n + 1, cplx());
             w.x.assign(n + 1, cplx());
         };
         // One pivot order, found at the first frequency, for every worker:
         // a point's result is then the same whichever thread computes it.
-        Work base;
+        ACWork base;
         fresh(base);
         base.lu.init(pat);
-        loadAt(base, f[0]);
+        loadACAt(base, f[0]);
         try { base.lu.factor(base.val.data()); }
         catch (const SingularMatrix& e) { singular(e); }
-        // One piece of the sweep per thread, each with its own matrix.
         size_t nt = std::min<size_t>(pool_ ? pool_->threads() : 1, f.size());
-        std::vector<Work> work(nt);
+        std::vector<ACWork> work(nt);
         for (auto& w : work) { fresh(w); w.lu.adopt(base.lu); }
-        r.x = f;
-        r.y.assign(f.size(), {});
-        auto point = [&](size_t i, size_t piece) {
-            Work& w = work[piece];
-            loadAt(w, f[i]);
+        auto one = [&](size_t i, size_t piece) {
+            ACWork& w = work[piece];
+            loadACAt(w, f[i]);
             if (w.lu.refactor(w.val.data())) {
-                w.lu.solve(w.rhs.data() + 1, w.x.data() + 1);
+                point(i, w, w.lu);
             } else {
                 SparseLU<cplx> own;
                 own.init(pat);
                 own.factor(w.val.data());
-                own.solve(w.rhs.data() + 1, w.x.data() + 1);
+                point(i, w, own);
             }
+        };
+        try {
+            auto piece = [&](size_t k) {
+                for (size_t i = k * f.size() / nt; i < (k + 1) * f.size() / nt; i++) one(i, k);
+            };
+            if (pool_) pool_->run(nt, piece);
+            else for (size_t k = 0; k < nt; k++) piece(k);
+        } catch (const SingularMatrix& e) { singular(e); }
+    }
+
+    void runAC(const AnalysisSpec& a, Result& r, const std::vector<Probe>& probes) {
+        smallSignalPoint();
+        std::vector<double> f = frequencies(a);
+        r.x = f;
+        r.y.assign(f.size(), {});
+        sweepAC(f, [&](size_t i, ACWork& w, SparseLU<cplx>& lu) {
+            lu.solve(w.rhs.data() + 1, w.x.data() + 1);
             const cplx* xs = w.x.data() + 1;
             std::vector<double> row(probes.size());
             for (size_t k = 0; k < probes.size(); k++) {
@@ -565,14 +588,156 @@ struct Circuit {
                 row[k] = reduce(z, p.fn);
             }
             r.y[i] = std::move(row);
-        };
-        try {
-            auto piece = [&](size_t k) {
-                for (size_t i = k * f.size() / nt; i < (k + 1) * f.size() / nt; i++) point(i, k);
-            };
-            if (pool_) pool_->run(nt, piece);
-            else for (size_t k = 0; k < nt; k++) piece(k);
-        } catch (const SingularMatrix& e) { singular(e); }
+        });
+    }
+
+    // The independent source an analysis names as its input.
+    Device* inputSource(const std::string& name, const std::string& where, const char* what) {
+        auto it = byName.find(name);
+        if (it != byName.end() && (dynamic_cast<VSource*>(it->second) || dynamic_cast<ISource*>(it->second))) return it->second;
+        throw Error(where + ": " + what + " needs an independent source as its input, and '" + name + "' is not one");
+    }
+
+    // The integral of a spectral density that follows a power law between points.
+    static double integrate(const std::vector<double>& f, const std::vector<double>& s) {
+        double sum = 0;
+        for (size_t i = 0; i + 1 < f.size(); i++) {
+            double f1 = f[i], f2 = f[i + 1], s1 = s[i], s2 = s[i + 1];
+            if (!(s1 > 0) || !(s2 > 0) || !(f2 > f1)) { sum += 0.5 * (s1 + s2) * (f2 - f1); continue; }
+            double e = std::log(s2 / s1) / std::log(f2 / f1);
+            sum += std::fabs(e + 1) < 1e-10 ? s1 * f1 * std::log(f2 / f1) : s1 * f1 * (std::pow(f2 / f1, e + 1) - 1) / (e + 1);
+        }
+        return sum;
+    }
+
+    // .noise: every device's noise at the output, by the adjoint circuit.
+    // One transposed solve per frequency gives the transfer from every
+    // noise source, and from the input source, to the output.
+    void runNoise(const AnalysisSpec& a, const Probe& out, Result& r) {
+        if (out.kind != 'v') throw Error(a.where + ": the output of .noise is a voltage, v(node) or v(a,b)");
+        Device* src = inputSource(a.src1, a.where, ".noise");
+        smallSignalPoint();
+        if (bsim4 && bsim4->size()) warnings.push_back(a.where + ": BSIM4 transistors are noiseless in .noise for now");
+        std::vector<double> f = frequencies(a);
+        struct Src { NoiseSrc s; int dev; };
+        std::vector<Src> srcs;
+        std::vector<NoiseSrc> tmp;
+        double kelvin = opt.temp + 273.15;
+        for (size_t d = 0; d < devs.size(); d++) {
+            tmp.clear();
+            devs[d]->noise(kelvin, tmp);
+            for (auto& x : tmp)
+                if (x.a != x.b && (x.white > 0 || x.flicker > 0)) srcs.push_back({x, (int)d});
+        }
+        auto* vs = dynamic_cast<VSource*>(src);
+        auto* is = dynamic_cast<ISource*>(src);
+        std::vector<double> on(f.size()), in(f.size());
+        // Each device's share at each frequency, unless that table would be huge.
+        bool shares = (double)devs.size() * f.size() <= 2e7;
+        std::vector<std::vector<double>> share(shares ? f.size() : 0);
+        sweepAC(f, [&](size_t i, ACWork& w, SparseLU<cplx>& lu) {
+            std::fill(w.rhs.begin(), w.rhs.end(), cplx());
+            cplx* e = w.rhs.data() + 1;
+            e[out.a] += 1; e[out.b] -= 1;
+            w.rhs[0] = 0;
+            lu.solveT(w.rhs.data() + 1, w.x.data() + 1);
+            const cplx* y = w.x.data() + 1;
+            if (shares) share[i].assign(devs.size(), 0);
+            double sum = 0;
+            for (const Src& k : srcs) {
+                double psd = (k.s.white + k.s.flicker / f[i]) * std::norm(y[k.s.a] - y[k.s.b]);
+                sum += psd;
+                if (shares) share[i][k.dev] += psd;
+            }
+            double gain = std::abs(vs ? y[vs->br] : y[is->n] - y[is->p]);
+            on[i] = sum;
+            in[i] = gain > 0 ? sum / (gain * gain) : 0;
+        });
+        r.x = f;
+        r.cols = {"onoise", "inoise"};
+        r.y.resize(f.size());
+        for (size_t i = 0; i < f.size(); i++) r.y[i] = {std::sqrt(on[i]), std::sqrt(in[i])};
+        double ot = integrate(f, on), it = integrate(f, in);
+        r.meas.push_back({"onoise_total", std::sqrt(ot)});
+        r.meas.push_back({"inoise_total", std::sqrt(it)});
+        if (shares && f.size() > 1 && ot > 0) {
+            std::vector<std::pair<double, int>> tot;
+            std::vector<double> col(f.size());
+            for (size_t d = 0; d < devs.size(); d++) {
+                bool any = false;
+                for (size_t i = 0; i < f.size(); i++) { col[i] = share[i][d]; any = any || col[i] > 0; }
+                if (any) tot.push_back({integrate(f, col), (int)d});
+            }
+            std::sort(tot.begin(), tot.end(), [&](auto& p, auto& q) { return p.first != q.first ? p.first > q.first : p.second < q.second; });
+            r.text.push_back("largest contributions to the output noise (V rms, share of the power):");
+            for (size_t k = 0; k < tot.size() && k < 10; k++) {
+                char buf[200];
+                std::snprintf(buf, sizeof buf, "  %-20s %.6e  %5.1f %%", devs[tot[k].second]->name.c_str(), std::sqrt(tot[k].first), 100 * tot[k].first / ot);
+                r.text.push_back(buf);
+            }
+        }
+    }
+
+    // .tf: the small-signal DC gain from a source to an output, the
+    // resistance the source sees and the resistance seen at the output.
+    void runTF(const AnalysisSpec& a, const Probe& out, Result& r) {
+        Device* src = inputSource(a.src1, a.where, ".tf");
+        smallSignalPoint();
+        auto* vs = dynamic_cast<VSource*>(src);
+        auto* is = dynamic_cast<ISource*>(src);
+        double tf = 0, rin = 0, rout = 0;
+        auto ohms = [](cplx i) { return i.real() == 0 ? 1e20 : -1 / i.real(); };
+        sweepAC({0.0}, [&](size_t, ACWork& w, SparseLU<cplx>& lu) {
+            cplx* b = w.rhs.data() + 1;
+            const cplx* xs = w.x.data() + 1;
+            auto solve = [&] { w.rhs[0] = 0; lu.solve(w.rhs.data() + 1, w.x.data() + 1); };
+            std::fill(w.rhs.begin(), w.rhs.end(), cplx());
+            if (vs) b[vs->br] = 1;
+            else { b[is->p] -= 1; b[is->n] += 1; }
+            solve();
+            tf = (out.kind == 'i' ? xs[out.a] : xs[out.a] - xs[out.b]).real();
+            rin = vs ? ohms(xs[vs->br]) : (xs[is->n] - xs[is->p]).real();
+            std::fill(w.rhs.begin(), w.rhs.end(), cplx());
+            if (out.kind == 'i') {
+                b[out.a] = 1;
+                solve();
+                rout = ohms(xs[out.a]);
+            } else {
+                b[out.a] += 1; b[out.b] -= 1;
+                solve();
+                rout = (xs[out.a] - xs[out.b]).real();
+            }
+        });
+        r.cols = {"transfer_function", "input_resistance", "output_resistance"};
+        r.x = {0};
+        r.y = {{tf, rin, rout}};
+    }
+
+    // .sens: how much the DC value of an output moves per unit of every
+    // resistance and every source value. One adjoint solve gives them all.
+    void runSens(const AnalysisSpec& a, const Probe& out, Result& r) {
+        smallSignalPoint();
+        std::vector<double> row;
+        sweepAC({0.0}, [&](size_t, ACWork& w, SparseLU<cplx>& lu) {
+            std::fill(w.rhs.begin(), w.rhs.end(), cplx());
+            cplx* e = w.rhs.data() + 1;
+            if (out.kind == 'i') e[out.a] = 1;
+            else { e[out.a] += 1; e[out.b] -= 1; }
+            w.rhs[0] = 0;
+            lu.solveT(w.rhs.data() + 1, w.x.data() + 1);
+            const cplx* y = w.x.data() + 1;
+            for (Device* d : devs) {
+                double v;
+                if (auto* res = dynamic_cast<Resistor*>(d)) v = res->g * res->g * (x[res->p] - x[res->n]) * (y[res->p] - y[res->n]).real();
+                else if (auto* vsrc = dynamic_cast<VSource*>(d)) v = y[vsrc->br].real();
+                else if (auto* isrc = dynamic_cast<ISource*>(d)) v = (y[isrc->n] - y[isrc->p]).real();
+                else continue;
+                r.cols.push_back(d->name);
+                row.push_back(v);
+            }
+        });
+        r.x = {0};
+        r.y = {row};
     }
 
     void runTran(const AnalysisSpec& a, Result& r, const std::vector<Probe>& probes) {
@@ -683,6 +848,12 @@ struct Controls {
     std::vector<AnalysisSpec> analyses;
     std::map<std::string, std::vector<std::string>> prints;   // by analysis name
     std::vector<Card> meas;
+    struct Four {
+        std::string where;
+        double freq = 0;
+        std::vector<std::string> outs;
+    };
+    std::vector<Four> fours;
 };
 
 class Builder {
@@ -1025,6 +1196,7 @@ private:
             d->cj0 = (m->has("cjo") ? m->get("cjo", 0) : m->get("cj0", 0)) * area;
             d->vj = m->get("vj", 1); d->mj = m->get("m", 0.5); d->tt = m->get("tt", 0);
             d->fc = m->get("fc", 0.5);
+            d->kf = m->get("kf", 0); d->af = m->get("af", 1);
             // Breakdown: the knee is placed so that the current at -BV is IBV.
             double bv = m->get("bv", 0), ibv = m->get("ibv", 1e-3) * area, nvt = d->nf * vt;
             if (bv > 0) d->bv = ibv < d->isat * bv / vt ? bv : bv - nvt * std::log(1 + ibv / d->isat);
@@ -1063,6 +1235,7 @@ private:
             d->cbs0 = (m->has("cbs") ? m->get("cbs", 0) : cj * as) * mult;
             d->cbdsw = cjsw * pd * mult; d->cbssw = cjsw * ps * mult;
             d->cox = coxPerArea * w * leff * mult;
+            d->kf = m->get("kf", 0); d->af = m->get("af", 1); d->flickDen = coxPerArea * coxPerArea * w * leff * mult;
             d->covgs = m->get("cgso", 0) * w * mult; d->covgd = m->get("cgdo", 0) * w * mult;
             d->covgb = m->get("cgbo", 0) * leff * mult;
             d->vcrit = vt * std::log(vt / (M_SQRT2 * d->isat));
@@ -1098,6 +1271,7 @@ private:
             d->cje = m->get("cje", 0) * area; d->vje = m->get("vje", 0.75); d->mje = m->get("mje", 0.33);
             d->cjc = m->get("cjc", 0) * area; d->vjc = m->get("vjc", 0.75); d->mjc = m->get("mjc", 0.33);
             d->tf = m->get("tf", 0); d->tr = m->get("tr", 0); d->fc = m->get("fc", 0.5);
+            d->kf = m->get("kf", 0); d->af = m->get("af", 1);
             d->vcrit = vt * std::log(vt / (M_SQRT2 * d->isat));
             int nc = node(e, t[1]), nb = node(e, t[2]), ne = node(e, t[3]);
             auto series = [&](const char* key, const char* tag, int& nd) {
@@ -1215,6 +1389,37 @@ private:
                 if (v.size() > 2) a.tstart = v[2];
                 if (v.size() > 3) a.tmax = v[3];
                 out.analyses.push_back(a);
+            } else if (d == ".noise") {
+                // .noise v(out[,ref]) source dec|oct|lin points fstart fstop
+                AnalysisSpec a;
+                a.type = AnalysisSpec::NOISE; a.where = k.where;
+                if (t.size() < 7 || (t[3] != "dec" && t[3] != "oct" && t[3] != "lin"))
+                    throw Error(k.where + ": expected .noise v(out) source dec|oct|lin points fstart fstop");
+                a.out = t[1]; a.src1 = t[2];
+                a.acMode = t[3]; a.npts = (int)num(4); a.f1 = num(5); a.f2 = num(6);
+                out.analyses.push_back(a);
+            } else if (d == ".tf") {
+                AnalysisSpec a;
+                a.type = AnalysisSpec::TF; a.where = k.where;
+                if (t.size() != 3) throw Error(k.where + ": expected .tf output source");
+                a.out = t[1]; a.src1 = t[2];
+                out.analyses.push_back(a);
+            } else if (d == ".sens") {
+                if (t.size() < 2) throw Error(k.where + ": expected .sens output ...");
+                for (size_t i = 1; i < t.size(); i++) {
+                    AnalysisSpec a;
+                    a.type = AnalysisSpec::SENS; a.where = k.where;
+                    a.out = t[i];
+                    out.analyses.push_back(a);
+                }
+            } else if (d == ".four" || d == ".fourier") {
+                if (t.size() < 3) throw Error(k.where + ": expected .four frequency outputs...");
+                Controls::Four f;
+                f.where = k.where;
+                f.freq = num(1);
+                if (!(f.freq > 0)) throw Error(k.where + ": .four needs a frequency above zero");
+                f.outs.assign(t.begin() + 2, t.end());
+                out.fours.push_back(f);
             } else if (d == ".print" || d == ".plot" || d == ".probe" || d == ".save") {
                 if (d != ".print") continue;
                 if (t.size() < 2) throw Error(k.where + ": expected .print op|dc|ac|tran outputs");
@@ -1469,6 +1674,65 @@ struct RunOutput {
 };
 
 // Build the circuit with these parameter overrides and run every analysis.
+inline std::string fmtNum(double v) {
+    char b[40];
+    std::snprintf(b, sizeof b, "%.6e", v);
+    return b;
+}
+
+// .four: the DC value and the first nine harmonics of an output over the
+// last period of a transient, and the total harmonic distortion. The output
+// is read on a uniform grid by linear interpolation. A harmonic is
+// magnitude * sin(k w t + phase), with t the simulation time.
+inline void fourier(Result& r, const std::string& label, const Controls::Four& f, std::vector<std::string>& warnings) {
+    int col = r.col(label);
+    double T = 1 / f.freq;
+    std::string thd = "thd_";
+    for (char ch : label.substr(label.find('(') + 1))
+        if (ch != ')') thd += std::isalnum((unsigned char)ch) ? ch : '_';
+    if (label[0] == 'i') thd.insert(4, "i_");
+    if (col < 0 || r.x.size() < 2 || r.x.back() - r.x.front() < T * (1 - 1e-9)) {
+        warnings.push_back(f.where + ": .four of " + label + " needs a transient of at least one period");
+        r.meas.push_back({thd, NAN});
+        return;
+    }
+    const int N = 4096, H = 9;
+    double t0 = r.x.back() - T, dc = 0, ca[H + 1] = {}, sa[H + 1] = {};
+    size_t k = 1;
+    for (int i = 0; i < N; i++) {
+        double t = t0 + T * i / N;
+        while (k + 1 < r.x.size() && r.x[k] < t) k++;
+        double x0 = r.x[k - 1], x1 = r.x[k];
+        double y = x1 == x0 ? r.y[k][col] : r.y[k - 1][col] + (r.y[k][col] - r.y[k - 1][col]) * (t - x0) / (x1 - x0);
+        dc += y;
+        for (int h = 1; h <= H; h++) {
+            double ph = 2 * M_PI * h * f.freq * t;
+            ca[h] += y * std::cos(ph);
+            sa[h] += y * std::sin(ph);
+        }
+    }
+    dc /= N;
+    double mag[H + 1] = {}, sum = 0;
+    char buf[200];
+    std::snprintf(buf, sizeof buf, "fourier analysis of %s, fundamental %s Hz", label.c_str(), fmtNum(f.freq).c_str());
+    r.text.push_back(buf);
+    r.text.push_back("  harmonic  frequency      magnitude      phase(deg)     normalized");
+    std::snprintf(buf, sizeof buf, "  %-9d %-14s %-14s", 0, fmtNum(0).c_str(), fmtNum(dc).c_str());
+    r.text.push_back(buf);
+    for (int h = 1; h <= H; h++) {
+        double a = 2 * ca[h] / N, b = 2 * sa[h] / N;
+        mag[h] = std::hypot(a, b);
+        if (h > 1) sum += mag[h] * mag[h];
+        // Phase of a harmonic that is only rounding noise means nothing: print 0.
+        double phase = mag[h] > 1e-12 * std::max(mag[1], 1e-300) ? std::atan2(a, b) * 180 / M_PI : 0;
+        std::snprintf(buf, sizeof buf, "  %-9d %-14s %-14s %-14s %-14s", h, fmtNum(h * f.freq).c_str(), fmtNum(mag[h]).c_str(),
+                      fmtNum(phase).c_str(), fmtNum(mag[1] > 0 ? mag[h] / mag[1] : 0).c_str());
+        r.text.push_back(buf);
+    }
+    // The distortion in percent.
+    r.meas.push_back({thd, mag[1] > 0 ? 100 * std::sqrt(sum) / mag[1] : NAN});
+}
+
 inline RunOutput runNetlist(const Netlist& nl, const std::map<std::string, double>& overrides, Pool* pool) {
     RunOutput out;
     Circuit c;
@@ -1485,11 +1749,45 @@ inline RunOutput runNetlist(const Netlist& nl, const std::map<std::string, doubl
                 sc.set(k.tok[i].substr(0, eq), k.tok[i].substr(eq + 1));
             }
     for (auto& [k, v] : overrides) sc.set(k, v);
-    if (ctl.analyses.empty()) c.warnings.push_back("the netlist asks for no analysis (.op, .dc, .ac or .tran)");
+    if (ctl.analyses.empty()) c.warnings.push_back("the netlist asks for no analysis (.op, .dc, .ac, .tran, .noise, .tf or .sens)");
+    if (!ctl.fours.empty() && std::none_of(ctl.analyses.begin(), ctl.analyses.end(), [](auto& a) { return a.type == AnalysisSpec::TRAN; }))
+        c.warnings.push_back(ctl.fours[0].where + ": .four needs a .tran analysis");
     for (const AnalysisSpec& a : ctl.analyses) {
         Result r;
         r.kind = a.name();
         r.tstep = a.tstep;
+        if (a.type == AnalysisSpec::NOISE || a.type == AnalysisSpec::TF || a.type == AnalysisSpec::SENS) {
+            // These make their own columns from one output.
+            Probe o = parseProbe(c, a.out, a.where);
+            if (o.fn) throw Error(a.where + ": '" + a.out + "': use v(node), v(a,b) or i(source) here");
+            size_t it0 = c.iterations;
+            if (a.type == AnalysisSpec::NOISE) {
+                r.xname = "frequency";
+                c.runNoise(a, o, r);
+                if (ctl.prints.count("noise")) r.printed = r.cols;
+                // .measure noise works on the columns onoise and inoise.
+                for (const Card& k : ctl.meas) {
+                    if (k.tok.size() < 4 || k.tok[1] != "noise") continue;
+                    Measure m(r, &sc);
+                    std::string name, why;
+                    double v = NAN;
+                    if (!m.eval(k, name, v, why)) {
+                        c.warnings.push_back(k.where + ": .measure " + name + " failed: " + why);
+                        v = NAN;
+                    }
+                    r.meas.push_back({name, v});
+                }
+            } else if (a.type == AnalysisSpec::TF) {
+                c.runTF(a, o, r);
+                r.text.push_back("from " + a.src1 + " to " + a.out);
+            } else {
+                c.runSens(a, o, r);
+                r.text.push_back("of " + a.out + ", per unit of each element's value");
+            }
+            r.iterations = c.iterations - it0;
+            out.results.push_back(std::move(r));
+            continue;
+        }
         bool ac = a.type == AnalysisSpec::AC;
         std::vector<Probe> probes;
         std::unordered_set<std::string> have;
@@ -1510,6 +1808,9 @@ inline RunOutput runNetlist(const Netlist& nl, const std::map<std::string, doubl
                 for (auto& d : c.devs)
                     if (dynamic_cast<VSource*>(d)) addProbe("i(" + d->name + ")", a.where);
         }
+        if (a.type == AnalysisSpec::TRAN)
+            for (auto& f : ctl.fours)
+                for (auto& e : f.outs) addProbe(e, f.where);
         std::vector<const Card*> mine;
         for (const Card& k : ctl.meas) {
             if (k.tok.size() < 4) throw Error(k.where + ": expected .measure analysis name ...");
@@ -1530,6 +1831,9 @@ inline RunOutput runNetlist(const Netlist& nl, const std::map<std::string, doubl
         case AnalysisSpec::TRAN: r.xname = "time"; c.runTran(a, r, probes); break;
         }
         r.iterations = c.iterations - it0;
+        if (a.type == AnalysisSpec::TRAN)
+            for (auto& f : ctl.fours)
+                for (auto& e : f.outs) fourier(r, e, f, c.warnings);
         for (const Card* k : mine) {
             Measure m(r, &sc);
             std::string name, why;

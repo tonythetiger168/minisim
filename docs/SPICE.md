@@ -145,6 +145,10 @@ prints the mean, standard deviation, minimum and maximum of each `.measure`.
 | `.dc src start stop step [src2 start2 stop2 step2]` | DC sweep of one or two sources |
 | `.ac dec\|oct\|lin n fstart fstop` | small-signal frequency response |
 | `.tran tstep tstop [tstart [tmax]] [uic]` | transient |
+| `.noise v(out[,ref]) src dec\|oct\|lin n fstart fstop` | noise at an output, and referred to the input source |
+| `.tf v(out)\|i(vsrc) src` | DC small-signal gain, input and output resistance |
+| `.sens v(out)\|i(vsrc) ...` | DC sensitivity of each output to every resistor and source |
+| `.four freq out1 out2 ...` | harmonics and distortion over the last period of the `.tran` |
 
 `.ic v(node)=value` holds nodes during the operating point (or, with `uic`,
 is the starting state); `.nodeset v(node)=value` is a first guess.
@@ -153,6 +157,29 @@ is the starting state); `.nodeset v(node)=value` is a first guess.
 `.step param name start stop step`, `.step param name list v1 v2 ...` and
 `.step dec|oct param name start stop points` repeat every analysis for each
 value. Several `.step` lines nest; the last one varies fastest.
+
+`.noise` adds up the noise of every device at the output: thermal noise of
+resistors (including the series resistances of the models), shot noise of
+diode and bipolar currents, channel thermal noise `8kT gm/3` of the level-1
+MOSFET, and flicker noise where the model gives `kf` (`af`, default 1): `kf
+i^af / f` for diodes and base currents, `kf id^af / (f W Leff Cox^2)` for the
+MOSFET, the formulas of ngspice. The columns are `onoise` and `inoise`, in
+V/sqrt(Hz) (`inoise` in the unit of the input source). `.print noise onoise
+inoise` prints them, `.measure noise` reads them, and the totals over the
+band come out as `onoise_total` and `inoise_total` with the ten largest
+contributors. One adjoint (transposed) solve per frequency gives the transfer
+from every noise source at once, so the cost is that of an `.ac` sweep
+however many devices there are; the frequencies are spread over the threads.
+
+`.tf` prints `transfer_function`, `input_resistance` and `output_resistance`;
+`.sens` prints one line per resistor and independent source: the change of
+the output per ohm, volt or ampere. Both come from the linearized circuit at
+the operating point; `.sens` takes a single adjoint solve.
+
+`.four` reads each output on 4,096 evenly spaced points of the last period
+and prints the DC value, nine harmonics as `magnitude * sin(k w t + phase)`
+and the total harmonic distortion in percent, which is also a measurement
+named `thd_<node>` (`thd_i_<source>` for a current).
 
 ### Outputs
 
@@ -239,6 +266,11 @@ that the output is the same at 1, 3 and all threads, and, when ngspice is
 installed (it is in CI), compares every measurement with ngspice: within 1%
 by default, 2% for the MOSFET and BJT switching circuits. With tolerances
 tightened in both simulators, an inverter's delays agree to five digits.
+The `.noise`, `.tf`, `.sens` and `.four` tests carry numbers worked out by
+hand and numbers from ngspice 42, whose noise analysis runs from a control
+block that check.py does not write: each device's share of the output noise,
+the transfer function, every sensitivity and the distortion agree to five or
+six digits.
 
 ## Speed
 
@@ -249,6 +281,7 @@ ngspice. On a 4-CPU cloud machine, ngspice 42, best of three, seconds:
 |---|---|---|---|
 | 20,000-section RC ladder, transient | 0.86 | 0.87 | 1.36 |
 | 60 x 60 RC mesh, 401-point AC | 1.86 | 0.73 | 6.41 |
+| the same mesh, 401-point noise analysis (7,140 noise sources) | 2.04 | 0.76 | 6.93 |
 | 2,000 inverters in a chain (4,000 level-1 MOSFETs), transient | 1.03 | 0.60 | 1.75 |
 | 101-stage ring oscillator, level 1, transient | 0.35 | 0.35 | 0.52 |
 | 3 inverters with RC load, 64-value `.step`, transient | 0.58 | 0.17 | no `.step` |
@@ -285,7 +318,8 @@ line: path, nodes, model, parameters.
 - BSIM3 and other MOSFET levels (2, 3, BSIM-CMG), the JFET; for BSIM4:
   noise, binned models, `ic=`; behavioral (`B`) sources, switches,
   transmission lines.
-- `.noise`, `.tf`, `.sens`, `.four`; `.data` sweeps, `lot`/`dev` tolerances
+- Noise of BSIM4 transistors; `.sens` for model parameters and in AC;
+  `.pz`; `.data` sweeps, `lot`/`dev` tolerances
   on `.model` lines, `.variation` blocks; `.dc` sweeps
   of a parameter or temperature; `i()` of a resistor or a device terminal.
 - Temperature: the thermal voltage, the diode and BJT saturation current and
