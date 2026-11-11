@@ -154,6 +154,26 @@ if(NOT out MATCHES "'cdc_sdc.b0' \\(clocked by cdc_sdc.bclk\\) is read by logic 
   message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_false.sdc:\n${out}")
 endif()
 
+# CDC004 through flops: where the signals meet, once, to the depth asked for.
+run(cdc_seq.sv "-top;cdc_seq;-only;cdc")
+foreach(want
+    "[CDC004] 'cdc_seq.a1', 'cdc_seq.a2' (clocked by cdc_seq.aclk) are synchronized separately and meet again at 'cdc_seq.o1', 1 flop after the synchronizers (and at 1 more flop)"
+    "[CDC004] 'cdc_seq.a1', 'cdc_seq.a3' (clocked by cdc_seq.aclk) are synchronized separately and meet again at 'cdc_seq.o3', 2 flops after the synchronizers:"
+    "2 findings (CDC004 2)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_seq.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+run(cdc_seq.sv "-top;cdc_seq;-only;cdc;-cdc-depth;3")
+if(NOT out MATCHES "meet again at 'cdc_seq.o4', 3 flops after the synchronizers" OR NOT out MATCHES "3 findings")
+  message(FATAL_ERROR "cdc_seq.sv -cdc-depth 3:\n${out}")
+endif()
+run(cdc_seq.sv "-top;cdc_seq;-only;cdc;-cdc-depth;0")
+if(NOT out MATCHES "0 findings")
+  message(FATAL_ERROR "cdc_seq.sv -cdc-depth 0:\n${out}")
+endif()
+
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
 set(one "${out}")

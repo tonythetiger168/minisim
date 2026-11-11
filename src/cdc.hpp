@@ -64,6 +64,7 @@ struct Options {
     std::vector<std::string> statics;                   // -static sig
     bool report = false;                                // -cdc-report
     std::vector<std::string> sdcFiles;                  // -sdc file
+    int depth = 2;                                      // -cdc-depth N
     int threads = 1;                                    // -threads N
 
     // Takes one command-line option if it is one of these. `next` returns the
@@ -73,6 +74,17 @@ struct Options {
         if (a == "-cdc-report") { report = true; return true; }
         if (a == "-static") { statics.push_back(next("a signal")); return true; }
         if (a == "-sdc") { sdcFiles.push_back(next("an SDC file")); return true; }
+        if (a == "-cdc-depth") {
+            std::string v = next("a number of flops");
+            char* e = nullptr;
+            long k = strtol(v.c_str(), &e, 10);
+            if (v.empty() || *e || k < 0 || k > 64) {
+                std::cerr << "mlint: -cdc-depth needs a number of flops from 0 to 64\n";
+                std::exit(2);
+            }
+            depth = (int)k;
+            return true;
+        }
         if (a == "-clock-group") {
             std::string list = next("clock names"), one;
             std::vector<std::string> g;
@@ -89,7 +101,8 @@ struct Options {
 };
 
 inline const char* usage() {
-    return "  -sdc FILE      clocks, generated clocks, clock groups and clock-to-clock false paths from an SDC file\n"
+    return "  -cdc-depth N   CDC004 follows synchronized signals through N more flops to where they meet (2)\n"
+           "  -sdc FILE      clocks, generated clocks, clock groups and clock-to-clock false paths from an SDC file\n"
            "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
            "  -static SIG    SIG does not change while it is read: its crossings are not reported\n"
            "  -cdc-report    list the clock domains, the resets and every crossing, safe or not\n";
@@ -1228,32 +1241,123 @@ struct Checker {
     // CDC004: two signals of one domain, each through its own synchronizer,
     // meet in one flop. Each synchronizer can take one cycle more or less, so
     // the pair can show a combination its source never had.
+    // CDC004. Signals of one domain that were synchronized separately and
+    // meet again: in the logic of one flop, or after up to -cdc-depth more
+    // flops of the reading domain (each side registered a different number of
+    // times does not bring them back in step).
     void reconverge(const std::vector<char>& first) {
-        for (size_t i = 0; i < m.flops.size(); i++) {
-            const Flop& f = m.flops[i];
-            if (!f.dom || first[i]) continue;
-            const std::vector<Root>& all = cones[i].all;
-            std::map<Sym, std::vector<std::pair<std::string, Sym>>> byDom;  // source domain -> (name, source)
-            for (const Root& r : all) {
-                const Flop* sf = m.flopOf(r.sym);
-                if (!sf || sf->dom != f.dom) continue;
-                const Member& mem = member[sf - m.flops.data()];
-                if (mem.pos < 2) continue;
-                auto& v = byDom[mem.srcDom];
-                bool dup = false;
-                for (auto& e : v) dup = dup || e.second == mem.src;
-                if (!dup) v.push_back({m.name(*m.flopOf(mem.src)), mem.src});
+        const size_t n = m.flops.size();
+        const int depth = std::max(0, opt.depth);
+        // What a flop carries: synchronized sources, and how many flops after
+        // its synchronizer each one is. Sorted by source; the smallest depth.
+        using Carried = std::vector<std::pair<Sym, int>>;
+        auto put = [](Carried& c, Sym s, int d) {
+            auto it = std::lower_bound(c.begin(), c.end(), s, [](const auto& e, Sym k) { return e.first < k; });
+            if (it != c.end() && it->first == s) {
+                if (d >= it->second) return false;
+                it->second = d;
+                return true;
             }
+            if (c.size() >= 64) return false;  // a flop where everything meets: enough to report
+            c.insert(it, {s, d});
+            return true;
+        };
+        auto depthIn = [](const Carried& c, Sym s) {
+            auto it = std::lower_bound(c.begin(), c.end(), s, [](const auto& e, Sym k) { return e.first < k; });
+            return it != c.end() && it->first == s ? it->second : -1;
+        };
+        std::vector<Carried> direct(n), reach;
+        std::vector<std::vector<int>> preds(n);
+        chunked(n, opt.threads, [&](size_t lo, size_t hi) {
+            for (size_t i = lo; i < hi; i++) {
+                const Flop& f = m.flops[i];
+                if (!f.dom || first[i]) continue;
+                for (const Root& r : cones[i].all) {
+                    const Flop* sf = m.flopOf(r.sym);
+                    if (!sf || sf->dom != f.dom) continue;
+                    size_t j = sf - m.flops.data();
+                    if (member[j].pos >= 2) put(direct[i], member[j].src, 0);
+                    else if (j != i && !first[j] && depth) preds[i].push_back((int)j);
+                }
+                std::sort(preds[i].begin(), preds[i].end());
+                preds[i].erase(std::unique(preds[i].begin(), preds[i].end()), preds[i].end());
+            }
+        });
+        reach = direct;
+        for (int round = 0; round < depth; round++) {
+            std::vector<Carried> grown = direct;
+            std::atomic<bool> changed{false};
+            chunked(n, opt.threads, [&](size_t lo, size_t hi) {
+                for (size_t i = lo; i < hi; i++) {
+                    for (int p : preds[i])
+                        for (auto& [s, d] : reach[p])
+                            if (d < depth) put(grown[i], s, d + 1);
+                    if (grown[i] != reach[i]) changed = true;
+                }
+            });
+            reach.swap(grown);
+            if (!changed) break;
+        }
+        // The same signals meet at one flop and then, in a state machine, at
+        // every flop behind it. One finding for each set of signals: at the
+        // flops where they meet in one cone of logic (as before), otherwise
+        // at the nearest flop, with a count of the others.
+        struct Seq {
+            int flop = -1, far = 0, more = 0;
+            std::string where;
+        };
+        std::map<std::pair<Sym, std::vector<Sym>>, Seq> seqs;
+        std::set<std::pair<Sym, std::vector<Sym>>> met;
+        auto namesOf = [&](const std::vector<Sym>& v) {
+            std::vector<std::string> sorted;
+            for (Sym e : v) sorted.push_back(m.name(*m.flopOf(e)));
+            std::sort(sorted.begin(), sorted.end());
+            std::string names;
+            for (auto& e : sorted) names += (names.empty() ? "'" : ", '") + e + "'";
+            return names;
+        };
+        const char* why = ": each can arrive a cycle apart from the others, so cross one signal (or a Gray code) "
+                          "and derive the rest from it";
+        for (size_t i = 0; i < n; i++) {
+            const Flop& f = m.flops[i];
+            if (reach[i].size() < 2) continue;
+            std::map<Sym, Carried> byDom;  // source domain -> what arrives from it
+            for (auto& e : reach[i]) byDom[m.flopOf(e.first)->dom].push_back(e);
             for (auto& [d, v] : byDom) {
                 if (v.size() < 2) continue;
-                std::sort(v.begin(), v.end());
-                std::string names;
-                for (auto& e : v) names += (names.empty() ? "'" : ", '") + e.first + "'";
-                add("CDC004", f.loc,
-                        names + " (clocked by " + m.name(d) + ") are synchronized separately and meet " +
-                            "again at '" + m.name(f) + "': each can arrive a cycle apart from the " +
-                            "others, so cross one signal (or a Gray code) and derive the rest from it");
+                std::vector<Sym> here, all;
+                int far = 0;
+                for (auto& e : v) {
+                    far = std::max(far, e.second);
+                    all.push_back(e.first);
+                    if (!e.second) here.push_back(e.first);
+                }
+                if (here.size() >= 2) {
+                    met.insert({d, here});
+                    add("CDC004", f.loc,
+                            namesOf(here) + " (clocked by " + m.name(d) + ") are synchronized separately and meet " +
+                                "again at '" + m.name(f) + "'" + why);
+                }
+                if (!far) continue;
+                Seq& q = seqs[{d, all}];
+                std::string where = m.name(f);
+                if (q.flop < 0 || far < q.far || (far == q.far && where < q.where)) {
+                    q.flop = (int)i;
+                    q.far = far;
+                    q.where = where;
+                }
+                q.more++;
             }
+        }
+        for (auto& [key, q] : seqs) {
+            if (met.count(key)) continue;
+            std::string others = q.more > 1 ? " (and at " + std::to_string(q.more - 1) +
+                                                  (q.more == 2 ? " more flop)" : " more flops)")
+                                            : "";
+            add("CDC004", m.flops[q.flop].loc,
+                    namesOf(key.second) + " (clocked by " + m.name(key.first) + ") are synchronized separately " +
+                        "and meet again at '" + q.where + "', " + std::to_string(q.far) +
+                        (q.far == 1 ? " flop" : " flops") + " after the synchronizers" + others + why);
         }
     }
 

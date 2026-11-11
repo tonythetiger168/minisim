@@ -15,6 +15,9 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mlint` `CDC004` follows synchronized signals through flops: signals
+  synchronized separately that meet again up to `-cdc-depth N` flops later
+  (default 2) are reported, once per set of signals.
 - `mlint -sdc file.sdc`: the CDC and RDC checks take the clocks and how they
   are related from the timing constraints (shared SDC reader): generated
   clocks are synchronous to their master, `set_clock_groups -asynchronous`
