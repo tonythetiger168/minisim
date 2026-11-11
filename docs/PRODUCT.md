@@ -35,7 +35,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mrcx** | Parasitic extraction: routed DEF + LEF in, SPEF out. Distributed RC per net with coupling capacitance, process stack and temperature, open and short checks, multi-core | Shipping next |
 | **mwave** | Waveforms for GTKWave / Surfer: hierarchical VCD and compressed FST (shipping in 0.2); `$dumpfile` / `$dumpvars` scoping and transaction views next | Partly shipping in 0.2 |
 | **mhls** | High-level synthesis: C/C++ functions to SystemVerilog (FSM with datapath or pipeline), with a self-checking testbench and a host-compiler check of the same vectors | Shipping next |
-| **mspice** | SPICE circuit simulator: DC, AC and transient analysis, diodes, level-1 MOSFETs and bipolar transistors, subcircuits and parameters, `.measure`, `.step`, CSV and VCD output, multi-threaded; see [`SPICE.md`](SPICE.md). BSIM models and mixed-signal co-simulation with msim come next | Shipping next |
+| **mspice** | SPICE circuit simulator: DC, AC, transient, noise, transfer-function, sensitivity and Fourier analysis, diodes, level-1 and BSIM4 MOSFETs, bipolar transistors, behavioral sources and switches, subcircuits and parameters, `.measure`, `.step`, `.lib` corners, `.alter` and Monte Carlo, CSV, VCD and raw-file output, multi-threaded; see [`SPICE.md`](SPICE.md). Mixed-signal co-simulation with msim comes next | Shipping next |
 | **mchar** | Cell library characterization on mspice: NLDM delay and transition, setup / hold / recovery / removal, internal power and pin capacitance from transistor netlists into Liberty, with the stimulus found from the Liberty functions; see [`CHAR.md`](CHAR.md) | Shipping next |
 
 All of them install from one package (`minisim_x.y.z_amd64.deb` /
@@ -45,13 +45,12 @@ All of them install from one package (`minisim_x.y.z_amd64.deb` /
 
 - **minisim (free, Apache-2.0)**: the verification flow - simulator,
   waveforms, coverage, regression runner, planning, lint and CDC,
-  scan-readiness checks, virtual prototypes and debug. No seat count, no key,
-  no time limit.
+  scan-readiness checks and debug. No seat count, no key, no time limit.
 - **Paid tools (closed source)**: implementation and signoff - synthesis,
   place and route, timing, extraction, equivalence, formal, ATPG, emulation,
   HLS, SPICE and characterization, physical verification, power, constraints
-  and IP protection. Same file formats and command lines, so the two mix in
-  one flow.
+  and IP protection, together with portable stimulus and virtual prototypes.
+  Same file formats and command lines, so the two mix in one flow.
 - **Enterprise** (support contract, long-term-support branches, validated
   platform builds, key management for encrypted IP): an option once 1.0 is
   out, on top of either edition.

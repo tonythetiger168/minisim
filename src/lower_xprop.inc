@@ -52,8 +52,17 @@ struct Xp {
     // the regions are lowered, where the merging copy takes over when
     // condition k is unknown (empty: the region is not merged).
     bool clean = false;
-    std::vector<std::vector<size_t>> sites;
-    size_t siteNext = 0, lastSite = 0;
+    // Keyed by the statement; a statement lowered more than once has one entry per time.
+    std::unordered_map<const void*, std::vector<std::vector<size_t>>> sites;
+    std::unordered_map<const void*, size_t> siteUse;
+    const void* key = nullptr;                // of the region xpChain is called for
+    std::vector<size_t>* lastSite = nullptr;
+    // The clean copy's entry for condition k of the region `key`, or Instr::NOX.
+    std::vector<size_t> cleanSite(const void* key) {
+        size_t n = siteUse[key]++;
+        auto it = sites.find(key);
+        return it != sites.end() && n < it->second.size() ? it->second[n] : std::vector<size_t>{};
+    }
     std::unordered_set<const slang::ast::Symbol*> once;   // nonblocking targets assigned at most once a pass
     std::vector<std::pair<size_t, size_t>> guarded, badRanges;
     std::vector<std::function<void()>> ool;
@@ -439,13 +448,13 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
              const std::function<void(size_t)>& body, const char* what, std::vector<size_t>* T = nullptr,
              const std::function<E(size_t)>& weight = nullptr, E total = nullptr) {
     if (xp.clean) {   // the clean copy of an if: an unknown condition goes to the merging copy
-        size_t id = xp.siteNext++;
+        std::vector<size_t> to = xp.cleanSite(xp.key);
         std::vector<size_t> toEnd;
         for (size_t k = 0; k <= nCond; k++) {
             size_t jn = (size_t)-1;
             if (k < nCond) {
                 jn = emitJmpIfNot(cond(k).second);
-                if (id < xp.sites.size() && k < xp.sites[id].size()) prog.code[jn].xt = xp.sites[id][k];
+                if (k < to.size()) prog.code[jn].xt = to[k];
             }
             body(k);
             if (k < nCond) {
@@ -456,8 +465,9 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
         for (size_t j : toEnd) prog.code[j].target = prog.here();
         return true;
     }
-    size_t site = xp.sites.size();
-    xp.sites.emplace_back();
+    const void* siteKey = xp.key;
+    size_t site = xp.sites[siteKey].size();
+    xp.sites[siteKey].emplace_back();
     struct Alt { E gx; bool three = false; size_t jpre = 0, N = 0, T = 0, bs = 0, be = 0, jmid = 0, next = 0; };
     std::vector<Alt> R(nCond + 1);
     std::string where = whereStr();
@@ -515,7 +525,7 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
             prog.code[R[k].jmid].target = Z;
         }
         if (jfull != (size_t)-1) prog.code[jfull].target = R[nCond].T;
-        xp.lastSite = site;
+        xp.lastSite = &xp.sites[siteKey][site];
         return false;
     }
     std::vector<XpUnit> units = xpUnits(tg);
@@ -617,8 +627,8 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
         xpJmp(Z);
     });
     for (size_t k = 0; k < nCond; k++)
-        if (R[k].three) xp.sites[site].push_back(R[k].jpre);
-    xp.lastSite = site;
+        if (R[k].three) xp.sites[siteKey][site].push_back(R[k].jpre);
+    xp.lastSite = &xp.sites[siteKey][site];
     return true;
 }
 
@@ -658,6 +668,7 @@ bool xpIf(const slang::ast::ConditionalStatement& top) {
             }
             for (size_t j : toEnd) prog.code[j].target = prog.here();
         });
+    xp.key = &top;
     xpChain(n,
         [&](size_t k) {
             E c = expr(*chain[k]->conditions[0].expr);
@@ -686,6 +697,15 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
             if (!x->type->isIntegral()) return false;
             if ((wz || wx) && !xpConstInt(*x)) return false;
         }
+    if (xp.clean) {   // the clean copy: an unknown selector goes to the merging copy, else the standard case
+        std::vector<size_t> to = xp.cleanSite(&c);
+        if (!to.empty()) {
+            size_t jx = emitJmpIfNot(un(Op::RedXor, expr(c.expr)));   // 0 or 1: go on
+            prog.code[jx].target = prog.here();
+            prog.code[jx].xt = to[0];
+        }
+        return false;
+    }
     Op cmp = wz ? Op::CaseZEq : wx ? Op::CaseXEq : Op::CaseEq;
     size_t n = c.items.size();
     size_t entry = prog.here();
@@ -726,25 +746,6 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
             }
             for (size_t j : toEnd) prog.code[j].target = prog.here();
         });
-    if (xp.clean) {   // the clean copy: the standard matches; an unknown selector goes to the merging copy
-        size_t id = xp.siteNext++;
-        if (id < xp.sites.size() && !xp.sites[id].empty()) {
-            size_t jx = emitJmpIfNot(un(Op::RedXor, expr(c.expr)));   // 0 or 1: go on
-            prog.code[jx].target = prog.here();
-            prog.code[jx].xt = xp.sites[id][0];
-        }
-        std::vector<size_t> toEnd;
-        for (size_t k = 0; k < n; k++) {
-            size_t jn = emitJmpIfNot(conds[k]);
-            stmt(*c.items[k].stmt);
-            toEnd.push_back(xpJmp());
-            prog.code[jn].target = prog.here();
-        }
-        if (c.defaultCase) stmt(*c.defaultCase);
-        else if (needAll) violation(s, checkName(c.check) + " case: no case item matches", c.check);
-        for (size_t j : toEnd) prog.code[j].target = prog.here();
-        return true;
-    }
     // Selector fully known: the standard matches pick the item (out of line).
     size_t jfast = emitJmpIfNot(xpIsX(un(Op::RedXor, expr(c.expr))));
     xp.oolJmp.insert(jfast);
@@ -768,6 +769,7 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
     E total;
     if (countable)   // 2^k, or 0 (never reached) when k is 32 or more
         total = bin(Op::Shl, konst(mk(1, 32)), resize(sysFnNode(SF_COUNTBITS, {expr(c.expr)}, 12), 32, false, false));
+    xp.key = &c;
     bool ok = xpChain(n,
         [&](size_t k) {
             E g;
@@ -807,7 +809,7 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
             }
             return sum;
         }, total);
-    if (ok) xp.sites[xp.lastSite] = {entry};
+    if (ok) *xp.lastSite = {entry};
     xp.ool.push_back([=, this] {
         if (!ok) { Instr j; j.k = IK::Jmp; j.line = prog.code[jfast].line; j.file = prog.code[jfast].file; prog.code[jfast] = j; }
         prog.code[jfast].target = prog.here();
@@ -884,6 +886,7 @@ void xpProc(const slang::ast::Statement& body) {
         }
         E amb = xpAmbiguousEdge(ev, level);
         ambLead = amb;
+        xp.key = &xp;
         xpChain(1, [&](size_t) { return std::pair<E, E>{amb, nullptr}; },
                 [&](size_t k) { if (k == 0) stmt(*b); }, "edge");
     } else {
@@ -928,10 +931,11 @@ void xpProc(const slang::ast::Statement& body) {
     // clock edge starts in the merging copy.
     if (lead != (size_t)-1) {
         bool plain = false;
-        for (auto& st : xp.sites) plain |= !st.empty();
+        for (auto& [key, sts] : xp.sites)
+            for (auto& st : sts) plain |= !st.empty();
         for (size_t pc = start; pc < prog.here() && plain; pc++) {
             IK k = prog.code[pc].k;
-            plain = k == IK::Assign || k == IK::Nba || k == IK::Jmp || k == IK::JmpIfNot;
+            plain = k == IK::Assign || k == IK::Nba || k == IK::Jmp || k == IK::JmpIfNot || k == IK::Call;
             if (k == IK::Assert) {   // the report of a unique / priority violation
                 int ty = asserts().at(prog.code[pc].sig).type;
                 plain = ty == AT_UNIQUE || ty == AT_UNIQUE0 || ty == AT_PRIORITY;
@@ -945,8 +949,8 @@ void xpProc(const slang::ast::Statement& body) {
                 prog.code[lead] = j;
             }
             prog.code[lead].target = prog.here();
+            if (ambLead && lead == 1) prog.xpFast = prog.here();
             xp.clean = true;
-            xp.siteNext = ambLead ? 1 : 0;
             stmt(*b);
             xp.clean = false;
             prog.code[jend].target = prog.here();
