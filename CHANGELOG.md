@@ -373,6 +373,9 @@ Spec references are IEEE 1800-2023 clauses.
 - `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
   Verilog netlist reader / flattener / writer, shared by the timing,
   synthesis, power, equivalence and physical tools.
+- `mlint` state machine rules on the extractor FSM coverage uses: `FSM001` a
+  state never entered, `FSM002` a state with no way out, `FSM003` a state
+  case with no default that leaves encodings unused, `FSM004` no reset state.
 - `mpower`, power analysis on the msim front end: average power by group,
   instance and cell from SAIF, VCD or FST activity and Liberty
   `internal_power` / `leakage_power` tables; activity propagation for nets
