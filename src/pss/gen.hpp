@@ -137,6 +137,7 @@ struct Emit {
     }
 
     std::string call(const Expr& e, std::vector<std::string>& pre, bool asStmt) {
+        if (!e.path.empty()) d.m.fail(e.loc, "'" + e.path[0].name + "." + e.s + "()': method calls are only supported in exec init blocks");
         if (e.s == "print" || e.s == "message") {
             if (!asStmt) d.m.fail(e.loc, e.s + "() has no value");
             size_t first = e.s == "message" ? 1 : 0;

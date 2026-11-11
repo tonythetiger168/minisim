@@ -108,6 +108,30 @@ jobs:
       - name: Put Icarus Verilog 13 on PATH
         run: echo "$HOME/iverilog13/bin" >> "$GITHUB_PATH" && ("$HOME/iverilog13/bin/iverilog" -V 2>&1 || true) | head -1
 
+      # msynth's high-effort compile hands the logic to ABC, run as a separate
+      # program (src/synth/abc.hpp). Built from source at a pinned commit,
+      # once, and cached. Optional: without it the msynth_*_abc tests use the
+      # yosys-abc of the Yosys package below, or are left out.
+      - name: Cache ABC
+        id: abc
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/abc-bin
+          key: abc-bde1659cf7bf-${{ runner.os }}
+
+      - name: Build ABC
+        if: steps.abc.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          git init -q /tmp/abc && cd /tmp/abc
+          git remote add origin https://github.com/berkeley-abc/abc
+          git fetch -q --depth 1 origin bde1659cf7bf2b355624c3599cb58e9b6e474f13 && git checkout -q FETCH_HEAD
+          make -j2 ABC_USE_NO_READLINE=1 abc
+          mkdir -p $HOME/abc-bin && cp abc copyright.txt $HOME/abc-bin/
+
+      - name: Put ABC on PATH
+        run: if [ -x "$HOME/abc-bin/abc" ]; then echo "$HOME/abc-bin" >> "$GITHUB_PATH"; "$HOME/abc-bin/abc" -q "version" || true; fi
+
       - name: Install zlib (FST waveforms)
         run: dpkg -s zlib1g-dev libssl-dev openssl >/dev/null 2>&1 || sudo apt-get install -y zlib1g-dev libssl-dev openssl
 

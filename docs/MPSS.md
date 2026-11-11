@@ -45,10 +45,10 @@ same for every `-threads` value, and scenario 7 of `-n 10` is scenario 7 of
 
 ```pss
 buffer data_buff_s {
-  rand bit[32] in [0x1000..0x1fff] addr;
-  rand bit[16] in [4..256] size;
-  constraint addr % 4 == 0;
-  constraint addr + size <= 0x2000;
+  rand addr_reg_pkg::transparent_addr_claim_s<> mem;   // its memory
+  rand bit[8] seed;                                    // its data
+  constraint mem.size in [4..256];
+  constraint mem.alignment == 4;
 }
 resource channel_s { }
 
@@ -59,12 +59,23 @@ component dma_c {
     input data_buff_s src;
     output data_buff_s dst;
     lock channel_s chan;
-    constraint dst.size == src.size;
-    constraint dst.addr >= src.addr + src.size || src.addr >= dst.addr + dst.size;
+    constraint dst.mem.size == src.mem.size;
+    constraint dst.seed == src.seed;
     exec body {
-      dma_copy(chan.instance_id, src.addr, dst.addr, src.size);
+      dma_copy(chan.instance_id, src.mem.addr, dst.mem.addr, src.mem.size);
     }
   }
+}
+
+component pss_top {
+  addr_reg_pkg::transparent_addr_space_c<> sys_mem;
+  exec init {
+    addr_reg_pkg::transparent_addr_region_s<> ram;
+    ram.addr = 0x1000;
+    ram.size = 0x7000;
+    (void)sys_mem.add_region(ram);
+  }
+  ...
 }
 ```
 
@@ -76,18 +87,48 @@ scenario 0 (seed 1)
   sequence pss_top::entry @pss_top: rounds=1
     parallel
       sequence
-        pss_top::init_mem @pss_top (inferred): seed=165 dst=#6
-        dma_c::mem2mem @pss_top.dma0: chan=chan_p[3] dst=#0 src=#6
+        pss_top::init_mem @pss_top (inferred): dst=#6
+        dma_c::mem2mem @pss_top.dma0: chan=chan_p[0] dst=#0 src=#6
       sequence
-        pss_top::init_mem @pss_top (inferred): seed=235 dst=#7
+        pss_top::init_mem @pss_top (inferred): dst=#7
         dma_c::mem2mem @pss_top.dma0: chan=chan_p[2] dst=#2 src=#7
-    dma_c::mem2mem @pss_top.dma0: chan=chan_p[3] dst=#4 src=#2
+    dma_c::mem2mem @pss_top.dma0: chan=chan_p[0] dst=#4 src=#2
     pss_top::check_mem @pss_top: src=#0
+  #0 mem_pkg::data_buff_s from entry.a: kind=RAM mem.addr=0x4290 mem.alignment=0x4 mem.permanent=false mem.size=0xa4 seed=73
+  ...
 ```
 
-The two parallel copies took different channels, the regions of each copy do
-not overlap, and each copy got an `init_mem` in front of it because nothing
-in the activity produced its source buffer.
+The two parallel copies took different channels, and each copy got an
+`init_mem` in front of it because nothing in the activity produced its
+source buffer. Every buffer has its own memory in `sys_mem`, so the check
+at the end can compare the data with what `init_mem` wrote.
+
+## Address spaces
+
+`addr_reg_pkg` is built in (the transparent kind, where the solver picks
+the addresses):
+
+- A component holds a `transparent_addr_space_c<>`, and an `exec init`
+  block gives it regions: a `transparent_addr_region_s<>` variable with
+  `addr` and `size`, passed to `add_region()` or
+  `add_nonallocatable_region()`. A region without an `addr` follows the
+  regions before it.
+- A `rand transparent_addr_claim_s<>` field in an action, a buffer or a
+  stream claims memory: `addr`, `size`, `alignment` (default 1) and
+  `permanent` (default false). The claim takes the nearest address space,
+  in the action's component or one above it (for a flow object: the
+  component of its pool).
+- Each claim lies inside one allocatable region, and claims that are alive
+  at the same time do not overlap. A claim in an action lives as long as
+  the action, or to the end of the test when it is permanent. A claim in a
+  buffer or stream lives from the action that writes the object to the end
+  of the test (longer than the standard asks, which ends it with the last
+  reader).
+
+`constraint default x == v;` holds unless another constraint of the
+scenario mentions `x`. Not there yet: `addr_claim_s` in a
+`contiguous_addr_space_c` with handles (`make_handle_from_claim`), traits
+other than `<>`, and `default disable`.
 
 ## The C output
 
@@ -98,13 +139,13 @@ extern void dma_copy(uint8_t chan, uint32_t src, uint32_t dst, uint16_t size);
 
 void entry_0(void)
 {
-  /* inferred5: pss_top::init_mem @pss_top (inferred): seed=165 dst=#6 */
+  /* inferred5: pss_top::init_mem @pss_top (inferred): dst=#6 */
   {
-    mem_fill(0x145cu, 56, 165);
+    mem_fill(0x34d8u, 0xa4u, 73);
   }
-  /* entry.a: dma_c::mem2mem @pss_top.dma0: chan=chan_p[3] dst=#0 src=#6 */
+  /* entry.a: dma_c::mem2mem @pss_top.dma0: chan=chan_p[0] dst=#0 src=#6 */
   {
-    dma_copy(3, 0x145cu, 0x1424u, 56);
+    dma_copy(0, 0x34d8u, 0x4290u, 0xa4u);
   }
   ...
 }
@@ -168,15 +209,16 @@ compares the output.
 | Data types | `bit[N]`, `bit[hi:lo]`, `int`, `int[N]` (to 64 bits), `bool`, `string` (constant), enums, structs, fixed-size arrays, `array<T, N>`, `in [..]` domains |
 | Flow objects | `input` / `output` of buffers and streams, `pool`, `bind` (every pool serves the subtree of its component), activity `bind a.out b.in;` |
 | Resources | `lock`, `share`, `pool [N]`, `instance_id` |
+| Address spaces | `addr_reg_pkg`: `transparent_addr_space_c<>`, regions, `transparent_addr_claim_s<>` (see above) |
 | Constraints | expressions with `+ - * / % ** << >> & \| ^ ~ ! && \|\| == != < <= > >= ?:` and `in [..]`, implication `->`, `if` / `else`, `foreach` (with iterator and index), `unique`, named and unnamed blocks, constraints across actions through handles (`a.x + b.x == 3`), inline `with` |
 | Activities | action handles, `do type`, `sequence`, `parallel`, `schedule`, `select` with weights and guards, `repeat` (count and index), `replicate`, `if` / `else`, `constraint`, labels |
 | Exec blocks | `exec body` with procedural code (variables, assignments, calls, `if`, `repeat`, `while`, `break`, `continue`) and with target templates (`exec body C = """...{{field}}..."""`, `SV` likewise), `header`, `declaration` |
 | Functions | `function` with a body, `import [target] [C] function` prototypes, `print` |
 
-Not supported yet (mpss reports the line): `state` objects, address space
-claims (`addr_reg_pkg`), registers, `dynamic` and `default` constraints,
+Not supported yet (mpss reports the line): `state` objects, address
+handles, registers, `dynamic` constraints, `default disable`,
 `forall`, `foreach` / `match` in activities and exec blocks, lists, maps and
-sets, coverage (`covergroup`), template types, `pre_solve` / `post_solve`
+sets, coverage (`covergroup`), template types (other than `<>`), `pre_solve` / `post_solve`
 exec blocks (they are read and not run), arrays of flow object or resource
 references, and multi-core C output.
 
@@ -194,7 +236,9 @@ width), and division rounds toward zero.
    so on for what that action needs, up to 16 deep).
 3. The constraints are collected: those of every action, struct and flow
    object, the inline ones, and for every two resource claims that overlap
-   in time with at least one `lock`, that they take different instances.
+   in time with at least one `lock`, that they take different instances;
+   and for every two address claims alive at the same time, that they do
+   not overlap.
 4. The solver groups the variables that share constraints and solves each
    group by itself. A variable's value is found by halving its range, a
    random half first; each value chosen narrows the ranges of the variables

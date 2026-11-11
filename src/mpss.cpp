@@ -111,6 +111,7 @@ int main(int argc, char** argv) {
     pss::Model model;
     pss::Design design(model);
     try {
+        pss::parseSource(model, pss::kAddrRegPkg, "<addr_reg_pkg>");
         for (auto& f : files) pss::parseFile(model, f);
         design.elaborate(top, rootName);
     } catch (pss::Error& e) {
