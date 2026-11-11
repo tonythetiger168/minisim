@@ -440,6 +440,10 @@ inline void writeEdtPatterns(const std::string& path, const EdtPlan& p, const Cu
         os << "# <pattern> capture <chain> <cell states after capture, scan-in cell first, x = unknown>\n"
            << (p.xmask ? "# <pattern> mask <bits for edt_mask_in in the last shift cycles of the load, first shifted first>\n" : "")
            << "# <pattern> out <channel> <what the channel shows while the next pattern loads, x = do not compare>\n";
+    // For a reader without the scan description (mdft -diagnose).
+    os << "edt channels " << p.c << " mask_index_bits " << (p.xmask ? p.mIdx : -1) << "\n";
+    for (int ch = 0; ch < p.n; ch++)
+        os << "chain " << ch << " " << p.sd.chains[ch].name << " " << p.sd.chains[ch].scanIn << " " << p.sd.chains[ch].length << "\n";
     for (size_t i = 0; i < res.size(); i++) {
         if (!res[i].ok) {
             os << cs.ids[i] << " unencodable\n";

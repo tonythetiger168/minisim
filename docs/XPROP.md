@@ -139,12 +139,14 @@ clean copy, as without `-xprop`, and a merging copy. The clean copy runs
 first. When an `if` condition or a `case` selector is unknown, a jump with
 a third target for an unknown value moves to the same place in the merging
 copy, which finishes the pass. An ambiguous clock edge starts in the
-merging copy. A block that assigns a variable with `<=` more than once in
+merging copy; a clocked function skips that test in a time step where no
+signal has changed from or to x. A `case` in the clean copy is the standard
+one, after one test of its selector. A block that assigns a variable with `<=` more than once in
 a pass, or that holds other statements (tasks, messages, delays), has only
 the merging copy, which tests after each branch whether a merge is running.
 
 The temporaries of the merge are stored without going through the
 scheduler, so clocked blocks still run as parallel clocked functions and
 combinational blocks stay in the static schedule. On Ibex (lowRISC,
-118 745 cycles) the interpreter takes 28 s with `-xprop` and 24.5 s
-without; with `-compile` a run with `-xprop` takes 8.4 s.
+118 745 cycles) the interpreter takes 25 s with `-xprop` and 22.5 s
+without.
