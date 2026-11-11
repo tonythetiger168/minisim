@@ -7,6 +7,13 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Changed
+- License: the repository is Apache-2.0 (`LICENSE`, attribution in `NOTICE`)
+  instead of MIT. The MIT grant is not withdrawn: copies obtained under it
+  stay under it, and so does the git history. `docs/LICENSING.md` holds the
+  open-core policy, the proposed free / paid split per tool, and the rule
+  that no GPL or other copyleft code enters the tree.
+
 ### Added
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
