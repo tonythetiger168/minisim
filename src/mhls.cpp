@@ -267,6 +267,7 @@ struct Sched {
   int pipedLoops = 0;
   std::vector<std::string> loopNotes;   // what became of each loop that was to be pipelined
   std::map<std::string, int> opCount;
+  std::string memRefused;               // pipelined function: why its memory accesses do not allow one call per cycle
 };
 
 int availSt(const Op& o) {
@@ -495,6 +496,55 @@ std::string pipeRate(int K) {
   return K == 1 ? "one iteration per cycle" : "one iteration every " + std::to_string(K) + " cycles";
 }
 
+// The memory accesses of a pipelined loop body, or of a pipelined function
+// (K = 1), where a new iteration or call follows K cycles behind. Returns
+// why not when they cannot keep their order; fills in B.bypass.
+std::string memRule(Function& f, Block& B, const Cfg& cfg, int K, const std::string& unit = "iteration") {
+  // The accesses to one memory share its port and must stay in program
+  // order across iterations: all of them within K stages.
+  std::map<int, std::pair<int, int>> acc;   // array -> first and last stage
+  std::map<int, std::vector<int>> accs;     // two ports: array -> its accesses in program order
+  B.bypass.clear();
+  for (int id : B.ops) {
+    const Op& o = f.ops[id];
+    if (o.k != OpK::Load && o.k != OpK::Store) continue;
+    if (cfg.dualPort && f.arrs[o.ref].mode != Arr::Stream) {
+      // With two ports the accesses need not be in different cycles, but a
+      // write still has to land before the next iteration, K cycles
+      // behind, gets to the accesses that come before it in the program,
+      // and after the previous iteration is done with those that follow.
+      // A read exactly K stages before the write meets the previous
+      // iteration's write in the same cycle: the written word is passed on.
+      auto& v = accs[o.ref];
+      if (o.port > 1)
+        return "array '" + f.arrs[o.ref].name + "' is accessed more than " + std::to_string(2 * K) +
+               " times per " + unit + ", and a memory has two ports";
+      for (int e : v) {
+        const Op& p = f.ops[e];
+        if (p.k != OpK::Store && o.k != OpK::Store) continue;
+        int d = o.st - p.st;
+        if (d < K) continue;
+        if (d == K && p.k == OpK::Load && o.k == OpK::Store) { B.bypass.push_back({e, id}); continue; }
+        std::string n = std::to_string(d) + " stage" + (d == 1 ? "" : "s");
+        if (o.k == OpK::Store)
+          return "array '" + f.arrs[o.ref].name + "' is written " + n + " after an earlier access, so the next " + unit +
+                 " would overtake the write";
+        return "array '" + f.arrs[o.ref].name + "' is read " + n + " after it is written, so the next " + unit +
+               " would write first";
+      }
+      v.push_back(id);
+      continue;
+    }
+    auto [it, fresh] = acc.insert({o.ref, {o.st, o.st}});
+    if (fresh) continue;
+    it->second.second = o.st;
+    if (o.st - it->second.first >= K)
+      return "array '" + f.arrs[o.ref].name + "' is accessed more than once per " + unit + ", and a memory has one port" +
+             (unit == "call" ? " (-dual-port gives it two)" : "");
+  }
+  return "";
+}
+
 // A loop body as a pipeline with a new iteration every K cycles. Returns why
 // not when the loop does not allow it; the block is then left unscheduled.
 std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg, int K) {
@@ -522,44 +572,10 @@ std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg, int 
       return "'" + f.vars[moved].name + "' is updated from its own previous value through logic or a memory read "
              "that takes more than one clock period";
   }
-  // The accesses to one memory share its port and must stay in program
-  // order across iterations: all of them within K stages.
-  std::map<int, std::pair<int, int>> acc;   // array -> first and last stage
-  std::map<int, std::vector<int>> accs;     // two ports: array -> its accesses in program order
-  B.bypass.clear();
-  for (int id : B.ops) {
-    const Op& o = f.ops[id];
-    if (o.cyc > 1) return std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)";
-    if (o.k != OpK::Load && o.k != OpK::Store) continue;
-    if (cfg.dualPort && f.arrs[o.ref].mode != Arr::Stream) {
-      // With two ports the accesses need not be in different cycles, but a
-      // write still has to land before the next iteration, K cycles
-      // behind, gets to the accesses that come before it in the program,
-      // and after the previous iteration is done with those that follow.
-      // A read exactly K stages before the write meets the previous
-      // iteration's write in the same cycle: the written word is passed on.
-      auto& v = accs[o.ref];
-      if (o.port > 1)
-        return "array '" + f.arrs[o.ref].name + "' is accessed more than " + std::to_string(2 * K) +
-               " times per iteration, and a memory has two ports";
-      for (int e : v) {
-        const Op& p = f.ops[e];
-        if (p.k != OpK::Store && o.k != OpK::Store) continue;
-        int d = o.st - p.st;
-        if (d < K) continue;
-        if (d == K && p.k == OpK::Load && o.k == OpK::Store) { B.bypass.push_back({e, id}); continue; }
-        return "array '" + f.arrs[o.ref].name + "' is written " + std::to_string(d) + " stage" + (d == 1 ? "" : "s") +
-               " after an earlier access, so the next iteration would overtake the write";
-      }
-      v.push_back(id);
-      continue;
-    }
-    auto [it, fresh] = acc.insert({o.ref, {o.st, o.st}});
-    if (fresh) continue;
-    it->second.second = o.st;
-    if (o.st - it->second.first >= K)
-      return "array '" + f.arrs[o.ref].name + "' is accessed more than once per iteration, and a memory has one port";
-  }
+  for (int id : B.ops)
+    if (f.ops[id].cyc > 1)
+      return std::string("a ") + opName(f.ops[id].k) + " takes more than one clock period (raise -clock)";
+  if (std::string why = memRule(f, B, cfg, K); !why.empty()) return why;
   if (availSt(f.ops[B.term.cond]) > K - 1)
     return "the loop condition is not known in the first stage (it depends on a memory read or on a long path)";
   return "";
@@ -590,8 +606,10 @@ Sched schedule(Function& f, const Cfg& cfg) {
         }
       }
     }
-    scheduleBlock(f, B, cfg, f.pipeline ? 1 : 0, temps[b]);
+    scheduleBlock(f, B, cfg, f.pipeline ? 1 : 0, temps[b], nullptr, f.pipeline ? 1 : 0);
   });
+  // A pipelined function: the next call is one cycle behind.
+  if (f.pipeline && f.blocks.size() == 1) sc.memRefused = memRule(f, f.blocks[0], cfg, 1, "call");
   for (size_t b = 0; b < f.blocks.size(); b++) {
     const Block& B = f.blocks[b];
     if (B.pipeL) sc.pipedLoops++;
@@ -924,6 +942,36 @@ struct Emitter {
       << cfg.clock << " ns clock.\n";
   }
 
+  void rams() {
+    // Internal RAMs.
+    for (auto& a : f.arrs) {
+      if (a.mode != Arr::Mem || a.isParam || (!a.read && !a.written)) continue;
+      std::string n = a.name;
+      o << "  logic " << rng(a.ety.w) << n << "_mem [0:" << a.size - 1 << "];\n";
+      o << "  logic " << rng(a.aw()) << n << "_addr;\n  logic " << n << "_ce, " << n << "_we;\n";
+      o << "  logic " << rng(a.ety.w) << n << "_wdata, " << n << "_rdata;\n";
+      const bool two = a.p1r || a.p1w;
+      if (two) {
+        // The second port. A read gets the word as it was before the clock
+        // edge, also when the other port writes it at that edge.
+        o << "  logic " << rng(a.aw()) << n << "_addr1;\n  logic " << n << "_ce1, " << n << "_we1;\n";
+        o << "  logic " << rng(a.ety.w) << n << "_wdata1, " << n << "_rdata1;\n";
+        if (!a.p1w) o << "  assign " << n << "_we1 = 1'b0;\n  assign " << n << "_wdata1 = '0;\n";
+      }
+      o << "  always_ff @(posedge ap_clk) begin\n";
+      for (std::string x : {std::string(), std::string("1")}) {
+        if (!x.empty() && !two) break;
+        o << "    if (" << n << "_ce" << x << ") begin\n      if (" << n << "_we" << x << ") " << n << "_mem[" << n
+          << "_addr" << x << "] <= " << n << "_wdata" << x << ";\n      else " << n << "_rdata" << x << " <= " << n
+          << "_mem[" << n << "_addr" << x << "];\n    end\n";
+      }
+      o << "  end\n";
+      if (a.isStatic)
+        o << "`ifndef SYNTHESIS\n  initial for (int i = 0; i < " << a.size << "; i++) " << n
+          << "_mem[i] = '0;\n`endif\n";
+    }
+  }
+
   // ---- FSM with datapath ----
   std::string go(int b) const {
     const Block& B = f.blocks[b];
@@ -966,33 +1014,7 @@ struct Emitter {
         o << "  assign " << n << "_tvalid = " << n << "_ce;\n  assign " << n << "_tdata = " << n << "_wdata;\n";
     }
 
-    // Internal RAMs.
-    for (auto& a : f.arrs) {
-      if (a.mode != Arr::Mem || a.isParam || (!a.read && !a.written)) continue;
-      std::string n = a.name;
-      o << "  logic " << rng(a.ety.w) << n << "_mem [0:" << a.size - 1 << "];\n";
-      o << "  logic " << rng(a.aw()) << n << "_addr;\n  logic " << n << "_ce, " << n << "_we;\n";
-      o << "  logic " << rng(a.ety.w) << n << "_wdata, " << n << "_rdata;\n";
-      const bool two = a.p1r || a.p1w;
-      if (two) {
-        // The second port. A read gets the word as it was before the clock
-        // edge, also when the other port writes it at that edge.
-        o << "  logic " << rng(a.aw()) << n << "_addr1;\n  logic " << n << "_ce1, " << n << "_we1;\n";
-        o << "  logic " << rng(a.ety.w) << n << "_wdata1, " << n << "_rdata1;\n";
-        if (!a.p1w) o << "  assign " << n << "_we1 = 1'b0;\n  assign " << n << "_wdata1 = '0;\n";
-      }
-      o << "  always_ff @(posedge ap_clk) begin\n";
-      for (std::string x : {std::string(), std::string("1")}) {
-        if (!x.empty() && !two) break;
-        o << "    if (" << n << "_ce" << x << ") begin\n      if (" << n << "_we" << x << ") " << n << "_mem[" << n
-          << "_addr" << x << "] <= " << n << "_wdata" << x << ";\n      else " << n << "_rdata" << x << " <= " << n
-          << "_mem[" << n << "_addr" << x << "];\n    end\n";
-      }
-      o << "  end\n";
-      if (a.isStatic)
-        o << "`ifndef SYNTHESIS\n  initial for (int i = 0; i < " << a.size << "; i++) " << n
-          << "_mem[i] = '0;\n`endif\n";
-    }
+    rams();
 
     // Datapath: one wire per operator.
     std::vector<std::vector<std::string>> act(sc.nStates);
@@ -1375,13 +1397,44 @@ struct Emitter {
     for (int s = 1; s < L; s++) o << "  logic vld" << s << ";\n";
     auto vld = [&](int s) { return s == 0 ? std::string("ap_vld_in") : "vld" + std::to_string(s); };
 
-    std::vector<std::vector<std::string>> stage(L);   // registers clocked at the end of stage s
+    rams();
+    std::vector<std::vector<std::string>> stage(L + 1);   // registers clocked at the end of stage s
+    std::map<int, std::string> memDrive;                  // 2 * array + port -> what its one access drives
     for (int id : B.ops) {
       const Op& q = f.ops[id];
       if (q.k == OpK::Const) continue;
       bool port = q.k == OpK::ReadVar;
       if (port && (f.vars[q.ref].isStatic || f.vars[q.ref].port == Var::None)) continue;
-      if (q.k == OpK::RomRd) {
+      bool fwd = false;
+      if (q.k == OpK::Load || q.k == OpK::Store) {
+        // A memory access happens in the cycle its stage holds a call and
+        // the pipeline moves.
+        const Arr& a = f.arrs[q.ref];
+        const std::string n = memName(a), x = q.port ? "1" : "";
+        auto R = [&](int y, int want) { return ref2(y, q.st, want); };
+        std::string en = "ap_ce && " + vld(q.st) + (q.k == OpK::Store && q.c >= 0 ? " && " + R(q.c, 1) : "");
+        std::string d = "    if (" + en + ") begin " + n + "_addr" + x + " = " + R(q.a, a.aw()) + "; " + n + "_ce" + x + " = 1'b1;";
+        if (q.k == OpK::Store) d += " " + n + "_we" + x + " = 1'b1; " + n + "_wdata" + x + " = " + R(q.b, a.ety.w) + ";";
+        memDrive[2 * q.ref + q.port] += d + " end\n";
+        if (q.k == OpK::Store) continue;
+        // The call ahead writes in the cycle this one reads: when it is
+        // the same word, the written value replaces what the memory returns.
+        for (auto& [ld, sto] : B.bypass) {
+          if (ld != id) continue;
+          const Op& w = f.ops[sto];
+          auto RW = [&](int y, int want) { return ref2(y, w.st, want); };
+          std::string hit = "fwd" + std::to_string(id), val = "fwdv" + std::to_string(id);
+          o << "  logic " << hit << ";\n  logic " << rng(q.w) << val << ";\n";
+          stage[q.st].push_back(hit + " <= " + vld(q.st) + " && " + vld(w.st) + (w.c >= 0 ? " && " + RW(w.c, 1) : "") +
+                                " && " + R(q.a, a.aw()) + " == " + RW(w.a, a.aw()) + ";");
+          stage[q.st].push_back(val + " <= " + RW(w.b, a.ety.w) + ";");
+          o << "  logic " << rng(q.w) << wire(id) << ";\n  assign " << wire(id) << " = " << hit << " ? " << val << " : " << n
+            << "_rdata" << x << ";\n";
+          fwd = true;
+        }
+      }
+      if (fwd) {
+      } else if (q.k == OpK::RomRd) {
         o << romRead(id, ref2(q.a, q.st, f.ops[q.a].w));
       } else if (!port) {
         std::string pre;
@@ -1393,6 +1446,13 @@ struct Emitter {
         o << "  logic " << rng(q.w) << pname(id, s) << ";\n";
         stage[s - 1].push_back(pname(id, s) + " <= " + ref2(id, s - 1, q.w) + ";");
       }
+    }
+    for (auto& [key, d] : memDrive) {
+      const Arr& a = f.arrs[key / 2];
+      const std::string n = memName(a), x = key % 2 ? "1" : "";
+      o << "  always_comb begin\n    " << n << "_addr" << x << " = '0; " << n << "_ce" << x << " = 1'b0;";
+      if (key % 2 ? a.p1w : (a.written || !a.isParam)) o << " " << n << "_we" << x << " = 1'b0; " << n << "_wdata" << x << " = '0;";
+      o << "\n" << d << "  end\n";
     }
     o << "  always_ff @(posedge ap_clk) begin\n    if (ap_rst) begin\n      ap_vld_out <= 1'b0;\n";
     for (int s = 1; s < L; s++) o << "      vld" << s << " <= 1'b0;\n";
@@ -1421,7 +1481,7 @@ struct Emitter {
 };
 
 // Pipelining needs a straight-line function; says why when it is not.
-void checkPipeline(const Function& f, const Program& P, const Func& src) {
+void checkPipeline(const Function& f, const Sched& sc, const Program& P, const Func& src) {
   auto no = [&](const std::string& why) { fail(P.file, src.line, "'" + f.name + "' cannot be pipelined: " + why); };
   if (f.blocks.size() != 1)
     no("it still has branches or loops after if-conversion (unroll the loops with -unroll-all or "
@@ -1431,9 +1491,9 @@ void checkPipeline(const Function& f, const Program& P, const Func& src) {
     const Op& o = f.ops[id];
     if ((o.k == OpK::Load || o.k == OpK::Store) && f.arrs[o.ref].mode == Arr::Stream)
       no("it reads or writes stream '" + f.arrs[o.ref].name + "' (use the FSM architecture)");
-    if (o.k == OpK::Load || o.k == OpK::Store) no("array '" + f.arrs[o.ref].name + "' is a memory (raise -max-reg-array, or use the FSM architecture)");
     if (o.cyc > 1) no(std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)");
   }
+  if (!sc.memRefused.empty()) no(sc.memRefused);
   // A static read and its update must share a stage, or the next input
   // would read a stale value.
   for (size_t i = 0; i < B.writes.size(); i++) {
@@ -1720,6 +1780,15 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
   } else {
     int L = f.blocks[0].len;
     o << "  integer tb_cyc = 0, tb_first_in = -1, tb_first_out = -1;\n  always @(posedge ap_clk) tb_cyc <= tb_cyc + 1;\n";
+    // The memories keep their contents from one call to the next.
+    o << "  initial begin\n";
+    for (auto& [ai, init] : V.memInit) {
+      const Arr& a = f.arrs[ai];
+      if (!a.read && !a.written) continue;
+      for (size_t k = 0; k < init.size(); k++)
+        o << "    " << svName(a.name) << "_m[" << k << "] = " << hexLit(init[k], a.ety.w) << ";\n";
+    }
+    o << "  end\n";
     if (hs) {
       // The sink refuses now and then; the source waits for each transfer.
       o << "  logic tb_acc = 0;\n  always @(posedge ap_clk) tb_acc <= in_valid && in_ready;\n"
@@ -1742,6 +1811,12 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
     }
     o << "    if (tb_n != " << V.v.size() << ") begin $display(\"FAIL: %0d results, expected " << V.v.size()
       << "\", tb_n); tb_errors = tb_errors + 1; end\n";
+    for (auto& [ai, fin] : V.memFinal) {
+      const Arr& a = f.arrs[ai];
+      if (!a.written) continue;
+      for (size_t k = 0; k < fin.size(); k++)
+        o << "    " << check(svName(a.name) + "_m[" + std::to_string(k) + "]", fin[k], a.ety.w, V.v.size()) << "\n";
+    }
     if (!hs)
       o << "    if (tb_first_out - tb_first_in != " << L << ") begin $display(\"FAIL: latency %0d, expected " << L
       << "\", tb_first_out - tb_first_in); tb_errors = tb_errors + 1; end\n";
@@ -2189,7 +2264,7 @@ int main(int argc, char** argv) {
         j.sc.entryLive = live;
         char buf[200];
         try {
-          if (j.fn.pipeline) checkPipeline(j.fn, P, src);
+          if (j.fn.pipeline) checkPipeline(j.fn, j.sc, P, src);
           summarize(j, c);
           snprintf(buf, sizeof buf, "%9.2f  %7d  %14s  %9d  %9ld  %10d", explore[i],
                    j.fn.pipeline ? j.fn.blocks[0].len : j.sc.nStates, fmtLat(j.sc).c_str(), j.sc.regBits,
@@ -2211,7 +2286,7 @@ int main(int argc, char** argv) {
       j.fn = lowerAndClean(P, *j.src, opt, live);
       j.sc = schedule(j.fn, cfg);
       j.sc.entryLive = live;
-      if (j.fn.pipeline) checkPipeline(j.fn, P, *j.src);
+      if (j.fn.pipeline) checkPipeline(j.fn, j.sc, P, *j.src);
       Emitter em(j.fn, j.sc);
       j.sv = j.fn.pipeline ? em.pipe(cfg) : em.fsm(cfg);
       summarize(j, cfg);

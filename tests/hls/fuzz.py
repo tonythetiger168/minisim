@@ -17,6 +17,9 @@ import sys
 TYPES = ["int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t", "bool"]
 
 
+PIPE_MEM = False
+
+
 class Gen:
     def __init__(self, seed):
         self.r = random.Random(seed)
@@ -265,7 +268,7 @@ class Gen:
             outp = r.choice(["*", "&"])
             params.append("%s %so0" % (t, outp))
             self.vars.append(("*o0" if outp == "*" else "o0", t))
-        if not self.pipe and r.random() < 0.4:
+        if (not self.pipe or PIPE_MEM) and r.random() < 0.4:
             t = r.choice(TYPES[:8])
             params.append("%s m0[16]" % t)
             self.arrs.append(("m0", 16, True))
@@ -353,7 +356,10 @@ def main():
     ap.add_argument("--vectors", default="12")
     ap.add_argument("--clang", action="store_true", help="read every program through mhls -clang")
     ap.add_argument("--dual-port", action="store_true", help="give every memory two ports (mhls -dual-port)")
+    ap.add_argument("--pipe-mem", action="store_true", help="pipelined functions get a memory argument too")
     a = ap.parse_args()
+    global PIPE_MEM
+    PIPE_MEM = a.pipe_mem
     lo, hi = [int(x) for x in a.seeds.split(":")]
     os.makedirs(a.out, exist_ok=True)
     bad = skipped = 0

@@ -317,6 +317,10 @@ Spec references are IEEE 1800-2023 clauses.
   that depends on memory data) is pipelined at one iteration every 2 or more
   cycles when that beats running it unpipelined; `#pragma hls pipeline` now
   also works first in a `do` body.
+- `mhls -pipeline`: memories in a pipelined function. An array parameter or
+  a large local array no longer refuses the pipeline: one access per call, or
+  two with `-dual-port`, where a read-modify-write of one word still takes a
+  new call every cycle.
 - `mhls -dual-port`: two-port memories. Two accesses to one array share a
   state when the first is a read, and a pipelined loop that updates a memory
   in place (`h[b] = h[b] + 1`) starts an iteration every cycle: the write of

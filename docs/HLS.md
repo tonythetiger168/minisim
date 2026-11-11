@@ -200,8 +200,17 @@ FSM architecture:
 Pipeline architecture: `ap_vld_in` marks an input, `ap_vld_out` its result
 `L` cycles later (the summary prints `L`), and `ap_ce` low stalls every
 stage. A pipeline needs a function that is straight-line after unrolling
-(no memories, no data-dependent loops), and a `static` must be read and
-updated in the same stage; `mhls` says which rule fails and why.
+(no data-dependent loops), and a `static` must be read and updated in the
+same stage; `mhls` says which rule fails and why.
+
+A pipeline may use memories (array parameters, and local arrays larger than
+`-max-reg-array`, `static` ones keeping their contents from call to call).
+With one port a memory takes one access per call. With `-dual-port` it takes
+two, and a call may read a word and write it back
+(`h[b] = h[b] + x`): the read of one call happens in the cycle the call
+before it writes, and when both go to the same word the written value is
+passed on. In `tests/hls/pipemem.c` a per-bucket counter takes a new call
+every cycle this way.
 
 ### Streams
 
