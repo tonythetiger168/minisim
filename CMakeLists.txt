@@ -187,6 +187,13 @@ if(MINISIM_WITH_SLANG)
   target_compile_definitions(test_lower PRIVATE MINISIM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME test_lower COMMAND test_lower)
 
+  # The FSM extractor as other tools use it: the header and slang, nothing else.
+  add_executable(test_fsm_extract tests/test_fsm_extract.cpp)
+  target_include_directories(test_fsm_extract PRIVATE src)
+  target_link_libraries(test_fsm_extract PRIVATE slang::slang)
+  target_compile_definitions(test_fsm_extract PRIVATE MINISIM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  add_test(NAME test_fsm_extract COMMAND test_fsm_extract)
+
   # msim end to end: two files, -top, +define+, -maxtime, -vcd, and a bad file.
   set(CLI ${CMAKE_SOURCE_DIR}/examples/cli)
   add_test(NAME msim_define

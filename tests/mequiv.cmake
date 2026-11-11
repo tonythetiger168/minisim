@@ -75,3 +75,10 @@ check(0 "4 flops are behind clock gates" -ref gated.sv -impl gated_gates.v cells
 check(0 "4 flops are behind clock gates" -ref gated.sv -impl gated_gates.v -lib cells.lib +define+ICG_CELL)
 check(1 "FAIL  clock/reset q[0]" -ref gated.sv -impl gated_gates.v cells.v +define+BUG)
 check(1 "FAIL  clock/reset q[0]" -ref gated.sv -impl gated_gates.v cells.v -noclockgate)
+
+# A netlist from a tool that flattens variables: flops of a struct and a
+# memory named by bit position (item_reg_3_, mem_reg_5_), unused QN pins left
+# open, and a register the reset does not touch built as a flop on the clock
+# alone that holds while the reset is high.
+check(0 "12 state elements" -ref flat.sv -impl flat_gates.v -lib cells.lib)
+check(1 "FAIL  output      q[1]" -ref flat.sv -impl flat_gates.v -lib cells.lib +define+BUG)

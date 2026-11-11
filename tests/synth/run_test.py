@@ -8,7 +8,7 @@ which prints the outputs for random stimulus. The testbench is simulated
 with msim twice, on the RTL and on the netlist with the library's cell
 models that msynth generates, and both runs must print the same lines.
 With [lib], that Liberty file is the target library instead of the
-built-in generic one.
+default one (mini45).
 """
 import os
 import subprocess

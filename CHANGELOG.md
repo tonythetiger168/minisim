@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdebug`: struct fields in the active-driver trace (conditions on a field
+  are evaluated; each field and constant part select has its own driver).
+- `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
+  made for it (lower pad turned or lengthened, written to the DEF's `VIAS`),
+  short pieces of wire and the pads of power via stacks are lengthened to
+  the layer's `AREA`, and a layer's `OFFSET 0` is taken as given (it used to
+  mean half a pitch). `bench/gen_pnr.py --mini45` writes netlists over the
+  library's cells; the `mpnr` test places, routes and DRC-checks one.
+- `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
+  and transitions of FSMs), in the totals, the history and `mplan init`.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
   inside a scope, their port connections and which instance feeds which.
 - `mdebug`: tasks and functions in a module, call output arguments, `force`,
@@ -136,7 +146,7 @@ Spec references are IEEE 1800-2023 clauses.
   `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
   mapped onto any Liberty library by cut matching for area or delay,
   high-fanout nets are buffered, and the result is timed with the library's
-  NLDM tables. A generic cell library is built in. Mapping runs on every
+  NLDM tables. The default library is mini45. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
@@ -148,6 +158,24 @@ Spec references are IEEE 1800-2023 clauses.
   `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
   calls with the host C++ compiler, `-explore` sweeps the clock period.
   See `docs/HLS.md`.
+- `mhls`: structs. Nested structs, arrays of structs, array members and
+  bit-fields; structs copied, passed by value, pointer or reference, and
+  returned. Each member becomes its own register, memory or port.
+- `mhls`: pipelined loops. `#pragma hls pipeline` first in a loop body, or
+  `-pipeline-loops` for every loop that allows it, starts a new iteration
+  every cycle: `n` iterations of an `L`-stage body take `n + L - 1` cycles
+  instead of `n * L`. A loop that cannot be pipelined is refused with the
+  rule it breaks.
+- `mhls`: pipelined loops at slower rates. A loop that cannot start an
+  iteration every cycle (a memory updated in place, a pointer chase, an exit
+  that depends on memory data) is pipelined at one iteration every 2 or more
+  cycles when that beats running it unpipelined; `#pragma hls pipeline` now
+  also works first in a `do` body.
+- `mhls`: a variable that only feeds itself (a counter or checksum nothing
+  reads) is removed with its register and operators.
+- `mhls -handshake`: also writes `<top>_hs`, the block behind
+  `in_valid`/`in_ready` and `out_valid`/`out_ready` ports (FSM and pipeline);
+  the generated testbench drives it with a sink that refuses now and then.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -203,7 +231,10 @@ Spec references are IEEE 1800-2023 clauses.
   database. `mcov report` adds `Condition:` and `FSM:` lines, `-detail`,
   `-uncovered`, `-fsm-reset-filter`, `-min-cond`, `-min-fsm-state`,
   `-min-fsm-trans`, and FSM and condition sections in the HTML report;
-  `mcov merge` merges both.
+  `mcov merge` merges both. One-hot FSMs tested bit by bit
+  (`case (1'b1)` on `state[K]`, `if (state[K])`) are extracted, and
+  conditions with a term that calls a function or reads through a class
+  handle are covered with short-circuit vectors.
 - `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
   through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
   gates) or a cell map, checked for a controllable clock and asynchronous
@@ -228,6 +259,18 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv` reads OASIS layouts (SEMI P39) as well as GDSII, told apart by the
+  file's first bytes: every record, repetition and point-list form, compact
+  trapezoids, name tables, strict mode and compressed blocks (built-in
+  DEFLATE). `src/oasis.hpp`; `oasis::readLayout` reads either format into a
+  `gds::Library`. Checked against KLayout on random files and SKY130 cells.
+- Fixed: the GDSII writer (`gds::write`) wrote STRANS as an integer record;
+  it is a bit array, and KLayout refused files with mirrored references.
+- `mpv lvs -lef tech.lef routed.def -netlist block.v`: LVS of a placed and
+  routed block against its gate netlist. The nets come from the geometry
+  (cell pins from the LEF, wires, vias and block pins from the DEF), not from
+  the DEF's connection lists; opens, shorts, missing or different cells and
+  pins are reported, and `-o` writes the extracted netlist as Verilog.
 - `mpv drc -lef tech.lef routed.def`: design rule checking of a routed DEF,
   with the rules taken from the LEF technology when no `-deck` is given
   (`-write-deck` shows them).
@@ -330,6 +373,31 @@ Spec references are IEEE 1800-2023 clauses.
 - `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
   Verilog netlist reader / flattener / writer, shared by the timing,
   synthesis, power, equivalence and physical tools.
+- `mlint` state machine rules on the extractor FSM coverage uses: `FSM001` a
+  state never entered, `FSM002` a state with no way out, `FSM003` a state
+  case with no default that leaves encodings unused, `FSM004` no reset state.
+- `mpower`, power analysis on the msim front end: average power by group,
+  instance and cell from SAIF, VCD or FST activity and Liberty
+  `internal_power` / `leakage_power` tables; activity propagation for nets
+  the file does not name (RTL activity on a gate netlist, or `-clock` with no
+  activity); an RTL estimate (register bits as the library's flop, logic as
+  reference gates); `-peak` with `-waveform` for power over time; `-upf` for
+  power per domain with domain voltages and switched domains; `-spef` for
+  extracted wire capacitance; `-json`.
+  Multithreaded, with the same report on any thread count. `msim -saif`
+  writes SAIF from a simulation, and `mpower -write_saif` converts a
+  waveform. `src/saif.hpp` (SAIF reader and writer) and `src/power.hpp` (the
+  computation) are shared headers. See `docs/POWER.md`.
+- FPGA synthesis: `mfpga` maps RTL or AIGER to K-input LUTs and flip-flops
+  (iCE40, ECP5, Xilinx 7-series, generic cells) on the shared graph of
+  `src/aig.hpp`, and writes Yosys JSON for nextpnr, EDIF or Verilog.
+  Depth-optimal priority-cut mapping with area recovery; multithreaded, with
+  the same output for any `-threads N`. See `docs/FPGA.md`.
+- `mfpga`: adders, subtractors and comparators map to the family's carry
+  chain (`SB_CARRY`, `CCU2C`, `CARRY4`), and clock enables and synchronous
+  resets to flop pins. `-nocarry` and `-noce` turn each off.
+- `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
+  `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:
