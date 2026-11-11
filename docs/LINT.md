@@ -227,7 +227,15 @@ or single rules.
 | `STY007` | info | off | A parameter with no type | explicit-parameter-storage-type |
 | `STY008` | info | off | A packed dimension that counts up (`[0:7]`) | packed-dimensions-range-ordering |
 | `STY009` | info | off | An unpacked dimension that counts down (`[3:0]`) | unpacked-dimensions-range-ordering |
+| `STY010` | info | off | A string literal carried over the line with a backslash | forbid-line-continuations |
+| `STY011` | info | off | A semicolon after a UVM macro (`` `uvm_info(...); ``) | uvm-macro-semicolon |
+| `STY012` | info | off | `disable name` where the name is not a `begin` block around the statement | disable-statement |
+| `SUS002` | warning | off | `void'()` around `randomize()` or `uvm_hdl_read()` | void-cast |
+| `SUS003` | info | off | `$psprintf`, `$random`, `$srandom` or a `$dist_` function | invalid-system-task-function |
 | `NAME014` | warning | off | A macro name does not match `name.macro` | macro-name-style |
+| `NAME015` | warning | off | An interface name does not match `name.interface` | interface-name-style |
+| `NAME016` | warning | off | A constraint name does not match `name.constraint` | constraint-name-style |
+| `NAME017` | info | off | A parameter named for what it disables (`DisableFoo`) | positive-meaning-parameter-name |
 | `W009` | info | off | A sized binary literal with fewer digits than its width (`8'b101`) | undersized-binary-literal |
 
 Verible's suspicious-semicolon (`if (c);`) is slang's own `-Wempty-body`
@@ -337,6 +345,8 @@ Severities: an `error` finding makes mlint exit 1; a `warning` does with
 | `name.max_length` | `40` | `NAME010` |
 | `unused.ignore` | `^_?unused\|_unused$\|^_?nc_\|_nc$` (any case) | `UNU001`..`UNU005` |
 | `name.macro` | `^[A-Z_][A-Z0-9_]*$` | `NAME014` |
+| `name.interface` | `_if$` | `NAME015` |
+| `name.constraint` | `_c$` | `NAME016` |
 | `fmt.line_length` | `100` | `FMT001` |
 | `tb.modules` | empty | module names (globs) to treat as testbench code |
 

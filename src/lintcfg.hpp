@@ -216,6 +216,9 @@ inline const std::vector<RuleInfo>& table() {
         {"NAME014", "naming", Sev::Warning, false, "a macro name does not match name.macro", "Verible rule macro-name-style."},
 
         // ------------------------------------------------------------------- style
+        {"NAME015", "naming", Sev::Warning, false, "an interface name does not match name.interface", "Verible rule interface-name-style."},
+        {"NAME016", "naming", Sev::Warning, false, "a constraint name does not match name.constraint", "Verible rule constraint-name-style."},
+        {"NAME017", "naming", Sev::Info, false, "a parameter named for what it disables", "Verible rule positive-meaning-parameter-name."},
         {"STY001", "style", Sev::Info, true, "more than one module in a file", ""},
         {"STY002", "style", Sev::Info, false, "a file's name is not its module's name", ""},
         {"STY003", "style", Sev::Info, false, "a plain always where always_ff / always_comb / always_latch says more", ""},
@@ -225,6 +228,9 @@ inline const std::vector<RuleInfo>& table() {
         {"STY007", "style", Sev::Info, false, "a parameter with no type", "Verible rule explicit-parameter-storage-type."},
         {"STY008", "style", Sev::Info, false, "a packed dimension that counts up", "Verible rule packed-dimensions-range-ordering."},
         {"STY009", "style", Sev::Info, false, "an unpacked dimension that counts down", "Verible rule unpacked-dimensions-range-ordering."},
+        {"STY010", "style", Sev::Info, false, "a string literal carried over the line with a backslash", "Verible rule forbid-line-continuations."},
+        {"STY011", "style", Sev::Info, false, "a semicolon after a UVM macro", "Verible rule uvm-macro-semicolon."},
+        {"STY012", "style", Sev::Info, false, "disable of a name that is not an enclosing begin block", "Verible rule disable-statement."},
         {"FUNC001", "style", Sev::Info, true, "a function reads or writes a signal that is not one of its arguments",
          "always @* does not see signals read inside a function, and the function cannot be reused."},
 
@@ -260,6 +266,9 @@ inline const std::vector<RuleInfo>& table() {
         {"FMT003", "format", Sev::Info, false, "trailing whitespace", "Verible rule no-trailing-spaces."},
         {"FMT004", "format", Sev::Info, false, "the file does not end with a newline", "Verible rule posix-eof."},
         {"SUS001", "suspicious", Sev::Info, false, "a stray semicolon (x = 1;; or endfunction;)", "Verible rule forbid-consecutive-null-statements."},
+        {"SUS002", "suspicious", Sev::Warning, false, "void'() around randomize() or uvm_hdl_read()", "Verible rule void-cast."},
+        {"SUS003", "suspicious", Sev::Info, false, "$psprintf, $random, $srandom or a $dist_ function",
+         "Verible rule invalid-system-task-function."},
         {"W009", "width", Sev::Info, false, "a sized binary literal with fewer digits than its width (8'b101)", "Verible rule undersized-binary-literal."},
         // --------------------------------------------------------------------- fsm
         {"FSM001", "fsm", Sev::Warning, true, "a state that no transition and no reset leads to",
