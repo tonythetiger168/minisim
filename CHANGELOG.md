@@ -96,6 +96,15 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal`: SVA local variables (assigned once, in an antecedent or a
+  cover's sequence) and `s.triggered` are checked instead of skipped.
+- `mformal -blackbox NAME` and `-cut SIGNAL`: leave a module or instance
+  out of the model, or make a signal a free input.
+- `mformal -connect FILE`: connectivity checking. Each line
+  `destination, source [, condition]` is proven, and a condition that can
+  never hold is flagged.
+- `mformal -app toggle`: unreachable-coverage analysis. Reports every
+  signal bit that can never be 0 or never be 1 after the reset.
 - `memu` is timing-aware between FPGAs: on a link with too few wires the
   signals on the longest combinational paths keep a wire of their own and the
   rest share what is left (40% fewer `emu_clk` cycles per event on a
