@@ -601,6 +601,8 @@ Spec references are IEEE 1800-2023 clauses.
 - `mfpga`: memories with registered reads map to block RAM on iCE40
   (`SB_RAM40_4K`) and ECP5 (`DP16KD`), with a bypass that keeps the RTL's
   read-during-write result. `-noram` keeps flops.
+- `mfpga`: block RAM on `xc7` too (`RAMB18E1`, 1024 x 18 to 16384 x 1,
+  parity bits used as data).
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:
