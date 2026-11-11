@@ -475,6 +475,10 @@ Spec references are IEEE 1800-2023 clauses.
   expected output channels and a load / capture / compare testbench;
   `-edt_xmask` adds compactor X masking (one chain per channel observed,
   mask chosen per pattern) so unknown captures do not hide known ones.
+- `mdft -diagnose -edt_patterns`: diagnosis from compressed-pattern fail logs
+  (failing output channel bits), with the candidates' failures folded through
+  the compactor and the masks; the pattern testbench writes such a log with
+  `+faillog`.
 - `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
   on the gate netlist (port inputs at 0, scan cells observed), with the
   coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
