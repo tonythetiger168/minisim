@@ -240,3 +240,44 @@ execute_process(COMMAND ${MDEBUG} ${SV} -top tb -fsm tb.nothing RESULT_VARIABLE 
 if(rc EQUAL 0)
   message(FATAL_ERROR "-fsm of a name with no state machine passed")
 endif()
+
+# The script interface: one JSON line per command, errors as answers, and
+# the exit status says a command failed.
+file(WRITE ${OUT}/q.txt "drivers tb.u.state\n# a comment\nvalue tb.u.state 40\nchanges tb.u.state 0 40\nfsm tb.u 40\nactive tb.busy 40 1\nend\n")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/fsm.vcd -script ${OUT}/q.txt
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("{\"cmd\":\"drivers tb.u.state\",\"ok\":true,\"signal\":\"tb.u.state\",\"drivers\":"
+     "\"line\":10,\"text\":\"state \\u003c= IDLE\"" "\"when\":\"!rst_n\""
+     "\"time\":40,\"value\":\"2'h2\",\"bits\":\"10\",\"since\":35}"
+     "\"changes\":[[0,\"00\"],[25,\"01\"],[35,\"10\"]],\"more\":false}"
+     "\"  @40: WAIT  (since 35)  after IDLE@0 RUN@25\"" "\"tb.busy = 1 @40  (since 25)\"" "\"end\":70,")
+if(NOT rc EQUAL 0 OR NOT "${err}" STREQUAL "")
+  message(FATAL_ERROR "-script: rc ${rc}, stderr: ${err}\n${out}")
+endif()
+file(WRITE ${OUT}/q.txt "value nope\nbogus\nend\n")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/fsm.vcd -script ${OUT}/q.txt
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("{\"cmd\":\"value nope\",\"ok\":false,\"error\":\"no signal 'nope' in the design\"}"
+     "\"ok\":false,\"error\":\"unknown command 'bogus' (help lists them)\"}" "\"end\":70,")
+if(rc EQUAL 0)
+  message(FATAL_ERROR "-script with failing commands exited 0")
+endif()
+# The Python interface on top of it.
+if(PY)
+  file(WRITE ${OUT}/api.py "import sys\nsys.path.insert(0, sys.argv[1])\nfrom mdebug_api import Mdebug, MdebugError\n"
+       "with Mdebug([sys.argv[3], '-top', 'tb'], wave=sys.argv[4], mdebug=sys.argv[2]) as d:\n"
+       "    assert d.value('tb.u.state', 40)['value'] == \"2'h2\"\n"
+       "    assert [x['line'] for x in d.drivers('tb.u.state')] == [10, 11]\n"
+       "    assert d.changes('tb.u.state', 0, 40) == [[0, '00'], [25, '01'], [35, '10']]\n"
+       "    assert d.end() == 70 and any('WAIT' in l for l in d.fsm('tb.u', 40))\n"
+       "    assert d.active('tb.busy', at=40, depth=1)[0].startswith('tb.busy = 1 @40')\n"
+       "    assert len(d.signals('tb.u')) == 8 and any(s['path'] == 'tb.u' for s in d.scopes())\n"
+       "    try:\n        d.value('nope')\n        sys.exit('no error for a missing signal')\n"
+       "    except MdebugError as e:\n        assert 'nope' in str(e)\n"
+       "    assert d.end() == 70\nprint('api ok')\n")
+  execute_process(COMMAND ${PY} ${OUT}/api.py ${SRC}/tools ${MDEBUG} ${SV} ${OUT}/fsm.vcd
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES "api ok")
+    message(FATAL_ERROR "mdebug_api.py: ${rc}\n${out}${err}")
+  endif()
+endif()

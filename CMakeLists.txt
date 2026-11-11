@@ -381,7 +381,7 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
-                   -DFST=${MINISIM_WITH_FST}
+                   -DFST=${MINISIM_WITH_FST} -DPY=${Python3_EXECUTABLE}
                    -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
@@ -462,6 +462,8 @@ install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mr
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
 install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
 install(PROGRAMS tools/mplan.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan)
+# The Python interface to mdebug -script (import mdebug_api).
+install(FILES tools/mdebug_api.py DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/python)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)

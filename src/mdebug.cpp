@@ -1602,6 +1602,157 @@ struct Tool {
         return o + "]";
     }
 
+    // ------------------------------------------------------------- script
+    // -script FILE (- for stdin): one command per line, one JSON object per
+    // answer line. The design and the waveform are loaded once, so a script
+    // or another program can ask many questions of one mdebug process.
+    std::string drvJson(const Driver& d) {
+        Where w = db.src.where(d.loc);
+        return "{\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) +
+               ",\"text\":" + js(text(d)) + ",\"kind\":" + js(label(d)) + ",\"when\":" + js(when(d)) +
+               ",\"target\":" + js(path(*d.target)) + "}";
+    }
+    int script(std::istream& in, std::ostream& out) {
+        int bad = 0;
+        std::string ln;
+        while (std::getline(in, ln)) {
+            std::istringstream is(ln);
+            std::vector<std::string> a;
+            for (std::string t; is >> t;) a.push_back(t);
+            if (a.empty() || a[0][0] == '#') continue;
+            if (a[0] == "quit" || a[0] == "exit") break;
+            auto num = [&](size_t i) -> std::optional<uint64_t> {
+                if (i >= a.size()) return std::nullopt;
+                return std::strtoull(a[i].c_str(), nullptr, 10);
+            };
+            // What the query functions print is captured, never mixed into the answers.
+            std::ostringstream txt, err;
+            std::streambuf* so = std::cout.rdbuf(txt.rdbuf());
+            std::streambuf* se = std::cerr.rdbuf(err.rdbuf());
+            bool ok = true, asText = false;
+            std::string body;
+            const std::string& c = a[0];
+            auto sig = [&]() -> const Symbol* {
+                if (a.size() < 2) { std::cerr << "mdebug: " << c << " needs a signal\n"; return nullptr; }
+                return find(a[1]);
+            };
+            auto needWave = [&](const Symbol* s) -> const Wave* {
+                if (!haveVcd) { std::cerr << "mdebug: " << c << " needs -vcd <file>\n"; return nullptr; }
+                const Wave* w = vcd.find(path(*s));
+                if (!w) std::cerr << "mdebug: " << path(*s) << " is not in the waveform\n";
+                return w;
+            };
+            if (c == "drivers" || c == "loads") {
+                const Symbol* s = sig();
+                if (!s) ok = false;
+                else {
+                    body = "\"signal\":" + js(path(*s)) + ",\"" + c + "\":[";
+                    auto& v = c == "drivers" ? db.driversOf[s] : db.loadsOf[s];
+                    for (size_t i = 0; i < v.size(); i++) {
+                        const Driver& d = db.drivers[v[i]];
+                        std::string o = drvJson(d);
+                        if (c == "loads") {
+                            bool data = std::find(d.reads.begin(), d.reads.end(), s) != d.reads.end();
+                            o.insert(o.size() - 1, std::string(",\"control\":") + (data ? "false" : "true"));
+                        }
+                        body += (i ? "," : "") + o;
+                    }
+                    body += "]";
+                }
+            } else if (c == "value") {
+                const Symbol* s = sig();
+                const Wave* w = s ? needWave(s) : nullptr;
+                if (!w) ok = false;
+                else {
+                    uint64_t t = num(2).value_or(vcd.end);
+                    int i = w->at(t);
+                    body = "\"signal\":" + js(path(*s)) + ",\"time\":" + std::to_string(t) + ",\"value\":" +
+                           js(i < 0 ? "x" : showBits(w->bits(i))) + ",\"bits\":" + js(i < 0 ? "" : w->bits(i)) +
+                           ",\"since\":" + std::to_string(i < 0 ? 0 : w->ch[i].t);
+                }
+            } else if (c == "changes") {
+                const Symbol* s = sig();
+                const Wave* w = s ? needWave(s) : nullptr;
+                if (!w) ok = false;
+                else {
+                    uint64_t t0 = num(2).value_or(0), t1 = num(3).value_or(vcd.end);
+                    const size_t cap = 10000;
+                    size_t n = 0;
+                    bool more = false;
+                    body = "\"signal\":" + js(path(*s)) + ",\"changes\":[";
+                    for (int i = std::max(0, w->at(t0)); i < (int)w->ch.size() && w->ch[i].t <= t1; i++) {
+                        if (w->ch[i].t < t0) continue;
+                        if (n == cap) { more = true; break; }
+                        body += std::string(n++ ? "," : "") + "[" + std::to_string(w->ch[i].t) + "," + js(w->bits(i)) + "]";
+                    }
+                    body += std::string("],\"more\":") + (more ? "true" : "false");
+                }
+            } else if (c == "scopes") {
+                body = "\"scopes\":[";
+                for (size_t i = 0; i < db.scopes.size(); i++) {
+                    Where w = db.src.where(db.scopes[i].loc);
+                    body += std::string(i ? "," : "") + "{\"path\":" + js(db.scopes[i].path) + ",\"def\":" + js(db.scopes[i].def) +
+                            ",\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) + "}";
+                }
+                body += "]";
+            } else if (c == "signals") {
+                // signals, or signals SCOPE: the ones directly inside it.
+                const std::string pre = a.size() > 1 ? a[1] + "." : "";
+                body = "\"signals\":[";
+                bool first = true;
+                for (auto* s : db.signals) {
+                    const std::string p = path(*s);
+                    if (!pre.empty() && (p.rfind(pre, 0) != 0 || p.find('.', pre.size()) != std::string::npos)) continue;
+                    Where w = db.src.where(s->location);
+                    body += std::string(first ? "" : ",") + "{\"path\":" + js(p) + ",\"type\":" + js(s->getType().toString()) +
+                            ",\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) + "}";
+                    first = false;
+                }
+                body += "]";
+            } else if (c == "end") {
+                if (!haveVcd) { std::cerr << "mdebug: end needs -vcd <file>\n"; ok = false; }
+                else body = "\"end\":" + std::to_string(vcd.end) + ",\"timescale\":" + js(vcd.timescale);
+            } else if (c == "active") {
+                asText = true;
+                ok = a.size() > 1 ? activeTrace(a[1], num(2), (int)num(3).value_or(3)) : (std::cerr << "mdebug: active needs a signal\n", false);
+            } else if (c == "trace") {
+                asText = true;
+                ok = a.size() > 1 ? trace(a[1], (int)num(2).value_or(2)) : (std::cerr << "mdebug: trace needs a signal\n", false);
+            } else if (c == "blocks") {
+                asText = true;
+                ok = a.size() > 1 ? blocks(a[1]) : (std::cerr << "mdebug: blocks needs an instance\n", false);
+            } else if (c == "fsm") {
+                // fsm, fsm NAME, fsm NAME T
+                asText = true;
+                bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
+                ok = fsm(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "help") {
+                body = "\"commands\":[\"drivers SIG\",\"loads SIG\",\"value SIG [T]\",\"changes SIG [T0 [T1]]\",\"active SIG [T [DEPTH]]\","
+                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
+            } else {
+                std::cerr << "mdebug: unknown command '" << c << "' (help lists them)\n";
+                ok = false;
+            }
+            std::cout.rdbuf(so);
+            std::cerr.rdbuf(se);
+            std::string e = err.str();
+            while (!e.empty() && e.back() == '\n') e.pop_back();
+            if (e.rfind("mdebug: ", 0) == 0) e = e.substr(8);
+            out << "{\"cmd\":" << js(ln) << ",\"ok\":" << (ok ? "true" : "false");
+            if (!ok) { out << ",\"error\":" << js(e); bad++; }
+            if (!body.empty()) out << "," << body;
+            if (asText && ok) {
+                out << ",\"text\":[";
+                std::istringstream ts(txt.str());
+                bool first = true;
+                for (std::string l; std::getline(ts, l);) { out << (first ? "" : ",") << js(l); first = false; }
+                out << "]";
+            }
+            out << "}" << std::endl;   // flushed: the caller may be waiting on a pipe
+        }
+        return bad;
+    }
+
     std::string casesJson() {
         std::string o = "[";
         for (size_t i = 0; i < cases.size(); i++) {
@@ -1754,6 +1905,9 @@ void usage() {
                  "  -fsm [NAME]      the state machines (all, under an instance, or one register): states,\n"
                  "                   transitions and their lines; with -vcd, the state at -at T, how often\n"
                  "                   each transition ran, the ones never taken and values that are not states\n"
+                 "  -script FILE     run commands from FILE (- for the standard input), one per line, and\n"
+                 "                   answer each with one line of JSON: drivers, loads, value, changes,\n"
+                 "                   active, trace, blocks, fsm, scopes, signals, end, help, quit\n"
                  "  -blocks INST     the instances inside INST, their port connections and what feeds what\n"
                  "  -html <file>     write a one-file viewer: hierarchy, source, drivers and\n"
                  "                   loads, a schematic of the cone, and waves when -vcd is given\n"
@@ -1771,7 +1925,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]};
     struct Query { std::string what, arg; int depth; std::optional<uint64_t> at; };
     std::vector<Query> queries;
-    std::string vcdPath, htmlPath, jsonPath;
+    std::string vcdPath, htmlPath, jsonPath, scriptPath;
     int depth = -1;
     std::optional<uint64_t> at;
     size_t maxChanges = 20000;
@@ -1798,6 +1952,7 @@ int main(int argc, char** argv) {
             queries.push_back({"fsm", arg, -1, std::nullopt});
             continue;
         }
+        if (a == "-script") { scriptPath = next("a file, or - for the standard input"); continue; }
         if (a == "-blocks") { queries.push_back({"blocks", next("an instance"), -1, std::nullopt}); continue; }
         if (a == "-drivers" || a == "-loads" || a == "-trace" || a == "-active") {
             queries.push_back({a.substr(1), next("a signal"), -1, std::nullopt});
@@ -1816,7 +1971,7 @@ int main(int argc, char** argv) {
         if (a == "-sv" || a == "-sverilog") continue;
         fwd.push_back(a);
     }
-    if (queries.empty() && htmlPath.empty() && jsonPath.empty() && fwd.size() == 1) { usage(); return 2; }
+    if (queries.empty() && htmlPath.empty() && jsonPath.empty() && scriptPath.empty() && fwd.size() == 1) { usage(); return 2; }
     // Every instance gets its own symbols, so tb.a.q and tb.b.q are two signals.
     fwd.push_back("--disable-instance-caching");
     fwd.push_back("--threads");   // the front end parses files in parallel
@@ -1856,6 +2011,14 @@ int main(int argc, char** argv) {
                           << tool.db.src.at(tool.db.src.where(s->location)) << "\n";
     }
 
+    if (!scriptPath.empty()) {
+        if (scriptPath == "-") ok &= tool.script(std::cin, std::cout) == 0;
+        else {
+            std::ifstream is(scriptPath);
+            if (!is) { std::cerr << "mdebug: cannot read " << scriptPath << "\n"; return 2; }
+            ok &= tool.script(is, std::cout) == 0;
+        }
+    }
     if (!jsonPath.empty()) {
         std::ofstream os(jsonPath);
         if (!os) { std::cerr << "mdebug: cannot write " << jsonPath << "\n"; return 2; }
