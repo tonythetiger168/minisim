@@ -20,6 +20,8 @@ Spec references are IEEE 1800-2023 clauses.
   of buffers. On by default (`-no_cts`); `-cts_buf CELL`, `-clock NET`. The
   buffers are in the DEF and the written netlist, and the run reports the
   shortest and longest driver-to-load wire of each tree.
+- `mdebug`: struct fields in the active-driver trace (conditions on a field
+  are evaluated; each field and constant part select has its own driver).
 - `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
   made for it (lower pad turned or lengthened, written to the DEF's `VIAS`),
   short pieces of wire and the pads of power via stacks are lengthened to
@@ -156,7 +158,7 @@ Spec references are IEEE 1800-2023 clauses.
   `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
   mapped onto any Liberty library by cut matching for area or delay,
   high-fanout nets are buffered, and the result is timed with the library's
-  NLDM tables. A generic cell library is built in. Mapping runs on every
+  NLDM tables. The default library is mini45. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
@@ -168,6 +170,24 @@ Spec references are IEEE 1800-2023 clauses.
   `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
   calls with the host C++ compiler, `-explore` sweeps the clock period.
   See `docs/HLS.md`.
+- `mhls`: structs. Nested structs, arrays of structs, array members and
+  bit-fields; structs copied, passed by value, pointer or reference, and
+  returned. Each member becomes its own register, memory or port.
+- `mhls`: pipelined loops. `#pragma hls pipeline` first in a loop body, or
+  `-pipeline-loops` for every loop that allows it, starts a new iteration
+  every cycle: `n` iterations of an `L`-stage body take `n + L - 1` cycles
+  instead of `n * L`. A loop that cannot be pipelined is refused with the
+  rule it breaks.
+- `mhls`: pipelined loops at slower rates. A loop that cannot start an
+  iteration every cycle (a memory updated in place, a pointer chase, an exit
+  that depends on memory data) is pipelined at one iteration every 2 or more
+  cycles when that beats running it unpipelined; `#pragma hls pipeline` now
+  also works first in a `do` body.
+- `mhls`: a variable that only feeds itself (a counter or checksum nothing
+  reads) is removed with its register and operators.
+- `mhls -handshake`: also writes `<top>_hs`, the block behind
+  `in_valid`/`in_ready` and `out_valid`/`out_ready` ports (FSM and pipeline);
+  the generated testbench drives it with a sink that refuses now and then.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -251,6 +271,12 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
+  database, to step through them in KLayout's marker browser.
+- `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
+  has the margin on two opposite sides (the foundry rule "on one of two
+  adjacent sides"). The SKY130 test deck gains li.5, licon.5c, m1.5,
+  via.5a and m2.5 (40 rules).
 - `mpv` reads OASIS layouts (SEMI P39) as well as GDSII, told apart by the
   file's first bytes: every record, repetition and point-list form, compact
   trapezoids, name tables, strict mode and compressed blocks (built-in
@@ -365,6 +391,9 @@ Spec references are IEEE 1800-2023 clauses.
 - `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
   Verilog netlist reader / flattener / writer, shared by the timing,
   synthesis, power, equivalence and physical tools.
+- `mlint` state machine rules on the extractor FSM coverage uses: `FSM001` a
+  state never entered, `FSM002` a state with no way out, `FSM003` a state
+  case with no default that leaves encodings unused, `FSM004` no reset state.
 - `mpower`, power analysis on the msim front end: average power by group,
   instance and cell from SAIF, VCD or FST activity and Liberty
   `internal_power` / `leakage_power` tables; activity propagation for nets
@@ -382,6 +411,11 @@ Spec references are IEEE 1800-2023 clauses.
   `src/aig.hpp`, and writes Yosys JSON for nextpnr, EDIF or Verilog.
   Depth-optimal priority-cut mapping with area recovery; multithreaded, with
   the same output for any `-threads N`. See `docs/FPGA.md`.
+- `mfpga`: adders, subtractors and comparators map to the family's carry
+  chain (`SB_CARRY`, `CCU2C`, `CARRY4`), and clock enables and synchronous
+  resets to flop pins. `-nocarry` and `-noce` turn each off.
+- `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
+  `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:
