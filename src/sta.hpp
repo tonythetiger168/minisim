@@ -80,12 +80,21 @@ struct TagKey {
     int16_t clk = -1;
     uint8_t edge = RISE;  // the edge of the clock at its source
     uint8_t isClk = 0;    // still in the clock network
+    // Data launched from a clock network whose early and late arrivals
+    // differ: the point of that network the launching clock path came
+    // through (node * 2 + its transition there), for the removal of clock
+    // reconvergence pessimism. -1: nothing to remove.
+    int32_t crpr = -1;
     Mask exc;
-    bool operator==(const TagKey& o) const { return clk == o.clk && edge == o.edge && isClk == o.isClk && exc == o.exc; }
+    bool operator==(const TagKey& o) const {
+        return clk == o.clk && edge == o.edge && isClk == o.isClk && crpr == o.crpr && exc == o.exc;
+    }
+    bool sameButCrpr(const TagKey& o) const { return clk == o.clk && edge == o.edge && isClk == o.isClk && exc == o.exc; }
     bool operator<(const TagKey& o) const {
         if (clk != o.clk) return clk < o.clk;
         if (edge != o.edge) return edge < o.edge;
         if (isClk != o.isClk) return isClk > o.isClk;
+        if (crpr != o.crpr) return crpr < o.crpr;
         return exc < o.exc;
     }
 };
@@ -96,6 +105,7 @@ struct Tag {
     int32_t prevEdge[2][2]; // the edge the arrival came over, -1: it starts here
     int32_t prevTag[2][2];  // index of the tag in the edge's from node
     uint8_t prevRf[2][2];
+    double cred = 0;        // the most pessimism that can be removed for key.crpr
     Tag() {
         for (int m = 0; m < 2; m++)
             for (int r = 0; r < 2; r++) {
@@ -230,6 +240,7 @@ struct PathEnd {
     double arrival = 0;                 // launchT + path delay
     double capArr = 0;                  // capture clock network delay
     double unc = 0, lib = 0, ext = 0;   // uncertainty, library time, external delay
+    double crpr = 0;                    // clock reconvergence pessimism removed
     double required = 0, slack = 0;
     int exc = -1;                       // the exception that set the relation, or -1
     bool pathDelay = false;             // set_max_delay / set_min_delay
@@ -382,6 +393,28 @@ public:
     // timing_type preset and clear). Off by default, as in PrimeTime
     // (timing_enable_preset_clear_arcs) and OpenSTA.
     bool presetClearArcs = false;
+    // On-chip variation: set_timing_derate factors, [LATE/EARLY][data, clock]
+    // [cell delay, net delay, cell check][RISE/FALL]. An instance, library
+    // cell or net with its own factors has a set of its own.
+    struct Derate {
+        double f[2][2][3][2];
+        Derate() {
+            for (auto& a : f) for (auto& b : a) for (auto& c : b) for (auto& d : c) d = 1;
+        }
+    };
+    enum { DCell = 0, DNet = 1, DCheck = 2 };
+    Derate derate;
+    std::vector<Derate> derateSets;
+    std::vector<int32_t> edgeDerate;  // per edge: index into derateSets, -1: the design's
+    bool hasDerate = false;
+    // Remove clock reconvergence pessimism: the part of the clock network
+    // the launching and the capturing path share cannot be both early and
+    // late. sameTransition: only where both paths have the same transition
+    // at the common point (otherwise the smaller of the two differences).
+    bool crprOn = true, crprSameTransition = false;
+    std::vector<int32_t> crprParent, crprDepth;  // the clock network as a tree; depth -1: not in it
+    std::vector<double> crprH;                   // late - early arrival at a clock network node
+    size_t maxTags = 0;  // the most tags on one node, for -stats
     par::Pool* pool = nullptr;
 
     void warn(const std::string& code, const std::string& text) { warnings.push_back({code, text}); }
@@ -798,6 +831,10 @@ public:
         std::fill(netWireCap.begin(), netWireCap.end(), 0.0);
         std::fill(portLoad.begin(), portLoad.end(), 0.0);
         for (auto& n : nodes) n.clockSrc = n.genSrc = n.idealClk = n.hasThrough = n.hasLaunch = n.hasSeed = false;
+        derate = Derate();
+        derateSets.clear();
+        edgeDerate.clear();
+        hasDerate = false;
         for (auto& e : edges) {
             e.disabled = false;
             e.ok = e.ok0;
@@ -1044,6 +1081,70 @@ public:
                 for (int n : ns) drives[n] = d;
             }
         }
+        for (auto* c : s.of("set_timing_derate")) {
+            double v = c->num("value", 1);
+            if (c->has("-increment")) {
+                warn("unsupported", "set_timing_derate -increment is not supported (" + c->loc.str() + ")");
+                continue;
+            }
+            bool early = c->has("-early"), lateF = c->has("-late");
+            if (!early && !lateF) {
+                warn("derate", "set_timing_derate needs -early or -late (" + c->loc.str() + ")");
+                continue;
+            }
+            bool clk = c->has("-clock"), data = c->has("-data");
+            if (!clk && !data) clk = data = true;
+            bool cell = c->has("-cell_delay"), net = c->has("-net_delay"), chk = c->has("-cell_check");
+            if (!cell && !net && !chk) cell = net = true;
+            bool rise = c->has("-rise"), fall = c->has("-fall");
+            if (!rise && !fall) rise = fall = true;
+            auto put = [&](Derate& d, bool wantCell, bool wantNet) {
+                for (int m = 0; m < 2; m++) {
+                    if (m == LATE ? !lateF : !early) continue;
+                    for (int k = 0; k < 2; k++) {
+                        if (k ? !clk : !data) continue;
+                        for (int rf = 0; rf < 2; rf++) {
+                            if (rf == RISE ? !rise : !fall) continue;
+                            if (cell && wantCell) d.f[m][k][DCell][rf] = v;
+                            if (net && wantNet) d.f[m][k][DNet][rf] = v;
+                            if (chk && wantCell) d.f[m][k][DCheck][rf] = v;
+                        }
+                    }
+                }
+            };
+            hasDerate = true;
+            auto objs = c->objs("objects");
+            if (objs.empty()) {
+                put(derate, true, true);
+                continue;
+            }
+            // Factors of an object replace the design's on its arcs. A set per
+            // edge, made from the design's as it is now.
+            if (edgeDerate.empty()) edgeDerate.assign(edges.size(), -1);
+            auto own = [&](size_t ei, bool isNet) {
+                if (edgeDerate[ei] < 0) {
+                    edgeDerate[ei] = (int32_t)derateSets.size();
+                    derateSets.push_back(derate);
+                }
+                put(derateSets[edgeDerate[ei]], !isNet, isNet);
+            };
+            for (auto& o : objs) {
+                // A library cell may be named library/cell.
+                std::string libCell = o.name.substr(o.name.rfind('/') == std::string::npos ? 0 : o.name.rfind('/') + 1);
+                if (o.kind == sdc::Kind::Net) {
+                    int ni = findNet(o.name);
+                    for (size_t ei = 0; ei < edges.size(); ei++)
+                        if (edges[ei].kind == NetEdge && nodes[edges[ei].from].net == ni) own(ei, true);
+                } else if (o.kind == sdc::Kind::Cell || o.kind == sdc::Kind::LibCell) {
+                    for (size_t ei = 0; ei < edges.size(); ei++) {
+                        if (edges[ei].kind == NetEdge) continue;
+                        int inst = nodes[edges[ei].from].inst;
+                        if (inst < 0) continue;
+                        if (o.kind == sdc::Kind::Cell ? nl->insts[inst].name == o.name : nl->insts[inst].cell == libCell) own(ei, false);
+                    }
+                }
+            }
+        }
         for (auto* c : s.of("set_load")) {
             double v = c->num("value") * C;
             for (auto& o : c->objs("objects")) {
@@ -1089,7 +1190,8 @@ public:
                     for (auto& e : edges) {
                         if (e.kind == NetEdge) continue;
                         int inst = nodes[e.from].inst;
-                        bool hit = o.kind == sdc::Kind::Cell ? nl->insts[inst].name == o.name : nl->insts[inst].cell == o.name;
+                        bool hit = o.kind == sdc::Kind::Cell ? nl->insts[inst].name == o.name
+                                   : nl->insts[inst].cell == o.name.substr(o.name.rfind('/') == std::string::npos ? 0 : o.name.rfind('/') + 1);
                         if (!hit) continue;
                         if (!from.empty() && *nodePin[e.from] != from) continue;
                         if (!to.empty() && *nodePin[e.to] != to) continue;
@@ -1517,6 +1619,9 @@ public:
 
     void propagate() {
         tags.assign(nodes.size(), {});
+        crprParent.assign(nodes.size(), -1);
+        crprDepth.assign(nodes.size(), -1);
+        crprH.assign(nodes.size(), 0);
         auto doNode = [&](int n) {
             Node& x = nodes[n];
             std::vector<Tag>& out = tags[n];
@@ -1529,10 +1634,33 @@ public:
                     const Tag& t = in[ti];
                     TagKey key = t.key;
                     bool zero = false;
+                    double cred = t.cred;
+                    const Derate& dr = hasDerate ? derateOf(ei) : derate;
+                    int dk = t.key.isClk && e.kind != LaunchEdge ? 1 : 0, dt = e.kind == NetEdge ? DNet : DCell;
                     if (t.key.isClk) {
                         if (e.kind == LaunchEdge) {
                             key.isClk = 0;
                             key.exc = launchMask(e.from, n, key.clk);
+                            if (crprOn && clocks[key.clk].propagated) {
+                                // One launching transition per register clock pin.
+                                int lrf = e.has(RISE, RISE) || e.has(RISE, FALL) ? RISE : FALL;
+                                cred = valid(t.arr[LATE][lrf]) ? t.arr[LATE][lrf] - t.arr[EARLY][lrf] : 0;
+                                if (cred > 1e-9) {
+                                    // The driver of the clock pin's net stands for
+                                    // every pin on it, unless the wire itself varies.
+                                    int at = e.from;
+                                    int pe = t.prevEdge[LATE][lrf];
+                                    if (pe >= 0 && pe == t.prevEdge[EARLY][lrf] && edges[pe].kind == NetEdge) {
+                                        const Derate& pd = hasDerate ? derateOf(pe) : derate;
+                                        double w = edges[pe].d[LATE][lrf][lrf] * pd.f[LATE][1][DNet][lrf] -
+                                                   edges[pe].d[EARLY][lrf][lrf] * pd.f[EARLY][1][DNet][lrf];
+                                        if (std::fabs(w) < 1e-12) at = edges[pe].from;
+                                    }
+                                    key.crpr = at * 2 + lrf;
+                                } else {
+                                    cred = 0;
+                                }
+                            }
                         } else {
                             zero = !clocks[key.clk].propagated;
                         }
@@ -1547,8 +1675,11 @@ public:
                             if (!valid(a)) continue;
                             for (int orf = 0; orf < 2; orf++) {
                                 if (!e.has(irf, orf)) continue;
-                                double v = a + (zero ? 0 : e.d[m][irf][orf]);
-                                if (!o) o = &tagFor(out, key);
+                                double v = a + (zero ? 0 : e.d[m][irf][orf] * dr.f[m][dk][dt][orf]);
+                                if (!o) {
+                                    o = &tagFor(out, key);
+                                    o->cred = cred;
+                                }
                                 if (m == LATE ? v > o->arr[m][orf] : v < o->arr[m][orf]) {
                                     o->arr[m][orf] = v;
                                     o->prevEdge[m][orf] = ei;
@@ -1608,8 +1739,132 @@ public:
                             }
                     }
             }
+            if (crprOn) {
+                // The clock network as a tree, for pruneCrpr: where a node
+                // has one way in, the variation at it is shared by all below.
+                bool clk = false;
+                double h = INF;
+                for (auto& t : out) {
+                    if (!t.key.isClk) continue;
+                    clk = true;
+                    for (int rf = 0; rf < 2; rf++)
+                        if (valid(t.arr[LATE][rf])) h = std::min(h, t.arr[LATE][rf] - t.arr[EARLY][rf]);
+                }
+                if (clk) {
+                    int ways = 0, from = -1;
+                    for (int k = finOff[n]; k < finOff[n + 1]; k++) {
+                        const Edge& e = edges[finIdx[k]];
+                        if (e.disabled || e.loopBreak || e.kind == LaunchEdge || crprDepth[e.from] < 0) continue;
+                        ways++;
+                        from = e.from;
+                    }
+                    bool root = ways != 1 || x.genSrc || x.clockSrc;
+                    crprParent[n] = root ? -1 : from;
+                    crprDepth[n] = root ? 0 : crprDepth[from] + 1;
+                    crprH[n] = h < INF / 2 && h > 0 ? h : 0;
+                }
+                pruneCrpr(out);
+            }
         };
         for (auto& lv : levels) runLevel(lv, doNode);
+        maxTags = 0;
+        for (auto& t : tags) maxTags = std::max(maxTags, t.size());
+    }
+
+    const Derate& derateOf(int ei) const {
+        return !edgeDerate.empty() && edgeDerate[ei] >= 0 ? derateSets[edgeDerate[ei]] : derate;
+    }
+
+    // Arrivals that differ only in where their clock path came from are
+    // kept apart, because the pessimism removed for each differs. One that
+    // cannot be the worst whatever is removed is dropped. B beats T when
+    // B's arrival is worse than T's by more than B can get back over T:
+    // at most all of B's, less what any capture path gives both of them,
+    // which is the variation at the point where their clock paths part.
+    void pruneCrpr(std::vector<Tag>& out) const {
+        bool any = false;
+        for (auto& t : out) any = any || t.key.crpr >= 0;
+        if (!any || out.size() < 2) return;
+        const double eps = 1e-12;
+        auto shared = [&](int a, int b) -> double {
+            if (a < 0 || b < 0) return 0;
+            a >>= 1;
+            b >>= 1;
+            while (a != b) {
+                if (a < 0 || b < 0) return 0;
+                if (crprDepth[a] >= crprDepth[b]) a = crprParent[a];
+                else b = crprParent[b];
+            }
+            return a < 0 ? 0 : crprH[a];
+        };
+        bool dropped = false;
+        for (size_t i = 0; i < out.size(); i++) {
+            Tag& t = out[i];
+            if (t.key.isClk) continue;
+            for (size_t j = 0; j < out.size(); j++) {
+                if (j == i) continue;
+                const Tag& b = out[j];
+                if (!b.key.sameButCrpr(t.key)) continue;
+                double back = -1;
+                for (int m = 0; m < 2; m++)
+                    for (int rf = 0; rf < 2; rf++) {
+                        double a = t.arr[m][rf], ba = b.arr[m][rf];
+                        if (!valid(a) || !valid(ba)) continue;
+                        // Cheap test first: B is no worse than T.
+                        if (m == LATE ? ba <= a : ba >= a) continue;
+                        if (back < 0) back = std::max(0.0, b.cred - shared(b.key.crpr, t.key.crpr));
+                        if (m == LATE ? ba - back > a + eps : ba + back < a - eps) t.arr[m][rf] = m == LATE ? -INF : INF;
+                    }
+            }
+            if (!valid(t.arr[0][0]) && !valid(t.arr[0][1]) && !valid(t.arr[1][0]) && !valid(t.arr[1][1])) dropped = true;
+        }
+        if (dropped)
+            out.erase(std::remove_if(out.begin(), out.end(), [](const Tag& t) {
+                return !t.key.isClk && !valid(t.arr[0][0]) && !valid(t.arr[0][1]) && !valid(t.arr[1][0]) && !valid(t.arr[1][1]);
+            }), out.end());
+    }
+
+    // The clock reconvergence pessimism of a check: the launching clock path
+    // (through the point in `crpr`, in mode lm) and the capturing one (to
+    // clkNode, in the other mode) share the network up to a common point,
+    // where the late and the early arrival differ by what is removed.
+    double crprCredit(const TagKey& key, int lm, int clkNode, int clkTag, int clkRf) const {
+        if (key.crpr < 0 || clkNode < 0 || clkTag < 0) return 0;
+        const Tag& ct = tags[clkNode][clkTag];
+        if (ct.key.clk != key.clk) return 0;
+        struct P { int node, tag, rf; };
+        auto walk = [&](int node, int tag, int rf, int m, std::vector<P>& path) {
+            while (node >= 0 && tag >= 0) {
+                const Tag& t = tags[node][tag];
+                path.push_back({node, tag, rf});
+                int ei = t.prevEdge[m][rf];
+                if (ei < 0) break;
+                int pt = t.prevTag[m][rf], prf = t.prevRf[m][rf];
+                node = edges[ei].from;
+                tag = pt;
+                rf = prf;
+            }
+        };
+        int ln = key.crpr >> 1, lrf = key.crpr & 1, lt = -1;
+        for (size_t i = 0; i < tags[ln].size(); i++) {
+            const TagKey& k = tags[ln][i].key;
+            if (k.isClk && k.clk == key.clk && k.edge == key.edge) lt = (int)i;
+        }
+        if (lt < 0) return 0;
+        std::vector<P> lp, cp;
+        walk(ln, lt, lrf, lm, lp);
+        walk(clkNode, clkTag, clkRf, 1 - lm, cp);
+        for (auto& a : lp)
+            for (auto& b : cp) {
+                if (a.node != b.node) continue;
+                if (crprSameTransition && a.rf != b.rf) return 0;
+                const Tag& ta = tags[a.node][a.tag];
+                const Tag& tb = tags[b.node][b.tag];
+                double da = ta.arr[LATE][a.rf] - ta.arr[EARLY][a.rf], db = tb.arr[LATE][b.rf] - tb.arr[EARLY][b.rf];
+                double c = std::min(da, db);
+                return valid(c) && c > 0 ? c : 0;
+            }
+        return 0;
     }
 
     // ------------------------------------------------------------- checks
@@ -1817,6 +2072,10 @@ public:
         pe.ext = ext;
         pe.exc = r.exc;
         pe.unc = uncertainty(lc, capClk, late);
+        if (crprOn && t.key.crpr >= 0) {
+            pe.crpr = crprCredit(t.key, late ? LATE : EARLY, clkNode, clkTag, clkRf);
+            capArr += late ? pe.crpr : -pe.crpr;
+        }
         if (r.pathDelay) {
             pe.pathDelay = true;
             pe.pathDelayValue = r.delay;
@@ -1897,6 +2156,7 @@ public:
                         if (tb.empty()) continue;
                         int m = late ? LATE : EARLY;
                         double lib = tb.constraint(nodes[ck.data].slew[m][rf], nodes[ck.clk].slew[late ? EARLY : LATE][crf]);
+                        if (hasDerate) lib *= derate.f[m][0][DCheck][rf];
                         timeEnd(perCheck[ci], kind, ck.data, (int)d, rf, ct[c].key.clk, ct[c].key.edge, capArr, lib, 0,
                                 ck.clk, (int)c, crf);
                     }

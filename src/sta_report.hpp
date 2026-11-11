@@ -224,6 +224,10 @@ public:
         }
         req += pe.capArr;
         add(std::string("clock network delay (") + (Cc.propagated && pe.clkNode >= 0 ? "propagated" : "ideal") + ")", pe.capArr, req);
+        if (pe.crpr != 0) {
+            req += late ? pe.crpr : -pe.crpr;
+            add("clock reconvergence pessimism", late ? pe.crpr : -pe.crpr, req);
+        }
         if (pe.unc != 0) {
             req += late ? -pe.unc : pe.unc;
             add("clock uncertainty", late ? -pe.unc : pe.unc, req);
@@ -571,7 +575,7 @@ public:
                    << "\", \"group\": " << js(groupOf(*pe)) << ", \"startpoint\": " << js(s.name(startNode(steps)))
                    << ", \"endpoint\": " << js(s.name(pe->node)) << ", \"launch_clock\": " << js(s.clocks[pe->launchClk].name)
                    << ", \"capture_clock\": " << js(s.clocks[pe->capClk].name) << ", \"arrival\": " << t(pe->arrival, 6)
-                   << ", \"required\": " << t(pe->required, 6) << ", \"slack\": " << t(pe->slack, 6) << ", \"points\": [";
+                   << ", \"required\": " << t(pe->required, 6) << ", \"crpr\": " << t(pe->crpr, 6) << ", \"slack\": " << t(pe->slack, 6) << ", \"points\": [";
                 for (size_t i = 0; i < steps.size(); i++)
                     os << (i ? ", " : "") << "{\"pin\": " << js(s.name(steps[i].node)) << ", \"edge\": \"" << (steps[i].rf == RISE ? "r" : "f")
                        << "\", \"arrival\": " << t(pe->launchT + steps[i].arr, 6) << "}";

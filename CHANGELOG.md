@@ -504,6 +504,11 @@ Spec references are IEEE 1800-2023 clauses.
   and a second, third... defect when one does not explain everything. Uses
   the shared fault simulator; multithreaded with the same report on any
   thread count. See docs/JTAG.md.
+- `msta`: on-chip variation. `set_timing_derate` on the design, cells,
+  library cells and nets (early / late, clock / data, cell delay / net delay /
+  cell check, rise / fall), and exact clock reconvergence pessimism removal,
+  reported as its own line (`-no_crpr`, `-crpr_same_transition`). Checked
+  against OpenSTA at every endpoint of a 200,000 cell design.
 
 ### Fixed
 - An inout port connected to a whole net is now that net (23.3.3.1). It was

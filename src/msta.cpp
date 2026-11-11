@@ -47,7 +47,7 @@ struct Shell {
     std::unique_ptr<sta::SdcDesign> design;
     std::unique_ptr<par::Pool> pool;
     sdc::Reader reader;
-    bool presetClearArcs = false;
+    bool presetClearArcs = false, crpr = true, crprSameTransition = false;
     size_t seenCommands = 0, seenDiags = 0;
     int threads = 0;
     int errors = 0;
@@ -104,6 +104,8 @@ struct Shell {
         double readT = secs();
         engine = std::make_unique<sta::Sta>();
         engine->presetClearArcs = presetClearArcs;
+        engine->crprOn = crpr;
+        engine->crprSameTransition = crprSameTransition;
         engine->phases.push_back({"read", readT});
         for (auto& l : libraries) engine->addLibrary(*l);
         auto busPins = [this](const std::string& cell, const std::string& pin, int) {
@@ -415,6 +417,8 @@ void usage() {
         "  -json FILE           write the summary and the worst paths as JSON\n"
         "  -threads N           worker threads (default: every logical core; 1: none)\n"
         "  -preset_clear_arcs   time paths through asynchronous set/reset to output arcs\n"
+        "  -no_crpr             keep clock reconvergence pessimism (it is removed by default)\n"
+        "  -crpr_same_transition  remove it only for the same transition at the common pin\n"
         "  -fail_on_violation   exit 2 when a constraint is violated\n"
         "  -q                   no warnings from the constraint reader\n"
         "  -version, -h\n";
@@ -448,6 +452,8 @@ int main(int argc, char** argv) {
         else if (a == "-json") json = val();
         else if (a == "-threads") sh.threads = std::atoi(val().c_str());
         else if (a == "-preset_clear_arcs") sh.presetClearArcs = true;
+        else if (a == "-no_crpr") sh.crpr = false;
+        else if (a == "-crpr_same_transition") sh.crprSameTransition = true;
         else if (a == "-fail_on_violation") failOnViolation = true;
         else if (a == "-stats") stats = true;
         else if (a == "-q") sh.quiet = true;
@@ -504,6 +510,7 @@ int main(int argc, char** argv) {
                   << s.levels.size() << " levels, " << ntags << " tags, " << s.ends.size() << " path ends, "
                   << sh.wantThreads() << " threads, " << dt << " s\n";
         for (auto& [what, t] : s.phases) std::cerr << "  " << what << ": " << t << " s\n";
+        std::cerr << "  most arrivals kept on one pin: " << s.maxTags << "\n";
     }
     if (sh.errors) return 1;
     return rc;

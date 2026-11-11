@@ -90,6 +90,42 @@ run(0 -lib ${LIB} soc.v -f soc.tcl -preset_clear_arcs -e "report_timing -from [g
 want("rb/Q (DFFR_X1)                                0.236      0.736 f"
      "slack (MET)                                              1.664")
 
+# --- on-chip variation: set_timing_derate and clock reconvergence pessimism.
+#  clk -> cb0 -> cb1 -> r1, r2, rn (falling edge);  cb0 -> cb2 -> r3.
+#  Early 0.9, late 1.2. cb0 rises in 0.088 and falls in 0.0792; cb1 rises in 0.0984.
+#  r1 -> r2 share cb0 and cb1: (0.088 + 0.0984) * (1.2 - 0.9) = 0.056 is removed.
+#  rn -> r3 share cb0 only, falling for the launch and rising for the capture:
+#  the smaller of 0.0792 * 0.3 and 0.088 * 0.3 = 0.024.
+#  The same numbers come out of OpenSTA.
+run(0 -lib ${LIB} ocv.v -sdc ocv.sdc -e "report_timing -max_paths 20 -path end\; report_timing -delay_type min -max_paths 20 -path end\; report_timing -to [get_pins r3/D] -path full_clock\; report_timing -delay_type min -to [get_pins r2/D]")
+want("r3/D (DFF_X1)          4.126       2.539       1.586"
+     "r2/D (DFF_X1)          4.163       0.649       3.515"
+     "r2/D (DFF_X1)          0.199       0.424       0.225"
+     "rn/D (DFFN_X1)        -1.818       0.308       2.126"
+     "clock network delay (propagated)              0.202      2.202"
+     "clock network delay (propagated)              0.161      4.161"
+     "clock reconvergence pessimism                 0.024      4.184"
+     "clock reconvergence pessimism                -0.056      0.168")
+#  Without the removal r2/D loses the 0.056; with -crpr_same_transition only
+#  the rn -> r3 path loses its 0.024.
+run(0 -lib ${LIB} ocv.v -sdc ocv.sdc -no_crpr -e "report_timing -max_paths 20 -path end")
+want("r3/D (DFF_X1)          4.102       2.539       1.562"
+     "r2/D (DFF_X1)          4.108       0.649       3.459")
+run(0 -lib ${LIB} ocv.v -sdc ocv.sdc -crpr_same_transition -e "report_timing -max_paths 20 -path end")
+want("r3/D (DFF_X1)          4.102       2.539       1.562"
+     "r2/D (DFF_X1)          4.163       0.649       3.515")
+#  Factors on one instance, on a library cell and on the timing checks
+#  (again the same as OpenSTA): cb1 late 1.5 makes the launch clock 0.253 and
+#  the removed pessimism 0.085; XOR2 early 0.8 on data; setup time * 1.1 and
+#  hold time * 1.3.
+run(0 -lib ${LIB} ocv.v -sdc ocv2.sdc -e "report_timing -max_paths 20 -path end\; report_timing -delay_type min -max_paths 20 -path end\; report_timing -delay_type min -to [get_pins r2/D]")
+want("r3/D (DFF_X1)          4.120       2.566       1.554"
+     "r2/D (DFF_X1)          4.187       0.678       3.509"
+     "u4/Y (XOR2_X1)                                0.103      0.411 f"
+     "clock reconvergence pessimism                -0.085      0.168"
+     "library hold time                             0.041      0.209"
+     "slack (MET)                                              0.202")
+
 # --- exceptions and the rest of the constraints.
 #  clock groups cut clk2 from clk; latency 0.3 + 0.2 source on the ideal clk;
 #  the false path through x1/Y then m1/Y leaves sel as rb/D's worst path;

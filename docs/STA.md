@@ -93,6 +93,20 @@ A report command takes `> FILE` or `>> FILE` at the end.
   other inputs block is removed, and one they make unate (an XOR with one
   input constant) keeps only that direction.
 - `set_disable_timing` on cells (`-from`, `-to`), library cells, pins and ports.
+- **On-chip variation**: `set_timing_derate` (`-early`, `-late`, `-clock`,
+  `-data`, `-cell_delay`, `-net_delay`, `-cell_check`, `-rise`, `-fall`, on
+  the design or on cells, library cells and nets) scales the delays of early
+  and late paths and the library check times. `-rise` and `-fall` select by
+  the transition at the output of the arc. **Clock reconvergence pessimism**
+  is removed: the part of the clock network that the launching and the
+  capturing clock path share is not counted both early and late. The amount
+  is the late less the early arrival at the last common pin (with different
+  transitions there, the smaller of the two), shown as its own line in
+  `report_timing` and as `crpr` in the JSON. It is exact: arrivals whose
+  clock paths leave the network at different points are kept apart while
+  the difference can still decide which is worst, so the slack is that of
+  the worst path after the removal. `-no_crpr` keeps the pessimism,
+  `-crpr_same_transition` removes it only for equal transitions.
 
 ## Threads
 
@@ -134,6 +148,17 @@ on 4 threads; reading and flattening the netlist and building the graph are
 the other 5 s. Writing a path for each of the 77,000 endpoints (`-max_paths`
 with `-json`) adds 14 s and is the next thing to speed up.
 
+With on-chip variation (early 0.95, late 1.05, clock cells late 1.08, check
+times 1.1 and 1.2) and clock reconvergence pessimism removal, the 20,000 and
+200,000 cell designs again agree at every endpoint to 0.06 ps for setup and
+hold. The million cell design takes 24 s and 8.9 GB in msta (4 threads) and
+109 s and 11.4 GB in OpenSTA: its clock tree is two levels of badly
+overloaded buffers, so a lot of pessimism is in play and both tools keep many
+arrivals per pin. OpenSTA reads `-rise` / `-fall` of `set_timing_derate` as
+the transition at the input of the arc; msta uses the output, so those two
+options were left out of the comparison (with the input reading msta matches
+there too).
+
 The comparison found two differences, both fixed:
 
 - The hold check between clocks of different periods used the capture edge
@@ -158,8 +183,9 @@ These are not done yet, and each is either reported or documented here:
   models.
 - Latches are timed as registers at the edge of their timing arcs: a latch's
   `D` is an endpoint and its `D` to `Q` arc is not a path (no time borrowing).
-- On-chip variation: no `set_timing_derate`, no clock reconvergence pessimism
-  removal. One library corner per run.
+- On-chip variation is by factors only: no AOCV or POCV tables, no
+  `set_timing_derate -increment`. Pessimism is not removed across a generated
+  clock and its master. One library corner per run.
 - `report_timing` shows the single worst path into each endpoint; `-nworst`
   above 1 and path-based analysis are not there. `-from` and `-through`
   therefore select among those worst paths.
