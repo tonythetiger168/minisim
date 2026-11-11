@@ -345,3 +345,41 @@ execute_process(COMMAND ${MDEBUG} ${SV} -top tb -cov ${OUT}/notcov.json RESULT_V
 if(NOT rc EQUAL 2 OR NOT err MATCHES "is not a coverage database")
   message(FATAL_ERROR "-cov of a file that is not a database: ${rc}\n${out}${err}")
 endif()
+
+# Low power: the domains of a UPF file, and with the log of a power-aware run
+# their states over time; a trace says that a value is x because its domain
+# is off, and names the isolation on a port.
+set(SV ${SRC}/tests/upf/gating.sv)
+set(UPF ${SRC}/tests/upf/gating.upf)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -upf ${UPF} -power_top u_dut -upf_verbose -vcd ${OUT}/upf.vcd
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out2)
+file(WRITE ${OUT}/upf.log "${out}${out2}")
+if(NOT "${out}${out2}" MATCHES "UPF: 45: power domain PD_CORE simstate CORRUPT")
+  message(FATAL_ERROR "msim -upf -upf_verbose: no power-down of PD_CORE at 45 (${rc})\n${out}${out2}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -power_top u_dut -power
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("PD_TOP  " "elements: tb.u_dut  (1 instance)" "primary supply: SS_AON  ground=VSS  power=VDD"
+     "PD_CORE  " "elements: tb.u_dut.u_core  (1 instance)"
+     "isolation ISO_0: outputs, clamp 0, on u_core/cnt u_core/q, enabled by iso_en(high)"
+     "level shifter LS_IN: inputs, on u_core/d")
+if(NOT rc EQUAL 0 OR out MATCHES "states:")
+  message(FATAL_ERROR "-power without a log: rc ${rc}, or power states were reported:\n${out}${err}")
+endif()
+# Without -power_top the UPF's set_design_top finds the instance.
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -log ${OUT}/upf.log -vcd ${OUT}/upf.vcd
+                        -power PD_CORE -active tb.u_dut.u_core.cnt -at 60 -depth 1
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("states: @0 CORRUPT @2 NORMAL @45 CORRUPT @66 NORMAL @90 CORRUPT"
+     "@60: CORRUPT  (since 45)  power switch SW_CORE state off; supply VDD_CORE = OFF"
+     "tb.u_dut.u_core.cnt = 8'bxxxxxxxx @60  (since 45)"
+     "power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF)"
+     "isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)"
+     "x because the domain has no power: no assignment made this value")
+if(NOT rc EQUAL 0 OR out MATCHES "PD_TOP|cnt <= cnt")
+  message(FATAL_ERROR "-power PD_CORE: rc ${rc}, another domain was listed, or an assignment was blamed for a powered-down value:\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -power RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0)
+  message(FATAL_ERROR "-power without -upf passed")
+endif()

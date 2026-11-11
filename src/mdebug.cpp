@@ -23,6 +23,7 @@
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <unistd.h>
 
 #include "fsm_extract.hpp"
 #include "lintir.hpp"
@@ -36,6 +37,7 @@
 #include "slang/ast/types/AllTypes.h"
 #include "slang/syntax/AllSyntax.h"
 #include "parallel.hpp"
+#include "upf.hpp"
 #include "version.hpp"
 #include "wave_reader.hpp"
 
@@ -1304,6 +1306,15 @@ struct Tool {
         std::cout << pad << name << " = " << (ci < 0 ? "x" : showBits(plo >= 0 ? part(ci) : w->bits(ci))) << " @" << t;
         if (tc != t) std::cout << "  (since " << tc << ")";
         std::cout << "\n";
+        if (std::string pn = powerNote(path(*s), t); !pn.empty()) std::cout << pad << "  " << pn << "\n";
+        // Unknown since its domain lost power: that is the cause, not an assignment.
+        if (haveUpf && ci >= 0 && w->bits(ci).find('x') != std::string::npos) {
+            auto [st, since] = simstateAt(domainOfSignal(path(*s)), t);
+            if (!st.empty() && st != "NORMAL" && tc >= since) {
+                std::cout << pad << "  x because the domain has no power: no assignment made this value\n";
+                return;
+            }
+        }
         auto it = db.driversOf.find(s);
         if (it == db.driversOf.end()) { std::cout << pad << "  no driver: an input or a testbench value\n"; return; }
         if (!seen.insert({s, tc, plo < 0 ? elem : elem + "#" + std::to_string(plo) + ":" + std::to_string(pw)}).second) { std::cout << pad << "  (shown above)\n"; return; }
@@ -1751,6 +1762,177 @@ struct Tool {
         return o + "]";
     }
 
+    // -------------------------------------------------------------- power
+    // -upf FILE: the power intent (IEEE 1801), read by msim's own reader
+    // (src/upf.hpp). With the log of `msim -upf ... -upf_verbose` the power
+    // state of every domain over time is known too, so a trace can say that
+    // a value is x because its domain was off.
+    bool haveUpf = false;
+    upf::Model upfModel;
+    upf::DomainMap upfDomains;
+    std::string simTop;   // the simulation top's name, which UPF paths leave out
+    struct PowerEv { uint64_t t; std::string text; };
+    std::vector<PowerEv> powerLog;                                             // every "UPF: T: ..." line
+    std::map<std::string, std::vector<std::pair<uint64_t, std::string>>> domainStates;   // domain -> (time, simstate)
+    std::map<std::string, std::string> isoOn;                                  // design path -> isolation strategy
+
+    bool readUpf(const std::string& file, std::string powerTop, bool powerTopSet) {
+        try {
+            upfModel.load(file, "");
+        } catch (const std::exception& e) {
+            std::cerr << "mdebug: " << e.what() << "\n";
+            return false;
+        }
+        if (!db.scopes.empty()) simTop = db.scopes[0].path.substr(0, db.scopes[0].path.find('.'));
+        std::string top = powerTopSet ? powerTop : upfModel.designTop;
+        for (char& c : top) if (c == '/') c = '.';
+        while (!top.empty() && top[0] == '.') top.erase(0, 1);
+        if (top == simTop) top.clear();
+        else if (top.rfind(simTop + ".", 0) == 0) top = top.substr(simTop.size() + 1);
+        if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {
+            // set_design_top names a module: the first instance of it.
+            for (const ScopeRec& sc : db.scopes)
+                if (sc.def == top) {
+                    top = sc.path == simTop ? "" : sc.path.substr(simTop.size() + 1);
+                    break;
+                }
+        }
+        upfModel.top = top;
+        upfDomains.build(upfModel);
+        haveUpf = true;
+        return true;
+    }
+
+    // The lines `msim -upf_verbose` prints: "UPF: 45: power domain PD_CORE simstate CORRUPT".
+    void readPowerLog(const std::string& file) {
+        std::ifstream is(file);
+        for (std::string ln; std::getline(is, ln);) {
+            if (ln.rfind("UPF: ", 0) != 0) continue;
+            size_t c = ln.find(':', 5);
+            if (c == std::string::npos) continue;
+            uint64_t t = std::strtoull(ln.c_str() + 5, nullptr, 10);
+            std::string text = ln.substr(std::min(ln.size(), c + 2));
+            powerLog.push_back({t, text});
+            std::istringstream ws(text);
+            std::vector<std::string> w;
+            for (std::string x; ws >> x;) w.push_back(x);
+            if (w.size() >= 5 && w[0] == "power" && w[1] == "domain" && w[3] == "simstate") domainStates[w[2]].push_back({t, w[4]});
+            if (w.size() >= 4 && w[0] == "isolation" && w[2] == "on") isoOn[w[3]] = w[1];
+        }
+    }
+
+    // A design path without the simulation top: tb.u_dut.u_core.q -> u_dut.u_core.q
+    std::string upfPath(const std::string& p) const {
+        return p == simTop ? "" : p.rfind(simTop + ".", 0) == 0 ? p.substr(simTop.size() + 1) : p;
+    }
+    std::string domainOfSignal(const std::string& sig) const {
+        std::string p = upfPath(sig);
+        size_t d = p.rfind('.');
+        return upfDomains.of(d == std::string::npos ? "" : p.substr(0, d));
+    }
+    // The simstate of a domain at a time, and since when; "" when the log has none.
+    std::pair<std::string, uint64_t> simstateAt(const std::string& dom, uint64_t t) const {
+        auto it = domainStates.find(dom);
+        std::pair<std::string, uint64_t> r{"", 0};
+        if (it == domainStates.end()) return r;
+        for (auto& [tt, st] : it->second)
+            if (tt <= t) r = {st, tt};
+        return r;
+    }
+    // Why the domain changed then: the supply and switch lines of that time.
+    std::string powerCause(uint64_t t) const {
+        std::string o;
+        for (const PowerEv& e : powerLog)
+            if (e.t == t && (e.text.rfind("supply ", 0) == 0 || e.text.rfind("power switch", 0) == 0) && e.text.rfind("supply set", 0) != 0)
+                o += (o.empty() ? "" : "; ") + e.text;
+        return o;
+    }
+    // One line for a trace: what the power intent says of this signal then.
+    std::string powerNote(const std::string& sig, uint64_t t) const {
+        if (!haveUpf) return "";
+        std::string o;
+        const std::string dom = domainOfSignal(sig);
+        if (!dom.empty()) {
+            auto [st, since] = simstateAt(dom, t);
+            if (!st.empty() && st != "NORMAL") {
+                o = "power domain " + dom + " is " + st + " since " + std::to_string(since);
+                if (std::string c = powerCause(since); !c.empty()) o += " (" + c + ")";
+            }
+        }
+        if (auto it = isoOn.find(upfPath(sig)); it != isoOn.end()) {
+            for (const upf::Isolation& is : upfModel.isos)
+                if (is.name == it->second) {
+                    o += (o.empty() ? "" : "; ") + ("isolation " + is.name + " on this port, clamp " + is.clamp);
+                    for (size_t k = 0; k < is.signals.size(); k++)
+                        o += std::string(k ? ", " : ", enabled by ") + is.signals[k] + (k < is.senseLow.size() && is.senseLow[k] ? " (low)" : " (high)");
+                }
+        }
+        return o;
+    }
+
+    // -power [NAME]: the power domains (all or one): what is in each, its
+    // supply set, the isolation, level-shifter and retention strategies, and
+    // with the log its power states over time and at -at T.
+    bool power(const std::string& name, std::optional<uint64_t> at) {
+        if (!haveUpf) { std::cerr << "mdebug: -power needs -upf <file>\n"; return false; }
+        bool any = false;
+        auto list = [](const std::vector<std::string>& v) {
+            std::string o;
+            for (auto& e : v) o += (o.empty() ? "" : " ") + e;
+            return o.empty() ? std::string("-") : o;
+        };
+        for (const std::string& dn : upfModel.domainOrder) {
+            if (!name.empty() && dn != name) continue;
+            any = true;
+            const upf::Domain& d = upfModel.domains.at(dn);
+            std::cout << dn << "  " << d.where << "\n";
+            std::string els;
+            size_t ninst = 0;
+            for (auto& e : d.elements) {
+                std::string p = upfModel.design(e);
+                els += (els.empty() ? "" : " ") + (p.empty() ? simTop : simTop + "." + p);
+            }
+            for (const ScopeRec& sc : db.scopes) ninst += upfDomains.of(upfPath(sc.path)) == dn;
+            std::cout << "  elements: " << (els.empty() ? "-" : els) << "  (" << ninst << (ninst == 1 ? " instance)" : " instances)") << "\n";
+            const std::string ps = upfModel.primaryOf(dn);
+            std::cout << "  primary supply: " << ps;
+            if (auto it = upfModel.sets.find(ps); it != upfModel.sets.end())
+                for (auto& [fn, net] : it->second.fn) std::cout << "  " << fn << "=" << net;
+            std::cout << "\n";
+            for (const upf::Isolation& is : upfModel.isos)
+                if (is.domain == dn && !is.noIso) {
+                    std::cout << "  isolation " << is.name << ": " << (is.appliesTo == 0 ? "inputs" : is.appliesTo == 1 ? "outputs" : "both")
+                              << ", clamp " << is.clamp << ", on " << list(is.elements) << ", enabled by";
+                    for (size_t k = 0; k < is.signals.size(); k++)
+                        std::cout << " " << is.signals[k] << (k < is.senseLow.size() && is.senseLow[k] ? "(low)" : "(high)");
+                    std::cout << "  " << is.where << "\n";
+                }
+            for (const upf::LevelShifter& l : upfModel.lss)
+                if (l.domain == dn && !l.noShift)
+                    std::cout << "  level shifter " << l.name << ": " << (l.appliesTo == 0 ? "inputs" : l.appliesTo == 1 ? "outputs" : "both")
+                              << ", on " << list(l.elements) << "  " << l.where << "\n";
+            for (const upf::Retention& r : upfModel.rets)
+                if (r.domain == dn && !r.noRet)
+                    std::cout << "  retention " << r.name << ": on " << list(r.elements) << ", save " << (r.save.net.empty() ? "-" : r.save.net)
+                              << ", restore " << (r.restore.net.empty() ? "-" : r.restore.net) << "  " << r.where << "\n";
+            auto it = domainStates.find(dn);
+            if (it == domainStates.end()) continue;
+            std::cout << "  states:";
+            for (size_t k = 0; k < it->second.size() && k < 12; k++) std::cout << " @" << it->second[k].first << " " << it->second[k].second;
+            if (it->second.size() > 12) std::cout << " ...";
+            std::cout << "\n";
+            uint64_t t = at ? *at : it->second.back().first;
+            auto [st, since] = simstateAt(dn, t);
+            if (!st.empty()) {
+                std::cout << "  @" << t << ": " << st << "  (since " << since << ")";
+                if (std::string c = powerCause(since); !c.empty()) std::cout << "  " << c;
+                std::cout << "\n";
+            }
+        }
+        if (!any) { std::cerr << "mdebug: no power domain " << (name.empty() ? "in the UPF file" : "'" + name + "'") << "\n"; return false; }
+        return true;
+    }
+
     // ----------------------------------------------------------- coverage
     // -cov FILE: msim's coverage database (msim -cov, or mcov merge). Line
     // hits say which assignments ever ran; toggles which bits ever moved.
@@ -2125,6 +2307,10 @@ struct Tool {
                 asText = true;
                 bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
                 ok = fsm(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "power") {
+                asText = true;
+                bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
+                ok = power(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
             } else if (c == "uncovered") {
                 asText = true;
                 ok = uncovered(a.size() > 1 ? a[1] : "");
@@ -2134,7 +2320,7 @@ struct Tool {
                 ok = asserts(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
             } else if (c == "help") {
                 body = "\"commands\":[\"drivers SIG\",\"loads SIG\",\"value SIG [T]\",\"changes SIG [T0 [T1]]\",\"active SIG [T [DEPTH]]\","
-                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"assert [NAME] [T]\",\"uncovered [INST]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
+                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"assert [NAME] [T]\",\"uncovered [INST]\",\"power [DOMAIN] [T]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
             } else {
                 std::cerr << "mdebug: unknown command '" << c << "' (help lists them)\n";
                 ok = false;
@@ -2315,6 +2501,11 @@ void usage() {
                  "  -assert [NAME]   the assertions (all, under an instance, or one); with -log LOG and -vcd,\n"
                  "                   each failure: what the assertion sampled at the clock ticks before it\n"
                  "                   and what drove each signal (-at T picks the failure at or before T)\n"
+                 "  -upf FILE        the power intent (IEEE 1801); -power_top INST as for msim\n"
+                 "  -power [DOMAIN]  with -upf: the power domains, what is in each, their supplies and their\n"
+                 "                   isolation, level-shifter and retention strategies; with -log (the output\n"
+                 "                   of msim -upf ... -upf_verbose) their power states over time, and -active\n"
+                 "                   says when a value is x because its domain was off or a port is isolated\n"
                  "  -cov FILE        a coverage database (msim -cov FILE): driver lines say how often they\n"
                  "                   ran, and the page marks the lines that ran and those that never did\n"
                  "  -uncovered [INST]  with -cov: the assignments that never ran and the signals with bits\n"
@@ -2340,7 +2531,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]};
     struct Query { std::string what, arg; int depth; std::optional<uint64_t> at; };
     std::vector<Query> queries;
-    std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath, covPath;
+    std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath, covPath, upfPath, powerTop;
+    bool powerTopSet = false;
     int depth = -1;
     std::optional<uint64_t> at;
     size_t maxChanges = 20000;
@@ -2371,6 +2563,14 @@ int main(int argc, char** argv) {
             std::string arg;
             if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
             queries.push_back({"assert", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-upf") { upfPath = next("a UPF file"); continue; }
+        if (a == "-power_top") { powerTop = next("an instance"); powerTopSet = true; continue; }
+        if (a == "-power") {
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"power", arg, -1, std::nullopt});
             continue;
         }
         if (a == "-cov") { covPath = next("a coverage database"); continue; }
@@ -2406,6 +2606,22 @@ int main(int argc, char** argv) {
     fwd.push_back("--threads");   // the front end parses files in parallel
     fwd.push_back(std::to_string(threads));
 
+    // With -upf the testbench may import package UPF (IEEE 1801-2024 11.2.4).
+    std::string pkgFile;
+    if (!upfPath.empty()) {
+        char tmpl[] = "/tmp/mdebug_upf_pkgXXXXXX.sv";
+        int fd = mkstemps(tmpl, 3);
+        std::string pkg = upf::svPackage();
+        if (fd < 0 || write(fd, pkg.data(), pkg.size()) != (ssize_t)pkg.size()) {
+            std::cerr << "mdebug: cannot write the UPF package\n";
+            return 2;
+        }
+        close(fd);
+        pkgFile = tmpl;
+        fwd.insert(fwd.begin() + 1, pkgFile);
+    }
+    struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{pkgFile};
+
     FrontEnd fe;
     if (int rc = fe.run(fwd, "mdebug front end")) return rc < 0 ? 0 : rc;
 
@@ -2419,6 +2635,8 @@ int main(int argc, char** argv) {
     tool.fsms = extractFsms(fe.comp->getRoot());
     if (!logPath.empty() && !tool.readLog(logPath)) return 2;
     if (!covPath.empty() && !tool.readCov(covPath)) return 2;
+    if (!upfPath.empty() && !tool.readUpf(upfPath, powerTop, powerTopSet)) return 2;
+    if (!logPath.empty()) tool.readPowerLog(logPath);
     if (!vcdPath.empty()) {
         std::string err;
         if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
@@ -2433,6 +2651,7 @@ int main(int argc, char** argv) {
         else if (q.what == "fsm") ok &= tool.fsm(q.arg, at);
         else if (q.what == "assert") ok &= tool.asserts(q.arg, at);
         else if (q.what == "uncovered") ok &= tool.uncovered(q.arg);
+        else if (q.what == "power") ok &= tool.power(q.arg, at);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")

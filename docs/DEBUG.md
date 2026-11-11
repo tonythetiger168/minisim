@@ -226,6 +226,37 @@ numbers of lines that ran have a green edge and those that never ran a red
 one, with the count as a tooltip, and a selected signal shows its toggle
 gaps. Reports and merging stay in `mcov`.
 
+## Low power (UPF)
+
+    msim tb.sv dut.sv -top tb -upf dut.upf -upf_verbose -vcd run.vcd > run.log
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -power
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -log run.log -vcd run.vcd -power PD_CORE -at 60
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -log run.log -vcd run.vcd -active tb.u_dut.u_core.cnt -at 60
+
+`-upf` reads the power intent with msim's own reader, so both see the same
+domains (`-power_top INST` as for msim; without it the UPF's
+`set_design_top`). `-power [DOMAIN]` lists each power domain: the instances
+in it, its primary supply set, and its isolation, level-shifter and
+retention strategies with their lines in the UPF file. With `-log`, the
+output of a run with `-upf_verbose`, it adds the domain's power states over
+time, the state at `-at T`, and the supply or switch change that caused it:
+
+    PD_CORE  dut.upf:7
+      elements: tb.u_dut.u_core  (1 instance)
+      primary supply: SS_CORE  ground=VSS  power=VDD_CORE
+      isolation ISO_0: outputs, clamp 0, on u_core/cnt u_core/q, enabled by iso_en(high)  dut.upf:30
+      states: @0 CORRUPT @2 NORMAL @45 CORRUPT @66 NORMAL @90 CORRUPT
+      @60: CORRUPT  (since 45)  power switch SW_CORE state off; supply VDD_CORE = OFF
+
+The active trace uses the same data. A value that is x because its domain
+has no power is reported as that, with the cause, and no assignment is
+blamed for it; a port with an isolation strategy says so, with the clamp
+value and the enable:
+
+    tb.u_dut.u_core.cnt = 8'bxxxxxxxx @60  (since 45)
+      power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF); isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)
+      x because the domain has no power: no assignment made this value
+
 ## Scripts and other programs
 
     mdebug design.sv -top tb -vcd run.vcd -script queries.txt
@@ -241,7 +272,7 @@ skipped. The exit status is 1 when a command failed.
 | `drivers SIG`, `loads SIG` | `drivers` / `loads`: `file`, `line`, `text`, `kind`, `when`, `target` (and `control` for a load) |
 | `value SIG [T]` | `value` (`8'h43`), `bits`, `since`, at T or at the end |
 | `changes SIG [T0 [T1]]` | `changes`: `[time, bits]` pairs, at most 10000, then `more` is true |
-| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]`, `assert [NAME] [T]`, `uncovered [INST]` | `text`: the lines the option of the same name prints |
+| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]`, `assert [NAME] [T]`, `uncovered [INST]`, `power [DOMAIN] [T]` | `text`: the lines the option of the same name prints |
 | `scopes`, `signals [SCOPE]` | the instances; the signals (directly inside SCOPE) |
 | `end` | `end` time and `timescale` of the waveform |
 | `help`, `quit` | the command list; stop |
