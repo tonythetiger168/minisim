@@ -68,6 +68,14 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `memu` is timing-aware between FPGAs: on a link with too few wires the
+  signals on the longest combinational paths keep a wire of their own and the
+  rest share what is left (40% fewer `emu_clk` cycles per event on a
+  910,000-cell netlist), and every partitioning attempt is routed and timed
+  so the fastest one is kept, not the smallest cut. `-partitioner CMD` lets
+  another partitioner compete (`tools/memu_mtkahypar.py` for Mt-KaHyPar). The
+  per-FPGA netlists now go through `mfpga` (the test maps a three-FPGA split
+  to iCE40 and checks it against the original netlist).
 - `mformal -aiger FILE` writes the model as AIGER 1.9 (bad-state
   properties for assertions and covers, invariant constraints for
   assumptions), so other model checkers can run on it or cross-check a
