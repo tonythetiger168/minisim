@@ -17,7 +17,10 @@ the toggle masks, matched by file path and line, and by signal name.
 Condition coverage (as VCS -cm cond): a condition a && b && c, a || b || c,
 or the condition of ?: with n terms has n + 1 vectors: the one where no term
 decides alone (all 1 for &&, all 0 for ||), and for each term the one where
-only that term has the deciding value (0 for &&, 1 for ||).
+only that term has the deciding value (0 for &&, 1 for ||). A condition with
+a term that && or || must be able to skip (it calls a function, or reads
+through a class handle) is counted as it runs: vector i is "term i is the
+first that decides", and the terms after it show as "-".
 
 FSM coverage (as VCS -cm fsm): for each state register msim extracted, the
 states entered and the transitions made, out of those its next-state logic
@@ -339,10 +342,11 @@ def cond_rows(op, terms, hits):
     n = len(terms)
     if op == "?:":
         return [(("1",), hits[0]), (("0",), hits[1])]
-    base, dec = ("0", "1") if op == "||" else ("1", "0")
+    base, dec = ("0", "1") if op.startswith("||") else ("1", "0")
     rows = [((base,) * n, hits[0])]
+    lazy = op.endswith("s")   # short-circuit: the terms after the deciding one did not run
     for i in range(n):
-        rows.append((tuple(dec if j == i else base for j in range(n)), hits[i + 1]))
+        rows.append((tuple(dec if j == i else "-" if lazy and j > i else base for j in range(n)), hits[i + 1]))
     return rows
 
 

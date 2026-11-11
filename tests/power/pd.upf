@@ -1,0 +1,24 @@
+# Power intent for pd.v: PD_CORE is switched by sw_en and runs at 0.8 V.
+upf_version 4.0
+set_design_top pd
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_CORE -elements {u_core}
+create_supply_port VDD
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSS
+create_supply_net VDD_CORE
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VSS -ports {VSS}
+create_supply_set SS_AON -function {power VDD} -function {ground VSS}
+create_supply_set SS_CORE -function {power VDD_CORE} -function {ground VSS}
+associate_supply_set SS_AON -handle PD_TOP.primary
+associate_supply_set SS_CORE -handle PD_CORE.primary
+add_power_state SS_AON -state {RUN -supply_expr {power == {FULL_ON 1.0}}}
+add_power_state SS_CORE -state {RUN -supply_expr {power == {FULL_ON 0.8}}} -state {SLEEP -supply_expr {power == OFF}}
+create_power_switch SW_CORE \
+    -output_supply_port {vout VDD_CORE} \
+    -input_supply_port {vin VDD} \
+    -control_port {en sw_en} \
+    -on_state {on vin {en}} \
+    -off_state {off {!en}}

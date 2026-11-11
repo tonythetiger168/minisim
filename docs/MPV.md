@@ -1,15 +1,31 @@
 # mpv: physical verification
 
-`mpv` checks a layout against a rule deck. This first version does design
-rule checking (DRC) on GDSII; layout versus schematic (LVS) and OASIS input
-are next.
+`mpv` checks a layout: design rule checking (DRC) against a rule deck, on
+GDSII, OASIS or a routed DEF, and layout versus schematic (LVS): transistor
+netlist extraction from GDSII or OASIS, and a routed block against its gate
+netlist.
 
 ```sh
 mpv drc -deck rules.drc chip.gds                 # every rule, one line each
 mpv drc -deck rules.drc chip.gds -top core -q    # one cell; only rules with violations
 mpv drc -deck rules.drc chip.gds -o drc.txt      # also write the markers
 mpv drc -deck rules.drc chip.gds -threads 8
+mpv drc -deck rules.drc chip.oas                 # OASIS, told from the file's first bytes
 ```
+
+## Layout files
+
+A layout is GDSII or OASIS (SEMI P39); `mpv` looks at the first bytes of the
+file, not at its name. The OASIS reader takes every record of the standard:
+rectangles, polygons and paths with all point-list forms, trapezoids and the
+25 compact trapezoids, circles (as 64-sided polygons), texts, placements
+with rotation, mirroring and magnification, the eleven repetition forms,
+modal variables, relative and absolute coordinates, name tables by reference
+(before or after their use, strict mode included) and compressed blocks
+(the DEFLATE decoder is built in; no zlib is needed). Properties and
+extension records are skipped. A repetition on a regular grid becomes an
+array reference; other repetitions are expanded. The reader is tested
+against KLayout's reading of the same files (`tests/pv/oasis`).
 
 ```
 mpv drc: cell bad, 6 shapes on 3 layers, 5 x 5 um, 1 unit = 0.001 um
@@ -149,6 +165,48 @@ parallel transistors merged and source and drain interchangeable. It reports
 unmatched devices and nets and size differences. The command line option to
 compare against a SPICE schematic comes with the shared SPICE reader.
 
+## LVS of a routed block
+
+```sh
+mpv lvs -lef tech.lef -lef cells.lef routed.def -netlist block.v
+mpv lvs -lef tech.lef routed.def -o extracted.v          # extraction only
+```
+
+```
+mpv lvs: block counter, 49 instances, 150 pins, 27 nets, 9 ports
+note: net VDD of the DEF is 3 separate nets in the layout
+open: net s[0] is in 2 pieces in the layout: [ha0/u_s/Y] [m0/A]
+MISMATCH: 49 instances, 21 nets and 9 ports compared, 1 opens, 0 shorts
+```
+
+Here the cells are the devices. The layout's nets are found from the
+geometry alone: the pin shapes of the placed cells (from the LEF), the wires
+and vias of the DEF and the shapes of the block's pins. Shapes of one metal
+layer that overlap or share part of a side are one net, a cut joins the
+metal under and over it, and all shapes of one cell pin are one node. The
+net names and connection lists in the DEF are not trusted; they only name
+the extracted nets in messages.
+
+The netlist is structural Verilog (read by `src/gnetlist.hpp`, hierarchy
+flattened to the leaf cells; `-top` picks the module, by default the one
+named like the DEF design). Instances and ports pair by name, as place and
+route keeps them. Then:
+
+- a net of the netlist whose pins are on several nets of the layout is an
+  **open**, listed with its pieces;
+- a net of the layout that holds pins of several nets of the netlist is a
+  **short**;
+- an instance on one side only, a different cell, a pin the cell does not
+  have, and a pin the netlist leaves open that is wired in the layout are
+  reported too.
+
+Supply pins are compared only when the netlist connects them. Cells with
+nothing but supply pins (fillers, taps) need not be in the netlist. A net of
+the DEF that is several nets in the layout and is not compared (supply rails
+that nothing ties together) is a note, as are pieces of wire that reach no
+pin. Exit status: 0 match, 1 mismatch, 2 error. `-o` writes the extracted
+netlist as Verilog, supply pins included.
+
 ## SKY130 example
 
 `tests/pv/sky130.drc` holds 35 SKY130 rules from diffusion to metal 2. The
@@ -177,9 +235,11 @@ in a canonical form, so the report is identical for every thread count.
 | File | |
 |---|---|
 | `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared with the other physical tools |
+| `src/oasis.hpp` | OASIS reader into the same library (namespace `oasis`); `oasis::readLayout` takes either format |
 | `src/geom.hpp` | regions of rectangles: booleans, sizing, boundary edges, connected polygons |
 | `src/layout.hpp` | a GDS library flattened to rectangles per layer |
 | `src/layout_def.hpp` | a routed DEF with its LEF as a flat layout; a deck from the LEF technology |
 | `src/drc.hpp` | the deck parser and the checks |
 | `src/lvs.hpp` | netlist extraction and netlist comparison |
+| `src/lvs_block.hpp` | block LVS: nets of a routed DEF from its geometry, comparison with a gate netlist |
 | `src/mpv.cpp` | the command line |
