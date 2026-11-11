@@ -167,3 +167,35 @@ file(READ ${OUT}/struct.json page)
 if(NOT page MATCHES "\"fld\"" OR NOT page MATCHES "\"lo\":4,\"w\":4")
   message(FATAL_ERROR "the database has no field expressions or bit ranges")
 endif()
+
+# Memories: msim -vcd-arrays writes the elements of small arrays, and the
+# active trace goes from the read to the element to the write. The default
+# waveform has no elements.
+set(SV ${SRC}/tests/debug/mem.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top mm -vcd ${OUT}/mem0.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+file(READ ${OUT}/mem0.vcd dflt)
+if(NOT rc EQUAL 0 OR dflt MATCHES "mem\\[")
+  message(FATAL_ERROR "msim mem.sv: array elements in the default VCD (${rc})")
+endif()
+execute_process(COMMAND ${MSIM} ${SV} -top mm -vcd ${OUT}/mem.vcd -vcd-arrays 8 RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+file(READ ${OUT}/mem.vcd arr)
+if(NOT rc EQUAL 0 OR NOT arr MATCHES "reg 8 [^ ]+ mem\\[3\\]" OR arr MATCHES "big\\[")
+  message(FATAL_ERROR "msim -vcd-arrays 8: want mem[0..3] and not big[] (${rc})")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top mm -vcd ${OUT}/mem.vcd -active mm.q -at 50 -depth 2
+                        -active mm.mem[1] -at 50 -depth 2
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("q = mem[2]" "mm.mem[2] = 8'h0c @25" "mem[idx] <= {6'd0, idx} + 8'd10" "with idx=2'h2 @24"
+     "mm.mem[1] = 8'h0b @50  (since 15)" "with idx=2'h1 @14")
+set(ref "${out}")
+execute_process(COMMAND ${MDEBUG} ${SV} -top mm -vcd ${OUT}/mem0.vcd -active mm.q -at 50
+                OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("mm.mem[2]  (not in the waveform: run msim with -vcd-arrays)")
+if(FST)
+  execute_process(COMMAND ${MSIM} ${SV} -top mm -fst ${OUT}/mem.fst -vcd-arrays 8 RESULT_VARIABLE rc OUTPUT_QUIET)
+  execute_process(COMMAND ${MDEBUG} ${SV} -top mm -fst ${OUT}/mem.fst -active mm.q -at 50 -depth 2
+                          -active mm.mem[1] -at 50 -depth 2 OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT out STREQUAL ref)
+    message(FATAL_ERROR "memory trace from the FST differs:\n${out}${err}")
+  endif()
+endif()
