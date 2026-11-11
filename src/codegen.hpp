@@ -2013,7 +2013,10 @@ private:
         }
         o << "static void fcommit() {" << (multi ? " dpend = false;" : "");
         for (int j = 0; j < nm; j++) o << " commitP" << j << "();";
-        o << " S.fastCombs(combAll); if (S.observed) syncP(); }\n\n";
+        // The comb pass is queued, not run here: other NBAs of this time
+        // step (a testbench driving the inputs) may still follow in the
+        // queue, and one pass after all of them is enough.
+        o << " S.markFast(); if (S.observed) syncP(); }\n\n";
     }
 
     // A clocked process: the body after its wait, NBAs into `nb`.
