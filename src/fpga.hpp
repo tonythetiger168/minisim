@@ -1275,8 +1275,8 @@ inline FrontOptions family_front(Family f) {
   o.dsp_b = f == Family::Ice40 ? 16 : 18;
   o.dsp_unsigned = f != Family::Xc7;
   if (f == Family::Generic) o.dsp_a = o.dsp_b = 0;
-  // SB_RAM40_4K goes to 2048 x 2, DP16KD to 16384 x 1
-  o.ram = f == Family::Ice40 || f == Family::Ecp5;
+  // SB_RAM40_4K goes to 2048 x 2, DP16KD and RAMB18E1 to 16384 x 1
+  o.ram = f != Family::Generic;
   o.ram_abits = f == Family::Ice40 ? 11 : 14;
   return o;
 }
@@ -1595,6 +1595,47 @@ class NetlistBuilder {
                     {"CLKAMUX", R.wneg ? "INV" : "CLKA", true}, {"CLKBMUX", R.rneg ? "INV" : "CLKB", true},
                     {"GSR", "DISABLED", true}},
                    std::move(c));
+        }
+        break;
+      }
+      case Family::Xc7: {
+        // RAMB18E1 as a true dual-port RAM: port A reads, port B writes. 1024 x 18 down to
+        // 16384 x 1; the address sits at the top of ADDR[13:0], and bits 16 and 17 of an 18 bit
+        // word (bit 8 of a 9 bit word) are the parity bits.
+        const int w = R.abits <= 10 ? 18 : R.abits == 11 ? 9 : R.abits == 12 ? 4 : R.abits == 13 ? 2 : 1;
+        const int shift = w == 18 ? 4 : w == 9 ? 3 : w == 4 ? 2 : w == 2 ? 1 : 0;
+        const int nd = w == 18 ? 16 : w == 9 ? 8 : w;   // data bits; the rest of a word is parity
+        for (int at = 0, j = 0; at < R.width; at += w, ++j) {
+          std::vector<int> ada(14, 1), adb(14, 1), di(16, 0), dip(2, 0), doa(16), dopa(2), dob(16), dopb(2);
+          for (int i = 0; i < 14 - shift; ++i) {
+            ada[shift + i] = i < (int)ra.size() ? ra[i] : 0;
+            adb[shift + i] = i < (int)wa.size() ? wa[i] : 0;
+          }
+          for (int b = 0; b < 16; ++b) { doa[b] = fresh(); dob[b] = fresh(); }
+          for (int b = 0; b < 2; ++b) { dopa[b] = fresh(); dopb[b] = fresh(); }
+          for (int b = 0; b < w && at + b < R.width; ++b) {
+            if (b < nd) { di[b] = wd[at + b]; doa[b] = q(at + b); }
+            else { dip[b - nd] = wd[at + b]; dopa[b - nd] = q(at + b); }
+          }
+          std::string name = base + "_ram" + std::to_string(j);
+          while (!used_.insert(name).second) name += "_";
+          ++n_.brams;
+          const std::vector<int> z16(16, 0), z2(2, 0);
+          add_cell("RAMB18E1", name,
+                   {{"RAM_MODE", "TDP", true}, {"READ_WIDTH_A", bitstr(w, 32), false}, {"READ_WIDTH_B", bitstr(0, 32), false},
+                    {"WRITE_WIDTH_A", bitstr(0, 32), false}, {"WRITE_WIDTH_B", bitstr(w, 32), false},
+                    {"DOA_REG", bitstr(0, 32), false}, {"DOB_REG", bitstr(0, 32), false},
+                    {"WRITE_MODE_A", "READ_FIRST", true}, {"WRITE_MODE_B", "READ_FIRST", true},
+                    {"IS_CLKARDCLK_INVERTED", R.rneg ? "1" : "0", false}, {"IS_CLKBWRCLK_INVERTED", R.wneg ? "1" : "0", false},
+                    {"SIM_DEVICE", "7SERIES", true}},
+                   {{"CLKARDCLK", false, {rclk}}, {"ENARDEN", false, {ren}}, {"REGCEAREGCE", false, {1}},
+                    {"RSTRAMARSTRAM", false, {0}}, {"RSTREGARSTREG", false, {0}}, {"WEA", false, z2},
+                    {"ADDRARDADDR", false, ada}, {"DIADI", false, z16}, {"DIPADIP", false, z2},
+                    {"DOADO", true, doa}, {"DOPADOP", true, dopa},
+                    {"CLKBWRCLK", false, {wclk}}, {"ENBWREN", false, {wen}}, {"REGCEB", false, {1}},
+                    {"RSTRAMB", false, {0}}, {"RSTREGB", false, {0}}, {"WEBWE", false, std::vector<int>(4, 1)},
+                    {"ADDRBWRADDR", false, adb}, {"DIBDI", false, di}, {"DIPBDIP", false, dip},
+                    {"DOBDO", true, dob}, {"DOPBDOP", true, dopb}});
         }
         break;
       }

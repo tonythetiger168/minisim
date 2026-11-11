@@ -69,3 +69,44 @@ module DSP48E1 #(parameter ACASCREG = 0, ADREG = 0, ALUMODEREG = 0, AREG = 0, BC
   wire [47:0] eb = {{30{B[17]}}, B};
   assign P = ea * eb;
 endmodule
+
+// RAMB18E1 as mfpga uses it: port A reads, port B writes, no output registers.
+module RAMB18E1 #(parameter RAM_MODE = "TDP", READ_WIDTH_A = 0, READ_WIDTH_B = 0, WRITE_WIDTH_A = 0, WRITE_WIDTH_B = 0,
+                  DOA_REG = 0, DOB_REG = 0, WRITE_MODE_A = "WRITE_FIRST", WRITE_MODE_B = "WRITE_FIRST",
+                  parameter [0:0] IS_CLKARDCLK_INVERTED = 0, IS_CLKBWRCLK_INVERTED = 0, parameter SIM_DEVICE = "7SERIES")
+  (input CLKARDCLK, ENARDEN, REGCEAREGCE, RSTRAMARSTRAM, RSTREGARSTREG, input [1:0] WEA, input [13:0] ADDRARDADDR,
+   input [15:0] DIADI, input [1:0] DIPADIP, output [15:0] DOADO, output [1:0] DOPADOP,
+   input CLKBWRCLK, ENBWREN, REGCEB, RSTRAMB, RSTREGB, input [3:0] WEBWE, input [13:0] ADDRBWRADDR,
+   input [15:0] DIBDI, input [1:0] DIPBDIP, output [15:0] DOBDO, output [1:0] DOPBDOP);
+  localparam SA = READ_WIDTH_A == 18 ? 4 : READ_WIDTH_A == 9 ? 3 : READ_WIDTH_A == 4 ? 2 : READ_WIDTH_A == 2 ? 1 : 0;
+  localparam SB = WRITE_WIDTH_B == 18 ? 4 : WRITE_WIDTH_B == 9 ? 3 : WRITE_WIDTH_B == 4 ? 2 : WRITE_WIDTH_B == 2 ? 1 : 0;
+  // data and parity are separate arrays of bits: 16384 and 2048
+  reg [16383:0] mem;
+  reg [2047:0] par;
+  reg [15:0] doa = 16'd0;
+  reg [1:0] dopa = 2'd0;
+  wire clka = CLKARDCLK ^ IS_CLKARDCLK_INVERTED;
+  wire clkb = CLKBWRCLK ^ IS_CLKBWRCLK_INVERTED;
+  wire [13:0] ra = (ADDRARDADDR >> SA) << SA;
+  wire [13:0] wa = (ADDRBWRADDR >> SB) << SB;
+  localparam ND_A = READ_WIDTH_A >= 9 ? READ_WIDTH_A / 9 * 8 : READ_WIDTH_A;
+  localparam ND_B = WRITE_WIDTH_B >= 9 ? WRITE_WIDTH_B / 9 * 8 : WRITE_WIDTH_B;
+  integer i;
+  always @(posedge clkb) if (ENBWREN) begin
+    for (i = 0; i < ND_B; i = i + 1) if (WEBWE[i / 8]) mem[wa + i] <= DIBDI[i];
+    for (i = 0; i < WRITE_WIDTH_B - ND_B; i = i + 1) if (WEBWE[i]) par[(wa >> 3) + i] <= DIPBDIP[i];
+  end
+  always @(posedge clka) if (ENARDEN) begin
+    if (RSTRAMARSTRAM) begin doa <= 16'd0; dopa <= 2'd0; end
+    // a word read while port B writes it is not defined on two clocks: x here, so a test sees it
+    else if (ENBWREN && WEBWE != 4'd0 && wa == ra) begin doa <= 16'hxxxx; dopa <= 2'bxx; end
+    else begin
+      for (i = 0; i < ND_A; i = i + 1) doa[i] <= mem[ra + i];
+      for (i = 0; i < READ_WIDTH_A - ND_A; i = i + 1) dopa[i] <= par[(ra >> 3) + i];
+    end
+  end
+  assign DOADO = doa;
+  assign DOPADOP = dopa;
+  assign DOBDO = 16'd0;
+  assign DOPBDOP = 2'd0;
+endmodule
