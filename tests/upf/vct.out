@@ -1,0 +1,9 @@
+1 all off: VREG=UNDETERMINED VDD=x VSSN=1 PGOOD=x y=x q=x
+2 VDD on, no ground: VREG=UNDETERMINED VDD=x VSSN=1 PGOOD=x y=x q=x
+12 regulator disabled: VREG=OFF VDD=0 VSSN=0 PGOOD=0 y=x q=x
+22 regulator enabled: VREG=FULL_ON VDD=1 VSSN=0 PGOOD=1 y=c q=3
+32 running: VREG=FULL_ON VDD=1 VSSN=0 PGOOD=1 y=9 q=6
+33 enable floats: VREG=UNDETERMINED VDD=x VSSN=0 PGOOD=0 y=x q=x
+34 regulator's own supply off: VREG=UNDETERMINED VDD=x VSSN=0 PGOOD=x y=x q=x
+44 back on: VREG=FULL_ON VDD=1 VSSN=0 PGOOD=1 y=9 q=6
+54 regulator disabled: VREG=OFF VDD=0 VSSN=0 PGOOD=0 y=x q=x

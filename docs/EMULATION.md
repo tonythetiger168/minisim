@@ -45,6 +45,18 @@ writes is a netlist of the same library cells plus a few lines of plain
 Verilog, which an FPGA flow (`mfpga`, Yosys, a vendor tool) maps given the
 cells' Verilog models. The outputs of the tests here pass `yosys synth`.
 
+`mfpga` takes the FPGAs from there. `tests/memu.cmake` splits a design over
+three FPGAs with multiplexed links, maps each with `mfpga -family ice40`, puts
+the three mapped netlists back on the board and runs the same testbench: the
+iCE40 LUTs and flops still match the original netlist at every event.
+
+```sh
+memu soc.gv -lib cells.lib -mem mems.txt -board board.txt -o out
+for k in 0 1 2; do
+  mfpga cells.v mems.v out/soc_fpga$k.v out/soc_emu_lib.v -top soc_fpga$k -family ice40 -o out/fpga$k.json
+done
+```
+
 ## Clock conversion
 
 The design's clocks do not exist on the FPGAs. A generator, one copy per
@@ -149,8 +161,55 @@ each level move cells between FPGAs while that lowers the cost
 follows makes up for it). Capacity is a limit, not a goal: nothing asks for
 equal halves.
 
-`-starts N` (default 16) runs N such attempts from different seeds and keeps
-the best. That is what the threads are for.
+`-starts N` (default 16) runs N such attempts from different seeds; that is
+what the threads are for. The smallest cut is not always the fastest
+emulation, so all of them are routed and timed (`-route-best N` for fewer),
+and the one with the fewest `emu_clk` cycles per delta is kept, the smallest
+cut among equals.
+
+### Another partitioner
+
+`-partitioner CMD` asks a second opinion. `memu` writes the problem as an
+hMETIS hypergraph and runs `CMD part.hgr K part.out THREADS`; beside
+`part.hgr` are `part.hgr.fix` (the FPGA of each vertex that has one, or -1),
+`part.hgr.caps` (what each FPGA holds, in the vertex weights' unit) and
+`part.hgr.board` (the wired pairs). The answer, one FPGA number per vertex, is
+held to the board's LUT, flop and block RAM limits, improved by `memu`'s own
+passes, and then competes with `memu`'s attempts on the same terms.
+
+`tools/memu_mtkahypar.py` is such a command for
+[Mt-KaHyPar](https://github.com/kahypar/mt-kahypar) (MIT licence,
+`pip install mtkahypar`):
+
+```sh
+memu soc.gv -lib cells.lib -board board.txt -partitioner tools/memu_mtkahypar.py
+```
+
+On the 910,000-cell benchmark its polished cut is within 2% of `memu`'s own
+best of 16 (3229 against 3183), so it is a cross-check more than a
+replacement; on a design shaped differently it may be the one that wins, and
+then the report says so.
+
+## Wires between FPGAs
+
+A link with enough wires gives every crossing signal its own, and such a
+signal arrives within the cycle. A link with too few shares them: N signals
+take turns on a wire, and each then arrives up to N + 1 cycles late. Every
+combinational path has to fit in a delta, so the slowest path through shared
+links sets the `emu_clk` cycles per delta, for the whole design.
+
+Not every signal needs to take turns. `memu` times every path, and on each
+short link gives a wire of their own to the signals on the longest paths,
+letting the rest share what is left at a higher ratio, for as long as that
+makes the slowest path shorter. The report shows what it bought:
+
+```
+timing: ... 6 emu_clk cycles per delta: 6 emu_clk cycles per event (10 before the signals that matter most got wires of their own)
+  link F2-F3: 266 + 335 signals on 300 of 300 wires, multiplexed 4:1 (168 signals keep a wire of their own)
+```
+
+That is the 910,000-cell benchmark on four FPGAs with 300 wires per pair: 40%
+fewer cycles per event, found in 7 s.
 
 ## Probes and waveforms
 
@@ -228,21 +287,21 @@ has (UART, JTAG, PCIe). Nothing depends on how long the link takes.
 
 `memu` uses every logical CPU by default (`-threads N` to choose) for the
 partitioning attempts. The result does not depend on the number of threads:
-the attempts are independent, and the best one wins by (overflow, cost,
-lowest seed).
+the attempts are independent, and the winner is picked by fixed rules
+(overflow, cycles per delta, cost, lowest seed).
 
 On a generated netlist of 910,000 cells split over 4 FPGAs
 (`bench/emu/run.sh`), on 4 cores: reading 4.7 s, partitioning 9.7 s (36 s on
-one thread), writing 0.3 s. Against KaHyPar (k-way, connectivity objective)
+one thread), routing and timing all 16 attempts 1.3 s, writing 0.3 s. Against KaHyPar (k-way, connectivity objective)
 on the same hypergraphs the cut is 7% larger on a 100-block netlist and 35%
 larger on a 500-block one, in less time; KaHyPar balances the parts, which
 `memu` does not need to.
 
 ## What it does not do yet
 
-- The partitioner does not look at timing: a combinational path may cross
-  between FPGAs more often than it must, which raises the cycles per delta on
-  multiplexed links.
+- Timing decides between finished partitions and shares out the wires, but
+  it does not yet steer the partitioner's own moves: a combinational path may
+  still cross between FPGAs more often than it must.
 - Tristate buses between FPGAs, and designs whose clocks form a combinational
   loop (`-settle N` gives those a fixed number of deltas).
 - Memory cells with more than one write clock per port, and FPGA vendor

@@ -14,6 +14,8 @@
 // (then the lowest seed) wins, so the answer does not depend on the thread
 // count.
 #pragma once
+#include <mutex>
+#include <thread>
 #include <array>
 #include <chrono>
 
@@ -101,6 +103,21 @@ public:
             refine(fine, part, rng);
         }
         st.seed = seed;
+        st.cost = cost(g, part);
+        st.over = overflow(g, part);
+        return part;
+    }
+
+    // A partition from somewhere else (memu -partitioner): held to the fixed
+    // vertices and the capacities, and improved, by the same passes.
+    std::vector<int> polish(const HGraph& g, std::vector<int> part, PartStats& st) const {
+        Rng rng(0x9e3779b9ull);
+        for (int v = 0; v < g.nv; v++) {
+            if (part[v] < 0 || part[v] >= k) part[v] = 0;
+            if (g.fixed[v] >= 0) part[v] = g.fixed[v];
+        }
+        refine(g, part, rng);
+        st.seed = 0;
         st.cost = cost(g, part);
         st.over = overflow(g, part);
         return part;
@@ -514,6 +531,9 @@ struct LinkUse {
     std::vector<int> ab, ba;       // the nets that go a to b, and b to a
     int pinsAB = 0, pinsBA = 0;    // wires given to each direction
     int ratioAB = 1, ratioBA = 1;  // signals per wire; 1: its own wire
+    // On a multiplexed direction, the first so many nets of the list still
+    // have a wire each: the ones whose delay costs the most.
+    int directAB = 0, directBA = 0;
 };
 
 // Where everything went: the FPGA of each cell and port bit, what crosses
@@ -521,11 +541,12 @@ struct LinkUse {
 struct Plan {
     std::vector<int> part;               // per instance, then per port
     std::vector<LinkUse> links;
-    std::vector<std::vector<int>> lag;   // emulation cycles from FPGA a to FPGA b
     int B = 1;                           // emulation cycles per delta
     PartStats stats;
-    int starts = 0;
+    int starts = 0, routed = 1;          // partitioning attempts, and how many of the best were routed
     std::vector<Wt> load;
+    double givenCost = -1;               // the cut cost of the -partitioner attempt, if there was one
+    int Bshared = 1;                     // what B would be with every signal of a short link taking turns
     double tGraph = 0, tPart = 0, tRoute = 0;  // seconds spent
     int partOfPort(const Design& d, int p) const { return part[d.ni() + p]; }
     // The FPGA a net is driven in.
@@ -590,39 +611,13 @@ inline HGraph buildGraph(const Design& d, const std::vector<int>& fixed) {
 
 // Partition, then route every cut net over the board's links, share wires
 // where a link has too few, and work out the cycles per delta.
-inline Plan makePlan(const Design& d, const Board& board, const std::vector<int>& fixed, int starts,
-                     unsigned threads) {
-    Plan pl;
+// Given the partition: routes the crossing nets over the board, shares out
+// the wires, and works out the cycles per delta.
+inline void routePlan(Plan& pl, const Design& d, const Board& board, const HGraph& g, unsigned threads,
+                      bool tuneWires = true) {
     int k = board.k();
     size_t ni = d.ni();
-    auto t0 = std::chrono::steady_clock::now();
-    auto lap = [&] {
-        auto t1 = std::chrono::steady_clock::now();
-        double s = std::chrono::duration<double>(t1 - t0).count();
-        t0 = t1;
-        return s;
-    };
-    HGraph g = buildGraph(d, fixed);
-    pl.tGraph = lap();
-    Partitioner pt(board);
-    if (k == 1) {
-        pl.part.assign(g.nv, 0);
-        pl.stats.over = pt.overflow(g, pl.part);
-        pl.starts = 1;
-    } else {
-        std::vector<std::vector<int>> parts(starts);
-        std::vector<PartStats> st(starts);
-        parallelFor((size_t)starts, threads, [&](size_t s) { parts[s] = pt.run(g, (int)s + 1, st[s]); });
-        int best = 0;
-        for (int s = 1; s < starts; s++)
-            if (st[s].over < st[best].over - 1e-12 ||
-                (std::abs(st[s].over - st[best].over) <= 1e-12 && st[s].cost < st[best].cost))
-                best = s;
-        pl.part = std::move(parts[best]);
-        pl.stats = st[best];
-        pl.starts = starts;
-    }
-    pl.tPart = lap();
+    pl.links.clear();
     pl.load.assign(k, Wt{0, 0, 0});
     for (int v = 0; v < g.nv; v++)
         for (int r = 0; r < 3; r++) pl.load[pl.part[v]][r] += g.w[v][r];
@@ -682,91 +677,406 @@ inline Plan makePlan(const Design& d, const Board& board, const std::vector<int>
     // A link with fewer wires than signals sends several signals down each
     // wire in turn (time-division multiplexing). A signal then takes up to
     // ratio + 1 emulation cycles to arrive: ratio to get its turn, one for the
-    // receiving register.
-    pl.lag.assign(k, std::vector<int>(k, 0));
-    std::vector<std::vector<int>> hopLag(k, std::vector<int>(k, 0));
+    // receiving register. Not every signal has to: some keep a wire of their
+    // own, and the rest share what is left at a higher ratio.
+    struct DirUse {
+        LinkUse* l;
+        bool ab;
+        int from, to, pins;
+        std::vector<int>* nets;
+        std::unordered_map<int, int> pos;
+        bool shared() const { return (int)nets->size() > pins; }
+        int maxDirect(int tdmMax) const {  // the most wires that can go to single signals
+            int x = (int)nets->size(), best = 0;
+            for (int D = 1; D < pins; D++)
+                if ((x - D + pins - D - 1) / (pins - D) <= tdmMax) best = D;
+            return best;
+        }
+        int ratio(int D) const {
+            int x = (int)nets->size();
+            return x <= pins ? 1 : (x - D + pins - D - 1) / (pins - D);
+        }
+    };
+    std::vector<DirUse> dirs;
+    std::vector<std::vector<int>> dirOf(k, std::vector<int>(k, -1));
     for (auto& l : pl.links) {
         int x = (int)l.ab.size(), y = (int)l.ba.size();
         if (x + y <= l.pins) {
             l.pinsAB = x;
             l.pinsBA = y;
-            continue;
-        }
-        if ((x > 0) + (y > 0) > l.pins)
-            throw Error("link " + board.fpgas[l.a].name + "-" + board.fpgas[l.b].name + " has " +
-                        std::to_string(l.pins) + " wire, and signals go both ways");
-        if (x && y) {
-            l.pinsAB = std::min(l.pins - 1, std::max(1, (int)std::lround((double)l.pins * x / (x + y))));
-            l.pinsBA = l.pins - l.pinsAB;
         } else {
-            l.pinsAB = x ? l.pins : 0;
-            l.pinsBA = y ? l.pins : 0;
+            if ((x > 0) + (y > 0) > l.pins)
+                throw Error("link " + board.fpgas[l.a].name + "-" + board.fpgas[l.b].name + " has " +
+                            std::to_string(l.pins) + " wire, and signals go both ways");
+            if (x && y) {
+                l.pinsAB = std::min(l.pins - 1, std::max(1, (int)std::lround((double)l.pins * x / (x + y))));
+                l.pinsBA = l.pins - l.pinsAB;
+            } else {
+                l.pinsAB = x ? l.pins : 0;
+                l.pinsBA = y ? l.pins : 0;
+            }
+            l.pinsAB = std::min(l.pinsAB, x);
+            l.pinsBA = std::min(l.pinsBA, y);
+            int worst = std::max(x ? (x + l.pinsAB - 1) / l.pinsAB : 1, y ? (y + l.pinsBA - 1) / l.pinsBA : 1);
+            if (worst > board.tdmMax)
+                throw Error("link " + board.fpgas[l.a].name + "-" + board.fpgas[l.b].name + ": " + std::to_string(x + y) +
+                            " signals over " + std::to_string(l.pins) + " wires needs " + std::to_string(worst) +
+                            " signals per wire, more than tdm_max " + std::to_string(board.tdmMax));
         }
-        l.pinsAB = std::min(l.pinsAB, x);
-        l.pinsBA = std::min(l.pinsBA, y);
-        l.ratioAB = x ? (x + l.pinsAB - 1) / l.pinsAB : 1;
-        l.ratioBA = y ? (y + l.pinsBA - 1) / l.pinsBA : 1;
-        int worst = std::max(l.ratioAB, l.ratioBA);
-        if (worst > board.tdmMax)
-            throw Error("link " + board.fpgas[l.a].name + "-" + board.fpgas[l.b].name + ": " + std::to_string(x + y) +
-                        " signals over " + std::to_string(l.pins) + " wires needs " + std::to_string(worst) +
-                        " signals per wire, more than tdm_max " + std::to_string(board.tdmMax));
-        if (l.ratioAB > 1) hopLag[l.a][l.b] = l.ratioAB + 1;
-        if (l.ratioBA > 1) hopLag[l.b][l.a] = l.ratioBA + 1;
+        if (x) {
+            dirOf[l.a][l.b] = (int)dirs.size();
+            dirs.push_back({&l, true, l.a, l.b, l.pinsAB, &l.ab, {}});
+        }
+        if (y) {
+            dirOf[l.b][l.a] = (int)dirs.size();
+            dirs.push_back({&l, false, l.b, l.a, l.pinsBA, &l.ba, {}});
+        }
     }
-    for (int a = 0; a < k; a++)
-        for (int b = 0; b < k; b++) {
-            if (a == b || board.dist[a][b] >= (1 << 20)) continue;
-            for (int v = b; v != a; v = board.prev(a, v)) pl.lag[a][b] += hopLag[board.prev(a, v)][v];
-        }
+    int nd = (int)dirs.size();
+    auto index = [&](DirUse& du) {
+        du.pos.clear();
+        for (size_t x = 0; x < du.nets->size(); x++) du.pos[(*du.nets)[x]] = (int)x;
+    };
+    for (auto& du : dirs) index(du);
+    // The nets that cross, and for each the FPGAs it must reach.
+    std::vector<int> cutIdx(d.nn(), -1), cutNets;
+    for (auto& du : dirs)
+        for (int n : *du.nets)
+            if (cutIdx[n] < 0) {
+                cutIdx[n] = (int)cutNets.size();
+                cutNets.push_back(n);
+            }
 
     // Cycles per delta: one, plus the slowest way a value can travel between
     // two steps (through multiplexed links, and through block RAM that stands
-    // in for a memory read without a clock).
-    std::vector<int> A(ni, 0);
-    int maxA = 0;
-    auto arrive = [&](int n, int to) {
-        if (n < 0 || d.isConst(n) || d.clockOfNet[n] >= 0 || d.drv[n] == -1) return 0;
-        int from = pl.netPart(d, n);
-        return (d.drv[n] >= 0 ? A[d.drv[n]] : 0) + pl.lag[from][to];
+    // in for a memory read without a clock). `direct` is how many nets of
+    // each direction have their own wire.
+    // Only what lies after a crossing net (or a memory read that takes a
+    // cycle) can be late at all: everything else arrives at 0, and is left
+    // out of the walk.
+    std::vector<int> cone;
+    {
+        // in: something late reaches the instance. out: its output can be
+        // late too (a flop's only through its set and reset pins).
+        std::vector<char> in(ni, 0), out(ni, 0);
+        auto lateNet = [&](int n) { return n >= 0 && (cutIdx[n] >= 0 || (d.drv[n] >= 0 && out[d.drv[n]])); };
+        for (int pass = 0; pass < 2; pass++)
+            for (int i : d.order) {
+                if (in[i] && out[i]) continue;
+                Kind kd = d.kind(i);
+                bool any = false, async = false;
+                auto& inst = d.nl.insts[i];
+                for (size_t c = 0; c < inst.conns.size(); c++) {
+                    PinCls pc = d.pinCls(i, c);
+                    if (pc == POut || pc == PClk || !lateNet(inst.conns[c].net)) continue;
+                    any = true;
+                    async |= pc == PAsync;
+                }
+                forEachInput(d, i, [&](int n) { any |= lateNet(n); });
+                bool lagRead = kd == Kind::Mem && d.roleOfInst(i).mem->lagRead;
+                in[i] = any || lagRead;
+                out[i] = kd == Kind::FF ? async : kd == Kind::Mem ? d.roleOfInst(i).mem->asyncRead() && in[i] : any;
+            }
+        for (int i : d.order)
+            if (in[i]) cone.push_back(i);
+    }
+    // One array of arrival times per thread, zero outside the cone for good.
+    std::mutex scratchMu;
+    std::unordered_map<std::thread::id, std::vector<int>> scratch;
+    auto scratchA = [&]() -> std::vector<int>& {
+        std::lock_guard<std::mutex> lock(scratchMu);
+        auto& v = scratch[std::this_thread::get_id()];
+        if (v.empty()) v.assign(ni, 0);
+        return v;
     };
-    auto eval = [&](int i) {
-        int me = pl.part[i], a = 0, all = 0;
-        Kind kd = d.kind(i);
-        auto& in = d.nl.insts[i];
-        for (size_t c = 0; c < in.conns.size(); c++) {
-            PinCls pc = d.pinCls(i, c);
-            if (pc == POut || pc == PClk) continue;
-            int t = arrive(in.conns[c].net, me);
-            all = std::max(all, t);
-            if (kd == Kind::FF ? pc == PAsync : true) a = std::max(a, t);
-        }
-        if (kd == Kind::FF && d.trig[i].root >= 0) all = std::max(all, arrive(d.trig[i].root, me));
-        if (kd == Kind::Mem) {
-            for (auto& t : d.memTrig.at(i))
-                if (t.root >= 0) all = std::max(all, arrive(t.root, me));
-            auto* m = d.roleOfInst(i).mem;
-            a = m->asyncRead() ? a + (m->lagRead ? 1 : 0) : 0;
-        }
-        maxA = std::max(maxA, std::max(all, a));
-        return a;
-    };
-    for (int round = 0; round < 3; round++) {
-        bool changed = false;
-        for (int i : d.order) {
-            int a = eval(i);
-            if (a != A[i]) {
-                A[i] = a;
-                changed = true;
+    auto analyze = [&](const std::vector<int>& direct, std::vector<int>* crit) {
+        // How late each crossing net is in each FPGA it is routed to.
+        std::vector<int> late(cutNets.size() * (size_t)k, 0);
+        for (size_t c = 0; c < cutNets.size(); c++) {
+            int n = cutNets[c], a = pl.netPart(d, n);
+            for (int b = 0; b < k; b++) {
+                if (b == a || board.dist[a][b] >= (1 << 20)) continue;
+                int t = 0;
+                for (int v = b; v != a;) {
+                    int u = board.prev(a, v), di = dirOf[u][v];
+                    if (di < 0) {
+                        t = 0;
+                        break;
+                    }
+                    auto& du = dirs[di];
+                    auto it = du.pos.find(n);
+                    if (it == du.pos.end()) {  // not routed this way: nothing in b reads it
+                        t = 0;
+                        break;
+                    }
+                    int r = du.ratio(direct[di]);
+                    if (r > 1 && it->second >= direct[di]) t += r + 1;
+                    v = u;
+                }
+                late[c * k + b] = t;
             }
         }
-        if (!changed) break;
+        std::vector<int>& A = scratchA();
+        for (int i : cone) A[i] = 0;
+        int maxA = 0;
+        auto lagOf = [&](int n, int to) { return cutIdx[n] < 0 ? 0 : late[(size_t)cutIdx[n] * k + to]; };
+        auto arrive = [&](int n, int to) {
+            if (n < 0 || d.isConst(n) || d.clockOfNet[n] >= 0 || d.drv[n] == -1) return 0;
+            return (d.drv[n] >= 0 ? A[d.drv[n]] : 0) + lagOf(n, to);
+        };
+        auto eval = [&](int i) {
+            int me = pl.part[i], a = 0, all = 0;
+            Kind kd = d.kind(i);
+            auto& in = d.nl.insts[i];
+            for (size_t c = 0; c < in.conns.size(); c++) {
+                PinCls pc = d.pinCls(i, c);
+                if (pc == POut || pc == PClk) continue;
+                int t = arrive(in.conns[c].net, me);
+                all = std::max(all, t);
+                if (kd == Kind::FF ? pc == PAsync : true) a = std::max(a, t);
+            }
+            if (kd == Kind::FF && d.trig[i].root >= 0) all = std::max(all, arrive(d.trig[i].root, me));
+            if (kd == Kind::Mem) {
+                for (auto& t : d.memTrig.at(i))
+                    if (t.root >= 0) all = std::max(all, arrive(t.root, me));
+                auto* m = d.roleOfInst(i).mem;
+                a = m->asyncRead() ? a + (m->lagRead ? 1 : 0) : 0;
+            }
+            maxA = std::max(maxA, std::max(all, a));
+            return a;
+        };
+        for (int round = 0; round < 3; round++) {
+            bool changed = false;
+            for (int i : cone) {
+                int a = eval(i);
+                if (a != A[i]) {
+                    A[i] = a;
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+        for (size_t p = 0; p < d.nl.ports.size(); p++)
+            if (d.nl.ports[p].dir != gnl::Dir::In)
+                maxA = std::max(maxA, arrive(d.nl.ports[p].net, pl.partOfPort(d, (int)p)));
+        if (crit) {
+            // For each crossing net, the longest way through it: what came
+            // before its driver, and what still follows its slowest reader.
+            // Q is what follows an instance's output.
+            std::vector<int> Q(ni, 0), qNet(d.nn(), 0);
+            for (size_t p = 0; p < d.nl.ports.size(); p++) {
+                auto& port = d.nl.ports[p];
+                if (port.dir != gnl::Dir::In && port.net >= 0)
+                    qNet[port.net] = std::max(qNet[port.net], lagOf(port.net, pl.partOfPort(d, (int)p)));
+            }
+            // Readers come after their drivers in the order, so backwards.
+            for (size_t x = d.order.size(); x-- > 0;) {
+                int i = d.order[x];
+                auto& in = d.nl.insts[i];
+                for (size_t c = 0; c < in.conns.size(); c++) {
+                    int n = in.conns[c].net;
+                    if (d.pinCls(i, c) == POut && n >= 0) Q[i] = std::max(Q[i], qNet[n]);
+                }
+                Kind kd = d.kind(i);
+                bool through = kd != Kind::FF && (kd != Kind::Mem || d.roleOfInst(i).mem->asyncRead());
+                int qi = through ? Q[i] : 0;
+                forEachInput(d, i, [&](int n) {
+                    int t = lagOf(n, pl.part[i]) + qi;
+                    if (t > qNet[n]) qNet[n] = t;
+                });
+            }
+            crit->assign(cutNets.size(), 0);
+            for (size_t c = 0; c < cutNets.size(); c++) {
+                int n = cutNets[c];
+                (*crit)[c] = (d.drv[n] >= 0 ? A[d.drv[n]] : 0) + qNet[n];
+            }
+        }
+        return maxA;
+    };
+
+    std::vector<int> direct(nd, 0);
+    int bestA = analyze(direct, nullptr);
+    pl.Bshared = 1 + bestA;
+    bool anyShared = false;
+    for (auto& du : dirs) anyShared |= du.shared() && du.maxDirect(board.tdmMax) > 0;
+    if (tuneWires && anyShared && bestA > 0) {
+        auto bestDirect = direct;
+        std::vector<std::vector<int>> bestNets;
+        for (auto& du : dirs) bestNets.push_back(*du.nets);
+        for (int pass = 0; pass < 4; pass++) {
+            // Order each shared direction by how much its nets' delay costs,
+            // then give the first of them wires of their own while that helps.
+            std::vector<int> crit;
+            analyze(direct, &crit);
+            for (auto& du : dirs) {
+                if (!du.shared()) continue;
+                std::stable_sort(du.nets->begin(), du.nets->end(), [&](int x, int y) {
+                    int cx = crit[cutIdx[x]], cy = crit[cutIdx[y]];
+                    return cx != cy ? cx > cy : x < y;
+                });
+                index(du);
+            }
+            // First every direction at once: own wires for the nets on paths
+            // longer than a threshold, for a spread of thresholds.
+            std::vector<int> levels;
+            for (auto& du : dirs)
+                if (du.shared())
+                    for (int n : *du.nets) levels.push_back(crit[cutIdx[n]]);
+            std::sort(levels.begin(), levels.end(), std::greater<int>());
+            levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+            if (levels.size() > 12) {
+                std::vector<int> some;
+                for (int x = 0; x < 12; x++) some.push_back(levels[x * (levels.size() - 1) / 11]);
+                levels = some;
+            }
+            std::vector<std::vector<int>> tries(levels.size() + 1, direct);
+            for (size_t x = 0; x < levels.size(); x++)
+                for (int di = 0; di < nd; di++) {
+                    auto& du = dirs[di];
+                    if (!du.shared()) continue;
+                    int D = 0;
+                    while (D < (int)du.nets->size() && crit[cutIdx[(*du.nets)[D]]] >= levels[x]) D++;
+                    tries[x][di] = std::min(D, du.maxDirect(board.tdmMax));
+                }
+            std::vector<int> got(tries.size());
+            parallelFor(tries.size(), threads, [&](size_t x) { got[x] = analyze(tries[x], nullptr); });
+            size_t bt = tries.size() - 1;  // as it was, unless something is better
+            for (size_t x = 0; x < levels.size(); x++)
+                if (got[x] < got[bt]) bt = x;
+            direct = tries[bt];
+            int passA = got[bt];
+            // Then one direction at a time, where the design is small enough to afford it.
+            bool fine = cone.size() * (size_t)nd < 4000000;
+            for (int di = 0; di < nd && fine; di++) {
+                auto& du = dirs[di];
+                if (!du.shared()) continue;
+                int top = du.maxDirect(board.tdmMax);
+                std::vector<int> cand;
+                for (int D = 0; D <= top; D = D ? D * 2 : 1) cand.push_back(D);
+                for (int D = top; D > top - 4 && D > 0; D--) cand.push_back(D);
+                std::sort(cand.begin(), cand.end());
+                cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+                std::vector<int> res(cand.size());
+                parallelFor(cand.size(), threads, [&](size_t x) {
+                    auto dd = direct;
+                    dd[di] = cand[x];
+                    res[x] = analyze(dd, nullptr);
+                });
+                size_t bx = 0;
+                for (size_t x = 1; x < cand.size(); x++)
+                    if (res[x] < res[bx]) bx = x;
+                direct[di] = cand[bx];
+                passA = res[bx];
+            }
+            if (passA >= bestA) break;
+            bestA = passA;
+            bestDirect = direct;
+            for (int di = 0; di < nd; di++) bestNets[di] = *dirs[di].nets;
+        }
+        direct = bestDirect;
+        for (int di = 0; di < nd; di++) {
+            *dirs[di].nets = bestNets[di];
+            index(dirs[di]);
+        }
     }
-    for (size_t p = 0; p < d.nl.ports.size(); p++)
-        if (d.nl.ports[p].dir != gnl::Dir::In) maxA = std::max(maxA, arrive(d.nl.ports[p].net, pl.partOfPort(d, (int)p)));
-    pl.B = 1 + maxA;
+    for (int di = 0; di < nd; di++) {
+        auto& du = dirs[di];
+        int r = du.ratio(direct[di]);
+        (du.ab ? du.l->ratioAB : du.l->ratioBA) = r;
+        (du.ab ? du.l->directAB : du.l->directBA) = r > 1 ? direct[di] : 0;
+    }
+    pl.B = 1 + analyze(direct, nullptr);
+}
+
+inline Plan makePlan(const Design& d, const Board& board, const std::vector<int>& fixed, int starts,
+                     int tries, unsigned threads, const std::vector<int>* given = nullptr) {
+    Plan pl;
+    int k = board.k();
+    size_t ni = d.ni();
+    auto t0 = std::chrono::steady_clock::now();
+    auto lap = [&] {
+        auto t1 = std::chrono::steady_clock::now();
+        double s = std::chrono::duration<double>(t1 - t0).count();
+        t0 = t1;
+        return s;
+    };
+    HGraph g = buildGraph(d, fixed);
+    pl.tGraph = lap();
+    Partitioner pt(board);
+    if (k == 1) {
+        pl.part.assign(g.nv, 0);
+        pl.stats.over = pt.overflow(g, pl.part);
+        pl.starts = 1;
+    } else {
+        std::vector<std::vector<int>> parts(starts);
+        std::vector<PartStats> st(starts);
+        parallelFor((size_t)starts, threads, [&](size_t s) { parts[s] = pt.run(g, (int)s + 1, st[s]); });
+        if (given) {  // one more attempt: the other partitioner's, polished
+            if ((int)given->size() != g.nv) throw Error("the partitioner's answer has the wrong number of lines");
+            parts.emplace_back();
+            st.emplace_back();
+            parts.back() = pt.polish(g, *given, st.back());
+            pl.givenCost = st.back().cost;
+            starts++;
+            tries++;
+        }
+        // The attempts, best first: least overflow, then least cost.
+        std::vector<int> rank(starts);
+        for (int s = 0; s < starts; s++) rank[s] = s;
+        std::stable_sort(rank.begin(), rank.end(), [&](int x, int y) {
+            if (std::abs(st[x].over - st[y].over) > 1e-12) return st[x].over < st[y].over;
+            return st[x].cost < st[y].cost;
+        });
+        // The cut is a means: what the user waits for is emu_clk cycles per
+        // delta. Route the few best cuts and keep the fastest of them.
+        std::vector<int> cand;
+        for (int s : rank) {
+            if (std::abs(st[s].over - st[rank[0]].over) > 1e-12 || (int)cand.size() >= tries) break;
+            bool dup = false;
+            for (int c : cand) dup |= parts[c] == parts[s];
+            if (!dup) cand.push_back(s);
+        }
+        pl.tPart = lap();
+        std::vector<Plan> plans(cand.size());
+        std::vector<std::string> errs(cand.size());
+        parallelFor(cand.size(), threads, [&](size_t x) {
+            plans[x].part = parts[cand[x]];
+            plans[x].stats = st[cand[x]];
+            try {
+                routePlan(plans[x], d, board, g, 1, false);
+            } catch (const Error& e) {
+                errs[x] = e.what();
+                if (errs[x].empty()) errs[x] = "error";
+            }
+        });
+        // Sharing the wires out well takes longer: only for the two that
+        // are fastest before it.
+        std::vector<int> byB;
+        for (size_t x = 0; x < cand.size(); x++)
+            if (errs[x].empty()) byB.push_back((int)x);
+        if (byB.empty()) throw Error(errs[0]);
+        std::stable_sort(byB.begin(), byB.end(), [&](int x, int y) { return plans[x].B < plans[y].B; });
+        int best = byB[0];
+        if (plans[best].B > 1) {
+            if (byB.size() > 2) byB.resize(2);
+            for (int x : byB) routePlan(plans[x], d, board, g, threads);
+            if (byB.size() > 1 && plans[byB[1]].B < plans[byB[0]].B) best = byB[1];
+        }
+        double tg = pl.tGraph, tp = pl.tPart, gc = pl.givenCost;
+        pl = std::move(plans[best]);
+        pl.tGraph = tg;
+        pl.tPart = tp;
+        pl.starts = starts - (given ? 1 : 0);
+        pl.givenCost = gc;
+        pl.routed = (int)cand.size();
+        pl.tRoute = lap();
+        return pl;
+    }
+    pl.tPart = lap();
+    routePlan(pl, d, board, g, threads);
     pl.tRoute = lap();
     return pl;
 }
+
 
 }  // namespace emu
