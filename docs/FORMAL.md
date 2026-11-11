@@ -153,6 +153,28 @@ decided" (a bit of a wide counter, say); `-toggle-deep` spends the whole
 `-depth` and PDR budget on each of those. With `-Werror` an unreachable
 target makes the exit status 1.
 
+### Connectivity
+
+`-connect FILE` proves a connectivity specification, the usual check for pad
+multiplexers and top-level wiring. Each line is one connection:
+
+```
+# destination, source [, condition]
+pad,       scan,       test_en
+pad,       uart_tx,    !test_en && mode == 2'd1
+dbg,       core.pc[7:4]
+```
+
+A connection is proven as "in every cycle after the reset, whenever the
+condition holds, destination == source". Names are signals, with or without
+the top's name, and may select bits (`sig[3]`, `sig[7:4]`); both sides must
+have the same width. A condition is terms joined by `&&`, each `name`,
+`!name`, `name == number` or `name != number`. A wrong connection is
+falsified with a trace like any assertion. For each condition there is also
+a cover, `<name>.enabled`: when the condition can never hold (so the
+connection is only proven vacuously) it is listed as unreachable.
+Assumptions in the design apply. An error in the file is a usage error.
+
 ## Other model checkers (AIGER)
 
 `mformal ... -aiger model.aig` writes the model and stops without checking

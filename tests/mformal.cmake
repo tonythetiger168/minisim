@@ -176,3 +176,30 @@ if(out MATCHES "covered" OR EXISTS ${OUT}/toggle.sv)
   message(FATAL_ERROR "toggle.sv: reachable targets must not be listed or traced\n${out}")
 endif()
 run(toggle.sv 1 "-top;toggle;-app;toggle;-Werror")
+
+# -connect: connections proven, a wrong one falsified, a condition that never holds flagged.
+run(connect.sv 1 "-top;connect;-connect;${SRC}/tests/formal/connect.csv")
+expect(connect.sv
+  "assert  connect.2.pad +proven"
+  "assert  connect.3.pad +proven"
+  "assert  connect.4.connect.pad +proven"
+  "assert  connect.5.pad +falsified  at cycle 0"
+  "assert  connect.6.pad\\[7:4\\] +proven"
+  "assert  connect.7.dbg +proven"
+  "cover   connect.8.func.enabled +unreachable"
+  "assert  connect.9.g\\[1\\].u.tx +proven"
+  "assert  connect.10.u_q\\[0\\] +proven"
+  "16 properties: 8 proven, 1 falsified, 5 covered, 1 unreachable, 1 assumed")
+if(out MATCHES "enabled +covered" OR NOT EXISTS ${OUT}/connect.sv/connect.5.pad.vcd OR EXISTS ${OUT}/connect.sv/connect.2.pad.enabled.vcd)
+  message(FATAL_ERROR "connect.sv: only the failing connection is listed with a trace\n${out}")
+endif()
+file(WRITE ${OUT}/bad.csv "pad, nosuch\n")
+execute_process(COMMAND ${MFORMAL} ${SRC}/tests/formal/connect.sv -top connect -connect ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 2 OR NOT err MATCHES "bad.csv:1: no signal named 'nosuch'")
+  message(FATAL_ERROR "connect.sv: a bad specification must be an error\n${rc}\n${err}")
+endif()
+file(WRITE ${OUT}/bad.csv "pad, dbg\n")
+execute_process(COMMAND ${MFORMAL} ${SRC}/tests/formal/connect.sv -top connect -connect ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 2 OR NOT err MATCHES "destination is 8 bits, source is 4")
+  message(FATAL_ERROR "connect.sv: a width mismatch must be an error\n${rc}\n${err}")
+endif()

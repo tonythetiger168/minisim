@@ -34,7 +34,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -315,7 +317,7 @@ struct Property {
     int live = 0;          // the liveness part of `bad`: such a loop closes in this cycle
     int saved = 0;         // the loop's first state has been saved
     std::string skipped;   // not modelled: why
-    bool app = false;      // made by -app, not written in the design
+    int app = 0;           // a coverage target made by an app: 1 -app toggle, 2 a -connect condition
     std::string file;
     int line = 0;
 };
@@ -330,6 +332,7 @@ struct Options {
     std::string outDir = "mformal_out";
     std::string json;
     std::string aiger;   // write the model here and stop
+    std::vector<std::string> connect;   // -connect: connectivity specifications
     bool appToggle = false;   // -app toggle: can every signal bit be 0 and be 1?
     bool toggleDeep = false;  // -app toggle: spend the whole budget on each target
     int toggleMax = 4096;     // -app toggle: skip signals wider than this
@@ -1573,6 +1576,177 @@ struct Model {
         props.push_back(std::move(pr));
     }
 
+    // ---- connectivity (-connect FILE)
+    // One connection per line: "destination, source [, condition]". A name is a
+    // signal (with or without the top's name) and may select bits: sig[3],
+    // sig[7:4]. A condition is terms joined by &&, each term [!]name or
+    // name == number / name != number. '#' starts a comment.
+    struct ConnParser {
+        Model& m;
+        std::string t;
+        size_t p = 0;
+        void ws() { while (p < t.size() && std::isspace((unsigned char)t[p])) p++; }
+        bool eat(const char* w) {
+            ws();
+            size_t n = std::strlen(w);
+            if (t.compare(p, n, w) != 0) return false;
+            p += n;
+            return true;
+        }
+        [[noreturn]] void fail(const std::string& why) { throw std::runtime_error(why + " in '" + t + "'"); }
+        long num() {
+            ws();
+            size_t b = p;
+            while (p < t.size() && std::isdigit((unsigned char)t[p])) p++;
+            if (b == p) fail("a number is expected");
+            return std::stol(t.substr(b, p - b));
+        }
+        // 12, 'h1f, 8'b1010_0000
+        uint64_t literal() {
+            ws();
+            size_t b = p;
+            while (p < t.size() && std::isdigit((unsigned char)t[p])) p++;
+            if (p < t.size() && t[p] == '\'') {
+                p++;
+                if (p < t.size() && (t[p] == 's' || t[p] == 'S')) p++;
+                int base = 0;
+                char c = p < t.size() ? (char)std::tolower((unsigned char)t[p]) : ' ';
+                base = c == 'h' ? 16 : c == 'd' ? 10 : c == 'b' ? 2 : c == 'o' ? 8 : 0;
+                if (!base) fail("a number base (h, d, b, o) is expected");
+                p++;
+                uint64_t v = 0;
+                size_t d0 = p;
+                for (; p < t.size() && (std::isxdigit((unsigned char)t[p]) || t[p] == '_'); p++) {
+                    if (t[p] == '_') continue;
+                    int d = std::isdigit((unsigned char)t[p]) ? t[p] - '0' : std::tolower((unsigned char)t[p]) - 'a' + 10;
+                    if (d >= base) fail("a digit outside the base");
+                    v = v * (uint64_t)base + (uint64_t)d;
+                }
+                if (d0 == p) fail("digits are expected");
+                return v;
+            }
+            if (b == p) fail("a number is expected");
+            return std::stoull(t.substr(b, p - b));
+        }
+        SV ref() {
+            ws();
+            size_t b = p;
+            while (p < t.size() && (std::isalnum((unsigned char)t[p]) || t[p] == '_' || t[p] == '.' || t[p] == '$')) p++;
+            // an index that is part of the name: an array element or a generate block (a.b[2].c, mem[3])
+            std::string name = t.substr(b, p - b);
+            if (name.empty()) fail("a signal name is expected");
+            auto find = [&](const std::string& n) {
+                int sg = m.findSig(n);
+                if (sg < 0 && !m.top.empty() && n.compare(0, m.top.size() + 1, m.top + ".") == 0) sg = m.findSig(n.substr(m.top.size() + 1));
+                return sg;
+            };
+            int sg = find(name);
+            while (p < t.size() && t[p] == '[') {
+                size_t close = t.find(']', p);
+                if (close == std::string::npos) fail("a ']' is missing");
+                size_t q = close + 1, e = q;
+                while (e < t.size() && (std::isalnum((unsigned char)t[e]) || t[e] == '_' || t[e] == '.' || t[e] == '$')) e++;
+                std::string longer = name + t.substr(p, e - p);
+                bool more = e < t.size() && t[e] == '[';
+                if (find(longer) >= 0 || (sg < 0 && (e > q || more))) {
+                    name = longer;
+                    p = e;
+                    sg = find(name);
+                    continue;
+                }
+                break;
+            }
+            if (sg < 0) fail("no signal named '" + name + "'");
+            SV v = m.cur(sg);
+            if (eat("[")) {
+                long hi = num(), lo = hi;
+                if (eat(":")) lo = num();
+                if (!eat("]")) fail("a ']' is missing");
+                if (lo > hi) std::swap(lo, hi);
+                if (hi >= v.w()) fail("a bit select outside '" + name + "'");
+                SV r;
+                for (long i = lo; i <= hi; i++) r.b.push_back(v.b[(size_t)i]);
+                return r;
+            }
+            return v;
+        }
+        int cond() {
+            int c = 1;
+            do {
+                bool neg = eat("!");
+                SV v = ref();
+                int term;
+                if (eat("==") || eat("!=")) {
+                    bool ne = t[p - 2] == '!';
+                    uint64_t k = literal();
+                    term = m.o.eq(v, m.o.konst(k, v.w())) ^ (ne ? 1 : 0);
+                } else {
+                    term = m.o.redOr(v);
+                }
+                c = m.g.And(c, term ^ (neg ? 1 : 0));
+            } while (eat("&&"));
+            return c;
+        }
+        void end() {
+            ws();
+            if (p != t.size()) fail("unexpected text");
+        }
+    };
+    void addConnectivity(const std::string& file) {
+        std::ifstream in(file);
+        if (!in) throw std::runtime_error("cannot read " + file);
+        std::string line;
+        for (int ln = 1; std::getline(in, line); ln++) {
+            if (auto h = line.find('#'); h != std::string::npos) line.erase(h);
+            if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+            std::vector<std::string> f;
+            std::stringstream ss(line);
+            for (std::string x; std::getline(ss, x, ',');) f.push_back(x);
+            std::string where = file + ":" + std::to_string(ln) + ": ";
+            if (f.size() < 2 || f.size() > 3) throw std::runtime_error(where + "expected 'destination, source [, condition]'");
+            try {
+                ConnParser pd{*this, f[0]}, ps{*this, f[1]};
+                SV d = pd.ref(), sr = ps.ref();
+                pd.end();
+                ps.end();
+                if (d.w() != sr.w())
+                    throw std::runtime_error("destination is " + std::to_string(d.w()) + " bits, source is " + std::to_string(sr.w()));
+                int c = 1;
+                if (f.size() == 3) {
+                    ConnParser pc{*this, f[2]};
+                    c = pc.cond();
+                    pc.end();
+                }
+                auto trim = [](std::string x) {
+                    x.erase(0, x.find_first_not_of(" \t\r"));
+                    x.erase(x.find_last_not_of(" \t\r") + 1);
+                    return x;
+                };
+                Property pr;
+                pr.name = "connect." + std::to_string(ln) + "." + trim(f[0]);
+                pr.dir = AD_ASSERT;
+                pr.file = file;
+                pr.line = ln;
+                pr.bad = g.And(startLit, g.And(c, o.eq(d, sr) ^ 1));
+                props.push_back(pr);
+                if (f.size() == 3) {   // a connection whose condition never holds is checked vacuously
+                    Property en;
+                    en.name = pr.name + ".enabled";
+                    en.dir = AD_COVER;
+                    en.app = 2;
+                    en.file = file;
+                    en.line = ln;
+                    en.bad = g.And(startLit, c);
+                    props.push_back(en);
+                }
+            } catch (const Unsupported& u) {
+                throw std::runtime_error(where + u.what());
+            } catch (const std::runtime_error& e) {
+                throw std::runtime_error(where + e.what());
+            }
+        }
+    }
+
     // -app toggle (unreachable coverage): two covers per signal bit, "is 0" and
     // "is 1" in some cycle after the reset. An unreachable one is a bit that is
     // stuck, so toggle coverage on it can never close in simulation.
@@ -1597,7 +1771,7 @@ struct Model {
                     Property pr;
                     pr.name = (top.empty() ? "" : top + ".") + n + (v.w() > 1 ? "[" + std::to_string(b) + "]" : "") + (val ? "==1" : "==0");
                     pr.dir = AD_COVER;
-                    pr.app = true;
+                    pr.app = 1;
                     pr.bad = g.And(startLit, v.b[(size_t)b] ^ (val ? 0 : 1));
                     props.push_back(std::move(pr));
                 }
@@ -1652,6 +1826,7 @@ struct Model {
             try { cur((int)s); } catch (const Unsupported&) {}
         }
         if (opt.appToggle) addToggleTargets();
+        for (auto& f : opt.connect) addConnectivity(f);
         closeStates();
         std::sort(props.begin(), props.end(), [](const Property& a, const Property& b) { return a.name < b.name; });
     }
@@ -2473,6 +2648,8 @@ void usage() {
                  "  -app toggle       unreachable coverage: report every signal bit that can never be 0\n"
                  "                    or never be 1 after the reset (-toggle-max N: skip wider signals;\n"
                  "                    -toggle-deep: the whole -depth and PDR budget per target)\n"
+                 "  -connect FILE     connectivity check: each line 'destination, source [, condition]' is\n"
+                 "                    proven as: whenever the condition holds, destination == source\n"
                  "  -aiger FILE       write the model as AIGER 1.9 (.aig binary, else ASCII) for another\n"
                  "                    model checker, and stop without checking\n"
                  "  -Werror           exit non-zero also for unreachable covers and inconclusive results\n"
@@ -2529,6 +2706,7 @@ int main(int argc, char** argv) {
             else { std::cerr << "mformal: unknown app '" << app << "' (apps: toggle)\n"; return 2; }
             continue;
         }
+        if (a == "-connect") { opt.connect.push_back(next("a file name")); continue; }
         if (a == "-toggle-deep") { opt.toggleDeep = true; continue; }
         if (a == "-toggle-max") { opt.toggleMax = std::atoi(next("a number").c_str()); continue; }
         if (a == "-aiger") { opt.aiger = next("a file name"); continue; }
@@ -2773,13 +2951,10 @@ int main(int argc, char** argv) {
     for (size_t i : todo) {
         const Property& p = m.props[i];
         const Result& r = results[i];
-        if (p.app) {
-            appCount[r.v]++;
-            if (r.v == V_COVERED && !opt.verbose) continue;
-        } else {
-            count[r.v]++;
-        }
-        const char* kind = p.app ? "toggle" : p.dir == AD_COVER ? "cover " : p.dir == AD_ASSUME ? "assume" : "assert";
+        if (p.app == 1) appCount[r.v]++;
+        else count[r.v]++;
+        if (p.app && r.v == V_COVERED && !opt.verbose) continue;
+        const char* kind = p.app == 1 ? "toggle" : p.dir == AD_COVER ? "cover " : p.dir == AD_ASSUME ? "assume" : "assert";
         std::cout << "  " << kind << "  " << p.name << std::string(nameW - p.name.size() + 2, ' ') << vname[r.v];
         switch (r.v) {
             case V_PROVEN: case V_UNREACHABLE:
@@ -2834,7 +3009,7 @@ int main(int argc, char** argv) {
         for (size_t k = 0; k < todo.size(); k++) {
             const Property& p = m.props[todo[k]];
             const Result& r = results[todo[k]];
-            js << "    {\"name\": " << jsonStr(p.name) << ", \"kind\": " << jsonStr(p.app ? "toggle" : p.dir == AD_COVER ? "cover" : p.dir == AD_ASSUME ? "assume" : "assert")
+            js << "    {\"name\": " << jsonStr(p.name) << ", \"kind\": " << jsonStr(p.app == 1 ? "toggle" : p.dir == AD_COVER ? "cover" : p.dir == AD_ASSUME ? "assume" : "assert")
                << ", \"result\": " << jsonStr(vname[r.v]);
             if (r.depth >= 0) js << ", \"cycle\": " << r.depth;
             if (r.v == V_BOUNDED || r.v == V_INCONCLUSIVE) js << ", \"bound\": " << r.bound;
