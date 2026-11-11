@@ -220,6 +220,11 @@ Spec references are IEEE 1800-2023 clauses.
   function templates, default arguments, overloads, static members, scoped
   enums, namespaces, and whatever the design uses from its headers
   (`std::min`, `std::max` included). `-emit-c` shows the reduction.
+- `mhls -clang`: inheritance. A base class is the first member of the
+  derived struct; base constructors, inherited and hidden members, several
+  bases, template bases and objects passed as their base all work. Classes
+  whose only constructor is the implicit one now run their members'
+  constructors. Virtual functions in a hierarchy are refused.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
