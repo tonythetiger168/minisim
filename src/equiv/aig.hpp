@@ -75,6 +75,47 @@ public:
     }
     template<typename Map>
     Lit rebuildSparse(Lit root, Map& memo) { return aig::rebuildSparse(graph, root, memo); }
+
+    // n is xnor(a, b) in the shape xor_ builds: !(a & !b) & !(!a & b).
+    bool isXnor(uint32_t n, Lit& a, Lit& b) const {
+        if (!isAnd(n)) return false;
+        const Node& nd = node(n);
+        if (!isNeg(nd.a) || !isNeg(nd.b) || !isAnd(nodeOf(nd.a)) || !isAnd(nodeOf(nd.b))) return false;
+        const Node& p = node(nodeOf(nd.a));
+        const Node& q = node(nodeOf(nd.b));
+        if ((p.a == neg(q.a) && p.b == neg(q.b)) || (p.a == neg(q.b) && p.b == neg(q.a))) {
+            a = p.a;
+            b = neg(p.b);
+            return true;
+        }
+        return false;
+    }
+    // rebuildSparse that puts every xor back through xor_, so that a cone with
+    // some variables fixed gets the same shape as logic built that way from
+    // the start (the polarity of an xor's operands decides how it is stored).
+    template<typename Map>
+    Lit cofactor(Lit root, Map& memo) {
+        uint32_t rn = nodeOf(root);
+        if (rn == 0) return root;
+        std::vector<uint32_t> st{rn};
+        auto get = [&](Lit l) { return nodeOf(l) ? memo.find(nodeOf(l))->second ^ (l & 1u) : l; };
+        while (!st.empty()) {
+            uint32_t n = st.back();
+            if (memo.count(n)) { st.pop_back(); continue; }
+            if (!isAnd(n)) { memo[n] = n * 2; st.pop_back(); continue; }
+            Lit a, b;
+            bool x = isXnor(n, a, b);
+            if (!x) a = node(n).a, b = node(n).b;
+            bool ready = true;
+            for (Lit f : {a, b})
+                if (nodeOf(f) && !memo.count(nodeOf(f))) { st.push_back(nodeOf(f)); ready = false; }
+            if (!ready) continue;
+            Lit r = x ? neg(xor_(get(a), get(b))) : and_(get(a), get(b));
+            memo[n] = r;
+            st.pop_back();
+        }
+        return memo[rn] ^ (root & 1u);
+    }
 };
 
 }  // namespace equiv

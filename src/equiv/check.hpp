@@ -22,6 +22,7 @@
 // the thread count.
 #include <algorithm>
 #include <set>
+#include <unordered_set>
 #include "../parallel.hpp"
 #include <map>
 #include <string>
@@ -55,6 +56,9 @@ struct CheckOptions {
     unsigned simRounds = 8;         // 64 patterns each
     uint64_t sweepEffort = 300;     // SAT conflicts per internal equivalence tried
     std::vector<std::pair<std::string, std::string>> matches;  // ref name, impl name
+    uint64_t splitEffort = 20000;   // SAT conflicts per case of a case split
+    unsigned splitDepth = 3;        // variables a hard point is split on
+    bool induction = true;          // prove failing points by induction over the reset state
     bool constRegs = true;          // read unmatched reference flops stuck at their reset value as that value
 };
 
@@ -63,6 +67,8 @@ struct Result {
     std::vector<std::string> refOnlyInputs, implOnlyInputs, refOnlyOutputs, implOnlyOutputs;
     std::vector<std::string> refOnlyStates, implOnlyStates;
     size_t matchedInputs = 0, matchedStates = 0, matchedOutputs = 0, invertedStates = 0;
+    size_t inductive = 0;          // points that hold in every state reachable after 'inductionReset'
+    std::string inductionReset;    // e.g. rst_n=0
     std::vector<std::string> constStates;  // reference flops read as a constant (CheckOptions::constRegs)
     size_t passed = 0, failed = 0, aborted = 0;
     size_t merged = 0;  // internal nodes SAT sweeping proved equal
@@ -271,6 +277,77 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
 }  // namespace detail
 
 namespace detail {
+
+// The free variable in the cone of 'root' that most shrinks the cone when it
+// is fixed: a hard miter is usually two datapaths that become the same logic
+// once a select between them is decided (an isolated operand, a bypass).
+inline uint32_t splitVar(Aig& g, Lit root, size_t slack) {
+    // Candidates: the variables with the most fanout in the cone, and the few
+    // variables behind the internal nodes with the most fanout (a select such
+    // as !rst && en is one node that every bit of an operand goes through).
+    std::unordered_map<uint32_t, uint32_t> fan;
+    std::unordered_set<uint32_t> seen;
+    std::vector<uint32_t> st{nodeOf(root)};
+    while (!st.empty()) {
+        uint32_t n = st.back();
+        st.pop_back();
+        if (n == 0 || !seen.insert(n).second) continue;
+        if (!g.isAnd(n)) continue;
+        for (Lit f : {g.node(n).a, g.node(n).b}) {
+            if (nodeOf(f)) ++fan[nodeOf(f)];
+            st.push_back(nodeOf(f));
+        }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> vars, ands;  // fanout, node
+    for (auto& [n, f] : fan) (g.isAnd(n) ? ands : vars).push_back({f, n});
+    auto byFan = [](auto& a, auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; };
+    std::sort(vars.begin(), vars.end(), byFan);
+    std::sort(ands.begin(), ands.end(), byFan);
+    if (vars.size() > 8) vars.resize(8);
+    if (ands.size() > 8) ands.resize(8);
+    std::vector<uint32_t> cand;
+    auto addCand = [&](uint32_t n) { if (std::find(cand.begin(), cand.end(), n) == cand.end()) cand.push_back(n); };
+    for (auto& [f, n] : vars) addCand(n);
+    for (auto& [f, n] : ands) {
+        std::vector<uint32_t> sup, todo{n};
+        std::unordered_set<uint32_t> in;
+        while (!todo.empty() && sup.size() <= 4 && in.size() < 64) {
+            uint32_t m = todo.back();
+            todo.pop_back();
+            if (m == 0 || !in.insert(m).second) continue;
+            if (!g.isAnd(m)) { sup.push_back(m); continue; }
+            todo.push_back(nodeOf(g.node(m).a));
+            todo.push_back(nodeOf(g.node(m).b));
+        }
+        if (todo.empty() && sup.size() <= 4) for (uint32_t v : sup) addCand(v);
+    }
+    auto coneSize = [&](Lit r) {
+        std::unordered_set<uint32_t> in;
+        std::vector<uint32_t> s2{nodeOf(r)};
+        while (!s2.empty()) {
+            uint32_t n = s2.back();
+            s2.pop_back();
+            if (n == 0 || !g.isAnd(n) || !in.insert(n).second) continue;
+            s2.push_back(nodeOf(g.node(n).a));
+            s2.push_back(nodeOf(g.node(n).b));
+        }
+        return in.size();
+    };
+    uint32_t best = 0;
+    // Worth it only when the two cases together are under slack/10 of the cone
+    // (20: any gain at all; less: only a variable that removes real work).
+    size_t bestSize = coneSize(root) * slack / 10;
+    for (uint32_t n : cand) {
+        size_t sz = 0;
+        for (Lit v : {kFalse, kTrue}) {
+            std::unordered_map<uint32_t, Lit> m{{n, v}};
+            sz += coneSize(g.cofactor(root, m));
+        }
+        if (sz < bestSize) bestSize = sz, best = n;
+    }
+    return best;
+}
+
 // One pass with a given polarity for every matched register: `flips` names
 // the implementation states to take with the opposite polarity from what the
 // names suggest.
@@ -413,21 +490,21 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
     // The same goes for a flop that only ever loads one constant (taken as
     // clocked once) and one that is never given a definite value at all.
     std::unordered_map<uint32_t, Lit> konst;
-    if (opt.constRegs) {
-        auto orTerms = [&](Lit root) {
-            std::vector<Lit> out, todo{root};
-            while (!todo.empty()) {
-                Lit l = todo.back();
-                todo.pop_back();
-                if (isNeg(l) && g.isAnd(nodeOf(l))) {
-                    todo.push_back(neg(g.node(nodeOf(l)).a));
-                    todo.push_back(neg(g.node(nodeOf(l)).b));
-                } else {
-                    out.push_back(l);
-                }
+    auto orTerms = [&](Lit root) {
+        std::vector<Lit> out, todo{root};
+        while (!todo.empty()) {
+            Lit l = todo.back();
+            todo.pop_back();
+            if (isNeg(l) && g.isAnd(nodeOf(l))) {
+                todo.push_back(neg(g.node(nodeOf(l)).a));
+                todo.push_back(neg(g.node(nodeOf(l)).b));
+            } else {
+                out.push_back(l);
             }
-            return out;
-        };
+        }
+        return out;
+    };
+    if (opt.constRegs) {
         // The value the flop takes under 'term', if that is a constant.
         auto under = [&](const State& st, Lit term, std::unordered_map<uint32_t, Lit> m) -> Lit {
             if (nodeOf(term) == 0) return kNoLit;
@@ -650,10 +727,62 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
             }
         });
     };
+    // First split on the variables that decide between datapaths.
+    // Serial, because the cases are new logic in the shared graph.
+    size_t splitSlack = 13;
+    std::function<int(Point&, Lit, unsigned, std::vector<std::pair<uint32_t, bool>>&, uint32_t)> split =
+        [&](Point& p, Lit m, unsigned depth, std::vector<std::pair<uint32_t, bool>>& path, uint32_t hint) -> int {
+        if (m == kFalse) return 0;
+        if (!path.empty()) {
+            Cnf cnf(g);
+            // Inner cases get a glance; the full effort goes to the last ones.
+            int r = cnf.solve(m, depth ? std::min<uint64_t>(opt.splitEffort, 300) : opt.splitEffort);
+            p.conflicts += cnf.sat.conflicts();
+            if (r == 1)
+                finishCex(p, [&](uint32_t n) {
+                    for (auto& [v, b] : path) if (v == n) return b;
+                    return cnf.model(n);
+                });
+            if (r >= 0) return r;
+        }
+        if (depth == 0) return -1;
+        uint32_t v = hint ? hint : detail::splitVar(g, m, splitSlack);
+        if (!v) return -1;
+        int all = 0;
+        for (bool b : {false, true}) {
+            std::unordered_map<uint32_t, Lit> fix{{v, b ? kTrue : kFalse}};
+            path.push_back({v, b});
+            int r = split(p, g.cofactor(m, fix), depth - 1, path, 0);
+            path.pop_back();
+            if (r == 1) return 1;
+            if (r < 0) all = -1;
+        }
+        return all;
+    };
     uint64_t quick = std::min<uint64_t>(opt.effort, 2000);
     satPass(quick, quick == opt.effort, "sat");
     bool anyOpen = false;
     for (char o : open) anyOpen |= bool(o);
+    if (anyOpen && quick < opt.effort) {
+        // Open points tend to be the bits of one bus: when a few in a row have
+        // no variable worth splitting on, the rest will not either.
+        unsigned dry = 0;
+        for (size_t k = 0; k < res.points.size() && opt.splitDepth && dry < 8; ++k) {
+            if (!open[k]) continue;
+            Point& p = res.points[k];
+            uint32_t v = detail::splitVar(g, p.miter, splitSlack);
+            if (!v) { ++dry; continue; }
+            dry = 0;
+            std::vector<std::pair<uint32_t, bool>> path;
+            int r = split(p, p.miter, opt.splitDepth, path, v);
+            if (r < 0) continue;
+            open[k] = 0;
+            p.how = "case split";
+            p.status = r == 0 ? Point::Pass : Point::Fail;
+        }
+        anyOpen = false;
+        for (char o : open) anyOpen |= bool(o);
+    }
     if (anyOpen && quick < opt.effort) {
         // The hard points are datapaths built differently on the two sides.
         // Find internal nodes that are equal, merge them, and try again.
@@ -670,6 +799,192 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
             }
         satPass(opt.effort, true, "sweep+sat");
     }
+
+    // ---- induction
+    // A point that fails for some state may still hold in every state the
+    // design can reach: the implementation has state of its own (a flop that
+    // remembers that nothing changed, and gates a clock with it) and the
+    // failing states are ones where that flop is wrong about the rest. Take
+    // "no failing point fails" as the invariant J(state, inputs) and show
+    //   step: J(s, in) and J(s, in') imply J(s', in') for s' after any one
+    //         event (a clock edge, an asynchronous set or reset) with inputs in;
+    //   base: J holds, from any state, after one event with some input held
+    //         at one value: the reset.
+    // Matched registers are one variable, moved by the implementation's
+    // next-state function; the points that pass say that is the reference's
+    // too. Events are taken one at a time.
+    [&] {
+        if (!opt.induction || impl.states.size() == res.matchedStates) return;
+        std::vector<size_t> F;
+        for (size_t k = 0; k < res.points.size(); ++k) {
+            const Point& p = res.points[k];
+            if (p.status == Point::Abort) return;
+            if (p.status != Point::Fail) continue;
+            if (!p.note.empty() || p.kind == Point::Trigger) return;
+            F.push_back(k);
+        }
+        if (F.empty()) return;
+        struct Flop {
+            uint32_t var;
+            Bit next;
+            std::vector<Lit> terms;
+        };
+        std::vector<Flop> flops;
+        std::unordered_set<uint32_t> stateVars;
+        for (size_t i = 0; i < impl.states.size(); ++i) {
+            const State& is = impl.states[i];
+            uint32_t var = stMap[i] >= 0 ? nodeOf(ref.states[stMap[i]].q) : nodeOf(is.q);
+            stateVars.insert(var);
+            if (is.latch) continue;  // left free
+            Bit nx = move(is.next), tr = move(is.trig);
+            if (stMap[i] >= 0 && stInv[i]) nx.v = neg(nx.v);
+            if (nx.x != kFalse || tr.x != kFalse) continue;
+            flops.push_back({var, nx, orTerms(tr.v)});
+        }
+        for (size_t r = 0; r < ref.states.size(); ++r) {
+            const State& rs = ref.states[r];
+            if (refSt[r] || konst.count(nodeOf(rs.q))) continue;
+            stateVars.insert(nodeOf(rs.q));
+            Bit nx = fold(rs.next), tr = fold(rs.trig);
+            if (rs.latch || nx.x != kFalse || tr.x != kFalse) continue;
+            flops.push_back({nodeOf(rs.q), nx, orTerms(tr.v)});
+        }
+        std::vector<Lit> events;
+        for (auto& f : flops)
+            for (Lit t : f.terms)
+                if (std::find(events.begin(), events.end(), t) == events.end()) events.push_back(t);
+        if (events.empty() || events.size() > 16) return;
+        std::unordered_map<uint32_t, Lit> fresh;
+        std::unordered_set<uint32_t> flopVars;
+        for (auto& f : flops) flopVars.insert(f.var);
+        // The reset after which the points F hold for good, or "".
+        auto prove = [&](const std::vector<size_t>& F) -> std::string {
+        Lit M = kFalse;
+        for (size_t k : F) M = g.or_(M, res.points[k].miter);
+        // Fresh inputs for the step after: every free variable that is not a flop.
+        auto freshen = [&](Lit root) {
+            std::vector<uint32_t> st{nodeOf(root)};
+            std::unordered_set<uint32_t> seen;
+            while (!st.empty()) {
+                uint32_t n = st.back();
+                st.pop_back();
+                if (!n || !seen.insert(n).second) continue;
+                if (g.isAnd(n)) { st.push_back(nodeOf(g.node(n).a)); st.push_back(nodeOf(g.node(n).b)); continue; }
+                bool isFlop = false;
+                for (auto& f : flops) isFlop |= f.var == n;
+                if (!isFlop && !fresh.count(n)) fresh[n] = g.input();
+            }
+        };
+        freshen(M);
+        // The state after event 'ev' (with 'forced' also held), as a substitution.
+        auto after = [&](Lit ev, Lit forced) {
+            std::unordered_map<uint32_t, Lit> fix;
+            for (Lit l : {ev, forced})
+                if (nodeOf(l) && !g.isAnd(nodeOf(l)) && !flopVars.count(nodeOf(l))) fix[nodeOf(l)] = isNeg(l) ? kFalse : kTrue;
+            std::unordered_map<uint32_t, Lit> sub = fresh;
+            for (auto& f : flops) {
+                if (std::find(f.terms.begin(), f.terms.end(), ev) == f.terms.end()) continue;
+                auto m = fix;
+                sub[f.var] = g.cofactor(f.next.v, m);
+            }
+            return std::pair{sub, fix};
+        };
+        auto holds = [&](Lit bad) {  // 'bad' cannot be true
+            if (bad == kFalse) return true;
+            Cnf cnf(g);
+            if (cnf.solve(bad, opt.splitEffort) == 0) return true;
+            Point scratch;
+            std::vector<std::pair<uint32_t, bool>> path;
+            splitSlack = 20;  // one query decides many points: any split that helps
+            return split(scratch, bad, opt.splitDepth, path, 0) == 0;
+        };
+        auto Jnext = fresh;
+        Lit hypNext = neg(g.cofactor(M, Jnext));  // J(s, in')
+        for (Lit ev : events) {
+            auto [sub, fix] = after(ev, kFalse);
+            Lit hyp = g.and_(neg(g.cofactor(M, fix)), hypNext);
+            if (!holds(g.and_(hyp, g.cofactor(M, sub)))) return {};
+        }
+        // Base: an asynchronous event first, then an input held through a clock edge.
+        auto name = [&](Lit l) {
+            auto it = varName.find(nodeOf(l));
+            return (it == varName.end() ? std::string("?") : it->second) + (isNeg(l) ? "=0" : "=1");
+        };
+        std::string reset;
+        for (Lit ev : events) {
+            if (!reset.empty()) break;
+            if (g.isAnd(nodeOf(ev)) || flopVars.count(nodeOf(ev))) continue;
+            auto [sub, fix] = after(ev, kFalse);
+            if (holds(g.cofactor(M, sub))) reset = name(ev);
+        }
+        if (reset.empty()) {
+            std::vector<uint32_t> ins;
+            for (auto& [n, l] : fresh) if (!stateVars.count(n)) ins.push_back(n);
+            std::sort(ins.begin(), ins.end());
+            if (ins.size() > 64) ins.resize(64);
+            for (Lit ev : events)
+                for (uint32_t n : ins)
+                    for (Lit l : {Lit(n * 2 + 1), Lit(n * 2)}) {
+                        if (!reset.empty() || nodeOf(ev) == n) continue;
+                        auto [sub, fix] = after(ev, l);
+                        if (holds(g.cofactor(M, sub))) reset = name(l);
+                    }
+        }
+        return reset;
+        };
+        // Points that share implementation-only state share an invariant; the
+        // rest are proved apart, each from its own reset. If that leaves any,
+        // try them all as one.
+        std::unordered_set<uint32_t> own;
+        for (uint32_t v : stateVars) own.insert(v);
+        for (size_t i = 0; i < impl.states.size(); ++i)
+            if (stMap[i] >= 0) own.erase(nodeOf(ref.states[stMap[i]].q));
+        std::map<uint32_t, uint32_t> parent;
+        std::function<uint32_t(uint32_t)> find = [&](uint32_t x) {
+            auto it = parent.find(x);
+            if (it == parent.end() || it->second == x) return x;
+            return it->second = find(it->second);
+        };
+        std::vector<uint32_t> first(F.size(), 0);
+        for (size_t j = 0; j < F.size(); ++j) {
+            std::vector<uint32_t> st{nodeOf(res.points[F[j]].miter)};
+            std::unordered_set<uint32_t> seen;
+            while (!st.empty()) {
+                uint32_t n = st.back();
+                st.pop_back();
+                if (!n || !seen.insert(n).second) continue;
+                if (g.isAnd(n)) { st.push_back(nodeOf(g.node(n).a)); st.push_back(nodeOf(g.node(n).b)); continue; }
+                if (!own.count(n)) continue;
+                parent.emplace(n, n);
+                if (first[j]) parent[find(n)] = find(first[j]);
+                else first[j] = n;
+            }
+        }
+        std::map<uint32_t, std::vector<size_t>> groups;
+        for (size_t j = 0; j < F.size(); ++j) groups[first[j] ? find(first[j]) : 0].push_back(F[j]);
+        std::vector<std::string> resets;
+        auto accept = [&](const std::vector<size_t>& pts, const std::string& reset) {
+            if (std::find(resets.begin(), resets.end(), reset) == resets.end()) resets.push_back(reset);
+            res.inductive += pts.size();
+            for (size_t k : pts) {
+                Point& p = res.points[k];
+                p.status = Point::Pass;
+                p.how = "induction";
+                p.cex.clear();
+            }
+        };
+        std::vector<size_t> left;
+        for (auto& [root, pts] : groups) {
+            std::string reset = root ? prove(pts) : std::string();
+            if (!reset.empty()) accept(pts, reset);
+            else left.insert(left.end(), pts.begin(), pts.end());
+        }
+        if (!left.empty() && groups.size() > 1 && left.size() == F.size()) {
+            std::string reset = prove(F);
+            if (!reset.empty()) accept(F, reset);
+        }
+        for (auto& r : resets) res.inductionReset += (res.inductionReset.empty() ? "" : ", ") + r;
+    }();
 
     for (auto& p : res.points) {
         if (p.status == Point::Pass) ++res.passed;

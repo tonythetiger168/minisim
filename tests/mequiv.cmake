@@ -102,3 +102,18 @@ check(1 "Unmatched reference state: 5" -noconstreg -ref stuck.sv -impl stuck.sv 
 check(0 "5 reference flops read as a constant" -ref dontcare.sv -impl dontcare.sv +define+FOLDED)
 check(1 "Verification FAILED" -ref dontcare.sv -impl dontcare.sv +define+FOLDED +define+BUG)
 check(1 "latch" -nofullcase -ref dontcare.sv -impl dontcare.sv +define+FOLDED)
+
+# Clock gates: an enable that folds to a constant, and a gate on a gated clock.
+check(0 "16 flops are behind clock gates" -ref cgconst.sv -impl cgconst_gated.sv)
+check(0 "Verification SUCCEEDED" -ref cgnest.sv -impl cgnest.sv +define+NEST)
+check(1 "Verification FAILED" -ref cgnest.sv -impl cgnest.sv +define+NEST +define+BUG)
+
+# Operand isolation of a multiplier: proved by splitting on the select.
+check(0 "Verification SUCCEEDED" -ref isomul.sv -impl isomul.sv +define+ISO)
+check(1 "Verification FAILED" -ref isomul.sv -impl isomul.sv +define+ISO +define+BUG)
+
+# Sequential clock gating: equal in every state reachable after reset, by induction.
+check(0 "16 of the passing points hold by induction" -ref seqgate.sv -impl seqgate.sv +define+GATED)
+check(1 "Verification FAILED" -noinduction -ref seqgate.sv -impl seqgate.sv +define+GATED)
+check(1 "Verification FAILED" -ref seqgate.sv -impl seqgate.sv +define+GATED +define+BUG_STUCK)
+check(1 "Verification FAILED" -ref seqgate.sv -impl seqgate.sv +define+GATED +define+BUG_EARLY)

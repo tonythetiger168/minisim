@@ -1858,37 +1858,55 @@ private:
     // gating mode) lets a gated netlist match RTL written with `if (en)`, and
     // the other way round. The pattern is confirmed by proof, not by shape.
     void absorbClockGates() {
-        std::unordered_map<uint32_t, size_t> latchByOut;
+        // A latch is found in a trigger by its output or, where the gate's AND
+        // has swallowed the transparent half (clk & (!clk | q) is clk & q, which
+        // is all that is left of a gate whose enable is a constant), by its
+        // stored value.
+        std::unordered_map<uint32_t, size_t> latchByOut, latchByQ;
         for (size_t i = 0; i < d.states.size(); ++i) {
             const State& l = d.states[i];
-            if (l.latch && l.next.x == kFalse && g.isAnd(nodeOf(l.next.v))) latchByOut[nodeOf(l.next.v)] = i;
+            if (!l.latch || l.next.x != kFalse) continue;
+            if (g.isAnd(nodeOf(l.next.v))) latchByOut[nodeOf(l.next.v)] = i;
+            latchByQ[nodeOf(l.q)] = i;
         }
-        if (latchByOut.empty()) return;
+        if (latchByQ.empty()) return;
         struct Gate {
             bool ok = false;
             Lit clk = kFalse, en = kFalse;
+            Lit root = kFalse;  // the clock input, as the literal that is true while it is high
         };
         std::unordered_map<Lit, Gate> cache;
-        auto analyze = [&](Lit t) {
+        std::function<Gate(Lit, size_t, bool, int)> attempt;
+        std::function<Gate(Lit, int)> analyze = [&](Lit t, int depth) {
             Gate gate;
-            // The latch output nearest the trigger.
+            // The latch nearest the trigger, by its output and by its stored value.
             std::vector<uint32_t> st{nodeOf(t)};
             std::unordered_set<uint32_t> seen;
-            size_t li = SIZE_MAX;
-            while (!st.empty() && seen.size() < 256 && li == SIZE_MAX) {
+            size_t liOut = SIZE_MAX, liQ = SIZE_MAX;
+            while (!st.empty() && seen.size() < 256) {
                 uint32_t n = st.back();
                 st.pop_back();
                 if (!n || !seen.insert(n).second) continue;
                 auto it = latchByOut.find(n);
-                if (it != latchByOut.end()) { li = it->second; break; }
+                if (it != latchByOut.end() && liOut == SIZE_MAX) liOut = it->second;
+                it = latchByQ.find(n);
+                if (it != latchByQ.end()) { if (liQ == SIZE_MAX) liQ = it->second; continue; }
                 if (g.isAnd(n)) st.push_back(nodeOf(g.node(n).a)), st.push_back(nodeOf(g.node(n).b));
             }
-            if (li == SIZE_MAX) return gate;
+            if (liOut != SIZE_MAX) gate = attempt(t, liOut, true, depth);
+            if (!gate.ok && liQ != SIZE_MAX) gate = attempt(t, liQ, false, depth);
+            return gate;
+        };
+        attempt = [&](Lit t, size_t li, bool byOut, int depth) {
+            Gate gate;
+            std::vector<uint32_t> st;
+            std::unordered_set<uint32_t> seen;
             const State& l = d.states[li];
             Lit e = l.next.v;
+            Lit key = byOut ? e : l.q;  // what the trigger sees of the latch
             std::unordered_map<uint32_t, Lit> e0, e1, q0, q1;
-            e0[nodeOf(e)] = isNeg(e) ? kTrue : kFalse;
-            e1[nodeOf(e)] = isNeg(e) ? kFalse : kTrue;
+            e0[nodeOf(key)] = isNeg(key) ? kTrue : kFalse;
+            e1[nodeOf(key)] = isNeg(key) ? kFalse : kTrue;
             // t = rest | (clk & E): E only ever raises the trigger, and only
             // matters while the latch is closed (clock high), where it holds.
             Lit t0 = g.rebuildSparse(t, e0), t1 = g.rebuildSparse(t, e1);
@@ -1923,15 +1941,32 @@ private:
                     low[v] = isNeg(c) ? kTrue : kFalse;  // c == 0
                     gate.ok = true;
                     gate.clk = t1;
+                    gate.root = c;
                     // Triggers that do not pass the gate (an async reset) load regardless.
                     gate.en = g.or_(t0, g.rebuildSparse(n0, low));
                 }
+            if (gate.ok || depth >= 8) return gate;
+            // A gate on a gated clock: the latch closes on the gated clock, not
+            // on an input. Read the clock it gates first. Every latch in the
+            // chain is transparent while the root clock is low, so the flop
+            // loads when all the enables seen there are set.
+            Gate sub = analyze(t1, depth + 1);
+            if (!sub.ok) return gate;
+            Lit rootLow = neg(sub.root);
+            Lit shut = g.and_(closed, rootLow);  // closed while the root clock is low?
+            if (shut != kFalse && cnf.solve(shut, 100000) != 0) return gate;
+            std::unordered_map<uint32_t, Lit> low;
+            low[nodeOf(sub.root)] = isNeg(sub.root) ? kTrue : kFalse;
+            gate.ok = true;
+            gate.clk = sub.clk;
+            gate.root = sub.root;
+            gate.en = g.or_(t0, g.and_(sub.en, g.rebuildSparse(n0, low)));
             return gate;
         };
         for (State& f : d.states) {
             if (f.latch || f.trig.x != kFalse || !g.isAnd(nodeOf(f.trig.v))) continue;
             auto it = cache.find(f.trig.v);
-            if (it == cache.end()) it = cache.emplace(f.trig.v, analyze(f.trig.v)).first;
+            if (it == cache.end()) it = cache.emplace(f.trig.v, analyze(f.trig.v, 0)).first;
             if (!it->second.ok) continue;
             f.trig = {it->second.clk, kFalse};
             f.next = bv.mux(Bit{it->second.en, kFalse}, f.next, Bit{f.q, kFalse});

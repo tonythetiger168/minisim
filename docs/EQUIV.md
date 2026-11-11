@@ -117,6 +117,11 @@ plain clock with the latch's enable as a load enable. An asynchronous reset
 still acts regardless of the enable. `-noclockgate` turns this off, and then
 gated and ungated flops differ at their clock point.
 
+A gate on an already gated clock is read through the whole chain: every latch
+in it is transparent while the root clock is low, so the flop loads when all
+the enables are set. A gate whose enable folds to a constant is the plain
+clock (1) or a flop that never loads (0).
+
 ## Speed and threads
 
 Reading the two designs runs on two threads; SAT runs on all logical cores
@@ -136,6 +141,7 @@ thread count.
 | `-blackbox MOD` | do not look inside MOD |
 | `-noclockgate` | compare gated clocks as they are, without turning them into enables |
 | `-nofullcase` | ignore `(* full_case *)`: a case with no matching arm keeps the old value |
+| `-noinduction` | compare in every state, not only the states reachable after reset |
 | `-noconstreg` | do not read a reference flop that can hold only one value as a constant |
 | `-threads N` | worker threads (default: all logical cores) |
 | `-effort N` | SAT conflicts allowed per compare point (default 2000000) |
@@ -182,7 +188,9 @@ under a second.
 ## Not yet
 
 - Sequential UDPs and Liberty `statetable` cells.
-- Retimed or merged registers; sequential equivalence (k-induction).
+- Retimed or merged registers. Sequential differences are proved only in the
+  form described under "Induction over the reset state" (one step, state
+  matched by name).
 - Tri-state buses and inout ports.
 
 ## The pieces
@@ -227,3 +235,36 @@ don't-cares there instead of holding their old value (which in a combinational
 block would be a latch). `-nofullcase` gives the plain Verilog reading back.
 PicoRV32 synthesized by msynth on mini45 proves equivalent with these readings
 (3553 compare points, about 0.3 s).
+
+### Case splitting
+
+Operand isolation puts `en ? a : 0` in front of a multiplier whose result is
+only used when `en` is set. The two multipliers have different operands and no
+internal node in common, which neither SAT nor sweeping gets through. A point
+still open after the quick SAT pass is split on up to three variables, chosen
+as the ones that shrink its cone most when fixed (the select, a reset); with
+them fixed the two sides are the same logic and hash together. A 24-bit
+isolated multiplier takes about a second this way.
+
+### Induction over the reset state
+
+Sequential clock gating adds state of its own: a flop that remembers that a
+pipeline stage's inputs did not change, used to gate the next stage's clock.
+The gated design equals the original only in states where that flop is right
+about the rest, so a state-by-state comparison finds failing points, with the
+added flop in the counterexample.
+
+When the implementation has state the reference does not and points fail,
+mequiv takes "none of these points fails" as an invariant J and shows two
+things. Step: if J holds in a state, it holds after any one event (a clock
+edge, an asynchronous set or reset) from that state. Base: J holds, from any
+state at all, after one event with some input held at one value, which it
+reports as the reset (`rst_n=0`). Then the points hold in every state the
+design can be in after a reset, and they are counted as passing with a line
+that says how many and after which reset. Points that do not share added state
+are proved apart, each from its own reset.
+
+What this assumes: the design is reset before it is used, and events come one
+at a time (two clocks do not tick in the same instant). `-noinduction` turns
+it off and shows the points as failing. mpopt's sequential clock gates prove
+this way (its `pipe` test: 80 of 875 points, about 2 s).
