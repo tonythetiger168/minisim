@@ -252,3 +252,18 @@ expect(trig.sv
   "cover   trig.c_two +covered  at cycle 4")
 replay(trig.sv trig.a_bad 35)
 replay(trig.sv trig.a_seq_bad 45)
+
+# Asynchronous set / reset act in the same cycle; a latch holds its value.
+run(arst.sv 1 "-top;arst;-tb")
+expect(arst.sv
+  "assert  arst.a_clr +proven"
+  "assert  arst.a_cnt +proven"
+  "assert  arst.a_hold +proven"
+  "assert  arst.a_hold_bad +falsified"
+  "assert  arst.a_load +proven"
+  "assert  arst.a_load_bad +falsified  at cycle 1"
+  "assert  arst.a_open +proven"
+  "assert  arst.a_set +proven"
+  "8 properties: 6 proven, 2 falsified")
+replay(arst.sv arst.a_load_bad 25)
+replay(arst.sv arst.a_hold_bad 15)
