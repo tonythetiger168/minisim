@@ -271,6 +271,12 @@ Spec references are IEEE 1800-2023 clauses.
   constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
   ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
   See `docs/SYNTH.md`.
+- RTL to logic (`src/aig_elab.hpp`, used by `msynth`, `mequiv`, `mformal`,
+  `mfpga`, `meco`): a `case` whose items cannot match together (`unique
+  case`, `parallel_case`, distinct constant labels) is built without
+  priority among the items. PicoRV32 on mini45 with `msynth`: 17534 to
+  17377 (high effort 16997), critical path 1.11 to 0.99; the ALU test
+  design: 4734 to 4449.
 - `msynth`: a register's hold condition is gathered out of its if/case
   tree into one enable, and the held leaves leave the data logic
   (`set msynth_hold_enables false` skips it). PicoRV32 on mini45: 18096 to
