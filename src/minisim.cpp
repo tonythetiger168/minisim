@@ -848,6 +848,11 @@ struct Sim {
         // Only a waveform (or coverage) watches a quiet signal: compare, store
         // and record the change. A full set() would also queue the domain's
         // comb pass and scan for waiters, which made -vcd runs 20x slower.
+        // Most writes of a comb pass store what is already there.
+        if (g.w <= 64 && g.val.hi.empty() && !g_cov) {
+            uint64_t m = mask(g.w);
+            if ((in.v & m) == g.val.v && (in.x & m) == g.val.x && (in.z & m) == g.val.z && in.real == g.val.real && in.str == g.val.str) return;
+        }
         bool waveOnly = !mon.on && !g.fl;
         if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) {
 #ifdef MSIM_FWSTAT
