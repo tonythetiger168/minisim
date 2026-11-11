@@ -130,7 +130,9 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 20.6.1 | $typename | ✅ | built-in, packed, enum, struct, array, class and string types, with the 20.6.1 spacing rules. `20.6.1-typename` |
 | 20.6.2 | $bits | ✅ | of any fixed-size expression or type |
 | 20.7 | Array query functions | ✅ | `$dimensions`, `$unpacked_dimensions`, `$left`, `$right`, `$low`, `$high`, `$increment`, `$size` of fixed, dynamic, queue and associative dimensions and of integer types; a run-time dimension number; out of range gives 'x. `7.11-array-query`, `20.7-array-query-dynamic` |
-| 20.17 | $system | ✅ | runs the command in a shell; the result is its exit status. `20.17-system` |
+| 20.15 | Stochastic analysis tasks | ✅ | `$q_initialize`, `$q_add`, `$q_remove`, `$q_full`, `$q_exam`: FIFO and LIFO queues, the status codes of Table 20-11 and the six statistics of Table 20-10 (times in the caller's time unit). `20.15-stochastic-queues` |
+| 20.16 | PLA modeling tasks | ✅ | all 16 `$async$...` / `$sync$...` tasks: and, or, nand, nor logic in `array` and `plane` format; async tasks re-evaluate when an input term or a personality word changes. `20.16-pla-tasks` |
+| 20.17 | $system, $stacktrace | ✅ | `$system` runs the command in a shell; the result is its exit status. `$stacktrace` prints the scope of the call (the format is tool-defined). `20.17-system`, `20.17-stacktrace` |
 | 21.7.1 | VCD tasks | ✅ | `$dumpfile`, `$dumpvars` (levels, scopes and variables), `$dumpoff`, `$dumpon`, `$dumpall`, `$dumpflush`, `$dumplimit`; also on FST. `msim -vcd` dumps every signal instead of the `$dumpvars` selection. `21.7-vcd-tasks` |
 | 21.7.3 | Extended VCD ($dumpports) | ❌ | skipped with a warning |
 | 22.7 | `` `timescale `` | ✅ | per-module unit and precision; an element with none, in a design where others have one, gets 1ns/1ps (3.14.2.3; `--timescale` changes it); one kernel tick is the finest precision in the design, also used as the VCD `$timescale`. `22.7-timescale` |
