@@ -138,3 +138,11 @@ must print the same lines. This is done with the default library and with a
 library of only an inverter, a NAND and one flop. Each netlist on the default library is
 also proven equivalent to its RTL with `mequiv`, and a netlist with one gate
 swapped must be reported as different.
+
+### The shell as a header
+
+The shell itself is `src/synth/shell.hpp` (`synth::Shell`); `src/msynth.cpp`
+is only the command line. A tool that wants the same shell with more
+commands includes the header, creates a `Shell`, and adds its commands
+with `sh.cmd(name, help, fn)`; `sh.des`, `sh.nl`, `sh.lib` and
+`sh.needNetlist()` give it the design, the mapped netlist and the library.
