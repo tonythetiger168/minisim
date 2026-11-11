@@ -125,6 +125,9 @@ Spec references are IEEE 1800-2023 clauses.
   source, drivers and loads, schematic, waves with values annotated in the
   source). `-vcd` reads VCD and FST; the page traces the active driver at the
   cursor itself. See `docs/DEBUG.md`.
+- `mrcx -corner NAME`: several extraction corners in one run. The options after a
+  `-corner` (`-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale`) are that corner's; the
+  design is read once and each corner goes to `design.NAME.spef`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
   coupling capacitance to same-layer neighbours (who also take over part of
@@ -132,7 +135,8 @@ Spec references are IEEE 1800-2023 clauses.
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
-  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  count. `ETCH` on a conductor gives the width as made. `src/spef.hpp` is the
+  SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
 - `mchar`, cell library characterization on `mspice`: from a Liberty
   template and one transistor `.subckt` per cell it measures delay and

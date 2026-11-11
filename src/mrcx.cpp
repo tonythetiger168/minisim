@@ -2,6 +2,8 @@
 //
 //   mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef
 //   mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o slow.spef
+//   mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef \
+//        -corner cmax -itf cmax.itf -temp 125 -corner cmin -itf cmin.itf -temp -40
 //
 // The LEF/DEF readers are src/lef.hpp and src/def.hpp (shared with the other
 // physical tools); the extraction itself is src/rcx.hpp. This file turns the
@@ -26,6 +28,23 @@ struct Args {
     bool werror = false, quiet = false, nameMap = true;
 };
 
+// One extraction corner: a process file and the values that go with it.
+struct Corner {
+    std::string name, itf;
+    rcx::Options opt;
+};
+
+// design.spef -> design.cmax.spef
+std::string cornerPath(const std::string& path, const std::string& corner) {
+    if (corner.empty()) return path;
+    size_t slash = path.find_last_of("/\\");
+    size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash) || dot == 0 ||
+        (slash != std::string::npos && dot == slash + 1))
+        return path + "." + corner;
+    return path.substr(0, dot) + "." + corner + path.substr(dot);
+}
+
 void usage() {
     std::cout <<
         "mrcx - parasitic RC extraction: routed DEF + LEF in, SPEF out\n"
@@ -41,6 +60,10 @@ void usage() {
         "  -rscale F          multiply every resistance\n"
         "  -cscale F          multiply every capacitance\n"
         "  -ccscale F         multiply coupling capacitance only\n"
+        "  -corner NAME       start a corner: the -itf, -temp, -rscale, -cscale and -ccscale after it\n"
+        "                     belong to it (those before the first -corner are every corner's\n"
+        "                     defaults). The design is read once and each corner is written to\n"
+        "                     its own file, design.NAME.spef (and report.NAME.txt)\n"
         "  -no_coupling       ground every coupling capacitance (decoupled SPEF)\n"
         "  -cc_factor F       with -no_coupling or below the threshold: grounded value = F x coupling (default 1)\n"
         "  -cc_threshold FF   ground a coupling capacitance smaller than this many fF\n"
@@ -256,6 +279,7 @@ double secondsSince(std::chrono::steady_clock::time_point t) {
 
 int main(int argc, char** argv) {
     Args a;
+    std::vector<Corner> corners;
     std::string date;
     unsigned threadsOpt = 0;
     try {
@@ -279,14 +303,25 @@ int main(int argc, char** argv) {
             }
             else if (s == "-lef") a.lefs.push_back(val());
             else if (s == "-def") a.def = val();
-            else if (s == "-itf") a.itf = val();
+            else if (s == "-corner") {
+                Corner c;
+                c.name = val();
+                if (c.name.empty() || c.name.find_first_of("/\\ \t") != std::string::npos)
+                    throw std::runtime_error("-corner: '" + c.name + "' is not a usable name");
+                for (auto& o : corners)
+                    if (o.name == c.name) throw std::runtime_error("-corner " + c.name + " is given twice");
+                c.itf = a.itf;
+                c.opt = a.opt;
+                corners.push_back(std::move(c));
+            }
+            else if (s == "-itf") (corners.empty() ? a.itf : corners.back().itf) = val();
             else if (s == "-map") a.map = val();
             else if (s == "-o") a.out = val();
             else if (s == "-report") a.report = val();
-            else if (s == "-temp") { a.opt.temp = numv(); a.opt.tempGiven = true; }
-            else if (s == "-rscale") a.opt.rscale = numv();
-            else if (s == "-cscale") a.opt.cscale = numv();
-            else if (s == "-ccscale") a.opt.ccscale = numv();
+            else if (s == "-temp") { rcx::Options& o = corners.empty() ? a.opt : corners.back().opt; o.temp = numv(); o.tempGiven = true; }
+            else if (s == "-rscale") (corners.empty() ? a.opt : corners.back().opt).rscale = numv();
+            else if (s == "-cscale") (corners.empty() ? a.opt : corners.back().opt).cscale = numv();
+            else if (s == "-ccscale") (corners.empty() ? a.opt : corners.back().opt).ccscale = numv();
             else if (s == "-no_coupling") a.opt.coupled = false;
             else if (s == "-cc_factor") a.opt.ccFactor = numv();
             else if (s == "-cc_threshold") a.opt.ccThreshold = numv();
@@ -305,6 +340,16 @@ int main(int argc, char** argv) {
         }
         int threads = a.opt.threads > 0 ? a.opt.threads : static_cast<int>(par::defaultThreads());
         a.opt.threads = threads;
+        // Without -corner there is one unnamed corner. What is not a corner's own
+        // (coupling, segment length, threads) is the same in all of them.
+        const bool named = !corners.empty();
+        if (!named) corners.push_back({"", a.itf, a.opt});
+        for (auto& c : corners) {
+            rcx::Options o = a.opt;
+            o.temp = c.opt.temp; o.tempGiven = c.opt.tempGiven;
+            o.rscale = c.opt.rscale; o.cscale = c.opt.cscale; o.ccscale = c.opt.ccscale;
+            c.opt = o;
+        }
 
         auto t0 = std::chrono::steady_clock::now();
         phys::Tech tech;
@@ -319,8 +364,6 @@ int main(int argc, char** argv) {
         std::vector<std::string> warnings;
         auto t1 = std::chrono::steady_clock::now();
         rcx::Layout L = toLayout(tech, design, threads, warnings);
-        rcx::Stack itf;
-        if (!a.itf.empty()) itf = rcx::Stack::parseItf(slurp(a.itf), a.itf);
         std::map<std::string, std::string> map;
         if (!a.map.empty()) {
             std::istringstream in(slurp(a.map));
@@ -331,14 +374,30 @@ int main(int argc, char** argv) {
                 if (ls >> x >> y) map[x] = y;
             }
         }
-        rcx::Stack stack = rcx::makeStack(L, a.itf.empty() ? nullptr : &itf, map);
-        rcx::Result R = rcx::extract(L, stack, a.opt);
-        double tExtract = secondsSince(t1);
+        double tLayout = secondsSince(t1);
+        if (a.out.empty()) a.out = L.design + ".spef";
+        // Every process file is read before any extraction, so a mistake in the
+        // last corner's file does not cost the time of the corners before it.
+        std::vector<rcx::Stack> stacks;
+        for (auto& c : corners) {
+            rcx::Stack itf;
+            if (!c.itf.empty()) itf = rcx::Stack::parseItf(slurp(c.itf), c.itf);
+            stacks.push_back(rcx::makeStack(L, c.itf.empty() ? nullptr : &itf, map));
+        }
+        for (auto& w : warnings) std::cerr << "mrcx: warning: " << w << "\n";
+        warnings.clear();
+        bool bad = false;
+      for (size_t ci = 0; ci < corners.size(); ci++) {
+        const Corner& cn = corners[ci];
+        const rcx::Stack& stack = stacks[ci];
+        const std::string outPath = cornerPath(a.out, cn.name);
+        auto t1c = std::chrono::steady_clock::now();
+        rcx::Result R = rcx::extract(L, stack, cn.opt);
+        double tExtract = secondsSince(t1c) + (ci == 0 ? tLayout : 0);
 
         auto t2 = std::chrono::steady_clock::now();
-        if (a.out.empty()) a.out = L.design + ".spef";
-        std::FILE* f = std::fopen(a.out.c_str(), "wb");
-        if (!f) throw std::runtime_error("cannot write " + a.out);
+        std::FILE* f = std::fopen(outPath.c_str(), "wb");
+        if (!f) throw std::runtime_error("cannot write " + outPath);
         std::vector<char> big(1 << 20);
         std::setvbuf(f, big.data(), _IOFBF, big.size());
         rcx::SpefOptions so;
@@ -350,7 +409,7 @@ int main(int argc, char** argv) {
         std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", std::gmtime(&now));
         so.date = date.empty() ? stamp : date;
         rcx::writeSpef(f, L, R, so);
-        if (std::fclose(f) != 0) throw std::runtime_error("error writing " + a.out);
+        if (std::fclose(f) != 0) throw std::runtime_error("error writing " + outPath);
         double tWrite = secondsSince(t2);
 
         // Totals.
@@ -366,29 +425,32 @@ int main(int argc, char** argv) {
                 else opens++;
             }
         }
-        for (auto& w : R.warnings) warnings.push_back(w);
-        for (auto& w : warnings) std::cerr << "mrcx: warning: " << w << "\n";
-        int shown = 0;
+        // Opens and shorts are the layout's, the same in every corner: say them once.
+        if (ci == 0)
+            for (auto& w : R.warnings) std::cerr << "mrcx: warning: " << w << "\n";
+        int shown = ci == 0 ? 0 : 1 << 30;
         for (size_t i = 0; i < L.nets.size(); i++) {
             if (L.nets[i].power || !R.nets[i].opens || (L.nets[i].wires.empty() && L.nets[i].vias.empty())) continue;
             if (shown++ < 10)
                 std::cerr << "mrcx: open: net " << L.nets[i].name << " is in " << R.nets[i].opens + 1
                           << " parts that the routing does not join\n";
         }
-        if (shown > 10) std::cerr << "mrcx: ... and " << shown - 10 << " more open nets\n";
-        shown = 0;
+        if (ci == 0 && shown > 10) std::cerr << "mrcx: ... and " << shown - 10 << " more open nets\n";
+        shown = ci == 0 ? 0 : 1 << 30;
         for (auto& s : R.shorts)
             if (shown++ < 10)
                 std::cerr << "mrcx: short: nets " << L.nets[static_cast<size_t>(s.netA)].name << " and "
                           << L.nets[static_cast<size_t>(s.netB)].name << " overlap on "
                           << L.layers[static_cast<size_t>(s.layer)].name << " at ("
                           << static_cast<double>(s.where.x0) / L.dbu << ", " << static_cast<double>(s.where.y0) / L.dbu << ")\n";
-        if (shown > 10) std::cerr << "mrcx: ... and " << shown - 10 << " more shorts\n";
+        if (ci == 0 && shown > 10) std::cerr << "mrcx: ... and " << shown - 10 << " more shorts\n";
 
         if (!a.report.empty()) {
-            std::ofstream rp(a.report);
-            if (!rp) throw std::runtime_error("cannot write " + a.report);
-            rp << "# mrcx report for " << L.design << " (" << stack.name << " stack, " << R.temp << " C)\n";
+            const std::string rpPath = cornerPath(a.report, cn.name);
+            std::ofstream rp(rpPath);
+            if (!rp) throw std::runtime_error("cannot write " + rpPath);
+            rp << "# mrcx report for " << L.design << " (" << (named ? "corner " + cn.name + ", " : std::string())
+               << stack.name << " stack, " << R.temp << " C)\n";
             rp << "# layer  wire length um\n";
             for (size_t l = 0; l < L.layers.size(); l++) rp << "#   " << L.layers[l].name << "  " << R.layerLen[l] << "\n";
             rp << "# net  length_um  res_ohm  cap_ground_fF  cap_coupling_fF  cap_total_fF  nodes  open_parts\n";
@@ -402,17 +464,23 @@ int main(int argc, char** argv) {
             }
         }
         if (!a.quiet) {
-            std::printf("mrcx: %s: %zu nets, %.1f um of wire, %zu nodes, %zu resistors, %zu coupling capacitors\n",
-                        L.design.c_str(), nets, len, nodes, res, ccs / 2);
+            if (ci == 0)
+                std::printf("mrcx: %s: %zu nets, %.1f um of wire, %zu nodes, %zu resistors, %zu coupling capacitors\n",
+                            L.design.c_str(), nets, len, nodes, res, ccs / 2);
+            if (named) std::printf("mrcx: corner %s\n", cn.name.c_str());
             std::printf("mrcx: capacitance %.4g fF to ground, %.4g fF between nets (%s stack, %g C)\n", cg, cc / 2,
                         stack.name.c_str(), R.temp);
-            if (opens || unrouted || !R.shorts.empty())
+            if (ci == 0 && (opens || unrouted || !R.shorts.empty()))
                 std::printf("mrcx: %zu open nets, %zu unrouted nets, %zu shorts\n", opens, unrouted, R.shorts.size());
-            std::printf("mrcx: wrote %s (read %.2f s, extract %.2f s, write %.2f s, %d threads)\n", a.out.c_str(),
-                        tRead, tExtract, tWrite, threads);
+            if (ci == 0)
+                std::printf("mrcx: wrote %s (read %.2f s, extract %.2f s, write %.2f s, %d threads)\n",
+                            outPath.c_str(), tRead, tExtract, tWrite, threads);
+            else
+                std::printf("mrcx: wrote %s (extract %.2f s, write %.2f s)\n", outPath.c_str(), tExtract, tWrite);
         }
-        if (a.werror && (opens || !R.shorts.empty())) return 1;
-        return 0;
+        if (opens || !R.shorts.empty()) bad = true;
+      }
+        return a.werror && bad ? 1 : 0;
     } catch (const std::exception& e) {
         std::cerr << "mrcx: error: " << e.what() << "\n";
         return 2;
