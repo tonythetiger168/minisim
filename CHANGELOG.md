@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
+  `q[3:0]`) follows only that part: its value, the time those bits last
+  changed, and the assignments that write them. The viewer page does the same.
 - `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
   elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
   the default waveform is unchanged. `mdebug -active` follows a memory read
