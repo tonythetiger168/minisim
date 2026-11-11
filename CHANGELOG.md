@@ -15,6 +15,12 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
+  built from the spare cells of the old netlist and the cells the change
+  frees, by function (the same cell, or one with inputs tied or shared, or
+  the inverse plus a spare inverter); no cell is added or removed, and the
+  script holds only net connections. Exit status 3 when a cell had to be
+  added after all. See `docs/ECO.md`.
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
   changed, and the assignments that write them. The viewer page does the same.
