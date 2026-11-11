@@ -74,14 +74,24 @@ struct Gate {
 struct FlopCell {
     const liberty::Cell* cell = nullptr;
     int d = -1, ck = -1, q = -1, clr = -1, pre = -1;
-    bool negClk = false, clrLow = false, preLow = false;
+    int en = -1;              // enable flops: next state = en ? d : q
+    bool negClk = false, clrLow = false, preLow = false, enLow = false;
     double area = 0;
+};
+
+// A 2:1 or 4:1 multiplexer cell, by pin index: out = d[{s1, s0}].
+struct MuxCell {
+    const liberty::Cell* cell = nullptr;
+    int d[4] = {-1, -1, -1, -1}, s0 = -1, s1 = -1, out = -1;
 };
 
 struct LibInfo {
     std::vector<std::shared_ptr<liberty::Library>> libs;
+    std::map<const liberty::Cell*, MuxCell> mux2s;   // every 2:1 mux cell
+    MuxCell mux4;                                    // the smallest 4:1 mux, if any
     std::vector<Gate> gates;
     std::vector<FlopCell> flops;
+    std::vector<FlopCell> enFlops;   // flops with a load enable and no async control
     int inv = -1, buf = -1, tie0 = -1, tie1 = -1;
     std::set<std::string> dontUse;
     struct M {
@@ -110,6 +120,69 @@ struct LibInfo {
         var = p->var;
         return true;
     }
+    // Is the gate a multiplexer (3 inputs: 2:1, 6 inputs: 4:1)? Finds the roles of its pins.
+    static bool asMuxCell(const Gate& gt, MuxCell& m) {
+        int n = (int)gt.in.size(), nd = n == 3 ? 2 : 4, ns = n - nd;
+        std::vector<int> pi(n);
+        for (int i = 0; i < n; i++) pi[i] = i;
+        do {   // pi[0..nd-1]: data inputs, then the selects (s0 first)
+            bool ok = true;
+            for (int v = 0; v < (1 << n) && ok; v++) {
+                int sel = 0;
+                for (int k = 0; k < ns; k++) sel |= ((v >> pi[nd + k]) & 1) << k;
+                ok = ((gt.tt >> v) & 1) == (uint64_t)((v >> pi[sel]) & 1);
+            }
+            if (!ok) continue;
+            m.cell = gt.cell;
+            m.out = gt.out;
+            for (int k = 0; k < nd; k++) m.d[k] = gt.in[pi[k]];
+            m.s0 = gt.in[pi[nd]];
+            m.s1 = ns > 1 ? gt.in[pi[nd + 1]] : -1;
+            return true;
+        } while (std::next_permutation(pi.begin(), pi.end()));
+        return false;
+    }
+    // A flop whose next state is `E ? D : IQ` (either polarity of E), with
+    // exactly D, E and the clock as inputs.
+    static bool enableFlop(const liberty::Cell& c, FlopCell& f) {
+        const auto& ff = c.ffs[0];
+        if (!ff.clear.empty() || !ff.preset.empty()) return false;
+        std::string v;
+        bool neg;
+        if (!simpleVar(ff.clockedOn, v, neg)) return false;
+        int ck = pinIndex(c, v);
+        std::vector<int> ins;
+        int q = -1;
+        for (size_t i = 0; i < c.pins.size(); i++) {
+            if (c.pins[i].dir == liberty::Dir::In && (int)i != ck) ins.push_back((int)i);
+            if (c.pins[i].dir == liberty::Dir::Out && c.pins[i].function == ff.iq) q = (int)i;
+        }
+        if (ck < 0 || q < 0 || ins.size() != 2) return false;
+        liberty::Expr e = liberty::parseFunction(ff.nextState);
+        for (int sw = 0; sw < 2; sw++)
+            for (int low = 0; low < 2; low++) {
+                int dp = ins[sw], ep = ins[!sw];
+                bool ok = true;
+                for (int m = 0; m < 8 && ok; m++) {
+                    bool dv = m & 1, ev = m & 2, qv = m & 4;
+                    bool r = e.eval([&](const std::string& n) {
+                        if (n == c.pins[dp].name) return dv;
+                        if (n == c.pins[ep].name) return ev;
+                        return qv;
+                    });
+                    ok = r == ((ev != (bool)low) ? dv : qv);
+                }
+                if (!ok) continue;
+                f.d = dp;
+                f.en = ep;
+                f.enLow = low;
+                f.ck = ck;
+                f.q = q;
+                f.negClk = neg;
+                return true;
+            }
+        return false;
+    }
     static int pinIndex(const liberty::Cell& c, const std::string& n) {
         for (size_t i = 0; i < c.pins.size(); i++)
             if (c.pins[i].name == n) return (int)i;
@@ -119,6 +192,9 @@ struct LibInfo {
     void build() {
         gates.clear();
         flops.clear();
+        enFlops.clear();
+        mux2s.clear();
+        mux4 = MuxCell{};
         inv = buf = tie0 = tie1 = -1;
         // nominal load: a few inverter inputs
         for (auto& l : libs)
@@ -134,6 +210,10 @@ struct LibInfo {
                     std::string v;
                     bool neg;
                     try {
+                        if (enableFlop(c, f)) {
+                            enFlops.push_back(f);
+                            continue;
+                        }
                         if (!simpleVar(ff.nextState, v, neg) || neg) continue;
                         f.d = pinIndex(c, v);
                         if (!simpleVar(ff.clockedOn, v, neg)) continue;
@@ -180,7 +260,7 @@ struct LibInfo {
                     } else
                         ok = false;
                 }
-                if (!ok || outs != 1 || gt.in.size() > 4) continue;
+                if (!ok || outs != 1 || (gt.in.size() > 4 && gt.in.size() != 6)) continue;
                 std::vector<std::string> names;
                 for (int i : gt.in) names.push_back(c.pins[i].name);
                 try {
@@ -193,6 +273,14 @@ struct LibInfo {
                 } catch (liberty::Error&) {
                     continue;
                 }
+                if (gt.in.size() == 3 || gt.in.size() == 6) {
+                    MuxCell m;
+                    if (asMuxCell(gt, m)) {
+                        if (gt.in.size() == 3) mux2s[&c] = m;
+                        else if (!mux4.cell || c.area < mux4.cell->area) mux4 = m;
+                    }
+                }
+                if (gt.in.size() > 4) continue;
                 gates.push_back(gt);
             }
         // nominal figures
@@ -295,6 +383,69 @@ inline std::string bitName(const std::string& port, int msb, int lsb, size_t i, 
 }
 
 // ------------------------------------------------------------ the mapper
+
+// Two 2:1 muxes on the same select that feed only a third become one 4:1
+// mux, where the library has one that is smaller than the three. The
+// mapper's cuts stop at 4 inputs, so wide selects (memories, case
+// statements) get their 4:1 cells here. Returns the number of cells made.
+inline size_t mergeMux4(Netlist& nl, const LibInfo& lib) {
+    if (!lib.mux4.cell || lib.mux2s.empty()) return 0;
+    std::vector<int> uses(nl.nets.size(), 0), driver(nl.nets.size(), -1);
+    std::vector<const MuxCell*> m2(nl.insts.size(), nullptr);
+    for (size_t i = 0; i < nl.insts.size(); i++) {
+        const Inst& in = nl.insts[i];
+        auto it = in.seq ? lib.mux2s.end() : lib.mux2s.find(in.cell);
+        if (it != lib.mux2s.end()) m2[i] = &it->second;
+        for (size_t p = 0; p < in.pins.size(); p++) {
+            if (in.pins[p] < 0) continue;
+            if (in.cell->pins[p].dir == liberty::Dir::Out) driver[in.pins[p]] = (int)i;
+            else uses[in.pins[p]]++;
+        }
+    }
+    for (auto& pb : nl.ports)
+        if (pb.out)
+            for (int n : pb.nets) uses[n] += 2;
+    for (auto& a : nl.assigns) uses[a.second] += 2;
+    const MuxCell& m4 = lib.mux4;
+    std::vector<uint8_t> dead(nl.insts.size(), 0);
+    size_t made = 0;
+    for (size_t i = 0; i < nl.insts.size(); i++) {
+        const MuxCell* top = m2[i];
+        if (!top) continue;
+        Inst& in = nl.insts[i];
+        int n0 = in.pins[top->d[0]], n1 = in.pins[top->d[1]];
+        if (n0 < 2 || n1 < 2 || n0 == n1 || uses[n0] != 1 || uses[n1] != 1) continue;
+        int a = driver[n0], b = driver[n1];
+        if (a < 0 || b < 0 || !m2[a] || !m2[b] || dead[a] || dead[b]) continue;
+        const Inst& ia = nl.insts[a];
+        const Inst& ib = nl.insts[b];
+        if (ia.pins[m2[a]->s0] != ib.pins[m2[b]->s0]) continue;
+        if (m4.cell->area >= in.cell->area + ia.cell->area + ib.cell->area) continue;
+        std::vector<int> pins(m4.cell->pins.size(), -1);
+        pins[m4.d[0]] = ia.pins[m2[a]->d[0]];
+        pins[m4.d[1]] = ia.pins[m2[a]->d[1]];
+        pins[m4.d[2]] = ib.pins[m2[b]->d[0]];
+        pins[m4.d[3]] = ib.pins[m2[b]->d[1]];
+        pins[m4.s0] = ia.pins[m2[a]->s0];
+        pins[m4.s1] = in.pins[top->s0];
+        pins[m4.out] = in.pins[top->out];
+        in.cell = m4.cell;
+        in.pins = std::move(pins);
+        m2[i] = nullptr;
+        dead[a] = dead[b] = 1;
+        made++;
+    }
+    if (made) {
+        size_t w = 0;
+        for (size_t i = 0; i < nl.insts.size(); i++)
+            if (!dead[i]) {
+                if (w != i) nl.insts[w] = std::move(nl.insts[i]);
+                w++;
+            }
+        nl.insts.resize(w);
+    }
+    return made;
+}
 
 class Mapper {
     const Design& d;
@@ -480,8 +631,11 @@ public:
         for (auto& p : d.ports)
             if (p.out)
                 for (Lit b : p.bits) fanout[lnode(b)] += 1;
-        for (auto& f : g.flops) {
-            fanout[lnode(f.d)] += 1;
+        planEnables();
+        for (size_t i = 0; i < g.flops.size(); i++) {
+            const Flop& f = g.flops[i];
+            fanout[lnode(fd[i])] += 1;
+            if (fen[i] != NOLIT) fanout[lnode(fen[i])] += 1;
             fanout[lnode(f.clk)] += 1;
             if (f.arst != NOLIT) fanout[lnode(f.arst)] += 1;
         }
@@ -514,6 +668,43 @@ public:
     }
 
 private:
+    // Per flop: the data input to build, and the enable when the flop goes
+    // onto an enable cell (its hold mux is then inside the cell).
+    std::vector<Lit> fd, fen;
+    std::vector<const FlopCell*> fcell;
+    void planEnables() {
+        size_t F = g.flops.size();
+        fd.resize(F);
+        fen.assign(F, NOLIT);
+        fcell.assign(F, nullptr);
+        for (size_t i = 0; i < F; i++) {
+            const Flop& f = g.flops[i];
+            fd[i] = f.d;
+            if (f.arst != NOLIT || lib.enFlops.empty()) continue;
+            Lit en, data;
+            if (!flopEnable(g, f, en, data)) continue;
+            const FlopCell* plain = pickFlop(f.negedge, false, false);
+            const FlopCell* bestE = nullptr;
+            for (auto& c : lib.enFlops)
+                if (c.negClk == f.negedge && (!bestE || c.area < bestE->area)) bestE = &c;
+            if (!bestE) continue;
+            // worth it when the cell costs less than a plain flop and a mux
+            double mux = muxArea();
+            if (plain && bestE->area >= plain->area + mux) continue;
+            fcell[i] = bestE;
+            fd[i] = data;
+            fen[i] = lxorc(en, bestE->enLow);
+        }
+    }
+    double muxArea() const {
+        double a = 1e30;
+        for (auto& gt : lib.gates)
+            if (gt.in.size() == 3)
+                for (unsigned t : {0xCAu, 0xACu, 0xD8u, 0xE4u, 0xB8u, 0xE2u})
+                    if ((gt.tt & 0xFF) == t) a = std::min(a, gt.area);
+        if (a > 1e29) a = 3 * lib.gates[lib.inv].area;
+        return a;
+    }
     const FlopCell* pickFlop(bool neg, bool clr, bool pre) const {
         const FlopCell* bestF = nullptr;
         for (auto& f : lib.flops) {
@@ -559,10 +750,12 @@ private:
         };
         std::vector<FlopPlan> plans;
         int tmp = 0;
-        for (auto& f : g.flops) {
+        for (size_t fi = 0; fi < g.flops.size(); fi++) {
+            const Flop& f = g.flops[fi];
             bool hasR = f.arst != NOLIT;
             bool wantClr = hasR && !f.rval, wantPre = hasR && f.rval;
             FlopPlan pl{};
+            pl.fc = fcell[fi];
             for (int tryInvClk = 0; tryInvClk < 2 && !pl.fc; tryInvClk++) {
                 bool neg = f.negedge ^ (tryInvClk == 1);
                 pl.invClk = tryInvClk == 1;
@@ -591,7 +784,8 @@ private:
             pl.inst = (int)nl.insts.size();
             nl.insts.push_back(std::move(in));
             plans.push_back(pl);
-            need(lxorc(f.d, pl.invD));
+            need(lxorc(fd[fi], pl.invD));
+            need(fen[fi]);
             need(lxorc(f.clk, pl.invClk));
             if (hasR) {
                 bool low = pl.invD ? (wantClr ? pl.fc->preLow : pl.fc->clrLow) : (wantClr ? pl.fc->clrLow : pl.fc->preLow);
@@ -653,7 +847,8 @@ private:
             const Flop& f = g.flops[i];
             const FlopPlan& pl = plans[i];
             Inst& in = nl.insts[pl.inst];
-            in.pins[pl.fc->d] = netOf(lxorc(f.d, pl.invD));
+            in.pins[pl.fc->d] = netOf(lxorc(fd[i], pl.invD));
+            if (pl.fc->en >= 0) in.pins[pl.fc->en] = netOf(fen[i]);
             in.pins[pl.fc->ck] = netOf(lxorc(f.clk, pl.invClk));
             bool hasR = f.arst != NOLIT;
             bool wantClr = hasR && !f.rval;

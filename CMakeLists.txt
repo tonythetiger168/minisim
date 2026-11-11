@@ -233,6 +233,11 @@ if(MINISIM_WITH_SLANG)
   # 2-state fast path vs 4-state on random expressions.
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)
+    # Compiled mode with a waveform: the same values as the interpreter's VCD.
+    add_test(NAME msim_compile_vcd
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile_vcd -DPY=${Python3_EXECUTABLE}
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_compile_vcd.cmake)
     add_test(NAME msim_fuzz
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR} -DPY=${Python3_EXECUTABLE}

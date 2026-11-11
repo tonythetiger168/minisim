@@ -682,6 +682,20 @@ mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
 
 See [docs/EQUIV.md](docs/EQUIV.md).
 
+### Functional ECO: `meco`
+
+`meco` turns a late RTL change into the smallest edit of the netlist that is
+already implemented, the way Conformal ECO does: it compares the old netlist
+with a fresh synthesis of the new RTL, finds the gates to change, reuses every
+old net that still has the right function, and proves the patched netlist
+equivalent to the new design.
+
+```sh
+meco -old impl.v -new resynth.v -lib cells.lib -o patched.v -script eco.tcl
+```
+
+See [docs/ECO.md](docs/ECO.md).
+
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per
