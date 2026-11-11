@@ -761,6 +761,15 @@ private:
         return r;
     }
 
+    // Records a word operator whose operands are not all constant (Design::ops).
+    Bits note(WordOp::Kind k, const Bits& a, const Bits& b, Bits y, bool sgn) {
+        bool ca = true, cb = true;
+        for (Lit l : a) ca &= l <= 1;
+        for (Lit l : b) cb &= l <= 1;
+        if (!(ca && cb)) des.ops.push_back(WordOp{k, a, b, y, sgn});
+        return y;
+    }
+
     Bits binary(const slang::ast::BinaryExpression& b) {
         using BO = slang::ast::BinaryOperator;
         auto loc = b.sourceRange.start();
@@ -794,9 +803,9 @@ private:
         }
         Bits x = expr(b.left()), y = expr(b.right());
         switch (b.op) {
-            case BO::Add: same(x, y); return Graph::extend(g.add(x, y, L0), w, false);
-            case BO::Subtract: same(x, y); return Graph::extend(g.sub(x, y), w, false);
-            case BO::Multiply: same(x, y); return Graph::extend(g.mul(x, y), w, false);
+            case BO::Add: same(x, y); return Graph::extend(note(WordOp::Add, x, y, g.add(x, y, L0), false), w, false);
+            case BO::Subtract: same(x, y); return Graph::extend(note(WordOp::Sub, x, y, g.sub(x, y), false), w, false);
+            case BO::Multiply: same(x, y); return Graph::extend(note(WordOp::Mul, x, y, g.mul(x, y), sgn), w, false);
             case BO::Divide:
             case BO::Mod: {
                 same(x, y);
@@ -820,17 +829,18 @@ private:
             case BO::BinaryXor: same(x, y); return g.bxor(x, y);
             case BO::BinaryXnor: same(x, y); return g.bnot(g.bxor(x, y));
             case BO::Equality:
-            case BO::CaseEquality: same(x, y); return one(g.eq(x, y), w);
+            case BO::CaseEquality: same(x, y); return one(note(WordOp::Eq, x, y, Bits{g.eq(x, y)}, false)[0], w);
             case BO::Inequality:
             case BO::CaseInequality: same(x, y); return one(lneg(g.eq(x, y)), w);
-            case BO::LessThan: same(x, y); return one(g.lt(x, y, sgn), w);
-            case BO::GreaterThan: same(x, y); return one(g.lt(y, x, sgn), w);
+            case BO::LessThan: same(x, y); return one(note(WordOp::Lt, x, y, Bits{g.lt(x, y, sgn)}, sgn)[0], w);
+            case BO::GreaterThan: same(x, y); return one(note(WordOp::Lt, y, x, Bits{g.lt(y, x, sgn)}, sgn)[0], w);
             case BO::LessThanEqual: same(x, y); return one(lneg(g.lt(y, x, sgn)), w);
             case BO::GreaterThanEqual: same(x, y); return one(lneg(g.lt(x, y, sgn)), w);
             case BO::LogicalShiftLeft:
-            case BO::ArithmeticShiftLeft: return Graph::extend(g.shift(x, y, true, false), w, false);
-            case BO::LogicalShiftRight: return Graph::extend(g.shift(x, y, false, false), w, false);
-            case BO::ArithmeticShiftRight: return Graph::extend(g.shift(x, y, false, b.type->isSigned()), w, false);
+            case BO::ArithmeticShiftLeft: return Graph::extend(note(WordOp::Shl, x, y, g.shift(x, y, true, false), false), w, false);
+            case BO::LogicalShiftRight: return Graph::extend(note(WordOp::Shr, x, y, g.shift(x, y, false, false), false), w, false);
+            case BO::ArithmeticShiftRight:
+                return Graph::extend(note(b.type->isSigned() ? WordOp::Sshr : WordOp::Shr, x, y, g.shift(x, y, false, b.type->isSigned()), false), w, false);
             case BO::Power: {
                 int64_t base, ex;
                 if (constVal(x, base, false) && base == 2) {

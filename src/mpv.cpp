@@ -52,6 +52,7 @@ int usage(FILE* f) {
         "  -netlist <file>  lvs of a DEF: the gate netlist to compare with\n"
         "  -top <cell>      cell to check (default: the one top cell)\n"
         "  -o <file>        write the violation markers here\n"
+        "  -rdb <file>      write the markers as a KLayout report database (.lyrdb)\n"
         "  -max <n>         markers written per rule (default 1000; counts stay exact)\n"
         "  -threads <n>     worker threads (default: every logical CPU)\n"
         "  -q               print only rules with violations and the summary\n"
@@ -70,8 +71,59 @@ std::string um(double v) {
     return s;
 }
 
+std::string xml(const std::string& s) {
+    std::string o;
+    for (char c : s) {
+        if (c == '&') o += "&amp;";
+        else if (c == '<') o += "&lt;";
+        else if (c == '>') o += "&gt;";
+        else o += c;
+    }
+    return o;
+}
+
+// The markers as a KLayout report database (the marker browser's .lyrdb):
+// one category per rule, one item per marker with its box (an edge when the
+// margin is zero) and the measured value. Lengths are in microns.
+bool writeRdb(const std::string& file, const std::string& layoutFile, const drc::Deck& deck, const layout::Flat& flat,
+              const std::vector<drc::RuleResult>& res, size_t maxMarkers) {
+    FILE* f = std::fopen(file.c_str(), "w");
+    if (!f) return false;
+    std::fprintf(f, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<report-database>\n <description>mpv drc</description>\n"
+                    " <original-file>%s</original-file>\n <generator>mpv drc</generator>\n <top-cell>%s</top-cell>\n"
+                    " <tags>\n </tags>\n <categories>\n", xml(layoutFile).c_str(), xml(flat.top).c_str());
+    for (const drc::Rule& r : deck.rules)
+        std::fprintf(f, "  <category>\n   <name>%s</name>\n   <description>%s</description>\n   <categories>\n   </categories>\n"
+                        "  </category>\n", xml(r.id).c_str(), xml(r.desc).c_str());
+    std::fprintf(f, " </categories>\n <cells>\n  <cell>\n   <name>%s</name>\n   <variant/>\n   <layout-name/>\n"
+                    "   <references>\n   </references>\n  </cell>\n </cells>\n <items>\n", xml(flat.top).c_str());
+    for (size_t i = 0; i < res.size(); ++i) {
+        // A category path: the name in quotes, with quotes and backslashes escaped.
+        std::string cat = "'";
+        for (char c : deck.rules[i].id) {
+            if (c == '\'' || c == '\\') cat += '\\';
+            cat += c;
+        }
+        cat += "'";
+        size_t n = std::min(maxMarkers, res[i].markers.size());
+        for (size_t k = 0; k < n; ++k) {
+            const drc::Marker& m = res[i].markers[k];
+            std::string x1 = um(m.box.x1 * flat.dbu), y1 = um(m.box.y1 * flat.dbu), x2 = um(m.box.x2 * flat.dbu),
+                        y2 = um(m.box.y2 * flat.dbu);
+            bool flatBox = m.box.x1 == m.box.x2 || m.box.y1 == m.box.y2;
+            std::fprintf(f, "  <item>\n   <tags/>\n   <category>%s</category>\n   <cell>%s</cell>\n   <visited>false</visited>\n"
+                            "   <multiplicity>1</multiplicity>\n   <comment/>\n   <image/>\n   <values>\n"
+                            "    <value>%s: (%s,%s;%s,%s)</value>\n    <value>float: %s</value>\n   </values>\n  </item>\n",
+                         xml(cat).c_str(), xml(flat.top).c_str(), flatBox ? "edge" : "box", x1.c_str(), y1.c_str(), x2.c_str(),
+                         y2.c_str(), um(m.value).c_str());
+        }
+    }
+    std::fprintf(f, " </items>\n</report-database>\n");
+    return std::fclose(f) == 0;
+}
+
 int drcMain(int argc, char** argv) {
-    std::string deckFile, gdsFile, top, outFile, writeDeck;
+    std::string deckFile, gdsFile, top, outFile, rdbFile, writeDeck;
     std::vector<std::string> lefs;
     unsigned threads = par::defaultThreads();
     size_t maxMarkers = 1000;
@@ -88,6 +140,7 @@ int drcMain(int argc, char** argv) {
         if (a == "-deck") { if (!val(deckFile)) return 2; }
         else if (a == "-top") { if (!val(top)) return 2; }
         else if (a == "-o") { if (!val(outFile)) return 2; }
+        else if (a == "-rdb") { if (!val(rdbFile)) return 2; }
         else if (a == "-q") quiet = true;
         else if (a == "-obs") withObs = true;
         else if (a == "-lef") { if (!val(v)) return 2; lefs.push_back(v); }
@@ -181,6 +234,10 @@ int drcMain(int argc, char** argv) {
             }
         }
         std::fclose(f);
+    }
+    if (!rdbFile.empty() && !writeRdb(rdbFile, gdsFile, deck, flat, res, maxMarkers)) {
+        std::fprintf(stderr, "mpv: cannot write %s\n", rdbFile.c_str());
+        return 2;
     }
     return total ? 1 : 0;
 }

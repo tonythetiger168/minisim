@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """mfpga test: map one design for every device family and check the result.
 
-  run_test.py MFPGA MSIM SRC_DIR OUT_DIR DESIGN [seq-depth]
+  run_test.py MFPGA MSIM SRC_DIR OUT_DIR DESIGN [seq-depth [reset-input [mfpga-option...]]]
 
-DESIGN is tests/synth/DESIGN.sv (the designs msynth is tested with) or
-tests/fpga/DESIGN.aag. Checks:
+DESIGN is tests/synth/DESIGN.sv (the designs msynth is tested with),
+tests/fpga/DESIGN.sv or tests/fpga/DESIGN.aag. Checks:
   1. mfpga -verify: the mapped netlist equals the graph on random patterns.
   2. One thread and four threads write the same bytes.
-  3. RTL designs: the design's testbench (tests/synth/DESIGN_tb.sv) prints
+  3. RTL designs: the design's testbench (DESIGN_tb.sv beside it) prints
      the same lines with msim on the RTL and on the mapped Verilog netlist
      with the cell models of tests/fpga/cells_FAMILY.v.
   4. With yosys on PATH and a seq-depth: the JSON netlist, on the vendor's
      own simulation models, equals the RTL for seq-depth cycles from reset
-     (bounded SAT on a miter). This check shares no code with mfpga.
+     (bounded SAT on a miter). This check shares no code with mfpga. With a
+     reset-input the proof holds that input at 1 in the first cycle: a flop
+     with a synchronous set powers up 1 on ecp5 and 0 in the RTL's proof.
   5. With nextpnr-ice40 / nextpnr-ecp5 on PATH: the netlist places and routes.
 """
 import os, shutil, subprocess, sys
 
 mfpga, msim, src, out, design = sys.argv[1:6]
 depth = int(sys.argv[6]) if len(sys.argv) > 6 else 0
+reset = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] != "-" else None
+extra = sys.argv[8:]
 os.makedirs(out, exist_ok=True)
 rtl = os.path.join(src, "tests", "synth", design + ".sv")
+if not os.path.exists(rtl):
+    rtl = os.path.join(src, "tests", "fpga", design + ".sv")
 aag = os.path.join(src, "tests", "fpga", design + ".aag")
-inp = [rtl, "-top", design] if os.path.exists(rtl) else [aag, "-top", design]
+inp = ([rtl, "-top", design] if os.path.exists(rtl) else [aag, "-top", design]) + extra
 
 def run(cmd, **kw):
     r = subprocess.run(cmd, capture_output=True, text=True, **kw)
@@ -47,23 +53,29 @@ for fam in ("generic", "ice40", "ecp5", "xc7"):
     if edif.count("(") != edif.count(")") or not edif.startswith("(edif "):
         sys.exit("malformed EDIF " + base + ".edf")
     if os.path.exists(rtl):
-        tb = os.path.join(src, "tests", "synth", design + "_tb.sv")
-        cells = os.path.join(src, "tests", "fpga", "cells_%s.v" % fam)
+        tb = rtl[:-3] + "_tb.sv"
+        cells = [os.path.join(src, "tests", "fpga", "cells_%s.v" % fam)]
+        if fam == "ecp5":
+            cells.append(os.path.join(src, "tests", "fpga", "cells_ecp5_dsp.v"))
         want = run([msim, rtl, tb, "-top", design + "_tb"])
-        got = run([msim, base + ".v", cells, tb, "-top", design + "_tb"])
+        got = run([msim, base + ".v"] + cells + [tb, "-top", design + "_tb"])
         if want != got or len(want.splitlines()) < 50:
             sys.exit("%s: the netlist simulates differently from the RTL (%d lines)" % (fam, len(want.splitlines())))
     if yosys:
         ys = ["read_verilog -sv " + rtl, "prep -top " + design, "design -stash gold"]
         if SIM[fam]:
             ys.append("read_verilog " + SIM[fam])
+        if fam == "ecp5":   # a black box in Yosys 0.33's library
+            ys.append("read_verilog " + os.path.join(src, "tests", "fpga", "cells_ecp5_dsp.v"))
         ys += ["read_json %s.json" % base, "hierarchy -top " + design, "proc", "flatten", "design -stash gate",
                "design -copy-from gold -as gold " + design, "design -copy-from gate -as gate " + design,
                "miter -equiv -flatten -make_outputs gold gate miter", "hierarchy -top miter", "flatten", "opt",
                # an asynchronous reset becomes a synchronous one for the bounded check
                "async2sync",
-               "sat -verify -prove trigger 0 -seq %d -set-init-zero miter" % depth]
-        run([yosys, "-q", "-p", "; ".join(ys)], timeout=600)
+               "sat -verify -prove trigger 0 -seq %d -set-init-zero %smiter" % (depth, "-set-at 1 in_%s 1 -prove-skip 1 " % reset if reset else "")]
+        r = subprocess.run([yosys, "-q", "-p", "; ".join(ys)], capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            sys.exit("FAILED: %s: the yosys proof against the RTL\n%s%s" % (fam, r.stdout[-3000:], r.stderr[-3000:]))
     pnr = {"ice40": ["nextpnr-ice40", "--hx8k", "--package", "ct256", "--pcf-allow-unconstrained", "--asc", base + ".asc"],
            "ecp5": ["nextpnr-ecp5", "--85k", "--package", "CABGA756", "--textcfg", base + ".cfg"]}.get(fam)
     if pnr and shutil.which(pnr[0]):

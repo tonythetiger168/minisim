@@ -41,7 +41,32 @@ struct Flop {
   bool negedge = false;
   bool rval = false;     // value loaded by arst
   int init = 2;          // power-up value: 0, 1, or 2 = don't care
+  Lit en = 1;            // clock enable; literal 1 = always
+  Lit srst = 0;          // synchronous reset, active high; literal 0 = none
+  bool sval = false;     // value loaded by srst
   std::string name;
+};
+
+// An adder on the family's carry chain: {cout, sum} = a + b + cin. The sum
+// and carry bits drive variables of the graph, which the LUT mapper sees as
+// inputs; a and b are outputs of the mapped logic.
+struct Box {
+  std::vector<Lit> a, b;        // LSB first, same width
+  bool mul = false;             // a multiplier: sum is the product, 2's complement operands where sa, sb
+  bool sa = false, sb = false;
+  bool cin = false;
+  bool binv = false;            // b is an operand inverted (a - b): a chain that can invert inside takes b ^ 1
+  std::vector<uint32_t> sum;    // variable driven by each sum bit, 0 = not used
+  uint32_t cout = 0;            // variable driven by the carry out, 0 = not used
+
+  template <class F> void for_each_out(F&& f) const {
+    for (uint32_t v : sum) if (v) f(v);
+    if (cout) f(cout);
+  }
+  template <class F> void for_each_in(F&& f) const {
+    for (Lit l : a) f(l);
+    for (Lit l : b) f(l);
+  }
 };
 
 struct Port {
@@ -56,18 +81,74 @@ struct Aig {
   std::vector<Flop> flops;                // variable nin+1+i is flop i's Q
   std::vector<std::array<Lit, 2>> ands;   // variable first_and()+i, fanins are lower variables
   std::vector<Port> ports;
+  std::vector<Box> boxes;
   std::string top = "top";
 
   uint32_t first_and() const { return 1 + nin + (uint32_t)flops.size(); }
   uint32_t nvars() const { return first_and() + (uint32_t)ands.size(); }
   bool is_and(uint32_t v) const { return v >= first_and(); }
 
-  template <class F> void for_each_root(F&& f) const {
+  // Every literal the mapped logic has to deliver: outputs, flop pins and
+  // (with_boxes) the operands of the carry chains.
+  template <class F> void for_each_root(F&& f, bool with_boxes = true) const {
     for (auto& p : ports)
       if (p.output) for (Lit l : p.bits) f(l);
-    for (auto& fl : flops) { f(fl.d); f(fl.clk); f(fl.arst); }
+    for (auto& fl : flops) { f(fl.d); f(fl.clk); f(fl.arst); f(fl.en); f(fl.srst); }
+    if (with_boxes)
+      for (auto& b : boxes) b.for_each_in(f);
   }
 };
+
+// Levels with carry chains: inputs and flops are 0, an AND is one above its
+// fanins, a box output is one above the box's operands. Returns false and
+// the box when a box's operands depend on its own outputs.
+inline bool box_levels(const Aig& g, std::vector<uint32_t>& level, int* bad_box = nullptr) {
+  const uint32_t nv = g.nvars(), fa = g.first_and();
+  level.assign(nv, 0);
+  if (g.boxes.empty()) {
+    for (uint32_t v = fa; v < nv; ++v)
+      level[v] = 1 + std::max(level[lit_var(g.ands[v - fa][0])], level[lit_var(g.ands[v - fa][1])]);
+    return true;
+  }
+  std::vector<int> box_of(fa, -1);
+  for (size_t k = 0; k < g.boxes.size(); ++k) g.boxes[k].for_each_out([&](uint32_t v) { box_of[v] = (int)k; });
+  std::vector<char> state(nv, 0);
+  std::vector<uint32_t> stack;
+  for (uint32_t root = 1; root < nv; ++root) {
+    if (state[root] == 2) continue;
+    stack.push_back(root);
+    while (!stack.empty()) {
+      uint32_t v = stack.back();
+      if (state[v] == 2) { stack.pop_back(); continue; }
+      uint32_t lv = 0;
+      bool ready = true;
+      auto dep = [&](uint32_t u) {
+        if (state[u] == 2) { lv = std::max(lv, level[u]); return true; }
+        if (state[u] == 1) return false;   // on the stack: a loop
+        ready = false;
+        stack.push_back(u);
+        return true;
+      };
+      bool ok = true;
+      if (v >= fa) ok = dep(lit_var(g.ands[v - fa][0])) && dep(lit_var(g.ands[v - fa][1]));
+      else if (box_of[v] >= 0) g.boxes[box_of[v]].for_each_in([&](Lit l) { ok = ok && dep(lit_var(l)); });
+      else { state[v] = 2; stack.pop_back(); continue; }
+      if (!ok) {
+        if (bad_box) {
+          *bad_box = -1;
+          for (size_t i = stack.size(); i-- > 0 && *bad_box < 0;)
+            if (stack[i] < fa) *bad_box = box_of[stack[i]];
+        }
+        return false;
+      }
+      if (!ready) { state[v] = 1; continue; }
+      level[v] = lv + 1;
+      state[v] = 2;
+      stack.pop_back();
+    }
+  }
+  return true;
+}
 
 // ------------------------------------------------------------ from aig.hpp
 
@@ -95,13 +176,26 @@ inline void invert_flops(aig::Design& d, const std::vector<char>& flag) {
   g.strash.clear();
 }
 
-// The flat view of a design. init[i] is flop i's power-up value (0, 1,
-// 2 = don't care); invert[i] maps the flop inverted (see invert_flops).
-inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const std::vector<char>& invert = {}) {
-  aig::Design work;
-  const bool inv = std::find(invert.begin(), invert.end(), 1) != invert.end();
-  if (inv) { work = in; invert_flops(work, invert); }
-  const aig::Design d = aig::cleanup(inv ? work : in);
+// What the front half pulls out of the logic before LUT mapping.
+struct FrontOptions {
+  bool carry = false;          // adders, subtractors and comparators onto carry chains
+  int carry_min = 3;           // narrowest operator worth a chain
+  bool enable = false;         // d = en ? x : q becomes the flop's clock enable
+  bool sync_reset = false;     // d = rst ? v : x becomes the flop's synchronous reset
+  bool ce_over_reset = false;  // the family's enable gates its synchronous reset (ice40)
+  int sync_reset_min = 3;      // flops one reset signal must control to be used as a reset
+  bool dsp = false;            // multipliers onto DSP blocks
+  int dsp_a = 0, dsp_b = 0;    // widest operands of one block, as it multiplies signed numbers
+  bool dsp_unsigned = false;   // the block also multiplies unsigned numbers of that width
+  int dsp_min = 10;            // fewest operand bits (both together) worth a block; narrower stay LUTs
+};
+
+namespace detail {
+
+// A cleaned design to the flat view. Ports and inputs whose name starts with
+// \x01 are from_design's own: flop enables and resets, box operands and outputs.
+inline Aig flatten(const aig::Design& d, const std::vector<int>& init, const std::vector<char>& invert,
+                   const std::vector<char>& sval, std::map<int, Box> boxes) {
   const aig::Graph& g = d.g;
   Aig out;
   out.top = d.top;
@@ -125,11 +219,277 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
     o.init = i < init.size() ? init[i] : 2;
     if (i < invert.size() && invert[i] && o.init != 2) o.init ^= 1;
   }
-  for (auto& p : d.ports) {
-    Port q{p.name, p.out, p.bits, p.msb, p.lsb};
-    out.ports.push_back(std::move(q));
+  for (size_t i = 0; i < g.inputNames.size(); ++i) {
+    const std::string& nm = g.inputNames[i];
+    if (nm.size() < 3 || nm[0] != '\x01') continue;
+    size_t pos = 2;
+    int k = std::stoi(nm.substr(2), &pos);
+    Box& b = boxes[k];
+    if (nm[2 + pos] == 'c') b.cout = 1 + (uint32_t)i;
+    else b.sum[std::stoi(nm.substr(3 + pos))] = 1 + (uint32_t)i;
   }
+  for (auto& p : d.ports) {
+    if (p.name.empty() || p.name[0] != '\x01') {
+      out.ports.push_back(Port{p.name, p.out, p.bits, p.msb, p.lsb});
+      continue;
+    }
+    size_t pos = 0;
+    int k = std::stoi(p.name.substr(2), &pos);
+    if (p.name[1] == 'e') out.flops[k].en = p.bits[0];
+    else if (p.name[1] == 'r') { out.flops[k].srst = p.bits[0]; out.flops[k].sval = sval[k]; }
+    else if (p.name[2 + pos] == 'a') boxes[k].a = p.bits;
+    else boxes[k].b = p.bits;
+  }
+  for (auto& kv : boxes) out.boxes.push_back(std::move(kv.second));
   return out;
+}
+
+// x = s ? t : e, as aig::Graph::mux builds it: !(!(s & t) & !(!s & e)).
+inline bool is_mux(const aig::Graph& g, Lit x, Lit& s, Lit& t, Lit& e) {
+  if (!aig::lisneg(x)) return false;
+  const aig::Node& o = g.at(x);
+  if (o.k != aig::NK::And || !aig::lisneg(o.a) || !aig::lisneg(o.b)) return false;
+  const aig::Node p = g.at(o.a), q = g.at(o.b);
+  if (p.k != aig::NK::And || q.k != aig::NK::And) return false;
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 2; ++j) {
+      Lit ps = i ? p.b : p.a, pt = i ? p.a : p.b, qs = j ? q.b : q.a, qe = j ? q.a : q.b;
+      if (ps == aig::lneg(qs)) { s = ps; t = pt; e = qe; return true; }
+    }
+  return false;
+}
+
+// x = en ? data : q, through nested muxes: "if (load) q <= d; else if (inc)
+// q <= q + 1" holds unless load | inc. The enable logic is new nodes in g,
+// shared by the bits of a register. False when no path of x holds q.
+inline bool hold_split(aig::Graph& g, Lit x, Lit q, int depth, Lit& en, Lit& data) {
+  if (x == q) { en = aig::L0; data = aig::L0; return true; }
+  Lit s, t, e;
+  if (depth == 0 || !is_mux(g, x, s, t, e)) return false;
+  // q ^ c is the mux c ? !q : q; a toggle is logic (often an adder's sum bit), not a hold
+  if (t == aig::lneg(q) || e == aig::lneg(q)) return false;
+  Lit et = aig::L1, dt = t, ee = aig::L1, de = e;
+  const bool ht = hold_split(g, t, q, depth - 1, et, dt);
+  const bool he = hold_split(g, e, q, depth - 1, ee, de);
+  if (!ht && !he) return false;
+  en = g.mux(s, et, ee);
+  data = et == aig::L0 ? de : ee == aig::L0 ? dt : g.mux(s, dt, de);
+  return true;
+}
+
+}  // namespace detail
+
+// The flat view of a design. init[i] is flop i's power-up value (0, 1,
+// 2 = don't care); invert[i] maps the flop inverted (see invert_flops).
+// With FrontOptions, clock enables and synchronous resets move from the D
+// logic onto flop pins, and the word operators the elaborator recorded
+// (aig::Design::ops) are cut out of the graph and become carry-chain boxes.
+inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const std::vector<char>& invert = {},
+                       const FrontOptions& fo = {}) {
+  aig::Design work;
+  const bool inv = std::find(invert.begin(), invert.end(), 1) != invert.end();
+  if (inv) { work = in; invert_flops(work, invert); }
+  aig::Design d = aig::cleanup(inv ? work : in);
+
+  // ---- clock enables and synchronous resets
+  std::vector<char> sval(d.g.flops.size(), 0);
+  if (fo.enable || fo.sync_reset) {
+    struct Pins { Lit en = aig::L1, rst = aig::L0, data = 0; bool val = false; };
+    aig::Graph& g = d.g;
+    auto peel = [&](size_t i, bool use_rst) {
+      const aig::Flop& f = g.flops[i];
+      Pins o;
+      o.data = f.d;
+      int iv = i < init.size() ? init[i] : 2;
+      if (iv != 2 && i < invert.size() && invert[i]) iv ^= 1;
+      auto try_en = [&] {
+        if (!fo.enable) return;
+        Lit en, data;
+        if (detail::hold_split(g, o.data, f.q, 4, en, data) && en != aig::L1) { o.en = en; o.data = data; }
+      };
+      auto try_rst = [&] {
+        if (!use_rst || !fo.sync_reset || f.arst != aig::NOLIT) return;
+        Lit r, data;
+        bool v;
+        if (!aig::flopSyncReset(g, o.data, r, v, data)) return;
+        if (iv != 2 && (iv == 1) != v) return;   // one value serves power-up and reset
+        o.rst = r; o.val = v; o.data = data;
+      };
+      // d = rst ? v : (en ? data : q), or with the enable outermost. The
+      // pins have one of the two priorities; the other is a gate away:
+      // reset first is en | rst under an enable that gates the reset, and
+      // enable first is rst & en under a reset that ignores the enable.
+      try_rst();
+      const bool rst_first = o.rst != aig::L0;
+      try_en();
+      if (!rst_first) try_rst();
+      if (o.rst != aig::L0 && o.en != aig::L1) {
+        if (fo.ce_over_reset && rst_first) o.en = g.orl(o.en, o.rst);
+        if (!fo.ce_over_reset && !rst_first) o.rst = g.andl(o.rst, o.en);
+      }
+      return o;
+    };
+    std::vector<Pins> pins(g.flops.size());
+    std::map<Lit, int> users;
+    for (size_t i = 0; i < pins.size(); ++i) {
+      pins[i] = peel(i, true);
+      if (pins[i].rst != aig::L0) users[pins[i].rst]++;
+    }
+    // A reset signal has to be shared: any d = x & y looks like a reset of one flop.
+    for (size_t i = 0; i < pins.size(); ++i)
+      if (pins[i].rst != aig::L0 && users[pins[i].rst] < fo.sync_reset_min) pins[i] = peel(i, false);
+    bool any = false;
+    for (size_t i = 0; i < pins.size(); ++i) {
+      const Pins& o = pins[i];
+      if (o.en == aig::L1 && o.rst == aig::L0) continue;
+      any = true;
+      d.g.flops[i].d = o.data;
+      sval[i] = o.val;
+      auto pseudo = [&](char tag, Lit l) {
+        aig::Port p;
+        p.name = std::string("\x01") + tag + std::to_string(i);
+        p.out = true;
+        p.bits = {l};
+        d.ports.push_back(std::move(p));
+      };
+      if (o.en != aig::L1) pseudo('e', o.en);
+      if (o.rst != aig::L0) pseudo('r', o.rst);
+    }
+    if (any) d = aig::cleanup(d);
+  }
+
+  // ---- carry chains
+  std::vector<char> sel(d.ops.size(), 0);
+  if (fo.carry)
+    for (size_t k = 0; k < d.ops.size(); ++k) {
+      const aig::WordOp& op = d.ops[k];
+      sel[k] = (op.kind == aig::WordOp::Add || op.kind == aig::WordOp::Sub || op.kind == aig::WordOp::Lt) &&
+               op.a.size() == op.b.size() && (int)op.a.size() >= fo.carry_min;
+    }
+  // A multiplier fits a DSP block by the width its operands really have:
+  // the elaborator extends both to the width of the result first.
+  struct MulFit { aig::Bits a, b; bool sa = false, sb = false; };
+  std::map<int, MulFit> fits;
+  if (fo.dsp)
+    for (size_t k = 0; k < d.ops.size(); ++k) {
+      const aig::WordOp& op = d.ops[k];
+      if (op.kind != aig::WordOp::Mul) continue;
+      MulFit m;
+      auto trim = [&](aig::Bits v, bool& sg) {
+        sg = op.sgn;
+        if (sg) while (v.size() > 1 && v.back() == v[v.size() - 2]) v.pop_back();
+        else while (v.size() > 1 && v.back() == aig::L0) v.pop_back();
+        if (sg && v.size() > 1 && v.back() == aig::L0) { v.pop_back(); sg = false; }   // never negative
+        return v;
+      };
+      m.a = trim(op.a, m.sa);
+      m.b = trim(op.b, m.sb);
+      if (m.a.size() < m.b.size()) { std::swap(m.a, m.b); std::swap(m.sa, m.sb); }
+      // an unsigned operand on a block that only does signed, or beside a signed one, gets a 0 sign bit
+      if (!fo.dsp_unsigned || m.sa != m.sb)
+        for (int side = 0; side < 2; ++side) {
+          aig::Bits& v = side ? m.b : m.a;
+          bool& sg = side ? m.sb : m.sa;
+          if (!sg) { v.push_back(aig::L0); sg = true; }
+        }
+      if (m.a.size() < m.b.size()) { std::swap(m.a, m.b); std::swap(m.sa, m.sb); }
+      if ((int)m.a.size() > fo.dsp_a || (int)m.b.size() > fo.dsp_b) continue;
+      if ((int)(m.a.size() + m.b.size()) < fo.dsp_min || m.b.size() < 2) continue;
+      sel[k] = 1;
+      fits[(int)k] = std::move(m);
+    }
+  for (int round = 0;; ++round) {
+    if (round == 16) std::fill(sel.begin(), sel.end(), 0);   // give up on chains rather than loop
+    if (std::find(sel.begin(), sel.end(), 1) == sel.end()) return detail::flatten(d, init, invert, sval, {});
+    aig::Design c = d;
+    c.g.strash.clear();
+    std::vector<char> cut(c.g.size(), 0);
+    std::map<int, Box> protos;
+    for (size_t k = 0; k < d.ops.size(); ++k) {
+      if (!sel[k]) continue;
+      const aig::WordOp& op = d.ops[k];
+      Box bx;
+      aig::Bits a = op.a, b = op.b;
+      const bool lt = op.kind == aig::WordOp::Lt;
+      const bool mul = op.kind == aig::WordOp::Mul;
+      if (mul) {
+        const MulFit& m = fits[(int)k];
+        a = m.a; b = m.b;
+        bx.mul = true; bx.sa = m.sa; bx.sb = m.sb;
+      } else if (op.kind != aig::WordOp::Add) {      // a - b = a + ~b + 1; a < b is its missing carry
+        for (Lit& l : b) l ^= 1;
+        bx.cin = bx.binv = true;
+      }
+      if (lt && op.sgn) { a.back() ^= 1; b.back() ^= 1; }   // signed: compare with the sign bits flipped
+      bx.sum.assign(mul ? std::min(op.y.size(), a.size() + b.size()) : a.size(), 0);
+      const std::string base = std::string("\x01") + "b" + std::to_string(k);
+      bool any = false;
+      // The node behind y becomes a wire from a new input the box will drive.
+      auto take = [&](Lit y, const std::string& name, bool inverted) {
+        uint32_t n = aig::lnode(y);
+        if (n >= cut.size() || cut[n] || c.g.nodes[n].k != aig::NK::And) return;
+        Lit x = c.g.input(name);
+        aig::Node w;
+        w.k = aig::NK::Wire;
+        w.a = x ^ (Lit)(aig::lisneg(y) != inverted);
+        c.g.nodes[n] = w;
+        cut[n] = 1;
+        any = true;
+      };
+      if (lt) take(op.y[0], base + "c", true);   // carry out = !(a < b)
+      else
+        for (size_t i = 0; i < op.y.size() && i < bx.sum.size(); ++i) take(op.y[i], base + "s" + std::to_string(i), false);
+      if (!any) { sel[k] = 0; continue; }
+      // result bits past the product: its sign, or 0
+      for (size_t i = bx.sum.size(); mul && i < op.y.size(); ++i) {
+        uint32_t n = aig::lnode(op.y[i]), top = aig::lnode(op.y[bx.sum.size() - 1]);
+        if (n >= cut.size() || cut[n] || c.g.nodes[n].k != aig::NK::And) continue;
+        aig::Node w;
+        w.k = aig::NK::Wire;
+        w.a = bx.sa ? aig::mklit(top, aig::lisneg(op.y[i]) != aig::lisneg(op.y[bx.sum.size() - 1]))
+                    : (aig::lisneg(op.y[i]) ? aig::L1 : aig::L0);
+        if (bx.sa && !cut[top]) continue;
+        c.g.nodes[n] = w;
+        cut[n] = 1;
+      }
+      for (int side = 0; side < 2; ++side) {
+        aig::Port p;
+        p.name = base + (side ? "b" : "a");
+        p.out = true;
+        p.bits = side ? b : a;
+        c.ports.push_back(std::move(p));
+      }
+      protos[(int)k] = std::move(bx);
+    }
+    if (protos.empty()) continue;
+    std::vector<int> ids;
+    for (auto& kv : protos) ids.push_back(kv.first);
+    Aig flat = detail::flatten(aig::cleanup(c), init, invert, sval, std::move(protos));
+    // A box nothing reads (the adders inside a comparator that became a
+    // chain itself) or one that feeds its own operands is dropped; try again.
+    std::vector<char> used(flat.first_and(), 0);
+    auto mark = [&](Lit l) { if (lit_var(l) < used.size()) used[lit_var(l)] = 1; };
+    for (auto& nd : flat.ands) { mark(nd[0]); mark(nd[1]); }
+    flat.for_each_root(mark);
+    bool again = false;
+    for (size_t j = 0; j < flat.boxes.size(); ++j) {
+      Box& b = flat.boxes[j];
+      for (uint32_t& v : b.sum) if (v && !used[v]) v = 0;
+      if (b.cout && !used[b.cout]) b.cout = 0;
+      bool live = b.cout != 0;
+      for (uint32_t v : b.sum) live |= v != 0;
+      if (!live) { sel[ids[j]] = 0; again = true; }
+    }
+    if (again) continue;
+    std::vector<uint32_t> level;
+    int bad = -1;
+    if (!box_levels(flat, level, &bad)) {
+      if (bad < 0) throw std::runtime_error("fpga: combinational loop");
+      sel[ids[bad]] = 0;
+      continue;
+    }
+    return flat;
+  }
 }
 
 // --------------------------------------------------------------- LUT mapping
@@ -221,13 +581,18 @@ class LutMapper {
     est_.assign(nv, 1.f);
 
     // levels and fanout counts
-    std::vector<uint32_t> level(nv, 0);
+    std::vector<uint32_t> level;
+    if (!box_levels(g_, level)) throw std::runtime_error("fpga: a carry chain feeds its own operands");
     uint32_t maxl = 0;
     for (uint32_t v = fa; v < nv; ++v) {
       auto& a = g_.ands[v - fa];
-      level[v] = 1 + std::max(level[lit_var(a[0])], level[lit_var(a[1])]);
       maxl = std::max(maxl, level[v]);
       ref_[lit_var(a[0])]++; ref_[lit_var(a[1])]++;
+    }
+    std::vector<uint32_t> box_level(g_.boxes.size(), 0);
+    for (size_t k = 0; k < g_.boxes.size(); ++k) {
+      g_.boxes[k].for_each_in([&](Lit l) { box_level[k] = std::max(box_level[k], level[lit_var(l)] + 1); });
+      maxl = std::max(maxl, box_level[k]);
     }
     g_.for_each_root([&](Lit l) { ref_[lit_var(l)]++; });
     for (uint32_t v = 0; v < nv; ++v) est_[v] = (float)std::max<uint32_t>(1, ref_[v]);
@@ -239,8 +604,18 @@ class LutMapper {
       for (uint32_t v = fa; v < nv; ++v) order[pos[level[v]]++] = v;
     }
 
+    // topological order of ANDs and boxes: by level, a level's boxes first
+    std::vector<std::vector<uint32_t>> boxes_at(maxl + 1);
+    for (size_t k = 0; k < g_.boxes.size(); ++k) boxes_at[box_level[k]].push_back((uint32_t)k);
+    topo_.clear();
+    for (uint32_t l = 1; l <= maxl; ++l) {
+      for (uint32_t k : boxes_at[l]) topo_.push_back(kBox | k);
+      for (uint32_t i = lstart[l]; i < lstart[l + 1]; ++i) topo_.push_back(order[i]);
+    }
+
     auto sweep = [&](int mode) {
       for (uint32_t l = 1; l <= maxl; ++l) {
+        for (uint32_t k : boxes_at[l]) box_arrival(k);
         uint32_t b = lstart[l], n = lstart[l + 1] - b;
         pool.chunks(n, 64, [&](size_t lo, size_t hi, size_t) {
           for (size_t i = lo; i < hi; ++i) enumerate(order[b + i], mode);
@@ -256,14 +631,24 @@ class LutMapper {
       cover(depth);
     }
     for (int p = 0; p < o_.exact_passes; ++p) {
-      for (uint32_t v = fa; v < nv; ++v) exact(v);
+      for (uint32_t it : topo_) {
+        if (it & kBox) box_arrival(it & ~kBox);
+        else exact(it);
+      }
       cover(depth);
     }
     return extract(pool);
   }
 
  private:
+  static constexpr uint32_t kBox = 0x80000000u;   // topo_ entry: a box, not an AND
   bool is_and(uint32_t v) const { return g_.is_and(v); }
+  // A carry chain costs one level from its latest operand to every output.
+  void box_arrival(uint32_t k) {
+    uint32_t d = 0;
+    g_.boxes[k].for_each_in([&](Lit l) { d = std::max(d, arr_[lit_var(l)]); });
+    g_.boxes[k].for_each_out([&](uint32_t v) { arr_[v] = d + 1; });
+  }
   Cut trivial(uint32_t v) const {
     Cut c;
     c.leaf[0] = v; c.n = 1; c.sig = detail::cut_sig(v);
@@ -339,10 +724,22 @@ class LutMapper {
     std::fill(ref_.begin(), ref_.end(), 0);
     std::fill(req_.begin(), req_.end(), UINT32_MAX);
     uint32_t depth = 0;
-    g_.for_each_root([&](Lit l) { ref_[lit_var(l)]++; depth = std::max(depth, arr_[lit_var(l)]); });
+    g_.for_each_root([&](Lit l) { depth = std::max(depth, arr_[lit_var(l)]); });
     if (D < depth) D = depth;
-    g_.for_each_root([&](Lit l) { req_[lit_var(l)] = D; });
-    for (uint32_t v = nv; v-- > fa;) {
+    g_.for_each_root([&](Lit l) { ref_[lit_var(l)]++; req_[lit_var(l)] = D; }, false);
+    for (size_t t = topo_.size(); t-- > 0;) {
+      const uint32_t v = topo_[t];
+      if (v & kBox) {
+        // operands are needed one level before the earliest required output
+        const Box& b = g_.boxes[v & ~kBox];
+        uint32_t r = D + 1;
+        b.for_each_out([&](uint32_t o) { if (ref_[o]) r = std::min(r, req_[o]); });
+        b.for_each_in([&](Lit l) {
+          ref_[lit_var(l)]++;
+          req_[lit_var(l)] = std::min(req_[lit_var(l)], r ? r - 1 : 0);
+        });
+        continue;
+      }
       if (!ref_[v]) { req_[v] = UINT32_MAX; continue; }
       const Cut& c = best_[v - fa];
       for (int i = 0; i < c.n; ++i) {
@@ -476,13 +873,21 @@ class LutMapper {
       if (live[luts[i].root])
         for (int k = 0; k < luts[i].n; ++k) live[luts[i].leaf[k]] = 1;
     std::vector<uint32_t> lvl(nv, 0);
-    for (auto& L : luts) {
-      if (!live[L.root]) continue;
-      uint32_t d = 0;
-      for (int k = 0; k < L.n; ++k) d = std::max(d, lvl[L.leaf[k]]);
-      lvl[L.root] = L.n ? d + 1 : 0;
-      out.depth = std::max(out.depth, lvl[L.root]);
-      out.luts.push_back(L);
+    std::vector<int> lut_at(nv, -1);
+    for (size_t i = 0; i < luts.size(); ++i)
+      if (live[luts[i].root]) { lut_at[luts[i].root] = (int)i; out.luts.push_back(luts[i]); }
+    for (uint32_t it : topo_) {
+      if (it & kBox) {
+        uint32_t d = 0;
+        g_.boxes[it & ~kBox].for_each_in([&](Lit l) { d = std::max(d, lvl[lit_var(l)]); });
+        g_.boxes[it & ~kBox].for_each_out([&](uint32_t v) { lvl[v] = d + 1; out.depth = std::max(out.depth, d + 1); });
+      } else if (lut_at[it] >= 0) {
+        const Lut& L = luts[lut_at[it]];
+        uint32_t d = 0;
+        for (int k = 0; k < L.n; ++k) d = std::max(d, lvl[L.leaf[k]]);
+        lvl[it] = L.n ? d + 1 : 0;
+        out.depth = std::max(out.depth, lvl[it]);
+      }
     }
     return out;
   }
@@ -491,7 +896,7 @@ class LutMapper {
   MapOptions o_;
   std::vector<Cut> cuts_, best_;
   std::vector<uint8_t> ncuts_;
-  std::vector<uint32_t> arr_, req_, ref_;
+  std::vector<uint32_t> arr_, req_, ref_, topo_;
   std::vector<float> flow_, est_;
 };
 
@@ -527,10 +932,11 @@ struct Netlist {
   std::vector<std::string> warnings;
   std::vector<std::pair<int, int>> inits;  // net, power-up value (generic family)
   int nbits = 2;
-  size_t luts = 0, ffs = 0;
+  size_t luts = 0, ffs = 0, ffs_en = 0, ffs_srst = 0, carry_bits = 0, chains = 0, dsps = 0;
   // where the Aig's signals ended up (for checking)
   std::vector<int> ci_bit;                 // per variable below first_and()
-  std::vector<std::array<int, 3>> ff_bits; // D, clock, reset pin nets per flop
+  std::vector<std::array<int, 5>> ff_bits; // D, clock, async reset, enable, sync reset pin nets per flop
+  std::vector<std::vector<std::pair<int, Lit>>> box_pins;  // per box: operand pin nets and the literal each carries
 };
 
 enum class Family { Generic, Ice40, Ecp5, Xc7 };
@@ -543,6 +949,23 @@ inline Family parse_family(const std::string& s) {
   throw std::runtime_error("unknown family '" + s + "' (generic, ice40, ecp5, xc7)");
 }
 inline int family_lut_size(Family f) { return f == Family::Xc7 ? 6 : 4; }
+// What each family's cells offer: all have a clock enable and a synchronous
+// reset; the generic cells have no carry.
+inline FrontOptions family_front(Family f) {
+  FrontOptions o;
+  o.carry = f != Family::Generic;
+  o.enable = o.sync_reset = true;
+  o.ce_over_reset = f == Family::Ice40;
+  // MULT18X18D and SB_MAC16 have a signed/unsigned switch per operand;
+  // DSP48E1 multiplies 25 x 18 signed. iCE40 has DSPs on UltraPlus parts
+  // only, so there the caller turns them on.
+  o.dsp = f == Family::Ecp5 || f == Family::Xc7;
+  o.dsp_a = f == Family::Xc7 ? 25 : f == Family::Ice40 ? 16 : 18;
+  o.dsp_b = f == Family::Ice40 ? 16 : 18;
+  o.dsp_unsigned = f != Family::Xc7;
+  if (f == Family::Generic) o.dsp_a = o.dsp_b = 0;
+  return o;
+}
 
 // ice40 flops power up 0: a flop that must power up 1 is mapped inverted.
 inline std::vector<char> family_invert(Family f, const std::vector<int>& init) {
@@ -587,6 +1010,9 @@ class NetlistBuilder {
       n_.netnames.push_back({p.name, np.bits});
       n_.ports.push_back(std::move(np));
     }
+    std::vector<char> port_in(nv, 0);
+    for (uint32_t v = 1; v <= g_.nin; ++v) port_in[v] = pos_[v] >= 0;
+    for (auto& b : g_.boxes) b.for_each_out([&](uint32_t v) { pos_[v] = fresh(); });
     for (uint32_t v = 1; v <= g_.nin; ++v)
       if (pos_[v] < 0) pos_[v] = 0;  // an input in no port reads as 0
     for (size_t i = 0; i < g_.flops.size(); ++i) pos_[1 + g_.nin + i] = fresh();
@@ -608,6 +1034,7 @@ class NetlistBuilder {
     }
 
     for (size_t i = 0; i < g_.flops.size(); ++i) emit_ff(i);
+    for (size_t k = 0; k < g_.boxes.size(); ++k) emit_box(k);
 
     for (auto& p : g_.ports) {
       if (!p.output) continue;
@@ -618,7 +1045,7 @@ class NetlistBuilder {
           int pad = fresh();
           add_cell("OBUF", "obuf_" + std::to_string(pad), {}, {{"I", false, {b}}, {"O", true, {pad}}});
           b = pad;
-        } else if (b >= 2 && lit_var(l) <= g_.nin && !lit_neg(l)) {
+        } else if (b >= 2 && port_in[lit_var(l)] && !lit_neg(l)) {
           // input wired straight to an output: give the output its own driver
           int o = fresh();
           int in[1] = {b};
@@ -705,9 +1132,12 @@ class NetlistBuilder {
     ++n_.ffs;
     const int q = pos_[1 + g_.nin + i];
     const int d = bit_of(f.d), clk = bit_of(f.clk);
-    const bool has_r = f.arst != 0;
+    const bool has_r = f.arst != 0, has_e = f.en != 1, has_s = f.srst != 0;
     const int r = has_r ? bit_of(f.arst) : 0;
-    n_.ff_bits.push_back({d, clk, r});
+    const int e = bit_of(f.en), sr = bit_of(f.srst);
+    n_.ff_bits.push_back({d, clk, r, e, sr});
+    n_.ffs_en += has_e;
+    n_.ffs_srst += has_s;
     // "_reg" keeps the cell and its Q net apart from a port of the same name
     std::string name = (f.name.empty() ? "ff_" + std::to_string(i) : f.name) + "_reg";
     while (!used_.insert(name).second) name += "_";
@@ -716,41 +1146,222 @@ class NetlistBuilder {
     std::vector<Param> p;
     switch (fam_) {
       case Family::Ice40: {
+        // SB_DFF [N] [E] [R|S: asynchronous, SR|SS: synchronous]
         std::string t = f.negedge ? "SB_DFFN" : "SB_DFF";
         c = {{"C", false, {clk}}, {"D", false, {d}}, {"Q", true, {q}}};
+        if (has_e) { t += "E"; c.push_back({"E", false, {e}}); }
         if (has_r) { t += f.rval ? "S" : "R"; c.push_back({f.rval ? "S" : "R", false, {r}}); }
+        else if (has_s) { t += f.sval ? "SS" : "SR"; c.push_back({f.sval ? "S" : "R", false, {sr}}); }
         if (f.init == 1) n_.warnings.push_back("flop " + name + ": power-up value 1 is not available on ice40");
         add_cell(t, name, {}, std::move(c));
         break;
       }
       case Family::Ecp5: {
-        bool set = has_r ? f.rval : f.init == 1;
+        bool set = has_r ? f.rval : has_s ? f.sval : f.init == 1;
         if (has_r && f.init != 2 && (f.init == 1) != f.rval)
           n_.warnings.push_back("flop " + name + ": power-up value differs from its reset value; ecp5 uses the reset value");
-        c = {{"CLK", false, {clk}}, {"CE", false, {1}}, {"DI", false, {d}}, {"LSR", false, {r}}, {"Q", true, {q}}};
-        p = {{"GSR", "DISABLED", true}, {"CEMUX", "1", true}, {"CLKMUX", f.negedge ? "INV" : "CLK", true},
+        c = {{"CLK", false, {clk}}, {"CE", false, {e}}, {"DI", false, {d}}, {"LSR", false, {has_r ? r : sr}}, {"Q", true, {q}}};
+        p = {{"GSR", "DISABLED", true}, {"CEMUX", has_e ? "CE" : "1", true}, {"CLKMUX", f.negedge ? "INV" : "CLK", true},
              {"LSRMUX", "LSR", true}, {"REGSET", set ? "SET" : "RESET", true},
              {"SRMODE", has_r ? "ASYNC" : "LSR_OVER_CE", true}};
         add_cell("TRELLIS_FF", name, std::move(p), std::move(c));
         break;
       }
       case Family::Xc7: {
-        std::string t = has_r ? (f.rval ? "FDPE" : "FDCE") : "FDRE";
-        c = {{"C", false, {clk}}, {"CE", false, {1}}, {"D", false, {d}}, {"Q", true, {q}}};
-        c.push_back({has_r ? (f.rval ? "PRE" : "CLR") : "R", false, {r}});
+        std::string t = has_r ? (f.rval ? "FDPE" : "FDCE") : (has_s && f.sval) ? "FDSE" : "FDRE";
+        c = {{"C", false, {clk}}, {"CE", false, {e}}, {"D", false, {d}}, {"Q", true, {q}}};
+        if (has_r) c.push_back({f.rval ? "PRE" : "CLR", false, {r}});
+        else c.push_back({has_s && f.sval ? "S" : "R", false, {sr}});
         p = {{"INIT", f.init == 1 ? "1" : "0", false}};
         if (f.negedge) p.push_back({"IS_C_INVERTED", "1", false});
         add_cell(t, name, std::move(p), std::move(c));
         break;
       }
       case Family::Generic: {
-        std::string t = std::string("$_DFF_") + (f.negedge ? "N" : "P");
+        // Yosys gate-level flops: $_DFF_P_, $_DFFE_PP_, $_DFF_PP0_, $_DFFE_PP0P_,
+        // $_SDFF_PP0_, $_SDFFE_PP0P_ (reset over enable)
+        const std::string ck = f.negedge ? "N" : "P";
+        std::string t;
         c = {{"C", false, {clk}}, {"D", false, {d}}, {"Q", true, {q}}};
-        if (has_r) { t += std::string("P") + (f.rval ? "1" : "0"); c.push_back({"R", false, {r}}); }
+        if (has_r || has_s) {
+          t = std::string(has_r ? "$_DFF" : "$_SDFF") + (has_e ? "E_" : "_") + ck + "P" +
+              ((has_r ? f.rval : f.sval) ? "1" : "0") + (has_e ? "P_" : "_");
+          c.push_back({"R", false, {has_r ? r : sr}});
+        } else {
+          t = has_e ? "$_DFFE_" + ck + "P_" : "$_DFF_" + ck + "_";
+        }
+        if (has_e) c.push_back({"E", false, {e}});
         if (f.init != 2) n_.inits.push_back({q, f.init});  // Yosys keeps it as the net's init attribute
-        add_cell(t + "_", name, {}, std::move(c));
+        add_cell(t, name, {}, std::move(c));
         break;
       }
+    }
+  }
+
+  // One multiplier on the family's DSP block.
+  void emit_mul(size_t k) {
+    const Box& B = g_.boxes[k];
+    ++n_.dsps;
+    n_.box_pins.emplace_back();
+    // operands padded to the block's width: by the sign, or by 0
+    auto operand = [&](const std::vector<Lit>& v, bool sg, size_t w) {
+      std::vector<int> r;
+      for (Lit l : v) { r.push_back(bit_of(l)); n_.box_pins.back().push_back({r.back(), l}); }
+      const int ext = sg ? r.back() : 0;
+      while (r.size() < w) r.push_back(ext);
+      return r;
+    };
+    auto product = [&](size_t w) {
+      std::vector<int> r;
+      for (size_t i = 0; i < w; ++i) r.push_back(i < B.sum.size() && B.sum[i] ? pos_[B.sum[i]] : fresh());
+      return r;
+    };
+    const std::string name = "mul" + std::to_string(k);
+    auto num = [](unsigned v, int w) { return bitstr(v, w); };
+    switch (fam_) {
+      case Family::Ice40: {
+        std::vector<Param> p;
+        for (const char* z : {"NEG_TRIGGER", "C_REG", "A_REG", "B_REG", "D_REG", "TOP_8x8_MULT_REG", "BOT_8x8_MULT_REG",
+                              "PIPELINE_16x16_MULT_REG1", "PIPELINE_16x16_MULT_REG2", "TOPADDSUB_UPPERINPUT",
+                              "BOTADDSUB_UPPERINPUT", "MODE_8x8"})
+          p.push_back({z, "0", false});
+        for (const char* z : {"TOPADDSUB_LOWERINPUT", "TOPADDSUB_CARRYSELECT", "BOTADDSUB_LOWERINPUT", "BOTADDSUB_CARRYSELECT"})
+          p.push_back({z, "00", false});
+        p.push_back({"TOPOUTPUT_SELECT", "11", false});
+        p.push_back({"BOTOUTPUT_SELECT", "11", false});
+        p.push_back({"A_SIGNED", B.sa ? "1" : "0", false});
+        p.push_back({"B_SIGNED", B.sb ? "1" : "0", false});
+        add_cell("SB_MAC16", name, std::move(p),
+                 {{"A", false, operand(B.a, B.sa, 16)}, {"B", false, operand(B.b, B.sb, 16)}, {"O", true, product(32)}});
+        break;
+      }
+      case Family::Ecp5: {
+        std::vector<Conn> c;
+        auto bus = [&](const char* pre, const std::vector<int>& v, bool out) {
+          for (size_t i = 0; i < v.size(); ++i) c.push_back({pre + std::to_string(i), out, {v[i]}});
+        };
+        bus("A", operand(B.a, B.sa, 18), false);
+        bus("B", operand(B.b, B.sb, 18), false);
+        bus("C", std::vector<int>(18, 0), false);
+        c.push_back({"SIGNEDA", false, {B.sa ? 1 : 0}});
+        c.push_back({"SIGNEDB", false, {B.sb ? 1 : 0}});
+        c.push_back({"SOURCEA", false, {0}});
+        c.push_back({"SOURCEB", false, {0}});
+        bus("P", product(36), true);
+        add_cell("MULT18X18D", name,
+                 {{"REG_INPUTA_CLK", "NONE", true}, {"REG_INPUTB_CLK", "NONE", true}, {"REG_INPUTC_CLK", "NONE", true},
+                  {"REG_PIPELINE_CLK", "NONE", true}, {"REG_OUTPUT_CLK", "NONE", true}, {"SOURCEB_MODE", "B_SHIFT", true},
+                  {"MULT_BYPASS", "DISABLED", true}, {"RESETMODE", "SYNC", true}, {"GSR", "DISABLED", true}},
+                 std::move(c));
+        break;
+      }
+      case Family::Xc7: {
+        std::vector<Param> p;
+        for (const char* z : {"ACASCREG", "ADREG", "ALUMODEREG", "AREG", "BCASCREG", "BREG", "CARRYINREG", "CARRYINSELREG",
+                              "CREG", "DREG", "INMODEREG", "MREG", "OPMODEREG", "PREG"})
+          p.push_back({z, num(0, 32), false});
+        p.push_back({"A_INPUT", "DIRECT", true});
+        p.push_back({"B_INPUT", "DIRECT", true});
+        p.push_back({"USE_MULT", "MULTIPLY", true});
+        p.push_back({"USE_SIMD", "ONE48", true});
+        p.push_back({"USE_DPORT", "FALSE", true});
+        const std::vector<int> z48(48, 0);
+        auto zeros = [](size_t w) { return std::vector<int>(w, 0); };
+        std::vector<int> opmode = {1, 0, 1, 0, 0, 0, 0};   // 7'b0000101: P = M
+        add_cell("DSP48E1", name, std::move(p),
+                 {{"A", false, operand(B.a, true, 30)}, {"B", false, operand(B.b, true, 18)}, {"C", false, zeros(48)},
+                  {"D", false, zeros(25)}, {"CARRYIN", false, {0}}, {"INMODE", false, zeros(5)}, {"ALUMODE", false, zeros(4)},
+                  {"OPMODE", false, opmode}, {"CARRYINSEL", false, zeros(3)}, {"ACIN", false, zeros(30)},
+                  {"BCIN", false, zeros(18)}, {"PCIN", false, zeros(48)}, {"P", true, product(48)}});
+        break;
+      }
+      case Family::Generic:
+        throw std::runtime_error("fpga: the generic family has no DSP cells");
+    }
+  }
+
+  // The carry chain of one box.
+  void emit_box(size_t k) {
+    const Box& B = g_.boxes[k];
+    if (B.mul) { emit_mul(k); return; }
+    // ecp5 and xc7 chains have a LUT per bit: it takes b as it is and inverts
+    // inside. ice40's SB_CARRY has none, so a subtraction needs b inverted outside.
+    const bool inv = B.binv && fam_ != Family::Ice40;
+    std::vector<int> A, Bb, S;   // operand nets and sum nets (-1: not used)
+    n_.box_pins.emplace_back();
+    for (Lit l : B.a) { A.push_back(bit_of(l)); n_.box_pins.back().push_back({A.back(), l}); }
+    for (Lit l : B.b) { Bb.push_back(bit_of(l ^ (Lit)inv)); n_.box_pins.back().push_back({Bb.back(), l ^ (Lit)inv}); }
+    const int pad = inv ? 1 : 0;   // an operand bit that is 0 past the top
+    for (uint32_t v : B.sum) S.push_back(v ? pos_[v] : -1);
+    int cout = B.cout ? pos_[B.cout] : -1;
+    const std::string base = "add" + std::to_string(k) + "_";
+    if (fam_ == Family::Ecp5 && cout >= 0) {
+      // the carry leaves the chain as the sum of one more bit: 0 + 0 + carry
+      A.push_back(0); Bb.push_back(pad); S.push_back(cout);
+      cout = -1;
+    }
+    size_t w = A.size();
+    if (cout < 0) while (w > 0 && S[w - 1] < 0) --w;   // bits above the last used sum
+    n_.carry_bits += w;
+    ++n_.chains;
+    int c = B.cin ? 1 : 0;
+    switch (fam_) {
+      case Family::Ice40:
+        for (size_t i = 0; i < w; ++i) {
+          const std::string id = base + std::to_string(i);
+          if (S[i] >= 0) {
+            // the sum LUT shares a logic cell with its SB_CARRY: I1, I2 are the operands, I3 the carry in
+            uint64_t x = (detail::kVarTT[1] ^ detail::kVarTT[2] ^ detail::kVarTT[3]) & 0xffff;
+            ++n_.luts;
+            add_cell("SB_LUT4", id + "_sum", {{"LUT_INIT", bitstr(x, 16), false}},
+                     {{"I0", false, {0}}, {"I1", false, {A[i]}}, {"I2", false, {Bb[i]}}, {"I3", false, {c}}, {"O", true, {S[i]}}});
+          }
+          const bool last = i + 1 == w;
+          if (last && cout < 0) break;
+          int co = last ? cout : fresh();
+          add_cell("SB_CARRY", id + "_carry", {},
+                   {{"CI", false, {c}}, {"I0", false, {A[i]}}, {"I1", false, {Bb[i]}}, {"CO", true, {co}}});
+          c = co;
+        }
+        break;
+      case Family::Ecp5:
+        for (size_t i = 0; i < w; i += 2) {
+          const bool two = i + 1 < w;
+          int co = fresh();
+          add_cell("CCU2C", base + std::to_string(i),
+                   // with C = 0 and D = 1 INIT[11:8] is the propagate LUT of A, B (xor, or xnor to
+                   // subtract) and INIT[3:0] the generate LUT (A)
+                   {{"INIT0", inv ? "1001100110101010" : "1001011010101010", false},
+                    {"INIT1", inv ? "1001100110101010" : "1001011010101010", false},
+                    {"INJECT1_0", "NO", true}, {"INJECT1_1", "NO", true}},
+                   {{"CIN", false, {c}},
+                    {"A0", false, {A[i]}}, {"B0", false, {Bb[i]}}, {"C0", false, {0}}, {"D0", false, {1}},
+                    {"A1", false, {two ? A[i + 1] : 0}}, {"B1", false, {two ? Bb[i + 1] : pad}}, {"C1", false, {0}}, {"D1", false, {1}},
+                    {"S0", true, {S[i] >= 0 ? S[i] : fresh()}}, {"S1", true, {two && S[i + 1] >= 0 ? S[i + 1] : fresh()}},
+                    {"COUT", true, {co}}});
+          c = co;
+        }
+        break;
+      case Family::Xc7:
+        for (size_t i = 0; i < w; i += 4) {
+          std::vector<int> di(4, 0), sel(4, 0), o(4), co(4);
+          for (size_t j = 0; j < 4; ++j) {
+            o[j] = i + j < w && S[i + j] >= 0 ? S[i + j] : fresh();
+            co[j] = i + j + 1 == w && cout >= 0 ? cout : fresh();
+            if (i + j >= w) continue;
+            di[j] = A[i + j];
+            sel[j] = fresh();   // propagate: a ^ b
+            int in[2] = {A[i + j], Bb[i + j]};
+            emit_lut_cell(in, 2, inv ? 9 : 6, sel[j], base + std::to_string(i + j) + "_p");
+          }
+          add_cell("CARRY4", base + std::to_string(i), {},
+                   {{"CI", false, {i ? c : 0}}, {"CYINIT", false, {i ? 0 : c}}, {"DI", false, di}, {"S", false, sel},
+                    {"O", true, o}, {"CO", true, co}});
+          c = co[3];
+        }
+        break;
+      case Family::Generic:
+        throw std::runtime_error("fpga: the generic family has no carry cells");
     }
   }
 
@@ -1190,11 +1801,14 @@ inline std::string check_netlist(const Aig& g, const Netlist& n, int rounds = 16
           for (size_t k = 0; k < p.bits.size(); ++k) b[np.bits[k]] = a[lit_var(p.bits[k])];
     }
     for (uint32_t v = 1 + g.nin; v < fa; ++v) b[n.ci_bit[v]] = a[v];
+    for (auto& bx : g.boxes) bx.for_each_out([&](uint32_t v) { b[n.ci_bit[v]] = a[v]; });   // chains are cut points
     for (auto& c : n.cells) {
       const std::string& t = c.type;
       if (t == "IBUF" || t == "OBUF") { b[c.conns[1].bits[0]] = b[c.conns[0].bits[0]]; continue; }
       const bool lut = t == "SB_LUT4" || t == "LUT4" || t == "$lut" || (t.size() == 4 && t.compare(0, 3, "LUT") == 0);
       if (!lut) continue;
+      if (c.name.compare(0, 3, "add") == 0 && c.name.size() > 4 && c.name.compare(c.name.size() - 4, 4, "_sum") == 0)
+        continue;   // the sum LUT of a carry chain: its output is a cut point
       std::vector<int> in;
       int out = -1;
       for (auto& cn : c.conns) {
@@ -1225,6 +1839,13 @@ inline std::string check_netlist(const Aig& g, const Netlist& n, int rounds = 16
       if (b[n.ff_bits[i][0]] != val(f.d)) return "flop " + std::to_string(i) + " D differs";
       if (b[n.ff_bits[i][1]] != val(f.clk)) return "flop " + std::to_string(i) + " clock differs";
       if (b[n.ff_bits[i][2]] != val(f.arst)) return "flop " + std::to_string(i) + " reset differs";
+      if (b[n.ff_bits[i][3]] != val(f.en)) return "flop " + std::to_string(i) + " enable differs";
+      if (b[n.ff_bits[i][4]] != val(f.srst)) return "flop " + std::to_string(i) + " synchronous reset differs";
+    }
+    for (size_t k = 0; k < g.boxes.size(); ++k) {
+      bool ok = true;
+      for (auto& pn : n.box_pins[k]) ok = ok && b[pn.first] == val(pn.second);
+      if (!ok) return "carry chain " + std::to_string(k) + " operand differs";
     }
   }
   return "";
