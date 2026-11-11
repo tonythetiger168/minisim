@@ -23,11 +23,19 @@ inline LayerMap defaultLayerMap(const phys::Tech& tech) {
     return m;
 }
 
-inline bool fromDef(const phys::Tech& tech, const phys::Design& d, const LayerMap& map, bool withObs, Flat& out,
-                    std::string& err) {
-    out = Flat();
-    out.top = d.name;
-    out.dbu = 1.0 / d.dbu;
+// Where a shape of a routed design comes from.
+struct DefShape {
+    enum Kind { CompPin, Obs, Wire, SpecialWire, IoPin } kind = Wire;
+    uint32_t a = 0;   // CompPin, Obs: component index; Wire, SpecialWire: net index; IoPin: pin index
+    uint32_t b = 0;   // CompPin: the pin's index in its macro
+};
+
+// Calls f(layer name, rectangle in design units, DefShape) for every shape of
+// the placed components' pins (and obstructions, when asked), the routed
+// wires and vias of the nets and special nets, and the design's pins.
+// Diagonal wires are counted in `skipped`.
+template <class F>
+bool defShapes(const phys::Tech& tech, const phys::Design& d, bool withObs, size_t& skipped, std::string& err, F&& f) {
     if (tech.dbu != d.dbu) {
         // LEF shapes are in the LEF's units; bring them to the DEF's.
         if (d.dbu % tech.dbu != 0 && tech.dbu % d.dbu != 0) {
@@ -36,24 +44,24 @@ inline bool fromDef(const phys::Tech& tech, const phys::Design& d, const LayerMa
         }
     }
     auto scale = [&](int64_t v) { return v * d.dbu / tech.dbu; };
-    auto add = [&](const std::string& layer, phys::Rect r) {
-        auto it = map.find(layer);
-        if (it == map.end()) return;
+    auto add = [&](const std::string& layer, phys::Rect r, DefShape src) {
         r.normalize();
         if (r.x0 == r.x1 || r.y0 == r.y1) return;
-        out.layers[it->second].push_back({C(r.x0), C(r.y0), C(r.x1), C(r.y1)});
-        ++out.shapes;
+        f(layer, r, src);
     };
     auto lefRect = [&](phys::Rect r) { return phys::Rect{scale(r.x0), scale(r.y0), scale(r.x1), scale(r.y1)}; };
-    for (const phys::Component& c : d.comps) {
+    for (uint32_t ci = 0; ci < d.comps.size(); ++ci) {
+        const phys::Component& c = d.comps[ci];
         const phys::Macro* m = tech.macro(c.macro);
         if (!m) { err = "component " + c.name + ": no macro " + c.macro + " in the LEF"; return false; }
         if (c.status.empty()) continue;   // not placed
         int64_t w = scale(m->w), h = scale(m->h);
-        for (const phys::MacroPin& p : m->pins)
-            for (const phys::LayerRect& s : p.ports) add(s.layer, phys::xform(lefRect(s.r), c.orient, w, h, c.x, c.y));
+        for (uint32_t pi = 0; pi < m->pins.size(); ++pi)
+            for (const phys::LayerRect& s : m->pins[pi].ports)
+                add(s.layer, phys::xform(lefRect(s.r), c.orient, w, h, c.x, c.y), {DefShape::CompPin, ci, pi});
         if (withObs)
-            for (const phys::LayerRect& s : m->obs) add(s.layer, phys::xform(lefRect(s.r), c.orient, w, h, c.x, c.y));
+            for (const phys::LayerRect& s : m->obs)
+                add(s.layer, phys::xform(lefRect(s.r), c.orient, w, h, c.x, c.y), {DefShape::Obs, ci, 0});
     }
     auto viaDef = [&](const std::string& n, bool& fromLef) -> const phys::ViaDef* {
         for (const phys::ViaDef& v : d.vias)
@@ -61,8 +69,10 @@ inline bool fromDef(const phys::Tech& tech, const phys::Design& d, const LayerMa
         fromLef = true;
         return tech.via(n);
     };
-    auto nets = [&](const std::vector<phys::Net>& ns) {
-        for (const phys::Net& n : ns) {
+    auto nets = [&](const std::vector<phys::Net>& ns, DefShape::Kind kind) {
+        for (uint32_t ni = 0; ni < ns.size(); ++ni) {
+            const phys::Net& n = ns[ni];
+            DefShape src{kind, ni, 0};
             for (const phys::Seg& s : n.segs) {
                 const phys::Layer* l = tech.layer(s.layer);
                 int64_t w = s.width;
@@ -83,12 +93,12 @@ inline bool fromDef(const phys::Tech& tech, const phys::Design& d, const LayerMa
                 int64_t hw = w / 2, e0 = s.ext0 < 0 ? hw : s.ext0, e1 = s.ext1 < 0 ? hw : s.ext1;
                 if (s.y0 == s.y1) {
                     bool fwd = s.x0 <= s.x1;
-                    add(s.layer, {std::min(s.x0, s.x1) - (fwd ? e0 : e1), s.y0 - hw, std::max(s.x0, s.x1) + (fwd ? e1 : e0), s.y0 + hw});
+                    add(s.layer, {std::min(s.x0, s.x1) - (fwd ? e0 : e1), s.y0 - hw, std::max(s.x0, s.x1) + (fwd ? e1 : e0), s.y0 + hw}, src);
                 } else if (s.x0 == s.x1) {
                     bool fwd = s.y0 <= s.y1;
-                    add(s.layer, {s.x0 - hw, std::min(s.y0, s.y1) - (fwd ? e0 : e1), s.x0 + hw, std::max(s.y0, s.y1) + (fwd ? e1 : e0)});
+                    add(s.layer, {s.x0 - hw, std::min(s.y0, s.y1) - (fwd ? e0 : e1), s.x0 + hw, std::max(s.y0, s.y1) + (fwd ? e1 : e0)}, src);
                 } else {
-                    ++out.skipped;   // a diagonal wire
+                    ++skipped;   // a diagonal wire
                 }
             }
             for (const phys::Via& v : n.vias) {
@@ -97,21 +107,33 @@ inline bool fromDef(const phys::Tech& tech, const phys::Design& d, const LayerMa
                 if (!def) { err = "net " + n.name + ": no via " + v.via + " in the LEF or the DEF"; return false; }
                 for (const phys::LayerRect& s : def->shapes) {
                     phys::Rect r = fromLef ? lefRect(s.r) : s.r;
-                    add(s.layer, {r.x0 + v.x, r.y0 + v.y, r.x1 + v.x, r.y1 + v.y});
+                    add(s.layer, {r.x0 + v.x, r.y0 + v.y, r.x1 + v.x, r.y1 + v.y}, src);
                 }
             }
-            for (const phys::LayerRect& s : n.rects) add(s.layer, s.r);
+            for (const phys::LayerRect& s : n.rects) add(s.layer, s.r, src);
         }
         return true;
     };
-    if (!nets(d.nets) || !nets(d.specialNets)) return false;
-    for (const phys::IoPin& p : d.pins)
-        for (const phys::LayerRect& s : p.shapes) {
-            add(s.layer, s.r);
-            auto it = map.find(s.layer);
-            if (it != map.end())
-                out.labels.push_back({it->second.layer, it->second.datatype, C((s.r.x0 + s.r.x1) / 2), C((s.r.y0 + s.r.y1) / 2), p.name});
-        }
+    if (!nets(d.nets, DefShape::Wire) || !nets(d.specialNets, DefShape::SpecialWire)) return false;
+    for (uint32_t pi = 0; pi < d.pins.size(); ++pi)
+        for (const phys::LayerRect& s : d.pins[pi].shapes) add(s.layer, s.r, {DefShape::IoPin, pi, 0});
+    return true;
+}
+
+inline bool fromDef(const phys::Tech& tech, const phys::Design& d, const LayerMap& map, bool withObs, Flat& out,
+                    std::string& err) {
+    out = Flat();
+    out.top = d.name;
+    out.dbu = 1.0 / d.dbu;
+    bool ok = defShapes(tech, d, withObs, out.skipped, err, [&](const std::string& layer, const phys::Rect& r, DefShape src) {
+        auto it = map.find(layer);
+        if (it == map.end()) return;
+        out.layers[it->second].push_back({C(r.x0), C(r.y0), C(r.x1), C(r.y1)});
+        ++out.shapes;
+        if (src.kind == DefShape::IoPin)
+            out.labels.push_back({it->second.layer, it->second.datatype, C((r.x0 + r.x1) / 2), C((r.y0 + r.y1) / 2), d.pins[src.a].name});
+    });
+    if (!ok) return false;
     bool first = true;
     for (const auto& [key, rs] : out.layers)
         for (const Rect& r : rs) {

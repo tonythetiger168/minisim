@@ -166,7 +166,8 @@ struct Writer {
     }
     void strans(const Ref& r) {
         if (!r.mirror && r.mag == 1.0 && r.angle == 0.0) return;
-        s16(STRANS, r.mirror ? 0x8000 : 0);
+        rec(STRANS, 1, 2);   // a bit array, not an integer
+        i16(r.mirror ? 0x8000 : 0);
         if (r.mag != 1.0) real(MAG, r.mag);
         if (r.angle != 0.0) real(ANGLE, r.angle);
     }

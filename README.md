@@ -53,7 +53,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
 | `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
 | `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
-| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck and design rule checks |
+| `src/oasis.hpp` | OASIS reader into the same library; `oasis::readLayout` takes GDSII or OASIS |
+| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/lvs.hpp`, `src/lvs_block.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck, design rule checks and LVS |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -216,9 +217,11 @@ one where no term decides alone (all 1 for `&&`, all 0 for `||`) and, for each
 term, the one where only that term has the deciding value. A vector with an
 x term counts for none. Conditions in procedures, continuous assignments,
 functions and tasks are covered; not those in constraints, assertions and
-covergroups, constant ones, or ones whose terms call a function or read
-through a class handle or a container (every term is evaluated to tell the
-vectors apart, so a term must be safe to evaluate).
+covergroups, or constant ones. To tell the vectors apart every term is
+evaluated, so a condition with a term that `&&` or `||` must be able to skip
+(it calls a function, or reads through a class handle or a container) is
+counted as it runs instead: vector i is "term i is the first that decides",
+and the report shows the terms after it as `-`.
 
 **FSM coverage** (as VCS `-cm fsm`). msim finds the state registers itself: a
 variable that one clocked procedure assigns, whose next value is always a
@@ -230,9 +233,11 @@ ones the next-state logic can make. A constant assigned under an `if` outside
 any branch on the state is taken as the reset, and transitions that only the
 reset makes are marked `(reset)`; `mcov report -fsm-reset-filter` leaves them
 out (VCS `-cm_fsmresetfilter`). A change the logic does not show (a forced
-value, say) is listed as "not in the next-state logic". Not extracted: one-hot
-registers tested bit by bit, states computed by arithmetic, registers written
-through a part select or by a task.
+value, say) is listed as "not in the next-state logic". One-hot registers
+tested bit by bit are extracted too (`case (1'b1)` with items `state[K]`,
+`if (state[K])`, next-state logic that clears the vector and sets
+`next[K]`); their states are named after the index. Not extracted: states
+computed by arithmetic, registers written through a part select or by a task.
 
 ```sh
 mcov report all.json -detail              # every vector, state and transition
@@ -272,7 +277,7 @@ plan uart "UART verification plan"
   owner: tony
   feature tx "Transmit path" weight=2 owner=alice
     test   uart_tx_*                # mregress tests
-    line   rtl/uart_tx.sv goal=95   # code coverage
+    line   rtl/uart_tx.sv goal=95   # code coverage (also branch, toggle, cond, fsm)
     cover  tb.cg_tx                 # a covergroup type, or type.item
     assert tb.dut.u_tx              # the assertions in that scope
     feature parity "Parity"
@@ -547,6 +552,19 @@ lists every domain and crossing, `-clock-group a,b` declares related clocks
 and `-static sig` waives a quasi-static signal. Findings print as
 `file:line:col: severity: [RULE] text`, sorted by file and line.
 
+### Power analysis: `mpower`
+
+`mpower` reports average and peak power from a simulation's switching
+activity (SAIF, VCD or FST) and a Liberty library, for a gate netlist or as
+an estimate for RTL, by group, instance, cell and UPF power domain
+([docs/POWER.md](docs/POWER.md)):
+
+```sh
+msim cells.v netlist.v tb.sv -top tb -saif run.saif
+mpower netlist.v -top dut -lib cells.lib -activity run.saif -strip_path tb.dut
+mpower rtl.sv -top dut -activity run.fst -peak -waveform power.csv   # RTL estimate, power over time
+```
+
 ### Source-level debug: `mdebug`
 
 `mdebug` lists the drivers and loads of a signal with the conditions on each
@@ -590,6 +608,18 @@ msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cell
 ```
 
 See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
+
+### FPGA synthesis: `mfpga`
+
+`mfpga` maps RTL (through the same elaborator as `msynth`) or an AIGER graph
+to the LUTs and flip-flops of an FPGA family (iCE40, ECP5, Xilinx 7-series,
+generic) and writes Yosys JSON for nextpnr or EDIF.
+
+```sh
+mfpga rtl/*.sv -top core -family ice40 -o core.json   # then: nextpnr-ice40 --json core.json ...
+```
+
+See [docs/FPGA.md](docs/FPGA.md).
 
 ### Formal property checking: `mformal`
 
@@ -671,6 +701,26 @@ mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v 
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
+### Test patterns: `matpg`
+
+`matpg` generates manufacturing test patterns for a scan-inserted gate
+netlist and reports the fault coverage: stuck-at faults, and transition
+faults by launch-on-capture. It builds with the core, without slang.
+
+```sh
+matpg scan.v                                   # stuck-at patterns and coverage
+matpg scan.v -fault all -stil p.stil -tb p_tb.v
+matpg scan.v -lib cells.lib -min_coverage 98   # Liberty cells; gate for CI
+matpg scan.v -faultsim p.pat                   # grade existing patterns
+```
+
+It traces the scan chains from the ports, runs random patterns and then
+PODEM, fault-simulates every pattern against every remaining fault (64
+patterns to the word, on every core, the same result for any `-threads N`),
+compacts, and writes STIL, a self-checking Verilog testbench that `msim`
+replays, and a fault list with each fault's class. See
+[docs/ATPG.md](docs/ATPG.md).
+
 ### Emulation and FPGA prototyping: `memu`
 
 `memu` is the step between synthesis and FPGA place and route that makes a
@@ -716,7 +766,7 @@ coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
 ### Physical verification: `mpv`
 
-`mpv drc` checks a GDSII layout against a rule deck: width, spacing,
+`mpv drc` checks a GDSII or OASIS layout against a rule deck: width, spacing,
 enclosure, overhang, area and density checks on drawn and derived layers
 (`&`, `|`, `-`, `grow`, `interact`, ...). It needs no slang and builds with
 the default configuration.
@@ -732,9 +782,17 @@ rule poly.8   overhang(poly, diff) < 0.13   "poly end cap beyond diff"
 rule licon.5a enclosure(licon & diff, diff | tap) < 0.04  "diff enclosure of licon"
 ```
 
-It runs on every hardware thread by default (`-threads N`), with the same
-report for every thread count. The deck format, the results file and the
-limits are in [docs/MPV.md](docs/MPV.md).
+`mpv lvs` compares a routed block with its gate netlist. The nets are found
+from the geometry of the DEF and LEF, so a missing via is an open and a
+stray wire is a short:
+
+```sh
+mpv lvs -lef tech.lef routed.def -netlist block.v      # exit 1 on a mismatch
+```
+
+It runs on every logical CPU by default (`-threads N`), with the same
+report for every thread count. The deck format, the results file, LVS and
+the limits are in [docs/MPV.md](docs/MPV.md).
 
 ### Virtual prototypes: `-mvp`
 

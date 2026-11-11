@@ -29,6 +29,8 @@ plan uart "UART verification plan"
     line   rtl/uart_tx.sv goal=95   # code coverage of the files
     branch rtl/uart_tx.sv goal=90
     toggle tb.dut.u_tx goal=80      # signals in that scope
+    cond   rtl/uart_tx.sv           # condition coverage of the files
+    fsm    tb.dut.u_tx.state        # an FSM (instance.state variable), or a scope
     cover  tb.cg_tx                 # a covergroup type, or type.item
     assert tb.dut.u_tx              # assertions in that scope
     feature parity "Parity"
@@ -56,6 +58,8 @@ whole path.
 | `line` | Lines hit over lines, of the matched files |
 | `branch` | Branch outcomes seen over outcomes, of the matched files |
 | `toggle` | Bits toggled both ways over bits, of the matched signals |
+| `cond` | Condition vectors seen over vectors, of the conditions in the matched files |
+| `fsm` | States reached plus transitions taken, over states plus transitions, of the matched FSMs. An FSM is named `instance.variable`; a scope matches every FSM below it. Reset transitions count |
 | `cover` | The matched covergroup items, each bins covered over bins (a bin is covered at `option.at_least` hits), weighed by `option.weight`. The instances of a type are joined by bin name (IEEE 1800-2023 19.11.3) |
 | `assert` | `assert` / `assume` directives that passed at least once and never failed, plus `cover` directives that were hit, over directives matched |
 
@@ -82,7 +86,7 @@ output directory gets:
 - `plan.html`: one self-contained page. Summary tiles, the trend chart, the
   feature tree with a bar and goal mark per metric, the failure triage
   table with a reproduce command per bucket, and the results that no plan
-  line points at (tests, files, covergroups, assertions).
+  line points at (tests, files, FSMs, covergroups, assertions).
 - `plan.json`: the same, for scripts.
 - `history.jsonl`: one snapshot per line (see below).
 

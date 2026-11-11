@@ -3,8 +3,8 @@
 
     python3 bench/gen_pnr.py CELLS [SEED] > design.v
 
-The cells are those of tests/pnr/tiny.lef (or, with --nangate, the Nangate45
-names). Each gate input picks a driver that was made shortly before it, so the
+The cells are those of tests/pnr/tiny.lef (or, with --mini45, of lib/mini45;
+with --nangate, the Nangate45 names). Each gate input picks a driver that was made shortly before it, so the
 netlist has the locality of real logic; one cell in eight is a flop on `clk`.
 """
 import random
@@ -27,6 +27,10 @@ else:
              ("NAND3", ["A", "B", "C"], "Y"), ("NOR3", ["A", "B", "C"], "Y"), ("AOI21", ["A1", "A2", "B"], "Y"),
              ("OAI21", ["A1", "A2", "B"], "Y"), ("MUX2", ["A", "B", "S"], "Y")]
     FLOP = ("DFF", "D", "CK", "Q")
+
+if "--mini45" in sys.argv:                 # lib/mini45: the same cells and pins, with a drive strength
+    GATES = [(g + "_X1", ins, o) for g, ins, o in GATES]
+    FLOP = (FLOP[0] + "_X1",) + FLOP[1:]
 
 nin = max(4, int(n ** 0.5))
 nout = max(4, int(n ** 0.5))
