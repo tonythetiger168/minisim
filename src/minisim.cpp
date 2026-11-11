@@ -787,7 +787,7 @@ struct Sim {
     void fastInit() {
         quiet.assign(sigs.size(), 1);
         for (size_t s = 0; s < sigs.size(); s++) {
-            if (sigs[s].w > 64 || sigs[s].net && sigs[s].drv.empty()) quiet[s] = 0;
+            if (sigs[s].w > 64) quiet[s] = 0;   // (a net whose one continuous assign msim merged into a plain write has no driver and is stored like a variable)
             if (s < tranOf.size() && !tranOf[s].empty()) quiet[s] = 0;   // a tran net: drive() resolves its group
             if (s < seqOf.size())
                 if (!seqOf[s].empty()) quiet[s] = 0;   // a clock: set() detects its edges
@@ -837,13 +837,36 @@ struct Sim {
         }
         drive(s, d, make(v & mask(g.w), 0, g.w), s0, s1);
     }
+    // Bits [hi:lo] (at most 64) of signal s already hold the known value u.
+    bool samePart(int s, int hi, int lo, uint64_t u) const {
+        const Val& c = sigs[s].val;
+        if (hi >= sigs[s].w) return false;
+        int n = hi - lo + 1, li = lo / 64, off = lo % 64;
+        uint64_t v = limbV(c, li) >> off, x = limbX(c, li) >> off;
+        if (off && off + n > 64) { v |= limbV(c, li + 1) << (64 - off); x |= limbX(c, li + 1) << (64 - off); }
+        uint64_t m = mask(n);
+        return (v & m) == (u & m) && (x & m) == 0;
+    }
     __attribute__((noinline)) void fwSlow(int s, const Val& in) {
         Sig& g = sigs[s];
         // Only a waveform (or coverage) watches a quiet signal: compare, store
         // and record the change. A full set() would also queue the domain's
         // comb pass and scan for waiters, which made -vcd runs 20x slower.
+        // Most writes of a comb pass store what is already there.
+        if (g.w <= 64 && g.val.hi.empty() && !g_cov) {
+            uint64_t m = mask(g.w);
+            if ((in.v & m) == g.val.v && (in.x & m) == g.val.x && (in.z & m) == g.val.z && in.real == g.val.real && in.str == g.val.str) return;
+        }
         bool waveOnly = !mon.on && !g.fl;
-        if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) { set(s, in); return; }
+        if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) {
+#ifdef MSIM_FWSTAT
+            { static struct St { std::map<std::string, long> m; ~St() { std::vector<std::pair<long, std::string>> v; for (auto& [k, c] : m) v.push_back({c, k});
+                std::sort(v.rbegin(), v.rend()); for (size_t i = 0; i < v.size() && i < 400; i++) std::fprintf(stderr, "FW %ld %s\n", v[i].first, v[i].second.c_str()); } } st;
+              std::string why = !quiet[s] ? (!seqOf[s].empty() ? "seq " : "comb ") : !waiters[s].empty() ? "wait " : "obs ";
+              if (!quiet[s] && seqOf[s].empty()) { why = "comb"; if (sigs[s].w > 64) why += ":wide"; if ((size_t)s < combOf.size()) for (int r : combOf[s]) why += r == fastComb ? ":all" : ":r" + std::to_string(r); why += " "; }
+              st.m[why + sigs[s].name]++; }
+#endif
+            set(s, in); return; }
         if (g.w <= 64 && g.val.hi.empty()) {   // the common case, without copying a Val
             uint64_t m = mask(g.w), v = in.v & m, x = in.x & m, z = in.z & m;
             if (v == g.val.v && x == g.val.x && z == g.val.z) return;
@@ -2337,7 +2360,12 @@ struct Sim {
         ws.erase(ws.begin() + (ptrdiff_t)keep, ws.end());
         if ((size_t)s < combOf.size())
             for (int r : combOf[s])
-                if (r != curComb) markComb(r);
+                if (r != curComb) {
+#ifdef MSIM_FWSTAT
+                    if (r == fastComb) { static struct St { std::map<std::string, long> m; ~St() { for (auto& [k, c] : m) std::fprintf(stderr, "MARK %ld %s\n", c, k.c_str()); } } st; st.m[sigs[s].name]++; }
+#endif
+                    markComb(r);
+                }
         if ((size_t)s < seqOf.size())
             for (auto& [id, e] : seqOf[s])
                 if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {

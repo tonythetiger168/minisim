@@ -650,6 +650,23 @@ mformal rtl/*.sv -top fifo -depth 40 -tb    # deeper, with replay testbenches
 Properties are checked in parallel on every core (`-threads N`), with the
 same result for any thread count. See `docs/FORMAL.md` for the model (clock,
 reset, two-state values, what is cut) and the supported property operators.
+### Portable stimulus: `mpss`
+
+`mpss` reads a test model in the Accellera PSS language, solves scenarios
+from it, and writes each one as a UVM sequence and as a C test function, so
+the same test runs in simulation and on the processor:
+
+```sh
+mpss examples/pss/dma.pss -n 20 -seed 1 -print      # show the solved scenarios
+mpss examples/pss/dma.pss -n 20 -sv dma_tests_pkg.sv -c dma_tests.c
+msim -uvm dma_tests_pkg.sv my_tb.sv -top top        # run the sequences
+```
+
+It picks the random fields, gives each action a free resource instance, and
+adds the actions a scenario needs but the test did not name (the write
+before a read). Scenarios are solved on all cores, and the output is the
+same for every `-threads` value. `docs/MPSS.md` has the supported subset of
+the language and the shape of the generated code.
 
 ### Equivalence checking: `mequiv`
 
@@ -664,6 +681,20 @@ mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
 ```
 
 See [docs/EQUIV.md](docs/EQUIV.md).
+
+### Functional ECO: `meco`
+
+`meco` turns a late RTL change into the smallest edit of the netlist that is
+already implemented, the way Conformal ECO does: it compares the old netlist
+with a fresh synthesis of the new RTL, finds the gates to change, reuses every
+old net that still has the right function, and proves the patched netlist
+equivalent to the new design.
+
+```sh
+meco -old impl.v -new resynth.v -lib cells.lib -o patched.v -script eco.tcl
+```
+
+See [docs/ECO.md](docs/ECO.md).
 
 ### Design for test: `mdft`
 

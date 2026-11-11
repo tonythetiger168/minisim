@@ -73,6 +73,22 @@ want("check_timing: 0"
 if(out MATCHES "sel \\(in\\)")
   message(FATAL_ERROR "the false path from sel was reported\n${out}")
 endif()
+#  Hold at rc/D, between clocks of different periods (clk 4, clk2 6, common
+#  period 12). clk falls at 2, 6, 10; clk2 rises at 1, 7, 13. The setup pairs
+#  are 6 -> 7 and 10 -> 13, so the hold pairs are 6 -> 1, 10 -> 7 (twice) and
+#  14 -> 13: the last is the tightest, the same as 2 -> 1.
+#  Arrival 2 + 0.090 + 0.148 = 2.238, required 1 + 0.029: slack 1.208.
+want("clock clk (fall edge)                         2.000      2.000"
+     "clock clk2 (rise edge)                        1.000      1.000"
+     "slack (MET)                                              1.208")
+
+# An asynchronous reset to output arc is not a path unless asked for.
+#  rst_n arrives at 0.5, RN -> Q 0.236; required 4 - 0.1 - 1.5: slack 1.664.
+run(0 -lib ${LIB} soc.v -f soc.tcl -e "report_timing -from [get_ports rst_n] -to [get_ports {y[0]}]")
+want("No constrained max paths.")
+run(0 -lib ${LIB} soc.v -f soc.tcl -preset_clear_arcs -e "report_timing -from [get_ports rst_n] -to [get_ports {y[0]}]")
+want("rb/Q (DFFR_X1)                                0.236      0.736 f"
+     "slack (MET)                                              1.664")
 
 # --- exceptions and the rest of the constraints.
 #  clock groups cut clk2 from clk; latency 0.3 + 0.2 source on the ideal clk;

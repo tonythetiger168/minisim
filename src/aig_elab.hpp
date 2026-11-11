@@ -80,7 +80,18 @@ class Elaborator {
     struct Env {
         std::map<const Symbol*, Bits> blk, nba;
         Lit brk = L0, cont = L0, ret = L0, od = L0;   // od: dead in an enclosing loop or call
+        std::map<int, Lit> wen;   // memory write ports reached so far: port -> its enable
     };
+    // Memory ports seen while the current clocked block runs (Design::mems).
+    struct PendingPort {
+        const Symbol* sym;
+        MemPort port;
+        int ew, n;
+    };
+    std::vector<PendingPort> pendWr;
+    std::vector<PendingPort> memRd;
+    std::map<const Symbol*, size_t> memIdx;
+    bool inSeq = false;
     Env cur;
     bool inProc = false;
     bool forceLive = false;   // loop steps run even on paths that took a break
@@ -154,7 +165,7 @@ class Elaborator {
         for (int i = 0; i < w; i++) {
             if (i < n) {
                 slang::logic_t b = v[i];
-                r[i] = (!b.isUnknown() && (bool)b) ? L1 : L0;
+                r[i] = exactlyEqual(b, slang::logic_t::x) ? g.dontCare() : (!b.isUnknown() && (bool)b) ? L1 : L0;
             } else if (v.isSigned() && n > 0) {
                 r[i] = r[n - 1];
             }
@@ -316,7 +327,22 @@ class Elaborator {
             if (p < 0 || p >= n) return Bits(ew, L0);
             return Bits(v.begin() + p * ew, v.begin() + (p + 1) * ew);
         }
-        return pick(v, ew, n, dynPos(e.selector(), r, 0));
+        Bits t = dynPos(e.selector(), r, 0);
+        Bits out = pick(v, ew, n, t);
+        // A word of an unpacked array read from its registers: a memory read port.
+        if (e.value().kind == EK::NamedValue && e.value().type->isUnpackedArray()) {
+            const Symbol* sym = &e.value().as<slang::ast::ValueExpressionBase>().symbol;
+            if (!inProc || (!cur.blk.count(sym))) {
+                PendingPort pp;
+                pp.sym = sym;
+                pp.port.addr = t;
+                pp.port.data = out;
+                pp.ew = ew;
+                pp.n = n;
+                memRd.push_back(std::move(pp));
+            }
+        }
+        return out;
     }
     // Where a range select starts (LSB-end element position): constant or dynamic.
     bool rangeStart(const slang::ast::RangeSelectExpression& e, const slang::ConstantRange& r, int cnt, int64_t& p,
@@ -399,6 +425,22 @@ class Elaborator {
                     return;
                 }
                 Bits t = dynPos(es.selector(), r, 0);
+                // A word of an unpacked array written in a clocked block: a memory write port.
+                if (inSeq && m != Cont && es.value().kind == EK::NamedValue && es.value().type->isUnpackedArray() &&
+                    off >= 0 && off + (int)val.size() <= ew) {
+                    Lit live = g.andl(en, lneg(dead()));
+                    if (live != L0) {
+                        PendingPort pp;
+                        pp.sym = &es.value().as<slang::ast::ValueExpressionBase>().symbol;
+                        pp.port.addr = t;
+                        pp.port.data = val;
+                        pp.port.lo = off;
+                        pp.ew = ew;
+                        pp.n = n;
+                        cur.wen[(int)pendWr.size()] = live;
+                        pendWr.push_back(std::move(pp));
+                    }
+                }
                 for (int p = 0; p < n; p++) {
                     Lit hit = g.andl(en, g.eq(t, g.konst(p, (int)t.size())));
                     if (hit != L0) assignSlice(es.value(), p * ew + off, val, hit, m);
@@ -614,7 +656,8 @@ public:
             case EK::IntegerLiteral: return fromSV(e.as<IntegerLiteral>().getValue(), widthOf(*e.type, loc));
             case EK::UnbasedUnsizedIntegerLiteral: {
                 auto v = e.as<UnbasedUnsizedIntegerLiteral>().getLiteralValue();
-                return Bits(widthOf(*e.type, loc), (!v.isUnknown() && (bool)v) ? L1 : L0);
+                return Bits(widthOf(*e.type, loc),
+                            exactlyEqual(v, slang::logic_t::x) ? g.dontCare() : (!v.isUnknown() && (bool)v) ? L1 : L0);
             }
             case EK::StringLiteral: return fromCV(tryConst(e), *e.type, loc);
             case EK::NamedValue:
@@ -899,6 +942,13 @@ private:
             for (auto& [s, eb] : ee)
                 if (!te.count(s)) eb = g.bmux(c, wires(*s), eb);
         }
+        for (auto& [id, tl] : t.wen) {
+            auto it = e.wen.find(id);
+            if (it == e.wen.end()) e.wen[id] = g.andl(c, tl);
+            else it->second = g.mux(c, tl, it->second);
+        }
+        for (auto& [id, el] : e.wen)
+            if (!t.wen.count(id)) el = g.andl(lneg(c), el);
         e.brk = g.mux(c, t.brk, e.brk);
         e.cont = g.mux(c, t.cont, e.cont);
         e.ret = g.mux(c, t.ret, e.ret);
@@ -1264,7 +1314,30 @@ private:
             s = c.ifFalse;
         }
         Env d;
+        pendWr.clear();
+        inSeq = true;
         if (s) runBody(*s, d);
+        inSeq = false;
+        // The memory write ports of this block: enable, clock, and the table entry.
+        for (size_t k = 0; k < pendWr.size(); k++) {
+            PendingPort& pp = pendWr[k];
+            auto en = d.wen.find((int)k);
+            pp.port.en = en == d.wen.end() ? L0 : en->second;
+            if (hasRst) pp.port.en = g.andl(pp.port.en, lneg(rstC));
+            if (pp.port.en == L0) continue;
+            pp.port.clk = edges[0].sig;
+            pp.port.negedge = edges[0].neg;
+            auto [it, fresh] = memIdx.emplace(pp.sym, des.mems.size());
+            if (fresh) {
+                Memory m;
+                m.name = flopBase(*pp.sym);
+                m.width = pp.ew;
+                m.depth = pp.n;
+                des.mems.push_back(std::move(m));
+            }
+            des.mems[it->second].wr.push_back(std::move(pp.port));
+        }
+        pendWr.clear();
         std::vector<const Symbol*> syms;
         std::set<const Symbol*> seen;
         for (const Env* e : {&d, &rst})
@@ -1478,6 +1551,8 @@ public:
             des.ports.push_back(std::move(p));
         }
         scope(top.body);
+        for (auto& pp : memRd)
+            if (auto it = memIdx.find(pp.sym); it != memIdx.end()) des.mems[it->second].rd.push_back(std::move(pp.port));
         // Give every wire its driver.
         for (const Symbol* s : sigOrder) {
             const Bits& w = sig[s];

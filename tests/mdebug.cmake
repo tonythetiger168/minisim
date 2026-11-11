@@ -167,6 +167,17 @@ file(READ ${OUT}/struct.json page)
 if(NOT page MATCHES "\"fld\"" OR NOT page MATCHES "\"lo\":4,\"w\":4")
   message(FATAL_ERROR "the database has no field expressions or bit ranges")
 endif()
+# A read of one field follows that field only: its value, the last time it
+# changed and its driver, not the assignments to the other fields.
+execute_process(COMMAND ${MDEBUG} ${SV} -top st -vcd ${OUT}/struct.vcd -active st.u -at 50 -depth 3
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("u = p.hi + 4'd1" "st.p.hi = 4'h4 @45" "p.hi = q[3:0]" "st.q[3:0] = 4'h4 @45")
+if(out MATCHES "p.lo = 4'd3|p = '0")
+  message(FATAL_ERROR "field trace: a driver of another field was reported:\n${out}")
+endif()
+if(NOT page MATCHES "\"part\":{\"[0-9]+\":[[]4,4,\"[.]hi\"[]]}")
+  message(FATAL_ERROR "the database does not say which field a driver reads")
+endif()
 
 # Memories: msim -vcd-arrays writes the elements of small arrays, and the
 # active trace goes from the read to the element to the write. The default

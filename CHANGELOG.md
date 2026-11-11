@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
+  `q[3:0]`) follows only that part: its value, the time those bits last
+  changed, and the assignments that write them. The viewer page does the same.
 - `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
   elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
   the default waveform is unchanged. `mdebug -active` follows a memory read
@@ -96,6 +99,13 @@ Spec references are IEEE 1800-2023 clauses.
   the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
   `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
   (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
+- `meco`, a functional ECO tool: given the implemented gate netlist and a
+  netlist of the revised design, it writes the smallest patch it can find
+  (patched netlist plus a Tcl edit script) and proves the result equivalent.
+  It looks for the gate or pin to change before copying any logic, reuses old
+  nets proved to have the same function, handles added, removed and replaced
+  registers, scan flops (`-tie se=0`) and black boxes, and gives the same
+  patch for any `-threads`. See `docs/ECO.md`.
 - `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
   netlist, RTL against RTL): both designs become one and-inverter graph,
   flops and latches are matched by name (or by the net on their output, also
@@ -122,6 +132,9 @@ Spec references are IEEE 1800-2023 clauses.
   source, drivers and loads, schematic, waves with values annotated in the
   source). `-vcd` reads VCD and FST; the page traces the active driver at the
   cursor itself. See `docs/DEBUG.md`.
+- `mrcx -corner NAME`: several extraction corners in one run. The options after a
+  `-corner` (`-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale`) are that corner's; the
+  design is read once and each corner goes to `design.NAME.spef`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
   coupling capacitance to same-layer neighbours (who also take over part of
@@ -129,7 +142,8 @@ Spec references are IEEE 1800-2023 clauses.
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
-  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  count. `ETCH` on a conductor gives the width as made. `src/spef.hpp` is the
+  SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
 - `mchar`, cell library characterization on `mspice`: from a Liberty
   template and one transistor `.subckt` per cell it measures delay and
@@ -178,6 +192,18 @@ Spec references are IEEE 1800-2023 clauses.
   NLDM tables. The default library is mini45. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
+- `aig::Design::mems`: the shared RTL-to-AIG front half lists every memory
+  with its write ports (clock, enable, address, data, byte lane) and read
+  ports, for block RAM inference; `msynth`'s `report_resources` shows them.
+- `msynth` area: registers nothing reads or that are stuck at their reset
+  value are removed (`aig::sweep`), nested selects fold into one
+  (`aig::Graph::mux`), load enables use the library's enable flops, and
+  wide selects use 4:1 mux cells; logic that computes the same function
+  twice is merged by simulation and SAT (`src/synth/fraig.hpp`); `'x` in a
+  select is a don't-care, and registers without reset that only hold a
+  constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
+  ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
+  See `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
@@ -217,6 +243,11 @@ Spec references are IEEE 1800-2023 clauses.
   function templates, default arguments, overloads, static members, scoped
   enums, namespaces, and whatever the design uses from its headers
   (`std::min`, `std::max` included). `-emit-c` shows the reduction.
+- `mhls -clang`: inheritance. A base class is the first member of the
+  derived struct; base constructors, inherited and hidden members, several
+  bases, template bases and objects passed as their base all work. Classes
+  whose only constructor is the implicit one now run their members'
+  constructors. Virtual functions in a hierarchy are refused.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -291,6 +322,18 @@ Spec references are IEEE 1800-2023 clauses.
   simulator reports stuck-at, transition, coupling and address-decoder
   coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
   expected results come from that simulator. See `docs/DFT.md`.
+- `mpss`, portable stimulus: reads a model in the Accellera PSS language
+  (components, actions, buffers, streams, resources and pools, constraints,
+  activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
+  and functions), solves scenarios (field values, resource instances, and
+  the actions inferred to feed unbound inputs), and writes each scenario as
+  a UVM sequence class (`-sv`, runs under `msim -uvm`) and as a C test
+  function (`-c`), plus `-print` and `-json`. Scenarios are solved on all
+  cores (`-threads N`) with the same output for every thread count. See
+  `docs/MPSS.md` and `examples/pss/dma.pss`.
+- `src/interval.hpp`: the interval arithmetic and bounds propagation of the
+  `randomize()` solver, moved out of `rand.inc` so that `mpss` uses the same
+  rules.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
@@ -677,6 +720,13 @@ Spec references are IEEE 1800-2023 clauses.
   automatic tasks called from several processes at once, and
   `fork automatic int j = i; ... join_none` with one copy per fork. This is
   the base for class methods (8).
+- `msta`: the hold check between clocks of different periods used a capture
+  edge that was too early and reported too much slack. It now takes the
+  tightest hold relation over the common period. Asynchronous set / reset to
+  output arcs are no longer timed as paths by default
+  (`-preset_clear_arcs` turns them on). Both were found by comparing with
+  OpenSTA, which now agrees at every endpoint of a million-cell design to
+  0.1 ps; see "Compared with OpenSTA" in `docs/STA.md` and `bench/sta/`.
 
 ### Changed
 - `mlint` prints each finding's severity (`error`, `warning` or `info`) and
