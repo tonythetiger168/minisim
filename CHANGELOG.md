@@ -8,6 +8,18 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpnr` on the SkyWater 130 nm cells (`lib/sky130`): pins on li1 that sit
+  off the met1/met2 crossings are reached by vias placed along the pin, with
+  a short wire to the nearest crossing; via pads wider than the wires keep
+  their spacing to other nets' pads, to cell shapes on the next track and
+  (met4 under a met5 via) to wires on the next track; a minimum area longer
+  than a track step is met by lengthening the piece; notches between a
+  net's own pads are filled with `RECT` patches; pin vias of one net keep
+  their cut spacing. Room is kept for pins with few ways in before routing
+  starts, and contested nets are taken out together, so routing settles in
+  fewer rounds. 10,000 sky130 cells route with 0 open, 0 shorts, 0 spacing
+  violations and 0 violations in `mpv drc -lef`. `bench/gen_pnr.py --sky130`
+  writes netlists over the library's cells.
 - `mpnr -lib FILE -sdc FILE`: timing of the placed design with the engine
   behind `msta` (wires estimated from the placement), reported after global
   placement and after legalization with the clocks propagated through
