@@ -74,6 +74,9 @@ design(looppipe sum)                             # pipelined loops: a memory rea
 design(looppipe scale)                           # read one memory, write another, carried maximum
 design(looppipe scale -clock 2.5)                # more stages
 design(looppipe mix)                             # pipelined inner loop, entered once per outer iteration
+design(looppipe2 hist)                           # one iteration every 2 cycles: a memory updated in place
+design(looppipe2 walk)                           # pointer chase
+design(looppipe2 copyz -clock 2.5)               # the loop ends on a value read from memory
 design(fir fir -pipeline-loops -clock 3)         # best effort: loops that cannot be pipelined stay as they are
 design(matmul matmul -pipeline-loops -clock 3)
 design(sqrt hist -pipeline-loops)

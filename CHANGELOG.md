@@ -156,6 +156,11 @@ Spec references are IEEE 1800-2023 clauses.
   every cycle: `n` iterations of an `L`-stage body take `n + L - 1` cycles
   instead of `n * L`. A loop that cannot be pipelined is refused with the
   rule it breaks.
+- `mhls`: pipelined loops at slower rates. A loop that cannot start an
+  iteration every cycle (a memory updated in place, a pointer chase, an exit
+  that depends on memory data) is pipelined at one iteration every 2 or more
+  cycles when that beats running it unpipelined; `#pragma hls pipeline` now
+  also works first in a `do` body.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).

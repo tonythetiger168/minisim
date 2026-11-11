@@ -84,6 +84,7 @@ struct Block {
   int pipeLine = 0;
   bool pipeMust = false;
   int pipeL = 0;
+  int pipeII = 1;                            // cycles between two iterations entering
 };
 
 struct Param {
@@ -1692,7 +1693,7 @@ inline long interpret(const Function& f, Machine& m, long maxSteps = 50'000'000)
   long states = 0, steps = 0;
   for (;;) {
     const Block& B = f.blocks[b];
-    states += B.len;
+    states += B.pipeL ? B.pipeII : B.len;
     for (int id : B.ops) {
       const Op& o = f.ops[id];
       switch (o.k) {
@@ -1732,7 +1733,7 @@ inline long interpret(const Function& f, Machine& m, long maxSteps = 50'000'000)
     int from = b;
     if (B.term.k == Term::Jump) b = B.term.t;
     else b = (val[B.term.cond] & 1) ? B.term.t : B.term.f;
-    if (B.pipeL > 1 && b != from) states += B.pipeL - 1;   // the last iterations drain
+    if (B.pipeL > 1 && b != from) states += B.pipeL - B.pipeII;   // the last iterations drain
     if (++steps > maxSteps) throw Error("mhls: the reference run of '" + f.name + "' does not terminate");
   }
 }

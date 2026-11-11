@@ -1200,8 +1200,10 @@ class Parser {
     }
     if (isId("do")) {
       Stmt* s = mkS(Stmt::Do);
+      s->unroll = pendUnroll_;
+      pendUnroll_ = false;
       i_++;
-      s->body = stmt();
+      innerUnroll(s);
       if (!acceptId("while")) err("expected 'while' after the do body");
       expect("(");
       s->cond = expr();

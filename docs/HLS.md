@@ -84,23 +84,32 @@ for (int i = 0; i < n; i++) {
 In `tests/hls/looppipe.c` this halves the latency of three loops (for
 example 129 to 67 cycles for a 63-element sum) at the same area.
 
-The pragma insists: when the loop cannot run one iteration per cycle,
+`mhls` picks the fastest rate the loop allows. Most loops can start an
+iteration every cycle. One that reads and writes the same memory, follows a
+pointer it has just read, or ends on a value read from memory cannot, but
+it can start one every second (or third) cycle, which still beats running
+the iterations one after the other when the body is longer than that:
+`n` iterations then take `(n - 1) * K + L` cycles. In
+`tests/hls/looppipe2.c` a histogram (`h[b] = h[b] + 1`) runs at one
+iteration every 2 cycles instead of 3.
+
+The pragma insists: when no rate is faster than the unpipelined loop,
 `mhls` stops and says which rule fails. `-pipeline-loops` tries every loop
 instead, leaves the others as they are, and the summary lists what happened
-to each. The rules:
+to each. The rules, for one iteration every `K` cycles:
 
 - the body is straight-line code after if-conversion and unrolling of inner
   loops (no `break`, `continue`, `return`, or inner loop that stays a loop);
-- each memory is accessed at most once per iteration (one port), so
-  `a[i] = a[i] + 1` does not qualify but `b[i] = a[i] + 1` does;
+- the accesses to one memory share its port: they are in different stages,
+  all within `K` stages of each other, so at one per cycle `b[i] = a[i] + 1`
+  qualifies and `a[i] = a[i] + 1` needs every second cycle;
 - a value carried from one iteration to the next (an accumulator, the loop
-  counter) is updated within one clock period of being read, so not
-  through a memory read (`p = next[p]`) or a multi-cycle operator;
-- the loop condition is known in the first stage, so it does not depend on
-  memory data (`while (s[n] != 0)`).
+  counter) is updated within `K` clock periods of being read, and not
+  through a multi-cycle operator;
+- the loop condition is known within the first `K` stages.
 
 A pipelined loop is one FSM state; the summary and the generated testbench
-count its `n + L - 1` cycles.
+count its cycles.
 
 ## Interfaces
 
@@ -163,7 +172,6 @@ need multicycle constraints.
 
 ## Not yet
 
-Dual-port memories, pipelined loops that start an iteration every second
-cycle, AXI-Stream/handshake interfaces,
+Dual-port memories, AXI-Stream/handshake interfaces,
 unions, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

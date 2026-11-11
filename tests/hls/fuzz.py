@@ -143,7 +143,7 @@ class Gen:
             self.emit("(%s)%s;" % (n, r.choice(["++", "--"])))
 
     def piped_loop(self):
-        """A loop with one read of src and at most one write of dst per iteration."""
+        """A loop over src and dst that can start an iteration every cycle or every few."""
         r = self.r
         self.n += 1
         i = "i%d" % self.n
@@ -173,8 +173,14 @@ class Gen:
             elif self.vars:
                 n, _t = r.choice(self.vars)
                 self.emit("if (%s) %s = %s;" % (self.expr(2), n, self.expr(2)))
-        if r.random() < 0.6:
+        k = r.random()
+        if k < 0.45:
             self.emit("dst[%s] = %s;" % (i, self.expr(1)))
+        elif k < 0.65:   # updated in place: one iteration every second cycle at best
+            self.emit("dst[%s & 15] %s %s;" % (r.choice([i, x]), r.choice(["+=", "^=", "-="]), self.expr(1)))
+        elif k < 0.8 and self.vars:   # a value carried through a memory read
+            n, _t = r.choice(self.vars)
+            self.emit("%s = src[%s & 15] + %s;" % (n, n, r.choice([i, x, "1"])))
         del self.vars[nv:]
         self.depth -= 1
         self.ro.remove(i)

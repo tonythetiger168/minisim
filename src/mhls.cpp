@@ -336,24 +336,29 @@ void scheduleBlock(Function& f, Block& B, const Cfg& cfg, int mode, std::map<int
   }
 }
 
-// A loop body as a pipeline with a new iteration every cycle. Returns why
+std::string pipeRate(int K) {
+  return K == 1 ? "one iteration per cycle" : "one iteration every " + std::to_string(K) + " cycles";
+}
+
+// A loop body as a pipeline with a new iteration every K cycles. Returns why
 // not when the loop does not allow it; the block is then left unscheduled.
-std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg) {
+std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg, int K) {
   if (B.term.k != Term::Br || (B.term.t != bi && B.term.f != bi))
     return "its body is not straight-line code (break, continue, return, or an inner loop that is not unrolled)";
   std::map<int, int> none, rs;
   std::set<int> readVars;
   for (int id : B.ops)
     if (f.ops[id].k == OpK::ReadVar) readVars.insert(f.ops[id].ref);
-  // A variable the loop updates from its old value is read and written in
-  // the same stage, so that the next iteration, one cycle behind, sees it.
+  // A variable the loop updates from its old value is written less than K
+  // stages after it is read, so that the next iteration, K cycles behind,
+  // sees the new value.
   for (int round = 0;; round++) {
     scheduleBlock(f, B, cfg, 2, none, &rs);
     int moved = -1;
     for (size_t i = 0; i < B.writes.size(); i++) {
       int v = B.writes[i].first;
-      if (readVars.count(v) && B.wst[i] > rs[v]) {
-        rs[v] = B.wst[i];
+      if (readVars.count(v) && B.wst[i] > rs[v] + K - 1) {
+        rs[v] = B.wst[i] - (K - 1);
         moved = v;
       }
     }
@@ -362,14 +367,20 @@ std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg) {
       return "'" + f.vars[moved].name + "' is updated from its own previous value through logic or a memory read "
              "that takes more than one clock period";
   }
-  std::map<int, int> acc;
+  // The accesses to one memory share its port and must stay in program
+  // order across iterations: all of them within K stages.
+  std::map<int, std::pair<int, int>> acc;   // array -> first and last stage
   for (int id : B.ops) {
     const Op& o = f.ops[id];
     if (o.cyc > 1) return std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)";
-    if ((o.k == OpK::Load || o.k == OpK::Store) && ++acc[o.ref] > 1)
+    if (o.k != OpK::Load && o.k != OpK::Store) continue;
+    auto [it, fresh] = acc.insert({o.ref, {o.st, o.st}});
+    if (fresh) continue;
+    it->second.second = o.st;
+    if (o.st - it->second.first >= K)
       return "array '" + f.arrs[o.ref].name + "' is accessed more than once per iteration, and a memory has one port";
   }
-  if (availSt(f.ops[B.term.cond]) != 0)
+  if (availSt(f.ops[B.term.cond]) > K - 1)
     return "the loop condition is not known in the first stage (it depends on a memory read or on a long path)";
   return "";
 }
@@ -382,11 +393,21 @@ Sched schedule(Function& f, const Cfg& cfg) {
     Block& B = f.blocks[b];
     B.pipeL = 0;
     if (B.pipeLine && !f.pipeline) {
-      refused[b] = schedulePipeLoop(f, B, (int)b, cfg);
-      if (refused[b].empty() && B.len > 1) {
-        B.pipeL = B.len;
-        B.len = 1;
-        return;
+      // The fastest rate that works, as long as it beats running the
+      // iterations one after the other.
+      for (int K = 1; K <= 8; K++) {
+        std::string why = schedulePipeLoop(f, B, (int)b, cfg, K);
+        if (K == 1) refused[b] = why;
+        if (why.empty() && K > 1 && K >= B.len)
+          refused[b] += " (one iteration every " + std::to_string(K) + " cycles would work, but that is what the loop does unpipelined)";
+        if (why.rfind("its body", 0) == 0 || (why.empty() && K >= B.len)) break;
+        if (why.empty()) {
+          refused[b].clear();
+          B.pipeL = B.len;
+          B.pipeII = K;
+          B.len = 1;
+          return;
+        }
       }
     }
     scheduleBlock(f, B, cfg, f.pipeline ? 1 : 0, temps[b]);
@@ -396,7 +417,7 @@ Sched schedule(Function& f, const Cfg& cfg) {
     if (B.pipeL) sc.pipedLoops++;
     if (B.pipeLine && !f.pipeline) {
       std::string n = "loop at line " + std::to_string(B.pipeLine) + ": ";
-      if (B.pipeL) n += "pipelined, " + std::to_string(B.pipeL) + " stages, one iteration per cycle";
+      if (B.pipeL) n += "pipelined, " + std::to_string(B.pipeL) + " stages, " + pipeRate(B.pipeII);
       else if (refused[b].empty()) n += "one iteration per cycle without pipelining";
       else n += "not pipelined: " + refused[b];
       // With -pipeline-loops an outer loop is not news.
@@ -875,12 +896,15 @@ struct Emitter {
   std::vector<std::string> resets;
   void pipeLoop(int bi, std::vector<std::vector<std::string>>& act, std::map<int, std::vector<std::string>>& memAct) {
     const Block& B = f.blocks[bi];
-    const int L = B.pipeL;
+    const int L = B.pipeL, K = B.pipeII;
+    const int C = availSt(f.ops[B.term.cond]);   // the stage that knows whether the loop goes on
     const std::string P = "lp" + std::to_string(bi);
     std::set<int> written;
     for (auto& [v, x] : B.writes) written.insert(v);
     auto pname = [&](int x, int s) { return P + "_p" + std::to_string(s) + "_" + wire(x); };
-    auto vld = [&](int s) { return s == 0 ? "!" + P + "_stop" : P + "_v" + std::to_string(s); };
+    auto vld = [&](int s) {
+      return s > 0 ? P + "_v" + std::to_string(s) : K == 1 ? "!" + P + "_stop" : "(!" + P + "_stop && " + P + "_ph == '0)";
+    };
     auto ref2 = [&](int x, int s, int want) -> std::string {
       const Op& q = f.ops[x];
       if (q.k == OpK::Const) return hexLit(q.imm, want);
@@ -888,15 +912,24 @@ struct Emitter {
       if (q.k != OpK::ReadVar && s <= availSt(q)) return slice(wire(x), q.w, want);
       return slice(pname(x, s), q.w, want);
     };
-    o << "  // Loop at line " << B.pipeLine << ": " << L << " stages, one iteration per cycle.\n";
+    o << "  // Loop at line " << B.pipeLine << ": " << L << " stages, " << pipeRate(K) << ".\n";
     o << "  logic " << P << "_stop;\n";
     resets.push_back(P + "_stop <= 1'b0;");
+    int phw = 1;
+    while ((1 << phw) < K) phw++;
+    if (K > 1) {
+      o << "  logic " << rng(phw) << P << "_ph;\n";
+      resets.push_back(P + "_ph <= '0;");
+    }
     for (int s = 1; s < L; s++) {
-      o << "  logic " << P << "_v" << s << ", " << P << "_last" << s << ";\n";
+      o << "  logic " << P << "_v" << s << ";\n";
       resets.push_back(P + "_v" + std::to_string(s) + " <= 1'b0;");
+      if (s <= C) continue;
+      o << "  logic " << P << "_last" << s << ";\n";
       resets.push_back(P + "_last" + std::to_string(s) + " <= 1'b0;");
     }
     std::vector<std::string> regs;
+    std::map<int, std::vector<std::pair<std::string, std::string>>> port;   // array -> (stage valid, what it drives)
     for (int id : B.ops) {
       const Op& q = f.ops[id];
       if (q.k == OpK::Const) continue;
@@ -905,14 +938,14 @@ struct Emitter {
       if (q.k == OpK::Store || q.k == OpK::Load) {
         const Arr& a = f.arrs[q.ref];
         std::string n = a.isParam ? svName(a.name) : a.name;
-        std::string arm = "      " + st(B.base) + ": begin " + n + "_addr = " + R(q.a, a.aw()) + "; ";
+        std::string drive = n + "_addr = " + R(q.a, a.aw()) + "; ";
         if (q.k == OpK::Load) {
-          arm += n + "_ce = " + vld(q.st) + "; end\n";
+          drive += n + "_ce = 1'b1;";
         } else {
-          std::string en = vld(q.st) + (q.c >= 0 ? " && " + R(q.c, 1) : "");
-          arm += n + "_ce = " + en + "; " + n + "_we = " + en + "; " + n + "_wdata = " + R(q.b, a.ety.w) + "; end\n";
+          std::string en = q.c >= 0 ? R(q.c, 1) : "1'b1";
+          drive += n + "_ce = " + en + "; " + n + "_we = " + en + "; " + n + "_wdata = " + R(q.b, a.ety.w) + ";";
         }
-        memAct[q.ref].push_back(arm);
+        port[q.ref].push_back({vld(q.st), drive});
         if (q.k == OpK::Store) continue;
       }
       if (q.k == OpK::RomRd) {
@@ -932,22 +965,35 @@ struct Emitter {
       for (auto& r : regs) o << "    " << r << "\n";
       o << "  end\n";
     }
+    // The accesses to one memory are in different stages less than K
+    // apart, so at most one of them holds an iteration in any cycle.
+    for (auto& [ai, uses] : port) {
+      std::string arm = "      " + st(B.base) + ": begin ";
+      for (size_t i = 0; i < uses.size(); i++)
+        arm += std::string(i ? "else " : "") + "if (" + uses[i].first + ") begin " + uses[i].second + " end ";
+      memAct[ai].push_back(arm + "end\n");
+    }
     auto& a = act[B.base];
-    std::string c = ref2(B.term.cond, 0, 1);
+    std::string c = ref2(B.term.cond, C, 1);
     std::string over = B.term.t == bi ? "!" + c : c;
     int next = B.term.t == bi ? B.term.f : B.term.t;
     for (int s = 1; s < L; s++) {
       a.push_back(P + "_v" + std::to_string(s) + " <= " + vld(s - 1) + ";");
+      if (s <= C) continue;
       a.push_back(P + "_last" + std::to_string(s) + " <= " +
-                  (s == 1 ? "!" + P + "_stop && (" + over + ")" : P + "_last" + std::to_string(s - 1)) + ";");
+                  (s == C + 1 ? vld(C) + " && (" + over + ")" : P + "_last" + std::to_string(s - 1)) + ";");
     }
-    a.push_back("if (!" + P + "_stop && (" + over + ")) " + P + "_stop <= 1'b1;");
+    a.push_back("if (" + vld(C) + " && (" + over + ")) " + P + "_stop <= 1'b1;");
+    if (K > 1)
+      a.push_back(P + "_ph <= " + P + "_ph == " + std::to_string(phw) + "'d" + std::to_string(K - 1) + " ? '0 : " + P +
+                  "_ph + 1'b1;");
     for (size_t i = 0; i < B.writes.size(); i++) {
       auto [v, x] = B.writes[i];
       a.push_back("if (" + vld(B.wst[i]) + ") " + vreg(v) + " <= " + ref2(x, B.wst[i], f.vars[v].ty.w) + ";");
     }
     std::string l = std::to_string(L - 1);
-    a.push_back("if (" + P + "_v" + l + " && " + P + "_last" + l + ") begin " + go(next) + " " + P + "_stop <= 1'b0; end");
+    a.push_back("if (" + P + "_v" + l + " && " + P + "_last" + l + ") begin " + go(next) + " " + P + "_stop <= 1'b0;" +
+                (K > 1 ? " " + P + "_ph <= '0;" : "") + " end");
   }
 
   // ---- pipeline ----
@@ -1480,6 +1526,10 @@ void summarize(Job& j, const Cfg& cfg) {
     }
     sc.regs += 2 * B.pipeL - 1;
     sc.regBits += 2 * B.pipeL - 1;
+    if (B.pipeII > 1) {
+      sc.regs++;
+      for (int k = 1; k < B.pipeII; k *= 2) sc.regBits++;
+    }
   }
   if (f.pipeline) {
     sc.regs = 0;
