@@ -36,6 +36,7 @@ struct Emitter {
     struct Dir {
         int peer = 0, pins = 0, ratio = 1;
         const std::vector<int>* nets = nullptr;
+        int direct = 0;  // with ratio > 1: the first so many nets have the first so many wires to themselves
     };
     std::vector<std::vector<int>> instsOf, piOf, poOf, probesOf;
     std::vector<std::vector<Dir>> txOf, rxOf;
@@ -78,12 +79,12 @@ struct Emitter {
         }
         for (auto& l : pl.links) {
             if (!l.ab.empty()) {
-                txOf[l.a].push_back({l.b, l.pinsAB, l.ratioAB, &l.ab});
-                rxOf[l.b].push_back({l.a, l.pinsAB, l.ratioAB, &l.ab});
+                txOf[l.a].push_back({l.b, l.pinsAB, l.ratioAB, &l.ab, l.directAB});
+                rxOf[l.b].push_back({l.a, l.pinsAB, l.ratioAB, &l.ab, l.directAB});
             }
             if (!l.ba.empty()) {
-                txOf[l.b].push_back({l.a, l.pinsBA, l.ratioBA, &l.ba});
-                rxOf[l.a].push_back({l.b, l.pinsBA, l.ratioBA, &l.ba});
+                txOf[l.b].push_back({l.a, l.pinsBA, l.ratioBA, &l.ba, l.directBA});
+                rxOf[l.a].push_back({l.b, l.pinsBA, l.ratioBA, &l.ba, l.directBA});
             }
         }
         // Ports by name, buses put back together.
@@ -332,7 +333,7 @@ struct Emitter {
     bool hasDebug(int f) const { return !probes.empty() && (f == 0 || !probesOf[f].empty()); }
 
     std::string fpga(int f) const {
-        std::ostringstream body, decl, o;
+        std::ostringstream body, decl, holdAsg, o;
         std::vector<char> used(d.nn(), 0), isReg(d.nn(), 0), driven(d.nn(), 0);
         std::vector<int> usedList;
         auto ref = [&](int n) -> std::string {
@@ -423,7 +424,9 @@ struct Emitter {
                     if (r.qPin.empty()) keep = "~" + keep;
                 }
                 if (r.dNeg) keep = keep[0] == '~' ? keep.substr(1) : "~" + keep;
-                decl << "  wire h" << i << " = " << ce << " ? " << (dNet >= 0 ? ref(dNet) : std::string("1'bx")) << " : "
+                // Declared here, assigned after the edge detectors it reads.
+                decl << "  wire h" << i << ";\n";
+                holdAsg << "  assign h" << i << " = " << ce << " ? " << (dNet >= 0 ? ref(dNet) : std::string("1'bx")) << " : "
                      << keep << ";\n";
             }
             if (r.kind == Kind::Mem) {
@@ -479,12 +482,16 @@ struct Emitter {
                 continue;
             }
             ratios.insert(t.ratio);
-            xfer << "  reg [" << t.pins - 1 << ":0] " << port << "_r;\n  assign " << port << " = " << port << "_r;\n"
+            int sh = t.pins - t.direct;  // the wires that are shared
+            for (int x = 0; x < t.direct; x++)
+                xfer << "  assign " << port << "[" << x << "] = " << ref((*t.nets)[x]) << ";\n";
+            xfer << "  reg [" << sh - 1 << ":0] " << port << "_r;\n  assign " << port << "[" << t.pins - 1 << ":"
+                 << t.direct << "] = " << port << "_r;\n"
                  << "  always @(posedge emu_clk)\n    case (tph" << t.ratio << ")\n";
             for (int s = 0; s < t.ratio; s++) {
                 xfer << "      " << s << ": " << port << "_r <= {";
-                for (int j = t.pins - 1; j >= 0; j--) {
-                    size_t x = (size_t)s * t.pins + j;
+                for (int j = sh - 1; j >= 0; j--) {
+                    size_t x = (size_t)t.direct + (size_t)s * sh + j;
                     xfer << (x < t.nets->size() ? ref((*t.nets)[x]) : std::string("1'b0")) << (j ? ", " : "");
                 }
                 xfer << "};\n";
@@ -501,15 +508,20 @@ struct Emitter {
                 continue;
             }
             ratios.insert(rx.ratio);
+            int sh = rx.pins - rx.direct;
+            for (int x = 0; x < rx.direct; x++) {
+                xfer << "  assign " << ref((*rx.nets)[x]) << " = " << port << "[" << x << "];\n";
+                driven[(*rx.nets)[x]] = 1;
+            }
             // The wires carry, one cycle later, the turn the sender's counter named.
             xfer << "  always @(posedge emu_clk)\n    case (tph" << rx.ratio << ")\n";
             for (int s = 0; s < rx.ratio; s++) {
                 xfer << "      " << (s + 1) % rx.ratio << ": begin";
-                for (int j = 0; j < rx.pins; j++) {
-                    size_t x = (size_t)s * rx.pins + j;
+                for (int j = 0; j < sh; j++) {
+                    size_t x = (size_t)rx.direct + (size_t)s * sh + j;
                     if (x >= rx.nets->size()) break;
                     int n = (*rx.nets)[x];
-                    xfer << " " << ref(n) << " <= " << port << "[" << j << "];";
+                    xfer << " " << ref(n) << " <= " << port << "[" << rx.direct + j << "];";
                     isReg[n] = 1;
                     driven[n] = 1;
                 }
@@ -641,7 +653,7 @@ struct Emitter {
                 o << " = " << (d.strobe ? std::string("1'b0") : "emu_clkv[" + std::to_string(d.clockOfNet[n]) + "]");
             o << ";  // " << d.nl.nets[n] << "\n";
         }
-        o << decl.str() << io.str() << xfer.str() << det.str() << body.str() << dbg.str() << trigOut << "endmodule\n";
+        o << decl.str() << io.str() << xfer.str() << det.str() << holdAsg.str() << body.str() << dbg.str() << trigOut << "endmodule\n";
         return o.str();
     }
 
