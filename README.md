@@ -449,6 +449,9 @@ mhls fir.c -top fir -clock 5 -o fir.sv -tb fir_tb.sv
 msim fir.sv fir_tb.sv -top fir_tb          # PASS: fir 20 calls, latency 2..2 cycles
 ```
 
+C++ classes and templates go through the installed clang:
+`mhls fir.cpp -clang -top fir4 -o fir4.sv`.
+
 ### Datapath library: `dw/`
 
 `dw/` is a library of synthesizable, parameterized building blocks

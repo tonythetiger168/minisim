@@ -201,6 +201,18 @@ Spec references are IEEE 1800-2023 clauses.
 - `mhls -handshake`: also writes `<top>_hs`, the block behind
   `in_valid`/`in_ready` and `out_valid`/`out_ready` ports (FSM and pipeline);
   the generated testbench drives it with a sink that refuses now and then.
+- `mhls`: stream arguments. A `hls::stream<T>&` parameter becomes a
+  `tdata`/`tvalid`/`tready` port; `read()` and `write(x)` are transfers the
+  state machine waits for. `include/mhls_stream.h` runs the same source on
+  the host; the testbench source and sink hesitate on every other call. A
+  pipelined loop over streams moves one element per cycle and stalls as a
+  whole.
+- `mhls -clang`: C++ classes and templates. The installed clang (run as a
+  program) reads the source; mhls reduces its syntax tree to plain functions
+  over structs: member functions, constructors, operators, class and
+  function templates, default arguments, overloads, static members, scoped
+  enums, namespaces, and whatever the design uses from its headers
+  (`std::min`, `std::max` included). `-emit-c` shows the reduction.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
