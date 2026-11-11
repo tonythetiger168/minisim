@@ -79,6 +79,7 @@ struct Ram {
   std::vector<Lit> waddr, wdata, raddr;   // LSB first
   Lit wen = 1, ren = 1, wclk = 0, rclk = 0;
   bool wneg = false, rneg = false;        // clocked on the falling edge
+  bool lut = false;                       // LUT RAM: the read is not clocked (ren, rclk unused)
   std::vector<uint32_t> q;                // variable of each read data bit, 0 = not used
 
   template <class F> void for_each_in(F&& f) const {
@@ -209,6 +210,8 @@ struct FrontOptions {
   bool ram = false;            // memories with a registered read onto block RAM
   int ram_abits = 0;           // address bits of the deepest configuration of one block
   int ram_min_bits = 512;      // smaller memories stay flops
+  int lutram_abits = 0;        // address bits of the family's LUT RAM cell, 0 = none
+  int lutram_min_bits = 16;    // smaller memories stay flops
   bool dsp = false;            // multipliers onto DSP blocks
   int dsp_a = 0, dsp_b = 0;    // widest operands of one block, as it multiplies signed numbers
   bool dsp_unsigned = false;   // the block also multiplies unsigned numbers of that width
@@ -343,7 +346,7 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
   std::vector<Ram> rams;
   bool have_init = inv;
   for (int v : init) have_init |= v != 2;
-  if (fo.ram && !have_init && !d.mems.empty()) {
+  if ((fo.ram || fo.lutram_abits) && !have_init && !d.mems.empty()) {
     aig::Graph& g = d.g;
     std::vector<uint32_t> ref(g.size(), 0);
     for (uint32_t n = 1; n < g.size(); ++n) {
@@ -375,7 +378,10 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
       if (w.lo != 0 || (int)w.data.size() != m.width) continue;
       int abits = 1;
       while ((1 << abits) < m.depth) ++abits;
-      if (abits > fo.ram_abits || (long)m.width * m.depth < fo.ram_min_bits) continue;
+      const long mbits = (long)m.width * m.depth;
+      const bool block = fo.ram && abits <= fo.ram_abits && mbits >= fo.ram_min_bits;
+      const bool lutram = abits <= fo.lutram_abits && mbits >= fo.lutram_min_bits;
+      if (!block && !lutram) continue;
       // An address is the word position; bits above abits have to be 0 wires.
       auto address = [&](aig::Bits a, bool& ok) {
         while ((int)a.size() > abits && a.back() == aig::L0) a.pop_back();
@@ -387,7 +393,9 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
       const aig::Bits wa = address(w.addr, ok);
       struct Read { aig::Bits addr; std::vector<int> flops; Lit en; Lit clk; bool neg; };
       std::vector<Read> reads;
+      ok = ok && block;
       for (const aig::MemPort& r : m.rd) {
+        if (!ok) break;
         Read rd;
         rd.addr = address(r.addr, ok);
         ok = ok && (int)r.data.size() == m.width;
@@ -403,6 +411,19 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
         }
         if (!ok) break;
         reads.push_back(std::move(rd));
+      }
+      // LUT RAM: the write is clocked and a read is not, as in the RTL, so any
+      // read will do as long as its data bits are logic of their own.
+      bool as_lut = false;
+      if (!ok && lutram) {
+        ok = true;
+        address(w.addr, ok);
+        for (const aig::MemPort& r : m.rd) {
+          address(r.addr, ok);
+          ok = ok && (int)r.data.size() == m.width;
+          for (size_t i = 0; ok && i < r.data.size(); ++i) ok = g.nodes[aig::lnode(r.data[i])].k == aig::NK::And;
+        }
+        as_lut = ok;
       }
       if (!ok) continue;
       // Rewire, then see that nothing else reads the memory's flops.
@@ -430,7 +451,29 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
         pt.bits = std::move(bits);
         d.ports.push_back(std::move(pt));
       };
-      for (size_t ri = 0; ri < reads.size(); ++ri) {
+      for (size_t ri = 0; as_lut && ri < m.rd.size(); ++ri) {
+        const aig::MemPort& r = m.rd[ri];
+        const size_t k = rams.size();
+        Ram ram;
+        ram.name = m.name + (m.rd.size() > 1 ? "_r" + std::to_string(ri) : "");
+        ram.width = m.width; ram.abits = abits;
+        ram.wneg = w.negedge; ram.lut = true;
+        ram.q.assign(m.width, 0);
+        rams.push_back(std::move(ram));
+        bool ok2 = true;
+        pseudo(k, 'a', wa);
+        pseudo(k, 'd', w.data);
+        pseudo(k, 'r', address(r.addr, ok2));
+        pseudo(k, 'w', {w.en, w.clk});
+        pseudo(k, 'n', {aig::L1, w.clk});
+        for (int i = 0; i < m.width; ++i) {
+          const uint32_t node = aig::lnode(r.data[i]);
+          if (g.nodes[node].k != aig::NK::And) continue;   // the bit of an earlier read of the same word
+          const Lit q = g.input(std::string("\x01") + "m" + std::to_string(k) + "q" + std::to_string(i));
+          set_wire(node, q ^ (r.data[i] & 1));
+        }
+      }
+      for (size_t ri = 0; !as_lut && ri < reads.size(); ++ri) {
         const Read& rd = reads[ri];
         const size_t k = rams.size();
         Ram ram;
@@ -1242,7 +1285,7 @@ struct Netlist {
   std::vector<std::string> warnings;
   std::vector<std::pair<int, int>> inits;  // net, power-up value (generic family)
   int nbits = 2;
-  size_t luts = 0, ffs = 0, ffs_en = 0, ffs_srst = 0, carry_bits = 0, chains = 0, dsps = 0, brams = 0;
+  size_t luts = 0, ffs = 0, ffs_en = 0, ffs_srst = 0, carry_bits = 0, chains = 0, dsps = 0, brams = 0, lutrams = 0;
   // where the Aig's signals ended up (for checking)
   std::vector<int> ci_bit;                 // per variable below first_and()
   std::vector<std::array<int, 5>> ff_bits; // D, clock, async reset, enable, sync reset pin nets per flop
@@ -1278,6 +1321,8 @@ inline FrontOptions family_front(Family f) {
   // SB_RAM40_4K goes to 2048 x 2, DP16KD and RAMB18E1 to 16384 x 1
   o.ram = f != Family::Generic;
   o.ram_abits = f == Family::Ice40 ? 11 : 14;
+  // RAM64X1D on xc7, TRELLIS_DPR16X4 on ecp5; iCE40 has no LUT RAM
+  o.lutram_abits = f == Family::Xc7 ? 6 : f == Family::Ecp5 ? 4 : 0;
   return o;
 }
 
@@ -1529,6 +1574,47 @@ class NetlistBuilder {
     auto padded = [](std::vector<int> v, size_t w) { v.resize(w, 0); return v; };
     std::string base = R.name;
     for (char& ch : base) if (ch == '/' || ch == '.') ch = '_';
+    if (R.lut) {
+      auto unique = [&](std::string name) { while (!used_.insert(name).second) name += "_"; return name; };
+      if (fam_ == Family::Xc7) {
+        // one RAM32X1D or RAM64X1D per bit: A writes, DPRA reads
+        const int ab = R.abits <= 5 ? 5 : 6;
+        for (int b = 0; b < R.width; ++b) {
+          if (!R.q[b]) continue;
+          std::vector<Conn> c = {{"D", false, {wd[b]}}, {"WE", false, {wen}}, {"WCLK", false, {wclk}}};
+          for (int i = 0; i < ab; ++i) c.push_back({"A" + std::to_string(i), false, {i < (int)wa.size() ? wa[i] : 0}});
+          for (int i = 0; i < ab; ++i) c.push_back({"DPRA" + std::to_string(i), false, {i < (int)ra.size() ? ra[i] : 0}});
+          c.push_back({"SPO", true, {fresh()}});
+          c.push_back({"DPO", true, {q(b)}});
+          ++n_.lutrams;
+          add_cell(ab == 5 ? "RAM32X1D" : "RAM64X1D", unique(base + "_lram" + std::to_string(b)),
+                   {{"INIT", bitstr(0, 1 << ab), false}, {"IS_WCLK_INVERTED", R.wneg ? "1" : "0", false}}, std::move(c));
+        }
+      }
+      else if (fam_ == Family::Ecp5) {
+        // TRELLIS_DPR16X4: 16 words of 4 bits
+        for (int at = 0, j = 0; at < R.width; at += 4, ++j) {
+          bool any = false;
+          for (int b = at; b < at + 4 && b < R.width; ++b) any = any || R.q[b];
+          if (!any) continue;
+          std::vector<int> di(4, 0), wad(4, 0), rad(4, 0), dout(4);
+          for (int b = 0; b < 4; ++b) {
+            if (at + b < R.width) di[b] = wd[at + b];
+            if (b < (int)wa.size()) wad[b] = wa[b];
+            if (b < (int)ra.size()) rad[b] = ra[b];
+            dout[b] = q(at + b);
+          }
+          std::vector<Conn> c = {{"DI", false, di}, {"WAD", false, wad}, {"WRE", false, {wen}}, {"WCK", false, {wclk}},
+                                 {"RAD", false, rad}, {"DO", true, dout}};
+          ++n_.lutrams;
+          add_cell("TRELLIS_DPR16X4", unique(base + "_lram" + std::to_string(j)),
+                   {{"WCKMUX", R.wneg ? "INV" : "WCK", true}, {"WREMUX", "WRE", true},
+                    {"INITVAL", bitstr(0, 64), false}}, std::move(c));
+        }
+      }
+      else throw std::runtime_error("fpga: no LUT RAM cell for this family");
+      return;
+    }
     switch (fam_) {
       case Family::Ice40: {
         // SB_RAM40_4K: 256 x 16, 512 x 8, 1024 x 4 or 2048 x 2; the narrow modes use these data bits

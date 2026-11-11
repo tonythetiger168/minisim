@@ -603,6 +603,9 @@ Spec references are IEEE 1800-2023 clauses.
   read-during-write result. `-noram` keeps flops.
 - `mfpga`: block RAM on `xc7` too (`RAMB18E1`, 1024 x 18 to 16384 x 1,
   parity bits used as data).
+- `mfpga`: small memories and memories read without a register map to LUT
+  RAM on `xc7` (`RAM32X1D`, `RAM64X1D`) and ECP5 (`TRELLIS_DPR16X4`).
+  `-nolutram` keeps flops.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

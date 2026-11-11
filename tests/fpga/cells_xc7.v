@@ -110,3 +110,21 @@ module RAMB18E1 #(parameter RAM_MODE = "TDP", READ_WIDTH_A = 0, READ_WIDTH_B = 0
   assign DOBDO = 16'd0;
   assign DOPBDOP = 2'd0;
 endmodule
+
+// LUT RAM, one bit wide: A writes (and reads SPO), DPRA reads DPO without a clock
+module RAM32X1D #(parameter [31:0] INIT = 32'd0, parameter [0:0] IS_WCLK_INVERTED = 0)
+  (input D, WE, WCLK, A0, A1, A2, A3, A4, DPRA0, DPRA1, DPRA2, DPRA3, DPRA4, output SPO, DPO);
+  reg [31:0] mem = INIT;
+  wire clk = WCLK ^ IS_WCLK_INVERTED;
+  always @(posedge clk) if (WE) mem[{A4, A3, A2, A1, A0}] <= D;
+  assign SPO = mem[{A4, A3, A2, A1, A0}];
+  assign DPO = mem[{DPRA4, DPRA3, DPRA2, DPRA1, DPRA0}];
+endmodule
+module RAM64X1D #(parameter [63:0] INIT = 64'd0, parameter [0:0] IS_WCLK_INVERTED = 0)
+  (input D, WE, WCLK, A0, A1, A2, A3, A4, A5, DPRA0, DPRA1, DPRA2, DPRA3, DPRA4, DPRA5, output SPO, DPO);
+  reg [63:0] mem = INIT;
+  wire clk = WCLK ^ IS_WCLK_INVERTED;
+  always @(posedge clk) if (WE) mem[{A5, A4, A3, A2, A1, A0}] <= D;
+  assign SPO = mem[{A5, A4, A3, A2, A1, A0}];
+  assign DPO = mem[{DPRA5, DPRA4, DPRA3, DPRA2, DPRA1, DPRA0}];
+endmodule
