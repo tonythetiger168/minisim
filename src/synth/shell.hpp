@@ -275,6 +275,14 @@ struct Shell {
         size_t swept = 0;
         des = aig::sweep(std::move(*des), &swept);
         if (swept && !quiet) outf("Information: removed %zu unloaded or constant register bits.\n", swept);
+        if (var("msynth_hold_enables", "true") != "false") {
+            size_t held = 0;
+            // the mapper's enable flops have no asynchronous reset
+            des = aig::holdEnables(std::move(*des), &held, false);
+            if (held && !quiet) outf("Information: gathered the hold conditions of %zu register bits into enables.\n", held);
+            // a register that now only holds is a constant
+            if (held) des = aig::sweep(std::move(*des), nullptr);
+        }
 #ifdef MSYNTH_HAVE_SAT
         if (var("msynth_fraig", "true") != "false") {
             FraigStats fs;
