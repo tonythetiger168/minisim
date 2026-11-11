@@ -5,3 +5,4 @@ build/
 .idea/
 tests/spec/_regress_*
 __pycache__/
+lib/sky130/pdk/

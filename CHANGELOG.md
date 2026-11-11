@@ -115,6 +115,12 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `lib/sky130`: cells of the open SkyWater 130 nm library (Apache-2.0) as a
+  second test library: a 47-cell Liberty subset with its LEF and technology
+  LEF, `sky130.py fetch` for the whole library at three corners (pinned
+  commits, SHA-256 checked), and a `sky130` test that runs `mlibc`, `msynth`,
+  `msta` and `mpower` on it. `mlibc` no longer expects a LEF pin for a
+  Liberty `internal` pin, and `mlibc report` fits long cell names.
 - `mlibc`, cell library checks and reports on the shared Liberty and LEF
   readers: `mlibc check` (23 rules: function against timing arcs and
   `timing_sense`, tables that shrink with load, missing setup or hold,
