@@ -25,6 +25,25 @@ foreach(want lib/cmake/minisimCore/minisimCoreConfig.cmake
   endif()
 endforeach()
 
+# An exported header that quotes a sibling the package does not install leaves
+# the consumer with a missing-header error, which is how interval.hpp was found
+# missing while rand.inc shipped. Every quoted sibling must be installed too.
+file(GLOB installed ${prefix}/include/minisim/*)
+foreach(header ${installed})
+  file(STRINGS ${header} includes REGEX "^[ \t]*#[ \t]*include[ \t]*\"")
+  foreach(line ${includes})
+    string(REGEX REPLACE "^.*#[ \t]*include[ \t]*\"([^\"]+)\".*$" "\\1" sibling "${line}")
+    get_filename_component(name ${sibling} NAME)
+    if(NOT sibling MATCHES "/" AND NOT EXISTS ${prefix}/include/minisim/${name})
+      get_filename_component(from ${header} NAME)
+      message(FATAL_ERROR
+              "${from} is installed but includes \"${name}\", which the "
+              "minisimCore package does not install: add it to "
+              "MINISIM_CORE_HEADERS in cmake/core.cmake.")
+    endif()
+  endforeach()
+endforeach()
+
 # The driver joins slang's include list with | so it survives as one argument.
 string(REPLACE "|" ";" SLANG_INCLUDE_DIRS "${SLANG_INCLUDE_DIRS}")
 

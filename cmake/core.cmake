@@ -24,6 +24,7 @@ set(MINISIM_CORE_HEADERS
     expr.hpp
     fsm_extract.hpp
     gnetlist.hpp
+    interval.hpp
     liberty.hpp
     lintir.hpp
     lower.hpp
