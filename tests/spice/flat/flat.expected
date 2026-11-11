@@ -1,0 +1,19 @@
+vdd vdd 0 dc=1.800000e+00
+vin a 0 dc=9.000000e-01
+xt.xb.x1.mp xt.xb.mid a vdd vdd pch l=1.800000e-07 w=2.000000e-06
+xt.xb.x1.mn xt.xb.mid a 0 0 nch l=1.800000e-07 m=2.000000e+00 w=1.000000e-06
+xt.xb.x2.mp xt.n1 xt.xb.mid vdd vdd pch l=1.800000e-07 m=3.000000e+00 w=2.000000e-06
+xt.xb.x2.mn xt.n1 xt.xb.mid 0 0 nch l=1.800000e-07 m=6.000000e+00 w=1.000000e-06
+xt.xb.r1 xt.n1 vdd rpoly l=2.000000e-05 w=1.000000e-06
+xt.xb.c1 xt.xb.mid 0 value=1.000000e-14
+xt.xc.x1.mp xt.xc.mid xt.n1 vdd vdd pch l=1.800000e-07 w=2.000000e-06
+xt.xc.x1.mn xt.xc.mid xt.n1 0 0 nch l=1.800000e-07 m=2.000000e+00 w=1.000000e-06
+xt.xc.x2.mp b xt.xc.mid vdd vdd pch l=1.800000e-07 w=2.000000e-06
+xt.xc.x2.mn b xt.xc.mid 0 0 nch l=1.800000e-07 m=2.000000e+00 w=1.000000e-06
+xt.xc.r1 b vdd rpoly l=2.000000e-05 w=1.000000e-06
+xt.xc.c1 xt.xc.mid 0 value=1.000000e-14
+xt.xm xt.n1 b vdd sky130_fd_pr__nfet_01v8 l=1.500000e-01 nf=2.000000e+00 w=6.500000e-01
+xt.d1 b vdd dx area=2.000000e+00
+xt.q1 b xt.n1 0 npn
+xt.q2 b xt.n1 0 xt.sub pnp area=4.000000e+00
+rl b 0 value=1.000000e+04
