@@ -266,6 +266,11 @@ Spec references are IEEE 1800-2023 clauses.
   that depends on memory data) is pipelined at one iteration every 2 or more
   cycles when that beats running it unpipelined; `#pragma hls pipeline` now
   also works first in a `do` body.
+- `mhls -dual-port`: two-port memories. Two accesses to one array share a
+  state when the first is a read, and a pipelined loop that updates a memory
+  in place (`h[b] = h[b] + 1`) starts an iteration every cycle: the write of
+  one iteration is passed on to the read of the next when both go to the
+  same word.
 - `mhls`: a variable that only feeds itself (a counter or checksum nothing
   reads) is removed with its register and operators.
 - `mhls -handshake`: also writes `<top>_hs`, the block behind

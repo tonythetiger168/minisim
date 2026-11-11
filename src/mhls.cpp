@@ -26,6 +26,8 @@
 //   -mul <n>, -div <n>  at most n multipliers / dividers working in one cycle (default: no limit)
 //   -no-share         one multiplier/divider per operation, one register per value
 //   -handshake        also write <top>_hs: the same block behind ready/valid ports
+//   -dual-port        memories have two ports: two accesses per cycle, and loops that update a
+//                     memory in place pipeline at one iteration per cycle
 //   -max-reg-array <n>  local arrays up to n elements become registers, larger ones RAMs (default 64)
 //   -delay-scale <x>  scale the built-in operator delays (default 1.0, a generic 28 nm-class library)
 //   -lib <file.lib>   take the delays from a Liberty library instead of the built-in ones
@@ -56,6 +58,7 @@ struct Cfg {
   int mulLimit = 0, divLimit = 0;
   bool share = true;
   bool handshake = false;   // also emit <top>_hs with ready/valid ports
+  bool dualPort = false;    // memories have two ports
 };
 
 // Threads come from the shared src/parallel.hpp. The wrapper only makes a
@@ -281,10 +284,15 @@ int availSt(const Op& o) {
 // mode 2: the body of a pipelined loop; readStage gives the stage in which
 // each variable the loop updates is read (and so must be written).
 void scheduleBlock(Function& f, Block& B, const Cfg& cfg, int mode, std::map<int, int>& temps,
-                   const std::map<int, int>* readStage = nullptr) {
+                   const std::map<int, int>* readStage = nullptr, int K = 0) {
   const bool pipeline = mode != 0;
   const double budget = cfg.clock - kTsu * cfg.scale, tcq = kTcq * cfg.scale;
   std::map<int, int> lastAcc;                       // array -> state of its last access
+  // With two ports: per array the state of the last access and of the last
+  // write, and how many accesses each state has (in a pipelined loop each
+  // of the K phases, since stages K apart are busy in the same cycle).
+  struct Acc2 { int last = 0, lastStore = -1; std::map<int, int> cnt; };
+  std::map<int, Acc2> acc2;
   std::map<std::pair<int, int>, int> used;          // (class, state) -> operators
   auto cls = [&](const Op& o) { return isMulFu(f, o) ? 1 : isDiv(o.k) ? 2 : 0; };
   auto limit = [&](int c) { return pipeline ? 0 : c == 1 ? cfg.mulLimit : c == 2 ? cfg.divLimit : 0; };
@@ -321,6 +329,22 @@ void scheduleBlock(Function& f, Block& B, const Cfg& cfg, int mode, std::map<int
       // One transfer per state over all streams: a state waits for at most
       // one partner.
       int port = f.arrs[o.ref].mode == Arr::Stream ? -1 : o.ref;
+      o.port = 0;
+      if (cfg.dualPort && port >= 0) {
+        // Two accesses share a state when the first is a read: it gets the
+        // word as it was before the state. After a write, the next state.
+        Acc2& A = acc2[port];
+        s = std::max({s, A.last, A.lastStore + 1});
+        // In a loop with more than 2K accesses to the array, the ports run
+        // out: port 2 says so.
+        for (int tries = 0; A.cnt[K ? s % K : s] >= 2 && (!K || tries < K); tries++) s++;
+        o.port = A.cnt[K ? s % K : s]++;
+        A.last = s;
+        if (o.k == OpK::Store) A.lastStore = s;
+        o.st = s;
+        o.tout = 0;
+        continue;
+      }
       auto it = lastAcc.find(port);
       if (it != lastAcc.end()) s = std::max(s, it->second + 1);
       lastAcc[port] = s;
@@ -484,7 +508,7 @@ std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg, int 
   // stages after it is read, so that the next iteration, K cycles behind,
   // sees the new value.
   for (int round = 0;; round++) {
-    scheduleBlock(f, B, cfg, 2, none, &rs);
+    scheduleBlock(f, B, cfg, 2, none, &rs, K);
     int moved = -1;
     for (size_t i = 0; i < B.writes.size(); i++) {
       int v = B.writes[i].first;
@@ -501,10 +525,35 @@ std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg, int 
   // The accesses to one memory share its port and must stay in program
   // order across iterations: all of them within K stages.
   std::map<int, std::pair<int, int>> acc;   // array -> first and last stage
+  std::map<int, std::vector<int>> accs;     // two ports: array -> its accesses in program order
+  B.bypass.clear();
   for (int id : B.ops) {
     const Op& o = f.ops[id];
     if (o.cyc > 1) return std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)";
     if (o.k != OpK::Load && o.k != OpK::Store) continue;
+    if (cfg.dualPort && f.arrs[o.ref].mode != Arr::Stream) {
+      // With two ports the accesses need not be in different cycles, but a
+      // write still has to land before the next iteration, K cycles
+      // behind, gets to the accesses that come before it in the program,
+      // and after the previous iteration is done with those that follow.
+      // A read exactly K stages before the write meets the previous
+      // iteration's write in the same cycle: the written word is passed on.
+      auto& v = accs[o.ref];
+      if (o.port > 1)
+        return "array '" + f.arrs[o.ref].name + "' is accessed more than " + std::to_string(2 * K) +
+               " times per iteration, and a memory has two ports";
+      for (int e : v) {
+        const Op& p = f.ops[e];
+        if (p.k != OpK::Store && o.k != OpK::Store) continue;
+        int d = o.st - p.st;
+        if (d < K) continue;
+        if (d == K && p.k == OpK::Load && o.k == OpK::Store) { B.bypass.push_back({e, id}); continue; }
+        return "array '" + f.arrs[o.ref].name + "' is written " + std::to_string(d) + " stage" + (d == 1 ? "" : "s") +
+               " after an earlier access, so the next iteration would overtake the write";
+      }
+      v.push_back(id);
+      continue;
+    }
     auto [it, fresh] = acc.insert({o.ref, {o.st, o.st}});
     if (fresh) continue;
     it->second.second = o.st;
@@ -560,6 +609,13 @@ Sched schedule(Function& f, const Cfg& cfg) {
   }
   for (auto& t : temps)
     for (auto& [w, n] : t) sc.temps[w] = std::max(sc.temps[w], n);
+  for (auto& a : f.arrs) a.p1r = a.p1w = false;
+  for (auto& B : f.blocks)
+    for (int id : B.ops) {
+      const Op& o = f.ops[id];
+      if ((o.k != OpK::Load && o.k != OpK::Store) || !o.port) continue;
+      (o.k == OpK::Load ? f.arrs[o.ref].p1r : f.arrs[o.ref].p1w) = true;
+    }
 
   // A block that only returns costs no state: jumping to it is "done".
   int base = 1;
@@ -799,7 +855,7 @@ struct Emitter {
         return "{{" + std::to_string(w - wa) + "{" + a + (wa > 1 ? "[" + std::to_string(wa - 1) + "]" : "") + "}}, " + a + "}";
       }
       case OpK::RomRd: return "rom_" + f.arrs[p.ref].name + "(" + full(p.a) + ")";
-      case OpK::Load: return memName(f.arrs[p.ref]) + "_rdata";
+      case OpK::Load: return memName(f.arrs[p.ref]) + (p.port ? "_rdata1" : "_rdata");
       default: return "'0";
     }
   }
@@ -838,6 +894,15 @@ struct Emitter {
           p.push_back("output logic " + rng(a.ety.w) + n + "_wdata");
         }
         if (a.read) p.push_back("input  logic " + rng(a.ety.w) + n + "_rdata");
+        if (a.p1r || a.p1w) {
+          p.push_back("output logic " + rng(a.aw()) + n + "_addr1");
+          p.push_back("output logic " + n + "_ce1");
+        }
+        if (a.p1w) {
+          p.push_back("output logic " + n + "_we1");
+          p.push_back("output logic " + rng(a.ety.w) + n + "_wdata1");
+        }
+        if (a.p1r) p.push_back("input  logic " + rng(a.ety.w) + n + "_rdata1");
       } else {
         const Var& v = f.vars[pm.id];
         std::string n = svName(v.name);
@@ -908,9 +973,22 @@ struct Emitter {
       o << "  logic " << rng(a.ety.w) << n << "_mem [0:" << a.size - 1 << "];\n";
       o << "  logic " << rng(a.aw()) << n << "_addr;\n  logic " << n << "_ce, " << n << "_we;\n";
       o << "  logic " << rng(a.ety.w) << n << "_wdata, " << n << "_rdata;\n";
-      o << "  always_ff @(posedge ap_clk)\n    if (" << n << "_ce) begin\n      if (" << n << "_we) " << n
-        << "_mem[" << n << "_addr] <= " << n << "_wdata;\n      else " << n << "_rdata <= " << n << "_mem["
-        << n << "_addr];\n    end\n";
+      const bool two = a.p1r || a.p1w;
+      if (two) {
+        // The second port. A read gets the word as it was before the clock
+        // edge, also when the other port writes it at that edge.
+        o << "  logic " << rng(a.aw()) << n << "_addr1;\n  logic " << n << "_ce1, " << n << "_we1;\n";
+        o << "  logic " << rng(a.ety.w) << n << "_wdata1, " << n << "_rdata1;\n";
+        if (!a.p1w) o << "  assign " << n << "_we1 = 1'b0;\n  assign " << n << "_wdata1 = '0;\n";
+      }
+      o << "  always_ff @(posedge ap_clk) begin\n";
+      for (std::string x : {std::string(), std::string("1")}) {
+        if (!x.empty() && !two) break;
+        o << "    if (" << n << "_ce" << x << ") begin\n      if (" << n << "_we" << x << ") " << n << "_mem[" << n
+          << "_addr" << x << "] <= " << n << "_wdata" << x << ";\n      else " << n << "_rdata" << x << " <= " << n
+          << "_mem[" << n << "_addr" << x << "];\n    end\n";
+      }
+      o << "  end\n";
       if (a.isStatic)
         o << "`ifndef SYNTHESIS\n  initial for (int i = 0; i < " << a.size << "; i++) " << n
           << "_mem[i] = '0;\n`endif\n";
@@ -918,7 +996,7 @@ struct Emitter {
 
     // Datapath: one wire per operator.
     std::vector<std::vector<std::string>> act(sc.nStates);
-    std::map<int, std::vector<std::string>> memAct;   // array -> case arms
+    std::map<int, std::vector<std::string>> memAct;   // 2 * array + port -> case arms
     std::map<int, std::vector<std::string>> waits;    // state -> what it waits for
     for (size_t bi = 0; bi < f.blocks.size(); bi++) {
       const Block& B = f.blocks[bi];
@@ -933,7 +1011,8 @@ struct Emitter {
         if (p.k == OpK::Store || p.k == OpK::Load) {
           const Arr& a = f.arrs[p.ref];
           std::string n = a.isParam ? svName(a.name) : a.name;
-          std::string arm = "      " + st(B.base + p.st) + ": begin " + n + "_addr = " + R(p.a, a.aw()) + "; ";
+          const std::string x = p.port ? "1" : "";
+          std::string arm = "      " + st(B.base + p.st) + ": begin " + n + "_addr" + x + " = " + R(p.a, a.aw()) + "; ";
           // A memory access in a state that waits for a stream happens in
           // the state's last cycle only: a read repeated earlier would
           // replace data the waiting transfer still uses. The mark is
@@ -945,12 +1024,13 @@ struct Emitter {
                   (p.k == OpK::Store ? n + "_wdata = " + R(p.b, a.ety.w) + "; " : "") + "end\n";
             waits[B.base + p.st].push_back("(!" + n + "_ce || " + n + (p.k == OpK::Load ? "_tvalid" : "_tready") + ")");
           } else if (p.k == OpK::Load) {
-            arm += n + "_ce = " + gate + "1'b1; end\n";
+            arm += n + "_ce" + x + " = " + gate + "1'b1; end\n";
           } else {
             std::string en = gate + (p.c >= 0 ? R(p.c, 1) : "1'b1");
-            arm += n + "_ce = " + en + "; " + n + "_we = " + en + "; " + n + "_wdata = " + R(p.b, a.ety.w) + "; end\n";
+            arm += n + "_ce" + x + " = " + en + "; " + n + "_we" + x + " = " + en + "; " + n + "_wdata" + x + " = " +
+                   R(p.b, a.ety.w) + "; end\n";
           }
-          memAct[p.ref].push_back(arm);
+          memAct[2 * p.ref + p.port].push_back(arm);
           if (p.k == OpK::Store) continue;
         }
         if (p.k == OpK::RomRd) {
@@ -1014,10 +1094,13 @@ struct Emitter {
     }
 
     // Memory ports.
-    for (auto& [ai, arms] : memAct) {
-      const Arr& a = f.arrs[ai];
+    for (auto& [key, arms] : memAct) {
+      const Arr& a = f.arrs[key / 2];
       std::string n = a.isParam ? svName(a.name) : a.name;
-      if (a.mode == Arr::Stream) {
+      if (key % 2) {
+        o << "  always_comb begin\n    " << n << "_addr1 = '0; " << n << "_ce1 = 1'b0;";
+        if (a.p1w) o << " " << n << "_we1 = 1'b0; " << n << "_wdata1 = '0;";
+      } else if (a.mode == Arr::Stream) {
         o << "  always_comb begin\n    " << n << "_ce = 1'b0;" << (a.read ? "" : " " + n + "_wdata = '0;");
       } else {
       o << "  always_comb begin\n    " << n << "_addr = '0; " << n << "_ce = 1'b0;";
@@ -1106,8 +1189,9 @@ struct Emitter {
       resets.push_back(P + "_last" + std::to_string(s) + " <= 1'b0;");
     }
     std::vector<std::string> regs;
-    std::map<int, std::vector<std::pair<std::string, std::string>>> port;   // array -> (stage valid, what it drives)
+    std::map<int, std::vector<std::pair<std::string, std::string>>> port;   // 2 * array + port -> (stage valid, what it drives)
     std::vector<std::string> xfer;   // per stream access: its stage has nothing to transfer, or the partner is ready
+    bool fwd = false;
     for (int id : B.ops) {
       const Op& q = f.ops[id];
       if (q.k == OpK::Const) continue;
@@ -1116,7 +1200,8 @@ struct Emitter {
       if (q.k == OpK::Store || q.k == OpK::Load) {
         const Arr& a = f.arrs[q.ref];
         std::string n = a.isParam ? svName(a.name) : a.name;
-        std::string drive = n + "_addr = " + R(q.a, a.aw()) + "; ";
+        const std::string x = q.port ? "1" : "";
+        std::string drive = n + "_addr" + x + " = " + R(q.a, a.aw()) + "; ";
         if (a.mode == Arr::Stream) {
           // "@O<k>@" becomes: every other stream is ready for its transfer.
           std::string en = q.c >= 0 ? R(q.c, 1) : "1'b1";
@@ -1124,13 +1209,38 @@ struct Emitter {
                   (q.k == OpK::Store ? n + "_wdata = " + R(q.b, a.ety.w) + ";" : "");
           xfer.push_back("(!(" + vld(q.st) + " && " + en + ") || " + n + (q.k == OpK::Load ? "_tvalid" : "_tready") + ")");
         } else if (q.k == OpK::Load) {
-          drive += n + "_ce = @G@1'b1;";
+          drive += n + "_ce" + x + " = @G@1'b1;";
         } else {
           std::string en = std::string("@G@") + (q.c >= 0 ? R(q.c, 1) : "1'b1");
-          drive += n + "_ce = " + en + "; " + n + "_we = " + en + "; " + n + "_wdata = " + R(q.b, a.ety.w) + ";";
+          drive += n + "_ce" + x + " = " + en + "; " + n + "_we" + x + " = " + en + "; " + n + "_wdata" + x + " = " +
+                   R(q.b, a.ety.w) + ";";
         }
-        port[q.ref].push_back({vld(q.st), drive});
+        port[2 * q.ref + q.port].push_back({vld(q.st), drive});
         if (q.k == OpK::Store) continue;
+        // The iteration ahead writes in the cycle this one reads: when it
+        // is the same word, the written value replaces what the memory
+        // returns.
+        for (auto& [ld, sto] : B.bypass) {
+          if (ld != id) continue;
+          const Op& w = f.ops[sto];
+          auto RW = [&](int y, int want) { return ref2(y, w.st, want); };
+          std::string hit = P + "_fwd" + std::to_string(id), val = P + "_fwdv" + std::to_string(id);
+          o << "  logic " << hit << ";\n  logic " << rng(q.w) << val << ";\n";
+          regs.push_back(hit + " <= " + vld(q.st) + " && " + vld(w.st) + (w.c >= 0 ? " && " + RW(w.c, 1) : "") + " && " +
+                         R(q.a, a.aw()) + " == " + RW(w.a, a.aw()) + ";");
+          regs.push_back(val + " <= " + RW(w.b, a.ety.w) + ";");
+          o << "  logic " << rng(q.w) << wire(id) << ";\n  assign " << wire(id) << " = " << hit << " ? " << val << " : " << n
+            << "_rdata" << x << ";\n";
+          fwd = true;
+        }
+        if (fwd) {
+          for (int s = availSt(q) + 1; s <= q.lastUse; s++) {
+            o << "  logic " << rng(q.w) << pname(id, s) << ";\n";
+            regs.push_back(pname(id, s) + " <= " + ref2(id, s - 1, q.w) + ";");
+          }
+          fwd = false;
+          continue;
+        }
       }
       if (q.k == OpK::RomRd) {
         o << romRead(id, R(q.a, f.ops[q.a].w));
@@ -1171,11 +1281,11 @@ struct Emitter {
       }
     // The accesses to one memory are in different stages less than K
     // apart, so at most one of them holds an iteration in any cycle.
-    for (auto& [ai, uses] : port) {
+    for (auto& [key, uses] : port) {
       std::string arm = "      " + st(B.base) + ": begin ";
       for (size_t i = 0; i < uses.size(); i++)
         arm += std::string(i ? "else " : "") + "if (" + uses[i].first + ") begin " + uses[i].second + " end ";
-      memAct[ai].push_back(arm + "end\n");
+      memAct[key].push_back(arm + "end\n");
     }
     auto& a = act[B.base];
     std::string c = ref2(B.term.cond, C, 1);
@@ -1502,6 +1612,22 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
       if (a.written) o << "    if (" << n << "_we) " << n << "_m[" << n << "_addr] <= " << n << "_wdata;\n";
       if (a.read) o << "    " << (a.written ? "else " : "") << n << "_rdata <= " << n << "_m[" << n << "_addr];\n";
       o << "  end\n";
+      if (a.p1r || a.p1w) {
+        o << "  wire " << rng(a.aw()) << n << "_addr1;\n  wire " << n << "_ce1;\n";
+        conn += ", ." + n + "_addr1(" + n + "_addr1), ." + n + "_ce1(" + n + "_ce1)";
+        if (a.p1w) {
+          o << "  wire " << n << "_we1;\n  wire " << rng(a.ety.w) << n << "_wdata1;\n";
+          conn += ", ." + n + "_we1(" + n + "_we1), ." + n + "_wdata1(" + n + "_wdata1)";
+        }
+        if (a.p1r) {
+          o << "  logic " << rng(a.ety.w) << n << "_rdata1;\n";
+          conn += ", ." + n + "_rdata1(" + n + "_rdata1)";
+        }
+        o << "  always @(posedge ap_clk) if (" << n << "_ce1) begin\n";
+        if (a.p1w) o << "    if (" << n << "_we1) " << n << "_m[" << n << "_addr1] <= " << n << "_wdata1;\n";
+        if (a.p1r) o << "    " << (a.p1w ? "else " : "") << n << "_rdata1 <= " << n << "_m[" << n << "_addr1];\n";
+        o << "  end\n";
+      }
     } else {
       const Var& v = f.vars[pm.id];
       if (pm.k == Param::Scalar || v.portIn) {
@@ -1934,6 +2060,7 @@ void summarize(Job& j, const Cfg& cfg) {
 int usage() {
   std::cerr << "usage: mhls <file.c>... [-top <f>[,<g>]] [-o <out.sv|dir>] [-clock <ns>] [-pipeline]\n"
                "            [-unroll-all] [-unroll-max <n>] [-pipeline-loops] [-mul <n>] [-div <n>] [-no-share] [-handshake]\n"
+               "            [-dual-port]\n"
                "            [-max-reg-array <n>] [-delay-scale <x>] [-lib <file.lib>] [-tb <file>] [-cref <file>]\n"
                "            [-vectors <n>] [-seed <n>] [-explore <ns,...>] [-report <file>]\n"
                "            [-clang] [-emit-c <file>] [-I<dir>] [-D<name>[=<v>]] [-threads <n>|all] [-q]\n";
@@ -1980,6 +2107,7 @@ int main(int argc, char** argv) {
       else if (a == "-div") cfg.divLimit = std::stoi(val());
       else if (a == "-no-share") cfg.share = false;
       else if (a == "-handshake") cfg.handshake = true;
+      else if (a == "-dual-port") cfg.dualPort = true;
       else if (a == "-max-reg-array") opt.maxRegArray = std::stoi(val());
       else if (a == "-delay-scale") cfg.scale = std::stod(val());
       else if (a == "-lib") libFile = val();

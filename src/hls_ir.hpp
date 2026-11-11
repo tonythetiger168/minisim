@@ -36,6 +36,7 @@ struct Op {
   int hold = -1;                // temp register index, or -2 - var when a variable register holds it
   int lastUse = -1;
   int fu = -1;                  // shared functional unit
+  int port = 0;                 // Load/Store: the memory port (1 only with -dual-port)
 };
 
 struct Var {
@@ -57,6 +58,7 @@ struct Arr {
   enum Mode { Reg, Mem, Rom, Stream } mode = Mem;   // Stream: a load takes an element, a store sends one
   bool isParam = false, isStatic = false;
   bool read = false, written = false;
+  bool p1r = false, p1w = false;   // a second port, as the schedule uses it (-dual-port)
   std::vector<uint64_t> init;
   std::vector<int> elems;   // Reg mode: one variable per element
   int aw() const {
@@ -85,6 +87,9 @@ struct Block {
   bool pipeMust = false;
   int pipeL = 0;
   int pipeII = 1;                            // cycles between two iterations entering
+  // Pipelined loop, two-port memory: a read (first) that is in the memory's
+  // read stage in the very cycle the iteration before it writes (second).
+  std::vector<std::pair<int, int>> bypass;
 };
 
 struct Param {

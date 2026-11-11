@@ -352,6 +352,7 @@ def main():
     ap.add_argument("--seeds", default="0:20")
     ap.add_argument("--vectors", default="12")
     ap.add_argument("--clang", action="store_true", help="read every program through mhls -clang")
+    ap.add_argument("--dual-port", action="store_true", help="give every memory two ports (mhls -dual-port)")
     a = ap.parse_args()
     lo, hi = [int(x) for x in a.seeds.split(":")]
     os.makedirs(a.out, exist_ok=True)
@@ -367,6 +368,8 @@ def main():
                "-vectors", a.vectors, "-seed", str(seed + 1), "-q"] + opts
         if a.clang:
             cmd.append("-clang")
+        if a.dual_port:
+            cmd.append("-dual-port")
         rc, out = run(cmd)
         if rc != 0:
             # A pipeline that cannot meet one input per cycle is a legal refusal.

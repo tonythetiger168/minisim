@@ -29,7 +29,7 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
    Operators chain in one cycle while the path fits in `-clock`; an operator
    slower than the clock takes several cycles; `-mul`/`-div` cap how many
    multipliers and dividers work in one cycle; an array has one port, so one
-   access per cycle.
+   access per cycle (two with `-dual-port`).
 4. **Binding**: values that outlive their cycle share registers (left-edge
    algorithm); multipliers and dividers that are never busy together share
    one unit with input multiplexers, as long as that closes no combinational
@@ -160,6 +160,27 @@ to each. The rules, for one iteration every `K` cycles:
 A pipelined loop is one FSM state; the summary and the generated testbench
 count its cycles.
 
+## Two-port memories
+
+`-dual-port` gives every memory a second port (`<arr>_addr1`, `_ce1`,
+`_we1`, `_wdata1`, `_rdata1`; only the signals the schedule uses exist, and a
+memory that never needs two accesses in a cycle keeps one port). Two
+accesses then share a state when the first one in the program is a read; a
+read after a write still waits a state, and so does a second write. A read
+gets the word as it was before the clock edge, also when the other port
+writes it at that edge, and a memory behind an array parameter has to
+behave the same way.
+
+In a pipelined loop the rule about one memory becomes: at most two accesses
+in any cycle, and a write lands before the next iteration reaches the
+accesses that come before that write in the program. So `a[i + 20] = a[i]`
+runs at one iteration per cycle, and so does a memory updated in place
+(`h[b] = h[b] + 1`): there the read of one iteration and the write of the
+one before it happen in the same cycle, and when both go to the same word
+the written value is passed on to the reader instead of what the memory
+returns. In `tests/hls/dualport.c` the 64-sample histogram takes 85 cycles
+instead of 149.
+
 ## Interfaces
 
 FSM architecture:
@@ -174,6 +195,7 @@ FSM architecture:
 | `ap_return` | the return value |
 | `<arg>__<member>` | one port (or memory interface) per member of a struct parameter, following the rules above |
 | `<arr>_addr`, `_ce`, `_we`, `_wdata`, `_rdata` | array parameter: a single-port memory with synchronous read (data one cycle after `_ce`) |
+| `<arr>_addr1`, `_ce1`, `_we1`, `_wdata1`, `_rdata1` | with `-dual-port`: the second port of that memory, where the schedule uses one |
 
 Pipeline architecture: `ap_vld_in` marks an input, `ap_vld_out` its result
 `L` cycles later (the summary prints `L`), and `ap_ce` low stalls every
@@ -248,6 +270,7 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 | `-mul <n>`, `-div <n>` | multipliers / dividers working in one cycle |
 | `-no-share` | no register or unit sharing |
 | `-handshake` | also write `<top>_hs`, the block behind ready/valid ports |
+| `-dual-port` | memories have two ports (see Two-port memories) |
 | `-max-reg-array <n>` | largest local array kept in registers (default 64) |
 | `-delay-scale <x>` | scale the built-in operator delays |
 | `-lib <file.lib>` | take the delays from a Liberty library (see below) |
@@ -279,5 +302,5 @@ need multicycle constraints.
 
 ## Not yet
 
-Dual-port memories, non-blocking stream access,
+Non-blocking stream access,
 unions, SystemC modules (`SC_MODULE`, clocked threads).

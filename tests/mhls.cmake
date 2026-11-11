@@ -149,6 +149,27 @@ endif()
 message(STATUS "mhls -lib: fir at 2 ns takes ${slow} states with mini45_ss, ${fast} with mini45_ff")
 refuses(gcd gcd "mhls: .*gcd.c" -lib ${H}/gcd.c)
 
+# Two-port memories.
+design(dualport pairs -dual-port)                # two reads per state
+design(dualport hist -dual-port)                 # updated in place at one iteration per cycle (forwarding)
+design(dualport hist -dual-port -handshake)
+design(dualport bump -dual-port)                 # a write that does not always happen
+design(dualport bump -dual-port -clock 1.6)      # every third cycle
+design(dualport copyfwd -dual-port)
+design(dualport runmax -dual-port)               # a local memory
+design(dualport swp -dual-port)
+design(looppipe2 hist -dual-port)
+design(looppipe2 walk -dual-port)
+design(matmul matmul -dual-port)
+design(structs track -dual-port)
+refuses(dualport stencil "accessed more than 2 times per iteration" -dual-port)
+refuses(dualport copyfwd "a memory has one port")
+execute_process(COMMAND ${MHLS} ${H}/dualport.c -top hist -dual-port -o ${OUT}/hist_rate.sv
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT "${out}${err}" MATCHES "pipelined, 3 stages, one iteration per cycle")
+  message(FATAL_ERROR "mhls -dual-port: the histogram loop should run at one iteration per cycle:\n${out}${err}")
+endif()
+
 # C++ through clang (mhls -clang): classes, templates, constructors, operators.
 find_program(CLANG NAMES clang)
 if(CLANG)
@@ -226,4 +247,11 @@ if(PY)
   endif()
   string(STRIP "${out}" out)
   message(STATUS "${out}")
+  execute_process(COMMAND ${PY} ${H}/fuzz.py --mhls ${MHLS} ${sim} --cxx ${CXX} --out ${OUT}/fuzz_dp --seeds 0:80 --dual-port
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "mhls fuzz with two-port memories:\n${out}${err}")
+  endif()
+  string(STRIP "${out}" out)
+  message(STATUS "two-port memories: ${out}")
 endif()
