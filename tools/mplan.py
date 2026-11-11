@@ -25,6 +25,8 @@ The plan file. Indentation nests features; ``#`` starts a comment:
         line   rtl/uart_tx.sv goal=95   # code coverage of the files
         branch rtl/uart_tx.sv goal=90
         toggle tb.dut.u_tx goal=80      # signals in that scope
+        cond   rtl/uart_tx.sv           # condition coverage of the files
+        fsm    tb.dut.u_tx.state        # an FSM (instance.state variable), or a scope
         cover  tb.cg_tx                 # a covergroup type, or type.item
         assert tb.dut.u_tx              # assertions in that scope
         feature parity "Parity"
@@ -43,6 +45,9 @@ directory (``rtl/``).
     line    lines hit over lines, of the matched files
     branch  branch outcomes seen over outcomes, of the matched files
     toggle  bits toggled both ways over bits, of the matched signals
+    cond    condition vectors seen over vectors, of the matched files
+    fsm     states reached plus transitions taken, over states plus
+            transitions, of the matched FSMs (named instance.variable)
     cover   covergroup items matched, each bins covered over bins, weighed
             by the item's option.weight
     assert  assert / assume directives that passed at least once and never
@@ -100,7 +105,7 @@ import sys
 import time
 
 VERSION = "0.1.0"
-KINDS = ("test", "line", "branch", "toggle", "cover", "assert")
+KINDS = ("test", "line", "branch", "toggle", "cond", "fsm", "cover", "assert")
 
 
 def signed(x):
@@ -456,6 +461,8 @@ class Data:
         self.items = {}       # "type.item" -> item
         self.types = {}
         self.asserts = {}
+        self.conds = {}       # file -> [vectors hit, vectors]
+        self.fsms = {}        # "inst.name" -> (states hit, states, transitions hit, transitions)
         if db is not None:
             per, _, _ = mcov.summarize(db, None)
             self.files = per
@@ -466,10 +473,17 @@ class Data:
                 for iname, it in items.items():
                     self.items[f"{tname}.{iname}"] = it
             self.asserts = db["asserts"]
+            for (f, _ln, _col, _text), (_op, _terms, hits) in db.get("conds", {}).items():
+                c = self.conds.setdefault(f, [0, 0])
+                c[0] += sum(1 for h in hits if h > 0)
+                c[1] += len(hits)
+            for (_mod, inst, name), m in db.get("fsms", {}).items():
+                self.fsms[f"{inst}.{name}"] = mcov.fsm_score(m, False)
         self.m = {"test": Matcher(self.tests, "name"), "file": Matcher(self.files, "file"),
                   "toggle": Matcher(self.toggles, "hier"), "cover": Matcher(self.items, "hier"),
-                  "assert": Matcher(self.asserts, "hier")}
-        self.used = {k: set() for k in ("test", "file", "toggle", "cover", "assert")}
+                  "assert": Matcher(self.asserts, "hier"), "cond": Matcher(self.conds, "file"),
+                  "fsm": Matcher(self.fsms, "hier")}
+        self.used = {k: set() for k in ("test", "file", "toggle", "cover", "assert", "fsm")}
 
 
 def score_metric(m, data):
@@ -507,6 +521,17 @@ def score_metric(m, data):
         m.hit = sum(data.toggles[n][0] for n in names)
         m.total = sum(data.toggles[n][1] for n in names)
         what = "signal"
+    elif kind == "cond":
+        names = data.m["cond"].match(m.pattern)
+        m.hit = sum(data.conds[n][0] for n in names)
+        m.total = sum(data.conds[n][1] for n in names)
+        what = "file with conditions"
+    elif kind == "fsm":
+        names = data.m["fsm"].match(m.pattern)
+        data.used["fsm"].update(names)
+        m.hit = sum(data.fsms[n][0] + data.fsms[n][2] for n in names)
+        m.total = sum(data.fsms[n][1] + data.fsms[n][3] for n in names)
+        what = "FSM"
     elif kind == "cover":
         names = data.m["cover"].match(m.pattern)
         data.used["cover"].update(names)
@@ -573,6 +598,7 @@ def unmapped(data):
            "assertions": sorted(set(data.asserts) - data.used["assert"])}
     used_types = {n.rsplit(".", 1)[0] for n in data.used["cover"]}
     out["covergroups"] = sorted(set(data.types) - used_types)
+    out["FSMs"] = sorted(set(data.fsms) - data.used["fsm"])
     return out
 
 
@@ -773,6 +799,10 @@ def coverage_totals(data):
     th = sum(v[0] for v in data.toggles.values()); ta = sum(v[1] for v in data.toggles.values())
     cgs, func, (aok, an, _f, _i) = mcov.summarize_func(data.db)
     out = {"line": round(mcov.pct(lh, lt), 2), "branch": round(mcov.pct(bh, bt), 2), "toggle": round(mcov.pct(th, ta), 2)}
+    if data.conds:
+        out["cond"] = round(mcov.pct(sum(c[0] for c in data.conds.values()), sum(c[1] for c in data.conds.values())), 2)
+    if data.fsms:
+        out["fsm"] = round(mcov.pct(sum(v[0] + v[2] for v in data.fsms.values()), sum(v[1] + v[3] for v in data.fsms.values())), 2)
     if cgs:
         out["func"] = round(func, 2)
     if an:
@@ -992,7 +1022,7 @@ def write_html(plan, data, tri, snap, history, path):
     tiles = [(f"{plan.score:.1f}%", f"plan score ({delta})"), (f"{met}/{len(feats)}", "features met"),
              (f"{c['pass']}/{c['pass'] + c['fail'] + c['xfail']}", "tests passing"),
              (str(len(tri["buckets"])), f"failure buckets ({sum(b['class'] == 'new' for b in tri['buckets'])} new)")]
-    tiles += [(f"{v:.1f}%", {"func": "functional coverage", "assert": "assertions passed or hit"}.get(k, f"{k} coverage"))
+    tiles += [(f"{v:.1f}%", {"func": "functional coverage", "assert": "assertions passed or hit", "cond": "condition coverage", "fsm": "FSM coverage"}.get(k, f"{k} coverage"))
               for k, v in cov.items()]
     doc = [f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>mplan: {esc(plan.title)}</title><style>{CSS}</style></head>"
            f"<body><div class='viz-root'><h1>{esc(plan.title)}</h1><p class='sub'>Snapshot {esc(snap['label'])}, {esc(snap['time'])}. "
@@ -1164,7 +1194,7 @@ def cmd_trend(a):
         raise SystemExit(f"mplan: {a.history}: no snapshots")
     if a.n:
         snaps = snaps[-a.n:]
-    covk = [k for k in ("line", "branch", "toggle", "func", "assert") if any(k in (s.get("coverage") or {}) for s in snaps)]
+    covk = [k for k in ("line", "branch", "toggle", "cond", "fsm", "func", "assert") if any(k in (s.get("coverage") or {}) for s in snaps)]
     head = ["Time", "Label", "Score", "Change", "Tests", "Buckets"] + [k.capitalize() for k in covk]
     rows, last = [], None
     for s in snaps:
@@ -1204,6 +1234,9 @@ def cmd_init(a):
         out.append(f"  feature {ident}")
         out.append(f"    test {key}*" if len(names) > 1 or names[0] != key else f"    test {key}")
     if data.db is not None:
+        if data.fsms:
+            out.append("  feature fsm \"State machines\"")
+            out += [f"    fsm {n}" for n in sorted(data.fsms)]
         if data.types:
             out.append("  feature functional \"Functional coverage\"")
             out += [f"    cover {t}" for t in sorted(data.types)]
@@ -1218,6 +1251,8 @@ def cmd_init(a):
                 rel = os.path.relpath(fpath, common) if common else fpath
                 out.append(f"    line {rel}")
                 out.append(f"    branch {rel}")
+                if fpath in data.conds:
+                    out.append(f"    cond {rel}")
     text = "\n".join(out) + "\n"
     if a.o:
         with open(a.o, "w", encoding="utf-8") as f:

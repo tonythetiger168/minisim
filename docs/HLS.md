@@ -22,7 +22,7 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
    is inlined; `if`/`switch`/`?:`/`&&`/`||` without loops become multiplexers
    (if-conversion), including early returns such as `if (x < lo) return lo;`; loops with a constant trip count unroll on request;
    small arrays become registers, large ones RAMs, `const` ones ROMs.
-   Dead code goes, and every operator is narrowed to the bits its readers
+   Dead code goes (also a variable that only feeds itself), and every operator is narrowed to the bits its readers
    look at, so `uint8_t c = a + b` is an 8-bit adder although C adds as `int`.
    Chains such as `a+b+c+d` are rebalanced into trees.
 3. **Scheduling** (`src/mhls.cpp`): each block is cut into clock cycles.
@@ -45,15 +45,71 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
 | every C operator, casts, `?:`, short-circuit `&&` `\|\|`, `++`/`--`, compound assignment | `sizeof`, string literals |
 | `if`, `switch` (with fall-through), `for`, `while`, `do`, `break`, `continue`, `return` anywhere | `goto` |
 | fixed-size arrays of any dimension, initializer lists | pointers other than scalar output parameters, dynamic memory |
-| functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion, structs, classes, templates |
+| functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion, classes, templates |
+| structs: nested, in arrays, with array members and bit-fields; copied, passed by value, pointer or reference, and returned | unions, pointer members, member functions, structs defined inside a function |
 
 `ap_`/`sc_` operands are widened to 64 bits in arithmetic, so a product of
 two 20-bit values keeps its 40 bits; the result is cut to the declared width
 on assignment. Division by zero gives all ones (remainder: the dividend),
 and a shift by the width or more gives 0, in the RTL and in the reference.
 
+A struct is taken apart: each member is its own register, memory or port,
+named `<variable>__<member>` (`s.px.r` is `s__px__r`), so only the members
+that are used cost anything. An array of structs is one memory per member.
+A returned struct comes out as `ap_return__<member>`. A struct with an
+array member is passed by pointer or reference, not by value.
+
 Pragmas: `#pragma hls unroll` (before a loop or first in its body),
-`#pragma hls pipeline` (in a function), `#pragma hls top`.
+`#pragma hls pipeline` (in a function: the whole function is a pipeline;
+first in a loop body: that loop is pipelined), `#pragma hls top`.
+
+## Pipelined loops
+
+A loop normally runs one iteration at a time, each taking as many states as
+its body needs: two for a body that reads a memory (address, then data),
+more when the logic does not fit in one clock period. A pipelined loop
+starts a new iteration every cycle while the earlier ones are still in
+their later stages, so `n` iterations of an `L`-stage body take `n + L - 1`
+cycles instead of `n * L`.
+
+```c
+for (int i = 0; i < n; i++) {
+#pragma hls pipeline
+  int32_t y = (in[i] * gain) >> 6;
+  out[i] = y;
+  if (y > peak) peak = y;
+}
+```
+
+In `tests/hls/looppipe.c` this halves the latency of three loops (for
+example 129 to 67 cycles for a 63-element sum) at the same area.
+
+`mhls` picks the fastest rate the loop allows. Most loops can start an
+iteration every cycle. One that reads and writes the same memory, follows a
+pointer it has just read, or ends on a value read from memory cannot, but
+it can start one every second (or third) cycle, which still beats running
+the iterations one after the other when the body is longer than that:
+`n` iterations then take `(n - 1) * K + L` cycles. In
+`tests/hls/looppipe2.c` a histogram (`h[b] = h[b] + 1`) runs at one
+iteration every 2 cycles instead of 3.
+
+The pragma insists: when no rate is faster than the unpipelined loop,
+`mhls` stops and says which rule fails. `-pipeline-loops` tries every loop
+instead, leaves the others as they are, and the summary lists what happened
+to each. The rules, for one iteration every `K` cycles:
+
+- the body is straight-line code after if-conversion and unrolling of inner
+  loops (no `break`, `continue`, `return`, or inner loop that stays a loop);
+- the accesses to one memory share its port: they are in different stages,
+  all within `K` stages of each other, so at one per cycle `b[i] = a[i] + 1`
+  qualifies and `a[i] = a[i] + 1` needs every second cycle;
+- a value carried from one iteration to the next (an accumulator, the loop
+  counter) is updated within `K` clock periods of being read, and not
+  through a multi-cycle operator;
+- the loop condition is known within the first `K` stages.
+
+A pipelined loop is one FSM state; the summary and the generated testbench
+count its cycles.
 
 ## Interfaces
 
@@ -67,6 +123,7 @@ FSM architecture:
 | `ap_idle` | high while waiting for `ap_start` |
 | `<arg>` | scalar parameter: input. Pointer/reference parameter: output, or `<arg>_i` and `<arg>_o` when the function also reads it |
 | `ap_return` | the return value |
+| `<arg>__<member>` | one port (or memory interface) per member of a struct parameter, following the rules above |
 | `<arr>_addr`, `_ce`, `_we`, `_wdata`, `_rdata` | array parameter: a single-port memory with synchronous read (data one cycle after `_ce`) |
 
 Pipeline architecture: `ap_vld_in` marks an input, `ap_vld_out` its result
@@ -74,6 +131,15 @@ Pipeline architecture: `ap_vld_in` marks an input, `ap_vld_out` its result
 stage. A pipeline needs a function that is straight-line after unrolling
 (no memories, no data-dependent loops), and a `static` must be read and
 updated in the same stage; `mhls` says which rule fails and why.
+
+`-handshake` adds a second module `<top>_hs` around the block with
+`in_valid`/`in_ready` for the scalar inputs and `out_valid`/`out_ready` for
+the results, in place of the `ap_` control ports. A transfer happens in a
+cycle where valid and ready are both high. Around an FSM the result waits
+with `out_valid` high until it is taken, and the next call is accepted
+after that; around a pipeline a result that is not taken stalls every
+stage, and `in_ready` goes low. Memory ports pass through unchanged. `-tb`
+then drives the wrapper, with a sink that refuses now and then.
 
 ## Checking the result
 
@@ -97,8 +163,10 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 | `-clock <ns>` | clock period used for scheduling (default 10) |
 | `-pipeline` | pipeline architecture |
 | `-unroll-all`, `-unroll-max <n>` | unroll every constant-trip loop; most iterations (default 4096) |
+| `-pipeline-loops` | pipeline every loop that allows it (see Pipelined loops) |
 | `-mul <n>`, `-div <n>` | multipliers / dividers working in one cycle |
 | `-no-share` | no register or unit sharing |
+| `-handshake` | also write `<top>_hs`, the block behind ready/valid ports |
 | `-max-reg-array <n>` | largest local array kept in registers (default 64) |
 | `-delay-scale <x>` | scale the built-in operator delays |
 | `-tb <file>`, `-cref <file>`, `-vectors <n>`, `-seed <n>` | verification collateral |
@@ -114,6 +182,6 @@ need multicycle constraints.
 
 ## Not yet
 
-Loop pipelining, dual-port memories, AXI-Stream/handshake interfaces,
-structs, SystemC modules (`SC_MODULE`, clocked threads), and
+Dual-port memories, array arguments as streams,
+unions, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

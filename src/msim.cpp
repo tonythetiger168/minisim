@@ -28,6 +28,9 @@
 //   +pulse_on_event / +pulse_on_detect, +showcancelled / +noshowcancelled
 //                    pulse styles of every path output (30.7.4)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
+//   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
+//                    time each bit spent at 0, 1 and x and its toggle count,
+//                    for power analysis with mpower (docs/POWER.md)
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -137,6 +140,7 @@
 
 #include "codegen.hpp"
 #include "lower.hpp"
+#include "saif.hpp"
 #include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/diagnostics/LookupDiags.h"
@@ -719,7 +723,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     first = true;
     for (auto& [key, c] : conds) {
         f << (first ? "\n  " : ",\n  ") << "[" << c.d->file << ", " << c.d->line << ", " << c.d->col << ", "
-          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? "\"||\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
+          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? (c.d->lazy ? "\"||s\"" : "\"||\"") : c.d->lazy ? "\"&&s\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
         for (size_t k = 0; k < c.d->terms.size(); k++) f << (k ? ", " : "") << jstr(c.d->terms[k]);
         f << "], [";
         for (size_t k = 0; k < c.hits.size(); k++) f << (k ? ", " : "") << c.hits[k];
@@ -840,6 +844,7 @@ static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
+                 "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -889,6 +894,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> plusargs;
     uint64_t seed = 0;
     std::optional<std::string> vcdPath;
+    std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
+    bool saifTmp = false;   // ...and the waveform was only written for that
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
@@ -1004,6 +1011,12 @@ int main(int argc, char** argv) {
         if (a == "+showcancelled" || a == "+show_cancelled") { pulseOpts().showCancelled = 1; continue; }                   // 30.7.4.2
         if (a == "+noshowcancelled" || a == "+noshow_cancelled") { pulseOpts().showCancelled = 0; continue; }
         if (a == "+fst") { vcdPath = "dump.fst"; continue; }
+        // Switching activity for power analysis (mpower): SAIF, T0/T1/TX/TC per bit.
+        if (a == "-saif") {
+            std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
+            saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
+            continue;
+        }
         if (a == "-cov") {
             g_cov = true;
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
@@ -1122,6 +1135,31 @@ int main(int argc, char** argv) {
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (!saifPath.empty() && !vcdPath) {
+#ifdef MINISIM_FST
+        vcdPath = saifPath + ".tmp.fst";
+#else
+        vcdPath = saifPath + ".tmp.vcd";
+#endif
+        saifTmp = true;
+    }
+    // After the run: every value change of the waveform, summed per bit.
+    auto writeSaif = [&]() -> bool {
+        if (saifPath.empty()) return true;
+        S.closeWaves();
+        try {
+            saif::Db db;
+            saif::load(*vcdPath, db, par::defaultThreads());
+            std::ofstream f(saifPath);
+            if (!f) throw saif::Error("cannot write " + saifPath);
+            saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+        } catch (const std::exception& e) {
+            std::cerr << "msim: -saif: " << e.what() << "\n";
+            return false;
+        }
+        if (saifTmp) std::remove(vcdPath->c_str());
+        return true;
+    };
     if (std::none_of(fwd.begin(), fwd.end(), [](const std::string& s) { return startsWith(s, "--std"); }))
         fwd.push_back("--std=1800-2023");
     if (seed) {   // the $urandom stream (18.13); $random keeps its own seed (Annex N)
@@ -1240,8 +1278,9 @@ int main(int argc, char** argv) {
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
     if (g_cov) {   // FSM coverage: the kernel records the state registers' values
         std::vector<int> watch;
-        for (auto& d : fsmDefs()) watch.push_back(d.sig);
-        S.fsmWatch(watch);
+        std::vector<char> hot;
+        for (auto& d : fsmDefs()) { watch.push_back(d.sig); hot.push_back(d.onehot); }
+        S.fsmWatch(watch, hot);
     }
     if (!xpropReport.empty()) {   // -xprop-report: what is merged, what is not and why
         std::ofstream f(xpropReport);
@@ -1402,6 +1441,7 @@ int main(int argc, char** argv) {
                 std::cerr << "msim: cannot write " << covPath << "\n";
                 return 1;
             }
+            if (!writeSaif()) return 1;
             return st;
         }
     }
@@ -1495,5 +1535,6 @@ int main(int argc, char** argv) {
         std::cerr << "msim: cannot write " << covPath << "\n";
         return 1;
     }
+    if (!writeSaif()) return 1;
     return S.exitCode;
 }

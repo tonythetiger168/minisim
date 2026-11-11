@@ -31,12 +31,12 @@ if(rc EQUAL 0 OR NOT err MATCHES "bad.upf:2: unknown UPF command set_isolatoin")
 endif()
 
 # mlint: the good intent is clean; the bad one reports every rule.
-execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${D}/gating.upf
+execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${D}/gating.upf -only upf
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0 OR NOT out MATCHES "0 findings")
   message(FATAL_ERROR "mlint gating.upf is not clean: ${rc}\n${out}${err}")
 endif()
-execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${D}/lint_bad.upf
+execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${D}/lint_bad.upf -only upf
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 foreach(want
     "[UPF001] power domain PD_GONE: no instance 'u_dut.u_gone'"

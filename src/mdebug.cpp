@@ -135,6 +135,7 @@ struct Driver {
     std::vector<Guard> guards;
     bool seq = false;
     bool whole = false;                   // assigns the whole target, not a select of it
+    int lo = -1, w = 0;                   // the bits written, when a field or a constant select; lo -1: not known
     std::string clock;                    // the event control as written, when seq
     std::string how;                      // "", or force, assign (procedural), call (an output argument)
     int block = -1;                       // which process; -1 outside one
@@ -175,6 +176,83 @@ struct DB {
         drivers.push_back(std::move(d));
     }
 };
+
+// Where a struct field sits in its struct's flat vector (bit 0 is the LSB),
+// which is how msim writes a struct to the waveform: a packed struct as
+// declared, an unpacked one with its first field in the high bits.
+bool fieldRange(const MemberAccessExpression& m, int& lo, int& w) {
+    if (m.member.kind != SymbolKind::Field) return false;
+    const auto& f = m.member.as<FieldSymbol>();
+    const Type& st = m.value().type->getCanonicalType();
+    const Type& ft = f.getType();
+    if (!ft.isIntegral()) return false;
+    w = (int)ft.getBitWidth();
+    if (st.kind == SymbolKind::PackedStructType) { lo = (int)f.bitOffset; return true; }
+    if (st.kind != SymbolKind::UnpackedStructType) return false;
+    uint64_t total = 0;
+    for (const FieldSymbol* o : st.as<UnpackedStructType>().fields) {
+        if (!o->getType().isIntegral()) return false;
+        total += o->getType().getBitWidth();
+    }
+    lo = (int)(total - f.bitOffset - (uint64_t)w);
+    return lo >= 0;
+}
+
+// The bits of its base variable an lvalue writes, when that is fixed:
+// s.f, v[3], v[7:4], s.f[2] and so on.
+bool flatRange(const Expression& e, int& lo, int& w) {
+    switch (e.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue: {
+            const Type& t = e.type->getCanonicalType();
+            lo = 0;
+            if (t.isIntegral()) { w = (int)t.getBitWidth(); return true; }
+            if (t.kind != SymbolKind::UnpackedStructType) return false;
+            w = 0;
+            for (const FieldSymbol* o : t.as<UnpackedStructType>().fields) {
+                if (!o->getType().isIntegral()) return false;
+                w += (int)o->getType().getBitWidth();
+            }
+            return true;
+        }
+        case ExpressionKind::MemberAccess: {
+            const auto& m = e.as<MemberAccessExpression>();
+            int bl, bw, fl, fw;
+            if (!flatRange(m.value(), bl, bw) || !fieldRange(m, fl, fw)) return false;
+            lo = bl + fl; w = fw;
+            return true;
+        }
+        case ExpressionKind::ElementSelect: {
+            const auto& x = e.as<ElementSelectExpression>();
+            const Type& vt = *x.value().type;
+            int bl, bw;
+            if (!vt.isIntegral() || e.type->getBitWidth() != 1 || x.selector().kind != ExpressionKind::IntegerLiteral ||
+                !flatRange(x.value(), bl, bw)) return false;
+            auto ix = x.selector().as<IntegerLiteral>().getValue().as<int32_t>();
+            ConstantRange r = vt.getFixedRange();
+            if (!ix || !r.containsPoint(*ix)) return false;
+            lo = bl + r.translateIndex(*ix); w = 1;
+            return true;
+        }
+        case ExpressionKind::RangeSelect: {
+            const auto& x = e.as<RangeSelectExpression>();
+            const Type& vt = *x.value().type;
+            int bl, bw;
+            if (!vt.isIntegral() || x.getSelectionKind() != RangeSelectionKind::Simple ||
+                x.left().kind != ExpressionKind::IntegerLiteral || x.right().kind != ExpressionKind::IntegerLiteral ||
+                !flatRange(x.value(), bl, bw)) return false;
+            auto a = x.left().as<IntegerLiteral>().getValue().as<int32_t>();
+            auto b = x.right().as<IntegerLiteral>().getValue().as<int32_t>();
+            ConstantRange r = vt.getFixedRange();
+            if (!a || !b || !r.containsPoint(*a) || !r.containsPoint(*b)) return false;
+            int h = r.translateIndex(*a), l = r.translateIndex(*b);
+            if (h < l) std::swap(h, l);
+            lo = bl + l; w = h - l + 1;
+            return true;
+        }
+        default: return false;
+    }
+}
 
 // The symbols an assignment's left side writes; select indices are reads.
 void lhsTargets(const Expression& e, std::vector<const Symbol*>& targets, std::vector<const Symbol*>& idx) {
@@ -282,6 +360,10 @@ struct Walker {
             d.rhs = &a.right();
             d.whole = a.left().kind == ExpressionKind::NamedValue ||
                       a.left().kind == ExpressionKind::HierarchicalValue;
+            if (targets.size() == 1) {
+                int lo, w;
+                if (flatRange(a.left(), lo, w)) { d.lo = lo; d.w = w; }
+            }
             namesIn(a.right(), d.reads);
             d.creads = idx;
             controls(d);
@@ -525,11 +607,12 @@ struct Eval {
 
     std::optional<SVInt> named(const std::string& name, const Type& type) {
         const Wave* w = vcd.find(name);
-        if (!w || !type.isIntegral()) return std::nullopt;
+        if (!w || !(type.isIntegral() || type.getCanonicalType().kind == SymbolKind::UnpackedStructType))
+            return std::nullopt;
         int i = w->at(t);
         std::string bits = i < 0 ? std::string(w->width, 'x') : w->bits(i);
         SVInt v = SVInt::fromString(std::to_string(bits.size()) + "'b" + bits);
-        v.setSigned(type.isSigned());
+        v.setSigned(type.isIntegral() && type.isSigned());
         return v;
     }
 
@@ -634,6 +717,17 @@ struct Eval {
                     sym && s.value().kind == ExpressionKind::NamedValue)
                     return named(path(*sym) + "[" + std::to_string(*ix) + "]", *e.type);
                 return std::nullopt;
+            }
+            case ExpressionKind::MemberAccess: {
+                // A struct is one vector in the waveform; a field is a slice.
+                const auto& m = e.as<MemberAccessExpression>();
+                int lo, w;
+                if (!fieldRange(m, lo, w)) return std::nullopt;
+                auto v = eval(m.value());
+                if (!v || lo + w > (int)v->getBitWidth()) return std::nullopt;
+                SVInt f = v->slice(lo + w - 1, lo);
+                f.setSigned(e.type->isSigned());
+                return f;
             }
             case ExpressionKind::RangeSelect: {
                 const auto& s = e.as<RangeSelectExpression>();
@@ -968,14 +1062,32 @@ struct Tool {
                     if (differs[k]) hits[k].state = 0;
         }
         // In one process the last assignment that ran is the one that counts.
-        std::map<int, int> last;
-        for (size_t k = 0; k < hits.size(); k++)
-            if (hits[k].state == 1 && db.drivers[hits[k].ix].block >= 0) last[db.drivers[hits[k].ix].block] = (int)k;
+        // A later assignment to other bits (another field) does not replace it.
+        auto covered = [&](size_t k) {
+            const Driver& a = db.drivers[hits[k].ix];
+            if (a.block < 0) return false;
+            std::vector<std::pair<int, int>> later;   // [lo, end) of the assignments after it
+            for (size_t j = k + 1; j < hits.size(); j++) {
+                const Driver& b = db.drivers[hits[j].ix];
+                if (hits[j].state != 1 || b.block != a.block) continue;
+                if (b.whole) return true;
+                if (b.lo >= 0) later.push_back({b.lo, b.lo + b.w});
+                else if (a.lo < 0 && !a.whole) return true;
+            }
+            if (a.lo < 0) return false;
+            std::sort(later.begin(), later.end());
+            int at = a.lo;
+            for (auto [l, e] : later) {
+                if (l > at) break;
+                at = std::max(at, e);
+            }
+            return at >= a.lo + a.w;
+        };
         bool any = false;
         for (size_t k = 0; k < hits.size(); k++) {
             const Driver& d = db.drivers[hits[k].ix];
             if (hits[k].state == 0) continue;
-            if (hits[k].state == 1 && d.block >= 0 && last[d.block] != (int)k) continue;
+            if (hits[k].state == 1 && covered(k)) continue;
             any = true;
             std::cout << pad << "  " << (hits[k].state == 1 ? "<- " : "?? ") << line(d) << "\n";
             if (depth <= 0) continue;
@@ -1068,8 +1180,9 @@ struct Tool {
             return cv.isInteger() ? constJson(cv.integer()) : "null";
         }
         auto it = db.sigIx.find(&sym);
-        if (it == db.sigIx.end() || !type.isIntegral()) return "null";
-        return "[\"s\"," + std::to_string(it->second) + "," + (type.isSigned() ? "1" : "0") + "]";
+        bool flat = type.getCanonicalType().kind == SymbolKind::UnpackedStructType;
+        if (it == db.sigIx.end() || !(type.isIntegral() || flat)) return "null";
+        return "[\"s\"," + std::to_string(it->second) + "," + (!flat && type.isSigned() ? "1" : "0") + "]";
     }
     std::string exprJson(const Expression& e) {
         auto bad = [](const std::string& x) { return x == "null"; };
@@ -1117,6 +1230,15 @@ struct Tool {
                 if (bad(v) || bad(i)) return "null";
                 ConstantRange r = vt.getFixedRange();
                 return "[\"bit\"," + v + "," + i + "," + std::to_string(r.left) + "," + std::to_string(r.right) + "]";
+            }
+            case ExpressionKind::MemberAccess: {
+                const auto& m = e.as<MemberAccessExpression>();
+                int lo, w;
+                if (!fieldRange(m, lo, w)) return "null";
+                std::string v = exprJson(m.value());
+                if (bad(v)) return "null";
+                return "[\"fld\"," + v + "," + std::to_string(lo) + "," + std::to_string(w) + "," +
+                       (e.type->isSigned() ? "1" : "0") + "]";
             }
             case ExpressionKind::RangeSelect: {
                 const auto& x = e.as<RangeSelectExpression>();
@@ -1241,7 +1363,7 @@ struct Tool {
             os << (first ? "" : ",\n") << "{\"sig\":" << it->second << ",\"kind\":" << js(label(d))
                << ",\"file\":" << dw[i].file << ",\"line\":" << dw[i].line << ",\"text\":" << js(text(d))
                << ",\"when\":" << js(when(d)) << ",\"seq\":" << (d.seq ? 1 : 0) << ",\"reads\":" << ids(d.reads)
-               << ",\"ctl\":" << ids(d.creads) << ",\"blk\":" << d.block << ",\"whole\":" << (d.whole ? 1 : 0)
+               << ",\"ctl\":" << ids(d.creads) << ",\"blk\":" << d.block << ",\"whole\":" << (d.whole ? 1 : 0) << ",\"lo\":" << d.lo << ",\"w\":" << d.w
                << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
