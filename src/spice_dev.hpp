@@ -39,6 +39,7 @@ struct Ctx {
     bool noLimit = false;        // evaluate exactly at x
     double reltol = 1e-3, abstol = 1e-12;
     bool bypass = true;          // latent devices keep their last linearization
+    int iter = 0;                // Newton iteration, from 0
 };
 
 struct Setup {
@@ -122,6 +123,39 @@ struct Device {
     virtual bool nonlinear() const { return false; }
     virtual int branch() const { return -1; }
 };
+
+// ------------------------------------------------------------------ BSIM4
+//
+// The BSIM4 transistors of a circuit (.model level 14 or 54). The model
+// equations are Berkeley's own BSIM4 code, unmodified, in third_party/bsim4;
+// spice_bsim4.cpp adapts it to this simulator. They are kept as one set
+// rather than as Devices: the model code evaluates each transistor on its
+// own (in parallel) and then adds all of them to the matrix in netlist order
+// on one thread, so results do not depend on the thread count.
+struct Bsim4Set {
+    using Params = std::map<std::string, double>;
+    virtual ~Bsim4Set() = default;
+    // Both return the names the model code does not know.
+    virtual std::vector<std::string> addModel(const std::string& name, bool pmos, const Params& p) = 0;
+    virtual std::vector<std::string> addInstance(const std::string& model, const std::string& name,
+                                                 const int node[4], const Params& p) = 0;
+    virtual size_t size() const = 0;
+    // Internal nodes (returned), matrix slots, temperature update, checks.
+    virtual std::vector<int> setup(Setup& S, const Options& opt) = 0;
+    // One Newton iteration: evaluate at xBuf (xBuf[0] is ground), then add
+    // to the matrix and right-hand side (rhsBuf[0] is ground's row).
+    virtual void eval(const Ctx& c, double* xBuf, par::Pool* pool) = 0;
+    virtual void load(double* val, double* rhsBuf) = 0;
+    virtual bool limited() const = 0;   // this iteration cannot be the last
+    virtual void accept() = 0;
+    virtual void start() = 0;           // the state before the first time step
+    virtual double maxStep(const double* h, int order, const Options& opt) const = 0;
+    virtual void prepareAC() = 0;       // after the operating point
+    virtual void loadAC(double w, cplx* val) const = 0;
+};
+// Defined in spice_bsim4.cpp; programs built without it (no MSPICE_BSIM4)
+// report level 14/54 models as unsupported.
+std::unique_ptr<Bsim4Set> makeBsim4();
 
 // ------------------------------------------------------------------ sources
 

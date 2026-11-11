@@ -52,10 +52,33 @@ Waveforms: `pulse(v1 v2 td tr tf pw per)`, `sin(vo va freq td theta phase)`,
 |---|---|
 | `d` | `is n rs cjo vj m tt bv ibv fc eg xti` |
 | `nmos`, `pmos` (level 1, Shichman-Hodges, Meyer gate capacitances) | `vto kp gamma phi lambda rd rs cbd cbs is pb cgso cgdo cgbo cj mj cjsw mjsw tox ld uo fc` |
+| `nmos`, `pmos` with `level=14` or `level=54`: BSIM4 4.8.3 | every BSIM4 model parameter (`toxe vth0 u0 vsat k1 k2 rdsw ... rgatemod rbodymod rdsmod trnqsmod acnqsmod igcmod igbmod`); on the element line `w l nf m ad as pd ps nrd nrs sa sb sd sca scb scc sc min rbsb rbdb rbpb rbps rbpd delvto mulu0 xgw ngcon dtemp trnqsmod acnqsmod rbodymod rgatemod geomod rgeomod off` |
 | `npn`, `pnp` (Gummel-Poon) | `is bf br nf nr vaf var ikf ikr ise ne isc nc rb rc re cje vje mje cjc vjc mjc tf tr fc eg xti` |
 
 A model parameter mspice does not use is reported as a warning rather than
-silently dropped. A MOSFET model with `level` other than 1 is an error.
+silently dropped. A MOSFET model with a `level` other than 1, 14 or 54 is
+an error.
+
+### BSIM4
+
+`level=14` or `level=54` selects BSIM4. The model equations are not
+mspice's: they are the BSIM4 4.8.3 code of the UC Berkeley BSIM Research
+Group, which developed the model, used unmodified under the Educational
+Community License 2.0 (`third_party/bsim4`, `THIRD_PARTY_NOTICES.md`). So a
+model card that works in another simulator with BSIM4 4.8 means the same
+here: all model and instance parameters are passed to that code by name,
+and a name it does not know is a warning (model) or an error (element).
+Its parameter checker prints its usual warnings to stderr.
+
+mspice's part is the adapter (`src/spice_bsim4.cpp`): internal nodes (drain
+and source resistance, gate resistance, body network, the NQS charge node)
+become unknowns, charges are integrated with mspice's trapezoidal and
+backward-Euler rule and watched by its step control, and AC uses the
+model's own small-signal stamps. What is not connected yet: noise, the
+safe-operating-area check, `ic=` on the element line, binned models
+(`lmin lmax wmin wmax` selection) and printing a transistor's operating
+point. A build without the model (`-DMINISIM_WITH_BSIM4=OFF`) reports
+level 14/54 as unsupported.
 
 ### Parameters, expressions, hierarchy
 
@@ -148,6 +171,10 @@ give `chgtol=1e-17` or so there.
 - **Devices** (`src/spice_dev.hpp`) are stored by type, so the per-iteration
   loops walk contiguous memory. A device whose terminal voltages have not
   moved keeps its last linearization (bypass).
+- **Pivot order**: unknowns fixed by a row with one entry (a supply node,
+  through its voltage source) are eliminated first, then minimum degree.
+  Without that the supply column gathers the product of the gains of a long
+  chain of stages before it is reached.
 
 ## Threads
 
@@ -178,22 +205,31 @@ tightened in both simulators, an inverter's delays agree to five digits.
 
 ## Speed
 
-`bench/spice/run.sh <mspice>` writes five netlists and times mspice against
+`bench/spice/run.sh <mspice>` writes seven netlists and times mspice against
 ngspice. On a 4-CPU cloud machine, ngspice 42, best of three, seconds:
 
 | Netlist | mspice, 1 thread | mspice, 4 threads | ngspice |
 |---|---|---|---|
-| 20,000-section RC ladder, transient | 0.81 | 0.82 | 1.45 |
-| 60 x 60 RC mesh, 401-point AC | 2.04 | 0.73 | 6.75 |
-| 2,000 inverters in a chain (4,000 MOSFETs), transient | 1.14 | 0.70 | 1.83 |
-| 101-stage ring oscillator, transient | 0.37 | 0.39 | 0.58 |
-| 3 inverters with RC load, 64-value `.step`, transient | 0.69 | 0.20 | no `.step` |
+| 20,000-section RC ladder, transient | 0.86 | 0.87 | 1.36 |
+| 60 x 60 RC mesh, 401-point AC | 1.86 | 0.73 | 6.41 |
+| 2,000 inverters in a chain (4,000 level-1 MOSFETs), transient | 1.03 | 0.60 | 1.75 |
+| 101-stage ring oscillator, level 1, transient | 0.35 | 0.35 | 0.52 |
+| 3 inverters with RC load, 64-value `.step`, transient | 0.58 | 0.17 | no `.step` |
+| 2,000 inverters in a chain (4,000 BSIM4 transistors), transient | 3.18 | 2.08 | 5.82 |
+| 101-stage ring oscillator, BSIM4, transient | 0.78 | 0.67 | 1.72 |
 
 Both simulators give the same measurements on these. The ladder is linear
 (one factorization, then solves), and the ring is under `parmin`, so
 neither uses threads. On the chain, MOSFET evaluation and assembly take
 0.81 s of the run on one thread and 0.36 s on four; what is left is the LU,
 the convergence and step-size checks and the output, which are serial.
+
+The two BSIM4 rows run the same model code in both simulators (delays agree
+to 0.1%). mspice is ahead on one thread because a transistor whose voltages
+have not moved is not evaluated again, including on the first iteration of
+a time step. With threads the evaluations run in parallel; adding the
+results to the matrix is serial and in netlist order (so any thread count
+gives the same bits), and that, with the LU, is what limits the gain.
 
 ## Flat netlists for other tools
 
@@ -209,8 +245,9 @@ line: path, nodes, model, parameters.
 
 ## Not there yet
 
-- MOSFET levels above 1 (BSIM3, BSIM4) and the JFET; behavioral (`B`)
-  sources, switches, transmission lines.
+- BSIM3 and other MOSFET levels (2, 3, BSIM-CMG), the JFET; for BSIM4:
+  noise, binned models, `ic=`; behavioral (`B`) sources, switches,
+  transmission lines.
 - `.noise`, `.tf`, `.sens`, `.four`, `.lib` sections, `.alter`; `.dc` sweeps
   of a parameter or temperature; `i()` of a resistor or a device terminal.
 - Temperature: the thermal voltage, the diode and BJT saturation current and

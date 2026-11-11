@@ -20,7 +20,7 @@ best() {   # best of three wall-clock times of a command
     echo "$b"
 }
 printf "%-8s %10s %10s %10s   %s\n" netlist "mspice-1" "mspice-all" ngspice "first measurement (mspice / ngspice)"
-for n in ladder mesh chain ring mc; do
+for n in ladder mesh chain ring mc chain4 ring4; do
     t1=$(best "$MSPICE" "$DIR/$n.cir" -q -threads 1)
     ta=$(best "$MSPICE" "$DIR/$n.cir" -q)
     m=$(grep -m1 ' = ' "$DIR/out.txt" | awk '{print $3}')
