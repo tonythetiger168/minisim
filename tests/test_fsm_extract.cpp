@@ -48,7 +48,7 @@ static void run(const char* rel, bool print) {
             for (auto& s : f.states) check(s.first && !(s.first & (s.first - 1)), id + ": one-hot state value");
         if (print) {
             std::cout << f.module << " " << id << " w=" << f.w << (f.onehot ? " onehot" : "") << (f.caseOnState ? " case" : "")
-                      << (f.caseDefault ? " default" : "") << (f.next ? " next=" + std::string(f.next->name) : "") << "\n  states:";
+                      << (f.caseDefault ? " default" : "") << (f.caseFull ? " full" : "") << (f.next ? " next=" + std::string(f.next->name) : "") << "\n  states:";
             for (auto& s : f.states) std::cout << " " << s.second << "=" << s.first;
             std::cout << "\n  reset:";
             for (uint64_t r : f.resetStates) std::cout << " " << r;
@@ -62,6 +62,27 @@ static void run(const char* rel, bool print) {
 
 int main(int argc, char** argv) {
     bool print = argc > 1;
+    // unique case, priority case and (* full_case *) with no default are full; a plain one is not.
+    {
+        auto tree = slang::syntax::SyntaxTree::fromText(R"(
+module m(input logic clk, rst, go);
+  logic [1:0] a, b, c, d;
+  always_ff @(posedge clk) if (rst) a <= 0; else unique case (a) 0: if (go) a <= 1; 1: a <= 2; 2: a <= 0; endcase
+  always_ff @(posedge clk) if (rst) b <= 0; else priority case (b) 0: if (go) b <= 1; 1: b <= 2; 2: b <= 0; endcase
+  always_ff @(posedge clk) if (rst) c <= 0; else (* full_case *) case (c) 0: if (go) c <= 1; 1: c <= 2; 2: c <= 0; endcase
+  always_ff @(posedge clk) if (rst) d <= 0; else case (d) 0: if (go) d <= 1; 1: d <= 2; 2: d <= 0; endcase
+endmodule
+)");
+        slang::ast::Compilation comp;
+        comp.addSyntaxTree(tree);
+        comp.getAllDiagnostics();
+        auto fsms = extractFsms(comp.getRoot());
+        check(fsms.size() == 4, "caseFull: four FSMs");
+        for (const ExtractedFsm& f : fsms) {
+            check(f.caseOnState && !f.caseDefault, f.name + ": case without default");
+            check(f.caseFull == (f.name != "d"), f.name + ": caseFull");
+        }
+    }
     run("tests/cov/fsm.sv", print);
     run("tests/cov/fsm_onehot.sv", print);
     if (failed) return 1;
