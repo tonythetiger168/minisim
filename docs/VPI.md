@@ -38,18 +38,51 @@ literal as a string constant; anything else as an expression whose value is
 taken when the call runs. `vpi_put_userdata` / `vpi_get_userdata` keep data
 per call site.
 
-**Objects (clause 37).** `vpiModule` (top modules from
-`vpi_iterate(vpiModule, NULL)`, children through generate blocks and
-instance arrays), `vpiNet`, `vpiReg`, `vpiIntegerVar`, `vpiTimeVar`,
-`vpiRealVar`, `vpiMemory` (one unpacked dimension) and `vpiMemoryWord`,
-`vpiNetBit` / `vpiRegBit`, `vpiParameter`, `vpiPort` (with `vpiDirection`
-and `vpiLowConn`), `vpiSysTaskCall` / `vpiSysFuncCall` with `vpiArgument`,
-`vpiScope` and `vpiUserSystf`. Properties: `vpiType`, `vpiName`,
-`vpiFullName`, `vpiDefName`, `vpiFile`, `vpiLineNo`, `vpiSize`, `vpiSigned`,
-`vpiScalar`, `vpiVector`, `vpiTopModule`, `vpiTimeUnit`, `vpiTimePrecision`,
-`vpiDirection`, `vpiNetType`, `vpiFuncType`, `vpiConstType`, `vpiLocalParam`,
-`vpiArray`. Handles are canonical: the same object always has the same
-handle, so `vpi_compare_objects` and `==` agree.
+**Objects (clause 37).** Instances: `vpiModule`, `vpiInterface` (with
+`vpiModport`), `vpiProgram` and `vpiPackage`; `vpi_iterate(vpiInstance, NULL)`
+gives the top instances and the packages, `vpi_iterate(vpiModule, NULL)` the
+top modules. Scopes inside an instance (`vpiInternalScope`): `vpiGenScope`
+(and `vpiGenScopeArray` for a generate loop), `vpiTask`, `vpiFunction`,
+`vpiNamedBegin`, `vpiNamedFork`. Nets and variables with their
+SystemVerilog types: `vpiNet`, `vpiReg` (`vpiLogicVar`), `vpiBitVar`,
+`vpiIntegerVar`, `vpiIntVar`, `vpiShortIntVar`, `vpiLongIntVar`,
+`vpiByteVar`, `vpiTimeVar`, `vpiRealVar`, `vpiShortRealVar`, `vpiStringVar`,
+`vpiEnumVar`, `vpiStructVar` and `vpiUnionVar` (packed), `vpiPackedArrayVar`
+and the matching net types; `vpi_iterate(vpiVariables / vpiNet, scope)`
+gives them all. Arrays of any number of unpacked dimensions (`vpiRegArray` /
+`vpiArrayVar`, `vpiNetArray`) with a `vpiRange` per dimension, elements by
+`vpi_handle_by_index`, `vpi_handle_by_multi_index`, by name (`top.m[1][2]`,
+also one bit `top.m[1][2][3]`) or by iteration. `vpiNetBit` / `vpiRegBit`,
+`vpiPartSelect`, `vpiParameter`, `vpiPort` (with `vpiDirection`,
+`vpiLowConn` and `vpiHighConn`), `vpiRange` with `vpiLeftRange` /
+`vpiRightRange` constants, `vpiSysTaskCall` / `vpiSysFuncCall` with
+`vpiArgument`, `vpiUserSystf`, and `vpi_iterate(vpiCallback, NULL)`.
+Typespecs (`vpiTypespec` of a variable, parameter, port, function or
+member; `vpi_iterate(vpiTypedef, scope)`): the integer, real, string, logic
+and bit typespecs, `vpiEnumTypespec` with its `vpiEnumConst` values and
+`vpiBaseTypespec`, `vpiStructTypespec` / `vpiUnionTypespec` with
+`vpiTypespecMember`, `vpiArrayTypespec` and `vpiPackedArrayTypespec` with
+`vpiElemTypespec`; a typedef's typespec has its name. Relations `vpiScope`,
+`vpiModule`, `vpiInstance`, `vpiParent`, `vpiIndex`. Properties: `vpiType`,
+`vpiName`, `vpiFullName`, `vpiDefName`, `vpiFile`, `vpiLineNo`,
+`vpiDefFile`, `vpiDefLineNo`, `vpiSize`, `vpiSigned`, `vpiScalar`,
+`vpiVector`, `vpiTopModule`, `vpiTop`, `vpiTimeUnit`, `vpiTimePrecision`,
+`vpiDirection`, `vpiNetType` (wire, wand, wor, tri, tri0, tri1, trireg,
+supply0, supply1, uwire), `vpiFuncType`, `vpiConstType`, `vpiLocalParam`,
+`vpiArray`, `vpiArrayType`, `vpiIsMemory`, `vpiArrayMember`, `vpiPacked`,
+`vpiTagged`, `vpiAutomatic`, `vpiConstantVariable`, `vpiRandType`.
+Handles are canonical: the same object always has the same handle, so
+`vpi_compare_objects` and `==` agree. `vpi_handle_by_name` takes full
+names, names relative to a scope, `pkg::name`, generate scopes
+(`top.gen[1].v`) and instance array elements.
+
+**Compatibility modes (36.12).** An application built for IEEE 1364 sees
+that standard's model: SystemVerilog variable types report as `vpiReg`
+(`bit [3:0]`, `int`, an enum, a packed struct) or their net as `vpiNet`,
+and for IEEE 1364-1995 / 2001 a one-dimensional array of `reg` is a
+`vpiMemory` of `vpiMemoryWord`s and the contents of generate blocks belong
+to the module. `vpi_iterate(vpiMemory, ...)` and `vpiMemoryWord` work in
+every mode.
 
 **Values and time (38.15, 38.18, 38.34, 38.35).** `vpi_get_value` and
 `vpi_put_value` with `vpiBinStrVal`, `vpiOctStrVal`, `vpiDecStrVal`,
@@ -98,17 +131,16 @@ may call VPI (35.5.3), as UVM's HDL backdoor does (see `docs/UVM.md`).
 
 ## Not yet
 
-SystemVerilog-specific objects (classes, structs, interfaces, packages,
-dynamic arrays: `sv_vpi_user.h` names their types, but handles to them are
-not made), statements and processes, drivers and
-loads, `vpiHighConn`, multi-dimensional memories, `vpi_get_delays` / `vpi_put_delays`, `cbForce` /
+Class objects, unpacked structs, dynamic arrays, queues and associative
+arrays, statements, processes and expressions, drivers and loads,
+instance arrays as objects, `vpi_get_delays` / `vpi_put_delays`, `cbForce` /
 `cbRelease` / `cbStmt`, and save / restart. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
