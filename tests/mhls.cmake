@@ -86,6 +86,9 @@ design(stream packet)                            # reads that depend on data rea
 design(stream merge)                             # two sources, reads in branches
 design(stream relay)                             # streams handed to an inlined function
 design(stream relay -unroll-all -handshake)
+design(stream peak)                              # pipelined loop over streams: one element per cycle, stalls as a whole
+design(stream scale -pipeline-loops)
+design(stream relay -pipeline-loops -clock 3)    # one iteration every 2 cycles, two reads per iteration
 design(fir fir -pipeline-loops -clock 3)         # best effort: loops that cannot be pipelined stay as they are
 design(matmul matmul -pipeline-loops -clock 3)
 design(sqrt hist -pipeline-loops)

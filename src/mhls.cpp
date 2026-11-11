@@ -379,8 +379,6 @@ std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg, int 
     const Op& o = f.ops[id];
     if (o.cyc > 1) return std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)";
     if (o.k != OpK::Load && o.k != OpK::Store) continue;
-    if (f.arrs[o.ref].mode == Arr::Stream)
-      return "it reads or writes stream '" + f.arrs[o.ref].name + "', which can make an iteration wait";
     auto [it, fresh] = acc.insert({o.ref, {o.st, o.st}});
     if (fresh) continue;
     it->second.second = o.st;
@@ -799,7 +797,7 @@ struct Emitter {
     for (size_t bi = 0; bi < f.blocks.size(); bi++) {
       const Block& B = f.blocks[bi];
       if (B.pipeL) {
-        pipeLoop((int)bi, act, memAct);
+        pipeLoop((int)bi, act, memAct, waits);
         continue;
       }
       for (int id : B.ops) {
@@ -946,7 +944,8 @@ struct Emitter {
   // iteration enters stage 0 every cycle until one says the loop is over;
   // the state is left when that last iteration has passed the last stage.
   std::vector<std::string> resets;
-  void pipeLoop(int bi, std::vector<std::vector<std::string>>& act, std::map<int, std::vector<std::string>>& memAct) {
+  void pipeLoop(int bi, std::vector<std::vector<std::string>>& act, std::map<int, std::vector<std::string>>& memAct,
+                std::map<int, std::vector<std::string>>& waits) {
     const Block& B = f.blocks[bi];
     const int L = B.pipeL, K = B.pipeII;
     const int C = availSt(f.ops[B.term.cond]);   // the stage that knows whether the loop goes on
@@ -982,6 +981,7 @@ struct Emitter {
     }
     std::vector<std::string> regs;
     std::map<int, std::vector<std::pair<std::string, std::string>>> port;   // array -> (stage valid, what it drives)
+    std::vector<std::string> xfer;   // per stream access: its stage has nothing to transfer, or the partner is ready
     for (int id : B.ops) {
       const Op& q = f.ops[id];
       if (q.k == OpK::Const) continue;
@@ -991,10 +991,16 @@ struct Emitter {
         const Arr& a = f.arrs[q.ref];
         std::string n = a.isParam ? svName(a.name) : a.name;
         std::string drive = n + "_addr = " + R(q.a, a.aw()) + "; ";
-        if (q.k == OpK::Load) {
-          drive += n + "_ce = 1'b1;";
-        } else {
+        if (a.mode == Arr::Stream) {
+          // "@O<k>@" becomes: every other stream is ready for its transfer.
           std::string en = q.c >= 0 ? R(q.c, 1) : "1'b1";
+          drive = n + "_ce = @O" + std::to_string(xfer.size()) + "@" + en + "; " +
+                  (q.k == OpK::Store ? n + "_wdata = " + R(q.b, a.ety.w) + ";" : "");
+          xfer.push_back("(!(" + vld(q.st) + " && " + en + ") || " + n + (q.k == OpK::Load ? "_tvalid" : "_tready") + ")");
+        } else if (q.k == OpK::Load) {
+          drive += n + "_ce = @G@1'b1;";
+        } else {
+          std::string en = std::string("@G@") + (q.c >= 0 ? R(q.c, 1) : "1'b1");
           drive += n + "_ce = " + en + "; " + n + "_we = " + en + "; " + n + "_wdata = " + R(q.b, a.ety.w) + ";";
         }
         port[q.ref].push_back({vld(q.st), drive});
@@ -1012,11 +1018,31 @@ struct Emitter {
         regs.push_back(pname(id, s) + " <= " + ref2(id, s - 1, q.w) + ";");
       }
     }
+    // With streams the whole pipeline moves only in a cycle where every
+    // transfer its stages ask for can happen.
+    if (!xfer.empty()) {
+      o << "  logic " << P << "_go;\n  assign " << P << "_go = ";
+      for (size_t i = 0; i < xfer.size(); i++) o << (i ? " && " : "") << xfer[i];
+      o << ";\n";
+      waits[B.base].push_back(P + "_go");
+    }
     if (!regs.empty()) {
-      o << "  always_ff @(posedge ap_clk) begin\n";
+      o << "  always_ff @(posedge ap_clk) " << (xfer.empty() ? "" : "if (" + P + "_go) ") << "begin\n";
       for (auto& r : regs) o << "    " << r << "\n";
       o << "  end\n";
     }
+    for (auto& [ai, uses] : port)
+      for (auto& [stage, drive] : uses) {
+        for (size_t at; (at = drive.find("@G@")) != std::string::npos;) drive.replace(at, 3, xfer.empty() ? "" : P + "_go && ");
+        for (size_t at; (at = drive.find("@O")) != std::string::npos;) {
+          size_t end = drive.find('@', at + 2);
+          size_t k = std::stoul(drive.substr(at + 2, end - at - 2));
+          std::string others;
+          for (size_t i = 0; i < xfer.size(); i++)
+            if (i != k) others += xfer[i] + " && ";
+          drive.replace(at, end - at + 1, others);
+        }
+      }
     // The accesses to one memory are in different stages less than K
     // apart, so at most one of them holds an iteration in any cycle.
     for (auto& [ai, uses] : port) {

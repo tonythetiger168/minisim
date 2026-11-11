@@ -52,3 +52,16 @@ uint16_t relay(hls::stream<uint8_t>& in, hls::stream<uint16_t>& out, uint8_t mod
   }
   return acc;
 }
+
+// A pipelined loop over streams: one element per cycle, and the whole
+// pipeline waits while the source is empty or the sink is full.
+uint16_t peak(hls::stream<uint8_t>& in, hls::stream<uint16_t>& out, uint8_t gain, uint8_t n) {
+  uint16_t top = 0;
+  for (int i = 0; i < (n & 31); i++) {
+#pragma hls pipeline
+    uint16_t y = (uint16_t)(in.read() * gain) >> 2;
+    if (y > top) top = y;
+    if (y & 1) out.write(y);
+  }
+  return top;
+}

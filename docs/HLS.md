@@ -156,8 +156,12 @@ void scale(hls::stream<uint8_t>& in, hls::stream<uint16_t>& out, uint8_t gain, u
 `include/mhls_stream.h` defines `hls::stream` for compiling the same source
 on the host; `mhls` ignores the include. A transfer takes a state of its
 own and a read delivers its data in the next one, so the loop above moves
-one element every two cycles. A loop or function with stream accesses is
-not pipelined. `-tb` adds a source and a sink that hesitate on every other
+one element every two cycles. Pipelined (`#pragma hls pipeline` or
+`-pipeline-loops`) it moves one element per cycle: the stages of a
+pipelined loop all stop in a cycle where one of them cannot make its
+transfer. Two accesses to the same stream in one iteration follow the
+memory rule (one iteration every 2 cycles). The pipeline architecture
+(`-pipeline`) does not take streams. `-tb` adds a source and a sink that hesitate on every other
 call and checks the elements, their order and their number; `-cref` checks
 the same on the host.
 
@@ -211,6 +215,6 @@ need multicycle constraints.
 
 ## Not yet
 
-Dual-port memories, pipelined loops over streams, non-blocking stream access,
+Dual-port memories, non-blocking stream access,
 unions, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

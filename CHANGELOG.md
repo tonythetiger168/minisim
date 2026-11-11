@@ -177,7 +177,9 @@ Spec references are IEEE 1800-2023 clauses.
 - `mhls`: stream arguments. A `hls::stream<T>&` parameter becomes a
   `tdata`/`tvalid`/`tready` port; `read()` and `write(x)` are transfers the
   state machine waits for. `include/mhls_stream.h` runs the same source on
-  the host; the testbench source and sink hesitate on every other call.
+  the host; the testbench source and sink hesitate on every other call. A
+  pipelined loop over streams moves one element per cycle and stalls as a
+  whole.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
