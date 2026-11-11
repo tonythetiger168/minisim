@@ -40,6 +40,7 @@ struct Layer {
   Type type = Other;
   char dir = 0;                 // 'H' or 'V' for routing layers, 0 when not given
   int64_t pitchX = 0, pitchY = 0, offsetX = 0, offsetY = 0;
+  bool hasOffset = false;       // OFFSET given (0 is a real value then)
   int64_t width = 0, spacing = 0, minArea = 0;   // minArea in dbu^2
   // Electrical values in LEF units; -1 when the LEF does not give one.
   double rPerSq = -1;           // routing: ohm per square
@@ -323,7 +324,7 @@ struct LefParser {
                : v == "MASTERSLICE" ? Layer::Masterslice : v == "OVERLAP" ? Layer::Overlap : Layer::Other;
       } else if (t == "DIRECTION") { l.dir = lx.need() == "HORIZONTAL" ? 'H' : 'V'; }
       else if (t == "PITCH") { l.pitchX = len(); l.pitchY = lx.peek() == ";" ? l.pitchX : len(); }
-      else if (t == "OFFSET") { l.offsetX = len(); l.offsetY = lx.peek() == ";" ? l.offsetX : len(); }
+      else if (t == "OFFSET") { l.hasOffset = true; l.offsetX = len(); l.offsetY = lx.peek() == ";" ? l.offsetX : len(); }
       else if (t == "WIDTH") { l.width = len(); }
       else if (t == "AREA") { l.minArea = (int64_t)std::llround(lx.num() * tech.dbu * tech.dbu); }
       else if (t == "SPACING") { int64_t s = len(); if (!l.spacing || lx.peek() == ";") l.spacing = s; }   // a plain SPACING wins over ranged ones

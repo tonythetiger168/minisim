@@ -81,6 +81,14 @@ with `-tielo CELL/PIN` and `-tiehi CELL/PIN`.
    it uses and those within the end-of-line spacing on the same track, so
    wires and via pads of different nets keep the layer's `SPACING`. Nets still
    contested after a few rounds pull their uncontested neighbours out too.
+   A pin on the layer below the first routing layer gets a via from the LEF
+   when its pad fits the pin. When none fits, mpnr turns the lower pad a
+   quarter or makes it longer, whichever keeps it nearest the pin and gives
+   pin and pad the layer's `AREA`, and writes that via (`mpnr_<via>_r`,
+   `_l`, `_rl`) to the DEF's `VIAS` section. A piece of wire below its
+   layer's `AREA` (a via landing with no wire, a one-step jog, the pads of a
+   power via stack) is made as long as the rule needs; the router keeps the
+   room for that at every node.
 6. **Check.** The DEF that was just written is checked from its shapes alone:
    every net one connected piece (opens), no metal of two nets touching
    (shorts) or closer than `SPACING`. The same check runs on any DEF with
@@ -154,8 +162,9 @@ The same flow routes 5,000 Nangate45 cells clean on the real Nangate45 LEF
 ## Limits
 
 - Design rules are those the grid enforces: width, spacing, via pads, track
-  alignment, and cut spacing (between nets and inside a net). Minimum area,
-  antenna and density rules are not checked; run a DRC tool on the result.
+  alignment, cut spacing (between nets and inside a net) and minimum area
+  of the wiring. Antenna and density rules are not handled, and `-check`
+  does not measure area; run a DRC tool on the result (`mpv drc -lef`).
 - Standard cells one row high. Larger macros can be fixed in a floorplan DEF
   (their pins and obstructions are honoured) but mpnr does not place them.
 - The clock is routed as an ordinary net: no clock tree, no buffering, no

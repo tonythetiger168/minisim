@@ -53,6 +53,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "aig.hpp"
 #include "lower.hpp"
 #include "parallel.hpp"
 #include "sat.hpp"
@@ -67,47 +68,34 @@ struct Unsupported : std::runtime_error {
 [[noreturn]] void unsup(const std::string& what) { throw Unsupported(what); }
 
 // ------------------------------------------------------------------ AIG
-// Literal = 2 * node + inverted. Node 0 is constant false (literal 1: true).
-// A node is an input (a = -1, b = input number) or the AND of two literals.
+// The graph is the shared aig::Graph (src/aig.hpp): literal = 2 * node +
+// inverted, node 0 is constant false. This is only a view of it with the
+// signed literals the checker uses (-1 means "none" in several places).
 struct Aig {
-    std::vector<std::array<int, 2>> n{{{0, 0}}};
-    std::unordered_map<uint64_t, int> hash;
+    aig::Graph gr;
     int nIn = 0;
-    int input() {
-        n.push_back({-1, nIn++});
-        return 2 * ((int)n.size() - 1);
-    }
-    bool isInput(int node) const { return node > 0 && n[(size_t)node][0] < 0; }
-    int And(int a, int b) {
-        if (a > b) std::swap(a, b);
-        if (a == 0) return 0;
-        if (a == 1) return b;
-        if (a == b) return a;
-        if (a == (b ^ 1)) return 0;
-        uint64_t key = (uint64_t)(uint32_t)a << 32 | (uint32_t)b;
-        auto [it, fresh] = hash.try_emplace(key, 0);
-        if (fresh) {
-            n.push_back({a, b});
-            it->second = 2 * ((int)n.size() - 1);
+    // n[node] = {-1, input number} for an input, the two fanins for an AND.
+    struct Nodes {
+        const aig::Graph& gr;
+        size_t size() const { return gr.nodes.size(); }
+        std::array<int, 2> operator[](size_t i) const {
+            const aig::Node& nd = gr.nodes[i];
+            if (nd.k == aig::NK::Input) return {-1, nd.aux};
+            return {(int)nd.a, (int)nd.b};
         }
-        return it->second;
+    } n{gr};
+    Aig() = default;
+    Aig(const Aig&) = delete;
+    Aig& operator=(const Aig&) = delete;
+    int input() {
+        nIn++;
+        return (int)gr.input({});
     }
-    int Or(int a, int b) { return And(a ^ 1, b ^ 1) ^ 1; }
-    int Xor(int a, int b) {
-        if (a == 0) return b;
-        if (b == 0) return a;
-        if (a == 1) return b ^ 1;
-        if (b == 1) return a ^ 1;
-        if (a == b) return 0;
-        if (a == (b ^ 1)) return 1;
-        return Or(And(a, b ^ 1), And(a ^ 1, b));
-    }
-    int Mux(int c, int t, int e) {
-        if (c == 1) return t;
-        if (c == 0) return e;
-        if (t == e) return t;
-        return Or(And(c, t), And(c ^ 1, e));
-    }
+    bool isInput(int node) const { return node > 0 && gr.nodes[(size_t)node].k == aig::NK::Input; }
+    int And(int a, int b) { return (int)gr.andl((aig::Lit)a, (aig::Lit)b); }
+    int Or(int a, int b) { return (int)gr.orl((aig::Lit)a, (aig::Lit)b); }
+    int Xor(int a, int b) { return (int)gr.xorl((aig::Lit)a, (aig::Lit)b); }
+    int Mux(int c, int t, int e) { return (int)gr.mux((aig::Lit)c, (aig::Lit)t, (aig::Lit)e); }
 };
 
 // A symbolic value: bit 0 first.
@@ -1665,7 +1653,7 @@ Cone coneOf(const Model& m, const std::vector<int>& roots) {
         int n = stack.back();
         stack.pop_back();
         c.nodes.push_back(n);
-        auto& nd = m.g.n[(size_t)n];
+        auto nd = m.g.n[(size_t)n];
         if (nd[0] < 0) {
             if (auto it = m.stateBitOfInput.find(n); it != m.stateBitOfInput.end()) {
                 c.stateBits.push_back(it->second);
@@ -1799,7 +1787,7 @@ struct Unroll {
         auto& mp = map.back();
         for (size_t p = 0; p < c.nodes.size(); p++) {
             int n = c.nodes[p];
-            auto& nd = m.g.n[(size_t)n];
+            auto nd = m.g.n[(size_t)n];
             if (nd[0] < 0) {
                 auto it = m.stateBitOfInput.find(n);
                 if (it == m.stateBitOfInput.end()) {
@@ -1880,7 +1868,7 @@ Result checkProperty(const Model& m, const Property& pr, const std::vector<int>&
             for (int f = 0; f <= k; f++)
                 for (size_t p = 0; p < cone.nodes.size(); p++) {
                     int n = cone.nodes[p];
-                    auto& nd = m.g.n[(size_t)n];
+                    auto nd = m.g.n[(size_t)n];
                     if (nd[0] >= 0) continue;
                     if (f > 0 && m.stateBitOfInput.count(n)) continue;
                     r.inputs[(size_t)f][(size_t)nd[1]] = bmc.val(bmc.map[(size_t)f][p]);
@@ -2192,7 +2180,7 @@ std::vector<std::vector<char>> replay(const Model& m, const Result& r) {
     for (size_t f = 0; f < nf; f++) {
         auto& v = val[f];
         for (size_t n = 1; n < m.g.n.size(); n++) {
-            auto& nd = m.g.n[n];
+            auto nd = m.g.n[n];
             if (nd[0] < 0) {
                 auto it = m.stateBitOfInput.find((int)n);
                 if (it != m.stateBitOfInput.end()) {
@@ -2624,8 +2612,8 @@ int main(int argc, char** argv) {
         if (m.hasReset) std::cout << ", reset " << opt.reset << (opt.resetLow ? " (active low" : " (active high") << ", " << opt.resetCycles << (opt.resetCycles == 1 ? " cycle)" : " cycles)");
         else std::cout << ", no reset";
         int ands = 0;
-        for (auto& nd : m.g.n) ands += nd[0] >= 0;
-        std::cout << ", " << m.stateBits.size() << " state bits, " << ands - 1 << " gates, depth " << opt.depth << ", " << threads << (threads == 1 ? " thread\n" : " threads\n");
+        for (auto& nd : m.g.gr.nodes) ands += nd.k == aig::NK::And;
+        std::cout << ", " << m.stateBits.size() << " state bits, " << ands << " gates, depth " << opt.depth << ", " << threads << (threads == 1 ? " thread\n" : " threads\n");
     }
     for (size_t i : todo) {
         const Property& p = m.props[i];
