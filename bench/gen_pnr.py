@@ -4,7 +4,7 @@
     python3 bench/gen_pnr.py CELLS [SEED] > design.v
 
 The cells are those of tests/pnr/tiny.lef (or, with --mini45, of lib/mini45;
-with --nangate, the Nangate45 names). Each gate input picks a driver that was made shortly before it, so the
+with --nangate, the Nangate45 names; with --sky130, the SkyWater 130 nm hd cells). Each gate input picks a driver that was made shortly before it, so the
 netlist has the locality of real logic; one cell in eight is a flop on `clk`.
 """
 import random
@@ -27,6 +27,14 @@ else:
              ("NAND3", ["A", "B", "C"], "Y"), ("NOR3", ["A", "B", "C"], "Y"), ("AOI21", ["A1", "A2", "B"], "Y"),
              ("OAI21", ["A1", "A2", "B"], "Y"), ("MUX2", ["A", "B", "S"], "Y")]
     FLOP = ("DFF", "D", "CK", "Q")
+
+if "--sky130" in sys.argv:                 # the SkyWater 130 nm high-density cells (lib/sky130)
+    P = "sky130_fd_sc_hd__"
+    GATES = [(P + "inv_1", ["A"], "Y"), (P + "buf_1", ["A"], "X"), (P + "nand2_1", ["A", "B"], "Y"), (P + "nor2_1", ["A", "B"], "Y"),
+             (P + "and2_1", ["A", "B"], "X"), (P + "or2_1", ["A", "B"], "X"), (P + "xor2_1", ["A", "B"], "X"), (P + "xnor2_1", ["A", "B"], "Y"),
+             (P + "nand3_1", ["A", "B", "C"], "Y"), (P + "nor3_1", ["A", "B", "C"], "Y"), (P + "a21oi_1", ["A1", "A2", "B1"], "Y"),
+             (P + "o21ai_1", ["A1", "A2", "B1"], "Y"), (P + "mux2_1", ["A0", "A1", "S"], "X")]
+    FLOP = (P + "dfxtp_1", "D", "CLK", "Q")
 
 if "--mini45" in sys.argv:                 # lib/mini45: the same cells and pins, with a drive strength
     GATES = [(g + "_X1", ins, o) for g, ins, o in GATES]

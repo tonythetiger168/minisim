@@ -129,6 +129,9 @@ release returns the value the object then has. `veriuser.h` declares
 `tf_dofinish` and `tf_dostop` for C code written for other simulators. A DPI context import
 may call VPI (35.5.3), as UVM's HDL backdoor does (see `docs/UVM.md`).
 
+**Protected objects (37.3.6).** `vpiIsProtected`, and the access rules for
+objects in decryption envelopes: see "VPI and DPI" in `docs/PROTECT.md`.
+
 ## Not yet
 
 Class objects, unpacked structs, dynamic arrays, queues and associative

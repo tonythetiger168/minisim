@@ -28,6 +28,7 @@
 //   -handshake        also write <top>_hs: the same block behind ready/valid ports
 //   -max-reg-array <n>  local arrays up to n elements become registers, larger ones RAMs (default 64)
 //   -delay-scale <x>  scale the built-in operator delays (default 1.0, a generic 28 nm-class library)
+//   -lib <file.lib>   take the delays from a Liberty library instead of the built-in ones
 //   -tb <file>        write a self-checking testbench with expected values from the reference run
 //   -cref <file>      write a C++ program that checks the same vectors with the host compiler
 //   -vectors <n>, -seed <n>   number of random calls (default 20) and the seed (default 1)
@@ -44,6 +45,7 @@
 #include "parallel.hpp"
 #include "hls_ir.hpp"
 #include "hls_clang.hpp"
+#include "liberty.hpp"
 
 using namespace hls;
 
@@ -76,7 +78,106 @@ void parallelFor(size_t n, F fn) {
 // ---- timing and area model ---------------------------------------------------
 // Delays in ns for a generic 28 nm-class standard-cell library. They only
 // decide where cycle boundaries fall; msynth and msta give the real numbers.
-const double kTcq = 0.10, kTsu = 0.05, kMemSu = 0.20, kMemQ = 0.45;
+double kTcq = 0.10, kTsu = 0.05, kMemSu = 0.20, kMemQ = 0.45;
+
+// With -lib the delays come from a Liberty library instead: the delay of a
+// few reference cells driving four of themselves, and each operator as the
+// number of such gates on its longest path. No netlist is built or mapped
+// here (that is msynth's work); this only places cycle boundaries where the
+// library says they belong.
+struct Tech {
+  bool on = false;
+  std::string name;
+  double inv = 0, nand = 0, xor2 = 0, mux = 0;   // ns, fanout of four
+  double nandArea = 0;                           // library area units per gate equivalent
+} g_tech;
+
+double fo4(const liberty::Cell& c, const liberty::Cell* loadCell = nullptr) {
+  const liberty::Cell& lc = loadCell ? *loadCell : c;
+  double cap = 0;
+  int n = 0;
+  for (auto& p : lc.pins)
+    if (p.dir == liberty::Dir::In && !p.clock) cap += p.cap, n++;
+  double load = n ? 4 * cap / n : 0, slew = 0.05, worst = 0;
+  for (int pass = 0; pass < 3; pass++) {   // the input edge is as slow as the output of the same gate
+    double d = 0, tr = 0;
+    for (auto& a : c.arcs) {
+      if (a.isCheck() || a.type == liberty::ArcType::Other) continue;
+      d = std::max({d, a.cellRise.lookup(slew, load), a.cellFall.lookup(slew, load)});
+      tr = std::max({tr, a.riseTrans.lookup(slew, load), a.fallTrans.lookup(slew, load)});
+    }
+    worst = d;
+    if (tr > 0) slew = tr;
+  }
+  return worst;
+}
+
+void loadTech(const std::string& path) {
+  liberty::Library L = liberty::load(path);
+  // Reference cells by what they compute, the smallest of each.
+  auto find = [&](size_t inputs, uint64_t table) -> const liberty::Cell* {
+    const liberty::Cell* best = nullptr;
+    for (auto& c : L.cells) {
+      if (c.sequential() || c.dontUse) continue;
+      std::vector<std::string> in;
+      const liberty::Pin* out = nullptr;
+      int outs = 0;
+      for (auto& p : c.pins) {
+        if (p.dir == liberty::Dir::In) in.push_back(p.name);
+        else if (p.dir == liberty::Dir::Out && p.hasFunction()) out = &p, outs++;
+      }
+      if (in.size() != inputs || outs != 1) continue;
+      // Any order of the inputs.
+      std::sort(in.begin(), in.end());
+      bool hit = false;
+      try {
+        liberty::Expr e = out->functionExpr();
+        do {
+          if (e.truthTable(in) == table) hit = true;
+        } while (!hit && std::next_permutation(in.begin(), in.end()));
+      } catch (std::exception&) {
+        continue;
+      }
+      if (hit && (!best || c.area < best->area)) best = &c;
+    }
+    return best;
+  };
+  const liberty::Cell* inv = find(1, 0x1);
+  const liberty::Cell* nand = find(2, 0x7);
+  const liberty::Cell* xr = find(2, 0x6);
+  const liberty::Cell* mux = find(3, 0xCA);   // S ? B : A with inputs sorted A, B, S
+  if (!mux) mux = find(3, 0xAC);
+  if (!mux) mux = find(3, 0xD8);
+  if (!mux) mux = find(3, 0xE4);
+  if (!mux) mux = find(3, 0xB8);
+  if (!mux) mux = find(3, 0xE2);
+  const liberty::Cell* ff = nullptr;
+  for (auto& c : L.cells)
+    if (!c.ffs.empty() && !c.dontUse && (!ff || c.area < ff->area)) ff = &c;
+  if (!nand || !inv) throw Error("mhls: " + path + " has no inverter and two-input NAND to measure");
+  g_tech.on = true;
+  g_tech.name = L.name;
+  g_tech.inv = fo4(*inv);
+  g_tech.nand = fo4(*nand);
+  g_tech.xor2 = xr ? fo4(*xr) : 3 * g_tech.nand;
+  g_tech.mux = mux ? fo4(*mux) : 2 * g_tech.nand + g_tech.inv;
+  g_tech.nandArea = nand->area;
+  if (g_tech.nand <= 0) throw Error("mhls: " + path + " gives no delay for " + nand->name);
+  double tcq = 0, tsu = 0;
+  if (ff) {
+    for (auto& a : ff->arcs) {
+      if (a.isEdge()) tcq = std::max(tcq, fo4(*ff, nand));
+      if (a.isSetup() && a.type != liberty::ArcType::RecoveryRising && a.type != liberty::ArcType::RecoveryFalling)
+        tsu = std::max({tsu, a.riseCons.constraint(0.05, 0.05), a.fallCons.constraint(0.05, 0.05)});
+    }
+  }
+  // Memories are not in a standard-cell library: theirs keep their ratio to the flip-flop.
+  double was = kTcq;
+  kTcq = tcq > 0 ? tcq : 2 * g_tech.nand;
+  kTsu = tsu > 0 ? tsu : g_tech.nand;
+  kMemSu *= kTcq / was;
+  kMemQ *= kTcq / was;
+}
 
 bool isMulFu(const Function& f, const Op& o) {
   return o.k == OpK::Mul && f.ops[o.a].k != OpK::Const && f.ops[o.b].k != OpK::Const;
@@ -86,6 +187,28 @@ bool isDiv(OpK k) { return k == OpK::UDiv || k == OpK::SDiv || k == OpK::URem ||
 double opDelay(const Function& f, const Op& o, double scale) {
   double lg = std::log2((double)std::max(o.w, 2));
   double d = 0;
+  if (g_tech.on) {
+    const double n = g_tech.nand, x = g_tech.xor2, m = g_tech.mux, i = g_tech.inv;
+    double lga = o.a >= 0 ? std::log2((double)std::max(f.ops[o.a].w, 2)) : lg;
+    bool konst = o.b >= 0 && f.ops[o.b].k == OpK::Const;
+    // The shapes below are fitted to what msynth builds and msta times for
+    // single operators between registers (mini45, 8 to 64 bits): a prefix
+    // adder, an array multiplier, a restoring divider with ripple rows.
+    switch (o.k) {
+      case OpK::Add: case OpK::Sub: d = 1.5 * x + lg * 2 * n; break;
+      case OpK::ULt: case OpK::ULe: case OpK::SLt: case OpK::SLe: d = 0.5 * x + lga * n; break;
+      case OpK::Eq: case OpK::Ne: d = 0.5 * x + lga * 0.5 * n; break;
+      case OpK::Mul: d = isMulFu(f, o) ? (2 * o.w - 2) * 0.9 * x : lg * 2 * x; break;
+      case OpK::UDiv: case OpK::SDiv: case OpK::URem: case OpK::SRem: d = o.w * (m + x + o.w * n / 3); break;
+      case OpK::And: case OpK::Or: d = konst ? i : n + i; break;
+      case OpK::Xor: d = konst ? i : x; break;
+      case OpK::Mux: d = m + lg * i; break;   // the select is buffered to every bit
+      case OpK::Shl: case OpK::LShr: case OpK::AShr: d = konst ? 0 : lg * m; break;
+      case OpK::RomRd: d = n + f.arrs[o.ref].aw() * m; break;
+      default: d = 0; break;
+    }
+    return d * scale;
+  }
   switch (o.k) {
     case OpK::Add: case OpK::Sub: d = 0.10 + 0.12 * lg; break;
     case OpK::ULt: case OpK::ULe: case OpK::SLt: case OpK::SLe:
@@ -1789,7 +1912,9 @@ void summarize(Job& j, const Cfg& cfg) {
   if (shared) s << " (" << shared << " shared unit" << (shared == 1 ? "" : "s") << ")";
   if (sc.multicycle) s << "\n  multi-cycle operators: " << sc.multicycle << " (constrain them as multicycle paths)";
   for (auto& n : sc.loopNotes) s << "\n  " << n;
-  s << "\n  estimated area: " << (long)std::llround(sc.area) << " gate equivalents\n";
+  s << "\n  estimated area: " << (long)std::llround(sc.area) << " gate equivalents";
+  if (g_tech.on) s << " (" << (long)std::llround(sc.area * g_tech.nandArea) << " area units of " << g_tech.name << ")";
+  s << "\n";
   j.summary = s.str();
   std::ostringstream js;
   js << "{\"top\": \"" << f.name << "\", \"architecture\": \"" << (f.pipeline ? "pipeline" : "fsm") << "\", \"clock_ns\": "
@@ -1809,7 +1934,7 @@ void summarize(Job& j, const Cfg& cfg) {
 int usage() {
   std::cerr << "usage: mhls <file.c>... [-top <f>[,<g>]] [-o <out.sv|dir>] [-clock <ns>] [-pipeline]\n"
                "            [-unroll-all] [-unroll-max <n>] [-pipeline-loops] [-mul <n>] [-div <n>] [-no-share] [-handshake]\n"
-               "            [-max-reg-array <n>] [-delay-scale <x>] [-tb <file>] [-cref <file>]\n"
+               "            [-max-reg-array <n>] [-delay-scale <x>] [-lib <file.lib>] [-tb <file>] [-cref <file>]\n"
                "            [-vectors <n>] [-seed <n>] [-explore <ns,...>] [-report <file>]\n"
                "            [-clang] [-emit-c <file>] [-I<dir>] [-D<name>[=<v>]] [-threads <n>|all] [-q]\n";
   return 2;
@@ -1819,7 +1944,7 @@ int usage() {
 
 int main(int argc, char** argv) {
   std::vector<std::string> files, tops;
-  std::string out, tb, crefOut, report, emitC;
+  std::string out, tb, crefOut, report, emitC, libFile;
   std::vector<std::string> clangArgs;
   bool useClang = false;
   std::vector<double> explore;
@@ -1857,6 +1982,7 @@ int main(int argc, char** argv) {
       else if (a == "-handshake") cfg.handshake = true;
       else if (a == "-max-reg-array") opt.maxRegArray = std::stoi(val());
       else if (a == "-delay-scale") cfg.scale = std::stod(val());
+      else if (a == "-lib") libFile = val();
       else if (a == "-tb") tb = val();
       else if (a == "-cref") crefOut = val();
       else if (a == "-clang") useClang = true;
@@ -1884,6 +2010,16 @@ int main(int argc, char** argv) {
       else files.push_back(a);
     }
     if (files.empty()) return usage();
+    if (!libFile.empty()) {
+      try {
+        loadTech(libFile);
+      } catch (liberty::Error& e) {
+        throw Error(std::string("mhls: ") + e.what());
+      }
+      if (!quiet)
+        fprintf(stderr, "mhls: delays from %s: inverter %.3f, NAND2 %.3f, XOR2 %.3f, MUX2 %.3f ns at fanout 4; clock to Q %.3f, setup %.3f ns\n",
+                g_tech.name.c_str(), g_tech.inv, g_tech.nand, g_tech.xor2, g_tech.mux, kTcq, kTsu);
+    }
     if (cfg.clock <= kTcq * cfg.scale + kTsu * cfg.scale) throw Error("mhls: -clock is shorter than a register's own delay");
 
     Program P;
