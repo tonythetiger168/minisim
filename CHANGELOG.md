@@ -485,6 +485,13 @@ Spec references are IEEE 1800-2023 clauses.
   and a second, third... defect when one does not explain everything. Uses
   the shared fault simulator; multithreaded with the same report on any
   thread count. See docs/JTAG.md.
+- `mspice`: process corners and statistics. `.lib 'file' section` reads a
+  section of a library file, `.alter` blocks rerun the deck with lines
+  replaced, and `.step monte N` (or `sweep monte=N`) runs Monte Carlo samples
+  in parallel with `gauss`, `agauss`, `unif` and `aunif`: a top-level
+  parameter varies globally, a subcircuit parameter per instance. Samples
+  depend only on the seed and the sample number; mean, sigma, minimum and
+  maximum of every `.measure` are printed.
 - `mspice`: BSIM4 transistors (`.model ... level=14` or `54`). The model
   equations are the UC Berkeley BSIM Research Group's BSIM4 4.8.3 code,
   unmodified under the Educational Community License 2.0

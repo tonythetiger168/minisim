@@ -100,6 +100,43 @@ subcircuit, node `n` of instance `x1` is `x1.n` and element `r1` is `x1.r1`.
 `.global` nodes and node `0` (or `gnd`) are shared. `.include "file"` reads
 another file.
 
+### Corners, `.alter` and Monte Carlo
+
+```
+.lib 'models.lib' tt        * read section tt of models.lib
+...
+.alter slow corner          * run everything again with:
+.lib 'models.lib' ss
+.alter                      * and once more, on top of that, with:
+r1 vdd d 5k
+```
+
+In a library file a section runs from `.lib name` to `.endl`; a section may
+read others with `.lib 'file' name`. Each `.alter` block is one more run of
+the whole deck. A line in the block replaces the line of the same name (an
+element, a `.model`, a `.param`, a `.subckt`, an analysis of the same kind, a
+`.measure`); a `.lib` line replaces what the earlier `.lib` of the same file
+brought in; anything else is added. Blocks build on each other, as in HSPICE.
+Output files of the k-th block get `.altk` before the extension.
+
+`.step monte N` (or `sweep monte=N` at the end of an analysis line) runs N
+Monte Carlo samples. In a sample these functions draw; otherwise they give
+the nominal value:
+
+| Function | Value |
+|---|---|
+| `gauss(nom, rel, sigma)` | normal, standard deviation `nom*rel/sigma` |
+| `agauss(nom, abs, sigma)` | normal, standard deviation `abs/sigma` |
+| `unif(nom, rel)` | uniform in `nom*(1 ± rel)` |
+| `aunif(nom, abs)` | uniform in `nom ± abs` |
+
+A top-level `.param` is drawn once per sample and so is the same everywhere
+it is used (global variation). A `.param` inside a subcircuit is drawn once
+per instance (local variation, mismatch). The draws depend only on
+`.option seed=` (default 1) and the sample number, so the results are the same
+at any thread count and sample k can be rerun alone. After the samples mspice
+prints the mean, standard deviation, minimum and maximum of each `.measure`.
+
 ### Analyses
 
 | Line | Analysis |
@@ -248,7 +285,8 @@ line: path, nodes, model, parameters.
 - BSIM3 and other MOSFET levels (2, 3, BSIM-CMG), the JFET; for BSIM4:
   noise, binned models, `ic=`; behavioral (`B`) sources, switches,
   transmission lines.
-- `.noise`, `.tf`, `.sens`, `.four`, `.lib` sections, `.alter`; `.dc` sweeps
+- `.noise`, `.tf`, `.sens`, `.four`; `.data` sweeps, `lot`/`dev` tolerances
+  on `.model` lines, `.variation` blocks; `.dc` sweeps
   of a parameter or temperature; `i()` of a resistor or a device terminal.
 - Temperature: the thermal voltage, the diode and BJT saturation current and
   the MOSFET mobility follow `temp`; other temperature coefficients do not.

@@ -85,6 +85,34 @@ void printTable(const Result& r) {
     }
 }
 
+// After Monte Carlo runs: mean, sigma, lowest and highest of each measurement.
+void monteStats(const StepPlan& plan, const std::vector<RunOutput>& runs, const Args& a) {
+    if (a.quiet || runs.size() < 2) return;
+    if (std::find(plan.names.begin(), plan.names.end(), "monte") == plan.names.end()) return;
+    std::vector<std::string> order;
+    std::map<std::string, std::vector<double>> vals;
+    for (auto& run : runs)
+        for (auto& r : run.results)
+            for (auto& m : r.meas) {
+                if (!vals.count(m.first)) order.push_back(m.first);
+                if (std::isfinite(m.second)) vals[m.first].push_back(m.second);
+                else vals[m.first];
+            }
+    if (order.empty()) return;
+    std::printf("monte carlo: %zu runs\n", runs.size());
+    std::printf("  %-20s %-14s %-14s %-14s %-14s\n", "measure", "mean", "sigma", "min", "max");
+    for (auto& name : order) {
+        const std::vector<double>& v = vals[name];
+        if (v.empty()) { std::printf("  %-20s failed\n", name.c_str()); continue; }
+        double sum = 0, lo = v[0], hi = v[0];
+        for (double x : v) { sum += x; lo = std::min(lo, x); hi = std::max(hi, x); }
+        double mean = sum / v.size(), var = 0;
+        for (double x : v) var += (x - mean) * (x - mean);
+        double sigma = v.size() > 1 ? std::sqrt(var / (v.size() - 1)) : 0;
+        std::printf("  %-20s %-14s %-14s %-14s %-14s\n", name.c_str(), num(mean).c_str(), num(sigma).c_str(), num(lo).c_str(), num(hi).c_str());
+    }
+}
+
 void report(const RunOutput& out, const Args& a) {
     for (const Result& r : out.results) {
         if (!a.quiet) {
@@ -227,9 +255,10 @@ int main(int argc, char** argv) {
 
     try {
         auto t0 = std::chrono::steady_clock::now();
-        Netlist nl = Reader().read(a.file);
+        std::vector<Netlist> decks = Reader().readAll(a.file);
+        Netlist& nl0 = decks[0];
         if (a.flatten) {
-            Flat f = flatten(nl, a.top);
+            Flat f = flatten(nl0, a.top);
             if (!a.top.empty()) {
                 std::printf(".ports");
                 for (auto& p : f.ports) std::printf(" %s", p.c_str());
@@ -244,10 +273,22 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-        StepPlan plan = stepPlan(nl, a.defines);
-        std::vector<RunOutput> runs(plan.sets.size());
         Pool pool(threads);
         pool.spin(20000);   // about 0.1 ms: one batch per Newton iteration, back to back
+        bool failed = false;
+        std::set<std::string> warned;
+        // One pass per deck: the netlist itself, then one per .alter block.
+        for (size_t d = 0; d < decks.size(); d++) {
+        const Netlist& nl = decks[d];
+        // Output files of an .alter deck get ".altN" before the extension.
+        auto fileOf = [&](std::string path) {
+            if (d == 0) return path;
+            auto dot = path.find_last_of('.');
+            std::string tag = ".alt" + std::to_string(d);
+            return dot == std::string::npos ? path + tag : path.substr(0, dot) + tag + path.substr(dot);
+        };
+        StepPlan plan = stepPlan(nl, a.defines);
+        std::vector<RunOutput> runs(plan.sets.size());
         auto overridesOf = [&](size_t k) {
             std::map<std::string, double> o = a.defines;
             for (size_t i = 0; i < plan.names.size(); i++) o[plan.names[i]] = plan.sets[k][i];
@@ -260,15 +301,14 @@ int main(int argc, char** argv) {
             pool.run(runs.size(), [&](size_t k) { runs[k] = runNetlist(nl, overridesOf(k), nullptr); });
         }
         if (!a.quiet) {
+            if (d > 0) std::printf("alter %zu of %zu%s%s\n", d, decks.size() - 1, nl.alter.empty() ? "" : ": ", nl.alter.c_str());
             std::printf("mspice %s: %s\n", MINISIM_VERSION, nl.title.c_str());
             std::printf("%zu nodes, %zu elements, %zu unknowns, %d thread%s\n", runs[0].nodes, runs[0].devices,
                         runs[0].unknowns, threads, threads == 1 ? "" : "s");
         }
-        std::set<std::string> warned;
         for (auto& r : runs)
             for (auto& w : r.warnings)
                 if (warned.insert(w).second) std::cerr << "mspice: warning: " << w << "\n";
-        bool failed = false;
         for (size_t k = 0; k < runs.size(); k++) {
             if (runs.size() > 1) std::printf("step %zu of %zu: %s\n", k + 1, runs.size(), stepLabel(plan, k).c_str());
             report(runs[k], a);
@@ -276,13 +316,14 @@ int main(int argc, char** argv) {
                 for (auto& m : r.meas)
                     if (!std::isfinite(m.second)) failed = true;
         }
-        if (!a.csv.empty()) writeCsv(a.csv, plan, runs);
+        monteStats(plan, runs, a);
+        if (!a.csv.empty()) writeCsv(fileOf(a.csv), plan, runs);
         if (!a.vcd.empty()) {
             bool any = false;
             for (size_t k = 0; k < runs.size(); k++)
                 for (auto& r : runs[k].results) {
                     if (r.kind != "tran") continue;
-                    std::string path = a.vcd;
+                    std::string path = fileOf(a.vcd);
                     if (runs.size() > 1) {
                         auto dot = path.find_last_of('.');
                         std::string tag = "." + std::to_string(k + 1);
@@ -293,6 +334,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             if (!any) std::cerr << "mspice: warning: -vcd needs a .tran analysis; nothing written\n";
+        }
         }
         if (a.stats) {
             double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

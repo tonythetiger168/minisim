@@ -698,6 +698,17 @@ public:
                 for (size_t i = 1; i < k.tok.size(); i++) globals_.insert(k.tok[i]);
         declare(top);
         for (auto& [k, v] : overrides_) top.sc.set(k, v);
+        // A Monte Carlo run (.step monte N gives each run its number as the
+        // parameter "monte"): gauss(), agauss(), unif() and aunif() draw.
+        if (auto it = overrides_.find("monte"); it != overrides_.end()) {
+            double seed = 1;
+            for (const Card& k : nl_.control)
+                if (k.tok[0] == ".option" || k.tok[0] == ".options")
+                    for (auto& t : k.tok)
+                        if (t.rfind("seed=", 0) == 0) seed = value(t.substr(5), nullptr);
+            random_ = std::make_unique<Random>((uint64_t)seed, (uint64_t)it->second);
+            top.sc.random = random_.get();
+        }
         // Options first: the temperature shapes the models.
         for (const Card& k : nl_.control) {
             if (k.tok[0] == ".option" || k.tok[0] == ".options") options(k, top);
@@ -724,6 +735,7 @@ private:
     const Netlist& nl_;
     Circuit& c_;
     const std::map<std::string, double>& overrides_;
+    std::unique_ptr<Random> random_;
     std::set<std::string> globals_;
     std::vector<std::pair<std::string, Model*>> allModels_;
     int depth_ = 0;
@@ -1143,6 +1155,7 @@ private:
             else if (key == "abstol") o.abstol = num();
             else if (key == "vntol") o.vntol = num();
             else if (key == "gmin") o.gmin = num();
+            else if (key == "seed") {}   // read when a Monte Carlo run starts
             else if (key == "trtol") o.trtol = num();
             else if (key == "chgtol") o.chgtol = num();
             else if (key == "itl1") o.itl1 = (int)num();
@@ -1556,14 +1569,21 @@ inline StepPlan stepPlan(const Netlist& nl, const std::map<std::string, double>&
         std::string mode = "lin";
         if (!t.empty() && (t[0] == "lin" || t[0] == "dec" || t[0] == "oct")) { mode = t[0]; t.erase(t.begin()); }
         if (!t.empty() && t[0] == "param") t.erase(t.begin());
-        if (t.size() < 3) throw Error(k.where + ": expected .step param name start stop step, or .step param name list v1 v2 ...");
+        // .step monte N (or monte=N): N Monte Carlo runs, numbered from 1.
+        if (!t.empty() && t[0].rfind("monte=", 0) == 0) t = {"monte", t[0].substr(6)};
+        bool monte = t.size() == 2 && t[0] == "monte";
+        if (t.size() < 3 && !monte) throw Error(k.where + ": expected .step param name start stop step, .step param name list v1 v2 ..., or .step monte N");
         std::string name = t[0];
         std::vector<double> vals;
         auto num = [&](size_t i) {
             try { return value(t[i], &sc); }
             catch (const Error& x) { throw Error(k.where + ": " + x.what()); }
         };
-        if (t[1] == "list") {
+        if (monte) {
+            double cnt = num(1);
+            if (!(cnt >= 1) || cnt > 1e7) throw Error(k.where + ": .step monte needs a number of runs");
+            for (int i = 1; i <= (int)cnt; i++) vals.push_back(i);
+        } else if (t[1] == "list") {
             for (size_t i = 2; i < t.size(); i++) vals.push_back(num(i));
         } else {
             if (t.size() < 4) throw Error(k.where + ": .step needs start, stop and step");
