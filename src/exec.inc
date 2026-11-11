@@ -1614,6 +1614,7 @@ static void combCommit(const void* ctx, Val v) {
 static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
     const Prog* p = static_cast<const Prog*>(ctx);
     size_t pc = 1, end = p->code.size() - 1;
+    if (p->xpFast && S.xAt != S.now) pc = p->xpFast;   // msim -xprop: no edge can be ambiguous
     if (g_cov) covHit(p->code[0].hits);   // the clock wait this function stands for
     while (pc < end) {
         const Instr& i = p->code[pc];

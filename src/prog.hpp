@@ -400,6 +400,11 @@ struct Prog {
     int pd = -1;           // UPF power domain, -1 for none (initial blocks are never gated, 9.2.1)
     bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
     std::vector<Instr> code;
+    // msim -xprop, a clocked block with a clean copy: code[1] tests for an
+    // ambiguous clock edge and otherwise jumps here. A clocked function
+    // starts here at once in a time step where no signal has changed from
+    // or to x (Sim::xAt). 0: none.
+    size_t xpFast = 0;
     // Named blocks this process runs as a whole (an initial's named body, a
     // fork branch that is a named block, every branch of a named fork).
     // `disable` of one of them from another process ends the process.
