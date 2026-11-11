@@ -408,6 +408,12 @@ Spec references are IEEE 1800-2023 clauses.
   as rules `TIDY001`..`TIDY021`, with mlint's severities, waivers, JSON and
   threads; the checks mlint already had a rule for are left out. See
   `docs/LINT.md` and `THIRD_PARTY_NOTICES.md`.
+- `mlint` has 13 text and syntax rules that follow Verible's lint rules
+  (`FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009`):
+  line length, tabs, trailing spaces, stray semicolons, `` `endif ``
+  comments, package file names, explicit lifetimes and parameter types,
+  range direction, macro names, short binary literals. Off by default; one
+  task per file, same output at any `-threads`.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

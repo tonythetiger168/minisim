@@ -34,3 +34,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
+
+## Rule sets followed without their code
+
+- Verible (https://github.com/chipsalliance/verible, Apache-2.0): `mlint`'s
+  text and syntax rules (`src/lintsrc.hpp`) check the same things as a
+  number of Verible's lint rules and name them in `mlint -explain`. They
+  are written for slang's syntax tree; no Verible source is included.

@@ -27,6 +27,7 @@
 #include "cpu.hpp"
 #include "lintir.hpp"
 #include "lintrules.hpp"
+#include "lintsrc.hpp"
 #ifdef MINISIM_TIDY
 #include "linttidy.hpp"
 #endif
@@ -533,6 +534,9 @@ int main(int argc, char** argv) {
         cdc::check(*fe.comp, rep, cdcOpt);
     }
     lap("clock and reset crossings");
+    // The source text and the syntax trees (lintsrc.hpp).
+    lintsrc::run(*fe.comp, rep, params, threads, [&](std::string_view f) { return !pkgFile.empty() && f == pkgFile; });
+    lap("text and syntax rules");
 #ifdef MINISIM_TIDY
     if (tidy) linttidy::run(*fe.comp, *am, fe.driver.diagEngine, rep, threads);
     lap("slang-tidy checks");

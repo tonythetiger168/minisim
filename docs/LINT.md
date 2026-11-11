@@ -205,6 +205,36 @@ reset checks look for, `tidy.reset_active_high` (`false`); `tidy.enum`,
 `tidy.cross` are the name patterns. Build without them with
 `-DMINISIM_WITH_SLANG_TIDY=OFF`.
 
+### Source text and syntax (`format`, `suspicious`, and more of `style`)
+
+These read the source files and the syntax tree, so they also see code that
+is never instantiated. The set follows Verible's lint rules, which is where
+most teams know them from; they are written on slang's syntax tree (no
+Verible code is used) and `mlint -explain RULE` names the Verible rule each
+one answers to. All are off by default: turn on a group (`-enable format`)
+or single rules.
+
+| Rule | Severity | Default | What it finds | Verible rule |
+|---|---|---|---|---|
+| `FMT001` | info | off | A line longer than `fmt.line_length` (100). A line that is one long word is let through | line-length |
+| `FMT002` | info | off | A tab character | no-tabs |
+| `FMT003` | info | off | Trailing whitespace | no-trailing-spaces |
+| `FMT004` | info | off | The file does not end with a newline | posix-eof |
+| `SUS001` | info | off | A stray semicolon: `x = 1;;`, `endfunction;` | forbid-consecutive-null-statements |
+| `STY004` | info | off | `` `endif `` with no comment | endif-comment |
+| `STY005` | info | off | A package in a file not named after it (`foo_pkg` may live in `foo.sv`) | package-filename |
+| `STY006` | info | off | A function or task with no lifetime, outside classes and `automatic` modules | explicit-function-lifetime, explicit-task-lifetime |
+| `STY007` | info | off | A parameter with no type | explicit-parameter-storage-type |
+| `STY008` | info | off | A packed dimension that counts up (`[0:7]`) | packed-dimensions-range-ordering |
+| `STY009` | info | off | An unpacked dimension that counts down (`[3:0]`) | unpacked-dimensions-range-ordering |
+| `NAME014` | warning | off | A macro name does not match `name.macro` | macro-name-style |
+| `W009` | info | off | A sized binary literal with fewer digits than its width (`8'b101`) | undersized-binary-literal |
+
+Verible's suspicious-semicolon (`if (c);`) is slang's own `-Wempty-body`
+warning, which mlint already prints, and its always-comb, case-missing-default,
+generate-label and name-style rules are `SYN`, `CASE`, `STY` and `NAME`
+rules above.
+
 ### State machines (`fsm`)
 
 Found by the extractor FSM coverage uses (`msim -cov`), so lint and coverage
@@ -306,6 +336,8 @@ Severities: an `error` finding makes mlint exit 1; a `warning` does with
 | `name.typedef` | `_(t\|e\|s\|u)$` | `NAME013` |
 | `name.max_length` | `40` | `NAME010` |
 | `unused.ignore` | `^_?unused\|_unused$\|^_?nc_\|_nc$` (any case) | `UNU001`..`UNU005` |
+| `name.macro` | `^[A-Z_][A-Z0-9_]*$` | `NAME014` |
+| `fmt.line_length` | `100` | `FMT001` |
 | `tb.modules` | empty | module names (globs) to treat as testbench code |
 
 Patterns are regular expressions (ECMAScript), matched anywhere in the name

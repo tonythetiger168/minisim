@@ -4,7 +4,8 @@
     check_rules.py <mlint> <tests/lint dir>
 
 Each tests/lint/rules/*.sv says how to run mlint on it ("//! args: ...") and
-marks every line that must get a finding ("//~ RULE [RULE ...]"). The run
+marks every line that must get a finding ("//~ RULE [RULE ...]", or
+"//~v RULE" on the line above it). The run
 must report exactly the marked (line, rule) pairs: a missing one is a rule
 that stopped working, an extra one is a false positive. The same file is run
 with -threads 1 and -threads 4, and the two outputs must be identical.
@@ -50,9 +51,9 @@ for name in sorted(os.listdir(rules_dir)):
     args = re.search(r"^//! args: (.*)$", text, re.M).group(1).split()
     want = []
     for n, line in enumerate(text.splitlines(), 1):
-        m = re.search(r"//~ (.*)$", line)
-        if m:
-            want += [(n, r) for r in m.group(1).split()]
+        m = re.search(r"//~(v?) (.*)$", line)
+        if m:  # "//~v RULE" marks the line below, for rules about the end of a line
+            want += [(n + (m.group(1) == "v"), r) for r in m.group(2).split()]
     rc, out, err = run([path] + args + ["-threads", "1"])
     if rc not in (0, 1) or "error:" in err:
         fail(f"{name}: mlint exited {rc}\n{out}{err}")

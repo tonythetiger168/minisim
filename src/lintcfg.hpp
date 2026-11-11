@@ -213,11 +213,18 @@ inline const std::vector<RuleInfo>& table() {
          "Its hierarchical names are genblk1, genblk2, ... and change when a block is added above it."},
         {"NAME012", "naming", Sev::Warning, false, "a name is a VHDL keyword", "A problem in mixed-language flows."},
         {"NAME013", "naming", Sev::Warning, false, "a typedef name does not match name.typedef", ""},
+        {"NAME014", "naming", Sev::Warning, false, "a macro name does not match name.macro", "Verible rule macro-name-style."},
 
         // ------------------------------------------------------------------- style
         {"STY001", "style", Sev::Info, true, "more than one module in a file", ""},
         {"STY002", "style", Sev::Info, false, "a file's name is not its module's name", ""},
         {"STY003", "style", Sev::Info, false, "a plain always where always_ff / always_comb / always_latch says more", ""},
+        {"STY004", "style", Sev::Info, false, "`endif with no comment", "Verible rule endif-comment."},
+        {"STY005", "style", Sev::Info, false, "a package in a file that is not named after it", "Verible rule package-filename."},
+        {"STY006", "style", Sev::Info, false, "a function or task with no lifetime (automatic or static)", "Verible rule explicit-function-lifetime, explicit-task-lifetime."},
+        {"STY007", "style", Sev::Info, false, "a parameter with no type", "Verible rule explicit-parameter-storage-type."},
+        {"STY008", "style", Sev::Info, false, "a packed dimension that counts up", "Verible rule packed-dimensions-range-ordering."},
+        {"STY009", "style", Sev::Info, false, "an unpacked dimension that counts down", "Verible rule unpacked-dimensions-range-ordering."},
         {"FUNC001", "style", Sev::Info, true, "a function reads or writes a signal that is not one of its arguments",
          "always @* does not see signals read inside a function, and the function cannot be reused."},
 
@@ -246,6 +253,14 @@ inline const std::vector<RuleInfo>& table() {
         {"TIDY020", "tidy", Sev::Warning, false, "a coverpoint name does not match tidy.coverpoint", "slang-tidy check CoverpointName."},
         {"TIDY021", "tidy", Sev::Warning, false, "a cross name does not match tidy.cross", "slang-tidy check CrossName."},
 #endif
+        // ------------------------------------------------- source text and syntax
+        // lintsrc.hpp. The rule set follows Verible's; the detail names its rule.
+        {"FMT001", "format", Sev::Info, false, "a line longer than fmt.line_length", "Verible rule line-length."},
+        {"FMT002", "format", Sev::Info, false, "a tab character", "Verible rule no-tabs."},
+        {"FMT003", "format", Sev::Info, false, "trailing whitespace", "Verible rule no-trailing-spaces."},
+        {"FMT004", "format", Sev::Info, false, "the file does not end with a newline", "Verible rule posix-eof."},
+        {"SUS001", "suspicious", Sev::Info, false, "a stray semicolon (x = 1;; or endfunction;)", "Verible rule forbid-consecutive-null-statements."},
+        {"W009", "width", Sev::Info, false, "a sized binary literal with fewer digits than its width (8'b101)", "Verible rule undersized-binary-literal."},
         // --------------------------------------------------------------------- fsm
         {"FSM001", "fsm", Sev::Warning, true, "a state that no transition and no reset leads to",
          "The state is named or tested, but the machine can never be in it: dead logic, or a transition that was forgotten."},
