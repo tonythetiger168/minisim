@@ -56,6 +56,7 @@ struct Cons {
     std::vector<CP> body, els;
     std::string it, idx;                     // Foreach iterator and index names
     std::vector<EP> list;                    // Unique
+    bool isDefault = false;                  // "constraint default x == v;"
     Loc loc;
 };
 

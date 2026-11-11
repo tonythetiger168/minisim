@@ -22,6 +22,12 @@ Spec references are IEEE 1800-2023 clauses.
   of the operand's own width (`mpopt_iso_L<line>_a`), so a power tool sees
   their activity and the operator is not widened; `-iso_inline` keeps the
   rewrite inside the expression. See `docs/POWEROPT.md`.
+- `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
+  built from the spare cells of the old netlist and the cells the change
+  frees, by function (the same cell, or one with inputs tied or shared, or
+  the inverse plus a spare inverter); no cell is added or removed, and the
+  script holds only net connections. Exit status 3 when a cell had to be
+  added after all. See `docs/ECO.md`.
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
   changed, and the assignments that write them. The viewer page does the same.
@@ -236,6 +242,15 @@ Spec references are IEEE 1800-2023 clauses.
   constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
   ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
   See `docs/SYNTH.md`.
+- `msynth`: a register's hold condition is gathered out of its if/case
+  tree into one enable, and the held leaves leave the data logic
+  (`set msynth_hold_enables false` skips it). PicoRV32 on mini45: 18096 to
+  17534, with high effort 17577 to 17166.
+- `msynth` high effort (`compile -map_effort high`, `compile_ultra`):
+  the logic is restructured by ABC, run as a separate program (`abc`,
+  `berkeley-abc` or `yosys-abc` on `PATH`, or `$MSYNTH_ABC`), and the
+  smaller of the two mapped results is kept. Without constraints the
+  smallest netlist now stands (high effort used to pick the faster one).
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
@@ -306,6 +321,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: a block of plain assignments and branches gets a clean copy
+  that runs while every condition is known and hands over to the merging
+  copy at the first unknown one. Ibex with `-xprop`: 36 s to 28 s in the
+  interpreter (24.5 s without).
 - `-xprop` is faster: an `if` evaluates its condition once, and clocked
   blocks with merged branches run in parallel again. Ibex with `-xprop`:
   42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
@@ -354,6 +373,12 @@ Spec references are IEEE 1800-2023 clauses.
   simulator reports stuck-at, transition, coupling and address-decoder
   coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
   expected results come from that simulator. See `docs/DFT.md`.
+- `mpss`: address spaces (`addr_reg_pkg`). A model declares a
+  `transparent_addr_space_c<>` with regions, and actions and buffers claim
+  memory from it with `transparent_addr_claim_s<>`; claims that are alive at
+  the same time never overlap, so `examples/pss/dma.pss` now checks the
+  copied data. Also `constraint default`, and `x.f()` calls and region
+  variables in `exec init`.
 - `mpss`, portable stimulus: reads a model in the Accellera PSS language
   (components, actions, buffers, streams, resources and pools, constraints,
   activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
@@ -375,6 +400,13 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -svrf rules.svrf` reads rule files in the SVRF style that foundry
+  decks use (`LAYER`, `LAYER MAP`, `AND`/`OR`/`NOT`/`XOR`, `INTERACT`,
+  `INSIDE`, `OUTSIDE`, `SIZE`, `HOLES`, `RECTANGLE`, rule blocks with `INT`,
+  `EXT`, `ENC`, `AREA`, `DENSITY`, `#IFDEF`, `INCLUDE`) and translates them
+  to the native deck (`-write-deck`). Options it does not apply are listed
+  in warnings; statements it cannot run are errors with their line. Decks
+  can now name every datatype of a layer (`layer m1 68/*`).
 - `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
   database, to step through them in KLayout's marker browser.
 - `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
@@ -465,6 +497,10 @@ Spec references are IEEE 1800-2023 clauses.
 - `mdft -edt`: scan test compression. A ring-generator decompressor and an
   XOR compactor around the scan chains, and an encoder that solves test
   cubes into channel data over GF(2), in parallel and deterministically.
+  With the gate netlist it simulates each compressed pattern and writes the
+  expected output channels and a load / capture / compare testbench;
+  `-edt_xmask` adds compactor X masking (one chain per channel observed,
+  mask chosen per pattern) so unknown captures do not hide known ones.
 - `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
   on the gate netlist (port inputs at 0, scan cells observed), with the
   coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
@@ -580,6 +616,11 @@ Spec references are IEEE 1800-2023 clauses.
   nodes) and `spice::Reader::readText()` for netlists held in memory.
   mspice now runs on the shared thread pool of `src/parallel.hpp`, which
   gains `Pool::spin()` for short batches that come one after the other.
+- `mfpga`: a multiplier wider than one DSP block is split into block-sized
+  partial products summed on carry chains (32x32 on ECP5: 4 blocks, no LUTs).
+- `mfpga`: memories with registered reads map to block RAM on iCE40
+  (`SB_RAM40_4K`) and ECP5 (`DP16KD`), with a bypass that keeps the RTL's
+  read-during-write result. `-noram` keeps flops.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

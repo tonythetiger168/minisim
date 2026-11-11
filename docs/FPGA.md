@@ -34,6 +34,7 @@ cuts and an exact-area pass so it scales to large designs.
 | `-cuts N` | cuts kept per node, 2 to 16 (default 8). More cuts: slightly fewer LUTs, more time |
 | `-threads N` | worker threads. Default: every logical core. The output does not depend on N |
 | `-nocarry` | adders, subtractors and comparators as LUTs, not carry chains |
+| `-noram` | memories as flops, not block RAM |
 | `-nodsp` | multipliers as LUTs, not DSP blocks |
 | `-dsp` | `ice40`: multipliers onto `SB_MAC16`. Off by default: only UltraPlus parts (UP5K) have them |
 | `-dsp-min N` | fewest operand bits, both operands together, worth a DSP block (default 10) |
@@ -46,8 +47,8 @@ cuts and an exact-area pass so it scales to large designs.
 | Family | LUT | Flip-flops | Other |
 |---|---|---|---|
 | `generic` | `$lut` (`WIDTH`, `LUT`) | `$_DFF_P_`, `$_DFF_PP0_`, `$_DFFE_PP_`, `$_DFFE_PP0P_`, `$_SDFF_PP0_`, `$_SDFFE_PP0P_`, ... (Yosys gate cells); power-up value as the net's `init` attribute | no carry cells |
-| `ice40` | `SB_LUT4` | `SB_DFF` with `E` (enable), `R`/`S` (asynchronous) or `SR`/`SS` (synchronous) reset, and the `SB_DFFN*` falling-edge ones | `SB_CARRY`, one per bit, beside the `SB_LUT4` of the sum; `SB_MAC16` with `-dsp` |
-| `ecp5` | `LUT4` | `TRELLIS_FF` (`REGSET`, `SRMODE=ASYNC` or `LSR_OVER_CE`, `CEMUX=CE` with an enable, `CLKMUX=INV` for the falling edge) | `CCU2C`, two bits each; `MULT18X18D` |
+| `ice40` | `SB_LUT4` | `SB_DFF` with `E` (enable), `R`/`S` (asynchronous) or `SR`/`SS` (synchronous) reset, and the `SB_DFFN*` falling-edge ones | `SB_CARRY`, one per bit, beside the `SB_LUT4` of the sum; `SB_MAC16` with `-dsp`; `SB_RAM40_4K` (and `NR`, `NW`, `NRNW`) |
+| `ecp5` | `LUT4` | `TRELLIS_FF` (`REGSET`, `SRMODE=ASYNC` or `LSR_OVER_CE`, `CEMUX=CE` with an enable, `CLKMUX=INV` for the falling edge) | `CCU2C`, two bits each; `MULT18X18D`; `DP16KD` |
 | `xc7` | `LUT1` to `LUT6` | `FDRE`, `FDSE`, `FDCE`, `FDPE` with `CE` (`INIT`, `IS_C_INVERTED`) | `CARRY4`, four bits each; `DSP48E1`; `IBUF` and `OBUF` on every port |
 
 Inverters cost nothing: they are folded into LUT tables. An iCE40 flop always
@@ -115,6 +116,38 @@ bits are left open. `tests/fpga/mul.sv` (8x8, signed 9x6, 11x8 truncated, a
 multiply-accumulate and a 28x28) takes 4 blocks and 1,758 LUT4, all of them
 the 28x28; without blocks it is 2,647.
 
+A multiplier too wide for one block is split. Each operand is cut into
+pieces a block input takes (only the top piece of a signed operand is
+signed), every pair of pieces is one block, and the shifted, extended partial
+products are summed on carry chains. Pieces whose product lies above a
+truncated result are left out. A registered 32x32 on an ECP5-85F is 4
+`MULT18X18D`, 3 chains and no LUT at 68 MHz after nextpnr (as LUTs: 2,831
+LUT4 and 8 MHz; Yosys `synth_ecp5`: 4 blocks, 120 LUTs, 81 MHz). With that,
+`mul.sv` is 8 blocks and its 28x28 costs no LUTs.
+
+## Block RAM
+
+The elaborator lists every memory with its write and read ports
+(`aig::Design::mems`, shared with `msynth`) and leaves it in the graph as
+flops and mux trees. `mfpga` takes a memory out again when it has one
+whole-word write port and every read of it is registered (`q <= mem[addr]`,
+with or without a read enable; any number of read ports, one RAM per port):
+the read register becomes the RAM's output register and the memory's flops
+are removed. The words go side by side over as many blocks as the width
+needs, in the widest configuration that is deep enough: `SB_RAM40_4K` from
+256 x 16 to 2048 x 2, `DP16KD` from 1024 x 18 to 16384 x 1.
+
+In RTL a read in the cycle its word is written returns the old word; in the
+blocks that read is not defined. With one clock for both ports `mfpga`
+therefore writes one cycle late and keeps the word that is on its way in a
+bypass register that the read takes instead, so the RAM behaves as the RTL
+does, at the cost of about two flops per data bit. With two clocks the ports
+connect directly. `tests/fpga/ram.sv` (a 64 x 12 RAM read through two ports,
+a 128-word FIFO and a 16 x 4 memory with an unregistered read) is 3 blocks
+172 LUTs and 169 flops on iCE40, against 2,495 LUTs and 1,904 flops
+without them; the unregistered
+memory stays flops.
+
 ## Speed
 
 A 128x128 multiplier (166,252 AND nodes) on a 4-core machine, LUT6: 32,344
@@ -127,14 +160,18 @@ on four, with byte-identical output. On a 32x32 multiplier the LUT count is
 
 `tests/fpga/run_test.py` maps the designs `msynth` is tested with, and a
 datapath with synchronous reset, enable, add/subtract and signed and unsigned
-compares (`tests/fpga/dp.sv`), and multipliers (`mul.sv`, `mulp.sv`), for
+compares (`tests/fpga/dp.sv`), multipliers (`mul.sv`, `mulp.sv`, and the
+wide ones of `mulw.sv`) and memories (`ram.sv`), for
 every family, and for each one:
 
 - `-verify` simulates the netlist against the graph on random patterns;
 - one and four threads must write the same bytes;
 - the design's testbench is run with `msim` on the RTL and on the mapped
   Verilog netlist (`-verilog`, with the cell models in `tests/fpga/`), and
-  both must print the same lines;
+  both must print the same lines. The iCE40 netlist is simulated a second
+  time on the vendor's models that Yosys ships (`ice40/cells_sim.v`), which
+  is what checks `SB_RAM40_4K`, and the test models of the RAMs return x for
+  a word read while it is written, so a missing bypass would show;
 - with Yosys installed, the JSON netlist on the vendor's own simulation
   models is proven equal to the RTL by a bounded SAT check that shares no code
   with `mfpga` (the counter, the datapath and the small multipliers; Yosys
@@ -146,15 +183,26 @@ CI installs Yosys and nextpnr.
 
 ## Limits
 
-- A multiplier wider than one DSP block stays LUTs: it is not split over
-  several blocks yet. The blocks' input, pipeline and output registers and
+- The DSP blocks' input, pipeline and output registers and
   their adders (multiply-accumulate) are not used. `MULT18X18D` is a black
   box in Yosys 0.33, so its proof runs on the model in
   `tests/fpga/cells_ecp5_dsp.v`; `DSP48E1` is proven on Yosys' own model, and
   `SB_MAC16` was (by hand, with place and route on a UP5K), since the CI
   tests place iCE40 netlists on an HX8K, which has no DSPs.
-- Memories become flops, not block RAM: that needs the memory table the
-  elaborator will record.
+- Block RAM: iCE40 and ECP5 only; on `xc7` and `generic` a memory stays
+  flops (Yosys has no behaviour for `RAMB18E1` to check a mapping against).
+  Left as flops as well: a memory with more than one write port or byte
+  enables, one deeper than a single block, one smaller than 512 bits, one
+  with a read that is not registered or whose read register has a reset, and
+  any memory when flop power-up values are known (AIGER input). No LUT RAM,
+  no initial contents, no use of the blocks' output registers. `DP16KD` is a
+  black box in Yosys 0.33: it is checked on the model in
+  `tests/fpga/cells_ecp5_dsp.v` and by nextpnr accepting it, not on a vendor
+  model. An address outside a memory whose depth is not a power of two (x in
+  simulation) reads and writes real words.
+- The partial products of a split multiplier are added one after another
+  on plain chains, not by the blocks' own adders or a compressor tree, and a
+  square does not share its two equal cross products.
 - Chains are not split or sped up (carry-select, carry-lookahead) by timing,
   and an adder is not merged with a mux or an AND in front of it into the
   chain's LUTs.

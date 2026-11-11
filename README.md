@@ -863,6 +863,7 @@ the default configuration.
 ```sh
 mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
 mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
+mpv drc -svrf rules.svrf chip.gds -rdb drc.lyrdb               # SVRF-style rules; markers for KLayout
 ```
 
 ```

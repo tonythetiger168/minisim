@@ -103,6 +103,8 @@ public:
             if (comb > 64 && comb > 64 * nba && !getenv("MSIM_XCYC")) dom.clear();
         }
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
+        std::vector<CodegenProc> wideProcs;
+        if (!dom.empty() && privates && !std::getenv("MSIM_NOWIDE")) wideProcs = splitWide(procs, dom);
         for (size_t i = 0; i < procs.size(); i++) {
             bool inDom = std::find(dom.begin(), dom.end(), (int)i) != dom.end();
             if (procs[i].combRank >= 0) {
@@ -117,7 +119,7 @@ public:
                 chunk([&](std::ostream& c) { emitProc(c, (int)i, *procs[i].prog, procs[i].kind); });
         }
 
-        if (!dom.empty()) { std::ostringstream c; emitCycle(c, procs, dom, byRank); cyc = c.str(); }
+        if (!dom.empty()) { std::ostringstream c; emitCycle(c, wideProcs.empty() ? procs : wideProcs, dom, byRank); cyc = c.str(); }
         // Several files: the shared variables are inline (one object for
         // all files) and the process functions external.
         size_t chunkBytes = 0;
@@ -1326,7 +1328,7 @@ private:
                     // The outputs of one always_comb with if / case: any
                     // number of whole or part writes, all from this process.
                     else if (in.drv < 0 && !in.tmp && sigs[in.sig].drivers == 0 && !in.arr && in.aidx.empty() &&
-                             (!cand[in.sig] || owner[in.sig] == (int)i)) {
+                             (!cand[in.sig] || owner[in.sig] == (int)i || sigs[in.sig].w > 64)) {   // wide: see splitWide
                         cand[in.sig] = 1;
                         owner[in.sig] = (int)i;
                     } else bad[in.sig] = 1;
@@ -1336,7 +1338,7 @@ private:
             if (mine[i]) {
                 for (auto& in : procs[i].prog->code)
                     if (in.k == IK::Nba && in.sig >= 0 && (size_t)in.sig < ns) {
-                        if (in.hi < 0) cand[in.sig] = 1; else bad[in.sig] = 1;
+                        if (in.hi < 0 || sigs[in.sig].w > 64) cand[in.sig] = 1; else bad[in.sig] = 1;
                     }
                 continue;
             }
@@ -1401,6 +1403,10 @@ private:
         priv_.assign(ns, 0);
         for (size_t s = 0; s < ns; s++)
             priv_[s] = cand[s] && !bad[s] && sigs[s].w >= 1 && sigs[s].w <= 64 &&
+                       sigs[s].name.find_first_of("[$") == std::string::npos;
+        wide_.assign(ns, 0);
+        for (size_t s = 0; s < ns; s++)
+            wide_[s] = cand[s] && !bad[s] && sigs[s].w > 64 && !noPriv.count((int)s) &&
                        sigs[s].name.find_first_of("[$") == std::string::npos;
     }
 
@@ -1507,6 +1513,275 @@ private:
     // dsN: one domain process, its NBAs into slots F<k>/H<k>. dseq runs them
     // all (in parallel) and leaves one marker NBA; fcommit writes the slots in
     // queue order and re-evaluates every static comb process in rank order.
+    // Wide signals in pieces. A signal of more than 64 bits that only the
+    // domain touches is cut where its part selects and part writes cut it
+    // (the fields of a packed struct), and at 64 bits at most. Each piece is
+    // a private signal of its own (ids from sigs.size() on, no S.sigs entry):
+    // a field read is a plain variable and a field write a store, with no
+    // Val to allocate. The processes that name such a signal are rewritten
+    // in copies (ownProgs_); syncP puts the pieces together for a waveform.
+    struct Piece { int id, hi, lo; };
+    std::vector<char> wide_;
+    std::map<int, std::vector<Piece>> pieces_;   // per split signal, from bit 0 up
+    std::vector<int> pieceOf_;                   // per piece id - sigs.size(): its signal
+    std::deque<Prog> ownProgs_;
+    size_t realSigs_ = 0;
+public:
+    int origOf(int s) const { return s >= 0 && (size_t)s >= realSigs_ && (size_t)s - realSigs_ < pieceOf_.size() ? pieceOf_[(size_t)s - realSigs_] : s; }
+private:
+    int widthOf(const E& e) const {
+        if (!e || e->at) return -1;
+        switch (e->op) {
+            case Op::Const: return e->k.w;
+            case Op::Ref: return e->sig >= 0 && (size_t)e->sig < sigW_.size() ? sigW_[e->sig] : -1;
+            case Op::Slice: return e->hi - e->lo + 1;
+            case Op::Resize: return e->hi;
+            case Op::Concat: { int w = 0; for (auto& k : e->kids) { int x = widthOf(k); if (x < 0) return -1; w += x; } return w; }
+            case Op::Mux: { int a = widthOf(e->kids[1]), b = widthOf(e->kids[2]); return a == b ? a : -1; }
+            case Op::Not: return widthOf(e->kids[0]);
+            case Op::And: case Op::Or: case Op::Xor: { int a = widthOf(e->kids[0]), b = widthOf(e->kids[1]); return a == b ? a : -1; }
+            default: return -1;
+        }
+    }
+    static E mkSlice(E a, int hi, int lo) {
+        E e = node(Op::Slice, {std::move(a)});
+        e->hi = hi; e->lo = lo;
+        return e;
+    }
+    // Bits [hi:lo] of a split signal, as its pieces.
+    E piecesOf(int s, int hi, int lo) const {
+        std::vector<E> parts;   // the top one first
+        const auto& ps = pieces_.at(s);
+        for (size_t k = ps.size(); k-- > 0;) {
+            const Piece& p = ps[k];
+            int a = std::max(lo, p.lo), b = std::min(hi, p.hi);
+            if (a > b) continue;
+            parts.push_back(a == p.lo && b == p.hi ? ref(p.id) : mkSlice(ref(p.id), b - p.lo, a - p.lo));
+        }
+        if (parts.size() == 1) return parts[0];
+        return node(Op::Concat, std::move(parts));
+    }
+    // Bits [hi:lo] of e, with the select pushed toward the leaves.
+    E sliceOf(const E& e, int hi, int lo) const {
+        int w = widthOf(e);
+        if (w > 0 && lo == 0 && hi == w - 1) return e;
+        if (w > 0 && hi < w && !e->at) switch (e->op) {
+            case Op::Const: return konst(v_slice(e->k, hi, lo));
+            case Op::Slice: return sliceOf(e->kids[0], e->lo + hi, e->lo + lo);
+            case Op::Resize: { int kw = widthOf(e->kids[0]); if (kw > hi) return sliceOf(e->kids[0], hi, lo); break; }
+            case Op::Mux: { E m = node(Op::Mux, {e->kids[0], sliceOf(e->kids[1], hi, lo), sliceOf(e->kids[2], hi, lo)}); return m; }
+            case Op::Not: return node(Op::Not, {sliceOf(e->kids[0], hi, lo)});
+            case Op::And: case Op::Or: case Op::Xor: return node(e->op, {sliceOf(e->kids[0], hi, lo), sliceOf(e->kids[1], hi, lo)});
+            case Op::Concat: {
+                std::vector<E> parts;
+                int top = w;
+                for (auto& k : e->kids) {
+                    int kw = widthOf(k), klo = top - kw, khi = top - 1;
+                    top = klo;
+                    int a = std::max(lo, klo), b = std::min(hi, khi);
+                    if (a > b) continue;
+                    parts.push_back(sliceOf(k, b - klo, a - klo));
+                }
+                if (parts.size() == 1) return parts[0];
+                return node(Op::Concat, std::move(parts));
+            }
+            default: break;
+        }
+        return mkSlice(e, hi, lo);
+    }
+    std::vector<CodegenProc> splitWide(const std::vector<CodegenProc>& procs, const std::vector<int>& dom) {
+        std::vector<CodegenProc> out = procs;
+        size_t ns = sigW_.size();
+        realSigs_ = ns;
+        std::vector<char> W = wide_;
+        W.resize(ns, 0);
+        if (std::find(W.begin(), W.end(), 1) == W.end()) return out;
+        auto isW = [&](int x) { return x >= 0 && (size_t)x < ns && W[x]; };
+        std::vector<char> mine(procs.size(), 0);
+        for (int i : dom) mine[i] = 1;
+        for (size_t i = 0; i < procs.size(); i++) if (procs[i].combRank >= 0) mine[i] = 1;
+        std::function<void(const E&, const std::function<void(const Expr&, bool)>&)> each =
+            [&](const E& e, const std::function<void(const Expr&, bool)>& f) {
+                if (!e) return;
+                if (e->op == Op::Ref) f(*e, false);
+                if (e->op == Op::Slice && e->kids.size() == 1 && e->kids[0] && e->kids[0]->op == Op::Ref && !e->kids[0]->at) { f(*e, true); return; }
+                each(e->at, f);
+                for (auto& k : e->kids) each(k, f);
+            };
+        auto exprs = [&](const Instr& in, const std::function<void(const Expr&, bool)>& f) {
+            each(in.e, f); each(in.bidx, f); each(in.de, f); each(in.fd, f);
+            for (auto& a : in.args) each(a, f);
+            for (auto& a : in.aidx) each(a, f);
+        };
+        auto drop = [&](int x) { if (isW(x)) W[x] = 0; };
+        auto dropAll = [&](const Instr& in) {
+            exprs(in, [&](const Expr& x, bool sl) { drop(sl ? x.kids[0]->sig : x.sig); });
+            drop(in.sig); drop(in.dres); drop(in.dkey); drop(in.dsrc); drop(in.dyn);
+            for (auto& [sg, ed] : in.events) drop(sg);
+        };
+        // Anything outside the domain that names one keeps it whole.
+        std::vector<const Prog*> seen;
+        std::function<void(const Prog*)> outside = [&](const Prog* p) {
+            if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) return;
+            seen.push_back(p);
+            for (auto& in : p->code) { dropAll(in); outside(in.callee); for (auto* b : in.branches) outside(b); }
+        };
+        for (size_t i = 0; i < procs.size(); i++) if (!mine[i]) outside(procs[i].prog);
+        static const std::set<Op> pure = {Op::Const, Op::Ref, Op::Not, Op::And, Op::Or, Op::Xor, Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Mod,
+                                          Op::Eq, Op::Ne, Op::CaseEq, Op::CaseZEq, Op::CaseXEq, Op::Lt, Op::Le, Op::Gt, Op::Ge, Op::Shl, Op::Shr,
+                                          Op::Asr, Op::Resize, Op::LogNot, Op::LogAnd, Op::LogOr, Op::RedAnd, Op::RedOr, Op::RedXor, Op::Slice,
+                                          Op::Index, Op::Concat, Op::Mux, Op::WildEq};
+        std::function<bool(const E&)> isPure = [&](const E& e) {
+            if (!e) return true;
+            if (e->at || !pure.count(e->op)) return false;
+            for (auto& k : e->kids) if (!isPure(k)) return false;
+            return true;
+        };
+        std::map<int, std::set<int>> cuts;
+        for (size_t i = 0; i < procs.size(); i++) {
+            if (!mine[i]) continue;
+            const Prog& p = *procs[i].prog;
+            bool comb = procs[i].combRank >= 0, asserts = comb && combAsserts(p);
+            for (auto& in : p.code) {
+                outside(in.callee);
+                for (auto* b : in.branches) outside(b);
+                bool wr = in.k == IK::Assign || in.k == IK::Nba;
+                if (asserts || !(wr || in.k == IK::Jmp || in.k == IK::JmpIfNot || in.k == IK::WaitEdge)) { dropAll(in); continue; }
+                if (in.k == IK::WaitEdge) {
+                    if (in.edge != ANY) drop(in.sig);
+                    for (auto& [sg, ed] : in.events) if (ed != ANY) drop(sg);
+                }
+                if (wr && isW(in.sig)) {
+                    bool self = false;
+                    each(in.e, [&](const Expr& x, bool sl) { self |= (sl ? x.kids[0]->sig : x.sig) == in.sig; });
+                    int w = sigW_[in.sig];
+                    if (in.bidx || in.arr || !in.aidx.empty() || in.tmp || in.dyn >= 0 || in.nbaLater || in.de || !in.dly.empty() ||
+                        in.gate >= 0 || in.udp || (comb ? in.k != IK::Assign : in.k != IK::Nba) || (comb && self) || !isPure(in.e) ||
+                        (in.hi >= 0 && (in.lo < 0 || in.hi >= w || in.lo > in.hi)))
+                        drop(in.sig);
+                    else if (in.hi >= 0) { cuts[in.sig].insert(in.lo); cuts[in.sig].insert(in.hi + 1); }
+                }
+                exprs(in, [&](const Expr& x, bool sl) {
+                    if (!sl) return;
+                    int sg = x.kids[0]->sig;
+                    if (!isW(sg)) return;
+                    if (x.lo < 0 || x.hi >= sigW_[sg] || x.lo > x.hi) { drop(sg); return; }
+                    cuts[sg].insert(x.lo); cuts[sg].insert(x.hi + 1);
+                });
+            }
+        }
+        for (size_t x = 0; x < ns; x++) {
+            if (!W[x]) continue;
+            std::set<int>& c = cuts[(int)x];
+            c.insert(0); c.insert(sigW_[x]);
+            std::vector<Piece> ps;
+            for (auto it = c.begin(); std::next(it) != c.end(); ++it)
+                for (int lo = *it, end = *std::next(it); lo < end; lo += 64) ps.push_back({0, std::min(lo + 63, end - 1), lo});
+            if (ps.size() > 64) { W[x] = 0; continue; }
+            for (auto& pc : ps) {
+                pc.id = (int)sigW_.size();
+                sigW_.push_back(pc.hi - pc.lo + 1);
+                sigNet_.push_back(sigNet_[x]);
+                scratch_.push_back(scratch_[x]);
+                priv_.push_back(1);
+                pieceOf_.push_back((int)x);
+            }
+            pieces_[(int)x] = std::move(ps);
+        }
+        if (std::getenv("MSIM_WHYCYCLE")) {
+            size_t np = 0;
+            for (auto& [sg, ps] : pieces_) np += ps.size();
+            std::fprintf(stderr, "cycle domain: %zu wide signals kept as %zu pieces\n", pieces_.size(), np);
+        }
+        if (pieces_.empty()) return out;
+        auto split = [&](int x) { return x >= 0 && (size_t)x < ns && W[x]; };
+        std::function<E(const E&)> rw = [&](const E& e) -> E {
+            if (!e) return e;
+            if (e->op == Op::Slice && e->kids.size() == 1 && e->kids[0] && e->kids[0]->op == Op::Ref && !e->kids[0]->at && split(e->kids[0]->sig))
+                return piecesOf(e->kids[0]->sig, e->hi, e->lo);
+            if (e->op == Op::Ref && !e->at && split(e->sig)) {
+                E c = piecesOf(e->sig, sigW_[e->sig] - 1, 0);
+                return e->sgn ? resize(c, sigW_[e->sig], false, true) : c;
+            }
+            E at = rw(e->at);
+            std::vector<E> kids;
+            bool ch = at != e->at;
+            for (auto& k : e->kids) { kids.push_back(rw(k)); ch |= kids.back() != k; }
+            if (!ch) return e;
+            auto n = std::make_shared<Expr>(*e);
+            n->kids = std::move(kids);
+            n->at = at;
+            return n;
+        };
+        for (size_t i = 0; i < procs.size(); i++) {
+            if (!mine[i]) continue;
+            const Prog& p = *procs[i].prog;
+            bool touch = false;
+            for (auto& in : p.code) {
+                exprs(in, [&](const Expr& x, bool sl) { touch |= split(sl ? x.kids[0]->sig : x.sig); });
+                touch |= split(in.sig);
+                for (auto& [sg, ed] : in.events) touch |= split(sg);
+            }
+            if (!touch) continue;
+            ownProgs_.push_back(p);
+            Prog& q = ownProgs_.back();
+            q.code.clear();
+            std::vector<size_t> at(p.code.size() + 1, 0);
+            for (size_t pc = 0; pc < p.code.size(); pc++) {
+                at[pc] = q.code.size();
+                Instr in = p.code[pc];
+                in.e = rw(in.e); in.bidx = rw(in.bidx); in.de = rw(in.de);
+                for (auto& a : in.args) a = rw(a);
+                for (auto& a : in.aidx) a = rw(a);
+                if (in.k == IK::WaitEdge) {
+                    std::vector<std::pair<int, Edge>> ev = in.events;
+                    if (ev.empty() && in.sig >= 0) ev.push_back({in.sig, in.edge});
+                    bool any = false;
+                    for (auto& [sg, ed] : ev) any |= split(sg);
+                    if (any) {
+                        std::vector<std::pair<int, Edge>> ne;
+                        for (auto& [sg, ed] : ev) {
+                            if (!split(sg)) { ne.push_back({sg, ed}); continue; }
+                            for (auto& pc2 : pieces_[sg]) ne.push_back({pc2.id, ANY});
+                        }
+                        in.events = ne;
+                        in.sig = ne[0].first;
+                        in.edge = ne.size() == 1 ? ne[0].second : in.edge;
+                        if (ne.size() == 1) in.events.clear();
+                    }
+                    q.code.push_back(std::move(in));
+                    continue;
+                }
+                if ((in.k == IK::Assign || in.k == IK::Nba) && split(in.sig)) {
+                    int L = in.hi >= 0 ? in.lo : 0, H = in.hi >= 0 ? in.hi : sigW_[in.sig] - 1;
+                    E val = in.e;
+                    for (auto& pc2 : pieces_[in.sig]) {
+                        if (pc2.hi < L || pc2.lo > H) continue;
+                        Instr w = in;
+                        w.sig = pc2.id; w.hi = -1; w.lo = 0; w.drv = -1; w.s0 = w.s1 = STR_STRONG;
+                        w.e = pc2.lo == L && pc2.hi == H ? val : sliceOf(val, pc2.hi - L, pc2.lo - L);
+                        q.code.push_back(std::move(w));
+                    }
+                    continue;
+                }
+                q.code.push_back(std::move(in));
+            }
+            at[p.code.size()] = q.code.size();
+            for (auto& in : q.code)
+                if (in.k == IK::Jmp || in.k == IK::JmpIfNot) {
+                    in.target = at[std::min(in.target, p.code.size())];
+                    if (in.xt != Instr::NOX) in.xt = at[std::min(in.xt, p.code.size())];
+                }
+            out[i].prog = &q;
+            std::vector<int> ins;
+            for (int x : out[i].combIns) {
+                if (!split(x)) { ins.push_back(x); continue; }
+                for (auto& pc2 : pieces_[x]) ins.push_back(pc2.id);
+            }
+            out[i].combIns = std::move(ins);
+        }
+        return out;
+    }
     void emitCycle(std::ostream& o, const std::vector<CodegenProc>& procs, const std::vector<int>& dom,
                    const std::vector<int>& byRank) {
         clock_.assign(sigW_.size(), 0);
@@ -1530,7 +1805,7 @@ private:
             std::vector<int> nw(ns, 0);
             std::function<void(const E&, const std::function<void(Expr&)>&)> each = [&](const E& e, const std::function<void(Expr&)>& f) {
                 if (!e) return;
-                if (e->op == Op::Ref) f(*e);
+                if (e->op == Op::Ref && !e->at) f(*e);
                 for (auto& k : e->kids) each(k, f);
             };
             auto exprs = [&](const Instr& in, const std::function<void(Expr&)>& f) {
@@ -1696,7 +1971,9 @@ private:
         // Only when something watches every change (a VCD opened at run time).
         o << "static void combDead();\nstatic void syncP() {\n    combDead();\n";
         for (int s : privs)
-            o << "    S.fw(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
+            if (origOf(s) == s)
+                o << "    S.fw(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
+        for (auto& [sg, ps] : pieces_) o << "    S.fw(" << sg << ", " << ex(piecesOf(sg, sigW_[sg] - 1, 0)) << ");\n";
         o << "}\n";
         // Comb statements first: their reads are part of `ext`, which twoNow checks.
         // One unit per straight-line assign, or per process with if / case
@@ -1856,7 +2133,7 @@ private:
             for (int e : ext) if (!scratch(e))
                 o << "    if (S.sigs[" << e << "].val.x) std::fprintf(stderr, \"4-state: %s\\n\", S.sigs[" << e << "].name.c_str());\n";
         for (int s : privs) if (!scratch(s) && !deadSig[s])
-            o << "    if (P" << s << ".x) std::fprintf(stderr, \"4-state (private): %s\\n\", S.sigs[" << s << "].name.c_str());\n";
+            o << "    if (P" << s << ".x) std::fprintf(stderr, \"4-state (private): %s\\n\", S.sigs[" << origOf(s) << "].name.c_str());\n";
         o << "}\n";
         o << "static void scanP() {\n    uint64_t x = 0;\n";
         for (int s : privs) if (!scratch(s) && !deadSig[s]) o << "    x |= P" << s << ".x;\n";
@@ -2388,7 +2665,7 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
         std::string src = g.run(sigs, procs, parts);
         if (!g.privHits_.empty()) {
             if (!g.privates) throw CodegenUnsupported("a private signal");
-            noPriv.insert(g.privHits_.begin(), g.privHits_.end());
+            for (int h : g.privHits_) noPriv.insert(g.origOf(h));
             continue;
         }
         if (covSlots) *covSlots = std::move(g.covSlots);

@@ -46,3 +46,51 @@ module SB_MAC16 #(parameter NEG_TRIGGER = 0, C_REG = 0, A_REG = 0, B_REG = 0, D_
   wire [31:0] eb = {{16{B_SIGNED != 0 && B[15]}}, B};
   assign O = ea * eb;
 endmodule
+// SB_RAM40_4K and its falling-edge variants, without initial contents (one clock assumed for
+// the clash check): 4096 bits read and
+// written 16, 8, 4 or 2 at a time (READ_MODE / WRITE_MODE 0..3) on the data bits each mode uses.
+module SB_RAM40_4K #(parameter READ_MODE = 0, WRITE_MODE = 0)
+  (output reg [15:0] RDATA, input RCLK, RCLKE, RE, input [10:0] RADDR,
+   input WCLK, WCLKE, WE, input [10:0] WADDR, input [15:0] MASK, WDATA);
+  reg [4095:0] mem;
+  integer i;
+  always @(posedge WCLK) if (WE && WCLKE) begin
+    case (WRITE_MODE)
+      0: for (i = 0; i < 16; i = i + 1) if (!MASK[i]) mem[{WADDR[7:0], 4'd0} + i] <= WDATA[i];
+      1: for (i = 0; i < 8; i = i + 1) mem[{WADDR[8:0], 3'd0} + i] <= WDATA[2 * i];
+      2: for (i = 0; i < 4; i = i + 1) mem[{WADDR[9:0], 2'd0} + i] <= WDATA[4 * i + 1];
+      default: for (i = 0; i < 2; i = i + 1) mem[{WADDR[10:0], 1'd0} + i] <= WDATA[8 * i + 3];
+    endcase
+  end
+  // a word read while it is written is not defined in the block: x here, so a test sees it
+  wire [10:0] used = READ_MODE == 0 ? 11'h0ff : READ_MODE == 1 ? 11'h1ff : READ_MODE == 2 ? 11'h3ff : 11'h7ff;
+  wire clash = WE && WCLKE && ((WADDR ^ RADDR) & used) == 11'd0;
+  always @(posedge RCLK) if (RE && RCLKE) begin
+    RDATA <= 16'd0;
+    if (clash) RDATA <= 16'hxxxx;
+    else case (READ_MODE)
+      0: for (i = 0; i < 16; i = i + 1) RDATA[i] <= mem[{RADDR[7:0], 4'd0} + i];
+      1: for (i = 0; i < 8; i = i + 1) RDATA[2 * i] <= mem[{RADDR[8:0], 3'd0} + i];
+      2: for (i = 0; i < 4; i = i + 1) RDATA[4 * i + 1] <= mem[{RADDR[9:0], 2'd0} + i];
+      default: for (i = 0; i < 2; i = i + 1) RDATA[8 * i + 3] <= mem[{RADDR[10:0], 1'd0} + i];
+    endcase
+  end
+endmodule
+module SB_RAM40_4KNR #(parameter READ_MODE = 0, WRITE_MODE = 0)
+  (output [15:0] RDATA, input RCLKN, RCLKE, RE, input [10:0] RADDR,
+   input WCLK, WCLKE, WE, input [10:0] WADDR, input [15:0] MASK, WDATA);
+  SB_RAM40_4K #(.READ_MODE(READ_MODE), .WRITE_MODE(WRITE_MODE)) r (.RDATA(RDATA), .RCLK(~RCLKN), .RCLKE(RCLKE), .RE(RE),
+    .RADDR(RADDR), .WCLK(WCLK), .WCLKE(WCLKE), .WE(WE), .WADDR(WADDR), .MASK(MASK), .WDATA(WDATA));
+endmodule
+module SB_RAM40_4KNW #(parameter READ_MODE = 0, WRITE_MODE = 0)
+  (output [15:0] RDATA, input RCLK, RCLKE, RE, input [10:0] RADDR,
+   input WCLKN, WCLKE, WE, input [10:0] WADDR, input [15:0] MASK, WDATA);
+  SB_RAM40_4K #(.READ_MODE(READ_MODE), .WRITE_MODE(WRITE_MODE)) r (.RDATA(RDATA), .RCLK(RCLK), .RCLKE(RCLKE), .RE(RE),
+    .RADDR(RADDR), .WCLK(~WCLKN), .WCLKE(WCLKE), .WE(WE), .WADDR(WADDR), .MASK(MASK), .WDATA(WDATA));
+endmodule
+module SB_RAM40_4KNRNW #(parameter READ_MODE = 0, WRITE_MODE = 0)
+  (output [15:0] RDATA, input RCLKN, RCLKE, RE, input [10:0] RADDR,
+   input WCLKN, WCLKE, WE, input [10:0] WADDR, input [15:0] MASK, WDATA);
+  SB_RAM40_4K #(.READ_MODE(READ_MODE), .WRITE_MODE(WRITE_MODE)) r (.RDATA(RDATA), .RCLK(~RCLKN), .RCLKE(RCLKE), .RE(RE),
+    .RADDR(RADDR), .WCLK(~WCLKN), .WCLKE(WCLKE), .WE(WE), .WADDR(WADDR), .MASK(MASK), .WDATA(WDATA));
+endmodule
