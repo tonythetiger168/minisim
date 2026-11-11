@@ -7,7 +7,20 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Changed
+- License: the repository is Apache-2.0 (`LICENSE`, attribution in `NOTICE`)
+  instead of MIT. The MIT grant is not withdrawn: copies obtained under it
+  stay under it, and so does the git history. `docs/LICENSING.md` holds the
+  open-core policy, the proposed free / paid split per tool, and the rule
+  that no GPL or other copyleft code enters the tree.
+
 ### Added
+- `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
+  built from the spare cells of the old netlist and the cells the change
+  frees, by function (the same cell, or one with inputs tied or shared, or
+  the inverse plus a spare inverter); no cell is added or removed, and the
+  script holds only net connections. Exit status 3 when a cell had to be
+  added after all. See `docs/ECO.md`.
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
   changed, and the assignments that write them. The viewer page does the same.
@@ -63,6 +76,10 @@ Spec references are IEEE 1800-2023 clauses.
   another partitioner compete (`tools/memu_mtkahypar.py` for Mt-KaHyPar). The
   per-FPGA netlists now go through `mfpga` (the test maps a three-FPGA split
   to iCE40 and checks it against the original netlist).
+- `mformal -aiger FILE` writes the model as AIGER 1.9 (bad-state
+  properties for assertions and covers, invariant constraints for
+  assumptions), so other model checkers can run on it or cross-check a
+  verdict.
 - `mformal`: fairness. A strong obligation in an `assume`
   (`assume property (req |-> s_eventually !req)`) restricts the loops a
   liveness counterexample may use.
@@ -103,10 +120,25 @@ Spec references are IEEE 1800-2023 clauses.
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`. See `docs/CDC.md`.
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
+- `mpopt`: RTL power optimization. Finds clock gating from enables (CG),
+  sequential clock gating from registers whose sources did not load in the
+  cycle before (SCG), memory gating (MG) and operand isolation of multipliers
+  and dividers (OI); rewrites the RTL source in place (`-o dir`, with the
+  `mpopt_icg` clock-gate model or a library cell via `-icg_cell`), and
+  `-verify` co-simulates original and rewritten RTL in msim on random
+  stimulus, comparing every output and register every cycle. Multithreaded
+  (`-threads N`), same result for any thread count. See `docs/POWEROPT.md`.
 - Shared headers for the tools: `src/parallel.hpp` (default thread count,
   the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
   `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
   (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
+- `meco`, a functional ECO tool: given the implemented gate netlist and a
+  netlist of the revised design, it writes the smallest patch it can find
+  (patched netlist plus a Tcl edit script) and proves the result equivalent.
+  It looks for the gate or pin to change before copying any logic, reuses old
+  nets proved to have the same function, handles added, removed and replaced
+  registers, scan flops (`-tie se=0`) and black boxes, and gives the same
+  patch for any `-threads`. See `docs/ECO.md`.
 - `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
   netlist, RTL against RTL): both designs become one and-inverter graph,
   flops and latches are matched by name (or by the net on their output, also
@@ -133,6 +165,9 @@ Spec references are IEEE 1800-2023 clauses.
   source, drivers and loads, schematic, waves with values annotated in the
   source). `-vcd` reads VCD and FST; the page traces the active driver at the
   cursor itself. See `docs/DEBUG.md`.
+- `mrcx -corner NAME`: several extraction corners in one run. The options after a
+  `-corner` (`-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale`) are that corner's; the
+  design is read once and each corner goes to `design.NAME.spef`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
   coupling capacitance to same-layer neighbours (who also take over part of
@@ -140,8 +175,15 @@ Spec references are IEEE 1800-2023 clauses.
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
-  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  count. `ETCH` on a conductor gives the width as made. `src/spef.hpp` is the
+  SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `lib/sky130`: cells of the open SkyWater 130 nm library (Apache-2.0) as a
+  second test library: a 47-cell Liberty subset with its LEF and technology
+  LEF, `sky130.py fetch` for the whole library at three corners (pinned
+  commits, SHA-256 checked), and a `sky130` test that runs `mlibc`, `msynth`,
+  `msta` and `mpower` on it. `mlibc` no longer expects a LEF pin for a
+  Liberty `internal` pin, and `mlibc report` fits long cell names.
 - `mchar`, cell library characterization on `mspice`: from a Liberty
   template and one transistor `.subckt` per cell it measures delay and
   transition tables (combinational, clock-to-output, set and reset arcs,
@@ -319,6 +361,18 @@ Spec references are IEEE 1800-2023 clauses.
   simulator reports stuck-at, transition, coupling and address-decoder
   coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
   expected results come from that simulator. See `docs/DFT.md`.
+- `mpss`, portable stimulus: reads a model in the Accellera PSS language
+  (components, actions, buffers, streams, resources and pools, constraints,
+  activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
+  and functions), solves scenarios (field values, resource instances, and
+  the actions inferred to feed unbound inputs), and writes each scenario as
+  a UVM sequence class (`-sv`, runs under `msim -uvm`) and as a C test
+  function (`-c`), plus `-print` and `-json`. Scenarios are solved on all
+  cores (`-threads N`) with the same output for every thread count. See
+  `docs/MPSS.md` and `examples/pss/dma.pss`.
+- `src/interval.hpp`: the interval arithmetic and bounds propagation of the
+  `randomize()` solver, moved out of `rand.inc` so that `mpss` uses the same
+  rules.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
@@ -328,6 +382,13 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -svrf rules.svrf` reads rule files in the SVRF style that foundry
+  decks use (`LAYER`, `LAYER MAP`, `AND`/`OR`/`NOT`/`XOR`, `INTERACT`,
+  `INSIDE`, `OUTSIDE`, `SIZE`, `HOLES`, `RECTANGLE`, rule blocks with `INT`,
+  `EXT`, `ENC`, `AREA`, `DENSITY`, `#IFDEF`, `INCLUDE`) and translates them
+  to the native deck (`-write-deck`). Options it does not apply are listed
+  in warnings; statements it cannot run are errors with their line. Decks
+  can now name every datatype of a layer (`layer m1 68/*`).
 - `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
   database, to step through them in KLayout's marker browser.
 - `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
@@ -402,6 +463,37 @@ Spec references are IEEE 1800-2023 clauses.
 - A run-time error (null object access, a crash) names the statement that
   was running; `MSIM_CALLTRACE=1` prints every method and automatic
   subroutine call.
+- `mdft -bscan`: IEEE 1149.1 boundary-scan insertion (TAP controller,
+  instruction, BYPASS, IDCODE and boundary registers, 2-state, 3-state and
+  bidirectional pads, EXTEST / SAMPLE / PRELOAD / CLAMP / HIGHZ / INTEST)
+  and the BSDL file; `mdft -bsdl` checks a BSDL file (rules BSD001..009) and
+  writes its device tests as SVF and a self-checking testbench
+  (`docs/JTAG.md`).
+- `mdft -icl`: IEEE 1687 IJTAG. Reads ICL, writes the scan network as RTL
+  (optionally behind a TAP), and retargets PDL (`iWrite`, `iRead`, `iApply`,
+  `iCall`, ...) through SIBs and scan muxes to SVF and a testbench.
+- `mdft -lbist`: logic BIST for a scan-inserted design (PRPG on a primitive
+  polynomial, phase shifter, space compactor, MISR, controller and wrapper),
+  the golden signature by simulation (`-lbist_sign`), a check for X sources,
+  and ICL / PDL to run it over IJTAG.
+- `mdft -edt`: scan test compression. A ring-generator decompressor and an
+  XOR compactor around the scan chains, and an encoder that solves test
+  cubes into channel data over GF(2), in parallel and deterministically.
+- `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
+  on the gate netlist (port inputs at 0, scan cells observed), with the
+  coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
+  `-lbist_min_coverage` gate. Uses the shared fault simulator.
+- `mdft -diagnose`: scan failure diagnosis. Reads a tester fail log (pattern,
+  chain, cell or output) with matpg's patterns and the gate netlist, and ranks
+  the stuck-at or transition faults that explain it, with equivalent faults
+  and a second, third... defect when one does not explain everything. Uses
+  the shared fault simulator; multithreaded with the same report on any
+  thread count. See docs/JTAG.md.
+
+### Fixed
+- An inout port connected to a whole net is now that net (23.3.3.1). It was
+  two continuous assignments, one each way, so the net kept the last value
+  driven after every driver had gone to z.
 - `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
   the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
   `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed
@@ -473,6 +565,16 @@ Spec references are IEEE 1800-2023 clauses.
   resets to flop pins. `-nocarry` and `-noce` turn each off.
 - `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
   `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mlint` runs slang-tidy's checks (the lint tool that ships with slang, MIT)
+  as rules `TIDY001`..`TIDY021`, with mlint's severities, waivers, JSON and
+  threads; the checks mlint already had a rule for are left out. See
+  `docs/LINT.md` and `THIRD_PARTY_NOTICES.md`.
+- `mlint` has 13 text and syntax rules that follow Verible's lint rules
+  (`FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009`):
+  line length, tabs, trailing spaces, stray semicolons, `` `endif ``
+  comments, package file names, explicit lifetimes and parameter types,
+  range direction, macro names, short binary literals. Off by default; one
+  task per file, same output at any `-threads`.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
@@ -492,6 +594,11 @@ Spec references are IEEE 1800-2023 clauses.
   nodes) and `spice::Reader::readText()` for netlists held in memory.
   mspice now runs on the shared thread pool of `src/parallel.hpp`, which
   gains `Pool::spin()` for short batches that come one after the other.
+- `mfpga`: a multiplier wider than one DSP block is split into block-sized
+  partial products summed on carry chains (32x32 on ECP5: 4 blocks, no LUTs).
+- `mfpga`: memories with registered reads map to block RAM on iCE40
+  (`SB_RAM40_4K`) and ECP5 (`DP16KD`), with a bypass that keeps the RTL's
+  read-during-write result. `-noram` keeps flops.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

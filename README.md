@@ -477,6 +477,15 @@ a macro of the wrong size, pins off the routing grid); `mlibc report` and
 corners. See `docs/LIBCHECK.md`. The generic cell library it is tested on is
 `lib/mini45` (`docs/MINI45.md`).
 
+
+### A real PDK as test data: sky130
+
+`lib/sky130` holds 47 cells of the open SkyWater 130 nm library (Liberty,
+LEF and technology LEF, Apache-2.0, unmodified extracts) as a second test
+library beside `lib/mini45`, and `python3 lib/sky130/sky130.py fetch`
+downloads all 428 cells at three corners. The `sky130` test runs `mlibc`,
+`msynth`, `msta` and `mpower` on it. See `lib/sky130/README.md`.
+
 ### Timing constraint checks: `msdc`
 
 `msdc` reads the design and its SDC file and reports what is wrong or missing
@@ -537,6 +546,8 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
 | `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
 | `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
+| `format`, `suspicious` | `FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009` | Verible-style text and syntax rules (off until enabled): line length, tabs, trailing spaces, stray semicolons, `` `endif `` comments, explicit lifetimes and parameter types, range direction |
+| `tidy` | `TIDY001`..`TIDY021` | slang-tidy's checks, built in: registers assigned only in reset, undriven bit ranges, struct fields split over processes, port and typedef style |
 | `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
@@ -603,6 +614,33 @@ msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 
+### RTL power optimization: `mpopt`
+
+`mpopt` finds clock gating, memory gating and operand isolation in RTL,
+rewrites the source in place (comments and formatting kept), and checks the
+result against the original:
+
+```
+mpopt rtl/*.sv -top soc_top                    # what can be gated, and what cannot (-v: why)
+mpopt rtl/*.sv -top soc_top -o out             # rewritten RTL, clock-gate cell and files.f in out/
+mpopt rtl/*.sv -top soc_top -o out -verify     # co-simulate original and rewritten RTL in msim
+```
+
+```
+rtl/pipe.sv:25: [CG] pipe: a_q, b_q (32 bits) gated by in_valid
+rtl/pipe.sv:36: [SCG] pipe: prod_d (32 bits) gated by mpopt_st_L36; stable unless in_valid held in the cycle before
+rtl/pipe.sv:60: [MG] pipe: mem (256 bits) gated by we
+rtl/iso.sv:30: [OI] iso: operator * (24 bits) isolated by use_mul
+```
+
+CG gates a register by the enable written in the RTL. SCG (sequential clock
+gating) finds enables that are not written: a pipeline stage does not load
+when the stage before it did not. MG does both for memories. OI forces the
+operands of a multiplier or divider to zero when its result is not used. On
+Ibex it gates 90% of the register bits in 0.07 s. Runs on every logical CPU
+(`-threads N`), with the same output for any thread count. See
+[docs/POWEROPT.md](docs/POWEROPT.md).
+
 ### Logic synthesis: `msynth`
 
 `msynth` synthesizes RTL to a gate netlist of Liberty library cells, with a
@@ -650,6 +688,23 @@ mformal rtl/*.sv -top fifo -depth 40 -tb    # deeper, with replay testbenches
 Properties are checked in parallel on every core (`-threads N`), with the
 same result for any thread count. See `docs/FORMAL.md` for the model (clock,
 reset, two-state values, what is cut) and the supported property operators.
+### Portable stimulus: `mpss`
+
+`mpss` reads a test model in the Accellera PSS language, solves scenarios
+from it, and writes each one as a UVM sequence and as a C test function, so
+the same test runs in simulation and on the processor:
+
+```sh
+mpss examples/pss/dma.pss -n 20 -seed 1 -print      # show the solved scenarios
+mpss examples/pss/dma.pss -n 20 -sv dma_tests_pkg.sv -c dma_tests.c
+msim -uvm dma_tests_pkg.sv my_tb.sv -top top        # run the sequences
+```
+
+It picks the random fields, gives each action a free resource instance, and
+adds the actions a scenario needs but the test did not name (the write
+before a read). Scenarios are solved on all cores, and the output is the
+same for every `-threads` value. `docs/MPSS.md` has the supported subset of
+the language and the shape of the generated code.
 
 ### Equivalence checking: `mequiv`
 
@@ -664,6 +719,20 @@ mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
 ```
 
 See [docs/EQUIV.md](docs/EQUIV.md).
+
+### Functional ECO: `meco`
+
+`meco` turns a late RTL change into the smallest edit of the netlist that is
+already implemented, the way Conformal ECO does: it compares the old netlist
+with a fresh synthesis of the new RTL, finds the gates to change, reuses every
+old net that still has the right function, and proves the patched netlist
+equivalent to the new design.
+
+```sh
+meco -old impl.v -new resynth.v -lib cells.lib -o patched.v -script eco.tcl
+```
+
+See [docs/ECO.md](docs/ECO.md).
 
 ### Design for test: `mdft`
 
@@ -701,6 +770,17 @@ and reports the fault coverage of the chosen algorithm. See
 ```sh
 mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
 mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
+`mdft` also does IEEE 1149.1 boundary scan and IEEE 1687 IJTAG
+([docs/JTAG.md](docs/JTAG.md)); every flow can write SVF and a self-checking
+testbench that `msim` runs:
+
+```sh
+mdft -bscan rtl/*.sv -top chip -tb chip_tb.sv    # chip_bscan.sv (TAP + boundary register), chip_bscan.bsdl
+mdft -bsdl chip.bsdl -svf chip.svf               # check a BSDL file (BSD001..009), write its device tests
+mdft -icl net.icl -icl_rtl net.sv -pdl t.pdl -iproc all -svf t.svf   # IJTAG network RTL, PDL retargeting
+mdft -lbist chip_scan.v -top chip -scandef chains.json -lbist_sign    # logic BIST wrapper, golden signature
+mdft -edt chip_scan.v -top chip -scandef chains.json -edt_cubes cubes.txt -edt_patterns p.txt   # scan compression
+mdft -diagnose fails.log -patterns pats.txt chip_scan.v -top chip   # which faults explain a tester fail log
 ```
 
 `mlint` and `mdft` share one model of the elaborated design
@@ -781,6 +861,7 @@ the default configuration.
 ```sh
 mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
 mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
+mpv drc -svrf rules.svrf chip.gds -rdb drc.lyrdb               # SVRF-style rules; markers for KLayout
 ```
 
 ```
@@ -842,4 +923,8 @@ cmake at another build with `-DIVERILOG=... -DVVP=...`. To add one, drop a `.sv`
 
 ## License
 
-MIT
+Apache License 2.0 (`LICENSE`, attribution in `NOTICE`). Until 2026-11-11 the
+repository was MIT; that grant is not withdrawn, and copies obtained under it
+stay under it. Paid tools are a separate, closed-source product; which tool is
+in which edition, and the rules on third-party code, are in
+[`docs/LICENSING.md`](docs/LICENSING.md).

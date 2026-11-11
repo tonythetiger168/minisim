@@ -35,6 +35,7 @@
 #include "lvs_block.hpp"
 #include "oasis.hpp"
 #include "parallel.hpp"
+#include "svrf.hpp"
 #include "version.hpp"
 
 namespace {
@@ -46,9 +47,11 @@ int usage(FILE* f) {
         "       mpv drc -lef <tech.lef> [-lef <cells.lef>] [-deck <rules>] <routed.def> [options]\n"
         "       mpv lvs -lef <tech.lef> [-lef <cells.lef>] <routed.def> -netlist <gates.v> [-top <module>] [-o <extracted.v>]\n"
         "  -deck <file>     rule deck (see docs/MPV.md)\n"
+        "  -svrf <file>     drc: rules in the SVRF style, in place of -deck (-D <name> defines a name\n"
+        "                   for #IFDEF; -write-deck writes the translation)\n"
         "  -lef <file>      LEF for a DEF layout; without -deck the rules come from it\n"
         "  -obs             with a DEF: also place the cells' obstructions\n"
-        "  -write-deck <f>  write the deck made from the LEF\n"
+        "  -write-deck <f>  write the deck made from the LEF or from -svrf\n"
         "  -netlist <file>  lvs of a DEF: the gate netlist to compare with\n"
         "  -top <cell>      cell to check (default: the one top cell)\n"
         "  -o <file>        write the violation markers here\n"
@@ -123,7 +126,8 @@ bool writeRdb(const std::string& file, const std::string& layoutFile, const drc:
 }
 
 int drcMain(int argc, char** argv) {
-    std::string deckFile, gdsFile, top, outFile, rdbFile, writeDeck;
+    std::string deckFile, svrfFile, svrfDeck, gdsFile, top, outFile, rdbFile, writeDeck;
+    std::set<std::string> defines;
     std::vector<std::string> lefs;
     unsigned threads = par::defaultThreads();
     size_t maxMarkers = 1000;
@@ -138,6 +142,8 @@ int drcMain(int argc, char** argv) {
         std::string v;
         if (par::threadsArg(argc, argv, i, threads, "mpv")) continue;
         if (a == "-deck") { if (!val(deckFile)) return 2; }
+        else if (a == "-svrf") { if (!val(svrfFile)) return 2; }
+        else if (a == "-D") { if (!val(v)) return 2; defines.insert(v); }
         else if (a == "-top") { if (!val(top)) return 2; }
         else if (a == "-o") { if (!val(outFile)) return 2; }
         else if (a == "-rdb") { if (!val(rdbFile)) return 2; }
@@ -158,6 +164,21 @@ int drcMain(int argc, char** argv) {
         else { std::fprintf(stderr, "mpv: more than one layout given (%s, %s)\n", gdsFile.c_str(), a.c_str()); return 2; }
     }
     bool isDef = ::isDef(gdsFile);
+    if (!svrfFile.empty()) {
+        // An SVRF rule file is translated to a deck first.
+        if (!deckFile.empty()) { std::fprintf(stderr, "mpv: give -deck or -svrf, not both\n"); return 2; }
+        svrf::Result tr;
+        std::string terr;
+        if (!svrf::read(svrfFile, tr, terr, defines)) { std::fprintf(stderr, "mpv: %s\n", terr.c_str()); return 2; }
+        for (const std::string& w : tr.warnings) std::fprintf(stderr, "mpv: %s: %s\n", svrfFile.c_str(), w.c_str());
+        if (!writeDeck.empty()) {
+            std::ofstream f(writeDeck);
+            if (!(f << tr.deck)) { std::fprintf(stderr, "mpv: cannot write %s\n", writeDeck.c_str()); return 2; }
+            writeDeck.clear();
+        }
+        svrfDeck = std::move(tr.deck);
+        deckFile = svrfFile;
+    }
     if (gdsFile.empty() || (deckFile.empty() && !(isDef && !lefs.empty()))) return usage(stderr);
     if (isDef && lefs.empty()) { std::fprintf(stderr, "mpv: a DEF layout needs its LEF (-lef)\n"); return 2; }
 
@@ -193,7 +214,16 @@ int drcMain(int argc, char** argv) {
         if (!oasis::readLayout(gdsFile, lib, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
         if (!layout::flatten(lib, top, flat, err, threads)) { std::fprintf(stderr, "mpv: %s: %s\n", gdsFile.c_str(), err.c_str()); return 2; }
     }
-    if (!deckFile.empty() && !drc::readDeck(deckFile, deck, err)) { std::fprintf(stderr, "mpv: %s\n", err.c_str()); return 2; }
+    if (!svrfFile.empty()) {
+        std::istringstream in(svrfDeck);
+        if (!drc::parseDeck(in, deck, err)) {
+            std::fprintf(stderr, "mpv: %s: the translated deck (see -write-deck): %s\n", svrfFile.c_str(), err.c_str());
+            return 2;
+        }
+    } else if (!deckFile.empty() && !drc::readDeck(deckFile, deck, err)) {
+        std::fprintf(stderr, "mpv: %s\n", err.c_str());
+        return 2;
+    }
 
     drc::Engine eng(deck, flat, threads);
     std::vector<drc::RuleResult> res = eng.run();

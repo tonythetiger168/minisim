@@ -3,7 +3,8 @@
 // A deck is a text file, one statement per line, # starts a comment.
 // Lengths are in microns and areas in square microns.
 //
-//   layer poly 66/20                  a drawn layer: GDS layer/datatype (several allowed)
+//   layer poly 66/20                  a drawn layer: GDS layer/datatype (several allowed;
+//                                     66/* is every datatype of layer 66)
 //   gate = poly & diff                a derived layer
 //   rule poly.1a width(poly) < 0.15 "poly width"
 //
@@ -48,6 +49,7 @@
 // number of threads.
 #pragma once
 
+#include <climits>
 #include <cmath>
 #include <fstream>
 #include <memory>
@@ -279,8 +281,13 @@ inline bool parseDeck(std::istream& in, Deck& deck, std::string& err) {
                 if (end == w.c_str()) return fail("bad layer number " + w);
                 if (*end == '/') {
                     const char* q = end + 1;
-                    k.datatype = int(std::strtol(q, &end, 10));
-                    if (end == q) return fail("bad datatype in " + w);
+                    if (*q == '*') {
+                        k.datatype = -1;   // every datatype of the layer
+                        end = const_cast<char*>(q) + 1;
+                    } else {
+                        k.datatype = int(std::strtol(q, &end, 10));
+                        if (end == q) return fail("bad datatype in " + w);
+                    }
                 }
                 if (*end) return fail("bad layer number " + w);
                 d.keys.push_back(k);
@@ -727,6 +734,11 @@ public:
             if (s.drawn) {
                 std::vector<Rect> all;
                 for (const layout::LayerKey& k : deck_.drawn[s.index].keys) {
+                    if (k.datatype < 0) {
+                        for (auto it = flat_.layers.lower_bound({k.layer, INT_MIN}); it != flat_.layers.end() && it->first.layer == k.layer; ++it)
+                            all.insert(all.end(), it->second.begin(), it->second.end());
+                        continue;
+                    }
                     auto it = flat_.layers.find(k);
                     if (it != flat_.layers.end()) all.insert(all.end(), it->second.begin(), it->second.end());
                 }

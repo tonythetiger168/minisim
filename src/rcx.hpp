@@ -86,6 +86,7 @@ struct Conductor {
     std::string name;
     double thickness = 0, zbot = 0;
     double rpsq = 0, wmin = 0, smin = 0, crt1 = 0, crt2 = 0;
+    double etch = 0;       // um each edge loses in manufacture: made width = drawn - 2 etch
     // LEF-style overrides for the capacitance to ground, used when >= 0:
     double areaCap = -1;   // fF/um^2
     double edgeCap = -1;   // fF/um, per edge
@@ -134,7 +135,7 @@ struct Stack {
     //   DIELECTRIC ild2 { THICKNESS = 0.12 ER = 2.9 }
     //   CONDUCTOR metal2 { THICKNESS = 0.14 WMIN = 0.07 SMIN = 0.07 RPSQ = 0.25 CRT1 = 0.003 }
     //   DIELECTRIC ild1 { THICKNESS = 0.12 ER = 2.9 }
-    //   CONDUCTOR metal1 { THICKNESS = 0.13 WMIN = 0.07 SMIN = 0.065 RPSQ = 0.38 }
+    //   CONDUCTOR metal1 { THICKNESS = 0.13 WMIN = 0.07 SMIN = 0.065 RPSQ = 0.38 ETCH = 0.005 }
     //   DIELECTRIC pmd { THICKNESS = 0.30 ER = 3.9 }
     //   VIA via1 { FROM = metal1 TO = metal2 AREA = 0.0049 RPV = 5 }
     // "$" starts a comment. Properties this model does not use are skipped.
@@ -236,6 +237,7 @@ struct Stack {
                 if (kv.count("RPSQ")) it.c.rpsq = num(kv["RPSQ"]);
                 if (kv.count("CRT1")) it.c.crt1 = num(kv["CRT1"]);
                 if (kv.count("CRT2")) it.c.crt2 = num(kv["CRT2"]);
+                if (kv.count("ETCH")) it.c.etch = num(kv["ETCH"]);
                 items.push_back(it);
             } else if (k == "VIA") {
                 ViaLayer v;
@@ -400,6 +402,7 @@ struct NetBuild {
 
 // Step 1 and 2 for one net: nodes, resistors and wire pieces.
 inline void buildNet(const Layout& L, int netIdx, const std::vector<double>& rsheet,
+                     const std::vector<double>& etch,
                      const std::vector<std::vector<double>>& viaRes, const Options& opt,
                      NetOut& out, NetBuild& nb) {
     const Net& net = L.nets[static_cast<size_t>(netIdx)];
@@ -549,6 +552,9 @@ inline void buildNet(const Layout& L, int netIdx, const std::vector<double>& rsh
         std::stable_sort(wn.bp.begin(), wn.bp.end(),
                          [](const auto& x, const auto& y) { return x.first < y.first; });
         const double rs = rsheet[static_cast<size_t>(w.layer)];
+        // The width as made; never less than a tenth of the drawn width.
+        const double made = std::max(static_cast<double>(w.width) - 2 * etch[static_cast<size_t>(w.layer)] * dbu,
+                                     0.1 * static_cast<double>(w.width));
         const i64 h = w.width / 2;
         auto rectOf = [&](i64 p, i64 q) {
             i64 lo = p == wn.a ? p - w.ext0 : p, hi = q == wn.b ? q + w.ext1 : q;
@@ -571,7 +577,7 @@ inline void buildNet(const Layout& L, int netIdx, const std::vector<double>& rsh
             for (i64 s = 1; s <= parts; s++) {
                 i64 to = s == parts ? q : p + (q - p) * s / parts;
                 int nto = s == parts ? n1 : (wn.axis ? mk(w.layer, w.x0, to) : mk(w.layer, to, w.y0));
-                double r = rs * static_cast<double>(to - from) / static_cast<double>(w.width) * opt.rscale;
+                double r = rs * static_cast<double>(to - from) / made * opt.rscale;
                 pres.push_back({nfrom, nto, r});
                 pp.push_back({rectOf(from, to), nfrom, nto, w.layer, wn.axis});
                 from = to; nfrom = nto;
@@ -761,10 +767,11 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
     int threads = opt.threads > 0 ? opt.threads : static_cast<int>(par::defaultThreads());
     R.threads = threads;
 
-    std::vector<double> rsheet(nl);
+    std::vector<double> rsheet(nl), etch(nl);
     for (size_t i = 0; i < nl; i++) {
         const Conductor& c = stack.cond[i];
         rsheet[i] = c.rpsq * (1 + c.crt1 * dT + c.crt2 * dT * dT);
+        etch[i] = c.etch;
         if (c.rpsq <= 0) R.warnings.push_back("layer " + c.name + " has no sheet resistance; its wires get 0 ohm");
     }
     // Resistance per cut between two layers from the process file, or -1.
@@ -785,7 +792,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
         for (size_t i = b * netBlock; i < std::min(nn, (b + 1) * netBlock); i++) {
             const Net& net = L.nets[i];
             if (!net.power) {
-                buildNet(L, static_cast<int>(i), rsheet, viaRes, opt, R.nets[i], nb[i]);
+                buildNet(L, static_cast<int>(i), rsheet, etch, viaRes, opt, R.nets[i], nb[i]);
                 continue;
             }
             // Power metal: pieces only, cut so that none spans the whole die.
@@ -929,7 +936,8 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
             const Conductor& cd = stack.cond[A.layer];
             const int ax = A.axis, py = 1 - ax;
             const double len = static_cast<double>(A.r.hi(ax) - A.r.lo(ax)) / dbu;
-            const double w = static_cast<double>(A.r.hi(py) - A.r.lo(py)) / dbu;
+            const double drawn = static_cast<double>(A.r.hi(py) - A.r.lo(py)) / dbu;
+            const double w = std::max(drawn - 2 * cd.etch, 0.1 * drawn);   // as made
             const i64 mid = A.r.lo(ax) + A.r.hi(ax);   // twice the middle
             double ga = 0, gb = 0;   // ground capacitance at n0, n1
             // Fringe capacitance to the substrate per unit length, one side.
@@ -977,7 +985,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
                     const Piece& B = pieces[best->id];
                     if (B.net == A.net) continue;   // shields, adds nothing
                     double l = static_cast<double>(cuts[c + 1] - cuts[c]) / dbu;
-                    double s = static_cast<double>(best->gap) / dbu;
+                    double s = static_cast<double>(best->gap) / dbu + 2 * cd.etch;
                     double cc = k.epsL * lateral(w, k.t, k.h, s) * l * opt.cscale * opt.ccscale;
                     i64 m2 = cuts[c] + cuts[c + 1];
                     int na = m2 < mid ? A.n0 : A.n1;
@@ -1056,7 +1064,7 @@ inline Result extract(const Layout& L, const Stack& stack, const Options& opt) {
             if (static_cast<size_t>(A.layer) + 2 < nl) crossing(A.layer + 2, false);
 
             // Ground.
-            double open = len * w > 0 ? std::clamp(1.0 - covered / (len * w), 0.0, 1.0) : 1.0;
+            double open = len * drawn > 0 ? std::clamp(1.0 - covered / (len * drawn), 0.0, 1.0) : 1.0;
             double cg;
             if (cd.areaCap >= 0 || cd.edgeCap >= 0)
                 cg = std::max(cd.areaCap, 0.0) * len * w * open + std::max(cd.edgeCap, 0.0) * 2 * len;

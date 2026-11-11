@@ -12,6 +12,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **msim** | Simulator: slang front end, event-driven 4-state kernel, interpreter by default, `-compile` to native C++, multi-core, VCD. irun / vcs -R style command line | Shipping in 0.1 |
 | **msimprotect** | IEEE 1735 IP protection: encrypt source with `msimprotect`, simulate it with `msim -keyfile` | PR #29, planned for 0.2 |
 | **nocgen** | UVM testbench and memory-profile generator for AXI NoC meshes ([SoC-tb-regress-builder](https://github.com/tonythetiger168/SoC-tb-regress-builder)) | Separate repo; runs on msim once classes and UVM land |
+| **mpss** | Portable stimulus: solves scenarios from an Accellera PSS model and writes each as a UVM sequence and as a bare-metal C test (`docs/MPSS.md`) | Shipping next |
 | **mregress** | Regression runner: test lists, seeds, parallel jobs on msim / VCS / Xcelium / Questa / Icarus, failure grouping, JUnit and HTML reports | Shipping in 0.2 |
 | **mbug** | Bug reports: each distinct mregress / mlint / mdft failure becomes one issue in GitHub Issues, Redmine or Jira (deduplicated by signature, a comment per repeat), with repro command, logs and the CI build link; syncs GitHub issues into Jira / Redmine | Shipping in 0.2 |
 | **mlint** | Lint and clock-domain checks on the elaborated design: about 80 rules (latches, combinational loops, widths, synthesizability, unused signals, connections, clocks, resets, naming, clock- and reset-domain crossings), each with a severity; configuration files, waivers in files and in the source, JSON report, multi-core. See `docs/LINT.md`, `docs/CDC.md` | Shipping next |
@@ -20,7 +21,9 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mdft** | Design-for-test: scan-readiness checks (gated clocks, logic-driven resets, latches, mixed edges, combinational loops) and a per-domain flop count for chain planning | Shipping next |
 | **mformal** | Formal property checking: proves or falsifies `assert`, constrains with `assume`, reaches `cover`, for every input sequence; bounded model checking and k-induction on CaDiCaL, counterexample waveforms and replay testbenches, one job per property on every core (`docs/FORMAL.md`) | Shipping next |
 | **mdft** | Design-for-test: scan-readiness checks (gated clocks, logic-driven resets, latches, mixed edges, combinational loops) and a per-domain flop count for chain planning; scan insertion on gate netlists (`-insert_scan`) and March memory BIST generation with fault coverage (`-mbist`) | Shipping next |
+| **mpopt** | RTL power optimization: clock gating from enables, sequential clock gating, memory gating and operand isolation, written back into the RTL source and co-simulated against the original | Shipping next |
 | **mequiv** | Logic equivalence checking: RTL vs netlist, netlist vs netlist, RTL vs RTL; name-based matching of flops and latches, SAT proof of every output and next-state function on all cores, counterexamples (`docs/EQUIV.md`) | Shipping next |
+| **meco** | Functional ECO: smallest netlist patch for a late RTL change, from the old netlist and a re-synthesis of the new RTL; edit script; result proved equivalent (`docs/ECO.md`) | Shipping next |
 | **mdebug** | Source-level debug: drivers and loads with their conditions, fan-in cones, the active driver at a time in a waveform traced back through time, and a one-file viewer (hierarchy, source, schematic, waves) | Shipping next |
 | **mpower** | Power analysis: average and peak power from SAIF / VCD / FST activity and Liberty power tables, at gate level or as an RTL estimate, per group, instance, cell and UPF power domain (`docs/POWER.md`) | Shipping next |
 | **matpg** | Test pattern generation on a scan netlist: stuck-at and launch-on-capture transition faults, PODEM with a 64-pattern parallel fault simulator on every core, fault classes and coverage, STIL and a self-checking Verilog testbench, grading of existing patterns ([docs/ATPG.md](ATPG.md)) | Shipping next |
@@ -40,10 +43,22 @@ All of them install from one package (`minisim_x.y.z_amd64.deb` /
 
 ## Editions
 
-- **minisim (open source, MIT)**: every product above. This is the product.
-- An enterprise edition (support contract, long-term-support branches,
-  validated platform builds, encrypted-IP key management) is an option once
-  1.0 is out; nothing is held back from the open-source build before then.
+- **minisim (free, Apache-2.0)**: the verification flow - simulator,
+  waveforms, coverage, regression runner, planning, lint and CDC,
+  scan-readiness checks, virtual prototypes and debug. No seat count, no key,
+  no time limit.
+- **Paid tools (closed source)**: implementation and signoff - synthesis,
+  place and route, timing, extraction, equivalence, formal, ATPG, emulation,
+  HLS, SPICE and characterization, physical verification, power, constraints
+  and IP protection. Same file formats and command lines, so the two mix in
+  one flow.
+- **Enterprise** (support contract, long-term-support branches, validated
+  platform builds, key management for encrypted IP): an option once 1.0 is
+  out, on top of either edition.
+
+The split per tool, and what it costs to make it, is in
+[`LICENSING.md`](LICENSING.md); it is a proposal until Tony confirms it, and
+until then every tool is built from this repository under Apache-2.0.
 
 ## Roadmap
 
@@ -63,7 +78,7 @@ schedules them into releases.
 
 | | minisim | Commercial (VCS, Xcelium, Questa, UniVista UVS) | Verilator | Icarus |
 |---|---|---|---|---|
-| Price | Free, MIT | Per-seat licenses | Free | Free |
+| Price | Free, Apache-2.0 (paid implementation tools beside it) | Per-seat licenses | Free | Free |
 | SystemVerilog testbench (classes, randomization, UVM) | Roadmap 0.3 to 0.5 | Yes | Partial (UVM support in progress) | Partial |
 | 4-state, event-driven semantics | Yes | Yes | 2-state; `--timing` for delays | Yes |
 | VCS / irun command line | Yes (`msim`) | Native to each | No | No |

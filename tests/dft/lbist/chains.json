@@ -1,0 +1,11 @@
+{
+  "top": "sdut",
+  "scan_enable": {"port": "scan_en", "active": "high"},
+  "clocks": [{"port": "clk", "off_state": 0, "flops": 9}],
+  "resets": [{"port": "rst_n", "active": "low"}],
+  "chains": [
+    {"name": "chain0", "scan_in": "scan_in[0]", "scan_out": "scan_out[0]", "length": 4},
+    {"name": "chain1", "scan_in": "scan_in[1]", "scan_out": "scan_out[1]", "length": 5}
+  ],
+  "unscanned": []
+}
