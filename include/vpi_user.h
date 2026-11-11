@@ -1,11 +1,11 @@
 /*
  * vpi_user.h - the Verilog Procedural Interface for minisim (IEEE 1800-2023
- * clauses 36-38, annex M).
+ * clauses 36 to 38 and annex K).
  *
  * The types, constants and function names are the ones the standard
  * defines, so a VPI application builds against this header or another
- * simulator's. This file was written for minisim and is MIT licensed like
- * the rest of the project. docs/VPI.md lists what minisim implements.
+ * simulator's. This file was written for minisim and is under the project's
+ * license. docs/VPI.md lists what minisim implements.
  */
 #ifndef VPI_USER_H
 #define VPI_USER_H
@@ -29,9 +29,27 @@ typedef int64_t PLI_INT64;
 typedef uint64_t PLI_UINT64;
 #endif
 
+/* How a symbol is imported and exported (a Windows DLL needs both). */
+#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__CYGWIN__)
+#ifndef PLI_DLLISPEC
+#define PLI_DLLISPEC __declspec(dllimport)
+#define VPI_USER_DEFINED_DLLISPEC 1
+#endif
+#ifndef PLI_DLLESPEC
+#define PLI_DLLESPEC __declspec(dllexport)
+#define VPI_USER_DEFINED_DLLESPEC 1
+#endif
+#else
+#ifndef PLI_DLLISPEC
 #define PLI_DLLISPEC
+#endif
+#ifndef PLI_DLLESPEC
 #define PLI_DLLESPEC
+#endif
+#endif
+#ifndef PLI_EXTERN
 #define PLI_EXTERN
+#endif
 #ifndef PLI_VEXTERN
 #define PLI_VEXTERN extern
 #endif
@@ -247,7 +265,7 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiTimeConst 8
 #define vpiBlocking 41
 #define vpiCaseType 42
-#define vpiFuncType 43
+#define vpiFuncType 44
 #define vpiIntFunc 1
 #define vpiRealFunc 2
 #define vpiTimeFunc 3
@@ -258,7 +276,7 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiSysFuncReal vpiRealFunc
 #define vpiSysFuncTime vpiTimeFunc
 #define vpiSysFuncSized vpiSizedFunc
-#define vpiNetDeclAssign 44
+#define vpiNetDeclAssign 43
 #define vpiUserDefn 45
 #define vpiScheduled 46
 #define vpiActive 49
@@ -286,6 +304,145 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiNegIndexed 2
 #define vpiIsMemory 73
 #define vpiIsProtected 74
+
+/* ---- more of annex K: relations, properties and their values ---- */
+#define vpiActiveTimeFormat 119
+#define vpiInTerm 120
+#define vpiInstanceArray 121
+#define vpiLocalDriver 122
+#define vpiLocalLoad 123
+#define vpiOutTerm 124
+#define vpiPorts 125
+#define vpiSimNet 126
+#define vpiTaskFunc 127
+#define vpiBaseExpr 131
+#define vpiWidthExpr 132
+#define vpiAutomatics 136
+#define vpiDefDelayMode 47
+#define vpiDelayModeNone 1
+#define vpiDelayModePath 2
+#define vpiDelayModeDistrib 3
+#define vpiDelayModeUnit 4
+#define vpiDelayModeZero 5
+#define vpiDelayModeMTM 6
+#define vpiDefDecayTime 48
+#define vpiNettypeNet 14
+#define vpiNettypeNetSelect 15
+#define vpiInterconnect 16
+#define vpiAndPrim 1
+#define vpiNandPrim 2
+#define vpiNorPrim 3
+#define vpiOrPrim 4
+#define vpiXorPrim 5
+#define vpiXnorPrim 6
+#define vpiBufPrim 7
+#define vpiNotPrim 8
+#define vpiBufif0Prim 9
+#define vpiBufif1Prim 10
+#define vpiNotif0Prim 11
+#define vpiNotif1Prim 12
+#define vpiNmosPrim 13
+#define vpiPmosPrim 14
+#define vpiCmosPrim 15
+#define vpiRnmosPrim 16
+#define vpiRpmosPrim 17
+#define vpiRcmosPrim 18
+#define vpiRtranPrim 19
+#define vpiRtranif0Prim 20
+#define vpiRtranif1Prim 21
+#define vpiTranPrim 22
+#define vpiTranif0Prim 23
+#define vpiTranif1Prim 24
+#define vpiPullupPrim 25
+#define vpiPulldownPrim 26
+#define vpiSeqPrim 27
+#define vpiCombPrim 28
+#define vpiPositive 1
+#define vpiNegative 2
+#define vpiUnknown 3
+#define vpiNoEdge 0x00
+#define vpiEdge01 0x01
+#define vpiEdge10 0x02
+#define vpiEdge0x 0x04
+#define vpiEdgex1 0x08
+#define vpiEdge1x 0x10
+#define vpiEdgex0 0x20
+#define vpiPosedge (vpiEdgex1 | vpiEdge01 | vpiEdge0x)
+#define vpiNegedge (vpiEdgex0 | vpiEdge10 | vpiEdge1x)
+#define vpiAnyEdge (vpiPosedge | vpiNegedge)
+#define vpiPathFull 1
+#define vpiPathParallel 2
+#define vpiSetup 1
+#define vpiHold 2
+#define vpiPeriod 3
+#define vpiWidth 4
+#define vpiSkew 5
+#define vpiRecovery 6
+#define vpiNoChange 7
+#define vpiSetupHold 8
+#define vpiFullskew 9
+#define vpiRecrem 10
+#define vpiRemoval 11
+#define vpiTimeskew 12
+#define vpiMinusOp 1
+#define vpiPlusOp 2
+#define vpiNotOp 3
+#define vpiBitNegOp 4
+#define vpiUnaryAndOp 5
+#define vpiUnaryNandOp 6
+#define vpiUnaryOrOp 7
+#define vpiUnaryNorOp 8
+#define vpiUnaryXorOp 9
+#define vpiUnaryXNorOp 10
+#define vpiSubOp 11
+#define vpiDivOp 12
+#define vpiModOp 13
+#define vpiEqOp 14
+#define vpiNeqOp 15
+#define vpiCaseEqOp 16
+#define vpiCaseNeqOp 17
+#define vpiGtOp 18
+#define vpiGeOp 19
+#define vpiLtOp 20
+#define vpiLeOp 21
+#define vpiLShiftOp 22
+#define vpiRShiftOp 23
+#define vpiAddOp 24
+#define vpiMultOp 25
+#define vpiLogAndOp 26
+#define vpiLogOrOp 27
+#define vpiBitAndOp 28
+#define vpiBitOrOp 29
+#define vpiBitXorOp 30
+#define vpiBitXNorOp 31
+#define vpiBitXnorOp vpiBitXNorOp
+#define vpiConditionOp 32
+#define vpiConcatOp 33
+#define vpiMultiConcatOp 34
+#define vpiEventOrOp 35
+#define vpiNullOp 36
+#define vpiListOp 37
+#define vpiMinTypMaxOp 38
+#define vpiPosedgeOp 39
+#define vpiNegedgeOp 40
+#define vpiArithLShiftOp 41
+#define vpiArithRShiftOp 42
+#define vpiPowerOp 43
+#define vpiCaseExact 1
+#define vpiCaseX 2
+#define vpiCaseZ 3
+#define vpiModPathDelay 1
+#define vpiInterModPathDelay 2
+#define vpiMIPDelay 3
+#define VPI_MCD_STDOUT 0x00000001
+#define vpiSupplyDrive 0x80
+#define vpiStrongDrive 0x40
+#define vpiPullDrive 0x20
+#define vpiWeakDrive 0x08
+#define vpiLargeCharge 0x10
+#define vpiMediumCharge 0x04
+#define vpiSmallCharge 0x02
+#define vpiHiZ 0x01
 
 /* ---- vpi_control operations ---- */
 #define vpiStop 66
@@ -339,6 +496,23 @@ typedef struct t_vpi_value {
         PLI_BYTE8 *misc;
     } value;
 } s_vpi_value, *p_vpi_value;
+
+/* The values of several array elements at once (38.16, 38.35). */
+typedef struct t_vpi_arrayvalue {
+    PLI_UINT32 format; /* vpiIntVal, vpiRealVal, vpiTimeVal, vpiShortIntVal, vpiLongIntVal,
+                          vpiShortRealVal, vpiVectorVal, vpiRawTwoStateVal, vpiRawFourStateVal */
+    PLI_UINT32 flags;  /* vpiUserAllocFlag; for a put also vpiOneValue, vpiPropagateOff */
+    union {
+        PLI_INT32 *integers;
+        PLI_INT16 *shortints;
+        PLI_INT64 *longints;
+        PLI_BYTE8 *rawvals;
+        struct t_vpi_vecval *vectors;
+        struct t_vpi_time *times;
+        double *reals;
+        float *shortreals;
+    } value;
+} s_vpi_arrayvalue, *p_vpi_arrayvalue;
 
 #define vpiBinStrVal 1
 #define vpiOctStrVal 2
@@ -463,6 +637,9 @@ typedef struct t_cb_data {
 #define cbAtEndOfSimTime 31
 
 /* ---- functions ---- */
+/* The compatibility mode an application asks for (36.12, annex L). */
+#include "vpi_compatibility.h"
+
 XXTERN vpiHandle vpi_register_cb(p_cb_data cb_data_p);
 XXTERN PLI_INT32 vpi_remove_cb(vpiHandle cb_obj);
 XXTERN void vpi_get_cb_info(vpiHandle object, p_cb_data cb_data_p);
@@ -481,6 +658,8 @@ XXTERN void vpi_get_delays(vpiHandle object, p_vpi_delay delay_p);
 XXTERN void vpi_put_delays(vpiHandle object, p_vpi_delay delay_p);
 XXTERN void vpi_get_value(vpiHandle expr, p_vpi_value value_p);
 XXTERN vpiHandle vpi_put_value(vpiHandle object, p_vpi_value value_p, p_vpi_time time_p, PLI_INT32 flags);
+XXTERN void vpi_get_value_array(vpiHandle object, p_vpi_arrayvalue arrayvalue_p, PLI_INT32 *index_p, PLI_UINT32 num);
+XXTERN void vpi_put_value_array(vpiHandle object, p_vpi_arrayvalue arrayvalue_p, PLI_INT32 *index_p, PLI_UINT32 num);
 XXTERN void vpi_get_time(vpiHandle object, p_vpi_time time_p);
 XXTERN PLI_UINT32 vpi_mcd_open(const PLI_BYTE8 *fileName);
 XXTERN PLI_UINT32 vpi_mcd_close(PLI_UINT32 mcd);

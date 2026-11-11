@@ -66,6 +66,24 @@ bit, with the time and value in the requested formats), `cbReadWriteSynch`,
 `vpi_remove_cb`, `vpi_get_cb_info`. Declaration initializers take effect
 before the simulation starts and are not value changes.
 
+**Array values (38.16, 38.35).** `vpi_get_value_array` and
+`vpi_put_value_array` on a memory, from a start index, in `vpiIntVal`,
+`vpiShortIntVal`, `vpiLongIntVal`, `vpiRealVal`, `vpiShortRealVal`,
+`vpiTimeVal`, `vpiVectorVal`, `vpiRawTwoStateVal` and `vpiRawFourStateVal`
+(ceil(size/8) value bytes per element, then as many unknown-mask bytes),
+with `vpiUserAllocFlag`, `vpiOneValue` and `vpiPropagateOff`. A whole array
+can be an argument of a user system task.
+
+**Headers (annexes K, L, M).** `vpi_user.h` and `sv_vpi_user.h` define every
+constant, structure and routine of annexes K and M with the standard's
+numbers. `vpi_compatibility.h` (annex L, included by `vpi_user.h`): an
+application that defines `VPI_COMPATIBILITY_VERSION_1364v1995`, `_1364v2001`,
+`_1364v2005`, `_1800v2005` or `_1800v2009` before the include is bound to
+that standard's variants of the routines (`vpi_get_1364v2005`, ...), and
+`vpi_get(vpiCompatibilityMode, NULL)` returns the mode of the calling
+application (36.12.2). The default mode is `vpiMode1800v2009`, the newest
+the standard defines. The object model is the same in every mode so far.
+
 **Other routines.** `vpi_printf`, `vpi_vprintf`, `vpi_mcd_open`,
 `vpi_mcd_close`, `vpi_mcd_name`, `vpi_mcd_printf`, `vpi_flush`,
 `vpi_chk_error`, `vpi_get_vlog_info`, `vpi_control(vpiFinish)` and
@@ -75,8 +93,7 @@ before the simulation starts and are not value changes.
 `vpi_put_value` with `vpiForceFlag` / `vpiReleaseFlag` forces and releases a
 net or variable (or one bit of it) like `force` / `release` (10.6.2); a
 release returns the value the object then has. `veriuser.h` declares
-`tf_dofinish` and `tf_dostop`, and `sv_vpi_user.h` the SystemVerilog object
-type numbers, for C code written for other simulators. A DPI context import
+`tf_dofinish` and `tf_dostop` for C code written for other simulators. A DPI context import
 may call VPI (35.5.3), as UVM's HDL backdoor does (see `docs/UVM.md`).
 
 ## Not yet
@@ -91,8 +108,9 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
-`tests/spec/data/vpi/`. When Icarus Verilog is installed, CI builds the same
+`tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
+`M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
 C files into an Icarus VPI module (`//! icarus-vpi:`) and checks that Icarus
 prints the same output.

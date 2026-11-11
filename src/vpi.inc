@@ -17,7 +17,7 @@
 #include <cstdarg>
 #include <cmath>
 
-#include "../include/vpi_user.h"
+#include "../include/sv_vpi_user.h"
 #include "version.hpp"
 #include "slang/ast/ASTContext.h"
 #include "slang/ast/SystemSubroutine.h"
@@ -80,6 +80,8 @@ struct State {
     std::unordered_map<int, std::vector<Cb*>> change;   // signal -> its cbValueChange callbacks
     std::vector<std::unique_ptr<Cb>> cbs;
     std::multimap<uint64_t, std::pair<int, Val>> puts;   // delayed vpi_put_value writes
+    int mode = vpiMode1800v2009;          // the compatibility mode of the running call (36.12)
+    std::vector<char> arrBuf;             // vpi_get_value_array without vpiUserAllocFlag
     Compilation* comp = nullptr;
     const LowerResult* lr = nullptr;
     std::vector<std::string> argv;
@@ -933,10 +935,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     }
 }
 
-vpiHandle vpi_handle_multi(PLI_INT32, vpiHandle, vpiHandle, ...) {
-    vpi::error(vpiWarning, "vpi_handle_multi is not supported");
-    return nullptr;
-}
+vpiHandle vpi_handle_multi(PLI_INT32 type, vpiHandle a, vpiHandle b, ...);
 
 vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     vpi::clearErr();
@@ -1157,6 +1156,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     auto& s = vpi::st();
     Obj* o = O(h);
     if (!o) {
+        if (prop == vpiCompatibilityMode) return s.mode;   // 36.12.2
         if (prop == vpiTimePrecision) return s.lr->precExp;
         if (prop == vpiTimeUnit) return s.lr->precExp;
         return vpiUndefined;
@@ -1518,18 +1518,219 @@ PLI_INT32 vpi_put_userdata(vpiHandle h, void* d) {
     return 1;
 }
 
-PLI_INT32 vpi_control(PLI_INT32 op, ...) {
-    vpi::clearErr();
+}   // extern "C"
+namespace vpi {
+inline PLI_INT32 control(PLI_INT32 op, va_list) {
+    clearErr();
     if (op == vpiFinish || op == vpiStop) {
         S.finished = true;
         return 1;
     }
-    vpi::error(vpiWarning, "vpi_control: operation " + std::to_string(op) + " is not supported");
+    error(vpiWarning, "vpi_control: operation " + std::to_string(op) + " is not supported");
     return 0;
+}
+inline vpiHandle handleMulti(PLI_INT32, vpiHandle, vpiHandle, va_list) {
+    error(vpiWarning, "vpi_handle_multi is not supported");
+    return nullptr;
+}
+// The elements a value-array call covers: `num` elements from the one at
+// `index`, toward the right bound, going on from the left bound after it.
+inline bool arraySpan(const char* who, const Obj* o, PLI_INT32* index, PLI_UINT32 num, const ArrShape*& sh, int64_t& first) {
+    if (!o || o->kind != Obj::Signal || o->type != vpiMemory) { error(vpiError, std::string(who) + ": the object is not an array of variables"); return false; }
+    sh = arrMap().find(o->sym)->second.get();
+    if (!index) { error(vpiError, std::string(who) + ": no index"); return false; }
+    auto [l, r] = sh->dims[0];
+    first = l <= r ? index[0] - l : l - index[0];
+    if (first < 0 || first >= sh->count) { error(vpiError, std::string(who) + ": index " + std::to_string(index[0]) + " is outside the array"); return false; }
+    if ((int64_t)num > sh->count) { error(vpiError, std::string(who) + ": more elements asked for than the array has"); return false; }
+    return true;
+}
+}   // namespace vpi
+extern "C" {
+
+PLI_INT32 vpi_control(PLI_INT32 op, ...) {
+    va_list ap;
+    va_start(ap, op);
+    PLI_INT32 r = vpi::control(op, ap);
+    va_end(ap);
+    return r;
+}
+
+// 38.16: the values of `num` elements of an array in one call. Each element
+// takes one entry of the format's C type; a vector takes ceil(size/32)
+// s_vpi_vecval, and the raw formats ceil(size/8) bytes of value (two-state)
+// followed, for vpiRawFourStateVal, by as many bytes of the unknown mask.
+void vpi_get_value_array(vpiHandle h, p_vpi_arrayvalue av, PLI_INT32* index, PLI_UINT32 num) {
+    vpi::clearErr();
+    Obj* o = O(h);
+    const ArrShape* sh = nullptr;
+    int64_t first = 0;
+    if (!av) { vpi::error(vpiError, "vpi_get_value_array: no value structure"); return; }
+    if (!vpi::arraySpan("vpi_get_value_array", o, index, num, sh, first)) return;
+    int w = sh->elemW, nb = (w + 7) / 8, nw = (w + 31) / 32;
+    size_t each = 0;
+    switch (av->format) {
+        case vpiIntVal: each = sizeof(PLI_INT32); break;
+        case vpiShortIntVal: each = sizeof(PLI_INT16); break;
+        case vpiLongIntVal: each = sizeof(PLI_INT64); break;
+        case vpiRealVal: each = sizeof(double); break;
+        case vpiShortRealVal: each = sizeof(float); break;
+        case vpiTimeVal: each = sizeof(s_vpi_time); break;
+        case vpiVectorVal: each = sizeof(s_vpi_vecval) * (size_t)nw; break;
+        case vpiRawTwoStateVal: each = (size_t)nb; break;
+        case vpiRawFourStateVal: each = (size_t)nb * 2; break;
+        default: vpi::error(vpiError, "vpi_get_value_array: unsupported format " + std::to_string(av->format)); return;
+    }
+    char* out = av->value.rawvals;
+    if (!(av->flags & vpiUserAllocFlag)) {   // minisim's buffer, good until the next call
+        vpi::st().arrBuf.assign(each * num + 8, 0);
+        out = vpi::st().arrBuf.data();
+        av->value.rawvals = out;
+    } else if (!out) { vpi::error(vpiError, "vpi_get_value_array: vpiUserAllocFlag without a buffer"); return; }
+    std::memset(out, 0, each * num);
+    for (PLI_UINT32 k = 0; k < num; k++) {
+        Val v = S.get(sh->base + (int)((first + k) % sh->count));
+        char* e = out + each * k;
+        auto bit = [&](int i) { return i < w ? bitAt(v, i) : (sh->sgn && w > 0 && bitAt(v, w - 1) == 1 ? 1 : 0); };
+        auto integer = [&](int n) { uint64_t r = 0; for (int i = 0; i < n; i++) if (bit(i) == 1) r |= 1ULL << i; return r; };
+        switch (av->format) {
+            case vpiIntVal: { PLI_INT32 x = (PLI_INT32)integer(32); std::memcpy(e, &x, sizeof x); break; }
+            case vpiShortIntVal: { PLI_INT16 x = (PLI_INT16)integer(16); std::memcpy(e, &x, sizeof x); break; }
+            case vpiLongIntVal: { PLI_INT64 x = (PLI_INT64)integer(64); std::memcpy(e, &x, sizeof x); break; }
+            case vpiRealVal: { double x = sh->sgn ? (double)(int64_t)integer(64) : (double)integer(64); std::memcpy(e, &x, sizeof x); break; }
+            case vpiShortRealVal: { float x = sh->sgn ? (float)(int64_t)integer(64) : (float)integer(64); std::memcpy(e, &x, sizeof x); break; }
+            case vpiTimeVal: {
+                uint64_t x = integer(64);
+                s_vpi_time tm{vpiSimTime, (PLI_UINT32)(x >> 32), (PLI_UINT32)x, (double)x};
+                std::memcpy(e, &tm, sizeof tm);
+                break;
+            }
+            case vpiVectorVal:
+                for (int i = 0; i < w; i++) {
+                    int b = bitAt(v, i);
+                    s_vpi_vecval vv;
+                    std::memcpy(&vv, e + sizeof vv * (size_t)(i / 32), sizeof vv);
+                    if (b == 1 || b == 2) vv.aval |= 1u << (i % 32);
+                    if (b == 2 || b == 3) vv.bval |= 1u << (i % 32);
+                    std::memcpy(e + sizeof vv * (size_t)(i / 32), &vv, sizeof vv);
+                }
+                break;
+            default:   // raw: value bytes, then (four-state) unknown bytes, lowest byte first
+                for (int i = 0; i < w; i++) {
+                    int b = bitAt(v, i);
+                    if (av->format == vpiRawTwoStateVal) { if (b == 1) e[i / 8] |= (char)(1 << (i % 8)); continue; }
+                    if (b == 1 || b == 2) e[i / 8] |= (char)(1 << (i % 8));
+                    if (b == 2 || b == 3) e[nb + i / 8] |= (char)(1 << (i % 8));
+                }
+        }
+    }
+}
+
+// 38.35: write `num` elements of an array in one call, with no delay. With
+// vpiOneValue every element gets the first value. With vpiPropagateOff the
+// elements change without waking the processes that wait on them.
+void vpi_put_value_array(vpiHandle h, p_vpi_arrayvalue av, PLI_INT32* index, PLI_UINT32 num) {
+    vpi::clearErr();
+    Obj* o = O(h);
+    const ArrShape* sh = nullptr;
+    int64_t first = 0;
+    if (!av || !av->value.rawvals) { vpi::error(vpiError, "vpi_put_value_array: no values"); return; }
+    if (!vpi::arraySpan("vpi_put_value_array", o, index, num, sh, first)) return;
+    int w = sh->elemW, nb = (w + 7) / 8, nw = (w + 31) / 32;
+    size_t each = 0;
+    switch (av->format) {
+        case vpiIntVal: each = sizeof(PLI_INT32); break;
+        case vpiShortIntVal: each = sizeof(PLI_INT16); break;
+        case vpiLongIntVal: each = sizeof(PLI_INT64); break;
+        case vpiRealVal: each = sizeof(double); break;
+        case vpiShortRealVal: each = sizeof(float); break;
+        case vpiTimeVal: each = sizeof(s_vpi_time); break;
+        case vpiVectorVal: each = sizeof(s_vpi_vecval) * (size_t)nw; break;
+        case vpiRawTwoStateVal: each = (size_t)nb; break;
+        case vpiRawFourStateVal: each = (size_t)nb * 2; break;
+        default: vpi::error(vpiError, "vpi_put_value_array: unsupported format " + std::to_string(av->format)); return;
+    }
+    const char* in = av->value.rawvals;
+    for (PLI_UINT32 k = 0; k < num; k++) {
+        const char* e = in + ((av->flags & vpiOneValue) ? 0 : each * k);
+        Val v = make(0, 0, w);
+        if (w > 64) v = maskWidth(v, w);
+        auto integer = [&](int64_t x, int n) { for (int i = 0; i < w; i++) setBit(v, i, (int)((x >> std::min(i, n - 1)) & 1)); };
+        switch (av->format) {
+            case vpiIntVal: { PLI_INT32 x; std::memcpy(&x, e, sizeof x); integer(x, 32); break; }
+            case vpiShortIntVal: { PLI_INT16 x; std::memcpy(&x, e, sizeof x); integer(x, 16); break; }
+            case vpiLongIntVal: { PLI_INT64 x; std::memcpy(&x, e, sizeof x); integer(x, 64); break; }
+            case vpiRealVal: { double x; std::memcpy(&x, e, sizeof x); integer((int64_t)std::llround(x), 64); break; }
+            case vpiShortRealVal: { float x; std::memcpy(&x, e, sizeof x); integer((int64_t)std::llround(x), 64); break; }
+            case vpiTimeVal: { s_vpi_time tm; std::memcpy(&tm, e, sizeof tm); integer((int64_t)(((uint64_t)tm.high << 32) | tm.low), 64); break; }
+            case vpiVectorVal:
+                for (int i = 0; i < w; i++) {
+                    s_vpi_vecval vv;
+                    std::memcpy(&vv, e + sizeof vv * (size_t)(i / 32), sizeof vv);
+                    int a = (vv.aval >> (i % 32)) & 1, b = (vv.bval >> (i % 32)) & 1;
+                    setBit(v, i, b ? (a ? 2 : 3) : a);
+                }
+                break;
+            default:
+                for (int i = 0; i < w; i++) {
+                    int a = (e[i / 8] >> (i % 8)) & 1;
+                    int b = av->format == vpiRawFourStateVal ? (e[nb + i / 8] >> (i % 8)) & 1 : 0;
+                    setBit(v, i, b ? (a ? 2 : 3) : a);
+                }
+        }
+        int sg = sh->base + (int)((first + k) % sh->count);
+        if (av->flags & vpiPropagateOff) S.sigs[(size_t)sg].val = v;
+        else S.set(sg, v);
+    }
+}
+
+// 39.4.2: callbacks on assertions. The assertion API is not implemented yet.
+vpiHandle vpi_register_assertion_cb(vpiHandle, PLI_INT32, vpi_assertion_callback_func*, PLI_BYTE8*) {
+    vpi::error(vpiWarning, "vpi_register_assertion_cb is not supported");
+    return nullptr;
 }
 
 // IEEE 1364 TF routines that VPI code from other simulators still calls (veriuser.h).
 int tf_dofinish(void) { return vpi_control(vpiFinish, 0); }
 int tf_dostop(void) { return vpi_control(vpiStop, 0); }
+
+// ---- compatibility modes (36.12, annex L) ----
+// An application built with VPI_COMPATIBILITY_VERSION_<std> calls these
+// variants; each runs the routine in that standard's mode.
+namespace vpi {
+struct ModeScope {
+    int saved;
+    explicit ModeScope(int m) : saved(st().mode) { st().mode = m; }
+    ~ModeScope() { st().mode = saved; }
+};
+}   // namespace vpi
+vpiHandle vpi_handle_multi(PLI_INT32 type, vpiHandle a, vpiHandle b, ...) {
+    va_list ap;
+    va_start(ap, b);
+    vpiHandle r = vpi::handleMulti(type, a, b, ap);
+    va_end(ap);
+    return r;
+}
+#define MSIM_VPI_COMPAT(sfx, mode) \
+    PLI_INT32 vpi_compare_objects_##sfx(vpiHandle a, vpiHandle b) { vpi::ModeScope m(mode); return vpi_compare_objects(a, b); } \
+    PLI_INT32 vpi_control_##sfx(PLI_INT32 op, ...) { vpi::ModeScope m(mode); va_list ap; va_start(ap, op); PLI_INT32 r = vpi::control(op, ap); va_end(ap); return r; } \
+    PLI_INT32 vpi_get_##sfx(PLI_INT32 p, vpiHandle h) { vpi::ModeScope m(mode); return vpi_get(p, h); } \
+    PLI_BYTE8* vpi_get_str_##sfx(PLI_INT32 p, vpiHandle h) { vpi::ModeScope m(mode); return vpi_get_str(p, h); } \
+    void vpi_get_value_##sfx(vpiHandle h, p_vpi_value v) { vpi::ModeScope m(mode); vpi_get_value(h, v); } \
+    vpiHandle vpi_handle_##sfx(PLI_INT32 t, vpiHandle h) { vpi::ModeScope m(mode); return vpi_handle(t, h); } \
+    vpiHandle vpi_handle_by_index_##sfx(vpiHandle h, PLI_INT32 i) { vpi::ModeScope m(mode); return vpi_handle_by_index(h, i); } \
+    vpiHandle vpi_handle_by_multi_index_##sfx(vpiHandle h, PLI_INT32 n, PLI_INT32* i) { vpi::ModeScope m(mode); return vpi_handle_by_multi_index(h, n, i); } \
+    vpiHandle vpi_handle_by_name_##sfx(PLI_BYTE8* n, vpiHandle h) { vpi::ModeScope m(mode); return vpi_handle_by_name(n, h); } \
+    vpiHandle vpi_handle_multi_##sfx(PLI_INT32 t, vpiHandle a, vpiHandle b, ...) { vpi::ModeScope m(mode); va_list ap; va_start(ap, b); vpiHandle r = vpi::handleMulti(t, a, b, ap); va_end(ap); return r; } \
+    vpiHandle vpi_iterate_##sfx(PLI_INT32 t, vpiHandle h) { vpi::ModeScope m(mode); return vpi_iterate(t, h); } \
+    vpiHandle vpi_put_value_##sfx(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 f) { vpi::ModeScope m(mode); return vpi_put_value(h, v, t, f); } \
+    vpiHandle vpi_register_cb_##sfx(p_cb_data d) { vpi::ModeScope m(mode); return vpi_register_cb(d); } \
+    vpiHandle vpi_scan_##sfx(vpiHandle h) { vpi::ModeScope m(mode); return vpi_scan(h); }
+MSIM_VPI_COMPAT(1364v1995, vpiMode1364v1995)
+MSIM_VPI_COMPAT(1364v2001, vpiMode1364v2001)
+MSIM_VPI_COMPAT(1364v2005, vpiMode1364v2005)
+MSIM_VPI_COMPAT(1800v2005, vpiMode1800v2005)
+MSIM_VPI_COMPAT(1800v2009, vpiMode1800v2009)
+#undef MSIM_VPI_COMPAT
 
 }   // extern "C"

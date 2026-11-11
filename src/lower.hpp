@@ -1880,6 +1880,20 @@ struct Lowerer {
                     continue;
                 }
             }
+            // A whole fixed-size array: the array object (37.19), for
+            // vpi_handle_by_index, vpi_iterate and the value-array calls.
+            if (ValueExpressionBase::isKind(a.kind) && t.isUnpackedArray()) {
+                const Symbol* sym = &a.as<ValueExpressionBase>().symbol;
+                if (auto it = arrMap().find(sym); it != arrMap().end() && !symOverride.count(sym) && !localMap().count(sym)) {
+                    va.kind = VpiArg::Signal;
+                    va.sig = it->second->base;
+                    va.w = it->second->elemW;
+                    va.sgn = it->second->sgn;
+                    va.sym = sym;
+                    site->args.push_back(va);
+                    continue;
+                }
+            }
             va.kind = VpiArg::Value;
             Instr i;
             i.k = IK::Assign;
