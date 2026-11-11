@@ -135,6 +135,7 @@ thread count.
 | `-lib FILE` | Liberty library for cells with no Verilog definition |
 | `-blackbox MOD` | do not look inside MOD |
 | `-noclockgate` | compare gated clocks as they are, without turning them into enables |
+| `-noconstreg` | do not read a reference flop stuck at its reset value as a constant |
 | `-threads N` | worker threads (default: all logical cores) |
 | `-effort N` | SAT conflicts allowed per compare point (default 2000000) |
 | `-maxfail N` | failing points printed in detail (default 10) |
@@ -195,3 +196,16 @@ point with its status and counterexample). The SAT solver is CaDiCaL behind
 A part-select above a select whose index is not constant (`mem[addr][7:0] <= ...`, a
 byte-lane write) is taken as a possible write to every word the index can reach; the
 part-select narrows the write itself, not the set of bits the block is known to drive.
+
+### Constant registers
+
+Synthesis removes a register that can never leave its reset value: one with an
+asynchronous reset to `c` whose next state is `c` whenever it holds `c`
+(`q <= q & en` after a reset to 0, `q <= q` after a reset to 1). The netlist has
+the constant in its place. A reference flop of that shape with no partner in the
+implementation is read as that constant, and the run reports how many
+(`-verbose` names them). This takes the reset as applied, as the netlist does:
+before the first reset the RTL register is unknown and the netlist's constant is
+one of the values it may have. `-noconstreg` compares with the register left
+free, and such a design then fails. A register the implementation still has is
+never treated this way.

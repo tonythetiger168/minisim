@@ -91,3 +91,8 @@ check(1 "Verification FAILED" -ref invint.sv -impl invint_gates.v -lib cells.lib
 # A memory written one byte lane at a time (mem[addr][7:0] <= ...) against the word-wide form.
 check(0 "Verification SUCCEEDED" -ref lanes_word.sv -impl lanes.sv)
 check(1 "Verification FAILED" -ref lanes_word.sv -impl lanes.sv +define+BUG)
+
+# Registers stuck at their reset value, replaced by the constant in the implementation.
+check(0 "5 reference flops stuck at their reset value" -ref stuck.sv -impl stuck.sv +define+FOLDED)
+check(1 "Verification FAILED" -ref stuck.sv -impl stuck.sv +define+FOLDED +define+BUG)
+check(1 "Unmatched reference state: 5" -noconstreg -ref stuck.sv -impl stuck.sv +define+FOLDED)

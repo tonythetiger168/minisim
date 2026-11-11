@@ -55,6 +55,7 @@ struct CheckOptions {
     unsigned simRounds = 8;         // 64 patterns each
     uint64_t sweepEffort = 300;     // SAT conflicts per internal equivalence tried
     std::vector<std::pair<std::string, std::string>> matches;  // ref name, impl name
+    bool constRegs = true;          // read unmatched reference flops stuck at their reset value as that value
 };
 
 struct Result {
@@ -62,6 +63,7 @@ struct Result {
     std::vector<std::string> refOnlyInputs, implOnlyInputs, refOnlyOutputs, implOnlyOutputs;
     std::vector<std::string> refOnlyStates, implOnlyStates;
     size_t matchedInputs = 0, matchedStates = 0, matchedOutputs = 0, invertedStates = 0;
+    std::vector<std::string> constStates;  // reference flops read as a constant (CheckOptions::constRegs)
     size_t passed = 0, failed = 0, aborted = 0;
     size_t merged = 0;  // internal nodes SAT sweeping proved equal
     bool equivalent() const { return failed == 0 && aborted == 0 && refOnlyOutputs.empty(); }
@@ -403,8 +405,70 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
         ++res.matchedStates;
     }
     for (size_t r = 0; r < ref.inputs.size(); ++r) if (!refIn[r]) res.refOnlyInputs.push_back(ref.inputs[r].first);
-    for (size_t r = 0; r < ref.states.size(); ++r) if (!refSt[r]) res.refOnlyStates.push_back(ref.states[r].name);
+    // ---- constant registers
+    // A reference flop the implementation does not have, with an asynchronous
+    // set or reset to c and a next state that is c whenever it holds c, never
+    // leaves c once reset. Synthesis replaces it with c; read it that way.
+    // This takes the reset as applied, which is what such a netlist assumes.
+    std::unordered_map<uint32_t, Lit> konst;
+    if (opt.constRegs) {
+        auto orTerms = [&](Lit root) {
+            std::vector<Lit> out, todo{root};
+            while (!todo.empty()) {
+                Lit l = todo.back();
+                todo.pop_back();
+                if (isNeg(l) && g.isAnd(nodeOf(l))) {
+                    todo.push_back(neg(g.node(nodeOf(l)).a));
+                    todo.push_back(neg(g.node(nodeOf(l)).b));
+                } else {
+                    out.push_back(l);
+                }
+            }
+            return out;
+        };
+        // The value the flop takes under 'term', if that is a constant.
+        auto under = [&](const State& st, Lit term, std::unordered_map<uint32_t, Lit> m) -> Lit {
+            if (nodeOf(term) == 0) return kNoLit;
+            m[nodeOf(term)] = isNeg(term) ? kFalse : kTrue;
+            auto mx = m;
+            Lit v = g.rebuildSparse(st.next.v, m);
+            if (g.rebuildSparse(st.next.x, mx) != kFalse || nodeOf(v) != 0) return kNoLit;
+            return v;
+        };
+        for (bool again = true; again;) {
+            again = false;
+            for (size_t r = 0; r < ref.states.size(); ++r) {
+                const State& st = ref.states[r];
+                if (refSt[r] || st.latch || st.trig.x != kFalse || konst.count(nodeOf(st.q))) continue;
+                auto terms = orTerms(st.trig.v);
+                if (terms.size() < 2) continue;
+                Lit c = kNoLit;
+                size_t clocks = 0;  // events that load something else
+                for (Lit t : terms) {
+                    Lit v = under(st, t, konst);
+                    if (v == kNoLit) ++clocks;
+                    else if (c == kNoLit) c = v;
+                    else if (c != v) { c = kNoLit; clocks = 0; break; }  // both a set and a reset
+                }
+                if (c == kNoLit || clocks == 0) continue;
+                auto m = konst;
+                m[nodeOf(st.q)] = isNeg(st.q) ? neg(c) : c;
+                auto mx = m;
+                if (g.rebuildSparse(st.next.v, m) != c || g.rebuildSparse(st.next.x, mx) != kFalse) continue;
+                konst[nodeOf(st.q)] = isNeg(st.q) ? neg(c) : c;
+                res.constStates.push_back(st.name);
+                again = true;
+            }
+        }
+    }
+    for (size_t r = 0; r < ref.states.size(); ++r)
+        if (!refSt[r] && !konst.count(nodeOf(ref.states[r].q))) res.refOnlyStates.push_back(ref.states[r].name);
     auto move = [&](Bit b) { return Bit{g.rebuild(b.v, memo), g.rebuild(b.x, memo)}; };
+    auto kmemo = konst;
+    auto fold = [&](Bit b) {
+        if (konst.empty()) return b;
+        return Bit{g.rebuildSparse(b.v, kmemo), g.rebuildSparse(b.x, kmemo)};
+    };
 
     // ---- compare points
     auto add = [&](Point::Kind kind, const std::string& rn, const std::string& in, Bit r, Bit i) {
@@ -412,6 +476,7 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
         p.kind = kind;
         p.name = rn;
         if (in != rn) p.implName = in;
+        r = fold(r);
         p.ref = r;
         p.impl = i;
         // Differ: the reference is a definite value and the implementation is
