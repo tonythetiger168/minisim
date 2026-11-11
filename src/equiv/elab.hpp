@@ -332,6 +332,13 @@ private:
             for (auto& f : sc->membersOfType<FieldSymbol>()) fields.push_back(&f);
         return fields;
     }
+    // Synthesis that flattens a struct or a memory names its flops by the bit
+    // position in the whole variable (item_reg_11_, mem_reg_30_), so a state
+    // bit is also known as var[position].
+    void flatAlias(const Symbol& s, uint32_t bit, State& st) {
+        std::string flat = pathOf(s) + "[" + std::to_string(bit) + "]";
+        if (flat != st.name) st.aliases.push_back(std::move(flat));
+    }
     const std::vector<std::string>& bitNames(const Symbol& s) {
         auto it = names.find(&s);
         if (it != names.end()) return it->second;
@@ -486,6 +493,8 @@ private:
             if (!pin)
                 throw Unsupported("Liberty cell '" + cell->name + "' has no pin '" + std::string(pnames[i]) +
                                   "' (instance '" + pathOf(u) + "')");
+            // .QN() leaves an output open: nothing to drive.
+            if (e->kind == ExpressionKind::EmptyArgument && pin->dir == liberty::Dir::Out) continue;
             dr.pins[pin->name] = e;
             if (pin->dir == liberty::Dir::Out) outs.push_back(e);
             else if (pin->dir != liberty::Dir::In)
@@ -2086,6 +2095,7 @@ private:
         for (auto& [key, h] : real) {
             State st;
             st.name = bitNames(*key.first)[key.second];
+            flatAlias(*key.first, key.second, st);
             owner(*key.first, st);
             st.q = h;
             st.latch = true;
@@ -2119,11 +2129,32 @@ private:
         Proc global;
         cur = &global;
         Bit trig = kB0;
+        std::vector<Bit> terms;
         for (auto& ev : dr.events) {
             Bit b = evalExpr(*ev.expr)[0];
-            trig = bv.or_(trig, ev.edge == EdgeKind::PosEdge ? b : bv.not_(b));
+            terms.push_back(ev.edge == EdgeKind::PosEdge ? b : bv.not_(b));
+            trig = bv.or_(trig, terms.back());
         }
         cur = savedCur;
+        // An event under whose active level a register keeps its value does
+        // nothing to it: `always @(posedge clk or posedge rst) if (!rst) m <= d;`
+        // is a flop on clk alone that holds while rst is high, and that is how
+        // synthesis builds it. Leave such events out of that register's trigger.
+        auto triggerOf = [&](const State& st) {
+            if (terms.size() < 2) return trig;
+            Bit t = kB0;
+            size_t kept = 0;
+            for (Bit& term : terms) {
+                bool holds = false;
+                if (term.x == kFalse && nodeOf(term.v) != 0) {
+                    std::unordered_map<uint32_t, Lit> fixed{{nodeOf(term.v), isNeg(term.v) ? kFalse : kTrue}};
+                    auto fx = fixed;
+                    holds = g.rebuildSparse(st.next.v, fixed) == st.q && g.rebuildSparse(st.next.x, fx) == kFalse;
+                }
+                if (!holds) t = bv.or_(t, term), ++kept;
+            }
+            return kept ? t : trig;
+        };
         std::vector<const Symbol*> order;
         for (auto& c : dr.claimList)
             if (std::find(order.begin(), order.end(), c.sym) == order.end()) order.push_back(c.sym);
@@ -2137,12 +2168,13 @@ private:
                 if (!mask[i]) continue;
                 State st;
                 st.name = nm[i];
+                flatAlias(*sym, i, st);
                 owner(*sym, st);
                 st.q = info(*sym).val[i].v;
                 st.next = {st.q, kFalse};
                 if (in != base.nba.end() && isSet(in->second[i])) st.next = in->second[i];
                 else if (ie != base.env.end() && isSet(ie->second[i])) st.next = ie->second[i];
-                st.trig = trig;
+                st.trig = triggerOf(st);
                 // A loop counter in a clocked block is not a register anyone built.
                 if (loopCounters.count(sym)) continue;
                 d.states.push_back(std::move(st));

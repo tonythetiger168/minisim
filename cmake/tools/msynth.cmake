@@ -9,31 +9,18 @@ endif()
 include(GNUInstallDirs)
 find_package(Python3 COMPONENTS Interpreter)
 
-# The built-in generic cell library is compiled in from lib/msynth_generic.lib.
-file(READ ${CMAKE_SOURCE_DIR}/lib/msynth_generic.lib MSYNTH_GENERIC_LIB)
-string(LENGTH "${MSYNTH_GENERIC_LIB}" MSYNTH_LIB_LEN)
-set(MSYNTH_LIB_CHUNKS "")
-set(MSYNTH_LIB_POS 0)
-while(MSYNTH_LIB_POS LESS MSYNTH_LIB_LEN)   # compilers limit one string literal: 8K pieces
-  string(SUBSTRING "${MSYNTH_GENERIC_LIB}" ${MSYNTH_LIB_POS} 8000 MSYNTH_LIB_PIECE)
-  string(APPEND MSYNTH_LIB_CHUNKS "R\"MSLIB(${MSYNTH_LIB_PIECE})MSLIB\"\n")
-  math(EXPR MSYNTH_LIB_POS "${MSYNTH_LIB_POS} + 8000")
-endwhile()
-file(WRITE ${CMAKE_BINARY_DIR}/gen/msynth_generic_lib.hpp.new
-     "// Generated from lib/msynth_generic.lib\nstatic const char kGenericLib[] =\n${MSYNTH_LIB_CHUNKS};\n")
-execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_BINARY_DIR}/gen/msynth_generic_lib.hpp.new ${CMAKE_BINARY_DIR}/gen/msynth_generic_lib.hpp)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/lib/msynth_generic.lib)
-
 add_executable(msynth src/msynth.cpp)
 target_include_directories(msynth PRIVATE src)
+# The default target library, mini45, is found next to an installed msynth
+# (share/minisim/lib/mini45) or, for a build-tree msynth, in the source tree.
+target_compile_definitions(msynth PRIVATE MSYNTH_ROOT_DIR="${CMAKE_SOURCE_DIR}")
 find_package(Threads REQUIRED)
 target_link_libraries(msynth PRIVATE slang::slang Threads::Threads)
 install(TARGETS msynth RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Each design is synthesized, and its testbench is simulated with msim on the
-# RTL and on the netlist: both must print the same. Once with the built-in
-# library and once with a library of only an inverter, a NAND and one flop.
+# RTL and on the netlist: both must print the same. Once with the default
+# library (mini45) and once with a library of only an inverter, a NAND and one flop.
 if(Python3_FOUND)
   foreach(t counter alu fsm hier)
     add_test(NAME msynth_${t}

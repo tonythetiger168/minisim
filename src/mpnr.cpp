@@ -1,6 +1,8 @@
 // mpnr: place and route. Reads a gate-level Verilog netlist and LEF, makes a
 // floorplan, places the cells, routes the nets, and writes DEF.
 #include "pnr_route.hpp"
+#include "pnr_cts.hpp"
+#include "pnr_timing.hpp"
 #include "pnr_gds.hpp"
 #include "version.hpp"
 #include <chrono>
@@ -26,6 +28,13 @@ static void usage() {
     "  -strap_layer N    routing layer of the straps (default: the top vertical layer)\n"
     "  -strap_width UM   strap width (four wire widths)\n"
     "  -strap_pitch UM   distance between straps of one supply (32 row heights)\n"
+    "  -no_cts           no clock trees: clock nets are routed as they are in the netlist\n"
+    "  -cts_fanout N     most loads on one clock buffer (16)\n"
+    "  -cts_buf CELL     clock buffer cell (default: found by name, a CLKBUF before a BUF)\n"
+    "  -clock NET        build a tree on this net (repeat; default: every net on a cell's clock pin)\n"
+    "  -lib FILE         Liberty library, for timing (repeat for several)\n"
+    "  -sdc FILE         timing constraints; with -lib: timing report and timing-driven placement\n"
+    "  -no_timing_driven with -lib and -sdc: only report timing\n"
     "  -place_only       stop after placement\n"
     "  -def FILE         write the placed and routed design as DEF\n"
     "  -netlist FILE     write the final flat netlist (with tie and filler cells)\n"
@@ -48,6 +57,8 @@ int main(int argc, char** argv) {
   NetlistOptions nopt;
   PlaceOptions popt;
   RouteOptions ropt;
+  CtsOptions copt;
+  TimingOptions topt;
   int threads = 0;
   bool placeOnly = false, verbose = false;
   try {
@@ -72,6 +83,13 @@ int main(int argc, char** argv) {
       else if (a == "-strap_layer") sopt.layer = atoi(val().c_str());
       else if (a == "-strap_width") sopt.widthUm = atof(val().c_str());
       else if (a == "-strap_pitch") sopt.pitchUm = atof(val().c_str());
+      else if (a == "-no_cts") copt.on = false;
+      else if (a == "-cts_fanout") copt.fanout = atoi(val().c_str());
+      else if (a == "-cts_buf") copt.buf = val();
+      else if (a == "-clock") copt.clocks.push_back(val());
+      else if (a == "-lib") topt.libs.push_back(val());
+      else if (a == "-sdc") topt.sdc = val();
+      else if (a == "-no_timing_driven") topt.driven = false;
       else if (a == "-place_only") placeOnly = true;
       else if (a == "-def" || a == "-o") defOut = val();
       else if (a == "-netlist") netlistOut = val();
@@ -114,6 +132,8 @@ int main(int argc, char** argv) {
               << " ports, " << pool.threads() << " threads\n";
 
     auto t1 = clk::now();
+    Cts cts(db, copt);
+    popt.reserve = cts.plan();
     if (!floorplanDef.empty()) loadFloorplan(db, floorplanDef, ropt.minLayer);
     else floorplan(db, popt, ropt.minLayer);
     double cellArea = 0;
@@ -121,6 +141,42 @@ int main(int argc, char** argv) {
     {
       Placer pl(db, pool, popt);
       pl.globalPlace();
+    }
+    // Timing of the placement, and a second placement with the nets on
+    // the slow paths pulled short.
+    topt.minLayer = ropt.minLayer;
+    if (topt.libs.empty() != topt.sdc.empty()) throw std::runtime_error("timing needs both -lib and -sdc");
+    Timing timing(db, pool, topt);
+    auto showTiming = [&](const char* when) {
+      timing.annotate();
+      TimingResult r = timing.run();
+      if (!r.constrained) { printf("timing (%s): the SDC defines no clock\n", when); return r; }
+      printf("timing (%s): setup WNS %.3f ns, TNS %.3f ns, %d of %d endpoints violate; hold WNS %.3f ns, %d violate\n", when, r.wns, r.tns,
+             r.violations, r.endpoints, r.holdWns, r.holdViolations);
+      return r;
+    };
+    if (timing.on()) {
+      auto tt = clk::now();
+      timing.loadLibraries();
+      timing.build(false);
+      showTiming("global placement");
+      if (topt.driven) {
+        std::vector<double> w = timing.netWeights();
+        size_t heavy = 0;
+        for (double x : w) heavy += x > 1.0;
+        if (heavy) {
+          popt.netWeight = &w;
+          Placer pl(db, pool, popt);
+          pl.globalPlace();
+          popt.netWeight = nullptr;
+          printf("timing-driven placement: %zu nets weighted\n", heavy);
+        }
+      }
+      cts.build();
+      timing.build(true);
+      if (verbose) fprintf(stderr, "  timing %.2f s\n", secs(tt));
+    } else {
+      cts.build();
     }
     int64_t gpLen = db.hpwl();
     if (verbose) fprintf(stderr, "  global placement %.2f s\n", secs(t1));
@@ -144,6 +200,15 @@ int main(int argc, char** argv) {
            db.um(db.core.w()), db.um(db.core.h()), db.rows.size(), 100 * cellArea / (db.um(db.core.w()) * db.um(db.core.h())));
     printf("placement: wire length (half perimeter) %.1f um global, %.1f legal, %.1f refined (%d changes); mean move %.2f um; %d fillers; %.2f s\n",
            db.um(gpLen), db.um(lgLen), db.um(dpLen), swaps, db.um((int64_t)moved), fillers, placeSecs);
+    for (auto& t : cts.report())
+      printf("clock tree: %s: %d loads behind %d %s in %d level%s; driver to load %.1f to %.1f um of wire\n", t.net.c_str(), t.sinks, t.buffers,
+             cts.bufferCell()->name.c_str(), t.levels, t.levels == 1 ? "" : "s", db.um(t.minLen), db.um(t.maxLen));
+    TimingResult placedTiming;
+    if (timing.on()) {
+      TimingResult r = placedTiming = showTiming("placed");
+      for (auto& k : r.skew)
+        printf("  clock %s: arrives at %d clock pins between %.3f and %.3f ns (skew %.3f ns)\n", k.clock.c_str(), k.pins, k.early, k.late, k.late - k.early);
+    }
     if (straps) printf("power: %d straps over the rails\n", straps);
     else if (sopt.on && !noStraps.empty()) printf("power: no straps: %s\n", noStraps.c_str());
 
@@ -175,7 +240,9 @@ int main(int argc, char** argv) {
     if (!gdsOut.empty()) writeGds(db.tech, out, gdsOut, gopt);
     if (!reportOut.empty()) {
       std::ofstream r(reportOut);
-      r << "{\n  \"design\": \"" << db.top << "\",\n  \"cells\": " << db.insts.size() - fillers << ",\n  \"fillers\": " << fillers
+      r << "{\n  \"design\": \"" << db.top << "\",\n  \"cells\": " << db.insts.size() - fillers << ",\n  \"fillers\": " << fillers << ",\n  \"clock_buffers\": " << cts.buffers()
+        << (timing.on() ? ",\n  \"setup_wns_ns\": " + std::to_string(placedTiming.wns) + ",\n  \"setup_tns_ns\": " + std::to_string(placedTiming.tns) +
+                              ",\n  \"setup_violations\": " + std::to_string(placedTiming.violations) + ",\n  \"hold_wns_ns\": " + std::to_string(placedTiming.holdWns) : std::string())
         << ",\n  \"nets\": " << db.nets.size() << ",\n  \"die_um\": [" << db.um(db.die.w()) << ", " << db.um(db.die.h()) << "]"
         << ",\n  \"utilization\": " << cellArea / (db.um(db.core.w()) * db.um(db.core.h()))
         << ",\n  \"hpwl_um\": " << db.um(dpLen) << ",\n  \"routed_nets\": " << rr.nets << ",\n  \"wire_length_um\": " << db.um(rr.wireLength)

@@ -532,6 +532,7 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `unused`, `connect` | `UNU001`..`UNU005`, `CON001`..`CON004` | never read, never driven, floating inputs, positional connections, implicit nets |
 | `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
 | `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
+| `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
 | `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
@@ -605,7 +606,7 @@ Tcl shell whose commands follow dc_shell:
 
 ```sh
 msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
-msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the built-in generic library
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the mini45 library
 msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
 ```
 
@@ -614,8 +615,8 @@ See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
 ### FPGA synthesis: `mfpga`
 
 `mfpga` maps RTL (through the same elaborator as `msynth`) or an AIGER graph
-to the LUTs and flip-flops of an FPGA family (iCE40, ECP5, Xilinx 7-series,
-generic) and writes Yosys JSON for nextpnr or EDIF.
+to the LUTs, carry chains and flip-flops of an FPGA family (iCE40, ECP5,
+Xilinx 7-series, generic) and writes Yosys JSON for nextpnr or EDIF.
 
 ```sh
 mfpga rtl/*.sv -top core -family ice40 -o core.json   # then: nextpnr-ice40 --json core.json ...

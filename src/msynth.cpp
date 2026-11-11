@@ -7,7 +7,7 @@
 //
 // A script reads like a Design Compiler script:
 //
-//   set target_library my.lib            ;# Liberty; none: the built-in generic library
+//   set target_library my.lib            ;# Liberty; none: mini45 (lib/mini45)
 //   analyze -format sverilog {a.sv b.sv}
 //   elaborate top
 //   create_clock -period 2.0 [get_ports clk]
@@ -34,10 +34,11 @@
 #include "slang/driver/Driver.h"
 
 #include "aig_elab.hpp"
+#include "gnetlist.hpp"
 #include "synth/map.hpp"
 #include "synth/sta.hpp"
+#include "sdc.hpp"
 #include "tcl.hpp"
-#include "msynth_generic_lib.hpp"
 #include "version.hpp"
 
 using namespace synth;
@@ -93,8 +94,61 @@ std::string verilogExpr(const liberty::Expr& e, const std::map<std::string, std:
     return "1'b0";
 }
 
+// The elaborated design as the shared SDC reader sees it: port bits and
+// flops, by name.
+struct SdcView : sdc::Design {
+    std::vector<std::string> ports, cells, regs, none;
+    std::unordered_map<std::string, int> dir;
+    std::unordered_set<std::string> seq;
+    void build(const aig::Design& d) {
+        ports.clear();
+        cells.clear();
+        dir.clear();
+        for (auto& p : d.ports)
+            for (size_t i = 0; i < p.bits.size(); i++) {
+                ports.push_back(bitName(p.name, p.msb, p.lsb, i, p.bits.size()));
+                dir[ports.back()] = p.out ? 1 : 0;
+            }
+        for (auto& f : d.g.flops) cells.push_back(f.name);
+        regs = cells;
+    }
+    // After compile the cells are the netlist's instances.
+    void mapped(const Netlist& nl) {
+        cells.clear();
+        regs.clear();
+        for (auto& i : nl.insts) {
+            cells.push_back(i.name);
+            if (i.seq) regs.push_back(i.name);
+        }
+        seq.clear();
+        seq.insert(regs.begin(), regs.end());
+    }
+    const std::vector<std::string>& names(sdc::Kind k) const override {
+        return k == sdc::Kind::Port ? ports : k == sdc::Kind::Cell ? cells : none;
+    }
+    int portDir(const std::string& n) const override {
+        auto it = dir.find(n);
+        return it == dir.end() ? -1 : it->second;
+    }
+    sdc::ObjList registers(const sdc::RegQuery& q) const override {
+        sdc::ObjList o;
+        if (q.cells && q.edgeTriggered)
+            for (auto& c : regs) o.push_back({sdc::Kind::Cell, c, true});
+        return o;
+    }
+    std::optional<std::string> attribute(const sdc::Obj& o, const std::string& a) const override {
+        if (o.kind == sdc::Kind::Port && a == "direction") return portDir(o.name) == 1 ? "out" : "in";
+        if (o.kind == sdc::Kind::Cell && a == "is_sequential") return seq.empty() || seq.count(o.name) ? "true" : "false";
+        return std::nullopt;
+    }
+};
+
 struct Shell {
-    tcl::Interp in;
+    // The interpreter is the shared SDC reader (src/sdc.hpp): every SDC
+    // command and object query is its own; msynth adds the synthesis commands.
+    sdc::Reader in;
+    SdcView view;
+    size_t digested = 0;   // SDC commands already folded into `sdc`
     std::vector<std::string> files, defines, incdirs;
     std::optional<Design> des;
     std::optional<Netlist> nl;
@@ -129,12 +183,31 @@ struct Shell {
     }
 
     // ---------------------------------------------------------- library
+    // mini45 (typical corner), the default target: $MINISIM_MINI45, else next
+    // to an installed msynth, else in the source tree this msynth was built from.
+    static std::string defaultLib() {
+        namespace fs = std::filesystem;
+        const char* file = "mini45_tt.lib";
+        std::error_code ec;
+        if (const char* e = std::getenv("MINISIM_MINI45")) return (fs::path(e) / file).string();
+        auto exe = fs::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            auto inst = exe.parent_path().parent_path() / "share" / "minisim" / "lib" / "mini45" / file;
+            if (fs::exists(inst, ec)) return inst.string();
+        }
+        auto src = fs::path(MSYNTH_ROOT_DIR) / "lib" / "mini45" / file;
+        if (fs::exists(src, ec)) return src.string();
+        throw tcl::Error("the default library mini45_tt.lib was not found; set target_library, or MINISIM_MINI45 to the directory that holds it");
+    }
     void loadLibs(const std::vector<std::string>& paths) {
         lib.libs.clear();
         for (auto& p : paths) {
             if (p == "<generic>") {
-                lib.libs.push_back(std::make_shared<liberty::Library>(
-                    liberty::Library::load(liberty::parse(kGenericLib, "msynth_generic.lib"), "msynth_generic.lib")));
+                try {
+                    lib.libs.push_back(std::make_shared<liberty::Library>(liberty::load(defaultLib())));
+                } catch (liberty::Error& e) {
+                    throw tcl::Error(e.what());
+                }
                 continue;
             }
             if (p.size() > 3 && p.compare(p.size() - 3, 3, ".db") == 0)
@@ -159,36 +232,11 @@ struct Shell {
         if (want.empty()) want.push_back("<generic>");
         if (want != libFiles || lib.libs.empty()) {
             loadLibs(want);
-            if (want[0] == "<generic>") out("Information: no target library set; using the built-in generic library (msynth_generic).\n");
+            if (want[0] == "<generic>") out("Information: no target library set; using the mini45 library (mini45_tt).\n");
         }
     }
 
     // ---------------------------------------------------------- ports
-    std::vector<std::string> portNames(int dir /*0 in, 1 out, 2 both*/) {
-        std::vector<std::string> r;
-        if (!des) throw tcl::Error("no design; run elaborate first");
-        for (auto& p : des->ports)
-            if (dir == 2 || (int)p.out == dir) r.push_back(p.name);
-        return r;
-    }
-    // Port names, bit names and patterns to port bit names.
-    std::vector<std::string> portBits(const std::vector<std::string>& names) {
-        std::vector<std::string> r;
-        if (!des) throw tcl::Error("no design; run elaborate first");
-        for (auto& n : names) {
-            bool hit = false;
-            for (auto& p : des->ports)
-                for (size_t i = 0; i < p.bits.size(); i++) {
-                    std::string bn = bitName(p.name, p.msb, p.lsb, i, p.bits.size());
-                    if (glob(n.c_str(), p.name.c_str()) || glob(n.c_str(), bn.c_str())) {
-                        r.push_back(bn);
-                        hit = true;
-                    }
-                }
-            if (!hit) out("Warning: no port matches '" + n + "'.\n");
-        }
-        return r;
-    }
     std::vector<std::string> flatten(const std::vector<std::string>& pos, size_t from = 0) {
         std::vector<std::string> r;
         for (size_t i = from; i < pos.size(); i++)
@@ -224,7 +272,10 @@ struct Shell {
         }
         nl.reset();
         tim.reset();
-        sdc = Constraints{};
+        view.build(*des);
+        in.design = &view;
+        in.designChanged();
+        digested = (size_t)-1;
         for (auto& w : des->warnings) out("Warning: " + w + "\n");
         size_t ands = 0;
         for (auto& n : des->g.nodes) ands += n.k == NK::And;
@@ -239,6 +290,7 @@ struct Shell {
     void compile(bool forceDelay) {
         if (!des) throw tcl::Error("no design; run elaborate first");
         needLib();
+        digest();
         auto t0 = std::chrono::steady_clock::now();
         try {
             Netlist a = Mapper(*des, lib, false).run();
@@ -258,6 +310,8 @@ struct Shell {
             }
             nl = std::move(a);
             tim = std::move(ta);
+            view.mapped(*nl);
+            in.designChanged();
         } catch (MapError& e) {
             throw tcl::Error(e.what());
         }
@@ -269,12 +323,61 @@ struct Shell {
             outf(" (%.2fs, %d threads).\n", dt, threads());
         }
     }
+    // What msynth's timing estimate uses of the constraints read so far:
+    // the clocks on ports, max I/O delays, port loads, clock uncertainty,
+    // input transition, max area and max fanout. A port object without a
+    // design behind it (constraints given before elaborate) is a pattern.
+    std::vector<std::string> portsOf(const sdc::ObjList& objs) {
+        std::vector<std::string> r;
+        for (auto& o : objs) {
+            if (o.kind != sdc::Kind::Port) continue;
+            if (o.resolved) { r.push_back(o.name); continue; }
+            for (auto& p : view.ports)
+                if (tcl::globMatch(o.name.c_str(), p.c_str(), true)) r.push_back(p);
+        }
+        return r;
+    }
+    bool digest() {
+        const sdc::Constraints& c = in.sdc;
+        if (digested == c.commands.size()) return false;
+        digested = c.commands.size();
+        Constraints n;
+        std::set<std::string> said;
+        auto note = [&](const std::string& m) {
+            if (noted.insert(m).second) out("Information: " + m + "\n");
+        };
+        for (auto& ck : c.clocks) {
+            if (ck.generated) { note("generated clock '" + ck.name + "' is not used by msynth's timing estimate."); continue; }
+            Constraints::Clock k;
+            k.name = ck.name;
+            k.period = ck.period;
+            k.ports = portsOf(ck.sources);
+            bool replaced = false;
+            for (auto& o : n.clocks)
+                if (o.name == k.name) { o = k; replaced = true; }
+            if (!replaced) n.clocks.push_back(k);
+        }
+        if (n.clocks.size() > 1)
+            note("msynth times every flop against the first clock ('" + n.clocks[0].name + "'); the other clocks only mark their ports as clocks.");
+        for (auto& d : c.ioDelays) {
+            if (d.min && !d.max) continue;   // hold side: not part of a setup estimate
+            for (auto& p : portsOf(d.ports)) (d.input ? n.inputDelay : n.outputDelay)[p] = d.value;
+        }
+        for (auto* cmd : c.of("set_load"))
+            for (auto& p : portsOf(cmd->objs("objects"))) n.load[p] = cmd->num("value");
+        for (auto& u : c.uncertainties)
+            if (!u.hold || u.setup) n.uncertainty = u.value;
+        for (auto* cmd : c.of("set_input_transition")) n.inputSlew = cmd->num("transition");
+        for (auto* cmd : c.of("set_max_area")) n.maxArea = cmd->num("value");
+        for (auto* cmd : c.of("set_max_fanout")) n.maxFanout = std::max(2, (int)cmd->num("value"));
+        if (!c.exceptions.empty()) note("timing exceptions (false paths, multicycle paths, max/min delays) are kept for write_sdc but not used by msynth's timing estimate.");
+        sdc = std::move(n);
+        return true;
+    }
+    std::set<std::string> noted;
     void needNetlist() {
         if (!nl) throw tcl::Error("the design is not mapped; run compile first");
-        if (!tim) tim = analyze(*nl, sdc);
-    }
-    void retime() {
-        if (nl) tim = analyze(*nl, sdc);
+        if (digest() || !tim) tim = analyze(*nl, sdc);
     }
 
     // ---------------------------------------------------------- reports
@@ -403,54 +506,70 @@ struct Shell {
     }
 
     // ---------------------------------------------------------- writers
-    static bool isBit(const std::string& n) { return n.find('[') != std::string::npos; }
-    std::string netRef(int id) const { return nl->nets[id]; }
-    void writeVerilog(const std::string& path) {
-        needNetlist();
-        std::ofstream f(path);
-        if (!f) throw tcl::Error("cannot write " + path);
-        f << "// Generated by msynth " << MINISIM_VERSION << "\n// Design: " << nl->top << "\n\n";
-        f << "module " << nl->top << " (";
-        for (size_t i = 0; i < nl->ports.size(); i++) f << (i ? ", " : "") << nl->ports[i].name;
-        f << ");\n";
+    // The mapped netlist as a gnl::Module, so that the shared structural
+    // netlist writer (src/gnetlist.hpp) is the only one in the tree.
+    gnl::Module toModule() const {
+        gnl::Module m;
+        m.name = nl->top;
         std::set<std::string> portNames;
         for (auto& p : nl->ports) {
             portNames.insert(p.name);
-            f << "  " << (p.out ? "output" : "input");
-            if (p.nets.size() > 1 || p.msb != 0 || p.lsb != 0) f << " [" << p.msb << ":" << p.lsb << "]";
-            f << " " << p.name << ";\n";
+            m.portOrder.push_back(p.name);
+            gnl::Decl& d = m.decl(p.name);
+            d.isPort = true;
+            d.dir = p.out ? gnl::Dir::Out : gnl::Dir::In;
+            d.ranged = p.nets.size() > 1 || p.msb != 0 || p.lsb != 0;
+            d.msb = p.msb;
+            d.lsb = p.lsb;
         }
+        auto ref = [&](const std::string& name) {
+            gnl::Ref r;
+            if (name == "1'b0" || name == "1'b1") {
+                r.kind = gnl::Ref::Const;
+                r.bits = {(uint8_t)(name[3] - '0')};
+                return r;
+            }
+            size_t br = name.rfind('[');
+            if (br != std::string::npos && name.back() == ']' && portNames.count(name.substr(0, br))) {
+                r.kind = gnl::Ref::Bit;
+                r.name = name.substr(0, br);
+                r.msb = r.lsb = std::atoi(name.c_str() + br + 1);
+                return r;
+            }
+            r.kind = gnl::Ref::Net;
+            r.name = name;
+            return r;
+        };
         std::vector<uint8_t> used(nl->nets.size(), 0);
         for (auto& i : nl->insts)
             for (int n : i.pins)
                 if (n >= 0) used[n] = 1;
         for (auto& [bn, id] : nl->assigns) used[id] = 1;
-        size_t col = 0;
-        bool any = false;
-        for (size_t n = 2; n < nl->nets.size(); n++) {
-            const std::string& name = nl->nets[n];
-            if (!used[n] || isBit(name) || portNames.count(name)) continue;
-            if (!any) { f << "  wire "; col = 7; any = true; }
-            else if (col + name.size() > 96) { f << ",\n       "; col = 7; }
-            else { f << ", "; col += 2; }
-            f << name;
-            col += name.size();
-        }
-        if (any) f << ";\n";
-        f << "\n";
+        for (size_t n = 2; n < nl->nets.size(); n++)
+            if (used[n] && ref(nl->nets[n]).kind == gnl::Ref::Net && !portNames.count(nl->nets[n])) m.decl(nl->nets[n]);
         for (auto& i : nl->insts) {
-            f << "  " << i.cell->name << " " << i.name << " (";
-            bool first = true;
+            gnl::Inst gi;
+            gi.cell = i.cell->name;
+            gi.name = i.name;
             for (size_t p = 0; p < i.pins.size(); p++) {
                 // an unused output is written as .QN() so that simulators do not warn
                 if (i.pins[p] < 0 && i.cell->pins[p].dir != liberty::Dir::Out) continue;
-                f << (first ? "" : ", ") << "." << i.cell->pins[p].name << "(" << (i.pins[p] < 0 ? "" : netRef(i.pins[p])) << ")";
-                first = false;
+                gnl::Conn c;
+                c.port = i.cell->pins[p].name;
+                if (i.pins[p] >= 0) c.refs.push_back(ref(nl->nets[i.pins[p]]));
+                gi.conns.push_back(std::move(c));
             }
-            f << ");\n";
+            m.insts.push_back(std::move(gi));
         }
-        for (auto& [bn, id] : nl->assigns) f << "  assign " << bn << " = " << netRef(id) << ";\n";
-        f << "endmodule\n";
+        for (auto& [bn, id] : nl->assigns) m.assigns.push_back({{ref(bn)}, {ref(nl->nets[id])}});
+        return m;
+    }
+    void writeVerilog(const std::string& path) {
+        needNetlist();
+        std::ofstream f(path);
+        if (!f) throw tcl::Error("cannot write " + path);
+        f << "// Generated by msynth " << MINISIM_VERSION << "\n// Design: " << nl->top << "\n\n";
+        gnl::write(toModule(), f);
     }
 
     // Verilog simulation models of the library's cells, from their Liberty functions.
@@ -497,7 +616,7 @@ struct Shell {
                             body += std::string("    ") + (body.empty() ? "" : "else ") + "if (" + (neg ? "!" : "") + v + ") IQ__ <= 1'b" + (k == 0 ? "0" : "1") + ";\n";
                         }
                         m << ")\n" << body << "    " << (body.empty() ? "" : "else ") << "IQ__ <= "
-                          << verilogExpr(liberty::parseFunction(ff.nextState), {}) << ";\n";
+                          << verilogExpr(liberty::parseFunction(ff.nextState), ren) << ";\n";
                     }
                     for (auto* p : outs) {
                         if (!p->hasFunction() || !p->threeState.empty()) throw liberty::Error("no function");
@@ -511,20 +630,36 @@ struct Shell {
             }
     }
 
+    // The constraints as read, one command per line, objects by name.
     void writeSdc(const std::string& path) {
         std::ofstream f(path);
         if (!f) throw tcl::Error("cannot write " + path);
         f << "# Written by msynth " << MINISIM_VERSION << "\n";
-        for (auto& c : sdc.clocks) {
-            f << "create_clock -name " << c.name << " -period " << c.period;
-            if (!c.ports.empty()) f << " [get_ports {" << tcl::joinList(c.ports) << "}]";
+        auto objs = [](const sdc::ObjList& l) {
+            std::map<sdc::Kind, std::vector<std::string>> by;
+            for (auto& o : l) by[o.kind].push_back(o.name);
+            std::string r;
+            for (auto& [k, names] : by) {
+                const char* get = k == sdc::Kind::Port ? "get_ports" : k == sdc::Kind::Pin ? "get_pins" : k == sdc::Kind::Cell ? "get_cells"
+                                : k == sdc::Kind::Net ? "get_nets" : k == sdc::Kind::Clock ? "get_clocks" : "get_lib_cells";
+                r += std::string(r.empty() ? "" : " ") + "[" + get + " {" + tcl::joinList(names) + "}]";
+            }
+            return by.size() > 1 ? "[list " + r + "]" : r;
+        };
+        for (auto& c : in.sdc.commands) {
+            f << c.name;
+            for (auto& a : c.args) {
+                bool opt = !a.opt.empty() && a.opt[0] == '-';
+                if (opt) f << " " << a.opt;
+                if (!a.objs.empty()) {
+                    // -clock takes a clock by name; everything else a collection
+                    if (opt && a.objs.size() == 1 && a.objs[0].kind == sdc::Kind::Clock) f << " " << a.objs[0].name;
+                    else f << " " << objs(a.objs);
+                }
+                else if (!opt || !a.s.empty()) f << " " << tcl::joinList({a.s});
+            }
             f << "\n";
         }
-        std::string ck = sdc.clock() ? " -clock " + sdc.clock()->name : "";
-        if (sdc.uncertainty != 0) f << "set_clock_uncertainty " << sdc.uncertainty << " [all_clocks]\n";
-        for (auto& [p, v] : sdc.inputDelay) f << "set_input_delay " << v << ck << " [get_ports {" << p << "}]\n";
-        for (auto& [p, v] : sdc.outputDelay) f << "set_output_delay " << v << ck << " [get_ports {" << p << "}]\n";
-        for (auto& [p, v] : sdc.load) f << "set_load " << v << " [get_ports {" << p << "}]\n";
     }
 
     // ---------------------------------------------------------- commands
@@ -634,147 +769,22 @@ struct Shell {
             return std::string("1");
         });
 
-        // ---- object queries: lists of names
-        cmd("get_ports", "get_ports {patterns}: port names", [this](Words& w) {
-            Args a = parseArgs(w, {"-filter", "-of_objects"});
-            std::vector<std::string> r;
-            auto pats = flatten(a.pos);
-            if (pats.empty()) pats.push_back("*");
-            for (auto& pat : pats) {
-                bool hit = false;
-                for (auto& p : des ? des->ports : std::vector<Port>{}) {
-                    if (glob(pat.c_str(), p.name.c_str())) { r.push_back(p.name); hit = true; continue; }
-                    for (size_t i = 0; i < p.bits.size(); i++) {
-                        std::string bn = bitName(p.name, p.msb, p.lsb, i, p.bits.size());
-                        if (bn != p.name && glob(pat.c_str(), bn.c_str())) { r.push_back(bn); hit = true; }
-                    }
-                }
-                if (!hit && !a.has("-quiet")) out("Warning: no port matches '" + pat + "'.\n");
-            }
-            return tcl::joinList(r);
-        });
-        cmd("all_inputs", "all_inputs: the input ports", [this](Words&) { return tcl::joinList(portNames(0)); });
-        cmd("all_outputs", "all_outputs: the output ports", [this](Words&) { return tcl::joinList(portNames(1)); });
-        cmd("get_clocks", "get_clocks {patterns}: clock names", [this](Words& w) {
-            Args a = parseArgs(w, {});
-            std::vector<std::string> r;
-            auto pats = flatten(a.pos);
-            if (pats.empty()) pats.push_back("*");
-            for (auto& c : sdc.clocks)
-                for (auto& p : pats)
-                    if (glob(p.c_str(), c.name.c_str())) { r.push_back(c.name); break; }
-            return tcl::joinList(r);
-        });
-        cmd("all_clocks", "all_clocks: the clocks", [this](Words&) {
-            std::vector<std::string> r;
-            for (auto& c : sdc.clocks) r.push_back(c.name);
-            return tcl::joinList(r);
-        });
-        cmd("get_cells", "get_cells {patterns}: cell instance names of the mapped design", [this](Words& w) {
-            Args a = parseArgs(w, {"-filter", "-of_objects"});
-            std::vector<std::string> r;
-            auto pats = flatten(a.pos);
-            if (pats.empty()) pats.push_back("*");
-            if (nl)
-                for (auto& i : nl->insts)
-                    for (auto& p : pats)
-                        if (glob(p.c_str(), i.name.c_str())) { r.push_back(i.name); break; }
-            return tcl::joinList(r);
-        });
-        cmd("all_registers", "all_registers: the flop instances of the mapped design", [this](Words&) {
-            std::vector<std::string> r;
-            if (nl) {
-                for (auto& i : nl->insts)
-                    if (i.seq) r.push_back(i.name);
-            } else if (des)
-                for (auto& f : des->g.flops) r.push_back(f.name);
-            return tcl::joinList(r);
-        });
-        cmd("remove_from_collection", "remove_from_collection a b: the names of a that are not in b", [](Words& w) {
-            if (w.size() != 3) throw tcl::Error("remove_from_collection: two lists expected");
-            auto b = tcl::splitList(w[2]);
-            std::vector<std::string> r;
-            for (auto& e : tcl::splitList(w[1]))
-                if (std::find(b.begin(), b.end(), e) == b.end()) r.push_back(e);
-            return tcl::joinList(r);
-        });
-        cmd("sizeof_collection", "sizeof_collection list: the number of names", [](Words& w) {
-            return std::to_string(w.size() > 1 ? tcl::splitList(w[1]).size() : 0);
-        });
-
-        // ---- constraints
-        cmd("create_clock", "create_clock -period P [-name N] [ports]: the clock the design is timed against", [this](Words& w) {
-            Args a = parseArgs(w, {"-period", "-name", "-waveform"});
-            if (!a.has("-period")) throw tcl::Error("create_clock: -period is required");
-            Constraints::Clock c;
-            c.period = num(a.get("-period"), "create_clock -period");
-            if (c.period <= 0) throw tcl::Error("create_clock: the period must be positive");
-            auto names = flatten(a.pos);
-            if (!names.empty()) c.ports = portBits(names);
-            c.name = a.get("-name", names.empty() ? "clk" : names[0]);
-            for (auto& o : sdc.clocks)
-                if (o.name == c.name) { o = c; retime(); return std::string("1"); }
-            if (!sdc.clocks.empty()) out("Warning: msynth times every flop against the first clock ('" + sdc.clocks[0].name + "'); '" + c.name + "' only marks its port as a clock.\n");
-            sdc.clocks.push_back(c);
-            retime();
-            return std::string("1");
-        });
-        auto ioDelay = [this](Words& w, bool input) {
-            Args a = parseArgs(w, {"-clock", "-reference_pin"});
-            if (a.pos.empty()) throw tcl::Error(w[0] + ": a delay value is expected");
-            double v = num(a.pos[0], w[0].c_str());
-            auto& tab = input ? sdc.inputDelay : sdc.outputDelay;
-            if (a.pos.size() < 2) (input ? sdc.defInputDelay : sdc.defOutputDelay) = v;
-            else
-                for (auto& b : portBits(flatten(a.pos, 1))) tab[b] = v;
-            retime();
-            return std::string("1");
-        };
-        cmd("set_input_delay", "set_input_delay D [-clock C] ports: arrival time of inputs after the clock edge", [ioDelay](Words& w) { return ioDelay(w, true); });
-        cmd("set_output_delay", "set_output_delay D [-clock C] ports: time outputs need before the next clock edge", [ioDelay](Words& w) { return ioDelay(w, false); });
-        cmd("set_load", "set_load C ports: capacitance on output ports", [this](Words& w) {
-            Args a = parseArgs(w, {});
-            if (a.pos.empty()) throw tcl::Error("set_load: a capacitance is expected");
-            double v = num(a.pos[0], "set_load");
-            if (a.pos.size() < 2) sdc.defLoad = v;
-            else
-                for (auto& b : portBits(flatten(a.pos, 1))) sdc.load[b] = v;
-            retime();
-            return std::string("1");
-        });
-        cmd("set_clock_uncertainty", "set_clock_uncertainty U [clocks]: margin taken off every path", [this](Words& w) {
-            Args a = parseArgs(w, {"-from", "-to"});
-            if (a.pos.empty()) throw tcl::Error("set_clock_uncertainty: a value is expected");
-            sdc.uncertainty = num(a.pos[0], "set_clock_uncertainty");
-            retime();
-            return std::string("1");
-        });
-        cmd("set_input_transition", "set_input_transition T [ports]: slew of the inputs", [this](Words& w) {
-            Args a = parseArgs(w, {});
-            if (a.pos.empty()) throw tcl::Error("set_input_transition: a value is expected");
-            sdc.inputSlew = num(a.pos[0], "set_input_transition");
-            retime();
-            return std::string("1");
-        });
-        cmd("set_max_area", "set_max_area A: the area goal (msynth always minimizes area within timing)", [this](Words& w) {
-            if (w.size() > 1) sdc.maxArea = num(w[1], "set_max_area");
-            return std::string("1");
-        });
-        cmd("set_max_fanout", "set_max_fanout N [design]: nets with more loads get a buffer tree (default 12)", [this](Words& w) {
-            Args a = parseArgs(w, {});
-            if (a.pos.empty()) throw tcl::Error("set_max_fanout: a number is expected");
-            sdc.maxFanout = std::max(2, (int)num(a.pos[0], "set_max_fanout"));
+        // Object queries (get_ports, all_inputs, ...) and the SDC constraints
+        // are the reader's own commands.
+        cmd("read_sdc", "read_sdc file: read constraints (SDC); every SDC command can also be typed directly", [this](Words& w) {
+            Args a = parseArgs(w, {"-version"});
+            if (a.pos.size() != 1) throw tcl::Error("read_sdc: a file is expected");
+            std::string f = findFile(a.pos[0]);
+            if (!std::filesystem::exists(f)) throw tcl::Error("cannot open file '" + a.pos[0] + "'");
+            in.load(f);
             return std::string("1");
         });
         // Accepted so that existing scripts run; they do not change msynth's result.
-        for (const char* n : {"link", "uniquify", "ungroup", "set_fix_multiple_port_nets", "set_wire_load_model",
-                              "set_wire_load_mode", "set_operating_conditions", "set_driving_cell",
-                              "set_max_transition", "set_max_capacitance", "set_false_path", "set_multicycle_path",
-                              "set_max_delay", "set_min_delay", "set_dont_touch", "set_dont_touch_network",
-                              "set_ideal_network", "set_clock_latency", "set_clock_transition", "set_flatten",
+        for (const char* n : {"link", "uniquify", "ungroup", "set_fix_multiple_port_nets", "set_dont_touch", "set_dont_touch_network",
+                              "set_flatten",
                               "set_structure", "define_design_lib", "change_names", "set_svf", "check_library",
-                              "set_clock_groups", "set_case_analysis", "group_path", "set_critical_range",
-                              "set_cost_priority", "set_drive", "set_propagated_clock", "define_name_rules",
+                              "set_critical_range",
+                              "set_cost_priority", "define_name_rules",
                               "remove_unconnected_ports", "set_clock_gating_style", "suppress_message",
                               "set_auto_disable_drc_nets", "set_boundary_optimization", "saif_map", "set_leakage_optimization",
                               "set_dynamic_optimization", "set_register_merging", "set_optimize_registers"}) {
@@ -806,6 +816,24 @@ struct Shell {
             for (auto& n : des->g.nodes) ands += n.k == NK::And;
             outf("Design '%s': %zu ports, %zu flops, %zu AND nodes, %zu warnings.\n", des->top.c_str(), des->ports.size(), des->g.flops.size(), ands, des->warnings.size());
             return std::string("1");
+        });
+
+        cmd("report_resources", "report_resources: the word-level operators of the design (adders, multipliers, comparators, shifters) and flops with an enable", [this](Words&) {
+            if (!des) throw tcl::Error("no design; run elaborate first");
+            header("resources");
+            static const char* names[] = {"add", "sub", "mult", "less-than", "equal", "shift-left", "shift-right", "arith-shift-right"};
+            std::map<std::pair<int, size_t>, int> count;
+            for (auto& op : des->ops) count[{(int)op.kind, op.a.size()}]++;
+            outf("%-20s %8s %8s\n", "Operator", "Width", "Count");
+            out(std::string(38, '-') + "\n");
+            for (auto& [k, n] : count) outf("%-20s %8zu %8d\n", names[k.first], k.second, n);
+            size_t en = 0;
+            for (auto& f : des->g.flops) {
+                Lit e, d;
+                en += flopEnable(des->g, f, e, d);
+            }
+            outf("\nFlip-flops: %zu, of which %zu load under an enable.\n", des->g.flops.size(), en);
+            return std::string();
         });
 
         // ---- reports

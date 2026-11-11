@@ -341,12 +341,68 @@ struct Graph {
 
 // ------------------------------------------------------------ the design
 
+// A word-level operator as the RTL had it, kept beside the bits it was
+// built into: y = a op b. A tool that has a better implementation of the
+// operator (a carry chain, a DSP block, a datapath cell) cuts the graph at
+// y and drives it from a and b itself. Listed in creation order.
+struct WordOp {
+    enum Kind { Add, Sub, Mul, Lt, Eq, Shl, Shr, Sshr } kind = Add;
+    Bits a, b, y;         // LSB first; Lt and Eq have a one-bit y
+    bool sgn = false;     // Lt: signed compare; Mul: operands were sign-extended
+};
+
 struct Design {
     std::string top;
     Graph g;
     std::vector<Port> ports;
     std::vector<std::string> warnings;
+    std::vector<WordOp> ops;
 };
+
+// d = en ? data : q, for a flop whose next state holds unless `en`. False
+// when the D logic is not of that shape.
+inline bool flopEnable(const Graph& g, const Flop& f, Lit& en, Lit& data) {
+    // mux(s, t, e) is built as !(!(s & t) & !(!s & e))
+    if (!lisneg(f.d)) return false;
+    const Node& o = g.at(f.d);
+    if (o.k != NK::And || !lisneg(o.a) || !lisneg(o.b)) return false;
+    const Node& x = g.at(o.a);
+    const Node& y = g.at(o.b);
+    if (x.k != NK::And || y.k != NK::And) return false;
+    for (int swap = 0; swap < 2; swap++) {
+        const Node& hold = swap ? x : y;
+        const Node& load = swap ? y : x;
+        for (int hs = 0; hs < 2; hs++) {
+            Lit hq = hs ? hold.b : hold.a, hc = hs ? hold.a : hold.b;   // hold = hc & q
+            if (hq != f.q) continue;
+            for (int ls = 0; ls < 2; ls++) {
+                Lit lc = ls ? load.b : load.a, ld = ls ? load.a : load.b;   // load = lc & data
+                if (lc == lneg(hc)) {
+                    en = lc;
+                    data = ld;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+// d = rst ? value : data, a synchronous set or reset in front of the D logic.
+inline bool flopSyncReset(const Graph& g, Lit d, Lit& rst, bool& value, Lit& data) {
+    const Node& n = g.at(d);
+    if (n.k != NK::And) return false;
+    // reset to 0: d = !rst & data. set to 1: d = !(!rst & !data).
+    value = lisneg(d);
+    for (int s = 0; s < 2; s++) {
+        Lit c = s ? n.b : n.a, o = s ? n.a : n.b;
+        const Node& cn = g.at(c);
+        if (cn.k == NK::And) continue;   // the control is a signal, not logic
+        rst = lneg(c);
+        data = lxorc(o, value);
+        return true;
+    }
+    return false;
+}
 
 // Rebuild into a clean graph: wires resolved, constants propagated, logic
 // that reaches no output or flop dropped, combinational loops reported.
@@ -422,6 +478,38 @@ inline Design cleanup(const Design& in) {
             if (f.arst == L0) f.arst = NOLIT;
         }
     }
+    // Word operators survive when all of their bits are still in the graph.
+    {
+        auto get = [&](Lit l, Lit& o) {
+            uint32_t n = lnode(l);
+            if (map[n] == NOLIT && g.nodes[n].k == NK::Wire && state[n] == 0) {
+                // a wire nothing reached: resolve it if its driver was built
+                uint32_t c = n;
+                int hops = 0;
+                bool neg = false;
+                while (g.nodes[c].k == NK::Wire && g.nodes[c].a != NOLIT && map[c] == NOLIT && hops++ < 64) {
+                    neg ^= lisneg(g.nodes[c].a);
+                    c = lnode(g.nodes[c].a);
+                }
+                if (map[c] == NOLIT) return false;
+                o = lxorc(map[c], neg ^ lisneg(l));
+                return true;
+            }
+            if (map[n] == NOLIT) return false;
+            o = lxorc(map[n], lisneg(l));
+            return true;
+        };
+        for (const WordOp& op : in.ops) {
+            WordOp no = op;
+            bool ok = true;
+            for (Bits* v : {&no.a, &no.b, &no.y})
+                for (Lit& l : *v)
+                    if (ok && !get(l, l)) ok = false;
+            bool anyLogic = false;
+            for (Lit l : no.y) anyLogic |= l > 1;
+            if (ok && anyLogic) out.ops.push_back(std::move(no));
+        }
+    }
     return out;
 }
 
@@ -455,6 +543,108 @@ inline std::vector<uint8_t> liveNodes(const Design& d) {
         break;
     }
     return live;
+}
+
+// ---- cone copies (used by the equivalence checker)
+//
+// rebuild: copy the cone of `root` with some nodes replaced. memo[n] is the
+// literal that stands for node n (NOLIT: not visited yet). Seed it with the
+// substitutions; it must be sized to at least lnode(root)+1. Nodes this call
+// creates are appended past that and never revisited. Only And nodes are
+// followed; every other kind stands for itself.
+inline Lit rebuild(Graph& g, Lit root, std::vector<Lit>& memo) {
+    uint32_t rn = lnode(root);
+    if (rn == 0) return root;
+    std::vector<uint32_t> st{rn};
+    while (!st.empty()) {
+        uint32_t n = st.back();
+        if (memo[n] != NOLIT) { st.pop_back(); continue; }
+        Node nd = g.nodes[n];
+        if (nd.k != NK::And) { memo[n] = mklit(n); st.pop_back(); continue; }
+        uint32_t na = lnode(nd.a), nb = lnode(nd.b);
+        bool ready = true;
+        if (na && memo[na] == NOLIT) { st.push_back(na); ready = false; }
+        if (nb && memo[nb] == NOLIT) { st.push_back(nb); ready = false; }
+        if (!ready) continue;
+        Lit a = na ? memo[na] ^ (nd.a & 1u) : nd.a;
+        Lit b = nb ? memo[nb] ^ (nd.b & 1u) : nd.b;
+        Lit r = g.andl(a, b);
+        memo[n] = r;
+        st.pop_back();
+    }
+    return memo[rn] ^ (root & 1u);
+}
+
+// The same with a sparse memo (any map from node to literal): for small
+// cones of a large graph.
+template<typename Map>
+Lit rebuildSparse(Graph& g, Lit root, Map& memo) {
+    uint32_t rn = lnode(root);
+    if (rn == 0) return root;
+    std::vector<uint32_t> st{rn};
+    while (!st.empty()) {
+        uint32_t n = st.back();
+        if (memo.count(n)) { st.pop_back(); continue; }
+        Node nd = g.nodes[n];
+        if (nd.k != NK::And) { memo[n] = mklit(n); st.pop_back(); continue; }
+        uint32_t na = lnode(nd.a), nb = lnode(nd.b);
+        auto ia = memo.find(na), ib = memo.find(nb);
+        bool ready = true;
+        if (na && ia == memo.end()) { st.push_back(na); ready = false; }
+        if (nb && ib == memo.end()) { st.push_back(nb); ready = false; }
+        if (!ready) continue;
+        Lit a = na ? ia->second ^ (nd.a & 1u) : nd.a;
+        Lit b = nb ? ib->second ^ (nd.b & 1u) : nd.b;
+        Lit r = g.andl(a, b);
+        memo[n] = r;
+        st.pop_back();
+    }
+    return memo[rn] ^ (root & 1u);
+}
+
+// resolve: copy the cone of `root`, replacing each placeholder node by the
+// logic it stands for (defs: node -> literal), which may itself contain
+// placeholders. Unlike Wire nodes and cleanup(), the definitions live
+// outside the graph, so a loop through placeholders that is false for the
+// cone asked about is not an error. Returns NOLIT if the definitions are
+// circular; *culprit is then a placeholder on the cycle. memo and active
+// are sized to g.size() by the caller (NOLIT and 0).
+template<typename Defs>
+Lit resolve(Graph& g, Lit root, std::vector<Lit>& memo, const Defs& defs, std::vector<uint8_t>& active,
+            uint32_t* culprit = nullptr) {
+    uint32_t rn = lnode(root);
+    if (rn == 0) return root;
+    std::vector<uint32_t> st{rn};
+    while (!st.empty()) {
+        uint32_t n = st.back();
+        if (memo[n] != NOLIT) { st.pop_back(); continue; }
+        Node nd = g.nodes[n];
+        if (nd.k != NK::And) {
+            auto it = defs.find(n);
+            if (it == defs.end()) { memo[n] = mklit(n); st.pop_back(); continue; }
+            uint32_t dn = lnode(it->second);
+            if (dn == 0) { memo[n] = it->second; st.pop_back(); continue; }
+            if (memo[dn] != NOLIT) { memo[n] = memo[dn] ^ (it->second & 1u); st.pop_back(); continue; }
+            if (active[n]) {
+                if (culprit) *culprit = n;
+                return NOLIT;
+            }
+            active[n] = 1;
+            st.push_back(dn);
+            continue;
+        }
+        uint32_t na = lnode(nd.a), nb = lnode(nd.b);
+        bool ready = true;
+        if (na && memo[na] == NOLIT) { st.push_back(na); ready = false; }
+        if (nb && memo[nb] == NOLIT) { st.push_back(nb); ready = false; }
+        if (!ready) continue;
+        Lit a = na ? memo[na] ^ (nd.a & 1u) : nd.a;
+        Lit b = nb ? memo[nb] ^ (nd.b & 1u) : nd.b;
+        Lit r = g.andl(a, b);
+        memo[n] = r;
+        st.pop_back();
+    }
+    return memo[rn] ^ (root & 1u);
 }
 
 }  // namespace aig

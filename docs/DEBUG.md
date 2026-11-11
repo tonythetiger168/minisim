@@ -132,6 +132,17 @@ right in the order data flows, wires join an output to the inputs it feeds,
 and nets that come from the scope's own logic are labelled at the port.
 Click a block to go into it, a net name to select the signal.
 
+## Structs and part assignments
+
+A struct, packed or unpacked with integral fields, is one vector in the
+waveform. mdebug reads a field as its slice of that vector, so a condition
+such as `if (p.lo == 4'd3)` is evaluated, in the tool and in the page. Each
+assignment to a field or to a constant bit or part select (`s.f`, `v[3]`,
+`v[7:4]`) knows the bits it writes: in one process a later assignment
+replaces an earlier one only where it writes the same bits, so every field's
+own driver is reported, and a whole assignment (`p = '0;`) that the fields
+then overwrite is not.
+
 ## Tasks, calls and force
 
 A task or function declared in a module drives the signals it assigns, as
@@ -145,7 +156,7 @@ declared with a value (`wire n = a + b;`) is a continuous assignment.
 
 - In the page, a condition that reads an `x` or `z` value is undecided
   (`??`); the command line evaluates all four states.
-- Unpacked arrays, structs and class objects are not in msim's VCD, so the
+- Unpacked arrays and class objects are not in msim's VCD, so the
   active-driver trace stops at them with `(not in the waveform)`.
 - A task's formal arguments are not in the waveform, so the active-driver
   trace shows an assignment inside a task that depends on one as undecided
