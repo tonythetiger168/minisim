@@ -27,11 +27,14 @@ static void usage() {
         "  -report FILE    write the report to a file as well\n"
         "  -prefix STR     prefix of added cells and nets (default ECO_)\n"
         "  -no-sweep       keep old cells that end up driving nothing\n"
+        "  -spare          metal-only: add and remove no cell; build the patch from the cells\n"
+        "                  that drive nothing (spare cells) and the ones the change frees\n"
+        "  -spare-cells GLOB   -spare, with only the unloaded cells of this instance name as spares\n"
         "  -no-rectify     only copy the changed cones (do not look for the gate to change)\n"
         "  -budget N       SAT conflicts per proof (default 100000)\n"
         "  -threads N      worker threads (default: all logical cores; results do not depend on N)\n"
         "  -q              print only the summary line\n"
-        "exit status: 0 the patched netlist is proved equivalent, 1 it is not, 2 error");
+        "exit status: 0 the patched netlist is proved equivalent, 1 it is not, 2 error,\n             3 proved, but -spare had to add cells");
 }
 
 static std::string pickTop(const gnl::Source& src, const std::string& want, const char* which) {
@@ -65,6 +68,8 @@ int main(int argc, char** argv) {
             else if (a == "-report") report = val();
             else if (a == "-prefix") opt.prefix = val();
             else if (a == "-no-sweep") opt.sweep = false;
+            else if (a == "-spare") opt.spare = true;
+            else if (a == "-spare-cells") opt.spare = true, opt.spareGlob = val();
             else if (a == "-budget") opt.budget = std::atol(val().c_str());
             else if (par::threadsArg(argc, argv, i, opt.threads, "meco")) {}
             else if (a == "-no-rectify") opt.rectify = false;
@@ -114,6 +119,13 @@ int main(int argc, char** argv) {
                       r.points, r.failing.size(), r.added, r.areaAdded, r.removed, r.areaRemoved, r.rewired, r.reused,
                       r.verified ? "patched netlist proved equivalent" : "patched netlist is NOT equivalent");
         rep << line;
+        if (opt.spare) {
+            std::snprintf(line, sizeof line, "meco: metal-only: %zu spare cells used, %zu old cells left as spares, %zu cells without a spare\n",
+                          r.spares, r.freed, r.unplaced.size());
+            rep << line;
+            if (!quiet)
+                for (auto& u : r.unplaced) rep << "  no spare cell for " << u << "\n";
+        }
         std::cout << rep.str();
         if (!report.empty()) std::ofstream(report) << rep.str();
         if (!out.empty()) {
@@ -127,7 +139,7 @@ int main(int argc, char** argv) {
             if (!os) throw eco::Error("cannot write " + script);
             eco::writeScript(r, os);
         }
-        return r.verified ? 0 : 1;
+        return !r.verified ? 1 : r.unplaced.empty() ? 0 : 3;
     } catch (std::exception& e) {
         std::fprintf(stderr, "meco: %s\n", e.what());
         return 2;

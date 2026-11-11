@@ -22,10 +22,11 @@ module top;
       for (int i = 0; i < size; i++) mem[dst + i] = mem[src + i];
       busy[chan] = 0;
     endtask
-    virtual task mem_sum(input bit [31:0] addr, input bit [15:0] size, output bit [31:0] mpss_ret);
+    virtual task mem_check(input bit [31:0] addr, input bit [15:0] size, input bit [7:0] seed,
+                           output bit [31:0] mpss_ret);
       mpss_ret = 0;
-      for (int i = 0; i < size; i++) mpss_ret += mem[addr + i];
-      mpss_ret |= 1;
+      for (int i = 0; i < size; i++)
+        if (mem[addr + i] != 8'(seed + i)) mpss_ret++;
       #1;
     endtask
   endclass

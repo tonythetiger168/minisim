@@ -478,6 +478,15 @@ a macro of the wrong size, pins off the routing grid); `mlibc report` and
 corners. See `docs/LIBCHECK.md`. The generic cell library it is tested on is
 `lib/mini45` (`docs/MINI45.md`).
 
+
+### A real PDK as test data: sky130
+
+`lib/sky130` holds 47 cells of the open SkyWater 130 nm library (Liberty,
+LEF and technology LEF, Apache-2.0, unmodified extracts) as a second test
+library beside `lib/mini45`, and `python3 lib/sky130/sky130.py fetch`
+downloads all 428 cells at three corners. The `sky130` test runs `mlibc`,
+`msynth`, `msta` and `mpower` on it. See `lib/sky130/README.md`.
+
 ### Timing constraint checks: `msdc`
 
 `msdc` reads the design and its SDC file and reports what is wrong or missing
@@ -853,6 +862,7 @@ the default configuration.
 ```sh
 mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
 mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
+mpv drc -svrf rules.svrf chip.gds -rdb drc.lyrdb               # SVRF-style rules; markers for KLayout
 ```
 
 ```
@@ -914,4 +924,8 @@ cmake at another build with `-DIVERILOG=... -DVVP=...`. To add one, drop a `.sv`
 
 ## License
 
-MIT
+Apache License 2.0 (`LICENSE`, attribution in `NOTICE`). Until 2026-11-11 the
+repository was MIT; that grant is not withdrawn, and copies obtained under it
+stay under it. Paid tools are a separate, closed-source product; which tool is
+in which edition, and the rules on third-party code, are in
+[`docs/LICENSING.md`](docs/LICENSING.md).

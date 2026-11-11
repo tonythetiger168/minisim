@@ -14,6 +14,7 @@
 
 #include "lvs.hpp"
 #include "oasis.hpp"
+#include "svrf.hpp"
 
 using geom::C;
 using geom::Op;
@@ -674,6 +675,116 @@ void testOasis() {
     assert(!oasis::readLayout(dir + "oasis/missing.oas", none, err) && !err.empty());
 }
 
+void testSvrf() {
+    auto tr = [](const std::string& text, std::string& err, std::set<std::string> defs = {}) {
+        svrf::Result r;
+        bool ok = svrf::translate(text, r, err, defs);
+        if (ok) err.clear();
+        return r;
+    };
+    std::string err;
+    // Every construct, layers used before they are defined, a local layer, two checks in one rule.
+    svrf::Result r = tr(
+        "/* a block\n comment */\n"
+        "LAYOUT PATH \"x.gds\"\n"
+        "layer map 5 datatype 2 100\n"
+        "LAYER M1 100 // comment\n"
+        "LAYER V1 7\n"
+        "LAYER both M1 8\n"
+        "wide = SIZE (SIZE M1 BY -0.2) BY 0.2\n"
+        "odd = (NOT RECTANGLE v1) OR (HOLES m1) OR ((COPY M1) XOR big) OR EXTENT\n"
+        "big = (M1 INTERACT V1) NOT INTERACT (wide INSIDE both)\n"
+        "R1 { @ first line\n     @ second \"line\"\n"
+        "  t = M1 NOT INSIDE wide\n"
+        "  EXT t wide < 0.2 OPPOSITE\n"
+        "  (M1 OUTSIDE V1)\n"
+        "     AND odd\n"
+        "}\n"
+        "#IFDEF EXTRA\nR2 { AREA M1 > 1e2 }\n#ELSE\nR3 { RECTANGLE V1 }\n#ENDIF\n"
+        "R4\n{ DENSITY M1 > 0.8 WINDOW 10 10 STEP 5 }\n"
+        "CONNECT M1 both BY V1\n",
+        err, {"extra"});
+    if (!err.empty()) { std::fprintf(stderr, "svrf: %s\n", err.c_str()); assert(false); }
+    const char* want =
+        "# Translated from an SVRF rule file by mpv.\n"
+        "layer M1 5/2\n"
+        "layer V1 7/*\n"
+        "layer _both_8 8/*\n"
+        "wide = grow(shrink(M1, 0.2), 0.2)\n"
+        "_R1_t = not_inside(M1, wide)\n"
+        "rule R1 space(_R1_t, wide) < 0.2 \"first line second 'line'\"\n"
+        "both = (M1 | _both_8)\n"
+        "big = not_interact(interact(M1, V1), inside(wide, both))\n"
+        "odd = (((not_rects(V1) | holes(M1)) | (M1 ^ big)) | extent())\n"
+        "rule R1/2 (outside(M1, V1) & odd) \"first line second 'line'\"\n"
+        "rule R2 area(M1) > 100\n"
+        "rule R4 density(M1, 10, 5) > 0.8\n"
+        "connect M1 both by V1\n";
+    if (r.deck != want) { std::fprintf(stderr, "svrf deck:\n%s", r.deck.c_str()); assert(false); }
+    assert(r.rules == 4 && r.warnings.size() == 2);
+    assert(r.warnings[0] == "line 14: rule R1: options not applied: OPPOSITE");
+    assert(r.warnings[1] == "statements not applied: LAYOUT PATH");
+    // The translation is a deck the engine takes.
+    drc::Deck deck;
+    std::istringstream in(r.deck);
+    if (!drc::parseDeck(in, deck, err)) { std::fprintf(stderr, "svrf deck: %s\n", err.c_str()); assert(false); }
+    assert(deck.rules.size() == 4);
+    // What is not supported is an error with its line, not a dropped rule.
+    auto bad = [&](const char* text, const char* msg) {
+        std::string e;
+        tr(text, e);
+        if (e != msg) { std::fprintf(stderr, "svrf error: got '%s', want '%s'\n", e.c_str(), msg); assert(false); }
+    };
+    bad("LAYER a 1\nR { INT a <= 0.1 }\n", "line 2: the constraint <= is not supported on INT (only <)");
+    bad("LAYER a 1\nR { EXT a > 0.1 < 0.2 }\n", "line 2: the constraint > is not supported on EXT (only <)");
+    bad("LAYER a 1\nLAYER b 2\n\nR { INT a b < 0.1 }\n", "line 4: INT between two layers is not supported");
+    bad("LAYER a 1\nR { ENC a < 0.1 }\n", "line 2: ENC takes two layers");
+    bad("LAYER a 1\nR { a AND c }\n", "line 2: layer c is not defined");
+    bad("LAYER a 1\nx = a TOUCH a\n", "line 2: TOUCH is not supported");
+    bad("LAYER a 1\nx = a INTERACT a > 2\n", "line 2: a count constraint on INTERACT is not supported");
+    bad("LAYER a 1\nx = EXT a < 1 REGION\n", "line 2: EXT is not supported inside a layer expression");
+    bad("x = y AND x\ny = x\nR { x }\n", "line 1: layer x is defined by itself");
+    bad("LAYER a 1\nLAYER A 2\n", "line 2: layer A is defined twice (line 1)");
+    bad("LAYER a 1\nR { a }\nR { a }\n", "line 3: rule R is defined twice");
+    bad("LAYER a 1\nR { @ nothing\n }\n", "line 2: rule R has no check");
+    bad("LAYER a 1\nR { a\n", "line 2: rule R has no closing }");
+    bad("LAYER a 1\nFROB a\n", "line 2: statement FROB is not supported");
+    bad("#IFDEF X\nLAYER a 1\n", "line 3: #IFDEF without #ENDIF");
+    bad("LAYER a 1\nR { DENSITY a < 0.2 }\n", "line 2: DENSITY needs WINDOW and a size");
+
+    // Any cut of a rule file is a translation or an error, never a crash.
+    std::string whole = slurp(std::string(MINISIM_SOURCE_DIR) + "/tests/pv/sky130.svrf");
+    for (size_t n = 0; n < whole.size(); n += 7) {
+        std::string e;
+        tr(whole.substr(0, n), e);
+        tr(whole.substr(n), e);
+    }
+
+    // The same rules in both formats give the same markers on a random layout.
+    std::mt19937 rng(11);
+    Shapes s;
+    for (int i = 0; i < 400; ++i) {
+        C x = C(rng() % 20000), y = C(rng() % 20000), w = C(100 + rng() % 900), h = C(100 + rng() % 900);
+        s.add(1 + int(rng() % 2), {x, y, x + w, y + h});
+    }
+    const char* native = "layer a 1\nlayer b 2\nc = a & b\n"
+                         "rule w width(a) < 0.3\nrule s space(a, b) < 0.25\nrule e enclosure(c, a) < 0.1\n"
+                         "rule ar area(b - a) < 0.05\nrule f not_interact(a, b)\nrule g grow(c, 0.05) - (a | b)\n";
+    svrf::Result t2 = tr("LAYER a 1\nLAYER b 2\nc = a AND b\n"
+                         "w { INT a < 0.3 }\ns { EXT a b < 0.25 }\ne { ENC c a < 0.1 }\n"
+                         "ar { AREA (b NOT a) < 0.05 }\nf { a NOT INTERACT b }\ng { (SIZE c BY 0.05) NOT (a OR b) }\n", err);
+    assert(err.empty());
+    // The flat layout of Shapes uses datatype 0, which 1/* covers.
+    auto x = runDeck(native, s.flat, 2), y = runDeck(t2.deck, s.flat, 2);
+    assert(x.size() == 6 && y.size() == 6);
+    size_t total = 0;
+    for (size_t i = 0; i < 6; ++i) {
+        assert(x[i].markers == y[i].markers);
+        total += x[i].markers.size();
+    }
+    assert(total > 100);
+}
+
 void writeBad(const std::string& dir) {
     gds::Library lib;
     lib.cells.resize(2);
@@ -714,6 +825,7 @@ int main(int argc, char** argv) {
     testTopology();
     testGds();
     testOasis();
+    testSvrf();
     testChecks();
     testCheckThreads();
     testLvs();

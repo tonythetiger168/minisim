@@ -412,6 +412,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_edt
                    -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt.cmake)
+  # Compressed-pattern responses and compactor X masking, run on the netlist in simulation.
+  add_test(NAME mdft_edt_resp
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMATPG=$<TARGET_FILE:matpg> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_edt_resp
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt_resp.cmake)
   # Logic BIST coverage, checked against the wrapper's signature in simulation.
   add_test(NAME mdft_lbist_cov
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
@@ -476,7 +481,7 @@ install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 # The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
+install(FILES README.md CHANGELOG.md LICENSE NOTICE docs/LICENSING.md docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 # The tools: one file each in cmake/tools, all included here, after the core
