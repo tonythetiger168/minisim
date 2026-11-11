@@ -23,7 +23,8 @@ install(TARGETS mfpga RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # 0.33 cannot read fsm.sv and hier.sv), the input it holds at 1 first (- for
 # none) and more mfpga options. mul and mulp are multipliers on DSP blocks.
 if(Python3_FOUND)
-  foreach(t counter:12 fsm:0 hier:0 alu:0 latch1:0 dp:6:rst mul:0 mulp:2:-:-dsp-min:4)
+  foreach(t counter:12 fsm:0 hier:0 alu:0 latch1:0 dp:6:rst mul:0 mulp:2:-:-dsp-min:4
+            mulw:0:-:--no-ice40-pnr)
     string(REPLACE ":" ";" t_parts ${t})
     list(GET t_parts 0 t_name)
     list(GET t_parts 1 t_depth)

@@ -115,6 +115,15 @@ bits are left open. `tests/fpga/mul.sv` (8x8, signed 9x6, 11x8 truncated, a
 multiply-accumulate and a 28x28) takes 4 blocks and 1,758 LUT4, all of them
 the 28x28; without blocks it is 2,647.
 
+A multiplier too wide for one block is split. Each operand is cut into
+pieces a block input takes (only the top piece of a signed operand is
+signed), every pair of pieces is one block, and the shifted, extended partial
+products are summed on carry chains. Pieces whose product lies above a
+truncated result are left out. A registered 32x32 on an ECP5-85F is 4
+`MULT18X18D`, 3 chains and no LUT at 68 MHz after nextpnr (as LUTs: 2,831
+LUT4 and 8 MHz; Yosys `synth_ecp5`: 4 blocks, 120 LUTs, 81 MHz). With that,
+`mul.sv` is 8 blocks and its 28x28 costs no LUTs.
+
 ## Speed
 
 A 128x128 multiplier (166,252 AND nodes) on a 4-core machine, LUT6: 32,344
@@ -127,7 +136,8 @@ on four, with byte-identical output. On a 32x32 multiplier the LUT count is
 
 `tests/fpga/run_test.py` maps the designs `msynth` is tested with, and a
 datapath with synchronous reset, enable, add/subtract and signed and unsigned
-compares (`tests/fpga/dp.sv`), and multipliers (`mul.sv`, `mulp.sv`), for
+compares (`tests/fpga/dp.sv`), and multipliers (`mul.sv`, `mulp.sv`, and the
+wide ones of `mulw.sv`), for
 every family, and for each one:
 
 - `-verify` simulates the netlist against the graph on random patterns;
@@ -146,8 +156,7 @@ CI installs Yosys and nextpnr.
 
 ## Limits
 
-- A multiplier wider than one DSP block stays LUTs: it is not split over
-  several blocks yet. The blocks' input, pipeline and output registers and
+- The DSP blocks' input, pipeline and output registers and
   their adders (multiply-accumulate) are not used. `MULT18X18D` is a black
   box in Yosys 0.33, so its proof runs on the model in
   `tests/fpga/cells_ecp5_dsp.v`; `DSP48E1` is proven on Yosys' own model, and
@@ -155,6 +164,9 @@ CI installs Yosys and nextpnr.
   tests place iCE40 netlists on an HX8K, which has no DSPs.
 - Memories become flops, not block RAM: that needs the memory table the
   elaborator will record.
+- The partial products of a split multiplier are added one after another
+  on plain chains, not by the blocks' own adders or a compressor tree, and a
+  square does not share its two equal cross products.
 - Chains are not split or sped up (carry-select, carry-lookahead) by timing,
   and an adder is not merged with a mux or an AND in front of it into the
   chain's LUTs.

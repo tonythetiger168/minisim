@@ -187,6 +187,7 @@ struct FrontOptions {
   bool dsp = false;            // multipliers onto DSP blocks
   int dsp_a = 0, dsp_b = 0;    // widest operands of one block, as it multiplies signed numbers
   bool dsp_unsigned = false;   // the block also multiplies unsigned numbers of that width
+  bool dsp_split = true;       // a multiplier too wide for one block: several blocks and adders
   int dsp_min = 10;            // fewest operand bits (both together) worth a block; narrower stay LUTs
 };
 
@@ -358,43 +359,150 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
     if (any) d = aig::cleanup(d);
   }
 
+  // ---- multipliers
+  // A multiplier fits a DSP block by the width its operands really have:
+  // the elaborator extends both to the width of the result first.
+  struct MulFit { aig::Bits a, b; bool sa = false, sb = false; };
+  auto mul_operands = [](const aig::WordOp& op) {
+    MulFit m;
+    auto trim = [&](aig::Bits v, bool& sg) {
+      sg = op.sgn;
+      if (sg) while (v.size() > 1 && v.back() == v[v.size() - 2]) v.pop_back();
+      else while (v.size() > 1 && v.back() == aig::L0) v.pop_back();
+      if (sg && v.size() > 1 && v.back() == aig::L0) { v.pop_back(); sg = false; }   // never negative
+      return v;
+    };
+    m.a = trim(op.a, m.sa);
+    m.b = trim(op.b, m.sb);
+    if (m.a.size() < m.b.size()) { std::swap(m.a, m.b); std::swap(m.sa, m.sb); }
+    return m;
+  };
+  // Pads m for the block and says whether one block takes it.
+  auto mul_fits = [&](MulFit& m) {
+    // an unsigned operand on a block that only does signed, or beside a signed one, gets a 0 sign bit
+    if (!fo.dsp_unsigned || m.sa != m.sb)
+      for (int side = 0; side < 2; ++side) {
+        aig::Bits& v = side ? m.b : m.a;
+        bool& sg = side ? m.sb : m.sa;
+        if (!sg) { v.push_back(aig::L0); sg = true; }
+      }
+    if (m.a.size() < m.b.size()) { std::swap(m.a, m.b); std::swap(m.sa, m.sb); }
+    return (int)m.a.size() <= fo.dsp_a && (int)m.b.size() <= fo.dsp_b;
+  };
+  // A multiplier too wide for one block is rebuilt as block-sized partial
+  // products and adders, both recorded as operators: the products become DSP
+  // blocks below and the adders carry chains. Only the top piece of a signed
+  // operand is signed; a result bit is the sum of the shifted, extended products.
+  if (fo.dsp && fo.dsp_split) {
+    const size_t nops = d.ops.size();
+    std::vector<char> drop(nops, 0);
+    aig::Graph& g = d.g;
+    const bool hashing = g.hashing;
+    g.hashing = false;   // new nodes only: a node of the old multiplier must not end up inside its replacement
+    for (size_t k = 0; k < nops; ++k) {
+      if (d.ops[k].kind != aig::WordOp::Mul) continue;
+      const aig::WordOp op = d.ops[k];
+      MulFit m = mul_operands(op);
+      {
+        MulFit one = m;
+        if (mul_fits(one)) continue;
+      }
+      if (m.b.size() < 2) continue;
+      const size_t n = std::min(op.y.size(), m.a.size() + m.b.size());
+      const bool sgn = m.sa || m.sb;
+      const bool umode = fo.dsp_unsigned && !sgn;
+      struct Piece { aig::Bits bits; bool sg; size_t off; };
+      auto pieces = [&](const aig::Bits& v, bool sg, int cap) {
+        const size_t c = umode ? cap : cap - 1;   // unsigned bits one block input takes
+        std::vector<Piece> r;
+        size_t off = 0;
+        while (v.size() - off > (sg ? (size_t)cap : c)) {
+          r.push_back({aig::Bits(v.begin() + off, v.begin() + off + c), false, off});
+          off += c;
+        }
+        r.push_back({aig::Bits(v.begin() + off, v.end()), sg, off});
+        return r;
+      };
+      const auto pa = pieces(m.a, m.sa, fo.dsp_a), pb = pieces(m.b, m.sb, fo.dsp_b);
+      aig::Bits acc(n, aig::L0);
+      bool first = true;
+      for (auto& x : pa)
+        for (auto& y : pb) {
+          const size_t s = x.off + y.off;
+          if (s >= n) continue;
+          const int w = (int)(x.bits.size() + y.bits.size());
+          const aig::Bits ex = aig::Graph::extend(x.bits, w, x.sg), ey = aig::Graph::extend(y.bits, w, y.sg);
+          aig::Bits pr = g.mul(ex, ey);
+          pr.resize(std::min((size_t)w, n - s));   // only the bits the result reads
+          d.ops.push_back(aig::WordOp{aig::WordOp::Mul, ex, ey, pr, true});
+          const aig::Bits pe = aig::Graph::extend(pr, (int)(n - s), x.sg || y.sg);
+          if (first) {
+            std::copy(pe.begin(), pe.end(), acc.begin() + s);
+            first = false;
+            continue;
+          }
+          const aig::Bits hi(acc.begin() + s, acc.end());
+          const aig::Bits sum = g.add(hi, pe, aig::L0);
+          d.ops.push_back(aig::WordOp{aig::WordOp::Add, hi, pe, sum, false});
+          std::copy(sum.begin(), sum.end(), acc.begin() + s);
+        }
+      for (size_t i = 0; i < op.y.size(); ++i) {
+        const uint32_t node = aig::lnode(op.y[i]);
+        if (g.nodes[node].k != aig::NK::And) continue;
+        const Lit to = i < n ? acc[i] : sgn ? acc[n - 1] : aig::L0;
+        aig::Node wr;
+        wr.k = aig::NK::Wire;
+        wr.a = to ^ (Lit)aig::lisneg(op.y[i]);
+        g.nodes[node] = wr;
+      }
+      drop[k] = 1;
+    }
+    g.hashing = hashing;
+    if (std::find(drop.begin(), drop.end(), 1) != drop.end()) {
+      std::vector<aig::WordOp> keep;
+      for (size_t k = 0; k < d.ops.size(); ++k)
+        if (k >= nops || !drop[k]) keep.push_back(std::move(d.ops[k]));
+      d.ops = std::move(keep);
+      // The operator table keeps an operator only with all of its bits alive.
+      // A result bit of the old multiplier that was a constant (bit 1 of a
+      // square) leaves its replacement unread: such bits leave the new entries.
+      std::vector<char> live(g.size(), 0);
+      std::vector<uint32_t> stack;
+      auto reach = [&](Lit l) {
+        if (l == aig::NOLIT) return;
+        const uint32_t v = aig::lnode(l);
+        if (v < live.size() && !live[v]) { live[v] = 1; stack.push_back(v); }
+      };
+      for (auto& pt : d.ports) if (pt.out) for (Lit l : pt.bits) reach(l);
+      for (auto& fl : g.flops) { reach(fl.d); reach(fl.clk); reach(fl.arst); }
+      while (!stack.empty()) {
+        const aig::Node& nd = g.nodes[stack.back()];
+        stack.pop_back();
+        if (nd.k == aig::NK::And) { reach(nd.a); reach(nd.b); }
+        else if (nd.k == aig::NK::Wire) reach(nd.a);
+      }
+      for (size_t k = nops - (size_t)std::count(drop.begin(), drop.end(), 1); k < d.ops.size(); ++k)
+        for (Lit& l : d.ops[k].y)
+          if (!live[aig::lnode(l)]) l = aig::L0;
+      g.strash.clear();
+      d = aig::cleanup(d);
+    }
+  }
+
   // ---- carry chains
   std::vector<char> sel(d.ops.size(), 0);
+  std::map<int, MulFit> fits;
   if (fo.carry)
     for (size_t k = 0; k < d.ops.size(); ++k) {
       const aig::WordOp& op = d.ops[k];
       sel[k] = (op.kind == aig::WordOp::Add || op.kind == aig::WordOp::Sub || op.kind == aig::WordOp::Lt) &&
                op.a.size() == op.b.size() && (int)op.a.size() >= fo.carry_min;
     }
-  // A multiplier fits a DSP block by the width its operands really have:
-  // the elaborator extends both to the width of the result first.
-  struct MulFit { aig::Bits a, b; bool sa = false, sb = false; };
-  std::map<int, MulFit> fits;
   if (fo.dsp)
     for (size_t k = 0; k < d.ops.size(); ++k) {
-      const aig::WordOp& op = d.ops[k];
-      if (op.kind != aig::WordOp::Mul) continue;
-      MulFit m;
-      auto trim = [&](aig::Bits v, bool& sg) {
-        sg = op.sgn;
-        if (sg) while (v.size() > 1 && v.back() == v[v.size() - 2]) v.pop_back();
-        else while (v.size() > 1 && v.back() == aig::L0) v.pop_back();
-        if (sg && v.size() > 1 && v.back() == aig::L0) { v.pop_back(); sg = false; }   // never negative
-        return v;
-      };
-      m.a = trim(op.a, m.sa);
-      m.b = trim(op.b, m.sb);
-      if (m.a.size() < m.b.size()) { std::swap(m.a, m.b); std::swap(m.sa, m.sb); }
-      // an unsigned operand on a block that only does signed, or beside a signed one, gets a 0 sign bit
-      if (!fo.dsp_unsigned || m.sa != m.sb)
-        for (int side = 0; side < 2; ++side) {
-          aig::Bits& v = side ? m.b : m.a;
-          bool& sg = side ? m.sb : m.sa;
-          if (!sg) { v.push_back(aig::L0); sg = true; }
-        }
-      if (m.a.size() < m.b.size()) { std::swap(m.a, m.b); std::swap(m.sa, m.sb); }
-      if ((int)m.a.size() > fo.dsp_a || (int)m.b.size() > fo.dsp_b) continue;
-      if ((int)(m.a.size() + m.b.size()) < fo.dsp_min || m.b.size() < 2) continue;
+      if (d.ops[k].kind != aig::WordOp::Mul) continue;
+      MulFit m = mul_operands(d.ops[k]);
+      if (!mul_fits(m) || (int)(m.a.size() + m.b.size()) < fo.dsp_min || m.b.size() < 2) continue;
       sel[k] = 1;
       fits[(int)k] = std::move(m);
     }

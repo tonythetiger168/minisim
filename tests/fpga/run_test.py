@@ -23,6 +23,9 @@ mfpga, msim, src, out, design = sys.argv[1:6]
 depth = int(sys.argv[6]) if len(sys.argv) > 6 else 0
 reset = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] != "-" else None
 extra = sys.argv[8:]
+# not an mfpga option: the design, as LUTs, is larger than the HX8K the iCE40 netlist is placed on
+skip_ice40_pnr = "--no-ice40-pnr" in extra
+extra = [e for e in extra if e != "--no-ice40-pnr"]
 os.makedirs(out, exist_ok=True)
 rtl = os.path.join(src, "tests", "synth", design + ".sv")
 if not os.path.exists(rtl):
@@ -78,6 +81,6 @@ for fam in ("generic", "ice40", "ecp5", "xc7"):
             sys.exit("FAILED: %s: the yosys proof against the RTL\n%s%s" % (fam, r.stdout[-3000:], r.stderr[-3000:]))
     pnr = {"ice40": ["nextpnr-ice40", "--hx8k", "--package", "ct256", "--pcf-allow-unconstrained", "--asc", base + ".asc"],
            "ecp5": ["nextpnr-ecp5", "--85k", "--package", "CABGA756", "--textcfg", base + ".cfg"]}.get(fam)
-    if pnr and shutil.which(pnr[0]):
+    if pnr and shutil.which(pnr[0]) and not (fam == "ice40" and skip_ice40_pnr):
         run(pnr + ["--json", base + ".json", "-q", "--placer", "heap"], timeout=900)
 print("ok")
