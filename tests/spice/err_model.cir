@@ -1,0 +1,6 @@
+A diode whose model is missing
+v1 a 0 1
+d1 a 0 nosuch
+.op
+*> error "err_model.cir:3: 'nosuch' is not a diode model"
+.end

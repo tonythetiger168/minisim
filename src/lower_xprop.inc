@@ -45,6 +45,7 @@ struct Xp {
     std::unordered_map<const slang::ast::Symbol*, int> cls;
     std::unordered_map<int, XpShadow> shadow;   // by target signal
     std::unordered_map<int, int> shadowOf;      // shadow value or mask -> target signal
+    std::unordered_set<int> temps;              // this process's temporaries
     std::unordered_set<int> bad;                // targets that cannot be merged (real, string, ...)
     std::unordered_set<size_t> okNba, okArr, oolJmp;
     std::unordered_set<const slang::ast::Symbol*> once;   // nonblocking targets assigned at most once a pass
@@ -56,7 +57,9 @@ struct Xp {
 int xpTemp(int w) {
     if (!mkSig) unsupported("temporary");
     int n = tempSeq ? (*tempSeq)++ : 0;
-    return mkSig("_xp$" + std::to_string(n), w, false);
+    int s = mkSig("_xp$" + std::to_string(n), w, false);
+    xp.temps.insert(s);
+    return s;
 }
 static int xpSigW(int s) { return (size_t)s < sigInfo().size() && sigInfo()[s].second > 0 ? sigInfo()[s].second : 1; }
 static E xpX(int w) { return konst(allx(w)); }
@@ -429,7 +432,7 @@ void xpFlush(int q, const XpShadow& sh, const std::vector<XpUnit>& units) {
 bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
              const std::function<void(size_t)>& body, const char* what, std::vector<size_t>* T = nullptr,
              const std::function<E(size_t)>& weight = nullptr, E total = nullptr) {
-    struct Alt { E gx; size_t jpre = 0, N = 0, T = 0, bs = 0, be = 0, jmid = 0, next = 0; };
+    struct Alt { E gx; bool three = false; size_t jpre = 0, N = 0, T = 0, bs = 0, be = 0, jmid = 0, next = 0; };
     std::vector<Alt> R(nCond + 1);
     std::string where = whereStr();
     int t = xpTemp(1);
@@ -440,13 +443,20 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
         size_t jn = (size_t)-1;
         if (k < nCond) {
             auto [gx, g] = cond(k);
-            r.gx = gx;
-            size_t jx = emitJmpIfNot(gx);
-            r.jpre = xpJmp();
-            xp.oolJmp.insert(r.jpre);
-            prog.code[jx].target = prog.here();
-            r.N = prog.here();
-            if (g) jn = emitJmpIfNot(g);
+            if (!gx) {   // unknown exactly when g is neither true nor false: one three-way jump
+                r.gx = xpIsX(un(Op::RedOr, g));
+                r.three = true;
+                r.N = prog.here();
+                r.jpre = jn = emitJmpIfNot(g);
+            } else {
+                r.gx = gx;
+                size_t jx = emitJmpIfNot(gx);
+                r.jpre = xpJmp();
+                xp.oolJmp.insert(r.jpre);
+                prog.code[jx].target = prog.here();
+                r.N = prog.here();
+                if (g) jn = emitJmpIfNot(g);
+            }
         }
         if (k == nCond && total) {   // in an unknown region: is the default still reachable?
             size_t jf = emitJmpIfNot(ref(t));
@@ -475,7 +485,7 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
     xpReport().push_back({where, what, why, ok});
     if (!ok) {
         for (size_t k = 0; k <= nCond; k++) {
-            if (k < nCond) prog.code[R[k].jpre].target = R[k].N;
+            if (k < nCond && !R[k].three) prog.code[R[k].jpre].target = R[k].N;
             prog.code[R[k].jmid].target = Z;
         }
         if (jfull != (size_t)-1) prog.code[jfull].target = R[nCond].T;
@@ -502,7 +512,7 @@ bool xpChain(size_t nCond, const std::function<std::pair<E, E>(size_t)>& cond,
         auto num = [](size_t k) { return konst(make(k, 0, 32)); };
         std::vector<size_t> toSetup, toMid, toPost;
         for (size_t k = 0; k < nCond; k++) {   // PRE k
-            prog.code[R[k].jpre].target = prog.here();
+            (R[k].three ? prog.code[R[k].jpre].xt : prog.code[R[k].jpre].target) = prog.here();
             size_t jf = emitJmpIfNot(ref(t));
             xpJmp(R[k].T);
             prog.code[jf].target = prog.here();
@@ -621,7 +631,7 @@ bool xpIf(const slang::ast::ConditionalStatement& top) {
     xpChain(n,
         [&](size_t k) {
             E c = expr(*chain[k]->conditions[0].expr);
-            return std::pair<E, E>{xpIsX(un(Op::RedOr, c)), c};
+            return std::pair<E, E>{nullptr, c};
         },
         [&](size_t k) {
             if (k < n) stmt(chain[k]->ifTrue);
@@ -853,6 +863,11 @@ void xpProc(const slang::ast::Statement& body) {
             xpJmp(jinit + 1);
         }
         prog.code[over].target = prog.here();
+    }
+    // Only this process uses its temporaries: their writes need no kernel.
+    for (size_t pc = start; pc < prog.here(); pc++) {
+        Instr& i = prog.code[pc];
+        if (i.k == IK::Assign && xp.temps.count(i.sig) && !i.arr && !i.bidx && i.pw <= 0 && i.drv < 0 && i.dyn < 0) i.tmp = true;
     }
     xp.on = false;
 }

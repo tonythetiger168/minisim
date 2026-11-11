@@ -37,13 +37,25 @@ Supported in properties: boolean expressions, `##n`, `##[m:n]`, `[*m:n]`,
 with arguments, `$past`, `$rose`, `$fell`, `$stable`, `$changed`, `$sampled`,
 `$countones`, `$onehot`, `$onehot0`.
 
-Liveness: a property with a strong obligation (`s_eventually`, `s_until`,
-`s_until_with`, `s_nexttime`, `strong(...)`, `always s_eventually`, the
-negation of a weak sequence) is also checked for a loop the design can go
-round forever with one evaluation attempt still pending. Such a
-counterexample is reported with the cycles that repeat. Liveness in an
-`assume` (a fairness constraint) is not used yet: only its safety part
-constrains the inputs.
+Liveness: a property with a strong unbounded obligation (`s_eventually`,
+`s_until`, `s_until_with`, a strong sequence with an unbounded repetition,
+`always s_eventually`) is also checked for a loop the design can go round
+forever without meeting it. Such a counterexample is reported with the cycles
+that repeat. Strong operators that end by themselves (`s_nexttime`, a bounded
+`strong(...)`) need no loop: on a run that never ends they pass or fail in
+bounded time.
+
+Fairness: the same obligation in an `assume` restricts the loops. A loop
+counts only if every obligation of every assumption is met on it, so
+`assume property (req |-> s_eventually !req)` rules out the requester that
+never lets go.
+
+Not decided: a strong obligation that a weak unbounded property could satisfy
+in its place (`s_eventually always q`), or under `not` of an unbounded
+property, `accept_on` or `reject_on`. The assertion is then reported
+`bounded`, with "the safety part is proven; liveness not decided" when no
+finite failure exists; such an assumption gives a warning and only its safety
+part is used.
 
 Reported as `skipped`, with the reason: local variables and match items,
 multiclock properties, `.triggered` / `.matched`, concurrent assertions inside
@@ -88,9 +100,17 @@ procedures, `expect`.
    * PDR (IC3) takes what is left. It builds the invariant the proof needs,
      clause by clause, or finds a failure deeper than `-depth` (the trace
      then comes from a bounded check that deep). `-no-pdr` turns it off.
-   Liveness is reduced to safety first: a free input saves the state once,
-   and the property fails when that state comes back with the tracked
-   attempt pending all the way round.
+   The first pass is short (induction over at most 10 cycles, a small PDR
+   budget), because PDR often proves at once what induction needs many
+   cycles for; what is still open gets induction up to `-depth` and PDR's
+   whole budget.
+   Liveness is reduced to safety first. A property is a conjunction of
+   obligations (the conjuncts of the terms its attempts are at), and a step
+   turns an obligation into the conjuncts of its derivative. A free input
+   saves the state once and picks one open obligation; the property fails
+   when that state comes back with the picked obligation open again, down a
+   chain of obligations each held open by a strong unbounded operator, and no
+   obligation of an assumption that was open at the save still is.
 4. Properties are independent jobs on `-threads N` threads (default: every
    logical core). The output is the same for any N. The solver stops at
    `-conflicts N` conflicts per call (a deterministic limit, not a

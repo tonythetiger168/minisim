@@ -143,3 +143,24 @@ expect(live.sv
   "assert  live.a_until +proven"
   "assert  live.a_always_ev +proven"
   "assert  live.a_idle +falsified  at cycle [0-9]+ .*liveness")
+
+# Liveness corner cases: renewed and bounded strong obligations hold, a
+# multi-cycle s_eventually fails on a loop, s_eventually always is not decided.
+run(live2.sv 1 "-top;live2;-depth;30")
+expect(live2.sv
+  "assert  live2.h_snext +proven" "assert  live2.h_asnext +proven" "assert  live2.h_gf2 +proven"
+  "assert  live2.h_renew +proven" "assert  live2.h_or +proven" "assert  live2.h_until +proven"
+  "assert  live2.h_ev3 +proven" "assert  live2.h_impl +proven"
+  "assert  live2.f_three +falsified  at cycle 4 .*repeat cycles 1 to 3 forever"
+  "assert  live2.f_ab +falsified .*liveness" "assert  live2.f_until +falsified  at cycle 2"
+  "assert  live2.f_until2 +falsified .*liveness" "assert  live2.f_gf +falsified .*liveness"
+  "assert  live2.f_strong +falsified .*liveness"
+  "assert  live2.u_fg +bounded .*the safety part is proven. liveness not decided"
+  "assert  live2.u_fg2 +bounded .*liveness not decided")
+
+# Fairness assumptions.
+run(fair.sv 1 "-top;fair;-depth;30")
+expect(fair.sv
+  "assert  fair.a_live1 +proven" "assert  fair.a_some +falsified .*liveness" "assert  fair.a_two +falsified .*liveness"
+  "assert  fair.a_y +proven" "assert  fair.a_x +falsified .*liveness" "assert  fair.a_z +falsified .*liveness"
+  "assert  fair.a_c +proven" "assert  fair.a_cc +falsified .*liveness")
