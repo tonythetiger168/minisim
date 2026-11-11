@@ -176,7 +176,7 @@ it. One-hot registers tested bit by bit are followed too.
 |---|---|---|---|
 | `FSM001` | warning | on | A state that no transition and no reset leads to |
 | `FSM002` | warning | on | A state with no way out (left only by reset) |
-| `FSM003` | warning | on | The case on a state register has no default and does not use every encoding |
+| `FSM003` | warning | on | The case on a state register has no default and does not use every encoding (not for `unique`, `priority` or `full_case`) |
 | `FSM004` | warning | on | A state register with no reset state |
 
 ### Clock-domain crossings (`cdc`)

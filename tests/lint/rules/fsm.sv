@@ -46,9 +46,26 @@ module fsm_norst(input logic clk, t, output logic o);
   assign o = st;
 endmodule
 
+// unique case: the designer says every value is covered; no FSM003.
+module fsm_unique(input logic clk, rst_n, go, output logic o);
+  typedef enum logic [1:0] {A, B, C} st_t;
+  st_t st;
+  always_ff @(posedge clk or negedge rst_n)
+    if (!rst_n) st <= A;
+    else
+      unique case (st)
+        A: if (go) st <= B;
+        B: st <= C;
+        C: st <= A;
+      endcase
+  assign o = st == C;
+endmodule
+
 module fsm(input logic clk, rst_n, go, done, t, output logic busy, o2, output logic [1:0] o);
   fsm_ok u_ok(.*);
   fsm_bad u_bad(.*);
   fsm_bad u_bad2(.clk, .rst_n, .go(done), .o());
   fsm_norst u_n(.clk, .t, .o(o2));
+  logic o3;
+  fsm_unique u_u(.clk, .rst_n, .go, .o(o3));
 endmodule

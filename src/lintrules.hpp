@@ -1878,7 +1878,7 @@ inline void checkFsms(const std::vector<ExtractedFsm>& fsms, Report& rep) {
                 rep.add("FSM002", loc,
                         "state " + label(v, n) + " of " + reg + " has no way out: once entered it is left only by reset");
         }
-        if (f.caseOnState && !f.caseDefault) {
+        if (f.caseOnState && !f.caseDefault && !f.caseFull) {   // unique, priority and full_case say it is meant
             // Every encoding a state: nothing for a default to catch.
             bool full = !f.onehot && f.w < 63 && f.states.size() == (uint64_t(1) << f.w);
             if (!full)
