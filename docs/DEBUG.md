@@ -148,6 +148,31 @@ A read of one field, or of fixed bits, follows only that part. For
 bits last changed (not the time another field moved) and only the assignments
 that write them. The same holds for `q[3:0]`, in the tool and in the page.
 
+## State machines
+
+    mdebug design.sv -top tb -fsm                      # every state machine
+    mdebug design.sv -top tb -vcd run.vcd -fsm tb.u -at 40
+
+`-fsm` lists the state machines of the design, or those under an instance, or
+one state register. They come from the extractor that `msim -cov` and mlint
+use (`src/fsm_extract.hpp`), so the three tools agree on what a state machine
+is. Each one is shown with its states (the reset state marked) and its
+transitions with the line that makes each:
+
+    tb.u.state  (ctrl, 2 bits, 4 states)  fsm.sv:8
+      states: IDLE=0(reset) RUN=1 WAIT=2 FAIL=3
+      IDLE -> RUN  fsm.sv:15  taken 1 time, first @25
+      RUN -> FAIL  fsm.sv:16  never taken
+      state FAIL never entered
+      @40: WAIT  (since 35)  after IDLE@0 RUN@25
+
+With a waveform it also says how often each transition ran and when first,
+which never ran, which states were never entered, the state at `-at T` with
+the states before it, a transition that ran but is not in the source's list,
+and a value that is not a state. In the page, selecting a state register
+draws its state diagram: the state at the cursor is marked, transitions that
+ran are bright, and an arrow opens its source line.
+
 ## Memories
 
 msim leaves unpacked arrays out of the waveform unless asked:

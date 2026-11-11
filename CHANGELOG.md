@@ -15,6 +15,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mdebug -fsm [NAME]`: the design's state machines (shared extractor), their
+  states and transitions with source lines; with a waveform, which transitions
+  ran, states never entered, values that are not states, and the state at
+  `-at T`. The viewer page draws the state diagram of a selected state register.
 - `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
   built from the spare cells of the old netlist and the cells the change
   frees, by function (the same cell, or one with inputs tied or shared, or

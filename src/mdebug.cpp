@@ -19,10 +19,12 @@
 // changed, combinational logic at that time.
 #include <climits>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 
+#include "fsm_extract.hpp"
 #include "lintir.hpp"
 #include "slang/ast/expressions/ConversionExpression.h"
 #include "slang/ast/expressions/LiteralExpressions.h"
@@ -1465,6 +1467,141 @@ struct Tool {
         }
         return o + "]";
     }
+    // -------------------------------------------------------------- FSMs
+    // State machines come from the shared extractor (src/fsm_extract.hpp),
+    // the one msim -cov and mlint use.
+    std::vector<ExtractedFsm> fsms;
+
+    static std::string stateName(const ExtractedFsm& f, uint64_t v) {
+        for (auto& [val, name] : f.states)
+            if (val == v) return name.empty() || std::isdigit((unsigned char)name[0]) ? std::to_string(v) : name;
+        return std::to_string(v);
+    }
+    static bool isState(const ExtractedFsm& f, uint64_t v) {
+        for (auto& st : f.states) if (st.first == v) return true;
+        return false;
+    }
+    // The register's values in the waveform: (time, value) with unknown = ~0.
+    std::vector<std::pair<uint64_t, uint64_t>> stateSeq(const ExtractedFsm& f) {
+        std::vector<std::pair<uint64_t, uint64_t>> seq;
+        const Wave* w = haveVcd && f.var ? vcd.find(path(*f.var)) : nullptr;
+        if (!w) return seq;
+        for (size_t i = 0; i < w->ch.size(); i++) {
+            const std::string b = w->bits((int)i);
+            uint64_t v = 0;
+            bool unk = b.size() > 64;
+            for (char c : b) { if (c != '0' && c != '1') unk = true; v = (v << 1) | (c == '1'); }
+            seq.push_back({w->ch[i].t, unk ? ~0ull : v});
+        }
+        return seq;
+    }
+
+    // -fsm [NAME]: the state machines under an instance (or one register):
+    // states, transitions and where they are written; with a waveform, the
+    // state at -at T, how often each transition ran, the ones that never did
+    // and any value that is not a state.
+    bool fsm(const std::string& name, std::optional<uint64_t> at) {
+        bool any = false;
+        for (const ExtractedFsm& f : fsms) {
+            if (!f.var || f.states.empty()) continue;
+            const std::string reg = path(*f.var);
+            if (!name.empty() && reg != name && reg.rfind(name + ".", 0) != 0) continue;
+            any = true;
+            std::cout << reg << "  (" << f.module << ", " << f.w << " bit" << (f.w == 1 ? "" : "s") << ", " << f.states.size()
+                      << " states" << (f.onehot ? ", one-hot" : "") << ")  " << db.src.at(db.src.where(f.var->location)) << "\n";
+            std::cout << "  states:";
+            for (auto& [v, n] : f.states) {
+                bool rst = std::find(f.resetStates.begin(), f.resetStates.end(), v) != f.resetStates.end();
+                // A name that is a literal (2'h1) says no more than the value.
+                bool lit = n.empty() || std::isdigit((unsigned char)n[0]);
+                std::cout << " " << (lit ? std::to_string(v) : n + "=" + std::to_string(v)) << (rst ? "(reset)" : "");
+            }
+            std::cout << "\n";
+            auto seq = stateSeq(f);
+            const Wave* w = haveVcd ? vcd.find(reg) : nullptr;
+            // Transitions seen: from -> to, count and first time.
+            std::map<std::pair<uint64_t, uint64_t>, std::pair<size_t, uint64_t>> seen;
+            std::map<uint64_t, size_t> visits;
+            for (size_t i = 0; i < seq.size(); i++) {
+                if (seq[i].second == ~0ull) continue;
+                visits[seq[i].second]++;
+                if (i && seq[i - 1].second != ~0ull) {
+                    auto [it, fresh] = seen.try_emplace({seq[i - 1].second, seq[i].second}, 0, seq[i].first);
+                    it->second.first++;
+                }
+            }
+            std::set<std::pair<uint64_t, uint64_t>> known;
+            for (const auto& t : f.trans) {
+                if (t.from == t.to || !known.insert({t.from, t.to}).second) continue;
+                std::cout << "  " << stateName(f, t.from) << " -> " << stateName(f, t.to) << "  "
+                          << db.src.at(db.src.where(t.loc)) << (t.reset ? "  (reset)" : "");
+                if (w) {
+                    auto it = seen.find({t.from, t.to});
+                    if (it == seen.end()) std::cout << "  never taken";
+                    else std::cout << "  taken " << it->second.first << (it->second.first == 1 ? " time" : " times") << ", first @" << it->second.second;
+                }
+                std::cout << "\n";
+            }
+            if (!w) {
+                if (haveVcd) std::cout << "  (not in the waveform)\n";
+                continue;
+            }
+            for (auto& [k, v] : seen)
+                if (!known.count(k))
+                    std::cout << "  " << stateName(f, k.first) << " -> " << stateName(f, k.second) << "  taken " << v.first
+                              << (v.first == 1 ? " time" : " times") << ", first @" << v.second
+                              << (isState(f, k.first) && isState(f, k.second) ? "  (not a transition found in the source)\n" : "  (a value that is not a state)\n");
+            for (auto& [v, n] : f.states)
+                if (!visits.count(v)) std::cout << "  state " << (n.empty() ? std::to_string(v) : n) << " never entered\n";
+            for (auto& [t, v] : seq)
+                if (v != ~0ull && !isState(f, v)) { std::cout << "  value " << v << " @" << t << " is not a state\n"; break; }
+            uint64_t t = at ? *at : vcd.end;
+            int ci = w->at(t);
+            if (ci >= 0) {
+                uint64_t v = seq[ci].second;
+                std::cout << "  @" << t << ": " << (v == ~0ull ? std::string("x") : stateName(f, v)) << "  (since " << seq[ci].first << ")";
+                // The road to it: the last states before.
+                int from = std::max(0, ci - 5);
+                std::cout << "  after";
+                for (int i = from; i < ci; i++)
+                    std::cout << " " << (seq[i].second == ~0ull ? std::string("x") : stateName(f, seq[i].second)) << "@" << seq[i].first;
+                if (from == ci) std::cout << " nothing";
+                std::cout << "\n";
+            }
+        }
+        if (!any) {
+            std::cerr << "mdebug: no state machine " << (name.empty() ? "in the design" : "at " + name) << "\n";
+            return name.empty();
+        }
+        return true;
+    }
+
+    std::string fsmsJson() {
+        std::string o = "[";
+        for (const ExtractedFsm& f : fsms) {
+            auto ix = f.var ? db.sigIx.find(f.var) : db.sigIx.end();
+            if (ix == db.sigIx.end() || f.states.empty()) continue;
+            o += std::string(o.size() > 1 ? ",\n" : "") + "{\"sig\":" + std::to_string(ix->second) + ",\"states\":[";
+            for (size_t i = 0; i < f.states.size(); i++) {
+                bool rst = std::find(f.resetStates.begin(), f.resetStates.end(), f.states[i].first) != f.resetStates.end();
+                o += std::string(i ? "," : "") + "[" + std::to_string(f.states[i].first) + "," +
+                     js(stateName(f, f.states[i].first)) + "," + (rst ? "1" : "0") + "]";
+            }
+            o += "],\"trans\":[";
+            std::set<std::pair<uint64_t, uint64_t>> known;
+            bool first = true;
+            for (const auto& t : f.trans) {
+                if (t.from == t.to || !known.insert({t.from, t.to}).second) continue;
+                Where wh = db.src.where(t.loc);
+                o += std::string(first ? "" : ",") + "[" + std::to_string(t.from) + "," + std::to_string(t.to) + "," + (t.reset ? "1" : "0") +
+                     "," + std::to_string(wh.file) + "," + std::to_string(wh.line) + "]";
+                first = false;
+            }
+            o += "]}";
+        }
+        return o + "]";
+    }
+
     std::string casesJson() {
         std::string o = "[";
         for (size_t i = 0; i < cases.size(); i++) {
@@ -1495,6 +1632,7 @@ struct Tool {
         for (auto* s : db.signals) sw.push_back(db.src.where(s->location));
         for (auto& s : db.scopes) { sd.push_back(db.src.where(s.loc)); si.push_back(db.src.where(s.inst)); }
         for (auto& d : db.drivers) dw.push_back(db.src.where(d.loc));
+        const std::string fsmText = fsmsJson();
         os << "{\"version\":" << js(MINISIM_VERSION) << ",\n\"files\":[";
         for (size_t i = 0; i < db.src.files.size(); i++) {
             auto& f = db.src.files[i];
@@ -1549,7 +1687,7 @@ struct Tool {
                << parts(d) << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
-        os << "],\n\"cases\":" << casesJson();
+        os << "],\n\"cases\":" << casesJson() << ",\n\"fsms\":" << fsmText;
         if (haveVcd) {
             os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale) << ",\"waves\":{";
             first = true;
@@ -1613,6 +1751,9 @@ void usage() {
                  "  -threads N       threads for parsing and for reading the waveform\n"
                  "                   (default: every logical core; the output is the same for any N)\n"
                  "  -scopes          list the instances    -signals  list the signals\n"
+                 "  -fsm [NAME]      the state machines (all, under an instance, or one register): states,\n"
+                 "                   transitions and their lines; with -vcd, the state at -at T, how often\n"
+                 "                   each transition ran, the ones never taken and values that are not states\n"
                  "  -blocks INST     the instances inside INST, their port connections and what feeds what\n"
                  "  -html <file>     write a one-file viewer: hierarchy, source, drivers and\n"
                  "                   loads, a schematic of the cone, and waves when -vcd is given\n"
@@ -1650,6 +1791,13 @@ int main(int argc, char** argv) {
             std::cout << "mdebug " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
             return 0;
         }
+        if (a == "-fsm") {
+            // -fsm, or -fsm NAME: an instance or a state register.
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"fsm", arg, -1, std::nullopt});
+            continue;
+        }
         if (a == "-blocks") { queries.push_back({"blocks", next("an instance"), -1, std::nullopt}); continue; }
         if (a == "-drivers" || a == "-loads" || a == "-trace" || a == "-active") {
             queries.push_back({a.substr(1), next("a signal"), -1, std::nullopt});
@@ -1684,6 +1832,7 @@ int main(int argc, char** argv) {
     Collect c(tool.db);
     fe.comp->getRoot().visit(c);
 
+    tool.fsms = extractFsms(fe.comp->getRoot());
     if (!vcdPath.empty()) {
         std::string err;
         if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
@@ -1695,6 +1844,7 @@ int main(int argc, char** argv) {
         if (q.what == "drivers") ok &= tool.drivers(q.arg);
         else if (q.what == "loads") ok &= tool.loads(q.arg);
         else if (q.what == "blocks") ok &= tool.blocks(q.arg);
+        else if (q.what == "fsm") ok &= tool.fsm(q.arg, at);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")
