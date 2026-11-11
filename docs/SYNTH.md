@@ -135,4 +135,6 @@ half that the equivalence, formal and FPGA tools share. Beside the graph,
 `tests/synth`: each design is synthesized and its testbench is simulated
 with `msim` on the RTL and on the netlist with random stimulus; both runs
 must print the same lines. This is done with the default library and with a
-library of only an inverter, a NAND and one flop.
+library of only an inverter, a NAND and one flop. Each netlist on the default library is
+also proven equivalent to its RTL with `mequiv`, and a netlist with one gate
+swapped must be reported as different.

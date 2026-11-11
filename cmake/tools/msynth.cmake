@@ -40,6 +40,16 @@ if(Python3_FOUND)
                      $<TARGET_FILE:msynth> $<TARGET_FILE:msim> ${CMAKE_SOURCE_DIR}/tests/synth
                      ${CMAKE_CURRENT_BINARY_DIR}/msynth_test_nand ${t} ${CMAKE_SOURCE_DIR}/tests/synth/nand.lib)
   endforeach()
+  # The netlist is also proven equivalent to the RTL by mequiv, and a netlist
+  # with one gate swapped must be reported as different.
+  if(TARGET mequiv)
+    foreach(t counter alu fsm hier)
+      add_test(NAME msynth_equiv_${t}
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/equiv_test.py
+                       $<TARGET_FILE:msynth> $<TARGET_FILE:mequiv> ${CMAKE_SOURCE_DIR}/tests/synth
+                       ${CMAKE_CURRENT_BINARY_DIR}/msynth_test ${t})
+    endforeach()
+  endif()
   add_test(NAME msynth_shell
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/shell_test.py
                    $<TARGET_FILE:msynth> ${CMAKE_SOURCE_DIR}/tests/synth ${CMAKE_CURRENT_BINARY_DIR}/msynth_shell)
