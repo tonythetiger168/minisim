@@ -283,6 +283,23 @@ struct SparseLU {
         }
         for (int i = 0; i < n; i++) x[colOf[i]] = y[i];
     }
+
+    // The transposed system (plain transpose, also for complex numbers):
+    // b by unknown, x by row. This is the adjoint circuit, which gives the
+    // transfer from every place in the circuit to one output in one solve.
+    void solveT(const T* b, T* x) {
+        for (int i = 0; i < n; i++) w[i] = b[colOf[i]];
+        for (int i = 0; i < n; i++) {
+            T t = w[i] * dinv[i];
+            y[i] = t;
+            for (int e = up[i] + 1; e < up[i + 1]; e++) w[ui[e]] -= ux[e] * t;
+        }
+        for (int i = n - 1; i >= 0; i--) {
+            T t = y[i];
+            for (int e = lp[i]; e < lp[i + 1]; e++) y[li[e]] -= lx[e] * t;
+            x[prow[i]] = t;
+        }
+    }
 };
 
 // The threads are the tool line's shared pool (parallel.hpp).

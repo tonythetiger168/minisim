@@ -38,6 +38,10 @@ and trailing unit letters are ignored (`10pF`, `2.2kohm`).
 | Voltage-controlled current source | `Gname n+ n- nc+ nc- gm` |
 | Current-controlled current source | `Fname n+ n- Vcontrol gain` |
 | Current-controlled voltage source | `Hname n+ n- Vcontrol r` |
+| Behavioral source | `Bname n+ n- v=expression` or `i=expression` |
+| The same, as E or G | `Ename n+ n- vol='expression'`, `Gname n+ n- cur='expression'` (or `value={...}`) |
+| Voltage-controlled switch | `Sname n+ n- nc+ nc- model [on\|off]` |
+| Current-controlled switch | `Wname n+ n- Vcontrol model [on\|off]` |
 | Diode | `Dname anode cathode model [area] [off]` |
 | MOSFET | `Mname d g s b model [w= l= ad= as= pd= ps= m=]` |
 | Bipolar transistor | `Qname c b e [substrate] model [area] [off]` |
@@ -45,6 +49,21 @@ and trailing unit letters are ignored (`10pF`, `2.2kohm`).
 
 Waveforms: `pulse(v1 v2 td tr tf pw per)`, `sin(vo va freq td theta phase)`,
 `pwl(t1 v1 t2 v2 ...)`, `exp(v1 v2 td1 tau1 td2 tau2)`.
+
+A behavioral expression may use `v(node)`, `v(a,b)`, `i(element)` (a voltage
+source, inductor, E or H source defined above the line), `time`, `temper`,
+parameters, every operator and function of parameter expressions, and `u(x)`
+(step), `uramp(x)` and `limit(x, lo, hi)`. The expression is compiled once;
+each evaluation gives its value and, by reverse-mode differentiation, the
+exact derivative with respect to every voltage and current in it, which is
+what Newton's method and the AC analysis use. A source may read its own
+output.
+
+Switches: `.model name sw vt= vh= ron= roff=` (and `csw it= ih=`) is the
+SPICE3 switch: on above `vt + vh`, off below `vt - vh`, unchanged in between.
+`.model name vswitch von= voff= ron= roff=` (and `iswitch ion= ioff=`) moves
+log(R) along a smooth S-curve between the two control levels, which converges
+and steps much better; prefer it where the exact threshold does not matter.
 
 ### Models
 
@@ -100,6 +119,43 @@ subcircuit, node `n` of instance `x1` is `x1.n` and element `r1` is `x1.r1`.
 `.global` nodes and node `0` (or `gnd`) are shared. `.include "file"` reads
 another file.
 
+### Corners, `.alter` and Monte Carlo
+
+```
+.lib 'models.lib' tt        * read section tt of models.lib
+...
+.alter slow corner          * run everything again with:
+.lib 'models.lib' ss
+.alter                      * and once more, on top of that, with:
+r1 vdd d 5k
+```
+
+In a library file a section runs from `.lib name` to `.endl`; a section may
+read others with `.lib 'file' name`. Each `.alter` block is one more run of
+the whole deck. A line in the block replaces the line of the same name (an
+element, a `.model`, a `.param`, a `.subckt`, an analysis of the same kind, a
+`.measure`); a `.lib` line replaces what the earlier `.lib` of the same file
+brought in; anything else is added. Blocks build on each other, as in HSPICE.
+Output files of the k-th block get `.altk` before the extension.
+
+`.step monte N` (or `sweep monte=N` at the end of an analysis line) runs N
+Monte Carlo samples. In a sample these functions draw; otherwise they give
+the nominal value:
+
+| Function | Value |
+|---|---|
+| `gauss(nom, rel, sigma)` | normal, standard deviation `nom*rel/sigma` |
+| `agauss(nom, abs, sigma)` | normal, standard deviation `abs/sigma` |
+| `unif(nom, rel)` | uniform in `nom*(1 ± rel)` |
+| `aunif(nom, abs)` | uniform in `nom ± abs` |
+
+A top-level `.param` is drawn once per sample and so is the same everywhere
+it is used (global variation). A `.param` inside a subcircuit is drawn once
+per instance (local variation, mismatch). The draws depend only on
+`.option seed=` (default 1) and the sample number, so the results are the same
+at any thread count and sample k can be rerun alone. After the samples mspice
+prints the mean, standard deviation, minimum and maximum of each `.measure`.
+
 ### Analyses
 
 | Line | Analysis |
@@ -108,6 +164,10 @@ another file.
 | `.dc src start stop step [src2 start2 stop2 step2]` | DC sweep of one or two sources |
 | `.ac dec\|oct\|lin n fstart fstop` | small-signal frequency response |
 | `.tran tstep tstop [tstart [tmax]] [uic]` | transient |
+| `.noise v(out[,ref]) src dec\|oct\|lin n fstart fstop` | noise at an output, and referred to the input source |
+| `.tf v(out)\|i(vsrc) src` | DC small-signal gain, input and output resistance |
+| `.sens v(out)\|i(vsrc) ...` | DC sensitivity of each output to every resistor and source |
+| `.four freq out1 out2 ...` | harmonics and distortion over the last period of the `.tran` |
 
 `.ic v(node)=value` holds nodes during the operating point (or, with `uic`,
 is the starting state); `.nodeset v(node)=value` is a first guess.
@@ -117,6 +177,29 @@ is the starting state); `.nodeset v(node)=value` is a first guess.
 `.step dec|oct param name start stop points` repeat every analysis for each
 value. Several `.step` lines nest; the last one varies fastest.
 
+`.noise` adds up the noise of every device at the output: thermal noise of
+resistors (including the series resistances of the models), shot noise of
+diode and bipolar currents, channel thermal noise `8kT gm/3` of the level-1
+MOSFET, and flicker noise where the model gives `kf` (`af`, default 1): `kf
+i^af / f` for diodes and base currents, `kf id^af / (f W Leff Cox^2)` for the
+MOSFET, the formulas of ngspice. The columns are `onoise` and `inoise`, in
+V/sqrt(Hz) (`inoise` in the unit of the input source). `.print noise onoise
+inoise` prints them, `.measure noise` reads them, and the totals over the
+band come out as `onoise_total` and `inoise_total` with the ten largest
+contributors. One adjoint (transposed) solve per frequency gives the transfer
+from every noise source at once, so the cost is that of an `.ac` sweep
+however many devices there are; the frequencies are spread over the threads.
+
+`.tf` prints `transfer_function`, `input_resistance` and `output_resistance`;
+`.sens` prints one line per resistor and independent source: the change of
+the output per ohm, volt or ampere. Both come from the linearized circuit at
+the operating point; `.sens` takes a single adjoint solve.
+
+`.four` reads each output on 4,096 evenly spaced points of the last period
+and prints the DC value, nine harmonics as `magnitude * sin(k w t + phase)`
+and the total harmonic distortion in percent, which is also a measurement
+named `thd_<node>` (`thd_i_<source>` for a current).
+
 ### Outputs
 
 `.print op|dc|ac|tran outputs...` prints a table. An output is `v(node)`,
@@ -125,6 +208,10 @@ AC, add `m` (magnitude), `db`, `p` (phase in degrees), `r` or `i`:
 `vdb(out)`, `vp(out)`, `im(v1)`. A transient table is printed on the `tstep`
 grid by interpolation; `-o` writes the solver's own points. With no `.print`
 for an analysis, `-o` holds every node voltage and source current.
+
+`-raw file` writes every analysis (and every `.step` run) as a plot of one
+SPICE raw file in the binary form of SPICE3 and ngspice, which waveform
+viewers read; `-raw-ascii file` writes the text form. All values are real.
 
 `.measure` (or `.meas`):
 
@@ -202,6 +289,11 @@ that the output is the same at 1, 3 and all threads, and, when ngspice is
 installed (it is in CI), compares every measurement with ngspice: within 1%
 by default, 2% for the MOSFET and BJT switching circuits. With tolerances
 tightened in both simulators, an inverter's delays agree to five digits.
+The `.noise`, `.tf`, `.sens` and `.four` tests carry numbers worked out by
+hand and numbers from ngspice 42, whose noise analysis runs from a control
+block that check.py does not write: each device's share of the output noise,
+the transfer function, every sensitivity and the distortion agree to five or
+six digits.
 
 ## Speed
 
@@ -212,6 +304,7 @@ ngspice. On a 4-CPU cloud machine, ngspice 42, best of three, seconds:
 |---|---|---|---|
 | 20,000-section RC ladder, transient | 0.86 | 0.87 | 1.36 |
 | 60 x 60 RC mesh, 401-point AC | 1.86 | 0.73 | 6.41 |
+| the same mesh, 401-point noise analysis (7,140 noise sources) | 2.04 | 0.76 | 6.93 |
 | 2,000 inverters in a chain (4,000 level-1 MOSFETs), transient | 1.03 | 0.60 | 1.75 |
 | 101-stage ring oscillator, level 1, transient | 0.35 | 0.35 | 0.52 |
 | 3 inverters with RC load, 64-value `.step`, transient | 0.58 | 0.17 | no `.step` |
@@ -246,11 +339,14 @@ line: path, nodes, model, parameters.
 ## Not there yet
 
 - BSIM3 and other MOSFET levels (2, 3, BSIM-CMG), the JFET; for BSIM4:
-  noise, binned models, `ic=`; behavioral (`B`) sources, switches,
-  transmission lines.
-- `.noise`, `.tf`, `.sens`, `.four`, `.lib` sections, `.alter`; `.dc` sweeps
+  noise, binned models, `ic=`; `ddt()`, `idt()` and tables in behavioral
+  sources; transmission lines.
+- Noise of BSIM4 transistors; `.sens` for model parameters and in AC;
+  `.pz`; `.data` sweeps, `lot`/`dev` tolerances
+  on `.model` lines, `.variation` blocks; `.dc` sweeps
   of a parameter or temperature; `i()` of a resistor or a device terminal.
 - Temperature: the thermal voltage, the diode and BJT saturation current and
   the MOSFET mobility follow `temp`; other temperature coefficients do not.
-- Gear integration; ngspice raw files (CSV and VCD are written).
+- Gear integration; complex values in raw files (an AC plot holds the
+  magnitudes and phases asked for).
 - Mixed-signal co-simulation with msim (real-number models, Verilog-AMS).

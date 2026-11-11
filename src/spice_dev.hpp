@@ -102,6 +102,14 @@ struct Charge {
     }
 };
 
+// A noise current source between two nodes, at the operating point: its
+// spectral density is white + flicker / f, in A^2/Hz.
+struct NoiseSrc {
+    int a, b;
+    double white, flicker;
+};
+constexpr double kBoltz = 1.380649e-23, kCharge = 1.602176634e-19;
+
 struct Device {
     std::string name;
     // Set by eval(): this iteration cannot be the last one, because a
@@ -122,6 +130,7 @@ struct Device {
     virtual void breaks(double, double, std::vector<double>&) const {}
     virtual bool nonlinear() const { return false; }
     virtual int branch() const { return -1; }
+    virtual void noise(double /*kelvin*/, std::vector<NoiseSrc>&) const {}
 };
 
 // ------------------------------------------------------------------ BSIM4
@@ -344,6 +353,7 @@ struct Resistor final : Device {
     void bind(Setup& S) override { int nd[2] = {p, n}; sl.init(S, nd); }
     void load(const Ctx&, double* val, double*) override { sl.g(val, 0, 1, g); }
     void loadAC(double, cplx* val, cplx*) const override { sl.g(val, 0, 1, g); }
+    void noise(double kelvin, std::vector<NoiseSrc>& out) const override { out.push_back({p, n, 4 * kBoltz * kelvin * g, 0}); }
 };
 
 struct Capacitor final : Device {
@@ -495,6 +505,7 @@ struct Diode final : Device {
     // Model, already scaled by area and temperature.
     double isat = 1e-14, nf = 1, cj0 = 0, vj = 1, mj = 0.5, tt = 0, fc = 0.5;
     double bv = 0;   // already moved so that I(bv) = ibv
+    double kf = 0, af = 1;   // flicker noise
     bool off = false;
     double vcrit = 0, vdOld = 0;
     double gd = 0, cap = 0, gtot = 0, ieq = 0, id = 0, itot = 0, qd = 0;
@@ -556,6 +567,11 @@ struct Diode final : Device {
         rhs[a] -= ieq; rhs[k] += ieq;
     }
     void loadAC(double w, cplx* val, cplx*) const override { sl.g(val, 0, 1, cplx(gd, w * cap)); }
+    // Shot noise of the junction current, and flicker noise KF id^AF / f.
+    void noise(double, std::vector<NoiseSrc>& out) const override {
+        double i = std::fabs(id);
+        out.push_back({a, k, 2 * kCharge * i, kf > 0 && i > 0 ? kf * std::pow(i, af) : 0});
+    }
     void accept(const Ctx&) override { ch.accept(); }
     void charges(std::vector<Charge*>& out) override { out.push_back(&ch); }
 };
@@ -569,6 +585,7 @@ struct Mosfet final : Device {
     double vto = 0, beta = 0, gamma = 0, phi = 0.6, lambda = 0, isat = 1e-14, pb = 0.8, fc = 0.5;
     double cbd0 = 0, cbs0 = 0, cbdsw = 0, cbssw = 0, mj = 0.5, mjsw = 0.5;
     double cox = 0, covgs = 0, covgd = 0, covgb = 0;
+    double kf = 0, af = 1, flickDen = 0;   // flicker noise; flickDen is W Leff Cox^2, Cox per area
     // The linearization point (limited voltages) and what was found there.
     double vgs = 0, vds = 0, vbs = 0, von = 0, vdsat = 0, vcrit = 0;
     int mode = 1;
@@ -758,6 +775,13 @@ struct Mosfet final : Device {
         sl.g(val, G, D, cplx(0, w * cgd));
         sl.g(val, G, B, cplx(0, w * cgb));
     }
+    // SPICE's level-1 noise: channel thermal noise 8kT gm / 3 and flicker
+    // noise KF id^AF / (f W Leff Cox^2), as ngspice has it, both from drain to source.
+    void noise(double kelvin, std::vector<NoiseSrc>& out) const override {
+        double i = std::fabs(ids);
+        out.push_back({node[D], node[S], 8.0 / 3 * kBoltz * kelvin * std::fabs(gm),
+                       kf > 0 && i > 0 && flickDen > 0 ? kf * std::pow(i, af) / flickDen : 0});
+    }
     void accept(const Ctx&) override {
         qbd.accept(); qbs.accept(); qgs.accept(); qgd.accept(); qgb.accept();
         vgs0 = evgs; vgd0 = evgs - evds; vgb0 = evgs - evbs;
@@ -775,6 +799,7 @@ struct Bjt final : Device {
     double isat = 1e-16, bf = 100, br = 1, nf = 1, nr = 1, ise = 0, ne = 1.5, isc = 0, nc = 2;
     double ivaf = 0, ivar = 0, iikf = 0, iikr = 0;   // inverses: 0 means infinite
     double cje = 0, vje = 0.75, mje = 0.33, cjc = 0, vjc = 0.75, mjc = 0.33, tf = 0, tr = 0, fc = 0.5;
+    double kf = 0, af = 1;   // flicker noise
     bool off = false, valid = false;
     double vcrit = 0, vbeO = 0, vbcO = 0;   // the last linearization point
     double vbeE = 0, vbcE = 0;              // the last evaluation
@@ -862,6 +887,12 @@ struct Bjt final : Device {
         sl.g(val, B, C, cplx(gmu, w * cbc));
         sl.vccs(val, C, E, B, E, gf);
         sl.vccs(val, C, E, B, C, gr);
+    }
+    // Shot noise of the collector and base currents, flicker noise of the base current.
+    void noise(double, std::vector<NoiseSrc>& out) const override {
+        double ic = std::fabs(icT), ib = std::fabs(ibT);
+        out.push_back({node[C], node[E], 2 * kCharge * ic, 0});
+        out.push_back({node[B], node[E], 2 * kCharge * ib, kf > 0 && ib > 0 ? kf * std::pow(ib, af) : 0});
     }
     void accept(const Ctx&) override { qbe.accept(); qbc.accept(); }
     void charges(std::vector<Charge*>& out) override { out.insert(out.end(), {&qbe, &qbc}); }

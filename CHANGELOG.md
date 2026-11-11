@@ -565,6 +565,27 @@ Spec references are IEEE 1800-2023 clauses.
   and a second, third... defect when one does not explain everything. Uses
   the shared fault simulator; multithreaded with the same report on any
   thread count. See docs/JTAG.md.
+- `mspice`: behavioral sources (`B` elements, `E`/`G` with `vol=`, `cur=` or
+  `value=`): any expression of node voltages, branch currents and `time`,
+  compiled once and differentiated exactly for Newton's method and AC;
+  switches (`S`, `W`) in the SPICE3 form with hysteresis and in a smooth
+  form (`vswitch`, `iswitch`); `-raw` and `-raw-ascii` write SPICE raw files
+  that ngspice and waveform viewers load.
+- `mspice`: `.noise` (thermal, shot and flicker noise of every device at an
+  output and referred to the input, totals and largest contributors), `.tf`
+  (DC gain, input and output resistance), `.sens` (DC sensitivity to every
+  resistor and source) and `.four` (harmonics and total harmonic distortion).
+  Noise and sensitivities use the adjoint circuit: one transposed solve
+  instead of one solve per device. On a 3,600-node mesh with 7,140 noise
+  sources, a 401-point noise analysis takes 2.0 s on one thread and 0.8 s on
+  four; ngspice 42 takes 6.9 s and gives the same total.
+- `mspice`: process corners and statistics. `.lib 'file' section` reads a
+  section of a library file, `.alter` blocks rerun the deck with lines
+  replaced, and `.step monte N` (or `sweep monte=N`) runs Monte Carlo samples
+  in parallel with `gauss`, `agauss`, `unif` and `aunif`: a top-level
+  parameter varies globally, a subcircuit parameter per instance. Samples
+  depend only on the seed and the sample number; mean, sigma, minimum and
+  maximum of every `.measure` are printed.
 - `mspice`: BSIM4 transistors (`.model ... level=14` or `54`). The model
   equations are the UC Berkeley BSIM Research Group's BSIM4 4.8.3 code,
   unmodified under the Educational Community License 2.0
