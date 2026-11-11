@@ -105,6 +105,7 @@ A rule reports the places where its comparison is true.
 | `space(a) < v` | outside distance between polygons, in notches, and corner to corner |
 | `space(a, b) < v` | outside distance between `a` and `b` |
 | `enclosure(a, b) < v` | `a` must be inside `b` with margin `v`. Reports margins from 0 up to `v`, and any part of `a` outside `b` |
+| `enclosure(a, b, opposite) < v` | the same margins, but a polygon of `a` passes when it has margin `v` on two opposite sides (left and right, or bottom and top). This is the foundry rule "enclosure on one of two adjacent sides", as for contacts and vias with a line-end enclosure. Parts of `a` outside `b` are always reported |
 | `overhang(a, b) < v` | where `a` crosses `b`, `a` must continue past `b` by `v` (a poly end cap, diffusion past a gate) |
 | `area(a) < v`, `area(a) > v` | polygon area |
 | `density(a, w) < v`, `... > v` | area of `a` over the area of each `w` by `w` window of the extent. `density(a, w, s)` steps the windows by `s`; the last window of each row and column is moved back to end on the extent |

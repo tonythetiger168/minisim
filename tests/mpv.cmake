@@ -24,7 +24,7 @@ endfunction()
 foreach(cell inv_1 nand2_1 mux2_1 dfxtp_1)
   run(0 drc -deck ${SRC}/tests/pv/sky130.drc ${SRC}/tests/pv/sky130/sky130_fd_sc_hd__${cell}.gds)
   expect("cell sky130_fd_sc_hd__${cell}")
-  expect("0 violations in 0 of 35 rules")
+  expect("0 violations in 0 of 40 rules")
 endforeach()
 
 # The same cell against a tighter rule: the tool does report what is there.
@@ -90,7 +90,7 @@ run(2 lvs -deck ${SRC}/tests/pv/mini.drc ${OUT}/pv_bad.gds)
 # OASIS layouts (plain and with compressed blocks): the same answers as GDSII.
 run(0 drc -deck ${SRC}/tests/pv/sky130.drc ${SRC}/tests/pv/oasis/sky130_fd_sc_hd__inv_1.oas)
 expect("cell sky130_fd_sc_hd__inv_1")
-expect("0 violations in 0 of 35 rules")
+expect("0 violations in 0 of 40 rules")
 run(0 lvs -deck ${SRC}/tests/pv/sky130.lvs ${SRC}/tests/pv/oasis/sky130_fd_sc_hd__dfxtp_1.oas -o ${OUT}/dfxtp_oas.spice)
 expect("cell sky130_fd_sc_hd__dfxtp_1, 24 devices, 18 nets, 7 ports")
 file(READ ${OUT}/dfxtp_oas.spice oas)
