@@ -145,6 +145,42 @@ run("-lef", lef, out("rand.v"), "-def", out("rand4.def"), "-threads", "4")
 assert open(out("rand1.def")).read() == open(out("rand4.def")).read(), "random design: -threads 4 differs from -threads 1"
 
 
+# 6a. Clock trees: every flop sits behind the same number of buffers, no
+# buffer or clock driver has more than the fan-out limit, and the options work.
+def clock_depths(def_path, fanout):
+    text = open(def_path).read()
+    nets = text[text.index("\nNETS "):text.index("END NETS")]
+    driver, depth, flops = {}, {}, 0
+    for m in re.finditer(r"\n- (\S+)((?:\s+\( \S+ \S+ \))+)", nets):
+        conns = re.findall(r"\( (\S+) (\S+) \)", m.group(2))
+        loads = [c for c in conns if not (c[0].startswith("mpnr_cts_b") and c[1] == "Y") and c[0] != "PIN"]
+        if any(c[1] == "CK" for c in conns) or any(c[0].startswith("mpnr_cts_b") for c in conns):
+            assert len(loads) <= fanout, "net %s has %d loads" % (m.group(1), len(loads))
+        src = [c[0] for c in conns if c[0].startswith("mpnr_cts_b") and c[1] == "Y"]
+        for c in loads:
+            driver[c] = src[0] if src else None
+    def up(conn):
+        n = 0
+        while driver.get(conn):
+            conn = (driver[conn], "A")
+            n += 1
+        return n
+    return sorted({up(c) for c in driver if c[1] == "CK"})
+need(log, r"clock tree: clk: 375 loads behind 27 BUF in 3 levels; driver to load [\d.]+ to [\d.]+ um of wire")
+assert clock_depths(out("rand1.def"), 16) == [3], "clock tree depths: %s" % clock_depths(out("rand1.def"), 16)
+log = run("-lef", lef, out("rand.v"), "-def", out("rand_f4.def"), "-cts_fanout", "4", "-cts_buf", "BUF", "-clock", "clk", "-netlist", out("rand_f4.v"))
+need(log, r"clock tree: clk: 375 loads behind \d+ BUF in 5 levels")
+need(log, r"0 open, 0 shorts, 0 spacing violations")
+assert clock_depths(out("rand_f4.def"), 4) == [5]
+# The netlist written back has the buffers and gets no second tree.
+log = run("-lef", lef, out("rand_f4.v"), "-def", out("rand_f4b.def"), "-cts_fanout", "4")
+assert "clock tree" not in log and "mpnr_cts_b0 " in open(out("rand_f4.v")).read()
+log = run("-lef", lef, out("rand.v"), "-def", out("rand_nc.def"), "-no_cts")
+assert "clock tree" not in log and "mpnr_cts" not in open(out("rand_nc.def")).read()
+need(run("-lef", lef, out("rand.v"), "-cts_buf", "NAND2", rc=2), r"-cts_buf: NAND2 is not a buffer")
+need(run("-lef", lef, out("rand.v"), "-clock", "nosuch", rc=2), r"-clock: no net 'nosuch'")
+need(run("-lef", lef, out("rand.v"), "-cts_fanout", "1", rc=2), r"-cts_fanout must be 2 or more")
+
 # 6b. Power straps: on by default, they tie every rail of a supply together.
 log = run("-lef", lef, counter, "-def", out("straps.def"))
 need(log, r"power: 2 straps over the rails")
@@ -190,6 +226,32 @@ if mpv:
         p = subprocess.run([mpv, "drc", *lefs, out(name), "-q"], capture_output=True, text=True)
         bad = [l for l in (p.stdout + p.stderr).splitlines() if re.match(r"\S+ +\d+ +\S", l) and not l.startswith("metal1.area")]
         assert not bad and "violations in" in p.stdout + p.stderr, "mini45: mpv drc finds\n" + p.stdout + p.stderr
+
+# 6d. Timing with the shared timing engine: a report from the placement, the
+# clocks timed through their trees, and a second placement that weights the
+# nets on slow paths and ends with more slack than the first.
+open(out("m45.sdc"), "w").write("create_clock -name clk -period 16 [get_ports clk]\n"
+                                "set_input_delay 0.2 -clock clk [all_inputs]\nset_output_delay 0.2 -clock clk [all_outputs]\n")
+tim = ["-lib", os.path.join(src, "lib/mini45/mini45_tt.lib"), "-sdc", out("m45.sdc")]
+def placed_wns(text):
+    m = re.search(r"timing \(placed\): setup WNS (-?[\d.]+) ns, TNS (-?[\d.]+) ns, (\d+) of (\d+) endpoints violate; hold WNS (-?[\d.]+) ns", text)
+    assert m, text
+    return float(m.group(1))
+log = run(*m45, out("m45.v"), "-def", out("m45_t.def"), *tim, "-report", out("m45_t.json"))
+need(log, r"timing \(global placement\): setup WNS -?[\d.]+ ns")
+need(log, r"timing-driven placement: \d+ nets weighted")
+need(log, r"clock clk: arrives at 250 clock pins between [\d.]+ and [\d.]+ ns \(skew 0\.00\d ns\)")
+need(log, r"0 open, 0 shorts, 0 spacing violations")
+need(open(out("m45_t.json")).read(), r'"setup_wns_ns": -?[\d.]+')
+plain = run(*m45, out("m45.v"), "-def", out("m45_p.def"), *tim, "-no_timing_driven")
+assert "nets weighted" not in plain
+assert placed_wns(log) > placed_wns(plain), "timing-driven placement: WNS %g, without %g" % (placed_wns(log), placed_wns(plain))
+# Without the timing-driven pass the placement is the one made with no timing at all.
+run(*m45, out("m45.v"), "-def", out("m45_n.def"))
+assert open(out("m45_p.def")).read() == open(out("m45_n.def")).read()
+run(*m45, out("m45.v"), "-def", out("m45_t1.def"), *tim, "-threads", "1")
+assert open(out("m45_t.def")).read() == open(out("m45_t1.def")).read(), "timing-driven: -threads 1 differs"
+need(run(*m45, out("m45.v"), "-sdc", out("m45.sdc"), rc=2), r"timing needs both -lib and -sdc")
 
 # 7. GDS out: one reference per component, the cells as abstracts, the same
 # bytes for any thread count, a layer map file, and the conversion of a DEF.
