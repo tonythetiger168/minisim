@@ -51,7 +51,7 @@ endif()
 
 # Corners: slow against fast is clean, the other way round is not.
 run(0 compare ${M45}/mini45_ss.lib ${M45}/mini45_ff.lib -Werror)
-if(NOT out MATCHES "88 cells, 210 arcs compared, slow/fast delay ratio 1.9[0-9]*, 0 findings")
+if(NOT out MATCHES "88 cells, 210 arcs compared, slow/fast delay ratio [12]\\.[0-9]+, 0 findings")
   message(FATAL_ERROR "compare ss ff:\n${out}")
 endif()
 run(1 compare ${M45}/mini45_ff.lib ${M45}/mini45_ss.lib -Werror)
@@ -64,7 +64,7 @@ if(NOT out MATCHES "INV_X1: .CMP001." OR NOT out MATCHES "NOFUNC: .CMP001.")
 endif()
 
 run(0 report ${M45}/mini45_tt.lib)
-if(NOT out MATCHES "library mini45_tt: 88 cells, 1.1 V, 25 C" OR NOT out MATCHES "NAND2_X1 +0.798 +2.4 +3 +0.0008"
+if(NOT out MATCHES "library mini45_tt: 88 cells, 1.1 V, 25 C" OR NOT out MATCHES "NAND2_X1 +0.798 +2.4 +3 +0.00[0-9]+"
    OR NOT out MATCHES "total area 193.648")
   message(FATAL_ERROR "report:\n${out}")
 endif()

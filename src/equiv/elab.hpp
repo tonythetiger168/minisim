@@ -113,6 +113,7 @@ struct ElabOptions {
     std::vector<const liberty::Library*> libs;  // cells for modules with no Verilog definition
     size_t maxLoop = 1u << 20;         // iterations before a loop is called unbounded
     bool clockGates = true;            // read a latch-and-AND gated clock as an enable
+    bool fullCase = true;              // honour (* full_case *): no arm matching is a don't-care
 };
 
 class Elab {
@@ -635,6 +636,12 @@ private:
         }
     }
 
+    bool hasAttribute(const Statement& s, std::string_view name) {
+        for (auto* a : comp.getAttributes(s))
+            if (a->name == name) return true;
+        return false;
+    }
+
     void walkProc(const ProceduralBlockSymbol& p) {
         if (p.procedureKind == ProceduralBlockKind::Initial || p.procedureKind == ProceduralBlockKind::Final) return;
         const Statement* body = &p.getBody();
@@ -869,6 +876,12 @@ private:
     // `partial`: when an index is not constant, return the enclosing range.
     // An out-of-range constant index gives w == 0.
     bool staticRange(const Expression& e, bool symbolic, bool partial, Claim& out) {
+        bool dyn = false;
+        return staticRange(e, symbolic, partial, out, dyn);
+    }
+    // dyn: a select below e has an index that is not constant, so 'out' is everything that
+    // select could reach and a constant select above it (mem[addr][7:0]) must not narrow it.
+    bool staticRange(const Expression& e, bool symbolic, bool partial, Claim& out, bool& dyn) {
         if (const Symbol* s = valueSym(e)) {
             if (!isSignal(*s)) return false;
             out = {s, 0, widthOf(*e.type)};
@@ -877,14 +890,17 @@ private:
         if (e.kind == ExpressionKind::Conversion) {
             auto& c = e.as<ConversionExpression>();
             if (widthOf(*c.operand().type) != widthOf(*e.type)) return false;
-            return staticRange(c.operand(), symbolic, partial, out);
+            return staticRange(c.operand(), symbolic, partial, out, dyn);
         }
         if (!isSelect(e)) return false;
         Level L = level(e, symbolic, false);
         Claim p;
-        if (!staticRange(*L.parent, symbolic, partial, p)) return false;
+        if (!staticRange(*L.parent, symbolic, partial, p, dyn)) return false;
         if (!L.isConst) {
             if (!partial) return false;
+            dyn = true;
+        }
+        if (dyn) {
             out = p;
             return true;
         }
@@ -1662,9 +1678,10 @@ private:
                     arms.pop_back();
                 } else if (c.defaultCase) {
                     acc = branch(accF, [&] { execStmt(*c.defaultCase, gd); });
-                } else if (c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Priority) {
-                    // unique/priority with no default: no arm matching is an
-                    // error in the design, so those values are don't-cares.
+                } else if (c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Priority ||
+                           (opt.fullCase && hasAttribute(s, "full_case"))) {
+                    // unique/priority or (* full_case *) with no default: the design
+                    // says no arm matching never happens, so those values are don't-cares.
                     for (auto& a : arms) {
                         for (auto& [k, b] : a.L.env) {
                             auto& v = acc.env[k];
