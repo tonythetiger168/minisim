@@ -417,6 +417,37 @@ Spec references are IEEE 1800-2023 clauses.
 - A run-time error (null object access, a crash) names the statement that
   was running; `MSIM_CALLTRACE=1` prints every method and automatic
   subroutine call.
+- `mdft -bscan`: IEEE 1149.1 boundary-scan insertion (TAP controller,
+  instruction, BYPASS, IDCODE and boundary registers, 2-state, 3-state and
+  bidirectional pads, EXTEST / SAMPLE / PRELOAD / CLAMP / HIGHZ / INTEST)
+  and the BSDL file; `mdft -bsdl` checks a BSDL file (rules BSD001..009) and
+  writes its device tests as SVF and a self-checking testbench
+  (`docs/JTAG.md`).
+- `mdft -icl`: IEEE 1687 IJTAG. Reads ICL, writes the scan network as RTL
+  (optionally behind a TAP), and retargets PDL (`iWrite`, `iRead`, `iApply`,
+  `iCall`, ...) through SIBs and scan muxes to SVF and a testbench.
+- `mdft -lbist`: logic BIST for a scan-inserted design (PRPG on a primitive
+  polynomial, phase shifter, space compactor, MISR, controller and wrapper),
+  the golden signature by simulation (`-lbist_sign`), a check for X sources,
+  and ICL / PDL to run it over IJTAG.
+- `mdft -edt`: scan test compression. A ring-generator decompressor and an
+  XOR compactor around the scan chains, and an encoder that solves test
+  cubes into channel data over GF(2), in parallel and deterministically.
+- `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
+  on the gate netlist (port inputs at 0, scan cells observed), with the
+  coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
+  `-lbist_min_coverage` gate. Uses the shared fault simulator.
+- `mdft -diagnose`: scan failure diagnosis. Reads a tester fail log (pattern,
+  chain, cell or output) with matpg's patterns and the gate netlist, and ranks
+  the stuck-at or transition faults that explain it, with equivalent faults
+  and a second, third... defect when one does not explain everything. Uses
+  the shared fault simulator; multithreaded with the same report on any
+  thread count. See docs/JTAG.md.
+
+### Fixed
+- An inout port connected to a whole net is now that net (23.3.3.1). It was
+  two continuous assignments, one each way, so the net kept the last value
+  driven after every driver had gone to z.
 - `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
   the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
   `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed

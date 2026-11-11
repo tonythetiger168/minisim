@@ -732,6 +732,17 @@ and reports the fault coverage of the chosen algorithm. See
 ```sh
 mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
 mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
+`mdft` also does IEEE 1149.1 boundary scan and IEEE 1687 IJTAG
+([docs/JTAG.md](docs/JTAG.md)); every flow can write SVF and a self-checking
+testbench that `msim` runs:
+
+```sh
+mdft -bscan rtl/*.sv -top chip -tb chip_tb.sv    # chip_bscan.sv (TAP + boundary register), chip_bscan.bsdl
+mdft -bsdl chip.bsdl -svf chip.svf               # check a BSDL file (BSD001..009), write its device tests
+mdft -icl net.icl -icl_rtl net.sv -pdl t.pdl -iproc all -svf t.svf   # IJTAG network RTL, PDL retargeting
+mdft -lbist chip_scan.v -top chip -scandef chains.json -lbist_sign    # logic BIST wrapper, golden signature
+mdft -edt chip_scan.v -top chip -scandef chains.json -edt_cubes cubes.txt -edt_patterns p.txt   # scan compression
+mdft -diagnose fails.log -patterns pats.txt chip_scan.v -top chip   # which faults explain a tester fail log
 ```
 
 `mlint` and `mdft` share one model of the elaborated design

@@ -1,0 +1,6 @@
+# Test cubes for the scan compression test: <pattern> <chain> <bits>, scan-in cell first.
+0 chain0 1x0x
+0 chain1 xx1x0
+1 chain1 10101
+1 chain0 0110
+2 chain0 xxx1
