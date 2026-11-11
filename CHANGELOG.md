@@ -310,6 +310,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: a block of plain assignments and branches gets a clean copy
+  that runs while every condition is known and hands over to the merging
+  copy at the first unknown one. Ibex with `-xprop`: 36 s to 28 s in the
+  interpreter (24.5 s without).
 - `-xprop` is faster: an `if` evaluates its condition once, and clocked
   blocks with merged branches run in parallel again. Ibex with `-xprop`:
   42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
