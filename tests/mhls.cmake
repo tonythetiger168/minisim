@@ -174,6 +174,15 @@ design(pipemem delay -pipeline -dual-port)
 design(pipemem xfer -pipeline -dual-port -clock 2)
 design(pipemem count4 -pipeline -dual-port)
 refuses(pipemem count "accessed more than once per call, and a memory has one port" -pipeline)
+
+# Pipelined functions with streams.
+design(pipestream scale -pipeline)
+design(pipestream scale -pipeline -handshake)
+design(pipestream filt -pipeline)                # a write that does not always happen
+design(pipestream filt -pipeline -handshake)
+design(pipestream gen -pipeline)
+design(pipestream sum -pipeline -clock 4)        # a stream and a memory
+refuses(pipestream twice "stream 'in' is read or written more than once per call" -pipeline)
 execute_process(COMMAND ${MHLS} ${H}/dualport.c -top hist -dual-port -o ${OUT}/hist_rate.sv
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0 OR NOT "${out}${err}" MATCHES "pipelined, 3 stages, one iteration per cycle")
@@ -257,7 +266,7 @@ if(PY)
   endif()
   string(STRIP "${out}" out)
   message(STATUS "${out}")
-  execute_process(COMMAND ${PY} ${H}/fuzz.py --mhls ${MHLS} ${sim} --cxx ${CXX} --out ${OUT}/fuzz_dp --seeds 0:80 --dual-port --pipe-mem
+  execute_process(COMMAND ${PY} ${H}/fuzz.py --mhls ${MHLS} ${sim} --cxx ${CXX} --out ${OUT}/fuzz_dp --seeds 0:80 --dual-port --pipe-io
                   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
   if(NOT rc EQUAL 0)
     message(FATAL_ERROR "mhls fuzz with two-port memories:\n${out}${err}")

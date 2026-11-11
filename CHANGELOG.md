@@ -317,6 +317,9 @@ Spec references are IEEE 1800-2023 clauses.
   that depends on memory data) is pipelined at one iteration every 2 or more
   cycles when that beats running it unpipelined; `#pragma hls pipeline` now
   also works first in a `do` body.
+- `mhls -pipeline`: streams in a pipelined function, one transfer per stream
+  per call. The pipeline waits while a stream it needs is not ready, and
+  says when it takes an input on a new `ap_ready` output.
 - `mhls -pipeline`: memories in a pipelined function. An array parameter or
   a large local array no longer refuses the pipeline: one access per call, or
   two with `-dual-port`, where a read-modify-write of one word still takes a

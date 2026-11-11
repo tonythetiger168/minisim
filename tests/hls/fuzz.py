@@ -17,7 +17,7 @@ import sys
 TYPES = ["int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t", "bool"]
 
 
-PIPE_MEM = False
+PIPE_IO = False
 
 
 class Gen:
@@ -30,6 +30,7 @@ class Gen:
         self.pts = []       # lvalues of struct type pt_t
         self.loopy = not self.pipe and self.r.random() < 0.3   # has loops shaped for loop pipelining
         self.streams = not self.pipe and self.r.random() < (0.5 if self.loopy else 0.2)   # has stream arguments
+        self.pstream = self.pipe and PIPE_IO and self.r.random() < 0.4   # a pipeline that reads and writes a stream once per call
         self.depth = 0
         self.loop = 0
         self.n = 0
@@ -268,7 +269,7 @@ class Gen:
             outp = r.choice(["*", "&"])
             params.append("%s %so0" % (t, outp))
             self.vars.append(("*o0" if outp == "*" else "o0", t))
-        if (not self.pipe or PIPE_MEM) and r.random() < 0.4:
+        if (not self.pipe or PIPE_IO) and r.random() < 0.4:
             t = r.choice(TYPES[:8])
             params.append("%s m0[16]" % t)
             self.arrs.append(("m0", 16, True))
@@ -276,7 +277,7 @@ class Gen:
             self.src_t = r.choice(TYPES[:8])
             params.append("const %s src[16]" % self.src_t)
             params.append("%s dst[16]" % r.choice(TYPES[:8]))
-        if self.streams:
+        if self.streams or self.pstream:
             out.insert(1, '#include "%s"' % os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "include", "mhls_stream.h"))
             params.append("hls::stream<uint8_t>& sin")
             params.append("hls::stream<uint16_t>& sout")
@@ -301,9 +302,14 @@ class Gen:
             t = r.choice(TYPES[:8])
             self.emit("static %s acc = %d;" % (t, r.randint(0, 9)))
             self.vars.append(("acc", t))
+        if self.pstream:
+            self.emit("uint8_t sx = sin.read();")
+            self.vars.append(("sx", "uint8_t"))
         self.depth = -1
         self.block(r.randint(3, 9))
         self.depth = 0
+        if self.pstream:
+            self.emit("%ssout.write(%s);" % ("if (%s) " % self.expr(2) if r.random() < 0.4 else "", self.expr(1)))
         if self.loopy:
             for _ in range(r.randint(1, 2)):
                 self.piped_loop()
@@ -356,10 +362,10 @@ def main():
     ap.add_argument("--vectors", default="12")
     ap.add_argument("--clang", action="store_true", help="read every program through mhls -clang")
     ap.add_argument("--dual-port", action="store_true", help="give every memory two ports (mhls -dual-port)")
-    ap.add_argument("--pipe-mem", action="store_true", help="pipelined functions get a memory argument too")
+    ap.add_argument("--pipe-io", action="store_true", help="pipelined functions get memory and stream arguments too")
     a = ap.parse_args()
-    global PIPE_MEM
-    PIPE_MEM = a.pipe_mem
+    global PIPE_IO
+    PIPE_IO = a.pipe_io
     lo, hi = [int(x) for x in a.seeds.split(":")]
     os.makedirs(a.out, exist_ok=True)
     bad = skipped = 0

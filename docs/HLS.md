@@ -212,6 +212,14 @@ before it writes, and when both go to the same word the written value is
 passed on. In `tests/hls/pipemem.c` a per-bucket counter takes a new call
 every cycle this way.
 
+A pipeline may also read and write streams, one transfer per stream per
+call. Such a pipeline has one more output, `ap_ready`: a call is taken in a
+cycle where `ap_vld_in`, `ap_ce` and `ap_ready` are high. In a cycle where a
+stage needs a stream that is not ready (no element to read, or the sink
+does not take one), every stage waits, `ap_ready` is low and no result comes
+out. With `-handshake` this folds into `in_ready`. See
+`tests/hls/pipestream.c`.
+
 ### Streams
 
 A parameter of type `hls::stream<T>&` (T a scalar type) is a valid/ready

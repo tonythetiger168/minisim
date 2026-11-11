@@ -539,8 +539,11 @@ std::string memRule(Function& f, Block& B, const Cfg& cfg, int K, const std::str
     if (fresh) continue;
     it->second.second = o.st;
     if (o.st - it->second.first >= K)
-      return "array '" + f.arrs[o.ref].name + "' is accessed more than once per " + unit + ", and a memory has one port" +
-             (unit == "call" ? " (-dual-port gives it two)" : "");
+      return f.arrs[o.ref].mode == Arr::Stream
+                 ? "stream '" + f.arrs[o.ref].name + "' is read or written more than once per " + unit +
+                       (unit == "call" ? " (one transfer per call keeps the calls in order)" : "")
+                 : "array '" + f.arrs[o.ref].name + "' is accessed more than once per " + unit + ", and a memory has one port" +
+                       (unit == "call" ? " (-dual-port gives it two)" : "");
   }
   return "";
 }
@@ -796,7 +799,7 @@ std::string svName(const std::string& n) {
       "rand", "randc", "constraint", "solve", "before", "inside", "dist", "with", "matches",
       "tagged", "foreach", "break", "continue", "iff", "chandle", "context", "clocking", "global",
       "let", "checker", "ap_clk", "ap_rst", "ap_start", "ap_done", "ap_idle", "ap_ce", "ap_vld_in",
-      "ap_vld_out", "state", "in_valid", "in_ready", "out_valid", "out_ready"};
+      "ap_vld_out", "ap_ready", "ap_go", "ap_adv", "state", "in_valid", "in_ready", "out_valid", "out_ready"};
   return kw.count(n) ? n + "_" : n;
 }
 
@@ -942,6 +945,25 @@ struct Emitter {
       << cfg.clock << " ns clock.\n";
   }
 
+  bool hasStreams() const {
+    for (auto& a : f.arrs)
+      if (a.mode == Arr::Stream && (a.read || a.written)) return true;
+    return false;
+  }
+  void streams() {
+    // Streams. A transfer happens in a cycle where tvalid and tready are high.
+    for (auto& a : f.arrs) {
+      if (a.mode != Arr::Stream || (!a.read && !a.written)) continue;
+      std::string n = svName(a.name);
+      o << "  logic " << n << "_ce;\n  logic " << rng(a.ety.w) << n << (a.read ? "_rdata" : "_wdata") << ";\n";
+      if (a.read)
+        o << "  assign " << n << "_tready = " << n << "_ce;\n  always_ff @(posedge ap_clk) if (" << n << "_ce && " << n
+          << "_tvalid) " << n << "_rdata <= " << n << "_tdata;\n";
+      else
+        o << "  assign " << n << "_tvalid = " << n << "_ce;\n  assign " << n << "_tdata = " << n << "_wdata;\n";
+    }
+  }
+
   void rams() {
     // Internal RAMs.
     for (auto& a : f.arrs) {
@@ -1002,18 +1024,7 @@ struct Emitter {
     for (auto& v : f.vars)
       if (v.portOut || v.port == Var::Ret) o << "  assign " << outPort(v) << " = r_" << v.name << ";\n";
 
-    // Streams. A transfer happens in a cycle where tvalid and tready are high.
-    for (auto& a : f.arrs) {
-      if (a.mode != Arr::Stream || (!a.read && !a.written)) continue;
-      std::string n = svName(a.name);
-      o << "  logic " << n << "_ce;\n  logic " << rng(a.ety.w) << n << (a.read ? "_rdata" : "_wdata") << ";\n";
-      if (a.read)
-        o << "  assign " << n << "_tready = " << n << "_ce;\n  always_ff @(posedge ap_clk) if (" << n << "_ce && " << n
-          << "_tvalid) " << n << "_rdata <= " << n << "_tdata;\n";
-      else
-        o << "  assign " << n << "_tvalid = " << n << "_ce;\n  assign " << n << "_tdata = " << n << "_wdata;\n";
-    }
-
+    streams();
     rams();
 
     // Datapath: one wire per operator.
@@ -1342,13 +1353,20 @@ struct Emitter {
          "// in_ready are high, the result waits with out_valid high until out_ready.\n";
     o << "module " << f.name << "_hs (\n  input  logic ap_clk,\n  input  logic ap_rst,\n  input  logic in_valid,\n"
          "  output logic in_ready,\n  output logic out_valid,\n  input  logic out_ready";
-    for (size_t i = 5; i < p.size(); i++) o << ",\n  " << p[i];
+    // A pipeline with streams also says when it takes an input (ap_ready).
+    const size_t first = pipeline && hasStreams() ? 6 : 5;
+    for (size_t i = first; i < p.size(); i++) o << ",\n  " << p[i];
     o << "\n);\n";
     std::string conn = ".ap_clk(ap_clk), .ap_rst(ap_rst)";
     if (pipeline) {
       // A result nobody takes stalls every stage behind it.
-      o << "  logic ap_ce;\n  assign ap_ce = !out_valid || out_ready;\n  assign in_ready = ap_ce;\n";
-      conn += ", .ap_ce(ap_ce), .ap_vld_in(in_valid), .ap_vld_out(out_valid)";
+      if (first == 6) {
+        o << "  logic ap_ce, ap_ready;\n  assign ap_ce = !out_valid || out_ready;\n  assign in_ready = ap_ce && ap_ready;\n";
+        conn += ", .ap_ce(ap_ce), .ap_vld_in(in_valid), .ap_vld_out(out_valid), .ap_ready(ap_ready)";
+      } else {
+        o << "  logic ap_ce;\n  assign ap_ce = !out_valid || out_ready;\n  assign in_ready = ap_ce;\n";
+        conn += ", .ap_ce(ap_ce), .ap_vld_in(in_valid), .ap_vld_out(out_valid)";
+      }
     } else {
       // The outputs hold after ap_done; the next call starts when the
       // result has been taken.
@@ -1357,7 +1375,7 @@ struct Emitter {
            "  always_ff @(posedge ap_clk) hold <= !ap_rst && out_valid && !out_ready;\n";
       conn += ", .ap_start(ap_start), .ap_done(ap_done), .ap_idle(ap_idle)";
     }
-    for (size_t i = 5; i < p.size(); i++) conn += ", ." + name(p[i]) + "(" + name(p[i]) + ")";
+    for (size_t i = first; i < p.size(); i++) conn += ", ." + name(p[i]) + "(" + name(p[i]) + ")";
     o << "  " << f.name << " core (" << conn << ");\nendmodule\n";
   }
 
@@ -1369,6 +1387,8 @@ struct Emitter {
     o << "// Latency " << L << " cycle" << (L == 1 ? "" : "s") << " from ap_vld_in to ap_vld_out.\n";
     std::vector<std::string> p = {"input  logic ap_clk", "input  logic ap_rst", "input  logic ap_ce",
                                   "input  logic ap_vld_in", "output logic ap_vld_out"};
+    const bool strm = hasStreams();
+    if (strm) p.push_back("output logic ap_ready");
     ports(p);
     o << "module " << f.name << " (\n";
     for (size_t i = 0; i < p.size(); i++) o << "  " << p[i] << (i + 1 < p.size() ? ",\n" : "\n");
@@ -1398,6 +1418,12 @@ struct Emitter {
     auto vld = [&](int s) { return s == 0 ? std::string("ap_vld_in") : "vld" + std::to_string(s); };
 
     rams();
+    streams();
+    // With streams every stage moves only in a cycle where each transfer
+    // its calls ask for can happen (ap_go); ap_adv is "the pipeline moves".
+    std::vector<std::string> xfer;   // per stream access: nothing to transfer, or the partner is ready
+    o << "  logic ap_go, ap_adv;\n  assign ap_adv = ap_ce && ap_go;\n";
+    if (strm) o << "  assign ap_ready = ap_go;\n";
     std::vector<std::vector<std::string>> stage(L + 1);   // registers clocked at the end of stage s
     std::map<int, std::string> memDrive;                  // 2 * array + port -> what its one access drives
     for (int id : B.ops) {
@@ -1406,13 +1432,24 @@ struct Emitter {
       bool port = q.k == OpK::ReadVar;
       if (port && (f.vars[q.ref].isStatic || f.vars[q.ref].port == Var::None)) continue;
       bool fwd = false;
-      if (q.k == OpK::Load || q.k == OpK::Store) {
+      if ((q.k == OpK::Load || q.k == OpK::Store) && f.arrs[q.ref].mode == Arr::Stream) {
+        // "@O<k>@" becomes: every other stream is ready for its transfer.
+        const Arr& a = f.arrs[q.ref];
+        const std::string n = memName(a);
+        auto R = [&](int y, int want) { return ref2(y, q.st, want); };
+        std::string en = vld(q.st) + (q.c >= 0 ? " && " + R(q.c, 1) : "");
+        std::string d = "    " + n + "_ce = ap_ce && @O" + std::to_string(xfer.size()) + "@" + en + ";";
+        if (q.k == OpK::Store) d += " " + n + "_wdata = " + R(q.b, a.ety.w) + ";";
+        memDrive[2 * q.ref] += d + "\n";
+        xfer.push_back("(!(" + en + ") || " + n + (q.k == OpK::Load ? "_tvalid" : "_tready") + ")");
+        if (q.k == OpK::Store) continue;
+      } else if (q.k == OpK::Load || q.k == OpK::Store) {
         // A memory access happens in the cycle its stage holds a call and
         // the pipeline moves.
         const Arr& a = f.arrs[q.ref];
         const std::string n = memName(a), x = q.port ? "1" : "";
         auto R = [&](int y, int want) { return ref2(y, q.st, want); };
-        std::string en = "ap_ce && " + vld(q.st) + (q.k == OpK::Store && q.c >= 0 ? " && " + R(q.c, 1) : "");
+        std::string en = "ap_adv && " + vld(q.st) + (q.k == OpK::Store && q.c >= 0 ? " && " + R(q.c, 1) : "");
         std::string d = "    if (" + en + ") begin " + n + "_addr" + x + " = " + R(q.a, a.aw()) + "; " + n + "_ce" + x + " = 1'b1;";
         if (q.k == OpK::Store) d += " " + n + "_we" + x + " = 1'b1; " + n + "_wdata" + x + " = " + R(q.b, a.ety.w) + ";";
         memDrive[2 * q.ref + q.port] += d + " end\n";
@@ -1447,9 +1484,25 @@ struct Emitter {
         stage[s - 1].push_back(pname(id, s) + " <= " + ref2(id, s - 1, q.w) + ";");
       }
     }
-    for (auto& [key, d] : memDrive) {
+    o << "  assign ap_go = ";
+    for (size_t i = 0; i < xfer.size(); i++) o << (i ? " && " : "") << xfer[i];
+    o << (xfer.empty() ? "1'b1;\n" : ";\n");
+    for (auto& [key, d0] : memDrive) {
       const Arr& a = f.arrs[key / 2];
       const std::string n = memName(a), x = key % 2 ? "1" : "";
+      std::string d = d0;
+      for (size_t at; (at = d.find("@O")) != std::string::npos;) {
+        size_t end = d.find('@', at + 2);
+        size_t k = std::stoul(d.substr(at + 2, end - at - 2));
+        std::string others;
+        for (size_t i = 0; i < xfer.size(); i++)
+          if (i != k) others += xfer[i] + " && ";
+        d.replace(at, end - at + 1, others);
+      }
+      if (a.mode == Arr::Stream) {
+        o << "  always_comb begin\n    " << n << "_ce = 1'b0;" << (a.read ? "" : " " + n + "_wdata = '0;") << "\n" << d << "  end\n";
+        continue;
+      }
       o << "  always_comb begin\n    " << n << "_addr" << x << " = '0; " << n << "_ce" << x << " = 1'b0;";
       if (key % 2 ? a.p1w : (a.written || !a.isParam)) o << " " << n << "_we" << x << " = 1'b0; " << n << "_wdata" << x << " = '0;";
       o << "\n" << d << "  end\n";
@@ -1458,18 +1511,20 @@ struct Emitter {
     for (int s = 1; s < L; s++) o << "      vld" << s << " <= 1'b0;\n";
     for (size_t v = 0; v < f.vars.size(); v++)
       if (preg[v]) o << "      " << vreg((int)v) << " <= " << hexLit(f.vars[v].init, f.vars[v].ty.w) << ";\n";
+    // A cycle where a stream holds the pipeline produces no result.
     o << "    end else if (ap_ce) begin\n";
-    for (int s = 1; s < L; s++) o << "      vld" << s << " <= " << vld(s - 1) << ";\n";
-    o << "      ap_vld_out <= " << vld(L - 1) << ";\n";
+    o << "      ap_vld_out <= " << (strm ? "ap_go && " : "") << vld(L - 1) << ";\n";
+    o << "      if (ap_go) begin\n";
+    for (int s = 1; s < L; s++) o << "        vld" << s << " <= " << vld(s - 1) << ";\n";
     for (size_t i = 0; i < B.writes.size(); i++) {
       auto [v, x] = B.writes[i];
-      o << "      if (" << vld(B.wst[i]) << ") " << vreg(v) << " <= " << ref2(x, B.wst[i], f.vars[v].ty.w) << ";\n";
+      o << "        if (" << vld(B.wst[i]) << ") " << vreg(v) << " <= " << ref2(x, B.wst[i], f.vars[v].ty.w) << ";\n";
     }
-    o << "    end\n  end\n";
+    o << "      end\n    end\n  end\n";
     bool any = false;
     for (auto& s : stage) any = any || !s.empty();
     if (any) {
-      o << "  always_ff @(posedge ap_clk) begin\n    if (ap_ce) begin\n";
+      o << "  always_ff @(posedge ap_clk) begin\n    if (ap_adv) begin\n";
       for (auto& s : stage)
         for (auto& a : s) o << "      " << a << "\n";
       o << "    end\n  end\n";
@@ -1489,8 +1544,6 @@ void checkPipeline(const Function& f, const Sched& sc, const Program& P, const F
   const Block& B = f.blocks[0];
   for (int id : B.ops) {
     const Op& o = f.ops[id];
-    if ((o.k == OpK::Load || o.k == OpK::Store) && f.arrs[o.ref].mode == Arr::Stream)
-      no("it reads or writes stream '" + f.arrs[o.ref].name + "' (use the FSM architecture)");
     if (o.cyc > 1) no(std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)");
   }
   if (!sc.memRefused.empty()) no(sc.memRefused);
@@ -1614,6 +1667,12 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
   } else if (f.pipeline) {
     o << "  logic ap_ce = 1, ap_vld_in = 0;\n  wire ap_vld_out;\n";
     conn += ", .ap_ce(ap_ce), .ap_vld_in(ap_vld_in), .ap_vld_out(ap_vld_out)";
+    for (auto& a : f.arrs)
+      if (a.mode == Arr::Stream && (a.read || a.written)) {
+        o << "  wire ap_ready;\n";
+        conn += ", .ap_ready(ap_ready)";
+        break;
+      }
   } else {
     o << "  logic ap_start = 0;\n  wire ap_done, ap_idle;\n";
     conn += ", .ap_start(ap_start), .ap_done(ap_done), .ap_idle(ap_idle)";
@@ -1786,19 +1845,33 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
       const Arr& a = f.arrs[ai];
       if (!a.read && !a.written) continue;
       for (size_t k = 0; k < init.size(); k++)
-        o << "    " << svName(a.name) << "_m[" << k << "] = " << hexLit(init[k], a.ety.w) << ";\n";
+        o << "    " << svName(a.name) << (a.mode == Arr::Stream ? "_src[" : "_m[") << k << "] = " << hexLit(init[k], a.ety.w) << ";\n";
     }
     o << "  end\n";
+    // With streams the pipeline takes an input only when ap_ready; the
+    // second half of the inputs runs against a hesitant source and sink.
+    if (nStreams && !hs)
+      o << "  logic tb_acc = 0;\n  always @(posedge ap_clk) tb_acc <= ap_vld_in && ap_ce && ap_ready;\n";
     if (hs) {
       // The sink refuses now and then; the source waits for each transfer.
       o << "  logic tb_acc = 0;\n  always @(posedge ap_clk) tb_acc <= in_valid && in_ready;\n"
            "  always @(negedge ap_clk) out_ready = (tb_cyc % 7 != 3) && (tb_cyc % 11 < 8);\n";
       o << "  initial begin\n    repeat (3) @(negedge ap_clk);\n    ap_rst = 0;\n    @(negedge ap_clk);\n";
       for (size_t i = 0; i < V.v.size(); i++) {
+        if (nStreams && i == V.v.size() / 2) o << "    tb_stall = 1;\n";
         o << "    in_valid = 1; " << setIn(V.v[i]) << "\n    @(negedge ap_clk); while (!tb_acc) @(negedge ap_clk);\n";
         if (i % 5 == 3) o << "    in_valid = 0; @(negedge ap_clk);\n";
       }
-      o << "    in_valid = 0;\n    repeat (" << 3 * L + 40 << ") @(negedge ap_clk);\n";
+      o << "    in_valid = 0;\n    repeat (" << (nStreams ? 12 : 3) * L + 40 << ") @(negedge ap_clk);\n";
+    } else if (nStreams) {
+      o << "  initial begin\n    repeat (3) @(negedge ap_clk);\n    ap_rst = 0;\n    @(negedge ap_clk);\n";
+      for (size_t i = 0; i < V.v.size(); i++) {
+        if (i == V.v.size() / 2) o << "    tb_stall = 1;\n";
+        if (i % 5 == 3) o << "    ap_vld_in = 0; @(negedge ap_clk);\n";
+        o << "    ap_vld_in = 1; " << setIn(V.v[i]) << (i == 0 ? "tb_first_in = tb_cyc;" : "")
+          << "\n    @(negedge ap_clk); while (!tb_acc) @(negedge ap_clk);\n";
+      }
+      o << "    ap_vld_in = 0;\n    repeat (" << 12 * L + 40 << ") @(negedge ap_clk);\n";
     } else {
     o << "  initial begin\n    repeat (3) @(negedge ap_clk);\n    ap_rst = 0;\n";
     for (size_t i = 0; i < V.v.size(); i++) {
@@ -1818,8 +1891,20 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
         o << "    " << check(svName(a.name) + "_m[" + std::to_string(k) + "]", fin[k], a.ety.w, V.v.size()) << "\n";
     }
     if (!hs)
-      o << "    if (tb_first_out - tb_first_in != " << L << ") begin $display(\"FAIL: latency %0d, expected " << L
-      << "\", tb_first_out - tb_first_in); tb_errors = tb_errors + 1; end\n";
+      o << "    if (tb_first_out - tb_first_in " << (nStreams ? "<" : "!=") << " " << L << ") begin $display(\"FAIL: latency %0d, expected "
+        << L << "\", tb_first_out - tb_first_in); tb_errors = tb_errors + 1; end\n";
+    std::map<int, size_t> taken, sent;
+    for (auto& vec : V.v) {
+      for (auto& [ai, xs] : vec.sIn) taken[ai] += xs.size();
+      for (auto& [ai, xs] : vec.sOut) sent[ai] += xs.size();
+    }
+    for (auto& [ai, k] : taken)
+      o << "    if (" << svName(f.arrs[ai].name) << "_pos != " << k << ") begin $display(\"FAIL: %0d elements taken from "
+        << svName(f.arrs[ai].name) << ", expected " << k << "\", " << svName(f.arrs[ai].name) << "_pos); tb_errors = tb_errors + 1; end\n";
+    for (auto& [ai, k] : sent)
+      if (f.arrs[ai].written)
+        o << "    if (" << svName(f.arrs[ai].name) << "_cnt != " << k << ") begin $display(\"FAIL: %0d elements sent to "
+          << svName(f.arrs[ai].name) << ", expected " << k << "\", " << svName(f.arrs[ai].name) << "_cnt); tb_errors = tb_errors + 1; end\n";
     o << "    if (tb_errors == 0) $display(\"PASS: " << f.name << " " << V.v.size() << " inputs, pipeline latency "
       << L << " cycles\");\n    else $display(\"FAIL: " << f.name << " %0d errors\", tb_errors);\n    $finish;\n  end\n";
     o << "  always @(posedge ap_clk) if (!ap_rst && " << (hs ? "out_valid && out_ready" : "ap_ce && ap_vld_out") << ") begin\n    if (tb_first_out < 0) tb_first_out = tb_cyc;\n    case (tb_n)\n";
