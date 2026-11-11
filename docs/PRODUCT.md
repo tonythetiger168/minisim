@@ -45,13 +45,12 @@ All of them install from one package (`minisim_x.y.z_amd64.deb` /
 
 - **minisim (free, Apache-2.0)**: the verification flow - simulator,
   waveforms, coverage, regression runner, planning, lint and CDC,
-  scan-readiness checks, virtual prototypes and debug. No seat count, no key,
-  no time limit.
+  scan-readiness checks and debug. No seat count, no key, no time limit.
 - **Paid tools (closed source)**: implementation and signoff - synthesis,
   place and route, timing, extraction, equivalence, formal, ATPG, emulation,
   HLS, SPICE and characterization, physical verification, power, constraints
-  and IP protection. Same file formats and command lines, so the two mix in
-  one flow.
+  and IP protection, together with portable stimulus and virtual prototypes.
+  Same file formats and command lines, so the two mix in one flow.
 - **Enterprise** (support contract, long-term-support branches, validated
   platform builds, key management for encrypted IP): an option once 1.0 is
   out, on top of either edition.
