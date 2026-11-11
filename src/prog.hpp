@@ -467,12 +467,18 @@ inline void collectProgRefs(const Prog& p, std::vector<int>& sigs, std::vector<c
     std::unordered_set<int> have(sigs.begin(), sigs.end());
     collectProgRefsInto(p, sigs, have, seen);
 }
+// The signals of every function and task: arguments, result and local
+// variables. No implicit sensitivity list holds one (9.2.2.2.1, 9.4.2.2):
+// a subroutine writes them itself, so two processes that call one function
+// would wake each other for ever.
+inline std::unordered_set<int>& subrLocalSigs() { static std::unordered_set<int> s; return s; }
 inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
     std::vector<int> sigs;
     std::vector<const Prog*> seen;
     collectProgRefs(p, sigs, seen);
     std::vector<std::pair<int, Edge>> ev;
-    for (int s : sigs) ev.push_back({s, ANY});
+    const auto& loc = subrLocalSigs();
+    for (int s : sigs) if (!loc.count(s)) ev.push_back({s, ANY});
     return ev;
 }
 // Signals a process (or a subroutine it calls) writes whole: an assignment

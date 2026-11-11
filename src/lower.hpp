@@ -7934,7 +7934,18 @@ inline const slang::ast::Symbol* inoutCollapses(const slang::ast::PortSymbol& ps
         return (n.netType.netKind == NetType::Wire || n.netType.netKind == NetType::Tri) && n.getType().isIntegral() &&
                !n.getDelay();
     };
-    if (!plain(in) || !plain(out) || in.getType().getBitWidth() != out.getType().getBitWidth()) return nullptr;
+    // A plain internal net joined to a tri0 / tri1 / wand / wor / trireg /
+    // supply net is one net of the external kind (23.3.3.7, table 23-1).
+    auto resolved = [](const NetSymbol& n) {
+        switch (n.netType.netKind) {
+            case NetType::Tri0: case NetType::Tri1: case NetType::WAnd: case NetType::TriAnd: case NetType::WOr:
+            case NetType::TriOr: case NetType::TriReg: case NetType::Supply0: case NetType::Supply1:
+                return n.getType().isIntegral() && !n.getType().isUnpackedArray() && !n.getDelay();
+            default: return false;
+        }
+    };
+    if (!plain(in) || !(plain(out) || resolved(out)) || in.getType().getBitWidth() != out.getType().getBitWidth())
+        return nullptr;
     return &in;
 }
 
@@ -8081,10 +8092,20 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) reg(p, false);
     }
+    int subrDepth = 0;
     void handle(const slang::ast::SubroutineSymbol& sub) {
         bool m = isClassMethod(sub);
         inMethod += m;
+        // Every signal made in here belongs to the subroutine (see subrLocalSigs).
+        MkSig saved = mkSig;
+        if (subrDepth++ == 0)
+            mkSig = [saved](const std::string& n, int w, bool net) {
+                int id = saved(n, w, net);
+                subrLocalSigs().insert(id);
+                return id;
+            };
         visitDefault(sub);
+        if (--subrDepth == 0) mkSig = saved;
         inMethod -= m;
     }
     void handle(const slang::ast::ClassType& c) {
@@ -9947,6 +9968,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     classRt().clear();
     layoutStore() = &out.layouts;
     netKinds().clear();
+    subrLocalSigs().clear();
     usesForce() = false;
     srcMgr() = comp.getSourceManager();
     dynMap().clear();
