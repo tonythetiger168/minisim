@@ -155,6 +155,25 @@ netlist with yet another architecture (Booth recoding) can still exhaust
 `-effort` and report those outputs as aborted, which is inconclusive, never a
 pass.
 
+## Against Yosys and ABC
+
+Measured on 4 cores with Yosys 0.33 (`equiv_make; equiv_simple; equiv_induct`)
+and its bundled ABC (`cec` on both sides bit-blasted to AND gates), 300 s
+limit. The netlists are `msynth` output on its generic library, except the
+datapath, which Yosys synthesized itself.
+
+| Design | Yosys equiv | ABC cec | mequiv |
+|---|---|---|---|
+| 8x8 multiplier and adder | 24 s | 19 s | 0.2 s |
+| 16x16 multiplier and adder | over 300 s | over 300 s | 2.0 s |
+| 32x32 multiplier and adder | not run | not run | 28 s |
+| datapath (dividers, 8-bit multiplier, flops) | 0.8 s | combinational only | 0.2 s |
+
+The multiplier rows are where the lead comes from: mequiv knows the
+architectures a synthesis tool emits (see Datapaths above), the other two
+treat the product as plain logic. On control logic all three finish in well
+under a second.
+
 ## Not yet
 
 - Sequential UDPs and Liberty `statetable` cells.

@@ -516,6 +516,8 @@ public:
         if (cov) {
             o << "    g_condHits.assign(" << g_condHits.size() << ", 0);\n    S.fsmWatch({";
             for (size_t k = 0; k < fsmDefs().size(); k++) o << (k ? ", " : "") << fsmDefs()[k].sig;
+            o << "}, {";
+            for (size_t k = 0; k < fsmDefs().size(); k++) o << (k ? ", " : "") << (fsmDefs()[k].onehot ? 1 : 0);
             o << "});\n";
         }
         o << "    S.run(maxTime);\n"
@@ -749,6 +751,11 @@ private:
             case Op::LogAnd: return f2("v_land");
             case Op::LogOr: return f2("v_lor");
             case Op::CondCov: {   // condition coverage: every term, then the counters (expr.hpp)
+                if (e->lo & 2) {   // lazy: each term a callable, run in order
+                    std::string r = "condCovLazy(" + std::to_string(e->hi) + ", " + (e->lo & 1 ? "true" : "false");
+                    for (size_t i = 0; i < e->kids.size(); i++) r += ", [&]() -> Val { return " + ex(e->kids[i]) + "; }";
+                    return r + ")";
+                }
                 std::string r = "condCovVal(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
                 for (size_t i = 0; i < e->kids.size(); i++) r += (i ? ", " : "") + ex(e->kids[i]);
                 return r + "})";
@@ -888,6 +895,7 @@ private:
                 fi = {1, false};
                 return true;
             case Op::CondCov: {
+                if (e->lo & 2) return false;   // lazy: the Val path
                 std::string r = "condCovFast(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
                 for (size_t i = 0; i < e->kids.size(); i++) {
                     std::string P;

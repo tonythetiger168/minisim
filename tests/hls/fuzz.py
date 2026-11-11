@@ -24,6 +24,8 @@ class Gen:
         self.vars = []      # (name, type) assignable scalars
         self.ro = []        # read-only names
         self.arrs = []      # (name, size, writable)
+        self.pts = []       # lvalues of struct type pt_t
+        self.loopy = not self.pipe and self.r.random() < 0.3   # has loops shaped for loop pipelining
         self.depth = 0
         self.loop = 0
         self.n = 0
@@ -130,9 +132,61 @@ class Gen:
             self.emit("}")
         elif k < 0.93 and not self.pipe and self.depth > 0 and self.loop == 0:
             self.emit("if (%s) return %s;" % (self.expr(2), self.expr(1)))
+        elif k < 0.955 and self.pts:
+            d = r.choice(self.pts)
+            if r.random() < 0.6:
+                self.emit("%s = hmix(%s, %s);" % (d, r.choice(self.pts), r.choice(self.pts)))
+            else:
+                self.emit("%s = %s;" % (d, r.choice(self.pts)))
         elif [v for v in self.vars if v[1] != "bool"]:
             n, _ = r.choice([v for v in self.vars if v[1] != "bool"])
             self.emit("(%s)%s;" % (n, r.choice(["++", "--"])))
+
+    def piped_loop(self):
+        """A loop over src and dst that can start an iteration every cycle or every few."""
+        r = self.r
+        self.n += 1
+        i = "i%d" % self.n
+        if r.random() < 0.5:
+            bound = str(r.randint(2, 14))
+        else:
+            self.emit("int n%d = (%s) & 15;" % (self.n, self.expr(2)))
+            bound = "n%d" % self.n
+        self.emit("for (int %s = 0; %s < %s; %s++) {" % (i, i, bound, i))
+        arrs, self.arrs = self.arrs, [a for a in self.arrs if a[0] == "rom"]
+        self.ro.append(i)
+        self.depth += 1
+        nv = len(self.vars)
+        x = "x%d" % self.n
+        self.emit("%s %s = src[(%s + %d) & 15];" % (self.src_t, x, i, r.randint(0, 3)))
+        self.ro.append(x)
+        for _ in range(r.randint(1, 3)):
+            k = r.random()
+            if k < 0.6 and self.vars:
+                n, _t = r.choice(self.vars)
+                self.emit("%s %s %s;" % (n, r.choice(["=", "+=", "-=", "^=", "|=", "&="]), self.expr(1)))
+            elif k < 0.8:
+                self.n += 1
+                n, t = "v%d" % self.n, self.ty()
+                self.emit("%s %s = %s;" % (t, n, self.expr(1)))
+                self.vars.append((n, t))
+            elif self.vars:
+                n, _t = r.choice(self.vars)
+                self.emit("if (%s) %s = %s;" % (self.expr(2), n, self.expr(2)))
+        k = r.random()
+        if k < 0.45:
+            self.emit("dst[%s] = %s;" % (i, self.expr(1)))
+        elif k < 0.65:   # updated in place: one iteration every second cycle at best
+            self.emit("dst[%s & 15] %s %s;" % (r.choice([i, x]), r.choice(["+=", "^=", "-="]), self.expr(1)))
+        elif k < 0.8 and self.vars:   # a value carried through a memory read
+            n, _t = r.choice(self.vars)
+            self.emit("%s = src[%s & 15] + %s;" % (n, n, r.choice([i, x, "1"])))
+        del self.vars[nv:]
+        self.depth -= 1
+        self.ro.remove(i)
+        self.ro.remove(x)
+        self.arrs = arrs
+        self.emit("}")
 
     def block(self, n):
         self.depth += 1
@@ -159,6 +213,34 @@ class Gen:
             t = r.choice(TYPES[:8])
             out.append("static %s gstate = %d;" % (t, r.randint(0, 50)))
             self.vars.append(("gstate", t))
+        structs = r.random() < 0.4
+        late = []
+        if structs:
+            ta, tb, tk, tarr = self.ty(), self.ty(), self.ty(), r.choice(TYPES[:8])
+            out.append("typedef struct { %s a; %s b; } pt_t;" % (ta, tb))
+            out.append("typedef struct { pt_t p; %s k; %s arr[4]; } rec_t;" % (tk, tarr))
+            out.append("static pt_t hmix(pt_t x, pt_t y) {\n  pt_t r;\n  r.a = x.a + y.b;\n  r.b = x.b ^ y.a;\n"
+                       "  if (x.a > y.a) r.a = x.b;\n  return r;\n}")
+
+            def pt(n):
+                self.pts.append(n)
+                self.vars += [(n + ".a", ta), (n + ".b", tb)]
+
+            if r.random() < 0.6:
+                params.append("pt_t q0")
+                pt("q0")
+            if not self.pipe and r.random() < 0.5:
+                params.append("rec_t %sr0" % r.choice(["*", "&"]))
+                acc = "r0->" if params[-1].startswith("rec_t *") else "r0."
+                pt(acc + "p")
+                self.vars.append((acc + "k", tk))
+                self.arrs.append((acc + "arr", 4, True))
+            if r.random() < 0.7:
+                late.append("pt_t l0 = {%s, %s};" % (self.expr(2), self.expr(2)))
+                late.append(("pt", "l0"))
+            if r.random() < 0.5:
+                late.append("rec_t l1 = {{%s, %s}, %s, {%s, %s}};" % tuple(self.expr(2) for _ in range(5)))
+                late.append(("rec", "l1", tk))
         outp = None
         if r.random() < 0.5:
             t = self.ty()
@@ -169,8 +251,22 @@ class Gen:
             t = r.choice(TYPES[:8])
             params.append("%s m0[16]" % t)
             self.arrs.append(("m0", 16, True))
+        if self.loopy:
+            self.src_t = r.choice(TYPES[:8])
+            params.append("const %s src[16]" % self.src_t)
+            params.append("%s dst[16]" % r.choice(TYPES[:8]))
         ret = self.ty()
         out.append("%s f(%s) {" % (ret, ", ".join(params)))
+        for x in late:
+            if isinstance(x, str):
+                self.emit(x)
+            elif x[0] == "pt":
+                self.pts.append(x[1])
+                self.vars += [(x[1] + ".a", ta), (x[1] + ".b", tb)]
+            else:
+                self.pts.append(x[1] + ".p")
+                self.vars += [(x[1] + ".p.a", ta), (x[1] + ".p.b", tb), (x[1] + ".k", x[2])]
+                self.arrs.append((x[1] + ".arr", 4, True))
         if r.random() < 0.5:
             t = r.choice(TYPES[:8])
             size = r.choice([4, 8]) if self.pipe else r.choice([4, 8, 16])
@@ -183,6 +279,12 @@ class Gen:
         self.depth = -1
         self.block(r.randint(3, 9))
         self.depth = 0
+        if self.loopy:
+            for _ in range(r.randint(1, 2)):
+                self.piped_loop()
+                self.depth = -1
+                self.block(r.randint(0, 2))
+                self.depth = 0
         self.emit("return %s;" % self.expr())
         return "\n".join(out + self.lines + ["}"]) + "\n"
 
@@ -202,6 +304,12 @@ class Gen:
                 o += ["-max-reg-array", "4"]
             if r.random() < 0.2:
                 o += ["-unroll-all"]
+            if r.random() < 0.35 or self.loopy:
+                o += ["-pipeline-loops"]
+            if self.loopy:
+                o[1] = r.choice(["1.5", "3", "5", "10"])
+        if r.random() < 0.15:
+            o += ["-handshake"]
         return o
 
 

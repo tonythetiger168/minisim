@@ -93,3 +93,41 @@ execute_process(COMMAND ${MCOV} report c.json -detail WORKING_DIRECTORY ${OUT} O
 if(NOT interp STREQUAL comp)
   message(FATAL_ERROR "-compile coverage differs from the interpreter's\n--- interpreter\n${interp}--- compiled\n${comp}")
 endif()
+
+# One-hot FSMs tested bit by bit, and conditions with a term that && and ||
+# must be able to skip (a function call, a system function, a class handle):
+# these are counted as they run, and the skipped terms show as "-".
+set(OH ${SRC}/tests/cov/fsm_onehot.sv)
+execute_process(COMMAND ${MSIM} ${OH} +define+CLS -cov oh.json WORKING_DIRECTORY ${OUT}
+                RESULT_VARIABLE rc OUTPUT_VARIABLE run ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT run MATCHES "hits=3 act=1")
+  message(FATAL_ERROR "fsm_onehot.sv with -cov exited ${rc}: ${run}${err}")
+endif()
+execute_process(COMMAND ${MCOV} report oh.json -detail WORKING_DIRECTORY ${OUT} OUTPUT_VARIABLE out)
+foreach(want
+    "Condition: 53\\.3% \\(8/15 vectors of 5 condition\\(s\\)\\)"
+    "FSM: states 80\\.0% \\(4/5\\), transitions 50\\.0% \\(3/6\\) of 2 FSM\\(s\\)"
+    "FSM tb\\.u\\.state  \\(module oh, [^\n]*\\)  states 2/3, transitions 1/4\n    state IDLE +1\n    state RUN +1\n    state DONE +Not covered\n    IDLE -> RUN +1\n    RUN -> IDLE +Not covered  \\(reset\\)\n    RUN -> DONE +Not covered\n    DONE -> IDLE +Not covered\n"
+    "FSM tb\\.v\\.s  \\(module ohif, [^\n]*\\)  states 2/2, transitions 2/2\n    state s\\[0\\] +2\n    state s\\[1\\] +1\n"
+    "p != null && p\\.len > 2\n[^\n]*\n[^\n]*\n[^\n]*\n     1   1   Not covered\n     0   -   1\n     1   0   Not covered"
+    "n > 1 && odd\\(n\\)\n[^\n]*\n[^\n]*\n[^\n]*\n     1   1   1\n     0   -   2\n     1   0   1"
+    "stop \\|\\| \\$countones\\(vec\\) > 1\n[^\n]*\n[^\n]*\n[^\n]*\n     0   0   2\n     1   -   Not covered\n     0   1   1")
+  if(NOT out MATCHES "${want}")
+    message(FATAL_ERROR "one-hot / short-circuit: no match for '${want}' in\n${out}")
+  endif()
+endforeach()
+if(out MATCHES "not in the next-state logic")
+  message(FATAL_ERROR "a one-hot register cleared and set in one time step was taken for a state change\n${out}")
+endif()
+# Without the class the design compiles: the same database from simv.
+execute_process(COMMAND ${MSIM} ${OH} -cov ohi.json WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_QUIET)
+execute_process(COMMAND ${MSIM} -compile -o ohdir ${OH} -cov ohc.json WORKING_DIRECTORY ${OUT}
+                RESULT_VARIABLE rc2 OUTPUT_QUIET ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT rc2 EQUAL 0 OR NOT EXISTS ${OUT}/ohdir/simv)
+  message(FATAL_ERROR "fsm_onehot.sv: msim -compile -cov exited ${rc2}: ${err}")
+endif()
+execute_process(COMMAND ${MCOV} report ohi.json -detail WORKING_DIRECTORY ${OUT} OUTPUT_VARIABLE interp)
+execute_process(COMMAND ${MCOV} report ohc.json -detail WORKING_DIRECTORY ${OUT} OUTPUT_VARIABLE comp)
+if(NOT interp STREQUAL comp OR NOT comp MATCHES "odd\\(n\\)")
+  message(FATAL_ERROR "fsm_onehot.sv: -compile coverage differs from the interpreter's\n--- interpreter\n${interp}--- compiled\n${comp}")
+endif()

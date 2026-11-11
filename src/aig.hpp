@@ -341,12 +341,68 @@ struct Graph {
 
 // ------------------------------------------------------------ the design
 
+// A word-level operator as the RTL had it, kept beside the bits it was
+// built into: y = a op b. A tool that has a better implementation of the
+// operator (a carry chain, a DSP block, a datapath cell) cuts the graph at
+// y and drives it from a and b itself. Listed in creation order.
+struct WordOp {
+    enum Kind { Add, Sub, Mul, Lt, Eq, Shl, Shr, Sshr } kind = Add;
+    Bits a, b, y;         // LSB first; Lt and Eq have a one-bit y
+    bool sgn = false;     // Lt: signed compare; Mul: operands were sign-extended
+};
+
 struct Design {
     std::string top;
     Graph g;
     std::vector<Port> ports;
     std::vector<std::string> warnings;
+    std::vector<WordOp> ops;
 };
+
+// d = en ? data : q, for a flop whose next state holds unless `en`. False
+// when the D logic is not of that shape.
+inline bool flopEnable(const Graph& g, const Flop& f, Lit& en, Lit& data) {
+    // mux(s, t, e) is built as !(!(s & t) & !(!s & e))
+    if (!lisneg(f.d)) return false;
+    const Node& o = g.at(f.d);
+    if (o.k != NK::And || !lisneg(o.a) || !lisneg(o.b)) return false;
+    const Node& x = g.at(o.a);
+    const Node& y = g.at(o.b);
+    if (x.k != NK::And || y.k != NK::And) return false;
+    for (int swap = 0; swap < 2; swap++) {
+        const Node& hold = swap ? x : y;
+        const Node& load = swap ? y : x;
+        for (int hs = 0; hs < 2; hs++) {
+            Lit hq = hs ? hold.b : hold.a, hc = hs ? hold.a : hold.b;   // hold = hc & q
+            if (hq != f.q) continue;
+            for (int ls = 0; ls < 2; ls++) {
+                Lit lc = ls ? load.b : load.a, ld = ls ? load.a : load.b;   // load = lc & data
+                if (lc == lneg(hc)) {
+                    en = lc;
+                    data = ld;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+// d = rst ? value : data, a synchronous set or reset in front of the D logic.
+inline bool flopSyncReset(const Graph& g, Lit d, Lit& rst, bool& value, Lit& data) {
+    const Node& n = g.at(d);
+    if (n.k != NK::And) return false;
+    // reset to 0: d = !rst & data. set to 1: d = !(!rst & !data).
+    value = lisneg(d);
+    for (int s = 0; s < 2; s++) {
+        Lit c = s ? n.b : n.a, o = s ? n.a : n.b;
+        const Node& cn = g.at(c);
+        if (cn.k == NK::And) continue;   // the control is a signal, not logic
+        rst = lneg(c);
+        data = lxorc(o, value);
+        return true;
+    }
+    return false;
+}
 
 // Rebuild into a clean graph: wires resolved, constants propagated, logic
 // that reaches no output or flop dropped, combinational loops reported.
@@ -420,6 +476,38 @@ inline Design cleanup(const Design& in) {
         if (f.arst != NOLIT) {
             f.arst = build(f.arst);
             if (f.arst == L0) f.arst = NOLIT;
+        }
+    }
+    // Word operators survive when all of their bits are still in the graph.
+    {
+        auto get = [&](Lit l, Lit& o) {
+            uint32_t n = lnode(l);
+            if (map[n] == NOLIT && g.nodes[n].k == NK::Wire && state[n] == 0) {
+                // a wire nothing reached: resolve it if its driver was built
+                uint32_t c = n;
+                int hops = 0;
+                bool neg = false;
+                while (g.nodes[c].k == NK::Wire && g.nodes[c].a != NOLIT && map[c] == NOLIT && hops++ < 64) {
+                    neg ^= lisneg(g.nodes[c].a);
+                    c = lnode(g.nodes[c].a);
+                }
+                if (map[c] == NOLIT) return false;
+                o = lxorc(map[c], neg ^ lisneg(l));
+                return true;
+            }
+            if (map[n] == NOLIT) return false;
+            o = lxorc(map[n], lisneg(l));
+            return true;
+        };
+        for (const WordOp& op : in.ops) {
+            WordOp no = op;
+            bool ok = true;
+            for (Bits* v : {&no.a, &no.b, &no.y})
+                for (Lit& l : *v)
+                    if (ok && !get(l, l)) ok = false;
+            bool anyLogic = false;
+            for (Lit l : no.y) anyLogic |= l > 1;
+            if (ok && anyLogic) out.ops.push_back(std::move(no));
         }
     }
     return out;
