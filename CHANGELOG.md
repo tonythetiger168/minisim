@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdebug`: struct fields in the active-driver trace (conditions on a field
+  are evaluated; each field and constant part select has its own driver).
 - `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
   made for it (lower pad turned or lengthened, written to the DEF's `VIAS`),
   short pieces of wire and the pads of power via stacks are lengthened to
