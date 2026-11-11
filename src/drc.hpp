@@ -25,6 +25,9 @@
 //   space(a, b) < v                   outside distance between a and b
 //   enclosure(a, b) < v               a must be inside b with margin v: reports margins
 //                                     from 0 up to v and the parts of a outside b
+//   enclosure(a, b, opposite) < v     the same, but a polygon of a passes when it has the
+//                                     margin on two opposite sides (left and right, or
+//                                     bottom and top)
 //   overhang(a, b) < v                where a crosses b, a must stick out of b by v
 //   area(a) < v     area(a) > v       polygon area
 //   density(a, w) < v   ... > v       area of a over area of each w by w window;
@@ -79,6 +82,7 @@ struct Rule {
     std::unique_ptr<Expr> a, b;
     char cmp = '<';
     double value = 0, window = 0, step = 0;
+    bool opposite = false;   // enclosure(a, b, opposite): two opposite sides are enough
 };
 
 struct Deck {
@@ -380,6 +384,13 @@ inline bool parseDeck(std::istream& in, Deck& deck, std::string& err) {
                     lx.next();
                     r.b = ps.expr();
                     if (!r.b) return fail(err);
+                    if (r.kind == Rule::Enclosure && lx.punct(",")) {
+                        lx.next();
+                        if (lx.cur.kind != Tok::Name || lx.cur.text != "opposite")
+                            return fail("the third argument of enclosure can only be opposite");
+                        r.opposite = true;
+                        lx.next();
+                    }
                 }
                 if (r.kind == Rule::Density) {
                     if (!lx.punct(",")) return fail("density needs a window size, as in density(met1, 100)");
@@ -835,7 +846,8 @@ private:
     // Runs the four passes of an edge check (two axes, and for one-sided
     // checks two directions) and turns the pairs into markers.
     template <class Lists>
-    void edgeCheck(C dist, bool zero, bool bothDirs, Lists&& lists, std::vector<Marker>& out) {
+    void edgeCheck(C dist, bool zero, bool bothDirs, Lists&& lists, std::vector<Marker>& out,
+                   std::vector<char>* fromVertical = nullptr) {
         std::vector<Marker> part[4];
         geom::parallelFor(bothDirs ? 4 : 2, threads_, [&](size_t k) {
             bool vertical = (k & 1) == 0;
@@ -852,7 +864,52 @@ private:
                 part[k].push_back(m);
             }
         });
-        for (auto& p : part) out.insert(out.end(), p.begin(), p.end());
+        for (size_t k = 0; k < 4; ++k) {
+            out.insert(out.end(), part[k].begin(), part[k].end());
+            if (fromVertical) fromVertical->insert(fromVertical->end(), part[k].size(), (k & 1) == 0);
+        }
+    }
+
+    // enclosure(a, b, opposite): of the margin markers `ms` (fromVertical
+    // tells the left and right margins from the bottom and top ones), keeps
+    // those of the polygons of `a` that are short of margin both across x and
+    // across y. A polygon with full margin on two opposite sides passes.
+    void oppositeSides(const Region& a, const std::vector<Marker>& ms, const std::vector<char>& fromVertical,
+                       std::vector<Marker>& out) {
+        std::vector<uint32_t> id;
+        size_t n = geom::components(a, id);
+        struct Side { C at, lo, hi; uint32_t comp; };
+        std::vector<Side> sides[2];   // [0]: left and right sides of a's rectangles, [1]: bottom and top
+        for (size_t i = 0; i < a.rects.size(); ++i) {
+            const Rect& q = a.rects[i];
+            sides[0].push_back({q.x1, q.y1, q.y2, id[i]});
+            sides[0].push_back({q.x2, q.y1, q.y2, id[i]});
+            sides[1].push_back({q.y1, q.x1, q.x2, id[i]});
+            sides[1].push_back({q.y2, q.x1, q.x2, id[i]});
+        }
+        for (auto& v : sides)
+            std::sort(v.begin(), v.end(), [](const Side& p, const Side& q) {
+                return p.at != q.at ? p.at < q.at : p.lo != q.lo ? p.lo < q.lo : p.hi < q.hi;
+            });
+        // The polygons whose sides a marker starts from: sides on the marker's two ends that it runs along.
+        auto owners = [&](const Marker& m, bool vertical, auto&& f) {
+            const std::vector<Side>& v = sides[vertical ? 0 : 1];
+            C lo = vertical ? m.box.y1 : m.box.x1, hi = vertical ? m.box.y2 : m.box.x2;
+            C ends[2] = {vertical ? m.box.x1 : m.box.y1, vertical ? m.box.x2 : m.box.y2};
+            for (int e = 0; e < (ends[0] == ends[1] ? 1 : 2); ++e) {
+                auto it = std::lower_bound(v.begin(), v.end(), ends[e], [](const Side& p, C at) { return p.at < at; });
+                for (; it != v.end() && it->at == ends[e] && it->lo < hi; ++it)
+                    if (it->hi > lo) f(it->comp);
+            }
+        };
+        std::vector<char> shortAxis(n, 0);   // bit 0: across x, bit 1: across y
+        for (size_t i = 0; i < ms.size(); ++i)
+            owners(ms[i], fromVertical[i], [&](uint32_t c) { shortAxis[c] |= fromVertical[i] ? 1 : 2; });
+        for (size_t i = 0; i < ms.size(); ++i) {
+            bool bad = false;
+            owners(ms[i], fromVertical[i], [&](uint32_t c) { bad = bad || shortAxis[c] == 3; });
+            if (bad) out.push_back(ms[i]);
+        }
     }
 
     void check(const Rule& r, std::vector<Marker>& out) {
@@ -891,11 +948,14 @@ private:
             break;
         }
         case Rule::Enclosure: {
+            std::vector<Marker> margins;
+            std::vector<char> fromVertical;
             edgeCheck(d, true, true, [&](bool vertical, int dir, auto& from, auto& to, auto& block) {
                 from = side(a->edges(vertical), -dir);
                 to = side(b->edges(vertical), -dir);
                 block = side(b->edges(vertical), dir);
-            }, out);
+            }, r.opposite ? margins : out, r.opposite ? &fromVertical : nullptr);
+            if (r.opposite) oppositeSides(a->region, margins, fromVertical, out);
             Region rest = geom::boolean(a->region, b->region, Op::Sub, threads_);
             std::vector<Marker> outside;
             polygons(rest, outside, -1, INFINITY);
