@@ -81,6 +81,8 @@ class Router {
   RouteOptions opt;
   std::vector<GLayer> gl;
   const phys::Layer* accessLayer = nullptr;          // pins here get a via from layer 0
+  std::vector<phys::ViaDef> pinVias;                 // the vias a pin may get: the LEF's, and turned or longer copies
+  size_t pinViasLef = 0;                             // the first so many are the LEF's own
   std::vector<int32_t> owner;                        // -1 free, -2 blocked, else the only net allowed
   std::vector<uint16_t> claim;
   std::vector<uint16_t> cutClaim;                    // per lower node: vias of nets whose cut is too close to a via here
@@ -197,6 +199,9 @@ class Router {
         for (auto& s : v.shapes) { lo |= s.layer == accessLayer->name; hi |= s.layer == l.L->name; }
         if (lo && hi && accessVia(v)) l.reach = std::max(l.reach, padReach(&v, *l.L));
       }
+      // A short piece of wire is made longer to meet the layer's minimum
+      // area, so every node keeps room for that.
+      l.reach = std::max(l.reach, minHalf(*l.L));
       // Two nets on one track need their metal a spacing apart.
       int64_t d = 2 * l.reach + l.L->spacing;
       l.hlo.resize(l.nP); l.hhi.resize(l.nP);
@@ -208,6 +213,7 @@ class Router {
         l.hlo[p] = lo; l.hhi[p] = hi;
       }
     }
+    buildPinVias();
     owner.assign(base, -1);
     claim.assign(base, 0);
     cutClaim.assign(base, 0);
@@ -215,6 +221,62 @@ class Router {
     viaCost = 2 * gl[0].L->pitch();
     unit = 4 * viaCost;
     pinCost = viaCost;
+  }
+
+  // Half the length a wire of the layer's width needs for the minimum area,
+  // rounded up to the manufacturing grid; 0 when the layer has no AREA rule.
+  int64_t minHalf(const phys::Layer& l) const {
+    if (l.minArea <= 0 || l.width <= 0) return 0;
+    int64_t len = (l.minArea + l.width - 1) / l.width, grid = std::max<int64_t>(db.tech.mfgGrid, 1);
+    return ((len + 1) / 2 + grid - 1) / grid * grid;
+  }
+
+  // The pin vias: each access via of the LEF, then a copy with the lower pad
+  // turned a quarter, then copies of both with the lower pad made long enough
+  // for the lower layer's minimum area. A pin too small for the LEF's pad
+  // gets the copy that suits it; mpnr writes the copies it used to the DEF.
+  void buildPinVias() {
+    pinVias.clear();
+    if (!accessLayer) return;
+    for (auto& v : db.tech.vias) {
+      bool lo = false, hi = false;
+      for (auto& sh : v.shapes) { lo |= sh.layer == accessLayer->name; hi |= sh.layer == gl[0].L->name; }
+      if (lo && hi && accessVia(v)) pinVias.push_back(v);
+    }
+    pinViasLef = pinVias.size();
+    auto lower = [&](const phys::ViaDef& v) { Rect r{0, 0, 0, 0}; for (auto& sh : v.shapes) if (sh.layer == accessLayer->name) r = sh.r; return r; };
+    auto same = [&](const Rect& r) {
+      for (auto& v : pinVias) { Rect q = lower(v); if (q.x0 == r.x0 && q.y0 == r.y0 && q.x1 == r.x1 && q.y1 == r.y1) return true; }
+      return false;
+    };
+    auto add = [&](const phys::ViaDef& from, const Rect& r, const char* tag) {
+      if (same(r)) return;
+      phys::ViaDef v = from;
+      v.name = "mpnr_" + from.name + tag;
+      v.isDefault = false;
+      bool first = true;
+      for (auto it = v.shapes.begin(); it != v.shapes.end();)
+        if (it->layer != accessLayer->name) ++it;
+        else if (first) { it->r = r; first = false; ++it; }
+        else it = v.shapes.erase(it);
+      pinVias.push_back(std::move(v));
+    };
+    int64_t grid = std::max<int64_t>(db.tech.mfgGrid, 1);
+    auto longer = [&](Rect r) {
+      int64_t w = r.w(), h = r.h();
+      if (accessLayer->minArea <= 0 || w * h >= accessLayer->minArea) return r;
+      bool alongX = w >= h;
+      int64_t half = (((accessLayer->minArea + std::min(w, h) - 1) / std::min(w, h) + 1) / 2 + grid - 1) / grid * grid;
+      if (alongX) { r.x0 = std::min(r.x0, -half); r.x1 = std::max(r.x1, half); } else { r.y0 = std::min(r.y0, -half); r.y1 = std::max(r.y1, half); }
+      return r;
+    };
+    for (size_t i = 0; i < pinViasLef; i++) {
+      phys::ViaDef v = pinVias[i];
+      Rect r = lower(v), t{r.y0, r.x0, r.y1, r.x1};
+      add(v, t, "_r");
+      add(v, longer(r), "_l");
+      add(v, longer(t), "_rl");
+    }
   }
 
   // Vias usable for pin access: the top pad must not be wider than the wire
@@ -366,21 +428,25 @@ class Router {
       }
   }
 
-  // The access via whose lower pad fits inside `r` at (x, y), or the best there is.
+  // The pin via whose lower pad fits inside `r` at (x, y); or else the one
+  // that, with the pin shape, has the lower layer's minimum area and sticks
+  // out least.
   const phys::ViaDef* pinVia(const Rect& r, int64_t x, int64_t y, bool* fits = nullptr) const {
     const phys::ViaDef* best = nullptr;
     int64_t bestOut = INT64_MAX;
-    for (auto& v : db.tech.vias) {
-      bool lo = false, hi = false;
+    for (auto& v : pinVias) {
       int64_t out = 0;
       for (auto& s : v.shapes) {
-        if (s.layer == gl[0].L->name) hi = true;
         if (s.layer != accessLayer->name) continue;
-        lo = true;
-        out += std::max<int64_t>(0, r.x0 - (x + s.r.x0)) + std::max<int64_t>(0, (x + s.r.x1) - r.x1) +
-               std::max<int64_t>(0, r.y0 - (y + s.r.y0)) + std::max<int64_t>(0, (y + s.r.y1) - r.y1);
+        Rect q{x + s.r.x0, y + s.r.y0, x + s.r.x1, y + s.r.y1};
+        out += std::max<int64_t>(0, r.x0 - q.x0) + std::max<int64_t>(0, q.x1 - r.x1) +
+               std::max<int64_t>(0, r.y0 - q.y0) + std::max<int64_t>(0, q.y1 - r.y1);
+        if (out && accessLayer->minArea > 0) {
+          int64_t ow = std::min(r.x1, q.x1) - std::max(r.x0, q.x0), oh = std::min(r.y1, q.y1) - std::max(r.y0, q.y0);
+          int64_t area = r.w() * r.h() + q.w() * q.h() - (ow > 0 && oh > 0 ? ow * oh : 0);
+          if (area < accessLayer->minArea) out += INT64_C(1) << 40;
+        }
       }
-      if (!lo || !hi || !accessVia(v)) continue;
       if (out < bestOut) { bestOut = out; best = &v; }
     }
     if (fits) *fits = best && bestOut == 0;

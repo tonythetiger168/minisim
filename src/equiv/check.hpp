@@ -310,16 +310,26 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
     for (int pass = 0; pass < 2; ++pass) {
         std::vector<char> refUsed(ref.states.size(), 0);
         for (int r : stMap) if (r >= 0) refUsed[r] = 1;
-        auto keysOf = [](const State& s, bool inv) {
+        // A cell that holds one state is also known by its instance name.
+        auto instCount = [](const std::vector<State>& v) {
+            std::unordered_map<std::string, int> n;
+            for (auto& s : v) ++n[s.inst];
+            return n;
+        };
+        auto refInst = instCount(ref.states), implInst = instCount(impl.states);
+        auto keysOf = [](const State& s, bool inv, std::unordered_map<std::string, int>& perInst) {
             std::vector<std::string> k;
-            if (!inv) k.push_back(normalize(s.name));
+            if (!inv) {
+                k.push_back(normalize(s.name));
+                if (!s.inst.empty() && perInst[s.inst] == 1) k.push_back(normalize(s.inst));
+            }
             for (auto& a : inv ? s.invAliases : s.aliases) k.push_back(normalize(a));
             return k;
         };
         std::unordered_map<std::string, int> table;
         for (size_t r = 0; r < ref.states.size(); ++r) {
             if (refUsed[r]) continue;
-            for (auto& k : keysOf(ref.states[r], false)) {
+            for (auto& k : keysOf(ref.states[r], false, refInst)) {
                 auto [it, fresh] = table.try_emplace(k, int(r));
                 if (!fresh && it->second != int(r)) it->second = -1;
             }
@@ -329,7 +339,7 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         for (size_t i = 0; i < impl.states.size(); ++i) {
             if (stMap[i] >= 0) continue;
             int found = -1;
-            for (auto& k : keysOf(impl.states[i], pass == 1)) {
+            for (auto& k : keysOf(impl.states[i], pass == 1, implInst)) {
                 auto it = table.find(k);
                 if (it == table.end() || it->second < 0) continue;
                 if (found >= 0 && found != it->second) { found = -2; break; }
@@ -471,7 +481,7 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         sim[0] = 0;
         for (uint32_t n = 1; n < N; ++n) {
             Aig::Node nd = g.node(n);
-            if (nd.a == kNoLit) {
+            if (!g.isAnd(n)) {
                 // Round 0 and 1 are all-zeros and all-ones in pattern 0, random after.
                 uint64_t r = detail::mix(uint64_t(n) * 0x100000001b3ULL + round);
                 if (round == 0) r &= ~1ull;
