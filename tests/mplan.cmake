@@ -115,6 +115,24 @@ foreach(rx "Counter verification plan" "<svg id='trend'" "Wrap around" "Failure 
   endif()
 endforeach()
 
+# FSM and condition metrics (tests/cov/fsm.sv): one run, then both.
+file(WRITE ${OUT}/fsm.list "a: ${SRC}/tests/cov/fsm.sv -top tb\nb: ${SRC}/tests/cov/fsm.sv -top tb +define+MORE\n")
+file(WRITE ${OUT}/fsm.vplan "plan fsm\n  feature ctrl\n    fsm tb.u.state goal=80\n    cond fsm.sv goal=60\n  feature all\n    fsm tb\n")
+execute_process(COMMAND ${MREGRESS} ${OUT}/fsm.list -exe ${MSIM} -cov -seed 1 -q -o ${OUT}/f0 -filter "^a$"
+                RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
+execute_process(COMMAND ${MPLAN} report ${OUT}/fsm.vplan -results ${OUT}/f0 -o ${OUT}/fplan -label f0
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("fsm report 0" ${rc} 0 "${out}" "fsm tb\\.u\\.state +60\\.0% +below goal +6/10  goal 80%"
+       "cond fsm\\.sv +50\\.0% +below goal +9/18  goal 60%" "fsm tb +70\\.8% +below goal +17/24" "cond 50\\.0%, fsm 70\\.8%")
+execute_process(COMMAND ${MREGRESS} ${OUT}/fsm.list -exe ${MSIM} -cov -seed 1 -q -o ${OUT}/f1
+                RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
+execute_process(COMMAND ${MPLAN} report ${OUT}/fsm.vplan -results ${OUT}/f1 -o ${OUT}/fplan -label f1
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("fsm report 1" ${rc} 0 "${out}" "fsm tb\\.u\\.state +90\\.0% +met +9/10  goal 80%" "fsm tb +87\\.5% +below goal +21/24"
+       "\\+17\\.2 since f0")
+execute_process(COMMAND ${MPLAN} init -results ${OUT}/f1 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("fsm init" ${rc} 0 "${out}" "fsm tb\\.u\\.state" "cond fsm\\.sv")
+
 # Bad plans are refused with the file and line.
 file(WRITE ${OUT}/bad1.vplan "plan p\n  feature a\n    tset x\n")
 file(WRITE ${OUT}/bad2.vplan "plan p\n  feature a\n  feature a\n")
