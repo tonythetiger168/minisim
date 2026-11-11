@@ -1347,7 +1347,8 @@ enum class Op {
     Slice, Index, Concat, Mux,
     Pow, Time,
     CondCov,   // condition coverage (msim -cov): the && (lo = 0) or || (lo = 1) of the kids' truth
-               // values, counted in g_condHits from hi on (see condCovHit)
+               // values, counted in g_condHits from hi on (see condCovHit). lo | 2: lazy, the
+               // kids in order until one decides (condCovLazyEnd)
     WildEq,    // a ==? b: x / z bits of b match anything (11.4.6)
     // real (6.12). Values are doubles in v, with Val::real set.
     FAdd, FSub, FMul, FDiv, FPow, FNeg,
@@ -1568,6 +1569,30 @@ inline int condCovHit(size_t base, bool isOr, const int* t, size_t n) {
     return count ? deciding : unknown ? 2 : 1 - deciding;
 }
 
+// A condition whose terms may not all be evaluated (a term calls a function
+// or reads through a class handle): the terms run in order, as && and || do.
+// Vector 0 is still "no term decides"; vector i is "term i - 1 is the first
+// that decides", whatever the terms after it would be.
+inline int condCovLazyEnd(size_t base, bool isOr, bool unknown, bool decided, size_t at) {
+    int deciding = isOr ? 1 : 0;
+    if (!unknown) __atomic_fetch_add(&g_condHits[base + (decided ? at + 1 : 0)], 1, __ATOMIC_RELAXED);
+    return decided ? deciding : unknown ? 2 : 1 - deciding;
+}
+template <class... F>
+inline Val condCovLazy(size_t base, bool isOr, F&&... terms) {   // for generated code: each term a callable
+    int deciding = isOr ? 1 : 0;
+    bool unknown = false, decided = false;
+    size_t i = 0, at = 0;
+    auto step = [&](auto&& f) {
+        if (decided) return;
+        int t = truth(f());
+        if (t == 2) unknown = true;
+        else if (t == deciding) { decided = true; at = i; }
+        i++;
+    };
+    (step(terms), ...);
+    return from_truth(condCovLazyEnd(base, isOr, unknown, decided, at));
+}
 // The same for generated code (msim -compile): terms as values, or as the
 // 0 / 1 of the 2-state path.
 inline Val condCovVal(size_t base, bool isOr, std::initializer_list<Val> terms) {
@@ -2684,6 +2709,16 @@ inline Val eval(const E& e, const Reader& rd) {
             return v_lor(a, k(1));
         }
         case Op::CondCov: {   // every term is evaluated: the lowerer wraps only terms without side effects
+            if (e->lo & 2) {   // ...or, marked lazy, the terms in order until one decides
+                int deciding = e->lo & 1;
+                bool unknown = false;
+                for (size_t i = 0; i < e->kids.size(); i++) {
+                    int t = truth(k((int)i));
+                    if (t == 2) unknown = true;
+                    else if (t == deciding) return from_truth(condCovLazyEnd((size_t)e->hi, deciding, unknown, true, i));
+                }
+                return from_truth(condCovLazyEnd((size_t)e->hi, deciding, unknown, false, 0));
+            }
             int ts[64];
             size_t n = e->kids.size();
             for (size_t i = 0; i < n; i++) ts[i] = truth(k((int)i));
