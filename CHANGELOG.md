@@ -15,6 +15,11 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- UPF is Tcl (IEEE 1801-2024 5.1): `msim -upf` and `mlint -upf` read power
+  intent with the tool line's Tcl interpreter (`src/tcl.hpp`), so `[command]`
+  substitution, `foreach`, `for`, `while`, `if`, `expr`, `proc`, lists,
+  `catch` and `puts` work in a UPF file. An error is reported with the file
+  and line of the command, inside procs and loops too.
 - `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
   built from the spare cells of the old netlist and the cells the change
   frees, by function (the same cell, or one with inputs tied or shared, or
