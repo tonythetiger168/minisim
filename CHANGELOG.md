@@ -186,6 +186,11 @@ Spec references are IEEE 1800-2023 clauses.
   constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
   ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
   See `docs/SYNTH.md`.
+- `msynth` high effort (`compile -map_effort high`, `compile_ultra`):
+  the logic is restructured by ABC, run as a separate program (`abc`,
+  `berkeley-abc` or `yosys-abc` on `PATH`, or `$MSYNTH_ABC`), and the
+  smaller of the two mapped results is kept. Without constraints the
+  smallest netlist now stands (high effort used to pick the faster one).
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
