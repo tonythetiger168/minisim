@@ -378,6 +378,10 @@ public:
     std::vector<Violation> transViol, capViol;
     std::vector<Warning> warnings;
     bool timed = false;
+    // Time paths through asynchronous set/reset to output arcs (Liberty
+    // timing_type preset and clear). Off by default, as in PrimeTime
+    // (timing_enable_preset_clear_arcs) and OpenSTA.
+    bool presetClearArcs = false;
     par::Pool* pool = nullptr;
 
     void warn(const std::string& code, const std::string& text) { warnings.push_back({code, text}); }
@@ -797,6 +801,16 @@ public:
         for (auto& e : edges) {
             e.disabled = false;
             e.ok = e.ok0;
+            // An asynchronous set or reset to output arc is not a path, and
+            // its slew is not part of the output's, unless asked for.
+            if (!presetClearArcs && e.kind != NetEdge && e.group >= 0 && nodes[e.from].inst >= 0) {
+                const CellInfo* ci = instInfo[nodes[e.from].inst];
+                if (ci && e.group < (int)ci->groups.size()) {
+                    bool all = true;
+                    for (auto* a : ci->groups[e.group].arcs) all = all && (a->typeName == "preset" || a->typeName == "clear");
+                    e.disabled = all;
+                }
+            }
         }
         const double T = timeUnit, C = capUnit;
 
@@ -1631,6 +1645,51 @@ public:
         }
     }
 
+    // The hold relation between clocks of different periods. A setup
+    // relation is a launch edge and a capture edge that are each other's
+    // nearest (the first capture after the launch, the last launch before
+    // the capture). For each one over the common period there are two hold
+    // checks: data from the setup launch edge must not be caught by the
+    // capture edge before the setup capture edge, and data from the next
+    // launch edge must not be caught by the setup capture edge. The most
+    // restrictive of them all (the largest capture - launch) is the check.
+    // Returns false when the periods are equal: the caller then takes the
+    // capture edge one period before the setup one.
+    bool holdRelation(const Clock& L, int le, const Clock& Cc, int ce, double& launch, double& capture) const {
+        const double eps = 1e-9;
+        if (std::fabs(L.period - Cc.period) < eps) return false;
+        double tl = L.edgeT[le], tc = Cc.edgeT[ce];
+        long long a = std::llround(L.period * 1e6), b = std::llround(Cc.period * 1e6);
+        long long g = std::gcd(a, b);
+        long long nL = g > 0 ? b / g : 1;
+        if (nL > 1000) nL = 1000;
+        double best = -INF;
+        auto take = [&](double l, double c) {
+            if (c - l > best + eps) {
+                best = c - l;
+                launch = l;
+                capture = c;
+            }
+        };
+        for (long long i = 0; i < nL; i++) {
+            double t = tl + (double)i * L.period;
+            double k = std::floor((t - tc + eps) / Cc.period) + 1;
+            double c = tc + k * Cc.period;                 // the first capture edge after t
+            if (t + L.period < c - eps) continue;           // a later launch edge is nearer to c
+            take(t, c - Cc.period);
+            take(t + L.period, c);
+        }
+        if (best == -INF) return false;
+        // Report the pair in the first common period.
+        if (g > 0 && b / g <= 1000) {
+            double common = (double)nL * L.period;
+            double shift = std::floor((std::min(launch, capture) + eps) / common) * common;
+            launch -= shift;
+            capture -= shift;
+        }
+        return true;
+    }
+
     struct Resolved {
         bool falsePath = false, pathDelay = false;
         double delay = 0;
@@ -1774,7 +1833,19 @@ public:
                 else capture += (r.mcSetup - 1) * Cc.period;
             }
             if (!late) {
-                capture -= Cc.period;
+                double hl = 0, hc = 0;
+                if (holdRelation(L, t.key.edge, Cc, capEdge, hl, hc)) {
+                    // The hold edges move with a setup multicycle, as the
+                    // setup edges did above.
+                    launch = hl;
+                    capture = hc;
+                    if (r.mcSetup != 1) {
+                        if (r.setupStart) launch -= (r.mcSetup - 1) * L.period;
+                        else capture += (r.mcSetup - 1) * Cc.period;
+                    }
+                } else {
+                    capture -= Cc.period;
+                }
                 if (r.mcHold != 0) {
                     if (r.holdEnd) capture -= r.mcHold * Cc.period;
                     else launch += r.mcHold * L.period;

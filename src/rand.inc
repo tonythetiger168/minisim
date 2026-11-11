@@ -14,49 +14,11 @@
 // soft constraints, they are added back from the highest priority down, each
 // kept only if a solution remains (18.5.13.1).
 
+#include "interval.hpp"   // AV, wrap, conv and the interval rule of each operator (shared with mpss)
+
 using i128 = __int128;
 
 namespace rnd {
-
-// An abstract value: every value in [lo, hi], read as w bits, signed or not.
-struct AV {
-    i128 lo = 0, hi = 0;
-    int w = 1;
-    bool sgn = false;
-};
-constexpr int kMaxW = 120;
-inline i128 rMin(int w, bool s) { return s ? -((i128)1 << (w - 1)) : 0; }
-inline i128 rMax(int w, bool s) { return s ? ((i128)1 << (w - 1)) - 1 : ((i128)1 << w) - 1; }
-inline AV full(int w, bool s) {
-    int cw = w > kMaxW ? kMaxW : (w < 1 ? 1 : w);
-    return {rMin(cw, s), rMax(cw, s), w, s};
-}
-inline bool isFull(const AV& a) { return a.w > kMaxW; }
-// [lo, hi] taken mod 2^w and read as (w, s).
-inline AV wrap(i128 lo, i128 hi, int w, bool s) {
-    if (w > kMaxW || w < 1) return full(w, s);
-    i128 m = (i128)1 << w;
-    if (hi - lo + 1 >= m) return full(w, s);
-    auto norm = [&](i128 v) {
-        v %= m;
-        if (v < 0) v += m;
-        if (s && v > rMax(w, true)) v -= m;
-        return v;
-    };
-    i128 a = norm(lo), b = norm(hi);
-    if (a <= b) return {a, b, w, s};
-    return full(w, s);
-}
-inline AV conv(const AV& a, int w, bool s) {
-    if (a.w == w && a.sgn == s) return a;
-    if (a.w > kMaxW) return full(w, s);
-    return wrap(a.lo, a.hi, w, s);
-}
-inline AV single(i128 v, int w, bool s) { return wrap(v, v, w, s); }
-inline AV boolAV(bool canFalse, bool canTrue) { return {canFalse ? 0 : 1, canTrue ? 1 : 0, 1, false}; }
-inline bool canTrue(const AV& a) { return !(a.lo == 0 && a.hi == 0); }
-inline bool canFalse(const AV& a) { return a.lo <= 0 && a.hi >= 0; }
-inline bool isSingle(const AV& a) { return a.w <= kMaxW && a.lo == a.hi; }
 
 // The math value of a known Val read as (w, s); false if it has x/z bits or
 // is wider than the solver handles.
@@ -193,10 +155,7 @@ inline AV aeval(const E& e, bool& exact) {
             if (exact && !(a.w == b.w && w <= kMaxW / 2 && isSingle(a) && isSingle(b))) return concrete(e, exact);
             if (w > kMaxW / 2) return full(w, s);
             a = conv(a, w, s); b = conv(b, w, s);
-            if (e->op == Op::Add) return wrap(a.lo + b.lo, a.hi + b.hi, w, s);
-            if (e->op == Op::Sub) return wrap(a.lo - b.hi, a.hi - b.lo, w, s);
-            i128 c[4] = {a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi};
-            return wrap(*std::min_element(c, c + 4), *std::max_element(c, c + 4), w, s);
+            return wrapOp(e->op == Op::Add ? ival::Op::Add : e->op == Op::Sub ? ival::Op::Sub : ival::Op::Mul, a, b, w, s);
         }
         case Op::Div: case Op::Mod: {
             bool ea, eb;
@@ -208,14 +167,7 @@ inline AV aeval(const E& e, bool& exact) {
             if (w > kMaxW / 2) return full(w, s);
             a = conv(a, w, s); b = conv(b, w, s);
             if (b.lo <= 0 && b.hi >= 0) return full(w, s);   // may divide by 0: x
-            if (e->op == Op::Div) {
-                i128 c[4] = {tdiv(a.lo, b.lo), tdiv(a.lo, b.hi), tdiv(a.hi, b.lo), tdiv(a.hi, b.hi)};
-                return wrap(*std::min_element(c, c + 4), *std::max_element(c, c + 4), w, s);
-            }
-            i128 m = std::max(b.lo < 0 ? -b.lo : b.lo, b.hi < 0 ? -b.hi : b.hi) - 1;
-            if (a.lo >= 0) return wrap(0, std::min(a.hi, m), w, s);
-            if (a.hi <= 0) return wrap(std::max(a.lo, -m), 0, w, s);
-            return wrap(-m, m, w, s);
+            return wrapOp(e->op == Op::Div ? ival::Op::Div : ival::Op::Mod, a, b, w, s);
         }
         case Op::Eq: case Op::Ne: case Op::CaseEq: case Op::WildEq: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: {
             bool ea, eb;
@@ -227,22 +179,14 @@ inline AV aeval(const E& e, bool& exact) {
             int w = std::max(a.w, b.w);
             bool s = a.sgn && b.sgn;
             a = conv(a, w, s); b = conv(b, w, s);
-            bool t = true, f = true;
             switch (e->op) {
-                case Op::Eq: case Op::CaseEq: case Op::WildEq:
-                    t = a.lo <= b.hi && b.lo <= a.hi;
-                    f = !(isSingle(a) && isSingle(b) && a.lo == b.lo);
-                    break;
-                case Op::Ne:
-                    f = a.lo <= b.hi && b.lo <= a.hi;
-                    t = !(isSingle(a) && isSingle(b) && a.lo == b.lo);
-                    break;
-                case Op::Lt: t = a.lo < b.hi; f = a.hi >= b.lo; break;
-                case Op::Le: t = a.lo <= b.hi; f = a.hi > b.lo; break;
-                case Op::Gt: t = a.hi > b.lo; f = a.lo <= b.hi; break;
-                default:     t = a.hi >= b.lo; f = a.lo < b.hi; break;
+                case Op::Eq: case Op::CaseEq: case Op::WildEq: return boolOp(ival::Op::Eq, a, b);
+                case Op::Ne: return boolOp(ival::Op::Ne, a, b);
+                case Op::Lt: return boolOp(ival::Op::Lt, a, b);
+                case Op::Le: return boolOp(ival::Op::Le, a, b);
+                case Op::Gt: return boolOp(ival::Op::Gt, a, b);
+                default:     return boolOp(ival::Op::Ge, a, b);
             }
-            return boolAV(f, t);
         }
         case Op::LogNot: {
             AV a = aeval(e->kids[0], exact);
@@ -259,8 +203,7 @@ inline AV aeval(const E& e, bool& exact) {
             AV b = aeval(e->kids[1], eb);
             exact = ea && eb;
             if (exact) return concrete(e, exact);
-            if (isAnd) return boolAV(canFalse(a) || canFalse(b), canTrue(a) && canTrue(b));
-            return boolAV(canFalse(a) && canFalse(b), canTrue(a) || canTrue(b));
+            return boolOp(isAnd ? ival::Op::LAnd : ival::Op::LOr, a, b);
         }
         case Op::Mux: {
             bool ec, ea, eb;
@@ -294,12 +237,12 @@ inline AV aeval(const E& e, bool& exact) {
             if (w > 64) return full(w, a.sgn && b.sgn);
             AV ua = conv(a, w, false), ub = conv(b, w, false);
             bool s = a.sgn && b.sgn;
-            auto ceilMask = [](i128 v) { i128 m = 0; while (m < v) m = m * 2 + 1; return m; };
-            AV r;
-            if (e->op == Op::And) r = {0, std::min(ua.hi, ub.hi), w, false};
-            else if (e->op == Op::Or) r = {std::max(ua.lo, ub.lo), ceilMask(std::max(ua.hi, ub.hi)), w, false};
-            else r = {0, ceilMask(std::max(ua.hi, ub.hi)), w, false};
-            return conv(r, w, s);
+            // Unsigned operands: the plain rule's bounds, without its exact
+            // case (two single values here need not be the bits compared).
+            ival::IV q = e->op == Op::And ? ival::IV{0, std::min(ua.hi, ub.hi)}
+                       : e->op == Op::Or ? ival::IV{std::max(ua.lo, ub.lo), ival::ceilMask(std::max(ua.hi, ub.hi))}
+                                         : ival::IV{0, ival::ceilMask(std::max(ua.hi, ub.hi))};
+            return conv(AV{q.lo, q.hi, w, false}, w, s);
         }
         case Op::Slice: {   // v[hi:lo]: the bits of every value in the range
             AV a = aeval(e->kids[0], exact);
@@ -504,21 +447,10 @@ inline int narrowVar(Var& v) {
     if (v.set || v.items.empty()) return 0;
     if (--g_ctx->budget < 0) return -1;
     if (!feasibleIn(v, v.lo, v.hi)) return -1;
-    // smallest m with [lo, m] feasible (lo itself, most of the time)
-    i128 a = v.lo, b = v.hi;
-    if (a < b && feasibleIn(v, a, a)) b = a;
-    while (a < b) {
-        i128 m = a + (b - a) / 2;
-        if (feasibleIn(v, v.lo, m)) b = m; else a = m + 1;
-    }
-    i128 nlo = a;
-    a = nlo; b = v.hi;
-    if (a < b && feasibleIn(v, b, b)) a = b;
-    while (a < b) {
-        i128 m = a + (b - a + 1) / 2;
-        if (feasibleIn(v, m, v.hi)) a = m; else b = m - 1;
-    }
-    i128 nhi = a;
+    // The feasible ends, by the binary search shared with mpss (interval.hpp).
+    auto ok = [&](i128 a, i128 b) { return feasibleIn(v, a, b); };
+    i128 nlo = ival::lowBound(v.lo, v.hi, ok);
+    i128 nhi = ival::highBound(nlo, v.hi, ok);
     if (nlo == v.lo && nhi == v.hi) return 0;
     v.lo = nlo; v.hi = nhi;
     return 1;

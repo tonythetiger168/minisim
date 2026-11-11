@@ -7921,6 +7921,23 @@ inline bool enterInstance(const slang::ast::InstanceSymbol& inst) {
     return true;
 }
 
+// An inout port whose actual is a whole net of the same width and kind is
+// the same net as its internal net (23.3.3.1). Returns the internal net when
+// the two can share one signal.
+inline const slang::ast::Symbol* inoutCollapses(const slang::ast::PortSymbol& ps, const slang::ast::Symbol& actual) {
+    using namespace slang::ast;
+    if (ps.direction != ArgumentDirection::InOut || !ps.internalSymbol) return nullptr;
+    if (ps.internalSymbol->kind != SymbolKind::Net || actual.kind != SymbolKind::Net) return nullptr;
+    const auto& in = ps.internalSymbol->as<NetSymbol>();
+    const auto& out = actual.as<NetSymbol>();
+    auto plain = [](const NetSymbol& n) {
+        return (n.netType.netKind == NetType::Wire || n.netType.netKind == NetType::Tri) && n.getType().isIntegral() &&
+               !n.getDelay();
+    };
+    if (!plain(in) || !plain(out) || in.getType().getBitWidth() != out.getType().getBitWidth()) return nullptr;
+    return &in;
+}
+
 // Pass 1: register every variable / net as a simulator signal.
 // Nested signals are named from the instance path (`u.y`) so two children
 // with the same local name stay distinct. The top module keeps bare names.
@@ -9270,6 +9287,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (ext->kind != ExpressionKind::Assignment)
                 Lowerer::unsupported("output port connection");
             const auto& asg = ext->as<AssignmentExpression>();
+            if (ps.direction == ArgumentDirection::InOut) {   // collapsed onto the net it connects to: nothing to drive
+                const Expression& act = Lowerer::peel(asg.left());
+                if (ValueExpressionBase::isKind(act.kind) && act.kind != ExpressionKind::ElementSelect &&
+                    inoutCollapses(ps, act.as<ValueExpressionBase>().symbol) && aliasOf().count(ps.internalSymbol))
+                    continue;
+            }
             if (Lowerer::peel(asg.left()).kind != ExpressionKind::Concatenation) linkFormal = formal->sig;
             driveActual(asg, *formal);
             linkFormal = -1;
@@ -9958,6 +9981,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     if (y->kind == ExpressionKind::Assignment) y = &Lowerer::peel(y->as<AssignmentExpression>().left());
                     if (y->kind != ExpressionKind::NamedValue && y->kind != ExpressionKind::HierarchicalValue) continue;
                     const Symbol& ns = y->as<ValueExpressionBase>().symbol;
+                    // An inout port joined to a whole net is that net (23.3.3.1):
+                    // one signal, as with alias. Two continuous assignments, one
+                    // each way, would hold the last driven value for ever.
+                    if (const Symbol* in = inoutCollapses(c->port.as<PortSymbol>(), ns)) {
+                        if (!up.count(&ns)) up[&ns] = &ns;
+                        if (!up.count(in)) up[in] = in;
+                        const Symbol* ra = root(&ns), *rb = root(in);
+                        if (ra != rb) up[rb] = ra;
+                    }
                     if (ns.kind != SymbolKind::Net || ns.as<NetSymbol>().netType.netKind != NetType::Interconnect) continue;
                     int w = (int)c->port.as<PortSymbol>().getType().getBitWidth();
                     int& cur = interconnectW()[&ns];

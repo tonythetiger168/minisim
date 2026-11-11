@@ -32,6 +32,9 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_get_vlog_info` gives a `-f` file's arguments as the nested
   array 38.36 describes, so `msim -uvm -f files.f` no longer crashes in
   UVM's command line reader.
+- `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
+  `q[3:0]`) follows only that part: its value, the time those bits last
+  changed, and the assignments that write them. The viewer page does the same.
 - `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
   elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
   the default waveform is unchanged. `mdebug -active` follows a memory read
@@ -76,6 +79,10 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal -aiger FILE` writes the model as AIGER 1.9 (bad-state
+  properties for assertions and covers, invariant constraints for
+  assumptions), so other model checkers can run on it or cross-check a
+  verdict.
 - `mformal`: fairness. A strong obligation in an `assume`
   (`assume property (req |-> s_eventually !req)`) restricts the loops a
   liveness counterexample may use.
@@ -116,10 +123,25 @@ Spec references are IEEE 1800-2023 clauses.
   of a clock bus are separate clocks. New options: `-cdc-report`,
   `-clock-group`, `-static`. See `docs/CDC.md`.
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
+- `mpopt`: RTL power optimization. Finds clock gating from enables (CG),
+  sequential clock gating from registers whose sources did not load in the
+  cycle before (SCG), memory gating (MG) and operand isolation of multipliers
+  and dividers (OI); rewrites the RTL source in place (`-o dir`, with the
+  `mpopt_icg` clock-gate model or a library cell via `-icg_cell`), and
+  `-verify` co-simulates original and rewritten RTL in msim on random
+  stimulus, comparing every output and register every cycle. Multithreaded
+  (`-threads N`), same result for any thread count. See `docs/POWEROPT.md`.
 - Shared headers for the tools: `src/parallel.hpp` (default thread count,
   the `-threads N` option, `par::parallelFor`, and `par::Pool` with `run`,
   `chunks` and an order-stable `sum`) and `src/wave_reader.hpp`
   (`wave::Reader`: a parallel, zero-copy VCD reader and an FST reader).
+- `meco`, a functional ECO tool: given the implemented gate netlist and a
+  netlist of the revised design, it writes the smallest patch it can find
+  (patched netlist plus a Tcl edit script) and proves the result equivalent.
+  It looks for the gate or pin to change before copying any logic, reuses old
+  nets proved to have the same function, handles added, removed and replaced
+  registers, scan flops (`-tie se=0`) and black boxes, and gives the same
+  patch for any `-threads`. See `docs/ECO.md`.
 - `mequiv`, a logic equivalence checker (RTL against netlist, netlist against
   netlist, RTL against RTL): both designs become one and-inverter graph,
   flops and latches are matched by name (or by the net on their output, also
@@ -146,6 +168,9 @@ Spec references are IEEE 1800-2023 clauses.
   source, drivers and loads, schematic, waves with values annotated in the
   source). `-vcd` reads VCD and FST; the page traces the active driver at the
   cursor itself. See `docs/DEBUG.md`.
+- `mrcx -corner NAME`: several extraction corners in one run. The options after a
+  `-corner` (`-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale`) are that corner's; the
+  design is read once and each corner goes to `design.NAME.spef`.
 - `mrcx`, parasitic RC extraction: a routed DEF and its LEF in, SPEF (IEEE
   1481) out. Per net a distributed RC network with capacitance to ground and
   coupling capacitance to same-layer neighbours (who also take over part of
@@ -153,7 +178,8 @@ Spec references are IEEE 1800-2023 clauses.
   ITF-style process stack (`-itf`, `-map`, `-temp`) or the LEF values; scale
   factors, decoupled output, per-net report, open and short checks
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
-  count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
+  count. `ETCH` on a conductor gives the width as made. `src/spef.hpp` is the
+  SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
 - `mchar`, cell library characterization on `mspice`: from a Liberty
   template and one transistor `.subckt` per cell it measures delay and
@@ -202,6 +228,18 @@ Spec references are IEEE 1800-2023 clauses.
   NLDM tables. The default library is mini45. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
+- `aig::Design::mems`: the shared RTL-to-AIG front half lists every memory
+  with its write ports (clock, enable, address, data, byte lane) and read
+  ports, for block RAM inference; `msynth`'s `report_resources` shows them.
+- `msynth` area: registers nothing reads or that are stuck at their reset
+  value are removed (`aig::sweep`), nested selects fold into one
+  (`aig::Graph::mux`), load enables use the library's enable flops, and
+  wide selects use 4:1 mux cells; logic that computes the same function
+  twice is merged by simulation and SAT (`src/synth/fraig.hpp`); `'x` in a
+  select is a don't-care, and registers without reset that only hold a
+  constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
+  ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
+  See `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
@@ -241,6 +279,11 @@ Spec references are IEEE 1800-2023 clauses.
   function templates, default arguments, overloads, static members, scoped
   enums, namespaces, and whatever the design uses from its headers
   (`std::min`, `std::max` included). `-emit-c` shows the reduction.
+- `mhls -clang`: inheritance. A base class is the first member of the
+  derived struct; base constructors, inherited and hidden members, several
+  bases, template bases and objects passed as their base all work. Classes
+  whose only constructor is the implicit one now run their members'
+  constructors. Virtual functions in a hierarchy are refused.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -315,6 +358,18 @@ Spec references are IEEE 1800-2023 clauses.
   simulator reports stuck-at, transition, coupling and address-decoder
   coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
   expected results come from that simulator. See `docs/DFT.md`.
+- `mpss`, portable stimulus: reads a model in the Accellera PSS language
+  (components, actions, buffers, streams, resources and pools, constraints,
+  activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
+  and functions), solves scenarios (field values, resource instances, and
+  the actions inferred to feed unbound inputs), and writes each scenario as
+  a UVM sequence class (`-sv`, runs under `msim -uvm`) and as a C test
+  function (`-c`), plus `-print` and `-json`. Scenarios are solved on all
+  cores (`-threads N`) with the same output for every thread count. See
+  `docs/MPSS.md` and `examples/pss/dma.pss`.
+- `src/interval.hpp`: the interval arithmetic and bounds propagation of the
+  `randomize()` solver, moved out of `rand.inc` so that `mpss` uses the same
+  rules.
 - Low-power simulation with UPF (IEEE 1801-2024): `msim -upf file.upf`
   (`-power_top`, `-upf_verbose`) reads power domains, supply ports, nets and
   sets, power switches, isolation, level-shifter and retention strategies,
@@ -398,6 +453,37 @@ Spec references are IEEE 1800-2023 clauses.
 - A run-time error (null object access, a crash) names the statement that
   was running; `MSIM_CALLTRACE=1` prints every method and automatic
   subroutine call.
+- `mdft -bscan`: IEEE 1149.1 boundary-scan insertion (TAP controller,
+  instruction, BYPASS, IDCODE and boundary registers, 2-state, 3-state and
+  bidirectional pads, EXTEST / SAMPLE / PRELOAD / CLAMP / HIGHZ / INTEST)
+  and the BSDL file; `mdft -bsdl` checks a BSDL file (rules BSD001..009) and
+  writes its device tests as SVF and a self-checking testbench
+  (`docs/JTAG.md`).
+- `mdft -icl`: IEEE 1687 IJTAG. Reads ICL, writes the scan network as RTL
+  (optionally behind a TAP), and retargets PDL (`iWrite`, `iRead`, `iApply`,
+  `iCall`, ...) through SIBs and scan muxes to SVF and a testbench.
+- `mdft -lbist`: logic BIST for a scan-inserted design (PRPG on a primitive
+  polynomial, phase shifter, space compactor, MISR, controller and wrapper),
+  the golden signature by simulation (`-lbist_sign`), a check for X sources,
+  and ICL / PDL to run it over IJTAG.
+- `mdft -edt`: scan test compression. A ring-generator decompressor and an
+  XOR compactor around the scan chains, and an encoder that solves test
+  cubes into channel data over GF(2), in parallel and deterministically.
+- `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
+  on the gate netlist (port inputs at 0, scan cells observed), with the
+  coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
+  `-lbist_min_coverage` gate. Uses the shared fault simulator.
+- `mdft -diagnose`: scan failure diagnosis. Reads a tester fail log (pattern,
+  chain, cell or output) with matpg's patterns and the gate netlist, and ranks
+  the stuck-at or transition faults that explain it, with equivalent faults
+  and a second, third... defect when one does not explain everything. Uses
+  the shared fault simulator; multithreaded with the same report on any
+  thread count. See docs/JTAG.md.
+
+### Fixed
+- An inout port connected to a whole net is now that net (23.3.3.1). It was
+  two continuous assignments, one each way, so the net kept the last value
+  driven after every driver had gone to z.
 - `src/sdc.hpp`: a reader for Synopsys Design Constraints (SDC 2.1) shared by
   the constraint, timing and synthesis tools. A small Tcl (variables, `expr`,
   `[...]`, `if`/`foreach`/`for`/`while`, `proc`, lists, `source`) fills a typed
@@ -469,6 +555,16 @@ Spec references are IEEE 1800-2023 clauses.
   resets to flop pins. `-nocarry` and `-noce` turn each off.
 - `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
   `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mlint` runs slang-tidy's checks (the lint tool that ships with slang, MIT)
+  as rules `TIDY001`..`TIDY021`, with mlint's severities, waivers, JSON and
+  threads; the checks mlint already had a rule for are left out. See
+  `docs/LINT.md` and `THIRD_PARTY_NOTICES.md`.
+- `mlint` has 13 text and syntax rules that follow Verible's lint rules
+  (`FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009`):
+  line length, tabs, trailing spaces, stray semicolons, `` `endif ``
+  comments, package file names, explicit lifetimes and parameter types,
+  range direction, macro names, short binary literals. Off by default; one
+  task per file, same output at any `-threads`.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
@@ -666,6 +762,13 @@ Spec references are IEEE 1800-2023 clauses.
   automatic tasks called from several processes at once, and
   `fork automatic int j = i; ... join_none` with one copy per fork. This is
   the base for class methods (8).
+- `msta`: the hold check between clocks of different periods used a capture
+  edge that was too early and reported too much slack. It now takes the
+  tightest hold relation over the common period. Asynchronous set / reset to
+  output arcs are no longer timed as paths by default
+  (`-preset_clear_arcs` turns them on). Both were found by comparing with
+  OpenSTA, which now agrees at every endpoint of a million-cell design to
+  0.1 ps; see "Compared with OpenSTA" in `docs/STA.md` and `bench/sta/`.
 
 ### Changed
 - `mlint` prints each finding's severity (`error`, `warning` or `info`) and

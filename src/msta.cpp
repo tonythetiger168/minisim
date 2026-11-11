@@ -47,6 +47,7 @@ struct Shell {
     std::unique_ptr<sta::SdcDesign> design;
     std::unique_ptr<par::Pool> pool;
     sdc::Reader reader;
+    bool presetClearArcs = false;
     size_t seenCommands = 0, seenDiags = 0;
     int threads = 0;
     int errors = 0;
@@ -102,6 +103,7 @@ struct Shell {
         }
         double readT = secs();
         engine = std::make_unique<sta::Sta>();
+        engine->presetClearArcs = presetClearArcs;
         engine->phases.push_back({"read", readT});
         for (auto& l : libraries) engine->addLibrary(*l);
         auto busPins = [this](const std::string& cell, const std::string& pin, int) {
@@ -412,6 +414,7 @@ void usage() {
         "  -sdf FILE            write the delays and timing checks as SDF\n"
         "  -json FILE           write the summary and the worst paths as JSON\n"
         "  -threads N           worker threads (default: every logical core; 1: none)\n"
+        "  -preset_clear_arcs   time paths through asynchronous set/reset to output arcs\n"
         "  -fail_on_violation   exit 2 when a constraint is violated\n"
         "  -q                   no warnings from the constraint reader\n"
         "  -version, -h\n";
@@ -444,6 +447,7 @@ int main(int argc, char** argv) {
         else if (a == "-sdf") sdf = val();
         else if (a == "-json") json = val();
         else if (a == "-threads") sh.threads = std::atoi(val().c_str());
+        else if (a == "-preset_clear_arcs") sh.presetClearArcs = true;
         else if (a == "-fail_on_violation") failOnViolation = true;
         else if (a == "-stats") stats = true;
         else if (a == "-q") sh.quiet = true;
