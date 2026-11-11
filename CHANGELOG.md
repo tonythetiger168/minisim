@@ -400,6 +400,9 @@ Spec references are IEEE 1800-2023 clauses.
   `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
 - `mfpga`: a multiplier wider than one DSP block is split into block-sized
   partial products summed on carry chains (32x32 on ECP5: 4 blocks, no LUTs).
+- `mfpga`: memories with registered reads map to block RAM on iCE40
+  (`SB_RAM40_4K`) and ECP5 (`DP16KD`), with a bypass that keeps the RTL's
+  read-during-write result. `-noram` keeps flops.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

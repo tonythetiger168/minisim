@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -69,6 +70,25 @@ struct Box {
   }
 };
 
+// A block RAM: one write port, one registered read port. The read data are
+// input variables (they change on the read clock, like flop outputs); the
+// pins are roots. An address holds 2^abits words.
+struct Ram {
+  std::string name;
+  int width = 0, abits = 0;
+  std::vector<Lit> waddr, wdata, raddr;   // LSB first
+  Lit wen = 1, ren = 1, wclk = 0, rclk = 0;
+  bool wneg = false, rneg = false;        // clocked on the falling edge
+  std::vector<uint32_t> q;                // variable of each read data bit, 0 = not used
+
+  template <class F> void for_each_in(F&& f) const {
+    for (Lit l : waddr) f(l);
+    for (Lit l : wdata) f(l);
+    for (Lit l : raddr) f(l);
+    f(wen); f(ren); f(wclk); f(rclk);
+  }
+};
+
 struct Port {
   std::string name;
   bool output = false;
@@ -82,6 +102,7 @@ struct Aig {
   std::vector<std::array<Lit, 2>> ands;   // variable first_and()+i, fanins are lower variables
   std::vector<Port> ports;
   std::vector<Box> boxes;
+  std::vector<Ram> rams;
   std::string top = "top";
 
   uint32_t first_and() const { return 1 + nin + (uint32_t)flops.size(); }
@@ -96,6 +117,7 @@ struct Aig {
     for (auto& fl : flops) { f(fl.d); f(fl.clk); f(fl.arst); f(fl.en); f(fl.srst); }
     if (with_boxes)
       for (auto& b : boxes) b.for_each_in(f);
+    for (auto& r : rams) r.for_each_in(f);
   }
 };
 
@@ -184,6 +206,9 @@ struct FrontOptions {
   bool sync_reset = false;     // d = rst ? v : x becomes the flop's synchronous reset
   bool ce_over_reset = false;  // the family's enable gates its synchronous reset (ice40)
   int sync_reset_min = 3;      // flops one reset signal must control to be used as a reset
+  bool ram = false;            // memories with a registered read onto block RAM
+  int ram_abits = 0;           // address bits of the deepest configuration of one block
+  int ram_min_bits = 512;      // smaller memories stay flops
   bool dsp = false;            // multipliers onto DSP blocks
   int dsp_a = 0, dsp_b = 0;    // widest operands of one block, as it multiplies signed numbers
   bool dsp_unsigned = false;   // the block also multiplies unsigned numbers of that width
@@ -196,7 +221,8 @@ namespace detail {
 // A cleaned design to the flat view. Ports and inputs whose name starts with
 // \x01 are from_design's own: flop enables and resets, box operands and outputs.
 inline Aig flatten(const aig::Design& d, const std::vector<int>& init, const std::vector<char>& invert,
-                   const std::vector<char>& sval, std::map<int, Box> boxes) {
+                   const std::vector<char>& sval, std::map<int, Box> boxes,
+                   std::vector<Ram> rams = {}) {
   const aig::Graph& g = d.g;
   Aig out;
   out.top = d.top;
@@ -225,6 +251,7 @@ inline Aig flatten(const aig::Design& d, const std::vector<int>& init, const std
     if (nm.size() < 3 || nm[0] != '\x01') continue;
     size_t pos = 2;
     int k = std::stoi(nm.substr(2), &pos);
+    if (nm[1] == 'm') { rams[k].q[std::stoi(nm.substr(3 + pos))] = 1 + (uint32_t)i; continue; }
     Box& b = boxes[k];
     if (nm[2 + pos] == 'c') b.cout = 1 + (uint32_t)i;
     else b.sum[std::stoi(nm.substr(3 + pos))] = 1 + (uint32_t)i;
@@ -236,12 +263,23 @@ inline Aig flatten(const aig::Design& d, const std::vector<int>& init, const std
     }
     size_t pos = 0;
     int k = std::stoi(p.name.substr(2), &pos);
-    if (p.name[1] == 'e') out.flops[k].en = p.bits[0];
+    if (p.name[1] == 'm') {
+      Ram& r = rams[k];
+      switch (p.name[2 + pos]) {
+        case 'a': r.waddr = p.bits; break;
+        case 'd': r.wdata = p.bits; break;
+        case 'r': r.raddr = p.bits; break;
+        case 'w': r.wen = p.bits[0]; r.wclk = p.bits[1]; break;
+        default: r.ren = p.bits[0]; r.rclk = p.bits[1]; break;
+      }
+    }
+    else if (p.name[1] == 'e') out.flops[k].en = p.bits[0];
     else if (p.name[1] == 'r') { out.flops[k].srst = p.bits[0]; out.flops[k].sval = sval[k]; }
     else if (p.name[2 + pos] == 'a') boxes[k].a = p.bits;
     else boxes[k].b = p.bits;
   }
   for (auto& kv : boxes) out.boxes.push_back(std::move(kv.second));
+  out.rams = std::move(rams);
   return out;
 }
 
@@ -291,6 +329,170 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
   const bool inv = std::find(invert.begin(), invert.end(), 1) != invert.end();
   if (inv) { work = in; invert_flops(work, invert); }
   aig::Design d = aig::cleanup(inv ? work : in);
+
+  // ---- block RAM
+  // The elaborator leaves a memory in the graph as flops and mux trees and
+  // lists its ports (aig::Design::mems). A memory with one whole-word write
+  // port, whose every read is registered (q <= mem[addr], with or without an
+  // enable), leaves the graph: the read register becomes the RAM's own
+  // output register, and the memory's flops, with nothing left to read them,
+  // are removed. A read in the same cycle as a write to the same address
+  // gives the old word in RTL and anything in the block, so with one clock
+  // the write is delayed a cycle and a bypass register returns the word that
+  // is still on its way.
+  std::vector<Ram> rams;
+  bool have_init = inv;
+  for (int v : init) have_init |= v != 2;
+  if (fo.ram && !have_init && !d.mems.empty()) {
+    aig::Graph& g = d.g;
+    std::vector<uint32_t> ref(g.size(), 0);
+    for (uint32_t n = 1; n < g.size(); ++n) {
+      const aig::Node& nd = g.nodes[n];
+      if (nd.k == aig::NK::And) { ref[aig::lnode(nd.a)]++; ref[aig::lnode(nd.b)]++; }
+      else if (nd.k == aig::NK::Wire && nd.a != aig::NOLIT) ref[aig::lnode(nd.a)]++;
+    }
+    for (auto& f : g.flops) {
+      ref[aig::lnode(f.d)]++; ref[aig::lnode(f.clk)]++;
+      if (f.arst != aig::NOLIT) ref[aig::lnode(f.arst)]++;
+    }
+    for (auto& pt : d.ports) if (pt.out) for (Lit l : pt.bits) ref[aig::lnode(l)]++;
+    // which flop registers a literal, and under which enable
+    struct Reader { int flop; Lit en; };
+    std::unordered_map<Lit, Reader> reader;
+    for (size_t i = 0; i < g.flops.size(); ++i) {
+      const aig::Flop& f = g.flops[i];
+      reader[f.d] = {(int)i, aig::L1};
+      Lit sl, t, e;
+      if (!detail::is_mux(g, f.d, sl, t, e)) continue;
+      if (e == f.q) reader.emplace(t, Reader{(int)i, sl});
+      else if (t == f.q) reader.emplace(e, Reader{(int)i, aig::lneg(sl)});
+    }
+    bool changed = false;
+    const size_t nflops = g.flops.size();
+    for (const aig::Memory& m : d.mems) {
+      if (m.wr.size() != 1 || m.rd.empty() || m.depth < 2) continue;
+      const aig::MemPort& w = m.wr[0];
+      if (w.lo != 0 || (int)w.data.size() != m.width) continue;
+      int abits = 1;
+      while ((1 << abits) < m.depth) ++abits;
+      if (abits > fo.ram_abits || (long)m.width * m.depth < fo.ram_min_bits) continue;
+      // An address is the word position; bits above abits have to be 0 wires.
+      auto address = [&](aig::Bits a, bool& ok) {
+        while ((int)a.size() > abits && a.back() == aig::L0) a.pop_back();
+        ok = ok && (int)a.size() <= abits;
+        a.resize(abits, aig::L0);
+        return a;
+      };
+      bool ok = true;
+      const aig::Bits wa = address(w.addr, ok);
+      struct Read { aig::Bits addr; std::vector<int> flops; Lit en; Lit clk; bool neg; };
+      std::vector<Read> reads;
+      for (const aig::MemPort& r : m.rd) {
+        Read rd;
+        rd.addr = address(r.addr, ok);
+        ok = ok && (int)r.data.size() == m.width;
+        for (size_t i = 0; ok && i < r.data.size(); ++i) {
+          auto it = reader.find(r.data[i]);
+          ok = it != reader.end() && ref[aig::lnode(r.data[i])] == 1 && it->second.flop < (int)nflops;
+          if (!ok) break;
+          const aig::Flop& f = g.flops[it->second.flop];
+          ok = f.arst == aig::NOLIT && f.var != m.name;
+          if (i == 0) { rd.en = it->second.en; rd.clk = f.clk; rd.neg = f.negedge; }
+          ok = ok && it->second.en == rd.en && f.clk == rd.clk && f.negedge == rd.neg;
+          rd.flops.push_back(it->second.flop);
+        }
+        if (!ok) break;
+        reads.push_back(std::move(rd));
+      }
+      if (!ok) continue;
+      // Rewire, then see that nothing else reads the memory's flops.
+      std::vector<std::pair<uint32_t, aig::Node>> undo;
+      const size_t inputs0 = g.inputNames.size(), nodes0 = g.nodes.size(), flops0 = g.flops.size(), ports0 = d.ports.size();
+      const size_t rams0 = rams.size();
+      auto set_wire = [&](uint32_t node, Lit to) {
+        undo.push_back({node, g.nodes[node]});
+        aig::Node wr;
+        wr.k = aig::NK::Wire;
+        wr.a = to;
+        g.nodes[node] = wr;
+      };
+      auto reg = [&](Lit dl, Lit en, const std::string& name) {   // q <= en ? dl : q
+        aig::Flop f;
+        f.clk = w.clk; f.negedge = w.negedge; f.name = name;
+        const Lit q = g.dff(f);
+        g.flops.back().d = en == aig::L1 ? dl : g.mux(en, dl, q);
+        return q;
+      };
+      auto pseudo = [&](size_t k, char tag, aig::Bits bits) {
+        aig::Port pt;
+        pt.name = std::string("\x01") + "m" + std::to_string(k) + tag;
+        pt.out = true;
+        pt.bits = std::move(bits);
+        d.ports.push_back(std::move(pt));
+      };
+      for (size_t ri = 0; ri < reads.size(); ++ri) {
+        const Read& rd = reads[ri];
+        const size_t k = rams.size();
+        Ram ram;
+        ram.name = m.name + (reads.size() > 1 ? "_r" + std::to_string(ri) : "");
+        ram.width = m.width; ram.abits = abits;
+        ram.wneg = w.negedge; ram.rneg = rd.neg;
+        ram.q.assign(m.width, 0);
+        rams.push_back(std::move(ram));
+        const bool same_clk = rd.clk == w.clk && rd.neg == w.negedge;
+        aig::Bits a = wa, dat = w.data;
+        Lit en = w.en, hit = aig::L0;
+        aig::Bits by;
+        if (same_clk) {
+          const std::string base = m.name + "_ram" + std::to_string(k);
+          for (size_t i = 0; i < a.size(); ++i) a[i] = reg(a[i], aig::L1, base + "_wa[" + std::to_string(i) + "]");
+          for (size_t i = 0; i < dat.size(); ++i) dat[i] = reg(dat[i], aig::L1, base + "_wd[" + std::to_string(i) + "]");
+          en = reg(en, aig::L1, base + "_we");
+          hit = reg(g.andl(en, g.eq(a, rd.addr)), rd.en, base + "_hit");
+          for (size_t i = 0; i < dat.size(); ++i) by.push_back(reg(dat[i], rd.en, base + "_by[" + std::to_string(i) + "]"));
+        }
+        pseudo(k, 'a', a);
+        pseudo(k, 'd', dat);
+        pseudo(k, 'r', rd.addr);
+        pseudo(k, 'w', {en, w.clk});
+        pseudo(k, 'n', {rd.en, rd.clk});
+        for (int i = 0; i < m.width; ++i) {
+          Lit q = g.input(std::string("\x01") + "m" + std::to_string(k) + "q" + std::to_string(i));
+          if (same_clk) q = g.mux(hit, by[i], q);
+          set_wire(aig::lnode(g.flops[rd.flops[i]].q), q);
+        }
+      }
+      bool clean = true;
+      {
+        const std::vector<uint8_t> live = aig::liveNodes(d);
+        for (uint32_t n = 1; n < nodes0 && clean; ++n)
+          if (g.nodes[n].k == aig::NK::Dff && live[n] && g.flops[g.nodes[n].aux].var == m.name) clean = false;
+      }
+      if (!clean) {   // something else reads the words: put everything back
+        for (auto it = undo.rbegin(); it != undo.rend(); ++it) g.nodes[it->first] = it->second;
+        g.nodes.resize(nodes0);
+        g.flops.resize(flops0);
+        g.inputNames.resize(inputs0);
+        d.ports.resize(ports0);
+        rams.resize(rams0);
+        g.strash.clear();
+        continue;
+      }
+      for (uint32_t n = 1; n < nodes0; ++n)
+        if (g.nodes[n].k == aig::NK::Dff && g.flops[g.nodes[n].aux].var == m.name) {
+          aig::Node gone;
+          gone.k = aig::NK::Wire;
+          gone.a = aig::NOLIT;
+          g.nodes[n] = gone;
+        }
+      changed = true;
+    }
+    if (changed) {
+      g.strash.clear();
+      d = aig::cleanup(d);
+      init.clear();
+    }
+  }
 
   // ---- clock enables and synchronous resets
   std::vector<char> sval(d.g.flops.size(), 0);
@@ -508,7 +710,7 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
     }
   for (int round = 0;; ++round) {
     if (round == 16) std::fill(sel.begin(), sel.end(), 0);   // give up on chains rather than loop
-    if (std::find(sel.begin(), sel.end(), 1) == sel.end()) return detail::flatten(d, init, invert, sval, {});
+    if (std::find(sel.begin(), sel.end(), 1) == sel.end()) return detail::flatten(d, init, invert, sval, {}, rams);
     aig::Design c = d;
     c.g.strash.clear();
     std::vector<char> cut(c.g.size(), 0);
@@ -572,7 +774,7 @@ inline Aig from_design(const aig::Design& in, std::vector<int> init = {}, const 
     if (protos.empty()) continue;
     std::vector<int> ids;
     for (auto& kv : protos) ids.push_back(kv.first);
-    Aig flat = detail::flatten(aig::cleanup(c), init, invert, sval, std::move(protos));
+    Aig flat = detail::flatten(aig::cleanup(c), init, invert, sval, std::move(protos), rams);
     // A box nothing reads (the adders inside a comparator that became a
     // chain itself) or one that feeds its own operands is dropped; try again.
     std::vector<char> used(flat.first_and(), 0);
@@ -1040,10 +1242,11 @@ struct Netlist {
   std::vector<std::string> warnings;
   std::vector<std::pair<int, int>> inits;  // net, power-up value (generic family)
   int nbits = 2;
-  size_t luts = 0, ffs = 0, ffs_en = 0, ffs_srst = 0, carry_bits = 0, chains = 0, dsps = 0;
+  size_t luts = 0, ffs = 0, ffs_en = 0, ffs_srst = 0, carry_bits = 0, chains = 0, dsps = 0, brams = 0;
   // where the Aig's signals ended up (for checking)
   std::vector<int> ci_bit;                 // per variable below first_and()
   std::vector<std::array<int, 5>> ff_bits; // D, clock, async reset, enable, sync reset pin nets per flop
+  std::vector<std::vector<std::pair<int, Lit>>> ram_pins;  // the same per block RAM
   std::vector<std::vector<std::pair<int, Lit>>> box_pins;  // per box: operand pin nets and the literal each carries
 };
 
@@ -1072,6 +1275,9 @@ inline FrontOptions family_front(Family f) {
   o.dsp_b = f == Family::Ice40 ? 16 : 18;
   o.dsp_unsigned = f != Family::Xc7;
   if (f == Family::Generic) o.dsp_a = o.dsp_b = 0;
+  // SB_RAM40_4K goes to 2048 x 2, DP16KD to 16384 x 1
+  o.ram = f == Family::Ice40 || f == Family::Ecp5;
+  o.ram_abits = f == Family::Ice40 ? 11 : 14;
   return o;
 }
 
@@ -1121,6 +1327,7 @@ class NetlistBuilder {
     std::vector<char> port_in(nv, 0);
     for (uint32_t v = 1; v <= g_.nin; ++v) port_in[v] = pos_[v] >= 0;
     for (auto& b : g_.boxes) b.for_each_out([&](uint32_t v) { pos_[v] = fresh(); });
+    for (auto& r : g_.rams) for (uint32_t v : r.q) if (v) pos_[v] = fresh();
     for (uint32_t v = 1; v <= g_.nin; ++v)
       if (pos_[v] < 0) pos_[v] = 0;  // an input in no port reads as 0
     for (size_t i = 0; i < g_.flops.size(); ++i) pos_[1 + g_.nin + i] = fresh();
@@ -1143,6 +1350,7 @@ class NetlistBuilder {
 
     for (size_t i = 0; i < g_.flops.size(); ++i) emit_ff(i);
     for (size_t k = 0; k < g_.boxes.size(); ++k) emit_box(k);
+    for (size_t k = 0; k < g_.rams.size(); ++k) emit_ram(k);
 
     for (auto& p : g_.ports) {
       if (!p.output) continue;
@@ -1303,6 +1511,95 @@ class NetlistBuilder {
         add_cell(t, name, {}, std::move(c));
         break;
       }
+    }
+  }
+
+  // One memory on the family's block RAMs: as many side by side as the word
+  // is wide, in the widest configuration that is deep enough.
+  void emit_ram(size_t k) {
+    const Ram& R = g_.rams[k];
+    n_.ram_pins.emplace_back();
+    auto pin = [&](Lit l) { int b = bit_of(l); n_.ram_pins.back().push_back({b, l}); return b; };
+    std::vector<int> wa, wd, ra;
+    for (Lit l : R.waddr) wa.push_back(pin(l));
+    for (Lit l : R.wdata) wd.push_back(pin(l));
+    for (Lit l : R.raddr) ra.push_back(pin(l));
+    const int wen = pin(R.wen), ren = pin(R.ren), wclk = pin(R.wclk), rclk = pin(R.rclk);
+    auto q = [&](int i) { return i < R.width && R.q[i] ? pos_[R.q[i]] : fresh(); };
+    auto padded = [](std::vector<int> v, size_t w) { v.resize(w, 0); return v; };
+    std::string base = R.name;
+    for (char& ch : base) if (ch == '/' || ch == '.') ch = '_';
+    switch (fam_) {
+      case Family::Ice40: {
+        // SB_RAM40_4K: 256 x 16, 512 x 8, 1024 x 4 or 2048 x 2; the narrow modes use these data bits
+        const int mode = R.abits <= 8 ? 0 : R.abits - 8;
+        static const std::vector<int> lanes[4] = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+                                                  {0, 2, 4, 6, 8, 10, 12, 14}, {1, 5, 9, 13}, {3, 11}};
+        const std::vector<int>& lane = lanes[mode];
+        const int w = (int)lane.size();
+        const std::string type = std::string("SB_RAM40_4K") + (R.rneg || R.wneg ? "N" : "") + (R.rneg ? "R" : "") + (R.wneg ? "W" : "");
+        for (int at = 0, j = 0; at < R.width; at += w, ++j) {
+          std::vector<int> di(16, 0), dout(16);
+          for (int b = 0; b < 16; ++b) dout[b] = fresh();
+          for (int b = 0; b < w && at + b < R.width; ++b) { di[lane[b]] = wd[at + b]; dout[lane[b]] = q(at + b); }
+          std::string name = base + "_ram" + std::to_string(j);
+          while (!used_.insert(name).second) name += "_";
+          ++n_.brams;
+          add_cell(type, name, {{"READ_MODE", bitstr(mode, 32), false}, {"WRITE_MODE", bitstr(mode, 32), false}},
+                   {{"RDATA", true, dout}, {R.rneg ? "RCLKN" : "RCLK", false, {rclk}}, {"RCLKE", false, {ren}}, {"RE", false, {1}},
+                    {"RADDR", false, padded(ra, 11)}, {R.wneg ? "WCLKN" : "WCLK", false, {wclk}}, {"WCLKE", false, {wen}},
+                    {"WE", false, {1}}, {"WADDR", false, padded(wa, 11)}, {"MASK", false, std::vector<int>(16, 0)},
+                    {"WDATA", false, di}});
+        }
+        break;
+      }
+      case Family::Ecp5: {
+        // DP16KD: port A writes, port B reads. 1024 x 18 down to 16384 x 1; the address sits at
+        // the top of AD[13:0], and in the 18 and 9 bit modes the low bits of port A are byte enables.
+        const int w = R.abits <= 10 ? 18 : R.abits == 11 ? 9 : R.abits == 12 ? 4 : R.abits == 13 ? 2 : 1;
+        const int shift = w == 18 ? 4 : w == 9 ? 3 : w == 4 ? 2 : w == 2 ? 1 : 0;
+        const int deep = 14 - shift;   // address bits of this mode
+        for (int at = 0, j = 0; at < R.width; at += w, ++j) {
+          std::vector<Conn> c;
+          auto bus = [&](const char* pre, const std::vector<int>& v, bool out) {
+            for (size_t i = 0; i < v.size(); ++i) c.push_back({pre + std::to_string(i), out, {v[i]}});
+          };
+          std::vector<int> ada(14, 0), adb(14, 0), dia(18, 0), dib(18, 0), doa(18), dob(18);
+          for (int i = 0; i < deep; ++i) {
+            ada[shift + i] = i < (int)wa.size() ? wa[i] : 0;
+            adb[shift + i] = i < (int)ra.size() ? ra[i] : 0;
+          }
+          if (w == 18) ada[0] = ada[1] = 1;
+          if (w == 9) ada[0] = 1;
+          for (int b = 0; b < 18; ++b) {
+            doa[b] = fresh();
+            dob[b] = b < w && at + b < R.width ? q(at + b) : fresh();
+            if (b < w && at + b < R.width) dia[b] = wd[at + b];
+          }
+          bus("DIA", dia, false); bus("ADA", ada, false);
+          c.push_back({"CEA", false, {1}}); c.push_back({"OCEA", false, {1}}); c.push_back({"CLKA", false, {wclk}});
+          c.push_back({"WEA", false, {wen}}); c.push_back({"RSTA", false, {0}});
+          bus("CSA", {0, 0, 0}, false); bus("DOA", doa, true);
+          bus("DIB", dib, false); bus("ADB", adb, false);
+          c.push_back({"CEB", false, {ren}}); c.push_back({"OCEB", false, {1}}); c.push_back({"CLKB", false, {rclk}});
+          c.push_back({"WEB", false, {0}}); c.push_back({"RSTB", false, {0}});
+          bus("CSB", {0, 0, 0}, false); bus("DOB", dob, true);
+          std::string name = base + "_ram" + std::to_string(j);
+          while (!used_.insert(name).second) name += "_";
+          ++n_.brams;
+          add_cell("DP16KD", name,
+                   {{"DATA_WIDTH_A", bitstr(w, 32), false}, {"DATA_WIDTH_B", bitstr(w, 32), false},
+                    {"REGMODE_A", "NOREG", true}, {"REGMODE_B", "NOREG", true}, {"RESETMODE", "SYNC", true},
+                    {"ASYNC_RESET_RELEASE", "SYNC", true}, {"CSDECODE_A", "0b000", true}, {"CSDECODE_B", "0b000", true},
+                    {"WRITEMODE_A", "NORMAL", true}, {"WRITEMODE_B", "NORMAL", true},
+                    {"CLKAMUX", R.wneg ? "INV" : "CLKA", true}, {"CLKBMUX", R.rneg ? "INV" : "CLKB", true},
+                    {"GSR", "DISABLED", true}},
+                   std::move(c));
+        }
+        break;
+      }
+      default:
+        throw std::runtime_error("fpga: no block RAM cell for this family");
     }
   }
 
@@ -1910,6 +2207,7 @@ inline std::string check_netlist(const Aig& g, const Netlist& n, int rounds = 16
     }
     for (uint32_t v = 1 + g.nin; v < fa; ++v) b[n.ci_bit[v]] = a[v];
     for (auto& bx : g.boxes) bx.for_each_out([&](uint32_t v) { b[n.ci_bit[v]] = a[v]; });   // chains are cut points
+    for (auto& rm : g.rams) for (uint32_t v : rm.q) if (v) b[n.ci_bit[v]] = a[v];
     for (auto& c : n.cells) {
       const std::string& t = c.type;
       if (t == "IBUF" || t == "OBUF") { b[c.conns[1].bits[0]] = b[c.conns[0].bits[0]]; continue; }
@@ -1955,6 +2253,9 @@ inline std::string check_netlist(const Aig& g, const Netlist& n, int rounds = 16
       for (auto& pn : n.box_pins[k]) ok = ok && b[pn.first] == val(pn.second);
       if (!ok) return "carry chain " + std::to_string(k) + " operand differs";
     }
+    for (size_t k = 0; k < g.rams.size(); ++k)
+      for (auto& pn : n.ram_pins[k])
+        if (b[pn.first] != val(pn.second)) return "block RAM " + g.rams[k].name + ": a pin differs";
   }
   return "";
 }

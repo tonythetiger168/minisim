@@ -24,7 +24,7 @@ install(TARGETS mfpga RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # none) and more mfpga options. mul and mulp are multipliers on DSP blocks.
 if(Python3_FOUND)
   foreach(t counter:12 fsm:0 hier:0 alu:0 latch1:0 dp:6:rst mul:0 mulp:2:-:-dsp-min:4
-            mulw:0:-:--no-ice40-pnr)
+            mulw:0:-:--no-ice40-pnr ram:0)
     string(REPLACE ":" ";" t_parts ${t})
     list(GET t_parts 0 t_name)
     list(GET t_parts 1 t_depth)

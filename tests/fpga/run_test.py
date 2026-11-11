@@ -15,6 +15,7 @@ tests/fpga/DESIGN.sv or tests/fpga/DESIGN.aag. Checks:
      (bounded SAT on a miter). This check shares no code with mfpga. With a
      reset-input the proof holds that input at 1 in the first cycle: a flop
      with a synchronous set powers up 1 on ecp5 and 0 in the RTL's proof.
+     iCE40 also runs on the vendor's simulation models (Yosys' ice40/cells_sim.v), when installed.
   5. With nextpnr-ice40 / nextpnr-ecp5 on PATH: the netlist places and routes.
 """
 import os, shutil, subprocess, sys
@@ -41,6 +42,7 @@ def run(cmd, **kw):
 
 SIM = {"ice40": "+/ice40/cells_sim.v", "ecp5": "+/ecp5/cells_sim.v", "xc7": "+/xilinx/cells_sim.v", "generic": None}
 yosys = shutil.which("yosys") if depth and os.path.exists(rtl) else None
+datdir = os.path.join(os.path.dirname(os.path.realpath(shutil.which("yosys"))), "..", "share", "yosys") if shutil.which("yosys") else ""
 
 for fam in ("generic", "ice40", "ecp5", "xc7"):
     base = os.path.join(out, "%s_%s" % (design, fam))
@@ -64,6 +66,12 @@ for fam in ("generic", "ice40", "ecp5", "xc7"):
         got = run([msim, base + ".v"] + cells + [tb, "-top", design + "_tb"])
         if want != got or len(want.splitlines()) < 50:
             sys.exit("%s: the netlist simulates differently from the RTL (%d lines)" % (fam, len(want.splitlines())))
+        # iCE40: once more on the vendor's own simulation models, which Yosys ships
+        vendor = os.path.join(datdir, "ice40", "cells_sim.v") if datdir and fam == "ice40" else ""
+        if os.path.exists(vendor):
+            got = run([msim, base + ".v", vendor, tb, "-top", design + "_tb"])
+            if want != got:
+                sys.exit("ice40: the netlist on the vendor's simulation models differs from the RTL")
     if yosys:
         ys = ["read_verilog -sv " + rtl, "prep -top " + design, "design -stash gold"]
         if SIM[fam]:
