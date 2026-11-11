@@ -15,6 +15,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
+  elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
+  the default waveform is unchanged. `mdebug -active` follows a memory read
+  to the element and the write that filled it.
 - `mpnr -lib FILE -sdc FILE`: timing of the placed design with the engine
   behind `msta` (wires estimated from the placement), reported after global
   placement and after legalization with the clocks propagated through

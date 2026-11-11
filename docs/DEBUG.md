@@ -143,6 +143,19 @@ replaces an earlier one only where it writes the same bits, so every field's
 own driver is reported, and a whole assignment (`p = '0;`) that the fields
 then overwrite is not.
 
+## Memories
+
+msim leaves unpacked arrays out of the waveform unless asked:
+
+    msim design.sv -top tb -vcd run.vcd -vcd-arrays        # arrays of up to 1024 elements
+    msim design.sv -top tb -fst run.fst -vcd-arrays 4096
+
+Each element is then a signal of its own, `tb.mem[3]`. `-active` follows a
+read `q = mem[addr]` to the element `addr` selected at that time, and from
+there to the write `mem[waddr] <= d` whose index was that element, with the
+index and data it had. `-active tb.mem[3]` starts at one element. Without
+`-vcd-arrays` the trace stops at the memory and says so.
+
 ## Tasks, calls and force
 
 A task or function declared in a module drives the signals it assigns, as
@@ -156,8 +169,10 @@ declared with a value (`wire n = a + b;`) is a continuous assignment.
 
 - In the page, a condition that reads an `x` or `z` value is undecided
   (`??`); the command line evaluates all four states.
-- Unpacked arrays and class objects are not in msim's VCD, so the
-  active-driver trace stops at them with `(not in the waveform)`.
+- Class objects are not in msim's waveform, so the active-driver trace
+  stops at them with `(not in the waveform)`. Memories need `-vcd-arrays`
+  (above); the page's own trace does not follow memory elements yet, the
+  command line does.
 - A task's formal arguments are not in the waveform, so the active-driver
   trace shows an assignment inside a task that depends on one as undecided
   (`??`); `-trace` follows the argument to every call.
