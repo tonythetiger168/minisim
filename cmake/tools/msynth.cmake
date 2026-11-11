@@ -30,7 +30,7 @@ add_test(NAME test_aig_mem COMMAND test_aig_mem ${CMAKE_SOURCE_DIR}/tests/synth/
 # RTL and on the netlist: both must print the same. Once with the default
 # library (mini45) and once with a library of only an inverter, a NAND and one flop.
 if(Python3_FOUND)
-  foreach(t counter alu fsm hier mem)
+  foreach(t counter alu fsm hier mem sweep)
     add_test(NAME msynth_${t}
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/run_test.py
                      $<TARGET_FILE:msynth> $<TARGET_FILE:msim> ${CMAKE_SOURCE_DIR}/tests/synth
@@ -42,6 +42,9 @@ if(Python3_FOUND)
   endforeach()
   # The netlist is also proven equivalent to the RTL by mequiv, and a netlist
   # with one gate swapped must be reported as different.
+  # (sweep is not in this list: its registers stuck at their reset value are
+  # constants in the netlist, which a combinational check with free state
+  # cannot know.)
   if(TARGET mequiv)
     foreach(t counter alu fsm hier)
       add_test(NAME msynth_equiv_${t}
@@ -50,6 +53,10 @@ if(Python3_FOUND)
                        ${CMAKE_CURRENT_BINARY_DIR}/msynth_test ${t})
     endforeach()
   endif()
+  # The area steps (register sweep, enable flops, 4:1 muxes) show in the netlist.
+  add_test(NAME msynth_qor
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/qor_test.py
+                   $<TARGET_FILE:msynth> ${CMAKE_SOURCE_DIR}/tests/synth ${CMAKE_CURRENT_BINARY_DIR}/msynth_qor)
   add_test(NAME msynth_shell
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/shell_test.py
                    $<TARGET_FILE:msynth> ${CMAKE_SOURCE_DIR}/tests/synth ${CMAKE_CURRENT_BINARY_DIR}/msynth_shell)

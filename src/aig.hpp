@@ -153,7 +153,43 @@ struct Graph {
         if (e == L1) return orl(lneg(s), t);
         if (e == L0) return andl(s, t);
         if (t == lneg(e)) return xnorl(s, t) == L0 ? L0 : lneg(xorl(s, t));
+        // Nested selects with a shared arm fold into one select with a
+        // combined condition (if (a) if (b) x = d; and priority chains), so
+        // a word costs one mux per bit plus one shared gate.
+        Lit s2, a, b;
+        if (asMux(t, s2, a, b)) {
+            if (b == e) return muxRaw(andl(s, s2), a, e);
+            if (a == e) return muxRaw(andl(s, lneg(s2)), b, e);
+        }
+        if (asMux(e, s2, a, b)) {
+            if (a == t) return muxRaw(orl(s, s2), t, b);
+            if (b == t) return muxRaw(orl(s, lneg(s2)), t, a);
+        }
+        return muxRaw(s, t, e);
+    }
+    Lit muxRaw(Lit s, Lit t, Lit e) {
+        if (s == L1) return t;
+        if (s == L0) return e;
         return orl(andl(s, t), andl(lneg(s), e));
+    }
+    // l == s ? t : e, when l has the shape mux() builds: !(!(s & t) & !(!s & e)).
+    bool asMux(Lit l, Lit& s, Lit& t, Lit& e) const {
+        if (!lisneg(l)) return false;
+        const Node& o = nodes[lnode(l)];
+        if (o.k != NK::And || !lisneg(o.a) || !lisneg(o.b)) return false;
+        const Node& x = nodes[lnode(o.a)];
+        const Node& y = nodes[lnode(o.b)];
+        if (x.k != NK::And || y.k != NK::And) return false;
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++) {
+                Lit xs = i ? x.b : x.a, ys = j ? y.b : y.a;
+                if (xs != lneg(ys)) continue;
+                s = xs;
+                t = i ? x.a : x.b;
+                e = j ? y.a : y.b;
+                return true;
+            }
+        return false;
     }
     Lit maj(Lit a, Lit b, Lit c) { return orl(andl(a, b), andl(c, orl(a, b))); }
 
@@ -442,7 +478,9 @@ inline bool flopSyncReset(const Graph& g, Lit d, Lit& rst, bool& value, Lit& dat
 // Rebuild into a clean graph: wires resolved, constants propagated, logic
 // that reaches no output or flop dropped, combinational loops reported.
 // Flops come first in the new graph, so feedback through them is fine.
-inline Design cleanup(const Design& in) {
+// With `keep` (per node of the old graph), only the flops marked there are
+// carried over; the caller guarantees that nothing kept reads the others.
+inline Design cleanup(const Design& in, const std::vector<uint8_t>* keep = nullptr) {
     Design out;
     out.top = in.top;
     out.warnings = in.warnings;
@@ -456,7 +494,7 @@ inline Design cleanup(const Design& in) {
     for (uint32_t n = 1; n < g.size(); n++)
         if (g.nodes[n].k == NK::Input) map[n] = ng.input(g.inputNames[g.nodes[n].aux]);
     for (uint32_t n = 1; n < g.size(); n++)
-        if (g.nodes[n].k == NK::Dff) {
+        if (g.nodes[n].k == NK::Dff && (!keep || (*keep)[n])) {
             Flop f = g.flops[g.nodes[n].aux];
             map[n] = ng.dff(f);
         }
@@ -600,6 +638,43 @@ inline std::vector<uint8_t> liveNodes(const Design& d) {
         break;
     }
     return live;
+}
+
+// Sequential sweep, as a synthesis tool does it: flops whose output reaches
+// no output port are dropped, and a flop that can only ever hold its
+// asynchronous reset value (its next state is that constant, itself, or
+// itself gated) becomes the constant. Repeats until nothing changes. `removed`, when
+// given, gets the number of flops taken out. cleanup() alone keeps every
+// flop, which is what tools that match registers by name want.
+inline Design sweep(Design d, size_t* removed = nullptr) {
+    size_t before = d.g.flops.size();
+    for (;;) {
+        Graph& g = d.g;
+        bool changed = false;
+        for (uint32_t n = 1; n < g.size(); n++) {
+            Node& nd = g.nodes[n];
+            if (nd.k != NK::Dff) continue;
+            const Flop& f = g.flops[nd.aux];
+            Lit c = f.rval ? L1 : L0;
+            if (f.arst == NOLIT) continue;
+            // stays at c: d is c, q itself, q & x (c = 0) or q | x (c = 1)
+            bool stuck = f.d == c || f.d == mklit(n);
+            const Node& dn = g.nodes[lnode(f.d)];
+            Lit qc = mklit(n, f.rval);   // q, as the AND under d sees it
+            if (!stuck && dn.k == NK::And && lisneg(f.d) == f.rval && (dn.a == qc || dn.b == qc)) stuck = true;
+            if (!stuck) continue;
+            nd.k = NK::Wire;
+            nd.a = c;
+            changed = true;
+        }
+        std::vector<uint8_t> live = liveNodes(d);
+        for (uint32_t n = 1; n < g.size() && !changed; n++)
+            if (g.nodes[n].k == NK::Dff && !live[n]) changed = true;
+        if (!changed) break;
+        d = cleanup(d, &live);
+    }
+    if (removed) *removed = before - d.g.flops.size();
+    return d;
 }
 
 // ---- cone copies (used by the equivalence checker)

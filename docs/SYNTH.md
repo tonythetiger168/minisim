@@ -38,13 +38,21 @@ write_sdc core.sdc
    functions and tasks inlined, memories become flops and multiplexers.
    Adders are ripple-carry below 8 bits and parallel-prefix (Sklansky) from
    8 bits up; multipliers are carry-save arrays; dividers are restoring.
-   Structural hashing shares equal logic as it is built.
+   Structural hashing shares equal logic as it is built, and nested
+   selects with a shared arm (`if (a) if (b) x <= d;`) fold into one
+   select with a combined condition. Registers that reach no output, and
+   registers stuck at their asynchronous reset value, are then removed
+   (`Information: removed N unloaded or constant register bits`).
 2. **Map** (`src/synth/map.hpp`). For every node the 4-input cuts are
    listed with their truth tables, and each is matched against the library
    by function, with any input or the output inverted. Each node keeps its
    best cover in both polarities, by area flow, or by arrival time when the
    area result misses the clock. Flops are chosen by the library's `ff`
    groups; a missing variant (falling edge, preset) is built from another.
+   A register that loads under an enable goes onto an enable flop
+   (`next_state : E ? D : IQ`) when that costs less than a flop and a mux.
+   Afterwards, two 2:1 muxes on one select that feed only a third become a
+   4:1 mux cell where the library has a smaller one.
 3. **Buffer**. Nets with more than `set_max_fanout` loads (12 by default)
    get a buffer tree. Clock nets are left alone.
 4. **Time** (`src/synth/sta.hpp`). Arrival times with the library's NLDM
@@ -127,8 +135,26 @@ half that the equivalence, formal and FPGA tools share. Beside the graph,
 - One clock is timed; `set_false_path` and `set_multicycle_path` are not
   applied. `msta` is the sign-off timer.
 - Library cells with more than 4 inputs or more than one output (adders,
-  scan and enable flops) are not used by the mapper.
+  scan flops) are not used by the mapper; 4:1 muxes and enable flops
+  without an asynchronous control are.
+- No logic restructuring yet (balancing, rewriting): random logic comes out
+  larger than from Yosys with ABC, see below.
 - The hierarchy is always flattened.
+
+## Against Yosys
+
+Yosys 0.33 (`synth -flatten; dfflibmap; abc -liberty`) and msynth on the
+same RTL and the same library (mini45, typical corner), one machine:
+
+| design | msynth area | Yosys area | msynth time | Yosys time |
+|---|---|---|---|---|
+| PicoRV32 (default parameters) | 19295 | 15458 | 0.11 s | 5.4 s |
+| tests/synth/mem.sv (three small memories) | 2149 | 2297 | 0.03 s | 0.4 s |
+| tests/synth/counter.sv | 92 | 85 | 0.03 s | 0.2 s |
+
+msynth's figures include its fanout buffers (Yosys adds none; about 700
+of PicoRV32's area). Yosys 0.33 does not read the SystemVerilog of the
+other test designs.
 
 ## Tests
 

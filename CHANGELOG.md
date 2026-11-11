@@ -152,6 +152,11 @@ Spec references are IEEE 1800-2023 clauses.
 - `aig::Design::mems`: the shared RTL-to-AIG front half lists every memory
   with its write ports (clock, enable, address, data, byte lane) and read
   ports, for block RAM inference; `msynth`'s `report_resources` shows them.
+- `msynth` area: registers nothing reads or that are stuck at their reset
+  value are removed (`aig::sweep`), nested selects fold into one
+  (`aig::Graph::mux`), load enables use the library's enable flops, and
+  wide selects use 4:1 mux cells. PicoRV32 on mini45: 30669 to 19295
+  (Yosys with ABC: 15458, and 50 times slower); see `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles

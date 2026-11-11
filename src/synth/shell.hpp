@@ -267,6 +267,10 @@ struct Shell {
         } catch (ElabError& e) {
             throw tcl::Error(e.what());
         }
+        // Registers nothing reads, and registers stuck at their reset value.
+        size_t swept = 0;
+        des = aig::sweep(std::move(*des), &swept);
+        if (swept && !quiet) outf("Information: removed %zu unloaded or constant register bits.\n", swept);
         nl.reset();
         tim.reset();
         view.build(*des);
@@ -291,6 +295,7 @@ struct Shell {
         auto t0 = std::chrono::steady_clock::now();
         try {
             Netlist a = Mapper(*des, lib, false).run();
+            mergeMux4(a, lib);
             bufferFanout(a, lib, sdc.maxFanout);
             Timing ta = analyze(a, sdc);
             bool viol = ta.constrained && ta.wns < 0;
