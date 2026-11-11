@@ -106,3 +106,59 @@ execute_process(COMMAND ${MECO} -old ${SRC}/tests/eco/nope.v -new ${SRC}/tests/e
 if(NOT rc EQUAL 2 OR NOT err MATCHES "cannot open")
   message(FATAL_ERROR "missing file: ${rc}\n${out}${err}")
 endif()
+
+# Revised RTL as the input: msynth makes the old netlist from the old RTL,
+# meco -rtl patches it to the new RTL (running msynth itself), and mequiv,
+# which shares no proof with meco, checks the patched netlist against the
+# new RTL. Needs the three tools: -DMSYNTH= -DMEQUIV= -DMINI45=<mini45_tt.lib>.
+if(MSYNTH AND MEQUIV AND MINI45)
+  execute_process(COMMAND ${MSYNTH} ${SRC}/tests/eco/rtl_old.sv -top ctl -lib ${MINI45} -o ${OUT}/rtl_impl.v -q
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "msynth on rtl_old.sv: ${rc}\n${out}${err}")
+  endif()
+  foreach(t 1 4)
+    execute_process(COMMAND ${MECO} -old ${OUT}/rtl_impl.v -rtl ${SRC}/tests/eco/rtl_new.sv -lib ${MINI45} -msynth ${MSYNTH}
+                            -threads ${t} -q -o ${OUT}/rtl_${t}.v -synth-out ${OUT}/rtl_new_${t}.v
+                    RESULT_VARIABLE rc OUTPUT_VARIABLE out${t} ERROR_VARIABLE err)
+    if(NOT rc EQUAL 0 OR NOT out${t} MATCHES "9 changed.*proved equivalent")
+      message(FATAL_ERROR "meco -rtl -threads ${t}: ${rc}\n${out${t}}${err}")
+    endif()
+  endforeach()
+  file(READ ${OUT}/rtl_1.v a)
+  file(READ ${OUT}/rtl_4.v b)
+  if(NOT a STREQUAL b)
+    message(FATAL_ERROR "meco -rtl: patched netlist differs between -threads 1 and -threads 4")
+  endif()
+  execute_process(COMMAND ${MEQUIV} -ref ${SRC}/tests/eco/rtl_new.sv -impl ${OUT}/rtl_1.v -lib ${MINI45} -top ctl
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES "Verification SUCCEEDED")
+    message(FATAL_ERROR "mequiv on the patched netlist against the new RTL: ${rc}\n${out}${err}")
+  endif()
+  # The old RTL again: nothing to change.
+  execute_process(COMMAND ${MECO} -old ${OUT}/rtl_impl.v -rtl ${SRC}/tests/eco/rtl_old.sv -lib ${MINI45} -msynth ${MSYNTH} -q
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES " 0 changed")
+    message(FATAL_ERROR "meco -rtl with the old RTL: ${rc}\n${out}")
+  endif()
+  # RTL that does not compile is an error, with the synthesis messages.
+  execute_process(COMMAND ${MECO} -old ${OUT}/rtl_impl.v -rtl ${SRC}/tests/eco/no_such.sv -lib ${MINI45} -msynth ${MSYNTH}
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 2 OR NOT err MATCHES "msynth failed")
+    message(FATAL_ERROR "meco -rtl on a missing file: ${rc}\n${out}${err}")
+  endif()
+endif()
+
+# The benchmark design, small: three gates changed in a pipelined adder whose
+# new netlist is rendered under other names. The patch stays three cells.
+if(PY)
+  execute_process(COMMAND ${PY} ${SRC}/bench/eco/gen.py 20 8 ${OUT}/bench_old.v ${OUT}/bench_new.v RESULT_VARIABLE rc)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "bench/eco/gen.py: ${rc}")
+  endif()
+  execute_process(COMMAND ${MECO} -old ${OUT}/bench_old.v -new ${OUT}/bench_new.v ${LIBS} -q
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES "\\+3 cells.*proved equivalent")
+    message(FATAL_ERROR "bench: ${rc}\n${out}")
+  endif()
+endif()

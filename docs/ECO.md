@@ -9,6 +9,7 @@ script that keep everything of the old netlist that still fits.
 
 ```sh
 meco -old impl.v -new resynth.v -lib cells.lib -o patched.v -script eco.tcl
+meco -old impl.v -rtl new/*.sv  -lib cells.lib -o patched.v -script eco.tcl   # straight from the RTL
 ```
 
 ```
@@ -40,6 +41,9 @@ without adding a cell.
 |---|---|
 | `-old FILE` | The implemented gate netlist (repeatable) |
 | `-new FILE` | The revised design as a gate netlist (repeatable) |
+| `-rtl FILE` | Or the revised RTL (repeatable): `msynth` makes the netlist first |
+| `-msynth PATH` | The `msynth` to run for `-rtl` (default: the one beside `meco`, else on `PATH`) |
+| `-synth-out FILE` | Keep the netlist `msynth` wrote for `-rtl` |
 | `-lib FILE` | Liberty cell library (repeatable) |
 | `-top NAME` | Top module of both; `-old-top` / `-new-top` when they differ |
 | `-tie PORT=0\|1` | Hold an input constant in both designs (scan enable, test mode) |
@@ -50,6 +54,7 @@ without adding a cell.
 | `-no-sweep` | Keep old cells that end up driving nothing |
 | `-spare` | Metal-only: add and remove no cell (see below) |
 | `-spare-cells GLOB` | `-spare`, with only the unloaded cells of this instance name as spare cells |
+| `-no-invert` | Do not reuse an old net with the inverse function through an inverter |
 | `-no-rectify` | Only copy the changed cones; do not look for the gate to change |
 | `-budget N` | SAT conflicts per proof (default 100000) |
 | `-threads N` | Worker threads. Default: all logical cores. The result does not depend on N |
@@ -91,11 +96,17 @@ scan: with scan enable held at 0 the scan flop is the plain flop.
    what finds a changed gate deep in a cone, or a changed pin.
 3. Whatever still differs gets its cone copied from the new design, down to
    the first old nets with the same function (proved, not guessed). Those
-   nets are reused, so a copy stops as early as it can.
+   nets are reused, so a copy stops as early as it can. An old net with the
+   inverse function is reused too, through one inverter.
 4. Old cells that no longer drive anything are removed (cells that drove
    nothing before, such as spares, are left alone).
 5. The patched netlist is read back from scratch and every compare point is
    proved against the new design. The exit status is that proof.
+
+Step 2 gives the small patch when the two netlists are built alike. When
+the new one is a fresh synthesis with another structure, copying alone can
+come out smaller, so a patch of more than eight cells is also made without
+step 2 and the smaller of the two is kept.
 
 Proofs are independent of each other and run on all cores; results are
 combined in a fixed order, so the patch is the same for any `-threads`.
@@ -133,6 +144,16 @@ free cell can stand in for is added as a normal cell, the report lists it
 group for now: a register of the patch is not moved onto a spare flop.
 Spare cells are chosen by function, not by where they sit on the die.
 
+## Revised RTL: `-rtl`
+
+`-rtl` takes the new RTL instead of a netlist of it. meco runs `msynth` on
+it (the first `-lib`, the top module of the old netlist unless `-top` or
+`-new-top` names another) and patches against the result; an RTL error ends
+the run with the synthesis messages and exit status 2. The patch is small
+when the old netlist came from the same synthesis: registers keep their
+names and unchanged logic comes out the same. `mequiv -ref new.sv -impl
+patched.v` is an independent check of the result (the test suite runs it).
+
 ## The edit script
 
 ```tcl
@@ -168,11 +189,9 @@ and also simulates each patched netlist against the new one in `msim`.
 
 ## Limits
 
-- `-new` is a gate netlist. RTL as the revised design waits for the
-  synthesis tool; today, synthesize the new RTL first.
+- With `-rtl`, synthesis runs with its defaults (no constraints file).
+  For anything else, run `msynth` yourself and pass the netlist as `-new`.
 - A hierarchical old netlist is patched and written back flat.
-- An old net is reused when it has the same function, not when it has the
-  inverse.
 - Registers are matched by name only.
 - `-spare` places gates but not registers on spare cells, and does not
   look at placement when it picks one.

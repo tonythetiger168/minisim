@@ -1,14 +1,19 @@
 // meco - functional ECO on a gate netlist (src/eco.hpp).
 //
 //   meco -old old.v -new new.v -lib cells.lib [-o patched.v] [-script eco.tcl]
+//   meco -old old.v -rtl new.sv -lib cells.lib ...     (synthesized with msynth first)
 //
 // old.v is the netlist that is already placed and routed; new.v is the
 // revised RTL after synthesis. meco writes the old netlist with the fewest
 // cells changed that make it equivalent to new.v, and proves the result.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+
+#include <unistd.h>
 
 #include "eco.hpp"
 #include "version.hpp"
@@ -18,6 +23,9 @@ static void usage() {
         "usage: meco -old OLD.v -new NEW.v -lib CELLS.lib [options]\n"
         "  -old FILE       the implemented gate netlist (repeatable)\n"
         "  -new FILE       the revised design as a gate netlist (repeatable)\n"
+        "  -rtl FILE       or the revised RTL (repeatable): msynth makes the netlist first\n"
+        "  -msynth PATH    the msynth to run for -rtl (default: the one beside meco, else on PATH)\n"
+        "  -synth-out FILE keep the netlist msynth wrote for -rtl\n"
         "  -lib FILE       Liberty cell library (repeatable)\n"
         "  -top NAME       top module of both (default: the one nothing instantiates)\n"
         "  -old-top NAME, -new-top NAME   when the two differ\n"
@@ -31,6 +39,7 @@ static void usage() {
         "                  that drive nothing (spare cells) and the ones the change frees\n"
         "  -spare-cells GLOB   -spare, with only the unloaded cells of this instance name as spares\n"
         "  -no-rectify     only copy the changed cones (do not look for the gate to change)\n"
+        "  -no-invert      do not reuse an old net with the inverse function through an inverter\n"
         "  -budget N       SAT conflicts per proof (default 100000)\n"
         "  -threads N      worker threads (default: all logical cores; results do not depend on N)\n"
         "  -q              print only the summary line\n"
@@ -46,8 +55,8 @@ static std::string pickTop(const gnl::Source& src, const std::string& want, cons
 }
 
 int main(int argc, char** argv) {
-    std::vector<std::string> oldF, newF, libF;
-    std::string top, oldTop, newTop, out, script, report;
+    std::vector<std::string> oldF, newF, libF, rtlF;
+    std::string top, oldTop, newTop, out, script, report, msynth, synthOut;
     eco::Options opt;
     bool quiet = false;
     try {
@@ -59,6 +68,9 @@ int main(int argc, char** argv) {
             };
             if (a == "-old") oldF.push_back(val());
             else if (a == "-new") newF.push_back(val());
+            else if (a == "-rtl") rtlF.push_back(val());
+            else if (a == "-msynth") msynth = val();
+            else if (a == "-synth-out") synthOut = val();
             else if (a == "-lib") libF.push_back(val());
             else if (a == "-top") top = val();
             else if (a == "-old-top") oldTop = val();
@@ -73,6 +85,7 @@ int main(int argc, char** argv) {
             else if (a == "-budget") opt.budget = std::atol(val().c_str());
             else if (par::threadsArg(argc, argv, i, opt.threads, "meco")) {}
             else if (a == "-no-rectify") opt.rectify = false;
+            else if (a == "-no-invert") opt.invert = false;
             else if (a == "-q") quiet = true;
             else if (a == "-tie") {
                 std::string v = val();
@@ -84,10 +97,60 @@ int main(int argc, char** argv) {
             else if (a == "-version" || a == "--version") { std::printf("meco %s\n", MINISIM_VERSION); return 0; }
             else throw eco::Error("unknown option " + a + " (see meco -h)");
         }
-        if (oldF.empty() || newF.empty() || libF.empty()) { usage(); return 2; }
+        if (oldF.empty() || (newF.empty() && rtlF.empty()) || libF.empty()) { usage(); return 2; }
+        if (!newF.empty() && !rtlF.empty()) throw eco::Error("give the revised design as -new or as -rtl, not both");
         eco::Lib lib;
         for (auto& f : libF) lib.add(f);
         if (opt.threads == 0) opt.threads = par::defaultThreads();
+        // Revised RTL: the synthesis tool makes the netlist, with the first
+        // library and the top module of the old netlist.
+        std::string synthTmp;
+        if (!rtlF.empty()) {
+            namespace fs = std::filesystem;
+            std::string t = !newTop.empty() ? newTop : top;
+            if (t.empty()) {
+                gnl::Source src;
+                for (auto& f : oldF) gnl::read(f, src);
+                t = pickTop(src, oldTop, "old");
+            }
+            if (msynth.empty()) {
+                std::error_code ec;
+                fs::path self = fs::read_symlink("/proc/self/exe", ec);
+                if (ec) self = argv[0];
+                fs::path beside = self.parent_path() / "msynth";
+                msynth = fs::exists(beside, ec) ? beside.string() : "msynth";
+            }
+            std::string netl = synthOut;
+            if (netl.empty()) {
+                synthTmp = (fs::temp_directory_path() / ("meco_" + std::to_string((long)::getpid()) + "_new.v")).string();
+                netl = synthTmp;
+            }
+            auto q = [](const std::string& s) {
+                std::string r = "'";
+                for (char c : s) r += c == '\'' ? std::string("'\\''") : std::string(1, c);
+                return r + "'";
+            };
+            std::string cmd = q(msynth);
+            for (auto& f : rtlF) cmd += " " + q(f);
+            cmd += " -top " + q(t) + " -lib " + q(libF[0]) + " -o " + q(netl) + " -q -threads " + std::to_string(opt.threads) +
+                   " > " + q(netl + ".log") + " 2>&1";
+            int rc = std::system(cmd.c_str());
+            if (rc != 0) {
+                std::string all;
+                {
+                    std::ifstream log(netl + ".log");
+                    all.assign((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
+                }
+                std::error_code ec;
+                if (synthOut.empty()) fs::remove(netl + ".log", ec), fs::remove(netl, ec);
+                if (all.size() > 2000) all = all.substr(all.size() - 2000);
+                throw eco::Error("msynth failed on the revised RTL (" + msynth + "):\n" + all);
+            }
+            std::error_code ec;
+            if (synthOut.empty()) fs::remove(netl + ".log", ec);
+            newF.push_back(netl);
+            if (newTop.empty()) newTop = t;
+        }
         gnl::Module mo, mn;  // the two netlists are read side by side
         par::parallelFor(2, opt.threads, [&](size_t i) {
             gnl::Source src;
@@ -95,6 +158,7 @@ int main(int argc, char** argv) {
             const std::string& t = i ? (newTop.empty() ? top : newTop) : (oldTop.empty() ? top : oldTop);
             (i ? mn : mo) = eco::flatModule(src, pickTop(src, t, i ? "new" : "old"), lib);
         });
+        if (!synthTmp.empty()) { std::error_code ec; std::filesystem::remove(synthTmp, ec); }
         eco::Result r = eco::run(mo, mn, lib, opt);
 
         std::ostringstream rep;

@@ -12,13 +12,15 @@ if(MINISIM_WITH_SLANG)
   target_link_libraries(meco PRIVATE cadical Threads::Threads)
   install(TARGETS meco RUNTIME DESTINATION bin)
 
+  find_package(Python3 COMPONENTS Interpreter)
   add_test(NAME meco
            COMMAND ${CMAKE_COMMAND} -DMECO=$<TARGET_FILE:meco> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DMSYNTH=$<TARGET_FILE:msynth> -DMEQUIV=$<TARGET_FILE:mequiv>
+                   -DMINI45=${CMAKE_SOURCE_DIR}/lib/mini45/mini45_tt.lib -DPY=${Python3_EXECUTABLE}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/meco_test -P ${CMAKE_SOURCE_DIR}/tests/meco.cmake)
 
   # Random ECOs: meco proves each patch, and msim simulates the patched
   # netlist against the new one.
-  find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)
     add_test(NAME meco_fuzz
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/eco/fuzz.py $<TARGET_FILE:meco> $<TARGET_FILE:msim>

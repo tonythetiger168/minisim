@@ -15,6 +15,11 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `meco -rtl new.sv`: the revised design as RTL; meco runs `msynth` on it
+  and patches against the result (`-msynth`, `-synth-out`). Patches are
+  smaller: an old net with the inverse function is reused through an
+  inverter (`-no-invert`), and a patch of more than eight cells is made both
+  with and without the search for the changed gate, the smaller one kept.
 - `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
   built from the spare cells of the old netlist and the cells the change
   frees, by function (the same cell, or one with inputs tied or shared, or

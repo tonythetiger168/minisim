@@ -38,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -931,6 +932,7 @@ struct Options {
     std::string prefix = "ECO_";
     bool sweep = true;                // remove old cells the patch leaves without a load
     std::set<std::string> replace;    // registers to swap for the new cell (set by the retry)
+    bool invert = true;               // reuse an old net with the inverse function through an inverter
     bool spare = false;               // metal-only: build the patch from cells already in the netlist
     std::string spareGlob = "*";      // which unloaded old cells are spare cells (instance name, * and ?)
 };
@@ -1361,7 +1363,7 @@ inline void emit(Design& d, const std::vector<std::vector<int>>& origPin, size_t
 
 }  // namespace detail
 
-inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& lib, Options opt) {
+inline Result runCore(const gnl::Module& oldM, const gnl::Module& newM, const Lib& lib, Options opt) {
     Result res;
     if (opt.threads == 0) opt.threads = par::defaultThreads();
     opt.simWords = std::max(1, std::min<int>(opt.simWords, Sig::Max));
@@ -1578,6 +1580,31 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
         if (!eqValid(nn)) eqSet(nn, lookup(nm.lit[(size_t)nn]));
         return eqNet[(size_t)nn];
     };
+    // The same for the inverse: an old net that is the complement of nn. An
+    // inverter on it is then the whole cone of nn.
+    const bool useInv = opt.invert && lib.inverter;
+    std::vector<int> cpNet(useInv ? N.nets.size() : 0, -3), cpEpoch(useInv ? N.nets.size() : 0, -1);
+    std::vector<Lit> cpLit(useInv ? N.nets.size() : 0, 0);
+    auto cpValid = [&](int nn) {
+        int e = cpNet[(size_t)nn];
+        if (e == -3) return false;
+        if (e < 0) return cpEpoch[(size_t)nn] == epoch;
+        return om.lit[(size_t)e] == cpLit[(size_t)nn];
+    };
+    auto cpSet = [&](int nn, int on) {
+        cpNet[(size_t)nn] = on;
+        cpEpoch[(size_t)nn] = epoch;
+        if (on >= 0) {
+            cpLit[(size_t)nn] = om.lit[(size_t)on];
+            pv.learn(om.lit[(size_t)on], nm.lit[(size_t)nn] ^ 1);
+        }
+    };
+    bool invNow = false;  // on for the final copy only: the search for the gate to change needs the plain region
+    auto complOf = [&](int nn) {
+        if (!useInv || !invNow) return -1;
+        if (!cpValid(nn)) cpSet(nn, lookup(nm.lit[(size_t)nn] ^ 1));
+        return cpNet[(size_t)nn];
+    };
 
     std::vector<int> memo(N.nets.size(), -1);  // new-netlist net -> net of the patched design
     std::vector<Lit> memoLit(N.nets.size(), 0);
@@ -1741,11 +1768,25 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
             par::parallelFor(cur.size(), T, [&](size_t i) {
                 if (!eqValid(cur[i])) found[i] = lookup(nm.lit[(size_t)cur[i]]);
             });
-            for (size_t i = 0; i < cur.size(); i++) {
+            for (size_t i = 0; i < cur.size(); i++)
                 if (found[i] != -2) eqSet(cur[i], found[i]);
+            if (useInv && invNow) {
+                std::vector<int> foundC(cur.size(), -2);
+                par::parallelFor(cur.size(), T, [&](size_t i) {
+                    int nn = cur[i];
+                    if (eqNet[(size_t)nn] >= 0 || cpValid(nn)) return;
+                    auto& n = N.nets[(size_t)nn];
+                    if (n.drvInst < 0 || N.insts[(size_t)n.drvInst].ci->kind != Kind::Comb) return;
+                    foundC[i] = lookup(nm.lit[(size_t)nn] ^ 1);
+                });
+                for (size_t i = 0; i < cur.size(); i++)
+                    if (foundC[i] != -2) cpSet(cur[i], foundC[i]);
+            }
+            for (size_t i = 0; i < cur.size(); i++) {
                 if (eqNet[(size_t)cur[i]] >= 0) continue;
                 auto& n = N.nets[(size_t)cur[i]];
                 if (n.drvInst < 0 || N.insts[(size_t)n.drvInst].ci->kind != Kind::Comb) continue;
+                if (useInv && invNow && cpValid(cur[i]) && cpNet[(size_t)cur[i]] >= 0) continue;
                 auto& x = N.insts[(size_t)n.drvInst];
                 for (size_t k = 0; k < x.pin.size(); k++)
                     if (!x.ci->isOut[k]) want(x.pin[k]);
@@ -1787,6 +1828,15 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
         } else if (isFresh) {
             throw Error("internal: output " + n.name + " of an added cell has no net");
         } else if (N.insts[(size_t)n.drvInst].ci->kind == Kind::Comb) {
+            // The old netlist has the inverse: one inverter is the cone.
+            if (int c = complOf(nn); c >= 0) {
+                r = addNet(opt.prefix + n.name, nm.lit[(size_t)nn]);
+                inverterTo(c, r, "reading " + n.name);
+                memoSet(nn, r);
+                noteLit(r);
+                res.reused++;
+                return r;
+            }
             // A gate of the patch: copy it, with its inputs mapped the same way.
             const Inst& x = N.insts[(size_t)n.drvInst];
             int ki = addInst(O.newInstName(opt.prefix + x.name), x.ci);
@@ -2376,6 +2426,7 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
     for (auto& [key, nn] : pinPlan)
         if (!replaced.count(key.first)) rewires.push_back({key.first, key.second, nn});
 
+    invNow = true;
     {
         std::vector<int> roots;
         for (auto& r : rewires) roots.push_back(r.nnet);
@@ -2541,10 +2592,25 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
             else
                 for (auto& n : retry)
                     if (o2.replace.insert(n).second) again = true;
-            if (again) return run(oldM, newM, lib, o2);
+            if (again) return runCore(oldM, newM, lib, o2);
         }
     }
     return res;
+}
+
+// The patch. The search for the gate to change gives the small patch when
+// the two netlists are built alike; when the new one is a fresh synthesis
+// with another structure, copying the changed cones can come out smaller.
+// So a patch that is not small is also made the second way, and the
+// smaller of the two is kept.
+inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& lib, Options opt) {
+    Result a = runCore(oldM, newM, lib, opt);
+    if (!opt.rectify || !a.verified || a.added + a.spares <= 8) return a;
+    Options o2 = opt;
+    o2.rectify = false;
+    Result b = runCore(oldM, newM, lib, o2);
+    auto cost = [](const Result& r) { return std::make_tuple(r.unplaced.size(), r.added + r.spares, r.areaAdded, r.rewired); };
+    return b.verified && cost(b) < cost(a) ? std::move(b) : std::move(a);
 }
 
 // The edits as a Tcl script in the form place-and-route tools read.
