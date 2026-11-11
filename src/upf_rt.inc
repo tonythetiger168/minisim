@@ -35,13 +35,15 @@ struct DomRt {
     int mode = SS_CORRUPT;
     bool applied = false;
     bool alwaysOn = false;
+    bool region = false;   // elements explicitly powered by a supply set (6.15), not a domain
     std::vector<int> owned;
     std::string state;     // current power state of the domain (add_power_state -domain)
     std::string forced;
 };
 struct GroupRt { std::string name, state = "UNDEFINED", forced; };
 struct Cell {               // an isolation or level-shifter cell on a port connection
-    int kind = 0;           // 0 isolation, 1 level shifter, 2 repeater
+    int kind = 0;           // 0 isolation, 1 level shifter, 2 repeater or a port corrupted with its supply
+    std::string clamp;      // isolation: the clamp value
     const Isolation* iso = nullptr;
     std::vector<std::string> supplies;   // all must be NORMAL
     std::vector<int> senseLow;
@@ -139,6 +141,8 @@ struct Rt {
         r.k = EVal::Supply;
         auto it = val.find(root(net));
         if (it != val.end()) r.sv = it->second;
+        // set_partial_on_translation (6.50): before any expression or PST sees it
+        if (r.sv.st == S_PARTIAL_ON && !m.partialOn.empty()) r.sv.st = m.partialOn == "OFF" ? S_OFF : S_FULL_ON;
         return r;
     }
     // Names in power state expressions: a function of the set itself, a
@@ -189,6 +193,106 @@ struct Rt {
         if (it == override.end()) return;
         override.erase(it);
         S.holdOff(s, true);
+    }
+
+    // ------------------------------------------- models, regions, behavior
+    // The module of an instance (simulator path); "" for a generate block.
+    std::string modelOf(const std::string& path) const {
+        std::string full = S.vcdTop.empty() ? path : path.empty() ? S.vcdTop : S.vcdTop + "." + path;
+        auto it = instCells().find(full);
+        return it == instCells().end() ? std::string() : it->second;
+    }
+    // The supply set an instance is explicitly connected to (6.15), or
+    // null: the closest element above it wins, and the later command.
+    const SupplyConn* explicitConn(const std::string& path) const {
+        const SupplyConn* best = nullptr;
+        size_t len = 0;
+        for (auto& sc : m.supplyConns) {
+            bool out = false;
+            for (auto& x : sc.exclude) if (DomainMap::within(path, m.design(x))) out = true;
+            if (out) continue;
+            for (auto& e : sc.elements) {
+                std::string d = m.design(e);
+                bool in = sc.transitive ? DomainMap::within(path, d) : path == d;
+                if (in && (!best || d.size() >= len)) { best = &sc; len = d.size(); }
+            }
+        }
+        return best;
+    }
+    std::map<std::string, int> regionIdx;
+    int regionOf(const std::string& set) {
+        auto it = regionIdx.find(set);
+        if (it != regionIdx.end()) return it->second;
+        DomRt d;
+        d.name = "supply set " + set;
+        d.set = m.setOf(set);
+        d.region = true;
+        auto st = m.sets.find(d.set);
+        d.alwaysOn = st == m.sets.end() || st->second.fn.empty();
+        d.mode = d.alwaysOn ? SS_NORMAL : SS_CORRUPT;
+        int idx = (int)doms.size();
+        regionIdx[set] = idx;
+        doms.push_back(d);
+        g_pdMode.push_back(d.mode);
+        g_pdSig.push_back(S.sig("$upf.ss_region." + set, 1));
+        return idx;
+    }
+    // The supply set that powers an instance: an explicit connection, else
+    // its domain's primary supply; "" outside every domain.
+    std::string supplySetOf(const std::string& path) const {
+        if (const SupplyConn* sc = explicitConn(path)) return m.setOf(sc->set);
+        std::string dn = dm.of(path);
+        return dn.empty() ? std::string() : m.primaryOf(dn);
+    }
+    // The simstate behavior of an instance (6.56): ENABLE, SIMSTATE_ONLY,
+    // PORT_CORR_ONLY or DISABLE, and the instance the rule was given for
+    // (the macro whose ports are corrupted).
+    std::pair<std::string, std::string> behaviorOf(const std::string& path) const {
+        std::string mode, at;
+        int best = -1;
+        auto take = [&](int rank, const std::string& md, const std::string& inst) {
+            if (rank >= best) { best = rank; mode = md; at = inst; }
+        };
+        // every instance from the top down to path
+        std::vector<std::string> chain{""};
+        for (size_t i = 0; i <= path.size(); i++)
+            if (i == path.size() || path[i] == '.') { if (i) chain.push_back(path.substr(0, i)); }
+        for (auto& a : chain) {
+            std::string mod = modelOf(a);
+            if (mod.empty() && !a.empty()) continue;
+            // attributes: the lowest precedence
+            std::string av = m.designAttr(a, mod, "UPF_simstate_behavior");
+            if (!av.empty()) take(1, av, a);
+            else if (m.designAttr(a, mod, "UPF_is_power_aware_model") == "TRUE") take(0, "DISABLE", a);
+        }
+        for (auto& sb : m.simBehaviors) {
+            if (!sb.models.empty() || !sb.lib.empty()) {
+                for (auto& a : chain) {
+                    std::string mod = modelOf(a);
+                    if (mod.empty()) continue;
+                    if (!sb.models.empty() && !Model::modelIn(sb.models, mod)) continue;
+                    bool in = sb.elements.empty();
+                    auto rel = [&](const std::string& e) {
+                        std::string d = e;
+                        for (char& ch : d) if (ch == '/') ch = '.';
+                        return a.empty() ? d : a + "." + d;
+                    };
+                    for (auto& e : sb.elements) if (DomainMap::within(path, rel(e))) in = true;
+                    for (auto& e : sb.exclude) if (DomainMap::within(path, rel(e))) in = false;
+                    if (in) take(sb.elements.empty() ? 2 : 3, sb.mode, a);
+                }
+            } else {
+                bool in = false;
+                std::string at2;
+                for (auto& e : sb.elements) if (DomainMap::within(path, m.design(e))) { in = true; at2 = m.design(e); }
+                for (auto& e : sb.exclude) if (DomainMap::within(path, m.design(e))) in = false;
+                if (in) take(3, sb.mode, at2);
+            }
+        }
+        if (mode == "PORT_CORR_ONLY" && m.designAttr(at, modelOf(at), "UPF_is_hard_macro") != "TRUE")
+            throw Error("set_simstate_behavior PORT_CORR_ONLY for " + (at.empty() ? std::string("the top") : at) +
+                        ", which is not a hard macro (UPF_is_hard_macro, 6.56)");
+        return {mode.empty() ? std::string("ENABLE") : mode, at};
     }
 
     // ----------------------------------------------------------- bind
@@ -266,6 +370,8 @@ struct Rt {
                 for (auto& [a, b] : t.paired) { chk(a); chk(b); }
             }
         }
+        for (auto& e : intentErrors(m, dm, [this](const std::string& p) { return modelOf(p); }))
+            throw Error(e.where + ": " + e.text);
         bindLogic(lw);
         // processes: domain, state or not; what each domain drives
         std::vector<std::set<int>> owned(doms.size());
@@ -276,8 +382,14 @@ struct Rt {
             const std::string& k = lp.kind;
             if (k == "Initial" || k == "Final" || k == "init" || k == "sampled") continue;
             std::string dn = dm.of(lp.scope);
-            if (dn.empty()) continue;
-            int pd = domIdx.at(dn);
+            // set_simstate_behavior (6.56): DISABLE and PORT_CORR_ONLY leave the logic alone
+            auto [beh, behAt] = behaviorOf(lp.scope);
+            if (beh == "DISABLE" || beh == "PORT_CORR_ONLY") continue;
+            int pd;
+            if (const SupplyConn* sc = explicitConn(lp.scope)) pd = regionOf(sc->set);   // connect_supply_set (6.15)
+            else if (!dn.empty()) pd = domIdx.at(dn);
+            else continue;
+            if (owned.size() < doms.size()) { owned.resize(doms.size()); stateSigs.resize(doms.size()); }
             lp.prog.pd = pd;
             bool st = k == "AlwaysFF" || k == "AlwaysLatch";
             if (k == "Always")
@@ -306,6 +418,9 @@ struct Rt {
                 for (auto& in : lp.prog.code)
                     if ((in.k == IK::Nba || in.k == IK::Assign) && in.sig >= 0 && !isRel(in.sig) && !in.arr) w.insert(in.sig);
                 for (int s : w) stateSigs[(size_t)pd].insert(s);
+                // a domain's retention strategies also reach the elements on another supply
+                if (doms[(size_t)pd].region && !dn.empty())
+                    for (int s : w) stateSigs[(size_t)domIdx.at(dn)].insert(s);
             }
         }
         for (size_t d = 0; d < doms.size(); d++) {
@@ -441,6 +556,11 @@ struct Rt {
     void bindCells(LowerResult& lw) {
         std::vector<PortSite> sites;
         std::vector<size_t> procOf;
+        std::set<std::string> hasLogic;   // instances with a process in or below them
+        for (auto& lp : lw.procs) {
+            if (!lp.port.empty() || lp.kind == "upf_wire") continue;
+            for (std::string sc = lp.scope; !sc.empty(); sc = parentOf(sc)) hasLogic.insert(sc);
+        }
         for (size_t i = 0; i < lw.procs.size(); i++) {
             auto& lp = lw.procs[i];
             if (lp.port.empty()) continue;
@@ -456,16 +576,50 @@ struct Rt {
             const PortSite& p = sites[k];
             if (p.dir == 2) continue;
             std::string child = dm.of(p.inst), parent = dm.of(parentOf(p.inst));
-            if (child == parent) continue;
+            std::string model = modelOf(p.inst);
+            auto attr = [&](const char* name) { return m.portAttr(p.inst, model, p.port, p.dir, name); };
+            bool cross = child != parent && attr("UPF_is_analog") != "TRUE";   // analog ports take no strategy
             Crossing c{&p, p.dir == 1 ? child : parent, p.dir == 1 ? parent : child};
             std::vector<int> made;
+            // The driver of the port is not in the design (6.51): a primary
+            // input of the power top, or an output of an instance with no
+            // logic in it. The port is corrupted with UPF_driver_supply.
+            // PORT_CORR_ONLY (6.56): the outputs of a hard macro follow its supply.
+            {
+                std::string ds = attr("UPF_driver_supply");
+                bool empty = !hasLogic.count(p.inst);
+                std::string portSupply;
+                if (!ds.empty()) {
+                    if ((p.dir == 0 && p.inst == m.top) || (p.dir == 1 && empty)) portSupply = m.setOf(ds);
+                    else if (p.dir == 1) {
+                        std::string actual = supplySetOf(p.inst);
+                        if (!actual.empty() && m.eqOf(actual) != m.eqOf(ds))
+                            throw Error("set_port_attributes -driver_supply " + ds + " on " + p.inst + "." + p.port +
+                                        ": the logic that drives it is on " + actual + " (6.51)");
+                    }
+                }
+                auto [beh, at] = behaviorOf(p.inst);
+                if (portSupply.empty() && p.dir == 1 && beh == "PORT_CORR_ONLY" && at == p.inst) portSupply = supplySetOf(p.inst);
+                if (!portSupply.empty() && sets.count(portSupply)) {
+                    Cell cell;
+                    cell.kind = 2;
+                    cell.port = p.inst + "." + p.port;
+                    cell.supplies.push_back(portSupply);
+                    made.push_back((int)cells.size());
+                    cells.push_back(cell);
+                    note("port " + cell.port + " is corrupted with supply set " + portSupply);
+                }
+            }
             for (auto& is : m.isos) {
-                if (!isoApplies(m, is, c)) continue;
+                if (!cross || !isoApplies(m, is, c)) continue;
                 if (is.noIso) break;
                 Cell cell;
                 cell.kind = 0;
                 cell.iso = &is;
                 cell.port = p.inst + "." + p.port;
+                // the port's own clamp requirement, when the strategy gives none (6.51)
+                cell.clamp = is.clamp;
+                if (std::string pc = attr("UPF_clamp_value"); !is.clampSet && (pc == "0" || pc == "1" || pc == "Z" || pc == "latch")) cell.clamp = pc;
                 if (!is.supply.empty()) cell.supplies.push_back(m.setOf(is.supply));
                 for (size_t q = 0; q < is.signals.size(); q++) cell.senseLow.push_back(q < is.senseLow.size() ? is.senseLow[q] : 0);
                 if (is.signals.empty()) throw Error(is.where + ": isolation " + is.name + " has no -isolation_signal");
@@ -475,7 +629,7 @@ struct Rt {
                 break;   // one strategy per port (5.7 precedence: the first that applies)
             }
             for (auto& l : m.lss) {
-                if (!lsApplies(m, l, c) || l.noShift) continue;
+                if (!cross || !lsApplies(m, l, c) || l.noShift) continue;
                 Cell cell;
                 cell.kind = 1;
                 cell.port = p.inst + "." + p.port;
@@ -488,7 +642,7 @@ struct Rt {
                 break;
             }
             for (auto& rp : m.reps) {   // 9.10: the repeater's output follows its supply's simstate
-                if (!repApplies(m, rp, c)) continue;
+                if (!cross || !repApplies(m, rp, c)) continue;
                 Cell cell;
                 cell.kind = 2;
                 cell.port = p.inst + "." + p.port;
@@ -793,6 +947,7 @@ struct Rt {
 
     void evalDomainStates() {
         for (auto& d : doms) {
+            if (d.region) continue;
             const Domain& dd = m.domains.at(d.name);
             if (dd.states.empty()) continue;
             auto cx = ctx(dd.scope, nullptr);
@@ -884,7 +1039,7 @@ struct Rt {
             d.mode = nm;
             g_pdMode[i] = nm;
             d.applied = true;
-            if (old != -1 || nm != SS_NORMAL) note("power domain " + d.name + " simstate " + simstateName(nm));
+            if (old != -1 || nm != SS_NORMAL) note((d.region ? "elements on " : "power domain ") + d.name + " simstate " + simstateName(nm));
             if (nm == SS_CORRUPT && old != SS_CORRUPT) {
                 // Retention: the retained value is kept by the retention
                 // supply; the register itself loses power (9.7.4).
@@ -1018,7 +1173,7 @@ struct Rt {
         if (it == m.portStates.end()) return v.st == S_OFF ? "OFF" : stateName(v.st);
         for (auto& d : it->second) {
             if (d.off && v.st == S_OFF) return d.name;
-            if (!d.off && v.st != S_OFF && v.hasV && v.v >= d.vmin - 1e-6 && v.v <= d.vmax + 1e-6) return d.name;
+            if (!d.off && v.st != S_OFF && (!d.partial || v.st == S_PARTIAL_ON) && v.hasV && v.v >= d.vmin - 1e-6 && v.v <= d.vmax + 1e-6) return d.name;
         }
         if (v.st == S_OFF) return "OFF";
         return std::string(stateName(v.st)) + (v.hasV ? " " + fmtV(v.v) + "V" : "");
@@ -1213,7 +1368,7 @@ struct Rt {
         bool ok = true;
         for (auto& sn : c.supplies) ok &= supplyNormal(sn);
         if (c.kind != 0) return ok ? d : allx(d.w);   // level shifter (9.9), repeater (9.10)
-        bool latch = c.iso->clamp == "latch";
+        bool latch = c.clamp == "latch";
         if (!ok) {
             if (latch) { c.latch = allx(d.w); c.latched = true; }
             return allx(d.w);
@@ -1232,7 +1387,7 @@ struct Rt {
             if (latch) { c.latch = d; c.latched = true; }
             return d;
         }
-        const std::string& cv = c.iso->clamp;
+        const std::string& cv = c.clamp;
         if (cv == "0") return make(0, 0, d.w, 0);
         if (cv == "1") return d.w <= 64 ? make(d.w >= 64 ? ~0ull : ((1ull << d.w) - 1), 0, d.w, 0) : v_not(make(0, 0, d.w, 0));
         if (cv == "Z" || cv == "z") return allz(d.w);

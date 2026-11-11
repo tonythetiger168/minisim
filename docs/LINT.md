@@ -271,7 +271,7 @@ it. One-hot registers tested bit by bit are followed too.
 How domains and synchronizers are recognized, and the options `-cdc-report`,
 `-clock-group` and `-static`, are in [CDC.md](CDC.md).
 
-The UPF rules (`UPF001`..`UPF006`, with `-upf`) are in `docs/LOWPOWER.md`.
+The UPF rules (`UPF001`..`UPF007`, with `-upf`) are in `docs/LOWPOWER.md`.
 Design-for-test rules (gated clocks, logic-driven resets, divided clocks,
 both clock edges) are `mdft`'s.
 
