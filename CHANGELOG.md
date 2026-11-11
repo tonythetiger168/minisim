@@ -55,6 +55,10 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal -aiger FILE` writes the model as AIGER 1.9 (bad-state
+  properties for assertions and covers, invariant constraints for
+  assumptions), so other model checkers can run on it or cross-check a
+  verdict.
 - `mformal`: fairness. A strong obligation in an `assume`
   (`assume property (req |-> s_eventually !req)`) restricts the loops a
   liveness counterexample may use.
