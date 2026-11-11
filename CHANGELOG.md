@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Changed
+- `mchar` measures input pin power: `internal_power` groups without a
+  `related_pin` get the supply energy of an edge that moves no output, and
+  the output arcs on the same pin hold the energy beyond it. The mini45
+  flops, latches and clock gates gain these groups on every input, so a
+  clock that toggles a register whose output holds now costs power in
+  `mpower`.
 - License: the repository is Apache-2.0 (`LICENSE`, attribution in `NOTICE`)
   instead of MIT. The MIT grant is not withdrawn: copies obtained under it
   stay under it, and so does the git history. `docs/LICENSING.md` holds the
