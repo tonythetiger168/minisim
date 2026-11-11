@@ -82,3 +82,23 @@ check(1 "FAIL  clock/reset q[0]" -ref gated.sv -impl gated_gates.v cells.v -nocl
 # alone that holds while the reset is high.
 check(0 "12 state elements" -ref flat.sv -impl flat_gates.v -lib cells.lib)
 check(1 "FAIL  output      q[1]" -ref flat.sv -impl flat_gates.v -lib cells.lib +define+BUG)
+
+# A register stored inverted with no net left to say so: found by retrying the
+# failing register with the other polarity. A wrong gate still fails.
+check(0 "1 stored inverted" -ref invint.sv -impl invint_gates.v -lib cells.lib)
+check(1 "Verification FAILED" -ref invint.sv -impl invint_gates.v -lib cells.lib +define+BUG)
+
+# A memory written one byte lane at a time (mem[addr][7:0] <= ...) against the word-wide form.
+check(0 "Verification SUCCEEDED" -ref lanes_word.sv -impl lanes.sv)
+check(1 "Verification FAILED" -ref lanes_word.sv -impl lanes.sv +define+BUG)
+
+# Registers stuck at their reset value, replaced by the constant in the implementation.
+check(0 "5 reference flops read as a constant" -ref stuck.sv -impl stuck.sv +define+FOLDED)
+check(1 "Verification FAILED" -ref stuck.sv -impl stuck.sv +define+FOLDED +define+BUG)
+check(1 "Unmatched reference state: 5" -noconstreg -ref stuck.sv -impl stuck.sv +define+FOLDED)
+
+# Synthesis don't-cares in the reference: (* full_case *), a register that only loads one
+# constant, a register never given a value.
+check(0 "5 reference flops read as a constant" -ref dontcare.sv -impl dontcare.sv +define+FOLDED)
+check(1 "Verification FAILED" -ref dontcare.sv -impl dontcare.sv +define+FOLDED +define+BUG)
+check(1 "latch" -nofullcase -ref dontcare.sv -impl dontcare.sv +define+FOLDED)
