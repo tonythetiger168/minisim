@@ -13,7 +13,7 @@ msynth rtl/*.sv -top core -period 2 -o core_net.v    # one step
 ## A script
 
 ```tcl
-set target_library my_cells.lib            ;# Liberty (.lib). None: the built-in generic library
+set target_library my_cells.lib            ;# Liberty (.lib). None: mini45 (lib/mini45)
 analyze -format sverilog {rtl/alu.sv rtl/core.sv}
 elaborate core -parameters "XLEN=32"
 
@@ -61,10 +61,10 @@ off). The netlist is the same for any thread count.
 |---|---|
 | Read | `analyze`, `read_verilog`, `read_sverilog`, `read_file`, `elaborate top [-parameters "N=8,W=4"]`, `current_design`, `check_design` |
 | Library | `set target_library {a.lib}`, `read_lib`, `set_dont_use`, `report_lib`, `write_lib_models cells.v` |
-| Constraints | `create_clock`, `set_input_delay`, `set_output_delay`, `set_load`, `set_clock_uncertainty`, `set_input_transition`, `set_max_fanout`, `set_max_area` |
-| Objects | `get_ports`, `all_inputs`, `all_outputs`, `get_clocks`, `all_clocks`, `get_cells`, `all_registers`, `remove_from_collection`, `sizeof_collection` |
+| Constraints | `read_sdc file.sdc` and every SDC 2.1 command directly, read by the shared reader (`src/sdc.hpp`). The timing estimate uses `create_clock`, `set_input_delay`, `set_output_delay`, `set_load`, `set_clock_uncertainty`, `set_input_transition`, `set_max_fanout`, `set_max_area`; the rest (exceptions, generated clocks, latencies) is checked, kept and written by `write_sdc` |
+| Objects | `get_ports`, `get_cells`, `get_clocks`, `all_inputs`, `all_outputs`, `all_clocks`, `all_registers`, with `-filter` and wildcards; collections: `sizeof_collection`, `foreach_in_collection`, `get_object_name`, `add_to_collection`, `remove_from_collection`, `filter_collection` |
 | Synthesis | `compile [-map_effort high]`, `compile_ultra` |
-| Reports | `report_area`, `report_timing [-max_paths N]`, `report_qor`, `report_cell`, `report_reference`, `report_constraint -all_violators` |
+| Reports | `report_resources` (word-level operators, before `compile`), `report_area`, `report_timing [-max_paths N]`, `report_qor`, `report_cell`, `report_reference`, `report_constraint -all_violators` |
 | Write | `write -format verilog -output f`, `write_verilog f`, `write_sdc f` |
 | Shell | `redirect file {cmd}`, `cmd > file`, `cmd >> file`, `set_app_var`, `set_host_options -max_cores N`, `source`, `help`, `exit`, and Tcl (`set`, `expr`, `if`, `foreach`, `for`, `while`, `proc`, lists, strings, `format`) |
 
@@ -87,14 +87,15 @@ their Liberty functions, so the netlist can be simulated:
 msim core_net.v cells.v tb.sv -top tb
 ```
 
-## The generic library
+## The default library
 
-With no target library, msynth maps to a built-in one
-(`lib/msynth_generic.lib`): INV, BUF, AND/OR/NAND/NOR with 2 to 4 inputs,
-XOR2, XNOR2, MUX2, AOI21/22, OAI21/22, TIE0/1, and the flops DFF, DFFR
-(asynchronous reset, active low) and DFFS (asynchronous set). Its timing
-tables are linear and its area unit is one inverter; use it to compare
-designs, not to predict silicon.
+With no target library, msynth maps to mini45, the tool line's cell library
+(`lib/mini45/mini45_tt.lib`, see `docs/MINI45.md`), so that a netlist goes
+on to timing, power, place and route and extraction with the same cells.
+msynth finds it next to an installed `msynth`
+(`share/minisim/lib/mini45`), in the source tree of a build-tree `msynth`,
+or in the directory named by `$MINISIM_MINI45`. For simulation use
+`lib/mini45/mini45.v`, or `write_lib_models`.
 
 ## Limits
 
@@ -115,5 +116,5 @@ designs, not to predict silicon.
 
 `tests/synth`: each design is synthesized and its testbench is simulated
 with `msim` on the RTL and on the netlist with random stimulus; both runs
-must print the same lines. This is done with the generic library and with a
+must print the same lines. This is done with the default library and with a
 library of only an inverter, a NAND and one flop.

@@ -227,6 +227,22 @@ int main() {
         std::remove("test_sdc_inc.sdc");
         std::remove("test_sdc_top.sdc");
     }
+    // the design changes under the reader: same object count, other names
+    {
+        Toy t2;
+        Reader r;
+        r.design = &t2;
+        auto n = [&](const char* q) {
+            r.parse(std::string("set v [") + q + "]\n", "t.sdc");
+            return r.objects(*r.get("v")).size();
+        };
+        assert(n("get_ports sel") == 1);
+        t2.ports.back() = "aaa_sel";   // sorts first now
+        r.designChanged();
+        assert(n("get_ports aaa_sel") == 1 && n("get_ports -quiet sel") == 0);
+        assert(n("get_ports q") == 1 && n("get_ports clk*") == 2);
+        assert(r.diags.empty());
+    }
     std::cout << "test_sdc: ok\n";
     return 0;
 }

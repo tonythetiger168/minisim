@@ -1,0 +1,20 @@
+Initial conditions: a charged capacitor into an inductor (uic), and .ic on an RC
+* LC tank from 1 V: v = cos(w t), w = 1/sqrt(LC) = 1e5 rad/s, period 62.832 us,
+* peak current sqrt(C/L) = 10 mA. The RC starts at 2 V and decays with 1 ms.
+c1 a 0 100n ic=1
+l1 a 0 1m
+r2 b 0 1k
+c2 b 0 1u
+l3 c 0 1m ic=5m
+r3 c 0 10
+.ic v(b)=2
+.tran 0.2u 200u 0 0.2u uic
+.meas tran period trig v(a) val=0 fall=1 targ v(a) val=0 fall=2
+.meas tran ipk max i(l1)
+.meas tran vb find v(b) at=100u
+.meas tran il find i(l3) at=100u
+*> period 62.832e-6 1e-3
+*> ipk 10e-3 2e-3
+*> vb 1.809675 1e-3
+*> il 1.839397e-3 2e-3
+.end

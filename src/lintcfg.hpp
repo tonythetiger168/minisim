@@ -221,6 +221,16 @@ inline const std::vector<RuleInfo>& table() {
         {"FUNC001", "style", Sev::Info, true, "a function reads or writes a signal that is not one of its arguments",
          "always @* does not see signals read inside a function, and the function cannot be reused."},
 
+        // --------------------------------------------------------------------- fsm
+        {"FSM001", "fsm", Sev::Warning, true, "a state that no transition and no reset leads to",
+         "The state is named or tested, but the machine can never be in it: dead logic, or a transition that was forgotten."},
+        {"FSM002", "fsm", Sev::Warning, true, "a state with no way out",
+         "Once there the machine stays until reset. Fine for a final state that is meant; waive it then."},
+        {"FSM003", "fsm", Sev::Warning, true, "the case on a state register has no default and does not use every encoding",
+         "An encoding that is not a state (after a glitch or an upset) is held forever; add a default that goes to a safe state."},
+        {"FSM004", "fsm", Sev::Warning, true, "a state register with no reset state",
+         "The machine starts in an unknown state; assign a state in a reset branch."},
+
         // --------------------------------------------------------------------- cdc
         {"CDC001", "cdc", Sev::Warning, true, "a clock-domain crossing with no synchronizer, or only one flop", ""},
         {"CDC002", "cdc", Sev::Warning, true, "a multi-bit bus crossing through a synchronizer, not Gray coded", ""},

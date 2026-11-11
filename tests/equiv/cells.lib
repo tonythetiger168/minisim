@@ -28,6 +28,13 @@ library (mequiv_test) {
     pin (D) { direction : input; } pin (CK) { direction : input; clock : true; } pin (RN) { direction : input; }
     pin (Q) { direction : output; function : "IQ"; }
   }
+  cell (DFFRX) {
+    area : 9;
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; clear : "!RN"; }
+    pin (D) { direction : input; } pin (CK) { direction : input; clock : true; } pin (RN) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+    pin (QN) { direction : output; function : "IQN"; }
+  }
   cell (DFFS) {
     area : 6;
     ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; preset : "!SN"; }

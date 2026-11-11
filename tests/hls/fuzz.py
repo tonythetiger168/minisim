@@ -26,6 +26,7 @@ class Gen:
         self.arrs = []      # (name, size, writable)
         self.pts = []       # lvalues of struct type pt_t
         self.loopy = not self.pipe and self.r.random() < 0.3   # has loops shaped for loop pipelining
+        self.streams = not self.pipe and self.r.random() < (0.5 if self.loopy else 0.2)   # has stream arguments
         self.depth = 0
         self.loop = 0
         self.n = 0
@@ -75,6 +76,14 @@ class Gen:
 
     def stmt(self):
         r = self.r
+        if self.streams and r.random() < 0.15:
+            if r.random() < 0.5:
+                self.n += 1
+                self.emit("uint8_t v%d = sin.read();" % self.n)
+                self.vars.append(("v%d" % self.n, "uint8_t"))
+            else:
+                self.emit("sout.write(%s);" % self.expr(1))
+            return
         k = r.random()
         if k < 0.40 and self.vars:
             n, _ = r.choice(self.vars)
@@ -160,6 +169,11 @@ class Gen:
         x = "x%d" % self.n
         self.emit("%s %s = src[(%s + %d) & 15];" % (self.src_t, x, i, r.randint(0, 3)))
         self.ro.append(x)
+        sx = None
+        if self.streams and r.random() < 0.6:
+            sx = "s%d" % self.n
+            self.emit("uint8_t %s = sin.read();" % sx)
+            self.ro.append(sx)
         for _ in range(r.randint(1, 3)):
             k = r.random()
             if k < 0.6 and self.vars:
@@ -181,6 +195,10 @@ class Gen:
         elif k < 0.8 and self.vars:   # a value carried through a memory read
             n, _t = r.choice(self.vars)
             self.emit("%s = src[%s & 15] + %s;" % (n, n, r.choice([i, x, "1"])))
+        if self.streams and r.random() < 0.6:
+            self.emit("%ssout.write(%s);" % ("if (%s) " % self.expr(2) if r.random() < 0.3 else "", self.expr(1)))
+        if sx:
+            self.ro.remove(sx)
         del self.vars[nv:]
         self.depth -= 1
         self.ro.remove(i)
@@ -255,6 +273,10 @@ class Gen:
             self.src_t = r.choice(TYPES[:8])
             params.append("const %s src[16]" % self.src_t)
             params.append("%s dst[16]" % r.choice(TYPES[:8]))
+        if self.streams:
+            out.insert(1, '#include "%s"' % os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "include", "mhls_stream.h"))
+            params.append("hls::stream<uint8_t>& sin")
+            params.append("hls::stream<uint16_t>& sout")
         ret = self.ty()
         out.append("%s f(%s) {" % (ret, ", ".join(params)))
         for x in late:
@@ -329,6 +351,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--seeds", default="0:20")
     ap.add_argument("--vectors", default="12")
+    ap.add_argument("--clang", action="store_true", help="read every program through mhls -clang")
     a = ap.parse_args()
     lo, hi = [int(x) for x in a.seeds.split(":")]
     os.makedirs(a.out, exist_ok=True)
@@ -342,6 +365,8 @@ def main():
             f.write(src)
         cmd = [a.mhls, base + ".c", "-top", "f", "-o", base + ".sv", "-tb", base + "_tb.sv", "-cref", base + "_ref.cpp",
                "-vectors", a.vectors, "-seed", str(seed + 1), "-q"] + opts
+        if a.clang:
+            cmd.append("-clang")
         rc, out = run(cmd)
         if rc != 0:
             # A pipeline that cannot meet one input per cycle is a legal refusal.
