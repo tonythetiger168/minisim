@@ -149,6 +149,9 @@ Spec references are IEEE 1800-2023 clauses.
   NLDM tables. The default library is mini45. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
+- `aig::Design::mems`: the shared RTL-to-AIG front half lists every memory
+  with its write ports (clock, enable, address, data, byte lane) and read
+  ports, for block RAM inference; `msynth`'s `report_resources` shows them.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles

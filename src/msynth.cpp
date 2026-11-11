@@ -818,7 +818,7 @@ struct Shell {
             return std::string("1");
         });
 
-        cmd("report_resources", "report_resources: the word-level operators of the design (adders, multipliers, comparators, shifters) and flops with an enable", [this](Words&) {
+        cmd("report_resources", "report_resources: the word-level operators of the design (adders, multipliers, comparators, shifters) flops with an enable, and memories with their ports", [this](Words&) {
             if (!des) throw tcl::Error("no design; run elaborate first");
             header("resources");
             static const char* names[] = {"add", "sub", "mult", "less-than", "equal", "shift-left", "shift-right", "arith-shift-right"};
@@ -833,6 +833,11 @@ struct Shell {
                 en += flopEnable(des->g, f, e, d);
             }
             outf("\nFlip-flops: %zu, of which %zu load under an enable.\n", des->g.flops.size(), en);
+            if (!des->mems.empty()) {
+                outf("\n%-28s %8s %8s %8s %8s\n", "Memory", "Depth", "Width", "Write", "Read");
+                out(std::string(64, '-') + "\n");
+                for (auto& m : des->mems) outf("%-28s %8d %8d %8zu %8zu\n", m.name.c_str(), m.depth, m.width, m.wr.size(), m.rd.size());
+            }
             return std::string();
         });
 
