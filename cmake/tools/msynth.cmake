@@ -18,11 +18,19 @@ find_package(Threads REQUIRED)
 target_link_libraries(msynth PRIVATE slang::slang Threads::Threads)
 install(TARGETS msynth RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# The memory table of the shared front half (aig::Design::mems): a model built
+# from the table alone must track the memory's flops and read ports.
+add_executable(test_aig_mem tests/test_aig_mem.cpp)
+target_include_directories(test_aig_mem PRIVATE src)
+target_compile_options(test_aig_mem PRIVATE -UNDEBUG)
+target_link_libraries(test_aig_mem PRIVATE slang::slang Threads::Threads)
+add_test(NAME test_aig_mem COMMAND test_aig_mem ${CMAKE_SOURCE_DIR}/tests/synth/mem.sv)
+
 # Each design is synthesized, and its testbench is simulated with msim on the
 # RTL and on the netlist: both must print the same. Once with the default
 # library (mini45) and once with a library of only an inverter, a NAND and one flop.
 if(Python3_FOUND)
-  foreach(t counter alu fsm hier)
+  foreach(t counter alu fsm hier mem)
     add_test(NAME msynth_${t}
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/run_test.py
                      $<TARGET_FILE:msynth> $<TARGET_FILE:msim> ${CMAKE_SOURCE_DIR}/tests/synth
@@ -32,6 +40,16 @@ if(Python3_FOUND)
                      $<TARGET_FILE:msynth> $<TARGET_FILE:msim> ${CMAKE_SOURCE_DIR}/tests/synth
                      ${CMAKE_CURRENT_BINARY_DIR}/msynth_test_nand ${t} ${CMAKE_SOURCE_DIR}/tests/synth/nand.lib)
   endforeach()
+  # The netlist is also proven equivalent to the RTL by mequiv, and a netlist
+  # with one gate swapped must be reported as different.
+  if(TARGET mequiv)
+    foreach(t counter alu fsm hier)
+      add_test(NAME msynth_equiv_${t}
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/equiv_test.py
+                       $<TARGET_FILE:msynth> $<TARGET_FILE:mequiv> ${CMAKE_SOURCE_DIR}/tests/synth
+                       ${CMAKE_CURRENT_BINARY_DIR}/msynth_test ${t})
+    endforeach()
+  endif()
   add_test(NAME msynth_shell
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/shell_test.py
                    $<TARGET_FILE:msynth> ${CMAKE_SOURCE_DIR}/tests/synth ${CMAKE_CURRENT_BINARY_DIR}/msynth_shell)

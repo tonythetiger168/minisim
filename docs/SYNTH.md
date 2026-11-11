@@ -64,7 +64,7 @@ off). The netlist is the same for any thread count.
 | Constraints | `read_sdc file.sdc` and every SDC 2.1 command directly, read by the shared reader (`src/sdc.hpp`). The timing estimate uses `create_clock`, `set_input_delay`, `set_output_delay`, `set_load`, `set_clock_uncertainty`, `set_input_transition`, `set_max_fanout`, `set_max_area`; the rest (exceptions, generated clocks, latencies) is checked, kept and written by `write_sdc` |
 | Objects | `get_ports`, `get_cells`, `get_clocks`, `all_inputs`, `all_outputs`, `all_clocks`, `all_registers`, with `-filter` and wildcards; collections: `sizeof_collection`, `foreach_in_collection`, `get_object_name`, `add_to_collection`, `remove_from_collection`, `filter_collection` |
 | Synthesis | `compile [-map_effort high]`, `compile_ultra` |
-| Reports | `report_resources` (word-level operators, before `compile`), `report_area`, `report_timing [-max_paths N]`, `report_qor`, `report_cell`, `report_reference`, `report_constraint -all_violators` |
+| Reports | `report_resources` (word-level operators and memories with their ports, before `compile`), `report_area`, `report_timing [-max_paths N]`, `report_qor`, `report_cell`, `report_reference`, `report_constraint -all_violators` |
 | Write | `write -format verilog -output f`, `write_verilog f`, `write_sdc f` |
 | Shell | `redirect file {cmd}`, `cmd > file`, `cmd >> file`, `set_app_var`, `set_host_options -max_cores N`, `source`, `help`, `exit`, and Tcl (`set`, `expr`, `if`, `foreach`, `for`, `while`, `proc`, lists, strings, `format`) |
 
@@ -97,6 +97,24 @@ msynth finds it next to an installed `msynth`
 or in the directory named by `$MINISIM_MINI45`. For simulation use
 `lib/mini45/mini45.v`, or `write_lib_models`.
 
+## For other tools: the shared front half
+
+`src/aig.hpp` and `src/aig_elab.hpp` (namespace `aig`) are the RTL-to-graph
+half that the equivalence, formal and FPGA tools share. Beside the graph,
+`aig::Design` keeps what a mapper with richer cells needs:
+
+- `ops`: every adder, subtractor, multiplier, comparator and shifter with
+  its operand and result bits (`aig::WordOp`), for carry chains, DSP blocks
+  and datapath cells.
+- `mems`: every memory (an unpacked array written through a dynamic index in
+  a clocked block) with its write ports (clock, enable, address, data, byte
+  lane) and read ports (address, data) (`aig::Memory`). The graph still
+  holds the memory as flops and multiplexers; a tool with a RAM drops those
+  flops (`Flop::var` is the memory's name) and drives the read data itself.
+  Later write ports win over earlier ones on the same word.
+- `aig::flopEnable` and `aig::flopSyncReset` find the enable and the
+  synchronous reset in front of a flop.
+
 ## Limits
 
 - Not synthesized: latches (an incompletely assigned `always_comb` is an
@@ -117,4 +135,6 @@ or in the directory named by `$MINISIM_MINI45`. For simulation use
 `tests/synth`: each design is synthesized and its testbench is simulated
 with `msim` on the RTL and on the netlist with random stimulus; both runs
 must print the same lines. This is done with the default library and with a
-library of only an inverter, a NAND and one flop.
+library of only an inverter, a NAND and one flop. Each netlist on the default library is
+also proven equivalent to its RTL with `mequiv`, and a netlist with one gate
+swapped must be reported as different.
