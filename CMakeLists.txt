@@ -115,7 +115,7 @@ if(MINISIM_WITH_SLANG)
     FetchContent_Populate(libfst)
     set(FST_SRC ${libfst_SOURCE_DIR}/src)
     add_library(fst STATIC ${FST_SRC}/fstapi.c ${FST_SRC}/fastlz.c ${FST_SRC}/lz4.c)
-    target_include_directories(fst PUBLIC ${FST_SRC})
+    target_include_directories(fst PUBLIC $<BUILD_INTERFACE:${FST_SRC}>)
     # FST_WRITER_PARALLEL: libfst compresses and writes each finished block on
     # a background thread while the simulation goes on (msim turns it on).
     find_package(Threads REQUIRED)
@@ -452,6 +452,23 @@ if(MINISIM_WITH_SLANG)
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+# minisim::core: the kernel headers, exported so a tool kept in another
+# repository builds against them instead of copying them (docs/LICENSING.md).
+if(MINISIM_WITH_SLANG)
+  include(cmake/core.cmake)
+
+  # A tool outside this repository, built against the installed package: the
+  # test installs minisim into a scratch prefix and builds tests/core_consumer
+  # there, so a header the package forgets to install fails here.
+  add_test(NAME core_lib
+           COMMAND ${CMAKE_COMMAND} -DBUILD=${CMAKE_BINARY_DIR} -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/core_lib
+                   -DSLANG_LIBRARY=$<TARGET_FILE:slang::slang>
+                   "-DSLANG_INCLUDE_DIRS=$<TARGET_PROPERTY:slang::slang,INTERFACE_INCLUDE_DIRECTORIES>"
+                   "-DSLANG_LINK_LIBRARIES=$<TARGET_PROPERTY:slang::slang,INTERFACE_LINK_LIBRARIES>"
+                   -P ${CMAKE_SOURCE_DIR}/tests/core_lib.cmake)
+  set_tests_properties(core_lib PROPERTIES TIMEOUT 900)
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)

@@ -1,0 +1,54 @@
+# The exported kernel package: install minisim into a scratch prefix, then
+# build tests/core_consumer against it the way a tool in another repository
+# does. A kernel header that minisimCore forgets to install, or a missing link
+# dependency, fails here instead of in that other repository.
+#   cmake -DBUILD=<build dir> -DSRC=<source dir> -DOUT=<dir> -DSLANG_*=... -P core_lib.cmake
+file(REMOVE_RECURSE ${OUT})
+file(MAKE_DIRECTORY ${OUT})
+set(prefix ${OUT}/prefix)
+
+execute_process(COMMAND ${CMAKE_COMMAND} --install ${BUILD} --prefix ${prefix}
+                --component Unspecified
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "installing into the scratch prefix failed: ${rc}\n${out}${err}")
+endif()
+
+# Everything the package promises must be there before a consumer is tried.
+foreach(want lib/cmake/minisimCore/minisimCoreConfig.cmake
+             lib/cmake/minisimCore/minisimCoreTargets.cmake
+             include/minisim/lintir.hpp include/minisim/prog.hpp
+             include/minisim/parallel.hpp include/minisim/lower.hpp
+             include/minisim/version.hpp)
+  if(NOT EXISTS ${prefix}/${want})
+    message(FATAL_ERROR "the minisimCore package did not install ${want}")
+  endif()
+endforeach()
+
+execute_process(COMMAND ${CMAKE_COMMAND} -S ${SRC}/tests/core_consumer -B ${OUT}/build
+                        -DCMAKE_BUILD_TYPE=Release
+                        -DCMAKE_PREFIX_PATH=${prefix}
+                        -DSLANG_LIBRARY=${SLANG_LIBRARY}
+                        -DSLANG_INCLUDE_DIRS=${SLANG_INCLUDE_DIRS}
+                        -DSLANG_LINK_LIBRARIES=${SLANG_LINK_LIBRARIES}
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "configuring the consumer against the package failed: ${rc}\n${out}${err}")
+endif()
+
+execute_process(COMMAND ${CMAKE_COMMAND} --build ${OUT}/build --parallel
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "building the consumer against the package failed: ${rc}\n${out}${err}")
+endif()
+
+execute_process(COMMAND ${OUT}/build/core_consumer
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "the consumer ran but failed: ${rc}\n${out}${err}")
+endif()
+if(NOT out MATCHES "core_consumer: minisim [0-9]+\\.[0-9]+\\.[0-9]+")
+  message(FATAL_ERROR "the consumer did not report the version it was built against:\n${out}")
+endif()
+
+message(STATUS "core_lib: ok - ${out}")
