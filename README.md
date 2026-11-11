@@ -596,29 +596,10 @@ mdft: 5 flops in 3 clock domains
   t.clk: 3 flops (2 rising, 1 falling)
 ```
 
-On a gate netlist `mdft -insert_scan` stitches the flops into scan chains
-(scan cells from the Liberty library or a mux in front of D, balanced chains
-per clock domain, lockup latches, clock gates held open) and writes the
-netlist, a chain description for ATPG and a chain flush testbench.
-`mdft -mbist` generates a March memory BIST controller and collar for a RAM
-and reports the fault coverage of the chosen algorithm. See
-[docs/DFT.md](docs/DFT.md).
-
-```sh
-mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
-mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
-`mdft` also does IEEE 1149.1 boundary scan and IEEE 1687 IJTAG
-([docs/JTAG.md](docs/JTAG.md)); every flow can write SVF and a self-checking
-testbench that `msim` runs:
-
-```sh
-mdft -bscan rtl/*.sv -top chip -tb chip_tb.sv    # chip_bscan.sv (TAP + boundary register), chip_bscan.bsdl
-mdft -bsdl chip.bsdl -svf chip.svf               # check a BSDL file (BSD001..009), write its device tests
-mdft -icl net.icl -icl_rtl net.sv -pdl t.pdl -iproc all -svf t.svf   # IJTAG network RTL, PDL retargeting
-mdft -lbist chip_scan.v -top chip -scandef chains.json -lbist_sign    # logic BIST wrapper, golden signature
-mdft -edt chip_scan.v -top chip -scandef chains.json -edt_cubes cubes.txt -edt_patterns p.txt   # scan compression
-mdft -diagnose fails.log -patterns pats.txt chip_scan.v -top chip   # which faults explain a tester fail log
-```
+Everything that *changes* a design for test — scan insertion, memory BIST,
+boundary scan, IJTAG, EDT scan compression, logic BIST and failure diagnosis —
+is `mdfti`, a paid tool; see [docs/LICENSING.md](docs/LICENSING.md). What is
+here is the reading half: the checks above, on RTL, before any of that.
 
 `mlint` and `mdft` share one model of the elaborated design
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
