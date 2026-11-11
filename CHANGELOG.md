@@ -21,6 +21,11 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- Value conversion tables (IEEE 1801-2024 4.10, 6.18, 6.28, Annex B):
+  `connect_supply_net` joins a supply net and an HDL port. An output port
+  (a regulator model) drives the net; an input port (a macro's power pin) is
+  driven by it. The twelve predefined tables and `create_hdl2upf_vct` /
+  `create_upf2hdl_vct`, chosen with `-vct` (`src/upf_vct.hpp`).
 - UPF is Tcl (IEEE 1801-2024 5.1): `msim -upf` and `mlint -upf` read power
   intent with the tool line's Tcl interpreter (`src/tcl.hpp`), so `[command]`
   substitution, `foreach`, `for`, `while`, `if`, `expr`, `proc`, lists,
