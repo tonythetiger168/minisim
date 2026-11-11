@@ -39,6 +39,7 @@
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <regex>
 
 #include "parallel.hpp"
 #include "hls_ir.hpp"
@@ -1976,7 +1977,8 @@ int main(int argc, char** argv) {
       if (!crefOut.empty()) {
         std::ofstream os(crefOut);
         if (!os) throw Error("mhls: cannot write " + crefOut);
-        os << cref(j.fn, *j.src, V, P.file);
+        // A base class is a member in what -clang hands over, not in the C++ the host compiles.
+        os << std::regex_replace(cref(j.fn, *j.src, V, P.file), std::regex("mhls_base_[A-Za-z0-9_]+\\."), "");
         if (!quiet) std::cout << "  wrote " << crefOut << "\n";
       }
     }

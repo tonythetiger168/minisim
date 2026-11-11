@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
+  `q[3:0]`) follows only that part: its value, the time those bits last
+  changed, and the assignments that write them. The viewer page does the same.
 - `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
   elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
   the default waveform is unchanged. `mdebug -active` follows a memory read
@@ -234,6 +237,11 @@ Spec references are IEEE 1800-2023 clauses.
   function templates, default arguments, overloads, static members, scoped
   enums, namespaces, and whatever the design uses from its headers
   (`std::min`, `std::max` included). `-emit-c` shows the reduction.
+- `mhls -clang`: inheritance. A base class is the first member of the
+  derived struct; base constructors, inherited and hidden members, several
+  bases, template bases and objects passed as their base all work. Classes
+  whose only constructor is the implicit one now run their members'
+  constructors. Virtual functions in a hierarchy are refused.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -659,6 +667,13 @@ Spec references are IEEE 1800-2023 clauses.
   automatic tasks called from several processes at once, and
   `fork automatic int j = i; ... join_none` with one copy per fork. This is
   the base for class methods (8).
+- `msta`: the hold check between clocks of different periods used a capture
+  edge that was too early and reported too much slack. It now takes the
+  tightest hold relation over the common period. Asynchronous set / reset to
+  output arcs are no longer timed as paths by default
+  (`-preset_clear_arcs` turns them on). Both were found by comparing with
+  OpenSTA, which now agrees at every endpoint of a million-cell design to
+  0.1 ps; see "Compared with OpenSTA" in `docs/STA.md` and `bench/sta/`.
 
 ### Changed
 - `mlint` prints each finding's severity (`error`, `warning` or `info`) and

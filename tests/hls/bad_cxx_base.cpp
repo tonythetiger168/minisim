@@ -1,12 +1,14 @@
-// Refused: inheritance.
-struct Base { int x; };
-struct Derived : Base {
-  int y;
-  int sum() const { return x + y; }
+// Refused: a virtual function called through a class hierarchy.
+struct Shape {
+  int w;
+  virtual int area() const { return w; }
+  int twice() const { return 2 * area(); }
+};
+struct Square : Shape {
+  int area() const override { return w * w; }
 };
 int top(int a) {
-  Derived d;
-  d.x = a;
-  d.y = 1;
-  return d.sum();
+  Square s;
+  s.w = a;
+  return s.twice();
 }

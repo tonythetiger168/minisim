@@ -14,6 +14,7 @@
 //   template instantiation     ->  one struct / function per instantiation
 //   constructor                ->  a function called after the declaration
 //   operator, method call      ->  a call
+//   base class                 ->  the first member of the derived struct
 //   implicit conversion        ->  a cast
 #pragma once
 
@@ -217,8 +218,10 @@ class ClangFront {
         for (auto& c : f.decl->inner()) {
           if (c.kind() != "CXXCtorInitializer") continue;
           const Json* m = c.get("anyInit");
-          if (!m || c.inner().empty()) unsupported(*f.decl, "a constructor that initializes a base class");
-          std::string line = initTo("self." + m->str("name"), c.inner()[0]);
+          const Json* bi = c.get("baseInit");
+          if ((!m && !bi) || c.inner().empty()) unsupported(*f.decl, "this constructor initializer");
+          std::string target = "self." + (m ? m->str("name") : "mhls_base_" + ctypeStr(bi->str("desugaredQualType").empty() ? bi->str("qualType") : bi->str("desugaredQualType"), *f.decl).base);
+          std::string line = initTo(target, c.inner()[0]);
           for (auto& l : pre_) body << "  " << l << "\n";
           pre_.clear();
           if (!line.empty()) body << "  " << line << "\n";
@@ -409,12 +412,40 @@ class ClangFront {
       u.isConst = u.isConst || r.isConst;
       u.dims = r.dims + u.dims;
       return u;
+    } else if (q != plainArgs(q)) {
+      // "Range<int16_t>": the class is known by the plain spelling, "Range<short>".
+      CT u = ctypeStr(plainArgs(q), at);
+      u.ref = r.ref, u.ptr = r.ptr, u.isConst = r.isConst, u.dims = r.dims;
+      return u;
     } else if (q == "float" || q == "double" || q == "long double") {
       unsupported(at, "floating point ('" + q + "')");
     } else {
       unsupported(at, "the type '" + q + "'");
     }
     return r;
+  }
+
+  // `q` with typedef names inside its template arguments replaced by what they stand for.
+  std::string plainArgs(const std::string& q) {
+    size_t lt = q.find('<');
+    if (lt == std::string::npos || q.back() != '>') return q;
+    std::string out = q.substr(0, lt + 1), arg;
+    int depth = 0;
+    auto flush = [&] {
+      std::string a2 = trim(arg);
+      auto td = typedefs_.find(a2);
+      out += td != typedefs_.end() ? td->second : plainArgs(a2);
+      arg.clear();
+    };
+    for (size_t i = lt + 1; i + 1 < q.size(); i++) {
+      char c = q[i];
+      if (c == '<') depth++;
+      else if (c == '>') depth--;
+      if (c == ',' && !depth) { flush(); out += ", "; }
+      else arg += c;
+    }
+    flush();
+    return out + ">";
   }
 
   // ---- declarations ----
@@ -523,7 +554,11 @@ class ClangFront {
       }
       return;
     }
-    if (d.flag("isImplicit")) return;
+    // An implicit default constructor that has work to do (bases or members with constructors) counts.
+    bool implicitDefault = d.kind() == "CXXConstructorDecl";
+    for (auto& c : d.inner())
+      if (c.kind() == "ParmVarDecl") implicitDefault = false;
+    if (d.flag("isImplicit") && !implicitDefault) return;
     lazyFn_[id] = {&d, suffix, recId};
     for (std::string p = prev; !p.empty(); p = prevOf_.count(p) ? prevOf_[p] : "") fnAlias_[p] = id;
     if (d.kind() == "CXXConstructorDecl" && d.get("type")) lazyCtor_[recId + "|" + d.get("type")->str("qualType")] = id;
@@ -583,6 +618,12 @@ class ClangFront {
   }
 
 
+  std::map<std::string, const Json*> recDecl_;   // class C name -> its definition
+  std::map<std::string, std::vector<std::pair<std::string, std::string>>> basesOf_;   // class C name -> bases: C name, plain name
+  static bool polymorphic(const Json& d) {
+    const Json* dd = d.get("definitionData");
+    return dd && dd->flag("isPolymorphic");
+  }
   // The C name of the class spelled `q`, writing its struct on first use; "" if `q` is no class.
   std::string recordOf(const std::string& q, const Json&) {
     auto a = recAlias_.find(q);
@@ -596,11 +637,33 @@ class ClangFront {
     std::string cn = unique(mangle(qual));
     alias(recAlias_, qual, cn);
     recId_[cn] = d.str("id");
-    if (const Json* bases = d.get("bases"))
-      if (!bases->a.empty()) unsupported(d, "base classes ('" + qual + "')");
+    recDecl_[cn] = &d;
     std::ostringstream o;
     o << "typedef struct {\n";
     int fields = 0;
+    // A base class is the first member, an object of the base's struct.
+    if (const Json* bases = d.get("bases"))
+      for (auto& b : bases->a) {
+        const Json* t = b.get("type");
+        if (!t || b.flag("isVirtual")) unsupported(d, "virtual base classes ('" + qual + "')");
+        std::string q = t->str("desugaredQualType");
+        if (q.empty()) q = t->str("qualType");
+        std::string bcn = ctypeStr(q, d).base;
+        if (!recDecl_.count(bcn)) unsupported(d, "this base class of '" + qual + "'");
+        if (polymorphic(d) || polymorphic(*recDecl_[bcn]))
+          unsupported(d, "virtual functions in a class with a base or derived class ('" + qual + "')");
+        std::string simple = q;
+        int depth = 0;
+        size_t cut = simple.size(), start = 0;
+        for (size_t i = 0; i < simple.size(); i++) {
+          if (simple[i] == '<') { if (!depth++) cut = std::min(cut, i); }
+          else if (simple[i] == '>') depth--;
+          else if (!depth && simple[i] == ':' && cut == simple.size()) start = i + 1;
+        }
+        basesOf_[cn].push_back({bcn, simple.substr(start, cut - start)});
+        o << "  " << bcn << " mhls_base_" << bcn << ";\n";
+        fields++;
+      }
     for (auto& c : d.inner()) {
       if (c.kind() != "FieldDecl") continue;
       CT t = ctype(c);
@@ -940,9 +1003,18 @@ class ClangFront {
     if (q.rfind("const ", 0) == 0) q = q.substr(6);
     auto td = typedefs_.find(q);
     if (td != typedefs_.end()) q = td->second;
+    if (recAlias_.count(q) || lazyRec_.count(q)) return true;
+    q = plainArgs(q);
     return recAlias_.count(q) || lazyRec_.count(q);
   }
   static bool isThis(const Json& e) {
+    const Json* x = &e;
+    while ((x->kind() == "ImplicitCastExpr" && !toBase(*x)) || x->kind() == "ParenExpr") x = &x->inner()[0];
+    return x->kind() == "CXXThisExpr";
+  }
+  static bool toBase(const Json& e) { return e.str("castKind") == "DerivedToBase" || e.str("castKind") == "UncheckedDerivedToBase"; }
+  // `this`, possibly seen as one of its base classes.
+  static bool thisRooted(const Json& e) {
     const Json* x = &e;
     while (x->kind() == "ImplicitCastExpr" || x->kind() == "ParenExpr") x = &x->inner()[0];
     return x->kind() == "CXXThisExpr";
@@ -1101,7 +1173,22 @@ class ClangFront {
       if (ck == "IntegralToBoolean") return "((" + ex(in[0]) + ") != 0)";
       if (ck == "IntegralCast" || ck == "BooleanToSignedIntegral") return "((" + ctype(n).base + ")(" + ex(in[0]) + "))";
       if (ck == "IntegralToFloating" || ck == "FloatingToIntegral" || ck == "FloatingCast") unsupported(n, "floating point");
-      if (ck == "DerivedToBase" || ck == "UncheckedDerivedToBase") unsupported(n, "base classes");
+      if (ck == "DerivedToBase" || ck == "UncheckedDerivedToBase") {
+        // The base object is a member: one step per class on the way up.
+        std::string v = ex(in[0]), cn = ctype(in[0]).base;
+        if (const Json* path = n.get("path"))
+          for (auto& step : path->a) {
+            auto& bases = basesOf_[cn];
+            const std::pair<std::string, std::string>* hit = bases.size() == 1 ? &bases[0] : nullptr;
+            for (auto& b : bases)
+              if (b.second == step.str("name")) hit = &b;
+            if (!hit) unsupported(n, "this conversion to a base class");
+            v += ".mhls_base_" + hit->first;
+            cn = hit->first;
+          }
+        return v;
+      }
+      if (ck == "BaseToDerived") unsupported(n, "a cast from a base class to a derived one");
       return ex(in[0]);
     }
     if (k == "UnaryOperator") {
@@ -1123,7 +1210,7 @@ class ClangFront {
     if (k == "CXXThisExpr") return "self";
     if (k == "MemberExpr") {
       if (isThis(in[0])) return "self." + n.str("name");
-      return ex(in[0]) + (n.flag("isArrow") ? "->" : ".") + n.str("name");
+      return ex(in[0]) + (n.flag("isArrow") && !thisRooted(in[0]) ? "->" : ".") + n.str("name");
     }
     if (k == "InitListExpr") {
       // A list shorter than its array comes as the filler value followed by
@@ -1152,7 +1239,7 @@ class ClangFront {
       }
       const std::vector<int>& kinds = kindsOf(m);
       auto kind = [&](size_t i) { return i < kinds.size() ? kinds[i] : 0; };
-      std::string first = isThis(obj) ? "self" : m.flag("isArrow") ? "(*" + ex(obj) + ")" : refArg(obj, kind(0));
+      std::string first = isThis(obj) ? "self" : m.flag("isArrow") && !thisRooted(obj) ? "(*" + ex(obj) + ")" : refArg(obj, kind(0));
       std::string s = callee(m, n) + "(" + first;
       for (size_t i = 1; i < in.size(); i++) {
         if (in[i].kind() == "CXXDefaultArgExpr") { s += ", " + defaultArg(m, i - 1, n); continue; }
