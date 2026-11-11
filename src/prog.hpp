@@ -25,7 +25,8 @@ enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_
               D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
               D_SORT, D_RSORT, D_SHUFFLE,
               D_SORT_BY, D_RSORT_BY,     // sort / rsort with (7.12.2): keys in dsrc
-              D_UNPACK };                // q = {>>{v}} (11.4.14.3): e cut into elements
+              D_UNPACK,                  // q = {>>{v}} (11.4.14.3): e cut into elements
+              D_DEFAULT };               // '{default: v} of an associative array (7.9.11): a missing element reads as e
 // IK::ProcOp operations (9.7).
 enum ProcOpKind { PO_SELF, PO_STATUS, PO_KILL, PO_AWAIT, PO_SUSPEND, PO_RESUME };
 enum class IK {
@@ -399,6 +400,11 @@ struct Prog {
     int pd = -1;           // UPF power domain, -1 for none (initial blocks are never gated, 9.2.1)
     bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
     std::vector<Instr> code;
+    // msim -xprop, a clocked block with a clean copy: code[1] tests for an
+    // ambiguous clock edge and otherwise jumps here. A clocked function
+    // starts here at once in a time step where no signal has changed from
+    // or to x (Sim::xAt). 0: none.
+    size_t xpFast = 0;
     // Named blocks this process runs as a whole (an initial's named body, a
     // fork branch that is a named block, every branch of a named fork).
     // `disable` of one of them from another process ends the process.

@@ -254,6 +254,12 @@ void setValues(TableRef& r, const std::vector<double>& v) {
     }
     a->complex = true;
     a->vals.clear();
+    if (r.i2.empty() && v.size() > 1) {            // one axis: one row
+        std::string row;
+        for (size_t i = 0; i < v.size(); i++) row += (i ? ", " : "") + num(v[i]);
+        a->vals.push_back(row);
+        return;
+    }
     for (size_t i = 0; i < r.rows(); i++) {
         std::string row;
         for (size_t j = 0; j < r.cols(); j++) row += (j ? ", " : "") + num(v[i * r.cols() + j]);
@@ -449,6 +455,14 @@ struct CapJob {
     Point pt;
 };
 
+struct PinPowerJob {  // rise_power or fall_power of an input pin: the energy of an edge that moves no output
+    Group* pin = nullptr;
+    std::string when;
+    bool rise = false;
+    TableRef tab;
+    std::vector<Point> pts;
+};
+
 struct LeakJob {
     Group* group = nullptr;                 // leakage_power group, or null for the cell value
     Point pt;
@@ -460,6 +474,7 @@ struct CellWork {
     std::vector<ArcJob> arcs;
     std::vector<ConsJob> cons;
     std::vector<PulseJob> pulses;
+    std::vector<PinPowerJob> pinPower;
     std::vector<CapJob> caps;
     std::vector<LeakJob> leaks;
     int kept = 0;                           // timing groups left as the template has them
@@ -798,6 +813,63 @@ struct Char {
         }
     }
 
+    // ---------------------------------------------- input pin power
+    bool pinPowerPlan(const CellWork& w, const PinPowerJob& j, std::vector<int>& flips) const {
+        const Logic& L = w.L;
+        int p = L.in(j.pin->name());
+        if (p < 0) return false;
+        Expr when;
+        bool hasWhen = !j.when.empty();
+        if (hasWhen) when = liberty::parseFunction(j.when);
+        State at;
+        return plan(L, [&](const State& s) {
+            if ((((s.v >> p) & 1) != 0) == j.rise) return false;      // the pin at its old level
+            State n = flip(L, s, p);
+            if (s.a != s.b || n.a != n.b || s.a != n.a) return false; // the state stays
+            if (hasWhen && (!L.eval(when, s.v, s.a) || !L.eval(when, n.v, n.a))) return false;
+            for (int o = 0; o < (int)L.outs.size(); o++) {
+                if (L.driven(o, s.v, s.a) != L.driven(o, n.v, n.a)) return false;
+                if (L.hasFn[o] && L.outv(o, s.v, s.a) != L.outv(o, n.v, n.a)) return false;
+            }
+            return true;
+        }, flips, at);
+    }
+
+    // What the supply delivers over an edge of the pin that moves no output,
+    // less leakage. The charge on the pin itself comes from its driver and
+    // is that net's switching power, not the cell's.
+    void pinPowerPoint(const CellWork& w, PinPowerJob& j, size_t idx, size_t deckId) const {
+        Point& pt = j.pts[idx];
+        try {
+            std::vector<int> flips;
+            if (!pinPowerPlan(w, j, flips)) throw std::runtime_error("no stimulus");
+            const Logic& L = w.L;
+            std::string pin = j.pin->name();
+            Deck d = deck(w);
+            std::string te = stimulus(L, flips, d);
+            auto& wv = d.wave[pin].pts;
+            wv.push_back({te, j.rise ? "0" : "vdd"});
+            wv.push_back({te + "+tr", j.rise ? "vdd" : "0"});
+            d.tstop = te + "+tr+ts";
+            spice::Netlist nl = runner.read(d, deckId);
+            double tr = tech.ramp(j.tab.i1[idx] * tech.tUnit, j.rise);
+            Trace t = run(nl, {{"tr", tr}, {"tmax", stepFor(tr)}});
+            double V = tech.vdd, t0 = (double)(flips.size() + 1) * opt.settle, tEnd = t.r.x.back();
+            int ci = t.col("i(vvdd)");
+            double e = -V * t.integral(ci, t0, tEnd);
+            double q0 = t0 - 0.3 * opt.settle;
+            e -= -V * t.integral(ci, q0, t0) / (t0 - q0) * (tEnd - t0);
+            for (auto& o : L.outs) {        // an output that drifted up took charge that is not internal
+                int c = t.v(o);
+                double dv = t.last(c) - t.at(c, t0);
+                if (dv > 0) e -= minLoad * tech.cUnit * V * dv;
+            }
+            pt.energy = e / tech.eUnit;
+        } catch (const std::exception& e) {
+            pt.err = e.what();
+        }
+    }
+
     // ------------------------------------------------- pin capacitance
     void capPoint(const CellWork& w, CapJob& j, size_t deckId) const {
         try {
@@ -977,6 +1049,18 @@ int main(int argc, char** argv) {
                 if (p.type != "pin") continue;
                 bool isOut = w.L.out(p.name()) >= 0;
                 if (!isOut && !opt.keep.count("caps") && p.has("capacitance")) w.caps.push_back({&p, {}});
+                if (!isOut && !opt.keep.count("power"))
+                    for (auto& ip : p.groups) {
+                        if (ip.type != "internal_power" || ip.has("related_pin")) continue;
+                        for (bool rise : {true, false}) {
+                            Group* tg = child(ip, rise ? "rise_power" : "fall_power");
+                            PinPowerJob j;
+                            if (!tg || !tableRef(*tg, templates, j.tab) || !j.tab.i2.empty()) continue;
+                            j.pin = &p; j.when = ip.str("when"); j.rise = rise;
+                            j.pts.resize(j.tab.i1.size());
+                            w.pinPower.push_back(std::move(j));
+                        }
+                    }
                 if (!isOut && !opt.keep.count("constraints"))
                     for (bool high : {true, false})
                         if (p.has(high ? "min_pulse_width_high" : "min_pulse_width_low")) w.pulses.push_back({&p, high, {}});
@@ -1077,6 +1161,8 @@ int main(int argc, char** argv) {
             for (size_t j = 0; j < w.caps.size(); j++) tasks.push_back({2, c, j, 0, 0});
             for (size_t j = 0; j < w.leaks.size(); j++) tasks.push_back({3, c, j, 0, 0});
             for (size_t j = 0; j < w.pulses.size(); j++) tasks.push_back({4, c, j, 0, 0});
+            for (size_t j = 0; j < w.pinPower.size(); j++)
+                for (size_t k = 0; k < w.pinPower[j].pts.size(); k++) tasks.push_back({5, c, j, 0, k});
         }
         if (!opt.quiet)
             std::cout << "mchar " << MINISIM_VERSION << ": " << work.size() << " cells, " << tasks.size()
@@ -1090,17 +1176,52 @@ int main(int argc, char** argv) {
             case 1: ch.consPoint(w, w.cons[t.job], t.idx, i); break;
             case 2: ch.capPoint(w, w.caps[t.job], i); break;
             case 4: ch.pulsePoint(w, w.pulses[t.job], i); break;
+            case 5: ch.pinPowerPoint(w, w.pinPower[t.job], t.idx, i); break;
             default: ch.leakPoint(w, w.leaks[t.job], i); break;
             }
         });
 
         // ---- write the numbers back, in order
-        int nArc = 0, nCons = 0, nCap = 0, nLeak = 0, nPower = 0, nPulse = 0, failed = 0, kept = 0;
+        int nArc = 0, nCons = 0, nCap = 0, nLeak = 0, nPower = 0, nPulse = 0, nPinPower = 0, failed = 0, kept = 0;
         std::vector<std::string> problems;
         for (auto& w : work) {
             const std::string cn = w.g->name();
             kept += w.kept;
             for (auto& n : w.notes) problems.push_back(cn + ": " + n);
+            // Input pin energy first: an output arc's table is what the event
+            // costs beyond the energy its input edge costs anyway, because a
+            // power tool adds the two.
+            std::map<std::string, const PinPowerJob*> pinE;      // "pin\nr" or "pin\nf", unconditional groups
+            for (auto& j : w.pinPower) {
+                std::string err;
+                std::vector<double> v;
+                for (auto& p : j.pts) {
+                    if (!p.err.empty()) err = p.err;
+                    v.push_back(p.energy);
+                }
+                if (!err.empty()) {
+                    problems.push_back(cn + ": " + (j.rise ? "rise_power" : "fall_power") + " of pin " + j.pin->name() + ": " + err +
+                                       " (template values kept)");
+                    failed++;
+                    j.pts.clear();
+                    continue;
+                }
+                setValues(j.tab, v);
+                nPinPower++;
+                if (j.when.empty()) pinE[j.pin->name() + (j.rise ? "\nr" : "\nf")] = &j;
+            }
+            auto pinEnergy = [&](const std::string& pin, bool rise, double slew) {
+                auto it = pinE.find(pin + (rise ? "\nr" : "\nf"));
+                if (it == pinE.end()) return 0.0;
+                const auto& x = it->second->tab.i1;
+                const auto& y = it->second->pts;
+                if (x.size() == 1 || slew <= x.front()) return y.front().energy;
+                if (slew >= x.back()) return y.back().energy;
+                size_t k = 1;
+                while (x[k] < slew) k++;
+                double f = (slew - x[k - 1]) / (x[k] - x[k - 1]);
+                return y[k - 1].energy + f * (y[k].energy - y[k - 1].energy);
+            };
             // Energy tables by (output, related pin, edge), for internal_power.
             std::map<std::string, std::vector<double>> energy;
             for (auto& j : w.arcs) {
@@ -1117,7 +1238,10 @@ int main(int argc, char** argv) {
                         if (best < 0 || p.delay > j.pts[best][k].delay) best = d;
                     }
                     if (best < 0) { if (err.empty()) err = "no stimulus moves the output"; break; }
-                    dly[k] = j.pts[best][k].delay; trn[k] = j.pts[best][k].trans; eng[k] = j.pts[best][k].energy;
+                    dly[k] = j.pts[best][k].delay; trn[k] = j.pts[best][k].trans;
+                    size_t row = k / j.delay.cols(), col = k % j.delay.cols();
+                    double slew = j.delay.v1 != liberty::Var::Load ? j.delay.i1[row] : j.delay.i2.empty() ? ch.minSlew : j.delay.i2[col];
+                    eng[k] = j.pts[best][k].energy - pinEnergy(j.related, best == 1, slew);
                 }
                 std::string what = cn + ": " + j.related + " -> " + j.out + (j.rise ? " rise" : " fall") +
                                    (j.when.empty() ? "" : " when " + j.when);
@@ -1200,8 +1324,9 @@ int main(int argc, char** argv) {
         for (auto& p : problems) std::cerr << "mchar: " << p << "\n";
         if (!opt.quiet) {
             double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            std::printf("%d delay tables, %d constraint tables, %d pulse widths, %d power tables, %d pin capacitances, %d leakage values\n",
-                        nArc, nCons, nPulse, nPower, nCap, nLeak);
+            std::printf("%d delay tables, %d constraint tables, %d pulse widths, %d power tables, %d input pin power tables, "
+                        "%d pin capacitances, %d leakage values\n",
+                        nArc, nCons, nPulse, nPower, nPinPower, nCap, nLeak);
             if (kept) std::printf("%d timing groups of other kinds kept from the template\n", kept);
             if (noNetlist) std::printf("%d cell%s without a netlist: the template's numbers are kept\n", noNetlist, noNetlist == 1 ? "" : "s");
             std::printf("%d failed; wrote %s in %.1f s\n", failed, opt.out.c_str(), s);

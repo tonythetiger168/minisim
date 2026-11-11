@@ -34,7 +34,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -315,6 +317,7 @@ struct Property {
     int live = 0;          // the liveness part of `bad`: such a loop closes in this cycle
     int saved = 0;         // the loop's first state has been saved
     std::string skipped;   // not modelled: why
+    int app = 0;           // a coverage target made by an app: 1 -app toggle, 2 a -connect condition
     std::string file;
     int line = 0;
 };
@@ -329,6 +332,11 @@ struct Options {
     std::string outDir = "mformal_out";
     std::string json;
     std::string aiger;   // write the model here and stop
+    std::vector<std::string> cuts, blackboxes;   // -cut signals; -blackbox modules or instances
+    std::vector<std::string> connect;   // -connect: connectivity specifications
+    bool appToggle = false;   // -app toggle: can every signal bit be 0 and be 1?
+    bool toggleDeep = false;  // -app toggle: spend the whole budget on each target
+    int toggleMax = 4096;     // -app toggle: skip signals wider than this
     std::vector<std::string> only;
     bool quiet = false, verbose = false, noTrace = false, dumpIr = false, werror = false;
     bool bmcOnly = false;
@@ -381,6 +389,11 @@ struct Model {
     std::unordered_map<int, int> stateBitOfInput;   // AIG node -> stateBits index
     std::vector<std::pair<int, int>> stateRange;    // per signal: first state bit, or -1
     std::vector<std::string> inputName;             // per AIG input number
+    std::vector<std::string> boxes;                 // -blackbox: instance paths below the top ("u.sub")
+    std::map<int, int> trig;                        // a tracker's time stamp signal -> "the sequence matched in this tick"
+    std::map<int, std::string> trigWhy;             // ... or why the tracker is not modelled
+    std::set<int> cutSigs;                          // -cut: signals that are free in every cycle
+    std::set<std::string> procLocals;               // variables declared inside a procedure (loop counters, temporaries)
     std::set<std::string> cutNotes;                 // what was cut, for the report
     std::vector<int> aliasOf;                       // signal -> the signal it is a plain copy of, or -1
     std::vector<Property> props;
@@ -401,6 +414,12 @@ struct Model {
         SV v;
         newInputs(sigs[(size_t)s].w, v.b, sigs[(size_t)s].name + suffix, 0);
         return v;
+    }
+    // The black box a name ("u.sub.x", relative to the top) is inside, if any.
+    const std::string* boxOf(const std::string& name) const {
+        for (auto& b : boxes)
+            if (name.size() > b.size() && name.compare(0, b.size(), b) == 0 && name[b.size()] == '.') return &b;
+        return nullptr;
     }
     int canon(int s) const {
         for (int n = 0; n < 64 && s >= 0 && (size_t)s < aliasOf.size() && aliasOf[(size_t)s] >= 0; n++) s = aliasOf[(size_t)s];
@@ -483,6 +502,11 @@ struct Model {
             case Op::Eq: return o.bit(o.eq(k(0), k(1)));
             case Op::Ne: return o.bit(o.eq(k(0), k(1)) ^ 1);
             case Op::CaseEq: {
+                // s.triggered: "the tracker's time stamp is now" (see seqEndPoint in lower_assert.inc)
+                if (e->kids[0]->op == Op::Ref && e->kids[1]->op == Op::Add && e->kids[1]->kids[0]->op == Op::Time) {
+                    if (auto it = trig.find(e->kids[0]->sig); it != trig.end()) return o.bit(it->second);
+                    if (auto it = trigWhy.find(e->kids[0]->sig); it != trigWhy.end()) unsup("a sequence end point: " + it->second);
+                }
                 SV a = k(0), b = k(1);
                 a.sgn = b.sgn = false;
                 return o.bit(o.eq(a, b));
@@ -893,6 +917,13 @@ struct Model {
                     aliasOf[(size_t)a.sig] = a.e->sig;
             }
         }
+        // -blackbox: nothing inside the instance is modelled, so what it drives is free
+        for (size_t k = 0; k < np && !boxes.empty(); k++) {
+            const std::string* box = boxOf(lowered.procs[k].scope + ".");
+            if (!box) continue;
+            if (pi[k].kind == P_INIT) pi[k].kind = P_SKIP;
+            else if (pi[k].kind != P_SKIP) { pi[k].kind = P_CUT; pi[k].why = "inside the black box " + *box; }
+        }
         for (size_t k = 0; k < np; k++) {
             if (pi[k].kind == P_INIT || pi[k].kind == P_SKIP) continue;
             for (int s : pi[k].writes) writers[(size_t)s].push_back((int)k);
@@ -1142,7 +1173,12 @@ struct Model {
         if (auto it = shadowSrc.find(s); it != shadowSrc.end()) return cur(it->second);
         if (clockSig >= 0 && canon(s) == clockSig) return o.konst(0, sigs[(size_t)s].w);   // sampled before its rising edge
         if (stageOf.count(s)) return makeState(s);
+        if (cutSigs.count(s)) {
+            cutNotes.insert(sigs[(size_t)s].name + ": -cut");
+            return freeSig(s);
+        }
         auto& ws = writers[(size_t)s];
+        if (ws.empty() && boxOf(sigs[(size_t)s].name)) return freeSig(s);
         if (ws.empty()) {
             bool hasInit = false;
             for (int8_t b : initVal[(size_t)s]) hasInit = hasInit || b >= 0;
@@ -1271,32 +1307,132 @@ struct Model {
     }
     void buildMonitor(ConcAssert& c) {
         AssertInfo& a = asserts()[(size_t)c.id];
-        if (a.hidden) return;
+        // A hidden one is the end point tracker of a sequence (16.13.6): its
+        // match in the current tick is what s.triggered reads.
+        bool tracker = a.hidden && c.endSig >= 0;
+        if (a.hidden && !tracker) return;
         Property pr;
         pr.name = a.name;
         pr.dir = a.dir;
         try {
+            if (tracker && (!c.localSig.empty() || !c.acts.empty())) unsup("a sequence with local variables");
             if (c.procedural) unsup("a concurrent assertion in a procedure");
             if (c.expect) unsup("an expect statement");
             if (!c.more.empty()) unsup("a multiclock assertion");
-            if (!c.localSig.empty() || !c.acts.empty()) unsup("local variables or match items");
-            if (!c.matchFlags.empty() || !c.clearFlags.empty() || c.endSig >= 0) unsup("a sequence end point (.triggered, .matched)");
+            if (!c.matchFlags.empty() || !c.clearFlags.empty()) unsup("a sequence end point read with .matched");
             if (!onClock(c.ev)) unsup("a clock other than posedge " + (clockSig >= 0 ? sigs[(size_t)clockSig].name : std::string("?")));
-            Reader rd = [this](int r) { return cur(r); };
+            // Local variables (16.10). A variable that is assigned once is
+            // replaced by a rigid unknown X (state bits that never change, free
+            // at the start): "(a, x = d) |-> p(x)" becomes "a && d == X |-> p(X)",
+            // which holds for every X exactly when the original holds. An
+            // assertion is proven for every X; a cover asks for some X.
+            std::vector<SV> rigid;
+            for (size_t k = 0; k < c.localSig.size(); k++) {
+                SV v;
+                int w = sigs[(size_t)c.localSig[k]].w;
+                newInputs(w, v.b, pr.name + "$local" + std::to_string(k), 1);
+                for (int b : v.b) {
+                    StateBit sb;
+                    sb.in = b;
+                    sb.next = b;
+                    sb.aux = true;
+                    stateBitOfInput[b >> 1] = (int)stateBits.size();
+                    stateBits.push_back(sb);
+                }
+                rigid.push_back(v);
+            }
+            Reader rd = [&](int r) {
+                for (size_t k = 0; k < c.localSig.size(); k++)
+                    if (c.localSig[k] == r) return rigid[k];
+                return cur(r);
+            };
             std::vector<int> atom;
             for (auto& e : c.atoms) atom.push_back(truthOf(ev(e, rd)));
+            const sva::Node* root = c.root;
+            if (!c.localSig.empty() || !c.acts.empty()) {
+                if (a.dir == AD_ASSUME) unsup("local variables in an assumption");
+                auto& st = sva::store();
+                std::vector<int> assigned(c.localSig.size(), 0);
+                // the items of acts[act] as one condition: every assigned variable's X equals its value now
+                auto condOf = [&](int act) {
+                    int cnd = 1;
+                    for (auto& item : c.acts[(size_t)act]) {
+                        if (item.k < 0) unsup("a subroutine call in a match item");
+                        if (assigned[(size_t)item.k]++) unsup("a local variable that is assigned more than once");
+                        SV v = ev(item.rhs, rd);
+                        SV x = rigid[(size_t)item.k];
+                        v = o.ext(v, x.w(), v.sgn);
+                        v.b.resize((size_t)x.w(), 0);
+                        cnd = g.And(cnd, o.eq(v, x));
+                    }
+                    atom.push_back(cnd);
+                    return (int)atom.size() - 1;
+                };
+                // where a term is: U a property that must hold in every attempt (an assertion's top level),
+                // A the antecedent sequence of an implication there, C a cover's top level, E a cover's
+                // sequence, X anywhere else (under or, not, eventually, until: an X per attempt would be needed)
+                enum Ctx { CU, CA, CC, CE, CX };
+                const char* where = "a local variable assigned outside the antecedent of an implication (or, in a cover, outside its sequence)";
+                std::function<const sva::Node*(const sva::Node*, Ctx, bool)> rw = [&](const sva::Node* t, Ctx cx, bool inRep) -> const sva::Node* {
+                    if (!t->envDep) return t;
+                    if (t->k == sva::MATCH) {
+                        if (cx != CA && cx != CE) unsup(where);
+                        if (inRep) unsup("a local variable assigned inside a repetition");
+                        const sva::Node* kid = rw(t->kids[0], cx, inRep);
+                        int ca = condOf(t->lo);
+                        if (kid->k == sva::BOOL && !(kid->flags & sva::NEG)) {
+                            atom[(size_t)ca] = g.And(atom[(size_t)ca], atom[(size_t)kid->atom]);
+                            return st.boolean(ca);
+                        }
+                        return st.sand(kid, st.cat(st.star(), st.boolean(ca)));
+                    }
+                    if (t->k == sva::INIT) {
+                        const sva::Node* kid;
+                        if (t->kids[0]->prop) {
+                            if (cx != CU && cx != CC) unsup(where);
+                            int ca = condOf(t->lo);
+                            kid = rw(t->kids[0], cx, inRep);
+                            return st.pif(ca, kid, cx == CC ? st.pfalse() : nullptr);
+                        }
+                        if (cx != CA && cx != CE) unsup(where);
+                        if (inRep) unsup("a local variable assigned inside a repetition");
+                        if (t->kids[0]->nullable) unsup("a local variable initialized in a sequence that can be empty");
+                        int ca = condOf(t->lo);
+                        kid = rw(t->kids[0], cx, inRep);
+                        return st.sand(kid, st.cat(st.boolean(ca), st.star()));
+                    }
+                    if (t->k == sva::ENV) unsup("local variables");
+                    sva::Node n = *t;
+                    n.flags &= (uint8_t)~sva::LOCAL;
+                    for (size_t i = 0; i < n.kids.size(); i++) {
+                        Ctx kc = CX;
+                        bool kr = inRep;
+                        switch (t->k) {
+                            case sva::PAND: case sva::ALWAYS: case sva::NEXT: case sva::IF: case sva::ACCEPT: case sva::REJECT: kc = cx == CU ? CU : CX; break;
+                            case sva::IMPL: kc = cx == CU ? (i == 0 ? CA : CU) : CX; break;
+                            case sva::PSEQ: case sva::COVSEQ: kc = cx == CC ? CE : CX; break;
+                            case sva::CAT: case sva::FUSE: case sva::SOR: case sva::SAND: case sva::FM: kc = cx == CA || cx == CE ? cx : CX; break;
+                            case sva::REP: kc = cx == CA || cx == CE ? cx : CX; kr = true; break;
+                            default: kc = CX;
+                        }
+                        n.kids[i] = rw(t->kids[i], kc, kr);
+                    }
+                    return st.mk(n);
+                };
+                root = rw(c.root, a.dir == AD_COVER ? CC : CU, false);
+            }
             int tick = c.clkIff ? truthOf(ev(c.clkIff, rd)) : 1;
             int kill = c.disable ? truthOf(ev(c.disable, rd)) : 0;
 
             // The terms an attempt can become, with whether it is nonvacuous so far.
             struct MS { const sva::Node* t; bool nonvac; };
-            std::vector<MS> states{{c.root, false}};
-            std::map<std::pair<const sva::Node*, bool>, int> idx{{{c.root, false}, 0}};
+            std::vector<MS> states{{root, false}};
+            std::map<std::pair<const sva::Node*, bool>, int> idx{{{root, false}, 0}};
             // per state: the atoms it reads and, per valuation, where it goes
             // (-1 fail, -2 pass nonvacuously, -3 ends without a verdict that counts) and whether a cover sequence matched
             struct Tr { std::vector<int> atoms; std::vector<int> to; std::vector<char> hit; };
             std::vector<Tr> trs;
-            std::vector<char> val(c.atoms.size(), 0);
+            std::vector<char> val(atom.size(), 0);
             for (size_t si = 0; si < states.size(); si++) {
                 if (states.size() > 4000) unsup("a property with more than 4000 automaton states");
                 MS ms = states[si];
@@ -1565,7 +1701,214 @@ struct Model {
         } catch (const Unsupported& u) {
             pr.skipped = u.what();
         }
+        if (tracker) {
+            if (pr.skipped.empty()) trig[c.endSig + 1] = pr.bad;
+            else trigWhy[c.endSig + 1] = pr.skipped;
+            return;
+        }
         props.push_back(std::move(pr));
+    }
+
+    // ---- connectivity (-connect FILE)
+    // One connection per line: "destination, source [, condition]". A name is a
+    // signal (with or without the top's name) and may select bits: sig[3],
+    // sig[7:4]. A condition is terms joined by &&, each term [!]name or
+    // name == number / name != number. '#' starts a comment.
+    struct ConnParser {
+        Model& m;
+        std::string t;
+        size_t p = 0;
+        void ws() { while (p < t.size() && std::isspace((unsigned char)t[p])) p++; }
+        bool eat(const char* w) {
+            ws();
+            size_t n = std::strlen(w);
+            if (t.compare(p, n, w) != 0) return false;
+            p += n;
+            return true;
+        }
+        [[noreturn]] void fail(const std::string& why) { throw std::runtime_error(why + " in '" + t + "'"); }
+        long num() {
+            ws();
+            size_t b = p;
+            while (p < t.size() && std::isdigit((unsigned char)t[p])) p++;
+            if (b == p) fail("a number is expected");
+            return std::stol(t.substr(b, p - b));
+        }
+        // 12, 'h1f, 8'b1010_0000
+        uint64_t literal() {
+            ws();
+            size_t b = p;
+            while (p < t.size() && std::isdigit((unsigned char)t[p])) p++;
+            if (p < t.size() && t[p] == '\'') {
+                p++;
+                if (p < t.size() && (t[p] == 's' || t[p] == 'S')) p++;
+                int base = 0;
+                char c = p < t.size() ? (char)std::tolower((unsigned char)t[p]) : ' ';
+                base = c == 'h' ? 16 : c == 'd' ? 10 : c == 'b' ? 2 : c == 'o' ? 8 : 0;
+                if (!base) fail("a number base (h, d, b, o) is expected");
+                p++;
+                uint64_t v = 0;
+                size_t d0 = p;
+                for (; p < t.size() && (std::isxdigit((unsigned char)t[p]) || t[p] == '_'); p++) {
+                    if (t[p] == '_') continue;
+                    int d = std::isdigit((unsigned char)t[p]) ? t[p] - '0' : std::tolower((unsigned char)t[p]) - 'a' + 10;
+                    if (d >= base) fail("a digit outside the base");
+                    v = v * (uint64_t)base + (uint64_t)d;
+                }
+                if (d0 == p) fail("digits are expected");
+                return v;
+            }
+            if (b == p) fail("a number is expected");
+            return std::stoull(t.substr(b, p - b));
+        }
+        SV ref() {
+            ws();
+            size_t b = p;
+            while (p < t.size() && (std::isalnum((unsigned char)t[p]) || t[p] == '_' || t[p] == '.' || t[p] == '$')) p++;
+            // an index that is part of the name: an array element or a generate block (a.b[2].c, mem[3])
+            std::string name = t.substr(b, p - b);
+            if (name.empty()) fail("a signal name is expected");
+            auto find = [&](const std::string& n) {
+                int sg = m.findSig(n);
+                if (sg < 0 && !m.top.empty() && n.compare(0, m.top.size() + 1, m.top + ".") == 0) sg = m.findSig(n.substr(m.top.size() + 1));
+                return sg;
+            };
+            int sg = find(name);
+            while (p < t.size() && t[p] == '[') {
+                size_t close = t.find(']', p);
+                if (close == std::string::npos) fail("a ']' is missing");
+                size_t q = close + 1, e = q;
+                while (e < t.size() && (std::isalnum((unsigned char)t[e]) || t[e] == '_' || t[e] == '.' || t[e] == '$')) e++;
+                std::string longer = name + t.substr(p, e - p);
+                bool more = e < t.size() && t[e] == '[';
+                if (find(longer) >= 0 || (sg < 0 && (e > q || more))) {
+                    name = longer;
+                    p = e;
+                    sg = find(name);
+                    continue;
+                }
+                break;
+            }
+            if (sg < 0) fail("no signal named '" + name + "'");
+            SV v = m.cur(sg);
+            if (eat("[")) {
+                long hi = num(), lo = hi;
+                if (eat(":")) lo = num();
+                if (!eat("]")) fail("a ']' is missing");
+                if (lo > hi) std::swap(lo, hi);
+                if (hi >= v.w()) fail("a bit select outside '" + name + "'");
+                SV r;
+                for (long i = lo; i <= hi; i++) r.b.push_back(v.b[(size_t)i]);
+                return r;
+            }
+            return v;
+        }
+        int cond() {
+            int c = 1;
+            do {
+                bool neg = eat("!");
+                SV v = ref();
+                int term;
+                if (eat("==") || eat("!=")) {
+                    bool ne = t[p - 2] == '!';
+                    uint64_t k = literal();
+                    term = m.o.eq(v, m.o.konst(k, v.w())) ^ (ne ? 1 : 0);
+                } else {
+                    term = m.o.redOr(v);
+                }
+                c = m.g.And(c, term ^ (neg ? 1 : 0));
+            } while (eat("&&"));
+            return c;
+        }
+        void end() {
+            ws();
+            if (p != t.size()) fail("unexpected text");
+        }
+    };
+    void addConnectivity(const std::string& file) {
+        std::ifstream in(file);
+        if (!in) throw std::runtime_error("cannot read " + file);
+        std::string line;
+        for (int ln = 1; std::getline(in, line); ln++) {
+            if (auto h = line.find('#'); h != std::string::npos) line.erase(h);
+            if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+            std::vector<std::string> f;
+            std::stringstream ss(line);
+            for (std::string x; std::getline(ss, x, ',');) f.push_back(x);
+            std::string where = file + ":" + std::to_string(ln) + ": ";
+            if (f.size() < 2 || f.size() > 3) throw std::runtime_error(where + "expected 'destination, source [, condition]'");
+            try {
+                ConnParser pd{*this, f[0]}, ps{*this, f[1]};
+                SV d = pd.ref(), sr = ps.ref();
+                pd.end();
+                ps.end();
+                if (d.w() != sr.w())
+                    throw std::runtime_error("destination is " + std::to_string(d.w()) + " bits, source is " + std::to_string(sr.w()));
+                int c = 1;
+                if (f.size() == 3) {
+                    ConnParser pc{*this, f[2]};
+                    c = pc.cond();
+                    pc.end();
+                }
+                auto trim = [](std::string x) {
+                    x.erase(0, x.find_first_not_of(" \t\r"));
+                    x.erase(x.find_last_not_of(" \t\r") + 1);
+                    return x;
+                };
+                Property pr;
+                pr.name = "connect." + std::to_string(ln) + "." + trim(f[0]);
+                pr.dir = AD_ASSERT;
+                pr.file = file;
+                pr.line = ln;
+                pr.bad = g.And(startLit, g.And(c, o.eq(d, sr) ^ 1));
+                props.push_back(pr);
+                if (f.size() == 3) {   // a connection whose condition never holds is checked vacuously
+                    Property en;
+                    en.name = pr.name + ".enabled";
+                    en.dir = AD_COVER;
+                    en.app = 2;
+                    en.file = file;
+                    en.line = ln;
+                    en.bad = g.And(startLit, c);
+                    props.push_back(en);
+                }
+            } catch (const Unsupported& u) {
+                throw std::runtime_error(where + u.what());
+            } catch (const std::runtime_error& e) {
+                throw std::runtime_error(where + e.what());
+            }
+        }
+    }
+
+    // -app toggle (unreachable coverage): two covers per signal bit, "is 0" and
+    // "is 1" in some cycle after the reset. An unreachable one is a bit that is
+    // stuck, so toggle coverage on it can never close in simulation.
+    void addToggleTargets() {
+        std::set<int> skip;
+        for (auto& [n, sg] : topInputs) skip.insert(canon(sg));
+        if (clockSig >= 0) skip.insert(clockSig);
+        std::set<int> seen;
+        for (size_t s = 0; s < sigs.size(); s++) {
+            const std::string& n = sigs[s].name;
+            if (n.empty() || n[0] == '$' || n.find('$') != std::string::npos) continue;
+            int c = canon((int)s);
+            if (skip.count(c) || procLocals.count(n) || !seen.insert(c).second) continue;
+            if (sigs[s].w > opt.toggleMax) {
+                if (!opt.quiet) std::cerr << "mformal: -app toggle: " << n << " is wider than " << opt.toggleMax << " bits, not checked (-toggle-max)\n";
+                continue;
+            }
+            SV v;
+            try { v = cur((int)s); } catch (const Unsupported&) { continue; }
+            for (int b = 0; b < v.w(); b++)
+                for (int val = 0; val < 2; val++) {
+                    Property pr;
+                    pr.name = (top.empty() ? "" : top + ".") + n + (v.w() > 1 ? "[" + std::to_string(b) + "]" : "") + (val ? "==1" : "==0");
+                    pr.dir = AD_COVER;
+                    pr.app = 1;
+                    pr.bad = g.And(startLit, v.b[(size_t)b] ^ (val ? 0 : 1));
+                    props.push_back(std::move(pr));
+                }
+        }
     }
 
     void build() {
@@ -1577,6 +1920,12 @@ struct Model {
             for (size_t li = 0; li < sampleClocks()[ci].lines.size(); li++)
                 for (size_t k = 0; k < sampleClocks()[ci].lines[li].stages.size(); k++)
                     stageOf[sampleClocks()[ci].lines[li].stages[k]] = {(int)ci, (int)li, (int)k};
+        for (auto& c : opt.cuts) {
+            int sg = findSig(c);
+            if (sg < 0 && !top.empty() && c.compare(0, top.size() + 1, top + ".") == 0) sg = findSig(c.substr(top.size() + 1));
+            if (sg < 0) throw std::runtime_error("no signal named '" + c + "' for -cut");
+            cutSigs.insert(sg);
+        }
         classify();
         findClock();
         runInits();
@@ -1615,7 +1964,13 @@ struct Model {
             if (sigs[s].name.empty() || sigs[s].name[0] == '$') continue;
             try { cur((int)s); } catch (const Unsupported&) {}
         }
+        if (opt.appToggle) addToggleTargets();
+        for (auto& f : opt.connect) addConnectivity(f);
         closeStates();
+        for (auto& pr : props) {
+            std::string rel = !top.empty() && pr.name.compare(0, top.size() + 1, top + ".") == 0 ? pr.name.substr(top.size() + 1) : pr.name;
+            if (const std::string* b = boxOf(rel); b && pr.skipped.empty()) pr.skipped = "inside the black box " + *b;
+        }
         std::sort(props.begin(), props.end(), [](const Property& a, const Property& b) { return a.name < b.name; });
     }
 };
@@ -2433,6 +2788,14 @@ void usage() {
                  "  -o DIR            where the traces go (default mformal_out); -no-trace: write none\n"
                  "  -tb               next to each trace, a testbench that replays it in msim (<property>_tb.sv)\n"
                  "  -json FILE        the results as JSON\n"
+                 "  -app toggle       unreachable coverage: report every signal bit that can never be 0\n"
+                 "                    or never be 1 after the reset (-toggle-max N: skip wider signals;\n"
+                 "                    -toggle-deep: the whole -depth and PDR budget per target)\n"
+                 "  -cut SIGNAL       cut point: the signal is a free input in every cycle (repeatable)\n"
+                 "  -blackbox NAME    black box: every instance of the module NAME, or the instance NAME,\n"
+                 "                    is not modelled and its outputs are free (repeatable)\n"
+                 "  -connect FILE     connectivity check: each line 'destination, source [, condition]' is\n"
+                 "                    proven as: whenever the condition holds, destination == source\n"
                  "  -aiger FILE       write the model as AIGER 1.9 (.aig binary, else ASCII) for another\n"
                  "                    model checker, and stop without checking\n"
                  "  -Werror           exit non-zero also for unreachable covers and inconclusive results\n"
@@ -2483,6 +2846,17 @@ int main(int argc, char** argv) {
         if (a == "-no-trace") { opt.noTrace = true; continue; }
         if (a == "-tb") { opt.tb = true; continue; }
         if (a == "-json") { opt.json = next("a file name"); continue; }
+        if (a == "-app") {
+            std::string app = next("an app name");
+            if (app == "toggle") opt.appToggle = true;
+            else { std::cerr << "mformal: unknown app '" << app << "' (apps: toggle)\n"; return 2; }
+            continue;
+        }
+        if (a == "-cut") { opt.cuts.push_back(next("a signal name")); continue; }
+        if (a == "-blackbox") { opt.blackboxes.push_back(next("a module or instance name")); continue; }
+        if (a == "-connect") { opt.connect.push_back(next("a file name")); continue; }
+        if (a == "-toggle-deep") { opt.toggleDeep = true; continue; }
+        if (a == "-toggle-max") { opt.toggleMax = std::atoi(next("a number").c_str()); continue; }
         if (a == "-aiger") { opt.aiger = next("a file name"); continue; }
         if (a == "-Werror") { opt.werror = true; continue; }
         if (a == "-quiet" || a == "-q") { opt.quiet = true; continue; }
@@ -2531,6 +2905,44 @@ int main(int argc, char** argv) {
                 int sg = m.findSig(std::string(port.name));
                 if (sg >= 0) m.topInputs.push_back({std::string(port.name), sg});
             }
+        }
+        if (opt.appToggle && comp->getRoot().topInstances.size() == 1) {
+            // Loop counters and other variables local to a procedure are not coverage targets.
+            std::string topPath = std::string(comp->getRoot().topInstances[0]->name) + ".";
+            comp->getRoot().visit(slang::ast::makeVisitor([&](auto& v, const slang::ast::VariableSymbol& var) {
+                const slang::ast::Scope* sc = var.getParentScope();
+                bool local = false;
+                while (sc) {
+                    auto k = sc->asSymbol().kind;
+                    if (k != slang::ast::SymbolKind::StatementBlock && k != slang::ast::SymbolKind::Subroutine) break;
+                    local = true;
+                    sc = sc->asSymbol().getParentScope();
+                }
+                if (local && sc) {
+                    std::string path = sc->asSymbol().getHierarchicalPath() + "." + std::string(var.name);
+                    if (path.compare(0, topPath.size(), topPath) == 0) m.procLocals.insert(path.substr(topPath.size()));
+                }
+                v.visitDefault(var);
+            }));
+        }
+        if (!opt.blackboxes.empty() && comp->getRoot().topInstances.size() == 1) {
+            std::string topPath = std::string(comp->getRoot().topInstances[0]->name) + ".";
+            std::set<std::string> used;
+            comp->getRoot().visit(slang::ast::makeVisitor([&](auto& v, const slang::ast::InstanceSymbol& inst) {
+                std::string path = inst.getHierarchicalPath();
+                if (path.compare(0, topPath.size(), topPath) == 0) {
+                    std::string rel = path.substr(topPath.size());
+                    for (auto& b : opt.blackboxes)
+                        if (b == inst.getDefinition().name || b == rel || b == path) {
+                            m.boxes.push_back(rel);
+                            used.insert(b);
+                            return;   // nothing below it matters
+                        }
+                }
+                v.visitDefault(inst);
+            }));
+            for (auto& b : opt.blackboxes)
+                if (!used.count(b)) throw std::runtime_error("no module or instance named '" + b + "' for -blackbox");
         }
         m.build();
         addLiveness(m);
@@ -2595,7 +3007,7 @@ int main(int argc, char** argv) {
         for (size_t i : todo) {
             const Result& r = results[i];
             if ((r.v == V_PROVEN || r.v == V_UNREACHABLE || safetyOnly[i]) && m.props[i].bad != 0) lemmas.push_back(m.props[i].bad);
-            if (r.v == V_BOUNDED && !safetyOnly[i]) open.push_back(i);
+            if (r.v == V_BOUNDED && !safetyOnly[i] && !(deep && m.props[i].app && !opt.toggleDeep)) open.push_back(i);
         }
         if (opt.bmcOnly || open.empty() || lemmas.size() == had) break;
         had = lemmas.size();
@@ -2617,7 +3029,7 @@ int main(int argc, char** argv) {
         for (size_t i : todo) {
             const Result& r = results[i];
             if ((r.v == V_PROVEN || r.v == V_UNREACHABLE || safetyOnly[i]) && m.props[i].bad != 0) lemmas.push_back(m.props[i].bad);
-            if (r.v == V_BOUNDED && !safetyOnly[i]) open.push_back(i);
+            if (r.v == V_BOUNDED && !safetyOnly[i] && !(deep && m.props[i].app && !opt.toggleDeep)) open.push_back(i);
         }
         std::vector<Result> again(open.size());
         parallel(open.size(), [&](size_t j) {
@@ -2673,6 +3085,7 @@ int main(int argc, char** argv) {
         for (size_t i : todo) {
             Result& r = results[i];
             if (r.v != V_FALSIFIED && r.v != V_COVERED) continue;
+            if (m.props[i].app) continue;   // a reachable coverage target needs no trace
             if (!made) {
                 std::error_code ec;
                 std::filesystem::create_directories(opt.outDir, ec);
@@ -2691,7 +3104,7 @@ int main(int argc, char** argv) {
 
     // report
     static const char* vname[] = {"proven", "falsified", "covered", "unreachable", "bounded", "inconclusive", "skipped", "assumed"};
-    int count[8] = {};
+    int count[8] = {}, appCount[8] = {};
     size_t nameW = 8;
     for (size_t i : todo) nameW = std::max(nameW, m.props[i].name.size());
     if (!opt.quiet) {
@@ -2705,8 +3118,10 @@ int main(int argc, char** argv) {
     for (size_t i : todo) {
         const Property& p = m.props[i];
         const Result& r = results[i];
-        count[r.v]++;
-        const char* kind = p.dir == AD_COVER ? "cover " : p.dir == AD_ASSUME ? "assume" : "assert";
+        if (p.app == 1) appCount[r.v]++;
+        else count[r.v]++;
+        if (p.app && r.v == V_COVERED && !opt.verbose) continue;
+        const char* kind = p.app == 1 ? "toggle" : p.dir == AD_COVER ? "cover " : p.dir == AD_ASSUME ? "assume" : "assert";
         std::cout << "  " << kind << "  " << p.name << std::string(nameW - p.name.size() + 2, ' ') << vname[r.v];
         switch (r.v) {
             case V_PROVEN: case V_UNREACHABLE:
@@ -2733,7 +3148,17 @@ int main(int argc, char** argv) {
     }
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (!opt.quiet) {
-        std::cout << "mformal: " << todo.size() << (todo.size() == 1 ? " property: " : " properties: ");
+        int nApp = 0;
+        for (int v = 0; v < 8; v++) nApp += appCount[v];
+        if (nApp) {
+            int open = nApp - appCount[V_COVERED] - appCount[V_UNREACHABLE];
+            std::cout << "mformal: toggle: " << nApp << " targets on " << nApp / 2 << " signal bits: " << appCount[V_COVERED] << " reachable, "
+                      << appCount[V_UNREACHABLE] << " unreachable";
+            if (open) std::cout << ", " << open << " not decided";
+            std::cout << "\n";
+        }
+        size_t nProps = todo.size() - (size_t)nApp;
+        std::cout << "mformal: " << nProps << (nProps == 1 ? " property: " : " properties: ");
         bool first = true;
         for (int v = 0; v < 8; v++)
             if (count[v]) { std::cout << (first ? "" : ", ") << count[v] << " " << vname[v]; first = false; }
@@ -2751,7 +3176,7 @@ int main(int argc, char** argv) {
         for (size_t k = 0; k < todo.size(); k++) {
             const Property& p = m.props[todo[k]];
             const Result& r = results[todo[k]];
-            js << "    {\"name\": " << jsonStr(p.name) << ", \"kind\": " << jsonStr(p.dir == AD_COVER ? "cover" : p.dir == AD_ASSUME ? "assume" : "assert")
+            js << "    {\"name\": " << jsonStr(p.name) << ", \"kind\": " << jsonStr(p.app == 1 ? "toggle" : p.dir == AD_COVER ? "cover" : p.dir == AD_ASSUME ? "assume" : "assert")
                << ", \"result\": " << jsonStr(vname[r.v]);
             if (r.depth >= 0) js << ", \"cycle\": " << r.depth;
             if (r.v == V_BOUNDED || r.v == V_INCONCLUSIVE) js << ", \"bound\": " << r.bound;
@@ -2765,6 +3190,6 @@ int main(int argc, char** argv) {
         js << "]\n}\n";
     }
     if (count[V_FALSIFIED]) return 1;
-    if (opt.werror && (count[V_UNREACHABLE] || count[V_INCONCLUSIVE] || count[V_SKIPPED])) return 1;
+    if (opt.werror && (count[V_UNREACHABLE] || count[V_INCONCLUSIVE] || count[V_SKIPPED] || appCount[V_UNREACHABLE])) return 1;
     return 0;
 }
