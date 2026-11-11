@@ -8,6 +8,18 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpnr -lib FILE -sdc FILE`: timing of the placed design with the engine
+  behind `msta` (wires estimated from the placement), reported after global
+  placement and after legalization with the clocks propagated through
+  their trees (setup and hold WNS/TNS, skew per clock), and timing-driven
+  placement: nets on slow paths are weighted in a second placement pass
+  (`-no_timing_driven` to only report).
+- `mpnr` clock tree synthesis: every clock net with more loads than
+  `-cts_fanout` (16) gets a tree of buffers, clustered by position level by
+  level down to one root buffer, so every flop sits behind the same number
+  of buffers. On by default (`-no_cts`); `-cts_buf CELL`, `-clock NET`. The
+  buffers are in the DEF and the written netlist, and the run reports the
+  shortest and longest driver-to-load wire of each tree.
 - `mdebug`: struct fields in the active-driver trace (conditions on a field
   are evaluated; each field and constant part select has its own driver).
 - `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
