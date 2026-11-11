@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
+  made for it (lower pad turned or lengthened, written to the DEF's `VIAS`),
+  short pieces of wire and the pads of power via stacks are lengthened to
+  the layer's `AREA`, and a layer's `OFFSET 0` is taken as given (it used to
+  mean half a pitch). `bench/gen_pnr.py --mini45` writes netlists over the
+  library's cells; the `mpnr` test places, routes and DRC-checks one.
 - `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
   and transitions of FSMs), in the totals, the history and `mplan init`.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
