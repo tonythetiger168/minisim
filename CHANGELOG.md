@@ -337,6 +337,14 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- `mcov` exclusion files and test ranking: `mcov report -elfile` leaves the
+  listed lines, branches, condition vectors, toggle bits, FSM states and
+  transitions, covergroups and assertions out of every number, each with its
+  reason; `mcov exclude` drafts the file from what is not covered, and
+  `-el-review` / `-el-strict` flag exclusions that are stale, that remove
+  covered items or that have no reason. `mcov rank` orders one database per
+  test by the coverage each adds, shows what only one test covers and which
+  tests add nothing, and `-item` lists the tests that cover an item.
 - Condition and FSM coverage (as VCS `-cm cond+fsm`): `msim -cov` (or
   `-cm <metrics>`) also records, for every `&&` / `||` / `?:` condition, the
   vectors in which each term decides the result, and, for every state
