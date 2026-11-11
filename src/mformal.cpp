@@ -315,6 +315,7 @@ struct Property {
     int live = 0;          // the liveness part of `bad`: such a loop closes in this cycle
     int saved = 0;         // the loop's first state has been saved
     std::string skipped;   // not modelled: why
+    bool app = false;      // made by -app, not written in the design
     std::string file;
     int line = 0;
 };
@@ -329,6 +330,9 @@ struct Options {
     std::string outDir = "mformal_out";
     std::string json;
     std::string aiger;   // write the model here and stop
+    bool appToggle = false;   // -app toggle: can every signal bit be 0 and be 1?
+    bool toggleDeep = false;  // -app toggle: spend the whole budget on each target
+    int toggleMax = 4096;     // -app toggle: skip signals wider than this
     std::vector<std::string> only;
     bool quiet = false, verbose = false, noTrace = false, dumpIr = false, werror = false;
     bool bmcOnly = false;
@@ -381,6 +385,7 @@ struct Model {
     std::unordered_map<int, int> stateBitOfInput;   // AIG node -> stateBits index
     std::vector<std::pair<int, int>> stateRange;    // per signal: first state bit, or -1
     std::vector<std::string> inputName;             // per AIG input number
+    std::set<std::string> procLocals;               // variables declared inside a procedure (loop counters, temporaries)
     std::set<std::string> cutNotes;                 // what was cut, for the report
     std::vector<int> aliasOf;                       // signal -> the signal it is a plain copy of, or -1
     std::vector<Property> props;
@@ -1568,6 +1573,37 @@ struct Model {
         props.push_back(std::move(pr));
     }
 
+    // -app toggle (unreachable coverage): two covers per signal bit, "is 0" and
+    // "is 1" in some cycle after the reset. An unreachable one is a bit that is
+    // stuck, so toggle coverage on it can never close in simulation.
+    void addToggleTargets() {
+        std::set<int> skip;
+        for (auto& [n, sg] : topInputs) skip.insert(canon(sg));
+        if (clockSig >= 0) skip.insert(clockSig);
+        std::set<int> seen;
+        for (size_t s = 0; s < sigs.size(); s++) {
+            const std::string& n = sigs[s].name;
+            if (n.empty() || n[0] == '$' || n.find('$') != std::string::npos) continue;
+            int c = canon((int)s);
+            if (skip.count(c) || procLocals.count(n) || !seen.insert(c).second) continue;
+            if (sigs[s].w > opt.toggleMax) {
+                if (!opt.quiet) std::cerr << "mformal: -app toggle: " << n << " is wider than " << opt.toggleMax << " bits, not checked (-toggle-max)\n";
+                continue;
+            }
+            SV v;
+            try { v = cur((int)s); } catch (const Unsupported&) { continue; }
+            for (int b = 0; b < v.w(); b++)
+                for (int val = 0; val < 2; val++) {
+                    Property pr;
+                    pr.name = (top.empty() ? "" : top + ".") + n + (v.w() > 1 ? "[" + std::to_string(b) + "]" : "") + (val ? "==1" : "==0");
+                    pr.dir = AD_COVER;
+                    pr.app = true;
+                    pr.bad = g.And(startLit, v.b[(size_t)b] ^ (val ? 0 : 1));
+                    props.push_back(std::move(pr));
+                }
+        }
+    }
+
     void build() {
         curMemo.assign(sigs.size(), std::nullopt);
         isState.assign(sigs.size(), 0);
@@ -1615,6 +1651,7 @@ struct Model {
             if (sigs[s].name.empty() || sigs[s].name[0] == '$') continue;
             try { cur((int)s); } catch (const Unsupported&) {}
         }
+        if (opt.appToggle) addToggleTargets();
         closeStates();
         std::sort(props.begin(), props.end(), [](const Property& a, const Property& b) { return a.name < b.name; });
     }
@@ -2433,6 +2470,9 @@ void usage() {
                  "  -o DIR            where the traces go (default mformal_out); -no-trace: write none\n"
                  "  -tb               next to each trace, a testbench that replays it in msim (<property>_tb.sv)\n"
                  "  -json FILE        the results as JSON\n"
+                 "  -app toggle       unreachable coverage: report every signal bit that can never be 0\n"
+                 "                    or never be 1 after the reset (-toggle-max N: skip wider signals;\n"
+                 "                    -toggle-deep: the whole -depth and PDR budget per target)\n"
                  "  -aiger FILE       write the model as AIGER 1.9 (.aig binary, else ASCII) for another\n"
                  "                    model checker, and stop without checking\n"
                  "  -Werror           exit non-zero also for unreachable covers and inconclusive results\n"
@@ -2483,6 +2523,14 @@ int main(int argc, char** argv) {
         if (a == "-no-trace") { opt.noTrace = true; continue; }
         if (a == "-tb") { opt.tb = true; continue; }
         if (a == "-json") { opt.json = next("a file name"); continue; }
+        if (a == "-app") {
+            std::string app = next("an app name");
+            if (app == "toggle") opt.appToggle = true;
+            else { std::cerr << "mformal: unknown app '" << app << "' (apps: toggle)\n"; return 2; }
+            continue;
+        }
+        if (a == "-toggle-deep") { opt.toggleDeep = true; continue; }
+        if (a == "-toggle-max") { opt.toggleMax = std::atoi(next("a number").c_str()); continue; }
         if (a == "-aiger") { opt.aiger = next("a file name"); continue; }
         if (a == "-Werror") { opt.werror = true; continue; }
         if (a == "-quiet" || a == "-q") { opt.quiet = true; continue; }
@@ -2531,6 +2579,25 @@ int main(int argc, char** argv) {
                 int sg = m.findSig(std::string(port.name));
                 if (sg >= 0) m.topInputs.push_back({std::string(port.name), sg});
             }
+        }
+        if (opt.appToggle && comp->getRoot().topInstances.size() == 1) {
+            // Loop counters and other variables local to a procedure are not coverage targets.
+            std::string topPath = std::string(comp->getRoot().topInstances[0]->name) + ".";
+            comp->getRoot().visit(slang::ast::makeVisitor([&](auto& v, const slang::ast::VariableSymbol& var) {
+                const slang::ast::Scope* sc = var.getParentScope();
+                bool local = false;
+                while (sc) {
+                    auto k = sc->asSymbol().kind;
+                    if (k != slang::ast::SymbolKind::StatementBlock && k != slang::ast::SymbolKind::Subroutine) break;
+                    local = true;
+                    sc = sc->asSymbol().getParentScope();
+                }
+                if (local && sc) {
+                    std::string path = sc->asSymbol().getHierarchicalPath() + "." + std::string(var.name);
+                    if (path.compare(0, topPath.size(), topPath) == 0) m.procLocals.insert(path.substr(topPath.size()));
+                }
+                v.visitDefault(var);
+            }));
         }
         m.build();
         addLiveness(m);
@@ -2595,7 +2662,7 @@ int main(int argc, char** argv) {
         for (size_t i : todo) {
             const Result& r = results[i];
             if ((r.v == V_PROVEN || r.v == V_UNREACHABLE || safetyOnly[i]) && m.props[i].bad != 0) lemmas.push_back(m.props[i].bad);
-            if (r.v == V_BOUNDED && !safetyOnly[i]) open.push_back(i);
+            if (r.v == V_BOUNDED && !safetyOnly[i] && !(deep && m.props[i].app && !opt.toggleDeep)) open.push_back(i);
         }
         if (opt.bmcOnly || open.empty() || lemmas.size() == had) break;
         had = lemmas.size();
@@ -2617,7 +2684,7 @@ int main(int argc, char** argv) {
         for (size_t i : todo) {
             const Result& r = results[i];
             if ((r.v == V_PROVEN || r.v == V_UNREACHABLE || safetyOnly[i]) && m.props[i].bad != 0) lemmas.push_back(m.props[i].bad);
-            if (r.v == V_BOUNDED && !safetyOnly[i]) open.push_back(i);
+            if (r.v == V_BOUNDED && !safetyOnly[i] && !(deep && m.props[i].app && !opt.toggleDeep)) open.push_back(i);
         }
         std::vector<Result> again(open.size());
         parallel(open.size(), [&](size_t j) {
@@ -2673,6 +2740,7 @@ int main(int argc, char** argv) {
         for (size_t i : todo) {
             Result& r = results[i];
             if (r.v != V_FALSIFIED && r.v != V_COVERED) continue;
+            if (m.props[i].app) continue;   // a reachable coverage target needs no trace
             if (!made) {
                 std::error_code ec;
                 std::filesystem::create_directories(opt.outDir, ec);
@@ -2691,7 +2759,7 @@ int main(int argc, char** argv) {
 
     // report
     static const char* vname[] = {"proven", "falsified", "covered", "unreachable", "bounded", "inconclusive", "skipped", "assumed"};
-    int count[8] = {};
+    int count[8] = {}, appCount[8] = {};
     size_t nameW = 8;
     for (size_t i : todo) nameW = std::max(nameW, m.props[i].name.size());
     if (!opt.quiet) {
@@ -2705,8 +2773,13 @@ int main(int argc, char** argv) {
     for (size_t i : todo) {
         const Property& p = m.props[i];
         const Result& r = results[i];
-        count[r.v]++;
-        const char* kind = p.dir == AD_COVER ? "cover " : p.dir == AD_ASSUME ? "assume" : "assert";
+        if (p.app) {
+            appCount[r.v]++;
+            if (r.v == V_COVERED && !opt.verbose) continue;
+        } else {
+            count[r.v]++;
+        }
+        const char* kind = p.app ? "toggle" : p.dir == AD_COVER ? "cover " : p.dir == AD_ASSUME ? "assume" : "assert";
         std::cout << "  " << kind << "  " << p.name << std::string(nameW - p.name.size() + 2, ' ') << vname[r.v];
         switch (r.v) {
             case V_PROVEN: case V_UNREACHABLE:
@@ -2733,7 +2806,17 @@ int main(int argc, char** argv) {
     }
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (!opt.quiet) {
-        std::cout << "mformal: " << todo.size() << (todo.size() == 1 ? " property: " : " properties: ");
+        int nApp = 0;
+        for (int v = 0; v < 8; v++) nApp += appCount[v];
+        if (nApp) {
+            int open = nApp - appCount[V_COVERED] - appCount[V_UNREACHABLE];
+            std::cout << "mformal: toggle: " << nApp << " targets on " << nApp / 2 << " signal bits: " << appCount[V_COVERED] << " reachable, "
+                      << appCount[V_UNREACHABLE] << " unreachable";
+            if (open) std::cout << ", " << open << " not decided";
+            std::cout << "\n";
+        }
+        size_t nProps = todo.size() - (size_t)nApp;
+        std::cout << "mformal: " << nProps << (nProps == 1 ? " property: " : " properties: ");
         bool first = true;
         for (int v = 0; v < 8; v++)
             if (count[v]) { std::cout << (first ? "" : ", ") << count[v] << " " << vname[v]; first = false; }
@@ -2751,7 +2834,7 @@ int main(int argc, char** argv) {
         for (size_t k = 0; k < todo.size(); k++) {
             const Property& p = m.props[todo[k]];
             const Result& r = results[todo[k]];
-            js << "    {\"name\": " << jsonStr(p.name) << ", \"kind\": " << jsonStr(p.dir == AD_COVER ? "cover" : p.dir == AD_ASSUME ? "assume" : "assert")
+            js << "    {\"name\": " << jsonStr(p.name) << ", \"kind\": " << jsonStr(p.app ? "toggle" : p.dir == AD_COVER ? "cover" : p.dir == AD_ASSUME ? "assume" : "assert")
                << ", \"result\": " << jsonStr(vname[r.v]);
             if (r.depth >= 0) js << ", \"cycle\": " << r.depth;
             if (r.v == V_BOUNDED || r.v == V_INCONCLUSIVE) js << ", \"bound\": " << r.bound;
@@ -2765,6 +2848,6 @@ int main(int argc, char** argv) {
         js << "]\n}\n";
     }
     if (count[V_FALSIFIED]) return 1;
-    if (opt.werror && (count[V_UNREACHABLE] || count[V_INCONCLUSIVE] || count[V_SKIPPED])) return 1;
+    if (opt.werror && (count[V_UNREACHABLE] || count[V_INCONCLUSIVE] || count[V_SKIPPED] || appCount[V_UNREACHABLE])) return 1;
     return 0;
 }

@@ -68,6 +68,8 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal -app toggle`: unreachable-coverage analysis. Reports every
+  signal bit that can never be 0 or never be 1 after the reset.
 - `mformal -aiger FILE` writes the model as AIGER 1.9 (bad-state
   properties for assertions and covers, invariant constraints for
   assumptions), so other model checkers can run on it or cross-check a

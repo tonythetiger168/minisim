@@ -130,6 +130,29 @@ inputs into the design, so the failure can be debugged in the simulator:
 msim rtl/*.sv mformal_out/top.u.a_push_counts_tb.sv -top mformal_replay
 ```
 
+## Apps
+
+`-app toggle` is unreachable-coverage analysis. For every bit of every
+signal of the design (not the top-level inputs or the clock) it asks two
+questions: can the bit be 0, and can it be 1, in some cycle after the reset?
+Only the targets that are proven unreachable are listed (`-v` lists all):
+
+```
+  toggle  top.u.dead==1     unreachable  (induction, k=8)
+  toggle  top.u.even[0]==1  unreachable  (induction, k=2)
+mformal: toggle: 30 targets on 15 signal bits: 27 reachable, 3 unreachable
+```
+
+Such a bit is stuck: toggle coverage on it can never close in simulation, so
+it is either dead logic or a coverage hole to waive. Assumptions apply, so a
+bit that only toggles outside the constraints is reported too. Signals wider
+than 4096 bits are skipped (`-toggle-max N`), and so are variables declared
+inside a procedure (loop counters). A target that is neither hit nor proven
+unreachable with a short budget is listed as bounded and counted as "not
+decided" (a bit of a wide counter, say); `-toggle-deep` spends the whole
+`-depth` and PDR budget on each of those. With `-Werror` an unreachable
+target makes the exit status 1.
+
 ## Other model checkers (AIGER)
 
 `mformal ... -aiger model.aig` writes the model and stops without checking
@@ -149,7 +172,7 @@ visits every reachable state and compares with mformal's verdicts.
 ## Exit status
 
 0: nothing falsified. 1: an assertion was falsified (with `-Werror`, also an
-unreachable cover, an inconclusive or a skipped property). 2: a usage or
+unreachable cover or toggle target, an inconclusive or a skipped property). 2: a usage or
 front-end error.
 
 ## Testing

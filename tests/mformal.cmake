@@ -164,3 +164,15 @@ expect(fair.sv
   "assert  fair.a_live1 +proven" "assert  fair.a_some +falsified .*liveness" "assert  fair.a_two +falsified .*liveness"
   "assert  fair.a_y +proven" "assert  fair.a_x +falsified .*liveness" "assert  fair.a_z +falsified .*liveness"
   "assert  fair.a_c +proven" "assert  fair.a_cc +falsified .*liveness")
+
+# -app toggle: the bits that are stuck, and nothing else is listed.
+run(toggle.sv 0 "-top;toggle;-app;toggle")
+expect(toggle.sv
+  "toggle  toggle.dead==1 +unreachable"
+  "toggle  toggle.even\\[0\\]==1 +unreachable"
+  "toggle  toggle.tied==0 +unreachable"
+  "toggle: 30 targets on 15 signal bits: 27 reachable, 3 unreachable")
+if(out MATCHES "covered" OR EXISTS ${OUT}/toggle.sv)
+  message(FATAL_ERROR "toggle.sv: reachable targets must not be listed or traced\n${out}")
+endif()
+run(toggle.sv 1 "-top;toggle;-app;toggle;-Werror")
