@@ -79,6 +79,9 @@ release returns the value the object then has. `veriuser.h` declares
 type numbers, for C code written for other simulators. A DPI context import
 may call VPI (35.5.3), as UVM's HDL backdoor does (see `docs/UVM.md`).
 
+**Protected objects (37.3.6).** `vpiIsProtected`, and the access rules for
+objects in decryption envelopes: see "VPI and DPI" in `docs/PROTECT.md`.
+
 ## Not yet
 
 SystemVerilog-specific objects (classes, structs, interfaces, packages,

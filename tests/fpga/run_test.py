@@ -73,12 +73,12 @@ for fam in ("generic", "ice40", "ecp5", "xc7"):
             if want != got:
                 sys.exit("ice40: the netlist on the vendor's simulation models differs from the RTL")
     if yosys:
-        ys = ["read_verilog -sv " + rtl, "prep -top " + design, "design -stash gold"]
+        ys = ["read_verilog -sv " + rtl, "prep -top " + design, "memory_map", "design -stash gold"]
         if SIM[fam]:
             ys.append("read_verilog " + SIM[fam])
         if fam == "ecp5":   # a black box in Yosys 0.33's library
             ys.append("read_verilog " + os.path.join(src, "tests", "fpga", "cells_ecp5_dsp.v"))
-        ys += ["read_json %s.json" % base, "hierarchy -top " + design, "proc", "flatten", "design -stash gate",
+        ys += ["read_json %s.json" % base, "hierarchy -top " + design, "proc", "flatten", "memory", "design -stash gate",
                "design -copy-from gold -as gold " + design, "design -copy-from gate -as gate " + design,
                "miter -equiv -flatten -make_outputs gold gate miter", "hierarchy -top miter", "flatten", "opt",
                # an asynchronous reset becomes a synchronous one for the bounded check
