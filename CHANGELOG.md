@@ -240,6 +240,15 @@ Spec references are IEEE 1800-2023 clauses.
   constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
   ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
   See `docs/SYNTH.md`.
+- `msynth`: a register's hold condition is gathered out of its if/case
+  tree into one enable, and the held leaves leave the data logic
+  (`set msynth_hold_enables false` skips it). PicoRV32 on mini45: 18096 to
+  17534, with high effort 17577 to 17166.
+- `msynth` high effort (`compile -map_effort high`, `compile_ultra`):
+  the logic is restructured by ABC, run as a separate program (`abc`,
+  `berkeley-abc` or `yosys-abc` on `PATH`, or `$MSYNTH_ABC`), and the
+  smaller of the two mapped results is kept. Without constraints the
+  smallest netlist now stands (high effort used to pick the faster one).
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
@@ -310,6 +319,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: a block of plain assignments and branches gets a clean copy
+  that runs while every condition is known and hands over to the merging
+  copy at the first unknown one. Ibex with `-xprop`: 36 s to 28 s in the
+  interpreter (24.5 s without).
 - `-xprop` is faster: an `if` evaluates its condition once, and clocked
   blocks with merged branches run in parallel again. Ibex with `-xprop`:
   42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
@@ -358,6 +371,12 @@ Spec references are IEEE 1800-2023 clauses.
   simulator reports stuck-at, transition, coupling and address-decoder
   coverage, and `-tb` writes a testbench of fault-injecting RAM models whose
   expected results come from that simulator. See `docs/DFT.md`.
+- `mpss`: address spaces (`addr_reg_pkg`). A model declares a
+  `transparent_addr_space_c<>` with regions, and actions and buffers claim
+  memory from it with `transparent_addr_claim_s<>`; claims that are alive at
+  the same time never overlap, so `examples/pss/dma.pss` now checks the
+  copied data. Also `constraint default`, and `x.f()` calls and region
+  variables in `exec init`.
 - `mpss`, portable stimulus: reads a model in the Accellera PSS language
   (components, actions, buffers, streams, resources and pools, constraints,
   activities with `parallel` / `schedule` / `select` / `repeat`, exec blocks
@@ -476,6 +495,10 @@ Spec references are IEEE 1800-2023 clauses.
 - `mdft -edt`: scan test compression. A ring-generator decompressor and an
   XOR compactor around the scan chains, and an encoder that solves test
   cubes into channel data over GF(2), in parallel and deterministically.
+  With the gate netlist it simulates each compressed pattern and writes the
+  expected output channels and a load / capture / compare testbench;
+  `-edt_xmask` adds compactor X masking (one chain per channel observed,
+  mask chosen per pattern) so unknown captures do not hide known ones.
 - `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
   on the gate netlist (port inputs at 0, scan cells observed), with the
   coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
