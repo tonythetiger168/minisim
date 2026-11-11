@@ -1,0 +1,9 @@
+raw file test: an RC step and its frequency response
+v1 in 0 dc 1 ac 1 pulse(0 1 0 1n 1n 1 2)
+r1 in out 1k
+c1 out 0 1u
+.op
+.tran 10u 2m
+.ac dec 5 10 10k
+.print ac vdb(out) vp(out)
+.end

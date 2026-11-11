@@ -65,10 +65,27 @@ struct Pattern {
             auto [r, c] = slots[s];
             if (r != c) { adj[r].insert(c); adj[c].insert(r); }
         }
-        std::set<std::pair<int, int>> heap;
-        for (int i = 0; i < n; i++) heap.insert({(int)adj[i].size(), i});
         order.clear();
         order.reserve(n);
+        // A row with a single entry (a voltage source to ground: v = E) fixes
+        // its unknown outright. Those columns go first: the pivot makes no
+        // fill, and a supply node is out of the way before the rest is
+        // ordered. Left for later, the supply column collects the product of
+        // the gains of a long chain of stages and its own equation, a plain
+        // 1, is no longer an acceptable pivot.
+        std::vector<char> first(n, 0);
+        for (int r = 0; r < n; r++)
+            if (rowStart[r + 1] - rowStart[r] == 1) {
+                int c = rowEnt[rowStart[r]].second;
+                if (first[c]) continue;
+                first[c] = 1;
+                order.push_back(c);
+                for (int u : adj[c]) adj[u].erase(c);
+                adj[c].clear();
+            }
+        std::set<std::pair<int, int>> heap;
+        for (int i = 0; i < n; i++)
+            if (!first[i]) heap.insert({(int)adj[i].size(), i});
         while (!heap.empty()) {
             int v = heap.begin()->second;
             heap.erase(heap.begin());
@@ -265,6 +282,23 @@ struct SparseLU {
             y[i] = s * dinv[i];
         }
         for (int i = 0; i < n; i++) x[colOf[i]] = y[i];
+    }
+
+    // The transposed system (plain transpose, also for complex numbers):
+    // b by unknown, x by row. This is the adjoint circuit, which gives the
+    // transfer from every place in the circuit to one output in one solve.
+    void solveT(const T* b, T* x) {
+        for (int i = 0; i < n; i++) w[i] = b[colOf[i]];
+        for (int i = 0; i < n; i++) {
+            T t = w[i] * dinv[i];
+            y[i] = t;
+            for (int e = up[i] + 1; e < up[i + 1]; e++) w[ui[e]] -= ux[e] * t;
+        }
+        for (int i = n - 1; i >= 0; i--) {
+            T t = y[i];
+            for (int e = lp[i]; e < lp[i + 1]; e++) y[li[e]] -= lx[e] * t;
+            x[prow[i]] = t;
+        }
     }
 };
 
