@@ -390,6 +390,8 @@ struct Model {
     std::vector<std::pair<int, int>> stateRange;    // per signal: first state bit, or -1
     std::vector<std::string> inputName;             // per AIG input number
     std::vector<std::string> boxes;                 // -blackbox: instance paths below the top ("u.sub")
+    std::map<int, int> trig;                        // a tracker's time stamp signal -> "the sequence matched in this tick"
+    std::map<int, std::string> trigWhy;             // ... or why the tracker is not modelled
     std::set<int> cutSigs;                          // -cut: signals that are free in every cycle
     std::set<std::string> procLocals;               // variables declared inside a procedure (loop counters, temporaries)
     std::set<std::string> cutNotes;                 // what was cut, for the report
@@ -500,6 +502,11 @@ struct Model {
             case Op::Eq: return o.bit(o.eq(k(0), k(1)));
             case Op::Ne: return o.bit(o.eq(k(0), k(1)) ^ 1);
             case Op::CaseEq: {
+                // s.triggered: "the tracker's time stamp is now" (see seqEndPoint in lower_assert.inc)
+                if (e->kids[0]->op == Op::Ref && e->kids[1]->op == Op::Add && e->kids[1]->kids[0]->op == Op::Time) {
+                    if (auto it = trig.find(e->kids[0]->sig); it != trig.end()) return o.bit(it->second);
+                    if (auto it = trigWhy.find(e->kids[0]->sig); it != trigWhy.end()) unsup("a sequence end point: " + it->second);
+                }
                 SV a = k(0), b = k(1);
                 a.sgn = b.sgn = false;
                 return o.bit(o.eq(a, b));
@@ -1300,32 +1307,132 @@ struct Model {
     }
     void buildMonitor(ConcAssert& c) {
         AssertInfo& a = asserts()[(size_t)c.id];
-        if (a.hidden) return;
+        // A hidden one is the end point tracker of a sequence (16.13.6): its
+        // match in the current tick is what s.triggered reads.
+        bool tracker = a.hidden && c.endSig >= 0;
+        if (a.hidden && !tracker) return;
         Property pr;
         pr.name = a.name;
         pr.dir = a.dir;
         try {
+            if (tracker && (!c.localSig.empty() || !c.acts.empty())) unsup("a sequence with local variables");
             if (c.procedural) unsup("a concurrent assertion in a procedure");
             if (c.expect) unsup("an expect statement");
             if (!c.more.empty()) unsup("a multiclock assertion");
-            if (!c.localSig.empty() || !c.acts.empty()) unsup("local variables or match items");
-            if (!c.matchFlags.empty() || !c.clearFlags.empty() || c.endSig >= 0) unsup("a sequence end point (.triggered, .matched)");
+            if (!c.matchFlags.empty() || !c.clearFlags.empty()) unsup("a sequence end point read with .matched");
             if (!onClock(c.ev)) unsup("a clock other than posedge " + (clockSig >= 0 ? sigs[(size_t)clockSig].name : std::string("?")));
-            Reader rd = [this](int r) { return cur(r); };
+            // Local variables (16.10). A variable that is assigned once is
+            // replaced by a rigid unknown X (state bits that never change, free
+            // at the start): "(a, x = d) |-> p(x)" becomes "a && d == X |-> p(X)",
+            // which holds for every X exactly when the original holds. An
+            // assertion is proven for every X; a cover asks for some X.
+            std::vector<SV> rigid;
+            for (size_t k = 0; k < c.localSig.size(); k++) {
+                SV v;
+                int w = sigs[(size_t)c.localSig[k]].w;
+                newInputs(w, v.b, pr.name + "$local" + std::to_string(k), 1);
+                for (int b : v.b) {
+                    StateBit sb;
+                    sb.in = b;
+                    sb.next = b;
+                    sb.aux = true;
+                    stateBitOfInput[b >> 1] = (int)stateBits.size();
+                    stateBits.push_back(sb);
+                }
+                rigid.push_back(v);
+            }
+            Reader rd = [&](int r) {
+                for (size_t k = 0; k < c.localSig.size(); k++)
+                    if (c.localSig[k] == r) return rigid[k];
+                return cur(r);
+            };
             std::vector<int> atom;
             for (auto& e : c.atoms) atom.push_back(truthOf(ev(e, rd)));
+            const sva::Node* root = c.root;
+            if (!c.localSig.empty() || !c.acts.empty()) {
+                if (a.dir == AD_ASSUME) unsup("local variables in an assumption");
+                auto& st = sva::store();
+                std::vector<int> assigned(c.localSig.size(), 0);
+                // the items of acts[act] as one condition: every assigned variable's X equals its value now
+                auto condOf = [&](int act) {
+                    int cnd = 1;
+                    for (auto& item : c.acts[(size_t)act]) {
+                        if (item.k < 0) unsup("a subroutine call in a match item");
+                        if (assigned[(size_t)item.k]++) unsup("a local variable that is assigned more than once");
+                        SV v = ev(item.rhs, rd);
+                        SV x = rigid[(size_t)item.k];
+                        v = o.ext(v, x.w(), v.sgn);
+                        v.b.resize((size_t)x.w(), 0);
+                        cnd = g.And(cnd, o.eq(v, x));
+                    }
+                    atom.push_back(cnd);
+                    return (int)atom.size() - 1;
+                };
+                // where a term is: U a property that must hold in every attempt (an assertion's top level),
+                // A the antecedent sequence of an implication there, C a cover's top level, E a cover's
+                // sequence, X anywhere else (under or, not, eventually, until: an X per attempt would be needed)
+                enum Ctx { CU, CA, CC, CE, CX };
+                const char* where = "a local variable assigned outside the antecedent of an implication (or, in a cover, outside its sequence)";
+                std::function<const sva::Node*(const sva::Node*, Ctx, bool)> rw = [&](const sva::Node* t, Ctx cx, bool inRep) -> const sva::Node* {
+                    if (!t->envDep) return t;
+                    if (t->k == sva::MATCH) {
+                        if (cx != CA && cx != CE) unsup(where);
+                        if (inRep) unsup("a local variable assigned inside a repetition");
+                        const sva::Node* kid = rw(t->kids[0], cx, inRep);
+                        int ca = condOf(t->lo);
+                        if (kid->k == sva::BOOL && !(kid->flags & sva::NEG)) {
+                            atom[(size_t)ca] = g.And(atom[(size_t)ca], atom[(size_t)kid->atom]);
+                            return st.boolean(ca);
+                        }
+                        return st.sand(kid, st.cat(st.star(), st.boolean(ca)));
+                    }
+                    if (t->k == sva::INIT) {
+                        const sva::Node* kid;
+                        if (t->kids[0]->prop) {
+                            if (cx != CU && cx != CC) unsup(where);
+                            int ca = condOf(t->lo);
+                            kid = rw(t->kids[0], cx, inRep);
+                            return st.pif(ca, kid, cx == CC ? st.pfalse() : nullptr);
+                        }
+                        if (cx != CA && cx != CE) unsup(where);
+                        if (inRep) unsup("a local variable assigned inside a repetition");
+                        if (t->kids[0]->nullable) unsup("a local variable initialized in a sequence that can be empty");
+                        int ca = condOf(t->lo);
+                        kid = rw(t->kids[0], cx, inRep);
+                        return st.sand(kid, st.cat(st.boolean(ca), st.star()));
+                    }
+                    if (t->k == sva::ENV) unsup("local variables");
+                    sva::Node n = *t;
+                    n.flags &= (uint8_t)~sva::LOCAL;
+                    for (size_t i = 0; i < n.kids.size(); i++) {
+                        Ctx kc = CX;
+                        bool kr = inRep;
+                        switch (t->k) {
+                            case sva::PAND: case sva::ALWAYS: case sva::NEXT: case sva::IF: case sva::ACCEPT: case sva::REJECT: kc = cx == CU ? CU : CX; break;
+                            case sva::IMPL: kc = cx == CU ? (i == 0 ? CA : CU) : CX; break;
+                            case sva::PSEQ: case sva::COVSEQ: kc = cx == CC ? CE : CX; break;
+                            case sva::CAT: case sva::FUSE: case sva::SOR: case sva::SAND: case sva::FM: kc = cx == CA || cx == CE ? cx : CX; break;
+                            case sva::REP: kc = cx == CA || cx == CE ? cx : CX; kr = true; break;
+                            default: kc = CX;
+                        }
+                        n.kids[i] = rw(t->kids[i], kc, kr);
+                    }
+                    return st.mk(n);
+                };
+                root = rw(c.root, a.dir == AD_COVER ? CC : CU, false);
+            }
             int tick = c.clkIff ? truthOf(ev(c.clkIff, rd)) : 1;
             int kill = c.disable ? truthOf(ev(c.disable, rd)) : 0;
 
             // The terms an attempt can become, with whether it is nonvacuous so far.
             struct MS { const sva::Node* t; bool nonvac; };
-            std::vector<MS> states{{c.root, false}};
-            std::map<std::pair<const sva::Node*, bool>, int> idx{{{c.root, false}, 0}};
+            std::vector<MS> states{{root, false}};
+            std::map<std::pair<const sva::Node*, bool>, int> idx{{{root, false}, 0}};
             // per state: the atoms it reads and, per valuation, where it goes
             // (-1 fail, -2 pass nonvacuously, -3 ends without a verdict that counts) and whether a cover sequence matched
             struct Tr { std::vector<int> atoms; std::vector<int> to; std::vector<char> hit; };
             std::vector<Tr> trs;
-            std::vector<char> val(c.atoms.size(), 0);
+            std::vector<char> val(atom.size(), 0);
             for (size_t si = 0; si < states.size(); si++) {
                 if (states.size() > 4000) unsup("a property with more than 4000 automaton states");
                 MS ms = states[si];
@@ -1593,6 +1700,11 @@ struct Model {
             }
         } catch (const Unsupported& u) {
             pr.skipped = u.what();
+        }
+        if (tracker) {
+            if (pr.skipped.empty()) trig[c.endSig + 1] = pr.bad;
+            else trigWhy[c.endSig + 1] = pr.skipped;
+            return;
         }
         props.push_back(std::move(pr));
     }

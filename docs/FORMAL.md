@@ -57,9 +57,21 @@ property, `accept_on` or `reject_on`. The assertion is then reported
 finite failure exists; such an assumption gives a warning and only its safety
 part is used.
 
-Reported as `skipped`, with the reason: local variables and match items,
-multiclock properties, `.triggered` / `.matched`, concurrent assertions inside
-procedures, `expect`.
+Local variables (16.10) are followed when each is assigned once: by its
+declaration's initializer, or by a match item in the antecedent of an
+implication at the top level of an assertion (`(req, x = d) |-> ##2 q == x`),
+or anywhere in the sequence of a cover. The variable becomes a rigid unknown
+(state bits that never change): the assertion is proven for every value, a
+cover asks for some value. Skipped, with the reason: a variable assigned
+twice or inside a repetition, a match item under `or`, `not`, `s_eventually`
+or `until`, a subroutine call in a match item, local variables in an
+assumption.
+
+`s.triggered` (16.13.6) is the sequence's match in the current tick; the
+sequence itself may not have local variables.
+
+Reported as `skipped`, with the reason: multiclock properties, `.matched`,
+concurrent assertions inside procedures, `expect`.
 
 ## The model
 

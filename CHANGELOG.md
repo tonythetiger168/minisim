@@ -68,6 +68,8 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal`: SVA local variables (assigned once, in an antecedent or a
+  cover's sequence) and `s.triggered` are checked instead of skipped.
 - `mformal -blackbox NAME` and `-cut SIGNAL`: leave a module or instance
   out of the model, or make a signal a free input.
 - `mformal -connect FILE`: connectivity checking. Each line

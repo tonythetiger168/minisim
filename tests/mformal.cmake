@@ -225,3 +225,30 @@ foreach(bad "-blackbox;nope" "-cut;nope")
     message(FATAL_ERROR "box.sv: ${bad} must be an error\n${rc}\n${err}")
   endif()
 endforeach()
+
+# SVA local variables: one rigid unknown per variable.
+run(local.sv 1 "-top;local_;-tb")
+expect(local.sv
+  "assert  local_.a_data +falsified  at cycle 2"
+  "assert  local_.a_data_ok +proven"
+  "assert  local_.a_init +proven"
+  "assert  local_.a_init_bad +falsified  at cycle 2"
+  "assert  local_.a_mid +proven"
+  "assert  local_.a_pos +skipped  a local variable assigned outside the antecedent"
+  "assert  local_.a_twice +skipped  a local variable that is assigned more than once"
+  "cover   local_.c_changed +covered  at cycle 2"
+  "cover   local_.c_never +unreachable")
+replay(local.sv local_.a_data 35)
+replay(local.sv local_.a_init_bad 35)
+
+# s.triggered: the end point tracker's match in the current tick.
+run(trig.sv 1 "-top;trig;-tb")
+expect(trig.sv
+  "assert  trig.a_bad +falsified  at cycle 2"
+  "assert  trig.a_idle +proven"
+  "assert  trig.a_seq +proven"
+  "assert  trig.a_seq_bad +falsified  at cycle 3"
+  "cover   trig.c_never +unreachable"
+  "cover   trig.c_two +covered  at cycle 4")
+replay(trig.sv trig.a_bad 35)
+replay(trig.sv trig.a_seq_bad 45)
