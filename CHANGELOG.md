@@ -582,6 +582,13 @@ Spec references are IEEE 1800-2023 clauses.
   automatic tasks called from several processes at once, and
   `fork automatic int j = i; ... join_none` with one copy per fork. This is
   the base for class methods (8).
+- `msta`: the hold check between clocks of different periods used a capture
+  edge that was too early and reported too much slack. It now takes the
+  tightest hold relation over the common period. Asynchronous set / reset to
+  output arcs are no longer timed as paths by default
+  (`-preset_clear_arcs` turns them on). Both were found by comparing with
+  OpenSTA, which now agrees at every endpoint of a million-cell design to
+  0.1 ps; see "Compared with OpenSTA" in `docs/STA.md` and `bench/sta/`.
 
 ### Changed
 - `mlint` prints each finding's severity (`error`, `warning` or `info`) and
