@@ -16,6 +16,11 @@ target_include_directories(msynth PRIVATE src)
 target_compile_definitions(msynth PRIVATE MSYNTH_ROOT_DIR="${CMAKE_SOURCE_DIR}")
 find_package(Threads REQUIRED)
 target_link_libraries(msynth PRIVATE slang::slang Threads::Threads)
+# Functional reduction (src/synth/fraig.hpp) uses the shared SAT solver.
+if(TARGET cadical)
+  target_link_libraries(msynth PRIVATE cadical)
+  target_compile_definitions(msynth PRIVATE MSYNTH_HAVE_SAT)
+endif()
 install(TARGETS msynth RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # The memory table of the shared front half (aig::Design::mems): a model built

@@ -28,6 +28,9 @@
 #include "gnetlist.hpp"
 #include "synth/map.hpp"
 #include "synth/sta.hpp"
+#ifdef MSYNTH_HAVE_SAT
+#include "synth/fraig.hpp"
+#endif
 #include "sdc.hpp"
 #include "tcl.hpp"
 #include "version.hpp"
@@ -271,6 +274,15 @@ struct Shell {
         size_t swept = 0;
         des = aig::sweep(std::move(*des), &swept);
         if (swept && !quiet) outf("Information: removed %zu unloaded or constant register bits.\n", swept);
+#ifdef MSYNTH_HAVE_SAT
+        if (var("msynth_fraig", "true") != "false") {
+            FraigStats fs;
+            des = fraig(*des, &fs);
+            if (fs.merged && !quiet)
+                outf("Information: merged %zu nodes that compute an earlier node's function (%zu refuted, %zu undecided).\n",
+                     fs.merged, fs.refuted, fs.undecided);
+        }
+#endif
         nl.reset();
         tim.reset();
         view.build(*des);

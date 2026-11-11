@@ -5,7 +5,7 @@
 
 <name>.sv is synthesized (top module <name>) onto the default library, or
 onto [lib], and mequiv must prove the netlist equivalent to the RTL. Then
-one gate of the netlist is swapped for another of the same pins, and mequiv
+a gate of the netlist is swapped for another of the same pins, and mequiv
 must report the difference: a proof that cannot fail proves nothing.
 """
 import os
@@ -40,15 +40,20 @@ rc, out = equiv(net)
 if rc != 0:
     sys.exit("FAIL: mequiv does not prove %s equivalent to its RTL\n%s" % (net, out))
 
-# Swap the first two-input gate for its dual (same pins): NAND <-> NOR.
+# Swap a two-input gate for its dual (same pins): NAND <-> NOR. One gate can
+# sit where its value never reaches an output, so up to eight are tried, one
+# at a time; mequiv must report at least one of them.
 text = open(net).read()
-swaps = [("NAND2_X1", "NOR2_X1"), ("NOR2_X1", "NAND2_X1"), ("ND2", "NR2")]
-for a, b in swaps:
-    m = re.search(r"^  %s " % re.escape(a), text, re.M)
-    if m:
-        open(bad, "w").write(text[:m.start()] + "  " + b + " " + text[m.end():])
-        rc, out = equiv(bad)
-        if rc == 0:
-            sys.exit("FAIL: mequiv proves a netlist with %s swapped for %s\n%s" % (a, b, out))
+sites = [(m.start(), m.end(), b) for a, b in [("NAND2_X1", "NOR2_X1"), ("NOR2_X1", "NAND2_X1"), ("ND2", "NR2")]
+         for m in re.finditer(r"^  %s " % re.escape(a), text, re.M)]
+sites.sort()
+found = False
+for start, end, b in sites[:8]:
+    open(bad, "w").write(text[:start] + "  " + b + " " + text[end:])
+    rc, out = equiv(bad)
+    if rc != 0:
+        found = True
         break
+if sites and not found:
+    sys.exit("FAIL: mequiv proves netlists with a gate swapped for its dual (%d tried)\n%s" % (min(8, len(sites)), out))
 print("PASS: %s" % tag)
