@@ -47,7 +47,7 @@ struct Shell {
     std::unique_ptr<sta::SdcDesign> design;
     std::unique_ptr<par::Pool> pool;
     sdc::Reader reader;
-    bool presetClearArcs = false, crpr = true, crprSameTransition = false;
+    bool presetClearArcs = false, crpr = true, crprSameTransition = false, gatingChecks = true;
     size_t seenCommands = 0, seenDiags = 0;
     int threads = 0;
     int errors = 0;
@@ -105,6 +105,7 @@ struct Shell {
         engine = std::make_unique<sta::Sta>();
         engine->presetClearArcs = presetClearArcs;
         engine->crprOn = crpr;
+        engine->gatingChecks = gatingChecks;
         engine->crprSameTransition = crprSameTransition;
         engine->phases.push_back({"read", readT});
         for (auto& l : libraries) engine->addLibrary(*l);
@@ -326,6 +327,26 @@ struct Shell {
             violations = n;
             return std::to_string(n);
         });
+        reader.addCommand("report_min_pulse_width", [this](const std::vector<std::string>& w) -> std::string {
+            Args a = args(w, {"-significant_digits", "-max_paths"}, {"-all_violators", "-verbose", "-nosplit"});
+            sta::Reporter r(timed());
+            int n = 0;
+            emit(a, [&](std::ostream& os) {
+                n = r.reportMinPulseWidth(a.has("-all_violators"), a.has("-verbose"), (size_t)std::atoi(a.get("-max_paths", "0").c_str()),
+                                          std::atoi(a.get("-significant_digits", "3").c_str()), os);
+            });
+            return std::to_string(n);
+        });
+        reader.addCommand("report_min_period", [this](const std::vector<std::string>& w) -> std::string {
+            Args a = args(w, {"-significant_digits", "-max_paths"}, {"-all_violators", "-verbose", "-nosplit"});
+            sta::Reporter r(timed());
+            int n = 0;
+            emit(a, [&](std::ostream& os) {
+                n = r.reportMinPeriod(a.has("-all_violators"), (size_t)std::atoi(a.get("-max_paths", "0").c_str()),
+                                      std::atoi(a.get("-significant_digits", "3").c_str()), os);
+            });
+            return std::to_string(n);
+        });
         reader.addCommand("report_clocks", [this](const std::vector<std::string>& w) -> std::string {
             Args a = args(w, {}, {});
             sta::Reporter r(timed());
@@ -418,6 +439,7 @@ void usage() {
         "  -threads N           worker threads (default: every logical core; 1: none)\n"
         "  -preset_clear_arcs   time paths through asynchronous set/reset to output arcs\n"
         "  -no_crpr             keep clock reconvergence pessimism (it is removed by default)\n"
+        "  -no_clock_gating_checks  do not infer clock gating setup and hold checks\n"
         "  -crpr_same_transition  remove it only for the same transition at the common pin\n"
         "  -fail_on_violation   exit 2 when a constraint is violated\n"
         "  -q                   no warnings from the constraint reader\n"
@@ -453,6 +475,7 @@ int main(int argc, char** argv) {
         else if (a == "-threads") sh.threads = std::atoi(val().c_str());
         else if (a == "-preset_clear_arcs") sh.presetClearArcs = true;
         else if (a == "-no_crpr") sh.crpr = false;
+        else if (a == "-no_clock_gating_checks") sh.gatingChecks = false;
         else if (a == "-crpr_same_transition") sh.crprSameTransition = true;
         else if (a == "-fail_on_violation") failOnViolation = true;
         else if (a == "-stats") stats = true;
@@ -492,7 +515,9 @@ int main(int argc, char** argv) {
         if (!json.empty()) sh.run("write_json " + tclWord(json) + " -max_paths " + std::to_string(std::max(maxPaths, 10)) + "\n", "<command line>");
         if (failOnViolation && sh.engine) {
             sta::Sta& s = sh.timed();
-            if (s.summary(true).violations || s.summary(false).violations || !s.transViol.empty() || !s.capViol.empty()) rc = 2;
+            if (s.summary(true).violations || s.summary(false).violations || !s.transViol.empty() || !s.capViol.empty() ||
+                (!s.pulses.empty() && s.pulses[0].slack < 0) || (!s.periods.empty() && s.periods[0].slack < 0))
+                rc = 2;
         }
     } catch (Shell::Quit&) {
         sh.flushDiags();

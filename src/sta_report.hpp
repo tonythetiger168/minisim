@@ -235,7 +235,8 @@ public:
         if (pe.clkNode >= 0) {
             add(point(pe.clkNode), 0, req, pe.clkRf == RISE ? 'r' : 'f');
             req += late ? -pe.lib : pe.lib;
-            add(std::string("library ") + kindLabel(pe.kind) + " time", late ? -pe.lib : pe.lib, req);
+            bool gate = pe.kind == EndKind::GateSetup || pe.kind == EndKind::GateHold;
+            add(std::string(gate ? "" : "library ") + kindLabel(pe.kind) + " time", late ? -pe.lib : pe.lib, req);
         } else {
             req -= pe.ext;
             add("output external delay", -pe.ext, req);
@@ -257,7 +258,11 @@ public:
         os << "  Endpoint: " << instOrPort(pe.node) << " ("
            << (pe.kind == EndKind::Recovery || pe.kind == EndKind::Removal
                    ? std::string(kindLabel(pe.kind)) + " check against " + (pe.clkRf == RISE ? "rising" : "falling") + "-edge clock " + Cc.name
-                   : describe(pe.node, pe.clkRf, pe.capClk, false))
+                   : pe.kind == EndKind::GateSetup || pe.kind == EndKind::GateHold
+                         ? std::string(pe.kind == EndKind::GateSetup ? (pe.clkRf == RISE ? "rising" : "falling")
+                                                                     : (pe.clkRf == RISE ? "falling" : "rising")) +
+                               " clock gating-check end-point clocked by " + Cc.name
+                         : describe(pe.node, pe.clkRf, pe.capClk, false))
            << ")\n";
         os << "  Path Group: " << groupOf(pe) << "\n";
         os << "  Path Type: " << (late ? "max" : "min") << "\n\n";
@@ -346,8 +351,127 @@ public:
         };
         drc("max_transition", s.transViol, false);
         drc("max_capacitance", s.capViol, true);
+        // Minimum pulse width and period: the violations.
+        size_t np = 0, nper = 0;
+        while (np < s.pulses.size() && s.pulses[np].slack < 0) np++;
+        while (nper < s.periods.size() && s.periods[nper].slack < 0) nper++;
+        viol += (int)(np + nper);
+        if (np) {
+            os << "  min_pulse_width: " << np << " violation" << (np == 1 ? "" : "s") << "\n";
+            if (allViolators) {
+                os << "\n";
+                pulseTable(np, digits, os);
+            } else {
+                const PulseCheck& pc = s.pulses[0];
+                os << "    worst: " << s.name(pc.node) << " (" << (pc.high ? "high" : "low") << ")  required "
+                   << t(pc.required, digits) << "  actual " << t(pc.actual, digits) << "\n\n";
+            }
+        }
+        if (nper) {
+            os << "  min_period: " << nper << " violation" << (nper == 1 ? "" : "s") << "\n";
+            if (allViolators) {
+                os << "\n";
+                periodTable(nper, digits, os);
+            } else {
+                const PeriodCheck& pc = s.periods[0];
+                os << "    worst: " << s.name(pc.node) << "  required " << t(pc.required, digits) << "  period "
+                   << t(pc.period, digits) << "\n\n";
+            }
+        }
         if (!viol) os << "  All constraints are met.\n";
         return viol;
+    }
+
+    void pulseTable(size_t count, int digits, std::ostream& os) {
+        size_t w = 8;
+        for (size_t i = 0; i < count; i++) w = std::max(w, s.name(s.pulses[i].node).size() + 7);
+        os << "  " << std::left << std::setw((int)w + 2) << "Pin" << std::right << std::setw(12) << "Required"
+           << std::setw(12) << "Actual" << std::setw(12) << "Slack" << "\n";
+        os << "  " << std::string(w + 38, '-') << "\n";
+        for (size_t i = 0; i < count; i++) {
+            const PulseCheck& pc = s.pulses[i];
+            os << "  " << std::left << std::setw((int)w + 2) << (s.name(pc.node) + (pc.high ? " (high)" : " (low)"))
+               << std::right << std::setw(12) << t(pc.required, digits) << std::setw(12) << t(pc.actual, digits)
+               << std::setw(12) << t(pc.slack, digits) << (pc.slack < 0 ? "  (VIOLATED)" : "") << "\n";
+        }
+        os << "\n";
+    }
+
+    void periodTable(size_t count, int digits, std::ostream& os) {
+        size_t w = 8;
+        for (size_t i = 0; i < count; i++) w = std::max(w, s.name(s.periods[i].node).size());
+        os << "  " << std::left << std::setw((int)w + 2) << "Pin" << std::right << std::setw(12) << "Required"
+           << std::setw(12) << "Period" << std::setw(12) << "Slack" << "\n";
+        os << "  " << std::string(w + 38, '-') << "\n";
+        for (size_t i = 0; i < count; i++) {
+            const PeriodCheck& pc = s.periods[i];
+            os << "  " << std::left << std::setw((int)w + 2) << s.name(pc.node) << std::right << std::setw(12)
+               << t(pc.required, digits) << std::setw(12) << t(pc.period, digits) << std::setw(12)
+               << t(pc.slack, digits) << (pc.slack < 0 ? "  (VIOLATED)" : "") << "\n";
+        }
+        os << "\n";
+    }
+
+    // report_min_pulse_width: the worst `count` checks (0: all, or the
+    // violations only); verbose shows how each width is made up.
+    int reportMinPulseWidth(bool violators, bool verbose, size_t count, int digits, std::ostream& os) {
+        s.update();
+        size_t n = s.pulses.size();
+        if (violators) {
+            n = 0;
+            while (n < s.pulses.size() && s.pulses[n].slack < 0) n++;
+        }
+        if (count && count < n) n = count;
+        if (!n) {
+            os << (violators ? "  No min_pulse_width violations.\n" : "  No min_pulse_width checks.\n");
+            return 0;
+        }
+        if (!verbose) {
+            pulseTable(n, digits, os);
+            return (int)n;
+        }
+        int nw = 8 + digits;
+        for (size_t i = 0; i < n; i++) {
+            const PulseCheck& pc = s.pulses[i];
+            const Clock& c = s.clocks[pc.clk];
+            auto line = [&](const std::string& text, double incr, double path, bool hasIncr = true) {
+                os << "  " << std::left << std::setw(40) << text << std::right << std::setw(nw)
+                   << (hasIncr ? t(incr, digits) : std::string()) << std::setw(nw) << t(path, digits) << "\n";
+            };
+            const char* net = c.propagated ? "clock network delay (propagated)" : "clock network delay (ideal)";
+            os << "  Pin: " << s.name(pc.node) << "\n  Check: min_pulse_width (" << (pc.high ? "high" : "low") << ")\n\n";
+            line("clock " + c.name + " (" + (pc.openEdge == RISE ? "rise" : "fall") + " edge)", pc.openT, pc.openT);
+            line(net, pc.openArr, pc.openT + pc.openArr);
+            line("open edge arrival time", 0, pc.openT + pc.openArr, false);
+            os << "\n";
+            line("clock " + c.name + " (" + (pc.closeEdge == RISE ? "rise" : "fall") + " edge)", pc.closeT, pc.closeT);
+            line(net, pc.closeArr, pc.closeT + pc.closeArr);
+            if (pc.crpr != 0) line("clock reconvergence pessimism", pc.crpr, pc.closeT + pc.closeArr + pc.crpr);
+            line("close edge arrival time", 0, pc.closeT + pc.closeArr + pc.crpr, false);
+            os << "  " << std::string(40 + 2 * nw, '-') << "\n";
+            line("required pulse width", 0, pc.required, false);
+            line("actual pulse width", 0, pc.actual, false);
+            os << "  " << std::string(40 + 2 * nw, '-') << "\n";
+            line(pc.slack < 0 ? "slack (VIOLATED)" : "slack (MET)", 0, pc.slack, false);
+            os << "\n\n";
+        }
+        return (int)n;
+    }
+
+    int reportMinPeriod(bool violators, size_t count, int digits, std::ostream& os) {
+        s.update();
+        size_t n = s.periods.size();
+        if (violators) {
+            n = 0;
+            while (n < s.periods.size() && s.periods[n].slack < 0) n++;
+        }
+        if (count && count < n) n = count;
+        if (!n) {
+            os << (violators ? "  No min_period violations.\n" : "  No min_period checks.\n");
+            return 0;
+        }
+        periodTable(n, digits, os);
+        return (int)n;
     }
 
     // Returns the number of problems found.
@@ -583,7 +707,11 @@ public:
                 first = false;
             }
         }
-        os << "\n  ],\n  \"max_transition_violations\": " << s.transViol.size() << ",\n  \"max_capacitance_violations\": "
+        os << "\n  ],\n  \"min_pulse_width_violations\": "
+           << std::count_if(s.pulses.begin(), s.pulses.end(), [](const PulseCheck& p) { return p.slack < 0; })
+           << ",\n  \"min_period_violations\": "
+           << std::count_if(s.periods.begin(), s.periods.end(), [](const PeriodCheck& p) { return p.slack < 0; })
+           << ",\n  \"max_transition_violations\": " << s.transViol.size() << ",\n  \"max_capacitance_violations\": "
            << s.capViol.size() << "\n}\n";
     }
 };

@@ -509,6 +509,12 @@ Spec references are IEEE 1800-2023 clauses.
   cell check, rise / fall), and exact clock reconvergence pessimism removal,
   reported as its own line (`-no_crpr`, `-crpr_same_transition`). Checked
   against OpenSTA at every endpoint of a 200,000 cell design.
+- `msta`: clock gating setup and hold checks, inferred from the cell
+  functions (`set_clock_gating_check`, `-no_clock_gating_checks`); minimum
+  pulse width and minimum period checks from the library and
+  `set_min_pulse_width` (`report_min_pulse_width`, `report_min_period`).
+  The Liberty reader keeps `min_pulse_width_high`, `min_pulse_width_low` and
+  `min_period` of a pin.
 
 ### Fixed
 - An inout port connected to a whole net is now that net (23.3.3.1). It was

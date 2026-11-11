@@ -159,6 +159,14 @@ struct CellInfo {
     };
     std::vector<Group> groups;
     std::vector<Chk> checks;
+    // Pins with a minimum pulse width or period: attributes of the pin and
+    // timing groups of type min_pulse_width / minimum_period.
+    struct Width {
+        int pin;
+        const liberty::Arc* pulse = nullptr;
+        const liberty::Arc* period = nullptr;
+    };
+    std::vector<Width> widths;
     std::unordered_map<std::string, int> pinIdx;
     bool latch = false;
     // The function of each output pin with one, for constant propagation.
@@ -212,8 +220,10 @@ struct Clock {
     int master = -1;
 };
 
-enum class EndKind { Setup, Hold, Recovery, Removal, OutSetup, OutHold };
-inline bool isLate(EndKind k) { return k == EndKind::Setup || k == EndKind::Recovery || k == EndKind::OutSetup; }
+enum class EndKind { Setup, Hold, Recovery, Removal, OutSetup, OutHold, GateSetup, GateHold };
+inline bool isLate(EndKind k) {
+    return k == EndKind::Setup || k == EndKind::Recovery || k == EndKind::OutSetup || k == EndKind::GateSetup;
+}
 inline const char* kindLabel(EndKind k) {
     switch (k) {
         case EndKind::Setup: return "setup";
@@ -222,6 +232,8 @@ inline const char* kindLabel(EndKind k) {
         case EndKind::Removal: return "removal";
         case EndKind::OutSetup: return "output setup";
         case EndKind::OutHold: return "output hold";
+        case EndKind::GateSetup: return "clock gating setup";
+        case EndKind::GateHold: return "clock gating hold";
     }
     return "";
 }
@@ -250,6 +262,22 @@ struct PathEnd {
 struct Violation {
     int node;
     double limit, actual, slack;
+};
+
+// A minimum pulse width check at a clock pin: the pulse opens with the late
+// arrival of one clock edge and closes with the early arrival of the other.
+struct PulseCheck {
+    int node = -1, clk = -1;
+    bool high = true;
+    int openEdge = RISE, closeEdge = FALL;  // the clock edges at the source
+    double openT = 0, closeT = 0;           // their times
+    double openArr = 0, closeArr = 0;       // clock network delays
+    double crpr = 0, required = 0, actual = 0, slack = 0;
+};
+
+struct PeriodCheck {
+    int node = -1, clk = -1;
+    double required = 0, period = 0, slack = 0;
 };
 
 struct Exc {
@@ -387,6 +415,22 @@ public:
     std::vector<int> noInputDelay;   // input ports without set_input_delay
     std::vector<int> loopNodes;
     std::vector<Violation> transViol, capViol;
+    std::vector<PulseCheck> pulses;   // worst first
+    std::vector<PeriodCheck> periods; // worst first
+    // set_min_pulse_width: [high, low]; -1: not set. On the design (the
+    // clock pins of registers), on clocks and on pins.
+    double minPulse[2] = {-1, -1};
+    std::unordered_map<int, std::array<double, 2>> minPulseClk, minPulseAt;
+    // set_clock_gating_check. A gating check is inferred where a clock and
+    // a signal that is not one meet at a combinational cell on the way to a
+    // register's clock pin. kind: 0 from the cell's function, 1 -high, 2 -low.
+    struct GateSpec {
+        double setup = 0, hold = 0;
+        int kind = 0;
+    };
+    GateSpec gateAll;
+    std::unordered_map<int, GateSpec> gateClk, gateInst;
+    bool gatingChecks = true;
     std::vector<Warning> warnings;
     bool timed = false;
     // Time paths through asynchronous set/reset to output arcs (Liberty
@@ -466,6 +510,8 @@ public:
                     for (auto& v : liberty::parseFunction(l.dataIn).vars()) latchData.insert(v);
                 } catch (liberty::Error&) {
                 }
+        for (size_t i = 0; i < c->pins.size(); i++)
+            if (c->pins[i].minPulseHigh > 0 || c->pins[i].minPulseLow > 0 || c->pins[i].minPeriod > 0) ci.widths.push_back({(int)i});
         std::map<std::tuple<int, int, bool>, int> gidx;
         for (auto& a : c->arcs) {
             auto f = ci.pinIdx.find(a.related), t = ci.pinIdx.find(a.to);
@@ -474,7 +520,18 @@ public:
                 ci.checks.push_back({t->second, f->second, &a});
                 continue;
             }
-            if (a.type == liberty::ArcType::Other) continue;
+            if (a.type == liberty::ArcType::Other) {
+                if (f->second == t->second && (a.typeName == "min_pulse_width" || a.typeName == "minimum_period")) {
+                    CellInfo::Width* w = nullptr;
+                    for (auto& x : ci.widths) if (x.pin == t->second) w = &x;
+                    if (!w) {
+                        ci.widths.push_back({t->second});
+                        w = &ci.widths.back();
+                    }
+                    (a.typeName == "min_pulse_width" ? w->pulse : w->period) = &a;
+                }
+                continue;
+            }
             // A latch's D to Q arc is not a path: the latch is timed at its clock.
             if (ci.latch && !a.isEdge() && latchData.count(a.related)) continue;
             auto key = std::make_tuple(f->second, t->second, a.isEdge());
@@ -831,6 +888,12 @@ public:
         std::fill(netWireCap.begin(), netWireCap.end(), 0.0);
         std::fill(portLoad.begin(), portLoad.end(), 0.0);
         for (auto& n : nodes) n.clockSrc = n.genSrc = n.idealClk = n.hasThrough = n.hasLaunch = n.hasSeed = false;
+        minPulse[0] = minPulse[1] = -1;
+        minPulseClk.clear();
+        minPulseAt.clear();
+        gateAll = GateSpec();
+        gateClk.clear();
+        gateInst.clear();
         derate = Derate();
         derateSets.clear();
         edgeDerate.clear();
@@ -1079,6 +1142,59 @@ public:
                 std::vector<int> ns;
                 nodesOf(o, ns);
                 for (int n : ns) drives[n] = d;
+            }
+        }
+        for (auto* c : s.of("set_min_pulse_width")) {
+            double v = c->num("value") * T;
+            bool hi = c->has("-high"), lo = c->has("-low");
+            if (!hi && !lo) hi = lo = true;
+            auto put = [&](double* w) {
+                if (hi) w[0] = v;
+                if (lo) w[1] = v;
+            };
+            auto slot = [&](std::unordered_map<int, std::array<double, 2>>& m, int k) {
+                auto it = m.find(k);
+                if (it == m.end()) it = m.emplace(k, std::array<double, 2>{-1, -1}).first;
+                return it->second.data();
+            };
+            auto objs = c->objs("objects");
+            if (objs.empty()) put(minPulse);
+            for (auto& o : objs) {
+                if (o.kind == sdc::Kind::Clock) {
+                    auto it = clockByName.find(o.name);
+                    if (it != clockByName.end()) put(slot(minPulseClk, it->second));
+                } else if (o.kind == sdc::Kind::Cell) {
+                    int i = findInst(o.name);
+                    if (i < 0) continue;
+                    for (int k = instPinOff[i]; k < instPinOff[i + 1]; k++)
+                        if (!nodes[instPinNode[k]].driver) put(slot(minPulseAt, instPinNode[k]));
+                } else {
+                    int n = findNode(o.name);
+                    if (n >= 0) put(slot(minPulseAt, n));
+                }
+            }
+        }
+        for (auto* c : s.of("set_clock_gating_check")) {
+            auto put = [&](GateSpec& g) {
+                if (c->has("-setup")) g.setup = c->num("-setup") * T;
+                if (c->has("-hold")) g.hold = c->num("-hold") * T;
+                if (c->has("-high")) g.kind = 1;
+                if (c->has("-low")) g.kind = 2;
+            };
+            auto objs = c->objs("objects");
+            if (objs.empty()) put(gateAll);
+            for (auto& o : objs) {
+                if (o.kind == sdc::Kind::Clock) {
+                    auto it = clockByName.find(o.name);
+                    if (it != clockByName.end()) put(gateClk.emplace(it->second, gateAll).first->second);
+                } else {
+                    int i = o.kind == sdc::Kind::Cell ? findInst(o.name) : -1;
+                    if (o.kind == sdc::Kind::Pin) {
+                        int n = findNode(o.name);
+                        if (n >= 0) i = nodes[n].inst;
+                    }
+                    if (i >= 0) put(gateInst.emplace(i, gateAll).first->second);
+                }
             }
         }
         for (auto* c : s.of("set_timing_derate")) {
@@ -2044,7 +2160,7 @@ public:
     // Times one data tag against one capture edge; keeps the worst per
     // (kind, capture clock) in `best`.
     void timeEnd(std::vector<PathEnd>& best, EndKind kind, int node, int tagIdx, int rf, int capClk, int capEdge,
-                 double capArr, double lib, double ext, int clkNode, int clkTag, int clkRf) {
+                 double capArr, double lib, double ext, int clkNode, int clkTag, int clkRf, int gateSetupEdge = -1) {
         const Tag& t = tags[node][tagIdx];
         bool late = isLate(kind);
         double a = t.arr[late ? LATE : EARLY][rf];
@@ -2086,12 +2202,23 @@ public:
             else pe.required = r.delay + capArr + pe.unc + lib - ext;
         } else {
             double launch = 0, capture = 0;
-            relation(L, t.key.edge, Cc, capEdge, launch, capture);
+            relation(L, t.key.edge, Cc, kind == EndKind::GateHold ? gateSetupEdge : capEdge, launch, capture);
             if (r.mcSetup != 1) {
                 if (r.setupStart) launch -= (r.mcSetup - 1) * L.period;
                 else capture += (r.mcSetup - 1) * Cc.period;
             }
-            if (!late) {
+            if (kind == EndKind::GateHold) {
+                // The enable must not change before the edge that closes the
+                // clock's active phase: the last such edge before the one
+                // the setup check is against.
+                double c = Cc.edgeT[capEdge];
+                c += std::ceil((capture - c) / Cc.period - 1e-9) * Cc.period - Cc.period;
+                capture = c;
+                if (r.mcHold != 0) {
+                    if (r.holdEnd) capture -= r.mcHold * Cc.period;
+                    else launch += r.mcHold * L.period;
+                }
+            } else if (!late) {
                 double hl = 0, hc = 0;
                 if (holdRelation(L, t.key.edge, Cc, capEdge, hl, hc)) {
                     // The hold edges move with a setup multicycle, as the
@@ -2123,6 +2250,209 @@ public:
                 return;
             }
         best.push_back(pe);
+    }
+
+    // Clock gating checks. At a combinational cell on the way to a
+    // register's clock pin, an input with a clock and an input without one:
+    // the second gates the first and must only change while the clock is in
+    // the state that blocks it. With an AND or a NAND that is low: setup to
+    // the rising edge at the clock input, hold to the falling edge. With an
+    // OR or a NOR the other way round.
+    void gatingEnds(std::vector<PathEnd>& out) {
+        size_t n = nodes.size();
+        // Nodes whose clock goes on to a register's clock pin.
+        std::vector<char> hasClk(n, 0), used(n, 0);
+        bool any = false;
+        for (size_t i = 0; i < n; i++)
+            for (auto& t : tags[i])
+                if (t.key.isClk) { hasClk[i] = 1; break; }
+        for (auto& ck : checks) if (hasClk[ck.clk]) used[ck.clk] = 1;
+        for (auto& e : edges) if (e.kind == LaunchEdge && hasClk[e.from]) used[e.from] = 1;
+        for (size_t li = levels.size(); li-- > 0;)
+            for (int v : levels[li]) {
+                if (!hasClk[v] || used[v]) continue;
+                for (int k = foutOff[v]; k < foutOff[v + 1]; k++) {
+                    const Edge& e = edges[foutIdx[k]];
+                    if (!e.disabled && !e.loopBreak && e.kind != LaunchEdge && used[e.to]) { used[v] = 1; break; }
+                }
+            }
+        for (size_t y = 0; y < n; y++) {
+            const Node& x = nodes[y];
+            if (!x.driver || x.inst < 0 || !hasClk[y] || !used[y]) continue;
+            const CellInfo* ci = instInfo[x.inst];
+            if (!ci || !ci->checks.empty() || ci->latch) continue;
+            std::vector<int> cks, ens;
+            for (int k = finOff[y]; k < finOff[y + 1]; k++) {
+                const Edge& e = edges[finIdx[k]];
+                if (e.kind != CombEdge || e.disabled || e.loopBreak) continue;
+                if (hasClk[e.from]) cks.push_back(e.from);
+                else if (!tags[e.from].empty()) ens.push_back(e.from);
+            }
+            if (cks.empty() || ens.empty()) continue;
+            any = true;
+            auto pi = ci->pinIdx.find(*nodePin[y]);
+            const liberty::Expr* fn = pi != ci->pinIdx.end() ? ci->fn[pi->second].get() : nullptr;
+            GateSpec spec = gateAll;
+            auto gi = gateInst.find(x.inst);
+            for (int c : cks) {
+                // 1: the clock passes while the enable is high and is blocked
+                // low (AND); 2: the other way round (OR).
+                int kind = 0;
+                if (fn) {
+                    auto with = [&](int v) {
+                        return eval3(*fn, [&](const std::string& var) { return var == *nodePin[c] ? v : -1; });
+                    };
+                    if (with(0) >= 0) kind = 1;
+                    else if (with(1) >= 0) kind = 2;
+                }
+                for (size_t t = 0; t < tags[c].size(); t++) {
+                    const Tag& ct = tags[c][t];
+                    if (!ct.key.isClk) continue;
+                    GateSpec g = spec;
+                    auto gc = gateClk.find(ct.key.clk);
+                    if (gc != gateClk.end()) g = gc->second;
+                    if (gi != gateInst.end()) g = gi->second;
+                    int kd = g.kind ? g.kind : kind;
+                    if (!kd) continue;
+                    // The edge at the clock input that opens the active phase
+                    // (setup) and the one that closes it (hold).
+                    int srf = kd == 1 ? RISE : FALL, hrf = 1 - srf;
+                    for (int en : ens) {
+                        std::vector<PathEnd> best;
+                        for (size_t d = 0; d < tags[en].size(); d++)
+                            for (int rf = 0; rf < 2; rf++) {
+                                if (valid(ct.arr[EARLY][srf]))
+                                    timeEnd(best, EndKind::GateSetup, en, (int)d, rf, ct.key.clk, ct.key.edge, ct.arr[EARLY][srf],
+                                            g.setup, 0, c, (int)t, srf);
+                                if (valid(ct.arr[LATE][hrf]))
+                                    timeEnd(best, EndKind::GateHold, en, (int)d, rf, ct.key.clk, ct.key.edge, ct.arr[LATE][hrf],
+                                            g.hold, 0, c, (int)t, hrf, 1 - ct.key.edge);
+                            }
+                        for (auto& pe : best) out.push_back(pe);
+                    }
+                }
+            }
+        }
+        (void)any;
+    }
+
+    // Minimum pulse width and minimum period at clock pins.
+    void widthChecks() {
+        pulses.clear();
+        periods.clear();
+        const double eps = 1e-12;
+        std::vector<char> seqClk;
+        bool sdcAny = minPulse[0] > 0 || minPulse[1] > 0 || !minPulseClk.empty();
+        if (sdcAny) {
+            seqClk.assign(nodes.size(), 0);
+            for (auto& ck : checks) seqClk[ck.clk] = 1;
+        }
+        auto doNode = [&](int n, const CellInfo::Width* w) {
+            const Node& x = nodes[n];
+            const std::vector<Tag>& ts = tags[n];
+            double req[2] = {-1, -1}, per = -1;  // [high, low]
+            auto more = [](double& a, double v) { if (v > a) a = v; };
+            if (x.pin) {
+                more(req[0], x.pin->minPulseHigh);
+                more(req[1], x.pin->minPulseLow);
+                more(per, x.pin->minPeriod);
+            }
+            if (w && w->pulse) {
+                if (!w->pulse->riseCons.empty()) more(req[0], w->pulse->riseCons.constraint(x.slew[LATE][RISE], x.slew[LATE][RISE]));
+                if (!w->pulse->fallCons.empty()) more(req[1], w->pulse->fallCons.constraint(x.slew[LATE][FALL], x.slew[LATE][FALL]));
+            }
+            if (w && w->period) {
+                if (!w->period->riseCons.empty()) more(per, w->period->riseCons.constraint(x.slew[LATE][RISE], x.slew[LATE][RISE]));
+                if (!w->period->fallCons.empty()) more(per, w->period->fallCons.constraint(x.slew[LATE][FALL], x.slew[LATE][FALL]));
+            }
+            auto at = minPulseAt.find(n);
+            std::vector<int> seen;
+            for (size_t i = 0; i < ts.size(); i++) {
+                const Tag& t1 = ts[i];
+                if (!t1.key.isClk) continue;
+                const Clock& c = clocks[t1.key.clk];
+                double rq[2] = {req[0], req[1]};
+                if (sdcAny && seqClk[n]) {
+                    more(rq[0], minPulse[0]);
+                    more(rq[1], minPulse[1]);
+                    auto mc = minPulseClk.find(t1.key.clk);
+                    if (mc != minPulseClk.end()) {
+                        more(rq[0], mc->second[0]);
+                        more(rq[1], mc->second[1]);
+                    }
+                }
+                if (at != minPulseAt.end()) {
+                    more(rq[0], at->second[0]);
+                    more(rq[1], at->second[1]);
+                }
+                if (per > 0 && std::find(seen.begin(), seen.end(), (int)t1.key.clk) == seen.end()) {
+                    seen.push_back(t1.key.clk);
+                    periods.push_back({n, t1.key.clk, per, c.period, c.period - per});
+                }
+                for (int hl = 0; hl < 2; hl++) {
+                    if (rq[hl] <= 0) continue;
+                    int orf = hl == 0 ? RISE : FALL, crf = 1 - orf;  // the transitions that open and close it
+                    if (!valid(t1.arr[LATE][orf])) continue;
+                    for (auto& t2 : ts) {
+                        if (!t2.key.isClk || t2.key.clk != t1.key.clk || t2.key.edge == t1.key.edge) continue;
+                        if (!valid(t2.arr[EARLY][crf])) continue;
+                        PulseCheck pc;
+                        pc.node = n;
+                        pc.clk = t1.key.clk;
+                        pc.high = hl == 0;
+                        pc.openEdge = t1.key.edge;
+                        pc.closeEdge = t2.key.edge;
+                        pc.openT = c.edgeT[pc.openEdge];
+                        pc.closeT = c.edgeT[pc.closeEdge];
+                        if (pc.closeT <= pc.openT + eps) pc.closeT += c.period;
+                        pc.openArr = t1.arr[LATE][orf];
+                        pc.closeArr = t2.arr[EARLY][crf];
+                        if (crprOn) {
+                            double v = std::min(t1.arr[LATE][orf] - t1.arr[EARLY][orf], t2.arr[LATE][crf] - t2.arr[EARLY][crf]);
+                            pc.crpr = valid(v) && v > 0 ? v : 0;
+                        }
+                        pc.required = rq[hl];
+                        pc.actual = pc.closeT + pc.closeArr + pc.crpr - (pc.openT + pc.openArr);
+                        pc.slack = pc.actual - pc.required;
+                        pulses.push_back(pc);
+                    }
+                }
+            }
+        };
+        for (size_t i = 0; i < instInfo.size(); i++) {
+            const CellInfo* ci = instInfo[i];
+            if (!ci) continue;
+            for (auto& w : ci->widths) doNode(pinNode((int)i, w.pin), &w);
+        }
+        // Pins that only the constraints give a width.
+        auto libHas = [&](int n) {
+            const Node& x = nodes[n];
+            if (x.inst < 0 || !instInfo[x.inst]) return false;
+            for (auto& w : instInfo[x.inst]->widths)
+                if (pinNode(x.inst, w.pin) == n) return true;
+            return false;
+        };
+        if (sdcAny) {
+            std::vector<int> ns;
+            for (auto& ck : checks) ns.push_back(ck.clk);
+            std::sort(ns.begin(), ns.end());
+            ns.erase(std::unique(ns.begin(), ns.end()), ns.end());
+            for (int n : ns)
+                if (!libHas(n)) doNode(n, nullptr);
+        }
+        for (auto& [n, v] : minPulseAt)
+            if (!libHas(n) && !(sdcAny && seqClk[n])) doNode(n, nullptr);
+        std::sort(pulses.begin(), pulses.end(), [](const PulseCheck& a, const PulseCheck& b) {
+            if (a.slack != b.slack) return a.slack < b.slack;
+            if (a.node != b.node) return a.node < b.node;
+            if (a.high != b.high) return a.high;
+            return a.clk < b.clk;
+        });
+        std::sort(periods.begin(), periods.end(), [](const PeriodCheck& a, const PeriodCheck& b) {
+            if (a.slack != b.slack) return a.slack < b.slack;
+            if (a.node != b.node) return a.node < b.node;
+            return a.clk < b.clk;
+        });
     }
 
     void runChecks() {
@@ -2186,6 +2516,8 @@ public:
             for (size_t i = 0; i < nChecks; i++) doCheck(i);
         }
         for (size_t p = 0; p < nPorts; p++) doPort(p);
+        std::vector<PathEnd> gateEnds;
+        if (gatingChecks) gatingEnds(gateEnds);
 
         std::vector<char> hasEnd(nodes.size(), 0);
         std::set<int> unclk;
@@ -2201,6 +2533,7 @@ public:
                 hasEnd[pe.node] = 1;
                 ends.push_back(pe);
             }
+        for (auto& pe : gateEnds) ends.push_back(pe);
         unclocked.assign(unclk.begin(), unclk.end());
         for (size_t n = 0; n < nodes.size(); n++)
             if (nodes[n].endpoint && !hasEnd[n]) unconstrained.push_back((int)n);
@@ -2265,7 +2598,7 @@ public:
         phase("levelize", [&] { levelize(); });
         phase("delays", [&] { computeDelays(); });
         phase("arrivals", [&] { propagate(); });
-        phase("checks", [&] { runChecks(); });
+        phase("checks", [&] { runChecks(); widthChecks(); });
         phase("design rules", [&] { designRules(); });
         timed = true;
     }

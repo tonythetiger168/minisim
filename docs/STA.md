@@ -93,6 +93,24 @@ A report command takes `> FILE` or `>> FILE` at the end.
   other inputs block is removed, and one they make unate (an XOR with one
   input constant) keeps only that direction.
 - `set_disable_timing` on cells (`-from`, `-to`), library cells, pins and ports.
+- **Clock gating checks** are inferred where a clock and a signal that is
+  not one meet at a combinational cell on the way to a register's clock pin.
+  With an AND or NAND the enable may only change while the clock is low:
+  setup to the rising edge at the clock input, hold to the falling edge
+  before it. With an OR or NOR the other way round. The kind comes from the
+  cell's function; `set_clock_gating_check` gives the setup and hold times
+  (0 by default) and `-high` / `-low` for cells whose function does not say
+  (a multiplexer). The endpoints are in `report_timing` and
+  `report_constraint` with the others. `-no_clock_gating_checks` turns them
+  off.
+- **Minimum pulse width and minimum period** at clock pins, from the
+  library (`min_pulse_width_high` / `_low` and `min_period` attributes,
+  `min_pulse_width` and `minimum_period` timing groups) and from
+  `set_min_pulse_width` (design, clocks, cells, pins). A pulse opens with the
+  late arrival of one clock edge and closes with the early arrival of the
+  other, less the pessimism the two share. `report_min_pulse_width`
+  (`-all_violators`, `-verbose`, `-max_paths`) and `report_min_period` list
+  them; `report_constraint` and the exit status count the violations.
 - **On-chip variation**: `set_timing_derate` (`-early`, `-late`, `-clock`,
   `-data`, `-cell_delay`, `-net_delay`, `-cell_check`, `-rise`, `-fall`, on
   the design or on cells, library cells and nets) scales the delays of early
@@ -193,7 +211,11 @@ These are not done yet, and each is either reported or documented here:
 - Path exceptions that name pins in `-from` or `-through` use one of 256
   internal state bits per stage; past that an exception is ignored with a
   warning.
-- CCS and ECSM tables, crosstalk, and minimum pulse width / period checks.
+- CCS and ECSM tables and crosstalk.
+- For the hold check of an OR-type clock gate OpenSTA takes the launch edge
+  a cycle later than msta does; msta checks the enable against the rising
+  edge that starts the phase it changes in. The other gating checks, pulse
+  widths and periods agree with OpenSTA.
 
 ## Files
 

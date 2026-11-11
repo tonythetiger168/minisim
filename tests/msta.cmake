@@ -126,6 +126,51 @@ want("r3/D (DFF_X1)          4.120       2.566       1.554"
      "library hold time                             0.041      0.209"
      "slack (MET)                                              0.202")
 
+# --- clock gating checks, minimum pulse width and minimum period.
+#  clk (period 2, high for 0.8) -> cb: rises in 0.104, falls in 0.0936.
+#  g1 (AND, enable from the falling-edge rn): setup to the rising edge,
+#    2 + 0.104 - 0.1 = 2.004 against 0.8 + 0.0936 + 0.164 = 1.058; hold to the
+#    falling edge, 0.8 + 0.0936 + 0.05 = 0.944 against 1.042.
+#  g3 (AND, enable from the rising-edge re): the enable changes at 0.257
+#    while the clock is still high until 0.944: a hold violation of 0.686.
+#  g2 (OR): setup to the falling edge 0.8936 - 0.1, hold to the rising edge
+#    0.104 + 0.05 = 0.154 against 0.257.
+#  rf/CK is behind an inverter: its low pulse opens at 0.164 and closes at
+#    0.958, 0.794 wide against the library's 0.27 (a min_pulse_width group);
+#    DFF_X1 has min_pulse_width_high / _low / min_period attributes.
+run(0 -lib ${LIB} gate.v -sdc gate.sdc -e "report_timing -max_paths 20 -path end\; report_timing -delay_type min -max_paths 20 -path end\; report_timing -delay_type min -to [get_pins g3/B] -path full_clock\; report_min_pulse_width\; report_min_pulse_width -verbose -max_paths 1\; report_min_period\; report_constraint")
+want("g2/B (OR2_X1)          0.794       0.273       0.520"
+     "g1/B (AND2_X1)         2.004       1.058       0.946"
+     "g3/B (AND2_X1)         2.004       0.273       1.731"
+     "g3/B (AND2_X1)         0.944       0.257      -0.686  (VIOLATED)"
+     "g1/B (AND2_X1)         0.944       1.042       0.099"
+     "g2/B (OR2_X1)          0.154       0.257       0.103"
+     "Endpoint: g3 (rising clock gating-check end-point clocked by clk)"
+     "g3/A (AND2_X1)                                0.000      0.894 f"
+     "clock gating hold time                        0.050      0.944"
+     "rf/CK (low)          0.270       0.794       0.524"
+     "r2/CK (high)         0.250       0.777       0.527"
+     "rn/CK (high)         0.220       0.790       0.570"
+     "r2/CK (low)          0.200       1.223       1.023"
+     "Check: min_pulse_width (low)"
+     "open edge arrival time                                   0.164"
+     "close edge arrival time                                  0.958"
+     "actual pulse width                                       0.794"
+     "rn/CK            0.600       2.000       1.400"
+     "re/CK            0.500       2.000       1.500"
+     "clk                   min           -0.686      -0.686           1          13")
+#  set_min_pulse_width on a clock (register clock pins) and on a pin; a
+#  period below the library's minimum; no gating checks when turned off.
+run(2 -lib ${LIB} gate.v -sdc gate.sdc -no_clock_gating_checks -fail_on_violation -e "set_min_pulse_width -high 0.78 [get_clocks clk]\; set_min_pulse_width -low 1.3 [get_pins rn/CK]\; report_constraint -all_violators")
+want("clk                   min            0.039       0.000           0          10"
+     "min_pulse_width: 4 violations"
+     "rn/CK (low)          1.300       1.210      -0.090  (VIOLATED)"
+     "r2/CK (high)         0.780       0.777      -0.003  (VIOLATED)"
+     "r1/CK (high)         0.780       0.778      -0.002  (VIOLATED)")
+run(2 -lib ${LIB} gate.v -sdc gate.sdc -no_clock_gating_checks -fail_on_violation -e "create_clock -name clk -period 0.55 [get_ports clk]\; report_constraint -all_violators")
+want("min_period: 2 violations"
+     "rn/CK            0.600       0.550      -0.050  (VIOLATED)")
+
 # --- exceptions and the rest of the constraints.
 #  clock groups cut clk2 from clk; latency 0.3 + 0.2 source on the ideal clk;
 #  the false path through x1/Y then m1/Y leaves sel as rb/D's worst path;
