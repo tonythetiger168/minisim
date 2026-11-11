@@ -102,6 +102,7 @@ public:
             if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %zu clocked processes, %zu NBAs, %zu comb statements\n", dom.size(), nba, comb);
             if (comb > 64 && comb > 64 * nba && !getenv("MSIM_XCYC")) dom.clear();
         }
+        if (!dom.empty()) wakeEvents(procs, dom);
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
         std::vector<CodegenProc> wideProcs;
         if (!dom.empty() && privates && !std::getenv("MSIM_NOWIDE")) wideProcs = splitWide(procs, dom);
@@ -500,22 +501,8 @@ public:
             o << "    S.fastSeqId = (int)S.seqs.size();\n    S.addSeq(dseq, nullptr, {";
             // Every event of every domain process: they wait on copies of the
             // same clocks (see cycleDomain), and one pending mark runs dseq once.
-            for (int g = 0; g < std::max(domGroups_, 1); g++) {
-                // One signal per source and edge: the copies of a source all
-                // change in the same comb pass, so one of them is enough to
-                // wake the group, and the others are then ordinary quiet
-                // signals. A copy rather than the source, when there is one
-                // (the group then runs after that pass).
-                std::vector<std::pair<int, Edge>> ev, key;
-                for (int d : dom)
-                    if (domGroups_ <= 1 || domGroup_[d] == g)
-                        for (auto& e : procs[d].seqEv) {
-                            int rt = e.first >= 0 && (size_t)e.first < domRoot_.size() ? domRoot_[e.first] : e.first;
-                            std::pair<int, Edge> kk{rt, e.second};
-                            auto it = std::find(key.begin(), key.end(), kk);
-                            if (it == key.end()) { key.push_back(kk); ev.push_back(e); }
-                            else if (ev[(size_t)(it - key.begin())].first == rt && e.first != rt) ev[(size_t)(it - key.begin())] = e;
-                        }
+            for (int g = 0; g < (int)domWake_.size(); g++) {
+                const auto& ev = domWake_[g];
                 if (g) o << "    S.addSeq(dseq, (const void*)(intptr_t)" << g << ", {";
                 for (size_t j = 0; j < ev.size(); j++)
                     o << (j ? ", " : "") << "{" << ev[j].first << ", " << edge(ev[j].second) << "}";
@@ -1289,6 +1276,33 @@ private:
     }
     std::vector<int> domRoot_;    // cycleDomain: per signal, the signal it is a copy of (itself if none)
     std::vector<int> domGroup_;   // cycleDomain: per process, its clock group in the domain (or -1)
+    // The events each clock group of the domain is registered on. One signal
+    // per source and edge: the copies of a source all change in the same comb
+    // pass, so one of them is enough to wake the group. A copy rather than
+    // the source, when there is one (the group then runs after that pass).
+    // The other copies are ordinary signals, and private ones when nothing
+    // else waits on them.
+    std::vector<std::vector<std::pair<int, Edge>>> domWake_;
+    void wakeEvents(const std::vector<CodegenProc>& procs, const std::vector<int>& dom) {
+        domWake_.clear();
+        for (int g = 0; g < std::max(domGroups_, 1); g++) {
+            std::vector<std::pair<int, Edge>> ev, key;
+            for (int d : dom)
+                if (domGroups_ <= 1 || domGroup_[d] == g)
+                    for (auto& e : procs[d].seqEv) {
+                        int rt = e.first >= 0 && (size_t)e.first < domRoot_.size() ? domRoot_[e.first] : e.first;
+                        std::pair<int, Edge> kk{rt, e.second};
+                        auto it = std::find(key.begin(), key.end(), kk);
+                        if (it == key.end()) { key.push_back(kk); ev.push_back(e); }
+                        else if (ev[(size_t)(it - key.begin())].first == rt && e.first != rt) ev[(size_t)(it - key.begin())] = e;
+                    }
+            domWake_.push_back(std::move(ev));
+        }
+    }
+    bool wakeSig(int s) const {
+        for (auto& g : domWake_) for (auto& e : g) if (e.first == s) return true;
+        return false;
+    }
     int domGroups_ = 0;
 
     // A signal is private to the cycle domain when only the domain uses it
@@ -1312,7 +1326,9 @@ private:
             for (auto& k : e->kids) refs(k);
         };
         for (size_t i = 0; i < procs.size(); i++) {
-            for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns) bad[sg] = 1;
+            // A clock or reset stays in S.sigs when a process waits on it: the
+            // domain waits on its wake signals only (wakeEvents).
+            for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns && (!mine[i] || procs[i].combRank >= 0 || wakeSig(sg))) bad[sg] = 1;
             if (procs[i].combRank >= 0) {
                 for (auto& in : procs[i].prog->code) {
                     if (in.k == IK::WaitEdge) break;
@@ -1328,7 +1344,9 @@ private:
                     // The outputs of one always_comb with if / case: any
                     // number of whole or part writes, all from this process.
                     else if (in.drv < 0 && !in.tmp && sigs[in.sig].drivers == 0 && !in.arr && in.aidx.empty() &&
-                             (!cand[in.sig] || owner[in.sig] == (int)i || sigs[in.sig].w > 64)) {   // wide: see splitWide
+                             (!cand[in.sig] || owner[in.sig] == (int)i || sigs[in.sig].w > 64 || (in.hi >= 0 && owner[in.sig] >= 0))) {
+                        // wide: see splitWide. Part writes from several processes: the
+                        // assigns of single bits or fields that msim merged (mergePartialDrivers).
                         cand[in.sig] = 1;
                         owner[in.sig] = (int)i;
                     } else bad[in.sig] = 1;
@@ -1785,8 +1803,9 @@ private:
     void emitCycle(std::ostream& o, const std::vector<CodegenProc>& procs, const std::vector<int>& dom,
                    const std::vector<int>& byRank) {
         clock_.assign(sigW_.size(), 0);
-        for (auto& pr : procs)
-            for (auto& [sg, ed] : pr.seqEv) if (sg >= 0 && (size_t)sg < clock_.size()) clock_[sg] = 1;
+        for (size_t i = 0; i < procs.size(); i++)
+            for (auto& [sg, ed] : procs[i].seqEv)
+                if (sg >= 0 && (size_t)sg < clock_.size() && (wakeSig(sg) || std::find(dom.begin(), dom.end(), (int)i) == dom.end())) clock_[sg] = 1;
         // Copies and dead logic. A private signal whose one write is a
         // whole copy of another private signal (a port connection) is that
         // signal under another name: the domain reads the source instead.
@@ -2073,10 +2092,15 @@ private:
                     if (in.k == IK::JmpIfNot) {
                         noteRefs(in.e);
                         unitConds.back().push_back(in.e);
-                        c4 += L4(pc) + ":" + jmpIfNot(in, fast(in.e), "goto " + L4(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L4(in.xt) + ";");
                         std::string g, u, sl;
+                        // A known condition is a plain test; the Val and truth() only when a bit is unknown.
+                        bool sp = split(in.e, g, u, sl);
+                        std::string slow4 = jmpIfNot(in, sp ? sl : fast(in.e), "goto " + L4(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L4(in.xt) + ";");
+                        if (sp && g.empty()) c4 += L4(pc) + ": if (!(" + u + ")) goto " + L4(in.target) + ";\n";
+                        else if (sp) c4 += L4(pc) + ": if (__builtin_expect(" + g + ", 1)) { if (!(" + u + ")) goto " + L4(in.target) + "; } else {" + slow4 + " }\n";
+                        else c4 += L4(pc) + ":" + slow4;
                         // Every signal read is known here (twoNow, and no bail so far).
-                        if (split(in.e, g, u, sl)) c2 += L2(pc) + ": if (!(" + u + ")) goto " + L2(in.target) + ";\n";
+                        if (sp) c2 += L2(pc) + ": if (!(" + u + ")) goto " + L2(in.target) + ";\n";
                         else c2 += L2(pc) + ":" + jmpIfNot(in, sl, "goto " + L2(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L2(in.xt) + ";");
                         continue;
                     }
