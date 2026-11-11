@@ -15,6 +15,13 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mplan`: requirement traceability. `req ID ...` in a feature and a
+  requirement list (`reqs FILE` in the plan or `-reqs FILE`), read from CSV
+  or ReqIF (`.reqif` / `.reqifz`, with the hierarchy). Every requirement is
+  verified, partial, failing, not started or uncovered; the report, the
+  HTML page, `plan.json`, the history and `mplan trend` show it, `-trace`
+  writes the matrix as CSV, `-fail-on-uncovered` gates on it, and
+  `mplan init -reqs` drafts a plan from the list.
 - `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
   built from the spare cells of the old netlist and the cells the change
   frees, by function (the same cell, or one with inputs tied or shared, or
