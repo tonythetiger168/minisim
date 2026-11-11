@@ -24,5 +24,11 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/eco/fuzz.py $<TARGET_FILE:meco> $<TARGET_FILE:msim>
                      ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib,${CMAKE_SOURCE_DIR}/tests/eco/eco_cells.lib
                      ${CMAKE_SOURCE_DIR}/tests/eco/cells.v 0 200 ${CMAKE_CURRENT_BINARY_DIR}/meco_fuzz)
+    # The same with spare cells in the old netlist and -spare (metal-only).
+    add_test(NAME meco_fuzz_spare
+             COMMAND ${CMAKE_COMMAND} -E env SPARE=1
+                     ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/eco/fuzz.py $<TARGET_FILE:meco> $<TARGET_FILE:msim>
+                     ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib,${CMAKE_SOURCE_DIR}/tests/eco/eco_cells.lib
+                     ${CMAKE_SOURCE_DIR}/tests/eco/cells.v 0 200 ${CMAKE_CURRENT_BINARY_DIR}/meco_fuzz_spare)
   endif()
 endif()

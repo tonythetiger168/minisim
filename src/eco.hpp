@@ -931,6 +931,8 @@ struct Options {
     std::string prefix = "ECO_";
     bool sweep = true;                // remove old cells the patch leaves without a load
     std::set<std::string> replace;    // registers to swap for the new cell (set by the retry)
+    bool spare = false;               // metal-only: build the patch from cells already in the netlist
+    std::string spareGlob = "*";      // which unloaded old cells are spare cells (instance name, * and ?)
 };
 
 struct Change {
@@ -945,6 +947,8 @@ struct Result {
     std::vector<std::string> unverified;  // still different after the patch
     std::vector<std::string> warnings;
     size_t points = 0, added = 0, removed = 0, rewired = 0, reused = 0;
+    size_t spares = 0, freed = 0;         // metal-only: spare cells put to use, old cells left as spares
+    std::vector<std::string> unplaced;    // metal-only: added cells no spare cell could stand in for
     double areaAdded = 0, areaRemoved = 0;
     bool verified = false;
 };
@@ -1066,6 +1070,93 @@ inline std::vector<uint8_t> unloaded(const Design& d, May&& may) {
     return gone;
 }
 
+inline bool globMatch(const char* p, const char* s) {
+    for (; *p; p++, s++) {
+        if (*p == '*') {
+            while (*p == '*') p++;
+            if (!*p) return true;
+            for (; *s; s++)
+                if (globMatch(p, s)) return true;
+            return false;
+        }
+        if (!*s || (*p != '?' && *p != *s)) return false;
+    }
+    return !*s;
+}
+
+// A pin function on 64 input patterns at once.
+template <class PinWord>
+inline uint64_t evalProg64(const Prog& p, PinWord&& pinWord) {
+    uint64_t st[64];
+    int sp = 0;
+    for (int c : p.code) {
+        if (c >= 0) st[sp++] = pinWord(c);
+        else if (c == Prog::Not) st[sp - 1] = ~st[sp - 1];
+        else if (c == Prog::C0 || c == Prog::Iq) st[sp++] = 0;
+        else if (c == Prog::C1 || c == Prog::Iqn) st[sp++] = ~0ull;
+        else {
+            uint64_t b = st[--sp];
+            st[sp - 1] = c == Prog::And ? st[sp - 1] & b : c == Prog::Or ? st[sp - 1] | b : st[sp - 1] ^ b;
+        }
+    }
+    return sp ? st[sp - 1] : 0;
+}
+
+// A combinational cell with one output and at most six inputs, as a truth
+// table over its inputs in pin order.
+struct Gate1 {
+    std::vector<int> in;
+    int out = -1;
+    uint64_t tt = 0;
+};
+inline bool gate1(const CellInfo& ci, Gate1& g) {
+    static const uint64_t pat[6] = {0xAAAAAAAAAAAAAAAAull, 0xCCCCCCCCCCCCCCCCull, 0xF0F0F0F0F0F0F0F0ull,
+                                    0xFF00FF00FF00FF00ull, 0xFFFF0000FFFF0000ull, 0xFFFFFFFF00000000ull};
+    if (ci.kind != Kind::Comb) return false;
+    g = Gate1();
+    for (size_t k = 0; k < ci.pins.size(); k++) {
+        if (!ci.isOut[k]) g.in.push_back((int)k);
+        else if (g.out >= 0) return false;
+        else g.out = (int)k;
+    }
+    if (g.out < 0 || g.in.size() > 6) return false;
+    std::vector<uint64_t> w(ci.pins.size(), 0);
+    for (size_t j = 0; j < g.in.size(); j++) w[(size_t)g.in[j]] = pat[j];
+    g.tt = evalProg64(ci.fn[(size_t)g.out], [&](int pin) { return w[(size_t)pin]; });
+    return true;
+}
+
+// How cell `s` can compute the function `tt` of `k` inputs: for each input
+// of s, the input of the function it reads (0..k-1), or k for constant 0,
+// k+1 for constant 1. Empty when it cannot.
+inline std::vector<int> standIn(const Gate1& s, uint64_t tt, int k) {
+    const int m = (int)s.in.size();
+    const uint64_t mask = k == 6 ? ~0ull : (1ull << (1u << k)) - 1;
+    double combos = 1;
+    for (int i = 0; i < m; i++) combos *= k + 2;
+    if (m == 0 || combos > 300000) return {};
+    std::vector<int> a((size_t)m, 0);
+    for (;;) {
+        // The table of s under this assignment, one pattern at a time over
+        // the 2^m rows of s folded onto the 2^k rows of the function.
+        uint64_t r = 0;
+        for (unsigned row = 0; row < (1u << k); row++) {
+            unsigned idx = 0;
+            for (int i = 0; i < m; i++) {
+                int v = a[(size_t)i];
+                unsigned bit = v < k ? (row >> v) & 1u : v == k ? 0u : 1u;
+                idx |= bit << i;
+            }
+            r |= ((s.tt >> idx) & 1ull) << row;
+        }
+        if (((r ^ tt) & mask) == 0) return a;
+        int i = 0;
+        while (i < m && ++a[(size_t)i] == k + 2) a[(size_t)i++] = 0;
+        if (i == m) break;
+    }
+    return {};
+}
+
 // Writes the edited design back into its module.
 inline void emit(Design& d, const std::vector<std::vector<int>>& origPin, size_t origNets, const Options& opt,
                  Result& res) {
@@ -1173,10 +1264,17 @@ inline void emit(Design& d, const std::vector<std::vector<int>>& origPin, size_t
             if (inConn[pinI] || x.pin[pinI] < 0) continue;
             if (!in.conns.empty() && in.conns[0].port.empty())
                 for (size_t k = 0; k < in.conns.size(); k++) in.conns[k].port = x.ci->ports[k].first;
-            gnl::Conn c;
-            c.port = x.ci->pins[pinI];
-            c.refs = {refOf(x.pin[pinI])};
-            in.conns.push_back(std::move(c));
+            gnl::Conn* open = nullptr;  // written as .Y(): filled in
+            for (auto& c : in.conns)
+                if (c.port == x.ci->pins[pinI] && c.refs.empty()) open = &c;
+            if (open) {
+                open->refs = {refOf(x.pin[pinI])};
+            } else {
+                gnl::Conn c;
+                c.port = x.ci->pins[pinI];
+                c.refs = {refOf(x.pin[pinI])};
+                in.conns.push_back(std::move(c));
+            }
             res.changes.push_back({Change::Connect, d.nets[(size_t)x.pin[pinI]].name, x.name + "/" + x.ci->pins[pinI]});
             res.rewired++;
         }
@@ -1379,6 +1477,9 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
     const size_t origNets = O.nets.size();
     std::vector<uint8_t> deadBefore;
     if (opt.sweep) deadBefore = detail::unloaded(O, [&](size_t i) { return O.insts[i].ci->kind == Kind::Comb; });
+    const size_t origInsts = O.insts.size();
+    std::vector<uint8_t> spareBefore;
+    if (opt.spare) spareBefore = detail::unloaded(O, [&](size_t i) { return O.insts[i].ci->kind == Kind::Comb; });
 
     std::vector<uint8_t> going(O.insts.size(), 0);  // its outputs may not be reused
     for (int i : removeInsts) going[(size_t)i] = 1;
@@ -2292,9 +2393,103 @@ inline Result run(const gnl::Module& oldM, const gnl::Module& newM, const Lib& l
     for (auto& r : rewires) { int in = mapNet(r.nnet); setIn(r.oi, r.pin, in); }
     for (auto& b : binds) { int in = mapNet(b.nnet); O.ports[(size_t)b.port].net = in; }
 
-    // Old cells nothing reads any more go; cells that were already unloaded
-    // (spare cells) stay. A removed register goes only if nothing reads it.
-    if (opt.sweep) {
+    // Metal-only: no cell is added and none is removed. Old cells nothing
+    // reads any more stay where they are, inputs tied low, and are spare
+    // cells from now on; every added gate is moved onto a spare cell that
+    // can compute it (the same cell, or one that can with inputs tied or
+    // shared), with a spare inverter behind it when only the inverse fits.
+    if (opt.spare) {
+        std::vector<uint8_t> rm(O.insts.size(), 0);
+        for (int i : removeInsts) rm[(size_t)i] = 1;
+        auto dead = detail::unloaded(O, [&](size_t i) { return i < origInsts && (O.insts[i].ci->kind == Kind::Comb || rm[i]); });
+        std::vector<int> pool;
+        std::vector<detail::Gate1> gate(origInsts);
+        for (size_t i = 0; i < origInsts; i++) {
+            Inst& x = O.insts[i];
+            if (x.dead) continue;
+            // A spare cell whose output the patch now reads is in use.
+            bool before = spareBefore[i] && dead[i] && detail::globMatch(opt.spareGlob.c_str(), x.name.c_str());
+            bool freed = dead[i] && !spareBefore[i];
+            if (freed) {
+                res.freed++;
+                for (size_t k = 0; k < x.pin.size(); k++)
+                    if (!x.ci->isOut[k]) setIn((int)i, (int)k, constNet(0));
+            }
+            if ((before || freed) && detail::gate1(*x.ci, gate[i])) pool.push_back((int)i);
+        }
+        std::vector<uint8_t> taken(origInsts, 0);
+        std::map<std::pair<const CellInfo*, std::pair<uint64_t, int>>, std::vector<int>> memo;
+        auto fit = [&](const CellInfo* ci, const detail::Gate1& g, uint64_t tt, int k) -> const std::vector<int>& {
+            auto key = std::make_pair(ci, std::make_pair(tt, k));
+            auto it = memo.find(key);
+            if (it == memo.end()) it = memo.emplace(key, detail::standIn(g, tt, k)).first;
+            return it->second;
+        };
+        // The free spare cell for a function: the same cell first, then the
+        // one with the fewest inputs, the smallest, the first in the netlist.
+        auto pick = [&](const CellInfo* same, uint64_t tt, int k) {
+            int best = -1;
+            for (int i : pool) {
+                if (taken[(size_t)i]) continue;
+                const CellInfo* ci = O.insts[(size_t)i].ci;
+                if (ci == same) return i;
+                if (fit(ci, gate[(size_t)i], tt, k).empty()) continue;
+                if (best < 0) { best = i; continue; }
+                const CellInfo* bc = O.insts[(size_t)best].ci;
+                if (std::make_pair(gate[(size_t)i].in.size(), ci->area) < std::make_pair(gate[(size_t)best].in.size(), bc->area)) best = i;
+            }
+            return best;
+        };
+        auto place = [&](int s, uint64_t tt, int k, const std::vector<int>& inNets, int outNet) {
+            taken[(size_t)s] = 1;
+            res.spares++;
+            const detail::Gate1& g = gate[(size_t)s];
+            const std::vector<int>& a = fit(O.insts[(size_t)s].ci, g, tt, k);
+            for (size_t j = 0; j < g.in.size(); j++) {
+                int v = a[j];
+                setIn(s, g.in[j], v < k ? inNets[(size_t)v] : constNet(v - k));
+            }
+            int old = O.insts[(size_t)s].pin[(size_t)g.out];
+            if (old >= 0 && O.nets[(size_t)old].drvInst == s) O.nets[(size_t)old].drvInst = -1;
+            drive(s, g.out, outNet);
+        };
+        const size_t nAll = O.insts.size();
+        for (size_t ai = origInsts; ai < nAll; ai++) {
+            if (O.insts[ai].dead) continue;
+            const CellInfo* ci = O.insts[ai].ci;
+            detail::Gate1 g;
+            bool placed = false;
+            if (detail::gate1(*ci, g) && O.insts[ai].pin[(size_t)g.out] >= 0) {
+                int k = (int)g.in.size();
+                uint64_t mask = k == 6 ? ~0ull : (1ull << (1u << k)) - 1;
+                std::vector<int> inNets;
+                for (int p : g.in) inNets.push_back(O.insts[ai].pin[(size_t)p] >= 0 ? O.insts[ai].pin[(size_t)p] : constNet(0));
+                int outNet = O.insts[ai].pin[(size_t)g.out];
+                int s = pick(ci, g.tt & mask, k);
+                if (s >= 0) {
+                    place(s, g.tt & mask, k, inNets, outNet);
+                    placed = true;
+                } else if ((s = pick(nullptr, ~g.tt & mask, k)) >= 0) {
+                    taken[(size_t)s] = 1;
+                    int inv = pick(lib.inverter, 1, 1);  // tt 01: out = !in
+                    taken[(size_t)s] = 0;
+                    if (inv >= 0) {
+                        int mid = addNet(opt.prefix + "n", om.lit[(size_t)outNet] ^ 1);
+                        place(s, ~g.tt & mask, k, inNets, mid);
+                        place(inv, 1, 1, {mid}, outNet);
+                        placed = true;
+                    }
+                }
+            }
+            if (placed) {
+                for (size_t k = 0; k < O.insts[ai].pin.size(); k++)
+                    if (!O.insts[ai].ci->isOut[k]) setIn((int)ai, (int)k, -1);
+                O.insts[ai].dead = true;
+            } else {
+                res.unplaced.push_back(O.insts[ai].name + " (" + ci->name + ")");
+            }
+        }
+    } else if (opt.sweep) {
         std::vector<uint8_t> rm(O.insts.size(), 0);
         for (int i : removeInsts) rm[(size_t)i] = 1;
         auto dead = detail::unloaded(O, [&](size_t i) { return O.insts[i].ci->kind == Kind::Comb || rm[i]; });
