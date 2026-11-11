@@ -216,9 +216,11 @@ one where no term decides alone (all 1 for `&&`, all 0 for `||`) and, for each
 term, the one where only that term has the deciding value. A vector with an
 x term counts for none. Conditions in procedures, continuous assignments,
 functions and tasks are covered; not those in constraints, assertions and
-covergroups, constant ones, or ones whose terms call a function or read
-through a class handle or a container (every term is evaluated to tell the
-vectors apart, so a term must be safe to evaluate).
+covergroups, or constant ones. To tell the vectors apart every term is
+evaluated, so a condition with a term that `&&` or `||` must be able to skip
+(it calls a function, or reads through a class handle or a container) is
+counted as it runs instead: vector i is "term i is the first that decides",
+and the report shows the terms after it as `-`.
 
 **FSM coverage** (as VCS `-cm fsm`). msim finds the state registers itself: a
 variable that one clocked procedure assigns, whose next value is always a
@@ -230,9 +232,11 @@ ones the next-state logic can make. A constant assigned under an `if` outside
 any branch on the state is taken as the reset, and transitions that only the
 reset makes are marked `(reset)`; `mcov report -fsm-reset-filter` leaves them
 out (VCS `-cm_fsmresetfilter`). A change the logic does not show (a forced
-value, say) is listed as "not in the next-state logic". Not extracted: one-hot
-registers tested bit by bit, states computed by arithmetic, registers written
-through a part select or by a task.
+value, say) is listed as "not in the next-state logic". One-hot registers
+tested bit by bit are extracted too (`case (1'b1)` with items `state[K]`,
+`if (state[K])`, next-state logic that clears the vector and sets
+`next[K]`); their states are named after the index. Not extracted: states
+computed by arithmetic, registers written through a part select or by a task.
 
 ```sh
 mcov report all.json -detail              # every vector, state and transition

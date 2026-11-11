@@ -723,7 +723,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     first = true;
     for (auto& [key, c] : conds) {
         f << (first ? "\n  " : ",\n  ") << "[" << c.d->file << ", " << c.d->line << ", " << c.d->col << ", "
-          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? "\"||\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
+          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? (c.d->lazy ? "\"||s\"" : "\"||\"") : c.d->lazy ? "\"&&s\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
         for (size_t k = 0; k < c.d->terms.size(); k++) f << (k ? ", " : "") << jstr(c.d->terms[k]);
         f << "], [";
         for (size_t k = 0; k < c.hits.size(); k++) f << (k ? ", " : "") << c.hits[k];
@@ -1278,8 +1278,9 @@ int main(int argc, char** argv) {
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
     if (g_cov) {   // FSM coverage: the kernel records the state registers' values
         std::vector<int> watch;
-        for (auto& d : fsmDefs()) watch.push_back(d.sig);
-        S.fsmWatch(watch);
+        std::vector<char> hot;
+        for (auto& d : fsmDefs()) { watch.push_back(d.sig); hot.push_back(d.onehot); }
+        S.fsmWatch(watch, hot);
     }
     if (!xpropReport.empty()) {   // -xprop-report: what is merged, what is not and why
         std::ofstream f(xpropReport);

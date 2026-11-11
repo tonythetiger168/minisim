@@ -205,7 +205,10 @@ Spec references are IEEE 1800-2023 clauses.
   database. `mcov report` adds `Condition:` and `FSM:` lines, `-detail`,
   `-uncovered`, `-fsm-reset-filter`, `-min-cond`, `-min-fsm-state`,
   `-min-fsm-trans`, and FSM and condition sections in the HTML report;
-  `mcov merge` merges both.
+  `mcov merge` merges both. One-hot FSMs tested bit by bit
+  (`case (1'b1)` on `state[K]`, `if (state[K])`) are extracted, and
+  conditions with a term that calls a function or reads through a class
+  handle are covered with short-circuit vectors.
 - `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
   through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
   gates) or a cell map, checked for a controllable clock and asynchronous
