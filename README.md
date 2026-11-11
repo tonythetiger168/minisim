@@ -53,7 +53,8 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
 | `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
 | `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
-| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck and design rule checks |
+| `src/oasis.hpp` | OASIS reader into the same library; `oasis::readLayout` takes GDSII or OASIS |
+| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/lvs.hpp`, `src/lvs_block.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck, design rule checks and LVS |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -603,7 +604,7 @@ Tcl shell whose commands follow dc_shell:
 
 ```sh
 msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
-msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the built-in generic library
+msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the mini45 library
 msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
 ```
 
@@ -612,8 +613,8 @@ See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
 ### FPGA synthesis: `mfpga`
 
 `mfpga` maps RTL (through the same elaborator as `msynth`) or an AIGER graph
-to the LUTs and flip-flops of an FPGA family (iCE40, ECP5, Xilinx 7-series,
-generic) and writes Yosys JSON for nextpnr or EDIF.
+to the LUTs, carry chains and flip-flops of an FPGA family (iCE40, ECP5,
+Xilinx 7-series, generic) and writes Yosys JSON for nextpnr or EDIF.
 
 ```sh
 mfpga rtl/*.sv -top core -family ice40 -o core.json   # then: nextpnr-ice40 --json core.json ...
@@ -766,7 +767,7 @@ coupling parts within 1% and 4%. See
 [`docs/RCX.md`](docs/RCX.md).
 ### Physical verification: `mpv`
 
-`mpv drc` checks a GDSII layout against a rule deck: width, spacing,
+`mpv drc` checks a GDSII or OASIS layout against a rule deck: width, spacing,
 enclosure, overhang, area and density checks on drawn and derived layers
 (`&`, `|`, `-`, `grow`, `interact`, ...). It needs no slang and builds with
 the default configuration.
@@ -782,9 +783,17 @@ rule poly.8   overhang(poly, diff) < 0.13   "poly end cap beyond diff"
 rule licon.5a enclosure(licon & diff, diff | tap) < 0.04  "diff enclosure of licon"
 ```
 
-It runs on every hardware thread by default (`-threads N`), with the same
-report for every thread count. The deck format, the results file and the
-limits are in [docs/MPV.md](docs/MPV.md).
+`mpv lvs` compares a routed block with its gate netlist. The nets are found
+from the geometry of the DEF and LEF, so a missing via is an open and a
+stray wire is a short:
+
+```sh
+mpv lvs -lef tech.lef routed.def -netlist block.v      # exit 1 on a mismatch
+```
+
+It runs on every logical CPU by default (`-threads N`), with the same
+report for every thread count. The deck format, the results file, LVS and
+the limits are in [docs/MPV.md](docs/MPV.md).
 
 ### Virtual prototypes: `-mvp`
 

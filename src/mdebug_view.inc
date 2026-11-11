@@ -98,6 +98,7 @@ function ev(e,t){if(!e)return null;switch(e[0]){
   case'rng':{const v=ev(e[1],t),A=ev(e[2],t),B=ev(e[3],t);if(!v||!A||!B)return null;let hi=Number(sg(A)),lo=Number(sg(B));const desc=e[5]>=e[6];
     if(e[4]==1){lo=Number(sg(A));hi=lo+Number(B.v)-1;if(!desc)[hi,lo]=[lo,hi]}else if(e[4]==2){hi=Number(sg(A));lo=hi-Number(B.v)+1;if(!desc)[hi,lo]=[lo,hi]}
     const ph=desc?hi-e[6]:e[6]-hi,pl=desc?lo-e[6]:e[6]-lo;return pl<0||ph>=v.w||ph<pl?null:mk(ph-pl+1,v.v>>BigInt(pl),0)}
+  case'fld':{const v=ev(e[1],t);return !v||e[2]+e[3]>v.w?null:mk(e[3],v.v>>BigInt(e[2]),e[4])}
   case'cat':{let w=0,x=0n;for(const o of e[1]){const v=ev(o,t);if(!v)return null;x=(x<<BigInt(v.w))|v.v;w+=v.w}return mk(w,x,0)}
   case'rep':{const n=ev(e[1],t),v=ev(e[2],t);if(!n||!v||n.v>4096n)return null;let w=0,x=0n;for(let k=0n;k<n.v;k++){x=(x<<BigInt(v.w))|v.v;w+=v.w}return w?mk(w,x,0):null}}
   return null}
@@ -115,8 +116,10 @@ function activeOf(sig,t){const k=chAt(sig,t);if(k<0)return {tc:0,hits:[]};const 
   let hits=drvOf[sig].map(i=>{const d=D[i],ts=d.seq&&tc>0?tc-1:tc;let st=1;for(const g of d.g){const h=holds(g,ts);if(h===null){if(st==1)st=-1}else if(!h){st=0;break}}return {d:i,state:st,ts}});
   if(!/[xz]/.test(seen)){const want=BigInt('0b'+seen);let match=false;hits.forEach(h=>{if(!h.state||!D[h.d].rhs)return;const v=ev(D[h.d].rhs,h.ts);if(!v)return;
     if(mk(seen.length,sg(v),0).v==want)match=true;else h.diff=1});if(match)hits.forEach(h=>{if(h.diff)h.state=0})}
-  const last={};hits.forEach((h,n)=>{if(h.state==1&&D[h.d].blk>=0)last[D[h.d].blk]=n});
-  hits=hits.filter((h,n)=>h.state&&!(h.state==1&&D[h.d].blk>=0&&last[D[h.d].blk]!=n));return {tc,hits}}
+  const cov=n=>{const a=D[hits[n].d];if(a.blk<0)return false;const later=[];for(let j=n+1;j<hits.length;j++){const b=D[hits[j].d];if(hits[j].state!=1||b.blk!=a.blk)continue;
+    if(b.whole)return true;if(b.lo>=0)later.push([b.lo,b.lo+b.w]);else if(a.lo<0&&!a.whole)return true}
+    if(a.lo<0)return false;later.sort((x,y)=>x[0]-y[0]);let at=a.lo;for(const[l,e]of later){if(l>at)break;at=Math.max(at,e)}return at>=a.lo+a.w};
+  hits=hits.filter((h,n)=>h.state&&!(h.state==1&&cov(n)));return {tc,hits}}
 function why(sig,t,depth,ind,seen,out){const pad='&nbsp;'.repeat(ind*2),nm=esc(S[sig].path),k=chAt(sig,t);
   if(!W[sig]){out.push(`<div data-s="${sig}">${pad}${nm} <span class="a">(not in the waveform)</span></div>`);return}
   const a=activeOf(sig,t);out.push(`<div data-s="${sig}" data-t="${a.tc}">${pad}${nm} = <span class="v">${k<0?'x':hex(W[sig][k][1])}</span> <span class="a">@${t}${a.tc!=t?' (since '+a.tc+')':''}</span></div>`);
