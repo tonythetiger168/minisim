@@ -1,0 +1,21 @@
+.lib corner sections and .alter
+* Saturated level-1 transistor: id = kp/2 (vgs-vth)^2, vd = 1.8 - id r.
+*   tt:               id = 50u 0.25 = 12.5u, r = 10k  -> vd = 1.675
+*   ss (first alter): id = 40u 0.16 = 6.4u,  r = 12k  -> vd = 1.7232
+*   second alter keeps ss and replaces r1 with 5k     -> vd = 1.768
+.lib 'corners.lib' tt
+vdd vdd 0 1.8
+vg g 0 1.0
+r1 vdd d 'rscale*10k'
+m1 d g 0 0 nm w=1u l=1u
+.dc vg 1 1 1
+.meas dc vd max v(d)
+.alter slow corner
+.lib 'corners.lib' ss
+.alter
+r1 vdd d 5k
+*> vd@1 1.675 1e-6
+*> vd@2 1.7232 1e-6
+*> vd@3 1.768 1e-6
+*> no-ngspice
+.end

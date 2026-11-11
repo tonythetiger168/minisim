@@ -307,6 +307,11 @@ tester with and without masking.
 with load, capture and compare on the wrapper around the netlist. It fails
 when the netlist has a defect the patterns detect.
 
+The pattern testbench writes its mismatches as a fail log with `+faillog`
+(`chip_edt.faillog`), one line per failing channel bit:
+`<pattern> ch <channel> <unload cycle>`. `mdft -diagnose` reads such a log
+with the compressed patterns in place of matpg's, see below.
+
 Not there yet: grading the masked patterns by fault simulation (a mask is
 chosen by the number of known cells, not by the faults they detect), and
 compare values for the port outputs.
@@ -411,3 +416,20 @@ compactor mapped back to cells first, which `-edt` does not do yet.
 
 Speed: a 60,000-gate, 6,000-flop netlist with 4,677 patterns and two
 injected defects diagnoses in 2.3 s on one thread and 0.6 s on four.
+
+### Compressed patterns
+
+```sh
+mdft -diagnose chip_edt.faillog -edt_patterns p.txt chip_scan.v -top chip
+```
+
+With `-edt_patterns` (the file `-edt_encode` or `-edt` writes when it has
+the netlist) the log is in output channel bits, `<pattern> ch <channel>
+<unload cycle>`, as the tester sees them. A channel bit is the XOR of the
+cells its chains show in that cycle, as far as the pattern's mask lets them
+through; a bit with an unknown in it is not compared. The diagnosis folds
+every candidate's failing cells through the same compactor, so two failing
+cells that cancel in a channel are predicted to pass, and scores against the
+channel bits. Candidates come from the fan-in of every cell that can reach a
+failing bit. Stuck-at only; port outputs are not compared in compressed
+patterns. `-diag_inject` and `-diag_log` work the same way.

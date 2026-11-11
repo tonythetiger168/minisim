@@ -94,6 +94,7 @@ class Elaborator {
     bool inSeq = false;
     Env cur;
     bool inProc = false;
+    bool parallelCases = true;   // parallelCase() below
     bool forceLive = false;   // loop steps run even on paths that took a break
     int callDepth = 0;
     const Bits* emptyArg = nullptr;   // the value an EmptyArgument stands for (output ports)
@@ -1053,6 +1054,7 @@ private:
                 }
             if (allConst && vals.size() == (size_t)1 << w) full = true;
         }
+        if (parallelCase(c, hits, full && !c.defaultCase)) return;
         if (full && !c.defaultCase && !hits.empty()) hits.back() = L1;
         std::function<void(size_t)> chain = [&](size_t k) {
             if (k == c.items.size()) {
@@ -1062,6 +1064,120 @@ private:
             branch(hits[k], [&] { stmt(*c.items[k].stmt); }, [&] { chain(k + 1); });
         };
         chain(0);
+    }
+
+    // A case whose items cannot match together (unique case, parallel_case,
+    // or distinct constant labels) needs no priority among them: each
+    // variable that every item and the default assign is OR(hit_k & value_k)
+    // instead of a chain of selects. False (and
+    // nothing done) when the case is not of that kind. lastIsRest: a full
+    // case with no default, whose last item takes every remaining value.
+    // v as a select tree over `base`: returns data with keep set so that
+    // v == keep ? base : data.
+    Lit splitHold(Lit v, Lit base, Lit& keep, int depth) {
+        keep = L0;
+        if (v == base) { keep = L1; return L0; }
+        Lit ms, mt, me;
+        if (depth > 12 || !g.asMux(v, ms, mt, me)) return v;
+        Lit kt, ke;
+        Lit dt = splitHold(mt, base, kt, depth + 1), de = splitHold(me, base, ke, depth + 1);
+        if (kt == L0 && ke == L0) return v;
+        keep = g.mux(ms, kt, ke);
+        return kt == L1 ? de : ke == L1 ? dt : g.mux(ms, dt, de);
+    }
+    bool parallelCase(const slang::ast::CaseStatement& c, const std::vector<Lit>& hits, bool lastIsRest) {
+        using CC = slang::ast::CaseStatementCondition;
+        if (!parallelCases || c.items.size() < 3) return false;
+        bool par = c.check == slang::ast::UniquePriorityCheck::Unique || c.check == slang::ast::UniquePriorityCheck::Unique0;
+        for (auto* attr : comp.getAttributes(c))
+            if (attr->name == "parallel_case") par = true;
+        if (!par && c.condition == CC::Normal) {
+            int w = widthOf(*c.expr.type, c.sourceRange.start());
+            std::set<int64_t> vals;
+            par = w <= 62;
+            for (auto& item : c.items)
+                for (const Expression* ie : item.expressions) {
+                    if (!par) break;
+                    int64_t v;
+                    Bits b = expr(*ie);
+                    if ((int)b.size() > w) { par = false; break; }
+                    b.resize(w, L0);
+                    if (!constVal(b, v, false) || !vals.insert(v).second) par = false;
+                }
+        }
+        if (!par) return false;
+        for (Lit h : hits)
+            if (h == L1) return false;
+        // every item from the same starting point
+        const Env saved = cur;
+        size_t n = c.items.size() - (lastIsRest ? 1 : 0);
+        std::vector<Env> envs(n);
+        std::vector<Lit> hs(hits.begin(), hits.begin() + n);
+        for (size_t k = 0; k < n; k++) {
+            if (hs[k] == L0) { envs[k] = saved; continue; }
+            cur = saved;
+            stmt(*c.items[k].stmt);
+            envs[k] = std::move(cur);
+        }
+        cur = saved;
+        if (lastIsRest) stmt(*c.items.back().stmt);
+        else if (c.defaultCase) stmt(*c.defaultCase);
+        Env def = cur;
+        // control state (break, return, memory write enables) by priority
+        for (size_t k = n; k-- > 0;)
+            if (hs[k] != L0) {
+                Env t = envs[k];
+                merge(cur, t, hs[k]);
+            }
+        Lit any = L0;
+        for (Lit h : hs) any = g.orl(any, h);
+        for (int pass = 0; pass < 2; pass++) {
+            std::set<const Symbol*> syms;
+            for (auto& e : envs)
+                for (auto& [sy, b] : pass ? e.nba : e.blk) syms.insert(sy);
+            for (auto& [sy, b] : pass ? def.nba : def.blk) syms.insert(sy);
+            auto& out = pass ? cur.nba : cur.blk;
+            for (const Symbol* sy : syms) {
+                auto valueIn = [&](const Env& e, const Bits& base) -> const Bits& {
+                    auto& m = pass ? e.nba : e.blk;
+                    auto it = m.find(sy);
+                    return it == m.end() ? base : it->second;
+                };
+                const Bits base = valueIn(saved, wires(*sy));
+                const Bits& dv = valueIn(def, base);
+                const Bits chain = out.at(sy);   // from the priority merge above
+                Bits res(base.size());
+                for (size_t i = 0; i < base.size(); i++) {
+                    Lit terms = L0, changing = L0, holding = L0;
+                    for (size_t k = 0; k < n; k++) {
+                        if (hs[k] == L0) continue;
+                        Lit v = valueIn(envs[k], base)[i];
+                        // an item that itself keeps the value under a
+                        // condition (if without else) changes it only on
+                        // the rest of its hit
+                        Lit h = hs[k];
+                        if (v != base[i]) {
+                            Lit keep = L0;
+                            v = splitHold(v, base[i], keep, 0);
+                            if (keep == L1) v = base[i];
+                            else if (keep != L0) h = g.andl(h, lneg(keep));
+                        }
+                        if (v == base[i]) { holding = g.orl(holding, hs[k]); continue; }
+                        if (h != hs[k]) holding = g.orl(holding, g.andl(hs[k], lneg(h)));
+                        changing = g.orl(changing, h);
+                        if (!g.isX(v)) terms = g.orl(terms, g.andl(h, v));
+                    }
+                    // Where an item or the default keeps the earlier value,
+                    // the chain of selects stays: the hold condition is
+                    // found there (aig::holdEnables), and that is worth
+                    // more than the flatter form.
+                    if (dv[i] == base[i] || holding != L0) res[i] = chain[i];
+                    else res[i] = g.isX(dv[i]) ? terms : g.orl(terms, g.andl(lneg(any), dv[i]));
+                }
+                out[sy] = std::move(res);
+            }
+        }
+        return true;
     }
 
     void foreachDims(const slang::ast::ForeachLoopStatement& f, size_t d) {

@@ -35,3 +35,15 @@ module CCU2C #(parameter [15:0] INIT0 = 0, INIT1 = 0, parameter INJECT1_0 = "YES
   assign S1 = p1 ^ c1;
   assign COUT = (~p1 & g1) | (p1 & co0);
 endmodule
+
+// 16 x 4 LUT RAM: clocked write, read without a clock
+module TRELLIS_DPR16X4 #(parameter WCKMUX = "WCK", WREMUX = "WRE", parameter [63:0] INITVAL = 64'd0)
+  (input [3:0] DI, WAD, input WRE, WCK, input [3:0] RAD, output [3:0] DO);
+  reg [3:0] mem [0:15];
+  integer i;
+  initial for (i = 0; i < 16; i = i + 1) mem[i] = INITVAL[4 * i +: 4];
+  wire wck = (WCKMUX == "INV") ? ~WCK : WCK;
+  wire wre = (WREMUX == "INV") ? ~WRE : WRE;
+  always @(posedge wck) if (wre) mem[WAD] <= DI;
+  assign DO = mem[RAD];
+endmodule
