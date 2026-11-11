@@ -28,7 +28,7 @@ jobs:
             if [ -f "$f" ]; then sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' "$f"; fi
           done
           printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "20";' 'Acquire::https::Timeout "20";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update
+          sudo timeout 240 apt-get update || echo "::warning::apt-get update did not finish cleanly"
 
       - name: Install g++ 13
         run: |

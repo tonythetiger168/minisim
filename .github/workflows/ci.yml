@@ -30,7 +30,7 @@ jobs:
             if [ -f "$f" ]; then sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' "$f"; fi
           done
           printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "20";' 'Acquire::https::Timeout "20";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update
+          sudo timeout 240 apt-get update || echo "::warning::apt-get update did not finish cleanly"
 
       - name: Cache fetched slang sources
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -64,7 +64,8 @@ jobs:
       # routed with nextpnr (tests/fpga/run_test.py skips what is not installed).
       - name: Install Yosys and nextpnr (mfpga tests)
         continue-on-error: true   # optional: a mirror problem must not fail CI
-        run: sudo apt-get update && sudo apt-get install -y yosys nextpnr-ice40 nextpnr-ecp5
+        timeout-minutes: 8        # ... nor hold the job while apt retries
+        run: sudo apt-get install -y yosys nextpnr-ice40 nextpnr-ecp5
 
       # The UVM tests (tests/uvm) run against the Accellera UVM library.
       - name: Fetch Accellera UVM (uvm-core 2020.3.1)
