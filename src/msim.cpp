@@ -416,6 +416,7 @@ static void splitCombBlocks(LowerResult& lowered) {
         for (size_t pc = 0; pc < end; pc++) {
             const Instr& i = code[pc];
             if ((i.k == IK::Jmp || i.k == IK::JmpIfNot) && i.target <= pc) { ok = false; why = "loop"; }   // a loop
+            if (i.tmp || i.xt != Instr::NOX) { ok = false; why = "-xprop code"; }   // shared temporaries, out-of-line jumps
             if (i.k == IK::Assert) {
                 const AssertInfo& a = asserts().at(i.sig);
                 for (auto* cs : {&a.passCap, &a.failCap})
