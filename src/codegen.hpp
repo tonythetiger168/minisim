@@ -497,13 +497,18 @@ public:
             o << "    S.fastSeqId = (int)S.seqs.size();\n    S.addSeq(dseq, nullptr, {";
             // Every event of every domain process: they wait on copies of the
             // same clocks (see cycleDomain), and one pending mark runs dseq once.
-            std::vector<std::pair<int, Edge>> ev;
-            for (int d : dom)
-                for (auto& e : procs[d].seqEv)
-                    if (std::find(ev.begin(), ev.end(), e) == ev.end()) ev.push_back(e);
-            for (size_t j = 0; j < ev.size(); j++)
-                o << (j ? ", " : "") << "{" << ev[j].first << ", " << edge(ev[j].second) << "}";
-            o << "});\n    S.fastCommit = fcommit;\n";
+            for (int g = 0; g < std::max(domGroups_, 1); g++) {
+                std::vector<std::pair<int, Edge>> ev;
+                for (int d : dom)
+                    if (domGroups_ <= 1 || domGroup_[d] == g)
+                        for (auto& e : procs[d].seqEv)
+                            if (std::find(ev.begin(), ev.end(), e) == ev.end()) ev.push_back(e);
+                if (g) o << "    S.addSeq(dseq, (const void*)(intptr_t)" << g << ", {";
+                for (size_t j = 0; j < ev.size(); j++)
+                    o << (j ? ", " : "") << "{" << ev[j].first << ", " << edge(ev[j].second) << "}";
+                o << "});\n";
+            }
+            o << "    S.fastCommit = fcommit;\n";
         }
         {   // clocked functions and coroutine processes, in process order
             std::string evs, tab;
@@ -1148,7 +1153,7 @@ private:
     // targets (a blocking write, as a testbench's reset, is fine: it is not
     // ordered against the NBA queue) and every jump in them goes forward (so each NBA runs at most
     // once and can own a fixed slot). Empty: no domain.
-    static std::vector<int> cycleDomain(const std::vector<CodegenProc>& procs, const std::vector<CodegenSig>& sigs) {
+    std::vector<int> cycleDomain(const std::vector<CodegenProc>& procs, const std::vector<CodegenSig>& sigs) {
         // The clock a process waits on is often a copy of the top clock made
         // by the port connections on the way down (assign u.clk_i = clk).
         // Copies change in the same comb pass as their source, so processes
@@ -1196,7 +1201,10 @@ private:
                 if (code[pc].k == IK::Assign) forward = false;
                 if (code[pc].arr || code[pc].bidx) forward = false;   // no fixed slot: an ordinary clocked function
             }
-            if (!forward) continue;
+            if (!forward) {
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "not in the domain (loop or run-time index): %s line %d\n", procs[i].kind.c_str(), code.empty() ? 0 : code[0].line);
+                continue;
+            }
             bool placed = false;
             for (auto& g : groups)
                 if (canon(procs[g[0]].seqEv) == canon(procs[i].seqEv)) { g.push_back((int)i); placed = true; break; }
@@ -1204,24 +1212,54 @@ private:
         }
         std::vector<int> best;
         for (auto& g : groups) if (g.size() > best.size()) best = g;
+        if (std::getenv("MSIM_WHYCYCLE"))
+            for (auto& g : groups) {
+                std::string ev;
+                for (auto& [sg, ed] : canon(procs[g[0]].seqEv)) ev += " " + sigs[sg].name + "/" + std::to_string((int)ed);
+                std::fprintf(stderr, "clock group of %zu:%s\n", g.size(), ev.c_str());
+            }
+        domGroup_.assign(procs.size(), -1);
+        domGroups_ = 0;
         if (best.empty()) return best;
-        std::vector<char> mine(procs.size(), 0);
-        for (int i : best) mine[i] = 1;
-        std::vector<int> targets;
-        for (int i : best)
-            for (auto& in : procs[i].prog->code) if (in.k == IK::Nba) targets.push_back(in.sig);
-        for (size_t i = 0; i < procs.size(); i++) {
-            if (mine[i]) continue;
-            std::vector<const Prog*> progs;
-            reach(procs[i].prog, progs);
-            for (const Prog* p : progs)
-                for (auto& in : p->code)
-                    if (in.k == IK::Nba &&
-                        std::find(targets.begin(), targets.end(), in.sig) != targets.end())
-                        return {};
+        // No other process may make an NBA to a target of the domain.
+        auto clash = [&](const std::vector<int>& d) {
+            std::vector<char> mine(procs.size(), 0);
+            for (int i : d) mine[i] = 1;
+            std::vector<int> targets;
+            for (int i : d)
+                for (auto& in : procs[i].prog->code) if (in.k == IK::Nba) targets.push_back(in.sig);
+            std::sort(targets.begin(), targets.end());
+            for (size_t i = 0; i < procs.size(); i++) {
+                if (mine[i]) continue;
+                std::vector<const Prog*> progs;
+                reach(procs[i].prog, progs);
+                for (const Prog* p : progs)
+                    for (auto& in : p->code)
+                        if (in.k == IK::Nba && std::binary_search(targets.begin(), targets.end(), in.sig)) return true;
+            }
+            return false;
+        };
+        // Every group (each wakes on its own events, see dseq), when there
+        // are few; else, or when that clashes, the largest one alone.
+        std::vector<int> all;
+        if (groups.size() > 1 && groups.size() <= 8) {
+            for (auto& g : groups) all.insert(all.end(), g.begin(), g.end());
+            std::sort(all.begin(), all.end());
+            if (clash(all)) all.clear();
         }
+        if (!all.empty()) {
+            for (size_t g = 0; g < groups.size(); g++)
+                for (int i : groups[g]) domGroup_[i] = (int)g;
+            domGroups_ = (int)groups.size();
+            return all;
+        }
+        if (clash(best)) return {};
+        for (int i : best) domGroup_[i] = 0;
+        domGroups_ = 1;
         return best;
     }
+    std::vector<int> domGroup_;   // cycleDomain: per process, its clock group in the domain (or -1)
+    int domGroups_ = 0;
 
     // A signal is private to the cycle domain when only the domain uses it
     // in ways that need S.sigs: a full-width NBA target of a domain process or the output of a
@@ -1681,6 +1719,14 @@ private:
             for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j] << "_2";
             o << "};\n";
         }
+        // Several clock groups: dseq is registered once per group and runs
+        // that group's processes; one marker NBA per slot commits them all.
+        const bool multi = domGroups_ > 1;
+        if (multi) {
+            o << "static const uint8_t DSGRP[] = {";
+            for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << domGroup_[dom[j]];
+            o << "};\nstatic bool dpend = false;\n";
+        }
         // Islands (like the kernel's partitions): processes and comb statements
         // that share no signal the domain writes. When every domain target is
         // private, each group of islands runs its NBAs, commit and comb logic
@@ -1735,7 +1781,7 @@ private:
         for (auto* in : combIns) islandOf(in->sig);
         int nIsl = (int)islandId.size();
         const int kGroups = 64;
-        bool par = allPriv && nIsl >= 32 && !serialOnly;
+        bool par = allPriv && nIsl >= 32 && !serialOnly && !multi;
         int G = par ? std::min(nIsl, kGroups) : 0;
         auto groupOf = [&](int sig) { return (int)((int64_t)islandOf(sig) * G / nIsl); };
         if (par) {
@@ -1756,7 +1802,7 @@ private:
             for (int g = 0; g < G; g++) o << (g ? ", " : "") << "dsG" << g;
             o << "};\n";
         }
-        o << "static void dseq(const void*, std::vector<Sim::NbaItem>& nb) {\n";
+        o << "static void dseq(const void* ctx, std::vector<Sim::NbaItem>& nb) {\n    (void)ctx;\n";
         if (par)
             // Nothing else runs before the NBA region (S.fuseOk()): each group
             // computes, commits and settles its islands in one parallel pass.
@@ -1770,8 +1816,13 @@ private:
                  "        return;\n    }\n"
                  "    { const bool t = twoNow(); const int use = S.domainTune[1].pick(S.threads);\n"
                  "      S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); }, use); S.domainTune[1].done(S.threads); }\n";
-        else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
-        if (!par) o << "    for (auto f : DS) f();\n";
+        else if (multi) {
+            o << "    const int grp = (int)(intptr_t)ctx;\n";
+            if (two) o << "    if (twoNow()) { for (size_t j = 0; j < " << dom.size() << "; j++) if (DSGRP[j] == grp) DS2[j](); } else\n";
+            o << "    for (size_t j = 0; j < " << dom.size() << "; j++) if (DSGRP[j] == grp) DS[j]();\n"
+                 "    if (dpend) return;\n    dpend = true;\n";
+        } else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
+        if (!par && !multi) o << "    for (auto f : DS) f();\n";
         o << "    nb.push_back({-1, Val{}, -1, 0});\n}\n";
         // Both are split into functions of at most kChunk statements: one huge
         // function takes the C++ compiler minutes and is no faster.
@@ -1933,7 +1984,7 @@ private:
                  "    if (S.observed) syncP();\n}\n\n";
             return;
         }
-        o << "static void fcommit() {";
+        o << "static void fcommit() {" << (multi ? " dpend = false;" : "");
         for (int j = 0; j < nm; j++) o << " commitP" << j << "();";
         o << " S.fastCombs(combAll); if (S.observed) syncP(); }\n\n";
     }
