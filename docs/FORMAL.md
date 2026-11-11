@@ -77,7 +77,18 @@ concurrent assertions inside procedures, `expect`.
 
 * **One clock.** Flops and assertions on the rising edge of one clock: the
   one the assertions use, or `-clock SIG`. One cycle of the model is one
-  rising edge. An asynchronous reset is treated as a synchronous one.
+  rising edge.
+* **Asynchronous set and reset.** For `always_ff @(posedge clk or negedge
+  rst_n)` and the like, what the block assigns while a control is at its
+  active level is visible in the same cycle, not from the next edge on, and
+  stays as long as the control is active (level-sensitive, as the flop is
+  built; a simulator runs the block only on the control's edge, which
+  differs when one control is released while another is still active). A
+  control changes at most once per cycle, like any other input.
+* **Latches.** A bit that a combinational block (`always_latch`, or an
+  `always_comb` with a path that does not assign it) leaves unassigned keeps
+  the value the signal had in the cycle before. A latch enabled by the clock
+  itself is not modelled (the clock reads as 0 inside a cycle).
 * **Reset.** `-reset SIG` (active high) or `-reset_n SIG` (active low);
   without either, an input named `rst`, `reset`, `rst_n`, `resetn`, ... is
   used. The reset is held for `-reset-cycles` cycles (default 1) from a state

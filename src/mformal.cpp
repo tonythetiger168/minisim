@@ -1089,10 +1089,107 @@ struct Model {
         return cur(s);
     }
     std::unordered_map<int, SV> latchMemo;
+    // What a combinational block's output is where the block does not assign
+    // it: a latch. It holds the signal's value of the cycle before (state bits
+    // whose next value is the signal itself, see closeStates).
+    std::vector<std::pair<int, int>> latches;   // signal, first state bit
     SV latchBase(int s) {
         if (auto it = latchMemo.find(s); it != latchMemo.end()) return it->second;
-        SV v = freeSig(s, "$undriven");
+        SV v;
+        int first = (int)stateBits.size();
+        newInputs(sigs[(size_t)s].w, v.b, sigs[(size_t)s].name + "$latch", 1);
+        for (int b = 0; b < sigs[(size_t)s].w; b++) {
+            StateBit sb;
+            sb.in = v.b[(size_t)b];
+            auto& iv = initVal[(size_t)s];
+            sb.init = b < (int)iv.size() ? iv[(size_t)b] : -1;
+            stateBitOfInput[sb.in >> 1] = (int)stateBits.size();
+            stateBits.push_back(sb);
+        }
+        latches.push_back({s, first});
         latchMemo[s] = v;
+        return v;
+    }
+    // ---- asynchronous set / reset
+    // A clocked process that also waits for an edge of another signal
+    // (always_ff @(posedge clk or negedge rst_n)). While such a signal is at
+    // its active level the process has run on that edge, so what it assigns
+    // then is visible at once, not from the next clock edge on. asyncOf runs
+    // the body once on the current values; asyncView puts its assignments in
+    // front of the stored state whenever a control is active.
+    struct AsyncRun {
+        bool ok = false, running = false;
+        int active = 0;
+        Env blk, nba;
+    };
+    std::map<int, AsyncRun> asyncRuns;
+    SV rawState(int s) {
+        SV v;
+        auto [first, cnt] = stateRange[(size_t)s];
+        for (int b = 0; b < cnt; b++) v.b.push_back(stateBits[(size_t)(first + b)].in);
+        return v;
+    }
+    const AsyncRun* asyncOf(int p) {
+        auto [it, fresh] = asyncRuns.try_emplace(p);
+        AsyncRun& ar = it->second;
+        if (!fresh) {
+            if (ar.running) unsup("asynchronous controls that depend on each other");
+            return ar.ok ? &ar : nullptr;
+        }
+        ProcInfo& q = pi[(size_t)p];
+        if (q.kind != P_CLOCKED) return nullptr;
+        std::vector<std::pair<int, Edge>> ctl;
+        for (auto& [sg, e] : eventsOf(lowered.procs[(size_t)p].prog.code[0])) {
+            if (clockSig >= 0 && canon(sg) == clockSig) continue;
+            if (e != POS && e != NEG) return nullptr;
+            if (sigs[(size_t)sg].w != 1) return nullptr;
+            ctl.push_back({sg, e});
+        }
+        if (ctl.empty()) return nullptr;
+        ar.running = true;
+        std::vector<int> made;   // registers of this process first seen here: their view comes after
+        try {
+            for (auto& [sg, e] : ctl) ar.active = g.Or(ar.active, cur(sg).b[0] ^ (e == POS ? 0 : 1));
+            Exec ex{*this};
+            ex.base = [&](int r) -> SV {
+                if (std::binary_search(q.writes.begin(), q.writes.end(), r)) {   // its own registers: the stored value
+                    if (isState[(size_t)r]) return rawState(r);
+                    bool reg = !curMemo[(size_t)r] && !stageOf.count(r) && !cutSigs.count(r);
+                    for (int w : writers[(size_t)r]) reg = reg && pi[(size_t)w].kind == P_CLOCKED;
+                    if (reg) {
+                        SV v = makeState(r);
+                        curMemo[(size_t)r] = v;
+                        made.push_back(r);
+                        return v;
+                    }
+                }
+                return cur(r);
+            };
+            St st = ex.run(lowered.procs[(size_t)p].prog, q.lo, q.hi, St{});
+            ar.blk = std::move(st.blk);
+            ar.nba = std::move(st.nba);
+            ar.ok = true;
+        } catch (const Unsupported&) {
+            ar.ok = false;   // the controls then act at the next clock edge only
+        }
+        ar.running = false;
+        for (int r : made) curMemo[(size_t)r] = asyncView(r, rawState(r));
+        return ar.ok ? &ar : nullptr;
+    }
+    SV asyncView(int s, SV v) {
+        curMemo[(size_t)s] = v;   // a read from inside the runs below is of the stored value
+        int w = sigs[(size_t)s].w;
+        for (int p : writers[(size_t)s]) {
+            const AsyncRun* ar = nullptr;
+            try { ar = asyncOf(p); } catch (const Unsupported&) {}
+            if (!ar) continue;
+            for (const Env* env : {&ar->blk, &ar->nba}) {
+                auto it = env->find(s);
+                if (it == env->end()) continue;
+                for (int b = 0; b < w; b++)
+                    if (it->second.t[(size_t)b]) v.b[(size_t)b] = g.Mux(ar->active, it->second.b[(size_t)b], v.b[(size_t)b]);
+            }
+        }
         return v;
     }
     // A comb process asked for one of its outputs while it is running: the
@@ -1198,7 +1295,7 @@ struct Model {
             cutNotes.insert(sigs[(size_t)s].name + ": assigned by both clocked and combinational processes");
             return freeSig(s);
         }
-        if (anyClocked) return makeState(s);
+        if (anyClocked) return asyncView(s, makeState(s));
         // combinational: every driver's bits side by side
         int w = sigs[(size_t)s].w;
         SV v;
@@ -1245,7 +1342,18 @@ struct Model {
 
     // ---- next-state functions ----
     void closeStates() {
-        for (size_t k = 0; k < stateSigs.size(); k++) {   // grows as cones pull in more state
+        size_t k = 0, lj = 0;
+        while (k < stateSigs.size() || lj < latches.size()) {
+        for (; lj < latches.size(); lj++) {   // a latch holds the value its signal had
+            auto [s, first] = latches[lj];
+            SV nx;
+            try { nx = cur(s); } catch (const Unsupported& u) {
+                cutNotes.insert(sigs[(size_t)s].name + ": " + u.what());
+                nx = freeSig(s, "$next");
+            }
+            for (int b = 0; b < sigs[(size_t)s].w; b++) stateBits[(size_t)(first + b)].next = nx.b[(size_t)b];
+        }
+        for (; k < stateSigs.size(); k++) {   // grows as cones pull in more state
             int s = stateSigs[k];
             int w = sigs[(size_t)s].w;
             auto [first, cnt] = stateRange[(size_t)s];
@@ -1296,6 +1404,7 @@ struct Model {
                 }
             }
             for (int b = 0; b < cnt; b++) stateBits[(size_t)(first + b)].next = nx.b[(size_t)b];
+        }
         }
     }
 
