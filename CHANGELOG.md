@@ -416,6 +416,25 @@ Spec references are IEEE 1800-2023 clauses.
   resets to flop pins. `-nocarry` and `-noce` turn each off.
 - `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
   `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
+  netlists with R, C, L, coupled inductors, independent and controlled
+  sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
+  transistors; `.model`, `.param` with expressions, nested `.subckt`,
+  `.include`, `.ic`, `.nodeset`, `.option`, `.print`, `.measure` and `.step`;
+  CSV (`-o`) and VCD (`-vcd`) output. Sparse LU with pivot reuse, latent
+  device bypass, and threads for `.step` runs, AC points and model
+  evaluation, with identical output at any `-threads`. Every test netlist is
+  checked against hand-worked values and against ngspice. See
+  `docs/SPICE.md`.
+- `mspice`: MOSFET evaluation and matrix assembly run in parallel (a
+  2,000-inverter chain goes from 1.14 s to 0.70 s on four threads, with the
+  same output bit for bit); `parmin` now defaults to 1024. The reader gains
+  `spice::flatten()`, a flat list of primitive elements for LVS and cell
+  characterization, printed by `mspice -flatten [-top name]`.
+- `mspice`: `.option chgtol=` (needed for accurate edges on femtofarad
+  nodes) and `spice::Reader::readText()` for netlists held in memory.
+  mspice now runs on the shared thread pool of `src/parallel.hpp`, which
+  gains `Pool::spin()` for short batches that come one after the other.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

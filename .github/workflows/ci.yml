@@ -11,6 +11,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Same mirror probe as in the slang job below. The runner image's default mirror (azure.archive.ubuntu.com) and then
+      # archive.ubuntu.com itself stopped resolving on the hosted runners, which
+      # failed every apt step. Probe a short list of mirrors (packages are
+      # signature-checked, so any mirror is safe), point apt at the first one
+      # that answers, and make apt fail fast. APT_OK=0 when none answers, so
+      # optional installs are skipped instead of holding the job in retries.
+      - name: Pick a reachable apt mirror
+        run: |
+          rel=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          pick=
+          for m in http://azure.archive.ubuntu.com/ubuntu http://archive.ubuntu.com/ubuntu \
+                   https://mirrors.edge.kernel.org/ubuntu https://mirror.us.leaseweb.net/ubuntu \
+                   https://ftp.halifax.rwth-aachen.de/ubuntu; do
+            if curl -fsS --max-time 10 -o /dev/null "$m/dists/$rel/InRelease"; then pick=$m; break; fi
+          done
+          printf '%s\n' 'Acquire::Retries "2";' 'Acquire::http::Timeout "15";' 'Acquire::https::Timeout "15";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          if [ -z "$pick" ]; then
+            echo "::warning::no Ubuntu apt mirror is reachable; using preinstalled packages only"
+            echo "APT_OK=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "apt mirror: $pick"
+          if [ -f /etc/apt/apt-mirrors.txt ]; then printf '%s/\tpriority:1\n' "$pick" | sudo tee /etc/apt/apt-mirrors.txt; fi
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            if [ -f "$f" ]; then sudo sed -i -E "s|https?://azure\.archive\.ubuntu\.com/ubuntu/?|$pick/|g" "$f"; fi
+          done
+          if sudo timeout 240 apt-get update; then echo "APT_OK=1" >> "$GITHUB_ENV"; else echo "APT_OK=0" >> "$GITHUB_ENV"; fi
+
+      # mspice's tests compare every measurement with ngspice when it is
+      # installed; without a mirror they still check their own expected values.
+      - name: Install ngspice
+        run: |
+          if [ "$APT_OK" = 1 ]; then sudo apt-get install -y ngspice
+          else echo "::warning::no apt mirror: mspice tests run without the ngspice comparison"; fi
+
       - name: Configure, build, and test
         run: CXX=g++ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 
