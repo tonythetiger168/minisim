@@ -13,8 +13,16 @@ Spec references are IEEE 1800-2023 clauses.
   stay under it, and so does the git history. `docs/LICENSING.md` holds the
   open-core policy, the proposed free / paid split per tool, and the rule
   that no GPL or other copyleft code enters the tree.
+- Protected IP: the `-license <feature>` option is removed. It let the IP
+  user grant a licensed right to themselves; only the license proxy named by
+  the envelope decides now. `-license_fail stop|deny` chooses what happens
+  when no proxy can be reached.
 
 ### Added
+- Protected IP: the IEEE 1735-2023 clause 8 license system. `msim`, `mlint`
+  and `mdft` ask the IP author's license proxy over TLS for the value of a
+  `license(...)` or `license_string(...)` call in a right; `mlicproxy` is
+  such a proxy, driven by a license file. See "Licenses" in `docs/PROTECT.md`.
 - `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
   built from the spare cells of the old netlist and the cells the change
   frees, by function (the same cell, or one with inputs tied or shared, or
