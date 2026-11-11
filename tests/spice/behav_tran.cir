@@ -1,0 +1,27 @@
+behavioral sources in a transient and in AC
+* A multiplier squares a 1 kHz sine: sin^2 = (1 - cos(2wt))/2, so the output
+* swings 0 to 1 at 2 kHz with an average of 0.5; a source written with
+* `time` ramps to 2 at 2 ms. In AC the multiplier is linearized at
+* v(in) = 0 + dc: with the 1.5 V bias on c, d(v(c)*v(c))/dv(c) = 3.
+v1 in 0 sin(0 1 1k)
+b1 sq 0 v = v(in)*v(in)
+r1 sq 0 1k
+b2 rmp 0 v = time * 1k
+r2 rmp 0 1k
+vc c 0 dc 1.5 ac 1
+b3 lin 0 v = v(c)*v(c)
+r3 lin 0 1k
+.tran 2u 2m 0 2u
+.meas tran sqmax max v(sq)
+.meas tran sqavg avg v(sq) from=0 to=2m
+.meas tran tpeak2 when v(sq)=0.5 rise=2
+.meas tran rmp max v(rmp)
+.ac dec 1 1k 10k
+.meas ac gain find vm(lin) at=1k
+*> sqmax 1 1e-4
+*> sqavg 0.5 1e-4
+*> tpeak2 6.25e-4 1e-3
+*> rmp 2 1e-9
+*> gain 3 1e-9
+*> no-ngspice
+.end
