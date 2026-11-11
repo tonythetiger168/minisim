@@ -202,6 +202,7 @@ struct VpiSite {
     std::string file;
     int line = 0;
     const void* scope = nullptr;   // the instance the call is in (slang InstanceSymbol)
+    bool prot = false;             // the call is in protected IP (37.3.6, IEEE 1735 9.7.1)
     mutable void* userdata = nullptr;   // vpi_put_userdata (38.40)
 };
 // An unpacked array actual of a DPI call: a fixed array or a container.

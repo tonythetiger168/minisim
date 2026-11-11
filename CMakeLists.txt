@@ -286,6 +286,12 @@ if(MINISIM_WITH_SLANG)
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_protect
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_protect.cmake)
   endif()
+  # VPI and DPI cannot look into protected IP (37.3.6; IEEE 1735 9.7).
+  if(OPENSSL_FOUND AND OPENSSL_CLI AND UNIX)
+    add_test(NAME pli_protect
+             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pli_protect.sh $<TARGET_FILE:msim> $<TARGET_FILE:msimprotect>
+                     ${OPENSSL_CLI} ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/pli_protect)
+  endif()
   # The virtual prototype layer: the design reaching C models over AXI4-Lite.
   add_test(NAME msim_mvp
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}

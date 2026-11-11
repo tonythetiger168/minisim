@@ -21,6 +21,12 @@ Spec references are IEEE 1800-2023 clauses.
   the inverse plus a spare inverter); no cell is added or removed, and the
   script holds only net connections. Exit status 3 when a cell had to be
   added after all. See `docs/ECO.md`.
+- Protected IP and VPI / DPI (IEEE 1800-2023 37.3.6, IEEE 1735-2023 9.7):
+  `vpiIsProtected`, and for a protected object only `vpiType` (and `vpiSize`
+  of an expression) can be read. Handles, iteration, names, values,
+  callbacks and `vpi_handle_by_name` are errors; the IP's own system task
+  calls keep working. `svGetNameFromScope` and `svGetCallerInfo` give
+  nothing for protected code. See "VPI and DPI" in `docs/PROTECT.md`.
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
   changed, and the assignments that write them. The viewer page does the same.
