@@ -26,6 +26,7 @@ class Gen:
         self.arrs = []      # (name, size, writable)
         self.pts = []       # lvalues of struct type pt_t
         self.loopy = not self.pipe and self.r.random() < 0.3   # has loops shaped for loop pipelining
+        self.streams = not self.pipe and self.r.random() < 0.25   # has stream arguments
         self.depth = 0
         self.loop = 0
         self.n = 0
@@ -75,6 +76,14 @@ class Gen:
 
     def stmt(self):
         r = self.r
+        if self.streams and r.random() < 0.15:
+            if r.random() < 0.5:
+                self.n += 1
+                self.emit("uint8_t v%d = sin.read();" % self.n)
+                self.vars.append(("v%d" % self.n, "uint8_t"))
+            else:
+                self.emit("sout.write(%s);" % self.expr(1))
+            return
         k = r.random()
         if k < 0.40 and self.vars:
             n, _ = r.choice(self.vars)
@@ -255,6 +264,10 @@ class Gen:
             self.src_t = r.choice(TYPES[:8])
             params.append("const %s src[16]" % self.src_t)
             params.append("%s dst[16]" % r.choice(TYPES[:8]))
+        if self.streams:
+            out.insert(1, '#include "%s"' % os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "include", "mhls_stream.h"))
+            params.append("hls::stream<uint8_t>& sin")
+            params.append("hls::stream<uint16_t>& sout")
         ret = self.ty()
         out.append("%s f(%s) {" % (ret, ", ".join(params)))
         for x in late:

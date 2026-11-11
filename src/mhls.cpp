@@ -192,9 +192,12 @@ void scheduleBlock(Function& f, Block& B, const Cfg& cfg, int mode, std::map<int
     if (fromReg) tin = std::max(tin, tcq);
     if (o.k == OpK::Load || o.k == OpK::Store) {
       if (tin + kMemSu * cfg.scale > budget && tin > tcq) { s++; tin = tcq; }
-      auto it = lastAcc.find(o.ref);
+      // One transfer per state over all streams: a state waits for at most
+      // one partner.
+      int port = f.arrs[o.ref].mode == Arr::Stream ? -1 : o.ref;
+      auto it = lastAcc.find(port);
       if (it != lastAcc.end()) s = std::max(s, it->second + 1);
-      lastAcc[o.ref] = s;
+      lastAcc[port] = s;
       o.st = s;
       o.tout = 0;
       continue;
@@ -376,6 +379,8 @@ std::string schedulePipeLoop(Function& f, Block& B, int bi, const Cfg& cfg, int 
     const Op& o = f.ops[id];
     if (o.cyc > 1) return std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)";
     if (o.k != OpK::Load && o.k != OpK::Store) continue;
+    if (f.arrs[o.ref].mode == Arr::Stream)
+      return "it reads or writes stream '" + f.arrs[o.ref].name + "', which can make an iteration wait";
     auto [it, fresh] = acc.insert({o.ref, {o.st, o.st}});
     if (fresh) continue;
     it->second.second = o.st;
@@ -695,6 +700,13 @@ struct Emitter {
         const Arr& a = f.arrs[pm.id];
         std::string n = svName(a.name);
         if (!a.read && !a.written) continue;
+        if (a.mode == Arr::Stream) {
+          std::string in = a.read ? "input  logic " : "output logic ", back = a.read ? "output logic " : "input  logic ";
+          p.push_back(in + rng(a.ety.w) + n + "_tdata");
+          p.push_back(in + n + "_tvalid");
+          p.push_back(back + n + "_tready");
+          continue;
+        }
         p.push_back("output logic " + rng(a.aw()) + n + "_addr");
         p.push_back("output logic " + n + "_ce");
         if (a.written) {
@@ -753,6 +765,18 @@ struct Emitter {
     for (auto& v : f.vars)
       if (v.portOut || v.port == Var::Ret) o << "  assign " << outPort(v) << " = r_" << v.name << ";\n";
 
+    // Streams. A transfer happens in a cycle where tvalid and tready are high.
+    for (auto& a : f.arrs) {
+      if (a.mode != Arr::Stream || (!a.read && !a.written)) continue;
+      std::string n = svName(a.name);
+      o << "  logic " << n << "_ce;\n  logic " << rng(a.ety.w) << n << (a.read ? "_rdata" : "_wdata") << ";\n";
+      if (a.read)
+        o << "  assign " << n << "_tready = " << n << "_ce;\n  always_ff @(posedge ap_clk) if (" << n << "_ce && " << n
+          << "_tvalid) " << n << "_rdata <= " << n << "_tdata;\n";
+      else
+        o << "  assign " << n << "_tvalid = " << n << "_ce;\n  assign " << n << "_tdata = " << n << "_wdata;\n";
+    }
+
     // Internal RAMs.
     for (auto& a : f.arrs) {
       if (a.mode != Arr::Mem || a.isParam || (!a.read && !a.written)) continue;
@@ -771,6 +795,7 @@ struct Emitter {
     // Datapath: one wire per operator.
     std::vector<std::vector<std::string>> act(sc.nStates);
     std::map<int, std::vector<std::string>> memAct;   // array -> case arms
+    std::map<int, std::vector<std::string>> waits;    // state -> what it waits for
     for (size_t bi = 0; bi < f.blocks.size(); bi++) {
       const Block& B = f.blocks[bi];
       if (B.pipeL) {
@@ -785,10 +810,20 @@ struct Emitter {
           const Arr& a = f.arrs[p.ref];
           std::string n = a.isParam ? svName(a.name) : a.name;
           std::string arm = "      " + st(B.base + p.st) + ": begin " + n + "_addr = " + R(p.a, a.aw()) + "; ";
-          if (p.k == OpK::Load) {
-            arm += n + "_ce = 1'b1; end\n";
+          // A memory access in a state that waits for a stream happens in
+          // the state's last cycle only: a read repeated earlier would
+          // replace data the waiting transfer still uses. The mark is
+          // replaced once the waits of every state are known.
+          std::string gate = "@W" + std::to_string(B.base + p.st) + "@";
+          if (a.mode == Arr::Stream) {
+            // The state is held until the element has been taken or sent.
+            arm = "      " + st(B.base + p.st) + ": begin " + n + "_ce = " + (p.c >= 0 ? R(p.c, 1) : "1'b1") + "; " +
+                  (p.k == OpK::Store ? n + "_wdata = " + R(p.b, a.ety.w) + "; " : "") + "end\n";
+            waits[B.base + p.st].push_back("(!" + n + "_ce || " + n + (p.k == OpK::Load ? "_tvalid" : "_tready") + ")");
+          } else if (p.k == OpK::Load) {
+            arm += n + "_ce = " + gate + "1'b1; end\n";
           } else {
-            std::string en = p.c >= 0 ? R(p.c, 1) : "1'b1";
+            std::string en = gate + (p.c >= 0 ? R(p.c, 1) : "1'b1");
             arm += n + "_ce = " + en + "; " + n + "_we = " + en + "; " + n + "_wdata = " + R(p.b, a.ety.w) + "; end\n";
           }
           memAct[p.ref].push_back(arm);
@@ -858,10 +893,22 @@ struct Emitter {
     for (auto& [ai, arms] : memAct) {
       const Arr& a = f.arrs[ai];
       std::string n = a.isParam ? svName(a.name) : a.name;
+      if (a.mode == Arr::Stream) {
+        o << "  always_comb begin\n    " << n << "_ce = 1'b0;" << (a.read ? "" : " " + n + "_wdata = '0;");
+      } else {
       o << "  always_comb begin\n    " << n << "_addr = '0; " << n << "_ce = 1'b0;";
       if (a.written || !a.isParam) o << " " << n << "_we = 1'b0; " << n << "_wdata = '0;";
+      }
       o << "\n    case (state)\n";
-      for (auto& s : arms) o << s;
+      for (std::string s : arms) {
+        for (size_t at; (at = s.find("@W")) != std::string::npos;) {
+          size_t end = s.find('@', at + 2);
+          std::string g;
+          for (auto& w : waits[std::stoi(s.substr(at + 2, end - at - 2))]) g += w + " && ";
+          s.replace(at, end - at + 1, g);
+        }
+        o << s;
+      }
       o << "      default: ;\n    endcase\n  end\n";
     }
 
@@ -884,7 +931,9 @@ struct Emitter {
     }
     o << "          " << go(0) << "\n        end\n";
     for (int s = 1; s < sc.nStates; s++) {
-      o << "        " << st(s) << ": begin\n";
+      o << "        " << st(s) << ": ";
+      for (size_t i = 0; i < waits[s].size(); i++) o << (i ? " && " : "if (") << waits[s][i] << (i + 1 == waits[s].size() ? ") " : "");
+      o << "begin\n";
       for (auto& a : act[s]) o << "          " << a << "\n";
       o << "        end\n";
     }
@@ -1118,6 +1167,8 @@ void checkPipeline(const Function& f, const Program& P, const Func& src) {
   const Block& B = f.blocks[0];
   for (int id : B.ops) {
     const Op& o = f.ops[id];
+    if ((o.k == OpK::Load || o.k == OpK::Store) && f.arrs[o.ref].mode == Arr::Stream)
+      no("it reads or writes stream '" + f.arrs[o.ref].name + "' (use the FSM architecture)");
     if (o.k == OpK::Load || o.k == OpK::Store) no("array '" + f.arrs[o.ref].name + "' is a memory (raise -max-reg-array, or use the FSM architecture)");
     if (o.cyc > 1) no(std::string("a ") + opName(o.k) + " takes more than one clock period (raise -clock)");
   }
@@ -1166,6 +1217,7 @@ struct Vec {
   std::map<int, uint64_t> in;     // variable -> input value
   std::map<int, uint64_t> out;    // variable -> expected output
   std::vector<std::tuple<int, int, uint64_t>> memChg;   // array, index, new value
+  std::map<int, std::vector<uint64_t>> sIn, sOut;        // stream -> the elements taken / sent by this call
   long lat = 0;
 };
 struct Vectors {
@@ -1173,6 +1225,10 @@ struct Vectors {
   std::vector<Vec> v;
   std::map<int, std::vector<uint64_t>> memFinal;
 };
+
+// What the source of a stream offers in the reference run and in the
+// testbench: this many elements, over and over.
+const int kStreamSrc = 64;
 
 Vectors makeVectors(const Function& f, int n, uint64_t seed) {
   Vectors V;
@@ -1182,6 +1238,7 @@ Vectors makeVectors(const Function& f, int n, uint64_t seed) {
   for (auto& pm : f.params)
     if (pm.k == Param::Array) {
       const Arr& a = f.arrs[pm.id];
+      if (a.mode == Arr::Stream) m.mems[pm.id].assign(a.read ? kStreamSrc : 0, 0);
       for (auto& x : m.mems[pm.id]) x = r.value(a.ety.w);
       V.memInit[pm.id] = m.mems[pm.id];
     }
@@ -1197,7 +1254,14 @@ Vectors makeVectors(const Function& f, int n, uint64_t seed) {
       }
     }
     auto before = m.mems;
+    auto pos = m.spos;
     vec.lat = interpret(f, m) + (f.pipeline ? 0 : 1);
+    for (auto& pm : f.params) {
+      if (pm.k != Param::Array || f.arrs[pm.id].mode != Arr::Stream) continue;
+      for (size_t k = pos[pm.id]; k < m.spos[pm.id]; k++) vec.sIn[pm.id].push_back(m.mems[pm.id][k % kStreamSrc]);
+      vec.sOut[pm.id] = std::move(m.sout[pm.id]);
+      m.sout[pm.id].clear();
+    }
     for (size_t v = 0; v < f.vars.size(); v++)
       if (f.vars[v].portOut || f.vars[v].port == Var::Ret) vec.out[(int)v] = m.vars[v];
     for (auto& pm : f.params)
@@ -1207,7 +1271,7 @@ Vectors makeVectors(const Function& f, int n, uint64_t seed) {
     V.v.push_back(vec);
   }
   for (auto& pm : f.params)
-    if (pm.k == Param::Array) V.memFinal[pm.id] = m.mems[pm.id];
+    if (pm.k == Param::Array && f.arrs[pm.id].mode != Arr::Stream) V.memFinal[pm.id] = m.mems[pm.id];
   return V;
 }
 
@@ -1220,6 +1284,7 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
     << " calls with expected values from the C reference run.\n`timescale 1ns/1ps\nmodule " << f.name << "_tb;\n";
   o << "  logic ap_clk = 0, ap_rst = 1;\n  integer tb_errors = 0, tb_lat = 0, tb_latmin = 1 << 30, tb_latmax = 0, tb_n = 0;\n";
   std::string conn = ".ap_clk(ap_clk), .ap_rst(ap_rst)";
+  int nStreams = 0;
   const bool hs = cfg.handshake;
   if (hs) {
     o << "  logic in_valid = 0, out_ready = " << (f.pipeline ? 1 : 0) << ";\n  wire in_ready, out_valid;\n";
@@ -1235,6 +1300,40 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
     if (pm.k == Param::Array) {
       const Arr& a = f.arrs[pm.id];
       if (!a.read && !a.written) continue;
+      if (a.mode == Arr::Stream) {
+        // A source that offers its elements in order and a sink that checks
+        // what arrives; while tb_stall is set both hesitate now and then.
+        std::string n = svName(a.name), k = std::to_string(nStreams++);
+        if (nStreams == 1)
+          o << "  logic tb_stall = 0;\n  integer tb_t = 0;\n  always @(posedge ap_clk) tb_t <= tb_t + 1;\n";
+        conn += ", ." + n + "_tdata(" + n + "_tdata), ." + n + "_tvalid(" + n + "_tvalid), ." + n + "_tready(" + n + "_tready)";
+        if (a.read) {
+          o << "  logic " << rng(a.ety.w) << n << "_src [0:" << kStreamSrc - 1 << "];\n  integer " << n << "_pos = 0;\n  logic " << n
+            << "_tvalid = 0, " << n << "_took = 0;\n  wire " << n << "_tready;\n  wire " << rng(a.ety.w) << n << "_tdata = " << n
+            << "_src[" << n << "_pos % " << kStreamSrc << "];\n";
+          o << "  always @(posedge ap_clk) begin\n    " << n << "_took <= " << n << "_tvalid && " << n << "_tready;\n    if (" << n
+            << "_tvalid && " << n << "_tready) " << n << "_pos <= " << n << "_pos + 1;\n  end\n";
+          o << "  always @(negedge ap_clk) if (!" << n << "_tvalid || " << n << "_took) " << n << "_tvalid = !tb_stall || (tb_t + "
+            << k << ") % 5 < 2;\n";
+        } else {
+          o << "  wire " << rng(a.ety.w) << n << "_tdata;\n  wire " << n << "_tvalid;\n  logic " << n << "_tready = 1;\n  integer " << n
+            << "_cnt = 0;\n";
+          o << "  always @(negedge ap_clk) " << n << "_tready = !tb_stall || (tb_t * 5 + " << k << ") % 7 < 4;\n";
+          o << "  always @(posedge ap_clk) if (!ap_rst && " << n << "_tvalid && " << n << "_tready) begin\n    case (" << n << "_cnt)\n";
+          size_t c = 0;
+          for (auto& vec : V.v) {
+            auto it = vec.sOut.find(pm.id);
+            if (it == vec.sOut.end()) continue;
+            for (auto x : it->second)
+              o << "      " << c++ << ": if (" << n << "_tdata !== " << hexLit(x, a.ety.w) << ") begin $display(\"FAIL: " << n
+                << " element " << c - 1 << " = %h, expected " << hexLit(x, a.ety.w) << "\", " << n
+                << "_tdata); tb_errors = tb_errors + 1; end\n";
+          }
+          o << "      default: begin $display(\"FAIL: " << n << " sent more than " << c
+            << " elements\"); tb_errors = tb_errors + 1; end\n    endcase\n    " << n << "_cnt = " << n << "_cnt + 1;\n  end\n";
+        }
+        continue;
+      }
       std::string n = svName(a.name);
       o << "  logic " << rng(a.ety.w) << n << "_m [0:" << a.size - 1 << "];\n  wire " << rng(a.aw()) << n
         << "_addr;\n  wire " << n << "_ce;\n";
@@ -1280,7 +1379,7 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
   if (!f.pipeline) {
     long limit = 0;
     for (auto& vec : V.v) limit = std::max(limit, vec.lat);
-    limit = limit * 2 + 100;
+    limit = (limit * 2 + 100) * (nStreams ? 4 : 1);
     // With handshakes: the result is left waiting for a few cycles, which
     // must not change it, and is then taken.
     o << "  task call;\n    begin\n"
@@ -1301,16 +1400,34 @@ std::string testbench(const Function& f, const Sched& sc, const Vectors& V, cons
       const Arr& a = f.arrs[ai];
       if (!a.read && !a.written) continue;
       for (size_t k = 0; k < init.size(); k++)
-        o << "    " << svName(a.name) << "_m[" << k << "] = " << hexLit(init[k], a.ety.w) << ";\n";
+        o << "    " << svName(a.name) << (a.mode == Arr::Stream ? "_src[" : "_m[") << k << "] = " << hexLit(init[k], a.ety.w) << ";\n";
     }
     o << "    repeat (3) @(negedge ap_clk);\n    ap_rst = 0;\n";
+    std::map<int, size_t> taken, sent;
     for (size_t i = 0; i < V.v.size(); i++) {
       const Vec& vec = V.v[i];
+      // Every other call runs against a hesitant source and sink: the same
+      // elements in the same order, in at least as many cycles.
+      const bool stall = nStreams && i % 2;
+      if (nStreams) o << "    tb_stall = " << stall << ";\n";
       o << "    " << setIn(vec) << "call;\n";
+      for (auto& [ai, xs] : vec.sIn) {
+        std::string n = svName(f.arrs[ai].name);
+        taken[ai] += xs.size();
+        o << "    if (" << n << "_pos != " << taken[ai] << ") begin $display(\"FAIL: call " << i << ": %0d elements taken from " << n
+          << ", expected " << taken[ai] << "\", " << n << "_pos); tb_errors = tb_errors + 1; end\n";
+      }
+      for (auto& [ai, xs] : vec.sOut) {
+        if (!f.arrs[ai].written) continue;
+        std::string n = svName(f.arrs[ai].name);
+        sent[ai] += xs.size();
+        o << "    if (" << n << "_cnt != " << sent[ai] << ") begin $display(\"FAIL: call " << i << ": %0d elements sent to " << n
+          << ", expected " << sent[ai] << "\", " << n << "_cnt); tb_errors = tb_errors + 1; end\n";
+      }
       for (auto& [v, x] : vec.out) o << "    " << check(em.outPort(f.vars[v]), x, f.vars[v].ty.w, i) << "\n";
       for (auto& [ai, k, x] : vec.memChg)
         o << "    " << check(svName(f.arrs[ai].name) + "_m[" + std::to_string(k) + "]", x, f.arrs[ai].ety.w, i) << "\n";
-      o << "    if (tb_lat != " << vec.lat << ") begin $display(\"FAIL: call " << i << ": %0d cycles, expected "
+      o << "    if (tb_lat " << (stall ? "<" : "!=") << " " << vec.lat << ") begin $display(\"FAIL: call " << i << ": %0d cycles, expected "
         << vec.lat << "\", tb_lat); tb_errors = tb_errors + 1; end\n";
     }
     for (auto& [ai, fin] : V.memFinal) {
@@ -1422,7 +1539,9 @@ std::string cref(const Function& f, const Func& src, const Vectors& V, const std
       continue;
     }
     std::string T = ctype(d.origParam);
-    if (pm.k == Param::Array) {
+    if (pm.k == Param::Array && f.arrs[pm.id].mode == Arr::Stream) {
+      o << "  static " << T << " mhls_v" << i << ";\n";
+    } else if (pm.k == Param::Array) {
       const Arr& a = f.arrs[pm.id];
       o << "  static " << T << " mhls_v" << i << "[" << a.size << "] = {";
       for (auto x : V.memInit.at(pm.id)) o << "(" << T << ")" << lit(x) << ", ";
@@ -1433,6 +1552,7 @@ std::string cref(const Function& f, const Func& src, const Vectors& V, const std
   }
   for (size_t i = 0; i < f.params.size(); i++) {
     if (!isStruct(i) || isRet(i) || f.params[i].k != Param::Array) continue;
+    if (f.arrs[f.params[i].id].mode == Arr::Stream) continue;
     const auto& init = V.memInit.at(f.params[i].id);
     for (size_t k = 0; k < init.size(); k++) o << "  " << cexpr(i, (long)k) << " = " << lit(init[k]) << ";\n";
   }
@@ -1458,6 +1578,14 @@ std::string cref(const Function& f, const Func& src, const Vectors& V, const std
       }
       arg[d.origParam] = a;
     }
+    // A stream holds exactly what the reference run took from it.
+    auto streamOf = [&](int ai) {
+      for (size_t i = 0; i < f.params.size(); i++)
+        if (f.params[i].k == Param::Array && f.params[i].id == ai) return "mhls_v" + std::to_string(i);
+      return std::string();
+    };
+    for (auto& [ai, xs] : vec.sIn)
+      for (auto x : xs) o << "    " << streamOf(ai) << ".write((decltype(" << streamOf(ai) << ".read()))" << lit(x) << ");\n";
     std::string args;
     for (size_t j = 0; j < arg.size(); j++) args += (j ? ", " : "") + arg[j];
     if (f.retVar >= 0 || src.retStruct) o << "    auto mhls_r = " << f.name << "(" << args << ");\n";
@@ -1473,6 +1601,18 @@ std::string cref(const Function& f, const Func& src, const Vectors& V, const std
         for (size_t i = 0; i < f.params.size(); i++)
           if (f.params[i].k == Param::Ref && f.params[i].id == v) chk(f.vars[v].name, cexpr(i, -1), x, f.vars[v].ty.w);
     }
+    for (auto& [ai, xs] : vec.sIn)
+      o << "    if (!" << streamOf(ai) << ".empty()) { printf(\"FAIL: call " << n << ": " << f.arrs[ai].name
+        << " was not read as often as expected\\n\"); mhls_errors++; while (!" << streamOf(ai) << ".empty()) " << streamOf(ai)
+        << ".read(); }\n";
+    for (auto& [ai, xs] : vec.sOut) {
+      if (!f.arrs[ai].written) continue;
+      o << "    if (" << streamOf(ai) << ".size() != " << xs.size() << ") { printf(\"FAIL: call " << n << ": " << f.arrs[ai].name
+        << " got %u elements, expected " << xs.size() << "\\n\", " << streamOf(ai) << ".size()); mhls_errors++; }\n";
+      for (size_t k = 0; k < xs.size(); k++)
+        chk(f.arrs[ai].name + " element " + std::to_string(k), streamOf(ai) + ".read()", xs[k], f.arrs[ai].ety.w);
+      o << "    while (!" << streamOf(ai) << ".empty()) " << streamOf(ai) << ".read();\n";
+    }
     for (auto& [ai, k, x] : vec.memChg)
       for (size_t i = 0; i < f.params.size(); i++)
         if (f.params[i].k == Param::Array && f.params[i].id == ai)
@@ -1482,6 +1622,7 @@ std::string cref(const Function& f, const Func& src, const Vectors& V, const std
   for (size_t i = 0; i < f.params.size(); i++) {
     if (f.params[i].k != Param::Array || isRet(i)) continue;
     const Arr& a = f.arrs[f.params[i].id];
+    if (a.mode == Arr::Stream) continue;
     const auto& fin = V.memFinal.at(f.params[i].id);
     if (isStruct(i)) {
       for (size_t k = 0; k < fin.size(); k++)

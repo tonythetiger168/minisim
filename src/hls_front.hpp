@@ -52,6 +52,7 @@ struct Decl {
   Type ty;
   bool isConst = false, isStatic = false, isRef = false, isPtr = false;
   bool isArray = false;
+  bool isStream = false;   // hls::stream<T>&: an array of one element whose reads and writes are transfers
   std::vector<Expr*> dims;
   Expr* init = nullptr;
   std::vector<Expr*> initList;
@@ -351,7 +352,7 @@ class Parser {
 
   struct Spec {
     Type ty;
-    bool isConst = false, isStatic = false;
+    bool isConst = false, isStatic = false, isStream = false;
     int sid = -1;   // a struct type
   };
 
@@ -727,6 +728,7 @@ class Parser {
         "bool", "void", "_Bool", "inline", "register", "extern", "constexpr",
         "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
         "size_t", "ap_int", "ap_uint", "sc_int", "sc_uint", "sc_bigint", "sc_biguint", "struct"};
+    if (cur().s == "hls" && peek().s == "::") return true;
     return kw.count(cur().s) || typedefs_.count(cur().s) || structNames_.count(cur().s);
   }
 
@@ -741,6 +743,32 @@ class Parser {
       if (s == "const" || s == "constexpr") { sp.isConst = true; i_++; }
       else if (s == "static") { sp.isStatic = true; i_++; }
       else if (s == "volatile" || s == "inline" || s == "register" || s == "extern") i_++;
+      else if (!sawBase && !longs && !sawUns && !sawSig && s == "hls" && peek().s == "::") {
+        i_ += 2;
+        if (!isId("stream")) err("of namespace hls only hls::stream<T> is supported");
+        i_++;
+        // ">>" closing two template lists is two tokens here.
+        int depth = 0;
+        for (size_t j = i_; j < t_.size() && t_[j].k != Tok::End; j++) {
+          if (t_[j].s == "<") depth++;
+          else if (t_[j].s == ">") depth--;
+          else if (t_[j].s == ">>") {
+            t_[j].s = ">";
+            t_.insert(t_.begin() + j, t_[j]);
+            j--;
+            continue;
+          } else if (t_[j].s == ";" || t_[j].s == "{") break;
+          if (depth == 0) break;
+        }
+        expect("<");
+        Spec in = typeSpec();
+        expect(">");
+        if (in.sid >= 0 || in.isStream) err("a stream carries a scalar type");
+        sp.ty = in.ty;
+        sp.isStream = true;
+        sawBase = true;
+        base = "td";
+      }
       else if (s == "unsigned") { sawUns = true; i_++; }
       else if (s == "signed") { sawSig = true; i_++; }
       else if (s == "long") { longs++; i_++; }
@@ -953,6 +981,25 @@ class Parser {
         x->a = e;
         i_++;
         e = x;
+      } else if (isP(".") && e->k == Expr::Var && streams_.count(e->name)) {
+        // s.read() is a read of s[0], s.write(x) an assignment to it; the
+        // one element is the head of the stream.
+        i_++;
+        std::string m = ident();
+        Expr* head = indexed(e->name, {num(0, line)}, line);
+        expect("(");
+        if (m == "read") {
+          e = head;
+        } else if (m == "write") {
+          Expr* x = mk(Expr::Asg, line);
+          x->op = "=";
+          x->a = head;
+          x->b = assign();
+          e = x;
+        } else {
+          err("a stream has read() and write(x); '" + m + "' is not supported");
+        }
+        expect(")");
       } else if (isP(".") || isP("->")) {
         if (e->k != Expr::Agg) err("'" + cur().s + "' needs a struct on its left");
         const AggInfo a = agg_.at(e);
@@ -1082,6 +1129,14 @@ class Parser {
     d.isConst = sp.isConst;
     d.isStatic = sp.isStatic;
     d.line = cur().line;
+    if (sp.isStream) {
+      if (!param || !accept("&")) err("a stream is a reference parameter: hls::stream<T>& name");
+      d.isStream = d.isArray = true;
+      d.dims.push_back(num(1, d.line));
+      d.name = ident();
+      streams_.insert(d.name);
+      return d;
+    }
     if (accept("*")) d.isRef = d.isPtr = true;
     else if (accept("&")) d.isRef = true;
     acceptId("const");
@@ -1306,6 +1361,7 @@ class Parser {
   }
 
   Func* curFunc_ = nullptr;
+  std::set<std::string> streams_;   // the stream parameters of the function being parsed
 
   void topLevel() {
     pragmas();
@@ -1422,6 +1478,7 @@ class Parser {
       scopes_.pop_back();
       P.funcs.back().body = body;
       curFunc_ = nullptr;
+      streams_.clear();
       pendUnroll_ = false;
       return;
     }

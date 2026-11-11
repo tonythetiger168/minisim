@@ -46,6 +46,7 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
 | `if`, `switch` (with fall-through), `for`, `while`, `do`, `break`, `continue`, `return` anywhere | `goto` |
 | fixed-size arrays of any dimension, initializer lists | pointers other than scalar output parameters, dynamic memory |
 | functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion, classes, templates |
+| `hls::stream<T>&` parameters with `read()` and `write(x)` (see Streams) | `empty()`, `full()`, non-blocking access, local streams |
 | structs: nested, in arrays, with array members and bit-fields; copied, passed by value, pointer or reference, and returned | unions, pointer members, member functions, structs defined inside a function |
 
 `ap_`/`sc_` operands are widened to 64 bits in arithmetic, so a product of
@@ -132,6 +133,34 @@ stage. A pipeline needs a function that is straight-line after unrolling
 (no memories, no data-dependent loops), and a `static` must be read and
 updated in the same stage; `mhls` says which rule fails and why.
 
+### Streams
+
+A parameter of type `hls::stream<T>&` (T a scalar type) is a valid/ready
+port instead of a memory. Each `read()` takes one element, each `write(x)`
+sends one, in program order, and the state machine waits in that state
+while the source has nothing to offer or the sink is not ready. A stream is
+read or written, not both.
+
+| Port | |
+|---|---|
+| `<s>_tdata`, `<s>_tvalid` | the element and its valid; inputs for a stream that is read, outputs for one that is written |
+| `<s>_tready` | the other direction: mhls is ready to take, or the sink is ready |
+
+```c
+#include "mhls_stream.h"
+void scale(hls::stream<uint8_t>& in, hls::stream<uint16_t>& out, uint8_t gain, uint8_t n) {
+  for (int i = 0; i < n; i++) out.write(in.read() * gain);
+}
+```
+
+`include/mhls_stream.h` defines `hls::stream` for compiling the same source
+on the host; `mhls` ignores the include. A transfer takes a state of its
+own and a read delivers its data in the next one, so the loop above moves
+one element every two cycles. A loop or function with stream accesses is
+not pipelined. `-tb` adds a source and a sink that hesitate on every other
+call and checks the elements, their order and their number; `-cref` checks
+the same on the host.
+
 `-handshake` adds a second module `<top>_hs` around the block with
 `in_valid`/`in_ready` for the scalar inputs and `out_valid`/`out_ready` for
 the results, in place of the `ap_` control ports. A transfer happens in a
@@ -182,6 +211,6 @@ need multicycle constraints.
 
 ## Not yet
 
-Dual-port memories, array arguments as streams,
+Dual-port memories, pipelined loops over streams, non-blocking stream access,
 unions, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

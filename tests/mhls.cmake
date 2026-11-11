@@ -81,6 +81,11 @@ design(faint faint)                              # variables that only feed them
 design(mac mac -handshake)                       # ready/valid ports around the FSM: the result waits for out_ready
 design(fir fir -handshake -pipeline -clock 2.5)  # around the pipeline: a refused result stalls every stage
 design(looppipe2 hist -handshake)                # with memories
+design(stream scale)                             # stream arguments: one in, one out, a stalling source and sink
+design(stream packet)                            # reads that depend on data read before, a conditional write
+design(stream merge)                             # two sources, reads in branches
+design(stream relay)                             # streams handed to an inlined function
+design(stream relay -unroll-all -handshake)
 design(fir fir -pipeline-loops -clock 3)         # best effort: loops that cannot be pipelined stay as they are
 design(matmul matmul -pipeline-loops -clock 3)
 design(sqrt hist -pipeline-loops)
@@ -103,6 +108,9 @@ refuses(bad_recursion fact "recursion")
 refuses(bad_looppipe_port bump "accessed more than once per iteration")
 refuses(bad_looppipe_cond length "condition is not known in the first stage")
 refuses(bad_looppipe_chain chase "updated from its own previous value")
+refuses(bad_stream_both echo "cannot also be written")
+refuses(bad_stream_empty peek "'empty' is not supported")
+refuses(bad_stream_local local "a stream is a reference parameter")
 refuses(bad_struct_byvalue byvalue "pass 'x' by pointer or reference")
 refuses(bad_struct_dropped dropped "must be assigned to a variable")
 refuses(bad_struct_scalar scalar "a struct cannot be used as a value")
