@@ -316,6 +316,34 @@ in `+incdir+` / `-I` / `-y` directories, so protected `` `include `` files and
 library cells work. An envelope in such an extra file that does not open is
 only an error if the design reads it.
 
+## VPI and DPI
+
+A user's C code cannot be used to look into protected IP (IEEE 1800-2023
+37.3.6 and clause 38, IEEE 1735-2023 9.7). An object is protected when it is
+declared in an envelope and no right or viewport makes it visible, or when it
+sits below an instance of a protected module (9.2: a path through protected
+IP is opaque, even to clear text below it).
+
+- `vpi_get(vpiIsProtected, h)` is 1 for such an object. `vpiType` can be
+  read; every other property, `vpi_get_str`, `vpi_handle`, `vpi_iterate`,
+  `vpi_handle_by_index`, `vpi_get_value` and `vpi_put_value` (force and
+  release included) are errors that `vpi_chk_error` reports.
+- `vpi_handle_by_name` is an error for a protected scope and for a name in
+  protected code, disclosed or not. Objects the IP author opened with a
+  viewport or a right are found by their full name.
+- `vpi_register_cb` puts no callback on a protected object: it returns NULL
+  and prints an error message.
+- Model fidelity: a system task or function the IP itself calls keeps
+  working. Its arguments can be iterated (38.36) and their `vpiSize` read
+  (37.57), and while its `calltf` runs it reads and writes its own arguments
+  and its result. A handle kept from such a call is closed again when the
+  call returns.
+- DPI: an import called from protected code runs as usual.
+  `svGetNameFromScope` gives `<protected>` for a scope in protected IP and
+  `svGetCallerInfo` gives `<protected>` and line 0 for a call in protected
+  code. `svGetScopeFromName` with the disclosed name still returns a scope
+  that `svSetScope` and the user data functions accept.
+
 ## Commercial tools
 
 A version 3 envelope opens in any IEEE 1735 tool that holds the private key
@@ -341,7 +369,7 @@ key, which minisim does not have and does not try to obtain.
 | 8 | License system: license specification, licensing calls, TLS connection to the proxy, DER messages, request id 0, return value reuse, irregularities; `mlicproxy` is a proxy | ✅ `license_proxy`, `test_protect` |
 | 9.2 | Error handling and model fidelity | ✅ msim, mlint, mdft |
 | 9.5–9.6 | viewport / interface_viewport | ✅ named and unnamed; named ones match by lexical name |
-| 9.7 | VPI / DPI visibility | ❌ minisim has no VPI; DPI calls are the IP author's |
+| 9.7 | VPI / DPI visibility | ✅ see "VPI and DPI"; `tests/pli_protect.sh` |
 | Annex B | Test vector | ✅ checked locally (not redistributable) |
 
 ## IEEE 1800-2023 clause 34 envelopes (`-v1`)
