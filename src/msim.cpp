@@ -28,6 +28,7 @@
 //   +pulse_on_event / +pulse_on_detect, +showcancelled / +noshowcancelled
 //                    pulse styles of every path output (30.7.4)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
+//   -vcd-arrays [N]  also write unpacked array elements (arrays of up to N, default 1024)
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
@@ -616,6 +617,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::string run = shq(exe);
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
+    if (vcdPath && S.dumpArrays) run += " -vcd-arrays " + std::to_string(S.dumpArrays);
     run += " -threads " + std::to_string(threads);
     if (g_pin >= 0) run += g_pin ? " -pin" : " -no-pin";
     // Run-time inputs go to simv, so one build serves every seed and plusarg.
@@ -853,6 +855,8 @@ static void usage() {
                  "  +pulse_r/<n> +pulse_e/<n>  pulse reject / error limits as n% of path delays\n"
                  "  +pulse_on_event / +pulse_on_detect, +showcancelled / +noshowcancelled  pulse styles\n"
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
+                 "  -vcd-arrays [N]  also write unpacked array elements (memories) of up to N\n"
+                 "                 elements each (default 1024) to the VCD or FST, as mem[3]\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov. -cm <metrics> (as VCS) does the same\n"
                  "  -maxtime <n>   stop after simulation time n\n"
@@ -1025,6 +1029,13 @@ int main(int argc, char** argv) {
         if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
             g_cov = true;
             ++i;
+            continue;
+        }
+        // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.
+        if (a == "-vcd-arrays" || a == "-fst-arrays") {
+            S.dumpArrays = 1024;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                S.dumpArrays = std::strtoull(argv[++i], nullptr, 10);
             continue;
         }
         // -vcd x.fst writes FST too: the file name picks the format.

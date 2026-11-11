@@ -403,6 +403,7 @@ public:
              "        if (!std::strcmp(argv[i], \"-maxtime\") && i + 1 < argc) maxTime = std::strtoull(argv[++i], nullptr, 10);\n"
              "        else if (!std::strcmp(argv[i], \"-vcd\") && i + 1 < argc) S.vcdPath = argv[++i];\n"
              "        else if (!std::strcmp(argv[i], \"-vcdtop\") && i + 1 < argc) S.vcdTop = argv[++i];\n"
+             "        else if (!std::strcmp(argv[i], \"-vcd-arrays\") && i + 1 < argc) S.dumpArrays = std::strtoull(argv[++i], nullptr, 10);\n"
              "        else if (!std::strcmp(argv[i], \"-threads\") && i + 1 < argc) {\n"
              "            ++i;\n"
              "            S.threads = !std::strcmp(argv[i], \"all\") ? maxThreads() : std::max(1, std::atoi(argv[i]));\n"

@@ -362,6 +362,10 @@ struct Sim {
     int exitCode = 0;                                // the process exit status ($fatal sets 1)
     string vcdPath = "dump.vcd";                     // empty: no waveform
     string vcdTop = "top";   // name of the root VCD scope (the top module)
+    // msim -vcd-arrays [N]: unpacked array elements go to the waveform too,
+    // as m[3], for arrays of at most N elements. 0 (the default): memories
+    // are left out, as $dumpvars does (21.7.1.2).
+    size_t dumpArrays = 0;
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
     // VCD text is built here and written in large blocks (an ostream insert
@@ -2405,6 +2409,22 @@ struct Sim {
 
     void header() {
         if (vcdPath.empty()) return;
+        if (dumpArrays) {
+            // Elements are hidden when they are made; show those of the small
+            // arrays. Only the last name component counts: blk[2].x is not one.
+            auto base = [](const string& n) {
+                size_t dot = n.rfind('.');
+                size_t br = n.find('[', dot == string::npos ? 0 : dot + 1);
+                return br == string::npos ? string() : n.substr(0, br);
+            };
+            unordered_map<string, size_t> count;
+            for (const Sig& g : sigs)
+                if (g.hide && g.name.find('$') == string::npos)
+                    if (string b = base(g.name); !b.empty()) count[b]++;
+            for (Sig& g : sigs)
+                if (g.hide && g.name.find('$') == string::npos)
+                    if (string b = base(g.name); !b.empty() && count[b] <= dumpArrays) g.hide = false;
+        }
         observed = true;   // every change is written: the cycle domain uses set()
         bool asFst = vcdPath.size() > 4 && vcdPath.compare(vcdPath.size() - 4, 4, ".fst") == 0;
 #ifdef MINISIM_FST

@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
+  elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
+  the default waveform is unchanged. `mdebug -active` follows a memory read
+  to the element and the write that filled it.
 - `mdebug`: struct fields in the active-driver trace (conditions on a field
   are evaluated; each field and constant part select has its own driver).
 - `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
