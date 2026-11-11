@@ -188,6 +188,15 @@ private:
             if (isP(".") && peek().k == Tok::Id) { p_++; name = ident(); continue; }
             break;
         }
+        if (isP("(") && e->scope.empty() && e->path.size() > 1 && !e->path.back().index) {
+            // receiver.method(args): the receiver stays in path.
+            e->k = Expr::Call;
+            e->s = e->path.back().name;
+            e->path.pop_back();
+            p_++;
+            if (!isP(")")) do e->a.push_back(expr()); while (acceptP(","));
+            expectP(")");
+        }
         return e;
     }
     EP unary() {
@@ -259,6 +268,14 @@ private:
     }
 
     // ------------------------------------------------------------------ types
+    // "a::b<> name": a declaration with a named type.
+    bool atNamedDecl() const {
+        if (!at(Tok::Id)) return false;
+        int k = 1;
+        while (peek(k).k == Tok::Punct && peek(k).s == "::" && peek(k + 1).k == Tok::Id) k += 2;
+        if (peek(k).k == Tok::Punct && peek(k).s == "<" && peek(k + 1).k == Tok::Punct && peek(k + 1).s == ">") k += 2;
+        return peek(k).k == Tok::Id;
+    }
     bool atType() const {
         if (!at(Tok::Id)) return false;
         const std::string& s = cur().s;
@@ -303,6 +320,8 @@ private:
         if (acceptK("void")) return t;
         t.k = TypeRef::Named;
         t.name = qname();
+        // "T<>": the default trait of an address space, region or claim.
+        if (isP("<") && peek().k == Tok::Punct && peek().s == ">") p_ += 2;
         return t;
     }
 
@@ -349,9 +368,10 @@ private:
             do c->list.push_back(expr()); while (acceptP(","));
             expectP("}");
             acceptP(";");
-        } else if (isK("forall") || isK("default") || isK("disable")) {
+        } else if (isK("forall") || isK("disable") || (isK("default") && peek().k == Tok::Id && peek().s == "disable")) {
             fail("'" + cur().s + "' constraints are not supported yet");
         } else {
+            c->isDefault = acceptK("default");
             EP e = expr();
             if (acceptP("->")) {
                 c->k = Cons::If;
@@ -524,7 +544,9 @@ private:
             return;
         }
         if (isK("foreach") || isK("match")) fail("'" + cur().s + "' is not supported in an exec block yet");
-        if (atType() || (at(Tok::Id) && peek().k == Tok::Id)) {
+        // "(void)f(x);" drops a result.
+        if (isP("(") && peek().k == Tok::Id && peek().s == "void" && peek(2).k == Tok::Punct && peek(2).s == ")") p_ += 3;
+        if (atType() || atNamedDecl()) {
             TypeRef t = type();
             do {
                 SP s = mkS(Stmt::Var);
