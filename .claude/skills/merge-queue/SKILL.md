@@ -1,14 +1,14 @@
 ---
 name: merge-queue
-description: How a minisim PR gets merged - open as draft, wait for your turn in the merge queue, update to main, merge only on green CI for the exact head. Use when opening a PR, when told it is your PR's turn, or when a PR is stuck behind main.
+description: How a minisim PR gets merged - arm auto-merge, merge only on green CI for the exact head, watch main afterwards, and the one-at-a-time queue used while the up-to-date rule is on. Use when opening a PR, merging one, or when a PR is stuck or conflicted.
 ---
 
 # Merging a minisim PR
 
 `main` is protected: the checks `build-and-test` and `build-and-test-slang`
-are both required, admins are not exempt, and (while "strict" is on) the
-branch must contain current `main`. Check the live rule before relying on
-this text:
+are both required and admins are not exempt. The "branch must be up to date"
+rule (strict) is currently off, so PRs merge in parallel, each on its own
+green head. Check the live rule before relying on this text:
 
 ```sh
 gh api repos/tonythetiger168/minisim/branches/main/protection/required_status_checks \
@@ -22,21 +22,27 @@ setting has to change, ask the repository owner and give the settings link.
 
 1. **Green means CI green on the exact head commit being merged.** A local
    `ctest` run, or green on an earlier commit, does not count.
-2. **While strict is on, PRs merge one at a time.** Every merge puts all the
-   other PRs behind `main` again, so updating them all at once only burns CI
-   minutes. New PRs join the end of the queue.
-3. **Keep auto-merge disarmed until it is your turn.** The coordinator says
-   when. Until then: PR stays draft, no auto-merge, keep working.
-4. Stacked PRs merge in stack order. When a newer PR contains older ones,
+2. **strict off (now): no queue.** Mark the PR ready and arm auto-merge as
+   soon as the work is complete; it merges when both checks pass. Merge
+   `main` in only when there is a conflict or the PR depends on something
+   that just landed.
+3. **After your PR merges, watch CI on `main`.** Two PRs that were each
+   green can break together. If the merge commit goes red, fix it at once
+   with a small follow-up PR; a red `main` blocks everyone.
+4. **strict on: one PR at a time.** Every merge puts the others behind
+   `main`, so keep the PR draft with auto-merge disarmed until the
+   coordinator says it is your turn, then follow the steps below. New PRs
+   join the end of the queue.
+5. Stacked PRs merge in stack order. When a newer PR contains older ones,
    merge only the newest and close the rest as superseded.
-5. Never skip, disable or quarantine a test to get green. Never force-push a
+6. Never skip, disable or quarantine a test to get green. Never force-push a
    branch someone else owns.
 
-## When it is your turn
+## Merging
 
 ```sh
 git fetch origin main
-git merge origin/main            # merge, do not rebase: the PR is already reviewed/linked
+git merge origin/main            # only if needed (conflict, strict on); merge, do not rebase
 # resolve conflicts (see below), build, run the tests you touched
 git push -u origin <branch>
 gh pr ready <n>                  # drafts can neither merge nor auto-merge
@@ -57,7 +63,8 @@ gh api repos/tonythetiger168/minisim/commits/<sha>/check-runs \
 
 Then stop and wait for the PR event. If CI goes red, reproduce the failing
 check locally, fix it, push, and let auto-merge re-arm on the new head.
-After the merge, report it to the coordinator so the next PR can start.
+After the merge, check the CI run of the merge commit on `main` and report
+the merge to the coordinator.
 
 ## Conflicts that keep coming back
 
