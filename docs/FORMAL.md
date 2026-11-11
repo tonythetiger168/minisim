@@ -82,6 +82,21 @@ procedures, `expect`.
   only has more behaviour), but a counterexample may be one the real design
   cannot show. The summary counts the cut signals and `-v` lists them.
 
+### Abstraction by option
+
+- `-blackbox NAME` leaves out every instance of the module `NAME` (or the
+  one instance with that path): nothing inside is modelled, its outputs are
+  free in every cycle, and properties inside it are reported as skipped.
+- `-cut SIGNAL` makes one signal a free input in every cycle, whatever
+  drives it.
+
+Both make the model an over-approximation: a proof still holds for the real
+design, while a failure may use a value the real design cannot produce (the
+trace shows the free values; a replay in the simulator will not reproduce
+such a failure). `-v` lists what was cut. Typical use: take a multiplier,
+a memory or a deep counter out of the cone of a property that does not
+depend on its exact value.
+
 ## How it works
 
 1. Each process is executed symbolically once. A combinational process gives

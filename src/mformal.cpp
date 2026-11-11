@@ -332,6 +332,7 @@ struct Options {
     std::string outDir = "mformal_out";
     std::string json;
     std::string aiger;   // write the model here and stop
+    std::vector<std::string> cuts, blackboxes;   // -cut signals; -blackbox modules or instances
     std::vector<std::string> connect;   // -connect: connectivity specifications
     bool appToggle = false;   // -app toggle: can every signal bit be 0 and be 1?
     bool toggleDeep = false;  // -app toggle: spend the whole budget on each target
@@ -388,6 +389,8 @@ struct Model {
     std::unordered_map<int, int> stateBitOfInput;   // AIG node -> stateBits index
     std::vector<std::pair<int, int>> stateRange;    // per signal: first state bit, or -1
     std::vector<std::string> inputName;             // per AIG input number
+    std::vector<std::string> boxes;                 // -blackbox: instance paths below the top ("u.sub")
+    std::set<int> cutSigs;                          // -cut: signals that are free in every cycle
     std::set<std::string> procLocals;               // variables declared inside a procedure (loop counters, temporaries)
     std::set<std::string> cutNotes;                 // what was cut, for the report
     std::vector<int> aliasOf;                       // signal -> the signal it is a plain copy of, or -1
@@ -409,6 +412,12 @@ struct Model {
         SV v;
         newInputs(sigs[(size_t)s].w, v.b, sigs[(size_t)s].name + suffix, 0);
         return v;
+    }
+    // The black box a name ("u.sub.x", relative to the top) is inside, if any.
+    const std::string* boxOf(const std::string& name) const {
+        for (auto& b : boxes)
+            if (name.size() > b.size() && name.compare(0, b.size(), b) == 0 && name[b.size()] == '.') return &b;
+        return nullptr;
     }
     int canon(int s) const {
         for (int n = 0; n < 64 && s >= 0 && (size_t)s < aliasOf.size() && aliasOf[(size_t)s] >= 0; n++) s = aliasOf[(size_t)s];
@@ -901,6 +910,13 @@ struct Model {
                     aliasOf[(size_t)a.sig] = a.e->sig;
             }
         }
+        // -blackbox: nothing inside the instance is modelled, so what it drives is free
+        for (size_t k = 0; k < np && !boxes.empty(); k++) {
+            const std::string* box = boxOf(lowered.procs[k].scope + ".");
+            if (!box) continue;
+            if (pi[k].kind == P_INIT) pi[k].kind = P_SKIP;
+            else if (pi[k].kind != P_SKIP) { pi[k].kind = P_CUT; pi[k].why = "inside the black box " + *box; }
+        }
         for (size_t k = 0; k < np; k++) {
             if (pi[k].kind == P_INIT || pi[k].kind == P_SKIP) continue;
             for (int s : pi[k].writes) writers[(size_t)s].push_back((int)k);
@@ -1150,7 +1166,12 @@ struct Model {
         if (auto it = shadowSrc.find(s); it != shadowSrc.end()) return cur(it->second);
         if (clockSig >= 0 && canon(s) == clockSig) return o.konst(0, sigs[(size_t)s].w);   // sampled before its rising edge
         if (stageOf.count(s)) return makeState(s);
+        if (cutSigs.count(s)) {
+            cutNotes.insert(sigs[(size_t)s].name + ": -cut");
+            return freeSig(s);
+        }
         auto& ws = writers[(size_t)s];
+        if (ws.empty() && boxOf(sigs[(size_t)s].name)) return freeSig(s);
         if (ws.empty()) {
             bool hasInit = false;
             for (int8_t b : initVal[(size_t)s]) hasInit = hasInit || b >= 0;
@@ -1787,6 +1808,12 @@ struct Model {
             for (size_t li = 0; li < sampleClocks()[ci].lines.size(); li++)
                 for (size_t k = 0; k < sampleClocks()[ci].lines[li].stages.size(); k++)
                     stageOf[sampleClocks()[ci].lines[li].stages[k]] = {(int)ci, (int)li, (int)k};
+        for (auto& c : opt.cuts) {
+            int sg = findSig(c);
+            if (sg < 0 && !top.empty() && c.compare(0, top.size() + 1, top + ".") == 0) sg = findSig(c.substr(top.size() + 1));
+            if (sg < 0) throw std::runtime_error("no signal named '" + c + "' for -cut");
+            cutSigs.insert(sg);
+        }
         classify();
         findClock();
         runInits();
@@ -1828,6 +1855,10 @@ struct Model {
         if (opt.appToggle) addToggleTargets();
         for (auto& f : opt.connect) addConnectivity(f);
         closeStates();
+        for (auto& pr : props) {
+            std::string rel = !top.empty() && pr.name.compare(0, top.size() + 1, top + ".") == 0 ? pr.name.substr(top.size() + 1) : pr.name;
+            if (const std::string* b = boxOf(rel); b && pr.skipped.empty()) pr.skipped = "inside the black box " + *b;
+        }
         std::sort(props.begin(), props.end(), [](const Property& a, const Property& b) { return a.name < b.name; });
     }
 };
@@ -2648,6 +2679,9 @@ void usage() {
                  "  -app toggle       unreachable coverage: report every signal bit that can never be 0\n"
                  "                    or never be 1 after the reset (-toggle-max N: skip wider signals;\n"
                  "                    -toggle-deep: the whole -depth and PDR budget per target)\n"
+                 "  -cut SIGNAL       cut point: the signal is a free input in every cycle (repeatable)\n"
+                 "  -blackbox NAME    black box: every instance of the module NAME, or the instance NAME,\n"
+                 "                    is not modelled and its outputs are free (repeatable)\n"
                  "  -connect FILE     connectivity check: each line 'destination, source [, condition]' is\n"
                  "                    proven as: whenever the condition holds, destination == source\n"
                  "  -aiger FILE       write the model as AIGER 1.9 (.aig binary, else ASCII) for another\n"
@@ -2706,6 +2740,8 @@ int main(int argc, char** argv) {
             else { std::cerr << "mformal: unknown app '" << app << "' (apps: toggle)\n"; return 2; }
             continue;
         }
+        if (a == "-cut") { opt.cuts.push_back(next("a signal name")); continue; }
+        if (a == "-blackbox") { opt.blackboxes.push_back(next("a module or instance name")); continue; }
         if (a == "-connect") { opt.connect.push_back(next("a file name")); continue; }
         if (a == "-toggle-deep") { opt.toggleDeep = true; continue; }
         if (a == "-toggle-max") { opt.toggleMax = std::atoi(next("a number").c_str()); continue; }
@@ -2776,6 +2812,25 @@ int main(int argc, char** argv) {
                 }
                 v.visitDefault(var);
             }));
+        }
+        if (!opt.blackboxes.empty() && comp->getRoot().topInstances.size() == 1) {
+            std::string topPath = std::string(comp->getRoot().topInstances[0]->name) + ".";
+            std::set<std::string> used;
+            comp->getRoot().visit(slang::ast::makeVisitor([&](auto& v, const slang::ast::InstanceSymbol& inst) {
+                std::string path = inst.getHierarchicalPath();
+                if (path.compare(0, topPath.size(), topPath) == 0) {
+                    std::string rel = path.substr(topPath.size());
+                    for (auto& b : opt.blackboxes)
+                        if (b == inst.getDefinition().name || b == rel || b == path) {
+                            m.boxes.push_back(rel);
+                            used.insert(b);
+                            return;   // nothing below it matters
+                        }
+                }
+                v.visitDefault(inst);
+            }));
+            for (auto& b : opt.blackboxes)
+                if (!used.count(b)) throw std::runtime_error("no module or instance named '" + b + "' for -blackbox");
         }
         m.build();
         addLiveness(m);

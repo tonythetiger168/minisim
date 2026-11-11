@@ -203,3 +203,25 @@ execute_process(COMMAND ${MFORMAL} ${SRC}/tests/formal/connect.sv -top connect -
 if(NOT rc EQUAL 2 OR NOT err MATCHES "destination is 8 bits, source is 4")
   message(FATAL_ERROR "connect.sv: a width mismatch must be an error\n${rc}\n${err}")
 endif()
+
+# -blackbox and -cut: the box's outputs and the cut signal are free, properties inside the box are skipped.
+run(box.sv 0 "-top;box")
+expect(box.sv "4 properties: 4 proven")
+run(box.sv 1 "-top;box;-blackbox;mulbox;-v")
+expect(box.sv
+  "assert  box.a_cnt +proven"
+  "assert  box.a_ten +proven"
+  "assert  box.a_zero +falsified  at cycle 1"
+  "assert  box.u_mul.a_in_box +skipped  inside the black box u_mul"
+  "u_mul.p: inside the black box u_mul")
+run(box.sv 1 "-top;box;-blackbox;u_mul;-cut;box.cnt")
+expect(box.sv
+  "assert  box.a_cnt +falsified  at cycle 0"
+  "assert  box.a_ten +falsified  at cycle 0"
+  "2 signals cut")
+foreach(bad "-blackbox;nope" "-cut;nope")
+  execute_process(COMMAND ${MFORMAL} ${SRC}/tests/formal/box.sv -top box ${bad} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 2 OR NOT err MATCHES "named 'nope'")
+    message(FATAL_ERROR "box.sv: ${bad} must be an error\n${rc}\n${err}")
+  endif()
+endforeach()
