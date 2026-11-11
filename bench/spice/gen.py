@@ -5,6 +5,7 @@
 
     ladder.cir   20,000-section RC ladder, transient (linear: one factorization)
     mesh.cir     60 x 60 resistor mesh with a capacitor on every node, 400-point AC
+    nmesh.cir    the same mesh, 400-point noise analysis (7,140 noise sources)
     chain.cir    2,000 CMOS inverters in a chain (4,000 level-1 MOSFETs), transient
     ring.cir     101-stage ring oscillator, transient
     mc.cir       an RC-loaded inverter repeated over a 64-value .step
@@ -43,6 +44,12 @@ def mesh(n=60):
             o.append(f"c{i}_{j} n{i}_{j} 0 10f")
     o += [f"rl n{n-1}_{n-1} 0 1k", ".ac dec 100 1meg 10g",
           f".meas ac f3 when vdb(n{n-1}_{n-1})=-6 fall=1", f".meas ac lf find vm(n{n-1}_{n-1}) at=1meg", ".end"]
+    return o
+
+
+def nmesh(n=60):
+    o = mesh(n)[:-4]
+    o += [f".noise v(n{n-1}_{n-1}) v1 dec 100 1meg 10g", ".print noise onoise_total", ".end"]
     return o
 
 
@@ -103,5 +110,5 @@ def mc():
 if __name__ == "__main__":
     d = sys.argv[1]
     for name, fn in (("ladder", ladder), ("mesh", mesh), ("chain", chain), ("ring", ring), ("mc", mc),
-                     ("chain4", chain4), ("ring4", ring4)):
+                     ("chain4", chain4), ("ring4", ring4), ("nmesh", nmesh)):
         open(f"{d}/{name}.cir", "w").write("\n".join(fn()) + "\n")

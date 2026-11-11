@@ -364,6 +364,24 @@ inline std::function<bool(slang::SourceLocation)>& hideMsgIf() {
     static std::function<bool(slang::SourceLocation)> f;
     return f;
 }
+// Is this instance inside protected IP (IEEE 1735 9.2)? True when its own
+// definition, or the definition of an instance above it, is protected code
+// the rights do not make visible: a path into or through protected IP is
+// opaque.
+inline const slang::ast::InstanceSymbol* instanceAround(const slang::ast::Scope* sc) {
+    for (; sc; sc = sc->asSymbol().getParentScope()) {
+        const slang::ast::Symbol& sy = sc->asSymbol();
+        if (sy.kind == slang::ast::SymbolKind::InstanceBody)
+            return sy.as<slang::ast::InstanceBodySymbol>().parentInstance;
+    }
+    return nullptr;
+}
+inline bool protectedInstance(const slang::ast::InstanceSymbol* inst) {
+    if (!hideMsgIf()) return false;
+    for (; inst; inst = instanceAround(inst->getParentScope()))
+        if (hideMsgIf()(inst->getDefinition().location)) return true;
+    return false;
+}
 inline void noteHidden(const slang::ast::Symbol& s, int first, int count) {
     if (hideSigIf() && hideSigIf()(s))
         for (int i = 0; i < count; i++) hiddenSigs().push_back(first + i);
@@ -529,6 +547,7 @@ inline ClassInfo* classInfo(const slang::ast::Type& t) {
 struct LowerResult {
     std::vector<std::unique_ptr<DpiFunc>> dpi;   // DPI imports and exports (35)
     std::vector<std::string> scopes;             // every instance and package, for svGetScopeFromName
+    std::vector<std::string> protScopes;         // those of `scopes` inside protected IP (IEEE 1735 9.7.2.3)
     std::unordered_map<const slang::ast::Symbol*, int> sigOf;   // variable / net -> signal (VPI, 37)
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
@@ -1803,6 +1822,12 @@ struct Lowerer {
             auto loc = call.sourceRange.start();
             c.fmt = std::string(srcMgr()->getFileName(loc));
             c.dline = (int)srcMgr()->getLineNumber(loc);
+            // A call from protected IP: svGetCallerInfo may not give the
+            // place in the IP author's source (IEEE 1735 9.7.2.3).
+            if (hideMsgIf() && hideMsgIf()(loc)) {
+                c.fmt = "<protected>";
+                c.dline = 0;
+            }
         }
         prog.emit(c);
         for (size_t n = 0; n < args.size(); n++) {
@@ -1911,6 +1936,7 @@ struct Lowerer {
         if (srcMgr()) {
             auto loc = call.sourceRange.start();
             site->file = std::string(srcMgr()->getFileName(loc));
+            site->prot = hideMsgIf() && hideMsgIf()(loc);
             site->line = (int)srcMgr()->getLineNumber(loc);
         }
         for (const Scope* sc = scope; sc; sc = sc->asSymbol().getParentScope()) {
@@ -4674,6 +4700,25 @@ struct Lowerer {
                     int src = storeW(*e.type);
                     return sized(r, src, e.type->isSigned(), ctx);
                 }
+                if (stmtDepth && isTaggedUnion(*m.value().type) && m.member.kind == SymbolKind::Field) {
+                    // 7.3.2: reading a member other than the one the tag names is a run-time error
+                    const Type& ut = m.value().type->getCanonicalType();
+                    int uw = ut.isUnpackedUnion() ? uWidth(ut) : (int)ut.getBitWidth();
+                    int tb = tagBitsOf(ut);
+                    if (tb > 0 && uw > 0) {
+                        Instr j; j.k = IK::JmpIfNot;
+                        j.e = un(Op::LogNot, bin(Op::CaseEq, slice(expr(m.value()), uw - 1, uw - tb),
+                                                 konst(mk((uint64_t)tagIndexOf(ut, m.member), tb))));
+                        size_t jf = prog.emit(j);
+                        Instr d; d.k = IK::Display;
+                        std::string at = whereStr();
+                        if (auto sl = at.rfind('/'); sl != std::string::npos) at = at.substr(sl + 1);
+                        d.fmt = escPct("Error: " + at + "read of tagged union member '" + std::string(m.member.name) +
+                                       "', which is not the member the tag names");
+                        prog.emit(d);
+                        prog.code[jf].target = prog.here();
+                    }
+                }
                                 return sized(readPSel(expr(m.value()), memberPSel(m)), bitsOf(*e.type), e.type->isSigned(), ctx);
             }
             case ExpressionKind::SimpleAssignmentPattern:
@@ -6927,7 +6972,59 @@ struct Lowerer {
             if (const TimingControl* tc = a.timingControl; tc && tc->kind != TimingControlKind::Delay) {
                 // a = @(e) b; a = repeat (n) @(e) b (9.4.5): b is taken now and
                 // written after the event (n events for repeat).
-                if (a.isNonBlocking()) unsupported("nonblocking assignment with an intra-assignment event control");
+                if (a.isNonBlocking()) {   // a <= @(e) b: a forked process waits and then schedules the update
+                    if (!store) unsupported("nonblocking assignment with an intra-assignment event control here");
+                    int w = storeW(*a.left().type);
+                    needWidth(w);
+                    Instr f; f.k = IK::Fork; f.join = 2;
+                    FrameLayout* flay = newLayout("nba event");
+                    int slot = flay->add(w, w > 64 ? allx(w) : Val{});
+                    f.init.push_back({slot, resize(i.e, w, a.right().type->isSigned(), false)});
+                    int cslot = -1;
+                    const TimingControl* ev = tc;
+                    if (tc->kind == TimingControlKind::RepeatedEvent) {
+                        const auto& re = tc->as<RepeatedEventControl>();
+                        cslot = flay->add(32, Val{});
+                        f.init.push_back({cslot, resize(expr(re.expr), 32, re.expr.type->isSigned(), true)});
+                        ev = &re.event;
+                    }
+                    f.lay = flay;
+                    Lowerer lw(sigmap);
+                    lw.bind(subs, mkSig, tempSeq, store);
+                    lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
+                    lw.current = current;
+                    lw.retSig = retSig;
+                    lw.scope = scope;
+                    lw.sampleEv = sampleEv;
+                    lw.curClass = curClass;
+                    FrameLayout* bl = newLayout("fork branch");
+                    lw.frames = frames;
+                    lw.frames.push_back(flay);
+                    lw.frames.push_back(bl);
+                    f.blays.push_back(bl);
+                    if (cslot >= 0) {
+                        int cnt = lw.relIn(flay, cslot);
+                        size_t top = lw.prog.here();
+                        Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(cnt, true), konst(make(0, 0, 32, 0, true)));
+                        size_t jf = lw.prog.emit(j);
+                        lw.timing(*ev);
+                        Instr dec; dec.k = IK::Assign; dec.sig = cnt; dec.e = bin(Op::Sub, ref(cnt, true), konst(make(1, 0, 32, 0, true)));
+                        lw.prog.emit(dec);
+                        Instr back; back.k = IK::Jmp; back.target = top; lw.prog.emit(back);
+                        lw.prog.code[jf].target = lw.prog.here();
+                    } else {
+                        lw.timing(*ev);
+                    }
+                    Instr n; n.k = IK::Nba;
+                    lw.lhs(a.left(), n);
+                    n.e = ref(lw.relIn(flay, slot), a.left().type->isSigned());
+                    lw.prog.emit(n);
+                    lw.finishImplicit();
+                    store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+                    f.branches.push_back(store->back().get());
+                    prog.emit(f);
+                    return;
+                }
                 int w = (int)a.left().type->getBitWidth();
                 needWidth(w);
                 int tmp = fresh(w);
@@ -10267,19 +10364,26 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     {   // DPI scope names (35.5.3): every instance and package
         struct Scopes : slang::ast::ASTVisitor<Scopes> {
             std::vector<std::string>* out;
+            std::vector<std::string>* prot;
             void handle(const slang::ast::InstanceSymbol& inst) {
                 if (!enterInstance(inst)) return;
                 out->push_back(inst.getHierarchicalPath());
+                if (protectedInstance(&inst)) prot->push_back(out->back());
                 visitDefault(inst);
             }
-            void handle(const slang::ast::PackageSymbol& p) { out->push_back(std::string(p.name)); }
+            void handle(const slang::ast::PackageSymbol& p) {
+                out->push_back(std::string(p.name));
+                if (hideMsgIf() && hideMsgIf()(p.location)) prot->push_back(out->back());
+            }
             void handle(const slang::ast::GenerateBlockSymbol& g) {
                 if (g.isUninstantiated) return;
                 out->push_back(g.getHierarchicalPath());
+                if (protectedInstance(instanceAround(g.getParentScope()))) prot->push_back(out->back());
                 visitDefault(g);
             }
         } sv;
         sv.out = &out.scopes;
+        sv.prot = &out.protScopes;
         comp.getRoot().visit(sv);
     }
 
