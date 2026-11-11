@@ -1,0 +1,45 @@
+// mpss: extend, select guards, array<>, labels, signed fields, **, a
+// component found without the name pss_top, and a root action by -root.
+enum color_e { RED, GREEN, BLUE }
+
+component leaf_c {
+  int[8] bias = -3;
+  action step {
+    rand int[8] v;
+    rand bit[8] sq;
+    rand array<bit[4], 3> digits;
+    rand color_e color;
+    constraint v in [-5..5];
+    constraint sq == v ** 2;
+    constraint foreach (digits[i]) { digits[i] == i + 1; }
+    constraint ~sq != 0;
+    exec body {
+      print("step v=%d sq=%d color=%d bias=%d\n", v, sq, color, comp.bias);
+    }
+  }
+}
+extend action leaf_c::step {
+  constraint v != 0;
+  constraint color != GREEN;
+}
+
+component soc_c {
+  leaf_c l0, l1;
+  exec init_down { l1.bias = 7; }
+
+  action pick {
+    rand bit[2] k;
+    leaf_c::step s;
+    activity {
+      first: s with { v < 0; };
+      second: select {
+        (k == 0): do leaf_c::step with { color == RED; v == 5; };
+        (k != 0) [2]: sequence {
+          do leaf_c::step with { color == BLUE; v == 4; };
+          do leaf_c::step with { color == BLUE; v == 3; };
+        }
+      }
+    }
+  }
+  action other { }
+}
