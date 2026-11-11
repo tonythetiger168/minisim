@@ -362,6 +362,10 @@ struct Sim {
     int exitCode = 0;                                // the process exit status ($fatal sets 1)
     string vcdPath = "dump.vcd";                     // empty: no waveform
     string vcdTop = "top";   // name of the root VCD scope (the top module)
+    // msim -vcd-arrays [N]: unpacked array elements go to the waveform too,
+    // as m[3], for arrays of at most N elements. 0 (the default): memories
+    // are left out, as $dumpvars does (21.7.1.2).
+    size_t dumpArrays = 0;
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
     // VCD text is built here and written in large blocks (an ostream insert
@@ -632,6 +636,15 @@ struct Sim {
         }
     }
     // set() inside a partition task: only this partition reads the signal.
+    // Stores a value nothing watches (Instr::tmp): no change detection, no
+    // wake-ups, safe from a clocked batch running in parallel.
+    void poke(int s, Val nv, int hi, int lo) {
+        Sig& g = sigs[s];
+        if (hi >= 0) nv = v_insert(g.val, nv, hi, lo);
+        nv = maskWidth(nv, g.w);
+        nv.sgn = false;
+        g.val = nv;
+    }
     void setLocal(int s, Val nv) {
         Sig& g = sigs[s];
         if (nv == g.val) return;
@@ -2204,14 +2217,32 @@ struct Sim {
     vector<int> fsmSigs, fsmOf;   // watched signals; signal -> index in fsmSigs, or -1
     vector<std::map<uint64_t, uint64_t>> fsmSeen;
     vector<std::map<std::pair<uint64_t, uint64_t>, uint64_t>> fsmTrans;
-    void fsmWatch(const vector<int>& watch) {
+    // A one-hot register (hot[i]) is followed from one one-hot value to the
+    // next: it may be cleared and have a bit set in the same time step.
+    vector<char> fsmHot, fsmHasLast;
+    vector<uint64_t> fsmLast;
+    void fsmWatch(const vector<int>& watch, const vector<char>& hot = {}) {
         fsmSigs = watch;
+        fsmHot = hot;
+        fsmHot.resize(watch.size(), 0);
+        fsmHasLast.assign(watch.size(), 0);
+        fsmLast.assign(watch.size(), 0);
         fsmOf.assign(sigs.size(), -1);
         for (size_t i = 0; i < watch.size(); i++) fsmOf[watch[i]] = (int)i;
         fsmSeen.assign(watch.size(), {});
         fsmTrans.assign(watch.size(), {});
     }
     void covFsm(int f, const Val& o, const Val& n) {
+        if (fsmHot[f]) {
+            auto hot = [](const Val& v) { return !(v.x | v.z) && v.v && !(v.v & (v.v - 1)); };
+            if (!fsmHasLast[f] && hot(o)) { fsmHasLast[f] = 1; fsmLast[f] = o.v; fsmSeen[f][o.v] = 1; }
+            if (!hot(n) || (fsmHasLast[f] && fsmLast[f] == n.v)) return;
+            if (fsmHasLast[f]) fsmTrans[f][{fsmLast[f], n.v}]++;
+            fsmSeen[f][n.v]++;
+            fsmHasLast[f] = 1;
+            fsmLast[f] = n.v;
+            return;
+        }
         if (n.x | n.z) return;
         if (!(o.x | o.z)) {
             fsmSeen[f].try_emplace(o.v, 1);   // the value it started with
@@ -2378,6 +2409,22 @@ struct Sim {
 
     void header() {
         if (vcdPath.empty()) return;
+        if (dumpArrays) {
+            // Elements are hidden when they are made; show those of the small
+            // arrays. Only the last name component counts: blk[2].x is not one.
+            auto base = [](const string& n) {
+                size_t dot = n.rfind('.');
+                size_t br = n.find('[', dot == string::npos ? 0 : dot + 1);
+                return br == string::npos ? string() : n.substr(0, br);
+            };
+            unordered_map<string, size_t> count;
+            for (const Sig& g : sigs)
+                if (g.hide && g.name.find('$') == string::npos)
+                    if (string b = base(g.name); !b.empty()) count[b]++;
+            for (Sig& g : sigs)
+                if (g.hide && g.name.find('$') == string::npos)
+                    if (string b = base(g.name); !b.empty() && count[b] <= dumpArrays) g.hide = false;
+        }
         observed = true;   // every change is written: the cycle domain uses set()
         bool asFst = vcdPath.size() > 4 && vcdPath.compare(vcdPath.size() - 4, 4, ".fst") == 0;
 #ifdef MINISIM_FST

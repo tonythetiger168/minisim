@@ -161,24 +161,6 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(mlint PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
-  # Formal property checking on the same lowering: mformal design.sv
-  # The SAT solver is CaDiCaL (MIT), pinned to a release.
-  FetchContent_Declare(cadical
-    GIT_REPOSITORY https://github.com/arminbiere/cadical.git
-    GIT_TAG rel-2.1.3
-    GIT_SHALLOW TRUE)
-  FetchContent_Populate(cadical)
-  file(GLOB CADICAL_SRC ${cadical_SOURCE_DIR}/src/*.cpp)
-  list(FILTER CADICAL_SRC EXCLUDE REGEX "/(cadical|mobical)\\.cpp$")
-  add_library(cadical STATIC ${CADICAL_SRC})
-  target_include_directories(cadical PUBLIC ${cadical_SOURCE_DIR}/src)
-  target_compile_definitions(cadical PRIVATE NBUILD NDEBUG NCLOSEFROM)
-  target_compile_options(cadical PRIVATE -O3 -w)
-  find_package(Threads REQUIRED)
-  add_executable(mformal src/mformal.cpp)
-  target_include_directories(mformal PRIVATE src)
-  target_link_libraries(mformal PRIVATE slang::slang cadical Threads::Threads)
-
   # Design-for-test checks and a scan chain plan: mdft design.sv
   add_executable(mdft src/mdft.cpp)
   target_include_directories(mdft PRIVATE src)
@@ -204,6 +186,13 @@ if(MINISIM_WITH_SLANG)
   target_link_libraries(test_lower PRIVATE slang::slang)
   target_compile_definitions(test_lower PRIVATE MINISIM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME test_lower COMMAND test_lower)
+
+  # The FSM extractor as other tools use it: the header and slang, nothing else.
+  add_executable(test_fsm_extract tests/test_fsm_extract.cpp)
+  target_include_directories(test_fsm_extract PRIVATE src)
+  target_link_libraries(test_fsm_extract PRIVATE slang::slang)
+  target_compile_definitions(test_fsm_extract PRIVATE MINISIM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  add_test(NAME test_fsm_extract COMMAND test_fsm_extract)
 
   # msim end to end: two files, -top, +define+, -maxtime, -vcd, and a bad file.
   set(CLI ${CMAKE_SOURCE_DIR}/examples/cli)
@@ -373,23 +362,18 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+  # Every mlint rule on a marked source file (tests/lint/rules), the
+  # configuration, the waivers, and -threads 1 against -threads 4.
+  if(Python3_FOUND)
+    add_test(NAME mlint_rules
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_rules.py
+                     $<TARGET_FILE:mlint> ${CMAKE_SOURCE_DIR}/tests/lint)
+  endif()
   # Power-aware simulation and UPF checks (IEEE 1801-2024): msim -upf, mlint -upf.
   add_test(NAME upf
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
-  # Formal property checking: verdicts, thread-count independence, and each
-  # counterexample replayed in msim.
-  add_test(NAME mformal
-           COMMAND ${CMAKE_COMMAND} -DMFORMAL=$<TARGET_FILE:mformal> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mformal_test
-                   -P ${CMAKE_SOURCE_DIR}/tests/mformal.cmake)
-  # mformal against msim on random designs (tests/formal/fuzz.py).
-  if(Python3_FOUND)
-    add_test(NAME mformal_fuzz
-             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/formal/fuzz.py ${CMAKE_CURRENT_BINARY_DIR}
-                     0 40 ${CMAKE_CURRENT_BINARY_DIR}/mformal_fuzz)
-  endif()
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
@@ -434,7 +418,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim mlint mdft mdebug mformal slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
