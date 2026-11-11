@@ -276,7 +276,7 @@ plan uart "UART verification plan"
   owner: tony
   feature tx "Transmit path" weight=2 owner=alice
     test   uart_tx_*                # mregress tests
-    line   rtl/uart_tx.sv goal=95   # code coverage
+    line   rtl/uart_tx.sv goal=95   # code coverage (also branch, toggle, cond, fsm)
     cover  tb.cg_tx                 # a covergroup type, or type.item
     assert tb.dut.u_tx              # the assertions in that scope
     feature parity "Parity"
@@ -552,6 +552,19 @@ lists every domain and crossing, `-clock-group a,b` declares related clocks
 and `-static sig` waives a quasi-static signal. Findings print as
 `file:line:col: severity: [RULE] text`, sorted by file and line.
 
+### Power analysis: `mpower`
+
+`mpower` reports average and peak power from a simulation's switching
+activity (SAIF, VCD or FST) and a Liberty library, for a gate netlist or as
+an estimate for RTL, by group, instance, cell and UPF power domain
+([docs/POWER.md](docs/POWER.md)):
+
+```sh
+msim cells.v netlist.v tb.sv -top tb -saif run.saif
+mpower netlist.v -top dut -lib cells.lib -activity run.saif -strip_path tb.dut
+mpower rtl.sv -top dut -activity run.fst -peak -waveform power.csv   # RTL estimate, power over time
+```
+
 ### Source-level debug: `mdebug`
 
 `mdebug` lists the drivers and loads of a signal with the conditions on each
@@ -595,6 +608,18 @@ msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cell
 ```
 
 See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
+
+### FPGA synthesis: `mfpga`
+
+`mfpga` maps RTL (through the same elaborator as `msynth`) or an AIGER graph
+to the LUTs and flip-flops of an FPGA family (iCE40, ECP5, Xilinx 7-series,
+generic) and writes Yosys JSON for nextpnr or EDIF.
+
+```sh
+mfpga rtl/*.sv -top core -family ice40 -o core.json   # then: nextpnr-ice40 --json core.json ...
+```
+
+See [docs/FPGA.md](docs/FPGA.md).
 
 ### Formal property checking: `mformal`
 
@@ -675,6 +700,26 @@ mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v 
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
 boundaries.
+
+### Test patterns: `matpg`
+
+`matpg` generates manufacturing test patterns for a scan-inserted gate
+netlist and reports the fault coverage: stuck-at faults, and transition
+faults by launch-on-capture. It builds with the core, without slang.
+
+```sh
+matpg scan.v                                   # stuck-at patterns and coverage
+matpg scan.v -fault all -stil p.stil -tb p_tb.v
+matpg scan.v -lib cells.lib -min_coverage 98   # Liberty cells; gate for CI
+matpg scan.v -faultsim p.pat                   # grade existing patterns
+```
+
+It traces the scan chains from the ports, runs random patterns and then
+PODEM, fault-simulates every pattern against every remaining fault (64
+patterns to the word, on every core, the same result for any `-threads N`),
+compacts, and writes STIL, a self-checking Verilog testbench that `msim`
+replays, and a fault list with each fault's class. See
+[docs/ATPG.md](docs/ATPG.md).
 
 ### Emulation and FPGA prototyping: `memu`
 
