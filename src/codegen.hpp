@@ -2159,9 +2159,13 @@ private:
         for (int s : privs) if (!scratch(s) && !deadSig[s])
             o << "    if (P" << s << ".x) std::fprintf(stderr, \"4-state (private): %s\\n\", S.sigs[" << origOf(s) << "].name.c_str());\n";
         o << "}\n";
-        o << "static void scanP() {\n    uint64_t x = 0;\n";
+        // While some register keeps an unknown value (one without a reset),
+        // the scan finds it every time: look again after 1, 3, 7 ... 255
+        // passes only. pclean = false is always safe (the 4-state pass runs).
+        o << "static void scanP() {\n    static unsigned skip = 0, wait = 0;\n"
+             "    if (wait) { wait--; pclean = false; return; }\n    uint64_t x = 0;\n";
         for (int s : privs) if (!scratch(s) && !deadSig[s]) o << "    x |= P" << s << ".x;\n";
-        o << "    pclean = x == 0;\n}\n";
+        o << "    pclean = x == 0;\n    skip = x ? (skip < 255 ? skip * 2 + 1 : 255) : 0;\n    wait = skip;\n}\n";
         o << "static void (*const DS[])() = {";
         for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j];
         o << "};\n";
