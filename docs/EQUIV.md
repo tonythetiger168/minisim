@@ -140,6 +140,7 @@ thread count.
 | `-lib FILE` | Liberty library for cells with no Verilog definition |
 | `-blackbox MOD` | do not look inside MOD |
 | `-noclockgate` | compare gated clocks as they are, without turning them into enables |
+| `-noparallelcase` | keep the priority between arms of `unique` and `(* parallel_case *)` cases |
 | `-nofullcase` | ignore `(* full_case *)`: a case with no matching arm keeps the old value |
 | `-noinduction` | compare in every state, not only the states reachable after reset |
 | `-noconstreg` | do not read a reference flop that can hold only one value as a constant |
@@ -233,6 +234,14 @@ no arm matching, and `(* full_case *)` on a case with no default: the attribute
 says the missing values never occur, so the signals the case assigns are
 don't-cares there instead of holding their old value (which in a combinational
 block would be a latch). `-nofullcase` gives the plain Verilog reading back.
+
+`unique`, `unique0` and `(* parallel_case *)` say no two arms of a case match
+at once, and synthesis (msynth among them) builds such a case as an AND-OR
+with no priority. Where two arms do match, what they assign is read as a
+don't-care, so either build is accepted. Arms whose labels are all constants
+cannot overlap and are left alone. `-noparallelcase` keeps the priority; use
+it to check RTL whose `parallel_case` may be wrong, since the attribute is
+otherwise trusted the way synthesis trusts it.
 PicoRV32 synthesized by msynth on mini45 proves equivalent with these readings
 (3553 compare points, about 0.3 s).
 
@@ -244,7 +253,10 @@ internal node in common, which neither SAT nor sweeping gets through. A point
 still open after the quick SAT pass is split on up to three variables, chosen
 as the ones that shrink its cone most when fixed (the select, a reset); with
 them fixed the two sides are the same logic and hash together. A 24-bit
-isolated multiplier takes about a second this way.
+isolated multiplier takes about a second this way. A select written as a long condition (`a && !b && c == 3`) is
+split on as one signal, and every variable a case fixes is substituted into
+it, so the case often collapses at once; what is left is the two sides built
+in different orders, which sweeping pairs up.
 
 ### Induction over the reset state
 
@@ -266,5 +278,8 @@ are proved apart, each from its own reset.
 
 What this assumes: the design is reset before it is used, and events come one
 at a time (two clocks do not tick in the same instant). `-noinduction` turns
-it off and shows the points as failing. mpopt's sequential clock gates prove
+it off and shows the points as failing. When a step or base query runs out of
+effort (`-effort`), the points it covers are reported as aborted, and the
+verdict is inconclusive (exit 3), not "not equivalent": the failing states
+may be unreachable. mpopt's sequential clock gates prove
 this way (its `pipe` test: 80 of 875 points, about 2 s).

@@ -53,6 +53,7 @@ const char* kHelp =
     "  -noclockgate     do not read a gated clock (latch and AND) as a flop enable\n"
     "  -nofullcase      ignore (* full_case *): a case with no matching arm keeps the old value\n"
     "  -noinduction     compare every state, not only those reachable after reset\n"
+    "  -noparallelcase  keep the priority between arms of unique and (* parallel_case *) cases\n"
     "  -noconstreg      do not read a reference flop that can hold only one value as a constant\n"
     "  -threads N       worker threads (default: all logical cores; 1 disables)\n"
     "  -effort N        SAT conflicts allowed per compare point (default 2000000)\n"
@@ -190,6 +191,7 @@ int main(int argc, char** argv) {
         if (a == "-verbose") { verbose = true; continue; }
         if (a == "-noclockgate") { eopt.clockGates = false; continue; }
         if (a == "-nofullcase") { eopt.fullCase = false; continue; }
+        if (a == "-noparallelcase") { eopt.parallelCase = false; continue; }
         if (a == "-noinduction") { copt.induction = false; continue; }
         if (a == "-noconstreg") { copt.constRegs = false; continue; }
         if (a == "-q") { quiet = true; continue; }

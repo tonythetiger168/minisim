@@ -104,7 +104,8 @@ public:
             if (memo.count(n)) { st.pop_back(); continue; }
             if (!isAnd(n)) { memo[n] = n * 2; st.pop_back(); continue; }
             Lit a, b;
-            bool x = isXnor(n, a, b);
+            // (not when one of the xnor's inner nodes is itself given a value)
+            bool x = isXnor(n, a, b) && !memo.count(nodeOf(node(n).a)) && !memo.count(nodeOf(node(n).b));
             if (!x) a = node(n).a, b = node(n).b;
             bool ready = true;
             for (Lit f : {a, b})

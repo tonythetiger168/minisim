@@ -117,3 +117,8 @@ check(0 "16 of the passing points hold by induction" -ref seqgate.sv -impl seqga
 check(1 "Verification FAILED" -noinduction -ref seqgate.sv -impl seqgate.sv +define+GATED)
 check(1 "Verification FAILED" -ref seqgate.sv -impl seqgate.sv +define+GATED +define+BUG_STUCK)
 check(1 "Verification FAILED" -ref seqgate.sv -impl seqgate.sv +define+GATED +define+BUG_EARLY)
+
+# (* parallel_case *): two arms matching at once is a don't-care in the reference.
+check(0 "Verification SUCCEEDED" -ref parcase.sv -impl parcase.sv +define+FLAT)
+check(1 "Verification FAILED" -ref parcase.sv -impl parcase.sv +define+FLAT +define+BUG)
+check(1 "Verification FAILED" -noparallelcase -ref parcase.sv -impl parcase.sv +define+FLAT)

@@ -57,7 +57,8 @@ struct CheckOptions {
     uint64_t sweepEffort = 300;     // SAT conflicts per internal equivalence tried
     std::vector<std::pair<std::string, std::string>> matches;  // ref name, impl name
     uint64_t splitEffort = 20000;   // SAT conflicts per case of a case split
-    unsigned splitDepth = 3;        // variables a hard point is split on
+    unsigned splitDepth = 10;       // variables one case of a hard point may fix
+    unsigned splitCases = 24;       // cases of one point that may go to the solver
     bool induction = true;          // prove failing points by induction over the reset state
     bool constRegs = true;          // read unmatched reference flops stuck at their reset value as that value
 };
@@ -278,6 +279,44 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
 
 namespace detail {
 
+// Everything that follows from literal l being true, as node values: an AND
+// that is true has both inputs true, all the way down. (A select written as
+// a && b && c fixes a, b and c when it is set, and an operand that was ANDed
+// with it may have been folded into those.)
+inline void assumeTrue(const Aig& g, Lit l, std::unordered_map<uint32_t, Lit>& fix) {
+    std::vector<Lit> st{l};
+    while (!st.empty() && fix.size() < 4096) {
+        Lit x = st.back();
+        st.pop_back();
+        uint32_t n = nodeOf(x);
+        if (!n || fix.count(n)) continue;
+        fix[n] = isNeg(x) ? kFalse : kTrue;
+        if (!isNeg(x) && g.isAnd(n)) st.push_back(g.node(n).a), st.push_back(g.node(n).b);
+    }
+}
+
+// The variables that must have one value for 'root' to be true: the
+// variable leaves of the AND tree at its top. A compare point's miter is
+// (the register loads) & (the two sides differ), and what the load needs is
+// often what makes the two sides the same logic.
+inline size_t rootFacts(const Aig& g, Lit root, std::unordered_map<uint32_t, Lit>& fix) {
+    size_t added = 0;
+    std::vector<Lit> st{root};
+    std::unordered_set<uint32_t> seen;
+    while (!st.empty() && seen.size() < 4096) {
+        Lit x = st.back();
+        st.pop_back();
+        uint32_t n = nodeOf(x);
+        if (!n || !seen.insert(n).second) continue;
+        if (g.isAnd(n)) {
+            if (!isNeg(x)) st.push_back(g.node(n).a), st.push_back(g.node(n).b);
+        } else if (fix.emplace(n, isNeg(x) ? kFalse : kTrue).second) {
+            ++added;
+        }
+    }
+    return added;
+}
+
 // The free variable in the cone of 'root' that most shrinks the cone when it
 // is fixed: a hard miter is usually two datapaths that become the same logic
 // once a select between them is decided (an isolated operand, a bypass).
@@ -321,6 +360,9 @@ inline uint32_t splitVar(Aig& g, Lit root, size_t slack) {
         }
         if (todo.empty() && sup.size() <= 4) for (uint32_t v : sup) addCand(v);
     }
+    // And those nodes themselves: a select with many variables behind it is
+    // still one signal that is either set or not.
+    for (auto& [f, n] : ands) addCand(n);
     auto coneSize = [&](Lit r) {
         std::unordered_set<uint32_t> in;
         std::vector<uint32_t> s2{nodeOf(r)};
@@ -339,8 +381,9 @@ inline uint32_t splitVar(Aig& g, Lit root, size_t slack) {
     size_t bestSize = coneSize(root) * slack / 10;
     for (uint32_t n : cand) {
         size_t sz = 0;
-        for (Lit v : {kFalse, kTrue}) {
-            std::unordered_map<uint32_t, Lit> m{{n, v}};
+        for (bool v : {false, true}) {
+            std::unordered_map<uint32_t, Lit> m;
+            assumeTrue(g, Lit(n * 2 + (v ? 0 : 1)), m);
             sz += coneSize(g.cofactor(root, m));
         }
         if (sz < bestSize) bestSize = sz, best = n;
@@ -727,33 +770,56 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
             }
         });
     };
-    // First split on the variables that decide between datapaths.
-    // Serial, because the cases are new logic in the shared graph.
     size_t splitSlack = 13;
-    std::function<int(Point&, Lit, unsigned, std::vector<std::pair<uint32_t, bool>>&, uint32_t)> split =
-        [&](Point& p, Lit m, unsigned depth, std::vector<std::pair<uint32_t, bool>>& path, uint32_t hint) -> int {
-        if (m == kFalse) return 0;
-        if (!path.empty()) {
+    unsigned splitCalls = 0;
+    // split(p, m, when, depth, hint): can m be true while 'when' holds?
+    // 0 no, 1 yes (p gets the counterexample), -1 not settled.
+    std::function<int(Point&, Lit, Lit, unsigned, uint32_t)> split =
+        [&](Point& p, Lit m, Lit when, unsigned depth, uint32_t hint) -> int {
+        if (m == kFalse || when == kFalse) return 0;
+        // What m needs of single variables, put back into m.
+        for (int round = 0; round < 8; ++round) {
+            std::unordered_map<uint32_t, Lit> facts;
+            if (!detail::rootFacts(g, m, facts)) break;
+            Lit all = kTrue;
+            for (auto& [n, v] : facts) all = g.and_(all, Lit(n * 2) ^ (v == kTrue ? 0u : 1u));
+            Lit m2 = g.cofactor(m, facts);
+            when = g.and_(when, all);
+            if (m2 == kFalse || when == kFalse) return 0;
+            bool same = m2 == kTrue;
+            m = m2;
+            if (same) break;
+        }
+        // A case that fixing one more variable would shrink is split again
+        // (one side of such a split usually vanishes, so this is a chain, not
+        // a tree); a case that would not is the solver's.
+        uint32_t v = depth ? (hint ? hint : detail::splitVar(g, m, splitSlack)) : 0;
+        if (when != kTrue) {
+            Lit q = g.and_(when, m);
+            if (q == kFalse) return 0;
+            if (splitCalls++ >= opt.splitCases) return -1;
+            if (!v) {
+                // The two sides are now the same function built two ways (one
+                // was built knowing what this case fixes, the other was not):
+                // their internal nodes pair up, which is what sweeping finds.
+                std::vector<Lit*> roots{&q};
+                res.merged += detail::sweep(g, roots, opt.sweepEffort, {});
+                if (q == kFalse) return 0;
+            }
             Cnf cnf(g);
-            // Inner cases get a glance; the full effort goes to the last ones.
-            int r = cnf.solve(m, depth ? std::min<uint64_t>(opt.splitEffort, 300) : opt.splitEffort);
+            int r = cnf.solve(q, v ? std::min<uint64_t>(opt.splitEffort, 300) : opt.splitEffort);
             p.conflicts += cnf.sat.conflicts();
-            if (r == 1)
-                finishCex(p, [&](uint32_t n) {
-                    for (auto& [v, b] : path) if (v == n) return b;
-                    return cnf.model(n);
-                });
+            if (r == 1) finishCex(p, [&](uint32_t n) { return cnf.model(n); });
             if (r >= 0) return r;
         }
-        if (depth == 0) return -1;
-        uint32_t v = hint ? hint : detail::splitVar(g, m, splitSlack);
         if (!v) return -1;
         int all = 0;
         for (bool b : {false, true}) {
-            std::unordered_map<uint32_t, Lit> fix{{v, b ? kTrue : kFalse}};
-            path.push_back({v, b});
-            int r = split(p, g.cofactor(m, fix), depth - 1, path, 0);
-            path.pop_back();
+            // v may be a signal inside the cone, not only a variable: m with v
+            // replaced by b is what m is whenever v is b.
+            std::unordered_map<uint32_t, Lit> fix;
+            detail::assumeTrue(g, Lit(v * 2 + (b ? 0 : 1)), fix);
+            int r = split(p, g.cofactor(m, fix), g.and_(when, Lit(v * 2 + (b ? 0 : 1))), depth - 1, 0);
             if (r == 1) return 1;
             if (r < 0) all = -1;
         }
@@ -770,11 +836,9 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
         for (size_t k = 0; k < res.points.size() && opt.splitDepth && dry < 8; ++k) {
             if (!open[k]) continue;
             Point& p = res.points[k];
-            uint32_t v = detail::splitVar(g, p.miter, splitSlack);
-            if (!v) { ++dry; continue; }
-            dry = 0;
-            std::vector<std::pair<uint32_t, bool>> path;
-            int r = split(p, p.miter, opt.splitDepth, path, v);
+            splitCalls = 0;
+            int r = split(p, p.miter, kTrue, opt.splitDepth, 0);
+            dry = r < 0 ? dry + 1 : 0;
             if (r < 0) continue;
             open[k] = 0;
             p.how = "case split";
@@ -818,8 +882,9 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
         std::vector<size_t> F;
         for (size_t k = 0; k < res.points.size(); ++k) {
             const Point& p = res.points[k];
-            if (p.status == Point::Abort) return;
-            if (p.status != Point::Fail) continue;
+            if (p.status == Point::Pass) continue;
+            // A point that ran out of effort joins the invariant: it may be
+            // provable in the reachable states, and nothing is lost by trying.
             if (!p.note.empty() || p.kind == Point::Trigger) return;
             F.push_back(k);
         }
@@ -889,21 +954,29 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
             }
             return std::pair{sub, fix};
         };
+        bool unsure = false;  // some query ran out of effort
         auto holds = [&](Lit bad) {  // 'bad' cannot be true
             if (bad == kFalse) return true;
             Cnf cnf(g);
-            if (cnf.solve(bad, opt.splitEffort) == 0) return true;
+            int r = cnf.solve(bad, opt.splitEffort);
+            if (r >= 0) return r == 0;
             Point scratch;
-            std::vector<std::pair<uint32_t, bool>> path;
             splitSlack = 20;  // one query decides many points: any split that helps
-            return split(scratch, bad, opt.splitDepth, path, 0) == 0;
+            splitCalls = 0;
+            r = split(scratch, bad, kTrue, opt.splitDepth, 0);
+            if (r < 0) {
+                Cnf full(g);
+                r = full.solve(bad, opt.effort);
+            }
+            if (r < 0) unsure = true;
+            return r == 0;
         };
         auto Jnext = fresh;
         Lit hypNext = neg(g.cofactor(M, Jnext));  // J(s, in')
         for (Lit ev : events) {
             auto [sub, fix] = after(ev, kFalse);
             Lit hyp = g.and_(neg(g.cofactor(M, fix)), hypNext);
-            if (!holds(g.and_(hyp, g.cofactor(M, sub)))) return {};
+            if (!holds(g.and_(hyp, g.cofactor(M, sub)))) return unsure ? "?" : "";
         }
         // Base: an asynchronous event first, then an input held through a clock edge.
         auto name = [&](Lit l) {
@@ -930,7 +1003,7 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
                         if (holds(g.cofactor(M, sub))) reset = name(l);
                     }
         }
-        return reset;
+        return reset.empty() && unsure ? std::string("?") : reset;
         };
         // Points that share implementation-only state share an invariant; the
         // rest are proved apart, each from its own reset. If that leaves any,
@@ -973,15 +1046,25 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
                 p.cex.clear();
             }
         };
-        std::vector<size_t> left;
+        std::vector<size_t> left, open;  // not inductive; ran out of effort
         for (auto& [root, pts] : groups) {
             std::string reset = root ? prove(pts) : std::string();
-            if (!reset.empty()) accept(pts, reset);
+            if (reset == "?") open.insert(open.end(), pts.begin(), pts.end());
+            else if (!reset.empty()) accept(pts, reset);
             else left.insert(left.end(), pts.begin(), pts.end());
         }
         if (!left.empty() && groups.size() > 1 && left.size() == F.size()) {
             std::string reset = prove(F);
-            if (!reset.empty()) accept(F, reset);
+            if (reset == "?") open = F;
+            else if (!reset.empty()) accept(F, reset);
+        }
+        // A point that fails in some state and whose induction was not settled
+        // is not known to differ: the state may be unreachable.
+        for (size_t k : open) {
+            Point& p = res.points[k];
+            if (p.status != Point::Fail) continue;
+            p.status = Point::Abort;
+            p.how = "induction";
         }
         for (auto& r : resets) res.inductionReset += (res.inductionReset.empty() ? "" : ", ") + r;
     }();

@@ -114,6 +114,7 @@ struct ElabOptions {
     size_t maxLoop = 1u << 20;         // iterations before a loop is called unbounded
     bool clockGates = true;            // read a latch-and-AND gated clock as an enable
     bool fullCase = true;              // honour (* full_case *): no arm matching is a don't-care
+    bool parallelCase = true;          // unique / (* parallel_case *): two arms matching is a don't-care
 };
 
 class Elab {
@@ -1645,13 +1646,16 @@ private:
                     Bit m;
                     Layer L;
                     Flags f;
+                    bool constant = true;  // every label is a constant
                 };
                 std::vector<Arm> arms;
                 bool closed = false;  // an arm that always matches ends the list
                 for (auto& item : c.items) {
                     Bit m = kB0;
+                    bool constant = true;
                     for (auto* ie : item.expressions) {
                         Bit one;
+                        if (!ie->eval(ectx)) constant = false;
                         if (c.condition == CaseStatementCondition::Inside) {
                             fail("case inside", s);
                         } else if (c.condition == CaseStatementCondition::Normal) {
@@ -1666,6 +1670,7 @@ private:
                     if (isFalse(m)) continue;
                     Arm a;
                     a.m = m;
+                    a.constant = constant;
                     a.L = branch(a.f, [&] { execStmt(*item.stmt, gd); });
                     arms.push_back(std::move(a));
                     if (isTrue(m)) { closed = true; break; }
@@ -1695,10 +1700,38 @@ private:
                         }
                     }
                 }
+                // unique, unique0 and (* parallel_case *) say no two arms match at
+                // once; synthesis then drops the priority between them. Where two
+                // do match, what the arms assign is a don't-care. (Arms whose
+                // labels are all constants cannot overlap each other.)
+                Bit overlap = kB0;
+                Layer clash;
+                if (opt.parallelCase &&
+                    (c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Unique0 ||
+                     hasAttribute(s, "parallel_case"))) {
+                    for (size_t i = 0; i < arms.size(); ++i)
+                        for (size_t j = i + 1; j < arms.size(); ++j)
+                            if (!arms[i].constant || !arms[j].constant)
+                                overlap = bv.or_(overlap, bv.and_(arms[i].m, arms[j].m));
+                    if (!isFalse(overlap))
+                        for (auto& a : arms) {
+                            for (auto& [k, b] : a.L.env) {
+                                auto& v = clash.env[k];
+                                if (v.empty()) v.assign(b.size(), kUnset);
+                                for (size_t i = 0; i < b.size(); ++i) if (isSet(b[i])) v[i] = kBX;
+                            }
+                            for (auto& [sym, b] : a.L.nba) {
+                                auto& v = clash.nba[sym];
+                                if (v.empty()) v.assign(b.size(), kUnset);
+                                for (size_t i = 0; i < b.size(); ++i) if (isSet(b[i])) v[i] = kBX;
+                            }
+                        }
+                }
                 for (size_t k = arms.size(); k-- > 0;) {
                     acc = mergeLayers(arms[k].m, std::move(arms[k].L), std::move(acc));
                     accF = mergeFlags(arms[k].m, arms[k].f, accF);
                 }
+                if (!isFalse(overlap)) acc = mergeLayers(overlap, std::move(clash), std::move(acc));
                 absorb(std::move(acc));
                 cur->f = accF;
                 break;
@@ -1865,7 +1898,7 @@ private:
         std::unordered_map<uint32_t, size_t> latchByOut, latchByQ;
         for (size_t i = 0; i < d.states.size(); ++i) {
             const State& l = d.states[i];
-            if (!l.latch || l.next.x != kFalse) continue;
+            if (!l.latch) continue;
             if (g.isAnd(nodeOf(l.next.v))) latchByOut[nodeOf(l.next.v)] = i;
             latchByQ[nodeOf(l.q)] = i;
         }
@@ -1874,6 +1907,8 @@ private:
             bool ok = false;
             Lit clk = kFalse, en = kFalse;
             Lit root = kFalse;  // the clock input, as the literal that is true while it is high
+            Lit enX = kFalse;   // the enable is unknown (an X reaches the gate's enable pin)
+            Lit anyX = kFalse;  // some latch in the chain shows X
         };
         std::unordered_map<Lit, Gate> cache;
         std::function<Gate(Lit, size_t, bool, int)> attempt;
@@ -1944,6 +1979,10 @@ private:
                     gate.root = c;
                     // Triggers that do not pass the gate (an async reset) load regardless.
                     gate.en = g.or_(t0, g.rebuildSparse(n0, low));
+                    auto qx = q0;
+                    auto lowx = low;
+                    gate.enX = g.and_(neg(t0), g.rebuildSparse(g.rebuildSparse(l.next.x, qx), lowx));  // not when it loads regardless
+                    gate.anyX = l.next.x;
                 }
             if (gate.ok || depth >= 8) return gate;
             // A gate on a gated clock: the latch closes on the gated clock, not
@@ -1961,15 +2000,25 @@ private:
             gate.clk = sub.clk;
             gate.root = sub.root;
             gate.en = g.or_(t0, g.and_(sub.en, g.rebuildSparse(n0, low)));
+            auto qx = q0;
+            auto lowx = low;
+            gate.enX = g.and_(neg(t0), g.or_(sub.enX, g.rebuildSparse(g.rebuildSparse(l.next.x, qx), lowx)));
+            gate.anyX = g.or_(sub.anyX, l.next.x);
             return gate;
         };
         for (State& f : d.states) {
-            if (f.latch || f.trig.x != kFalse || !g.isAnd(nodeOf(f.trig.v))) continue;
+            if (f.latch || !g.isAnd(nodeOf(f.trig.v))) continue;
             auto it = cache.find(f.trig.v);
             if (it == cache.end()) it = cache.emplace(f.trig.v, analyze(f.trig.v, 0)).first;
             if (!it->second.ok) continue;
+            if (f.trig.x != kFalse) {
+                // The trigger may be unknown only because the gate's enable is.
+                Lit other = g.and_(f.trig.x, neg(it->second.anyX));
+                Cnf cnf(g);
+                if (other != kFalse && cnf.solve(other, 100000) != 0) continue;
+            }
             f.trig = {it->second.clk, kFalse};
-            f.next = bv.mux(Bit{it->second.en, kFalse}, f.next, Bit{f.q, kFalse});
+            f.next = bv.mux(Bit{it->second.en, it->second.enX}, f.next, Bit{f.q, kFalse});
             ++d.gatedFlops;
         }
     }
