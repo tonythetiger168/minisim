@@ -87,18 +87,20 @@ public:
         std::vector<int> dom = cycle && !cov ? cycleDomain(procs, sigs) : std::vector<int>{};
         {
             // The domain re-evaluates every static combinational statement on
-            // each commit (and whenever any input changes). That pays when the
-            // registers feed most of the logic every cycle (bench/: at most 6
-            // statements per NBA), not for a CPU whose decoder and datapath far
-            // outnumber the registers that change: Ibex has 1400 statements for
-            // 62 NBAs, and ran 6x faster with only the changed ranks evaluated.
+            // each commit (and whenever an input outside the clock cone
+            // changes). That pays when registers feed the logic every cycle:
+            // bench/ has at most 6 statements per NBA, Ibex 16 (3200 for 199)
+            // and runs 1.5x faster in the domain than with only the changed
+            // ranks evaluated. A design that is nearly all comb logic stays
+            // out. MSIM_XCYC=1 forces the domain, MSIM_WHYCYCLE=1 prints the counts.
             size_t nba = 0, comb = 0;
             for (int i : dom)
                 for (auto& in : procs[i].prog->code) nba += in.k == IK::Nba;
             for (auto& p : procs)
                 if (p.combRank >= 0)
                     for (auto& in : p.prog->code) { if (in.k == IK::WaitEdge) break; comb += in.k == IK::Assign; }
-            if (comb > 64 && comb > 8 * nba && !getenv("MSIM_XCYC")) dom.clear();
+            if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %zu clocked processes, %zu NBAs, %zu comb statements\n", dom.size(), nba, comb);
+            if (comb > 64 && comb > 64 * nba && !getenv("MSIM_XCYC")) dom.clear();
         }
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
         for (size_t i = 0; i < procs.size(); i++) {
