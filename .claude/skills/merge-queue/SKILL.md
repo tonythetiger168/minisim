@@ -43,6 +43,18 @@ gh pr ready <n>                  # drafts can neither merge nor auto-merge
 gh pr merge <n> --auto --merge   # arms auto-merge; it fires when both checks pass
 ```
 
+In a Claude Code cloud session GitHub GraphQL is blocked, so `gh pr ready`,
+`gh pr merge --auto` and `gh pr view --json` fail with 403. Use the GitHub
+MCP tools (`update_pull_request` with `draft: false`, `enable_pr_auto_merge`)
+or the REST routes:
+
+```sh
+gh api -X POST repos/tonythetiger168/minisim/pulls/<n>/ccr/ready_for_review
+gh api -X PUT  repos/tonythetiger168/minisim/pulls/<n>/ccr/auto_merge -f merge_method=merge
+gh api repos/tonythetiger168/minisim/commits/<sha>/check-runs \
+  --jq '.check_runs[]|{name,status,conclusion}'
+```
+
 Then stop and wait for the PR event. If CI goes red, reproduce the failing
 check locally, fix it, push, and let auto-merge re-arm on the new head.
 After the merge, report it to the coordinator so the next PR can start.
