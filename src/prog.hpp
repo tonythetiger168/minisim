@@ -25,7 +25,8 @@ enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_
               D_POP_BACK, D_FIRST, D_LAST, D_NEXT, D_PREV, D_COPY, D_APPEND, D_APPEND_SLICE, D_REVERSE,
               D_SORT, D_RSORT, D_SHUFFLE,
               D_SORT_BY, D_RSORT_BY,     // sort / rsort with (7.12.2): keys in dsrc
-              D_UNPACK };                // q = {>>{v}} (11.4.14.3): e cut into elements
+              D_UNPACK,                  // q = {>>{v}} (11.4.14.3): e cut into elements
+              D_DEFAULT };               // '{default: v} of an associative array (7.9.11): a missing element reads as e
 // IK::ProcOp operations (9.7).
 enum ProcOpKind { PO_SELF, PO_STATUS, PO_KILL, PO_AWAIT, PO_SUSPEND, PO_RESUME };
 enum class IK {
