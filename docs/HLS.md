@@ -45,7 +45,9 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
 | every C operator, casts, `?:`, short-circuit `&&` `\|\|`, `++`/`--`, compound assignment | `sizeof`, string literals |
 | `if`, `switch` (with fall-through), `for`, `while`, `do`, `break`, `continue`, `return` anywhere | `goto` |
 | fixed-size arrays of any dimension, initializer lists | pointers other than scalar output parameters, dynamic memory |
-| functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion, classes, templates |
+| functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion |
+| with `-clang`: classes, inheritance, member functions, constructors, operators, templates, namespaces (see C++ through Clang) | virtual functions in a class hierarchy, lambdas |
+| `hls::stream<T>&` parameters with `read()` and `write(x)` (see Streams) | `empty()`, `full()`, non-blocking access, local streams |
 | structs: nested, in arrays, with array members and bit-fields; copied, passed by value, pointer or reference, and returned | unions, pointer members, member functions, structs defined inside a function |
 
 `ap_`/`sc_` operands are widened to 64 bits in arithmetic, so a product of
@@ -62,6 +64,53 @@ array member is passed by pointer or reference, not by value.
 Pragmas: `#pragma hls unroll` (before a loop or first in its body),
 `#pragma hls pipeline` (in a function: the whole function is a pipeline;
 first in a loop body: that loop is pipelined), `#pragma hls top`.
+
+## C++ through Clang
+
+`mhls -clang` has the installed `clang` read the source (an external
+program; nothing of LLVM is built into mhls) and takes its syntax tree. In
+that tree every template is instantiated, every overload is resolved and
+every implicit conversion is spelled out, so C++ reduces to what the rest of
+mhls already synthesizes: plain functions over structs.
+
+```sh
+mhls fir.cpp -clang -top fir4 -o fir4.sv -tb fir4_tb.sv -cref fir4_ref.cpp
+mhls fir.cpp -clang -emit-c fir.c      # see the reduction
+```
+
+| C++ | becomes |
+|---|---|
+| a class or struct with member functions | a struct, and one function per member function that is used, taking the object as `self` |
+| a class or function template | one struct or function per instantiation (`Fir<4>` is `Fir_4`) |
+| a base class | the first member of the derived struct (`mhls_base_<Base>`); inherited members and member functions go through it, and an object passed as its base passes that member |
+| a constructor, member initializers | a function run where the object is declared; an array of objects runs it per element |
+| `a + b`, `v[i]`, `f(x)` on objects | calls to `operator+`, `operator[]`, `operator()` |
+| a temporary object, an object returned by a call, `c ? a : b` on objects | a variable declared before the statement |
+| a member function that returns `*this` (`operator+=`, `++`, a setter that chains) | a void function; the call's value is the object |
+| default arguments, overloads, `static` members, `enum class`, namespaces, `constexpr`, `auto` | the value, the function or the constant they stand for |
+| `const T&` to a number | the number |
+
+Only what the design uses is written. That covers the classes, templates and
+inline functions of the headers it includes, and of the standard library
+where they are this plain (`std::min`, `std::max`). `-I` and `-D` go to
+clang, and `__MHLS__` is defined while it reads. With `-top`, only the
+functions named and what they use are looked at, so the file may hold more
+than mhls can synthesize. Errors and warnings from the rest of mhls name the
+lines of the C++ file. `clang` is found on the `PATH`; set
+`MHLS_CLANG` to use another one.
+
+Refused, with the line: virtual base classes, virtual functions in a class
+that has a base or is one, casts from base to derived, pointer or reference members and
+variables, functions that return a non-constant reference to anything but
+their own object, floating point,
+lambdas, range-based `for`, `new`, exceptions, a call to a function clang
+shows no body for. The C limits apply as well (no recursion, fixed-size
+arrays). A class without data members cannot be a base. `ap_int<N>` and `ap_uint<N>` are not available with `-clang` yet;
+use `intN_t` types or bit-fields. `#pragma hls` lines are read from the file
+given to mhls, not from its headers.
+
+Without `-clang` nothing changes: the built-in C front end reads the file
+and clang is not needed.
 
 ## Pipelined loops
 
@@ -132,6 +181,38 @@ stage. A pipeline needs a function that is straight-line after unrolling
 (no memories, no data-dependent loops), and a `static` must be read and
 updated in the same stage; `mhls` says which rule fails and why.
 
+### Streams
+
+A parameter of type `hls::stream<T>&` (T a scalar type) is a valid/ready
+port instead of a memory. Each `read()` takes one element, each `write(x)`
+sends one, in program order, and the state machine waits in that state
+while the source has nothing to offer or the sink is not ready. A stream is
+read or written, not both.
+
+| Port | |
+|---|---|
+| `<s>_tdata`, `<s>_tvalid` | the element and its valid; inputs for a stream that is read, outputs for one that is written |
+| `<s>_tready` | the other direction: mhls is ready to take, or the sink is ready |
+
+```c
+#include "mhls_stream.h"
+void scale(hls::stream<uint8_t>& in, hls::stream<uint16_t>& out, uint8_t gain, uint8_t n) {
+  for (int i = 0; i < n; i++) out.write(in.read() * gain);
+}
+```
+
+`include/mhls_stream.h` defines `hls::stream` for compiling the same source
+on the host; `mhls` ignores the include. A transfer takes a state of its
+own and a read delivers its data in the next one, so the loop above moves
+one element every two cycles. Pipelined (`#pragma hls pipeline` or
+`-pipeline-loops`) it moves one element per cycle: the stages of a
+pipelined loop all stop in a cycle where one of them cannot make its
+transfer. Two accesses to the same stream in one iteration follow the
+memory rule (one iteration every 2 cycles). The pipeline architecture
+(`-pipeline`) does not take streams. `-tb` adds a source and a sink that hesitate on every other
+call and checks the elements, their order and their number; `-cref` checks
+the same on the host.
+
 `-handshake` adds a second module `<top>_hs` around the block with
 `in_valid`/`in_ready` for the scalar inputs and `out_valid`/`out_ready` for
 the results, in place of the `ap_` control ports. A transfer happens in a
@@ -169,6 +250,9 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 | `-handshake` | also write `<top>_hs`, the block behind ready/valid ports |
 | `-max-reg-array <n>` | largest local array kept in registers (default 64) |
 | `-delay-scale <x>` | scale the built-in operator delays |
+| `-clang` | read the source with clang: C++ classes and templates (see C++ through Clang) |
+| `-emit-c <file>` | with `-clang`: write the plain C the source reduces to |
+| `-I<dir>`, `-D<name>[=<v>]` | include path (clang only) and macro definition |
 | `-tb <file>`, `-cref <file>`, `-vectors <n>`, `-seed <n>` | verification collateral |
 | `-explore <ns,...>` | schedule at each clock period, print states, latency, register bits, area |
 | `-report <file>` | the summary as JSON |
@@ -182,6 +266,6 @@ need multicycle constraints.
 
 ## Not yet
 
-Dual-port memories, array arguments as streams,
+Dual-port memories, non-blocking stream access,
 unions, SystemC modules (`SC_MODULE`, clocked threads), and
 operator delays taken from a Liberty library.

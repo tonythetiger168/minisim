@@ -1,0 +1,17 @@
+RC low-pass: step response and corner frequency
+* tau = R*C = 1 ms. v(out) reaches 1 - 1/e at t = tau; -3 dB at 1/(2 pi tau).
+.param r=1k c=1u
+v1 in 0 dc 0 ac 1 pulse(0 1 0 1u 1u 1 2)
+r1 in out {r}
+c1 out 0 {c}
+.tran 10u 5m
+.ac dec 20 1 100k
+.meas tran t63 when v(out)=0.632120559 rise=1
+.meas tran vend find v(out) at=5m
+.meas ac f3db when vdb(out)=-3.0103
+.meas ac ph find vp(out) at=159.154943
+*> t63 1.0005e-3 2e-3
+*> vend 0.993262 1e-3
+*> f3db 159.1549 2e-3
+*> ph -45 2e-3 mspice-only
+.end

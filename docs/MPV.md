@@ -9,6 +9,7 @@ netlist.
 mpv drc -deck rules.drc chip.gds                 # every rule, one line each
 mpv drc -deck rules.drc chip.gds -top core -q    # one cell; only rules with violations
 mpv drc -deck rules.drc chip.gds -o drc.txt      # also write the markers
+mpv drc -deck rules.drc chip.gds -rdb drc.lyrdb  # markers for KLayout's marker browser
 mpv drc -deck rules.drc chip.gds -threads 8
 mpv drc -deck rules.drc chip.oas                 # OASIS, told from the file's first bytes
 ```
@@ -45,6 +46,7 @@ Exit status: 0 clean, 1 violations, 2 a usage or input error.
 | `-deck <file>` | the rule deck (below) |
 | `-top <cell>` | cell to check; default is the one cell nothing references |
 | `-o <file>` | results file with the markers |
+| `-rdb <file>` | the markers as a KLayout report database (`.lyrdb`): open it in KLayout's marker browser (Tools, Marker Browser) over the layout to step through the violations. One category per rule; each marker is a box, or an edge where the margin is zero, with the measured value |
 | `-max <n>` | markers written per rule (default 1000); the counts stay exact |
 | `-threads <n>` | worker threads; default is every logical CPU (`$MINISIM_THREADS` overrides) |
 | `-q` | print only the rules with violations |
@@ -105,6 +107,7 @@ A rule reports the places where its comparison is true.
 | `space(a) < v` | outside distance between polygons, in notches, and corner to corner |
 | `space(a, b) < v` | outside distance between `a` and `b` |
 | `enclosure(a, b) < v` | `a` must be inside `b` with margin `v`. Reports margins from 0 up to `v`, and any part of `a` outside `b` |
+| `enclosure(a, b, opposite) < v` | the same margins, but a polygon of `a` passes when it has margin `v` on two opposite sides (left and right, or bottom and top). This is the foundry rule "enclosure on one of two adjacent sides", as for contacts and vias with a line-end enclosure. Parts of `a` outside `b` are always reported |
 | `overhang(a, b) < v` | where `a` crosses `b`, `a` must continue past `b` by `v` (a poly end cap, diffusion past a gate) |
 | `area(a) < v`, `area(a) > v` | polygon area |
 | `density(a, w) < v`, `... > v` | area of `a` over the area of each `w` by `w` window of the extent. `density(a, w, s)` steps the windows by `s`; the last window of each row and column is moved back to end on the extent |

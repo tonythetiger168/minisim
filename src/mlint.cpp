@@ -466,6 +466,11 @@ int main(int argc, char** argv) {
     fe.comp->getRoot().visit(global);
     lintrules::BodyCollector bodies;
     fe.comp->getRoot().visit(bodies);
+    // State machines, from the extractor FSM coverage uses (one more walk).
+    std::vector<ExtractedFsm> fsms;
+    if (rep.rules.enabled("FSM001") || rep.rules.enabled("FSM002") || rep.rules.enabled("FSM003") ||
+        rep.rules.enabled("FSM004"))
+        fsms = extractFsms(fe.comp->getRoot());
     lap("hierarchy walks");
 
     bool upfFailed = false;
@@ -481,6 +486,7 @@ int main(int argc, char** argv) {
             global.analyze(r);
         } else if (i == 2) {
             lintrules::checkDefinitions(*fe.comp, params, r);
+            lintrules::checkFsms(fsms, r);
         } else if (i == 3) {
             if (upfPath.empty()) return;
             try {

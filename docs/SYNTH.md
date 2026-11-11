@@ -38,13 +38,29 @@ write_sdc core.sdc
    functions and tasks inlined, memories become flops and multiplexers.
    Adders are ripple-carry below 8 bits and parallel-prefix (Sklansky) from
    8 bits up; multipliers are carry-save arrays; dividers are restoring.
-   Structural hashing shares equal logic as it is built.
+   Structural hashing shares equal logic as it is built, and nested
+   selects with a shared arm (`if (a) if (b) x <= d;`) fold into one
+   select with a combined condition. An `'x` in the source is a
+   don't-care: a select with an `'x` arm is its other arm (elsewhere `'x`
+   is 0). Registers that reach no output, registers stuck at their
+   asynchronous reset value, and registers without reset whose next state
+   is a constant or only themselves, are then removed
+   (`Information: removed N unloaded or constant register bits`).
+   Last, functional reduction (`src/synth/fraig.hpp`): nodes are simulated
+   with random patterns, nodes with the same signature are candidates, and
+   the shared SAT solver proves or refutes each pair; a proven node is
+   replaced by the earlier one (`Information: merged N nodes ...`).
+   `set msynth_fraig false` before `elaborate` skips it.
 2. **Map** (`src/synth/map.hpp`). For every node the 4-input cuts are
    listed with their truth tables, and each is matched against the library
    by function, with any input or the output inverted. Each node keeps its
    best cover in both polarities, by area flow, or by arrival time when the
    area result misses the clock. Flops are chosen by the library's `ff`
    groups; a missing variant (falling edge, preset) is built from another.
+   A register that loads under an enable goes onto an enable flop
+   (`next_state : E ? D : IQ`) when that costs less than a flop and a mux.
+   Afterwards, two 2:1 muxes on one select that feed only a third become a
+   4:1 mux cell where the library has a smaller one.
 3. **Buffer**. Nets with more than `set_max_fanout` loads (12 by default)
    get a buffer tree. Clock nets are left alone.
 4. **Time** (`src/synth/sta.hpp`). Arrival times with the library's NLDM
@@ -127,8 +143,36 @@ half that the equivalence, formal and FPGA tools share. Beside the graph,
 - One clock is timed; `set_false_path` and `set_multicycle_path` are not
   applied. `msta` is the sign-off timer.
 - Library cells with more than 4 inputs or more than one output (adders,
-  scan and enable flops) are not used by the mapper.
+  scan flops) are not used by the mapper; 4:1 muxes and enable flops
+  without an asynchronous control are.
+- No logic rewriting yet (balancing, rewriting, don't-cares): random logic
+  comes out larger than from Yosys with ABC, see below.
 - The hierarchy is always flattened.
+
+## Against Yosys
+
+Yosys 0.33 (`synth -flatten; dfflibmap; abc -liberty`) and msynth on the
+same RTL and the same library (mini45, typical corner), one machine:
+
+| design | msynth area | Yosys area | msynth time | Yosys time |
+|---|---|---|---|---|
+| PicoRV32 (default parameters) | 18098 | 15458 | 0.8 s | 5.4 s |
+| tests/synth/mem.sv (three small memories) | 2149 | 2297 | 0.03 s | 0.4 s |
+| tests/synth/counter.sv | 92 | 85 | 0.03 s | 0.2 s |
+
+Most of msynth's time on PicoRV32 is functional reduction (0.7 s); without
+it the run takes 0.1 s and the area is about 3% larger.
+
+msynth's figures include its fanout buffers (Yosys adds none; about 700
+of PicoRV32's area). Yosys 0.33 does not read the SystemVerilog of the
+other test designs.
+
+Where the difference to Yosys is, measured on PicoRV32: ABC's
+optimization scripts (`dc2`, `resyn2`) on msynth's graph, mapped by
+msynth, gain 3 to 4%; ABC's own mappers (`map`, `amap`, `&nf` with `dch`)
+on the same graph give more area than msynth's. Yosys's netlist before
+ABC, read by msynth, maps to 16817. So about half of the gap is in how the
+RTL is turned into logic, and half is ABC's optimization on Yosys's side.
 
 ## Tests
 
@@ -138,3 +182,11 @@ must print the same lines. This is done with the default library and with a
 library of only an inverter, a NAND and one flop. Each netlist on the default library is
 also proven equivalent to its RTL with `mequiv`, and a netlist with one gate
 swapped must be reported as different.
+
+## The shell as a header
+
+The shell itself is `src/synth/shell.hpp` (`synth::Shell`); `src/msynth.cpp`
+is only the command line. A tool that wants the same shell with more
+commands includes the header, creates a `Shell`, and adds its commands
+with `sh.cmd(name, help, fn)`; `sh.des`, `sh.nl`, `sh.lib` and
+`sh.needNetlist()` give it the design, the mapped netlist and the library.

@@ -11,18 +11,24 @@ function(design file top)
   list(REMOVE_ITEM opts NOCREF)
   string(REPLACE ";" " " shown "${opts}")
   set(base ${OUT}/${top})
+  set(src ${H}/${file}.c)
+  set(inc)
+  if(file MATCHES "\\.cpp$")   # C++ goes through clang
+    set(src ${H}/${file} -clang -I${SRC}/include)
+    set(inc -I${SRC}/include)
+  endif()
   set(cref -cref ${base}_ref.cpp)
   if(NOT nocref EQUAL -1)
     set(cref)
   endif()
-  execute_process(COMMAND ${MHLS} ${H}/${file}.c -top ${top} -o ${base}.sv -tb ${base}_tb.sv ${cref}
+  execute_process(COMMAND ${MHLS} ${src} -top ${top} -o ${base}.sv -tb ${base}_tb.sv ${cref}
                           -vectors 40 -q ${opts}
                   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
   if(NOT rc EQUAL 0)
     message(FATAL_ERROR "mhls ${file}.c -top ${top} ${shown} failed:\n${out}${err}")
   endif()
   if(cref)
-    execute_process(COMMAND ${CXX} -std=c++17 -fwrapv -w -o ${base}_ref ${base}_ref.cpp
+    execute_process(COMMAND ${CXX} -std=c++17 -fwrapv -w ${inc} -o ${base}_ref ${base}_ref.cpp
                     RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
     if(NOT rc EQUAL 0)
       message(FATAL_ERROR "${top} ${shown}: the C reference does not compile:\n${out}${err}")
@@ -81,6 +87,14 @@ design(faint faint)                              # variables that only feed them
 design(mac mac -handshake)                       # ready/valid ports around the FSM: the result waits for out_ready
 design(fir fir -handshake -pipeline -clock 2.5)  # around the pipeline: a refused result stalls every stage
 design(looppipe2 hist -handshake)                # with memories
+design(stream scale)                             # stream arguments: one in, one out, a stalling source and sink
+design(stream packet)                            # reads that depend on data read before, a conditional write
+design(stream merge)                             # two sources, reads in branches
+design(stream relay)                             # streams handed to an inlined function
+design(stream relay -unroll-all -handshake)
+design(stream peak)                              # pipelined loop over streams: one element per cycle, stalls as a whole
+design(stream scale -pipeline-loops)
+design(stream relay -pipeline-loops -clock 3)    # one iteration every 2 cycles, two reads per iteration
 design(fir fir -pipeline-loops -clock 3)         # best effort: loops that cannot be pipelined stay as they are
 design(matmul matmul -pipeline-loops -clock 3)
 design(sqrt hist -pipeline-loops)
@@ -90,7 +104,11 @@ design(apint blend -pipeline -clock 2 NOCREF)
 
 # What cannot be built says why.
 function(refuses file top pattern)
-  execute_process(COMMAND ${MHLS} ${H}/${file}.c -top ${top} -o ${OUT}/refused.sv -q ${ARGN}
+  set(src ${H}/${file}.c)
+  if(file MATCHES "\\.cpp$")
+    set(src ${H}/${file} -clang)
+  endif()
+  execute_process(COMMAND ${MHLS} ${src} -top ${top} -o ${OUT}/refused.sv -q ${ARGN}
                   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
   if(rc EQUAL 0 OR NOT err MATCHES "${pattern}")
     message(FATAL_ERROR "mhls ${file}.c -top ${top} ${ARGN}: expected an error matching '${pattern}', got rc=${rc}:\n${err}")
@@ -103,10 +121,51 @@ refuses(bad_recursion fact "recursion")
 refuses(bad_looppipe_port bump "accessed more than once per iteration")
 refuses(bad_looppipe_cond length "condition is not known in the first stage")
 refuses(bad_looppipe_chain chase "updated from its own previous value")
+refuses(bad_stream_both echo "cannot also be written")
+refuses(bad_stream_empty peek "'empty' is not supported")
+refuses(bad_stream_local local "a stream is a reference parameter")
 refuses(bad_struct_byvalue byvalue "pass 'x' by pointer or reference")
 refuses(bad_struct_dropped dropped "must be assigned to a variable")
 refuses(bad_struct_scalar scalar "a struct cannot be used as a value")
 refuses(gcd nosuch "is not defined")
+
+# C++ through clang (mhls -clang): classes, templates, constructors, operators.
+find_program(CLANG NAMES clang)
+if(CLANG)
+  set(ENV{MHLS_CLANG} ${CLANG})
+  design(cxx.cpp fir4)                           # class templates, constructors, operators, a scoped enum
+  design(cxx.cpp fir4 -unroll-all -clock 4 -handshake)
+  design(cxx.cpp gather)                         # an object fed from a stream
+  design(cxx.cpp gather -pipeline-loops)
+  design(cxx2.cpp filt)                          # nested class, static and template members, overloads, default arguments
+  design(cxx2.cpp filt -unroll-all -clock 5)
+  design(cxx2.cpp tally)                         # member functions that return *this: +=, ++, chained calls
+  design(cxx2.cpp tally -unroll-all)
+  design(cxx3.cpp survey)                        # inheritance: base constructors, inherited and hidden members, two bases
+  design(cxx3.cpp survey -unroll-all -clock 6)
+  design(cxx3.cpp shade)                         # a derived struct as an argument
+  design(cxxhdr.cpp ring)                        # classes and templates from a header, std::min and std::max
+  refuses(bad_cxx_base.cpp top "virtual functions in a class with a base")
+  refuses(bad_cxx_float.cpp top "does not support floating point")
+  refuses(bad_cxx_lambda.cpp top "lambda")
+  refuses(bad_cxx_syntax.cpp top "clang did not accept")
+  if(PY)
+    set(sim)
+    if(MSIM)
+      set(sim --msim ${MSIM})
+    endif()
+    # The fuzzer's C programs are C++ too: the same checks with clang reading them.
+    execute_process(COMMAND ${PY} ${H}/fuzz.py --mhls ${MHLS} ${sim} --cxx ${CXX} --out ${OUT}/fuzz_clang --seeds 0:40 --clang
+                    RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT rc EQUAL 0)
+      message(FATAL_ERROR "mhls fuzz through clang:\n${out}${err}")
+    endif()
+    string(STRIP "${out}" out)
+    message(STATUS "through clang: ${out}")
+  endif()
+else()
+  message(STATUS "mhls -clang: no clang on this machine, C++ designs skipped")
+endif()
 
 # Threads: the same files whatever -threads says (two tops at once, and the clock sweep).
 foreach(n 1 4)

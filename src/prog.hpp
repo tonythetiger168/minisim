@@ -655,6 +655,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
 // in the set drives), stable within a level, so ranks of one level never
 // feed each other and can be computed in parallel. `levels` (optional)
 // receives the level of each entry of the returned order.
+inline std::vector<int>* g_combCycles = nullptr;   // out: per process, its cycle (component) or -1
 inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::vector<int>* levels = nullptr, bool* cyclic = nullptr) {
     size_t n = cs.size();
     std::vector<std::vector<size_t>> succ(n);
@@ -717,6 +718,10 @@ inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::v
         }
     }
     for (size_t a = 0; a < n; a++) rep[a] = members[(size_t)comp[a]][0];
+    if (g_combCycles) {   // msim's MSIM_WHYCYCLE report
+        g_combCycles->assign(n, -1);
+        for (size_t a = 0; a < n; a++) if (members[(size_t)comp[a]].size() > 1) (*g_combCycles)[a] = comp[a];
+    }
     if (cyclic) {
         *cyclic = false;
         for (auto& m : members) *cyclic |= m.size() > 1;
