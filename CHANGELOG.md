@@ -404,6 +404,10 @@ Spec references are IEEE 1800-2023 clauses.
   resets to flop pins. `-nocarry` and `-noce` turn each off.
 - `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
   `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mlint` runs slang-tidy's checks (the lint tool that ships with slang, MIT)
+  as rules `TIDY001`..`TIDY021`, with mlint's severities, waivers, JSON and
+  threads; the checks mlint already had a rule for are left out. See
+  `docs/LINT.md` and `THIRD_PARTY_NOTICES.md`.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

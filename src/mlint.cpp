@@ -27,6 +27,9 @@
 #include "cpu.hpp"
 #include "lintir.hpp"
 #include "lintrules.hpp"
+#ifdef MINISIM_TIDY
+#include "linttidy.hpp"
+#endif
 #include "parallel.hpp"
 #include "upf.hpp"
 #include "version.hpp"
@@ -389,6 +392,9 @@ int main(int argc, char** argv) {
         fwd.push_back(a);
     }
     lintrules::Params params = lintrules::Params::from(cfg, cfg.errors);
+#ifdef MINISIM_TIDY
+    linttidy::configure(cfg, cfg.errors);
+#endif
     if (!cfg.errors.empty()) {
         for (auto& e : cfg.errors) std::cerr << "mlint: " << e << "\n";
         return 2;
@@ -446,11 +452,17 @@ int main(int argc, char** argv) {
     lap("design model");
     // L001 from the front end's data-flow analysis, which follows single
     // bits: z[i] assigned for every i in a loop is assigned, w[3:2] is not w.
-    if (rep.rules.enabled("L001")) {
+    // slang-tidy's checks read the same analysis.
+    std::unique_ptr<analysis::AnalysisManager> am;
+    bool tidy = false;
+#ifdef MINISIM_TIDY
+    tidy = linttidy::anyEnabled(rep.rules);
+#endif
+    if (rep.rules.enabled("L001") || tidy) {
         fe.comp->freeze();
-        analysis::AnalysisManager am({}, std::make_shared<ThreadPool>(threads));
-        am.analyze(*fe.comp);
-        for (auto& dg : am.getDiagnostics()) {
+        am = std::make_unique<analysis::AnalysisManager>(analysis::AnalysisOptions{}, std::make_shared<ThreadPool>(threads));
+        am->analyze(*fe.comp);
+        for (auto& dg : am->getDiagnostics()) {
             if (dg.code != diag::InferredLatch || dg.args.empty()) continue;
             const std::string* name = std::get_if<std::string>(&dg.args[0]);
             if (!name) continue;
@@ -521,6 +533,10 @@ int main(int argc, char** argv) {
         cdc::check(*fe.comp, rep, cdcOpt);
     }
     lap("clock and reset crossings");
+#ifdef MINISIM_TIDY
+    if (tidy) linttidy::run(*fe.comp, *am, fe.driver.diagEngine, rep, threads);
+    lap("slang-tidy checks");
+#endif
     std::vector<Final> fs = resolve(rep.out, cfg);
     printText(std::cout, fs, cfg, quiet, showWaived);
     if (hidden)

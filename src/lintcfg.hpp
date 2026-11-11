@@ -221,6 +221,31 @@ inline const std::vector<RuleInfo>& table() {
         {"FUNC001", "style", Sev::Info, true, "a function reads or writes a signal that is not one of its arguments",
          "always @* does not see signals read inside a function, and the function cannot be reused."},
 
+#ifdef MINISIM_TIDY
+        // -------------------------------------------------------------------- tidy
+        // slang-tidy's checks (linttidy.hpp); the detail names the check.
+        {"TIDY001", "tidy", Sev::Warning, true, "a register is assigned in the reset branch only", "slang-tidy check OnlyAssignedOnReset."},
+        {"TIDY002", "tidy", Sev::Warning, true, "an always_ff with a reset assigns a register outside the if / else of the reset", "slang-tidy check AlwaysFFAssignmentOutsideConditional."},
+        {"TIDY003", "tidy", Sev::Warning, true, "a for loop in front of the reset test of an always_ff", "slang-tidy check LoopBeforeResetCheck."},
+        {"TIDY004", "tidy", Sev::Warning, true, "some bits of a signal are never driven", "slang-tidy check UndrivenRange."},
+        {"TIDY005", "tidy", Sev::Warning, true, "fields of one struct are assigned in different processes", "slang-tidy check StructFieldsInSameProcess."},
+        {"TIDY006", "tidy", Sev::Warning, true, "a signed cast used as an index", "slang-tidy check CastSignedIndex."},
+        {"TIDY007", "tidy", Sev::Warning, false, "a signal in a sensitivity list is not used in the block", "slang-tidy check UnusedSensitiveSignal."},
+        {"TIDY008", "tidy", Sev::Warning, false, "'d or '? literals (not accepted by some FPGA tools)", "slang-tidy check XilinxDoNotCareValues."},
+        {"TIDY009", "tidy", Sev::Warning, false, "a .* port connection", "slang-tidy check NoDotStarInPortConnection."},
+        {"TIDY010", "tidy", Sev::Warning, false, "a .name port connection with no expression", "slang-tidy check NoDotVarInPortConnection."},
+        {"TIDY011", "tidy", Sev::Warning, false, "a non-ANSI port declaration", "slang-tidy check OnlyANSIPortDecl."},
+        {"TIDY012", "tidy", Sev::Warning, false, "generate / endgenerate keywords or a genvar declared outside its loop", "slang-tidy check NoLegacyGenerate."},
+        {"TIDY013", "tidy", Sev::Warning, false, "an always_comb whose begin has no label", "slang-tidy check AlwaysCombBlockNamed."},
+        {"TIDY014", "tidy", Sev::Warning, false, "an enum declared without a typedef", "slang-tidy check TypedefEnums."},
+        {"TIDY015", "tidy", Sev::Warning, false, "a struct or union declared without a typedef", "slang-tidy check TypedefStructUnion."},
+        {"TIDY016", "tidy", Sev::Warning, false, "an enum type name does not match tidy.enum", "slang-tidy check EnumName."},
+        {"TIDY017", "tidy", Sev::Warning, false, "a struct type name does not match tidy.struct", "slang-tidy check StructName."},
+        {"TIDY018", "tidy", Sev::Warning, false, "a union type name does not match tidy.union", "slang-tidy check UnionName."},
+        {"TIDY019", "tidy", Sev::Warning, false, "a covergroup name does not match tidy.covergroup", "slang-tidy check CovergroupName."},
+        {"TIDY020", "tidy", Sev::Warning, false, "a coverpoint name does not match tidy.coverpoint", "slang-tidy check CoverpointName."},
+        {"TIDY021", "tidy", Sev::Warning, false, "a cross name does not match tidy.cross", "slang-tidy check CrossName."},
+#endif
         // --------------------------------------------------------------------- fsm
         {"FSM001", "fsm", Sev::Warning, true, "a state that no transition and no reset leads to",
          "The state is named or tested, but the machine can never be in it: dead logic, or a transition that was forgotten."},

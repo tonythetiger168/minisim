@@ -82,7 +82,10 @@ struct Params {
         static const std::set<std::string> keys = {
             "name.module", "name.signal", "name.param", "name.clock", "name.reset", "name.active_low",
             "name.instance", "name.port_in", "name.port_out", "name.typedef", "unused.ignore",
-            "name.max_length", "tb.modules"};
+            "name.max_length", "tb.modules",
+            // slang-tidy's settings (linttidy.hpp)
+            "tidy.clock", "tidy.reset", "tidy.reset_active_high", "tidy.enum", "tidy.struct", "tidy.union",
+            "tidy.covergroup", "tidy.coverpoint", "tidy.cross"};
         for (auto& [k, v] : cfg.params)
             if (!keys.count(k)) errors.push_back("set " + k + ": no such setting");
         return p;

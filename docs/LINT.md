@@ -165,6 +165,46 @@ a module with no ports, or a module named in `tb.modules`.
 | `STY003` | info | off | A plain always where always_ff / always_comb / always_latch says more |
 | `FUNC001` | info | on | A function reads or writes a signal that is not one of its arguments |
 
+### slang-tidy checks (`tidy`)
+
+[slang-tidy](https://github.com/MikePopoloski/slang/tree/master/tools/tidy)
+is the lint tool that ships with slang, mlint's front end (MIT license). Its
+checks are built into mlint and report as mlint rules, so severities,
+waivers, `-json` and `-threads` apply to them. Only the checks mlint has no
+rule of its own for are here (its `NoCaseX` is `CASE003`, `AlwaysFFBlocking`
+is `L002`, and so on). The name in brackets is the slang-tidy check.
+
+| Rule | Severity | Default | What it finds |
+|---|---|---|---|
+| `TIDY001` | warning | on | A register is assigned in the reset branch only (`OnlyAssignedOnReset`) |
+| `TIDY002` | warning | on | An always_ff with a reset assigns a register outside the if / else of the reset (`AlwaysFFAssignmentOutsideConditional`) |
+| `TIDY003` | warning | on | A for loop in front of the reset test of an always_ff (`LoopBeforeResetCheck`) |
+| `TIDY004` | warning | on | Some bits of a signal are never driven (`UndrivenRange`) |
+| `TIDY005` | warning | on | Fields of one struct are assigned in different processes (`StructFieldsInSameProcess`) |
+| `TIDY006` | warning | on | A signed cast used as an index (`CastSignedIndex`) |
+| `TIDY007` | warning | off | A signal in a sensitivity list is not used in the block (`UnusedSensitiveSignal`) |
+| `TIDY008` | warning | off | 'd or '? literals (not accepted by some FPGA tools) (`XilinxDoNotCareValues`) |
+| `TIDY009` | warning | off | A .* port connection (`NoDotStarInPortConnection`) |
+| `TIDY010` | warning | off | A .name port connection with no expression (`NoDotVarInPortConnection`) |
+| `TIDY011` | warning | off | A non-ANSI port declaration (`OnlyANSIPortDecl`) |
+| `TIDY012` | warning | off | Generate / endgenerate keywords or a genvar declared outside its loop (`NoLegacyGenerate`) |
+| `TIDY013` | warning | off | An always_comb whose begin has no label (`AlwaysCombBlockNamed`) |
+| `TIDY014` | warning | off | An enum declared without a typedef (`TypedefEnums`) |
+| `TIDY015` | warning | off | A struct or union declared without a typedef (`TypedefStructUnion`) |
+| `TIDY016` | warning | off | An enum type name does not match tidy.enum (`EnumName`) |
+| `TIDY017` | warning | off | A struct type name does not match tidy.struct (`StructName`) |
+| `TIDY018` | warning | off | A union type name does not match tidy.union (`UnionName`) |
+| `TIDY019` | warning | off | A covergroup name does not match tidy.covergroup (`CovergroupName`) |
+| `TIDY020` | warning | off | A coverpoint name does not match tidy.coverpoint (`CoverpointName`) |
+| `TIDY021` | warning | off | A cross name does not match tidy.cross (`CrossName`) |
+
+Settings (`-set`, or `set` in a configuration file): `tidy.clock` (default
+`clk_i`) and `tidy.reset` (`rst_ni`) name the clock and the reset the
+reset checks look for, `tidy.reset_active_high` (`false`); `tidy.enum`,
+`tidy.struct`, `tidy.union`, `tidy.covergroup`, `tidy.coverpoint` and
+`tidy.cross` are the name patterns. Build without them with
+`-DMINISIM_WITH_SLANG_TIDY=OFF`.
+
 ### State machines (`fsm`)
 
 Found by the extractor FSM coverage uses (`msim -cov`), so lint and coverage

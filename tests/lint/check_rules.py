@@ -38,8 +38,12 @@ def findings(out):
 
 rules_dir = os.path.join(here, "rules")
 tested = set()
+# The TIDY rules are a build option (MINISIM_WITH_SLANG_TIDY).
+have_tidy = "TIDY001" in run(["-list"])[1]
 for name in sorted(os.listdir(rules_dir)):
     if not name.endswith(".sv"):
+        continue
+    if name == "tidy.sv" and not have_tidy:
         continue
     path = os.path.join(rules_dir, name)
     text = open(path).read()
