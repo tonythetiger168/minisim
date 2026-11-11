@@ -17,6 +17,7 @@
 // other way. The active-driver trace evaluates the guards against the values
 // in a VCD: a flop's guards are sampled just before the time its output
 // changed, combinational logic at that time.
+#include <climits>
 #include <cstdint>
 #include <fstream>
 #include <optional>
@@ -253,6 +254,74 @@ bool flatRange(const Expression& e, int& lo, int& w) {
         }
         default: return false;
     }
+}
+
+// The variable an lvalue or a select is a part of.
+const Symbol* baseOf(const Expression& e) {
+    const Expression* b = &e;
+    for (;;) {
+        switch (b->kind) {
+            case ExpressionKind::MemberAccess: b = &b->as<MemberAccessExpression>().value(); break;
+            case ExpressionKind::ElementSelect: b = &b->as<ElementSelectExpression>().value(); break;
+            case ExpressionKind::RangeSelect: b = &b->as<RangeSelectExpression>().value(); break;
+            case ExpressionKind::NamedValue: return &b->as<NamedValueExpression>().symbol;
+            case ExpressionKind::HierarchicalValue: return &b->as<HierarchicalValueExpression>().symbol;
+            default: return nullptr;
+        }
+    }
+}
+
+// The bits of sym that an expression reads: [lo, end) around every fixed
+// part that is read (s.f, v[7:4]), or whole when sym is read as it is.
+struct BitsRead {
+    int lo = INT_MAX, end = -1;
+    bool whole = false;
+    bool part() const { return !whole && end > lo; }
+};
+void bitsRead(const Expression& e, const Symbol* sym, BitsRead& out) {
+    auto take = [&](const Expression& x) {
+        int lo, w;
+        if (baseOf(x) != sym || !flatRange(x, lo, w)) return false;
+        out.lo = std::min(out.lo, lo);
+        out.end = std::max(out.end, lo + w);
+        return true;
+    };
+    e.visit(makeVisitor(
+        [&](auto& v, const MemberAccessExpression& x) { if (!take(x)) v.visitDefault(x); },
+        [&](auto& v, const ElementSelectExpression& x) { if (!take(x)) v.visitDefault(x); },
+        [&](auto& v, const RangeSelectExpression& x) { if (!take(x)) v.visitDefault(x); },
+        [&](auto&, const NamedValueExpression& x) { if (&x.symbol == sym) out.whole = true; },
+        [&](auto&, const HierarchicalValueExpression& x) { if (&x.symbol == sym) out.whole = true; }));
+}
+// The part of sym that driver expressions read, as lo and width; false when
+// it is read whole or the part is not fixed.
+bool partRead(const Expression* rhs, const std::vector<const Expression*>& conds, const Symbol* sym, int& lo, int& w) {
+    BitsRead b;
+    if (!rhs) return false;
+    bitsRead(*rhs, sym, b);
+    for (const Expression* c : conds) if (c) bitsRead(*c, sym, b);
+    if (!b.part()) return false;
+    lo = b.lo; w = b.end - b.lo;
+    return true;
+}
+// "s.f" for a field of a struct, "v[7:4]" for other bits.
+std::string partName(const Symbol& s, int lo, int w) {
+    if (s.kind == SymbolKind::Variable || s.kind == SymbolKind::Net) {
+        const Type& t = s.as<ValueSymbol>().getType().getCanonicalType();
+        std::vector<const FieldSymbol*> fields;
+        bool packed = t.kind == SymbolKind::PackedStructType;
+        if (packed) for (const FieldSymbol& f : t.as<PackedStructType>().membersOfType<FieldSymbol>()) fields.push_back(&f);
+        else if (t.kind == SymbolKind::UnpackedStructType) for (const FieldSymbol* f : t.as<UnpackedStructType>().fields) fields.push_back(f);
+        int total = 0;
+        for (const FieldSymbol* f : fields) total += f->getType().isIntegral() ? (int)f->getType().getBitWidth() : 0;
+        for (const FieldSymbol* f : fields) {
+            if (!f->getType().isIntegral()) continue;
+            int fw = (int)f->getType().getBitWidth();
+            int fl = packed ? (int)f->bitOffset : total - (int)f->bitOffset - fw;
+            if (fl == lo && fw == w) return "." + std::string(f->name);
+        }
+    }
+    return w == 1 ? "[" + std::to_string(lo) + "]" : "[" + std::to_string(lo + w - 1) + ":" + std::to_string(lo) + "]";
 }
 
 // The symbols an assignment's left side writes; select indices are reads.
@@ -1040,12 +1109,28 @@ struct Tool {
 
     using Seen = std::set<std::tuple<const Symbol*, uint64_t, std::string>>;
 
+    // The part of r that driver d reads (one struct field, some bits), when
+    // it does not read r whole.
+    bool readPart(const Driver& d, const Symbol* r, int& lo, int& w) {
+        std::vector<const Expression*> conds{d.lhs};
+        for (const Guard& g : d.guards) {
+            conds.push_back(g.cond);
+            if (!g.cs) continue;
+            conds.push_back(&g.cs->expr);
+            for (const auto& item : g.cs->items)
+                for (const Expression* x : item.expressions) conds.push_back(x);
+        }
+        return partRead(d.rhs, conds, r, lo, w);
+    }
+
     // The assignment that gave s its value at time t, then what caused it.
     // elem: one element of an unpacked array, "[3]", which has its own
     // waveform when msim ran with -vcd-arrays.
-    void active(const Symbol* s, uint64_t t, int depth, int indent, Seen& seen, const std::string& elem = "") {
+    // plo, pw: only these bits of s matter (a struct field that was read).
+    void active(const Symbol* s, uint64_t t, int depth, int indent, Seen& seen, const std::string& elem = "",
+                int plo = -1, int pw = 0) {
         std::string pad(indent * 2, ' ');
-        const std::string name = path(*s) + elem;
+        std::string name = path(*s) + elem;
         const Wave* w = vcd.find(name);
         if (!w) {
             bool arr = s->kind == SymbolKind::Variable && s->as<ValueSymbol>().getType().isUnpackedArray();
@@ -1053,13 +1138,24 @@ struct Tool {
             return;
         }
         int ci = w->at(t);
-        uint64_t tc = ci < 0 ? 0 : w->ch[ci].t;
-        std::cout << pad << name << " = " << (ci < 0 ? "x" : showBits(w->bits(ci))) << " @" << t;
+        if (plo == 0 && ci >= 0 && pw >= (int)w->bits(ci).size()) plo = -1;   // all of it
+        // A part: its own value, and the last time those bits changed.
+        auto part = [&](int i) {
+            std::string b = w->bits(i);
+            return (int)b.size() >= plo + pw ? b.substr(b.size() - plo - pw, pw) : b;
+        };
+        int pi = ci;
+        if (plo >= 0 && ci >= 0) {
+            name += partName(*s, plo, pw);
+            while (pi > 0 && part(pi - 1) == part(pi)) pi--;
+        }
+        uint64_t tc = pi < 0 ? 0 : w->ch[pi].t;
+        std::cout << pad << name << " = " << (ci < 0 ? "x" : showBits(plo >= 0 ? part(ci) : w->bits(ci))) << " @" << t;
         if (tc != t) std::cout << "  (since " << tc << ")";
         std::cout << "\n";
         auto it = db.driversOf.find(s);
         if (it == db.driversOf.end()) { std::cout << pad << "  no driver: an input or a testbench value\n"; return; }
-        if (!seen.insert({s, tc, elem}).second) { std::cout << pad << "  (shown above)\n"; return; }
+        if (!seen.insert({s, tc, plo < 0 ? elem : elem + "#" + std::to_string(plo) + ":" + std::to_string(pw)}).second) { std::cout << pad << "  (shown above)\n"; return; }
 
         // Which drivers ran? A flop's conditions are sampled before the edge.
         struct Hit { int ix; int state; uint64_t ts; };   // state: 1 yes, 0 no, -1 unknown
@@ -1135,6 +1231,8 @@ struct Tool {
             const Driver& d = db.drivers[hits[k].ix];
             if (hits[k].state == 0) continue;
             if (hits[k].state == 1 && covered(k)) continue;
+            // An assignment to other bits is not a cause of this part.
+            if (plo >= 0 && d.lo >= 0 && (d.lo + d.w <= plo || d.lo >= plo + pw)) continue;
             any = true;
             std::cout << pad << "  " << (hits[k].state == 1 ? "<- " : "?? ") << line(d) << "\n";
             if (depth <= 0) continue;
@@ -1177,7 +1275,10 @@ struct Tool {
                         if (el != "?") { active(r, ts, depth - 1, indent + 2, seen, el); any2 = true; }
                     if (any2) continue;
                 }
-                active(r, ts, depth - 1, indent + 2, seen);
+                // A struct: only the field that was read.
+                int rlo = -1, rw2 = 0;
+                if (!readPart(d, r, rlo, rw2)) rlo = -1;
+                active(r, ts, depth - 1, indent + 2, seen, "", rlo, rw2);
             }
         }
         if (!any) std::cout << pad << "  no assignment's conditions hold at " << tc << " (" << it->second.size() << " drivers)\n";
@@ -1421,6 +1522,21 @@ struct Tool {
                     o += (o.size() > 1 ? "," : "") + std::to_string(it->second);
             return o + "]";
         };
+        // "part": the signals a driver reads only a part of, as [lo, width, name].
+        auto parts = [&](const Driver& d) {
+            std::string o;
+            std::vector<const Symbol*> all = d.reads;
+            all.insert(all.end(), d.creads.begin(), d.creads.end());
+            std::set<const Symbol*> done;
+            for (const Symbol* r : all) {
+                auto ix = db.sigIx.find(r);
+                int lo, w;
+                if (ix == db.sigIx.end() || !done.insert(r).second || !readPart(d, r, lo, w)) continue;
+                o += (o.empty() ? "" : ",") + ("\"" + std::to_string(ix->second) + "\":[") + std::to_string(lo) + "," +
+                     std::to_string(w) + "," + js(partName(*r, lo, w)) + "]";
+            }
+            return o.empty() ? o : ",\"part\":{" + o + "}";
+        };
         bool first = true;
         for (size_t i = 0; i < db.drivers.size(); i++) {
             const Driver& d = db.drivers[i];
@@ -1430,7 +1546,7 @@ struct Tool {
                << ",\"file\":" << dw[i].file << ",\"line\":" << dw[i].line << ",\"text\":" << js(text(d))
                << ",\"when\":" << js(when(d)) << ",\"seq\":" << (d.seq ? 1 : 0) << ",\"reads\":" << ids(d.reads)
                << ",\"ctl\":" << ids(d.creads) << ",\"blk\":" << d.block << ",\"whole\":" << (d.whole ? 1 : 0) << ",\"lo\":" << d.lo << ",\"w\":" << d.w
-               << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
+               << parts(d) << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
         os << "],\n\"cases\":" << casesJson();

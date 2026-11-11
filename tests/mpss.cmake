@@ -1,0 +1,155 @@
+# mpss self-test: solve scenarios from the models in examples/pss and
+# tests/pss, and run what it generates.
+#   cmake -DMPSS=<mpss> -DSRC=<source dir> -DOUT=<work dir>
+#         [-DCC=<C compiler>] [-DMSIM=<msim> -DUVM_HOME=<uvm-core>] -P mpss.cmake
+# With a C compiler the C tests are built and run against a small platform
+# model. With msim and UVM the sequences run under msim -uvm, and must print
+# what the C tests print.
+file(REMOVE_RECURSE ${OUT})
+file(MAKE_DIRECTORY ${OUT})
+
+function(mpss)
+  execute_process(COMMAND ${MPSS} ${ARGN} WORKING_DIRECTORY ${OUT}
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "mpss ${ARGN} exited ${rc}\n${out}${err}")
+  endif()
+  set(out "${out}" PARENT_SCOPE)
+endfunction()
+function(must_fail want)
+  execute_process(COMMAND ${MPSS} ${ARGN} WORKING_DIRECTORY ${OUT}
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(rc EQUAL 0)
+    message(FATAL_ERROR "mpss ${ARGN} should have failed\n${out}")
+  endif()
+  string(FIND "${err}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "mpss ${ARGN}: expected an error with '${want}', got\n${err}")
+  endif()
+endfunction()
+function(same a b)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files ${OUT}/${a} ${OUT}/${b} RESULT_VARIABLE rc)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "${a} and ${b} differ")
+  endif()
+endfunction()
+# Build a generated C file with its platform model and run it.
+function(run_c name harness)
+  execute_process(COMMAND ${CC} -std=c99 -Wall -Wextra -Werror -DMPSS_MAIN ${name}.c ${SRC}/tests/pss/${harness}
+                          -o ${name}_c
+                  WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "the generated ${name}.c does not compile:\n${out}${err}")
+  endif()
+  execute_process(COMMAND ${OUT}/${name}_c RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0 OR out MATCHES "ERROR")
+    message(FATAL_ERROR "${name}_c failed (${rc}):\n${out}${err}")
+  endif()
+  set(out "${out}" PARENT_SCOPE)
+endfunction()
+# Run a generated package with its testbench under msim -uvm; `keep` picks
+# the lines to compare with the C run.
+function(run_uvm name tb keep)
+  execute_process(COMMAND ${MSIM} -uvmhome ${UVM_HOME} ${name}.sv ${SRC}/tests/pss/${tb} -top top
+                  WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 600)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES "UVM_ERROR :    0" OR NOT out MATCHES "UVM_FATAL :    0")
+    message(FATAL_ERROR "msim -uvm on ${name}.sv failed (${rc}):\n${out}${err}")
+  endif()
+  string(REGEX MATCHALL "(^|\n)(${keep})[^\n]*" lines "${out}")
+  string(REPLACE "\n" "" lines "${lines}")
+  string(REPLACE ";" "\n" lines "${lines}")
+  set(out "${lines}\n" PARENT_SCOPE)
+endfunction()
+
+# --- the DMA example: the same output on one thread and on four ----------
+set(DMA ${SRC}/examples/pss/dma.pss)
+mpss(${DMA} -check)
+if(NOT out MATCHES "2 component instances, 2 pools, root action pss_top::entry")
+  message(FATAL_ERROR "-check: ${out}")
+endif()
+mpss(${DMA} -n 12 -seed 3 -threads 1 -q -print -c dma.c -sv dma.sv -json dma.json)
+set(print1 "${out}")
+mpss(${DMA} -n 12 -seed 3 -threads 4 -q -print -c dma4.c -sv dma4.sv -json dma4.json)
+if(NOT out STREQUAL print1)
+  message(FATAL_ERROR "-print differs between -threads 1 and -threads 4")
+endif()
+same(dma.c dma4.c)
+same(dma.sv dma4.sv)
+same(dma.json dma4.json)
+foreach(want "scenario 11 (seed 3)" "pss_top::init_mem @pss_top (inferred)" "dma_c::mem2mem @pss_top.dma0" "parallel")
+  string(FIND "${print1}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "-print: missing '${want}'\n${print1}")
+  endif()
+endforeach()
+file(READ ${OUT}/dma.json js)
+string(JSON n LENGTH "${js}")
+string(JSON kind GET "${js}" 0 tree 0 kind)
+if(NOT n EQUAL 12 OR NOT kind STREQUAL "sequence")
+  message(FATAL_ERROR "dma.json: ${n} scenarios, first node ${kind}")
+endif()
+# Another seed, other scenarios.
+mpss(${DMA} -n 12 -seed 4 -q -print)
+if(out STREQUAL print1)
+  message(FATAL_ERROR "-seed 4 gave the scenarios of -seed 3")
+endif()
+
+# --- features.pss: everything in the supported subset --------------------
+mpss(${SRC}/tests/pss/features.pss -n 3 -name feat -q -print -c feat.c -sv feat.sv)
+foreach(want "port_c::send @pss_top.ports[" "pss_top::noop" "(inferred)" "prio=" "hdr.mode=")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "features -print: missing '${want}'\n${out}")
+  endif()
+endforeach()
+
+# --- more.pss: a root component that is not pss_top, a root action by -root --
+mpss(${SRC}/tests/pss/more.pss -root soc_c::pick -n 40 -q -print -c more.c -sv more.sv)
+foreach(want "sequence soc_c::pick @soc_c: k=0" "color=RED digits[0]=1 digits[1]=2 digits[2]=3 sq=25 v=5"
+             "color=BLUE digits[0]=1 digits[1]=2 digits[2]=3 sq=9 v=3" "@soc_c.l0" "@soc_c.l1")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "more -print: missing '${want}'\n${out}")
+  endif()
+endforeach()
+if(out MATCHES "color=GREEN" OR out MATCHES " v=0\n")
+  message(FATAL_ERROR "more: the constraints of 'extend action' were not applied\n${out}")
+endif()
+
+# --- errors ---------------------------------------------------------------
+must_fail("no solution" ${SRC}/tests/pss/unsat.pss)
+must_fail("bad.pss:4: expected ';'" ${SRC}/tests/pss/bad.pss)
+must_fail("no action 'nope'" ${DMA} -root nope)
+must_fail("unknown option" ${DMA} -frobnicate)
+
+# --- the generated C, run ---------------------------------------------------
+if(CC)
+  run_c(dma dma_harness.c)
+  set(dma_c "${out}")
+  string(REGEX MATCHALL "check [0-9a-f]+: [0-9]+ words\n" oks "${out}")
+  list(LENGTH oks n)
+  if(n LESS 12)
+    message(FATAL_ERROR "dma_c: expected a check in each of the 12 scenarios:\n${out}")
+  endif()
+  run_c(more more_harness.c)
+  if(NOT out MATCHES "step v=-[1-5] sq=[0-9]+ color=[02] bias=7\n" OR NOT out MATCHES "bias=-3\n")
+    message(FATAL_ERROR "more_c:\n${out}")
+  endif()
+  run_c(feat features_harness.c)
+  set(feat_c "${out}")
+  if(NOT out MATCHES "write [0-9a-f]+ [0-9a-f]+\n" OR NOT out MATCHES "recv.sum=100\n" OR NOT out MATCHES "twice=")
+    message(FATAL_ERROR "feat_c:\n${out}")
+  endif()
+endif()
+
+# --- the generated UVM sequences, run under msim ---------------------------
+if(MSIM AND UVM_HOME)
+  run_uvm(dma dma_tb.sv "check ")
+  if(CC AND NOT out STREQUAL dma_c)
+    message(FATAL_ERROR "dma: the UVM run and the C run differ\n--- UVM ---\n${out}--- C ---\n${dma_c}")
+  endif()
+  run_uvm(feat features_tb.sv "write |[a-z.]+=")
+  if(CC AND NOT out STREQUAL feat_c)
+    message(FATAL_ERROR "features: the UVM run and the C run differ\n--- UVM ---\n${out}--- C ---\n${feat_c}")
+  endif()
+endif()

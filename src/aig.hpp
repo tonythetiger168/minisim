@@ -17,6 +17,7 @@
 #include <functional>
 #include <map>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -79,6 +80,14 @@ struct Graph {
         nodes.push_back(n);
         return mklit((uint32_t)nodes.size() - 1);
     }
+    // The don't-care value ('x in the source): a leaf that mux() resolves to
+    // the other arm, and that cleanup() turns into 0 wherever it is left.
+    Lit xl = NOLIT;
+    Lit dontCare() {
+        if (xl == NOLIT) xl = input("$x");
+        return xl;
+    }
+    bool isX(Lit l) const { return xl != NOLIT && (l | 1u) == (xl | 1u); }
     Lit wire() {
         Node n;
         n.k = NK::Wire;
@@ -147,12 +156,50 @@ struct Graph {
         if (s == L1) return t;
         if (s == L0) return e;
         if (t == e) return t;
+        if (isX(t) || isX(s)) return e;
+        if (isX(e)) return t;
         if (t == L1) return orl(s, e);
         if (t == L0) return andl(lneg(s), e);
         if (e == L1) return orl(lneg(s), t);
         if (e == L0) return andl(s, t);
         if (t == lneg(e)) return xnorl(s, t) == L0 ? L0 : lneg(xorl(s, t));
+        // Nested selects with a shared arm fold into one select with a
+        // combined condition (if (a) if (b) x = d; and priority chains), so
+        // a word costs one mux per bit plus one shared gate.
+        Lit s2, a, b;
+        if (asMux(t, s2, a, b)) {
+            if (b == e) return muxRaw(andl(s, s2), a, e);
+            if (a == e) return muxRaw(andl(s, lneg(s2)), b, e);
+        }
+        if (asMux(e, s2, a, b)) {
+            if (a == t) return muxRaw(orl(s, s2), t, b);
+            if (b == t) return muxRaw(orl(s, lneg(s2)), t, a);
+        }
+        return muxRaw(s, t, e);
+    }
+    Lit muxRaw(Lit s, Lit t, Lit e) {
+        if (s == L1) return t;
+        if (s == L0) return e;
         return orl(andl(s, t), andl(lneg(s), e));
+    }
+    // l == s ? t : e, when l has the shape mux() builds: !(!(s & t) & !(!s & e)).
+    bool asMux(Lit l, Lit& s, Lit& t, Lit& e) const {
+        if (!lisneg(l)) return false;
+        const Node& o = nodes[lnode(l)];
+        if (o.k != NK::And || !lisneg(o.a) || !lisneg(o.b)) return false;
+        const Node& x = nodes[lnode(o.a)];
+        const Node& y = nodes[lnode(o.b)];
+        if (x.k != NK::And || y.k != NK::And) return false;
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++) {
+                Lit xs = i ? x.b : x.a, ys = j ? y.b : y.a;
+                if (xs != lneg(ys)) continue;
+                s = xs;
+                t = i ? x.a : x.b;
+                e = j ? y.a : y.b;
+                return true;
+            }
+        return false;
     }
     Lit maj(Lit a, Lit b, Lit c) { return orl(andl(a, b), andl(c, orl(a, b))); }
 
@@ -351,12 +398,46 @@ struct WordOp {
     bool sgn = false;     // Lt: signed compare; Mul: operands were sign-extended
 };
 
+// A memory as the RTL had it: an unpacked array written through a dynamic
+// index in a clocked block. The graph holds it as flops and multiplexers
+// (Flop::var == name, Flop::bit == word * width + bit); this table lets a
+// tool that has a RAM (a block RAM, a compiled memory) take them out again:
+// it drops the memory's flops, drives every read port's data from the RAM
+// and connects the write ports.
+//
+// addr is the word position counted from the LSB end of the array, already
+// corrected for the declared range (mem[4:19] has positions 0..15), and may
+// be wider than the depth needs: a position outside 0..depth-1 writes
+// nothing and reads zero.
+struct MemPort {
+    Bits addr;
+    // Write: the value stored, into bits [lo, lo + data.size()) of the word
+    // (a whole word, or a byte lane). Read: the word read, combinationally,
+    // from the flops' outputs; a tool finds a registered read by the flops
+    // that data feeds.
+    Bits data;
+    int lo = 0;
+    // Write only: the port writes on its clock edge when en is 1.
+    Lit en = L1;
+    Lit clk = L0;
+    bool negedge = false;
+};
+struct Memory {
+    std::string name;     // as Flop::var
+    int width = 0, depth = 0;
+    // In statement order: when two write ports hit the same bits in the same
+    // cycle, the later one wins.
+    std::vector<MemPort> wr;
+    std::vector<MemPort> rd;
+};
+
 struct Design {
     std::string top;
     Graph g;
     std::vector<Port> ports;
     std::vector<std::string> warnings;
     std::vector<WordOp> ops;
+    std::vector<Memory> mems;   // in declaration order of first write
 };
 
 // d = en ? data : q, for a flop whose next state holds unless `en`. False
@@ -407,7 +488,9 @@ inline bool flopSyncReset(const Graph& g, Lit d, Lit& rst, bool& value, Lit& dat
 // Rebuild into a clean graph: wires resolved, constants propagated, logic
 // that reaches no output or flop dropped, combinational loops reported.
 // Flops come first in the new graph, so feedback through them is fine.
-inline Design cleanup(const Design& in) {
+// With `keep` (per node of the old graph), only the flops marked there are
+// carried over; the caller guarantees that nothing kept reads the others.
+inline Design cleanup(const Design& in, const std::vector<uint8_t>* keep = nullptr) {
     Design out;
     out.top = in.top;
     out.warnings = in.warnings;
@@ -419,9 +502,9 @@ inline Design cleanup(const Design& in) {
     for (size_t i = 0; i < g.inputNames.size(); i++) (void)0;
     // inputs keep their order
     for (uint32_t n = 1; n < g.size(); n++)
-        if (g.nodes[n].k == NK::Input) map[n] = ng.input(g.inputNames[g.nodes[n].aux]);
+        if (g.nodes[n].k == NK::Input) map[n] = g.isX(mklit(n)) ? L0 : ng.input(g.inputNames[g.nodes[n].aux]);
     for (uint32_t n = 1; n < g.size(); n++)
-        if (g.nodes[n].k == NK::Dff) {
+        if (g.nodes[n].k == NK::Dff && (!keep || (*keep)[n])) {
             Flop f = g.flops[g.nodes[n].aux];
             map[n] = ng.dff(f);
         }
@@ -509,6 +592,28 @@ inline Design cleanup(const Design& in) {
             for (Lit l : no.y) anyLogic |= l > 1;
             if (ok && anyLogic) out.ops.push_back(std::move(no));
         }
+        // A memory port survives when all of its bits do; a memory, when it
+        // still has flops and a write port.
+        std::set<std::string> flopVars;
+        for (auto& f : ng.flops) flopVars.insert(f.var);
+        for (const Memory& m : in.mems) {
+            if (!flopVars.count(m.name)) continue;
+            Memory nm;
+            nm.name = m.name;
+            nm.width = m.width;
+            nm.depth = m.depth;
+            for (int rd = 0; rd < 2; rd++)
+                for (const MemPort& mp : rd ? m.rd : m.wr) {
+                    MemPort np = mp;
+                    bool ok = true;
+                    for (Bits* v : {&np.addr, &np.data})
+                        for (Lit& l : *v)
+                            if (ok && !get(l, l)) ok = false;
+                    if (!rd && ok) ok = get(np.en, np.en) && get(np.clk, np.clk);
+                    if (ok && !(!rd && np.en == L0)) (rd ? nm.rd : nm.wr).push_back(std::move(np));
+                }
+            if (!nm.wr.empty()) out.mems.push_back(std::move(nm));
+        }
     }
     return out;
 }
@@ -543,6 +648,53 @@ inline std::vector<uint8_t> liveNodes(const Design& d) {
         break;
     }
     return live;
+}
+
+// Sequential sweep, as a synthesis tool does it: flops whose output reaches
+// no output port are dropped, and a flop that can only ever hold its
+// asynchronous reset value (its next state is that constant, itself, or
+// itself gated) becomes the constant. Repeats until nothing changes. `removed`, when
+// given, gets the number of flops taken out. cleanup() alone keeps every
+// flop, which is what tools that match registers by name want.
+inline Design sweep(Design d, size_t* removed = nullptr) {
+    size_t before = d.g.flops.size();
+    for (;;) {
+        Graph& g = d.g;
+        bool changed = false;
+        for (uint32_t n = 1; n < g.size(); n++) {
+            Node& nd = g.nodes[n];
+            if (nd.k != NK::Dff) continue;
+            const Flop& f = g.flops[nd.aux];
+            Lit c = f.rval ? L1 : L0;
+            if (f.arst == NOLIT) {
+                // No reset: a constant next state is that constant after the
+                // first clock edge, and a register that only keeps its
+                // value never had one; both become constants (0 for the latter).
+                if (f.d == L0 || f.d == L1 || f.d == mklit(n)) {
+                    nd.k = NK::Wire;
+                    nd.a = f.d == L1 ? L1 : L0;
+                    changed = true;
+                }
+                continue;
+            }
+            // stays at c: d is c, q itself, q & x (c = 0) or q | x (c = 1)
+            bool stuck = f.d == c || f.d == mklit(n);
+            const Node& dn = g.nodes[lnode(f.d)];
+            Lit qc = mklit(n, f.rval);   // q, as the AND under d sees it
+            if (!stuck && dn.k == NK::And && lisneg(f.d) == f.rval && (dn.a == qc || dn.b == qc)) stuck = true;
+            if (!stuck) continue;
+            nd.k = NK::Wire;
+            nd.a = c;
+            changed = true;
+        }
+        std::vector<uint8_t> live = liveNodes(d);
+        for (uint32_t n = 1; n < g.size() && !changed; n++)
+            if (g.nodes[n].k == NK::Dff && !live[n]) changed = true;
+        if (!changed) break;
+        d = cleanup(d, &live);
+    }
+    if (removed) *removed = before - d.g.flops.size();
+    return d;
 }
 
 // ---- cone copies (used by the equivalence checker)
