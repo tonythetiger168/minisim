@@ -111,6 +111,24 @@ int main() {
         assert(near(R6.nets[0].cgTotal, cg) && near(coupling(R6, 0, 1), cc));
     }
 
+    // --- ETCH: each edge loses 0.01 um, so the wire is 0.08 um wide and 0.12 um from its neighbour
+    {
+        std::string text = kItf;
+        size_t at = text.find("RPSQ = 0.4");
+        text.insert(at, "ETCH = 0.01 ");
+        Stack etched = Stack::parseItf(text, "etch.itf");
+        Layout L = base();
+        L.nets.push_back(wire("a", 0, 0, 0, 10000, 0));
+        L.nets.push_back(wire("b", 0, 0, 200, 10000, 200));
+        Result R = extract(L, makeStack(L, &etched), opt);
+        assert(near(R.nets[0].res[0].r, 0.4 * 10 / 0.08));
+        const double w = 0.08, t = 0.15, h = 0.4, s = 0.12, len = 10;
+        double moved = kEps0 * 3.9 * 1.40 * std::pow(t / h, 0.222) * len * (0.2 * h / (s + 0.2 * h));
+        double cg = kEps0 * 3.9 * (1.15 * w / h + 2.80 * std::pow(t / h, 0.222)) * len - moved;
+        double cc = kEps0 * 2.9 * (0.03 * w / h + 0.83 * t / h - 0.07 * std::pow(t / h, 0.222)) * std::pow(s / h, -1.34) * len + moved;
+        assert(near(R.nets[0].cgTotal, cg) && near(coupling(R, 0, 1), cc));
+    }
+
     // --- a wire between two others hides them from each other
     {
         Layout L = base();

@@ -396,6 +396,32 @@ if(MINISIM_WITH_SLANG)
                    -DIVERILOG=${IVERILOG} -DVVP=${VVP} -DOUT=${CMAKE_BINARY_DIR}/dft_mbist
                    -P ${CMAKE_SOURCE_DIR}/tests/dft_mbist.cmake)
 
+  # Boundary scan and IJTAG: generated RTL and testbenches run on msim.
+  add_test(NAME mdft_jtag
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_jtag
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_jtag.cmake)
+
+  add_test(NAME mdft_lbist
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist.cmake)
+
+  add_test(NAME mdft_edt
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_edt
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt.cmake)
+  # Logic BIST coverage, checked against the wrapper's signature in simulation.
+  add_test(NAME mdft_lbist_cov
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist_cov
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist_cov.cmake)
+  # Failure diagnosis: injected faults come back as the first suspect.
+  add_test(NAME mdft_diag
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMATPG=$<TARGET_FILE:matpg> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_diag
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_diag.cmake)
+
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec
