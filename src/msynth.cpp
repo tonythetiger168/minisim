@@ -274,6 +274,7 @@ struct Shell {
         tim.reset();
         view.build(*des);
         in.design = &view;
+        in.designChanged();
         digested = (size_t)-1;
         for (auto& w : des->warnings) out("Warning: " + w + "\n");
         size_t ands = 0;
@@ -310,6 +311,7 @@ struct Shell {
             nl = std::move(a);
             tim = std::move(ta);
             view.mapped(*nl);
+            in.designChanged();
         } catch (MapError& e) {
             throw tcl::Error(e.what());
         }
