@@ -164,3 +164,91 @@ expect(fair.sv
   "assert  fair.a_live1 +proven" "assert  fair.a_some +falsified .*liveness" "assert  fair.a_two +falsified .*liveness"
   "assert  fair.a_y +proven" "assert  fair.a_x +falsified .*liveness" "assert  fair.a_z +falsified .*liveness"
   "assert  fair.a_c +proven" "assert  fair.a_cc +falsified .*liveness")
+
+# -app toggle: the bits that are stuck, and nothing else is listed.
+run(toggle.sv 0 "-top;toggle;-app;toggle")
+expect(toggle.sv
+  "toggle  toggle.dead==1 +unreachable"
+  "toggle  toggle.even\\[0\\]==1 +unreachable"
+  "toggle  toggle.tied==0 +unreachable"
+  "toggle: 30 targets on 15 signal bits: 27 reachable, 3 unreachable")
+if(out MATCHES "covered" OR EXISTS ${OUT}/toggle.sv)
+  message(FATAL_ERROR "toggle.sv: reachable targets must not be listed or traced\n${out}")
+endif()
+run(toggle.sv 1 "-top;toggle;-app;toggle;-Werror")
+
+# -connect: connections proven, a wrong one falsified, a condition that never holds flagged.
+run(connect.sv 1 "-top;connect;-connect;${SRC}/tests/formal/connect.csv")
+expect(connect.sv
+  "assert  connect.2.pad +proven"
+  "assert  connect.3.pad +proven"
+  "assert  connect.4.connect.pad +proven"
+  "assert  connect.5.pad +falsified  at cycle 0"
+  "assert  connect.6.pad\\[7:4\\] +proven"
+  "assert  connect.7.dbg +proven"
+  "cover   connect.8.func.enabled +unreachable"
+  "assert  connect.9.g\\[1\\].u.tx +proven"
+  "assert  connect.10.u_q\\[0\\] +proven"
+  "16 properties: 8 proven, 1 falsified, 5 covered, 1 unreachable, 1 assumed")
+if(out MATCHES "enabled +covered" OR NOT EXISTS ${OUT}/connect.sv/connect.5.pad.vcd OR EXISTS ${OUT}/connect.sv/connect.2.pad.enabled.vcd)
+  message(FATAL_ERROR "connect.sv: only the failing connection is listed with a trace\n${out}")
+endif()
+file(WRITE ${OUT}/bad.csv "pad, nosuch\n")
+execute_process(COMMAND ${MFORMAL} ${SRC}/tests/formal/connect.sv -top connect -connect ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 2 OR NOT err MATCHES "bad.csv:1: no signal named 'nosuch'")
+  message(FATAL_ERROR "connect.sv: a bad specification must be an error\n${rc}\n${err}")
+endif()
+file(WRITE ${OUT}/bad.csv "pad, dbg\n")
+execute_process(COMMAND ${MFORMAL} ${SRC}/tests/formal/connect.sv -top connect -connect ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 2 OR NOT err MATCHES "destination is 8 bits, source is 4")
+  message(FATAL_ERROR "connect.sv: a width mismatch must be an error\n${rc}\n${err}")
+endif()
+
+# -blackbox and -cut: the box's outputs and the cut signal are free, properties inside the box are skipped.
+run(box.sv 0 "-top;box")
+expect(box.sv "4 properties: 4 proven")
+run(box.sv 1 "-top;box;-blackbox;mulbox;-v")
+expect(box.sv
+  "assert  box.a_cnt +proven"
+  "assert  box.a_ten +proven"
+  "assert  box.a_zero +falsified  at cycle 1"
+  "assert  box.u_mul.a_in_box +skipped  inside the black box u_mul"
+  "u_mul.p: inside the black box u_mul")
+run(box.sv 1 "-top;box;-blackbox;u_mul;-cut;box.cnt")
+expect(box.sv
+  "assert  box.a_cnt +falsified  at cycle 0"
+  "assert  box.a_ten +falsified  at cycle 0"
+  "2 signals cut")
+foreach(bad "-blackbox;nope" "-cut;nope")
+  execute_process(COMMAND ${MFORMAL} ${SRC}/tests/formal/box.sv -top box ${bad} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 2 OR NOT err MATCHES "named 'nope'")
+    message(FATAL_ERROR "box.sv: ${bad} must be an error\n${rc}\n${err}")
+  endif()
+endforeach()
+
+# SVA local variables: one rigid unknown per variable.
+run(local.sv 1 "-top;local_;-tb")
+expect(local.sv
+  "assert  local_.a_data +falsified  at cycle 2"
+  "assert  local_.a_data_ok +proven"
+  "assert  local_.a_init +proven"
+  "assert  local_.a_init_bad +falsified  at cycle 2"
+  "assert  local_.a_mid +proven"
+  "assert  local_.a_pos +skipped  a local variable assigned outside the antecedent"
+  "assert  local_.a_twice +skipped  a local variable that is assigned more than once"
+  "cover   local_.c_changed +covered  at cycle 2"
+  "cover   local_.c_never +unreachable")
+replay(local.sv local_.a_data 35)
+replay(local.sv local_.a_init_bad 35)
+
+# s.triggered: the end point tracker's match in the current tick.
+run(trig.sv 1 "-top;trig;-tb")
+expect(trig.sv
+  "assert  trig.a_bad +falsified  at cycle 2"
+  "assert  trig.a_idle +proven"
+  "assert  trig.a_seq +proven"
+  "assert  trig.a_seq_bad +falsified  at cycle 3"
+  "cover   trig.c_never +unreachable"
+  "cover   trig.c_two +covered  at cycle 4")
+replay(trig.sv trig.a_bad 35)
+replay(trig.sv trig.a_seq_bad 45)

@@ -54,6 +54,7 @@ struct Obj {
     bool sgn = false, real = false, str = false;
     std::vector<vpiHandle> items;         // Iter
     size_t pos = 0;
+    mutable int8_t prot = -1;             // vpiIsProtected, once worked out (-1: not yet)
     Cb* cb = nullptr;                     // Callback
 };
 struct Cb {
@@ -187,6 +188,62 @@ inline Obj* valueObj(const Symbol* s) {
     st().symObj[s] = o;
     return o;
 }
+// ---- protected objects (37.3.6; IEEE 1735-2023 9.7.1) ----
+// An object is protected when it represents code in a decryption envelope
+// that the IP author's rights and viewports do not make visible, or when it
+// sits below an instance of protected code (a path through protected IP is
+// opaque). For a protected object only vpiType and vpiIsProtected may be
+// read; every other property and relationship is an error, no callback may
+// be placed on it, and vpi_handle_by_name does not find it. Two exceptions
+// keep a user system task working when the IP itself calls it (model
+// fidelity, IEEE 1735 9.2.2): the arguments of a protected call can be
+// iterated and their vpiSize read (38.36, 37.57), and while that call's
+// calltf or compiletf runs its arguments' values can be read and written.
+inline bool protSym(const Symbol* s) {
+    if (!s || !hideMsgIf()) return false;
+    if (s->kind == SymbolKind::Port) {
+        const auto& p = s->as<PortSymbol>();
+        if (p.internalSymbol) s = p.internalSymbol;
+    }
+    if (hideSigIf() && hideSigIf()(*s)) return true;
+    // Declared in clear text, but inside a protected instance.
+    return !hideMsgIf()(s->location) && protectedInstance(instOf(s->getParentScope()));
+}
+inline bool isProt(const Obj* o) {
+    if (!o) return false;
+    if (o->prot >= 0) return o->prot;
+    bool p = false;
+    switch (o->kind) {
+        case Obj::Module: p = protectedInstance(&o->sym->as<InstanceSymbol>()); break;
+        case Obj::Signal:
+        case Obj::Param:
+        case Obj::Port: p = protSym(o->sym); break;
+        case Obj::Word:
+        case Obj::Bit: p = isProt(o->parent); break;
+        case Obj::Call:
+        case Obj::Arg: p = o->site && o->site->prot; break;
+        default: break;
+    }
+    o->prot = p;
+    return p;
+}
+// Is `o` an argument (or the result) of the protected call whose calltf or
+// compiletf is running? Its value may then be read and written.
+inline bool inOwnCall(const Obj* o) {
+    const VpiSite* cur = st().cur;
+    if (!cur || !cur->prot) return false;
+    if (o->kind == Obj::Word || o->kind == Obj::Bit) o = o->parent;
+    if (o->kind == Obj::Call || o->kind == Obj::Arg) return o->site == cur;
+    for (const VpiArg& a : cur->args)
+        if ((a.kind == VpiArg::Signal || a.kind == VpiArg::Scope) && a.sym == o->sym) return true;
+    return false;
+}
+inline bool denied(const Obj* o, const char* fn) {
+    if (!isProt(o)) return false;
+    error(vpiError, std::string(fn) + ": the object is protected");
+    return true;
+}
+
 // The full name of a design object (38.1.2 vpiFullName).
 inline std::string fullName(const Symbol& s) {
     return s.getHierarchicalPath();
@@ -830,6 +887,13 @@ vpiHandle vpi_register_cb(p_cb_data d) {
     switch (d->reason) {
         case cbValueChange: {
             Obj* o = c->obj;
+            // No callback on a protected object (38.36.1, IEEE 1735 9.7.1).
+            if (vpi::isProt(o)) {
+                vpi_printf((PLI_BYTE8*)"VPI error: vpi_register_cb: a callback cannot be placed on a protected object\n");
+                vpi::error(vpiError, "vpi_register_cb: the object is protected");
+                s.cbs.pop_back();
+                return nullptr;
+            }
             if (!o || (o->kind != Obj::Signal && o->kind != Obj::Word && o->kind != Obj::Bit) || o->type == vpiMemory || o->sig < 0) {
                 vpi::error(vpiError, "vpi_register_cb: cbValueChange needs a net, variable, memory word or bit");
                 return nullptr;
@@ -907,6 +971,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
         return H(vpi::callObj(s.cur));
     }
     if (!o) { vpi::error(vpiError, "vpi_handle: null reference handle"); return nullptr; }
+    if (vpi::denied(o, "vpi_handle")) return nullptr;
     switch (type) {
         case vpiScope:
         case vpiModule:
@@ -954,6 +1019,9 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
         return vpi::iter(std::move(items));
     }
     if (!o) { vpi::error(vpiError, "vpi_iterate: null reference handle"); return nullptr; }
+    // A protected call still gives its arguments (38.36); nothing else of a
+    // protected object can be iterated.
+    if (!(type == vpiArgument && o->kind == Obj::Call) && vpi::denied(o, "vpi_iterate")) return nullptr;
     if (type == vpiArgument) {
         if (o->kind != Obj::Call) return nullptr;
         for (size_t k = 0; k < o->site->args.size(); k++)
@@ -1072,6 +1140,19 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* name, vpiHandle scope) {
     const slang::ast::Symbol* sym = nullptr;
     const slang::ast::Scope* sc = nullptr;
     Obj* so = O(scope);
+    if (vpi::denied(so, "vpi_handle_by_name")) return nullptr;   // a protected scope (38.20)
+    // The name may not find a protected object or instance, even by its
+    // disclosed name (38.20; IEEE 1735 9.7.1). What the IP author made
+    // visible with a viewport or a right is found by its full name.
+    auto shut = [&](const slang::ast::Symbol* y) {
+        bool p = false;
+        if (y->kind == slang::ast::SymbolKind::Instance) p = protectedInstance(&y->as<slang::ast::InstanceSymbol>());
+        else if (y->kind == slang::ast::SymbolKind::GenerateBlock || y->kind == slang::ast::SymbolKind::GenerateBlockArray)
+            p = protectedInstance(vpi::instOf(y->getParentScope())) || (hideMsgIf() && hideMsgIf()(y->location));
+        else p = vpi::protSym(y);
+        if (p) vpi::error(vpiError, "vpi_handle_by_name: the name is in protected code");
+        return p;
+    };
     if (so && so->kind == Obj::Module) sc = &so->sym->as<slang::ast::InstanceSymbol>().body;
     // A name with an index: the base, then [i] steps.
     auto step = [&](const slang::ast::Scope* in, const std::string& part) -> const slang::ast::Symbol* {
@@ -1113,6 +1194,7 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* name, vpiHandle scope) {
         else sc = nullptr;
     }
     if (!sym) return nullptr;
+    if (shut(sym)) return nullptr;
     if (sym->kind == slang::ast::SymbolKind::Instance) return H(vpi::moduleObj(&sym->as<slang::ast::InstanceSymbol>()));
     if (sym->kind == slang::ast::SymbolKind::Parameter) {
         auto& po = s.symObj[sym];
@@ -1147,6 +1229,7 @@ vpiHandle vpi_handle_by_index(vpiHandle h, PLI_INT32 i) {
     vpi::clearErr();
     Obj* o = O(h);
     if (!o || o->kind != Obj::Signal) return nullptr;
+    if (vpi::denied(o, "vpi_handle_by_index")) return nullptr;
     if (o->type == vpiMemory) return H(vpi::wordObj(o, i));
     if (o->real) return nullptr;
     return H(vpi::bitObj(o, i));
@@ -1167,6 +1250,13 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
         if (prop == vpiTimeUnit) return s.lr->precExp;
         return vpiUndefined;
     }
+    // 37.3.6: of a protected object only vpiType and vpiIsProtected can be
+    // read, and vpiSize of an expression (37.57).
+    if (prop == vpiIsProtected) return vpi::isProt(o) ? 1 : 0;
+    bool expr = o->kind == Obj::Arg || o->kind == Obj::Call || o->kind == Obj::Word || o->kind == Obj::Bit ||
+                (o->kind == Obj::Signal && o->type != vpiMemory);
+    if (prop != vpiType && !(prop == vpiSize && expr) && vpi::denied(o, "vpi_get"))
+        return vpiUndefined;
     switch (prop) {
         case vpiType: return o->type;
         case vpiSize:
@@ -1227,6 +1317,7 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
     auto& s = vpi::st();
     Obj* o = O(h);
     if (!o) return nullptr;
+    if (prop != vpiType && vpi::denied(o, "vpi_get_str")) return nullptr;
     auto nameOf = [&](bool full) -> std::string {
         switch (o->kind) {
             case Obj::Call: return s.systfs[(size_t)o->site->systf].name;
@@ -1294,6 +1385,11 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
     vpi::clearErr();
     Obj* o = O(h);
     if (!o || !v) { vpi::error(vpiError, "vpi_get_value: null handle"); return; }
+    if (vpi::isProt(o) && !vpi::inOwnCall(o)) {
+        vpi::error(vpiError, "vpi_get_value: the object is protected");
+        v->format = vpiSuppressVal;
+        return;
+    }
     if (o->kind == Obj::Param) {
         const slang::ConstantValue& cv = o->sym->as<slang::ast::ParameterSymbol>().getValue();
         Val val;
@@ -1333,6 +1429,8 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
     vpi::clearErr();
     Obj* o = O(h);
     if (!o || !v) { vpi::error(vpiError, "vpi_put_value: null handle"); return nullptr; }
+    // Protected IP cannot be written from outside it (IEEE 1735 9.7.1).
+    if (vpi::isProt(o) && !vpi::inOwnCall(o)) { vpi::error(vpiError, "vpi_put_value: the object is protected"); return nullptr; }
     bool target = (o->kind == Obj::Signal && o->type != vpiMemory) || o->kind == Obj::Word || o->kind == Obj::Bit ||
                   (o->kind == Obj::Call && o->site->func);
     if (!target || o->sig < 0) { vpi::error(vpiError, "vpi_put_value: the object cannot be written"); return nullptr; }

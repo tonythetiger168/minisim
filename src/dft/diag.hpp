@@ -58,6 +58,7 @@ namespace dft {
 
 struct DiagOpts {
     std::string failLog, patterns, top, se, json, writeLog;
+    std::string edtPatterns;       // compressed patterns (mdft -edt_patterns with responses) instead of `patterns`
     std::vector<std::string> files, libs, inject;
     std::string fault = "stuck";   // stuck or transition
     int threads = 0, maxDefects = 4, maxSuspects = 10;
@@ -85,6 +86,64 @@ struct Diagnoser {
     std::vector<int> obsOf;                          // node -> index in obsNodes, or -1
     std::vector<std::vector<int>> chainObs;          // chain, cell -> obs index
     std::map<std::string, int> poObs;
+    int nObs = 0;                                    // observations per pattern
+
+    // Compressed patterns: the tester sees output channels, not cells. An
+    // observation is then (channel, unload cycle), the XOR of the cells its
+    // chains show in that cycle, as far as the pattern's mask lets them
+    // through and no unknown spoils the bit.
+    bool edt = false;
+    int edtC = 0, edtM = -1, edtLen = 0;
+    std::vector<long> edtIds;                        // the file's number of each pattern
+    std::map<long, int> edtIdx;
+    std::vector<std::vector<int>> capCells;          // obsOf[node] -> the scan cells that capture the node
+    std::vector<int> cellObs, cellChain;             // scan cell -> its (channel, cycle) and its chain in the file
+    std::vector<int> cellNode;                       // scan cell -> capture node
+    std::vector<std::string> edtMask;                // per pattern
+    std::vector<std::vector<uint64_t>> seen;         // [block][scan cell]: patterns in which the cell reaches the tester
+    std::vector<std::vector<std::vector<int>>> obsCells;  // obs -> scan cells, for the cones
+    bool cellSeen(size_t p, int cell) const { return seen[p / 64][(size_t)cell] >> (p % 64) & 1; }
+
+    // A fault's failing capture nodes as failing observations.
+    struct Proj {
+        std::vector<uint64_t> acc;
+        std::vector<int> touched;
+        std::vector<std::pair<int, uint64_t>> out;
+    };
+    const std::vector<std::pair<int, uint64_t>>& project(Proj& pj, const std::vector<std::pair<int, uint64_t>>& at, size_t b0) const {
+        pj.out.clear();
+        if (!edt) {
+            for (auto& [node, mask] : at) pj.out.push_back({obsOf[node], mask});
+            return pj.out;
+        }
+        if (pj.acc.empty()) pj.acc.assign((size_t)nObs, 0);
+        pj.touched.clear();
+        const std::vector<uint64_t>& sw = seen[b0 / 64];
+        for (auto& [node, mask] : at) {
+            if (obsOf[node] < 0) continue;
+            for (int cell : capCells[obsOf[node]]) {
+                uint64_t w = mask & sw[(size_t)cell];
+                if (!w) continue;
+                int ob = cellObs[cell];
+                if (!pj.acc[ob]) pj.touched.push_back(ob);
+                pj.acc[ob] ^= w;
+            }
+        }
+        std::sort(pj.touched.begin(), pj.touched.end());
+        pj.touched.erase(std::unique(pj.touched.begin(), pj.touched.end()), pj.touched.end());
+        for (int ob : pj.touched) {
+            if (pj.acc[ob]) pj.out.push_back({ob, pj.acc[ob]});
+            pj.acc[ob] = 0;
+        }
+        return pj.out;
+    }
+    // The nodes whose fan-in can make observation ob fail in pattern p.
+    template <class F>
+    void roots(size_t p, int ob, F&& f) const {
+        if (!edt) return f(obsNodes[ob]);
+        for (int cell : obsCells[0][(size_t)ob])
+            if (cellSeen(p, cell)) f(cellNode[cell]);
+    }
 
     struct Suspect {
         int fault;
@@ -116,6 +175,11 @@ struct Diagnoser {
         faults = atpg::makeFaults(m, tr);
         atpg::collapse(m.c, faults, tr);
         obsOf.assign(m.c.size(), -1);
+        if (!o.edtPatterns.empty()) {
+            if (tr) throw DiagError("compressed patterns are stuck-at patterns: no -diag_fault transition with -edt_patterns");
+            readEdt();
+            return;
+        }
         auto obs = [&](int node, const std::string& name) {
             if (node < 0 || !m.c.obs[node]) return -1;
             if (obsOf[node] < 0) {
@@ -134,7 +198,151 @@ struct Diagnoser {
         }
         auto outName = atpg::portNames(ds, false);
         for (size_t i = 0; i < m.poNets.size(); i++) poObs[outName[m.poNets[i]]] = obs(m.poNodes[i], "po " + outName[m.poNets[i]]);
+        nObs = (int)obsNodes.size();
         readPatterns(tr);
+    }
+
+    // The compressed pattern file of mdft -edt_encode / -edt with a netlist.
+    void readEdt() {
+        edt = true;
+        std::ifstream f(o.edtPatterns);
+        if (!f) throw DiagError("cannot open " + o.edtPatterns);
+        size_t nPI = m.piNets.size();
+        struct FChain {
+            std::string name;
+            int traced = -1, length = 0;
+            size_t base = 0;   // first scan cell
+        };
+        std::vector<FChain> ch;
+        std::map<std::string, int> byName;
+        std::vector<size_t> tracedBase;
+        {
+            size_t at = 0;
+            for (auto& c : scan.chains) tracedBase.push_back(at), at += c.cells.size();
+        }
+        std::vector<std::vector<std::string>> outs;   // per pattern, per channel
+        std::string line;
+        int ln = 0;
+        bool sawOut = false;
+        while (std::getline(f, line)) {
+            ln++;
+            size_t h = line.find('#');
+            if (h != std::string::npos) line.erase(h);
+            std::istringstream is(line);
+            std::string a, b, c2, d;
+            if (!(is >> a)) continue;
+            auto bad = [&](const std::string& why) { throw DiagError(o.edtPatterns + ":" + std::to_string(ln) + ": " + why); };
+            if (a == "edt") {
+                std::string k1, k2;
+                if (!(is >> k1 >> edtC >> k2 >> edtM) || edtC < 1) bad("expected 'edt channels C mask_index_bits M'");
+                continue;
+            }
+            if (a == "chain") {
+                FChain fc;
+                int idx;
+                std::string si;
+                if (!(is >> idx >> fc.name >> si >> fc.length) || idx != (int)ch.size()) bad("expected 'chain <index> <name> <scan-in> <length>'");
+                for (size_t i = 0; i < scan.chains.size(); i++)
+                    if (scan.chains[i].siName == si) fc.traced = (int)i;
+                if (fc.traced < 0) bad("the netlist has no scan chain from '" + si + "'");
+                if ((int)scan.chains[fc.traced].cells.size() != fc.length)
+                    bad("chain " + fc.name + " has " + std::to_string(scan.chains[fc.traced].cells.size()) + " cells in the netlist");
+                fc.base = tracedBase[fc.traced];
+                byName[fc.name] = (int)ch.size();
+                edtLen = std::max(edtLen, fc.length);
+                ch.push_back(fc);
+                continue;
+            }
+            long id = 0;
+            try {
+                size_t used = 0;
+                id = std::stol(a, &used);
+                if (used != a.size()) throw 0;
+            } catch (...) {
+                bad("expected a pattern number");
+            }
+            is >> b;
+            if (b == "unencodable") continue;
+            if (!edtC || ch.empty()) bad("the file has no 'edt' and 'chain' lines: write it with this version of mdft");
+            auto [it, fresh] = edtIdx.emplace(id, (int)pats.size());
+            if (fresh) {
+                edtIds.push_back(id);
+                pats.emplace_back(nPI + m.scanCells.size(), 0);
+                edtMask.emplace_back();
+                outs.emplace_back((size_t)edtC);
+            }
+            size_t pi = (size_t)it->second;
+            is >> c2;
+            if (b == "pi") {
+                for (size_t k = 0; k < nPI && k < c2.size(); k++) pats[pi][k] = (uint8_t)(c2[k] == '1');
+            } else if (b == "mask") {
+                edtMask[pi] = c2;
+            } else if (b == "load") {
+                is >> d;
+                auto ci = byName.find(c2);
+                if (ci == byName.end()) bad("no chain '" + c2 + "'");
+                const FChain& fc = ch[ci->second];
+                if ((int)d.size() != fc.length) bad("chain " + c2 + " has " + std::to_string(fc.length) + " cells");
+                for (int j = 0; j < fc.length; j++) pats[pi][nPI + fc.base + (size_t)j] = (uint8_t)(d[(size_t)j] == '1');
+            } else if (b == "out") {
+                is >> d;
+                int k = -1;
+                try { k = std::stoi(c2); } catch (...) {}
+                if (k < 0 || k >= edtC) bad("no channel " + c2);
+                outs[pi][(size_t)k] = d;
+                sawOut = true;
+            }
+        }
+        if (pats.empty()) throw DiagError(o.edtPatterns + ": no patterns");
+        if (!sawOut) throw DiagError(o.edtPatterns + ": no expected outputs: encode with the netlist on the line (mdft -edt_encode ... netlist.v)");
+        if (edtM >= 0)
+            for (auto& mk : edtMask)
+                if ((int)mk.size() != edtC * (1 + edtM)) throw DiagError(o.edtPatterns + ": a pattern has no mask line of " + std::to_string(edtC * (1 + edtM)) + " bits");
+        // Cells and observations.
+        size_t nCells = m.scanCells.size();
+        nObs = edtC * edtLen;
+        cellObs.assign(nCells, -1), cellChain.assign(nCells, -1), cellNode.assign(nCells, -1);
+        obsCells.assign(1, std::vector<std::vector<int>>((size_t)nObs));
+        obsNames.assign((size_t)nObs, {});
+        for (int k = 0; k < edtC; k++)
+            for (int t = 0; t < edtLen; t++) obsNames[(size_t)(k * edtLen + t)].push_back("ch " + std::to_string(k) + " " + std::to_string(t));
+        for (size_t i = 0; i < ch.size(); i++)
+            for (int j = 0; j < ch[i].length; j++) {
+                size_t cell = ch[i].base + (size_t)j;
+                int node = m.capNodes[cell];
+                cellChain[cell] = (int)i;
+                if (node < 0 || !m.c.obs[node]) continue;
+                cellNode[cell] = node;
+                cellObs[cell] = (int)(i % (size_t)edtC) * edtLen + (ch[i].length - 1 - j);
+                if (obsOf[node] < 0) {
+                    obsOf[node] = (int)capCells.size();
+                    capCells.emplace_back();
+                }
+                capCells[obsOf[node]].push_back((int)cell);
+                obsCells[0][(size_t)cellObs[cell]].push_back((int)cell);
+            }
+        // Only what reaches the tester counts as observed: clear the rest
+        // (port outputs are not compared in compressed patterns).
+        for (int nd : m.poNodes)
+            if (nd >= 0 && obsOf[nd] < 0) m.c.obs[nd] = 0;
+        m.c.finish();
+        auto observed = [&](const std::string& mk, int chain) {
+            if (edtM < 0 || mk.empty()) return true;
+            int at = (chain % edtC) * (1 + edtM), idx = 0;
+            if (mk[(size_t)at] != '1') return true;
+            for (int b2 = 0; b2 < edtM; b2++)
+                if (mk[(size_t)(at + 1 + b2)] == '1') idx |= 1 << b2;
+            return idx == chain / edtC;
+        };
+        seen.assign((pats.size() + 63) / 64, std::vector<uint64_t>(nCells, 0));
+        for (size_t p = 0; p < pats.size(); p++)
+            for (size_t cell = 0; cell < nCells; cell++) {
+                if (cellObs[cell] < 0 || !observed(edtMask[p], cellChain[cell])) continue;
+                int k = cellObs[cell] / edtLen, t = cellObs[cell] % edtLen;
+                const std::string& ob = outs[p][(size_t)k];
+                if ((int)ob.size() <= t || ob[(size_t)t] == 'x') continue;
+                seen[p / 64][cell] |= 1ull << (p % 64);
+            }
     }
 
     // matpg's pattern file; the file numbers the stuck-at set first.
@@ -186,7 +394,11 @@ struct Diagnoser {
             } catch (...) {
                 bad("expected a pattern number");
             }
-            p -= firstId;
+            if (edt) {
+                auto it = edtIdx.find(p);
+                if (it == edtIdx.end()) bad("pattern " + (a == "last" ? b : a) + " is not in " + o.edtPatterns);
+                p = it->second;
+            } else p -= firstId;
             if (a == "last") {
                 if (p + 1 < applied) applied = (int)std::max<long>(0, p + 1);
                 continue;
@@ -196,7 +408,27 @@ struct Diagnoser {
                 bad("pattern " + a + " is not in " + o.patterns);
             }
             int ob = -1;
-            if (b == "po") {
+            if (edt) {
+                long k = -1, t = -1;
+                try {
+                    is >> c;
+                    k = std::stol(c);
+                    is >> c;
+                    t = std::stol(c);
+                } catch (...) {
+                    k = -1;
+                }
+                if (b != "ch" || k < 0) bad("expected '<pattern> ch <channel> <cycle>' for compressed patterns");
+                if (k >= edtC) bad("there is no channel " + std::to_string(k));
+                // Past the longest chain the channel shows the next load, and
+                // a bit no cell reaches cannot be explained by a capture.
+                ob = t >= 0 && t < edtLen ? (int)(k * edtLen + t) : -1;
+                if (ob >= 0) {
+                    bool any = false;
+                    for (int cell : obsCells[0][(size_t)ob]) any |= cellSeen((size_t)p, cell);
+                    if (!any) ob = -1;
+                }
+            } else if (b == "po") {
                 is >> c;
                 auto it = poObs.find(c);
                 if (it == poObs.end()) bad("'" + c + "' is not an output port bit");
@@ -267,14 +499,15 @@ struct Diagnoser {
         atpg::Sim::Work w;
         w.init(m.c.size());
         std::vector<std::pair<int, uint64_t>> at;
+        Proj pj;
         pack();
         for (size_t b0 = 0; b0 < pats.size(); b0 += 64) {
             uint64_t valid;
             sim.good(words(b0, valid));
             for (int fi : fl) {
                 sim.detect(w, faults[fi], &at);
-                for (auto& [node, mask] : at)
-                    for (uint64_t x = mask & valid; x; x &= x - 1) fails[b0 + (size_t)__builtin_ctzll(x)].push_back(obsOf[node]);
+                for (auto& [ob, mask] : project(pj, at, b0))
+                    for (uint64_t x = mask & valid; x; x &= x - 1) fails[b0 + (size_t)__builtin_ctzll(x)].push_back(ob);
             }
         }
         for (auto& v : fails) {
@@ -286,10 +519,11 @@ struct Diagnoser {
     void writeFailLog(const std::string& path) const {
         std::ofstream f(path);
         if (!f) throw DiagError("cannot write " + path);
-        f << "# fail log: <pattern> <chain> <cell> | <pattern> po <port>\ntop " << ds.top << "\npatterns " << o.patterns << "\n";
+        f << (edt ? "# fail log: <pattern> ch <channel> <unload cycle>\ntop " : "# fail log: <pattern> <chain> <cell> | <pattern> po <port>\ntop ")
+          << ds.top << "\npatterns " << (edt ? o.edtPatterns : o.patterns) << "\n";
         for (size_t p = 0; p < fails.size(); p++)
             for (int ob : fails[p])
-                for (auto& n : obsNames[ob]) f << p + (size_t)firstId << " " << n << "\n";
+                for (auto& n : obsNames[ob]) f << (edt ? edtIds[p] : (long)(p + (size_t)firstId)) << " " << n << "\n";
     }
 
     std::string faultName(int i) const {
@@ -308,6 +542,7 @@ struct Diagnoser {
             atpg::Sim sim;
             atpg::Sim::Work work;
             std::vector<std::pair<int, uint64_t>> at;
+            Proj pj;
             std::vector<uint64_t> failMask, origMask;
             std::vector<long> tfsf, tpsf;
             long removed = 0;
@@ -316,8 +551,8 @@ struct Diagnoser {
         std::vector<Ctx> ctx;
         for (int t = 0; t < threads; t++) {
             ctx.emplace_back(m.c);
-            ctx.back().failMask.assign(obsNodes.size(), 0);
-            ctx.back().origMask.assign(obsNodes.size(), 0);
+            ctx.back().failMask.assign((size_t)nObs, 0);
+            ctx.back().origMask.assign((size_t)nObs, 0);
         }
         if (packed.empty()) pack();
         std::vector<std::vector<int>> left;   // not yet explained
@@ -360,8 +595,10 @@ struct Diagnoser {
                     if (left[p].empty()) continue;
                     touched.clear();
                     for (int ob : left[p]) {
-                        stack.assign(1, obsNodes[ob]);
-                        seen[obsNodes[ob]] = tag;
+                        stack.clear();
+                        roots(p, ob, [&](int nd) {
+                            if (seen[nd] != tag) { seen[nd] = tag; stack.push_back(nd); }
+                        });
                         while (!stack.empty()) {
                             int n = stack.back();
                             stack.pop_back();
@@ -395,10 +632,10 @@ struct Diagnoser {
                         pool.each((int)cand.size(), 64, [&](int t, int i) {
                             Suspect& s = cand[i];
                             if (!ctx[0].sim.detect(ctx[t].work, faults[s.fault], &ctx[t].at)) return;
-                            for (auto& [node, mask] : ctx[t].at) {
+                            for (auto& [ob, mask] : project(ctx[t].pj, ctx[t].at, b0)) {
                                 uint64_t d = mask & valid;
-                                s.tfsf += __builtin_popcountll(d & ctx[0].failMask[obsOf[node]]);
-                                s.tpsf += __builtin_popcountll(d & ~ctx[0].origMask[obsOf[node]]);
+                                s.tfsf += __builtin_popcountll(d & ctx[0].failMask[ob]);
+                                s.tpsf += __builtin_popcountll(d & ~ctx[0].origMask[ob]);
                             }
                         });
                     }
@@ -414,10 +651,10 @@ struct Diagnoser {
                     load(t, blocks[bi], valid);
                     for (size_t i = 0; i < cand.size(); i++) {
                         if (!c.sim.detect(c.work, faults[cand[i].fault], &c.at)) continue;
-                        for (auto& [node, mask] : c.at) {
+                        for (auto& [ob, mask] : project(c.pj, c.at, blocks[bi])) {
                             uint64_t d = mask & valid;
-                            c.tfsf[i] += __builtin_popcountll(d & c.failMask[obsOf[node]]);
-                            c.tpsf[i] += __builtin_popcountll(d & ~c.origMask[obsOf[node]]);
+                            c.tfsf[i] += __builtin_popcountll(d & c.failMask[ob]);
+                            c.tpsf[i] += __builtin_popcountll(d & ~c.origMask[ob]);
                         }
                     }
                 });
@@ -464,11 +701,11 @@ struct Diagnoser {
                 uint64_t valid;
                 c.sim.good(words(b0, valid));
                 c.sim.detect(c.work, faults[best], &c.at);
-                for (auto& [node, mask] : c.at)
+                for (auto& [ob, mask] : project(c.pj, c.at, b0))
                     for (uint64_t x = mask & valid; x; x &= x - 1) {
                         auto& v = left[b0 + (size_t)__builtin_ctzll(x)];
-                        auto it = std::lower_bound(v.begin(), v.end(), obsOf[node]);
-                        if (it != v.end() && *it == obsOf[node]) { v.erase(it); c.removed++; }
+                        auto it = std::lower_bound(v.begin(), v.end(), ob);
+                        if (it != v.end() && *it == ob) { v.erase(it); c.removed++; }
                     }
             });
             long removed = 0;
@@ -559,7 +796,9 @@ struct Diagnoser {
 // Exit code: 0 diagnosed (or nothing failed), 1 failures left unexplained.
 inline int runDiagnose(const DiagOpts& o) {
     if (o.files.empty()) throw DiagError("-diagnose needs the gate netlist the patterns were made for");
-    if (o.patterns.empty()) throw DiagError("-diagnose needs -patterns FILE (from matpg -patterns)");
+    if (o.patterns.empty() && o.edtPatterns.empty())
+        throw DiagError("-diagnose needs -patterns FILE (from matpg -patterns) or -edt_patterns FILE (compressed)");
+    if (!o.patterns.empty() && !o.edtPatterns.empty()) throw DiagError("-diagnose takes -patterns or -edt_patterns, not both");
     if (o.failLog.empty() && o.inject.empty()) throw DiagError("-diagnose needs a fail log");
     Diagnoser d(o);
     if (!o.inject.empty()) {

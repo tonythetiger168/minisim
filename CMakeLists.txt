@@ -115,7 +115,7 @@ if(MINISIM_WITH_SLANG)
     FetchContent_Populate(libfst)
     set(FST_SRC ${libfst_SOURCE_DIR}/src)
     add_library(fst STATIC ${FST_SRC}/fstapi.c ${FST_SRC}/fastlz.c ${FST_SRC}/lz4.c)
-    target_include_directories(fst PUBLIC ${FST_SRC})
+    target_include_directories(fst PUBLIC $<BUILD_INTERFACE:${FST_SRC}>)
     # FST_WRITER_PARALLEL: libfst compresses and writes each finished block on
     # a background thread while the simulation goes on (msim turns it on).
     find_package(Threads REQUIRED)
@@ -267,6 +267,10 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fsm
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fsm.cmake)
+    add_test(NAME mcov_excl
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_excl
+                     -P ${CMAKE_SOURCE_DIR}/tests/mcov_excl.cmake)
   endif()
   if(MINISIM_WITH_FST)
     add_executable(test_fst tests/test_fst.cpp)
@@ -297,6 +301,12 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_dpi
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_dpi.cmake)
+  # VPI and DPI cannot look into protected IP (37.3.6; IEEE 1735 9.7).
+  if(OPENSSL_FOUND AND OPENSSL_CLI AND UNIX)
+    add_test(NAME pli_protect
+             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pli_protect.sh $<TARGET_FILE:msim> $<TARGET_FILE:msimprotect>
+                     ${OPENSSL_CLI} ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/pli_protect)
+  endif()
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
@@ -458,6 +468,27 @@ if(MINISIM_WITH_SLANG)
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+# minisim::core: the kernel headers, exported so a tool kept in another
+# repository builds against them instead of copying them (docs/LICENSING.md).
+if(MINISIM_WITH_SLANG)
+  include(cmake/core.cmake)
+
+  # A tool outside this repository, built against the installed package: the
+  # test installs minisim into a scratch prefix and builds tests/core_consumer
+  # there, so a header the package forgets to install fails here.
+  add_test(NAME core_lib
+           COMMAND ${CMAKE_COMMAND} -DBUILD=${CMAKE_BINARY_DIR} -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/core_lib
+                   -DSLANG_LIBRARY=$<TARGET_FILE:slang::slang>
+                   # A list would be split into separate arguments on its
+                   # semicolons, so it is joined and split again in the script.
+                   # slang's own link interface is left out: it names targets
+                   # (Boost, fmt, tomlplusplus) that are header-only and exist
+                   # only in this build.
+                   "-DSLANG_INCLUDE_DIRS=$<JOIN:$<TARGET_PROPERTY:slang::slang,INTERFACE_INCLUDE_DIRECTORIES>,|>"
+                   -P ${CMAKE_SOURCE_DIR}/tests/core_lib.cmake)
+  set_tests_properties(core_lib PROPERTIES TIMEOUT 900)
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
