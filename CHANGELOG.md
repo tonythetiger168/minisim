@@ -286,6 +286,9 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: the clean copy uses the standard `case`, and clocked blocks skip
+  the ambiguous-edge test when nothing went from or to x. Ibex with
+  `-xprop` now costs about 12% more than without (was 30%).
 - `-xprop`: a block of plain assignments and branches gets a clean copy
   that runs while every condition is known and hands over to the merging
   copy at the first unknown one. Ibex with `-xprop`: 36 s to 28 s in the

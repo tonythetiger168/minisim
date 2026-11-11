@@ -2154,6 +2154,7 @@ private:
         auto L = [](size_t pc) { return "s_" + std::to_string(pc); };
         o << "// process " << n << " (" << kind << ", clocked)\n";
         o << "static void seq" << n << "(const void*, std::vector<Sim::NbaItem>& nb) {" << CH(&p, 0) << "\n";
+        if (p.xpFast) o << " if (S.xAt != S.now) goto " << L(p.xpFast) << ";\n";   // msim -xprop: no edge can be ambiguous
         for (size_t pc = 1; pc < end; pc++) {
             const Instr& i = p.code[pc];
             o << L(pc) << ":" << CH(&p, pc);
