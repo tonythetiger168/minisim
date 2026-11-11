@@ -585,6 +585,7 @@ struct Isolation {
     std::vector<int> senseLow;
     std::string supply, source, sink;
     bool diffSupplyOnly = true, noIso = false;
+    int boundary = 0;    // -applies_to_boundary: 0 both, 1 lower, 2 upper
 };
 struct LevelShifter {
     std::string name, domain, where;
@@ -592,7 +593,19 @@ struct LevelShifter {
     int appliesTo = 2;
     std::string inSupply, outSupply, rule = "both";
     bool noShift = false;
+    int boundary = 0;
+    std::string source, sink;
 };
+// A repeater (buffer) strategy (6.52).
+struct Repeater {
+    std::string name, domain, scope, where;
+    std::vector<std::string> elements, exclude;
+    int appliesTo = 2;   // 0 inputs, 1 outputs, 2 both
+    int boundary = 0;    // 0 both, 1 lower, 2 upper
+    std::string supply, source, sink;
+};
+// connect_logic_net (6.13): one port of the net.
+struct LogicConn { std::string net, port, scope, where; bool reconnect = false; };
 struct Retention {
     std::string name, domain, where;
     std::vector<std::string> elements, exclude;
@@ -601,6 +614,34 @@ struct Retention {
     ExP saveCond, restoreCond, restorePeriodCond, powerdownCond;
     bool noRet = false, useAsPrimary = false, retSupCor = true, savResCor = true;
     std::string appliesTo = "any";
+};
+// add_state_transition (6.7): named transitions between power states of an object.
+struct Transition {
+    std::string name, where;
+    std::vector<std::string> from, to;                          // -from / -to (empty: every legal state)
+    bool fromTo = false;
+    std::vector<std::pair<std::string, std::string>> paired;    // -paired
+    bool illegal = false;
+    bool matches(const std::string& a, const std::string& b) const {
+        for (auto& [x, y] : paired) if (x == a && y == b) return true;
+        if (!fromTo) return false;
+        auto in = [](const std::vector<std::string>& l, const std::string& v) {
+            return l.empty() || std::find(l.begin(), l.end(), v) != l.end();
+        };
+        return in(from, a) && in(to, b);
+    }
+};
+struct TransSet {
+    std::vector<Transition> tr;
+    bool complete = false;
+    std::string where;
+    char kind = 0;   // 's' supply set, 'd' domain, 'g' group, 0 any
+};
+// create_power_state_group (6.22).
+struct StateGroup {
+    std::string name, scope, where;
+    std::vector<PowerState> states;
+    bool complete = false;
 };
 struct PortStateDef { std::string name; bool off = false; double vmin = 0, vmax = 0; };
 struct Pst {
@@ -625,6 +666,13 @@ struct Model {
     std::vector<Isolation> isos;
     std::vector<LevelShifter> lss;
     std::vector<Retention> rets;
+    std::vector<Repeater> reps;
+    std::map<std::string, TransSet> transitions;     // object (rooted name) -> its named transitions
+    std::map<std::string, StateGroup> groups;
+    std::vector<std::string> groupOrder;
+    std::map<std::string, std::string> logicPorts;   // create_logic_port: rooted name -> in / out / inout
+    std::set<std::string> logicNets;                 // create_logic_net: rooted names
+    std::vector<LogicConn> logicConns;
     std::map<std::string, std::vector<PortStateDef>> portStates;
     std::vector<Pst> psts;
     std::string version;
@@ -744,6 +792,12 @@ struct Model {
             o.pos.push_back(a);
         }
         return o;
+    }
+    static int boundaryOf(const std::string& v, const Cmd& c) {
+        if (v == "both") return 0;
+        if (v == "lower") return 1;
+        if (v == "upper") return 2;
+        throw Error(c.where() + ": -applies_to_boundary " + v + " (lower, upper or both)");
     }
     static ExP expr(const std::string& t, const Cmd& c) {
         return t.empty() ? nullptr : parseExpr(t, c.where());
@@ -1001,6 +1055,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (o.has("-sink")) is->sink = join(scope, o.get("-sink"));
             if (o.has("-diff_supply_only")) is->diffSupplyOnly = o.get("-diff_supply_only") == "TRUE";
             if (o.has("-no_isolation")) is->noIso = true;
+            if (o.has("-applies_to_boundary")) is->boundary = boundaryOf(o.get("-applies_to_boundary"), c);
             if (is->clamp != "0" && is->clamp != "1" && is->clamp != "Z" && is->clamp != "z" && is->clamp != "latch")
                 throw Error(c.where() + ": -clamp_value " + is->clamp + " is not supported (0, 1, Z, latch)");
             continue;
@@ -1033,6 +1088,9 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (o.has("-output_supply")) l.outSupply = join(scope, o.get("-output_supply"));
             l.rule = o.get("-rule", "both");
             l.noShift = o.has("-no_shift");
+            if (o.has("-applies_to_boundary")) l.boundary = boundaryOf(o.get("-applies_to_boundary"), c);
+            if (o.has("-source")) l.source = join(scope, o.get("-source"));
+            if (o.has("-sink")) l.sink = join(scope, o.get("-sink"));
             lss.push_back(l);
             continue;
         }
@@ -1081,6 +1139,152 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 throw Error(c.where() + ": -restore_event_condition and -restore_period_condition together (6.53)");
             continue;
         }
+        if (n == "create_power_state_group") {   // 6.22
+            Opts o = opts(c, {});
+            need(o, 1, "a group name");
+            std::string name = join(scope, o.pos[0]);
+            if (groups.count(name)) throw Error(c.where() + ": power state group " + o.pos[0] + " is already defined");
+            StateGroup& g = groups[name];
+            g.name = name;
+            g.scope = scope;
+            g.where = c.where();
+            groupOrder.push_back(name);
+            continue;
+        }
+        if (n == "add_state_transition" || n == "describe_state_transition") {   // 6.7 (and its UPF 2.x name)
+            Opts o = opts(c, {"-supply", "-domain", "-group", "-model", "-instance", "-update", "-complete", "-legal", "-illegal"});
+            need(o, 1, "an object");
+            bool legacy = n == "describe_state_transition";   // name -object obj -from .. -to .. [-paired ..] [-illegal]
+            if (legacy && !o.has("-object")) throw Error(c.where() + ": describe_state_transition needs -object");
+            std::string objArg = legacy ? o.get("-object") : o.pos[0];
+            std::string obj = join(scope, objArg);
+            char kind = o.has("-supply") ? 's' : o.has("-domain") ? 'd' : o.has("-group") ? 'g' : 0;
+            if (o.has("-model") || o.has("-instance")) {
+                warnings.push_back(c.where() + ": " + n + " -model / -instance: power states of models are not simulated");
+                continue;
+            }
+            if (kind == 's' || (!kind && !domains.count(obj) && !groups.count(obj))) obj = setRef(obj, c.where()).name;
+            else if (kind == 'd' && !domains.count(obj)) throw Error(c.where() + ": no domain " + objArg);
+            else if (kind == 'g' && !groups.count(obj)) throw Error(c.where() + ": no power state group " + objArg);
+            if (!kind) kind = groups.count(obj) ? 'g' : domains.count(obj) ? 'd' : 's';
+            bool fresh = !transitions.count(obj);
+            if (fresh && o.has("-update")) throw Error(c.where() + ": " + n + " -update: no transitions of " + objArg + " to update");
+            TransSet& ts = transitions[obj];
+            if (fresh) { ts.where = c.where(); ts.kind = kind; }
+            if (o.has("-complete")) ts.complete = true;
+            auto parse = [&](const std::vector<std::string>& l) {
+                if (l.empty()) throw Error(c.where() + ": -transition needs a name");
+                Transition t;
+                t.name = l[0];
+                t.where = c.where();
+                bool from = false, to = false;
+                for (size_t k = 1; k < l.size(); k++) {
+                    auto val = [&]() -> std::string {
+                        if (k + 1 >= l.size()) throw Error(c.where() + ": " + l[k] + " needs a value");
+                        return l[++k];
+                    };
+                    if (l[k] == "-from") { t.from = splitList(val()); from = true; }
+                    else if (l[k] == "-to") { t.to = splitList(val()); to = true; }
+                    else if (l[k] == "-paired") {
+                        for (auto& pr : splitList(val())) {
+                            auto two = splitList(pr);
+                            if (two.size() != 2) throw Error(c.where() + ": -paired needs {{from to} ...}");
+                            t.paired.push_back({two[0], two[1]});
+                        }
+                    } else if (l[k] == "-illegal") t.illegal = true;
+                    else if (l[k] == "-legal") t.illegal = false;
+                    else throw Error(c.where() + ": unknown transition option " + l[k]);
+                }
+                if (from != to) throw Error(c.where() + ": transition " + t.name + " needs both -from and -to (6.7)");
+                t.fromTo = from;
+                if (!t.fromTo && t.paired.empty())
+                    throw Error(c.where() + ": transition " + t.name + " needs -from and -to, or -paired (6.7)");
+                for (auto& a : t.from)
+                    for (auto& b : t.to)
+                        if (a == b) throw Error(c.where() + ": transition " + t.name + ": " + a + " is both the -from and the -to state (6.7)");
+                for (auto& [a, b] : t.paired)
+                    if (a == b) throw Error(c.where() + ": transition " + t.name + ": " + a + " is both the from and the to state (6.7)");
+                bool merged = false;
+                for (auto& old : ts.tr)
+                    if (old.name == t.name) {
+                        if (!o.has("-update") && !legacy) throw Error(c.where() + ": transition " + t.name + " is already defined");
+                        if (t.fromTo) { old.from = t.from; old.to = t.to; old.fromTo = true; }
+                        for (auto& pr : t.paired) old.paired.push_back(pr);
+                        old.illegal = t.illegal;
+                        merged = true;
+                    }
+                if (!merged) ts.tr.push_back(t);
+            };
+            for (auto& tv : o.all("-transition")) parse(splitList(tv));
+            if (legacy) {
+                std::vector<std::string> l{o.pos[0]};
+                if (o.has("-from")) { l.push_back("-from"); l.push_back(o.get("-from")); }
+                if (o.has("-to")) { l.push_back("-to"); l.push_back(o.get("-to")); }
+                if (o.has("-paired")) { l.push_back("-paired"); l.push_back(o.get("-paired")); }
+                if (o.has("-illegal")) l.push_back("-illegal");
+                parse(l);
+            }
+            continue;
+        }
+        if (n == "set_repeater") {   // 6.52
+            Opts o = opts(c, {"-update"}, {"-use_functional_equivalence"});
+            need(o, 1, "a strategy name");
+            if (!o.has("-domain")) throw Error(c.where() + ": set_repeater needs -domain");
+            std::string dn = join(scope, o.get("-domain"));
+            if (!domains.count(dn)) throw Error(c.where() + ": no domain " + o.get("-domain"));
+            Repeater* rp = nullptr;
+            for (auto& x : reps) if (x.name == o.pos[0] && x.domain == dn && x.scope == scope) rp = &x;
+            if (o.has("-update") && !rp) throw Error(c.where() + ": set_repeater -update of unknown strategy " + o.pos[0]);
+            if (!o.has("-update") && rp) throw Error(c.where() + ": repeater strategy " + o.pos[0] + " is already defined");
+            if (!rp) { reps.push_back({}); rp = &reps.back(); rp->name = o.pos[0]; rp->domain = dn; rp->scope = scope; rp->where = c.where(); }
+            for (auto& e : rooted(o.list("-elements"))) rp->elements.push_back(e);
+            for (auto& e : rooted(o.list("-exclude_elements"))) rp->exclude.push_back(e);
+            if (o.has("-repeater_supply")) rp->supply = join(scope, o.get("-repeater_supply"));
+            if (o.has("-source")) rp->source = join(scope, o.get("-source"));
+            if (o.has("-sink")) rp->sink = join(scope, o.get("-sink"));
+            if (o.has("-applies_to")) {
+                std::string a = o.get("-applies_to");
+                if (a != "inputs" && a != "outputs" && a != "both") throw Error(c.where() + ": -applies_to " + a);
+                rp->appliesTo = a == "inputs" ? 0 : a == "outputs" ? 1 : 2;
+            }
+            if (o.has("-applies_to_boundary")) rp->boundary = boundaryOf(o.get("-applies_to_boundary"), c);
+            if (rp->supply.empty()) throw Error(c.where() + ": set_repeater needs -repeater_supply (6.52)");
+            continue;
+        }
+        if (n == "create_logic_port") {   // 6.20
+            Opts o = opts(c, {});
+            need(o, 1, "a port name");
+            auto l = splitList(o.pos[0]);
+            if (l.empty()) throw Error(c.where() + ": create_logic_port: the port list is empty (6.20)");
+            std::string dir = o.get("-direction", "in");
+            if (dir != "in" && dir != "out" && dir != "inout") throw Error(c.where() + ": -direction " + dir);
+            for (auto& p : l) logicPorts[join(scope, p)] = dir;
+            continue;
+        }
+        if (n == "create_logic_net") {   // 6.19
+            Opts o = opts(c, {});
+            need(o, 1, "a net name");
+            auto l = splitList(o.pos[0]);
+            if (l.empty()) throw Error(c.where() + ": create_logic_net: the net list is empty (6.19)");
+            for (auto& p : l) logicNets.insert(join(scope, p));
+            continue;
+        }
+        if (n == "connect_logic_net") {   // 6.13
+            Opts o = opts(c, {"-reconnect"});
+            need(o, 1, "a net name");
+            if (!o.has("-ports")) throw Error(c.where() + ": connect_logic_net needs -ports");
+            if (o.pos[0].find('/') != std::string::npos)
+                throw Error(c.where() + ": connect_logic_net: " + o.pos[0] + " is not a simple name (6.13)");
+            std::string net = join(scope, o.pos[0]);
+            for (auto& p : o.list("-ports")) {
+                std::string port = join(scope, p);
+                for (auto& x : logicConns)
+                    if (x.port == port && x.net != net)
+                        throw Error(c.where() + ": port " + p + " is already connected to logic net " + x.net + " (6.13 e)");
+                logicConns.push_back({net, port, scope, c.where(), o.has("-reconnect")});
+            }
+            continue;
+        }
         if (n == "add_power_state") {
             Opts o = opts(c, {"-supply", "-domain", "-group", "-model", "-instance", "-update", "-complete"});
             need(o, 1, "an object");
@@ -1088,7 +1292,12 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             std::vector<PowerState>* states = nullptr;
             bool* complete = nullptr;
             bool isSet = false;
-            if (domains.count(obj) && !o.has("-supply")) {
+            if (groups.count(obj) && !o.has("-supply") && !o.has("-domain")) {
+                states = &groups[obj].states;
+                complete = &groups[obj].complete;
+            } else if (o.has("-group")) {
+                throw Error(c.where() + ": no power state group " + o.pos[0]);
+            } else if (domains.count(obj) && !o.has("-supply")) {
                 states = &domains[obj].states;
                 complete = &domains[obj].complete;
             } else {
@@ -1185,9 +1394,9 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
         static const std::set<std::string> ignored = {
             "set_port_attributes", "set_design_attributes", "map_isolation_cell", "map_level_shifter_cell",
             "map_retention_cell", "map_power_switch", "use_interface_cell", "name_format", "set_simstate_behavior",
-            "set_partial_on_translation", "set_variation", "set_correlated", "bind_checker", "describe_state_transition",
-            "add_state_transition", "create_power_state_group", "set_equivalent", "create_logic_net", "create_logic_port",
-            "connect_logic_net", "set_repeater", "save_upf", "sim_assertion_control", "sim_corruption_control",
+            "set_partial_on_translation", "set_variation", "set_correlated", "bind_checker", 
+            "set_equivalent", 
+            "save_upf", "sim_assertion_control", "sim_corruption_control",
             "sim_replay_control", "load_simstate_behavior", "create_composite_domain", "set_retention_elements",
             "set_retention_control", "define_power_model", "end_power_model", "apply_power_model", "create_hdl2upf_vct",
             "create_upf2hdl_vct", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
@@ -1279,32 +1488,44 @@ inline std::vector<Crossing> crossings(const DomainMap& dm, const std::vector<Po
     return r;
 }
 
-// Does an isolation strategy of domain `d` apply to crossing c?
-inline bool isoApplies(const Model& m, const Isolation& is, const Crossing& c) {
-    bool out = c.from == is.domain, in = c.to == is.domain;
+// The filters every interface-cell strategy shares (6.48, 6.49, 6.52):
+// -applies_to, -applies_to_boundary, -elements, -exclude_elements, -source
+// and -sink, for a strategy of `domain` at crossing c.
+inline std::string supplyOfDomain(const Model& m, const std::string& dom) {
+    return dom.empty() ? std::string("<always-on>") : m.primaryOf(dom);
+}
+inline bool strategyApplies(const Model& m, const std::string& domain, int appliesTo, int boundary,
+                            const std::vector<std::string>& elements, const std::vector<std::string>& exclude,
+                            const std::string& source, const std::string& sink, const Crossing& c) {
+    bool out = c.from == domain, in = c.to == domain;
     if (!out && !in) return false;
-    if (is.appliesTo == 0 && !in) return false;
-    if (is.appliesTo == 1 && !out) return false;
-    if (!is.elements.empty() && !namesPort(m, is.elements, *c.p)) return false;
-    if (!is.exclude.empty() && namesPort(m, is.exclude, *c.p)) return false;
-    auto supplyOf = [&](const std::string& dom) { return dom.empty() ? std::string("<always-on>") : m.primaryOf(dom); };
+    if (appliesTo == 0 && !in) return false;
+    if (appliesTo == 1 && !out) return false;
+    // upper boundary: a port of the domain's own instance; lower: the
+    // HighConn of a port of a child instance that is in another domain
+    bool upper = (c.p->dir == 1) == out;
+    if (boundary == 1 && upper) return false;
+    if (boundary == 2 && !upper) return false;
+    if (!elements.empty() && !namesPort(m, elements, *c.p)) return false;
+    if (!exclude.empty() && namesPort(m, exclude, *c.p)) return false;
     auto matches = [&](const std::string& filter, const std::string& dom) {
         if (filter.empty()) return true;
-        if (m.domains.count(filter)) return filter == dom || m.primaryOf(filter) == supplyOf(dom);
-        return m.setOf(filter) == supplyOf(dom);
+        if (m.domains.count(filter)) return filter == dom || m.primaryOf(filter) == supplyOfDomain(m, dom);
+        return m.setOf(filter) == supplyOfDomain(m, dom);
     };
-    if (!matches(is.source, c.from) || !matches(is.sink, c.to)) return false;
-    if (is.diffSupplyOnly && supplyOf(c.from) == supplyOf(c.to)) return false;
+    return matches(source, c.from) && matches(sink, c.to);
+}
+// Does an isolation strategy apply to crossing c?
+inline bool isoApplies(const Model& m, const Isolation& is, const Crossing& c) {
+    if (!strategyApplies(m, is.domain, is.appliesTo, is.boundary, is.elements, is.exclude, is.source, is.sink, c)) return false;
+    if (is.diffSupplyOnly && supplyOfDomain(m, c.from) == supplyOfDomain(m, c.to)) return false;
     return true;
 }
 inline bool lsApplies(const Model& m, const LevelShifter& l, const Crossing& c) {
-    bool out = c.from == l.domain, in = c.to == l.domain;
-    if (!out && !in) return false;
-    if (l.appliesTo == 0 && !in) return false;
-    if (l.appliesTo == 1 && !out) return false;
-    if (!l.elements.empty() && !namesPort(m, l.elements, *c.p)) return false;
-    if (!l.exclude.empty() && namesPort(m, l.exclude, *c.p)) return false;
-    return true;
+    return strategyApplies(m, l.domain, l.appliesTo, l.boundary, l.elements, l.exclude, l.source, l.sink, c);
+}
+inline bool repApplies(const Model& m, const Repeater& r, const Crossing& c) {
+    return strategyApplies(m, r.domain, r.appliesTo, r.boundary, r.elements, r.exclude, r.source, r.sink, c);
 }
 
 // ------------------------------------------------------------ static checks
@@ -1410,7 +1631,18 @@ inline std::vector<Finding> check(const Model& m, const DesignView& dv) {
                 add("UPF001", d.where, "power domain " + dn + ": no instance '" + p + "' in the design");
         }
     }
-    auto sigExists = [&](const std::string& upfName) { return dv.signals.count(m.design(upfName)) != 0; };
+    auto sigExists = [&](const std::string& upfName) {
+        return dv.signals.count(m.design(upfName)) != 0 || m.logicNets.count(upfName) || m.logicPorts.count(upfName);
+    };
+    for (auto& lc : m.logicConns) {
+        if (!sigExists(lc.net))
+            add("UPF001", lc.where, "connect_logic_net: no logic net '" + m.design(lc.net) + "' in the design or made by create_logic_net");
+        if (!sigExists(lc.port))
+            add("UPF001", lc.where, "connect_logic_net: no port '" + m.design(lc.port) + "' in the design or made by create_logic_port");
+    }
+    for (auto& rp : m.reps)
+        if (!m.domains.count(rp.supply) && !m.sets.count(m.setOf(rp.supply)))
+            add("UPF001", rp.where, "repeater " + rp.name + ": no supply set '" + rp.supply + "'");
     for (auto& is : m.isos) {
         if (is.noIso) continue;
         for (auto& s : is.signals)

@@ -15,6 +15,11 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- UPF (IEEE 1801-2024): `set_repeater` and the simulation of repeaters
+  (6.52, 9.10); `create_logic_net`, `create_logic_port` and
+  `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with
+  transition detection (6.7, 9.4); `create_power_state_group` (6.22);
+  `-applies_to_boundary` on isolation and level-shifter strategies.
 - `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
   built from the spare cells of the old netlist and the cells the change
   frees, by function (the same cell, or one with inputs tied or shared, or
