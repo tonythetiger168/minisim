@@ -21,6 +21,12 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mplan rank`: per-test coverage and test ranking from the per-run
+  coverage databases of `mregress -cov`. A greedy order by new coverage
+  points (`-by rate`: per second of run time), each test's unique points,
+  the redundant tests, `-keep FILE` for the short list with the same
+  coverage, and with a plan the tests behind each feature's coverage.
+  `mplan report -rank` adds it to `plan.html` and `plan.json`.
 - `mplan`: requirement traceability. `req ID ...` in a feature and a
   requirement list (`reqs FILE` in the plan or `-reqs FILE`), read from CSV
   or ReqIF (`.reqif` / `.reqifz`, with the hierarchy). Every requirement is

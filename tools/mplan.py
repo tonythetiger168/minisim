@@ -7,6 +7,7 @@
     mplan trend  plan.d/history.jsonl
     mplan init   -results regress.d [-cov cov.json] -o draft.vplan
     mplan init   -reqs reqs.csv -o draft.vplan
+    mplan rank   -results regress.d [uart.vplan] [-by rate] [-keep keep.list]
 
 A verification plan (vPlan) lists the features of a design and, per feature,
 what proves it: tests (mregress results), code coverage, covergroups and
@@ -79,6 +80,20 @@ that names an id the list does not hold gets a warning. ``-trace FILE``
 writes the traceability matrix as CSV, ``-fail-on-uncovered`` exits 1 on an
 uncovered requirement or an unknown id, and ``init -reqs`` drafts a plan
 with one feature per requirement.
+
+Ranking. ``mplan rank`` reads the coverage database of every run (mregress
+-cov keeps one per run) and says what each test adds. A coverage point is a
+line, a branch outcome, a toggle direction of a bit, a condition vector, an
+FSM state or transition, a covergroup bin, or an assertion that passed (a
+cover that was hit). The tests are ordered greedily: first the one with the
+most points, then the one that adds the most new points, and so on (``-by
+rate``: the most new points per second of run time). The table gives each
+test's new points, the coverage so far, its run time, and its unique points
+(covered by no other test). Tests that add nothing are listed as redundant;
+``-keep FILE`` writes the others, one name a line, in rank order. Failing
+tests are left out (``-all`` ranks them too). With a plan, each feature
+lists the tests that contribute to its coverage metrics. ``report -rank``
+puts the same table in ``plan.html`` and ``plan.json``.
 
 History. ``report`` appends one snapshot per run to ``<o>/history.jsonl``
 (``-history FILE``; ``-no-history`` to leave it alone): the time, a label
@@ -872,6 +887,233 @@ def write_trace(order, path):
                         " ".join(owners), " ".join(tests)])
 
 
+# ---------------------------------------------------------------- per-test coverage and ranking
+
+def _cov_points(path):
+    """The coverage points of one run's database, per owner (a file, a signal, an FSM, a
+    covergroup item, an assertion): {(kind, owner): (covered, all)}. For lines and toggles
+    the two are bit masks (bit = line number; bit = rise of bit i, then fall); for the
+    other kinds they are lists of point keys."""
+    try:
+        db = tool("mcov").load(path)
+    except (OSError, ValueError, KeyError, SystemExit):
+        return None
+    out = {}
+    for (f, ln), h in db["lines"].items():
+        c, a = out.get(("line", f), (0, 0))
+        out[("line", f)] = (c | (1 << ln) if h else c, a | (1 << ln))
+    for (f, ln, n), (t, fl) in db["branches"].items():
+        c, a = out.setdefault(("branch", f), ([], []))
+        a += [(ln, n, 1), (ln, n, 0)]
+        if t:
+            c.append((ln, n, 1))
+        if fl:
+            c.append((ln, n, 0))
+    for name, (w, r, fall) in db["toggles"].items():
+        out[("toggle", name)] = (r | (fall << w), (1 << (2 * w)) - 1)
+    for (f, ln, col, text), (_op, _terms, hits) in db["conds"].items():
+        c, a = out.setdefault(("cond", f), ([], []))
+        for i, h in enumerate(hits):
+            a.append((ln, col, text, i))
+            if h:
+                c.append((ln, col, text, i))
+    for (_mod, inst, name), m in db["fsms"].items():
+        c, a = out.setdefault(("fsm", f"{inst}.{name}"), ([], []))
+        for v, (_n, h) in m["states"].items():
+            a.append(("s", v))
+            if h:
+                c.append(("s", v))
+        for (x, y), (h, _r) in m["trans"].items():
+            a.append(("t", x, y))
+            if h:
+                c.append(("t", x, y))
+    for tname, (_w, _g, items) in db["cgs"].items():
+        for iname, it in items.items():
+            # A cross lists only the bins that were hit: the item's bin total rides along.
+            out[("cover", f"{tname}.{iname}")] = ([b for b, h in it[5].items() if h], [("#total", it[4])] + list(it[5]))
+    for name, (kind, _evals, passes, fails) in db["asserts"].items():
+        out[("assert", name)] = ([0] if passes and (kind == "cover" or not fails) else [], [0])
+    return out
+
+
+class Points:
+    """Every test's coverage as one bit mask over a common layout of points."""
+
+    def __init__(self, runs, jobs, include_failing=False):
+        tests = test_table(runs)
+        self.skipped = sorted(n for n, t in tests.items() if t["status"] != "pass") if not include_failing else []
+        want = [r for r in runs if (include_failing or tests[r["test"]]["status"] == "pass") and r.get("log")]
+        paths = [os.path.join(r["_dir"], os.path.dirname(r["log"]), "cov.json") for r in want]
+        have = [os.path.exists(p) for p in paths]
+        todo = [p for p, ok in zip(paths, have) if ok]
+        if jobs > 1 and len(todo) > 1:
+            try:
+                with cf.ProcessPoolExecutor(max_workers=min(jobs, len(todo))) as pool:
+                    got = list(pool.map(_cov_points, todo, chunksize=max(1, len(todo) // (4 * jobs))))
+            except Exception:           # no fork / not picklable here: read them one by one
+                got = [_cov_points(p) for p in todo]
+        else:
+            got = [_cov_points(p) for p in todo]
+        per_run = dict(zip(todo, got))
+        # The layout: owners in (kind, name) order, each on a byte boundary, so a scope is one range.
+        width, index, cover_total, every = {}, {}, {}, {}
+        for p in todo:
+            for key, (c, a) in (per_run[p] or {}).items():
+                if type(a) is int:
+                    if every.get(key) != a:
+                        every[key] = every.get(key, 0) | a
+                else:
+                    idx = index.setdefault(key, {})
+                    for k in a:
+                        if type(k) is tuple and k[0] == "#total":
+                            cover_total[key] = max(cover_total.get(key, 0), k[1])
+                        elif k not in idx:
+                            idx[k] = len(idx)
+        for key, a in every.items():
+            width[key] = a.bit_length()
+        for key, idx in index.items():
+            width[key] = max(len(idx), cover_total.get(key, 0))
+            every[key] = (1 << width[key]) - 1 if key[0] == "cover" else 0
+        self.offset, self.nbytes = {}, {}
+        place = {}
+        at = 0
+        for key in sorted(width):
+            n = (width[key] + 7) // 8
+            self.offset[key], self.nbytes[key] = at, n
+            place[key] = (at, at + n, n)
+            at += n
+        self.size = at
+        universe = bytearray(at)
+        self.mask, self.seconds, self.no_data = {}, {}, []
+        for r, p, ok in zip(want, paths, have):
+            name = r["test"]
+            self.seconds[name] = self.seconds.get(name, 0.0) + r.get("seconds", 0.0)
+            pts = per_run.get(p) if ok else None
+            if pts is None:
+                self.mask.setdefault(name, 0)
+                continue
+            buf = bytearray(at)
+            for key, (c, a) in pts.items():
+                lo, hi, n = place[key]
+                if type(a) is not int:
+                    idx = index[key]
+                    c = sum(1 << idx[k] for k in c)
+                    if key[0] != "cover":
+                        for k in a:
+                            every[key] |= 1 << idx[k]
+                if c:
+                    buf[lo:hi] = c.to_bytes(n, "little")
+            self.mask[name] = self.mask.get(name, 0) | int.from_bytes(buf, "little")
+        self.no_data = sorted(n for n, m in self.mask.items() if not m and not any(
+            ok and per_run.get(p) is not None for r, p, ok in zip(want, paths, have) if r["test"] == n))
+        for key, a in every.items():
+            lo, hi, n = place[key]
+            universe[lo:hi] = a.to_bytes(n, "little")
+        self.universe = int.from_bytes(universe, "little")
+        self.total = bin(self.universe).count("1")
+
+    def ranges(self, keys):
+        """Byte ranges of the owners, adjacent ones joined."""
+        out = []
+        for o, n in sorted((self.offset[k], self.nbytes[k]) for k in keys if k in self.offset):
+            if out and out[-1][1] == o:
+                out[-1][1] = o + n
+            elif n:
+                out.append([o, o + n])
+        return out
+
+
+def rank_tests(pts, by="points"):
+    """Greedy order of the tests by what each adds. Returns the ranking as a dict."""
+    pop = tool("mcov").popcount
+    names = sorted(n for n in pts.mask if n not in pts.no_data)
+    once = multi = 0
+    for n in names:
+        multi |= once & pts.mask[n]
+        once |= pts.mask[n]
+    only = once & ~multi
+    covered, order, left = 0, [], set(names)
+
+    def worth(n, gain):
+        return gain / max(pts.seconds.get(n, 0.0), 1e-3) if by == "rate" else gain
+    # Lazy greedy: a test's gain only shrinks as others are picked, so a stale best that is still best is the best.
+    cand = sorted(((worth(n, pop(pts.mask[n])), n) for n in names), key=lambda x: (-x[0], x[1]))
+    while cand:
+        best = None
+        for i, (w, n) in enumerate(cand):
+            if best is not None and w <= best[0]:
+                break
+            gain = pop(pts.mask[n] & ~covered)
+            w = worth(n, gain)
+            cand[i] = (w, n)
+            if gain and (best is None or w > best[0] or (w == best[0] and n < best[1])):
+                best = (w, n, gain)
+        if best is None:
+            break
+        _, n, gain = best
+        covered |= pts.mask[n]
+        left.discard(n)
+        order.append({"test": n, "new": gain, "points": pop(pts.mask[n]), "unique": pop(pts.mask[n] & only),
+                      "seconds": round(pts.seconds.get(n, 0.0), 3), "covered": pop(covered),
+                      "cumulative": round(100.0 * pop(covered) / pts.total, 2) if pts.total else 0.0})
+        cand = sorted(((w, m) for w, m in cand if m != n), key=lambda x: (-x[0], x[1]))
+    return {"by": by, "points": pts.total, "covered": pop(covered),
+            "coverage": round(100.0 * pop(covered) / pts.total, 2) if pts.total else 0.0,
+            "seconds": round(sum(pts.seconds.get(n, 0.0) for n in names), 3),
+            "seconds_ranked": round(sum(o["seconds"] for o in order), 3),
+            "order": order, "redundant": sorted(left), "no_data": pts.no_data, "not_ranked": pts.skipped}
+
+
+METRIC_OWNER = {"line": ("file", ("line",)), "branch": ("file", ("branch",)), "cond": ("cond", ("cond",)),
+                "toggle": ("toggle", ("toggle",)), "fsm": ("fsm", ("fsm",)), "cover": ("cover", ("cover",)),
+                "assert": ("assert", ("assert",))}
+
+
+def attribute(plan, data, pts, top=10):
+    """Per feature, the tests that cover points of its own coverage metrics: {path: [[test, points], ...]}."""
+    pop = tool("mcov").popcount
+    raw = {n: m.to_bytes(pts.size, "little") for n, m in pts.mask.items() if m}
+    out = {}
+    for f, depth in plan.walk():
+        keys = set()
+        for m in f.metrics:
+            if m.kind in METRIC_OWNER:
+                matcher, kinds = METRIC_OWNER[m.kind]
+                keys.update((k, n) for n in data.m[matcher].match(m.pattern) for k in kinds)
+        spans = pts.ranges(keys)
+        if not spans:
+            continue
+        rows = []
+        for n, b in raw.items():
+            c = sum(pop(int.from_bytes(b[lo:hi], "little")) for lo, hi in spans)
+            if c:
+                rows.append([n, c])
+        rows.sort(key=lambda r: (-r[1], r[0]))
+        out[f.path] = {"tests": len(rows), "top": rows[:top]}
+    return out
+
+
+def print_rank(rk, attr=None, limit=0, out=None):
+    out = out or sys.stdout
+    rows = [("Rank", "Test", "New", "Coverage", "Seconds", "Unique")]
+    for i, o in enumerate(rk["order"][: limit or None], 1):
+        rows.append((str(i), o["test"], str(o["new"]), f"{o['cumulative']:.1f}%", f"{o['seconds']:.1f}", str(o["unique"])))
+    ws = [max(len(r[i]) for r in rows) for i in range(6)]
+    for r in rows:
+        print(f"{r[0]:>{ws[0]}}  {r[1]:<{ws[1]}}  {r[2]:>{ws[2]}}  {r[3]:>{ws[3]}}  {r[4]:>{ws[4]}}  {r[5]:>{ws[5]}}".rstrip(), file=out)
+    if limit and len(rk["order"]) > limit:
+        print(f"  ... {len(rk['order']) - limit} more", file=out)
+    print(f"\nmplan: {len(rk['order'])} of {len(rk['order']) + len(rk['redundant'])} tests reach {rk['coverage']:.1f}% "
+          f"({rk['covered']}/{rk['points']} points) in {rk['seconds_ranked']:.1f}s of {rk['seconds']:.1f}s", file=out)
+    for label, key in (("redundant (add nothing)", "redundant"), ("no coverage data", "no_data"), ("not ranked (not passing)", "not_ranked")):
+        if rk[key]:
+            print(f"{label}: {', '.join(rk[key][:20])}{' ...' if len(rk[key]) > 20 else ''}", file=out)
+    if attr:
+        print("\ntests behind each feature's coverage:", file=out)
+        for path, a in attr.items():
+            print(f"  {path}: " + ", ".join(f"{n} ({c})" for n, c in a["top"][:5]) + (f" and {a['tests'] - 5} more" if a["tests"] > 5 else ""), file=out)
+
+
 # ---------------------------------------------------------------- triage
 
 GENERIC = re.compile(r"^(timeout$|exit status )")
@@ -1097,7 +1339,7 @@ def make_snapshot(plan, data, tri, when, label, trace=None):
 
 # ---------------------------------------------------------------- reports
 
-def plan_json(plan, data, tri, snap, history, trace=None):
+def plan_json(plan, data, tri, snap, history, trace=None, rank=None):
     def feat(f):
         return {"id": f.id, "path": f.path, "title": f.title, "owner": f.owner_of(), "doc": f.doc, "weight": f.weight,
                 "reqs": f.reqs,
@@ -1108,6 +1350,7 @@ def plan_json(plan, data, tri, snap, history, trace=None):
                 "features": [feat(c) for c in f.children]}
     return {"format": "mplan", "version": 1, "tool": f"mplan {VERSION}", "snapshot": snap, "plan": feat(plan),
             "requirements": reqs_json(*trace) if trace and trace[0] else None,
+            "ranking": {**rank[0], "features": rank[1]} if rank else None,
             "triage": tri, "unmapped": unmapped(data), "history": [
                 {"time": s.get("time"), "label": s.get("label"), "score": s.get("score"), "tests": s.get("tests"),
                  "coverage": s.get("coverage")} for s in history]}
@@ -1287,7 +1530,7 @@ def trend_svg(history):
     return "".join(out)
 
 
-def write_html(plan, data, tri, snap, history, path, trace=None):
+def write_html(plan, data, tri, snap, history, path, trace=None, rank=None):
     esc = html.escape
     feats = [f for f, d in plan.walk() if d > 0]
     met = sum(f.status == "met" for f in feats)
@@ -1378,6 +1621,25 @@ def write_html(plan, data, tri, snap, history, path, trace=None):
         if items:
             doc.append(f"<details open><summary>{title} ({len(items)})</summary><p>" + "<br>".join(f"<code>{esc(i)}</code>" for i in items[:200]) + "</p></details>")
 
+    if rank:
+        rk, attr = rank
+        rows = "".join(f"<tr><td class='num'>{i}</td><td><code>{esc(o['test'])}</code></td><td class='num'>{o['new']}</td>"
+                       f"<td class='num'>{o['cumulative']:.1f}%</td><td>{bar(o['cumulative'])}</td><td class='num'>{o['seconds']:.1f}</td>"
+                       f"<td class='num'>{o['unique']}</td></tr>" for i, o in enumerate(rk["order"][:500], 1))
+        doc.append(f"<h2>Tests by what they add</h2><p class='sub'>{len(rk['order'])} of {len(rk['order']) + len(rk['redundant'])} tests reach "
+                   f"{rk['coverage']:.1f}% of {rk['points']} coverage points in {rk['seconds_ranked']:.1f}s of {rk['seconds']:.1f}s "
+                   f"(ordered by {'new points per second' if rk['by'] == 'rate' else 'new points'}).</p>"
+                   "<table><tr><th>Rank</th><th>Test</th><th>New points</th><th>Coverage so far</th><th></th><th>Seconds</th>"
+                   "<th>Unique points</th></tr>" + rows + "</table>")
+        for title, items in (("Redundant tests (add nothing)", rk["redundant"]), ("Tests without coverage data", rk["no_data"])):
+            if items:
+                doc.append(f"<details><summary>{title} ({len(items)})</summary><p>" + "<br>".join(f"<code>{esc(i)}</code>" for i in items[:500]) + "</p></details>")
+        if attr:
+            doc.append("<details><summary>Tests behind each feature's coverage</summary><table><tr><th>Feature</th><th>Tests</th><th>Most points</th></tr>"
+                       + "".join(f"<tr><td><code>{esc(p)}</code></td><td class='num'>{a['tests']}</td><td>"
+                                 + ", ".join(f"<code>{esc(n)}</code> ({c})" for n, c in a["top"][:5]) + "</td></tr>" for p, a in attr.items())
+                       + "</table></details>")
+
     um = unmapped(data)
     if any(um.values()):
         doc.append("<h2>Not in the plan</h2><p class='sub'>Results that no plan line points at.</p>")
@@ -1445,6 +1707,10 @@ def cmd_report(a):
         history.pop()
     tri = triage(data.runs, data.tests, plan, history, load_rules(a.rules), jobs, data.m["test"])
     snap = make_snapshot(plan, data, tri, when, label, trace)
+    rank = None
+    if a.rank:
+        pts = Points(data.runs, jobs)
+        rank = (rank_tests(pts, a.by), attribute(plan, data, pts))
     prev = history[-1] if history else None
     history.append(snap)
     os.makedirs(outdir, exist_ok=True)
@@ -1452,14 +1718,17 @@ def cmd_report(a):
         write_history(hpath, history)
     with open(os.path.join(outdir, "plan.json"), "w", encoding="utf-8") as f:
         # No indent: that keeps the C encoder, several times faster on a large plan.
-        f.write(json.dumps(plan_json(plan, data, tri, snap, history, trace), sort_keys=True) + "\n")
-    write_html(plan, data, tri, snap, history, os.path.join(outdir, "plan.html"), trace)
+        f.write(json.dumps(plan_json(plan, data, tri, snap, history, trace, rank), sort_keys=True) + "\n")
+    write_html(plan, data, tri, snap, history, os.path.join(outdir, "plan.html"), trace, rank)
     if a.md:
         write_md(plan, a.md)
     if a.trace:
         write_trace(trace[0], a.trace)
     if not a.q:
         print_plan(plan, data, tri, prev, trace=trace)
+        if rank:
+            print()
+            print_rank(rank[0], limit=10)
     else:
         print(f"mplan: {plan.id}: {plan.score:.1f}% ({plan.status})")
     print(f"report: {os.path.relpath(os.path.join(outdir, 'plan.html'))}")
@@ -1499,6 +1768,27 @@ def cmd_triage(a):
     print_triage(tri)
     fresh = [b for b in tri["buckets"] if b["class"] == "new" and b["status"] == "open"]
     return 1 if a.fail_on_new and fresh else 0
+
+
+def cmd_rank(a):
+    if not a.results:
+        raise SystemExit("mplan: rank needs -results DIR")
+    plan = parse_plan(a.plan) if a.plan else None
+    data, jobs = load_data(a)
+    pts = Points(data.runs, jobs, a.all)
+    if not pts.total:
+        raise SystemExit("mplan: rank: no per-run coverage (run mregress with -cov)")
+    rk = rank_tests(pts, a.by)
+    attr = attribute(plan, data, pts) if plan is not None and data.db is not None else None
+    print_rank(rk, attr, a.n or 0)
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump({"format": "mplan-rank", "version": 1, **rk, "features": attr}, f, indent=1, sort_keys=True)
+            f.write("\n")
+    if a.keep:
+        with open(a.keep, "w", encoding="utf-8") as f:
+            f.write("".join(o["test"] + "\n" for o in rk["order"]))
+    return 0
 
 
 def cmd_trend(a):
@@ -1629,6 +1919,8 @@ def main(argv=None):
     r.add_argument("-time", help="time of this snapshot, ISO 8601 (default: SOURCE_DATE_EPOCH, else now)")
     r.add_argument("-rules", metavar="FILE", help="triage rules: /regex/ status=known|waived owner=.. bug=.. note=..")
     r.add_argument("-md", metavar="FILE", help="also write the feature table as Markdown")
+    r.add_argument("-rank", action="store_true", help="also rank the tests by the coverage each adds (see mplan rank)")
+    r.add_argument("-by", choices=("points", "rate"), default="points", help="-rank order: new points, or new points per second")
     reqopt(r)
     r.add_argument("-trace", metavar="FILE", help="also write the requirement traceability matrix as CSV")
     r.add_argument("-fail-on-uncovered", action="store_true",
@@ -1644,6 +1936,14 @@ def main(argv=None):
     t.add_argument("-rules", metavar="FILE", help="triage rules")
     t.add_argument("-json", metavar="FILE", help="also write the buckets as JSON")
     t.add_argument("-fail-on-new", action="store_true", help="exit 1 on a new bucket that no rule marks known or waived")
+    k = sub.add_parser("rank", help="rank the tests by the coverage each adds; list the redundant ones")
+    k.add_argument("plan", nargs="?", help="a plan, to list the tests behind each feature's coverage")
+    inputs(k)
+    k.add_argument("-by", choices=("points", "rate"), default="points", help="order by new points (default) or new points per second")
+    k.add_argument("-all", action="store_true", help="rank failing tests too")
+    k.add_argument("-n", type=int, help="print only the first N ranks")
+    k.add_argument("-json", metavar="FILE", help="also write the ranking as JSON")
+    k.add_argument("-keep", metavar="FILE", help="write the tests that add coverage, one name a line, in rank order")
     d = sub.add_parser("trend", help="print the history as a table")
     d.add_argument("history")
     d.add_argument("-n", type=int, help="only the last N snapshots")
@@ -1655,7 +1955,8 @@ def main(argv=None):
     i.add_argument("-o", metavar="FILE", help="write the plan here (default: standard output)")
     a = ap.parse_args(argv)
     try:
-        return {"check": cmd_check, "report": cmd_report, "triage": cmd_triage, "trend": cmd_trend, "init": cmd_init}[a.cmd](a)
+        return {"check": cmd_check, "report": cmd_report, "triage": cmd_triage, "trend": cmd_trend, "init": cmd_init,
+                "rank": cmd_rank}[a.cmd](a)
     except PlanError as e:
         print(f"mplan: {e}", file=sys.stderr)
         return 2
