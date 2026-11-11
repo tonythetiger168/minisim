@@ -84,7 +84,7 @@ public:
         std::string cyc;                   // the cycle domain, kept with main()
         auto chunk = [&](auto&& emit) { std::ostringstream c; emit(c); chunks.push_back(c.str()); };
         std::vector<int> byRank;
-        std::vector<int> dom = cycle && !cov ? cycleDomain(procs) : std::vector<int>{};
+        std::vector<int> dom = cycle && !cov ? cycleDomain(procs, sigs) : std::vector<int>{};
         {
             // The domain re-evaluates every static combinational statement on
             // each commit (and whenever any input changes). That pays when the
@@ -493,7 +493,12 @@ public:
         }
         if (!dom.empty()) {
             o << "    S.fastSeqId = (int)S.seqs.size();\n    S.addSeq(dseq, nullptr, {";
-            const auto& ev = procs[dom[0]].seqEv;
+            // Every event of every domain process: they wait on copies of the
+            // same clocks (see cycleDomain), and one pending mark runs dseq once.
+            std::vector<std::pair<int, Edge>> ev;
+            for (int d : dom)
+                for (auto& e : procs[d].seqEv)
+                    if (std::find(ev.begin(), ev.end(), e) == ev.end()) ev.push_back(e);
             for (size_t j = 0; j < ev.size(); j++)
                 o << (j ? ", " : "") << "{" << ev[j].first << ", " << edge(ev[j].second) << "}";
             o << "});\n    S.fastCommit = fcommit;\n";
@@ -1130,7 +1135,43 @@ private:
     // targets (a blocking write, as a testbench's reset, is fine: it is not
     // ordered against the NBA queue) and every jump in them goes forward (so each NBA runs at most
     // once and can own a fixed slot). Empty: no domain.
-    static std::vector<int> cycleDomain(const std::vector<CodegenProc>& procs) {
+    static std::vector<int> cycleDomain(const std::vector<CodegenProc>& procs, const std::vector<CodegenSig>& sigs) {
+        // The clock a process waits on is often a copy of the top clock made
+        // by the port connections on the way down (assign u.clk_i = clk).
+        // Copies change in the same comb pass as their source, so processes
+        // that wait on copies of the same signals belong to one domain.
+        std::vector<int> root(sigs.size());
+        for (size_t x = 0; x < root.size(); x++) root[x] = (int)x;
+        {
+            std::vector<int> writers(sigs.size(), 0);
+            for (auto& pr : procs) {
+                std::vector<const Prog*> progs;
+                reach(pr.prog, progs);
+                for (const Prog* p : progs)
+                    for (auto& in : p->code)
+                        if ((in.k == IK::Assign || in.k == IK::Nba || in.k == IK::Force) && in.sig >= 0 && (size_t)in.sig < writers.size())
+                            writers[in.sig] += in.k == IK::Force ? 2 : 1;
+            }
+            for (auto& pr : procs) {
+                if (pr.combRank < 0 || !oneAssign(*pr.prog)) continue;
+                const Instr& a = pr.prog->code[0];
+                if (a.k != IK::Assign || a.hi >= 0 || a.arr || a.bidx || !a.aidx.empty() || !a.e || a.e->op != Op::Ref || a.e->at) continue;
+                int d = a.sig, src = a.e->sig;
+                if (d < 0 || src < 0 || (size_t)d >= sigs.size() || (size_t)src >= sigs.size()) continue;
+                if (writers[d] != 1 || sigs[d].w != 1 || sigs[src].w != 1 || sigs[d].drivers > 1) continue;
+                root[d] = src;
+            }
+        }
+        auto find = [&](int x) {
+            for (int n = 0; x >= 0 && (size_t)x < root.size() && root[x] != x && n < 1000; n++) x = root[x];
+            return x;
+        };
+        auto canon = [&](const std::vector<std::pair<int, Edge>>& ev) {
+            std::vector<std::pair<int, Edge>> c;
+            for (auto& [sg, ed] : ev) c.push_back({find(sg), ed});
+            std::sort(c.begin(), c.end());
+            return c;
+        };
         std::vector<std::vector<int>> groups;
         for (size_t i = 0; i < procs.size(); i++) {
             if (!procs[i].seq || procs[i].combRank >= 0) continue;
@@ -1145,7 +1186,7 @@ private:
             if (!forward) continue;
             bool placed = false;
             for (auto& g : groups)
-                if (procs[g[0]].seqEv == procs[i].seqEv) { g.push_back((int)i); placed = true; break; }
+                if (canon(procs[g[0]].seqEv) == canon(procs[i].seqEv)) { g.push_back((int)i); placed = true; break; }
             if (!placed) groups.push_back({(int)i});
         }
         std::vector<int> best;
@@ -1205,7 +1246,7 @@ private:
                         cand[in.sig] = 1;
                     // The outputs of one always_comb with if / case: any
                     // number of whole or part writes, all from this process.
-                    else if (in.drv < 0 && sigs[in.sig].drivers == 0 && !in.arr && in.aidx.empty() &&
+                    else if (in.drv < 0 && !in.tmp && sigs[in.sig].drivers == 0 && !in.arr && in.aidx.empty() &&
                              (!cand[in.sig] || owner[in.sig] == (int)i)) {
                         cand[in.sig] = 1;
                         owner[in.sig] = (int)i;
@@ -1308,6 +1349,7 @@ private:
         std::ostringstream o;
         std::string g, u, sl;
         struct Dyn { bool& f; Dyn(bool& x) : f(x) { f = true; } ~Dyn() { f = false; } } dyn(dynOk_);   // every split below is guarded
+        if (i.tmp) return assign(i);   // an -xprop temporary: poked, as everywhere else
         if (i.bidx) {   // v[i] = ...: the bits are chosen at run time
             bool pv = isPriv(i.sig);
             int W = sigW_[i.sig];
