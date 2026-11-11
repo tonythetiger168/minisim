@@ -7,7 +7,8 @@ Registers nothing reads and registers stuck at their reset value are gone,
 registers with a load enable sit on enable flops with no mux in front, and
 the 16:1 read select uses 4:1 mux cells. (That the netlist still behaves as
 the RTL is the msynth_sweep test.) A second design computes one function
-two ways: functional reduction leaves no logic.
+two ways: functional reduction leaves no logic. hold.sv has registers
+whose hold case is buried in an if/case tree.
 """
 import os
 import re
@@ -80,6 +81,29 @@ r3 = subprocess.run([msynth, "-top", "dc", "-o", os.path.join(work, "dc_qor.v"),
 check(r3.returncode == 0, "msynth failed on dc.sv")
 check("removed 1 unloaded or constant register bits" in r3.stdout, "dc.sv: expected 1 register bit removed")
 check("Mapped design 'dc': 0 cells" in r3.stdout, "dc.sv should need no cells:\n" + r3.stdout[:600])
+
+# Hold conditions under the selects of an if/case tree (hold.sv): every
+# register sits on an enable flop, and the pass can be switched off.
+net4 = os.path.join(work, "hold_qor.v")
+r4 = subprocess.run([msynth, "-top", "hold", "-o", net4, os.path.join(src, "hold.sv")],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+check(r4.returncode == 0, "msynth failed on hold.sv")
+check("gathered the hold conditions of 24 register bits" in r4.stdout, "hold.sv: expected 24 register bits gathered")
+text4 = open(net4).read() if os.path.exists(net4) else ""
+hc = {}
+for m in re.finditer(r"^\s*([A-Z][A-Z0-9]*_X\d+)\s+\S+\s*\(", text4, re.M):
+    hc[m.group(1)] = hc.get(m.group(1), 0) + 1
+check(hc.get("DFFE_X1", 0) == 24, "hold.sv: expected 24 enable flops, got %d" % hc.get("DFFE_X1", 0))
+check(hc.get("DFF_X1", 0) == 0, "hold.sv: a plain flop is left")
+# r and s choose between x and y: one select a bit, none for the hold
+check(hc.get("MUX2_X1", 0) <= 16, "hold.sv: expected at most 16 MUX2 cells, got %d" % hc.get("MUX2_X1", 0))
+m4 = re.search(r"Mapped design 'hold': \d+ cells, area ([0-9.]+)", r4.stdout)
+tcl = os.path.join(work, "hold_off.tcl")
+open(tcl, "w").write("set msynth_hold_enables false\nanalyze -format sverilog %s\nelaborate hold\ncompile\n" % os.path.join(src, "hold.sv"))
+r5 = subprocess.run([msynth, "-f", tcl], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+m5 = re.search(r"Mapped design 'hold': \d+ cells, area ([0-9.]+)", r5.stdout)
+check("gathered the hold" not in r5.stdout, "hold.sv: msynth_hold_enables false did not switch the pass off")
+check(bool(m4 and m5) and float(m4.group(1)) < 0.95 * float(m5.group(1)), "hold.sv: the pass should save over 5% area")
 if fails:
     print(out)
     print(cells)

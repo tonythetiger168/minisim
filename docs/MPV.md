@@ -68,6 +68,65 @@ of each cut layer, and every cut covered by the metal below and above. The
 extent for density rules is the die area. The LEF and DEF readers are the
 shared `src/lef.hpp` and `src/def.hpp`.
 
+## Rule files in the SVRF style
+
+`mpv drc -svrf rules.svrf chip.gds` reads rules written in the statement
+syntax that foundry decks commonly use, translates the part it supports to
+the deck format below and runs that. `-write-deck out.drc` writes the
+translation; `-D NAME` defines a name for `#IFDEF`.
+
+```
+LAYER MAP 68 DATATYPE 20 1008       // layer number 1008 is GDS 68/20
+LAYER met1 1008
+LAYER via  68                       // without a map: every datatype of GDS layer 68
+wide = SIZE (SIZE met1 BY -1.5) BY 1.5
+m1.1  { @ met1 width
+        INT met1 < 0.14 }
+m1.2  { @ met1 spacing
+        EXT met1 < 0.14 }
+m1.3b { @ spacing to wide met1
+        EXT wide met1 < 0.28 }
+via.4 { @ met1 enclosure of via
+        ENC via met1 < 0.055 }
+m1.x  { @ via without met1
+        via NOT met1 }
+```
+
+| Read | As |
+|---|---|
+| `LAYER name n ...`, `LAYER MAP n DATATYPE d m`, `LAYER name other ...` | drawn layers, and names for unions of layers |
+| `name = expression`, also inside a rule's braces | derived layers; a layer may be used before its definition |
+| `a AND b`, `a OR b`, `a NOT b`, `a XOR b` | `&`, `\|`, `-`, `^` |
+| `a INTERACT b`, `a NOT INTERACT b`, `a INSIDE b`, `a NOT INSIDE b`, `a OUTSIDE b` | the polygon selections of the same names |
+| `SIZE a BY v`, `HOLES a`, `RECTANGLE a`, `NOT RECTANGLE a`, `COPY a`, `EXTENT` | `grow` or `shrink`, `holes`, `rects`, `not_rects`, the layer itself, `extent()` |
+| `INT a < v`, `EXT a < v`, `EXT a b < v`, `ENC a b < v` | `width`, `space`, `enclosure` |
+| `AREA a < v`, `AREA a > v`, `DENSITY a < v WINDOW w [STEP s]` | `area`, `density` |
+| a layer expression in a rule's braces | every polygon is a result |
+| `CONNECT a b [BY c]` | `connect` |
+| `#DEFINE`, `#UNDEFINE`, `#IFDEF`, `#IFNDEF`, `#ELSE`, `#ENDIF`, `INCLUDE "file"`, `//` and `/* */` | |
+
+Keywords and names are case-insensitive. Binary layer operations apply left
+to right, so write parentheses where it matters.
+
+The translation never drops a rule silently:
+
+- Options after a check's constraint (`ABUT`, `SINGULAR`, `REGION`,
+  `OPPOSITE`, ...) are not applied, and each is listed in a warning. The
+  checks measure as described under [Checks](#checks): Euclidean across
+  corners, and `ENC` also reports the parts of the first layer that are
+  outside or flush with the second.
+- Statements that set up the run (`LAYOUT PATH`, `DRC RESULTS DATABASE`,
+  `PRECISION`, ...) and `DEVICE`, `LVS` and `TEXT` statements are listed in
+  one warning.
+- Anything else stops with an error and its line: constraints other than
+  `<` (and `>` for area and density), ranges, `INT` between two layers,
+  `TOUCH`, `ENCLOSE`, `CUT`, counts on `INTERACT`, edge operations
+  (`LENGTH`, `ANGLE`, `EXPAND EDGE`, checks used as layers), `WITH WIDTH`,
+  net-based rules and device extraction. A line number counts lines after
+  `INCLUDE` files are spliced in.
+
+`tests/pv/sky130.svrf` is the SKY130 test deck in this style.
+
 ## Rule deck
 
 One statement per line; `#` starts a comment. Lengths are in microns, areas
@@ -75,6 +134,7 @@ in square microns.
 
 ```
 layer poly 66/20                 # a drawn layer: GDS layer/datatype, several allowed
+layer anymet1 68/*               # every datatype of GDS layer 68
 layer diff 65/20
 gate = poly & diff               # a derived layer
 rule poly.1a width(poly) < 0.15 "poly width"
@@ -243,6 +303,7 @@ in a canonical form, so the report is identical for every thread count.
 | `src/layout.hpp` | a GDS library flattened to rectangles per layer |
 | `src/layout_def.hpp` | a routed DEF with its LEF as a flat layout; a deck from the LEF technology |
 | `src/drc.hpp` | the deck parser and the checks |
+| `src/svrf.hpp` | SVRF-style rule files translated to a deck (namespace `svrf`) |
 | `src/lvs.hpp` | netlist extraction and netlist comparison |
 | `src/lvs_block.hpp` | block LVS: nets of a routed DEF from its geometry, comparison with a gate netlist |
 | `src/mpv.cpp` | the command line |

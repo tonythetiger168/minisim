@@ -76,6 +76,25 @@ if(pos EQUAL -1)
   message(FATAL_ERROR "box: bus pin not rewired as expected\n${text}")
 endif()
 
+# Metal-only: no cell added or removed. The OR2 the fix needs comes from a
+# spare MUX2 (S and B on one net), the AND2 it replaces is left as a spare
+# with its inputs tied low.
+eco(spare "-spare-cells;spare_*" "+0 cells" "-0 cells" "1 spare cells used, 1 old cells left as spares, 0 cells without a spare"
+    "> spare_m0/S <- a[2]" "> spare_m0/Y <- ECO_c[2]" "> cy2/A <- 1'b0" "proved equivalent")
+# Only a NOR2 and a NAND2 are spare: OR2 is the NOR2 with the NAND2 as its inverter.
+eco(spare2 "-spare" "+0 cells" "2 spare cells used" "> spare_n0/A <- ECO_n" "> spare_n0/B <- ECO_n" "proved equivalent")
+file(READ ${OUT}/spare2_1.v text)
+string(FIND "${text}" "NOR2_X1 spare_r0 (.A(c[1]), .B(a[2]), .Y(ECO_n));" pos)
+if(pos EQUAL -1)
+  message(FATAL_ERROR "spare2: spare cell not wired as expected\n${text}")
+endif()
+# No spare cell at all: the cell is added, and the exit status says so.
+execute_process(COMMAND ${MECO} -old ${SRC}/tests/eco/deep_old.v -new ${SRC}/tests/eco/deep_new.v ${LIBS} -spare
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 3 OR NOT out MATCHES "no spare cell for ECO_cy2 \\(OR2_X1\\)" OR NOT out MATCHES "proved equivalent")
+  message(FATAL_ERROR "deep -spare: ${rc}\n${out}")
+endif()
+
 # Nothing to do: the same design, and the exit status of a netlist that cannot be read.
 execute_process(COMMAND ${MECO} -old ${SRC}/tests/eco/deep_new.v -new ${SRC}/tests/eco/deep_new.v ${LIBS} -o ${OUT}/same.v
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out)
