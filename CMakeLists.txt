@@ -316,6 +316,10 @@ if(MINISIM_WITH_SLANG)
     add_test(NAME pli_protect
              COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pli_protect.sh $<TARGET_FILE:msim> $<TARGET_FILE:msimprotect>
                      ${OPENSSL_CLI} ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/pli_protect)
+    # IEEE 1735 5.2, 9.3, 9.4, 9.9 and Annex A, rule by rule.
+    add_test(NAME protect_conformance
+             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/protect_conformance.sh $<TARGET_FILE:msim> $<TARGET_FILE:msimprotect>
+                     ${OPENSSL_CLI} ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/protect_conformance)
   endif()
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)

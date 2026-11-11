@@ -138,9 +138,27 @@ struct ProtectedCode {
 
     // May a tool show this object (a net or variable)? Outside protected code
     // always; inside, when the rights or a viewport make it visible (1735 9.5).
+    // Is the instance whose body holds `sc`, or one above it, an instance of
+    // protected code the rights do not open? A path through it is opaque
+    // (9.2), so clear-text children and modules bound into it are hidden
+    // too (9.4.2.2: no part of the path to a visible object may be protected).
+    bool insideProtected(const slang::ast::Scope* sc) const {
+        while (sc) {
+            const slang::ast::Symbol& sy = sc->asSymbol();
+            if (sy.kind == slang::ast::SymbolKind::InstanceBody) {
+                const auto* inst = sy.as<slang::ast::InstanceBodySymbol>().parentInstance;
+                if (!inst) return false;
+                if (hidden(inst->getDefinition().location)) return true;
+                sc = inst->getParentScope();
+            } else {
+                sc = sy.getParentScope();
+            }
+        }
+        return false;
+    }
     bool visible(const slang::ast::Symbol& s) const {
         const Envelope* e = envelopeAt(s.location);
-        if (!e) return true;
+        if (!e) return !insideProtected(s.getParentScope());
         std::string vis = e->right("visibility", "none");
         if (vis == "full") return true;
         const slang::ast::InstanceBodySymbol* body = nullptr;

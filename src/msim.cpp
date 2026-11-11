@@ -1878,6 +1878,14 @@ int main(int argc, char** argv) {
     }
 
     for (int id : hiddenSigs()) S.sigs[(size_t)id].hide = true;
+    // With protected IP in the design, the lowering's temporaries (_tf...)
+    // stay out of the waveform: one may hold a value computed inside the IP
+    // (an argument of the IP's own system task call).
+    if (hideSigIf())
+        for (auto& g : S.sigs) {
+            size_t dot = g.name.rfind('.');
+            if (g.name.compare(dot == std::string::npos ? 0 : dot + 1, 3, "_tf") == 0) g.hide = true;
+        }
 
     // DPI-C (35): write the header, build the C code and the export stubs,
     // load the libraries, and resolve the imports.

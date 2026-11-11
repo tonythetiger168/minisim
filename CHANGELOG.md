@@ -19,6 +19,14 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- Protected IP, IEEE 1735-2023 5.2, 9.3, 9.4, 9.9 and Annex A checked rule
+  by rule (`tests/protect_conformance.sh`): strings without `\` or control
+  characters, lower-case keywords (`` `pragma protect BEGIN `` is an error
+  instead of leaving the source in the clear), key names and rights that
+  differ only in case, end-of-file characters inside an envelope, strict
+  BASE64_TEXT, what tool and common blocks may hold, and viewport lists with
+  `.` or `:` scoped names. Clear modules instantiated in or bound into
+  protected IP are hidden from waveforms, coverage and lint output.
 - Protected IP: the IEEE 1735-2023 clause 8 license system. `msim`, `mlint`
   and `mdft` ask the IP author's license proxy over TLS for the value of a
   `license(...)` or `license_string(...)` call in a right; `mlicproxy` is

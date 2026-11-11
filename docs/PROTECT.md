@@ -299,7 +299,10 @@ Unless `visibility = "full"`:
   the model's behavior, not the tool's.
 - **Waveforms (VCD / FST)**: signals declared in protected code are left out,
   except viewport objects (and ports with `visibility = "interface"`).
-  Signals declared in the clear stay.
+  Signals declared in the clear stay, unless they sit below an instance of
+  protected code: a clear module instantiated inside the IP, or bound into it
+  with `bind`, is hidden, because its path goes through the IP (1735 9.2,
+  9.4.2.2). msim's own temporaries are left out too.
 - **Coverage (`-cov`, mcov)**: no line or branch entries for protected code
   (unless `coverage = "on"`), and no toggle entries for hidden signals.
 - **mlint / mdft**: findings located in protected code are counted, not
@@ -357,6 +360,7 @@ key, which minisim does not have and does not try to obtain.
 
 | Clause | Topic | Status |
 |---|---|---|
+| 5.2 | Strings are printable ASCII without `"` or `\` (no escapes); keywords and standardized strings lower case; key names and rights may not differ in case alone; an end-of-file character inside an envelope is an error | ✅ `protect_conformance` |
 | 5.3–5.4 | Version 3 cryptography: RSA no-padding root key, AES-256-CBC, HMAC-SHA512, base64 | ✅ |
 | 5.4.9 | version=3 second and alone; one version per envelope | ✅ |
 | 5.5 | Envelope anatomy: author / agent pragmas, common block, tool blocks, data_block | ✅ |
@@ -368,8 +372,13 @@ key, which minisim does not have and does not try to obtain.
 | 7 | Rights in tool blocks, licensed rights syntax | ✅ (minisim rights above) |
 | 8 | License system: license specification, licensing calls, TLS connection to the proxy, DER messages, request id 0, return value reuse, irregularities; `mlicproxy` is a proxy | ✅ `license_proxy`, `test_protect` |
 | 9.2 | Error handling and model fidelity | ✅ msim, mlint, mdft |
-| 9.5–9.6 | viewport / interface_viewport | ✅ named and unnamed; named ones match by lexical name |
+| 9.1, 9.3 | Build phase: the user's HDL can reference protected names, nothing is shown; run phase: protected names are not shown or accepted | ✅ `protect_conformance`, `pli_protect` |
+| 9.4 | Protected text regions; child visibility: clear modules instantiated in, or bound into, protected IP are hidden, since their path goes through it | ✅ `protect_conformance` |
+| 9.5–9.6 | viewport / interface_viewport | ✅ named (a list, `.` or `:` between scopes) and unnamed; named ones match by lexical name |
 | 9.7 | VPI / DPI visibility | ✅ see "VPI and DPI"; `tests/pli_protect.sh` |
+| 9.8 | Visibility through rights | ✅ `visibility`, `coverage` |
+| 9.9 | Dynamic objects: the named handle, queue or array variables in the IP are protected; the objects themselves stay usable through them | ✅ `protect_conformance` |
+| Annex A | Syntax: what a tool block and a common block may hold, BASE64_TEXT without spaces or inner padding, INTEGER version, STRING; msimprotect output checked against it | ✅ `protect_conformance` |
 | Annex B | Test vector | ✅ checked locally (not redistributable) |
 
 ## IEEE 1800-2023 clause 34 envelopes (`-v1`)

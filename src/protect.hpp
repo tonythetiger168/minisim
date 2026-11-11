@@ -58,6 +58,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -170,6 +171,7 @@ struct PExpr;
 struct PVal {
     enum Kind { None, Str, Num, Ident, List } kind = None;
     std::string s;               // Str / Num / Ident
+    bool esc = false;            // Str: written with a backslash escape
     std::vector<PExpr> list;     // List
 };
 struct PExpr {
@@ -218,7 +220,7 @@ private:
         if (s[p] == '"') {
             v.kind = PVal::Str;
             for (p++; p < s.size() && s[p] != '"'; p++) {
-                if (s[p] == '\\' && p + 1 < s.size()) p++;
+                if (s[p] == '\\' && p + 1 < s.size()) { p++; v.esc = true; }
                 v.s += s[p];
             }
             if (p >= s.size()) throw Error("unterminated string in `pragma protect");
@@ -244,6 +246,12 @@ private:
         return v;
     }
 };
+
+inline std::string lowerCase(std::string_view s) {
+    std::string r(s);
+    for (char& c : r) c = (char)std::tolower((unsigned char)c);
+    return r;
+}
 
 inline std::string quote(std::string_view s) {
     std::string r = "\"";
@@ -725,9 +733,14 @@ private:
     // IEEE 1735 6.2.1: two keys may not share a key_keyowner / key_keyname.
     void checkUnique(const std::string& owner, const std::string& name) {
         if (name.empty()) return;
-        for (auto& k : keys)
+        for (auto& k : keys) {
             if (k.keyname == name && k.owner == owner)
                 throw Error("two keys named key_keyowner=" + quote(owner) + " key_keyname=" + quote(name));
+            // 5.2.2: names are matched with their case, and may not differ in case alone.
+            if (!k.keyname.empty() && lowerCase(k.keyname) == lowerCase(name) && lowerCase(k.owner) == lowerCase(owner))
+                throw Error("keys " + quote(k.owner) + " / " + quote(k.keyname) + " and " + quote(owner) + " / " +
+                            quote(name) + " differ only in letter case (IEEE 1735 5.2.2)");
+        }
     }
     void addKey(std::string owner, std::string name, const std::string& path) {
         PrivateKey k;
@@ -894,10 +907,18 @@ inline std::string canonical(std::string_view t) {
 }
 
 // base64 with mandatory padding (5.4.1).
+// Annex A BASE64_TEXT: lines of [A-Za-z0-9+/], at most two '=' and only at
+// the very end; no spaces, and nothing after the padding.
 inline std::string strictBase64(std::string_view enc, const std::string& what) {
-    size_t n = 0;
-    for (char c : enc) if (c != '\n' && c != '\r') n++;
-    if (n == 0 || n % 4) throw Error(what + " is not padded base64 (IEEE 1735 5.4.1)");
+    size_t n = 0, pad = 0;
+    for (char c : enc) {
+        if (c == '\n' || c == '\r') continue;
+        n++;
+        if (c == '=') { pad++; continue; }
+        bool b64 = std::isalnum((unsigned char)c) || c == '+' || c == '/';
+        if (!b64 || pad) throw Error(what + " is not base64 text (IEEE 1735 Annex A)");
+    }
+    if (n == 0 || n % 4 || pad > 2) throw Error(what + " is not padded base64 (IEEE 1735 5.4.1)");
     return base64Decode(enc);
 }
 
@@ -905,6 +926,27 @@ inline std::string strictBase64(std::string_view enc, const std::string& what) {
 inline bool validString(std::string_view s) {
     for (char c : s) if (c < 0x20 || c > 0x7e || c == '"' || c == '\\') return false;
     return true;
+}
+// The string value of a version 3 pragma expression. There is no escape
+// mechanism (5.2.1), so a backslash is an error, not an escape.
+inline std::string stringValue(const PExpr& e, const std::string& where) {
+    if (e.val.kind != PVal::Str) throw Error(where + e.key + " needs a quoted string");
+    if (e.val.esc || !validString(e.val.s))
+        throw Error(where + e.key + ": a string holds printable ASCII without \" or \\ (IEEE 1735 5.2.1)");
+    return e.val.s;
+}
+// Standardized keywords are lower case (5.2.2). A keyword written in another
+// case is an error, so that `pragma protect BEGIN does not leave an IP
+// author's source in the clear.
+inline void checkKeywordCase(const std::string& k, const std::string& where) {
+    static const std::set<std::string> kw{
+        "version", "author", "author_info", "encrypt_agent", "encrypt_agent_info", "data_method", "data_block",
+        "begin", "end", "begin_protected", "end_protected", "begin_toolblock", "end_toolblock", "begin_commonblock",
+        "end_commonblock", "key_keyowner", "key_keyname", "key_method", "key_block", "key_public_key", "control",
+        "license_proxyenv", "license_certificate", "viewport", "interface_viewport"};
+    std::string l = lowerCase(k);
+    if (l != k && kw.count(l))
+        throw Error(where + "'" + k + "': IEEE 1735 keywords are lower case, write '" + l + "' (5.2.2)");
 }
 
 // ---- rights (1735 clause 7): `pragma protect control a = "x", b = license("f") ? "t" : "e"
@@ -953,6 +995,9 @@ public:
             } else {
                 throw Error("a right's value is a string, license(...) ? ... : ..., or license_string(...)");
             }
+            for (auto& [n0, v0] : out)
+                if (n0 != id.s && lowerCase(n0) == lowerCase(id.s))
+                    throw Error("rights " + n0 + " and " + id.s + " differ only in letter case (5.2.2)");
             out.emplace_back(id.s, val);
             ControlTok n = tok();
             if (n.k == ControlTok::End) break;
@@ -973,6 +1018,7 @@ private:
             if (e == std::string_view::npos) throw Error("unterminated string in control");
             std::string v(s.substr(p + 1, e - p - 1));
             p = e + 1;
+            if (!validString(v)) throw Error("a string in control holds printable ASCII without \" or \\ (5.2.1)");
             return {ControlTok::Str, v};
         }
         if (std::isalpha((unsigned char)c) || c == '_') {
@@ -1074,10 +1120,15 @@ inline std::string envelope(std::string_view text, size_t lineStart, Scanner& sc
         for (size_t xi = 0; xi < d->exprs.size(); xi++) {
             const PExpr& e = d->exprs[xi];
             const std::string& k = e.key;
-            auto str = [&]() -> std::string {
-                if (e.val.kind != PVal::Str) throw Error(where(d->line) + k + " needs a quoted string");
-                return e.val.s;
-            };
+            auto str = [&]() -> std::string { return stringValue(e, where(d->line)); };
+            checkKeywordCase(k, where(d->line));
+            // Annex A: what may stand in a common block and in a tool block.
+            if (inCommon && k != "license_proxyenv" && k != "license_certificate" && k != "end_commonblock")
+                throw Error(where(d->line) + "only license_proxyenv and license_certificate belong in a common block");
+            if (cur && k != "key_keyowner" && k != "key_keyname" && k != "key_method" && k != "key_block" &&
+                k != "control" && k != "end_toolblock" && k != "begin_toolblock" && k != "end_protected" &&
+                k != "begin_commonblock" && k != "data_block")
+                throw Error(where(d->line) + "'" + k + "' does not belong in a tool block");
             if (!sawVersion) {
                 if (k != "version" || d->exprs.size() != 1)
                     throw Error(where(d->line) + "version = 3 must be alone on the line after begin_protected (5.4.9)");
@@ -1171,6 +1222,11 @@ inline std::string envelope(std::string_view text, size_t lineStart, Scanner& sc
         if (done) break;
     }
     if (!done) throw Error(where(beginLine) + "begin_protected without end_protected");
+    // 5.2.3: a file may not be split inside a decryption envelope; an
+    // end-of-file character there is an error.
+    for (char c : text.substr(lineStart, signedEnd - lineStart))
+        if (c == 0x05 || c == 0x04 || c == 0x1a)
+            throw Error(where(beginLine) + "end-of-file character inside a decryption envelope (IEEE 1735 5.2.3)");
     if (dataMethod != kDataMethod)
         throw Error(where(beginLine) + "version 3 envelope needs data_method = \"" + kDataMethod + "\"");
     if (tbs.empty()) throw Error(where(beginLine) + "version 3 envelope has no tool block (5.4.2)");
@@ -1271,19 +1327,30 @@ inline std::string envelope(std::string_view text, size_t lineStart, Scanner& sc
                 throw Error(where(beginLine) + "a version 3 envelope may not hold another envelope (5.1.2)");
             }
             if (e.key == "viewport" || e.key == "interface_viewport") {
-                Viewport v;
-                v.iface = e.key == "interface_viewport";
-                std::string_view a = d->args;
-                while (!a.empty() && (a.front() == ' ' || a.front() == '\t')) a.remove_prefix(1);
-                v.name = std::string(a);
-                v.at = d->start;
-                for (size_t i = d->start; i < d->lineEnd; i++) (*plain)[i] = ' ';
-                if (v.name.empty()) {
-                    auto [b, en] = nextDeclaration(*plain, d->next);
-                    v.targetBegin = b;
-                    v.targetEnd = en;
+                // Annex A: viewport [scoped_identifier {, scoped_identifier}],
+                // the parts of a scoped name joined by '.' (9.6.1) or ':'.
+                std::vector<std::string> names;
+                std::string one;
+                for (char c : std::string(d->args) + ",") {
+                    if (c == ' ' || c == '\t') continue;
+                    if (c == ',') { if (!one.empty()) names.push_back(one); one.clear(); continue; }
+                    one += c == ':' ? '.' : c;
                 }
-                info.viewports.push_back(std::move(v));
+                if (names.empty()) names.emplace_back();
+                size_t at = d->start, next = d->next;
+                for (size_t i = d->start; i < d->lineEnd; i++) (*plain)[i] = ' ';
+                for (auto& nm : names) {
+                    Viewport v;
+                    v.iface = e.key == "interface_viewport";
+                    v.name = nm;
+                    v.at = at;
+                    if (v.name.empty()) {
+                        auto [b, en] = nextDeclaration(*plain, next);
+                        v.targetBegin = b;
+                        v.targetEnd = en;
+                    }
+                    info.viewports.push_back(std::move(v));
+                }
             }
         }
     }
@@ -1296,7 +1363,10 @@ inline bool startsV3(const Scanner& sc, int* version) {
     Scanner peek = sc;
     auto d = peek.next();
     if (!d || d->kind != Directive::Protect || d->exprs.empty() || d->exprs[0].key != "version") return false;
-    try { *version = std::stoi(d->exprs[0].val.s); } catch (...) { *version = -1; }
+    const std::string& v = d->exprs[0].val.s;
+    // Annex A INTEGER: decimal digits only.
+    bool digits = !v.empty() && v.find_first_not_of("0123456789") == std::string::npos;
+    try { *version = digits ? std::stoi(v) : -1; } catch (...) { *version = -1; }
     return *version == 3;
 }
 
@@ -1739,10 +1809,14 @@ class PublicKeyring {
 public:
     std::vector<PublicKeyEntry> keys;
     void add(PublicKeyEntry e) {
-        for (auto& k : keys)
+        for (auto& k : keys) {
             if (k.owner == e.owner && k.name == e.name)
                 throw Error("two keys named key_keyowner=" + quote(e.owner) + " key_keyname=" + quote(e.name) +
                             " (IEEE 1735 6.2.1)");
+            if (lowerCase(k.owner) == lowerCase(e.owner) && lowerCase(k.name) == lowerCase(e.name))
+                throw Error("keys " + quote(k.owner) + " / " + quote(k.name) + " and " + quote(e.owner) + " / " +
+                            quote(e.name) + " differ only in letter case (IEEE 1735 5.2.2)");
+        }
         keys.push_back(std::move(e));
     }
     const PublicKeyEntry* find(const std::string& owner, const std::string& name) const {
@@ -1981,6 +2055,7 @@ inline std::string encryptSourceV3(std::string_view text, const V3Options& o, st
             continue;
         }
         const std::string& k0 = d->exprs.empty() ? std::string() : d->exprs[0].key;
+        for (auto& e : d->exprs) checkKeywordCase(e.key, where(d->line));
         if (k0 == "begin_protected") {
             if (o.warn) o.warn(where(d->line) + "warning: begin_protected in the input; the envelope is copied unchanged (5.6.3)");
             skipAnyEnvelope(sc, file, d->line);
@@ -2004,6 +2079,7 @@ inline std::string encryptSourceV3(std::string_view text, const V3Options& o, st
             while (auto e = sc.next()) {
                 if (e->kind != Directive::Protect) continue;
                 const std::string& k = e->exprs.empty() ? std::string() : e->exprs[0].key;
+                checkKeywordCase(k, where(e->line));
                 if (k == "end") { endDir = e; break; }
                 if (k == "viewport" || k == "interface_viewport") continue;
                 if (k == "begin" || k == "begin_protected")
@@ -2020,10 +2096,7 @@ inline std::string encryptSourceV3(std::string_view text, const V3Options& o, st
         bool recipe = true;
         for (auto& e : d->exprs) {
             const std::string& k = e.key;
-            auto str = [&]() -> std::string {
-                if (e.val.kind != PVal::Str) throw Error(where(d->line) + k + " needs a quoted string");
-                return e.val.s;
-            };
+            auto str = [&]() -> std::string { return stringValue(e, where(d->line)); };
             if (k == "version") {
                 if (d->exprs.size() != 1) throw Error(where(d->line) + "the version pragma must be alone on its line (5.6)");
                 if (e.val.s != "3") throw Error(where(d->line) + "msimprotect writes version 3; use -v1 for IEEE 1800-2023 clause 34 envelopes");
