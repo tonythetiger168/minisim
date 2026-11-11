@@ -165,6 +165,76 @@ a module with no ports, or a module named in `tb.modules`.
 | `STY003` | info | off | A plain always where always_ff / always_comb / always_latch says more |
 | `FUNC001` | info | on | A function reads or writes a signal that is not one of its arguments |
 
+### slang-tidy checks (`tidy`)
+
+[slang-tidy](https://github.com/MikePopoloski/slang/tree/master/tools/tidy)
+is the lint tool that ships with slang, mlint's front end (MIT license). Its
+checks are built into mlint and report as mlint rules, so severities,
+waivers, `-json` and `-threads` apply to them. Only the checks mlint has no
+rule of its own for are here (its `NoCaseX` is `CASE003`, `AlwaysFFBlocking`
+is `L002`, and so on). The name in brackets is the slang-tidy check.
+
+| Rule | Severity | Default | What it finds |
+|---|---|---|---|
+| `TIDY001` | warning | on | A register is assigned in the reset branch only (`OnlyAssignedOnReset`) |
+| `TIDY002` | warning | on | An always_ff with a reset assigns a register outside the if / else of the reset (`AlwaysFFAssignmentOutsideConditional`) |
+| `TIDY003` | warning | on | A for loop in front of the reset test of an always_ff (`LoopBeforeResetCheck`) |
+| `TIDY004` | warning | on | Some bits of a signal are never driven (`UndrivenRange`) |
+| `TIDY005` | warning | on | Fields of one struct are assigned in different processes (`StructFieldsInSameProcess`) |
+| `TIDY006` | warning | on | A signed cast used as an index (`CastSignedIndex`) |
+| `TIDY007` | warning | off | A signal in a sensitivity list is not used in the block (`UnusedSensitiveSignal`) |
+| `TIDY008` | warning | off | 'd or '? literals (not accepted by some FPGA tools) (`XilinxDoNotCareValues`) |
+| `TIDY009` | warning | off | A .* port connection (`NoDotStarInPortConnection`) |
+| `TIDY010` | warning | off | A .name port connection with no expression (`NoDotVarInPortConnection`) |
+| `TIDY011` | warning | off | A non-ANSI port declaration (`OnlyANSIPortDecl`) |
+| `TIDY012` | warning | off | Generate / endgenerate keywords or a genvar declared outside its loop (`NoLegacyGenerate`) |
+| `TIDY013` | warning | off | An always_comb whose begin has no label (`AlwaysCombBlockNamed`) |
+| `TIDY014` | warning | off | An enum declared without a typedef (`TypedefEnums`) |
+| `TIDY015` | warning | off | A struct or union declared without a typedef (`TypedefStructUnion`) |
+| `TIDY016` | warning | off | An enum type name does not match tidy.enum (`EnumName`) |
+| `TIDY017` | warning | off | A struct type name does not match tidy.struct (`StructName`) |
+| `TIDY018` | warning | off | A union type name does not match tidy.union (`UnionName`) |
+| `TIDY019` | warning | off | A covergroup name does not match tidy.covergroup (`CovergroupName`) |
+| `TIDY020` | warning | off | A coverpoint name does not match tidy.coverpoint (`CoverpointName`) |
+| `TIDY021` | warning | off | A cross name does not match tidy.cross (`CrossName`) |
+
+Settings (`-set`, or `set` in a configuration file): `tidy.clock` (default
+`clk_i`) and `tidy.reset` (`rst_ni`) name the clock and the reset the
+reset checks look for, `tidy.reset_active_high` (`false`); `tidy.enum`,
+`tidy.struct`, `tidy.union`, `tidy.covergroup`, `tidy.coverpoint` and
+`tidy.cross` are the name patterns. Build without them with
+`-DMINISIM_WITH_SLANG_TIDY=OFF`.
+
+### Source text and syntax (`format`, `suspicious`, and more of `style`)
+
+These read the source files and the syntax tree, so they also see code that
+is never instantiated. The set follows Verible's lint rules, which is where
+most teams know them from; they are written on slang's syntax tree (no
+Verible code is used) and `mlint -explain RULE` names the Verible rule each
+one answers to. All are off by default: turn on a group (`-enable format`)
+or single rules.
+
+| Rule | Severity | Default | What it finds | Verible rule |
+|---|---|---|---|---|
+| `FMT001` | info | off | A line longer than `fmt.line_length` (100). A line that is one long word is let through | line-length |
+| `FMT002` | info | off | A tab character | no-tabs |
+| `FMT003` | info | off | Trailing whitespace | no-trailing-spaces |
+| `FMT004` | info | off | The file does not end with a newline | posix-eof |
+| `SUS001` | info | off | A stray semicolon: `x = 1;;`, `endfunction;` | forbid-consecutive-null-statements |
+| `STY004` | info | off | `` `endif `` with no comment | endif-comment |
+| `STY005` | info | off | A package in a file not named after it (`foo_pkg` may live in `foo.sv`) | package-filename |
+| `STY006` | info | off | A function or task with no lifetime, outside classes and `automatic` modules | explicit-function-lifetime, explicit-task-lifetime |
+| `STY007` | info | off | A parameter with no type | explicit-parameter-storage-type |
+| `STY008` | info | off | A packed dimension that counts up (`[0:7]`) | packed-dimensions-range-ordering |
+| `STY009` | info | off | An unpacked dimension that counts down (`[3:0]`) | unpacked-dimensions-range-ordering |
+| `NAME014` | warning | off | A macro name does not match `name.macro` | macro-name-style |
+| `W009` | info | off | A sized binary literal with fewer digits than its width (`8'b101`) | undersized-binary-literal |
+
+Verible's suspicious-semicolon (`if (c);`) is slang's own `-Wempty-body`
+warning, which mlint already prints, and its always-comb, case-missing-default,
+generate-label and name-style rules are `SYN`, `CASE`, `STY` and `NAME`
+rules above.
+
 ### State machines (`fsm`)
 
 Found by the extractor FSM coverage uses (`msim -cov`), so lint and coverage
@@ -266,6 +336,8 @@ Severities: an `error` finding makes mlint exit 1; a `warning` does with
 | `name.typedef` | `_(t\|e\|s\|u)$` | `NAME013` |
 | `name.max_length` | `40` | `NAME010` |
 | `unused.ignore` | `^_?unused\|_unused$\|^_?nc_\|_nc$` (any case) | `UNU001`..`UNU005` |
+| `name.macro` | `^[A-Z_][A-Z0-9_]*$` | `NAME014` |
+| `fmt.line_length` | `100` | `FMT001` |
 | `tb.modules` | empty | module names (globs) to treat as testbench code |
 
 Patterns are regular expressions (ECMAScript), matched anywhere in the name

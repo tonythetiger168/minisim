@@ -7,6 +7,13 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Changed
+- License: the repository is Apache-2.0 (`LICENSE`, attribution in `NOTICE`)
+  instead of MIT. The MIT grant is not withdrawn: copies obtained under it
+  stay under it, and so does the git history. `docs/LICENSING.md` holds the
+  open-core policy, the proposed free / paid split per tool, and the rule
+  that no GPL or other copyleft code enters the tree.
+
 ### Added
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
@@ -55,6 +62,10 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal -aiger FILE` writes the model as AIGER 1.9 (bad-state
+  properties for assertions and covers, invariant constraints for
+  assumptions), so other model checkers can run on it or cross-check a
+  verdict.
 - `mformal`: fairness. A strong obligation in an `assume`
   (`assume property (req |-> s_eventually !req)`) restricts the loops a
   liveness counterexample may use.
@@ -153,6 +164,12 @@ Spec references are IEEE 1800-2023 clauses.
   count. `ETCH` on a conductor gives the width as made. `src/spef.hpp` is the
   SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `lib/sky130`: cells of the open SkyWater 130 nm library (Apache-2.0) as a
+  second test library: a 47-cell Liberty subset with its LEF and technology
+  LEF, `sky130.py fetch` for the whole library at three corners (pinned
+  commits, SHA-256 checked), and a `sky130` test that runs `mlibc`, `msynth`,
+  `msta` and `mpower` on it. `mlibc` no longer expects a LEF pin for a
+  Liberty `internal` pin, and `mlibc report` fits long cell names.
 - `mchar`, cell library characterization on `mspice`: from a Liberty
   template and one transistor `.subckt` per cell it measures delay and
   transition tables (combinational, clock-to-output, set and reset arcs,
@@ -351,6 +368,13 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -svrf rules.svrf` reads rule files in the SVRF style that foundry
+  decks use (`LAYER`, `LAYER MAP`, `AND`/`OR`/`NOT`/`XOR`, `INTERACT`,
+  `INSIDE`, `OUTSIDE`, `SIZE`, `HOLES`, `RECTANGLE`, rule blocks with `INT`,
+  `EXT`, `ENC`, `AREA`, `DENSITY`, `#IFDEF`, `INCLUDE`) and translates them
+  to the native deck (`-write-deck`). Options it does not apply are listed
+  in warnings; statements it cannot run are errors with their line. Decks
+  can now name every datatype of a layer (`layer m1 68/*`).
 - `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
   database, to step through them in KLayout's marker browser.
 - `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
@@ -527,6 +551,16 @@ Spec references are IEEE 1800-2023 clauses.
   resets to flop pins. `-nocarry` and `-noce` turn each off.
 - `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
   `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mlint` runs slang-tidy's checks (the lint tool that ships with slang, MIT)
+  as rules `TIDY001`..`TIDY021`, with mlint's severities, waivers, JSON and
+  threads; the checks mlint already had a rule for are left out. See
+  `docs/LINT.md` and `THIRD_PARTY_NOTICES.md`.
+- `mlint` has 13 text and syntax rules that follow Verible's lint rules
+  (`FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009`):
+  line length, tabs, trailing spaces, stray semicolons, `` `endif ``
+  comments, package file names, explicit lifetimes and parameter types,
+  range direction, macro names, short binary literals. Off by default; one
+  task per file, same output at any `-threads`.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
