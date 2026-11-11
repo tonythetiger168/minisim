@@ -288,6 +288,10 @@ Spec references are IEEE 1800-2023 clauses.
   bases, template bases and objects passed as their base all work. Classes
   whose only constructor is the implicit one now run their members'
   constructors. Virtual functions in a hierarchy are refused.
+- `mhls -lib cells.lib`: operator delays, clock-to-Q and setup from a
+  Liberty library (reference cells at fanout four, operators as gate
+  counts fitted to msynth and msta results), so the schedule follows the
+  library and its corner. `tests/hls/calibrate.sh` measures the fit.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
