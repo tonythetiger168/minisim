@@ -63,18 +63,10 @@ struct Options {
     bool report = false;                                // -cdc-report
     int threads = 1;                                    // -threads N
 
-    // Every logical CPU unless -threads says otherwise; RDC004 is off until
-    // -enable RDC004.
-    void defaults(std::set<std::string>& disabled) {
-        threads = (int)par::defaultThreads();
-        disabled.insert("RDC004");
-    }
-
     // Takes one command-line option if it is one of these. `next` returns the
-    // option's value; `fwd` is what goes on to the front end.
+    // option's value. -threads, -enable and the rule table are mlint's.
     template<typename Next>
-    bool take(const std::string& a, Next&& next, std::set<std::string>& disabled, std::vector<std::string>& fwd) {
-        if (a == "-enable") { disabled.erase(next("a rule name")); return true; }
+    bool take(const std::string& a, Next&& next) {
         if (a == "-cdc-report") { report = true; return true; }
         if (a == "-static") { statics.push_back(next("a signal")); return true; }
         if (a == "-clock-group") {
@@ -88,44 +80,14 @@ struct Options {
             clockGroups.push_back(g);
             return true;
         }
-        if (a == "-threads") {
-            std::string n = next("a count");
-            if (n == "all") {
-                threads = (int)par::defaultThreads();
-            } else {
-                try { threads = std::stoi(n); } catch (...) { threads = 0; }
-                if (threads < 1) {
-                    std::cerr << "mlint: bad -threads " << n << "\n";
-                    std::exit(2);
-                }
-            }
-            // The front end parses its files on the same number of threads.
-            fwd.push_back("--threads");
-            fwd.push_back(std::to_string(threads));
-            return true;
-        }
         return false;
     }
 };
 
 inline const char* usage() {
-    return "  -enable RULE   turn on a rule that is off by default (RDC004)\n"
-           "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
+    return "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
            "  -static SIG    SIG does not change while it is read: its crossings are not reported\n"
-           "  -cdc-report    list the clock domains, the resets and every crossing, safe or not\n"
-           "  -threads N     worker threads, or all (default: every logical CPU; 1 = none)\n";
-}
-
-inline const char* rules() {
-    return "CDC001  a clock-domain crossing with no synchronizer, or only one flop\n"
-           "CDC002  a multi-bit bus crossing through a synchronizer, not Gray coded\n"
-           "CDC003  combinational logic in front of a synchronizer (a glitch can be captured)\n"
-           "CDC004  separately synchronized signals of one domain meet again (reconvergence)\n"
-           "CDC005  one signal synchronized more than once into the same domain\n"
-           "RDC001  an asynchronous reset generated in another clock domain\n"
-           "RDC002  one asynchronous reset used directly in several clock domains\n"
-           "RDC003  a flop feeds a flop with a different asynchronous reset, in one clock domain\n"
-           "RDC004  a reset flop feeds a flop with no asynchronous reset (off by default)\n";
+           "  -cdc-report    list the clock domains, the resets and every crossing, safe or not\n";
 }
 
 using Sym = const Symbol*;
