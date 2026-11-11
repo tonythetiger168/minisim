@@ -7,6 +7,23 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Removed
+- The implementation and signoff tools leave this repository. `msynth`,
+  `mpnr`, `msta`, `mrcx`, `mequiv`, `mformal`, `matpg`, `memu`, `mfpga`,
+  `mhls`, `mspice`, `mchar`, `mpv`, `mpower`, `mpopt`, `msdc`, `mlibc`,
+  `msimprotect`, `mpss` and the `mvp` virtual prototype layer are a paid
+  product now, described in `docs/LICENSING.md`. The free edition is the
+  verification flow: `msim`, `mwave`, `mcov`, `mregress`, `mplan`, `mbug`,
+  `mlint` with CDC, `mdft`'s scan-readiness checks and `mdebug`.
+  - `msim -mvp` keeps its option and reports that it cannot find the runtime
+    when the paid layer is not installed beside it.
+  - `msim -keyfile` still opens IEEE 1735 envelopes; only `msimprotect`,
+    which writes them, has gone.
+  - `mdft` is unchanged and still does scan insertion, MBIST, boundary scan,
+    IJTAG, EDT, LBIST and diagnosis. Its paid flows share one binary with the
+    free checks, so splitting it is a separate piece of work; until then the
+    fault engine headers it reads stay here too.
+
 ### Changed
 - `mchar` measures input pin power: `internal_power` groups without a
   `related_pin` get the supply energy of an edge that moves no output, and
