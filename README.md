@@ -841,4 +841,8 @@ cmake at another build with `-DIVERILOG=... -DVVP=...`. To add one, drop a `.sv`
 
 ## License
 
-MIT
+Apache License 2.0 (`LICENSE`, attribution in `NOTICE`). Until 2026-11-11 the
+repository was MIT; that grant is not withdrawn, and copies obtained under it
+stay under it. Paid tools are a separate, closed-source product; which tool is
+in which edition, and the rules on third-party code, are in
+[`docs/LICENSING.md`](docs/LICENSING.md).

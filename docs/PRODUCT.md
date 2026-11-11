@@ -40,10 +40,22 @@ All of them install from one package (`minisim_x.y.z_amd64.deb` /
 
 ## Editions
 
-- **minisim (open source, MIT)**: every product above. This is the product.
-- An enterprise edition (support contract, long-term-support branches,
-  validated platform builds, encrypted-IP key management) is an option once
-  1.0 is out; nothing is held back from the open-source build before then.
+- **minisim (free, Apache-2.0)**: the verification flow - simulator,
+  waveforms, coverage, regression runner, planning, lint and CDC,
+  scan-readiness checks, virtual prototypes and debug. No seat count, no key,
+  no time limit.
+- **Paid tools (closed source)**: implementation and signoff - synthesis,
+  place and route, timing, extraction, equivalence, formal, ATPG, emulation,
+  HLS, SPICE and characterization, physical verification, power, constraints
+  and IP protection. Same file formats and command lines, so the two mix in
+  one flow.
+- **Enterprise** (support contract, long-term-support branches, validated
+  platform builds, key management for encrypted IP): an option once 1.0 is
+  out, on top of either edition.
+
+The split per tool, and what it costs to make it, is in
+[`LICENSING.md`](LICENSING.md); it is a proposal until Tony confirms it, and
+until then every tool is built from this repository under Apache-2.0.
 
 ## Roadmap
 
@@ -63,7 +75,7 @@ schedules them into releases.
 
 | | minisim | Commercial (VCS, Xcelium, Questa, UniVista UVS) | Verilator | Icarus |
 |---|---|---|---|---|
-| Price | Free, MIT | Per-seat licenses | Free | Free |
+| Price | Free, Apache-2.0 (paid implementation tools beside it) | Per-seat licenses | Free | Free |
 | SystemVerilog testbench (classes, randomization, UVM) | Roadmap 0.3 to 0.5 | Yes | Partial (UVM support in progress) | Partial |
 | 4-state, event-driven semantics | Yes | Yes | 2-state; `--timing` for delays | Yes |
 | VCS / irun command line | Yes (`msim`) | Native to each | No | No |
