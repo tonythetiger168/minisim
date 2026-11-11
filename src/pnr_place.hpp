@@ -226,9 +226,7 @@ class Placer {
       if (pool.threads() > 1 && n < 400000) {
         // x and y are independent: one thread each.
         static par::Pool px(1), py(1);
-        std::thread ty([&] { solveAxis(py, 1, alpha, ay); });
-        solveAxis(px, 0, alpha, ax);
-        ty.join();
+        pool.run(2, [&](size_t axis) { solveAxis(axis ? py : px, (int)axis, alpha, axis ? ay : ax); });
       } else {
         for (int axis = 0; axis < 2; axis++) solveAxis(pool, axis, alpha, axis ? ay : ax);
       }
@@ -429,7 +427,12 @@ class Placer {
 
   struct Region { double x0, y0, x1, y1; };
 
-  void bisect(std::vector<int>& ids, size_t lo, size_t hi, Region rg, std::vector<double>& x, std::vector<double>& y, int depth) {
+  struct Part { size_t lo, hi; Region rg; int depth; };
+
+  // With `later`, the two halves of a large part near the top of the tree
+  // are handed back instead of being split here, so spread() can give them
+  // to the pool.
+  void bisect(std::vector<int>& ids, size_t lo, size_t hi, Region rg, std::vector<double>& x, std::vector<double>& y, int depth, std::vector<Part>* later = nullptr) {
     size_t cnt = hi - lo;
     if (cnt == 0) return;
     if (cnt == 1) {
@@ -465,10 +468,9 @@ class Placer {
     }
     Region r1 = rg, r2 = rg;
     if (vertCut) { r1.x1 = cut; r2.x0 = cut; } else { r1.y1 = cut; r2.y0 = cut; }
-    if (depth < forkDepth && cnt > 2000) {
-      std::thread t([&] { bisect(ids, lo, mid, r1, x, y, depth + 1); });
-      bisect(ids, mid, hi, r2, x, y, depth + 1);
-      t.join();
+    if (later && depth < forkDepth && cnt > 2000) {
+      later->push_back({lo, mid, r1, depth + 1});
+      later->push_back({mid, hi, r2, depth + 1});
     } else {
       bisect(ids, lo, mid, r1, x, y, depth + 1);
       bisect(ids, mid, hi, r2, x, y, depth + 1);
@@ -488,7 +490,14 @@ class Placer {
     }
     std::vector<int> ids(mov.size());
     std::iota(ids.begin(), ids.end(), 0);
-    bisect(ids, 0, ids.size(), {(double)db.core.x0, (double)db.core.y0, (double)db.core.x1, (double)db.core.y1}, x, y, 0);
+    // Level by level near the top, each level's parts side by side on the pool.
+    std::vector<Part> parts{{0, ids.size(), {(double)db.core.x0, (double)db.core.y0, (double)db.core.x1, (double)db.core.y1}, 0}};
+    while (!parts.empty()) {
+      std::vector<std::vector<Part>> made(parts.size());
+      pool.run(parts.size(), [&](size_t i) { bisect(ids, parts[i].lo, parts[i].hi, parts[i].rg, x, y, parts[i].depth, &made[i]); });
+      parts.clear();
+      for (auto& m : made) parts.insert(parts.end(), m.begin(), m.end());
+    }
   }
 };
 
