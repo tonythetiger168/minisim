@@ -1,6 +1,7 @@
 # memu: a gate-level netlist onto one or more FPGAs for emulation and
 # prototyping (docs/EMULATION.md). Plain C++20 and threads: no slang, so it
 # builds in every configuration.
+include_guard(GLOBAL)
 find_package(Threads REQUIRED)
 add_executable(memu src/memu.cpp)
 target_include_directories(memu PRIVATE src)

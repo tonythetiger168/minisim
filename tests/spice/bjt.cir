@@ -1,0 +1,40 @@
+Bipolar transistor: bias point and common-emitter gain
+* IS = 1e-16, BF = 100, base fed from 5 V through 430k:
+* Ib = (5 - Vbe)/430k, Vbe = Vt ln(BF Ib/IS + 1) = 0.773783 V, Ic = 982.84 uA,
+* Vc = 5 - Ic * 1k = 4.01716 V. Gain = -gm Rc = -Ic/Vt * 1k = -38.0.
+.model q1 npn is=1e-16 bf=100
+.model q2 npn is=2e-16 bf=150 br=2 vaf=80 ikf=50m ise=1e-14 ne=1.6 rb=50 rc=5 re=1 cje=2p cjc=1p tf=0.3n tr=10n
+.model q3 pnp is=1e-16 bf=80 vaf=50 cje=2p cjc=1.5p tf=0.5n
+vcc vcc 0 dc 5
+vin in 0 dc 0 ac 1
+rb vcc b 430k
+cin in b 1
+rc vcc c 1k
+qa c b 0 q1
+* a stage with every model parameter in play
+rb2 vcc b2 300k
+rc2 vcc c2 2k
+re2 e2 0 100
+qb c2 b2 e2 q2
+cin2 in b2 1u
+* pnp follower
+qc 0 c2 e3 q3
+re3 vcc e3 4.7k
+* switching
+vp pin 0 pulse(0 5 1n 1n 1n 20n 100n)
+rbs pin bs 10k
+rcs vcc cs 1k
+qs cs bs 0 q2
+.op
+.ac dec 10 10 100meg
+.tran 0.1n 100n
+.meas ac gain find vm(c) at=1k
+.meas ac gain2 find vm(c2) at=10k
+.meas ac f3 when vdb(c2)=20 fall=1
+.meas ac vfol find vm(e3) at=10k
+.meas tran tfall trig v(pin) val=2.5 rise=1 targ v(cs) val=2.5 fall=1
+.meas tran trise trig v(pin) val=2.5 fall=1 targ v(cs) val=2.5 rise=1
+.meas tran vsat min v(cs)
+*> gain 38.0 2e-3
+*> ngspice 0.02
+.end
