@@ -8,7 +8,9 @@ which prints the outputs for random stimulus. The testbench is simulated
 with msim twice, on the RTL and on the netlist with the library's cell
 models that msynth generates, and both runs must print the same lines.
 With [lib], that Liberty file is the target library instead of the
-default one (mini45).
+default one (mini45). With `abc` in its place, the design is compiled at
+high effort with ABC restructuring forced on (an abc program must be
+found), and the run must report it.
 """
 import os
 import subprocess
@@ -16,11 +18,17 @@ import sys
 
 msynth, msim, src, work, name = sys.argv[1:6]
 lib = sys.argv[6] if len(sys.argv) > 6 else None
+abc = lib == "abc"
+if abc:
+    lib = None
+    name_tag = "_abc"
+else:
+    name_tag = ""
 os.makedirs(work, exist_ok=True)
 rtl = os.path.join(src, name + ".sv")
 tb = os.path.join(src, name + "_tb.sv")
-net = os.path.join(work, name + "_net.v")
-cells = os.path.join(work, name + "_cells.v")
+net = os.path.join(work, name + name_tag + "_net.v")
+cells = os.path.join(work, name + name_tag + "_cells.v")
 
 script = []
 if lib:
@@ -28,13 +36,14 @@ if lib:
 script += [
     "analyze -format sverilog {%s}" % rtl,
     "elaborate %s" % name,
-    "compile",
+    "set msynth_abc true" if abc else "",
+    "compile -map_effort high" if abc else "compile",
     "report_area",
     "report_timing",
     "write -format verilog -output {%s}" % net,
     "write_lib_models {%s}" % cells,
 ]
-tcl = os.path.join(work, name + ".tcl")
+tcl = os.path.join(work, name + name_tag + ".tcl")
 with open(tcl, "w") as f:
     f.write("\n".join(script) + "\n")
 
@@ -56,6 +65,8 @@ for threads in ("1", "4"):
     elif text != first:
         sys.exit("FAIL: the netlist differs between -threads 1 and -threads 4")
 print(out)
+if abc and "Information: ABC restructuring: area" not in out:
+    sys.exit("FAIL: ABC restructuring did not run")
 want = run([msim, rtl, tb, "-top", name + "_tb"])
 got = run([msim, net, cells, tb, "-top", name + "_tb"])
 wl, gl = want.splitlines(), got.splitlines()
