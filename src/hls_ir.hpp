@@ -54,7 +54,7 @@ struct Arr {
   Type ety;
   int size = 0;
   std::vector<int> dims;
-  enum Mode { Reg, Mem, Rom } mode = Mem;
+  enum Mode { Reg, Mem, Rom, Stream } mode = Mem;   // Stream: a load takes an element, a store sends one
   bool isParam = false, isStatic = false;
   bool read = false, written = false;
   std::vector<uint64_t> init;
@@ -199,7 +199,7 @@ class Lowerer {
           a.dims.push_back(n);
           a.size *= n;
         }
-        a.mode = Arr::Mem;
+        a.mode = d.isStream ? Arr::Stream : Arr::Mem;
         a.isParam = true;
         S.fn.arrs.push_back(a);
         pm.k = Param::Array;
@@ -736,12 +736,13 @@ class Lowerer {
       o.ref = lv.arr;
       return pure(o);
     }
-    (void)line;
+    if (a.mode == Arr::Stream && a.written) fail(P.file, line, "stream '" + a.name + "' is written; it cannot also be read");
     Op o;
     o.k = OpK::Load;
     o.w = a.ety.w;
     o.a = lv.idx;
     o.ref = lv.arr;
+    if (a.mode == Arr::Stream) o.c = S.pred;   // taking an element is an effect: only on the path that asks
     return push(o);
   }
 
@@ -752,6 +753,7 @@ class Lowerer {
     }
     Arr& a = S.fn.arrs[lv.arr];
     if (a.mode == Arr::Rom) fail(P.file, line, "'" + a.name + "' is const");
+    if (a.mode == Arr::Stream && a.read) fail(P.file, line, "stream '" + a.name + "' is read; it cannot also be written");
     a.written = true;
     if (a.mode == Arr::Reg) {
       if (isC(lv.idx)) {
@@ -1426,13 +1428,18 @@ class Lowerer {
 
 // ---- cleanup passes --------------------------------------------------------
 
+// A store, or a read that takes an element from a stream.
+inline bool hasEffect(const Function& f, const Op& o) {
+  return o.k == OpK::Store || (o.k == OpK::Load && f.arrs[o.ref].mode == Arr::Stream);
+}
+
 // Drop unreachable blocks, skip blocks that do nothing, renumber.
 inline void pruneBlocks(Function& f) {
   auto empty = [&](int b) {
     const Block& B = f.blocks[b];
     if (!B.writes.empty() || B.term.k != Term::Jump) return false;
     for (int o : B.ops)
-      if (f.ops[o].k == OpK::Store) return false;
+      if (hasEffect(f, f.ops[o])) return false;
     return true;
   };
   auto resolve = [&](int b) {
@@ -1515,7 +1522,7 @@ inline std::vector<bool> deadCode(Function& f) {
       for (auto& B : f.blocks) {
         cone(B.term.cond, grew);
         for (int id : B.ops)
-          if (f.ops[id].k == OpK::Store) cone(id, grew);
+          if (hasEffect(f, f.ops[id])) cone(id, grew);
         for (auto& [v, val] : B.writes)
           if (need[v]) cone(val, grew);
       }
@@ -1537,7 +1544,7 @@ inline std::vector<bool> deadCode(Function& f) {
       mark(B.term.cond);
       for (size_t i = B.ops.size(); i-- > 0;) {
         Op& o = f.ops[B.ops[i]];
-        if (o.k == OpK::Store) liveOp[B.ops[i]] = true;
+        if (hasEffect(f, o)) liveOp[B.ops[i]] = true;
         if (!liveOp[B.ops[i]]) continue;
         mark(o.a);
         mark(o.b);
@@ -1716,7 +1723,13 @@ inline void balance(Function& f) {
 struct Machine {
   std::vector<uint64_t> vars;
   std::vector<std::vector<uint64_t>> mems;
+  // Streams: mems holds what the source offers (taken in order, starting
+  // over at the end), spos the next element, sout what was sent.
+  std::vector<size_t> spos;
+  std::vector<std::vector<uint64_t>> sout;
   void reset(const Function& f) {
+    spos.assign(f.arrs.size(), 0);
+    sout.assign(f.arrs.size(), {});
     vars.assign(f.vars.size(), 0);
     for (size_t v = 0; v < f.vars.size(); v++) vars[v] = f.vars[v].init;
     mems.resize(f.arrs.size());
@@ -1740,6 +1753,12 @@ inline long interpret(const Function& f, Machine& m, long maxSteps = 50'000'000)
         case OpK::Const: val[id] = o.imm; break;
         case OpK::ReadVar: val[id] = maskW(m.vars[o.ref], o.w); break;
         case OpK::Load: {
+          if (f.arrs[o.ref].mode == Arr::Stream) {
+            auto& src = m.mems[o.ref];
+            val[id] = 0;
+            if ((o.c < 0 || (val[o.c] & 1)) && !src.empty()) val[id] = src[m.spos[o.ref]++ % src.size()];
+            break;
+          }
           uint64_t i = maskW(val[o.a], f.ops[o.a].w);
           val[id] = i < m.mems[o.ref].size() ? m.mems[o.ref][i] : 0;
           break;
@@ -1751,6 +1770,10 @@ inline long interpret(const Function& f, Machine& m, long maxSteps = 50'000'000)
         }
         case OpK::Store: {
           if (o.c >= 0 && !(val[o.c] & 1)) break;
+          if (f.arrs[o.ref].mode == Arr::Stream) {
+            m.sout[o.ref].push_back(maskW(val[o.b], o.w));
+            break;
+          }
           uint64_t i = maskW(val[o.a], f.ops[o.a].w);
           if (i < m.mems[o.ref].size()) m.mems[o.ref][i] = maskW(val[o.b], o.w);
           break;

@@ -132,6 +132,7 @@ struct Driver {
     SourceLocation loc;
     SourceRange range;                    // the assignment as written; empty for a port
     const Expression* rhs = nullptr;      // null for an output port
+    const Expression* lhs = nullptr;      // the left side as written, when an assignment
     std::vector<Guard> guards;
     bool seq = false;
     bool whole = false;                   // assigns the whole target, not a select of it
@@ -358,6 +359,7 @@ struct Walker {
             d.loc = a.sourceRange.start();
             d.range = a.sourceRange;
             d.rhs = &a.right();
+            d.lhs = &a.left();
             d.whole = a.left().kind == ExpressionKind::NamedValue ||
                       a.left().kind == ExpressionKind::HierarchicalValue;
             if (targets.size() == 1) {
@@ -1009,19 +1011,55 @@ struct Tool {
         return i < 0 ? "x" : showBits(w->bits(i));
     }
 
+    // The elements of the unpacked array arr that e selects, as "[3]" or
+    // "[1][2]", with the indices evaluated at ev's time. An index that cannot
+    // be evaluated gives "?" in the list.
+    void elemsIn(const Expression& e, const Symbol* arr, Eval& ev, std::vector<std::string>& out) {
+        e.visit(makeVisitor([&](auto& v, const ElementSelectExpression& x) {
+            // Walk down mem[i][j] to its base, collecting the indices.
+            std::vector<const Expression*> ix;
+            const Expression* b = &x;
+            while (b->kind == ExpressionKind::ElementSelect && b->as<ElementSelectExpression>().value().type->isUnpackedArray()) {
+                ix.push_back(&b->as<ElementSelectExpression>().selector());
+                b = &b->as<ElementSelectExpression>().value();
+            }
+            const Symbol* sym = b->kind == ExpressionKind::NamedValue ? &b->as<NamedValueExpression>().symbol
+                              : b->kind == ExpressionKind::HierarchicalValue ? &b->as<HierarchicalValueExpression>().symbol : nullptr;
+            if (sym != arr || ix.empty()) { v.visitDefault(x); return; }
+            std::string name;
+            for (auto it = ix.rbegin(); it != ix.rend(); ++it) {
+                auto i = ev.eval(**it);
+                auto n = i && !i->hasUnknown() ? i->template as<int32_t>() : std::nullopt;
+                if (!n) { name = "?"; break; }
+                name += "[" + std::to_string(*n) + "]";
+            }
+            if (std::find(out.begin(), out.end(), name) == out.end()) out.push_back(name);
+            for (const Expression* i : ix) i->visit(v);
+        }));
+    }
+
+    using Seen = std::set<std::tuple<const Symbol*, uint64_t, std::string>>;
+
     // The assignment that gave s its value at time t, then what caused it.
-    void active(const Symbol* s, uint64_t t, int depth, int indent, std::set<std::pair<const Symbol*, uint64_t>>& seen) {
+    // elem: one element of an unpacked array, "[3]", which has its own
+    // waveform when msim ran with -vcd-arrays.
+    void active(const Symbol* s, uint64_t t, int depth, int indent, Seen& seen, const std::string& elem = "") {
         std::string pad(indent * 2, ' ');
-        const Wave* w = vcd.find(path(*s));
-        if (!w) { std::cout << pad << path(*s) << "  (not in the waveform)\n"; return; }
+        const std::string name = path(*s) + elem;
+        const Wave* w = vcd.find(name);
+        if (!w) {
+            bool arr = s->kind == SymbolKind::Variable && s->as<ValueSymbol>().getType().isUnpackedArray();
+            std::cout << pad << name << (arr ? "  (not in the waveform: run msim with -vcd-arrays)\n" : "  (not in the waveform)\n");
+            return;
+        }
         int ci = w->at(t);
         uint64_t tc = ci < 0 ? 0 : w->ch[ci].t;
-        std::cout << pad << path(*s) << " = " << (ci < 0 ? "x" : showBits(w->bits(ci))) << " @" << t;
+        std::cout << pad << name << " = " << (ci < 0 ? "x" : showBits(w->bits(ci))) << " @" << t;
         if (tc != t) std::cout << "  (since " << tc << ")";
         std::cout << "\n";
         auto it = db.driversOf.find(s);
         if (it == db.driversOf.end()) { std::cout << pad << "  no driver: an input or a testbench value\n"; return; }
-        if (!seen.insert({s, tc}).second) { std::cout << pad << "  (shown above)\n"; return; }
+        if (!seen.insert({s, tc, elem}).second) { std::cout << pad << "  (shown above)\n"; return; }
 
         // Which drivers ran? A flop's conditions are sampled before the edge.
         struct Hit { int ix; int state; uint64_t ts; };   // state: 1 yes, 0 no, -1 unknown
@@ -1035,6 +1073,15 @@ struct Tool {
                 auto h = ev.holds(g);
                 if (!h) { if (state == 1) state = -1; }
                 else if (!*h) { state = 0; break; }
+            }
+            // Of an array's drivers, only one that wrote this element.
+            if (state && !elem.empty() && d.lhs) {
+                std::vector<std::string> wrote;
+                elemsIn(*d.lhs, s, ev, wrote);
+                if (std::find(wrote.begin(), wrote.end(), elem) == wrote.end()) {
+                    if (std::find(wrote.begin(), wrote.end(), "?") != wrote.end() || wrote.empty()) { if (state == 1 && !wrote.empty()) state = -1; }
+                    else state = 0;
+                }
             }
             hits.push_back({i, state, ts});
         }
@@ -1119,6 +1166,17 @@ struct Tool {
                         continue;
                     }
                 }
+                // A memory: the element that was read, by the index at that time.
+                if (!rw && r->kind == SymbolKind::Variable && r->as<ValueSymbol>().getType().isUnpackedArray()) {
+                    Eval ev{vcd, ts};
+                    std::vector<std::string> els;
+                    if (d.rhs) elemsIn(*d.rhs, r, ev, els);
+                    for (const Guard& g : d.guards) if (g.cond) elemsIn(*g.cond, r, ev, els);
+                    bool any2 = false;
+                    for (const std::string& el : els)
+                        if (el != "?") { active(r, ts, depth - 1, indent + 2, seen, el); any2 = true; }
+                    if (any2) continue;
+                }
                 active(r, ts, depth - 1, indent + 2, seen);
             }
         }
@@ -1127,10 +1185,18 @@ struct Tool {
 
     bool activeTrace(const std::string& name, std::optional<uint64_t> at, int depth) {
         if (!haveVcd) { std::cerr << "mdebug: -active needs -vcd <file>\n"; return false; }
-        const Symbol* s = find(name);
+        // -active tb.mem[3]: one element of a memory.
+        std::string base = name, elem;
+        size_t dot = name.rfind('.');
+        size_t br = name.find('[', dot == std::string::npos ? 0 : dot + 1);
+        if (br != std::string::npos && name.back() == ']' && !db.byPath.count(name)) {
+            base = name.substr(0, br);
+            elem = name.substr(br);
+        }
+        const Symbol* s = find(base);
         if (!s) return false;
-        std::set<std::pair<const Symbol*, uint64_t>> seen;
-        active(s, at ? *at : vcd.end, depth, 0, seen);
+        Seen seen;
+        active(s, at ? *at : vcd.end, depth, 0, seen, elem);
         return true;
     }
 
