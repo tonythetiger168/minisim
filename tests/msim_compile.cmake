@@ -26,6 +26,7 @@ set(CASES
   "examples/combbidx.sv"
   "examples/clkcone.sv"
   "examples/combcall.sv"
+  "examples/rstcopy.sv"
   "bench/chain.sv +define+END_TIME=2000"
   "examples/cli/init.sv"
   "examples/cli/adder.sv examples/cli/adder_tb.sv -top adder_tb +define+WIDTH=8"

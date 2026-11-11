@@ -79,7 +79,7 @@ class Codegen {
 public:
     std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                     const CodegenParts& parts = {}) {
-        for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); }
+        for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); scratch_.push_back(g.name.rfind("_tf", 0) == 0); }
         std::vector<std::string> chunks;   // one per process: the unit spread over files
         std::string cyc;                   // the cycle domain, kept with main()
         auto chunk = [&](auto&& emit) { std::ostringstream c; emit(c); chunks.push_back(c.str()); };
@@ -498,11 +498,21 @@ public:
             // Every event of every domain process: they wait on copies of the
             // same clocks (see cycleDomain), and one pending mark runs dseq once.
             for (int g = 0; g < std::max(domGroups_, 1); g++) {
-                std::vector<std::pair<int, Edge>> ev;
+                // One signal per source and edge: the copies of a source all
+                // change in the same comb pass, so one of them is enough to
+                // wake the group, and the others are then ordinary quiet
+                // signals. A copy rather than the source, when there is one
+                // (the group then runs after that pass).
+                std::vector<std::pair<int, Edge>> ev, key;
                 for (int d : dom)
                     if (domGroups_ <= 1 || domGroup_[d] == g)
-                        for (auto& e : procs[d].seqEv)
-                            if (std::find(ev.begin(), ev.end(), e) == ev.end()) ev.push_back(e);
+                        for (auto& e : procs[d].seqEv) {
+                            int rt = e.first >= 0 && (size_t)e.first < domRoot_.size() ? domRoot_[e.first] : e.first;
+                            std::pair<int, Edge> kk{rt, e.second};
+                            auto it = std::find(key.begin(), key.end(), kk);
+                            if (it == key.end()) { key.push_back(kk); ev.push_back(e); }
+                            else if (ev[(size_t)(it - key.begin())].first == rt && e.first != rt) ev[(size_t)(it - key.begin())] = e;
+                        }
                 if (g) o << "    S.addSeq(dseq, (const void*)(intptr_t)" << g << ", {";
                 for (size_t j = 0; j < ev.size(); j++)
                     o << (j ? ", " : "") << "{" << ev[j].first << ", " << edge(ev[j].second) << "}";
@@ -605,6 +615,11 @@ public:
 
 private:
     std::vector<int> sigW_;
+    // Temporaries of the lowering and of msim's call expansion (_tf...): each
+    // read follows a write in the same pass, so an X left in one from a pass
+    // that did not use it says nothing about 2-state mode.
+    std::vector<char> scratch_;
+    bool scratch(int s) const { return s >= 0 && (size_t)s < scratch_.size() && scratch_[(size_t)s]; }
     // Private signals of the cycle domain (see privateSigs): kept in plain
     // static variables P<s> instead of S.sigs, like Verilator's model members.
     std::vector<char> priv_, sigNet_, clock_;
@@ -1190,6 +1205,12 @@ private:
             std::sort(c.begin(), c.end());
             return c;
         };
+        auto raw = [&](const std::vector<std::pair<int, Edge>>& ev) {
+            for (auto& [sg, ed] : ev) if (find(sg) != sg) return false;
+            return true;
+        };
+        domRoot_.resize(sigs.size());
+        for (size_t x = 0; x < sigs.size(); x++) domRoot_[x] = find((int)x);
         std::vector<std::vector<int>> groups;
         for (size_t i = 0; i < procs.size(); i++) {
             if (!procs[i].seq || procs[i].combRank >= 0) continue;
@@ -1205,9 +1226,14 @@ private:
                 if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "not in the domain (loop or run-time index): %s line %d\n", procs[i].kind.c_str(), code.empty() ? 0 : code[0].line);
                 continue;
             }
+            // A process that waits on the source signals themselves runs when
+            // they change; one that waits on copies runs after the comb pass
+            // that brings the copies (and anything else computed from the
+            // sources, as a reset it reads) up to date. Two groups, so each
+            // still runs at its own point of the time step.
             bool placed = false;
             for (auto& g : groups)
-                if (canon(procs[g[0]].seqEv) == canon(procs[i].seqEv)) { g.push_back((int)i); placed = true; break; }
+                if (canon(procs[g[0]].seqEv) == canon(procs[i].seqEv) && raw(procs[g[0]].seqEv) == raw(procs[i].seqEv)) { g.push_back((int)i); placed = true; break; }
             if (!placed) groups.push_back({(int)i});
         }
         std::vector<int> best;
@@ -1216,7 +1242,7 @@ private:
             for (auto& g : groups) {
                 std::string ev;
                 for (auto& [sg, ed] : canon(procs[g[0]].seqEv)) ev += " " + sigs[sg].name + "/" + std::to_string((int)ed);
-                std::fprintf(stderr, "clock group of %zu:%s\n", g.size(), ev.c_str());
+                std::fprintf(stderr, "clock group of %zu:%s%s\n", g.size(), ev.c_str(), raw(procs[g[0]].seqEv) ? "" : " (through copies)");
             }
         domGroup_.assign(procs.size(), -1);
         domGroups_ = 0;
@@ -1258,6 +1284,7 @@ private:
         domGroups_ = 1;
         return best;
     }
+    std::vector<int> domRoot_;    // cycleDomain: per signal, the signal it is a copy of (itself if none)
     std::vector<int> domGroup_;   // cycleDomain: per process, its clock group in the domain (or -1)
     int domGroups_ = 0;
 
@@ -1626,7 +1653,7 @@ private:
                             o << "static Val CW" << I_ << "_" << G_ << ";\n";
                             chk += "      ch |= UPDV(CW" + I_ + "_" + G_ + ", S.sigs[" + G_ + "].val);\n";
                         }
-                        ext.insert(sg);
+                        if (!isPriv(sg)) ext.insert(sg);   // a private one is in P, and S.sigs keeps its first X
                     }
                     o << "static uint64_t CI" << I_ << "[" << std::max<size_t>(nw, 1) << "]; static bool CIV" << I_ << ";\n";
                     chk += "      if (!ch) goto @END@; }\n    CC" + I_ + "->epoch++;\n";
@@ -1694,7 +1721,7 @@ private:
         // by the writes) and so is every S.sigs signal the domain reads.
         o << "static bool twoNow() {\n    return " << (two ? "pclean && (0" : "false");
         if (two) {
-            for (int e : ext) o << " | S.sigs[" << e << "].val.x";
+            for (int e : ext) if (!scratch(e)) o << " | S.sigs[" << e << "].val.x";
             o << ") == 0";
         }
         o << ";\n}\n";
@@ -1703,13 +1730,13 @@ private:
         o << "static void why4() {\n    static long n = 0; static const char* w = std::getenv(\"MSIM_WHY4\");\n"
              "    if (!w || ++n != std::atol(w)) return;\n";
         if (two)
-            for (int e : ext)
+            for (int e : ext) if (!scratch(e))
                 o << "    if (S.sigs[" << e << "].val.x) std::fprintf(stderr, \"4-state: %s\\n\", S.sigs[" << e << "].name.c_str());\n";
-        for (int s : privs)
+        for (int s : privs) if (!scratch(s))
             o << "    if (P" << s << ".x) std::fprintf(stderr, \"4-state (private): %s\\n\", S.sigs[" << s << "].name.c_str());\n";
         o << "}\n";
         o << "static void scanP() {\n    uint64_t x = 0;\n";
-        for (int s : privs) o << "    x |= P" << s << ".x;\n";
+        for (int s : privs) if (!scratch(s)) o << "    x |= P" << s << ".x;\n";
         o << "    pclean = x == 0;\n}\n";
         o << "static void (*const DS[])() = {";
         for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j];

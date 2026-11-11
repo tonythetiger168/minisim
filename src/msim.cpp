@@ -592,7 +592,15 @@ static void inlineCombCalls(LowerResult& lowered) {
                 if (i.k == IK::Assign) rd.insert(i.sig);
                 if (rd.count(x)) { used = true; break; }
             }
-            if (used) clone[x] = S.sig("_tf$c" + std::to_string(serial++) + "$" + S.sigs[(size_t)x].name, S.sigs[(size_t)x].w, false);
+            if (!used) continue;
+            // Named as a temporary of the lowering (_tf...), without the
+            // characters that mark array elements and internal signals.
+            std::string nm = S.sigs[(size_t)x].name;
+            nm = nm.substr(nm.rfind('.') == std::string::npos ? 0 : nm.rfind('.') + 1);
+            for (char& ch : nm) if (!std::isalnum((unsigned char)ch)) ch = '_';
+            int w = S.sigs[(size_t)x].w;
+            clone[x] = S.sig("_tfc" + std::to_string(serial++) + "_" + nm, w, false);
+            S.sigs[(size_t)clone[x]].hide = true;
         }
         std::function<E(const E&)> sub = [&](const E& e) -> E {
             if (!e) return e;

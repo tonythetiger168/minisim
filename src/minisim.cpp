@@ -783,7 +783,7 @@ struct Sim {
     void fastInit() {
         quiet.assign(sigs.size(), 1);
         for (size_t s = 0; s < sigs.size(); s++) {
-            if (sigs[s].w > 64 || sigs[s].net && sigs[s].drv.empty()) quiet[s] = 0;
+            if (sigs[s].w > 64) quiet[s] = 0;   // (a net whose one continuous assign msim merged into a plain write has no driver and is stored like a variable)
             if (s < tranOf.size() && !tranOf[s].empty()) quiet[s] = 0;   // a tran net: drive() resolves its group
             if (s < seqOf.size())
                 if (!seqOf[s].empty()) quiet[s] = 0;   // a clock: set() detects its edges
@@ -859,6 +859,7 @@ struct Sim {
             { static struct St { std::map<std::string, long> m; ~St() { std::vector<std::pair<long, std::string>> v; for (auto& [k, c] : m) v.push_back({c, k});
                 std::sort(v.rbegin(), v.rend()); for (size_t i = 0; i < v.size() && i < 400; i++) std::fprintf(stderr, "FW %ld %s\n", v[i].first, v[i].second.c_str()); } } st;
               std::string why = !quiet[s] ? (!seqOf[s].empty() ? "seq " : "comb ") : !waiters[s].empty() ? "wait " : "obs ";
+              if (!quiet[s] && seqOf[s].empty()) { why = "comb"; if (sigs[s].w > 64) why += ":wide"; if ((size_t)s < combOf.size()) for (int r : combOf[s]) why += r == fastComb ? ":all" : ":r" + std::to_string(r); why += " "; }
               st.m[why + sigs[s].name]++; }
 #endif
             set(s, in); return; }
