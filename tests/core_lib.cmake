@@ -27,14 +27,23 @@ endforeach()
 
 # An exported header that quotes a sibling the package does not install leaves
 # the consumer with a missing-header error, which is how interval.hpp was found
-# missing while rand.inc shipped. Every quoted sibling must be installed too.
+# missing while rand.inc shipped. A quoted name that is one of this repository's
+# own headers must be installed too; a quoted system header such as "stdint.h"
+# is not ours and is left alone.
+file(GLOB_RECURSE ours ${SRC}/src/*.hpp ${SRC}/src/*.h ${SRC}/src/*.inc)
+set(our_names "")
+foreach(path ${ours})
+  get_filename_component(name ${path} NAME)
+  list(APPEND our_names ${name})
+endforeach()
 file(GLOB installed ${prefix}/include/minisim/*)
 foreach(header ${installed})
   file(STRINGS ${header} includes REGEX "^[ \t]*#[ \t]*include[ \t]*\"")
   foreach(line ${includes})
     string(REGEX REPLACE "^.*#[ \t]*include[ \t]*\"([^\"]+)\".*$" "\\1" sibling "${line}")
     get_filename_component(name ${sibling} NAME)
-    if(NOT sibling MATCHES "/" AND NOT EXISTS ${prefix}/include/minisim/${name})
+    list(FIND our_names ${name} found)
+    if(NOT found EQUAL -1 AND NOT EXISTS ${prefix}/include/minisim/${name})
       get_filename_component(from ${header} NAME)
       message(FATAL_ERROR
               "${from} is installed but includes \"${name}\", which the "

@@ -78,7 +78,12 @@ if(MINISIM_WITH_FST)
   target_include_directories(fst INTERFACE
                              $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/minisim>)
   list(APPEND MINISIM_CORE_EXPORTS fst)
-  install(FILES ${FST_SRC}/fstapi.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/minisim)
+  # fst_win_unistd.h is what fstapi.h reaches for on Windows. It is never
+  # compiled on a Unix host, but a consumer that builds the package on Windows
+  # needs it, and shipping a header whose own include is missing is a trap
+  # either way.
+  install(FILES ${FST_SRC}/fstapi.h ${FST_SRC}/fst_win_unistd.h
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/minisim)
 endif()
 
 list(TRANSFORM MINISIM_CORE_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/
