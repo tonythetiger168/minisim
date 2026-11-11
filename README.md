@@ -591,6 +591,18 @@ msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cell
 
 See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
 
+### FPGA synthesis: `mfpga`
+
+`mfpga` maps RTL (through the same elaborator as `msynth`) or an AIGER graph
+to the LUTs and flip-flops of an FPGA family (iCE40, ECP5, Xilinx 7-series,
+generic) and writes Yosys JSON for nextpnr or EDIF.
+
+```sh
+mfpga rtl/*.sv -top core -family ice40 -o core.json   # then: nextpnr-ice40 --json core.json ...
+```
+
+See [docs/FPGA.md](docs/FPGA.md).
+
 ### Formal property checking: `mformal`
 
 `mformal` proves or falsifies the design's assertions for every input

@@ -330,6 +330,11 @@ Spec references are IEEE 1800-2023 clauses.
 - `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
   Verilog netlist reader / flattener / writer, shared by the timing,
   synthesis, power, equivalence and physical tools.
+- FPGA synthesis: `mfpga` maps RTL or AIGER to K-input LUTs and flip-flops
+  (iCE40, ECP5, Xilinx 7-series, generic cells) on the shared graph of
+  `src/aig.hpp`, and writes Yosys JSON for nextpnr, EDIF or Verilog.
+  Depth-optimal priority-cut mapping with area recovery; multithreaded, with
+  the same output for any `-threads N`. See `docs/FPGA.md`.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:
