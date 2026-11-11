@@ -390,6 +390,10 @@ Spec references are IEEE 1800-2023 clauses.
 - `mdft -edt`: scan test compression. A ring-generator decompressor and an
   XOR compactor around the scan chains, and an encoder that solves test
   cubes into channel data over GF(2), in parallel and deterministically.
+  With the gate netlist it simulates each compressed pattern and writes the
+  expected output channels and a load / capture / compare testbench;
+  `-edt_xmask` adds compactor X masking (one chain per channel observed,
+  mask chosen per pattern) so unknown captures do not hide known ones.
 - `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
   on the gate netlist (port inputs at 0, scan cells observed), with the
   coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
