@@ -22,7 +22,7 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
    is inlined; `if`/`switch`/`?:`/`&&`/`||` without loops become multiplexers
    (if-conversion), including early returns such as `if (x < lo) return lo;`; loops with a constant trip count unroll on request;
    small arrays become registers, large ones RAMs, `const` ones ROMs.
-   Dead code goes, and every operator is narrowed to the bits its readers
+   Dead code goes (also a variable that only feeds itself), and every operator is narrowed to the bits its readers
    look at, so `uint8_t c = a + b` is an 8-bit adder although C adds as `int`.
    Chains such as `a+b+c+d` are rebalanced into trees.
 3. **Scheduling** (`src/mhls.cpp`): each block is cut into clock cycles.

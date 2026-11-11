@@ -1484,6 +1484,46 @@ inline std::vector<bool> deadCode(Function& f) {
   std::vector<bool> exitLive(nv, false);
   for (size_t v = 0; v < nv; v++)
     exitLive[v] = f.vars[v].isStatic || f.vars[v].port == Var::Ref || f.vars[v].port == Var::Ret;
+  // A variable matters when it reaches an output, a memory write or a
+  // branch, directly or through other variables that matter. One that only
+  // feeds itself (a counter nobody looks at) goes, with its register.
+  {
+    std::vector<bool> need = exitLive;
+    std::vector<int> stack;
+    std::vector<int> seen(f.ops.size(), -1);
+    int epoch = 0;
+    auto cone = [&](int root, bool& grew) {   // the variables read to compute root
+      if (root < 0) return;
+      epoch++;
+      stack.assign(1, root);
+      while (!stack.empty()) {
+        int x = stack.back();
+        stack.pop_back();
+        if (seen[x] == epoch) continue;
+        seen[x] = epoch;
+        const Op& o = f.ops[x];
+        if (o.k == OpK::ReadVar && !need[o.ref]) {
+          need[o.ref] = true;
+          grew = true;
+        }
+        for (int y : {o.a, o.b, o.c})
+          if (y >= 0) stack.push_back(y);
+      }
+    };
+    for (bool grew = true; grew;) {
+      grew = false;
+      for (auto& B : f.blocks) {
+        cone(B.term.cond, grew);
+        for (int id : B.ops)
+          if (f.ops[id].k == OpK::Store) cone(id, grew);
+        for (auto& [v, val] : B.writes)
+          if (need[v]) cone(val, grew);
+      }
+    }
+    for (auto& B : f.blocks)
+      B.writes.erase(std::remove_if(B.writes.begin(), B.writes.end(), [&](auto& w) { return !need[w.first]; }),
+                     B.writes.end());
+  }
   std::vector<std::vector<bool>> in(nb, std::vector<bool>(nv, false));
   for (;;) {
     // Mark operators reachable from the roots of each block.

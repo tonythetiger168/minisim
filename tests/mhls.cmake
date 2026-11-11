@@ -77,6 +77,7 @@ design(looppipe mix)                             # pipelined inner loop, entered
 design(looppipe2 hist)                           # one iteration every 2 cycles: a memory updated in place
 design(looppipe2 walk)                           # pointer chase
 design(looppipe2 copyz -clock 2.5)               # the loop ends on a value read from memory
+design(faint faint)                              # variables that only feed themselves are removed
 design(fir fir -pipeline-loops -clock 3)         # best effort: loops that cannot be pipelined stay as they are
 design(matmul matmul -pipeline-loops -clock 3)
 design(sqrt hist -pipeline-loops)
