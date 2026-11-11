@@ -65,12 +65,17 @@ A netlist read together with its whole cell library has many unused modules;
    computes (asynchronous set/reset included, as written), and its trigger is
    the clock and async controls. A bit that a level-sensitive block does not
    assign on every path is a latch; that is decided by proof, so a full `case`
-   without a `default` is plain logic.
+   without a `default` is plain logic. An event that leaves a register
+   unchanged while it is active is left out of that register's trigger, so a
+   memory written in a block with an asynchronous reset that does not reset
+   it equals the plain clocked flops synthesis builds for it.
 3. **Matching.** Inputs, outputs and state elements are paired by name: exact,
    then normalized (`u_core.cnt[3]`, `u_core_cnt_reg_3_` and
    `\u_core/cnt_reg[3]` are one name), then by the cell instance that holds
    the state, then by the net on the flop's output pin, which also finds
-   registers that synthesis stored inverted. `-match REF=IMPL` and
+   registers that synthesis stored inverted. A struct or memory that
+   synthesis flattened is matched by bit position in the whole variable
+   (`item.valid` of a 12-bit struct is `item_reg_11_`). `-match REF=IMPL` and
    `-matchfile` add pairs by hand.
 4. **Proof.** Each matched pair of state elements is cut, which leaves a
    combinational question per compare point: every output, every next-state
@@ -150,6 +155,25 @@ netlist with yet another architecture (Booth recoding) can still exhaust
 `-effort` and report those outputs as aborted, which is inconclusive, never a
 pass.
 
+## Against Yosys and ABC
+
+Measured on 4 cores with Yosys 0.33 (`equiv_make; equiv_simple; equiv_induct`)
+and its bundled ABC (`cec` on both sides bit-blasted to AND gates), 300 s
+limit. The netlists are `msynth` output on its generic library, except the
+datapath, which Yosys synthesized itself.
+
+| Design | Yosys equiv | ABC cec | mequiv |
+|---|---|---|---|
+| 8x8 multiplier and adder | 24 s | 19 s | 0.2 s |
+| 16x16 multiplier and adder | over 300 s | over 300 s | 2.0 s |
+| 32x32 multiplier and adder | not run | not run | 28 s |
+| datapath (dividers, 8-bit multiplier, flops) | 0.8 s | combinational only | 0.2 s |
+
+The multiplier rows are where the lead comes from: mequiv knows the
+architectures a synthesis tool emits (see Datapaths above), the other two
+treat the product as plain logic. On control logic all three finish in well
+under a second.
+
 ## Not yet
 
 - Sequential UDPs and Liberty `statetable` cells.
@@ -159,7 +183,8 @@ pass.
 ## The pieces
 
 `src/equiv/` is header-only and usable as a library (namespace `equiv`):
-`aig.hpp` (the graph), `bv.hpp` (bit vectors with X), `sat.hpp` and `cnf.hpp`
-(the solver and the encoding), `elab.hpp` (a slang compilation to a `Design`),
+`aig.hpp` (mequiv's names on the shared graph in `src/aig.hpp`), `bv.hpp` (bit vectors with X), `cnf.hpp`
+(the encoding), `elab.hpp` (a slang compilation to a `Design`),
 `check.hpp` (`equiv::check(aig, ref, impl, options)` returns every compare
-point with its status and counterexample).
+point with its status and counterexample). The SAT solver is CaDiCaL behind
+`src/sat.hpp`, the interface the other minisim tools share.

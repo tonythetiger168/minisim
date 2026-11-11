@@ -203,9 +203,9 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
         Lit late = nx > ny ? x : y, early = nx > ny ? y : x;
         if (!g.isAnd(nodeOf(late)) || rep[nodeOf(late)] != kNoLit) continue;
         rep[nodeOf(late)] = early ^ (late & 1u);
-        Sat::L a = cnf.lit(x), b = cnf.lit(y);
-        cnf.sat.addClause(Sat::no(a), b);
-        cnf.sat.addClause(a, Sat::no(b));
+        int a = cnf.lit(x), b = cnf.lit(y);
+        cnf.sat.addClause({-a, b});
+        cnf.sat.addClause({a, -b});
     }
     for (uint32_t n : cone) {
         if (rep[n] != kNoLit) continue;  // settled by a lemma
@@ -219,19 +219,19 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
             if (!same(n, r, inv)) continue;
             ++tries;
             // Is n != r possible?
-            Sat::L a = cnf.lit(Lit(n << 1)), b = cnf.lit(Lit(r << 1) ^ (inv ? 1u : 0u));
-            uint32_t t = cnf.sat.newVar();
-            cnf.sat.addClause(Sat::mk(t, true), a, b);
-            cnf.sat.addClause(Sat::mk(t, true), Sat::no(a), Sat::no(b));
-            Sat::Result res = cnf.sat.solve({Sat::mk(t)}, effort);
-            if (res == Sat::Unsat) {
-                cnf.sat.addClause(Sat::mk(t, true));
-                cnf.sat.addClause(Sat::no(a), b);
-                cnf.sat.addClause(a, Sat::no(b));
+            int a = cnf.lit(Lit(n << 1)), b = cnf.lit(Lit(r << 1) ^ (inv ? 1u : 0u));
+            int t = cnf.sat.newVar();
+            cnf.sat.addClause({-t, a, b});
+            cnf.sat.addClause({-t, -a, -b});
+            sat::Result res = cnf.sat.solve({t}, int64_t(effort));
+            if (res == sat::Unsat) {
+                cnf.sat.addClause({-t});
+                cnf.sat.addClause({-a, b});
+                cnf.sat.addClause({a, -b});
                 rep[n] = Lit(r << 1) ^ (inv ? 1u : 0u);
                 ++merged;
                 done = true;
-            } else if (res == Sat::SatResult) {
+            } else if (res == sat::Sat) {
                 // A pattern that tells them apart, and 63 neighbours of it.
                 if (sig.size() < maxWords) {
                     sig.emplace_back(N, 0);
@@ -244,9 +244,9 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
                     }
                     simWord(w);
                 }
-                cnf.sat.addClause(Sat::mk(t, true));
+                cnf.sat.addClause({-t});
             } else {
-                cnf.sat.addClause(Sat::mk(t, true));
+                cnf.sat.addClause({-t});
             }
         }
         if (!done) bucket.push_back(n);
@@ -310,16 +310,26 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
     for (int pass = 0; pass < 2; ++pass) {
         std::vector<char> refUsed(ref.states.size(), 0);
         for (int r : stMap) if (r >= 0) refUsed[r] = 1;
-        auto keysOf = [](const State& s, bool inv) {
+        // A cell that holds one state is also known by its instance name.
+        auto instCount = [](const std::vector<State>& v) {
+            std::unordered_map<std::string, int> n;
+            for (auto& s : v) ++n[s.inst];
+            return n;
+        };
+        auto refInst = instCount(ref.states), implInst = instCount(impl.states);
+        auto keysOf = [](const State& s, bool inv, std::unordered_map<std::string, int>& perInst) {
             std::vector<std::string> k;
-            if (!inv) k.push_back(normalize(s.name));
+            if (!inv) {
+                k.push_back(normalize(s.name));
+                if (!s.inst.empty() && perInst[s.inst] == 1) k.push_back(normalize(s.inst));
+            }
             for (auto& a : inv ? s.invAliases : s.aliases) k.push_back(normalize(a));
             return k;
         };
         std::unordered_map<std::string, int> table;
         for (size_t r = 0; r < ref.states.size(); ++r) {
             if (refUsed[r]) continue;
-            for (auto& k : keysOf(ref.states[r], false)) {
+            for (auto& k : keysOf(ref.states[r], false, refInst)) {
                 auto [it, fresh] = table.try_emplace(k, int(r));
                 if (!fresh && it->second != int(r)) it->second = -1;
             }
@@ -329,7 +339,7 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         for (size_t i = 0; i < impl.states.size(); ++i) {
             if (stMap[i] >= 0) continue;
             int found = -1;
-            for (auto& k : keysOf(impl.states[i], pass == 1)) {
+            for (auto& k : keysOf(impl.states[i], pass == 1, implInst)) {
                 auto it = table.find(k);
                 if (it == table.end() || it->second < 0) continue;
                 if (found >= 0 && found != it->second) { found = -2; break; }
@@ -471,7 +481,7 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         sim[0] = 0;
         for (uint32_t n = 1; n < N; ++n) {
             Aig::Node nd = g.node(n);
-            if (nd.a == kNoLit) {
+            if (!g.isAnd(n)) {
                 // Round 0 and 1 are all-zeros and all-ones in pattern 0, random after.
                 uint64_t r = detail::mix(uint64_t(n) * 0x100000001b3ULL + round);
                 if (round == 0) r &= ~1ull;

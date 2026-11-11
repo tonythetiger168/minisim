@@ -25,8 +25,8 @@
 // plan is built from.
 #include <functional>
 
-#include "dft_mbist.hpp"
-#include "dft_scan.hpp"
+#include "dft/mbist.hpp"
+#include "dft/scan.hpp"
 #include "lintir.hpp"
 #include "version.hpp"
 

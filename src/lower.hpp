@@ -57,6 +57,7 @@
 #include "tchk.hpp"
 #include "specify.hpp"
 #include "sdf.hpp"
+#include "fsm_extract.hpp"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
@@ -2802,6 +2803,103 @@ struct Lowerer {
         if (t.isString()) return exprStr(x);
         return expr(x, ctx);
     }
+    // ---------- condition coverage (msim -cov) ----------
+    // On while a procedure, a continuous assignment or a subroutine body is
+    // lowered; off inside constraints, assertions and covergroups, whose
+    // expressions other passes take apart.
+    bool condCov = false;
+    int condCovOff = 0;
+    struct NoCondCov { int& n; explicit NoCondCov(int& x) : n(x) { n++; } ~NoCondCov() { n--; } };
+    // Evaluating e reads signals and nothing else: no call, no handle that
+    // may be null, no container. Every term of a covered condition is
+    // evaluated, also the ones && and || would skip.
+    static bool condPure(const E& e) {
+        if (!e || e->at) return false;
+        switch (e->op) {
+            case Op::Const: case Op::Ref: case Op::Not: case Op::And: case Op::Or: case Op::Xor: case Op::Add: case Op::Sub:
+            case Op::Mul: case Op::Div: case Op::Mod: case Op::Eq: case Op::Ne: case Op::CaseEq: case Op::CaseZEq:
+            case Op::CaseXEq: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Shl: case Op::Shr: case Op::Asr:
+            case Op::Resize: case Op::LogNot: case Op::LogAnd: case Op::LogOr: case Op::RedAnd: case Op::RedOr:
+            case Op::RedXor: case Op::Slice: case Op::Index: case Op::Concat: case Op::Mux: case Op::WildEq:
+            case Op::CondCov: case Op::ArrRead:
+                break;
+            default: return false;
+        }
+        for (auto& k : e->kids) if (!condPure(k)) return false;
+        return true;
+    }
+    static std::string condText(const slang::ast::Expression& x) {
+        if (!x.syntax) return "?";
+        std::string t = x.syntax->toString(), r;
+        bool sp = false;
+        for (char c : t) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { sp = !r.empty(); continue; }
+            if (sp) r += ' ';
+            sp = false;
+            r += c;
+        }
+        return r;
+    }
+    // e is a && b, a || b, or the condition of ?: . The covered form of it,
+    // or null when it is not covered: coverage is off here, it is constant,
+    // or a term has a side effect or is not an integral value.
+    E condCovExpr(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        if (!g_cov || !condCov || condCovOff > 0 || !covSM()) return nullptr;
+        const Expression& top = peel(e);
+        bool andOp = top.kind == ExpressionKind::BinaryOp && top.as<BinaryExpression>().op == BinaryOperator::LogicalAnd;
+        bool orOp = top.kind == ExpressionKind::BinaryOp && top.as<BinaryExpression>().op == BinaryOperator::LogicalOr;
+        if (&top != &e && (andOp || orOp)) return nullptr;   // c of c ? a : b is itself a && b: covered as that
+        if (e.getConstant()) return nullptr;
+        std::vector<const Expression*> terms;
+        // (a && f()) && b: the inner && is lowered as jumps (lazyExpr), so it stays one term
+        auto flat = [&](auto&& self, const Expression& x) -> void {
+            if (x.kind == ExpressionKind::BinaryOp && (andOp || orOp) &&
+                x.as<BinaryExpression>().op == (andOp ? BinaryOperator::LogicalAnd : BinaryOperator::LogicalOr) &&
+                !sideEffects(x.as<BinaryExpression>().right())) {
+                self(self, x.as<BinaryExpression>().left());
+                self(self, x.as<BinaryExpression>().right());
+            } else terms.push_back(&x);
+        };
+        flat(flat, top);
+        if (terms.size() > 64) return nullptr;
+        for (const Expression* t : terms)
+            if (!t->type->isIntegral() || isHandleType(*t->type) || t->getConstant()) return nullptr;
+        std::vector<E> kids;
+        bool pure = true;
+        for (const Expression* t : terms) {
+            kids.push_back(expr(*t));
+            pure = pure && condPure(kids.back());
+        }
+        // A term that is not safe to evaluate when && or || would skip it:
+        // the terms in order, and the vectors of condCovLazyEnd.
+        bool lazy = !pure && terms.size() > 1;
+        std::vector<std::string> texts;
+        for (const Expression* t : terms) texts.push_back(condText(*t));
+        auto n = node(Op::CondCov, std::move(kids));
+        n->hi = (int)condDef(e, orOp, lazy, std::move(texts));
+        n->lo = (orOp ? 1 : 0) | (lazy ? 2 : 0);
+        return n;
+    }
+    // Registers a condition; returns the index of its first counter.
+    size_t condDef(const slang::ast::Expression& e, bool orOp, bool lazy, std::vector<std::string> terms) {
+        CondDef d;
+        auto loc = e.sourceRange.start();
+        if (loc.valid()) {
+            auto ol = covSM()->getFullyOriginalLoc(loc);
+            d.file = covFileId(std::string(covSM()->getFullPath(ol.buffer()).string()));
+            d.line = (uint32_t)covSM()->getLineNumber(ol);
+            d.col = (uint32_t)covSM()->getColumnNumber(ol);
+        }
+        d.isOr = orOp;
+        d.lazy = lazy;
+        d.text = condText(e);
+        d.terms = std::move(terms);
+        d.base = g_condHits.size();
+        g_condHits.resize(d.base + d.terms.size() + 1, 0);
+        condDefs().push_back(std::move(d));
+        return condDefs().back().base;
+    }
     E lazyExpr(const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
         if (e.kind == ExpressionKind::ConditionalOp) {
@@ -2812,7 +2910,8 @@ struct Lowerer {
             needWidth(w);
             bool sg = ctx.live ? ctx.tag : e.type->isSigned();
             int tmp = fresh(w);
-            Instr j; j.k = IK::JmpIfNot; j.e = expr(*c.conditions[0].expr);
+            Instr j; j.k = IK::JmpIfNot; j.e = condCovExpr(*c.conditions[0].expr);
+            if (!j.e) j.e = expr(*c.conditions[0].expr);
             size_t jf = prog.emit(j);
             Instr a; a.k = IK::Assign; a.sig = tmp; a.e = lowerAs(c.left(), *e.type, ctx); prog.emit(a);
             size_t je = emitJmp();
@@ -2831,11 +2930,27 @@ struct Lowerer {
             };
             int tmp = fresh(1);
             Instr l; l.k = IK::Assign; l.sig = tmp; l.e = truthE(b.left()); prog.emit(l);
+            // Condition coverage: the left term is kept, and after the right
+            // one ran (or was skipped) the pair is counted as a lazy
+            // condition of (left, result), which has the same vectors.
+            bool cover = g_cov && condCov && condCovOff == 0 && covSM() && b.left().type->isIntegral() &&
+                         b.right().type->isIntegral() && !isHandleType(*b.left().type) && !isHandleType(*b.right().type);
+            int left = -1;
+            if (cover) {
+                left = fresh(1);
+                Instr s; s.k = IK::Assign; s.sig = left; s.e = ref(tmp); prog.emit(s);
+            }
             Instr j; j.k = IK::JmpIfNot; j.e = andOp ? ref(tmp) : un(Op::LogNot, ref(tmp));
             size_t jf = prog.emit(j);
             Instr r; r.k = IK::Assign; r.sig = tmp; r.e = bin(andOp ? Op::LogAnd : Op::LogOr, ref(tmp), truthE(b.right()));
             prog.emit(r);
             prog.code[jf].target = prog.here();
+            if (cover) {
+                auto n = node(Op::CondCov, {ref(left), ref(tmp)});
+                n->hi = (int)condDef(e, orOp, true, {condText(b.left()), condText(b.right())});
+                n->lo = (orOp ? 1 : 0) | 2;
+                Instr c; c.k = IK::Assign; c.sig = tmp; c.e = n; prog.emit(c);
+            }
             return sized(ref(tmp), 1, false, ctx);
         }
         return nullptr;
@@ -4377,6 +4492,8 @@ struct Lowerer {
                     }
                     return sized(out, 1, false, ctx);
                 }
+                if (b.op == BinaryOperator::LogicalAnd || b.op == BinaryOperator::LogicalOr)
+                    if (E cc = condCovExpr(e)) return sized(cc, 1, false, ctx);
                 bool sizeBoth = widthPropagates(b.op) || isDivMod(b.op);
                 // a ** b sizes like a shift: the result is a's width, b is
                 // self-determined (11.6.1).
@@ -4461,7 +4578,9 @@ struct Lowerer {
                 needWidth(w);
                 bool sg = e.type->isSigned();
                 ExprCtx arm{w, sg, sg, true};
-                return mux(expr(*c.conditions[0].expr), expr(c.left(), arm), expr(c.right(), arm));
+                E cond = condCovExpr(*c.conditions[0].expr);
+                if (!cond) cond = expr(*c.conditions[0].expr);
+                return mux(cond, expr(c.left(), arm), expr(c.right(), arm));
             }
             case ExpressionKind::Concatenation: {
                 std::vector<E> parts;
@@ -5602,6 +5721,7 @@ struct Lowerer {
     std::vector<std::shared_ptr<Prog>> consFns;   // function calls lowered in the current constraint (18.5.12)
     std::vector<std::pair<int, E>> consRefs;      // m[i] containers named in the current constraint
     void constraintItems(const slang::ast::Constraint& c, E guard, std::vector<RandItem>& items, BeforeList& before) {
+        NoCondCov off(condCovOff);
         consDepth++;
         struct Out { int& d; ~Out() { d--; } } out{consDepth};
         size_t f0 = consFns.size(), i0 = items.size(), r0 = consRefs.size();
@@ -7605,8 +7725,11 @@ struct Lowerer {
                 xpGuard([&] { immAssert(s.as<ImmediateAssertionStatement>()); });
                 break;
             case StatementKind::ConcurrentAssertion:
+{
+                NoCondCov off(condCovOff);
                 concAssert(s.as<ConcurrentAssertionStatement>());
                 break;
+            }
             case StatementKind::DisableFork: { Instr i; i.k = IK::DisableFork; prog.emit(i); break; }
             default:
                 throw std::runtime_error("lower: unsupported statement kind " + std::string(toString(s.kind)));
@@ -8607,6 +8730,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         Lowerer::lastLoc() = ca.location;
         Lowerer lw(sigmap);
         prep(lw);
+        lw.condCov = true;
         auto [ds0, ds1] = ca.getDriveStrength();
         if (a.left().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
             // assign arr = other_arr / '{...}: one assign per element (10.3, 7.6)
@@ -9301,6 +9425,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         // a process would run it at time 0 and, looping, forever.
         Lowerer lw(sigmap);
         prep(lw);
+        lw.condCov = true;
         lw.setScope(p.getParentScope());
         if (p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final)
             if (const auto* t = leadingEvent(p.getBody())) {
@@ -9340,6 +9465,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                              p.procedureKind == ProceduralBlockKind::Initial ? program : -1, checkerDepth > 0});
     }
 };
+
 
 // @* lowered inside a subroutine is a WaitEdge with no events yet. Patch it
 // after every callee body is installed, so the wait sees those reads too.
@@ -9767,6 +9893,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     dynPendingAt().clear();
     blockIds() = BlockIds{};
     Lowerer::covSM() = comp.getSourceManager();   // statement locations, for coverage and run-time messages
+    condDefs().clear();
+    g_condHits.clear();
+    fsmDefs().clear();
     {   // alias statements (10.11), before any signal is made
         aliasOf().clear();
         interconnectW().clear();
@@ -10063,6 +10192,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         lw.bind(&subMap, mkSig, &tempSeq, &out.subs);
         lw.setScope(sub->sym);
         lw.retSig = sub->retSig;
+        lw.condCov = true;
         if (sub->lay) { lw.frames = {sub->lay}; lw.retSig = sub->retSig >= 0 ? relSig(0, sub->retSig) : -1; }
         if (isClassMethod(*sub->sym)) lw.curClass = classInfo(sub->sym->getParentScope()->asSymbol().as<slang::ast::ClassType>());
         lw.current = sub;
@@ -10294,6 +10424,28 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (!blockIds().roots.count(blockIds().of(b)))
             Lowerer::unsupported(("disable of block '" + std::string(b->name) +
                                   "' from outside it, unless it is a whole initial or fork branch").c_str());
+    if (g_cov) {   // FSM coverage: the state registers and their transitions
+        const slang::SourceManager* sm = comp.getSourceManager();
+        for (ExtractedFsm& x : extractFsms(comp.getRoot())) {
+            auto sit = sigmap.find(x.var);
+            if (sit == sigmap.end()) continue;
+            FsmDef d;
+            d.module = std::move(x.module);
+            d.inst = std::move(x.inst);
+            d.name = std::move(x.name);
+            if (sm && x.var->location.valid()) {
+                auto ol = sm->getFullyOriginalLoc(x.var->location);
+                d.file = covFileId(std::string(sm->getFullPath(ol.buffer()).string()));
+                d.line = (uint32_t)sm->getLineNumber(ol);
+            }
+            d.sig = sit->second;
+            d.w = x.w;
+            d.onehot = x.onehot;
+            d.states = std::move(x.states);
+            for (auto& t : x.trans) d.trans.push_back({t.from, t.to, t.reset});
+            fsmDefs().push_back(std::move(d));
+        }
+    }
     out.sigOf = sigmap;
     return out;
 }
