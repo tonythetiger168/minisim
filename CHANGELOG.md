@@ -190,6 +190,10 @@ Spec references are IEEE 1800-2023 clauses.
   constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
   ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
   See `docs/SYNTH.md`.
+- `msynth`: a register's hold condition is gathered out of its if/case
+  tree into one enable, and the held leaves leave the data logic
+  (`set msynth_hold_enables false` skips it). PicoRV32 on mini45: 18096 to
+  17534, with high effort 17577 to 17166.
 - `msynth` high effort (`compile -map_effort high`, `compile_ultra`):
   the logic is restructured by ABC, run as a separate program (`abc`,
   `berkeley-abc` or `yosys-abc` on `PATH`, or `$MSYNTH_ABC`), and the

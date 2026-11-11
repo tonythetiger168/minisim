@@ -61,7 +61,7 @@ if(Python3_FOUND)
   # with one gate swapped must be reported as different. On the default
   # library and on the inverter/NAND/flop one.
   if(TARGET mequiv)
-    foreach(t counter alu fsm hier mem sweep)
+    foreach(t counter alu fsm hier mem sweep hold)
       add_test(NAME msynth_equiv_${t}
                COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/synth/equiv_test.py
                        $<TARGET_FILE:msynth> $<TARGET_FILE:mequiv> ${CMAKE_SOURCE_DIR}/tests/synth

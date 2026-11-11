@@ -46,6 +46,15 @@ write_sdc core.sdc
    asynchronous reset value, and registers without reset whose next state
    is a constant or only themselves, are then removed
    (`Information: removed N unloaded or constant register bits`).
+   A register's hold condition is then gathered out of its next-state
+   logic (`aig::holdEnables`): `if (a) r <= x; else if (b) r <= y;` is a
+   select chain with the register's own value at the bottom, and becomes
+   one enable `a | b` in front of `a ? x : y`, also behind a synchronous
+   reset and through `case` items that assign nothing
+   (`Information: gathered the hold conditions of N register bits into
+   enables`; `set msynth_hold_enables false` skips it). Only registers
+   without an asynchronous reset are rewritten, the ones the mapper has
+   enable flops for.
    Last, functional reduction (`src/synth/fraig.hpp`): nodes are simulated
    with random patterns, nodes with the same signature are candidates, and
    the shared SAT solver proves or refutes each pair; a proven node is
@@ -181,9 +190,9 @@ same RTL and the same library (mini45, typical corner), one machine:
 
 | design | msynth area | Yosys area | msynth time | Yosys time |
 |---|---|---|---|---|
-| PicoRV32 (default parameters) | 18096 | 15458 | 0.8 s | 5.4 s |
-| PicoRV32, `compile -map_effort high` (ABC) | 17577 | 15458 | 1.3 s | 5.4 s |
-| tests/synth/mem.sv (three small memories) | 2149 | 2297 | 0.03 s | 0.4 s |
+| PicoRV32 (default parameters) | 17534 | 15458 | 0.8 s | 5.4 s |
+| PicoRV32, `compile -map_effort high` (ABC) | 17166 | 15458 | 1.2 s | 5.4 s |
+| tests/synth/mem.sv (three small memories) | 2131 | 2297 | 0.03 s | 0.4 s |
 | tests/synth/counter.sv | 92 | 85 | 0.03 s | 0.2 s |
 
 Most of msynth's time on PicoRV32 is functional reduction (0.7 s); without
@@ -199,6 +208,12 @@ msynth, gain 3 to 4%; ABC's own mappers (`map`, `amap`, `&nf` with `dch`)
 on the same graph give more area than msynth's. Yosys's netlist before
 ABC, read by msynth, maps to 16817. So about half of the gap is in how the
 RTL is turned into logic, and half is ABC's optimization on Yosys's side.
+
+Running Yosys's RTL passes one at a time in front of msynth shows where
+the first half is: `opt_dff`, which finds each register's enable and
+synchronous reset in its select tree, is worth 6% on its own. Gathering
+hold conditions (above) took 3% of that (18096 to 17534); the rest of
+what the pass finds, and `share`/`wreduce` (under 1%), are still open.
 
 ## Tests
 

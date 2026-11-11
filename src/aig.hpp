@@ -697,6 +697,94 @@ inline Design sweep(Design d, size_t* removed = nullptr) {
     return d;
 }
 
+// Pull each register's hold condition out of its next-state logic. An
+// if/case tree leaves d = c1 ? a : (c2 ? b : q), with q somewhere under the
+// selects; this rewrites it as d = en ? data : q with en = c1 | c2 and
+// data = c1 ? a : b, the tree with its q leaves dropped. flopEnable() then
+// sees the enable, and the data logic is a select smaller per held leaf. A
+// synchronous reset in front (d = !rst & tree) is looked through. Only
+// selects that feed nothing else are opened, so no logic is duplicated.
+// `changed` counts the registers rewritten. Run it on a cleaned-up design.
+// With asyncToo false, registers with an asynchronous reset are left alone
+// (for a target whose enable flops have none, the rewrite gains nothing).
+inline Design holdEnables(Design d, size_t* changed = nullptr, bool asyncToo = true) {
+    Graph& g = d.g;
+    std::vector<uint32_t> fanout(g.size(), 0);
+    for (uint32_t n = 1; n < g.size(); n++)
+        if (g.nodes[n].k == NK::And) {
+            fanout[lnode(g.nodes[n].a)]++;
+            fanout[lnode(g.nodes[n].b)]++;
+        }
+    for (auto& f : g.flops) {
+        fanout[lnode(f.d)]++;
+        fanout[lnode(f.clk)]++;
+        if (f.arst != NOLIT) fanout[lnode(f.arst)]++;
+    }
+    for (auto& p : d.ports)
+        if (p.out)
+            for (Lit b : p.bits) fanout[lnode(b)]++;
+    for (auto& m : d.mems)
+        for (int rd = 0; rd < 2; rd++)
+            for (auto& mp : rd ? m.rd : m.wr) {
+                for (Lit b : mp.addr) fanout[lnode(b)]++;
+                for (Lit b : mp.data) fanout[lnode(b)]++;
+                fanout[lnode(mp.en)]++;
+            }
+    const uint32_t oldSize = g.size();
+    size_t count = 0;
+    struct R {
+        Lit data, hold;
+    };
+    for (size_t fi = 0; fi < g.flops.size(); fi++) {
+        const Lit q = g.flops[fi].q;
+        // l as (data, hold): l == hold ? q : data
+        std::function<R(Lit, int)> rec = [&](Lit l, int depth) -> R {
+            if (l == q) return {L0, L1};
+            uint32_t n = lnode(l);
+            if (n == 0 || n >= oldSize || g.nodes[n].k != NK::And || depth > 48) return {l, L0};
+            if (depth > 0 && fanout[n] != 1) return {l, L0};
+            auto arms = [&](Lit s, Lit t, Lit e, R& out) {
+                R rt = rec(t, depth + 1), re = rec(e, depth + 1);
+                if (rt.hold == L0 && re.hold == L0) return false;
+                out.hold = g.mux(s, rt.hold, re.hold);
+                out.data = rt.hold == L1 ? re.data : re.hold == L1 ? rt.data : g.mux(s, rt.data, re.data);
+                return true;
+            };
+            R out;
+            Lit s, t, e;
+            if (g.asMux(l, s, t, e)) {
+                if (arms(s, t, e, out)) return out;
+                return {l, L0};
+            }
+            // a & b is a ? b : 0; !(a & b) is a ? !b : 1
+            Lit a = g.nodes[n].a, b = g.nodes[n].b;
+            Lit other = lisneg(l) ? L1 : L0;
+            if (arms(a, lxorc(b, lisneg(l)), other, out)) return out;
+            if (arms(b, lxorc(a, lisneg(l)), other, out)) return out;
+            return {l, L0};
+        };
+        Lit en0, data0;
+        Flop f0 = g.flops[fi];
+        if (!asyncToo && f0.arst != NOLIT) continue;
+        if (flopEnable(g, f0, en0, data0)) {
+            // already d = en ? data : q; open data for more held leaves
+            R r = rec(data0, 1);
+            if (r.hold == L0 || r.hold == L1) continue;
+            Lit en = g.andl(en0, lneg(r.hold));
+            g.flops[fi].d = g.muxRaw(en, r.data, q);
+            count++;
+            continue;
+        }
+        R r = rec(f0.d, 0);
+        if (r.hold == L0) continue;
+        g.flops[fi].d = r.hold == L1 ? q : g.muxRaw(lneg(r.hold), r.data, q);
+        count++;
+    }
+    if (changed) *changed = count;
+    if (!count) return d;
+    return cleanup(d);
+}
+
 // ---- cone copies (used by the equivalence checker)
 //
 // rebuild: copy the cone of `root` with some nodes replaced. memo[n] is the
