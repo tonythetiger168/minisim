@@ -82,7 +82,8 @@ if os.path.exists(one) and os.path.exists(many):
         for (tn, a), (_, b) in zip(new[n], old[n]):
             for x, y in zip(a, b):
                 # 2% or 1 ps: compilers and math libraries round differently
-                if abs(x - y) > max(0.02 * abs(y), 0.001):
+                # energies are differences of larger numbers: 0.02 fJ
+                if abs(x - y) > max(0.02 * abs(y), 0.02 if tn.endswith("_power") else 0.001):
                     errors.append("%s %s: %.5f, the tree has %.5f (run lib/mini45/characterize.sh?)" % (n, tn, x, y))
                     break
     # 3. shape: 7x7 delay tables rise along both axes

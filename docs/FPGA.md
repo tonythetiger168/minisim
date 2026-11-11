@@ -35,6 +35,7 @@ cuts and an exact-area pass so it scales to large designs.
 | `-threads N` | worker threads. Default: every logical core. The output does not depend on N |
 | `-nocarry` | adders, subtractors and comparators as LUTs, not carry chains |
 | `-noram` | memories as flops, not block RAM |
+| `-nolutram` | small memories as flops, not LUT RAM |
 | `-nodsp` | multipliers as LUTs, not DSP blocks |
 | `-dsp` | `ice40`: multipliers onto `SB_MAC16`. Off by default: only UltraPlus parts (UP5K) have them |
 | `-dsp-min N` | fewest operand bits, both operands together, worth a DSP block (default 10) |
@@ -48,8 +49,8 @@ cuts and an exact-area pass so it scales to large designs.
 |---|---|---|---|
 | `generic` | `$lut` (`WIDTH`, `LUT`) | `$_DFF_P_`, `$_DFF_PP0_`, `$_DFFE_PP_`, `$_DFFE_PP0P_`, `$_SDFF_PP0_`, `$_SDFFE_PP0P_`, ... (Yosys gate cells); power-up value as the net's `init` attribute | no carry cells |
 | `ice40` | `SB_LUT4` | `SB_DFF` with `E` (enable), `R`/`S` (asynchronous) or `SR`/`SS` (synchronous) reset, and the `SB_DFFN*` falling-edge ones | `SB_CARRY`, one per bit, beside the `SB_LUT4` of the sum; `SB_MAC16` with `-dsp`; `SB_RAM40_4K` (and `NR`, `NW`, `NRNW`) |
-| `ecp5` | `LUT4` | `TRELLIS_FF` (`REGSET`, `SRMODE=ASYNC` or `LSR_OVER_CE`, `CEMUX=CE` with an enable, `CLKMUX=INV` for the falling edge) | `CCU2C`, two bits each; `MULT18X18D`; `DP16KD` |
-| `xc7` | `LUT1` to `LUT6` | `FDRE`, `FDSE`, `FDCE`, `FDPE` with `CE` (`INIT`, `IS_C_INVERTED`) | `CARRY4`, four bits each; `DSP48E1`; `IBUF` and `OBUF` on every port |
+| `ecp5` | `LUT4` | `TRELLIS_FF` (`REGSET`, `SRMODE=ASYNC` or `LSR_OVER_CE`, `CEMUX=CE` with an enable, `CLKMUX=INV` for the falling edge) | `CCU2C`, two bits each; `MULT18X18D`; `DP16KD`; `TRELLIS_DPR16X4` |
+| `xc7` | `LUT1` to `LUT6` | `FDRE`, `FDSE`, `FDCE`, `FDPE` with `CE` (`INIT`, `IS_C_INVERTED`) | `CARRY4`, four bits each; `DSP48E1`; `RAMB18E1`; `RAM32X1D`, `RAM64X1D`; `IBUF` and `OBUF` on every port |
 
 Inverters cost nothing: they are folded into LUT tables. An iCE40 flop always
 powers up 0, so a flop that must power up 1 is mapped inverted (D, Q and reset
@@ -135,7 +136,21 @@ with or without a read enable; any number of read ports, one RAM per port):
 the read register becomes the RAM's output register and the memory's flops
 are removed. The words go side by side over as many blocks as the width
 needs, in the widest configuration that is deep enough: `SB_RAM40_4K` from
-256 x 16 to 2048 x 2, `DP16KD` from 1024 x 18 to 16384 x 1.
+256 x 16 to 2048 x 2, `DP16KD` and `RAMB18E1` from 1024 x 18 to 16384 x 1
+(`RAMB18E1` in true dual-port mode: port A reads, port B writes, and bits 16
+and 17 of an 18 bit word, or bit 8 of a 9 bit word, use the parity bits).
+
+### LUT RAM
+
+A memory that does not go to a block (a read without a register, or fewer
+than 512 bits) and is shallow enough becomes LUT RAM: `RAM32X1D` or
+`RAM64X1D` per bit on `xc7` (up to 64 words), `TRELLIS_DPR16X4` per four bits
+on `ecp5` (up to 16 words). The write is clocked and the read is not, exactly
+as in the RTL, so there is no bypass; any number of read ports, one set of
+cells per port. At least 16 bits, one whole-word write port. `-nolutram`
+keeps flops. iCE40 has no LUT RAM. The 16 x 8 register file with two read
+ports, 64 x 5 table and 16 x 8 memory of `tests/fpga/lram.sv` take 40 LUTs,
+8 flops and 29 RAM cells on `xc7`, against 698 LUTs and 584 flops as flops.
 
 In RTL a read in the cycle its word is written returns the old word; in the
 blocks that read is not defined. With one clock for both ports `mfpga`
@@ -189,13 +204,15 @@ CI installs Yosys and nextpnr.
   `tests/fpga/cells_ecp5_dsp.v`; `DSP48E1` is proven on Yosys' own model, and
   `SB_MAC16` was (by hand, with place and route on a UP5K), since the CI
   tests place iCE40 netlists on an HX8K, which has no DSPs.
-- Block RAM: iCE40 and ECP5 only; on `xc7` and `generic` a memory stays
-  flops (Yosys has no behaviour for `RAMB18E1` to check a mapping against).
-  Left as flops as well: a memory with more than one write port or byte
+- Block RAM: on `generic` a memory stays flops. `xc7` uses `RAMB18E1` only
+  (no `RAMB36E1`, no 36 bit simple dual-port mode); it is a black box in
+  Yosys 0.33, so it is checked on the model in `tests/fpga/cells_xc7.v` and
+  not on a vendor model or in Vivado. Left as flops as well: a memory with more than one write port or byte
   enables, one deeper than a single block, one smaller than 512 bits, one
   with a read that is not registered or whose read register has a reset, and
-  any memory when flop power-up values are known (AIGER input). No LUT RAM,
-  no initial contents, no use of the blocks' output registers. `DP16KD` is a
+  any memory when flop power-up values are known (AIGER input). LUT RAM is not
+  cascaded past one cell's depth, and the mapper counts its read as an input
+  (depth 0). No initial contents, no use of the blocks' output registers. `DP16KD` is a
   black box in Yosys 0.33: it is checked on the model in
   `tests/fpga/cells_ecp5_dsp.v` and by nextpnr accepting it, not on a vendor
   model. An address outside a memory whose depth is not a power of two (x in

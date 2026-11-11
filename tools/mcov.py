@@ -36,10 +36,43 @@ bins; a type's coverage weighs its items, and the total weighs the types
 assert / assume directives that passed at least once and never failed plus
 cover directives that were hit.
 
-Exit status: 0, or 1 when a -min-* threshold is not met, 2 on bad usage.
+Exclusions (as an URG exclusion file, -elfile): ``mcov report -elfile x.el``
+leaves the listed items out of every number and report. One exclusion per
+line, ``kind target -- reason``; # starts a comment; names take * and ?; a
+file name also matches as the end of a path:
+
+    file   rtl/dbg_*.sv                -- debug only, not in the product
+    line   rtl/ctrl.sv:40-44           -- unreachable: parameter ties it off
+    branch rtl/ctrl.sv:52
+    cond   rtl/ctrl.sv:60              -- every vector; "cond rtl/ctrl.sv:60 3" only the third row of -detail
+    toggle tb.dut.scan_*               -- or tb.dut.bus[31:24] for some bits
+    fsm    tb.dut.u.state
+    state  tb.dut.u.state FAIL
+    trans  tb.dut.u.state RUN->FAIL
+    cg     tb.dut.cg_dbg*
+    assert tb.dut.a_dbg*
+
+Review: ``mcov exclude all.json -o draft.el`` writes one exclusion per item
+that is not covered, each with the reason "TODO"; a reviewer keeps the ones
+that are justified and writes the reason. ``mcov report -elfile x.el
+-el-review`` lists every exclusion with what it removed and flags the ones
+that match nothing (stale), that remove items the tests did cover, or that
+have no reason; ``-el-strict`` makes any of those exit status 1.
+
+Tests: ``mcov rank run1.json run2.json ...`` takes one database per test and
+orders the tests so that each next one adds the most items not yet covered
+(lines, branch outcomes, toggle edges, condition vectors, FSM states and
+transitions, covergroup bins, assertions). It prints what each test covers,
+what only it covers, what it adds in that order and the running total; the
+tests that add nothing are redundant for coverage. ``-item file:line`` (or a
+signal, FSM, covergroup or assertion name) lists the tests that cover it.
+
+Exit status: 0, or 1 when a -min-* threshold is not met (or -el-strict finds
+an exclusion to review), 2 on bad usage.
 """
 
 import argparse
+import fnmatch
 import html
 import json
 import os
@@ -312,7 +345,7 @@ def cond_summary(db, exclude):
         if rx and rx.search(f):
             continue
         n += 1
-        tot += len(hits)
+        tot += sum(1 for h in hits if h >= 0)   # -1: excluded by -elfile
         hit += sum(1 for h in hits if h > 0)
     return hit, tot, n
 
@@ -356,7 +389,7 @@ def detail_text(db, exclude, reset_filter, uncovered_only):
     for (f, ln, col, text), (op, terms, hits) in sorted(db["conds"].items()):
         if rx and rx.search(f):
             continue
-        if uncovered_only and all(h > 0 for h in hits):
+        if uncovered_only and all(h != 0 for h in hits):
             continue
         out.append(f"\nCondition {f}:{ln}:{col}  {text}")
         for i, t in enumerate(terms, 1):
@@ -364,7 +397,7 @@ def detail_text(db, exclude, reset_filter, uncovered_only):
         out.append("    " + " ".join(f"-{i}-" for i in range(1, len(terms) + 1)) + "  Hits")
         for vals, h in cond_rows(op, terms, hits):
             out.append("    " + " ".join(f"{v:^{len(str(i)) + 2}}" for i, v in enumerate(vals, 1)) +
-                       f"  {h if h else 'Not covered'}")
+                       f"  {'Excluded' if h < 0 else h if h else 'Not covered'}")
     for (mod, inst, name), m in sorted(db["fsms"].items()):
         if rx and (rx.search(m["file"]) or rx.search(f"{inst}.{name}")):
             continue
@@ -504,7 +537,7 @@ def write_html(db, outdir, exclude, files=None, reset_filter=False):
     lh = sum(v[0] for v in per.values()); lt = sum(v[1] for v in per.values())
     bh = sum(v[2] for v in per.values()); bt = sum(v[3] for v in per.values())
     esc = html.escape
-    cell = lambda h: f"<td class='{'hit' if h else 'miss'}'>{h if h else 'Not covered'}</td>"
+    cell = lambda h: "<td>Excluded</td>" if h < 0 else f"<td class='{'hit' if h else 'miss'}'>{h if h else 'Not covered'}</td>"
     ch, ct, cn = cond_summary(db, exclude)
     (sh, st, xh, xt), fn = fsm_summary(db, exclude, reset_filter)
     conds = []
@@ -580,6 +613,347 @@ def func_html(db, exclude):
     return out
 
 
+# ---- exclusions ------------------------------------------------------------
+
+EL_KINDS = ("file", "line", "branch", "cond", "toggle", "fsm", "state", "trans", "cg", "assert")
+
+
+def read_elfile(path):
+    """[{kind, target, arg, reason, where}] of an exclusion file."""
+    out = []
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError as e:
+        raise SystemExit(f"mcov: {e}")
+    with f:
+        for no, raw in enumerate(f, 1):
+            text = raw.split("#", 1)[0].strip()
+            if not text:
+                continue
+            body, _, reason = text.partition("--")
+            w = body.split()
+            if w[0] not in EL_KINDS or len(w) < 2 or len(w) > 3:
+                raise SystemExit(f"mcov: {path}:{no}: expected '<kind> <target> [-- reason]', kind one of {', '.join(EL_KINDS)}")
+            out.append({"kind": w[0], "target": w[1], "arg": w[2] if len(w) == 3 else "", "reason": reason.strip(),
+                        "where": f"{path}:{no}", "n": 0, "covered": 0})
+    return out
+
+
+def _file_match(path, pat):
+    return fnmatch.fnmatchcase(path, pat) or fnmatch.fnmatchcase(path, "*/" + pat)
+
+
+def _file_lines(target, where):
+    """'a.sv:10-12' -> ('a.sv', 10, 12)."""
+    f, _, rng = target.rpartition(":")
+    lo, _, hi = rng.partition("-")
+    if not f or not lo.isdigit() or (hi and not hi.isdigit()):
+        raise SystemExit(f"mcov: {where}: expected <file>:<line> or <file>:<line>-<line>, not '{target}'")
+    return f, int(lo), int(hi or lo)
+
+
+def apply_exclusions(db, rules):
+    """Take the excluded items out of db. Each rule gets n (items removed)
+    and covered (how many of those the tests had covered)."""
+    for r in rules:
+        kind, tg, arg, where = r["kind"], r["target"], r["arg"], r["where"]
+        n = cov = 0
+        if kind in ("file", "line", "branch", "cond"):
+            if kind == "file":
+                pat, lo, hi = tg, 0, 1 << 60
+            else:
+                pat, lo, hi = _file_lines(tg, where)
+            fm = {}
+            ok = lambda f, ln: lo <= ln <= hi and (fm[f] if f in fm else fm.setdefault(f, _file_match(f, pat)))
+            if kind in ("file", "line"):
+                for k in [k for k in db["lines"] if ok(k[0], k[1])]:
+                    n += 1; cov += db["lines"].pop(k) > 0
+            if kind in ("file", "branch"):
+                for k in [k for k in db["branches"] if ok(k[0], k[1])]:
+                    t, fl = db["branches"].pop(k)
+                    n += 2; cov += (t > 0) + (fl > 0)
+            if kind in ("file", "cond"):
+                if arg and not arg.isdigit():
+                    raise SystemExit(f"mcov: {where}: the vector of a cond exclusion is a row number, not '{arg}'")
+                for k in [k for k in db["conds"] if ok(k[0], k[1])]:
+                    hits = db["conds"][k][2]
+                    if arg:
+                        i = int(arg) - 1
+                        if 0 <= i < len(hits) and hits[i] >= 0:
+                            n += 1; cov += hits[i] > 0
+                            hits[i] = -1
+                    else:
+                        live = [h for h in hits if h >= 0]
+                        n += len(live); cov += sum(1 for h in live if h > 0)
+                        del db["conds"][k]
+            if kind == "file":
+                for k in [k for k, m in db["fsms"].items() if ok(m["file"], m["line"])]:
+                    m = db["fsms"].pop(k)
+                    n += len(m["states"]) + len(m["trans"])
+                    cov += sum(1 for _, h in m["states"].values() if h > 0) + sum(1 for h, _ in m["trans"].values() if h > 0)
+        elif kind == "toggle":
+            mt = re.fullmatch(r"(.*)\[(\d+)(?::(\d+))?\]", tg)
+            pat, bits = tg, None
+            if mt and not any(fnmatch.fnmatchcase(name, tg) for name in db["toggles"]):
+                a, b = int(mt.group(2)), int(mt.group(3) or mt.group(2))
+                pat, bits = mt.group(1), ((1 << (max(a, b) + 1)) - 1) & ~((1 << min(a, b)) - 1)
+            for name in [x for x in db["toggles"] if fnmatch.fnmatchcase(x, pat)]:
+                w, rise, fall = db["toggles"][name]
+                if bits is None:
+                    n += w; cov += popcount(rise & fall)
+                    del db["toggles"][name]
+                else:
+                    m = bits & ((1 << w) - 1)
+                    k = popcount(m)
+                    if not k:
+                        continue
+                    n += k; cov += popcount(rise & fall & m)
+                    # the bits left are packed down so that width stays the number of bits counted
+                    keep = [i for i in range(w) if not (m >> i) & 1]
+                    pack = lambda v: sum(((v >> b) & 1) << i for i, b in enumerate(keep))
+                    if keep:
+                        db["toggles"][name] = (len(keep), pack(rise), pack(fall))
+                    else:
+                        del db["toggles"][name]
+        elif kind in ("fsm", "state", "trans"):
+            for key in [k for k in db["fsms"] if fnmatch.fnmatchcase(f"{k[1]}.{k[2]}", tg)]:
+                m = db["fsms"][key]
+                val = {name: v for v, (name, _) in m["states"].items()}
+                if kind == "fsm":
+                    n += len(m["states"]) + len(m["trans"])
+                    cov += sum(1 for _, h in m["states"].values() if h > 0) + sum(1 for h, _ in m["trans"].values() if h > 0)
+                    del db["fsms"][key]
+                elif kind == "state":
+                    for v in [v for name, v in val.items() if fnmatch.fnmatchcase(name, arg)]:
+                        n += 1; cov += m["states"].pop(v)[1] > 0
+                        for t in [t for t in m["trans"] if v in t]:
+                            n += 1; cov += m["trans"].pop(t)[0] > 0
+                        for t in [t for t in m["extra"] if v in t]:
+                            del m["extra"][t]
+                else:
+                    a, sep, b = arg.partition("->")
+                    if not sep:
+                        raise SystemExit(f"mcov: {where}: a trans exclusion is '<fsm> <FROM>-><TO>'")
+                    name = {v: nm for nm, v in val.items()}
+                    for t in [t for t in m["trans"] if fnmatch.fnmatchcase(name.get(t[0], ""), a)
+                              and fnmatch.fnmatchcase(name.get(t[1], ""), b)]:
+                        n += 1; cov += m["trans"].pop(t)[0] > 0
+        elif kind == "cg":
+            for name in [x for x in db["cgs"] if fnmatch.fnmatchcase(x, tg)]:
+                for it in db["cgs"].pop(name)[2].values():
+                    c, t = item_count(it)
+                    n += t; cov += c
+        elif kind == "assert":
+            for name in [x for x in db["asserts"] if fnmatch.fnmatchcase(x, tg)]:
+                a = db["asserts"].pop(name)
+                n += 1; cov += bool(a[2]) and not (a[3] and a[0] != "cover")
+        r["n"] += n
+        r["covered"] += cov
+    return rules
+
+
+def el_issue(r):
+    """What a reviewer should look at in an applied exclusion, or ''."""
+    if not r["n"]:
+        return "matches nothing (stale?)"
+    if r["covered"]:
+        return f"{r['covered']} of its {r['n']} item(s) are covered by the tests"
+    if not r["reason"] or r["reason"].upper().startswith("TODO"):
+        return "no reason given"
+    return ""
+
+
+def el_review_text(rules):
+    out = ["Exclusions:"]
+    for r in rules:
+        tgt = r["target"] + (" " + r["arg"] if r["arg"] else "")
+        issue = el_issue(r)
+        out.append(f"  {r['where']}: {r['kind']} {tgt}: {r['n']} item(s)"
+                   + (f"  -- {r['reason']}" if r["reason"] else "") + (f"  ** {issue}" if issue else ""))
+    return "\n".join(out)
+
+
+def draft_exclusions(db, reset_filter=False):
+    """Exclusion file text: one exclusion per item that is not covered."""
+    out = ["# mcov exclusion draft: every item below is not covered. Keep an exclusion only if the",
+           "# item cannot or need not be covered, and replace TODO with the reason.", ""]
+    todo = "  -- TODO"
+    runs = {}
+    for (f, ln), h in sorted(db["lines"].items()):
+        if not h:
+            runs.setdefault(f, []).append(ln)
+    for f, lns in runs.items():
+        i = 0
+        while i < len(lns):
+            j = i
+            while j + 1 < len(lns) and lns[j + 1] == lns[j] + 1:
+                j += 1
+            out.append(f"line   {f}:{lns[i]}" + (f"-{lns[j]}" if j > i else "") + todo)
+            i = j + 1
+    for (f, ln) in sorted({(f, ln) for (f, ln, _), (t, fl) in db["branches"].items() if not (t and fl)}):
+        out.append(f"branch {f}:{ln}{todo}")
+    for (f, ln, col, text), (op, terms, hits) in sorted(db["conds"].items()):
+        miss = [i for i, h in enumerate(hits, 1) if h == 0]
+        if len(miss) == len(hits):
+            out.append(f"cond   {f}:{ln}{todo}   # {text}")
+        else:
+            out += [f"cond   {f}:{ln} {i}{todo}   # {text}" for i in miss]
+    for name, (w, r, fl) in sorted(db["toggles"].items()):
+        miss = [i for i in range(w) if not (r & fl) >> i & 1]
+        if len(miss) == w:
+            out.append(f"toggle {name}{todo}")
+            continue
+        i = 0
+        while i < len(miss):
+            j = i
+            while j + 1 < len(miss) and miss[j + 1] == miss[j] + 1:
+                j += 1
+            out.append(f"toggle {name}[{miss[j]}:{miss[i]}]{todo}" if j > i else f"toggle {name}[{miss[i]}]{todo}")
+            i = j + 1
+    for (mod, inst, name), m in sorted(db["fsms"].items()):
+        nm = lambda v: m["states"][v][0]
+        dead = {v for v, (_, h) in m["states"].items() if not h}
+        for v in sorted(dead):
+            out.append(f"state  {inst}.{name} {nm(v)}{todo}")
+        for (a, b), (h, r) in sorted(m["trans"].items()):
+            if not h and a not in dead and b not in dead and not (reset_filter and r):
+                out.append(f"trans  {inst}.{name} {nm(a)}->{nm(b)}{todo}")
+    for name, a in sorted(db["asserts"].items()):
+        if not a[2]:
+            out.append(f"assert {name}{todo}")
+    return "\n".join(out) + "\n"
+
+
+# ---- test ranking ----------------------------------------------------------
+
+def test_items(db):
+    """(every item of the database, the ones this run covered), as keys that
+    are the same in every run of the same design."""
+    all_, hit = [], []
+    def add(k, h):
+        all_.append(k)
+        if h:
+            hit.append(k)
+    for k, h in db["lines"].items():
+        add(("l",) + k, h > 0)
+    for k, (t, f) in db["branches"].items():
+        add(("b",) + k + (1,), t > 0)
+        add(("b",) + k + (0,), f > 0)
+    for name, (w, r, f) in db["toggles"].items():
+        for i in range(w):
+            add(("t", name, i, 1), (r >> i) & 1)
+            add(("t", name, i, 0), (f >> i) & 1)
+    for k, (_, _, hits) in db["conds"].items():
+        for i, h in enumerate(hits):
+            add(("c",) + k + (i,), h > 0)
+    for k, m in db["fsms"].items():
+        for v, (_, h) in m["states"].items():
+            add(("s",) + k + (v,), h > 0)
+        for t, (h, _) in m["trans"].items():
+            add(("x",) + k + t, h > 0)
+    for g, (_, _, items) in db["cgs"].items():
+        for i, it in items.items():
+            al = max(1, it[3])
+            for b, h in it[5].items():
+                add(("g", g, i, b), h >= al)
+    for name, a in db["asserts"].items():
+        add(("a", name), bool(a[2]) and not (a[3] and a[0] != "cover"))
+    return all_, hit
+
+
+def _rank_load(path):
+    db = load(path)
+    return (path,) + test_items(db)
+
+
+def item_label(k):
+    c = k[0]
+    if c == "l": return f"{k[1]}:{k[2]}"
+    if c == "b": return f"{k[1]}:{k[2]} branch {k[3]} {'taken' if k[4] else 'not taken'}"
+    if c == "t": return f"{k[1]}[{k[2]}] {'rise' if k[3] else 'fall'}"
+    if c == "c": return f"{k[1]}:{k[2]}:{k[3]} vector {k[5] + 1}  {k[4]}"
+    if c == "s": return f"{k[2]}.{k[3]} state {k[4]}"
+    if c == "x": return f"{k[2]}.{k[3]} transition {k[4]}->{k[5]}"
+    if c == "g": return f"{k[1]}.{k[2]} bin {k[3]}"
+    return k[1]
+
+
+def rank_tests(paths, jobs=0):
+    """Greedy order of the tests by what each adds. Returns (rows, total items,
+    index, masks): rows are (path, covered, unique, added, cumulative), in
+    rank order; a test's items are the bits of an int, so adding a test is one
+    AND-NOT and a popcount."""
+    jobs = max(1, min(jobs or cpu_count(), len(paths) // 2))
+    loaded = None
+    if jobs > 1:
+        import concurrent.futures as cf
+        try:
+            with cf.ProcessPoolExecutor(max_workers=jobs) as pool:
+                loaded = list(pool.map(_rank_load, paths, chunksize=max(1, len(paths) // (jobs * 4))))
+        except SystemExit:
+            raise
+        except Exception:
+            loaded = None
+    if loaded is None:
+        loaded = [_rank_load(p) for p in paths]
+    index = {}
+    for _, all_, _ in loaded:           # in input order: the numbering does not depend on -j
+        for k in all_:
+            if k not in index:
+                index[k] = len(index)
+    masks = []
+    for _, _, hit in loaded:
+        nb = (len(index) + 7) // 8
+        buf = bytearray(nb)
+        for k in hit:
+            i = index[k]
+            buf[i >> 3] |= 1 << (i & 7)
+        masks.append(int.from_bytes(buf, "little"))
+    once = twice = 0
+    for m in masks:
+        twice |= once & m
+        once |= m
+    only = once & ~twice
+    left = list(range(len(paths)))
+    cum, rows = 0, []
+    while left:
+        best = max(left, key=lambda i: (popcount(masks[i] & ~cum), -i))   # ties: input order
+        gain = popcount(masks[best] & ~cum)
+        cum |= masks[best]
+        rows.append((paths[best], popcount(masks[best]), popcount(masks[best] & only), gain, popcount(cum)))
+        left.remove(best)
+    return rows, len(index), index, masks
+
+
+def rank_main(a):
+    rows, total, index, masks = rank_tests(a.dbs, a.j)
+    if a.item:
+        rx = a.item
+        found = False
+        for k, i in index.items():
+            lab = item_label(k)
+            if not (lab == rx or lab.startswith(rx + " ") or lab.startswith(rx + "[") or lab.startswith(rx + ":")):
+                continue
+            found = True
+            who = [a.dbs[t] for t, m in enumerate(masks) if (m >> i) & 1]
+            print(f"{lab}: " + (", ".join(who) if who else "no test"))
+        if not found:
+            print(f"mcov: no coverage item matches '{a.item}'", file=sys.stderr)
+            return 1
+        return 0
+    w = max([len(r[0]) for r in rows] + [4])
+    print(f"{'Rank':>4}  {'Test':<{w}}  {'Covers':>8}  {'Only it':>8}  {'Adds':>8}  {'Total':>16}")
+    for n, (p, c, u, g, cum) in enumerate(rows, 1):
+        print(f"{n:>4}  {p:<{w}}  {c:>8}  {u:>8}  {g:>8}  {cum:>8} {pct(cum, total):6.1f}%")
+    need = sum(1 for r in rows if r[3])
+    print(f"{len(rows)} test(s), {total} item(s); the first {need} reach the total, {len(rows) - need} add nothing")
+    if a.o:
+        with open(a.o, "w", encoding="utf-8") as f:
+            f.write("".join(r[0] + "\n" for r in rows if r[3]))
+        print(f"Tests that add coverage, in rank order: {a.o}")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="mcov", description="Merge and report msim coverage (see module docstring).")
     ap.add_argument("-version", action="version", version=f"mcov {VERSION}")
@@ -598,11 +972,37 @@ def main(argv=None):
     r.add_argument("-uncovered", action="store_true", help="as -detail, only what is not covered")
     r.add_argument("-fsm-reset-filter", action="store_true",
                    help="leave transitions into reset states out of FSM coverage")
+    r.add_argument("-elfile", metavar="FILE", action="append", default=[], help="exclusion file (may be repeated)")
+    r.add_argument("-el-review", action="store_true", help="list every exclusion, what it removes and what to review")
+    r.add_argument("-el-strict", action="store_true",
+                   help="exit 1 if an exclusion matches nothing, removes covered items or has no reason")
     for k in ("line", "branch", "toggle", "cond", "fsm-state", "fsm-trans", "func", "assert"):
         r.add_argument(f"-min-{k}", type=float, metavar="PCT", help=f"exit 1 if {k} coverage is below PCT")
+    x = sub.add_parser("exclude", help="write an exclusion file draft: one exclusion per item not covered")
+    x.add_argument("dbs", nargs="+", help="databases (merged first if several)")
+    x.add_argument("-o", required=True, help="exclusion file to write")
+    x.add_argument("-elfile", metavar="FILE", action="append", default=[], help="exclusions already agreed (left out of the draft)")
+    x.add_argument("-fsm-reset-filter", action="store_true", help="leave out transitions into reset states")
+    x.add_argument("-j", type=int, default=0, help="worker processes for loading (default: available CPUs)")
+    k = sub.add_parser("rank", help="order tests by the coverage each adds; one database per test")
+    k.add_argument("dbs", nargs="+", help="one database per test")
+    k.add_argument("-o", metavar="FILE", help="write the tests that add coverage, in rank order")
+    k.add_argument("-item", metavar="NAME", help="list the tests that cover this item (file:line, signal, FSM, covergroup, assertion)")
+    k.add_argument("-j", type=int, default=0, help="worker processes for loading (default: available CPUs)")
     a = ap.parse_args(argv)
 
+    if a.cmd == "rank":
+        return rank_main(a)
     db = load_all(a.dbs, a.j)
+    rules = []
+    for path in getattr(a, "elfile", ()):
+        rules += apply_exclusions(db, read_elfile(path))
+    if a.cmd == "exclude":
+        text = draft_exclusions(db, a.fsm_reset_filter)
+        with open(a.o, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"mcov: {sum(1 for l in text.splitlines() if l and l[0] != '#')} exclusion(s) to review in {a.o}")
+        return 0
     if a.cmd == "merge":
         save(db, a.o)
         print(f"mcov: merged {len(a.dbs)} database(s) ({len(db['tests'])} run(s)) into {a.o}")
@@ -621,6 +1021,10 @@ def main(argv=None):
     (sh, st, xh, xt), fn = fsm_summary(db, a.exclude, a.fsm_reset_filter)
     print(f"Condition: {pct(ch, ct):.1f}% ({ch}/{ct} vectors of {cn} condition(s))")
     print(f"FSM: states {pct(sh, st):.1f}% ({sh}/{st}), transitions {pct(xh, xt):.1f}% ({xh}/{xt}) of {fn} FSM(s)")
+    if rules:
+        print(f"Excluded: {sum(r['n'] for r in rules)} item(s) by {len(rules)} exclusion(s)")
+        if a.el_review:
+            print(el_review_text(rules))
     if a.detail or a.uncovered:
         text = detail_text(db, a.exclude, a.fsm_reset_filter, a.uncovered)
         if text:
@@ -643,6 +1047,13 @@ def main(argv=None):
         write_lcov(db, a.lcov, a.exclude, files)
         print(f"LCOV: {a.lcov}")
     rc = 0
+    issues = [r for r in rules if el_issue(r)]
+    if a.el_strict and issues:
+        if not a.el_review:
+            for r in issues:
+                print(f"mcov: {r['where']}: {r['kind']} {r['target']}: {el_issue(r)}")
+        print(f"mcov: {len(issues)} exclusion(s) need review")
+        rc = 1
     for k, (hit, tot) in {"line": (lh, lt), "branch": (bh, bt), "toggle": (th, ta), "cond": (ch, ct),
                           "fsm-state": (sh, st), "fsm-trans": (xh, xt),
                           "func": (ftotal, 100.0), "assert": (aok, an)}.items():

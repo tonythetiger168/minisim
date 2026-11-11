@@ -129,6 +129,26 @@ refuses(bad_struct_dropped dropped "must be assigned to a variable")
 refuses(bad_struct_scalar scalar "a struct cannot be used as a value")
 refuses(gcd nosuch "is not defined")
 
+# Delays from a Liberty library: the slow corner needs more states than the fast one.
+design(fir fir -lib ${SRC}/lib/mini45/mini45_tt.lib -clock 2)
+design(arith arith -lib ${SRC}/lib/mini45/mini45_ss.lib -clock 1.5 -mul 1 -div 1)
+design(looppipe sum -lib ${SRC}/lib/mini45/mini45_ff.lib -clock 2)
+function(states corner var)
+  execute_process(COMMAND ${MHLS} ${H}/fir.c -top fir -lib ${SRC}/lib/mini45/mini45_${corner}.lib -clock 2 -o ${OUT}/fir_${corner}.sv
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0 OR NOT "${out}${err}" MATCHES "delays from mini45_${corner}: inverter" OR NOT "${out}${err}" MATCHES ", ([0-9]+) states")
+    message(FATAL_ERROR "mhls -lib mini45_${corner}.lib:\n${out}${err}")
+  endif()
+  set(${var} ${CMAKE_MATCH_1} PARENT_SCOPE)
+endfunction()
+states(ss slow)
+states(ff fast)
+if(NOT slow GREATER fast)
+  message(FATAL_ERROR "mhls -lib: fir takes ${slow} states at the slow corner and ${fast} at the fast one; the slow corner should need more")
+endif()
+message(STATUS "mhls -lib: fir at 2 ns takes ${slow} states with mini45_ss, ${fast} with mini45_ff")
+refuses(gcd gcd "mhls: .*gcd.c" -lib ${H}/gcd.c)
+
 # C++ through clang (mhls -clang): classes, templates, constructors, operators.
 find_program(CLANG NAMES clang)
 if(CLANG)
