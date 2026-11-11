@@ -3171,8 +3171,9 @@ struct Lowerer {
         } else {
             if (cur->kind == ExpressionKind::MemberAccess || cur->kind == ExpressionKind::ElementSelect)
                 return std::nullopt;   // s.arr[i]: an array inside an unpacked struct is bits of it (7.2)
-            if (cur->kind != ExpressionKind::NamedValue) unsupported("array select on a non-variable");
-            shape = arrFind(&cur->as<NamedValueExpression>().symbol);
+            if (cur->kind != ExpressionKind::NamedValue && cur->kind != ExpressionKind::HierarchicalValue)
+                unsupported("array select on a non-variable");
+            shape = arrFind(&cur->as<ValueExpressionBase>().symbol);   // m[i] or top.u.m[i] (23.6)
         }
         if (!shape) unsupported("array select");
         ArrSel s;
@@ -3697,6 +3698,9 @@ struct Lowerer {
         prog.emit(dynCmd(t, D_DELETE));
         assignInto(t, rhs);
         Instr i = dynCmd(dst, D_COPY); i.dsrc = t; prog.emit(i);
+        if (rhs.kind == slang::ast::ExpressionKind::StructuredAssignmentPattern &&
+            rhs.as<slang::ast::StructuredAssignmentPatternExpression>().defaultSetter)
+            prog.emit(dynCmd(t, D_DEFAULT));   // the temporary is shared: its default goes back to the type's
     }
     // Build rhs into the empty container t.
     void assignInto(int t, const slang::ast::Expression& rhs0) {
@@ -3720,7 +3724,10 @@ struct Lowerer {
                 const auto& sp = rhs.as<StructuredAssignmentPatternExpression>();
                 if (dynShape(t).kind != 2) unsupported("keyed pattern for this container");
                 if (!sp.memberSetters.empty() || !sp.typeSetters.empty()) unsupported("pattern member setter");
-                if (sp.defaultSetter) unsupported("default: in an associative array pattern");
+                if (sp.defaultSetter) {   // 7.9.11: what a missing element reads as from now on
+                    if (dynShape(t).elem) unsupported("default: in a pattern for an associative array of containers");
+                    Instr i = dynCmd(t, D_DEFAULT); i.e = expr(*sp.defaultSetter); prog.emit(i);
+                }
                 for (auto& is : sp.indexSetters) {
                     Instr i = dynCmd(t, D_SET); i.args = {dynKey(t, *is.index)}; i.e = expr(*is.expr); prog.emit(i);
                 }
@@ -4693,6 +4700,25 @@ struct Lowerer {
                     int src = storeW(*e.type);
                     return sized(r, src, e.type->isSigned(), ctx);
                 }
+                if (stmtDepth && isTaggedUnion(*m.value().type) && m.member.kind == SymbolKind::Field) {
+                    // 7.3.2: reading a member other than the one the tag names is a run-time error
+                    const Type& ut = m.value().type->getCanonicalType();
+                    int uw = ut.isUnpackedUnion() ? uWidth(ut) : (int)ut.getBitWidth();
+                    int tb = tagBitsOf(ut);
+                    if (tb > 0 && uw > 0) {
+                        Instr j; j.k = IK::JmpIfNot;
+                        j.e = un(Op::LogNot, bin(Op::CaseEq, slice(expr(m.value()), uw - 1, uw - tb),
+                                                 konst(mk((uint64_t)tagIndexOf(ut, m.member), tb))));
+                        size_t jf = prog.emit(j);
+                        Instr d; d.k = IK::Display;
+                        std::string at = whereStr();
+                        if (auto sl = at.rfind('/'); sl != std::string::npos) at = at.substr(sl + 1);
+                        d.fmt = escPct("Error: " + at + "read of tagged union member '" + std::string(m.member.name) +
+                                       "', which is not the member the tag names");
+                        prog.emit(d);
+                        prog.code[jf].target = prog.here();
+                    }
+                }
                                 return sized(readPSel(expr(m.value()), memberPSel(m)), bitsOf(*e.type), e.type->isSigned(), ctx);
             }
             case ExpressionKind::SimpleAssignmentPattern:
@@ -5082,6 +5108,7 @@ struct Lowerer {
     // cast writes dst and gives 1; an invalid one leaves dst alone and gives 0,
     // and as a task it is a run-time error.
     bool asTask = false;   // the system call being lowered is a statement
+    bool voidCast = false; // ... written as void'(f(...)): still the function form
     E castCall(const slang::ast::CallExpression& call) {
         using namespace slang::ast;
         auto args = call.arguments();
@@ -6190,7 +6217,7 @@ struct Lowerer {
         if (n == "randomize") { randomizeCall(call); return; }
         if (n == "rand_mode" || n == "constraint_mode") { randModeCall(call, false); return; }
         if (n == "$cast" && call.arguments().size() == 2 && isHandleType(*outArg(*call.arguments()[0]).type)) {
-            castClass(call, false);
+            castClass(call, voidCast);
             return;
         }
         if (n == "$finish" || n == "$stop") {
@@ -6322,7 +6349,7 @@ struct Lowerer {
             prog.emit(i);
             return;
         }
-        asTask = true;
+        asTask = !voidCast;
         E rt = sysFn(call, n);
         asTask = false;
         if (E r = rt) {   // a system function called as a task: its effect only
@@ -6945,7 +6972,59 @@ struct Lowerer {
             if (const TimingControl* tc = a.timingControl; tc && tc->kind != TimingControlKind::Delay) {
                 // a = @(e) b; a = repeat (n) @(e) b (9.4.5): b is taken now and
                 // written after the event (n events for repeat).
-                if (a.isNonBlocking()) unsupported("nonblocking assignment with an intra-assignment event control");
+                if (a.isNonBlocking()) {   // a <= @(e) b: a forked process waits and then schedules the update
+                    if (!store) unsupported("nonblocking assignment with an intra-assignment event control here");
+                    int w = storeW(*a.left().type);
+                    needWidth(w);
+                    Instr f; f.k = IK::Fork; f.join = 2;
+                    FrameLayout* flay = newLayout("nba event");
+                    int slot = flay->add(w, w > 64 ? allx(w) : Val{});
+                    f.init.push_back({slot, resize(i.e, w, a.right().type->isSigned(), false)});
+                    int cslot = -1;
+                    const TimingControl* ev = tc;
+                    if (tc->kind == TimingControlKind::RepeatedEvent) {
+                        const auto& re = tc->as<RepeatedEventControl>();
+                        cslot = flay->add(32, Val{});
+                        f.init.push_back({cslot, resize(expr(re.expr), 32, re.expr.type->isSigned(), true)});
+                        ev = &re.event;
+                    }
+                    f.lay = flay;
+                    Lowerer lw(sigmap);
+                    lw.bind(subs, mkSig, tempSeq, store);
+                    lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
+                    lw.current = current;
+                    lw.retSig = retSig;
+                    lw.scope = scope;
+                    lw.sampleEv = sampleEv;
+                    lw.curClass = curClass;
+                    FrameLayout* bl = newLayout("fork branch");
+                    lw.frames = frames;
+                    lw.frames.push_back(flay);
+                    lw.frames.push_back(bl);
+                    f.blays.push_back(bl);
+                    if (cslot >= 0) {
+                        int cnt = lw.relIn(flay, cslot);
+                        size_t top = lw.prog.here();
+                        Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(cnt, true), konst(make(0, 0, 32, 0, true)));
+                        size_t jf = lw.prog.emit(j);
+                        lw.timing(*ev);
+                        Instr dec; dec.k = IK::Assign; dec.sig = cnt; dec.e = bin(Op::Sub, ref(cnt, true), konst(make(1, 0, 32, 0, true)));
+                        lw.prog.emit(dec);
+                        Instr back; back.k = IK::Jmp; back.target = top; lw.prog.emit(back);
+                        lw.prog.code[jf].target = lw.prog.here();
+                    } else {
+                        lw.timing(*ev);
+                    }
+                    Instr n; n.k = IK::Nba;
+                    lw.lhs(a.left(), n);
+                    n.e = ref(lw.relIn(flay, slot), a.left().type->isSigned());
+                    lw.prog.emit(n);
+                    lw.finishImplicit();
+                    store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+                    f.branches.push_back(store->back().get());
+                    prog.emit(f);
+                    return;
+                }
                 int w = (int)a.left().type->getBitWidth();
                 needWidth(w);
                 int tmp = fresh(w);
@@ -7278,7 +7357,10 @@ struct Lowerer {
                 break;
             }
             case StatementKind::ExpressionStatement:
+                // void'($cast(d, s)) is the function form (8.16): a failed cast is not an error.
+                voidCast = s.syntax && s.syntax->kind == slang::syntax::SyntaxKind::VoidCastedCallStatement;
                 xpExprStmt(s.as<ExpressionStatement>().expr);
+                voidCast = false;
                 break;
             case StatementKind::VariableDeclaration: {   // int x = 5;  inside a block
                 const auto& vd = s.as<VariableDeclStatement>();
@@ -10430,8 +10512,11 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         continue;
                     }
                     // (slang adds a built-in pre/post_randomize, with no body, to a class that declares none)
-                    if (m.kind == SymbolKind::Subroutine && m.getSyntax() && (m.name == "pre_randomize" || m.name == "post_randomize")) {
-                        auto it = subMap.find(&m.as<SubroutineSymbol>());
+                    // An extern declaration is a prototype: its body is the out-of-block definition (8.24).
+                    const SubroutineSymbol* rsub = m.kind == SymbolKind::Subroutine ? &m.as<SubroutineSymbol>()
+                        : m.kind == SymbolKind::MethodPrototype ? m.as<MethodPrototypeSymbol>().getSubroutine() : nullptr;
+                    if (rsub && m.getSyntax() && (m.name == "pre_randomize" || m.name == "post_randomize")) {
+                        auto it = subMap.find(rsub);
                         if (it == subMap.end()) continue;
                         if (m.name == "pre_randomize") { sp->pre = it->second->prog; sp->preLay = it->second->lay; }
                         else { sp->post = it->second->prog; sp->postLay = it->second->lay; }

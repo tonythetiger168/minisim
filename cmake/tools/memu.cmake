@@ -12,7 +12,8 @@ target_link_libraries(memu PRIVATE Threads::Threads)
 # against plain simulation. That needs msim, which exists with slang; without
 # it the test runs memu alone.
 if(MINISIM_WITH_SLANG)
-  set(memu_msim -DMSIM=$<TARGET_FILE:msim>)
+  # mfpga is built beside memu; the test uses it if it is there.
+  set(memu_msim -DMSIM=$<TARGET_FILE:msim> -DMFPGA=$<TARGET_FILE_DIR:memu>/mfpga)
 else()
   set(memu_msim)
 endif()
@@ -24,3 +25,5 @@ include(GNUInstallDirs)
 install(TARGETS memu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # The transactors: memu -xtor-sv looks for these next to itself.
 install(FILES emu/sv/memu_xtor.sv emu/sv/memu_mvp_host.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/emu/sv)
+# Mt-KaHyPar as a second partitioner (memu -partitioner).
+install(PROGRAMS tools/memu_mtkahypar.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME memu-mtkahypar)

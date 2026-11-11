@@ -97,7 +97,27 @@ with `-tielo CELL/PIN` and `-tiehi CELL/PIN`.
    `_l`, `_rl`) to the DEF's `VIAS` section. A piece of wire below its
    layer's `AREA` (a via landing with no wire, a one-step jog, the pads of a
    power via stack) is made as long as the rule needs; the router keeps the
-   room for that at every node.
+   room for that at every node, or, where that room would cost nodes (the
+   length is more than a track step), the piece takes its next node on the
+   track instead.
+   **Pin access.** A pin below the first routing layer can be reached at
+   every crossing of a track over it, and also off the crossings: at each
+   end of the stretch where the via pad still fits the pin, from the
+   crossing on either side, with a short wire to the via when its pad does
+   not reach. One node can so offer several via positions. Each access knows
+   what it cannot stand next to: vias of other nets whose pads or cuts
+   would be too close (on its own track, the next ones, or another pin's
+   access), and these count in the negotiation like shared nodes. Before
+   any net is routed, the nodes and via sites a pin needs are priced for
+   other nets, the higher the fewer ways into the pin there are. Via pads
+   wider than the wire are kept off shapes on the next track (cell
+   obstructions, rails, other nets' pads and, for the widest, their wires).
+   **Same-net gaps.** Two pads of one net side by side with less than a
+   `SPACING` between them (a notch) get the gap filled with a `RECT` patch
+   in the DEF; vias of one net whose pads would leave a gap no patch can
+   fill (corner to corner, or facing over less than the least width) are
+   not placed, and neither are two pin vias of one net with their cuts
+   too close.
 6. **Check.** The DEF that was just written is checked from its shapes alone:
    every net one connected piece (opens), no metal of two nets touching
    (shorts) or closer than `SPACING`. The same check runs on any DEF with
@@ -222,12 +242,38 @@ layers), utilization 0.6, 4 cores of a cloud VM. Every run ends with 0 open,
 The same flow routes 5,000 Nangate45 cells clean on the real Nangate45 LEF
 (ten metal layers) in 1.9 s.
 
+On the SkyWater 130 nm high-density cells (`lib/sky130`, pins on li1, five
+metal layers; `bench/gen_pnr.py N SEED --sky130`), utilization 0.6. Every run
+ends with every net routed, 0 open, 0 shorts and 0 spacing violations.
+`mpv drc -lef` on the DEF finds 0 violations up to 10,000 cells and one
+(a met4 notch inside one net, between a met4-to-met5 pad and another of its
+vias) at 20,000:
+
+| Cells | Nets routed | Route rounds | Route | Total |
+|---|---|---|---|---|
+| 1,000 | 897 | 17 | 2.0 s | 2.2 s |
+| 5,000 | 4,470 | 13 | 3.9 s | 4.8 s |
+| 10,000 | 8,904 | 17 | 22 s | 24 s |
+| 20,000 | 17,856 | 29 | 141 s | 145 s |
+
+Routing takes more rounds here than on the other libraries because the pins
+of a row compete for met1, and the time grows faster than the cell count
+because a random netlist's wires grow with the die: at 20,000 cells its few
+500 um nets search through layers that are more than half full. That is the
+case a global-routing stage is for (see Limits).
+
 ## Limits
 
-- Design rules are those the grid enforces: width, spacing, via pads, track
-  alignment, cut spacing (between nets and inside a net) and minimum area
-  of the wiring. Antenna and density rules are not handled, and `-check`
-  does not measure area; run a DRC tool on the result (`mpv drc -lef`).
+- Design rules are those the grid enforces: width, spacing (one value per
+  layer: the first row of a `SPACINGTABLE`), via pads, track alignment, cut
+  spacing (between nets and inside a net), notches between a net's own via
+  pads, and minimum area of the wiring. Antenna and density rules are not
+  handled, and `-check` does not measure area or same-net gaps; run a DRC
+  tool on the result (`mpv drc -lef`).
+- Pin vias are the LEF's (and the turned or lengthened copies); a pin is not
+  given a via with a different upper pad when its neighbour is in the way,
+  so two pins that can only be reached side by side on one track may leave
+  a net unrouted.
 - Standard cells one row high. Larger macros can be fixed in a floorplan DEF
   (their pins and obstructions are honoured) but mpnr does not place them.
 - Clock trees are balanced by level and load, not by delay, and are routed
@@ -252,4 +298,4 @@ The same flow routes 5,000 Nangate45 cells clean on the real Nangate45 LEF
 | `src/pnr_check.hpp` | Opens, shorts and spacing on a routed DEF |
 | `src/lef.hpp`, `src/def.hpp` | LEF and DEF readers, DEF writer (shared) |
 | `tests/pnr/`, `tests/pnr_test.py` | Test library, netlists and the self-test |
-| `bench/gen_pnr.py` | Random netlists of any size |
+| `bench/gen_pnr.py` | Random netlists of any size (`--mini45`, `--sky130`, `--nangate` for those libraries' cells) |
