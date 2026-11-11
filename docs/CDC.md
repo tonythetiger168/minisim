@@ -25,6 +25,8 @@ mlint rtl/*.sv -top soc_top -enable RDC004 -Werror
 | `RDC002` | One asynchronous reset is used directly by flops of several clock domains | A reset synchronizer per domain |
 | `RDC003` | In one clock domain, a flop with one asynchronous reset feeds a flop with another: when the first asserts alone, the second samples a changing value | Reset both together, or synchronize or gate the path |
 | `RDC004` | The same, into a flop with no asynchronous reset. Off by default (`-enable RDC004`), because data-path flops without a reset are common | As RDC003 |
+| `RDC005` | A reset synchronizer is one flop: released near a clock edge it can go metastable and release its flops at different times | Two flops |
+| `RDC006` | An asynchronous reset is combinational logic of several flops, which can glitch when they change together. A scan mux or a gate on one flop is not reported | Register the reset after the logic |
 
 ## What is a domain
 
@@ -113,6 +115,27 @@ Object names follow `msdc`: `/` between instance levels and no top name
 `CK`, `D` and `Q`, generate blocks are `name.` and `name[i].`. With `-sdc`,
 `-cdc-report` prints the SDC clocks of every domain. `-clock-group` and
 `-static` still apply on top of the file.
+
+## Waivers
+
+A crossing that is safe for a reason the RTL does not show is waived like any
+other mlint finding (`docs/LINT.md`): in a waiver file given with `-waivers`,
+or with a `// mlint: waive CDC001 reason` comment on the reading flop. `-msg`
+matches the text of the finding, which names the source, its clock and the
+reading clock, so one line waives one crossing and nothing else:
+
+```
+waive CDC001 -msg "'top.u_a.cfg' (clocked by top.aclk) is read by logic clocked by top.bclk*" -reason "held for four bclk cycles"
+waive CDC005 -file "*/status_sync.sv" -reason "both copies feed status only"
+waive RDC002 -msg "asynchronous reset 'top.por_n' *" -reason "released while both clocks are stopped"
+```
+
+A waived crossing is not printed and does not fail the run. It is counted
+(`4 findings (...), 3 waived`), shown with `-show-waived`, written to the
+`-json` report with its reason, and still listed by `-cdc-report`. A waiver
+that matches nothing is reported, so waivers of crossings that are gone do
+not pile up. Use `-static sig` instead when the signal is quasi-static for
+every reader.
 
 ## Threads
 

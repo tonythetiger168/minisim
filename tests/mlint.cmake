@@ -174,6 +174,36 @@ if(NOT out MATCHES "0 findings")
   message(FATAL_ERROR "cdc_seq.sv -cdc-depth 0:\n${out}")
 endif()
 
+# The reset tree: one-flop reset synchronizers and logic on a reset; a
+# two-flop synchronizer behind a scan mux is clean and in the report.
+run(rdc_tree.sv "-top;rdc_tree;-only;cdc,rdc;-cdc-report")
+foreach(want
+    "reset synchronizers: 4"
+    "rdc_tree.rst_n (rdc_tree.clk)  2 flops, resets 1 flop, from rdc_tree.por_n"
+    "rdc_tree.e2 (rdc_tree.clk)  2 flops, resets 1 flop"
+    "[RDC005] reset synchronizer 'rdc_tree.one_n' (clocked by rdc_tree.clk) is one flop"
+    "[RDC005] reset synchronizer 'rdc_tree.ext_q' (clocked by rdc_tree.clk) is one flop"
+    "[RDC006] asynchronous reset 'rdc_tree.both_n' of 1 flop is combinational logic of 2 flops ('rdc_tree.sw', 'rdc_tree.wd')"
+    "3 findings (RDC005 2, RDC006 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "rdc_tree.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
+# Crossing waivers: by source and reading clock, by file, and a reset.
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-waivers;${SRC}/tests/lint/cdc_waivers.cfg;-show-waived")
+foreach(want
+    "waived: [CDC001] 'cdc_bad.a1' (clocked by cdc_bad.aclk)"
+    "waived: [CDC005] 'cdc_bad.a3'"
+    "waived: [RDC002] asynchronous reset 'cdc_bad.rst_n'"
+    "4 findings (CDC002 1, CDC003 2, CDC004 1), 3 waived")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_bad.sv with waivers missing: ${want}\n${out}")
+  endif()
+endforeach()
+
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
 set(one "${out}")

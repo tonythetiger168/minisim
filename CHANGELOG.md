@@ -15,6 +15,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mlint` reset tree checks: `RDC005` (a reset synchronizer of one flop) and
+  `RDC006` (an asynchronous reset made by combinational logic of several
+  flops). `-cdc-report` lists the reset synchronizers, their length and how
+  many flops each resets.
 - `mlint` `CDC004` follows synchronized signals through flops: signals
   synchronized separately that meet again up to `-cdc-depth N` flops later
   (default 2) are reported, once per set of signals.

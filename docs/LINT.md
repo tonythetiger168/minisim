@@ -268,6 +268,8 @@ it. One-hot registers tested bit by bit are followed too.
 | `RDC002` | warning | on | One asynchronous reset used directly in several clock domains |
 | `RDC003` | warning | on | A flop feeds a flop with a different asynchronous reset, in one clock domain |
 | `RDC004` | warning | off | A reset flop feeds a flop with no asynchronous reset |
+| `RDC005` | warning | on | A reset synchronizer of one flop |
+| `RDC006` | warning | on | An asynchronous reset made by combinational logic of several flops |
 
 How domains and synchronizers are recognized, and the options `-cdc-report`,
 `-clock-group` and `-static`, are in [CDC.md](CDC.md).

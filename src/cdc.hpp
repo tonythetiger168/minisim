@@ -35,6 +35,8 @@
 //   RDC003  a flop with one asynchronous reset feeds a flop with another, in
 //           the same clock domain.
 //   RDC004  (off by default) ... feeds a flop with no asynchronous reset.
+//   RDC005  a reset synchronizer of one flop.
+//   RDC006  an asynchronous reset made by combinational logic of several flops.
 //
 // Constraints: -clock-group a,b says clocks are synchronous to each other
 // (one domain); -static s says a signal does not change while it is read.
@@ -1361,6 +1363,100 @@ struct Checker {
         }
     }
 
+    // A reset synchronizer: flops in a row with the same clock and the same
+    // asynchronous reset, the first one fed a constant (asserted at once,
+    // released on the clock), or flops with no reset that sample a reset
+    // input. Returns how many flops, 0 when `g` is something else.
+    int resetSyncStages(const Flop& g) const {
+        if (!g.plain) return 0;
+        int stages = 1;
+        const Flop* f = &g;
+        for (int guard = 0; guard < 16; guard++) {
+            if (!f->from) return f->arst.empty() ? 0 : stages;  // a constant behind the reset
+            Sym r = m.wireRoot(f->from);
+            const Flop* p = m.flopOf(r);
+            if (!p) {
+                // An input, sampled: a synchronizer when the flops have no reset.
+                const Comb* c = m.combOf(r);
+                return f->arst.empty() && g.arst.empty() && (!c || c->src.empty()) ? stages : 0;
+            }
+            if (p == f || !p->plain || p->dom != g.dom || p->arst != g.arst) return 0;
+            f = p;
+            stages++;
+        }
+        return stages;
+    }
+
+    // RDC005 / RDC006: how the asynchronous resets are made.
+    struct ResetSync {
+        const Flop* out;
+        int stages, flops;
+    };
+    std::vector<ResetSync> resetSyncs;
+    void resetTree() {
+        struct Use {
+            int flops = 0;
+            SourceLocation loc;
+            Sym dom = nullptr;
+        };
+        std::map<Sym, Use> uses;  // the reset as wired -> the flops it resets
+        std::vector<Sym> order;
+        for (const Flop& f : m.flops)
+            for (Sym a : f.arst) {
+                Sym r = m.wireRoot(a);
+                Use& u = uses[r];
+                if (!u.flops++) {
+                    u.loc = f.loc;
+                    u.dom = f.dom;
+                    order.push_back(r);
+                }
+            }
+        Tracer tr(m);
+        for (Sym r : order) {
+            const Use& u = uses[r];
+            if (m.statics.count(r)) continue;
+            // The flops behind it: the reset itself, or what a scan mux or a
+            // gate on it is fed.
+            std::vector<const Flop*> made;
+            bool logic = false;
+            if (const Flop* g = m.flopOf(r)) {
+                made.push_back(g);
+            } else {
+                for (const Root& root : tr.roots(r))
+                    if (const Flop* g = m.flopOf(root.sym); g && !m.statics.count(root.sym)) {
+                        made.push_back(g);
+                        logic = logic || root.logic;
+                    }
+            }
+            if (made.size() == 1) {
+                const Flop* g = made[0];
+                int stages = resetSyncStages(*g);
+                if (!stages) continue;
+                resetSyncs.push_back({g, stages, u.flops});
+                if (stages == 1)
+                    add("RDC005", g->loc,
+                            "reset synchronizer '" + m.name(*g) + "' (clocked by " + clocked(*g) + ") is one flop: " +
+                                "when the reset is released near a clock edge it can go metastable and release " +
+                                "the " + std::to_string(u.flops) + (u.flops == 1 ? " flop" : " flops") +
+                                " it resets at different times, so use two flops");
+                continue;
+            }
+            // Logic on a reset: two flops that change together can glitch it.
+            if (made.size() < 2 || !logic) continue;
+            std::vector<std::string> from;
+            for (const Flop* g : made) from.push_back(m.name(*g));
+            std::sort(from.begin(), from.end());
+            std::string names;
+            for (size_t i = 0; i < from.size() && i < 4; i++) names += (i ? ", '" : "'") + from[i] + "'";
+            if (from.size() > 4) names += ", ...";
+            add("RDC006", u.loc,
+                    "asynchronous reset '" + m.name(r) + "' of " + std::to_string(u.flops) +
+                        (u.flops == 1 ? " flop" : " flops") + " is combinational logic of " +
+                        std::to_string(from.size()) + " flops (" + names + "): when they change together the " +
+                        "logic can glitch and reset by accident, so register the reset after the logic");
+        }
+    }
+
     void rdc() {
         // Flops that make a reset (a reset synchronizer and the flops in front
         // of it) are where a raw reset is supposed to go.
@@ -1426,6 +1522,8 @@ struct Checker {
                         "synchronously to all of them, so give each domain a reset synchronizer");
         }
 
+        resetTree();
+
         // RDC003 / RDC004: within one clock domain, from a flop one reset can
         // clear at any time into a flop that reset does not clear.
         bool strict = rep.rules.enabled("RDC004");
@@ -1490,6 +1588,15 @@ struct Checker {
         os << "asynchronous resets: " << rsts.size() << "\n";
         for (auto& [d, k] : rsts) os << "  " << d << "  " << k << (k == 1 ? " flop\n" : " flops\n");
         std::vector<std::string> lines;
+        for (const ResetSync& r : resetSyncs)
+            lines.push_back("  " + m.name(*r.out) + " (" + clocked(*r.out) + ")  " + std::to_string(r.stages) +
+                            (r.stages == 1 ? " flop" : " flops") + ", resets " + std::to_string(r.flops) +
+                            (r.flops == 1 ? " flop" : " flops") +
+                            (r.out->arst.empty() ? "" : ", from " + m.name(m.resetRoot(r.out->arst[0]))));
+        std::sort(lines.begin(), lines.end());
+        os << "reset synchronizers: " << lines.size() << "\n";
+        for (auto& l : lines) os << l << "\n";
+        lines.clear();
         for (const Crossing& c : crossings) {
             const Flop& f = m.flops[c.flop];
             const Flop& s = *m.flopOf(c.src);

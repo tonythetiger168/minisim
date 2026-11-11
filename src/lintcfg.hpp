@@ -282,6 +282,8 @@ inline const std::vector<RuleInfo>& table() {
         {"RDC002", "rdc", Sev::Warning, true, "one asynchronous reset used directly in several clock domains", ""},
         {"RDC003", "rdc", Sev::Warning, true, "a flop feeds a flop with a different asynchronous reset, in one clock domain", ""},
         {"RDC004", "rdc", Sev::Warning, false, "a reset flop feeds a flop with no asynchronous reset", ""},
+        {"RDC005", "rdc", Sev::Warning, true, "a reset synchronizer of one flop", ""},
+        {"RDC006", "rdc", Sev::Warning, true, "an asynchronous reset made by combinational logic of several flops", ""},
     };
     return t;
 }
