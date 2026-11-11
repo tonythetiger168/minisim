@@ -1,0 +1,20 @@
+A small cell: femtofarad nodes need a smaller chgtol
+* The gate and the 1 fF load hold about 1e-15 C, under the default chgtol of
+* 1e-14 C, so by default the truncation test never shortens a step and tf
+* comes out 9% long whatever trtol is. The expected values are the converged
+* ones (reltol=1e-5, 1 ps steps).
+.option chgtol=1e-17 trtol=1
+.model nch nmos vto=0.4 kp=200u gamma=0.4 phi=0.65 lambda=0.05 tox=4n cgso=0.3n cgdo=0.3n cj=1m cjsw=0.2n
+.model pch pmos vto=-0.4 kp=80u gamma=0.4 phi=0.65 lambda=0.05 tox=4n cgso=0.3n cgdo=0.3n cj=1m cjsw=0.2n
+vdd vdd 0 1.2
+vin a 0 pwl(0 0 100p 0 633p 1.2)
+mp y a vdd vdd pch w=0.6u l=0.1u ad=0.1p as=0.1p pd=1u ps=1u
+mn y a 0 0 nch w=0.3u l=0.1u ad=0.05p as=0.05p pd=0.7u ps=0.7u
+cl y 0 1f
+.tran 20p 1.5n
+.meas tran tphl trig v(a) val=0.6 rise=1 targ v(y) val=0.6 fall=1
+.meas tran tf trig v(y) val=0.96 fall=1 targ v(y) val=0.24 fall=1
+*> tphl 5.37e-11 0.03
+*> tf 4.33e-11 0.03
+*> ngspice 0.04
+.end
