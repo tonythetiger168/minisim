@@ -77,6 +77,51 @@ int main() {
         r.parse("if {[catch {zap 1} m]} { set seen $m }\n", "e.upf");
         assert(r.get("seen") && r.get("seen")->find("unknown UPF command zap") != std::string::npos);
     }
+    // Value conversion tables (6.18, 6.28, Annex B)
+    {
+        auto& pre = predefinedVcts();
+        assert(pre.size() == 12);
+        auto h2u = [&](const char* t, char v) { return pre.at(t).toUpf(v); };
+        auto u2h = [&](const char* t, int st) { return pre.at(t).toHdl(st); };
+        assert(h2u("SV_LOGIC2UPF", '0') == S_OFF && h2u("SV_LOGIC2UPF", '1') == S_FULL_ON);
+        assert(h2u("SV_LOGIC2UPF", 'x') == S_UNDETERMINED && h2u("SV_LOGIC2UPF", 'Z') == S_UNDETERMINED);
+        assert(h2u("SV_LOGIC2UPF_GNDZERO", '0') == S_FULL_ON && h2u("SV_LOGIC2UPF_GNDZERO", '1') == S_OFF);
+        assert(u2h("UPF2SV_LOGIC", S_OFF) == '0' && u2h("UPF2SV_LOGIC", S_FULL_ON) == '1');
+        assert(u2h("UPF2SV_LOGIC", S_PARTIAL_ON) == 'X' && u2h("UPF2SV_LOGIC", S_UNDETERMINED) == 'X');
+        assert(u2h("UPF_GNDZERO2SV_LOGIC", S_OFF) == '1' && u2h("UPF_GNDZERO2SV_LOGIC", S_FULL_ON) == '0');
+        assert(h2u("VHDL_SL2UPF", 'H') == S_FULL_ON && h2u("VHDL_SL2UPF", 'L') == S_OFF && h2u("VHDL_SL2UPF", 'U') == S_UNDETERMINED);
+        assert(h2u("VHDL_SL2UPF", 'W') == S_UNDETERMINED && h2u("VHDL_SL2UPF", '-') == S_UNDETERMINED);
+        assert(h2u("VHDL_SL2UPF_GNDZERO", 'L') == S_FULL_ON && h2u("VHDL_SL2UPF_GNDZERO", '1') == S_OFF);
+        assert(u2h("UPF2VHDL_SL", S_FULL_ON) == '1' && u2h("UPF_GNDZERO2VHDL_SL", S_FULL_ON) == '0');
+        for (char v : std::string("01XZ")) assert(h2u("SV_TIED_HI", v) == S_FULL_ON && h2u("SV_TIED_LO", v) == S_OFF);
+        for (char v : std::string("UX01ZWLH-")) assert(h2u("VHDL_TIED_HI", v) == S_FULL_ON && h2u("VHDL_TIED_LO", v) == S_OFF);
+        Model m = load("create_supply_net VR\n"
+                       "create_hdl2upf_vct H -hdl_type {vhdl std_logic} -table {{'1' FULL_ON} {'H' PARTIAL_ON} {'0' off}}\n"
+                       "create_upf2hdl_vct U -hdl_type {sv} -table {{FULL_ON 1} {OFF z}}\n"
+                       "connect_supply_net VR -ports {u_a/p u_b/q} -vct U\n"
+                       "connect_supply_net VR -ports {u_c/r}\n");
+        const Vct* h = m.vct("H");
+        assert(h && h->hdl2upf && h->lang == "vhdl" && h->hdlType == "std_logic");
+        assert(h->toUpf('1') == S_FULL_ON && h->toUpf('h') == S_PARTIAL_ON && h->toUpf('0') == S_OFF && h->toUpf('Z') == S_UNDETERMINED);
+        const Vct* u = m.vct("U");
+        assert(u && !u->hdl2upf && u->toHdl(S_FULL_ON) == '1' && u->toHdl(S_OFF) == 'Z' && u->toHdl(S_PARTIAL_ON) == 'X');
+        assert(m.vct("SV_TIED_HI") && !m.vct("NOPE"));
+        assert(m.connectVct.at({"VR", "u_a/p"}) == "U" && m.connectVct.at({"VR", "u_b/q"}) == "U" && !m.connectVct.count({"VR", "u_c/r"}));
+        for (const char* bad : {"create_hdl2upf_vct H2 -table {{1 OFF}}\n",                       // no -hdl_type
+                                "create_hdl2upf_vct H2 -hdl_type {sc} -table {{1 OFF}}\n",       // not vhdl or sv
+                                "create_hdl2upf_vct H2 -hdl_type {sv} -table {{1 ON}}\n",        // not a supply state
+                                "create_hdl2upf_vct H2 -hdl_type {sv} -table {{U OFF}}\n",       // U is not SystemVerilog
+                                "create_hdl2upf_vct H2 -hdl_type {sv} -table {{1 OFF} {1 FULL_ON}}\n",
+                                "create_upf2hdl_vct U2 -hdl_type {sv} -table {{OFF 0 1}}\n",
+                                "create_upf2hdl_vct SV_TIED_HI -hdl_type {sv} -table {{OFF 0}}\n",
+                                "connect_supply_net VR -ports {p} -vct NOPE\n"}) {
+            bool threw = false;
+            try { load(std::string("create_supply_net VR\n") + bad); } catch (const Error& e) {
+                threw = std::string(e.what()).find("test_upf_tmp.upf:2") != std::string::npos;
+            }
+            assert(threw);
+        }
+    }
     // Expressions: precedence, unknowns, supply comparisons
     {
         EvalCtx c;

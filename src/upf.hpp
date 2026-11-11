@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "tcl.hpp"
+#include "upf_vct.hpp"
 
 namespace upf {
 
@@ -565,6 +566,16 @@ struct Model {
     std::map<std::string, std::string> portDir;     // supply port -> in / out
     std::map<std::string, std::string> resolve;     // supply net -> resolution
     std::map<std::string, std::vector<std::string>> connects;   // supply net -> ports it connects
+    std::map<std::string, Vct> vcts;                            // create_hdl2upf_vct / create_upf2hdl_vct
+    std::map<std::pair<std::string, std::string>, std::string> connectVct;   // {net, port} -> connect_supply_net -vct
+    std::map<std::pair<std::string, std::string>, std::string> connectWhere;
+    // A VCT by name: one made in this power intent, or a predefined one (Annex B).
+    const Vct* vct(const std::string& n) const {
+        auto it = vcts.find(n);
+        if (it != vcts.end()) return &it->second;
+        auto p = predefinedVcts().find(n);
+        return p == predefinedVcts().end() ? nullptr : &p->second;
+    }
     std::map<std::string, Switch> switches;
     std::vector<Isolation> isos;
     std::vector<LevelShifter> lss;
@@ -805,7 +816,48 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             Opts o = opts(c, {});
             need(o, 1, "a net name");
             std::string net = join(scope, o.pos[0]);
-            for (auto& p : o.list("-ports")) connects[net].push_back(join(scope, p));
+            std::string v = o.get("-vct");
+            if (!v.empty() && !vct(v)) throw Error(c.where() + ": connect_supply_net -vct: no value conversion table '" + v + "'");
+            for (auto& p : o.list("-ports")) {
+                std::string port = join(scope, p);
+                connects[net].push_back(port);
+                if (!v.empty()) connectVct[{net, port}] = v;
+                connectWhere[{net, port}] = c.where();
+            }
+            continue;
+        }
+        if (n == "create_hdl2upf_vct" || n == "create_upf2hdl_vct") {   // 6.18, 6.28
+            Opts o = opts(c, {});
+            need(o, 1, "a table name");
+            Vct v;
+            v.name = o.pos[0];
+            v.where = c.where();
+            v.hdl2upf = n == "create_hdl2upf_vct";
+            if (vct(v.name)) throw Error(c.where() + ": value conversion table " + v.name + " is already defined" +
+                                         (vcts.count(v.name) ? "" : " (Annex B)"));
+            auto ht = o.list("-hdl_type");
+            if (ht.empty()) throw Error(c.where() + ": " + n + " needs -hdl_type {vhdl|sv [typename]}");
+            v.lang = ht[0];
+            for (char& ch : v.lang) ch = (char)std::tolower((unsigned char)ch);
+            if (v.lang != "sv" && v.lang != "vhdl") throw Error(c.where() + ": -hdl_type " + ht[0] + ": the language is vhdl or sv");
+            if (ht.size() > 1) v.hdlType = ht[1];
+            if (!o.has("-table")) throw Error(c.where() + ": " + n + " needs -table {{from_value to_value} ...}");
+            std::set<std::string> seen;
+            for (auto& row : o.list("-table")) {
+                auto l = splitList(row);
+                if (l.size() != 2) throw Error(c.where() + ": -table row {" + row + "} is not {from_value to_value}");
+                const std::string& hdl = v.hdl2upf ? l[0] : l[1];
+                const std::string& st = v.hdl2upf ? l[1] : l[0];
+                if (Vct::stateNum(st) < 0)
+                    throw Error(c.where() + ": -table row {" + row + "}: '" + st + "' is not OFF, FULL_ON, PARTIAL_ON or UNDETERMINED");
+                if (!Vct::hdlChar(hdl, v.lang))
+                    throw Error(c.where() + ": -table row {" + row + "}: '" + hdl + "' is not a value of " +
+                                (v.lang == "sv" ? "SystemVerilog logic (0 1 X Z)" : "VHDL std_logic (U X 0 1 Z W L H -)"));
+                std::string from = v.hdl2upf ? std::string(1, Vct::hdlChar(hdl, v.lang)) : Vct::upper(st);
+                if (!seen.insert(from).second) throw Error(c.where() + ": -table has two rows for " + l[0]);
+                v.table.push_back({l[0], l[1]});
+            }
+            vcts[v.name] = v;
             continue;
         }
         if (n == "create_supply_set") {
@@ -1129,8 +1181,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             "add_state_transition", "create_power_state_group", "set_equivalent", "create_logic_net", "create_logic_port",
             "connect_logic_net", "set_repeater", "save_upf", "sim_assertion_control", "sim_corruption_control",
             "sim_replay_control", "load_simstate_behavior", "create_composite_domain", "set_retention_elements",
-            "set_retention_control", "define_power_model", "end_power_model", "apply_power_model", "create_hdl2upf_vct",
-            "create_upf2hdl_vct", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
+            "set_retention_control", "define_power_model", "end_power_model", "apply_power_model", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
             "define_retention_cell", "define_power_switch_cell", "define_always_on_cell", "define_diode_clamp",
             "map_retention_clamp_cell", "map_repeater_cell", "create_abstract_power_source", "set_pin_related_supply",
             "set_related_supply_net", "query_upf", "add_parameter"};
