@@ -73,7 +73,10 @@ A netlist read together with its whole cell library has many unused modules;
    then normalized (`u_core.cnt[3]`, `u_core_cnt_reg_3_` and
    `\u_core/cnt_reg[3]` are one name), then by the cell instance that holds
    the state, then by the net on the flop's output pin, which also finds
-   registers that synthesis stored inverted. A struct or memory that
+   registers that synthesis stored inverted. A register matched by name
+   whose next-state function still differs is retried with the other
+   polarity, which finds one stored inverted with no net left to show it
+   (a set-type register on a library whose flops only clear). A struct or memory that
    synthesis flattened is matched by bit position in the whole variable
    (`item.valid` of a 12-bit struct is `item_reg_11_`). `-match REF=IMPL` and
    `-matchfile` add pairs by hand.

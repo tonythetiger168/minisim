@@ -21,6 +21,7 @@
 // own solver, which makes every answer and counterexample the same whatever
 // the thread count.
 #include <algorithm>
+#include <set>
 #include "../parallel.hpp"
 #include <map>
 #include <string>
@@ -267,7 +268,12 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
 
 }  // namespace detail
 
-inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions& opt) {
+namespace detail {
+// One pass with a given polarity for every matched register: `flips` names
+// the implementation states to take with the opposite polarity from what the
+// names suggest.
+inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOptions& opt,
+                        const std::set<std::string>& flips) {
     Result res;
     using Keys = std::vector<std::vector<std::string>>;
     auto forcedPairs = [&](auto& rlist, auto& ilist, auto nameOf) {
@@ -353,6 +359,27 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         for (size_t i = 0; i < impl.states.size(); ++i)
             if (want[i] >= 0 && claim[want[i]] == int(i)) stMap[i] = want[i], stInv[i] = pass == 1;
     }
+    // A register matched by its cell's name may still be stored inverted: a
+    // library with only a clear-type flop holds a set-type register as its
+    // complement. The nets tell: the reference's name is on a net that
+    // carries !Q and on none that carries Q.
+    for (size_t i = 0; i < impl.states.size(); ++i) {
+        if (stMap[i] < 0 || stInv[i]) continue;
+        const State& is = impl.states[i];
+        const State& rs = ref.states[stMap[i]];
+        std::vector<std::string> names{normalize(rs.name)};
+        for (auto& a : rs.aliases) names.push_back(normalize(a));
+        auto carries = [&](const std::vector<std::string>& nets) {
+            for (auto& a : nets)
+                if (std::find(names.begin(), names.end(), normalize(a)) != names.end()) return true;
+            return false;
+        };
+        if (carries(is.invAliases) && !carries(is.aliases) &&
+            std::find(names.begin(), names.end(), normalize(is.name)) == names.end())
+            stInv[i] = 1;
+    }
+    for (size_t i = 0; i < impl.states.size(); ++i)
+        if (stMap[i] >= 0 && flips.count(impl.states[i].name)) stInv[i] = !stInv[i];
 
     // ---- match outputs
     rk.clear(), ik.clear();
@@ -557,6 +584,34 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         else ++res.aborted;
     }
     return res;
+}
+}  // namespace detail
+
+// Check the two designs. When registers were matched by name but their
+// next-state functions differ, synthesis may have stored them inverted with
+// no net left to say so (an internal set-type register on a library whose
+// flops only clear). Those are retried with the opposite polarity. Any
+// polarity under which every point passes is a proof: the outputs agree and
+// the matched registers stay in step, reset values included.
+inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions& opt) {
+    std::set<std::string> flips;
+    Result best = detail::checkOnce(g, ref, impl, opt, flips);
+    for (int round = 0; round < 4 && best.failed > 0; ++round) {
+        std::set<std::string> forced;
+        for (auto& [r, i] : opt.matches) forced.insert(i);
+        std::set<std::string> next = flips;
+        for (auto& p : best.points)
+            if (p.kind == Point::Next && p.status == Point::Fail && p.note.empty()) {
+                const std::string& in = p.implName.empty() ? p.name : p.implName;
+                if (!forced.count(in)) next.insert(in);
+            }
+        if (next.size() == flips.size()) break;
+        Result r = detail::checkOnce(g, ref, impl, opt, next);
+        if (r.failed >= best.failed) break;
+        best = std::move(r);
+        flips = std::move(next);
+    }
+    return best;
 }
 
 }  // namespace equiv
