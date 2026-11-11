@@ -81,7 +81,7 @@ One JSON file per product in `support/products/`:
 | Key | Meaning |
 |---|---|
 | `docs` | Markdown files under the documentation root. `file#Heading` takes only the sections whose title starts with `Heading`. A file or section that no longer exists is an error at start-up, and the test fails, so a renamed heading cannot silently empty an agent |
-| `access` | `public`: anyone may ask. `customer`: the request must carry a token (see below) |
+| `access` | `public`: anyone may ask. `customer`: the request must carry a licence that covers the product (see below) |
 | `run` | Leave it out and the agent has nothing to run. `flags` and `valued` are the only options the agent may pass |
 | `model`, `effort` | Per-product model settings |
 | `docs_root` | Where `docs` are read from; default is this repository for the files here, and the product file's own directory for files from elsewhere |
@@ -95,9 +95,18 @@ The nine free products each have a file: `msim`, `mwave`, `mcov`, `mregress`,
 product files from other directories. A commercial product ships its product
 file and its manuals in its own distribution, marks itself
 `"access": "customer"`, and is served by the same program; nothing about it
-is stored here. `-tokens FILE` names a file of SHA-256 hashes, one per
-customer token, and a customer product answers only a request with
-`Authorization: Bearer <token>` whose hash is in it.
+is stored here.
+
+A customer proves the entitlement with the licence file they already have
+for the tools: a short signed text file that names the licensee, the tools it
+covers and an expiry. `msupport -serve -license-key PUB.pem` is given the
+public key those licences are signed with (the same one the commercial tools
+are built against, so there is one secret, the private key, and it is not on
+the support server). A request for a customer product carries the licence
+text in its `license` field; the service checks the Ed25519 signature with
+`openssl`, the expiry and that the licence lists the product (`licensed_as`
+in the product file, default its name; `tools: all` covers every product),
+on every request. Without `-license-key`, customer products are closed.
 
 ## Running examples safely
 
@@ -136,7 +145,7 @@ key only in the service process's environment.
 |---|---|
 | `GET /` | A one-page chat with a product picker |
 | `GET /products` | The products: name, title, edition, access |
-| `POST /chat` `{"product", "message", "session"}` | `{"session", "answer", "usage"}` |
+| `POST /chat` `{"product", "message", "session", "license"}` | `{"session", "answer", "usage"}`; `license` only for a customer product |
 
 It keeps each conversation in memory by session id (the questions and the
 answers as text), limits questions per address per minute (`-per-minute`,
@@ -149,8 +158,8 @@ escalation as a JSON line: id, time, product, category, summary.
 `tests/msupport_test.py` runs without a network or an API key: every product
 file loads and indexes, searches return the right section, the option and
 source filters refuse what they should, a real `msim` runs an example and a
-runaway loop is stopped, the service enforces its limits and the customer
-check, and the whole agent loop runs through the Anthropic SDK against a
+runaway loop is stopped, the service enforces its limits and checks customers' licences
+(signed in the test with a throwaway key), and the whole agent loop runs through the Anthropic SDK against a
 fake Messages API (skipped when the `anthropic` package is not installed).
 
 ## Before going online
@@ -164,8 +173,9 @@ fake Messages API (skipped when the `anthropic` package is not installed).
 - **Privacy.** Users paste source code and logs. Decide what is stored and
   for how long, publish it, and tell users not to paste confidential code
   into a public desk.
-- **Customer sign-in.** The token file is a placeholder for whatever the
-  commercial license system issues.
+- **Licence handling online.** The licence text travels in each request;
+  the page keeps it in the browser only. Decide whether an id plus a server
+  copy is wanted instead, and how a leaked licence file is revoked.
 - **Tickets.** `escalate` writes a file; connect it to the issue tracker
   (`mbug` already speaks GitHub Issues, Jira and Redmine).
 - **Streaming.** Answers arrive whole; a long answer should stream.

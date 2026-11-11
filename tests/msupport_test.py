@@ -9,7 +9,8 @@ Without the binary the sandbox tests that need a simulator are skipped; the
 agent-loop test is skipped when the anthropic package is not installed.
 """
 import argparse
-import hashlib
+import shutil
+import subprocess
 import importlib.util
 import json
 import sys
@@ -109,38 +110,78 @@ class FakeDesk:
         return f"echo {len(history)}: {q}", {}
 
 
+def openssl_ed25519():
+    exe = shutil.which("openssl")
+    if not exe:
+        return False
+    return b"-rawin" in subprocess.run([exe, "pkeyutl", "-help"], capture_output=True).stderr
+
+
+def make_license(d, key, tools, expires, licensee="Acme Corporation"):
+    """What the licence issuer writes: the text, then its Ed25519 signature in base64."""
+    import base64
+    text = f"minisim license v1\nid: ML-TEST-1\nlicensee: {licensee}\nissued: 2026-01-01\nexpires: {expires}\ntools: {tools}\n"
+    Path(d, "signed").write_text(text)
+    subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", key, "-rawin", "-in", str(Path(d, "signed")),
+                    "-out", str(Path(d, "sig"))], check=True)
+    return text + "signature: " + base64.b64encode(Path(d, "sig").read_bytes()).decode() + "\n"
+
+
 class Web(unittest.TestCase):
-    def service(self, tokens=None):
+    def service(self, license_key=None):
         products = ms.load_products()
         with tempfile.TemporaryDirectory() as d:
             Path(d, "m.md").write_text("# M\ntext\n")
             Path(d, "p.json").write_text(json.dumps({"name": "paidtool", "access": "customer", "docs": ["m.md"]}))
             products.update(ms.load_products([d]))
-        args = argparse.Namespace(tokens=tokens, allow_run=False, tickets=None, per_minute=3)
+        args = argparse.Namespace(license_key=license_key, allow_run=False, tickets=None, per_minute=3)
         s = ms.Service(products, args)
         s.desk = lambda name: FakeDesk()
         return s
 
     def test_chat_and_limits(self):
         s = self.service()
-        code, r = s.chat({"product": "msim", "message": "hi"}, "", "1.1.1.1")
+        code, r = s.chat({"product": "msim", "message": "hi"}, "1.1.1.1")
         self.assertEqual((code, r["answer"]), (200, "echo 0: hi"))
-        code, r2 = s.chat({"product": "msim", "message": "again", "session": r["session"]}, "", "1.1.1.1")
+        code, r2 = s.chat({"product": "msim", "message": "again", "session": r["session"]}, "1.1.1.1")
         self.assertEqual(r2["answer"], "echo 2: again")
-        self.assertEqual(s.chat({"product": "nope", "message": "x"}, "", "1.1.1.1")[0], 400)
-        self.assertEqual(s.chat({"product": "msim", "message": ""}, "", "1.1.1.1")[0], 400)
-        s.chat({"product": "msim", "message": "3"}, "", "2.2.2.2")
-        s.chat({"product": "msim", "message": "3"}, "", "2.2.2.2")
-        s.chat({"product": "msim", "message": "3"}, "", "2.2.2.2")
-        self.assertEqual(s.chat({"product": "msim", "message": "4"}, "", "2.2.2.2")[0], 429)
+        self.assertEqual(s.chat({"product": "nope", "message": "x"}, "1.1.1.1")[0], 400)
+        self.assertEqual(s.chat({"product": "msim", "message": ""}, "1.1.1.1")[0], 400)
+        s.chat({"product": "msim", "message": "3"}, "2.2.2.2")
+        s.chat({"product": "msim", "message": "3"}, "2.2.2.2")
+        s.chat({"product": "msim", "message": "3"}, "2.2.2.2")
+        self.assertEqual(s.chat({"product": "msim", "message": "4"}, "2.2.2.2")[0], 429)
+        # A customer product is closed when the server has no licence key at all.
+        self.assertEqual(s.chat({"product": "paidtool", "message": "hi", "license": "x"}, "4.4.4.4")[0], 403)
 
-    def test_customer_products_need_a_token(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-            f.write(hashlib.sha256(b"secret-token").hexdigest() + "\n")
-        s = self.service(tokens=f.name)
-        self.assertEqual(s.chat({"product": "paidtool", "message": "hi"}, "", "3.3.3.3")[0], 403)
-        self.assertEqual(s.chat({"product": "paidtool", "message": "hi"}, "wrong", "3.3.3.3")[0], 403)
-        self.assertEqual(s.chat({"product": "paidtool", "message": "hi"}, "secret-token", "3.3.3.3")[0], 200)
+    @unittest.skipUnless(openssl_ed25519(), "no openssl with Ed25519 -rawin")
+    def test_customer_products_need_a_licence(self):
+        with tempfile.TemporaryDirectory() as d:
+            key, pub, other = str(Path(d, "k.pem")), str(Path(d, "pub.pem")), str(Path(d, "o.pem"))
+            for k in (key, other):
+                subprocess.run(["openssl", "genpkey", "-algorithm", "ed25519", "-out", k], check=True)
+            subprocess.run(["openssl", "pkey", "-in", key, "-pubout", "-out", pub], check=True)
+            good = make_license(d, key, "paidtool othertool", "2999-01-01")
+            every = make_license(d, key, "all", "never")
+            s = self.service(license_key=pub)
+            ask = lambda lic, who: s.chat({"product": "paidtool", "message": "hi", "license": lic}, who)
+            self.assertEqual(ask(None, "a")[0], 403)
+            self.assertEqual(ask(good, "b")[0], 200)
+            self.assertEqual(ask(good.replace("\n", "\r\n"), "b")[0], 200)       # pasted through a Windows editor
+            self.assertEqual(ask(every, "c")[0], 200)
+            code, r = ask(good.replace("Acme", "Acne"), "d")                    # edited after signing
+            self.assertEqual(code, 403)
+            self.assertIn("signature does not match", r["error"])
+            self.assertIn("expired", ask(make_license(d, key, "paidtool", "2020-01-01"), "e")[1]["error"])
+            self.assertIn("does not cover", ask(make_license(d, key, "othertool", "never"), "f")[1]["error"])
+            self.assertEqual(ask(make_license(d, other, "all", "never"), "g")[0], 403)   # someone else's key
+            self.assertEqual(ask("minisim license v1\ntools: all\nexpires: never\n", "h")[0], 403)
+            self.assertEqual(ask("hello", "i")[0], 403)
+            # The licence is checked on every request: a session id is not an entitlement.
+            sid = ask(good, "j")[1]["session"]
+            self.assertEqual(s.chat({"product": "paidtool", "message": "x", "session": sid}, "j")[0], 403)
+            # Public products never need one.
+            self.assertEqual(s.chat({"product": "msim", "message": "hi"}, "k")[0], 200)
 
 
 def fake_api(replies, seen):

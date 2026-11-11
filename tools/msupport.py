@@ -18,7 +18,7 @@ credentials come from the environment (ANTHROPIC_API_KEY). Everything else is
 the Python standard library.
 """
 import argparse
-import hashlib
+import base64
 import json
 import math
 import os
@@ -56,6 +56,7 @@ class Product:
         self.model = cfg.get("model", DEFAULT_MODEL)
         self.effort = cfg.get("effort", "medium")
         self.related = cfg.get("related", [])
+        self.licensed_as = cfg.get("licensed_as", self.name)   # the name a licence lists for it
         self.docs_root = Path(cfg["docs_root"]) if "docs_root" in cfg else None
 
 
@@ -493,6 +494,56 @@ class Desk:
                  "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0}
         return text, usage
 
+# ---------------------------------------------------------------- licences
+
+def check_license(text, pubkey, tool, today=None):
+    """Does this licence file entitle `tool`? A licence is the signed text
+    file the commercial tools read: a "minisim license v1" line, "key: value"
+    fields, and a last line "signature: <base64 Ed25519>" over every byte
+    above it. Verified with the same public key the tools are built against
+    (`openssl pkeyutl`, so no key handling is written here). Returns
+    (fields, None) or (None, reason)."""
+    data = text.replace("\r\n", "\n").encode("utf-8")
+    if len(data) > 8192:
+        return None, "that is too large to be a licence file"
+    fields, signed, sig, pos = {}, None, None, 0
+    for raw in data.split(b"\n"):
+        line = raw.decode("utf-8", "replace").strip()
+        if pos == 0 and line != "minisim license v1":
+            return None, "this is not a minisim licence file"
+        key, colon, val = line.partition(":")
+        if colon and key.strip() == "signature":
+            signed = data[:pos]
+            try:
+                sig = base64.b64decode(val.strip(), validate=True)
+            except ValueError:
+                return None, "the signature is not valid base64"
+            break
+        if colon:
+            fields[key.strip()] = val.strip()
+        pos += len(raw) + 1
+    if sig is None or len(sig) != 64:
+        return None, "the licence has no valid signature line"
+    with tempfile.TemporaryDirectory(prefix="msupport-lic-") as tmp:
+        Path(tmp, "signed").write_bytes(signed)
+        Path(tmp, "sig").write_bytes(sig)
+        try:
+            r = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(pubkey), "-rawin",
+                                "-in", str(Path(tmp, "signed")), "-sigfile", str(Path(tmp, "sig"))],
+                               capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return None, "licences cannot be checked on this server"
+    if r.returncode != 0:
+        return None, "the signature does not match the licence text"
+    today = today or time.strftime("%Y-%m-%d", time.gmtime())
+    exp = fields.get("expires", "")
+    if exp != "never" and (len(exp) != 10 or exp < today):      # an unreadable date counts as expired
+        return None, f"the licence expired on {exp}"
+    covered = fields.get("tools", "").split()
+    if covered != ["all"] and tool not in covered:
+        return None, f"this licence does not cover {tool}; it covers: {' '.join(covered)}"
+    return fields, None
+
 # ---------------------------------------------------------------- web
 
 PAGE = """<!doctype html><meta charset=utf-8><title>minisim support</title>
@@ -501,6 +552,7 @@ PAGE = """<!doctype html><meta charset=utf-8><title>minisim support</title>
 .u{background:#e8f0fe}.a{background:#f3f3f3}textarea{width:100%;height:5em}</style>
 <h2>minisim support</h2><p>Product <select id=p></select></p><div id=log></div>
 <textarea id=q placeholder="Ask about the selected product"></textarea><button id=b>Send</button>
+<details><summary>Licence (commercial products)</summary><textarea id=l placeholder="Paste your licence file"></textarea></details>
 <script>
 let sid=null;const $=id=>document.getElementById(id);
 fetch('products').then(r=>r.json()).then(l=>l.forEach(x=>{let o=document.createElement('option');
@@ -509,7 +561,7 @@ $('p').onchange=()=>{sid=null;$('log').textContent=''};
 function add(c,t){let d=document.createElement('div');d.className=c;d.textContent=t;$('log').append(d);return d}
 $('b').onclick=async()=>{let q=$('q').value.trim();if(!q)return;$('q').value='';add('u',q);let d=add('a','...');
 let r=await fetch('chat',{method:'POST',headers:{'content-type':'application/json'},
-body:JSON.stringify({product:$('p').value,session:sid,message:q})});let j=await r.json();
+body:JSON.stringify({product:$('p').value,session:sid,message:q,license:$('l').value||undefined})});let j=await r.json();
 sid=j.session||sid;d.textContent=j.answer||j.error};
 </script>"""
 
@@ -519,9 +571,7 @@ class Service:
         self.products, self.args = products, args
         self.desks, self.sessions, self.hits = {}, {}, {}
         self.lock = threading.Lock()
-        self.tokens = set()
-        if args.tokens:
-            self.tokens = {l.strip() for l in Path(args.tokens).read_text().splitlines() if l.strip()}
+        self.pubkey = args.license_key
 
     def desk(self, name):
         with self.lock:
@@ -530,11 +580,16 @@ class Service:
                                         require_isolation=True, tickets=self.args.tickets)
             return self.desks[name]
 
-    def allowed(self, product, bearer):
-        """A customer-only product needs a token whose SHA-256 is in the tokens file."""
+    def allowed(self, product, license_text):
+        """A customer-only product needs a licence that covers it. Returns
+        None when the request may go ahead, else the reason it may not."""
         if product.access == "public":
-            return True
-        return bool(bearer) and hashlib.sha256(bearer.encode()).hexdigest() in self.tokens
+            return None
+        if not self.pubkey:
+            return "this product's support desk is not open on this server"
+        if not isinstance(license_text, str) or not license_text.strip():
+            return "this product's support desk is for customers; send your licence file"
+        return check_license(license_text, self.pubkey, product.licensed_as)[1]
 
     def throttled(self, who):
         now = time.time()
@@ -544,12 +599,15 @@ class Service:
             self.hits[who] = recent
             return len(recent) > self.args.per_minute
 
-    def chat(self, body, bearer, who):
+    def chat(self, body, who):
         name, msg = body.get("product"), body.get("message")
         if name not in self.products or not isinstance(msg, str) or not msg.strip():
             return 400, {"error": "need a known product and a message"}
-        if not self.allowed(self.products[name], bearer):
-            return 403, {"error": "this product's support desk is for customers; sign in first"}
+        # The licence is checked on every request (it can expire mid-conversation,
+        # and a session id alone must not carry an entitlement).
+        why = self.allowed(self.products[name], body.get("license"))
+        if why:
+            return 403, {"error": why}
         if self.throttled(who):
             return 429, {"error": "too many questions; try again in a minute"}
         sid = body.get("session")
@@ -595,10 +653,8 @@ def serve(service, host, port):
                 body = json.loads(self.rfile.read(n))
             except ValueError:
                 return self.send(400, {"error": "not JSON"})
-            auth = self.headers.get("Authorization", "")
-            bearer = auth[7:] if auth.startswith("Bearer ") else ""
             try:
-                code, obj = service.chat(body, bearer, self.client_address[0])
+                code, obj = service.chat(body, self.client_address[0])
             except Exception as e:          # never leak a traceback to a user
                 print(f"msupport: {type(e).__name__}: {e}", file=sys.stderr)
                 code, obj = 500, {"error": "the support desk failed; please try again"}
@@ -627,7 +683,7 @@ def main(argv=None):
     ap.add_argument("-allow-run", action="store_true", help="with -serve: let agents run examples (isolation required)")
     ap.add_argument("-no-run", action="store_true", help="without -serve: do not run examples")
     ap.add_argument("-tickets", metavar="FILE", help="append escalations to this JSON-lines file")
-    ap.add_argument("-tokens", metavar="FILE", help="SHA-256 of each customer token, one per line")
+    ap.add_argument("-license-key", metavar="PEM", help="public key that customers' licence files are signed with")
     ap.add_argument("-per-minute", type=int, default=6, help="questions per address per minute (default 6)")
     args = ap.parse_args(argv)
 
