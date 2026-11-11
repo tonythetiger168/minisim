@@ -171,6 +171,35 @@ run(2 -lib ${LIB} gate.v -sdc gate.sdc -no_clock_gating_checks -fail_on_violatio
 want("min_period: 2 violations"
      "rn/CK            0.600       0.550      -0.050  (VIOLATED)")
 
+# --- latches and time borrowing (period 0.7, ideal clock; the same as OpenSTA).
+#  la is open while clk is low (from 0.35): r1's data is there at 0.338, in
+#    time, and la launches the next path when it opens.
+#  lb is open while clk is high (from 0.7): la's data arrives at 0.858, so
+#    0.158 is borrowed (at most the pulse width 0.35 less the setup time
+#    0.06) and the slack is 0. lb/Q then moves at 0 + 0.158 + 0.130 instead
+#    of with the opening edge at 0.144.
+#  lh is open from the edge that launches its data: it always borrows.
+run(0 -lib ${LIB} latch.v -sdc latch.sdc -e "report_timing -max_paths 20 -path end\; report_timing -to [get_pins lb/D]\; report_timing -to [get_pins r4/D]")
+want("lh/D (LATCH_X1)         0.158       0.158       0.000"
+     "lb/D (LATCH_X1)         0.858       0.858       0.000"
+     "r4/D (DFFN_X1)          0.295       0.288       0.007"
+     "la/D (LATCH_X1)         0.350       0.338       0.012"
+     "r2/D (DFF_X1)           0.644       0.588       0.056"
+     "Endpoint: lb (positive level-sensitive latch clocked by clk)"
+     "time borrowed from endpoint                   0.158      0.858"
+     "clk pulse width                           0.350"
+     "max time borrow                           0.290"
+     "actual time borrow                        0.158"
+     "time given to startpoint                      0.158      0.158"
+     "lb/Q (LATCH_X1)                               0.130      0.288 r")
+#  A limit on the borrowing: 0.05 of the 0.158 needed.
+run(0 -lib ${LIB} latch.v -sdc latch.sdc -e "set_max_time_borrow 0.05 [get_cells lb]\; report_timing -max_paths 20 -path end")
+want("lb/D (LATCH_X1)         0.750       0.858      -0.108  (VIOLATED)")
+#  Period 0.5: lb would need 0.332 and has 0.19; r4 behind it is late too.
+run(0 -lib ${LIB} latch.v -sdc latch.sdc -e "create_clock -name clk -period 0.5 [get_ports clk]\; report_timing -max_paths 20 -path end")
+want("lb/D (LATCH_X1)         0.690       0.832      -0.142  (VIOLATED)"
+     "la/D (LATCH_X1)         0.338       0.338       0.000")
+
 # --- exceptions and the rest of the constraints.
 #  clock groups cut clk2 from clk; latency 0.3 + 0.2 source on the ideal clk;
 #  the false path through x1/Y then m1/Y leaves sel as rb/D's worst path;

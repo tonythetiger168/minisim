@@ -703,7 +703,22 @@ library (sta_test) {
       data_in : "D";
     }
     pin (G) { direction : input; clock : true; capacitance : 0.002; }
-    pin (D) { direction : input; capacitance : 0.002; }
+    pin (D) {
+      direction : input;
+      capacitance : 0.002;
+      timing () {
+        related_pin : "G";
+        timing_type : setup_falling;
+        rise_constraint (scalar) { values ("0.06"); }
+        fall_constraint (scalar) { values ("0.05"); }
+      }
+      timing () {
+        related_pin : "G";
+        timing_type : hold_falling;
+        rise_constraint (scalar) { values ("0.02"); }
+        fall_constraint (scalar) { values ("0.03"); }
+      }
+    }
     pin (Q) {
       direction : output;
       function : "IQ";

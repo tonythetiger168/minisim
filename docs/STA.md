@@ -93,6 +93,17 @@ A report command takes `> FILE` or `>> FILE` at the end.
   other inputs block is removed, and one they make unate (an XOR with one
   input constant) keeps only that direction.
 - `set_disable_timing` on cells (`-from`, `-to`), library cells, pins and ports.
+- **Latches and time borrowing**. A latch's data pin is checked against the
+  edge that opens the latch: data that is there by then has positive slack
+  and the latch launches the next path with its enable. Data that arrives
+  while the latch is open borrows the lateness from the next path, up to the
+  closing edge less the setup time, the uncertainty and
+  `set_max_time_borrow`; the slack is then 0, or negative by what is still
+  missing. The paths from the latch's output start later by the borrowed
+  time (through the latch's data to output arc), which can make the next
+  latch borrow in turn; the analysis repeats until nothing changes.
+  `report_timing` shows "time borrowed from endpoint", "time given to
+  startpoint" and the borrowing limits.
 - **Clock gating checks** are inferred where a clock and a signal that is
   not one meet at a combinational cell on the way to a register's clock pin.
   With an AND or NAND the enable may only change while the clock is low:
@@ -199,8 +210,8 @@ These are not done yet, and each is either reported or documented here:
   crosstalk delay), and an RC network with loops is timed along a tree.
   Without SPEF nets are ideal apart from `set_load`; there are no wire load
   models.
-- Latches are timed as registers at the edge of their timing arcs: a latch's
-  `D` is an endpoint and its `D` to `Q` arc is not a path (no time borrowing).
+- Early (hold) analysis launches a latch's output with its opening edge
+  only; data passing through an open latch is not a min path.
 - On-chip variation is by factors only: no AOCV or POCV tables, no
   `set_timing_derate -increment`. Pessimism is not removed across a generated
   clock and its master. One library corner per run.

@@ -515,6 +515,10 @@ Spec references are IEEE 1800-2023 clauses.
   `set_min_pulse_width` (`report_min_pulse_width`, `report_min_period`).
   The Liberty reader keeps `min_pulse_width_high`, `min_pulse_width_low` and
   `min_period` of a pin.
+- `msta`: latch time borrowing. Latch data pins are checked against the
+  opening edge, late data borrows from the paths behind the latch
+  (`set_max_time_borrow`), and the borrowed time is passed on through any
+  number of latches. Same slacks as OpenSTA.
 
 ### Fixed
 - An inout port connected to a whole net is now that net (23.3.3.1). It was

@@ -167,6 +167,14 @@ struct CellInfo {
         const liberty::Arc* period = nullptr;
     };
     std::vector<Width> widths;
+    // A latch: data passes from d to an output while the enable g is open.
+    struct Latch {
+        int d = -1, g = -1;
+        int openRf = RISE;                       // the transition at g that opens it
+        const liberty::Arc* setup = nullptr;     // the setup check at d against the closing edge
+        std::vector<const liberty::Arc*> dq;     // d to output arcs
+    };
+    std::vector<Latch> latches;
     std::unordered_map<std::string, int> pinIdx;
     bool latch = false;
     // The function of each output pin with one, for constant propagation.
@@ -253,6 +261,10 @@ struct PathEnd {
     double capArr = 0;                  // capture clock network delay
     double unc = 0, lib = 0, ext = 0;   // uncertainty, library time, external delay
     double crpr = 0;                    // clock reconvergence pessimism removed
+    // A latch's data pin: the check is against the opening edge plus what
+    // the path borrows from the next one (at most maxBorrow).
+    bool latch = false;
+    double borrow = 0, maxBorrow = 0, pulse = 0;
     double required = 0, slack = 0;
     int exc = -1;                       // the exception that set the relation, or -1
     bool pathDelay = false;             // set_max_delay / set_min_delay
@@ -428,6 +440,26 @@ public:
         double setup = 0, hold = 0;
         int kind = 0;
     };
+    // Time borrowing. A latch whose data arrives after it opened hands the
+    // lateness on to the paths from its output; those seeds are found by
+    // the checks and used by the next propagation, until nothing changes.
+    struct LatchAt {
+        int inst, d, g;
+        const CellInfo::Latch* info;
+    };
+    std::vector<LatchAt> latchAt;
+    struct Borrow {
+        TagKey key;
+        int rf;
+        double arr, given;
+        bool operator==(const Borrow& o) const {
+            return key == o.key && rf == o.rf && std::fabs(arr - o.arr) < 1e-12 && std::fabs(given - o.given) < 1e-12;
+        }
+    };
+    std::unordered_map<int, std::vector<Borrow>> borrows;  // by output node
+    double maxBorrowAll = -1;                               // set_max_time_borrow
+    std::unordered_map<int, double> maxBorrowClk, maxBorrowInst;
+    int latchPasses = 0;
     GateSpec gateAll;
     std::unordered_map<int, GateSpec> gateClk, gateInst;
     bool gatingChecks = true;
@@ -512,6 +544,29 @@ public:
                 }
         for (size_t i = 0; i < c->pins.size(); i++)
             if (c->pins[i].minPulseHigh > 0 || c->pins[i].minPulseLow > 0 || c->pins[i].minPeriod > 0) ci.widths.push_back({(int)i});
+        for (auto& l : c->latches) {
+            // One data and one enable pin; anything else is timed as before.
+            try {
+                auto dv = liberty::parseFunction(l.dataIn).vars();
+                liberty::Expr en = liberty::parseFunction(l.enable);
+                auto ev = en.vars();
+                if (dv.size() != 1 || ev.size() != 1) continue;
+                auto di = ci.pinIdx.find(*dv.begin()), gi = ci.pinIdx.find(*ev.begin());
+                if (di == ci.pinIdx.end() || gi == ci.pinIdx.end()) continue;
+                CellInfo::Latch li;
+                li.d = di->second;
+                li.g = gi->second;
+                li.openRf = eval3(en, [](const std::string&) { return 1; }) == 1 ? RISE : FALL;
+                for (auto& a : c->arcs) {
+                    if (a.related == c->pins[li.d].name && a.type == liberty::ArcType::Comb) li.dq.push_back(&a);
+                    if (a.to == c->pins[li.d].name && a.related == c->pins[li.g].name &&
+                        (a.type == liberty::ArcType::SetupRising || a.type == liberty::ArcType::SetupFalling))
+                        li.setup = &a;
+                }
+                if (!li.dq.empty()) ci.latches.push_back(li);
+            } catch (liberty::Error&) {
+            }
+        }
         std::map<std::tuple<int, int, bool>, int> gidx;
         for (auto& a : c->arcs) {
             auto f = ci.pinIdx.find(a.related), t = ci.pinIdx.find(a.to);
@@ -682,7 +737,16 @@ public:
             for (auto& ck : ci->checks) {
                 int d = pinNode((int)i, ck.data), c = pinNode((int)i, ck.clk);
                 if (d < 0 || c < 0) continue;
-                checks.push_back({d, c, (int)i, ck.arc});
+                // A latch's setup check is part of its borrowing (latchEnds).
+                bool latchSetup = false;
+                for (auto& l : ci->latches) latchSetup = latchSetup || l.setup == ck.arc;
+                if (!latchSetup) checks.push_back({d, c, (int)i, ck.arc});
+                nodes[d].endpoint = true;
+            }
+            for (auto& l : ci->latches) {
+                int d = pinNode((int)i, l.d), g = pinNode((int)i, l.g);
+                if (d < 0 || g < 0) continue;
+                latchAt.push_back({(int)i, d, g, &l});
                 nodes[d].endpoint = true;
             }
         }
@@ -891,6 +955,9 @@ public:
         minPulse[0] = minPulse[1] = -1;
         minPulseClk.clear();
         minPulseAt.clear();
+        maxBorrowAll = -1;
+        maxBorrowClk.clear();
+        maxBorrowInst.clear();
         gateAll = GateSpec();
         gateClk.clear();
         gateInst.clear();
@@ -1171,6 +1238,24 @@ public:
                 } else {
                     int n = findNode(o.name);
                     if (n >= 0) put(slot(minPulseAt, n));
+                }
+            }
+        }
+        for (auto* c : s.of("set_max_time_borrow")) {
+            double v = c->num("delay") * T;
+            auto objs = c->objs("objects");
+            if (objs.empty()) maxBorrowAll = v;
+            for (auto& o : objs) {
+                if (o.kind == sdc::Kind::Clock) {
+                    auto it = clockByName.find(o.name);
+                    if (it != clockByName.end()) maxBorrowClk[it->second] = v;
+                } else {
+                    int i = o.kind == sdc::Kind::Cell ? findInst(o.name) : -1;
+                    if (o.kind == sdc::Kind::Pin) {
+                        int n = findNode(o.name);
+                        if (n >= 0) i = nodes[n].inst;
+                    }
+                    if (i >= 0) maxBorrowInst[i] = v;
                 }
             }
         }
@@ -1755,28 +1840,7 @@ public:
                     int dk = t.key.isClk && e.kind != LaunchEdge ? 1 : 0, dt = e.kind == NetEdge ? DNet : DCell;
                     if (t.key.isClk) {
                         if (e.kind == LaunchEdge) {
-                            key.isClk = 0;
-                            key.exc = launchMask(e.from, n, key.clk);
-                            if (crprOn && clocks[key.clk].propagated) {
-                                // One launching transition per register clock pin.
-                                int lrf = e.has(RISE, RISE) || e.has(RISE, FALL) ? RISE : FALL;
-                                cred = valid(t.arr[LATE][lrf]) ? t.arr[LATE][lrf] - t.arr[EARLY][lrf] : 0;
-                                if (cred > 1e-9) {
-                                    // The driver of the clock pin's net stands for
-                                    // every pin on it, unless the wire itself varies.
-                                    int at = e.from;
-                                    int pe = t.prevEdge[LATE][lrf];
-                                    if (pe >= 0 && pe == t.prevEdge[EARLY][lrf] && edges[pe].kind == NetEdge) {
-                                        const Derate& pd = hasDerate ? derateOf(pe) : derate;
-                                        double w = edges[pe].d[LATE][lrf][lrf] * pd.f[LATE][1][DNet][lrf] -
-                                                   edges[pe].d[EARLY][lrf][lrf] * pd.f[EARLY][1][DNet][lrf];
-                                        if (std::fabs(w) < 1e-12) at = edges[pe].from;
-                                    }
-                                    key.crpr = at * 2 + lrf;
-                                } else {
-                                    cred = 0;
-                                }
-                            }
+                            key = launchKey(t, e, n, cred);
                         } else {
                             zero = !clocks[key.clk].propagated;
                         }
@@ -1855,6 +1919,13 @@ public:
                             }
                     }
             }
+            if (!borrows.empty()) {
+                auto bi = borrows.find(n);
+                if (bi != borrows.end())
+                    for (auto& b : bi->second)
+                        for (auto& t : out)
+                            if (t.key == b.key && b.arr > t.arr[LATE][b.rf]) t.arr[LATE][b.rf] = b.arr;
+            }
             if (crprOn) {
                 // The clock network as a tree, for pruneCrpr: where a node
                 // has one way in, the variation at it is shared by all below.
@@ -1885,6 +1956,36 @@ public:
         for (auto& lv : levels) runLevel(lv, doNode);
         maxTags = 0;
         for (auto& t : tags) maxTags = std::max(maxTags, t.size());
+    }
+
+    // The key of the data a register launches: from the clock arrival t at
+    // its clock pin, over the launch edge e to the output n.
+    TagKey launchKey(const Tag& t, const Edge& e, int n, double& cred) const {
+        TagKey key = t.key;
+        key.isClk = 0;
+        key.exc = launchMask(e.from, n, key.clk);
+        cred = 0;
+        if (crprOn && clocks[key.clk].propagated) {
+            // One launching transition per register clock pin.
+            int lrf = e.has(RISE, RISE) || e.has(RISE, FALL) ? RISE : FALL;
+            cred = valid(t.arr[LATE][lrf]) ? t.arr[LATE][lrf] - t.arr[EARLY][lrf] : 0;
+            if (cred > 1e-9) {
+                // The driver of the clock pin's net stands for every pin on
+                // it, unless the wire itself varies.
+                int at = e.from;
+                int pe = t.prevEdge[LATE][lrf];
+                if (pe >= 0 && pe == t.prevEdge[EARLY][lrf] && edges[pe].kind == NetEdge) {
+                    const Derate& pd = hasDerate ? derateOf(pe) : derate;
+                    double w = edges[pe].d[LATE][lrf][lrf] * pd.f[LATE][1][DNet][lrf] -
+                               edges[pe].d[EARLY][lrf][lrf] * pd.f[EARLY][1][DNet][lrf];
+                    if (std::fabs(w) < 1e-12) at = edges[pe].from;
+                }
+                key.crpr = at * 2 + lrf;
+            } else {
+                cred = 0;
+            }
+        }
+        return key;
     }
 
     const Derate& derateOf(int ei) const {
@@ -2336,6 +2437,110 @@ public:
         (void)any;
     }
 
+    // Latches. The data must arrive before the latch closes, less the setup
+    // time. What arrives after the latch opened borrows from the paths that
+    // start at its output: they are launched that much later.
+    std::unordered_map<int, std::vector<Borrow>> newBorrows;
+    void latchEnds(std::vector<PathEnd>& out) {
+        for (auto& la : latchAt) {
+            const CellInfo::Latch& li = *la.info;
+            const std::vector<Tag>& gt = tags[la.g];
+            const std::vector<Tag>& dt = tags[la.d];
+            int orf = li.openRf, crf = 1 - orf;
+            std::vector<PathEnd> best;
+            for (size_t io = 0; io < gt.size(); io++) {
+                const Tag& to = gt[io];
+                if (!to.key.isClk || !valid(to.arr[LATE][orf])) continue;
+                for (size_t ic = 0; ic < gt.size(); ic++) {
+                    const Tag& tc = gt[ic];
+                    if (!tc.key.isClk || tc.key.clk != to.key.clk || tc.key.edge == to.key.edge) continue;
+                    if (!valid(tc.arr[EARLY][crf])) continue;
+                    const Clock& c = clocks[to.key.clk];
+                    double width = c.edgeT[tc.key.edge] - c.edgeT[to.key.edge];
+                    if (width <= 1e-12) width += c.period;
+                    double openArr = to.arr[LATE][orf];
+                    for (size_t d = 0; d < dt.size(); d++)
+                        for (int rf = 0; rf < 2; rf++) {
+                            double lib = 0;
+                            if (li.setup) {
+                                const liberty::Table& tb = rf == RISE ? li.setup->riseCons : li.setup->fallCons;
+                                if (!tb.empty()) lib = tb.constraint(nodes[la.d].slew[LATE][rf], nodes[la.g].slew[EARLY][crf]);
+                                if (hasDerate) lib *= derate.f[LATE][0][DCheck][rf];
+                            }
+                            std::vector<PathEnd> one;
+                            timeEnd(one, EndKind::Setup, la.d, (int)d, rf, tc.key.clk, tc.key.edge, tc.arr[EARLY][crf], lib, 0,
+                                    la.g, (int)ic, crf);
+                            if (one.empty()) continue;
+                            PathEnd pe = one[0];
+                            double open = pe.capT - width + openArr;  // when the latch opens
+                            double maxB = pe.required - open;         // closing, less setup and uncertainty
+                            auto lim = [&](double v) { if (v >= 0 && v < maxB) maxB = v; };
+                            lim(maxBorrowAll);
+                            auto mc = maxBorrowClk.find(tc.key.clk);
+                            if (mc != maxBorrowClk.end()) lim(mc->second);
+                            auto mi = maxBorrowInst.find(la.inst);
+                            if (mi != maxBorrowInst.end()) lim(mi->second);
+                            if (maxB < 0) maxB = 0;
+                            double b = pe.arrival - open;
+                            pe.latch = true;
+                            pe.pulse = width;
+                            pe.maxBorrow = maxB;
+                            pe.borrow = b <= 0 ? 0 : std::min(b, maxB);
+                            pe.capT -= width;
+                            pe.capEdge = to.key.edge;
+                            pe.capArr = openArr;
+                            pe.clkTag = (int)io;
+                            pe.clkRf = orf;
+                            pe.required = open + pe.borrow;
+                            pe.slack = pe.required - pe.arrival;
+                            if (std::fabs(pe.slack) < 1e-12) pe.slack = 0;
+                            bool placed = false;
+                            for (auto& x : best)
+                                if (x.capClk == pe.capClk) {
+                                    if (pe.slack < x.slack || (pe.slack == x.slack && pe.borrow > x.borrow)) x = pe;
+                                    placed = true;
+                                }
+                            if (!placed) best.push_back(pe);
+                            if (pe.borrow <= 1e-12) continue;
+                            // Hand the borrowed time to the output's paths.
+                            for (auto* a : li.dq) {
+                                auto qi = instInfo[la.inst]->pinIdx.find(a->to);
+                                if (qi == instInfo[la.inst]->pinIdx.end()) continue;
+                                int q = pinNode(la.inst, qi->second);
+                                if (q < 0) continue;
+                                const Edge* le = nullptr;
+                                for (int k = finOff[q]; k < finOff[q + 1]; k++) {
+                                    const Edge& e = edges[finIdx[k]];
+                                    if (e.kind == LaunchEdge && e.from == la.g && !e.disabled) le = &e;
+                                }
+                                if (!le) continue;
+                                double cred = 0;
+                                TagKey key = launchKey(to, *le, q, cred);
+                                if (nodes[q].hasThrough) applyThrough(q, key);
+                                for (int qrf = 0; qrf < 2; qrf++) {
+                                    bool pos = a->sense == liberty::Sense::Positive, neg = a->sense == liberty::Sense::Negative;
+                                    if ((pos && qrf != rf) || (neg && qrf == rf)) continue;
+                                    const liberty::Table& tb = qrf == RISE ? a->cellRise : a->cellFall;
+                                    if (tb.empty()) continue;
+                                    double dq = tb.lookup(nodes[la.d].slew[LATE][rf], nodes[q].load) * derate.f[LATE][0][DCell][qrf];
+                                    double v = openArr + pe.borrow + dq;
+                                    auto& list = newBorrows[q];
+                                    bool have = false;
+                                    for (auto& x : list)
+                                        if (x.key == key && x.rf == qrf) {
+                                            if (v > x.arr) { x.arr = v; x.given = pe.borrow; }
+                                            have = true;
+                                        }
+                                    if (!have) list.push_back({key, qrf, v, pe.borrow});
+                                }
+                            }
+                        }
+                }
+            }
+            for (auto& pe : best) out.push_back(pe);
+        }
+    }
+
     // Minimum pulse width and minimum period at clock pins.
     void widthChecks() {
         pulses.clear();
@@ -2518,6 +2723,8 @@ public:
         for (size_t p = 0; p < nPorts; p++) doPort(p);
         std::vector<PathEnd> gateEnds;
         if (gatingChecks) gatingEnds(gateEnds);
+        newBorrows.clear();
+        latchEnds(gateEnds);
 
         std::vector<char> hasEnd(nodes.size(), 0);
         std::set<int> unclk;
@@ -2593,12 +2800,36 @@ public:
         f();
         phases.push_back({what, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()});
     }
+    bool sameBorrows() const {
+        if (borrows.size() != newBorrows.size()) return false;
+        for (auto& [n, list] : newBorrows) {
+            auto it = borrows.find(n);
+            if (it == borrows.end() || it->second.size() != list.size()) return false;
+            for (auto& b : list)
+                if (std::find(it->second.begin(), it->second.end(), b) == it->second.end()) return false;
+        }
+        return true;
+    }
     void update() {
         if (timed) return;
         phase("levelize", [&] { levelize(); });
         phase("delays", [&] { computeDelays(); });
+        borrows.clear();
+        latchPasses = 0;
         phase("arrivals", [&] { propagate(); });
-        phase("checks", [&] { runChecks(); widthChecks(); });
+        phase("checks", [&] { runChecks(); });
+        // Borrowed time moves the arrivals behind the latches, which can
+        // make the next latch borrow: again until nothing changes.
+        while (!sameBorrows()) {
+            if (++latchPasses > 100) {
+                warn("latch", "time borrowing did not settle after 100 passes (a loop of latches that does not meet timing?)");
+                break;
+            }
+            borrows = newBorrows;
+            phase("arrivals (borrowing)", [&] { propagate(); });
+            phase("checks (borrowing)", [&] { runChecks(); });
+        }
+        phase("width checks", [&] { widthChecks(); });
         phase("design rules", [&] { designRules(); });
         timed = true;
     }

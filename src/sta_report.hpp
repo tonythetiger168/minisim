@@ -184,6 +184,15 @@ public:
             add(std::string("clock network delay (") + (L.propagated ? "propagated" : "ideal") + ")", ck, base + ck);
             prev = base + ck;
             add(point(steps[li - 1].node), 0, prev, steps[li - 1].rf == RISE ? 'r' : 'f');
+            // A latch that passed on time borrowed by the path into it.
+            auto bi = s.borrows.find(steps[li].node);
+            if (bi != s.borrows.end())
+                for (auto& b : bi->second)
+                    if (m == LATE && b.rf == steps[li].rf && b.key == s.tags[steps[li].node][steps[li].tag].key &&
+                        std::fabs(b.arr - steps[li].arr) < 1e-12) {
+                        prev += b.given;
+                        add("time given to startpoint", b.given, prev);
+                    }
         } else if (clockData) {
             double lat = steps[0].arr;
             add(std::string("clock network delay (") + (L.propagated ? "propagated" : "ideal") + ")", lat, base + lat);
@@ -224,6 +233,12 @@ public:
         }
         req += pe.capArr;
         add(std::string("clock network delay (") + (Cc.propagated && pe.clkNode >= 0 ? "propagated" : "ideal") + ")", pe.capArr, req);
+        if (pe.latch) {
+            // Against the opening edge, plus what is borrowed.
+            add(point(pe.clkNode), 0, req, pe.clkRf == RISE ? 'r' : 'f');
+            req += pe.borrow;
+            add("time borrowed from endpoint", pe.borrow, req);
+        } else {
         if (pe.crpr != 0) {
             req += late ? pe.crpr : -pe.crpr;
             add("clock reconvergence pessimism", late ? pe.crpr : -pe.crpr, req);
@@ -232,7 +247,9 @@ public:
             req += late ? -pe.unc : pe.unc;
             add("clock uncertainty", late ? -pe.unc : pe.unc, req);
         }
-        if (pe.clkNode >= 0) {
+        }
+        if (pe.latch) {
+        } else if (pe.clkNode >= 0) {
             add(point(pe.clkNode), 0, req, pe.clkRf == RISE ? 'r' : 'f');
             req += late ? -pe.lib : pe.lib;
             bool gate = pe.kind == EndKind::GateSetup || pe.kind == EndKind::GateHold;
@@ -285,7 +302,22 @@ public:
         os << "  " << std::left << std::setw((int)w) << (pe.slack < 0 ? "slack (VIOLATED)" : "slack (MET)") << std::right;
         if (o.showCap) os << std::setw(nw) << "";
         if (o.showTrans) os << std::setw(nw) << "";
-        os << std::setw(nw) << "" << std::setw(nw) << t(pe.slack, o.digits) << "\n\n\n";
+        os << std::setw(nw) << "" << std::setw(nw) << t(pe.slack, o.digits) << "\n\n";
+        if (pe.latch) {
+            auto row = [&](const std::string& text, double v) {
+                os << "  " << std::left << std::setw(36) << text << std::right << std::setw(nw) << t(v, o.digits) << "\n";
+            };
+            os << "  Time Borrowing Information\n  " << std::string(36 + nw, '-') << "\n";
+            row(Cc.name + " pulse width", pe.pulse);
+            if (pe.lib != 0) row("library setup time", -pe.lib);
+            if (pe.unc != 0) row("clock uncertainty", -pe.unc);
+            if (pe.crpr != 0) row("clock reconvergence pessimism", pe.crpr);
+            os << "  " << std::string(36 + nw, '-') << "\n";
+            row("max time borrow", pe.maxBorrow);
+            row("actual time borrow", pe.borrow);
+            os << "  " << std::string(36 + nw, '-') << "\n\n";
+        }
+        os << "\n";
     }
 
     // ---------------------------------------------------------- constraints
