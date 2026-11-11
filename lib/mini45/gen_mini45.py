@@ -4,23 +4,31 @@
 mini45 is a made-up 45 nm-class library for testing the tool line: synthesis
 maps to it, timing and power read it, place and route uses its LEF, and the
 gate-level netlists simulate against its Verilog models. Nothing in it comes
-from a foundry or from another library; the numbers come from the small
-analytic model below (logical effort for delay, simple energy and leakage
-rules), which gives tables with the right shape and ordering:
-a stronger drive is faster and bigger, a stack is slower, a slow corner is
-slower and a hot one leaks more. Do not use it for a real chip.
+from a foundry or from another library. Do not use it for a real chip.
+
+This script writes everything but the Liberty files:
 
     python3 gen_mini45.py            # rewrite the files next to this script
     python3 gen_mini45.py --check    # exit 1 if a file on disk is out of date
 
-Files written:
-    mini45_tt.lib   typical  1.10 V   25 C
-    mini45_ss.lib   slow     0.95 V  125 C
-    mini45_ff.lib   fast     1.25 V  -40 C
     mini45.v        Verilog models (functional, specify paths for SDF)
     mini45_tech.lef technology LEF (site, 6 metal layers, vias)
     mini45.lef      cell LEF (macros with pin shapes)
     mini45_tb.sv    self-checking bench: Verilog models against the functions
+    mini45.sp       transistor netlists, one .subckt per cell
+    mini45_models_{tt,ss,ff}.sp   level-1 MOSFET models per corner
+
+The Liberty files (mini45_tt.lib 1.10 V 25 C, mini45_ss.lib 0.95 V 125 C,
+mini45_ff.lib 1.25 V -40 C) are measured: characterize.sh runs mchar on the
+transistor netlists. What to measure comes from templates this script
+writes with
+
+    python3 gen_mini45.py --templates DIR
+
+The templates carry numbers from a small analytic model (logical effort for
+delay, simple energy and leakage rules). mchar replaces them, except the
+leakage values, the tristate enable and disable arcs and the minimum pulse
+widths, which stay analytic (docs/MINI45.md says why).
 """
 import itertools
 import math
@@ -660,6 +668,7 @@ def verilog():
 
 # ------------------------------------------------------------ LEF
 M1_W = 0.07
+PIN_H = 0.21            # um: 0.07 x 0.21 is the metal1 minimum area
 
 def tech_lef():
     s = "# mini45 technology LEF: a made-up 45 nm-class stack for testing tools.\n"
@@ -708,6 +717,15 @@ def tech_lef():
         else:
             s += "  LAYER %s ;\n    RECT %.3f %.3f %.3f %.3f ;\n" % (hi[0], -hi[3] / 2 if hi[3] >= cw else -h, -e2 - 0.03, hi[3] / 2 if hi[3] >= cw else h, e2 + 0.03)
         s += "END via%d_0\n\n" % n
+        if n == 1:
+            # The same cut with a vertical metal1 pad, the shape of a cell
+            # pin: two of them fit on neighbouring metal2 tracks, where the
+            # horizontal pads of via1_0 would be closer than the spacing.
+            s += "VIA via1_1 DEFAULT\n  RESISTANCE %.1f ;\n" % hi[9][3]
+            s += "  LAYER %s ;\n    RECT %.3f %.3f %.3f %.3f ;\n" % (lo[0], -lo[3] / 2, -PIN_H / 2, lo[3] / 2, PIN_H / 2)
+            s += "  LAYER %s ;\n    RECT %.4f %.4f %.4f %.4f ;\n" % (cn, -h, -h, h, h)
+            s += "  LAYER %s ;\n    RECT %.3f %.3f %.3f %.3f ;\n" % (hi[0], -hi[3] / 2 if hi[3] >= cw else -h, -e2 - 0.03, hi[3] / 2 if hi[3] >= cw else h, e2 + 0.03)
+            s += "END via1_1\n\n"
     s += "END LIBRARY\n"
     return s
 
@@ -724,7 +742,8 @@ def cell_lef():
             raise SystemExit("%s: %d pins do not fit %d sites" % (c.name, len(pins), c.sites))
         # One metal2 track per pin, spread over the cell, on metal1 tracks 3..7
         # in a zigzag so neighbours keep their spacing. Each shape is a
-        # metal1 bar centred on a metal1 track, covering its metal2 track.
+        # vertical metal1 bar centred on a metal1 track, covering its metal2
+        # track, and tall enough to meet the metal1 area rule on its own.
         used = []
         for n, (p, d) in enumerate(pins):
             col = int(round((n + 0.5) * c.sites / len(pins) - 0.5))
@@ -737,7 +756,7 @@ def cell_lef():
                 p, d, " TRISTATE" if (c.tri and d == "OUTPUT") else "",
                 "CLOCK" if p == "CK" and c.seq else "SIGNAL")
             s += "    PORT\n      LAYER metal1 ;\n        RECT %.3f %.3f %.3f %.3f ;\n    END\n  END %s\n" % (
-                x - M1_W / 2, y - 0.07, x + M1_W / 2, y + 0.07, p)
+                x - M1_W / 2, y - PIN_H / 2, x + M1_W / 2, y + PIN_H / 2, p)
         for p, use, y in (("VDD", "POWER", ROW_H), ("VSS", "GROUND", 0.0)):
             s += "  PIN %s\n    DIRECTION INOUT ;\n    USE %s ;\n    SHAPE ABUTMENT ;\n" % (p, use)
             s += "    PORT\n      LAYER metal1 ;\n        RECT 0.000 %.3f %.3f %.3f ;\n    END\n  END %s\n" % (y - rail, w, y + rail, p)
@@ -882,6 +901,232 @@ def testbench():
     s += "        $display(\"mini45: %0d cells checked, %0d errors\", cells, errors);\n        $finish;\n    end\nendmodule\n"
     return s
 
+# ------------------------------------------------------------ transistors
+# Transistor netlists for the characterizer (mchar on mspice). Static CMOS
+# with level-1 MOSFETs; the devices are as made up as the rest of mini45.
+L_GATE = 0.05            # um
+WN = 0.20                # um, INV_X1 pull-down
+WP = 0.30                # um, INV_X1 pull-up
+DIFF = 0.10              # um, source/drain length
+
+MODELS = {
+    # corner: (nmos vto, nmos kp, pmos vto, pmos kp)
+    # A level-1 device's mobility falls as T^-1.5, far more than a short
+    # channel's current does, so kp leans the other way at the hot and cold
+    # corners: slow over fast comes out near 2.5, not 5.
+    "tt": (0.35, 105e-6, -0.35, 54e-6),
+    "ss": (0.37, 136e-6, -0.37, 70e-6),
+    "ff": (0.33, 84e-6, -0.33, 43e-6),
+}
+
+def spice_models(corner):
+    vtn, kpn, vtp, kpp = MODELS[corner]
+    _, vdd, temp, _, _ = CORNERS[corner]
+    common = "tox=2n gamma=0.3 phi=0.7 lambda=0.1 cgso=0.15n cgdo=0.15n cj=1.2m mj=0.5 cjsw=0.25n mjsw=0.33 pb=0.8"
+    return ("* mini45 %s corner: device models and conditions for the cell netlists.\n"
+            "* Made up, not a foundry model. Generated by gen_mini45.py; do not edit.\n"
+            "* Supply and temperature come from the Liberty corner: %g V, %g C.\n"
+            ".model nch nmos level=1 vto=%g kp=%g %s\n"
+            ".model pch pmos level=1 vto=%g kp=%g %s\n"
+            % (corner, vdd, temp, vtn, kpn, common, vtp, kpp, common))
+
+class Sub:
+    """One .subckt: static CMOS gates, transmission gates, tristate inverters."""
+    def __init__(self, name, pins):
+        self.name, self.pins, self.lines, self.k, self.m = name, pins, [], 0, 0
+
+    def net(self):
+        self.k += 1
+        return "n%d" % self.k
+
+    def mos(self, kind, d, g, s, w):
+        self.m += 1
+        w = max(w, 0.12)
+        self.lines.append("m%d %s %s %s %s %s w=%su l=%su ad=%sp as=%sp pd=%su ps=%su"
+                          % (self.m, d, g, s, "vss" if kind == "n" else "vdd", "nch" if kind == "n" else "pch",
+                             fmt(w), fmt(L_GATE), fmt(w * DIFF), fmt(w * DIFF),
+                             fmt(2 * (w + DIFF)), fmt(2 * (w + DIFF))))
+
+    def network(self, kind, e, top, bot, w):
+        """e is a net name, ('s', ...) in series or ('p', ...) in parallel."""
+        if isinstance(e, str):
+            self.mos(kind, top, e, bot, w)
+        elif e[0] == "s":
+            kids = e[1:]
+            nodes = [top] + [self.net() for _ in kids[1:]] + [bot]
+            for i, kid in enumerate(kids):
+                self.network(kind, kid, nodes[i], nodes[i + 1], w * len(kids))
+        else:
+            for kid in e[1:]:
+                self.network(kind, kid, top, bot, w)
+
+    @staticmethod
+    def dual(e):
+        if isinstance(e, str):
+            return e
+        return ("p" if e[0] == "s" else "s",) + tuple(Sub.dual(k) for k in e[1:])
+
+    def gate(self, out, pd, size=1.0):
+        """out = !(pd): pd is the pull-down network, the pull-up is its dual."""
+        self.network("n", pd, out, "vss", WN * size)
+        self.network("p", Sub.dual(pd), "vdd", out, WP * size)
+        return out
+
+    def inv(self, out, a, size=1.0):
+        return self.gate(out, a, size)
+
+    def tgate(self, a, b, gn, gp, size=1.0):
+        self.mos("n", a, gn, b, WN * size)
+        self.mos("p", a, gp, b, WP * size)
+
+    def tinv(self, out, a, en, enb, size=1.0):
+        """Tristate inverter: drives out = !a while en is high (enb low)."""
+        x, y = self.net(), self.net()
+        self.mos("n", out, en, x, 2 * WN * size)
+        self.mos("n", x, a, "vss", 2 * WN * size)
+        self.mos("p", out, enb, y, 2 * WP * size)
+        self.mos("p", y, a, "vdd", 2 * WP * size)
+
+    def text(self):
+        return (".subckt %s %s vdd vss\n" % (self.name.lower(), " ".join(p.lower() for p in self.pins))
+                + "".join(l + "\n" for l in self.lines) + ".ends\n")
+
+def cell_netlist(c):
+    pins = list(c.inputs) + list(c.outputs)
+    x = Sub(c.name, pins)
+    d = float(c.drive)
+    pre = max(1.0, d / 3.0)              # the stage in front of an output inverter
+    k = c.kind
+    ins = c.inputs
+    S = lambda *a: ("s",) + a
+    P = lambda *a: ("p",) + a
+    if k in ("INV", "CLKINV"):
+        x.inv("Y", "A", d)
+    elif k in ("BUF", "CLKBUF"):
+        x.inv("Y", x.inv(x.net(), "A", pre), d)
+    elif k.startswith("NAND"):
+        x.gate("Y", S(*ins), d)
+    elif k.startswith("NOR"):
+        x.gate("Y", P(*ins), d)
+    elif k.startswith("AND"):
+        x.inv("Y", x.gate(x.net(), S(*ins), pre), d)
+    elif k.startswith("OR"):
+        x.inv("Y", x.gate(x.net(), P(*ins), pre), d)
+    elif k in ("XOR2", "XNOR2"):
+        an, bn = x.inv(x.net(), "A"), x.inv(x.net(), "B")
+        core = P(S("A", bn), S(an, "B")) if k == "XOR2" else P(S("A", "B"), S(an, bn))
+        x.inv("Y", x.gate(x.net(), core, pre), d)
+    elif k == "AOI21":
+        x.gate("Y", P(S("A1", "A2"), "B"), d)
+    elif k == "AOI22":
+        x.gate("Y", P(S("A1", "A2"), S("B1", "B2")), d)
+    elif k == "AOI211":
+        x.gate("Y", P(S("A1", "A2"), "B", "C"), d)
+    elif k == "OAI21":
+        x.gate("Y", S(P("A1", "A2"), "B"), d)
+    elif k == "OAI22":
+        x.gate("Y", S(P("A1", "A2"), P("B1", "B2")), d)
+    elif k == "OAI211":
+        x.gate("Y", S(P("A1", "A2"), "B", "C"), d)
+    elif k == "MUX2":
+        sn = x.inv(x.net(), "S")
+        x.inv("Y", x.gate(x.net(), P(S("A", sn), S("B", "S")), pre), d)
+    elif k == "MUX4":
+        s0n, s1n = x.inv(x.net(), "S0"), x.inv(x.net(), "S1")
+        lo = x.gate(x.net(), P(S("A", s0n), S("B", "S0")))
+        hi = x.gate(x.net(), P(S("C", s0n), S("D", "S0")))
+        y = x.gate(x.net(), P(S(lo, s1n), S(hi, "S1")))
+        x.inv("Y", x.inv(x.net(), y, pre), d)
+    elif k == "HA":
+        an, bn = x.inv(x.net(), "A"), x.inv(x.net(), "B")
+        x.inv("S", x.gate(x.net(), P(S("A", bn), S(an, "B")), pre), d)
+        x.inv("CO", x.gate(x.net(), S("A", "B"), pre), d)
+    elif k == "FA":
+        con = x.gate(x.net(), P(S("A", "B"), S("CI", P("A", "B"))))
+        sn = x.gate(x.net(), P(S("A", "B", "CI"), S(con, P("A", "B", "CI"))))
+        x.inv("CO", con, d)
+        x.inv("S", sn, d)
+    elif k == "TBUF":
+        enb = x.inv(x.net(), "EN")
+        pg = x.gate(x.net(), S("A", "EN"), pre)
+        ng = x.gate(x.net(), P("A", enb), pre)
+        x.mos("p", "Y", pg, "vdd", WP * d)
+        x.mos("n", "Y", ng, "vss", WN * d)
+    elif c.seq and c.seq["type"] == "ff":
+        q = c.seq
+        din = "D"
+        if q["scan"]:
+            sen = x.inv(x.net(), "SE")
+            din = x.inv(x.net(), x.gate(x.net(), P(S("SI", "SE"), S("D", sen))))
+        s2 = x.net()
+        if "E" in ins:
+            en = x.inv(x.net(), "E")
+            din = x.inv(x.net(), x.gate(x.net(), P(S("D", "E"), S(s2, en))))
+        ckn = x.inv(x.net(), "CK")
+        ckb = x.inv(x.net(), ckn)
+        m1, m2, s1 = x.net(), x.net(), x.net()
+        r = x.inv(x.net(), "RN") if q["rn"] else None
+        s = x.inv(x.net(), "SN") if q["sn"] else None
+        # Master, open while CK is low: m1 = D, m2 = !D.
+        x.tgate(din, m1, ckn, ckb)
+        if r and s:
+            x.gate(m2, S(P(m1, s), "RN"))
+        elif r:
+            x.gate(m2, S(m1, "RN"))
+        elif s:
+            x.gate(m2, P(m1, s))
+        else:
+            x.inv(m2, m1)
+        x.tinv(m1, m2, ckb, ckn, 0.5)
+        # Slave, open while CK is high: s1 = !D, s2 = D.
+        x.tgate(m2, s1, ckb, ckn)
+        if r and s:
+            x.gate(s2, P(S(s1, "SN"), r))
+        elif r:
+            x.gate(s2, P(s1, r))
+        elif s:
+            x.gate(s2, S(s1, "SN"))
+        else:
+            x.inv(s2, s1)
+        x.tinv(s1, s2, ckn, ckb, 0.5)
+        x.inv("Q", s1, d)
+        x.inv("QN", s2, d)
+    elif c.seq and c.seq["type"] == "latch":
+        e = "E" if "E" in ins else "EN"
+        a = x.inv(x.net(), e)
+        b = x.inv(x.net(), a)
+        on, onb = (b, a) if e == "E" else (a, b)      # on is high while the latch is open
+        l1, l2 = x.net(), x.net()
+        x.tgate("D", l1, on, onb)
+        x.inv(l2, l1)
+        x.tinv(l1, l2, onb, on, 0.5)
+        x.inv("Q", l2, d)
+    elif c.seq and c.seq["type"] == "icg":
+        ckn = x.inv(x.net(), "CK")
+        ckb = x.inv(x.net(), ckn)
+        l1, l2 = x.net(), x.net()
+        x.tgate(x.gate(x.net(), P("E", "SE")), l1, ckn, ckb)
+        x.inv(l2, l1)
+        x.tinv(l1, l2, ckb, ckn, 0.5)
+        x.inv("GCK", x.gate(x.net(), S("CK", l2), pre), d)
+    elif k == "TIE1":
+        g = x.net()
+        x.mos("n", g, g, "vss", WN)
+        x.mos("p", "Y", g, "vdd", WP)
+    elif k == "TIE0":
+        g = x.net()
+        x.mos("p", g, g, "vdd", WP)
+        x.mos("n", "Y", g, "vss", WN)
+    return x.text()
+
+def spice():
+    s = ("* mini45 transistor netlists: one .subckt per cell, pins in the order of the\n"
+         "* Liberty cell (inputs, then outputs), then vdd and vss. Models nch and pch come\n"
+         "* from mini45_models_<corner>.sp. Generated by gen_mini45.py; do not edit.\n")
+    for c in CELLS:
+        s += "\n" + cell_netlist(c)
+    return s
+
 # ------------------------------------------------------------ main
 def main():
     files = {
@@ -889,9 +1134,19 @@ def main():
         "mini45_tech.lef": tech_lef(),
         "mini45.lef": cell_lef(),
         "mini45_tb.sv": testbench(),
+        "mini45.sp": spice(),
     }
     for corner in CORNERS:
-        files["mini45_%s.lib" % corner] = liberty(corner)
+        files["mini45_models_%s.sp" % corner] = spice_models(corner)
+    if "--templates" in sys.argv:
+        # The analytic Liberty files: what to measure, for characterize.sh.
+        out = sys.argv[sys.argv.index("--templates") + 1]
+        os.makedirs(out, exist_ok=True)
+        for corner in CORNERS:
+            with open(os.path.join(out, "mini45_%s.lib" % corner), "w") as f:
+                f.write(liberty(corner))
+        print("mini45: %d template libraries in %s" % (len(CORNERS), out))
+        return
     check = "--check" in sys.argv
     stale = 0
     for name, text in sorted(files.items()):

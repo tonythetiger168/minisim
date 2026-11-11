@@ -1,0 +1,30 @@
+Resistor network with every controlled source
+v1 a 0 dc 10
+r1 a b 1k
+r2 b 0 1k
+e1 c 0 b 0 2
+r3 c 0 1k
+g1 0 d b 0 1m
+r4 d 0 2k
+vs b e 0
+r5 e 0 5k
+f1 0 f vs 3
+r6 f 0 1k
+h1 g 0 vs 2k
+r7 g 0 1k
+.dc v1 0 10 1
+.print dc v(b) v(c) v(d) v(f) v(g) i(v1)
+.meas dc vb find v(b) at=10
+.meas dc vc find v(c) at=10
+.meas dc vd find v(d) at=10
+.meas dc vf find v(f) at=10
+.meas dc vg find v(g) at=10
+.meas dc iv find i(v1) at=10
+* b: 1k from 10 V, 1k || 5k to ground -> 10 * 833.33/1833.33 = 4.54545
+*> vb 4.5454545 1e-6
+*> vc 9.0909091 1e-6
+*> vd 9.0909091 1e-6
+*> vf 2.7272727 1e-6
+*> vg 1.8181818 1e-6
+*> iv -5.4545455e-3 1e-6
+.end

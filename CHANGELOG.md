@@ -8,6 +8,37 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
+  elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
+  the default waveform is unchanged. `mdebug -active` follows a memory read
+  to the element and the write that filled it.
+- `mpnr -lib FILE -sdc FILE`: timing of the placed design with the engine
+  behind `msta` (wires estimated from the placement), reported after global
+  placement and after legalization with the clocks propagated through
+  their trees (setup and hold WNS/TNS, skew per clock), and timing-driven
+  placement: nets on slow paths are weighted in a second placement pass
+  (`-no_timing_driven` to only report).
+- `mpnr` clock tree synthesis: every clock net with more loads than
+  `-cts_fanout` (16) gets a tree of buffers, clustered by position level by
+  level down to one root buffer, so every flop sits behind the same number
+  of buffers. On by default (`-no_cts`); `-cts_buf CELL`, `-clock NET`. The
+  buffers are in the DEF and the written netlist, and the run reports the
+  shortest and longest driver-to-load wire of each tree.
+- `mdebug`: struct fields in the active-driver trace (conditions on a field
+  are evaluated; each field and constant part select has its own driver).
+- `mpnr` on `lib/mini45`: a pin too small for the LEF's via pad gets a via
+  made for it (lower pad turned or lengthened, written to the DEF's `VIAS`),
+  short pieces of wire and the pads of power via stacks are lengthened to
+  the layer's `AREA`, and a layer's `OFFSET 0` is taken as given (it used to
+  mean half a pitch). `bench/gen_pnr.py --mini45` writes netlists over the
+  library's cells; the `mpnr` test places, routes and DRC-checks one.
+- `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
+  and transitions of FSMs), in the totals, the history and `mplan init`.
+- `mdebug -blocks INST`, and a block diagram in the viewer: the instances
+  inside a scope, their port connections and which instance feeds which.
+- `mdebug`: tasks and functions in a module, call output arguments, `force`,
+  procedural `assign` and net declaration assignments are drivers and loads;
+  the fan-in cone follows a task argument to its calls.
 - `memu`, emulation and FPGA prototyping: puts a gate-level netlist
   (structural Verilog over a Liberty library) on a board of FPGAs. Clock
   conversion onto one free-running clock (strobes for clean clocks, edge
@@ -21,6 +52,14 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `mformal`: fairness. A strong obligation in an `assume`
+  (`assume property (req |-> s_eventually !req)`) restricts the loops a
+  liveness counterexample may use.
+- `mformal` is faster on larger designs: PDR lifts each state to the bits
+  that matter, and a short induction with a small PDR budget runs before the
+  deep search (8-way arbiter liveness 24 s to 4 s, a failure 300 cycles deep
+  6.6 s to 1.7 s, one thread). It solves through `src/sat.hpp` and takes its
+  threads from `src/parallel.hpp`. Benchmark designs are in `bench/formal`.
 - `mformal`: a PDR (IC3) engine proves what k-induction cannot and finds
   failures deeper than `-depth`; liveness (`s_eventually`, `s_until`,
   `strong()`, `always s_eventually`) is proven or falsified with a loop
@@ -51,6 +90,7 @@ Spec references are IEEE 1800-2023 clauses.
   or as per-bit synchronizer cells, enable-qualified buses and Gray-coded
   pointers are recognized; clock gates stay in their clock's domain and bits
   of a clock bus are separate clocks. New options: `-cdc-report`,
+  `-clock-group`, `-static`. See `docs/CDC.md`.
   `-clock-group`, `-static`, `-enable`, `-threads`. See `docs/CDC.md`.
 - `mpopt`: RTL power optimization. Finds clock gating from enables (CG),
   sequential clock gating from registers whose sources did not load in the
@@ -72,6 +112,16 @@ Spec references are IEEE 1800-2023 clauses.
   SAT on all cores, with a counterexample for each failing point. X in the
   reference is a don't-care. `-blackbox`, `-match`, `-effort`, `-threads`,
   `-report`. See `docs/EQUIV.md`.
+- `mpnr`, place and route for gate-level netlists: an automatic floorplan or
+  one from a DEF (`-floorplan`), analytic global placement, Abacus
+  legalization, refinement and filler cells, a negotiated-congestion detailed
+  router on the LEF track grid, and DEF out with a built-in check for opens,
+  shorts and spacing (`-check FILE.def` checks any routed DEF). Multithreaded
+  with identical results for any `-threads`. `-gds` writes the layout as GDSII
+  (LEF cell abstracts or real cells from `-gds_cells`, layer map with
+  `-gds_map`). Vertical power straps with via stacks tie the rows' rails
+  together (`-no_straps`, `-strap_layer`, `-strap_width`, `-strap_pitch`).
+  See `docs/PNR.md`.
 - `mdebug`, source-level debug on the msim front end: `-drivers` and `-loads`
   of a signal with the `if` / `case` conditions on each assignment, `-trace`
   for the fan-in cone across ports, `-active SIG -at T` with `-vcd` for the
@@ -89,6 +139,25 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `mchar`, cell library characterization on `mspice`: from a Liberty
+  template and one transistor `.subckt` per cell it measures delay and
+  transition tables (combinational, clock-to-output, set and reset arcs,
+  tristate enable), setup, hold, recovery and removal tables and minimum
+  pulse widths by bisection, internal energy,
+  pin capacitance and leakage, and writes Liberty with the shared writer.
+  The stimulus for each arc is found from the Liberty functions and `ff` /
+  `latch` groups. Every table point runs as its own task on all logical
+  CPUs (`-threads N`) with byte-identical output. `lib/mini45` gains
+  transistor netlists (`mini45.sp`) and device models per corner, and its
+  timing, power and capacitance tables are now measured, not analytic
+  (leakage and tristate disable arcs stay analytic). See
+  `docs/CHAR.md`.
+- `mlibc`, cell library checks and reports on the shared Liberty and LEF
+  readers: `mlibc check` (23 rules: function against timing arcs and
+  `timing_sense`, tables that shrink with load, missing setup or hold,
+  leakage states, drive strengths out of order, and Liberty against LEF),
+  `mlibc report` and `mlibc compare slow.lib fast.lib`. Multithreaded, with
+  the same output for any `-threads`. See `docs/LIBCHECK.md`.
 - `lib/mini45`: a generic 45 nm-class standard cell library for the tool
   line, written from scratch (not a foundry library): 88 cells (inverters,
   buffers, NAND/NOR/AND/OR up to 4 inputs, XOR, AOI/OAI, muxes, adders,
@@ -107,6 +176,55 @@ Spec references are IEEE 1800-2023 clauses.
   `min_version` rights and `viewport` / `interface_viewport` pragmas, and keep
   protected code out of diagnostics, assertion messages, VCD / FST, coverage,
   lint findings and the DFT chain plan. See `docs/PROTECT.md`.
+- Logic synthesis: `msynth`, a dc_shell-style Tcl shell (`analyze`,
+  `elaborate`, `create_clock`, `compile`, `report_timing`, `report_area`,
+  `report_qor`, `write -format verilog` ...) on the slang front end. RTL is
+  flattened into an and-inverter graph with flops (`src/aig.hpp`,
+  `src/aig_elab.hpp`, shared with the equivalence, formal and FPGA tools),
+  mapped onto any Liberty library by cut matching for area or delay,
+  high-fanout nets are buffered, and the result is timed with the library's
+  NLDM tables. The default library is mini45. Mapping runs on every
+  core (`-threads N`) with the same netlist for any thread count. See
+  `docs/SYNTH.md`.
+- `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
+  types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
+  functions, all control flow but `goto`) is scheduled into clock cycles
+  under `-clock`, `-mul` and `-div`, with operator chaining, multi-cycle
+  operators, register and multiplier/divider sharing, and comes out as an
+  FSM with datapath or (`-pipeline`) a pipeline taking one input per cycle.
+  `-tb` writes a self-checking testbench for `msim`, `-cref` checks the same
+  calls with the host C++ compiler, `-explore` sweeps the clock period.
+  See `docs/HLS.md`.
+- `mhls`: structs. Nested structs, arrays of structs, array members and
+  bit-fields; structs copied, passed by value, pointer or reference, and
+  returned. Each member becomes its own register, memory or port.
+- `mhls`: pipelined loops. `#pragma hls pipeline` first in a loop body, or
+  `-pipeline-loops` for every loop that allows it, starts a new iteration
+  every cycle: `n` iterations of an `L`-stage body take `n + L - 1` cycles
+  instead of `n * L`. A loop that cannot be pipelined is refused with the
+  rule it breaks.
+- `mhls`: pipelined loops at slower rates. A loop that cannot start an
+  iteration every cycle (a memory updated in place, a pointer chase, an exit
+  that depends on memory data) is pipelined at one iteration every 2 or more
+  cycles when that beats running it unpipelined; `#pragma hls pipeline` now
+  also works first in a `do` body.
+- `mhls`: a variable that only feeds itself (a counter or checksum nothing
+  reads) is removed with its register and operators.
+- `mhls -handshake`: also writes `<top>_hs`, the block behind
+  `in_valid`/`in_ready` and `out_valid`/`out_ready` ports (FSM and pipeline);
+  the generated testbench drives it with a sink that refuses now and then.
+- `mhls`: stream arguments. A `hls::stream<T>&` parameter becomes a
+  `tdata`/`tvalid`/`tready` port; `read()` and `write(x)` are transfers the
+  state machine waits for. `include/mhls_stream.h` runs the same source on
+  the host; the testbench source and sink hesitate on every other call. A
+  pipelined loop over streams moves one element per cycle and stalls as a
+  whole.
+- `mhls -clang`: C++ classes and templates. The installed clang (run as a
+  program) reads the source; mhls reduces its syntax tree to plain functions
+  over structs: member functions, constructors, operators, class and
+  function templates, default arguments, overloads, static members, scoped
+  enums, namespaces, and whatever the design uses from its headers
+  (`std::min`, `std::max` included). `-emit-c` shows the reduction.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -116,6 +234,26 @@ Spec references are IEEE 1800-2023 clauses.
   root, barrel shifters, leading-zero and priority logic, Gray code, ECC,
   CRC, LFSR, counters, synchronous and dual-clock FIFOs, arbiters). Use with
   `msim -y dw +libext+.sv`; `docs/DATAPATH.md` lists every module.
+- The `matpg -tb` testbench writes a fail log with `+faillog` (pattern, chain
+  and cell of every wrong bit) for diagnosis; the fault simulator queues
+  events by level and is up to twice as fast on deep logic; the pattern file
+  reader and writer are in `src/atpg_model.hpp` for other tools.
+- `matpg -cubes FILE` writes each test before the random fill (x for a free
+  bit) for test compression, and the fault simulator can report where each
+  pattern fails (`Sim::detect` with a third argument) for diagnosis.
+- `matpg`: test pattern generation and fault simulation on a scan-inserted
+  gate netlist. Stuck-at faults and launch-on-capture transition faults on
+  every cell pin; scan chains traced from the ports (library scan flops or a
+  mux on D); random patterns, PODEM, a 64-pattern parallel fault simulator
+  and reverse-order compaction; fault classes (DS, DI, UU, UR, AU, ND) with
+  test and fault coverage; patterns as STIL (IEEE 1450), as a self-checking
+  Verilog testbench and as text; `-faultsim` grades existing patterns;
+  `-lib` takes cell functions from Liberty; `-threads N` with the same
+  result for any N. The fault simulator is `src/faultsim.hpp` for the other
+  test tools. See `docs/ATPG.md`.
+- `-xprop` is faster: an `if` evaluates its condition once, and clocked
+  blocks with merged branches run in parallel again. Ibex with `-xprop`:
+  42 s to 26 s in the interpreter, 9.8 s to 7 s with `-compile`.
 - `-xprop`: an assignment to an array element chosen at run time
   (`if (we) mem[addr] <= d;`) is merged with the element's present value
   instead of blocking the merge or giving `x`.
@@ -142,7 +280,10 @@ Spec references are IEEE 1800-2023 clauses.
   database. `mcov report` adds `Condition:` and `FSM:` lines, `-detail`,
   `-uncovered`, `-fsm-reset-filter`, `-min-cond`, `-min-fsm-state`,
   `-min-fsm-trans`, and FSM and condition sections in the HTML report;
-  `mcov merge` merges both.
+  `mcov merge` merges both. One-hot FSMs tested bit by bit
+  (`case (1'b1)` on `state[K]`, `if (state[K])`) are extracted, and
+  conditions with a term that calls a function or reads through a class
+  handle are covered with short-circuit vectors.
 - `mdft -insert_scan`: scan insertion on a gate netlist. Flops are found
   through the Liberty library (`-lib`: ff groups, `test_cell` scan pins, clock
   gates) or a cell map, checked for a controllable clock and asynchronous
@@ -167,6 +308,39 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
+  database, to step through them in KLayout's marker browser.
+- `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
+  has the margin on two opposite sides (the foundry rule "on one of two
+  adjacent sides"). The SKY130 test deck gains li.5, licon.5c, m1.5,
+  via.5a and m2.5 (40 rules).
+- `mpv` reads OASIS layouts (SEMI P39) as well as GDSII, told apart by the
+  file's first bytes: every record, repetition and point-list form, compact
+  trapezoids, name tables, strict mode and compressed blocks (built-in
+  DEFLATE). `src/oasis.hpp`; `oasis::readLayout` reads either format into a
+  `gds::Library`. Checked against KLayout on random files and SKY130 cells.
+- Fixed: the GDSII writer (`gds::write`) wrote STRANS as an integer record;
+  it is a bit array, and KLayout refused files with mirrored references.
+- `mpv lvs -lef tech.lef routed.def -netlist block.v`: LVS of a placed and
+  routed block against its gate netlist. The nets come from the geometry
+  (cell pins from the LEF, wires, vias and block pins from the DEF), not from
+  the DEF's connection lists; opens, shorts, missing or different cells and
+  pins are reported, and `-o` writes the extracted netlist as Verilog.
+- `mpv drc -lef tech.lef routed.def`: design rule checking of a routed DEF,
+  with the rules taken from the LEF technology when no `-deck` is given
+  (`-write-deck` shows them).
+- `mpv lvs`: extracts the transistor netlist of a layout (nets from `connect`
+  statements, names and ports from `label`, MOS devices with W and L from
+  `device mos`) and writes it as SPICE. `src/lvs.hpp` also holds the netlist
+  comparison (partition refinement, parallel merging, source/drain
+  exchange). `tests/pv/sky130.lvs` is the SKY130 deck.
+- `mpv drc`: design rule checking on GDSII layouts. A rule deck defines drawn
+  and derived layers (`&`, `|`, `-`, `^`, `grow`, `shrink`, `interact`,
+  `inside`, `outside`, `holes`, ...) and width, spacing, enclosure, overhang,
+  area and density checks; violations are written as markers. Multithreaded
+  by default (`-threads N`) with the same report for every thread count. A
+  35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
+  is the shared GDSII reader and writer. See `docs/MPV.md`.
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
@@ -230,8 +404,82 @@ Spec references are IEEE 1800-2023 clauses.
   `docs/CONSTRAINTS.md`.
 - SDC reader: object lookups use sorted name indexes and `-filter` is parsed
   once, so large designs with thousands of queries read in seconds.
+- `mlint` grows from 6 rules to about 80, in groups: latches and
+  combinational logic (`L001` now bit-accurate, `LAT001`, incomplete
+  sensitivity lists, combinational loops across modules), case statements,
+  assignment style, widths and signs (`W001`..`W008`), synthesizability
+  (`SYN001`..`SYN017`), unused and undriven signals, connections, clocks and
+  resets (`CLK`, `RST`), naming (`NAME001`..`NAME013`, by pattern) and style.
+  Every rule has a severity and an on/off default; `-config`, `-enable`,
+  `-disable`, `-only`, `-severity`, `-set` configure them, `-list` and
+  `-explain` describe them. Waivers: a waiver file (`-waivers`, by rule,
+  file, line and message, stale ones reported) and comments in the source
+  (`// mlint: waive RULE reason`, `mlint: off / on`, `translate_off`).
+  `-json` report, `-show-waived`, `-stats`. Rules run on every logical CPU
+  (`-threads N`), with the same output for any count. See `docs/LINT.md`.
+- `msta`: static timing analysis of gate-level netlists in the style of
+  PrimeTime. Liberty (NLDM) delay calculation, ideal and propagated clocks,
+  generated clocks, setup / hold / recovery / removal and output delay
+  checks, false paths, multicycle paths, max and min delay, clock groups,
+  `max_transition` and `max_capacitance`; `check_timing`, `report_timing`,
+  `report_constraint`, `report_clocks`, `report_qor`, SDF and JSON output;
+  Tcl scripts on the shared SDC reader. Multithreaded, with the same results
+  at any thread count. See `docs/STA.md`.
+- `src/liberty.hpp`, `src/gnetlist.hpp`: a Liberty reader and a gate-level
+  Verilog netlist reader / flattener / writer, shared by the timing,
+  synthesis, power, equivalence and physical tools.
+- `mlint` state machine rules on the extractor FSM coverage uses: `FSM001` a
+  state never entered, `FSM002` a state with no way out, `FSM003` a state
+  case with no default that leaves encodings unused, `FSM004` no reset state.
+- `mpower`, power analysis on the msim front end: average power by group,
+  instance and cell from SAIF, VCD or FST activity and Liberty
+  `internal_power` / `leakage_power` tables; activity propagation for nets
+  the file does not name (RTL activity on a gate netlist, or `-clock` with no
+  activity); an RTL estimate (register bits as the library's flop, logic as
+  reference gates); `-peak` with `-waveform` for power over time; `-upf` for
+  power per domain with domain voltages and switched domains; `-spef` for
+  extracted wire capacitance; `-json`.
+  Multithreaded, with the same report on any thread count. `msim -saif`
+  writes SAIF from a simulation, and `mpower -write_saif` converts a
+  waveform. `src/saif.hpp` (SAIF reader and writer) and `src/power.hpp` (the
+  computation) are shared headers. See `docs/POWER.md`.
+- FPGA synthesis: `mfpga` maps RTL or AIGER to K-input LUTs and flip-flops
+  (iCE40, ECP5, Xilinx 7-series, generic cells) on the shared graph of
+  `src/aig.hpp`, and writes Yosys JSON for nextpnr, EDIF or Verilog.
+  Depth-optimal priority-cut mapping with area recovery; multithreaded, with
+  the same output for any `-threads N`. See `docs/FPGA.md`.
+- `mfpga`: adders, subtractors and comparators map to the family's carry
+  chain (`SB_CARRY`, `CCU2C`, `CARRY4`), and clock enables and synchronous
+  resets to flop pins. `-nocarry` and `-noce` turn each off.
+- `mfpga`: a multiplier that fits one DSP block maps to it (`MULT18X18D`,
+  `DSP48E1`, and `SB_MAC16` with `-dsp`). `-nodsp` keeps LUTs.
+- `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
+  netlists with R, C, L, coupled inductors, independent and controlled
+  sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
+  transistors; `.model`, `.param` with expressions, nested `.subckt`,
+  `.include`, `.ic`, `.nodeset`, `.option`, `.print`, `.measure` and `.step`;
+  CSV (`-o`) and VCD (`-vcd`) output. Sparse LU with pivot reuse, latent
+  device bypass, and threads for `.step` runs, AC points and model
+  evaluation, with identical output at any `-threads`. Every test netlist is
+  checked against hand-worked values and against ngspice. See
+  `docs/SPICE.md`.
+- `mspice`: MOSFET evaluation and matrix assembly run in parallel (a
+  2,000-inverter chain goes from 1.14 s to 0.70 s on four threads, with the
+  same output bit for bit); `parmin` now defaults to 1024. The reader gains
+  `spice::flatten()`, a flat list of primitive elements for LVS and cell
+  characterization, printed by `mspice -flatten [-top name]`.
+- `mspice`: `.option chgtol=` (needed for accurate edges on femtofarad
+  nodes) and `spice::Reader::readText()` for netlists held in memory.
+  mspice now runs on the shared thread pool of `src/parallel.hpp`, which
+  gains `Pool::spin()` for short batches that come one after the other.
 
 ### Fixed
+- `mformal` could report a liveness assertion proven when it fails:
+  `s_eventually` of a sequence longer than one cycle (`s_eventually (a ##1 a)`
+  with `a` alternating), and could have reported a loop for obligations that
+  are met and renewed. Liveness now follows single obligations round the
+  loop; what it does not decide (`s_eventually always q`) is reported
+  `bounded`, not proven.
 - `mlint`, `mdft`: a net connected to thousands of instances no longer makes
   the clock-domain union-find quadratic (path compression).
 - A concurrent assertion read the current value, not the sampled one, of a
@@ -404,6 +652,14 @@ Spec references are IEEE 1800-2023 clauses.
   the base for class methods (8).
 
 ### Changed
+- `mlint` prints each finding's severity (`error`, `warning` or `info`) and
+  names signals by their name in the module rather than by full path, so a
+  module instantiated many times reports once. `-Werror` fails on warnings
+  and errors, not on `info` findings. Modules that nothing instantiates are
+  no longer linted as if they were part of the design.
+- `mlint` and `mdft`: the structure that joins signals across ports now
+  compresses paths. A clock reaching 4000 instances made every lookup walk
+  4000 links: 13 s for a 120,000-line design, now 1.3 s.
 - msim compiles as IEEE 1800-2023 by default (slang's default was 2017);
   `--std` still selects another version.
 - Waveforms nest the instance hierarchy as scopes under the top module

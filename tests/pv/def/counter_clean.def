@@ -1,0 +1,350 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN counter ;
+UNITS DISTANCE MICRONS 2000 ;
+DIEAREA ( 0 0 ) ( 34200 36400 ) ;
+ROW ROW_0 core 11400 11200 N DO 30 BY 1 STEP 380 0 ;
+ROW ROW_1 core 11400 14000 FS DO 30 BY 1 STEP 380 0 ;
+ROW ROW_2 core 11400 16800 N DO 30 BY 1 STEP 380 0 ;
+ROW ROW_3 core 11400 19600 FS DO 30 BY 1 STEP 380 0 ;
+ROW ROW_4 core 11400 22400 N DO 30 BY 1 STEP 380 0 ;
+TRACKS Y 140 DO 130 STEP 280 LAYER m1 ;
+TRACKS X 190 DO 90 STEP 380 LAYER m2 ;
+TRACKS Y 140 DO 130 STEP 280 LAYER m3 ;
+TRACKS X 190 DO 61 STEP 560 LAYER m4 ;
+TRACKS Y 140 DO 65 STEP 560 LAYER m5 ;
+TRACKS X 190 DO 61 STEP 560 LAYER m6 ;
+COMPONENTS 49 ;
+- ha0/u_s XOR2 + PLACED ( 11780 22400 ) N ;
+- ha0/u_c AND2 + PLACED ( 12540 19600 ) FS ;
+- ha1/u_s XOR2 + PLACED ( 15200 19600 ) FS ;
+- ha1/u_c AND2 + PLACED ( 15580 16800 ) FN ;
+- ha2/u_s XOR2 + PLACED ( 15200 11200 ) N ;
+- ha2/u_c AND2 + PLACED ( 15200 14000 ) S ;
+- ha3/u_s XOR2 + PLACED ( 12540 11200 ) N ;
+- ha3/u_c AND2 + PLACED ( 11780 16800 ) FN ;
+- m0 MUX2 + PLACED ( 14820 22400 ) N ;
+- b1 BUF + PLACED ( 17100 19600 ) FS ;
+- b2 BUF + PLACED ( 17100 14000 ) FS ;
+- b3 BUF + PLACED ( 17100 11200 ) N ;
+- r0 DFFR + PLACED ( 17100 22400 ) N ;
+- r1 DFFR + PLACED ( 18240 19600 ) FS ;
+- r2 DFFR + PLACED ( 18240 14000 ) FS ;
+- r3 DFFR + PLACED ( 18240 11200 ) N ;
+- mpnr_tiehi TIE1 + PLACED ( 22040 22400 ) N ;
+- mpnr_tielo TIE0 + PLACED ( 14060 22400 ) N ;
+- FILLER_0 FILL2 + SOURCE DIST + PLACED ( 11400 11200 ) N ;
+- FILLER_1 FILL1 + SOURCE DIST + PLACED ( 12160 11200 ) N ;
+- FILLER_2 FILL2 + SOURCE DIST + PLACED ( 14440 11200 ) N ;
+- FILLER_3 FILL1 + SOURCE DIST + PLACED ( 17860 11200 ) N ;
+- FILLER_4 FILL2 + SOURCE DIST + PLACED ( 21660 11200 ) N ;
+- FILLER_5 FILL1 + SOURCE DIST + PLACED ( 22420 11200 ) N ;
+- FILLER_6 FILL4 + SOURCE DIST + PLACED ( 11400 14000 ) FS ;
+- FILLER_7 FILL4 + SOURCE DIST + PLACED ( 12920 14000 ) FS ;
+- FILLER_8 FILL2 + SOURCE DIST + PLACED ( 14440 14000 ) FS ;
+- FILLER_9 FILL1 + SOURCE DIST + PLACED ( 16720 14000 ) FS ;
+- FILLER_10 FILL1 + SOURCE DIST + PLACED ( 17860 14000 ) FS ;
+- FILLER_11 FILL2 + SOURCE DIST + PLACED ( 21660 14000 ) FS ;
+- FILLER_12 FILL1 + SOURCE DIST + PLACED ( 22420 14000 ) FS ;
+- FILLER_13 FILL1 + SOURCE DIST + PLACED ( 11400 16800 ) N ;
+- FILLER_14 FILL4 + SOURCE DIST + PLACED ( 13300 16800 ) N ;
+- FILLER_15 FILL2 + SOURCE DIST + PLACED ( 14820 16800 ) N ;
+- FILLER_16 FILL4 + SOURCE DIST + PLACED ( 17100 16800 ) N ;
+- FILLER_17 FILL4 + SOURCE DIST + PLACED ( 18620 16800 ) N ;
+- FILLER_18 FILL4 + SOURCE DIST + PLACED ( 20140 16800 ) N ;
+- FILLER_19 FILL2 + SOURCE DIST + PLACED ( 21660 16800 ) N ;
+- FILLER_20 FILL1 + SOURCE DIST + PLACED ( 22420 16800 ) N ;
+- FILLER_21 FILL2 + SOURCE DIST + PLACED ( 11400 19600 ) FS ;
+- FILLER_22 FILL1 + SOURCE DIST + PLACED ( 12160 19600 ) FS ;
+- FILLER_23 FILL2 + SOURCE DIST + PLACED ( 14060 19600 ) FS ;
+- FILLER_24 FILL1 + SOURCE DIST + PLACED ( 14820 19600 ) FS ;
+- FILLER_25 FILL1 + SOURCE DIST + PLACED ( 17860 19600 ) FS ;
+- FILLER_26 FILL2 + SOURCE DIST + PLACED ( 21660 19600 ) FS ;
+- FILLER_27 FILL1 + SOURCE DIST + PLACED ( 22420 19600 ) FS ;
+- FILLER_28 FILL1 + SOURCE DIST + PLACED ( 11400 22400 ) N ;
+- FILLER_29 FILL1 + SOURCE DIST + PLACED ( 13680 22400 ) N ;
+- FILLER_30 FILL4 + SOURCE DIST + PLACED ( 20520 22400 ) N ;
+END COMPONENTS
+PINS 9 ;
+- clk + NET clk + DIRECTION INPUT + USE SIGNAL
+  + LAYER m3 ( -760 -70 ) ( 760 70 )
+  + PLACED ( 760 9100 ) N ;
+- rst_n + NET rst_n + DIRECTION INPUT + USE SIGNAL
+  + LAYER m3 ( -760 -70 ) ( 760 70 )
+  + PLACED ( 760 27300 ) N ;
+- en + NET en + DIRECTION INPUT + USE SIGNAL
+  + LAYER m2 ( -70 -760 ) ( 70 760 )
+  + PLACED ( 17290 760 ) N ;
+- q[3] + NET q[3] + DIRECTION OUTPUT + USE SIGNAL
+  + LAYER m3 ( -760 -70 ) ( 760 70 )
+  + PLACED ( 33440 4620 ) N ;
+- q[2] + NET q[2] + DIRECTION OUTPUT + USE SIGNAL
+  + LAYER m3 ( -760 -70 ) ( 760 70 )
+  + PLACED ( 33440 13580 ) N ;
+- q[1] + NET q[1] + DIRECTION OUTPUT + USE SIGNAL
+  + LAYER m3 ( -760 -70 ) ( 760 70 )
+  + PLACED ( 33440 22820 ) N ;
+- q[0] + NET q[0] + DIRECTION OUTPUT + USE SIGNAL
+  + LAYER m3 ( -760 -70 ) ( 760 70 )
+  + PLACED ( 33440 31780 ) N ;
+- carry + NET carry + DIRECTION OUTPUT + USE SIGNAL
+  + LAYER m2 ( -70 -760 ) ( 70 760 )
+  + PLACED ( 8550 35640 ) N ;
+- one + NET 1'b1 + DIRECTION OUTPUT + USE SIGNAL
+  + LAYER m2 ( -70 -760 ) ( 70 760 )
+  + PLACED ( 25650 35640 ) N ;
+END PINS
+SPECIALNETS 2 ;
+- VDD
+  ( * VDD )
+  + USE POWER
+  + ROUTED m1 340 + SHAPE FOLLOWPIN ( 11400 14000 ) ( 22800 * )
+    NEW m1 340 + SHAPE FOLLOWPIN ( 11400 19600 ) ( 22800 * )
+    NEW m1 340 + SHAPE FOLLOWPIN ( 11400 25200 ) ( 22800 * ) ;
+- VSS
+  ( * VSS )
+  + USE GROUND
+  + ROUTED m1 340 + SHAPE FOLLOWPIN ( 11400 11200 ) ( 22800 * )
+    NEW m1 340 + SHAPE FOLLOWPIN ( 11400 16800 ) ( 22800 * )
+    NEW m1 340 + SHAPE FOLLOWPIN ( 11400 22400 ) ( 22800 * ) ;
+END SPECIALNETS
+NETS 21 ;
+- clk
+  ( PIN clk ) ( r0 CK ) ( r1 CK ) ( r2 CK )
+  ( r3 CK )
+  + ROUTED m2 ( 18050 20300 ) ( * 23100 )
+    NEW m2 ( 19190 9100 ) ( * 20300 )
+    NEW m3 ( 1330 9100 ) ( 19190 * )
+    NEW m3 ( 18050 20300 ) ( 19190 * )
+    NEW m2 ( 19190 9100 ) via23
+    NEW m2 ( 18050 20300 ) via23
+    NEW m2 ( 19190 20300 ) via23
+    NEW m1 ( 18050 23100 ) via12_pin
+    NEW m1 ( 19190 20300 ) via12_pin
+    NEW m1 ( 19190 14700 ) via12_pin
+    NEW m1 ( 19190 11900 ) via12_pin ;
+- rst_n
+  ( PIN rst_n ) ( r0 RN ) ( r1 RN ) ( r2 RN )
+  ( r3 RN )
+  + ROUTED m2 ( 18810 24220 ) ( * 27300 )
+    NEW m2 ( 19950 13300 ) ( * 24220 )
+    NEW m3 ( 18810 24220 ) ( 19950 * )
+    NEW m3 ( 1330 27300 ) ( 18810 * )
+    NEW m2 ( 18810 27300 ) via23
+    NEW m2 ( 19950 24220 ) via23
+    NEW m2 ( 18810 24220 ) via23
+    NEW m1 ( 18810 24500 ) via12_pin
+    NEW m1 ( 19950 21700 ) via12_pin
+    NEW m1 ( 19950 16100 ) via12_pin
+    NEW m1 ( 19950 13300 ) via12_pin ;
+- en
+  ( PIN en ) ( ha0/u_s B ) ( ha0/u_c B )
+  + ROUTED m2 ( 12730 22260 ) ( * 23100 )
+    NEW m2 ( 13110 1260 ) ( * 16940 )
+    NEW m2 ( 13110 19460 ) ( * 22260 )
+    NEW m3 ( 13110 1260 ) ( 17290 * )
+    NEW m3 ( 13070 16940 ) ( 13110 * )
+    NEW m3 ( 13070 19460 ) ( 13110 * )
+    NEW m3 ( 12730 22260 ) ( 13110 * )
+    NEW m4 ( 13070 16940 ) ( * 19460 )
+    NEW m2 ( 13110 19460 ) via23
+    NEW m3 ( 13070 19460 ) via34
+    NEW m3 ( 13070 16940 ) via34
+    NEW m2 ( 13110 16940 ) via23
+    NEW m2 ( 13110 1260 ) via23
+    NEW m2 ( 17290 1260 ) via23
+    NEW m2 ( 12730 22260 ) via23
+    NEW m2 ( 13110 22260 ) via23
+    NEW m1 ( 12730 23100 ) via12_pin
+    NEW m1 ( 13110 20300 ) via12_pin ;
+- q[3]
+  ( PIN q[3] ) ( ha3/u_s A ) ( ha3/u_c A ) ( r3 Q )
+  + ROUTED m2 ( 12730 11620 ) ( * 11900 )
+    NEW m2 ( 21470 4620 ) ( * 11900 )
+    NEW m3 ( 21470 4620 ) ( 32870 * )
+    NEW m3 ( 12730 11620 ) ( 21470 * )
+    NEW m3 ( 13110 17500 ) ( 13630 * )
+    NEW m4 ( 13630 11620 ) ( * 17500 )
+    NEW m2 ( 21470 4620 ) via23
+    NEW m2 ( 12730 11620 ) via23
+    NEW m2 ( 21470 11620 ) via23
+    NEW m2 ( 13110 17500 ) via23
+    NEW m3 ( 13630 17500 ) via34
+    NEW m3 ( 13630 11620 ) via34
+    NEW m1 ( 12730 11900 ) via12_pin
+    NEW m1 ( 13110 17500 ) via12_pin
+    NEW m1 ( 21470 11900 ) via12_pin ;
+- q[2]
+  ( PIN q[2] ) ( ha2/u_s A ) ( ha2/u_c A ) ( r2 Q )
+  + ROUTED m2 ( 15390 13300 ) ( * 13580 )
+    NEW m2 ( 16530 13580 ) ( * 14700 )
+    NEW m2 ( 21470 13580 ) ( * 14700 )
+    NEW m3 ( 15390 13580 ) ( 16530 * )
+    NEW m3 ( 21470 13580 ) ( 32870 * )
+    NEW m3 ( 16530 14420 ) ( 21470 * )
+    NEW m2 ( 21470 13580 ) via23
+    NEW m2 ( 16530 14420 ) via23
+    NEW m2 ( 21470 14420 ) via23
+    NEW m2 ( 15390 13580 ) via23
+    NEW m2 ( 16530 13580 ) via23
+    NEW m1 ( 15390 13300 ) via12_pin
+    NEW m1 ( 16530 14700 ) via12_pin
+    NEW m1 ( 21470 14700 ) via12_pin ;
+- q[1]
+  ( PIN q[1] ) ( ha1/u_s A ) ( ha1/u_c A ) ( r1 Q )
+  + ROUTED m2 ( 16910 18900 ) ( * 19460 )
+    NEW m2 ( 21470 21700 ) ( * 22820 )
+    NEW m3 ( 16910 19460 ) ( 16990 * )
+    NEW m3 ( 15390 21700 ) ( 21470 * )
+    NEW m3 ( 21470 22820 ) ( 32870 * )
+    NEW m4 ( 16990 19460 ) ( * 21700 )
+    NEW m2 ( 21470 22820 ) via23
+    NEW m2 ( 15390 21700 ) via23
+    NEW m2 ( 21470 21700 ) via23
+    NEW m2 ( 16910 19460 ) via23
+    NEW m3 ( 16990 19460 ) via34
+    NEW m3 ( 16990 21700 ) via34
+    NEW m1 ( 15390 21700 ) via12_pin
+    NEW m1 ( 16910 18900 ) via12_pin
+    NEW m1 ( 21470 21700 ) via12_pin ;
+- q[0]
+  ( PIN q[0] ) ( ha0/u_s A ) ( ha0/u_c A ) ( r0 Q )
+  + ROUTED m2 ( 20330 24500 ) ( * 31780 )
+    NEW m3 ( 12510 21700 ) ( 12730 * )
+    NEW m3 ( 11970 24500 ) ( 20330 * )
+    NEW m3 ( 20330 31780 ) ( 32870 * )
+    NEW m4 ( 12510 21700 ) ( * 24500 )
+    NEW m2 ( 20330 31780 ) via23
+    NEW m2 ( 11970 24500 ) via23
+    NEW m2 ( 20330 24500 ) via23
+    NEW m2 ( 12730 21700 ) via23
+    NEW m3 ( 12510 21700 ) via34
+    NEW m3 ( 12510 24500 ) via34
+    NEW m1 ( 11970 24500 ) via12_pin
+    NEW m1 ( 12730 21700 ) via12_pin
+    NEW m1 ( 20330 24500 ) via12_pin ;
+- carry
+  ( PIN carry ) ( ha3/u_c Y )
+  + ROUTED m2 ( 11970 18900 ) ( * 22540 )
+    NEW m2 ( 11970 25060 ) ( * 35140 )
+    NEW m3 ( 11950 22540 ) ( 11970 * )
+    NEW m3 ( 11950 25060 ) ( 11970 * )
+    NEW m3 ( 8550 35140 ) ( 11970 * )
+    NEW m4 ( 11950 22540 ) ( * 25060 )
+    NEW m2 ( 11970 22540 ) via23
+    NEW m3 ( 11950 22540 ) via34
+    NEW m3 ( 11950 25060 ) via34
+    NEW m2 ( 11970 25060 ) via23
+    NEW m2 ( 11970 35140 ) via23
+    NEW m2 ( 8550 35140 ) via23
+    NEW m1 ( 11970 18900 ) via12_pin ;
+- 1'b1
+  ( PIN one ) ( mpnr_tiehi Y )
+  + ROUTED m2 ( 22610 24500 ) ( * 35140 )
+    NEW m3 ( 22610 35140 ) ( 25650 * )
+    NEW m2 ( 22610 35140 ) via23
+    NEW m2 ( 25650 35140 ) via23
+    NEW m1 ( 22610 24500 ) via12_pin ;
+- s[0]
+  ( ha0/u_s Y ) ( m0 A )
+  + ROUTED m3 ( 13490 23100 ) ( 15010 * )
+    NEW m2 ( 15010 23100 ) via23
+    NEW m2 ( 13490 23100 ) via23
+    NEW m1 ( 13490 23100 ) via12_pin
+    NEW m1 ( 15010 23100 ) via12_pin ;
+- c[1]
+  ( ha0/u_c Y ) ( ha1/u_s B ) ( ha1/u_c B )
+  + ROUTED m2 ( 16150 19740 ) ( * 20300 )
+    NEW m2 ( 16530 18900 ) ( * 19740 )
+    NEW m3 ( 16150 19740 ) ( 16530 * )
+    NEW m3 ( 13870 20300 ) ( 16150 * )
+    NEW m2 ( 16150 20300 ) via23
+    NEW m2 ( 13870 20300 ) via23
+    NEW m2 ( 16530 19740 ) via23
+    NEW m2 ( 16150 19740 ) via23
+    NEW m1 ( 13870 20300 ) via12_pin
+    NEW m1 ( 16150 20300 ) via12_pin
+    NEW m1 ( 16530 18900 ) via12_pin ;
+- s[1]
+  ( ha1/u_s Y ) ( b1 A )
+  + ROUTED m3 ( 16910 20300 ) ( 17290 * )
+    NEW m2 ( 17290 20300 ) via23
+    NEW m2 ( 16910 20300 ) via23
+    NEW m1 ( 16910 20300 ) via12_pin
+    NEW m1 ( 17290 20300 ) via12_pin ;
+- c[2]
+  ( ha1/u_c Y ) ( ha2/u_s B ) ( ha2/u_c B )
+  + ROUTED m2 ( 16150 13300 ) ( * 17500 )
+    NEW m3 ( 15770 17500 ) ( 16150 * )
+    NEW m2 ( 16150 17500 ) via23
+    NEW m2 ( 15770 17500 ) via23
+    NEW m1 ( 15770 17500 ) via12_pin
+    NEW m1 ( 16150 13300 ) via12_pin
+    NEW m1 ( 16150 16100 ) via12_pin ;
+- s[2]
+  ( ha2/u_s Y ) ( b2 A )
+  + ROUTED m2 ( 16910 13300 ) ( * 13860 )
+    NEW m2 ( 17290 13860 ) ( * 14700 )
+    NEW m3 ( 16910 13860 ) ( 17290 * )
+    NEW m2 ( 17290 13860 ) via23
+    NEW m2 ( 16910 13860 ) via23
+    NEW m1 ( 16910 13300 ) via12_pin
+    NEW m1 ( 17290 14700 ) via12_pin ;
+- c[3]
+  ( ha2/u_c Y ) ( ha3/u_s B ) ( ha3/u_c B )
+  + ROUTED m2 ( 12730 14700 ) ( * 17500 )
+    NEW m2 ( 13490 13300 ) ( * 14700 )
+    NEW m3 ( 12730 14700 ) ( 15390 * )
+    NEW m2 ( 13490 14700 ) via23
+    NEW m2 ( 15390 14700 ) via23
+    NEW m2 ( 12730 14700 ) via23
+    NEW m1 ( 15390 14700 ) via12_pin
+    NEW m1 ( 13490 13300 ) via12_pin
+    NEW m1 ( 12730 17500 ) via12_pin ;
+- s[3]
+  ( ha3/u_s Y ) ( b3 A )
+  + ROUTED m3 ( 14250 12180 ) ( 17290 * )
+    NEW m2 ( 17290 12180 ) via23
+    NEW m2 ( 14250 12180 ) via23
+    NEW m1 ( 14250 12180 ) via12_pin
+    NEW m1 ( 17290 12180 ) via12_pin ;
+- 1'b0
+  ( m0 B ) ( m0 S ) ( mpnr_tielo Y )
+  + ROUTED m3 ( 14630 23380 ) ( 16150 * )
+    NEW m2 ( 16150 23380 ) via23
+    NEW m2 ( 15390 23380 ) via23
+    NEW m2 ( 14630 23380 ) via23
+    NEW m1 ( 15390 23380 ) via12_pin
+    NEW m1 ( 16150 23380 ) via12_pin
+    NEW m1 ( 14630 23380 ) via12_pin ;
+- d[0]
+  ( m0 Y ) ( r0 D )
+  + ROUTED m3 ( 16910 23100 ) ( 17290 * )
+    NEW m2 ( 17290 23100 ) via23
+    NEW m2 ( 16910 23100 ) via23
+    NEW m1 ( 16910 23100 ) via12_pin
+    NEW m1 ( 17290 23100 ) via12_pin ;
+- d[1]
+  ( b1 Y ) ( r1 D )
+  + ROUTED m3 ( 17670 20580 ) ( 18430 * )
+    NEW m2 ( 18430 20580 ) via23
+    NEW m2 ( 17670 20580 ) via23
+    NEW m1 ( 17670 20580 ) via12_pin
+    NEW m1 ( 18430 20580 ) via12_pin ;
+- d[2]
+  ( b2 Y ) ( r2 D )
+  + ROUTED m3 ( 17670 14700 ) ( 18430 * )
+    NEW m2 ( 18430 14700 ) via23
+    NEW m2 ( 17670 14700 ) via23
+    NEW m1 ( 17670 14700 ) via12_pin
+    NEW m1 ( 18430 14700 ) via12_pin ;
+- d[3]
+  ( b3 Y ) ( r3 D )
+  + ROUTED m3 ( 17670 11900 ) ( 18430 * )
+    NEW m2 ( 18430 11900 ) via23
+    NEW m2 ( 17670 11900 ) via23
+    NEW m1 ( 17670 11900 ) via12_pin
+    NEW m1 ( 18430 11900 ) via12_pin ;
+END NETS
+END DESIGN
