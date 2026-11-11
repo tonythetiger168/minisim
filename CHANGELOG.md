@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mpopt -prove` proves the rewritten RTL equivalent to the original with
+  `mequiv` (the rewrite without sequential gates when there are any), and
+  `mpopt -power` reports power before and after from `mpower` on the activity
+  of the `-verify` run. Operand isolation now writes named isolation signals
+  of the operand's own width (`mpopt_iso_L<line>_a`), so a power tool sees
+  their activity and the operator is not widened; `-iso_inline` keeps the
+  rewrite inside the expression. See `docs/POWEROPT.md`.
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
   changed, and the assignments that write them. The viewer page does the same.

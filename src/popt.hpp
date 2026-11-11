@@ -89,6 +89,7 @@ struct Options {
     unsigned isoMinBits = 8;   // smallest operator result worth isolating
     unsigned isoAddBits = 0;   // isolate adders/subtractors at least this wide (0: never)
     bool isoPlain = false;     // write (c ? a : 0) instead of (c !== 1'b0 ? a : 0)
+    bool isoInline = false;    // never add a named isolation signal: rewrite the expression only
     unsigned maxEnableTerms = 12;  // an enable with more OR terms than this is not used
     std::string prefix = "mpopt";
     std::string icgCell;       // library cell to instantiate instead of <prefix>_icg
@@ -370,6 +371,11 @@ using SymSet = std::set<Sym>;
 struct IsoCand {
     Span a, b;              // the two operands
     bool wrapA = false, wrapB = false, signedA = false, signedB = false;
+    bool leafA = false, leafB = false;   // a plain signal that the expression widens: keep its own width
+    unsigned widthA = 0, widthB = 0;
+    bool namedOk = false;   // operands and condition read module-level signals only
+    Span decl;              // where a declaration for this statement can go (continuous assignments)
+    std::string indent;
     CP cond;
     std::string op;
     unsigned bits = 0;
@@ -630,20 +636,36 @@ struct IsoVisitor : public ASTVisitor<IsoVisitor, VisitFlags::Expressions> {
             ic.condReads = readStack.back();
             ic.op = std::string(OpInfo::getText(e.op));
             ic.bits = bits;
-            auto side = [&](const Expression& x0, Span& sp, bool& wrap, bool& sgn) {
+            bool named = true;
+            for (Sym s : ic.condReads)
+                if (!s || !moduleLevel(*s)) named = false;
+            auto side = [&](const Expression& x0, Span& sp, bool& wrap, bool& sgn, bool& leaf, unsigned& width) {
                 const Expression& x = unwrap(x0);
                 sp = spanOf(sm, x);
                 SymSet rs;
                 readsOf(x, rs);
                 bool varies = false;
-                for (Sym s : rs)
+                for (Sym s : rs) {
                     if (s) varies = true;
+                    if (!s || !moduleLevel(*s)) named = false;
+                }
+                width = x.type->isIntegral() ? (unsigned)x.type->getBitWidth() : 0;
+                switch (x.kind) {
+                    case ExpressionKind::NamedValue:
+                    case ExpressionKind::ElementSelect:
+                    case ExpressionKind::RangeSelect:
+                    case ExpressionKind::MemberAccess:
+                    case ExpressionKind::Concatenation:
+                    case ExpressionKind::Replication: leaf = &x != &x0; break;
+                    default: leaf = false;
+                }
                 wrap = sp.ok && sp.end > sp.begin && varies && !x.getConstant() &&
                        x.type->isIntegral() && !hasExpensive(x, opt);
                 sgn = x.type->isSigned();
             };
-            side(e.left(), ic.a, ic.wrapA, ic.signedA);
-            side(e.right(), ic.b, ic.wrapB, ic.signedB);
+            side(e.left(), ic.a, ic.wrapA, ic.signedA, ic.leafA, ic.widthA);
+            side(e.right(), ic.b, ic.wrapB, ic.signedB, ic.leafB, ic.widthB);
+            ic.namedOk = named;
             if (ic.wrapA || ic.wrapB) {
                 ic.line = sm.getLineNumber(sm.getFullyOriginalLoc(e.sourceRange.start()));
                 out.push_back(std::move(ic));
@@ -1121,8 +1143,26 @@ struct Gatherer {
                     readsOf(a.right(), r);
                     for (Sym s : t) comb(s, r);
                     if (opt.iso) {
+                        size_t n0 = m.assignIso.size();
                         IsoVisitor iv(sm, opt, cTrue(), {}, m.assignIso);
                         a.right().visit(iv);
+                        // A declaration can go in front of the assign statement.
+                        const syntax::SyntaxNode* st = mem.getSyntax();
+                        while (st && st->kind != syntax::SyntaxKind::ContinuousAssign) st = st->parent;
+                        Span sp;
+                        if (st) sp = spanOf(sm, st->sourceRange());
+                        if (sp.ok) {
+                            auto text = sm.getSourceText(BufferID(sp.buf, ""sv));
+                            size_t ls = sp.begin;
+                            while (ls > 0 && text[ls - 1] != '\n') ls--;
+                            std::string ind(text.substr(ls, sp.begin - ls));
+                            for (char ch : ind)
+                                if (ch != ' ' && ch != '\t') ind.clear();
+                            for (size_t i = n0; i < m.assignIso.size(); i++) {
+                                m.assignIso[i].decl = sp;
+                                m.assignIso[i].indent = ind;
+                            }
+                        }
                     }
                     break;
                 }
@@ -1477,18 +1517,33 @@ inline std::string applyLocal(std::string_view text, size_t base, std::vector<Ed
 // The isolating condition is compared with !== 1'b0 so that an x in it lets
 // the operand through, as the original does when it takes an else or a
 // default on an x: the rewritten RTL then simulates the same, x for x.
-inline void isoEdits(const SourceManager& sm, const IsoCand& ic, std::vector<Edit>& es, bool plain) {
-    std::string c = cText(ic.cond, false) + (plain ? "" : " !== 1'b0");
-    auto wrap = [&](const Span& sp, bool sgn) {
+// The edits of one isolated operator. With names, each operand becomes a
+// signal declared in decl (a power tool then sees its activity, and the
+// operator keeps the operand's own width); without, the expression is
+// rewritten in place.
+inline void isoEdits(const SourceManager& sm, const IsoCand& ic, std::vector<Edit>& es, const Options& opt,
+                     const std::string& nameA = "", const std::string& nameB = "", std::string* decl = nullptr,
+                     const std::string& ind = "") {
+    std::string c = cText(ic.cond, false) + (opt.isoPlain ? "" : " !== 1'b0");
+    auto wrap = [&](const Span& sp, bool sgn, bool leaf, unsigned width, const std::string& name) {
         Edit e;
         e.buf = sp.buf;
         e.begin = sp.begin;
         e.end = sp.end;
-        e.text = "(" + c + " ? " + std::string(rawText(sm, sp)) + (sgn ? " : $signed(1'b0))" : " : 1'b0)");
+        std::string iso = "(" + c + " ? " + std::string(rawText(sm, sp)) + (sgn ? " : $signed(1'b0))" : " : 1'b0)");
+        if (decl && !name.empty() && width) {
+            *decl += "wire " + std::string(sgn ? "signed " : "") + "[" + std::to_string(width - 1) + ":0] " + name + " = " +
+                     iso.substr(1, iso.size() - 2) + ";\n" + ind;
+            e.text = name;
+        } else if (leaf)
+            // A concatenation is as wide as its operand: the operator is not widened by the ?:.
+            e.text = sgn ? "$signed({" + iso + "})" : "{" + iso + "}";
+        else
+            e.text = iso;
         es.push_back(std::move(e));
     };
-    if (ic.wrapA) wrap(ic.a, ic.signedA);
-    if (ic.wrapB) wrap(ic.b, ic.signedB);
+    if (ic.wrapA) wrap(ic.a, ic.signedA, ic.leafA, ic.widthA, nameA);
+    if (ic.wrapB) wrap(ic.b, ic.signedB, ic.leafB, ic.widthB, nameB);
 }
 
 inline std::string regNames(const Group& g) {
@@ -1523,6 +1578,13 @@ inline void plan(const SourceManager& sm, Module& m, const Options& opt, bool al
     std::vector<std::vector<int>> gates(m.blks.size());
     std::vector<char> wholes(m.blks.size());
     std::vector<std::vector<Edit>> isos(m.blks.size());
+    std::vector<std::string> isoDecls(m.blks.size());
+    std::unordered_map<std::string, int> isoNames;
+    auto isoName = [&](const IsoCand& ic, const char* side) {
+        std::string n = opt.prefix + "_iso_L" + std::to_string(ic.line);
+        int k = isoNames[n + side]++;
+        return n + (k ? "_" + std::to_string(k) : "") + side;
+    };
     for (size_t bi = 0; bi < m.blks.size(); bi++) {
         Blk& b = m.blks[bi];
         if (b.kind != Blk::Seq) continue;
@@ -1560,7 +1622,10 @@ inline void plan(const SourceManager& sm, Module& m, const Options& opt, bool al
         if (opt.iso && b.bail.empty())
             for (auto& n : b.nbas)
                 for (auto& ic : n.iso) {
-                    isoEdits(sm, ic, iso, opt.isoPlain);
+                    if (ic.namedOk && !opt.isoInline)
+                        isoEdits(sm, ic, iso, opt, isoName(ic, "_a"), isoName(ic, "_b"), &isoDecls[bi], b.indent);
+                    else
+                        isoEdits(sm, ic, iso, opt);
                     Finding f;
                     f.kind = "OI";
                     f.file = fileOf(b.span.buf);
@@ -1683,12 +1748,20 @@ inline void plan(const SourceManager& sm, Module& m, const Options& opt, bool al
         if (gate.empty()) {
             // Only isolation, if any: edit in place.
             for (auto& e : iso) { e.seq = seq++; m.edits.push_back(e); }
+            if (!isoDecls[bi].empty()) {
+                Edit e;
+                e.buf = b.span.buf;
+                e.begin = e.end = b.span.begin;
+                e.seq = seq++;
+                e.text = isoDecls[bi];
+                m.edits.push_back(std::move(e));
+            }
             continue;
         }
         m.usesIcg = true;
         std::string_view text = rawText(sm, b.span);
         std::string ind = b.indent;
-        std::string decls, after;
+        std::string decls = isoDecls[bi], after;
         auto render = [&](int keep, bool gatedClock, const std::string& gclk) {
             // keep >= 0: only that group's assignments; -1: everything; -2: all but the gated groups.
             std::vector<Edit> es = iso;
@@ -1776,7 +1849,15 @@ inline void plan(const SourceManager& sm, Module& m, const Options& opt, bool al
     auto loose = [&](const std::vector<IsoCand>& v) {
         for (auto& ic : v) {
             std::vector<Edit> es;
-            isoEdits(sm, ic, es, opt.isoPlain);
+            if (ic.namedOk && ic.decl.ok && !opt.isoInline) {
+                Edit d;
+                d.buf = ic.decl.buf;
+                d.begin = d.end = ic.decl.begin;
+                isoEdits(sm, ic, es, opt, isoName(ic, "_a"), isoName(ic, "_b"), &d.text, ic.indent);
+                d.seq = seq++;
+                m.edits.push_back(std::move(d));
+            } else
+                isoEdits(sm, ic, es, opt);
             for (auto& e : es) { e.seq = seq++; m.edits.push_back(e); }
             Finding f;
             f.kind = "OI";

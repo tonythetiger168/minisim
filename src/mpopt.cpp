@@ -7,6 +7,7 @@
 //   mpopt design.sv -top soc                 report what can be gated
 //   mpopt design.sv -top soc -o out          and write the rewritten RTL to out/
 //   mpopt design.sv -top soc -o out -verify  and co-simulate it against the original
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -28,6 +29,11 @@ void usage() {
                  "  -verify          simulate original and rewritten RTL on the same random stimulus\n"
                  "                   and compare every output and register, every cycle (needs -o)\n"
                  "  -verify_only     the same check on what is in <dir> now (after an edit by hand)\n"
+                 "  -prove           prove the rewritten RTL equivalent to the original with mequiv (needs -o);\n"
+                 "                   sequential gates are outside the proof: -verify covers those\n"
+                 "  -prove_effort <n>  SAT conflicts mequiv may spend per compare point\n"
+                 "  -power           power before and after, from mpower on the activity of the -verify run\n"
+                 "  -lib <file.lib>  Liberty library for -power and -prove (default: mpower's generic technology)\n"
                  "  -cycles <n>      cycles for -verify (default 2000)\n"
                  "  -clock <port>    a clock port of the top, for -verify (default: found from the RTL)\n"
                  "  -reset <port>    an active-high reset port; -reset_n <port>: active-low\n"
@@ -43,6 +49,7 @@ void usage() {
                  "  -iso_add <n>     also isolate adders and subtractors of n bits or more\n"
                  "  -iso_plain       isolate with (c ? a : 0) instead of (c !== 1'b0 ? a : 0): for flows that\n"
                  "                   reject !==; an x in c then becomes an x in the result\n"
+                 "  -iso_inline      rewrite the expression in place; do not add named isolation signals\n"
                  "  -icg_cell <cell>[:<clk>,<en>,<te>,<gclk>]  instantiate a library clock gate\n"
                  "  -test_enable <signal>  connect the gates' test enable to this signal where a module has it\n"
                  "  -prefix <name>   prefix of everything mpopt adds (default mpopt)\n"
@@ -256,6 +263,10 @@ std::string makeTb(const popt::Design& d, const InstanceSymbol& top, const Verif
        << "  task automatic drive();\n    begin\n" << drive.str() << "    end\n  endtask\n"
        << "  task automatic reset_on();\n    begin\n" << rstOn.str() << "    end\n  endtask\n"
        << "  task automatic reset_off();\n    begin\n" << rstOff.str() << "    end\n  endtask\n"
+       << "  // +mpopt_vcd=<file>: the design's activity, for mpopt -power\n"
+       << "  string vcd_file;\n"
+       << "  initial if ($value$plusargs(\"mpopt_vcd=%s\", vcd_file)) begin\n"
+       << "    $dumpfile(vcd_file);\n    $dumpvars(0, " << prefix << "_tb.dut);\n  end\n"
        << "  integer i;\n  initial begin\n    reset_on();\n    drive();\n"
        << "    repeat (3) begin @(negedge " << firstClock << "); drive(); end\n    reset_off();\n"
        << "    for (i = 0; i < " << vo.cycles << "; i = i + 1) begin\n      @(negedge " << firstClock << ");\n";
@@ -310,6 +321,10 @@ int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]}, simArgs;
     std::string outDir, jsonPath;
     bool verify = false, verifyOnly = false, quiet = false, verbose = false, threadsSet = false;
+    bool prove = false, power = false;
+    unsigned proveEffort = 0;
+    std::string topName;
+    std::vector<std::string> libs;
     for (size_t i = 0; i < args.size(); i++) {
         const std::string& a = args[i];
         auto next = [&](const char* what) -> std::string {
@@ -337,6 +352,10 @@ int main(int argc, char** argv) {
         if (a == "-o") { outDir = next("a directory"); continue; }
         if (a == "-verify") { verify = true; continue; }
         if (a == "-verify_only") { verify = verifyOnly = true; continue; }
+        if (a == "-prove") { prove = true; continue; }
+        if (a == "-prove_effort") { proveEffort = num("a number of conflicts"); continue; }
+        if (a == "-power") { power = verify = true; continue; }
+        if (a == "-lib") { libs.push_back(next("a Liberty file")); continue; }
         if (a == "-cycles") { vo.cycles = num("a number of cycles"); continue; }
         if (a == "-clock") { vo.clocks.push_back(next("a port name")); continue; }
         if (a == "-reset") { vo.resets.push_back(next("a port name")); continue; }
@@ -354,6 +373,7 @@ int main(int argc, char** argv) {
         if (a == "-iso_min_bits") { opt.isoMinBits = num("a number of bits"); continue; }
         if (a == "-iso_add") { opt.isoAddBits = num("a number of bits"); continue; }
         if (a == "-iso_plain") { opt.isoPlain = true; continue; }
+        if (a == "-iso_inline") { opt.isoInline = true; continue; }
         if (a == "-prefix") { opt.prefix = next("a name"); continue; }
         if (a == "-test_enable") { opt.testEnable = next("a signal name"); continue; }
         if (a == "-icg_cell") {
@@ -386,13 +406,25 @@ int main(int argc, char** argv) {
             continue;
         }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
-        if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
+        if (a == "-top") { topName = next("a module name"); fwd.push_back("--top"); fwd.push_back(topName); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
-        if (a.rfind("+define+", 0) == 0 || a.rfind("+incdir+", 0) == 0) simArgs.push_back(a);
-        if ((a == "-I" || a == "-D") && i + 1 < args.size()) {
-            simArgs.push_back(a);
-            simArgs.push_back(args[i + 1]);
-        }
+        // Defines and include directories go to msim, mequiv and mpower too, in the
+        // one spelling all of them read, with directories made absolute.
+        auto incdir = [&](const std::string& dir) {
+            std::error_code ec2;
+            fs::path abs = fs::absolute(dir, ec2);
+            simArgs.push_back("+incdir+" + (ec2 ? dir : abs.string()));
+        };
+        if (a.rfind("+define+", 0) == 0) simArgs.push_back(a);
+        else if (a.rfind("+incdir+", 0) == 0) incdir(a.substr(8));
+        else if ((a == "-I" || a == "-D") && i + 1 < args.size()) {
+            if (a == "-I") incdir(args[i + 1]);
+            else simArgs.push_back("+define+" + args[i + 1]);
+            fwd.push_back(a);
+            fwd.push_back(args[++i]);
+            continue;
+        } else if (a.size() > 2 && a.rfind("-I", 0) == 0) incdir(a.substr(2));
+        else if (a.size() > 2 && a.rfind("-D", 0) == 0) simArgs.push_back("+define+" + a.substr(2));
         fwd.push_back(a);
     }
     // The front end parses the source files on the same number of threads.
@@ -400,8 +432,8 @@ int main(int argc, char** argv) {
         fwd.push_back("--threads");
         fwd.push_back(std::to_string(opt.threads));
     }
-    if (verify && outDir.empty()) {
-        std::cerr << "mpopt: -verify needs -o <dir>\n";
+    if ((verify || prove) && outDir.empty()) {
+        std::cerr << "mpopt: " << (prove ? "-prove" : power ? "-power" : "-verify") << " needs -o <dir>\n";
         return 2;
     }
 
@@ -444,71 +476,145 @@ int main(int argc, char** argv) {
         std::cerr << "mpopt: cannot create " << outDir << "\n";
         return 2;
     }
-    auto texts = popt::rewrite(sm, d, opt.threads);
-    // Top-level source files in command-line order, then included files that changed.
-    std::vector<std::pair<uint32_t, bool>> bufs;   // buffer, is an include
-    std::set<uint32_t> have;
-    for (auto& tree : fe.driver.syntaxTrees)
-        for (BufferID b : tree->getSourceBufferIds()) {
-            if (sm.getIncludedFrom(b)) continue;
-            if (sm.getFullPath(b).empty()) continue;
-            if (have.insert(b.getId()).second) bufs.push_back({b.getId(), false});
+    struct Emitted {
+        std::vector<std::string> origFiles, newFiles;
+        std::set<std::string> origDirs;
+        bool incChanged = false, hasSeq = false, ok = true;
+    };
+    // Writes one rewritten design (or, with write off, only names its files).
+    auto emit = [&](const popt::Design& dd, const std::string& dir, bool write) {
+        Emitted e;
+        auto texts = popt::rewrite(sm, dd, opt.threads);
+        for (auto& [b, t] : texts)
+            if (t.find(opt.prefix + "_st_") != std::string::npos) e.hasSeq = true;
+        // Top-level source files in command-line order, then included files that changed.
+        std::vector<std::pair<uint32_t, bool>> bufs;   // buffer, is an include
+        std::set<uint32_t> have;
+        for (auto& tree : fe.driver.syntaxTrees)
+            for (BufferID b : tree->getSourceBufferIds()) {
+                if (sm.getIncludedFrom(b)) continue;
+                if (sm.getFullPath(b).empty()) continue;
+                if (have.insert(b.getId()).second) bufs.push_back({b.getId(), false});
+            }
+        for (auto& [b, t] : texts)
+            if (have.insert(b).second) bufs.push_back({b, true});
+        std::set<std::string> usedNames;
+        for (auto& [b, inc] : bufs) {
+            BufferID id(b, ""sv);
+            fs::path orig = sm.getFullPath(id);
+            std::string base = orig.filename().string();
+            // Two inputs of one name: keep both.
+            std::string name = base;
+            for (int k = 2; !usedNames.insert(name).second; k++)
+                name = orig.stem().string() + "_" + std::to_string(k) + orig.extension().string();
+            auto it = texts.find(b);
+            std::string text;
+            if (it != texts.end()) text = it->second;
+            else {
+                std::string_view sv = sm.getSourceText(id);
+                if (!sv.empty() && sv.back() == '\0') sv.remove_suffix(1);
+                text = std::string(sv);
+            }
+            if (write && !writeFile(fs::path(dir) / name, text)) {
+                std::cerr << "mpopt: cannot write " << (fs::path(dir) / name).string() << "\n";
+                e.ok = false;
+                return e;
+            }
+            if (inc) e.incChanged = true;
+            else {
+                e.origFiles.push_back(orig.string());
+                e.newFiles.push_back((fs::path(dir) / name).string());
+                e.origDirs.insert(orig.parent_path().string());
+            }
         }
-    for (auto& [b, t] : texts)
-        if (have.insert(b).second) bufs.push_back({b, true});
-    std::set<std::string> usedNames, origDirs;
-    std::vector<std::string> origFiles, newFiles;
-    bool incChanged = false;
-    for (auto& [b, inc] : bufs) {
-        BufferID id(b, ""sv);
-        fs::path orig = sm.getFullPath(id);
-        std::string base = orig.filename().string();
-        // Two inputs of one name: keep both.
-        std::string name = base;
-        for (int k = 2; !usedNames.insert(name).second; k++)
-            name = orig.stem().string() + "_" + std::to_string(k) + orig.extension().string();
-        auto it = texts.find(b);
-        std::string text;
-        if (it != texts.end()) text = it->second;
-        else {
-            std::string_view sv = sm.getSourceText(id);
-            if (!sv.empty() && sv.back() == '\0') sv.remove_suffix(1);
-            text = std::string(sv);
+        bool anyIcg = false;
+        for (auto& m : dd.mods) anyIcg |= m.usesIcg;
+        std::string cells = (fs::path(dir) / (opt.prefix + "_cells.sv")).string();
+        if (anyIcg && opt.icgCell.empty()) {
+            if (write) writeFile(cells, popt::cellText(opt));
+            e.newFiles.push_back(cells);
         }
-        if (!verifyOnly && !writeFile(fs::path(outDir) / name, text)) {
-            std::cerr << "mpopt: cannot write " << (fs::path(outDir) / name).string() << "\n";
-            return 2;
+        if (write) {
+            std::ostringstream ff;
+            if (e.incChanged) ff << "+incdir+" << dir << "\n";
+            for (auto& dname : e.origDirs) ff << "+incdir+" << dname << "\n";
+            for (auto& sa : simArgs) ff << sa << "\n";
+            for (auto& f : e.newFiles) ff << f << "\n";
+            writeFile(fs::path(dir) / "files.f", ff.str());
+            std::ofstream js(fs::path(dir) / (opt.prefix + ".json"));
+            popt::writeJson(js, dd);
         }
-        if (inc) incChanged = true;
-        else {
-            origFiles.push_back(orig.string());
-            newFiles.push_back((fs::path(outDir) / name).string());
-            origDirs.insert(orig.parent_path().string());
-        }
-    }
-    bool anyIcg = false;
-    for (auto& m : d.mods) anyIcg |= m.usesIcg;
-    std::string cells = (fs::path(outDir) / (opt.prefix + "_cells.sv")).string();
-    if (anyIcg && opt.icgCell.empty()) {
-        if (!verifyOnly) writeFile(cells, popt::cellText(opt));
-        newFiles.push_back(cells);
-    }
-    if (!verifyOnly) {
-        std::ostringstream ff;
-        if (incChanged) ff << "+incdir+" << outDir << "\n";
-        for (auto& dname : origDirs) ff << "+incdir+" << dname << "\n";
-        for (size_t i = 0; i < simArgs.size(); i++) {
-            ff << simArgs[i];
-            if ((simArgs[i] == "-I" || simArgs[i] == "-D") && i + 1 < simArgs.size()) ff << " " << simArgs[++i];
-            ff << "\n";
-        }
-        for (auto& f : newFiles) ff << f << "\n";
-        writeFile(fs::path(outDir) / "files.f", ff.str());
-        std::ofstream js(fs::path(outDir) / (opt.prefix + ".json"));
-        popt::writeJson(js, d);
-    }
+        return e;
+    };
+    Emitted em = emit(d, outDir, !verifyOnly);
+    if (!em.ok) return 2;
+    const std::vector<std::string>&origFiles = em.origFiles, &newFiles = em.newFiles;
+    const std::set<std::string>& origDirs = em.origDirs;
+    const bool incChanged = em.incChanged;
     if (!quiet && !verifyOnly) std::cout << "mpopt: wrote " << newFiles.size() << " files to " << outDir << "\n";
-    if (!verify) return 0;
+    auto tool = [&](const char* name, const char* env) {
+        std::string t = name;
+        if (std::string sd = selfDir(); !sd.empty() && fs::exists(fs::path(sd) / name)) t = (fs::path(sd) / name).string();
+        if (const char* e = std::getenv(env)) t = e;
+        return t;
+    };
+    auto exitOf = [](int rc) { return rc == -1 ? 127 : WIFEXITED(rc) ? WEXITSTATUS(rc) : 128; };
+    if (topName.empty()) {
+        auto tops = fe.comp->getRoot().topInstances;
+        if (tops.size() == 1) topName = std::string(tops[0]->body.getDefinition().name);
+    }
+    int result = 0;   // 1: a check failed, 3: the proof was inconclusive
+
+    // ---- prove with mequiv
+    if (prove) {
+        // A sequential gate is right because of what held one cycle before, which a
+        // combinational proof cannot see: the proof is of the rewrite without them.
+        std::string dir = outDir;
+        const Emitted* pe = &em;
+        Emitted noSeq;
+        if (em.hasSeq) {
+            popt::Options o2 = opt;
+            o2.seq = false;
+            popt::Design d2 = popt::run(*fe.comp, o2);
+            dir = (fs::path(outDir) / "prove").string();
+            fs::create_directories(dir, ec);
+            noSeq = emit(d2, dir, true);
+            if (ec || !noSeq.ok) return 2;
+            pe = &noSeq;
+        }
+        std::string log = (fs::path(outDir) / "prove.log").string();
+        std::string c = shq(tool("mequiv", "MPOPT_MEQUIV")) + " -q -threads " + std::to_string(opt.threads);
+        if (!topName.empty()) c += " -top " + shq(topName);
+        if (proveEffort) c += " -effort " + std::to_string(proveEffort);
+        for (auto& l : libs) c += " -lib " + shq(l);
+        c += " -report " + shq((fs::path(outDir) / "prove.json").string());
+        for (auto& sa : simArgs) c += " " + shq(sa);
+        c += " -ref";
+        for (auto& f : pe->origFiles) c += " " + shq(f);
+        c += " -impl -f " + shq((fs::path(dir) / "files.f").string()) + " > " + shq(log) + " 2>&1";
+        auto p0 = std::chrono::steady_clock::now();
+        int rc = exitOf(std::system(c.c_str()));
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - p0).count();
+        char took[32];
+        std::snprintf(took, sizeof took, "%.2f s", sec);
+        const char* scope = em.hasSeq ? "the rewrite without sequential gates (in prove/)" : "the rewritten RTL";
+        if (rc == 0) {
+            std::cout << "mpopt: -prove passed: mequiv proved " << scope << " equivalent to the original (" << took << ")\n";
+            if (em.hasSeq)
+                std::cout << "mpopt: -prove: sequential gates are outside the proof; -verify checks them in simulation\n";
+        } else if (rc == 1) {
+            std::cerr << "mpopt: -prove FAILED: mequiv found a difference in " << scope << "; see " << log << "\n";
+            result = 1;
+        } else if (rc == 3) {
+            std::cerr << "mpopt: -prove inconclusive: mequiv ran out of effort on " << scope << " (raise -prove_effort); see "
+                      << log << "\n";
+            result = 3;
+        } else {
+            std::cerr << "mpopt: -prove: mequiv could not read the design (exit " << rc << "); see " << log << "\n";
+            result = 2;
+        }
+    }
+    if (!verify) return result;
 
     // ---- co-simulate
     auto tops = fe.comp->getRoot().topInstances;
@@ -524,9 +630,7 @@ int main(int argc, char** argv) {
     }
     std::string tbPath = (fs::path(outDir) / (opt.prefix + "_tb.sv")).string();
     writeFile(tbPath, tb);
-    std::string msim = "msim";
-    if (std::string sd = selfDir(); !sd.empty() && fs::exists(fs::path(sd) / "msim")) msim = (fs::path(sd) / "msim").string();
-    if (const char* e = std::getenv("MPOPT_MSIM")) msim = e;
+    std::string msim = tool("msim", "MPOPT_MSIM");
     auto command = [&](const std::vector<std::string>& files, bool rewritten, const std::string& log) {
         std::string c = shq(msim);
         if (rewritten && incChanged) c += " " + shq("+incdir+" + outDir);
@@ -534,7 +638,9 @@ int main(int argc, char** argv) {
             for (auto& dname : origDirs) c += " " + shq("+incdir+" + dname);
         for (auto& s : simArgs) c += " " + shq(s);
         for (auto& f : files) c += " " + shq(f);
-        c += " " + shq(tbPath) + " -top " + opt.prefix + "_tb > " + shq(log) + " 2> " + shq(log + ".err");
+        c += " " + shq(tbPath) + " -top " + opt.prefix + "_tb";
+        if (power) c += " " + shq("+mpopt_vcd=" + (fs::path(outDir) / (rewritten ? "power_opt.vcd" : "power_ref.vcd")).string());
+        c += " > " + shq(log) + " 2> " + shq(log + ".err");
         return c;
     };
     std::string refLog = (fs::path(outDir) / "verify_ref.log").string();
@@ -587,5 +693,71 @@ int main(int argc, char** argv) {
     }
     std::cout << "mpopt: -verify passed: " << vo.cycles << " cycles of random stimulus, every output and register equal ("
               << lines << " lines compared)\n";
-    return 0;
+    if (!power) return result;
+
+    // ---- power before and after: mpower on the activity of the two runs
+    std::string mpower = tool("mpower", "MPOPT_MPOWER");
+    auto powerOf = [&](bool rewritten, double& total, double& clock, double& reg, double& comb) {
+        std::string tag = rewritten ? "power_opt" : "power_ref";
+        std::string json = (fs::path(outDir) / (tag + ".json")).string(), log = (fs::path(outDir) / (tag + ".log")).string();
+        std::string c = shq(mpower) + " -q -threads " + std::to_string(opt.threads);
+        if (!topName.empty()) c += " -top " + shq(topName);
+        for (auto& l : libs) c += " -lib " + shq(l);
+        c += " -activity " + shq((fs::path(outDir) / (tag + ".vcd")).string()) + " -strip_path " + opt.prefix + "_tb.dut";
+        c += " -json " + shq(json);
+        if (rewritten) c += " -f " + shq((fs::path(outDir) / "files.f").string());
+        else {
+            for (auto& sa : simArgs) c += " " + shq(sa);
+            for (auto& f : origFiles) c += " " + shq(f);
+        }
+        c += " > " + shq(log) + " 2>&1";
+        if (exitOf(std::system(c.c_str())) != 0) return false;
+        std::string j = readFile(json);
+        // "total" of the whole design, and of three groups, in watts.
+        auto field = [&](const std::string& obj) {
+            size_t at = j.find("\"" + obj + "\": {");
+            if (at == std::string::npos) return -1.0;
+            size_t end = j.find('}', at), t = j.find("\"total\":", at + obj.size() + 3);
+            if (t == std::string::npos || t > end) return -1.0;
+            return std::strtod(j.c_str() + t + 8, nullptr);
+        };
+        total = field("total");
+        clock = field("clock_network");
+        reg = field("register");
+        comb = field("combinational");
+        return total >= 0;
+    };
+    double a[4] = {0, 0, 0, 0}, b[4] = {0, 0, 0, 0};
+    bool okA = false, okB = false;
+    {
+        std::thread ta([&] { okA = powerOf(false, a[0], a[1], a[2], a[3]); });
+        if (opt.threads > 1) {
+            std::thread tb2([&] { okB = powerOf(true, b[0], b[1], b[2], b[3]); });
+            tb2.join();
+            ta.join();
+        } else {
+            ta.join();
+            okB = powerOf(true, b[0], b[1], b[2], b[3]);
+        }
+    }
+    if (!okA || !okB) {
+        std::cerr << "mpopt: -power: mpower failed on the " << (okA ? "rewritten" : "original") << " design; see "
+                  << (fs::path(outDir) / (okA ? "power_opt.log" : "power_ref.log")).string() << "\n";
+        return 2;
+    }
+    auto row = [&](const char* name, double x, double y) {
+        char line[160];
+        double pct = x > 0 ? (y - x) / x * 100.0 : 0.0;
+        std::snprintf(line, sizeof line, "  %-15s %10.2f uW  ->  %10.2f uW  (%+.1f%%)\n", name, x * 1e6, y * 1e6, pct);
+        std::cout << line;
+    };
+    std::cout << "mpopt: -power: before and after, on the " << vo.cycles << " cycles of random stimulus of -verify"
+              << (libs.empty() ? " (generic technology)" : "") << "\n";
+    row("total", a[0], b[0]);
+    if (a[1] >= 0 && b[1] >= 0) row("clock network", a[1], b[1]);
+    if (a[2] >= 0 && b[2] >= 0) row("registers", a[2], b[2]);
+    if (a[3] >= 0 && b[3] >= 0) row("combinational", a[3], b[3]);
+    std::remove((fs::path(outDir) / "power_ref.vcd").string().c_str());
+    std::remove((fs::path(outDir) / "power_opt.vcd").string().c_str());
+    return result;
 }

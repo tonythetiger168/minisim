@@ -69,16 +69,33 @@ expect(iso
   "[OI] iso: operator / (12 bits) isolated by mode == 2'd3"
   "operators isolated:          4")
 file(READ ${OUT}/iso/iso.sv text)
-string(FIND "${text}" "((!rst && use_mul) !== 1'b0 ? sa : $signed(1'b0)) * ((!rst && use_mul) !== 1'b0 ? sb : $signed(1'b0))" pos)
-if(pos EQUAL -1)
-  message(FATAL_ERROR "iso.sv: the signed multiplier was not isolated as expected\n${text}")
+# Named isolation signals of the operand's own width in always_ff and assign;
+# the expression rewritten in place in always_comb.
+foreach(want
+    "wire signed [11:0] mpopt_iso_L22_a = (!rst && use_mul) !== 1'b0 ? sa : $signed(1'b0);"
+    "if (use_mul) sp <= mpopt_iso_L22_a * mpopt_iso_L22_b;"
+    "wire [23:0] mpopt_iso_L30_b = use_mul !== 1'b0 ? (ub + 12'd3) : 1'b0;"
+    "assign y = use_mul ? mpopt_iso_L30_a * mpopt_iso_L30_b : {12'd0, ua};"
+    "q = ((mode == 2'd3) !== 1'b0 ? ua : 1'b0) / ((mode == 2'd3) !== 1'b0 ? (ub | 12'd1) : 1'b0);")
+  string(FIND "${text}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "iso.sv: missing: ${want}\n${text}")
+  endif()
+endforeach()
+# -iso_inline: no new signals; a plain signal keeps its width inside a concatenation.
+run(iso ${SRC}/tests/popt/iso.sv -top iso -o ${OUT}/iso_inline -iso_inline -verify)
+file(READ ${OUT}/iso_inline/iso.sv text)
+string(FIND "${text}" "$signed({((!rst && use_mul) !== 1'b0 ? sa : $signed(1'b0))}) * $signed({((!rst && use_mul) !== 1'b0 ? sb : $signed(1'b0))})" pos)
+string(FIND "${text}" "mpopt_iso_" named)
+if(pos EQUAL -1 OR NOT named EQUAL -1 OR NOT rc EQUAL 0)
+  message(FATAL_ERROR "-iso_inline: unexpected rewrite or -verify failed\n${out}${err}${text}")
 endif()
 # -no_iso and -iso_add.
 run(iso ${SRC}/tests/popt/iso.sv -top iso -no_iso)
 expect(iso "operators isolated:          0")
 run(iso ${SRC}/tests/popt/iso.sv -top iso -o ${OUT}/iso_plain -iso_plain -verify)
 file(READ ${OUT}/iso_plain/iso.sv text)
-string(FIND "${text}" "(use_mul ? ua : 1'b0) * (use_mul ? (ub + 12'd3) : 1'b0)" pos)
+string(FIND "${text}" "wire [11:0] mpopt_iso_L30_a = use_mul ? ua : 1'b0;" pos)
 if(pos EQUAL -1 OR NOT rc EQUAL 0)
   message(FATAL_ERROR "-iso_plain: unexpected rewrite or -verify failed\n${out}${err}${text}")
 endif()
@@ -168,4 +185,44 @@ endif()
 string(FIND "${text}" "mpopt_gclk_L63" pos)   # raddr is 4 bits: under -min_bits 8
 if(NOT pos EQUAL -1)
   message(FATAL_ERROR "-min_bits 8 gated a 4-bit register\n${text}")
+endif()
+
+# -prove: mequiv proves the rewrite; with sequential gates, the rewrite without them.
+if(EXISTS ${MEQUIV})
+  run(prove ${SRC}/tests/popt/top.sv -top top -o ${OUT}/prove_top -no_seq -prove)
+  expect(prove "-prove passed: mequiv proved the rewritten RTL equivalent to the original")
+  run(prove ${SRC}/tests/popt/pipe.sv -top pipe -o ${OUT}/prove_pipe -prove -threads 2)
+  expect(prove "-prove passed: mequiv proved the rewrite without sequential gates (in prove/)"
+               "sequential gates are outside the proof")
+  if(NOT rc EQUAL 0 OR NOT EXISTS ${OUT}/prove_pipe/prove/files.f OR NOT EXISTS ${OUT}/prove_pipe/prove.json)
+    message(FATAL_ERROR "-prove: exit ${rc} or files missing\n${out}${err}")
+  endif()
+  # A wrong enable in the rewritten RTL must fail the proof.
+  file(READ ${OUT}/prove_top/top.sv text)
+  string(REPLACE ".en(rst || en)" ".en(rst)" bad "${text}")
+  if(bad STREQUAL text)
+    message(FATAL_ERROR "-prove: the enable to break was not found\n${text}")
+  endif()
+  file(WRITE ${OUT}/prove_top/top.sv "${bad}")
+  execute_process(COMMAND ${MEQUIV} -q -top top -ref ${SRC}/tests/popt/top.sv -impl -f ${OUT}/prove_top/files.f
+                  RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
+  if(NOT rc EQUAL 1)
+    message(FATAL_ERROR "-prove: mequiv did not catch a wrong enable (exit ${rc})")
+  endif()
+endif()
+
+# -power: mpower before and after, on the activity of the -verify run.
+if(EXISTS ${MPOWER})
+  run(power ${SRC}/tests/popt/pipe.sv -top pipe -o ${OUT}/power_pipe -power)
+  expect(power "-verify passed" "-power: before and after" "clock network")
+  string(REGEX MATCH "total +([0-9.]+) uW  ->  +([0-9.]+) uW" m "${out}")
+  if(NOT rc EQUAL 0 OR NOT m OR NOT CMAKE_MATCH_2 LESS CMAKE_MATCH_1)
+    message(FATAL_ERROR "-power: pipe did not get cheaper\n${out}${err}")
+  endif()
+  # Operand isolation alone must show a saving too.
+  run(power ${SRC}/tests/popt/iso.sv -top iso -o ${OUT}/power_iso -no_cg -power)
+  string(REGEX MATCH "combinational +([0-9.]+) uW  ->  +([0-9.]+) uW" m "${out}")
+  if(NOT rc EQUAL 0 OR NOT m OR NOT CMAKE_MATCH_2 LESS CMAKE_MATCH_1)
+    message(FATAL_ERROR "-power: isolation did not lower the combinational power\n${out}${err}")
+  endif()
 endif()

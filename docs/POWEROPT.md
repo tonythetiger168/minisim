@@ -106,8 +106,23 @@ does not toggle for results nobody reads:
 // before
 assign y = use_mul ? ua * (ub + 12'd3) : {12'd0, ua};
 // after
-assign y = use_mul ? (use_mul !== 1'b0 ? ua : 1'b0) * (use_mul !== 1'b0 ? (ub + 12'd3) : 1'b0) : {12'd0, ua};
+wire [11:0] mpopt_iso_L30_a = use_mul !== 1'b0 ? ua : 1'b0;
+wire [23:0] mpopt_iso_L30_b = use_mul !== 1'b0 ? (ub + 12'd3) : 1'b0;
+assign y = use_mul ? mpopt_iso_L30_a * mpopt_iso_L30_b : {12'd0, ua};
 ```
+
+The isolated operands are named signals, declared in front of the statement.
+A power tool reads their activity from a waveform like any other signal (an
+operand hidden inside an expression has none), and the operator keeps the
+size it had: a 12-bit `ua` stays a 12-bit operand of the multiplier, where a
+`?:` written into the expression would have been widened to the 24 bits of
+the result. An operand that is itself an expression gets the width it is
+computed in (`ub + 12'd3` above: 24 bits, with its carry). Named signals are
+used in `always_ff` blocks and continuous assignments whose operands and
+condition read module-level signals. In `always_comb`, where a value may be a
+step of a blocking computation, and with `-iso_inline` everywhere, the
+expression is rewritten in place: `((c) !== 1'b0 ? a : 1'b0)`, inside a
+concatenation when `a` is a plain signal so that it keeps its width.
 
 The condition is the path condition of the operator: `if`/`case` branches in
 `always_ff` and `always_comb`, and `?:` in any expression. The operand keeps
@@ -147,12 +162,56 @@ the RTL (`-clock`, `-reset`, `-reset_n` name them by hand); `-cycles N` sets
 the length (default 2000). `-verify_only` repeats the check on what is in the
 output directory now, for example after an edit by hand.
 
-Co-simulation is a check, not a proof. The proof belongs to `mequiv`, the
-equivalence checker: `mequiv -ref rtl/*.sv -impl out/*.sv -top soc`. It reads
-a flop on a gated clock as a flop with a load enable, which makes CG, MG on
-write ports and OI combinational compare points. SCG adds stability flops and
-needs an inductive argument from reset, which `mequiv` does not have yet; run
-`mpopt -no_seq` for a result it can prove in full today. Besides that,
+Co-simulation is a check, not a proof. `-prove` hands the proof to `mequiv`,
+the equivalence checker: it runs `mequiv -ref <the original> -impl -f
+<dir>/files.f` and reports proved (exit 0), a difference (exit 1) or out of
+effort (exit 3, see `-prove_effort`), with the log in `<dir>/prove.log` and
+every compare point in `<dir>/prove.json`. `mequiv` reads a flop on a gated
+clock as a flop with a load enable, which makes CG, MG on write ports and OI
+combinational compare points. Two limits, both stated in the output:
+
+- SCG adds stability flops and is right because of what held one cycle
+  earlier, an inductive argument from reset that `mequiv` does not have yet.
+  When the rewrite has sequential gates, `-prove` writes the rewrite without
+  them to `<dir>/prove/` and proves that one; the sequential gates
+  themselves are covered by `-verify`.
+- The miter of two wide multipliers whose operands differ by the isolation
+  is hard for SAT: with isolated multipliers of 24 bits the proof can end as
+  out of effort. `-no_iso -prove` proves the gating alone.
+- `mequiv` does not yet read a gate on a clock that is already gated (a
+  design with its own top-level clock gate, such as Ibex) or a gate whose
+  enable is a constant as an enable flop, and reports those registers as
+  different. Until it does, `-verify` is the check for such designs.
+
+## Measuring the result
+
+`-power` measures what the rewrite saved. It runs the `-verify` simulations
+with waveforms on, gives each waveform to `mpower` with its own design, and
+prints the two results:
+
+```
+mpopt: -power: before and after, on the 2000 cycles of random stimulus of -verify (generic technology)
+  total               192.49 uW  ->      148.44 uW  (-22.9%)
+  clock network        36.45 uW  ->       21.01 uW  (-42.4%)
+  registers            80.68 uW  ->       48.77 uW  (-39.6%)
+  combinational        72.98 uW  ->       75.56 uW  (+3.5%)
+```
+
+On Ibex (`ibex_top`, 62 gates on 90% of the register bits) the same run over
+5000 cycles gives 1325 uW before and 801 uW after, 40% lower: the clock
+network and the registers each drop by about 80%.
+
+`-lib file.lib` gives `mpower` a Liberty library; without one it uses its
+generic technology, which is good for comparing two versions of a design and
+not for absolute numbers. The reports are `<dir>/power_ref.json` and
+`<dir>/power_opt.json`. Two things to keep in mind. The stimulus is random:
+every enable is high about half the time, which is busier than most real
+workloads, so the saving on a real workload is usually larger; for that
+number, simulate both designs with your own testbench and run `mpower` on
+each. And the combinational row can go up a little: the gates, the enable
+logic and the isolation logic are new logic. The total is what counts.
+
+Besides that,
 `ctest -R mpopt_fuzz` runs random designs through `mpopt -verify`
 (`tests/popt/fuzz_popt.py`; 3000 designs with 2000 sequential gates passed
 before the first release), and a broken rewrite is shown to be caught
@@ -201,13 +260,15 @@ that clock's activity.
 |---|---|
 | `-o <dir>` | write the rewritten RTL |
 | `-verify`, `-verify_only`, `-cycles <n>` | co-simulate against the original |
+| `-prove`, `-prove_effort <n>` | prove the rewrite with `mequiv` |
+| `-power`, `-lib <file.lib>` | power before and after, from `mpower` |
 | `-clock <port>`, `-reset <port>`, `-reset_n <port>` | clock and reset ports for `-verify` |
 | `-json <file>`, `-v`, `-quiet` | report |
 | `-no_cg`, `-no_seq`, `-no_iso`, `-no_split` | turn one transformation off |
 | `-min_bits <n>` | smallest register group to gate (default 4) |
 | `-seq_min_bits <n>` | smallest group for a sequential gate (default 8) |
 | `-seq_depth <n>` | stages a sequential enable follows (default 4) |
-| `-iso_min_bits <n>`, `-iso_add <n>`, `-iso_plain` | operand isolation |
+| `-iso_min_bits <n>`, `-iso_add <n>`, `-iso_plain`, `-iso_inline` | operand isolation |
 | `-icg_cell <cell>[:clk,en,te,gclk]`, `-test_enable <signal>`, `-prefix <name>` | what is inserted |
 | `-threads <n>` | worker threads (default: every logical CPU) |
 
@@ -243,5 +304,6 @@ every minisim tool) and 0.65 s is `mpopt`'s own analysis (1.8 s on one thread).
   It changes register values in cycles nobody observes, so it waits for the
   sequential equivalence proof in `mequiv`.
 - Chip-enable gating of instantiated RAM macros (inferred memories are done).
-- Ranking candidates by measured activity (`mpower`'s activity reader).
+- A proof of the sequential gates (needs induction with an invariant in `mequiv`).
+- Ranking candidates by measured activity, and `-power` on a user testbench.
 - Falling-edge registers and latch-based designs.

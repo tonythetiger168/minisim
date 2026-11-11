@@ -613,6 +613,8 @@ result against the original:
 mpopt rtl/*.sv -top soc_top                    # what can be gated, and what cannot (-v: why)
 mpopt rtl/*.sv -top soc_top -o out             # rewritten RTL, clock-gate cell and files.f in out/
 mpopt rtl/*.sv -top soc_top -o out -verify     # co-simulate original and rewritten RTL in msim
+mpopt rtl/*.sv -top soc_top -o out -prove      # prove it equivalent with mequiv
+mpopt rtl/*.sv -top soc_top -o out -power      # power before and after, from mpower
 ```
 
 ```

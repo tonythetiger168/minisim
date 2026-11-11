@@ -10,6 +10,7 @@ if(MINISIM_WITH_SLANG)
   # Found, rewritten, co-simulated against the original (uses msim).
   add_test(NAME mpopt
            COMMAND ${CMAKE_COMMAND} -DMPOPT=$<TARGET_FILE:mpopt> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DMEQUIV=$<TARGET_FILE_DIR:mpopt>/mequiv -DMPOWER=$<TARGET_FILE_DIR:mpopt>/mpower
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mpopt_test -P ${CMAKE_SOURCE_DIR}/tests/mpopt.cmake)
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)
