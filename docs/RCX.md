@@ -75,6 +75,10 @@ DIELECTRIC pmd   { THICKNESS = 0.40 ER = 3.9 }
 VIA via1 { FROM = metal1 TO = metal2 AREA = 0.0049 RPV = 6 CRT1 = 0.001 }
 ```
 
+`ETCH = e` on a conductor says each edge of a wire loses `e` um when it is
+made: resistance and capacitance use the width `drawn - 2e` and the spacing
+`drawn + 2e`.
+
 `$` starts a comment. Properties the model does not use are skipped. When the
 LEF and the process file name a layer differently, `-map FILE` holds lines of
 `LEF-layer process-conductor`. `tests/rcx/sky130.itf` is the stack of the open
@@ -83,6 +87,25 @@ SkyWater 130 nm process.
 Without `-itf`, the LEF's own numbers are used: `RESISTANCE RPERSQ`, the cut
 layers' `RESISTANCE`, `CAPACITANCE CPERSQDIST` and `EDGECAPACITANCE` for the
 capacitance to ground, `THICKNESS` and `HEIGHT` for coupling.
+
+## Corners
+
+A sign-off run wants the same design at several corners. `-corner NAME` starts
+one, and the process file, temperature and scale options that follow belong to
+it; those given before the first `-corner` are the defaults of every corner.
+
+```
+mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef \
+     -corner cmax -itf cmax.itf -temp 125 \
+     -corner cmin -itf cmin.itf -temp -40 \
+     -corner typ  -itf typ.itf
+```
+
+This writes `design.cmax.spef`, `design.cmin.spef` and `design.typ.spef` (and a
+report per corner with `-report`). The LEF and DEF are read once, every process
+file is checked before the first extraction, and each file is byte for byte
+what a run with only that corner's options writes. Three corners of the 290k-net
+benchmark take 8.6 s on 4 cores against 10.9 s for three runs.
 
 ## Options
 
@@ -93,6 +116,7 @@ capacitance to ground, `THICKNESS` and `HEIGHT` for coupling.
 | `-o FILE` | SPEF to write (default `<design>.spef`) |
 | `-itf FILE`, `-map FILE` | process stack, and layer names when they differ |
 | `-temp C` | temperature for resistance |
+| `-corner NAME` | start a corner; the `-itf`, `-temp`, `-rscale`, `-cscale`, `-ccscale` after it are its own, and it is written to `design.NAME.spef` |
 | `-rscale F`, `-cscale F`, `-ccscale F` | scale resistance, all capacitance, coupling only (corners) |
 | `-no_coupling` | ground every coupling capacitor (a decoupled SPEF); `-cc_factor F` multiplies it on the way |
 | `-cc_threshold FF` | ground coupling capacitors smaller than this |
@@ -119,8 +143,12 @@ test suite (`src/rcx/test/gcd.def`, reference `gcd.spefok`), with
 
 The one fitted number in the model is how much of the ground fringe a
 neighbour takes over (`kShield` in `src/rcx.hpp`); it was set on this design.
-Resistance is lower than OpenRCX's by about 10% per net; the reference lumps
-vias into wire segments, so the two cannot be compared resistor by resistor.
+The resistance difference is input data, not method. A fit over the 411 nets
+reproduces OpenRCX's totals to 1% as 1.33 x mrcx's wire resistance plus a
+resistance per via: OpenRCX's rules file for this design carries 1.21 ohm/um
+for a 0.14 um met1 wire (0.169 ohm/sq), where the LEF and `sky130.itf` say
+0.125 ohm/sq, and its via values differ too. Give mrcx the same sheet and via
+resistances, or an `ETCH`, and the two agree.
 
 ## Speed
 
@@ -151,6 +179,6 @@ wire, 1.7 million nodes, 2.9 million coupling capacitors, a 270 MB SPEF) on a
 - Metal inside cells (pins, obstructions) connects but adds no capacitance.
 - No coupling across three or more layers or to wires that pass nearby on
   another layer without overlapping, no via capacitance, no inductance.
-- One corner per run; use `-temp` and the scale options for the others.
+- Corners in one run share the read of the design, not the extraction: each corner is extracted again, since its stack changes every capacitance.
 - Dielectrics are planar layers: no conformal layers, no width-dependent
   etch or thickness.

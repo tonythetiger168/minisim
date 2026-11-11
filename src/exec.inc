@@ -1654,6 +1654,11 @@ static void execComb(const void* ctx) {
         if (g_cov) covHit(i.hits);
         Val v = eval(i.e, rd);
         if (i.tmp) { S.poke(i.sig, v, i.hi, i.lo); continue; }   // a temporary of its own
+        if (i.bidx) {   // v[i] = ...: the bits are chosen now; an invalid index writes nothing
+            int sg = i.sig, hi = i.hi, lo = i.lo;
+            if (target(i, sg, hi, lo, v)) S.set(sg, hi >= 0 ? v_insert(S.get(sg), v, hi, lo) : v);
+            continue;
+        }
         if (i.drv >= 0) {
             // A driver of part of a net drives Z on the other bits, as in exec().
             if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
