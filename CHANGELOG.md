@@ -7,7 +7,20 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Changed
+- License: the repository is Apache-2.0 (`LICENSE`, attribution in `NOTICE`)
+  instead of MIT. The MIT grant is not withdrawn: copies obtained under it
+  stay under it, and so does the git history. `docs/LICENSING.md` holds the
+  open-core policy, the proposed free / paid split per tool, and the rule
+  that no GPL or other copyleft code enters the tree.
+
 ### Added
+- `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
+  built from the spare cells of the old netlist and the cells the change
+  frees, by function (the same cell, or one with inputs tied or shared, or
+  the inverse plus a spare inverter); no cell is added or removed, and the
+  script holds only net connections. Exit status 3 when a cell had to be
+  added after all. See `docs/ECO.md`.
 - `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
   `q[3:0]`) follows only that part: its value, the time those bits last
   changed, and the assignments that write them. The viewer page does the same.
@@ -157,6 +170,12 @@ Spec references are IEEE 1800-2023 clauses.
   count. `ETCH` on a conductor gives the width as made. `src/spef.hpp` is the
   SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `lib/sky130`: cells of the open SkyWater 130 nm library (Apache-2.0) as a
+  second test library: a 47-cell Liberty subset with its LEF and technology
+  LEF, `sky130.py fetch` for the whole library at three corners (pinned
+  commits, SHA-256 checked), and a `sky130` test that runs `mlibc`, `msynth`,
+  `msta` and `mpower` on it. `mlibc` no longer expects a LEF pin for a
+  Liberty `internal` pin, and `mlibc report` fits long cell names.
 - `mchar`, cell library characterization on `mspice`: from a Liberty
   template and one transistor `.subckt` per cell it measures delay and
   transition tables (combinational, clock-to-output, set and reset arcs,
@@ -355,6 +374,13 @@ Spec references are IEEE 1800-2023 clauses.
   `set_power_state`, `get_supply_value`, ...) is added for the testbench.
   `mlint -upf` checks the power intent: UPF001 to UPF006. See
   `docs/LOWPOWER.md`.
+- `mpv drc -svrf rules.svrf` reads rule files in the SVRF style that foundry
+  decks use (`LAYER`, `LAYER MAP`, `AND`/`OR`/`NOT`/`XOR`, `INTERACT`,
+  `INSIDE`, `OUTSIDE`, `SIZE`, `HOLES`, `RECTANGLE`, rule blocks with `INT`,
+  `EXT`, `ENC`, `AREA`, `DENSITY`, `#IFDEF`, `INCLUDE`) and translates them
+  to the native deck (`-write-deck`). Options it does not apply are listed
+  in warnings; statements it cannot run are errors with their line. Decks
+  can now name every datatype of a layer (`layer m1 68/*`).
 - `mpv drc -rdb drc.lyrdb` writes the violation markers as a KLayout report
   database, to step through them in KLayout's marker browser.
 - `mpv drc`: `enclosure(a, b, opposite) < v` passes a contact or via that
@@ -445,6 +471,10 @@ Spec references are IEEE 1800-2023 clauses.
 - `mdft -edt`: scan test compression. A ring-generator decompressor and an
   XOR compactor around the scan chains, and an encoder that solves test
   cubes into channel data over GF(2), in parallel and deterministically.
+  With the gate netlist it simulates each compressed pattern and writes the
+  expected output channels and a load / capture / compare testbench;
+  `-edt_xmask` adds compactor X masking (one chain per channel observed,
+  mask chosen per pattern) so unknown captures do not hide known ones.
 - `mdft -lbist_coverage`: stuck-at fault coverage of the logic BIST patterns
   on the gate netlist (port inputs at 0, scan cells observed), with the
   coverage after 64, 128, 256, ... patterns, a fault list, JSON and a
@@ -455,6 +485,17 @@ Spec references are IEEE 1800-2023 clauses.
   and a second, third... defect when one does not explain everything. Uses
   the shared fault simulator; multithreaded with the same report on any
   thread count. See docs/JTAG.md.
+- `mspice`: BSIM4 transistors (`.model ... level=14` or `54`). The model
+  equations are the UC Berkeley BSIM Research Group's BSIM4 4.8.3 code,
+  unmodified under the Educational Community License 2.0
+  (`third_party/bsim4`, `THIRD_PARTY_NOTICES.md`), behind an adapter to
+  mspice's solver: DC, AC and transient, gate/body/source-drain resistance
+  networks and the NQS model, evaluated on all threads with identical
+  results. Checked against ngspice (same equations, within 1 to 2%); a
+  4,000-transistor chain runs in 3.2 s on one thread and 2.1 s on four
+  against 5.8 s. Build option `MINISIM_WITH_BSIM4`.
+- `mspice`: unknowns fixed by a voltage source to ground are eliminated
+  first, which keeps the pivots of a long chain of gain stages usable.
 
 ### Fixed
 - An inout port connected to a whole net is now that net (23.3.3.1). It was
@@ -560,17 +601,11 @@ Spec references are IEEE 1800-2023 clauses.
   nodes) and `spice::Reader::readText()` for netlists held in memory.
   mspice now runs on the shared thread pool of `src/parallel.hpp`, which
   gains `Pool::spin()` for short batches that come one after the other.
-- `mspice`: BSIM4 transistors (`.model ... level=14` or `54`). The model
-  equations are the UC Berkeley BSIM Research Group's BSIM4 4.8.3 code,
-  unmodified under the Educational Community License 2.0
-  (`third_party/bsim4`, `THIRD_PARTY_NOTICES.md`), behind an adapter to
-  mspice's solver: DC, AC and transient, gate/body/source-drain resistance
-  networks and the NQS model, evaluated on all threads with identical
-  results. Checked against ngspice (same equations, within 1 to 2%); a
-  4,000-transistor chain runs in 3.2 s on one thread and 2.1 s on four
-  against 5.8 s. Build option `MINISIM_WITH_BSIM4`.
-- `mspice`: unknowns fixed by a voltage source to ground are eliminated
-  first, which keeps the pivots of a long chain of gain stages usable.
+- `mfpga`: a multiplier wider than one DSP block is split into block-sized
+  partial products summed on carry chains (32x32 on ECP5: 4 blocks, no LUTs).
+- `mfpga`: memories with registered reads map to block RAM on iCE40
+  (`SB_RAM40_4K`) and ECP5 (`DP16KD`), with a bypass that keeps the RTL's
+  read-during-write result. `-noram` keeps flops.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

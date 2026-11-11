@@ -1,0 +1,104 @@
+// The rules of sky130.drc written in the SVRF style, to test the reader
+// (src/svrf.hpp). mpv must report the same results for both files.
+
+LAYOUT SYSTEM GDSII
+PRECISION 1000
+DRC RESULTS DATABASE "drc.results" ASCII
+
+LAYER MAP 64 DATATYPE 20 1001
+LAYER MAP 65 DATATYPE 20 1002
+LAYER MAP 65 DATATYPE 44 1003
+LAYER MAP 66 DATATYPE 20 1004
+LAYER MAP 66 DATATYPE 44 1005
+LAYER MAP 67 DATATYPE 20 1006
+LAYER MAP 67 DATATYPE 44 1007
+LAYER MAP 68 DATATYPE 20 1008
+LAYER MAP 68 DATATYPE 44 1009
+LAYER MAP 69 DATATYPE 20 1010
+LAYER MAP 81 DATATYPE 4  1011
+
+LAYER nwell   1001
+LAYER diff    1002
+LAYER tap     1003
+LAYER poly    1004
+LAYER licon   1005
+LAYER li      1006
+LAYER mcon    1007
+LAYER met1    1008
+LAYER via     1009
+LAYER met2    1010
+LAYER stdcell 1011
+LAYER difftap diff tap
+
+// Derived layers may be used before they are defined.
+licon_diff = LICON AND difftap
+licon_poly = licon AND poly
+gate       = poly AND diff
+fieldpoly  = poly NOT diff
+
+nwell.1  { @ nwell width
+           INT nwell < 0.84 ABUT<90 SINGULAR REGION }
+nwell.2a { @ nwell spacing
+           EXT nwell < 1.27 }
+difftap.1 { @ diff or tap width
+            INTERNAL difftap < 0.15 }
+difftap.3 { @ diff or tap spacing
+            EXTERNAL difftap < 0.27 }
+poly.1a  { @ poly width
+           INT poly < 0.15 }
+poly.2   { @ poly spacing
+           EXT poly < 0.21 }
+poly.4   { @ poly on field to diff spacing
+           EXT fieldpoly diff < 0.075 }
+poly.5   { @ poly on field to tap spacing
+           EXT fieldpoly tap < 0.055 }
+licon.2  { @ licon spacing
+           EXT licon < 0.17 }
+licon.5a { @ diff enclosure of licon
+           ENC (licon AND diff) difftap < 0.04 }
+licon.8  { @ poly enclosure of licon
+           ENC licon_poly poly < 0.05 }
+licon.11 { @ licon on diff to gate spacing
+           x = licon_diff NOT stdcell
+           EXT x gate < 0.055 }
+licon.11a { @ licon on diff to gate spacing
+            @ in a standard cell
+            EXT (licon_diff AND stdcell) gate < 0.05 }
+licon.x  { @ licon must be on diff, tap or poly
+           licon NOT (difftap OR poly) }
+li.1     { @ li width
+           INT li < 0.17 }
+li.3     { @ li spacing
+           EXT li < 0.17 }
+li.x     { @ licon must be covered by li
+           licon NOT li }
+li.6     { @ li area
+           AREA li < 0.0561 }
+mcon.2   { @ mcon spacing
+           EXT mcon < 0.19 }
+mcon.x   { @ mcon must be on li
+           mcon NOT li }
+m1.1     { @ met1 width
+           INT met1 < 0.14 }
+m1.2     { @ met1 spacing
+           EXT met1 < 0.14 }
+m1.4     { @ met1 enclosure of mcon
+           ENC mcon met1 < 0.03 }
+m1.6     { @ met1 area
+           AREA met1 < 0.083 }
+via.2    { @ via spacing
+           EXT via < 0.17 }
+via.4a   { @ met1 enclosure of via
+           ENC via met1 < 0.055 }
+m2.1     { @ met2 width
+           INT met2 < 0.14 }
+m2.2     { @ met2 spacing
+           EXT met2 < 0.14 }
+m2.4     { @ met2 enclosure of via
+           ENC via met2 < 0.055 }
+m2.6     { @ met2 area
+           AREA met2 < 0.0676 }
+#IFDEF WITH_DENSITY
+m1.pd    { @ met1 density
+           DENSITY met1 > 0.9 WINDOW 50 STEP 25 }
+#ENDIF

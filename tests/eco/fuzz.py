@@ -6,6 +6,7 @@ import random, subprocess, sys, os, copy, re
 MECO, MSIM, LIBS, CELLS = sys.argv[1], sys.argv[2], sys.argv[3].split(','), sys.argv[4]
 N0, N1 = int(sys.argv[5]), int(sys.argv[6])
 SCALE = int(os.environ.get('SCALE', '1'))
+SPARE = os.environ.get('SPARE') == '1'  # metal-only: spare cells in the old netlist, meco -spare
 out = sys.argv[7]
 os.makedirs(out, exist_ok=True)
 G2 = ['NAND2_X1', 'NOR2_X1', 'AND2_X1', 'OR2_X1', 'XOR2_X1']
@@ -137,6 +138,11 @@ def render(r, d, style):
     if old:
         body.append('  assign scan_out = %s;' % si)
         body.append('  NOR2_X1 spare0 (.A(1\'b0), .B(1\'b0), .Y(spare_n));')
+        if SPARE:
+            for i in range(r.randint(0, 6)):
+                t = r.choice(G2 + ['INV_X1', 'MUX2_X1', 'AOI21_X1'])
+                pins = {'INV_X1': ['A'], 'MUX2_X1': ['A', 'B', 'S'], 'AOI21_X1': ['A1', 'A2', 'B']}.get(t, ['A', 'B'])
+                body.append('  %s spare_%d (%s, .Y());' % (t, i + 1, ', '.join(".%s(1'b0)" % x for x in pins)))
     seen = {}
     for o in d['outs']:
         src = nm(o[1])
@@ -166,7 +172,7 @@ def tb(dn, ptext):
     s += '      clk = 0; #1;\n    end\n    $display("bad=%0d", bad);\n    $finish;\n  end\nendmodule\n'
     return s
 
-fails = 0; stats = dict(cases=0, changed=0)
+fails = 0; stats = dict(cases=0, changed=0, metal=0)
 for seed in range(N0, N1):
     r = random.Random(seed)
     base = gen(r); new = mutate(r, base)
@@ -175,17 +181,19 @@ for seed in range(N0, N1):
     libs = sum((['-lib', l] for l in LIBS), [])
     res = []
     for th in ('1', '7'):
-        p = subprocess.run([MECO, '-old', po, '-new', pn, *libs, '-tie', 'scan_en=0', '-o', pp + th, '-script', pp + th + '.tcl', '-threads', th], capture_output=True, text=True)
+        p = subprocess.run([MECO, '-old', po, '-new', pn, *libs, '-tie', 'scan_en=0', *(['-spare'] if SPARE else []), '-o', pp + th, '-script', pp + th + '.tcl', '-threads', th], capture_output=True, text=True)
         res.append((p.returncode, p.stdout, open(pp + th).read() if os.path.exists(pp + th) else '', p.stderr))
     if res[0] != res[1]: print('seed', seed, 'THREAD MISMATCH'); fails += 1; continue
-    if res[0][0] != 0: print('seed', seed, 'rc', res[0][0], res[0][1][-300:], res[0][3]); fails += 1; continue
+    if res[0][0] not in ((0, 3) if SPARE else (0,)) or (SPARE and (res[0][0] == 0) != (', 0 cells without a spare' in res[0][1] and ' +0 cells' in res[0][1])): print('seed', seed, 'rc', res[0][0], res[0][1][-300:], res[0][3]); fails += 1; continue
     stats['cases'] += 1
-    if ' 0 changed' not in res[0][1]: stats['changed'] += 1
+    if ' 0 changed' not in res[0][1]:
+        stats['changed'] += 1
+        if SPARE and res[0][0] == 0: stats['metal'] += 1
     if MSIM != '-':
         open(pp, 'w').write(res[0][2])
         nt = re.sub(r'module top ', 'module top_new ', open(pn).read())
         open(pn + '.sim.v', 'w').write(nt); open(pp + '.tb.v', 'w').write(tb(new, res[0][2]))
         p = subprocess.run([MSIM, CELLS, pp, pn + '.sim.v', pp + '.tb.v', '-top', 'tb'], capture_output=True, text=True)
         if 'bad=0' not in p.stdout: print('seed', seed, 'SIM MISMATCH', p.stdout[-200:], p.stderr[-300:]); fails += 1
-print('fuzz: %d cases, %d with changes, %d failures' % (stats['cases'], stats['changed'], fails))
+print('fuzz: %d cases, %d with changes, %d failures' % (stats['cases'], stats['changed'], fails) + (', %d patched with spare cells only' % stats['metal'] if SPARE else ''))
 sys.exit(1 if fails else 0)

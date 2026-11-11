@@ -355,6 +355,7 @@ void checkLef(const Library& L, const Cell& c, const phys::Tech& tech, std::vect
                               fmt((double)st->second.w / tech.dbu) + " x " + fmt((double)st->second.h / tech.dbu));
     }
     for (auto& p : c.pins) {
+        if (p.dir == Dir::Internal) continue;        // a state node, not a terminal
         const phys::MacroPin* mp = m->pin(p.name);
         if (!mp) { add("LEF003", "pin " + p.name + " is not in the macro"); continue; }
         std::string want = p.dir == Dir::In ? "INPUT" : p.dir == Dir::Out ? "OUTPUT" : "INOUT";
@@ -479,8 +480,13 @@ int doReport(const std::string& path, const std::string& only) {
     }
     std::cout << "library " << L.name << ": " << L.cells.size() << " cells, " << fmt(L.nomVoltage) << " V, " << fmt(L.nomTemperature)
               << " C, leakage in " << (L.leakagePowerUnit.empty() ? "library units" : L.leakagePowerUnit) << "\n";
+    int nameW = 14, leakW = 9;                        // widened to the longest cell name and value
+    for (auto& c : L.cells) {
+        nameW = std::max(nameW, (int)c.name.size());
+        leakW = std::max(leakW, (int)fmt(c.leakage).size());
+    }
     if (only.empty())
-        std::printf("%-14s %8s %9s %4s %9s %9s  %s\n", "cell", "area", "leakage", "pins", "cap pF", "delay ns", "function");
+        std::printf("%-*s %8s %*s %4s %9s %9s  %s\n", nameW, "cell", "area", leakW, "leakage", "pins", "cap pF", "delay ns", "function");
     double area = 0;
     for (auto& c : L.cells) {
         area += c.area;
@@ -503,7 +509,7 @@ int doReport(const std::string& path, const std::string& only) {
         if (!c.ffs.empty()) fn += "  [ff " + c.ffs[0].clockedOn + ": " + c.ffs[0].nextState + "]";
         if (!c.latches.empty()) fn += "  [latch " + c.latches[0].enable + ": " + c.latches[0].dataIn + "]";
         if (only.empty()) {
-            std::printf("%-14s %8s %9s %4zu %9s %9s  %s\n", c.name.c_str(), fmt(c.area).c_str(), fmt(c.leakage).c_str(), c.pins.size(),
+            std::printf("%-*s %8s %*s %4zu %9s %9s  %s\n", nameW, c.name.c_str(), fmt(c.area).c_str(), leakW, fmt(c.leakage).c_str(), c.pins.size(),
                         fmt(cap).c_str(), fmt(worst).c_str(), fn.c_str());
             continue;
         }
