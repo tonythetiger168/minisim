@@ -44,7 +44,6 @@
 
 #include "equiv/aig.hpp"
 #include "equiv/cnf.hpp"
-#include "equiv/sat.hpp"
 #include "gnetlist.hpp"
 #include "liberty.hpp"
 #include "parallel.hpp"
@@ -895,23 +894,27 @@ struct Prover {
         if ((a ^ 1) == b) return 0;
         if (!sigEqual(a, b)) return 0;
         equiv::Cnf c(g);
-        equiv::Sat::L x = c.lit(a), y = c.lit(b);
+        int x = c.lit(a), y = c.lit(b);
         // Equivalences proved earlier are given to the solver: a proof over
-        // a patched cone then ends at the old nets the patch reads.
-        if (!lemma.empty())
-            for (auto& [node, var] : c.var) {
+        // a patched cone then ends at the old nets the patch reads. In node
+        // order, so the clause order (and the search) is always the same.
+        if (!lemma.empty()) {
+            std::vector<std::pair<uint32_t, int>> vs(c.var.begin(), c.var.end());
+            std::sort(vs.begin(), vs.end());
+            for (auto& [node, var] : vs) {
                 auto it = lemma.find(node);
                 if (it == lemma.end()) continue;
                 auto other = c.var.find(it->second >> 1);
                 if (other == c.var.end()) continue;
-                equiv::Sat::L p = equiv::Sat::mk(var), q = equiv::Sat::mk(other->second, it->second & 1);
-                c.sat.addClause(equiv::Sat::no(p), q);
-                c.sat.addClause(p, equiv::Sat::no(q));
+                int q = (it->second & 1) ? -other->second : other->second;
+                c.sat.addClause({-var, q});
+                c.sat.addClause({var, -q});
             }
-        c.sat.addClause(x, y);  // a != b
-        c.sat.addClause(equiv::Sat::no(x), equiv::Sat::no(y));
-        auto r = c.sat.solve({}, (uint64_t)(limit ? limit : budget));
-        return r == equiv::Sat::Unsat ? 1 : r == equiv::Sat::SatResult ? 0 : -1;
+        }
+        c.sat.addClause({x, y});  // a != b
+        c.sat.addClause({-x, -y});
+        auto r = c.sat.solve({}, (int64_t)(limit ? limit : budget));
+        return r == sat::Unsat ? 1 : r == sat::Sat ? 0 : -1;
     }
 };
 
