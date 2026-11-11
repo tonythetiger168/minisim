@@ -314,6 +314,9 @@ class Lexer {
           std::string n;
           ls >> n;
           macros_.erase(n);
+        } else if (d == "line") {
+          int n = 0;   // the text was written by a tool from another file: report that file's lines
+          if (ls >> n) line_ = n;
         } else if (d == "pragma") {
           std::string w, rest;
           ls >> w;
@@ -1526,15 +1529,19 @@ class Parser {
   }
 };
 
+inline void parseText(Program& P, const std::string& path, const std::string& text, const std::map<std::string, std::string>& defs) {
+  P.file = path;
+  Lexer lx(path, text, defs);
+  Parser ps(P, std::move(lx.out));
+  ps.parseProgram();
+}
+
 inline void parseFile(Program& P, const std::string& path, const std::map<std::string, std::string>& defs) {
   std::ifstream in(path);
   if (!in) throw Error("mhls: cannot open " + path);
   std::stringstream ss;
   ss << in.rdbuf();
-  P.file = path;
-  Lexer lx(path, ss.str(), defs);
-  Parser ps(P, std::move(lx.out));
-  ps.parseProgram();
+  parseText(P, path, ss.str(), defs);
 }
 
 }   // namespace hls

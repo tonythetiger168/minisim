@@ -5,6 +5,7 @@
 //   mhls fir.c -top fir -tb fir_tb.sv -vectors 100   self-checking testbench for msim
 //   mhls fir.c -top fir -cref fir_ref.cpp            the same vectors against the host compiler
 //   mhls fir.c -top fir -explore 2,5,10,20           latency/area over clock periods
+//   mhls fir.cpp -clang -top fir4                    C++ classes and templates, read by clang
 //
 // Flow: parse (hls_front.hpp), lower to a control/data-flow graph with
 // inlining, if-conversion, loop unrolling and array scalarization
@@ -41,6 +42,7 @@
 
 #include "parallel.hpp"
 #include "hls_ir.hpp"
+#include "hls_clang.hpp"
 
 using namespace hls;
 
@@ -1808,7 +1810,7 @@ int usage() {
                "            [-unroll-all] [-unroll-max <n>] [-pipeline-loops] [-mul <n>] [-div <n>] [-no-share] [-handshake]\n"
                "            [-max-reg-array <n>] [-delay-scale <x>] [-tb <file>] [-cref <file>]\n"
                "            [-vectors <n>] [-seed <n>] [-explore <ns,...>] [-report <file>]\n"
-               "            [-D<name>[=<v>]] [-threads <n>|all] [-q]\n";
+               "            [-clang] [-emit-c <file>] [-I<dir>] [-D<name>[=<v>]] [-threads <n>|all] [-q]\n";
   return 2;
 }
 
@@ -1816,7 +1818,9 @@ int usage() {
 
 int main(int argc, char** argv) {
   std::vector<std::string> files, tops;
-  std::string out, tb, crefOut, report;
+  std::string out, tb, crefOut, report, emitC;
+  std::vector<std::string> clangArgs;
+  bool useClang = false;
   std::vector<double> explore;
   std::map<std::string, std::string> defs;
   Options opt;
@@ -1854,6 +1858,9 @@ int main(int argc, char** argv) {
       else if (a == "-delay-scale") cfg.scale = std::stod(val());
       else if (a == "-tb") tb = val();
       else if (a == "-cref") crefOut = val();
+      else if (a == "-clang") useClang = true;
+      else if (a == "-emit-c") { emitC = val(); useClang = true; }
+      else if (a.rfind("-I", 0) == 0) clangArgs.push_back(a.size() > 2 ? a : "-I" + val());
       else if (a == "-vectors") nvec = std::stoi(val());
       else if (a == "-seed") seed = std::stoull(val());
       else if (a == "-explore") { for (auto& t : split(val())) explore.push_back(std::stod(t)); }
@@ -1870,6 +1877,7 @@ int main(int argc, char** argv) {
       else if (a.rfind("-D", 0) == 0 && a.size() > 2) {
         auto eq = a.find('=');
         defs[a.substr(2, eq == std::string::npos ? eq : eq - 2)] = eq == std::string::npos ? "1" : a.substr(eq + 1);
+        clangArgs.push_back(a);
       }
       else if (a[0] == '-') { std::cerr << "mhls: unknown option " << a << "\n"; return usage(); }
       else files.push_back(a);
@@ -1878,7 +1886,16 @@ int main(int argc, char** argv) {
     if (cfg.clock <= kTcq * cfg.scale + kTsu * cfg.scale) throw Error("mhls: -clock is shorter than a register's own delay");
 
     Program P;
-    for (auto& fn : files) parseFile(P, fn, defs);
+    for (auto& fn : files) {
+      if (!useClang) { parseFile(P, fn, defs); continue; }
+      std::string c = ClangFront().run(fn, clangArgs, tops);
+      if (!emitC.empty()) {
+        std::ofstream os(emitC, &fn == &files[0] ? std::ios::out : std::ios::app);
+        if (!os) throw Error("mhls: cannot write " + emitC);
+        os << c;
+      }
+      parseText(P, fn, c, {});
+    }
     if (tops.empty()) {
       for (auto& f : P.funcs)
         if (f.top) tops.push_back(f.name);

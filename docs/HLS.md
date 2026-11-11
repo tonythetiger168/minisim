@@ -45,7 +45,8 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
 | every C operator, casts, `?:`, short-circuit `&&` `\|\|`, `++`/`--`, compound assignment | `sizeof`, string literals |
 | `if`, `switch` (with fall-through), `for`, `while`, `do`, `break`, `continue`, `return` anywhere | `goto` |
 | fixed-size arrays of any dimension, initializer lists | pointers other than scalar output parameters, dynamic memory |
-| functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion, classes, templates |
+| functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion |
+| with `-clang`: classes, member functions, constructors, operators, templates, namespaces (see C++ through Clang) | inheritance, virtual dispatch through a base, lambdas |
 | `hls::stream<T>&` parameters with `read()` and `write(x)` (see Streams) | `empty()`, `full()`, non-blocking access, local streams |
 | structs: nested, in arrays, with array members and bit-fields; copied, passed by value, pointer or reference, and returned | unions, pointer members, member functions, structs defined inside a function |
 
@@ -63,6 +64,51 @@ array member is passed by pointer or reference, not by value.
 Pragmas: `#pragma hls unroll` (before a loop or first in its body),
 `#pragma hls pipeline` (in a function: the whole function is a pipeline;
 first in a loop body: that loop is pipelined), `#pragma hls top`.
+
+## C++ through Clang
+
+`mhls -clang` has the installed `clang` read the source (an external
+program; nothing of LLVM is built into mhls) and takes its syntax tree. In
+that tree every template is instantiated, every overload is resolved and
+every implicit conversion is spelled out, so C++ reduces to what the rest of
+mhls already synthesizes: plain functions over structs.
+
+```sh
+mhls fir.cpp -clang -top fir4 -o fir4.sv -tb fir4_tb.sv -cref fir4_ref.cpp
+mhls fir.cpp -clang -emit-c fir.c      # see the reduction
+```
+
+| C++ | becomes |
+|---|---|
+| a class or struct with member functions | a struct, and one function per member function that is used, taking the object as `self` |
+| a class or function template | one struct or function per instantiation (`Fir<4>` is `Fir_4`) |
+| a constructor, member initializers | a function run where the object is declared; an array of objects runs it per element |
+| `a + b`, `v[i]`, `f(x)` on objects | calls to `operator+`, `operator[]`, `operator()` |
+| a temporary object, an object returned by a call, `c ? a : b` on objects | a variable declared before the statement |
+| a member function that returns `*this` (`operator+=`, `++`, a setter that chains) | a void function; the call's value is the object |
+| default arguments, overloads, `static` members, `enum class`, namespaces, `constexpr`, `auto` | the value, the function or the constant they stand for |
+| `const T&` to a number | the number |
+
+Only what the design uses is written. That covers the classes, templates and
+inline functions of the headers it includes, and of the standard library
+where they are this plain (`std::min`, `std::max`). `-I` and `-D` go to
+clang, and `__MHLS__` is defined while it reads. With `-top`, only the
+functions named and what they use are looked at, so the file may hold more
+than mhls can synthesize. Errors and warnings from the rest of mhls name the
+lines of the C++ file. `clang` is found on the `PATH`; set
+`MHLS_CLANG` to use another one.
+
+Refused, with the line: base classes, pointer or reference members and
+variables, functions that return a non-constant reference to anything but
+their own object, floating point,
+lambdas, range-based `for`, `new`, exceptions, a call to a function clang
+shows no body for. The C limits apply as well (no recursion, fixed-size
+arrays). `ap_int<N>` and `ap_uint<N>` are not available with `-clang` yet;
+use `intN_t` types or bit-fields. `#pragma hls` lines are read from the file
+given to mhls, not from its headers.
+
+Without `-clang` nothing changes: the built-in C front end reads the file
+and clang is not needed.
 
 ## Pipelined loops
 
@@ -202,6 +248,9 @@ tests/hls/fuzz.py --mhls build/mhls --msim build/msim --out /tmp/hlsfuzz --seeds
 | `-handshake` | also write `<top>_hs`, the block behind ready/valid ports |
 | `-max-reg-array <n>` | largest local array kept in registers (default 64) |
 | `-delay-scale <x>` | scale the built-in operator delays |
+| `-clang` | read the source with clang: C++ classes and templates (see C++ through Clang) |
+| `-emit-c <file>` | with `-clang`: write the plain C the source reduces to |
+| `-I<dir>`, `-D<name>[=<v>]` | include path (clang only) and macro definition |
 | `-tb <file>`, `-cref <file>`, `-vectors <n>`, `-seed <n>` | verification collateral |
 | `-explore <ns,...>` | schedule at each clock period, print states, latency, register bits, area |
 | `-report <file>` | the summary as JSON |

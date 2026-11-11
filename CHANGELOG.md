@@ -180,6 +180,12 @@ Spec references are IEEE 1800-2023 clauses.
   the host; the testbench source and sink hesitate on every other call. A
   pipelined loop over streams moves one element per cycle and stalls as a
   whole.
+- `mhls -clang`: C++ classes and templates. The installed clang (run as a
+  program) reads the source; mhls reduces its syntax tree to plain functions
+  over structs: member functions, constructors, operators, class and
+  function templates, default arguments, overloads, static members, scoped
+  enums, namespaces, and whatever the design uses from its headers
+  (`std::min`, `std::max` included). `-emit-c` shows the reduction.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).

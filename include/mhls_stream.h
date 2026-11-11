@@ -3,6 +3,17 @@
 // valid/ready port, read() and write() become transfers.
 #ifndef MHLS_STREAM_H
 #define MHLS_STREAM_H
+#ifdef __MHLS__
+// What mhls -clang shows clang: the interface alone.
+namespace hls {
+template <class T>
+class stream {
+ public:
+  T read();
+  void write(const T& v);
+};
+}   // namespace hls
+#else
 #include <deque>
 
 namespace hls {
@@ -23,4 +34,5 @@ class stream {
   std::deque<T> q_;
 };
 }   // namespace hls
+#endif
 #endif

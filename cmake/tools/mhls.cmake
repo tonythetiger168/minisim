@@ -1,6 +1,8 @@
 include_guard(GLOBAL)   # CMakeLists.txt may include this by name and by glob
 # mhls: high-level synthesis, C/C++ to SystemVerilog. No external
-# dependencies; the RTL tests need msim (the slang build).
+# dependencies; the RTL tests need msim (the slang build). `mhls -clang`
+# runs the clang it finds on the machine as a program (nothing is linked);
+# its tests are skipped where there is none.
 add_executable(mhls src/mhls.cpp)
 target_include_directories(mhls PRIVATE src)
 find_package(Threads REQUIRED)

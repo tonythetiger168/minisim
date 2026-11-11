@@ -351,6 +351,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--seeds", default="0:20")
     ap.add_argument("--vectors", default="12")
+    ap.add_argument("--clang", action="store_true", help="read every program through mhls -clang")
     a = ap.parse_args()
     lo, hi = [int(x) for x in a.seeds.split(":")]
     os.makedirs(a.out, exist_ok=True)
@@ -364,6 +365,8 @@ def main():
             f.write(src)
         cmd = [a.mhls, base + ".c", "-top", "f", "-o", base + ".sv", "-tb", base + "_tb.sv", "-cref", base + "_ref.cpp",
                "-vectors", a.vectors, "-seed", str(seed + 1), "-q"] + opts
+        if a.clang:
+            cmd.append("-clang")
         rc, out = run(cmd)
         if rc != 0:
             # A pipeline that cannot meet one input per cycle is a legal refusal.
