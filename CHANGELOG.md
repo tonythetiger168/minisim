@@ -8,14 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `memu` is timing-aware between FPGAs: on a link with too few wires the
-  signals on the longest combinational paths keep a wire of their own and the
-  rest share what is left (40% fewer `emu_clk` cycles per event on a
-  910,000-cell netlist), and every partitioning attempt is routed and timed
-  so the fastest one is kept, not the smallest cut. `-partitioner CMD` lets
-  another partitioner compete (`tools/memu_mtkahypar.py` for Mt-KaHyPar). The
-  per-FPGA netlists now go through `mfpga` (the test maps a three-FPGA split
-  to iCE40 and checks it against the original netlist).
+- `mdebug -active`: a read of one struct field or of fixed bits (`p.hi`,
+  `q[3:0]`) follows only that part: its value, the time those bits last
+  changed, and the assignments that write them. The viewer page does the same.
 - `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
   elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
   the default waveform is unchanged. `mdebug -active` follows a memory read
@@ -60,6 +55,14 @@ Spec references are IEEE 1800-2023 clauses.
   master driven by a testbench class through a virtual interface, both
   stopping the design's clock while the host answers. Multi-threaded with
   thread-independent results. See `docs/EMULATION.md`.
+- `memu` is timing-aware between FPGAs: on a link with too few wires the
+  signals on the longest combinational paths keep a wire of their own and the
+  rest share what is left (40% fewer `emu_clk` cycles per event on a
+  910,000-cell netlist), and every partitioning attempt is routed and timed
+  so the fastest one is kept, not the smallest cut. `-partitioner CMD` lets
+  another partitioner compete (`tools/memu_mtkahypar.py` for Mt-KaHyPar). The
+  per-FPGA netlists now go through `mfpga` (the test maps a three-FPGA split
+  to iCE40 and checks it against the original netlist).
 - `mformal`: fairness. A strong obligation in an `assume`
   (`assume property (req |-> s_eventually !req)`) restricts the loops a
   liveness counterexample may use.
@@ -186,6 +189,18 @@ Spec references are IEEE 1800-2023 clauses.
   NLDM tables. The default library is mini45. Mapping runs on every
   core (`-threads N`) with the same netlist for any thread count. See
   `docs/SYNTH.md`.
+- `aig::Design::mems`: the shared RTL-to-AIG front half lists every memory
+  with its write ports (clock, enable, address, data, byte lane) and read
+  ports, for block RAM inference; `msynth`'s `report_resources` shows them.
+- `msynth` area: registers nothing reads or that are stuck at their reset
+  value are removed (`aig::sweep`), nested selects fold into one
+  (`aig::Graph::mux`), load enables use the library's enable flops, and
+  wide selects use 4:1 mux cells; logic that computes the same function
+  twice is merged by simulation and SAT (`src/synth/fraig.hpp`); `'x` in a
+  select is a don't-care, and registers without reset that only hold a
+  constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
+  ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
+  See `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles
@@ -225,6 +240,11 @@ Spec references are IEEE 1800-2023 clauses.
   function templates, default arguments, overloads, static members, scoped
   enums, namespaces, and whatever the design uses from its headers
   (`std::min`, `std::max` included). `-emit-c` shows the reduction.
+- `mhls -clang`: inheritance. A base class is the first member of the
+  derived struct; base constructors, inherited and hidden members, several
+  bases, template bases and objects passed as their base all work. Classes
+  whose only constructor is the implicit one now run their members'
+  constructors. Virtual functions in a hierarchy are refused.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
@@ -650,6 +670,13 @@ Spec references are IEEE 1800-2023 clauses.
   automatic tasks called from several processes at once, and
   `fork automatic int j = i; ... join_none` with one copy per fork. This is
   the base for class methods (8).
+- `msta`: the hold check between clocks of different periods used a capture
+  edge that was too early and reported too much slack. It now takes the
+  tightest hold relation over the common period. Asynchronous set / reset to
+  output arcs are no longer timed as paths by default
+  (`-preset_clear_arcs` turns them on). Both were found by comparing with
+  OpenSTA, which now agrees at every endpoint of a million-cell design to
+  0.1 ps; see "Compared with OpenSTA" in `docs/STA.md` and `bench/sta/`.
 
 ### Changed
 - `mlint` prints each finding's severity (`error`, `warning` or `info`) and

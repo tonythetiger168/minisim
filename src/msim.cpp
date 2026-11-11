@@ -348,6 +348,292 @@ static void mergePartialDrivers(LowerResult& lowered) {
     }
 }
 
+// Subroutine calls in a combinational block (always_comb, or an assign whose
+// value calls a function) are expanded in place, so the block is straight
+// code that the static schedule can rank and split like any other. A static
+// subroutine keeps its arguments, result and locals in signals that every
+// caller shares; the expanded copy gets its own, when no value ever travels
+// between callers through them: here and in every other process each read
+// follows a whole write in the same activation.
+static void inlineCombCalls(LowerResult& lowered) {
+    const bool dbg = std::getenv("MSIM_WHYINLINE") != nullptr;
+    auto plainAssign = [](const Instr& i) {
+        return i.k == IK::Assign && i.sig >= 0 && !i.arr && i.aidx.empty() && !i.de && !i.delay && i.dly.empty() && i.drv < 0 &&
+               i.dyn < 0 && i.dsrc < 0 && i.dres < 0 && i.dkey < 0 && !i.tmp;
+    };
+    auto plainCall = [](const Instr& i) {
+        return i.k == IK::Call && i.callee && !i.lay && !i.self && i.vslot == -1 && i.init.empty() && i.dinit.empty();
+    };
+    // A body that is only assignments, forward branches, deferred assertions and such calls.
+    std::function<bool(const Prog&, int)> okBody = [&](const Prog& c, int depth) {
+        if (depth > 16 || !c.roots.empty()) return false;
+        for (size_t pc = 0; pc < c.code.size(); pc++) {
+            const Instr& i = c.code[pc];
+            if (i.k == IK::Jmp || i.k == IK::JmpIfNot) {
+                if (i.target <= pc || i.xt != Instr::NOX) return false;
+            } else if (i.k == IK::Ret) {
+            } else if (i.k == IK::Assert) {
+                if (i.join != 1 && i.join != 2) return false;
+            } else if (i.k == IK::Call) {
+                if (!plainCall(i) || !okBody(*i.callee, depth + 1)) return false;
+            } else if (!plainAssign(i)) return false;
+        }
+        return true;
+    };
+    std::function<void(const E&, std::set<int>&)> refs = [&](const E& e, std::set<int>& out) {
+        if (!e) return;
+        if (e->sig >= 0) out.insert(e->sig);
+        if (e->arr) out.insert(e->arr->base);
+        refs(e->at, out);
+        for (auto& k : e->kids) refs(k, out);
+    };
+    auto instrRefs = [&](const Instr& i, std::set<int>& out) {
+        refs(i.e, out); refs(i.bidx, out); refs(i.de, out); refs(i.fd, out); refs(i.self, out);
+        for (auto& a : i.args) refs(a, out);
+        for (auto& a : i.aidx) refs(a, out);
+        for (auto& a : i.init) refs(a.second, out);
+        if (i.k == IK::Assert) {
+            const AssertInfo& a = asserts().at(i.sig);
+            for (auto* cs : {&a.passCap, &a.failCap, &a.passSlot, &a.failSlot})
+                for (auto& c : *cs) refs(c, out);
+        }
+    };
+    // Every candidate a body may read before it has written it whole
+    // (`def`: written so far; a wait forgets them all). Returns false for a
+    // body it cannot follow: its candidates are then all in `bad`.
+    std::set<int> cand, bad;
+    // def: the bits written so far of each signal (all ones: the whole of it).
+    using Def = std::map<int, uint64_t>;
+    auto full = [&](int x) -> uint64_t { int w = x >= 0 && (size_t)x < S.sigs.size() ? S.sigs[(size_t)x].w : 0; return w > 0 && w < 64 ? (1ULL << w) - 1 : ~0ULL; };
+    auto isDef = [&](const Def& d, int x) { auto it = d.find(x); return it != d.end() && (it->second & full(x)) == full(x); };
+    auto both = [](const Def& a, const Def& b) { Def r; for (auto& [x, m] : a) { auto it = b.find(x); if (it != b.end() && (m & it->second)) r[x] = m & it->second; } return r; };
+    const char* curWhy = "";
+    auto mark = [&](int x, const char* why) { if (bad.insert(x).second && dbg && x >= 0 && (size_t)x < S.sigs.size()) std::cerr << "    shared: " << S.sigs[(size_t)x].name << " (" << why << ", " << curWhy << ")\n"; };
+    std::function<void(const Prog&, Def&, int)> flow = [&](const Prog& q, Def& def, int depth) {
+        size_t n = q.code.size();
+        std::vector<char> has(n + 1, 0), back(n + 1, 0);
+        std::vector<Def> in(n + 1);
+        for (size_t pc = 0; pc < n; pc++)
+            if ((q.code[pc].k == IK::Jmp || q.code[pc].k == IK::JmpIfNot) && q.code[pc].target <= pc) back[std::min(q.code[pc].target, n)] = 1;
+        auto meet = [&](size_t t, const Def& d) {
+            t = std::min(t, n);
+            if (!has[t]) { in[t] = d; has[t] = 1; return; }
+            in[t] = both(in[t], d);
+        };
+        in[0] = def; has[0] = 1;
+        Def out;   // at the exits
+        bool exits = false;
+        auto leave = [&](const Def& d) {
+            if (!exits) { out = d; exits = true; return; }
+            out = both(out, d);
+        };
+        for (size_t pc = 0; pc < n; pc++) {
+            if (back[pc]) { in[pc].clear(); has[pc] = 1; }
+            if (!has[pc]) continue;   // not reached (the code after a return)
+            Def d = std::move(in[pc]);
+            const Instr& i = q.code[pc];
+            std::set<int> rd;
+            instrRefs(i, rd);
+            bool known = true, falls = true;
+            switch (i.k) {
+                case IK::Assign:
+                    if (i.sig >= 0 && (i.bidx || !plainAssign(i) || (i.hi >= 0 && S.sigs[(size_t)i.sig].w > 64))) rd.insert(i.sig);   // keeps the other bits
+                    break;
+                case IK::Jmp: falls = false; break;
+                case IK::JmpIfNot: case IK::Display: case IK::Finish: case IK::Assert: case IK::Ret: break;
+                case IK::WaitDelay: break;
+                case IK::WaitEdge:
+                    if (i.events.empty()) { if (cand.count(i.sig)) mark(i.sig, "waited on"); }
+                    for (auto& [sg, ed] : i.events) if (cand.count(sg)) mark(sg, "waited on");
+                    break;
+                case IK::Call: break;
+                default: known = false; break;
+            }
+            for (int x : rd) if (cand.count(x) && !isDef(d, x)) mark(x, "read before written");
+            if (!known) {   // anything else: whatever it names is out
+                if (i.sig >= 0 && cand.count(i.sig)) mark(i.sig, "other use");
+                for (int x : rd) if (cand.count(x)) mark(x, "other use");
+                for (int x : {i.dsrc, i.dres, i.dkey, i.dyn}) if (cand.count(x)) mark(x, "other use");
+                for (const Prog* b : i.branches) { Def e; flow(*b, e, depth + 1); }
+                d.clear();
+            }
+            if (i.k == IK::Assign && plainAssign(i) && !i.bidx) {
+                if (i.hi < 0) d[i.sig] = ~0ULL;
+                else if (S.sigs[(size_t)i.sig].w <= 64) d[i.sig] |= (i.hi - i.lo >= 63 ? ~0ULL : ((1ULL << (i.hi - i.lo + 1)) - 1)) << i.lo;
+            }
+            if (i.k == IK::WaitDelay || i.k == IK::WaitEdge) d.clear();
+            if (i.k == IK::Call) {
+                if (i.callee && depth < 16 && !i.lay) flow(*i.callee, d, depth + 1);
+                else {
+                    if (i.callee) {
+                        std::vector<int> sg; std::vector<const Prog*> seen;
+                        collectProgRefs(*i.callee, sg, seen);
+                        for (int x : sg) if (cand.count(x)) mark(x, "other use");
+                        std::unordered_set<int> wr; seen.clear();
+                        collectProgWrites(*i.callee, wr, seen);
+                        for (int x : wr) if (cand.count(x)) mark(x, "other use");
+                    }
+                    d.clear();
+                }
+            }
+            if (i.k == IK::Ret) { leave(d); continue; }
+            if (i.k == IK::Jmp || i.k == IK::JmpIfNot) { if (i.target > pc) meet(i.target, d); }
+            if (i.k == IK::JmpIfNot && i.xt != Instr::NOX && i.xt > pc) meet(i.xt, d);
+            if (falls) meet(pc + 1, d);
+        }
+        if (has[n]) leave(in[n]);
+        def = exits ? out : Def{};
+    };
+    // Does a prog (or one it calls or forks) name a candidate at all?
+    auto touches = [&](const Prog& q) {
+        std::vector<const Prog*> seen;
+        std::function<bool(const Prog&)> t = [&](const Prog& r) {
+            if (std::find(seen.begin(), seen.end(), &r) != seen.end()) return false;
+            seen.push_back(&r);
+            for (auto& i : r.code) {
+                std::set<int> rd;
+                instrRefs(i, rd);
+                if (i.k != IK::Assert && i.sig >= 0) rd.insert(i.sig);
+                for (auto& [sg, ed] : i.events) rd.insert(sg);
+                for (int x : {i.dsrc, i.dres, i.dkey, i.dyn}) if (x >= 0) rd.insert(x);
+                for (int x : rd) if (cand.count(x)) return true;
+                if (i.callee && t(*i.callee)) return true;
+                for (const Prog* b : i.branches) if (t(*b)) return true;
+            }
+            return false;
+        };
+        return t(q);
+    };
+    int serial = 0;
+    for (size_t pi = 0; pi < lowered.procs.size(); pi++) {
+        LoweredProc& lp = lowered.procs[pi];
+        if (lp.program >= 0 || lp.reactive) continue;
+        const Prog& p = lp.prog;
+        size_t n = p.code.size();
+        if (n < 3 || !p.roots.empty() || p.code[n - 1].k != IK::Jmp || p.code[n - 1].target != 0 || p.code[n - 2].k != IK::WaitEdge) continue;
+        bool calls = false, ok = true;
+        for (size_t pc = 0; pc + 2 < n && ok; pc++) {
+            const Instr& i = p.code[pc];
+            if (i.k == IK::Call) { calls = true; ok = plainCall(i) && okBody(*i.callee, 0); }
+            else if (i.k == IK::Jmp || i.k == IK::JmpIfNot) ok = i.target > pc && i.target <= n - 2 && i.xt == Instr::NOX;
+            else if (i.k == IK::Assert) ok = i.join == 1 || i.join == 2;
+            else ok = i.k == IK::Assign;
+        }
+        if (!calls || !ok) continue;
+        // The signals of the subroutines: everything their bodies name.
+        cand.clear(); bad.clear();
+        {
+            std::vector<const Prog*> seen;
+            std::function<void(const Prog&)> names = [&](const Prog& c) {
+                if (std::find(seen.begin(), seen.end(), &c) != seen.end()) return;
+                seen.push_back(&c);
+                for (auto& i : c.code) {
+                    if (i.k == IK::Assign && i.sig >= 0) cand.insert(i.sig);
+                    refs(i.e, cand); refs(i.bidx, cand);
+                    if (i.k == IK::Call) names(*i.callee);
+                }
+            };
+            for (size_t pc = 0; pc + 2 < n; pc++) if (p.code[pc].k == IK::Call) names(*p.code[pc].callee);
+        }
+        // The expanded body.
+        std::vector<Instr> code = p.code;
+        bool big = false;
+        for (size_t pos = 0; pos < code.size() && !big;) {
+            if (code[pos].k != IK::Call) { pos++; continue; }
+            const Prog& c = *code[pos].callee;
+            size_t L = c.code.size();
+            std::vector<Instr> mid;
+            for (size_t k = 0; k < L; k++) {
+                Instr i = c.code[k];
+                if (i.k == IK::Ret) { Instr j; j.k = IK::Jmp; j.file = i.file; j.line = i.line; j.target = pos + L; i = j; }
+                else if (i.k == IK::Jmp || i.k == IK::JmpIfNot) i.target = pos + std::min(i.target, L);
+                i.hits = i.taken = 0;
+                mid.push_back(std::move(i));
+            }
+            for (auto& i : code)
+                if ((i.k == IK::Jmp || i.k == IK::JmpIfNot) && i.target > pos) i.target += L - 1;
+            code.erase(code.begin() + (long)pos);
+            code.insert(code.begin() + (long)pos, mid.begin(), mid.end());
+            code.back().target = 0;
+            big = code.size() > 20000;
+        }
+        if (big) continue;
+        // Which candidates are scratch: never waited on, written only by
+        // plain blocking assignments, and written before read everywhere.
+        for (int x : cand)
+            if (x < 0 || (size_t)x >= S.sigs.size() || S.sigs[(size_t)x].net || !S.sigs[(size_t)x].drv.empty()) mark(x, "other use");
+        {
+            Prog q;
+            q.code = code;
+            curWhy = "this block";
+            Def d;
+            flow(q, d, 0);
+        }
+        auto other = [&](const Prog& q) {
+            if (!touches(q)) return;
+            curWhy = "another process";
+            Def d;
+            flow(q, d, 0);
+        };
+        for (size_t pj = 0; pj < lowered.procs.size(); pj++) if (pj != pi) other(lowered.procs[pj].prog);
+        for (auto& f : lowered.finals) other(f.prog);
+        for (auto& a : asserts()) {
+            std::set<int> rd;
+            for (auto* cs : {&a.passCap, &a.failCap, &a.passSlot, &a.failSlot})
+                for (auto& c : *cs) refs(c, rd);
+            for (int x : rd) if (cand.count(x)) mark(x, "other use");
+        }
+        std::map<int, int> clone;
+        for (int x : cand) {
+            if (bad.count(x)) continue;
+            bool used = false;
+            for (auto& i : code) {
+                std::set<int> rd;
+                instrRefs(i, rd);
+                if (i.k == IK::Assign) rd.insert(i.sig);
+                if (rd.count(x)) { used = true; break; }
+            }
+            if (!used) continue;
+            // Named as a temporary of the lowering (_tf...), without the
+            // characters that mark array elements and internal signals.
+            std::string nm = S.sigs[(size_t)x].name;
+            nm = nm.substr(nm.rfind('.') == std::string::npos ? 0 : nm.rfind('.') + 1);
+            for (char& ch : nm) if (!std::isalnum((unsigned char)ch)) ch = '_';
+            int w = S.sigs[(size_t)x].w;
+            clone[x] = S.sig("_tfc" + std::to_string(serial++) + "_" + nm, w, false);
+            S.sigs[(size_t)clone[x]].hide = true;
+        }
+        std::function<E(const E&)> sub = [&](const E& e) -> E {
+            if (!e) return e;
+            std::set<int> rd;
+            refs(e, rd);
+            bool hit = false;
+            for (int x : rd) hit |= clone.count(x) > 0;
+            if (!hit) return e;
+            auto c = std::make_shared<Expr>(*e);
+            if (c->sig >= 0 && !c->arr) { auto it = clone.find(c->sig); if (it != clone.end()) c->sig = it->second; }
+            c->at = sub(c->at);
+            for (auto& k : c->kids) k = sub(k);
+            return c;
+        };
+        for (auto& i : code) {
+            if (i.k == IK::Assign) { auto it = clone.find(i.sig); if (it != clone.end()) i.sig = it->second; }
+            i.e = sub(i.e); i.bidx = sub(i.bidx);
+            for (auto& a : i.args) a = sub(a);
+        }
+        Prog trial = lp.prog;
+        trial.code = code;
+        CombShape sh;
+        bool shaped = combShape(trial, sh);
+        if (dbg) {
+            std::cerr << "inline " << lp.kind << " line " << p.code[0].line << ": " << n << " -> " << code.size() << " instructions, " << clone.size()
+                      << " private of " << cand.size() << (shaped ? "" : " (still not a static block)") << "\n";
+        }
+        lp.prog.code = std::move(code);
+    }
+}
+
+
 // An always_comb with if / case that writes several signals, as one slice per
 // group of outputs: the block's control flow with only the assignments to
 // that group, minus the branches that no longer choose anything, waiting on
@@ -418,6 +704,7 @@ static void splitCombBlocks(LowerResult& lowered) {
             const Instr& i = code[pc];
             if ((i.k == IK::Jmp || i.k == IK::JmpIfNot) && i.target <= pc) { ok = false; why = "loop"; }   // a loop
             if (i.tmp || i.xt != Instr::NOX) { ok = false; why = "-xprop code"; }   // shared temporaries, out-of-line jumps
+            if (i.bidx) { ok = false; why = "variable bit select"; }
             if (i.k == IK::Assert) {
                 const AssertInfo& a = asserts().at(i.sig);
                 for (auto* cs : {&a.passCap, &a.failCap})
@@ -476,7 +763,7 @@ static void splitCombBlocks(LowerResult& lowered) {
                 for (size_t pc = 0; pc < end; pc++) {
                     if (!keep[pc]) continue;
                     refs(code[pc].e, rd);
-                    if (code[pc].k == IK::Assign && code[pc].hi >= 0) rd.insert(code[pc].sig);   // a part write keeps the other bits
+                    if (code[pc].k == IK::Assign && (code[pc].hi >= 0 || code[pc].bidx)) rd.insert(code[pc].sig);   // a part write keeps the other bits
                 }
                 for (size_t j = 0; j < sh.outs.size(); j++)
                     if (rd.count(sh.outs[j]) && !isTemp(sh.outs[j]) && find((int)j) != (int)k) { grp[find((int)j)] = (int)k; again = true; }
@@ -592,6 +879,32 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     if (staticSeq)
         for (size_t i = 0; i < n; i++)
             if (p.rank[i] < 0 && lowered.procs[i].program < 0 && !lowered.procs[i].reactive && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
+    // MSIM_WHYCORO=1: the processes left as coroutines, with the kinds of
+    // instruction that are neither an assign nor a jump.
+    if (std::getenv("MSIM_WHYCORO"))
+        for (size_t i = 0; i < n; i++) {
+            if (p.rank[i] >= 0 || p.seq[i]) continue;
+            const Prog& q = lowered.procs[i].prog;
+            std::string w;
+            int waits = 0, blk = 0, nba = 0, arr = 0, back = 0;
+            std::set<int> ks;
+            for (size_t pc = 0; pc < q.code.size(); pc++) {
+                const Instr& x = q.code[pc];
+                if (x.k == IK::WaitEdge) waits++;
+                else if (x.k == IK::Assign) { blk++; if (x.arr || !x.aidx.empty() || x.bidx) arr++;
+                    if (x.arr) w += " arrW(" + S.sigs[x.arr->base].name + " n=" + std::to_string(x.arr->count) + ")";
+                    else if (x.bidx) w += " bidx(" + S.sigs[x.sig].name + ")";
+                    if (x.dyn >= 0) w += " dyn"; if (x.de || x.delay || !x.dly.empty()) w += " dly"; }
+                else if (x.k == IK::Assert) w += " assert.join" + std::to_string(x.join);
+                else if (x.k == IK::Call) w += " call(n=" + std::to_string(x.callee ? x.callee->code.size() : 0) + ")";
+                else if (x.k == IK::Nba) { nba++; if (x.arr || !x.aidx.empty() || x.bidx) arr++; }
+                else if (x.k == IK::Jmp || x.k == IK::JmpIfNot) { if (x.target <= pc && !(x.k == IK::Jmp && pc + 1 == q.code.size())) back++; }
+                else ks.insert((int)x.k);
+            }
+            for (int k : ks) w += " ik" + std::to_string(k);
+            std::cerr << "coro " << lowered.procs[i].kind << " n=" << q.code.size() << " waits=" << waits << " blk=" << blk << " nba=" << nba
+                      << " arr=" << arr << " back=" << back << " roots=" << q.roots.size() << w << " : " << (q.code.size() > 2 && q.code[q.code.size() - 2].k == IK::WaitEdge ? S.sigs[q.code[q.code.size() - 2].sig].name : std::string("?")) << "\n";
+        }
     return p;
 }
 
@@ -1641,6 +1954,7 @@ int main(int argc, char** argv) {
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty())
         mergePartialDrivers(lowered);
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
