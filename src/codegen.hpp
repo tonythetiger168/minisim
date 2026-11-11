@@ -965,21 +965,32 @@ private:
                 fi = {1, false};
                 return true;
             }
-            case Op::RedAnd:
+            case Op::RedAnd: case Op::RedOr: case Op::RedXor: {
+                // Over a concatenation (often wider than 64 bits: a parity
+                // over several registers) the reduction goes part by part.
+                const E& c = e->kids.empty() ? e : e->kids[0];
+                if (c && c->op == Op::Concat && c->kids.size() > 1) {
+                    std::string r;
+                    bool ok = true;
+                    for (auto& ck : c->kids) {
+                        std::string P;
+                        FastInfo fp{};
+                        if (!fx(ck, P, fp, refs)) { ok = false; break; }
+                        std::string t = e->op == Op::RedAnd ? "(" + P + " == " + M(fp.w) + ")" : e->op == Op::RedOr ? "(" + P + " != 0)" : P;
+                        r += (r.empty() ? "" : e->op == Op::RedAnd ? " && " : e->op == Op::RedOr ? " || " : " ^ ") + t;
+                    }
+                    if (ok) {
+                        out = e->op == Op::RedXor ? "(uint64_t)__builtin_parityll(" + r + ")" : "(uint64_t)(" + r + ")";
+                        fi = {1, false};
+                        return true;
+                    }
+                }
                 if (!kid(0, A, fa)) return false;
-                out = "(uint64_t)(" + A + " == " + M(fa.w) + ")";
+                out = e->op == Op::RedAnd ? "(uint64_t)(" + A + " == " + M(fa.w) + ")"
+                    : e->op == Op::RedOr ? "(uint64_t)(" + A + " != 0)" : "(uint64_t)__builtin_parityll(" + A + ")";
                 fi = {1, false};
                 return true;
-            case Op::RedOr:
-                if (!kid(0, A, fa)) return false;
-                out = "(uint64_t)(" + A + " != 0)";
-                fi = {1, false};
-                return true;
-            case Op::RedXor:
-                if (!kid(0, A, fa)) return false;
-                out = "(uint64_t)__builtin_parityll(" + A + ")";
-                fi = {1, false};
-                return true;
+            }
             case Op::Slice: {
                 if (!kid(0, A, fa)) return false;
                 int w = e->hi - e->lo + 1;
@@ -1409,9 +1420,18 @@ private:
         if (i.drv >= 0 && i.hi >= 0) return assign(i, val);
         if (i.drv >= 0)
             o << " S.fwd(" << i.sig << ", " << i.drv << ", " << val << ", " << (int)i.s0 << ", " << (int)i.s1 << ");\n";
-        else if (i.hi >= 0)
-            o << " S.fw(" << i.sig << ", v_insert(S.get(" << i.sig << "), " << val << ", " << i.hi << ", " << i.lo << "));\n";
-        else
+        else if (i.hi >= 0) {
+            // Some bits of a signal in S.sigs (it may be wider than 64 bits):
+            // most passes write what is already there, which samePart sees
+            // without building the whole value.
+            std::string slowW = "S.fw(" + std::to_string(i.sig) + ", v_insert(S.get(" + std::to_string(i.sig) + "), " + val + ", " +
+                                std::to_string(i.hi) + ", " + std::to_string(i.lo) + "));";
+            if (i.hi - i.lo < 64 && i.lo >= 0 && split(i.e, g, u, sl))
+                o << " if (!(" << (g.empty() ? "true" : g) << " && S.samePart(" << i.sig << ", " << i.hi << ", " << i.lo << ", " << u << "))) "
+                  << slowW << "\n";
+            else
+                o << " " << slowW << "\n";
+        } else
             o << " S.fw(" << i.sig << ", " << val << ");\n";
         return o.str();
     }

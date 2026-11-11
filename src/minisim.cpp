@@ -833,6 +833,16 @@ struct Sim {
         }
         drive(s, d, make(v & mask(g.w), 0, g.w), s0, s1);
     }
+    // Bits [hi:lo] (at most 64) of signal s already hold the known value u.
+    bool samePart(int s, int hi, int lo, uint64_t u) const {
+        const Val& c = sigs[s].val;
+        if (hi >= sigs[s].w) return false;
+        int n = hi - lo + 1, li = lo / 64, off = lo % 64;
+        uint64_t v = limbV(c, li) >> off, x = limbX(c, li) >> off;
+        if (off && off + n > 64) { v |= limbV(c, li + 1) << (64 - off); x |= limbX(c, li + 1) << (64 - off); }
+        uint64_t m = mask(n);
+        return (v & m) == (u & m) && (x & m) == 0;
+    }
     __attribute__((noinline)) void fwSlow(int s, const Val& in) {
         Sig& g = sigs[s];
         // Only a waveform (or coverage) watches a quiet signal: compare, store
