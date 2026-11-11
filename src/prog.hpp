@@ -106,6 +106,30 @@ inline uint32_t covFileId(const std::string& path) {
     if (fresh) g_covFiles.push_back(path);
     return it->second;
 }
+// Condition coverage: one entry per instrumented condition (see
+// Op::CondCov). Its counters are g_condHits[base .. base + terms.size()].
+struct CondDef {
+    uint32_t file = 0, line = 0, col = 0;
+    bool isOr = false;
+    bool lazy = false;                // the terms run in order until one decides (see condCovLazyEnd)
+    std::string text;                 // the whole condition, as written
+    std::vector<std::string> terms;   // each term, as written
+    size_t base = 0;
+};
+inline std::vector<CondDef>& condDefs() { static std::vector<CondDef> d; return d; }
+// FSM coverage: a state register found by the lowerer (fsm_extract.hpp), its
+// states and the transitions its next-state logic can make. The kernel
+// records the values the register takes and each change (Sim::covFsm).
+struct FsmDef {
+    std::string module, inst, name;   // definition, instance path, register
+    uint32_t file = 0, line = 0;
+    int sig = -1, w = 0;
+    bool onehot = false;   // tested bit by bit: only values with one bit set are states
+    std::vector<std::pair<uint64_t, std::string>> states;   // value, name
+    struct Tr { uint64_t from, to; bool reset; };            // reset: to a state the block's reset branch assigns
+    std::vector<Tr> trans;
+};
+inline std::vector<FsmDef>& fsmDefs() { static std::vector<FsmDef> d; return d; }
 // Relaxed atomic add: a task body can run on two worker threads at once.
 inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
 
@@ -192,6 +216,9 @@ struct Instr {
     E e;
     Edge edge = ANY;
     size_t target = 0;
+    // JmpIfNot: where to go when the condition is unknown (x), if not `target` (msim -xprop).
+    static constexpr size_t NOX = (size_t)-1;
+    size_t xt = NOX;
     uint64_t delay = 0;
     int drv = -1;         // Assign from a continuous driver: driver id on a resolved net
     int gate = -1;        // a gate or UDP output driver: its gateRecs() entry (SDF DEVICE, 32.4.1)
@@ -229,6 +256,9 @@ struct Instr {
     int pw = 0;
     bool pdown = false;
     bool hex = false;
+    // Assign to a temporary only this process uses (msim -xprop): nothing
+    // watches it, so the value is stored at once (Sim::poke).
+    bool tmp = false;
     const UdpTable* udp = nullptr;   // Udp
     // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
     // signal-name prefixes relative to the top ("" is the top, "u1." an
@@ -586,6 +616,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
         // An always_comb with if / case / loops: jumps that stay in the body.
         if (p.code[i].k == IK::JmpIfNot || p.code[i].k == IK::Jmp) {
             if (p.code[i].target > n - 2) return false;
+            if (p.code[i].xt != Instr::NOX && p.code[i].xt > n - 2) return false;
             c.branches = true;
             continue;
         }
@@ -599,6 +630,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
         // A target chosen at run time (a[i] = ..., v[i] = ...) has no fixed output signal.
         if (p.code[i].arr || !p.code[i].aidx.empty() || p.code[i].bidx) return false;
         if (p.code[i].de || p.code[i].delay || !p.code[i].dly.empty()) return false;
+        if (p.code[i].tmp) continue;   // a temporary of its own: not an output
         bool seen = false;
         for (int o : c.outs) seen |= o == p.code[i].sig;
         if (!seen) c.outs.push_back(p.code[i].sig);
@@ -623,6 +655,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
 // in the set drives), stable within a level, so ranks of one level never
 // feed each other and can be computed in parallel. `levels` (optional)
 // receives the level of each entry of the returned order.
+inline std::vector<int>* g_combCycles = nullptr;   // out: per process, its cycle (component) or -1
 inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::vector<int>* levels = nullptr, bool* cyclic = nullptr) {
     size_t n = cs.size();
     std::vector<std::vector<size_t>> succ(n);
@@ -685,6 +718,10 @@ inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::v
         }
     }
     for (size_t a = 0; a < n; a++) rep[a] = members[(size_t)comp[a]][0];
+    if (g_combCycles) {   // msim's MSIM_WHYCYCLE report
+        g_combCycles->assign(n, -1);
+        for (size_t a = 0; a < n; a++) if (members[(size_t)comp[a]].size() > 1) (*g_combCycles)[a] = comp[a];
+    }
     if (cyclic) {
         *cyclic = false;
         for (auto& m : members) *cyclic |= m.size() > 1;
@@ -724,7 +761,8 @@ inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::v
 
 // A clocked process that only schedules nonblocking assignments:
 //     WaitEdge (fixed events) ; { Nba | JmpIfNot | Jmp } ... ; Jmp 0
-// with every jump inside the body. Typical always @(posedge clk) RTL. It
+// with every jump inside the body. It may also assign temporaries of its
+// own (Instr::tmp, msim -xprop). Typical always @(posedge clk) RTL. It
 // reads signals and writes nothing until the NBA region, so all such
 // processes triggered in one slot can run at the same time.
 inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
@@ -740,6 +778,8 @@ inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
             if (x.drv >= 0 || x.nbaLater || x.de || x.delay) return false;  // a <= #d b goes through the kernel
         } else if (x.k == IK::JmpIfNot || x.k == IK::Jmp) {
             if (x.target < 1 || x.target > n - 1) return false;
+            if (x.xt != Instr::NOX && (x.xt < 1 || x.xt > n - 1)) return false;
+        } else if (x.k == IK::Assign && x.tmp) {
         } else
             return false;
     }

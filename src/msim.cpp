@@ -28,6 +28,10 @@
 //   +pulse_on_event / +pulse_on_detect, +showcancelled / +noshowcancelled
 //                    pulse styles of every path output (30.7.4)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
+//   -vcd-arrays [N]  also write unpacked array elements (arrays of up to N, default 1024)
+//   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
+//                    time each bit spent at 0, 1 and x and its toggle count,
+//                    for power analysis with mpower (docs/POWER.md)
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -137,6 +141,7 @@
 
 #include "codegen.hpp"
 #include "lower.hpp"
+#include "saif.hpp"
 #include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/diagnostics/LookupDiags.h"
@@ -343,6 +348,207 @@ static void mergePartialDrivers(LowerResult& lowered) {
     }
 }
 
+// An always_comb with if / case that writes several signals, as one slice per
+// group of outputs: the block's control flow with only the assignments to
+// that group, minus the branches that no longer choose anything, waiting on
+// just the signals the slice reads. A controller that sets thirty outputs in
+// one case statement otherwise makes everything it reads feed everything it
+// writes; on Ibex that tied 106 blocks into one cycle of whole-block
+// dependencies, and every change in it re-ran the whole controller.
+// Outputs are grouped when one's slice reads the other (an intermediate
+// value inside the block), so a slice only reads final values from outside
+// its group. The block's deferred assertions form a group of their own.
+static void splitCombBlocks(LowerResult& lowered) {
+    size_t np = lowered.procs.size();
+    // Temporaries of the lowering (_tf<n>: a unique case's "which item
+    // matched") that only one process names: a slice that reads one carries
+    // the assignments to it, so they do not tie the outputs together.
+    std::vector<int> users(S.sigs.size(), 0);
+    {
+        std::function<void(const E&, std::set<int>&)> all = [&](const E& e, std::set<int>& out) {
+            if (!e) return;
+            if (e->sig >= 0) out.insert(e->sig);
+            for (auto& k : e->kids) all(k, out);
+        };
+        std::vector<const Prog*> seen;
+        std::function<void(const Prog*, std::set<int>&)> walk = [&](const Prog* p, std::set<int>& out) {
+            if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) return;
+            seen.push_back(p);
+            for (auto& in : p->code) {
+                if (in.sig >= 0) out.insert(in.sig);
+                all(in.e, out); all(in.bidx, out); all(in.de, out);
+                for (auto& a : in.args) all(a, out);
+                for (auto& a : in.aidx) all(a, out);
+                for (auto& [sg, ed] : in.events) out.insert(sg);
+                walk(in.callee, out);
+                for (auto* b : in.branches) walk(b, out);
+            }
+        };
+        for (auto& lp : lowered.procs) {
+            std::set<int> m;
+            seen.clear();
+            walk(&lp.prog, m);
+            for (int x : m) if ((size_t)x < users.size()) users[(size_t)x]++;
+        }
+    }
+    auto isTemp = [&](int sg) {
+        return sg >= 0 && (size_t)sg < users.size() && users[(size_t)sg] == 1 && S.sigs[(size_t)sg].name.rfind("_tf", 0) == 0;
+    };
+    for (size_t pi = 0; pi < np; pi++) {
+        if (lowered.procs[pi].program >= 0 || lowered.procs[pi].reactive) continue;
+        CombShape sh;
+        {
+            const Prog& p = lowered.procs[pi].prog;
+            if (!combShape(p, sh) || !sh.branches || sh.outs.size() + (sh.asserts ? 1 : 0) < 2) continue;
+        }
+        const Prog orig = lowered.procs[pi].prog;
+        const auto& code = orig.code;
+        size_t n = code.size(), end = n - 2;   // code[end] is the wait
+        bool ok = true;
+        const char* why = "";
+        struct Rep { const char*& w; bool& ok; const LoweredProc& lp; size_t no; ~Rep() { if (std::getenv("MSIM_WHYSPLIT")) std::cerr << "split " << lp.kind << " line " << (lp.prog.code.empty() ? 0 : lp.prog.code[0].line) << " outs " << no << ": " << (*w ? w : "split") << "\n"; } } rep{why, ok, lowered.procs[pi], sh.outs.size()};
+        std::set<int> refAll;
+        std::function<void(const E&, std::set<int>&)> refs = [&](const E& e, std::set<int>& out) {
+            if (!e) return;
+            if (e->arr) { ok = false; why = "arr"; }   // an element chosen at run time: no fixed set of signals
+            if (e->op == Op::Ref && e->sig >= 0) out.insert(e->sig);
+            for (auto& k : e->kids) refs(k, out);
+        };
+        for (size_t pc = 0; pc < end; pc++) {
+            const Instr& i = code[pc];
+            if ((i.k == IK::Jmp || i.k == IK::JmpIfNot) && i.target <= pc) { ok = false; why = "loop"; }   // a loop
+            if (i.tmp || i.xt != Instr::NOX) { ok = false; why = "-xprop code"; }   // shared temporaries, out-of-line jumps
+            if (i.k == IK::Assert) {
+                const AssertInfo& a = asserts().at(i.sig);
+                for (auto* cs : {&a.passCap, &a.failCap})
+                    for (auto& c : *cs) refs(c, refAll);
+            }
+            refs(i.e, refAll);
+        }
+        const Instr& w = code[end];
+        std::vector<std::pair<int, Edge>> ev = w.events;
+        if (ev.size() <= 1) ev = {{w.sig, w.edge}};
+        for (auto& [sg, ed] : ev) if (!refAll.count(sg)) { ok = false; if (!*why) why = "waits on a signal the body does not name"; }
+        if (!ok) continue;
+        // Output index of each instruction: its signal's, or the assertions' (last).
+        size_t no = sh.outs.size() + (sh.asserts ? 1 : 0);
+        auto outOf = [&](const Instr& i) -> int {
+            if (i.k == IK::Assert) return (int)sh.outs.size();
+            if (i.k != IK::Assign || isTemp(i.sig)) return -1;
+            for (size_t k = 0; k < sh.outs.size(); k++) if (sh.outs[k] == i.sig) return (int)k;
+            return -1;
+        };
+        std::vector<int> grp(no);
+        for (size_t k = 0; k < no; k++) grp[k] = (int)k;
+        std::function<int(int)> find = [&](int x) { while (grp[x] != x) x = grp[x] = grp[grp[x]]; return x; };
+        // The slice of one group: nxt[pc] is the first instruction it keeps
+        // at or after pc (end: none). A branch is kept when its two ways differ.
+        std::vector<size_t> nxt(n);
+        std::vector<char> keep(n);
+        auto slice = [&](int g) {
+            std::set<int> temps;   // the temporaries the slice reads: their assignments stay too
+            for (;;) {
+                nxt[end] = end;
+                for (size_t pc = end; pc-- > 0;) {
+                    const Instr& i = code[pc];
+                    keep[pc] = 0;
+                    if (i.k == IK::Jmp) nxt[pc] = nxt[i.target];
+                    else if (i.k == IK::JmpIfNot) {
+                        size_t a = nxt[pc + 1], b = nxt[i.target];
+                        if (a == b) nxt[pc] = a;
+                        else { nxt[pc] = pc; keep[pc] = 1; }
+                    } else if ((outOf(i) >= 0 && find(outOf(i)) == g) || (i.k == IK::Assign && temps.count(i.sig))) { nxt[pc] = pc; keep[pc] = 1; }
+                    else nxt[pc] = nxt[pc + 1];
+                }
+                size_t before = temps.size();
+                std::set<int> rd;
+                for (size_t pc = 0; pc < end; pc++) if (keep[pc]) refs(code[pc].e, rd);
+                for (int x : rd) if (isTemp(x)) temps.insert(x);
+                if (temps.size() == before) break;
+            }
+        };
+        for (bool again = true; again;) {
+            again = false;
+            for (size_t k = 0; k < no && !again; k++) {
+                if (find((int)k) != (int)k || (k < sh.outs.size() && isTemp(sh.outs[k]))) continue;
+                slice((int)k);
+                std::set<int> rd;
+                for (size_t pc = 0; pc < end; pc++) {
+                    if (!keep[pc]) continue;
+                    refs(code[pc].e, rd);
+                    if (code[pc].k == IK::Assign && code[pc].hi >= 0) rd.insert(code[pc].sig);   // a part write keeps the other bits
+                }
+                for (size_t j = 0; j < sh.outs.size(); j++)
+                    if (rd.count(sh.outs[j]) && !isTemp(sh.outs[j]) && find((int)j) != (int)k) { grp[find((int)j)] = (int)k; again = true; }
+            }
+        }
+        std::vector<int> roots;
+        for (size_t k = 0; k < no; k++)
+            if (find((int)k) == (int)k && !(k < sh.outs.size() && isTemp(sh.outs[k]))) roots.push_back((int)k);
+        if (roots.size() < 2) { why = "one group"; continue; }
+        std::vector<Prog> progs;
+        for (int g : roots) {
+            slice(g);
+            Prog q;
+            q.pd = orig.pd; q.pstate = orig.pstate;
+            std::vector<size_t> at(n, 0);       // old pc -> new index
+            std::vector<std::pair<size_t, size_t>> fix;   // new index of a jump, old target pc
+            std::set<int> rd;
+            for (size_t pc = 0; pc < end; pc++) {
+                if (!keep[pc]) continue;
+                at[pc] = q.code.size();
+                Instr i = code[pc];
+                refs(i.e, rd);
+                if (i.k == IK::Assert) {
+                    const AssertInfo& a = asserts().at(i.sig);
+                    for (auto* cs : {&a.passCap, &a.failCap})
+                        for (auto& c : *cs) refs(c, rd);
+                }
+                q.code.push_back(i);
+                if (i.k == IK::JmpIfNot) fix.push_back({q.code.size() - 1, nxt[i.target]});
+                // Falls through to the next kept instruction, or jumps to where it went.
+                size_t to = nxt[pc + 1], nextKept = pc + 1;
+                while (nextKept < end && !keep[nextKept]) nextKept++;
+                if (to != nextKept) {
+                    Instr j; j.k = IK::Jmp; j.file = i.file; j.line = i.line;
+                    q.code.push_back(j);
+                    fix.push_back({q.code.size() - 1, to});
+                }
+            }
+            size_t first = nxt[0];
+            if (first != end) {
+                size_t fk = 0;
+                while (fk < end && !keep[fk]) fk++;
+                if (first != fk) { ok = false; why = "entry"; break; }   // cannot happen: the first kept instruction is nxt[0]
+            }
+            at[end] = q.code.size();
+            for (auto& [ni, old] : fix) q.code[ni].target = at[old];
+            Instr wt = w;
+            wt.events.clear();
+            for (auto& e : ev) if (rd.count(e.first)) wt.events.push_back(e);
+            if (wt.events.empty()) { ok = false; why = "a slice waits on nothing"; break; }   // reads nothing it waits on: leave the block whole
+            if (wt.events.size() == 1) { wt.sig = wt.events[0].first; wt.edge = wt.events[0].second; wt.events.clear(); }
+            q.code.push_back(wt);
+            Instr back = code[n - 1];
+            q.code.push_back(back);
+            progs.push_back(std::move(q));
+        }
+        if (!ok) continue;
+        for (auto& q : progs) {
+            CombShape c;
+            if (!combShape(q, c)) { ok = false; why = "slice shape"; break; }
+        }
+        if (!ok) continue;
+        LoweredProc tmpl = lowered.procs[pi];
+        lowered.procs[pi].prog = std::move(progs[0]);
+        for (size_t k = 1; k < progs.size(); k++) {
+            LoweredProc lp = tmpl;
+            lp.prog = std::move(progs[k]);
+            lowered.procs.push_back(std::move(lp));
+        }
+    }
+}
+
 static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     size_t n = lowered.procs.size();
     Plan p;
@@ -361,7 +567,19 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
             if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
+        // MSIM_WHYCYCLE=1: the blocks that feed each other (they keep the
+        // design out of the partitions and the cycle domain).
+        std::vector<int> cyc;
+        if (std::getenv("MSIM_WHYCYCLE")) g_combCycles = &cyc;
         std::vector<size_t> order = combSchedule(shapes, &lv, &p.cyclic);
+        g_combCycles = nullptr;
+        for (size_t a = 0; a < cyc.size(); a++) {
+            if (cyc[a] < 0) continue;
+            std::string o, in;
+            for (int x : shapes[a].outs) o += S.sigs[x].name + " ";
+            for (int x : shapes[a].ins) in += S.sigs[x].name + " ";
+            std::cerr << "cycle " << cyc[a] << ": " << lowered.procs[procOf[a]].kind << " writes " << o << "| reads " << in << "\n";
+        }
         for (size_t r = 0; r < order.size(); r++) {
             size_t i = procOf[order[r]];
             p.rank[i] = (int)r;
@@ -416,6 +634,24 @@ static bool readCompiledCov(const std::string& path, const std::vector<std::pair
         S.togRise[s].resize(w);
         S.togFall[s].resize(w);
         ok = rd(S.togRise[s].data(), w) && rd(S.togFall[s].data(), w);
+    }
+    // condition counters, then per FSM its states and transitions
+    uint64_t nc = 0, nfsm = 0;
+    ok = ok && rd(&nc, 1) && nc == g_condHits.size();
+    for (size_t k = 0; ok && k < nc; k++) {
+        uint64_t c = 0;
+        ok = rd(&c, 1);
+        g_condHits[k] += c;
+    }
+    ok = ok && rd(&nfsm, 1) && nfsm == S.fsmSigs.size();
+    for (size_t k = 0; ok && k < nfsm; k++) {
+        uint64_t a = 0, b = 0, r[3];
+        ok = rd(&a, 1);
+        for (uint64_t j = 0; ok && j < a; j++)
+            if ((ok = rd(r, 2))) S.fsmSeen[k][r[0]] += r[1];
+        ok = ok && rd(&b, 1);
+        for (uint64_t j = 0; ok && j < b; j++)
+            if ((ok = rd(r, 3))) S.fsmTrans[k][{r[0], r[1]}] += r[2];
     }
     std::fclose(f);
     return ok;
@@ -594,6 +830,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::string run = shq(exe);
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
+    if (vcdPath && S.dumpArrays) run += " -vcd-arrays " + std::to_string(S.dumpArrays);
     run += " -threads " + std::to_string(threads);
     if (g_pin >= 0) run += g_pin ? " -pin" : " -no-pin";
     // Run-time inputs go to simv, so one build serves every seed and plusarg.
@@ -687,6 +924,59 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         f << (first ? "\n  " : ",\n  ") << "[" << jstr(top + "." + g.name) << ", " << g.w << ", \"" << hex(R, g.w) << "\", \"" << hex(F, g.w) << "\"]";
         first = false;
     }
+    // Conditions (a && b, a || b, the condition of ?:): per source position,
+    // the hits of each vector, summed over the instances of the module.
+    struct CondSum { const CondDef* d; std::vector<uint64_t> hits; };
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, std::string>, CondSum> conds;
+    for (auto& d : condDefs()) {
+        auto& c = conds[{d.file, d.line, d.col, d.text}];
+        if (!c.d) { c.d = &d; c.hits.assign(d.terms.size() + 1, 0); }
+        if (c.d->terms.size() != d.terms.size()) continue;
+        for (size_t k = 0; k <= d.terms.size(); k++) c.hits[k] += g_condHits[d.base + k];
+    }
+    f << "\n ],\n \"conditions\": [";
+    first = true;
+    for (auto& [key, c] : conds) {
+        f << (first ? "\n  " : ",\n  ") << "[" << c.d->file << ", " << c.d->line << ", " << c.d->col << ", "
+          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? (c.d->lazy ? "\"||s\"" : "\"||\"") : c.d->lazy ? "\"&&s\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
+        for (size_t k = 0; k < c.d->terms.size(); k++) f << (k ? ", " : "") << jstr(c.d->terms[k]);
+        f << "], [";
+        for (size_t k = 0; k < c.hits.size(); k++) f << (k ? ", " : "") << c.hits[k];
+        f << "]]";
+        first = false;
+    }
+    // FSMs: per state register, its states and transitions with their hits;
+    // "extra" lists changes seen that the next-state logic does not show.
+    S.fsmFinish();
+    f << "\n ],\n \"fsms\": [";
+    first = true;
+    for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++) {
+        const FsmDef& d = fsmDefs()[k];
+        const auto& seen = S.fsmSeen[k];
+        auto trans = S.fsmTrans[k];
+        f << (first ? "\n  " : ",\n  ") << "{\"module\": " << jstr(d.module) << ", \"inst\": " << jstr(d.inst) << ", \"name\": "
+          << jstr(d.name) << ", \"file\": " << d.file << ", \"line\": " << d.line << ", \"width\": " << d.w << ",\n   \"states\": [";
+        for (size_t j = 0; j < d.states.size(); j++) {
+            auto it = seen.find(d.states[j].first);
+            f << (j ? ", " : "") << "[" << d.states[j].first << ", " << jstr(d.states[j].second) << ", "
+              << (it == seen.end() ? 0 : it->second) << "]";
+        }
+        f << "],\n   \"trans\": [";
+        for (size_t j = 0; j < d.trans.size(); j++) {
+            auto it = trans.find({d.trans[j].from, d.trans[j].to});
+            f << (j ? ", " : "") << "[" << d.trans[j].from << ", " << d.trans[j].to << ", " << (it == trans.end() ? 0 : it->second)
+              << ", " << (d.trans[j].reset ? 1 : 0) << "]";
+            if (it != trans.end()) trans.erase(it);
+        }
+        f << "],\n   \"extra\": [";
+        bool f2 = true;
+        for (auto& [t, c] : trans) {
+            f << (f2 ? "" : ", ") << "[" << t.first << ", " << t.second << ", " << c << "]";
+            f2 = false;
+        }
+        f << "]}";
+        first = false;
+    }
     f << "\n ],\n";
     // Functional coverage: covergroup bins and assertion statistics. A
     // compiled run's simv wrote them next to its counters.
@@ -769,6 +1059,7 @@ static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
+                 "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -777,7 +1068,10 @@ static void usage() {
                  "  +pulse_r/<n> +pulse_e/<n>  pulse reject / error limits as n% of path delays\n"
                  "  +pulse_on_event / +pulse_on_detect, +showcancelled / +noshowcancelled  pulse styles\n"
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
-                 "  -cov [<file>]  write line / branch / toggle coverage (default cov.json); see mcov\n"
+                 "  -vcd-arrays [N]  also write unpacked array elements (memories) of up to N\n"
+                 "                 elements each (default 1024) to the VCD or FST, as mem[3]\n"
+                 "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
+                 "                 see mcov. -cm <metrics> (as VCS) does the same\n"
                  "  -maxtime <n>   stop after simulation time n\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
                  "                 and reuses <dir>/simv while the design is unchanged\n"
@@ -817,6 +1111,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> plusargs;
     uint64_t seed = 0;
     std::optional<std::string> vcdPath;
+    std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
+    bool saifTmp = false;   // ...and the waveform was only written for that
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
@@ -932,9 +1228,27 @@ int main(int argc, char** argv) {
         if (a == "+showcancelled" || a == "+show_cancelled") { pulseOpts().showCancelled = 1; continue; }                   // 30.7.4.2
         if (a == "+noshowcancelled" || a == "+noshow_cancelled") { pulseOpts().showCancelled = 0; continue; }
         if (a == "+fst") { vcdPath = "dump.fst"; continue; }
+        // Switching activity for power analysis (mpower): SAIF, T0/T1/TX/TC per bit.
+        if (a == "-saif") {
+            std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
+            saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
+            continue;
+        }
         if (a == "-cov") {
             g_cov = true;
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
+            continue;
+        }
+        if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
+            g_cov = true;
+            ++i;
+            continue;
+        }
+        // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.
+        if (a == "-vcd-arrays" || a == "-fst-arrays") {
+            S.dumpArrays = 1024;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                S.dumpArrays = std::strtoull(argv[++i], nullptr, 10);
             continue;
         }
         // -vcd x.fst writes FST too: the file name picks the format.
@@ -1045,6 +1359,31 @@ int main(int argc, char** argv) {
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (!saifPath.empty() && !vcdPath) {
+#ifdef MINISIM_FST
+        vcdPath = saifPath + ".tmp.fst";
+#else
+        vcdPath = saifPath + ".tmp.vcd";
+#endif
+        saifTmp = true;
+    }
+    // After the run: every value change of the waveform, summed per bit.
+    auto writeSaif = [&]() -> bool {
+        if (saifPath.empty()) return true;
+        S.closeWaves();
+        try {
+            saif::Db db;
+            saif::load(*vcdPath, db, par::defaultThreads());
+            std::ofstream f(saifPath);
+            if (!f) throw saif::Error("cannot write " + saifPath);
+            saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+        } catch (const std::exception& e) {
+            std::cerr << "msim: -saif: " << e.what() << "\n";
+            return false;
+        }
+        if (saifTmp) std::remove(vcdPath->c_str());
+        return true;
+    };
     if (std::none_of(fwd.begin(), fwd.end(), [](const std::string& s) { return startsWith(s, "--std"); }))
         fwd.push_back("--std=1800-2023");
     if (seed) {   // the $urandom stream (18.13); $random keeps its own seed (Annex N)
@@ -1161,6 +1500,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (g_cov) {   // FSM coverage: the kernel records the state registers' values
+        std::vector<int> watch;
+        std::vector<char> hot;
+        for (auto& d : fsmDefs()) { watch.push_back(d.sig); hot.push_back(d.onehot); }
+        S.fsmWatch(watch, hot);
+    }
     if (!xpropReport.empty()) {   // -xprop-report: what is merged, what is not and why
         std::ofstream f(xpropReport);
         if (!f) { std::cerr << "msim: cannot write " << xpropReport << "\n"; return 1; }
@@ -1295,7 +1640,8 @@ int main(int argc, char** argv) {
     // resolve them: those designs keep every driver.
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty())
-        mergePartialDrivers(lowered);   // -no-static-comb keeps them, as the reference
+        mergePartialDrivers(lowered);
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
@@ -1320,6 +1666,7 @@ int main(int argc, char** argv) {
                 std::cerr << "msim: cannot write " << covPath << "\n";
                 return 1;
             }
+            if (!writeSaif()) return 1;
             return st;
         }
     }
@@ -1413,5 +1760,6 @@ int main(int argc, char** argv) {
         std::cerr << "msim: cannot write " << covPath << "\n";
         return 1;
     }
+    if (!writeSaif()) return 1;
     return S.exitCode;
 }

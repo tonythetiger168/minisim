@@ -21,6 +21,7 @@
 // own solver, which makes every answer and counterexample the same whatever
 // the thread count.
 #include <algorithm>
+#include <set>
 #include "../parallel.hpp"
 #include <map>
 #include <string>
@@ -54,6 +55,7 @@ struct CheckOptions {
     unsigned simRounds = 8;         // 64 patterns each
     uint64_t sweepEffort = 300;     // SAT conflicts per internal equivalence tried
     std::vector<std::pair<std::string, std::string>> matches;  // ref name, impl name
+    bool constRegs = true;          // read unmatched reference flops stuck at their reset value as that value
 };
 
 struct Result {
@@ -61,6 +63,7 @@ struct Result {
     std::vector<std::string> refOnlyInputs, implOnlyInputs, refOnlyOutputs, implOnlyOutputs;
     std::vector<std::string> refOnlyStates, implOnlyStates;
     size_t matchedInputs = 0, matchedStates = 0, matchedOutputs = 0, invertedStates = 0;
+    std::vector<std::string> constStates;  // reference flops read as a constant (CheckOptions::constRegs)
     size_t passed = 0, failed = 0, aborted = 0;
     size_t merged = 0;  // internal nodes SAT sweeping proved equal
     bool equivalent() const { return failed == 0 && aborted == 0 && refOnlyOutputs.empty(); }
@@ -203,9 +206,9 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
         Lit late = nx > ny ? x : y, early = nx > ny ? y : x;
         if (!g.isAnd(nodeOf(late)) || rep[nodeOf(late)] != kNoLit) continue;
         rep[nodeOf(late)] = early ^ (late & 1u);
-        Sat::L a = cnf.lit(x), b = cnf.lit(y);
-        cnf.sat.addClause(Sat::no(a), b);
-        cnf.sat.addClause(a, Sat::no(b));
+        int a = cnf.lit(x), b = cnf.lit(y);
+        cnf.sat.addClause({-a, b});
+        cnf.sat.addClause({a, -b});
     }
     for (uint32_t n : cone) {
         if (rep[n] != kNoLit) continue;  // settled by a lemma
@@ -219,19 +222,19 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
             if (!same(n, r, inv)) continue;
             ++tries;
             // Is n != r possible?
-            Sat::L a = cnf.lit(Lit(n << 1)), b = cnf.lit(Lit(r << 1) ^ (inv ? 1u : 0u));
-            uint32_t t = cnf.sat.newVar();
-            cnf.sat.addClause(Sat::mk(t, true), a, b);
-            cnf.sat.addClause(Sat::mk(t, true), Sat::no(a), Sat::no(b));
-            Sat::Result res = cnf.sat.solve({Sat::mk(t)}, effort);
-            if (res == Sat::Unsat) {
-                cnf.sat.addClause(Sat::mk(t, true));
-                cnf.sat.addClause(Sat::no(a), b);
-                cnf.sat.addClause(a, Sat::no(b));
+            int a = cnf.lit(Lit(n << 1)), b = cnf.lit(Lit(r << 1) ^ (inv ? 1u : 0u));
+            int t = cnf.sat.newVar();
+            cnf.sat.addClause({-t, a, b});
+            cnf.sat.addClause({-t, -a, -b});
+            sat::Result res = cnf.sat.solve({t}, int64_t(effort));
+            if (res == sat::Unsat) {
+                cnf.sat.addClause({-t});
+                cnf.sat.addClause({-a, b});
+                cnf.sat.addClause({a, -b});
                 rep[n] = Lit(r << 1) ^ (inv ? 1u : 0u);
                 ++merged;
                 done = true;
-            } else if (res == Sat::SatResult) {
+            } else if (res == sat::Sat) {
                 // A pattern that tells them apart, and 63 neighbours of it.
                 if (sig.size() < maxWords) {
                     sig.emplace_back(N, 0);
@@ -244,9 +247,9 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
                     }
                     simWord(w);
                 }
-                cnf.sat.addClause(Sat::mk(t, true));
+                cnf.sat.addClause({-t});
             } else {
-                cnf.sat.addClause(Sat::mk(t, true));
+                cnf.sat.addClause({-t});
             }
         }
         if (!done) bucket.push_back(n);
@@ -267,7 +270,12 @@ inline size_t sweep(Aig& g, const std::vector<Lit*>& roots, uint64_t effort,
 
 }  // namespace detail
 
-inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions& opt) {
+namespace detail {
+// One pass with a given polarity for every matched register: `flips` names
+// the implementation states to take with the opposite polarity from what the
+// names suggest.
+inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOptions& opt,
+                        const std::set<std::string>& flips) {
     Result res;
     using Keys = std::vector<std::vector<std::string>>;
     auto forcedPairs = [&](auto& rlist, auto& ilist, auto nameOf) {
@@ -310,16 +318,26 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
     for (int pass = 0; pass < 2; ++pass) {
         std::vector<char> refUsed(ref.states.size(), 0);
         for (int r : stMap) if (r >= 0) refUsed[r] = 1;
-        auto keysOf = [](const State& s, bool inv) {
+        // A cell that holds one state is also known by its instance name.
+        auto instCount = [](const std::vector<State>& v) {
+            std::unordered_map<std::string, int> n;
+            for (auto& s : v) ++n[s.inst];
+            return n;
+        };
+        auto refInst = instCount(ref.states), implInst = instCount(impl.states);
+        auto keysOf = [](const State& s, bool inv, std::unordered_map<std::string, int>& perInst) {
             std::vector<std::string> k;
-            if (!inv) k.push_back(normalize(s.name));
+            if (!inv) {
+                k.push_back(normalize(s.name));
+                if (!s.inst.empty() && perInst[s.inst] == 1) k.push_back(normalize(s.inst));
+            }
             for (auto& a : inv ? s.invAliases : s.aliases) k.push_back(normalize(a));
             return k;
         };
         std::unordered_map<std::string, int> table;
         for (size_t r = 0; r < ref.states.size(); ++r) {
             if (refUsed[r]) continue;
-            for (auto& k : keysOf(ref.states[r], false)) {
+            for (auto& k : keysOf(ref.states[r], false, refInst)) {
                 auto [it, fresh] = table.try_emplace(k, int(r));
                 if (!fresh && it->second != int(r)) it->second = -1;
             }
@@ -329,7 +347,7 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         for (size_t i = 0; i < impl.states.size(); ++i) {
             if (stMap[i] >= 0) continue;
             int found = -1;
-            for (auto& k : keysOf(impl.states[i], pass == 1)) {
+            for (auto& k : keysOf(impl.states[i], pass == 1, implInst)) {
                 auto it = table.find(k);
                 if (it == table.end() || it->second < 0) continue;
                 if (found >= 0 && found != it->second) { found = -2; break; }
@@ -343,6 +361,27 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         for (size_t i = 0; i < impl.states.size(); ++i)
             if (want[i] >= 0 && claim[want[i]] == int(i)) stMap[i] = want[i], stInv[i] = pass == 1;
     }
+    // A register matched by its cell's name may still be stored inverted: a
+    // library with only a clear-type flop holds a set-type register as its
+    // complement. The nets tell: the reference's name is on a net that
+    // carries !Q and on none that carries Q.
+    for (size_t i = 0; i < impl.states.size(); ++i) {
+        if (stMap[i] < 0 || stInv[i]) continue;
+        const State& is = impl.states[i];
+        const State& rs = ref.states[stMap[i]];
+        std::vector<std::string> names{normalize(rs.name)};
+        for (auto& a : rs.aliases) names.push_back(normalize(a));
+        auto carries = [&](const std::vector<std::string>& nets) {
+            for (auto& a : nets)
+                if (std::find(names.begin(), names.end(), normalize(a)) != names.end()) return true;
+            return false;
+        };
+        if (carries(is.invAliases) && !carries(is.aliases) &&
+            std::find(names.begin(), names.end(), normalize(is.name)) == names.end())
+            stInv[i] = 1;
+    }
+    for (size_t i = 0; i < impl.states.size(); ++i)
+        if (stMap[i] >= 0 && flips.count(impl.states[i].name)) stInv[i] = !stInv[i];
 
     // ---- match outputs
     rk.clear(), ik.clear();
@@ -366,8 +405,98 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         ++res.matchedStates;
     }
     for (size_t r = 0; r < ref.inputs.size(); ++r) if (!refIn[r]) res.refOnlyInputs.push_back(ref.inputs[r].first);
-    for (size_t r = 0; r < ref.states.size(); ++r) if (!refSt[r]) res.refOnlyStates.push_back(ref.states[r].name);
+    // ---- constant registers
+    // A reference flop the implementation does not have, with an asynchronous
+    // set or reset to c and a next state that is c whenever it holds c, never
+    // leaves c once reset. Synthesis replaces it with c; read it that way.
+    // This takes the reset as applied, which is what such a netlist assumes.
+    // The same goes for a flop that only ever loads one constant (taken as
+    // clocked once) and one that is never given a definite value at all.
+    std::unordered_map<uint32_t, Lit> konst;
+    if (opt.constRegs) {
+        auto orTerms = [&](Lit root) {
+            std::vector<Lit> out, todo{root};
+            while (!todo.empty()) {
+                Lit l = todo.back();
+                todo.pop_back();
+                if (isNeg(l) && g.isAnd(nodeOf(l))) {
+                    todo.push_back(neg(g.node(nodeOf(l)).a));
+                    todo.push_back(neg(g.node(nodeOf(l)).b));
+                } else {
+                    out.push_back(l);
+                }
+            }
+            return out;
+        };
+        // The value the flop takes under 'term', if that is a constant.
+        auto under = [&](const State& st, Lit term, std::unordered_map<uint32_t, Lit> m) -> Lit {
+            if (nodeOf(term) == 0) return kNoLit;
+            m[nodeOf(term)] = isNeg(term) ? kFalse : kTrue;
+            auto mx = m;
+            Lit v = g.rebuildSparse(st.next.v, m);
+            if (g.rebuildSparse(st.next.x, mx) != kFalse || nodeOf(v) != 0) return kNoLit;
+            return v;
+        };
+        for (bool again = true; again;) {
+            again = false;
+            for (size_t r = 0; r < ref.states.size(); ++r) {
+                const State& st = ref.states[r];
+                if (refSt[r] || st.latch || st.trig.x != kFalse || konst.count(nodeOf(st.q))) continue;
+                // No definite value other than c is ever stored: every load is c
+                // (or X), whatever the flop holds. With both c, nothing definite is
+                // ever stored and the flop is unknown for good; synthesis ties it
+                // to 0 and any fixed value is a legitimate reading of it.
+                {
+                    auto m = konst;
+                    Lit v = g.rebuildSparse(st.next.v, m), x = g.rebuildSparse(st.next.x, m);
+                    bool is0 = g.or_(x, neg(v)) == kTrue, is1 = g.or_(x, v) == kTrue;
+                    if (!is0 && !is1) {
+                        // Or it only ever keeps what it has.
+                        bool keep[2];
+                        for (int k = 0; k < 2; ++k) {
+                            auto mk = konst;
+                            mk[nodeOf(st.q)] = k ? kTrue : kFalse;
+                            Lit vk = g.rebuildSparse(st.next.v, mk), xk = g.rebuildSparse(st.next.x, mk);
+                            keep[k] = g.or_(xk, k ? vk : neg(vk)) == kTrue;
+                        }
+                        is0 = keep[0] && keep[1];
+                    }
+                    if (is0 || is1) {
+                        konst[nodeOf(st.q)] = is0 ? kFalse : kTrue;
+                        res.constStates.push_back(st.name);
+                        again = true;
+                        continue;
+                    }
+                }
+                auto terms = orTerms(st.trig.v);
+                if (terms.size() < 2) continue;
+                Lit c = kNoLit;
+                size_t clocks = 0;  // events that load something else
+                for (Lit t : terms) {
+                    Lit v = under(st, t, konst);
+                    if (v == kNoLit) ++clocks;
+                    else if (c == kNoLit) c = v;
+                    else if (c != v) { c = kNoLit; clocks = 0; break; }  // both a set and a reset
+                }
+                if (c == kNoLit || clocks == 0) continue;
+                auto m = konst;
+                m[nodeOf(st.q)] = isNeg(st.q) ? neg(c) : c;
+                auto mx = m;
+                if (g.rebuildSparse(st.next.v, m) != c || g.rebuildSparse(st.next.x, mx) != kFalse) continue;
+                konst[nodeOf(st.q)] = isNeg(st.q) ? neg(c) : c;
+                res.constStates.push_back(st.name);
+                again = true;
+            }
+        }
+    }
+    for (size_t r = 0; r < ref.states.size(); ++r)
+        if (!refSt[r] && !konst.count(nodeOf(ref.states[r].q))) res.refOnlyStates.push_back(ref.states[r].name);
     auto move = [&](Bit b) { return Bit{g.rebuild(b.v, memo), g.rebuild(b.x, memo)}; };
+    auto kmemo = konst;
+    auto fold = [&](Bit b) {
+        if (konst.empty()) return b;
+        return Bit{g.rebuildSparse(b.v, kmemo), g.rebuildSparse(b.x, kmemo)};
+    };
 
     // ---- compare points
     auto add = [&](Point::Kind kind, const std::string& rn, const std::string& in, Bit r, Bit i) {
@@ -375,6 +504,7 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         p.kind = kind;
         p.name = rn;
         if (in != rn) p.implName = in;
+        r = fold(r);
         p.ref = r;
         p.impl = i;
         // Differ: the reference is a definite value and the implementation is
@@ -471,7 +601,7 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         sim[0] = 0;
         for (uint32_t n = 1; n < N; ++n) {
             Aig::Node nd = g.node(n);
-            if (nd.a == kNoLit) {
+            if (!g.isAnd(n)) {
                 // Round 0 and 1 are all-zeros and all-ones in pattern 0, random after.
                 uint64_t r = detail::mix(uint64_t(n) * 0x100000001b3ULL + round);
                 if (round == 0) r &= ~1ull;
@@ -547,6 +677,34 @@ inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions&
         else ++res.aborted;
     }
     return res;
+}
+}  // namespace detail
+
+// Check the two designs. When registers were matched by name but their
+// next-state functions differ, synthesis may have stored them inverted with
+// no net left to say so (an internal set-type register on a library whose
+// flops only clear). Those are retried with the opposite polarity. Any
+// polarity under which every point passes is a proof: the outputs agree and
+// the matched registers stay in step, reset values included.
+inline Result check(Aig& g, const Design& ref, Design& impl, const CheckOptions& opt) {
+    std::set<std::string> flips;
+    Result best = detail::checkOnce(g, ref, impl, opt, flips);
+    for (int round = 0; round < 4 && best.failed > 0; ++round) {
+        std::set<std::string> forced;
+        for (auto& [r, i] : opt.matches) forced.insert(i);
+        std::set<std::string> next = flips;
+        for (auto& p : best.points)
+            if (p.kind == Point::Next && p.status == Point::Fail && p.note.empty()) {
+                const std::string& in = p.implName.empty() ? p.name : p.implName;
+                if (!forced.count(in)) next.insert(in);
+            }
+        if (next.size() == flips.size()) break;
+        Result r = detail::checkOnce(g, ref, impl, opt, next);
+        if (r.failed >= best.failed) break;
+        best = std::move(r);
+        flips = std::move(next);
+    }
+    return best;
 }
 
 }  // namespace equiv

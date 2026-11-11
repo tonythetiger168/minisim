@@ -1,0 +1,6 @@
+'c++' -std=c++20 -O2 -I'/home/claude/minisim/src' 'msim.d/design.cpp' -o 'msim.d/simv'
+minisim.cpp 126534 -4643293096238395153
+exec.inc 79849 -4643324871657405823
+expr.hpp 121802 -4643294698501247574
+prog.hpp 39321 -4643294698485247574
+cpu.hpp 7233 -4643347310270671296
