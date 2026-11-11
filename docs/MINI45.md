@@ -101,4 +101,9 @@ and edge capacitance per layer and a default via per cut layer. Every cell
 is a whole number of sites wide and its Liberty `area` is its LEF size. Each
 signal pin is a metal1 shape centred where a metal2 track crosses a metal1
 track, one metal2 track per pin, so a router can drop a via on any pin.
-`VDD` and `VSS` are metal1 rails on the top and bottom edges.
+Each pin is 0.07 um by 0.21 um, the metal1 minimum area, so a pin no net
+connects is still legal. `VDD` and `VSS` are metal1 rails on the top and
+bottom edges. Metal1 to metal2 has two default vias: `via1_0` with a
+horizontal metal1 pad for wires, and `via1_1` with a vertical pad the shape
+of a pin, so vias on the pins of neighbouring metal2 tracks keep their
+spacing.

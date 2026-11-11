@@ -52,6 +52,11 @@ jobs:
       - name: Install zlib (FST waveforms)
         run: sudo apt-get install -y zlib1g-dev libssl-dev openssl
 
+      # mfpga's netlists are proven against the RTL with Yosys and placed and
+      # routed with nextpnr (tests/fpga/run_test.py skips what is not installed).
+      - name: Install Yosys and nextpnr (mfpga tests)
+        run: sudo apt-get update && sudo apt-get install -y yosys nextpnr-ice40 nextpnr-ecp5
+
       # The UVM tests (tests/uvm) run against the Accellera UVM library.
       - name: Fetch Accellera UVM (uvm-core 2020.3.1)
         run: git clone --depth 1 --branch 2020.3.1 https://github.com/accellera-official/uvm-core $HOME/uvm-core
