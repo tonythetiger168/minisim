@@ -54,6 +54,7 @@ extern "C" {
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
+#define ABS(a) ((a) < 0.0 ? -(a) : (a))
 #define NG_IGNORE(x) (void)(x)
 #define NG_IGNOREABLE(x) (void)(x)
 
@@ -62,6 +63,13 @@ extern "C" {
 #define FREE(p) do { free(p); (p) = NULL; } while (0)
 #define tfree(p) do { free(p); (p) = NULL; } while (0)
 char* copy(const char* s);
+#ifndef __cplusplus
+/* The parameter checker would write its warnings to a file "bsim4.out" in
+ * the working directory as well as to stderr. Not from a library: this
+ * returns NULL, which leaves stderr. */
+FILE* mspice_bsim4_nofile(const char* name, const char* mode);
+#define fopen(name, mode) mspice_bsim4_nofile(name, mode)
+#endif
 char* tprintf(const char* fmt, ...);
 
 /* ------------------------------------------------------------ constants */

@@ -100,6 +100,8 @@ struct Circuit {
         std::apply([&](auto&... p) { (f(p), ...); }, pools);
     }
     std::vector<Device*> devs;   // every device, in netlist order
+    std::unique_ptr<Bsim4Set> bsim4;   // the BSIM4 transistors, when there are any
+    std::vector<char> voltLike;        // per unknown: a node voltage (also a device's internal node)
     std::map<std::string, Device*> byName;
     bool linear = true;
     std::map<int, double> ic, nodeset;
@@ -140,7 +142,12 @@ struct Circuit {
         Setup S{pat, names};
         for (Device* d : devs) d->branches(S);
         for (Device* d : devs) d->bind(S);
+        std::vector<int> inner;
+        if (bsim4) inner = bsim4->setup(S, opt);
         n = (int)names.size();
+        voltLike.assign(n, 0);
+        std::fill(voltLike.begin(), voltLike.begin() + numNodes, 1);
+        for (int i : inner) voltLike[i] = 1;
         diag.resize(numNodes);
         for (int i = 0; i < numNodes; i++) diag[i] = pat.slot(i, i);
         pat.finalize(n);
@@ -148,7 +155,7 @@ struct Circuit {
         val.assign(pat.slots.size(), 0);
         rhsBuf.assign(n + 1, 0); xBuf.assign(n + 1, 0); xnewBuf.assign(n + 1, 0);
         rhs = rhsBuf.data() + 1; x = xBuf.data() + 1; xnew = xnewBuf.data() + 1;
-        linear = pool<Diode>().empty() && pool<Mosfet>().empty() && pool<Bjt>().empty();
+        linear = pool<Diode>().empty() && pool<Mosfet>().empty() && pool<Bjt>().empty() && !bsim4;
     }
 
     Ctx context() const {
@@ -280,6 +287,10 @@ struct Circuit {
                 }
                 for (auto& d : p) d.load(c, v, rhs);
             });
+            if (bsim4) {
+                bsim4->eval(c, xBuf.data(), pool_);
+                bsim4->load(v, rhsBuf.data());
+            }
             if (gdiag != 0)
                 for (int i = 0; i < numNodes; i++) val[diag[i]] += gdiag;
         }
@@ -305,6 +316,7 @@ struct Circuit {
     bool newton(Ctx& c, int maxIter, bool initJct = false) {
         for (int it = 0; it < maxIter; it++) {
             c.initJct = initJct && it == 0;
+            c.iter = it;
             bool hold = holdIC || holdNodeset;
             bool reuse = linear && factored && factoredA == c.a && factoredG == gdiag && factoredHold == hold;
             loadAll(c, reuse);
@@ -315,7 +327,8 @@ struct Circuit {
                 factored = true; factoredA = c.a; factoredG = gdiag; factoredHold = hold;
             }
             lu.solve(rhs, xnew);
-            bool conv = linear || (it > 0 && !anyLimited<Diode>() && !anyLimited<Mosfet>() && !anyLimited<Bjt>());
+            bool conv = linear || (it > 0 && !anyLimited<Diode>() && !anyLimited<Mosfet>() && !anyLimited<Bjt>() &&
+                                  !(bsim4 && bsim4->limited()));
             bool finite = true;
             if (linear) {
                 for (int i = 0; i < n; i++) finite &= std::isfinite(xnew[i]);
@@ -324,7 +337,7 @@ struct Circuit {
                 for (int i = 0; i < n; i++) {
                     double a = xnew[i], b = x[i], d = std::fabs(a - b);
                     finite &= std::isfinite(a);
-                    if (d > rt * std::max(std::fabs(a), std::fabs(b)) + (i < numNodes ? opt.vntol : opt.abstol)) conv = false;
+                    if (d > rt * std::max(std::fabs(a), std::fabs(b)) + (voltLike[i] ? opt.vntol : opt.abstol)) conv = false;
                 }
             }
             if (!finite) { c.initJct = false; return false; }
@@ -495,6 +508,7 @@ struct Circuit {
         holdIC = !ic.empty();
         op(c);
         holdIC = false;
+        if (bsim4) bsim4->prepareAC();
         std::vector<double> f = frequencies(a);
         struct Work {
             std::vector<cplx> val, rhs, x;
@@ -508,6 +522,7 @@ struct Circuit {
                 cplx* v = w.val.data();
                 cplx* r = w.rhs.data() + 1;
                 eachPool([&](auto& p) { for (const auto& d : p) d.loadAC(om, v, r); });
+                if (bsim4) bsim4->loadAC(om, v);
             }
             if (opt.gshunt != 0)
                 for (int i = 0; i < numNodes; i++) w.val[diag[i]] += opt.gshunt;
@@ -583,6 +598,7 @@ struct Circuit {
             d->charges(charges);
         }
         for (Charge* q : charges) q->start();
+        if (bsim4) { bsim4->accept(); bsim4->start(); }
         std::vector<double> bps;
         for (Device* d : devs) d->breaks(a.tstep, a.tstop, bps);
         bps.push_back(a.tstop);
@@ -626,6 +642,7 @@ struct Circuit {
             double room = 1e300;
             for (Charge* q : charges)
                 room = std::min(room, q->maxStep(hist, euler ? 1 : 2, opt.reltol, opt.abstol, opt.trtol, opt.chgtol));
+            if (bsim4) room = std::min(room, bsim4->maxStep(hist, euler ? 1 : 2, opt));
             double hnew = std::min(2 * h, euler ? room : std::sqrt(room));
             if (hnew < 0.9 * h && h > 4 * hmin) {
                 std::copy(x0.begin(), x0.end(), x);
@@ -634,6 +651,7 @@ struct Circuit {
                 continue;
             }
             eachPool([&](auto& p) { for (auto& d : p) d.accept(c); });
+            if (bsim4) bsim4->accept();
             t = c.time;
             x0.assign(x, x + n);
             hist[2] = hist[1]; hist[1] = h;
@@ -732,7 +750,10 @@ private:
             for (size_t i = 3; i < k.tok.size(); i++) {
                 auto eq = k.tok[i].find('=');
                 if (eq == std::string::npos) throw Error(k.where + ": model parameter '" + k.tok[i] + "' has no value");
-                try { m->p[k.tok[i].substr(0, eq)] = value(k.tok[i].substr(eq + 1), &e.sc); }
+                std::string key = k.tok[i].substr(0, eq), text = k.tok[i].substr(eq + 1);
+                // version=4.8.3 is a name, not a number: keep its "4.8".
+                if (key == "version") { m->p[key] = std::strtod(text.c_str(), nullptr); continue; }
+                try { m->p[key] = value(text, &e.sc); }
                 catch (const Error& x) { throw Error(k.where + ": " + x.what()); }
             }
             allModels_.push_back({e.prefix + m->name, m.get()});
@@ -817,6 +838,42 @@ private:
     void need(const Card& k, size_t ntok, const char* form) {
         if (k.tok.size() < ntok) throw Error(k.where + ": expected " + form);
     }
+
+    // A transistor of a BSIM4 model: every model and instance parameter goes
+    // to the model code, which knows their names.
+    void bsim4(const Card& k, Env& e, const Model& m, const std::string& name) {
+#ifdef MSPICE_BSIM4
+        if (!c_.bsim4) c_.bsim4 = makeBsim4();
+        auto [it, fresh] = bsim4Models_.try_emplace(&m, "");
+        if (fresh) {
+            // Models of the same name in different subcircuits are told apart.
+            it->second = m.name;
+            for (int k = 2; !bsim4ModelNames_.insert(it->second).second; k++) it->second = m.name + "#" + std::to_string(k);
+            Bsim4Set::Params p;
+            for (auto& [key, v] : m.p) {
+                m.used.insert(key);
+                if (key != "level") p[key] = v;
+            }
+            for (auto& bad : c_.bsim4->addModel(it->second, m.type == "pmos", p))
+                c_.warnings.push_back("model " + m.name + ": BSIM4 has no parameter '" + bad + "'");
+        }
+        if (c_.byName.count(name) || !bsim4Names_.insert(name).second)
+            throw Error("two elements are named '" + name + "'");
+        Args a = args(k, 6);
+        Bsim4Set::Params p;
+        for (auto& [key, text] : a.kv) p[key] = value(text, &e.sc);
+        for (auto& flag : a.pos) p[flag] = 1;
+        const auto& t = k.tok;
+        int nodes[4] = {node(e, t[1]), node(e, t[2]), node(e, t[3]), node(e, t[4])};
+        auto bad = c_.bsim4->addInstance(it->second, name, nodes, p);
+        if (!bad.empty()) throw Error(k.where + ": BSIM4 has no instance parameter '" + bad[0] + "'");
+#else
+        (void)e; (void)name;
+        throw Error(k.where + ": model '" + m.name + "' is BSIM4 (level 14/54), which this build of mspice leaves out");
+#endif
+    }
+    std::map<const Model*, std::string> bsim4Models_;
+    std::set<std::string> bsim4Names_, bsim4ModelNames_;
 
     Resistor* resistor(const std::string& name, int p, int n, double r, const Card& k) {
         if (!(r != 0) || !std::isfinite(r)) throw Error(k.where + ": resistance of '" + name + "' must not be zero");
@@ -966,9 +1023,13 @@ private:
             need(k, 6, "Mname drain gate source bulk model [w= l= ad= as= pd= ps= m=]");
             const Model* m = model(e, t[5]);
             if (!m || (m->type != "nmos" && m->type != "pmos")) throw Error("'" + t[5] + "' is not an nmos or pmos model");
+            if (int level = (int)m->get("level", 1); level == 14 || level == 54) {
+                bsim4(k, e, *m, name);
+                break;
+            }
             if (m->get("level", 1) != 1)
                 throw Error("model '" + t[5] + "' is MOSFET level " + std::to_string((int)m->get("level", 1)) +
-                            "; mspice has level 1 only so far");
+                            "; mspice has level 1 and BSIM4 (level 14 or 54)");
             Args a = args(k, 6);
             auto* d = c_.add<Mosfet>(name);
             d->type = m->type == "nmos" ? 1 : -1;
@@ -1401,7 +1462,7 @@ inline RunOutput runNetlist(const Netlist& nl, const std::map<std::string, doubl
     Builder b(nl, c, overrides);
     Controls ctl = b.build();
     c.pool_ = pool;
-    out.nodes = c.numNodes; out.unknowns = c.n; out.devices = c.devs.size();
+    out.nodes = c.numNodes; out.unknowns = c.n; out.devices = c.devs.size() + (c.bsim4 ? c.bsim4->size() : 0);
     // A scope for values on .measure lines.
     Scope sc;
     for (const Card& k : nl.top.cards)

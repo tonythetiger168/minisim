@@ -435,6 +435,17 @@ Spec references are IEEE 1800-2023 clauses.
   nodes) and `spice::Reader::readText()` for netlists held in memory.
   mspice now runs on the shared thread pool of `src/parallel.hpp`, which
   gains `Pool::spin()` for short batches that come one after the other.
+- `mspice`: BSIM4 transistors (`.model ... level=14` or `54`). The model
+  equations are the UC Berkeley BSIM Research Group's BSIM4 4.8.3 code,
+  unmodified under the Educational Community License 2.0
+  (`third_party/bsim4`, `THIRD_PARTY_NOTICES.md`), behind an adapter to
+  mspice's solver: DC, AC and transient, gate/body/source-drain resistance
+  networks and the NQS model, evaluated on all threads with identical
+  results. Checked against ngspice (same equations, within 1 to 2%); a
+  4,000-transistor chain runs in 3.2 s on one thread and 2.1 s on four
+  against 5.8 s. Build option `MINISIM_WITH_BSIM4`.
+- `mspice`: unknowns fixed by a voltage source to ground are eliminated
+  first, which keeps the pivots of a long chain of gain stages usable.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:

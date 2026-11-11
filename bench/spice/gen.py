@@ -55,6 +55,34 @@ def chain(n=2000):
     return o
 
 
+BSIM4 = """.model nch nmos level=54 version=4.8.3 toxe=1.8n vth0=0.4 u0=0.04 vsat=1.2e5 rdsw=150
++ k1=0.5 k2=-0.05 eta0=0.02 pclm=1.2 cgso=0.2n cgdo=0.2n cjs=1m cjd=1m cjsws=0.1n cjswd=0.1n
+.model pch pmos level=54 version=4.8.3 toxe=1.9n vth0=-0.42 u0=0.012 vsat=1.0e5 rdsw=250
++ k1=0.5 k2=-0.03 eta0=0.02 pclm=1.2 cgso=0.2n cgdo=0.2n cjs=1m cjd=1m cjsws=0.1n cjswd=0.1n
+.subckt inv a y vdd
+mp y a vdd vdd pch w=400n l=50n ad=40f as=40f pd=1u ps=1u
+mn y a 0 0 nch w=200n l=50n ad=20f as=20f pd=0.6u ps=0.6u
+.ends
+"""
+
+
+def chain4(n=2000):
+    o = ["BSIM4 inverter chain, %d stages" % n, BSIM4.rstrip(), "vdd vdd 0 1", "vin n0 0 pulse(0 1 100p 20p 20p 2n 4n)"]
+    for i in range(n):
+        o.append(f"x{i} n{i} n{i+1} vdd inv")
+    o += [".tran 2p 1.6n", ".meas tran d10 trig v(n0) val=0.5 rise=1 targ v(n10) val=0.5 rise=1",
+          ".meas tran d50 trig v(n0) val=0.5 rise=1 targ v(n50) val=0.5 rise=1", ".end"]
+    return o
+
+
+def ring4(n=101):
+    o = ["BSIM4 ring oscillator, %d stages" % n, BSIM4.rstrip(), "vdd vdd 0 1"]
+    for i in range(n):
+        o.append(f"x{i} n{i} n{(i+1) % n} vdd inv")
+    o += [".ic v(n0)=0", ".tran 5p 20n", ".meas tran period trig v(n0) val=0.5 rise=2 targ v(n0) val=0.5 rise=3", ".end"]
+    return o
+
+
 def ring(n=101):
     o = ["Ring oscillator, %d stages" % n, MODELS.rstrip(), "vdd vdd 0 3.3"]
     for i in range(n):
@@ -74,5 +102,6 @@ def mc():
 
 if __name__ == "__main__":
     d = sys.argv[1]
-    for name, fn in (("ladder", ladder), ("mesh", mesh), ("chain", chain), ("ring", ring), ("mc", mc)):
+    for name, fn in (("ladder", ladder), ("mesh", mesh), ("chain", chain), ("ring", ring), ("mc", mc),
+                     ("chain4", chain4), ("ring4", ring4)):
         open(f"{d}/{name}.cir", "w").write("\n".join(fn()) + "\n")
