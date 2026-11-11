@@ -16,6 +16,7 @@
 // stored by index and matrices are summed in netlist order, so the output is
 // the same bit for bit at any -threads.
 #include <chrono>
+#include <ctime>
 #include <cinttypes>
 #include <iostream>
 
@@ -34,7 +35,8 @@ std::string num(double v) {
 }
 
 struct Args {
-    std::string file, csv, vcd;
+    std::string file, csv, vcd, raw;
+    bool rawAscii = false;
     int threads = 0;
     bool quiet = false, stats = false;
     std::map<std::string, double> defines;
@@ -46,6 +48,7 @@ void usage() {
     std::cout << "usage: mspice [options] netlist.cir\n"
                  "  -o <prefix>    write <prefix>.<analysis>.csv with every computed point\n"
                  "  -vcd <file>    write the transient waveforms as a VCD (real variables)\n"
+                 "  -raw <file>    write every analysis to a SPICE raw file (binary; -raw-ascii <file> for text)\n"
                  "  -threads <n>   worker threads, or all (default: every logical CPU)\n"
                  "  -D name=value  set a .param (overrides the netlist)\n"
                  "  -q             print measurements and errors only\n"
@@ -85,19 +88,105 @@ void printTable(const Result& r) {
     }
 }
 
+// A SPICE raw file (the format of SPICE3 and ngspice, which waveform viewers
+// read): one plot per analysis and per .step run, all values real. An AC
+// plot holds the magnitudes and phases that were asked for.
+void writeRaw(const std::string& path, const std::string& title, const StepPlan& plan, const std::vector<RunOutput>& runs, bool ascii) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) throw Error("cannot write " + path);
+    char date[64] = "";
+    std::time_t now = std::time(nullptr);
+    std::strftime(date, sizeof date, "%a %b %d %H:%M:%S %Y", std::localtime(&now));
+    static const std::map<std::string, const char*> plotName = {
+        {"op", "Operating Point"}, {"dc", "DC transfer characteristic"}, {"ac", "AC Analysis"},
+        {"tran", "Transient Analysis"}, {"noise", "Noise Spectral Density Curves"}, {"tf", "Transfer Function"},
+        {"sens", "Sensitivity Analysis"}};
+    auto typeOf = [](const std::string& n) {
+        if (n == "time") return "time";
+        if (n == "frequency") return "frequency";
+        if (n[0] == 'i' && n.find('(') != std::string::npos) return "current";
+        return "voltage";
+    };
+    for (size_t k = 0; k < runs.size(); k++)
+        for (const Result& r : runs[k].results) {
+            bool sweep = !r.xname.empty();
+            std::string name = plotName.at(r.kind);
+            if (runs.size() > 1) name += " (" + stepLabel(plan, k) + ")";
+            std::fprintf(f, "Title: %s\nDate: %s\nPlotname: %s\nFlags: real\n", title.c_str(), date, name.c_str());
+            std::fprintf(f, "No. Variables: %zu\nNo. Points: %zu\nVariables:\n", r.cols.size() + sweep, r.x.size());
+            size_t v = 0;
+            if (sweep) std::fprintf(f, "\t%zu\t%s\t%s\n", v++, r.xname.c_str(), typeOf(r.xname));
+            for (auto& c : r.cols) std::fprintf(f, "\t%zu\t%s\t%s\n", v++, c.c_str(), typeOf(c));
+            if (ascii) {
+                std::fprintf(f, "Values:\n");
+                for (size_t i = 0; i < r.x.size(); i++) {
+                    std::fprintf(f, " %zu", i);
+                    if (sweep) std::fprintf(f, "\t%.16e\n", r.x[i]);
+                    for (size_t c = 0; c < r.cols.size(); c++) std::fprintf(f, "\t%.16e\n", c < r.y[i].size() ? r.y[i][c] : 0.0);
+                    std::fprintf(f, "\n");
+                }
+            } else {
+                std::fprintf(f, "Binary:\n");
+                std::vector<double> row;
+                for (size_t i = 0; i < r.x.size(); i++) {
+                    row.clear();
+                    if (sweep) row.push_back(r.x[i]);
+                    for (size_t c = 0; c < r.cols.size(); c++) row.push_back(c < r.y[i].size() ? r.y[i][c] : 0.0);
+                    std::fwrite(row.data(), sizeof(double), row.size(), f);
+                }
+            }
+        }
+    std::fclose(f);
+}
+
+// After Monte Carlo runs: mean, sigma, lowest and highest of each measurement.
+void monteStats(const StepPlan& plan, const std::vector<RunOutput>& runs, const Args& a) {
+    if (a.quiet || runs.size() < 2) return;
+    if (std::find(plan.names.begin(), plan.names.end(), "monte") == plan.names.end()) return;
+    std::vector<std::string> order;
+    std::map<std::string, std::vector<double>> vals;
+    for (auto& run : runs)
+        for (auto& r : run.results)
+            for (auto& m : r.meas) {
+                if (!vals.count(m.first)) order.push_back(m.first);
+                if (std::isfinite(m.second)) vals[m.first].push_back(m.second);
+                else vals[m.first];
+            }
+    if (order.empty()) return;
+    std::printf("monte carlo: %zu runs\n", runs.size());
+    std::printf("  %-20s %-14s %-14s %-14s %-14s\n", "measure", "mean", "sigma", "min", "max");
+    for (auto& name : order) {
+        const std::vector<double>& v = vals[name];
+        if (v.empty()) { std::printf("  %-20s failed\n", name.c_str()); continue; }
+        double sum = 0, lo = v[0], hi = v[0];
+        for (double x : v) { sum += x; lo = std::min(lo, x); hi = std::max(hi, x); }
+        double mean = sum / v.size(), var = 0;
+        for (double x : v) var += (x - mean) * (x - mean);
+        double sigma = v.size() > 1 ? std::sqrt(var / (v.size() - 1)) : 0;
+        std::printf("  %-20s %-14s %-14s %-14s %-14s\n", name.c_str(), num(mean).c_str(), num(sigma).c_str(), num(lo).c_str(), num(hi).c_str());
+    }
+}
+
 void report(const RunOutput& out, const Args& a) {
     for (const Result& r : out.results) {
         if (!a.quiet) {
             if (r.kind == "op") {
                 std::printf("operating point\n");
                 for (size_t i = 0; i < r.cols.size(); i++) std::printf("  %-20s = %s\n", r.cols[i].c_str(), num(r.y[0][i]).c_str());
+            } else if (r.kind == "tf" || r.kind == "sens") {
+                std::printf("%s %s\n", r.kind == "tf" ? "transfer function" : "dc sensitivity", r.text.empty() ? "" : r.text[0].c_str());
             } else if (!r.printed.empty()) {
                 std::printf("%s analysis\n", r.kind.c_str());
                 printTable(r);
             } else {
                 std::printf("%s analysis: %zu points\n", r.kind.c_str(), r.x.size());
             }
+            if (r.kind != "tf" && r.kind != "sens")
+                for (auto& l : r.text) std::printf("%s\n", l.c_str());
         }
+        // These few numbers are the whole result: printed with -q too, like measurements.
+        if (r.kind == "tf" || r.kind == "sens")
+            for (size_t i = 0; i < r.cols.size(); i++) std::printf("%s = %s\n", r.cols[i].c_str(), num(r.y[0][i]).c_str());
         if (a.stats)
             std::printf("  %s: %zu Newton iterations, %zu steps accepted, %zu rejected\n", r.kind.c_str(), r.iterations,
                         r.accepted, r.rejected);
@@ -204,6 +293,8 @@ int main(int argc, char** argv) {
         }
         if (s == "-o") a.csv = next();
         else if (s == "-vcd") a.vcd = next();
+        else if (s == "-raw") a.raw = next();
+        else if (s == "-raw-ascii") { a.raw = next(); a.rawAscii = true; }
         else if (s == "-q") a.quiet = true;
         else if (s == "-stats") a.stats = true;
         else if (s == "-flatten") a.flatten = true;
@@ -227,9 +318,10 @@ int main(int argc, char** argv) {
 
     try {
         auto t0 = std::chrono::steady_clock::now();
-        Netlist nl = Reader().read(a.file);
+        std::vector<Netlist> decks = Reader().readAll(a.file);
+        Netlist& nl0 = decks[0];
         if (a.flatten) {
-            Flat f = flatten(nl, a.top);
+            Flat f = flatten(nl0, a.top);
             if (!a.top.empty()) {
                 std::printf(".ports");
                 for (auto& p : f.ports) std::printf(" %s", p.c_str());
@@ -244,10 +336,22 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-        StepPlan plan = stepPlan(nl, a.defines);
-        std::vector<RunOutput> runs(plan.sets.size());
         Pool pool(threads);
         pool.spin(20000);   // about 0.1 ms: one batch per Newton iteration, back to back
+        bool failed = false;
+        std::set<std::string> warned;
+        // One pass per deck: the netlist itself, then one per .alter block.
+        for (size_t d = 0; d < decks.size(); d++) {
+        const Netlist& nl = decks[d];
+        // Output files of an .alter deck get ".altN" before the extension.
+        auto fileOf = [&](std::string path) {
+            if (d == 0) return path;
+            auto dot = path.find_last_of('.');
+            std::string tag = ".alt" + std::to_string(d);
+            return dot == std::string::npos ? path + tag : path.substr(0, dot) + tag + path.substr(dot);
+        };
+        StepPlan plan = stepPlan(nl, a.defines);
+        std::vector<RunOutput> runs(plan.sets.size());
         auto overridesOf = [&](size_t k) {
             std::map<std::string, double> o = a.defines;
             for (size_t i = 0; i < plan.names.size(); i++) o[plan.names[i]] = plan.sets[k][i];
@@ -260,15 +364,14 @@ int main(int argc, char** argv) {
             pool.run(runs.size(), [&](size_t k) { runs[k] = runNetlist(nl, overridesOf(k), nullptr); });
         }
         if (!a.quiet) {
+            if (d > 0) std::printf("alter %zu of %zu%s%s\n", d, decks.size() - 1, nl.alter.empty() ? "" : ": ", nl.alter.c_str());
             std::printf("mspice %s: %s\n", MINISIM_VERSION, nl.title.c_str());
             std::printf("%zu nodes, %zu elements, %zu unknowns, %d thread%s\n", runs[0].nodes, runs[0].devices,
                         runs[0].unknowns, threads, threads == 1 ? "" : "s");
         }
-        std::set<std::string> warned;
         for (auto& r : runs)
             for (auto& w : r.warnings)
                 if (warned.insert(w).second) std::cerr << "mspice: warning: " << w << "\n";
-        bool failed = false;
         for (size_t k = 0; k < runs.size(); k++) {
             if (runs.size() > 1) std::printf("step %zu of %zu: %s\n", k + 1, runs.size(), stepLabel(plan, k).c_str());
             report(runs[k], a);
@@ -276,13 +379,15 @@ int main(int argc, char** argv) {
                 for (auto& m : r.meas)
                     if (!std::isfinite(m.second)) failed = true;
         }
-        if (!a.csv.empty()) writeCsv(a.csv, plan, runs);
+        monteStats(plan, runs, a);
+        if (!a.csv.empty()) writeCsv(fileOf(a.csv), plan, runs);
+        if (!a.raw.empty()) writeRaw(fileOf(a.raw), nl.title, plan, runs, a.rawAscii);
         if (!a.vcd.empty()) {
             bool any = false;
             for (size_t k = 0; k < runs.size(); k++)
                 for (auto& r : runs[k].results) {
                     if (r.kind != "tran") continue;
-                    std::string path = a.vcd;
+                    std::string path = fileOf(a.vcd);
                     if (runs.size() > 1) {
                         auto dot = path.find_last_of('.');
                         std::string tag = "." + std::to_string(k + 1);
@@ -293,6 +398,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             if (!any) std::cerr << "mspice: warning: -vcd needs a .tran analysis; nothing written\n";
+        }
         }
         if (a.stats) {
             double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
