@@ -191,3 +191,7 @@ under a second.
 `check.hpp` (`equiv::check(aig, ref, impl, options)` returns every compare
 point with its status and counterexample). The SAT solver is CaDiCaL behind
 `src/sat.hpp`, the interface the other minisim tools share.
+
+A part-select above a select whose index is not constant (`mem[addr][7:0] <= ...`, a
+byte-lane write) is taken as a possible write to every word the index can reach; the
+part-select narrows the write itself, not the set of bits the block is known to drive.

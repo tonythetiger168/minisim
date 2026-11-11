@@ -869,6 +869,12 @@ private:
     // `partial`: when an index is not constant, return the enclosing range.
     // An out-of-range constant index gives w == 0.
     bool staticRange(const Expression& e, bool symbolic, bool partial, Claim& out) {
+        bool dyn = false;
+        return staticRange(e, symbolic, partial, out, dyn);
+    }
+    // dyn: a select below e has an index that is not constant, so 'out' is everything that
+    // select could reach and a constant select above it (mem[addr][7:0]) must not narrow it.
+    bool staticRange(const Expression& e, bool symbolic, bool partial, Claim& out, bool& dyn) {
         if (const Symbol* s = valueSym(e)) {
             if (!isSignal(*s)) return false;
             out = {s, 0, widthOf(*e.type)};
@@ -877,14 +883,17 @@ private:
         if (e.kind == ExpressionKind::Conversion) {
             auto& c = e.as<ConversionExpression>();
             if (widthOf(*c.operand().type) != widthOf(*e.type)) return false;
-            return staticRange(c.operand(), symbolic, partial, out);
+            return staticRange(c.operand(), symbolic, partial, out, dyn);
         }
         if (!isSelect(e)) return false;
         Level L = level(e, symbolic, false);
         Claim p;
-        if (!staticRange(*L.parent, symbolic, partial, p)) return false;
+        if (!staticRange(*L.parent, symbolic, partial, p, dyn)) return false;
         if (!L.isConst) {
             if (!partial) return false;
+            dyn = true;
+        }
+        if (dyn) {
             out = p;
             return true;
         }

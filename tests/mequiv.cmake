@@ -87,3 +87,7 @@ check(1 "FAIL  output      q[1]" -ref flat.sv -impl flat_gates.v -lib cells.lib 
 # failing register with the other polarity. A wrong gate still fails.
 check(0 "1 stored inverted" -ref invint.sv -impl invint_gates.v -lib cells.lib)
 check(1 "Verification FAILED" -ref invint.sv -impl invint_gates.v -lib cells.lib +define+BUG)
+
+# A memory written one byte lane at a time (mem[addr][7:0] <= ...) against the word-wide form.
+check(0 "Verification SUCCEEDED" -ref lanes_word.sv -impl lanes.sv)
+check(1 "Verification FAILED" -ref lanes_word.sv -impl lanes.sv +define+BUG)
