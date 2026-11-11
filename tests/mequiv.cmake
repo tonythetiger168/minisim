@@ -93,6 +93,12 @@ check(0 "Verification SUCCEEDED" -ref lanes_word.sv -impl lanes.sv)
 check(1 "Verification FAILED" -ref lanes_word.sv -impl lanes.sv +define+BUG)
 
 # Registers stuck at their reset value, replaced by the constant in the implementation.
-check(0 "5 reference flops stuck at their reset value" -ref stuck.sv -impl stuck.sv +define+FOLDED)
+check(0 "5 reference flops read as a constant" -ref stuck.sv -impl stuck.sv +define+FOLDED)
 check(1 "Verification FAILED" -ref stuck.sv -impl stuck.sv +define+FOLDED +define+BUG)
 check(1 "Unmatched reference state: 5" -noconstreg -ref stuck.sv -impl stuck.sv +define+FOLDED)
+
+# Synthesis don't-cares in the reference: (* full_case *), a register that only loads one
+# constant, a register never given a value.
+check(0 "5 reference flops read as a constant" -ref dontcare.sv -impl dontcare.sv +define+FOLDED)
+check(1 "Verification FAILED" -ref dontcare.sv -impl dontcare.sv +define+FOLDED +define+BUG)
+check(1 "latch" -nofullcase -ref dontcare.sv -impl dontcare.sv +define+FOLDED)

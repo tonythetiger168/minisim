@@ -410,6 +410,8 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
     // set or reset to c and a next state that is c whenever it holds c, never
     // leaves c once reset. Synthesis replaces it with c; read it that way.
     // This takes the reset as applied, which is what such a netlist assumes.
+    // The same goes for a flop that only ever loads one constant (taken as
+    // clocked once) and one that is never given a definite value at all.
     std::unordered_map<uint32_t, Lit> konst;
     if (opt.constRegs) {
         auto orTerms = [&](Lit root) {
@@ -440,6 +442,32 @@ inline Result checkOnce(Aig& g, const Design& ref, Design& impl, const CheckOpti
             for (size_t r = 0; r < ref.states.size(); ++r) {
                 const State& st = ref.states[r];
                 if (refSt[r] || st.latch || st.trig.x != kFalse || konst.count(nodeOf(st.q))) continue;
+                // No definite value other than c is ever stored: every load is c
+                // (or X), whatever the flop holds. With both c, nothing definite is
+                // ever stored and the flop is unknown for good; synthesis ties it
+                // to 0 and any fixed value is a legitimate reading of it.
+                {
+                    auto m = konst;
+                    Lit v = g.rebuildSparse(st.next.v, m), x = g.rebuildSparse(st.next.x, m);
+                    bool is0 = g.or_(x, neg(v)) == kTrue, is1 = g.or_(x, v) == kTrue;
+                    if (!is0 && !is1) {
+                        // Or it only ever keeps what it has.
+                        bool keep[2];
+                        for (int k = 0; k < 2; ++k) {
+                            auto mk = konst;
+                            mk[nodeOf(st.q)] = k ? kTrue : kFalse;
+                            Lit vk = g.rebuildSparse(st.next.v, mk), xk = g.rebuildSparse(st.next.x, mk);
+                            keep[k] = g.or_(xk, k ? vk : neg(vk)) == kTrue;
+                        }
+                        is0 = keep[0] && keep[1];
+                    }
+                    if (is0 || is1) {
+                        konst[nodeOf(st.q)] = is0 ? kFalse : kTrue;
+                        res.constStates.push_back(st.name);
+                        again = true;
+                        continue;
+                    }
+                }
                 auto terms = orTerms(st.trig.v);
                 if (terms.size() < 2) continue;
                 Lit c = kNoLit;

@@ -135,7 +135,8 @@ thread count.
 | `-lib FILE` | Liberty library for cells with no Verilog definition |
 | `-blackbox MOD` | do not look inside MOD |
 | `-noclockgate` | compare gated clocks as they are, without turning them into enables |
-| `-noconstreg` | do not read a reference flop stuck at its reset value as a constant |
+| `-nofullcase` | ignore `(* full_case *)`: a case with no matching arm keeps the old value |
+| `-noconstreg` | do not read a reference flop that can hold only one value as a constant |
 | `-threads N` | worker threads (default: all logical cores) |
 | `-effort N` | SAT conflicts allowed per compare point (default 2000000) |
 | `-maxfail N` | failing points printed in detail (default 10) |
@@ -209,3 +210,20 @@ before the first reset the RTL register is unknown and the netlist's constant is
 one of the values it may have. `-noconstreg` compares with the register left
 free, and such a design then fails. A register the implementation still has is
 never treated this way.
+
+The same reading covers two more shapes with no reset involved: a flop that
+only ever loads one constant (taken as clocked once), and a flop that is never
+given a definite value at all (never assigned, or only assigned `'x`). The last
+is unknown for good in the RTL; synthesis ties it to 0 and mequiv reads it as 0.
+
+### Don't-cares in the reference
+
+An X in the reference matches anything in the implementation, as it does in
+simulation-based sign-off and in commercial checkers by default. Sources of X:
+an explicit `'x` assignment, an out-of-range index, `unique`/`priority` case with
+no arm matching, and `(* full_case *)` on a case with no default: the attribute
+says the missing values never occur, so the signals the case assigns are
+don't-cares there instead of holding their old value (which in a combinational
+block would be a latch). `-nofullcase` gives the plain Verilog reading back.
+PicoRV32 synthesized by msynth on mini45 proves equivalent with these readings
+(3553 compare points, about 0.3 s).
