@@ -67,6 +67,7 @@ struct ExtractedFsm {
     bool onehot = false;      // tested bit by bit: only values with one bit set are states
     bool caseOnState = false; // the logic has a case on the register (or case (1'b1) on its bits) ...
     bool caseDefault = false; // ... and every such case has a default item
+    bool caseFull = false;    // ... and every such case without a default is unique, priority or (* full_case *)
     std::vector<std::pair<uint64_t, std::string>> states;   // value, name; in value order
     struct Tr {
         uint64_t from, to;
@@ -228,7 +229,7 @@ struct FsmExtractor {
         std::map<uint64_t, std::string>& names;
         int ifDepth = 0, splitDepth = 0;
         bool split = false, bad = false, onehot = false;
-        bool caseOnState = false, caseDefault = true;
+        bool caseOnState = false, caseDefault = true, caseFull = true;
         slang::SourceLocation at;   // the assignment being followed
 
         // e is X[K] with a constant K: the value with only that bit set.
@@ -401,7 +402,13 @@ struct FsmExtractor {
                     }
                     split = true;
                     caseOnState = true;
-                    if (!c.defaultCase) caseDefault = false;
+                    if (!c.defaultCase) {
+                        caseDefault = false;
+                        bool full = c.check != UniquePriorityCheck::None;
+                        for (const AttributeSymbol* a : scope->getCompilation().getAttributes(c))
+                            if (a->name == "full_case") full = true;
+                        if (!full) caseFull = false;
+                    }
                     std::set<uint64_t> covered;
                     Map out;
                     splitDepth++;
@@ -489,6 +496,7 @@ struct FsmExtractor {
                 iv.onehot = iv.onehot || in.onehot;
                 iv.caseOnState = iv.caseOnState || in.caseOnState;
                 iv.caseDefault = iv.caseDefault && in.caseDefault;
+                iv.caseFull = iv.caseFull && in.caseFull;
                 auto subst = [&](const Set& sv, const Set& sn) {
                     Set r;
                     for (auto& [v, f] : sv) {
@@ -535,6 +543,7 @@ struct FsmExtractor {
             d.onehot = iv.onehot;
             d.caseOnState = iv.caseOnState;
             d.caseDefault = iv.caseOnState && iv.caseDefault;
+            d.caseFull = iv.caseOnState && iv.caseFull;
             for (uint64_t st : states) {
                 auto nm = names.find(st);
                 char b[40];
