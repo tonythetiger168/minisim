@@ -14,6 +14,22 @@ foreach(t gating retention states)
   endif()
 endforeach()
 
+# UPF is Tcl (5.1): the same intent written with proc, foreach, if, expr and
+# [command] substitution simulates the same.
+execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/tcl.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ ${D}/gating.out want)
+if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
+  message(FATAL_ERROR "tcl.upf: ${rc}\n${out}${err}")
+endif()
+# An error inside a proc called from a loop is reported where it is.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badtcl.upf "proc p {d} {\n  create_power_domain $d -update\n}\nforeach d {A B} { p $d }\n")
+execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/badtcl.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "badtcl.upf:2: -update of unknown domain A")
+  message(FATAL_ERROR "an error in a UPF proc was not reported: ${rc}\n${out}${err}")
+endif()
+
 # -power_top names the instance the UPF describes; it wins over set_design_top.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)

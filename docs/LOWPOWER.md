@@ -56,7 +56,8 @@ turned on.
 | `set_level_shifter` (9.9) | `x` when its input or output supply (by default the two domains' primary supplies) is not `NORMAL` |
 | `set_retention` (9.7) | single control (`{ret high}` / `{ret low}`: saved on entry, held through power-down, shown again at power-up, released when the control falls), or separate save and restore signals (edge or level), `-save_event_condition`, `-restore_event_condition`, `-restore_period_condition`, `-powerdown_period_condition`, `-retention_supply` with `RET_SUP_COR` / `NO_RET_SUP_COR`, `SAV_RES_COR`, `-use_retention_as_primary` |
 | `create_pst`, `add_port_state`, `add_pst_state` (legacy) | when a time step settles, the supplies must match a row of every PST |
-| `upf_version`, `set_scope`, `set_design_top`, `load_upf`, Tcl `set` and `$var` | yes |
+| `upf_version`, `set_scope`, `set_design_top`, `load_upf` | yes |
+| Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
 
 `initial` blocks are never gated, so testbench and model initialization code
 keeps running in a powered-off domain (9.2.1). Errors print as
@@ -73,9 +74,8 @@ other implementation commands are read and ignored with a note.
 Isolation and level shifters sit on port connections between a parent and a
 child instance; a strategy on a port of the simulation top itself, or on a
 hierarchical reference, has no cell. `-applies_to flop` / `latch` of a
-retention strategy are not told apart. Supply ports connected to HDL ports
-(VCTs, 4.10), Tcl command substitution `[...]`, `foreach` and procedures are
-not supported.
+retention strategy are not told apart. Supply ports connected to HDL ports (VCTs, 4.10) are not supported. Tcl
+has no `namespace`, `upvar`, `regexp` or file I/O.
 
 ## Static checks: `mlint -upf`
 

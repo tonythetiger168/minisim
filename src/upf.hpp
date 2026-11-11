@@ -24,6 +24,8 @@
 #include <utility>
 #include <vector>
 
+#include "tcl.hpp"
+
 namespace upf {
 
 struct Error : std::runtime_error {
@@ -88,13 +90,14 @@ inline int simstateOf(const std::string& s) {
     return -2;
 }
 
-// ------------------------------------------------------------- Tcl subset
-// UPF is Tcl (5.1). The reader takes commands one per line or separated by
-// ';', '\' line continuation, '#' comments, {braced} words (no
-// substitution), "quoted" words and bare words with $var and ${var}
-// substitution, and `set var value`. Command substitution [...] is not
-// evaluated: a word that holds one is an error, except that brackets inside
-// a name (gen[0]) are kept as text.
+// -------------------------------------------------------------------- Tcl
+// UPF is Tcl (5.1). The reader is the tool line's Tcl interpreter
+// (tcl.hpp): variables and arrays, [command] substitution, braces and
+// quotes, expr, if / foreach / for / while, proc, list and string commands,
+// catch, source. Every command Tcl does not know is a UPF command: it is
+// handed to onCmd as it is reached, so its result can be used by the Tcl
+// around it (foreach d [find_objects ...] { ... }). A bus index in a name
+// (gen[0], d[7:0]) is kept as text.
 struct Cmd {
     std::string file;
     int line = 0;
@@ -136,131 +139,72 @@ inline std::vector<std::string> splitList(const std::string& s) {
     return out;
 }
 
-struct Reader {
-    std::map<std::string, std::string> vars;
-    std::vector<Cmd> cmds;
+struct Reader : tcl::Interp {
+    std::vector<Cmd> cmds;                          // the UPF commands, when there is no onCmd
+    std::function<std::string(const Cmd&)> onCmd;   // runs one UPF command; its result is the Tcl result
 
-    std::string subst(const std::string& w, const Cmd& at) {
-        std::string r;
-        for (size_t i = 0; i < w.size(); i++) {
-            if (w[i] == '\\' && i + 1 < w.size()) { r += w[++i]; continue; }
-            if (w[i] != '$') { r += w[i]; continue; }
-            std::string name;
-            if (i + 1 < w.size() && w[i + 1] == '{') {
-                size_t e = w.find('}', i + 2);
-                if (e == std::string::npos) throw Error(at.where() + ": unterminated ${");
-                name = w.substr(i + 2, e - i - 2);
-                i = e;
-            } else {
-                size_t j = i + 1;
-                while (j < w.size() && (std::isalnum((unsigned char)w[j]) || w[j] == '_')) j++;
-                name = w.substr(i + 1, j - i - 1);
-                i = j - 1;
-            }
-            if (name.empty()) { r += '$'; continue; }
-            auto it = vars.find(name);
-            if (it == vars.end()) throw Error(at.where() + ": can't read \"" + name + "\": no such variable");
-            r += it->second;
-        }
-        return r;
+    Reader() {
+        busBrackets = true;
+        onUnknown = [this](const std::vector<std::string>& w, std::string& res) {
+            Cmd c;
+            c.file = file_;
+            c.line = line_;
+            c.w = w;
+            if (!onCmd) { cmds.push_back(std::move(c)); return true; }
+            // a UPF error is a Tcl error: catch {...} sees it, and the read stops at the first one
+            try { res = onCmd(c); } catch (const Error& e) { throw tcl::Error(e.what()); }
+            return true;
+        };
     }
 
-    // Parse text into commands. `set` is evaluated here, so later words see
-    // the variable.
+    // Runs `text`. The first error of the script is thrown, with its file and line.
     void parse(const std::string& text, const std::string& file) {
-        size_t i = 0, n = text.size();
-        int line = 1;
-        while (i < n) {
-            // skip blank space and command separators
-            while (i < n && (std::isspace((unsigned char)text[i]) || text[i] == ';')) {
-                if (text[i] == '\n') line++;
-                i++;
+        size_t before = diags.size();
+        tcl::Interp::parse(text, file);
+        raise(before);
+    }
+    void load(const std::string& path) { parse(slurp(path), path); }
+
+    // load_upf: runs another file in this interpreter, so variables and procs are shared.
+    void include(const std::string& path) {
+        std::string text = slurp(path);
+        std::string savedFile = file_;
+        int savedLine = line_;
+        struct Back { Reader& r; std::string f; int l; ~Back() { r.file_ = f; r.line_ = l; } } back{*this, savedFile, savedLine};
+        file_ = path;
+        size_t before = diags.size();
+        try { eval(text, 1); } catch (const Ret&) {}
+        // an error in the file ends the load_upf command that read it
+        for (size_t i = before; i < diags.size(); i++)
+            if (diags[i].sev == tcl::Diag::ErrorSev) {
+                std::string m = located(diags[i]);
+                diags.resize(before);
+                throw Error(m);
             }
-            if (i >= n) break;
-            if (text[i] == '#') {   // a comment runs to the end of the line (a '\' continues it)
-                while (i < n && text[i] != '\n') {
-                    if (text[i] == '\\' && i + 1 < n && text[i + 1] == '\n') { i++; line++; }
-                    i++;
-                }
-                continue;
-            }
-            Cmd c;
-            c.file = file;
-            c.line = line;
-            for (;;) {
-                // blanks inside a command; backslash-newline is a blank
-                while (i < n) {
-                    if (text[i] == '\\' && i + 1 < n && (text[i + 1] == '\n' || text[i + 1] == '\r')) {
-                        i += text[i + 1] == '\r' && i + 2 < n && text[i + 2] == '\n' ? 3 : 2;
-                        line++;
-                        continue;
-                    }
-                    if (text[i] == ' ' || text[i] == '\t' || text[i] == '\r') { i++; continue; }
-                    break;
-                }
-                if (i >= n || text[i] == '\n' || text[i] == ';') break;
-                std::string w;
-                if (text[i] == '{') {
-                    int d = 1;
-                    i++;
-                    size_t st = i;
-                    while (i < n && d) {
-                        if (text[i] == '\\' && i + 1 < n) { if (text[i + 1] == '\n') line++; i += 2; continue; }
-                        if (text[i] == '{') d++;
-                        else if (text[i] == '}') d--;
-                        if (text[i] == '\n') line++;
-                        i++;
-                    }
-                    if (d) throw Error(file + ":" + std::to_string(c.line) + ": missing close-brace");
-                    w = text.substr(st, i - st - 1);
-                    // backslash-newline inside braces is a blank (Tcl rule 9)
-                    std::string t;
-                    for (size_t k = 0; k < w.size(); k++) {
-                        if (w[k] == '\\' && k + 1 < w.size() && w[k + 1] == '\n') { t += ' '; k++; continue; }
-                        t += w[k];
-                    }
-                    w = t;
-                } else if (text[i] == '"') {
-                    i++;
-                    std::string raw;
-                    while (i < n && text[i] != '"') {
-                        if (text[i] == '\\' && i + 1 < n) { raw += text[i]; raw += text[i + 1]; i += 2; continue; }
-                        if (text[i] == '\n') line++;
-                        raw += text[i++];
-                    }
-                    if (i >= n) throw Error(file + ":" + std::to_string(c.line) + ": missing \"");
-                    i++;
-                    w = subst(raw, c);
-                } else {
-                    std::string raw;
-                    int br = 0;
-                    while (i < n) {
-                        char ch = text[i];
-                        if (ch == '[') br++;
-                        if (ch == ']') br--;
-                        if (br <= 0 && (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == ';')) break;
-                        if (ch == '\\' && i + 1 < n) {
-                            if (text[i + 1] == '\n') break;
-                            raw += ch; raw += text[i + 1]; i += 2; continue;
-                        }
-                        raw += ch;
-                        i++;
-                    }
-                    if (!raw.empty() && raw[0] == '[')
-                        throw Error(file + ":" + std::to_string(c.line) + ": command substitution [...] is not supported");
-                    w = subst(raw, c);
-                }
-                c.w.push_back(w);
-            }
-            if (c.w.empty()) continue;
-            if (c.w[0] == "set") {
-                if (c.w.size() == 3) vars[c.w[1]] = c.w[2];
-                else if (c.w.size() != 2) throw Error(c.where() + ": set needs a name and a value");
-                continue;
-            }
-            if (c.w[0] == "puts") continue;
-            cmds.push_back(std::move(c));
+    }
+
+    static std::string slurp(const std::string& path) {
+        std::ifstream f(path);
+        if (!f) throw Error("cannot read UPF file " + path);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
+    // "file:line: text"; a UPF command's own message already starts that way.
+    static std::string located(const tcl::Diag& d) {
+        size_t c = d.text.find(": ");
+        if (c != std::string::npos && c > 1) {
+            size_t k = c;
+            while (k > 0 && std::isdigit((unsigned char)d.text[k - 1])) k--;
+            if (k < c && k > 0 && d.text[k - 1] == ':') return d.text;
         }
+        return d.loc.str() + ": " + d.text;
+    }
+
+private:
+    void raise(size_t before) {
+        for (size_t i = before; i < diags.size(); i++)
+            if (diags[i].sev == tcl::Diag::ErrorSev) throw Error(located(diags[i]));
     }
 };
 
@@ -687,17 +631,16 @@ struct Model {
     void load(const std::string& path, const std::string& powerTop) {
         top = powerTop;
         Reader r;
-        readFile(r, path);
         std::string scope;
-        run(r.cmds, scope, r, path);
+        r.onPuts = [this](const std::string& t) { if (out) *out << t << "\n"; };
+        r.onCmd = [&](const Cmd& c) {
+            run({c}, scope, r, c.file);
+            return std::string();
+        };
+        r.load(path);
+        for (auto& d : r.diags) warnings.push_back(Reader::located(d));
     }
-    static void readFile(Reader& r, const std::string& path) {
-        std::ifstream f(path);
-        if (!f) throw Error("cannot read UPF file " + path);
-        std::stringstream ss;
-        ss << f.rdbuf();
-        r.parse(ss.str(), path);
-    }
+    std::ostream* out = &std::cout;   // where Tcl puts goes
 
     struct Opts {
         std::multimap<std::string, std::string> v;
@@ -780,7 +723,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             } else if (s != ".") scope = join(scope, s);
             continue;
         }
-        if (n == "load_upf" || n == "source") {
+        if (n == "load_upf") {
             Opts o = opts(c, {});
             need(o, 1, "a file");
             std::string p = o.pos[0];
@@ -790,11 +733,8 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             }
             std::string saved = scope;
             if (o.has("-scope")) scope = join(scope, o.get("-scope"));
-            Reader r;
-            r.vars = rd.vars;
-            readFile(r, p);
-            run(r.cmds, scope, r, p);
-            rd.vars = r.vars;
+            struct Back { std::string& s; std::string v; ~Back() { s = v; } } back{scope, saved};
+            rd.include(p);
             scope = saved;
             continue;
         }

@@ -37,6 +37,46 @@ int main() {
         }
         assert(threw);
     }
+    // Tcl (5.1): command substitution, foreach, proc, if, expr, lists; a bus
+    // index stays text; a UPF command's result is the value of [command]
+    {
+        Reader r;
+        r.onCmd = [&](const Cmd& c) {
+            r.cmds.push_back(c);
+            return c.w[0] == "find_objects" ? std::string("u_a u_b") : std::string();
+        };
+        r.parse("proc mkdom {name args} {\n"
+                "  create_power_domain PD_$name -elements $args\n"
+                "}\n"
+                "foreach i [find_objects . -pattern u_*] { mkdom [string toupper $i] $i }\n"
+                "set n [expr {[llength [find_objects . -pattern *]] * 2}]\n"
+                "if {$n == 4} { set_isolation iso$n -domain PD_U_A -elements {d[3] q[7:0]} } else { bad }\n"
+                "for {set k 0} {$k < 2} {incr k} { create_supply_net VDD$k }\n"
+                "set_level_shifter ls -domain PD_U_B -elements [list gen[0]/u x]\n"
+                "catch { nope_cmd } msg\n",
+                "t.upf");
+        std::vector<std::string> got;
+        for (auto& c : r.cmds) if (c.w[0] != "find_objects") got.push_back(tcl::joinList(c.w));
+        assert(got.size() == 7);
+        assert(got[0] == "create_power_domain PD_U_A -elements u_a" && r.cmds[1].line == 2);
+        assert(got[1] == "create_power_domain PD_U_B -elements u_b");
+        assert(got[2] == "set_isolation iso4 -domain PD_U_A -elements {d[3] q[7:0]}");
+        assert(got[3] == "create_supply_net VDD0" && got[4] == "create_supply_net VDD1");
+        auto els = splitList(r.cmds[7].w[5]);
+        assert(r.cmds[7].w[0] == "set_level_shifter" && els.size() == 2 && els[0] == "gen[0]/u" && els[1] == "x");
+        assert(got[6] == "nope_cmd");
+        // the first error of a script is thrown; a UPF command's error keeps its own place
+        r.onCmd = [](const Cmd& c) -> std::string { throw Error(c.where() + ": unknown UPF command " + c.w[0]); };
+        std::string msg;
+        try { r.parse("set a 1\nforeach x {1 2} {\n  zap $x\n}\n", "e.upf"); } catch (const Error& e) { msg = e.what(); }
+        assert(msg == "e.upf:3: unknown UPF command zap");
+        msg.clear();
+        try { r.parse("set a [expr {1 +}]\n", "e.upf"); } catch (const Error& e) { msg = e.what(); }
+        assert(msg.rfind("e.upf:1: ", 0) == 0);
+        // catch sees a UPF error and the read goes on
+        r.parse("if {[catch {zap 1} m]} { set seen $m }\n", "e.upf");
+        assert(r.get("seen") && r.get("seen")->find("unknown UPF command zap") != std::string::npos);
+    }
     // Expressions: precedence, unknowns, supply comparisons
     {
         EvalCtx c;
