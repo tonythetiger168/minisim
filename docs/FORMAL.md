@@ -57,9 +57,21 @@ property, `accept_on` or `reject_on`. The assertion is then reported
 finite failure exists; such an assumption gives a warning and only its safety
 part is used.
 
-Reported as `skipped`, with the reason: local variables and match items,
-multiclock properties, `.triggered` / `.matched`, concurrent assertions inside
-procedures, `expect`.
+Local variables (16.10) are followed when each is assigned once: by its
+declaration's initializer, or by a match item in the antecedent of an
+implication at the top level of an assertion (`(req, x = d) |-> ##2 q == x`),
+or anywhere in the sequence of a cover. The variable becomes a rigid unknown
+(state bits that never change): the assertion is proven for every value, a
+cover asks for some value. Skipped, with the reason: a variable assigned
+twice or inside a repetition, a match item under `or`, `not`, `s_eventually`
+or `until`, a subroutine call in a match item, local variables in an
+assumption.
+
+`s.triggered` (16.13.6) is the sequence's match in the current tick; the
+sequence itself may not have local variables.
+
+Reported as `skipped`, with the reason: multiclock properties, `.matched`,
+concurrent assertions inside procedures, `expect`.
 
 ## The model
 
@@ -81,6 +93,21 @@ procedures, `expect`.
   it drives becomes free in every cycle. A proof is still a proof (the model
   only has more behaviour), but a counterexample may be one the real design
   cannot show. The summary counts the cut signals and `-v` lists them.
+
+### Abstraction by option
+
+- `-blackbox NAME` leaves out every instance of the module `NAME` (or the
+  one instance with that path): nothing inside is modelled, its outputs are
+  free in every cycle, and properties inside it are reported as skipped.
+- `-cut SIGNAL` makes one signal a free input in every cycle, whatever
+  drives it.
+
+Both make the model an over-approximation: a proof still holds for the real
+design, while a failure may use a value the real design cannot produce (the
+trace shows the free values; a replay in the simulator will not reproduce
+such a failure). `-v` lists what was cut. Typical use: take a multiplier,
+a memory or a deep counter out of the cone of a property that does not
+depend on its exact value.
 
 ## How it works
 
@@ -130,6 +157,51 @@ inputs into the design, so the failure can be debugged in the simulator:
 msim rtl/*.sv mformal_out/top.u.a_push_counts_tb.sv -top mformal_replay
 ```
 
+## Apps
+
+`-app toggle` is unreachable-coverage analysis. For every bit of every
+signal of the design (not the top-level inputs or the clock) it asks two
+questions: can the bit be 0, and can it be 1, in some cycle after the reset?
+Only the targets that are proven unreachable are listed (`-v` lists all):
+
+```
+  toggle  top.u.dead==1     unreachable  (induction, k=8)
+  toggle  top.u.even[0]==1  unreachable  (induction, k=2)
+mformal: toggle: 30 targets on 15 signal bits: 27 reachable, 3 unreachable
+```
+
+Such a bit is stuck: toggle coverage on it can never close in simulation, so
+it is either dead logic or a coverage hole to waive. Assumptions apply, so a
+bit that only toggles outside the constraints is reported too. Signals wider
+than 4096 bits are skipped (`-toggle-max N`), and so are variables declared
+inside a procedure (loop counters). A target that is neither hit nor proven
+unreachable with a short budget is listed as bounded and counted as "not
+decided" (a bit of a wide counter, say); `-toggle-deep` spends the whole
+`-depth` and PDR budget on each of those. With `-Werror` an unreachable
+target makes the exit status 1.
+
+### Connectivity
+
+`-connect FILE` proves a connectivity specification, the usual check for pad
+multiplexers and top-level wiring. Each line is one connection:
+
+```
+# destination, source [, condition]
+pad,       scan,       test_en
+pad,       uart_tx,    !test_en && mode == 2'd1
+dbg,       core.pc[7:4]
+```
+
+A connection is proven as "in every cycle after the reset, whenever the
+condition holds, destination == source". Names are signals, with or without
+the top's name, and may select bits (`sig[3]`, `sig[7:4]`); both sides must
+have the same width. A condition is terms joined by `&&`, each `name`,
+`!name`, `name == number` or `name != number`. A wrong connection is
+falsified with a trace like any assertion. For each condition there is also
+a cover, `<name>.enabled`: when the condition can never hold (so the
+connection is only proven vacuously) it is listed as unreachable.
+Assumptions in the design apply. An error in the file is a usage error.
+
 ## Other model checkers (AIGER)
 
 `mformal ... -aiger model.aig` writes the model and stops without checking
@@ -149,7 +221,7 @@ visits every reachable state and compares with mformal's verdicts.
 ## Exit status
 
 0: nothing falsified. 1: an assertion was falsified (with `-Werror`, also an
-unreachable cover, an inconclusive or a skipped property). 2: a usage or
+unreachable cover or toggle target, an inconclusive or a skipped property). 2: a usage or
 front-end error.
 
 ## Testing

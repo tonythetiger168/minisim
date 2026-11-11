@@ -38,6 +38,7 @@ corner). A cell without a subcircuit keeps the template's numbers.
 | `cell_rise`, `cell_fall`, `rise_transition`, `fall_transition` of `combinational`, `rising_edge`, `falling_edge`, `preset` and `clear` arcs | one transient per table point: the related pin ramps with the index slew into the cell loaded with the index capacitance; delay between the input and output thresholds, transition between the slew thresholds |
 | `rise_constraint`, `fall_constraint` of `setup_*`, `hold_*`, `recovery_*`, `removal_*` | a bisection per table point on the offset between the pin's edge and the clock's: the smallest offset at which the cell still captures the right value and its clock-to-output delay is no more than 10% longer (`-degrade`) than with the pin far away (`-range`, 1 ns) |
 | `rise_power`, `fall_power` of `internal_power` | from the same transient as the delay: the energy drawn from the supply during the event, less leakage, less the energy delivered to the loads of the outputs that rose; shared equally by the outputs that move together and have a group for that pin |
+| `rise_power`, `fall_power` of an input pin's `internal_power` (no `related_pin`, a table over the input slew) | an edge on the pin in a state where no output moves and the stored state stays (the clock with the data equal to the output; an input masked by another): the energy drawn from the supply, less leakage. The charge on the pin itself comes from its driver and is not counted. One of the two edges can be negative, when the edge pushes charge back into the supply; the pair sums to the real loss. An output arc's table on the same related pin then holds what the event costs beyond this, because a power tool adds the two |
 | `cell_rise`, `cell_fall` and the transitions of a `three_state_enable` arc | the output starts undriven, with the other level left on its load by an earlier step of the stimulus, and the enable pin's edge makes the cell drive it; either edge of the pin is tried |
 | `min_pulse_width_high`, `min_pulse_width_low` of a pin | bisection on the width of a pulse (between the input thresholds, edges of four times the smallest table slew): the narrowest one after which the cell ends where a wide pulse leaves it, with the output no more than 10% later; never less than the edge time, where the pulse just reaches the rail |
 | `capacitance` (and `rise_capacitance`, `fall_capacitance` where the template has them) | the charge a ramp on the pin delivers, over the supply voltage; the mean of rising and falling |
@@ -68,7 +69,9 @@ the shortest sequence that ends in the wanted event:
 - for a tristate enable arc, a state where the output is undriven and still
   holds the level opposite to the one the cell is about to drive;
 - for a pulse width, a state where a pulse on the pin leaves an output
-  changed.
+  changed;
+- for input pin power, a state where the pin's edge changes no output and
+  not the stored state.
 
 The search runs on both power-up values of the state at once and accepts a
 sequence only when both give the same result, so the first steps of a
@@ -98,6 +101,4 @@ AOI, say) the first state found is used.
 - State-dependent tables that the template does not ask for with `when`
   (the worst case over side inputs); CCS and ECSM current-source models;
   on-chip variation (LVF) tables.
-- Clock-pin and other input-pin internal power (energy when no output
-  moves).
 - Noise and signal-integrity views.

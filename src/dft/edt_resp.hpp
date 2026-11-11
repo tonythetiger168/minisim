@@ -156,14 +156,15 @@ inline std::string writeEdtPatternTb(const std::vector<Port>& ports, const std::
         else tb << "  wire " << q.range() << q.name << ";\n";
     }
     tb << "  logic edt_mode = 1, edt_update = 0, edt_mask_in = 0;\n  logic [" << p.c - 1 << ":0] edt_channels_in = '0;\n  wire ["
-       << p.c - 1 << ":0] edt_channels_out;\n  int errors = 0, checks = 0, pattern = -1;\n  " << wrap << " dut (.*);\n"
+       << p.c - 1 << ":0] edt_channels_out;\n  int errors = 0, checks = 0, pattern = -1, flog = 0;\n  " << wrap << " dut (.*);\n"
        << "  task automatic cyc(input logic [" << p.c - 1 << ":0] in, input logic [" << p.c - 1 << ":0] exp, input logic ["
-       << p.c - 1 << ":0] care, input logic mk = 0);\n"
+       << p.c - 1 << ":0] care, input int sh = -1, input logic mk = 0);\n"
        << "    edt_channels_in = in; edt_mask_in = mk; #4;\n"
        << "    for (int k = 0; k < " << p.c << "; k++) if (care[k]) begin\n      checks++;\n"
        << "      if (edt_channels_out[k] !== exp[k]) begin\n        errors++;\n"
        << "        if (errors <= 20) $display(\"MISMATCH at %0t: pattern %0d channel %0d = %b, expected %b\", $time, pattern, k, "
           "edt_channels_out[k], exp[k]);\n"
+       << "        if (flog) $fdisplay(flog, \"%0d ch %0d %0d\", pattern, k, sh);\n"
        << "      end\n    end\n    #1 " << clk << " = 1; #5 " << clk << " = 0;\n  endtask\n  initial begin\n";
     // Held inputs (resets) at their values from the start.
     auto drive = [&](const std::string& pi) {
@@ -173,6 +174,9 @@ inline std::string writeEdtPatternTb(const std::vector<Port>& ports, const std::
     std::vector<size_t> seq;
     for (size_t i = 0; i < res.size() && (int)seq.size() < o.tbPatterns; i++)
         if (res[i].ok) seq.push_back(i);
+    // +faillog: the mismatches as a fail log for mdft -diagnose -edt_patterns.
+    tb << "    if ($test$plusargs(\"faillog\")) begin\n      flog = $fopen(\"" << wrap << ".faillog\", \"w\");\n"
+       << "      $fdisplay(flog, \"# <pattern> ch <channel> <unload cycle>\");\n      $fdisplay(flog, \"top " << top << "\");\n    end\n";
     if (!seq.empty()) drive(rs[seq[0]].pi);
     tb << "    " << se << " = " << seOn << ";\n    edt_update = 1; cyc('0, '0, '0); edt_update = 0;\n";
     const std::vector<std::string> zero(p.c, std::string(p.T, '0'));
@@ -198,13 +202,14 @@ inline std::string writeEdtPatternTb(const std::vector<Port>& ports, const std::
             }
             int mq = t - (p.T - p.mw);
             bool mk = p.xmask && cur && mq >= 0 && cur->mask[mq] == '1';
-            tb << "    cyc(" << vlog(in) << ", " << vlog(exp) << ", " << vlog(care) << (mk ? ", 1'b1" : "") << ");\n";
+            tb << "    cyc(" << vlog(in) << ", " << vlog(exp) << ", " << vlog(care) << ", " << t << (mk ? ", 1'b1" : "") << ");\n";
         }
         if (!cur) break;
         drive(cur->pi);
         tb << "    pattern = " << cs.ids[seq[q]] << "; " << se << " = " << seOff << "; edt_update = 1; cyc('0, '0, '0); edt_update = 0; "
            << se << " = " << seOn << ";\n";
     }
+    if (!seq.empty()) tb << "    if (flog) begin\n      $fdisplay(flog, \"last " << cs.ids[seq.back()] << "\");\n      $fclose(flog);\n    end\n";
     tb << "    if (errors == 0 && checks > 0) $display(\"" << name << ": PASS (%0d checks)\", checks);\n"
        << "    else $display(\"" << name << ": FAIL (%0d mismatches)\", errors);\n    $finish;\n  end\nendmodule\n";
     std::string path = o.outDir + "/" + name + ".sv";
