@@ -364,6 +364,24 @@ inline std::function<bool(slang::SourceLocation)>& hideMsgIf() {
     static std::function<bool(slang::SourceLocation)> f;
     return f;
 }
+// Is this instance inside protected IP (IEEE 1735 9.2)? True when its own
+// definition, or the definition of an instance above it, is protected code
+// the rights do not make visible: a path into or through protected IP is
+// opaque.
+inline const slang::ast::InstanceSymbol* instanceAround(const slang::ast::Scope* sc) {
+    for (; sc; sc = sc->asSymbol().getParentScope()) {
+        const slang::ast::Symbol& sy = sc->asSymbol();
+        if (sy.kind == slang::ast::SymbolKind::InstanceBody)
+            return sy.as<slang::ast::InstanceBodySymbol>().parentInstance;
+    }
+    return nullptr;
+}
+inline bool protectedInstance(const slang::ast::InstanceSymbol* inst) {
+    if (!hideMsgIf()) return false;
+    for (; inst; inst = instanceAround(inst->getParentScope()))
+        if (hideMsgIf()(inst->getDefinition().location)) return true;
+    return false;
+}
 inline void noteHidden(const slang::ast::Symbol& s, int first, int count) {
     if (hideSigIf() && hideSigIf()(s))
         for (int i = 0; i < count; i++) hiddenSigs().push_back(first + i);
@@ -529,6 +547,7 @@ inline ClassInfo* classInfo(const slang::ast::Type& t) {
 struct LowerResult {
     std::vector<std::unique_ptr<DpiFunc>> dpi;   // DPI imports and exports (35)
     std::vector<std::string> scopes;             // every instance and package, for svGetScopeFromName
+    std::vector<std::string> protScopes;         // those of `scopes` inside protected IP (IEEE 1735 9.7.2.3)
     std::unordered_map<const slang::ast::Symbol*, int> sigOf;   // variable / net -> signal (VPI, 37)
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
@@ -1803,6 +1822,12 @@ struct Lowerer {
             auto loc = call.sourceRange.start();
             c.fmt = std::string(srcMgr()->getFileName(loc));
             c.dline = (int)srcMgr()->getLineNumber(loc);
+            // A call from protected IP: svGetCallerInfo may not give the
+            // place in the IP author's source (IEEE 1735 9.7.2.3).
+            if (hideMsgIf() && hideMsgIf()(loc)) {
+                c.fmt = "<protected>";
+                c.dline = 0;
+            }
         }
         prog.emit(c);
         for (size_t n = 0; n < args.size(); n++) {
@@ -1911,6 +1936,7 @@ struct Lowerer {
         if (srcMgr()) {
             auto loc = call.sourceRange.start();
             site->file = std::string(srcMgr()->getFileName(loc));
+            site->prot = hideMsgIf() && hideMsgIf()(loc);
             site->line = (int)srcMgr()->getLineNumber(loc);
         }
         for (const Scope* sc = scope; sc; sc = sc->asSymbol().getParentScope()) {
@@ -10338,19 +10364,26 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     {   // DPI scope names (35.5.3): every instance and package
         struct Scopes : slang::ast::ASTVisitor<Scopes> {
             std::vector<std::string>* out;
+            std::vector<std::string>* prot;
             void handle(const slang::ast::InstanceSymbol& inst) {
                 if (!enterInstance(inst)) return;
                 out->push_back(inst.getHierarchicalPath());
+                if (protectedInstance(&inst)) prot->push_back(out->back());
                 visitDefault(inst);
             }
-            void handle(const slang::ast::PackageSymbol& p) { out->push_back(std::string(p.name)); }
+            void handle(const slang::ast::PackageSymbol& p) {
+                out->push_back(std::string(p.name));
+                if (hideMsgIf() && hideMsgIf()(p.location)) prot->push_back(out->back());
+            }
             void handle(const slang::ast::GenerateBlockSymbol& g) {
                 if (g.isUninstantiated) return;
                 out->push_back(g.getHierarchicalPath());
+                if (protectedInstance(instanceAround(g.getParentScope()))) prot->push_back(out->back());
                 visitDefault(g);
             }
         } sv;
         sv.out = &out.scopes;
+        sv.prot = &out.protScopes;
         comp.getRoot().visit(sv);
     }
 
