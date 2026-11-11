@@ -42,6 +42,10 @@ if(Python3_FOUND)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/spice/check.py $<TARGET_FILE:mspice> ${f}
                      $<$<BOOL:${NGSPICE}>:${NGSPICE}>)
   endforeach()
+  # -raw and -raw-ascii: both files read back and compared.
+  add_test(NAME spice/raw
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/spice/raw/check.py $<TARGET_FILE:mspice>
+                   ${CMAKE_SOURCE_DIR}/tests/spice/raw/rc.cir)
   # spice::flatten(), the reader's view for LVS and characterization.
   set(flat ${CMAKE_SOURCE_DIR}/tests/spice/flat)
   add_test(NAME spice/flatten

@@ -38,6 +38,10 @@ and trailing unit letters are ignored (`10pF`, `2.2kohm`).
 | Voltage-controlled current source | `Gname n+ n- nc+ nc- gm` |
 | Current-controlled current source | `Fname n+ n- Vcontrol gain` |
 | Current-controlled voltage source | `Hname n+ n- Vcontrol r` |
+| Behavioral source | `Bname n+ n- v=expression` or `i=expression` |
+| The same, as E or G | `Ename n+ n- vol='expression'`, `Gname n+ n- cur='expression'` (or `value={...}`) |
+| Voltage-controlled switch | `Sname n+ n- nc+ nc- model [on\|off]` |
+| Current-controlled switch | `Wname n+ n- Vcontrol model [on\|off]` |
 | Diode | `Dname anode cathode model [area] [off]` |
 | MOSFET | `Mname d g s b model [w= l= ad= as= pd= ps= m=]` |
 | Bipolar transistor | `Qname c b e [substrate] model [area] [off]` |
@@ -45,6 +49,21 @@ and trailing unit letters are ignored (`10pF`, `2.2kohm`).
 
 Waveforms: `pulse(v1 v2 td tr tf pw per)`, `sin(vo va freq td theta phase)`,
 `pwl(t1 v1 t2 v2 ...)`, `exp(v1 v2 td1 tau1 td2 tau2)`.
+
+A behavioral expression may use `v(node)`, `v(a,b)`, `i(element)` (a voltage
+source, inductor, E or H source defined above the line), `time`, `temper`,
+parameters, every operator and function of parameter expressions, and `u(x)`
+(step), `uramp(x)` and `limit(x, lo, hi)`. The expression is compiled once;
+each evaluation gives its value and, by reverse-mode differentiation, the
+exact derivative with respect to every voltage and current in it, which is
+what Newton's method and the AC analysis use. A source may read its own
+output.
+
+Switches: `.model name sw vt= vh= ron= roff=` (and `csw it= ih=`) is the
+SPICE3 switch: on above `vt + vh`, off below `vt - vh`, unchanged in between.
+`.model name vswitch von= voff= ron= roff=` (and `iswitch ion= ioff=`) moves
+log(R) along a smooth S-curve between the two control levels, which converges
+and steps much better; prefer it where the exact threshold does not matter.
 
 ### Models
 
@@ -190,6 +209,10 @@ AC, add `m` (magnitude), `db`, `p` (phase in degrees), `r` or `i`:
 grid by interpolation; `-o` writes the solver's own points. With no `.print`
 for an analysis, `-o` holds every node voltage and source current.
 
+`-raw file` writes every analysis (and every `.step` run) as a plot of one
+SPICE raw file in the binary form of SPICE3 and ngspice, which waveform
+viewers read; `-raw-ascii file` writes the text form. All values are real.
+
 `.measure` (or `.meas`):
 
 ```
@@ -316,13 +339,14 @@ line: path, nodes, model, parameters.
 ## Not there yet
 
 - BSIM3 and other MOSFET levels (2, 3, BSIM-CMG), the JFET; for BSIM4:
-  noise, binned models, `ic=`; behavioral (`B`) sources, switches,
-  transmission lines.
+  noise, binned models, `ic=`; `ddt()`, `idt()` and tables in behavioral
+  sources; transmission lines.
 - Noise of BSIM4 transistors; `.sens` for model parameters and in AC;
   `.pz`; `.data` sweeps, `lot`/`dev` tolerances
   on `.model` lines, `.variation` blocks; `.dc` sweeps
   of a parameter or temperature; `i()` of a resistor or a device terminal.
 - Temperature: the thermal voltage, the diode and BJT saturation current and
   the MOSFET mobility follow `temp`; other temperature coefficients do not.
-- Gear integration; ngspice raw files (CSV and VCD are written).
+- Gear integration; complex values in raw files (an AC plot holds the
+  magnitudes and phases asked for).
 - Mixed-signal co-simulation with msim (real-number models, Verilog-AMS).

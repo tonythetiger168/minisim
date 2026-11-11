@@ -504,6 +504,12 @@ Spec references are IEEE 1800-2023 clauses.
   and a second, third... defect when one does not explain everything. Uses
   the shared fault simulator; multithreaded with the same report on any
   thread count. See docs/JTAG.md.
+- `mspice`: behavioral sources (`B` elements, `E`/`G` with `vol=`, `cur=` or
+  `value=`): any expression of node voltages, branch currents and `time`,
+  compiled once and differentiated exactly for Newton's method and AC;
+  switches (`S`, `W`) in the SPICE3 form with hysteresis and in a smooth
+  form (`vswitch`, `iswitch`); `-raw` and `-raw-ascii` write SPICE raw files
+  that ngspice and waveform viewers load.
 - `mspice`: `.noise` (thermal, shot and flicker noise of every device at an
   output and referred to the input, totals and largest contributors), `.tf`
   (DC gain, input and output resistance), `.sens` (DC sensitivity to every

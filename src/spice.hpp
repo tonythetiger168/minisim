@@ -17,7 +17,7 @@
 #include <tuple>
 #include <unordered_set>
 
-#include "spice_dev.hpp"
+#include "spice_behav.hpp"
 
 namespace spice {
 
@@ -96,7 +96,7 @@ struct Circuit {
     // Newton iteration walk contiguous memory and call no virtual function.
     // Stamps are therefore added type by type, each type in netlist order.
     template <class... T> using PoolsOf = std::tuple<std::deque<T>...>;
-    PoolsOf<Resistor, Capacitor, Inductor, VSource, ISource, VCVS, VCCS, CCCS, CCVS, Diode, Mosfet, Bjt> pools;
+    PoolsOf<Resistor, Capacitor, Inductor, VSource, ISource, VCVS, VCCS, CCCS, CCVS, Diode, Mosfet, Bjt, Behav, Switch> pools;
     template <class D> std::deque<D>& pool() { return std::get<std::deque<D>>(pools); }
     template <class F> void eachPool(F&& f) {
         std::apply([&](auto&... p) { (f(p), ...); }, pools);
@@ -157,7 +157,8 @@ struct Circuit {
         val.assign(pat.slots.size(), 0);
         rhsBuf.assign(n + 1, 0); xBuf.assign(n + 1, 0); xnewBuf.assign(n + 1, 0);
         rhs = rhsBuf.data() + 1; x = xBuf.data() + 1; xnew = xnewBuf.data() + 1;
-        linear = pool<Diode>().empty() && pool<Mosfet>().empty() && pool<Bjt>().empty() && !bsim4;
+        linear = pool<Diode>().empty() && pool<Mosfet>().empty() && pool<Bjt>().empty() && pool<Behav>().empty() &&
+                 pool<Switch>().empty() && !bsim4;
     }
 
     Ctx context() const {
@@ -329,7 +330,7 @@ struct Circuit {
                 factored = true; factoredA = c.a; factoredG = gdiag; factoredHold = hold;
             }
             lu.solve(rhs, xnew);
-            bool conv = linear || (it > 0 && !anyLimited<Diode>() && !anyLimited<Mosfet>() && !anyLimited<Bjt>() &&
+            bool conv = linear || (it > 0 && !anyLimited<Diode>() && !anyLimited<Mosfet>() && !anyLimited<Bjt>() && !anyLimited<Switch>() &&
                                   !(bsim4 && bsim4->limited()));
             bool finite = true;
             if (linear) {
@@ -964,6 +965,67 @@ private:
         return e.prefix + t;
     }
 
+    // E and G with vol=, value= or cur= instead of a gain are behavioral sources.
+    static bool hasExpression(const Card& k) {
+        for (size_t i = 3; i < k.tok.size(); i++)
+            for (const char* w : {"vol=", "value=", "cur="})
+                if (k.tok[i].rfind(w, 0) == 0) return true;
+        return false;
+    }
+
+    // B elements, and E/G written with an expression. The expression is
+    // taken from the line as written, because v(a,b) must stay together.
+    void behavioral(const Card& k, Env& e, const std::string& name, char kind) {
+        const std::string& s = k.text;
+        // Skip the name and the two nodes.
+        size_t i = 0;
+        for (int w = 0; w < 3; w++) {
+            while (i < s.size() && !std::isspace((unsigned char)s[i])) i++;
+            while (i < s.size() && std::isspace((unsigned char)s[i])) i++;
+        }
+        size_t eq = s.find('=', i);
+        if (eq == std::string::npos) throw Error("expected " + std::string(kind == 'b' ? "v= or i=" : kind == 'e' ? "vol= or value=" : "cur= or value=") + " and an expression");
+        std::string key = s.substr(i, eq - i), text = s.substr(eq + 1);
+        while (!key.empty() && std::isspace((unsigned char)key.back())) key.pop_back();
+        auto trim = [](std::string& x) {
+            while (!x.empty() && std::isspace((unsigned char)x.back())) x.pop_back();
+            size_t b = 0;
+            while (b < x.size() && std::isspace((unsigned char)x[b])) b++;
+            x.erase(0, b);
+        };
+        trim(text);
+        if (text.size() >= 2 && ((text.front() == '{' && text.back() == '}') || (text.front() == '\'' && text.back() == '\'')))
+            text = text.substr(1, text.size() - 2);
+        bool isV;
+        if (kind == 'b' && (key == "v" || key == "i")) isV = key == "v";
+        else if (kind == 'e' && (key == "vol" || key == "value")) isV = true;
+        else if (kind == 'g' && (key == "cur" || key == "value")) isV = false;
+        else throw Error("'" + key + "=' is not how this source takes an expression");
+        BExpr ex(text, &e.sc, c_.opt.temp);
+        auto* d = c_.add<Behav>(name);
+        d->isV = isV;
+        d->p = node(e, k.tok[1]); d->n = node(e, k.tok[2]);
+        for (const BExpr::Var& v : ex.vars) {
+            Behav::In in{};
+            if (v.kind == 'v') {
+                in.a = node(e, v.a);
+                in.b = v.b.empty() ? -1 : node(e, v.b);
+            } else {
+                auto it = c_.byName.find(e.prefix + v.a);
+                if (it == c_.byName.end()) throw Error("i(" + v.a + "): no element '" + v.a + "' defined before this line");
+                if (!dynamic_cast<VSource*>(it->second) && !dynamic_cast<Inductor*>(it->second) &&
+                    !dynamic_cast<VCVS*>(it->second) && !dynamic_cast<CCVS*>(it->second) && !dynamic_cast<Behav*>(it->second))
+                    throw Error("i(" + v.a + "): only voltage sources, inductors, E and H sources carry a current to read");
+                if (auto* bs = dynamic_cast<Behav*>(it->second); bs && !bs->isV)
+                    throw Error("i(" + v.a + "): only voltage sources, inductors, E and H sources carry a current to read");
+                in.cur = true;
+                in.src = it->second;
+            }
+            d->in.push_back(in);
+        }
+        d->ex = std::move(ex);
+    }
+
     static bool waveKeyword(const std::string& t) {
         return t == "dc" || t == "ac" || t == "pulse" || t == "sin" || t == "pwl" || t == "exp";
     }
@@ -1139,7 +1201,52 @@ private:
             d->w = wave(k, e, 3);
             break;
         }
+        case 'b': {
+            // Bname n+ n- v=expression | i=expression
+            need(k, 4, "Bname n+ n- v=expression or i=expression");
+            behavioral(k, e, name, 'b');
+            break;
+        }
+        case 's':
+        case 'w': {
+            bool byI = t[0][0] == 'w';
+            need(k, byI ? 5 : 6, byI ? "Wname n+ n- Vcontrol model [on|off]" : "Sname n+ n- nc+ nc- model [on|off]");
+            size_t mi = byI ? 4 : 5;
+            const Model* m = model(e, t[mi]);
+            const char* abrupt = byI ? "csw" : "sw";
+            const char* soft = byI ? "iswitch" : "vswitch";
+            if (!m || (m->type != abrupt && m->type != soft))
+                throw Error("'" + t[mi] + "' is not a " + abrupt + " or " + soft + " model");
+            Device* ctl = nullptr;
+            if (byI) {
+                auto it = c_.byName.find(e.prefix + t[3]);
+                if (it == c_.byName.end() || !dynamic_cast<VSource*>(it->second))
+                    throw Error("'" + t[3] + "' is not a voltage source defined before this line");
+                ctl = it->second;
+            }
+            auto* d = c_.add<Switch>(name);
+            d->p = node(e, t[1]); d->n = node(e, t[2]);
+            if (byI) d->ctl = ctl;
+            else { d->cp = node(e, t[3]); d->cn = node(e, t[4]); }
+            d->ron = m->get("ron", 1); d->roff = m->get("roff", m->type == soft ? 1e6 : 1e12);
+            if (!(d->ron > 0) || !(d->roff > 0)) throw Error("a switch needs ron and roff above zero");
+            if (m->type == soft) {
+                d->smooth = true;
+                d->von = m->get(byI ? "ion" : "von", byI ? 1e-3 : 1);
+                d->voff = m->get(byI ? "ioff" : "voff", 0);
+                if (d->von == d->voff) throw Error("a smooth switch needs two different control levels");
+            } else {
+                d->vt = m->get(byI ? "it" : "vt", 0);
+                d->vh = std::fabs(m->get(byI ? "ih" : "vh", 0));
+            }
+            for (size_t i = mi + 1; i < t.size(); i++) {
+                if (t[i] == "on") d->on = d->onAcc = true;
+                else if (t[i] != "off") throw Error("a switch takes on or off after its model, not '" + t[i] + "'");
+            }
+            break;
+        }
         case 'e': {
+            if (hasExpression(k)) { behavioral(k, e, name, 'e'); break; }
             need(k, 6, "Ename n+ n- nc+ nc- gain");
             auto* d = c_.add<VCVS>(name);
             d->p = node(e, t[1]); d->n = node(e, t[2]); d->cp = node(e, t[3]); d->cn = node(e, t[4]);
@@ -1147,6 +1254,7 @@ private:
             break;
         }
         case 'g': {
+            if (hasExpression(k)) { behavioral(k, e, name, 'g'); break; }
             need(k, 6, "Gname n+ n- nc+ nc- transconductance");
             auto* d = c_.add<VCCS>(name);
             d->p = node(e, t[1]); d->n = node(e, t[2]); d->cp = node(e, t[3]); d->cn = node(e, t[4]);
