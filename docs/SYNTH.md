@@ -38,6 +38,12 @@ write_sdc core.sdc
    functions and tasks inlined, memories become flops and multiplexers.
    Adders are ripple-carry below 8 bits and parallel-prefix (Sklansky) from
    8 bits up; multipliers are carry-save arrays; dividers are restoring.
+   A `case` whose items cannot match together (`unique case`, a
+   `parallel_case` attribute, or distinct constant labels) is built
+   without priority: a variable that every item and the default assign is
+   the OR of each item's hit ANDed with its value. Where an item keeps the
+   earlier value the chain of selects stays, so the hold condition is
+   still found.
    Structural hashing shares equal logic as it is built, and nested
    selects with a shared arm (`if (a) if (b) x <= d;`) fold into one
    select with a combined condition. An `'x` in the source is a
@@ -46,6 +52,15 @@ write_sdc core.sdc
    asynchronous reset value, and registers without reset whose next state
    is a constant or only themselves, are then removed
    (`Information: removed N unloaded or constant register bits`).
+   A register's hold condition is then gathered out of its next-state
+   logic (`aig::holdEnables`): `if (a) r <= x; else if (b) r <= y;` is a
+   select chain with the register's own value at the bottom, and becomes
+   one enable `a | b` in front of `a ? x : y`, also behind a synchronous
+   reset and through `case` items that assign nothing
+   (`Information: gathered the hold conditions of N register bits into
+   enables`; `set msynth_hold_enables false` skips it). Only registers
+   without an asynchronous reset are rewritten, the ones the mapper has
+   enable flops for.
    Last, functional reduction (`src/synth/fraig.hpp`): nodes are simulated
    with random patterns, nodes with the same signature are candidates, and
    the shared SAT solver proves or refutes each pair; a proven node is
@@ -61,6 +76,9 @@ write_sdc core.sdc
    (`next_state : E ? D : IQ`) when that costs less than a flop and a mux.
    Afterwards, two 2:1 muxes on one select that feed only a third become a
    4:1 mux cell where the library has a smaller one.
+   At high effort (`compile -map_effort high`, `compile_ultra`) the
+   logic is also restructured by ABC and mapped again; the smaller result
+   is kept (see "High effort: ABC" below).
 3. **Buffer**. Nets with more than `set_max_fanout` loads (12 by default)
    get a buffer tree. Clock nets are left alone.
 4. **Time** (`src/synth/sta.hpp`). Arrival times with the library's NLDM
@@ -149,6 +167,28 @@ half that the equivalence, formal and FPGA tools share. Beside the graph,
   comes out larger than from Yosys with ABC, see below.
 - The hierarchy is always flattened.
 
+## High effort: ABC
+
+[ABC](https://github.com/berkeley-abc/abc) (Berkeley; a permissive
+BSD-style licence) rewrites and-inverter graphs. At high effort msynth
+writes the design's combinational logic as an AIGER file, runs ABC on it
+as a separate program, reads the result back, and maps it with its own
+mapper. Flops stay outside, so load enables are still enables. The result
+replaces the plain one only when it is smaller and, with a clock, does not
+lose slack: `Information: ABC restructuring: area A against B, kept.`
+
+- The program is `$MSYNTH_ABC`, else the first of `abc`, `berkeley-abc`,
+  `yosys-abc` on `PATH` (a Yosys installation brings `yosys-abc`). Without
+  one, high effort is the plain flow.
+- `set msynth_abc true` uses it at every `compile`, `false` never;
+  the default `auto` is high effort only.
+- `set msynth_abc_script {...}` replaces the script (one line of ABC
+  commands; the default is `drw; drf; drw; drwsat; drw -z; drf -z`).
+
+ABC is not linked into msynth: it carries its own copies of SAT solvers
+that the minisim tools link too, and a separate process keeps a failure
+there from taking msynth down. CI builds it from source at a pinned commit.
+
 ## Against Yosys
 
 Yosys 0.33 (`synth -flatten; dfflibmap; abc -liberty`) and msynth on the
@@ -156,8 +196,9 @@ same RTL and the same library (mini45, typical corner), one machine:
 
 | design | msynth area | Yosys area | msynth time | Yosys time |
 |---|---|---|---|---|
-| PicoRV32 (default parameters) | 18098 | 15458 | 0.8 s | 5.4 s |
-| tests/synth/mem.sv (three small memories) | 2149 | 2297 | 0.03 s | 0.4 s |
+| PicoRV32 (default parameters) | 17377 | 15458 | 0.8 s | 5.4 s |
+| PicoRV32, `compile -map_effort high` (ABC) | 16997 | 15458 | 1.2 s | 5.4 s |
+| tests/synth/mem.sv (three small memories) | 2131 | 2297 | 0.03 s | 0.4 s |
 | tests/synth/counter.sv | 92 | 85 | 0.03 s | 0.2 s |
 
 Most of msynth's time on PicoRV32 is functional reduction (0.7 s); without
@@ -174,12 +215,19 @@ on the same graph give more area than msynth's. Yosys's netlist before
 ABC, read by msynth, maps to 16817. So about half of the gap is in how the
 RTL is turned into logic, and half is ABC's optimization on Yosys's side.
 
+Running Yosys's RTL passes one at a time in front of msynth shows where
+the first half is: `opt_dff`, which finds each register's enable and
+synchronous reset in its select tree, is worth 6% on its own. Gathering
+hold conditions (above) took 3% of that (18096 to 17534), and cases
+without priority another 1% (17377); the rest of what `opt_dff` finds,
+and `share`/`wreduce` (under 1%), are still open.
+
 ## Tests
 
 `tests/synth`: each design is synthesized and its testbench is simulated
 with `msim` on the RTL and on the netlist with random stimulus; both runs
 must print the same lines. This is done with the default library and with a
-library of only an inverter, a NAND and one flop. Each netlist on the default library is
+library of only an inverter, a NAND and one flop. Each netlist, on both libraries, is
 also proven equivalent to its RTL with `mequiv`, and a netlist with one gate
 swapped must be reported as different.
 

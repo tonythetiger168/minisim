@@ -15,6 +15,7 @@ tests/fpga/DESIGN.sv or tests/fpga/DESIGN.aag. Checks:
      (bounded SAT on a miter). This check shares no code with mfpga. With a
      reset-input the proof holds that input at 1 in the first cycle: a flop
      with a synchronous set powers up 1 on ecp5 and 0 in the RTL's proof.
+     iCE40 also runs on the vendor's simulation models (Yosys' ice40/cells_sim.v), when installed.
   5. With nextpnr-ice40 / nextpnr-ecp5 on PATH: the netlist places and routes.
 """
 import os, shutil, subprocess, sys
@@ -23,6 +24,9 @@ mfpga, msim, src, out, design = sys.argv[1:6]
 depth = int(sys.argv[6]) if len(sys.argv) > 6 else 0
 reset = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] != "-" else None
 extra = sys.argv[8:]
+# not an mfpga option: the design, as LUTs, is larger than the HX8K the iCE40 netlist is placed on
+skip_ice40_pnr = "--no-ice40-pnr" in extra
+extra = [e for e in extra if e != "--no-ice40-pnr"]
 os.makedirs(out, exist_ok=True)
 rtl = os.path.join(src, "tests", "synth", design + ".sv")
 if not os.path.exists(rtl):
@@ -38,6 +42,7 @@ def run(cmd, **kw):
 
 SIM = {"ice40": "+/ice40/cells_sim.v", "ecp5": "+/ecp5/cells_sim.v", "xc7": "+/xilinx/cells_sim.v", "generic": None}
 yosys = shutil.which("yosys") if depth and os.path.exists(rtl) else None
+datdir = os.path.join(os.path.dirname(os.path.realpath(shutil.which("yosys"))), "..", "share", "yosys") if shutil.which("yosys") else ""
 
 for fam in ("generic", "ice40", "ecp5", "xc7"):
     base = os.path.join(out, "%s_%s" % (design, fam))
@@ -61,13 +66,19 @@ for fam in ("generic", "ice40", "ecp5", "xc7"):
         got = run([msim, base + ".v"] + cells + [tb, "-top", design + "_tb"])
         if want != got or len(want.splitlines()) < 50:
             sys.exit("%s: the netlist simulates differently from the RTL (%d lines)" % (fam, len(want.splitlines())))
+        # iCE40: once more on the vendor's own simulation models, which Yosys ships
+        vendor = os.path.join(datdir, "ice40", "cells_sim.v") if datdir and fam == "ice40" else ""
+        if os.path.exists(vendor):
+            got = run([msim, base + ".v", vendor, tb, "-top", design + "_tb"])
+            if want != got:
+                sys.exit("ice40: the netlist on the vendor's simulation models differs from the RTL")
     if yosys:
-        ys = ["read_verilog -sv " + rtl, "prep -top " + design, "design -stash gold"]
+        ys = ["read_verilog -sv " + rtl, "prep -top " + design, "memory_map", "design -stash gold"]
         if SIM[fam]:
             ys.append("read_verilog " + SIM[fam])
         if fam == "ecp5":   # a black box in Yosys 0.33's library
             ys.append("read_verilog " + os.path.join(src, "tests", "fpga", "cells_ecp5_dsp.v"))
-        ys += ["read_json %s.json" % base, "hierarchy -top " + design, "proc", "flatten", "design -stash gate",
+        ys += ["read_json %s.json" % base, "hierarchy -top " + design, "proc", "flatten", "memory", "design -stash gate",
                "design -copy-from gold -as gold " + design, "design -copy-from gate -as gate " + design,
                "miter -equiv -flatten -make_outputs gold gate miter", "hierarchy -top miter", "flatten", "opt",
                # an asynchronous reset becomes a synchronous one for the bounded check
@@ -78,6 +89,6 @@ for fam in ("generic", "ice40", "ecp5", "xc7"):
             sys.exit("FAILED: %s: the yosys proof against the RTL\n%s%s" % (fam, r.stdout[-3000:], r.stderr[-3000:]))
     pnr = {"ice40": ["nextpnr-ice40", "--hx8k", "--package", "ct256", "--pcf-allow-unconstrained", "--asc", base + ".asc"],
            "ecp5": ["nextpnr-ecp5", "--85k", "--package", "CABGA756", "--textcfg", base + ".cfg"]}.get(fam)
-    if pnr and shutil.which(pnr[0]):
+    if pnr and shutil.which(pnr[0]) and not (fam == "ice40" and skip_ice40_pnr):
         run(pnr + ["--json", base + ".json", "-q", "--placer", "heap"], timeout=900)
 print("ok")

@@ -17,6 +17,10 @@
 // so they are encoded in parallel, and the result does not depend on the
 // thread count.
 //
+// With -edt_xmask the compactor can observe one chain per channel (a mask
+// per pattern on edt_mask_in), so an unknown capture does not hide the other
+// chains; edt_resp.hpp works out the expected outputs and picks the masks.
+//
 // One pattern on the tester: one clock with edt_update high (the generator
 // clears; this is the capture cycle), then T = longest chain + init cycles
 // shift clocks. Channel bit (k, u) is what channel k carries in shift cycle u.
@@ -31,6 +35,8 @@ namespace dft {
 struct EdtOpts {
     std::string scandef, outDir = ".", cubes, patterns, fill = "random";
     int channels = 0, ring = 0, threads = 0, tbPatterns = 8;
+    bool xmask = false;      // a compactor that can observe one chain per channel
+    bool responses = false;  // simulate the netlist for the expected channel outputs
 };
 
 struct EdtPlan {
@@ -39,6 +45,11 @@ struct EdtPlan {
     uint64_t poly = 0, mask = 0;
     std::vector<uint64_t> phase;  // per chain: the generator bits it XORs
     std::vector<int> pos;         // per channel: where it is injected
+    // X masking: a mask of mw bits per pattern, per output channel one enable
+    // bit and mIdx index bits (low bit first). Enable 0: the channel is the
+    // XOR of all its chains; 1: of chain (index * c + channel) alone.
+    bool xmask = false;
+    int mIdx = 0, mw = 0;
 
     void plan(const EdtOpts& o) {
         n = (int)sd.chains.size();
@@ -66,6 +77,29 @@ struct EdtPlan {
                 }
             }
         }
+        if (o.xmask) {
+            int group = (n + c - 1) / c;
+            if (group < 2) throw Error("-edt_xmask needs more chains than channels: there is nothing to mask");
+            xmask = true;
+            while ((1 << mIdx) < group) mIdx++;
+            mw = c * (1 + mIdx);
+            if (mw > T) throw Error("the mask (" + std::to_string(mw) + " bits) is longer than a pattern's " + std::to_string(T) + " shift cycles");
+        }
+    }
+    // Whether mask m (first shifted bit first; empty = no masking) lets chain i through.
+    bool observed(const std::string& m, int i) const {
+        if (!xmask || m.empty()) return true;
+        int at = (i % c) * (1 + mIdx), idx = 0;
+        if (m[at] != '1') return true;
+        for (int b = 0; b < mIdx; b++)
+            if (m[at + 1 + b] == '1') idx |= 1 << b;
+        return idx == i / c;
+    }
+    // In mask m: channel k observes chain `chain` alone.
+    void only(std::string& m, int chain) const {
+        int at = (chain % c) * (1 + mIdx);
+        m[at] = '1';
+        for (int b = 0; b < mIdx; b++) m[at + 1 + b] = ((chain / c) >> b & 1) ? '1' : '0';
     }
     uint64_t step(uint64_t s) const { return ((s << 1) & mask) ^ (((s >> (r - 1)) & 1) ? poly : 0); }
     uint64_t inject(const std::vector<std::string>& ch, int u) const {
@@ -315,21 +349,116 @@ inline std::vector<EdtEncoder::Result> encodeAll(const EdtPlan& p, const CubeSet
     return out;
 }
 
+// What a pattern's capture looks like from the tester.
+struct EdtResponse {
+    std::string pi;                    // the port inputs applied at capture
+    std::vector<std::string> load;     // per chain: the cell states loaded, scan-in cell first
+    std::vector<std::string> capture;  // per chain: the cell states captured, x = unknown
+    std::vector<std::string> so;       // per chain: the same at the scan output, by unload cycle
+    std::string mask;                  // the mask chosen (with -edt_xmask)
+    std::vector<std::string> out;      // per channel: T bits of the unload, x = do not compare
+};
+struct EdtRespStats {
+    long known = 0, unknown = 0, seen = 0, seenUnmasked = 0, masked = 0;
+};
+
+// Chooses each pattern's mask and works out the output channels of its
+// unload. Pattern k unloads while the next encoded pattern loads (after the
+// last one: T cycles with the channels at 0), so a chain shorter than T also
+// passes what the decompressor put in; thru[i] says chain i inverts on the way.
+inline EdtRespStats compactResponses(const EdtPlan& p, const std::vector<EdtEncoder::Result>& res, std::vector<EdtResponse>& rs,
+                                     const std::vector<uint8_t>& thru, int threads) {
+    std::vector<size_t> seq;
+    for (size_t i = 0; i < res.size(); i++)
+        if (res[i].ok) seq.push_back(i);
+    std::vector<EdtRespStats> part(seq.size());
+    const std::vector<std::string> zero(p.c, std::string(p.T, '0'));
+    par::parallelFor(seq.size(), (unsigned)std::max(1, threads), [&](size_t q) {
+        EdtResponse& r = rs[seq[q]];
+        EdtRespStats& st = part[q];
+        std::vector<std::string> next = p.expand(q + 1 < seq.size() ? res[seq[q + 1]].channels : zero, p.T);
+        // v(i, t): what chain i shows in unload cycle t.
+        auto v = [&](int i, int t) -> char {
+            int len = p.sd.chains[i].length;
+            if (t < len) return r.so[i][t];
+            return (char)('0' + ((next[i][t - len] == '1') ^ (thru[i] != 0)));
+        };
+        r.mask.assign(p.xmask ? p.mw : 0, '0');
+        r.out.assign(p.c, std::string(p.T, '0'));
+        for (int i = 0; i < p.n; i++)
+            for (char b : r.so[i]) (b == 'x' ? st.unknown : st.known)++;
+        for (int k = 0; k < p.c; k++) {
+            long all = 0, best = -1;
+            int bestChain = -1;
+            for (int t = 0; t < p.len; t++) {
+                long here = 0;
+                bool x = false;
+                for (int i = k; i < p.n; i += p.c) {
+                    if (t >= p.sd.chains[i].length) continue;
+                    if (r.so[i][t] == 'x') x = true;
+                    else here++;
+                }
+                if (!x) all += here;
+            }
+            st.seenUnmasked += all;
+            if (p.xmask)
+                for (int i = k; i < p.n; i += p.c) {
+                    long cnt = 0;
+                    for (char b : r.so[i]) cnt += b != 'x';
+                    if (cnt > best) best = cnt, bestChain = i;
+                }
+            if (best > all) {
+                p.only(r.mask, bestChain);
+                st.masked++;
+                st.seen += best;
+            } else st.seen += all;
+            for (int t = 0; t < p.T; t++) {
+                bool x = false, bit = false;
+                for (int i = k; i < p.n; i += p.c) {
+                    if (!p.observed(r.mask, i)) continue;
+                    char b = v(i, t);
+                    if (b == 'x') x = true;
+                    else bit ^= b == '1';
+                }
+                r.out[k][t] = x ? 'x' : bit ? '1' : '0';
+            }
+        }
+    });
+    EdtRespStats st;
+    for (const EdtRespStats& a : part)
+        st.known += a.known, st.unknown += a.unknown, st.seen += a.seen, st.seenUnmasked += a.seenUnmasked, st.masked += a.masked;
+    return st;
+}
+
 inline void writeEdtPatterns(const std::string& path, const EdtPlan& p, const CubeSet& cs,
-                             const std::vector<EdtEncoder::Result>& res) {
+                             const std::vector<EdtEncoder::Result>& res, const std::vector<EdtResponse>* rs = nullptr) {
     std::ostringstream os;
     os << "# mdft EDT patterns: " << p.c << " channels, " << p.T << " shift cycles per pattern (" << p.init
        << " init + " << p.len << ")\n# <pattern> in <channel> <bits, first shifted first>\n"
        << "# <pattern> load <chain> <bits, scan-in cell first>\n# <pattern> pi <port input bits, as given with the cubes>\n";
+    if (rs)
+        os << "# <pattern> capture <chain> <cell states after capture, scan-in cell first, x = unknown>\n"
+           << (p.xmask ? "# <pattern> mask <bits for edt_mask_in in the last shift cycles of the load, first shifted first>\n" : "")
+           << "# <pattern> out <channel> <what the channel shows while the next pattern loads, x = do not compare>\n";
+    // For a reader without the scan description (mdft -diagnose).
+    os << "edt channels " << p.c << " mask_index_bits " << (p.xmask ? p.mIdx : -1) << "\n";
+    for (int ch = 0; ch < p.n; ch++)
+        os << "chain " << ch << " " << p.sd.chains[ch].name << " " << p.sd.chains[ch].scanIn << " " << p.sd.chains[ch].length << "\n";
     for (size_t i = 0; i < res.size(); i++) {
         if (!res[i].ok) {
             os << cs.ids[i] << " unencodable\n";
             continue;
         }
-        if (auto pi = cs.pi.find(cs.ids[i]); pi != cs.pi.end()) os << cs.ids[i] << " pi " << pi->second << "\n";
+        if (rs) os << cs.ids[i] << " pi " << (*rs)[i].pi << "\n";
+        else if (auto pi = cs.pi.find(cs.ids[i]); pi != cs.pi.end()) os << cs.ids[i] << " pi " << pi->second << "\n";
         for (int k = 0; k < p.c; k++) os << cs.ids[i] << " in " << k << " " << res[i].channels[k] << "\n";
-        std::vector<std::string> ld = p.loads(res[i].channels);
+        std::vector<std::string> ld = rs ? (*rs)[i].load : p.loads(res[i].channels);
         for (int ch = 0; ch < p.n; ch++) os << cs.ids[i] << " load " << p.sd.chains[ch].name << " " << ld[ch] << "\n";
+        if (!rs) continue;
+        const EdtResponse& r = (*rs)[i];
+        for (int ch = 0; ch < p.n; ch++) os << cs.ids[i] << " capture " << p.sd.chains[ch].name << " " << r.capture[ch] << "\n";
+        if (p.xmask) os << cs.ids[i] << " mask " << r.mask << "\n";
+        for (int k = 0; k < p.c; k++) os << cs.ids[i] << " out " << k << " " << r.out[k] << "\n";
     }
     writeFile(path, os.str());
 }
@@ -347,7 +476,7 @@ inline EdtResult insertEdt(const std::vector<Port>& ports, const std::string& to
     EdtResult r;
     std::map<std::string, const Port*> byName;
     for (const Port& q : ports) byName[q.name] = &q;
-    for (const char* t : {"edt_mode", "edt_update", "edt_channels_in", "edt_channels_out"})
+    for (const char* t : {"edt_mode", "edt_update", "edt_channels_in", "edt_channels_out", "edt_mask_in"})
         if (byName.count(t)) throw Error(std::string("the design already has a port named '") + t + "'");
     auto need = [&](const std::string& ref, Port::Dir d, const char* what) -> std::pair<const Port*, int> {
         auto [name, bit] = portBit(ref);
@@ -388,19 +517,46 @@ inline EdtResult insertEdt(const std::vector<Port>& ports, const std::string& to
     rtl << "  always_ff @(posedge clk) begin\n    if (update) gen <= '0;\n    else if (shift) gen <= ({gen[" << p.r - 2
         << ":0], 1'b0} ^ (gen[" << p.r - 1 << "] ? " << hex(p.poly, p.r) << " : " << p.r << "'b0)) ^ inj;\n  end\n";
     for (int i = 0; i < p.n; i++) rtl << "  assign scan_in[" << i << "] = ^(gen & " << hex(p.phase[i], p.r) << ");\n";
-    rtl << "endmodule\n\n// Scan compactor: chain i goes to output channel i mod " << p.c << "\nmodule " << r.wrap
-        << "_comp (\n  input  logic [" << p.n - 1 << ":0] scan_out,\n  output logic [" << p.c - 1 << ":0] channels);\n";
-    for (int k = 0; k < p.c; k++) {
-        std::string xs;
-        for (int i = k; i < p.n; i += p.c) xs += (xs.empty() ? "" : " ^ ") + ("scan_out[" + std::to_string(i) + "]");
-        rtl << "  assign channels[" << k << "] = " << (xs.empty() ? "1'b0" : xs) << ";\n";
+    rtl << "endmodule\n\n// Scan compactor: chain i goes to output channel i mod " << p.c << "\n";
+    if (p.xmask) {
+        // The mask shifts in from mask_in with the pattern and takes effect at
+        // update (the capture), so it is in place for that pattern's unload.
+        rtl << "// X masking: " << p.mw << " mask bits, per channel an enable and a " << p.mIdx
+            << "-bit chain index (low bit first), first channel first\n"
+            << "module " << r.wrap << "_comp (\n  input  logic clk, shift, update, mask_in,\n  input  logic [" << p.n - 1
+            << ":0] scan_out,\n  output logic [" << p.c - 1 << ":0] channels);\n  logic [" << p.mw - 1 << ":0] mask_sr, mask;\n"
+            << "  always_ff @(posedge clk) begin\n    if (update) mask <= mask_sr;\n    else if (shift) mask_sr <= "
+            << (p.mw > 1 ? "{mask_sr[" + std::to_string(p.mw - 2) + ":0], mask_in}" : std::string("mask_in")) << ";\n  end\n"
+            << "  wire [" << p.n - 1 << ":0] seen;\n";
+        // Mask bit q (in shift order) sits in mask[mw-1-q].
+        auto mb = [&](int q) { return "mask[" + std::to_string(p.mw - 1 - q) + "]"; };
+        for (int i = 0; i < p.n; i++) {
+            int at = (i % p.c) * (1 + p.mIdx);
+            std::string eq;
+            for (int b = 0; b < p.mIdx; b++) eq += std::string(eq.empty() ? "" : " & ") + (((i / p.c) >> b & 1) ? "" : "~") + mb(at + 1 + b);
+            rtl << "  assign seen[" << i << "] = ~" << mb(at) << " | (" << eq << ");\n";
+        }
+        for (int k = 0; k < p.c; k++) {
+            std::string xs;
+            for (int i = k; i < p.n; i += p.c)
+                xs += (xs.empty() ? "" : " ^ ") + ("(scan_out[" + std::to_string(i) + "] & seen[" + std::to_string(i) + "])");
+            rtl << "  assign channels[" << k << "] = " << xs << ";\n";
+        }
+    } else {
+        rtl << "module " << r.wrap << "_comp (\n  input  logic [" << p.n - 1 << ":0] scan_out,\n  output logic [" << p.c - 1
+            << ":0] channels);\n";
+        for (int k = 0; k < p.c; k++) {
+            std::string xs;
+            for (int i = k; i < p.n; i += p.c) xs += (xs.empty() ? "" : " ^ ") + ("scan_out[" + std::to_string(i) + "]");
+            rtl << "  assign channels[" << k << "] = " << (xs.empty() ? "1'b0" : xs) << ";\n";
+        }
     }
     rtl << "endmodule\n\n// " << top << " with scan compression. edt_mode 0: the scan pins work as before.\nmodule " << r.wrap
         << " (\n";
     for (const Port& q : ports)
         rtl << "  " << (q.dir == Port::In ? "input  logic " : q.dir == Port::Out ? "output logic " : "inout  wire  ") << q.range()
             << q.name << ",\n";
-    rtl << "  input  logic edt_mode, edt_update,\n  input  logic [" << p.c - 1 << ":0] edt_channels_in,\n  output logic ["
+    rtl << "  input  logic edt_mode, edt_update," << (p.xmask ? " edt_mask_in," : "") << "\n  input  logic [" << p.c - 1 << ":0] edt_channels_in,\n  output logic ["
         << p.c - 1 << ":0] edt_channels_out);\n  wire [" << p.n - 1 << ":0] dec_si, core_so;\n";
     std::ostringstream conn;
     bool first = true;
@@ -425,7 +581,8 @@ inline EdtResult insertEdt(const std::vector<Port>& ports, const std::string& to
     rtl << "  " << top << " u_core (\n" << conn.str() << ");\n"
         << "  " << r.wrap << "_decomp u_decomp (.clk(" << clk << "), .shift(" << se
         << "), .update(edt_update), .channels(edt_channels_in), .scan_in(dec_si));\n"
-        << "  " << r.wrap << "_comp u_comp (.scan_out(core_so), .channels(edt_channels_out));\nendmodule\n";
+        << "  " << r.wrap << "_comp u_comp (" << (p.xmask ? ".clk(" + clk + "), .shift(" + se + "), .update(edt_update), .mask_in(edt_mask_in), " : "")
+        << ".scan_out(core_so), .channels(edt_channels_out));\nendmodule\n";
 
     // The testbench: shift mode only. A chain is a shift register, so what
     // leaves it is what the decompressor put in `length` cycles earlier.
@@ -438,17 +595,36 @@ inline EdtResult insertEdt(const std::vector<Port>& ports, const std::string& to
         if (q.dir == Port::In) tb << "  logic " << q.range() << q.name << " = '0;\n";
         else tb << "  wire " << q.range() << q.name << ";\n";
     }
-    tb << "  logic edt_mode = 1, edt_update = 0;\n  logic [" << p.c - 1 << ":0] edt_channels_in = '0;\n  wire [" << p.c - 1
+    tb << "  logic edt_mode = 1, edt_update = 0, edt_mask_in = 0;\n  logic [" << p.c - 1 << ":0] edt_channels_in = '0;\n  wire [" << p.c - 1
        << ":0] edt_channels_out;\n  int errors = 0, checks = 0;\n  " << r.wrap << " dut (.*);\n"
        << "  task automatic cyc(input logic [" << p.c - 1 << ":0] in, input logic [" << p.c - 1 << ":0] exp, input logic ["
-       << p.c - 1 << ":0] care);\n"
-       << "    edt_channels_in = in; #4;\n"
+       << p.c - 1 << ":0] care, input logic mk = 0);\n"
+       << "    edt_channels_in = in; edt_mask_in = mk; #4;\n"
        << "    for (int k = 0; k < " << p.c << "; k++) if (care[k]) begin\n      checks++;\n"
        << "      if (edt_channels_out[k] !== exp[k]) begin\n        errors++;\n"
        << "        if (errors <= 20) $display(\"MISMATCH at %0t: channel %0d = %b, expected %b\", $time, k, edt_channels_out[k], exp[k]);\n"
        << "      end\n    end\n    #1 " << clk << " = 1; #5 " << clk << " = 0;\n  endtask\n  initial begin\n";
     for (auto& [port, high] : p.sd.resets) tb << "    " << port << " = " << (high ? "1'b0" : "1'b1") << ";\n";
     tb << "    " << sePort->bit(seBit) << " = " << (p.sd.scanEnHigh ? "1'b1" : "1'b0") << ";\n";
+    // With masking: every pattern gets a mask (none, one chain, or an index
+    // past the last chain), shifted in at the end of the pattern before.
+    std::vector<std::string> masks(tbCh.size() + 1);
+    if (p.xmask) {
+        std::mt19937_64 rng(0x3A5C0FFEEull);
+        for (size_t k = 0; k < tbCh.size(); k++) {
+            masks[k].assign(p.mw, '0');
+            if (k == 0) continue;
+            for (int c = 0; c < p.c; c++) {
+                int pick = (int)(rng() % 4);
+                if (pick == 0) continue;
+                int at = c * (1 + p.mIdx), idx = (int)(rng() % (pick == 1 ? (1u << p.mIdx) : (unsigned)((p.n - c + p.c - 1) / p.c)));
+                masks[k][at] = '1';
+                for (int b = 0; b < p.mIdx; b++) masks[k][at + 1 + b] = (idx >> b & 1) ? '1' : '0';
+            }
+        }
+        masks[tbCh.size()].assign(p.mw, '0');
+        for (int q = 0; q < p.mw; q++) tb << "    cyc('0, '0, '0, " << (masks[0][q] == '1' ? "1'b1" : "1'b0") << ");\n";
+    }
     for (size_t k = 0; k < tbCh.size(); k++) {
         std::vector<std::string> si = p.expand(tbCh[k], total);
         tb << "    // pattern " << k << "\n    edt_update = 1; cyc('0, '0, '0); edt_update = 0;\n";
@@ -459,6 +635,10 @@ inline EdtResult insertEdt(const std::vector<Port>& ports, const std::string& to
                 bool known = false, v = false;
                 bool all = true;
                 for (int i = c; i < p.n; i += p.c) {
+                    if (!p.observed(masks[k], i)) {
+                        known = true;
+                        continue;
+                    }
                     int back = t - p.sd.chains[i].length;
                     if (back < 0) all = false;
                     else v ^= si[i][back] == '1';
@@ -466,7 +646,9 @@ inline EdtResult insertEdt(const std::vector<Port>& ports, const std::string& to
                 }
                 if (known && all) care[c] = '1', exp[c] = v ? '1' : '0';
             }
-            tb << "    cyc(" << vlog(in) << ", " << vlog(exp) << ", " << vlog(care) << ");\n";
+            int mq = t - (total - p.mw);
+            tb << "    cyc(" << vlog(in) << ", " << vlog(exp) << ", " << vlog(care)
+               << (p.xmask && mq >= 0 && masks[k + 1][mq] == '1' ? ", 1'b1" : "") << ");\n";
         }
     }
     tb << "    if (errors == 0 && checks > 0) $display(\"" << tbName << ": PASS (%0d checks)\", checks);\n"

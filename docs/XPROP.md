@@ -133,10 +133,20 @@ outside the function are not merged.
 
 ## Cost
 
-A run with `-xprop` does more work per `if` and `case`. An `if` tests its
-condition once, with a jump that has a third target for an unknown value.
+While every condition is known, `-xprop` should cost close to nothing. So
+a block made of plain assignments, `if` and `case` is lowered twice: a
+clean copy, as without `-xprop`, and a merging copy. The clean copy runs
+first. When an `if` condition or a `case` selector is unknown, a jump with
+a third target for an unknown value moves to the same place in the merging
+copy, which finishes the pass. An ambiguous clock edge starts in the
+merging copy; a clocked function skips that test in a time step where no
+signal has changed from or to x. A `case` in the clean copy is the standard
+one, after one test of its selector. A block that assigns a variable with `<=` more than once in
+a pass, or that holds other statements (tasks, messages, delays), has only
+the merging copy, which tests after each branch whether a merge is running.
+
 The temporaries of the merge are stored without going through the
 scheduler, so clocked blocks still run as parallel clocked functions and
 combinational blocks stay in the static schedule. On Ibex (lowRISC,
-118 745 cycles) the interpreter takes 26 s with `-xprop` and 19 s without
-(31 s with `-threads 1`); with `-compile` a run with `-xprop` takes 7 s.
+118 745 cycles) the interpreter takes 25 s with `-xprop` and 22.5 s
+without.

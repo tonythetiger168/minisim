@@ -14,7 +14,9 @@
 
 #include "bscan.hpp"
 #include "diag.hpp"
+#include <memory>
 #include "edt.hpp"
+#include "edt_resp.hpp"
 #include "lbist.hpp"
 #include "lbist_cov.hpp"
 #include "pdl.hpp"
@@ -77,12 +79,17 @@ struct Cli {
               "  -edt_cubes FILE        test cubes: '<pattern> <chain> <bits>', scan-in cell first, x = free\n"
               "  -edt_patterns FILE     the compressed patterns and what they load\n"
               "  -edt_fill random|0     the free channel bits (default random)\n"
+              "  -edt_xmask             a compactor that can observe one chain per channel (port edt_mask_in)\n"
+              "  -edt_responses         with -edt on a gate netlist: expected outputs and <top>_edt_pat_tb.sv\n"
+              "                         (-edt_encode does this when the netlist is on the line; -lib, -se as matpg)\n"
+              "  -edt_netlist FILE      the gate netlist for the responses, when the line also has cell models\n"
               "  -edt_out DIR           where <top>_edt.sv and its testbench go (default .)\n"
               "  -threads N             encode on N threads (default: every core; the result is the same)\n"
               "failure diagnosis (gate netlist, no SystemVerilog front end):\n"
               "  -diagnose FAILLOG      rank the faults that explain a tester fail log; needs the netlist,\n"
               "                         -patterns, and -lib / -top / -se as given to matpg\n"
               "  -patterns FILE         the patterns that were applied (matpg -patterns)\n"
+              "  -edt_patterns FILE     with -diagnose: compressed patterns instead; the log is '<pattern> ch <channel> <cycle>'\n"
               "  -diag_fault stuck|transition   the fault model and pattern set (default stuck)\n"
               "  -diag_defects N        diagnose up to N defects (default 4)\n"
               "  -diag_suspects N       list up to N suspects per defect (default 10)\n"
@@ -156,6 +163,9 @@ struct Cli {
                 else if (a == "-edt_patterns") eo.patterns = next();
                 else if (a == "-edt_fill") eo.fill = next();
                 else if (a == "-edt_out") eo.outDir = next();
+                else if (a == "-edt_xmask") eo.xmask = true;
+                else if (a == "-edt_responses") eo.responses = true;
+                else if (a == "-edt_netlist") edtNetlist.push_back(next()), eo.responses = true;
                 else if (a == "-diagnose") dg.failLog = next(), diag = mine = true;
                 else if (a == "-diag_inject") dg.inject.push_back(next()), diag = mine = true;
                 else if (a == "-patterns") dg.patterns = next();
@@ -210,6 +220,7 @@ struct Cli {
                 if (diag && (lbistCov || lbist || bscan || edt || edtEncode)) throw Error("-diagnose is a separate run");
                 if (diag) {
                     dg.files = files, dg.libs = libs, dg.top = top, dg.se = se;
+                    dg.edtPatterns = eo.patterns;
                     dg.threads = threads, dg.quiet = quiet;
                     return runDiagnose(dg);
                 }
@@ -225,6 +236,24 @@ struct Cli {
             if ((int)lbist + (int)bscan + (int)edt + (int)edtEncode > 1) throw Error("-bscan, -lbist, -edt and -edt_encode are separate runs");
             if ((edt || edtEncode) && lo.scandef.empty()) throw Error("-edt needs -scandef FILE");
             eo.scandef = lo.scandef, eo.threads = threads;
+            if (edt || edtEncode) {
+                // The gate netlist, for the expected responses (left on the line for -edt).
+                for (size_t k = 1; k < rest.size(); k++) {
+                    std::string a = rest[k];
+                    auto val = [&]() -> std::string {
+                        if (k + 1 >= rest.size()) throw Error(a + " needs a value");
+                        return rest[++k];
+                    };
+                    if (a == "-top") nlTop = val();
+                    else if (a == "-lib") nlLibs.push_back(val());
+                    else if (a == "-se") nlSe = val();
+                    else if (a == "-o" || a == "-threads") val();
+                    else if (a[0] != '-') nlFiles.push_back(a);
+                }
+                if (!edtNetlist.empty()) nlFiles = edtNetlist;
+                if (edtEncode && !nlFiles.empty()) eo.responses = true;
+                if (eo.responses && eo.cubes.empty()) throw Error("-edt_responses needs -edt_cubes FILE");
+            }
             if (edtEncode) {
                 if (eo.cubes.empty()) throw Error("-edt_encode needs -edt_cubes FILE");
                 EdtPlan p;
@@ -335,6 +364,14 @@ struct Cli {
     }
 
     // Encodes -edt_cubes; returns the channel data of the first few patterns for the testbench.
+    std::vector<std::string> nlFiles, nlLibs, edtNetlist;
+    std::string nlTop, nlSe;
+    // What -edt_responses leaves for the pattern testbench.
+    std::unique_ptr<EdtNetlist> edtNl;
+    CubeSet edtCubes;
+    std::vector<EdtEncoder::Result> edtRes;
+    std::vector<EdtResponse> edtRs;
+
     void runEncode(const EdtPlan& p, std::vector<std::vector<std::string>>* tbCh) {
         if (!quiet)
             std::cout << "mdft: scan compression: " << p.n << " chains (longest " << p.len << ") on " << p.c
@@ -342,9 +379,18 @@ struct Cli {
                       << " shift cycles per pattern\n";
         if (eo.cubes.empty()) return;
         CubeSet cs = readCubes(eo.cubes, p);
+        if (eo.responses) {
+            edtNl = std::make_unique<EdtNetlist>(p, nlFiles, nlLibs, nlTop, nlSe);
+            edtNl->toShifted(cs);
+        }
         EdtStats st;
         std::vector<EdtEncoder::Result> res = encodeAll(p, cs, eo, st);
-        if (!eo.patterns.empty()) writeEdtPatterns(eo.patterns, p, cs, res);
+        EdtRespStats rst;
+        if (eo.responses) {
+            edtRs = edtNl->simulate(p, cs, res, st.threads);
+            rst = compactResponses(p, res, edtRs, edtNl->thru, st.threads);
+        }
+        if (!eo.patterns.empty()) writeEdtPatterns(eo.patterns, p, cs, res, eo.responses ? &edtRs : nullptr);
         if (tbCh)
             for (size_t i = 0; i < res.size() && (int)tbCh->size() < eo.tbPatterns; i++)
                 if (res[i].ok) tbCh->push_back(res[i].channels);
@@ -359,7 +405,21 @@ struct Cli {
                           st.encoded, st.total, st.failed, st.total ? (double)st.care / st.total : 0.0, st.maxCare, cells,
                           p.c * p.T, (double)cells / (p.c * p.T), st.seconds, st.threads, st.threads == 1 ? "" : "s");
             std::cout << buf;
+            if (eo.responses) {
+                long cells2 = rst.known + rst.unknown;
+                std::snprintf(buf, sizeof buf,
+                              "  responses: %ld of %ld captured cells are unknown; the compactor shows %.1f%% of the known ones",
+                              rst.unknown, cells2, rst.known ? 100.0 * (double)rst.seen / (double)rst.known : 100.0);
+                std::cout << buf;
+                if (p.xmask) {
+                    std::snprintf(buf, sizeof buf, " (%.1f%% without masking; %ld channel masks used)",
+                                  rst.known ? 100.0 * (double)rst.seenUnmasked / (double)rst.known : 100.0, rst.masked);
+                    std::cout << buf;
+                }
+                std::cout << "\n";
+            }
         }
+        if (eo.responses) edtCubes = std::move(cs), edtRes = std::move(res);
     }
     int runEdt(std::vector<Port> ports, const std::string& top) {
         try {
@@ -378,6 +438,10 @@ struct Cli {
             }
             EdtResult r = insertEdt(ports, top, eo, p, tbCh);
             if (!quiet) std::cout << "  " << r.rtlPath << "\n  " << r.tbPath << "\n";
+            if (eo.responses) {
+                std::string pt = writeEdtPatternTb(ports, top, eo, p, *edtNl, edtCubes, edtRes, edtRs);
+                if (!quiet) std::cout << "  " << pt << "\n";
+            }
             return 0;
         } catch (const Error& e) {
             std::cerr << "mdft: " << e.what() << "\n";

@@ -16,7 +16,11 @@ inline bool makeRails(DB& db) {
     if (p.use != "POWER" && p.use != "GROUND") continue;
     // The widest shape is the rail.
     const phys::LayerRect* rail = nullptr;
-    for (auto& s : p.ports) if (!rail || s.r.w() > rail->r.w()) rail = &s;
+    for (auto& s : p.ports) {
+      const phys::Layer* pl = db.tech.layer(s.layer);
+      if (!pl || pl->type != phys::Layer::Routing) continue;     // a well pin is not a rail
+      if (!rail || s.r.w() > rail->r.w()) rail = &s;
+    }
     if (!rail || rail->r.w() < ref->w) continue;
     phys::Net& n = nets[p.name];
     n.name = p.name; n.use = p.use; n.wiring = "ROUTED";
@@ -229,7 +233,7 @@ inline phys::Design Router::toDef(bool routed) const {
         for (auto& ru : runs) {
           const GLayer& l = gl[ru[0]];
           int64_t half = minHalf(*l.L);
-          if (!half) continue;
+          if (!half || l.extend) continue;
           int64_t a = l.pos[ru[2]], b = l.pos[ru[3]], w = l.L->width;
           if ((b - a + w) * w >= l.L->minArea) continue;
           int64_t grid = std::max<int64_t>(db.tech.mfgGrid, 1);
@@ -247,23 +251,65 @@ inline phys::Design Router::toDef(bool routed) const {
         for (size_t k = 0; k < nt.pins.size(); k++) {
           int an = r.pinNode[k];
           if (an < 0) continue;
+          int ai = r.pinAcc[k];
+          if (ai < 0 || accVia[ai] < 0) continue;
+          n.vias.push_back({pinVias[accVia[ai]].name, accessLayer->name, accX[ai], accY[ai]});
+          // A via off the node: the wire from the node to it.
           int g, t, p;
           int64_t x, y;
           decode(an, g, t, p);
-          if (g != 0) continue;
           xy(g, t, p, x, y);
-          pinShapes(nt.pins[k], shapes);
-          const Rect* on = nullptr;
-          bool direct = false;
-          for (auto& s : shapes) {
-            if (!s.r.contains(x, y)) continue;
-            if (s.layer == gl[0].L->name) direct = true;
-            else if (s.layer == accessLayer->name && (!on || fitsVia(s.r, x, y))) on = &s.r;
+          if (x != accX[ai] || y != accY[ai]) {
+            phys::Seg sg;
+            sg.layer = gl[0].L->name;
+            sg.x0 = std::min(x, accX[ai]); sg.x1 = std::max(x, accX[ai]); sg.y0 = std::min(y, accY[ai]); sg.y1 = std::max(y, accY[ai]);
+            n.segs.push_back(sg);
           }
-          if (direct || !on) continue;
-          const phys::ViaDef* v = pinVia(*on, x, y);
-          if (v) { n.vias.push_back({v->name, accessLayer->name, x, y}); if ((size_t)(v - pinVias.data()) >= pinViasLef) usedGen[v - pinVias.data()] = 1; }
+          if ((size_t)accVia[ai] >= pinViasLef) usedGen[accVia[ai]] = 1;
         }
+      // A via pad of the net beside another, or beside a wire of the net,
+      // with less than a spacing between them: the gap is filled.
+      {
+        struct Pad { int g; Rect r; };
+        std::vector<Pad> pads;
+        for (auto& e : r.edges) {
+          int g1, t1, p1, g2, t2, p2;
+          decode(e.first, g1, t1, p1); decode(e.second, g2, t2, p2);
+          if (g1 == g2) continue;
+          int lo = std::min(g1, g2);
+          int64_t x, y;
+          xy(g1, t1, p1, x, y);
+          pads.push_back({lo, at(gl[lo].padLo, x, y)});
+          pads.push_back({lo + 1, at(gl[lo].padHi, x, y)});
+        }
+        for (int a : r.acc)
+          for (auto& sh : pinVias[accVia[a]].shapes) if (sh.layer == gl[0].L->name) pads.push_back({0, at(sh.r, accX[a], accY[a])});
+        std::sort(pads.begin(), pads.end(), [](const Pad& u, const Pad& v) { return std::tie(u.g, u.r.x0, u.r.y0, u.r.x1, u.r.y1) < std::tie(v.g, v.r.x0, v.r.y0, v.r.x1, v.r.y1); });
+        auto fill = [&](int g, const Rect& a, const Rect& b) {
+          int64_t sp = gl[g].L->spacing, w = gl[g].L->width;
+          int64_t gx = std::max(a.x0 - b.x1, b.x0 - a.x1), gy = std::max(a.y0 - b.y1, b.y0 - a.y1);
+          if (gx > 0 && gx < sp && -gy >= w) n.rects.push_back({gl[g].L->name, Rect{std::min(a.x1, b.x1), std::max(a.y0, b.y0), std::max(a.x0, b.x0), std::min(a.y1, b.y1)}});
+          else if (gy > 0 && gy < sp && -gx >= w) n.rects.push_back({gl[g].L->name, Rect{std::max(a.x0, b.x0), std::min(a.y1, b.y1), std::min(a.x1, b.x1), std::max(a.y0, b.y0)}});
+        };
+        for (size_t i = 0; i < pads.size(); i++) {
+          const GLayer& l = gl[pads[i].g];
+          for (size_t j = i + 1; j < pads.size() && pads[j].g == pads[i].g && pads[j].r.x0 < pads[i].r.x1 + l.L->spacing; j++) fill(pads[i].g, pads[i].r, pads[j].r);
+          // Wires on the tracks next to a wide pad.
+          if (!l.wideUp && !l.wideDn) continue;
+          const Rect& a = pads[i].r;
+          int64_t c = l.horiz ? (a.y0 + a.y1) / 2 : (a.x0 + a.x1) / 2, w = l.L->width;
+          for (size_t k = 0; k < steps.size();) {
+            size_t e = k;
+            int end = steps[k][3];
+            while (e + 1 < steps.size() && steps[e + 1][0] == steps[k][0] && steps[e + 1][1] == steps[k][1] && steps[e + 1][2] <= end) { e++; end = std::max(end, steps[e][3]); }
+            if (steps[k][0] == pads[i].g && l.trk[steps[k][1]] != c) {
+              int64_t t = l.trk[steps[k][1]], lo = l.pos[steps[k][2]] - w / 2, hi = l.pos[end] + w / 2;
+              fill(pads[i].g, a, l.horiz ? Rect{lo, t - w / 2, hi, t + w / 2} : Rect{t - w / 2, lo, t + w / 2, hi});
+            }
+            k = e + 1;
+          }
+        }
+      }
     }
     d.nets.push_back(std::move(n));
   }

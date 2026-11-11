@@ -31,7 +31,8 @@ registers. The patch is that one gate, not fourteen cones.
 
 Exit status: 0 the patched netlist is proved equivalent to the new design,
 1 it is not (a proof failed or ran out of effort; the report names the
-points), 2 a file could not be read.
+points), 2 a file could not be read, 3 proved, but `-spare` could not do it
+without adding a cell.
 
 ## Options
 
@@ -47,6 +48,8 @@ points), 2 a file could not be read.
 | `-report FILE` | Write the report to a file as well |
 | `-prefix STR` | Prefix of added cells and nets (default `ECO_`) |
 | `-no-sweep` | Keep old cells that end up driving nothing |
+| `-spare` | Metal-only: add and remove no cell (see below) |
+| `-spare-cells GLOB` | `-spare`, with only the unloaded cells of this instance name as spare cells |
 | `-no-rectify` | Only copy the changed cones; do not look for the gate to change |
 | `-budget N` | SAT conflicts per proof (default 100000) |
 | `-threads N` | Worker threads. Default: all logical cores. The result does not depend on N |
@@ -97,6 +100,39 @@ scan: with scan enable held at 0 the scan flop is the plain flop.
 Proofs are independent of each other and run on all cores; results are
 combined in a fixed order, so the patch is the same for any `-threads`.
 
+## Metal-only: `-spare`
+
+After the base layers are made, an ECO can change wires but not cells.
+`-spare` builds the patch from cells that are already there:
+
+- the spare cells: cells of the old netlist that drive nothing (all of them,
+  or those `-spare-cells 'spare_*'` names);
+- the cells the change itself frees. They are not removed: their inputs are
+  tied low and they are spare cells from then on.
+
+Each gate of the patch is moved onto a free cell that can compute it: the
+same cell, or another one with inputs tied or sharing a net (an OR2 from a
+MUX2 with `S` and `B` together, an inverter from a NAND2), or the inverse
+function with a spare cell as inverter behind it. Among the cells that fit,
+the one with the fewest inputs is taken.
+
+```
+  > cy2/A <- 1'b0
+  > cy2/B <- 1'b0
+  > spare_m0/A <- c[1]
+  > spare_m0/B <- a[2]
+  > spare_m0/S <- a[2]
+  > spare_m0/Y <- ECO_c[2]
+meco: 81 compare points, 14 changed; patch: +0 cells (area 0), -0 cells (area 0), 8 pins rewired, 2 existing nets reused; patched netlist proved equivalent
+meco: metal-only: 1 spare cells used, 1 old cells left as spares, 0 cells without a spare
+```
+
+The script then holds only `connect_net` and `disconnect_net`. A gate no
+free cell can stand in for is added as a normal cell, the report lists it
+(`no spare cell for ...`) and the exit status is 3. Registers are in that
+group for now: a register of the patch is not moved onto a spare flop.
+Spare cells are chosen by function, not by where they sit on the die.
+
 ## The edit script
 
 ```tcl
@@ -125,7 +161,7 @@ copy with three gates changed, re-rendered under other net names.
 
 `tests/meco.cmake` runs the cases in `tests/eco` (scan against no scan, a
 deep one-gate change, added, removed and replaced registers, a hierarchical
-netlist, a memory) and checks the patch, the proof, that a second run on the
+netlist, a memory, spare cells) and checks the patch, the proof, that a second run on the
 patched netlist finds nothing to change, and that one thread and four give
 the same files. `tests/eco/fuzz.py` makes random netlists and random edits,
 and also simulates each patched netlist against the new one in `msim`.
@@ -138,5 +174,5 @@ and also simulates each patched netlist against the new one in `msim`.
 - An old net is reused when it has the same function, not when it has the
   inverse.
 - Registers are matched by name only.
-- No metal-only mode yet: the patch uses new cells, not the spare cells
-  already on the die.
+- `-spare` places gates but not registers on spare cells, and does not
+  look at placement when it picks one.

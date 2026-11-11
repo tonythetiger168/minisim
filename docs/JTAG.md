@@ -274,10 +274,47 @@ chain in shift mode is a shift register, so what leaves it is what the
 decompressor put in `length` cycles before. That checks the decompressor, the
 compactor, the wiring and the chain lengths against the encoder's model.
 
-Not there yet: X masking in the compactor (an unknown response bit spoils its
-output channel for that cycle), expected compacted responses (they need the
-good-machine responses from fault simulation), and reading the ATPG tool's
-own pattern format directly.
+### Expected responses and X masking
+
+With the scan-inserted gate netlist the encoder also says what the tester
+must see. `-edt_encode ... netlist.v [-lib L] [-top M] [-se PORT]`, or
+`-edt ... -edt_netlist netlist.v`, simulates every encoded pattern on the
+netlist (the good machine of the shared fault simulator): the decompressed
+load plus the port inputs give what each scan cell captures, 0, 1 or
+unknown. The pattern file gains
+
+- `<pattern> capture <chain> <bits>`: the captured cell states, `x` unknown;
+- `<pattern> out <channel> <bits>`: the output channel in each of the T shift
+  cycles of the unload, `x` where the tester must not compare.
+
+A pattern unloads while the next one in the file loads (after the last: T
+cycles with the channels at 0), and the `out` lines assume that order. The
+netlist also tells where a chain inverts, which the scan description does
+not: cubes and `load` lines are cell states, and the encoder converts.
+
+One unknown cell makes its channel unknown for that cycle, and with it every
+other chain on the channel. `-edt_xmask` adds mask logic to the compactor
+and one pin, `edt_mask_in`: per output channel an enable bit and a chain
+index. Enable 0 gives the XOR of all the channel's chains, 1 one chain alone.
+The mask bits go in on `edt_mask_in` during the last shift cycles of the
+pattern's own load and take effect at its capture (`edt_update`), so they
+are in place for the unload. The encoder picks, per pattern and channel, the
+setting that shows the most known cells and writes it as
+`<pattern> mask <bits>`; the report says how many known cells reach the
+tester with and without masking.
+
+`-edt` with a netlist also writes `chip_edt_pat_tb.sv`: the first patterns
+with load, capture and compare on the wrapper around the netlist. It fails
+when the netlist has a defect the patterns detect.
+
+The pattern testbench writes its mismatches as a fail log with `+faillog`
+(`chip_edt.faillog`), one line per failing channel bit:
+`<pattern> ch <channel> <unload cycle>`. `mdft -diagnose` reads such a log
+with the compressed patterns in place of matpg's, see below.
+
+Not there yet: grading the masked patterns by fault simulation (a mask is
+chosen by the number of known cells, not by the faults they detect), and
+compare values for the port outputs.
 
 `matpg -cubes FILE` writes cubes the encoder reads as they are: it numbers
 the chains in its own order and names their scan-in ports in a `chains` line,
@@ -379,3 +416,20 @@ compactor mapped back to cells first, which `-edt` does not do yet.
 
 Speed: a 60,000-gate, 6,000-flop netlist with 4,677 patterns and two
 injected defects diagnoses in 2.3 s on one thread and 0.6 s on four.
+
+### Compressed patterns
+
+```sh
+mdft -diagnose chip_edt.faillog -edt_patterns p.txt chip_scan.v -top chip
+```
+
+With `-edt_patterns` (the file `-edt_encode` or `-edt` writes when it has
+the netlist) the log is in output channel bits, `<pattern> ch <channel>
+<unload cycle>`, as the tester sees them. A channel bit is the XOR of the
+cells its chains show in that cycle, as far as the pattern's mask lets them
+through; a bit with an unknown in it is not compared. The diagnosis folds
+every candidate's failing cells through the same compactor, so two failing
+cells that cancel in a channel are predicted to pass, and scores against the
+channel bits. Candidates come from the fan-in of every cell that can reach a
+failing bit. Stuck-at only; port outputs are not compared in compressed
+patterns. `-diag_inject` and `-diag_log` work the same way.

@@ -4,11 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static uint8_t mem[0x2000];
+static uint8_t mem[0x8000];
 
 static void range(uint32_t addr, uint32_t size)
 {
-  if (addr < 0x1000 || addr + size > 0x2000 || addr % 4 || size % 4) {
+  if (addr < 0x1000 || addr + size > 0x8000 || addr % 4 || size % 4) {
     printf("ERROR: bad region %x +%u\n", (unsigned)addr, (unsigned)size);
     exit(1);
   }
@@ -28,10 +28,11 @@ void dma_copy(uint8_t chan, uint32_t src, uint32_t dst, uint16_t size)
   }
   for (unsigned i = 0; i < size; i++) mem[dst + i] = mem[src + i];
 }
-uint32_t mem_sum(uint32_t addr, uint16_t size)
+/* The bytes that are not what the first write of this data put there. */
+uint32_t mem_check(uint32_t addr, uint16_t size, uint8_t seed)
 {
-  uint32_t s = 0;
+  uint32_t bad = 0;
   range(addr, size);
-  for (unsigned i = 0; i < size; i++) s += mem[addr + i];
-  return s | 1;   /* the data depends on the order of overlapping copies; the test prints none of it */
+  for (unsigned i = 0; i < size; i++) bad += mem[addr + i] != (uint8_t)(seed + i);
+  return bad;
 }
