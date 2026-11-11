@@ -1,0 +1,31 @@
+@PACKAGE_INIT@
+
+# minisimCore: the kernel headers a minisim tool builds against, exported so a
+# tool kept outside this repository links them instead of copying them.
+# docs/LICENSING.md says which tools those are.
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+set(MINISIM_CORE_WITH_FST @MINISIM_WITH_FST@)
+set(MINISIM_CORE_WITH_OPENSSL @OPENSSL_FOUND@)
+if(MINISIM_CORE_WITH_FST)
+  find_dependency(ZLIB)
+endif()
+if(MINISIM_CORE_WITH_OPENSSL)
+  find_dependency(OpenSSL COMPONENTS Crypto)
+endif()
+
+# slang is not installed by minisim: a consumer either has it installed, or
+# fetches the same version (@MINISIM_CORE_SLANG_TAG@) the way minisim does.
+# Saying so here beats a link error naming a slang symbol.
+if(NOT TARGET slang::slang)
+  find_dependency(slang)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/minisimCoreTargets.cmake")
+
+# slang is not part of the export set (minisim fetches it), so it is linked
+# here, once the imported target exists.
+set_property(TARGET minisim::core APPEND PROPERTY INTERFACE_LINK_LIBRARIES slang::slang)
+check_required_components(minisimCore)
