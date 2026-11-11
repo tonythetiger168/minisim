@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
+  and transitions of FSMs), in the totals, the history and `mplan init`.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
   inside a scope, their port connections and which instance feeds which.
 - `mdebug`: tasks and functions in a module, call output arguments, `force`,

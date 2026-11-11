@@ -272,7 +272,7 @@ plan uart "UART verification plan"
   owner: tony
   feature tx "Transmit path" weight=2 owner=alice
     test   uart_tx_*                # mregress tests
-    line   rtl/uart_tx.sv goal=95   # code coverage
+    line   rtl/uart_tx.sv goal=95   # code coverage (also branch, toggle, cond, fsm)
     cover  tb.cg_tx                 # a covergroup type, or type.item
     assert tb.dut.u_tx              # the assertions in that scope
     feature parity "Parity"
