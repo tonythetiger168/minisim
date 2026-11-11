@@ -15,6 +15,12 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `msupport`: an AI support agent per product. Each answers from its
+  product's documentation (BM25 search over the manuals), can run a short
+  example on the product's tool in a sandbox, and files a ticket when the
+  documentation does not answer; command line, terminal chat and a local web
+  service. Product files for the nine free tools in `support/products/`.
+  Not online yet. See `docs/SUPPORT.md`.
 - `meco -spare` (and `-spare-cells GLOB`): metal-only ECO. The patch is
   built from the spare cells of the old netlist and the cells the change
   frees, by function (the same cell, or one with inputs tied or shared, or
