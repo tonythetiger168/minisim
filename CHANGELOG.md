@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -vcd-arrays [N]`: unpacked array elements (memories of up to N
+  elements, default 1024) in the VCD or FST, as `mem[3]`. Off by default;
+  the default waveform is unchanged. `mdebug -active` follows a memory read
+  to the element and the write that filled it.
 - `mpnr -lib FILE -sdc FILE`: timing of the placed design with the engine
   behind `msta` (wires estimated from the placement), reported after global
   placement and after legalization with the clocks propagated through
@@ -127,6 +131,19 @@ Spec references are IEEE 1800-2023 clauses.
   (`-Werror`). Multi-core by default (`-threads N`), same file for any thread
   count. `src/spef.hpp` is the SPEF reader and writer for the other tools.
   See `docs/RCX.md`.
+- `mchar`, cell library characterization on `mspice`: from a Liberty
+  template and one transistor `.subckt` per cell it measures delay and
+  transition tables (combinational, clock-to-output, set and reset arcs,
+  tristate enable), setup, hold, recovery and removal tables and minimum
+  pulse widths by bisection, internal energy,
+  pin capacitance and leakage, and writes Liberty with the shared writer.
+  The stimulus for each arc is found from the Liberty functions and `ff` /
+  `latch` groups. Every table point runs as its own task on all logical
+  CPUs (`-threads N`) with byte-identical output. `lib/mini45` gains
+  transistor netlists (`mini45.sp`) and device models per corner, and its
+  timing, power and capacitance tables are now measured, not analytic
+  (leakage and tristate disable arcs stay analytic). See
+  `docs/CHAR.md`.
 - `mlibc`, cell library checks and reports on the shared Liberty and LEF
   readers: `mlibc check` (23 rules: function against timing arcs and
   `timing_sense`, tables that shrink with load, missing setup or hold,
@@ -188,6 +205,18 @@ Spec references are IEEE 1800-2023 clauses.
 - `mhls -handshake`: also writes `<top>_hs`, the block behind
   `in_valid`/`in_ready` and `out_valid`/`out_ready` ports (FSM and pipeline);
   the generated testbench drives it with a sink that refuses now and then.
+- `mhls`: stream arguments. A `hls::stream<T>&` parameter becomes a
+  `tdata`/`tvalid`/`tready` port; `read()` and `write(x)` are transfers the
+  state machine waits for. `include/mhls_stream.h` runs the same source on
+  the host; the testbench source and sink hesitate on every other call. A
+  pipelined loop over streams moves one element per cycle and stalls as a
+  whole.
+- `mhls -clang`: C++ classes and templates. The installed clang (run as a
+  program) reads the source; mhls reduces its syntax tree to plain functions
+  over structs: member functions, constructors, operators, class and
+  function templates, default arguments, overloads, static members, scoped
+  enums, namespaces, and whatever the design uses from its headers
+  (`std::min`, `std::max` included). `-emit-c` shows the reduction.
 - Functional coverage in the coverage database: `msim -cov` records the bins
   of every covergroup type (19.11) and the statistics of every assertion
   (16.3); `mcov` merges and reports them (`-min-func`, `-min-assert`).
