@@ -249,6 +249,46 @@ mcov report all.json -uncovered           # only what is missing
 mcov report all.json -min-cond 80 -min-fsm-state 100 -min-fsm-trans 90
 ```
 
+**Exclusions.** Items that cannot or need not be covered go in an exclusion
+file (as URG's `-elfile`), one per line with the reason; they are left out of
+every number and report:
+
+```
+state  tb.dut.u.state FAIL     -- error injection is not in this regression
+trans  tb.dut.u.state RUN->IDLE -- reset only
+cond   rtl/ctrl.sv:60 3        -- b is tied high in this configuration
+line   rtl/ctrl.sv:40-44       -- unreachable with WIDTH=8
+toggle tb.dut.bus[31:24]       -- upper byte unused
+file   rtl/dbg_*.sv            -- debug only
+```
+
+```sh
+mcov exclude all.json -o draft.el                    # one exclusion per uncovered item, reason TODO
+mcov report all.json -elfile ok.el -el-review        # each exclusion, what it removes, what to review
+mcov report all.json -elfile ok.el -el-strict        # exit 1 on a stale, covered or unexplained exclusion
+```
+
+`-el-review` flags an exclusion that matches nothing (the code changed), one
+that removes items the tests did cover, and one without a reason. Kinds:
+`file`, `line`, `branch`, `cond`, `toggle`, `fsm`, `state`, `trans`, `cg`,
+`assert`; names take `*` and `?`.
+
+**Which test covers what.** With one database per test, `mcov rank` orders
+the tests so that each next one adds the most items not yet covered, and
+shows what only one test covers and which tests add nothing:
+
+```sh
+mcov rank cov/*.json -o keep.txt       # keep.txt: the tests that add coverage, best first
+mcov rank cov/*.json -item rtl/ctrl.sv:52     # the tests that cover this line (or signal, FSM, covergroup)
+```
+
+```
+Rank  Test          Covers   Only it      Adds             Total
+   1  smoke.json      170        19       170       170   87.6%
+   2  reset.json      151         0         0       170   87.6%
+2 test(s), 194 item(s); the first 1 reach the total, 1 add nothing
+```
+
 ```
 Condition tb.sv:30:15  a && b
     -1- a

@@ -45,6 +45,7 @@ struct OpenArr {
 
 struct Scope {
     std::string name;
+    bool prot = false;   // inside protected IP: its name is not given out (IEEE 1735 9.7.2.3)
     std::map<void*, void*> user;
 };
 
@@ -649,7 +650,14 @@ svScope svSetScope(const svScope scope) {
     dpi::st().scope = (dpi::Scope*)scope;
     return old;
 }
-const char* svGetNameFromScope(const svScope s) { return s ? ((dpi::Scope*)s)->name.c_str() : nullptr; }
+// A scope inside protected IP gives a fixed, meaningless name (IEEE 1735
+// 9.7.2.3). svGetScopeFromName still finds it by its disclosed name, so an
+// import can set up its context and keep user data there.
+const char* svGetNameFromScope(const svScope s) {
+    if (!s) return nullptr;
+    const dpi::Scope* sc = (const dpi::Scope*)s;
+    return sc->prot ? "<protected>" : sc->name.c_str();
+}
 svScope svGetScopeFromName(const char* name) {
     if (!name) return nullptr;
     auto& m = dpi::st().scopes;
@@ -769,6 +777,7 @@ inline void collectExports(const LowerResult& lr) {
 // function such as abs needs no library).
 inline bool setup(const LowerResult& lr, const std::vector<std::string>& libs, std::string& err) {
     for (auto& sc : lr.scopes) scopeOf(sc);
+    for (auto& sc : lr.protScopes) scopeOf(sc)->prot = true;
     for (auto& path : libs) {
         void* h = dlopen(path.c_str(), RTLD_LAZY | RTLD_GLOBAL);
         if (!h) { err = std::string("cannot load ") + path + ": " + dlerror(); return false; }

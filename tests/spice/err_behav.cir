@@ -1,0 +1,8 @@
+a behavioral source that reads a current nothing carries
+v1 a 0 1
+r1 a 0 1k
+b1 b 0 v = i(r1) * 2
+r2 b 0 1k
+.op
+*> error "i(r1): only voltage sources, inductors, E and H sources carry a current to read"
+.end
