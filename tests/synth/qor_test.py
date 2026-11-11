@@ -58,6 +58,28 @@ r2 = subprocess.run([msynth, "-top", "dup", "-o", net2, dup], stdout=subprocess.
 check(r2.returncode == 0, "msynth failed on dup.sv")
 check("Information: merged" in r2.stdout, "no nodes merged in dup.sv")
 check("Mapped design 'dup': 0 cells" in r2.stdout, "dup.sv should need no cells:\n" + r2.stdout[:600])
+
+# 'x is a don't-care: a select with an 'x arm is the other arm. A register
+# without reset whose next state is a constant is that constant.
+dc = os.path.join(work, "dc.sv")
+open(dc, "w").write("""module dc (input logic clk, s, input logic [3:0] a, output logic [3:0] o, p);
+    logic one;
+    logic [3:0] t;
+    always_comb
+        case (s)
+            1'b1: t = a;
+            default: t = 'x;
+        endcase
+    always_ff @(posedge clk) one <= 1'b1;
+    assign o = t;
+    assign p = a & {4{one}};
+endmodule
+""")
+r3 = subprocess.run([msynth, "-top", "dc", "-o", os.path.join(work, "dc_qor.v"), dc],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+check(r3.returncode == 0, "msynth failed on dc.sv")
+check("removed 1 unloaded or constant register bits" in r3.stdout, "dc.sv: expected 1 register bit removed")
+check("Mapped design 'dc': 0 cells" in r3.stdout, "dc.sv should need no cells:\n" + r3.stdout[:600])
 if fails:
     print(out)
     print(cells)

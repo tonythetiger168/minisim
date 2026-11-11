@@ -156,9 +156,11 @@ Spec references are IEEE 1800-2023 clauses.
   value are removed (`aig::sweep`), nested selects fold into one
   (`aig::Graph::mux`), load enables use the library's enable flops, and
   wide selects use 4:1 mux cells; logic that computes the same function
-  twice is merged by simulation and SAT (`src/synth/fraig.hpp`). PicoRV32
-  on mini45: 30669 to 18877 (Yosys with ABC: 15458, in 7 times the run
-  time); the ALU test design: 6536 to 4682. See `docs/SYNTH.md`.
+  twice is merged by simulation and SAT (`src/synth/fraig.hpp`); `'x` in a
+  select is a don't-care, and registers without reset that only hold a
+  constant are removed. PicoRV32 on mini45: 30669 to 18098 (Yosys with
+  ABC: 15458, in 7 times the run time); the ALU test design: 6536 to 4682.
+  See `docs/SYNTH.md`.
 - `mhls`: high-level synthesis, C/C++ to SystemVerilog. A C subset (integer
   types up to 64 bits including `ap_int`/`ap_uint`, arrays, inlined
   functions, all control flow but `goto`) is scheduled into clock cycles

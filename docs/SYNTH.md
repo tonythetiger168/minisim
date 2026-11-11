@@ -40,8 +40,11 @@ write_sdc core.sdc
    8 bits up; multipliers are carry-save arrays; dividers are restoring.
    Structural hashing shares equal logic as it is built, and nested
    selects with a shared arm (`if (a) if (b) x <= d;`) fold into one
-   select with a combined condition. Registers that reach no output, and
-   registers stuck at their asynchronous reset value, are then removed
+   select with a combined condition. An `'x` in the source is a
+   don't-care: a select with an `'x` arm is its other arm (elsewhere `'x`
+   is 0). Registers that reach no output, registers stuck at their
+   asynchronous reset value, and registers without reset whose next state
+   is a constant or only themselves, are then removed
    (`Information: removed N unloaded or constant register bits`).
    Last, functional reduction (`src/synth/fraig.hpp`): nodes are simulated
    with random patterns, nodes with the same signature are candidates, and
@@ -153,16 +156,23 @@ same RTL and the same library (mini45, typical corner), one machine:
 
 | design | msynth area | Yosys area | msynth time | Yosys time |
 |---|---|---|---|---|
-| PicoRV32 (default parameters) | 18877 | 15458 | 0.8 s | 5.4 s |
+| PicoRV32 (default parameters) | 18098 | 15458 | 0.8 s | 5.4 s |
 | tests/synth/mem.sv (three small memories) | 2149 | 2297 | 0.03 s | 0.4 s |
 | tests/synth/counter.sv | 92 | 85 | 0.03 s | 0.2 s |
 
 Most of msynth's time on PicoRV32 is functional reduction (0.7 s); without
-it the run takes 0.1 s and the area is 19295.
+it the run takes 0.1 s and the area is about 3% larger.
 
 msynth's figures include its fanout buffers (Yosys adds none; about 700
 of PicoRV32's area). Yosys 0.33 does not read the SystemVerilog of the
 other test designs.
+
+Where the difference to Yosys is, measured on PicoRV32: ABC's
+optimization scripts (`dc2`, `resyn2`) on msynth's graph, mapped by
+msynth, gain 3 to 4%; ABC's own mappers (`map`, `amap`, `&nf` with `dch`)
+on the same graph give more area than msynth's. Yosys's netlist before
+ABC, read by msynth, maps to 16817. So about half of the gap is in how the
+RTL is turned into logic, and half is ABC's optimization on Yosys's side.
 
 ## Tests
 

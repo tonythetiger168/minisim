@@ -80,6 +80,14 @@ struct Graph {
         nodes.push_back(n);
         return mklit((uint32_t)nodes.size() - 1);
     }
+    // The don't-care value ('x in the source): a leaf that mux() resolves to
+    // the other arm, and that cleanup() turns into 0 wherever it is left.
+    Lit xl = NOLIT;
+    Lit dontCare() {
+        if (xl == NOLIT) xl = input("$x");
+        return xl;
+    }
+    bool isX(Lit l) const { return xl != NOLIT && (l | 1u) == (xl | 1u); }
     Lit wire() {
         Node n;
         n.k = NK::Wire;
@@ -148,6 +156,8 @@ struct Graph {
         if (s == L1) return t;
         if (s == L0) return e;
         if (t == e) return t;
+        if (isX(t) || isX(s)) return e;
+        if (isX(e)) return t;
         if (t == L1) return orl(s, e);
         if (t == L0) return andl(lneg(s), e);
         if (e == L1) return orl(lneg(s), t);
@@ -492,7 +502,7 @@ inline Design cleanup(const Design& in, const std::vector<uint8_t>* keep = nullp
     for (size_t i = 0; i < g.inputNames.size(); i++) (void)0;
     // inputs keep their order
     for (uint32_t n = 1; n < g.size(); n++)
-        if (g.nodes[n].k == NK::Input) map[n] = ng.input(g.inputNames[g.nodes[n].aux]);
+        if (g.nodes[n].k == NK::Input) map[n] = g.isX(mklit(n)) ? L0 : ng.input(g.inputNames[g.nodes[n].aux]);
     for (uint32_t n = 1; n < g.size(); n++)
         if (g.nodes[n].k == NK::Dff && (!keep || (*keep)[n])) {
             Flop f = g.flops[g.nodes[n].aux];
@@ -656,7 +666,17 @@ inline Design sweep(Design d, size_t* removed = nullptr) {
             if (nd.k != NK::Dff) continue;
             const Flop& f = g.flops[nd.aux];
             Lit c = f.rval ? L1 : L0;
-            if (f.arst == NOLIT) continue;
+            if (f.arst == NOLIT) {
+                // No reset: a constant next state is that constant after the
+                // first clock edge, and a register that only keeps its
+                // value never had one; both become constants (0 for the latter).
+                if (f.d == L0 || f.d == L1 || f.d == mklit(n)) {
+                    nd.k = NK::Wire;
+                    nd.a = f.d == L1 ? L1 : L0;
+                    changed = true;
+                }
+                continue;
+            }
             // stays at c: d is c, q itself, q & x (c = 0) or q | x (c = 1)
             bool stuck = f.d == c || f.d == mklit(n);
             const Node& dn = g.nodes[lnode(f.d)];

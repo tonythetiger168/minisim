@@ -165,7 +165,7 @@ class Elaborator {
         for (int i = 0; i < w; i++) {
             if (i < n) {
                 slang::logic_t b = v[i];
-                r[i] = (!b.isUnknown() && (bool)b) ? L1 : L0;
+                r[i] = exactlyEqual(b, slang::logic_t::x) ? g.dontCare() : (!b.isUnknown() && (bool)b) ? L1 : L0;
             } else if (v.isSigned() && n > 0) {
                 r[i] = r[n - 1];
             }
@@ -656,7 +656,8 @@ public:
             case EK::IntegerLiteral: return fromSV(e.as<IntegerLiteral>().getValue(), widthOf(*e.type, loc));
             case EK::UnbasedUnsizedIntegerLiteral: {
                 auto v = e.as<UnbasedUnsizedIntegerLiteral>().getLiteralValue();
-                return Bits(widthOf(*e.type, loc), (!v.isUnknown() && (bool)v) ? L1 : L0);
+                return Bits(widthOf(*e.type, loc),
+                            exactlyEqual(v, slang::logic_t::x) ? g.dontCare() : (!v.isUnknown() && (bool)v) ? L1 : L0);
             }
             case EK::StringLiteral: return fromCV(tryConst(e), *e.type, loc);
             case EK::NamedValue:
