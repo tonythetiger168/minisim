@@ -65,12 +65,20 @@ A netlist read together with its whole cell library has many unused modules;
    computes (asynchronous set/reset included, as written), and its trigger is
    the clock and async controls. A bit that a level-sensitive block does not
    assign on every path is a latch; that is decided by proof, so a full `case`
-   without a `default` is plain logic.
+   without a `default` is plain logic. An event that leaves a register
+   unchanged while it is active is left out of that register's trigger, so a
+   memory written in a block with an asynchronous reset that does not reset
+   it equals the plain clocked flops synthesis builds for it.
 3. **Matching.** Inputs, outputs and state elements are paired by name: exact,
    then normalized (`u_core.cnt[3]`, `u_core_cnt_reg_3_` and
    `\u_core/cnt_reg[3]` are one name), then by the cell instance that holds
    the state, then by the net on the flop's output pin, which also finds
-   registers that synthesis stored inverted. `-match REF=IMPL` and
+   registers that synthesis stored inverted. A register matched by name
+   whose next-state function still differs is retried with the other
+   polarity, which finds one stored inverted with no net left to show it
+   (a set-type register on a library whose flops only clear). A struct or memory that
+   synthesis flattened is matched by bit position in the whole variable
+   (`item.valid` of a 12-bit struct is `item_reg_11_`). `-match REF=IMPL` and
    `-matchfile` add pairs by hand.
 4. **Proof.** Each matched pair of state elements is cut, which leaves a
    combinational question per compare point: every output, every next-state
@@ -127,6 +135,8 @@ thread count.
 | `-lib FILE` | Liberty library for cells with no Verilog definition |
 | `-blackbox MOD` | do not look inside MOD |
 | `-noclockgate` | compare gated clocks as they are, without turning them into enables |
+| `-nofullcase` | ignore `(* full_case *)`: a case with no matching arm keeps the old value |
+| `-noconstreg` | do not read a reference flop that can hold only one value as a constant |
 | `-threads N` | worker threads (default: all logical cores) |
 | `-effort N` | SAT conflicts allowed per compare point (default 2000000) |
 | `-maxfail N` | failing points printed in detail (default 10) |
@@ -150,6 +160,25 @@ netlist with yet another architecture (Booth recoding) can still exhaust
 `-effort` and report those outputs as aborted, which is inconclusive, never a
 pass.
 
+## Against Yosys and ABC
+
+Measured on 4 cores with Yosys 0.33 (`equiv_make; equiv_simple; equiv_induct`)
+and its bundled ABC (`cec` on both sides bit-blasted to AND gates), 300 s
+limit. The netlists are `msynth` output on its generic library, except the
+datapath, which Yosys synthesized itself.
+
+| Design | Yosys equiv | ABC cec | mequiv |
+|---|---|---|---|
+| 8x8 multiplier and adder | 24 s | 19 s | 0.2 s |
+| 16x16 multiplier and adder | over 300 s | over 300 s | 2.0 s |
+| 32x32 multiplier and adder | not run | not run | 28 s |
+| datapath (dividers, 8-bit multiplier, flops) | 0.8 s | combinational only | 0.2 s |
+
+The multiplier rows are where the lead comes from: mequiv knows the
+architectures a synthesis tool emits (see Datapaths above), the other two
+treat the product as plain logic. On control logic all three finish in well
+under a second.
+
 ## Not yet
 
 - Sequential UDPs and Liberty `statetable` cells.
@@ -159,7 +188,42 @@ pass.
 ## The pieces
 
 `src/equiv/` is header-only and usable as a library (namespace `equiv`):
-`aig.hpp` (the graph), `bv.hpp` (bit vectors with X), `sat.hpp` and `cnf.hpp`
-(the solver and the encoding), `elab.hpp` (a slang compilation to a `Design`),
+`aig.hpp` (mequiv's names on the shared graph in `src/aig.hpp`), `bv.hpp` (bit vectors with X), `cnf.hpp`
+(the encoding), `elab.hpp` (a slang compilation to a `Design`),
 `check.hpp` (`equiv::check(aig, ref, impl, options)` returns every compare
-point with its status and counterexample).
+point with its status and counterexample). The SAT solver is CaDiCaL behind
+`src/sat.hpp`, the interface the other minisim tools share.
+
+A part-select above a select whose index is not constant (`mem[addr][7:0] <= ...`, a
+byte-lane write) is taken as a possible write to every word the index can reach; the
+part-select narrows the write itself, not the set of bits the block is known to drive.
+
+### Constant registers
+
+Synthesis removes a register that can never leave its reset value: one with an
+asynchronous reset to `c` whose next state is `c` whenever it holds `c`
+(`q <= q & en` after a reset to 0, `q <= q` after a reset to 1). The netlist has
+the constant in its place. A reference flop of that shape with no partner in the
+implementation is read as that constant, and the run reports how many
+(`-verbose` names them). This takes the reset as applied, as the netlist does:
+before the first reset the RTL register is unknown and the netlist's constant is
+one of the values it may have. `-noconstreg` compares with the register left
+free, and such a design then fails. A register the implementation still has is
+never treated this way.
+
+The same reading covers two more shapes with no reset involved: a flop that
+only ever loads one constant (taken as clocked once), and a flop that is never
+given a definite value at all (never assigned, or only assigned `'x`). The last
+is unknown for good in the RTL; synthesis ties it to 0 and mequiv reads it as 0.
+
+### Don't-cares in the reference
+
+An X in the reference matches anything in the implementation, as it does in
+simulation-based sign-off and in commercial checkers by default. Sources of X:
+an explicit `'x` assignment, an out-of-range index, `unique`/`priority` case with
+no arm matching, and `(* full_case *)` on a case with no default: the attribute
+says the missing values never occur, so the signals the case assigns are
+don't-cares there instead of holding their old value (which in a combinational
+block would be a latch). `-nofullcase` gives the plain Verilog reading back.
+PicoRV32 synthesized by msynth on mini45 proves equivalent with these readings
+(3553 compare points, about 0.3 s).

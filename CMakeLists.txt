@@ -72,6 +72,9 @@ add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
 
+# The mini45 cell library: generator check and install rules.
+include(cmake/tools/mini45.cmake)
+
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -83,6 +86,7 @@ if(Python3_FOUND)
 endif()
 
 # Tools that need nothing but the compiler: one file each in cmake/tools.
+include(cmake/tools/memu.cmake)
 include(cmake/tools/mrcx.cmake)
 include(cmake/tools/shared_par_wave.cmake)
 include(cmake/tools/mequiv.cmake)
@@ -158,24 +162,6 @@ if(MINISIM_WITH_SLANG)
     target_compile_definitions(mlint PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
-  # Formal property checking on the same lowering: mformal design.sv
-  # The SAT solver is CaDiCaL (MIT), pinned to a release.
-  FetchContent_Declare(cadical
-    GIT_REPOSITORY https://github.com/arminbiere/cadical.git
-    GIT_TAG rel-2.1.3
-    GIT_SHALLOW TRUE)
-  FetchContent_Populate(cadical)
-  file(GLOB CADICAL_SRC ${cadical_SOURCE_DIR}/src/*.cpp)
-  list(FILTER CADICAL_SRC EXCLUDE REGEX "/(cadical|mobical)\\.cpp$")
-  add_library(cadical STATIC ${CADICAL_SRC})
-  target_include_directories(cadical PUBLIC ${cadical_SOURCE_DIR}/src)
-  target_compile_definitions(cadical PRIVATE NBUILD NDEBUG NCLOSEFROM)
-  target_compile_options(cadical PRIVATE -O3 -w)
-  find_package(Threads REQUIRED)
-  add_executable(mformal src/mformal.cpp)
-  target_include_directories(mformal PRIVATE src)
-  target_link_libraries(mformal PRIVATE slang::slang cadical Threads::Threads)
-
   # Design-for-test checks and a scan chain plan: mdft design.sv
   add_executable(mdft src/mdft.cpp)
   target_include_directories(mdft PRIVATE src)
@@ -201,6 +187,13 @@ if(MINISIM_WITH_SLANG)
   target_link_libraries(test_lower PRIVATE slang::slang)
   target_compile_definitions(test_lower PRIVATE MINISIM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME test_lower COMMAND test_lower)
+
+  # The FSM extractor as other tools use it: the header and slang, nothing else.
+  add_executable(test_fsm_extract tests/test_fsm_extract.cpp)
+  target_include_directories(test_fsm_extract PRIVATE src)
+  target_link_libraries(test_fsm_extract PRIVATE slang::slang)
+  target_compile_definitions(test_fsm_extract PRIVATE MINISIM_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  add_test(NAME test_fsm_extract COMMAND test_fsm_extract)
 
   # msim end to end: two files, -top, +define+, -maxtime, -vcd, and a bad file.
   set(CLI ${CMAKE_SOURCE_DIR}/examples/cli)
@@ -266,6 +259,10 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_cov.cmake)
+    add_test(NAME msim_fsm
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fsm
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_fsm.cmake)
   endif()
   if(MINISIM_WITH_FST)
     add_executable(test_fst tests/test_fst.cpp)
@@ -356,26 +353,27 @@ if(MINISIM_WITH_SLANG)
     endforeach()
   endif()
 
+  # mini45's Verilog models against the functions in its Liberty files.
+  add_test(NAME mini45_models
+           COMMAND msim ${CMAKE_SOURCE_DIR}/lib/mini45/mini45.v ${CMAKE_SOURCE_DIR}/lib/mini45/mini45_tb.sv
+                   -top mini45_tb)
+  set_tests_properties(mini45_models PROPERTIES PASS_REGULAR_EXPRESSION "mini45: 84 cells checked, 0 errors")
+
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+  # Every mlint rule on a marked source file (tests/lint/rules), the
+  # configuration, the waivers, and -threads 1 against -threads 4.
+  if(Python3_FOUND)
+    add_test(NAME mlint_rules
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_rules.py
+                     $<TARGET_FILE:mlint> ${CMAKE_SOURCE_DIR}/tests/lint)
+  endif()
   # Power-aware simulation and UPF checks (IEEE 1801-2024): msim -upf, mlint -upf.
   add_test(NAME upf
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
 
-  # Formal property checking: verdicts, thread-count independence, and each
-  # counterexample replayed in msim.
-  add_test(NAME mformal
-           COMMAND ${CMAKE_COMMAND} -DMFORMAL=$<TARGET_FILE:mformal> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mformal_test
-                   -P ${CMAKE_SOURCE_DIR}/tests/mformal.cmake)
-  # mformal against msim on random designs (tests/formal/fuzz.py).
-  if(Python3_FOUND)
-    add_test(NAME mformal_fuzz
-             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/formal/fuzz.py ${CMAKE_CURRENT_BINARY_DIR}
-                     0 40 ${CMAKE_CURRENT_BINARY_DIR}/mformal_fuzz)
-  endif()
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
@@ -412,7 +410,7 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
+#   bin/msim, bin/minisim, bin/memu, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)
@@ -420,7 +418,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(MINISIM_WITH_SLANG)
-  install(TARGETS msim mlint mdft mdebug mformal slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
   install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -449,6 +447,22 @@ install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
 install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+# The tools: one file each in cmake/tools, all included here, after the core
+# targets, the slang front end, FST and the install directories, so a tool
+# file can test if(MINISIM_WITH_SLANG), if(TARGET msim) and MINISIM_WITH_FST.
+# Add a file, not a line: every *.cmake there is included. A file that is
+# also named in an include() line above is skipped here, so a missing
+# include_guard(GLOBAL) cannot define its targets twice.
+file(GLOB TOOL_CMAKE CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tools/*.cmake)
+file(READ ${CMAKE_CURRENT_LIST_FILE} TOOL_CMAKE_SELF)
+foreach(f ${TOOL_CMAKE})
+  get_filename_component(n ${f} NAME)
+  string(FIND "${TOOL_CMAKE_SELF}" "include(cmake/tools/${n})" explicit)
+  if(explicit EQUAL -1)
+    include(${f})
+  endif()
+endforeach()
 
 set(CPACK_PACKAGE_NAME minisim)
 set(CPACK_PACKAGE_VENDOR "minisim")
