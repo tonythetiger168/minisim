@@ -9,6 +9,7 @@ netlist.
 mpv drc -deck rules.drc chip.gds                 # every rule, one line each
 mpv drc -deck rules.drc chip.gds -top core -q    # one cell; only rules with violations
 mpv drc -deck rules.drc chip.gds -o drc.txt      # also write the markers
+mpv drc -deck rules.drc chip.gds -rdb drc.lyrdb  # markers for KLayout's marker browser
 mpv drc -deck rules.drc chip.gds -threads 8
 mpv drc -deck rules.drc chip.oas                 # OASIS, told from the file's first bytes
 ```
@@ -45,6 +46,7 @@ Exit status: 0 clean, 1 violations, 2 a usage or input error.
 | `-deck <file>` | the rule deck (below) |
 | `-top <cell>` | cell to check; default is the one cell nothing references |
 | `-o <file>` | results file with the markers |
+| `-rdb <file>` | the markers as a KLayout report database (`.lyrdb`): open it in KLayout's marker browser (Tools, Marker Browser) over the layout to step through the violations. One category per rule; each marker is a box, or an edge where the margin is zero, with the measured value |
 | `-max <n>` | markers written per rule (default 1000); the counts stay exact |
 | `-threads <n>` | worker threads; default is every logical CPU (`$MINISIM_THREADS` overrides) |
 | `-q` | print only the rules with violations |
