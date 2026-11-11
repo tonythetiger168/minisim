@@ -27,3 +27,4 @@ report_timing -delay_type min -to [get_pins rb/RN]
 report_constraint -all_violators
 report_qor
 puts "wns [worst_slack] tns [total_negative_slack]"
+report_timing -delay_type min -to [get_pins rc/D]

@@ -102,6 +102,51 @@ every logical core by default. `-threads N` sets the number of threads and
 test suite compares the reports, the SDF and the JSON of a 20,000 cell design
 at 1, 2 and 8 threads.
 
+## Compared with OpenSTA
+
+msta is checked against [OpenSTA](https://github.com/parallaxsw/OpenSTA)
+3.2.0, run as a separate program (it is GPL; none of its code is in minisim).
+The designs are random netlists from `tests/sta/gen_netlist.py` on the mini45
+typical library: two propagated clocks of periods 4 and 6 with paths between
+them, clock uncertainty, input and output delays, a false path and multicycle
+paths. `bench/sta/opensta.tcl` runs OpenSTA and
+`bench/sta/compare_opensta.py` compares the slack at every endpoint.
+
+| Cells | Endpoints | Setup slack, largest difference | Hold slack, largest difference |
+|---|---|---|---|
+| 20,000 | 1,551 | 0.05 ps | 0.05 ps |
+| 200,000 | 15,645 | 0.06 ps | 0.06 ps |
+| 1,000,000 | 77,000 | 0.10 ps | 0.09 ps |
+
+Every endpoint is in both reports, and the differences are the rounding of
+OpenSTA's four-digit report. Time from start to the worst setup and hold
+slack (read the library, netlist and constraints, then a full update), on a
+4-core Xeon at 2.1 GHz:
+
+| Cells | OpenSTA, 1 thread | OpenSTA, 4 threads | msta, 1 thread | msta, 4 threads | Peak memory (OpenSTA / msta) |
+|---|---|---|---|---|---|
+| 20,000 | 0.56 s | 0.45 s | 0.15 s | 0.12 s | 77 / 49 MB |
+| 200,000 | 6.5 s | 4.9 s | 1.4 s | 1.2 s | 471 / 431 MB |
+| 1,000,000 | 38.3 s | 29.6 s | 7.1 s | 6.0 s | 2.2 / 2.1 GB |
+
+At a million cells msta's analysis itself (delays, arrivals, checks) is 0.5 s
+on 4 threads; reading and flattening the netlist and building the graph are
+the other 5 s. Writing a path for each of the 77,000 endpoints (`-max_paths`
+with `-json`) adds 14 s and is the next thing to speed up.
+
+The comparison found two differences, both fixed:
+
+- The hold check between clocks of different periods used the capture edge
+  one period before the setup one. It now takes, over the common period, the
+  tightest of the two hold checks of every setup relation (the launch edge
+  against the capture edge before, and the next launch edge against the
+  capture edge).
+- Asynchronous set and reset to output arcs (`timing_type` `preset` and
+  `clear`) were timed as paths and their slew was merged into the output's.
+  They are now off by default, as in PrimeTime and OpenSTA;
+  `-preset_clear_arcs` turns them on. Recovery and removal checks are not
+  affected.
+
 ## Limits
 
 These are not done yet, and each is either reported or documented here:

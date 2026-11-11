@@ -46,7 +46,7 @@ mhls fir.c -top fir -explore 2,5,10,20             # latency and area against th
 | `if`, `switch` (with fall-through), `for`, `while`, `do`, `break`, `continue`, `return` anywhere | `goto` |
 | fixed-size arrays of any dimension, initializer lists | pointers other than scalar output parameters, dynamic memory |
 | functions (inlined), `static` locals and globals (state kept between calls), `const` globals, `enum`, `typedef` | recursion |
-| with `-clang`: classes, member functions, constructors, operators, templates, namespaces (see C++ through Clang) | inheritance, virtual dispatch through a base, lambdas |
+| with `-clang`: classes, inheritance, member functions, constructors, operators, templates, namespaces (see C++ through Clang) | virtual functions in a class hierarchy, lambdas |
 | `hls::stream<T>&` parameters with `read()` and `write(x)` (see Streams) | `empty()`, `full()`, non-blocking access, local streams |
 | structs: nested, in arrays, with array members and bit-fields; copied, passed by value, pointer or reference, and returned | unions, pointer members, member functions, structs defined inside a function |
 
@@ -82,6 +82,7 @@ mhls fir.cpp -clang -emit-c fir.c      # see the reduction
 |---|---|
 | a class or struct with member functions | a struct, and one function per member function that is used, taking the object as `self` |
 | a class or function template | one struct or function per instantiation (`Fir<4>` is `Fir_4`) |
+| a base class | the first member of the derived struct (`mhls_base_<Base>`); inherited members and member functions go through it, and an object passed as its base passes that member |
 | a constructor, member initializers | a function run where the object is declared; an array of objects runs it per element |
 | `a + b`, `v[i]`, `f(x)` on objects | calls to `operator+`, `operator[]`, `operator()` |
 | a temporary object, an object returned by a call, `c ? a : b` on objects | a variable declared before the statement |
@@ -98,12 +99,13 @@ than mhls can synthesize. Errors and warnings from the rest of mhls name the
 lines of the C++ file. `clang` is found on the `PATH`; set
 `MHLS_CLANG` to use another one.
 
-Refused, with the line: base classes, pointer or reference members and
+Refused, with the line: virtual base classes, virtual functions in a class
+that has a base or is one, casts from base to derived, pointer or reference members and
 variables, functions that return a non-constant reference to anything but
 their own object, floating point,
 lambdas, range-based `for`, `new`, exceptions, a call to a function clang
 shows no body for. The C limits apply as well (no recursion, fixed-size
-arrays). `ap_int<N>` and `ap_uint<N>` are not available with `-clang` yet;
+arrays). A class without data members cannot be a base. `ap_int<N>` and `ap_uint<N>` are not available with `-clang` yet;
 use `intN_t` types or bit-fields. `#pragma hls` lines are read from the file
 given to mhls, not from its headers.
 

@@ -35,5 +35,11 @@ if(MINISIM_WITH_SLANG)
     add_test(NAME mformal_fuzz
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/formal/fuzz.py ${CMAKE_BINARY_DIR}
                      0 40 ${CMAKE_BINARY_DIR}/mformal_fuzz)
+    # The AIGER export: every reachable state of the exported model against mformal's verdicts.
+    foreach(d counter cut fifo fsm seq)
+      add_test(NAME mformal_aiger_${d}
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/formal/aiger_check.py
+                       $<TARGET_FILE:mformal> ${CMAKE_SOURCE_DIR}/tests/formal/${d}.sv)
+    endforeach()
   endif()
 endif()

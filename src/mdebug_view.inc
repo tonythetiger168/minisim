@@ -112,26 +112,29 @@ function holds(g,t){if(g[0]=='if'||g[0]=='else'){const v=ev(g[1],t);if(!v)return
     for(let j=0;j<upto;j++){const m=itemHit(c,j,sel,t);if(m===null)return null;if(m)return false}return g[2]<0?true:itemHit(c,g[2],sel,t)}
   return null}
 // The drivers of sig that ran for its value at time t: [{d,state,ts}], state 1 yes, -1 undecided.
-function activeOf(sig,t){const k=chAt(sig,t);if(k<0)return {tc:0,hits:[]};const tc=W[sig][k][0],seen=W[sig][k][1];
+// pt: [lo,width,name], the bits of sig that matter (a struct field that was read).
+function activeOf(sig,t,pt){const k=chAt(sig,t);if(k<0)return {tc:0,hits:[]};const seen=W[sig][k][1];
+  if(pt&&pt[0]==0&&pt[1]>=seen.length)pt=null;const cut=j=>{const b=W[sig][j][1];return b.slice(Math.max(0,b.length-pt[0]-pt[1]),b.length-pt[0])};
+  let pi=k;if(pt)while(pi>0&&cut(pi-1)==cut(pi))pi--;const tc=W[sig][pi][0];
   let hits=drvOf[sig].map(i=>{const d=D[i],ts=d.seq&&tc>0?tc-1:tc;let st=1;for(const g of d.g){const h=holds(g,ts);if(h===null){if(st==1)st=-1}else if(!h){st=0;break}}return {d:i,state:st,ts}});
   if(!/[xz]/.test(seen)){const want=BigInt('0b'+seen);let match=false;hits.forEach(h=>{if(!h.state||!D[h.d].rhs)return;const v=ev(D[h.d].rhs,h.ts);if(!v)return;
     if(mk(seen.length,sg(v),0).v==want)match=true;else h.diff=1});if(match)hits.forEach(h=>{if(h.diff)h.state=0})}
   const cov=n=>{const a=D[hits[n].d];if(a.blk<0)return false;const later=[];for(let j=n+1;j<hits.length;j++){const b=D[hits[j].d];if(hits[j].state!=1||b.blk!=a.blk)continue;
     if(b.whole)return true;if(b.lo>=0)later.push([b.lo,b.lo+b.w]);else if(a.lo<0&&!a.whole)return true}
     if(a.lo<0)return false;later.sort((x,y)=>x[0]-y[0]);let at=a.lo;for(const[l,e]of later){if(l>at)break;at=Math.max(at,e)}return at>=a.lo+a.w};
-  hits=hits.filter((h,n)=>h.state&&!(h.state==1&&cov(n)));return {tc,hits}}
-function why(sig,t,depth,ind,seen,out){const pad='&nbsp;'.repeat(ind*2),nm=esc(S[sig].path),k=chAt(sig,t);
+  hits=hits.filter((h,n)=>{const d=D[h.d];return h.state&&!(h.state==1&&cov(n))&&!(pt&&d.lo>=0&&(d.lo+d.w<=pt[0]||d.lo>=pt[0]+pt[1]))});return {tc,hits,pt,v:pt?cut(k):seen}}
+function why(sig,t,depth,ind,seen,out,pt){const pad='&nbsp;'.repeat(ind*2),k=chAt(sig,t);let nm=esc(S[sig].path);
   if(!W[sig]){out.push(`<div data-s="${sig}">${pad}${nm} <span class="a">(not in the waveform)</span></div>`);return}
-  const a=activeOf(sig,t);out.push(`<div data-s="${sig}" data-t="${a.tc}">${pad}${nm} = <span class="v">${k<0?'x':hex(W[sig][k][1])}</span> <span class="a">@${t}${a.tc!=t?' (since '+a.tc+')':''}</span></div>`);
+  const a=activeOf(sig,t,pt);if(a.pt)nm+=esc(a.pt[2]);out.push(`<div data-s="${sig}" data-t="${a.tc}">${pad}${nm} = <span class="v">${k<0?'x':hex(a.v)}</span> <span class="a">@${t}${a.tc!=t?' (since '+a.tc+')':''}</span></div>`);
   if(!drvOf[sig].length){out.push(`<div class="a">${pad}&nbsp;&nbsp;no driver: an input or a testbench value</div>`);return}
-  const key=sig+'@'+a.tc;if(seen.has(key)){out.push(`<div class="a">${pad}&nbsp;&nbsp;(shown above)</div>`);return}seen.add(key);
+  const key=sig+'@'+a.tc+(a.pt?'#'+a.pt[0]+':'+a.pt[1]:'');if(seen.has(key)){out.push(`<div class="a">${pad}&nbsp;&nbsp;(shown above)</div>`);return}seen.add(key);
   if(!a.hits.length)out.push(`<div class="a">${pad}&nbsp;&nbsp;no assignment's conditions hold at ${a.tc}</div>`);
   a.hits.forEach(h=>{const d=D[h.d],f=DB.files[d.file];
     out.push(`<div data-d="${h.d}">${pad}&nbsp;&nbsp;<span class="${h.state==1?'v':'q'}">${h.state==1?'&larr;':'??'}</span> ${esc(d.text)} <span class="a">${esc(f?f.name.replace(/.*\//,''):'?')}:${d.line}${d.when?' when '+esc(d.when):''}</span></div>`);
     if(depth<=0)return;const follow=d.reads.slice();
     if(!d.seq)d.ctl.forEach(c=>{const kk=chAt(c,a.tc);if(kk>=0&&W[c][kk][0]==a.tc&&a.tc>0&&!follow.includes(c))follow.push(c)});
     follow.forEach(r=>{if(!d.seq&&W[r]&&follow.length>1){const kk=chAt(r,a.tc);if(kk<0||W[r][kk][0]!=a.tc){out.push(`<div data-s="${r}" data-t="${a.tc}" class="a">${pad}&nbsp;&nbsp;&nbsp;&nbsp;${esc(S[r].path)} = ${val(r,a.tc)} (unchanged)</div>`);return}}
-      why(r,h.ts,depth-1,ind+2,seen,out)})})}
+      why(r,h.ts,depth-1,ind+2,seen,out,d.part&&d.part[r])})})}
 function tree(){const kids=new Map();DB.scopes.forEach(s=>{const p=s.path.includes('.')?scopeOf(s.path):'';(kids.get(p)||kids.set(p,[]).get(p)).push(s)});
   let h='';const walk=(p,dep)=>(kids.get(p)||[]).forEach(s=>{h+=`<div class="row${s.path==st.scope?' on':''}" data-p="${esc(s.path)}" style="padding-left:${10+dep*14}px">${esc(leaf(s.path))} <small>${esc(s.def)}</small></div>`;walk(s.path,dep+1)});
   walk('',0);$('tree').innerHTML=h}

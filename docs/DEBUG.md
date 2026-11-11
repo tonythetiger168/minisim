@@ -143,6 +143,11 @@ replaces an earlier one only where it writes the same bits, so every field's
 own driver is reported, and a whole assignment (`p = '0;`) that the fields
 then overwrite is not.
 
+A read of one field, or of fixed bits, follows only that part. For
+`u = p.hi + 4'd1` the trace goes on as `tb.p.hi = 4'h4`, with the time those
+bits last changed (not the time another field moved) and only the assignments
+that write them. The same holds for `q[3:0]`, in the tool and in the page.
+
 ## Memories
 
 msim leaves unpacked arrays out of the waveform unless asked:

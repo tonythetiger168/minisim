@@ -141,8 +141,11 @@ if(CLANG)
   design(cxx2.cpp filt -unroll-all -clock 5)
   design(cxx2.cpp tally)                         # member functions that return *this: +=, ++, chained calls
   design(cxx2.cpp tally -unroll-all)
+  design(cxx3.cpp survey)                        # inheritance: base constructors, inherited and hidden members, two bases
+  design(cxx3.cpp survey -unroll-all -clock 6)
+  design(cxx3.cpp shade)                         # a derived struct as an argument
   design(cxxhdr.cpp ring)                        # classes and templates from a header, std::min and std::max
-  refuses(bad_cxx_base.cpp top "does not support base classes")
+  refuses(bad_cxx_base.cpp top "virtual functions in a class with a base")
   refuses(bad_cxx_float.cpp top "does not support floating point")
   refuses(bad_cxx_lambda.cpp top "lambda")
   refuses(bad_cxx_syntax.cpp top "clang did not accept")

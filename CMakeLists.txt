@@ -233,6 +233,11 @@ if(MINISIM_WITH_SLANG)
   # 2-state fast path vs 4-state on random expressions.
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)
+    # Compiled mode with a waveform: the same values as the interpreter's VCD.
+    add_test(NAME msim_compile_vcd
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile_vcd -DPY=${Python3_EXECUTABLE}
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_compile_vcd.cmake)
     add_test(NAME msim_fuzz
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR} -DPY=${Python3_EXECUTABLE}
@@ -391,6 +396,32 @@ if(MINISIM_WITH_SLANG)
                    -DIVERILOG=${IVERILOG} -DVVP=${VVP} -DOUT=${CMAKE_BINARY_DIR}/dft_mbist
                    -P ${CMAKE_SOURCE_DIR}/tests/dft_mbist.cmake)
 
+  # Boundary scan and IJTAG: generated RTL and testbenches run on msim.
+  add_test(NAME mdft_jtag
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_jtag
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_jtag.cmake)
+
+  add_test(NAME mdft_lbist
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist.cmake)
+
+  add_test(NAME mdft_edt
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_edt
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt.cmake)
+  # Logic BIST coverage, checked against the wrapper's signature in simulation.
+  add_test(NAME mdft_lbist_cov
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist_cov
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist_cov.cmake)
+  # Failure diagnosis: injected faults come back as the first suspect.
+  add_test(NAME mdft_diag
+           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMATPG=$<TARGET_FILE:matpg> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_diag
+                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_diag.cmake)
+
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec
@@ -444,7 +475,7 @@ install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
 install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 # The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
-install(FILES README.md CHANGELOG.md LICENSE docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
+install(FILES README.md CHANGELOG.md LICENSE NOTICE docs/LICENSING.md docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 # The tools: one file each in cmake/tools, all included here, after the core
