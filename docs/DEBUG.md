@@ -173,6 +173,37 @@ and a value that is not a state. In the page, selecting a state register
 draws its state diagram: the state at the cursor is marked, transitions that
 ran are bright, and an arrow opens its source line.
 
+## Assertions
+
+    msim design.sv -top tb -vcd run.vcd > run.log
+    mdebug design.sv -top tb -assert                              # the assertions
+    mdebug design.sv -top tb -vcd run.vcd -log run.log -assert    # and why each one failed
+
+`-assert` lists the assert, assume and cover directives of the design, or
+those under an instance, or one by name. With `-log` (msim's output, which
+has a line `Error: "file", line: name: at time T` per failure) it says which
+failed and when. With a waveform as well it explains one failure of each, the
+first, or with `-at T` the last at or before T:
+
+    tb.u.a_gnt  assert property  arb.sv:5
+      a_gnt: assert property (@(posedge clk) disable iff (rst) req |=> gnt);
+      failed 1 time: @55
+      failure @55, values sampled before each clock tick:
+                       @25       @35       @45       @55
+        tb.u.rst         0         0         0         0
+        tb.u.req         1         0         1         0
+        tb.u.gnt         0         1         0         0
+      what drove them:
+        tb.u.gnt = 0 @54  (since 35)
+          <- arb.sv:4: gnt <= rst ? 1'b0 : req && !hold  [always_ff @posedge clk]
+
+The table has the signals the assertion reads at its last four clock ticks,
+sampled before the edge as a concurrent assertion samples them; an immediate
+assertion shows the values at the failure. Below it is the active-driver
+trace of each signal. The log's time and the waveform's must be in the same
+unit. `-json` and the page's database carry the assertions and their failure
+times (`asserts`).
+
 ## Scripts and other programs
 
     mdebug design.sv -top tb -vcd run.vcd -script queries.txt
@@ -188,7 +219,7 @@ skipped. The exit status is 1 when a command failed.
 | `drivers SIG`, `loads SIG` | `drivers` / `loads`: `file`, `line`, `text`, `kind`, `when`, `target` (and `control` for a load) |
 | `value SIG [T]` | `value` (`8'h43`), `bits`, `since`, at T or at the end |
 | `changes SIG [T0 [T1]]` | `changes`: `[time, bits]` pairs, at most 10000, then `more` is true |
-| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]` | `text`: the lines the option of the same name prints |
+| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]`, `assert [NAME] [T]` | `text`: the lines the option of the same name prints |
 | `scopes`, `signals [SCOPE]` | the instances; the signals (directly inside SCOPE) |
 | `end` | `end` time and `timescale` of the waveform |
 | `help`, `quit` | the command list; stop |

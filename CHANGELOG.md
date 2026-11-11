@@ -15,6 +15,9 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mdebug -assert [NAME]`: the design's assertions; with `-log LOG` and a
+  waveform, each failure with the values the assertion sampled at the clock
+  ticks before it and the driver trace of each signal.
 - `mdebug -script FILE` (`-` for the standard input): one command per line
   (drivers, loads, value, changes, active, trace, blocks, fsm, scopes,
   signals, end), one line of JSON per answer, from one process that loads the

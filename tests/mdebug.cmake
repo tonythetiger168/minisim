@@ -281,3 +281,36 @@ if(PY)
     message(FATAL_ERROR "mdebug_api.py: ${rc}\n${out}${err}")
   endif()
 endif()
+
+# Assertions: the list, and with the simulation log and the waveform each
+# failure with what the assertion sampled at the clock ticks before it and
+# what drove each signal.
+set(SV ${SRC}/tests/debug/assert.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -vcd ${OUT}/assert.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out2)
+file(WRITE ${OUT}/assert.log "${out}${out2}")
+if(NOT "${out}${out2}" MATCHES "tb.u.a_gnt: at time 55")
+  message(FATAL_ERROR "msim assert.sv: no failure of a_gnt at 55 (${rc})\n${out}${out2}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -assert RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("tb.u.a_gnt  assert property  " "assert.sv:5" "a_gnt: assert property (@(posedge clk) disable iff (rst) req |=> gnt);"
+     "tb.u.a_onehot  assert property  " "tb.u.a_imm  assert  ")
+if(out MATCHES "failed|no failure")
+  message(FATAL_ERROR "-assert without a log reported results:\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/assert.vcd -log ${OUT}/assert.log -assert tb.u.a_gnt -json ${OUT}/assert.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("failed 1 time: @55" "failure @55, values sampled before each clock tick:"
+     "@25       @35       @45       @55"
+     "tb.u.req         1         0         1         0"
+     "tb.u.gnt         0         1         0         0"
+     "tb.u.gnt = 0 @54  (since 35)" "gnt <= rst ? 1'b0 : req && !hold  [always_ff @posedge clk]")
+if(NOT rc EQUAL 0 OR out MATCHES "a_onehot")
+  message(FATAL_ERROR "-assert tb.u.a_gnt: rc ${rc}, or another assertion was listed:\n${out}")
+endif()
+file(READ ${OUT}/assert.json page)
+if(NOT page MATCHES "\"name\":\"tb.u.a_gnt\",\"kind\":\"assert property\"" OR NOT page MATCHES "\"fails\":\\[55\\]")
+  message(FATAL_ERROR "the database has no assertions or failures")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/assert.vcd -log ${OUT}/assert.log -assert tb.u.a_imm
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("tb.u.a_imm  assert  " "no failure in the log")

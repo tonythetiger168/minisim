@@ -34,6 +34,7 @@
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/types/AllTypes.h"
+#include "slang/syntax/AllSyntax.h"
 #include "parallel.hpp"
 #include "version.hpp"
 #include "wave_reader.hpp"
@@ -153,8 +154,21 @@ struct ScopeRec {
     SourceLocation inst;                  // where it is instantiated
 };
 
+// An assert, assume or cover directive of the design.
+struct AssertRec {
+    std::string name;                     // tb.u.a_gnt, or tb.u.<file>:<line> without a label
+    std::string kind;                     // "assert property", "assert", "cover property" ...
+    SourceLocation loc;
+    SourceRange range;
+    bool concurrent = false;
+    std::vector<const Symbol*> reads;     // the signals it looks at, clock first when it has one
+    const Symbol* clock = nullptr;
+    EdgeKind edge = EdgeKind::None;
+};
+
 struct DB {
     Sources src;
+    std::vector<AssertRec> asserts;
     std::vector<ScopeRec> scopes;
     std::vector<const ValueSymbol*> signals;
     std::unordered_map<const Symbol*, int> sigIx;
@@ -625,6 +639,59 @@ struct Collect : ASTVisitor<Collect> {
         w.walk(sub.getBody());
     }
 
+    // The assertions written in (or as) a procedure.
+    void assertions(const ProceduralBlockSymbol& p, const Statement& body) {
+        const Scope* sc = p.getParentScope();
+        std::string scope;
+        if (sc) scope = path(sc->asSymbol());
+        auto start = [&](const Statement& st, AssertionKind k, const char* what) {
+            AssertRec a;
+            a.loc = st.sourceRange.start();
+            a.range = st.sourceRange;
+            a.kind = std::string(k == AssertionKind::Assume ? "assume" : k == AssertionKind::CoverProperty || k == AssertionKind::CoverSequence ? "cover"
+                               : k == AssertionKind::Restrict ? "restrict" : k == AssertionKind::Expect ? "expect" : "assert") + what;
+            std::string label;
+            if (st.syntax && slang::syntax::StatementSyntax::isKind(st.syntax->kind))
+                if (auto* l = st.syntax->as<slang::syntax::StatementSyntax>().label) label = std::string(l->name.valueText());
+            if (label.empty()) {
+                Where w = db.src.where(a.loc);
+                std::string f = w.file < 0 ? "?" : db.src.files[w.file].name;
+                label = f.substr(f.find_last_of('/') + 1) + ":" + std::to_string(w.line);
+            }
+            a.name = scope.empty() ? label : scope + "." + label;
+            return a;
+        };
+        body.visit(makeVisitor(
+            [&](auto&, const ConcurrentAssertionStatement& st) {
+                AssertRec a = start(st, st.assertionKind, " property");
+                a.concurrent = true;
+                auto names = makeVisitor(
+                    [&](auto& v, const ClockingAssertionExpr& c) {
+                        std::vector<const SignalEventControl*> evs;
+                        clocksOf(c.clocking, evs);
+                        if (!a.clock && !evs.empty()) {
+                            std::vector<const Symbol*> ck;
+                            namesIn(evs[0]->expr, ck);
+                            if (ck.size() == 1) { a.clock = ck[0]; a.edge = evs[0]->edge; }
+                        }
+                        v.visitDefault(c);
+                    },
+                    [&](auto&, const NamedValueExpression& e) {
+                        if (std::find(a.reads.begin(), a.reads.end(), &e.symbol) == a.reads.end()) a.reads.push_back(&e.symbol);
+                    },
+                    [&](auto&, const HierarchicalValueExpression& e) {
+                        if (std::find(a.reads.begin(), a.reads.end(), &e.symbol) == a.reads.end()) a.reads.push_back(&e.symbol);
+                    });
+                st.propertySpec.visit(names);
+                db.asserts.push_back(std::move(a));
+            },
+            [&](auto&, const ImmediateAssertionStatement& st) {
+                AssertRec a = start(st, st.assertionKind, st.isDeferred ? (st.isFinal ? " final" : " #0") : "");
+                namesIn(st.cond, a.reads);
+                db.asserts.push_back(std::move(a));
+            }));
+    }
+
     void handle(const ProceduralBlockSymbol& p) {
         Walker w{db, {}, {}};
         switch (p.procedureKind) {
@@ -637,6 +704,7 @@ struct Collect : ASTVisitor<Collect> {
         }
         w.proto.block = nblock++;
         const Statement& body = p.getBody();
+        assertions(p, body);
         if (body.kind == StatementKind::Timed && w.proto.kind != "initial") {
             const auto& t = body.as<TimedStatement>();
             std::vector<const SignalEventControl*> evs;
@@ -1602,6 +1670,131 @@ struct Tool {
         return o + "]";
     }
 
+    // --------------------------------------------------------- assertions
+    // The failures in a simulation log: msim (like VCS) prints
+    //   Error: "file.sv", 12: tb.u.a_gnt: at time 55
+    std::map<std::string, std::vector<uint64_t>> assertFails;   // by assertion name
+    std::map<std::pair<std::string, size_t>, std::vector<uint64_t>> assertFailsAt;   // by file name and line
+    bool haveLog = false;
+
+    bool readLog(const std::string& file) {
+        std::ifstream is(file);
+        if (!is) { std::cerr << "mdebug: cannot read " << file << "\n"; return false; }
+        haveLog = true;
+        for (std::string ln; std::getline(is, ln);) {
+            size_t q1 = ln.find('"'), q2 = q1 == std::string::npos ? q1 : ln.find('"', q1 + 1);
+            size_t at = ln.rfind(": at time ");
+            if (q2 == std::string::npos || at == std::string::npos || at < q2) continue;
+            if (ln.rfind("Error:", 0) != 0 && ln.rfind("Fatal:", 0) != 0 && ln.rfind("Warning:", 0) != 0) continue;
+            // "file", LINE: NAME: at time T
+            size_t c1 = ln.find(':', q2);
+            if (c1 == std::string::npos || c1 >= at) continue;
+            std::string fname = ln.substr(q1 + 1, q2 - q1 - 1);
+            size_t lineNo = std::strtoull(ln.c_str() + q2 + 2, nullptr, 10);
+            std::string name = c1 + 2 <= at ? ln.substr(c1 + 2, at - c1 - 2) : "";
+            uint64_t t = std::strtoull(ln.c_str() + at + 10, nullptr, 10);
+            assertFails[name].push_back(t);
+            assertFailsAt[{fname.substr(fname.find_last_of('/') + 1), lineNo}].push_back(t);
+        }
+        return true;
+    }
+
+    const std::vector<uint64_t>* failsOf(const AssertRec& a) {
+        if (auto it = assertFails.find(a.name); it != assertFails.end()) return &it->second;
+        Where w = db.src.where(a.loc);
+        if (w.file < 0) return nullptr;
+        const std::string& f = db.src.files[w.file].name;
+        auto it = assertFailsAt.find({f.substr(f.find_last_of('/') + 1), (size_t)w.line});
+        // By place only when one assertion is written there (one instance).
+        if (it == assertFailsAt.end()) return nullptr;
+        int same = 0;
+        for (const AssertRec& b : db.asserts) {
+            Where wb = db.src.where(b.loc);
+            same += wb.file == w.file && wb.line == w.line;
+        }
+        return same == 1 ? &it->second : nullptr;
+    }
+
+    // -assert [NAME]: the assertions (all, under an instance, or one), and
+    // with -log and a waveform, each failure: the values the assertion saw at
+    // the clock ticks up to it, and what drove each signal.
+    bool asserts(const std::string& name, std::optional<uint64_t> at) {
+        bool any = false;
+        for (const AssertRec& a : db.asserts) {
+            if (!name.empty() && a.name != name && a.name.rfind(name + ".", 0) != 0) continue;
+            any = true;
+            std::cout << a.name << "  " << a.kind << "  " << db.src.at(db.src.where(a.loc)) << "\n";
+            std::string text = db.src.text(a.range);
+            if (text == "?") text = db.src.lineText(db.src.where(a.loc));
+            if (text.size() > 160) text = text.substr(0, 157) + "...";
+            for (char& ch : text) if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+            std::cout << "  " << text << "\n";
+            const std::vector<uint64_t>* fails = haveLog ? failsOf(a) : nullptr;
+            if (!haveLog) continue;
+            if (!fails) { std::cout << "  no failure in the log\n"; continue; }
+            std::cout << "  failed " << fails->size() << (fails->size() == 1 ? " time:" : " times:");
+            for (size_t i = 0; i < fails->size() && i < 8; i++) std::cout << " @" << (*fails)[i];
+            if (fails->size() > 8) std::cout << " ...";
+            std::cout << "\n";
+            if (!haveVcd) continue;
+            // The failure to explain: the one at -at T, else the first.
+            uint64_t tf = (*fails)[0];
+            if (at) for (uint64_t t : *fails) if (t <= *at) tf = t;
+            // The clock ticks up to the failure; values are sampled before each.
+            std::vector<uint64_t> ticks;
+            const Wave* cw = a.clock ? vcd.find(path(*a.clock)) : nullptr;
+            if (cw) {
+                for (int i = cw->at(tf); i >= 0 && ticks.size() < 4; i--) {
+                    const std::string b = cw->bits(i);
+                    bool hit = a.edge == EdgeKind::PosEdge ? b == "1" : a.edge == EdgeKind::NegEdge ? b == "0" : true;
+                    if (hit && cw->ch[i].t <= tf) ticks.insert(ticks.begin(), cw->ch[i].t);
+                }
+            }
+            if (ticks.empty()) ticks.push_back(tf);
+            auto sample = [&](uint64_t t) { return a.concurrent && t > 0 ? t - 1 : t; };
+            size_t wide = 4;
+            std::vector<const Symbol*> sigs;
+            for (const Symbol* r : a.reads)
+                if (r != a.clock && db.sigIx.count(r)) { sigs.push_back(r); wide = std::max(wide, path(*r).size()); }
+            std::cout << "  failure @" << tf << (a.concurrent ? ", values sampled before each clock tick:\n" : ", values then:\n");
+            std::cout << "    " << std::string(wide, ' ');
+            for (uint64_t t : ticks) { std::string h = "@" + std::to_string(t); std::cout << "  " << std::string(h.size() < 8 ? 8 - h.size() : 0, ' ') << h; }
+            std::cout << "\n";
+            for (const Symbol* r : sigs) {
+                const std::string p = path(*r);
+                std::cout << "    " << p << std::string(wide - p.size(), ' ');
+                for (uint64_t t : ticks) { std::string v = valueAt(r, sample(t)); std::cout << "  " << std::string(v.size() < 8 ? 8 - v.size() : 0, ' ') << v; }
+                std::cout << "\n";
+            }
+            std::cout << "  what drove them:\n";
+            Seen seen;
+            for (const Symbol* r : sigs) active(r, sample(tf), 1, 2, seen);
+        }
+        if (!any) {
+            std::cerr << "mdebug: no assertion " << (name.empty() ? "in the design" : "at " + name) << "\n";
+            return name.empty();
+        }
+        return true;
+    }
+
+    std::string assertsJson() {
+        std::string o = "[";
+        for (size_t i = 0; i < db.asserts.size(); i++) {
+            const AssertRec& a = db.asserts[i];
+            Where w = db.src.where(a.loc);
+            o += std::string(i ? ",\n" : "") + "{\"name\":" + js(a.name) + ",\"kind\":" + js(a.kind) + ",\"file\":" +
+                 std::to_string(w.file) + ",\"line\":" + std::to_string(w.line) + ",\"reads\":[";
+            bool first = true;
+            for (const Symbol* r : a.reads)
+                if (auto it = db.sigIx.find(r); it != db.sigIx.end()) { o += (first ? "" : ",") + std::to_string(it->second); first = false; }
+            o += "],\"fails\":[";
+            if (const std::vector<uint64_t>* f = haveLog ? failsOf(a) : nullptr)
+                for (size_t k = 0; k < f->size() && k < 1000; k++) o += (k ? "," : "") + std::to_string((*f)[k]);
+            o += "]}";
+        }
+        return o + "]";
+    }
+
     // ------------------------------------------------------------- script
     // -script FILE (- for stdin): one command per line, one JSON object per
     // answer line. The design and the waveform are loaded once, so a script
@@ -1726,9 +1919,13 @@ struct Tool {
                 asText = true;
                 bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
                 ok = fsm(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "assert") {
+                asText = true;
+                bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
+                ok = asserts(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
             } else if (c == "help") {
                 body = "\"commands\":[\"drivers SIG\",\"loads SIG\",\"value SIG [T]\",\"changes SIG [T0 [T1]]\",\"active SIG [T [DEPTH]]\","
-                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
+                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"assert [NAME] [T]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
             } else {
                 std::cerr << "mdebug: unknown command '" << c << "' (help lists them)\n";
                 ok = false;
@@ -1783,7 +1980,7 @@ struct Tool {
         for (auto* s : db.signals) sw.push_back(db.src.where(s->location));
         for (auto& s : db.scopes) { sd.push_back(db.src.where(s.loc)); si.push_back(db.src.where(s.inst)); }
         for (auto& d : db.drivers) dw.push_back(db.src.where(d.loc));
-        const std::string fsmText = fsmsJson();
+        const std::string fsmText = fsmsJson(), assertText = assertsJson();
         os << "{\"version\":" << js(MINISIM_VERSION) << ",\n\"files\":[";
         for (size_t i = 0; i < db.src.files.size(); i++) {
             auto& f = db.src.files[i];
@@ -1838,7 +2035,7 @@ struct Tool {
                << parts(d) << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
-        os << "],\n\"cases\":" << casesJson() << ",\n\"fsms\":" << fsmText;
+        os << "],\n\"cases\":" << casesJson() << ",\n\"fsms\":" << fsmText << ",\n\"asserts\":" << assertText;
         if (haveVcd) {
             os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale) << ",\"waves\":{";
             first = true;
@@ -1905,6 +2102,10 @@ void usage() {
                  "  -fsm [NAME]      the state machines (all, under an instance, or one register): states,\n"
                  "                   transitions and their lines; with -vcd, the state at -at T, how often\n"
                  "                   each transition ran, the ones never taken and values that are not states\n"
+                 "  -assert [NAME]   the assertions (all, under an instance, or one); with -log LOG and -vcd,\n"
+                 "                   each failure: what the assertion sampled at the clock ticks before it\n"
+                 "                   and what drove each signal (-at T picks the failure at or before T)\n"
+                 "  -log FILE        the simulation log with the assertion failures (msim's output)\n"
                  "  -script FILE     run commands from FILE (- for the standard input), one per line, and\n"
                  "                   answer each with one line of JSON: drivers, loads, value, changes,\n"
                  "                   active, trace, blocks, fsm, scopes, signals, end, help, quit\n"
@@ -1925,7 +2126,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]};
     struct Query { std::string what, arg; int depth; std::optional<uint64_t> at; };
     std::vector<Query> queries;
-    std::string vcdPath, htmlPath, jsonPath, scriptPath;
+    std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath;
     int depth = -1;
     std::optional<uint64_t> at;
     size_t maxChanges = 20000;
@@ -1952,6 +2153,13 @@ int main(int argc, char** argv) {
             queries.push_back({"fsm", arg, -1, std::nullopt});
             continue;
         }
+        if (a == "-assert") {
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"assert", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-log") { logPath = next("a simulation log"); continue; }
         if (a == "-script") { scriptPath = next("a file, or - for the standard input"); continue; }
         if (a == "-blocks") { queries.push_back({"blocks", next("an instance"), -1, std::nullopt}); continue; }
         if (a == "-drivers" || a == "-loads" || a == "-trace" || a == "-active") {
@@ -1988,6 +2196,7 @@ int main(int argc, char** argv) {
     fe.comp->getRoot().visit(c);
 
     tool.fsms = extractFsms(fe.comp->getRoot());
+    if (!logPath.empty() && !tool.readLog(logPath)) return 2;
     if (!vcdPath.empty()) {
         std::string err;
         if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
@@ -2000,6 +2209,7 @@ int main(int argc, char** argv) {
         else if (q.what == "loads") ok &= tool.loads(q.arg);
         else if (q.what == "blocks") ok &= tool.blocks(q.arg);
         else if (q.what == "fsm") ok &= tool.fsm(q.arg, at);
+        else if (q.what == "assert") ok &= tool.asserts(q.arg, at);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")
