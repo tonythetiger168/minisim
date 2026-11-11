@@ -342,6 +342,11 @@ Spec references are IEEE 1800-2023 clauses.
   writes SAIF from a simulation, and `mpower -write_saif` converts a
   waveform. `src/saif.hpp` (SAIF reader and writer) and `src/power.hpp` (the
   computation) are shared headers. See `docs/POWER.md`.
+- FPGA synthesis: `mfpga` maps RTL or AIGER to K-input LUTs and flip-flops
+  (iCE40, ECP5, Xilinx 7-series, generic cells) on the shared graph of
+  `src/aig.hpp`, and writes Yosys JSON for nextpnr, EDIF or Verilog.
+  Depth-optimal priority-cut mapping with area recovery; multithreaded, with
+  the same output for any `-threads N`. See `docs/FPGA.md`.
 
 ### Fixed
 - `mformal` could report a liveness assertion proven when it fails:
