@@ -15,6 +15,9 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mdebug -cov FILE`: with msim's coverage database, driver lines say how
+  often their line ran, `-uncovered [INST]` lists assignments that never ran
+  and signals that never toggled, and the viewer page marks covered lines.
 - `mdebug -assert [NAME]`: the design's assertions; with `-log LOG` and a
   waveform, each failure with the values the assertion sampled at the clock
   ticks before it and the driver trace of each signal.

@@ -204,6 +204,28 @@ trace of each signal. The log's time and the waveform's must be in the same
 unit. `-json` and the page's database carry the assertions and their failure
 times (`asserts`).
 
+## Coverage
+
+    msim design.sv -top tb -cov cov.json
+    mdebug design.sv -top tb -cov cov.json -drivers tb.u.next
+    mdebug design.sv -top tb -cov cov.json -uncovered tb.u
+    mdebug design.sv -top tb -cov cov.json -vcd run.vcd -html debug.html
+
+`-cov` reads msim's coverage database (one run, or several merged with
+`mcov merge`). Every driver line then says how often its source line ran:
+
+    fsm.sv:15: next = RUN  [always_comb]  when state == IDLE && go  (line ran 3 times)
+    fsm.sv:19: next = IDLE  [always_comb]  when state == FAIL  (line never ran)
+
+so a trace shows at a glance which of a signal's drivers the tests never
+reached. The count is the line's: a line with a condition and an assignment
+counts when the condition was evaluated. `-uncovered [INST]` lists the
+assignments on lines that never ran and the signals with bits that never rose
+or never fell, in the design or under one instance. In the page, the line
+numbers of lines that ran have a green edge and those that never ran a red
+one, with the count as a tooltip, and a selected signal shows its toggle
+gaps. Reports and merging stay in `mcov`.
+
 ## Scripts and other programs
 
     mdebug design.sv -top tb -vcd run.vcd -script queries.txt
@@ -219,7 +241,7 @@ skipped. The exit status is 1 when a command failed.
 | `drivers SIG`, `loads SIG` | `drivers` / `loads`: `file`, `line`, `text`, `kind`, `when`, `target` (and `control` for a load) |
 | `value SIG [T]` | `value` (`8'h43`), `bits`, `since`, at T or at the end |
 | `changes SIG [T0 [T1]]` | `changes`: `[time, bits]` pairs, at most 10000, then `more` is true |
-| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]`, `assert [NAME] [T]` | `text`: the lines the option of the same name prints |
+| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]`, `assert [NAME] [T]`, `uncovered [INST]` | `text`: the lines the option of the same name prints |
 | `scopes`, `signals [SCOPE]` | the instances; the signals (directly inside SCOPE) |
 | `end` | `end` time and `timescale` of the waveform |
 | `help`, `quit` | the command list; stop |

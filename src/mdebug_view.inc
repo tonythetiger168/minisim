@@ -25,7 +25,7 @@ h3{margin:0;padding:5px 10px;font-size:11px;letter-spacing:.06em;text-transform:
 .row.on{background:var(--sel)}.row i{color:var(--dim);font-style:normal;margin-left:auto;font-family:ui-monospace,monospace;font-size:11px}
 .row small{color:var(--dim)}
 .ln{display:flex;white-space:pre}.ln>u{flex:0 0 52px;text-align:right;padding-right:10px;color:var(--dim);text-decoration:none;user-select:none}
-.ln.drv{background:var(--hi)}.ln.load{background:var(--sel)}.ln.cur{outline:1px solid var(--acc)}
+.ln.hit>u{border-right:3px solid #3a9a5c}.ln.miss>u{border-right:3px solid #d0453a;color:#d0453a}.ln.drv{background:var(--hi)}.ln.load{background:var(--sel)}.ln.cur{outline:1px solid var(--acc)}
 .id{cursor:pointer;border-bottom:1px dotted var(--dim)}.id:hover,.id.on{background:var(--sel);color:var(--acc)}
 .id em{font-style:normal;color:var(--w1);font-size:10px;margin-left:2px}
 .kw{color:var(--kw)}.cm{color:var(--cm)}.nu{color:var(--num)}
@@ -144,7 +144,7 @@ function sigList(){const l=sigsIn.get(st.scope)||[];$('sigs').innerHTML=l.map(i=
   return `<div class="row${i==st.sig?' on':''}" data-s="${i}">${esc(leaf(S[i].path))}<i>${v===null?esc(S[i].type):v}</i></div>`}).join('')||'<div class="row none">no signals here</div>'}
 function source(scroll){const sc=DB.scopes.find(s=>s.path==st.scope);const f=st.file>=0?st.file:(sc?sc.file:-1);
   if(f<0||!DB.files[f]){$('src').innerHTML='<div class="fname">no source</div>';return}
-  st.file=f;const drv=new Set,lod=new Set;
+  st.file=f;const drv=new Set,lod=new Set,CL=DB.cov&&DB.cov.lines[f];
   if(st.sig>=0){drvOf[st.sig].forEach(i=>D[i].file==f&&drv.add(D[i].line));loadOf[st.sig].forEach(i=>D[i].file==f&&lod.add(D[i].line))}
   let lo=1,hi=1e9;if(sc&&sc.file==f){lo=sc.line;const L=DB.files[f].text.split('\n');for(let k=lo;k<=L.length;k++)if(/\bend(module|interface|program)\b/.test(L[k-1])){hi=k;break}}
   const pre=st.scope+'.';let h=`<div class="fname">${esc(DB.files[f].name)} &middot; scope ${esc(st.scope)}</div>`;
@@ -155,11 +155,11 @@ function source(scroll){const sc=DB.scopes.find(s=>s.path==st.scope);const f=st.
       else if(s!==undefined){const v=W?val(s,st.t):null;o+=`<span class="id${s==st.sig?' on':''}" data-s="${s}">${m}${v===null?'':`<em>${v}</em>`}</span>`}
       else o+=esc(m);return m});
     o+=esc(code.slice(p))+(cm?`<span class="cm">${esc(cm)}</span>`:'');
-    h+=`<div class="ln${drv.has(n+1)?' drv':lod.has(n+1)?' load':''}${n+1==scroll?' cur':''}" id="L${n+1}"><u>${n+1}</u><span>${o}</span></div>`});
+    const cv=CL&&CL[n+1];h+=`<div class="ln${drv.has(n+1)?' drv':lod.has(n+1)?' load':''}${n+1==scroll?' cur':''}${cv===undefined?'':cv?' hit':' miss'}" id="L${n+1}"${cv===undefined?'':` title="${cv?'line ran '+cv+(cv==1?' time':' times'):'line never ran'}"`}><u>${n+1}</u><span>${o}</span></div>`});
   $('src').innerHTML=h;if(scroll){const e=$('L'+scroll);e&&e.scrollIntoView({block:'center'})}}
 function card(i,showT){const d=D[i],f=DB.files[d.file];return `<div class="d" data-d="${i}"><code>${esc(d.text)}</code><small>${esc(f?f.name:'?')}:${d.line} &middot; ${esc(d.kind)}${showT?' &rarr; '+esc(S[d.sig].path):''}</small>${d.when?`<small><br>when <span class="w">${esc(d.when)}</span></small>`:''}</div>`}
 function panel(){if(st.sig<0)return;const s=S[st.sig],v=W?val(st.sig,st.t):null;$('name').className='';$('name').textContent=s.path;
-  $('meta').textContent=s.type+(v===null?'':'  =  '+v+'  @'+st.t)+'  ·  '+(DB.files[s.file]?DB.files[s.file].name:'?')+':'+s.line;
+  $('meta').textContent=s.type+(v===null?'':'  =  '+v+'  @'+st.t)+'  ·  '+(DB.files[s.file]?DB.files[s.file].name:'?')+':'+s.line+(DB.cov&&DB.cov.stuck[st.sig]?'  ·  coverage: '+DB.cov.stuck[st.sig]:'');
   let act=null;if(W&&W[st.sig]){act=activeOf(st.sig,st.t);const out=[];why(st.sig,st.t,4,0,new Set,out);$('act').innerHTML='<div class="tr">'+out.join('')+'</div>'}
   else $('act').innerHTML='<div class="none">'+(W?'This signal is not in the waveform.':'Run mdebug with -vcd to see it.')+'</div>';
   const cls=i=>!act?'':act.hits.some(h=>h.d==i&&h.state==1)?' act':act.hits.some(h=>h.d==i)?'':' off';

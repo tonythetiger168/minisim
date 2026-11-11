@@ -314,3 +314,34 @@ endif()
 execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/assert.vcd -log ${OUT}/assert.log -assert tb.u.a_imm
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 want("tb.u.a_imm  assert  " "no failure in the log")
+
+# Coverage: with msim's coverage database, driver lines say how often their
+# line ran, -uncovered lists what never ran or never toggled, and the page's
+# database has the hits per line.
+set(SV ${SRC}/tests/cov/fsm.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -cov ${OUT}/cov.json RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT EXISTS ${OUT}/cov.json)
+  message(FATAL_ERROR "msim -cov: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -cov ${OUT}/cov.json -drivers tb.u.next -uncovered tb.u -json ${OUT}/covdb.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("next = RUN  [always_comb]  when state == IDLE && go  (line ran 3 times)"
+     "next = IDLE  [always_comb]  when state == FAIL  (line never ran)"
+     "assignments on lines that never ran under tb.u:" "signals that never toggled fully:"
+     "tb.u.rst_n  (never fell)" "tb.u.err  (never changed)")
+if(NOT rc EQUAL 0 OR out MATCHES "tb.v.")
+  message(FATAL_ERROR "-uncovered tb.u: rc ${rc}, or another instance was listed:\n${out}${err}")
+endif()
+file(READ ${OUT}/covdb.json page)
+if(NOT page MATCHES "\"cov\":{\"lines\":{\"0\":{\"9\":8" OR NOT page MATCHES "\"19\":0" OR NOT page MATCHES "\"stuck\":{\"[0-9]+\":\"never")
+  message(FATAL_ERROR "the database has no coverage section")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -uncovered RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "needs -cov")
+  message(FATAL_ERROR "-uncovered without -cov: ${rc}\n${out}${err}")
+endif()
+file(WRITE ${OUT}/notcov.json "{}")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -cov ${OUT}/notcov.json RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 2 OR NOT err MATCHES "is not a coverage database")
+  message(FATAL_ERROR "-cov of a file that is not a database: ${rc}\n${out}${err}")
+endif()

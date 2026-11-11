@@ -154,6 +154,85 @@ struct ScopeRec {
     SourceLocation inst;                  // where it is instantiated
 };
 
+// A small JSON reader, enough for msim's coverage database.
+struct JVal {
+    enum K { Null, Num, Str, Arr, Obj } k = Null;
+    double n = 0;
+    std::string s;
+    std::vector<JVal> a;
+    std::vector<std::pair<std::string, JVal>> o;
+    const JVal* get(const std::string& key) const {
+        for (auto& [kk, v] : o) if (kk == key) return &v;
+        return nullptr;
+    }
+};
+struct JReader {
+    const std::string& t;
+    size_t p = 0;
+    bool bad = false;
+    void ws() { while (p < t.size() && (t[p] == ' ' || t[p] == '\n' || t[p] == '\r' || t[p] == '\t')) p++; }
+    std::string str() {
+        std::string o;
+        p++;
+        while (p < t.size() && t[p] != '"') {
+            if (t[p] == '\\' && p + 1 < t.size()) {
+                char c = t[++p];
+                if (c == 'n') o += '\n';
+                else if (c == 't') o += '\t';
+                else if (c == 'u' && p + 4 < t.size()) { o += (char)std::strtoul(t.substr(p + 1, 4).c_str(), nullptr, 16); p += 4; }
+                else o += c;
+            } else o += t[p];
+            p++;
+        }
+        p++;
+        return o;
+    }
+    JVal val() {
+        JVal v;
+        ws();
+        if (p >= t.size()) { bad = true; return v; }
+        char c = t[p];
+        if (c == '"') { v.k = JVal::Str; v.s = str(); }
+        else if (c == '[') {
+            v.k = JVal::Arr;
+            p++;
+            for (ws(); p < t.size() && t[p] != ']'; ws()) {
+                v.a.push_back(val());
+                ws();
+                if (p < t.size() && t[p] == ',') p++;
+                else if (p >= t.size() || t[p] != ']') { bad = true; break; }
+                if (bad) break;
+            }
+            p++;
+        } else if (c == '{') {
+            v.k = JVal::Obj;
+            p++;
+            for (ws(); p < t.size() && t[p] != '}'; ws()) {
+                if (t[p] != '"') { bad = true; break; }
+                std::string key = str();
+                ws();
+                if (p >= t.size() || t[p] != ':') { bad = true; break; }
+                p++;
+                v.o.emplace_back(std::move(key), val());
+                ws();
+                if (p < t.size() && t[p] == ',') p++;
+                else if (p >= t.size() || t[p] != '}') { bad = true; break; }
+                if (bad) break;
+            }
+            p++;
+        } else if (c == '-' || (c >= '0' && c <= '9')) {
+            v.k = JVal::Num;
+            char* e = nullptr;
+            v.n = std::strtod(t.c_str() + p, &e);
+            p = e - t.c_str();
+        } else if (t.compare(p, 4, "true") == 0) { v.k = JVal::Num; v.n = 1; p += 4; }
+        else if (t.compare(p, 5, "false") == 0) { v.k = JVal::Num; p += 5; }
+        else if (t.compare(p, 4, "null") == 0) p += 4;
+        else bad = true;
+        return v;
+    }
+};
+
 // An assert, assume or cover directive of the design.
 struct AssertRec {
     std::string name;                     // tb.u.a_gnt, or tb.u.<file>:<line> without a label
@@ -1007,6 +1086,8 @@ struct Tool {
         Where w = db.src.where(d.loc);
         std::string s = db.src.at(w) + ": " + text(d) + "  [" + label(d) + "]";
         if (std::string c = when(d); !c.empty()) s += "  when " + c;
+        // With a coverage database: whether this line ever ran.
+        if (auto h = hitsOf(w)) s += *h ? "  (line ran " + std::to_string(*h) + (*h == 1 ? " time)" : " times)") : "  (line never ran)";
         return s;
     }
 
@@ -1670,6 +1751,131 @@ struct Tool {
         return o + "]";
     }
 
+    // ----------------------------------------------------------- coverage
+    // -cov FILE: msim's coverage database (msim -cov, or mcov merge). Line
+    // hits say which assignments ever ran; toggles which bits ever moved.
+    bool haveCov = false;
+    std::map<std::pair<std::string, size_t>, uint64_t> covLines;    // (file name, line) -> hits
+    std::map<std::pair<std::string, size_t>, uint64_t> covBase;     // by the name without directories
+    struct Tog { int w = 0; std::string rise, fall; };              // hex masks of the bits seen 0->1, 1->0
+    std::map<std::string, Tog> covTog;
+
+    static std::string baseName(const std::string& f) { return f.substr(f.find_last_of('/') + 1); }
+
+    bool readCov(const std::string& file) {
+        std::ifstream is(file, std::ios::binary);
+        if (!is) { std::cerr << "mdebug: cannot read " << file << "\n"; return false; }
+        std::string text((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+        JReader r{text};
+        JVal d = r.val();
+        const JVal* files = d.get("files");
+        const JVal* lines = d.get("lines");
+        if (r.bad || d.k != JVal::Obj || !files || !lines) {
+            std::cerr << "mdebug: " << file << " is not a coverage database (msim -cov FILE)\n";
+            return false;
+        }
+        for (const JVal& l : lines->a) {
+            if (l.a.size() < 3 || (size_t)l.a[0].n >= files->a.size()) continue;
+            const std::string& f = files->a[(size_t)l.a[0].n].s;
+            covLines[{f, (size_t)l.a[1].n}] += (uint64_t)l.a[2].n;
+            covBase[{baseName(f), (size_t)l.a[1].n}] += (uint64_t)l.a[2].n;
+        }
+        if (const JVal* tg = d.get("toggles"))
+            for (const JVal& t : tg->a)
+                if (t.a.size() >= 4) covTog[t.a[0].s] = {(int)t.a[1].n, t.a[2].s, t.a[3].s};
+        haveCov = true;
+        return true;
+    }
+
+    // How often a source line ran; nullopt when the database has no record of it.
+    std::optional<uint64_t> hitsOf(const Where& w) {
+        if (!haveCov || w.file < 0) return std::nullopt;
+        const std::string& f = db.src.files[w.file].name;
+        if (auto it = covLines.find({f, (size_t)w.line}); it != covLines.end()) return it->second;
+        if (auto it = covBase.find({baseName(f), (size_t)w.line}); it != covBase.end()) return it->second;
+        return std::nullopt;
+    }
+
+    // The bits of a signal that never rose or never fell: "" when all did.
+    std::string stuck(const std::string& p) {
+        auto it = covTog.find(p);
+        if (it == covTog.end()) return "";
+        const Tog& t = it->second;
+        auto count = [&](const std::string& hex) {
+            int n = 0;
+            for (char c : hex) {
+                int v = c >= 'a' ? c - 'a' + 10 : c >= 'A' ? c - 'A' + 10 : c - '0';
+                n += __builtin_popcount(v & 15);
+            }
+            return n;
+        };
+        int r = count(t.rise), f = count(t.fall);
+        if (r >= t.w && f >= t.w) return "";
+        if (t.w == 1) return r == 0 && f == 0 ? "never changed" : r == 0 ? "never rose" : "never fell";
+        std::string o;
+        if (r < t.w) o = std::to_string(t.w - r) + " of " + std::to_string(t.w) + " bits never rose";
+        if (f < t.w) o += (o.empty() ? "" : ", ") + std::to_string(t.w - f) + " of " + std::to_string(t.w) + " bits never fell";
+        return o;
+    }
+
+    // -uncovered [SCOPE]: the assignments that never ran and the signals with
+    // bits that never toggled, in the design or under one instance.
+    bool uncovered(const std::string& scope) {
+        if (!haveCov) { std::cerr << "mdebug: -uncovered needs -cov <file> (msim -cov FILE)\n"; return false; }
+        const std::string pre = scope.empty() ? "" : scope + ".";
+        std::set<std::pair<int, size_t>> done;
+        size_t nd = 0, ns = 0;
+        std::cout << "assignments on lines that never ran" << (scope.empty() ? "" : " under " + scope) << ":\n";
+        for (const Driver& d : db.drivers) {
+            if (!pre.empty() && path(*d.target).rfind(pre, 0) != 0) continue;
+            if (d.kind == "port") continue;
+            Where w = db.src.where(d.loc);
+            auto h = hitsOf(w);
+            if (!h || *h || !done.insert({w.file, w.line}).second) continue;
+            std::cout << "  " << line(d) << "\n";
+            nd++;
+        }
+        if (!nd) std::cout << "  none\n";
+        std::cout << "signals that never toggled fully:\n";
+        for (auto* s : db.signals) {
+            const std::string p = path(*s);
+            if (!pre.empty() && p.rfind(pre, 0) != 0) continue;
+            std::string st = stuck(p);
+            if (st.empty()) continue;
+            std::cout << "  " << p << "  (" << st << ")\n";
+            ns++;
+        }
+        if (!ns) std::cout << "  none\n";
+        return true;
+    }
+
+    std::string covJson() {
+        // Per file of the page's own file table: line -> hits; per signal: stuck text.
+        std::string o = "{\"lines\":{";
+        bool firstF = true;
+        for (size_t f = 0; f < db.src.files.size(); f++) {
+            std::string part;
+            for (size_t l = 1; l <= db.src.files[f].lines.size(); l++) {
+                Where w;
+                w.file = (int)f;
+                w.line = l;
+                if (auto h = hitsOf(w)) part += (part.empty() ? "" : ",") + ("\"" + std::to_string(l) + "\":") + std::to_string(*h);
+            }
+            if (part.empty()) continue;
+            o += std::string(firstF ? "" : ",") + "\"" + std::to_string(f) + "\":{" + part + "}";
+            firstF = false;
+        }
+        o += "},\"stuck\":{";
+        bool first = true;
+        for (size_t i = 0; i < db.signals.size(); i++) {
+            std::string st = stuck(path(*db.signals[i]));
+            if (st.empty()) continue;
+            o += std::string(first ? "" : ",") + "\"" + std::to_string(i) + "\":" + js(st);
+            first = false;
+        }
+        return o + "}}";
+    }
+
     // --------------------------------------------------------- assertions
     // The failures in a simulation log: msim (like VCS) prints
     //   Error: "file.sv", 12: tb.u.a_gnt: at time 55
@@ -1919,13 +2125,16 @@ struct Tool {
                 asText = true;
                 bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
                 ok = fsm(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "uncovered") {
+                asText = true;
+                ok = uncovered(a.size() > 1 ? a[1] : "");
             } else if (c == "assert") {
                 asText = true;
                 bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
                 ok = asserts(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
             } else if (c == "help") {
                 body = "\"commands\":[\"drivers SIG\",\"loads SIG\",\"value SIG [T]\",\"changes SIG [T0 [T1]]\",\"active SIG [T [DEPTH]]\","
-                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"assert [NAME] [T]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
+                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"assert [NAME] [T]\",\"uncovered [INST]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
             } else {
                 std::cerr << "mdebug: unknown command '" << c << "' (help lists them)\n";
                 ok = false;
@@ -2036,6 +2245,7 @@ struct Tool {
             first = false;
         }
         os << "],\n\"cases\":" << casesJson() << ",\n\"fsms\":" << fsmText << ",\n\"asserts\":" << assertText;
+        if (haveCov) os << ",\n\"cov\":" << covJson();
         if (haveVcd) {
             os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale) << ",\"waves\":{";
             first = true;
@@ -2105,6 +2315,10 @@ void usage() {
                  "  -assert [NAME]   the assertions (all, under an instance, or one); with -log LOG and -vcd,\n"
                  "                   each failure: what the assertion sampled at the clock ticks before it\n"
                  "                   and what drove each signal (-at T picks the failure at or before T)\n"
+                 "  -cov FILE        a coverage database (msim -cov FILE): driver lines say how often they\n"
+                 "                   ran, and the page marks the lines that ran and those that never did\n"
+                 "  -uncovered [INST]  with -cov: the assignments that never ran and the signals with bits\n"
+                 "                   that never toggled, in the design or under INST\n"
                  "  -log FILE        the simulation log with the assertion failures (msim's output)\n"
                  "  -script FILE     run commands from FILE (- for the standard input), one per line, and\n"
                  "                   answer each with one line of JSON: drivers, loads, value, changes,\n"
@@ -2126,7 +2340,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]};
     struct Query { std::string what, arg; int depth; std::optional<uint64_t> at; };
     std::vector<Query> queries;
-    std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath;
+    std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath, covPath;
     int depth = -1;
     std::optional<uint64_t> at;
     size_t maxChanges = 20000;
@@ -2157,6 +2371,13 @@ int main(int argc, char** argv) {
             std::string arg;
             if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
             queries.push_back({"assert", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-cov") { covPath = next("a coverage database"); continue; }
+        if (a == "-uncovered") {
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"uncovered", arg, -1, std::nullopt});
             continue;
         }
         if (a == "-log") { logPath = next("a simulation log"); continue; }
@@ -2197,6 +2418,7 @@ int main(int argc, char** argv) {
 
     tool.fsms = extractFsms(fe.comp->getRoot());
     if (!logPath.empty() && !tool.readLog(logPath)) return 2;
+    if (!covPath.empty() && !tool.readCov(covPath)) return 2;
     if (!vcdPath.empty()) {
         std::string err;
         if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
@@ -2210,6 +2432,7 @@ int main(int argc, char** argv) {
         else if (q.what == "blocks") ok &= tool.blocks(q.arg);
         else if (q.what == "fsm") ok &= tool.fsm(q.arg, at);
         else if (q.what == "assert") ok &= tool.asserts(q.arg, at);
+        else if (q.what == "uncovered") ok &= tool.uncovered(q.arg);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")
