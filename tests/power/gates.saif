@@ -1,0 +1,20 @@
+(SAIFILE
+(SAIFVERSION "2.0")
+(DIRECTION "backward")
+(DESIGN "dut")
+(DIVIDER / )
+(TIMESCALE 1 ns)
+(DURATION 1000)
+(INSTANCE tb
+ (INSTANCE dut
+  (NET
+   (clk (T0 500) (T1 500) (TX 0) (TC 200) (IG 0))
+   (a (T0 600) (T1 400) (TX 0) (TC 20) (IG 0))
+   (b (T0 300) (T1 700) (TX 0) (TC 10) (IG 0))
+   (n1 (T0 400) (T1 600) (TX 0) (TC 20) (IG 0))
+   (n2 (T0 420) (T1 580) (TX 0) (TC 16) (IG 0))
+   (y (T0 500) (T1 500) (TX 0) (TC 8) (IG 0))
+  )
+ )
+)
+)

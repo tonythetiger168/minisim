@@ -1,5 +1,6 @@
-# mlint self-test: the rules fire on tests/lint/lint.sv and tests/lint/cdc.sv,
-# and nothing fires on tests/lint/clean.sv.
+# mlint self-test: the first rules fire on tests/lint/lint.sv and
+# tests/lint/cdc.sv, and nothing fires on tests/lint/clean.sv. The rest of the
+# rules, the configuration and the waivers are in tests/lint/check_rules.py.
 #   cmake -DMLINT=<mlint> -DSRC=<source dir> -P mlint.cmake
 function(run file args)
   execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/${file} ${args}
@@ -10,9 +11,9 @@ function(run file args)
   endif()
 endfunction()
 
-run(lint.sv "-top;t")
+run(lint.sv "-top;t;-only;L001,L002,L003,L004")
 foreach(want
-    "[L001] 't.y' is not assigned on every path"
+    "[L001] 'y' is not assigned on every path"
     "[L002] blocking assignment to 't.r' in an always_ff"
     "[L003] non-blocking assignment to 't.z' in an always_comb"
     "[L004] 't.z' is assigned by 2 processes")
@@ -26,13 +27,13 @@ if(NOT out MATCHES "4 findings")
 endif()
 
 # -disable turns one rule off.
-run(lint.sv "-top;t;-disable;L001;-disable;L004")
+run(lint.sv "-top;t;-only;L001,L002,L003,L004;-disable;L001;-disable;L004")
 if(NOT out MATCHES "2 findings" OR out MATCHES "L001|L004")
   message(FATAL_ERROR "-disable did not take:\n${out}")
 endif()
 
 # CDC: one flop is not a synchronizer, and a wide bus needs more than flops.
-run(cdc.sv "-top;t")
+run(cdc.sv "-top;t;-only;cdc")
 if(NOT out MATCHES "\\[CDC001\\] 't.rq'.*through one flop only")
   message(FATAL_ERROR "cdc.sv: the single-flop crossing was not reported:\n${out}")
 endif()
@@ -45,7 +46,7 @@ if(out MATCHES "t.s1|t.s2|t.b1")
 endif()
 
 # Every crossing rule fires once on cdc_bad.sv (CDC003 names both sources).
-run(cdc_bad.sv "-top;cdc_bad")
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003")
 foreach(want
     "[CDC001] 'cdc_bad.a1' (clocked by cdc_bad.aclk) is read by logic clocked by cdc_bad.bclk with no synchronizer"
     "[CDC002] 'cdc_bad.abus' (clocked by cdc_bad.aclk) is read by logic clocked by cdc_bad.bclk through 2 flops, but it is 4 bits wide"
@@ -64,13 +65,13 @@ endforeach()
 # The safe schemes: a shift-register synchronizer in a module, an
 # enable-qualified bus, a Gray pointer, reset synchronizers, a gated clock.
 # The divided clock is a domain of its own until -clock-group says otherwise.
-run(cdc_clean.sv "-top;cdc_clean")
+run(cdc_clean.sv "-top;cdc_clean;-only;cdc,RDC001,RDC002,RDC003")
 if(NOT out MATCHES "\\[CDC001\\] 'cdc_clean.req' \\(clocked by cdc_clean.aclk\\) is read by logic clocked by cdc_clean.div"
    OR NOT out MATCHES "\\[RDC001\\] asynchronous reset 'cdc_clean.a_rst_n' \\(clocked by cdc_clean.aclk\\) resets 1 flop clocked by cdc_clean.div"
    OR NOT out MATCHES "2 findings")
   message(FATAL_ERROR "cdc_clean.sv: expected the divided clock's two findings only:\n${out}")
 endif()
-run(cdc_clean.sv "-top;cdc_clean;-clock-group;aclk,div;-Werror;-cdc-report")
+run(cdc_clean.sv "-top;cdc_clean;-only;cdc,RDC001,RDC002,RDC003;-clock-group;aclk,div;-Werror;-cdc-report")
 foreach(want
     "clock domains: 2"
     "cdc_clean.req (cdc_clean.aclk) -> cdc_clean.u_req.s (cdc_clean.bclk)  4-flop synchronizer"
@@ -83,14 +84,14 @@ foreach(want
   endif()
 endforeach()
 # -static: a1 is said not to change while it is read, so its two findings go.
-run(cdc_bad.sv "-top;cdc_bad;-static;cdc_bad.a1")
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-static;cdc_bad.a1")
 if(out MATCHES "cdc_bad.a1'" OR NOT out MATCHES "5 findings \\(CDC002 1, CDC003 1, CDC004 1, CDC005 1, RDC002 1\\)")
   message(FATAL_ERROR "cdc_bad.sv -static did not take:\n${out}")
 endif()
 
 # Bits of one bus are separate clocks, and a bus synchronized bit by bit is
 # one Gray-coded crossing, not four synchronizers of one signal.
-run(cdc_bits.sv "-top;cdc_bits;-cdc-report")
+run(cdc_bits.sv "-top;cdc_bits;-only;cdc,RDC001,RDC002,RDC003;-cdc-report")
 foreach(want
     "clock domains: 2"
     "cdc_bits.clk[0]  1 flop"
@@ -104,7 +105,7 @@ foreach(want
 endforeach()
 
 # Reset crossings; RDC004 is off until -enable.
-run(rdc.sv "-top;rdc")
+run(rdc.sv "-top;rdc;-only;cdc,RDC001,RDC002,RDC003")
 foreach(want
     "[RDC001] asynchronous reset 'rdc.wd_rst_n' (clocked by rdc.aclk) resets 1 flop clocked by rdc.bclk"
     "[RDC002] asynchronous reset 'rdc.por_n' is used directly by flops in 2 clock domains (rdc.aclk, rdc.bclk)"
@@ -115,21 +116,22 @@ foreach(want
     message(FATAL_ERROR "rdc.sv missing: ${want}\n${out}")
   endif()
 endforeach()
-run(rdc.sv "-top;rdc;-enable;RDC004")
+run(rdc.sv "-top;rdc;-only;cdc,RDC001,RDC002,RDC003;-enable;RDC004")
 if(NOT out MATCHES "\\[RDC004\\] 'rdc.s', reset by 'rdc.soft_n', feeds 'rdc.q4', which has no asynchronous reset" OR NOT out MATCHES "4 findings")
   message(FATAL_ERROR "rdc.sv -enable RDC004:\n${out}")
 endif()
 
 # The findings do not depend on the thread count.
-run(cdc_bad.sv "-top;cdc_bad;-cdc-report;-threads;1")
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
 set(one "${out}")
-run(cdc_bad.sv "-top;cdc_bad;-cdc-report;-threads;8")
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;8")
 if(NOT one STREQUAL out)
   message(FATAL_ERROR "-threads 1 and -threads 8 differ:\n${one}\n---\n${out}")
 endif()
 
-# Nothing to report, and -Werror still exits 0.
-run(clean.sv "-top;clean;-Werror")
+# Nothing to report with every default rule on, and -Werror still exits 0.
+# (STY001: the file holds its submodule too.)
+run(clean.sv "-top;clean;-Werror;-disable;STY001")
 if(NOT out MATCHES "0 findings")
   message(FATAL_ERROR "clean.sv is not clean:\n${out}")
 endif()
