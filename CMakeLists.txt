@@ -268,12 +268,9 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_dpi
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_dpi.cmake)
-  # VPI and DPI cannot look into protected IP (37.3.6; IEEE 1735 9.7).
-  if(OPENSSL_FOUND AND OPENSSL_CLI AND UNIX)
-    add_test(NAME pli_protect
-             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pli_protect.sh $<TARGET_FILE:msim> $<TARGET_FILE:msimprotect>
-                     ${OPENSSL_CLI} ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/pli_protect)
-  endif()
+  # VPI and DPI cannot look into protected IP (37.3.6; IEEE 1735 9.7). The
+  # check needs an envelope, so it needs the encryptor, which is a paid tool:
+  # it runs beside msimprotect instead of here.
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
@@ -458,13 +455,13 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES include/svdpi.h include/vpi_user.h include/sv_vpi_user.h include/veriuser.h include/mvp.h
+install(FILES include/svdpi.h include/vpi_user.h include/sv_vpi_user.h include/veriuser.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 # UVM's C code for minisim: msim -uvm looks for it next to itself.
 install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/uvm)
 # The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
-install(FILES README.md CHANGELOG.md LICENSE NOTICE docs/LICENSING.md docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
+install(FILES README.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md docs/LICENSING.md docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 # The tools: one file each in cmake/tools, all included here, after the core
