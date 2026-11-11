@@ -477,6 +477,14 @@ Spec references are IEEE 1800-2023 clauses.
   thread count. See docs/JTAG.md.
 
 ### Fixed
+- msim: four faults found by re-measuring the spec table with uvm-core.
+  `void'($cast(d, s))` no longer reports an error when the cast fails; only
+  the task form does (8.16). `'{default: v}` on an associative array sets
+  the value a missing element reads as (7.9.11); this lets
+  `uvm_sequence_library` compile. A hierarchical name can end in an element
+  of an unpacked array in an expression (`top.u.m[2]`, 23.6).
+  `pre_randomize` / `post_randomize` declared `extern` are called (18.6.2);
+  before, `uvm_reg::randomize()` left the fields' desired values unchanged.
 - An inout port connected to a whole net is now that net (23.3.3.1). It was
   two continuous assignments, one each way, so the net kept the last value
   driven after every driver had gone to z.

@@ -3145,8 +3145,9 @@ struct Lowerer {
         } else {
             if (cur->kind == ExpressionKind::MemberAccess || cur->kind == ExpressionKind::ElementSelect)
                 return std::nullopt;   // s.arr[i]: an array inside an unpacked struct is bits of it (7.2)
-            if (cur->kind != ExpressionKind::NamedValue) unsupported("array select on a non-variable");
-            shape = arrFind(&cur->as<NamedValueExpression>().symbol);
+            if (cur->kind != ExpressionKind::NamedValue && cur->kind != ExpressionKind::HierarchicalValue)
+                unsupported("array select on a non-variable");
+            shape = arrFind(&cur->as<ValueExpressionBase>().symbol);   // m[i] or top.u.m[i] (23.6)
         }
         if (!shape) unsupported("array select");
         ArrSel s;
@@ -3671,6 +3672,9 @@ struct Lowerer {
         prog.emit(dynCmd(t, D_DELETE));
         assignInto(t, rhs);
         Instr i = dynCmd(dst, D_COPY); i.dsrc = t; prog.emit(i);
+        if (rhs.kind == slang::ast::ExpressionKind::StructuredAssignmentPattern &&
+            rhs.as<slang::ast::StructuredAssignmentPatternExpression>().defaultSetter)
+            prog.emit(dynCmd(t, D_DEFAULT));   // the temporary is shared: its default goes back to the type's
     }
     // Build rhs into the empty container t.
     void assignInto(int t, const slang::ast::Expression& rhs0) {
@@ -3694,7 +3698,10 @@ struct Lowerer {
                 const auto& sp = rhs.as<StructuredAssignmentPatternExpression>();
                 if (dynShape(t).kind != 2) unsupported("keyed pattern for this container");
                 if (!sp.memberSetters.empty() || !sp.typeSetters.empty()) unsupported("pattern member setter");
-                if (sp.defaultSetter) unsupported("default: in an associative array pattern");
+                if (sp.defaultSetter) {   // 7.9.11: what a missing element reads as from now on
+                    if (dynShape(t).elem) unsupported("default: in a pattern for an associative array of containers");
+                    Instr i = dynCmd(t, D_DEFAULT); i.e = expr(*sp.defaultSetter); prog.emit(i);
+                }
                 for (auto& is : sp.indexSetters) {
                     Instr i = dynCmd(t, D_SET); i.args = {dynKey(t, *is.index)}; i.e = expr(*is.expr); prog.emit(i);
                 }
@@ -5056,6 +5063,7 @@ struct Lowerer {
     // cast writes dst and gives 1; an invalid one leaves dst alone and gives 0,
     // and as a task it is a run-time error.
     bool asTask = false;   // the system call being lowered is a statement
+    bool voidCast = false; // ... written as void'(f(...)): still the function form
     E castCall(const slang::ast::CallExpression& call) {
         using namespace slang::ast;
         auto args = call.arguments();
@@ -6164,7 +6172,7 @@ struct Lowerer {
         if (n == "randomize") { randomizeCall(call); return; }
         if (n == "rand_mode" || n == "constraint_mode") { randModeCall(call, false); return; }
         if (n == "$cast" && call.arguments().size() == 2 && isHandleType(*outArg(*call.arguments()[0]).type)) {
-            castClass(call, false);
+            castClass(call, voidCast);
             return;
         }
         if (n == "$finish" || n == "$stop") {
@@ -6296,7 +6304,7 @@ struct Lowerer {
             prog.emit(i);
             return;
         }
-        asTask = true;
+        asTask = !voidCast;
         E rt = sysFn(call, n);
         asTask = false;
         if (E r = rt) {   // a system function called as a task: its effect only
@@ -7252,7 +7260,10 @@ struct Lowerer {
                 break;
             }
             case StatementKind::ExpressionStatement:
+                // void'($cast(d, s)) is the function form (8.16): a failed cast is not an error.
+                voidCast = s.syntax && s.syntax->kind == slang::syntax::SyntaxKind::VoidCastedCallStatement;
                 xpExprStmt(s.as<ExpressionStatement>().expr);
+                voidCast = false;
                 break;
             case StatementKind::VariableDeclaration: {   // int x = 5;  inside a block
                 const auto& vd = s.as<VariableDeclStatement>();
@@ -10397,8 +10408,11 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         continue;
                     }
                     // (slang adds a built-in pre/post_randomize, with no body, to a class that declares none)
-                    if (m.kind == SymbolKind::Subroutine && m.getSyntax() && (m.name == "pre_randomize" || m.name == "post_randomize")) {
-                        auto it = subMap.find(&m.as<SubroutineSymbol>());
+                    // An extern declaration is a prototype: its body is the out-of-block definition (8.24).
+                    const SubroutineSymbol* rsub = m.kind == SymbolKind::Subroutine ? &m.as<SubroutineSymbol>()
+                        : m.kind == SymbolKind::MethodPrototype ? m.as<MethodPrototypeSymbol>().getSubroutine() : nullptr;
+                    if (rsub && m.getSyntax() && (m.name == "pre_randomize" || m.name == "post_randomize")) {
+                        auto it = subMap.find(rsub);
                         if (it == subMap.end()) continue;
                         if (m.name == "pre_randomize") { sp->pre = it->second->prog; sp->preLay = it->second->lay; }
                         else { sp->post = it->second->prog; sp->postLay = it->second->lay; }
