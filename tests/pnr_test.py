@@ -227,6 +227,32 @@ if mpv:
         bad = [l for l in (p.stdout + p.stderr).splitlines() if re.match(r"\S+ +\d+ +\S", l) and not l.startswith("metal1.area")]
         assert not bad and "violations in" in p.stdout + p.stderr, "mini45: mpv drc finds\n" + p.stdout + p.stderr
 
+# 6d. Timing with the shared timing engine: a report from the placement, the
+# clocks timed through their trees, and a second placement that weights the
+# nets on slow paths and ends with more slack than the first.
+open(out("m45.sdc"), "w").write("create_clock -name clk -period 16 [get_ports clk]\n"
+                                "set_input_delay 0.2 -clock clk [all_inputs]\nset_output_delay 0.2 -clock clk [all_outputs]\n")
+tim = ["-lib", os.path.join(src, "lib/mini45/mini45_tt.lib"), "-sdc", out("m45.sdc")]
+def placed_wns(text):
+    m = re.search(r"timing \(placed\): setup WNS (-?[\d.]+) ns, TNS (-?[\d.]+) ns, (\d+) of (\d+) endpoints violate; hold WNS (-?[\d.]+) ns", text)
+    assert m, text
+    return float(m.group(1))
+log = run(*m45, out("m45.v"), "-def", out("m45_t.def"), *tim, "-report", out("m45_t.json"))
+need(log, r"timing \(global placement\): setup WNS -?[\d.]+ ns")
+need(log, r"timing-driven placement: \d+ nets weighted")
+need(log, r"clock clk: arrives at 250 clock pins between [\d.]+ and [\d.]+ ns \(skew 0\.00\d ns\)")
+need(log, r"0 open, 0 shorts, 0 spacing violations")
+need(open(out("m45_t.json")).read(), r'"setup_wns_ns": -?[\d.]+')
+plain = run(*m45, out("m45.v"), "-def", out("m45_p.def"), *tim, "-no_timing_driven")
+assert "nets weighted" not in plain
+assert placed_wns(log) > placed_wns(plain), "timing-driven placement: WNS %g, without %g" % (placed_wns(log), placed_wns(plain))
+# Without the timing-driven pass the placement is the one made with no timing at all.
+run(*m45, out("m45.v"), "-def", out("m45_n.def"))
+assert open(out("m45_p.def")).read() == open(out("m45_n.def")).read()
+run(*m45, out("m45.v"), "-def", out("m45_t1.def"), *tim, "-threads", "1")
+assert open(out("m45_t.def")).read() == open(out("m45_t1.def")).read(), "timing-driven: -threads 1 differs"
+need(run(*m45, out("m45.v"), "-sdc", out("m45.sdc"), rc=2), r"timing needs both -lib and -sdc")
+
 # 7. GDS out: one reference per component, the cells as abstracts, the same
 # bytes for any thread count, a layer map file, and the conversion of a DEF.
 def gds_records(path):

@@ -49,6 +49,9 @@ with `-tielo CELL/PIN` and `-tiehi CELL/PIN`.
 | `-cts_fanout N` | Most loads on one clock buffer (16) |
 | `-cts_buf CELL` | Clock buffer cell (default: by name, a `CLKBUF` before a `BUF`) |
 | `-clock NET` | Build a tree on this net (repeat; default: nets on clock pins) |
+| `-lib FILE` | Liberty library for timing (repeat) |
+| `-sdc FILE` | Constraints; with `-lib`: timing report and timing-driven placement |
+| `-no_timing_driven` | With `-lib` and `-sdc`: only report timing |
 | `-place_only` | Stop after placement |
 | `-def FILE` | The placed and routed design |
 | `-netlist FILE` | The final flat netlist, with the tie and filler cells, for LVS and timing |
@@ -126,6 +129,34 @@ before any timing is known. Trees are balanced by level and by load, not by
 delay: there is no wire snaking, no sizing and no timing analysis yet, and
 a clock gate's output net gets its own tree, not balanced against the others.
 
+## Timing
+
+With `-lib FILE` (Liberty, repeatable) and `-sdc FILE`, mpnr times the design
+with the same engine as `msta` (`src/sta.hpp`; see [STA.md](STA.md) for the
+model and the SDC commands it reads). Wires are estimated from the placement:
+a net's capacitance from its half-perimeter length, each driver-to-load delay
+as the Elmore delay of a direct wire, with the resistance and capacitance per
+micron of the two lowest routing layers in use (LEF `RESISTANCE RPERSQ`,
+`CAPACITANCE CPERSQDIST`, `EDGECAPACITANCE`).
+
+1. After global placement the design is timed with ideal clocks.
+2. Nets on the worst path into an endpoint with less setup slack than a
+   tenth of the clock period get a weight of up to 5, and global placement
+   runs again with those weights (`-no_timing_driven` skips this).
+3. The clock trees are built, and after legalization and refinement the
+   design is timed again with the clocks propagated through their trees.
+
+```
+timing (global placement): setup WNS -1.039 ns, TNS -7.256 ns, 12 of 695 endpoints violate; hold WNS 0.018 ns, 0 violate
+timing-driven placement: 945 nets weighted
+timing (placed): setup WNS 1.646 ns, TNS 0.000 ns, 0 of 695 endpoints violate; hold WNS 0.018 ns, 0 violate
+  clock clk: arrives at 625 clock pins between 0.120 and 0.127 ns (skew 0.007 ns)
+```
+
+The numbers are an estimate before routing. For sign-off, extract the routed
+DEF with `mrcx` and run `msta` with the SPEF. mpnr does not size cells, add
+buffers on data nets or fix hold violations.
+
 ## Power
 
 Every row gets its VDD and VSS rail from the cells' supply pins (`SHAPE
@@ -200,7 +231,8 @@ The same flow routes 5,000 Nangate45 cells clean on the real Nangate45 LEF
 - Standard cells one row high. Larger macros can be fixed in a floorplan DEF
   (their pins and obstructions are honoured) but mpnr does not place them.
 - Clock trees are balanced by level and load, not by delay, and are routed
-  as ordinary nets. No timing-driven placement or routing yet.
+  as ordinary nets. Timing drives placement only: no timing-driven routing,
+  no sizing, no buffering of data nets, no hold fixing.
 - No global-routing stage: a design too dense for its layers (above about
   85% utilization on three routing layers) leaves nets unrouted and takes
   long to say so.
