@@ -1,0 +1,23 @@
+{
+  "name": "mplan",
+  "title": "mplan verification planning",
+  "summary": "Maps features to tests, coverage and assertions; scores per feature, history and trend, failure triage, HTML report and CI gates.",
+  "docs": [
+    "README.md#Verification planning",
+    "docs/MPLAN.md",
+    "README.md#Regressions",
+    "CHANGELOG.md"
+  ],
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "msim",
+    "mwave",
+    "mcov",
+    "mregress",
+    "mbug",
+    "mlint",
+    "mdft",
+    "mdebug"
+  ]
+}

@@ -30,7 +30,7 @@ target_include_directories(minisim PRIVATE src)
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
 # net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_lefdef)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -42,27 +42,16 @@ add_executable(test_liberty tests/test_liberty.cpp)
 target_include_directories(test_liberty PRIVATE src)
 add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/sta_test.lib)
 # Protected envelopes (IEEE 1800-2023 clause 34 / IEEE 1735) use OpenSSL's
-# libcrypto: the msimprotect encryptor, msim -keyfile, and their tests.
+# libcrypto. What is here is the reading half: msim -keyfile opens an envelope
+# and src/protect.hpp is tested directly. The encryptor that makes one,
+# msimprotect, is a paid tool (docs/LICENSING.md).
 find_package(OpenSSL COMPONENTS Crypto)
 if(OPENSSL_FOUND)
-  add_executable(msimprotect src/msimprotect.cpp)
-  target_include_directories(msimprotect PRIVATE src)
-  target_link_libraries(msimprotect PRIVATE OpenSSL::Crypto)
   add_executable(test_protect tests/test_protect.cpp)
   target_include_directories(test_protect PRIVATE src)
   target_link_libraries(test_protect PRIVATE OpenSSL::Crypto)
   target_compile_options(test_protect PRIVATE -UNDEBUG)
   add_test(NAME test_protect COMMAND test_protect)
-  # Interop: envelopes made by msimprotect open with the openssl command line
-  # tool, and an envelope built with the openssl tool opens in msimprotect's
-  # decryptor (checked by msim in the slang build below).
-  find_program(OPENSSL_CLI openssl)
-  if(OPENSSL_CLI)
-    add_test(NAME protect_openssl_cli
-             COMMAND ${CMAKE_COMMAND} -DOPENSSL=${OPENSSL_CLI} -DPROTECT=$<TARGET_FILE:msimprotect>
-                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/protect_openssl
-                     -P ${CMAKE_SOURCE_DIR}/tests/protect_openssl.cmake)
-  endif()
 else()
   message(STATUS "OpenSSL not found: building without protected envelope support")
 endif()
@@ -79,9 +68,6 @@ target_compile_options(test_saif PRIVATE -UNDEBUG)
 target_link_libraries(test_saif PRIVATE Threads::Threads)
 add_test(NAME test_saif COMMAND test_saif ${CMAKE_SOURCE_DIR}/tests/power/gates_sdpd.saif)
 
-# The mini45 cell library: generator check and install rules.
-include(cmake/tools/mini45.cmake)
-
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
 # mbug (bug reports) against fake GitHub, Jira and Redmine servers: Python only, no simulator.
@@ -92,11 +78,9 @@ if(Python3_FOUND)
                    ${CMAKE_CURRENT_BINARY_DIR}/mbug_test)
 endif()
 
-# Tools that need nothing but the compiler: one file each in cmake/tools.
-include(cmake/tools/memu.cmake)
-include(cmake/tools/mrcx.cmake)
+# Shared unit tests that need nothing but the compiler: one file each in
+# cmake/tools.
 include(cmake/tools/shared_par_wave.cmake)
-include(cmake/tools/mequiv.cmake)
 
 # Optional slang front end. slang v12.1 is the release this lowerer compiles
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
@@ -278,6 +262,19 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_excl
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_excl.cmake)
+    # mformal is defined in cmake/tools/mformal.cmake, included further down
+    add_test(NAME mcov_formal
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim> -DMFORMAL=$<TARGET_FILE:mformal>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_formal
+                     -P ${CMAKE_SOURCE_DIR}/tests/mcov_formal.cmake)
+    add_test(NAME msim_cov_inst
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_inst
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_cov_inst.cmake)
+    add_test(NAME msim_cond_modes
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cond_modes
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_cond_modes.cmake)
   endif()
   if(MINISIM_WITH_FST)
     add_executable(test_fst tests/test_fst.cpp)
@@ -287,33 +284,13 @@ if(MINISIM_WITH_SLANG)
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
   endif()
-  # Protected envelopes end to end: msimprotect, then msim -keyfile; no key,
-  # the wrong key, redacted diagnostics, and a VCD without protected signals.
-  if(OPENSSL_FOUND AND OPENSSL_CLI)
-    add_test(NAME msim_protect
-             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DPROTECT=$<TARGET_FILE:msimprotect>
-                     -DMLINT=$<TARGET_FILE:mlint> -DMDFT=$<TARGET_FILE:mdft>
-                     -DOPENSSL=${OPENSSL_CLI} -DSRC=${CMAKE_SOURCE_DIR}
-                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_protect
-                     -P ${CMAKE_SOURCE_DIR}/tests/msim_protect.cmake)
-  endif()
-  # The virtual prototype layer: the design reaching C models over AXI4-Lite.
-  add_test(NAME msim_mvp
-           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
-                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_mvp
-                   -P ${CMAKE_SOURCE_DIR}/tests/mvp.cmake)
-  set_tests_properties(msim_mvp PROPERTIES ENVIRONMENT MINISIM_MVP=${CMAKE_SOURCE_DIR}/mvp)
-
   # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
   add_test(NAME msim_dpi
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_dpi.cmake)
-  # VPI and DPI cannot look into protected IP (37.3.6; IEEE 1735 9.7).
-  if(OPENSSL_FOUND AND OPENSSL_CLI AND UNIX)
-    add_test(NAME pli_protect
-             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/pli_protect.sh $<TARGET_FILE:msim> $<TARGET_FILE:msimprotect>
-                     ${OPENSSL_CLI} ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/pli_protect)
-  endif()
+  # VPI and DPI cannot look into protected IP (37.3.6; IEEE 1735 9.7). The
+  # check needs an envelope, so it needs the encryptor, which is a paid tool:
+  # it runs beside msimprotect instead of here.
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
@@ -398,52 +375,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_test
-                   -DFST=${MINISIM_WITH_FST}
+                   -DFST=${MINISIM_WITH_FST} -DPY=${Python3_EXECUTABLE}
                    -P ${CMAKE_SOURCE_DIR}/tests/mdebug.cmake)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
-  # Scan insertion and memory BIST: the results are simulated with msim.
-  add_test(NAME mdft_insert_scan
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/dft_scan
-                   -P ${CMAKE_SOURCE_DIR}/tests/dft_scan.cmake)
-  add_test(NAME mdft_mbist
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DIVERILOG=${IVERILOG} -DVVP=${VVP} -DOUT=${CMAKE_BINARY_DIR}/dft_mbist
-                   -P ${CMAKE_SOURCE_DIR}/tests/dft_mbist.cmake)
-
-  # Boundary scan and IJTAG: generated RTL and testbenches run on msim.
-  add_test(NAME mdft_jtag
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_jtag
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_jtag.cmake)
-
-  add_test(NAME mdft_lbist
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist.cmake)
-
-  add_test(NAME mdft_edt
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_edt
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt.cmake)
-  # Compressed-pattern responses and compactor X masking, run on the netlist in simulation.
-  add_test(NAME mdft_edt_resp
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMATPG=$<TARGET_FILE:matpg> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_edt_resp
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt_resp.cmake)
-  # Logic BIST coverage, checked against the wrapper's signature in simulation.
-  add_test(NAME mdft_lbist_cov
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist_cov
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist_cov.cmake)
-  # Failure diagnosis: injected faults come back as the first suspect.
-  add_test(NAME mdft_diag
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMATPG=$<TARGET_FILE:matpg> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_diag
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_diag.cmake)
-
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec
@@ -462,7 +398,7 @@ if(MINISIM_WITH_SLANG)
 endif()
 
 # Install layout (cmake --install, and the cpack packages below):
-#   bin/msim, bin/minisim, bin/memu, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan, bin/msimprotect (with OpenSSL)
+#   bin/msim, bin/minisim, bin/slang_dump, bin/mregress, bin/mcov, bin/mbug, bin/mplan
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)
@@ -473,7 +409,6 @@ if(MINISIM_WITH_SLANG)
   install(TARGETS msim mlint mdft mdebug slang_dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(OPENSSL_FOUND)
-  install(TARGETS msimprotect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 # minisim::core: the kernel headers, exported so a tool kept in another
 # repository builds against them instead of copying them (docs/LICENSING.md).
@@ -500,6 +435,8 @@ install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mr
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
 install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
 install(PROGRAMS tools/mplan.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan)
+# The Python interface to mdebug -script (import mdebug_api).
+install(FILES tools/mdebug_api.py DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/python)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
@@ -508,17 +445,13 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES include/svdpi.h include/vpi_user.h include/sv_vpi_user.h include/veriuser.h include/mvp.h
+install(FILES include/svdpi.h include/vpi_user.h include/sv_vpi_user.h include/veriuser.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 # UVM's C code for minisim: msim -uvm looks for it next to itself.
 install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/uvm)
-# The virtual prototype layer: msim -mvp looks for these next to itself.
-install(FILES mvp/mvp.c mvp/mvp_tlm.h DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
-install(FILES mvp/sv/mvp.sv DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp/sv)
-install(DIRECTORY mvp/models DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/mvp)
 # The datapath library: synthesizable SystemVerilog, msim -y <prefix>/share/minisim/dw +libext+.sv
 install(DIRECTORY dw DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim FILES_MATCHING PATTERN "*.sv")
-install(FILES README.md CHANGELOG.md LICENSE NOTICE docs/LICENSING.md docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
+install(FILES README.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md docs/LICENSING.md docs/COVERAGE.md docs/VPI.md docs/UVM.md docs/PROTECT.md docs/DATAPATH.md docs/MPLAN.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 # The tools: one file each in cmake/tools, all included here, after the core

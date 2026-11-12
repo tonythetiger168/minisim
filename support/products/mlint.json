@@ -1,0 +1,45 @@
+{
+  "name": "mlint",
+  "title": "mlint lint and clock-domain checks",
+  "summary": "Lint and CDC / RDC checks on the elaborated design: about 80 rules with severities, configuration files, waivers, JSON report, multi-core.",
+  "docs": [
+    "README.md#Lint and clock-domain checks",
+    "docs/LINT.md",
+    "docs/CDC.md",
+    "CHANGELOG.md"
+  ],
+  "run": {
+    "binary": "mlint",
+    "source_ext": ".sv",
+    "fixed": [
+      "-threads",
+      "2"
+    ],
+    "flags": [
+      "-Werror",
+      "-list"
+    ],
+    "valued": [
+      "-top",
+      "-disable",
+      "-enable",
+      "-explain"
+    ],
+    "plusargs": false,
+    "cpu_seconds": 10,
+    "wall_seconds": 20,
+    "memory_mb": 2048
+  },
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "msim",
+    "mwave",
+    "mcov",
+    "mregress",
+    "mplan",
+    "mbug",
+    "mdft",
+    "mdebug"
+  ]
+}
