@@ -7,6 +7,25 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Removed
+- `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
+  IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
+  a paid tool. What stays is what `mdft` always was first: the RTL
+  scan-readiness rules DFT001..DFT006 and the flop count per clock domain,
+  before a design is changed for test. `src/dft/` and the fault engine
+  headers those flows read go with them.
+- The implementation and signoff tools leave this repository. `msynth`,
+  `mpnr`, `msta`, `mrcx`, `mequiv`, `mformal`, `matpg`, `memu`, `mfpga`,
+  `mhls`, `mspice`, `mchar`, `mpv`, `mpower`, `mpopt`, `msdc`, `mlibc`,
+  `msimprotect`, `mpss` and the `mvp` virtual prototype layer are a paid
+  product now, described in `docs/LICENSING.md`. The free edition is the
+  verification flow: `msim`, `mwave`, `mcov`, `mregress`, `mplan`, `mbug`,
+  `mlint` with CDC, `mdft`'s scan-readiness checks and `mdebug`.
+  - `msim -mvp` keeps its option and reports that it cannot find the runtime
+    when the paid layer is not installed beside it.
+  - `msim -keyfile` still opens IEEE 1735 envelopes; only `msimprotect`,
+    which writes them, has gone.
+
 ### Changed
 - `mchar` measures input pin power: `internal_power` groups without a
   `related_pin` get the supply energy of an edge that moves no output, and
@@ -19,27 +38,46 @@ Spec references are IEEE 1800-2023 clauses.
   stay under it, and so does the git history. `docs/LICENSING.md` holds the
   open-core policy, the proposed free / paid split per tool, and the rule
   that no GPL or other copyleft code enters the tree.
+- Protected IP: the `-license <feature>` option is removed. It let the IP
+  user grant a licensed right to themselves; only the license proxy named by
+  the envelope decides now. `-license_fail stop|deny` chooses what happens
+  when no proxy can be reached.
 
 ### Added
-- `mplan serve` and `mplan push`: a multi-user server and web dashboard.
-  CI pushes each report; the server keeps the history per project and shows
-  every plan (score, status, tests, requirements, trend) and one page per
-  plan where people set the owner, status, bug id and note of each failure
-  bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
-  and `mplan report -rules URL` to take the annotations as triage rules.
-- `mplan rank`: per-test coverage and test ranking from the per-run
-  coverage databases of `mregress -cov`. A greedy order by new coverage
-  points (`-by rate`: per second of run time), each test's unique points,
-  the redundant tests, `-keep FILE` for the short list with the same
-  coverage, and with a plan the tests behind each feature's coverage.
-  `mplan report -rank` adds it to `plan.html` and `plan.json`.
-- `mplan`: requirement traceability. `req ID ...` in a feature and a
-  requirement list (`reqs FILE` in the plan or `-reqs FILE`), read from CSV
-  or ReqIF (`.reqif` / `.reqifz`, with the hierarchy). Every requirement is
-  verified, partial, failing, not started or uncovered; the report, the
-  HTML page, `plan.json`, the history and `mplan trend` show it, `-trace`
-  writes the matrix as CSV, `-fail-on-uncovered` gates on it, and
-  `mplan init -reqs` drafts a plan from the list.
+- `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
+  the object a module's class handle variable points to is a signal
+  `tb.p.addr` that follows the handle (x while it is null), with handle
+  properties followed N levels. `mdebug` reads them back: script `value` and
+  `changes`, `-signals`, and the page adds them when the handle is picked.
+- `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
+  uvm-core writes (`tr_db.log`): streams, each item's begin, end, fields and
+  parent sequence, those in progress at `-at T`, and stream rows in the
+  viewer's waves.
+- `msim -i` and `msim -do FILE`: interactive simulation like VCS UCLI:
+  `run [T]`, `step`, stops on a signal change, edge or value, `print` of
+  signals and class objects (properties, inherited ones, paths through
+  handles), `force`, `release`, `deposit` and `signals`.
+- `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
+  signal's waves are sent when the page first shows it, so large waveforms
+  are not cut to the one-file page's budget.
+- `mdebug -upf FILE -power [DOMAIN]`: the power domains, their supplies and
+  isolation, level-shifter and retention strategies; with the log of
+  `msim -upf_verbose`, power states over time. The active trace says when a
+  value is x because its domain is off and names the isolation on a port.
+- `mdebug -cov FILE`: with msim's coverage database, driver lines say how
+  often their line ran, `-uncovered [INST]` lists assignments that never ran
+  and signals that never toggled, and the viewer page marks covered lines.
+- `mdebug -assert [NAME]`: the design's assertions; with `-log LOG` and a
+  waveform, each failure with the values the assertion sampled at the clock
+  ticks before it and the driver trace of each signal.
+- `mdebug -script FILE` (`-` for the standard input): one command per line
+  (drivers, loads, value, changes, active, trace, blocks, fsm, scopes,
+  signals, end), one line of JSON per answer, from one process that loads the
+  design and waveform once. `tools/mdebug_api.py` wraps it for Python.
+- `mdebug -fsm [NAME]`: the design's state machines (shared extractor), their
+  states and transitions with source lines; with a waveform, which transitions
+  ran, states never entered, values that are not states, and the state at
+  `-at T`. The viewer page draws the state diagram of a selected state register.
 - `msupport`: an AI support agent per product. Each answers from its
   product's documentation (BM25 search over the manuals), can run a short
   example on the product's tool in a sandbox, and files a ticket when the
@@ -426,6 +464,12 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- `mcov exclude -formal`: what `mformal -json` proves unreachable (toggle
+  bits today, other targets that name the exclusion they prove) becomes
+  exclusions with that reason, for the items the tests did not cover.
+- Condition coverage modes (as VCS `-cm_cond`): `full` records every
+  combination of the term values (up to 8 terms), `allops` also covers `&`
+  and `|` of one-bit operands; interpreter and `-compile`.
 - Per-instance coverage: `msim -cov` also writes each module instance's own
   line hits, branch outcomes and condition vectors (interpreter and
   `-compile`); `mcov report -instances` prints a row per instance with line,
@@ -643,8 +687,51 @@ Spec references are IEEE 1800-2023 clauses.
   against 5.8 s. Build option `MINISIM_WITH_BSIM4`.
 - `mspice`: unknowns fixed by a voltage source to ground are eliminated
   first, which keeps the pivots of a long chain of gain stages usable.
+- Protected IP: the IEEE 1735-2023 clause 8 license system. `msim`, `mlint`
+  and `mdft` ask the IP author's license proxy over TLS for the value of a
+  `license(...)` or `license_string(...)` call in a right (`src/licproxy.hpp`).
+  See "Licenses" in `docs/PROTECT.md`.
+- Protected IP, IEEE 1735-2023 5.2, 9.3, 9.4, 9.9 and Annex A checked rule
+  by rule (in `test_protect`): strings without `\` or control
+  characters, lower-case keywords (`` `pragma protect BEGIN `` is an error
+  instead of leaving the source in the clear), key names and rights that
+  differ only in case, end-of-file characters inside an envelope, strict
+  BASE64_TEXT, what tool and common blocks may hold, and viewport lists with
+  `.` or `:` scoped names. Clear modules instantiated in or bound into
+  protected IP are hidden from waveforms, coverage and lint output.
+- `mplan`: requirement traceability. `req ID ...` in a feature and a
+  requirement list (`reqs FILE` in the plan or `-reqs FILE`), read from CSV
+  or ReqIF (`.reqif` / `.reqifz`, with the hierarchy). Every requirement is
+  verified, partial, failing, not started or uncovered; the report, the
+  HTML page, `plan.json`, the history and `mplan trend` show it, `-trace`
+  writes the matrix as CSV, `-fail-on-uncovered` gates on it, and
+  `mplan init -reqs` drafts a plan from the list.
+- `mplan rank`: per-test coverage and test ranking from the per-run
+  coverage databases of `mregress -cov`. A greedy order by new coverage
+  points (`-by rate`: per second of run time), each test's unique points,
+  the redundant tests, `-keep FILE` for the short list with the same
+  coverage, and with a plan the tests behind each feature's coverage.
+  `mplan report -rank` adds it to `plan.html` and `plan.json`.
+- `mplan serve` and `mplan push`: a multi-user server and web dashboard.
+  CI pushes each report; the server keeps the history per project and shows
+  every plan (score, status, tests, requirements, trend) and one page per
+  plan where people set the owner, status, bug id and note of each failure
+  bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
+  and `mplan report -rules URL` to take the annotations as triage rules.
 
 ### Fixed
+- msim memory on big VIP benches: a 2-state unpacked array with more than
+  64 elements gets its 0 defaults (6.8) from a loop instead of one
+  instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and
+  an assertion action block (16.14.3) is freed when it finishes instead of
+  at the end of the run (a pass action on every clock grew without bound).
+  A UFS VIP test went from 7.5 GB to 2.3 GB; SD and eMMC tests were killed
+  for memory before.
+- `randomize()` no longer fails when a variable solved first is tied to one
+  whose values have holes (`s == d` with `d inside {512, 1024, 4096}` and
+  `solve s before d`, or `data.size() == len` with `len` in a set, since
+  array sizes are solved first). The value search now narrows the other
+  variables at each step (18.5, 18.4).
 - msim: four faults found by re-measuring the spec table with uvm-core.
   `void'($cast(d, s))` no longer reports an error when the cast fails; only
   the task form does (8.16). `'{default: v}` on an associative array sets
