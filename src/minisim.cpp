@@ -925,6 +925,7 @@ struct Sim {
     // msim -xprop (SF_XPROP_EDGE): set() keeps each signal's bit 0 from
     // before its last change and the time of that change (Sig::p0, at).
     bool edgeTrack = false;
+    uint64_t xAt = ~0ULL;   // the last time step in which bit 0 of a signal changed from or to x (kept with edgeTrack)
     int sig(const string& n, int w, bool net = false) {
         self = this;
         // An unpacked array element is named "m[3]". The VCD leaves memories
@@ -2337,7 +2338,10 @@ struct Sim {
             g.val = nv;
         }
         if (__builtin_expect(!pathIn.empty(), 0) && (size_t)s < pathIn.size() && pathIn[s]) lastChg[s] = now;
-        if (__builtin_expect(edgeTrack, 0)) { g.p0 = (uint8_t)o; g.at = now; }   // msim -xprop
+        if (__builtin_expect(edgeTrack, 0)) {   // msim -xprop
+            g.p0 = (uint8_t)o; g.at = now;
+            if (o == 2 || n == 2) xAt = now;
+        }
         dump(s);
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
         if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)

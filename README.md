@@ -248,6 +248,46 @@ mcov report all.json -uncovered           # only what is missing
 mcov report all.json -min-cond 80 -min-fsm-state 100 -min-fsm-trans 90
 ```
 
+**Exclusions.** Items that cannot or need not be covered go in an exclusion
+file (as URG's `-elfile`), one per line with the reason; they are left out of
+every number and report:
+
+```
+state  tb.dut.u.state FAIL     -- error injection is not in this regression
+trans  tb.dut.u.state RUN->IDLE -- reset only
+cond   rtl/ctrl.sv:60 3        -- b is tied high in this configuration
+line   rtl/ctrl.sv:40-44       -- unreachable with WIDTH=8
+toggle tb.dut.bus[31:24]       -- upper byte unused
+file   rtl/dbg_*.sv            -- debug only
+```
+
+```sh
+mcov exclude all.json -o draft.el                    # one exclusion per uncovered item, reason TODO
+mcov report all.json -elfile ok.el -el-review        # each exclusion, what it removes, what to review
+mcov report all.json -elfile ok.el -el-strict        # exit 1 on a stale, covered or unexplained exclusion
+```
+
+`-el-review` flags an exclusion that matches nothing (the code changed), one
+that removes items the tests did cover, and one without a reason. Kinds:
+`file`, `line`, `branch`, `cond`, `toggle`, `fsm`, `state`, `trans`, `cg`,
+`assert`; names take `*` and `?`.
+
+**Which test covers what.** With one database per test, `mcov rank` orders
+the tests so that each next one adds the most items not yet covered, and
+shows what only one test covers and which tests add nothing:
+
+```sh
+mcov rank cov/*.json -o keep.txt       # keep.txt: the tests that add coverage, best first
+mcov rank cov/*.json -item rtl/ctrl.sv:52     # the tests that cover this line (or signal, FSM, covergroup)
+```
+
+```
+Rank  Test          Covers   Only it      Adds             Total
+   1  smoke.json      170        19       170       170   87.6%
+   2  reset.json      151         0         0       170   87.6%
+2 test(s), 194 item(s); the first 1 reach the total, 1 add nothing
+```
+
 ```
 Condition tb.sv:30:15  a && b
     -1- a
@@ -770,6 +810,8 @@ and reports the fault coverage of the chosen algorithm. See
 ```sh
 mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
 mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
+```
+
 `mdft` also does IEEE 1149.1 boundary scan and IEEE 1687 IJTAG
 ([docs/JTAG.md](docs/JTAG.md)); every flow can write SVF and a self-checking
 testbench that `msim` runs:
@@ -899,6 +941,21 @@ A model is ordinary C against [`include/mvp.h`](include/mvp.h):
 to interrupt, `mvp_bus_read` / `mvp_bus_write` to be a master. A TLM-2.0
 target goes behind the same bridge with `mvp_tlm.h`. A memory and a 16550-style
 UART are bundled in `mvp/models/`. See [docs/VPROTO.md](docs/VPROTO.md).
+
+### Support agents: `msupport`
+
+Each product has an AI support agent that answers users' questions from that
+product's documentation, can run a short example on the product's own tool in
+a sandbox, and files a ticket when the documentation does not answer. One
+JSON file per product in `support/products/`; the model is Claude through the
+Anthropic SDK. Built and tested, not online yet. See
+[docs/SUPPORT.md](docs/SUPPORT.md).
+
+```sh
+python3 tools/msupport.py -list
+python3 tools/msupport.py -product msim "How do I write an FST waveform?"
+python3 tools/msupport.py -serve 8080            # a local web page and JSON API
+```
 
 ## Known limits
 
