@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
+  acknowledge back gets an assertion that it changes only once the
+  acknowledge has caught up (two- and four-phase). The one-bit stability
+  check no longer counts the reset value as a change.
 - `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
   and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
   with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
