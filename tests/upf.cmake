@@ -26,8 +26,9 @@ endforeach()
 # replayed at power-up (6.60); attributes written in the HDL (5.6, 5.7); an
 # abstract power source (6.16); value conversion methods in UPF libraries,
 # for real, enum, integer and upfSupplyTypeT ports (4.10, 5.11, 6.29, 6.30,
-# 6.36, 6.63).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm)
+# 6.36, 6.63); function and model VCMs (6.30.8, 6.30.9); supply ports
+# connected by pg_type (4.5.4.6.2, 6.14, 6.15).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -285,7 +286,13 @@ upf_error_in(vcm e_vcm10 "create_vcm R2U -vcms {vlib::R2U}\nconnect_supply_net V
 upf_error_in(vcm e_vcm11 "create_vcm V11 -vcms {vlib::R2U vlib::REAL}" "both convert from HDL type real (6.30)")
 upf_error_in(vcm e_vcm12 "create_vcm V12 -vcms {nope}" "no VCM 'nope' for -vcms (6.30)")
 upf_error_in(vcm e_vcm13 "create_supply_net VX\nconnect_supply_net VX -ports {u_ana/vi} -vcm REAL" "is an integer port (input), and VCM vlib::REAL has no upf2hdl conversion for it")
-upf_error_in(vcm e_vcm14 "create_vcm F -function p::f\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vi} -vcm F" "converts with an HDL function, which msim does not run yet")
+upf_error_in(vcmfn e_fn1 "create_vcm X -function vcm_pkg::nope\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "VCM IEEE::X: no function vcm_pkg::nope (6.30.8)")
+upf_error_in(vcmfn e_fn2 "create_vcm X -function nopkg::f\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "no package nopkg for -function nopkg::f (6.30.8)")
+upf_error_in(vcmfn e_fn3 "create_vcm X -function vcm_pkg::both\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "exactly one of the argument and the return type of vcm_pkg::both is upfSupplyTypeT (6.30.8)")
+upf_error_in(vcmfn e_fn4 "create_vcm X -function vcm_pkg::two\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "vcm_pkg::two needs exactly one input argument (6.30.8)")
+upf_error_in(vcmfn e_fn5 "create_vcm X -model nomod\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "no module nomod for -model (6.30.9)")
+upf_error_in(vcmfn e_fn6 "create_vcm X -model two_in\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "two_in needs one input and one output port (6.30.9)")
+upf_error_in(vcmfn e_fn7 "create_supply_net VX\nconnect_supply_net VX -ports {u_ana/vi} -vcm FN" "is an integer port (input), and VCM IEEE::FN has no upf2hdl conversion for it")
 upf_error_in(vcm e_vcm15 "create_vcm V15 -vcms {.::R2U}" "'.' names the library being created, and this is not in create_upf_library (6.29)")
 upf_error_in(vcm e_lib1 "create_upf_library L1 -contents {create_supply_net X}" "create_supply_net inside create_upf_library L1; a UPF library holds only create_vcm and use_upf_library (6.29)")
 upf_error_in(vcm e_lib2 "create_upf_library vlib -contents {}" "UPF library vlib already exists (6.29)")
@@ -294,3 +301,11 @@ upf_error_in(vcm e_lib4 "load_upf_library vcm_bad_lib.upf" "create_vcm in a UPF 
 upf_error_in(vcm e_lib5 "connect_supply_net VR -ports {u_ana/vr} -vcm zlib::R2U" "no UPF library zlib (5.11)")
 upf_error_in(vcm e_lib6 "connect_supply_net VR -ports {u_ana/vr} -vcm vlib::NOPE" "UPF library vlib has no VCM NOPE (6.30)")
 upf_error_in(vcm e_lib7 "create_upf_library L7 -contents {create_vcm A -vcms {vlib::R2U}}\nconnect_supply_net VR -ports {u_ana/vr} -vcm A" "no VCM 'A'")
+
+# Errors of connect_supply_net by pg_type.
+upf_error_in(pgconn e_pg1 "connect_supply_net VBAT -ports {u_m1/VBK} -pg_type backup_power" "-ports cannot go with -pg_type, -cells, -domain or -elements (6.14)")
+upf_error_in(pgconn e_pg2 "connect_supply_net VBAT -pg_type backup_power" "-pg_type needs -cells, -domain or -elements (6.14)")
+upf_error_in(pgconn e_pg3 "connect_supply_net VBAT" "connect_supply_net needs -ports or -pg_type (6.14)")
+upf_error_in(pgconn e_pg4 "connect_supply_net VBAT -pg_type backup_power -cells nocell" "connect_supply_net -cells: no instance of nocell in the design (6.14)")
+upf_error_in(pgconn e_pg5 "connect_supply_net VBAT -pg_type backup_power -domain PD_X" "connect_supply_net -domain: no power domain PD_X")
+upf_error_in(pgconn e_pg6 "connect_supply_net VBAT -pg_type backup_power -elements {u_m9}" "connect_supply_net -elements: no instance u_dut.u_m9 in the design (6.14)")

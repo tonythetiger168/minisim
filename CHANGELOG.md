@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
+  one cycle, crossing from a clock of shorter period into one of longer
+  period through a plain synchronizer, can be missed. Periods come from
+  `create_clock -period`, and for a generated clock from its master with
+  `-divide_by` / `-multiply_by`. A toggle or a held request is not reported.
 - Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
   `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
   the last place), checked by `tests/dw/more.sv`.
@@ -114,6 +119,13 @@ Spec references are IEEE 1800-2023 clauses.
   ports, VCM lists, and ports of type `upfSupplyTypeT` without conversion
   (4.10); UPF libraries (`create_upf_library`, `use_upf_library`,
   `load_upf_library`; 5.11, 6.29, 6.36, 6.63).
+- UPF (IEEE 1801-2024): function and model VCMs (6.30.8, 6.30.9) are
+  simulated: the function is called, or the model instantiated, on the port
+  through a module bound into the simulation top.
+- UPF (IEEE 1801-2024): supply ports connected by pg_type:
+  `connect_supply_net -pg_type` with `-cells`, `-domain`, `-elements` (6.14),
+  `connect_supply_set -connect` (6.15), and the automatic connection of a
+  domain's primary supply set (4.5.4.6.2).
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.
@@ -918,6 +930,11 @@ Spec references are IEEE 1800-2023 clauses.
   plan where people set the owner, status, bug id and note of each failure
   bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
   and `mplan report -rules URL` to take the annotations as triage rules.
+- `src/compat.hpp` and `docs/COMPAT.md`: one shared layer that lets every tool
+  accept Synopsys, Cadence or Siemens command lines (`--compat=cadence`, or the
+  name the tool was started as). It renames or drops options from a per-tool
+  rule table and prints messages in the chosen vendor's layout. The engine
+  stays the same; nothing is implemented twice. Unit test `test_compat`.
 - `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
   / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
   state times of an instance to `Db::states`. Unit test `test_saif`.
@@ -929,6 +946,10 @@ Spec references are IEEE 1800-2023 clauses.
   so the callers woke each other forever. Callers are now sensitive only to
   their operands (10.3.2, 9.2.2.2.1). Five open-ip-portfolio IPs that timed
   out after 600 s now pass in 2 to 101 s (AES_GCM 27.5 s; Icarus 30 s).
+- `c ? q.pop_front() : d` (and `pop_back`) runs the pop only in the chosen
+  arm, after the condition (11.4.11). It used to pop first, so a condition
+  on `q.size()` popping the last element gave `d` and lost the element.
+  Found by the SPI VIP's slave model.
 - `x inside {q}` in a constraint, where `q` is a queue or dynamic array (a
   caller's variable in `randomize() with`, or a class property), no longer
   makes randomize() fail: the solver narrows x to the container's elements
