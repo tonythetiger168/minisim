@@ -76,6 +76,16 @@ Spec references are IEEE 1800-2023 clauses.
   the caller's mode. New routines `vpi_get_value_array` and
   `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
   a user system task. See `docs/VPI.md`.
+- `mdebug -upf FILE -power [DOMAIN]`: the power domains, their supplies and
+  isolation, level-shifter and retention strategies; with the log of
+  `msim -upf_verbose`, power states over time. The active trace says when a
+  value is x because its domain is off and names the isolation on a port.
+- `mdebug -cov FILE`: with msim's coverage database, driver lines say how
+  often their line ran, `-uncovered [INST]` lists assignments that never ran
+  and signals that never toggled, and the viewer page marks covered lines.
+- `mdebug -assert [NAME]`: the design's assertions; with `-log LOG` and a
+  waveform, each failure with the values the assertion sampled at the clock
+  ticks before it and the driver trace of each signal.
 - `mdebug -script FILE` (`-` for the standard input): one command per line
   (drivers, loads, value, changes, active, trace, blocks, fsm, scopes,
   signals, end), one line of JSON per answer, from one process that loads the
