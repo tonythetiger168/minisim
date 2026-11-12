@@ -40,6 +40,11 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
+  the object a module's class handle variable points to is a signal
+  `tb.p.addr` that follows the handle (x while it is null), with handle
+  properties followed N levels. `mdebug` reads them back: script `value` and
+  `changes`, `-signals`, and the page adds them when the handle is picked.
 - `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
   uvm-core writes (`tr_db.log`): streams, each item's begin, end, fields and
   parent sequence, those in progress at `-at T`, and stream rows in the
