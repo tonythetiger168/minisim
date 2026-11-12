@@ -2832,9 +2832,24 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::Slice: return v_slice(k(0), e->hi, e->lo);
         case Op::Index: return v_index(k(0), k(1));
         case Op::Concat: {
-            std::vector<Val> parts;
-            for (size_t i = 0; i < e->kids.size(); i++) parts.push_back(k((int)i));
-            return v_concat(parts);
+            // Up to 64 bits (the usual case) the result is built in place, the
+            // way v_concat does it: no vector and no allocation.
+            size_t n = e->kids.size();
+            Val r{0, 0, 0};
+            for (size_t i = 0; i < n; i++) {
+                Val p = k((int)i);
+                if (r.w + p.w > 64) {
+                    std::vector<Val> parts;
+                    parts.reserve(n - i + 1);
+                    if (r.w > 0) parts.push_back(std::move(r));
+                    parts.push_back(std::move(p));
+                    for (i++; i < n; i++) parts.push_back(k((int)i));
+                    return v_concat(parts);
+                }
+                uint64_t rv = p.w >= 64 ? 0 : r.v << p.w, rx = p.w >= 64 ? 0 : r.x << p.w, rz = p.w >= 64 ? 0 : r.z << p.w;
+                r = make(rv | p.v, rx | p.x, r.w + p.w, rz | p.z);
+            }
+            return r;
         }
         case Op::Mux: {   // only the selected operand is evaluated (11.4.11); an unknown condition merges both
             Val c = k(0);
