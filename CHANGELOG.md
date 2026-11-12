@@ -23,6 +23,11 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- `mvplat` supervisor mode and Sv32 paging: delegation (`medeleg`,
+  `mideleg`), the supervisor CSRs, SRET, SFENCE.VMA, SUM/MXR/TVM/TW/TSR, a
+  TLB per hart, Svade accessed/dirty faults, and a supervisor-mode PLIC
+  context per hart. The riscv-tests run grows to 144 programs (rv32si, and
+  the `v` environment with paging on), all passing.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
