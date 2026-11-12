@@ -316,7 +316,7 @@ struct Plan {
 // run time; the drive of its ~1700 single-driver nets was another quarter.
 static void mergePartialDrivers(LowerResult& lowered) {
     if (!S.varPathDrv.empty() || !S.loadsOf.empty() || !lowered.netDelays.empty()) return;
-    for (auto& t : S.tranOf) if (!t.empty()) return;
+    if (!lowered.trans.empty()) return;   // switches resolve their nets from the drivers (S.tranOf is set later)
     for (uint8_t b : S.pathIn) if (b) return;
     size_t ns = S.sigs.size();
     std::vector<std::vector<Instr*>> by(ns);
@@ -2431,7 +2431,7 @@ int main(int argc, char** argv) {
         if (t.charge != STR_MEDIUM) S.charge[t.sig] = t.charge;
         if (t.decays) S.decay[t.sig] = Sim::Decay{t.decay, 0, true};
     }
-    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
+    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist, t.aLo, t.bLo, t.w);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
