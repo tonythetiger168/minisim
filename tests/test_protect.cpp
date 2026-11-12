@@ -308,6 +308,87 @@ int main() {
         assert(vps[2].iface && vps[2].name.empty());
         assert(dv.text.substr(vps[2].targetBegin, 9) == "endmodule");
 
+        // Annex A: a viewport takes a list of scoped names, '.' or ':' between scopes.
+        {
+            const char* VL = "`pragma protect begin\n`pragma protect viewport m.a, m:blk:b\nmodule m; endmodule\n`pragma protect end\n";
+            Decrypted dl = decryptSource(encryptSourceV3(VL, va, "vl.sv"), a, "vl.svp");
+            auto& l = dl.envs[0].viewports;
+            assert(l.size() == 2 && l[0].name == "m.a" && l[1].name == "m.blk.b");
+        }
+
+        // IEEE 1735-2023 5.2 and Annex A, rule by rule.
+        auto enc = [&](const std::string& src) { return encryptSourceV3(src, va, "r.sv"); };
+        const std::string body = "`pragma protect begin\nmodule m; endmodule\n`pragma protect end\n";
+        // 5.2.1: strings are printable ASCII without " or backslash; no escapes.
+        assert(throws([&] { enc("`pragma protect author = \"a\\\\b\"\n" + body); }, "printable ASCII without"));
+        assert(throws([&] { enc("`pragma protect author = \"a\tb\"\n" + body); }, "printable ASCII without"));
+        assert(throws([&] { enc("`pragma protect begin_toolblock\n`pragma protect key_keyowner = \"Alice Corp\", key_keyname = \"alice-1\"\n"
+                                "`pragma protect control visibility = \"fu\\\\ll\"\n`pragma protect end_toolblock\n" + body); }, "5.2.1"));
+        // 5.2.2: keywords are lower case, so `pragma protect BEGIN cannot leave
+        // the source in the clear; names may not differ in case alone.
+        assert(throws([&] { enc("`pragma protect BEGIN\nmodule m; endmodule\n`pragma protect END\n"); }, "keywords are lower case"));
+        assert(throws([&] { enc("`pragma protect begin\nmodule m; endmodule\n`pragma protect End\n"); }, "keywords are lower case"));
+        assert(throws([&] { enc("`pragma protect begin_toolblock\n`pragma protect key_keyowner = \"Alice Corp\", key_keyname = \"alice-1\"\n"
+                                "`pragma protect control visibility = \"full\", Visibility = \"none\"\n`pragma protect end_toolblock\n" + body); },
+                      "differ only in letter case"));
+        assert(throws([&] { enc("`pragma protect data_method = \"AES256-CBC-HMAC-SHA512\"\n" + body); }));
+        {
+            Keyring k;
+            k.add(copyPriv(alice.get()), "key1", "Acme");
+            assert(throws([&] { k.add(copyPriv(bob.get()), "KEY1", "ACME"); }, "differ only in letter case"));
+            PublicKeyring pk2;
+            PublicKeyEntry x, y;
+            x.owner = "Acme"; x.name = "key1"; x.pub = pub(alice.get());
+            y.owner = "acme"; y.name = "Key1"; y.pub = pub(bob.get());
+            pk2.add(std::move(x));
+            assert(throws([&] { pk2.add(std::move(y)); }, "differ only in letter case"));
+        }
+        // Inside an envelope: the same rules, before the signature is checked.
+        const std::string good = enc(body);
+        assert(decryptSource(good, a, "g.svp").text.find("module m;") != std::string::npos);
+        auto edit = [&](const std::string& from, const std::string& to) {
+            std::string t = good;
+            size_t at = t.find(from);
+            assert(at != std::string::npos);
+            return t.replace(at, from.size(), to);
+        };
+        assert(throws([&] { decryptSource(edit("`pragma protect key_block", "`pragma protect KEY_BLOCK"), a, "c.svp"); },
+                      "keywords are lower case"));
+        // 5.2.3: no end-of-file character inside an envelope.
+        assert(throws([&] { decryptSource(edit("`pragma protect begin_toolblock\n", "`pragma protect begin_toolblock\n\x05\n"), a, "e.svp"); },
+                      "end-of-file character inside a decryption envelope"));
+        // Annex A: BASE64_TEXT has no spaces; tool and common blocks hold only their own pragmas.
+        {
+            std::string t = good;
+            size_t d = t.find("`pragma protect data_block\n") + 27;
+            t.insert(d + 10, " ");
+            assert(throws([&] { decryptSource(t, a, "b.svp"); }, "is not base64 text"));
+        }
+        assert(throws([&] { decryptSource(edit("`pragma protect end_toolblock", "`pragma protect author = \"x\"\n`pragma protect end_toolblock"), a, "t.svp"); },
+                      "does not belong in a tool block"));
+        assert(throws([&] { decryptSource(edit("`pragma protect begin_toolblock",
+                                               "`pragma protect begin_commonblock\n`pragma protect author = \"x\"\n"
+                                               "`pragma protect end_commonblock\n`pragma protect begin_toolblock"), a, "cb.svp"); },
+                      "only license_proxyenv and license_certificate belong in a common block"));
+        // The encryptor's own output stays inside the grammar: lower-case
+        // keywords, base64 lines, one quoted signature.
+        {
+            size_t at = good.find("`pragma protect begin_protected"), end = good.find("`pragma protect end_protected");
+            std::string env = good.substr(at, end - at);
+            size_t b0 = 0;
+            while (b0 < env.size()) {
+                size_t e = env.find('\n', b0);
+                std::string ln = env.substr(b0, e - b0);
+                b0 = e + 1;
+                if (ln.rfind("`pragma protect ", 0) == 0) {
+                    std::string k = ln.substr(16, ln.find_first_of(" =,", 16) - 16);
+                    for (char c : k) assert(!std::isupper((unsigned char)c));
+                } else {
+                    for (char c : ln) assert(std::isalnum((unsigned char)c) || c == '+' || c == '/' || c == '=');
+                }
+            }
+        }
+
         // Recipe pragmas in the source (5.6.1), with the key in a keyring
         // file in the 6.3.1 pragma exchange format; recipe lines are removed.
         PublicKeyring pk;

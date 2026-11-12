@@ -7,6 +7,25 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Removed
+- `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
+  IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
+  a paid tool. What stays is what `mdft` always was first: the RTL
+  scan-readiness rules DFT001..DFT006 and the flop count per clock domain,
+  before a design is changed for test. `src/dft/` and the fault engine
+  headers those flows read go with them.
+- The implementation and signoff tools leave this repository. `msynth`,
+  `mpnr`, `msta`, `mrcx`, `mequiv`, `mformal`, `matpg`, `memu`, `mfpga`,
+  `mhls`, `mspice`, `mchar`, `mpv`, `mpower`, `mpopt`, `msdc`, `mlibc`,
+  `msimprotect`, `mpss` and the `mvp` virtual prototype layer are a paid
+  product now, described in `docs/LICENSING.md`. The free edition is the
+  verification flow: `msim`, `mwave`, `mcov`, `mregress`, `mplan`, `mbug`,
+  `mlint` with CDC, `mdft`'s scan-readiness checks and `mdebug`.
+  - `msim -mvp` keeps its option and reports that it cannot find the runtime
+    when the paid layer is not installed beside it.
+  - `msim -keyfile` still opens IEEE 1735 envelopes; only `msimprotect`,
+    which writes them, has gone.
+
 ### Changed
 - `mchar` measures input pin power: `internal_power` groups without a
   `related_pin` get the supply energy of an edge that moves no output, and
@@ -419,6 +438,9 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- `mcov exclude -formal`: what `mformal -json` proves unreachable (toggle
+  bits today, other targets that name the exclusion they prove) becomes
+  exclusions with that reason, for the items the tests did not cover.
 - Condition coverage modes (as VCS `-cm_cond`): `full` records every
   combination of the term values (up to 8 terms), `allops` also covers `&`
   and `|` of one-bit operands; interpreter and `-compile`.
@@ -641,10 +663,10 @@ Spec references are IEEE 1800-2023 clauses.
   first, which keeps the pivots of a long chain of gain stages usable.
 - Protected IP: the IEEE 1735-2023 clause 8 license system. `msim`, `mlint`
   and `mdft` ask the IP author's license proxy over TLS for the value of a
-  `license(...)` or `license_string(...)` call in a right; `mlicproxy` is
-  such a proxy, driven by a license file. See "Licenses" in `docs/PROTECT.md`.
+  `license(...)` or `license_string(...)` call in a right (`src/licproxy.hpp`).
+  See "Licenses" in `docs/PROTECT.md`.
 - Protected IP, IEEE 1735-2023 5.2, 9.3, 9.4, 9.9 and Annex A checked rule
-  by rule (`tests/protect_conformance.sh`): strings without `\` or control
+  by rule (in `test_protect`): strings without `\` or control
   characters, lower-case keywords (`` `pragma protect BEGIN `` is an error
   instead of leaving the source in the clear), key names and rights that
   differ only in case, end-of-file characters inside an envelope, strict
@@ -653,6 +675,11 @@ Spec references are IEEE 1800-2023 clauses.
   protected IP are hidden from waveforms, coverage and lint output.
 
 ### Fixed
+- `randomize()` no longer fails when a variable solved first is tied to one
+  whose values have holes (`s == d` with `d inside {512, 1024, 4096}` and
+  `solve s before d`, or `data.size() == len` with `len` in a set, since
+  array sizes are solved first). The value search now narrows the other
+  variables at each step (18.5, 18.4).
 - msim: four faults found by re-measuring the spec table with uvm-core.
   `void'($cast(d, s))` no longer reports an error when the cast fails; only
   the task form does (8.16). `'{default: v}` on an associative array sets
