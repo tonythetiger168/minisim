@@ -51,6 +51,7 @@
 #include "lintir.hpp"
 #include "parallel.hpp"
 #include <deque>
+#include <fstream>
 #include "sdc.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/ConversionExpression.h"
@@ -68,6 +69,7 @@ struct Options {
     bool report = false;                                // -cdc-report
     std::vector<std::string> sdcFiles;                  // -sdc file
     int depth = 2;                                      // -cdc-depth N
+    std::string sva;                                    // -cdc-sva FILE
     int threads = 1;                                    // -threads N
 
     // Takes one command-line option if it is one of these. `next` returns the
@@ -77,6 +79,7 @@ struct Options {
         if (a == "-cdc-report") { report = true; return true; }
         if (a == "-static") { statics.push_back(next("a signal")); return true; }
         if (a == "-sdc") { sdcFiles.push_back(next("an SDC file")); return true; }
+        if (a == "-cdc-sva") { sva = next("an output file"); return true; }
         if (a == "-cdc-depth") {
             std::string v = next("a number of flops");
             char* e = nullptr;
@@ -104,7 +107,8 @@ struct Options {
 };
 
 inline const char* usage() {
-    return "  -cdc-depth N   CDC004 follows synchronized signals through N more flops to where they meet (2)\n"
+    return "  -cdc-sva FILE  write SVA for every crossing to FILE, as module mlint_cdc_sva (compile it with the design)\n"
+           "  -cdc-depth N   CDC004 follows synchronized signals through N more flops to where they meet (2)\n"
            "  -sdc FILE      clocks, generated clocks, clock groups and clock-to-clock false paths from an SDC file\n"
            "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
            "  -static SIG    SIG does not change while it is read: its crossings are not reported\n"
@@ -282,6 +286,8 @@ struct Flop {
     Sym from = nullptr;
     uint64_t fromBits = 0;
     uint64_t bits = 1;
+    bool negedge = false;     // clocked on the falling edge
+    bool arstHigh = false;    // the first asynchronous reset is a posedge event (active high)
     std::vector<const Expression*> rhs;
     mutable std::string pathName;
 };
@@ -639,6 +645,8 @@ struct Walk {
     const Scope* scope = nullptr;  // of a continuous assign, to evaluate a bit index
     bool seq = false;
     Sym clk = nullptr;
+    bool neg = false;  // the clock's edge is negedge
+    bool arstHigh = false;
     SymSet arst;  // canonical
 
     void name(Sym s, SymSet& out) {
@@ -781,6 +789,8 @@ struct Walk {
             Flop& f = m.flop(base, lhs.sourceRange.start());
             if (!f.clkSym) {
                 f.clkSym = clk;
+                f.negedge = neg;
+                f.arstHigh = arstHigh;
                 f.arst = arst;
             }
             f.ctrl.insert(f.ctrl.end(), ctrl.begin(), ctrl.end());
@@ -1215,13 +1225,18 @@ struct Gather : ASTVisitor<Gather> {
                 for (const SignalEventControl* e : edges) {
                     Sym s = oneName(e->expr);
                     if (!s) continue;
-                    if (has(read, s))
+                    if (has(read, s)) {
+                        if (w.arst.empty()) w.arstHigh = e->edge == EdgeKind::PosEdge;
                         w.arst.push_back(m.canon(s));
-                    else if (!w.clk)
+                    }
+                    else if (!w.clk) {
                         w.clk = s;
+                        w.neg = e->edge == EdgeKind::NegEdge;
+                    }
                 }
                 if (!w.clk) {  // every edge is read: take the first, as lintir does
                     w.clk = oneName(edges[0]->expr);
+                    w.neg = edges[0]->edge == EdgeKind::NegEdge;
                     if (w.clk) std::erase(w.arst, m.canon(w.clk));
                 }
                 if (!w.clk) w.seq = false;
@@ -1328,10 +1343,14 @@ struct Checker {
     std::vector<Member> member;
     std::vector<std::vector<int>> next;  // flop -> the plain flops that copy it
 
+    // What -cdc-sva can check about a crossing.
+    enum Check : uint8_t { NoCheck, Stable, OneBit, Qualified };
     struct Crossing {
         int flop;
         Sym src;
         std::string how;
+        Check check = NoCheck;
+        Sym qual = nullptr;  // Qualified: the synchronized control the reader takes it with
     };
     std::vector<Crossing> crossings;
 
@@ -1445,6 +1464,7 @@ struct Checker {
         prof.lap("resets");
         flush();
         if (opt.report) report();
+        if (!opt.sva.empty()) writeSva(opt.sva);
         prof.lap("report");
     }
 
@@ -1470,6 +1490,7 @@ struct Checker {
             Kind kind;
             bool logic;
             int len;
+            Sym qual = nullptr;
         };
         const size_t n = m.flops.size();
         std::vector<std::vector<Rec>> recs(n);
@@ -1487,18 +1508,22 @@ struct Checker {
                 // control from its own domain says when to take it: the domains
                 // this flop has such a control from.
                 SymSet quals;
+                std::vector<Sym> qualBy;  // the control flop, by quals entry
                 for (const Root& q : all) {
                     const Flop* qf = m.flopOf(q.sym);
                     if (!qf || qf->dom != f.dom) continue;
                     const Member& mem = member[qf - m.flops.data()];
-                    if (mem.pos >= 2) quals.push_back(mem.srcDom);
+                    if (mem.pos >= 2) {
+                        quals.push_back(mem.srcDom);
+                        qualBy.push_back(q.sym);
+                    }
                 }
                 for (const Root& r : all) {
                     const Flop* s = foreign(f, r.sym);
                     if (!s) continue;
-                    bool qualified = std::find(quals.begin(), quals.end(), s->dom) != quals.end();
-                    if (qualified)
-                        recs[i].push_back({r.sym, Qualified, r.logic, 0});
+                    auto qit = std::find(quals.begin(), quals.end(), s->dom);
+                    if (qit != quals.end())
+                        recs[i].push_back({r.sym, Qualified, r.logic, 0, qualBy[qit - quals.begin()]});
                     else if (first[i] && inFrom(r.sym)) {
                         int len = chainLen((int)i);
                         recs[i].push_back({r.sym, len < 2 ? OneFlop : Synced, r.logic, len});
@@ -1525,7 +1550,7 @@ struct Checker {
             for (const Rec& r : recs[i]) {
                 const Flop& s = *m.flopOf(r.src);
                 if (r.kind == Qualified) {
-                    crossings.push_back({(int)i, r.src, "enable-qualified"});
+                    crossings.push_back({(int)i, r.src, "enable-qualified", Check::Qualified, r.qual});
                     continue;
                 }
                 std::string where = "'" + m.name(s) + "' (clocked by " + clocked(s) +
@@ -1580,7 +1605,8 @@ struct Checker {
                 } else if (total > 1 && gray) {
                     sync += ", Gray coded";
                 }
-                crossings.push_back({st.flop, key.first, sync});
+                Check check = st.logic ? NoCheck : total > 1 || s.bits > 1 ? OneBit : Stable;
+                crossings.push_back({st.flop, key.first, sync, check});
             }
             if (!fanout) continue;
             std::string names;
@@ -1923,6 +1949,110 @@ struct Checker {
     }
 
     // -cdc-report: the domains and every crossing, clean or not.
+    // -cdc-sva: a module of assertions on the crossings, by hierarchical
+    // name, to compile next to the design (an extra top, or bound into it).
+    // What makes each kind of crossing safe:
+    //   a one-bit synchronizer: the source holds a value for two reading
+    //     edges, or a pulse can fall between them (counted on every change,
+    //     since sampling on the reading clock can miss a fast toggle);
+    //   a Gray-coded or multi-bit bus: at most one bit changes per source
+    //     edge, so the reader sees the old or the new value;
+    //   an enable-qualified bus: the data does not change on the reading edge
+    //     where the synchronized control changes.
+    void writeSva(const std::string& file) {
+        auto ok = [](const std::string& n) { return !n.empty() && n.find("<protected>") == std::string::npos; };
+        auto edge = [&](const Flop& f) {
+            return std::string(f.negedge ? "negedge " : "posedge ") + m.name(f.dom);
+        };
+        // While a flop is in reset its value is not a crossing yet, and
+        // $past has no history: the check starts when the reset is released.
+        auto clocking = [&](const Flop& f) {
+            std::string c = "@(" + edge(f) + ")";
+            if (!f.arst.empty() && ok(m.name(f.arst[0])))
+                c += std::string(" disable iff (") + (f.arstHigh ? "" : "!") + m.name(f.arst[0]) + ")";
+            return c;
+        };
+        auto ident = [](std::string n) {
+            for (char& c : n)
+                if (!isalnum((unsigned char)c) && c != '_') c = '_';
+            while (n.find("__") != std::string::npos) n.erase(n.find("__"), 1);
+            return n;
+        };
+        struct Prop {
+            std::string key, text;
+        };
+        std::vector<Prop> props;
+        std::set<std::string> seen;
+        int skipped = 0;
+        for (const Crossing& c : crossings) {
+            if (c.check == NoCheck) continue;
+            const Flop& f = m.flops[c.flop];
+            const Flop& s = *m.flopOf(c.src);
+            std::string src = m.name(s), dst = m.name(f);
+            if (!ok(src) || !ok(dst) || !ok(m.name(f.dom)) || !ok(m.name(s.dom))) {
+                skipped++;
+                continue;
+            }
+            std::string label, body, what;
+            switch (c.check) {
+                case Stable:
+                    // Sampled on the reading clock a fast toggle can look
+                    // stable, so count the reading edges between changes.
+                    label = "stable_" + ident(src) + "_to_" + ident(m.name(f.dom));
+                    what = src + " changed again before two " + m.name(f.dom) + " edges: " + dst +
+                           " can miss a value";
+                    break;
+                case OneBit:
+                    label = "onebit_" + ident(src);
+                    body = clocking(s) + " $countones(" + src + " ^ $past(" + src + ")) <= 1";
+                    what = "more than one bit of " + src + " changed at once: " + dst + " can see a value it never had";
+                    break;
+                case Qualified: {
+                    const Flop* q = c.qual ? m.flopOf(c.qual) : nullptr;
+                    if (!q || !ok(m.name(*q))) {
+                        skipped++;
+                        continue;
+                    }
+                    label = "held_" + ident(src) + "_at_" + ident(m.name(*q));
+                    body = clocking(f) + " $changed(" + m.name(*q) + ") |-> $stable(" + src + ")";
+                    what = src + " changed as " + m.name(*q) + " said to take it into " + dst;
+                    break;
+                }
+                default: break;
+            }
+            if (!seen.insert(label).second) continue;
+            std::string t = "  // " + src + " (" + m.name(s.dom) + ") -> " + dst + " (" + m.name(f.dom) + "): " +
+                            c.how + "\n";
+            if (c.check == Stable) {
+                std::string n = "n_" + label;
+                t += "  int unsigned " + n + " = 2;  // " + m.name(f.dom) + " edges since " + src + " changed\n" +
+                     "  always @(" + edge(f) + ") if (" + n + " < 2) " + n + "++;\n" +
+                     "  always @(" + src + ") begin\n    cdc_" + label + ": assert (" + n +
+                     " >= 2) else $error(\"[mlint cdc] " + what + "\");\n    " + n + " = 0;\n  end\n";
+            } else {
+                t += "  cdc_" + label + ": assert property (" + body + ")\n    else $error(\"[mlint cdc] " + what +
+                     "\");\n";
+            }
+            props.push_back({label, t});
+        }
+        std::sort(props.begin(), props.end(), [](const Prop& a, const Prop& b) { return a.key < b.key; });
+        std::ofstream os(file);
+        if (!os) {
+            std::cerr << "mlint: -cdc-sva " << file << ": cannot write\n";
+            return;
+        }
+        os << "// Clock-domain crossing assertions, written by mlint -cdc-sva.\n"
+              "// Compile with the design and add mlint_cdc_sva as a second top\n"
+              "// (msim ... -top <top> -top mlint_cdc_sva), or bind it into the top.\n"
+              "module mlint_cdc_sva;\n";
+        for (auto& p : props) os << p.text;
+        os << "endmodule\n";
+        std::cerr << "mlint: -cdc-sva " << file << ": " << props.size()
+                  << (props.size() == 1 ? " assertion" : " assertions");
+        if (skipped) std::cerr << " (" << skipped << " crossings in protected code skipped)";
+        std::cerr << "\n";
+    }
+
     void report() {
         std::map<std::string, int> doms, rsts;
         std::map<std::string, std::string> sdcClocks;

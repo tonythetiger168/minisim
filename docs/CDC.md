@@ -116,6 +116,28 @@ Object names follow `msdc`: `/` between instance levels and no top name
 `-cdc-report` prints the SDC clocks of every domain. `-clock-group` and
 `-static` still apply on top of the file.
 
+## Assertions
+
+`-cdc-sva FILE` writes a module `mlint_cdc_sva` with one check per
+synchronized crossing, by hierarchical name. Compile it with the design and
+make it a second top, so a simulation checks the assumption each
+synchronizer depends on. The checks are disabled while the flop they watch
+is in its asynchronous reset:
+
+```
+mlint rtl/*.sv -top soc_tb -cdc-sva cdc_sva.sv
+msim rtl/*.sv cdc_sva.sv -top soc_tb -top mlint_cdc_sva
+```
+
+| Crossing | Check |
+| --- | --- |
+| One-bit synchronizer | The source holds each value for at least two edges of the reading clock, or a pulse can fall between them. It counts reading edges between changes of the source, because a toggle faster than the reading clock can look stable when sampled on it |
+| Gray-coded or multi-bit bus | At most one bit changes per edge of the source clock, so the reader sees the old value or the new one (`$countones(x ^ $past(x)) <= 1`) |
+| Enable-qualified bus | The data does not change on a reading edge where the synchronized control changes |
+
+Crossings already reported (no synchronizer, logic in front of one) get no
+check; crossings in protected code are skipped.
+
 ## Waivers
 
 A crossing that is safe for a reason the RTL does not show is waived like any

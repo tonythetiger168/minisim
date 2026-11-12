@@ -376,6 +376,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+  # mlint -cdc-sva writes assertions that msim runs next to the design.
+  add_test(NAME mlint_cdc_sva
+           COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mlint_cdc_sva
+                   -P ${CMAKE_SOURCE_DIR}/tests/mlint_cdc_sva.cmake)
   # Every mlint rule on a marked source file (tests/lint/rules), the
   # configuration, the waivers, and -threads 1 against -threads 4.
   if(Python3_FOUND)

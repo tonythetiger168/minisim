@@ -21,6 +21,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mlint -cdc-sva FILE`: writes a module of assertions for the synchronized
+  crossings (a one-bit signal holds for two reading edges, a Gray or
+  multi-bit bus changes one bit at a time, enable-qualified data is stable
+  when its control arrives), to simulate with the design.
 - `mlint` CDC/RDC: a vector written bit by bit, or a struct written field by
   field, is tracked as separate signals (`top.r[1]`, `top.ctl.req`), so two
   synchronizers kept in one vector, or a struct with fields in different
