@@ -7,6 +7,15 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Added
+- Floating point datapath modules, IEEE 754 in any exponent and fraction
+  width with subnormals and all five rounding modes: `MW_fp_add`,
+  `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
+  `MW_fp_cmp` (with minimumNumber / maximumNumber), `MW_fp_i2flt`,
+  `MW_fp_flt2i`, `MW_fp_mac` (fused multiply-add), `MW_fp_recip`,
+  `MW_fp_flt2flt` (format conversion) and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
+  them against an exact rational reference (docs/DATAPATH.md).
+
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
   IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
@@ -55,6 +64,13 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `mlint` clock checks: `CDC007` (a clock read as data) and `CDC008` (a
+  clock made by combinational logic of a clock and other signals, which can
+  glitch).
+- `mlint -sdc`: `set_input_delay` / `set_output_delay -clock` give ports a
+  clock domain (virtual clocks included), so an input read without a
+  synchronizer, or an output launched on another clock, is a crossing.
+  `set_case_analysis 0/1` makes a signal static.
 - UPF (IEEE 1801-2024): `set_repeater` and the simulation of repeaters
   (6.52, 9.10); `create_logic_net`, `create_logic_port` and
   `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with
@@ -193,6 +209,13 @@ Spec references are IEEE 1800-2023 clauses.
   library's cells; the `mpnr` test places, routes and DRC-checks one.
 - `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
   and transitions of FSMs), in the totals, the history and `mplan init`.
+- `mregress -farm`: runs go to a compute farm instead of the local machine:
+  `lsf` (bsub -K), `slurm` (srun), `sge` (qsub -sync y), `ssh:HOST[*N],...`
+  or `cmd:TEMPLATE` for any other launcher. `-farm-opts`, `-farm-cpus`
+  (cores per job and msim -threads), `-farm-retries` (a job that never ran
+  is submitted again), `-farm-wait`, `-farm-dry`. The time limit runs on the
+  farm host, so queue time does not count; results come back through the
+  shared run directory.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
   inside a scope, their port connections and which instance feeds which.
 - `mdebug`: tasks and functions in a module, call output arguments, `force`,
@@ -532,6 +555,74 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI `cbCreateObj` and `cbSizeChange` (38.36.1); the save, restart and
+  reset callback reasons register (msim has no save, so they never run).
+  `tests/spec/38.36-vpi-sv-callbacks.sv`.
+- VPI constraints (37.31): `vpi_iterate(vpiConstraint, class)`, the items of
+  each block (expressions, implication, if / if-else, foreach, disable soft,
+  solve before), and pure virtual prototypes in `vpiMethods`.
+  `tests/spec/37-vpi-constraints.sv`.
+- VPI module path properties: `vpiPathType`, `vpiPolarity`,
+  `vpiDataPolarity`, `vpiCondition` and `vpiModDataPathIn` (37, 38.10).
+- VPI delays of continuous assignments (38.10): `vpi_get_delays` /
+  `vpi_put_delays` on a `vpiContAssign` with a delay.
+  `tests/spec/38.10-vpi-assign-delay.sv`.
+- VPI primitives (37, 38.10): `vpi_iterate(vpiPrimitive / vpiGate /
+  vpiSwitch / vpiUdp, module)`, `vpiPrimType`, `vpiPrimTerm` terminals with
+  direction and connection, and gate delays through `vpi_get_delays` /
+  `vpi_put_delays`. `tests/spec/38.10-vpi-primitives.sv`.
+- VPI module paths (38.10): `vpi_iterate(vpiModPath, module)`, their input
+  and output terms, and their delays through `vpi_get_delays` /
+  `vpi_put_delays`. `tests/spec/38.10-vpi-modpath.sv`.
+- VPI timing checks: `vpi_iterate(vpiTchk, module)`, their terms, notifier
+  and limits (`vpi_get_delays` / `vpi_put_delays`), and `cbTchkViolation`
+  (38.10, 38.36.1). `tests/spec/38.36-vpi-tchk.sv`.
+- VPI assertion stepping (39.5.2): `vpiAssertionEnableStep` /
+  `vpiAssertionDisableStep` with `cbAssertionStepSuccess` /
+  `cbAssertionStepFailure` for each clock step of each attempt.
+  `tests/spec/39.5-vpi-assert-step.sv`.
+- VPI `vpi_control(vpiCoverageMerge, type, name)` (40.5.1): adds the
+  statement, toggle, FSM or assertion counts of a saved msim coverage
+  database to the current run. `tests/spec/40-vpi-coverage-merge.sv`.
+- VPI `vpi_handle_multi(vpiInterModPath, out, in)` (38.21): the path
+  between two instance ports on one net, its ports, and its interconnect
+  delay through `vpi_get_delays` / `vpi_put_delays`.
+  `tests/spec/38.21-vpi-handle-multi.sv`.
+- VPI `cbError` and `cbPLIError` (38.36.3): called for run-time error
+  messages of the simulation and for errors of VPI calls, with
+  `vpi_chk_error` giving the error. `tests/spec/38.36-vpi-cberror.sv`.
+- VPI class definitions (37.29): `vpiClassDefn`, `vpiExtends`,
+  `vpiMethods`, `vpiDerivedClasses` and static `vpiVariables`; a class
+  object now reports the class it was made of, and its properties include
+  that class's own. `tests/spec/37-vpi-classes.sv`.
+- VPI drivers and loads (37.16, 37.17): `vpiDriver`, `vpiLoad`,
+  `vpiLocalDriver`, `vpiLocalLoad` and `vpiPortInst` on nets and variables
+  give continuous assignments and instance ports, following whole-signal
+  port connections through the hierarchy. `tests/spec/37-vpi-drivers.sv`.
+- VPI structs, containers and classes (37.17, 37.18, 37.29): unpacked
+  struct and union variables with `vpiMember` (also of packed ones),
+  dynamic arrays, queues and associative arrays with their elements, class
+  variables, `vpiClassObj` and its properties.
+- VPI `cbStmt` (38.36.1): a callback each time a statement runs.
+- VPI processes, statements and expressions (37.32 to 37.51):
+  `vpi_iterate(vpiProcess / vpiContAssign, module)`, the statement tree
+  (blocks, assignments, if, case and case items, loops, delay and event
+  controls, task calls, wait, disable, force / release, ...) and
+  expressions (`vpiOperation`, `vpiConstant`, function calls, selects) with
+  `vpiOpType`, `vpiConstType`, `vpiDecompile`, `vpiLineNo`.
+- VPI scheduling (38.35, 38.36): `vpiReturnEvent` gives a `vpiSchedEvent`
+  handle that `vpiCancelEvent` cancels (`vpiScheduled`); inertial,
+  transport and pure transport writes remove pending writes as the standard
+  says; `cbForce`, `cbRelease`, `cbAssign`, `cbDeassign`, `cbNBASynch` and
+  `cbAtEndOfSimTime`; `vpi_get_delays` / `vpi_put_delays` on nets with a
+  declared delay (38.10, 38.30).
+- VPI coverage API (clause 40): `vpi_get` of `vpiStatementCoverage`,
+  `vpiToggleCoverage`, `vpiFsmStateCoverage` and `vpiAssertCoverage` on an
+  instance, `vpiCovered` / `vpiCoveredCount` / `vpiCoveredMax` and the
+  assertion counts on assertions, FSMs, FSM states, nets and bits,
+  `vpi_iterate(vpiFsm)` and `vpiFsmStates`, and `vpi_control` with
+  `vpiCoverageStart`, `Stop`, `Reset`, `Check` and `Save` (`msim -cov`).
+  `vpi_handle_by_name` finds an assertion by its label.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
