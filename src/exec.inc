@@ -554,6 +554,22 @@ struct ProcCtl {
         for (auto& k : kids) if (!k->ended) return false;
         return true;
     }
+    // Where it is, for disable (9.6.2): the running coroutine's call stack,
+    // code and frame (its locals), the code it started from, and where its
+    // parent forked it. A disable that moves a waiting process starts a new
+    // coroutine at the new place (restart) and bumps gen: the old one stops
+    // when it next runs.
+    vector<RetFrame>* rets = nullptr;
+    const Prog** pp = nullptr;
+    size_t* ppc = nullptr;
+    FrameP* pfr = nullptr;
+    const Prog* entry = nullptr;
+    FrameP fr0;
+    uint64_t gen = 0;
+    struct Restart { vector<RetFrame> rets; const Prog* p; size_t pc; FrameP fr; };
+    std::unique_ptr<Restart> restart;
+    size_t forkDepth = 0, forkPc = 0;
+    const Prog* forkProg = nullptr;
 };
 inline unordered_map<int, vector<weak_ptr<ProcCtl>>>& rootProcs() {
     static unordered_map<int, vector<weak_ptr<ProcCtl>>> m;
@@ -651,11 +667,83 @@ static void procResume(ProcCtl* c) {
 }
 static int doRandomize(int obj, const RandCall* rc);   // rand.inc
 static void randModeAll(int obj, bool blocks, bool on);
+inline vector<weak_ptr<ProcCtl>>& liveProcs() { static vector<weak_ptr<ProcCtl>> v; return v; }
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
+    c->entry = p;
+    c->fr0 = fr;
     Task t = exec(p, c, std::move(fr));
     c->h = t.h;
     for (int r : p->roots) rootProcs()[r].push_back(c);
+    if (anySpans()) liveProcs().push_back(c);
     return t;
+}
+// disable of block or task id (9.6.2) for every process inside it: it
+// resumes after the block, or after the call of the task; what it forked
+// in there ends. Returns whether self was moved (its own locals are set).
+inline bool disableSpans(int id, const shared_ptr<ProcCtl>& self) {
+    auto& L = liveProcs();
+    std::erase_if(L, [](auto& w) { auto c = w.lock(); return !c || c->ended; });
+    auto list = L;
+    bool moved = false;
+    for (auto& w : list) {
+        auto c = w.lock();
+        if (!c || c->ended || c->killed || !c->rets) continue;
+        auto& R = *c->rets;
+        size_t n = R.size();
+        // The outermost frame inside the span: frame k runs R[k].prog at
+        // R[k].pc (the return address of its call) for k < n, else the
+        // current code and pc.
+        size_t hit = SIZE_MAX;
+        const Prog::Span* sp = nullptr;
+        for (size_t k = 0; k <= n && hit == SIZE_MAX; k++) {
+            const Prog* P = k < n ? R[k].prog : *c->pp;
+            size_t pc = k < n ? R[k].pc : *c->ppc;
+            for (auto& x : P->spans) {
+                if (x.id != id) continue;
+                bool in = x.e == SIZE_MAX ? k > 0
+                        : k < n ? x.s < pc && pc <= x.e
+                        : (x.s <= pc && pc < x.e) || (pc == x.e && pc > x.s && P->code[pc - 1].k == IK::Fork);
+                if (in) { hit = k; sp = &x; break; }
+            }
+        }
+        if (hit == SIZE_MAX) continue;
+        bool task = sp->e == SIZE_MAX;
+        const Prog* hp = hit < n ? R[hit].prog : *c->pp;
+        // What it forked in there ends with it.
+        for (auto& kid : c->kids) {
+            if (kid->ended) continue;
+            bool inside = task ? kid->forkDepth >= hit
+                        : kid->forkDepth > hit || (kid->forkDepth == hit && kid->forkProg == hp && sp->s <= kid->forkPc && kid->forkPc < sp->e);
+            if (inside) procKill(kid);
+        }
+        std::erase_if(c->kids, [](auto& k) { return k->ended; });
+        auto r = std::make_unique<ProcCtl::Restart>();
+        if (task) {   // back in the caller, after the call
+            r->rets.assign(R.begin(), R.begin() + (long)(hit - 1));
+            r->p = R[hit - 1].prog; r->pc = R[hit - 1].pc; r->fr = R[hit - 1].fr;
+        } else {      // after the block, in the frame that runs it
+            r->rets.assign(R.begin(), R.begin() + (long)hit);
+            r->p = hp; r->pc = sp->e; r->fr = hit < n ? R[hit].fr : *c->pfr;
+        }
+        if (c == self) {
+            *c->rets = std::move(r->rets);
+            *c->pp = r->p; *c->ppc = r->pc; *c->pfr = std::move(r->fr);
+            moved = true;
+            continue;
+        }
+        // A waiting process: its wait is dropped, and it goes on from there now.
+        c->gen++;
+        c->rets = nullptr;   // until the new coroutine runs
+        S.dead.insert(c->h.address());
+        c->restart = std::move(r);
+        c->waitingFork = false;
+        c->parked = false;
+        Task t = exec(c->entry, c, c->fr0);
+        c->h = t.h;
+        S.all.push_back(t.h);
+        S.active.push_back(t.h);
+    }
+    return moved;
 }
 // A top-level process (initial, always, final).
 // A new top-level process's generator (18.14.2), seeded in start order.
@@ -1189,7 +1277,16 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         pc = f.pc;
         if (f.fr != fr) { lastRet = std::move(fr); fr = std::move(f.fr); }
     };
-    for (auto& [slot, v] : ctl->init) slot->k = v;
+    const uint64_t gen0 = ctl->gen;
+    if (ctl->restart) {   // moved here by a disable (9.6.2)
+        rets = std::move(ctl->restart->rets);
+        p = ctl->restart->p;
+        pc = ctl->restart->pc;
+        fr = std::move(ctl->restart->fr);
+        ctl->restart.reset();
+    } else
+        for (auto& [slot, v] : ctl->init) slot->k = v;
+    ctl->rets = &rets; ctl->pp = &p; ctl->ppc = &pc; ctl->pfr = &fr;
     // A program thread runs in the reactive region set (24.3.1): it starts
     // there, and goes back there after every wait.
 #define TO_REACTIVE if (__builtin_expect(ctl->reactive, 0) && S.region != R_REACTIVE) co_await ToReactive{}
@@ -1199,6 +1296,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         g_ret = lastRet.get();
         g_threadRng = ctl->rngp;
         if (ctl->killed) goto done;
+        if (ctl->gen != gen0) [[unlikely]] co_return;   // a disable moved it to a new coroutine
         // A process of a powered-off domain is inactive (1801 9.5.3): it
         // sleeps until the domain powers up, then starts over from its top,
         // so combinational logic re-evaluates and edge-triggered logic waits
@@ -1300,6 +1398,15 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++; break;
             }
             case IK::Dump: {
+                if (i.dcmd >= DC_PORTS) {   // extended VCD: [size,] file name
+                    size_t k = 0;
+                    int64_t size = 0;
+                    std::string file;
+                    if (i.dcmd == DC_PLIMIT) { Val sz = eval(i.args[k++], rd); size = sz.x ? 0 : v_to_i64(sz); }
+                    if (k < i.args.size()) { Val f = eval(i.args[k], rd); f.str = true; file = v_str(f); }
+                    S.dumpPorts(i.dcmd, file, size, i.dsel);
+                    pc++; break;
+                }
                 Val a = i.args.empty() ? Val{} : eval(i.args[0], rd);
                 std::string str;
                 int64_t num = -1;
@@ -1523,6 +1630,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         uint64_t a = urandomNext(*ctl->rngp), b = urandomNext(*ctl->rngp);
                         c->rng = seedState(a << 32 | b);
                     }
+                    c->forkDepth = rets.size(); c->forkProg = p; c->forkPc = pc;
                     ctl->kids.push_back(c);
                     FrameP bf = bn < i.blays.size() && i.blays[bn] ? newFrame(i.blays[bn], ff, ff ? ff->self : 0) : ff;
                     Task t = startProc(b, c, std::move(bf));
@@ -1540,6 +1648,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 for (auto& w : list)
                     if (auto c = w.lock()) procKill(c);
                 std::erase_if(v, [](auto& w) { auto c = w.lock(); return !c || c->ended; });
+                if (anySpans() && !ctl->killed && disableSpans(i.sig, ctl)) break;   // this process was inside it
                 pc++;
                 break;   // the loop top stops this process if it was one of them
             }

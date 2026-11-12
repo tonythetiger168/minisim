@@ -14,6 +14,12 @@
 // pull in the slang front end, so they also prove the link line is right.
 #include "lintir.hpp"
 #include "prog.hpp"
+// Every other header the paid tools read: the netlist and Liberty readers and
+// the power intent reader, which itself pulls in the Tcl reader and the value
+// conversion tables.
+#include "gnetlist.hpp"
+#include "liberty.hpp"
+#include "upf.hpp"
 
 int main() {
     // The pool: the same one every tool uses for its per-core work.

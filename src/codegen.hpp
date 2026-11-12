@@ -808,7 +808,7 @@ private:
                     for (size_t i = 0; i < e->kids.size(); i++) r += ", [&]() -> Val { return " + ex(e->kids[i]) + "; }";
                     return r + ")";
                 }
-                std::string r = "condCovVal(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
+                std::string r = "condCovVal(" + std::to_string(e->hi) + ", " + std::to_string(e->lo & 5) + ", {";
                 for (size_t i = 0; i < e->kids.size(); i++) r += (i ? ", " : "") + ex(e->kids[i]);
                 return r + "})";
             }
@@ -979,7 +979,7 @@ private:
                 return true;
             case Op::CondCov: {
                 if (e->lo & 2) return false;   // lazy: the Val path
-                std::string r = "condCovFast(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
+                std::string r = "condCovFast(" + std::to_string(e->hi) + ", " + std::to_string(e->lo & 5) + ", {";
                 for (size_t i = 0; i < e->kids.size(); i++) {
                     std::string P;
                     FastInfo fp{};
@@ -2541,7 +2541,7 @@ private:
                     throw CodegenUnsupported(std::string("array or variable-index ") + (i.drv >= 0 ? "continuous assign" : "write (instruction " + std::to_string((int)i.k) + ")"));
                 if (i.de || i.nbaLater) throw CodegenUnsupported("delay expression or intra-assignment delay");
                 if (i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) throw CodegenUnsupported("dynamic array");
-                if (!p.roots.empty()) throw CodegenUnsupported("disable of a named block");
+                if (!p.roots.empty() || !p.spans.empty()) throw CodegenUnsupported("disable of a named block");
                 if (i.k == IK::Finish && i.hi > 0) throw CodegenUnsupported("$fatal exit status");
                 if (i.fd) throw CodegenUnsupported("$fstrobe / $fmonitor");
                 if (!i.dly.empty()) throw CodegenUnsupported("delayed continuous assignment");
