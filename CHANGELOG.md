@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
+  one cycle, crossing from a clock of shorter period into one of longer
+  period through a plain synchronizer, can be missed. Periods come from
+  `create_clock -period`, and for a generated clock from its master with
+  `-divide_by` / `-multiply_by`. A toggle or a held request is not reported.
+- Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
+  `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
+  the last place), checked by `tests/dw/more.sv`.
+
+### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
   width with subnormals and all five rounding modes: `MW_fp_add`,
   `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
@@ -64,6 +74,13 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `msim -cm <metrics>` now selects the code coverage metrics written. It takes
+  three notations: VCS `line+branch+cond+tgl+fsm`, Xcelium `b:e:t:f` or
+  `all`, and Questa `bcesftx`. `msim -cm_hier <file>` selects the part of
+  the design by instance, module or file. It reads VCS `+tree`/`-tree`
+  lines and Xcelium covfile `select_coverage` / `deselect_coverage`
+  commands. Before this, `-cm` wrote every metric. Covergroups and
+  assertions are always written.
 - `mlint` clock checks: `CDC007` (a clock read as data) and `CDC008` (a
   clock made by combinational logic of a clock and other signals, which can
   glitch).
@@ -551,6 +568,17 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `break` and `continue` in `while`, `do ... while`, `repeat` and
+  `forever` loops are merged; once a break or the condition of an unbounded
+  loop is unknown, what the loop assigns becomes x. Fixed: a `foreach` or
+  `repeat` loop whose body met an unknown condition in the clean copy
+  continued with a stale loop counter.
+- `-xprop`: a configuration file (`-xprop=<file>` or `-xprop-config <file>`,
+  VCS style: `tree`, `instance`, `module`, `merge`) turns X-propagation on or
+  off per instance, subtree or module. Branches that call tasks or functions
+  are merged (their writes too); `break` and `continue` in `for` / `foreach`
+  loops are merged; an array write whose index has an unknown bit merges
+  into every element the index may name.
 - `-xprop`: the clean copy uses the standard `case`, and clocked blocks skip
   the ambiguous-edge test when nothing went from or to x. Ibex with
   `-xprop` now costs about 12% more than without (was 30%).
@@ -924,8 +952,24 @@ Spec references are IEEE 1800-2023 clauses.
   plan where people set the owner, status, bug id and note of each failure
   bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
   and `mplan report -rules URL` to take the annotations as triage rules.
+- `src/compat.hpp` and `docs/COMPAT.md`: one shared layer that lets every tool
+  accept Synopsys, Cadence or Siemens command lines (`--compat=cadence`, or the
+  name the tool was started as). It renames or drops options from a per-tool
+  rule table and prints messages in the chosen vendor's layout. The engine
+  stays the same; nothing is implemented twice. Unit test `test_compat`.
+- `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
+  / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
+  state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
+- `c ? q.pop_front() : d` (and `pop_back`) runs the pop only in the chosen
+  arm, after the condition (11.4.11). It used to pop first, so a condition
+  on `q.size()` popping the last element gave `d` and lost the element.
+  Found by the SPI VIP's slave model.
+- `x inside {q}` in a constraint, where `q` is a queue or dynamic array (a
+  caller's variable in `randomize() with`, or a class property), no longer
+  makes randomize() fail: the solver narrows x to the container's elements
+  (11.4.13, 18.5.4). Found by the CCIX VIP's data sequence.
 - A port of an unpacked struct type is one vector, as a variable of that
   type is; it was "unsupported port width".
 - msim memory on big VIP benches: a 2-state unpacked array with more than

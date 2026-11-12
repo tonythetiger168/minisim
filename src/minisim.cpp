@@ -1359,14 +1359,16 @@ struct Sim {
     // becomes strong through a tran, and each rtran lowers it one more step.
     // A switch with an X or Z control is resolved both ways: bits that
     // differ become X.
-    struct TranSw { int a, b; bool resist; int state = -1; };   // state: 0 off, 1 on, 2 unknown
+    // A switch with w >= 0 joins only bits [aLo, aLo+w) of a to [bLo, bLo+w)
+    // of b (an inout port on a part of a net).
+    struct TranSw { int a, b; bool resist; int aLo = 0, bLo = 0, w = -1; int state = -1; };   // state: 0 off, 1 on, 2 unknown
     vector<TranSw> trans;
     vector<vector<int>> tranOf;   // net -> its switches
-    void addTran(int a, int b, bool resist) {
+    void addTran(int a, int b, bool resist, int aLo = 0, int bLo = 0, int w = -1) {
         if (tranOf.size() != sigs.size()) tranOf.resize(sigs.size());
         tranOf[(size_t)a].push_back((int)trans.size());
         tranOf[(size_t)b].push_back((int)trans.size());
-        trans.push_back({a, b, resist});
+        trans.push_back({a, b, resist, aLo, bLo, w});
     }
     void tranCtl(int id, int st) {
         if (trans[(size_t)id].state == st) return;
@@ -1382,39 +1384,57 @@ struct Sim {
     // The value net n sees: the drivers of every net it reaches through
     // switches that are on (and, when unkOn, those with an unknown control).
     Val tranValue(int n, bool unkOn, vector<int>& seen) {
-        // Best path to each net: the fewest resistive steps, then any switch at all.
-        map<int, pair<int, bool>> best;   // net -> (resistive steps, crossed a switch)
+        // Best path to each net: the fewest resistive steps, then any switch
+        // at all. Bit b of n is bit b + delta of the net reached, for b in [lo, hi).
+        struct Reach { int k; bool crossed; int delta, lo, hi; };
+        const Sig& g = sigs[(size_t)n];
+        map<int, Reach> best;
         deque<int> q{n};
-        best[n] = {0, false};
+        best[n] = {0, false, 0, 0, g.w};
         while (!q.empty()) {
             int m = q.front(); q.pop_front();
-            auto [k, crossed] = best[m];
+            Reach r = best[m];
             for (int id : tranOf[(size_t)m]) {
                 const TranSw& t = trans[(size_t)id];
                 if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
                 int o = t.a == m ? t.b : t.a;
-                pair<int, bool> nb{k + (t.resist ? 1 : 0), true};
+                Reach nb{r.k + (t.resist ? 1 : 0), true, r.delta, r.lo, r.hi};
+                if (t.w >= 0) {   // only the joined bits, moved to o's place
+                    int mLo = t.a == m ? t.aLo : t.bLo, oLo = t.a == m ? t.bLo : t.aLo;
+                    nb.lo = std::max(r.lo, mLo - r.delta);
+                    nb.hi = std::min(r.hi, mLo + t.w - r.delta);
+                    nb.delta = r.delta + oLo - mLo;
+                    if (nb.lo >= nb.hi) continue;
+                }
                 auto it = best.find(o);
-                if (it != best.end() && it->second.first <= nb.first) continue;
+                if (it != best.end() && it->second.k <= nb.k) continue;
                 best[o] = nb;
                 q.push_back(o);
             }
         }
         vector<Drv> all;
-        for (auto& [m, kc] : best) {
+        uint8_t kind = g.kind;
+        for (auto& [m, r] : best) {
             seen.push_back(m);
-            for (Drv d : sigs[(size_t)m].drv) {
-                if (kc.second) {
+            const Sig& sm = sigs[(size_t)m];
+            if (kind == NR_WIRE && sm.kind != NR_WIRE && r.lo == 0 && r.hi == g.w) kind = sm.kind;   // a wire joined to a tri1 is pulled too
+            bool same = r.delta == 0 && r.lo == 0 && r.hi == g.w && sm.w == g.w;
+            for (Drv d : sm.drv) {
+                if (r.crossed) {
                     d.s0 = tranReduce(d.s0, false);
                     d.s1 = tranReduce(d.s1, false);
                 }
-                for (int r = 0; r < kc.first; r++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                for (int k = 0; k < r.k; k++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                if (!same) {   // as n's bits: those outside the joined range are Z
+                    Val v = make(0, 0, g.w);
+                    for (int b = 0; b < g.w; b++) setBit(v, b, b >= r.lo && b < r.hi ? bitAt(d.v, b + r.delta) : 3);
+                    d.v = v;
+                }
                 all.push_back(d);
             }
         }
-        const Sig& g = sigs[(size_t)n];
-        return g.kind != NR_WIRE ? resolveNet(g.kind, all.data(), all.size(), g.w, g.val)
-                                 : resolveDrives(all.data(), all.size(), g.w);
+        return kind != NR_WIRE ? resolveNet(kind, all.data(), all.size(), g.w, g.val)
+                               : resolveDrives(all.data(), all.size(), g.w);
     }
     void tranResolve(int s) {
         vector<int> group, scratch;
@@ -2984,7 +3004,14 @@ struct Sim {
     }
 };
 
+// A simv built as several files (msim -compile of a large design) defines S
+// once, in design.cpp: the other files do not compile its constructor and
+// destructor and everything they reach.
+#ifdef MINISIM_EXTERN_S
+extern Sim S;
+#else
 inline Sim S;
+#endif
 // msim -xprop (SF_XPROP_EDGE): how signal s changed in this time step, seen
 // as a posedge (or negedge). With `level` the process tests the signal's
 // level, as for an asynchronous reset: once the level is known it does not

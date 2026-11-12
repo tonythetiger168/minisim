@@ -31,6 +31,8 @@
 //   CDC006  with -sdc: a flop's clock is not a clock in the SDC file.
 //   CDC007  a clock read as data by logic.
 //   CDC008  a clock made by combinational logic of a clock and other signals.
+//   CDC009  with -sdc: a one-bit signal that can pulse for one cycle, from a
+//           faster clock into a slower one through a plain synchronizer.
 //   RDC001  an asynchronous reset generated in another clock domain: its
 //           release is not synchronous to the flops it resets.
 //   RDC002  one asynchronous reset used directly in several clock domains.
@@ -295,6 +297,7 @@ struct Flop {
     // one other signal `from`.
     bool plain = true;
     bool shifts = false;      // the flop itself is on a right-hand side
+    bool reads = false;       // ... or in any expression of one (q <= ~q, q <= q | set)
     Sym from = nullptr;
     uint64_t fromBits = 0;
     uint64_t bits = 1;
@@ -404,6 +407,7 @@ struct Model {
         std::unordered_map<Sym, std::vector<int>> at;    // node -> the clocks defined on it
         std::vector<std::vector<uint8_t>> rel;           // clock x clock
         std::unordered_map<Sym, std::vector<int>> of;    // domain -> the clocks that reach it
+        std::vector<double> period;                      // by clock; 0 when not known
     } sdc;
     std::unordered_set<Sym> statics;
 
@@ -831,6 +835,11 @@ struct Walk {
                 if (!whole && (t.ext || t.self)) t.other = true;  // {a, b} <= '0 is still plain
                 if (t.other || t.many) f.plain = false;
                 if (t.self) f.shifts = true;
+                if (!f.reads) {
+                    SymSet n;
+                    names(*e, n);
+                    for (Sym x : n) f.reads = f.reads || x == self;
+                }
                 if (t.ext) {
                     if (f.from && f.from != t.ext) f.plain = false;
                     f.from = t.ext;
@@ -1432,6 +1441,23 @@ struct Checker {
     }
 
     std::string clocked(const Flop& f) const { return m.name(f.dom); }
+    // The period of a domain from the SDC file: its fastest clock (the
+    // shortest pulse it can launch), or its slowest (the longest a reader can
+    // miss). 0 when a clock that reaches it has no known period.
+    static std::string num(double d) {
+        std::ostringstream o;
+        o << d;
+        return o.str();
+    }
+    double period(Sym dom, bool slowest) const {
+        double out = 0;
+        for (int c : m.clocksOf(dom)) {
+            double p = c < (int)m.sdc.period.size() ? m.sdc.period[c] : 0;
+            if (!(p > 0)) return 0;
+            out = out == 0 ? p : slowest ? std::max(out, p) : std::min(out, p);
+        }
+        return out;
+    }
 
     // CDC007 / CDC008: how the clocks are used and made.
     void clockChecks() {
@@ -1701,6 +1727,19 @@ struct Checker {
                     sync += ", multi-bit (CDC002)";
                 } else if (total > 1 && gray) {
                     sync += ", Gray coded";
+                } else if (total == 1 && s.bits == 1 && !s.shifts && !s.reads) {
+                    // CDC009: a value that can last one cycle, from a faster
+                    // clock into a slower one.
+                    double fast = period(s.dom, false), slow = period(f.dom, true);
+                    if (fast > 0 && slow > 0 && fast < slow) {
+                        add("CDC009", f.loc,
+                                st.where + " through " + std::to_string(st.len) + " flops, from a clock of period " +
+                                    num(fast) + " into one of period " + num(slow) +
+                                    ": a pulse of one source cycle can come and go between two edges of the "
+                                    "reading clock and be missed, so hold it for 1.5 reading periods, use a "
+                                    "toggle (pulse) synchronizer, or a handshake");
+                        sync += ", fast to slow (CDC009)";
+                    }
                 }
                 Check check = st.logic ? NoCheck : total > 1 || s.bits > 1 ? OneBit : Stable;
                 crossings.push_back({st.flop, key.first, sync, check});
@@ -2697,6 +2736,14 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
         for (int hops = 0; master[i] >= 0 && hops < n; hops++) i = master[i];
         return i;
     };
+    // Periods: a generated clock's is its master's times divide_by over
+    // multiply_by (none with -edges, or when the master's is not known).
+    s.period.assign(n, 0);
+    for (int i = 0; i < n; i++) s.period[i] = clocks[i].generated ? 0 : clocks[i].period;
+    for (int pass = 0; pass < n; pass++)
+        for (int i = 0; i < n; i++)
+            if (clocks[i].generated && !clocks[i].edges && !s.period[i] && master[i] >= 0 && s.period[master[i]])
+                s.period[i] = s.period[master[i]] * clocks[i].divideBy / clocks[i].multiplyBy;
     bool related = false;
     auto clockPair = [&](const cdcsdc::Exception& e) {
         if (e.type != cdcsdc::Exception::FalsePath || e.path.from.empty() || e.path.to.empty() || !e.path.through.empty())
