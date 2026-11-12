@@ -5520,8 +5520,64 @@ struct Lowerer {
         prog.emit(w);
         return resize(slice(ref(tmp), 31, 0), 32, false, true);
     }
+    // The coverage access functions (20.13, 40.3.2). The hierarchy argument
+    // becomes a list of instance paths below the top ("" is the top; "*" is
+    // $root, every top), separated by '|', or "\x01" when it names nothing:
+    // an instance as a hierarchical reference, or a module definition name as
+    // a string, which stands for every instance of that module.
+    E coverageApi(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        int op = n == "$coverage_control" ? 0 : n == "$coverage_get_max" ? 1 : n == "$coverage_get" ? 2
+               : n == "$coverage_save" ? 3 : n == "$coverage_merge" ? 4 : -1;
+        if (op < 0) unsupported(("system function " + std::string(n)).c_str());
+        size_t nInts = op == 0 ? 3 : op <= 2 ? 2 : 1;
+        if (args.size() != nInts + 1) unsupported(("the arguments of " + std::string(n)).c_str());
+        std::vector<E> kids;
+        for (size_t k = 0; k < nInts; k++) kids.push_back(expr(*args[k]));
+        const Expression& last = *args[nInts];
+        if (op >= 3) { kids.push_back(strOf(last)); return sysFnNode(SF_COVAPI, std::move(kids), op); }
+        auto rel = [](const Symbol& s) {
+            std::string p = s.getHierarchicalPath();
+            size_t d = p.find('.');
+            return d == std::string::npos ? std::string() : p.substr(d + 1);
+        };
+        std::string targets;
+        const Symbol* sym = last.kind == ExpressionKind::ArbitrarySymbol ? last.as<ArbitrarySymbolExpression>().symbol.get() : nullptr;
+        if (sym && sym->kind == SymbolKind::Root) targets = "*";
+        else if (sym && sym->kind == SymbolKind::Instance) targets = rel(*sym);
+        else if (last.type->isString() || last.kind == ExpressionKind::StringLiteral || peel(last).kind == ExpressionKind::StringLiteral) {
+            std::string def;
+            if (peel(last).kind == ExpressionKind::StringLiteral) def = std::string(peel(last).as<StringLiteral>().getValue());
+            else if (const auto* cv = last.getConstant()) def = cv->isString() ? cv->str() : cv->convertToStr().str();
+            else unsupported(("a module name that is not a constant in " + std::string(n)).c_str());
+            const auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine);
+            if (!sci || !sci->scope) unsupported("$coverage_* outside a scope");
+            const RootSymbol& root = sci->scope->getCompilation().getRoot();
+            bool any = false;
+            std::function<void(const Scope&)> walk = [&](const Scope& sc) {
+                for (const Symbol& m : sc.members()) {
+                    if (m.kind == SymbolKind::Instance) {
+                        const auto& in = m.as<InstanceSymbol>();
+                        if (in.getDefinition().name == def) { targets += (any ? "|" : "") + rel(in); any = true; }
+                        walk(in.body);
+                    } else if (m.kind == SymbolKind::InstanceArray) walk(m.as<InstanceArraySymbol>());
+                    else if (m.kind == SymbolKind::GenerateBlock && !m.as<GenerateBlockSymbol>().isUninstantiated) walk(m.as<GenerateBlockSymbol>());
+                    else if (m.kind == SymbolKind::GenerateBlockArray) walk(m.as<GenerateBlockArraySymbol>());
+                }
+            };
+            for (const InstanceSymbol* top : root.topInstances) {
+                if (top->getDefinition().name == def) { targets += (any ? "|" : "") + std::string(); any = true; }
+                walk(top->body);
+            }
+            if (!any) targets = "\x01";
+        } else unsupported(("the hierarchy argument of " + std::string(n)).c_str());
+        kids.push_back(konst(mkstr(targets)));
+        return sysFnNode(SF_COVAPI, std::move(kids), op);
+    }
     E sysFn(const slang::ast::CallExpression& call, std::string_view n) {
         if (n == "$get_coverage") return sysFnNode(SF_CG, {}, CG_GLOBAL);   // 19.9
+        if (n.starts_with("$coverage_")) return coverageApi(call, n);   // 20.13
         if (E r = sampledFn(call, n)) return r;   // $past, $rose, ... (16.9.3)
         if (E r = enumMethod(call)) return r;
         auto args = call.arguments();
