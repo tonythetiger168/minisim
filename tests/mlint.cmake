@@ -134,13 +134,14 @@ foreach(want
     "[CDC001] 'cdc_sdc.b0' (clocked by cdc_sdc.bclk) is read by logic clocked by cdc_sdc.cclk"
     "[CDC001] 'cdc_sdc.c0' (clocked by cdc_sdc.cclk) is read by logic clocked by cdc_sdc.mclk"
     "[CDC006] clock 'cdc_sdc.uclk' of 1 flop is not a clock in the SDC file"
-    "5 findings (CDC001 4, CDC006 1)")
+    "6 findings (CDC001 4, CDC006 1, CDC008 1)")
   string(FIND "${out}" "${want}" pos)
   if(pos EQUAL -1)
     message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_none.sdc missing: ${want}\n${out}")
   endif()
 endforeach()
-# set_clock_groups: A against B only; exclusive clocks are no crossing.
+# set_clock_groups: A against B only; exclusive clocks are no crossing, and
+# set_case_analysis makes the clock mux select constant (no CDC008).
 run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_groups.sdc")
 if(NOT out MATCHES "'cdc_sdc.a0' \\(clocked by cdc_sdc.aclk\\) is read by logic clocked by cdc_sdc.bclk"
    OR NOT out MATCHES "'cdc_sdc.d0' \\(clocked by cdc_sdc.div2\\) is read by logic clocked by cdc_sdc.bclk"
@@ -157,7 +158,7 @@ endif()
 # A false path between two clocks makes that pair asynchronous.
 run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_false.sdc")
 if(NOT out MATCHES "'cdc_sdc.b0' \\(clocked by cdc_sdc.bclk\\) is read by logic clocked by cdc_sdc.cclk"
-   OR NOT out MATCHES "1 finding \\(CDC001 1\\)")
+   OR NOT out MATCHES "2 findings \\(CDC001 1, CDC008 1\\)")
   message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_false.sdc:\n${out}")
 endif()
 
@@ -210,6 +211,98 @@ foreach(want
     message(FATAL_ERROR "cdc_bad.sv with waivers missing: ${want}\n${out}")
   endif()
 endforeach()
+
+# Bits of a vector and fields of a struct written separately are separate
+# signals: two synchronizers in one vector are clean, a first stage read by
+# logic is found by its bit.
+run(cdc_slices.sv "-top;cdc_slices;-only;cdc,RDC001,RDC002,RDC003;-cdc-report")
+foreach(want
+    "cdc_slices.a1 (cdc_slices.aclk) -> cdc_slices.s[0] (cdc_slices.bclk)  3-flop synchronizer"
+    "cdc_slices.a2 (cdc_slices.aclk) -> cdc_slices.s[2] (cdc_slices.bclk)  3-flop synchronizer"
+    "cdc_slices.c_a.req (cdc_slices.aclk) -> cdc_slices.q1 (cdc_slices.bclk)  2-flop synchronizer"
+    "cdc_slices.a1 (cdc_slices.aclk) -> cdc_slices.r[1] (cdc_slices.bclk)  one flop only (CDC001)"
+    "1 finding (CDC001 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_slices.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
+# Block models: -cdc-abstract writes cdc_block's model (the golden one in
+# tests/lint/cdc_block.cdc), and the SoC gives the same findings with the RTL,
+# with the model in place of the RTL, and with the block as a black box.
+execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/cdc_block.sv -top cdc_block -only cdc
+                        -cdc-abstract cdc_block_model.cdc
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ cdc_block_model.cdc got)
+file(READ ${SRC}/tests/lint/cdc_block.cdc want)
+if(NOT rc EQUAL 0 OR NOT got STREQUAL want)
+  message(FATAL_ERROR "-cdc-abstract on cdc_block.sv (exit ${rc}):\n${got}\nexpected:\n${want}\n${err}")
+endif()
+foreach(variant "cdc_block.sv" "cdc_block.sv;-cdc-model;${SRC}/tests/lint/cdc_block.cdc"
+                "cdc_block_bb.sv;-cdc-model;${SRC}/tests/lint/cdc_block.cdc")
+  list(GET variant 0 blk)
+  list(REMOVE_AT variant 0)
+  execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/${blk} ${SRC}/tests/lint/cdc_soc.sv -top cdc_soc -only cdc ${variant}
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0
+     OR NOT out MATCHES "\\[CDC001\\] 'cdc_soc.f_d' \\(clocked by cdc_soc.fclk\\) is read by logic clocked by cdc_soc.sclk"
+     OR NOT out MATCHES "\\[CDC001\\] 'cdc_soc.u_blk.q' \\(clocked by cdc_soc.sclk\\) is read by logic clocked by cdc_soc.fclk"
+     OR NOT out MATCHES "2 findings \\(CDC001 2\\)")
+    message(FATAL_ERROR "cdc_soc.sv with ${blk} ${variant}:\n${out}${err}")
+  endif()
+endforeach()
+
+# -cdc-html: one self-contained page with every crossing and reset synchronizer.
+execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/cdc_clean.sv -top cdc_clean -only cdc,rdc -cdc-html cdc_clean.html
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ cdc_clean.html page)
+foreach(want
+    "<title>CDC: cdc_clean</title>"
+    "{\"src\":\"cdc_clean.gray\",\"sd\":1,\"dst\":\"cdc_clean.gsync\",\"dd\":0,\"how\":\"2-flop synchronizer, Gray coded\""
+    "\"how\":\"one flop only (CDC001)\",\"rule\":\"CDC001\""
+    "{\"out\":\"cdc_clean.a_rst_n\",\"d\":0,\"stages\":2,\"flops\":4}")
+  string(FIND "${page}" "${want}" pos)
+  if(NOT rc EQUAL 0 OR pos EQUAL -1)
+    message(FATAL_ERROR "-cdc-html page missing: ${want}\n${err}")
+  endif()
+endforeach()
+if(page MATCHES "(src|href)=\"?https?:|url\\(https?:|@import")
+  message(FATAL_ERROR "-cdc-html page loads something from the network")
+endif()
+
+# Port domains from set_input_delay / set_output_delay -clock, with a
+# virtual clock: an input read by one flop and an output launched on the
+# wrong clock are crossings; the same clock and a synchronized input are not.
+run(cdc_io.sv "-top;cdc_io;-only;cdc,rdc;-sdc;${SRC}/tests/lint/cdc_io.sdc;-cdc-report")
+foreach(want
+    "virtual clock VIO  3 flops  SDC clock VIO"
+    "cdc_io.din_s (launched by VIO) (virtual clock VIO) -> cdc_io.s1 (cdc_io.clk)  2-flop synchronizer"
+    "[CDC001] 'cdc_io.din_v (launched by VIO)' (clocked by virtual clock VIO) is read by logic clocked by cdc_io.clk through one flop only"
+    "[CDC001] 'cdc_io.dout_v' (clocked by cdc_io.clk) is read by logic clocked by virtual clock VIO with no synchronizer"
+    "2 findings (CDC001 2)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_io.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
+# Clock checks: a clock sampled as data (CDC007) and a clock mux made of
+# gates (CDC008); a clock gate is not reported, nor a -static select.
+run(cdc_clk.sv "-top;cdc_clk;-only;cdc")
+foreach(want
+    "[CDC007] clock 'cdc_clk.bclk' is read as data by 1 flop clocked by cdc_clk.aclk"
+    "[CDC008] clock 'cdc_clk.mclk' of 1 flop is combinational logic of 'cdc_clk.aclk', 'cdc_clk.bclk', 'cdc_clk.sel'"
+    "2 findings (CDC007 1, CDC008 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_clk.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+run(cdc_clk.sv "-top;cdc_clk;-only;cdc;-static;sel")
+if(NOT out MATCHES "1 finding \\(CDC007 1\\)")
+  message(FATAL_ERROR "cdc_clk.sv -static sel:\n${out}")
+endif()
 
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")

@@ -116,6 +116,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `-xprop[=tmerge\|xmerge\|<config file>]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
+| `-profile [<file>]` | Simulation profile: time and activations per process, instance, source file and kind, plus scheduler regions (default `simprofile.txt`); see [`docs/PROFILE.md`](docs/PROFILE.md) |
 | `-upf <file>` | Power-aware simulation with this UPF (IEEE 1801) power intent; see [`docs/LOWPOWER.md`](docs/LOWPOWER.md) |
 | `-power_top <inst>`, `-upf_verbose` | The instance the UPF describes; print supply, power state and simstate changes |
 | `<file>.c`, `.cpp`, `.o`, `.a` | DPI-C code: msim builds it (with `svdpi.h` on the include path) and loads it |
@@ -152,6 +153,7 @@ failures grouped by their first error line:
 ```sh
 mregress tests.list -sim msim -j 8 -seeds 3     # or -sim vcs / xrun / questa / iverilog
 mregress tests.list -rerun                      # repeat only the failures
+mregress tests.list -farm lsf '-farm-opts=-q regress'   # on a farm: lsf, slurm, sge, ssh:hosts, or cmd:TEMPLATE
 mregress -spec tests/spec -sim iverilog         # the spec suite on another simulator
 ```
 
@@ -549,7 +551,7 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
 | `format`, `suspicious` | `FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009` | Verible-style text and syntax rules (off until enabled): line length, tabs, trailing spaces, stray semicolons, `` `endif `` comments, explicit lifetimes and parameter types, range direction |
 | `tidy` | `TIDY001`..`TIDY021` | slang-tidy's checks, built in: registers assigned only in reset, undriven bit ranges, struct fields split over processes, port and typedef style |
-| `cdc`, `rdc` | `CDC001`..`CDC006`, `RDC001`..`RDC006` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
+| `cdc`, `rdc` | `CDC001`..`CDC008`, `RDC001`..`RDC006` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
 mlint rtl/*.sv -config mlint.cfg -waivers waivers.cfg -json lint.json
@@ -567,7 +569,10 @@ the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 Clock and reset domains are found from the RTL: the clock of every
 edge-triggered block, followed through ports, buffers and clock gates, so one
 clock passed down through several modules stays one domain. `-cdc-report`
-lists every domain and crossing, `-sdc file.sdc` takes the clocks and their
+lists every domain and crossing, `-cdc-html FILE` writes a page to browse
+them, `-cdc-abstract`/`-cdc-model` check a
+block once and use its port model in the SoC, `-cdc-sva FILE` writes assertions for the
+synchronized crossings, `-sdc file.sdc` takes the clocks and their
 relations (generated clocks, `set_clock_groups`, false paths between clocks)
 from the timing constraints, `-clock-group a,b` declares related clocks
 and `-static sig` waives a quasi-static signal. Findings print as
