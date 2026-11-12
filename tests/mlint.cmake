@@ -134,7 +134,7 @@ foreach(want
     "[CDC001] 'cdc_sdc.b0' (clocked by cdc_sdc.bclk) is read by logic clocked by cdc_sdc.cclk"
     "[CDC001] 'cdc_sdc.c0' (clocked by cdc_sdc.cclk) is read by logic clocked by cdc_sdc.mclk"
     "[CDC006] clock 'cdc_sdc.uclk' of 1 flop is not a clock in the SDC file"
-    "5 findings (CDC001 4, CDC006 1)")
+    "6 findings (CDC001 4, CDC006 1, CDC008 1)")
   string(FIND "${out}" "${want}" pos)
   if(pos EQUAL -1)
     message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_none.sdc missing: ${want}\n${out}")
@@ -144,13 +144,13 @@ endforeach()
 run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_groups.sdc")
 if(NOT out MATCHES "'cdc_sdc.a0' \\(clocked by cdc_sdc.aclk\\) is read by logic clocked by cdc_sdc.bclk"
    OR NOT out MATCHES "'cdc_sdc.d0' \\(clocked by cdc_sdc.div2\\) is read by logic clocked by cdc_sdc.bclk"
-   OR NOT out MATCHES "2 findings \\(CDC001 2\\)")
+   OR NOT out MATCHES "3 findings \\(CDC001 2, CDC008 1\\)")
   message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_groups.sdc:\n${out}")
 endif()
 # A false path between two clocks makes that pair asynchronous.
 run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_false.sdc")
 if(NOT out MATCHES "'cdc_sdc.b0' \\(clocked by cdc_sdc.bclk\\) is read by logic clocked by cdc_sdc.cclk"
-   OR NOT out MATCHES "1 finding \\(CDC001 1\\)")
+   OR NOT out MATCHES "2 findings \\(CDC001 1, CDC008 1\\)")
   message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_false.sdc:\n${out}")
 endif()
 
@@ -278,6 +278,23 @@ foreach(want
     message(FATAL_ERROR "cdc_io.sv missing: ${want}\n${out}")
   endif()
 endforeach()
+
+# Clock checks: a clock sampled as data (CDC007) and a clock mux made of
+# gates (CDC008); a clock gate is not reported, nor a -static select.
+run(cdc_clk.sv "-top;cdc_clk;-only;cdc")
+foreach(want
+    "[CDC007] clock 'cdc_clk.bclk' is read as data by 1 flop clocked by cdc_clk.aclk"
+    "[CDC008] clock 'cdc_clk.mclk' of 1 flop is combinational logic of 'cdc_clk.aclk', 'cdc_clk.bclk', 'cdc_clk.sel'"
+    "2 findings (CDC007 1, CDC008 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_clk.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+run(cdc_clk.sv "-top;cdc_clk;-only;cdc;-static;sel")
+if(NOT out MATCHES "1 finding \\(CDC007 1\\)")
+  message(FATAL_ERROR "cdc_clk.sv -static sel:\n${out}")
+endif()
 
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
