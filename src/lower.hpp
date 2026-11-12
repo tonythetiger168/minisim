@@ -8014,6 +8014,23 @@ inline const slang::ast::Symbol* sharedPortVar(const slang::ast::PortSymbol& ps,
     return in;
 }
 
+// Ports whose internal and external connections are both nets of one
+// user-defined nettype are merged into a single simulated net (23.3.3.7.2),
+// whatever the direction: its resolution function sees the drivers of both
+// sides. Returns the internal net when they can be merged.
+inline const slang::ast::Symbol* nettypeCollapses(const slang::ast::PortSymbol& ps, const slang::ast::Symbol& actual) {
+    using namespace slang::ast;
+    const Symbol* in = ps.internalSymbol;
+    if (!in || in->kind != SymbolKind::Net || actual.kind != SymbolKind::Net) return nullptr;
+    const NetType& a = in->as<NetSymbol>().netType;
+    const NetType& b = actual.as<NetSymbol>().netType;
+    if (a.netKind != NetType::UserDefined || b.netKind != NetType::UserDefined) return nullptr;
+    if (&a != &b && (a.getResolutionFunction() != b.getResolutionFunction() ||
+                     !a.getDataType().isMatching(b.getDataType())))
+        return nullptr;
+    return in;
+}
+
 // An inout port whose actual is a whole net of the same width and kind is
 // the same net as its internal net (23.3.3.1). Returns the internal net when
 // the two can share one signal.
@@ -9363,7 +9380,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             // A ref port or a container port joined to a whole variable shares
             // that variable's signal (see sharedPortVar).
             if (ps.internalSymbol && aliasOf().count(ps.internalSymbol) && aliasOf().at(ps.internalSymbol) != ps.internalSymbol &&
-                (ps.internalSymbol->kind != SymbolKind::Net || Lowerer::isDynType(ps.getType())))
+                (ps.internalSymbol->kind != SymbolKind::Net || Lowerer::isDynType(ps.getType()) ||
+                 ps.internalSymbol->as<NetSymbol>().netType.netKind == NetType::UserDefined))
                 continue;
             if (ps.direction == ArgumentDirection::Ref) Lowerer::unsupported("ref port connected to anything but a whole variable");
             if (ps.internalSymbol && Lowerer::isDynType(ps.getType()))
@@ -10096,6 +10114,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     // each way, would hold the last driven value for ever.
                     const Symbol* in = inoutCollapses(c->port.as<PortSymbol>(), ns);
                     if (!in) in = sharedPortVar(c->port.as<PortSymbol>(), ns);
+                    if (!in) in = nettypeCollapses(c->port.as<PortSymbol>(), ns);
                     if (in) {
                         if (!up.count(&ns)) up[&ns] = &ns;
                         if (!up.count(in)) up[in] = in;
