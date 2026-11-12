@@ -41,7 +41,9 @@ h3{margin:0;padding:5px 10px;font-size:11px;letter-spacing:.06em;text-transform:
 svg{display:block}svg text{font:11px ui-monospace,monospace;fill:var(--fg)}
 svg .n rect{fill:var(--bg);stroke:var(--dim)}svg .n.me rect{stroke:var(--acc);stroke-width:2}svg .n{cursor:pointer}
 svg .b rect{fill:var(--panel);stroke:var(--fg)}svg .b text.bn{fill:var(--fg);font-weight:600}svg text.net{cursor:pointer;fill:var(--acc)}svg .b text{fill:var(--dim)}svg .b{cursor:pointer}
-svg path{fill:none;stroke:var(--dim)}svg path.c{stroke-dasharray:3 3}svg .tri{fill:none;stroke:var(--fg)}
+svg path{fill:none;stroke:var(--dim)}svg .st circle{fill:var(--bg);stroke:var(--fg)}svg .st.me circle{stroke:var(--acc);stroke-width:2.5}svg .st.rs circle{stroke-dasharray:4 2}svg .st text{text-anchor:middle}
+svg path.tr{cursor:pointer;stroke:var(--fg);stroke-width:1.6}svg path.tr.off{stroke:var(--dim);opacity:.45}svg path.tr.on{stroke:var(--acc)}svg marker path{fill:var(--dim);stroke:none}
+svg path.c{stroke-dasharray:3 3}svg .tri{fill:none;stroke:var(--fg)}
 #wbar{display:flex;gap:8px;align-items:center;padding:3px 10px;border-bottom:1px solid var(--line);color:var(--dim)}
 #wc{flex:1;min-height:0;position:relative;overflow-y:auto}canvas{display:block;width:100%}
 .none{color:var(--dim);padding:4px 0}
@@ -162,7 +164,7 @@ function panel(){if(st.sig<0)return;const s=S[st.sig],v=W?val(st.sig,st.t):null;
   else $('act').innerHTML='<div class="none">'+(W?'This signal is not in the waveform.':'Run mdebug with -vcd to see it.')+'</div>';
   const cls=i=>!act?'':act.hits.some(h=>h.d==i&&h.state==1)?' act':act.hits.some(h=>h.d==i)?'':' off';
   $('drv').innerHTML=drvOf[st.sig].map(i=>card(i).replace('class="d"','class="d'+cls(i)+'"')).join('')||'<div class="none">No driver: an input or a testbench value.</div>';
-  $('lod').innerHTML=loadOf[st.sig].map(i=>card(i,1)).join('')||'<div class="none">Nothing reads it.</div>';schematic()}
+  $('lod').innerHTML=loadOf[st.sig].map(i=>card(i,1)).join('')||'<div class="none">Nothing reads it.</div>';fsmOf.has(st.sig)?fsmView():schematic()}
 // Inputs -> assignments -> the signal -> assignments that read it -> what they drive.
 function schematic(){const me=st.sig,dv=drvOf[me].slice(0,12),ld=loadOf[me].slice(0,12);
   const ins=[],outs=[];dv.forEach(i=>[...D[i].reads,...D[i].ctl].forEach(s=>ins.includes(s)||ins.push(s)));ld.forEach(i=>outs.includes(D[i].sig)||outs.push(D[i].sig));
@@ -178,6 +180,21 @@ function schematic(){const me=st.sig,dv=drvOf[me].slice(0,12),ld=loadOf[me].slic
   ld.forEach((i,k)=>{const yb=y(k,ld.length);o+=wire(X[2]+WN,ym,X[3],yb,!D[i].reads.includes(me))+wire(X[3]+WB,yb,X[4],y(outs.indexOf(D[i].sig),outs.length))+box(i,X[3],yb)});
   ins.forEach((s,k)=>o+=node(s,X[0],y(k,ins.length)));outs.forEach((s,k)=>o+=node(s,X[4],y(k,outs.length)));o+=node(me,X[2],ym,'me');
   $('sch').innerHTML=`<svg viewBox="0 0 ${X[4]+WN+4} ${ht}" width="${X[4]+WN+4}">${o}</svg><div class="none">Solid: data. Dashed: a condition. Click a signal to move the view.</div>`}
+// A state register: its states in a ring, the transitions the source has,
+// the state at the cursor, and (with waves) which transitions ran.
+const fsmOf=new Map((DB.fsms||[]).map(f=>[f.sig,f]));
+function fsmView(){const f=fsmOf.get(st.sig),n=f.states.length,R=Math.max(60,n*17),cx=R+60,cy=R+30,pos=new Map,nm=new Map(f.states.map(s=>[s[0],s[1]]));
+  f.states.forEach((s,k)=>{const a=-Math.PI/2+2*Math.PI*k/n;pos.set(s[0],[cx+R*Math.cos(a),cy+R*Math.sin(a)])});
+  const c=W&&W[st.sig]||[],num=b=>/[xz]/.test(b)?-1:Number(BigInt('0b'+b)),took=new Map;
+  for(let k=1;k<c.length;k++){const key=num(c[k-1][1])+'>'+num(c[k][1]);took.set(key,(took.get(key)||0)+1)}
+  const k=chAt(st.sig,st.t),cur=k<0?-1:num(c[k][1]),cut=(t,m)=>t.length>m?t.slice(0,m-1)+'…':t;
+  let o='<defs><marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L8 4L0 8z"/></marker></defs>';
+  f.trans.forEach(t=>{const a=pos.get(t[0]),b=pos.get(t[1]);if(!a||!b)return;const dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy)||1,ux=dx/L,uy=dy/L,r=19,
+    x1=a[0]+ux*r,y1=a[1]+uy*r,x2=b[0]-ux*r,y2=b[1]-uy*r,mx=(x1+x2)/2-uy*L*.14,my=(y1+y2)/2+ux*L*.14,nn=took.get(t[0]+'>'+t[1])||0;
+    o+=`<path class="tr${W&&W[st.sig]?(nn?' on':' off'):''}${t[2]?' c':''}" data-f="${t[3]}" data-l="${t[4]}" marker-end="url(#ah)" d="M${x1} ${y1}Q${mx} ${my} ${x2} ${y2}"><title>${esc(nm.get(t[0]))} → ${esc(nm.get(t[1]))}${t[2]?' (reset)':''}${W&&W[st.sig]?', taken '+nn+(nn==1?' time':' times'):''}</title></path>`});
+  f.states.forEach(s=>{const[x,y]=pos.get(s[0]);o+=`<g class="st${s[0]==cur?' me':''}${s[2]?' rs':''}"><title>${esc(s[1])} = ${s[0]}${s[2]?' (reset state)':''}</title><circle cx="${x}" cy="${y}" r="19"/><text x="${x}" y="${y+4}">${esc(cut(s[1],6))}</text></g>`});
+  const bad=cur>=0&&!nm.has(cur);
+  $('sch').innerHTML=`<svg viewBox="0 0 ${2*cx} ${2*cy}" width="${2*cx}">${o}</svg><div class="none">State machine ${esc(leaf(S[st.sig].path))}${cur>=0?': '+esc(nm.get(cur)||String(cur))+' at '+st.t:''}${bad?' (not a state)':''}. ${W&&W[st.sig]?'Bright: a transition that ran. Faint: never taken. ':''}Dashed: reset. Click an arrow for its line.</div>`}
 function blocks(){const P=st.scope,ch=DB.scopes.filter(s=>s.path.includes('.')&&scopeOf(s.path)==P);
   if(!ch.length){$('sch').innerHTML='<div class="none">No instances inside '+esc(P)+'. Select a signal to draw its drivers and loads.</div>';return}
   const ix=new Map(ch.map((s,k)=>[s.path,k])),B=ch.map(s=>({s,ins:[],outs:[],lv:0})),src=new Map,use=new Map;
@@ -218,7 +235,8 @@ function goDriver(i){const d=D[i],own=scopeOf(S[d.sig].path);
   // A port connection is written in the parent's file.
   const sc=DB.scopes.find(s=>s.path==own&&s.file==d.file)||DB.scopes.find(s=>s.path==scopeOf(own)&&s.file==d.file);
   if(sc)st.scope=sc.path;st.file=d.file;tree();sigList();source(d.line)}
-document.body.addEventListener('click',e=>{const t=e.target.closest('[data-s],[data-d],[data-p]');if(!t)return;
+document.body.addEventListener('click',e=>{const t=e.target.closest('[data-s],[data-d],[data-p],[data-f]');if(!t)return;
+  if(t.dataset.f!==undefined){st.file=+t.dataset.f;source(+t.dataset.l);return}
   if(t.dataset.s!==undefined){if(t.dataset.t!==undefined&&W){st.t=Math.max(0,Math.min(END,+t.dataset.t));$('tcur').textContent='t = '+st.t+' '+(DB.timescale||'')}pick(+t.dataset.s)}else if(t.dataset.d!==undefined)goDriver(+t.dataset.d);
   else{st.scope=t.dataset.p;st.file=-1;tree();sigList();const sc=DB.scopes.find(s=>s.path==st.scope);source(sc?sc.line:0);blocks()}});
 $('q').addEventListener('change',e=>{const v=e.target.value.trim();let i=byPath.get(v);
