@@ -57,3 +57,9 @@ endif()
 # VHDL is refused with a message, not passed on.
 run(2 ${MSIM} -xrun tb.sv x.vhd -nolog)
 expect("${err}" "VHDL is not supported")
+
+# The same front end with --compat=cadence (compat.hpp), anywhere on the line,
+# and Cadence options in any case: -SV, -ACCESS +rwc and -NOCOPYRIGHT are
+# dropped, -TIMESCALE is renamed.
+run(0 ${MSIM} -f run.f -SV --compat=cadence -ACCESS +rwc -TIMESCALE 1ns/1ps -NOCOPYRIGHT -nolog +stop)
+expect("${out}" "n=10 at 100000\n")
