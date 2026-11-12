@@ -162,6 +162,97 @@ counts (the `Reqs` column of `mplan trend`), and:
 - `mplan init -reqs FILE -o draft.vplan` drafts a plan with one feature per
   requirement, nested like the requirements.
 
+## Ranking and per-test coverage
+
+`mregress -cov` keeps one coverage database per run. `mplan rank` reads
+them and says what each test adds:
+
+```
+$ mplan rank uart.vplan -results regress.d -keep keep.list
+Rank  Test          New  Coverage  Seconds  Unique
+   1  uart_random  5120     71.3%     41.0     310
+   2  uart_parity   640     80.2%      6.5     122
+   ...
+mplan: 34 of 300 tests reach 92.1% (6610/7177 points) in 97.0s of 900.0s
+redundant (add nothing): uart_smoke, uart_tx_1, ...
+```
+
+A coverage point is one of `mcov`'s items (the same ones `mcov rank`
+counts): a line, a branch outcome, a toggle direction of one bit, a
+condition vector, an FSM state or transition, a covergroup bin, or an
+assertion that passed (a cover directive that was hit). `mcov rank` ranks
+database files; `mplan rank` works from the regression instead: it names
+tests rather than files, joins the seeds of a test, leaves failing tests
+out, can order by run time, and ties the tests to the plan's features. The order is
+greedy: the test with the most points first, then the one that adds the
+most new points, and so on. `-by rate` orders by new points per second of
+run time instead, which gives the cheapest way to the same coverage.
+
+- **New** is what the test adds to the ones above it, **Coverage** the
+  total so far, **Unique** the points no other test covers (removing the
+  test loses them).
+- Tests that add nothing are listed as redundant. `-keep FILE` writes the
+  others, one name a line, in rank order: a short regression with the same
+  coverage.
+- Failing tests are left out; `-all` ranks them too. The seeds of a test
+  count together.
+- With a plan, each feature lists the tests that cover points of its own
+  coverage metrics, most points first.
+- `-json FILE` writes all of it; `-n N` prints only the first N ranks.
+
+`mplan report -rank [-by rate]` puts the ranking and the per-feature tests
+in `plan.html` and `plan.json`. The per-run databases are read in parallel
+(`-threads`). The result does not depend on the worker count.
+
+## Server and dashboard
+
+`mplan serve` is one place for many plans and many people.
+
+```
+mplan serve -root /srv/mplan -port 8080 -bind 0.0.0.0 -users users.txt
+mplan push  http://host:8080 plan.d -token $MPLAN_TOKEN     # from CI, after mplan report
+```
+
+The server keeps a directory per project under `-root`: `history.jsonl`
+(every snapshot pushed), the last `plan.json` and `plan.html`,
+`annotations.json` (what people set on the failure buckets) and
+`audit.jsonl` (who pushed or changed what, and when). They are plain files:
+back them up or put them in git. Pushing the same label again replaces that
+snapshot. The project name is the plan's name unless `-project` says
+otherwise.
+
+| Page | Shows |
+|---|---|
+| `/` | every plan: score, change since the previous snapshot, status, features met, tests passing, requirements verified, failure buckets, a sparkline of the score |
+| `/p/NAME/` | one plan: the trend chart, the snapshots, and each failure bucket with a form for its status (open / known / waived), owner, bug id and note |
+| `/p/NAME/plan.html` | the full report of the last push |
+
+| API | |
+|---|---|
+| `GET /api/projects` | the summaries the index shows |
+| `GET /api/p/NAME` | one summary with the annotations |
+| `GET /api/p/NAME/history` | every snapshot |
+| `GET /api/p/NAME/rules` | the annotations, as `mplan report -rules URL` reads them |
+| `POST /api/p/NAME/push` | `{"plan": <plan.json>, "html": <plan.html>}` (what `mplan push` sends) |
+| `POST /api/p/NAME/annotate` | `{"signature", "status", "owner", "bug", "note"}` |
+
+`mplan report -rules http://host:8080/api/p/NAME/rules` takes the
+dashboard's annotations as its triage rules (the token comes from
+`MPLAN_TOKEN`), so a bucket somebody marked known with an owner and a bug
+id shows that way in the next report and does not trip `-fail-on-new`.
+
+**Users.** `-users FILE` holds one `name:token[:role]` a line, the role
+`read`, `write` (default) or `admin`. A request carries the token as
+`Authorization: Bearer TOKEN`; a browser signs in at `/login`. Without
+`-users` everybody may read and nobody may write; `-open` lets anyone who
+reaches the port write (trusted networks only); `-private` asks for a token
+to read as well. Writes must be `application/json`, so a page on another
+site cannot post on a signed-in user's behalf, and an uploaded report is
+served sandboxed. The server listens on 127.0.0.1 unless `-bind` says
+otherwise and speaks plain HTTP: put a TLS proxy in front of it outside a
+trusted network. It serves requests on threads and writes each project one
+change at a time.
+
 ## Triage
 
 Every failing run goes into a bucket by its failure signature: mregress's,

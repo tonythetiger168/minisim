@@ -38,18 +38,51 @@ literal as a string constant; anything else as an expression whose value is
 taken when the call runs. `vpi_put_userdata` / `vpi_get_userdata` keep data
 per call site.
 
-**Objects (clause 37).** `vpiModule` (top modules from
-`vpi_iterate(vpiModule, NULL)`, children through generate blocks and
-instance arrays), `vpiNet`, `vpiReg`, `vpiIntegerVar`, `vpiTimeVar`,
-`vpiRealVar`, `vpiMemory` (one unpacked dimension) and `vpiMemoryWord`,
-`vpiNetBit` / `vpiRegBit`, `vpiParameter`, `vpiPort` (with `vpiDirection`
-and `vpiLowConn`), `vpiSysTaskCall` / `vpiSysFuncCall` with `vpiArgument`,
-`vpiScope` and `vpiUserSystf`. Properties: `vpiType`, `vpiName`,
-`vpiFullName`, `vpiDefName`, `vpiFile`, `vpiLineNo`, `vpiSize`, `vpiSigned`,
-`vpiScalar`, `vpiVector`, `vpiTopModule`, `vpiTimeUnit`, `vpiTimePrecision`,
-`vpiDirection`, `vpiNetType`, `vpiFuncType`, `vpiConstType`, `vpiLocalParam`,
-`vpiArray`. Handles are canonical: the same object always has the same
-handle, so `vpi_compare_objects` and `==` agree.
+**Objects (clause 37).** Instances: `vpiModule`, `vpiInterface` (with
+`vpiModport`), `vpiProgram` and `vpiPackage`; `vpi_iterate(vpiInstance, NULL)`
+gives the top instances and the packages, `vpi_iterate(vpiModule, NULL)` the
+top modules. Scopes inside an instance (`vpiInternalScope`): `vpiGenScope`
+(and `vpiGenScopeArray` for a generate loop), `vpiTask`, `vpiFunction`,
+`vpiNamedBegin`, `vpiNamedFork`. Nets and variables with their
+SystemVerilog types: `vpiNet`, `vpiReg` (`vpiLogicVar`), `vpiBitVar`,
+`vpiIntegerVar`, `vpiIntVar`, `vpiShortIntVar`, `vpiLongIntVar`,
+`vpiByteVar`, `vpiTimeVar`, `vpiRealVar`, `vpiShortRealVar`, `vpiStringVar`,
+`vpiEnumVar`, `vpiStructVar` and `vpiUnionVar` (packed), `vpiPackedArrayVar`
+and the matching net types; `vpi_iterate(vpiVariables / vpiNet, scope)`
+gives them all. Arrays of any number of unpacked dimensions (`vpiRegArray` /
+`vpiArrayVar`, `vpiNetArray`) with a `vpiRange` per dimension, elements by
+`vpi_handle_by_index`, `vpi_handle_by_multi_index`, by name (`top.m[1][2]`,
+also one bit `top.m[1][2][3]`) or by iteration. `vpiNetBit` / `vpiRegBit`,
+`vpiPartSelect`, `vpiParameter`, `vpiPort` (with `vpiDirection`,
+`vpiLowConn` and `vpiHighConn`), `vpiRange` with `vpiLeftRange` /
+`vpiRightRange` constants, `vpiSysTaskCall` / `vpiSysFuncCall` with
+`vpiArgument`, `vpiUserSystf`, and `vpi_iterate(vpiCallback, NULL)`.
+Typespecs (`vpiTypespec` of a variable, parameter, port, function or
+member; `vpi_iterate(vpiTypedef, scope)`): the integer, real, string, logic
+and bit typespecs, `vpiEnumTypespec` with its `vpiEnumConst` values and
+`vpiBaseTypespec`, `vpiStructTypespec` / `vpiUnionTypespec` with
+`vpiTypespecMember`, `vpiArrayTypespec` and `vpiPackedArrayTypespec` with
+`vpiElemTypespec`; a typedef's typespec has its name. Relations `vpiScope`,
+`vpiModule`, `vpiInstance`, `vpiParent`, `vpiIndex`. Properties: `vpiType`,
+`vpiName`, `vpiFullName`, `vpiDefName`, `vpiFile`, `vpiLineNo`,
+`vpiDefFile`, `vpiDefLineNo`, `vpiSize`, `vpiSigned`, `vpiScalar`,
+`vpiVector`, `vpiTopModule`, `vpiTop`, `vpiTimeUnit`, `vpiTimePrecision`,
+`vpiDirection`, `vpiNetType` (wire, wand, wor, tri, tri0, tri1, trireg,
+supply0, supply1, uwire), `vpiFuncType`, `vpiConstType`, `vpiLocalParam`,
+`vpiArray`, `vpiArrayType`, `vpiIsMemory`, `vpiArrayMember`, `vpiPacked`,
+`vpiTagged`, `vpiAutomatic`, `vpiConstantVariable`, `vpiRandType`.
+Handles are canonical: the same object always has the same handle, so
+`vpi_compare_objects` and `==` agree. `vpi_handle_by_name` takes full
+names, names relative to a scope, `pkg::name`, generate scopes
+(`top.gen[1].v`) and instance array elements.
+
+**Compatibility modes (36.12).** An application built for IEEE 1364 sees
+that standard's model: SystemVerilog variable types report as `vpiReg`
+(`bit [3:0]`, `int`, an enum, a packed struct) or their net as `vpiNet`,
+and for IEEE 1364-1995 / 2001 a one-dimensional array of `reg` is a
+`vpiMemory` of `vpiMemoryWord`s and the contents of generate blocks belong
+to the module. `vpi_iterate(vpiMemory, ...)` and `vpiMemoryWord` work in
+every mode.
 
 **Values and time (38.15, 38.18, 38.34, 38.35).** `vpi_get_value` and
 `vpi_put_value` with `vpiBinStrVal`, `vpiOctStrVal`, `vpiDecStrVal`,
@@ -66,6 +99,72 @@ bit, with the time and value in the requested formats), `cbReadWriteSynch`,
 `vpi_remove_cb`, `vpi_get_cb_info`. Declaration initializers take effect
 before the simulation starts and are not value changes.
 
+**Array values (38.16, 38.35).** `vpi_get_value_array` and
+`vpi_put_value_array` on a memory, from a start index, in `vpiIntVal`,
+`vpiShortIntVal`, `vpiLongIntVal`, `vpiRealVal`, `vpiShortRealVal`,
+`vpiTimeVal`, `vpiVectorVal`, `vpiRawTwoStateVal` and `vpiRawFourStateVal`
+(ceil(size/8) value bytes per element, then as many unknown-mask bytes),
+with `vpiUserAllocFlag`, `vpiOneValue` and `vpiPropagateOff`. A whole array
+can be an argument of a user system task.
+
+**Headers (annexes K, L, M).** `vpi_user.h` and `sv_vpi_user.h` define every
+constant, structure and routine of annexes K and M with the standard's
+numbers. `vpi_compatibility.h` (annex L, included by `vpi_user.h`): an
+application that defines `VPI_COMPATIBILITY_VERSION_1364v1995`, `_1364v2001`,
+`_1364v2005`, `_1800v2005` or `_1800v2009` before the include is bound to
+that standard's variants of the routines (`vpi_get_1364v2005`, ...), and
+`vpi_get(vpiCompatibilityMode, NULL)` returns the mode of the calling
+application (36.12.2). The default mode is `vpiMode1800v2009`, the newest
+the standard defines. The object model is the same in every mode so far.
+
+**Assertions (clause 39).** Every assertion, assumption and cover,
+concurrent or immediate, is an object: `vpiAssert`, `vpiAssume`,
+`vpiCover`, `vpiImmediateAssert`, `vpiImmediateAssume`, `vpiImmediateCover`,
+from `vpi_iterate(vpiAssertion, NULL)` (all of them) or from an instance or
+scope (those in it), with `vpiName`, `vpiFullName`, `vpiFile`, `vpiLineNo`,
+`vpiIsDeferred`, `vpiIsFinal`, `vpiScope` and `vpiModule`.
+`vpi_register_assertion_cb` (39.4.2) places a callback on one assertion for
+`cbAssertionStart`, `cbAssertionSuccess`, `cbAssertionVacuousSuccess`,
+`cbAssertionFailure` and `cbAssertionDisabledEvaluation` (each with the
+attempt's start time in `s_vpi_attempt_info`), and for the control reasons
+`cbAssertionDisable`, `Enable`, `Reset`, `Kill`, `Lock`, `Unlock` and the
+pass, fail and vacuous action ones; `vpi_remove_cb` removes it.
+`vpi_register_cb` takes the system reasons (39.4.1):
+`cbAssertionSysInitialized` (at the start of simulation), `SysOn`, `SysOff`,
+`SysKill`, `SysLock`, `SysUnlock`, `SysReset`, `SysEnd` (also at the end of
+simulation) and the action ones. `vpi_control` (39.5) takes every assertion
+operation of annex M, on one assertion (`vpi_control(vpiAssertionDisable,
+h)`) or the system (`vpi_control(vpiAssertionSysOff)`). The system tasks of
+20.11 (`$assertoff`, `$assertcontrol`, ...) call the same callbacks. Not
+supported: stepping (`vpiAssertionEnableStep`, `cbAssertionStepSuccess`,
+39.5.2), and `failExpr` of a failure is NULL.
+
+**Coverage (clause 40).** With `msim -cov`, `vpi_get(<coverage type>,
+instance)` gives the covered items of that instance: `vpiStatementCoverage`
+(source lines of its processes that ran), `vpiToggleCoverage` (bits that
+rose and fell), `vpiFsmStateCoverage` (FSM states entered) and
+`vpiAssertCoverage` (assertions that succeeded, or covers that matched;
+counted with or without `-cov`). Items in instances below it are not
+included. `vpiCovered`, `vpiCoveredCount` and `vpiCoveredMax` read an
+assertion (succeeded, successes, 1), an FSM (states entered, entries, states),
+an FSM state, or a net, variable, word or bit (bits toggled both ways, bits
+toggled, width). An assertion also gives `vpiAssertAttemptCovered`,
+`vpiAssertSuccessCovered`, `vpiAssertFailureCovered`,
+`vpiAssertVacuousSuccessCovered`, `vpiAssertDisableCovered` and
+`vpiAssertKillCovered`. `vpi_iterate(vpiFsm, instance)` gives the FSMs msim
+found (`vpiFsm` objects with `vpiName`, `vpiFullName`, `vpiFile`,
+`vpiLineNo`); `vpi_handle(vpiFsmStateExpression, fsm)` the state register;
+`vpi_iterate(vpiFsmStates, fsm)` its states (`vpiFsmHandle` objects whose
+`vpi_get_value` is the state's value and `vpiName` its name).
+`vpi_control(op, type, handle)` takes `vpiCoverageStart`, `vpiCoverageStop`,
+`vpiCoverageReset` and `vpiCoverageCheck` (1 when every item of the type is
+covered) with an instance, an assertion (for `vpiAssertCoverage`) or NULL
+(the whole design); `vpi_control(vpiCoverageSave, type, name)` writes the
+coverage database (the `-cov` JSON) to `name` now. Not supported:
+`vpiCoverageMerge` (merge saved databases with `mcov merge`), and starting
+or stopping statement, toggle or FSM coverage for an instance below the
+top (it is for the whole design).
+
 **Other routines.** `vpi_printf`, `vpi_vprintf`, `vpi_mcd_open`,
 `vpi_mcd_close`, `vpi_mcd_name`, `vpi_mcd_printf`, `vpi_flush`,
 `vpi_chk_error`, `vpi_get_vlog_info`, `vpi_control(vpiFinish)` and
@@ -75,8 +174,7 @@ before the simulation starts and are not value changes.
 `vpi_put_value` with `vpiForceFlag` / `vpiReleaseFlag` forces and releases a
 net or variable (or one bit of it) like `force` / `release` (10.6.2); a
 release returns the value the object then has. `veriuser.h` declares
-`tf_dofinish` and `tf_dostop`, and `sv_vpi_user.h` the SystemVerilog object
-type numbers, for C code written for other simulators. A DPI context import
+`tf_dofinish` and `tf_dostop` for C code written for other simulators. A DPI context import
 may call VPI (35.5.3), as UVM's HDL backdoor does (see `docs/UVM.md`).
 
 **Protected objects (37.3.6).** `vpiIsProtected`, and the access rules for
@@ -84,18 +182,18 @@ objects in decryption envelopes: see "VPI and DPI" in `docs/PROTECT.md`.
 
 ## Not yet
 
-SystemVerilog-specific objects (classes, structs, interfaces, packages,
-dynamic arrays: `sv_vpi_user.h` names their types, but handles to them are
-not made), statements and processes, drivers and
-loads, `vpiHighConn`, multi-dimensional memories, `vpi_get_delays` / `vpi_put_delays`, `cbForce` /
+Class objects, unpacked structs, dynamic arrays, queues and associative
+arrays, statements, processes and expressions, drivers and loads,
+instance arrays as objects, `vpi_get_delays` / `vpi_put_delays`, `cbForce` /
 `cbRelease` / `cbStmt`, and save / restart. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
-`tests/spec/data/vpi/`. When Icarus Verilog is installed, CI builds the same
+`tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
+`M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
 C files into an Icarus VPI module (`//! icarus-vpi:`) and checks that Icarus
 prints the same output.

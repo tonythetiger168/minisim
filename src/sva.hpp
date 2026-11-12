@@ -35,6 +35,11 @@ struct AssertInfo {
     bool vacOn = true;                   // VacuousOff clears it, PassOn sets it
     bool hidden = false;                 // tracks a sequence's end points (16.13.6): not an assertion
     bool prot = false;                   // declared in protected code (34): kept out of the coverage database
+    // Where it is, for VPI (39.3): the slang statement and scope, the source line.
+    const void* stmt = nullptr;
+    const void* scope = nullptr;
+    std::string file;
+    int line = 0;
     uint64_t killGen = 0;                // Kill: pending deferred reports and attempts made before it die
     // Deferred assertions (16.4): the action subroutine call as a process,
     // and the argument expressions captured when the assertion is evaluated.
@@ -48,6 +53,18 @@ struct AssertInfo {
     uint64_t evals = 0, passes = 0, fails = 0;
 };
 inline std::vector<AssertInfo>& asserts() { static std::vector<AssertInfo> v; return v; }
+
+// What happens to an assertion, for the VPI assertion callbacks (39.4).
+// AE_CTL + an AssertCtlType: assertion control changed the assertion; with
+// id -1, the whole assertion system (no targets, all levels).
+enum AssertEvent : int {
+    AE_START, AE_SUCCESS, AE_VACUOUS, AE_FAILURE, AE_DISABLED, AE_KILLED, AE_RESET, AE_CTL = 100
+};
+using AssertHook = void (*)(int id, int ev, uint64_t start);
+inline AssertHook& assertHook() { static AssertHook h = nullptr; return h; }
+inline void assertEvent(int id, int ev, uint64_t start = 0) {
+    if (assertHook()) assertHook()(id, ev, start);
+}
 
 // One $assertcontrol call (20.11). Each target is a scope (an instance path)
 // or one assertion's name. Levels count instance levels below a scope: 0 is
@@ -78,8 +95,10 @@ inline void assertControl(int ctl, int atype, int dtype, int levels, const std::
             for (auto& t : targets)
                 if (int d = depthIn(a, t)) { hit = true; depth = d; break; }
         if (!hit || (levels > 0 && depth > levels)) continue;
-        if (ctl == AC_UNLOCK) { a.locked = false; continue; }
+        int id = (int)(&a - asserts().data());
+        if (ctl == AC_UNLOCK) { a.locked = false; assertEvent(id, AE_CTL + ctl); continue; }
         if (a.locked) continue;
+        assertEvent(id, AE_CTL + ctl);
         switch (ctl) {
             case AC_LOCK: a.locked = true; break;
             case AC_ON: a.on = true; break;
@@ -94,6 +113,7 @@ inline void assertControl(int ctl, int atype, int dtype, int levels, const std::
             default: break;
         }
     }
+    if (targets.empty() && levels == 0 && (atype & 15) == 15) assertEvent(-1, AE_CTL + ctl);
 }
 
 // A clock for sampled value functions (16.9.3). At each tick of `ev` (when
