@@ -304,6 +304,11 @@ struct Sim {
     vector<Sig> sigs;
     vector<vector<Waiter>> waiters;                  // dynamic sensitivity
     vector<Handle> all;                              // owned coroutines
+    // Assertion action blocks (16.14.3) not yet run: most finish on their
+    // first resume and are freed then, so a pass action that runs on every
+    // clock does not keep one coroutine per run until the end (gigabytes in
+    // a long run). One that waits joins `all`.
+    std::unordered_set<void*> oneShot;
     deque<Handle> active, inactive;                  // active / inactive regions
     struct NbaItem { int s; Val v; int hi, lo; };    // hi < 0: whole signal
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
@@ -910,6 +915,7 @@ struct Sim {
 
     ~Sim() {
         for (auto h : all) h.destroy();
+        for (void* p : oneShot) Handle::from_address(p).destroy();
         closeWaves();
     }
     void closeWaves() {
@@ -976,6 +982,7 @@ struct Sim {
         Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
               : (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) ? g.drv[0].v
                                                                        : resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        if (__builtin_expect(!decay.empty(), 0) && g.kind == NR_TRIREG) decayArm(s, r);   // 28.16.2
         if (!timedOut.empty() && (size_t)s < timedOut.size() && timedOut[s]) {   // 30.5.3, 30.7, 32.4.4
             if (shadowed(s)) return;   // its value comes from the delayed sources (shadowOf)
             Val from = projected(s, PQ_PATH, g.val);
@@ -999,7 +1006,46 @@ struct Sim {
     // (slot PQ_PATH), or of one source's driver as a load sees it through an
     // interconnect delay (slot PQ_SRC - driver, 32.4.4). Each entry is one
     // future change; an unlimited number may be pending.
-    enum { PQ_PATH = -2, PQ_SRC = -10, PQ_VAR = -1000000 };
+    enum { PQ_PATH = -2, PQ_DECAY = -3, PQ_SRC = -10, PQ_VAR = -1000000 };
+    // trireg nets (28.16.2): the charge strength when not medium, and the
+    // charge decay time. When the drivers turn off, the held 0 or 1 becomes
+    // x after the decay time unless a driver turns on first.
+    struct Decay { uint64_t ticks = 0; uint64_t gen = 0; bool on = false; };
+    unordered_map<int, Decay> decay;
+    unordered_map<int, uint8_t> charge;
+    uint8_t chargeOf(int s) const {
+        if (charge.empty()) return STR_MEDIUM;
+        auto it = charge.find(s);
+        return it == charge.end() ? STR_MEDIUM : it->second;
+    }
+    // r: the net's new resolved value. A decay time of 0 makes held bits x at once.
+    void decayArm(int s, Val& r) {
+        auto it = decay.find(s);
+        if (it == decay.end() || !it->second.on) return;
+        Decay& dc = it->second;
+        dc.gen++;
+        const Sig& g = sigs[(size_t)s];
+        Val dr = resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        bool held = false;
+        for (int b = 0; b < g.w; b++)
+            if (bitAt(dr, b) == 3) {
+                held = true;
+                if (dc.ticks == 0 && bitAt(r, b) < 2) setBit(r, b, 2);
+            }
+        if (!held || dc.ticks == 0) return;
+        laterDrv[now + dc.ticks].push_back({s, PQ_DECAY, dc.gen, 0, 0});
+        wheel[now + dc.ticks];
+    }
+    void decayFire(int s, uint64_t gen) {
+        auto it = decay.find(s);
+        if (it == decay.end() || it->second.gen != gen) return;   // a driver changed since
+        const Sig& g = sigs[(size_t)s];
+        Val dr = resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        Val nv = g.val;
+        for (int b = 0; b < g.w; b++)
+            if (bitAt(dr, b) == 3 && bitAt(nv, b) < 2) setBit(nv, b, 2);
+        if (!sameVal(nv, g.val)) set(s, nv);
+    }
     // The port connections of variable path outputs: (net, driver) -> the
     // variable and the value the driver last passed on.
     map<pair<int, int>, pair<int, Val>> varPathDrv;
@@ -1440,6 +1486,7 @@ struct Sim {
         auto batch = std::move(it->second);
         laterDrv.erase(it);
         for (auto& l : batch) {
+            if (l.d == PQ_DECAY) { decayFire(l.s, l.gen); continue; }   // 28.16.2
             if (l.d <= PQ_PATH) { runPulse(l.s, l.d, l.gen); continue; }   // 30.7, 32.4.4
             auto pi = pend.find({l.s, l.d});
             if (pi == pend.end() || !pi->second.live || pi->second.gen != l.gen) continue;   // cancelled
@@ -1703,7 +1750,7 @@ struct Sim {
                 have = true;
             } else if (g.net) {
                 unsigned st = g.kind == NR_SUPPLY0 || g.kind == NR_SUPPLY1 ? STR_SUPPLY
-                            : g.kind == NR_TRIREG && g.drv.empty() ? STR_MEDIUM
+                            : g.kind == NR_TRIREG && g.drv.empty() ? self->chargeOf(sig)
                             : (g.kind == NR_TRI0 || g.kind == NR_TRI1) && v == (g.kind == NR_TRI1 ? 1 : 0) ? STR_PULL
                             : STR_STRONG;
                 if (v == 3) sb = SBit{};
@@ -1713,7 +1760,10 @@ struct Sim {
                         SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
                         sb = sbit_resolv(sb, cur);
                     }
-                    if (sbit_z(sb)) sb = v == 1 ? sbit_1(STR_MEDIUM) : v == 0 ? sbit_0(STR_MEDIUM) : sbit_x(STR_MEDIUM, STR_MEDIUM);
+                    if (sbit_z(sb)) {
+                        uint8_t c = self->chargeOf(sig);
+                        sb = v == 1 ? sbit_1(c) : v == 0 ? sbit_0(c) : sbit_x(c, c);
+                    }
                 } else sb = v == 1 ? sbit_1(st) : v == 0 ? sbit_0(st) : sbit_x(st, st);
                 have = true;
             }
@@ -2555,6 +2605,12 @@ struct Sim {
                     region = R_REACTIVE;
                     if (!h.done()) h.resume();
                     region = R_ACTIVE;
+                    if (!oneShot.empty())
+                        if (auto it = oneShot.find(h.address()); it != oneShot.end()) {
+                            oneShot.erase(it);
+                            if (h.done()) h.destroy();
+                            else all.push_back(h);
+                        }
                 } else if (!reInactive.empty()) {          // re-inactive (#0 in the reactive set)
                     for (auto h : reInactive) reactive.push_back(h);
                     reInactive.clear();
@@ -2713,7 +2769,8 @@ struct Sim {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t));
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t)) ||
+                       !active.empty() || !seqq.empty() || !nbaq.empty();   // work queued between slots (msim -i: force, deposit)
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
