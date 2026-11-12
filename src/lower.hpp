@@ -38,6 +38,8 @@
 #pragma once
 #include <cmath>
 #include <deque>
+#include <fstream>
+#include <sstream>
 #include <set>
 #include <functional>
 #include <iostream>
@@ -653,8 +655,8 @@ struct LowerResult {
     // in every time step (17.7.2). Signal, every step.
     std::vector<std::pair<int, bool>> freeVars;
     std::vector<std::unique_ptr<UdpTable>> udps;   // tables of the user-defined primitives (29)
-    struct TranDecl { int a, b; bool resist; };
-    std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive
+    struct TranDecl { int a, b; bool resist; int aLo = 0, bLo = 0, w = -1; };
+    std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive; w >= 0: only bits [aLo, aLo+w) of a and [bLo, bLo+w) of b
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
     std::string timescale() const {
@@ -691,6 +693,7 @@ struct Lowerer {
     struct LoopJumps {
         std::vector<size_t> breaks;
         std::vector<size_t> continues;
+        int xpBrk = -1, xpCnt = -1;   // -xprop: break / continue set these flags instead of jumping
     };
     std::vector<LoopJumps> loops;
     // Named sequential blocks around the statement being lowered, each with
@@ -3254,6 +3257,9 @@ struct Lowerer {
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
         if (const Expression* c = modportConn(e)) return expr(*c, ctx);
+        if (!exprOverride.empty())
+            if (auto ov = exprOverride.find(&e); ov != exprOverride.end())
+                return sized(ref(ov->second, e.type->isSigned()), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
         if (e.kind == ExpressionKind::NamedValue && !labelled().empty())   // a LABEL'd specparam (32.4.3)
             if (auto lv = labelled().find(&e.as<NamedValueExpression>().symbol); lv != labelled().end()) {
                 if (e.type->isFloating()) return konst(mkreal(lv->second));
@@ -4827,6 +4833,20 @@ struct Lowerer {
                     // int'(u3) in a signed 32-bit sum is 0..7, not -4..3.
                     needWidth(dst);
                     E v = expr(c.operand(), ExprCtx{dst, c.operand().type->isSigned(), c.type->isSigned(), true});
+                    return sized(std::move(v), dst, c.type->isSigned(), ctx);
+                }
+                if (c.conversionKind == ConversionKind::Explicit && c.type->isIntegral() &&
+                    c.operand().type->isIntegral() &&
+                    ((int)c.operand().type->getBitWidth() > dst ||
+                     ((int)c.operand().type->getBitWidth() == dst && ctx.live && ctx.w > dst))) {
+                    // A narrowing cast (6.24.1): the operand is worked out at its
+                    // own width, 16'((a + 32'd4) >> 1) keeps the carry, and cut to
+                    // the cast's; a wider context extends only that result, so
+                    // 16'(a + k) < 32 compares 16 bits.
+                    needWidth(dst);
+                    int ow = (int)c.operand().type->getBitWidth();
+                    bool os = c.operand().type->isSigned();
+                    E v = resize(expr(c.operand(), ExprCtx{ow, os, os, true}), dst, false, c.type->isSigned());
                     return sized(std::move(v), dst, c.type->isSigned(), ctx);
                 }
                 bool fill, tag;
@@ -6786,6 +6806,9 @@ struct Lowerer {
     // ---------- constrained randomization (18) ----------
     std::unordered_map<const slang::ast::Symbol*, Val> constVals;     // foreach indices of a constraint, unrolled
     std::unordered_map<const slang::ast::Symbol*, int> symOverride;   // with {...}: the caller's properties, copied
+    // with {...}: an element of the caller's array or container, by an index
+    // the caller knows (addrs[i]), read into a signal before the call.
+    std::unordered_map<const slang::ast::Expression*, int> exprOverride;
     using BeforeList = std::vector<std::pair<std::vector<E>, std::vector<E>>>;
     std::unordered_map<const slang::ast::Symbol*, E> exprBind;
     // a.sum(), a.sum() with (expr) ... of a fixed-size array (7.12.3): the
@@ -7092,10 +7115,55 @@ struct Lowerer {
             // The caller's own properties named in with {...} are copied
             // first: inside the call `this` is the object being randomized.
             if (info && info->inlineConstraints && savedCls) {
+                auto inObjScope = [&](const Symbol* sym) {
+                    const Scope* sc = sym->getParentScope();
+                    for (ClassInfo* c = wc; c; c = c->base)
+                        if (sc == static_cast<const Scope*>(c->ty)) return true;
+                    return false;
+                };
+                // addrs[i] with addrs the caller's array or container and i
+                // known to the caller (a local, a loop variable, a scalar
+                // property): read the element now, into a signal.
+                struct Sel : ASTVisitor<Sel, VisitFlags::Expressions> {
+                    std::vector<const ElementSelectExpression*> sels;
+                    void handle(const ElementSelectExpression& x) { sels.push_back(&x); visitDefault(x); }
+                } sv;
+                info->inlineConstraints->visit(sv);
+                std::unordered_set<const Expression*> covered;   // the array names read this way
+                for (const ElementSelectExpression* x : sv.sels) {
+                    if (x->value().kind != ExpressionKind::NamedValue) continue;
+                    const Symbol* arr = &x->value().as<NamedValueExpression>().symbol;
+                    auto pm = propMap().find(arr);
+                    if (pm == propMap().end() || pm->second.kind == 0 || inObjScope(arr)) continue;
+                    const Type& et = x->type->getCanonicalType();
+                    if (!et.isIntegral() || isHandleType(*x->type)) continue;
+                    struct Refs : ASTVisitor<Refs, VisitFlags::Expressions> {
+                        std::vector<const Symbol*> syms;
+                        void handle(const NamedValueExpression& n) { syms.push_back(&n.symbol); }
+                    } rv;
+                    x->selector().visit(rv);
+                    bool callerOnly = true;
+                    for (const Symbol* r : rv.syms) {
+                        if (inObjScope(r)) { callerOnly = false; break; }
+                        // a constraint's own foreach iterator has no signal yet
+                        if (r->kind == SymbolKind::Iterator && sigFind(r) < 0) { callerOnly = false; break; }
+                        auto rp = propMap().find(r);
+                        if (rp != propMap().end() && rp->second.kind != 0) { callerOnly = false; break; }
+                    }
+                    if (!callerOnly) continue;
+                    int t = fresh(storeW(*x->type));
+                    Instr a; a.k = IK::Assign; a.sig = t;
+                    a.e = expr(*x);
+                    prog.emit(a);
+                    exprOverride[x] = t;
+                    covered.insert(&x->value());
+                }
                 struct V : ASTVisitor<V, VisitFlags::Expressions> {
+                    const std::unordered_set<const Expression*>* skip;
                     std::vector<const Symbol*> found;
-                    void handle(const NamedValueExpression& n) { found.push_back(&n.symbol); }
+                    void handle(const NamedValueExpression& n) { if (!skip->count(&n)) found.push_back(&n.symbol); }
                 } v;
+                v.skip = &covered;
                 info->inlineConstraints->visit(v);
                 for (const Symbol* sym : v.found) {
                     auto pm = propMap().find(sym);
@@ -7171,6 +7239,7 @@ struct Lowerer {
         if (info && info->inlineConstraints) constraintItems(*info->inlineConstraints, nullptr, rc->items, rc->before);
         curClass = savedCls;
         symOverride = std::move(savedOv);
+        exprOverride.clear();
         i.sig = fresh(32);
         i.rc = rc;
         prog.emit(i);
@@ -8677,6 +8746,7 @@ struct Lowerer {
         switch (s.kind) {
             case StatementKind::Empty: break;
             case StatementKind::List:
+                if (!loops.empty() && loops.back().xpBrk >= 0) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
                 for (auto* st : s.as<StatementList>().list) stmt(*st);
                 break;
             case StatementKind::Block: {
@@ -8897,10 +8967,12 @@ struct Lowerer {
                     }
                     break;
                 }
-                // A static local in a task or function is initialized on the
-                // first call, then left alone. The flag starts as X, so the
-                // first call fails the "already done" test and takes the init.
-                bool once = current && vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
+                // A static local is initialized once (6.21), not on every
+                // entry: on the first call of a task or function, or the
+                // first pass of an always or of a loop body, then left alone.
+                // The flag starts as X, so the first entry fails the "already
+                // done" test and takes the init.
+                bool once = vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
                 auto initVar = [&] {   // a fixed-size array takes its value element by element
                     if (arrFind(&vd.symbol) && assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false)) return;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = expr(*init);
@@ -8948,11 +9020,13 @@ struct Lowerer {
                     break;
                 }
                 if (loops.empty()) unsupported("break outside a loop");
+                if (loops.back().xpBrk >= 0) { xpSet(loops.back().xpBrk, konst(mk(1, 1))); break; }   // -xprop
                 loops.back().breaks.push_back(emitJmp());
                 break;
             }
             case StatementKind::Continue: {
                 if (loops.empty()) unsupported("continue outside a loop");
+                if (loops.back().xpCnt >= 0) { xpSet(loops.back().xpCnt, konst(mk(1, 1))); break; }   // -xprop
                 loops.back().continues.push_back(emitJmp());
                 break;
             }
@@ -8970,6 +9044,17 @@ struct Lowerer {
                 size_t top = prog.here(), jf = (size_t)-1;
                 if (f.stopExpr) { Instr j; j.k = IK::JmpIfNot; j.e = expr(*f.stopExpr); jf = prog.emit(j); }
                 loops.push_back({});
+                if (f.stopExpr && xpLoopOk(f.body)) {   // -xprop: break / continue become flags
+                    size_t jb = xpLoopBody(f.body);
+                    patch(loops.back().continues, prog.here());
+                    for (const Expression* e : f.steps) exprStmt(*e);
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    prog.code[jf].target = prog.here();
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
+                }
                 stmt(f.body);
                 // continue lands on the step. The step then falls into the
                 // back-edge, which checks the condition again.
@@ -9022,7 +9107,7 @@ struct Lowerer {
                     const auto& d = f.loopDims[dk];
                     if (!d.loopVar && !(da && f.loopDims.size() > nfixed)) continue;
                     if (!d.range) unsupported("foreach over a dynamic dimension");
-                    int v = fresh(32);
+                    int v = xpLoopTemp(&d, 32);
                     if (d.loopVar) bindVar(d.loopVar, v);
                     Instr init; init.k = IK::Assign; init.sig = v;
                     init.e = konst(make((uint64_t)d.range->left, 0, 32, 0, true));
@@ -9040,6 +9125,21 @@ struct Lowerer {
                     auto n = node(Op::ArrAddr, std::move(ks));
                     n->arr = da;
                     foreachDynDim(f, bindCont(std::move(n), *da->dynElem), nfixed);
+                } else if (xpLoopOk(f.body)) {   // -xprop: break / continue become flags
+                    size_t jb = xpLoopBody(f.body);
+                    patch(loops.back().continues, prog.here());
+                    for (size_t k = lv.size(); k-- > 0;) {
+                        const Lvl& L = lv[k];
+                        Instr st; st.k = IK::Assign; st.sig = L.var;
+                        st.e = bin(L.up ? Op::Add : Op::Sub, ref(L.var, true), konst(make(1, 0, 32, 0, true)));
+                        prog.emit(st);
+                        Instr back; back.k = IK::Jmp; back.target = L.top; prog.emit(back);
+                        prog.code[L.jf].target = prog.here();
+                    }
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
                 } else stmt(f.body);
                 patch(loops.back().continues, prog.here());
                 for (size_t k = lv.size(); k-- > 0;) {
@@ -9058,6 +9158,25 @@ struct Lowerer {
             }
             case StatementKind::WhileLoop: {
                 const auto& w = s.as<WhileLoopStatement>();
+                if (xpCondLoopOk(w.body)) {   // -xprop: break / continue become flags
+                    loops.push_back({});
+                    xpLoopStart();
+                    size_t top = prog.here();
+                    size_t jp = xpLoopGuard(&w.cond);
+                    Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
+                    size_t jf = prog.emit(j);
+                    size_t a = prog.here();
+                    size_t jb = xpLoopBody(w.body);
+                    size_t b = prog.here();
+                    patch(loops.back().continues, prog.here());
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    xpLoopPoison(a, b, {jp});
+                    prog.code[jf].target = prog.here();
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
+                }
                 size_t top = prog.here();
                 Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
                 size_t jf = prog.emit(j);
@@ -9072,6 +9191,25 @@ struct Lowerer {
             }
             case StatementKind::DoWhileLoop: {
                 const auto& w = s.as<DoWhileLoopStatement>();
+                if (xpCondLoopOk(w.body)) {   // -xprop: break / continue become flags
+                    loops.push_back({});
+                    xpLoopStart();
+                    size_t top = prog.here();
+                    size_t a = prog.here();
+                    size_t jb = xpLoopBody(w.body);
+                    size_t b = prog.here();
+                    patch(loops.back().continues, prog.here());
+                    size_t jp = xpLoopGuard(&w.cond);
+                    Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
+                    size_t jf = prog.emit(j);
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    xpLoopPoison(a, b, {jp});
+                    prog.code[jf].target = prog.here();
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
+                }
                 size_t top = prog.here();
                 loops.push_back({});
                 stmt(w.body);
@@ -9086,6 +9224,22 @@ struct Lowerer {
                 break;
             }
             case StatementKind::ForeverLoop: {
+                if (const auto& body = s.as<ForeverLoopStatement>().body; xpCondLoopOk(body)) {   // -xprop
+                    loops.push_back({});
+                    xpLoopStart();
+                    size_t top = prog.here();
+                    size_t jp = xpLoopGuard(nullptr);
+                    size_t a = prog.here();
+                    size_t jb = xpLoopBody(body);
+                    size_t b = prog.here();
+                    patch(loops.back().continues, prog.here());
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    xpLoopPoison(a, b, {jp});
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
+                }
                 size_t top = prog.here();
                 loops.push_back({});
                 stmt(s.as<ForeverLoopStatement>().body);
@@ -9100,8 +9254,11 @@ struct Lowerer {
                 const auto* cv = r.count.getConstant();
                 bool small = (r.count.kind == ExpressionKind::IntegerLiteral || (cv && cv->isInteger())) &&
                              constInt(r.count) <= 1024;
-                if (!small) {   // a counter (12.7.2): x, z or a negative count runs the body zero times
-                    int c = fresh(64);
+                // -xprop: break / continue become flags, in the counter form; the
+                // clean copy uses the same form and counter (xpLoopTemp).
+                bool xpr = xpLoopOk(r.body), xpc = xp.on && xpEscapes(r.body);
+                if (!small || xpc) {   // a counter (12.7.2): x, z or a negative count runs the body zero times
+                    int c = xpLoopTemp(&r, 64);
                     Instr init; init.k = IK::Assign; init.sig = c;
                     init.e = resize(expr(r.count), 64, r.count.type->isSigned(), true);
                     prog.emit(init);
@@ -9111,12 +9268,15 @@ struct Lowerer {
                     Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(c, true), konst(zero));
                     size_t jf = prog.emit(j);
                     loops.push_back({});
-                    stmt(r.body);
+                    size_t jb = (size_t)-1;
+                    if (xpr) jb = xpLoopBody(r.body);
+                    else stmt(r.body);
                     patch(loops.back().continues, prog.here());
                     Instr dec; dec.k = IK::Assign; dec.sig = c; dec.e = bin(Op::Sub, ref(c, true), konst(one));
                     prog.emit(dec);
                     Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
                     prog.code[jf].target = prog.here();
+                    if (xpr) { prog.code[jb].target = prog.here(); xpLoopEnd(); }
                     patch(loops.back().breaks, prog.here());
                     loops.pop_back();
                     break;
@@ -10874,6 +11034,44 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
 
     // The child's formal signal. A null port (no internal connection) is skipped.
     struct Formal { int sig; int w; bool sgn; };
+    // An inout port on a constant bit or part select of a net (`.d0(dat[0])`),
+    // or on a whole net it does not collapse into (another net type): a switch between the internal net and those bits, so each side resolves
+    // the other's drivers (23.3.3.1) and neither holds the other's last value.
+    bool inoutTran(const slang::ast::PortSymbol& ps, const slang::ast::Expression& act0, const Formal& f) {
+        using namespace slang::ast;
+        const Expression& act = Lowerer::peel(act0);
+        if (act.kind != ExpressionKind::ElementSelect && act.kind != ExpressionKind::RangeSelect &&
+            act.kind != ExpressionKind::NamedValue && act.kind != ExpressionKind::HierarchicalValue)
+            return false;
+        auto simple = [](const Symbol& s) {
+            if (s.kind != SymbolKind::Net) return false;
+            const auto& n = s.as<NetSymbol>();
+            auto k = n.netType.netKind;
+            return n.getType().isIntegral() && !n.getDelay() && k != NetType::UserDefined && k != NetType::Interconnect &&
+                   k != NetType::TriReg && k != NetType::Unknown;
+        };
+        if (!ps.internalSymbol || !simple(*ps.internalSymbol)) return false;
+        const Expression* root = &act;
+        while (root->kind == ExpressionKind::ElementSelect || root->kind == ExpressionKind::RangeSelect)
+            root = root->kind == ExpressionKind::ElementSelect ? &root->as<ElementSelectExpression>().value()
+                                                               : &root->as<RangeSelectExpression>().value();
+        if (root->kind != ExpressionKind::NamedValue && root->kind != ExpressionKind::HierarchicalValue) return false;
+        if (!simple(root->as<ValueExpressionBase>().symbol)) return false;
+        if ((int)act.type->getBitWidth() != f.w) return false;
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i;
+        lw.lhs(act, i);
+        if (i.arr || i.bidx || i.dyn >= 0 || !lw.prog.code.empty()) return false;   // a variable index
+        int id = (int)out.trans.size();
+        out.trans.push_back({f.sig, i.sig, false, 0, i.hi >= 0 ? i.lo : 0, f.w});
+        Instr t;
+        t.k = IK::Tran;
+        t.sig = id;
+        lw.prog.emit(t);
+        out.procs.push_back({std::move(lw.prog), false, "tran"});
+        return true;
+    }
     std::optional<Formal> portFormal(const slang::ast::PortSymbol& ps) {
         using namespace slang::ast;
         const Symbol* sym = ps.internalSymbol;
@@ -11089,6 +11287,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                     inoutCollapses(ps, act.as<ValueExpressionBase>().symbol) && aliasOf().count(ps.internalSymbol))
                     continue;
             }
+            if (ps.direction == ArgumentDirection::InOut && inoutTran(ps, asg.left(), *formal)) continue;
             if (Lowerer::peel(asg.left()).kind != ExpressionKind::Concatenation) linkFormal = formal->sig;
             driveActual(asg, *formal);
             linkFormal = -1;
@@ -11299,6 +11498,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         out.procs.push_back({std::move(lw.prog), loops, "always_comb", curScope});
     }
+    // -xprop configuration file: whether the instance around p is on.
+    static bool xpropHere(const slang::ast::Symbol& p) {
+        if (Lowerer::xpRules().empty()) return true;
+        const auto* inst = instanceAround(p.getParentScope());
+        if (!inst) return true;
+        return Lowerer::xpConfigOn(inst->getHierarchicalPath(), inst->getDefinition().name);
+    }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
         if (p.isFromAssertion) {
@@ -11317,7 +11523,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
         int below = checkerDepth > 0 && p.procedureKind == ProceduralBlockKind::AlwaysFF ? lw.fresh(1) : -1;
         if (Lowerer::xpropMode() && checkerDepth == 0 && program < 0 && lw.frames.empty() &&
-            p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final)
+            p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final &&
+            xpropHere(p))
             lw.xpProc(p.getBody());   // -xprop
         else
             lw.stmt(p.getBody());
@@ -11344,6 +11551,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             else lw.prog.emit(waitInstr(rs));
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
+        if (loops && p.procedureKind == ProceduralBlockKind::Always && !lw.prog.code.empty() &&
+            lw.prog.code[0].k == IK::WaitEdge)
+            lw.prog.alwaysTop = true;
         out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind)),
                              curScope, {}, -1,
                              p.procedureKind == ProceduralBlockKind::Initial ? program : -1, checkerDepth > 0});
@@ -12151,6 +12361,21 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
         { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);
+        if (!sub->lay) {   // its static variables: callers are not sensitive to them
+            struct Walk {
+                const std::unordered_map<const slang::ast::Symbol*, int>& sm;
+                std::vector<int>& out;
+                void scope(const slang::ast::Scope& sc) {
+                    for (const auto& m : sc.members()) {
+                        if (m.kind == slang::ast::SymbolKind::Variable || m.kind == slang::ast::SymbolKind::FormalArgument)
+                            if (auto it = sm.find(&m); it != sm.end()) out.push_back(it->second);
+                        if (m.isScope()) scope(m.as<slang::ast::Scope>());
+                    }
+                }
+            } w{sigmap, sub->prog->locals};
+            w.scope(*sub->sym);
+            if (sub->retSig >= 0) sub->prog->locals.push_back(sub->retSig);
+        }
     }
     g_covInst = 0;
     for (Subr* sub : order) patchImplicit(*sub->prog);

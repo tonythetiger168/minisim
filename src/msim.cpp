@@ -33,12 +33,17 @@
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
+//   -restore <file> [+args]  go back to a $save checkpoint and go on (docs/CHECKPOINT.md)
 //   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
 //   -xrun, -irun     take the rest of the command line as xrun / irun options
 //                    (also when msim runs as xrun, irun or xmverilog): docs/XRUN.md
 //   -profile [<file>] time every process and region and write a report
 //                    (default simprofile.txt): busiest processes, time per
 //                    instance, file and kind. Runs the interpreter on one thread.
+//   -saif_forward <file>  a forward SAIF file (IEEE 1801-2024 Annex J.4, J.5)
+//                    for -saif: a library one adds state- and path-dependent
+//                    activity of its cells, an RTL one keeps only its mapped
+//                    points (repeatable)
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -153,6 +158,7 @@
 #include "cov_select.hpp"
 #include "lower.hpp"
 #include "saif.hpp"
+#include "saif_fwd.hpp"
 #include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/diagnostics/LookupDiags.h"
@@ -322,7 +328,7 @@ struct Plan {
 // run time; the drive of its ~1700 single-driver nets was another quarter.
 static void mergePartialDrivers(LowerResult& lowered) {
     if (!S.varPathDrv.empty() || !S.loadsOf.empty() || !lowered.netDelays.empty()) return;
-    for (auto& t : S.tranOf) if (!t.empty()) return;
+    if (!lowered.trans.empty()) return;   // switches resolve their nets from the drivers (S.tranOf is set later)
     for (uint8_t b : S.pathIn) if (b) return;
     size_t ns = S.sigs.size();
     std::vector<std::vector<Instr*>> by(ns);
@@ -2016,14 +2022,87 @@ static std::vector<std::string> implicitTops(slang::driver::Driver& driver, slan
     return tops;
 }
 
+// -saif with -saif_forward (IEEE 1801-2024 Annex J): an RTL forward file
+// keeps only its mapped points (J.5); a library one adds the state- and
+// path-dependent activity of each instance of its cells (J.3.6 to J.3.10, J.4).
+static void writeForwardSaif(const saif::Db& db, const wave::Reader& wr, const std::vector<std::string>& files,
+                             std::ostream& f) {
+    saif::Forward lib, rtl;
+    lib.lib = true;
+    for (auto& p : files) {
+        saif::Forward fw = saif::readForward(p);
+        if (fw.lib) {
+            for (auto& [n, c] : fw.cells) lib.cells[n] = std::move(c);
+            lib.path = p;
+        } else {
+            if (rtl.path.empty()) rtl.path = p;
+            for (auto& in : fw.insts) rtl.insts.push_back(std::move(in));
+        }
+    }
+    if (!rtl.path.empty()) {
+        if (!lib.cells.empty())
+            std::cerr << "msim: -saif_forward: the RTL mapping of " << rtl.path
+                      << " is written; library cells are not mapped points, so " << lib.path << " is not used\n";
+        std::vector<std::string> warn;
+        saif::rtlBackward(db, rtl, f, S.vcdTop, "msim", MINISIM_VERSION, warn);
+        for (auto& w : warn) std::cerr << "msim: -saif_forward: " << w << "\n";
+        return;
+    }
+    std::vector<saif::CellInst> insts;
+    for (auto& [path, mod] : instCells()) {
+        auto it = lib.cells.find(mod);
+        if (it == lib.cells.end()) continue;
+        saif::CellInst ci;
+        ci.path = path;
+        ci.cell = &it->second;
+        std::string pre = path + ".";
+        for (auto pi = portRecs().lower_bound(pre); pi != portRecs().end() && pi->first.compare(0, pre.size(), pre) == 0; ++pi) {
+            std::string pin = pi->first.substr(pre.size());
+            if (pin.find('.') == std::string::npos) ci.output[pin] = pi->second.dir == 1;
+        }
+        insts.push_back(std::move(ci));
+    }
+    std::vector<saif::CellActivity> acts(insts.size());
+    uint64_t end = std::max<uint64_t>(wr.end, db.start);
+    par::parallelFor(insts.size(), par::defaultThreads(), [&](size_t i) {
+        acts[i] = saif::cellActivity(insts[i], wr, db.start, end);
+    });
+    std::map<std::string, size_t> at;
+    for (size_t i = 0; i < insts.size(); i++) at[insts[i].path] = i;
+    saif::WriteHooks h;
+    h.cell = [&](const std::string& p) {
+        auto it = at.find(p);
+        return it == at.end() ? std::string() : insts[it->second].cell->name;
+    };
+    h.isPort = [&](const std::string& p, const std::string& net) {
+        auto it = at.find(p);
+        if (it == at.end()) return false;
+        size_t br = net.find('[');
+        return insts[it->second].output.count(br == std::string::npos ? net : net.substr(0, br)) > 0;
+    };
+    h.pin = [&](const std::string& p, const std::string& pin, std::ostream& os, const std::string& ind) {
+        size_t i = at.at(p);
+        auto& ports = insts[i].cell->ports;
+        auto pd = std::find_if(ports.begin(), ports.end(), [&](auto& x) { return x.first == pin; });
+        if (pd != ports.end()) saif::writePortDirectives(os, pd->second, acts[i].ports.at(pin), ind);
+    };
+    h.extra = [&](const std::string& p, std::ostream& os, const std::string& ind) {
+        auto it = at.find(p);
+        if (it != at.end()) saif::writeLeakage(os, *insts[it->second].cell, acts[it->second], ind);
+    };
+    saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION, &h);
+}
+
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
+                 "  -restore <file> go back to a $save checkpoint (first option; also -r)\n"
                  "  -xrun ...      the rest is an xrun / irun command line (also when run as xrun or irun)\n"
                  "  -elab          stop after elaboration, before the run\n"
                  "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
+                 "  -saif_forward <file>  forward SAIF for -saif: library (SDPD) or RTL mapping\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -2062,6 +2141,8 @@ static void usage() {
               << protfront::Options::help() <<
                  "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
                  "                 merges the branches instead of picking one (docs/XPROP.md)\n"
+                 "  -xprop=<file>, -xprop-config <file>  X-propagation set per instance or module\n"
+                 "                 (tree / instance / module {names} {xpropOn|xpropOff}; merge = ...)\n"
                  "  -xprop-report <file>  list every if / case / edge and whether it is merged\n"
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
@@ -2110,6 +2191,7 @@ int main(int argc, char** argv) {
     int vcdClass = 0;   // -vcd-class [N]
     std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
     bool saifTmp = false;   // ...and the waveform was only written for that
+    std::vector<std::string> saifForward;   // -saif_forward (IEEE 1801-2024 Annex J)
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
     bool interactiveMode = false;   // -i / -do FILE
@@ -2153,7 +2235,13 @@ int main(int argc, char** argv) {
         if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
         if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
         if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }
-        if (a.rfind("-xprop=", 0) == 0) { std::cerr << "msim: bad " << a << " (tmerge, xmerge or off)\n"; return 2; }
+        if (a.rfind("-xprop=", 0) == 0 || a == "-xprop-config") {   // a configuration file (docs/XPROP.md)
+            std::string cfg = a == "-xprop-config" ? next("a file name") : a.substr(7);
+            if (a != "-xprop-config" && !std::ifstream(cfg)) { std::cerr << "msim: bad " << a << " (tmerge, xmerge, off or a configuration file)\n"; return 2; }
+            std::string err = Lowerer::xpReadConfig(cfg);
+            if (!err.empty()) { std::cerr << "msim: -xprop configuration " << cfg << ": " << err << "\n"; return 2; }
+            continue;
+        }
         if (a == "-xprop-report") { xpropReport = next("a file name"); continue; }
         if (a == "-no-pin") { g_pin = 0; continue; }
         if (a == "-pin") { g_pin = 1; continue; }
@@ -2235,6 +2323,10 @@ int main(int argc, char** argv) {
         if (a == "-saif") {
             std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
             saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
+            continue;
+        }
+        if (a == "-saif_forward" && i + 1 < argc) {
+            saifForward.push_back(argv[++i]);
             continue;
         }
         if (a == "-profile") {   // profile.hpp
@@ -2410,6 +2502,7 @@ int main(int argc, char** argv) {
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (!saifForward.empty() && saifPath.empty()) saifPath = "dump.saif";   // -saif_forward implies -saif
     if (!saifPath.empty() && !vcdPath) {
 #ifdef MINISIM_FST
         vcdPath = saifPath + ".tmp.fst";
@@ -2424,10 +2517,15 @@ int main(int argc, char** argv) {
         S.closeWaves();
         try {
             saif::Db db;
-            saif::load(*vcdPath, db, par::defaultThreads());
+            wave::Reader wr;
+            saif::load(*vcdPath, db, par::defaultThreads(), saifForward.empty() ? nullptr : &wr);
             std::ofstream f(saifPath);
             if (!f) throw saif::Error("cannot write " + saifPath);
-            saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            if (saifForward.empty()) {
+                saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            } else {
+                writeForwardSaif(db, wr, saifForward, f);
+            }
         } catch (const std::exception& e) {
             std::cerr << "msim: -saif: " << e.what() << "\n";
             return false;
@@ -2816,7 +2914,7 @@ int main(int argc, char** argv) {
         if (t.charge != STR_MEDIUM) S.charge[t.sig] = t.charge;
         if (t.decays) S.decay[t.sig] = Sim::Decay{t.decay, 0, true};
     }
-    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
+    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist, t.aLo, t.bLo, t.w);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
