@@ -1,5 +1,6 @@
 build/
 *.vcd
+*.evcd
 *.o
 .vscode/
 .idea/
@@ -8,3 +9,5 @@ __pycache__/
 lib/sky130/pdk/
 tests/spec/spec_*.hex
 tests/spec/spec_d_*
+*.mcovsave
+tests/spec/spec_*.cov.json

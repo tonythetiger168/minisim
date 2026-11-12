@@ -1330,6 +1330,15 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++; break;
             }
             case IK::Dump: {
+                if (i.dcmd >= DC_PORTS) {   // extended VCD: [size,] file name
+                    size_t k = 0;
+                    int64_t size = 0;
+                    std::string file;
+                    if (i.dcmd == DC_PLIMIT) { Val sz = eval(i.args[k++], rd); size = sz.x ? 0 : v_to_i64(sz); }
+                    if (k < i.args.size()) { Val f = eval(i.args[k], rd); f.str = true; file = v_str(f); }
+                    S.dumpPorts(i.dcmd, file, size, i.dsel);
+                    pc++; break;
+                }
                 Val a = i.args.empty() ? Val{} : eval(i.args[0], rd);
                 std::string str;
                 int64_t num = -1;

@@ -210,3 +210,74 @@ if(FST)
     message(FATAL_ERROR "memory trace from the FST differs:\n${out}${err}")
   endif()
 endif()
+
+# State machines: the shared extractor's states and transitions with their
+# lines; with a waveform, which transitions ran, the state at a time and the
+# states never entered. The page gets the same data.
+set(SV ${SRC}/tests/cov/fsm.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -vcd ${OUT}/fsm.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "msim fsm.sv: ${rc}\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -fsm RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("tb.u.state  (ctrl, 2 bits, 4 states)" "states: IDLE=0(reset) RUN=1 WAIT=2 FAIL=3" "RUN -> FAIL  " "fsm.sv:16"
+     "tb.v.st  (one, 2 bits, 3 states)" "tb.w.ph  (ifs, 2 bits, 3 states)")
+if(out MATCHES "taken|cnt")
+  message(FATAL_ERROR "-fsm without a waveform reported run data, or a counter as a state machine:\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/fsm.vcd -fsm tb.u -at 40 -json ${OUT}/fsm.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("IDLE -> RUN  " "taken 1 time, first @25" "fsm.sv:16  never taken" "state FAIL never entered"
+     "@40: WAIT  (since 35)  after IDLE@0 RUN@25")
+if(NOT rc EQUAL 0 OR out MATCHES "tb.v.st")
+  message(FATAL_ERROR "-fsm tb.u: rc ${rc}, or a machine of another instance was listed:\n${out}")
+endif()
+file(READ ${OUT}/fsm.json page)
+if(NOT page MATCHES "\"fsms\":\\[{\"sig\":[0-9]+,\"states\":\\[\\[0,\"IDLE\",1\\],\\[1,\"RUN\",0\\]")
+  message(FATAL_ERROR "the database has no state machines")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -fsm tb.nothing RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0)
+  message(FATAL_ERROR "-fsm of a name with no state machine passed")
+endif()
+
+# The script interface: one JSON line per command, errors as answers, and
+# the exit status says a command failed.
+file(WRITE ${OUT}/q.txt "drivers tb.u.state\n# a comment\nvalue tb.u.state 40\nchanges tb.u.state 0 40\nfsm tb.u 40\nactive tb.busy 40 1\nend\n")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/fsm.vcd -script ${OUT}/q.txt
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("{\"cmd\":\"drivers tb.u.state\",\"ok\":true,\"signal\":\"tb.u.state\",\"drivers\":"
+     "\"line\":10,\"text\":\"state \\u003c= IDLE\"" "\"when\":\"!rst_n\""
+     "\"time\":40,\"value\":\"2'h2\",\"bits\":\"10\",\"since\":35}"
+     "\"changes\":[[0,\"00\"],[25,\"01\"],[35,\"10\"]],\"more\":false}"
+     "\"  @40: WAIT  (since 35)  after IDLE@0 RUN@25\"" "\"tb.busy = 1 @40  (since 25)\"" "\"end\":70,")
+if(NOT rc EQUAL 0 OR NOT "${err}" STREQUAL "")
+  message(FATAL_ERROR "-script: rc ${rc}, stderr: ${err}\n${out}")
+endif()
+file(WRITE ${OUT}/q.txt "value nope\nbogus\nend\n")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/fsm.vcd -script ${OUT}/q.txt
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("{\"cmd\":\"value nope\",\"ok\":false,\"error\":\"no signal 'nope' in the design\"}"
+     "\"ok\":false,\"error\":\"unknown command 'bogus' (help lists them)\"}" "\"end\":70,")
+if(rc EQUAL 0)
+  message(FATAL_ERROR "-script with failing commands exited 0")
+endif()
+# The Python interface on top of it.
+if(PY)
+  file(WRITE ${OUT}/api.py "import sys\nsys.path.insert(0, sys.argv[1])\nfrom mdebug_api import Mdebug, MdebugError\n"
+       "with Mdebug([sys.argv[3], '-top', 'tb'], wave=sys.argv[4], mdebug=sys.argv[2]) as d:\n"
+       "    assert d.value('tb.u.state', 40)['value'] == \"2'h2\"\n"
+       "    assert [x['line'] for x in d.drivers('tb.u.state')] == [10, 11]\n"
+       "    assert d.changes('tb.u.state', 0, 40) == [[0, '00'], [25, '01'], [35, '10']]\n"
+       "    assert d.end() == 70 and any('WAIT' in l for l in d.fsm('tb.u', 40))\n"
+       "    assert d.active('tb.busy', at=40, depth=1)[0].startswith('tb.busy = 1 @40')\n"
+       "    assert len(d.signals('tb.u')) == 8 and any(s['path'] == 'tb.u' for s in d.scopes())\n"
+       "    try:\n        d.value('nope')\n        sys.exit('no error for a missing signal')\n"
+       "    except MdebugError as e:\n        assert 'nope' in str(e)\n"
+       "    assert d.end() == 70\nprint('api ok')\n")
+  execute_process(COMMAND ${PY} ${OUT}/api.py ${SRC}/tools ${MDEBUG} ${SV} ${OUT}/fsm.vcd
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES "api ok")
+    message(FATAL_ERROR "mdebug_api.py: ${rc}\n${out}${err}")
+  endif()
+endif()
