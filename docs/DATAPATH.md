@@ -87,6 +87,9 @@ rounded once, correctly.
 | `MW_fp_mult` | `z = a * b` |
 | `MW_fp_div` | `z = a / b`; finite / 0 gives a signed infinity and divzero |
 | `MW_fp_sqrt` | `z = sqrt(a)`; `sqrt(-0) = -0` |
+| `MW_fp_mac` | fused `z = a * b + c`, one rounding; `0 * inf` is invalid even with a quiet NaN `c` |
+| `MW_fp_recip` | `z = 1 / a` |
+| `MW_fp_flt2flt` | conversion between two formats (`EXP_A`/`FRAC_A` to `EXP_Z`/`FRAC_Z`), narrowing or widening |
 | `MW_fp_cmp` | `altb`, `aeqb`, `agtb`, `unordered`; `z0`, `z1` are IEEE 754-2019 minimumNumber and maximumNumber (swapped when `zctr` = 1), with `-0 < +0` |
 | `MW_fp_i2flt` | `IW`-bit integer to float, unsigned or two's complement (`tc`) |
 | `MW_fp_flt2i` | float to `IW`-bit integer by `rnd`; NaN, infinity and out-of-range values saturate and raise invalid |
@@ -121,7 +124,9 @@ the library is clean under `verilator --lint-only -Wall`.
 The floating point modules have their own check, `tests/dw_fp_test.py`
 (`dw/fp` in ctest): an exact reference written with Python fractions rounds
 each result once, and msim must match it bit for bit, flags included, in five
-formats (4/3, half, bfloat16, single, double) and all five rounding modes.
+formats (4/3, half, bfloat16, single, double) and all five rounding modes;
+the fused multiply-add gets operands that nearly cancel, and the format
+conversion goes from each format to another, wider or narrower.
 A third of the operands are zeros, infinities, quiet and signaling NaNs,
 subnormals, the largest and smallest numbers, and near-cancelling pairs.
 `dw_fp_test.py REPO MSIM 3000` runs 75000 vectors instead of 7500.
