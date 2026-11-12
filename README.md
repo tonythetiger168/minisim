@@ -272,6 +272,32 @@ that removes items the tests did cover, and one without a reason. Kinds:
 `file`, `line`, `branch`, `cond`, `toggle`, `fsm`, `state`, `trans`, `cg`,
 `assert`; names take `*` and `?`.
 
+**Condition modes** (as VCS `-cm_cond`): `msim -cm_cond full` records every
+combination of the term values of a condition of up to 8 terms (2^n vectors)
+instead of the n + 1 sensitized ones; `-cm_cond allops` also covers `&` and
+`|` of one-bit operands (`assign y = (a & b) | c;`). Join them as
+`-cm_cond full+allops`. Both work with `-compile`.
+
+**Per instance.** The database also keeps each module instance's own lines,
+decisions and condition vectors. `mcov report -instances` prints one row per
+instance (line, branch, condition, toggle, FSM state and transition, for that
+instance's own code and signals), the HTML report gets an Instances table,
+and with `-detail` every condition shows its vectors per instance, so that a
+vector reached in one instance of a module but not in another shows up.
+`inst tb.dut.u_dbg` in an exclusion file leaves out an instance and all below
+it; code another instance of the same module runs stays counted.
+
+**Proven unreachable.** `mformal` proves which coverage items can never be
+reached (`-app toggle`: bits stuck at 0 or 1). `mcov exclude -formal` turns
+its verdicts into exclusions whose reason says so, for the items the tests
+did not cover; an item the tests did cover is reported instead:
+
+```sh
+mformal rtl/*.sv -top dut -app toggle -json formal.json
+mcov exclude all.json -formal formal.json -o unreachable.el      # finds tb.dut from the names, or -formal-scope tb.dut
+mcov report all.json -elfile unreachable.el -el-review
+```
+
 **Which test covers what.** With one database per test, `mcov rank` orders
 the tests so that each next one adds the most items not yet covered, and
 shows what only one test covers and which tests add nothing:

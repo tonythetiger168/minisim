@@ -111,7 +111,10 @@
 //
 // Exit status: 0 when the simulation ran, 1 on a compile or lowering error,
 // 2 on a bad command line.
+#include <array>
 #include <atomic>
+#include <functional>
+#include <sstream>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -1181,7 +1184,294 @@ static void collectProgs(const Prog* p, std::vector<const Prog*>& all, std::unor
         for (auto* b : i.branches) collectProgs(b, all, seen);
     }
 }
+// Coverage access from SystemVerilog (20.13, 40.3.2): $coverage_control,
+// $coverage_get_max, $coverage_get, $coverage_save and $coverage_merge.
+// Statement, toggle and FSM state coverage exist only with msim -cov;
+// assertion coverage (an assertion or cover with at least one success)
+// always does. A hierarchy is a list of instance paths below the top.
+namespace covapi {
+enum { START = 0, STOP = 1, RESET = 2, CHECK = 3, MODULE = 10, HIER = 11,
+       ASSERTION = 20, FSM_STATE = 21, STATEMENT = 22, TOGGLE = 23,
+       OVERFLOW = -2, ERROR = -1, NOCOV = 0, OK = 1, PARTIAL = 2 };
+struct Stmt { std::string scope; uint32_t file, line; std::vector<uint64_t*> hits; };
+const LowerResult* lw = nullptr;
+std::vector<Stmt> stmts;
+bool built = false;
+// Stopped items keep the values they had at the stop; START puts them back
+// (what ran while stopped is not counted), queries read them meanwhile.
+std::map<uint64_t*, uint64_t> stopStmt;
+std::map<int, std::pair<std::vector<uint64_t>, std::vector<uint64_t>>> stopTog;
+std::map<int, std::array<uint64_t, 3>> stopAssert;
+std::map<size_t, std::map<uint64_t, uint64_t>> stopFsm;
+
+void build() {
+    if (built) return;
+    built = true;
+    std::map<std::tuple<std::string, uint32_t, uint32_t>, size_t> at;
+    std::function<void(const Prog*, const std::string&, std::unordered_set<const Prog*>&)> walk =
+        [&](const Prog* p, const std::string& sc, std::unordered_set<const Prog*>& seen) {
+            if (!p || !seen.insert(p).second) return;
+            for (auto& i : p->code) {
+                if (i.line) {
+                    auto key = std::make_tuple(sc, i.file, i.line);
+                    auto it = at.find(key);
+                    if (it == at.end()) { it = at.emplace(key, stmts.size()).first; stmts.push_back({sc, i.file, i.line, {}}); }
+                    stmts[it->second].hits.push_back(const_cast<uint64_t*>(&i.hits));
+                }
+                for (auto* b : i.branches) walk(b, sc, seen);
+            }
+        };
+    for (auto& p : lw->procs) { std::unordered_set<const Prog*> seen; walk(&p.prog, p.scope, seen); }
+    for (auto& p : lw->finals) { std::unordered_set<const Prog*> seen; walk(&p.prog, p.scope, seen); }
+}
+// "top.u1.x" -> "u1": the instance below the top of a signal or assertion.
+std::string instOfSig(const std::string& n) {
+    int br = 0;
+    size_t cut = std::string::npos;
+    for (size_t k = 0; k < n.size(); k++) {
+        if (n[k] == '[') br++;
+        else if (n[k] == ']') br--;
+        else if (n[k] == '.' && !br) cut = k;
+    }
+    return cut == std::string::npos ? std::string() : n.substr(0, cut);
+}
+std::string belowTop(const std::string& inst) {
+    size_t d = inst.find('.');
+    return d == std::string::npos ? std::string() : inst.substr(d + 1);
+}
+struct Sel {
+    std::vector<std::string> paths;
+    bool all = false, hier = false, bad = false;
+    bool has(const std::string& sc) const {
+        if (all) return hier || sc.empty();
+        for (const auto& p : paths) {
+            if (sc == p) return true;
+            if (hier && (p.empty() || (sc.size() > p.size() && sc.compare(0, p.size(), p) == 0 && sc[p.size()] == '.'))) return true;
+        }
+        return false;
+    }
+};
+Sel selOf(int64_t scopeDef, const std::string& t) {
+    Sel s;
+    if (scopeDef != MODULE && scopeDef != HIER) { s.bad = true; return s; }
+    s.hier = scopeDef == HIER;
+    if (t == "\x01") { s.bad = true; return s; }
+    if (t == "*") { s.all = true; return s; }
+    size_t b = 0;
+    for (;;) {
+        size_t e = t.find('|', b);
+        s.paths.push_back(t.substr(b, e == std::string::npos ? std::string::npos : e - b));
+        if (e == std::string::npos) break;
+        b = e + 1;
+    }
+    return s;
+}
+bool available(int64_t type) {
+    if (type == ASSERTION) return true;
+    if (type == STATEMENT || type == TOGGLE || type == FSM_STATE) return g_cov;
+    return false;
+}
+bool knownType(int64_t type) { return type >= ASSERTION && type <= TOGGLE; }
+// Every coverable item of the type in the selection: f(covered) per item.
+// op: 0 count, 1 stop, 2 start, 3 reset.
+int64_t visit(int64_t type, const Sel& sel, int op, int64_t* covered) {
+    int64_t n = 0;
+    if (covered) *covered = 0;
+    if (type == STATEMENT) {
+        build();
+        for (auto& st : stmts) {
+            if (!sel.has(st.scope)) continue;
+            n++;
+            uint64_t h = 0;
+            for (uint64_t* c : st.hits) {
+                auto sit = stopStmt.find(c);
+                uint64_t v = sit != stopStmt.end() ? sit->second : *c;
+                h = std::max(h, v);
+                if (op == 1 && sit == stopStmt.end()) stopStmt[c] = *c;
+                if (op == 2 && sit != stopStmt.end()) { *c = sit->second; stopStmt.erase(sit); }
+                if (op == 3) { *c = 0; if (sit != stopStmt.end()) sit->second = 0; }
+            }
+            if (covered && h) ++*covered;
+        }
+    } else if (type == TOGGLE) {
+        for (size_t s = 0; s < S.sigs.size(); s++) {
+            const auto& g = S.sigs[s];
+            if (g.hide || g.name.find('$') != std::string::npos || !sel.has(instOfSig(g.name))) continue;
+            n += g.w;
+            if (S.togRise.size() < S.sigs.size()) { S.togRise.resize(S.sigs.size()); S.togFall.resize(S.sigs.size()); }
+            auto& R = S.togRise[s];
+            auto& F = S.togFall[s];
+            auto st = stopTog.find((int)s);
+            if (op == 1 && st == stopTog.end()) st = stopTog.emplace((int)s, std::make_pair(R, F)).first;
+            else if (op == 2 && st != stopTog.end()) { R = st->second.first; F = st->second.second; stopTog.erase(st); st = stopTog.end(); }
+            else if (op == 3) {
+                std::fill(R.begin(), R.end(), 0); std::fill(F.begin(), F.end(), 0);
+                if (st != stopTog.end()) { st->second.first.assign(st->second.first.size(), 0); st->second.second.assign(st->second.second.size(), 0); }
+            }
+            if (covered) {
+                const auto& r = st != stopTog.end() ? st->second.first : R;
+                const auto& f = st != stopTog.end() ? st->second.second : F;
+                for (size_t k = 0; k < r.size() && k < f.size(); k++) *covered += __builtin_popcountll(r[k] & f[k]);
+            }
+        }
+    } else if (type == ASSERTION) {
+        for (size_t id = 0; id < asserts().size(); id++) {
+            AssertInfo& a = asserts()[id];
+            if (a.hidden || a.prot || !sel.has(belowTop(a.inst))) continue;
+            n++;
+            auto st = stopAssert.find((int)id);
+            if (op == 1 && st == stopAssert.end()) st = stopAssert.emplace((int)id, std::array<uint64_t, 3>{a.evals, a.passes, a.fails}).first;
+            else if (op == 2 && st != stopAssert.end()) { a.evals = st->second[0]; a.passes = st->second[1]; a.fails = st->second[2]; stopAssert.erase(st); st = stopAssert.end(); }
+            else if (op == 3) { a.evals = a.passes = a.fails = 0; if (st != stopAssert.end()) st->second = {0, 0, 0}; }
+            if (covered && (st != stopAssert.end() ? st->second[1] : a.passes)) ++*covered;
+        }
+    } else if (type == FSM_STATE) {
+        for (size_t k = 0; k < fsmDefs().size(); k++) {
+            const FsmDef& d = fsmDefs()[k];
+            if (!sel.has(belowTop(d.inst)) && !sel.has(d.inst)) continue;
+            n += (int64_t)d.states.size();
+            if (S.fsmSeen.size() <= k) continue;
+            auto& seen = S.fsmSeen[k];
+            auto st = stopFsm.find(k);
+            if (op == 1 && st == stopFsm.end()) st = stopFsm.emplace(k, seen).first;
+            else if (op == 2 && st != stopFsm.end()) { seen = st->second; stopFsm.erase(st); st = stopFsm.end(); }
+            else if (op == 3) { seen.clear(); if (st != stopFsm.end()) st->second.clear(); }
+            if (covered) {
+                const auto& m = st != stopFsm.end() ? st->second : seen;
+                for (auto& [v, nm] : d.states) if (m.count(v)) ++*covered;
+            }
+        }
+    }
+    return n;
+}
+// Put stopped items back as they were at the stop, before the database is written.
+void restoreStopped() {
+    for (auto& [c, v] : stopStmt) *c = v;
+    for (auto& [s, rf] : stopTog) if ((size_t)s < S.togRise.size()) { S.togRise[(size_t)s] = rf.first; S.togFall[(size_t)s] = rf.second; }
+    for (auto& [id, a] : stopAssert) { asserts()[(size_t)id].evals = a[0]; asserts()[(size_t)id].passes = a[1]; asserts()[(size_t)id].fails = a[2]; }
+    for (auto& [k, m] : stopFsm) if (k < S.fsmSeen.size()) S.fsmSeen[k] = m;
+}
+Val ret(int64_t v) {
+    if (v > INT32_MAX) v = OVERFLOW;
+    return make((uint64_t)v, 0, 32, 0, true);
+}
+std::string dbPath(const std::string& name) { return name + ".mcovsave"; }
+Val hook(int op, const std::vector<Val>& a) {
+    auto num = [&](size_t k) -> int64_t { return k < a.size() && !a[k].x ? v_to_i64(a[k]) : -1000; };
+    auto str = [&](size_t k) { if (k >= a.size()) return std::string(); Val v = a[k]; v.str = true; return v_str(v); };
+    if (op == 0) {   // $coverage_control
+        int64_t ctl = num(0), type = num(1);
+        Sel sel = selOf(num(2), str(3));
+        if (sel.bad || ctl < START || ctl > CHECK || !knownType(type)) return ret(ERROR);
+        if (!available(type)) return ret(ctl == STOP || ctl == RESET ? OK : NOCOV);
+        int64_t n = visit(type, sel, ctl == STOP ? 1 : ctl == START ? 2 : ctl == RESET ? 3 : 0, nullptr);
+        if ((ctl == CHECK || ctl == START) && n == 0) return ret(NOCOV);
+        return ret(OK);
+    }
+    if (op == 1 || op == 2) {   // $coverage_get_max / $coverage_get
+        int64_t type = num(0);
+        Sel sel = selOf(num(1), str(2));
+        if (sel.bad || !knownType(type)) return ret(ERROR);
+        if (!available(type)) return ret(NOCOV);
+        int64_t cov = 0;
+        int64_t n = visit(type, sel, 0, &cov);
+        return ret(op == 1 ? n : cov);
+    }
+    int64_t type = num(0);
+    std::string name = str(1);
+    if (!knownType(type) || name.empty()) return ret(ERROR);
+    Sel everything;
+    everything.all = everything.hier = true;
+    if (op == 3) {   // $coverage_save: the counts of every item of the type
+        if (!available(type)) return ret(NOCOV);
+        std::ofstream f(dbPath(name));
+        if (!f) return ret(ERROR);
+        f << "msim-covsave 1 " << type << "\n";
+        if (type == STATEMENT) {
+            build();
+            for (auto& st : stmts) {
+                uint64_t h = 0;
+                for (uint64_t* c : st.hits) { auto it = stopStmt.find(c); h = std::max(h, it != stopStmt.end() ? it->second : *c); }
+                f << "S " << (st.scope.empty() ? "." : st.scope) << " " << (st.file < g_covFiles.size() ? g_covFiles[st.file] : "?") << " " << st.line << " " << h << "\n";
+            }
+        } else if (type == TOGGLE) {
+            for (size_t s = 0; s < S.sigs.size() && s < S.togRise.size(); s++) {
+                auto st = stopTog.find((int)s);
+                const auto& r = st != stopTog.end() ? st->second.first : S.togRise[s];
+                const auto& fl = st != stopTog.end() ? st->second.second : S.togFall[s];
+                if (r.empty()) continue;
+                f << "T " << S.sigs[s].name;
+                for (size_t k = 0; k < r.size(); k++) f << " " << r[k] << " " << (k < fl.size() ? fl[k] : 0);
+                f << "\n";
+            }
+        } else if (type == ASSERTION) {
+            for (size_t id = 0; id < asserts().size(); id++) {
+                const AssertInfo& as = asserts()[id];
+                if (as.hidden || as.prot) continue;
+                auto st = stopAssert.find((int)id);
+                f << "A " << as.name << " " << (st != stopAssert.end() ? st->second[1] : as.passes) << "\n";
+            }
+        } else {
+            for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++)
+                for (auto& [v, c] : S.fsmSeen[k]) f << "F " << fsmDefs()[k].inst << "." << fsmDefs()[k].name << " " << v << " " << c << "\n";
+        }
+        return ret(f ? OK : ERROR);
+    }
+    // $coverage_merge: add the saved counts to this run's
+    std::ifstream f(dbPath(name));
+    std::string magic;
+    int ver = 0;
+    int64_t savedType = 0;
+    if (!f || !(f >> magic >> ver >> savedType) || magic != "msim-covsave") return ret(ERROR);
+    if (savedType != type) return ret(NOCOV);
+    if (!available(type)) return ret(NOCOV);
+    std::string kind, key;
+    if (type == STATEMENT) {
+        build();
+        std::string sc, file;
+        uint32_t line;
+        uint64_t h;
+        while (f >> kind >> sc >> file >> line >> h) {
+            if (sc == ".") sc.clear();
+            for (auto& st : stmts)
+                if (st.scope == sc && st.line == line && st.file < g_covFiles.size() && g_covFiles[st.file] == file && !st.hits.empty())
+                    *st.hits[0] += h;
+        }
+    } else if (type == TOGGLE) {
+        std::unordered_map<std::string, size_t> byName;
+        for (size_t s = 0; s < S.sigs.size(); s++) byName.emplace(S.sigs[s].name, s);
+        std::string line;
+        std::getline(f, line);
+        while (std::getline(f, line)) {
+            std::istringstream ls(line);
+            if (!(ls >> kind >> key)) continue;
+            auto it = byName.find(key);
+            if (it == byName.end()) continue;
+            size_t s = it->second;
+            if (S.togRise.size() < S.sigs.size()) { S.togRise.resize(S.sigs.size()); S.togFall.resize(S.sigs.size()); }
+            auto& R = S.togRise[s];
+            auto& F = S.togFall[s];
+            size_t words = (size_t)(S.sigs[s].w + 63) / 64;
+            if (R.size() < words) { R.resize(words, 0); F.resize(words, 0); }
+            uint64_t r, fl;
+            for (size_t k = 0; k < words && (ls >> r >> fl); k++) { R[k] |= r; F[k] |= fl; }
+        }
+    } else if (type == ASSERTION) {
+        uint64_t p;
+        while (f >> kind >> key >> p)
+            for (auto& as : asserts()) if (as.name == key) as.passes += p;
+    } else {
+        uint64_t v, c;
+        while (f >> kind >> key >> v >> c)
+            for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++)
+                if (fsmDefs()[k].inst + "." + fsmDefs()[k].name == key) S.fsmSeen[k][v] += c;
+    }
+    return ret(OK);
+}
+}  // namespace covapi
+
 static bool writeCoverage(const std::string& path, const LowerResult& lw, const std::string& top) {
+    covapi::restoreStopped();   // a coverage_control STOP still in force (40.3.2.1)
     std::vector<const Prog*> progs;
     std::unordered_set<const Prog*> seen;
     for (auto& p : lw.procs) collectProgs(&p.prog, progs, seen);
@@ -1189,15 +1479,33 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     for (auto& p : lw.subs) collectProgs(p.get(), progs, seen);
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> lines;            // (file, line) -> hits
     std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint64_t, uint64_t>>> branches;
-    for (const Prog* p : progs)
+    // The same per module instance (Prog::covInst): its own line hits, and
+    // which of the decisions of a line are its own (n as in "branches").
+    struct InstCov {
+        std::map<std::pair<uint32_t, uint32_t>, uint64_t> lines;
+        std::vector<std::array<uint64_t, 5>> branches;       // file, line, n, true, false
+        std::map<size_t, std::vector<uint64_t>> conds;       // index in "conditions" -> hits
+    };
+    std::vector<InstCov> insts(g_covInsts.size());
+    for (const Prog* p : progs) {
+        InstCov* ic = p->covInst && p->covInst < insts.size() ? &insts[p->covInst] : nullptr;
         for (auto& i : p->code) {
             if (!i.line) continue;
             auto key = std::make_pair(i.file, i.line);
             auto& h = lines[key];
             h = std::max(h, i.hits);
+            if (ic) {
+                auto& ih = ic->lines[key];
+                ih = std::max(ih, i.hits);
+            }
             // A JmpIfNot is a two-way decision: true = fell through, false = jumped.
-            if (i.k == IK::JmpIfNot) branches[key].push_back({i.hits - i.taken, i.taken});
+            if (i.k == IK::JmpIfNot) {
+                auto& v = branches[key];
+                if (ic) ic->branches.push_back({i.file, i.line, v.size(), i.hits - i.taken, i.taken});
+                v.push_back({i.hits - i.taken, i.taken});
+            }
         }
+    }
     std::ofstream f(path);
     if (!f) return false;
     f << "{\n \"format\": \"msim-cov\", \"version\": 1, \"tool\": \"msim " MINISIM_VERSION "\", \"top\": " << jstr(top)
@@ -1240,19 +1548,22 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     }
     // Conditions (a && b, a || b, the condition of ?:): per source position,
     // the hits of each vector, summed over the instances of the module.
-    struct CondSum { const CondDef* d; std::vector<uint64_t> hits; };
+    struct CondSum { const CondDef* d; std::vector<uint64_t> hits; size_t index = 0; };
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, std::string>, CondSum> conds;
     for (auto& d : condDefs()) {
         auto& c = conds[{d.file, d.line, d.col, d.text}];
-        if (!c.d) { c.d = &d; c.hits.assign(d.terms.size() + 1, 0); }
-        if (c.d->terms.size() != d.terms.size()) continue;
-        for (size_t k = 0; k <= d.terms.size(); k++) c.hits[k] += g_condHits[d.base + k];
+        if (!c.d) { c.d = &d; c.hits.assign(d.counters(), 0); }
+        if (c.d->counters() != d.counters()) continue;
+        for (size_t k = 0; k < d.counters(); k++) c.hits[k] += g_condHits[d.base + k];
     }
     f << "\n ],\n \"conditions\": [";
     first = true;
     for (auto& [key, c] : conds) {
         f << (first ? "\n  " : ",\n  ") << "[" << c.d->file << ", " << c.d->line << ", " << c.d->col << ", "
-          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? (c.d->lazy ? "\"||s\"" : "\"||\"") : c.d->lazy ? "\"&&s\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
+          << (c.d->terms.size() == 1 ? std::string("\"?:\"")
+              : "\"" + std::string(c.d->bitwise ? (c.d->isOr ? "|" : "&") : (c.d->isOr ? "||" : "&&")) +
+                    (c.d->lazy ? "s" : c.d->full ? "f" : "") + "\"")
+          << ", " << jstr(c.d->text) << ", [";
         for (size_t k = 0; k < c.d->terms.size(); k++) f << (k ? ", " : "") << jstr(c.d->terms[k]);
         f << "], [";
         for (size_t k = 0; k < c.hits.size(); k++) f << (k ? ", " : "") << c.hits[k];
@@ -1289,6 +1600,47 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
             f2 = false;
         }
         f << "]}";
+        first = false;
+    }
+    // Per instance: [path, module, lines [file, line, hits], branches [file,
+    // line, n, true, false], conditions [index in "conditions", hits]].
+    {
+        size_t ci = 0;
+        for (auto& [key, c] : conds) c.index = ci++;
+        for (auto& d : condDefs()) {
+            if (!d.inst || d.inst >= insts.size()) continue;
+            const CondSum& c = conds[{d.file, d.line, d.col, d.text}];
+            if (d.counters() != c.d->counters()) continue;
+            auto& h = insts[d.inst].conds[c.index];
+            h.resize(d.counters(), 0);
+            for (size_t k = 0; k < d.counters(); k++) h[k] += g_condHits[d.base + k];
+        }
+    }
+    f << "\n ],\n \"instances\": [";
+    first = true;
+    for (size_t k = 1; k < insts.size(); k++) {
+        const InstCov& ic = insts[k];
+        f << (first ? "\n  " : ",\n  ") << "[" << jstr(g_covInsts[k].path.empty() ? top : top + "." + g_covInsts[k].path) << ", "
+          << jstr(g_covInsts[k].module) << ", [";
+        bool f2 = true;
+        for (auto& [key, h] : ic.lines) {
+            f << (f2 ? "" : ", ") << "[" << key.first << ", " << key.second << ", " << h << "]";
+            f2 = false;
+        }
+        f << "], [";
+        for (size_t j = 0; j < ic.branches.size(); j++) {
+            auto& b = ic.branches[j];
+            f << (j ? ", " : "") << "[" << b[0] << ", " << b[1] << ", " << b[2] << ", " << b[3] << ", " << b[4] << "]";
+        }
+        f << "], [";
+        f2 = true;
+        for (auto& [ci, h] : ic.conds) {
+            f << (f2 ? "" : ", ") << "[" << ci << ", [";
+            for (size_t j = 0; j < h.size(); j++) f << (j ? ", " : "") << h[j];
+            f << "]]";
+            f2 = false;
+        }
+        f << "]]";
         first = false;
     }
     f << "\n ],\n";
@@ -1386,6 +1738,8 @@ static void usage() {
                  "                 elements each (default 1024) to the VCD or FST, as mem[3]\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov. -cm <metrics> (as VCS) does the same\n"
+                 "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
+                 "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
                  "  -i             interactive: run, step, stop on a signal, print (signals and class objects),\n"
                  "                 force, release, deposit; commands on the standard input (help lists them)\n"
@@ -1563,6 +1917,21 @@ int main(int argc, char** argv) {
         if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
             g_cov = true;
             ++i;
+            continue;
+        }
+        if (a == "-cm_cond" && i + 1 < argc) {   // VCS: -cm_cond full+allops (std / basic: the default)
+            std::string_view v = argv[++i];
+            while (!v.empty()) {
+                size_t p = v.find('+');
+                std::string_view w = v.substr(0, p);
+                if (w == "full") g_condFull = true;
+                else if (w == "allops") g_condAllops = true;
+                else if (w != "std" && w != "basic") {
+                    std::cerr << "msim: -cm_cond: unknown mode '" << w << "' (full, allops, std)\n";
+                    return 2;
+                }
+                v = p == std::string_view::npos ? std::string_view() : v.substr(p + 1);
+            }
             continue;
         }
         // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.
@@ -2076,6 +2445,8 @@ int main(int argc, char** argv) {
         partitionInputs(lowered, pl, po, pi, pt);
         S.buildPartitions(po, pi, pt);
     }
+    covapi::lw = &lowered;
+    g_covApiHook = covapi::hook;   // 20.13
     if (interactiveMode) {   // msim -i: commands drive the run (interactive.inc)
         interactive::Session ses;
         ses.comp = comp.get();
