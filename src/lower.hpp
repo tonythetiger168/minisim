@@ -1772,6 +1772,11 @@ struct Lowerer {
                 return nullptr;
             }
         }
+        if (sym->flags.has(MethodFlags::InterfaceExtern))   // extern task of an interface: the module that exports it (25.7)
+            if (const auto* pr = sym->getPrototype(); pr && pr->getFirstExternImpl()) {
+                if (pr->getFirstExternImpl()->getNextImpl()) unsupported("extern forkjoin task with more than one export");
+                sym = pr->getFirstExternImpl()->impl;
+            }
         auto it = subs->find(sym);
         if (it == subs->end()) {
             auto sk = skippedSubs().find(sym);
@@ -3141,8 +3146,17 @@ struct Lowerer {
         }
         return nullptr;
     }
+    // A modport port with an expression (.P(r[3:0]), 25.5.4): that expression.
+    static const slang::ast::Expression* modportConn(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) return nullptr;
+        const Symbol& s = e.as<ValueExpressionBase>().symbol;
+        if (s.kind != SymbolKind::ModportPort) return nullptr;
+        return s.as<ModportPortSymbol>().explicitConnection;
+    }
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
+        if (const Expression* c = modportConn(e)) return expr(*c, ctx);
         if (e.kind == ExpressionKind::NamedValue && !labelled().empty())   // a LABEL'd specparam (32.4.3)
             if (auto lv = labelled().find(&e.as<NamedValueExpression>().symbol); lv != labelled().end()) {
                 if (e.type->isFloating()) return konst(mkreal(lv->second));
@@ -5098,6 +5112,7 @@ struct Lowerer {
     // Fill i.sig (+ i.hi/i.lo for partial writes) from an assignment target.
     void lhs(const slang::ast::Expression& e, Instr& i) {
         using namespace slang::ast;
+        if (const Expression* c = modportConn(e)) { lhs(*c, i); return; }   // a modport expression (25.5.4)
         switch (e.kind) {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {
@@ -5186,7 +5201,7 @@ struct Lowerer {
             if (classMember(s.expr) || vifAccess(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x), @(v.x)
             else if (ValueExpressionBase::isKind(s.expr.kind) && eventPtr().count(&s.expr.as<ValueExpressionBase>().symbol))
                 sig = eventSig(s.expr);   // an event that may be an alias (6.17)
-            else if (ValueExpressionBase::isKind(s.expr.kind)) {
+            else if (ValueExpressionBase::isKind(s.expr.kind) && !modportConn(s.expr)) {
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
             } else {
                 // @(posedge clk[i]), @(a & b): wait on a signal that a
@@ -7737,7 +7752,9 @@ struct Lowerer {
         int w = (int)a.left().type->getBitWidth();
         needWidth(w);
         std::vector<std::tuple<const Expression*, int, int>> parts;
-        concatParts(a.left(), w - 1, parts);
+        const Expression* tgt = &a.left();
+        if (const Expression* c = modportConn(peel(*tgt))) tgt = c;   // .W({a, b}) (25.5.4)
+        concatParts(*tgt, w - 1, parts);
         int tmp = fresh(w);
         Instr hold; hold.k = IK::Assign; hold.sig = tmp;
         const Expression* saved = lvalue;
@@ -7859,7 +7876,8 @@ struct Lowerer {
             if (a.left().type->isUnpackedArray() && !a.timingControl && !a.isCompound() &&
                 assignWholeArray(a.left(), a.right(), a.isNonBlocking()))
                 return;
-            if (peel(a.left()).kind == ExpressionKind::Concatenation) {
+            if (const Expression* mc = modportConn(peel(a.left()));
+                peel(mc ? *mc : a.left()).kind == ExpressionKind::Concatenation) {
                 concatAssign(a);
                 return;
             }
@@ -9135,6 +9153,12 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         visitDefault(sub);
         inMethod -= m;
     }
+    // extern task t in an interface (25.7): the module task that exports it
+    // is not a member of any scope; its variables are registered here.
+    void handle(const slang::ast::MethodPrototypeSymbol& p) {
+        visitDefault(p);
+        for (auto* x = p.getFirstExternImpl(); x; x = x->getNextImpl()) x->impl->visit(*this);
+    }
     void handle(const slang::ast::ClassType& c) {
         std::string saved = prefix;
         prefix += std::string(c.name) + "::";
@@ -9178,8 +9202,11 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     void aliasModports() {
         for (const auto* m : modportPorts) {
-            if (m->explicitConnection) Lowerer::unsupported("modport expression (25.5.4)");
             const slang::ast::Symbol* in = m->internalSymbol;
+            if (m->explicitConnection) {   // .P(r) names r; .P(r[3:0]) and others are lowered where used (25.5.4)
+                const auto& c = Lowerer::peel(*m->explicitConnection);
+                in = slang::ast::ValueExpressionBase::isKind(c.kind) ? &c.as<slang::ast::ValueExpressionBase>().symbol : nullptr;
+            }
             if (!in) continue;
             if (auto it = sigmap.find(in); it != sigmap.end()) sigmap[m] = it->second;
             if (auto it = arrMap().find(in); it != arrMap().end()) arrMap()[m] = it->second;
@@ -11260,6 +11287,14 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 spec.visit(finder);
         else if (m.kind == slang::ast::SymbolKind::ClassType && (m.name == "semaphore" || m.name == "process"))
             m.visit(finder);
+    // A task an interface declares extern and a module exports (25.7): the
+    // module's body, which is not a member of any scope.
+    for (size_t k = 0, n = finder.found.size(); k < n; k++)
+        if (finder.found[k]->flags.has(slang::ast::MethodFlags::InterfaceExtern))
+            if (const auto* pr = finder.found[k]->getPrototype())
+                for (auto* x = pr->getFirstExternImpl(); x; x = x->getNextImpl())
+                    if (std::find(finder.found.begin(), finder.found.end(), x->impl.get()) == finder.found.end())
+                        finder.found.push_back(x->impl.get());
     // Every interface instance gets its virtual interface number (25.9).
     {
         struct IfInst : slang::ast::ASTVisitor<IfInst> {
