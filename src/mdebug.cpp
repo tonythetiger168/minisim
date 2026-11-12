@@ -19,10 +19,17 @@
 // changed, combinational logic at that time.
 #include <climits>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <arpa/inet.h>
+#include <csignal>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include "fsm_extract.hpp"
 #include "lintir.hpp"
 #include "slang/ast/expressions/ConversionExpression.h"
 #include "slang/ast/expressions/LiteralExpressions.h"
@@ -32,7 +39,9 @@
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/types/AllTypes.h"
+#include "slang/syntax/AllSyntax.h"
 #include "parallel.hpp"
+#include "upf.hpp"
 #include "version.hpp"
 #include "wave_reader.hpp"
 
@@ -151,8 +160,100 @@ struct ScopeRec {
     SourceLocation inst;                  // where it is instantiated
 };
 
+// A small JSON reader, enough for msim's coverage database.
+struct JVal {
+    enum K { Null, Num, Str, Arr, Obj } k = Null;
+    double n = 0;
+    std::string s;
+    std::vector<JVal> a;
+    std::vector<std::pair<std::string, JVal>> o;
+    const JVal* get(const std::string& key) const {
+        for (auto& [kk, v] : o) if (kk == key) return &v;
+        return nullptr;
+    }
+};
+struct JReader {
+    const std::string& t;
+    size_t p = 0;
+    bool bad = false;
+    void ws() { while (p < t.size() && (t[p] == ' ' || t[p] == '\n' || t[p] == '\r' || t[p] == '\t')) p++; }
+    std::string str() {
+        std::string o;
+        p++;
+        while (p < t.size() && t[p] != '"') {
+            if (t[p] == '\\' && p + 1 < t.size()) {
+                char c = t[++p];
+                if (c == 'n') o += '\n';
+                else if (c == 't') o += '\t';
+                else if (c == 'u' && p + 4 < t.size()) { o += (char)std::strtoul(t.substr(p + 1, 4).c_str(), nullptr, 16); p += 4; }
+                else o += c;
+            } else o += t[p];
+            p++;
+        }
+        p++;
+        return o;
+    }
+    JVal val() {
+        JVal v;
+        ws();
+        if (p >= t.size()) { bad = true; return v; }
+        char c = t[p];
+        if (c == '"') { v.k = JVal::Str; v.s = str(); }
+        else if (c == '[') {
+            v.k = JVal::Arr;
+            p++;
+            for (ws(); p < t.size() && t[p] != ']'; ws()) {
+                v.a.push_back(val());
+                ws();
+                if (p < t.size() && t[p] == ',') p++;
+                else if (p >= t.size() || t[p] != ']') { bad = true; break; }
+                if (bad) break;
+            }
+            p++;
+        } else if (c == '{') {
+            v.k = JVal::Obj;
+            p++;
+            for (ws(); p < t.size() && t[p] != '}'; ws()) {
+                if (t[p] != '"') { bad = true; break; }
+                std::string key = str();
+                ws();
+                if (p >= t.size() || t[p] != ':') { bad = true; break; }
+                p++;
+                v.o.emplace_back(std::move(key), val());
+                ws();
+                if (p < t.size() && t[p] == ',') p++;
+                else if (p >= t.size() || t[p] != '}') { bad = true; break; }
+                if (bad) break;
+            }
+            p++;
+        } else if (c == '-' || (c >= '0' && c <= '9')) {
+            v.k = JVal::Num;
+            char* e = nullptr;
+            v.n = std::strtod(t.c_str() + p, &e);
+            p = e - t.c_str();
+        } else if (t.compare(p, 4, "true") == 0) { v.k = JVal::Num; v.n = 1; p += 4; }
+        else if (t.compare(p, 5, "false") == 0) { v.k = JVal::Num; p += 5; }
+        else if (t.compare(p, 4, "null") == 0) p += 4;
+        else bad = true;
+        return v;
+    }
+};
+
+// An assert, assume or cover directive of the design.
+struct AssertRec {
+    std::string name;                     // tb.u.a_gnt, or tb.u.<file>:<line> without a label
+    std::string kind;                     // "assert property", "assert", "cover property" ...
+    SourceLocation loc;
+    SourceRange range;
+    bool concurrent = false;
+    std::vector<const Symbol*> reads;     // the signals it looks at, clock first when it has one
+    const Symbol* clock = nullptr;
+    EdgeKind edge = EdgeKind::None;
+};
+
 struct DB {
     Sources src;
+    std::vector<AssertRec> asserts;
     std::vector<ScopeRec> scopes;
     std::vector<const ValueSymbol*> signals;
     std::unordered_map<const Symbol*, int> sigIx;
@@ -623,6 +724,59 @@ struct Collect : ASTVisitor<Collect> {
         w.walk(sub.getBody());
     }
 
+    // The assertions written in (or as) a procedure.
+    void assertions(const ProceduralBlockSymbol& p, const Statement& body) {
+        const Scope* sc = p.getParentScope();
+        std::string scope;
+        if (sc) scope = path(sc->asSymbol());
+        auto start = [&](const Statement& st, AssertionKind k, const char* what) {
+            AssertRec a;
+            a.loc = st.sourceRange.start();
+            a.range = st.sourceRange;
+            a.kind = std::string(k == AssertionKind::Assume ? "assume" : k == AssertionKind::CoverProperty || k == AssertionKind::CoverSequence ? "cover"
+                               : k == AssertionKind::Restrict ? "restrict" : k == AssertionKind::Expect ? "expect" : "assert") + what;
+            std::string label;
+            if (st.syntax && slang::syntax::StatementSyntax::isKind(st.syntax->kind))
+                if (auto* l = st.syntax->as<slang::syntax::StatementSyntax>().label) label = std::string(l->name.valueText());
+            if (label.empty()) {
+                Where w = db.src.where(a.loc);
+                std::string f = w.file < 0 ? "?" : db.src.files[w.file].name;
+                label = f.substr(f.find_last_of('/') + 1) + ":" + std::to_string(w.line);
+            }
+            a.name = scope.empty() ? label : scope + "." + label;
+            return a;
+        };
+        body.visit(makeVisitor(
+            [&](auto&, const ConcurrentAssertionStatement& st) {
+                AssertRec a = start(st, st.assertionKind, " property");
+                a.concurrent = true;
+                auto names = makeVisitor(
+                    [&](auto& v, const ClockingAssertionExpr& c) {
+                        std::vector<const SignalEventControl*> evs;
+                        clocksOf(c.clocking, evs);
+                        if (!a.clock && !evs.empty()) {
+                            std::vector<const Symbol*> ck;
+                            namesIn(evs[0]->expr, ck);
+                            if (ck.size() == 1) { a.clock = ck[0]; a.edge = evs[0]->edge; }
+                        }
+                        v.visitDefault(c);
+                    },
+                    [&](auto&, const NamedValueExpression& e) {
+                        if (std::find(a.reads.begin(), a.reads.end(), &e.symbol) == a.reads.end()) a.reads.push_back(&e.symbol);
+                    },
+                    [&](auto&, const HierarchicalValueExpression& e) {
+                        if (std::find(a.reads.begin(), a.reads.end(), &e.symbol) == a.reads.end()) a.reads.push_back(&e.symbol);
+                    });
+                st.propertySpec.visit(names);
+                db.asserts.push_back(std::move(a));
+            },
+            [&](auto&, const ImmediateAssertionStatement& st) {
+                AssertRec a = start(st, st.assertionKind, st.isDeferred ? (st.isFinal ? " final" : " #0") : "");
+                namesIn(st.cond, a.reads);
+                db.asserts.push_back(std::move(a));
+            }));
+    }
+
     void handle(const ProceduralBlockSymbol& p) {
         Walker w{db, {}, {}};
         switch (p.procedureKind) {
@@ -635,6 +789,7 @@ struct Collect : ASTVisitor<Collect> {
         }
         w.proto.block = nblock++;
         const Statement& body = p.getBody();
+        assertions(p, body);
         if (body.kind == StatementKind::Timed && w.proto.kind != "initial") {
             const auto& t = body.as<TimedStatement>();
             std::vector<const SignalEventControl*> evs;
@@ -937,6 +1092,8 @@ struct Tool {
         Where w = db.src.where(d.loc);
         std::string s = db.src.at(w) + ": " + text(d) + "  [" + label(d) + "]";
         if (std::string c = when(d); !c.empty()) s += "  when " + c;
+        // With a coverage database: whether this line ever ran.
+        if (auto h = hitsOf(w)) s += *h ? "  (line ran " + std::to_string(*h) + (*h == 1 ? " time)" : " times)") : "  (line never ran)";
         return s;
     }
 
@@ -1153,6 +1310,15 @@ struct Tool {
         std::cout << pad << name << " = " << (ci < 0 ? "x" : showBits(plo >= 0 ? part(ci) : w->bits(ci))) << " @" << t;
         if (tc != t) std::cout << "  (since " << tc << ")";
         std::cout << "\n";
+        if (std::string pn = powerNote(path(*s), t); !pn.empty()) std::cout << pad << "  " << pn << "\n";
+        // Unknown since its domain lost power: that is the cause, not an assignment.
+        if (haveUpf && ci >= 0 && w->bits(ci).find('x') != std::string::npos) {
+            auto [st, since] = simstateAt(domainOfSignal(path(*s)), t);
+            if (!st.empty() && st != "NORMAL" && tc >= since) {
+                std::cout << pad << "  x because the domain has no power: no assignment made this value\n";
+                return;
+            }
+        }
         auto it = db.driversOf.find(s);
         if (it == db.driversOf.end()) { std::cout << pad << "  no driver: an input or a testbench value\n"; return; }
         if (!seen.insert({s, tc, plo < 0 ? elem : elem + "#" + std::to_string(plo) + ":" + std::to_string(pw)}).second) { std::cout << pad << "  (shown above)\n"; return; }
@@ -1465,6 +1631,893 @@ struct Tool {
         }
         return o + "]";
     }
+    // -------------------------------------------------------------- FSMs
+    // State machines come from the shared extractor (src/fsm_extract.hpp),
+    // the one msim -cov and mlint use.
+    std::vector<ExtractedFsm> fsms;
+
+    static std::string stateName(const ExtractedFsm& f, uint64_t v) {
+        for (auto& [val, name] : f.states)
+            if (val == v) return name.empty() || std::isdigit((unsigned char)name[0]) ? std::to_string(v) : name;
+        return std::to_string(v);
+    }
+    static bool isState(const ExtractedFsm& f, uint64_t v) {
+        for (auto& st : f.states) if (st.first == v) return true;
+        return false;
+    }
+    // The register's values in the waveform: (time, value) with unknown = ~0.
+    std::vector<std::pair<uint64_t, uint64_t>> stateSeq(const ExtractedFsm& f) {
+        std::vector<std::pair<uint64_t, uint64_t>> seq;
+        const Wave* w = haveVcd && f.var ? vcd.find(path(*f.var)) : nullptr;
+        if (!w) return seq;
+        for (size_t i = 0; i < w->ch.size(); i++) {
+            const std::string b = w->bits((int)i);
+            uint64_t v = 0;
+            bool unk = b.size() > 64;
+            for (char c : b) { if (c != '0' && c != '1') unk = true; v = (v << 1) | (c == '1'); }
+            seq.push_back({w->ch[i].t, unk ? ~0ull : v});
+        }
+        return seq;
+    }
+
+    // -fsm [NAME]: the state machines under an instance (or one register):
+    // states, transitions and where they are written; with a waveform, the
+    // state at -at T, how often each transition ran, the ones that never did
+    // and any value that is not a state.
+    bool fsm(const std::string& name, std::optional<uint64_t> at) {
+        bool any = false;
+        for (const ExtractedFsm& f : fsms) {
+            if (!f.var || f.states.empty()) continue;
+            const std::string reg = path(*f.var);
+            if (!name.empty() && reg != name && reg.rfind(name + ".", 0) != 0) continue;
+            any = true;
+            std::cout << reg << "  (" << f.module << ", " << f.w << " bit" << (f.w == 1 ? "" : "s") << ", " << f.states.size()
+                      << " states" << (f.onehot ? ", one-hot" : "") << ")  " << db.src.at(db.src.where(f.var->location)) << "\n";
+            std::cout << "  states:";
+            for (auto& [v, n] : f.states) {
+                bool rst = std::find(f.resetStates.begin(), f.resetStates.end(), v) != f.resetStates.end();
+                // A name that is a literal (2'h1) says no more than the value.
+                bool lit = n.empty() || std::isdigit((unsigned char)n[0]);
+                std::cout << " " << (lit ? std::to_string(v) : n + "=" + std::to_string(v)) << (rst ? "(reset)" : "");
+            }
+            std::cout << "\n";
+            auto seq = stateSeq(f);
+            const Wave* w = haveVcd ? vcd.find(reg) : nullptr;
+            // Transitions seen: from -> to, count and first time.
+            std::map<std::pair<uint64_t, uint64_t>, std::pair<size_t, uint64_t>> seen;
+            std::map<uint64_t, size_t> visits;
+            for (size_t i = 0; i < seq.size(); i++) {
+                if (seq[i].second == ~0ull) continue;
+                visits[seq[i].second]++;
+                if (i && seq[i - 1].second != ~0ull) {
+                    auto [it, fresh] = seen.try_emplace({seq[i - 1].second, seq[i].second}, 0, seq[i].first);
+                    it->second.first++;
+                }
+            }
+            std::set<std::pair<uint64_t, uint64_t>> known;
+            for (const auto& t : f.trans) {
+                if (t.from == t.to || !known.insert({t.from, t.to}).second) continue;
+                std::cout << "  " << stateName(f, t.from) << " -> " << stateName(f, t.to) << "  "
+                          << db.src.at(db.src.where(t.loc)) << (t.reset ? "  (reset)" : "");
+                if (w) {
+                    auto it = seen.find({t.from, t.to});
+                    if (it == seen.end()) std::cout << "  never taken";
+                    else std::cout << "  taken " << it->second.first << (it->second.first == 1 ? " time" : " times") << ", first @" << it->second.second;
+                }
+                std::cout << "\n";
+            }
+            if (!w) {
+                if (haveVcd) std::cout << "  (not in the waveform)\n";
+                continue;
+            }
+            for (auto& [k, v] : seen)
+                if (!known.count(k))
+                    std::cout << "  " << stateName(f, k.first) << " -> " << stateName(f, k.second) << "  taken " << v.first
+                              << (v.first == 1 ? " time" : " times") << ", first @" << v.second
+                              << (isState(f, k.first) && isState(f, k.second) ? "  (not a transition found in the source)\n" : "  (a value that is not a state)\n");
+            for (auto& [v, n] : f.states)
+                if (!visits.count(v)) std::cout << "  state " << (n.empty() ? std::to_string(v) : n) << " never entered\n";
+            for (auto& [t, v] : seq)
+                if (v != ~0ull && !isState(f, v)) { std::cout << "  value " << v << " @" << t << " is not a state\n"; break; }
+            uint64_t t = at ? *at : vcd.end;
+            int ci = w->at(t);
+            if (ci >= 0) {
+                uint64_t v = seq[ci].second;
+                std::cout << "  @" << t << ": " << (v == ~0ull ? std::string("x") : stateName(f, v)) << "  (since " << seq[ci].first << ")";
+                // The road to it: the last states before.
+                int from = std::max(0, ci - 5);
+                std::cout << "  after";
+                for (int i = from; i < ci; i++)
+                    std::cout << " " << (seq[i].second == ~0ull ? std::string("x") : stateName(f, seq[i].second)) << "@" << seq[i].first;
+                if (from == ci) std::cout << " nothing";
+                std::cout << "\n";
+            }
+        }
+        if (!any) {
+            std::cerr << "mdebug: no state machine " << (name.empty() ? "in the design" : "at " + name) << "\n";
+            return name.empty();
+        }
+        return true;
+    }
+
+    std::string fsmsJson() {
+        std::string o = "[";
+        for (const ExtractedFsm& f : fsms) {
+            auto ix = f.var ? db.sigIx.find(f.var) : db.sigIx.end();
+            if (ix == db.sigIx.end() || f.states.empty()) continue;
+            o += std::string(o.size() > 1 ? ",\n" : "") + "{\"sig\":" + std::to_string(ix->second) + ",\"states\":[";
+            for (size_t i = 0; i < f.states.size(); i++) {
+                bool rst = std::find(f.resetStates.begin(), f.resetStates.end(), f.states[i].first) != f.resetStates.end();
+                o += std::string(i ? "," : "") + "[" + std::to_string(f.states[i].first) + "," +
+                     js(stateName(f, f.states[i].first)) + "," + (rst ? "1" : "0") + "]";
+            }
+            o += "],\"trans\":[";
+            std::set<std::pair<uint64_t, uint64_t>> known;
+            bool first = true;
+            for (const auto& t : f.trans) {
+                if (t.from == t.to || !known.insert({t.from, t.to}).second) continue;
+                Where wh = db.src.where(t.loc);
+                o += std::string(first ? "" : ",") + "[" + std::to_string(t.from) + "," + std::to_string(t.to) + "," + (t.reset ? "1" : "0") +
+                     "," + std::to_string(wh.file) + "," + std::to_string(wh.line) + "]";
+                first = false;
+            }
+            o += "]}";
+        }
+        return o + "]";
+    }
+
+    // -------------------------------------------------------------- power
+    // -upf FILE: the power intent (IEEE 1801), read by msim's own reader
+    // (src/upf.hpp). With the log of `msim -upf ... -upf_verbose` the power
+    // state of every domain over time is known too, so a trace can say that
+    // a value is x because its domain was off.
+    bool haveUpf = false;
+    upf::Model upfModel;
+    upf::DomainMap upfDomains;
+    std::string simTop;   // the simulation top's name, which UPF paths leave out
+    struct PowerEv { uint64_t t; std::string text; };
+    std::vector<PowerEv> powerLog;                                             // every "UPF: T: ..." line
+    std::map<std::string, std::vector<std::pair<uint64_t, std::string>>> domainStates;   // domain -> (time, simstate)
+    std::map<std::string, std::string> isoOn;                                  // design path -> isolation strategy
+
+    bool readUpf(const std::string& file, std::string powerTop, bool powerTopSet) {
+        try {
+            upfModel.load(file, "");
+        } catch (const std::exception& e) {
+            std::cerr << "mdebug: " << e.what() << "\n";
+            return false;
+        }
+        if (!db.scopes.empty()) simTop = db.scopes[0].path.substr(0, db.scopes[0].path.find('.'));
+        std::string top = powerTopSet ? powerTop : upfModel.designTop;
+        for (char& c : top) if (c == '/') c = '.';
+        while (!top.empty() && top[0] == '.') top.erase(0, 1);
+        if (top == simTop) top.clear();
+        else if (top.rfind(simTop + ".", 0) == 0) top = top.substr(simTop.size() + 1);
+        if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {
+            // set_design_top names a module: the first instance of it.
+            for (const ScopeRec& sc : db.scopes)
+                if (sc.def == top) {
+                    top = sc.path == simTop ? "" : sc.path.substr(simTop.size() + 1);
+                    break;
+                }
+        }
+        upfModel.top = top;
+        upfDomains.build(upfModel);
+        haveUpf = true;
+        return true;
+    }
+
+    // The lines `msim -upf_verbose` prints: "UPF: 45: power domain PD_CORE simstate CORRUPT".
+    void readPowerLog(const std::string& file) {
+        std::ifstream is(file);
+        for (std::string ln; std::getline(is, ln);) {
+            if (ln.rfind("UPF: ", 0) != 0) continue;
+            size_t c = ln.find(':', 5);
+            if (c == std::string::npos) continue;
+            uint64_t t = std::strtoull(ln.c_str() + 5, nullptr, 10);
+            std::string text = ln.substr(std::min(ln.size(), c + 2));
+            powerLog.push_back({t, text});
+            std::istringstream ws(text);
+            std::vector<std::string> w;
+            for (std::string x; ws >> x;) w.push_back(x);
+            if (w.size() >= 5 && w[0] == "power" && w[1] == "domain" && w[3] == "simstate") domainStates[w[2]].push_back({t, w[4]});
+            if (w.size() >= 4 && w[0] == "isolation" && w[2] == "on") isoOn[w[3]] = w[1];
+        }
+    }
+
+    // A design path without the simulation top: tb.u_dut.u_core.q -> u_dut.u_core.q
+    std::string upfPath(const std::string& p) const {
+        return p == simTop ? "" : p.rfind(simTop + ".", 0) == 0 ? p.substr(simTop.size() + 1) : p;
+    }
+    std::string domainOfSignal(const std::string& sig) const {
+        std::string p = upfPath(sig);
+        size_t d = p.rfind('.');
+        return upfDomains.of(d == std::string::npos ? "" : p.substr(0, d));
+    }
+    // The simstate of a domain at a time, and since when; "" when the log has none.
+    std::pair<std::string, uint64_t> simstateAt(const std::string& dom, uint64_t t) const {
+        auto it = domainStates.find(dom);
+        std::pair<std::string, uint64_t> r{"", 0};
+        if (it == domainStates.end()) return r;
+        for (auto& [tt, st] : it->second)
+            if (tt <= t) r = {st, tt};
+        return r;
+    }
+    // Why the domain changed then: the supply and switch lines of that time.
+    std::string powerCause(uint64_t t) const {
+        std::string o;
+        for (const PowerEv& e : powerLog)
+            if (e.t == t && (e.text.rfind("supply ", 0) == 0 || e.text.rfind("power switch", 0) == 0) && e.text.rfind("supply set", 0) != 0)
+                o += (o.empty() ? "" : "; ") + e.text;
+        return o;
+    }
+    // One line for a trace: what the power intent says of this signal then.
+    std::string powerNote(const std::string& sig, uint64_t t) const {
+        if (!haveUpf) return "";
+        std::string o;
+        const std::string dom = domainOfSignal(sig);
+        if (!dom.empty()) {
+            auto [st, since] = simstateAt(dom, t);
+            if (!st.empty() && st != "NORMAL") {
+                o = "power domain " + dom + " is " + st + " since " + std::to_string(since);
+                if (std::string c = powerCause(since); !c.empty()) o += " (" + c + ")";
+            }
+        }
+        if (auto it = isoOn.find(upfPath(sig)); it != isoOn.end()) {
+            for (const upf::Isolation& is : upfModel.isos)
+                if (is.name == it->second) {
+                    o += (o.empty() ? "" : "; ") + ("isolation " + is.name + " on this port, clamp " + is.clamp);
+                    for (size_t k = 0; k < is.signals.size(); k++)
+                        o += std::string(k ? ", " : ", enabled by ") + is.signals[k] + (k < is.senseLow.size() && is.senseLow[k] ? " (low)" : " (high)");
+                }
+        }
+        return o;
+    }
+
+    // -power [NAME]: the power domains (all or one): what is in each, its
+    // supply set, the isolation, level-shifter and retention strategies, and
+    // with the log its power states over time and at -at T.
+    bool power(const std::string& name, std::optional<uint64_t> at) {
+        if (!haveUpf) { std::cerr << "mdebug: -power needs -upf <file>\n"; return false; }
+        bool any = false;
+        auto list = [](const std::vector<std::string>& v) {
+            std::string o;
+            for (auto& e : v) o += (o.empty() ? "" : " ") + e;
+            return o.empty() ? std::string("-") : o;
+        };
+        for (const std::string& dn : upfModel.domainOrder) {
+            if (!name.empty() && dn != name) continue;
+            any = true;
+            const upf::Domain& d = upfModel.domains.at(dn);
+            std::cout << dn << "  " << d.where << "\n";
+            std::string els;
+            size_t ninst = 0;
+            for (auto& e : d.elements) {
+                std::string p = upfModel.design(e);
+                els += (els.empty() ? "" : " ") + (p.empty() ? simTop : simTop + "." + p);
+            }
+            for (const ScopeRec& sc : db.scopes) ninst += upfDomains.of(upfPath(sc.path)) == dn;
+            std::cout << "  elements: " << (els.empty() ? "-" : els) << "  (" << ninst << (ninst == 1 ? " instance)" : " instances)") << "\n";
+            const std::string ps = upfModel.primaryOf(dn);
+            std::cout << "  primary supply: " << ps;
+            if (auto it = upfModel.sets.find(ps); it != upfModel.sets.end())
+                for (auto& [fn, net] : it->second.fn) std::cout << "  " << fn << "=" << net;
+            std::cout << "\n";
+            for (const upf::Isolation& is : upfModel.isos)
+                if (is.domain == dn && !is.noIso) {
+                    std::cout << "  isolation " << is.name << ": " << (is.appliesTo == 0 ? "inputs" : is.appliesTo == 1 ? "outputs" : "both")
+                              << ", clamp " << is.clamp << ", on " << list(is.elements) << ", enabled by";
+                    for (size_t k = 0; k < is.signals.size(); k++)
+                        std::cout << " " << is.signals[k] << (k < is.senseLow.size() && is.senseLow[k] ? "(low)" : "(high)");
+                    std::cout << "  " << is.where << "\n";
+                }
+            for (const upf::LevelShifter& l : upfModel.lss)
+                if (l.domain == dn && !l.noShift)
+                    std::cout << "  level shifter " << l.name << ": " << (l.appliesTo == 0 ? "inputs" : l.appliesTo == 1 ? "outputs" : "both")
+                              << ", on " << list(l.elements) << "  " << l.where << "\n";
+            for (const upf::Retention& r : upfModel.rets)
+                if (r.domain == dn && !r.noRet)
+                    std::cout << "  retention " << r.name << ": on " << list(r.elements) << ", save " << (r.save.net.empty() ? "-" : r.save.net)
+                              << ", restore " << (r.restore.net.empty() ? "-" : r.restore.net) << "  " << r.where << "\n";
+            auto it = domainStates.find(dn);
+            if (it == domainStates.end()) continue;
+            std::cout << "  states:";
+            for (size_t k = 0; k < it->second.size() && k < 12; k++) std::cout << " @" << it->second[k].first << " " << it->second[k].second;
+            if (it->second.size() > 12) std::cout << " ...";
+            std::cout << "\n";
+            uint64_t t = at ? *at : it->second.back().first;
+            auto [st, since] = simstateAt(dn, t);
+            if (!st.empty()) {
+                std::cout << "  @" << t << ": " << st << "  (since " << since << ")";
+                if (std::string c = powerCause(since); !c.empty()) std::cout << "  " << c;
+                std::cout << "\n";
+            }
+        }
+        if (!any) { std::cerr << "mdebug: no power domain " << (name.empty() ? "in the UPF file" : "'" + name + "'") << "\n"; return false; }
+        return true;
+    }
+
+    // ------------------------------------------------------- transactions
+    // -tr FILE: the transactions UVM recorded (IEEE 1800.2 16.4, the text
+    // database uvm_text_tr_database writes, tr_db.log by default): streams,
+    // each transaction's begin and end, its fields and its parent.
+    struct TrStream { std::string name, scope; std::vector<size_t> tx; };
+    struct Tx {
+        int stream = -1;
+        std::string name;
+        uint64_t begin = 0, end = UINT64_MAX;       // UINT64_MAX: never closed
+        std::vector<std::pair<std::string, std::string>> attrs;
+        long parent = -1;                           // index into trTx
+    };
+    std::vector<TrStream> trStreams;
+    std::vector<Tx> trTx;
+    uint64_t trEnd = 0;
+
+    // "KEY:value" up to the next " KEY2:" / " KEY2=" or the closing brace.
+    static std::string trField(const std::string& l, const std::string& key) {
+        size_t p = l.find(key + ":");
+        if (p == std::string::npos) p = l.find(key + "=");
+        if (p == std::string::npos) return "";
+        p += key.size() + 1;
+        size_t e = l.size();
+        for (const char* k : {" NAME:", " T:", " SCOPE:", " STREAM:", " TIME:", " TIME=", " TYPE=", " VALUE:", " RADIX:", " BITS=", " TXH2:", " RELATION="})
+            if (size_t q = l.find(k, p); q != std::string::npos && q < e) e = q;
+        if (size_t q = l.rfind('}'); q != std::string::npos && q >= p && q < e) e = q;
+        while (e > p && l[e - 1] == ' ') e--;
+        std::string v = l.substr(p, e - p);
+        if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+        return v;
+    }
+
+    bool readTr(const std::string& file) {
+        std::ifstream is(file);
+        if (!is) { std::cerr << "mdebug: cannot read " << file << "\n"; return false; }
+        std::unordered_map<std::string, int> streamOf;       // STREAM id -> index
+        std::unordered_map<std::string, size_t> txOf;        // TXH -> index (handles are reused after FREE)
+        std::string l;
+        size_t n = 0;
+        while (std::getline(is, l)) {
+            size_t k = l.find_first_not_of(' ');
+            if (k == std::string::npos) continue;
+            size_t sp = l.find(' ', k);
+            const std::string kw = l.substr(k, sp == std::string::npos ? std::string::npos : sp - k);
+            uint64_t t = 0;
+            if (size_t at = l.find('@', k); at != std::string::npos) t = std::strtoull(l.c_str() + at + 1, nullptr, 10);
+            trEnd = std::max(trEnd, t);
+            if (kw == "CREATE_STREAM") {
+                streamOf[trField(l, "STREAM")] = (int)trStreams.size();
+                trStreams.push_back({trField(l, "NAME"), trField(l, "SCOPE"), {}});
+                n++;
+            } else if (kw == "OPEN_RECORDER") {
+                auto s = streamOf.find(trField(l, "STREAM"));
+                if (s == streamOf.end()) continue;
+                Tx x;
+                x.stream = s->second;
+                x.name = trField(l, "NAME");
+                std::string b = trField(l, "TIME");
+                x.begin = b.empty() ? t : std::strtoull(b.c_str(), nullptr, 10);
+                txOf[trField(l, "TXH")] = trTx.size();
+                trStreams[x.stream].tx.push_back(trTx.size());
+                trTx.push_back(std::move(x));
+                n++;
+            } else if (kw == "CLOSE_RECORDER" || kw == "SET_ATTR") {
+                auto x = txOf.find(trField(l, "TXH"));
+                if (x == txOf.end()) continue;
+                Tx& tx = trTx[x->second];
+                if (kw == "CLOSE_RECORDER") {
+                    std::string e = trField(l, "TIME");
+                    tx.end = e.empty() ? t : std::strtoull(e.c_str(), nullptr, 10);
+                    continue;
+                }
+                std::string nm = trField(l, "NAME"), v = trField(l, "VALUE"), r = trField(l, "RADIX");
+                if (nm == "inst_id" || nm == "label") continue;
+                if (r == "UVM_HEX") v = "'h" + v;
+                else if (r == "UVM_BIN") v = "'b" + v;
+                else if (r == "UVM_OCT") v = "'o" + v;
+                else if (r == "UVM_STRING") v = "\"" + v + "\"";
+                bool set = false;
+                for (auto& a : tx.attrs)
+                    if (a.first == nm) { a.second = v; set = true; }
+                if (!set) tx.attrs.push_back({nm, v});
+            } else if (kw == "LINK") {
+                auto p = txOf.find(trField(l, "TXH1")), c = txOf.find(trField(l, "TXH2"));
+                std::string rel = trField(l, "RELATION");
+                if (p == txOf.end() || c == txOf.end()) continue;
+                if (rel == "child") trTx[c->second].parent = (long)p->second;
+                else if (rel == "parent") trTx[p->second].parent = (long)c->second;
+            }
+        }
+        if (!n) {
+            std::cerr << "mdebug: " << file << " has no UVM transaction streams (uvm_text_tr_database, tr_db.log)\n";
+            return false;
+        }
+        for (Tx& x : trTx) trEnd = std::max(trEnd, x.end == UINT64_MAX ? x.begin : x.end);
+        return true;
+    }
+
+    std::string streamPath(const TrStream& s) const { return s.scope.empty() ? s.name : s.scope + "." + s.name; }
+    std::string txLine(size_t i) const {
+        const Tx& x = trTx[i];
+        std::string o = "#" + std::to_string(i) + " " + x.name + "  @" + std::to_string(x.begin) + " to " +
+                        (x.end == UINT64_MAX ? std::string("(open)") : std::to_string(x.end));
+        std::string f;
+        for (auto& a : x.attrs) f += (f.empty() ? "" : " ") + a.first + "=" + a.second;
+        if (!f.empty()) o += "  " + f;
+        if (x.parent >= 0) {
+            const Tx& p = trTx[(size_t)x.parent];
+            o += "  (in #" + std::to_string(x.parent) + " " + p.name + " on " + streamPath(trStreams[(size_t)p.stream]) + ")";
+        }
+        return o;
+    }
+
+    // -trans [STREAM]: the streams, or one stream's transactions; with -at T
+    // only the transactions in progress at T.
+    bool trans(const std::string& name, std::optional<uint64_t> t) {
+        if (trStreams.empty()) { std::cerr << "mdebug: -trans needs -tr <file> (UVM's tr_db.log)\n"; return false; }
+        auto open = [&](const Tx& x) { return !t || (x.begin <= *t && (*t < x.end || x.begin == *t)); };
+        std::vector<size_t> pick;
+        for (size_t s = 0; s < trStreams.size(); s++) {
+            const std::string p = streamPath(trStreams[s]);
+            if (name.empty() || p == name || (p.size() > name.size() && p.compare(p.size() - name.size(), name.size(), name) == 0 &&
+                                              p[p.size() - name.size() - 1] == '.') || trStreams[s].scope == name)
+                pick.push_back(s);
+        }
+        if (pick.empty()) { std::cerr << "mdebug: no transaction stream '" << name << "' (-trans lists them)\n"; return false; }
+        if (name.empty() && !t) {
+            for (size_t s : pick) {
+                const TrStream& st = trStreams[s];
+                uint64_t a = UINT64_MAX, b = 0;
+                for (size_t i : st.tx) { a = std::min(a, trTx[i].begin); b = std::max(b, trTx[i].end == UINT64_MAX ? trTx[i].begin : trTx[i].end); }
+                std::cout << streamPath(st) << "  " << st.tx.size() << " transaction" << (st.tx.size() == 1 ? "" : "s");
+                if (!st.tx.empty()) std::cout << "  (" << a << " to " << b << ")";
+                std::cout << "\n";
+            }
+            return true;
+        }
+        for (size_t s : pick) {
+            std::string lines;
+            for (size_t i : trStreams[s].tx)
+                if (open(trTx[i])) lines += "  " + txLine(i) + "\n";
+            if (lines.empty() && t && name.empty()) continue;
+            std::cout << streamPath(trStreams[s]) << (t ? " at " + std::to_string(*t) : "") << ":\n" << (lines.empty() ? "  none\n" : lines);
+        }
+        return true;
+    }
+
+    std::string transJson() {
+        std::string o = "{\"end\":" + std::to_string(trEnd) + ",\"streams\":[";
+        for (size_t s = 0; s < trStreams.size(); s++) {
+            o += std::string(s ? "," : "") + "{\"name\":" + js(trStreams[s].name) + ",\"scope\":" + js(trStreams[s].scope) + ",\"tx\":[";
+            for (size_t k = 0; k < trStreams[s].tx.size(); k++) o += (k ? "," : "") + std::to_string(trStreams[s].tx[k]);
+            o += "]}";
+        }
+        o += "],\"tx\":[";
+        for (size_t i = 0; i < trTx.size(); i++) {
+            const Tx& x = trTx[i];
+            o += std::string(i ? "," : "") + "[" + std::to_string(x.stream) + "," + std::to_string(x.begin) + "," +
+                 (x.end == UINT64_MAX ? std::string("-1") : std::to_string(x.end)) + "," + js(x.name) + "," + std::to_string(x.parent) + ",[";
+            for (size_t k = 0; k < x.attrs.size(); k++) o += std::string(k ? "," : "") + "[" + js(x.attrs[k].first) + "," + js(x.attrs[k].second) + "]";
+            o += "]]";
+        }
+        return o + "]}";
+    }
+
+    // ----------------------------------------------------------- coverage
+    // -cov FILE: msim's coverage database (msim -cov, or mcov merge). Line
+    // hits say which assignments ever ran; toggles which bits ever moved.
+    bool haveCov = false;
+    std::map<std::pair<std::string, size_t>, uint64_t> covLines;    // (file name, line) -> hits
+    std::map<std::pair<std::string, size_t>, uint64_t> covBase;     // by the name without directories
+    struct Tog { int w = 0; std::string rise, fall; };              // hex masks of the bits seen 0->1, 1->0
+    std::map<std::string, Tog> covTog;
+
+    static std::string baseName(const std::string& f) { return f.substr(f.find_last_of('/') + 1); }
+
+    bool readCov(const std::string& file) {
+        std::ifstream is(file, std::ios::binary);
+        if (!is) { std::cerr << "mdebug: cannot read " << file << "\n"; return false; }
+        std::string text((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+        JReader r{text};
+        JVal d = r.val();
+        const JVal* files = d.get("files");
+        const JVal* lines = d.get("lines");
+        if (r.bad || d.k != JVal::Obj || !files || !lines) {
+            std::cerr << "mdebug: " << file << " is not a coverage database (msim -cov FILE)\n";
+            return false;
+        }
+        for (const JVal& l : lines->a) {
+            if (l.a.size() < 3 || (size_t)l.a[0].n >= files->a.size()) continue;
+            const std::string& f = files->a[(size_t)l.a[0].n].s;
+            covLines[{f, (size_t)l.a[1].n}] += (uint64_t)l.a[2].n;
+            covBase[{baseName(f), (size_t)l.a[1].n}] += (uint64_t)l.a[2].n;
+        }
+        if (const JVal* tg = d.get("toggles"))
+            for (const JVal& t : tg->a)
+                if (t.a.size() >= 4) covTog[t.a[0].s] = {(int)t.a[1].n, t.a[2].s, t.a[3].s};
+        haveCov = true;
+        return true;
+    }
+
+    // How often a source line ran; nullopt when the database has no record of it.
+    std::optional<uint64_t> hitsOf(const Where& w) {
+        if (!haveCov || w.file < 0) return std::nullopt;
+        const std::string& f = db.src.files[w.file].name;
+        if (auto it = covLines.find({f, (size_t)w.line}); it != covLines.end()) return it->second;
+        if (auto it = covBase.find({baseName(f), (size_t)w.line}); it != covBase.end()) return it->second;
+        return std::nullopt;
+    }
+
+    // The bits of a signal that never rose or never fell: "" when all did.
+    std::string stuck(const std::string& p) {
+        auto it = covTog.find(p);
+        if (it == covTog.end()) return "";
+        const Tog& t = it->second;
+        auto count = [&](const std::string& hex) {
+            int n = 0;
+            for (char c : hex) {
+                int v = c >= 'a' ? c - 'a' + 10 : c >= 'A' ? c - 'A' + 10 : c - '0';
+                n += __builtin_popcount(v & 15);
+            }
+            return n;
+        };
+        int r = count(t.rise), f = count(t.fall);
+        if (r >= t.w && f >= t.w) return "";
+        if (t.w == 1) return r == 0 && f == 0 ? "never changed" : r == 0 ? "never rose" : "never fell";
+        std::string o;
+        if (r < t.w) o = std::to_string(t.w - r) + " of " + std::to_string(t.w) + " bits never rose";
+        if (f < t.w) o += (o.empty() ? "" : ", ") + std::to_string(t.w - f) + " of " + std::to_string(t.w) + " bits never fell";
+        return o;
+    }
+
+    // -uncovered [SCOPE]: the assignments that never ran and the signals with
+    // bits that never toggled, in the design or under one instance.
+    bool uncovered(const std::string& scope) {
+        if (!haveCov) { std::cerr << "mdebug: -uncovered needs -cov <file> (msim -cov FILE)\n"; return false; }
+        const std::string pre = scope.empty() ? "" : scope + ".";
+        std::set<std::pair<int, size_t>> done;
+        size_t nd = 0, ns = 0;
+        std::cout << "assignments on lines that never ran" << (scope.empty() ? "" : " under " + scope) << ":\n";
+        for (const Driver& d : db.drivers) {
+            if (!pre.empty() && path(*d.target).rfind(pre, 0) != 0) continue;
+            if (d.kind == "port") continue;
+            Where w = db.src.where(d.loc);
+            auto h = hitsOf(w);
+            if (!h || *h || !done.insert({w.file, w.line}).second) continue;
+            std::cout << "  " << line(d) << "\n";
+            nd++;
+        }
+        if (!nd) std::cout << "  none\n";
+        std::cout << "signals that never toggled fully:\n";
+        for (auto* s : db.signals) {
+            const std::string p = path(*s);
+            if (!pre.empty() && p.rfind(pre, 0) != 0) continue;
+            std::string st = stuck(p);
+            if (st.empty()) continue;
+            std::cout << "  " << p << "  (" << st << ")\n";
+            ns++;
+        }
+        if (!ns) std::cout << "  none\n";
+        return true;
+    }
+
+    std::string covJson() {
+        // Per file of the page's own file table: line -> hits; per signal: stuck text.
+        std::string o = "{\"lines\":{";
+        bool firstF = true;
+        for (size_t f = 0; f < db.src.files.size(); f++) {
+            std::string part;
+            for (size_t l = 1; l <= db.src.files[f].lines.size(); l++) {
+                Where w;
+                w.file = (int)f;
+                w.line = l;
+                if (auto h = hitsOf(w)) part += (part.empty() ? "" : ",") + ("\"" + std::to_string(l) + "\":") + std::to_string(*h);
+            }
+            if (part.empty()) continue;
+            o += std::string(firstF ? "" : ",") + "\"" + std::to_string(f) + "\":{" + part + "}";
+            firstF = false;
+        }
+        o += "},\"stuck\":{";
+        bool first = true;
+        for (size_t i = 0; i < db.signals.size(); i++) {
+            std::string st = stuck(path(*db.signals[i]));
+            if (st.empty()) continue;
+            o += std::string(first ? "" : ",") + "\"" + std::to_string(i) + "\":" + js(st);
+            first = false;
+        }
+        return o + "}}";
+    }
+
+    // --------------------------------------------------------- assertions
+    // The failures in a simulation log: msim (like VCS) prints
+    //   Error: "file.sv", 12: tb.u.a_gnt: at time 55
+    std::map<std::string, std::vector<uint64_t>> assertFails;   // by assertion name
+    std::map<std::pair<std::string, size_t>, std::vector<uint64_t>> assertFailsAt;   // by file name and line
+    bool haveLog = false;
+
+    bool readLog(const std::string& file) {
+        std::ifstream is(file);
+        if (!is) { std::cerr << "mdebug: cannot read " << file << "\n"; return false; }
+        haveLog = true;
+        for (std::string ln; std::getline(is, ln);) {
+            size_t q1 = ln.find('"'), q2 = q1 == std::string::npos ? q1 : ln.find('"', q1 + 1);
+            size_t at = ln.rfind(": at time ");
+            if (q2 == std::string::npos || at == std::string::npos || at < q2) continue;
+            if (ln.rfind("Error:", 0) != 0 && ln.rfind("Fatal:", 0) != 0 && ln.rfind("Warning:", 0) != 0) continue;
+            // "file", LINE: NAME: at time T
+            size_t c1 = ln.find(':', q2);
+            if (c1 == std::string::npos || c1 >= at) continue;
+            std::string fname = ln.substr(q1 + 1, q2 - q1 - 1);
+            size_t lineNo = std::strtoull(ln.c_str() + q2 + 2, nullptr, 10);
+            std::string name = c1 + 2 <= at ? ln.substr(c1 + 2, at - c1 - 2) : "";
+            uint64_t t = std::strtoull(ln.c_str() + at + 10, nullptr, 10);
+            assertFails[name].push_back(t);
+            assertFailsAt[{fname.substr(fname.find_last_of('/') + 1), lineNo}].push_back(t);
+        }
+        return true;
+    }
+
+    const std::vector<uint64_t>* failsOf(const AssertRec& a) {
+        if (auto it = assertFails.find(a.name); it != assertFails.end()) return &it->second;
+        Where w = db.src.where(a.loc);
+        if (w.file < 0) return nullptr;
+        const std::string& f = db.src.files[w.file].name;
+        auto it = assertFailsAt.find({f.substr(f.find_last_of('/') + 1), (size_t)w.line});
+        // By place only when one assertion is written there (one instance).
+        if (it == assertFailsAt.end()) return nullptr;
+        int same = 0;
+        for (const AssertRec& b : db.asserts) {
+            Where wb = db.src.where(b.loc);
+            same += wb.file == w.file && wb.line == w.line;
+        }
+        return same == 1 ? &it->second : nullptr;
+    }
+
+    // -assert [NAME]: the assertions (all, under an instance, or one), and
+    // with -log and a waveform, each failure: the values the assertion saw at
+    // the clock ticks up to it, and what drove each signal.
+    bool asserts(const std::string& name, std::optional<uint64_t> at) {
+        bool any = false;
+        for (const AssertRec& a : db.asserts) {
+            if (!name.empty() && a.name != name && a.name.rfind(name + ".", 0) != 0) continue;
+            any = true;
+            std::cout << a.name << "  " << a.kind << "  " << db.src.at(db.src.where(a.loc)) << "\n";
+            std::string text = db.src.text(a.range);
+            if (text == "?") text = db.src.lineText(db.src.where(a.loc));
+            if (text.size() > 160) text = text.substr(0, 157) + "...";
+            for (char& ch : text) if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+            std::cout << "  " << text << "\n";
+            const std::vector<uint64_t>* fails = haveLog ? failsOf(a) : nullptr;
+            if (!haveLog) continue;
+            if (!fails) { std::cout << "  no failure in the log\n"; continue; }
+            std::cout << "  failed " << fails->size() << (fails->size() == 1 ? " time:" : " times:");
+            for (size_t i = 0; i < fails->size() && i < 8; i++) std::cout << " @" << (*fails)[i];
+            if (fails->size() > 8) std::cout << " ...";
+            std::cout << "\n";
+            if (!haveVcd) continue;
+            // The failure to explain: the one at -at T, else the first.
+            uint64_t tf = (*fails)[0];
+            if (at) for (uint64_t t : *fails) if (t <= *at) tf = t;
+            // The clock ticks up to the failure; values are sampled before each.
+            std::vector<uint64_t> ticks;
+            const Wave* cw = a.clock ? vcd.find(path(*a.clock)) : nullptr;
+            if (cw) {
+                for (int i = cw->at(tf); i >= 0 && ticks.size() < 4; i--) {
+                    const std::string b = cw->bits(i);
+                    bool hit = a.edge == EdgeKind::PosEdge ? b == "1" : a.edge == EdgeKind::NegEdge ? b == "0" : true;
+                    if (hit && cw->ch[i].t <= tf) ticks.insert(ticks.begin(), cw->ch[i].t);
+                }
+            }
+            if (ticks.empty()) ticks.push_back(tf);
+            auto sample = [&](uint64_t t) { return a.concurrent && t > 0 ? t - 1 : t; };
+            size_t wide = 4;
+            std::vector<const Symbol*> sigs;
+            for (const Symbol* r : a.reads)
+                if (r != a.clock && db.sigIx.count(r)) { sigs.push_back(r); wide = std::max(wide, path(*r).size()); }
+            std::cout << "  failure @" << tf << (a.concurrent ? ", values sampled before each clock tick:\n" : ", values then:\n");
+            std::cout << "    " << std::string(wide, ' ');
+            for (uint64_t t : ticks) { std::string h = "@" + std::to_string(t); std::cout << "  " << std::string(h.size() < 8 ? 8 - h.size() : 0, ' ') << h; }
+            std::cout << "\n";
+            for (const Symbol* r : sigs) {
+                const std::string p = path(*r);
+                std::cout << "    " << p << std::string(wide - p.size(), ' ');
+                for (uint64_t t : ticks) { std::string v = valueAt(r, sample(t)); std::cout << "  " << std::string(v.size() < 8 ? 8 - v.size() : 0, ' ') << v; }
+                std::cout << "\n";
+            }
+            std::cout << "  what drove them:\n";
+            Seen seen;
+            for (const Symbol* r : sigs) active(r, sample(tf), 1, 2, seen);
+        }
+        if (!any) {
+            std::cerr << "mdebug: no assertion " << (name.empty() ? "in the design" : "at " + name) << "\n";
+            return name.empty();
+        }
+        return true;
+    }
+
+    std::string assertsJson() {
+        std::string o = "[";
+        for (size_t i = 0; i < db.asserts.size(); i++) {
+            const AssertRec& a = db.asserts[i];
+            Where w = db.src.where(a.loc);
+            o += std::string(i ? ",\n" : "") + "{\"name\":" + js(a.name) + ",\"kind\":" + js(a.kind) + ",\"file\":" +
+                 std::to_string(w.file) + ",\"line\":" + std::to_string(w.line) + ",\"reads\":[";
+            bool first = true;
+            for (const Symbol* r : a.reads)
+                if (auto it = db.sigIx.find(r); it != db.sigIx.end()) { o += (first ? "" : ",") + std::to_string(it->second); first = false; }
+            o += "],\"fails\":[";
+            if (const std::vector<uint64_t>* f = haveLog ? failsOf(a) : nullptr)
+                for (size_t k = 0; k < f->size() && k < 1000; k++) o += (k ? "," : "") + std::to_string((*f)[k]);
+            o += "]}";
+        }
+        return o + "]";
+    }
+
+    // ------------------------------------------------------------- script
+    // -script FILE (- for stdin): one command per line, one JSON object per
+    // answer line. The design and the waveform are loaded once, so a script
+    // or another program can ask many questions of one mdebug process.
+    std::string drvJson(const Driver& d) {
+        Where w = db.src.where(d.loc);
+        return "{\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) +
+               ",\"text\":" + js(text(d)) + ",\"kind\":" + js(label(d)) + ",\"when\":" + js(when(d)) +
+               ",\"target\":" + js(path(*d.target)) + "}";
+    }
+    int script(std::istream& in, std::ostream& out) {
+        int bad = 0;
+        std::string ln;
+        while (std::getline(in, ln)) {
+            std::istringstream is(ln);
+            std::vector<std::string> a;
+            for (std::string t; is >> t;) a.push_back(t);
+            if (a.empty() || a[0][0] == '#') continue;
+            if (a[0] == "quit" || a[0] == "exit") break;
+            auto num = [&](size_t i) -> std::optional<uint64_t> {
+                if (i >= a.size()) return std::nullopt;
+                return std::strtoull(a[i].c_str(), nullptr, 10);
+            };
+            // What the query functions print is captured, never mixed into the answers.
+            std::ostringstream txt, err;
+            std::streambuf* so = std::cout.rdbuf(txt.rdbuf());
+            std::streambuf* se = std::cerr.rdbuf(err.rdbuf());
+            bool ok = true, asText = false;
+            std::string body;
+            const std::string& c = a[0];
+            auto sig = [&]() -> const Symbol* {
+                if (a.size() < 2) { std::cerr << "mdebug: " << c << " needs a signal\n"; return nullptr; }
+                return find(a[1]);
+            };
+            auto needWave = [&](const Symbol* s) -> const Wave* {
+                if (!haveVcd) { std::cerr << "mdebug: " << c << " needs -vcd <file>\n"; return nullptr; }
+                const Wave* w = vcd.find(path(*s));
+                if (!w) std::cerr << "mdebug: " << path(*s) << " is not in the waveform\n";
+                return w;
+            };
+            if (c == "drivers" || c == "loads") {
+                const Symbol* s = sig();
+                if (!s) ok = false;
+                else {
+                    body = "\"signal\":" + js(path(*s)) + ",\"" + c + "\":[";
+                    auto& v = c == "drivers" ? db.driversOf[s] : db.loadsOf[s];
+                    for (size_t i = 0; i < v.size(); i++) {
+                        const Driver& d = db.drivers[v[i]];
+                        std::string o = drvJson(d);
+                        if (c == "loads") {
+                            bool data = std::find(d.reads.begin(), d.reads.end(), s) != d.reads.end();
+                            o.insert(o.size() - 1, std::string(",\"control\":") + (data ? "false" : "true"));
+                        }
+                        body += (i ? "," : "") + o;
+                    }
+                    body += "]";
+                }
+            } else if (c == "value") {
+                const Symbol* s = sig();
+                const Wave* w = s ? needWave(s) : nullptr;
+                if (!w) ok = false;
+                else {
+                    uint64_t t = num(2).value_or(vcd.end);
+                    int i = w->at(t);
+                    body = "\"signal\":" + js(path(*s)) + ",\"time\":" + std::to_string(t) + ",\"value\":" +
+                           js(i < 0 ? "x" : showBits(w->bits(i))) + ",\"bits\":" + js(i < 0 ? "" : w->bits(i)) +
+                           ",\"since\":" + std::to_string(i < 0 ? 0 : w->ch[i].t);
+                }
+            } else if (c == "changes") {
+                const Symbol* s = sig();
+                const Wave* w = s ? needWave(s) : nullptr;
+                if (!w) ok = false;
+                else {
+                    uint64_t t0 = num(2).value_or(0), t1 = num(3).value_or(vcd.end);
+                    const size_t cap = 10000;
+                    size_t n = 0;
+                    bool more = false;
+                    body = "\"signal\":" + js(path(*s)) + ",\"changes\":[";
+                    for (int i = std::max(0, w->at(t0)); i < (int)w->ch.size() && w->ch[i].t <= t1; i++) {
+                        if (w->ch[i].t < t0) continue;
+                        if (n == cap) { more = true; break; }
+                        body += std::string(n++ ? "," : "") + "[" + std::to_string(w->ch[i].t) + "," + js(w->bits(i)) + "]";
+                    }
+                    body += std::string("],\"more\":") + (more ? "true" : "false");
+                }
+            } else if (c == "scopes") {
+                body = "\"scopes\":[";
+                for (size_t i = 0; i < db.scopes.size(); i++) {
+                    Where w = db.src.where(db.scopes[i].loc);
+                    body += std::string(i ? "," : "") + "{\"path\":" + js(db.scopes[i].path) + ",\"def\":" + js(db.scopes[i].def) +
+                            ",\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) + "}";
+                }
+                body += "]";
+            } else if (c == "signals") {
+                // signals, or signals SCOPE: the ones directly inside it.
+                const std::string pre = a.size() > 1 ? a[1] + "." : "";
+                body = "\"signals\":[";
+                bool first = true;
+                for (auto* s : db.signals) {
+                    const std::string p = path(*s);
+                    if (!pre.empty() && (p.rfind(pre, 0) != 0 || p.find('.', pre.size()) != std::string::npos)) continue;
+                    Where w = db.src.where(s->location);
+                    body += std::string(first ? "" : ",") + "{\"path\":" + js(p) + ",\"type\":" + js(s->getType().toString()) +
+                            ",\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) + "}";
+                    first = false;
+                }
+                body += "]";
+            } else if (c == "end") {
+                if (!haveVcd) { std::cerr << "mdebug: end needs -vcd <file>\n"; ok = false; }
+                else body = "\"end\":" + std::to_string(vcd.end) + ",\"timescale\":" + js(vcd.timescale);
+            } else if (c == "active") {
+                asText = true;
+                ok = a.size() > 1 ? activeTrace(a[1], num(2), (int)num(3).value_or(3)) : (std::cerr << "mdebug: active needs a signal\n", false);
+            } else if (c == "trace") {
+                asText = true;
+                ok = a.size() > 1 ? trace(a[1], (int)num(2).value_or(2)) : (std::cerr << "mdebug: trace needs a signal\n", false);
+            } else if (c == "blocks") {
+                asText = true;
+                ok = a.size() > 1 ? blocks(a[1]) : (std::cerr << "mdebug: blocks needs an instance\n", false);
+            } else if (c == "fsm") {
+                // fsm, fsm NAME, fsm NAME T
+                asText = true;
+                bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
+                ok = fsm(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "power") {
+                asText = true;
+                bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
+                ok = power(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "trans") {
+                asText = true;
+                bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
+                ok = trans(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "uncovered") {
+                asText = true;
+                ok = uncovered(a.size() > 1 ? a[1] : "");
+            } else if (c == "assert") {
+                asText = true;
+                bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
+                ok = asserts(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "help") {
+                body = "\"commands\":[\"drivers SIG\",\"loads SIG\",\"value SIG [T]\",\"changes SIG [T0 [T1]]\",\"active SIG [T [DEPTH]]\","
+                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"assert [NAME] [T]\",\"uncovered [INST]\",\"power [DOMAIN] [T]\",\"trans [STREAM] [T]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
+            } else {
+                std::cerr << "mdebug: unknown command '" << c << "' (help lists them)\n";
+                ok = false;
+            }
+            std::cout.rdbuf(so);
+            std::cerr.rdbuf(se);
+            std::string e = err.str();
+            while (!e.empty() && e.back() == '\n') e.pop_back();
+            if (e.rfind("mdebug: ", 0) == 0) e = e.substr(8);
+            out << "{\"cmd\":" << js(ln) << ",\"ok\":" << (ok ? "true" : "false");
+            if (!ok) { out << ",\"error\":" << js(e); bad++; }
+            if (!body.empty()) out << "," << body;
+            if (asText && ok) {
+                out << ",\"text\":[";
+                std::istringstream ts(txt.str());
+                bool first = true;
+                for (std::string l; std::getline(ts, l);) { out << (first ? "" : ",") << js(l); first = false; }
+                out << "]";
+            }
+            out << "}" << std::endl;   // flushed: the caller may be waiting on a pipe
+        }
+        return bad;
+    }
+
     std::string casesJson() {
         std::string o = "[";
         for (size_t i = 0; i < cases.size(); i++) {
@@ -1495,6 +2548,7 @@ struct Tool {
         for (auto* s : db.signals) sw.push_back(db.src.where(s->location));
         for (auto& s : db.scopes) { sd.push_back(db.src.where(s.loc)); si.push_back(db.src.where(s.inst)); }
         for (auto& d : db.drivers) dw.push_back(db.src.where(d.loc));
+        const std::string fsmText = fsmsJson(), assertText = assertsJson();
         os << "{\"version\":" << js(MINISIM_VERSION) << ",\n\"files\":[";
         for (size_t i = 0; i < db.src.files.size(); i++) {
             auto& f = db.src.files[i];
@@ -1549,9 +2603,14 @@ struct Tool {
                << parts(d) << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
-        os << "],\n\"cases\":" << casesJson();
+        os << "],\n\"cases\":" << casesJson() << ",\n\"fsms\":" << fsmText << ",\n\"asserts\":" << assertText;
+        if (haveCov) os << ",\n\"cov\":" << covJson();
+        if (!trStreams.empty()) os << ",\n\"trans\":" << transJson();
         if (haveVcd) {
-            os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale) << ",\"waves\":{";
+            os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale);
+            // Served live, the page asks for each signal's waves when it shows them.
+            if (live) { os << ",\"live\":true}\n"; return; }
+            os << ",\"waves\":{";
             first = true;
             std::vector<std::string> part(db.signals.size());
             std::vector<const Wave*> wv(db.signals.size());
@@ -1564,7 +2623,7 @@ struct Tool {
             if (cutSigs)
                 std::cerr << "mdebug: the waves of " << cutSigs << " signals are cut to " << maxChanges << " changes each in the page, "
                           << (center ? "around -at" : "from the start; -at T keeps the changes around T")
-                          << " (-max-changes N for more per signal)\n";
+                          << " (-max-changes N for more per signal; -serve sends every signal whole, on demand)\n";
             parallelFor(db.signals.size(), threads, [&](size_t i) {
                 const Wave* w = wv[i];
                 if (!w) return;
@@ -1596,6 +2655,98 @@ struct Tool {
         }
         os << "}\n";
     }
+
+    // --------------------------------------------------------------- serve
+    // -serve [PORT]: the viewer from a local web server instead of one file.
+    // The page holds the design; the waves of a signal are sent when the page
+    // first shows it, so the size of the waveform no longer limits the page.
+    bool live = false;
+    static constexpr size_t kLiveChanges = 4000000;   // per signal
+
+    std::string waveJsonOf(size_t sig) {
+        const Wave* w = sig < db.signals.size() && haveVcd ? vcd.find(path(*db.signals[sig])) : nullptr;
+        if (!w) return "null";
+        std::string o = "[";
+        size_t n = std::min(w->ch.size(), kLiveChanges), k0 = 0;
+        if (center && n < w->ch.size()) {
+            int c = w->at(*center);
+            k0 = std::min((size_t)std::max(0, c - (int)(n / 2)), w->ch.size() - n);
+        }
+        for (size_t k = k0; k < k0 + n; k++) {
+            if (k > k0) o += ',';
+            o += '[';
+            o += std::to_string(w->ch[k].t);
+            o += ",\"";
+            o += w->bits((int)k);
+            o += "\"]";
+        }
+        return o + "]";
+    }
+
+    // Answers until the process is stopped; maxRequests > 0 ends after that many (tests).
+    int serve(int port, long maxRequests) {
+        live = true;
+        std::ostringstream data;
+        json(data, 0);
+        std::string page = kViewer;
+        const std::string mark = "/*MDEBUG_DATA*/null";
+        size_t mp = page.find(mark);
+        page = page.substr(0, mp) + data.str() + page.substr(mp + mark.size());
+
+        int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) { std::cerr << "mdebug: cannot open a socket\n"; return 2; }
+        int one = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // this machine only
+        addr.sin_port = htons((uint16_t)port);
+        if (::bind(srv, (sockaddr*)&addr, sizeof addr) < 0 || ::listen(srv, 16) < 0) {
+            std::cerr << "mdebug: cannot listen on 127.0.0.1:" << port << " (in use? -serve 0 picks a free port)\n";
+            ::close(srv);
+            return 2;
+        }
+        socklen_t alen = sizeof addr;
+        getsockname(srv, (sockaddr*)&addr, &alen);
+        std::cout << "mdebug: serving http://127.0.0.1:" << ntohs(addr.sin_port) << "/  (" << db.scopes.size() << " instances, "
+                  << db.signals.size() << " signals; Ctrl-C to stop)" << std::endl;
+        signal(SIGPIPE, SIG_IGN);
+        for (long served = 0; maxRequests <= 0 || served < maxRequests; served++) {
+            int c = ::accept(srv, nullptr, nullptr);
+            if (c < 0) continue;
+            std::string req;
+            char buf[4096];
+            while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
+                ssize_t n = ::recv(c, buf, sizeof buf, 0);
+                if (n <= 0) break;
+                req.append(buf, (size_t)n);
+            }
+            std::string target, body, type = "application/json", status = "200 OK";
+            if (req.rfind("GET ", 0) == 0) target = req.substr(4, req.find(' ', 4) - 4);
+            // A page of another site must not read the design through the browser.
+            std::string low = req;
+            for (char& ch : low) ch = (char)std::tolower((unsigned char)ch);
+            size_t hp = low.find("\nhost:");
+            std::string host = hp == std::string::npos ? "" : low.substr(hp + 6, low.find('\r', hp) - hp - 6);
+            while (!host.empty() && host[0] == ' ') host.erase(0, 1);
+            bool local = host.rfind("127.0.0.1", 0) == 0 || host.rfind("localhost", 0) == 0;
+            if (!local) { status = "403 Forbidden"; body = "{\"error\":\"local requests only\"}"; }
+            else if (target == "/" || target == "/index.html") { body = page; type = "text/html; charset=utf-8"; }
+            else if (target.rfind("/wave?i=", 0) == 0) body = waveJsonOf(std::strtoull(target.c_str() + 8, nullptr, 10));
+            else { status = "404 Not Found"; body = "{\"error\":\"not found\"}"; }
+            std::string head = "HTTP/1.1 " + status + "\r\nContent-Type: " + type + "\r\nContent-Length: " + std::to_string(body.size()) +
+                               "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+            std::string out = head + body;
+            for (size_t off = 0; off < out.size();) {
+                ssize_t n = ::send(c, out.data() + off, out.size() - off, 0);
+                if (n <= 0) break;
+                off += (size_t)n;
+            }
+            ::close(c);
+        }
+        ::close(srv);
+        return 0;
+    }
 };
 
 void usage() {
@@ -1613,6 +2764,33 @@ void usage() {
                  "  -threads N       threads for parsing and for reading the waveform\n"
                  "                   (default: every logical core; the output is the same for any N)\n"
                  "  -scopes          list the instances    -signals  list the signals\n"
+                 "  -fsm [NAME]      the state machines (all, under an instance, or one register): states,\n"
+                 "                   transitions and their lines; with -vcd, the state at -at T, how often\n"
+                 "                   each transition ran, the ones never taken and values that are not states\n"
+                 "  -assert [NAME]   the assertions (all, under an instance, or one); with -log LOG and -vcd,\n"
+                 "                   each failure: what the assertion sampled at the clock ticks before it\n"
+                 "                   and what drove each signal (-at T picks the failure at or before T)\n"
+                 "  -serve [PORT]    the viewer from a web server on this machine (127.0.0.1, port 8765 or\n"
+                 "                   PORT, 0 for a free one): waves are sent per signal when the page shows\n"
+                 "                   it, so a large waveform does not have to fit in one page\n"
+                 "  -upf FILE        the power intent (IEEE 1801); -power_top INST as for msim\n"
+                 "  -power [DOMAIN]  with -upf: the power domains, what is in each, their supplies and their\n"
+                 "                   isolation, level-shifter and retention strategies; with -log (the output\n"
+                 "                   of msim -upf ... -upf_verbose) their power states over time, and -active\n"
+                 "                   says when a value is x because its domain was off or a port is isolated\n"
+                 "  -cov FILE        a coverage database (msim -cov FILE): driver lines say how often they\n"
+                 "                   ran, and the page marks the lines that ran and those that never did\n"
+                 "  -uncovered [INST]  with -cov: the assignments that never ran and the signals with bits\n"
+                 "                   that never toggled, in the design or under INST\n"
+                 "  -tr FILE         the transactions UVM recorded (uvm_text_tr_database: tr_db.log, with\n"
+                 "                   recording_detail set): streams, begin and end, fields, parent sequence;\n"
+                 "                   the page shows each stream as a row under the waves\n"
+                 "  -trans [STREAM]  with -tr: the streams, or one stream's transactions (-at T: those in\n"
+                 "                   progress at T, in every stream when no STREAM is given)\n"
+                 "  -log FILE        the simulation log with the assertion failures (msim's output)\n"
+                 "  -script FILE     run commands from FILE (- for the standard input), one per line, and\n"
+                 "                   answer each with one line of JSON: drivers, loads, value, changes,\n"
+                 "                   active, trace, blocks, fsm, scopes, signals, end, help, quit\n"
                  "  -blocks INST     the instances inside INST, their port connections and what feeds what\n"
                  "  -html <file>     write a one-file viewer: hierarchy, source, drivers and\n"
                  "                   loads, a schematic of the cone, and waves when -vcd is given\n"
@@ -1630,7 +2808,10 @@ int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]};
     struct Query { std::string what, arg; int depth; std::optional<uint64_t> at; };
     std::vector<Query> queries;
-    std::string vcdPath, htmlPath, jsonPath;
+    std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath, covPath, upfPath, powerTop, trPath;
+    bool powerTopSet = false, serve = false;
+    int servePort = 8765;
+    long serveRequests = 0;
     int depth = -1;
     std::optional<uint64_t> at;
     size_t maxChanges = 20000;
@@ -1650,6 +2831,49 @@ int main(int argc, char** argv) {
             std::cout << "mdebug " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
             return 0;
         }
+        if (a == "-fsm") {
+            // -fsm, or -fsm NAME: an instance or a state register.
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"fsm", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-assert") {
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"assert", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-serve") {
+            serve = true;
+            if (i + 1 < argc && std::isdigit((unsigned char)argv[i + 1][0]) && !std::filesystem::exists(argv[i + 1])) servePort = std::atoi(argv[++i]);
+            continue;
+        }
+        if (a == "-serve-requests") { serveRequests = std::atol(next("a number").c_str()); continue; }
+        if (a == "-upf") { upfPath = next("a UPF file"); continue; }
+        if (a == "-power_top") { powerTop = next("an instance"); powerTopSet = true; continue; }
+        if (a == "-power") {
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"power", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-cov") { covPath = next("a coverage database"); continue; }
+        if (a == "-uncovered") {
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"uncovered", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-tr") { trPath = next("a transaction file (UVM's tr_db.log)"); continue; }
+        if (a == "-trans") {
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"trans", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-log") { logPath = next("a simulation log"); continue; }
+        if (a == "-script") { scriptPath = next("a file, or - for the standard input"); continue; }
         if (a == "-blocks") { queries.push_back({"blocks", next("an instance"), -1, std::nullopt}); continue; }
         if (a == "-drivers" || a == "-loads" || a == "-trace" || a == "-active") {
             queries.push_back({a.substr(1), next("a signal"), -1, std::nullopt});
@@ -1668,11 +2892,27 @@ int main(int argc, char** argv) {
         if (a == "-sv" || a == "-sverilog") continue;
         fwd.push_back(a);
     }
-    if (queries.empty() && htmlPath.empty() && jsonPath.empty() && fwd.size() == 1) { usage(); return 2; }
+    if (queries.empty() && htmlPath.empty() && jsonPath.empty() && scriptPath.empty() && !serve && fwd.size() == 1) { usage(); return 2; }
     // Every instance gets its own symbols, so tb.a.q and tb.b.q are two signals.
     fwd.push_back("--disable-instance-caching");
     fwd.push_back("--threads");   // the front end parses files in parallel
     fwd.push_back(std::to_string(threads));
+
+    // With -upf the testbench may import package UPF (IEEE 1801-2024 11.2.4).
+    std::string pkgFile;
+    if (!upfPath.empty()) {
+        char tmpl[] = "/tmp/mdebug_upf_pkgXXXXXX.sv";
+        int fd = mkstemps(tmpl, 3);
+        std::string pkg = upf::svPackage();
+        if (fd < 0 || write(fd, pkg.data(), pkg.size()) != (ssize_t)pkg.size()) {
+            std::cerr << "mdebug: cannot write the UPF package\n";
+            return 2;
+        }
+        close(fd);
+        pkgFile = tmpl;
+        fwd.insert(fwd.begin() + 1, pkgFile);
+    }
+    struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{pkgFile};
 
     FrontEnd fe;
     if (int rc = fe.run(fwd, "mdebug front end")) return rc < 0 ? 0 : rc;
@@ -1684,6 +2924,12 @@ int main(int argc, char** argv) {
     Collect c(tool.db);
     fe.comp->getRoot().visit(c);
 
+    tool.fsms = extractFsms(fe.comp->getRoot());
+    if (!logPath.empty() && !tool.readLog(logPath)) return 2;
+    if (!covPath.empty() && !tool.readCov(covPath)) return 2;
+    if (!trPath.empty() && !tool.readTr(trPath)) return 2;
+    if (!upfPath.empty() && !tool.readUpf(upfPath, powerTop, powerTopSet)) return 2;
+    if (!logPath.empty()) tool.readPowerLog(logPath);
     if (!vcdPath.empty()) {
         std::string err;
         if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
@@ -1695,6 +2941,11 @@ int main(int argc, char** argv) {
         if (q.what == "drivers") ok &= tool.drivers(q.arg);
         else if (q.what == "loads") ok &= tool.loads(q.arg);
         else if (q.what == "blocks") ok &= tool.blocks(q.arg);
+        else if (q.what == "fsm") ok &= tool.fsm(q.arg, at);
+        else if (q.what == "assert") ok &= tool.asserts(q.arg, at);
+        else if (q.what == "uncovered") ok &= tool.uncovered(q.arg);
+        else if (q.what == "trans") ok &= tool.trans(q.arg, at);
+        else if (q.what == "power") ok &= tool.power(q.arg, at);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")
@@ -1706,6 +2957,14 @@ int main(int argc, char** argv) {
                           << tool.db.src.at(tool.db.src.where(s->location)) << "\n";
     }
 
+    if (!scriptPath.empty()) {
+        if (scriptPath == "-") ok &= tool.script(std::cin, std::cout) == 0;
+        else {
+            std::ifstream is(scriptPath);
+            if (!is) { std::cerr << "mdebug: cannot read " << scriptPath << "\n"; return 2; }
+            ok &= tool.script(is, std::cout) == 0;
+        }
+    }
     if (!jsonPath.empty()) {
         std::ofstream os(jsonPath);
         if (!os) { std::cerr << "mdebug: cannot write " << jsonPath << "\n"; return 2; }
@@ -1723,5 +2982,6 @@ int main(int argc, char** argv) {
         std::cout << "mdebug: wrote " << htmlPath << " (" << tool.db.scopes.size() << " instances, "
                   << tool.db.signals.size() << " signals, " << tool.db.drivers.size() << " drivers)\n";
     }
+    if (serve) return tool.serve(servePort, serveRequests);
     return ok ? 0 : 1;
 }

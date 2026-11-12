@@ -148,6 +148,165 @@ A read of one field, or of fixed bits, follows only that part. For
 bits last changed (not the time another field moved) and only the assignments
 that write them. The same holds for `q[3:0]`, in the tool and in the page.
 
+## State machines
+
+    mdebug design.sv -top tb -fsm                      # every state machine
+    mdebug design.sv -top tb -vcd run.vcd -fsm tb.u -at 40
+
+`-fsm` lists the state machines of the design, or those under an instance, or
+one state register. They come from the extractor that `msim -cov` and mlint
+use (`src/fsm_extract.hpp`), so the three tools agree on what a state machine
+is. Each one is shown with its states (the reset state marked) and its
+transitions with the line that makes each:
+
+    tb.u.state  (ctrl, 2 bits, 4 states)  fsm.sv:8
+      states: IDLE=0(reset) RUN=1 WAIT=2 FAIL=3
+      IDLE -> RUN  fsm.sv:15  taken 1 time, first @25
+      RUN -> FAIL  fsm.sv:16  never taken
+      state FAIL never entered
+      @40: WAIT  (since 35)  after IDLE@0 RUN@25
+
+With a waveform it also says how often each transition ran and when first,
+which never ran, which states were never entered, the state at `-at T` with
+the states before it, a transition that ran but is not in the source's list,
+and a value that is not a state. In the page, selecting a state register
+draws its state diagram: the state at the cursor is marked, transitions that
+ran are bright, and an arrow opens its source line.
+
+## Assertions
+
+    msim design.sv -top tb -vcd run.vcd > run.log
+    mdebug design.sv -top tb -assert                              # the assertions
+    mdebug design.sv -top tb -vcd run.vcd -log run.log -assert    # and why each one failed
+
+`-assert` lists the assert, assume and cover directives of the design, or
+those under an instance, or one by name. With `-log` (msim's output, which
+has a line `Error: "file", line: name: at time T` per failure) it says which
+failed and when. With a waveform as well it explains one failure of each, the
+first, or with `-at T` the last at or before T:
+
+    tb.u.a_gnt  assert property  arb.sv:5
+      a_gnt: assert property (@(posedge clk) disable iff (rst) req |=> gnt);
+      failed 1 time: @55
+      failure @55, values sampled before each clock tick:
+                       @25       @35       @45       @55
+        tb.u.rst         0         0         0         0
+        tb.u.req         1         0         1         0
+        tb.u.gnt         0         1         0         0
+      what drove them:
+        tb.u.gnt = 0 @54  (since 35)
+          <- arb.sv:4: gnt <= rst ? 1'b0 : req && !hold  [always_ff @posedge clk]
+
+The table has the signals the assertion reads at its last four clock ticks,
+sampled before the edge as a concurrent assertion samples them; an immediate
+assertion shows the values at the failure. Below it is the active-driver
+trace of each signal. The log's time and the waveform's must be in the same
+unit. `-json` and the page's database carry the assertions and their failure
+times (`asserts`).
+
+## Coverage
+
+    msim design.sv -top tb -cov cov.json
+    mdebug design.sv -top tb -cov cov.json -drivers tb.u.next
+    mdebug design.sv -top tb -cov cov.json -uncovered tb.u
+    mdebug design.sv -top tb -cov cov.json -vcd run.vcd -html debug.html
+
+`-cov` reads msim's coverage database (one run, or several merged with
+`mcov merge`). Every driver line then says how often its source line ran:
+
+    fsm.sv:15: next = RUN  [always_comb]  when state == IDLE && go  (line ran 3 times)
+    fsm.sv:19: next = IDLE  [always_comb]  when state == FAIL  (line never ran)
+
+so a trace shows at a glance which of a signal's drivers the tests never
+reached. The count is the line's: a line with a condition and an assignment
+counts when the condition was evaluated. `-uncovered [INST]` lists the
+assignments on lines that never ran and the signals with bits that never rose
+or never fell, in the design or under one instance. In the page, the line
+numbers of lines that ran have a green edge and those that never ran a red
+one, with the count as a tooltip, and a selected signal shows its toggle
+gaps. Reports and merging stay in `mcov`.
+
+## Low power (UPF)
+
+    msim tb.sv dut.sv -top tb -upf dut.upf -upf_verbose -vcd run.vcd > run.log
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -power
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -log run.log -vcd run.vcd -power PD_CORE -at 60
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -log run.log -vcd run.vcd -active tb.u_dut.u_core.cnt -at 60
+
+`-upf` reads the power intent with msim's own reader, so both see the same
+domains (`-power_top INST` as for msim; without it the UPF's
+`set_design_top`). `-power [DOMAIN]` lists each power domain: the instances
+in it, its primary supply set, and its isolation, level-shifter and
+retention strategies with their lines in the UPF file. With `-log`, the
+output of a run with `-upf_verbose`, it adds the domain's power states over
+time, the state at `-at T`, and the supply or switch change that caused it:
+
+    PD_CORE  dut.upf:7
+      elements: tb.u_dut.u_core  (1 instance)
+      primary supply: SS_CORE  ground=VSS  power=VDD_CORE
+      isolation ISO_0: outputs, clamp 0, on u_core/cnt u_core/q, enabled by iso_en(high)  dut.upf:30
+      states: @0 CORRUPT @2 NORMAL @45 CORRUPT @66 NORMAL @90 CORRUPT
+      @60: CORRUPT  (since 45)  power switch SW_CORE state off; supply VDD_CORE = OFF
+
+The active trace uses the same data. A value that is x because its domain
+has no power is reported as that, with the cause, and no assignment is
+blamed for it; a port with an isolation strategy says so, with the clamp
+value and the enable:
+
+    tb.u_dut.u_core.cnt = 8'bxxxxxxxx @60  (since 45)
+      power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF); isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)
+      x because the domain has no power: no assignment made this value
+
+## Large designs: the served viewer
+
+    mdebug design.sv -top tb -fst run.fst -serve          # http://127.0.0.1:8765/
+    mdebug design.sv -top tb -fst run.fst -serve 0        # any free port; the address is printed
+
+The one-file page of `-html` carries its waves inside it, so it has a budget
+(2 million value changes over all signals; long waves are cut around
+`-at T`). `-serve` has no such budget: mdebug stays running as a web server
+on this machine, the page holds the design, and the waves of a signal are
+sent the first time the page shows that signal, whole (up to 4 million
+changes per signal, around `-at T` beyond that). Everything else in the page
+is the same: trace, schematic, state diagrams, coverage marks.
+
+The server listens on 127.0.0.1 only and answers only requests addressed to
+`127.0.0.1` or `localhost`, so another machine, or a web page from another
+site, cannot read the design through it. To look from another machine, use
+an SSH tunnel (`ssh -L 8765:127.0.0.1:8765 host`). Stop it with Ctrl-C.
+
+## Scripts and other programs
+
+    mdebug design.sv -top tb -vcd run.vcd -script queries.txt
+    mdebug design.sv -top tb -vcd run.vcd -script -          # commands on the standard input
+
+`-script` loads the design and the waveform once, then runs one command per
+line and answers each with one line of JSON, so a script, a test or an AI
+agent can ask many questions of one process. Lines that start with `#` are
+skipped. The exit status is 1 when a command failed.
+
+| Command | Answer |
+|---|---|
+| `drivers SIG`, `loads SIG` | `drivers` / `loads`: `file`, `line`, `text`, `kind`, `when`, `target` (and `control` for a load) |
+| `value SIG [T]` | `value` (`8'h43`), `bits`, `since`, at T or at the end |
+| `changes SIG [T0 [T1]]` | `changes`: `[time, bits]` pairs, at most 10000, then `more` is true |
+| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]`, `assert [NAME] [T]`, `uncovered [INST]`, `power [DOMAIN] [T]` | `text`: the lines the option of the same name prints |
+| `scopes`, `signals [SCOPE]` | the instances; the signals (directly inside SCOPE) |
+| `end` | `end` time and `timescale` of the waveform |
+| `help`, `quit` | the command list; stop |
+
+    {"cmd":"value tb.u.state 40","ok":true,"signal":"tb.u.state","time":40,"value":"2'h2","bits":"10","since":35}
+    {"cmd":"value nope","ok":false,"error":"no signal 'nope' in the design"}
+
+`tools/mdebug_api.py` wraps this for Python (installed under
+`share/minisim/python`):
+
+    from mdebug_api import Mdebug
+    with Mdebug(["design.sv", "-top", "tb"], wave="run.vcd") as d:
+        print(d.value("tb.u.state", 40)["value"])
+        for drv in d.drivers("tb.u.state"):
+            print(drv["file"], drv["line"], drv["text"])
+
 ## Memories
 
 msim leaves unpacked arrays out of the waveform unless asked:
@@ -169,6 +328,79 @@ arguments that go in, as `[..., call]`, and the arguments that go in drive
 the task's formals, so the fan-in cone crosses the call. `force` and the
 procedural `assign` are listed as `[..., force]` and `[..., assign]`. A net
 declared with a value (`wire n = a + b;`) is a continuous assignment.
+
+## UVM transactions
+
+`-tr FILE` reads the transactions UVM recorded: the text database
+`uvm_text_tr_database` writes (`tr_db.log` by default) when
+`recording_detail` is on, for sequences and sequence items started on a
+sequencer and for every `begin_tr`/`end_tr` in a driver or monitor. Turn it
+on in the testbench and run msim as usual:
+
+```systemverilog
+uvm_config_db#(uvm_bitstream_t)::set(null, "*", "recording_detail", UVM_FULL);
+```
+
+```
+msim -uvmhome $UVM_HOME tb.sv -vcd tb.vcd
+mdebug tb.sv -vcd tb.vcd -tr tr_db.log -trans
+uvm_test_top.e.ag.sqr.s  6 transactions  (0 to 100000)
+uvm_test_top.e.ag.d.drive  5 transactions  (10000 to 100000)
+uvm_test_top.e.ag.m.observed  5 transactions  (15000 to 100000)
+mdebug tb.sv -tr tr_db.log -trans -at 35000
+uvm_test_top.e.ag.d.drive at 35000:
+  #5 t  @30000 to 40000  a='h22 b='ha sum='h0  (in #0 s on uvm_test_top.e.ag.sqr.s)
+uvm_test_top.e.ag.m.observed at 35000:
+  #6 t  @35000 to 40000  a='h22 b='ha sum='h2c
+```
+
+`-trans STREAM` lists one stream (its full name or a unique tail such as
+`ag.d.drive`); `-at T` keeps the transactions in progress at `T`, so the
+driver's item and the monitor's view of the same bus cycle sit side by
+side. Each line gives the fields the item recorded and the sequence it ran
+in. The page draws each stream as a row under the waves, one lane per
+transaction in flight; a click on a transaction shows its fields and
+parent and moves the cursor to its start. Times are the simulation's, the
+same as the waveform's. In `-script`: `trans [STREAM] [T]`.
+
+## Interactive simulation (msim -i)
+
+`msim -i` stops before time 0 and reads commands, like VCS UCLI or
+`irun -tcl`. `msim -do FILE` reads them from a file instead; when the
+commands run out, the simulation goes on to its end, so a `-do` file can
+set stops and checks and leave the rest of the run alone.
+
+```
+msim design.sv -i
+msim> stop tb.cnt == 3
+stop 1 set on tb.cnt
+msim> run
+time 35: stop 1: tb.cnt = 8'h3
+msim> print tb.head
+tb.head = item @10 { id = 32'h1, data = 8'h11, tag = "it1", next = big @16 }
+msim> print tb.head.next.id
+tb.head.next.id = 32'h2
+msim> force tb.en 0
+msim> run 30
+time 75: ran to time 75 (next event at 80)
+```
+
+| Command | What it does |
+|---|---|
+| `run [T]` | run until a stop, for `T` time units, or to the end |
+| `step [N]` | run `N` time slots (one by default) |
+| `stop SIG [posedge\|negedge\|== VALUE]` | stop when the signal changes, rises, falls, or takes the value; `stop` alone lists stops |
+| `delete N` | remove stop `N` |
+| `print NAME ...` | a signal, a class handle (class name, object id and every property, inherited ones included) or a path through handles such as `tb.head.next.id` |
+| `force SIG VALUE`, `release SIG` | as the `force` and `release` statements |
+| `deposit SIG VALUE` | set the value once; the design's next assignment overwrites it |
+| `signals [TEXT]` | list signals whose name contains `TEXT` |
+| `time`, `help`, `quit` | |
+
+Values are decimal or sized literals (`8'h40`, `4'b10x1`). Names can leave
+out the top module (`cnt` for `tb.cnt`). `-i` and `-do` use the
+interpreter, so they turn off `-compile`. Lines that start with `#` are
+comments.
 
 ## Limits
 

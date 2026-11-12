@@ -47,7 +47,9 @@
 #include <algorithm>
 #include <functional>
 #include <initializer_list>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -1433,6 +1435,7 @@ enum SysFnId : int {
     SF_OBJ_GETSTATE, // obj.get_randstate(): the generator state as a string
     SF_OBJ_SETSTATE, // obj.set_randstate(state)
     SF_CG,           // a covergroup operation (19): lo is the CgOp, run by g_cgHook
+    SF_COVAPI,       // $coverage_control/get_max/get/save/merge (20.13, 40.3.2): lo picks one, run by g_covApiHook
     // Power-aware simulation (IEEE 1801-2024), run by g_upfHook: a function of
     // package UPF (lo = UpfOp), or a strategy cell on a port connection
     // (lo = UPF_ISO / UPF_LS with the cell's index above the low 8 bits).
@@ -1446,6 +1449,11 @@ enum SysFnId : int {
     SF_DIST_T,           // (seed, degrees of freedom)
     SF_DIST_ERLANG,      // (seed, k, mean)
     SF_SYSTEM,           // $system(command) (20.17): the shell's exit status
+    // $q_* (20.15), ctl: 0 initialize(id, type, max), 1 add(id, job, inform), 2 remove(id),
+    // 3 the job and 4 the inform value of the last entry removed, 5 full(id),
+    // 6 exam(id, code, ticks per unit), 7 the value of the last exam. The result is the status
+    // (5: full << 32 | status).
+    SF_QUEUE,
     SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
     SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
     SF_FREAD_GET,        // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
@@ -1455,8 +1463,16 @@ enum SysFnId : int {
     // negedge << 1 | level (the body tests the signal's level). 1 when an
     // edge that happened in this time step went from or to x / z and none
     // certainly happened.
-    SF_XPROP_EDGE
+    SF_XPROP_EDGE,
+    SF_ANNEXD            // Annex D optional tasks and functions: lo is the AnnexOp, run by g_annexHook
 };
+// Annex D (annexd.inc): $countdrivers (kid0 the net signal, kid1 the bit;
+// AD_COUNT_GET k reads count k of the last call), $log / $nolog, $key /
+// $nokey, $input, $reset / $reset_count / $reset_value, $save / $incsave /
+// $restart.
+enum AnnexOp : int { AD_COUNT, AD_COUNT_GET, AD_LOG, AD_NOLOG, AD_KEY, AD_NOKEY, AD_INPUT,
+                     AD_RESET, AD_RESET_COUNT, AD_RESET_VALUE, AD_SAVE, AD_INCSAVE, AD_RESTART };
+inline Val (*g_annexHook)(int op, const std::vector<Val>& a) = nullptr;
 // The kernel's answer for one event (0 no edge now, 1 a certain edge, 2 an ambiguous one).
 inline int (*g_edgeClass)(int sig, bool neg, bool level) = nullptr;
 enum UpfOp : int { UPF_SUPPLY_ON, UPF_SUPPLY_OFF, UPF_SUPPLY_PARTIAL_ON, UPF_SET_SUPPLY_STATE, UPF_SET_POWER_STATE,
@@ -1465,6 +1481,9 @@ inline Val (*g_upfHook)(int op, const std::vector<Val>& a) = nullptr;
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
 enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
 inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
+// 40.3.2: lo 0 control, 1 get_max, 2 get, 3 save, 4 merge. With no hook
+// (no design data) every call answers SV_COV_NOCOV (0).
+inline Val (*g_covApiHook)(int op, const std::vector<Val>& a) = nullptr;
 inline void (*g_sdfHook)(const std::vector<std::string>& a) = nullptr;
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
@@ -1595,16 +1614,31 @@ inline Val condCovLazy(size_t base, bool isOr, F&&... terms) {   // for generate
     (step(terms), ...);
     return from_truth(condCovLazyEnd(base, isOr, unknown, decided, at));
 }
+// -cm_cond full: counter k is the combination whose term i has the value of
+// bit n - 1 - i of k (term 1 is the high bit, as the report lists them).
+inline int condCovHitFull(size_t base, bool isOr, const int* t, size_t n) {
+    int deciding = isOr ? 1 : 0, count = 0;
+    bool unknown = false;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (t[i] == 2) unknown = true;
+        else if (t[i] == deciding) count++;
+        k = k << 1 | (size_t)(t[i] == 1);
+    }
+    if (!unknown) __atomic_fetch_add(&g_condHits[base + k], 1, __ATOMIC_RELAXED);
+    return count ? deciding : unknown ? 2 : 1 - deciding;
+}
 // The same for generated code (msim -compile): terms as values, or as the
-// 0 / 1 of the 2-state path.
-inline Val condCovVal(size_t base, bool isOr, std::initializer_list<Val> terms) {
+// 0 / 1 of the 2-state path. mode: 1 = ||, 4 = full.
+inline Val condCovVal(size_t base, int mode, std::initializer_list<Val> terms) {
     int ts[64];
     size_t n = 0;
     for (const Val& v : terms) ts[n++] = truth(v);
-    return from_truth(condCovHit(base, isOr, ts, n));
+    return from_truth(mode & 4 ? condCovHitFull(base, mode & 1, ts, n) : condCovHit(base, mode & 1, ts, n));
 }
-inline uint64_t condCovFast(size_t base, bool isOr, std::initializer_list<int> terms) {
-    return (uint64_t)condCovHit(base, isOr, terms.begin(), terms.size());
+inline uint64_t condCovFast(size_t base, int mode, std::initializer_list<int> terms) {
+    return (uint64_t)(mode & 4 ? condCovHitFull(base, mode & 1, terms.begin(), terms.size())
+                               : condCovHit(base, mode & 1, terms.begin(), terms.size()));
 }
 
 // Current simulation time, for $time / $stime / $realtime (IEEE 1800 20.3).
@@ -2002,6 +2036,67 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             }
             return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
         }
+        case SF_QUEUE: {   // 20.15: stochastic queues
+            struct QEntry { int32_t job, inform; uint64_t at; };
+            struct Q { int type = 1; int64_t max = 0; std::deque<QEntry> e; uint64_t arrivals = 0, firstAt = 0, lastAt = 0;
+                       size_t maxLen = 0; uint64_t removed = 0, waitSum = 0, minWait = 0; };
+            static std::map<int32_t, Q> qs;
+            static std::mutex mu;
+            static thread_local int32_t lastJob = 0, lastInform = 0, lastExam = 0;
+            if (ctl == 3) return sint(lastJob);
+            if (ctl == 4) return sint(lastInform);
+            if (ctl == 7) return sint(lastExam);
+            std::lock_guard<std::mutex> lk(mu);
+            int32_t qid = i32(a[0]);
+            if (ctl == 0) {
+                int32_t type = i32(a[1]), max = i32(a[2]);
+                if (type != 1 && type != 2) return sint(4);
+                if (max <= 0) return sint(5);
+                if (qs.count(qid)) return sint(6);
+                Q q; q.type = type; q.max = max;
+                qs[qid] = q;
+                return sint(0);
+            }
+            auto it = qs.find(qid);
+            if (it == qs.end()) return ctl == 5 ? make(2, 0, 64, 0) : sint(2);
+            Q& q = it->second;
+            switch (ctl) {
+                case 1:
+                    if ((int64_t)q.e.size() >= q.max) return sint(1);
+                    q.e.push_back({i32(a[1]), i32(a[2]), g_simTime});
+                    if (!q.arrivals) q.firstAt = g_simTime;
+                    q.arrivals++; q.lastAt = g_simTime;
+                    q.maxLen = std::max(q.maxLen, q.e.size());
+                    return sint(0);
+                case 2: {
+                    if (q.e.empty()) return sint(3);
+                    QEntry en = q.type == 1 ? q.e.front() : q.e.back();
+                    if (q.type == 1) q.e.pop_front(); else q.e.pop_back();
+                    uint64_t w = g_simTime - en.at;
+                    q.minWait = q.removed ? std::min(q.minWait, w) : w;
+                    q.removed++; q.waitSum += w;
+                    lastJob = en.job; lastInform = en.inform;
+                    return sint(0);
+                }
+                case 5: return make(((uint64_t)((int64_t)q.e.size() >= q.max ? 1 : 0) << 32), 0, 64, 0);
+                case 6: {
+                    uint64_t tpu = a.size() > 2 && u64(a[2]) ? u64(a[2]) : 1;
+                    uint64_t v = 0;
+                    switch (i32(a[1])) {
+                        case 1: lastExam = (int32_t)q.e.size(); return sint(0);
+                        case 2: v = q.arrivals > 1 ? (q.lastAt - q.firstAt) / (q.arrivals - 1) : 0; break;
+                        case 3: lastExam = (int32_t)q.maxLen; return sint(0);
+                        case 4: v = q.minWait; break;
+                        case 5: for (auto& en : q.e) v = std::max(v, g_simTime - en.at); break;
+                        case 6: v = q.removed ? q.waitSum / q.removed : 0; break;
+                        default: lastExam = 0; return sint(0);
+                    }
+                    lastExam = (int32_t)((v + tpu / 2) / tpu);
+                    return sint(0);
+                }
+            }
+            return sint(0);
+        }
         case SF_SYSTEM: {   // 20.17: run the command in a shell; the result is its exit status
             Val c = a.empty() ? mkstr("") : a[0];
             c.str = true;
@@ -2158,6 +2253,8 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         case SF_FERROR: return sint(0);
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
         case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
+        case SF_ANNEXD: return g_annexHook ? g_annexHook(ctl, a) : sint(0);
+        case SF_COVAPI: return g_covApiHook ? g_covApiHook(ctl, a) : make(0, 0, 32, 0, true);
         case SF_UPF: return g_upfHook ? g_upfHook(ctl, a) : make(0, 0, 1, 0);
         case SF_SDF: {
             std::vector<std::string> args;
@@ -2724,7 +2821,8 @@ inline Val eval(const E& e, const Reader& rd) {
             int ts[64];
             size_t n = e->kids.size();
             for (size_t i = 0; i < n; i++) ts[i] = truth(k((int)i));
-            return from_truth(condCovHit((size_t)e->hi, e->lo != 0, ts, n));
+            if (e->lo & 4) return from_truth(condCovHitFull((size_t)e->hi, e->lo & 1, ts, n));
+            return from_truth(condCovHit((size_t)e->hi, e->lo & 1, ts, n));
         }
         case Op::RedAnd: return v_red_and(k(0));
         case Op::RedOr: return v_red_or(k(0));

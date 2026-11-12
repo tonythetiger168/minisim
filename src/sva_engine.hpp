@@ -689,6 +689,12 @@ struct ConcAssert {
     std::vector<std::pair<std::vector<std::pair<int, Edge>>, E>> more;
     uint32_t ticked = 0;   // runtime: the clocks that ticked in this time step
     bool due = false;      // runtime: a step is waiting for the observed region
+    // An assume set of a checker (17.7.2): at each tick of its clock, before
+    // the observed region, the active free variables solveVars take random
+    // values, tried again while solveOk (the assumptions' checks in this time
+    // step) is false, up to a limit; an unsuccessful attempt keeps the last.
+    std::vector<int> solveVars;
+    E solveOk;
     std::vector<int> matchFlags;
     std::vector<int> clearFlags;   // .matched flags this assertion reads: cleared after each of its ticks
 };
