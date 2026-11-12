@@ -8,15 +8,30 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
+  and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
+  with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
+  board is the built-in `virt32` or a JSON platform file with RAM/ROM, a 16550
+  UART, CLINT, PLIC and the test finisher; ELF and HTIF are supported.
+  Several harts run on several threads, and the result does not depend on the
+  thread count. A spike-style commit log, a decoded-instruction cache (about
+  160 MIPS on one hart) and RAM mapped on first touch are included. Its
+  headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
+  is the interface of the licensed extension library: gdb, checkpoints, the
+  profile, model libraries and RTL co-simulation.
+- `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
+  one cycle, crossing from a clock of shorter period into one of longer
+  period through a plain synchronizer, can be missed. Periods come from
+  `create_clock -period`, and for a generated clock from its master with
+  `-divide_by` / `-multiply_by`. A toggle or a held request is not reported.
 - Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
   `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
   the last place), checked by `tests/dw/more.sv`.
-- `mcov` reads and writes UCIS XML (Accellera UCIS 1.0, its XML interchange
-  format): a database named `.xml` is UCIS. Each instance becomes an
-  instanceCoverages scope with its statements, branches, conditions,
-  toggles, FSMs, assertions and covergroups. It also reads what other tools
-  write, such as blocks, case statements with more than two arms and
-  SystemVerilog literal state values.
+- VPI constraint details (37.31): `vpiSoft` on expression items, `dist`
+  items as `vpiDistribution` / `vpiDistItem` / `vpiValueRange` objects with
+  `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
+  object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
+  `vpiRefObj` has `vpiName` and `vpiFullName`.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -26,6 +41,12 @@ Spec references are IEEE 1800-2023 clauses.
   `MW_fp_flt2i`, `MW_fp_mac` (fused multiply-add), `MW_fp_recip`,
   `MW_fp_flt2flt` (format conversion) and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
   them against an exact rational reference (docs/DATAPATH.md).
+- `mcov` reads and writes UCIS XML (Accellera UCIS 1.0, its XML interchange
+  format): a database named `.xml` is UCIS. Each instance becomes an
+  instanceCoverages scope with its statements, branches, conditions,
+  toggles, FSMs, assertions and covergroups. It also reads what other tools
+  write, such as blocks, case statements with more than two arms and
+  SystemVerilog literal state values.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
@@ -97,6 +118,13 @@ Spec references are IEEE 1800-2023 clauses.
   clock domain (virtual clocks included), so an input read without a
   synchronizer, or an output launched on another clock, is a crossing.
   `set_case_analysis 0/1` makes a signal static.
+- `msim -upf` and `mlint -upf` check the implementation commands of IEEE
+  1801-2024 instead of ignoring them: `map_power_switch`, `map_repeater_cell`,
+  `map_retention_cell`, `map_retention_clamp_cell`, `name_format`,
+  `set_correlated`, `set_variation`, `use_interface_cell` (6.37 to 6.41, 6.43,
+  6.57, 6.62) and the `define_*_cell` library commands (clause 7). Each error
+  their clauses list is reported with file, line and clause; the simulation is
+  unchanged.
 - UPF (IEEE 1801-2024): `set_repeater` and the simulation of repeaters
   (6.52, 9.10); `create_logic_net`, `create_logic_port` and
   `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with
@@ -135,6 +163,12 @@ Spec references are IEEE 1800-2023 clauses.
   `connect_supply_net -pg_type` with `-cells`, `-domain`, `-elements` (6.14),
   `connect_supply_set -connect` (6.15), and the automatic connection of a
   domain's primary supply set (4.5.4.6.2).
+- Forward SAIF (IEEE 1801-2024 Annex J): `msim -saif_forward <file>`. A
+  library forward file (J.4) adds state-dependent, path-dependent and SDPD
+  toggle counts and state-dependent leakage times for each instance of its
+  cells (J.3.6 to J.3.10); an RTL forward file (J.5) writes only its mapped
+  ports and nets, typed ports as virtual instances (J.3.11). The SAIF reader
+  takes `(INSTANCE "design" path ..)` and `VIRTUAL_INSTANCE`.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.
@@ -566,6 +600,17 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `break` and `continue` in `while`, `do ... while`, `repeat` and
+  `forever` loops are merged; once a break or the condition of an unbounded
+  loop is unknown, what the loop assigns becomes x. Fixed: a `foreach` or
+  `repeat` loop whose body met an unknown condition in the clean copy
+  continued with a stale loop counter.
+- `-xprop`: a configuration file (`-xprop=<file>` or `-xprop-config <file>`,
+  VCS style: `tree`, `instance`, `module`, `merge`) turns X-propagation on or
+  off per instance, subtree or module. Branches that call tasks or functions
+  are merged (their writes too); `break` and `continue` in `for` / `foreach`
+  loops are merged; an array write whose index has an unknown bit merges
+  into every element the index may name.
 - `-xprop`: the clean copy uses the standard `case`, and clocked blocks skip
   the ambiguous-edge test when nothing went from or to x. Ibex with
   `-xprop` now costs about 12% more than without (was 30%).
@@ -939,11 +984,26 @@ Spec references are IEEE 1800-2023 clauses.
   plan where people set the owner, status, bug id and note of each failure
   bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
   and `mplan report -rules URL` to take the annotations as triage rules.
+- `src/compat.hpp` and `docs/COMPAT.md`: one shared layer that lets every tool
+  accept Synopsys, Cadence or Siemens command lines (`--compat=cadence`, or the
+  name the tool was started as). It renames or drops options from a per-tool
+  rule table and prints messages in the chosen vendor's layout. The engine
+  stays the same; nothing is implemented twice. Unit test `test_compat`.
 - `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
   / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
   state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
+- A function that writes part-selects of its result or of a local in a
+  loop, called from two continuous assignments or always_comb blocks, hung
+  msim at time 0: each caller was sensitive to the function's own variables,
+  so the callers woke each other forever. Callers are now sensitive only to
+  their operands (10.3.2, 9.2.2.2.1). Five open-ip-portfolio IPs that timed
+  out after 600 s now pass in 2 to 101 s (AES_GCM 27.5 s; Icarus 30 s).
+- `c ? q.pop_front() : d` (and `pop_back`) runs the pop only in the chosen
+  arm, after the condition (11.4.11). It used to pop first, so a condition
+  on `q.size()` popping the last element gave `d` and lost the element.
+  Found by the SPI VIP's slave model.
 - `x inside {q}` in a constraint, where `q` is a queue or dynamic array (a
   caller's variable in `randomize() with`, or a class property), no longer
   makes randomize() fail: the solver narrows x to the container's elements

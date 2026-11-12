@@ -1,0 +1,2 @@
+# map_repeater_cell (6.38) on logic.upf.
+map_repeater_cell REP -domain PD_CORE -elements {u_core/r} -lib_cells {aon_bufx2}

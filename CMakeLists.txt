@@ -227,6 +227,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vcd_class
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd_class.cmake)
+  # Checkpoints: $save, then msim -restore (like simv -r).
+  add_test(NAME msim_restore
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_restore
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_restore.cmake)
   # The xrun / irun command line (msim run as xrun, or msim -xrun).
   add_test(NAME msim_xrun
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -262,6 +267,11 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_smoke
                      -P ${CMAKE_SOURCE_DIR}/tests/mregress.cmake)
+    # -farm slurm on a real one-node Slurm (CI starts it); skips without one.
+    add_test(NAME mregress_slurm
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_slurm
+                     -P ${CMAKE_SOURCE_DIR}/tests/mregress_slurm.cmake)
   endif()
   # mplan: a verification plan scored against a regression (tests/plan).
   if(Python3_FOUND)
@@ -351,6 +361,9 @@ if(MINISIM_WITH_SLANG)
       add_test(NAME icarus/${name}
                COMMAND ${CMAKE_COMMAND} -DSIM=${IVERILOG} -DVVP=${VVP} -DSV=${sv}
                        -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
+      # Both runs work in tests/spec: a test that writes a file there
+      # ($fopen, $writememh) must not run under both simulators at once.
+      set_tests_properties(spec/${name} icarus/${name} PROPERTIES RESOURCE_LOCK spec_${name})
     endif()
   endforeach()
 
@@ -411,6 +424,10 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME upf
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
+  # Forward SAIF (IEEE 1801-2024 Annex J): msim -saif -saif_forward.
+  add_test(NAME saif_forward
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/saif_fwd.cmake)
 
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>

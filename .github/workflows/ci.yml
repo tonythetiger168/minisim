@@ -139,6 +139,13 @@ jobs:
           pip install --user yowasp-yosys && echo "$HOME/.local/bin" >> "$GITHUB_PATH" || true
           pip install --user mtkahypar || true
 
+      # A one-node Slurm, so mregress -farm slurm runs on a real scheduler
+      # (test mregress_slurm). Without it that test skips.
+      - name: Start a one-node Slurm (mregress -farm test)
+        if: env.APT_OK == '1'
+        continue-on-error: true
+        run: sudo timeout 300 apt-get install -y slurm-wlm munge && sudo timeout 120 sh tests/regress/slurm_up.sh
+
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang
         run: (dpkg -s libffi-dev >/dev/null 2>&1 || sudo apt-get install -y libffi-dev) && CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON -DUVM_HOME=$HOME/uvm-core && cmake --build build -j2 && ctest --test-dir build --output-on-failure
