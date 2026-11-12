@@ -21,6 +21,14 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mdebug -script FILE` (`-` for the standard input): one command per line
+  (drivers, loads, value, changes, active, trace, blocks, fsm, scopes,
+  signals, end), one line of JSON per answer, from one process that loads the
+  design and waveform once. `tools/mdebug_api.py` wraps it for Python.
+- `mdebug -fsm [NAME]`: the design's state machines (shared extractor), their
+  states and transitions with source lines; with a waveform, which transitions
+  ran, states never entered, values that are not states, and the state at
+  `-at T`. The viewer page draws the state diagram of a selected state register.
 - `msupport`: an AI support agent per product. Each answers from its
   product's documentation (BM25 search over the manuals), can run a short
   example on the product's tool in a sandbox, and files a ticket when the
