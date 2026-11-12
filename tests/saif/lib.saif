@@ -1,0 +1,24 @@
+(SAIFILE
+(SAIFVERSION "2.0" "lib")
+(DIRECTION "forward")
+(DESIGN)
+(DATE "today")
+(VENDOR "test")
+(PROGRAM_NAME "hand")
+(PROGRAM_VERSION "1.0")
+(DIVIDER /)
+(LIBRARY "testlib"
+ (MODULE AN2
+  (PORT
+   (A (COND B RISE_FALL COND_DEFAULT))
+   (B (COND A RISE_FALL COND_DEFAULT))
+   (Y (COND A RISE_FALL (IOPATH B)
+       COND B RISE_FALL (IOPATH A)
+       COND_DEFAULT))
+  )
+  (LEAKAGE
+   (COND (A * B) COND (A | B) COND_DEFAULT)
+  )
+ )
+)
+)

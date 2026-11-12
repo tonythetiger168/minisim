@@ -33,12 +33,17 @@
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
+//   -restore <file> [+args]  go back to a $save checkpoint and go on (docs/CHECKPOINT.md)
 //   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
 //   -xrun, -irun     take the rest of the command line as xrun / irun options
 //                    (also when msim runs as xrun, irun or xmverilog): docs/XRUN.md
 //   -profile [<file>] time every process and region and write a report
 //                    (default simprofile.txt): busiest processes, time per
 //                    instance, file and kind. Runs the interpreter on one thread.
+//   -saif_forward <file>  a forward SAIF file (IEEE 1801-2024 Annex J.4, J.5)
+//                    for -saif: a library one adds state- and path-dependent
+//                    activity of its cells, an RTL one keeps only its mapped
+//                    points (repeatable)
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -153,6 +158,7 @@
 #include "cov_select.hpp"
 #include "lower.hpp"
 #include "saif.hpp"
+#include "saif_fwd.hpp"
 #include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/diagnostics/LookupDiags.h"
@@ -322,7 +328,7 @@ struct Plan {
 // run time; the drive of its ~1700 single-driver nets was another quarter.
 static void mergePartialDrivers(LowerResult& lowered) {
     if (!S.varPathDrv.empty() || !S.loadsOf.empty() || !lowered.netDelays.empty()) return;
-    for (auto& t : S.tranOf) if (!t.empty()) return;
+    if (!lowered.trans.empty()) return;   // switches resolve their nets from the drivers (S.tranOf is set later)
     for (uint8_t b : S.pathIn) if (b) return;
     size_t ns = S.sigs.size();
     std::vector<std::vector<Instr*>> by(ns);
@@ -600,6 +606,159 @@ static void fixArrayNbas(LowerResult& lowered) {
         }
         code = std::move(out);
     }
+}
+
+// `always @*` (9.4.2.2) lowers to WaitEdge(reads) ; body ; Jmp 0: it waits
+// first, so it is not a combinational shape (body ; WaitEdge ; Jmp 0) and
+// stays a coroutine. A body of plain assignments and forward jumps becomes
+//     JmpIfNot armed -> W ; body ; W: WaitEdge(reads, armed) ; Jmp 0
+// which the static schedule ranks like an always_comb (as Verilator treats
+// @*). Unlike always_comb, @* does not run at time 0: its outputs keep their
+// values until an input changes. `armed` (2-state, 0) is set by a one-shot
+// process that waits once on the same inputs, so the body runs from the
+// first change on, as the waiting process would. MSIM_NOATSTAR=1 keeps the
+// coroutines.
+static void rotateAtStar(LowerResult& lowered) {
+    const bool dbg = std::getenv("MSIM_WHYATSTAR") != nullptr;
+    size_t done = 0, np = lowered.procs.size();
+    for (size_t pi = 0; pi < np; pi++) {
+        auto& pr = lowered.procs[pi];
+        Prog& q = pr.prog;
+        size_t n = q.code.size();
+        if (pr.kind != "Always" || !pr.loops || pr.program >= 0 || pr.reactive || n < 3) continue;
+        if (!q.roots.empty() || !q.spans.empty()) continue;
+        const Instr& w = q.code[0];
+        const Instr& j = q.code[n - 1];
+        if (w.k != IK::WaitEdge || w.dynWait || j.k != IK::Jmp || j.target != 0) continue;
+        std::vector<std::pair<int, Edge>> ev = w.events.empty() ? std::vector<std::pair<int, Edge>>{{w.sig, w.edge}} : w.events;
+        bool ok = true;
+        for (auto& [sg, ed] : ev) ok &= ed == ANY && sg >= 0;
+        for (size_t pc = 1; ok && pc + 1 < n; pc++) {
+            const Instr& x = q.code[pc];
+            if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
+                ok &= x.target > pc && x.target <= n - 1 && (x.xt == Instr::NOX || (x.xt > pc && x.xt <= n - 1));
+            } else if (x.k == IK::Assert) ok &= x.join == 1 || x.join == 2;
+            else ok &= x.k == IK::Assign && !x.de && !x.delay && x.dly.empty();
+        }
+        if (!ok) continue;
+        // The wait must cover everything the body reads (the sensitivity of
+        // @*, or a complete hand-written list).
+        auto rs = combReadSet(q);
+        std::set<int> have;
+        for (auto& e : ev) have.insert(e.first);
+        for (auto& e : rs) ok &= have.count(e.first) > 0;
+        if (!ok) { if (dbg) std::cerr << "@* kept: the wait misses a read, line " << q.code[1].line << "\n"; continue; }
+        int armed = S.sig("$atstar" + std::to_string(done), 1, false);
+        S.sigs[(size_t)armed].val = Val{0, 0, 1, 0, false};
+        S.sigs[(size_t)armed].hide = true;
+        Instr gate;
+        gate.k = IK::JmpIfNot;
+        gate.e = ref(armed);
+        gate.target = n - 1;
+        gate.line = q.code[1].line;
+        gate.file = q.code[1].file;
+        Instr wait = q.code[0];
+        ev.push_back({armed, ANY});
+        wait = waitInstr(ev);
+        wait.line = q.code[0].line;
+        wait.file = q.code[0].file;
+        q.code[0] = gate;
+        q.code.insert(q.code.end() - 1, wait);
+        // The one-shot process: wait for the first change, then arm.
+        LoweredProc arm;
+        arm.kind = "Always";
+        arm.loops = false;
+        arm.scope = pr.scope;
+        Instr w1 = waitInstr(std::vector<std::pair<int, Edge>>(ev.begin(), ev.end() - 1));
+        Instr set;
+        set.k = IK::Assign;
+        set.sig = armed;
+        set.e = konst(Val{1, 0, 1, 0, false});
+        arm.prog.code = {w1, set};
+        // The one-shot process takes the block's place in the start order,
+        // so it waits as early as the block would have (a change at time 0
+        // from a later process still wakes it); the block, now ranked, goes last.
+        LoweredProc blk = std::move(pr);
+        lowered.procs[pi] = std::move(arm);
+        lowered.procs.push_back(std::move(blk));
+        done++;
+    }
+    if (dbg) std::cerr << "@* rotated: " << done << "\n";
+}
+
+// A clocked block that keeps working values in module variables with
+// blocking assignments (PicoRV32's `set_mem_do_rinst = 0; ... if (...)
+// set_mem_do_rinst = 1;`) is not a seqShape: its Assigns wake readers, so
+// it stays a coroutine. When no other process, final block or wait touches
+// such a variable and nothing dumps waveforms, nobody can see the change
+// events: its Assigns become temporaries (Instr::tmp, a store without
+// notification; the value is still kept in the signal, so a read before the
+// first write of an activation sees the last one, as before), and the block
+// can join the static clocked schedule. MSIM_NOSEQTMP=1 keeps them.
+static void localizeSeqBlocking(LowerResult& lowered) {
+    const bool dbg = std::getenv("MSIM_WHYSEQTMP") != nullptr;
+    size_t ns = S.sigs.size();
+    // Per signal: the process that touches it, -1 none, -2 more than one or something else.
+    std::vector<int> owner(ns, -1);
+    auto touch = [&](int s, int who) {
+        if (s < 0 || (size_t)s >= ns) return;
+        int& o = owner[s];
+        o = (o == -1 || o == who) ? who : -2;
+    };
+    auto scanProg = [&](const Prog& top, int who) -> bool {
+        std::vector<const Prog*> seen, todo{&top};
+        while (!todo.empty()) {
+            const Prog* p = todo.back(); todo.pop_back();
+            if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+            seen.push_back(p);
+            for (const Instr& i : p->code) {
+                if (i.k == IK::Dump) return false;
+                touch(i.sig, who);
+                for (auto& [sg, ed] : i.events) touch(sg, who);
+                if (i.arr) for (int k = 0; k < i.arr->count; k++) touch(i.arr->base + k, who);
+                if (i.k == IK::Call && i.callee) todo.push_back(i.callee);
+                for (const Prog* b : i.branches) todo.push_back(b);
+            }
+            std::vector<int> rd;
+            std::vector<const Prog*> seen2;
+            collectProgRefs(*p, rd, seen2);
+            for (int r : rd) touch(r, who);
+        }
+        return true;
+    };
+    for (size_t pi = 0; pi < lowered.procs.size(); pi++)
+        if (!scanProg(lowered.procs[pi].prog, (int)pi)) return;
+    for (auto& f : lowered.finals) if (!scanProg(f.prog, -2)) return;
+    for (auto& sp : lowered.subs) if (sp) for (const Instr& i : sp->code) if (i.k == IK::Dump) return;
+    size_t done = 0, procsDone = 0;
+    for (size_t pi = 0; pi < lowered.procs.size(); pi++) {
+        auto& pr = lowered.procs[pi];
+        Prog& q = pr.prog;
+        size_t n = q.code.size();
+        if (!pr.loops || pr.program >= 0 || pr.reactive || n < 3) continue;
+        if (!q.roots.empty() || !q.spans.empty()) continue;
+        if (q.code[0].k != IK::WaitEdge || q.code[n - 1].k != IK::Jmp || q.code[n - 1].target != 0) continue;
+        bool edge = !q.code[0].events.empty() || q.code[0].edge != ANY;
+        for (auto& [sg, ed] : q.code[0].events) edge &= ed != ANY;
+        if (!edge) continue;   // a clocked block only
+        std::vector<size_t> cand;
+        bool ok = true;
+        for (size_t pc = 1; ok && pc + 1 < n; pc++) {
+            const Instr& x = q.code[pc];
+            if (x.k != IK::Assign || x.tmp) continue;
+            ok = x.sig >= 0 && (size_t)x.sig < ns && owner[x.sig] == (int)pi && x.drv < 0 && !x.arr && x.aidx.empty() &&
+                 x.dyn < 0 && !x.de && !x.delay && x.dly.empty() && x.gate < 0 && !x.udp;
+            cand.push_back(pc);
+        }
+        if (!ok || cand.empty()) {
+            if (dbg && !cand.empty()) std::cerr << "seqtmp kept: line " << q.code[1].line << "\n";
+            continue;
+        }
+        for (size_t pc : cand) q.code[pc].tmp = true;
+        done += cand.size();
+        procsDone++;
+    }
+    if (dbg) std::cerr << "seqtmp: " << done << " assigns in " << procsDone << " clocked blocks\n";
 }
 
 // Subroutine calls in a combinational block (always_comb, or an assign whose
@@ -2016,14 +2175,87 @@ static std::vector<std::string> implicitTops(slang::driver::Driver& driver, slan
     return tops;
 }
 
+// -saif with -saif_forward (IEEE 1801-2024 Annex J): an RTL forward file
+// keeps only its mapped points (J.5); a library one adds the state- and
+// path-dependent activity of each instance of its cells (J.3.6 to J.3.10, J.4).
+static void writeForwardSaif(const saif::Db& db, const wave::Reader& wr, const std::vector<std::string>& files,
+                             std::ostream& f) {
+    saif::Forward lib, rtl;
+    lib.lib = true;
+    for (auto& p : files) {
+        saif::Forward fw = saif::readForward(p);
+        if (fw.lib) {
+            for (auto& [n, c] : fw.cells) lib.cells[n] = std::move(c);
+            lib.path = p;
+        } else {
+            if (rtl.path.empty()) rtl.path = p;
+            for (auto& in : fw.insts) rtl.insts.push_back(std::move(in));
+        }
+    }
+    if (!rtl.path.empty()) {
+        if (!lib.cells.empty())
+            std::cerr << "msim: -saif_forward: the RTL mapping of " << rtl.path
+                      << " is written; library cells are not mapped points, so " << lib.path << " is not used\n";
+        std::vector<std::string> warn;
+        saif::rtlBackward(db, rtl, f, S.vcdTop, "msim", MINISIM_VERSION, warn);
+        for (auto& w : warn) std::cerr << "msim: -saif_forward: " << w << "\n";
+        return;
+    }
+    std::vector<saif::CellInst> insts;
+    for (auto& [path, mod] : instCells()) {
+        auto it = lib.cells.find(mod);
+        if (it == lib.cells.end()) continue;
+        saif::CellInst ci;
+        ci.path = path;
+        ci.cell = &it->second;
+        std::string pre = path + ".";
+        for (auto pi = portRecs().lower_bound(pre); pi != portRecs().end() && pi->first.compare(0, pre.size(), pre) == 0; ++pi) {
+            std::string pin = pi->first.substr(pre.size());
+            if (pin.find('.') == std::string::npos) ci.output[pin] = pi->second.dir == 1;
+        }
+        insts.push_back(std::move(ci));
+    }
+    std::vector<saif::CellActivity> acts(insts.size());
+    uint64_t end = std::max<uint64_t>(wr.end, db.start);
+    par::parallelFor(insts.size(), par::defaultThreads(), [&](size_t i) {
+        acts[i] = saif::cellActivity(insts[i], wr, db.start, end);
+    });
+    std::map<std::string, size_t> at;
+    for (size_t i = 0; i < insts.size(); i++) at[insts[i].path] = i;
+    saif::WriteHooks h;
+    h.cell = [&](const std::string& p) {
+        auto it = at.find(p);
+        return it == at.end() ? std::string() : insts[it->second].cell->name;
+    };
+    h.isPort = [&](const std::string& p, const std::string& net) {
+        auto it = at.find(p);
+        if (it == at.end()) return false;
+        size_t br = net.find('[');
+        return insts[it->second].output.count(br == std::string::npos ? net : net.substr(0, br)) > 0;
+    };
+    h.pin = [&](const std::string& p, const std::string& pin, std::ostream& os, const std::string& ind) {
+        size_t i = at.at(p);
+        auto& ports = insts[i].cell->ports;
+        auto pd = std::find_if(ports.begin(), ports.end(), [&](auto& x) { return x.first == pin; });
+        if (pd != ports.end()) saif::writePortDirectives(os, pd->second, acts[i].ports.at(pin), ind);
+    };
+    h.extra = [&](const std::string& p, std::ostream& os, const std::string& ind) {
+        auto it = at.find(p);
+        if (it != at.end()) saif::writeLeakage(os, *insts[it->second].cell, acts[it->second], ind);
+    };
+    saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION, &h);
+}
+
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
+                 "  -restore <file> go back to a $save checkpoint (first option; also -r)\n"
                  "  -xrun ...      the rest is an xrun / irun command line (also when run as xrun or irun)\n"
                  "  -elab          stop after elaboration, before the run\n"
                  "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
+                 "  -saif_forward <file>  forward SAIF for -saif: library (SDPD) or RTL mapping\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -2062,6 +2294,8 @@ static void usage() {
               << protfront::Options::help() <<
                  "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
                  "                 merges the branches instead of picking one (docs/XPROP.md)\n"
+                 "  -xprop=<file>, -xprop-config <file>  X-propagation set per instance or module\n"
+                 "                 (tree / instance / module {names} {xpropOn|xpropOff}; merge = ...)\n"
                  "  -xprop-report <file>  list every if / case / edge and whether it is merged\n"
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
@@ -2110,6 +2344,7 @@ int main(int argc, char** argv) {
     int vcdClass = 0;   // -vcd-class [N]
     std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
     bool saifTmp = false;   // ...and the waveform was only written for that
+    std::vector<std::string> saifForward;   // -saif_forward (IEEE 1801-2024 Annex J)
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
     bool interactiveMode = false;   // -i / -do FILE
@@ -2153,7 +2388,13 @@ int main(int argc, char** argv) {
         if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
         if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
         if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }
-        if (a.rfind("-xprop=", 0) == 0) { std::cerr << "msim: bad " << a << " (tmerge, xmerge or off)\n"; return 2; }
+        if (a.rfind("-xprop=", 0) == 0 || a == "-xprop-config") {   // a configuration file (docs/XPROP.md)
+            std::string cfg = a == "-xprop-config" ? next("a file name") : a.substr(7);
+            if (a != "-xprop-config" && !std::ifstream(cfg)) { std::cerr << "msim: bad " << a << " (tmerge, xmerge, off or a configuration file)\n"; return 2; }
+            std::string err = Lowerer::xpReadConfig(cfg);
+            if (!err.empty()) { std::cerr << "msim: -xprop configuration " << cfg << ": " << err << "\n"; return 2; }
+            continue;
+        }
         if (a == "-xprop-report") { xpropReport = next("a file name"); continue; }
         if (a == "-no-pin") { g_pin = 0; continue; }
         if (a == "-pin") { g_pin = 1; continue; }
@@ -2235,6 +2476,10 @@ int main(int argc, char** argv) {
         if (a == "-saif") {
             std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
             saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
+            continue;
+        }
+        if (a == "-saif_forward" && i + 1 < argc) {
+            saifForward.push_back(argv[++i]);
             continue;
         }
         if (a == "-profile") {   // profile.hpp
@@ -2410,6 +2655,7 @@ int main(int argc, char** argv) {
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (!saifForward.empty() && saifPath.empty()) saifPath = "dump.saif";   // -saif_forward implies -saif
     if (!saifPath.empty() && !vcdPath) {
 #ifdef MINISIM_FST
         vcdPath = saifPath + ".tmp.fst";
@@ -2424,10 +2670,15 @@ int main(int argc, char** argv) {
         S.closeWaves();
         try {
             saif::Db db;
-            saif::load(*vcdPath, db, par::defaultThreads());
+            wave::Reader wr;
+            saif::load(*vcdPath, db, par::defaultThreads(), saifForward.empty() ? nullptr : &wr);
             std::ofstream f(saifPath);
             if (!f) throw saif::Error("cannot write " + saifPath);
-            saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            if (saifForward.empty()) {
+                saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            } else {
+                writeForwardSaif(db, wr, saifForward, f);
+            }
         } catch (const std::exception& e) {
             std::cerr << "msim: -saif: " << e.what() << "\n";
             return false;
@@ -2768,10 +3019,12 @@ int main(int argc, char** argv) {
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
-    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOSEQTMP")) localizeSeqBlocking(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
@@ -2816,7 +3069,7 @@ int main(int argc, char** argv) {
         if (t.charge != STR_MEDIUM) S.charge[t.sig] = t.charge;
         if (t.decays) S.decay[t.sig] = Sim::Decay{t.decay, 0, true};
     }
-    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
+    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist, t.aLo, t.bLo, t.w);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
