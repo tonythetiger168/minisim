@@ -1,0 +1,4 @@
+# Validated on WSL Ubuntu / Python 3.14.4, 2026-11-01.
+pyslang==12.1.0
+pyuvm==5.0.0
+cocotb==2.1.0

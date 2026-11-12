@@ -16,5 +16,9 @@ int main(){
   std::vector<int> regs={5};
   auto e=bin(Op::Add,ref(0),konst(mk(1,4)));
   assert(eval(e,[&](int s){return mk(regs[s],4);}).v==6);
+  auto extend = eval(resize(konst(allz(4)), 8), [](int){ return mk(0); });
+  assert(extend.w == 8 && extend.x == 15 && extend.z == 15 && extend.v == 0);
+  auto narrow = eval(resize(konst(mk(0xA5,8)), 4), [](int){ return mk(0); });
+  assert(narrow.w == 4 && narrow.v == 5 && narrow.x == 0);
   std::cout<<"ok\n";
 }

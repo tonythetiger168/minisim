@@ -1,0 +1,559 @@
+{
+  "checked_date_taipei": "2026-11-03",
+  "repositories": [
+    {
+      "repo": "freecores/uart16550",
+      "revision": "2b0ad80d0968f201f95506854ad769c8a44abe2b",
+      "truncated": false,
+      "header_source": "https://raw.githubusercontent.com/freecores/uart16550/2b0ad80d0968f201f95506854ad769c8a44abe2b/bench/verilog/uart_testbench.v",
+      "test_sources": [
+        {
+          "path": "bench/verilog/test_cases/uart_int.v",
+          "sha": "9cd0b35d7cf9fa5e9911fc215aa7a52a97dff32b"
+        },
+        {
+          "path": "bench/verilog/uart_device.v",
+          "sha": "a5b0b12d05d088e659023294d17b126d569d4f75"
+        },
+        {
+          "path": "bench/verilog/uart_device_utilities.v",
+          "sha": "d6eb1b11f652ec744ff5539194ccf1235b2a3d97"
+        },
+        {
+          "path": "bench/verilog/uart_log.v",
+          "sha": "921b9575158a94c155795c36e4bd9347ef78d84d"
+        },
+        {
+          "path": "bench/verilog/uart_test.v",
+          "sha": "5d61949ba378daa6bcb22e47b7c71f816c6b19f0"
+        },
+        {
+          "path": "bench/verilog/uart_testbench.v",
+          "sha": "8254a19f0bebf5f0a9ee75f4bd5e3b952b14946f"
+        },
+        {
+          "path": "bench/verilog/uart_testbench_defines.v",
+          "sha": "38334b13330544d7c0ff0c01f65f5d6fc6f2ab12"
+        },
+        {
+          "path": "bench/verilog/uart_testbench_utilities.v",
+          "sha": "a2c24b91c7ebdcc3784c4de54b660d2326c1a61f"
+        },
+        {
+          "path": "bench/verilog/uart_wb_utilities.v",
+          "sha": "68317a9ab827beb6e23e3c294b392a94a6c98102"
+        },
+        {
+          "path": "bench/verilog/wb_mast.v",
+          "sha": "7e6ba1864c25ce7c9b75411caec3f1901b6d6756"
+        },
+        {
+          "path": "bench/verilog/wb_master_model.v",
+          "sha": "d6690af30810afc2012d54cc2ea262639a31fdf6"
+        },
+        {
+          "path": "bench/verilog/wb_model_defines.v",
+          "sha": "234307ab83012815454d88b493c527fa932f871f"
+        }
+      ],
+      "license_note": "Inspected testbench header references LGPL-2.1-or-later; not a repository-wide license audit",
+      "status": "queued_not_simulated"
+    },
+    {
+      "repo": "freecores/i2c",
+      "revision": "3b067f00ccced753b0502024766a51f58f3e04bc",
+      "truncated": false,
+      "header_source": "https://raw.githubusercontent.com/freecores/i2c/3b067f00ccced753b0502024766a51f58f3e04bc/bench/verilog/tst_bench_top.v",
+      "test_sources": [
+        {
+          "path": "bench/verilog/i2c_slave_model.v",
+          "sha": "53298b680e7af18343dd33e36928edadbbf75a3e"
+        },
+        {
+          "path": "bench/verilog/tst_bench_top.v",
+          "sha": "8b6a29069005025be7260403737b75781da9a70b"
+        },
+        {
+          "path": "bench/verilog/wb_master_model.v",
+          "sha": "1b2f43ccd1c6ff58ba24c720f66d3ee537a1aaad"
+        }
+      ],
+      "license_note": "Inspected testbench header has copyright-retention/disclaimer terms; no repository-wide SPDX classification established",
+      "status": "queued_not_simulated"
+    },
+    {
+      "repo": "freecores/simple_spi",
+      "revision": "61c39a5f79fd8477d78f7b04edf6d9d530a904af",
+      "truncated": false,
+      "header_source": "https://raw.githubusercontent.com/freecores/simple_spi/61c39a5f79fd8477d78f7b04edf6d9d530a904af/bench/verilog/tst_bench_top.v",
+      "test_sources": [
+        {
+          "path": "bench/verilog/spi_slave_model.v",
+          "sha": "a695c93765bfcb00f4a782204d1e4fac2d63ffb7"
+        },
+        {
+          "path": "bench/verilog/tst_bench_top.v",
+          "sha": "de4a9e83dc03d5d7fa29bc542fc6c58648320e2c"
+        },
+        {
+          "path": "bench/verilog/wb_master_model.v",
+          "sha": "ad154fe3475f850a1251604f19ca7ab9e5129af6"
+        }
+      ],
+      "license_note": "Inspected testbench header has copyright-retention/disclaimer terms; no repository-wide SPDX classification established",
+      "status": "queued_not_simulated"
+    },
+    {
+      "repo": "freecores/gpio",
+      "revision": "73eafb007e6718b1503d17ae3e0c06139109d345",
+      "truncated": false,
+      "header_source": "https://raw.githubusercontent.com/freecores/gpio/73eafb007e6718b1503d17ae3e0c06139109d345/bench/verilog/gpio_testbench.v",
+      "test_sources": [
+        {
+          "path": "bench/verilog/clkrst.v",
+          "sha": "d0bb9befff76bb68bc13865bf7abf5f9add45459"
+        },
+        {
+          "path": "bench/verilog/gpio_mon.v",
+          "sha": "a809a80244a6c5786a7eff3bb18739836a7951af"
+        },
+        {
+          "path": "bench/verilog/gpio_testbench.v",
+          "sha": "7035e4a14bff3a7d201c0d364e0c5f2110830abd"
+        },
+        {
+          "path": "bench/verilog/tb_defines.v",
+          "sha": "852c2294826337b5a76bc3685b34d4d4c8759f14"
+        },
+        {
+          "path": "bench/verilog/tb_tasks.v",
+          "sha": "f0868f3b07e64ff1e4fdcceb348b8bf6f5d44780"
+        },
+        {
+          "path": "bench/verilog/timescale.v",
+          "sha": "ff200d44e95c687ec9018d0ac3a9f43e3fd84771"
+        },
+        {
+          "path": "bench/verilog/wb_master.v",
+          "sha": "f663513d82203310138a67f11aa2b7f0e0739b4d"
+        }
+      ],
+      "license_note": "Inspected testbench header references LGPL-2.1-or-later; not a repository-wide license audit",
+      "status": "queued_not_simulated"
+    }
+  ],
+  "opentitan": {
+    "revision": "41049e9deb40e0602cd5272c40398be380ae2637",
+    "inventory_kind": "literal core-file entries only; not resolved FuseSoC targets",
+    "cores": [
+      {
+        "name": "uart",
+        "core": "hw/ip/uart/uart.core",
+        "core_sha256": "a50b1605df8e902d5e73812cb8581700fd569b841ab0dddbe8d0e1496a226307",
+        "sources": [
+          {
+            "path": "hw/ip/uart/rtl/uart_reg_pkg.sv",
+            "exists": true,
+            "sha256": "0aa5047f82044669814e5cf4631a29e034f27e5f0fb7528f13e3d28d234b6942"
+          },
+          {
+            "path": "hw/ip/uart/rtl/uart_reg_top.sv",
+            "exists": true,
+            "sha256": "d971d08310ce3253a8c9cdc83e697c11c2599c54d7a970d0de5f04cd7dcedda3"
+          },
+          {
+            "path": "hw/ip/uart/rtl/uart_rx.sv",
+            "exists": true,
+            "sha256": "c167aeabb5b333b4719ac1b0562d0e65a6ba27ed6f1653c195cc87956cf41849"
+          },
+          {
+            "path": "hw/ip/uart/rtl/uart_tx.sv",
+            "exists": true,
+            "sha256": "ac46be1c9c8d1a8dcb988f7ef05eda2408632e8bd4c3242bb9f142cb801cb151"
+          },
+          {
+            "path": "hw/ip/uart/rtl/uart_core.sv",
+            "exists": true,
+            "sha256": "eae5b741c536f5b01b3f76828df7c4dbec1a2994ebc352d9e7fec0bdd5877497"
+          },
+          {
+            "path": "hw/ip/uart/rtl/uart.sv",
+            "exists": true,
+            "sha256": "e1a6112299c577ae43227f3c6a9f6b11c9c1e0dee1bc0218e93ddf08b4898434"
+          }
+        ],
+        "status": "queued_not_simulated"
+      },
+      {
+        "name": "spi_host",
+        "core": "hw/ip/spi_host/spi_host.core",
+        "core_sha256": "438d8c2c51f319fefc88ddc2d2b25b8ff9988785c378f7faca26635b33787eb2",
+        "sources": [
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_reg_pkg.sv",
+            "exists": true,
+            "sha256": "78e78ce2c6d51e67500f5ff7f4c711a1af36ce333b8676bfd6cdacc43191cc8a"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_cmd_pkg.sv",
+            "exists": true,
+            "sha256": "2a20cfd0eb1d1c5d8c191e24a0beb03fb3b89eb4f517f37c8b81ceddc9dd442e"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_shift_register.sv",
+            "exists": true,
+            "sha256": "c77ae0ebdcbdaa203c30e5e4a6ee5d054a086f0441ce29e81d881680ed478d10"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_byte_select.sv",
+            "exists": true,
+            "sha256": "71e58ea5d02a87db488f89de12a9f2ff06e2a209733e06d68edc1724e749069a"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_byte_merge.sv",
+            "exists": true,
+            "sha256": "bab3755d6a4959a0263025d77200ec7e8daf22930da4699951dfcfe0a426afb2"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_fsm.sv",
+            "exists": true,
+            "sha256": "d36ba70a6e8069532714e0203b9c176dadabda27f0798e91e78a6f7b2a4bc892"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_core.sv",
+            "exists": true,
+            "sha256": "47d1dab26aa33c5f95b691dffac009dec6db7873809cb5a322d3d9c823f45d4c"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_command_queue.sv",
+            "exists": true,
+            "sha256": "61036243f9c8a50a36718977454e17578a1987e8931b678ac5fc29230754e69e"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_data_fifos.sv",
+            "exists": true,
+            "sha256": "0344bbd847f9f212d3a4efe64ff205b365a3ff2a6055a1c1dfdc485f6cffe0fe"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_reg_top.sv",
+            "exists": true,
+            "sha256": "eea9309b1c52f0226b5fdfa4a0528005e2d37281096584d99b01835cde149f4c"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host_window.sv",
+            "exists": true,
+            "sha256": "6d2acf6bdfabcf5d28f22f2d27601156a0681d6e7e56ae9f2bc12aaac1db25ef"
+          },
+          {
+            "path": "hw/ip/spi_host/rtl/spi_host.sv",
+            "exists": true,
+            "sha256": "e7d6b1474202761a56a0592c18e8811609baa6f5619630bb66d49844bb8d295a"
+          }
+        ],
+        "status": "queued_not_simulated"
+      },
+      {
+        "name": "i2c",
+        "core": "hw/ip/i2c/i2c.core",
+        "core_sha256": "dab6c9548b9f134962357d63392290f600267e255141e7bb836a126b05f2f6f4",
+        "sources": [
+          {
+            "path": "hw/ip/i2c/rtl/i2c_reg_pkg.sv",
+            "exists": true,
+            "sha256": "7775d405a5b87b2169722b18c7c23e8207fc96259381d80121adc031def8f55e"
+          },
+          {
+            "path": "hw/ip/i2c/rtl/i2c_reg_top.sv",
+            "exists": true,
+            "sha256": "1a5ac00132961f4f3330a7ac2c2ea10612f5066dece3747f04cb488fcfe8cb9a"
+          },
+          {
+            "path": "hw/ip/i2c/rtl/i2c_fifo_sync_sram_adapter.sv",
+            "exists": true,
+            "sha256": "4bd154937b8ed62c6b1fac6b9d173ff1024d4886da6c4171a039a1264632567d"
+          },
+          {
+            "path": "hw/ip/i2c/rtl/i2c_fifos.sv",
+            "exists": true,
+            "sha256": "a80f3085aa8e74cb8373c33448c6d6856f9608e7b17bf3aca70832270efea894"
+          },
+          {
+            "path": "hw/ip/i2c/rtl/i2c_core.sv",
+            "exists": true,
+            "sha256": "8d1e05f716facc801e8741956309db5b3121c1e80290bbde67cb5722934e9e4a"
+          },
+          {
+            "path": "hw/ip/i2c/rtl/i2c_bus_monitor.sv",
+            "exists": true,
+            "sha256": "83150c3366ba0de8e0f71a56e99011f7fd724e04b6804f23870155e36ba7ea24"
+          },
+          {
+            "path": "hw/ip/i2c/rtl/i2c_controller_fsm.sv",
+            "exists": true,
+            "sha256": "bf6d90f1a88d7bc4bb18416477c4fe78e464d40f2deff3d5104977ea32ac15a5"
+          },
+          {
+            "path": "hw/ip/i2c/rtl/i2c_target_fsm.sv",
+            "exists": true,
+            "sha256": "5b96249bc5299dbf3aac94770ef01dd6b0257072a8b399ee1c6adb35af7bacac"
+          },
+          {
+            "path": "hw/ip/i2c/rtl/i2c.sv",
+            "exists": true,
+            "sha256": "1a47df3b0e15e629509aad2894d7d1946cc789527f6759c86c9273ceb815a2ee"
+          }
+        ],
+        "status": "queued_not_simulated"
+      },
+      {
+        "name": "aes",
+        "core": "hw/ip/aes/aes.core",
+        "core_sha256": "b73ae8ea40c616882268bc1e34a2eeffb471b1f95f6bc5c950ea9b0b6a5e2f47",
+        "sources": [
+          {
+            "path": "hw/ip/aes/rtl/aes_reg_pkg.sv",
+            "exists": true,
+            "sha256": "c1eca486a5c07b1d865cc7ef502673c056140fec8dc971b4695bd04d2ce5f186"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_pkg.sv",
+            "exists": true,
+            "sha256": "8fe62c993278cc30ec719c4037acc49e80334e90ad2effb1b00d495e615402bc"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_reg_top.sv",
+            "exists": true,
+            "sha256": "0534c7a1cec788900fe4761270b93391bb1ff1581147c8918b6c1a7084425e0e"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_ctrl_reg_shadowed.sv",
+            "exists": true,
+            "sha256": "9bf58ca28b7c3fdb15d406ad39b22860d81343798bc93316f74e46bf64786170"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_ctrl_gcm_reg_shadowed.sv",
+            "exists": true,
+            "sha256": "d7607822d2edda795f21ef0e79141c9d0b694d92f5f9c1333f57f29967b819ba"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_core.sv",
+            "exists": true,
+            "sha256": "b3f0dff462db282dc3c039093ab2ac2fbfbe6dad93b9ad35e56d0cecc5f99889"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_ctr.sv",
+            "exists": true,
+            "sha256": "5a14c2b634af47c2fa4501c1203783a5a25af7d72f4689e1c99d62fcfaff4564"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_ctr_fsm.sv",
+            "exists": true,
+            "sha256": "5bc85a4f5beaac8ea177bad62f6edf7fd4057cae7e73aef23d8e26130cda1527"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_ctr_fsm_p.sv",
+            "exists": true,
+            "sha256": "07e06ff631dc317fabd2af7a176cd3f33c951432d13ff3175aa77582c506e5ea"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_ctr_fsm_n.sv",
+            "exists": true,
+            "sha256": "a2bca3332ec2c5174f4323495e4c6c477ba771a9b4aa5d8a51124ba8c11ef7ec"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_control.sv",
+            "exists": true,
+            "sha256": "ccc26193285ed17a33b64f0e0fb2a72ab4a88d2ca457014eb8f70f2ef5102ceb"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_control_fsm.sv",
+            "exists": true,
+            "sha256": "eb26cd94891789675bb4b04bb56d9c2021647fbcc4c448b33d9d499178aeb594"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_control_fsm_p.sv",
+            "exists": true,
+            "sha256": "0a4b49e8286191f59da185f612cb76839cdd64c6a16825171a3a2256df3c158b"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_control_fsm_n.sv",
+            "exists": true,
+            "sha256": "f95a961893766f69c730cb2f54d4556ef1937186468cf61457b1f6f1d4f2a60b"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_reg_status.sv",
+            "exists": true,
+            "sha256": "26475a30255f24df6897393fafb1e84d5b4471b28e1eb496bcf6a90b5d00ec99"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sel_buf_chk.sv",
+            "exists": true,
+            "sha256": "75e91d3432145803a4a8cc916ca34a1c84d9db661a872ebec87b9b5683795c2f"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_cipher_core.sv",
+            "exists": true,
+            "sha256": "9b7a9bb915df4403b7111d4113a73aa63b7b8699fc96bd6d3a7d6f0b983e57c9"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_cipher_control.sv",
+            "exists": true,
+            "sha256": "f2d83ca351660d76352ad6d0a882e9999e6349c92e312dcd1fa58564aac84837"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_cipher_control_fsm.sv",
+            "exists": true,
+            "sha256": "8759f31a4c6618fd0bed4b692422d4ca2ee49a0376ee0fb17cc8ad0122394b40"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_cipher_control_fsm_p.sv",
+            "exists": true,
+            "sha256": "fcb2c10e8b3c0fa2c741f4c055bf7233e1c9a323d35155219c5d91de682dad4c"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_cipher_control_fsm_n.sv",
+            "exists": true,
+            "sha256": "975e5ced8006bdf5f5e563886ee71c3afa3fcc053cabee17524e3e0494dd339d"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sub_bytes.sv",
+            "exists": true,
+            "sha256": "08913054c338e7dcb968d097cd9ee35f77942f8bf1abd1d8d047c8b3074cc55d"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sbox.sv",
+            "exists": true,
+            "sha256": "4993e2929c9c66b3c9453cf81bf80ecd31211a7f86ef344f2fe5e0659bab0ed8"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sbox_lut.sv",
+            "exists": true,
+            "sha256": "2add0b2f220019e8398d4a6d1c3f0651426aa8e10adb97ea364ae03c947f9d3d"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sbox_canright_pkg.sv",
+            "exists": true,
+            "sha256": "accca4b45c95817bdd83541c58c8302fa99b6205e44847c33bd70ddcc03d74f5"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sbox_canright.sv",
+            "exists": true,
+            "sha256": "c6aa1da23655325c85fdd1b09ff9943840208112e568d1a62a8634adc0c469ee"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sbox_canright_masked_noreuse.sv",
+            "exists": true,
+            "sha256": "e8c26215b7eda4bea8dbc06b20557b2426ad6dcf37b0c8dce23d37120cb94e36"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sbox_canright_masked.sv",
+            "exists": true,
+            "sha256": "666c2a9f4429b197f3637bd91ec5809e0c8e89db32ef026836febc1f5f6a7ef8"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_sbox_dom.sv",
+            "exists": true,
+            "sha256": "aaa5d40fed4f8a96d347920f8981028166263854fe7b6df927185304940a47e1"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_shift_rows.sv",
+            "exists": true,
+            "sha256": "29643c837537eadf4f7d078565696cb8d5f4653d9e66aebc83828dd420b7d2e0"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_mix_columns.sv",
+            "exists": true,
+            "sha256": "efc59305a911b13904cbb669b62d0319d3754e1c77689852f6c6061e15f07f30"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_mix_single_column.sv",
+            "exists": true,
+            "sha256": "e39ae77ef548c5f888068aa148d15742af7d02b75f0a987ede336d7aa1e78465"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_key_expand.sv",
+            "exists": true,
+            "sha256": "90a4a099b8841ec176fc45d48c5de54bfff5249de17cd736499e0ed1d0218b71"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_prng_clearing.sv",
+            "exists": true,
+            "sha256": "cb9575986d2dabbfd010df5d598c4b08eb097cbcf03e17111ec678a80c580689"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_prng_masking.sv",
+            "exists": true,
+            "sha256": "0c4946b5f1a977b6e7a10cf854168b5fb9bfbfaca52ac56ec103477c4f023fc3"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes_ghash.sv",
+            "exists": true,
+            "sha256": "a857a8585c832468edabdd5c5c74e79e86824b6d44be0c06b309b70d6abb8379"
+          },
+          {
+            "path": "hw/ip/aes/rtl/aes.sv",
+            "exists": true,
+            "sha256": "0009516cd7b14849b6c37393fdcde6bd27769ae5def049612bab20c4e8bb5d55"
+          }
+        ],
+        "status": "queued_not_simulated"
+      },
+      {
+        "name": "hmac",
+        "core": "hw/ip/hmac/hmac.core",
+        "core_sha256": "dea26d20add316df1e1311e79ff53181b335822bf6f0e61ba7e11726ab3290dd",
+        "sources": [
+          {
+            "path": "hw/ip/hmac/rtl/hmac_reg_pkg.sv",
+            "exists": true,
+            "sha256": "e5ff6513a561fb38b347f0fb2a2090683129f6a15f2c725813961899dd443075"
+          },
+          {
+            "path": "hw/ip/hmac/rtl/hmac_reg_top.sv",
+            "exists": true,
+            "sha256": "c333fa792215561e0fa7b64de6c59308e7e5a812508f22b64905b733e93d17c3"
+          },
+          {
+            "path": "hw/ip/hmac/rtl/hmac_core.sv",
+            "exists": true,
+            "sha256": "fd237e13a469ebc9b587b3c70f31b1b0c925cf3e311e0dc79e290a74e8eb3d83"
+          },
+          {
+            "path": "hw/ip/hmac/rtl/hmac.sv",
+            "exists": true,
+            "sha256": "8c76b98de3089b6a236ee387de868c2f92bf43a065c2ca94c7f37046178a92fd"
+          }
+        ],
+        "status": "queued_not_simulated"
+      },
+      {
+        "name": "gpio",
+        "core": "hw/top_earlgrey/ip_autogen/gpio/gpio.core",
+        "core_sha256": "894f659b7452af5895ac6e196ca122e17bcb90787e7ac9e0effbc0dae1d4f129",
+        "sources": [
+          {
+            "path": "hw/top_earlgrey/ip_autogen/gpio/rtl/gpio_pkg.sv",
+            "exists": true,
+            "sha256": "b05724c2bf9dd955b4e325fca56e12dc43fb3bb2a81290dab3196711094471d7"
+          },
+          {
+            "path": "hw/top_earlgrey/ip_autogen/gpio/rtl/gpio_reg_pkg.sv",
+            "exists": true,
+            "sha256": "d9e9800bd560d3b18a08c0d9c1b97161a097d4c167ec0cff51ee5997ab309ffc"
+          },
+          {
+            "path": "hw/top_earlgrey/ip_autogen/gpio/rtl/gpio_reg_top.sv",
+            "exists": true,
+            "sha256": "24afb53691eddc55fdd8864911419769b0e8d2d0a1f8e7123e23c02198832463"
+          },
+          {
+            "path": "hw/top_earlgrey/ip_autogen/gpio/rtl/gpio.sv",
+            "exists": true,
+            "sha256": "55adc9133e6dbf2243957c6bdef5a76928addce935b4126cf10328d84a367156"
+          }
+        ],
+        "status": "queued_not_simulated"
+      }
+    ]
+  }
+}

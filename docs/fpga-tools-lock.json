@@ -1,0 +1,114 @@
+{
+  "checked_date": "2026-11-01",
+  "scope": "GitHub FPGA tool candidates; metadata verification is not installation or execution",
+  "tools": [
+    {
+      "repo": "YosysHQ/yosys",
+      "url": "https://github.com/YosysHQ/yosys",
+      "description": "Yosys Open SYnthesis Suite",
+      "license": "ISC",
+      "archived": false,
+      "revision": "63eecf3ddca2f143750f11e37ebd18ecb16b51c7",
+      "commit_date": "2026-10-29T15:02:43Z"
+    },
+    {
+      "repo": "YosysHQ/nextpnr",
+      "url": "https://github.com/YosysHQ/nextpnr",
+      "description": "nextpnr portable FPGA place and route tool",
+      "license": "ISC",
+      "archived": false,
+      "revision": "a2c6479977d64d312686d853a93941744fdbeacf",
+      "commit_date": "2026-10-31T14:04:28Z"
+    },
+    {
+      "repo": "YosysHQ/icestorm",
+      "url": "https://github.com/YosysHQ/icestorm",
+      "description": "Project IceStorm - Lattice iCE40 FPGAs Bitstream Documentation (Reverse Engineered)",
+      "license": "ISC",
+      "archived": false,
+      "revision": "ee340bb2cec60e0d01948076537a9bb3d08aea26",
+      "commit_date": "2026-10-18T05:17:11Z"
+    },
+    {
+      "repo": "YosysHQ/prjtrellis",
+      "url": "https://github.com/YosysHQ/prjtrellis",
+      "description": "Documenting the Lattice ECP5 bit-stream format.",
+      "license": "NOASSERTION",
+      "archived": false,
+      "revision": "2d12005ab9703ff60603d7ae91dca254939e671f",
+      "commit_date": "2026-10-31T13:47:06Z"
+    },
+    {
+      "repo": "YosysHQ/apicula",
+      "url": "https://github.com/YosysHQ/apicula",
+      "description": "Project Apicula 🐝: bitstream documentation for Gowin FPGAs",
+      "license": "MIT",
+      "archived": false,
+      "revision": "59ef8978bc329642e32ec3f6e5f27ae67003c6bb",
+      "commit_date": "2026-10-31T01:01:36Z"
+    },
+    {
+      "repo": "YosysHQ/oss-cad-suite-build",
+      "url": "https://github.com/YosysHQ/oss-cad-suite-build",
+      "description": "Multi-platform nightly builds of open source digital design and verification tools",
+      "license": "ISC",
+      "archived": false,
+      "revision": "4901acb76364db4fcba2cc7877139aa2bf41291c",
+      "commit_date": "2026-10-30T07:06:16Z"
+    },
+    {
+      "repo": "olofk/fusesoc",
+      "url": "https://github.com/olofk/fusesoc",
+      "description": "Package manager and build abstraction tool for FPGA/ASIC development",
+      "license": "BSD-2-Clause",
+      "archived": false,
+      "revision": "2ed5d336467f31d552641fb986339ccefb0ee1cb",
+      "commit_date": "2026-10-23T09:00:02Z"
+    },
+    {
+      "repo": "olofk/edalize",
+      "url": "https://github.com/olofk/edalize",
+      "description": "An abstraction library for interfacing EDA tools",
+      "license": "BSD-2-Clause",
+      "archived": false,
+      "revision": "9a6f648c596bfe74224ae82f529075e565d4182b",
+      "commit_date": "2026-09-15T16:32:45Z"
+    },
+    {
+      "repo": "trabucayre/openFPGALoader",
+      "url": "https://github.com/trabucayre/openFPGALoader",
+      "description": "Universal utility for programming FPGA",
+      "license": "Apache-2.0",
+      "archived": false,
+      "revision": "cdfe87afea9a3e6e85ded1309a6bf1ce6d897f8e",
+      "commit_date": "2026-10-29T21:34:38Z"
+    },
+    {
+      "repo": "f4pga/f4pga",
+      "url": "https://github.com/f4pga/f4pga",
+      "description": "Documentation for F4PGA",
+      "license": "Apache-2.0",
+      "archived": false,
+      "revision": "835a40534f9efd70770d74f56f25fef6cfc6ebc6",
+      "commit_date": "2023-04-22T12:31:59Z"
+    },
+    {
+      "repo": "f4pga/prjxray",
+      "url": "https://github.com/f4pga/prjxray",
+      "description": "Documenting the Xilinx 7-series bit-stream format.",
+      "license": "ISC",
+      "archived": false,
+      "revision": "c9f02d8576042325425824647ab5555b1bc77833",
+      "commit_date": "2025-06-05T15:15:54Z"
+    },
+    {
+      "repo": "enjoy-digital/litex",
+      "url": "https://github.com/enjoy-digital/litex",
+      "description": "Build your hardware, easily!",
+      "license": "NOASSERTION",
+      "archived": false,
+      "revision": "57dc334007b56f9b3b74e2a4ac97882d96bd4260",
+      "commit_date": "2026-10-30T16:15:53Z"
+    }
+  ]
+}

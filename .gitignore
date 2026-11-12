@@ -3,3 +3,6 @@ build/
 *.o
 .vscode/
 .idea/
+.venv*/
+__pycache__/
+*.pyc

@@ -3,6 +3,7 @@
 // Flat code avoids recursive coroutines: if/else become jumps.
 #pragma once
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -21,6 +22,8 @@ enum class IK {
 };
 
 struct Instr {
+    // Optional source-map bin (e.g. line:counter_sv:4); a frontend must populate it.
+    std::string line_bin;
     IK k = IK::Jmp;
     int sig = -1;
     E e;

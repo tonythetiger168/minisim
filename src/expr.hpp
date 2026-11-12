@@ -143,13 +143,13 @@ inline Val v_concat(const std::vector<Val>& parts) {
     }
     return r;
 }
-// Unknown condition: keep bits where both branches agree and are known, else X.
+// Unknown condition: keep identical 0/1/X/Z bits; differing bits become X.
 inline Val v_mux(Val c, Val a, Val b) {
     int t = truth(c);
     if (t == 1) return a;
     if (t == 0) return b;
     uint64_t diff = (a.v ^ b.v) | a.x | b.x;
-    return make(a.v & ~diff, diff, wmax(a, b));
+    return make(a.v & ~diff, diff, wmax(a, b), a.z & b.z);
 }
 
 // Wire resolution of two drivers, per bit (no strengths):
@@ -168,7 +168,7 @@ enum class Op {
     Not, And, Or, Xor, Add, Sub, Mul,
     Eq, Ne, CaseEq, CaseZEq, CaseXEq, Lt, Le, Gt, Ge, Shl, Shr,
     LogNot, LogAnd, LogOr, RedAnd, RedOr, RedXor,
-    Slice, Index, Concat, Mux
+    Slice, Index, Concat, Mux, Resize
 };
 struct Expr;
 using E = std::shared_ptr<Expr>;
@@ -193,6 +193,10 @@ inline E bin(Op op, E a, E b) { return node(op, {a, b}); }
 inline E slice(E a, int hi, int lo) { auto e = node(Op::Slice, {a}); e->hi = hi; e->lo = lo; return e; }
 inline E concat(std::vector<E> parts) { return node(Op::Concat, std::move(parts)); }
 inline E mux(E c, E a, E b) { return node(Op::Mux, {c, a, b}); }
+// Unsigned integral conversion (zero extension or truncation), including X/Z bits.
+inline E resize(E a, int width) {
+    auto e = node(Op::Resize, {a}); e->hi = width; return e;
+}
 
 using Reader = std::function<Val(int)>;
 
@@ -233,6 +237,10 @@ inline Val eval(const E& e, const Reader& rd) {
             return v_concat(parts);
         }
         case Op::Mux: return v_mux(k(0), k(1), k(2));
+        case Op::Resize: {
+            Val value = k(0);
+            return make(value.v, value.x, e->hi, value.z);
+        }
     }
     return allx(1);
 }
