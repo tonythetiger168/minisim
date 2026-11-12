@@ -887,6 +887,12 @@ struct Lowerer {
             i.delay = ticksOf((double)*x.as<IntegerLiteral>().getValue().as<uint64_t>());
             return;
         }
+        if (d.type->isFloating()) {   // #(hb) with a real variable: scaled to ticks, rounded (10.3.3, 11.11)
+            // rounded to the module's precision first, as a constant delay is
+            E inPrec = rtoi(bin(Op::FMul, realOf(d), realK((double)pow10u(tsUnit - tsPrec))), 64, false, false);
+            i.de = bin(Op::Mul, inPrec, konst(mk(pow10u(tsPrec - simPrecExp()), 64)));
+            return;
+        }
         if (!d.type->isIntegral()) unsupported("non-integral delay expression");
         E v = resize(expr(d), 64, false, false);
         i.de = bin(Op::Mul, v, konst(mk(ticksPerUnit(), 64)));

@@ -56,7 +56,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 9.2.3 | Final procedures | ✅ | run once after the last time slot, also after `$finish`. `9.2.3-final` |
 | 9.3.1 | begin…end | ✅ | |
 | 9.3.2 | fork…join / join_any / join_none | ✅ | automatic variables in a fork block get one copy per execution of the fork (`fork automatic int j = i; ... join_none` in a loop). `9.3.2-fork-join`, `9.3.2-fork-automatic` |
-| 9.4.1 | Delay control | ✅ | constant, real, time literal, or any integral expression (evaluated when reached; x or z waits 0). `9.4.5-intra-assign-delay` |
+| 9.4.1 | Delay control | ✅ | constant, real, time literal, or any integral or real expression (evaluated when reached, a real one rounded to the precision; x or z waits 0). `9.4.5-intra-assign-delay`, `9.4.1-real-delay-variable` |
 | 9.4.2 | Event control | ✅ | posedge / negedge / any change, `or`, `@*`, named events; on any expression, such as `@(posedge clk[i])` (an edge on its least significant bit). `9.4.2-edge-on-expression` |
 | 9.4.3 | wait | ✅ | `9.4.3-wait` |
 | 9.4.5 | Intra-assignment delay | ✅ | `a = #d b` and `a <= #d b`. Blocking intra-assignment event controls `a = @(e) b` and `a = repeat (n) @(e) b`. The nonblocking forms `a <= @(e) b` and `a <= repeat (n) @(e) b` start a process that schedules the update at the event (`9.4.5-nonblocking-event-assign`). `9.4.5-intra-assign-delay`, `9.4.5-repeat-event-assign` |
