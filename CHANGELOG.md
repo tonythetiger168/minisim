@@ -694,6 +694,13 @@ Spec references are IEEE 1800-2023 clauses.
   BASE64_TEXT, what tool and common blocks may hold, and viewport lists with
   `.` or `:` scoped names. Clear modules instantiated in or bound into
   protected IP are hidden from waveforms, coverage and lint output.
+- `mplan`: requirement traceability. `req ID ...` in a feature and a
+  requirement list (`reqs FILE` in the plan or `-reqs FILE`), read from CSV
+  or ReqIF (`.reqif` / `.reqifz`, with the hierarchy). Every requirement is
+  verified, partial, failing, not started or uncovered; the report, the
+  HTML page, `plan.json`, the history and `mplan trend` show it, `-trace`
+  writes the matrix as CSV, `-fail-on-uncovered` gates on it, and
+  `mplan init -reqs` drafts a plan from the list.
 
 ### Fixed
 - msim memory on big VIP benches: a 2-state unpacked array with more than

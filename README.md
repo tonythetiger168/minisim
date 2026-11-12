@@ -356,6 +356,7 @@ mplan report uart.vplan -results regress.d -label $GIT_COMMIT -rules triage.rule
 mplan triage -results regress.d -plan uart.vplan   # only the failure buckets
 mplan trend  plan.d/history.jsonl                  # score, tests and coverage per snapshot
 mplan init   -results regress.d -o draft.vplan     # a starting plan from an existing regression
+mplan report uart.vplan -results regress.d -reqs reqs.reqif -trace trace.csv   # requirement traceability
 ```
 
 `mplan report` scores every feature (weighted, with a goal per metric),

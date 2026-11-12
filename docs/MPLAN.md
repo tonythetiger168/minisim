@@ -119,6 +119,49 @@ features whose score dropped, and the triage classes below.
 `mplan trend history.jsonl [-n N] [-feature PATH]` prints the history as a
 table, for the plan or for one feature.
 
+## Requirements
+
+A feature says which requirements it verifies, and the plan names the list
+they come from:
+
+```
+plan uart "UART verification plan"
+  reqs uart_reqs.csv              # CSV or ReqIF, relative to the plan file
+  feature parity "Parity"
+    req UART-12 UART-13
+    test uart_parity_*
+```
+
+`-reqs FILE` (repeatable, on `check`, `report` and `init`) adds lists from
+the command line.
+
+- **CSV** (`,`, `;` or tab): a header row with an `id` column and,
+  optionally, `title` (or `name`, `summary`), `text` (or `description`),
+  `parent` and `priority`. Excel and Jira exports fit as they are.
+- **ReqIF** (`.reqif`, or a `.reqifz` archive, as DOORS, Polarion and Jama
+  export): one requirement per SPEC-OBJECT. The id is `ReqIF.ForeignID`
+  (else the object's IDENTIFIER), the title `ReqIF.Name` or
+  `ReqIF.ChapterName`, the text `ReqIF.Text` with its markup removed, and
+  the parent comes from the specification hierarchy.
+
+A requirement is `verified` when every feature that names it is met,
+`failing` when one of them is failing, `partial` or `not started`
+otherwise, and `uncovered` when no feature names it. A requirement with
+children also takes their states into account; the counts are over the
+requirements without children. An id the plan names that no list holds is
+reported as a warning. Without a list, the requirements are the ids the
+plan names.
+
+The report prints the requirements that are not verified, `plan.html` gets
+a Requirements table, `plan.json` a `requirements` object, each snapshot the
+counts (the `Reqs` column of `mplan trend`), and:
+
+- `-trace FILE` writes the traceability matrix as CSV: id, title, parent,
+  priority, status, score, features, owners, tests.
+- `-fail-on-uncovered` exits 1 on an uncovered requirement or an unknown id.
+- `mplan init -reqs FILE -o draft.vplan` drafts a plan with one feature per
+  requirement, nested like the requirements.
+
 ## Triage
 
 Every failing run goes into a bucket by its failure signature: mregress's,
