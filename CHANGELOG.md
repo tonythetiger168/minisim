@@ -87,6 +87,8 @@ Spec references are IEEE 1800-2023 clauses.
   `set_retention_elements` (6.54), `set_partial_on_translation` (6.50) and
   `add_supply_state` with `{net_state voltage}` (6.8) are applied instead of
   read and ignored; `mlint -upf` rule `UPF007`. See `docs/LOWPOWER.md`.
+- UPF (IEEE 1801-2024): `sim_corruption_control` (6.59),
+  `sim_assertion_control` (6.58) and `load_simstate_behavior` (6.34).
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.

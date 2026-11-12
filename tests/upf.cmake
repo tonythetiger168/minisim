@@ -18,8 +18,10 @@ endforeach()
 # 6.52, 9.10); named state transitions and power state groups, which report
 # through -upf_verbose (6.7, 6.22, 9.4); attributes of ports and models,
 # equivalent supplies, composite domains, explicit supply connections and
-# simstate behavior (5.6, 6.8, 6.15, 6.17, 6.44, 6.47, 6.50, 6.51, 6.56).
-foreach(t logic transitions attributes)
+# simstate behavior (5.6, 6.8, 6.15, 6.17, 6.44, 6.47, 6.50, 6.51, 6.56);
+# corruption and assertion controls and a library's simstate behavior file
+# (6.34, 6.58, 6.59).
+foreach(t logic transitions attributes simctl)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -122,6 +124,27 @@ string(FIND "${out}${err}" "[UPF007] composite domain PD_C: the primary supply o
 if(pos EQUAL -1)
   message(FATAL_ERROR "mlint: UPF007 was not reported\n${out}${err}")
 endif()
+
+# Errors of the simulation controls and load_simstate_behavior. The copies
+# of simctl.upf read simctl_lib.upf next to them.
+file(COPY ${D}/simctl_lib.upf DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+upf_error_in(simctl e_ac1 "sim_assertion_control -elements {u_k} -controlling_domain PD_SW -control_expr {quiet}" "-controlling_domain and -control_expr together (6.58)")
+upf_error_in(simctl e_ac2 "sim_assertion_control -elements {u_k} -type pause" "sim_assertion_control -type pause (reset, suspend or kill)")
+upf_error_in(simctl e_ac3 "sim_assertion_control -domain PD_NONE" "sim_assertion_control: no power domain PD_NONE")
+upf_error_in(simctl e_cc1 "sim_corruption_control -elements {u_c}" "sim_corruption_control needs -type")
+upf_error_in(simctl e_cc2 "sim_corruption_control -type float" "sim_corruption_control -type float (real, integer, seq, comb, port or process)")
+upf_error_in(simctl e_cc3 "sim_corruption_control -type real -control_expr {quiet}" "sim_corruption_control: unknown option -control_expr")
+upf_error_in(simctl e_ls1 "load_simstate_behavior mylib -file nope.upf" "load_simstate_behavior: no file")
+foreach(case
+    "set_simstate_behavior DISABLE -models {beh} -lib x|set_simstate_behavior -lib in a simstate behavior file (6.34)"
+    "create_power_domain PD_Q -elements {u_m}|create_power_domain in a simstate behavior file; only set_simstate_behavior is allowed (6.34)"
+    "set_simstate_behavior DISABLE -models {nosuch}|load_simstate_behavior: model nosuch is not in the design (6.34)")
+  string(REPLACE "|" ";" case "${case}")
+  list(GET case 0 line)
+  list(GET case 1 want)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badlib.upf "${line}\n")
+  upf_error_in(simctl e_lib "load_simstate_behavior mylib -file ${CMAKE_CURRENT_BINARY_DIR}/badlib.upf" "${want}")
+endforeach()
 
 # -power_top names the instance the UPF describes; it wins over set_design_top.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut
