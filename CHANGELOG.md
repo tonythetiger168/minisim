@@ -64,6 +64,13 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `mlint` clock checks: `CDC007` (a clock read as data) and `CDC008` (a
+  clock made by combinational logic of a clock and other signals, which can
+  glitch).
+- `mlint -sdc`: `set_input_delay` / `set_output_delay -clock` give ports a
+  clock domain (virtual clocks included), so an input read without a
+  synchronizer, or an output launched on another clock, is a crossing.
+  `set_case_analysis 0/1` makes a signal static.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.
