@@ -139,6 +139,32 @@ h)`) or the system (`vpi_control(vpiAssertionSysOff)`). The system tasks of
 supported: stepping (`vpiAssertionEnableStep`, `cbAssertionStepSuccess`,
 39.5.2), and `failExpr` of a failure is NULL.
 
+**Coverage (clause 40).** With `msim -cov`, `vpi_get(<coverage type>,
+instance)` gives the covered items of that instance: `vpiStatementCoverage`
+(source lines of its processes that ran), `vpiToggleCoverage` (bits that
+rose and fell), `vpiFsmStateCoverage` (FSM states entered) and
+`vpiAssertCoverage` (assertions that succeeded, or covers that matched;
+counted with or without `-cov`). Items in instances below it are not
+included. `vpiCovered`, `vpiCoveredCount` and `vpiCoveredMax` read an
+assertion (succeeded, successes, 1), an FSM (states entered, entries, states),
+an FSM state, or a net, variable, word or bit (bits toggled both ways, bits
+toggled, width). An assertion also gives `vpiAssertAttemptCovered`,
+`vpiAssertSuccessCovered`, `vpiAssertFailureCovered`,
+`vpiAssertVacuousSuccessCovered`, `vpiAssertDisableCovered` and
+`vpiAssertKillCovered`. `vpi_iterate(vpiFsm, instance)` gives the FSMs msim
+found (`vpiFsm` objects with `vpiName`, `vpiFullName`, `vpiFile`,
+`vpiLineNo`); `vpi_handle(vpiFsmStateExpression, fsm)` the state register;
+`vpi_iterate(vpiFsmStates, fsm)` its states (`vpiFsmHandle` objects whose
+`vpi_get_value` is the state's value and `vpiName` its name).
+`vpi_control(op, type, handle)` takes `vpiCoverageStart`, `vpiCoverageStop`,
+`vpiCoverageReset` and `vpiCoverageCheck` (1 when every item of the type is
+covered) with an instance, an assertion (for `vpiAssertCoverage`) or NULL
+(the whole design); `vpi_control(vpiCoverageSave, type, name)` writes the
+coverage database (the `-cov` JSON) to `name` now. Not supported:
+`vpiCoverageMerge` (merge saved databases with `mcov merge`), and starting
+or stopping statement, toggle or FSM coverage for an instance below the
+top (it is for the whole design).
+
 **Other routines.** `vpi_printf`, `vpi_vprintf`, `vpi_mcd_open`,
 `vpi_mcd_close`, `vpi_mcd_name`, `vpi_mcd_printf`, `vpi_flush`,
 `vpi_chk_error`, `vpi_get_vlog_info`, `vpi_control(vpiFinish)` and
@@ -165,7 +191,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `39-vpi-assertions.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

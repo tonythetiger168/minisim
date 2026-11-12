@@ -8523,6 +8523,7 @@ struct Lowerer {
     }
     void stmt(const slang::ast::Statement& s) {
         struct Depth { int& d; Depth(int& x) : d(x) { d++; } ~Depth() { d--; } } depth(stmtDepth);
+        if (g_cov && !prog.inst) prog.inst = instanceAround(scope);   // statement coverage per instance (40)
         // Each statement's instructions carry its line; a block's own
         // instructions keep the line of the statement around them.
         SrcLoc savedLoc = g_emitLoc;
