@@ -9748,6 +9748,23 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
         initStatic(v);
     }
+    // `output logic q = 5` (23.2.2.3): slang keeps the initializer on the
+    // port; it initializes the port's variable like a declaration's.
+    void handle(const slang::ast::PortSymbol& ps) {
+        using namespace slang::ast;
+        if (ps.direction != ArgumentDirection::Out || !ps.internalSymbol ||
+            ps.internalSymbol->kind != SymbolKind::Variable)
+            return;
+        const Expression* e = ps.getInitializer();
+        if (!e) return;
+        const auto& v = ps.internalSymbol->as<VariableSymbol>();
+        if (!sigmap.count(&v) || arrMap().count(&v) || dynMap().count(&v)) Lowerer::unsupported("this output port initializer");
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        init->setScope(ps.getParentScope());
+        Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
+        i.e = resize(init->expr(*e), storeW(v.getType()), e->type->isSigned(), v.getType().isSigned());
+        init->prog.emit(i);
+    }
     // A class's static property (8.9) starts like a module variable.
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) initStatic(p);
@@ -10698,7 +10715,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 }
                 continue;
             }
-            if (!ext || ps.isNullPort) continue;
+            if (!ext || ps.isNullPort || Lowerer::peel(*ext).kind == ExpressionKind::EmptyArgument) continue;   // u(a, ): left open (23.3.2)
             Lowerer::lastLoc() = ext->sourceRange.start().valid() ? ext->sourceRange.start() : inst.location;
             // A ref port or a container port joined to a whole variable shares
             // that variable's signal (see sharedPortVar).
@@ -10729,6 +10746,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
             if (ps.direction != ArgumentDirection::Out && ps.direction != ArgumentDirection::InOut)
                 Lowerer::unsupported("ref port");
+            // An open output with an initializer (`output logic q = 5`): slang
+            // gives the initializer as the connection; nothing is connected.
+            if (ext->kind != ExpressionKind::Assignment && ps.direction == ArgumentDirection::Out &&
+                ext == ps.getInitializer())
+                continue;
             if (ext->kind != ExpressionKind::Assignment)
                 Lowerer::unsupported("output port connection");
             const auto& asg = ext->as<AssignmentExpression>();

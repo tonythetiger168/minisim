@@ -36,6 +36,7 @@ set(MINISIM_CORE_HEADERS
     lower_xprop.inc
     parallel.hpp
     prog.hpp
+    profile.hpp
     protect.hpp
     protect_front.hpp
     rand.inc
