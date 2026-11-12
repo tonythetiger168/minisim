@@ -8637,6 +8637,23 @@ inline bool enterInstance(const slang::ast::InstanceSymbol& inst) {
     return true;
 }
 
+// A ref port (23.3.3.3) is another name for the variable it connects to, so
+// a write on either side is seen at once on the other. A dynamic array, queue
+// or associative array port (7.5-7.9) is joined the same way: the child sees
+// the parent's container itself. Returns the internal variable when the
+// port's actual is a whole variable that the two can share.
+inline const slang::ast::Symbol* sharedPortVar(const slang::ast::PortSymbol& ps, const slang::ast::Symbol& actual) {
+    using namespace slang::ast;
+    const Symbol* in = ps.internalSymbol;
+    if (!in || actual.kind != SymbolKind::Variable) return nullptr;
+    // slang makes an input port of container type a net; it holds a container all the same.
+    bool dyn = Lowerer::isDynType(ps.getType());
+    if (in->kind != SymbolKind::Variable && !(dyn && in->kind == SymbolKind::Net)) return nullptr;
+    if (ps.direction != ArgumentDirection::Ref && !dyn) return nullptr;
+    if (!in->as<ValueSymbol>().getType().isMatching(actual.as<VariableSymbol>().getType())) return nullptr;
+    return in;
+}
+
 // An inout port whose actual is a whole net of the same width and kind is
 // the same net as its internal net (23.3.3.1). Returns the internal net when
 // the two can share one signal.
@@ -8835,9 +8852,13 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     void finishAliases() {
         for (const auto* s : aliased) {
-            auto it = sigmap.find(aliasOf().at(s));
-            if (it == sigmap.end()) Lowerer::unsupported("alias of a net that has no signal");
-            sigmap[s] = it->second;
+            const slang::ast::Symbol* root = aliasOf().at(s);
+            bool any = false;
+            if (auto it = sigmap.find(root); it != sigmap.end()) { sigmap[s] = it->second; any = true; }
+            if (auto it = arrMap().find(root); it != arrMap().end()) { arrMap()[s] = it->second; any = true; }
+            if (auto it = dynMap().find(root); it != dynMap().end()) { dynMap()[s] = it->second; any = true; }
+            if (auto it = dynArrMap().find(root); it != dynArrMap().end()) { dynArrMap()[s] = it->second; any = true; }
+            if (!any) Lowerer::unsupported("alias of a net that has no signal");
         }
     }
     void aliasModports() {
@@ -10021,6 +10042,14 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
             if (!ext || ps.isNullPort) continue;
             Lowerer::lastLoc() = ext->sourceRange.start().valid() ? ext->sourceRange.start() : inst.location;
+            // A ref port or a container port joined to a whole variable shares
+            // that variable's signal (see sharedPortVar).
+            if (ps.internalSymbol && aliasOf().count(ps.internalSymbol) && aliasOf().at(ps.internalSymbol) != ps.internalSymbol &&
+                (ps.internalSymbol->kind != SymbolKind::Net || Lowerer::isDynType(ps.getType())))
+                continue;
+            if (ps.direction == ArgumentDirection::Ref) Lowerer::unsupported("ref port connected to anything but a whole variable");
+            if (ps.internalSymbol && Lowerer::isDynType(ps.getType()))
+                Lowerer::unsupported("container port connected to anything but a whole container variable");
             if (ps.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
                 connectArrayPort(ps, *ext);
                 continue;
@@ -10757,7 +10786,9 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     // An inout port joined to a whole net is that net (23.3.3.1):
                     // one signal, as with alias. Two continuous assignments, one
                     // each way, would hold the last driven value for ever.
-                    if (const Symbol* in = inoutCollapses(c->port.as<PortSymbol>(), ns)) {
+                    const Symbol* in = inoutCollapses(c->port.as<PortSymbol>(), ns);
+                    if (!in) in = sharedPortVar(c->port.as<PortSymbol>(), ns);
+                    if (in) {
                         if (!up.count(&ns)) up[&ns] = &ns;
                         if (!up.count(in)) up[in] = in;
                         const Symbol* ra = root(&ns), *rb = root(in);
