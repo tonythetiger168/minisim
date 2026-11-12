@@ -543,6 +543,10 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI class definitions (37.29): `vpiClassDefn`, `vpiExtends`,
+  `vpiMethods`, `vpiDerivedClasses` and static `vpiVariables`; a class
+  object now reports the class it was made of, and its properties include
+  that class's own. `tests/spec/37-vpi-classes.sv`.
 - VPI drivers and loads (37.16, 37.17): `vpiDriver`, `vpiLoad`,
   `vpiLocalDriver`, `vpiLocalLoad` and `vpiPortInst` on nets and variables
   give continuous assignments and instance ports, following whole-signal

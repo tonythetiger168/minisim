@@ -41,7 +41,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -283,6 +283,7 @@ inline int varType(const Type& t, bool net, int& t05) {
     return 0;
 }
 inline Obj* valueObj(const Symbol* s);
+inline Obj* typespecObj(const Type* t);
 #include "vpi_data.inc"
 // A variable or net as a VPI object, or null if VPI does not model it.
 inline Obj* valueObj(const Symbol* s) {
@@ -1972,7 +1973,8 @@ inline const char* typeName(int type) {
         {vpiEventTypespec, "vpiEventTypespec"}, {vpiInterfaceTypespec, "vpiInterfaceTypespec"},
         {vpiAssert, "vpiAssert"}, {vpiAssume, "vpiAssume"}, {vpiCover, "vpiCover"},
         {vpiImmediateAssert, "vpiImmediateAssert"}, {vpiImmediateAssume, "vpiImmediateAssume"},
-        {vpiImmediateCover, "vpiImmediateCover"}};
+        {vpiImmediateCover, "vpiImmediateCover"}, {vpiClassObj, "vpiClassObj"}, {vpiClassVar, "vpiClassVar"},
+        {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}};
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
 }
@@ -1993,6 +1995,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     using slang::ast::SymbolKind;
     if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
     if (type == vpiClassObj && o->type == vpiClassVar) return H(vpi::classObjOf(o));   // 37.29
+    if (type == vpiClassDefn || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return H(vpi::classHandle(type, o));
     if (o->kind == Obj::DynElem) {
         if (type == vpiParent) return H(const_cast<Obj*>(o->parent));
         if (type == vpiIndex) return o->idx >= 0 ? H(vpi::constObj(o->idx)) : nullptr;
@@ -2160,6 +2163,8 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
         vpi::dynElems(o, items);
         return vpi::iter(std::move(items));
     }
+    if (o->kind == Obj::ClassDefn) return vpi::classIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
+    if (o->kind == Obj::Extends) return nullptr;
     if (o->kind == Obj::ClassObj) {   // the properties of a class object (37.29)
         if (type != vpiVariables) return nullptr;
         vpi::classProps(o, *o->ty, items);
@@ -2569,6 +2574,8 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
             default: return vpiUndefined;
         }
     }
+    if (o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return (PLI_INT32)vpi::classGet(prop, o);
+    if (prop == vpiVirtual && vpi::isMethod(o)) return o->sym->as<slang::ast::SubroutineSymbol>().isVirtual();
     if (o->kind == Obj::ClassObj) {   // 37.29
         if (prop == vpiType) return vpiClassObj;
         if (prop == vpiObjId) return o->idx;
@@ -2761,6 +2768,10 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
         vpi::codeGetStr(prop, o, r, have);
         return have ? vpi::retStr(r) : nullptr;
     }
+    if ((o->kind == Obj::ClassDefn || o->kind == Obj::Extends) && prop != vpiType) {   // 37.29
+        std::string r;
+        return vpi::classGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
+    }
     if ((o->kind == Obj::Fsm || o->kind == Obj::FsmState) && prop != vpiType) {   // 40.5.2
         const FsmDef& d = fsmDefs()[(size_t)o->idx];
         std::string name = o->kind == Obj::Fsm ? d.name : d.states[o->pos].second;
@@ -2804,6 +2815,7 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
             case Obj::Typespec:
                 // A typedef's name; a built-in or anonymous type has none.
                 if (x->ty->kind == SymbolKind::TypeAlias) return full ? vpi::fullName(*x->ty) : std::string(x->ty->name);
+                if (x->ty->kind == SymbolKind::ClassType) return full ? x->ty->getHierarchicalPath() : std::string(x->ty->name);   // 8.3
                 return "";
             case Obj::Arg:
             case Obj::Const:
@@ -2904,7 +2916,7 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
     if (o->kind == Obj::Iter || o->kind == Obj::Callback || o->kind == Obj::Systf || o->kind == Obj::Module ||
         o->kind == Obj::Scope || o->kind == Obj::Typespec || o->kind == Obj::Member || o->kind == Obj::Range ||
         o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
-        o->kind == Obj::ClassObj) {
+        o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) {
         vpi::error(vpiError, "vpi_get_value: the object has no value");
         return;
     }
