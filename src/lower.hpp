@@ -9482,11 +9482,16 @@ inline const slang::ast::Symbol* inoutCollapses(const slang::ast::PortSymbol& ps
     if (ps.internalSymbol->kind != SymbolKind::Net || actual.kind != SymbolKind::Net) return nullptr;
     const auto& in = ps.internalSymbol->as<NetSymbol>();
     const auto& out = actual.as<NetSymbol>();
-    auto plain = [](const NetSymbol& n) {
-        return (n.netType.netKind == NetType::Wire || n.netType.netKind == NetType::Tri) && n.getType().isIntegral() &&
-               !n.getDelay();
+    auto wireish = [](const NetSymbol& n) { return n.netType.netKind == NetType::Wire || n.netType.netKind == NetType::Tri; };
+    auto simple = [](const NetSymbol& n) {
+        auto k = n.netType.netKind;
+        return n.getType().isIntegral() && !n.getDelay() && k != NetType::UserDefined && k != NetType::Interconnect &&
+               k != NetType::TriReg && k != NetType::Unknown;
     };
-    if (!plain(in) || !plain(out) || in.getType().getBitWidth() != out.getType().getBitWidth()) return nullptr;
+    if (!simple(in) || !simple(out) || in.getType().getBitWidth() != out.getType().getBitWidth()) return nullptr;
+    // One net, of the kind that wins (23.3.3.7): a wire or tri side takes the
+    // other side's kind (an inout tri port on a tri1 bus is a tri1 net).
+    if (!wireish(in) && !wireish(out) && in.netType.netKind != out.netType.netKind) return nullptr;
     return &in;
 }
 
@@ -9675,6 +9680,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         visitDefault(p);
         prefix = std::move(saved);
     }
+    std::vector<std::pair<const slang::ast::Symbol*, uint8_t>> aliasedKinds;
     void finishAliases() {
         for (const auto* s : aliased) {
             const slang::ast::Symbol* root = aliasOf().at(s);
@@ -9685,6 +9691,8 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             if (auto it = dynArrMap().find(root); it != dynArrMap().end()) { dynArrMap()[s] = it->second; any = true; }
             if (!any) Lowerer::unsupported("alias of a net that has no signal");
         }
+        for (auto [s, k] : aliasedKinds)
+            if (auto it = sigmap.find(s); it != sigmap.end()) netKinds().push_back({it->second, k});
     }
     void aliasModports() {
         for (const auto* m : modportPorts) {
@@ -9701,7 +9709,6 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     void handle(const slang::ast::NetSymbol& n) {
         reg(n, true);
-        if (auto a = aliasOf().find(&n); a != aliasOf().end() && a->second != &n) return;
         using NK = slang::ast::NetType::NetKind;
         uint8_t k = NR_WIRE;
         switch (n.netType.netKind) {
@@ -9716,6 +9723,13 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             default: break;
         }
         if (k == NR_WIRE) return;
+        // A net collapsed into another (an inout port, alias): its type is the
+        // simulated net's when the other side is a wire (23.3.3.7), once the
+        // alias has its signal.
+        if (auto a = aliasOf().find(&n); a != aliasOf().end() && a->second != &n) {
+            if (!n.getType().isUnpackedArray()) aliasedKinds.push_back({&n, k});
+            return;
+        }
         if (n.getType().isUnpackedArray()) {   // wor w [0:1]: each element resolves on its own (6.6.3)
             auto a = arrMap().find(&n);
             if (a == arrMap().end() || a->second->dynElem) Lowerer::unsupported("this array of wand/wor/tri0/tri1/trireg/supply nets");
