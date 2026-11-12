@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
+  `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
+  the last place), checked by `tests/dw/more.sv`.
+- `mcov` reads and writes UCIS XML (Accellera UCIS 1.0, its XML interchange
+  format): a database named `.xml` is UCIS. Each instance becomes an
+  instanceCoverages scope with its statements, branches, conditions,
+  toggles, FSMs, assertions and covergroups. It also reads what other tools
+  write, such as blocks, case statements with more than two arms and
+  SystemVerilog literal state values.
+
+### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
   width with subnormals and all five rounding modes: `MW_fp_add`,
   `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
@@ -72,12 +83,6 @@ Spec references are IEEE 1800-2023 clauses.
 
   The engine is mcov's own, and it reads mcov's own databases.
   A database that does not exist is now a one-line error instead of a traceback.
-- `mcov` reads and writes UCIS XML (Accellera UCIS 1.0, its XML interchange
-  format): a database named `.xml` is UCIS. Each instance becomes an
-  instanceCoverages scope with its statements, branches, conditions,
-  toggles, FSMs, assertions and covergroups. It also reads what other tools
-  write, such as blocks, case statements with more than two arms and
-  SystemVerilog literal state values.
 - `mlint` clock checks: `CDC007` (a clock read as data) and `CDC008` (a
   clock made by combinational logic of a clock and other signals, which can
   glitch).
