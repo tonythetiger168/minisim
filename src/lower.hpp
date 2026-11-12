@@ -2344,7 +2344,7 @@ struct Lowerer {
         return &icb;
     }
     // 1 + the signal id of v.x now (0 for a null v).
-    E vifAddr(const slang::ast::MemberAccessExpression& m) {
+    E vifAddr(const slang::ast::MemberAccessExpression& m, bool elems = false) {
         using namespace slang::ast;
         const Expression* v = vifBase(m);
         const Symbol& mem = m.member;
@@ -2355,7 +2355,7 @@ struct Lowerer {
         } else {
             if (!mem.isValue()) unsupported("this member through a virtual interface");
             const Type& mt = mem.as<ValueSymbol>().getType().getCanonicalType();
-            if (mt.isUnpackedArray() || isDynType(mt)) unsupported("an array member through a virtual interface");
+            if ((mt.isUnpackedArray() && !elems) || isDynType(mt)) unsupported("an array member through a virtual interface");
         }
         auto n = node(Op::VifSig, {exprH(*v)});
         n->hi = vifMember(mem);
@@ -2365,7 +2365,11 @@ struct Lowerer {
     // whichever instance v names.
     bool vifSyncDrive(const slang::ast::AssignmentExpression& a) {
         using namespace slang::ast;
-        const Expression& l = a.left();
+        const Expression* lp = &a.left();   // v.cb.a[i]: the clockvar under the indices
+        while (lp->kind == ExpressionKind::ElementSelect &&
+               lp->as<ElementSelectExpression>().value().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType)
+            lp = &lp->as<ElementSelectExpression>().value();
+        const Expression& l = *lp;
         if (!vifAccess(l) || l.as<MemberAccessExpression>().member.kind != SymbolKind::ClockVar) return false;
         if (!a.isNonBlocking()) unsupported("a write to a clockvar other than a synchronous drive (14.16)");
         const auto& m = l.as<MemberAccessExpression>();
@@ -2380,6 +2384,13 @@ struct Lowerer {
             const Symbol* cv = icb->find(m.member.name);
             if (!cv) continue;
             size_t no = emitJmpIfNot(bin(Op::Eq, ref(h), konst(make((uint64_t)k, 0, 64))));
+            if (auto ca = arrMap().find(cv); ca != arrMap().end()) {   // an array clockvar: element by element
+                cbArrayDrive(clockingIdx(*icb), ca->second->base, *ca->second, a);
+                ends.push_back(emitJmp());
+                prog.code[no].target = prog.code.size();
+                continue;
+            }
+            if (&l != &a.left()) unsupported("a synchronous drive of part of a clockvar through a virtual interface (14.16)");
             Instr i;
             i.k = IK::CbDrive;
             i.sig = sigmap.at(cv);
@@ -2402,16 +2413,49 @@ struct Lowerer {
         return true;
     }
     // v.x as an indirect id (expr.hpp mode 10/11); n consecutive ids.
-    int vifSlot(const slang::ast::MemberAccessExpression& m, int n = 1) {
+    int vifSlot(const slang::ast::MemberAccessExpression& m, int n = 1, bool elems = false) {
         int first = -1;
         for (int k = 0; k < n; k++) {
             int tmp = fresh(64);
             Instr i; i.k = IK::Assign; i.sig = tmp;
-            i.e = k ? bin(Op::Add, vifAddr(m), konst(make((uint64_t)k, 0, 64))) : vifAddr(m);
+            i.e = k ? bin(Op::Add, vifAddr(m, elems), konst(make((uint64_t)k, 0, 64))) : vifAddr(m, elems);
             prog.emit(i);
             if (!k) first = indThrough(tmp);
         }
         return first;
+    }
+    // The shape of a fixed-size array of integral elements, or null.
+    static std::shared_ptr<ArrShape> fixedShape(const slang::ast::Type& t0) {
+        using namespace slang::ast;
+        const Type* t = &t0.getCanonicalType();
+        if (t->kind != SymbolKind::FixedSizeUnpackedArrayType) return nullptr;
+        auto a = std::make_shared<ArrShape>();
+        int64_t total = 1;
+        while (t->kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+            a->dims.push_back({ft.range.left, ft.range.right});
+            total *= (int64_t)ft.range.width();
+            t = &ft.elementType.getCanonicalType();
+        }
+        if (!t->isIntegral() || total > 4096) return nullptr;
+        a->count = (int)total;
+        a->elemW = (int)t->getBitWidth();
+        a->sgn = t->isSigned();
+        a->twoState = !t->isFourState();
+        return a;
+    }
+    // v.a or v.cb.a (25.9, 14.3): a fixed-size array member through a virtual
+    // interface, as one indirect id per element; null for anything else.
+    std::shared_ptr<const ArrShape> vifArr(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        if (!vifAccess(x)) return nullptr;
+        const auto& m = x.as<MemberAccessExpression>();
+        if (!m.member.isValue()) return nullptr;
+        auto a = fixedShape(m.member.as<ValueSymbol>().getType());
+        if (!a) return nullptr;
+        if (a->count > 256) unsupported("an array of more than 256 elements through a virtual interface");
+        a->base = vifSlot(m, a->count, true);
+        return a;
     }
     // new / new(args) (8.7): allocate, then run the constructor on it.
     E newObject(const slang::ast::NewClassExpression& n) {
@@ -3379,7 +3423,8 @@ struct Lowerer {
         }
         if (idx.empty()) return std::nullopt;
         std::shared_ptr<const ArrShape> shape;
-        if (classMember(*cur)) {   // h.a[i] (8.4): the array's first slot through the handle
+        if (auto va = vifArr(*cur)) shape = va;   // v.a[i], v.cb.a[i] (25.9)
+        else if (classMember(*cur)) {   // h.a[i] (8.4): the array's first slot through the handle
             const auto& m = cur->as<MemberAccessExpression>();
             const PropSlot* ps = memberSlot(m);
             if (!ps) shape = arrFind(&m.member);
@@ -3579,11 +3624,12 @@ struct Lowerer {
                 return;
             }
             case ExpressionKind::MemberAccess:
-                if (classMember(x)) {   // h.a (8.4): each element read through the handle
+                if (classMember(x) || vifAccess(x)) {   // h.a (8.4), v.a (25.9): each element read through the handle
                     const auto& m = x.as<MemberAccessExpression>();
-                    const PropSlot* ps = memberSlot(m);
+                    const PropSlot* ps = vifAccess(x) ? nullptr : memberSlot(m);
                     std::shared_ptr<const ArrShape> A;
-                    if (!ps) A = arrFind(&m.member);
+                    if (vifAccess(x)) A = vifArr(x);
+                    else if (!ps) A = arrFind(&m.member);
                     else {
                         if (ps->kind != 1 || ps->arr->dynElem) unsupported("array value of this property");
                         auto c = std::make_shared<ArrShape>(*ps->arr);
@@ -12327,6 +12373,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     if (const Symbol* in = f->as<PortSymbol>().internalSymbol) f = in;
                 if (!f) continue;
                 if (auto it = sigmap.find(f); it != sigmap.end()) tab[k][j] = it->second;
+                else if (auto a = arrMap().find(f); a != arrMap().end()) tab[k][j] = a->second->base;   // its first element
             }
         }
     }
