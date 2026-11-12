@@ -47,6 +47,11 @@ Spec references are IEEE 1800-2023 clauses.
   toggles, FSMs, assertions and covergroups. It also reads what other tools
   write, such as blocks, case statements with more than two arms and
   SystemVerilog literal state values.
+- `mcov` takes other vendors' coverage command lines:
+  - URG options with `--compat=synopsys`
+  - IMC batch commands with `--compat=cadence`: `-exec`, `-execcmd`, `load`, `merge -out`, `report`, `rank`
+  - `vcover merge`, `report` and `ranktest` with `--compat=siemens`
+  - the same through a symlink named `urg`, `imc` or `vcover`
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
@@ -96,11 +101,6 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
-- `mcov` takes other vendors' coverage command lines:
-  - URG options with `--compat=synopsys`
-  - IMC batch commands with `--compat=cadence`: `-exec`, `-execcmd`, `load`, `merge -out`, `report`, `rank`
-  - `vcover merge`, `report` and `ranktest` with `--compat=siemens`
-  - the same through a symlink named `urg`, `imc` or `vcover`
 
   The engine is mcov's own, and it reads mcov's own databases.
   A database that does not exist is now a one-line error instead of a traceback.
