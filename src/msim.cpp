@@ -463,6 +463,7 @@ static void unrollSeqLoops(LowerResult& lowered) {
                     Instr x = code[b];
                     x.e = sub(x.e, var, v);
                     for (auto& ai : x.aidx) ai = sub(ai, var, v);
+                    x.bidx = sub(x.bidx, var, v);   // v[i*8 +: 8] <= ...: the bit index too
                     if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
                         if (x.target == E) breaks.push_back(out.size());
                         else x.target = base + (x.target - (top + 1));   // the step: the end of this copy
