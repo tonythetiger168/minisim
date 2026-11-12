@@ -3278,6 +3278,20 @@ struct Lowerer {
         const Type& et = ft.elementType;
         int64_t n = (int64_t)ft.range.width();
         const Expression& x = peel(x0);
+        if (isDynType(*x.type)) {   // fa = q (7.6): elements left to right; the size is checked by the caller
+            const Type& set = x.type->getArrayElementType()->getCanonicalType();
+            const Type& ec = et.getCanonicalType();
+            if (ec.isUnpackedArray() || !(ec.isIntegral() || ec.isFloating() || ec.isString()) || !set.isMatching(ec))
+                unsupported("fixed-size array from a container of another element type");
+            int d = dynSig(x);
+            if (d < 0) unsupported("array value");
+            for (int64_t k = 0; k < n; k++) {
+                auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
+                g->sig = d;
+                out.push_back(g);
+            }
+            return;
+        }
         switch (x.kind) {
             case ExpressionKind::SimpleAssignmentPattern:
                 for (auto* el : x.as<SimpleAssignmentPatternExpression>().elements()) arrayElems(et, *el, out);
@@ -3479,6 +3493,29 @@ struct Lowerer {
         auto ap = arrFind(&sym);
         if (!ap) return false;
         const ArrShape& A = *ap;
+        size_t skip = 0;   // the jump past the write when a container source has the wrong size
+        bool sized = false;
+        if (const auto& r = peel(rhs); isDynType(*r.type)) {
+            // fa = q (7.6): an error, and no write, unless q has as many elements
+            int d = dynSig(r);
+            if (d < 0) return false;
+            int ok = castOk >= 0 ? castOk : fresh(1);
+            Instr o; o.k = IK::Assign; o.sig = ok;
+            o.e = bin(Op::Eq, resize(dynSize(d), 32, false, false), konst(make((uint64_t)A.count, 0, 32, 0, false)));
+            prog.emit(o);
+            if (castOk < 0) {
+                Instr j; j.k = IK::JmpIfNot; j.e = un(Op::LogNot, ref(ok));
+                size_t jo = prog.emit(j);
+                Instr e; e.k = IK::Display;
+                e.fmt = "Error: assignment to a fixed-size array of " + std::to_string(A.count) +
+                        " elements from a container of another size";
+                prog.emit(e);
+                prog.code[jo].target = prog.here();
+            }
+            Instr j; j.k = IK::JmpIfNot; j.e = ref(ok);
+            skip = prog.emit(j);
+            sized = true;
+        }
         std::vector<E> vals;
         arrayElems(lt, rhs, vals);
         if ((int)vals.size() != A.count) unsupported("array value with the wrong number of elements");
@@ -3499,8 +3536,10 @@ struct Lowerer {
             Instr i; i.k = nba ? IK::Nba : IK::Assign; i.sig = A.base + k; i.e = vals[k];
             xpDirect(i);
         }
+        if (sized) prog.code[skip].target = prog.here();
         return true;
     }
+    int castOk = -1;   // set by $cast: the flag a container-to-array size check writes, instead of an error
     int64_t constOffset(const ArrSel& s) {
         std::vector<int64_t> v;
         for (auto* x : s.idx) v.push_back(constInt(*x));
@@ -5482,8 +5521,35 @@ struct Lowerer {
         const Expression& src = *args[1];
         const Type& dt = dst.type->getCanonicalType();
         const Type& st = src.type->getCanonicalType();
-        if (dt.isClass() || st.isClass() || !(dt.isIntegral() || dt.isFloating()) || !(st.isIntegral() || st.isFloating()))
-            unsupported("$cast of these types");
+        if (dt.isClass() || st.isClass()) unsupported("$cast of these types");
+        if (!(dt.isIntegral() || dt.isFloating()) || !(st.isIntegral() || st.isFloating())) {
+            // Strings, unpacked structs and arrays (6.24.2): the cast is the
+            // assignment dst = type(dst)'(src), which is always valid when
+            // the types are cast compatible; dst gets the converted value.
+            if (!dt.isCastCompatible(st)) unsupported("$cast of these types");
+            static thread_local std::deque<ConversionExpression> convs;
+            static thread_local std::deque<AssignmentExpression> asgs;
+            Expression* rhs = const_cast<Expression*>(&src);
+            if (!dt.isMatching(st))
+                rhs = &convs.emplace_back(*dst.type, ConversionKind::Explicit, *rhs, src.sourceRange);
+            auto& a = asgs.emplace_back(std::nullopt, false, *dst.type, const_cast<Expression&>(dst), *rhs, nullptr,
+                                        call.sourceRange);
+            int ok = fresh(1);
+            Instr o; o.k = IK::Assign; o.sig = ok; o.e = konst(mk(1, 1));
+            prog.emit(o);
+            int saved = castOk;
+            castOk = ok;
+            exprStmt(a);
+            castOk = saved;
+            if (task) {   // as a task, a failed cast is a run-time error (6.24.2)
+                Instr j; j.k = IK::JmpIfNot; j.e = un(Op::LogNot, ref(ok));
+                size_t jo = prog.emit(j);
+                Instr d; d.k = IK::Display; d.fmt = "Error: $cast failed: the source has the wrong number of elements";
+                prog.emit(d);
+                prog.code[jo].target = prog.here();
+            }
+            return resize(ref(ok), 32, false, true);
+        }
         int w = (int)dt.getBitWidth();
         E v;
         if (dt.isFloating()) v = realOf(src);
