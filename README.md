@@ -567,7 +567,10 @@ the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 Clock and reset domains are found from the RTL: the clock of every
 edge-triggered block, followed through ports, buffers and clock gates, so one
 clock passed down through several modules stays one domain. `-cdc-report`
-lists every domain and crossing, `-sdc file.sdc` takes the clocks and their
+lists every domain and crossing, `-cdc-html FILE` writes a page to browse
+them, `-cdc-abstract`/`-cdc-model` check a
+block once and use its port model in the SoC, `-cdc-sva FILE` writes assertions for the
+synchronized crossings, `-sdc file.sdc` takes the clocks and their
 relations (generated clocks, `set_clock_groups`, false paths between clocks)
 from the timing constraints, `-clock-group a,b` declares related clocks
 and `-static sig` waives a quasi-static signal. Findings print as
