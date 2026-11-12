@@ -20,8 +20,11 @@ endforeach()
 # equivalent supplies, composite domains, explicit supply connections and
 # simstate behavior (5.6, 6.8, 6.15, 6.17, 6.44, 6.47, 6.50, 6.51, 6.56);
 # corruption and assertion controls and a library's simstate behavior file
-# (6.34, 6.58, 6.59).
-foreach(t logic transitions attributes simctl)
+# (6.34, 6.58, 6.59); power models, applied by name and to every instance of
+# a model, with a parameter, and a legacy one (6.3, 6.9, 6.11, 6.31, 6.32);
+# checkers bound into the design by the power intent (6.12); initial blocks
+# replayed at power-up (6.60).
+foreach(t logic transitions attributes simctl pmodel bindchk replay)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -145,6 +148,59 @@ foreach(case
   file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badlib.upf "${line}\n")
   upf_error_in(simctl e_lib "load_simstate_behavior mylib -file ${CMAKE_CURRENT_BINARY_DIR}/badlib.upf" "${want}")
 endforeach()
+
+# Errors of power models and parameters.
+upf_error_in(pmodel e_pm1 "define_power_model MAC_PM {}" "power model MAC_PM is already defined (6.31)")
+upf_error_in(pmodel e_pm2 "define_power_model P2 -complete {}\ndefine_power_model P2 -update {}" "power model P2 is -complete; it cannot be updated (6.31)")
+upf_error_in(pmodel e_pm3 "define_power_model P3 {define_power_model P4 {}}" "define_power_model inside power model P3; power models do not nest (6.31)")
+upf_error_in(pmodel e_pm4 "apply_power_model NOPE -elements {u_mac0}" "apply_power_model: no power model NOPE (6.9)")
+upf_error_in(pmodel e_pm5 "define_power_model P5 {add_parameter X -default 1}\napply_power_model P5 -elements {u_mac0/u_core} -parameters {{Y 2}}" "Y is not a parameter of power model P5 (6.9)")
+upf_error_in(pmodel e_pm6 "define_power_model P6 {add_parameter X}\napply_power_model P6 -elements {u_mac0/u_core}" "add_parameter X needs -default (6.3 b)")
+upf_error_in(pmodel e_pm7 "define_power_model P7 {\n  add_parameter X -default 1\n  add_parameter X -default 2\n}\napply_power_model P7 -elements {u_mac0/u_core}" "e_pm7.upf:48: parameter X is already defined in power model P7 (6.3 a)")
+upf_error_in(pmodel e_pm8 "begin_power_model P8" "begin_power_model P8 has no end_power_model (6.11)")
+upf_error_in(pmodel e_pm9 "end_power_model" "end_power_model without begin_power_model (6.32)")
+upf_error_in(pmodel e_pm10 "apply_power_model ROM_PM -elements {u_rom}" "power model ROM_PM is already applied to u_rom")
+upf_error_in(pmodel e_pm11 "define_power_model P9 {}\napply_power_model P9 -elements {u_mac0} -update" "apply_power_model -update: P9 is not applied to u_mac0 (6.9)")
+upf_error_in(pmodel e_pm12 "define_power_model P5 {}\napply_power_model P5 -elements {u_rom/x}" "apply_power_model P5: no instance 'u_dut.u_rom.x' in the design (6.9)")
+upf_error_in(pmodel e_pm13 "define_power_model P10 -for {rom} {}\napply_power_model P10 -elements {u_mac0/u_core}" "an instance of mac_core, which is not a model it is for (6.31)")
+upf_error_in(pmodel e_pm14 "add_parameter Q -type sometimes -default 1" "add_parameter -type sometimes (buildtime, runtime or rate)")
+
+# Errors of bind_checker; a parameter the checker does not have is reported
+# by the elaboration of the bind directive.
+upf_error_in(bindchk e_bc1 "bind_checker c2 -bind_to leaf" "bind_checker needs -module")
+upf_error_in(bindchk e_bc2 "bind_checker c3 -module pwr_chk -arch rtl -elements {u_core}" "bind_checker -arch without -bind_to")
+upf_error_in(bindchk e_bc3 "bind_checker chk_leaf -module pwr_chk -bind_to leaf" "bind_checker: chk_leaf already exists in leaf (6.12)")
+upf_error_in(bindchk e_bc4 "bind_checker c4 -module pwr_chk -parameters {{NOPE 1}} -ports {{clk clk} {v q} {en on}}" "parameter 'NOPE' does not exist in 'pwr_chk'")
+
+# Errors of sim_replay_control and save_upf.
+upf_error_in(replay e_rp1 "sim_replay_control" "sim_replay_control needs -elements, -model or -domain (6.60)")
+upf_error_in(replay e_rp2 "sim_replay_control -elements {u_rom}" "u_dut.u_rom is already covered by sim_replay_control -model rom")
+upf_error_in(replay e_rp3 "sim_replay_control -domain NOPE" "sim_replay_control: no power domain NOPE")
+upf_error_in(replay e_sv1 "save_upf a.upf\nsave_upf a.upf" "save_upf a.upf is already written by")
+
+# save_upf (6.42): the file it writes is the same power intent; the
+# simulation with it prints the same.
+foreach(t pmodel attributes simctl)
+  file(READ ${D}/${t}.upf base)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/save_${t}.upf "${base}save_upf saved_${t}.upf\n")
+  execute_process(COMMAND ${MSIM} ${D}/${t}.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/save_${t}.upf
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  execute_process(COMMAND ${MSIM} ${D}/${t}.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/saved_${t}.upf
+                  RESULT_VARIABLE rc2 OUTPUT_VARIABLE out2 ERROR_VARIABLE err2)
+  file(READ ${D}/${t}.out want)
+  if(NOT rc EQUAL 0 OR NOT rc2 EQUAL 0 OR NOT out STREQUAL want OR NOT out2 STREQUAL want)
+    message(FATAL_ERROR "save_upf ${t}: ${rc} ${rc2}\n${out}${err}--- from the saved file\n${out2}${err2}")
+  endif()
+endforeach()
+# save_upf -scope: only what ran in that scope, relative to it
+file(READ ${D}/logic.upf base)
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/save_scope.upf "${base}set_scope u_core\ncreate_logic_net zz\nset_scope ..\nsave_upf saved_scope.upf -scope u_core\n")
+execute_process(COMMAND ${MSIM} ${D}/logic.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/save_scope.upf
+                RESULT_VARIABLE rc OUTPUT_QUIET ERROR_VARIABLE err)
+file(READ ${CMAKE_CURRENT_BINARY_DIR}/saved_scope.upf saved)
+if(NOT rc EQUAL 0 OR NOT saved MATCHES "\ncreate_logic_net zz\n" OR saved MATCHES "create_power_domain")
+  message(FATAL_ERROR "save_upf -scope u_core: ${rc} ${err}\n${saved}")
+endif()
 
 # -power_top names the instance the UPF describes; it wins over set_design_top.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut

@@ -89,6 +89,14 @@ Spec references are IEEE 1800-2023 clauses.
   read and ignored; `mlint -upf` rule `UPF007`. See `docs/LOWPOWER.md`.
 - UPF (IEEE 1801-2024): `sim_corruption_control` (6.59),
   `sim_assertion_control` (6.58) and `load_simstate_behavior` (6.34).
+- UPF (IEEE 1801-2024): power models: `define_power_model` (6.31),
+  `begin_power_model` / `end_power_model` (6.11, 6.32), `apply_power_model`
+  (6.9) with `-supply_map`, `-port_map` and `-parameters`, and
+  `add_parameter` (6.3).
+- UPF (IEEE 1801-2024): `bind_checker` (6.12) instantiates checker modules
+  in the design through SV `bind` directives; `sim_replay_control` (6.60)
+  runs initial blocks again when their domain powers up; `save_upf` (6.42)
+  writes the power intent of a scope.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.

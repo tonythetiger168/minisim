@@ -70,6 +70,11 @@ turned on.
 | `sim_corruption_control` (6.59) | `-type real`, `integer` (a predefined integer type: `int`, `integer`, ...), `seq`, `comb`, `port`, `process`, by `-elements`, `-exclude_elements`, `-domain`, `-model`, `-transitive`: those elements keep their values while their domain is off; a process that drives only such elements keeps running. A retained register stays corrupted, with a warning |
 | `sim_assertion_control` (6.58) | `-type suspend`, `reset` (attempts in progress end) or `kill` (never on again), by `-elements` (instances or assertion labels), `-exclude_elements`, `-domain`, `-model`, `-transitive`; active while the assertion's domain (or `-controlling_domain`) is not `NORMAL`, or while `-control_expr` is true. Decided when a time step settles, so supplies the testbench turns on at time 0 do not trigger it |
 | `load_simstate_behavior` (6.34) | reads a file of `set_simstate_behavior` commands for a library; any other command, `-lib` in the file, or a model that is not in the design is an error |
+| `define_power_model` (6.31), `begin_power_model` / `end_power_model` (6.11, 6.32, legacy), `apply_power_model` (6.9) | a power model's commands run once for each instance it is applied to, with the instance as the current scope; `define_power_model` runs them in a Tcl frame of its own. `-for`, `-update`, `-complete`; `apply_power_model -elements`, or every instance of the model's modules under the current scope; `-supply_map` (an implied `associate_supply_set`), `-port_map` (an implied `connect_supply_net` or `connect_logic_net`), `-parameters`, `-update`. Nested definitions, an instance that does not exist or is not of a model the power model is for, and an unknown parameter are errors. `-implementation` is accepted and not enforced |
+| `add_parameter` (6.3) | in a power model, a Tcl variable with the `-default` value or the one `apply_power_model -parameters` gives; `-type buildtime`, `runtime`, `rate` are recorded (power consumption is not modelled) |
+| `bind_checker` (6.12) | each command becomes an SV `bind` directive and the design is elaborated with it: `-bind_to` binds into every instance of a module, otherwise into each of `-elements` (or the current scope); `-ports` connects HDL names of that scope, `-parameters` overrides parameters (a value that is not a number is passed as a string). `-upf_verbose` prints the directives. A port that names a UPF object is not supported |
+| `sim_replay_control` (6.60) | the selected initial blocks (`-elements` instances, `-exclude_elements`, `-model`, `-domain`, `-transitive`) run again each time their domain (or `-controlling_domain`) goes from not `NORMAL` to `NORMAL` after time 0. An instance named in `-elements` that a `-model` command already covers is an error. Initial blocks are selected by instance, not by label |
+| `save_upf` (6.42) | writes, once the power intent is read, every UPF command that ran in the scope (or `-scope`) or below it, after Tcl substitution, with `set_scope` moves relative to that scope. A power model's commands are written as its `define_power_model` and `apply_power_model`. Reading the file back gives the same simulation |
 | `create_pst`, `add_port_state`, `add_pst_state` (legacy) | when a time step settles, the supplies must match a row of every PST |
 | `upf_version`, `set_scope`, `set_design_top`, `load_upf` | yes |
 | Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
@@ -83,8 +88,8 @@ schedules and `-threads` are turned off with `-upf`.
 
 ### Not yet
 
-`map_*`, `use_interface_cell`, `define_*_cell`, power models and the
-other implementation commands are read and ignored with a note.
+`map_*`, `use_interface_cell`, `define_*_cell` and the other
+implementation commands are read and ignored with a note.
 Isolation and level shifters sit on port connections between a parent and a
 child instance; a strategy on a port of the simulation top itself, or on a
 hierarchical reference, has no cell. `-applies_to flop` / `latch` of a

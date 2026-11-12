@@ -152,6 +152,11 @@ void checkUpf(Compilation& comp, const std::string& upfPath, std::string powerTo
         top = found == "." ? "" : found.empty() ? top : found;
     }
     m.top = top;
+    m.resolveApplies([&](const std::string& mod) {   // apply_power_model without -elements (6.9)
+        std::vector<std::string> r;
+        for (auto& [p, md] : dv.models) if (md == mod) r.push_back(p);
+        return r;
+    });
     for (auto& w : m.warnings) std::cerr << "mlint: UPF: " << w << "\n";
     for (auto& f : upf::check(m, dv)) {
         if (!rep.rules.enabled(f.rule)) continue;
