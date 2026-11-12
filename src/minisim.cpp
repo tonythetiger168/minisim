@@ -2201,8 +2201,14 @@ struct Sim {
         listenTo(s, e);
         holdFlags(s, h);
         applyHold(s);
+        if (vpiHoldCb) vpiHoldCb(s, force, true, hi, lo);
     }
     void holdOff(int s, bool force, int hi = -1, int lo = 0) {
+        bool had = holds.count(s) > 0;
+        holdOffAll(s, force, hi, lo);
+        if (had && vpiHoldCb) vpiHoldCb(s, force, false, hi, lo);
+    }
+    void holdOffAll(int s, bool force, int hi, int lo) {
         auto it = holds.find(s);
         if (it == holds.end()) return;
         Hold& h = it->second;
@@ -2306,9 +2312,14 @@ struct Sim {
     // callbacks of a signal; vpiRegion runs the callbacks of a point in the
     // time slot (VR_*) and says whether any ran. vpiAt counts the
     // cbAfterDelay callbacks due at each time, so that slot is not skipped.
-    enum { VR_START, VR_RW, VR_RO };
+    // vpiHoldCb reports a force / release (force) or procedural assign /
+    // deassign of signal s (bits hi:lo, hi < 0 the whole signal).
+    // vpiNbaPend: cbNBASynch callbacks wait for the NBA region of this slot.
+    enum { VR_START, VR_RW, VR_RO, VR_NBA };
     void (*vpiChange)(int) = nullptr;
     bool (*vpiRegion)(int) = nullptr;
+    void (*vpiHoldCb)(int s, bool force, bool on, int hi, int lo) = nullptr;
+    bool vpiNbaPend = false;
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         Sig& g = sigs[s];
@@ -2585,7 +2596,9 @@ struct Sim {
                 } else if (!inactive.empty()) {                // inactive (#0)
                     for (auto h : inactive) active.push_back(h);
                     inactive.clear();
-                } else if (!nbaq.empty()) {                    // NBA
+                } else if (!nbaq.empty() || vpiNbaPend) {      // NBA
+                    if (vpiNbaPend && vpiRegion(VR_NBA)) continue;   // cbNBASynch first (38.36.2)
+                    if (nbaq.empty()) continue;
                     // Swap, not move: both buffers keep their capacity across slots.
                     nbaRun.clear();
                     nbaRun.swap(nbaq);
