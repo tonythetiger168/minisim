@@ -1,0 +1,23 @@
+# Implementation-only commands (6.37 to 6.41, 6.43, 6.57, 6.62, clause 7),
+# appended to gating.upf: they are checked and the simulation is unchanged.
+define_power_switch_cell -cells {HDR_X1} -type header -stage_1_enable {en} \
+    -stage_1_output {enb} -power_switchable VVDD -power VDD
+map_power_switch SW_CORE -lib_cells {HDR_X1} -port_map {{VDD vin} {VVDD vout} {en en} {enb ack}}
+define_isolation_cell -cells {ISO_LO} -power VDD -ground VSS -enable ISO -valid_location sink
+define_isolation_cell -cells {ISO_CL} -power VDD -enable ISO -clamp_cell high
+define_isolation_cell -cells {ISO_MB} -power VDD -ground VSS -pin_groups {{A1 Z1 E} {A2 Z2 E}} -non_dedicated
+define_level_shifter_cell -cells {LS_LH} -input_voltage_range {{0.7 0.9}} -output_voltage_range {{0.9 1.1}} \
+    -direction low_to_high -input_power_pin VDDL -output_power_pin VDD -ground VSS
+define_always_on_cell -cells {AON_BUF} -power VDD -ground VSS -power_switchable VDD_SW \
+    -isolated_pins {{A B} {C}} -enable {!iso1 ""}
+define_diode_clamp -cells {ANT} -data_pins {A} -type power -power VDD
+define_retention_cell -cells {RDFF} -power VDDC -ground VSS -power_switchable VDD \
+    -save_check {!clk} -restore_check {!clk} -save_function {save negedge} -hold_check {clk}
+use_interface_cell IF_CORE -strategy {ISO_0 LS_IN} -domain PD_CORE -lib_cells {ISO_LO LS_LH} -applies_to_clamp 0
+use_interface_cell IF_HI -strategy {ISO_1} -domain PD_CORE -lib_cells {ISO_CL} -elements {u_core/hi} -force_function
+name_format -isolation_prefix "MY_ISO_" -isolation_suffix ""
+name_format -level_shift_suffix "_LS%i"
+set_correlated -nets {{VDD VDD_CORE}}
+set_correlated -sets {{SS_AON SS_CORE}}
+set_variation -supply {VDD VSS} -range {0.95 1.05}
+set_variation -supply {SS_AON.power} -range {0.95 1.05}

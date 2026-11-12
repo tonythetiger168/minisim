@@ -81,6 +81,7 @@ turned on.
 | attributes in the HDL (5.6) | `(* UPF_... = "value" *)` on a module or on one of its ports counts as `set_design_attributes -models` or `set_port_attributes -model -ports` given before the UPF, so a UPF command of the same precedence wins (5.7). Values are checked; Table 8 (attributes that only models, or only instances, can have) is enforced for HDL attributes and UPF commands |
 | `create_abstract_power_source` (6.16) | each function of the output supply set is driven like the output of a power switch whose inputs are that function of each input supply set (a function all sets share, such as a common ground, is left alone): `-on_state` (the named input set while its expression of control ports holds), `-off_state` (or off when no on state holds), `-ack_port` with `-ack_delay` (inertial) and `-ack_polarity`. With `-power_switch` (`-update`) the switches drive the nets instead; they must use the source's controls and drive its ack nets. A non-`NORMAL` `-supply_set` is not simulated yet |
 | `create_pst`, `add_port_state`, `add_pst_state` (legacy) | when a time step settles, the supplies must match a row of every PST |
+| Implementation commands: `map_power_switch` (6.37), `map_repeater_cell` (6.38), `map_retention_cell` (6.39), `map_retention_clamp_cell` (6.40), `name_format` (6.41), `set_correlated` (6.43), `set_variation` (6.57), `use_interface_cell` (6.62), `define_always_on_cell`, `define_diode_clamp`, `define_isolation_cell`, `define_level_shifter_cell`, `define_power_switch_cell`, `define_retention_cell` (7.2 to 7.7) | they choose library cells and names for implementation, so the simulation does not change. Each is read and checked against the errors its clause lists, with file, line and clause: unknown options, missing required options, an empty list, a domain, switch or strategy that does not exist (a strategy of another domain too), an element outside the strategy's elements, more than one isolation or level-shifter strategy in `use_interface_cell`, `-lib_model_name` without `-port_map`, an affix given twice, `-nets` with `-sets`, a `-range` whose low factor is above the high one, different variations on electrically equivalent supplies, `-pin_groups` that repeat a pin, input and output voltage range lists of different lengths, a supply pin a clamp or shifting cell cannot have, a footer switch with `-power_switchable`, save and restore functions on the same pin and edge, and `-hold_check` pins that the save, restore and retention checks need at different values |
 | `upf_version`, `set_scope`, `set_design_top`, `load_upf` | yes |
 | Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
 
@@ -93,8 +94,10 @@ schedules and `-threads` are turned off with `-upf`.
 
 ### Not yet
 
-`map_*`, `use_interface_cell`, `define_*_cell` and the other
-implementation commands are read and ignored with a note.
+The implementation commands are checked and do not change the simulation:
+the model given by `map_retention_cell -lib_model_name` and the function of a
+`use_interface_cell -force_function` cell are not simulated in place of the
+strategy, and a library cell is not checked against a Liberty file.
 Isolation and level shifters sit on port connections between a parent and a
 child instance; a strategy on a port of the simulation top itself, or on a
 hierarchical reference, has no cell. `-applies_to flop` / `latch` of a
