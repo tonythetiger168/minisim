@@ -62,6 +62,12 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- A for loop with a constant trip count in an always_comb or always @* block
+  is unrolled, as loops in clocked blocks already were, so the block runs as
+  straight code and can be split per output. On OpenTitan Ibex this saves 8%
+  of the instructions executed (`tests/spec/12.7.1-comb-loop-unroll.sv`).
+  The unroller also substitutes the loop variable into an indexed
+  part-select's base (`v[i*8 +: 8] = ...`).
 - VPI: a variable of a SystemVerilog type no longer reports `vpiReg` (an
   `int` is a `vpiIntVar`, a `bit` vector a `vpiBitVar`), a
   one-dimensional array reports `vpiRegArray` (`vpiIsMemory` is 1 and
