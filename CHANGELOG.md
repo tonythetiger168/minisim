@@ -55,6 +55,11 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `src/compat.hpp` and `docs/COMPAT.md`: one shared layer that lets every tool
+  accept Synopsys, Cadence or Siemens command lines (`--compat=cadence`, or the
+  name the tool was started as). It renames or drops options from a per-tool
+  rule table and prints messages in the chosen vendor's layout. The engine
+  stays the same; nothing is implemented twice. Unit test `test_compat`.
 - `mlint` reset tree checks: `RDC005` (a reset synchronizer of one flop) and
   `RDC006` (an asynchronous reset made by combinational logic of several
   flops). `-cdc-report` lists the reset synchronizers, their length and how
