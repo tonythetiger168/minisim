@@ -4745,6 +4745,22 @@ struct Lowerer {
                 // (11.8.3): extend with the operand's signedness. An outer width
                 // still wins, so a truncating assign stays narrow.
                 const auto& c = e.as<ConversionExpression>();
+                // To a 2-state type (bit, int, byte) from a 4-state one: x and
+                // z bits become 0 (6.11.2, 10.7). The conversion is lowered as
+                // usual, then its x and z bits are cleared.
+                if (to2State != &e && c.type->isIntegral() && !c.type->isFourState() &&
+                    c.operand().type->isIntegral() && c.operand().type->isFourState()) {
+                    const Expression* saved = to2State;
+                    to2State = &e;
+                    E v = expr(e, ctx);
+                    to2State = saved;
+                    if (v->op == Op::Const) {
+                        Val k = v->k;
+                        for (int i = 0; i < limbCount(k.w); i++) setLimb(k, i, limbV(k, i) & ~limbX(k, i), 0, 0);
+                        return konst(k);
+                    }
+                    return sysFnNode(SF_TO_2STATE, {std::move(v)});
+                }
                 if (peel(c.operand()).kind == ExpressionKind::Streaming && c.type->isIntegral()) {
                     // a stream into a wider integral type is left-aligned,
                     // padded with zeros on the right (11.4.14)
@@ -6733,6 +6749,7 @@ struct Lowerer {
     // ---------- constrained randomization (18) ----------
     std::unordered_map<const slang::ast::Symbol*, Val> constVals;     // foreach indices of a constraint, unrolled
     std::unordered_map<const slang::ast::Symbol*, int> symOverride;   // with {...}: the caller's properties, copied
+    const slang::ast::Expression* to2State = nullptr;   // the conversion being lowered without its x/z clearing
     using BeforeList = std::vector<std::pair<std::vector<E>, std::vector<E>>>;
     std::unordered_map<const slang::ast::Symbol*, E> exprBind;
     // a.sum(), a.sum() with (expr) ... of a fixed-size array (7.12.3): the
