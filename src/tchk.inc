@@ -75,6 +75,7 @@ inline void violation(const TimingCheck& tc, int64_t t0, int64_t t1) {
     if (tc.nev == 2) std::cout << ", " << tc.ev[1].text << ":" << timeStr(t1, tc.unit);
     else std::cout << ", :" << timeStr(t1, tc.unit);
     std::cout << ", " << tc.limText << " );\n";
+    if (g_tchkHook) g_tchkHook((int)(&tc - timingChecks().data()));
     if (tc.notifier >= 0) {
         Val n = S.get(tc.notifier);
         bool z = n.z & 1, x = n.x & 1;
