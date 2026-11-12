@@ -1,0 +1,4 @@
+# map_retention_cell and map_retention_clamp_cell (6.39, 6.40) on retention.upf.
+map_retention_cell {RET_A} -domain PD_A -elements {u_a/keep} -lib_cells {RDFF}
+map_retention_cell {RET_B} -domain PD_B -lib_cell_type ret_b
+map_retention_clamp_cell {RET_A RET_B} -domain PD_A -clock_clamp_lib_cells {CC} -async_clamp_lib_cells {AC}

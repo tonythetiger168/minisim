@@ -177,6 +177,23 @@ struct SelfScope {
     explicit SelfScope(const CgInst& in) : saved(g_fr) { if (in.self) g_fr = in.self.get(); }
     ~SelfScope() { g_fr = saved; }
 };
+// A coverpoint's function calls (tr.ones() > 0), in the instance's scope,
+// run to their end; a function cannot wait.
+inline void runPre(const Prog& p) {
+    Frame* sf = g_fr;
+    Frame* sr = g_ret;
+    FrameP fp(g_fr, [](Frame*) {});
+    auto ctl = std::make_shared<ProcCtl>();
+    Task t = exec(&p, ctl, fp);
+    t.h.resume();
+    if (!t.h.done()) {
+        std::cerr << "error: a function called in a coverpoint waited (time " << S.now << ")\n";
+        std::exit(1);
+    }
+    t.h.destroy();
+    g_fr = sf;
+    g_ret = sr;
+}
 inline void setArgs(const CgInst& in) {
     const CgDef& d = cgDefs()[in.def];
     for (size_t k = 0; k < d.argSigs.size(); k++)
@@ -628,9 +645,11 @@ inline void sampleInst(CgInst& in) {
         CgCpInst& cp = in.cps[ci];
         cp.hit.clear();
         cp.sampled = false;
-        if (c.preIff) g_cgRun(c.preIff.get(), in);
+        for (const auto& [t, e] : c.preIff) S.set(t, eval(e, rd));
+        if (c.preIffProg) runPre(*c.preIffProg);
         if (c.iff && truth(eval(c.iff, rd)) != 1) continue;
-        if (c.pre) g_cgRun(c.pre.get(), in);
+        for (const auto& [t, e] : c.pre) S.set(t, eval(e, rd));
+        if (c.preProg) runPre(*c.preProg);
         Val v = eval(c.expr, rd);
         bool hasX = !c.isReal && (v.x & kmask(c.w)) != 0;
         uint64_t k = keyOf(c, v);

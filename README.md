@@ -118,7 +118,8 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
-| `-xprop[=tmerge\|xmerge]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
+| `-xprop[=tmerge\|xmerge\|<config file>]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
+| `-restore <checkpoint> [+plusargs]` | Go back to a `$save` checkpoint: run the saved command line again quietly up to it, check the state, and carry on; see [`docs/CHECKPOINT.md`](docs/CHECKPOINT.md) |
 | `-xrun ...` (or msim run as `xrun` / `irun`) | The rest of the command line is an xrun / irun one: `-f`, `-incdir`, `-define`, `-l`, `-input`, `-access`, ... translated to msim options; see [`docs/XRUN.md`](docs/XRUN.md) |
 | `-elab` | Stop after elaboration, before the run |
 | `-profile [<file>]` | Simulation profile: time and activations per process, instance, source file and kind, plus scheduler regions (default `simprofile.txt`); see [`docs/PROFILE.md`](docs/PROFILE.md) |
