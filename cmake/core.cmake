@@ -16,6 +16,7 @@
 # installed package, so a header that is used but not listed here fails the
 # build rather than being found by accident through the source tree.
 set(MINISIM_CORE_HEADERS
+    annexd.inc
     clocking.hpp
     cover.hpp
     cover_rt.inc
@@ -26,6 +27,7 @@ set(MINISIM_CORE_HEADERS
     gnetlist.hpp
     interval.hpp
     liberty.hpp
+    licproxy.hpp
     lintir.hpp
     lower.hpp
     lower_assert.inc
@@ -68,8 +70,9 @@ target_include_directories(minisim_core INTERFACE
 target_link_libraries(minisim_core INTERFACE $<BUILD_INTERFACE:slang::slang> Threads::Threads)
 if(OPENSSL_FOUND)
   # protect.hpp decrypts IEEE 1735 envelopes; without OpenSSL it reports that
-  # the build has no crypto rather than failing to compile.
-  target_link_libraries(minisim_core INTERFACE OpenSSL::Crypto)
+  # the build has no crypto rather than failing to compile. licproxy.hpp talks
+  # TLS to an IP author's license proxy (IEEE 1735 clause 8), hence SSL.
+  target_link_libraries(minisim_core INTERFACE OpenSSL::SSL OpenSSL::Crypto)
   target_compile_definitions(minisim_core INTERFACE MINISIM_HAVE_OPENSSL)
 endif()
 

@@ -44,6 +44,65 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
 // $writememh / $writememb (21.5): one word per line, every digit written
 // (x and z as x and z), no @ addresses. The default range is the whole
 // memory, lowest address first; start and finish pick a range and order.
+// A multidimensional memory in a $readmem / $writemem file (21.4.3): an
+// address picks a word of the highest dimension, and its words of the
+// lower dimensions follow in row-major order, each dimension from its low
+// address up. k numbers those words; memSub is how many there are.
+static int64_t memSub(const ArrShape& a) {
+    int64_t n = 1;
+    for (size_t d = 1; d < a.dims.size(); d++) n *= std::abs(a.dims[d].first - a.dims[d].second) + 1;
+    return n;
+}
+static std::vector<int64_t> memIdx(const ArrShape& a, int64_t addr, int64_t k) {
+    std::vector<int64_t> idx(a.dims.size());
+    idx[0] = addr;
+    for (size_t d = a.dims.size(); d-- > 1;) {
+        auto [l, r] = a.dims[d];
+        int64_t n = std::abs(l - r) + 1;
+        idx[d] = std::min(l, r) + k % n;
+        k /= n;
+    }
+    return idx;
+}
+// A partly indexed memory as the $readmem / $writemem target (21.4):
+// aidx holds the indexes of the leading dimensions and, when pdown is set,
+// the left and right bounds of a slice of the next one. i.arr becomes the
+// lesser dimensioned array they select, in place in the memory.
+static bool memView(Instr& i) {
+    const ArrShape& a = *i.arr;
+    size_t ni = i.aidx.size() - (i.pdown ? 2 : 0);
+    std::vector<int64_t> idx(a.dims.size());
+    auto bad = [&](const char* why) {
+        std::cerr << (i.k == IK::ReadMem ? "$readmem" : "$writemem") << ": " << why << " for " << i.fmt << "\n";
+        return false;
+    };
+    for (size_t d = 0; d < a.dims.size(); d++) idx[d] = a.dims[d].first;
+    for (size_t d = 0; d < ni; d++) {
+        Val v = eval(i.aidx[d], rd);
+        if (v.x) return bad("unknown memory index");
+        idx[d] = v_to_i64(v);
+    }
+    auto view = std::make_shared<ArrShape>(a);
+    view->dims.erase(view->dims.begin(), view->dims.begin() + (long)ni);
+    if (i.pdown) {
+        Val l = eval(i.aidx[ni], rd), r = eval(i.aidx[ni + 1], rd);
+        if (l.x || r.x) return bad("unknown slice bound");
+        int64_t sl = v_to_i64(l), sr = v_to_i64(r);
+        auto [dl, dr] = a.dims[ni];
+        if ((dl <= dr) != (sl <= sr) && sl != sr) return bad("slice in the wrong direction");
+        if (std::min(sl, sr) < std::min(dl, dr) || std::max(sl, sr) > std::max(dl, dr)) return bad("slice out of range");
+        idx[ni] = sl;
+        view->dims[0] = {sl, sr};
+    }
+    int64_t off = a.offset(idx);
+    if (off < 0) return bad("memory index out of range");
+    view->base = a.base + (int)off;
+    int64_t cnt = 1;
+    for (size_t d = 0; d < view->dims.size(); d++) cnt *= view->size(d);
+    view->count = (int)cnt;
+    i.arr = view;
+    return true;
+}
 static void writeMem(const Instr& i) {
     const ArrShape& a = *i.arr;
     auto [l, r] = a.dims[0];
@@ -54,8 +113,10 @@ static void writeMem(const Instr& i) {
     std::ofstream out(i.fmt);
     if (!out) { std::cerr << "$writemem: cannot open " << i.fmt << "\n"; return; }
     int64_t step = finish < start ? -1 : 1;
+    const int64_t sub = memSub(a);
     for (int64_t ad = start;; ad += step) {
-        int64_t off = a.offset({ad});
+      for (int64_t k = 0; k < sub; k++) {
+        int64_t off = a.offset(memIdx(a, ad, k));
         if (off >= 0) {
             Val v = S.get(R(a.base) + (int)off);
             v.sgn = false;
@@ -74,6 +135,7 @@ static void writeMem(const Instr& i) {
             }
             out << s << "\n";
         }
+      }
         if (ad == finish) break;
     }
 }
@@ -205,10 +267,16 @@ static void readMem(const Instr& i) {
     if (i.args.size() > 1) { Val v = eval(i.args[1], rd); if (!v.x) { finish = v_to_i64(v); haveFinish = true; } }
     int64_t step = (haveFinish && finish < start) ? -1 : 1;
     if (!haveFinish) finish = highA;
-    std::ifstream in(i.fmt);
-    if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    int64_t addr = start;
+    std::string text;
+    if (i.pw == 2) {   // $sreadmemb / $sreadmemh (D.14): the data is in the string arguments
+        for (size_t k = 2; k < i.args.size(); k++) { Val sv = eval(i.args[k], rd); sv.str = true; text += v_str(sv) + "\n"; }
+    } else {
+        std::ifstream in(i.fmt);
+        if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    int64_t addr = start, k = 0;
+    const int64_t sub = memSub(a);
     int bits = i.hex ? 4 : 1;
     int64_t words = 0;
     bool sawAddr = false;
@@ -232,6 +300,7 @@ static void readMem(const Instr& i) {
         p = e;
         if (c == '@') {
             addr = (int64_t)std::stoull(tok, nullptr, 16);
+            k = 0;
             sawAddr = true;
             if (!inRange(addr)) { std::cerr << "$readmem: address " << tok << " out of range in " << i.fmt << "\n"; return; }
             continue;
@@ -251,14 +320,14 @@ static void readMem(const Instr& i) {
                 acc = v_or(v_shl(acc, sh), dig);
             }
             if (!inRange(addr)) break;
-            int64_t off = a.offset({addr});
+            int64_t off = a.offset(memIdx(a, addr, k));
             if (off < 0) break;
             if (a.twoState) {
                 acc.v &= ~acc.x; acc.x = acc.z = 0;
                 for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
             }
             S.set(R(a.base) + (int)off, acc);
-            addr += step;
+            if (++k == sub) { k = 0; addr += step; }
             words++;
             continue;
         }
@@ -274,17 +343,17 @@ static void readMem(const Instr& i) {
             else { std::cerr << "$readmem: bad digit '" << d << "' in " << i.fmt << "\n"; return; }
         }
         if (!inRange(addr)) break;
-        int64_t off = a.offset({addr});
+        int64_t off = a.offset(memIdx(a, addr, k));
         if (off < 0) break;
         if (a.twoState) { v &= ~x; x = z = 0; }
         S.set(R(a.base) + (int)off, make(v, x, a.elemW, z));
-        addr += step;
+        if (++k == sub) { k = 0; addr += step; }
         words++;
     }
     // A file with no @address whose word count differs from the range warns
     // (21.4): the range given by start and finish addresses, or, with no
     // finish address, a file with more words than the memory has room for.
-    int64_t range = (step > 0 ? finish - start : start - finish) + 1;
+    int64_t range = ((step > 0 ? finish - start : start - finish) + 1) * sub;
     if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
 }
@@ -789,6 +858,10 @@ static size_t runAssert(const Instr& i, const shared_ptr<ProcCtl>& ctl, size_t p
     bool ok = truth(eval(i.e, rd)) == 1;
     a.evals++;
     (ok ? a.passes : a.fails)++;
+    if (assertHook()) {   // an immediate assertion's attempt starts and ends at once (39.4.2)
+        assertEvent(i.sig, AE_START, S.now);
+        assertEvent(i.sig, ok ? AE_SUCCESS : AE_FAILURE, S.now);
+    }
     if (!i.join) {
         if (ok) return a.passOn ? pc + 1 : i.hi;
         return a.failOn ? i.target : i.hi;
@@ -888,7 +961,7 @@ static void runAction(const Prog* p, uint64_t n, const vector<E>* slots = nullpt
         if (slots && caps)
             for (size_t j = 0; j < slots->size(); j++) ctl->init.push_back({(*slots)[j].get(), (*caps)[j]});
         Task t = startProc(p, ctl);
-        S.all.push_back(t.h);
+        S.oneShot.insert(t.h.address());   // freed after its run (Sim::oneShot)
         S.reactive.push_back(t.h);
     }
     S.rare = true;
@@ -1006,7 +1079,10 @@ static void expectDone(const shared_ptr<void>& p, int res) {
     S.reactive.push_back(w->h);
     S.rare = true;
 }
-static void dropAttempts(ConcAssert& c) {   // disabled or killed: expect statements go on
+static void dropAttempts(ConcAssert& c, int ev = AE_DISABLED) {   // disabled or killed: expect statements go on
+    if (assertHook() && !asserts()[c.id].hidden)
+        for (auto& at : c.att)
+            for (uint64_t n = 0; n < at.count; n++) assertEvent(c.id, ev, at.start);
     for (auto& at : c.att) expectDone(at.wait, 2);
     for (auto& p : c.matured) expectDone(p.wait, 2);
     c.att.clear();
@@ -1032,27 +1108,39 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
         std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
             if (t.killGen == a.killGen) return false;
+            if (!a.hidden) for (uint64_t n = 0; n < t.count; n++) assertEvent(c.id, AE_KILLED, t.start);
             expectDone(t.wait, 2);
             return true;
         });
     if (c.disable && truth(eval(c.disable, rd)) == 1) {   // disabled: no pass, no fail (16.12)
         dropAttempts(c);
         c.pending.clear();
-        if (a.on && (ticked & 1)) a.evals++;
+        if (a.on && (ticked & 1)) {
+            a.evals++;
+            if (assertHook() && !a.hidden && !c.procedural) {   // the attempt of this tick starts disabled (39.4.2)
+                assertEvent(c.id, AE_START, S.now);
+                assertEvent(c.id, AE_DISABLED, S.now);
+            }
+        }
         return;
     }
     if (!(ticked & 1)) {
     } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait}); a.evals++; }
+        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait, S.now}); a.evals++; assertEvent(c.id, AE_START, S.now); }
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) { c.att.push_back({c.root, false, 1, a.killGen, p.caps}); a.evals++; }
+            if (!pc->killed && pc->epoch == p.epoch) {
+                c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, nullptr, S.now});
+                a.evals++;
+                assertEvent(c.id, AE_START, S.now);
+            }
         }
         c.pending.clear();
     } else if (a.on) {
-        c.att.push_back({c.root, false, 1, a.killGen, nullptr});
+        c.att.push_back({c.root, false, 1, a.killGen, nullptr, nullptr, nullptr, S.now});
         a.evals++;
+        if (!a.hidden) assertEvent(c.id, AE_START, S.now);
     }
     if (c.att.empty()) {
         for (int f : c.clearFlags) S.set(f, mk(0, 1));
@@ -1094,29 +1182,32 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
             if (dv.matches) ended = true;
             if (dv.matches && !a.hidden) {
                 a.passes += at.count * dv.matches;
+                for (uint64_t n = 0; assertHook() && n < at.count * dv.matches; n++) assertEvent(c.id, AE_SUCCESS, at.start);
                 if (a.passOn) runAction(c.pass, at.count * dv.matches, &c.capSlot, at.caps.get());
             }
             if (t->k == sva::DONE) continue;
         } else if (t->k == sva::PTRUE) {
             a.passes += at.count;
+            for (uint64_t n = 0; assertHook() && n < at.count; n++) assertEvent(c.id, dv.nonvac ? AE_SUCCESS : AE_VACUOUS, at.start);
             expectDone(at.wait, 1);
             if (dv.nonvac ? a.passOn : a.vacOn) runAction(c.pass, at.count, &c.capSlot, at.caps.get());
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            for (uint64_t n = 0; assertHook() && n < at.count; n++) assertEvent(c.id, AE_FAILURE, at.start);
             expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (!assertHook() || n.start == at.start) && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
                 (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait, at.start});
     }
     c.att.swap(next);
     if (ended && c.endSig >= 0) {   // the sequence's end point (16.13.6)
@@ -1142,6 +1233,15 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     c.pending.push_back({ctl, ctl->epoch, caps});
     S.rare = true;
 }
+// The assume set of a checker ticked (17.7.2): new random values for its
+// active free variables, tried again while an assumption would fail now.
+static void freeSolveNow(ConcAssert& c) {
+    if (c.solveVars.empty()) return;
+    for (int t = 0; t < 4096; t++) {   // random tries: no search, so a narrow assume set can still miss (allowed)
+        for (int v : c.solveVars) S.set(v, S.freeValue(v));
+        if (!c.solveOk || truth(eval(c.solveOk, rd)) == 1) return;
+    }
+}
 // A multiclock assertion (16.13): one process per clock marks it ticked;
 // the first in a time step runs the assertion in the observed region, once,
 // with every clock that ticked in that step.
@@ -1153,6 +1253,7 @@ inline Task concClockProc(int k, int ci) {
         if (ev->size() > 1) co_await WaitAny{ev};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
         if (iff && truth(eval(iff, rd)) != 1) continue;
+        if (ci == 0) freeSolveNow(c);
         c.ticked |= 1u << ci;
         if (c.due) continue;
         c.due = true;
@@ -1170,6 +1271,7 @@ inline Task concProc(int k) {
         if (ev->size() > 1) co_await WaitAny{ev};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
         if (c.clkIff && truth(eval(c.clkIff, rd)) != 1) continue;   // @(posedge clk iff en)
+        freeSolveNow(c);
         co_await ToObserved{};
         concTick(c);
     }
@@ -1207,6 +1309,7 @@ inline vector<Task> concEnd() {
         for (auto& at : c.att)
             if (at.killGen == a.killGen && !sva::endValue(at.t)) {
                 a.fails += at.count;
+                for (uint64_t n = 0; assertHook() && !a.hidden && n < at.count; n++) assertEvent(c.id, AE_FAILURE, at.start);
                 if (a.failOn && c.fail)
                     for (uint64_t n = 0; n < at.count; n++) ts.push_back(startProc(c.fail, make_shared<ProcCtl>()));
             }
@@ -1376,9 +1479,10 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             }
             case IK::ReadMem:
             case IK::WriteMem: {
-                if (i.e) {   // a file name known only at run time: a string variable or expression
+                if (i.e || !i.aidx.empty()) {   // a file name known only at run time, or a part of the memory
                     Instr n = i;
-                    n.fmt = v_str(eval(i.e, rd));
+                    if (i.e) n.fmt = v_str(eval(i.e, rd));
+                    if (!i.aidx.empty() && !memView(n)) { pc++; break; }
                     if (i.k == IK::ReadMem) readMem(n); else writeMem(n);
                 } else if (i.k == IK::ReadMem) readMem(i);
                 else writeMem(i);
@@ -1929,3 +2033,4 @@ inline void startClockings() {
 #include "cover_rt.inc"
 #include "tchk.inc"
 #include "sdf_annotate.inc"
+#include "annexd.inc"

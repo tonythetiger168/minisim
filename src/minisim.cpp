@@ -304,6 +304,11 @@ struct Sim {
     vector<Sig> sigs;
     vector<vector<Waiter>> waiters;                  // dynamic sensitivity
     vector<Handle> all;                              // owned coroutines
+    // Assertion action blocks (16.14.3) not yet run: most finish on their
+    // first resume and are freed then, so a pass action that runs on every
+    // clock does not keep one coroutine per run until the end (gigabytes in
+    // a long run). One that waits joins `all`.
+    std::unordered_set<void*> oneShot;
     deque<Handle> active, inactive;                  // active / inactive regions
     struct NbaItem { int s; Val v; int hi, lo; };    // hi < 0: whole signal
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
@@ -366,6 +371,13 @@ struct Sim {
     // as m[3], for arrays of at most N elements. 0 (the default): memories
     // are left out, as $dumpvars does (21.7.1.2).
     size_t dumpArrays = 0;
+    // msim -vcd-class [N]: class objects in the waveform. A view signal named
+    // h.prop shows a property of the object the handle signal `handle` points
+    // to; `offs` are property slots from that object (all but the last are
+    // handle properties to follow). It is x while a handle on the way is
+    // null, and is refreshed at the end of each time slot (viewTail).
+    struct ObjView { int sig, handle; vector<int> offs; };
+    vector<ObjView> objViews;
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
     // VCD text is built here and written in large blocks (an ostream insert
@@ -910,9 +922,11 @@ struct Sim {
 
     ~Sim() {
         for (auto h : all) h.destroy();
+        for (void* p : oneShot) Handle::from_address(p).destroy();
         closeWaves();
     }
     void closeWaves() {
+        if (!objViews.empty()) viewTail();   // the slot $finish ended
         evcdClose();
 #ifdef MINISIM_FST
         if (fst) { fstWriterClose((fstWriterContext*)fst); fst = nullptr; }
@@ -976,6 +990,7 @@ struct Sim {
         Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)   // wand, tri0, ... (6.6)
               : (g.drv.size() == 1 && s0 != STR_HIZ && s1 != STR_HIZ) ? g.drv[0].v
                                                                        : resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        if (__builtin_expect(!decay.empty(), 0) && g.kind == NR_TRIREG) decayArm(s, r);   // 28.16.2
         if (!timedOut.empty() && (size_t)s < timedOut.size() && timedOut[s]) {   // 30.5.3, 30.7, 32.4.4
             if (shadowed(s)) return;   // its value comes from the delayed sources (shadowOf)
             Val from = projected(s, PQ_PATH, g.val);
@@ -999,7 +1014,46 @@ struct Sim {
     // (slot PQ_PATH), or of one source's driver as a load sees it through an
     // interconnect delay (slot PQ_SRC - driver, 32.4.4). Each entry is one
     // future change; an unlimited number may be pending.
-    enum { PQ_PATH = -2, PQ_SRC = -10, PQ_VAR = -1000000 };
+    enum { PQ_PATH = -2, PQ_DECAY = -3, PQ_SRC = -10, PQ_VAR = -1000000 };
+    // trireg nets (28.16.2): the charge strength when not medium, and the
+    // charge decay time. When the drivers turn off, the held 0 or 1 becomes
+    // x after the decay time unless a driver turns on first.
+    struct Decay { uint64_t ticks = 0; uint64_t gen = 0; bool on = false; };
+    unordered_map<int, Decay> decay;
+    unordered_map<int, uint8_t> charge;
+    uint8_t chargeOf(int s) const {
+        if (charge.empty()) return STR_MEDIUM;
+        auto it = charge.find(s);
+        return it == charge.end() ? STR_MEDIUM : it->second;
+    }
+    // r: the net's new resolved value. A decay time of 0 makes held bits x at once.
+    void decayArm(int s, Val& r) {
+        auto it = decay.find(s);
+        if (it == decay.end() || !it->second.on) return;
+        Decay& dc = it->second;
+        dc.gen++;
+        const Sig& g = sigs[(size_t)s];
+        Val dr = resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        bool held = false;
+        for (int b = 0; b < g.w; b++)
+            if (bitAt(dr, b) == 3) {
+                held = true;
+                if (dc.ticks == 0 && bitAt(r, b) < 2) setBit(r, b, 2);
+            }
+        if (!held || dc.ticks == 0) return;
+        laterDrv[now + dc.ticks].push_back({s, PQ_DECAY, dc.gen, 0, 0});
+        wheel[now + dc.ticks];
+    }
+    void decayFire(int s, uint64_t gen) {
+        auto it = decay.find(s);
+        if (it == decay.end() || it->second.gen != gen) return;   // a driver changed since
+        const Sig& g = sigs[(size_t)s];
+        Val dr = resolveDrives(g.drv.data(), g.drv.size(), g.w);
+        Val nv = g.val;
+        for (int b = 0; b < g.w; b++)
+            if (bitAt(dr, b) == 3 && bitAt(nv, b) < 2) setBit(nv, b, 2);
+        if (!sameVal(nv, g.val)) set(s, nv);
+    }
     // The port connections of variable path outputs: (net, driver) -> the
     // variable and the value the driver last passed on.
     map<pair<int, int>, pair<int, Val>> varPathDrv;
@@ -1440,6 +1494,7 @@ struct Sim {
         auto batch = std::move(it->second);
         laterDrv.erase(it);
         for (auto& l : batch) {
+            if (l.d == PQ_DECAY) { decayFire(l.s, l.gen); continue; }   // 28.16.2
             if (l.d <= PQ_PATH) { runPulse(l.s, l.d, l.gen); continue; }   // 30.7, 32.4.4
             auto pi = pend.find({l.s, l.d});
             if (pi == pend.end() || !pi->second.live || pi->second.gen != l.gen) continue;   // cancelled
@@ -1703,7 +1758,7 @@ struct Sim {
                 have = true;
             } else if (g.net) {
                 unsigned st = g.kind == NR_SUPPLY0 || g.kind == NR_SUPPLY1 ? STR_SUPPLY
-                            : g.kind == NR_TRIREG && g.drv.empty() ? STR_MEDIUM
+                            : g.kind == NR_TRIREG && g.drv.empty() ? self->chargeOf(sig)
                             : (g.kind == NR_TRI0 || g.kind == NR_TRI1) && v == (g.kind == NR_TRI1 ? 1 : 0) ? STR_PULL
                             : STR_STRONG;
                 if (v == 3) sb = SBit{};
@@ -1713,7 +1768,10 @@ struct Sim {
                         SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
                         sb = sbit_resolv(sb, cur);
                     }
-                    if (sbit_z(sb)) sb = v == 1 ? sbit_1(STR_MEDIUM) : v == 0 ? sbit_0(STR_MEDIUM) : sbit_x(STR_MEDIUM, STR_MEDIUM);
+                    if (sbit_z(sb)) {
+                        uint8_t c = self->chargeOf(sig);
+                        sb = v == 1 ? sbit_1(c) : v == 0 ? sbit_0(c) : sbit_x(c, c);
+                    }
                 } else sb = v == 1 ? sbit_1(st) : v == 0 ? sbit_0(st) : sbit_x(st, st);
                 have = true;
             }
@@ -2109,10 +2167,11 @@ struct Sim {
     }
     // Extended VCD (21.7.3): one file per $dumpports call, holding the ports
     // of the modules it names. Values are compared at the end of each time
-    // slot, so a run without $dumpports pays nothing. Which side drives a
-    // port is not looked at: an input shows D/U/N/Z, an output L/H/X/T and
-    // an inout 0/1/?/F, each bit at strong strength (or highz for z).
-    struct EvcdPort { int sig; char dir; string id; };
+    // slot, so a run without $dumpports pays nothing.
+    struct EvcdPort { int sig; char dir; string id; string inst; };
+    // The instance each continuous driver of a signal belongs to ("" the
+    // top), filled when the design calls $dumpports.
+    std::unordered_map<int, vector<string>> drvScope;
     struct Evcd {
         string path;
         std::ofstream f;
@@ -2122,16 +2181,98 @@ struct Sim {
         uint64_t limit = 0, lastT = ~0ULL;
     };
     std::deque<Evcd> evcds;
+    // One bit of a port (21.7.4.3.1): which side drives it, with what. The
+    // drivers inside the port's module are the DUT (output) side, the rest
+    // the test fixture (input) side. A port with no continuous drivers (a
+    // variable) shows its value as its direction says.
+    struct Side { int n = 0; int s0 = 0, s1 = 0; };   // active drivers, strongest 0 and 1
+    static char sideVal(const Side& d) {
+        if (!d.n) return 'z';
+        return d.s0 > d.s1 ? '0' : d.s1 > d.s0 ? '1' : 'x';
+    }
+    static int sideStr(const Side& d, char v) { return v == '0' ? d.s0 : v == '1' ? d.s1 : std::max(d.s0, d.s1); }
     string evcdValue(const EvcdPort& p, bool asX) {
-        const int w = sigs[p.sig].w;
+        const auto& g = sigs[p.sig];
+        const int w = g.w;
         string bits((size_t)w, 'x');
-        if (!asX) putBits(bits.data(), sigs[p.sig].val, w);
+        if (!asX) putBits(bits.data(), g.val, w);
+        const vector<string>* sc = nullptr;
+        if (!asX && !g.drv.empty())
+            if (auto it = drvScope.find(p.sig); it != drvScope.end()) sc = &it->second;
+        vector<string> dbits;
+        vector<char> inside;
+        if (sc) {
+            for (size_t d = 0; d < g.drv.size(); d++) {
+                string b((size_t)w, 'z');
+                putBits(b.data(), g.drv[d].v, w);
+                dbits.push_back(std::move(b));
+                const string& o = d < sc->size() ? (*sc)[d] : string();
+                inside.push_back(p.inst.empty() || o == p.inst || (o.size() > p.inst.size() && o.compare(0, p.inst.size(), p.inst) == 0 &&
+                                                                   o[p.inst.size()] == '.'));
+            }
+        }
         string v = "p", s0, s1;
-        for (char c : bits) {
-            int k = c == '0' ? 0 : c == '1' ? 1 : c == 'z' ? 3 : 2;
-            v += (p.dir == 'i' ? "DUNZ" : p.dir == 'o' ? "LHXT" : "01?F")[k];
-            s0 += k == 0 || k == 2 ? '6' : '0';
-            s1 += k == 1 || k == 2 ? '6' : '0';
+        for (int k = 0; k < w; k++) {
+            char c = bits[(size_t)k];
+            if (!sc) {   // no drivers to look at: the value, as the direction says
+                int x = c == '0' ? 0 : c == '1' ? 1 : c == 'z' ? 3 : 2;
+                v += (p.dir == 'i' ? "DUNZ" : p.dir == 'o' ? "LHXT" : "01?F")[x];
+                s0 += x == 0 || x == 2 ? '6' : '0';
+                s1 += x == 1 || x == 2 ? '6' : '0';
+                continue;
+            }
+            Side in, out;
+            for (size_t d = 0; d < dbits.size(); d++) {
+                char b = dbits[d][(size_t)k];
+                int a0 = b == '0' || b == 'x' ? g.drv[d].s0 : 0, a1 = b == '1' || b == 'x' ? g.drv[d].s1 : 0;
+                if (!a0 && !a1) continue;
+                Side& sd = inside[d] ? out : in;
+                sd.n++;
+                sd.s0 = std::max(sd.s0, a0);
+                sd.s1 = std::max(sd.s1, a1);
+            }
+            char st;
+            int str0 = 0, str1 = 0;
+            auto strengthOf = [&](char val, int s) {
+                if (val == '0') str0 = s;
+                else if (val == '1') str1 = s;
+                else if (val == 'x') str0 = str1 = s;
+            };
+            char iv = sideVal(in), ov = sideVal(out);
+            if (p.dir != 'b' || !in.n || !out.n) {
+                // One side drives (or the direction fixes the side): its value,
+                // d/u or l/h when two or more drivers are active.
+                bool dut = p.dir == 'o' || (p.dir == 'b' && out.n && !in.n);
+                bool fixture = p.dir == 'i' || (p.dir == 'b' && in.n && !out.n);
+                Side all = in;
+                all.n += out.n;
+                all.s0 = std::max(in.s0, out.s0);
+                all.s1 = std::max(in.s1, out.s1);
+                char val = all.n ? (c == 'z' ? sideVal(all) : c) : 'z';
+                int x = val == '0' ? 0 : val == '1' ? 1 : val == 'z' ? 3 : 2;
+                bool many = all.n >= 2 && x < 2;
+                if (fixture) st = many ? "du"[x] : "DUNZ"[x];
+                else if (dut) st = many ? "lh"[x] : "LHXT"[x];
+                else {   // an inout nobody drives now: F if a side has no driver at all, f if both are three-stated
+                    bool inDrv = false, outDrv = false;
+                    for (char d : inside) (d ? outDrv : inDrv) = true;
+                    st = x == 3 ? (inDrv && outDrv ? 'f' : 'F') : "01?F"[x];
+                }
+                strengthOf(val, sideStr(all, val));
+            } else if (iv == ov && iv != 'x') {   // both drive the same value (21.7.4.3.2)
+                bool sIn = sideStr(in, iv) >= STR_PULL, sOut = sideStr(out, ov) >= STR_PULL;
+                if (sIn == sOut) { st = iv; strengthOf(iv, std::max(sideStr(in, iv), sideStr(out, ov))); }
+                else if (sIn) { st = iv == '0' ? 'd' : 'u'; strengthOf(iv, sideStr(in, iv)); }
+                else { st = iv == '0' ? 'l' : 'h'; strengthOf(iv, sideStr(out, ov)); }
+            } else {   // a conflict
+                st = iv == '0' ? (ov == '1' ? 'A' : 'a')
+                   : iv == '1' ? (ov == '0' ? 'B' : 'b')
+                   : ov == '0' ? 'C' : ov == '1' ? 'c' : '?';
+                strengthOf('x', std::max(std::max(in.s0, in.s1), std::max(out.s0, out.s1)));
+            }
+            v += st;
+            s0 += (char)('0' + str0);
+            s1 += (char)('0' + str1);
         }
         return v + " " + s0 + " " + s1 + " " + p.id + "\n";
     }
@@ -2147,6 +2288,25 @@ struct Sim {
             if (!asX) e.last[k] = v;
         }
         e.f << "$end\n";
+    }
+    // The end of a time slot: each object view takes the value it shows now.
+    void viewTail() {
+        if (!waving()) return;
+        for (const ObjView& o : objViews) {
+            const Val* src = nullptr;
+            size_t at = (size_t)o.handle;
+            for (size_t k = 0; k < o.offs.size(); k++) {
+                const Val& h = sigs[at].val;
+                if (h.x || h.v == 0 || h.v >= sigs.size()) break;   // null (or not yet set)
+                at = (size_t)h.v + (size_t)o.offs[k];
+                if (at >= sigs.size()) break;
+                if (k + 1 == o.offs.size()) src = &sigs[at].val;
+            }
+            Val nv = src ? *src : allx(sigs[o.sig].w);
+            if (sameBits(nv, sigs[o.sig].val)) continue;
+            sigs[o.sig].val = nv;
+            dump(o.sig);
+        }
     }
     // The end of a time slot: the first values, then the ports that changed.
     void evcdTail() {
@@ -2212,7 +2372,9 @@ struct Sim {
                     scopes += (scopes.empty() ? "" : ", ") + scope;
                     defs << "$scope module " << scope << " $end\n";
                 }
-                EvcdPort p{it->second, fld[0][0], "<" + std::to_string(e.ports.size())};
+                EvcdPort p{it->second, fld[0][0], "<" + std::to_string(e.ports.size()), ""};
+                // The instance as signals name it: the path without the top module.
+                if (size_t d = fld[1].find('.'); d != string::npos) p.inst = fld[1].substr(d + 1);
                 defs << "$var port " << (vec ? "[" + fld[3] + ":" + fld[4] + "]" : string("1")) << " " << p.id << " " << fld[2] << " $end\n";
                 e.ports.push_back(p);
             }
@@ -2555,6 +2717,12 @@ struct Sim {
                     region = R_REACTIVE;
                     if (!h.done()) h.resume();
                     region = R_ACTIVE;
+                    if (!oneShot.empty())
+                        if (auto it = oneShot.find(h.address()); it != oneShot.end()) {
+                            oneShot.erase(it);
+                            if (h.done()) h.destroy();
+                            else all.push_back(h);
+                        }
                 } else if (!reInactive.empty()) {          // re-inactive (#0 in the reactive set)
                     for (auto h : reInactive) reactive.push_back(h);
                     reInactive.clear();
@@ -2576,6 +2744,7 @@ struct Sim {
         if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
         if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
+        if (!objViews.empty()) { viewTail(); if (evcds.empty()) return false; }   // msim -vcd-class: as $dumpports
         if (!evcds.empty()) { evcdTail(); return false; }   // $dumpports: rare stays set, every slot ends here
         rare = false;
         return false;
@@ -2707,13 +2876,14 @@ struct Sim {
         run(~0ULL, false);
     }
     void run(uint64_t end, bool start = true) {
-        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); }
+        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); if (!objViews.empty()) rare = true; }
         if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t));
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t)) ||
+                       !active.empty() || !seqq.empty() || !nbaq.empty();   // work queued between slots (msim -i: force, deposit)
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);

@@ -50,6 +50,7 @@ where it does, is in [docs/LICENSING.md](docs/LICENSING.md).
 | `src/parallel.hpp` | Shared by the tools: default thread count, `-threads N`, `par::parallelFor`, `par::Pool` |
 | `src/wave_reader.hpp` | Shared by the tools: `wave::Reader`, VCD (parallel, mapped) and FST into memory |
 | `src/protect.hpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): `msim -keyfile` decrypts with OpenSSL |
+| `src/licproxy.hpp` | IEEE 1735 clause 8 license system: msim asks the IP author's license proxy over TLS |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
@@ -101,6 +102,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
 | `-cov [<file>]` | Write line / branch / toggle / condition / FSM coverage (default `cov.json`); see `mcov`. `-cm line+cond+fsm+tgl` (as VCS) does the same |
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
+| `-vcd-class [N]` | Also write class objects: each property of the object a module's class handle variable points to, as `tb.p.addr` (x while the handle is null), following handle properties N levels (default 1). See `docs/DEBUG.md` |
 | `-vcd-arrays [N]` | Also write the elements of unpacked arrays (memories) with at most N elements (default 1024) to the VCD or FST, as `mem[3]`. Off by default: memories are left out, as `$dumpvars` does. `mdebug` uses them to trace through a memory |
 | `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
@@ -355,6 +357,9 @@ mplan report uart.vplan -results regress.d -label $GIT_COMMIT -rules triage.rule
 mplan triage -results regress.d -plan uart.vplan   # only the failure buckets
 mplan trend  plan.d/history.jsonl                  # score, tests and coverage per snapshot
 mplan init   -results regress.d -o draft.vplan     # a starting plan from an existing regression
+mplan rank   -results regress.d -keep keep.list    # what each test adds; the redundant tests
+mplan serve  -root /srv/mplan -users users.txt     # dashboard for many plans; CI uploads with mplan push
+mplan report uart.vplan -results regress.d -reqs reqs.reqif -trace trace.csv   # requirement traceability
 ```
 
 `mplan report` scores every feature (weighted, with a goal per metric),
@@ -544,7 +549,7 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
 | `format`, `suspicious` | `FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009` | Verible-style text and syntax rules (off until enabled): line length, tabs, trailing spaces, stray semicolons, `` `endif `` comments, explicit lifetimes and parameter types, range direction |
 | `tidy` | `TIDY001`..`TIDY021` | slang-tidy's checks, built in: registers assigned only in reset, undriven bit ranges, struct fields split over processes, port and typedef style |
-| `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
+| `cdc`, `rdc` | `CDC001`..`CDC006`, `RDC001`..`RDC006` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
 mlint rtl/*.sv -config mlint.cfg -waivers waivers.cfg -json lint.json
@@ -562,7 +567,12 @@ the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 Clock and reset domains are found from the RTL: the clock of every
 edge-triggered block, followed through ports, buffers and clock gates, so one
 clock passed down through several modules stays one domain. `-cdc-report`
-lists every domain and crossing, `-clock-group a,b` declares related clocks
+lists every domain and crossing, `-cdc-html FILE` writes a page to browse
+them, `-cdc-abstract`/`-cdc-model` check a
+block once and use its port model in the SoC, `-cdc-sva FILE` writes assertions for the
+synchronized crossings, `-sdc file.sdc` takes the clocks and their
+relations (generated clocks, `set_clock_groups`, false paths between clocks)
+from the timing constraints, `-clock-group a,b` declares related clocks
 and `-static sig` waives a quasi-static signal. Findings print as
 `file:line:col: severity: [RULE] text`, sorted by file and line.
 

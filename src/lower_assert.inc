@@ -53,6 +53,9 @@ int newAssert(int type, int dir, const slang::ast::Statement& st) {
     a.dir = dir;
     a.inst = instPath(scope);
     a.prot = hideLocIf() && hideLocIf()(st.sourceRange.start());   // the coverage right (1735)
+    a.stmt = &st;
+    a.scope = labelSym && labelOf == &st && labelSym->getParentScope() ? labelSym->getParentScope() : scope;
+    std::tie(a.file, a.line) = fileLine(st.sourceRange.start());
     int id = (int)asserts().size();
     if (labelSym && labelOf == &st) a.name = labelSym->getHierarchicalPath();
     else a.name = scopePath(scope) + "." + (dir == AD_COVER ? "cover_" : dir == AD_ASSUME ? "assume_" : "assert_") + std::to_string(id);
@@ -238,6 +241,15 @@ int shadowOf(int s) {
 static std::unordered_set<int>& svaLocalSigs() { static std::unordered_set<int> s; return s; }
 // The signals of sequence end points (16.13.6): read as they are, too.
 static std::unordered_set<int>& svaLiveSigs() { static std::unordered_set<int> s; return s; }
+// The checker whose body is being lowered, when it has assume statements and
+// active free variables (17.7.2): those variables, and the assume set of
+// each clock (its first assumption, which holds the solve).
+struct FreeSolve {
+    bool active = false;
+    std::vector<int> vars;
+    std::vector<std::pair<std::vector<std::pair<int, Edge>>, int>> groups;
+};
+static FreeSolve& freeSolve() { static FreeSolve f; return f; }
 // Signals from this id on are read as they are (temporaries; see sampleProg).
 static int& sampleBelow() { static int n = INT_MAX; return n; }
 E sampledE(const E& e) {
@@ -993,7 +1005,74 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
             prog.code[at].lo = (int)prog.here();
         }
     }
+    if (s.assertionKind == AssertionKind::Assume && freeSolve().active && staticAssert) {
+        // An assumption of a checker with active free variables (17.7.2):
+        // its check in this time step joins the assume set of its clock.
+        E ok = assumeNow(*a);
+        if (ok && dis) ok = bin(Op::LogOr, un(Op::LogNot, un(Op::LogNot, expr(*dis))), ok);
+        auto& fs = freeSolve();
+        int g = -1;
+        for (auto& [ev, idx] : fs.groups)
+            if (ev == c.ev && !c.clkIff) g = idx;
+        if (g < 0) {
+            g = (int)concAsserts().size();
+            fs.groups.push_back({c.ev, g});
+            c.solveVars = fs.vars;
+            c.solveOk = ok ? ok : konst(mk(1, 1));
+        } else if (ok) {
+            concAsserts()[g].solveOk = bin(Op::LogAnd, concAsserts()[g].solveOk, ok);
+        }
+    }
     concAsserts().push_back(std::move(c));
     sampleEv = savedEv;
     svb = saved;
+}
+// What assumption a requires in the current time step (17.7.2), on sampled
+// values (active free variables read as they are): a boolean, an
+// overlapping implication of booleans, and and / or / not of such checks.
+// Null when it has no such check (a temporal property: not constrained).
+E assumeNow(const slang::ast::AssertionExpr& a) {
+    using namespace slang::ast;
+    auto boolOf = [&](const AssertionExpr& x) -> E {
+        if (x.kind != AssertionExprKind::Simple) return nullptr;
+        const auto& se = x.as<SimpleAssertionExpr>();
+        if (se.repetition) return nullptr;
+        if (se.expr.kind == ExpressionKind::AssertionInstance) return nullptr;
+        if (!se.expr.type->isIntegral() && !se.expr.type->isFloating()) return nullptr;
+        return un(Op::LogNot, un(Op::LogNot, sampledE(expr(se.expr))));
+    };
+    if (const auto* ai = instanceOf(a); ai && ai->symbol.kind == SymbolKind::Property) return nullptr;
+    switch (a.kind) {
+        case AssertionExprKind::Simple: return boolOf(a);
+        case AssertionExprKind::Unary: {
+            const auto& u = a.as<UnaryAssertionExpr>();
+            if (u.op != UnaryAssertionOperator::Not) return nullptr;
+            E b = boolOf(u.expr);
+            return b ? un(Op::LogNot, b) : nullptr;
+        }
+        case AssertionExprKind::Binary: {
+            const auto& b = a.as<BinaryAssertionExpr>();
+            if (b.op == BinaryAssertionOperator::OverlappedImplication) {
+                E l = boolOf(b.left);
+                E r = assumeNow(b.right);
+                return l && r ? bin(Op::LogOr, un(Op::LogNot, l), r) : nullptr;
+            }
+            if (b.op == BinaryAssertionOperator::NonOverlappedImplication && !sampleEv.empty() &&
+                b.left.kind == AssertionExprKind::Simple && !b.left.as<SimpleAssertionExpr>().repetition &&
+                boolOf(b.left)) {   // l |=> r: r now if l held at the previous tick
+                const Expression& lx = b.left.as<SimpleAssertionExpr>().expr;
+                E r = assumeNow(b.right);
+                if (!r) return nullptr;
+                E was = un(Op::LogNot, un(Op::LogNot, pastOf(lx, 1, nullptr, sampleEv)));
+                return bin(Op::LogOr, un(Op::LogNot, was), r);
+            }
+            if (b.op == BinaryAssertionOperator::And || b.op == BinaryAssertionOperator::Or) {
+                E l = assumeNow(b.left), r = assumeNow(b.right);
+                if (b.op == BinaryAssertionOperator::And) return l && r ? bin(Op::LogAnd, l, r) : l ? l : r;
+                return l && r ? bin(Op::LogOr, l, r) : nullptr;
+            }
+            return nullptr;
+        }
+        default: return nullptr;
+    }
 }
