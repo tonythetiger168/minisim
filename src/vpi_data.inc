@@ -210,7 +210,7 @@ inline Obj* extendsObj(const ClassType* c) {
     return slot;
 }
 inline bool isMethod(const Obj* o) {
-    if (o->kind != Obj::Scope || !o->sym || o->sym->kind != SymbolKind::Subroutine) return false;
+    if (o->kind != Obj::Scope || !o->sym || (o->sym->kind != SymbolKind::Subroutine && o->sym->kind != SymbolKind::MethodPrototype)) return false;
     const Scope* p = o->sym->getParentScope();
     return p && p->asSymbol().kind == SymbolKind::ClassType;
 }
@@ -248,10 +248,12 @@ inline std::vector<const ClassType*> allClasses() {
 }
 inline bool classIterate(int type, const Obj* o, std::vector<vpiHandle>& items) {
     const auto* c = static_cast<const ClassType*>(o->ty);
-    if (type == vpiMethods) {   // the tasks and functions the class declares (not built-in ones, not pure virtual prototypes)
+    if (type == vpiMethods) {   // the tasks and functions the class declares (not built-in ones; pure virtual prototypes too)
         for (const Symbol& m : c->members())
-            if (m.kind == SymbolKind::Subroutine && !(m.as<SubroutineSymbol>().flags & MethodFlags::BuiltIn))
+            if ((m.kind == SymbolKind::Subroutine && !(m.as<SubroutineSymbol>().flags & MethodFlags::BuiltIn)) ||
+                m.kind == SymbolKind::MethodPrototype) {   // pure virtual: scopeObj skips other prototypes
                 if (Obj* x = scopeObj(m)) items.push_back(H(x));
+            }
         return true;
     }
     if (type == vpiDerivedClasses) {

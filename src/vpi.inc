@@ -41,7 +41,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm, Constraint, ConstrItem } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -205,6 +205,11 @@ inline Obj* moduleObj(const InstanceSymbol* inst) {
 }
 // A scope that is not an instance: a package, generate scope, task,
 // function or named block (37.3.x). Null for anything else.
+// The return type of a function or of a pure virtual prototype.
+inline const Type& subrReturnType(const Symbol& s) {
+    if (s.kind == SymbolKind::MethodPrototype) return s.as<MethodPrototypeSymbol>().getReturnType();
+    return s.as<SubroutineSymbol>().getReturnType();
+}
 inline Obj* scopeObj(const Symbol& s) {
     int type = 0;
     switch (s.kind) {
@@ -217,6 +222,10 @@ inline Obj* scopeObj(const Symbol& s) {
             break;
         case SymbolKind::GenerateBlockArray: type = vpiGenScopeArray; break;
         case SymbolKind::Subroutine: type = s.as<SubroutineSymbol>().subroutineKind == SubroutineKind::Task ? vpiTask : vpiFunction; break;
+        case SymbolKind::MethodPrototype:   // a pure virtual method (37.30): a task or function with no body
+            if (!(s.as<MethodPrototypeSymbol>().flags & MethodFlags::Pure)) return nullptr;
+            type = s.as<MethodPrototypeSymbol>().subroutineKind == SubroutineKind::Task ? vpiTask : vpiFunction;
+            break;
         case SymbolKind::StatementBlock:
             if (s.name.empty()) return nullptr;
             type = s.as<StatementBlockSymbol>().blockKind == StatementBlockKind::Sequential ? vpiNamedBegin : vpiNamedFork;
@@ -2084,13 +2093,17 @@ inline const char* typeName(int type) {
         {vpiImmediateAssert, "vpiImmediateAssert"}, {vpiImmediateAssume, "vpiImmediateAssume"},
         {vpiImmediateCover, "vpiImmediateCover"}, {vpiClassObj, "vpiClassObj"}, {vpiClassVar, "vpiClassVar"},
         {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}, {vpiInterModPath, "vpiInterModPath"}, {vpiTchk, "vpiTchk"}, {vpiTchkTerm, "vpiTchkTerm"}, {vpiModPath, "vpiModPath"}, {vpiPathTerm, "vpiPathTerm"},
-        {vpiGate, "vpiGate"}, {vpiSwitch, "vpiSwitch"}, {vpiUdp, "vpiUdp"}, {vpiPrimTerm, "vpiPrimTerm"}};
+        {vpiGate, "vpiGate"}, {vpiSwitch, "vpiSwitch"}, {vpiUdp, "vpiUdp"}, {vpiPrimTerm, "vpiPrimTerm"},
+        {vpiConstraint, "vpiConstraint"}, {vpiImplication, "vpiImplication"}, {vpiConstrIf, "vpiConstrIf"},
+        {vpiConstrIfElse, "vpiConstrIfElse"}, {vpiConstrForEach, "vpiConstrForEach"}, {vpiSoftDisable, "vpiSoftDisable"},
+        {vpiConstraintOrdering, "vpiConstraintOrdering"}};
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
 }
 #include "vpi_code.inc"
 #include "vpi_tchk.inc"
 #include "vpi_prim.inc"
+#include "vpi_constr.inc"
 }   // namespace vpi
 extern "C" {
 
@@ -2107,6 +2120,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     using slang::ast::SymbolKind;
     if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
     if (type == vpiClassObj && o->type == vpiClassVar) return H(vpi::classObjOf(o));   // 37.29
+    if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return H(vpi::constrHandle(type, o));   // 37.31
     if (type == vpiClassDefn || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return H(vpi::classHandle(type, o));
     if (o->kind == Obj::InterModPath) return nullptr;
     if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return H(vpi::tchkHandle(type, o));   // timing checks
@@ -2199,7 +2213,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
             if (o->kind == Obj::Signal && o->sym) return H(vpi::typespecObj(&o->sym->as<slang::ast::ValueSymbol>().getType()));
             if (o->kind == Obj::Word || o->kind == Obj::Param || o->kind == Obj::Member) return H(vpi::typespecObj(o->ty));
             if (o->kind == Obj::Port) return H(vpi::typespecObj(&o->sym->as<slang::ast::PortSymbol>().getType()));
-            if (o->kind == Obj::Scope && o->type == vpiFunction) return H(vpi::typespecObj(&o->sym->as<slang::ast::SubroutineSymbol>().getReturnType()));
+            if (o->kind == Obj::Scope && o->type == vpiFunction) return H(vpi::typespecObj(&vpi::subrReturnType(*o->sym)));
             return nullptr;
         case vpiBaseTypespec:
             if (o->kind == Obj::Typespec && o->type == vpiEnumTypespec)
@@ -2275,6 +2289,8 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return nullptr;
     if (vpi::primIterate(type, o, items)) return vpi::iter(std::move(items));   // primitives
     if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return nullptr;   // drivers, loads (37.16, 37.17)
+    if (vpi::constrIterate(type, o, items)) return vpi::iter(std::move(items));   // constraints (37.31)
+    if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return nullptr;
     if (type == vpiMember) {   // the members of a struct or union variable (37.17)
         if (!vpi::isStructObj(o)) return nullptr;
         vpi::members(o, items);
@@ -2702,7 +2718,9 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return (PLI_INT32)vpi::tchkGet(prop, o);
     if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return (PLI_INT32)vpi::pathGet(prop, o);
     if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return (PLI_INT32)vpi::primGet(prop, o);
-    if (prop == vpiVirtual && vpi::isMethod(o)) return o->sym->as<slang::ast::SubroutineSymbol>().isVirtual();
+    if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return (PLI_INT32)vpi::constrGet(prop, o);
+    if (prop == vpiVirtual && vpi::isMethod(o))
+        return o->sym->kind == SymbolKind::MethodPrototype || o->sym->as<slang::ast::SubroutineSymbol>().isVirtual();
     if (o->kind == Obj::ClassObj) {   // 37.29
         if (prop == vpiType) return vpiClassObj;
         if (prop == vpiObjId) return o->idx;
@@ -2804,7 +2822,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
             if (o->kind == Obj::Call) return o->site->func ? vpiSystfNames()[s.systfs[(size_t)o->site->systf].name].ftype : 0;
             if (o->kind == Obj::Systf) return s.systfs[(size_t)o->idx].d.sysfunctype;
             if (o->kind == Obj::Scope && o->type == vpiFunction) {
-                const slang::ast::Type& rt = o->sym->as<slang::ast::SubroutineSymbol>().getReturnType().getCanonicalType();
+                const slang::ast::Type& rt = vpi::subrReturnType(*o->sym).getCanonicalType();
                 if (rt.isFloating()) return vpiRealFunc;
                 if (rt.isPredefinedInteger()) {
                     auto k = rt.as<slang::ast::PredefinedIntegerType>().integerKind;
@@ -2850,7 +2868,8 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
             return 0;
         case vpiAutomatic:
             if (o->kind == Obj::Scope && (o->type == vpiTask || o->type == vpiFunction))
-                return o->sym->as<slang::ast::SubroutineSymbol>().defaultLifetime == slang::ast::VariableLifetime::Automatic;
+                return o->sym->kind != SymbolKind::Subroutine ||
+                       o->sym->as<slang::ast::SubroutineSymbol>().defaultLifetime == slang::ast::VariableLifetime::Automatic;
             if (o->kind == Obj::Signal && o->sym->kind == SymbolKind::Variable)
                 return o->sym->as<slang::ast::VariableSymbol>().lifetime == slang::ast::VariableLifetime::Automatic;
             return 0;
@@ -2899,6 +2918,10 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
     if ((o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) && prop != vpiType) {
         std::string r;
         return vpi::tchkGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
+    }
+    if ((o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) && prop != vpiType) {
+        std::string r;
+        return vpi::constrGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
     }
     if ((o->kind == Obj::Prim || o->kind == Obj::PrimTerm) && prop != vpiType) {
         std::string r;
@@ -3057,7 +3080,8 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
         o->kind == Obj::Scope || o->kind == Obj::Typespec || o->kind == Obj::Member || o->kind == Obj::Range ||
         o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
         o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends || o->kind == Obj::InterModPath || o->kind == Obj::Tchk || o->kind == Obj::TchkTerm ||
-        o->kind == Obj::ModPath || o->kind == Obj::PathTerm || o->kind == Obj::Prim || o->kind == Obj::PrimTerm) {
+        o->kind == Obj::ModPath || o->kind == Obj::PathTerm || o->kind == Obj::Prim || o->kind == Obj::PrimTerm ||
+        o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) {
         vpi::error(vpiError, "vpi_get_value: the object has no value");
         return;
     }

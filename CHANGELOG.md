@@ -32,6 +32,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI constraints (37.31): `vpi_iterate(vpiConstraint, class)`, the items of
+  each block (expressions, implication, if / if-else, foreach, disable soft,
+  solve before), and pure virtual prototypes in `vpiMethods`.
+  `tests/spec/37-vpi-constraints.sv`.
 - VPI module path properties: `vpiPathType`, `vpiPolarity`,
   `vpiDataPolarity`, `vpiCondition` and `vpiModDataPathIn` (37, 38.10).
 - VPI delays of continuous assignments (38.10): `vpi_get_delays` /
