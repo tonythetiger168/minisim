@@ -9101,6 +9101,16 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             // A variable output (output reg q): the module reads q at once,
             // and the path delay is on its port connection (30.4).
             bool var = osym->kind != SymbolKind::Net;
+            // ch.q of an interface port (25.6): a modport port, or a member of an interface instance
+            const Symbol* osrc = osym;
+            if (osrc->kind == SymbolKind::ModportPort) osrc = nullptr;
+            bool ifaceTerm = !osrc;
+            if (osrc) {
+                const Scope* ps = osrc->getParentScope();
+                const Symbol* body = ps ? &ps->asSymbol() : nullptr;
+                ifaceTerm = body && body->kind == SymbolKind::InstanceBody &&
+                            body->as<InstanceBodySymbol>().getDefinition().definitionKind == DefinitionKind::Interface;
+            }
             for (const Expression* i : ins) {
                 PathRec r = base;
                 r.in = termText(*i);
@@ -9108,6 +9118,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 r.src = sigOf(i, "a path from this input").first;
                 r.dst = dst;
                 r.dstVar = var;
+                r.dstIface = var && ifaceTerm;
                 pathRecs().push_back(std::move(r));
             }
         }

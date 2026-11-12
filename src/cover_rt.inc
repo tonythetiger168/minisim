@@ -897,7 +897,9 @@ inline Task cgInstProc(int id, std::vector<std::pair<int, Edge>> ev) {
         cg::sampleInst(in);
     }
 }
-inline void startCovergroups() {
+// The hooks covergroup new() needs, before any process runs: declaration
+// initializers (cg_t cg = new()) may run before the simulation starts.
+inline void installCovergroupHooks() {
     g_cgHook = cg::hook;
     cg::g_cgRun = [](const Prog* p, const CgInst& in) {
         Frame* sf = g_fr;
@@ -920,6 +922,9 @@ inline void startCovergroups() {
         for (auto& [s, e] : cgDefs()[in.def].ev) ev.push_back({R(s), e});
         S.spawn(cgInstProc(id, std::move(ev)));
     };
+}
+inline void startCovergroups() {
+    installCovergroupHooks();
     for (size_t d = 0; d < cgDefs().size(); d++)
         if (!cgDefs()[d].ev.empty() && !cgDefs()[d].inClass) S.spawn(cgProc((int)d));
 }
