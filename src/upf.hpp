@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <tuple>
@@ -764,6 +765,72 @@ struct Model {
         auto p = predefinedVcts().find(n);
         return p == predefinedVcts().end() ? nullptr : &p->second;
     }
+    // UPF libraries (5.11, 6.29, 6.36, 6.63) and value conversion methods (6.30)
+    std::set<std::string> upfLibs{"IEEE"};
+    std::string curLib;                                          // inside create_upf_library -contents
+    std::map<std::string, std::set<std::string>> usedLibs;      // scope (or "#lib:" + library) -> used libraries
+    std::set<std::string> libFiles;                              // load_upf_library: files already run
+    std::map<std::string, Vcm> vcms;                             // "lib::name"
+    mutable std::map<std::string, Vcm> builtinVcms;              // Annex B tables and legacy VCTs as VCMs
+    std::map<std::pair<std::string, std::string>, const Vcm*> connectVcm;   // {net, port} -> connect_supply_net -vcm
+    // A VCM named in `scope` (or in the library being created): "lib::name",
+    // ".::name" (this library), "IEEE::name", or a simple name visible here.
+    const Vcm* findVcm(const std::string& name, const std::string& scope, const std::string& where) const {
+        auto inLib = [&](const std::string& lib, const std::string& n) -> const Vcm* {
+            auto it = vcms.find(lib + "::" + n);
+            if (it != vcms.end()) return &it->second;
+            if (lib != "IEEE") return nullptr;
+            const Vct* t = vct(n);   // a predefined or legacy table (4.10.3)
+            if (!t) return nullptr;
+            auto b = builtinVcms.find(n);
+            if (b == builtinVcms.end()) {
+                Vcm m;
+                m.name = "IEEE::" + n;
+                m.where = t->where;
+                m.hdl2upf = t->hdl2upf;
+                m.lang = t->lang;
+                m.hdlType = t->hdlType;
+                m.cat = 'b';
+                m.bits = *t;
+                b = builtinVcms.emplace(n, m).first;
+            }
+            return &b->second;
+        };
+        size_t q = name.find("::");
+        if (q != std::string::npos) {
+            std::string lib = name.substr(0, q), n = name.substr(q + 2);
+            if (lib == ".") {
+                if (curLib.empty()) throw Error(where + ": " + name + ": '.' names the library being created, and this is not in create_upf_library (6.29)");
+                lib = curLib;
+            }
+            if (!upfLibs.count(lib)) throw Error(where + ": no UPF library " + lib + " (5.11)");
+            const Vcm* m = inLib(lib, n);
+            if (!m) throw Error(where + ": UPF library " + lib + " has no VCM " + n + " (6.30)");
+            return m;
+        }
+        std::set<std::string> libs{"IEEE"};
+        if (!curLib.empty()) {
+            libs.insert(curLib);
+            auto u = usedLibs.find("#lib:" + curLib);
+            if (u != usedLibs.end()) libs.insert(u->second.begin(), u->second.end());
+        } else {
+            // use_upf_library in this scope or one above it
+            for (std::string sc = scope;; sc = sc.substr(0, sc.rfind('/') == std::string::npos ? 0 : sc.rfind('/'))) {
+                auto u = usedLibs.find(sc);
+                if (u != usedLibs.end()) libs.insert(u->second.begin(), u->second.end());
+                if (sc.empty()) break;
+            }
+        }
+        const Vcm* hit = nullptr;
+        std::string from;
+        for (auto& l : libs)
+            if (const Vcm* m = inLib(l, name)) {
+                if (hit) throw Error(where + ": VCM " + name + " is in UPF libraries " + from + " and " + l + "; name it as library::" + name + " (5.11)");
+                hit = m;
+                from = l;
+            }
+        return hit;
+    }
     std::map<std::string, Switch> switches;
     std::map<std::string, PowerSource> sources;
     std::vector<Isolation> isos;
@@ -1316,7 +1383,11 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (!noLog && pmStack.empty()) history.push_back({scope, c});
             continue;
         }
-        if (!noLog && pmStack.empty() && n != "save_upf" && n != "load_upf" && n != "set_scope" && n != "load_simstate_behavior")
+        if (!curLib.empty() && n != "create_vcm" && n != "use_upf_library")
+            throw Error(c.where() + ": " + n + " inside create_upf_library " + curLib +
+                        "; a UPF library holds only create_vcm and use_upf_library (6.29)");
+        if (!noLog && pmStack.empty() && curLib.empty() && n != "save_upf" && n != "load_upf" && n != "set_scope" &&
+            n != "load_simstate_behavior")
             history.push_back({scope, c});
         auto need = [&](const Opts& o, size_t k, const char* what) {
             if (o.pos.size() < k) throw Error(c.where() + ": " + n + " needs " + what);
@@ -1427,12 +1498,331 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             std::string net = join(scope, o.pos[0]);
             std::string v = o.get("-vct");
             if (!v.empty() && !vct(v)) throw Error(c.where() + ": connect_supply_net -vct: no value conversion table '" + v + "'");
+            const Vcm* vm = nullptr;
+            if (o.has("-vcm")) {
+                if (!v.empty()) throw Error(c.where() + ": connect_supply_net takes -vcm or the legacy -vct, not both (6.14)");
+                // the VCM in use in this command's scope, wherever the port is (4.10.2)
+                vm = findVcm(o.get("-vcm"), scope, c.where());
+                if (!vm) throw Error(c.where() + ": connect_supply_net -vcm: no VCM '" + o.get("-vcm") + "' (6.14)");
+            }
             for (auto& p : o.list("-ports")) {
                 std::string port = join(scope, p);
                 connects[net].push_back(port);
                 if (!v.empty()) connectVct[{net, port}] = v;
+                if (vm) connectVcm[{net, port}] = vm;
                 connectWhere[{net, port}] = c.where();
             }
+            continue;
+        }
+        if (n == "create_upf_library") {   // 6.29
+            Opts o = opts(c, {});
+            need(o, 1, "a library name");
+            std::string lib = o.pos[0];
+            if (!curLib.empty()) throw Error(c.where() + ": create_upf_library inside create_upf_library " + curLib + " (6.29)");
+            if (lib.find("::") != std::string::npos || lib == ".")
+                throw Error(c.where() + ": create_upf_library " + lib + ": not a simple name (6.29)");
+            if (upfLibs.count(lib)) throw Error(c.where() + ": UPF library " + lib + " already exists (6.29)");
+            std::string body;
+            if (o.has("-contents")) body = o.get("-contents");
+            else if (o.pos.size() > 1) body = o.pos[1];   // the brace-only form of the 6.63 examples
+            else throw Error(c.where() + ": create_upf_library needs -contents {upf commands} (6.29)");
+            upfLibs.insert(lib);
+            curLib = lib;
+            struct Back { std::string& l; ~Back() { l.clear(); } } back{curLib};
+            rd.runIsolated(body, c.file, c.line);
+            continue;
+        }
+        if (n == "use_upf_library") {   // 6.63
+            Opts o = opts(c, {});
+            need(o, 1, "a library name");
+            for (auto& lib : o.pos) {
+                if (!upfLibs.count(lib)) throw Error(c.where() + ": use_upf_library: no UPF library " + lib + " (6.63)");
+                usedLibs[curLib.empty() ? scope : "#lib:" + curLib].insert(lib);
+            }
+            continue;
+        }
+        if (n == "load_upf_library") {   // 6.36
+            Opts o = opts(c, {});
+            need(o, 1, "a UPF library file");
+            std::string f = o.pos[0];
+            if (!f.empty() && f[0] != '/') {
+                size_t sl = c.file.rfind('/');
+                if (sl != std::string::npos) f = c.file.substr(0, sl + 1) + f;
+            }
+            {
+                std::ifstream probe(f);
+                if (!probe) throw Error(c.where() + ": load_upf_library: no file " + f);
+            }
+            char* rp = realpath(f.c_str(), nullptr);
+            std::string key = rp ? rp : f;
+            free(rp);
+            if (!libFiles.insert(key).second) continue;   // run once (6.36)
+            Reader sub;
+            sub.onCmd = [&, f](const Cmd& sc) -> std::string {
+                if (curLib.empty() && sc.w[0] != "create_upf_library")
+                    throw Error(sc.where() + ": " + sc.w[0] + " in a UPF library file; only create_upf_library is allowed (6.36)");
+                std::string sco = scope;
+                run({sc}, sco, sub, f);
+                return "";
+            };
+            sub.load(f);
+            continue;
+        }
+        if (n == "create_vcm") {   // 6.30
+            Opts o = opts(c, {});
+            need(o, 1, "a VCM name");
+            Vcm m;
+            std::string simple = o.pos[0];
+            if (simple.find("::") != std::string::npos) throw Error(c.where() + ": create_vcm " + simple + ": the name is a simple name (6.30)");
+            std::string lib = curLib.empty() ? "IEEE" : curLib;
+            m.name = lib + "::" + simple;
+            m.where = c.where();
+            if (vcms.count(m.name) || (lib == "IEEE" && vct(simple)))
+                throw Error(c.where() + ": VCM " + simple + " is already defined (6.30)");
+            int kinds = o.has("-table") + o.has("-function") + o.has("-model") + o.has("-vcms");
+            if (kinds == 0) throw Error(c.where() + ": create_vcm needs one of -table, -function, -model or -vcms (6.30)");
+            if (kinds > 1) throw Error(c.where() + ": create_vcm takes only one of -table, -function, -model and -vcms (6.30)");
+            bool table = o.has("-table");
+            for (const char* k : {"-hdl_type", "-conversion_direction", "-field"})
+                if (!table && o.has(k)) throw Error(c.where() + ": create_vcm " + k + " is only for -table (6.30)");
+            if (o.has("-parameters") && !o.has("-model")) throw Error(c.where() + ": create_vcm -parameters is only for -model (6.30)");
+            auto bad = [&](const std::string& m2) { throw Error(c.where() + ": create_vcm " + simple + ": " + m2); };
+            if (o.has("-vcms")) {
+                m.kind = Vcm::Bundle;
+                for (auto& e : o.list("-vcms")) {
+                    const Vcm* x = findVcm(e, scope, c.where());
+                    if (!x) bad("no VCM '" + e + "' for -vcms (6.30)");
+                    m.members.push_back(x);
+                }
+                std::vector<const Vcm*> flat;
+                m.flatten(flat);
+                for (size_t i = 0; i < flat.size(); i++)
+                    for (size_t j = i + 1; j < flat.size(); j++)
+                        if (flat[i]->kind == Vcm::Table && flat[j]->kind == Vcm::Table && flat[i]->hdl2upf == flat[j]->hdl2upf &&
+                            flat[i]->lang == flat[j]->lang && flat[i]->cat == flat[j]->cat && flat[i]->hdlType == flat[j]->hdlType &&
+                            flat[i]->field == flat[j]->field)
+                            bad(flat[i]->name + " and " + flat[j]->name + " both convert " +
+                                (flat[i]->hdl2upf ? "from" : "to") + " HDL type " + flat[i]->hdlType + " (6.30)");
+            } else if (o.has("-function")) {
+                m.kind = Vcm::Function;
+                m.function = o.get("-function");
+                if (m.function.find("::") == std::string::npos) bad("-function " + m.function + ": name it as hdl_package::function_name (6.30)");
+            } else if (o.has("-model")) {
+                m.kind = Vcm::Model;
+                m.model = o.get("-model");
+                for (auto& pv : o.list("-parameters")) {
+                    auto l = splitList(pv);
+                    if (l.size() != 2) bad("-parameters {" + pv + "} is not {name value} (6.30)");
+                    m.params.push_back({l[0], l[1]});
+                }
+            } else {
+                if (!o.has("-hdl_type") || !o.has("-conversion_direction"))
+                    bad("-table needs -hdl_type and -conversion_direction (6.30)");
+                auto ht = o.list("-hdl_type");
+                if (ht.empty()) bad("-hdl_type {<vhdl | sv> [HDL_typename]}");
+                m.lang = ht[0];
+                for (char& ch : m.lang) ch = (char)std::tolower((unsigned char)ch);
+                if (m.lang != "sv" && m.lang != "vhdl") bad("-hdl_type " + ht[0] + ": the language is vhdl or sv (6.30)");
+                m.hdlType = ht.size() > 1 ? ht[1] : (m.lang == "sv" ? "logic" : "std_logic");
+                std::string dir = o.get("-conversion_direction");
+                if (dir != "hdl2upf" && dir != "upf2hdl") bad("-conversion_direction " + dir + " (hdl2upf or upf2hdl)");
+                m.hdl2upf = dir == "hdl2upf";
+                m.field = o.get("-field");
+                std::string ty = Vct::upper(m.hdlType);
+                for (char& ch : ty) ch = (char)std::tolower((unsigned char)ch);
+                auto isNum = [](const std::string& t, bool intOnly) {
+                    if (t.empty()) return false;
+                    char* e = nullptr;
+                    if (intOnly) { std::strtoll(t.c_str(), &e, 10); return *e == 0; }
+                    std::strtod(t.c_str(), &e);
+                    return *e == 0;
+                };
+                std::vector<std::vector<std::string>> rws;
+                for (auto& row : o.list("-table")) {
+                    auto l = splitList(row);
+                    if (l.size() != 2) bad("-table row {" + row + "} is not {from_value to_value} (6.30.2)");
+                    rws.push_back({l[0], l[1], row});
+                }
+                if (rws.empty()) bad("-table has no rows (6.30.2)");
+                bool bitT = ty == "bit" || ty == "logic" || ty == "reg" || ty == "std_logic" || ty == "std_ulogic" || ty == "boolean";
+                bool realT = ty == "real" || ty == "shortreal" || ty == "realtime";
+                bool intT = ty == "integer" || ty == "int" || ty == "shortint" || ty == "longint" || ty == "byte" || ty == "natural" || ty == "positive";
+                if (bitT) m.cat = 'b';
+                else if (realT) m.cat = 'r';
+                else if (intT) m.cat = 'i';
+                else {
+                    // an enum, or a user type: what its table holds says which (6.30.3 to 6.30.6)
+                    bool allInt = true, anyReal = false;
+                    for (auto& r : rws) {
+                        auto hv = splitList(m.hdl2upf ? r[0] : r[1]);
+                        for (auto& x : hv) {
+                            if (x == "*" || x == "Xreal" || x == "Zreal" || (isNum(x, false) && !isNum(x, true))) anyReal = true;
+                            if (!isNum(x, true)) allInt = false;
+                        }
+                        if (m.hdl2upf && hv.size() > 1) anyReal = true;
+                    }
+                    m.cat = anyReal ? 'r' : allInt ? 'i' : 'e';
+                }
+                auto state = [&](const std::string& st, const std::string& row) {
+                    int k = Vct::stateNum(st);
+                    if (k < 0) bad("-table row {" + row + "}: '" + st + "' is not a value of upfSupplyStateE (OFF, FULL_ON, PARTIAL_ON, UNDETERMINED)");
+                    return k;
+                };
+                auto bound = [&](const std::string& x, double inf, const std::string& row) {
+                    if (x == "*") return inf;
+                    if (!isNum(x, false)) bad("-table row {" + row + "}: '" + x + "' is not a number or * (6.30.3)");
+                    return std::strtod(x.c_str(), nullptr);
+                };
+                if (m.cat == 'b') {
+                    Vct v;
+                    v.name = m.name;
+                    v.where = m.where;
+                    v.hdl2upf = m.hdl2upf;
+                    v.lang = m.lang;
+                    v.hdlType = m.hdlType;
+                    // legal values of the type (6.30.7)
+                    std::vector<std::string> legal = m.lang == "vhdl" ? (ty == "boolean" ? std::vector<std::string>{"FALSE", "TRUE"}
+                                                                       : std::vector<std::string>{"U", "X", "0", "1", "Z", "W", "L", "H", "-"})
+                                                     : ty == "bit" ? std::vector<std::string>{"0", "1"} : std::vector<std::string>{"0", "1", "X", "Z"};
+                    auto norm = [&](const std::string& x) {
+                        std::string t;
+                        for (char ch : x) if (ch != '\'' && ch != '"') t += (char)std::toupper((unsigned char)ch);
+                        return t;
+                    };
+                    std::set<std::string> seen;
+                    for (auto& r : rws) {
+                        std::string hdl = norm(m.hdl2upf ? r[0] : r[1]), st = m.hdl2upf ? r[1] : r[0];
+                        state(st, r[2]);
+                        if (std::find(legal.begin(), legal.end(), hdl) == legal.end())
+                            bad("-table row {" + r[2] + "}: '" + (m.hdl2upf ? r[0] : r[1]) + "' is not a value of " + m.lang + " " + m.hdlType + " (6.30.7)");
+                        std::string from = m.hdl2upf ? hdl : Vct::upper(st);
+                        if (!seen.insert(from).second) bad("-table has two rows for " + (m.hdl2upf ? r[0] : r[0]) + " (6.30.7)");
+                        // boolean is a bit: FALSE 0, TRUE 1
+                        std::string h = hdl == "TRUE" ? "1" : hdl == "FALSE" ? "0" : hdl;
+                        v.table.push_back(m.hdl2upf ? std::make_pair(h, Vct::upper(st)) : std::make_pair(Vct::upper(st), h));
+                    }
+                    if (m.hdl2upf) {
+                        for (auto& l : legal)
+                            if (!seen.count(l)) bad("-table has no row for the HDL value " + l + " (6.30.7)");
+                    } else {
+                        for (const char* st : {"OFF", "FULL_ON", "PARTIAL_ON", "UNDETERMINED"})
+                            if (!seen.count(st)) bad("-table has no row for the supply state " + std::string(st) + " (6.30.7)");
+                    }
+                    m.bits = v;
+                } else if (m.hdl2upf) {
+                    for (auto& r : rws) {
+                        Vcm::Row w;
+                        auto from = splitList(r[0]), to = splitList(r[1]);
+                        if (from.empty() || from.size() > 2) bad("-table row {" + r[2] + "}: from_value is one or two values (6.30.3)");
+                        if (to.empty() || to.size() > 2) bad("-table row {" + r[2] + "}: to_value is {UPF_state [UPF_voltage]} (6.30.3)");
+                        w.st = state(to[0], r[2]);
+                        if (to.size() > 1) {
+                            if (to[1] == "*") w.vk = Vcm::Row::Star;
+                            else if (isNum(to[1], false)) { w.vk = Vcm::Row::Value; w.v = std::strtod(to[1].c_str(), nullptr); }
+                            else bad("-table row {" + r[2] + "}: '" + to[1] + "' is not a voltage or * (6.30.3)");
+                        }
+                        if (m.cat == 'r') {
+                            if (from.size() == 1) {
+                                if (from[0] == "*") w.h = Vcm::Row::Any;
+                                else if (from[0] == "Xreal") w.h = Vcm::Row::XReal;
+                                else if (from[0] == "Zreal") w.h = Vcm::Row::ZReal;
+                                else { w.h = Vcm::Row::Exact; w.num = bound(from[0], 0, r[2]); }
+                            } else {
+                                if (from[0] == "*" && from[1] == "*") bad("-table row {" + r[2] + "}: {* *} is not a range (6.30.3)");
+                                w.h = Vcm::Row::Range;
+                                w.lo = bound(from[0], -INFINITY, r[2]);
+                                w.hi = bound(from[1], INFINITY, r[2]);
+                                if (w.hi <= w.lo) bad("-table row {" + r[2] + "}: the upper value is not above the lower value (6.30.3)");
+                            }
+                        } else {
+                            if (from.size() > 1) bad("-table row {" + r[2] + "}: from_value is one HDL value (6.30.6)");
+                            if (m.cat == 'e') { w.h = Vcm::Row::Label; w.label = from[0]; }
+                            else {
+                                if (!isNum(from[0], true)) bad("-table row {" + r[2] + "}: '" + from[0] + "' is not an integer (6.30.6)");
+                                w.h = Vcm::Row::Exact;
+                                w.num = (double)std::strtoll(from[0].c_str(), nullptr, 10);
+                            }
+                        }
+                        m.rows.push_back(w);
+                    }
+                    // ranges may not share a value (6.30.3)
+                    auto span = [](const Vcm::Row& w, double& lo, double& hi, bool& closed) {
+                        closed = false;
+                        if (w.h == Vcm::Row::Any) { lo = -INFINITY; hi = INFINITY; return true; }
+                        if (w.h == Vcm::Row::Range) { lo = w.lo; hi = w.hi; return true; }
+                        if (w.h == Vcm::Row::Exact) { lo = hi = w.num; closed = true; return true; }
+                        return false;
+                    };
+                    for (size_t i = 0; i < m.rows.size(); i++)
+                        for (size_t j = i + 1; j < m.rows.size(); j++) {
+                            const auto &a = m.rows[i], &b = m.rows[j];
+                            if (a.h == Vcm::Row::Label || b.h == Vcm::Row::Label) {
+                                if (a.label == b.label) bad("-table has two rows for " + a.label + " (6.30.6)");
+                                continue;
+                            }
+                            if ((a.h == Vcm::Row::XReal && b.h == Vcm::Row::XReal) || (a.h == Vcm::Row::ZReal && b.h == Vcm::Row::ZReal))
+                                bad("-table has two rows for " + std::string(a.h == Vcm::Row::XReal ? "Xreal" : "Zreal") + " (6.30.3)");
+                            double l1, h1, l2, h2;
+                            bool c1, c2;
+                            if (!span(a, l1, h1, c1) || !span(b, l2, h2, c2)) continue;
+                            bool meet = c1 && c2 ? l1 == l2 : c1 ? (l1 >= l2 && l1 < h2) : c2 ? (l2 >= l1 && l2 < h1) : (l1 < h2 && l2 < h1);
+                            if (meet) bad("-table rows " + std::to_string(i + 1) + " and " + std::to_string(j + 1) + " overlap (6.30.3)");
+                        }
+                } else {   // upf2hdl
+                    std::set<int> covered;
+                    for (auto& r : rws) {
+                        Vcm::Row w;
+                        auto from = splitList(r[0]), to = splitList(r[1]);
+                        if (from.empty() || from.size() > 3 || (m.cat != 'r' && from.size() > 2))
+                            bad("-table row {" + r[2] + "}: from_value is {UPF_state [UPF_voltage]}" + (m.cat == 'r' ? " or {UPF_state lower upper}" : "") + " (6.30.4)");
+                        w.st = state(from[0], r[2]);
+                        covered.insert(w.st);
+                        if (from.size() == 2 && from[1] != "*") {
+                            if (!isNum(from[1], false)) bad("-table row {" + r[2] + "}: '" + from[1] + "' is not a voltage (6.30.4)");
+                            w.vk = Vcm::Row::Value;
+                            w.v = std::strtod(from[1].c_str(), nullptr);
+                        } else if (from.size() == 3) {
+                            w.vk = Vcm::Row::VRange;
+                            w.vlo = bound(from[1], -INFINITY, r[2]);
+                            w.vhi = bound(from[2], INFINITY, r[2]);
+                            if (w.vhi <= w.vlo) bad("-table row {" + r[2] + "}: the upper value is not above the lower value (6.30.4)");
+                        }
+                        if (to.size() != 1) bad("-table row {" + r[2] + "}: to_value is one HDL value (6.30.4)");
+                        const std::string& t = to[0];
+                        if (m.cat == 'r') {
+                            if (t == "*") w.h = Vcm::Row::Pass;
+                            else if (t == "Xreal") w.h = Vcm::Row::XReal;
+                            else if (t == "Zreal") w.h = Vcm::Row::ZReal;
+                            else if (isNum(t, false)) { w.h = Vcm::Row::Exact; w.num = std::strtod(t.c_str(), nullptr); }
+                            else bad("-table row {" + r[2] + "}: '" + t + "' is not a real value, *, Xreal or Zreal (6.30.4)");
+                        } else if (m.cat == 'e' && !isNum(t, true)) {
+                            w.h = Vcm::Row::Label;
+                            w.label = t;
+                        } else {
+                            if (!isNum(t, true)) bad("-table row {" + r[2] + "}: '" + t + "' is not an integer (6.30.5)");
+                            w.h = Vcm::Row::Exact;
+                            w.num = (double)std::strtoll(t.c_str(), nullptr, 10);
+                        }
+                        m.rows.push_back(w);
+                    }
+                    for (int st = 0; st < 4; st++)
+                        if (!covered.count(st))
+                            bad("-table has no row for the supply state " + std::string(st == 0 ? "OFF" : st == 1 ? "FULL_ON" : st == 2 ? "PARTIAL_ON" : "UNDETERMINED") + " (6.30.4)");
+                    for (size_t i = 0; i < m.rows.size(); i++)
+                        for (size_t j = i + 1; j < m.rows.size(); j++) {
+                            const auto &a = m.rows[i], &b = m.rows[j];
+                            if (a.st != b.st) continue;
+                            auto lo = [](const Vcm::Row& w) { return w.vk == Vcm::Row::Value ? w.v : w.vk == Vcm::Row::VRange ? w.vlo : -INFINITY; };
+                            auto hi = [](const Vcm::Row& w) { return w.vk == Vcm::Row::Value ? w.v : w.vk == Vcm::Row::VRange ? w.vhi : INFINITY; };
+                            bool pa = a.vk == Vcm::Row::Value, pb = b.vk == Vcm::Row::Value;
+                            bool meet = pa && pb ? a.v == b.v : pa ? (a.v >= lo(b) && a.v < hi(b)) : pb ? (b.v >= lo(a) && b.v < hi(a))
+                                                                   : (lo(a) < hi(b) && lo(b) < hi(a));
+                            if (meet) bad("-table rows " + std::to_string(i + 1) + " and " + std::to_string(j + 1) + " overlap for " +
+                                          (a.st == 0 ? "OFF" : a.st == 1 ? "FULL_ON" : a.st == 2 ? "PARTIAL_ON" : "UNDETERMINED") + " (6.30.4)");
+                        }
+                }
+            }
+            vcms[m.name] = m;
             continue;
         }
         if (n == "create_hdl2upf_vct" || n == "create_upf2hdl_vct") {   // 6.18, 6.28
@@ -2606,7 +2996,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             "set_variation", "set_correlated", 
             
 
-            "set_retention_control", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
+            "set_retention_control", "define_isolation_cell", "define_level_shifter_cell",
             "define_retention_cell", "define_power_switch_cell", "define_always_on_cell", "define_diode_clamp",
             "map_retention_clamp_cell", "map_repeater_cell", "set_pin_related_supply",
             "set_related_supply_net", "query_upf", "add_parameter"};

@@ -493,7 +493,7 @@ struct Rt {
         }
         for (auto& ac : m.assertCtls) addIds(ac.ctlExpr, ac.sel.scope);
         bindHdlPorts(lw);
-        for (auto& h : hdlPorts) if (h.vct->hdl2upf) w.insert(h.sig);
+        for (auto& h : hdlPorts) if (h.hdl2upf) w.insert(h.sig);
         for (int s : w) watch.push_back({s, ANY});
         chkSig = S.sig("$upf.check", 1);
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
@@ -749,26 +749,113 @@ struct Rt {
     // net's state into the port's value (upf2hdl, the net drives the port).
     // Without -vct an output port drives the net through SV_LOGIC2UPF and
     // an input port is driven through UPF2SV_LOGIC (Annex B).
+    // With -vcm (6.14, 6.30) a VCM converts other HDL types too: real,
+    // integer, enum and multi-bit ports by table, the VCM picked out of a
+    // list by the port's type and direction (4.10.2). A port of the package
+    // type upfSupplyTypeT (supply_net_type) connects without conversion
+    // (4.10.1).
     struct HdlPort {
         int sig = -1;
         std::string net, port;
         const Vct* vct = nullptr;
-        int last = -1;   // upf2hdl: the value held on the port
+        const Vcm* vcm = nullptr;    // a table VCM of type r, i or e
+        bool supply = false;         // a upfSupplyTypeT port
+        bool hdl2upf = true;
+        char cat = 'b';
+        bool sgn = false;
+        int w = 1;
+        std::map<int64_t, std::string> labelOf;   // enum value -> name
+        std::map<std::string, int64_t> valueOf;   // enum name -> value
+        int last = -1;               // upf2hdl through a Vct: the value held on the port
+        Val lastVal;
+        bool held = false;
+        double lastV = 0;            // hdl2upf: the voltage last driven (rows without a voltage keep it)
+        bool hasV = false;
+        bool warned = false;
     };
     std::vector<HdlPort> hdlPorts;
+    // What an HDL port is, for choosing a VCM: its category, type name, enum values.
+    struct PortType {
+        char cat = 'x';              // b one bit, r real, i integer or vector, e enum, s upfSupplyTypeT
+        std::string name, keyword;   // the type's own name (an alias or enum), the predefined keyword
+        bool sgn = false;
+        std::map<int64_t, std::string> labels;
+    };
+    static std::string stateName(int st) {
+        return st == S_OFF ? "OFF" : st == S_FULL_ON ? "FULL_ON" : st == S_PARTIAL_ON ? "PARTIAL_ON" : "UNDETERMINED";
+    }
+    static PortType portTypeOf(const slang::ast::Symbol* sym) {
+        using namespace slang::ast;
+        PortType pt;
+        if (!sym || !ValueSymbol::isKind(sym->kind)) return pt;
+        const Type& t = sym->as<ValueSymbol>().getType();
+        const Type& ct = t.getCanonicalType();
+        if (t.isAlias()) pt.name = std::string(t.name);
+        if (ct.kind == SymbolKind::PackedStructType) {
+            std::set<std::string> f;
+            for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>()) f.insert(std::string(fs.name));
+            if (f == std::set<std::string>{"state", "voltage"}) pt.cat = 's';
+            return pt;
+        }
+        if (ct.isFloating()) { pt.cat = 'r'; pt.keyword = ct.toString(); return pt; }
+        if (ct.isEnum()) {
+            pt.cat = 'e';
+            if (pt.name.empty()) pt.name = std::string(ct.name);
+            for (auto& ev : ct.as<EnumType>().values()) {
+                auto cv = ev.getValue();
+                if (cv.isInteger()) {
+                    auto iv = cv.integer().as<int64_t>();
+                    if (iv) pt.labels[*iv] = std::string(ev.name);
+                }
+            }
+            return pt;
+        }
+        if (ct.isIntegral()) {
+            pt.sgn = ct.isSigned();
+            if (ct.kind == SymbolKind::PredefinedIntegerType) { pt.cat = 'i'; pt.keyword = ct.toString(); }
+            else pt.cat = ct.getBitWidth() == 1 ? 'b' : 'i';
+        }
+        return pt;
+    }
+    // Whether a table VCM converts this port's type (6.14).
+    static bool vcmFits(const Vcm& v, const PortType& pt) {
+        if (v.lang != "sv") return false;
+        if (v.cat != pt.cat) return false;
+        static const std::set<std::string> builtin = {"bit", "logic", "reg", "real", "shortreal", "realtime", "int", "integer",
+                                                      "shortint", "longint", "byte"};
+        std::string ty = v.hdlType;
+        for (char& c : ty) c = (char)std::tolower((unsigned char)c);
+        if (!builtin.count(ty)) {   // a user type: by its name, with or without the package
+            std::string last = v.hdlType.substr(v.hdlType.rfind(':') == std::string::npos ? 0 : v.hdlType.rfind(':') + 1);
+            return last == pt.name;
+        }
+        if (pt.cat == 'i' && !pt.keyword.empty()) return ty == pt.keyword;
+        if (pt.cat == 'i') return ty == "integer" || ty == "int" || ty == "longint";   // a vector
+        return true;
+    }
     void bindHdlPorts(LowerResult& lw) {
         std::map<std::string, int> dirOf;   // instance port (simulator name) -> 0 input, 1 output, 2 inout
         for (auto& lp : lw.procs)
             if (!lp.port.empty()) dirOf[lp.port] = lp.portDir;
+        std::map<int, const slang::ast::Symbol*> symOf;
+        auto typeOf = [&](int s) {
+            if (symOf.empty())
+                for (auto& [sym, sid] : lw.sigOf)
+                    if (sym && slang::ast::ValueSymbol::isKind(sym->kind)) symOf.emplace(sid, sym);
+            auto it = symOf.find(s);
+            return portTypeOf(it == symOf.end() ? nullptr : it->second);
+        };
         for (auto& [net, ps] : m.connects)
             for (auto& p : ps) {
                 if (isSupply(p)) continue;
                 auto key = std::make_pair(net, p);
                 std::string where = m.connectWhere.count(key) ? m.connectWhere.at(key) : "";
                 auto named = m.connectVct.find(key);
+                auto nvcm = m.connectVcm.find(key);
+                bool explicitConv = named != m.connectVct.end() || nvcm != m.connectVcm.end();
                 int s = sigOf(p);
                 if (s < 0) {
-                    if (named != m.connectVct.end())
+                    if (explicitConv)
                         throw Error(where + ": connect_supply_net " + net + ": no port '" + m.design(p) + "' in the design");
                     continue;
                 }
@@ -776,8 +863,58 @@ struct Rt {
                 h.sig = s;
                 h.net = net;
                 h.port = p;
+                h.w = S.sigs[(size_t)s].w;
                 auto d = dirOf.find(S.sigs[(size_t)s].name);
                 int dir = d == dirOf.end() ? -1 : d->second;
+                PortType pt = typeOf(s);
+                auto fail = [&](const std::string& msg) { throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) + msg); };
+                if (pt.cat == 's') {   // upfSupplyTypeT: no conversion; -vct and -vcm do not apply (6.14)
+                    if (dir != 0 && dir != 1) fail(" is a upfSupplyTypeT port that is neither an input nor an output");
+                    h.supply = true;
+                    h.hdl2upf = dir == 1;
+                    note(std::string("supply net ") + net + (h.hdl2upf ? " is driven by " : " drives ") + m.design(p) + " (upfSupplyTypeT)");
+                    hdlPorts.push_back(h);
+                    continue;
+                }
+                if (nvcm != m.connectVcm.end()) {
+                    std::vector<const Vcm*> all, fit;
+                    nvcm->second->flatten(all);
+                    for (auto* v : all) {
+                        if (v->kind == Vcm::Function || v->kind == Vcm::Model)
+                            fail(": VCM " + v->name + " converts with an HDL " + (v->kind == Vcm::Function ? "function" : "module") +
+                                 ", which msim does not run yet");
+                        bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
+                        if (!dirOk) continue;
+                        bool typeOk = v->cat == 'b' ? (pt.cat == 'b' && (v->lang == "sv" || v->bits.lang == "sv")) : vcmFits(*v, pt);
+                        if (typeOk) fit.push_back(v);
+                    }
+                    std::string tn = pt.cat == 'b' ? "a one-bit port" : pt.cat == 'r' ? "a real port" : pt.cat == 'e' ? "an enum port (" + pt.name + ")"
+                                   : pt.cat == 'i' ? "an integer port" : "a port of a type no VCM converts";
+                    std::string dn = dir == 0 ? "input" : dir == 1 ? "output" : "inout";
+                    if (fit.empty())
+                        fail(" is " + tn + " (" + dn + "), and VCM " + nvcm->second->name + " has no " +
+                             (dir == 0 ? "upf2hdl " : dir == 1 ? "hdl2upf " : "") + "conversion for it (6.14, 4.10.2)");
+                    if (fit.size() > 1)
+                        fail(" is " + tn + " (" + dn + "), and VCMs " + fit[0]->name + " and " + fit[1]->name + " both fit it" +
+                             (dir == 2 ? "; a list for an inout port holds one direction per type (4.10.2)" : " (6.14)"));
+                    const Vcm* v = fit[0];
+                    if (!v->field.empty()) fail(": VCM " + v->name + " converts field " + v->field + " of a struct; msim does not convert struct fields yet");
+                    h.hdl2upf = v->hdl2upf;
+                    if (v->cat == 'b') h.vct = &v->bits;
+                    else {
+                        h.vcm = v;
+                        h.cat = pt.cat;
+                        h.sgn = pt.sgn;
+                        for (auto& [val, nm] : pt.labels) { h.labelOf[val] = nm; h.valueOf[nm] = val; }
+                        if (pt.cat == 'e')
+                            for (auto& r : v->rows)
+                                if (r.h == Vcm::Row::Label && !h.valueOf.count(r.label))
+                                    fail(": VCM " + v->name + " names " + r.label + ", which is not a value of " + pt.name + " (6.30.6)");
+                    }
+                    note(std::string("supply net ") + net + (h.hdl2upf ? " is driven by " : " drives ") + m.design(p) + " through " + v->name);
+                    hdlPorts.push_back(h);
+                    continue;
+                }
                 if (named != m.connectVct.end()) {
                     h.vct = m.vct(named->second);
                     if ((dir == 0 && h.vct->hdl2upf) || (dir == 1 && !h.vct->hdl2upf))
@@ -785,11 +922,14 @@ struct Rt {
                                     (dir == 0 ? "input" : "output") + " port, but " + h.vct->name + " converts " +
                                     (h.vct->hdl2upf ? "an HDL value to a supply state" : "a supply state to an HDL value"));
                 } else if (dir == 0 || dir == 1) {
+                    if (pt.cat != 'b' && pt.cat != 'x')
+                        fail(" is not a one-bit port; connect it with -vcm and a VCM for its type (6.14, 9.1)");
                     h.vct = m.vct(dir == 1 ? "SV_LOGIC2UPF" : "UPF2SV_LOGIC");
                 } else {
                     throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) +
                                 " is not an input or output port of an instance; name a value conversion table with -vct");
                 }
+                h.hdl2upf = h.vct->hdl2upf;
                 if (S.sigs[(size_t)s].w != 1)
                     throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) + " is " +
                                 std::to_string(S.sigs[(size_t)s].w) + " bits wide; a value conversion table converts one bit");
@@ -799,7 +939,7 @@ struct Rt {
             }
         std::map<std::string, std::string> drivers;
         for (auto& h : hdlPorts) {
-            if (!h.vct->hdl2upf) continue;
+            if (!h.hdl2upf) continue;
             std::string r = root(h.net);
             if (swOf.count(r))
                 throw Error("supply net " + h.net + " is driven by the HDL port " + m.design(h.port) + " and by the power switch " +
@@ -811,20 +951,89 @@ struct Rt {
     // The HDL ports that drive supply nets: their value is the root supply.
     void readHdlPorts() {
         for (auto& h : hdlPorts) {
-            if (!h.vct->hdl2upf) continue;
+            if (!h.hdl2upf) continue;
             Val v = S.get(h.sig);
-            char c = (v.z & 1) ? 'Z' : (v.x & 1) ? 'X' : (v.v & 1) ? '1' : '0';
             SupplyVal sv;
-            sv.st = h.vct->toUpf(c);
+            if (h.supply) {   // {state, voltage in microvolts}, state in the upper word
+                if (v.x) sv.st = S_UNDETERMINED;
+                else {
+                    uint64_t st = (v.v >> 32) & 0xffffffffu;
+                    sv.st = st <= 3 ? (int)st : S_UNDETERMINED;
+                    sv.v = (double)(int32_t)(uint32_t)(v.v & 0xffffffffu) / 1e6;
+                    sv.hasV = true;
+                }
+            } else if (h.vcm) {
+                uint64_t mask = h.w >= 64 ? ~0ull : ((1ull << h.w) - 1);
+                bool unknown = (v.x & mask) != 0;
+                double x = 0;
+                std::string label;
+                if (h.cat == 'r') {
+                    x = Vcm::bitsReal(v.v);
+                    if (v.v == Vcm::XrealBits || v.v == Vcm::ZrealBits) unknown = true;
+                } else {
+                    uint64_t u = v.v & mask;
+                    int64_t iv = (int64_t)u;
+                    if (h.sgn && h.w < 64 && (u >> (h.w - 1)) & 1) iv = (int64_t)(u | ~mask);
+                    x = (double)iv;
+                    if (h.cat == 'e') {
+                        auto it = h.labelOf.find(iv);
+                        if (it != h.labelOf.end()) label = it->second;
+                        else unknown = true;
+                    }
+                }
+                int st;
+                bool setV;
+                double nv = 0;
+                h.vcm->toUpf(x, label, unknown, v.v, st, setV, nv);
+                sv.st = st;
+                if (setV) { h.lastV = nv; h.hasV = true; }
+                sv.v = h.lastV;
+                sv.hasV = h.hasV;
+            } else {
+                char c = (v.z & 1) ? 'Z' : (v.x & 1) ? 'X' : (v.v & 1) ? '1' : '0';
+                sv.st = h.vct->toUpf(c);
+            }
             drv[root(h.net)] = sv;
         }
     }
     // The HDL ports that supply nets drive: held at the converted value.
     void driveHdlPorts() {
         for (auto& h : hdlPorts) {
-            if (h.vct->hdl2upf) continue;
+            if (h.hdl2upf) continue;
             auto it = val.find(root(h.net));
-            char c = h.vct->toHdl(it == val.end() ? S_OFF : it->second.st);
+            SupplyVal sv = it == val.end() ? SupplyVal{} : it->second;
+            if (h.supply || h.vcm) {
+                Val out;
+                if (h.supply) {
+                    int64_t uv = (int64_t)std::llround(sv.v * 1e6);
+                    out = make(((uint64_t)sv.st << 32) | (uint32_t)uv, 0, 64, 0);
+                } else {
+                    const Vcm::Row* r = h.vcm->toHdl(sv.st, sv.v);
+                    if (!r) {   // 6.30.4 f
+                        if (!h.warned)
+                            error("supply net " + h.net + " is " + stateName(sv.st) + (sv.hasV ? " " + std::to_string(sv.v) : "") +
+                                  ", which VCM " + h.vcm->name + " has no row for (6.30.4)");
+                        h.warned = true;
+                        continue;
+                    }
+                    h.warned = false;
+                    uint64_t mask = h.w >= 64 ? ~0ull : ((1ull << h.w) - 1);
+                    switch (r->h) {
+                        case Vcm::Row::Pass: out = mkreal(sv.v); break;
+                        case Vcm::Row::XReal: out = mkreal(Vcm::bitsReal(Vcm::XrealBits)); break;
+                        case Vcm::Row::ZReal: out = mkreal(Vcm::bitsReal(Vcm::ZrealBits)); break;
+                        case Vcm::Row::Label: out = make((uint64_t)h.valueOf.at(r->label) & mask, 0, h.w, 0); break;
+                        default:
+                            out = h.cat == 'r' ? mkreal(r->num) : make((uint64_t)(int64_t)r->num & mask, 0, h.w, 0);
+                    }
+                }
+                if (h.held && out == h.lastVal) continue;
+                h.held = true;
+                h.lastVal = out;
+                S.holdOn(h.sig, konst(out), true);
+                continue;
+            }
+            char c = h.vct->toHdl(sv.st);
             if (c == h.last) continue;
             h.last = c;
             bool one = c == '1' || c == 'H', zero = c == '0' || c == 'L', z = c == 'Z';
