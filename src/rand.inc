@@ -1232,6 +1232,15 @@ static int doRandomize(int obj, const RandCall* rc) {
             return false;
         };
         ok = attempt();
+        long nFirst = std::count(rank.begin(), rank.end(), -1);
+        if (!ok && pass == 1 && nFirst > 0 && (size_t)nFirst < order.size()) {
+            // A size picked first may leave the other variables no solution
+            // when they decide it together (op == 2 -> q.size() > 1; op != 2
+            // -> q.size() == 0): then the sizes go last, picked within what
+            // the others leave.
+            std::rotate(order.begin(), order.begin() + nFirst, order.end());
+            ok = attempt();
+        }
         if (!ok && !softs.empty()) {
             // Keep soft constraints from the highest priority down, each only if
             // it still leaves a solution (18.5.13.1).

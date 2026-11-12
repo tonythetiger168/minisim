@@ -48,7 +48,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 8.18 | local / protected | ✅ | checked by the front end. `8.18-data-hiding` |
 | 8.20–8.22 | Virtual methods, abstract classes, polymorphism | ✅ | pure virtual methods; a call of an unimplemented one is a run-time error. `8.20-virtual-methods`, `8.21-abstract-classes`, `8.22-polymorphism` |
 | 8.23, 8.24 | Class scope `::`, out-of-block (extern) methods | ✅ | `8.23-class-scope-resolution`, `8.24-out-of-block` |
-| 8.25 | Parameterized classes | ✅ | value and type parameters, a static member per specialization. `8.25-parameterized-classes` |
+| 8.25 | Parameterized classes | ✅ | value and type parameters, a static member per specialization; a parameter, localparam or enum value read through a handle (`h.P`). `8.25-parameterized-classes`, `8.25-param-through-handle` |
 | 8.26 | Interface classes | ✅ | `implements`, interface classes extending others, parameters, calls and `$cast` through interface handles. `8.26-interface-classes` |
 | 8.27 | typedef class | ✅ | `8.27-typedef-class` |
 | 8.30 | std::weak_reference | ✅ | `get`, `clear`, `get_id`. Objects are never collected, so `get` returns the referent until `clear`. `8.30-weak-reference` |

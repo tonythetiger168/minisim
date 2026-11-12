@@ -2509,6 +2509,11 @@ struct Lowerer {
     }
     E exprReal64(const slang::ast::Expression& e) {
         using namespace slang::ast;
+        if (const auto* ps = paramMember(e); ps && ps->kind == SymbolKind::Parameter) {   // h.P (8.25)
+            const slang::ConstantValue& cv = ps->as<ParameterSymbol>().getValue();
+            if (cv.isReal()) return realK(cv.real());
+            if (cv.isShortReal()) return realK(cv.shortReal());
+        }
         switch (e.kind) {
             case ExpressionKind::RealLiteral: return realK(e.as<RealLiteral>().getValue());
             case ExpressionKind::TimeLiteral: return realK(e.as<TimeLiteral>().getValue());
@@ -2769,6 +2774,7 @@ struct Lowerer {
     }
     E exprStr(const slang::ast::Expression& e) {
         using namespace slang::ast;
+        if (const auto* ps = paramMember(e)) return constSym(*ps, e, ExprCtx{});   // h.P (8.25)
         switch (e.kind) {
             case ExpressionKind::StringLiteral:
                 return konst(mkstr(std::string(e.as<StringLiteral>().getValue())));
@@ -2936,6 +2942,14 @@ struct Lowerer {
         condDefs().push_back(std::move(d));
         return condDefs().back().base;
     }
+    // h.P, a class parameter or localparam read through a handle (8.25), or
+    // an enum value named that way: the constant, whatever h holds.
+    static const slang::ast::Symbol* paramMember(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        if (e.kind != ExpressionKind::MemberAccess) return nullptr;
+        const Symbol& m = e.as<MemberAccessExpression>().member;
+        return m.kind == SymbolKind::Parameter || m.kind == SymbolKind::EnumValue ? &m : nullptr;
+    }
     E lazyExpr(const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
         if (e.kind == ExpressionKind::ConditionalOp) {
@@ -3000,6 +3014,7 @@ struct Lowerer {
                 Val k = make((uint64_t)std::llround(lv->second), 0, w, 0, e.type->isSigned());
                 return sized(konst(k), w, e.type->isSigned(), ctx);
             }
+        if (const auto* ps = paramMember(e); ps && !e.type->isFloating()) return constSym(*ps, e, ctx);   // h.P (8.25)
         if (!rawNext)
             if (E l = lazyExpr(e, ctx)) return l;
         bool raw = rawNext;
