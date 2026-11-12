@@ -301,6 +301,7 @@ struct Wheel {
 };
 
 struct Sim {
+    uint64_t resumeN = 1;   // kernel resumes of a process so far (VPI cbEnterThread)
     vector<Sig> sigs;
     vector<vector<Waiter>> waiters;                  // dynamic sensitivity
     vector<Handle> all;                              // owned coroutines
@@ -2727,7 +2728,7 @@ struct Sim {
                 if (!reactive.empty()) {                   // reactive (4.4.2.6)
                     Handle h = reactive.front(); reactive.pop_front();
                     region = R_REACTIVE;
-                    if (!h.done()) h.resume();
+                    if (!h.done()) { ++resumeN; h.resume(); }
                     region = R_ACTIVE;
                     if (!oneShot.empty())
                         if (auto it = oneShot.find(h.address()); it != oneShot.end()) {
@@ -2916,7 +2917,7 @@ struct Sim {
             for (;;) {                                         // one time slot
                 if (!active.empty()) {                         // active
                     Handle h = active.front(); active.pop_front();
-                    if (!h.done()) h.resume();
+                    if (!h.done()) { ++resumeN; h.resume(); }
                 } else if (!seqq.empty()) {                    // clocked processes, one parallel batch
                     runSeqs();
                 } else if (!combq.empty()) {                   // levelized combinational logic

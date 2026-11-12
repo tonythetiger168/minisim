@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI threads and frames (38.36.1): `vpi_handle(vpiThread / vpiFrame, NULL)`
+  in a calltf, thread objects (`vpiParent`, `vpiFrame`, child threads) and
+  frame objects (`vpiScope`, `vpiParent`, `vpiThread`, `vpiAutomatic`), both
+  with `vpiValid`, and the callbacks `cbStartOfThread`, `cbEndOfThread`,
+  `cbEnterThread`, `cbStartOfFrame` and `cbEndOfFrame`. The value of a
+  system task argument that is an automatic variable no longer crashes.
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
   width with subnormals and all five rounding modes: `MW_fp_add`,
   `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
