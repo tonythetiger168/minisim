@@ -21,6 +21,20 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mdebug -script FILE` (`-` for the standard input): one command per line
+  (drivers, loads, value, changes, active, trace, blocks, fsm, scopes,
+  signals, end), one line of JSON per answer, from one process that loads the
+  design and waveform once. `tools/mdebug_api.py` wraps it for Python.
+- `mdebug -fsm [NAME]`: the design's state machines (shared extractor), their
+  states and transitions with source lines; with a waveform, which transitions
+  ran, states never entered, values that are not states, and the state at
+  `-at T`. The viewer page draws the state diagram of a selected state register.
+- `msupport`: an AI support agent per product. Each answers from its
+  product's documentation (BM25 search over the manuals), can run a short
+  example on the product's tool in a sandbox, and files a ticket when the
+  documentation does not answer; command line, terminal chat and a local web
+  service. Product files for the nine free tools in `support/products/`.
+  Not online yet. See `docs/SUPPORT.md`.
 - Value conversion tables (IEEE 1801-2024 4.10, 6.18, 6.28, Annex B):
   `connect_supply_net` joins a supply net and an HDL port. An output port
   (a regulator model) drives the net; an input port (a macro's power pin) is
@@ -401,6 +415,15 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- Condition coverage modes (as VCS `-cm_cond`): `full` records every
+  combination of the term values (up to 8 terms), `allops` also covers `&`
+  and `|` of one-bit operands; interpreter and `-compile`.
+- Per-instance coverage: `msim -cov` also writes each module instance's own
+  line hits, branch outcomes and condition vectors (interpreter and
+  `-compile`); `mcov report -instances` prints a row per instance with line,
+  branch, condition, toggle and FSM coverage, `-detail -instances` the
+  vectors of each condition per instance, the HTML report an Instances table,
+  and `inst <path>` excludes an instance and everything below it.
 - `mcov` exclusion files and test ranking: `mcov report -elfile` leaves the
   listed lines, branches, condition vectors, toggle bits, FSM states and
   transitions, covergroups and assertions out of every number, each with its
