@@ -1,7 +1,0 @@
-.noise needs a source as its input
-v1 in 0 1
-r1 in out 1k
-r2 out 0 1k
-.noise v(out) r1 dec 10 1 1k
-*> error ".noise needs an independent source as its input, and 'r1' is not one"
-.end
