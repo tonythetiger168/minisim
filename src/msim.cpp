@@ -369,7 +369,7 @@ static void inlineCombCalls(LowerResult& lowered) {
     };
     // A body that is only assignments, forward branches, deferred assertions and such calls.
     std::function<bool(const Prog&, int)> okBody = [&](const Prog& c, int depth) {
-        if (depth > 16 || !c.roots.empty()) return false;
+        if (depth > 16 || !c.roots.empty() || !c.spans.empty()) return false;   // spans: a disable finds it by its own code (9.6.2)
         for (size_t pc = 0; pc < c.code.size(); pc++) {
             const Instr& i = c.code[pc];
             if (i.k == IK::Jmp || i.k == IK::JmpIfNot) {
@@ -513,7 +513,7 @@ static void inlineCombCalls(LowerResult& lowered) {
         if (lp.program >= 0 || lp.reactive) continue;
         const Prog& p = lp.prog;
         size_t n = p.code.size();
-        if (n < 3 || !p.roots.empty() || p.code[n - 1].k != IK::Jmp || p.code[n - 1].target != 0 || p.code[n - 2].k != IK::WaitEdge) continue;
+        if (n < 3 || !p.roots.empty() || !p.spans.empty() || p.code[n - 1].k != IK::Jmp || p.code[n - 1].target != 0 || p.code[n - 2].k != IK::WaitEdge) continue;
         bool calls = false, ok = true;
         for (size_t pc = 0; pc + 2 < n && ok; pc++) {
             const Instr& i = p.code[pc];
@@ -2396,6 +2396,7 @@ int main(int argc, char** argv) {
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
+    installCovergroupHooks();   // the init process below may run now, and may create covergroups
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
         if (vpi::st().active && lowered.procs[i].kind == "init") {
