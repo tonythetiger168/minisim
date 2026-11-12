@@ -26,8 +26,8 @@ endforeach()
 # replayed at power-up (6.60); attributes written in the HDL (5.6, 5.7); an
 # abstract power source (6.16); value conversion methods in UPF libraries,
 # for real, enum, integer and upfSupplyTypeT ports (4.10, 5.11, 6.29, 6.30,
-# 6.36, 6.63).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm)
+# 6.36, 6.63); function and model VCMs (6.30.8, 6.30.9).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -285,7 +285,13 @@ upf_error_in(vcm e_vcm10 "create_vcm R2U -vcms {vlib::R2U}\nconnect_supply_net V
 upf_error_in(vcm e_vcm11 "create_vcm V11 -vcms {vlib::R2U vlib::REAL}" "both convert from HDL type real (6.30)")
 upf_error_in(vcm e_vcm12 "create_vcm V12 -vcms {nope}" "no VCM 'nope' for -vcms (6.30)")
 upf_error_in(vcm e_vcm13 "create_supply_net VX\nconnect_supply_net VX -ports {u_ana/vi} -vcm REAL" "is an integer port (input), and VCM vlib::REAL has no upf2hdl conversion for it")
-upf_error_in(vcm e_vcm14 "create_vcm F -function p::f\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vi} -vcm F" "converts with an HDL function, which msim does not run yet")
+upf_error_in(vcmfn e_fn1 "create_vcm X -function vcm_pkg::nope\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "VCM IEEE::X: no function vcm_pkg::nope (6.30.8)")
+upf_error_in(vcmfn e_fn2 "create_vcm X -function nopkg::f\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "no package nopkg for -function nopkg::f (6.30.8)")
+upf_error_in(vcmfn e_fn3 "create_vcm X -function vcm_pkg::both\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "exactly one of the argument and the return type of vcm_pkg::both is upfSupplyTypeT (6.30.8)")
+upf_error_in(vcmfn e_fn4 "create_vcm X -function vcm_pkg::two\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "vcm_pkg::two needs exactly one input argument (6.30.8)")
+upf_error_in(vcmfn e_fn5 "create_vcm X -model nomod\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "no module nomod for -model (6.30.9)")
+upf_error_in(vcmfn e_fn6 "create_vcm X -model two_in\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vr} -vcm X" "two_in needs one input and one output port (6.30.9)")
+upf_error_in(vcmfn e_fn7 "create_supply_net VX\nconnect_supply_net VX -ports {u_ana/vi} -vcm FN" "is an integer port (input), and VCM IEEE::FN has no upf2hdl conversion for it")
 upf_error_in(vcm e_vcm15 "create_vcm V15 -vcms {.::R2U}" "'.' names the library being created, and this is not in create_upf_library (6.29)")
 upf_error_in(vcm e_lib1 "create_upf_library L1 -contents {create_supply_net X}" "create_supply_net inside create_upf_library L1; a UPF library holds only create_vcm and use_upf_library (6.29)")
 upf_error_in(vcm e_lib2 "create_upf_library vlib -contents {}" "UPF library vlib already exists (6.29)")

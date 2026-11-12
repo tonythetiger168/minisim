@@ -493,7 +493,10 @@ struct Rt {
         }
         for (auto& ac : m.assertCtls) addIds(ac.ctlExpr, ac.sel.scope);
         bindHdlPorts(lw);
-        for (auto& h : hdlPorts) if (h.hdl2upf) w.insert(h.sig);
+        for (auto& h : hdlPorts) {
+            if (h.hdl2upf) w.insert(h.sig);
+            if (h.copyFrom >= 0) w.insert(h.copyFrom);
+        }
         for (int s : w) watch.push_back({s, ANY});
         chkSig = S.sig("$upf.check", 1);
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
@@ -772,8 +775,19 @@ struct Rt {
         double lastV = 0;            // hdl2upf: the voltage last driven (rows without a voltage keep it)
         bool hasV = false;
         bool warned = false;
+        int copyFrom = -1, target = -1;   // a function or model VCM (upf2hdl): its result, held on the port
+        Val lastCopy;
+        bool copied = false;
     };
     std::vector<HdlPort> hdlPorts;
+    // Function and model VCMs (6.30.8, 6.30.9) placed in the design before
+    // it is elaborated again: the instance that runs the conversion.
+    struct VcmBind {
+        const Vcm* vcm = nullptr;
+        bool hdl2upf = true;
+        std::string inst;   // under the simulation top
+    };
+    std::map<std::pair<std::string, std::string>, VcmBind> vcmBinds;
     // What an HDL port is, for choosing a VCM: its category, type name, enum values.
     struct PortType {
         char cat = 'x';              // b one bit, r real, i integer or vector, e enum, s upfSupplyTypeT
@@ -876,13 +890,30 @@ struct Rt {
                     hdlPorts.push_back(h);
                     continue;
                 }
+                if (auto vb = vcmBinds.find(key); vb != vcmBinds.end()) {   // a function or model VCM
+                    auto sigNamed = [&](const std::string& n) {
+                        auto it = sigByName.find(n);
+                        if (it == sigByName.end()) fail(": VCM " + vb->second.vcm->name + ": no signal " + n);
+                        return it->second;
+                    };
+                    h.supply = true;
+                    h.hdl2upf = vb->second.hdl2upf;
+                    if (h.hdl2upf) h.sig = sigNamed(vb->second.inst + ".upf_vcm_out");
+                    else {
+                        h.sig = sigNamed(vb->second.inst + ".upf_vcm_in");
+                        h.copyFrom = sigNamed(vb->second.inst + ".upf_vcm_val");
+                        h.target = s;
+                    }
+                    note(std::string("supply net ") + net + (h.hdl2upf ? " is driven by " : " drives ") + m.design(p) + " through " +
+                         vb->second.vcm->name + " (" + vb->second.inst + ")");
+                    hdlPorts.push_back(h);
+                    continue;
+                }
                 if (nvcm != m.connectVcm.end()) {
                     std::vector<const Vcm*> all, fit;
                     nvcm->second->flatten(all);
                     for (auto* v : all) {
-                        if (v->kind == Vcm::Function || v->kind == Vcm::Model)
-                            fail(": VCM " + v->name + " converts with an HDL " + (v->kind == Vcm::Function ? "function" : "module") +
-                                 ", which msim does not run yet");
+                        if (v->kind == Vcm::Function || v->kind == Vcm::Model) continue;   // none fit this port (vcmSource)
                         bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
                         if (!dirOk) continue;
                         bool typeOk = v->cat == 'b' ? (pt.cat == 'b' && (v->lang == "sv" || v->bits.lang == "sv")) : vcmFits(*v, pt);
@@ -947,6 +978,161 @@ struct Rt {
             if (!drivers.emplace(r, h.port).second)
                 throw Error("supply net " + h.net + " is driven by two HDL ports (" + m.design(drivers[r]) + ", " + m.design(h.port) + ")");
         }
+    }
+    // A function or model VCM's result, held on its port (upf2hdl).
+    void copyVcmResults() {
+        for (auto& h : hdlPorts) {
+            if (h.copyFrom < 0) continue;
+            Val v = S.get(h.copyFrom);
+            if (h.copied && v == h.lastCopy) continue;
+            h.copied = true;
+            h.lastCopy = v;
+            S.holdOn(h.target, konst(v), true);
+        }
+    }
+    static bool supplyType(const slang::ast::Type& t) {
+        using namespace slang::ast;
+        const Type& ct = t.getCanonicalType();
+        if (ct.kind != SymbolKind::PackedStructType) return false;
+        std::set<std::string> f;
+        for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>()) f.insert(std::string(fs.name));
+        return f == std::set<std::string>{"state", "voltage"};
+    }
+    // SystemVerilog for the function and model VCMs of connect_supply_net
+    // -vcm (6.30.8, 6.30.9): one module per connection, bound into the
+    // simulation top, that calls the function or instantiates the model on
+    // the port (a hierarchical reference) and a upfSupplyTypeT variable the
+    // runtime reads or writes. Table VCMs need none. simTop is the
+    // simulation's top instance; comp is the design elaborated without them.
+    std::string vcmSource(slang::ast::Compilation& comp, const std::string& simTop) {
+        using namespace slang::ast;
+        std::string out;
+        int k = 0;
+        for (auto& [key, vcm] : m.connectVcm) {
+            std::vector<const Vcm*> all;
+            vcm->flatten(all);
+            if (std::none_of(all.begin(), all.end(), [](const Vcm* v) { return v->kind == Vcm::Function || v->kind == Vcm::Model; }))
+                continue;
+            const std::string& p = key.second;
+            std::string where = m.connectWhere.count(key) ? m.connectWhere.at(key) : "";
+            std::string full = simTop + "." + m.design(p);
+            auto fail = [&](const std::string& msg) -> void { throw Error(where + ": connect_supply_net " + key.first + ": " + msg); };
+            // walk the instance tree: the instance, then the port's own variable or net
+            size_t dot = full.rfind('.');
+            const Symbol* instSym = nullptr;
+            {
+                std::vector<std::string> parts;
+                for (size_t a = 0, b2; a <= dot; a = b2 + 1) {
+                    b2 = full.find('.', a);
+                    if (b2 == std::string::npos || b2 > dot) b2 = dot;
+                    parts.push_back(full.substr(a, b2 - a));
+                    if (b2 == dot) break;
+                }
+                for (auto* t : comp.getRoot().topInstances)
+                    if (!parts.empty() && t->name == parts[0]) instSym = t;
+                for (size_t i = 1; instSym && i < parts.size(); i++) {
+                    const Symbol* c2 = instSym->as<InstanceSymbol>().body.find(parts[i]);
+                    instSym = c2 && c2->kind == SymbolKind::Instance ? c2 : nullptr;
+                }
+            }
+            const Symbol* sym = instSym ? instSym->as<InstanceSymbol>().body.find(full.substr(dot + 1)) : nullptr;
+            if (!sym || !instSym || instSym->kind != SymbolKind::Instance) fail("no port '" + m.design(p) + "' in the design");
+            const Symbol* ps = instSym->as<InstanceSymbol>().body.findPort(full.substr(dot + 1));
+            if (!ps || ps->kind != SymbolKind::Port) fail(m.design(p) + " is not a port");
+            ArgumentDirection pd = ps->as<PortSymbol>().direction;
+            int dir = pd == ArgumentDirection::In ? 0 : pd == ArgumentDirection::Out ? 1 : 2;
+            if (!ValueSymbol::isKind(sym->kind)) fail(m.design(p) + " is not a variable or net");
+            const Type& pt = sym->as<ValueSymbol>().getType();
+            PortType ptc = portTypeOf(sym);
+            if (ptc.cat == 's') continue;   // no conversion (6.14)
+            struct Fit { const Vcm* v; bool h2u; std::string inPort, outPort; };
+            std::vector<Fit> fits;
+            for (const Vcm* v : all) {
+                bool h2u = false;
+                std::string inP, outP;
+                if (v->kind == Vcm::Table) {
+                    bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
+                    bool typeOk = v->cat == 'b' ? ptc.cat == 'b' : vcmFits(*v, ptc);
+                    if (dirOk && typeOk) fits.push_back({v, v->hdl2upf, "", ""});
+                    continue;
+                }
+                if (v->kind == Vcm::Function) {   // 6.30.8
+                    std::string pkg = v->function.substr(0, v->function.find("::")), fn = v->function.substr(v->function.find("::") + 2);
+                    const PackageSymbol* pk = comp.getPackage(pkg);
+                    if (!pk) fail("VCM " + v->name + ": no package " + pkg + " for -function " + v->function + " (6.30.8)");
+                    const Symbol* f = pk->find(fn);
+                    if (!f || f->kind != SymbolKind::Subroutine) fail("VCM " + v->name + ": no function " + v->function + " (6.30.8)");
+                    auto& sub = f->as<SubroutineSymbol>();
+                    auto args = sub.getArguments();
+                    if (args.size() != 1 || args[0]->direction != ArgumentDirection::In)
+                        fail("VCM " + v->name + ": " + v->function + " needs exactly one input argument (6.30.8)");
+                    bool argS = supplyType(args[0]->getType()), retS = supplyType(sub.getReturnType());
+                    if (argS == retS)
+                        fail("VCM " + v->name + ": exactly one of the argument and the return type of " + v->function +
+                             " is upfSupplyTypeT (6.30.8)");
+                    h2u = retS;
+                    const Type& hdlT = h2u ? args[0]->getType() : sub.getReturnType();
+                    if (!hdlT.isMatching(pt) && !hdlT.isEquivalent(pt)) continue;
+                } else {   // 6.30.9
+                    std::string mod = v->model.substr(v->model.rfind('.') == std::string::npos ? 0 : v->model.rfind('.') + 1);
+                    auto def = comp.tryGetDefinition(mod, comp.getRoot());
+                    if (!def.definition || def.definition->kind != SymbolKind::Definition)
+                        fail("VCM " + v->name + ": no module " + v->model + " for -model (6.30.9)");
+                    auto& inst = InstanceSymbol::createDefault(comp, def.definition->as<DefinitionSymbol>());
+                    std::vector<const PortSymbol*> ins, outs;
+                    for (const Symbol* q : inst.body.getPortList()) {
+                        if (q->kind != SymbolKind::Port) fail("VCM " + v->name + ": " + v->model + " has a port that is not a plain port (6.30.9)");
+                        auto& qp = q->as<PortSymbol>();
+                        if (qp.direction == ArgumentDirection::In) ins.push_back(&qp);
+                        else if (qp.direction == ArgumentDirection::Out) outs.push_back(&qp);
+                        else fail("VCM " + v->name + ": " + v->model + " has an inout port; bidirectional model VCMs are not supported (6.30.9)");
+                    }
+                    if (ins.size() != 1 || outs.size() != 1)
+                        fail("VCM " + v->name + ": " + v->model + " needs one input and one output port (6.30.9)");
+                    bool inS = supplyType(ins[0]->getType()), outS = supplyType(outs[0]->getType());
+                    if (inS == outS)
+                        fail("VCM " + v->name + ": exactly one port of " + v->model + " is upfSupplyTypeT (6.30.9)");
+                    h2u = outS;
+                    const Type& hdlT = h2u ? ins[0]->getType() : outs[0]->getType();
+                    if (!hdlT.isMatching(pt) && !hdlT.isEquivalent(pt)) continue;
+                    inP = std::string(ins[0]->name);
+                    outP = std::string(outs[0]->name);
+                }
+                bool dirOk = dir == 2 || (dir == 0 && !h2u) || (dir == 1 && h2u);
+                if (dirOk) fits.push_back({v, h2u, inP, outP});
+            }
+            if (fits.size() > 1)
+                fail(m.design(p) + ": VCMs " + fits[0].v->name + " and " + fits[1].v->name + " both fit it (6.14)");
+            if (fits.empty() || fits[0].v->kind == Vcm::Table) continue;   // bindHdlPorts reports it, or converts by table
+            const Fit& f = fits[0];
+            std::string modName = "upf_vcm_mod_" + std::to_string(k), inst = "upf_vcm_" + std::to_string(k);
+            k++;
+            std::string body;
+            if (f.v->kind == Vcm::Function) {
+                if (f.h2u) body = "  UPF::upfSupplyTypeT upf_vcm_out;\n  assign upf_vcm_out = " + f.v->function + "(" + full + ");\n";
+                else
+                    body = "  UPF::upfSupplyTypeT upf_vcm_in = '0;\n  var type(" + f.v->function + "(upf_vcm_in)) upf_vcm_val;\n" +
+                           "  assign upf_vcm_val = " + f.v->function + "(upf_vcm_in);\n";
+            } else {
+                std::string mod = f.v->model.substr(f.v->model.rfind('.') == std::string::npos ? 0 : f.v->model.rfind('.') + 1);
+                std::string params;
+                for (size_t i = 0; i < f.v->params.size(); i++) {
+                    static const std::regex num(R"(^[-+]?([0-9][0-9_]*(\.[0-9_]+)?([eE][-+]?[0-9]+)?)?('[sS]?[bBoOdDhH]?[0-9a-fA-FxXzZ_?]+)?$)");
+                    std::string val = f.v->params[i].second;
+                    if (val.empty() || !std::regex_match(val, num)) val = "\"" + val + "\"";
+                    params += std::string(i ? ", ." : ".") + f.v->params[i].first + "(" + val + ")";
+                }
+                std::string inst2 = mod + (params.empty() ? "" : " #(" + params + ")") + " u_model(";
+                if (f.h2u) body = "  UPF::upfSupplyTypeT upf_vcm_out;\n  " + inst2 + "." + f.inPort + "(" + full + "), ." + f.outPort + "(upf_vcm_out));\n";
+                else
+                    body = "  UPF::upfSupplyTypeT upf_vcm_in = '0;\n  " + pt.toString() + " upf_vcm_val;\n  " + inst2 + "." + f.inPort +
+                           "(upf_vcm_in), ." + f.outPort + "(upf_vcm_val));\n";
+            }
+            out += "// connect_supply_net " + key.first + " -ports " + p + " -vcm " + f.v->name + " (IEEE 1801-2024 6.30)\nmodule " + modName +
+                   ";\n" + body + "endmodule\nbind " + simTop + " " + modName + " " + inst + "();\n";
+            vcmBinds[key] = {f.v, f.h2u, inst};
+        }
+        return out;
     }
     // The HDL ports that drive supply nets: their value is the root supply.
     void readHdlPorts() {
@@ -1702,6 +1888,7 @@ struct Rt {
 
     bool checkArmed = false;
     void evaluate() {
+        copyVcmResults();
         readHdlPorts();
         evalSupplies();
         driveHdlPorts();

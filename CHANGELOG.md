@@ -114,6 +114,9 @@ Spec references are IEEE 1800-2023 clauses.
   ports, VCM lists, and ports of type `upfSupplyTypeT` without conversion
   (4.10); UPF libraries (`create_upf_library`, `use_upf_library`,
   `load_upf_library`; 5.11, 6.29, 6.36, 6.63).
+- UPF (IEEE 1801-2024): function and model VCMs (6.30.8, 6.30.9) are
+  simulated: the function is called, or the model instantiated, on the port
+  through a module bound into the simulation top.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.

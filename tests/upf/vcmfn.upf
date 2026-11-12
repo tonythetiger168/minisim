@@ -1,0 +1,22 @@
+# Power intent for vcmfn.sv: function and model VCMs (6.30.8, 6.30.9).
+upf_version 4.0
+set_design_top dut
+create_power_domain PD_TOP -include_scope
+foreach s {VDD VSS} {
+    create_supply_port $s
+    create_supply_net $s
+    connect_supply_net $s -ports $s
+}
+create_supply_set SS_TOP -function {power VDD} -function {ground VSS}
+associate_supply_set SS_TOP -handle PD_TOP.primary
+
+create_vcm H2U -function vcm_pkg::real2upf
+create_vcm U2H -function vcm_pkg::upf2real
+create_vcm FN -vcms {H2U U2H}
+create_vcm SNAP -model work.snap_vcm -parameters {{on_threshold 0.5} {snap 1.2}}
+create_vcm STATE -model state_vcm
+
+foreach n {VF VM} { create_supply_net $n }
+connect_supply_net VF -ports {u_ldo/vout u_ana/vr} -vcm FN
+connect_supply_net VM -ports {u_ldo2/vout} -vcm SNAP
+connect_supply_net VM -ports {u_ana/vi} -vcm STATE
