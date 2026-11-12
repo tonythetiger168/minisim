@@ -430,6 +430,9 @@ inline std::function<bool(const slang::ast::Symbol&)>& hideSigIf() {
     return f;
 }
 inline std::vector<int>& hiddenSigs() { static std::vector<int> v; return v; }
+// The automatic variables declared by for statements (12.7.1) in a static
+// process: local to their loop, so msim may unroll the loop (unrollSeqLoops).
+inline std::vector<int>& loopVarSigs() { static std::vector<int> v; return v; }
 // Per-instance coverage: the g_covInsts id of an instance, named by its path
 // below the top ("" = a top).
 inline uint32_t covInstIdOf(const slang::ast::InstanceSymbol& inst) {
@@ -8902,6 +8905,9 @@ struct Lowerer {
             case StatementKind::ForLoop: {
                 const auto& f = s.as<ForLoopStatement>();
                 for (const VariableSymbol* v : f.loopVars)
+                    if (v->lifetime == VariableLifetime::Automatic && !localMap().count(v))
+                        if (int sg = sigFind(v); sg >= 0) loopVarSigs().push_back(sg);
+                for (const VariableSymbol* v : f.loopVars)
                     if (const Expression* init = v->getInitializer()) {
                         Instr i; i.k = IK::Assign; i.sig = sigAt(v); i.e = expr(*init);
                         prog.emit(i);
@@ -11714,6 +11720,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     dynMap().clear();
     dynStore().clear();
     hiddenSigs().clear();
+    loopVarSigs().clear();
     dynPending().clear();
     dynPendingAt().clear();
     blockIds() = BlockIds{};
