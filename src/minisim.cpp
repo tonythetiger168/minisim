@@ -46,6 +46,7 @@ using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
 #include "cpu.hpp"
+#include "profile.hpp"
 #include "sva.hpp"
 #include "sva_engine.hpp"
 #include "clocking.hpp"
@@ -563,6 +564,17 @@ struct Sim {
                 combBatch.push_back(r);
             }
             combVals.resize(combBatch.size());
+            if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
+                for (int r : combBatch) {
+                    uint64_t t = prof::Profiler::nowNs();
+                    curComb = r;
+                    if (combs[r].compute) combs[r].commit(combs[r].ctx, combs[r].compute(combs[r].ctx));
+                    else combs[r].fn(combs[r].ctx);
+                    curComb = -1;
+                    prof::P().charge(prof::P().combEnt[r], prof::Profiler::nowNs() - t);
+                }
+                continue;
+            }
             parallelTuned(combTune, combBatch.size(), [&](size_t k) {
                 const Comb& c = combs[combBatch[k]];
                 if (c.compute) combVals[k] = c.compute(c.ctx);
@@ -762,6 +774,14 @@ struct Sim {
     void runSeqs() {
         if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
+        if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
+            for (size_t k = 0; k < seqq.size(); k++) {
+                uint64_t t = prof::Profiler::nowNs();
+                seqBufs[k].clear();
+                seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+                prof::P().charge(prof::P().seqEnt[seqq[k]], prof::Profiler::nowNs() - t);
+            }
+        } else
         parallelTuned(seqTune, seqq.size(), [&](size_t k) {
             seqBufs[k].clear();
             seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
@@ -2512,8 +2532,14 @@ struct Sim {
         listenTo(s, e);
         holdFlags(s, h);
         applyHold(s);
+        if (vpiHoldCb) vpiHoldCb(s, force, true, hi, lo);
     }
     void holdOff(int s, bool force, int hi = -1, int lo = 0) {
+        bool had = holds.count(s) > 0;
+        holdOffAll(s, force, hi, lo);
+        if (had && vpiHoldCb) vpiHoldCb(s, force, false, hi, lo);
+    }
+    void holdOffAll(int s, bool force, int hi, int lo) {
         auto it = holds.find(s);
         if (it == holds.end()) return;
         Hold& h = it->second;
@@ -2593,7 +2619,8 @@ struct Sim {
         }
     }
     void covToggle(int s, const Val& o, const Val& n) {
-        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0) covFsm(fsmOf[s], o, n);
+        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0 && !(g_covStop & 4)) covFsm(fsmOf[s], o, n);
+        if (g_covStop & 2) return;
         if (togRise.size() <= (size_t)s) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
         int w = sigs[s].w;
         auto& R = togRise[s];
@@ -2616,9 +2643,14 @@ struct Sim {
     // callbacks of a signal; vpiRegion runs the callbacks of a point in the
     // time slot (VR_*) and says whether any ran. vpiAt counts the
     // cbAfterDelay callbacks due at each time, so that slot is not skipped.
-    enum { VR_START, VR_RW, VR_RO };
+    // vpiHoldCb reports a force / release (force) or procedural assign /
+    // deassign of signal s (bits hi:lo, hi < 0 the whole signal).
+    // vpiNbaPend: cbNBASynch callbacks wait for the NBA region of this slot.
+    enum { VR_START, VR_RW, VR_RO, VR_NBA };
     void (*vpiChange)(int) = nullptr;
     bool (*vpiRegion)(int) = nullptr;
+    void (*vpiHoldCb)(int s, bool force, bool on, int hi, int lo) = nullptr;
+    bool vpiNbaPend = false;
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         Sig& g = sigs[s];
@@ -2700,6 +2732,20 @@ struct Sim {
 
     void runObserved();
     void matureFinal();
+    // msim -profile (profile.hpp): a process resumed and timed, and the NBA region.
+    void profResume(Handle h) {
+        int e = prof::P().ofHandle(h.address());
+        uint64_t t = prof::Profiler::nowNs();
+        h.resume();
+        prof::P().charge(e, prof::Profiler::nowNs() - t);
+        if (h.done()) prof::P().byHandle.erase(h.address());   // its frame may be reused
+    }
+    void timedNba() {
+        if (!prof::P().on) [[likely]] { applyNba(); return; }
+        uint64_t t = prof::Profiler::nowNs();
+        applyNba();
+        prof::P().chargeRegion(prof::Profiler::NBA, prof::Profiler::nowNs() - t);
+    }
     // The regions after NBA (4.5), once the active set is empty: observed,
     // the reactive set, postponed, and the end-of-slot $past shift. False
     // when all are empty and time can advance. `rare` is set whenever work is
@@ -2707,7 +2753,14 @@ struct Sim {
     // or programs pays one flag test per pass.
     bool slotTail() {
         if (vpiRegion && vpiRegion(VR_RW)) return true;   // cbReadWriteSynch (38.36.2)
-        if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) { runObserved(); return true; }   // observed (4.4.2.5)
+        if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) {   // observed (4.4.2.5)
+            if (prof::P().on) [[unlikely]] {
+                uint64_t t = prof::Profiler::nowNs();
+                runObserved();
+                prof::P().chargeRegion(prof::Profiler::OBSERVED, prof::Profiler::nowNs() - t);
+            } else runObserved();
+            return true;
+        }   // observed (4.4.2.5)
         if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
             // Once the reactive set starts, it runs until it is empty, and
             // only then does the active set run again (4.5).
@@ -2715,7 +2768,8 @@ struct Sim {
                 if (!reactive.empty()) {                   // reactive (4.4.2.6)
                     Handle h = reactive.front(); reactive.pop_front();
                     region = R_REACTIVE;
-                    if (!h.done()) h.resume();
+                    if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
+                    else if (!h.done()) h.resume();
                     region = R_ACTIVE;
                     if (!oneShot.empty())
                         if (auto it = oneShot.find(h.address()); it != oneShot.end()) {
@@ -2729,16 +2783,18 @@ struct Sim {
                 } else if (!reNbaq.empty()) {              // re-NBA
                     nbaRun.clear();
                     nbaRun.swap(reNbaq);
-                    applyNba();
+                    timedNba();
                 } else break;
             }
             return true;
         }
         if (!postq.empty() || !defFin.empty()) {           // postponed ($strobe, $monitor, assert final)
             region = R_POSTPONED;
+            uint64_t pt = prof::P().on ? prof::Profiler::nowNs() : 0;
             matureFinal();
             region = R_ACTIVE;
             drainPost();
+            if (pt) prof::P().chargeRegion(prof::Profiler::POSTPONED, prof::Profiler::nowNs() - pt);
             return true;
         }
         if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
@@ -2904,7 +2960,8 @@ struct Sim {
             for (;;) {                                         // one time slot
                 if (!active.empty()) {                         // active
                     Handle h = active.front(); active.pop_front();
-                    if (!h.done()) h.resume();
+                    if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
+                    else if (!h.done()) h.resume();
                 } else if (!seqq.empty()) {                    // clocked processes, one parallel batch
                     runSeqs();
                 } else if (!combq.empty()) {                   // levelized combinational logic
@@ -2912,11 +2969,13 @@ struct Sim {
                 } else if (!inactive.empty()) {                // inactive (#0)
                     for (auto h : inactive) active.push_back(h);
                     inactive.clear();
-                } else if (!nbaq.empty()) {                    // NBA
+                } else if (!nbaq.empty() || vpiNbaPend) {      // NBA
+                    if (vpiNbaPend && vpiRegion(VR_NBA)) continue;   // cbNBASynch first (38.36.2)
+                    if (nbaq.empty()) continue;
                     // Swap, not move: both buffers keep their capacity across slots.
                     nbaRun.clear();
                     nbaRun.swap(nbaq);
-                    applyNba();
+                    timedNba();
                 } else if (rare || !postq.empty()) {           // observed, reactive set, postponed
                     if (!slotTail()) break;                    // then, and only then, time advances
                 } else break;
