@@ -7,6 +7,25 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Removed
+- `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
+  IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
+  a paid tool. What stays is what `mdft` always was first: the RTL
+  scan-readiness rules DFT001..DFT006 and the flop count per clock domain,
+  before a design is changed for test. `src/dft/` and the fault engine
+  headers those flows read go with them.
+- The implementation and signoff tools leave this repository. `msynth`,
+  `mpnr`, `msta`, `mrcx`, `mequiv`, `mformal`, `matpg`, `memu`, `mfpga`,
+  `mhls`, `mspice`, `mchar`, `mpv`, `mpower`, `mpopt`, `msdc`, `mlibc`,
+  `msimprotect`, `mpss` and the `mvp` virtual prototype layer are a paid
+  product now, described in `docs/LICENSING.md`. The free edition is the
+  verification flow: `msim`, `mwave`, `mcov`, `mregress`, `mplan`, `mbug`,
+  `mlint` with CDC, `mdft`'s scan-readiness checks and `mdebug`.
+  - `msim -mvp` keeps its option and reports that it cannot find the runtime
+    when the paid layer is not installed beside it.
+  - `msim -keyfile` still opens IEEE 1735 envelopes; only `msimprotect`,
+    which writes them, has gone.
+
 ### Changed
 - `mchar` measures input pin power: `internal_power` groups without a
   `related_pin` get the supply energy of an edge that moves no output, and
@@ -50,6 +69,14 @@ Spec references are IEEE 1800-2023 clauses.
   groups are not checked, any other pair is synchronous. New rule `CDC006`:
   a flop's clock is not a clock in the SDC file. `-cdc-report` lists the SDC
   clocks of every domain (`docs/CDC.md`).
+- `mdebug -script FILE` (`-` for the standard input): one command per line
+  (drivers, loads, value, changes, active, trace, blocks, fsm, scopes,
+  signals, end), one line of JSON per answer, from one process that loads the
+  design and waveform once. `tools/mdebug_api.py` wraps it for Python.
+- `mdebug -fsm [NAME]`: the design's state machines (shared extractor), their
+  states and transitions with source lines; with a waveform, which transitions
+  ran, states never entered, values that are not states, and the state at
+  `-at T`. The viewer page draws the state diagram of a selected state register.
 - `msupport`: an AI support agent per product. Each answers from its
   product's documentation (BM25 search over the manuals), can run a short
   example on the product's tool in a sandbox, and files a ticket when the
@@ -436,6 +463,18 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- `mcov exclude -formal`: what `mformal -json` proves unreachable (toggle
+  bits today, other targets that name the exclusion they prove) becomes
+  exclusions with that reason, for the items the tests did not cover.
+- Condition coverage modes (as VCS `-cm_cond`): `full` records every
+  combination of the term values (up to 8 terms), `allops` also covers `&`
+  and `|` of one-bit operands; interpreter and `-compile`.
+- Per-instance coverage: `msim -cov` also writes each module instance's own
+  line hits, branch outcomes and condition vectors (interpreter and
+  `-compile`); `mcov report -instances` prints a row per instance with line,
+  branch, condition, toggle and FSM coverage, `-detail -instances` the
+  vectors of each condition per instance, the HTML report an Instances table,
+  and `inst <path>` excludes an instance and everything below it.
 - `mcov` exclusion files and test ranking: `mcov report -elfile` leaves the
   listed lines, branches, condition vectors, toggle bits, FSM states and
   transitions, covergroups and assertions out of every number, each with its
