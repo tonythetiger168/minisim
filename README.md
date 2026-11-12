@@ -27,11 +27,14 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches, with its C code (regular expressions, command line, HDL backdoor) via `msim -uvm`; see [`docs/UVM.md`](docs/UVM.md)
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
-- **Emulation and FPGA prototyping**: `memu` puts a gate-level netlist on a board of FPGAs (clock conversion, memory mapping, partitioning, pin multiplexing, probes, transactors to `msim -mvp` models and to testbench classes) and writes a testbench that checks the emulation against the netlist; see [docs/EMULATION.md](docs/EMULATION.md)
-- **Virtual prototypes**: `msim -mvp` gives the design an AXI4-Lite port onto C, C++ or SystemC/TLM models, with a memory map, interrupts and timed callbacks; see [docs/VPROTO.md](docs/VPROTO.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
-- **SPICE**: `mspice` runs DC, AC and transient analyses of a SPICE netlist (R, C, L, coupled inductors, sources, diodes, level-1 MOSFETs, bipolar transistors, subcircuits, `.measure`, `.step`), multi-threaded, checked against ngspice; see [docs/SPICE.md](docs/SPICE.md)
-- **Cell characterization**: `mchar` measures a cell library from its transistor netlists on `mspice` and writes Liberty: delay and transition tables, setup, hold, recovery and removal, internal power, pin capacitance; multi-threaded with identical output on any thread count. The mini45 library is measured with it; see [docs/CHAR.md](docs/CHAR.md)
+
+The implementation and signoff tools — synthesis, place and route, timing,
+extraction, equivalence, formal, ATPG, emulation, HLS, SPICE and
+characterization, physical verification, power, constraints, library checks,
+portable stimulus, virtual prototypes and IP encryption — are a separate paid
+product and are not in this repository. What they are, and why the line falls
+where it does, is in [docs/LICENSING.md](docs/LICENSING.md).
 
 ## Layout
 
@@ -46,17 +49,11 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 | `src/msim.cpp` | `msim` command line: slang driver, lower, run, optional VCD |
 | `src/parallel.hpp` | Shared by the tools: default thread count, `-threads N`, `par::parallelFor`, `par::Pool` |
 | `src/wave_reader.hpp` | Shared by the tools: `wave::Reader`, VCD (parallel, mapped) and FST into memory |
-| `src/protect.hpp`, `src/msimprotect.cpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): encrypt and decrypt with OpenSSL |
+| `src/protect.hpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): `msim -keyfile` decrypts with OpenSSL |
+| `src/licproxy.hpp` | IEEE 1735 clause 8 license system: msim asks the IP author's license proxy over TLS |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
-| `src/lef.hpp`, `src/def.hpp` | LEF 5.8 and DEF 5.8 readers and a DEF writer (namespace `phys`), shared by the physical tools |
-| `src/mpnr.cpp`, `src/pnr_*.hpp` | `mpnr` place and route: netlist database, placement, detailed router, DEF out, layout check ([docs/PNR.md](docs/PNR.md)) |
-| `src/mrcx.cpp`, `src/rcx.hpp` | Parasitic RC extraction (`mrcx`): routed DEF + LEF in, SPEF out |
-| `src/spef.hpp` | SPEF (IEEE 1481) reader and writer, shared by extraction, timing and power |
-| `src/gds.hpp` | GDSII reader and writer (namespace `gds`), shared by the physical tools |
-| `src/oasis.hpp` | OASIS reader into the same library; `oasis::readLayout` takes GDSII or OASIS |
-| `src/geom.hpp`, `src/layout.hpp`, `src/drc.hpp`, `src/lvs.hpp`, `src/lvs_block.hpp`, `src/mpv.cpp` | `mpv`: polygon engine, flattening, rule deck, design rule checks and LVS |
 | `bench/` | Throughput designs (`gen_wide.py` writes `wide.sv`) and `run.sh` (msim, msim -compile, Verilator, Icarus) |
 | `tests/` | Unit tests for the value library |
 
@@ -105,6 +102,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
 | `-cov [<file>]` | Write line / branch / toggle / condition / FSM coverage (default `cov.json`); see `mcov`. `-cm line+cond+fsm+tgl` (as VCS) does the same |
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
+| `-vcd-class [N]` | Also write class objects: each property of the object a module's class handle variable points to, as `tb.p.addr` (x while the handle is null), following handle properties N levels (default 1). See `docs/DEBUG.md` |
 | `-vcd-arrays [N]` | Also write the elements of unpacked arrays (memories) with at most N elements (default 1024) to the VCD or FST, as `mem[3]`. Off by default: memories are left out, as `$dumpvars` does. `mdebug` uses them to trace through a memory |
 | `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
@@ -248,6 +246,72 @@ mcov report all.json -uncovered           # only what is missing
 mcov report all.json -min-cond 80 -min-fsm-state 100 -min-fsm-trans 90
 ```
 
+**Exclusions.** Items that cannot or need not be covered go in an exclusion
+file (as URG's `-elfile`), one per line with the reason; they are left out of
+every number and report:
+
+```
+state  tb.dut.u.state FAIL     -- error injection is not in this regression
+trans  tb.dut.u.state RUN->IDLE -- reset only
+cond   rtl/ctrl.sv:60 3        -- b is tied high in this configuration
+line   rtl/ctrl.sv:40-44       -- unreachable with WIDTH=8
+toggle tb.dut.bus[31:24]       -- upper byte unused
+file   rtl/dbg_*.sv            -- debug only
+```
+
+```sh
+mcov exclude all.json -o draft.el                    # one exclusion per uncovered item, reason TODO
+mcov report all.json -elfile ok.el -el-review        # each exclusion, what it removes, what to review
+mcov report all.json -elfile ok.el -el-strict        # exit 1 on a stale, covered or unexplained exclusion
+```
+
+`-el-review` flags an exclusion that matches nothing (the code changed), one
+that removes items the tests did cover, and one without a reason. Kinds:
+`file`, `line`, `branch`, `cond`, `toggle`, `fsm`, `state`, `trans`, `cg`,
+`assert`; names take `*` and `?`.
+
+**Condition modes** (as VCS `-cm_cond`): `msim -cm_cond full` records every
+combination of the term values of a condition of up to 8 terms (2^n vectors)
+instead of the n + 1 sensitized ones; `-cm_cond allops` also covers `&` and
+`|` of one-bit operands (`assign y = (a & b) | c;`). Join them as
+`-cm_cond full+allops`. Both work with `-compile`.
+
+**Per instance.** The database also keeps each module instance's own lines,
+decisions and condition vectors. `mcov report -instances` prints one row per
+instance (line, branch, condition, toggle, FSM state and transition, for that
+instance's own code and signals), the HTML report gets an Instances table,
+and with `-detail` every condition shows its vectors per instance, so that a
+vector reached in one instance of a module but not in another shows up.
+`inst tb.dut.u_dbg` in an exclusion file leaves out an instance and all below
+it; code another instance of the same module runs stays counted.
+
+**Proven unreachable.** `mformal` proves which coverage items can never be
+reached (`-app toggle`: bits stuck at 0 or 1). `mcov exclude -formal` turns
+its verdicts into exclusions whose reason says so, for the items the tests
+did not cover; an item the tests did cover is reported instead:
+
+```sh
+mformal rtl/*.sv -top dut -app toggle -json formal.json
+mcov exclude all.json -formal formal.json -o unreachable.el      # finds tb.dut from the names, or -formal-scope tb.dut
+mcov report all.json -elfile unreachable.el -el-review
+```
+
+**Which test covers what.** With one database per test, `mcov rank` orders
+the tests so that each next one adds the most items not yet covered, and
+shows what only one test covers and which tests add nothing:
+
+```sh
+mcov rank cov/*.json -o keep.txt       # keep.txt: the tests that add coverage, best first
+mcov rank cov/*.json -item rtl/ctrl.sv:52     # the tests that cover this line (or signal, FSM, covergroup)
+```
+
+```
+Rank  Test          Covers   Only it      Adds             Total
+   1  smoke.json      170        19       170       170   87.6%
+   2  reset.json      151         0         0       170   87.6%
+2 test(s), 194 item(s); the first 1 reach the total, 1 add nothing
+```
+
 ```
 Condition tb.sv:30:15  a && b
     -1- a
@@ -293,6 +357,8 @@ mplan report uart.vplan -results regress.d -label $GIT_COMMIT -rules triage.rule
 mplan triage -results regress.d -plan uart.vplan   # only the failure buckets
 mplan trend  plan.d/history.jsonl                  # score, tests and coverage per snapshot
 mplan init   -results regress.d -o draft.vplan     # a starting plan from an existing regression
+mplan rank   -results regress.d -keep keep.list    # what each test adds; the redundant tests
+mplan report uart.vplan -results regress.d -reqs reqs.reqif -trace trace.csv   # requirement traceability
 ```
 
 `mplan report` scores every feature (weighted, with a goal per metric),
@@ -304,31 +370,25 @@ owners each bucket blocks; a rules file marks buckets known or waived and
 attaches a bug id. `-gate`, `-min-score` and `-fail-on-new` turn it into a
 CI gate. Full reference: [`docs/MPLAN.md`](docs/MPLAN.md) and `mplan -h`.
 
-### Protected IP: `msimprotect` and `msim -keyfile`
+### Protected IP: `msim -keyfile`
 
-minisim reads and writes IEEE 1735-2023 version 3 envelopes, the format
-commercial simulators exchange encrypted IP in: a random root key, RSA
-encrypted for each tool's key (a tool block, with the IP author's rights for
-that tool), AES-256-CBC for the source, and an HMAC-SHA512 signature that is
+minisim reads IEEE 1735-2023 version 3 envelopes, the format commercial
+simulators exchange encrypted IP in: a random root key, RSA encrypted for each
+tool's key, AES-256-CBC for the source, and an HMAC-SHA512 signature that is
 checked before anything is decrypted. The older IEEE 1800-2023 clause 34
-envelopes work too (`msimprotect -v1`). The crypto is OpenSSL's libcrypto.
-Mark the region to hide and encrypt it:
+envelopes work too. The crypto is OpenSSL's libcrypto. Give `msim` the private
+key of a tool block addressed to you and it runs the protected source without
+showing it:
 
 ```sh
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out acme.pem
-openssl pkey -in acme.pem -pubout -out acme_pub.pem
-./build/msimprotect -key acme_pub.pem -keyowner Acme -keyname acme-1 \
-                    -control visibility=interface examples/protect/secret_core.sv -o core.svp
-./build/msim  -keyfile Acme:acme-1=acme.pem core.svp examples/protect/core_tb.sv -vcd waves.vcd
-./build/mlint -keyfile Acme:acme-1=acme.pem core.svp examples/protect/core_tb.sv
+msim -keyfile Acme:acme-1=acme.pem core.svp -top top
 ```
 
-msim, mlint and mdft keep the protected code out of diagnostics, waveforms,
-coverage, lint findings and the DFT chain plan, except what the rights
-(`visibility`, `coverage`) and `viewport` pragmas allow.
-[`docs/PROTECT.md`](docs/PROTECT.md) has the format, recipes, keyrings
-(`-keyring`, IEEE 1735 key exchange format), the rights, and a clause by
-clause status.
+Protected regions stay hidden in errors, in the waveform and in coverage, to
+the depth the envelope's rights allow (`docs/PROTECT.md`).
+
+`msimprotect`, which *writes* envelopes, is a paid tool; see
+[docs/LICENSING.md](docs/LICENSING.md).
 
 ### Compiled mode
 
@@ -438,21 +498,6 @@ command line.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 
-### High-level synthesis: `mhls`
-
-`mhls` turns a C/C++ function into SystemVerilog: an FSM with datapath, or
-with `-pipeline` a pipeline that takes one input per cycle. It also writes
-a self-checking testbench, so the result is one `msim` run away from proven
-against the C. See [docs/HLS.md](docs/HLS.md).
-
-```sh
-mhls fir.c -top fir -clock 5 -o fir.sv -tb fir_tb.sv
-msim fir.sv fir_tb.sv -top fir_tb          # PASS: fir 20 calls, latency 2..2 cycles
-```
-
-C++ classes and templates go through the installed clang:
-`mhls fir.cpp -clang -top fir4 -o fir4.sv`.
-
 ### Datapath library: `dw/`
 
 `dw/` is a library of synthesizable, parameterized building blocks
@@ -467,50 +512,14 @@ msim tb.sv rtl/*.sv -y dw +libext+.sv -top tb
 
 `docs/DATAPATH.md` lists every module and its ports.
 
-### Cell library checks: `mlibc`
+### A real PDK as test data: sky130
 
-`mlibc check lib.lib -lef cells.lef` checks a Liberty library and its LEF for
-the mistakes that break the tools downstream (a function that disagrees with
-its timing arcs, tables that shrink with load, a flop without setup or hold,
-a macro of the wrong size, pins off the routing grid); `mlibc report` and
-`mlibc compare slow.lib fast.lib` summarize a library and check a pair of
-corners. See `docs/LIBCHECK.md`. The generic cell library it is tested on is
-`lib/mini45` (`docs/MINI45.md`).
-
-### Timing constraint checks: `msdc`
-
-`msdc` reads the design and its SDC file and reports what is wrong or missing
-in the constraints: syntax and names that match nothing, clocks that clock
-nothing, registers no clock reaches, ports with no I/O delay, exceptions that
-are not startpoint-to-endpoint or have no path in the design, a setup
-multicycle with no hold, and paths between clocks whose relationship nobody
-declared. 32 rules, multithreaded, same report for any `-threads N`.
-
-```sh
-msdc rtl/*.sv -top soc -sdc soc.sdc         # the report, then a summary
-msdc rtl/*.sv -top soc -sdc soc.sdc -Werror # exit 1 on any finding (for CI)
-msdc -sdc soc.sdc                           # the file alone
-msdc -list                                  # the rules
-```
-
-The SDC reader (`src/sdc.hpp`) and the Tcl interpreter under it
-(`src/tcl.hpp`) are shared with the timing and synthesis tools. See
-[docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
-
-### Static timing analysis: `msta`
-
-`msta` times a gate-level netlist against SDC constraints with Liberty
-libraries, PrimeTime style, and builds without the slang front end:
-
-```sh
-msta -lib cells.lib netlist.v -top top -sdc top.sdc      # check_timing, worst setup and hold paths, summary
-msta -lib cells.lib netlist.v -sdc top.sdc -sdf top.sdf  # delays and timing checks for msim -sdf
-msta -f run.tcl                                          # report_timing, report_constraint, ... in a Tcl script
-```
-
-It runs on every core by default (`-threads N`), with the same results at any
-thread count. Commands, what is modeled and the current limits are in
-[docs/STA.md](docs/STA.md).
+`lib/sky130` holds 47 cells of the open SkyWater 130 nm library (Liberty,
+LEF and technology LEF, Apache-2.0, unmodified extracts) as a second test
+library beside `lib/mini45`, and `python3 lib/sky130/sky130.py fetch`
+downloads all 428 cells at three corners. The implementation tools that read
+it are a paid product ([docs/LICENSING.md](docs/LICENSING.md)); the libraries
+themselves stay here, under their own licences. See `lib/sky130/README.md`.
 
 ### Lint and clock-domain checks: `mlint`
 
@@ -537,6 +546,8 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
 | `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
 | `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
+| `format`, `suspicious` | `FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009` | Verible-style text and syntax rules (off until enabled): line length, tabs, trailing spaces, stray semicolons, `` `endif `` comments, explicit lifetimes and parameter types, range direction |
+| `tidy` | `TIDY001`..`TIDY021` | slang-tidy's checks, built in: registers assigned only in reset, undriven bit ranges, struct fields split over processes, port and typedef style |
 | `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
@@ -558,19 +569,6 @@ clock passed down through several modules stays one domain. `-cdc-report`
 lists every domain and crossing, `-clock-group a,b` declares related clocks
 and `-static sig` waives a quasi-static signal. Findings print as
 `file:line:col: severity: [RULE] text`, sorted by file and line.
-
-### Power analysis: `mpower`
-
-`mpower` reports average and peak power from a simulation's switching
-activity (SAIF, VCD or FST) and a Liberty library, for a gate netlist or as
-an estimate for RTL, by group, instance, cell and UPF power domain
-([docs/POWER.md](docs/POWER.md)):
-
-```sh
-msim cells.v netlist.v tb.sv -top tb -saif run.saif
-mpower netlist.v -top dut -lib cells.lib -activity run.saif -strip_path tb.dut
-mpower rtl.sv -top dut -activity run.fst -peak -waveform power.csv   # RTL estimate, power over time
-```
 
 ### Source-level debug: `mdebug`
 
@@ -603,68 +601,6 @@ msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 
-### Logic synthesis: `msynth`
-
-`msynth` synthesizes RTL to a gate netlist of Liberty library cells, with a
-Tcl shell whose commands follow dc_shell:
-
-```sh
-msynth -f run.tcl                                   # analyze, elaborate, create_clock, compile, report_*, write
-msynth rtl/*.sv -top core -period 2 -o core_net.v   # one step, with the mini45 library
-msim core_net.v cells.v tb.sv -top tb               # simulate the netlist (cells.v: write_lib_models)
-```
-
-See [docs/SYNTH.md](docs/SYNTH.md) for the commands, the flow and the limits.
-
-### FPGA synthesis: `mfpga`
-
-`mfpga` maps RTL (through the same elaborator as `msynth`) or an AIGER graph
-to the LUTs, carry chains and flip-flops of an FPGA family (iCE40, ECP5,
-Xilinx 7-series, generic) and writes Yosys JSON for nextpnr or EDIF.
-
-```sh
-mfpga rtl/*.sv -top core -family ice40 -o core.json   # then: nextpnr-ice40 --json core.json ...
-```
-
-See [docs/FPGA.md](docs/FPGA.md).
-
-### Formal property checking: `mformal`
-
-`mformal` proves or falsifies the design's assertions for every input
-sequence, on the same front end and lowering as `msim`. Assertions are
-proven or falsified, assumptions constrain the inputs, covers are reached or
-proven unreachable. A failure comes with a VCD of the whole design and, with
-`-tb`, a testbench that replays it in `msim`.
-
-```sh
-mformal rtl/*.sv -top fifo                  # every assert / assume / cover
-mformal rtl/*.sv -top fifo -depth 40 -tb    # deeper, with replay testbenches
-```
-
-```
-  assert  top.u.a_count        proven  (induction, k=2)
-  assert  top.u.a_push_counts  falsified  at cycle 5  mformal_out/top.u.a_push_counts.vcd
-  cover   top.u.c_full         covered  at cycle 4  mformal_out/top.u.c_full.vcd
-```
-
-Properties are checked in parallel on every core (`-threads N`), with the
-same result for any thread count. See `docs/FORMAL.md` for the model (clock,
-reset, two-state values, what is cut) and the supported property operators.
-
-### Equivalence checking: `mequiv`
-
-`mequiv` proves that a netlist is the same circuit as the RTL it came from
-(or as another netlist, or one RTL revision as the next), the way Formality
-and Conformal do: flops are matched by name and cut, and every output and
-next-state function is proved equal. A failing point comes with the input
-values that show the difference.
-
-```sh
-mequiv -ref rtl/*.sv -impl netlist.v cells.v -top alu
-```
-
-See [docs/EQUIV.md](docs/EQUIV.md).
-
 ### Design for test: `mdft`
 
 `mdft` checks that a design can be scan-tested, and prints the flop count per
@@ -690,134 +626,30 @@ mdft: 5 flops in 3 clock domains
   t.clk: 3 flops (2 rising, 1 falling)
 ```
 
-On a gate netlist `mdft -insert_scan` stitches the flops into scan chains
-(scan cells from the Liberty library or a mux in front of D, balanced chains
-per clock domain, lockup latches, clock gates held open) and writes the
-netlist, a chain description for ATPG and a chain flush testbench.
-`mdft -mbist` generates a March memory BIST controller and collar for a RAM
-and reports the fault coverage of the chosen algorithm. See
-[docs/DFT.md](docs/DFT.md).
-
-```sh
-mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
-mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
-```
+Everything that *changes* a design for test — scan insertion, memory BIST,
+boundary scan, IJTAG, EDT scan compression, logic BIST and failure diagnosis —
+is `mdfti`, a paid tool; see [docs/LICENSING.md](docs/LICENSING.md). What is
+here is the reading half: the checks above, on RTL, before any of that.
 
 `mlint` and `mdft` share one model of the elaborated design
 (`src/lintir.hpp`): the blocks with what each assigns, reads and assigns on
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
-### Test patterns: `matpg`
+### Support agents: `msupport`
 
-`matpg` generates manufacturing test patterns for a scan-inserted gate
-netlist and reports the fault coverage: stuck-at faults, and transition
-faults by launch-on-capture. It builds with the core, without slang.
-
-```sh
-matpg scan.v                                   # stuck-at patterns and coverage
-matpg scan.v -fault all -stil p.stil -tb p_tb.v
-matpg scan.v -lib cells.lib -min_coverage 98   # Liberty cells; gate for CI
-matpg scan.v -faultsim p.pat                   # grade existing patterns
-```
-
-It traces the scan chains from the ports, runs random patterns and then
-PODEM, fault-simulates every pattern against every remaining fault (64
-patterns to the word, on every core, the same result for any `-threads N`),
-compacts, and writes STIL, a self-checking Verilog testbench that `msim`
-replays, and a fault list with each fault's class. See
-[docs/ATPG.md](docs/ATPG.md).
-
-### Emulation and FPGA prototyping: `memu`
-
-`memu` is the step between synthesis and FPGA place and route that makes a
-design fit a board of several FPGAs and run there at all: every flop moves
-onto one free-running clock, memories become FPGA RAM, the cells are split
-over the FPGAs, and signals share wires where the board has too few.
+Each product has an AI support agent that answers users' questions from that
+product's documentation, can run a short example on the product's own tool in
+a sandbox, and files a ticket when the documentation does not answer. One
+JSON file per product in `support/products/`; the model is Claude through the
+Anthropic SDK. Built and tested, not online yet. See
+[docs/SUPPORT.md](docs/SUPPORT.md).
 
 ```sh
-memu soc.gv -lib cells.lib -mem mems.txt -fpgas 4 -lut 200000 -pins 240 -probe 'u_core.pc*' -o out
-msim cells.v mems.v soc.gv out/soc_fpga*.v out/soc_emu_lib.v out/soc_emu.v out/soc_emu_tb.sv -top soc_emu_tb
+python3 tools/msupport.py -list
+python3 tools/msupport.py -product msim "How do I write an FST waveform?"
+python3 tools/msupport.py -serve 8080            # a local web page and JSON API
 ```
-```
-memu: PASS, 2000 events (2000 with a clock edge), 80856 output bits compared, netlist and emulation agree
-```
-
-The second command needs no hardware: it runs the netlist `memu` was given
-next to the emulation it wrote, on the same random inputs, and compares every
-output at every clock event. Transactors (`memu -xtor-sv`) connect the
-emulated design to the C models of a virtual prototype or to a testbench
-class, with the design's clock stopped while the host answers. It uses every
-logical CPU by default (`-threads N`), with the same result on any number.
-[docs/EMULATION.md](docs/EMULATION.md) has the timing model, the file formats
-and the transactors.
-### Parasitic extraction: `mrcx`
-
-`mrcx` reads a routed DEF and its LEF and writes every net's resistance and
-capacitance, coupling included, as SPEF for timing and power analysis:
-
-```sh
-mrcx -lef tech.lef -lef cells.lef -def routed.def -o design.spef
-mrcx -lef tech.lef -lef cells.lef -def routed.def -itf process.itf -temp 125 -o slow.spef
-```
-
-```
-mrcx: gcd: 411 nets, 22243.4 um of wire, 6986 nodes, 6688 resistors, 5134 coupling capacitors
-mrcx: capacitance 2029 fF to ground, 409.5 fF between nets (sky130 stack, 25 C)
-```
-
-It runs on every core (`-threads N`), writes the same file for any thread
-count, and reports open and shorted nets. On the OpenROAD `gcd` test design
-its total net capacitance is within 2% of OpenRCX's, and the ground and
-coupling parts within 1% and 4%. See
-[`docs/RCX.md`](docs/RCX.md).
-### Physical verification: `mpv`
-
-`mpv drc` checks a GDSII or OASIS layout against a rule deck: width, spacing,
-enclosure, overhang, area and density checks on drawn and derived layers
-(`&`, `|`, `-`, `grow`, `interact`, ...). It needs no slang and builds with
-the default configuration.
-
-```sh
-mpv drc -deck tests/pv/sky130.drc tests/pv/sky130/sky130_fd_sc_hd__inv_1.gds
-mpv drc -deck rules.drc chip.gds -top core -o drc.txt -q     # exit 1 on violations
-```
-
-```
-rule poly.1a  width(poly) < 0.15            "poly width"
-rule poly.8   overhang(poly, diff) < 0.13   "poly end cap beyond diff"
-rule licon.5a enclosure(licon & diff, diff | tap) < 0.04  "diff enclosure of licon"
-```
-
-`mpv lvs` compares a routed block with its gate netlist. The nets are found
-from the geometry of the DEF and LEF, so a missing via is an open and a
-stray wire is a short:
-
-```sh
-mpv lvs -lef tech.lef routed.def -netlist block.v      # exit 1 on a mismatch
-```
-
-It runs on every logical CPU by default (`-threads N`), with the same
-report for every thread count. The deck format, the results file, LVS and
-the limits are in [docs/MPV.md](docs/MPV.md).
-
-### Virtual prototypes: `-mvp`
-
-A memory, a peripheral, or a whole subsystem can be a program instead of RTL,
-so software and design meet before the RTL is finished. The design drives an
-AXI4-Lite port and the model answers in C or C++:
-
-```sh
-msim -mvp soc_tb.sv my_model.c -top soc_tb
-```
-
-`-mvp` adds `mvp.sv` (`mvp_axil_slave`, `mvp_irq_slave`, `mvp_clock`) and the
-runtime that keeps the memory map, the interrupt lines and the models' time.
-A model is ordinary C against [`include/mvp.h`](include/mvp.h):
-`mvp_add_device` to join the map, `mvp_after_ps` to take time, `mvp_set_irq`
-to interrupt, `mvp_bus_read` / `mvp_bus_write` to be a master. A TLM-2.0
-target goes behind the same bridge with `mvp_tlm.h`. A memory and a 16550-style
-UART are bundled in `mvp/models/`. See [docs/VPROTO.md](docs/VPROTO.md).
 
 ## Known limits
 
@@ -842,4 +674,8 @@ cmake at another build with `-DIVERILOG=... -DVVP=...`. To add one, drop a `.sv`
 
 ## License
 
-MIT
+Apache License 2.0 (`LICENSE`, attribution in `NOTICE`). Until 2026-11-11 the
+repository was MIT; that grant is not withdrawn, and copies obtained under it
+stay under it. Paid tools are a separate, closed-source product; which tool is
+in which edition, and the rules on third-party code, are in
+[`docs/LICENSING.md`](docs/LICENSING.md).

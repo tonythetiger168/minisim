@@ -25,8 +25,6 @@
 // plan is built from.
 #include <functional>
 
-#include "dft/mbist.hpp"
-#include "dft/scan.hpp"
 #include "lintir.hpp"
 #include "version.hpp"
 
@@ -270,9 +268,9 @@ struct Dft {
 
 void usage() {
     std::cout << "usage: mdft [options] file.sv ...\n"
-                 "  design-for-test checks and a scan chain plan\n"
-                 "       mdft -insert_scan netlist.v -o scanned.v ...   (see mdft -insert_scan -help)\n"
-                 "       mdft -mbist -name N -words W -width B ...      (see mdft -mbist -help)\n\n"
+                 "  design-for-test checks and a scan chain plan on the elaborated design\n"
+                 "  (scan insertion, memory BIST, boundary scan, IJTAG, EDT, logic BIST and\n"
+                 "  failure diagnosis are in mdfti, a paid tool; see docs/LICENSING.md)\n\n"
                  "  -disable RULE  turn one rule off (repeatable)\n"
                  "  -list          list the rules\n"
                  "  -Werror        exit non-zero on any finding\n"
@@ -281,7 +279,7 @@ void usage() {
               << protfront::Options::help() <<
                  "  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
                  "  -version       print the version\n"
-                 "  --help-slang   list every front-end option\n";
+                 "  --help-slang   list every front-end option\n\n";
 }
 
 void listRules() {
@@ -296,17 +294,6 @@ void listRules() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Scan insertion and memory BIST work on a gate netlist or on numbers,
-    // not on the elaborated design: they have their own option sets.
-    if (argc > 1 && (std::string(argv[1]) == "-insert_scan" || std::string(argv[1]) == "-mbist")) {
-        std::vector<std::string> rest(argv + 2, argv + argc);
-        try {
-            return std::string(argv[1]) == "-mbist" ? mbist::main(rest) : scan::main(rest);
-        } catch (const std::exception& e) {
-            std::cerr << "mdft: " << e.what() << "\n";
-            return 2;
-        }
-    }
     FrontEnd fe;
     std::vector<std::string> fwd{argv[0]};
     Rules rules;

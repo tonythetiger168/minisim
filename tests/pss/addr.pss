@@ -1,0 +1,55 @@
+// Address claims (addr_reg_pkg): regions, a hole, alignment, permanent
+// claims, and memory that is used again once a claim has ended.
+import addr_reg_pkg::*;
+
+import target function void claim(bit[64] addr, bit[64] size);
+
+component pss_top {
+  transparent_addr_space_c<> mem;
+  exec init {
+    transparent_addr_region_s<> lo;
+    lo.addr = 0x1000;
+    lo.size = 0x100;
+    (void)mem.add_region(lo);
+    transparent_addr_region_s<> hole;
+    hole.addr = 0x1100;
+    hole.size = 0x10;
+    (void)mem.add_nonallocatable_region(hole);
+    transparent_addr_region_s<> hi;
+    hi.addr = 0x1110;
+    hi.size = 0x40;
+    (void)mem.add_region(hi);
+  }
+
+  // Kept for the rest of the test: no two of these ever overlap.
+  action keep {
+    rand transparent_addr_claim_s<> c;
+    constraint c.size in [16..48];
+    constraint c.alignment == 16;
+    constraint c.permanent;
+    exec body { claim(c.addr, c.size); }
+  }
+  // Three quarters of the high region, given back when the action ends.
+  action big {
+    rand transparent_addr_claim_s<> c;
+    constraint c.size == 48;
+    constraint c.addr >= 0x1110;
+    exec body { print("big %x %d %d\n", c.addr, c.alignment, c.permanent); }
+  }
+
+  action entry {
+    activity {
+      do keep;
+      parallel { do keep; do keep; do keep; }
+      do keep;
+    }
+  }
+  // One after the other they fit, each time in the same 64 bytes.
+  action reuse {
+    activity { repeat (4) { do big; } }
+  }
+  // At the same time they do not.
+  action clash {
+    activity { parallel { do big; do big; } }
+  }
+}

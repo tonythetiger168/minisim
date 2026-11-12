@@ -1,0 +1,51 @@
+# The power intent of gating.upf written with Tcl (IEEE 1801-2024 5.1):
+# command substitution, foreach, proc, if, expr and lists. msim must behave
+# exactly as with gating.upf.
+upf_version 4.0
+set_design_top dut
+set iso_sig iso_en
+
+proc domain {name args} {
+    if {[llength $args] == 0} {
+        create_power_domain $name -include_scope
+    } else {
+        create_power_domain $name -elements $args
+    }
+    return $name
+}
+set top  [domain PD_TOP]
+set core [domain PD_CORE u_core]
+
+foreach s {VDD VSS} {
+    create_supply_port $s
+    create_supply_net $s
+    connect_supply_net $s -ports [list $s]
+}
+create_supply_net VDD_CORE
+
+foreach {set pwr dom} [list SS_AON VDD $top SS_CORE VDD_CORE $core] {
+    create_supply_set $set -function [list power $pwr] -function {ground VSS}
+    associate_supply_set $set -handle $dom.primary
+}
+
+create_power_switch SW_CORE \
+    -output_supply_port {vout VDD_CORE} \
+    -input_supply_port {vin VDD} \
+    -control_port {en sw_en} \
+    -ack_port {ack ack {en}} \
+    -on_state {on vin {en}} \
+    -off_state {off {!en}}
+
+# name suffix, clamp value and the outputs it isolates
+set n 0
+foreach {clamp ports} {0 {cnt q} 1 hi latch lat} {
+    set els {}
+    foreach p $ports { lappend els u_core/$p }
+    set name [expr {$clamp eq "latch" ? "ISO_L" : "ISO_$clamp"}]
+    set_isolation $name -domain $core -applies_to outputs -elements $els \
+        -isolation_supply SS_AON -clamp_value $clamp \
+        -isolation_signal $iso_sig -isolation_sense high
+    incr n
+}
+if {$n != 3} { error "expected three isolation strategies, got $n" }
+set_level_shifter LS_IN -domain $core -applies_to inputs -elements [string map {X d} u_core/X]

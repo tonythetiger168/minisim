@@ -415,6 +415,14 @@ def lib_cell(c, corner):
                     w(cons_table("rise_constraint", base, kd, kc, corner, "        "))
                     w(cons_table("fall_constraint", base * 1.15, kd, kc, corner, "        "))
                     w("      }\n")
+        if q:
+            # What an edge on the pin costs inside the cell when no output
+            # moves: the clock tree's share of a register's power.
+            w("      internal_power () {\n")
+            for rising in (True, False):
+                e = [[0.25 * pin_cap(c, i) * VDD_TT * VDD_TT * (1.0 if rising else 0.9) + 0.9 * sl] for sl in SLEWS]
+                w(table("rise_power" if rising else "fall_power", "power_7", e, "        ", SLEWS))
+            w("      }\n")
         w("    }\n")
 
     # ---- outputs
@@ -522,6 +530,7 @@ def liberty(corner):
     s += "  lu_table_template (constraint_3x3) {\n    variable_1 : related_pin_transition;\n"
     s += "    variable_2 : constrained_pin_transition;\n"
     s += '    index_1 ("%s");\n    index_2 ("%s");\n  }\n' % ((", ".join(fmt(x) for x in CONS_SLEWS),) * 2)
+    s += '  power_lut_template (power_7) {\n    variable_1 : input_transition_time;\n    index_1 ("%s");\n  }\n' % ", ".join(fmt(x) for x in SLEWS)
     s += "  power_lut_template (power_7x7) {\n    variable_1 : input_transition_time;\n"
     s += "    variable_2 : total_output_net_capacitance;\n"
     s += '    index_1 ("%s");\n    index_2 ("%s");\n  }\n' % (", ".join(fmt(x) for x in SLEWS), ", ".join(fmt(x) for x in LOADS_X1))

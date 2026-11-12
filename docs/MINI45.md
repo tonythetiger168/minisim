@@ -60,7 +60,9 @@ Units are ns, fF, V, kohm, nW. Each corner has:
 - Setup, hold, recovery and removal tables (3x3) and minimum pulse widths
   for the sequential cells; `ff`, `latch` and `test_cell` groups; clock gate
   attributes.
-- `internal_power` tables per arc and `leakage_power` per input state.
+- `internal_power` tables per arc, input pin power (the clock, data, scan,
+  set and reset pins of the sequential cells and clock gates: what an edge
+  costs when no output moves) and `leakage_power` per input state.
 - `function`, `three_state`, `max_capacitance`, pin capacitances,
   `pg_pin`s, three `wire_load` models and `operating_conditions`.
 

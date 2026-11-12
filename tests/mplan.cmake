@@ -142,3 +142,70 @@ foreach(n 1 2 3 4)
   execute_process(COMMAND ${MPLAN} check ${OUT}/bad${n}.vplan RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
   expect("bad plan ${n}" ${rc} 2 "${out}" "bad${n}\\.vplan(:[0-9]+)?: ")
 endforeach()
+
+# Requirements: a CSV list named by the plan, the matrix, the gate, the trend column.
+set(TRACED ${SRC}/tests/plan/traced.vplan)
+execute_process(COMMAND ${MPLAN} check ${TRACED} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqs check" ${rc} 0 "${out}" "6 requirement\\(s\\), 5 named by a feature" "no feature verifies: CNT-5  Parity output"
+       "warning: feature reset names requirement 'CNT-9'")
+execute_process(COMMAND ${MPLAN} report ${TRACED} -results ${OUT}/r1 -o ${OUT}/tplan -label t1 -trace ${OUT}/trace.csv -fail-on-uncovered
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqs report" ${rc} 1 "${out}" "requirements: 3/6 verified, 1 not started, 1 failing, 1 uncovered"
+       "failing +CNT-3  Scoreboard agrees  \\(scoreboard 0\\.0%\\)" "uncovered +CNT-5  Parity output"
+       "gate: 1 uncovered requirement\\(s\\), 1 unknown id\\(s\\)")
+file(READ ${OUT}/trace.csv csv)
+foreach(rx "CNT-1,Counting,,,verified,100\\.0,,," "CNT-1\\.2,Wrap around,CNT-1,high,verified,100\\.0,count\\.wrap,,count_wrap"
+           "CNT-3,Scoreboard agrees,,medium,failing,0\\.0,scoreboard,,sb_\\*" "CNT-5,Parity output,,low,uncovered,0\\.0,,,")
+  if(NOT csv MATCHES "${rx}")
+    message(FATAL_ERROR "trace.csv lacks '${rx}'\n${csv}")
+  endif()
+endforeach()
+file(READ ${OUT}/tplan/plan.html page)
+foreach(rx "<h2>Requirements</h2>" "requirements verified \\(1 uncovered\\)" "verifies CNT-1\\.2")
+  if(NOT page MATCHES "${rx}")
+    message(FATAL_ERROR "plan.html lacks '${rx}'")
+  endif()
+endforeach()
+execute_process(COMMAND ${MPLAN} trend ${OUT}/tplan/history.jsonl RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqs trend" ${rc} 0 "${out}" "Buckets +Reqs" " 3/6 ")
+
+# The same requirements from ReqIF (-reqs), with the hierarchy and the XHTML text; a draft plan from them.
+file(WRITE ${OUT}/rq.vplan "plan rq\n  feature count\n    req CNT-1.1 CNT-1.2\n    test count_*\n  feature sb\n    req CNT-2\n    test sb_*\n")
+execute_process(COMMAND ${MPLAN} report ${OUT}/rq.vplan -reqs ${SRC}/tests/plan/reqs.reqif -results ${OUT}/r1 -o ${OUT}/rqplan -no-history
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqif report" ${rc} 0 "${out}" "requirements: 2/3 verified, 1 failing" "failing +CNT-2  Reset  \\(sb 0\\.0%\\)")
+file(READ ${OUT}/rqplan/plan.json js)
+if(NOT js MATCHES "\"id\": \"CNT-1\\.1\", \"parent\": \"CNT-1\"" OR NOT js MATCHES "q follows dir, one step per clock")
+  message(FATAL_ERROR "plan.json lacks the ReqIF hierarchy or text")
+endif()
+execute_process(COMMAND ${MPLAN} init -reqs ${SRC}/tests/plan/reqs.reqif -name cnt RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqif init" ${rc} 0 "${out}" "feature CNT-1 \"Counting\"\n    feature CNT-1_1 \"Count up and down\"\n      req CNT-1\\.1" "feature CNT-2 \"Reset\"\n    req CNT-2")
+file(WRITE ${OUT}/bad.csv "name,text\nx,y\n")
+execute_process(COMMAND ${MPLAN} check ${OUT}/rq.vplan -reqs ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("bad reqs" ${rc} 2 "${out}" "bad\\.csv: no 'id' column")
+
+# Ranking: what each passing test adds (per-run coverage databases), the redundant ones, the tests behind a feature.
+execute_process(COMMAND ${MPLAN} rank ${PLAN} -results ${OUT}/r1 -keep ${OUT}/keep.list -json ${OUT}/rank.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("rank" ${rc} 0 "${out}" "1  count_down +54 +39\\.4%" "2  count_wrap +7 +44\\.5%" "3  count_up +2 +46\\.0%"
+       "3 of 3 tests reach 46\\.0% \\(63/137 points\\)" "not ranked \\(not passing\\): sb_check"
+       "count\\.wrap: count_wrap \\(1\\)" "reset: count_down \\(31\\), count_wrap \\(29\\), count_up \\(25\\)")
+file(READ ${OUT}/keep.list keep)
+if(NOT keep STREQUAL "count_down\ncount_wrap\ncount_up\n")
+  message(FATAL_ERROR "keep list wrong:\n${keep}")
+endif()
+execute_process(COMMAND ${MPLAN} rank -results ${OUT}/r1 -all -threads 1 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("rank -all" ${rc} 0 "${out}" "4 of 4 tests reach 48\\.9% \\(67/137 points\\)")
+execute_process(COMMAND ${MPLAN} rank -results ${OUT}/f1 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("rank redundant" ${rc} 0 "${out}" "1  b +170 +87\\.6%" "redundant \\(add nothing\\): a")
+execute_process(COMMAND ${MPLAN} report ${PLAN} -results ${OUT}/r1 -o ${OUT}/kplan -no-history -rank -q
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+file(READ ${OUT}/kplan/plan.html page)
+file(READ ${OUT}/kplan/plan.json js)
+if(NOT page MATCHES "<h2>Tests by what they add</h2>" OR NOT js MATCHES "\"ranking\": {\"by\": \"points\"")
+  message(FATAL_ERROR "report -rank: no ranking in plan.html / plan.json")
+endif()
+execute_process(COMMAND ${MPLAN} rank -results ${OUT}/r3x RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+if(rc EQUAL 0)
+  message(FATAL_ERROR "rank on a missing directory passed")
+endif()

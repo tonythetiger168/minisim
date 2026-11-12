@@ -14,49 +14,11 @@
 // soft constraints, they are added back from the highest priority down, each
 // kept only if a solution remains (18.5.13.1).
 
+#include "interval.hpp"   // AV, wrap, conv and the interval rule of each operator (shared with mpss)
+
 using i128 = __int128;
 
 namespace rnd {
-
-// An abstract value: every value in [lo, hi], read as w bits, signed or not.
-struct AV {
-    i128 lo = 0, hi = 0;
-    int w = 1;
-    bool sgn = false;
-};
-constexpr int kMaxW = 120;
-inline i128 rMin(int w, bool s) { return s ? -((i128)1 << (w - 1)) : 0; }
-inline i128 rMax(int w, bool s) { return s ? ((i128)1 << (w - 1)) - 1 : ((i128)1 << w) - 1; }
-inline AV full(int w, bool s) {
-    int cw = w > kMaxW ? kMaxW : (w < 1 ? 1 : w);
-    return {rMin(cw, s), rMax(cw, s), w, s};
-}
-inline bool isFull(const AV& a) { return a.w > kMaxW; }
-// [lo, hi] taken mod 2^w and read as (w, s).
-inline AV wrap(i128 lo, i128 hi, int w, bool s) {
-    if (w > kMaxW || w < 1) return full(w, s);
-    i128 m = (i128)1 << w;
-    if (hi - lo + 1 >= m) return full(w, s);
-    auto norm = [&](i128 v) {
-        v %= m;
-        if (v < 0) v += m;
-        if (s && v > rMax(w, true)) v -= m;
-        return v;
-    };
-    i128 a = norm(lo), b = norm(hi);
-    if (a <= b) return {a, b, w, s};
-    return full(w, s);
-}
-inline AV conv(const AV& a, int w, bool s) {
-    if (a.w == w && a.sgn == s) return a;
-    if (a.w > kMaxW) return full(w, s);
-    return wrap(a.lo, a.hi, w, s);
-}
-inline AV single(i128 v, int w, bool s) { return wrap(v, v, w, s); }
-inline AV boolAV(bool canFalse, bool canTrue) { return {canFalse ? 0 : 1, canTrue ? 1 : 0, 1, false}; }
-inline bool canTrue(const AV& a) { return !(a.lo == 0 && a.hi == 0); }
-inline bool canFalse(const AV& a) { return a.lo <= 0 && a.hi >= 0; }
-inline bool isSingle(const AV& a) { return a.w <= kMaxW && a.lo == a.hi; }
 
 // The math value of a known Val read as (w, s); false if it has x/z bits or
 // is wider than the solver handles.
@@ -193,10 +155,7 @@ inline AV aeval(const E& e, bool& exact) {
             if (exact && !(a.w == b.w && w <= kMaxW / 2 && isSingle(a) && isSingle(b))) return concrete(e, exact);
             if (w > kMaxW / 2) return full(w, s);
             a = conv(a, w, s); b = conv(b, w, s);
-            if (e->op == Op::Add) return wrap(a.lo + b.lo, a.hi + b.hi, w, s);
-            if (e->op == Op::Sub) return wrap(a.lo - b.hi, a.hi - b.lo, w, s);
-            i128 c[4] = {a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi};
-            return wrap(*std::min_element(c, c + 4), *std::max_element(c, c + 4), w, s);
+            return wrapOp(e->op == Op::Add ? ival::Op::Add : e->op == Op::Sub ? ival::Op::Sub : ival::Op::Mul, a, b, w, s);
         }
         case Op::Div: case Op::Mod: {
             bool ea, eb;
@@ -208,14 +167,7 @@ inline AV aeval(const E& e, bool& exact) {
             if (w > kMaxW / 2) return full(w, s);
             a = conv(a, w, s); b = conv(b, w, s);
             if (b.lo <= 0 && b.hi >= 0) return full(w, s);   // may divide by 0: x
-            if (e->op == Op::Div) {
-                i128 c[4] = {tdiv(a.lo, b.lo), tdiv(a.lo, b.hi), tdiv(a.hi, b.lo), tdiv(a.hi, b.hi)};
-                return wrap(*std::min_element(c, c + 4), *std::max_element(c, c + 4), w, s);
-            }
-            i128 m = std::max(b.lo < 0 ? -b.lo : b.lo, b.hi < 0 ? -b.hi : b.hi) - 1;
-            if (a.lo >= 0) return wrap(0, std::min(a.hi, m), w, s);
-            if (a.hi <= 0) return wrap(std::max(a.lo, -m), 0, w, s);
-            return wrap(-m, m, w, s);
+            return wrapOp(e->op == Op::Div ? ival::Op::Div : ival::Op::Mod, a, b, w, s);
         }
         case Op::Eq: case Op::Ne: case Op::CaseEq: case Op::WildEq: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: {
             bool ea, eb;
@@ -227,22 +179,14 @@ inline AV aeval(const E& e, bool& exact) {
             int w = std::max(a.w, b.w);
             bool s = a.sgn && b.sgn;
             a = conv(a, w, s); b = conv(b, w, s);
-            bool t = true, f = true;
             switch (e->op) {
-                case Op::Eq: case Op::CaseEq: case Op::WildEq:
-                    t = a.lo <= b.hi && b.lo <= a.hi;
-                    f = !(isSingle(a) && isSingle(b) && a.lo == b.lo);
-                    break;
-                case Op::Ne:
-                    f = a.lo <= b.hi && b.lo <= a.hi;
-                    t = !(isSingle(a) && isSingle(b) && a.lo == b.lo);
-                    break;
-                case Op::Lt: t = a.lo < b.hi; f = a.hi >= b.lo; break;
-                case Op::Le: t = a.lo <= b.hi; f = a.hi > b.lo; break;
-                case Op::Gt: t = a.hi > b.lo; f = a.lo <= b.hi; break;
-                default:     t = a.hi >= b.lo; f = a.lo < b.hi; break;
+                case Op::Eq: case Op::CaseEq: case Op::WildEq: return boolOp(ival::Op::Eq, a, b);
+                case Op::Ne: return boolOp(ival::Op::Ne, a, b);
+                case Op::Lt: return boolOp(ival::Op::Lt, a, b);
+                case Op::Le: return boolOp(ival::Op::Le, a, b);
+                case Op::Gt: return boolOp(ival::Op::Gt, a, b);
+                default:     return boolOp(ival::Op::Ge, a, b);
             }
-            return boolAV(f, t);
         }
         case Op::LogNot: {
             AV a = aeval(e->kids[0], exact);
@@ -259,8 +203,7 @@ inline AV aeval(const E& e, bool& exact) {
             AV b = aeval(e->kids[1], eb);
             exact = ea && eb;
             if (exact) return concrete(e, exact);
-            if (isAnd) return boolAV(canFalse(a) || canFalse(b), canTrue(a) && canTrue(b));
-            return boolAV(canFalse(a) && canFalse(b), canTrue(a) || canTrue(b));
+            return boolOp(isAnd ? ival::Op::LAnd : ival::Op::LOr, a, b);
         }
         case Op::Mux: {
             bool ec, ea, eb;
@@ -294,12 +237,12 @@ inline AV aeval(const E& e, bool& exact) {
             if (w > 64) return full(w, a.sgn && b.sgn);
             AV ua = conv(a, w, false), ub = conv(b, w, false);
             bool s = a.sgn && b.sgn;
-            auto ceilMask = [](i128 v) { i128 m = 0; while (m < v) m = m * 2 + 1; return m; };
-            AV r;
-            if (e->op == Op::And) r = {0, std::min(ua.hi, ub.hi), w, false};
-            else if (e->op == Op::Or) r = {std::max(ua.lo, ub.lo), ceilMask(std::max(ua.hi, ub.hi)), w, false};
-            else r = {0, ceilMask(std::max(ua.hi, ub.hi)), w, false};
-            return conv(r, w, s);
+            // Unsigned operands: the plain rule's bounds, without its exact
+            // case (two single values here need not be the bits compared).
+            ival::IV q = e->op == Op::And ? ival::IV{0, std::min(ua.hi, ub.hi)}
+                       : e->op == Op::Or ? ival::IV{std::max(ua.lo, ub.lo), ival::ceilMask(std::max(ua.hi, ub.hi))}
+                                         : ival::IV{0, ival::ceilMask(std::max(ua.hi, ub.hi))};
+            return conv(AV{q.lo, q.hi, w, false}, w, s);
         }
         case Op::Shl: case Op::Shr: {
             bool ea, eb;
@@ -446,10 +389,40 @@ inline i128 below(i128 n) {
 }
 
 // Find a value of v in [lo, hi] (DFS over halves, random order by size).
+inline bool propagate();
+// With few variables, each step of the search also narrows the others
+// (forward checking): bounds alone miss holes, so s == d with d inside
+// {512, 1024, 4096} would let s take 3000 and the next variable fail.
 inline bool search(Var& v, i128 lo, i128 hi) {
     if (--g_ctx->budget < 0) return false;
     v.lo = lo; v.hi = hi;
     if (!varOk(v)) return false;
+    if (g_ctx->vars.size() > 1 && g_ctx->vars.size() <= 32) {
+        std::pair<i128, i128> snap[32];
+        size_t n = g_ctx->vars.size();
+        for (size_t k = 0; k < n; k++) snap[k] = {g_ctx->vars[k].lo, g_ctx->vars[k].hi};
+        if (!propagate()) {
+            for (size_t k = 0; k < n; k++) { g_ctx->vars[k].lo = snap[k].first; g_ctx->vars[k].hi = snap[k].second; }
+            return false;
+        }
+        if (v.lo != lo || v.hi != hi) {   // propagation narrowed v itself
+            i128 nlo = v.lo, nhi = v.hi;
+            bool ok = search(v, nlo, nhi);
+            if (!ok) for (size_t k = 0; k < n; k++) { g_ctx->vars[k].lo = snap[k].first; g_ctx->vars[k].hi = snap[k].second; }
+            return ok;
+        }
+        if (lo != hi) {
+            i128 mid = lo + (hi - lo) / 2;
+            i128 n1 = mid - lo + 1, n2 = hi - mid;
+            bool firstLow = below(n1 + n2) < n1;
+            for (int t = 0; t < 2; t++) {
+                bool low = (t == 0) == firstLow;
+                if (low ? search(v, lo, mid) : search(v, mid + 1, hi)) return true;
+                for (size_t k = 0; k < n; k++) { g_ctx->vars[k].lo = snap[k].first; g_ctx->vars[k].hi = snap[k].second; }
+            }
+            return false;
+        }
+    }
     if (lo == hi) { v.set = true; v.val = lo; return true; }
     // Small ranges: try the values in random order.
     if (hi - lo < 8) {
@@ -488,21 +461,10 @@ inline int narrowVar(Var& v) {
     if (v.set || v.items.empty()) return 0;
     if (--g_ctx->budget < 0) return -1;
     if (!feasibleIn(v, v.lo, v.hi)) return -1;
-    // smallest m with [lo, m] feasible (lo itself, most of the time)
-    i128 a = v.lo, b = v.hi;
-    if (a < b && feasibleIn(v, a, a)) b = a;
-    while (a < b) {
-        i128 m = a + (b - a) / 2;
-        if (feasibleIn(v, v.lo, m)) b = m; else a = m + 1;
-    }
-    i128 nlo = a;
-    a = nlo; b = v.hi;
-    if (a < b && feasibleIn(v, b, b)) a = b;
-    while (a < b) {
-        i128 m = a + (b - a + 1) / 2;
-        if (feasibleIn(v, m, v.hi)) a = m; else b = m - 1;
-    }
-    i128 nhi = a;
+    // The feasible ends, by the binary search shared with mpss (interval.hpp).
+    auto ok = [&](i128 a, i128 b) { return feasibleIn(v, a, b); };
+    i128 nlo = ival::lowBound(v.lo, v.hi, ok);
+    i128 nhi = ival::highBound(nlo, v.hi, ok);
     if (nlo == v.lo && nhi == v.hi) return 0;
     v.lo = nlo; v.hi = nhi;
     return 1;
@@ -560,6 +522,42 @@ inline bool pickVar(Var& v) {
             left.clear();   // nothing left in this cycle is allowed: start a new one
         }
         v.lo = flo; v.hi = fhi;
+        return false;
+    }
+    if (v.randc) {
+        // Wider than 16 bits: the values given in this cycle are kept
+        // (sorted) and not given again. A cycle ends when no unused value
+        // is found, or after 65536 values, which bounds the memory.
+        auto& used = randcLeft()[{v.owner, v.addr}];
+        auto isUsed = [&](i128 x) { return std::binary_search(used.begin(), used.end(), x); };
+        auto take = [&](i128 x) {
+            used.insert(std::lower_bound(used.begin(), used.end(), x), x);
+            v.lo = v.hi = x; v.set = true; v.val = x;
+            return true;
+        };
+        if (used.size() >= 65536) used.clear();
+        for (int pass = 0; pass < 2; pass++) {
+            if (fhi - flo < 4096) {
+                std::vector<i128> cand;
+                for (i128 x = flo; x <= fhi; x++) if (!isUsed(x)) cand.push_back(x);
+                for (size_t k = cand.size(); k > 1; k--) std::swap(cand[k - 1], cand[(size_t)below((i128)k)]);
+                for (i128 x : cand) {
+                    v.lo = v.hi = x;
+                    if (varOk(v)) return take(x);
+                }
+            } else {
+                for (int t = 0; t < 64; t++) {
+                    v.lo = flo; v.hi = fhi; v.set = false;
+                    v.randc = false;
+                    bool got = pickVar(v);
+                    v.randc = true;
+                    if (!got) { v.lo = flo; v.hi = fhi; return false; }
+                    if (!isUsed(v.val)) return take(v.val);
+                }
+            }
+            used.clear();   // start a new cycle
+        }
+        v.lo = flo; v.hi = fhi; v.set = false;
         return false;
     }
     if (v.dist) {
@@ -1264,6 +1262,15 @@ static int doRandomize(int obj, const RandCall* rc) {
             return false;
         };
         ok = attempt();
+        long nFirst = std::count(rank.begin(), rank.end(), -1);
+        if (!ok && pass == 1 && nFirst > 0 && (size_t)nFirst < order.size()) {
+            // A size picked first may leave the other variables no solution
+            // when they decide it together (op == 2 -> q.size() > 1; op != 2
+            // -> q.size() == 0): then the sizes go last, picked within what
+            // the others leave.
+            std::rotate(order.begin(), order.begin() + nFirst, order.end());
+            ok = attempt();
+        }
         if (!ok && !softs.empty()) {
             // Keep soft constraints from the highest priority down, each only if
             // it still leaves a solution (18.5.13.1).
@@ -1298,11 +1305,29 @@ static int doRandomize(int obj, const RandCall* rc) {
         return ok;
     };
 
+    // rand variables wider than 64 bits take random bits. A constraint
+    // that reads one sees those bits as state, so the fill is retried
+    // while the rest has no solution.
+    std::vector<std::pair<int, Val>> wideOld;
+    for (auto& sv : scalars)
+        if (sv.w > 64) wideOld.push_back({sv.addr, S.get(sv.addr)});
+    auto fillWide = [&]() {
+        for (auto& [addr, old] : wideOld) {
+            Val nv = make(0, 0, old.w, 0, old.sgn);
+            for (int i = 0; i < limbCount(old.w); i++) setLimb(nv, i, rnd64(), 0, 0);
+            S.set(addr, finish(nv));
+        }
+    };
     bool ok;
     if (conts.empty()) {
         std::vector<int> none;
-        ok = solvePass(0, none);
+        for (int fill = 0; fill < (wideOld.empty() ? 1 : 64); fill++) {
+            fillWide();
+            ok = solvePass(0, none);
+            if (ok) break;
+        }
     } else {
+        fillWide();
         // Sizes are solved before elements (18.5.8.1), so a size may leave
         // the elements no solution: then the sizes are picked again.
         const std::vector<RCont> conts0 = conts;
@@ -1389,6 +1414,8 @@ static int doRandomize(int obj, const RandCall* rc) {
                 dynBump(c.cid);
             }
     }
+    if (!ok)
+        for (auto& [addr, old] : wideOld) S.set(addr, old);
     if (!ok) cerr << "warning: randomize() failed: the constraints cannot all be met (time " << S.now << ")\n";
     g_fr = callerFr;
     g_rng = savedRng;
