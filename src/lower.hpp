@@ -10646,6 +10646,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (it == sigmap.end())
             throw std::runtime_error("lower: port '" + std::string(ps.name) + "' is not a signal");
         int w = (int)ps.getType().getBitWidth();
+        if (w <= 0 && (ps.getType().isUnpackedStruct() || ps.getType().isUnpackedUnion()))
+            w = storeW(ps.getType());   // an unpacked struct port: one vector, as for a variable (7.2)
         if (w <= 0) Lowerer::unsupported("port width");
         return Formal{it->second, w, ps.getType().isSigned()};
     }
