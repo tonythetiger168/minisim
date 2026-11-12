@@ -3091,6 +3091,29 @@ struct Lowerer {
         condDefs().push_back(std::move(d));
         return condDefs().back().base;
     }
+    // A procedural checker instance (17.3): the process reaching it queues
+    // the checker's static assertions, concurrent ones as procedural
+    // concurrent assertions (16.14.6) and deferred ones as procedural
+    // deferred assertions (16.4), with the procedure's clock and automatic
+    // values. Those of checkers it instantiates statically go the same way.
+    // Everything else in the checker runs on its own (ProcCollector).
+    void procCheckerAsserts(const slang::ast::Scope& body) {
+        using namespace slang::ast;
+        const Scope* savedScope = scope;
+        scope = &body;
+        for (const Symbol& m : body.members()) {
+            if (m.kind == SymbolKind::ProceduralBlock && m.as<ProceduralBlockSymbol>().isFromAssertion)
+                stmt(m.as<ProceduralBlockSymbol>().getBody());
+            else if (m.kind == SymbolKind::CheckerInstance)
+                procCheckerAsserts(m.as<CheckerInstanceSymbol>().body);
+            else if (m.kind == SymbolKind::GenerateBlock && !m.as<GenerateBlockSymbol>().isUninstantiated)
+                procCheckerAsserts(m.as<GenerateBlockSymbol>());
+            else if (m.kind == SymbolKind::GenerateBlockArray)
+                for (const auto* e : m.as<GenerateBlockArraySymbol>().entries)
+                    if (!e->isUninstantiated) procCheckerAsserts(*e);
+        }
+        scope = savedScope;
+    }
     // The condition of c ? a : b, or of x matches p &&& g ? a : b (12.6.2):
     // each part in turn, pattern variables bound as they are matched.
     E condOf(const slang::ast::ConditionalExpression& c) {
@@ -3797,6 +3820,28 @@ struct Lowerer {
             emitUserCall(call, false);
             int t = dynTemp(dynShapeOf(*e.type));
             Instr i = dynCmd(t, D_COPY); i.dsrc = relSig(kRelRet, it->second->retSig); prog.emit(i);
+            return t;
+        }
+        if (e.kind == ExpressionKind::Call && isDynType(*e.type) && e.as<CallExpression>().isSystemCall()) {
+            // qq.pop_front() / pop_back() of a queue of queues (7.10.2.6): the
+            // element is copied out, then removed
+            const auto& call = e.as<CallExpression>();
+            auto n = call.getSubroutineName();
+            if ((n != "pop_front" && n != "pop_back") || call.arguments().empty()) return -1;
+            int outer = dynSig(*call.arguments()[0]);
+            if (outer < 0 || !dynShape(outer).elem) return -1;
+            int t = dynTemp(dynShapeOf(*e.type));
+            { Instr c = dynCmd(t, D_DELETE); prog.emit(c); }   // empty when the queue is
+            Instr j; j.k = IK::JmpIfNot;
+            j.e = bin(Op::Ne, dynSize(outer), konst(mk(0, 32)));
+            size_t at = prog.emit(j);
+            E key = n == "pop_front" ? konst(mk(0, 64)) : bin(Op::Sub, resize(dynSize(outer), 64, false, false), konst(mk(1, 64)));
+            auto r = node(Op::DynElemRef, {key});
+            r->sig = outer;
+            int el = elemRef(outer, r);
+            Instr c = dynCmd(t, D_COPY); c.dsrc = el; prog.emit(c);
+            prog.code[at].target = prog.here();
+            prog.emit(dynCmd(outer, n == "pop_front" ? D_POP_FRONT : D_POP_BACK));   // warns when it is empty
             return t;
         }
         if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // m[i] of a container of containers
@@ -6376,6 +6421,7 @@ struct Lowerer {
             out.push_back(name);
             return;
         }
+        if (isTaggedUnion(t)) { pfmtTagged(t, v, fmt, out); return; }
         if (t.kind == SymbolKind::PackedStructType || t.kind == SymbolKind::PackedUnionType) {
             fmt += "'{";
             bool first = true;
@@ -6402,10 +6448,42 @@ struct Lowerer {
         }
         unsupported("%p of this type");
     }
+    // A tagged union prints tag:value of the member its tag names (21.2.1.6),
+    // as '{M:v}; a void member prints as '{M}.
+    void pfmtTagged(const slang::ast::Type& t, E v, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        bool up = t.isUnpackedUnion();
+        int w = up ? uWidth(t) : (int)t.getBitWidth();
+        int tb = tagBitsOf(t);
+        E r = konst(mkstr("'{?}"));
+        std::vector<const FieldSymbol*> fs;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) fs.push_back(&f);
+        for (size_t k = fs.size(); k-- > 0;) {
+            const FieldSymbol& f = *fs[k];
+            const Type& mt = f.getType();
+            std::string sub = "'{" + escPct(std::string(f.name));
+            std::vector<E> subArgs;
+            if (!mt.isVoid()) {
+                int fw = up ? uWidth(mt) : (int)mt.getBitWidth();
+                sub += ":";
+                E part = slice(v, fw - 1, 0);
+                if (up) pfmtBits(mt, part, sub, subArgs);
+                else pfmtSingular(mt, mt.isSigned() ? resize(part, fw, false, true) : part, sub, subArgs);
+            }
+            sub += "}";
+            auto sf = node(Op::SFormat, std::move(subArgs));
+            sf->fmt = sub;
+            E cond = tb > 0 ? bin(Op::CaseEq, slice(v, w - 1, w - tb), konst(mk((uint64_t)k, tb))) : konst(mk(1, 1));
+            r = mux(cond, sf, r);
+        }
+        fmt += "%s";
+        out.push_back(r);
+    }
     // An unpacked struct prints with member names; a union, its first member (21.2.1.6).
     void pfmtStruct(const slang::ast::Type& t0, E v, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
         const Type& t = t0.getCanonicalType();
+        if (isTaggedUnion(t)) { pfmtTagged(t, v, fmt, out); return; }
         fmt += "'{";
         bool first = true;
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
@@ -9190,6 +9268,10 @@ struct Lowerer {
                 break;
             }
             case StatementKind::WaitFork: { Instr i; i.k = IK::WaitFork; prog.emit(i); break; }
+            case StatementKind::ProceduralChecker:   // 17.3: its static assertions, queued here
+                for (const Symbol* inst : s.as<ProceduralCheckerStatement>().instances)
+                    if (inst->kind == SymbolKind::CheckerInstance) procCheckerAsserts(inst->as<CheckerInstanceSymbol>().body);
+                break;
             case StatementKind::ImmediateAssertion:
                 xpGuard([&] { immAssert(s.as<ImmediateAssertionStatement>()); });
                 break;
@@ -9898,6 +9980,23 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
         initStatic(v);
     }
+    // `output logic q = 5` (23.2.2.3): slang keeps the initializer on the
+    // port; it initializes the port's variable like a declaration's.
+    void handle(const slang::ast::PortSymbol& ps) {
+        using namespace slang::ast;
+        if (ps.direction != ArgumentDirection::Out || !ps.internalSymbol ||
+            ps.internalSymbol->kind != SymbolKind::Variable)
+            return;
+        const Expression* e = ps.getInitializer();
+        if (!e) return;
+        const auto& v = ps.internalSymbol->as<VariableSymbol>();
+        if (!sigmap.count(&v) || arrMap().count(&v) || dynMap().count(&v)) Lowerer::unsupported("this output port initializer");
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        init->setScope(ps.getParentScope());
+        Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
+        i.e = resize(init->expr(*e), storeW(v.getType()), e->type->isSigned(), v.getType().isSigned());
+        init->prog.emit(i);
+    }
     // A class's static property (8.9) starts like a module variable.
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) initStatic(p);
@@ -10021,6 +10120,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         PathRec base;
         base.inst = Lowerer::instPath(tp.getParentScope());
         base.unit = d.ticksPerUnit();
+        base.sym = &tp;
         if (const Expression* c = tp.getConditionExpr()) {
             base.hasCond = true;
             base.cond = termText(*c);
@@ -10397,6 +10497,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.e = els[(size_t)k];
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay());
+                assignGate(ca, i);
                 finishAssign(L, i);
             }
             g_emitLoc = {};
@@ -10420,6 +10521,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.e = slice(resize(L.expr(a.right()), w, false, false), hi, lo);
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay());
+                assignGate(ca, i);
                 finishAssign(L, i);
             }
             g_emitLoc = {};
@@ -10431,8 +10533,26 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.e = lw.expr(a.right());
         lw.setScope(ca.getParentScope());
         i.dly = lw.delays3(ca.getDelay());
+        assignGate(ca, i);
         finishAssign(lw, i);
         g_emitLoc = {};
+    }
+    // A delayed continuous assignment drives through a gateRecs() entry, so
+    // vpi_put_delays can change its delay at run time (38.10).
+    void assignGate(const slang::ast::ContinuousAssignSymbol& ca, Instr& i) {
+        if (i.dly.empty()) return;
+        auto [it, fresh] = assignGates().try_emplace(&ca, (int)gateRecs().size());
+        if (fresh) {
+            GateRec gr;
+            gr.inst = Lowerer::instPath(ca.getParentScope());
+            gr.name = "$assign";
+            std::vector<uint64_t> d3 = i.dly;
+            if (d3.size() > 3) d3.resize(3);
+            std::vector<uint64_t> d12 = expand12(d3);
+            std::copy(d12.begin(), d12.end(), gr.d);
+            gateRecs().push_back(std::move(gr));
+        }
+        i.gate = it->second;
     }
 
     // buf/not/and/nand/or/nor/xor/xnor and pullup/pulldown drive the same way
@@ -10848,7 +10968,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 }
                 continue;
             }
-            if (!ext || ps.isNullPort) continue;
+            if (!ext || ps.isNullPort || Lowerer::peel(*ext).kind == ExpressionKind::EmptyArgument) continue;   // u(a, ): left open (23.3.2)
             Lowerer::lastLoc() = ext->sourceRange.start().valid() ? ext->sourceRange.start() : inst.location;
             // A ref port or a container port joined to a whole variable shares
             // that variable's signal (see sharedPortVar).
@@ -10880,6 +11000,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
             if (ps.direction != ArgumentDirection::Out && ps.direction != ArgumentDirection::InOut)
                 Lowerer::unsupported("ref port");
+            // An open output with an initializer (`output logic q = 5`): slang
+            // gives the initializer as the connection; nothing is connected.
+            if (ext->kind != ExpressionKind::Assignment && ps.direction == ArgumentDirection::Out &&
+                ext == ps.getInitializer())
+                continue;
             if (ext->kind != ExpressionKind::Assignment)
                 Lowerer::unsupported("output port connection");
             const auto& asg = ext->as<AssignmentExpression>();
@@ -10912,6 +11037,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     int checkerDepth = 0;
     std::unordered_set<const slang::ast::Symbol*> freeAssigned;
     bool checkerAssumes = false;
+    int procCheckerDepth = 0;   // inside a checker instantiated in procedural code (17.3)
     // A free checker variable (17.7): random from the start, unless it has
     // an initializer; an active one gets a new random value every time step.
     void freeVar(const slang::ast::VariableSymbol& v) {
@@ -10926,7 +11052,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     void handle(const slang::ast::CheckerInstanceSymbol& ci) {
         using namespace slang::ast;
-        if (ci.body.isProcedural) Lowerer::unsupported("a checker instance in procedural code (17.3)");
+        // In procedural code (17.3) its static assertions are lowered where the
+        // process reaches the instance (Lowerer::procCheckerAsserts); the rest
+        // runs as for a static instance.
+        bool procedural = ci.body.isProcedural;
+        if (procedural) procCheckerDepth++;
+        struct Leave { int& d; bool on; ~Leave() { if (on) d--; } } leave{procCheckerDepth, procedural};
         // Which variables the checker assigns, and whether it has assume
         // statements (17.7.2): an active free variable is one it never assigns.
         struct Scan : ASTVisitor<Scan, VisitFlags::Statements | VisitFlags::Expressions> {
@@ -11095,7 +11226,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
-        if (p.isFromAssertion) { assertionItem(p); return; }
+        if (p.isFromAssertion) {
+            if (procCheckerDepth == 0) assertionItem(p);   // else queued by the procedure (17.3)
+            return;
+        }
         // A final block (9.2.3) runs once when simulation ends. Lowering it as
         // a process would run it at time 0 and, looping, forever.
         Lowerer lw(sigmap);
@@ -11528,6 +11662,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     portRecs().clear();
     instCells().clear();
     gateRecs().clear();
+    assignGates().clear();
     pulseStyles().clear();
     outLinks().clear();
     inLinks().clear();
