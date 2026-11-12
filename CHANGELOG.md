@@ -880,6 +880,9 @@ Spec references are IEEE 1800-2023 clauses.
   plan where people set the owner, status, bug id and note of each failure
   bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
   and `mplan report -rules URL` to take the annotations as triage rules.
+- `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
+  / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
+  state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
 - `x inside {q}` in a constraint, where `q` is a queue or dynamic array (a
