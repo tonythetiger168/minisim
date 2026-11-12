@@ -125,6 +125,14 @@ inline Obj* classVarObj(const Symbol* s, const Type& t) {
     o->ty = &t;
     return o;
 }
+// The class an object was made of: its first signal holds the class id.
+inline const Type* dynClass(int base) {
+    if (base <= 0 || (size_t)base >= S.sigs.size()) return nullptr;
+    int64_t id = (int64_t)S.sigs[(size_t)base].val.v;
+    for (const auto& [t, ci] : classMap())
+        if (ci && ci->id == id && ci->ty) return ci->ty;
+    return nullptr;
+}
 // The object a class variable refers to now; null for a null handle.
 inline Obj* classObjOf(const Obj* var) {
     Val h = S.get(var->sig);
@@ -133,8 +141,10 @@ inline Obj* classObjOf(const Obj* var) {
     if (!slot) {
         slot = mkObj(Obj::ClassObj, vpiClassObj);
         slot->idx = (int)h.v;
-        slot->ty = var->ty;   // the variable's class; a derived object shows the properties of this class
     }
+    // The object's own class (its dynamic type, 8.20); the variable's class if unknown.
+    const Type* dyn = dynClass(slot->idx);
+    slot->ty = dyn ? dyn : var->ty;
     return slot;
 }
 // A non-static property of an object: a variable at the object's base
@@ -169,5 +179,112 @@ inline void classProps(const Obj* cobj, const Type& ct, std::vector<vpiHandle>& 
         if (p.lifetime == VariableLifetime::Static) {
             if (Obj* v = valueObj(&p)) items.push_back(H(v));
         } else if (Obj* v = propObj(cobj, p)) items.push_back(H(v));
+    }
+}
+// ---- Class definitions (37.29) ----
+inline const ClassType* classTypeOf(const Type* t) {
+    if (!t) return nullptr;
+    const Type& c = t->getCanonicalType();
+    return c.isClass() ? &c.as<ClassType>() : nullptr;
+}
+inline Obj* classDefnObj(const ClassType* c) {
+    if (!c) return nullptr;
+    auto& slot = st().symObj[c];
+    if (!slot) {
+        slot = mkObj(Obj::ClassDefn, vpiClassDefn);
+        slot->sym = c;
+        slot->ty = c;
+    }
+    return slot;
+}
+// The extends clause of a class (8.13): its base class as a typespec.
+inline Obj* extendsObj(const ClassType* c) {
+    const ClassType* b = c ? classTypeOf(c->getBaseClass()) : nullptr;
+    if (!b) return nullptr;
+    auto& slot = st().codeObjs[{c, vpiExtends}];
+    if (!slot) {
+        slot = mkObj(Obj::Extends, vpiExtends);
+        slot->sym = c;
+        slot->ty = b;
+    }
+    return slot;
+}
+inline bool isMethod(const Obj* o) {
+    if (o->kind != Obj::Scope || !o->sym || (o->sym->kind != SymbolKind::Subroutine && o->sym->kind != SymbolKind::MethodPrototype)) return false;
+    const Scope* p = o->sym->getParentScope();
+    return p && p->asSymbol().kind == SymbolKind::ClassType;
+}
+// vpi_handle on class objects, variables, typespecs, definitions and methods.
+inline Obj* classHandle(int type, const Obj* o) {
+    if (type == vpiClassDefn) {
+        if (o->kind == Obj::ClassObj || o->kind == Obj::Typespec || (o->kind == Obj::Signal && o->type == vpiClassVar))
+            return classDefnObj(classTypeOf(o->ty));
+        if (o->kind == Obj::Extends) return classDefnObj(classTypeOf(o->ty));
+        if (isMethod(o)) return classDefnObj(&o->sym->getParentScope()->asSymbol().as<ClassType>());
+        return nullptr;
+    }
+    if (o->kind == Obj::ClassDefn) {
+        if (type == vpiExtends) return extendsObj(static_cast<const ClassType*>(o->ty));
+        if (type == vpiTypespec) return typespecObj(o->ty);
+        if (type == vpiParent || type == vpiScope || type == vpiInstance) return scopeOfSym(*o->sym);
+        return nullptr;
+    }
+    if (o->kind == Obj::Extends) {
+        if (type == vpiClassTypespec || type == vpiTypespec) return typespecObj(o->ty);
+        if (type == vpiParent) return classDefnObj(static_cast<const ClassType*>(&o->sym->as<Type>()));
+    }
+    return nullptr;
+}
+inline std::vector<const ClassType*> allClasses() {
+    std::vector<const ClassType*> v;
+    for (const auto& [t, ci] : classMap())
+        if (const ClassType* c = classTypeOf(t)) v.push_back(c);
+    std::sort(v.begin(), v.end(), [](const ClassType* a, const ClassType* b) {
+        if (a->location != b->location) return a->location < b->location;
+        return a->name < b->name;
+    });
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
+}
+inline bool classIterate(int type, const Obj* o, std::vector<vpiHandle>& items) {
+    const auto* c = static_cast<const ClassType*>(o->ty);
+    if (type == vpiMethods) {   // the tasks and functions the class declares (not built-in ones; pure virtual prototypes too)
+        for (const Symbol& m : c->members())
+            if ((m.kind == SymbolKind::Subroutine && !(m.as<SubroutineSymbol>().flags & MethodFlags::BuiltIn)) ||
+                m.kind == SymbolKind::MethodPrototype) {   // pure virtual: scopeObj skips other prototypes
+                if (Obj* x = scopeObj(m)) items.push_back(H(x));
+            }
+        return true;
+    }
+    if (type == vpiDerivedClasses) {
+        for (const ClassType* d : allClasses())
+            if (classTypeOf(d->getBaseClass()) == c) items.push_back(H(classDefnObj(d)));
+        return true;
+    }
+    if (type == vpiVariables) {   // the static properties (the others live in objects)
+        for (const auto& p : c->membersOfType<ClassPropertySymbol>())
+            if (p.lifetime == VariableLifetime::Static)
+                if (Obj* v = valueObj(&p)) items.push_back(H(v));
+        return true;
+    }
+    return false;
+}
+inline int64_t classGet(int prop, const Obj* o) {
+    if (prop == vpiType) return o->type;
+    const Symbol* s = o->kind == Obj::ClassDefn ? o->sym : static_cast<const Symbol*>(o->ty);
+    if (prop == vpiVirtual && o->kind == Obj::ClassDefn) return s->as<ClassType>().isAbstract;
+    if (prop == vpiLineNo) return srcMgr() ? (int64_t)srcMgr()->getLineNumber(o->sym->location) : 0;
+    return vpiUndefined;
+}
+inline bool classGetStr(int prop, const Obj* o, std::string& r) {
+    const auto* c = static_cast<const ClassType*>(o->kind == Obj::ClassDefn ? o->sym : o->ty);
+    switch (prop) {
+        case vpiName: r = std::string(c->name); return true;
+        case vpiFullName: r = c->getHierarchicalPath(); return true;
+        case vpiFile:
+            if (!srcMgr()) return false;
+            r = std::string(srcMgr()->getFileName(o->sym->location));
+            return true;
+        default: return false;
     }
 }

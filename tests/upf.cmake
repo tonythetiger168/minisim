@@ -14,6 +14,40 @@ foreach(t gating retention states vct)
   endif()
 endforeach()
 
+# Logic nets and ports made by the power intent, repeaters (6.13, 6.19, 6.20,
+# 6.52, 9.10); named state transitions and power state groups, which report
+# through -upf_verbose (6.7, 6.22, 9.4).
+foreach(t logic transitions)
+  set(flags)
+  if(t STREQUAL "transitions")
+    set(flags -upf_verbose)
+  endif()
+  execute_process(COMMAND ${MSIM} ${D}/${t}.sv -upf ${D}/${t}.upf ${flags}
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  file(READ ${D}/${t}.out want)
+  if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
+    message(FATAL_ERROR "${t}: ${rc}\n--- got\n${out}${err}--- want\n${want}")
+  endif()
+endforeach()
+# Errors of the logic and transition commands, each with its file and line.
+function(upf_error name text want)
+  file(READ ${D}/logic.upf base)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${name}.upf "${base}${text}\n")
+  execute_process(COMMAND ${MSIM} ${D}/logic.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/${name}.upf
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  string(FIND "${err}" "${want}" pos)
+  if(rc EQUAL 0 OR pos EQUAL -1)
+    message(FATAL_ERROR "${name}: expected the error '${want}': ${rc}\n${out}${err}")
+  endif()
+endfunction()
+upf_error(e_const "create_logic_net t1\nconnect_logic_net t1 -ports {u_core/d}" "must both be one bit of logic (6.13)")
+upf_error(e_net "connect_logic_net nope -ports {u_core/r}" "no logic net 'u_dut.nope'")
+upf_error(e_two "create_logic_net t2\nconnect_logic_net t2 -ports {u_pmu/iso}" "is already connected to logic net iso_w (6.13 e)")
+upf_error(e_drv "create_logic_net t3\nconnect_logic_net t3 -ports {u_pmu/req}" "is already connected to another net (6.13 b)")
+upf_error(e_rep "set_repeater R2 -domain PD_CORE" "set_repeater needs -repeater_supply (6.52)")
+upf_error(e_tr1 "add_state_transition PD_CORE -domain -transition {t -from A}" "needs both -from and -to (6.7)")
+upf_error(e_tr2 "add_power_state PD_CORE -domain -state {A -logic_expr {u_pmu/req}}\nadd_state_transition PD_CORE -domain -transition {t -from A -to B}" "B is not a power state of PD_CORE (6.7)")
+upf_error(e_tr3 "add_state_transition PD_CORE -domain -transition {t -from A -to A}" "A is both the -from and the -to state (6.7)")
 # UPF is Tcl (5.1): the same intent written with proc, foreach, if, expr and
 # [command] substitution simulates the same.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/tcl.upf

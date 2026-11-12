@@ -20,6 +20,7 @@
 #include "../include/sv_vpi_user.h"
 #include "version.hpp"
 #include "slang/ast/ASTContext.h"
+#include "slang/ast/ASTVisitor.h"
 #include "slang/ast/SystemSubroutine.h"
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
@@ -40,7 +41,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm, Constraint, ConstrItem } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -95,6 +96,7 @@ struct State {
     std::unordered_map<int64_t, Obj*> constObj;
     std::unordered_map<int, Obj*> assertObj;
     std::unordered_map<int, std::vector<Cb*>> assertCbs;   // assertion -> its callbacks (39.4.2)
+    std::map<std::pair<int, const void*>, int> stepStates;   // (assertion, engine term) -> state number (39.5.2)
     std::vector<Cb*> assertSys;                            // callbacks on the assertion system (39.4.1)
     bool assertEnded = false;                              // vpiAssertionSysEnd
     // Coverage (40): per assertion its attempts, successes, failures, vacuous
@@ -118,6 +120,10 @@ struct State {
     std::multimap<uint64_t, Put> puts;
     std::vector<Cb*> holdCbs;             // cbForce, cbRelease, cbAssign, cbDeassign (38.36.1)
     std::map<std::pair<uint32_t, uint32_t>, std::vector<Cb*>> stmtCbs;   // cbStmt: by source file id and line
+    std::vector<Cb*> tchkCbs;             // cbTchkViolation (38.36.1)
+    std::vector<Cb*> createCbs, sizeCbs;  // cbCreateObj, cbSizeChange (38.36.1)
+    std::vector<Cb*> errCbs;              // cbError, cbPLIError (38.36.3)
+    bool inErrCb = false;
     std::vector<Cb*> nbaCbs, endSlot;     // cbNBASynch, cbAtEndOfSimTime of this time slot (38.36.2)
     int mode = vpiMode1800v2009;          // the compatibility mode of the running call (36.12)
     std::vector<char> arrBuf;             // vpi_get_value_array without vpiUserAllocFlag
@@ -150,6 +156,10 @@ inline Obj* mkObj(Obj::Kind k, int type) {
     return o;
 }
 inline void clearErr() { st().err = false; }
+inline void fireErrorCbs(int reason);
+inline void onTchk(int id);
+inline void onNewObj(int obj);
+inline void onSizeChange(int sig);
 inline void error(int level, const std::string& msg) {
     auto& s = st();
     s.err = true;
@@ -157,6 +167,7 @@ inline void error(int level, const std::string& msg) {
     s.errMsg = msg;
     s.errFile.clear();
     s.errLine = 0;
+    if (level >= vpiError) fireErrorCbs(cbPLIError);   // 38.36.3: an error in a VPI call
 }
 inline char* retStr(std::string s) {
     st().strBuf = std::move(s);
@@ -197,6 +208,11 @@ inline Obj* moduleObj(const InstanceSymbol* inst) {
 }
 // A scope that is not an instance: a package, generate scope, task,
 // function or named block (37.3.x). Null for anything else.
+// The return type of a function or of a pure virtual prototype.
+inline const Type& subrReturnType(const Symbol& s) {
+    if (s.kind == SymbolKind::MethodPrototype) return s.as<MethodPrototypeSymbol>().getReturnType();
+    return s.as<SubroutineSymbol>().getReturnType();
+}
 inline Obj* scopeObj(const Symbol& s) {
     int type = 0;
     switch (s.kind) {
@@ -209,6 +225,10 @@ inline Obj* scopeObj(const Symbol& s) {
             break;
         case SymbolKind::GenerateBlockArray: type = vpiGenScopeArray; break;
         case SymbolKind::Subroutine: type = s.as<SubroutineSymbol>().subroutineKind == SubroutineKind::Task ? vpiTask : vpiFunction; break;
+        case SymbolKind::MethodPrototype:   // a pure virtual method (37.30): a task or function with no body
+            if (!(s.as<MethodPrototypeSymbol>().flags & MethodFlags::Pure)) return nullptr;
+            type = s.as<MethodPrototypeSymbol>().subroutineKind == SubroutineKind::Task ? vpiTask : vpiFunction;
+            break;
         case SymbolKind::StatementBlock:
             if (s.name.empty()) return nullptr;
             type = s.as<StatementBlockSymbol>().blockKind == StatementBlockKind::Sequential ? vpiNamedBegin : vpiNamedFork;
@@ -282,6 +302,7 @@ inline int varType(const Type& t, bool net, int& t05) {
     return 0;
 }
 inline Obj* valueObj(const Symbol* s);
+inline Obj* typespecObj(const Type* t);
 #include "vpi_data.inc"
 // A variable or net as a VPI object, or null if VPI does not model it.
 inline Obj* valueObj(const Symbol* s) {
@@ -934,6 +955,56 @@ inline void fillTime(p_vpi_time t, const Obj* o, uint64_t ticks) {
         t->low = (PLI_UINT32)ticks;
     }
 }
+// cbError and cbPLIError (38.36.3): vpi_chk_error in the callback reports
+// the error. A callback that itself fails does not call them again.
+inline void fireErrorCbs(int reason) {
+    auto& s = st();
+    if (s.inErrCb) return;
+    s.inErrCb = true;
+    std::vector<Cb*> due;
+    for (Cb* c : s.errCbs)
+        if (c->live && c->d.reason == reason) due.push_back(c);
+    bool err = s.err;
+    int lvl = s.errLevel;
+    std::string msg = s.errMsg;
+    for (Cb* c : due) {
+        s_cb_data d = c->d;
+        s_vpi_time t = c->t;
+        d.obj = nullptr;
+        d.value = nullptr;
+        d.time = nullptr;
+        if (c->hasT && t.type != vpiSuppressTime) {
+            fillTime(&t, nullptr, S.now);
+            d.time = &t;
+        }
+        s.err = err;   // what the callback's vpi_chk_error sees
+        s.errLevel = lvl;
+        s.errMsg = msg;
+        d.cb_rtn(&d);
+    }
+    s.err = err;
+    s.errLevel = lvl;
+    s.errMsg = msg;
+    s.inErrCb = false;
+}
+// A run-time error message of the simulation: its first line, the location
+// and scope, without the time.
+inline void onRunError(const std::string& fmt) {
+    std::string m = fmt.substr(0, fmt.find('\n'));
+    if (auto k = m.find(": at time"); k != std::string::npos) m.resize(k);
+    std::string clean;
+    for (size_t k = 0; k < m.size(); k++) {
+        if (m[k] == '%' && k + 1 < m.size() && m[k + 1] == '%') k++;
+        clean += m[k];
+    }
+    auto& s = st();
+    s.err = true;
+    s.errLevel = vpiError;
+    s.errMsg = clean;
+    s.errFile.clear();
+    s.errLine = 0;
+    fireErrorCbs(cbError);
+}
 // A delay given in a s_vpi_time, in ticks.
 inline int64_t sigTicks(const p_vpi_time t, const Obj* o) {
     if (!t) return 0;
@@ -1208,6 +1279,8 @@ inline void onAssert(int id, int ev, uint64_t start) {
         case AE_VACUOUS: reason = cbAssertionVacuousSuccess; break;
         case AE_FAILURE: reason = cbAssertionFailure; break;
         case AE_DISABLED: reason = cbAssertionDisabledEvaluation; break;
+        case AE_STEP_OK: reason = cbAssertionStepSuccess; break;
+        case AE_STEP_FAIL: reason = cbAssertionStepFailure; break;
         case AE_RESET: reason = cbAssertionReset; break;
         case AE_KILLED: return;   // an attempt that $assertkill ended: no outcome (39.4.2)
         default: reason = ev >= AE_CTL ? ctlReason(ev - AE_CTL, false) : 0;
@@ -1222,7 +1295,23 @@ inline void onAssert(int id, int ev, uint64_t start) {
         s_vpi_attempt_info info{};
         info.attemptStartTime = s_vpi_time{vpiSimTime, (PLI_UINT32)(start >> 32), (PLI_UINT32)start, (double)start};
         info.detail.failExpr = nullptr;
-        bool attempt = ev <= AE_DISABLED;
+        s_vpi_assertion_step_info step{};
+        if (ev == AE_STEP_OK || ev == AE_STEP_FAIL) {   // 39.5.2: the states are the engine's, numbered per assertion as first seen
+            auto num = [&](const void* n) {
+                auto [it2, fresh] = s.stepStates.try_emplace({id, n}, 0);
+                if (fresh) {
+                    int k = 0;
+                    for (auto& [key, v] : s.stepStates)
+                        if (key.first == id && key.second != n) k++;
+                    it2->second = k;
+                }
+                return it2->second;
+            };
+            step.stateFrom = num(assertStep().from);
+            step.stateTo = num(assertStep().to);
+            info.detail.step = &step;
+        }
+        bool attempt = ev <= AE_DISABLED || ev == AE_STEP_OK || ev == AE_STEP_FAIL;
         c->assertFn(reason, &t, H(a), attempt ? &info : nullptr, c->d.user_data);
     }
 }
@@ -1258,9 +1347,23 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
         case vpiAssertionSysEnableNonvacuousAction: ctl = AC_NONVACON; sys = true; break;
         case vpiAssertionSysDisableVacuousAction: ctl = AC_VACOFF; sys = true; break;
         case vpiAssertionEnableStep:
-        case vpiAssertionDisableStep:
+        case vpiAssertionDisableStep: {   // 39.5.2: report each clock step of the assertion's attempts
+            Obj* o = O(va_arg(ap, vpiHandle));
+            if (!o || o->kind != Obj::Assertion) {
+                error(vpiError, "vpi_control: assertion stepping needs an assertion handle");
+                return 0;
+            }
+            if (denied(o, "vpi_control")) return 0;
+            AssertInfo& a = asserts()[(size_t)o->idx];
+            if (a.type != AT_CONCURRENT) {   // a concurrent assertion: immediate ones have no steps
+                error(vpiError, "vpi_control: only a concurrent assertion has clock steps");
+                return 0;
+            }
+            a.step = op == vpiAssertionEnableStep;
+            return 1;
+        }
         case vpiAssertionClockSteps:
-            error(vpiError, "vpi_control: assertion stepping (39.5.2) is not supported");
+            error(vpiError, "vpi_control: vpiAssertionClockSteps is not supported");
             return 0;
         default: return -1;   // not an assertion operation
     }
@@ -1496,6 +1599,7 @@ inline void covReset(int type, const InstanceSymbol* inst, const Obj* a) {
             if (!inst || sigInst(fsmDefs()[k].sig) == inst) { S.fsmSeen[k].clear(); S.fsmTrans[k].clear(); }
     }
 }
+#include "vpi_covmerge.inc"
 // vpi_control for coverage (40.5.1): vpiCoverageStart / Stop / Reset /
 // Check with a coverage type and an instance or assertion handle (null: the
 // whole design); vpiCoverageSave / Merge with a coverage type and a name.
@@ -1514,10 +1618,7 @@ inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
     if (op == vpiCoverageSave || op == vpiCoverageMerge) {
         const char* name = va_arg(ap, const char*);
         if (!name || !*name) { error(vpiError, "vpi_control: coverage save / merge needs a database name"); return 0; }
-        if (op == vpiCoverageMerge) {
-            error(vpiWarning, "vpi_control: vpiCoverageMerge is not supported (merge saved databases with mcov merge)");
-            return 0;
-        }
+        if (op == vpiCoverageMerge) return covMerge(type, name) ? 1 : 0;
         if (!covSaveHook() || !covSaveHook()(name)) { error(vpiError, std::string("vpi_control: cannot write coverage to ") + name); return 0; }
         return 1;
     }
@@ -1738,6 +1839,45 @@ vpiHandle vpi_register_cb(p_cb_data d) {
                 vpi::at(c->at);
             }
             break;
+        case cbTchkViolation:   // 38.36.1: on one timing check, or (obj NULL) any
+            if (c->obj && c->obj->kind != Obj::Tchk) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbTchkViolation needs a timing check handle or NULL");
+                return nullptr;
+            }
+            s.tchkCbs.push_back(c);
+            g_tchkHook = vpi::onTchk;
+            break;
+        case cbCreateObj:   // 38.36.1: a class object is made (obj NULL: any; a class definition: its objects)
+            if (c->obj && c->obj->kind != Obj::ClassDefn) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbCreateObj needs NULL or a class definition handle");
+                return nullptr;
+            }
+            s.createCbs.push_back(c);
+            g_newObjHook = vpi::onNewObj;
+            break;
+        case cbSizeChange:   // 38.36.1: a dynamic array, queue or associative array changes size
+            if (!c->obj || c->obj->kind != Obj::Dyn) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbSizeChange needs a dynamic array, queue or associative array handle");
+                return nullptr;
+            }
+            s.sizeCbs.push_back(c);
+            g_sizeHook = vpi::onSizeChange;
+            break;
+        case cbStartOfSave:
+        case cbEndOfSave:
+        case cbStartOfRestart:
+        case cbEndOfRestart:
+        case cbStartOfReset:
+        case cbEndOfReset:   // 38.36.2: msim has no save, restart or reset, so these never fire
+            break;
+        case cbError:
+        case cbPLIError:   // 38.36.3
+            s.errCbs.push_back(c);
+            if (d->reason == cbError) g_errHook = vpi::onRunError;
+            break;
         case cbEndOfCompile: s.endCompile.push_back(c); break;
         case cbStartOfSimulation: s.start.push_back(c); break;
         case cbEndOfSimulation: s.endSim.push_back(c); break;
@@ -1767,6 +1907,14 @@ PLI_INT32 vpi_remove_cb(vpiHandle h) {
         l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
     } else if (vpi::assertSysReason(o->cb->d.reason)) {
         auto& l = vpi::st().assertSys;
+        l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
+    }
+    if (o->cb->d.reason == cbTchkViolation) {
+        auto& l = vpi::st().tchkCbs;
+        l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
+    }
+    if (o->cb->d.reason == cbError || o->cb->d.reason == cbPLIError) {
+        auto& l = vpi::st().errCbs;
         l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
     }
     if (o->cb->d.reason == cbValueChange && o->cb->obj) {
@@ -1971,11 +2119,20 @@ inline const char* typeName(int type) {
         {vpiEventTypespec, "vpiEventTypespec"}, {vpiInterfaceTypespec, "vpiInterfaceTypespec"},
         {vpiAssert, "vpiAssert"}, {vpiAssume, "vpiAssume"}, {vpiCover, "vpiCover"},
         {vpiImmediateAssert, "vpiImmediateAssert"}, {vpiImmediateAssume, "vpiImmediateAssume"},
-        {vpiImmediateCover, "vpiImmediateCover"}};
+        {vpiImmediateCover, "vpiImmediateCover"}, {vpiClassObj, "vpiClassObj"}, {vpiClassVar, "vpiClassVar"},
+        {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}, {vpiInterModPath, "vpiInterModPath"}, {vpiTchk, "vpiTchk"}, {vpiTchkTerm, "vpiTchkTerm"}, {vpiModPath, "vpiModPath"}, {vpiPathTerm, "vpiPathTerm"},
+        {vpiGate, "vpiGate"}, {vpiSwitch, "vpiSwitch"}, {vpiUdp, "vpiUdp"}, {vpiPrimTerm, "vpiPrimTerm"},
+        {vpiConstraint, "vpiConstraint"}, {vpiImplication, "vpiImplication"}, {vpiConstrIf, "vpiConstrIf"},
+        {vpiConstrIfElse, "vpiConstrIfElse"}, {vpiConstrForEach, "vpiConstrForEach"}, {vpiSoftDisable, "vpiSoftDisable"},
+        {vpiConstraintOrdering, "vpiConstraintOrdering"}};
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
 }
 #include "vpi_code.inc"
+#include "vpi_tchk.inc"
+#include "vpi_prim.inc"
+#include "vpi_constr.inc"
+#include "vpi_svcb.inc"
 }   // namespace vpi
 extern "C" {
 
@@ -1992,6 +2149,12 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     using slang::ast::SymbolKind;
     if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
     if (type == vpiClassObj && o->type == vpiClassVar) return H(vpi::classObjOf(o));   // 37.29
+    if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return H(vpi::constrHandle(type, o));   // 37.31
+    if (type == vpiClassDefn || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return H(vpi::classHandle(type, o));
+    if (o->kind == Obj::InterModPath) return nullptr;
+    if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return H(vpi::tchkHandle(type, o));   // timing checks
+    if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return H(vpi::pathHandle(type, o));   // module paths
+    if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return H(vpi::primHandle(type, o));   // primitives
     if (o->kind == Obj::DynElem) {
         if (type == vpiParent) return H(const_cast<Obj*>(o->parent));
         if (type == vpiIndex) return o->idx >= 0 ? H(vpi::constObj(o->idx)) : nullptr;
@@ -2079,7 +2242,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
             if (o->kind == Obj::Signal && o->sym) return H(vpi::typespecObj(&o->sym->as<slang::ast::ValueSymbol>().getType()));
             if (o->kind == Obj::Word || o->kind == Obj::Param || o->kind == Obj::Member) return H(vpi::typespecObj(o->ty));
             if (o->kind == Obj::Port) return H(vpi::typespecObj(&o->sym->as<slang::ast::PortSymbol>().getType()));
-            if (o->kind == Obj::Scope && o->type == vpiFunction) return H(vpi::typespecObj(&o->sym->as<slang::ast::SubroutineSymbol>().getReturnType()));
+            if (o->kind == Obj::Scope && o->type == vpiFunction) return H(vpi::typespecObj(&vpi::subrReturnType(*o->sym)));
             return nullptr;
         case vpiBaseTypespec:
             if (o->kind == Obj::Typespec && o->type == vpiEnumTypespec)
@@ -2148,6 +2311,15 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     // protected object can be iterated.
     if (!(type == vpiArgument && o->kind == Obj::Call) && vpi::denied(o, "vpi_iterate")) return nullptr;
     if (vpi::isCode(o)) return vpi::codeIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
+    if (vpi::netConn(type, o, items)) return vpi::iter(std::move(items));
+    if (vpi::tchkIterate(type, o, items)) return vpi::iter(std::move(items));   // timing checks
+    if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return nullptr;
+    if (vpi::pathIterate(type, o, items)) return vpi::iter(std::move(items));   // module paths
+    if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return nullptr;
+    if (vpi::primIterate(type, o, items)) return vpi::iter(std::move(items));   // primitives
+    if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return nullptr;   // drivers, loads (37.16, 37.17)
+    if (vpi::constrIterate(type, o, items)) return vpi::iter(std::move(items));   // constraints (37.31)
+    if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return nullptr;
     if (type == vpiMember) {   // the members of a struct or union variable (37.17)
         if (!vpi::isStructObj(o)) return nullptr;
         vpi::members(o, items);
@@ -2158,6 +2330,9 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
         vpi::dynElems(o, items);
         return vpi::iter(std::move(items));
     }
+    if (o->kind == Obj::ClassDefn) return vpi::classIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
+    if (o->kind == Obj::InterModPath) return type == vpiPort ? vpi::iter(std::vector<vpiHandle>(o->items)) : nullptr;   // 38.21
+    if (o->kind == Obj::Extends) return nullptr;
     if (o->kind == Obj::ClassObj) {   // the properties of a class object (37.29)
         if (type != vpiVariables) return nullptr;
         vpi::classProps(o, *o->ty, items);
@@ -2567,6 +2742,14 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
             default: return vpiUndefined;
         }
     }
+    if (o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return (PLI_INT32)vpi::classGet(prop, o);
+    if (o->kind == Obj::InterModPath) return prop == vpiType ? vpiInterModPath : vpiUndefined;
+    if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return (PLI_INT32)vpi::tchkGet(prop, o);
+    if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return (PLI_INT32)vpi::pathGet(prop, o);
+    if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return (PLI_INT32)vpi::primGet(prop, o);
+    if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return (PLI_INT32)vpi::constrGet(prop, o);
+    if (prop == vpiVirtual && vpi::isMethod(o))
+        return o->sym->kind == SymbolKind::MethodPrototype || o->sym->as<slang::ast::SubroutineSymbol>().isVirtual();
     if (o->kind == Obj::ClassObj) {   // 37.29
         if (prop == vpiType) return vpiClassObj;
         if (prop == vpiObjId) return o->idx;
@@ -2668,7 +2851,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
             if (o->kind == Obj::Call) return o->site->func ? vpiSystfNames()[s.systfs[(size_t)o->site->systf].name].ftype : 0;
             if (o->kind == Obj::Systf) return s.systfs[(size_t)o->idx].d.sysfunctype;
             if (o->kind == Obj::Scope && o->type == vpiFunction) {
-                const slang::ast::Type& rt = o->sym->as<slang::ast::SubroutineSymbol>().getReturnType().getCanonicalType();
+                const slang::ast::Type& rt = vpi::subrReturnType(*o->sym).getCanonicalType();
                 if (rt.isFloating()) return vpiRealFunc;
                 if (rt.isPredefinedInteger()) {
                     auto k = rt.as<slang::ast::PredefinedIntegerType>().integerKind;
@@ -2714,7 +2897,8 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
             return 0;
         case vpiAutomatic:
             if (o->kind == Obj::Scope && (o->type == vpiTask || o->type == vpiFunction))
-                return o->sym->as<slang::ast::SubroutineSymbol>().defaultLifetime == slang::ast::VariableLifetime::Automatic;
+                return o->sym->kind != SymbolKind::Subroutine ||
+                       o->sym->as<slang::ast::SubroutineSymbol>().defaultLifetime == slang::ast::VariableLifetime::Automatic;
             if (o->kind == Obj::Signal && o->sym->kind == SymbolKind::Variable)
                 return o->sym->as<slang::ast::VariableSymbol>().lifetime == slang::ast::VariableLifetime::Automatic;
             return 0;
@@ -2759,6 +2943,27 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
         vpi::codeGetStr(prop, o, r, have);
         return have ? vpi::retStr(r) : nullptr;
     }
+    if (o->kind == Obj::InterModPath && prop != vpiType) return nullptr;
+    if ((o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) && prop != vpiType) {
+        std::string r;
+        return vpi::tchkGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
+    }
+    if ((o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) && prop != vpiType) {
+        std::string r;
+        return vpi::constrGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
+    }
+    if ((o->kind == Obj::Prim || o->kind == Obj::PrimTerm) && prop != vpiType) {
+        std::string r;
+        return vpi::primGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
+    }
+    if ((o->kind == Obj::ModPath || o->kind == Obj::PathTerm) && prop != vpiType) {
+        std::string r;
+        return vpi::pathGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
+    }
+    if ((o->kind == Obj::ClassDefn || o->kind == Obj::Extends) && prop != vpiType) {   // 37.29
+        std::string r;
+        return vpi::classGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
+    }
     if ((o->kind == Obj::Fsm || o->kind == Obj::FsmState) && prop != vpiType) {   // 40.5.2
         const FsmDef& d = fsmDefs()[(size_t)o->idx];
         std::string name = o->kind == Obj::Fsm ? d.name : d.states[o->pos].second;
@@ -2802,6 +3007,7 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
             case Obj::Typespec:
                 // A typedef's name; a built-in or anonymous type has none.
                 if (x->ty->kind == SymbolKind::TypeAlias) return full ? vpi::fullName(*x->ty) : std::string(x->ty->name);
+                if (x->ty->kind == SymbolKind::ClassType) return full ? x->ty->getHierarchicalPath() : std::string(x->ty->name);   // 8.3
                 return "";
             case Obj::Arg:
             case Obj::Const:
@@ -2902,7 +3108,9 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
     if (o->kind == Obj::Iter || o->kind == Obj::Callback || o->kind == Obj::Systf || o->kind == Obj::Module ||
         o->kind == Obj::Scope || o->kind == Obj::Typespec || o->kind == Obj::Member || o->kind == Obj::Range ||
         o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
-        o->kind == Obj::ClassObj) {
+        o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends || o->kind == Obj::InterModPath || o->kind == Obj::Tchk || o->kind == Obj::TchkTerm ||
+        o->kind == Obj::ModPath || o->kind == Obj::PathTerm || o->kind == Obj::Prim || o->kind == Obj::PrimTerm ||
+        o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) {
         vpi::error(vpiError, "vpi_get_value: the object has no value");
         return;
     }
@@ -3010,10 +3218,80 @@ inline bool delayCount(p_vpi_delay d, const char* who) {
     }
     return true;
 }
+// The delays of an inter-module path as VPI gives them: 1, 2, 3, 6 or 12
+// of the 12 transitions, with pulse limits.
+inline bool imDelayCount(p_vpi_delay d, const char* who) {
+    if (!d || !d->da) { error(vpiError, std::string(who) + ": no delay structure"); return false; }
+    int n = d->no_of_delays;
+    if (n != 1 && n != 2 && n != 3 && n != 6 && n != 12) {
+        error(vpiError, std::string(who) + ": an inter-module path has 1, 2, 3, 6 or 12 delays");
+        return false;
+    }
+    return true;
+}
+inline void imGetDelays(const Obj* o, p_vpi_delay d) {
+    Delay12 z;
+    auto it = S.icDelay.find(o->sig);
+    const Delay12& v = it == S.icDelay.end() ? z : it->second;
+    int per = (d->mtm_flag ? 3 : 1) * (d->pulsere_flag ? 3 : 1);
+    for (int k = 0; k < d->no_of_delays; k++) {
+        uint64_t vals[3] = {v.d[k], v.rj[k], v.er[k]};
+        for (int q = 0; q < (d->pulsere_flag ? 3 : 1); q++)
+            for (int m = 0; m < (d->mtm_flag ? 3 : 1); m++) {
+                p_vpi_time t = &d->da[k * per + q * (d->mtm_flag ? 3 : 1) + m];
+                t->type = d->time_type;
+                fillTime(t, o->items.empty() ? nullptr : O(o->items[1]), vals[q]);
+            }
+    }
+}
+inline void imPutDelays(const Obj* o, p_vpi_delay d) {
+    int per = (d->mtm_flag ? 3 : 1) * (d->pulsere_flag ? 3 : 1);
+    std::vector<uint64_t> dv, rv, ev;
+    const Obj* port = O(o->items[1]);
+    for (int k = 0; k < d->no_of_delays; k++) {
+        auto at = [&](int q) {
+            s_vpi_time t = d->da[k * per + q * (d->mtm_flag ? 3 : 1) + (d->mtm_flag ? 1 : 0)];   // typical
+            t.type = d->time_type;
+            return (uint64_t)std::max<int64_t>(0, sigTicks(&t, port));
+        };
+        uint64_t x = at(0);
+        dv.push_back(x);
+        rv.push_back(d->pulsere_flag ? at(1) : rejectOf(x));
+        ev.push_back(d->pulsere_flag ? at(2) : x * (uint64_t)std::max(pulseOpts().errorPct, pulseOpts().rejectPct) / 100);
+    }
+    auto D = expand12(dv), R = expand12(rv), E = expand12(ev);
+    Delay12& v = S.icDelay[o->sig];
+    for (int k = 0; k < 12; k++) {
+        v.d[k] = d->append_flag ? v.d[k] + D[(size_t)k] : D[(size_t)k];
+        v.rj[k] = d->append_flag ? v.rj[k] + R[(size_t)k] : R[(size_t)k];
+        v.er[k] = d->append_flag ? v.er[k] + E[(size_t)k] : E[(size_t)k];
+    }
+    if (S.timedOut.size() < S.sigs.size()) S.timedOut.resize(S.sigs.size(), 0);
+    if (S.pathIn.size() < S.sigs.size()) S.pathIn.resize(S.sigs.size(), 0);
+    if (S.lastChg.size() < S.sigs.size()) S.lastChg.resize(S.sigs.size(), 0);
+    S.timedOut[(size_t)o->sig] = 1;
+}
 }   // namespace vpi
 void vpi_get_delays(vpiHandle h, p_vpi_delay d) {
     vpi::clearErr();
     Obj* o = O(h);
+    if (o && o->kind == Obj::InterModPath) {   // 38.21
+        if (vpi::imDelayCount(d, "vpi_get_delays")) vpi::imGetDelays(o, d);
+        return;
+    }
+    if (o && o->kind == Obj::ModPath) {   // 38.10
+        if (vpi::pathDelayCount(d, "vpi_get_delays")) vpi::pathGetDelays(o, d);
+        return;
+    }
+    if (o && (o->kind == Obj::Prim || o->kind == Obj::ContAssign)) {   // 38.10
+        if (vpi::primDelayCount(o, d, "vpi_get_delays")) vpi::primGetDelays(o, d);
+        return;
+    }
+    if (o && o->kind == Obj::Tchk) {   // 38.10: the limits
+        if (!d || !d->da || d->no_of_delays < 1) { vpi::error(vpiError, "vpi_get_delays: no delay structure"); return; }
+        vpi::tchkGetDelays(o, d);
+        return;
+    }
     auto* nd = vpi::netDelays(o, "vpi_get_delays");
     if (!nd || !vpi::delayCount(d, "vpi_get_delays")) return;
     auto& v = *nd;
@@ -3029,6 +3307,23 @@ void vpi_get_delays(vpiHandle h, p_vpi_delay d) {
 void vpi_put_delays(vpiHandle h, p_vpi_delay d) {
     vpi::clearErr();
     Obj* o = O(h);
+    if (o && o->kind == Obj::InterModPath) {   // 38.21
+        if (vpi::imDelayCount(d, "vpi_put_delays")) vpi::imPutDelays(o, d);
+        return;
+    }
+    if (o && o->kind == Obj::ModPath) {   // 38.10
+        if (vpi::pathDelayCount(d, "vpi_put_delays")) vpi::pathPutDelays(o, d);
+        return;
+    }
+    if (o && (o->kind == Obj::Prim || o->kind == Obj::ContAssign)) {   // 38.10
+        if (vpi::primDelayCount(o, d, "vpi_put_delays")) vpi::primPutDelays(o, d);
+        return;
+    }
+    if (o && o->kind == Obj::Tchk) {   // 38.10: the limits
+        if (!d || !d->da || d->no_of_delays < 1) { vpi::error(vpiError, "vpi_put_delays: no delay structure"); return; }
+        vpi::tchkPutDelays(o, d);
+        return;
+    }
     auto* nd = vpi::netDelays(o, "vpi_put_delays");
     if (!nd || !vpi::delayCount(d, "vpi_put_delays")) return;
     std::vector<uint64_t> v;
@@ -3199,9 +3494,57 @@ inline PLI_INT32 control(PLI_INT32 op, va_list ap) {
     error(vpiWarning, "vpi_control: operation " + std::to_string(op) + " is not supported");
     return 0;
 }
-inline vpiHandle handleMulti(PLI_INT32, vpiHandle, vpiHandle, va_list) {
-    error(vpiWarning, "vpi_handle_multi is not supported");
-    return nullptr;
+// vpi_handle_multi(vpiInterModPath, port1, port2) (38.21): the path from
+// an output (or inout) port of one instance to an input (or inout) port of
+// another on the same net, in either order. Its delays are the
+// interconnect delay of the load port (32.4.4).
+inline vpiHandle handleMulti(PLI_INT32 type, vpiHandle a, vpiHandle b, va_list) {
+    if (type != vpiInterModPath) {
+        error(vpiError, "vpi_handle_multi: only vpiInterModPath is defined");
+        return nullptr;
+    }
+    Obj* x = O(a);
+    Obj* y = O(b);
+    if (!x || !y || x->kind != Obj::Port || y->kind != Obj::Port) {
+        error(vpiError, "vpi_handle_multi: vpiInterModPath needs two port handles");
+        return nullptr;
+    }
+    using slang::ast::ArgumentDirection;
+    auto dirOf = [](const Obj* p) { return p->sym->as<PortSymbol>().direction; };
+    auto drives = [&](const Obj* p) { return dirOf(p) == ArgumentDirection::Out || dirOf(p) == ArgumentDirection::InOut; };
+    auto loads = [&](const Obj* p) { return dirOf(p) == ArgumentDirection::In || dirOf(p) == ArgumentDirection::InOut; };
+    if (!(drives(x) && loads(y))) std::swap(x, y);
+    if (!(drives(x) && loads(y))) {
+        error(vpiError, "vpi_handle_multi: vpiInterModPath needs an output and an input port");
+        return nullptr;
+    }
+    auto netOf = [](const Obj* p) -> const Symbol* {
+        const auto& ps = p->sym->as<PortSymbol>();
+        const InstanceSymbol* inst = instOf(ps.getParentScope());
+        const slang::ast::PortConnection* pc = inst ? inst->getPortConnection(ps) : nullptr;
+        return pc ? rootOf(pc->getExpression()) : nullptr;
+    };
+    const Symbol* n = netOf(x);
+    if (!n || n != netOf(y)) {
+        error(vpiError, "vpi_handle_multi: the ports are not connected to one net");
+        return nullptr;
+    }
+    const auto& in = y->sym->as<PortSymbol>();
+    Obj* lv = in.internalSymbol && ValueSymbol::isKind(in.internalSymbol->kind) ? valueObj(in.internalSymbol) : nullptr;
+    if (!lv || lv->sig < 0 || in.internalSymbol->kind != SymbolKind::Net) {
+        error(vpiError, "vpi_handle_multi: the input port is not a net (an interconnect delay needs one)");
+        return nullptr;
+    }
+    auto& slot = st().pairObjs[{x->sym, y->sym}];
+    if (!slot) {
+        slot = mkObj(Obj::InterModPath, vpiInterModPath);
+        slot->parent = x;   // the source port
+        slot->sym = y->sym; // the load port
+        slot->items = {H(x), H(y)};
+        slot->sig = lv->sig;
+        slot->w = lv->w;
+    }
+    return H(slot);
 }
 // The elements a value-array call covers: `num` elements from the one at
 // `index`, toward the right bound, going on from the left bound after it.
@@ -3366,10 +3709,6 @@ vpiHandle vpi_register_assertion_cb(vpiHandle assertion, PLI_INT32 reason, vpi_a
     if (!fn) { vpi::error(vpiError, "vpi_register_assertion_cb: no callback routine"); return nullptr; }
     if (!vpi::assertReason(reason)) {
         vpi::error(vpiError, "vpi_register_assertion_cb: reason " + std::to_string(reason) + " is not an assertion callback reason");
-        return nullptr;
-    }
-    if (reason == cbAssertionStepSuccess || reason == cbAssertionStepFailure) {
-        vpi::error(vpiError, "vpi_register_assertion_cb: assertion stepping (39.5.2) is not supported");
         return nullptr;
     }
     if (asserts()[(size_t)a->idx].prot) { vpi::error(vpiError, "vpi_register_assertion_cb: the assertion is protected"); return nullptr; }
