@@ -1,0 +1,5 @@
+1 on: q=5 r=5
+2 mode from the pmu: q=a r=5
+3 isolated by the pmu: q=f r=5
+4 repeater supply off: q=a r=x
+5 repeater supply on: q=a r=5
