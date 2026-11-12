@@ -142,3 +142,44 @@ foreach(n 1 2 3 4)
   execute_process(COMMAND ${MPLAN} check ${OUT}/bad${n}.vplan RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
   expect("bad plan ${n}" ${rc} 2 "${out}" "bad${n}\\.vplan(:[0-9]+)?: ")
 endforeach()
+
+# Requirements: a CSV list named by the plan, the matrix, the gate, the trend column.
+set(TRACED ${SRC}/tests/plan/traced.vplan)
+execute_process(COMMAND ${MPLAN} check ${TRACED} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqs check" ${rc} 0 "${out}" "6 requirement\\(s\\), 5 named by a feature" "no feature verifies: CNT-5  Parity output"
+       "warning: feature reset names requirement 'CNT-9'")
+execute_process(COMMAND ${MPLAN} report ${TRACED} -results ${OUT}/r1 -o ${OUT}/tplan -label t1 -trace ${OUT}/trace.csv -fail-on-uncovered
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqs report" ${rc} 1 "${out}" "requirements: 3/6 verified, 1 not started, 1 failing, 1 uncovered"
+       "failing +CNT-3  Scoreboard agrees  \\(scoreboard 0\\.0%\\)" "uncovered +CNT-5  Parity output"
+       "gate: 1 uncovered requirement\\(s\\), 1 unknown id\\(s\\)")
+file(READ ${OUT}/trace.csv csv)
+foreach(rx "CNT-1,Counting,,,verified,100\\.0,,," "CNT-1\\.2,Wrap around,CNT-1,high,verified,100\\.0,count\\.wrap,,count_wrap"
+           "CNT-3,Scoreboard agrees,,medium,failing,0\\.0,scoreboard,,sb_\\*" "CNT-5,Parity output,,low,uncovered,0\\.0,,,")
+  if(NOT csv MATCHES "${rx}")
+    message(FATAL_ERROR "trace.csv lacks '${rx}'\n${csv}")
+  endif()
+endforeach()
+file(READ ${OUT}/tplan/plan.html page)
+foreach(rx "<h2>Requirements</h2>" "requirements verified \\(1 uncovered\\)" "verifies CNT-1\\.2")
+  if(NOT page MATCHES "${rx}")
+    message(FATAL_ERROR "plan.html lacks '${rx}'")
+  endif()
+endforeach()
+execute_process(COMMAND ${MPLAN} trend ${OUT}/tplan/history.jsonl RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqs trend" ${rc} 0 "${out}" "Buckets +Reqs" " 3/6 ")
+
+# The same requirements from ReqIF (-reqs), with the hierarchy and the XHTML text; a draft plan from them.
+file(WRITE ${OUT}/rq.vplan "plan rq\n  feature count\n    req CNT-1.1 CNT-1.2\n    test count_*\n  feature sb\n    req CNT-2\n    test sb_*\n")
+execute_process(COMMAND ${MPLAN} report ${OUT}/rq.vplan -reqs ${SRC}/tests/plan/reqs.reqif -results ${OUT}/r1 -o ${OUT}/rqplan -no-history
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqif report" ${rc} 0 "${out}" "requirements: 2/3 verified, 1 failing" "failing +CNT-2  Reset  \\(sb 0\\.0%\\)")
+file(READ ${OUT}/rqplan/plan.json js)
+if(NOT js MATCHES "\"id\": \"CNT-1\\.1\", \"parent\": \"CNT-1\"" OR NOT js MATCHES "q follows dir, one step per clock")
+  message(FATAL_ERROR "plan.json lacks the ReqIF hierarchy or text")
+endif()
+execute_process(COMMAND ${MPLAN} init -reqs ${SRC}/tests/plan/reqs.reqif -name cnt RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("reqif init" ${rc} 0 "${out}" "feature CNT-1 \"Counting\"\n    feature CNT-1_1 \"Count up and down\"\n      req CNT-1\\.1" "feature CNT-2 \"Reset\"\n    req CNT-2")
+file(WRITE ${OUT}/bad.csv "name,text\nx,y\n")
+execute_process(COMMAND ${MPLAN} check ${OUT}/rq.vplan -reqs ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("bad reqs" ${rc} 2 "${out}" "bad\\.csv: no 'id' column")

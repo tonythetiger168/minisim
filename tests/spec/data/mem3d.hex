@@ -1,0 +1,5 @@
+// a 3x2x2 memory, highest dimension by address (21.4.3)
+@1
+10 11 12 13
+@0 00 01 02 03
+@2 20 21 22 23
