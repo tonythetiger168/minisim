@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
+  and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
+  with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
+  board is the built-in `virt32` or a JSON platform file with RAM/ROM, a 16550
+  UART, CLINT, PLIC and the test finisher; ELF and HTIF are supported.
+  Several harts run on several threads, and the result does not depend on the
+  thread count. A spike-style commit log, a decoded-instruction cache (about
+  160 MIPS on one hart) and RAM mapped on first touch are included. Its
+  headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
+  is the interface of the licensed extension library: gdb, checkpoints, the
+  profile, model libraries and RTL co-simulation.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
@@ -146,6 +157,12 @@ Spec references are IEEE 1800-2023 clauses.
   `connect_supply_net -pg_type` with `-cells`, `-domain`, `-elements` (6.14),
   `connect_supply_set -connect` (6.15), and the automatic connection of a
   domain's primary supply set (4.5.4.6.2).
+- Forward SAIF (IEEE 1801-2024 Annex J): `msim -saif_forward <file>`. A
+  library forward file (J.4) adds state-dependent, path-dependent and SDPD
+  toggle counts and state-dependent leakage times for each instance of its
+  cells (J.3.6 to J.3.10); an RTL forward file (J.5) writes only its mapped
+  ports and nets, typed ports as virtual instances (J.3.11). The SAIF reader
+  takes `(INSTANCE "design" path ..)` and `VIRTUAL_INSTANCE`.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.
@@ -971,6 +988,12 @@ Spec references are IEEE 1800-2023 clauses.
   state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
+- A function that writes part-selects of its result or of a local in a
+  loop, called from two continuous assignments or always_comb blocks, hung
+  msim at time 0: each caller was sensitive to the function's own variables,
+  so the callers woke each other forever. Callers are now sensitive only to
+  their operands (10.3.2, 9.2.2.2.1). Five open-ip-portfolio IPs that timed
+  out after 600 s now pass in 2 to 101 s (AES_GCM 27.5 s; Icarus 30 s).
 - `c ? q.pop_front() : d` (and `pop_back`) runs the pop only in the chosen
   arm, after the condition (11.4.11). It used to pop first, so a condition
   on `q.size()` popping the last element gave `d` and lost the element.
