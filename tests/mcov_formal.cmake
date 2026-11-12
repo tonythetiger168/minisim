@@ -52,6 +52,16 @@ if(NOT fel MATCHES "\nstate tb\\.u\\.state FAIL  -- unreachable: mformal" OR fel
    OR NOT out MATCHES "state tb\\.u\\.state RUN: proven unreachable but the tests covered it")
   message(FATAL_ERROR "state targets:\n${out}\n${fel}")
 endif()
+# Without -formal-scope, the instance of mformal's top module is found even
+# when another FSM has the same register name (tb.v.st is module one, tb.w.ph ifs).
+file(WRITE ${OUT}/one.json [=[{"tool": "mformal", "properties": [
+  {"name": "one.st==S2", "kind": "cover", "result": "unreachable", "mcov": "trans one.st S2->S0"}]}
+]=])
+execute_process(COMMAND ${MCOV} exclude a.json -formal one.json -o one.el WORKING_DIRECTORY ${OUT} OUTPUT_VARIABLE out)
+file(READ ${OUT}/one.el oel)
+if(NOT oel MATCHES "\ntrans tb\\.v\\.st S2->S0  -- unreachable")
+  message(FATAL_ERROR "scope from the top module:\n${out}\n${oel}")
+endif()
 file(WRITE ${OUT}/bad.json "{\"tool\": \"other\"}")
 execute_process(COMMAND ${MCOV} exclude a.json -formal bad.json -o x.el WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_QUIET ERROR_VARIABLE err)
 if(rc EQUAL 0 OR NOT err MATCHES "not an mformal -json result")

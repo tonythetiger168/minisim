@@ -1043,6 +1043,8 @@ def _formal_map(name, ftop, scope, db):
     known = set(db["toggles"]) | {f"{k[1]}.{k[2]}" for k in db["fsms"]} | set(db["insts"])
     base = rest.split("[")[0]
     hits = sorted({k[: len(k) - len(base)] for k in known if k.endswith(base)})
+    if len(hits) > 1 and ftop:   # several: the instances of mformal's top module
+        hits = [h for h in hits if db["insts"].get(h, {}).get("module") == ftop]
     return (hits[0] + rest) if len(hits) == 1 else None
 
 
