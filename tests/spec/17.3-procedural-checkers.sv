@@ -21,7 +21,7 @@ endchecker
 checker c2(logic [7:0] x, event ck = $inferred_clock);
   px: assert property (@ck x != 3) else $display("%0t px fail %m", $time);
 endchecker
-checker c3(logic y);
+checker c3(logic [7:0] y);
   c2 inner(y);   // static in c3: queued with c3's procedural instance
 endchecker
 module m;
