@@ -557,6 +557,11 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `break` and `continue` in `while`, `do ... while`, `repeat` and
+  `forever` loops are merged; once a break or the condition of an unbounded
+  loop is unknown, what the loop assigns becomes x. Fixed: a `foreach` or
+  `repeat` loop whose body met an unknown condition in the clean copy
+  continued with a stale loop counter.
 - `-xprop`: a configuration file (`-xprop=<file>` or `-xprop-config <file>`,
   VCS style: `tree`, `instance`, `module`, `merge`) turns X-propagation on or
   off per instance, subtree or module. Branches that call tasks or functions
