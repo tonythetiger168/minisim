@@ -907,24 +907,11 @@ def _owner(k):
     return ("assert", k[1])
 
 
-def _run_items(path):
-    """One run's coverage in a worker: (path, layout digest, hit mask over the run's own item order).
-
-    Runs of one design list the same items in the same order, so the main process keeps one
-    layout per digest and only remaps a run whose layout differs."""
-    import hashlib
-    import pickle
-    try:
-        _p, all_, hit = tool("mcov")._rank_load(path)
-    except (OSError, ValueError, KeyError):
-        return path, None, 0
-    hs = set(hit)
-    bits = "".join("1" if k in hs else "0" for k in reversed(all_))
-    return path, hashlib.blake2b(pickle.dumps(all_, 4), digest_size=16).hexdigest(), int(bits, 2) if bits else 0
-
-
 class Points:
-    """Every test's coverage as one bit mask over mcov's items (all seeds of a test together)."""
+    """Every test's coverage as one bit mask over mcov's items (all seeds of a test together).
+
+    The masks are mcov's own (mcov._rank_mask in the workers, mcov.test_layout for the
+    layout, mcov._remap for a run whose layout differs), the same items mcov rank counts."""
 
     def __init__(self, runs, jobs, include_failing=False):
         mcov = tool("mcov")
@@ -933,51 +920,54 @@ class Points:
         want = [r for r in runs if (include_failing or tests[r["test"]]["status"] == "pass") and r.get("log")]
         paths = [os.path.join(r["_dir"], os.path.dirname(r["log"]), "cov.json") for r in want]
         todo = [p for p in paths if os.path.exists(p)]
-        loaded = None
+        got = None
         if jobs > 1 and len(todo) > 1:
             try:
                 with cf.ProcessPoolExecutor(max_workers=min(jobs, len(todo))) as pool:
-                    loaded = list(pool.map(_run_items, todo, chunksize=max(1, len(todo) // (4 * jobs))))
+                    got = list(pool.map(mcov._rank_mask, todo, chunksize=max(1, len(todo) // (4 * jobs))))
             except SystemExit:
                 raise
             except Exception:           # no fork / not picklable here: read them one by one
-                loaded = None
-        if loaded is None:
-            loaded = [_run_items(p) for p in todo]
-        # Number the items in run order (the first run's layout first), so the result does not
-        # depend on the worker count. Each distinct layout is read once more here to learn its items.
-        index, remap = {}, {}
-        for path, digest, _ in loaded:
-            if digest is None or digest in remap:
-                continue
-            _p, all_, _h = mcov._rank_load(path)
-            pos = []
-            for k in all_:
-                i = index.get(k)
-                if i is None:
-                    i = index[k] = len(index)
-                pos.append(i)
-            remap[digest] = None if pos == list(range(len(pos))) else pos
-        self.index, self.total = index, len(index)
-        hit_of = {}
-        for path, digest, m in loaded:
-            if digest is None:
-                continue
-            pos = remap[digest]
-            if pos is not None and m:      # another layout: move its bits to the common numbering
-                out, i = 0, 0
-                while m:
-                    if m & 1:
-                        out |= 1 << pos[i]
-                    m >>= 1
-                    i += 1
-                m = out
-            hit_of[path] = m
+                got = None
+        if got is None:
+            got = [mcov._rank_mask(p) for p in todo]
+        # One layout per digest, in run order, so the numbering does not depend on the worker count.
+        layouts = {}
+        for p, g in zip(todo, got):
+            if g[0] not in layouts:
+                sg, tg, _m, _n = mcov.test_layout(mcov.load(p))
+                layouts[g[0]] = (sg, tg)
+        if len(layouts) <= 1:
+            singles, togs = next(iter(layouts.values()), ([], []))
+            masks = {p: g[1] for p, g in zip(todo, got)}
+            self.total = got[0][2] if got else 0
+        else:                           # several design versions: move every mask onto the union
+            singles, index = [], {}
+            for sg, _ in layouts.values():
+                for k in sg:
+                    if k not in index:
+                        index[k] = len(singles)
+                        singles.append(k)
+            togs, togoff = [], []
+            off = (len(singles) + 7) // 8 * 8
+            for _, tg in layouts.values():
+                for name, w in tg:
+                    k = ("T", name, w)
+                    if k not in index:
+                        index[k] = len(togoff)
+                        togoff.append(off)
+                        togs.append((name, w))
+                        off += (2 * w + 7) // 8 * 8
+            togoff.append(off)
+            dst = (singles, None, index, togoff)
+            masks = {p: mcov._remap(g[1], layouts[g[0]], dst) for p, g in zip(todo, got)}
+            self.total = len(singles) + sum(2 * w for _, w in togs)
+        self.layout = (singles, togs)
         self.mask, self.seconds = {}, {}
         for r, p in zip(want, paths):
             name = r["test"]
             self.seconds[name] = self.seconds.get(name, 0.0) + r.get("seconds", 0.0)
-            m = hit_of.get(p)
+            m = masks.get(p)
             if m is None:
                 self.mask.setdefault(name, None)
                 continue
@@ -990,16 +980,19 @@ class Points:
     def owner_masks(self):
         """(kind, name) -> the bits of that file / signal / FSM / covergroup item / assertion."""
         if self._owners is None:
-            bits = {}
-            for k, i in self.index.items():
-                bits.setdefault(_owner(k), []).append(i)
-            nb = (self.total + 7) // 8
-            self._owners = {}
-            for o, ii in bits.items():
-                buf = bytearray(nb)
-                for i in ii:
-                    buf[i >> 3] |= 1 << (i & 7)
-                self._owners[o] = int.from_bytes(buf, "little")
+            singles, togs = self.layout
+            nb = (len(singles) + 7) // 8
+            bufs = {}
+            for i, k in enumerate(singles):
+                buf = bufs.get(_owner(k))
+                if buf is None:
+                    buf = bufs[_owner(k)] = bytearray(nb)
+                buf[i >> 3] |= 1 << (i & 7)
+            self._owners = {o: int.from_bytes(b, "little") for o, b in bufs.items()}
+            off = nb * 8
+            for name, w in togs:
+                self._owners[("toggle", name)] = self._owners.get(("toggle", name), 0) | (((1 << (2 * w)) - 1) << off)
+                off += (2 * w + 7) // 8 * 8
         return self._owners
 
 
