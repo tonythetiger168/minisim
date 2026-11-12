@@ -36,6 +36,7 @@ set(MINISIM_CORE_HEADERS
     lower_xprop.inc
     parallel.hpp
     prog.hpp
+    profile.hpp
     protect.hpp
     protect_front.hpp
     rand.inc
@@ -53,6 +54,13 @@ set(MINISIM_CORE_HEADERS
     upf_vct.hpp
     upf_rt.inc
     vpi.inc
+    vpi_code.inc
+    vpi_covmerge.inc
+    vpi_data.inc
+    vpi_prim.inc
+    vpi_constr.inc
+    vpi_svcb.inc
+    vpi_tchk.inc
     wave_reader.hpp)
 
 add_library(minisim_core INTERFACE)

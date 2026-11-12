@@ -102,6 +102,7 @@ public:
             if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %zu clocked processes, %zu NBAs, %zu comb statements\n", dom.size(), nba, comb);
             if (comb > 64 && comb > 64 * nba && !getenv("MSIM_XCYC")) dom.clear();
         }
+        if (!dom.empty()) wakeEvents(procs, dom);
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
         std::vector<CodegenProc> wideProcs;
         if (!dom.empty() && privates && !std::getenv("MSIM_NOWIDE")) wideProcs = splitWide(procs, dom);
@@ -185,8 +186,9 @@ public:
              "    auto u = [&] { char* e; uint64_t v = std::strtoull(p, &e, 16); p = e; return v; };\n"
              "    auto i = [&] { char* e; long v = std::strtol(p, &e, 10); p = e; return (int)v; };\n"
              "    if (*p == 'S') { p++; return *XSL[i()]; }\n"
-             "    Op op = Op(i()); Val k; k.v = u(); k.x = u(); k.w = i(); k.z = u(); k.sgn = i();\n"
+             "    Op op = Op(i()); Val k; k.v = u(); k.x = u(); k.w = i(); k.z = u(); int fl = i(); k.sgn = fl & 1; k.real = fl & 2;\n"
              "    if (int nl = i()) { k.hi.resize(nl); for (int j = 0; j < nl; j++) { k.hi[j].v = u(); k.hi[j].x = u(); k.hi[j].z = u(); } }\n"
+             "    if (fl & 4) { int n = i(); p++; Val s = mkstr(std::string(p, n)); p += n; k.v = s.v; k.str = true; }\n"
              "    int sig = i(), hi = i(), lo = i(); bool sg = i();\n"
              "    std::string f;\n"
              "    if (int fl = i()) { p++; f.assign(p, fl); p += fl; }\n"
@@ -416,6 +418,8 @@ public:
              "    uint64_t maxTime = ~0ULL;\n"
              "    const char* covOut = nullptr;\n"
              "    S.vcdPath = \"\";\n"
+             "    timeFmt().tickExp = timeFmt().units = " << precExp << ";\n"
+             "    S.timescale = " << quote(timescale) << ";\n"
              "    S.threads = defaultThreads();\n"
              "    for (int i = 1; i < argc; i++) {\n"
              "        if (!std::strcmp(argv[i], \"-maxtime\") && i + 1 < argc) maxTime = std::strtoull(argv[++i], nullptr, 10);\n"
@@ -496,26 +500,19 @@ public:
               << tab << "    };\n"
                  "    for (auto& c : COMBS) S.addComb(c.f, nullptr, std::vector<int>(CINS + c.at, CINS + c.at + c.n), c.lv, c.v, c.c);\n";
         }
+        // Declaration initializers take effect before anything waits (6.8):
+        // logic clk = 0 is no negedge for a clocked process registered below.
+        auto isInit = [&](size_t i) { return procs[i].combRank < 0 && !procs[i].seq && procs[i].kind == "init"; };
+        for (size_t i = 0; i < procs.size(); i++)
+            if (isInit(i)) o << "    { Task t = proc" << i << "(); S.all.push_back(t.h); t.h.resume(); }\n";
+        // A waveform opened at run time starts with the initialized values.
+        if (!dom.empty()) o << "    if (!S.vcdPath.empty()) syncInit();\n";
         if (!dom.empty()) {
             o << "    S.fastSeqId = (int)S.seqs.size();\n    S.addSeq(dseq, nullptr, {";
             // Every event of every domain process: they wait on copies of the
             // same clocks (see cycleDomain), and one pending mark runs dseq once.
-            for (int g = 0; g < std::max(domGroups_, 1); g++) {
-                // One signal per source and edge: the copies of a source all
-                // change in the same comb pass, so one of them is enough to
-                // wake the group, and the others are then ordinary quiet
-                // signals. A copy rather than the source, when there is one
-                // (the group then runs after that pass).
-                std::vector<std::pair<int, Edge>> ev, key;
-                for (int d : dom)
-                    if (domGroups_ <= 1 || domGroup_[d] == g)
-                        for (auto& e : procs[d].seqEv) {
-                            int rt = e.first >= 0 && (size_t)e.first < domRoot_.size() ? domRoot_[e.first] : e.first;
-                            std::pair<int, Edge> kk{rt, e.second};
-                            auto it = std::find(key.begin(), key.end(), kk);
-                            if (it == key.end()) { key.push_back(kk); ev.push_back(e); }
-                            else if (ev[(size_t)(it - key.begin())].first == rt && e.first != rt) ev[(size_t)(it - key.begin())] = e;
-                        }
+            for (int g = 0; g < (int)domWake_.size(); g++) {
+                const auto& ev = domWake_[g];
                 if (g) o << "    S.addSeq(dseq, (const void*)(intptr_t)" << g << ", {";
                 for (size_t j = 0; j < ev.size(); j++)
                     o << (j ? ", " : "") << "{" << ev[j].first << ", " << edge(ev[j].second) << "}";
@@ -528,7 +525,7 @@ public:
             size_t off = 0, n = 0;
             for (size_t i = 0; i < procs.size(); i++) {
                 if (procs[i].combRank >= 0) continue;
-                if (std::find(dom.begin(), dom.end(), (int)i) != dom.end()) continue;
+                if (std::find(dom.begin(), dom.end(), (int)i) != dom.end() || isInit(i)) continue;
                 n++;
                 if (procs[i].seq) {
                     for (auto& [sg, ed] : procs[i].seqEv) evs += "{" + std::to_string(sg) + ", " + edge(ed) + "},";
@@ -593,6 +590,11 @@ public:
     // file took minutes. Small designs stay one file. Negative: -files files
     // whatever the size (msim -cfiles).
     int files = 1;
+    // One kernel tick = 10^precExp s (the finest `timescale precision).
+    // Delays are already in ticks; simv needs it for %t, $timeformat and
+    // the waveform header.
+    int precExp = -9;
+    std::string timescale = "1ns";
     std::vector<std::pair<const Prog*, size_t>> covSlots;
     std::map<std::pair<const Prog*, size_t>, size_t> covIdx_;
     size_t covSlot(const Prog* p, size_t pc) {
@@ -626,6 +628,7 @@ private:
     // Private signals of the cycle domain (see privateSigs): kept in plain
     // static variables P<s> instead of S.sigs, like Verilator's model members.
     std::vector<char> priv_, sigNet_, clock_;
+    std::string syncPriv_;   // copies every private signal to S.sigs
     // A narrow variable no clocked process waits on: Sim::fastInit marks it
     // quiet, so a write is a store unless a process waits on it (or a VCD
     // or $monitor watches everything). `obs` is S.observed, read once per function.
@@ -710,7 +713,14 @@ private:
         return b;
     }
     static std::string val(const Val& k) {
-        if (k.real || k.str) throw CodegenUnsupported("real or string constant");
+        // A real keeps its double in v. A string is an id into strPool, which
+        // simv fills in its own order: the text is looked up once, at startup.
+        if (k.str)
+            return "([]{ static const Val v = [] { Val s = mkstr(" + quote(v_str(k)) + "); s.w = " + std::to_string(k.w) +
+                   "; s.sgn = " + (k.sgn ? "true" : "false") + "; return s; }(); return v; }())";
+        if (k.real)
+            return "([]{ Val v{" + hex(k.v) + ", " + hex(k.x) + ", " + std::to_string(k.w) + ", " + hex(k.z) + ", " +
+                   (k.sgn ? "true" : "false") + "}; v.real = true; return v; }())";
         std::string base = "Val{" + hex(k.v) + ", " + hex(k.x) + ", " + std::to_string(k.w) + ", " + hex(k.z) +
                            ", " + (k.sgn ? "true" : "false") + "}";
         if (k.hi.empty()) return base;
@@ -738,11 +748,12 @@ private:
         if (auto it = slotNames_.find(e.get()); it != slotNames_.end()) { t += "S" + it->second.substr(2); return; }
         bool ar = e->op == Op::ArrRead;   // only its kids and array count
         const Val k = ar ? Val{} : e->k;
-        if (k.real || k.str) throw CodegenUnsupported("real or string constant");
         char b[96];
+        // flags: 1 signed, 2 real (the double in v), 4 string (the text follows the limbs)
         std::snprintf(b, sizeof b, "%d %llx %llx %d %llx %d %zu", (int)e->op, (unsigned long long)k.v, (unsigned long long)k.x,
-                      k.w, (unsigned long long)k.z, (int)k.sgn, k.hi.size());
+                      k.w, (unsigned long long)k.z, (int)k.sgn | (k.real ? 2 : 0) | (k.str ? 4 : 0), k.hi.size());
         t += b;
+        if (k.str) { const std::string& tx = v_str(k); t += " " + std::to_string(tx.size()) + " " + tx; }
         for (size_t i = 0; i < k.hi.size(); i++) {
             std::snprintf(b, sizeof b, " %llx %llx %llx", (unsigned long long)k.hi[i].v, (unsigned long long)k.hi[i].x,
                           (unsigned long long)k.hi[i].z);
@@ -837,7 +848,6 @@ private:
         // Any other operator (==?, real math, strings, system functions, ...):
         // the interpreter's eval() on the subtree, rebuilt at startup.
         hitPriv(e);
-        val(e->k);   // throws for a real or string constant
         evals_.push_back(e);
         return "eval(ET" + std::to_string(evals_.size() - 1) + ", rd)";
     }
@@ -1289,6 +1299,33 @@ private:
     }
     std::vector<int> domRoot_;    // cycleDomain: per signal, the signal it is a copy of (itself if none)
     std::vector<int> domGroup_;   // cycleDomain: per process, its clock group in the domain (or -1)
+    // The events each clock group of the domain is registered on. One signal
+    // per source and edge: the copies of a source all change in the same comb
+    // pass, so one of them is enough to wake the group. A copy rather than
+    // the source, when there is one (the group then runs after that pass).
+    // The other copies are ordinary signals, and private ones when nothing
+    // else waits on them.
+    std::vector<std::vector<std::pair<int, Edge>>> domWake_;
+    void wakeEvents(const std::vector<CodegenProc>& procs, const std::vector<int>& dom) {
+        domWake_.clear();
+        for (int g = 0; g < std::max(domGroups_, 1); g++) {
+            std::vector<std::pair<int, Edge>> ev, key;
+            for (int d : dom)
+                if (domGroups_ <= 1 || domGroup_[d] == g)
+                    for (auto& e : procs[d].seqEv) {
+                        int rt = e.first >= 0 && (size_t)e.first < domRoot_.size() ? domRoot_[e.first] : e.first;
+                        std::pair<int, Edge> kk{rt, e.second};
+                        auto it = std::find(key.begin(), key.end(), kk);
+                        if (it == key.end()) { key.push_back(kk); ev.push_back(e); }
+                        else if (ev[(size_t)(it - key.begin())].first == rt && e.first != rt) ev[(size_t)(it - key.begin())] = e;
+                    }
+            domWake_.push_back(std::move(ev));
+        }
+    }
+    bool wakeSig(int s) const {
+        for (auto& g : domWake_) for (auto& e : g) if (e.first == s) return true;
+        return false;
+    }
     int domGroups_ = 0;
 
     // A signal is private to the cycle domain when only the domain uses it
@@ -1312,7 +1349,9 @@ private:
             for (auto& k : e->kids) refs(k);
         };
         for (size_t i = 0; i < procs.size(); i++) {
-            for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns) bad[sg] = 1;
+            // A clock or reset stays in S.sigs when a process waits on it: the
+            // domain waits on its wake signals only (wakeEvents).
+            for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns && (!mine[i] || procs[i].combRank >= 0 || wakeSig(sg))) bad[sg] = 1;
             if (procs[i].combRank >= 0) {
                 for (auto& in : procs[i].prog->code) {
                     if (in.k == IK::WaitEdge) break;
@@ -1328,7 +1367,9 @@ private:
                     // The outputs of one always_comb with if / case: any
                     // number of whole or part writes, all from this process.
                     else if (in.drv < 0 && !in.tmp && sigs[in.sig].drivers == 0 && !in.arr && in.aidx.empty() &&
-                             (!cand[in.sig] || owner[in.sig] == (int)i || sigs[in.sig].w > 64)) {   // wide: see splitWide
+                             (!cand[in.sig] || owner[in.sig] == (int)i || sigs[in.sig].w > 64 || (in.hi >= 0 && owner[in.sig] >= 0))) {
+                        // wide: see splitWide. Part writes from several processes: the
+                        // assigns of single bits or fields that msim merged (mergePartialDrivers).
                         cand[in.sig] = 1;
                         owner[in.sig] = (int)i;
                     } else bad[in.sig] = 1;
@@ -1785,8 +1826,9 @@ private:
     void emitCycle(std::ostream& o, const std::vector<CodegenProc>& procs, const std::vector<int>& dom,
                    const std::vector<int>& byRank) {
         clock_.assign(sigW_.size(), 0);
-        for (auto& pr : procs)
-            for (auto& [sg, ed] : pr.seqEv) if (sg >= 0 && (size_t)sg < clock_.size()) clock_[sg] = 1;
+        for (size_t i = 0; i < procs.size(); i++)
+            for (auto& [sg, ed] : procs[i].seqEv)
+                if (sg >= 0 && (size_t)sg < clock_.size() && (wakeSig(sg) || std::find(dom.begin(), dom.end(), (int)i) == dom.end())) clock_[sg] = 1;
         // Copies and dead logic. A private signal whose one write is a
         // whole copy of another private signal (a port connection) is that
         // signal under another name: the domain reads the source instead.
@@ -1969,11 +2011,20 @@ private:
         std::vector<int> privs;
         for (size_t s = 0; s < priv_.size(); s++) if (priv_[s]) privs.push_back((int)s);
         // Only when something watches every change (a VCD opened at run time).
-        o << "static void combDead();\nstatic void syncP() {\n    combDead();\n";
+        syncPriv_.clear();
         for (int s : privs)
             if (origOf(s) == s)
-                o << "    S.fw(" << s << ", Val{P" << s << ".v, P" << s << ".x, " << sigW_[s] << ", P" << s << ".z, false});\n";
-        for (auto& [sg, ps] : pieces_) o << "    S.fw(" << sg << ", " << ex(piecesOf(sg, sigW_[sg] - 1, 0)) << ");\n";
+                syncPriv_ += "    S.fw(" + std::to_string(s) + ", Val{P" + std::to_string(s) + ".v, P" + std::to_string(s) + ".x, " +
+                             std::to_string(sigW_[s]) + ", P" + std::to_string(s) + ".z, false});\n";
+        for (auto& [sg, ps] : pieces_) syncPriv_ += "    S.fw(" + std::to_string(sg) + ", " + ex(piecesOf(sg, sigW_[sg] - 1, 0)) + ");\n";
+        o << "static void combDead();\nstatic void syncP() {\n    combDead();\n" << syncPriv_ << "}\n";
+        // Before the kernel starts (no waiters yet): the values only.
+        o << "static void syncInit() {\n";
+        for (int s : privs)
+            if (origOf(s) == s)
+                o << "    { Val& g = S.sigs[" << s << "].val; g.v = P" << s << ".v; g.x = P" << s << ".x; g.z = P" << s << ".z; }\n";
+        for (auto& [sg, ps] : pieces_)
+            o << "    { Val v = " << ex(piecesOf(sg, sigW_[sg] - 1, 0)) << "; Val& g = S.sigs[" << sg << "].val; g.v = v.v; g.x = v.x; g.z = v.z; g.hi = v.hi; }\n";
         o << "}\n";
         // Comb statements first: their reads are part of `ext`, which twoNow checks.
         // One unit per straight-line assign, or per process with if / case
@@ -2073,10 +2124,15 @@ private:
                     if (in.k == IK::JmpIfNot) {
                         noteRefs(in.e);
                         unitConds.back().push_back(in.e);
-                        c4 += L4(pc) + ":" + jmpIfNot(in, fast(in.e), "goto " + L4(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L4(in.xt) + ";");
                         std::string g, u, sl;
+                        // A known condition is a plain test; the Val and truth() only when a bit is unknown.
+                        bool sp = split(in.e, g, u, sl);
+                        std::string slow4 = jmpIfNot(in, sp ? sl : fast(in.e), "goto " + L4(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L4(in.xt) + ";");
+                        if (sp && g.empty()) c4 += L4(pc) + ": if (!(" + u + ")) goto " + L4(in.target) + ";\n";
+                        else if (sp) c4 += L4(pc) + ": if (__builtin_expect(" + g + ", 1)) { if (!(" + u + ")) goto " + L4(in.target) + "; } else {" + slow4 + " }\n";
+                        else c4 += L4(pc) + ":" + slow4;
                         // Every signal read is known here (twoNow, and no bail so far).
-                        if (split(in.e, g, u, sl)) c2 += L2(pc) + ": if (!(" + u + ")) goto " + L2(in.target) + ";\n";
+                        if (sp) c2 += L2(pc) + ": if (!(" + u + ")) goto " + L2(in.target) + ";\n";
                         else c2 += L2(pc) + ":" + jmpIfNot(in, sl, "goto " + L2(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L2(in.xt) + ";");
                         continue;
                     }
@@ -2135,9 +2191,13 @@ private:
         for (int s : privs) if (!scratch(s) && !deadSig[s])
             o << "    if (P" << s << ".x) std::fprintf(stderr, \"4-state (private): %s\\n\", S.sigs[" << origOf(s) << "].name.c_str());\n";
         o << "}\n";
-        o << "static void scanP() {\n    uint64_t x = 0;\n";
+        // While some register keeps an unknown value (one without a reset),
+        // the scan finds it every time: look again after 1, 3, 7 ... 255
+        // passes only. pclean = false is always safe (the 4-state pass runs).
+        o << "static void scanP() {\n    static unsigned skip = 0, wait = 0;\n"
+             "    if (wait) { wait--; pclean = false; return; }\n    uint64_t x = 0;\n";
         for (int s : privs) if (!scratch(s) && !deadSig[s]) o << "    x |= P" << s << ".x;\n";
-        o << "    pclean = x == 0;\n}\n";
+        o << "    pclean = x == 0;\n    skip = x ? (skip < 255 ? skip * 2 + 1 : 255) : 0;\n    wait = skip;\n}\n";
         o << "static void (*const DS[])() = {";
         for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j];
         o << "};\n";
@@ -2653,11 +2713,14 @@ private:
 inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                            const CodegenParts& parts = {}, bool twoState = true, bool cycle = true,
                            bool privates = true,
-                           std::vector<std::pair<const Prog*, size_t>>* covSlots = nullptr, int split = 1) {
+                           std::vector<std::pair<const Prog*, size_t>>* covSlots = nullptr, int split = 1,
+                           int precExp = -9, const std::string& timescale = "1ns") {
     std::set<int> noPriv;
     for (int pass = 0;; pass++) {
         Codegen g;
         g.files = split;
+        g.precExp = precExp;
+        g.timescale = timescale;
         g.twoState = twoState;
         g.cycle = cycle;
         g.privates = privates && pass < 8;   // each pass keeps the signals the last one tripped on in S.sigs
