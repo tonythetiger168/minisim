@@ -44,6 +44,12 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `mdebug` reads a waveform on demand: the signal list first, then each
+  signal's changes when a query or the page first needs it (the `-html`
+  page in blocks of 2048 signals). On a 1024-core generated SoC (23305
+  signals, 384 MB FST) a script query takes 1 s and 113 MB, `-serve` 157 MB,
+  `-html` 1.6 GB, where every one of them ran out of memory before.
+  `wave::Reader::lazy`, `fetch()` and `release()` give other tools the same.
 - `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
   the object a module's class handle variable points to is a signal
   `tb.p.addr` that follows the handle (x while it is null), with handle
