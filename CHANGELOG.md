@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- The `minisimCore` package installs `compat.hpp`, so a tool built against the
+  installed kernel can register its vendor command-line rules too.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
