@@ -12,7 +12,8 @@ Spec references are IEEE 1800-2023 clauses.
   width with subnormals and all five rounding modes: `MW_fp_add`,
   `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
   `MW_fp_cmp` (with minimumNumber / maximumNumber), `MW_fp_i2flt`,
-  `MW_fp_flt2i` and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
+  `MW_fp_flt2i`, `MW_fp_mac` (fused multiply-add), `MW_fp_recip`,
+  `MW_fp_flt2flt` (format conversion) and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
   them against an exact rational reference (docs/DATAPATH.md).
 
 ### Removed
