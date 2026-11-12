@@ -606,6 +606,21 @@ here is the reading half: the checks above, on RTL, before any of that.
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
+### Support agents: `msupport`
+
+Each product has an AI support agent that answers users' questions from that
+product's documentation, can run a short example on the product's own tool in
+a sandbox, and files a ticket when the documentation does not answer. One
+JSON file per product in `support/products/`; the model is Claude through the
+Anthropic SDK. Built and tested, not online yet. See
+[docs/SUPPORT.md](docs/SUPPORT.md).
+
+```sh
+python3 tools/msupport.py -list
+python3 tools/msupport.py -product msim "How do I write an FST waveform?"
+python3 tools/msupport.py -serve 8080            # a local web page and JSON API
+```
+
 ## Known limits
 
 - `nmos`, `pmos`, `cmos`, `tran` (and the resistive forms), `bufif` / `notif`, and `trireg` charge storage are an error. Strength is resolved when a net is driven, and a read of the net is 0, 1, X, or Z.

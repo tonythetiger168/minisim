@@ -1,0 +1,23 @@
+{
+  "name": "mdebug",
+  "title": "mdebug source-level debug",
+  "summary": "Drivers and loads of a signal with their conditions, fan-in cones, the active driver at a time in a waveform traced back through time, and a one-file viewer.",
+  "docs": [
+    "README.md#Source-level debug",
+    "docs/DEBUG.md",
+    "README.md#Simulating your own design",
+    "CHANGELOG.md"
+  ],
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "msim",
+    "mwave",
+    "mcov",
+    "mregress",
+    "mplan",
+    "mbug",
+    "mlint",
+    "mdft"
+  ]
+}
