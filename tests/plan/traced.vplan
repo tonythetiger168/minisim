@@ -1,0 +1,18 @@
+# mplan self-test plan with requirement links (tests/mplan.cmake).
+plan traced "Counter plan with requirements"
+  reqs reqs.csv
+  feature count "Counting"
+    req CNT-1.1
+    test count_*
+    feature wrap "Wrap around"
+      req CNT-1.2
+      test count_wrap
+      assert tb.dut.c_wrap
+  feature reset "Reset and hold"
+    req CNT-2, CNT-9
+    assert tb.dut.a_*
+  feature scoreboard "Scoreboard"
+    req CNT-3
+    test sb_*
+  feature lowpower "Low power"
+    req CNT-4
