@@ -187,12 +187,15 @@ inline Val finish(Val a) {
         apply(a.hi[i - 1].v, a.hi[i - 1].x, a.hi[i - 1].z, limbMask(a.w, i));
     return a;
 }
-inline Val make(uint64_t v, uint64_t x, int w, uint64_t z = 0, bool sgn = false) {
-    if (w > 64) {
-        Val a;
-        a.v = v; a.x = x; a.z = z; a.w = w; a.sgn = sgn;
-        return finish(a);
-    }
+[[gnu::noinline]] inline Val makeWide(uint64_t v, uint64_t x, int w, uint64_t z, bool sgn) {
+    Val a;
+    a.v = v; a.x = x; a.z = z; a.w = w; a.sgn = sgn;
+    return finish(a);
+}
+// Always inlined: a simv built as several files otherwise kept one
+// out-of-line copy for every caller (2.5% of Ibex).
+[[gnu::always_inline]] inline Val make(uint64_t v, uint64_t x, int w, uint64_t z = 0, bool sgn = false) {
+    if (__builtin_expect(w > 64, 0)) return makeWide(v, x, w, z, sgn);
     uint64_t m = mask(w);
     x &= m;
     v &= m & ~x;
@@ -2832,9 +2835,24 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::Slice: return v_slice(k(0), e->hi, e->lo);
         case Op::Index: return v_index(k(0), k(1));
         case Op::Concat: {
-            std::vector<Val> parts;
-            for (size_t i = 0; i < e->kids.size(); i++) parts.push_back(k((int)i));
-            return v_concat(parts);
+            // Up to 64 bits (the usual case) the result is built in place, the
+            // way v_concat does it: no vector and no allocation.
+            size_t n = e->kids.size();
+            Val r{0, 0, 0};
+            for (size_t i = 0; i < n; i++) {
+                Val p = k((int)i);
+                if (r.w + p.w > 64) {
+                    std::vector<Val> parts;
+                    parts.reserve(n - i + 1);
+                    if (r.w > 0) parts.push_back(std::move(r));
+                    parts.push_back(std::move(p));
+                    for (i++; i < n; i++) parts.push_back(k((int)i));
+                    return v_concat(parts);
+                }
+                uint64_t rv = p.w >= 64 ? 0 : r.v << p.w, rx = p.w >= 64 ? 0 : r.x << p.w, rz = p.w >= 64 ? 0 : r.z << p.w;
+                r = make(rv | p.v, rx | p.x, r.w + p.w, rz | p.z);
+            }
+            return r;
         }
         case Op::Mux: {   // only the selected operand is evaluated (11.4.11); an unknown condition merges both
             Val c = k(0);
