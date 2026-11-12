@@ -15,7 +15,8 @@
 //   L003  a non-blocking assignment in an always_comb.
 //   L004  one variable or net is assigned by more than one process.
 //   CDC001..CDC005, RDC001..RDC004  clock- and reset-domain crossings (cdc.hpp).
-//   UPF001..UPF006  with -upf: power intent checks (upf.hpp check()).
+//   UPF001..UPF007  with -upf: power intent checks (upf.hpp check()).
+#include "upf_hdl.hpp"
 #include <unistd.h>
 
 #include <chrono>
@@ -80,6 +81,12 @@ void checkUpf(Compilation& comp, const std::string& upfPath, std::string powerTo
     upf::Model m;
     upf::DesignView dv = upf::designView(comp);
     upf::loadWithDesign(m, upfPath, comp, dv, powerTop, powerTopSet);
+    m.addHdlAttrs(upfHdlAttrs(comp));   // (* UPF_... *) in the HDL (5.6)
+    m.resolveApplies([&](const std::string& mod) {   // apply_power_model without -elements (6.9)
+        std::vector<std::string> r;
+        for (auto& [p, md] : dv.models) if (md == mod) r.push_back(p);
+        return r;
+    });
     for (auto& w : m.warnings) std::cerr << "mlint: UPF: " << w << "\n";
     for (auto& f : upf::check(m, dv)) {
         if (!rep.rules.enabled(f.rule)) continue;

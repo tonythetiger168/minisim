@@ -1,0 +1,54 @@
+# Power intent for attributes.sv.
+upf_version 4.0
+set_design_top dut
+set_partial_on_translation OFF
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_A -elements {u_a}
+create_power_domain PD_B -elements {u_b}
+create_power_domain PD_M -elements {u_m u_i}
+create_supply_port VDD
+create_supply_port VDD_SW
+create_supply_port VDD_SW2
+create_supply_port VDD_E
+create_supply_port VDD_EXT
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VDD_SW
+create_supply_net VDD_SW2
+create_supply_net VDD_E
+create_supply_net VDD_EXT
+create_supply_net VSS
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VDD_SW -ports {VDD_SW}
+connect_supply_net VDD_SW2 -ports {VDD_SW2}
+connect_supply_net VDD_E -ports {VDD_E}
+connect_supply_net VDD_EXT -ports {VDD_EXT}
+connect_supply_net VSS -ports {VSS}
+create_supply_set SS -function {power VDD} -function {ground VSS}
+create_supply_set SS_A -function {power VDD_SW} -function {ground VSS}
+create_supply_set SS_B -function {power VDD_SW2} -function {ground VSS}
+create_supply_set SS_E -function {power VDD_E} -function {ground VSS}
+create_supply_set SS_EXT -function {power VDD_EXT} -function {ground VSS}
+associate_supply_set SS -handle PD_TOP.primary
+associate_supply_set SS_A -handle PD_A.primary
+associate_supply_set SS_B -handle PD_B.primary
+associate_supply_set SS_A -handle PD_M.primary
+
+# VDD_SW2 is the same rail as VDD_SW: the testbench drives only VDD_SW
+set_equivalent -nets {VDD_SW VDD_SW2}
+add_supply_state SS_A.power -state {ON 1.0} -state {HALF {PARTIAL_ON 1.0}} -state {OFF off}
+
+# one strategy for both domains; u_b/q asks for its own clamp value
+create_composite_domain PD_AB -subdomains {PD_A PD_B} -supply {primary SS_A}
+set_port_attributes -ports {u_b/q} -clamp_value 1
+set_isolation ISO -domain PD_AB -applies_to outputs -isolation_supply SS \
+    -isolation_signal iso -isolation_sense high
+
+# the macro and the model
+set_design_attributes -models {macro} -is_hard_macro TRUE
+set_simstate_behavior PORT_CORR_ONLY -models {macro}
+set_design_attributes -models {ip} -is_power_aware_model TRUE
+
+# u_e is on its own supply; the driver of d is outside the design
+connect_supply_set SS_E -elements {u_e}
+set_port_attributes -ports {d} -driver_supply SS_EXT

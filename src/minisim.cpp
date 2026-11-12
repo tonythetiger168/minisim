@@ -2984,7 +2984,14 @@ struct Sim {
     }
 };
 
+// A simv built as several files (msim -compile of a large design) defines S
+// once, in design.cpp: the other files do not compile its constructor and
+// destructor and everything they reach.
+#ifdef MINISIM_EXTERN_S
+extern Sim S;
+#else
 inline Sim S;
+#endif
 // msim -xprop (SF_XPROP_EDGE): how signal s changed in this time step, seen
 // as a posedge (or negedge). With `level` the process tests the signal's
 // level, as for an asynchronous reset: once the level is known it does not

@@ -1,0 +1,17 @@
+# Power intent for pgconn.sv: supply ports found by pg_type.
+upf_version 4.0
+set_design_top dut
+foreach s {VDD VDDB VSS VBAT} {
+    create_supply_port $s
+    create_supply_net $s
+    connect_supply_net $s -ports $s
+}
+create_supply_set SS_A -function {power VDD} -function {ground VSS}
+create_supply_set SS_B -function {power VDDB} -function {ground VSS}
+create_power_domain PD_A -include_scope
+associate_supply_set SS_A -handle PD_A.primary
+# VSS's pg_type from the power intent (6.51); VDD's is in the HDL (5.6)
+set_port_attributes -model macro -ports {VSS} -pg_type primary_ground
+set_port_attributes -model macro -ports {VBK} -pg_type backup_power
+connect_supply_set SS_B -elements {u_m2} -connect {power primary_power}
+connect_supply_net VBAT -pg_type backup_power -cells macro
