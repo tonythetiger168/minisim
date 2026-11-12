@@ -209,3 +209,8 @@ execute_process(COMMAND ${MPLAN} rank -results ${OUT}/r3x RESULT_VARIABLE rc OUT
 if(rc EQUAL 0)
   message(FATAL_ERROR "rank on a missing directory passed")
 endif()
+
+# The server: push, the dashboard pages, tokens and roles, annotations, the audit log, -rules from the server.
+execute_process(COMMAND ${PY} ${SRC}/tests/plan/serve_test.py ${SRC}/tools/mplan.py ${PLAN} ${OUT}/r1 ${OUT}/serve
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("serve" ${rc} 0 "${out}" "serve_test: ok")

@@ -50,6 +50,9 @@
 
 #include "lintir.hpp"
 #include "parallel.hpp"
+#include <deque>
+#include <fstream>
+#include <sstream>
 #include "cdc_sdc.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/ConversionExpression.h"
@@ -67,6 +70,10 @@ struct Options {
     bool report = false;                                // -cdc-report
     std::vector<std::string> sdcFiles;                  // -sdc file
     int depth = 2;                                      // -cdc-depth N
+    std::string sva;                                    // -cdc-sva FILE
+    std::string abstractOut;                            // -cdc-abstract FILE
+    std::vector<std::string> models;                    // -cdc-model FILE
+    std::string html;                                   // -cdc-html FILE
     int threads = 1;                                    // -threads N
 
     // Takes one command-line option if it is one of these. `next` returns the
@@ -76,6 +83,10 @@ struct Options {
         if (a == "-cdc-report") { report = true; return true; }
         if (a == "-static") { statics.push_back(next("a signal")); return true; }
         if (a == "-sdc") { sdcFiles.push_back(next("an SDC file")); return true; }
+        if (a == "-cdc-sva") { sva = next("an output file"); return true; }
+        if (a == "-cdc-html") { html = next("an output file"); return true; }
+        if (a == "-cdc-abstract") { abstractOut = next("an output file"); return true; }
+        if (a == "-cdc-model") { models.push_back(next("a CDC model file")); return true; }
         if (a == "-cdc-depth") {
             std::string v = next("a number of flops");
             char* e = nullptr;
@@ -103,7 +114,11 @@ struct Options {
 };
 
 inline const char* usage() {
-    return "  -cdc-depth N   CDC004 follows synchronized signals through N more flops to where they meet (2)\n"
+    return "  -cdc-html FILE  write a page to browse the clock domains, crossings and reset synchronizers\n"
+           "  -cdc-abstract FILE  write the top's CDC model (the clock of each port) for -cdc-model\n"
+           "  -cdc-model FILE  use these block models instead of the blocks' RTL (repeatable)\n"
+           "  -cdc-sva FILE  write SVA for every crossing to FILE, as module mlint_cdc_sva (compile it with the design)\n"
+           "  -cdc-depth N   CDC004 follows synchronized signals through N more flops to where they meet (2)\n"
            "  -sdc FILE      clocks, generated clocks, clock groups and clock-to-clock false paths from an SDC file\n"
            "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
            "  -static SIG    SIG does not change while it is read: its crossings are not reported\n"
@@ -144,6 +159,111 @@ inline Sym baseOf(const Expression& ex) {
     }
 }
 
+// The part of a variable an expression selects: r[3], r[7:4], r.field. Bits
+// count from the least significant one; for an unpacked struct they are the
+// fields. `exact` is false when a select index is not a constant, or the
+// select goes inside an unpacked field: [lo, hi] is then all it can reach.
+struct Sel {
+    Sym base = nullptr;
+    uint64_t lo = 0, hi = 0;
+    bool exact = true, packed = true;
+};
+inline std::optional<int64_t> constInt(const Expression& e, Sym base) {
+    ConstantValue cv;
+    if (const ConstantValue* c = e.getConstant()) {
+        cv = *c;
+    } else {
+        const Scope* sc = base->getParentScope();
+        if (!sc) return std::nullopt;
+        EvalContext ctx(ASTContext(*sc, LookupLocation::max));
+        cv = e.eval(ctx);
+    }
+    if (!cv.isInteger()) return std::nullopt;
+    return cv.integer().as<int64_t>();
+}
+inline bool bitRange(const Expression& ex, Sel& r) {
+    const Expression& e = strip(ex);
+    auto named = [](const Expression& x) {
+        return x.kind == ExpressionKind::NamedValue || x.kind == ExpressionKind::HierarchicalValue;
+    };
+    switch (e.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue: {
+            const Symbol& s = e.kind == ExpressionKind::NamedValue ? (const Symbol&)e.as<NamedValueExpression>().symbol
+                                                                    : e.as<HierarchicalValueExpression>().symbol;
+            if (!isSignal(s)) return false;
+            const Type& t = s.as<ValueSymbol>().getType().getCanonicalType();
+            r = {};
+            r.base = &s;
+            if (t.isIntegral()) {
+                r.hi = std::max<uint64_t>(1, t.getBitstreamWidth()) - 1;
+            } else if (t.isUnpackedStruct()) {
+                auto fields = t.as<UnpackedStructType>().fields;
+                if (fields.empty()) return false;
+                r.hi = fields.size() - 1;
+                r.packed = false;
+            } else {
+                return false;
+            }
+            return true;
+        }
+        case ExpressionKind::ElementSelect:
+        case ExpressionKind::RangeSelect: {
+            bool element = e.kind == ExpressionKind::ElementSelect;
+            const Expression& v =
+                strip(element ? e.as<ElementSelectExpression>().value() : e.as<RangeSelectExpression>().value());
+            if (!bitRange(v, r)) return false;
+            const Type& vt = v.type->getCanonicalType();
+            if (!r.exact || !r.packed || !vt.isIntegral() || !vt.hasFixedRange()) {
+                r.exact = false;
+                return true;
+            }
+            ConstantRange rg = vt.getFixedRange();
+            const Type* et = vt.getArrayElementType();
+            uint64_t w = et ? std::max<uint64_t>(1, et->getBitstreamWidth()) : 1;
+            std::optional<int64_t> a, b;
+            if (element) {
+                a = b = constInt(e.as<ElementSelectExpression>().selector(), r.base);
+            } else {
+                const auto& rs = e.as<RangeSelectExpression>();
+                a = constInt(rs.left(), r.base);
+                b = constInt(rs.right(), r.base);
+                if (a && b && rs.getSelectionKind() == RangeSelectionKind::IndexedUp) b = *a + *b - 1;
+                else if (a && b && rs.getSelectionKind() == RangeSelectionKind::IndexedDown) b = *a - *b + 1;
+            }
+            if (!a || !b || *a < INT32_MIN || *a > INT32_MAX || *b < INT32_MIN || *b > INT32_MAX ||
+                !rg.containsPoint((int32_t)*a) || !rg.containsPoint((int32_t)*b)) {
+                r.exact = false;
+                return true;
+            }
+            uint64_t x = (uint64_t)rg.translateIndex((int32_t)*a), y = (uint64_t)rg.translateIndex((int32_t)*b);
+            uint64_t lo = r.lo + std::min(x, y) * w;
+            r.hi = r.lo + (std::max(x, y) + 1) * w - 1;
+            r.lo = lo;
+            return true;
+        }
+        case ExpressionKind::MemberAccess: {
+            const auto& ma = e.as<MemberAccessExpression>();
+            if (ma.member.kind != SymbolKind::Field) return false;
+            const auto& field = ma.member.as<FieldSymbol>();
+            const Expression& v = strip(ma.value());
+            if (!bitRange(v, r)) return false;
+            const Type& vt = v.type->getCanonicalType();
+            if (r.exact && !r.packed && named(v) && vt.isUnpackedStruct()) {
+                r.lo = r.hi = field.fieldIndex;
+            } else if (r.exact && r.packed && vt.isIntegral() && !vt.isPackedUnion()) {
+                r.lo += field.bitOffset;
+                r.hi = r.lo + std::max<uint64_t>(1, field.getType().getBitstreamWidth()) - 1;
+            } else {
+                r.exact = false;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 // b ^ (b >> 1), in either order: the binary-to-Gray conversion.
 inline bool isGrayOp(const Expression& ex) {
     const Expression& e = strip(ex);
@@ -176,6 +296,8 @@ struct Flop {
     Sym from = nullptr;
     uint64_t fromBits = 0;
     uint64_t bits = 1;
+    bool negedge = false;     // clocked on the falling edge
+    bool arstHigh = false;    // the first asynchronous reset is a posedge event (active high)
     std::vector<const Expression*> rhs;
     mutable std::string pathName;
 };
@@ -205,6 +327,62 @@ struct Model {
     // connection is one bit of it, which makes clk[0] and clk[1] one clock.
     Join join;
     // One bit of a bus, as ports are connected to it: (bus, index) -> node.
+    // A variable written piece by piece (r[0] <= a; r[1] <= b; or the fields
+    // of a struct) is one node per piece, so two bits of one vector are two
+    // signals. Disjoint, sorted.
+    struct Slice {
+        uint64_t lo, hi;
+        Sym node;
+    };
+    std::unordered_map<Sym, std::vector<Slice>> sliced;
+    std::deque<std::string> sliceNames;
+    std::unordered_map<Sym, const std::string*> sliceLabel;
+    // A piece is not in the design: its name is the one it was given.
+    std::string pathOf(Sym s) const {
+        if (!sliceLabel.empty())
+            if (auto it = sliceLabel.find(s); it != sliceLabel.end()) return *it->second;
+        return path(*s);
+    }
+    const std::vector<Slice>* slicesOf(Sym s) const {
+        if (sliced.empty()) return nullptr;
+        auto it = sliced.find(s);
+        return it == sliced.end() ? nullptr : &it->second;
+    }
+    // The pieces an expression on a sliced variable touches. Returns true
+    // when it is exactly one whole piece.
+    bool pieces(const Expression& e, const std::vector<Slice>& sl, SymSet& out) {
+        Sel r;
+        if (!bitRange(e, r)) {
+            for (const Slice& x : sl) out.push_back(canon(x.node));
+            return false;
+        }
+        bool one = false;
+        size_t n = 0;
+        for (const Slice& x : sl)
+            if (x.lo <= r.hi && r.lo <= x.hi) {
+                out.push_back(canon(x.node));
+                one = !n++ && r.exact && x.lo == r.lo && x.hi == r.hi;
+            }
+        return one && n == 1;
+    }
+    // -cdc-model: blocks described by their ports, not their RTL.
+    struct PortModel {
+        std::string port, kind, clock;  // kind: clock, sync, data, comb, mixed
+        bool output = false;
+    };
+    std::map<std::string, std::vector<PortModel>> blockModels;  // module name -> ports
+    std::vector<const InstanceSymbol*> modeled;                // instances that use one
+    bool isModeled(const InstanceSymbol& inst) const {
+        return !blockModels.empty() && blockModels.count(std::string(inst.getDefinition().name));
+    }
+    // The top's ports, for -cdc-abstract.
+    struct TopPort {
+        std::string name;
+        bool output;
+        Sym sym;
+    };
+    std::vector<TopPort> topPorts;
+    std::string topName;
     std::map<std::pair<Sym, int64_t>, Sym> bitOf;
     std::map<std::pair<Sym, int64_t>, Sym> bitCanon;  // the same, by canonical bus
     std::set<std::pair<Sym, int64_t>> bitDriven;      // bits a port or an assign drives
@@ -282,16 +460,16 @@ struct Model {
         if (!fresh) return it->second;
         std::string best;
         auto nit = named.find(c);
-        if (nit == named.end()) return it->second = path(*c);
+        if (nit == named.end()) return it->second = pathOf(c);
         for (Sym s : nit->second.syms)
-            if (std::string p = path(*s); best.empty() || p < best) best = std::move(p);
+            if (std::string p = pathOf(s); best.empty() || p < best) best = std::move(p);
         for (const std::string& p : nit->second.labels)
             if (best.empty() || p < best) best = p;
-        return it->second = best.empty() ? path(*c) : best;
+        return it->second = best.empty() ? pathOf(c) : best;
     }
     // A flop's own name, as its module wrote it.
     const std::string& name(const Flop& f) const {
-        if (f.pathName.empty()) f.pathName = path(*f.sym);
+        if (f.pathName.empty()) f.pathName = pathOf(f.sym);
         return f.pathName;
     }
 
@@ -495,12 +673,51 @@ struct Walk {
     const Scope* scope = nullptr;  // of a continuous assign, to evaluate a bit index
     bool seq = false;
     Sym clk = nullptr;
+    bool neg = false;  // the clock's edge is negedge
+    bool arstHigh = false;
     SymSet arst;  // canonical
 
+    void name(Sym s, SymSet& out) {
+        if (!isSignal(*s)) return;
+        if (const auto* sl = m.slicesOf(s)) {
+            for (const Model::Slice& x : *sl) out.push_back(m.canon(x.node));
+            return;
+        }
+        out.push_back(m.canon(s));
+    }
+    // A select on a variable that is kept in pieces reads those pieces, and
+    // the signals of its indexes.
+    template<typename V, typename T>
+    void select(V& v, const T& e, SymSet& out) {
+        Sym b = m.sliced.empty() ? nullptr : baseOf(e);
+        const std::vector<Model::Slice>* sl = b ? m.slicesOf(b) : nullptr;
+        if (!sl) {
+            v.visitDefault(e);
+            return;
+        }
+        m.pieces(e, *sl, out);
+        for (const Expression* x = &strip(e);;) {
+            if (x->kind == ExpressionKind::ElementSelect) {
+                x->as<ElementSelectExpression>().selector().visit(v);
+                x = &strip(x->as<ElementSelectExpression>().value());
+            } else if (x->kind == ExpressionKind::RangeSelect) {
+                x->as<RangeSelectExpression>().left().visit(v);
+                x->as<RangeSelectExpression>().right().visit(v);
+                x = &strip(x->as<RangeSelectExpression>().value());
+            } else if (x->kind == ExpressionKind::MemberAccess) {
+                x = &strip(x->as<MemberAccessExpression>().value());
+            } else {
+                break;
+            }
+        }
+    }
     void names(const Expression& e, SymSet& out) {
         e.visit(makeVisitor(
-            [&](auto&, const NamedValueExpression& n) { if (isSignal(n.symbol)) out.push_back(m.canon(&n.symbol)); },
-            [&](auto&, const HierarchicalValueExpression& n) { if (isSignal(n.symbol)) out.push_back(m.canon(&n.symbol)); }));
+            [&](auto&, const NamedValueExpression& n) { name(&n.symbol, out); },
+            [&](auto&, const HierarchicalValueExpression& n) { name(&n.symbol, out); },
+            [&](auto& v, const ElementSelectExpression& x) { select(v, x, out); },
+            [&](auto& v, const RangeSelectExpression& x) { select(v, x, out); },
+            [&](auto& v, const MemberAccessExpression& x) { select(v, x, out); }));
     }
 
     static bool local(Sym s) {
@@ -548,6 +765,13 @@ struct Walk {
                 if (!b) { t.other = true; return; }
                 if (!isSignal(*b)) return;  // a parameter or an enum value
                 Sym c = m.canon(b);
+                if (const auto* sl = m.slicesOf(b)) {
+                    SymSet hit;
+                    m.pieces(e, *sl, hit);
+                    if (hit.empty()) return;  // bits nothing drives
+                    if (hit.size() > 1) { t.other = true; return; }
+                    c = hit[0];
+                }
                 if (c == self) { t.self = true; return; }
                 if (t.ext && t.ext != c) t.many = true;
                 t.ext = c;
@@ -562,8 +786,22 @@ struct Walk {
     }
 
     void one(const Expression& lhs, const Expression& rhs, bool nonBlocking, const SymSet& ctrl0, bool whole) {
-        Sym base = baseOf(lhs);
-        if (!base || !isSignal(*base)) return;
+        Sym real = baseOf(lhs);
+        if (!real || !isSignal(*real)) return;
+        if (const auto* sl = m.slicesOf(real)) {
+            // Each piece the left-hand side touches is assigned; it is a
+            // whole assignment when that is exactly one piece.
+            SymSet hit, own;
+            bool exact = m.pieces(lhs, *sl, hit);
+            for (const Model::Slice& x : *sl) own.push_back(m.canon(x.node));
+            for (Sym node : hit) one(node, real, own, lhs, rhs, nonBlocking, ctrl0, whole && exact);
+            return;
+        }
+        one(real, real, {m.canon(real)}, lhs, rhs, nonBlocking, ctrl0, whole);
+    }
+    // `base` is the node assigned: the variable, or one piece of it.
+    void one(Sym base, Sym real, const SymSet& own, const Expression& lhs, const Expression& rhs, bool nonBlocking,
+             const SymSet& ctrl0, bool whole) {
         Sym self = m.canon(base);
         SymSet ctrl = ctrl0;
         // A select index on the left chooses what is written: control.
@@ -571,14 +809,16 @@ struct Walk {
             SymSet ln;
             names(lhs, ln);
             for (Sym s : ln)
-                if (s != self) ctrl.push_back(s);
+                if (std::find(own.begin(), own.end(), s) == own.end()) ctrl.push_back(s);
         }
         std::vector<const Expression*> lv;
         leaves(rhs, ctrl, lv);
-        if (seq && (nonBlocking || !local(base))) {
+        if (seq && (nonBlocking || !local(real))) {
             Flop& f = m.flop(base, lhs.sourceRange.start());
             if (!f.clkSym) {
                 f.clkSym = clk;
+                f.negedge = neg;
+                f.arstHigh = arstHigh;
                 f.arst = arst;
             }
             f.ctrl.insert(f.ctrl.end(), ctrl.begin(), ctrl.end());
@@ -604,7 +844,7 @@ struct Walk {
             // assign bus[3] = x, where ports are connected to bus[3]: that bit
             // is x, not the whole bus.
             const Expression& l = strip(lhs);
-            if (scope && l.kind == ExpressionKind::ElementSelect && !m.bitCanon.empty()) {
+            if (scope && base == real && l.kind == ExpressionKind::ElementSelect && !m.bitCanon.empty()) {
                 const auto& sel = l.as<ElementSelectExpression>();
                 const Expression& v = strip(sel.value());
                 if (v.kind == ExpressionKind::NamedValue || v.kind == ExpressionKind::HierarchicalValue) {
@@ -693,6 +933,149 @@ struct Walk {
     }
 };
 
+// Before anything else: which variables are written piece by piece. Such a
+// variable becomes one node per piece. Left whole: a variable a port is
+// connected to by name or by a select (the port passes are about those), and
+// one that is also assigned whole from other signals.
+struct Slicer : ASTVisitor<Slicer> {
+    Model& m;
+    Compilation& comp;
+    struct Var {
+        std::vector<std::pair<uint64_t, uint64_t>> writes;
+        bool whole = false;
+    };
+    std::unordered_map<Sym, Var> vars;
+    std::vector<Sym> order;
+    Slicer(Model& mm, Compilation& c) : m(mm), comp(c) {}
+
+    Var& var(Sym s) {
+        auto [it, fresh] = vars.try_emplace(s);
+        if (fresh) order.push_back(s);
+        return it->second;
+    }
+    static bool constant(const Expression& e) {
+        bool any = false;
+        e.visit(makeVisitor([&](auto&, const NamedValueExpression& n) { any = any || isSignal(n.symbol); },
+                            [&](auto&, const HierarchicalValueExpression& n) { any = any || isSignal(n.symbol); }));
+        return !any;
+    }
+    void keepWhole(const Expression& e) {
+        e.visit(makeVisitor([&](auto&, const NamedValueExpression& n) { if (isSignal(n.symbol)) var(&n.symbol).whole = true; },
+                            [&](auto&, const HierarchicalValueExpression& n) { if (isSignal(n.symbol)) var(&n.symbol).whole = true; }));
+    }
+    void written(const Expression& lhs, bool constRhs) {
+        const Expression& l = strip(lhs);
+        if (l.kind == ExpressionKind::Concatenation) {
+            for (const Expression* o : l.as<ConcatenationExpression>().operands()) written(*o, constRhs);
+            return;
+        }
+        Sel r;
+        if (!bitRange(l, r)) {
+            if (Sym b = baseOf(l); b && isSignal(*b)) var(b).whole = true;
+            return;
+        }
+        bool all = l.kind == ExpressionKind::NamedValue || l.kind == ExpressionKind::HierarchicalValue;
+        if (all && constRhs) return;  // r <= '0 clears every piece
+        if (all) var(r.base).whole = true;
+        else var(r.base).writes.push_back({r.lo, r.hi});
+    }
+    void assignment(const Expression& e) {
+        if (e.kind != ExpressionKind::Assignment) return;
+        const auto& a = e.as<AssignmentExpression>();
+        written(a.left(), constant(a.right()));
+    }
+
+    void handle(const GenerateBlockSymbol& g) {
+        if (!g.isUninstantiated) visitDefault(g);
+    }
+    void handle(const InstanceSymbol& inst) {
+        if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return;
+        for (const PortConnection* conn : inst.getPortConnections()) {
+            if (!conn || conn->port.kind != SymbolKind::Port) continue;
+            const auto& port = conn->port.as<PortSymbol>();
+            if (port.internalSymbol && isSignal(*port.internalSymbol)) var(port.internalSymbol).whole = true;
+            const Expression* ext = conn->getExpression();
+            if (!ext) continue;
+            const Expression* outer = ext;
+            if (outer->kind == ExpressionKind::Assignment) outer = &outer->as<AssignmentExpression>().left();
+            // An input fed an expression only reads; anything else ties the
+            // variable to the port.
+            if (port.direction != ArgumentDirection::In || baseOf(*outer)) keepWhole(*outer);
+        }
+        if (!m.isModeled(inst)) visitDefault(inst);
+    }
+    void handle(const NetSymbol& n) {
+        if (const Expression* init = n.getInitializer(); init && !constant(*init)) var(&n).whole = true;
+    }
+    void handle(const ContinuousAssignSymbol& ca) { assignment(ca.getAssignment()); }
+    void handle(const ProceduralBlockSymbol& p) {
+        if (p.procedureKind == ProceduralBlockKind::Initial || p.procedureKind == ProceduralBlockKind::Final)
+            return;
+        p.getBody().visit(makeVisitor([&](auto& v, const AssignmentExpression& a) {
+            written(a.left(), constant(a.right()));
+            v.visitDefault(a);
+        }));
+    }
+
+    void finish() {
+        for (Sym s : order) {
+            Var& v = vars[s];
+            if (v.whole || v.writes.size() < 2) continue;
+            const Scope* sc = s->getParentScope();
+            if (!sc || sc->asSymbol().kind == SymbolKind::StatementBlock) continue;  // a local of a block
+            std::sort(v.writes.begin(), v.writes.end());
+            std::vector<std::pair<uint64_t, uint64_t>> parts;
+            for (auto& w : v.writes) {
+                if (!parts.empty() && w.first <= parts.back().second)
+                    parts.back().second = std::max(parts.back().second, w.second);
+                else
+                    parts.push_back(w);
+            }
+            if (parts.size() < 2 || parts.size() > 4096) continue;
+            const Type& t = s->as<ValueSymbol>().getType().getCanonicalType();
+            std::string base = path(*s);
+            bool hidden = base == "<protected>";
+            auto& out = m.sliced[s];
+            for (auto& [lo, hi] : parts) {
+                std::string label = base;
+                const Type* pt = nullptr;
+                if (t.isUnpackedStruct()) {
+                    auto fields = t.as<UnpackedStructType>().fields;
+                    if (!hidden) {
+                        label += "." + std::string(fields[lo]->name);
+                        if (hi != lo) label += ".." + std::string(fields[hi]->name);
+                    }
+                    pt = lo == hi ? &fields[lo]->getType() : nullptr;
+                } else if (!hidden) {
+                    label += bits(t, lo, hi);
+                }
+                if (!pt) pt = &comp.getType((bitwidth_t)std::min<uint64_t>(hi - lo + 1, 1u << 20), IntegralFlags::FourState);
+                m.sliceNames.push_back(std::move(label));
+                auto* node = comp.emplace<VariableSymbol>(std::string_view(m.sliceNames.back()), s->location,
+                                                          VariableLifetime::Static);
+                node->setType(*pt);
+                m.sliceLabel[node] = &m.sliceNames.back();
+                out.push_back({lo, hi, node});
+            }
+        }
+    }
+    // How the source would write bits lo..hi of a variable: the field of a
+    // packed struct, the index of a vector, or the bit numbers.
+    static std::string bits(const Type& t, uint64_t lo, uint64_t hi) {
+        if (t.kind == SymbolKind::PackedStructType)
+            for (const FieldSymbol& f : t.as<PackedStructType>().membersOfType<FieldSymbol>())
+                if (f.bitOffset == lo && f.bitOffset + f.getType().getBitstreamWidth() - 1 == hi)
+                    return "." + std::string(f.name);
+        if (t.hasFixedRange() && (!t.getArrayElementType() || t.getArrayElementType()->getBitstreamWidth() == 1)) {
+            ConstantRange rg = t.getFixedRange();
+            auto ix = [&](uint64_t off) { return rg.isDescending() ? rg.lower() + (int64_t)off : rg.upper() - (int64_t)off; };
+            return lo == hi ? "[" + std::to_string(ix(lo)) + "]"
+                            : "[" + std::to_string(ix(hi)) + ":" + std::to_string(ix(lo)) + "]";
+        }
+        return "[bits " + std::to_string(hi) + ":" + std::to_string(lo) + "]";
+    }
+};
+
 // The first pass: what the ports connect. It has to finish before any node is
 // looked up, because joining two nodes changes which symbol stands for them.
 struct Ports : ASTVisitor<Ports> {
@@ -776,6 +1159,10 @@ struct Ports : ASTVisitor<Ports> {
             else
                 for (Sym t : n) wires.push_back({t, {in}, base != nullptr, nullptr});
         }
+        if (m.isModeled(inst)) {
+            m.modeled.push_back(&inst);
+            return;
+        }
         visitDefault(inst);
     }
 
@@ -790,8 +1177,16 @@ struct Ports : ASTVisitor<Ports> {
             if (!b.input) m.bitDriven.insert({m.join.find(b.bus), b.index});
         for (Wire& w : wires) {
             SymSet from;
-            for (Sym s : w.from) from.push_back(m.canon(s));
-            m.addComb(w.to, from, w.plain, w.rhs);
+            bool plain = w.plain;
+            for (Sym s : w.from) {
+                if (const auto* sl = m.slicesOf(s)) {
+                    for (const Model::Slice& x : *sl) from.push_back(m.canon(x.node));
+                    plain = false;
+                } else {
+                    from.push_back(m.canon(s));
+                }
+            }
+            m.addComb(w.to, from, plain, plain ? w.rhs : nullptr);
         }
     }
     // After the assigns are known: a bit a port or an assign drives is that
@@ -815,6 +1210,7 @@ struct Gather : ASTVisitor<Gather> {
     void handle(const InstanceSymbol& inst) {
         // A module nobody instantiates is elaborated for its errors only.
         if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return;
+        if (m.isModeled(inst)) return;  // its model stands in for it
         visitDefault(inst);
     }
 
@@ -828,7 +1224,7 @@ struct Gather : ASTVisitor<Gather> {
             Walk w{m};
             SymSet src;
             w.names(*init, src);
-            if (!src.empty()) m.addComb(&n, src, baseOf(*init) != nullptr, init);
+            if (!src.empty() && !m.slicesOf(&n)) m.addComb(&n, src, baseOf(*init) != nullptr, init);
         }
     }
 
@@ -862,13 +1258,18 @@ struct Gather : ASTVisitor<Gather> {
                 for (const SignalEventControl* e : edges) {
                     Sym s = oneName(e->expr);
                     if (!s) continue;
-                    if (has(read, s))
+                    if (has(read, s)) {
+                        if (w.arst.empty()) w.arstHigh = e->edge == EdgeKind::PosEdge;
                         w.arst.push_back(m.canon(s));
-                    else if (!w.clk)
+                    }
+                    else if (!w.clk) {
                         w.clk = s;
+                        w.neg = e->edge == EdgeKind::NegEdge;
+                    }
                 }
                 if (!w.clk) {  // every edge is read: take the first, as lintir does
                     w.clk = oneName(edges[0]->expr);
+                    w.neg = edges[0]->edge == EdgeKind::NegEdge;
                     if (w.clk) std::erase(w.arst, m.canon(w.clk));
                 }
                 if (!w.clk) w.seq = false;
@@ -975,10 +1376,14 @@ struct Checker {
     std::vector<Member> member;
     std::vector<std::vector<int>> next;  // flop -> the plain flops that copy it
 
+    // What -cdc-sva can check about a crossing.
+    enum Check : uint8_t { NoCheck, Stable, OneBit, Qualified };
     struct Crossing {
         int flop;
         Sym src;
         std::string how;
+        Check check = NoCheck;
+        Sym qual = nullptr;  // Qualified: the synchronized control the reader takes it with
     };
     std::vector<Crossing> crossings;
 
@@ -1092,6 +1497,9 @@ struct Checker {
         prof.lap("resets");
         flush();
         if (opt.report) report();
+        if (!opt.sva.empty()) writeSva(opt.sva);
+        if (!opt.html.empty()) writeHtml(opt.html);
+        if (!opt.abstractOut.empty()) writeAbstract(opt.abstractOut);
         prof.lap("report");
     }
 
@@ -1117,6 +1525,7 @@ struct Checker {
             Kind kind;
             bool logic;
             int len;
+            Sym qual = nullptr;
         };
         const size_t n = m.flops.size();
         std::vector<std::vector<Rec>> recs(n);
@@ -1134,18 +1543,22 @@ struct Checker {
                 // control from its own domain says when to take it: the domains
                 // this flop has such a control from.
                 SymSet quals;
+                std::vector<Sym> qualBy;  // the control flop, by quals entry
                 for (const Root& q : all) {
                     const Flop* qf = m.flopOf(q.sym);
                     if (!qf || qf->dom != f.dom) continue;
                     const Member& mem = member[qf - m.flops.data()];
-                    if (mem.pos >= 2) quals.push_back(mem.srcDom);
+                    if (mem.pos >= 2) {
+                        quals.push_back(mem.srcDom);
+                        qualBy.push_back(q.sym);
+                    }
                 }
                 for (const Root& r : all) {
                     const Flop* s = foreign(f, r.sym);
                     if (!s) continue;
-                    bool qualified = std::find(quals.begin(), quals.end(), s->dom) != quals.end();
-                    if (qualified)
-                        recs[i].push_back({r.sym, Qualified, r.logic, 0});
+                    auto qit = std::find(quals.begin(), quals.end(), s->dom);
+                    if (qit != quals.end())
+                        recs[i].push_back({r.sym, Qualified, r.logic, 0, qualBy[qit - quals.begin()]});
                     else if (first[i] && inFrom(r.sym)) {
                         int len = chainLen((int)i);
                         recs[i].push_back({r.sym, len < 2 ? OneFlop : Synced, r.logic, len});
@@ -1172,7 +1585,7 @@ struct Checker {
             for (const Rec& r : recs[i]) {
                 const Flop& s = *m.flopOf(r.src);
                 if (r.kind == Qualified) {
-                    crossings.push_back({(int)i, r.src, "enable-qualified"});
+                    crossings.push_back({(int)i, r.src, "enable-qualified", Check::Qualified, r.qual});
                     continue;
                 }
                 std::string where = "'" + m.name(s) + "' (clocked by " + clocked(s) +
@@ -1227,7 +1640,8 @@ struct Checker {
                 } else if (total > 1 && gray) {
                     sync += ", Gray coded";
                 }
-                crossings.push_back({st.flop, key.first, sync});
+                Check check = st.logic ? NoCheck : total > 1 || s.bits > 1 ? OneBit : Stable;
+                crossings.push_back({st.flop, key.first, sync, check});
             }
             if (!fanout) continue;
             std::string names;
@@ -1570,6 +1984,319 @@ struct Checker {
     }
 
     // -cdc-report: the domains and every crossing, clean or not.
+    // -cdc-html: one self-contained page (no network) to browse the crossings:
+    // the domains in colour, a table to filter, and for the selected crossing
+    // its path from the source flop through the synchronizer stages.
+    static std::string esc(const std::string& t) {
+        std::string o;
+        for (char c : t) {
+            switch (c) {
+                case '&': o += "&amp;"; break;
+                case '<': o += "&lt;"; break;
+                case '>': o += "&gt;"; break;
+                case '"': o += "&quot;"; break;
+                default: o += c;
+            }
+        }
+        return o;
+    }
+    static std::string json(const std::string& t) {
+        std::string o = "\"";
+        for (char c : t) {
+            if (c == '"' || c == '\\') o += '\\';
+            if ((unsigned char)c < 0x20) { o += ' '; continue; }
+            if (c == '<') { o += "\\u003c"; continue; }
+            o += c;
+        }
+        return o + "\"";
+    }
+    void writeHtml(const std::string& file) {
+        std::map<std::string, int> domIx;
+        std::vector<std::string> domNames;
+        std::map<std::string, int> domFlops;
+        for (const Flop& f : m.flops)
+            if (f.dom) domFlops[m.name(f.dom)]++;
+        for (auto& [d, k] : domFlops) {
+            domIx[d] = (int)domNames.size();
+            domNames.push_back(d);
+        }
+        std::vector<std::string> rows;
+        for (const Crossing& c : crossings) {
+            const Flop& f = m.flops[c.flop];
+            const Flop& s = *m.flopOf(c.src);
+            // The path: source, then the reading flop and the plain copies
+            // after it in its domain (the synchronizer), up to 8.
+            std::string chain = "[";
+            int at = c.flop;
+            for (int k = 0; k < 8 && at >= 0; k++) {
+                chain += (k ? "," : "") + json(m.name(m.flops[at]));
+                int nx = -1;
+                for (int g : next[at])
+                    if (nx < 0 || m.name(m.flops[g]) < m.name(m.flops[nx])) nx = g;
+                at = c.how.find("synchronizer") == std::string::npos ? -1 : nx;
+            }
+            chain += "]";
+            std::string rule;
+            if (auto p = c.how.find("(CDC"); p != std::string::npos) rule = c.how.substr(p + 1, 6);
+            rows.push_back("{\"src\":" + json(m.name(s)) + ",\"sd\":" + std::to_string(domIx[m.name(s.dom)]) +
+                           ",\"dst\":" + json(m.name(f)) + ",\"dd\":" + std::to_string(domIx[m.name(f.dom)]) +
+                           ",\"how\":" + json(c.how) + ",\"rule\":" + json(rule) + ",\"chain\":" + chain + "}");
+        }
+        std::sort(rows.begin(), rows.end());
+        std::vector<std::string> rsts;
+        for (const ResetSync& r : resetSyncs)
+            rsts.push_back("{\"out\":" + json(m.name(*r.out)) + ",\"d\":" + std::to_string(domIx[m.name(r.out->dom)]) +
+                           ",\"stages\":" + std::to_string(r.stages) + ",\"flops\":" + std::to_string(r.flops) + "}");
+        std::sort(rsts.begin(), rsts.end());
+        std::string doms = "[";
+        for (size_t i = 0; i < domNames.size(); i++)
+            doms += (i ? "," : "") + std::string("{\"name\":") + json(domNames[i]) + ",\"flops\":" +
+                    std::to_string(domFlops[domNames[i]]) + "}";
+        doms += "]";
+        std::ofstream os(file);
+        if (!os) {
+            std::cerr << "mlint: -cdc-html " << file << ": cannot write\n";
+            return;
+        }
+        os << R"(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CDC: )" << esc(m.topName) << R"(</title>
+<style>
+:root{--bg:#fff;--fg:#1f2328;--mut:#59636e;--line:#d1d9e0;--sel:#eef4ff;--bad:#b42318}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--mut:#9198a1;--line:#30363d;--sel:#1b2a44;--bad:#ff7b72}}
+body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:16px 20px;border-bottom:1px solid var(--line)}h1{font-size:18px;margin:0 0 4px}
+.mut{color:var(--mut)}main{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:0}
+section{padding:12px 20px;min-width:0}#side{border-left:1px solid var(--line)}
+.legend span{display:inline-flex;align-items:center;gap:6px;margin:0 14px 6px 0}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block}
+input,select{font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+table{border-collapse:collapse;width:100%;margin-top:8px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-weight:600;color:var(--mut);font-size:12px}td{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
+tr.r{cursor:pointer}tr.r:hover,tr.on{background:var(--sel)}.bad{color:var(--bad);font-weight:600}
+svg text{font:12px ui-monospace,monospace;fill:var(--fg)}h2{font-size:14px;margin:16px 0 6px}
+</style></head><body>
+<header><h1>Clock-domain crossings of <span id="top"></span></h1><div class="mut" id="sum"></div></header>
+<main><section><div class="legend" id="legend"></div>
+<input id="q" placeholder="Filter by name" size="28"> <select id="kind"><option value="">All crossings</option><option value="bad">With a finding</option><option value="ok">Synchronized</option></select>
+<table><thead><tr><th>Source</th><th>Reader</th><th>How</th></tr></thead><tbody id="rows"></tbody></table></section>
+<section id="side"><h2>Path</h2><div id="path" class="mut">Pick a crossing.</div>
+<h2>Reset synchronizers</h2><table><thead><tr><th>Output</th><th>Stages</th><th>Resets</th></tr></thead><tbody id="rst"></tbody></table></section></main>
+<script>
+const TOP=)" << json(m.topName) << ",DOMS=" << doms << ",X=[";
+        for (size_t i = 0; i < rows.size(); i++) os << (i ? ",\n" : "\n") << rows[i];
+        os << "],R=[";
+        for (size_t i = 0; i < rsts.size(); i++) os << (i ? ",\n" : "\n") << rsts[i];
+        os << R"(];
+const PAL=['#2a78d6','#e0730b','#1a9b5a','#c43e9b','#7a5af5','#b8860b','#0f8c8c','#d1495b'];
+const col=i=>PAL[i%PAL.length];
+const el=(t,a={},...k)=>{const e=document.createElement(t);for(const[n,v]of Object.entries(a))e.setAttribute(n,v);for(const c of k)e.append(c);return e};
+document.getElementById('top').textContent=TOP;
+const bad=X.filter(x=>x.rule).length;
+document.getElementById('sum').textContent=`${DOMS.length} clock domains, ${X.length} crossings, ${bad} with a finding, ${R.length} reset synchronizers`;
+const lg=document.getElementById('legend');
+DOMS.forEach((d,i)=>lg.append(el('span',{},el('i',{class:'sw',style:'background:'+col(i)}),`${d.name} (${d.flops})`)));
+const sw=i=>el('i',{class:'sw',style:'background:'+col(i)+';margin-right:6px'});
+function show(x,tr){document.querySelectorAll('tr.on').forEach(r=>r.classList.remove('on'));tr.classList.add('on');
+ const n=[{t:x.src,d:x.sd}].concat(x.chain.map(t=>({t,d:x.dd})));const W=300,H=46,G=26;
+ const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('width',W+20);s.setAttribute('height',n.length*(H+G)+10);
+ n.forEach((b,i)=>{const y=5+i*(H+G);const r=document.createElementNS(s.namespaceURI,'rect');
+  Object.entries({x:10,y,width:W,height:H,rx:6,fill:'none',stroke:col(b.d),'stroke-width':2}).forEach(([k,v])=>r.setAttribute(k,v));s.append(r);
+  const t=document.createElementNS(s.namespaceURI,'text');t.setAttribute('x',20);t.setAttribute('y',y+19);t.textContent=b.t.length>40?'…'+b.t.slice(-39):b.t;s.append(t);
+  const c=document.createElementNS(s.namespaceURI,'text');c.setAttribute('x',20);c.setAttribute('y',y+36);c.setAttribute('fill-opacity','.7');c.textContent=(i==0?'source, ':i==1?'reader, ':'stage '+i+', ')+DOMS[b.d].name;s.append(c);
+  if(i<n.length-1){const l=document.createElementNS(s.namespaceURI,'line');Object.entries({x1:160,y1:y+H,x2:160,y2:y+H+G,stroke:i==0?'currentColor':col(b.d),'stroke-width':2,'stroke-dasharray':i==0?'4 3':''}).forEach(([k,v])=>l.setAttribute(k,v));s.append(l)}});
+ const p=document.getElementById('path');p.className='';p.replaceChildren(el('div',{class:x.rule?'bad':'mut'},x.how),s)}
+function draw(){const q=document.getElementById('q').value.toLowerCase(),k=document.getElementById('kind').value;const tb=document.getElementById('rows');tb.replaceChildren();
+ X.filter(x=>(!q||(x.src+' '+x.dst).toLowerCase().includes(q))&&(!k||(k=='bad')==!!x.rule)).forEach(x=>{
+  const tr=el('tr',{class:'r'},el('td',{},sw(x.sd),x.src),el('td',{},sw(x.dd),x.dst),el('td',{class:x.rule?'bad':''},x.how));tr.onclick=()=>show(x,tr);tb.append(tr)})}
+document.getElementById('q').oninput=draw;document.getElementById('kind').onchange=draw;draw();
+const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td',{},sw(r.d),r.out),el('td',{class:r.stages<2?'bad':''},String(r.stages)),el('td',{},String(r.flops)))));
+</script></body></html>
+)";
+        std::cerr << "mlint: -cdc-html " << file << ": " << rows.size() << " crossings\n";
+    }
+
+    // -cdc-abstract: the top's model, port by port, for -cdc-model.
+    void writeAbstract(const std::string& file) {
+        std::map<Sym, std::string> clockName;  // domain -> the top port that is its clock
+        std::set<Sym> doms;
+        for (const Flop& f : m.flops)
+            if (f.dom) doms.insert(f.dom);
+        for (const Model::TopPort& p : m.topPorts)
+            if (!p.output) {
+                Sym d = m.domainOf(m.canon(p.sym));
+                if (doms.count(d) && !clockName.count(d)) clockName[d] = p.name;
+            }
+        std::map<Sym, std::vector<int>> readers;  // input node -> flops that read it
+        std::set<Sym> inputs;
+        for (const Model::TopPort& p : m.topPorts)
+            if (!p.output) inputs.insert(m.canon(p.sym));
+        for (size_t i = 0; i < m.flops.size(); i++)
+            for (const Root& r : cones[i].all)
+                if (inputs.count(r.sym)) readers[r.sym].push_back((int)i);
+        auto clockOf = [&](Sym d) -> std::string {
+            auto it = clockName.find(d);
+            return it == clockName.end() ? std::string() : it->second;
+        };
+        std::ofstream os(file);
+        if (!os) {
+            std::cerr << "mlint: -cdc-abstract " << file << ": cannot write\n";
+            return;
+        }
+        os << "# CDC model of " << m.topName << ", written by mlint -cdc-abstract.\n"
+              "# Use it with -cdc-model in place of the module's RTL.\n"
+              "module " << m.topName << "\n";
+        int unknown = 0;
+        for (const Model::TopPort& p : m.topPorts) {
+            Sym c = m.canon(p.sym);
+            std::string kind;
+            if (!p.output) {
+                bool isClock = false;
+                for (auto& [d, n] : clockName) isClock = isClock || n == p.name;
+                if (isClock) {
+                    kind = "clock";
+                } else {
+                    std::set<std::string> clocks;
+                    bool synced = true, any = false;
+                    for (int i : readers[c]) {
+                        const Flop& f = m.flops[i];
+                        if (!f.dom) continue;
+                        any = true;
+                        clocks.insert(clockOf(f.dom));
+                        const auto& fr = cones[i].from;
+                        bool copy = f.plain && fr.size() == 1 && fr[0].sym == c && !fr[0].logic;
+                        synced = synced && copy && chainLen(i) >= 2;
+                    }
+                    if (!any) kind = "comb";
+                    else if (clocks.size() != 1 || clocks.begin()->empty()) kind = "mixed";
+                    else kind = std::string(synced ? "sync " : "data ") + *clocks.begin();
+                }
+            } else {
+                Tracer tr(m);
+                std::set<std::string> clocks;
+                bool flops = false;
+                for (const Root& r : tr.roots(c))
+                    if (const Flop* f = m.flopOf(r.sym); f && f->dom) {
+                        flops = true;
+                        clocks.insert(clockOf(f->dom));
+                    }
+                if (!flops) kind = "comb";
+                else if (clocks.size() != 1 || clocks.begin()->empty()) kind = "mixed";
+                else kind = "data " + *clocks.begin();
+            }
+            if (kind == "mixed") unknown++;
+            os << "  " << (p.output ? "output " : "input  ") << p.name << "  " << kind << "\n";
+        }
+        os << "end\n";
+        std::cerr << "mlint: -cdc-abstract " << file << ": " << m.topPorts.size() << " ports";
+        if (unknown) std::cerr << ", " << unknown << " mixed (more than one clock, or a clock that is not a port)";
+        std::cerr << "\n";
+    }
+
+    // -cdc-sva: a module of assertions on the crossings, by hierarchical
+    // name, to compile next to the design (an extra top, or bound into it).
+    // What makes each kind of crossing safe:
+    //   a one-bit synchronizer: the source holds a value for two reading
+    //     edges, or a pulse can fall between them (counted on every change,
+    //     since sampling on the reading clock can miss a fast toggle);
+    //   a Gray-coded or multi-bit bus: at most one bit changes per source
+    //     edge, so the reader sees the old or the new value;
+    //   an enable-qualified bus: the data does not change on the reading edge
+    //     where the synchronized control changes.
+    void writeSva(const std::string& file) {
+        auto ok = [](const std::string& n) { return !n.empty() && n.find("<protected>") == std::string::npos; };
+        auto edge = [&](const Flop& f) {
+            return std::string(f.negedge ? "negedge " : "posedge ") + m.name(f.dom);
+        };
+        // While a flop is in reset its value is not a crossing yet, and
+        // $past has no history: the check starts when the reset is released.
+        auto clocking = [&](const Flop& f) {
+            std::string c = "@(" + edge(f) + ")";
+            if (!f.arst.empty() && ok(m.name(f.arst[0])))
+                c += std::string(" disable iff (") + (f.arstHigh ? "" : "!") + m.name(f.arst[0]) + ")";
+            return c;
+        };
+        auto ident = [](std::string n) {
+            for (char& c : n)
+                if (!isalnum((unsigned char)c) && c != '_') c = '_';
+            while (n.find("__") != std::string::npos) n.erase(n.find("__"), 1);
+            return n;
+        };
+        struct Prop {
+            std::string key, text;
+        };
+        std::vector<Prop> props;
+        std::set<std::string> seen;
+        int skipped = 0;
+        for (const Crossing& c : crossings) {
+            if (c.check == NoCheck) continue;
+            const Flop& f = m.flops[c.flop];
+            const Flop& s = *m.flopOf(c.src);
+            std::string src = m.name(s), dst = m.name(f);
+            if (!ok(src) || !ok(dst) || !ok(m.name(f.dom)) || !ok(m.name(s.dom))) {
+                skipped++;
+                continue;
+            }
+            std::string label, body, what;
+            switch (c.check) {
+                case Stable:
+                    // Sampled on the reading clock a fast toggle can look
+                    // stable, so count the reading edges between changes.
+                    label = "stable_" + ident(src) + "_to_" + ident(m.name(f.dom));
+                    what = src + " changed again before two " + m.name(f.dom) + " edges: " + dst +
+                           " can miss a value";
+                    break;
+                case OneBit:
+                    label = "onebit_" + ident(src);
+                    body = clocking(s) + " $countones(" + src + " ^ $past(" + src + ")) <= 1";
+                    what = "more than one bit of " + src + " changed at once: " + dst + " can see a value it never had";
+                    break;
+                case Qualified: {
+                    const Flop* q = c.qual ? m.flopOf(c.qual) : nullptr;
+                    if (!q || !ok(m.name(*q))) {
+                        skipped++;
+                        continue;
+                    }
+                    label = "held_" + ident(src) + "_at_" + ident(m.name(*q));
+                    body = clocking(f) + " $changed(" + m.name(*q) + ") |-> $stable(" + src + ")";
+                    what = src + " changed as " + m.name(*q) + " said to take it into " + dst;
+                    break;
+                }
+                default: break;
+            }
+            if (!seen.insert(label).second) continue;
+            std::string t = "  // " + src + " (" + m.name(s.dom) + ") -> " + dst + " (" + m.name(f.dom) + "): " +
+                            c.how + "\n";
+            if (c.check == Stable) {
+                std::string n = "n_" + label;
+                t += "  int unsigned " + n + " = 2;  // " + m.name(f.dom) + " edges since " + src + " changed\n" +
+                     "  always @(" + edge(f) + ") if (" + n + " < 2) " + n + "++;\n" +
+                     "  always @(" + src + ") begin\n    cdc_" + label + ": assert (" + n +
+                     " >= 2) else $error(\"[mlint cdc] " + what + "\");\n    " + n + " = 0;\n  end\n";
+            } else {
+                t += "  cdc_" + label + ": assert property (" + body + ")\n    else $error(\"[mlint cdc] " + what +
+                     "\");\n";
+            }
+            props.push_back({label, t});
+        }
+        std::sort(props.begin(), props.end(), [](const Prop& a, const Prop& b) { return a.key < b.key; });
+        std::ofstream os(file);
+        if (!os) {
+            std::cerr << "mlint: -cdc-sva " << file << ": cannot write\n";
+            return;
+        }
+        os << "// Clock-domain crossing assertions, written by mlint -cdc-sva.\n"
+              "// Compile with the design and add mlint_cdc_sva as a second top\n"
+              "// (msim ... -top <top> -top mlint_cdc_sva), or bind it into the top.\n"
+              "module mlint_cdc_sva;\n";
+        for (auto& p : props) os << p.text;
+        os << "endmodule\n";
+        std::cerr << "mlint: -cdc-sva " << file << ": " << props.size()
+                  << (props.size() == 1 ? " assertion" : " assertions");
+        if (skipped) std::cerr << " (" << skipped << " crossings in protected code skipped)";
+        std::cerr << "\n";
+    }
+
     void report() {
         std::map<std::string, int> doms, rsts;
         std::map<std::string, std::string> sdcClocks;
@@ -1626,7 +2353,7 @@ inline void constrain(Model& m, const Options& opt) {
         std::vector<Sym> all;
         for (auto& [s, up] : m.join.up) all.push_back(s);
         for (Sym s : all)
-            if (isSignal(*s)) offer(s, path(*s));
+            if (isSignal(*s)) offer(s, m.pathOf(s));
         for (auto& [s, label] : m.labels) offer(s, label);
         if (!best) std::cerr << "mlint: " << what << " " << n << ": no such signal\n";
         return best ? m.join.find(best) : nullptr;
@@ -1750,6 +2477,104 @@ struct SdcView : cdcsdc::Design {
     }
 };
 
+
+// ------------------------------------------------------------- block models
+//
+// A CDC model of a block says, port by port, what the crossing checks need to
+// know about it, so a block can be checked once and then stand in for itself
+// in the SoC (or be a black box whose RTL is not there):
+//
+//   module cdc_block
+//     input  clk_a   clock               # a clock
+//     input  d       data clk_a          # read by flops clocked by clk_a
+//     input  req     sync clk_b          # synchronized into clk_b inside
+//     output q       data clk_b          # launched by a flop clocked by clk_b
+//     output y       comb                # combinational from inputs only
+//   end
+inline void readModels(Model& m, const std::vector<std::string>& files) {
+    for (const std::string& file : files) {
+        std::ifstream in(file);
+        if (!in) {
+            std::cerr << "mlint: -cdc-model " << file << ": cannot open\n";
+            continue;
+        }
+        std::string line, mod;
+        int n = 0;
+        while (std::getline(in, line)) {
+            n++;
+            if (auto h = line.find('#'); h != std::string::npos) line.erase(h);
+            std::istringstream ws(line);
+            std::vector<std::string> w;
+            for (std::string x; ws >> x;) w.push_back(x);
+            if (w.empty()) continue;
+            auto bad = [&](const char* why) {
+                std::cerr << "mlint: " << file << ":" << n << ": " << why << "\n";
+            };
+            if (w[0] == "module" && w.size() == 2) {
+                mod = w[1];
+                m.blockModels[mod];
+            } else if (w[0] == "end") {
+                mod.clear();
+            } else if ((w[0] == "input" || w[0] == "output") && w.size() >= 3 && !mod.empty()) {
+                Model::PortModel p{w[1], w[2], w.size() > 3 ? w[3] : "", w[0] == "output"};
+                bool known = p.kind == "clock" || p.kind == "comb" || p.kind == "mixed" ||
+                             ((p.kind == "data" || p.kind == "sync") && !p.clock.empty());
+                if (!known) { bad("expected clock, data CLK, sync CLK, comb or mixed"); continue; }
+                m.blockModels[mod].push_back(p);
+            } else {
+                bad("expected module NAME, input/output PORT KIND [CLOCK], or end");
+            }
+        }
+    }
+}
+
+// After the design is gathered: each modeled instance becomes the flops its
+// model describes, on the nets its ports connect to.
+inline void applyModels(Model& m, Compilation& comp) {
+    for (const InstanceSymbol* inst : m.modeled) {
+        const auto& ports = m.blockModels.at(std::string(inst->getDefinition().name));
+        std::map<std::string, const ValueSymbol*> sym;
+        for (const Symbol* ps : inst->body.getPortList())
+            if (ps->kind == SymbolKind::Port)
+                if (const Symbol* in = ps->as<PortSymbol>().internalSymbol; in && isSignal(*in))
+                    sym[std::string(ps->name)] = &in->as<ValueSymbol>();
+        std::string here = path(*inst);
+        for (const Model::PortModel& p : ports) {
+            auto it = sym.find(p.port);
+            const ValueSymbol* clk = p.clock.empty() ? nullptr : (sym.count(p.clock) ? sym[p.clock] : nullptr);
+            if (it == sym.end() || (!p.clock.empty() && !clk)) {
+                std::cerr << "mlint: -cdc-model " << inst->getDefinition().name << ": no port "
+                          << (it == sym.end() ? p.port : p.clock) << "\n";
+                continue;
+            }
+            const ValueSymbol* port = it->second;
+            if (p.kind != "data" && p.kind != "sync") continue;
+            if (p.output) {  // launched by a flop of that clock
+                Flop& f = m.flop(port, inst->location);
+                f.clkSym = clk;
+                continue;
+            }
+            // Read by one flop (data), or by a two-flop synchronizer (sync).
+            Sym from = m.canon(port);
+            for (int stage = 1; stage <= (p.kind == "sync" ? 2 : 1); stage++) {
+                m.sliceNames.push_back(here + "." + p.port + (p.kind == "sync" ? " (synchronizer " +
+                                       std::to_string(stage) + " in the model)" : " (read in the model)"));
+                auto* v = comp.emplace<VariableSymbol>(std::string_view(m.sliceNames.back()), inst->location,
+                                                       VariableLifetime::Static);
+                v->setType(port->getType());
+                m.sliceLabel[v] = &m.sliceNames.back();
+                Flop& f = m.flop(v, inst->location);
+                f.clkSym = clk;
+                f.data = {from};
+                f.from = from;
+                f.fromBits = f.bits;
+                f.plain = p.kind == "sync";  // data: logic in the block reads it
+                from = v;
+            }
+        }
+    }
+}
+
 // Reads the SDC files: where each clock starts and how each pair is related.
 //   - a generated clock is synchronous to its master;
 //   - set_clock_groups -asynchronous makes the groups asynchronous to each
@@ -1864,6 +2689,20 @@ inline void check(Compilation& comp, Report& rep, const Options& opt) {
     Prof prof;
     auto lap = [&](const char* what) { prof.lap(what); };
     Model m;
+    readModels(m, opt.models);
+    for (const InstanceSymbol* top : comp.getRoot().topInstances) {
+        if (!m.topName.empty()) break;
+        m.topName = std::string(top->getDefinition().name);
+        for (const Symbol* ps : top->body.getPortList())
+            if (ps->kind == SymbolKind::Port)
+                if (const Symbol* in = ps->as<PortSymbol>().internalSymbol; in && isSignal(*in))
+                    m.topPorts.push_back({std::string(ps->name),
+                                          ps->as<PortSymbol>().direction == ArgumentDirection::Out, in});
+    }
+    Slicer slicer(m, comp);
+    comp.getRoot().visit(slicer);
+    slicer.finish();
+    lap("slices");
     Ports ports(m);
     comp.getRoot().visit(ports);
     ports.finish();
@@ -1871,6 +2710,7 @@ inline void check(Compilation& comp, Report& rep, const Options& opt) {
     Gather g(m);
     comp.getRoot().visit(g);
     ports.finishBits();
+    applyModels(m, comp);
     lap("gather");
     m.sealCombs();
     m.nameNodes();
