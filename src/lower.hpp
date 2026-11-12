@@ -5461,7 +5461,8 @@ struct Lowerer {
         if (dst.isFloating()) return rl ? v : txt ? v : un(Op::IToR, v);
         if (txt) { v = node(Op::StrToInt, {v}); v->hi = w; return v; }
         if (rl) return rtoi(v, w, dst.isSigned(), false);
-        return resize(v, w, true, dst.isSigned());
+        // %d reads a signed number; %h, %o, %b digits are zero-extended (21.3.4.3)
+        return resize(v, w, c == 'd', dst.isSigned());
     }
     // $fscanf / $sscanf (21.3.4): one node reads everything; then each output
     // that a conversion reached is written. Returns the count.
