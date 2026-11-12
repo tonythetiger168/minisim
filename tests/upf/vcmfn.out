@@ -1,0 +1,3 @@
+1 start: VF=OFF 0 VM=OFF 0 | vr=0 vi=0
+2 on: VF=FULL_ON 1100000 VM=FULL_ON 1200000 | vr=1.1 vi=2
+3 low: VF=PARTIAL_ON 500000 VM=OFF 0 | vr=0.5 vi=0

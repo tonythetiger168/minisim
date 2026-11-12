@@ -2227,17 +2227,23 @@ int main(int argc, char** argv) {
             }
             rt.m.top = top;
             rt.m.addHdlAttrs(upfHdlAttrs(*comp));   // (* UPF_... *) in the HDL (5.6)
-            if (!rt.m.bindCheckers.empty()) {
-                static std::string bindText;
-                // the simulation top: a checker module nothing instantiates yet is a top too
-                std::string simTop = S.vcdTop;
+            // the simulation top: a checker module nothing instantiates yet is a top too
+            std::string simTop = S.vcdTop;
+            {
                 std::set<std::string> checkers;
                 for (auto& b : rt.m.bindCheckers) checkers.insert(b.module);
+                for (auto& [n, v] : rt.m.vcms)   // and so is a model VCM's module (6.30.9)
+                    if (v.kind == upf::Vcm::Model) checkers.insert(v.model.substr(v.model.rfind('.') == std::string::npos ? 0 : v.model.rfind('.') + 1));
                 std::vector<std::string> real;
                 for (auto* t : comp->getRoot().topInstances)
                     if (!checkers.count(std::string(t->getDefinition().name))) real.push_back(std::string(t->name));
                 if (real.size() == 1) simTop = real[0];
-                bindText = rt.m.bindSource(simTop);
+            }
+            // function and model VCMs (6.30.8, 6.30.9) are placed in the design too
+            std::string vcmText = rt.m.connectVcm.empty() ? std::string() : rt.vcmSource(*comp, simTop);
+            if (!rt.m.bindCheckers.empty() || !vcmText.empty()) {
+                static std::string bindText;
+                bindText = (rt.m.bindCheckers.empty() ? std::string() : rt.m.bindSource(simTop)) + vcmText;
                 if (upfVerbose) std::cout << "UPF: " << bindText;
                 driver.syntaxTrees.push_back(slang::syntax::SyntaxTree::fromText(bindText, driver.sourceManager, "upf_bind_checker.sv", "",
                                                                                  driver.createOptionBag()));
