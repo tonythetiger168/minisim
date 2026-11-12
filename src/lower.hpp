@@ -4722,6 +4722,20 @@ struct Lowerer {
                     E v = expr(c.operand(), ExprCtx{dst, c.operand().type->isSigned(), c.type->isSigned(), true});
                     return sized(std::move(v), dst, c.type->isSigned(), ctx);
                 }
+                if (c.conversionKind == ConversionKind::Explicit && c.type->isIntegral() &&
+                    c.operand().type->isIntegral() &&
+                    ((int)c.operand().type->getBitWidth() > dst ||
+                     ((int)c.operand().type->getBitWidth() == dst && ctx.live && ctx.w > dst))) {
+                    // A narrowing cast (6.24.1): the operand is worked out at its
+                    // own width, 16'((a + 32'd4) >> 1) keeps the carry, and cut to
+                    // the cast's; a wider context extends only that result, so
+                    // 16'(a + k) < 32 compares 16 bits.
+                    needWidth(dst);
+                    int ow = (int)c.operand().type->getBitWidth();
+                    bool os = c.operand().type->isSigned();
+                    E v = resize(expr(c.operand(), ExprCtx{ow, os, os, true}), dst, false, c.type->isSigned());
+                    return sized(std::move(v), dst, c.type->isSigned(), ctx);
+                }
                 bool fill, tag;
                 if (ctx.live && ctx.w > 0) {
                     dst = ctx.w;
