@@ -32,6 +32,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI drivers and loads (37.16, 37.17): `vpiDriver`, `vpiLoad`,
+  `vpiLocalDriver`, `vpiLocalLoad` and `vpiPortInst` on nets and variables
+  give continuous assignments and instance ports, following whole-signal
+  port connections through the hierarchy. `tests/spec/37-vpi-drivers.sv`.
 - VPI structs, containers and classes (37.17, 37.18, 37.29): unpacked
   struct and union variables with `vpiMember` (also of packed ones),
   dynamic arrays, queues and associative arrays with their elements, class

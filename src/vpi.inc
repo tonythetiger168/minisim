@@ -20,6 +20,7 @@
 #include "../include/sv_vpi_user.h"
 #include "version.hpp"
 #include "slang/ast/ASTContext.h"
+#include "slang/ast/ASTVisitor.h"
 #include "slang/ast/SystemSubroutine.h"
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
@@ -2148,6 +2149,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     // protected object can be iterated.
     if (!(type == vpiArgument && o->kind == Obj::Call) && vpi::denied(o, "vpi_iterate")) return nullptr;
     if (vpi::isCode(o)) return vpi::codeIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
+    if (vpi::netConn(type, o, items)) return vpi::iter(std::move(items));   // drivers, loads (37.16, 37.17)
     if (type == vpiMember) {   // the members of a struct or union variable (37.17)
         if (!vpi::isStructObj(o)) return nullptr;
         vpi::members(o, items);
