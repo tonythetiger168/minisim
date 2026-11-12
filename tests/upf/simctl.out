@@ -1,0 +1,17 @@
+5 a_known failed
+5 a_kill failed
+5 a_expr failed
+12 on: v=1.50 q=0 n=0 qm=9
+15 a_expr failed
+25 a_expr failed
+32 VDD_SW off: v=1.50 q=x n=2 qm=9
+35 a_known failed
+35 a_expr failed
+45 a_known failed
+45 a_expr failed
+52 VDD_SW on, q is x until reset: v=1.50 q=x n=4 qm=9
+55 a_known failed
+65 a_known failed
+72 quiet: v=1.50 q=x n=6 qm=9
+75 a_known failed
+102 reset: v=1.50 q=2 n=2 qm=9

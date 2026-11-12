@@ -256,6 +256,23 @@ inline AV aeval(const E& e, bool& exact) {
             if (a.w + sh > kMaxW) return full(a.w, a.sgn);
             return wrap(u.lo << sh, u.hi << sh, a.w, a.sgn);
         }
+        case Op::DynHas: {   // x inside {q} (11.4.13, 18.5.4): x equals some element of q
+            bool ea;
+            AV a = aeval(e->kids[0], ea);
+            if (ea) return concrete(e, exact);
+            exact = false;
+            const DynObj& d = dynStore()[R(e->sig)];
+            if (d.kind == 2) return boolAV(true, true);
+            bool t = false;
+            for (const Val& el : d.vec) {
+                i128 x;
+                if (!valOf(el, x)) { t = true; break; }   // an x / z element: left to the final check
+                int w = std::max(a.w, el.w);
+                bool s = a.sgn && el.sgn;
+                if (canTrue(boolOp(ival::Op::Eq, conv(a, w, s), conv(single(x, el.w, el.sgn), w, s)))) { t = true; break; }
+            }
+            return boolAV(true, t);
+        }
         default: {
             // Anything else: exact when nothing it reads is unsolved.
             return concrete(e, exact);

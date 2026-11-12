@@ -1,19 +1,60 @@
 #!/usr/bin/env python3
-"""bench/gen_soc.py N [CYCLES] - a synthetic SoC-shaped design for the tool benchmarks.
+"""bench/gen_soc.py [--core synthetic|ibex|picorv32|femtorv32] N [CYCLES] - a SoC-shaped design.
 
-N cores, each a small pipeline: an LFSR stimulus, a 4-state FSM, an ALU with a
-case decode, a 16-entry register file, an accumulator, and a two-flop
-synchronizer into a second clock domain. Hierarchy is soc_top -> cluster ->
-core -> alu, so waveform scopes, coverage files and lint/DFT walks all see a
-realistic instance tree. The testbench prints a checksum and finishes after
-CYCLES cycles of the fast clock (default 2000).
+--core picks what each of the N cores is (default synthetic). The three real
+RISC-V cores hand over to bench/gen_rv_soc.py, which gives every core 1 KB of
+RAM with a program in it and prints cores_ran=N/N, a checksum and the loop
+count. They are not part of minisim; see bench/README.md for their sources.
+
+  core       license     RTL                    CPI*  msynth area   pros / cons
+  synthetic  (ours)      generated SV           -     -             + fastest to build, every tool reads it
+                                                                    - not a real design
+  ibex       Apache-2.0  SystemVerilog, 29k     1.3   not read yet  + real chip core (OpenTitan), 2-stage
+             (lowRISC)   lines with prims                           pipeline, exercises SV most
+                                                                    - biggest: slowest to build and run
+  picorv32   ISC         Verilog-2005, one      5.6   16.1k         + plain Verilog, every simulator and
+             (YosysHQ)   file, 3k lines                             msynth read it; widely used, mature
+                                                                    - multi-cycle, ~4x slower per clock
+  femtorv32  BSD-3       Verilog, one file,     6.7   12.2k         + smallest RTL, fastest real core
+             (B. Levy)   420 lines (Quark)                          to build
+                                                                    - teaching core, little use in
+                                                                    industry; 1-bit-per-cycle shifter;
+                                                                    needs -DBENCH (else x never clears)
+  * cycles per instruction on the generated program, measured on msim
+    and Verilator (same loop counts); bench/README.md has build and run times.
+
+Recommended use:
+  synthetic  quick smoke tests and scaling runs of every tool (cores, waves, coverage, lint)
+  ibex       realism and SystemVerilog coverage: the closest to a real SoC
+  picorv32   cross-tool compatibility (Icarus, Verilator, msynth, other simulators)
+  femtorv32  scale and speed limits with a real CPU: most cores per build
+
+The synthetic design: N cores, each a small pipeline: an LFSR stimulus, a
+4-state FSM, an ALU with a case decode, a 16-entry register file, an
+accumulator, and a two-flop synchronizer into a second clock domain.
+Hierarchy is soc_top -> cluster -> core -> alu, so waveform scopes, coverage
+files and lint/DFT walks all see a realistic instance tree. The testbench
+prints a checksum and finishes after CYCLES cycles of the fast clock
+(default 2000).
 
     python3 bench/gen_soc.py 64 > soc.sv && msim soc.sv -top soc_tb
 """
+import os
 import sys
 
-n = int(sys.argv[1]) if len(sys.argv) > 1 else 64
-cycles = int(sys.argv[2]) if len(sys.argv) > 2 else 2000
+args = sys.argv[1:]
+if args[:1] in (["-h"], ["--help"]):
+    print(__doc__)
+    sys.exit(0)
+if len(args) >= 2 and args[0] in ("--core", "--cpu"):
+    core, args = args[1], args[2:]
+    if core in ("ibex", "picorv32", "femtorv32"):
+        rv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen_rv_soc.py")
+        os.execv(sys.executable, [sys.executable, rv, "--cpu", core] + args)
+    if core != "synthetic":
+        sys.exit("gen_soc.py: --core synthetic, ibex, picorv32 or femtorv32")
+n = int(args[0]) if len(args) > 0 else 64
+cycles = int(args[1]) if len(args) > 1 else 2000
 per_cluster = 8
 clusters = (n + per_cluster - 1) // per_cluster
 
