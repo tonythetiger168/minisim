@@ -3,6 +3,8 @@
 // pair), vpiModPathIn / vpiModPathOut their terms (vpiEdge, vpiExpr: the
 // signal), vpiModPathHasIfNone; vpi_get_delays reads a path's delays and
 // vpi_put_delays changes them: y then follows a with rise 5, fall 6.
+// vpiPathType (full / parallel), vpiPolarity, vpiCondition (the if
+// expression) and vpiModDataPathIn with vpiDataPolarity (edge-sensitive).
 //! icarus-skip: Icarus 13 has no module path delays through VPI
 //! args: data/vpi/modpath.c
 `timescale 1ns/1ns
@@ -11,8 +13,9 @@ module bufp(input a, input clk, input d, output y, output reg q);
   always @(posedge clk) q <= d;
   specify
     (a => y) = (2, 3);
+    (d -*> y) = 1;
     (posedge clk => (q +: d)) = 4;
-    if (d) (clk => q) = 1;
+    if (d && a) (clk => q) = 1;
     ifnone (clk => q) = 2;
   endspecify
 endmodule
@@ -30,13 +33,19 @@ module top;
   end
   always @(y) $display("%0t y %b", $time, y);
 endmodule
-//> 3 y 0
+//> 1 y 0
 //> 12 y 1
 //> 23 y 0
 //> vpiModPath ifnone 0: in a edge 0 out y (top.b.y) delays 2 3 2
+//>   type 2 polarity 3
+//> vpiModPath ifnone 0: in d edge 0 out y (top.b.y) delays 1 1 1
+//>   type 1 polarity 2
 //> vpiModPath ifnone 0: in clk edge 13 out q (top.b.q) delays 4 4 4
+//>   type 2 polarity 3 data d polarity 1
 //> vpiModPath ifnone 0: in clk edge 0 out q (top.b.q) delays 1 1 1
+//>   type 2 polarity 3 cond d && a
 //> vpiModPath ifnone 1: in clk edge 0 out q (top.b.q) delays 2 2 2
+//>   type 2 polarity 3
 //> a => y now: delays 5 6 5
 //> 35 y 1
 //> 46 y 0

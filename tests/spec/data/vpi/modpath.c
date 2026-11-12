@@ -22,6 +22,15 @@ static PLI_INT32 run(PLI_BYTE8* u) {
         vpi_printf(" (%s)", vpi_get_str(vpiFullName, vpi_handle(vpiExpr, t)));
         delays(p);
         vpi_printf("\n");
+        vpi_printf("  type %d polarity %d", vpi_get(vpiPathType, p), vpi_get(vpiPolarity, p));
+        if ((t = vpi_handle(vpiCondition, p))) vpi_printf(" cond %s", vpi_get_str(vpiDecompile, t));
+        ti = vpi_iterate(vpiModDataPathIn, p);
+        if (ti && (t = vpi_scan(ti))) {
+            vpi_printf(" data %s", vpi_get_str(vpiName, t));
+            vpi_printf(" polarity %d", vpi_get(vpiDataPolarity, p));
+            vpi_scan(ti);
+        }
+        vpi_printf("\n");
     }
     {
         s_vpi_time v[2] = {{vpiScaledRealTime, 0, 0, 5.0}, {vpiScaledRealTime, 0, 0, 6.0}};

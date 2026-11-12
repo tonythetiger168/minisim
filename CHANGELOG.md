@@ -32,6 +32,8 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI module path properties: `vpiPathType`, `vpiPolarity`,
+  `vpiDataPolarity`, `vpiCondition` and `vpiModDataPathIn` (37, 38.10).
 - VPI delays of continuous assignments (38.10): `vpi_get_delays` /
   `vpi_put_delays` on a `vpiContAssign` with a delay.
   `tests/spec/38.10-vpi-assign-delay.sv`.

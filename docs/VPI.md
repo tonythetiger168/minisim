@@ -295,9 +295,12 @@ pair (`(a, b *> y)` is two), with `vpiModPathHasIfNone`.
 with `vpiName`, `vpiDirection`, `vpiEdge` (the input's edge) and `vpiExpr`
 (the signal). `vpi_get_delays` / `vpi_put_delays` read and write the
 path's delays (1, 2, 3, 6 or 12 values, `pulsere_flag` pulse limits,
-`append_flag`); a new delay takes effect for the next change. Not yet: the
-condition of a path as an object, `vpiPathType`, `vpiPolarity`, and a data
-path's `vpiModDataPathIn`.
+`append_flag`); a new delay takes effect for the next change. A path also
+has `vpiPathType` (`vpiPathFull` for `*>`, `vpiPathParallel` for `=>`),
+`vpiPolarity` (`+`, `-` or unknown), `vpiLineNo`, `vpi_handle(vpiCondition)`
+(the `if` expression of a state-dependent path) and, for an edge-sensitive
+path, `vpi_iterate(vpiModDataPathIn)` (the data source) with
+`vpiDataPolarity`.
 
 **Primitives (37, 38.10).** `vpi_iterate(vpiPrimitive, module)` gives the
 gate, switch and UDP instances of a module; `vpiGate`, `vpiSwitch` and
