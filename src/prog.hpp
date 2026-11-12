@@ -433,6 +433,12 @@ struct Prog {
     // fork branch that is a named block, every branch of a named fork).
     // `disable` of one of them from another process ends the process.
     std::vector<int> roots;
+    // Named blocks and tasks some `disable` names (9.6.2): code [s, e) is
+    // block id, and a process there resumes at e when it is disabled. A
+    // task's whole body is one span with e = SIZE_MAX: its caller resumes
+    // after the call.
+    struct Span { int id; size_t s, e; };
+    std::vector<Span> spans;
     // A static combinational process with deferred assertions (a unique
     // case's violation check): the ProcCtl its reports are queued under.
     // Each evaluation is a flush point (16.4.2), as the wait of the process is.
@@ -445,6 +451,9 @@ struct Prog {
     }
     size_t here() const { return code.size(); }
 };
+
+// Some Prog has spans: processes are tracked for disable (9.6.2).
+inline bool& anySpans() { static bool b = false; return b; }
 
 // ---- helpers shared by lowering and tests ----
 // Signals an expression reads, each once, in first-read order. A variable
@@ -641,7 +650,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
     const Instr& w = p.code[n - 2];
     const Instr& j = p.code[n - 1];
     if (j.k != IK::Jmp || j.target != 0 || w.k != IK::WaitEdge) return false;
-    if (!p.roots.empty()) return false;  // another process can `disable` it
+    if (!p.roots.empty() || !p.spans.empty()) return false;  // another process can `disable` it
     c = CombShape{};
     for (size_t i = 0; i + 2 < n; i++) {
         // An always_comb with if / case / loops: jumps that stay in the body.
@@ -805,7 +814,7 @@ inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
     const Instr& w = p.code[0];
     const Instr& j = p.code[n - 1];
     if (w.k != IK::WaitEdge || j.k != IK::Jmp || j.target != 0) return false;
-    if (!p.roots.empty()) return false;  // another process can `disable` it
+    if (!p.roots.empty() || !p.spans.empty()) return false;  // another process can `disable` it
     for (size_t i = 1; i + 1 < n; i++) {
         const Instr& x = p.code[i];
         if (x.k == IK::Nba) {
