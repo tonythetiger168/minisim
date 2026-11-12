@@ -10513,9 +10513,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (w > 64 || !v.getType().isIntegral()) Lowerer::unsupported("a free checker variable wider than 64 bits or not integral");
         bool isConst = v.flags.has(VariableFlags::Const);
         bool active = !isConst && !freeAssigned.count(&v);
-        if (active && checkerAssumes)
-            Lowerer::unsupported("free checker variables constrained by assume statements (17.7.2)");
-        out.freeVars.push_back({sigmap.at(&v), active});
+        // With assume statements, active ones change only at the assume
+        // set's clock, solved there (17.7.2), not in every time step.
+        out.freeVars.push_back({sigmap.at(&v), active && !checkerAssumes});
     }
     void handle(const slang::ast::CheckerInstanceSymbol& ci) {
         using namespace slang::ast;
@@ -10545,9 +10545,22 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         std::swap(freeAssigned, scan.assigned);
         bool savedAssumes = checkerAssumes;
         checkerAssumes = scan.assumes;
+        // The active free variables of this checker (17.7.2): its assume set
+        // solves for them. They are read as they are, also in assertions.
+        Lowerer::FreeSolve fs;
+        if (scan.assumes)
+            for (const auto& v : ci.body.membersOfType<VariableSymbol>())
+                if (v.flags.has(VariableFlags::CheckerFreeVariable) && !v.flags.has(VariableFlags::Const) &&
+                    !freeAssigned.count(&v) && sigmap.count(&v)) {
+                    fs.vars.push_back(sigmap.at(&v));
+                    Lowerer::svaLiveSigs().insert(sigmap.at(&v));
+                }
+        fs.active = !fs.vars.empty();
+        std::swap(Lowerer::freeSolve(), fs);
         checkerDepth++;
         visitDefault(ci);
         checkerDepth--;
+        std::swap(Lowerer::freeSolve(), fs);
         checkerAssumes = savedAssumes;
         for (const auto& c : ci.getPortConnections()) {
             if (c.formal.kind != SymbolKind::FormalArgument) continue;

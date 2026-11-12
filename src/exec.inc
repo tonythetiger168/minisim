@@ -1172,6 +1172,15 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     c.pending.push_back({ctl, ctl->epoch, caps});
     S.rare = true;
 }
+// The assume set of a checker ticked (17.7.2): new random values for its
+// active free variables, tried again while an assumption would fail now.
+static void freeSolveNow(ConcAssert& c) {
+    if (c.solveVars.empty()) return;
+    for (int t = 0; t < 4096; t++) {   // random tries: no search, so a narrow assume set can still miss (allowed)
+        for (int v : c.solveVars) S.set(v, S.freeValue(v));
+        if (!c.solveOk || truth(eval(c.solveOk, rd)) == 1) return;
+    }
+}
 // A multiclock assertion (16.13): one process per clock marks it ticked;
 // the first in a time step runs the assertion in the observed region, once,
 // with every clock that ticked in that step.
@@ -1183,6 +1192,7 @@ inline Task concClockProc(int k, int ci) {
         if (ev->size() > 1) co_await WaitAny{ev};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
         if (iff && truth(eval(iff, rd)) != 1) continue;
+        if (ci == 0) freeSolveNow(c);
         c.ticked |= 1u << ci;
         if (c.due) continue;
         c.due = true;
@@ -1200,6 +1210,7 @@ inline Task concProc(int k) {
         if (ev->size() > 1) co_await WaitAny{ev};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
         if (c.clkIff && truth(eval(c.clkIff, rd)) != 1) continue;   // @(posedge clk iff en)
+        freeSolveNow(c);
         co_await ToObserved{};
         concTick(c);
     }
