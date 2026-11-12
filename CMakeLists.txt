@@ -71,6 +71,13 @@ endif()
 add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
+# The SAIF reader (src/saif.hpp), state- and path-dependent counts included.
+find_package(Threads REQUIRED)
+add_executable(test_saif tests/test_saif.cpp)
+target_include_directories(test_saif PRIVATE src)
+target_compile_options(test_saif PRIVATE -UNDEBUG)
+target_link_libraries(test_saif PRIVATE Threads::Threads)
+add_test(NAME test_saif COMMAND test_saif ${CMAKE_SOURCE_DIR}/tests/power/gates_sdpd.saif)
 
 # The mini45 cell library: generator check and install rules.
 include(cmake/tools/mini45.cmake)

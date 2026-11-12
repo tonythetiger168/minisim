@@ -612,6 +612,9 @@ Spec references are IEEE 1800-2023 clauses.
   against 5.8 s. Build option `MINISIM_WITH_BSIM4`.
 - `mspice`: unknowns fixed by a voltage source to ground are eliminated
   first, which keeps the pivots of a long chain of gain stages usable.
+- `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
+  / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
+  state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
 - msim: four faults found by re-measuring the spec table with uvm-core.
