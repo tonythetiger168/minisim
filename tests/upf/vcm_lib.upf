@@ -1,0 +1,8 @@
+# A UPF library file for vcm.upf (6.36): only create_upf_library.
+create_upf_library ilib -contents {
+    create_vcm U2I -hdl_type {sv integer} -conversion_direction upf2hdl \
+        -table {{{FULL_ON} {2}} {{PARTIAL_ON} {1}} {{OFF} {0}} {{UNDETERMINED} {-32768}}}
+    create_vcm E2U -hdl_type {sv temp_pkg::temp_e} -conversion_direction hdl2upf \
+        -table {{{HOT} {FULL_ON 2.5}} {{MILD} {PARTIAL_ON 1.5}} {{COLD} {OFF}} {{FROZEN} {OFF}}}
+    create_vcm BUNDLE -vcms {U2I .::E2U}
+}
