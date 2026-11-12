@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- UPF information model and Tcl queries (IEEE 1801-2024 clause 10, 11.1):
+  `upf_query_object_properties`, `upf_query_object_type`,
+  `upf_object_in_class`, `upf_query_object_pathname` and `query_upf`, with
+  phase 5 enforced after the first query (docs/LOWPOWER.md).
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
   width with subnormals and all five rounding modes: `MW_fp_add`,
   `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
@@ -15,6 +19,10 @@ Spec references are IEEE 1800-2023 clauses.
   `MW_fp_flt2i`, `MW_fp_mac` (fused multiply-add), `MW_fp_recip`,
   `MW_fp_flt2flt` (format conversion) and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
   them against an exact rational reference (docs/DATAPATH.md).
+
+### Fixed
+- The `SV_TIED_HI`, `SV_TIED_LO`, `VHDL_TIED_HI` and `VHDL_TIED_LO` value
+  conversion tables are upf2hdl tables, as in IEEE 1801-2024 Annex B.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,

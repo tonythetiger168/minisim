@@ -40,6 +40,22 @@ execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${D}/find.upf -only upf
 if(NOT rc EQUAL 0 OR NOT out MATCHES "0 findings")
   message(FATAL_ERROR "mlint find.upf is not clean: ${rc}\n${out}${err}")
 endif()
+# The information model and its queries (clause 10, 11.1): query.upf runs
+# after gating.upf and checks every answer itself.
+file(READ ${D}/gating.upf g)
+file(READ ${D}/query.upf q)
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/query_all.upf "${g}${q}")
+execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/query_all.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ ${D}/gating.out want)
+if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
+  message(FATAL_ERROR "query.upf (msim): ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/query_all.upf -only upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "0 findings")
+  message(FATAL_ERROR "query.upf (mlint): ${rc}\n${out}${err}")
+endif()
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badfind.upf "set_design_top dut\nfind_objects u_nope -pattern *\n")
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/badfind.upf
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)

@@ -34,7 +34,10 @@ inline void walkDesign(const slang::ast::Scope& sc, const std::string& path, Des
         return std::string(sm.getFileName(f)) + ":" + std::to_string(sm.getLineNumber(f));
     };
     for (const Symbol& m : sc.members()) {
-        if (m.kind == SymbolKind::Variable || m.kind == SymbolKind::Net) dv.signals.insert(in(std::string(m.name)));
+        if (m.kind == SymbolKind::Variable || m.kind == SymbolKind::Net) {
+            dv.signals.insert(in(std::string(m.name)));
+            dv.width[in(std::string(m.name))] = (int)m.as<ValueSymbol>().getType().getBitWidth();
+        }
         if (m.kind == SymbolKind::Instance) {
             const auto& ch = m.as<InstanceSymbol>();
             std::string p = in(std::string(ch.name));

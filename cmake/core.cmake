@@ -51,6 +51,7 @@ set(MINISIM_CORE_HEADERS
     tcl.hpp
     upf.hpp
     upf_vct.hpp
+    upf_query.hpp
     upf_rt.inc
     vpi.inc
     wave_reader.hpp)
