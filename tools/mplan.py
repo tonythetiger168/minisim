@@ -82,10 +82,8 @@ uncovered requirement or an unknown id, and ``init -reqs`` drafts a plan
 with one feature per requirement.
 
 Ranking. ``mplan rank`` reads the coverage database of every run (mregress
--cov keeps one per run) and says what each test adds. A coverage point is a
-line, a branch outcome, a toggle direction of a bit, a condition vector, an
-FSM state or transition, a covergroup bin, or an assertion that passed (a
-cover that was hit). The tests are ordered greedily: first the one with the
+-cov keeps one per run) and says what each test adds. The coverage points
+are mcov's items (``mcov rank`` counts the same ones, per database file). The tests are ordered greedily: first the one with the
 most points, then the one that adds the most new points, and so on (``-by
 rate``: the most new points per second of run time). The table gives each
 test's new points, the coverage so far, its run time, and its unique points
@@ -889,138 +887,89 @@ def write_trace(order, path):
 
 # ---------------------------------------------------------------- per-test coverage and ranking
 
-def _cov_points(path):
-    """The coverage points of one run's database, per owner (a file, a signal, an FSM, a
-    covergroup item, an assertion): {(kind, owner): (covered, all)}. For lines and toggles
-    the two are bit masks (bit = line number; bit = rise of bit i, then fall); for the
-    other kinds they are lists of point keys."""
-    try:
-        db = tool("mcov").load(path)
-    except (OSError, ValueError, KeyError, SystemExit):
-        return None
-    out = {}
-    for (f, ln), h in db["lines"].items():
-        c, a = out.get(("line", f), (0, 0))
-        out[("line", f)] = (c | (1 << ln) if h else c, a | (1 << ln))
-    for (f, ln, n), (t, fl) in db["branches"].items():
-        c, a = out.setdefault(("branch", f), ([], []))
-        a += [(ln, n, 1), (ln, n, 0)]
-        if t:
-            c.append((ln, n, 1))
-        if fl:
-            c.append((ln, n, 0))
-    for name, (w, r, fall) in db["toggles"].items():
-        out[("toggle", name)] = (r | (fall << w), (1 << (2 * w)) - 1)
-    for (f, ln, col, text), (_op, _terms, hits) in db["conds"].items():
-        c, a = out.setdefault(("cond", f), ([], []))
-        for i, h in enumerate(hits):
-            a.append((ln, col, text, i))
-            if h:
-                c.append((ln, col, text, i))
-    for (_mod, inst, name), m in db["fsms"].items():
-        c, a = out.setdefault(("fsm", f"{inst}.{name}"), ([], []))
-        for v, (_n, h) in m["states"].items():
-            a.append(("s", v))
-            if h:
-                c.append(("s", v))
-        for (x, y), (h, _r) in m["trans"].items():
-            a.append(("t", x, y))
-            if h:
-                c.append(("t", x, y))
-    for tname, (_w, _g, items) in db["cgs"].items():
-        for iname, it in items.items():
-            # A cross lists only the bins that were hit: the item's bin total rides along.
-            out[("cover", f"{tname}.{iname}")] = ([b for b, h in it[5].items() if h], [("#total", it[4])] + list(it[5]))
-    for name, (kind, _evals, passes, fails) in db["asserts"].items():
-        out[("assert", name)] = ([0] if passes and (kind == "cover" or not fails) else [], [0])
-    return out
+# The coverage items and their keys are mcov's (mcov.test_items, the same ones
+# mcov rank counts); mplan adds the test names and seeds from the regression,
+# the order by run time, and the features each test serves.
+
+def _owner(k):
+    """The plan-facing owner of an mcov item key: (kind, name) as the matchers know them."""
+    c = k[0]
+    if c in ("l", "b"):
+        return ("file", k[1])
+    if c == "t":
+        return ("toggle", k[1])
+    if c == "c":
+        return ("cond", k[1])
+    if c in ("s", "x"):
+        return ("fsm", f"{k[2]}.{k[3]}")
+    if c == "g":
+        return ("cover", f"{k[1]}.{k[2]}")
+    return ("assert", k[1])
 
 
 class Points:
-    """Every test's coverage as one bit mask over a common layout of points."""
+    """Every test's coverage as one bit mask over mcov's items (all seeds of a test together)."""
 
     def __init__(self, runs, jobs, include_failing=False):
+        mcov = tool("mcov")
         tests = test_table(runs)
         self.skipped = sorted(n for n, t in tests.items() if t["status"] != "pass") if not include_failing else []
         want = [r for r in runs if (include_failing or tests[r["test"]]["status"] == "pass") and r.get("log")]
         paths = [os.path.join(r["_dir"], os.path.dirname(r["log"]), "cov.json") for r in want]
-        have = [os.path.exists(p) for p in paths]
-        todo = [p for p, ok in zip(paths, have) if ok]
+        todo = [p for p in paths if os.path.exists(p)]
+        loaded = None
         if jobs > 1 and len(todo) > 1:
             try:
                 with cf.ProcessPoolExecutor(max_workers=min(jobs, len(todo))) as pool:
-                    got = list(pool.map(_cov_points, todo, chunksize=max(1, len(todo) // (4 * jobs))))
+                    loaded = list(pool.map(mcov._rank_load, todo, chunksize=max(1, len(todo) // (4 * jobs))))
+            except SystemExit:
+                raise
             except Exception:           # no fork / not picklable here: read them one by one
-                got = [_cov_points(p) for p in todo]
-        else:
-            got = [_cov_points(p) for p in todo]
-        per_run = dict(zip(todo, got))
-        # The layout: owners in (kind, name) order, each on a byte boundary, so a scope is one range.
-        width, index, cover_total, every = {}, {}, {}, {}
-        for p in todo:
-            for key, (c, a) in (per_run[p] or {}).items():
-                if type(a) is int:
-                    if every.get(key) != a:
-                        every[key] = every.get(key, 0) | a
-                else:
-                    idx = index.setdefault(key, {})
-                    for k in a:
-                        if type(k) is tuple and k[0] == "#total":
-                            cover_total[key] = max(cover_total.get(key, 0), k[1])
-                        elif k not in idx:
-                            idx[k] = len(idx)
-        for key, a in every.items():
-            width[key] = a.bit_length()
-        for key, idx in index.items():
-            width[key] = max(len(idx), cover_total.get(key, 0))
-            every[key] = (1 << width[key]) - 1 if key[0] == "cover" else 0
-        self.offset, self.nbytes = {}, {}
-        place = {}
-        at = 0
-        for key in sorted(width):
-            n = (width[key] + 7) // 8
-            self.offset[key], self.nbytes[key] = at, n
-            place[key] = (at, at + n, n)
-            at += n
-        self.size = at
-        universe = bytearray(at)
-        self.mask, self.seconds, self.no_data = {}, {}, []
-        for r, p, ok in zip(want, paths, have):
+                loaded = None
+        if loaded is None:
+            loaded = [mcov._rank_load(p) for p in todo]
+        # Number the items in run order, so the result does not depend on the worker count.
+        index = {}
+        for _, all_, _ in loaded:
+            for k in all_:
+                if k not in index:
+                    index[k] = len(index)
+        self.index, self.total = index, len(index)
+        hit_of = {p: hit for p, _, hit in loaded}
+        nb = (len(index) + 7) // 8
+        self.mask, self.seconds = {}, {}
+        for r, p in zip(want, paths):
             name = r["test"]
             self.seconds[name] = self.seconds.get(name, 0.0) + r.get("seconds", 0.0)
-            pts = per_run.get(p) if ok else None
-            if pts is None:
-                self.mask.setdefault(name, 0)
+            hit = hit_of.get(p)
+            if hit is None:
+                self.mask.setdefault(name, None)
                 continue
-            buf = bytearray(at)
-            for key, (c, a) in pts.items():
-                lo, hi, n = place[key]
-                if type(a) is not int:
-                    idx = index[key]
-                    c = sum(1 << idx[k] for k in c)
-                    if key[0] != "cover":
-                        for k in a:
-                            every[key] |= 1 << idx[k]
-                if c:
-                    buf[lo:hi] = c.to_bytes(n, "little")
-            self.mask[name] = self.mask.get(name, 0) | int.from_bytes(buf, "little")
-        self.no_data = sorted(n for n, m in self.mask.items() if not m and not any(
-            ok and per_run.get(p) is not None for r, p, ok in zip(want, paths, have) if r["test"] == n))
-        for key, a in every.items():
-            lo, hi, n = place[key]
-            universe[lo:hi] = a.to_bytes(n, "little")
-        self.universe = int.from_bytes(universe, "little")
-        self.total = bin(self.universe).count("1")
+            buf = bytearray(nb)
+            for k in hit:
+                i = index[k]
+                buf[i >> 3] |= 1 << (i & 7)
+            m = int.from_bytes(buf, "little")
+            self.mask[name] = m if self.mask.get(name) is None else self.mask[name] | m
+        self.no_data = sorted(n for n, m in self.mask.items() if m is None)
+        for n in self.no_data:
+            self.mask[n] = 0
+        self._owners = None
 
-    def ranges(self, keys):
-        """Byte ranges of the owners, adjacent ones joined."""
-        out = []
-        for o, n in sorted((self.offset[k], self.nbytes[k]) for k in keys if k in self.offset):
-            if out and out[-1][1] == o:
-                out[-1][1] = o + n
-            elif n:
-                out.append([o, o + n])
-        return out
+    def owner_masks(self):
+        """(kind, name) -> the bits of that file / signal / FSM / covergroup item / assertion."""
+        if self._owners is None:
+            bits = {}
+            for k, i in self.index.items():
+                bits.setdefault(_owner(k), []).append(i)
+            nb = (self.total + 7) // 8
+            self._owners = {}
+            for o, ii in bits.items():
+                buf = bytearray(nb)
+                for i in ii:
+                    buf[i >> 3] |= 1 << (i & 7)
+                self._owners[o] = int.from_bytes(buf, "little")
+        return self._owners
 
 
 def rank_tests(pts, by="points"):
@@ -1064,31 +1013,25 @@ def rank_tests(pts, by="points"):
             "order": order, "redundant": sorted(left), "no_data": pts.no_data, "not_ranked": pts.skipped}
 
 
-METRIC_OWNER = {"line": ("file", ("line",)), "branch": ("file", ("branch",)), "cond": ("cond", ("cond",)),
-                "toggle": ("toggle", ("toggle",)), "fsm": ("fsm", ("fsm",)), "cover": ("cover", ("cover",)),
-                "assert": ("assert", ("assert",))}
+METRIC_OWNER = {"line": ("file", "file"), "branch": ("file", "file"), "cond": ("cond", "cond"), "toggle": ("toggle", "toggle"),
+                "fsm": ("fsm", "fsm"), "cover": ("cover", "cover"), "assert": ("assert", "assert")}
 
 
 def attribute(plan, data, pts, top=10):
-    """Per feature, the tests that cover points of its own coverage metrics: {path: [[test, points], ...]}."""
+    """Per feature, the tests that cover items of its own coverage metrics: {path: {"tests": N, "top": [[test, items], ...]}}."""
     pop = tool("mcov").popcount
-    raw = {n: m.to_bytes(pts.size, "little") for n, m in pts.mask.items() if m}
+    owners = pts.owner_masks()
     out = {}
-    for f, depth in plan.walk():
-        keys = set()
+    for f, _ in plan.walk():
+        fm = 0
         for m in f.metrics:
             if m.kind in METRIC_OWNER:
-                matcher, kinds = METRIC_OWNER[m.kind]
-                keys.update((k, n) for n in data.m[matcher].match(m.pattern) for k in kinds)
-        spans = pts.ranges(keys)
-        if not spans:
+                matcher, kind = METRIC_OWNER[m.kind]
+                for n in data.m[matcher].match(m.pattern):
+                    fm |= owners.get((kind, n), 0)
+        if not fm:
             continue
-        rows = []
-        for n, b in raw.items():
-            c = sum(pop(int.from_bytes(b[lo:hi], "little")) for lo, hi in spans)
-            if c:
-                rows.append([n, c])
-        rows.sort(key=lambda r: (-r[1], r[0]))
+        rows = sorted(([n, pop(mk & fm)] for n, mk in pts.mask.items() if mk & fm), key=lambda r: (-r[1], r[0]))
         out[f.path] = {"tests": len(rows), "top": rows[:top]}
     return out
 

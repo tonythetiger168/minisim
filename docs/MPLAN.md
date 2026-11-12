@@ -177,9 +177,13 @@ mplan: 34 of 300 tests reach 92.1% (6610/7177 points) in 97.0s of 900.0s
 redundant (add nothing): uart_smoke, uart_tx_1, ...
 ```
 
-A coverage point is a line, a branch outcome, a toggle direction of one
-bit, a condition vector, an FSM state or transition, a covergroup bin, or
-an assertion that passed (a cover directive that was hit). The order is
+A coverage point is one of `mcov`'s items (the same ones `mcov rank`
+counts): a line, a branch outcome, a toggle direction of one bit, a
+condition vector, an FSM state or transition, a covergroup bin, or an
+assertion that passed (a cover directive that was hit). `mcov rank` ranks
+database files; `mplan rank` works from the regression instead: it names
+tests rather than files, joins the seeds of a test, leaves failing tests
+out, can order by run time, and ties the tests to the plan's features. The order is
 greedy: the test with the most points first, then the one that adds the
 most new points, and so on. `-by rate` orders by new points per second of
 run time instead, which gives the cheapest way to the same coverage.
@@ -198,8 +202,7 @@ run time instead, which gives the cheapest way to the same coverage.
 
 `mplan report -rank [-by rate]` puts the ranking and the per-feature tests
 in `plan.html` and `plan.json`. The per-run databases are read in parallel
-(`-threads`); 300 runs with 1.3 million points rank in about 11 s on four
-cores. The result does not depend on the worker count.
+(`-threads`). The result does not depend on the worker count.
 
 ## Triage
 
