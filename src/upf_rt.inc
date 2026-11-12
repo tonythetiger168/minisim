@@ -300,6 +300,7 @@ struct Rt {
         on = true;
         g_upf = true;
         dm.build(m);
+        expandPgConnects();
         g.build(m);
         for (size_t i = 0; i < S.sigs.size(); i++) sigByName.emplace(S.sigs[i].name, (int)i);
         for (auto& w : m.warnings) std::cerr << "msim: UPF: " << w << "\n";
@@ -780,6 +781,112 @@ struct Rt {
         bool copied = false;
     };
     std::vector<HdlPort> hdlPorts;
+    // Supply ports found by their pg_type (UPF_pg_type, 6.51): the
+    // connections of connect_supply_net -pg_type (6.14), of
+    // connect_supply_set -connect (6.15), and the automatic ones of each
+    // domain's primary supply set (4.5.4.6.2), in that order of precedence;
+    // a port already connected keeps its connection.
+    void expandPgConnects() {
+        std::set<std::string> taken;
+        for (auto& [net, ps] : m.connects) taken.insert(ps.begin(), ps.end());
+        std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+        std::string topPre = m.top.empty() ? "" : m.top + ".";
+        struct Inst { std::string design, upf, model; };
+        std::vector<Inst> insts;
+        for (auto& [full, mod] : instCells()) {
+            if (!pre.empty() && full.compare(0, pre.size(), pre) != 0) continue;
+            std::string d = full.substr(pre.size());
+            if (!topPre.empty() && d.compare(0, topPre.size(), topPre) != 0) continue;
+            std::string u = d.substr(topPre.size());
+            for (char& c : u) if (c == '.') c = '/';
+            insts.push_back({d, u, mod});
+        }
+        auto under = [](const std::string& u, const std::string& scope) {
+            return scope.empty() || u == scope || (u.size() > scope.size() && u.compare(0, scope.size(), scope) == 0 && u[scope.size()] == '/');
+        };
+        // the ports of an instance with a pg_type in `types`
+        auto pgPorts = [&](const Inst& in, const std::vector<std::string>& types, std::vector<std::pair<std::string, std::string>>& out) {
+            std::string full = pre + in.design + ".";
+            for (auto it = portRecs().lower_bound(full); it != portRecs().end() && it->first.compare(0, full.size(), full) == 0; ++it) {
+                std::string port = it->first.substr(full.size());
+                if (port.find('.') != std::string::npos) continue;
+                std::string pg = m.portAttr(in.design, in.model, port, it->second.dir, "UPF_pg_type");
+                if (!pg.empty() && std::find(types.begin(), types.end(), pg) != types.end()) out.push_back({in.upf + "/" + port, pg});
+            }
+        };
+        auto add = [&](const std::string& net, const std::string& port, const Vcm* vcm, const std::string& where, const std::string& how) {
+            if (!taken.insert(port).second) return;
+            m.connects[net].push_back(port);
+            if (vcm) m.connectVcm[{net, port}] = vcm;
+            m.connectWhere[{net, port}] = where;
+            note("supply " + net + " connected to " + m.design(port) + " (" + how + ")");
+        };
+        for (auto& pc : m.pgConnects) {   // 6.14
+            std::string base = pc.domain.empty() ? pc.scope : m.domains.at(pc.domain).scope;
+            int hits = 0;
+            for (auto& in : insts) {
+                if (!under(in.upf, base) || in.upf == base) continue;
+                if (!pc.domain.empty() && dm.of(in.design) != pc.domain) continue;
+                if (!pc.cells.empty() && std::find(pc.cells.begin(), pc.cells.end(), in.model) == pc.cells.end()) continue;
+                if (!pc.elements.empty() && std::find(pc.elements.begin(), pc.elements.end(), in.upf) == pc.elements.end()) continue;
+                std::vector<std::pair<std::string, std::string>> ps;
+                pgPorts(in, pc.pgTypes, ps);
+                for (auto& [port, pg] : ps) { add(pc.net, port, pc.vcm, pc.where, "-pg_type " + pg); hits++; }
+            }
+            for (auto& c : pc.cells)
+                if (std::none_of(insts.begin(), insts.end(), [&](const Inst& in) { return in.model == c; }))
+                    throw Error(pc.where + ": connect_supply_net -cells: no instance of " + c + " in the design (6.14)");
+            for (auto& e : pc.elements)
+                if (std::none_of(insts.begin(), insts.end(), [&](const Inst& in) { return in.upf == e; }))
+                    throw Error(pc.where + ": connect_supply_net -elements: no instance " + m.design(e) + " in the design (6.14)");
+            if (!hits) std::cerr << "msim: UPF: " << pc.where << ": connect_supply_net " << pc.net << " -pg_type: no port with that pg_type\n";
+        }
+        // the supply net of a supply set function
+        auto fnNet = [&](const std::string& set, const std::string& fn) -> std::string {
+            auto it = m.sets.find(m.setOf(set));
+            if (it == m.sets.end()) return "";
+            auto f = it->second.fn.find(fn);
+            return f == it->second.fn.end() ? "" : f->second;
+        };
+        for (auto& sc : m.supplyConns) {   // 6.15 -connect
+            if (sc.connect.empty()) continue;
+            for (auto& in : insts) {
+                bool hit = false;
+                for (auto& e : sc.elements)
+                    if (in.upf == e || (sc.transitive && under(in.upf, e))) hit = true;
+                for (auto& e : sc.exclude)
+                    if (in.upf == e || under(in.upf, e)) hit = false;
+                if (!hit) continue;
+                for (auto& [fn, pg] : sc.connect) {
+                    std::string net = fnNet(sc.set, fn);
+                    if (net.empty()) throw Error(sc.where + ": connect_supply_set " + sc.set + " -connect: the set has no " + fn + " function (6.15)");
+                    std::vector<std::pair<std::string, std::string>> ps;
+                    pgPorts(in, {pg}, ps);
+                    for (auto& pp : ps) add(net, pp.first, nullptr, sc.where, "connect_supply_set " + sc.set + "." + fn);
+                }
+            }
+        }
+        // 4.5.4.6.2: each function of a domain's primary supply set to the
+        // ports of its default pg_type, on instances in the domain's extent
+        static const std::vector<std::pair<std::string, std::string>> dflt = {
+            {"power", "primary_power"}, {"ground", "primary_ground"}, {"pwell", "pwell"},
+            {"nwell", "nwell"}, {"deeppwell", "deeppwell"}, {"deepnwell", "deepnwell"}};
+        for (auto& in : insts) {
+            std::string dn = dm.of(in.design);
+            if (dn.empty()) continue;
+            auto d = m.domains.find(dn);
+            if (d == m.domains.end()) continue;
+            auto h = d->second.handles.find("primary");
+            if (h == d->second.handles.end()) continue;
+            for (auto& [fn, pg] : dflt) {
+                std::string net = fnNet(h->second, fn);
+                if (net.empty()) continue;
+                std::vector<std::pair<std::string, std::string>> ps;
+                pgPorts(in, {pg}, ps);
+                for (auto& pp : ps) add(net, pp.first, nullptr, d->second.where, "primary supply of " + dn);
+            }
+        }
+    }
     // Function and model VCMs (6.30.8, 6.30.9) placed in the design before
     // it is elaborated again: the instance that runs the conversion.
     struct VcmBind {

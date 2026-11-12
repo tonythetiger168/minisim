@@ -117,6 +117,10 @@ Spec references are IEEE 1800-2023 clauses.
 - UPF (IEEE 1801-2024): function and model VCMs (6.30.8, 6.30.9) are
   simulated: the function is called, or the model instantiated, on the port
   through a module bound into the simulation top.
+- UPF (IEEE 1801-2024): supply ports connected by pg_type:
+  `connect_supply_net -pg_type` with `-cells`, `-domain`, `-elements` (6.14),
+  `connect_supply_set -connect` (6.15), and the automatic connection of a
+  domain's primary supply set (4.5.4.6.2).
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.

@@ -646,6 +646,13 @@ struct SupplyConn {
     bool hasElements = false, transitive = true;
     std::vector<std::pair<std::string, std::string>> connect;   // function, pg_type
 };
+// connect_supply_net -pg_type (6.14): the net goes to every port of the
+// selected instances whose pg_type is in the list, once the design is known.
+struct PgConnect {
+    std::string net, scope, domain, where;
+    std::vector<std::string> pgTypes, cells, elements;
+    const struct Vcm* vcm = nullptr;
+};
 // set_simstate_behavior (6.56) for models or instances.
 struct SimBehavior {
     std::string mode, lib, scope, where;
@@ -773,6 +780,7 @@ struct Model {
     std::map<std::string, Vcm> vcms;                             // "lib::name"
     mutable std::map<std::string, Vcm> builtinVcms;              // Annex B tables and legacy VCTs as VCMs
     std::map<std::pair<std::string, std::string>, const Vcm*> connectVcm;   // {net, port} -> connect_supply_net -vcm
+    std::vector<PgConnect> pgConnects;                           // connect_supply_net -pg_type
     // A VCM named in `scope` (or in the library being created): "lib::name",
     // ".::name" (this library), "IEEE::name", or a simple name visible here.
     const Vcm* findVcm(const std::string& name, const std::string& scope, const std::string& where) const {
@@ -1504,6 +1512,27 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 // the VCM in use in this command's scope, wherever the port is (4.10.2)
                 vm = findVcm(o.get("-vcm"), scope, c.where());
                 if (!vm) throw Error(c.where() + ": connect_supply_net -vcm: no VCM '" + o.get("-vcm") + "' (6.14)");
+            }
+            bool sel = o.has("-pg_type") || o.has("-cells") || o.has("-domain") || o.has("-elements");
+            if (o.has("-ports") && sel)
+                throw Error(c.where() + ": connect_supply_net -ports cannot go with -pg_type, -cells, -domain or -elements (6.14)");
+            if (!o.has("-ports") && !o.has("-pg_type")) throw Error(c.where() + ": connect_supply_net needs -ports or -pg_type (6.14)");
+            if (o.has("-pg_type")) {
+                if (!o.has("-cells") && !o.has("-domain") && !o.has("-elements"))
+                    throw Error(c.where() + ": connect_supply_net -pg_type needs -cells, -domain or -elements (6.14)");
+                PgConnect pc;
+                pc.net = net;
+                pc.scope = scope;
+                pc.where = c.where();
+                for (auto& t : o.list("-pg_type")) pc.pgTypes.push_back(t);
+                pc.cells = o.list("-cells");
+                for (auto& e : o.list("-elements")) pc.elements.push_back(join(scope, e));
+                if (o.has("-domain")) {
+                    pc.domain = join(scope, o.get("-domain"));
+                    if (!domains.count(pc.domain)) throw Error(c.where() + ": connect_supply_net -domain: no power domain " + o.get("-domain"));
+                }
+                pc.vcm = vm;
+                pgConnects.push_back(pc);
             }
             for (auto& p : o.list("-ports")) {
                 std::string port = join(scope, p);

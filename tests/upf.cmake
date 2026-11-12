@@ -26,8 +26,9 @@ endforeach()
 # replayed at power-up (6.60); attributes written in the HDL (5.6, 5.7); an
 # abstract power source (6.16); value conversion methods in UPF libraries,
 # for real, enum, integer and upfSupplyTypeT ports (4.10, 5.11, 6.29, 6.30,
-# 6.36, 6.63); function and model VCMs (6.30.8, 6.30.9).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn)
+# 6.36, 6.63); function and model VCMs (6.30.8, 6.30.9); supply ports
+# connected by pg_type (4.5.4.6.2, 6.14, 6.15).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -300,3 +301,11 @@ upf_error_in(vcm e_lib4 "load_upf_library vcm_bad_lib.upf" "create_vcm in a UPF 
 upf_error_in(vcm e_lib5 "connect_supply_net VR -ports {u_ana/vr} -vcm zlib::R2U" "no UPF library zlib (5.11)")
 upf_error_in(vcm e_lib6 "connect_supply_net VR -ports {u_ana/vr} -vcm vlib::NOPE" "UPF library vlib has no VCM NOPE (6.30)")
 upf_error_in(vcm e_lib7 "create_upf_library L7 -contents {create_vcm A -vcms {vlib::R2U}}\nconnect_supply_net VR -ports {u_ana/vr} -vcm A" "no VCM 'A'")
+
+# Errors of connect_supply_net by pg_type.
+upf_error_in(pgconn e_pg1 "connect_supply_net VBAT -ports {u_m1/VBK} -pg_type backup_power" "-ports cannot go with -pg_type, -cells, -domain or -elements (6.14)")
+upf_error_in(pgconn e_pg2 "connect_supply_net VBAT -pg_type backup_power" "-pg_type needs -cells, -domain or -elements (6.14)")
+upf_error_in(pgconn e_pg3 "connect_supply_net VBAT" "connect_supply_net needs -ports or -pg_type (6.14)")
+upf_error_in(pgconn e_pg4 "connect_supply_net VBAT -pg_type backup_power -cells nocell" "connect_supply_net -cells: no instance of nocell in the design (6.14)")
+upf_error_in(pgconn e_pg5 "connect_supply_net VBAT -pg_type backup_power -domain PD_X" "connect_supply_net -domain: no power domain PD_X")
+upf_error_in(pgconn e_pg6 "connect_supply_net VBAT -pg_type backup_power -elements {u_m9}" "connect_supply_net -elements: no instance u_dut.u_m9 in the design (6.14)")
