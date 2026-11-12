@@ -32,6 +32,9 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI module paths (38.10): `vpi_iterate(vpiModPath, module)`, their input
+  and output terms, and their delays through `vpi_get_delays` /
+  `vpi_put_delays`. `tests/spec/38.10-vpi-modpath.sv`.
 - VPI timing checks: `vpi_iterate(vpiTchk, module)`, their terms, notifier
   and limits (`vpi_get_delays` / `vpi_put_delays`), and `cbTchkViolation`
   (38.10, 38.36.1). `tests/spec/38.36-vpi-tchk.sv`.

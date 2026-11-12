@@ -41,7 +41,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -2083,7 +2083,7 @@ inline const char* typeName(int type) {
         {vpiAssert, "vpiAssert"}, {vpiAssume, "vpiAssume"}, {vpiCover, "vpiCover"},
         {vpiImmediateAssert, "vpiImmediateAssert"}, {vpiImmediateAssume, "vpiImmediateAssume"},
         {vpiImmediateCover, "vpiImmediateCover"}, {vpiClassObj, "vpiClassObj"}, {vpiClassVar, "vpiClassVar"},
-        {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}, {vpiInterModPath, "vpiInterModPath"}, {vpiTchk, "vpiTchk"}, {vpiTchkTerm, "vpiTchkTerm"}};
+        {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}, {vpiInterModPath, "vpiInterModPath"}, {vpiTchk, "vpiTchk"}, {vpiTchkTerm, "vpiTchkTerm"}, {vpiModPath, "vpiModPath"}, {vpiPathTerm, "vpiPathTerm"}};
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
 }
@@ -2108,6 +2108,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     if (type == vpiClassDefn || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return H(vpi::classHandle(type, o));
     if (o->kind == Obj::InterModPath) return nullptr;
     if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return H(vpi::tchkHandle(type, o));   // timing checks
+    if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return H(vpi::pathHandle(type, o));   // module paths
     if (o->kind == Obj::DynElem) {
         if (type == vpiParent) return H(const_cast<Obj*>(o->parent));
         if (type == vpiIndex) return o->idx >= 0 ? H(vpi::constObj(o->idx)) : nullptr;
@@ -2266,7 +2267,9 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     if (vpi::isCode(o)) return vpi::codeIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
     if (vpi::netConn(type, o, items)) return vpi::iter(std::move(items));
     if (vpi::tchkIterate(type, o, items)) return vpi::iter(std::move(items));   // timing checks
-    if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return nullptr;   // drivers, loads (37.16, 37.17)
+    if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return nullptr;
+    if (vpi::pathIterate(type, o, items)) return vpi::iter(std::move(items));   // module paths
+    if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return nullptr;   // drivers, loads (37.16, 37.17)
     if (type == vpiMember) {   // the members of a struct or union variable (37.17)
         if (!vpi::isStructObj(o)) return nullptr;
         vpi::members(o, items);
@@ -2692,6 +2695,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return (PLI_INT32)vpi::classGet(prop, o);
     if (o->kind == Obj::InterModPath) return prop == vpiType ? vpiInterModPath : vpiUndefined;
     if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return (PLI_INT32)vpi::tchkGet(prop, o);
+    if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return (PLI_INT32)vpi::pathGet(prop, o);
     if (prop == vpiVirtual && vpi::isMethod(o)) return o->sym->as<slang::ast::SubroutineSymbol>().isVirtual();
     if (o->kind == Obj::ClassObj) {   // 37.29
         if (prop == vpiType) return vpiClassObj;
@@ -2890,6 +2894,10 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
         std::string r;
         return vpi::tchkGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
     }
+    if ((o->kind == Obj::ModPath || o->kind == Obj::PathTerm) && prop != vpiType) {
+        std::string r;
+        return vpi::pathGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
+    }
     if ((o->kind == Obj::ClassDefn || o->kind == Obj::Extends) && prop != vpiType) {   // 37.29
         std::string r;
         return vpi::classGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
@@ -3038,7 +3046,8 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
     if (o->kind == Obj::Iter || o->kind == Obj::Callback || o->kind == Obj::Systf || o->kind == Obj::Module ||
         o->kind == Obj::Scope || o->kind == Obj::Typespec || o->kind == Obj::Member || o->kind == Obj::Range ||
         o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
-        o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends || o->kind == Obj::InterModPath || o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) {
+        o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends || o->kind == Obj::InterModPath || o->kind == Obj::Tchk || o->kind == Obj::TchkTerm ||
+        o->kind == Obj::ModPath || o->kind == Obj::PathTerm) {
         vpi::error(vpiError, "vpi_get_value: the object has no value");
         return;
     }
@@ -3207,6 +3216,10 @@ void vpi_get_delays(vpiHandle h, p_vpi_delay d) {
         if (vpi::imDelayCount(d, "vpi_get_delays")) vpi::imGetDelays(o, d);
         return;
     }
+    if (o && o->kind == Obj::ModPath) {   // 38.10
+        if (vpi::pathDelayCount(d, "vpi_get_delays")) vpi::pathGetDelays(o, d);
+        return;
+    }
     if (o && o->kind == Obj::Tchk) {   // 38.10: the limits
         if (!d || !d->da || d->no_of_delays < 1) { vpi::error(vpiError, "vpi_get_delays: no delay structure"); return; }
         vpi::tchkGetDelays(o, d);
@@ -3229,6 +3242,10 @@ void vpi_put_delays(vpiHandle h, p_vpi_delay d) {
     Obj* o = O(h);
     if (o && o->kind == Obj::InterModPath) {   // 38.21
         if (vpi::imDelayCount(d, "vpi_put_delays")) vpi::imPutDelays(o, d);
+        return;
+    }
+    if (o && o->kind == Obj::ModPath) {   // 38.10
+        if (vpi::pathDelayCount(d, "vpi_put_delays")) vpi::pathPutDelays(o, d);
         return;
     }
     if (o && o->kind == Obj::Tchk) {   // 38.10: the limits
