@@ -250,6 +250,11 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_smoke
                      -P ${CMAKE_SOURCE_DIR}/tests/mregress.cmake)
+    # -farm slurm on a real one-node Slurm (CI starts it); skips without one.
+    add_test(NAME mregress_slurm
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_slurm
+                     -P ${CMAKE_SOURCE_DIR}/tests/mregress_slurm.cmake)
   endif()
   # mplan: a verification plan scored against a regression (tests/plan).
   if(Python3_FOUND)
