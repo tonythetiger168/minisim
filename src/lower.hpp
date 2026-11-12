@@ -6394,8 +6394,13 @@ struct Lowerer {
                 lowerDump(call, n);
                 return;
             }
+            if (n == "$dumpports" || n == "$dumpportsoff" || n == "$dumpportson" || n == "$dumpportsall" ||
+                n == "$dumpportsflush" || n == "$dumpportslimit") {
+                lowerDumpPorts(call, n);
+                return;
+            }
             static const std::set<std::string_view> harmless = {
-                "$dumpports", "$set_coverage_db_name", "$load_coverage_db", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
+                "$set_coverage_db_name", "$load_coverage_db", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
                 "$vcdpluson", "$vcdplusoff", "$vcdplusfile", "$shm_open", "$shm_probe", "$recordvars"};
             if (!harmless.count(n)) unsupported(("system task " + std::string(n)).c_str());
             std::cerr << "lower: ignoring system call " << n << "\n";
@@ -6446,6 +6451,72 @@ struct Lowerer {
             i.dcmd = n == "$dumpon" ? DC_ON : n == "$dumpoff" ? DC_OFF : n == "$dumpall" ? DC_ALL
                    : n == "$dumpflush" ? DC_FLUSH : DC_LIMIT;
             if (i.dcmd == DC_LIMIT && !args.empty()) i.args.push_back(expr(*args[0]));
+        }
+        prog.emit(i);
+    }
+
+    // Extended VCD tasks (21.7.3). $dumpports names module instances; each
+    // of their ports becomes one dsel entry "dir \t scope \t port \t msb \t
+    // lsb \t signal" (the signal named as msim names it, below the top).
+    void lowerDumpPorts(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        Instr i;
+        i.k = IK::Dump;
+        auto args = call.arguments();
+        auto isEmpty = [](const Expression& x) { return x.kind == ExpressionKind::EmptyArgument; };
+        if (n != "$dumpports") {
+            i.dcmd = n == "$dumpportsoff" ? DC_POFF : n == "$dumpportson" ? DC_PON : n == "$dumpportsall" ? DC_PALL
+                   : n == "$dumpportsflush" ? DC_PFLUSH : DC_PLIMIT;
+            size_t a = 0;
+            if (i.dcmd == DC_PLIMIT) {
+                if (args.empty() || isEmpty(*args[0])) unsupported("$dumpportslimit without a size");
+                i.args.push_back(expr(*args[a++]));
+            }
+            if (a < args.size() && !isEmpty(*args[a])) i.args.push_back(strOf(*args[a]));
+            prog.emit(i);
+            return;
+        }
+        i.dcmd = DC_PORTS;
+        std::vector<const InstanceBodySymbol*> bodies;
+        const Expression* file = nullptr;
+        for (size_t a = 0; a < args.size(); a++) {
+            const Expression* x = args[a];
+            if (isEmpty(*x)) continue;
+            const Symbol* sym = nullptr;
+            if (x->kind == ExpressionKind::ArbitrarySymbol) sym = x->as<ArbitrarySymbolExpression>().symbol.get();
+            if (sym && sym->kind == SymbolKind::Instance) bodies.push_back(&sym->as<InstanceSymbol>().body);
+            else if (a + 1 == args.size()) file = x;
+            else unsupported("$dumpports argument that is not a module instance");
+        }
+        if (bodies.empty()) {
+            // No scope: the module the call is in.
+            const auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine);
+            const Scope* sc = sci ? sci->scope.get() : nullptr;
+            const InstanceBodySymbol* body = sc ? sc->getContainingInstance() : nullptr;
+            if (!body) unsupported("$dumpports outside a module");
+            bodies.push_back(body);
+        }
+        if (file) i.args.push_back(strOf(*file));
+        for (const InstanceBodySymbol* body : bodies) {
+            std::string scopePath = body->parentInstance ? body->parentInstance->getHierarchicalPath() : std::string(body->name);
+            for (const Symbol* ps : body->getPortList()) {
+                if (ps->kind != SymbolKind::Port) continue;   // interface ports have no value
+                const auto& port = ps->as<PortSymbol>();
+                if (!port.internalSymbol) continue;
+                const Type& t = port.getType().getCanonicalType();
+                if (!t.isIntegral()) continue;
+                std::string path = port.internalSymbol->getHierarchicalPath();
+                size_t d = path.find('.');
+                std::string rel = d == std::string::npos ? path : path.substr(d + 1);
+                if (auto it = sigmap.find(port.internalSymbol); it != sigmap.end()) rel = "#" + std::to_string(it->second);
+                int w = (int)t.getBitWidth();
+                int msb = w - 1, lsb = 0;
+                if (t.hasFixedRange()) { auto r = t.getFixedRange(); msb = r.left; lsb = r.right; }
+                char dir = port.direction == ArgumentDirection::In ? 'i' : port.direction == ArgumentDirection::Out ? 'o' : 'b';
+                std::string enc(1, dir);
+                enc += '\t' + scopePath + '\t' + std::string(port.name) + '\t' + std::to_string(msb) + '\t' + std::to_string(lsb) + '\t' + rel;
+                i.dsel.push_back({enc, w > 1 || t.hasFixedRange() && !t.isScalar()});
+            }
         }
         prog.emit(i);
     }
