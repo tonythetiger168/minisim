@@ -204,6 +204,22 @@ foreach(want
   endif()
 endforeach()
 
+# Bits of a vector and fields of a struct written separately are separate
+# signals: two synchronizers in one vector are clean, a first stage read by
+# logic is found by its bit.
+run(cdc_slices.sv "-top;cdc_slices;-only;cdc,RDC001,RDC002,RDC003;-cdc-report")
+foreach(want
+    "cdc_slices.a1 (cdc_slices.aclk) -> cdc_slices.s[0] (cdc_slices.bclk)  3-flop synchronizer"
+    "cdc_slices.a2 (cdc_slices.aclk) -> cdc_slices.s[2] (cdc_slices.bclk)  3-flop synchronizer"
+    "cdc_slices.c_a.req (cdc_slices.aclk) -> cdc_slices.q1 (cdc_slices.bclk)  2-flop synchronizer"
+    "cdc_slices.a1 (cdc_slices.aclk) -> cdc_slices.r[1] (cdc_slices.bclk)  one flop only (CDC001)"
+    "1 finding (CDC001 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_slices.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
 set(one "${out}")

@@ -149,8 +149,11 @@ RDC analysis is 0.3 s.
 
 ## Limits
 
-- Signals are tracked whole, not per bit, except where ports are connected to
-  single bits of a bus. Two fields of one struct are one signal.
+- A vector or struct is tracked piece by piece when it is written piece by
+  piece (`r[0] <= a; r[1] <= b;`, or the fields of a struct one at a time)
+  and where ports are connected to single bits of a bus. A variable that is
+  only ever assigned whole, or that a port is connected to by name, is one
+  signal, whichever bits are read.
 - Reconvergence is followed through `-cdc-depth` flops (2 by default), not
   further.
 - Primary inputs have no domain: a crossing from an input is not reported.

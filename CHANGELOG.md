@@ -21,6 +21,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mlint` CDC/RDC: a vector written bit by bit, or a struct written field by
+  field, is tracked as separate signals (`top.r[1]`, `top.ctl.req`), so two
+  synchronizers kept in one vector, or a struct with fields in different
+  domains, are no longer mixed up.
 - `mlint` reset tree checks: `RDC005` (a reset synchronizer of one flop) and
   `RDC006` (an asynchronous reset made by combinational logic of several
   flops). `-cdc-report` lists the reset synchronizers, their length and how

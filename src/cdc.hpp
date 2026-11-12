@@ -50,6 +50,7 @@
 
 #include "lintir.hpp"
 #include "parallel.hpp"
+#include <deque>
 #include "sdc.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/ConversionExpression.h"
@@ -144,6 +145,111 @@ inline Sym baseOf(const Expression& ex) {
     }
 }
 
+// The part of a variable an expression selects: r[3], r[7:4], r.field. Bits
+// count from the least significant one; for an unpacked struct they are the
+// fields. `exact` is false when a select index is not a constant, or the
+// select goes inside an unpacked field: [lo, hi] is then all it can reach.
+struct Sel {
+    Sym base = nullptr;
+    uint64_t lo = 0, hi = 0;
+    bool exact = true, packed = true;
+};
+inline std::optional<int64_t> constInt(const Expression& e, Sym base) {
+    ConstantValue cv;
+    if (const ConstantValue* c = e.getConstant()) {
+        cv = *c;
+    } else {
+        const Scope* sc = base->getParentScope();
+        if (!sc) return std::nullopt;
+        EvalContext ctx(ASTContext(*sc, LookupLocation::max));
+        cv = e.eval(ctx);
+    }
+    if (!cv.isInteger()) return std::nullopt;
+    return cv.integer().as<int64_t>();
+}
+inline bool bitRange(const Expression& ex, Sel& r) {
+    const Expression& e = strip(ex);
+    auto named = [](const Expression& x) {
+        return x.kind == ExpressionKind::NamedValue || x.kind == ExpressionKind::HierarchicalValue;
+    };
+    switch (e.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue: {
+            const Symbol& s = e.kind == ExpressionKind::NamedValue ? (const Symbol&)e.as<NamedValueExpression>().symbol
+                                                                    : e.as<HierarchicalValueExpression>().symbol;
+            if (!isSignal(s)) return false;
+            const Type& t = s.as<ValueSymbol>().getType().getCanonicalType();
+            r = {};
+            r.base = &s;
+            if (t.isIntegral()) {
+                r.hi = std::max<uint64_t>(1, t.getBitstreamWidth()) - 1;
+            } else if (t.isUnpackedStruct()) {
+                auto fields = t.as<UnpackedStructType>().fields;
+                if (fields.empty()) return false;
+                r.hi = fields.size() - 1;
+                r.packed = false;
+            } else {
+                return false;
+            }
+            return true;
+        }
+        case ExpressionKind::ElementSelect:
+        case ExpressionKind::RangeSelect: {
+            bool element = e.kind == ExpressionKind::ElementSelect;
+            const Expression& v =
+                strip(element ? e.as<ElementSelectExpression>().value() : e.as<RangeSelectExpression>().value());
+            if (!bitRange(v, r)) return false;
+            const Type& vt = v.type->getCanonicalType();
+            if (!r.exact || !r.packed || !vt.isIntegral() || !vt.hasFixedRange()) {
+                r.exact = false;
+                return true;
+            }
+            ConstantRange rg = vt.getFixedRange();
+            const Type* et = vt.getArrayElementType();
+            uint64_t w = et ? std::max<uint64_t>(1, et->getBitstreamWidth()) : 1;
+            std::optional<int64_t> a, b;
+            if (element) {
+                a = b = constInt(e.as<ElementSelectExpression>().selector(), r.base);
+            } else {
+                const auto& rs = e.as<RangeSelectExpression>();
+                a = constInt(rs.left(), r.base);
+                b = constInt(rs.right(), r.base);
+                if (a && b && rs.getSelectionKind() == RangeSelectionKind::IndexedUp) b = *a + *b - 1;
+                else if (a && b && rs.getSelectionKind() == RangeSelectionKind::IndexedDown) b = *a - *b + 1;
+            }
+            if (!a || !b || *a < INT32_MIN || *a > INT32_MAX || *b < INT32_MIN || *b > INT32_MAX ||
+                !rg.containsPoint((int32_t)*a) || !rg.containsPoint((int32_t)*b)) {
+                r.exact = false;
+                return true;
+            }
+            uint64_t x = (uint64_t)rg.translateIndex((int32_t)*a), y = (uint64_t)rg.translateIndex((int32_t)*b);
+            uint64_t lo = r.lo + std::min(x, y) * w;
+            r.hi = r.lo + (std::max(x, y) + 1) * w - 1;
+            r.lo = lo;
+            return true;
+        }
+        case ExpressionKind::MemberAccess: {
+            const auto& ma = e.as<MemberAccessExpression>();
+            if (ma.member.kind != SymbolKind::Field) return false;
+            const auto& field = ma.member.as<FieldSymbol>();
+            const Expression& v = strip(ma.value());
+            if (!bitRange(v, r)) return false;
+            const Type& vt = v.type->getCanonicalType();
+            if (r.exact && !r.packed && named(v) && vt.isUnpackedStruct()) {
+                r.lo = r.hi = field.fieldIndex;
+            } else if (r.exact && r.packed && vt.isIntegral() && !vt.isPackedUnion()) {
+                r.lo += field.bitOffset;
+                r.hi = r.lo + std::max<uint64_t>(1, field.getType().getBitstreamWidth()) - 1;
+            } else {
+                r.exact = false;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 // b ^ (b >> 1), in either order: the binary-to-Gray conversion.
 inline bool isGrayOp(const Expression& ex) {
     const Expression& e = strip(ex);
@@ -205,6 +311,44 @@ struct Model {
     // connection is one bit of it, which makes clk[0] and clk[1] one clock.
     Join join;
     // One bit of a bus, as ports are connected to it: (bus, index) -> node.
+    // A variable written piece by piece (r[0] <= a; r[1] <= b; or the fields
+    // of a struct) is one node per piece, so two bits of one vector are two
+    // signals. Disjoint, sorted.
+    struct Slice {
+        uint64_t lo, hi;
+        Sym node;
+    };
+    std::unordered_map<Sym, std::vector<Slice>> sliced;
+    std::deque<std::string> sliceNames;
+    std::unordered_map<Sym, const std::string*> sliceLabel;
+    // A piece is not in the design: its name is the one it was given.
+    std::string pathOf(Sym s) const {
+        if (!sliceLabel.empty())
+            if (auto it = sliceLabel.find(s); it != sliceLabel.end()) return *it->second;
+        return path(*s);
+    }
+    const std::vector<Slice>* slicesOf(Sym s) const {
+        if (sliced.empty()) return nullptr;
+        auto it = sliced.find(s);
+        return it == sliced.end() ? nullptr : &it->second;
+    }
+    // The pieces an expression on a sliced variable touches. Returns true
+    // when it is exactly one whole piece.
+    bool pieces(const Expression& e, const std::vector<Slice>& sl, SymSet& out) {
+        Sel r;
+        if (!bitRange(e, r)) {
+            for (const Slice& x : sl) out.push_back(canon(x.node));
+            return false;
+        }
+        bool one = false;
+        size_t n = 0;
+        for (const Slice& x : sl)
+            if (x.lo <= r.hi && r.lo <= x.hi) {
+                out.push_back(canon(x.node));
+                one = !n++ && r.exact && x.lo == r.lo && x.hi == r.hi;
+            }
+        return one && n == 1;
+    }
     std::map<std::pair<Sym, int64_t>, Sym> bitOf;
     std::map<std::pair<Sym, int64_t>, Sym> bitCanon;  // the same, by canonical bus
     std::set<std::pair<Sym, int64_t>> bitDriven;      // bits a port or an assign drives
@@ -282,16 +426,16 @@ struct Model {
         if (!fresh) return it->second;
         std::string best;
         auto nit = named.find(c);
-        if (nit == named.end()) return it->second = path(*c);
+        if (nit == named.end()) return it->second = pathOf(c);
         for (Sym s : nit->second.syms)
-            if (std::string p = path(*s); best.empty() || p < best) best = std::move(p);
+            if (std::string p = pathOf(s); best.empty() || p < best) best = std::move(p);
         for (const std::string& p : nit->second.labels)
             if (best.empty() || p < best) best = p;
-        return it->second = best.empty() ? path(*c) : best;
+        return it->second = best.empty() ? pathOf(c) : best;
     }
     // A flop's own name, as its module wrote it.
     const std::string& name(const Flop& f) const {
-        if (f.pathName.empty()) f.pathName = path(*f.sym);
+        if (f.pathName.empty()) f.pathName = pathOf(f.sym);
         return f.pathName;
     }
 
@@ -497,10 +641,47 @@ struct Walk {
     Sym clk = nullptr;
     SymSet arst;  // canonical
 
+    void name(Sym s, SymSet& out) {
+        if (!isSignal(*s)) return;
+        if (const auto* sl = m.slicesOf(s)) {
+            for (const Model::Slice& x : *sl) out.push_back(m.canon(x.node));
+            return;
+        }
+        out.push_back(m.canon(s));
+    }
+    // A select on a variable that is kept in pieces reads those pieces, and
+    // the signals of its indexes.
+    template<typename V, typename T>
+    void select(V& v, const T& e, SymSet& out) {
+        Sym b = m.sliced.empty() ? nullptr : baseOf(e);
+        const std::vector<Model::Slice>* sl = b ? m.slicesOf(b) : nullptr;
+        if (!sl) {
+            v.visitDefault(e);
+            return;
+        }
+        m.pieces(e, *sl, out);
+        for (const Expression* x = &strip(e);;) {
+            if (x->kind == ExpressionKind::ElementSelect) {
+                x->as<ElementSelectExpression>().selector().visit(v);
+                x = &strip(x->as<ElementSelectExpression>().value());
+            } else if (x->kind == ExpressionKind::RangeSelect) {
+                x->as<RangeSelectExpression>().left().visit(v);
+                x->as<RangeSelectExpression>().right().visit(v);
+                x = &strip(x->as<RangeSelectExpression>().value());
+            } else if (x->kind == ExpressionKind::MemberAccess) {
+                x = &strip(x->as<MemberAccessExpression>().value());
+            } else {
+                break;
+            }
+        }
+    }
     void names(const Expression& e, SymSet& out) {
         e.visit(makeVisitor(
-            [&](auto&, const NamedValueExpression& n) { if (isSignal(n.symbol)) out.push_back(m.canon(&n.symbol)); },
-            [&](auto&, const HierarchicalValueExpression& n) { if (isSignal(n.symbol)) out.push_back(m.canon(&n.symbol)); }));
+            [&](auto&, const NamedValueExpression& n) { name(&n.symbol, out); },
+            [&](auto&, const HierarchicalValueExpression& n) { name(&n.symbol, out); },
+            [&](auto& v, const ElementSelectExpression& x) { select(v, x, out); },
+            [&](auto& v, const RangeSelectExpression& x) { select(v, x, out); },
+            [&](auto& v, const MemberAccessExpression& x) { select(v, x, out); }));
     }
 
     static bool local(Sym s) {
@@ -548,6 +729,13 @@ struct Walk {
                 if (!b) { t.other = true; return; }
                 if (!isSignal(*b)) return;  // a parameter or an enum value
                 Sym c = m.canon(b);
+                if (const auto* sl = m.slicesOf(b)) {
+                    SymSet hit;
+                    m.pieces(e, *sl, hit);
+                    if (hit.empty()) return;  // bits nothing drives
+                    if (hit.size() > 1) { t.other = true; return; }
+                    c = hit[0];
+                }
                 if (c == self) { t.self = true; return; }
                 if (t.ext && t.ext != c) t.many = true;
                 t.ext = c;
@@ -562,8 +750,22 @@ struct Walk {
     }
 
     void one(const Expression& lhs, const Expression& rhs, bool nonBlocking, const SymSet& ctrl0, bool whole) {
-        Sym base = baseOf(lhs);
-        if (!base || !isSignal(*base)) return;
+        Sym real = baseOf(lhs);
+        if (!real || !isSignal(*real)) return;
+        if (const auto* sl = m.slicesOf(real)) {
+            // Each piece the left-hand side touches is assigned; it is a
+            // whole assignment when that is exactly one piece.
+            SymSet hit, own;
+            bool exact = m.pieces(lhs, *sl, hit);
+            for (const Model::Slice& x : *sl) own.push_back(m.canon(x.node));
+            for (Sym node : hit) one(node, real, own, lhs, rhs, nonBlocking, ctrl0, whole && exact);
+            return;
+        }
+        one(real, real, {m.canon(real)}, lhs, rhs, nonBlocking, ctrl0, whole);
+    }
+    // `base` is the node assigned: the variable, or one piece of it.
+    void one(Sym base, Sym real, const SymSet& own, const Expression& lhs, const Expression& rhs, bool nonBlocking,
+             const SymSet& ctrl0, bool whole) {
         Sym self = m.canon(base);
         SymSet ctrl = ctrl0;
         // A select index on the left chooses what is written: control.
@@ -571,11 +773,11 @@ struct Walk {
             SymSet ln;
             names(lhs, ln);
             for (Sym s : ln)
-                if (s != self) ctrl.push_back(s);
+                if (std::find(own.begin(), own.end(), s) == own.end()) ctrl.push_back(s);
         }
         std::vector<const Expression*> lv;
         leaves(rhs, ctrl, lv);
-        if (seq && (nonBlocking || !local(base))) {
+        if (seq && (nonBlocking || !local(real))) {
             Flop& f = m.flop(base, lhs.sourceRange.start());
             if (!f.clkSym) {
                 f.clkSym = clk;
@@ -604,7 +806,7 @@ struct Walk {
             // assign bus[3] = x, where ports are connected to bus[3]: that bit
             // is x, not the whole bus.
             const Expression& l = strip(lhs);
-            if (scope && l.kind == ExpressionKind::ElementSelect && !m.bitCanon.empty()) {
+            if (scope && base == real && l.kind == ExpressionKind::ElementSelect && !m.bitCanon.empty()) {
                 const auto& sel = l.as<ElementSelectExpression>();
                 const Expression& v = strip(sel.value());
                 if (v.kind == ExpressionKind::NamedValue || v.kind == ExpressionKind::HierarchicalValue) {
@@ -690,6 +892,149 @@ struct Walk {
                 break;
             }
         }
+    }
+};
+
+// Before anything else: which variables are written piece by piece. Such a
+// variable becomes one node per piece. Left whole: a variable a port is
+// connected to by name or by a select (the port passes are about those), and
+// one that is also assigned whole from other signals.
+struct Slicer : ASTVisitor<Slicer> {
+    Model& m;
+    Compilation& comp;
+    struct Var {
+        std::vector<std::pair<uint64_t, uint64_t>> writes;
+        bool whole = false;
+    };
+    std::unordered_map<Sym, Var> vars;
+    std::vector<Sym> order;
+    Slicer(Model& mm, Compilation& c) : m(mm), comp(c) {}
+
+    Var& var(Sym s) {
+        auto [it, fresh] = vars.try_emplace(s);
+        if (fresh) order.push_back(s);
+        return it->second;
+    }
+    static bool constant(const Expression& e) {
+        bool any = false;
+        e.visit(makeVisitor([&](auto&, const NamedValueExpression& n) { any = any || isSignal(n.symbol); },
+                            [&](auto&, const HierarchicalValueExpression& n) { any = any || isSignal(n.symbol); }));
+        return !any;
+    }
+    void keepWhole(const Expression& e) {
+        e.visit(makeVisitor([&](auto&, const NamedValueExpression& n) { if (isSignal(n.symbol)) var(&n.symbol).whole = true; },
+                            [&](auto&, const HierarchicalValueExpression& n) { if (isSignal(n.symbol)) var(&n.symbol).whole = true; }));
+    }
+    void written(const Expression& lhs, bool constRhs) {
+        const Expression& l = strip(lhs);
+        if (l.kind == ExpressionKind::Concatenation) {
+            for (const Expression* o : l.as<ConcatenationExpression>().operands()) written(*o, constRhs);
+            return;
+        }
+        Sel r;
+        if (!bitRange(l, r)) {
+            if (Sym b = baseOf(l); b && isSignal(*b)) var(b).whole = true;
+            return;
+        }
+        bool all = l.kind == ExpressionKind::NamedValue || l.kind == ExpressionKind::HierarchicalValue;
+        if (all && constRhs) return;  // r <= '0 clears every piece
+        if (all) var(r.base).whole = true;
+        else var(r.base).writes.push_back({r.lo, r.hi});
+    }
+    void assignment(const Expression& e) {
+        if (e.kind != ExpressionKind::Assignment) return;
+        const auto& a = e.as<AssignmentExpression>();
+        written(a.left(), constant(a.right()));
+    }
+
+    void handle(const GenerateBlockSymbol& g) {
+        if (!g.isUninstantiated) visitDefault(g);
+    }
+    void handle(const InstanceSymbol& inst) {
+        if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return;
+        for (const PortConnection* conn : inst.getPortConnections()) {
+            if (!conn || conn->port.kind != SymbolKind::Port) continue;
+            const auto& port = conn->port.as<PortSymbol>();
+            if (port.internalSymbol && isSignal(*port.internalSymbol)) var(port.internalSymbol).whole = true;
+            const Expression* ext = conn->getExpression();
+            if (!ext) continue;
+            const Expression* outer = ext;
+            if (outer->kind == ExpressionKind::Assignment) outer = &outer->as<AssignmentExpression>().left();
+            // An input fed an expression only reads; anything else ties the
+            // variable to the port.
+            if (port.direction != ArgumentDirection::In || baseOf(*outer)) keepWhole(*outer);
+        }
+        visitDefault(inst);
+    }
+    void handle(const NetSymbol& n) {
+        if (const Expression* init = n.getInitializer(); init && !constant(*init)) var(&n).whole = true;
+    }
+    void handle(const ContinuousAssignSymbol& ca) { assignment(ca.getAssignment()); }
+    void handle(const ProceduralBlockSymbol& p) {
+        if (p.procedureKind == ProceduralBlockKind::Initial || p.procedureKind == ProceduralBlockKind::Final)
+            return;
+        p.getBody().visit(makeVisitor([&](auto& v, const AssignmentExpression& a) {
+            written(a.left(), constant(a.right()));
+            v.visitDefault(a);
+        }));
+    }
+
+    void finish() {
+        for (Sym s : order) {
+            Var& v = vars[s];
+            if (v.whole || v.writes.size() < 2) continue;
+            const Scope* sc = s->getParentScope();
+            if (!sc || sc->asSymbol().kind == SymbolKind::StatementBlock) continue;  // a local of a block
+            std::sort(v.writes.begin(), v.writes.end());
+            std::vector<std::pair<uint64_t, uint64_t>> parts;
+            for (auto& w : v.writes) {
+                if (!parts.empty() && w.first <= parts.back().second)
+                    parts.back().second = std::max(parts.back().second, w.second);
+                else
+                    parts.push_back(w);
+            }
+            if (parts.size() < 2 || parts.size() > 4096) continue;
+            const Type& t = s->as<ValueSymbol>().getType().getCanonicalType();
+            std::string base = path(*s);
+            bool hidden = base == "<protected>";
+            auto& out = m.sliced[s];
+            for (auto& [lo, hi] : parts) {
+                std::string label = base;
+                const Type* pt = nullptr;
+                if (t.isUnpackedStruct()) {
+                    auto fields = t.as<UnpackedStructType>().fields;
+                    if (!hidden) {
+                        label += "." + std::string(fields[lo]->name);
+                        if (hi != lo) label += ".." + std::string(fields[hi]->name);
+                    }
+                    pt = lo == hi ? &fields[lo]->getType() : nullptr;
+                } else if (!hidden) {
+                    label += bits(t, lo, hi);
+                }
+                if (!pt) pt = &comp.getType((bitwidth_t)std::min<uint64_t>(hi - lo + 1, 1u << 20), IntegralFlags::FourState);
+                m.sliceNames.push_back(std::move(label));
+                auto* node = comp.emplace<VariableSymbol>(std::string_view(m.sliceNames.back()), s->location,
+                                                          VariableLifetime::Static);
+                node->setType(*pt);
+                m.sliceLabel[node] = &m.sliceNames.back();
+                out.push_back({lo, hi, node});
+            }
+        }
+    }
+    // How the source would write bits lo..hi of a variable: the field of a
+    // packed struct, the index of a vector, or the bit numbers.
+    static std::string bits(const Type& t, uint64_t lo, uint64_t hi) {
+        if (t.kind == SymbolKind::PackedStructType)
+            for (const FieldSymbol& f : t.as<PackedStructType>().membersOfType<FieldSymbol>())
+                if (f.bitOffset == lo && f.bitOffset + f.getType().getBitstreamWidth() - 1 == hi)
+                    return "." + std::string(f.name);
+        if (t.hasFixedRange() && (!t.getArrayElementType() || t.getArrayElementType()->getBitstreamWidth() == 1)) {
+            ConstantRange rg = t.getFixedRange();
+            auto ix = [&](uint64_t off) { return rg.isDescending() ? rg.lower() + (int64_t)off : rg.upper() - (int64_t)off; };
+            return lo == hi ? "[" + std::to_string(ix(lo)) + "]"
+                            : "[" + std::to_string(ix(hi)) + ":" + std::to_string(ix(lo)) + "]";
+        }
+        return "[bits " + std::to_string(hi) + ":" + std::to_string(lo) + "]";
     }
 };
 
@@ -790,8 +1135,16 @@ struct Ports : ASTVisitor<Ports> {
             if (!b.input) m.bitDriven.insert({m.join.find(b.bus), b.index});
         for (Wire& w : wires) {
             SymSet from;
-            for (Sym s : w.from) from.push_back(m.canon(s));
-            m.addComb(w.to, from, w.plain, w.rhs);
+            bool plain = w.plain;
+            for (Sym s : w.from) {
+                if (const auto* sl = m.slicesOf(s)) {
+                    for (const Model::Slice& x : *sl) from.push_back(m.canon(x.node));
+                    plain = false;
+                } else {
+                    from.push_back(m.canon(s));
+                }
+            }
+            m.addComb(w.to, from, plain, plain ? w.rhs : nullptr);
         }
     }
     // After the assigns are known: a bit a port or an assign drives is that
@@ -828,7 +1181,7 @@ struct Gather : ASTVisitor<Gather> {
             Walk w{m};
             SymSet src;
             w.names(*init, src);
-            if (!src.empty()) m.addComb(&n, src, baseOf(*init) != nullptr, init);
+            if (!src.empty() && !m.slicesOf(&n)) m.addComb(&n, src, baseOf(*init) != nullptr, init);
         }
     }
 
@@ -1626,7 +1979,7 @@ inline void constrain(Model& m, const Options& opt) {
         std::vector<Sym> all;
         for (auto& [s, up] : m.join.up) all.push_back(s);
         for (Sym s : all)
-            if (isSignal(*s)) offer(s, path(*s));
+            if (isSignal(*s)) offer(s, m.pathOf(s));
         for (auto& [s, label] : m.labels) offer(s, label);
         if (!best) std::cerr << "mlint: " << what << " " << n << ": no such signal\n";
         return best ? m.join.find(best) : nullptr;
@@ -1865,6 +2218,10 @@ inline void check(Compilation& comp, Report& rep, const Options& opt) {
     Prof prof;
     auto lap = [&](const char* what) { prof.lap(what); };
     Model m;
+    Slicer slicer(m, comp);
+    comp.getRoot().visit(slicer);
+    slicer.finish();
+    lap("slices");
     Ports ports(m);
     comp.getRoot().visit(ports);
     ports.finish();
