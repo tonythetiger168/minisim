@@ -40,6 +40,13 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `msim -i` and `msim -do FILE`: interactive simulation like VCS UCLI:
+  `run [T]`, `step`, stops on a signal change, edge or value, `print` of
+  signals and class objects (properties, inherited ones, paths through
+  handles), `force`, `release`, `deposit` and `signals`.
+- `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
+  signal's waves are sent when the page first shows it, so large waveforms
+  are not cut to the one-file page's budget.
 - `mdebug -upf FILE -power [DOMAIN]`: the power domains, their supplies and
   isolation, level-shifter and retention strategies; with the log of
   `msim -upf_verbose`, power states over time. The active trace says when a

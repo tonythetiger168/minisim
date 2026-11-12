@@ -23,6 +23,10 @@
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <arpa/inet.h>
+#include <csignal>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "fsm_extract.hpp"
@@ -2433,7 +2437,10 @@ struct Tool {
         os << "],\n\"cases\":" << casesJson() << ",\n\"fsms\":" << fsmText << ",\n\"asserts\":" << assertText;
         if (haveCov) os << ",\n\"cov\":" << covJson();
         if (haveVcd) {
-            os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale) << ",\"waves\":{";
+            os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale);
+            // Served live, the page asks for each signal's waves when it shows them.
+            if (live) { os << ",\"live\":true}\n"; return; }
+            os << ",\"waves\":{";
             first = true;
             std::vector<std::string> part(db.signals.size());
             std::vector<const Wave*> wv(db.signals.size());
@@ -2446,7 +2453,7 @@ struct Tool {
             if (cutSigs)
                 std::cerr << "mdebug: the waves of " << cutSigs << " signals are cut to " << maxChanges << " changes each in the page, "
                           << (center ? "around -at" : "from the start; -at T keeps the changes around T")
-                          << " (-max-changes N for more per signal)\n";
+                          << " (-max-changes N for more per signal; -serve sends every signal whole, on demand)\n";
             parallelFor(db.signals.size(), threads, [&](size_t i) {
                 const Wave* w = wv[i];
                 if (!w) return;
@@ -2478,6 +2485,98 @@ struct Tool {
         }
         os << "}\n";
     }
+
+    // --------------------------------------------------------------- serve
+    // -serve [PORT]: the viewer from a local web server instead of one file.
+    // The page holds the design; the waves of a signal are sent when the page
+    // first shows it, so the size of the waveform no longer limits the page.
+    bool live = false;
+    static constexpr size_t kLiveChanges = 4000000;   // per signal
+
+    std::string waveJsonOf(size_t sig) {
+        const Wave* w = sig < db.signals.size() && haveVcd ? vcd.find(path(*db.signals[sig])) : nullptr;
+        if (!w) return "null";
+        std::string o = "[";
+        size_t n = std::min(w->ch.size(), kLiveChanges), k0 = 0;
+        if (center && n < w->ch.size()) {
+            int c = w->at(*center);
+            k0 = std::min((size_t)std::max(0, c - (int)(n / 2)), w->ch.size() - n);
+        }
+        for (size_t k = k0; k < k0 + n; k++) {
+            if (k > k0) o += ',';
+            o += '[';
+            o += std::to_string(w->ch[k].t);
+            o += ",\"";
+            o += w->bits((int)k);
+            o += "\"]";
+        }
+        return o + "]";
+    }
+
+    // Answers until the process is stopped; maxRequests > 0 ends after that many (tests).
+    int serve(int port, long maxRequests) {
+        live = true;
+        std::ostringstream data;
+        json(data, 0);
+        std::string page = kViewer;
+        const std::string mark = "/*MDEBUG_DATA*/null";
+        size_t mp = page.find(mark);
+        page = page.substr(0, mp) + data.str() + page.substr(mp + mark.size());
+
+        int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) { std::cerr << "mdebug: cannot open a socket\n"; return 2; }
+        int one = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // this machine only
+        addr.sin_port = htons((uint16_t)port);
+        if (::bind(srv, (sockaddr*)&addr, sizeof addr) < 0 || ::listen(srv, 16) < 0) {
+            std::cerr << "mdebug: cannot listen on 127.0.0.1:" << port << " (in use? -serve 0 picks a free port)\n";
+            ::close(srv);
+            return 2;
+        }
+        socklen_t alen = sizeof addr;
+        getsockname(srv, (sockaddr*)&addr, &alen);
+        std::cout << "mdebug: serving http://127.0.0.1:" << ntohs(addr.sin_port) << "/  (" << db.scopes.size() << " instances, "
+                  << db.signals.size() << " signals; Ctrl-C to stop)" << std::endl;
+        signal(SIGPIPE, SIG_IGN);
+        for (long served = 0; maxRequests <= 0 || served < maxRequests; served++) {
+            int c = ::accept(srv, nullptr, nullptr);
+            if (c < 0) continue;
+            std::string req;
+            char buf[4096];
+            while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
+                ssize_t n = ::recv(c, buf, sizeof buf, 0);
+                if (n <= 0) break;
+                req.append(buf, (size_t)n);
+            }
+            std::string target, body, type = "application/json", status = "200 OK";
+            if (req.rfind("GET ", 0) == 0) target = req.substr(4, req.find(' ', 4) - 4);
+            // A page of another site must not read the design through the browser.
+            std::string low = req;
+            for (char& ch : low) ch = (char)std::tolower((unsigned char)ch);
+            size_t hp = low.find("\nhost:");
+            std::string host = hp == std::string::npos ? "" : low.substr(hp + 6, low.find('\r', hp) - hp - 6);
+            while (!host.empty() && host[0] == ' ') host.erase(0, 1);
+            bool local = host.rfind("127.0.0.1", 0) == 0 || host.rfind("localhost", 0) == 0;
+            if (!local) { status = "403 Forbidden"; body = "{\"error\":\"local requests only\"}"; }
+            else if (target == "/" || target == "/index.html") { body = page; type = "text/html; charset=utf-8"; }
+            else if (target.rfind("/wave?i=", 0) == 0) body = waveJsonOf(std::strtoull(target.c_str() + 8, nullptr, 10));
+            else { status = "404 Not Found"; body = "{\"error\":\"not found\"}"; }
+            std::string head = "HTTP/1.1 " + status + "\r\nContent-Type: " + type + "\r\nContent-Length: " + std::to_string(body.size()) +
+                               "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+            std::string out = head + body;
+            for (size_t off = 0; off < out.size();) {
+                ssize_t n = ::send(c, out.data() + off, out.size() - off, 0);
+                if (n <= 0) break;
+                off += (size_t)n;
+            }
+            ::close(c);
+        }
+        ::close(srv);
+        return 0;
+    }
 };
 
 void usage() {
@@ -2501,6 +2600,9 @@ void usage() {
                  "  -assert [NAME]   the assertions (all, under an instance, or one); with -log LOG and -vcd,\n"
                  "                   each failure: what the assertion sampled at the clock ticks before it\n"
                  "                   and what drove each signal (-at T picks the failure at or before T)\n"
+                 "  -serve [PORT]    the viewer from a web server on this machine (127.0.0.1, port 8765 or\n"
+                 "                   PORT, 0 for a free one): waves are sent per signal when the page shows\n"
+                 "                   it, so a large waveform does not have to fit in one page\n"
                  "  -upf FILE        the power intent (IEEE 1801); -power_top INST as for msim\n"
                  "  -power [DOMAIN]  with -upf: the power domains, what is in each, their supplies and their\n"
                  "                   isolation, level-shifter and retention strategies; with -log (the output\n"
@@ -2532,7 +2634,9 @@ int main(int argc, char** argv) {
     struct Query { std::string what, arg; int depth; std::optional<uint64_t> at; };
     std::vector<Query> queries;
     std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath, covPath, upfPath, powerTop;
-    bool powerTopSet = false;
+    bool powerTopSet = false, serve = false;
+    int servePort = 8765;
+    long serveRequests = 0;
     int depth = -1;
     std::optional<uint64_t> at;
     size_t maxChanges = 20000;
@@ -2565,6 +2669,12 @@ int main(int argc, char** argv) {
             queries.push_back({"assert", arg, -1, std::nullopt});
             continue;
         }
+        if (a == "-serve") {
+            serve = true;
+            if (i + 1 < argc && std::isdigit((unsigned char)argv[i + 1][0]) && !std::filesystem::exists(argv[i + 1])) servePort = std::atoi(argv[++i]);
+            continue;
+        }
+        if (a == "-serve-requests") { serveRequests = std::atol(next("a number").c_str()); continue; }
         if (a == "-upf") { upfPath = next("a UPF file"); continue; }
         if (a == "-power_top") { powerTop = next("an instance"); powerTopSet = true; continue; }
         if (a == "-power") {
@@ -2600,7 +2710,7 @@ int main(int argc, char** argv) {
         if (a == "-sv" || a == "-sverilog") continue;
         fwd.push_back(a);
     }
-    if (queries.empty() && htmlPath.empty() && jsonPath.empty() && scriptPath.empty() && fwd.size() == 1) { usage(); return 2; }
+    if (queries.empty() && htmlPath.empty() && jsonPath.empty() && scriptPath.empty() && !serve && fwd.size() == 1) { usage(); return 2; }
     // Every instance gets its own symbols, so tb.a.q and tb.b.q are two signals.
     fwd.push_back("--disable-instance-caching");
     fwd.push_back("--threads");   // the front end parses files in parallel
@@ -2688,5 +2798,6 @@ int main(int argc, char** argv) {
         std::cout << "mdebug: wrote " << htmlPath << " (" << tool.db.scopes.size() << " instances, "
                   << tool.db.signals.size() << " signals, " << tool.db.drivers.size() << " drivers)\n";
     }
+    if (serve) return tool.serve(servePort, serveRequests);
     return ok ? 0 : 1;
 }

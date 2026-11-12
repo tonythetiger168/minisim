@@ -383,3 +383,30 @@ execute_process(COMMAND ${MDEBUG} ${SV} -top tb -power RESULT_VARIABLE rc OUTPUT
 if(rc EQUAL 0)
   message(FATAL_ERROR "-power without -upf passed")
 endif()
+
+# The local server: the page without waves in it, each signal's waves on
+# request, nothing for another host name, and only on 127.0.0.1.
+if(PY)
+  file(WRITE ${OUT}/serve.py "import subprocess, sys, json, re, urllib.request, urllib.error\n"
+       "p = subprocess.Popen([sys.argv[1], sys.argv[2], '-top', 'tb', '-vcd', sys.argv[3], '-serve', '0', '-serve-requests', '5'], stdout=subprocess.PIPE, text=True)\n"
+       "line = p.stdout.readline()\n"
+       "assert 'serving http://127.0.0.1:' in line, line\n"
+       "base = line.split('serving ')[1].split('/ ')[0]\n"
+       "op = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
+       "page = op.open(base + '/').read().decode()\n"
+       "assert '\"live\":true' in page and '\"waves\":' not in page and '\"fsms\":' in page\n"
+       "paths = re.findall(r'\\{\"path\":\"([^\"]+)\",\"width\"', page)\n"
+       "ix = paths.index('tb.u.state')\n"
+       "w = json.loads(op.open(base + '/wave?i=%d' % ix).read())\n"
+       "assert w[:3] == [[0, '00'], [25, '01'], [35, '10']], w\n"
+       "assert json.loads(op.open(base + '/wave?i=99999').read()) is None\n"
+       "for url, hdr, code in ((base + '/nope', {}, 404), (base + '/wave?i=0', {'Host': 'other.example'}, 403)):\n"
+       "    try:\n        op.open(urllib.request.Request(url, headers=hdr))\n        sys.exit('no error for ' + url)\n"
+       "    except urllib.error.HTTPError as e:\n        assert e.code == code, (url, e.code)\n"
+       "assert p.wait(timeout=20) == 0\nprint('serve ok')\n")
+  execute_process(COMMAND ${PY} ${OUT}/serve.py ${MDEBUG} ${SRC}/tests/cov/fsm.sv ${OUT}/fsm.vcd
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 60)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES "serve ok")
+    message(FATAL_ERROR "mdebug -serve: ${rc}\n${out}${err}")
+  endif()
+endif()
