@@ -47,6 +47,23 @@ inline Tee& tee() { static Tee t; return t; }
 
 inline long envLong(const char* n) { const char* v = getenv(n); return v ? strtol(v, nullptr, 10) : 0; }
 
+// A digest of every signal's value: a checkpoint keeps it, and a run that goes
+// back to the checkpoint checks it got the same state (a design that reads
+// the clock, the environment or a DPI model may not).
+inline std::string stateDigest() {
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&](uint64_t x) { for (int b = 0; b < 8; b++) { h ^= (x >> (8 * b)) & 0xff; h *= 1099511628211ULL; } };
+    for (size_t s = 0; s < S.sigs.size(); s++) {
+        const Val& v = S.sigs[s].val;
+        mix(v.v); mix(v.x); mix(v.z); mix((uint64_t)v.w | (uint64_t)v.real << 32 | (uint64_t)v.str << 33);
+        for (size_t k = 0; k < v.hi.size(); k++) { mix(v.hi[k].v); mix(v.hi[k].x); mix(v.hi[k].z); }
+    }
+    mix(S.now);
+    char b[32];
+    snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
+    return b;
+}
+
 // Muted output while a $restart runs again up to its checkpoint.
 inline int savedOut = -1, savedErr = -1;
 inline long saveSeq = 0;
@@ -146,13 +163,24 @@ inline Val hook(int op, const std::vector<Val>& a) {
             if (savedOut >= 0 && envLong("MSIM_RESTORE_AT") == saveSeq) {   // the checkpoint of a $restart
                 unsetenv("MSIM_RESTORE_AT");
                 unmute();
+                const char* want = getenv("MSIM_RESTORE_STATE");
+                if (want && *want && stateDigest() != want)
+                    std::cerr << "msim: warning: the state at the checkpoint differs from the one saved; the run is "
+                                 "not repeatable (it reads the clock, the environment or a DPI model?)\n";
+                else if (want && *want) std::cerr << "msim: restored the checkpoint at time " << S.now << "\n";
+                unsetenv("MSIM_RESTORE_STATE");
                 return i32(0);
             }
             if (savedOut >= 0) return i32(0);   // running again: the checkpoint files are already there
             std::string f = a.empty() ? std::string() : str(a[0]);
             std::ofstream o(f);
             if (!o) { std::cerr << (op == AD_SAVE ? "$save" : "$incsave") << ": cannot write " << f << "\n"; return i32(0); }
-            o << "msim checkpoint\nsave " << saveSeq << "\ntime " << S.now << "\n";
+            // What msim -restore needs to run the same simulation again: the
+            // directory and the command line, and the state to compare.
+            char cwd[4096];
+            o << "msim checkpoint\nsave " << saveSeq << "\ntime " << S.now << "\nstate " << stateDigest() << "\n";
+            if (getcwd(cwd, sizeof cwd)) o << "cwd " << cwd << "\n";
+            for (auto& x : argv0()) o << "arg " << x << "\n";
             return i32(0);
         }
         case AD_RESTART: {
@@ -168,6 +196,8 @@ inline Val hook(int op, const std::vector<Val>& a) {
                 return i32(0);
             }
             setenv("MSIM_RESTORE_AT", std::to_string(seq).c_str(), 1);
+            for (std::string ln; std::getline(in, ln);)
+                if (ln.rfind("state ", 0) == 0) setenv("MSIM_RESTORE_STATE", ln.c_str() + 6, 1);
             again();
         }
     }
@@ -179,6 +209,35 @@ inline Val hook(int op, const std::vector<Val>& a) {
 // At the start of main: keep the arguments for $reset / $restart, and mute
 // the output of a run that goes back to a $save checkpoint.
 inline void annexStartup(int argc, char** argv) {
+    // msim -restore <checkpoint> [+plusargs...]: run the saved command line
+    // again in its directory, quietly up to the checkpoint (like simv -r).
+    if (argc > 1 && (std::string(argv[1]) == "-restore" || std::string(argv[1]) == "-r")) {
+        if (argc < 3) { std::cerr << "msim: -restore needs a checkpoint file\n"; std::exit(2); }
+        std::ifstream in(argv[2]);
+        std::string magic, ln, cwd, state;
+        long seq = 0;
+        std::vector<std::string> args;
+        std::getline(in, magic);
+        while (std::getline(in, ln)) {
+            if (ln.rfind("save ", 0) == 0) seq = strtol(ln.c_str() + 5, nullptr, 10);
+            else if (ln.rfind("state ", 0) == 0) state = ln.substr(6);
+            else if (ln.rfind("cwd ", 0) == 0) cwd = ln.substr(4);
+            else if (ln.rfind("arg ", 0) == 0) args.push_back(ln.substr(4));
+        }
+        if (magic != "msim checkpoint" || seq <= 0 || args.empty()) {
+            std::cerr << "msim: " << argv[2] << " is not a checkpoint written by $save (or it is from an older msim)\n";
+            std::exit(2);
+        }
+        if (!cwd.empty() && chdir(cwd.c_str()) != 0) {
+            std::cerr << "msim: -restore: cannot go to " << cwd << ": " << strerror(errno) << "\n";
+            std::exit(2);
+        }
+        for (int k = 3; k < argc; k++) args.push_back(argv[k]);   // more plusargs: read after the checkpoint
+        setenv("MSIM_RESTORE_AT", std::to_string(seq).c_str(), 1);
+        if (!state.empty()) setenv("MSIM_RESTORE_STATE", state.c_str(), 1);
+        annexd::argv0() = args;
+        annexd::again();
+    }
     for (int k = 0; k < argc; k++) annexd::argv0().push_back(argv[k]);
     g_annexHook = annexd::hook;
     if (annexd::envLong("MSIM_RESTORE_AT") > 0) {

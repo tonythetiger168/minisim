@@ -1970,6 +1970,33 @@ inline int scanFormat(const std::string& fmt, Next next, Back back) {
             }
             if (neg) val = ~val + 1;
             v = unk ? allx(64) : make(val, x, 64, z);
+            // More digits than 64 bits hold (a 128-bit %h): build the value
+            // digit by digit at its full width.
+            size_t nd = 0;
+            for (size_t q = (!bits && (tok[0] == '-' || tok[0] == '+')) ? 1 : 0; q < tok.size(); q++) nd += tok[q] != '_';
+            if (bits && nd * bits > 64) {
+                int W = (int)(nd * bits);
+                Val acc = v_resize(make(0, 0, 64, 0), W, false);
+                int pos = 0;
+                for (size_t q = tok.size(); q-- > 0;) {
+                    char d = (char)tolower((unsigned char)tok[q]);
+                    if (d == '_') continue;
+                    uint64_t m = (1ull << bits) - 1;
+                    Val part = d == 'x' ? make(0, m, bits, 0)
+                             : (d == 'z' || d == '?') ? make(0, m, bits, m)
+                             : make((uint64_t)(isdigit((unsigned char)d) ? d - '0' : d - 'a' + 10), 0, bits, 0);
+                    acc = v_insert(acc, part, pos + bits - 1, pos);
+                    pos += bits;
+                }
+                v = acc;
+            } else if (!bits && !unk && nd > 18) {
+                int W = (int)(nd * 3.33) + 2;
+                Val acc = v_resize(make(0, 0, 64, 0), W, false), ten = v_resize(make(10, 0, 64, 0), W, false);
+                for (size_t q = neg || tok[0] == '+' ? 1 : 0; q < tok.size(); q++)
+                    if (tok[q] != '_') acc = v_add(v_mul(acc, ten), v_resize(make((uint64_t)(tok[q] - '0'), 0, 64, 0), W, false));
+                if (neg) acc = v_sub(v_resize(make(0, 0, 64, 0), W, false), acc);
+                v = acc;
+            }
             v.sgn = !bits;
         }
         scanOut().push_back(v);
@@ -2285,25 +2312,13 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             std::string t = m ? m->substr(pre.size()) : "";
             if (ctl == 's') return mkstr(t);
             if (ctl == 'f' || ctl == 'e' || ctl == 'g') { Val r = make(0, 0, 64, 0); double d = atof(t.c_str()); memcpy(&r.v, &d, 8); r.real = true; return r; }
-            int base = ctl == 'h' || ctl == 'x' ? 16 : ctl == 'o' ? 8 : ctl == 'b' ? 2 : 10;
-            uint64_t v = 0, x = 0;
-            bool neg = false;
-            size_t i = 0;
-            if (base == 10 && i < t.size() && (t[i] == '-' || t[i] == '+')) neg = t[i++] == '-';
-            int bits = base == 16 ? 4 : base == 8 ? 3 : 1;
-            for (; i < t.size(); i++) {
-                char c = (char)tolower((unsigned char)t[i]);
-                if (c == '_') continue;
-                if (base != 10 && (c == 'x' || c == 'z')) { v <<= bits; x = (x << bits) | mask(bits); continue; }
-                int d = isdigit((unsigned char)c) ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : 99;
-                if (d >= base) break;
-                v = base == 10 ? v * 10 + d : (v << bits) | d;
-                x <<= base == 10 ? 0 : bits;
-            }
-            if (neg) v = ~v + 1;
-            Val r = make(v, x, 64, 0);
-            r.sgn = base == 10;
-            return r;
+            // A number: read as $sscanf would, at any width (21.6, 21.3.4.3).
+            size_t pos = 0;
+            int got = scanFormat(std::string("%") + (char)(ctl == 'x' ? 'h' : ctl),
+                                 [&]() -> int { return pos < t.size() ? (unsigned char)t[pos++] : EOF; },
+                                 [&](int) { if (pos) pos--; });
+            if (got <= 0 || scanOut().empty()) { Val r = make(0, 0, 64, 0); r.sgn = ctl == 'd'; return r; }
+            return scanOut()[0];
         }
     }
     return xfill(32, false);
