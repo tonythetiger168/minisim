@@ -2088,8 +2088,7 @@ struct Lowerer {
             }
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
-                if (c.conditions.size() != 1) unsupported("pattern ?:");
-                return mux(un(Op::LogNot, un(Op::LogNot, expr(*c.conditions[0].expr))), exprH(c.left()), exprH(c.right()));
+                return mux(un(Op::LogNot, un(Op::LogNot, condOf(c))), exprH(c.left()), exprH(c.right()));
             }
             case ExpressionKind::Assignment: unsupported("assignment of a handle inside an expression");
             default: break;
@@ -2530,8 +2529,7 @@ struct Lowerer {
             }
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
-                if (c.conditions.size() != 1) unsupported("pattern conditional");
-                return mux(expr(*c.conditions[0].expr), realOf(c.left()), realOf(c.right()));
+                return mux(condOf(c), realOf(c.left()), realOf(c.right()));
             }
             case ExpressionKind::Call: {
                 const auto& call = e.as<CallExpression>();
@@ -2779,8 +2777,7 @@ struct Lowerer {
             }
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
-                if (c.conditions.size() != 1) unsupported("pattern conditional");
-                return mux(expr(*c.conditions[0].expr), strOf(c.left()), strOf(c.right()));
+                return mux(condOf(c), strOf(c.left()), strOf(c.right()));
             }
             case ExpressionKind::Call: {
                 const auto& call = e.as<CallExpression>();
@@ -2926,18 +2923,32 @@ struct Lowerer {
         condDefs().push_back(std::move(d));
         return condDefs().back().base;
     }
+    // The condition of c ? a : b, or of x matches p &&& g ? a : b (12.6.2):
+    // each part in turn, pattern variables bound as they are matched.
+    E condOf(const slang::ast::ConditionalExpression& c) {
+        if (c.conditions.size() == 1 && !c.conditions[0].pattern) {
+            if (E k = condCovExpr(*c.conditions[0].expr)) return k;
+            return expr(*c.conditions[0].expr);
+        }
+        E out;
+        for (auto& cd : c.conditions) {
+            E x = cd.pattern ? matchExpr(*cd.expr, *cd.pattern, slang::ast::CaseStatementCondition::Normal)
+                             : un(Op::LogNot, un(Op::LogNot, expr(*cd.expr)));
+            out = out ? bin(Op::LogAnd, out, x) : x;
+        }
+        return out;
+    }
     E lazyExpr(const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
         if (e.kind == ExpressionKind::ConditionalOp) {
             const auto& c = e.as<ConditionalExpression>();
-            if (c.conditions.size() != 1 || (!sideEffects(c.left()) && !sideEffects(c.right()))) return nullptr;
+            if (!sideEffects(c.left()) && !sideEffects(c.right())) return nullptr;
             int w = isHandleType(*e.type) || e.type->isFloating() || e.type->isString() ? 64
                   : ctx.live ? ctx.w : (int)e.type->getBitWidth();
             needWidth(w);
             bool sg = ctx.live ? ctx.tag : e.type->isSigned();
             int tmp = fresh(w);
-            Instr j; j.k = IK::JmpIfNot; j.e = condCovExpr(*c.conditions[0].expr);
-            if (!j.e) j.e = expr(*c.conditions[0].expr);
+            Instr j; j.k = IK::JmpIfNot; j.e = condOf(c);
             size_t jf = prog.emit(j);
             Instr a; a.k = IK::Assign; a.sig = tmp; a.e = lowerAs(c.left(), *e.type, ctx); prog.emit(a);
             size_t je = emitJmp();
@@ -4606,13 +4617,11 @@ struct Lowerer {
             }
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
-                if (c.conditions.size() != 1) unsupported("pattern conditional");
                 int w = ctx.live && ctx.w > 0 ? ctx.w : e.type->isIntegral() ? (int)e.type->getBitWidth() : storeW(*e.type);
                 needWidth(w);
                 bool sg = e.type->isSigned();
                 ExprCtx arm{w, sg, sg, true};
-                E cond = condCovExpr(*c.conditions[0].expr);
-                if (!cond) cond = expr(*c.conditions[0].expr);
+                E cond = condOf(c);
                 return mux(cond, expr(c.left(), arm), expr(c.right(), arm));
             }
             case ExpressionKind::Concatenation: {
@@ -6748,7 +6757,12 @@ struct Lowerer {
             }
             case PatternKind::Constant: {
                 const Expression& ce = p.as<ConstantPattern>().expr;
-                if (t.isFloating() || t.isString()) unsupported("constant pattern of a real or string");
+                if (t.isFloating()) return fcmp(4, un(Op::AsReal, v), realOf(ce));   // 12.6: a real compares as ==
+                if (t.isString()) {
+                    auto n = node(Op::StrCmp, {un(Op::AsStr, v), strOf(ce)});
+                    n->hi = 4;
+                    return n;
+                }
                 return bin(eqOp, v, resize(storageOf(t, ce), w, ce.type->isSigned(), false));
             }
             case PatternKind::Tagged: {
