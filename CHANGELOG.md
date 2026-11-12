@@ -826,6 +826,10 @@ Spec references are IEEE 1800-2023 clauses.
   and `mplan report -rules URL` to take the annotations as triage rules.
 
 ### Fixed
+- `c ? q.pop_front() : d` (and `pop_back`) runs the pop only in the chosen
+  arm, after the condition (11.4.11). It used to pop first, so a condition
+  on `q.size()` popping the last element gave `d` and lost the element.
+  Found by the SPI VIP's slave model.
 - msim memory on big VIP benches: a 2-state unpacked array with more than
   64 elements gets its 0 defaults (6.8) from a loop instead of one
   instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and

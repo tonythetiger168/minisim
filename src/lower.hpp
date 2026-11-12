@@ -2946,7 +2946,14 @@ struct Lowerer {
         using namespace slang::ast;
         struct V : ASTVisitor<V, VisitFlags::Expressions> {
             bool found = false;
-            void handle(const CallExpression& c) { if (!c.isSystemCall()) found = true; else visitDefault(c); }
+            // A user subroutine, or a container method that changes the container
+            // (q.pop_front() is a system call to slang): it must run only in the
+            // arm that is chosen, after the condition (11.4.11).
+            void handle(const CallExpression& c) {
+                auto n = c.getSubroutineName();
+                if (!c.isSystemCall() || n == "pop_front" || n == "pop_back") found = true;
+                else visitDefault(c);
+            }
             void handle(const NewClassExpression&) { found = true; }
             void handle(const CopyClassExpression&) { found = true; }
         } v;
