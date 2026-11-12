@@ -62,8 +62,10 @@ const char* kUsage =
     "  -gates-per-lut F   library gates one LUT holds, for the size estimate (default 3)\n"
     "  -lutram-max BITS   largest clockless-read memory kept in LUT RAM (default 4096)\n"
     "  -fmax MHZ          emu_clk frequency for the speed estimate (default 50)\n"
-    "  -starts N          partitioning attempts, best one kept (default 16)\n"
-    "  -dump-hgr FILE     also write the partitioning problem as an hMETIS hypergraph\n"
+    "  -starts N          partitioning attempts (default 16)\n"
+    "  -route-best N      route the N attempts with the smallest cut and keep the fastest (default: all)\n"
+    "  -partitioner CMD   also ask another partitioner (CMD part.hgr K part.out THREADS), polish its\n"
+    "                     answer, and let it compete with memu's own; tools/memu_mtkahypar.py is one\n"    "  -dump-hgr FILE     also write the partitioning problem as an hMETIS hypergraph\n"
     "  -threads N         worker threads (default: every logical CPU; the result is the same)\n"
     "  -o DIR             output directory (default: memu.d)\n"
     "  -q                 print errors only\n"
@@ -262,8 +264,8 @@ int traceToVcd(const std::string& mapFile, const std::string& dumpFile, const st
 
 int main(int argc, char** argv) {
     std::vector<std::string> netlists, libs, memFiles, clockSpecs, probePats, assigns;
-    std::string top, boardFile, outDir = "memu.d", ioFpga, trigger, hgrFile;
-    int nFpgas = 0, pins = 100, starts = 16, traceDepth = 1024, tdmMax = -1;
+    std::string top, boardFile, outDir = "memu.d", ioFpga, trigger, hgrFile, partitioner;
+    int nFpgas = 0, pins = 100, starts = 16, routeTries = 0, traceDepth = 1024, tdmMax = -1;
     double lut = 0, ff = 0, bramKb = 0, util = -1, fmax = 50;
     unsigned threads = par::defaultThreads();
     bool quiet = false;
@@ -315,10 +317,12 @@ int main(int argc, char** argv) {
             else if (a == "-lutram-max") opt.lutramMaxBits = std::atol(next("a number").c_str());
             else if (a == "-fmax") fmax = std::atof(next("MHz").c_str());
             else if (a == "-starts") starts = std::max(1, std::atoi(next("a number").c_str()));
+            else if (a == "-route-best") routeTries = std::max(1, std::atoi(next("a number").c_str()));
             else if (par::threadsArg(argc, argv, i, threads, "memu")) continue;
             else if (a == "-o") outDir = next("a path"), outGiven = true;
             else if (a == "-q") quiet = true;
             else if (a == "-dump-hgr") hgrFile = next("a file");
+            else if (a == "-partitioner") partitioner = next("a command");
             else if (a == "-trace") {
                 traceMode = true;
                 trace.push_back(next("the probe map"));
@@ -372,9 +376,9 @@ int main(int argc, char** argv) {
             for (size_t p = 0; p < d.nl.ports.size(); p++) fixed[d.ni() + p] = f;
         }
 
-        if (!hgrFile.empty()) {
-            // The partitioning problem in hMETIS format, for comparing with other partitioners.
-            HGraph g = buildGraph(d, fixed);
+        // The partitioning problem in hMETIS format: for another partitioner
+        // to solve (-partitioner), or to compare with one (-dump-hgr).
+        auto writeHgr = [&](const std::string& file, const HGraph& g) {
             std::ostringstream h;
             h << g.ne() << " " << g.nv << " 11\n";
             for (int e = 0; e < g.ne(); e++) {
@@ -382,10 +386,42 @@ int main(int argc, char** argv) {
                 for (int x = g.netOff[e]; x < g.netOff[e + 1]; x++) h << " " << g.netPins[x] + 1;
                 h << "\n";
             }
-            for (int v = 0; v < g.nv; v++) h << std::lround(g.w[v][0] * opt.gatesPerLut) << "\n";
-            writeFile(hgrFile, h.str());
+            for (int v = 0; v < g.nv; v++) h << std::max(1L, std::lround(g.w[v][0] * opt.gatesPerLut)) << "\n";
+            writeFile(file, h.str());
+        };
+        if (!hgrFile.empty()) writeHgr(hgrFile, buildGraph(d, fixed));
+        std::vector<int> given;
+        if (!partitioner.empty() && board.k() > 1) {
+            // The job: part.hgr, and beside it part.hgr.fix (the FPGA of each
+            // vertex that has one, or -1), part.hgr.caps (what each FPGA holds,
+            // in the vertex weights' unit; 0: no limit) and part.hgr.board (the
+            // wired pairs of FPGAs). The answer: one FPGA number per vertex.
+            mkdir(outDir.c_str(), 0777);
+            HGraph g = buildGraph(d, fixed);
+            std::string job = outDir + "/part.hgr", ans = outDir + "/part.out";
+            writeHgr(job, g);
+            std::ostringstream fx, cp, bd;
+            for (int v = 0; v < g.nv; v++) fx << g.fixed[v] << "\n";
+            for (auto& f : board.fpgas) cp << (f.lut > 0 ? std::lround(f.lut * board.util * opt.gatesPerLut) : 0L) << "\n";
+            for (auto& l : board.links) bd << l.a << " " << l.b << "\n";
+            writeFile(job + ".fix", fx.str());
+            writeFile(job + ".caps", cp.str());
+            writeFile(job + ".board", bd.str());
+            std::remove(ans.c_str());
+            auto quote = [](const std::string& x) {
+                std::string q = "'";
+                for (char c : x) q += c == '\'' ? std::string("'\\''") : std::string(1, c);
+                return q + "'";
+            };
+            std::string cmd = partitioner + " " + quote(job) + " " + std::to_string(board.k()) + " " + quote(ans) + " " +
+                              std::to_string(threads);
+            int rc = std::system(cmd.c_str());
+            if (rc != 0) throw Error("-partitioner: '" + cmd + "' failed");
+            std::istringstream in(readFile(ans));
+            for (long x; in >> x;) given.push_back((int)x);
         }
-        Plan pl = makePlan(d, board, fixed, starts, threads);
+        Plan pl = makePlan(d, board, fixed, starts, routeTries ? routeTries : starts, threads,
+                           given.empty() ? nullptr : &given);
         double tPart = since();
 
         Emitter em(d, board, pl);
@@ -453,7 +489,10 @@ int main(int argc, char** argv) {
         }
         r << "timing: " << d.dc << " delta" << (d.dc == 1 ? "" : "s") << " after a clock event, " << d.da
           << " after the inputs change, " << pl.B << " emu_clk cycle" << (pl.B == 1 ? "" : "s") << " per delta: "
-          << K << " emu_clk cycle" << (K == 1 ? "" : "s") << " per event\n";
+          << K << " emu_clk cycle" << (K == 1 ? "" : "s") << " per event";
+        if (pl.Bshared > pl.B)
+            r << " (" << em.N() * pl.Bshared << " before the signals that matter most got wires of their own)";
+        r << "\n";
         r << "time: emu_time counts in units of " << em.unitPs << " ps\n";
         for (auto& m : d.mems) {
             if (!d.roleOf.count(m.cell)) continue;
@@ -464,8 +503,12 @@ int main(int argc, char** argv) {
               << ", " << (!m.asyncRead() ? "block RAM" : m.lagRead ? "block RAM read on emu_clk" : "LUT RAM") << "\n";
         }
         if (k > 1)
-            r << "partition: cut cost " << (long)pl.stats.cost << " (best of " << pl.starts << " starts, seed "
-              << pl.stats.seed << ")\n";
+            r << "partition: cut cost " << (long)pl.stats.cost << " (" << pl.starts << " starts, "
+              << (pl.stats.seed ? "seed " + std::to_string(pl.stats.seed) : std::string("the -partitioner's won"))
+              << (pl.routed > 1 ? ", the fastest of the " + std::to_string(pl.routed) + " smallest cuts" : std::string(", the smallest cut"))
+              << ")\n";
+        if (pl.givenCost >= 0 && pl.stats.seed)
+            r << "  the -partitioner's cut cost " << (long)pl.givenCost << " after polishing\n";
         for (int f = 0; f < k; f++) {
             auto& fp = board.fpgas[f];
             auto pct = [&](double used, double cap) {
@@ -485,6 +528,8 @@ int main(int argc, char** argv) {
             r << "  link " << board.fpgas[l.a].name << "-" << board.fpgas[l.b].name << ": " << l.ab.size() << " + "
               << l.ba.size() << " signals on " << l.pinsAB + l.pinsBA << " of " << l.pins << " wires";
             if (l.ratioAB > 1 || l.ratioBA > 1) r << ", multiplexed " << std::max(l.ratioAB, l.ratioBA) << ":1";
+            if (l.directAB + l.directBA > 0)
+                r << " (" << l.directAB + l.directBA << " signal" << (l.directAB + l.directBA == 1 ? " keeps a wire of its own)" : "s keep a wire of their own)");
             r << "\n";
         }
         if (!em.probes.empty()) {

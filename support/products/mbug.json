@@ -1,0 +1,23 @@
+{
+  "name": "mbug",
+  "title": "mbug bug filing",
+  "summary": "Turns each distinct mregress, mlint or mdft failure into one issue in GitHub Issues, Redmine or Jira, deduplicated by signature.",
+  "docs": [
+    "README.md#Bug reports",
+    "README.md#Regressions",
+    "ci/README.md",
+    "CHANGELOG.md"
+  ],
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "msim",
+    "mwave",
+    "mcov",
+    "mregress",
+    "mplan",
+    "mlint",
+    "mdft",
+    "mdebug"
+  ]
+}
