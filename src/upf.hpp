@@ -895,6 +895,14 @@ struct Model {
         std::vector<std::pair<std::string, std::string>> portMap;   // model port -> net_ref (a leading ~ inverts)
     };
     std::vector<RetModel> retModels;
+    // use_interface_cell -force_function (6.62): the first of -lib_cells is
+    // the functional model of the isolation strategy's cells.
+    struct IfcModel {
+        std::string strategy, ls, domain, scope, where, model, clamp;   // ls: the level shifter of -strategy; clamp: -applies_to_clamp
+        std::vector<std::string> elements, exclude;                 // rooted
+        std::vector<std::pair<std::string, std::string>> portMap;   // model port -> net_ref (a leading ~ inverts)
+    };
+    std::vector<IfcModel> ifcModels;
     std::map<std::string, std::string> nameFormat;                  // name_format affix -> pattern
     struct Variation { double lo = 1, hi = 1; std::string where; };
     std::map<std::string, Variation> variations;                    // set_variation: supply -> range

@@ -2589,6 +2589,8 @@ int main(int argc, char** argv) {
                     if (v.kind == upf::Vcm::Model) checkers.insert(v.model.substr(v.model.rfind('.') == std::string::npos ? 0 : v.model.rfind('.') + 1));
                 for (auto& rm : rt.m.retModels)   // and a retention model (6.39)
                     checkers.insert(rm.model.substr(rm.model.rfind('.') == std::string::npos ? 0 : rm.model.rfind('.') + 1));
+                for (auto& im : rt.m.ifcModels)   // and an isolation model (6.62)
+                    checkers.insert(im.model.substr(im.model.rfind('.') == std::string::npos ? 0 : im.model.rfind('.') + 1));
                 std::vector<std::string> real;
                 for (auto* t : comp->getRoot().topInstances)
                     if (!checkers.count(std::string(t->getDefinition().name))) real.push_back(std::string(t->name));
@@ -2597,6 +2599,7 @@ int main(int argc, char** argv) {
             // function and model VCMs (6.30.8, 6.30.9) are placed in the design too
             std::string vcmText = rt.m.connectVcm.empty() ? std::string() : rt.vcmSource(*comp, simTop);
             vcmText += rt.m.retModels.empty() ? std::string() : rt.retModelSource(*comp, simTop);   // map_retention_cell -lib_model_name (6.39)
+            vcmText += rt.m.ifcModels.empty() ? std::string() : rt.ifcModelSource(*comp, simTop);   // use_interface_cell -force_function (6.62)
             if (!rt.m.bindCheckers.empty() || !vcmText.empty()) {
                 static std::string bindText;
                 bindText = (rt.m.bindCheckers.empty() ? std::string() : rt.m.bindSource(simTop)) + vcmText;

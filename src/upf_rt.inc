@@ -50,6 +50,7 @@ struct Cell {               // an isolation or level-shifter cell on a port conn
     Val latch;
     bool latched = false;
     std::string port;
+    int model = -1;         // isolation: use_interface_cell -force_function model (Rt::ifcEls), or -1
 };
 struct RetEl { int sig; Val saved; bool have = false; };
 struct RetRt {
@@ -304,6 +305,13 @@ struct Rt {
         g.build(m);
         for (size_t i = 0; i < S.sigs.size(); i++) sigByName.emplace(S.sigs[i].name, (int)i);
         for (auto& w : m.warnings) std::cerr << "msim: UPF: " << w << "\n";
+        for (auto& e : ifcEls) {   // use_interface_cell -force_function (6.62)
+            auto a = sigByName.find(e.d), b = sigByName.find(e.y);
+            if (a == sigByName.end() || b == sigByName.end())
+                throw Error("use_interface_cell: no signal " + (a == sigByName.end() ? e.d : e.y) + " for the isolation model");
+            e.dSig = a->second;
+            e.ySig = b->second;
+        }
         for (auto& e : retModelEls) {   // map_retention_cell -lib_model_name (6.39)
             auto a = sigByName.find(e.el), b = sigByName.find(e.q);
             if (a == sigByName.end() || b == sigByName.end())
@@ -395,7 +403,7 @@ struct Rt {
             // slang names procedure kinds "Initial", "AlwaysFF", ...; lowering adds "assign", "init", "sampled"
             const std::string& k = lp.kind;
             if (k == "Initial" || k == "Final" || k == "init" || k == "sampled") continue;
-            if (inRetModel(lp.scope)) continue;   // a -lib_model_name model is not corrupted (6.39)
+            if (inRetModel(lp.scope)) continue;   // a -lib_model_name or -force_function model is not corrupted (6.39, 6.62)
             std::string dn = dm.of(lp.scope);
             // set_simstate_behavior (6.56): DISABLE and PORT_CORR_ONLY leave the logic alone
             auto [beh, behAt] = behaviorOf(lp.scope);
@@ -1652,6 +1660,195 @@ struct Rt {
             S.holdOn(e.elSig, konst(v), true);
         }
     }
+    // use_interface_cell -force_function (6.62): an isolation cell of the
+    // strategy is simulated by the first of -lib_cells, an HDL module. For
+    // each port the strategy isolates (and the command selects), a wrapper
+    // bound into the power top holds an instance of the model; the model's
+    // one input and one output that -port_map leaves open are the data
+    // input and output. The runtime holds the data input at the port's
+    // value and the port takes the model's output; the strategy's
+    // -isolation_sense does not apply. The cell's output is still corrupted
+    // while the isolation supply is not NORMAL (9.8).
+    struct IfcEl { std::string port, d, y; int dSig = -1, ySig = -1; bool held = false; Val last; };
+    std::vector<IfcEl> ifcEls;
+    std::map<std::string, int> ifcElOf;   // "inst.port" -> ifcEls index
+    std::string ifcModelSource(slang::ast::Compilation& comp, const std::string& simTop) {
+        using namespace slang::ast;
+        std::string out;
+        DomainMap dm2;
+        dm2.build(m);
+        // the port connections, named as the runtime names them
+        struct Site { PortSite p; std::string model; };
+        std::vector<Site> sites;
+        std::function<void(const Scope&, const std::string&)> walk = [&](const Scope& sc, const std::string& path) {
+            auto in = [&](const std::string& n) { return path.empty() ? n : path + "." + n; };
+            for (const Symbol& x : sc.members()) {
+                if (x.kind == SymbolKind::Instance) {
+                    const auto& ch = x.as<InstanceSymbol>();
+                    std::string p = in(std::string(ch.name));
+                    for (const PortConnection* c : ch.getPortConnections()) {
+                        if (!c || c->port.kind != SymbolKind::Port || !c->getExpression()) continue;
+                        const auto& ps = c->port.as<PortSymbol>();
+                        Site st;
+                        st.p.inst = p;
+                        st.p.port = std::string(ps.name);
+                        st.p.dir = ps.direction == ArgumentDirection::In ? 0 : ps.direction == ArgumentDirection::Out ? 1 : 2;
+                        st.p.width = (int)ps.getType().getBitWidth();
+                        st.model = std::string(ch.getDefinition().name);
+                        sites.push_back(st);
+                    }
+                    walk(ch.body, p);
+                } else if (x.kind == SymbolKind::GenerateBlock) {
+                    const auto& g = x.as<GenerateBlockSymbol>();
+                    if (!g.isUninstantiated) walk(g, in(g.getExternalName()));
+                } else if (x.kind == SymbolKind::GenerateBlockArray) {
+                    const auto& ga = x.as<GenerateBlockArraySymbol>();
+                    std::string an = ga.name.empty() ? std::string("genblk") : std::string(ga.name);
+                    for (const auto* e : ga.entries)
+                        if (!e->isUninstantiated)
+                            walk(*e, in(an + "[" + (e->getArrayIndex() ? e->getArrayIndex()->toString() : std::string("?")) + "]"));
+                }
+            }
+        };
+        const InstanceSymbol* topInst = nullptr;
+        for (auto* t : comp.getRoot().topInstances) if (std::string(t->name) == simTop) topInst = t;
+        if (!topInst) return out;
+        walk(topInst->body, "");
+        // the wrappers go into the power top
+        std::string ptRel = m.top;   // design path of the power top, relative to simTop
+        std::string ptFull = simTop + (ptRel.empty() ? "" : "." + ptRel);
+        std::string root = simTop + ".";
+        auto hier = [&](const std::string& upfName) { return root + m.design(upfName); };
+        int k = 0;
+        for (auto& im : m.ifcModels) {
+            auto fail = [&](const std::string& msg) -> void { throw Error(im.where + ": use_interface_cell -force_function " + im.model + ": " + msg + " (6.62)"); };
+            const Isolation* is = nullptr;
+            for (auto& x : m.isos) if (x.name == im.strategy && x.domain == im.domain) is = &x;
+            const LevelShifter* ls = nullptr;
+            for (auto& x : m.lss) if (x.name == im.ls && x.domain == im.domain) ls = &x;
+            std::string mod = im.model.substr(im.model.rfind('.') == std::string::npos ? 0 : im.model.rfind('.') + 1);
+            auto def = comp.tryGetDefinition(mod, comp.getRoot());
+            if (!def.definition || def.definition->kind != SymbolKind::Definition) {
+                // a library cell with no HDL model (define_isolation_cell, Liberty): the 9.8 algorithm
+                std::cerr << "msim: UPF: " << im.where << ": use_interface_cell -force_function: no HDL module " << im.model
+                          << "; isolation " << im.strategy << " is simulated as 9.8 describes\n";
+                continue;
+            }
+            auto& minst = InstanceSymbol::createDefault(comp, def.definition->as<DefinitionSymbol>());
+            struct MP { std::string name; int dir; bool supply; int w; };
+            std::vector<MP> mports;
+            for (const Symbol* q : minst.body.getPortList()) {
+                if (q->kind != SymbolKind::Port) fail(im.model + " has a port that is not a plain port");
+                auto& qp = q->as<PortSymbol>();
+                int dir = qp.direction == ArgumentDirection::In ? 0 : qp.direction == ArgumentDirection::Out ? 1 : 2;
+                if (dir == 2) fail(im.model + " has an inout port " + std::string(qp.name));
+                mports.push_back({std::string(qp.name), dir, supplyType(qp.getType()), (int)qp.getType().getBitWidth()});
+            }
+            for (auto& [port, ref] : im.portMap)
+                if (std::none_of(mports.begin(), mports.end(), [&](const MP& x) { return x.name == port; }))
+                    fail(im.model + " has no port " + port);
+            // the data input and output: the ports -port_map leaves open
+            const MP *din = nullptr, *dout = nullptr;
+            for (auto& mp : mports) {
+                if (std::any_of(im.portMap.begin(), im.portMap.end(), [&](auto& pm) { return pm.first == mp.name; })) {
+                    if (mp.dir == 1) fail("-port_map connects output port " + mp.name + "; only the data output is an output");
+                    continue;
+                }
+                const MP*& slot = mp.dir == 0 ? din : dout;
+                if (slot) fail("port " + mp.name + " is not connected: " + slot->name + " is already the data " + (mp.dir == 0 ? "input" : "output"));
+                slot = &mp;
+            }
+            if (!din) fail(im.model + " has no data input: -port_map connects every input");
+            if (!dout) fail(im.model + " has no data output");
+            if (din->w != dout->w) fail("data input " + din->name + " and output " + dout->name + " differ in width");
+            int made = 0;
+            for (auto& st : sites) {
+                const PortSite& p = st.p;
+                if (p.dir == 2) continue;
+                std::string child = dm2.of(p.inst), parent = dm2.of(parentOf(p.inst));
+                if (child == parent || m.portAttr(p.inst, st.model, p.port, p.dir, "UPF_is_analog") == "TRUE") continue;
+                Crossing c{&p, p.dir == 1 ? child : parent, p.dir == 1 ? parent : child};
+                const Isolation* first = nullptr;
+                for (auto& x : m.isos) if (isoApplies(m, x, c)) { first = &x; break; }
+                if (first != is || is->noIso) continue;   // one strategy per port: the first that applies
+                if (!im.elements.empty() && !namesPort(m, im.elements, p)) continue;
+                if (!im.exclude.empty() && namesPort(m, im.exclude, p)) continue;
+                std::string clamp = is->clamp;
+                if (std::string pc = m.portAttr(p.inst, st.model, p.port, p.dir, "UPF_clamp_value");
+                    !is->clampSet && (pc == "0" || pc == "1" || pc == "Z" || pc == "latch"))
+                    clamp = pc;
+                if (!im.clamp.empty() && im.clamp != clamp) continue;
+                int W = p.width;
+                if (din->w != W && din->w != 1)
+                    fail("the data ports of " + im.model + " are " + std::to_string(din->w) + " bits; port " + p.inst + "." + p.port + " is " + std::to_string(W));
+                std::string id = std::to_string(k++);
+                std::string modName = "upf_isom_mod_" + id, inst = "upf_isom_" + id;
+                std::string rel = ptRel.empty() ? inst : ptRel + "." + inst;
+                std::string ports, conns, bindConns;
+                int nsup = 0;
+                for (auto& mp : mports) {
+                    std::string e2;
+                    if (&mp == din) e2 = "upf_d";
+                    else if (&mp == dout) e2 = "upf_y";
+                    else {
+                        std::string ref;
+                        for (auto& [port, r2] : im.portMap) if (port == mp.name) ref = r2;
+                        bool inv = ref[0] == '~';
+                        std::string x = inv ? ref.substr(1) : ref;
+                        static const std::regex sigRef(R"(isolation_signal(\[([0-9]+)\])?)");
+                        static const std::regex fnRef(R"((isolation_supply|input_supply|output_supply)(\[[0-9]+\])?\.(\w+))");
+                        std::smatch mm;
+                        std::string sp = "upf_in_" + std::to_string(nsup++);
+                        if (std::regex_match(x, mm, sigRef)) {
+                            size_t i = mm[2].matched ? std::stoul(mm[2].str()) : 0;
+                            ports += std::string(ports.empty() ? "" : ", ") + "input logic " + sp;
+                            bindConns += std::string(bindConns.empty() ? "" : ", ") + "." + sp + "(" + hier(is->signals[i]) + ")";
+                            e2 = (inv ? "~" : "") + sp;
+                        } else {
+                            std::string net, j = Model::join(im.scope, x);
+                            if (std::regex_match(x, mm, fnRef)) {
+                                std::string k2 = mm[1].str(), set = k2 == "isolation_supply" ? m.setOf(is->supply)
+                                                                  : k2 == "input_supply"   ? m.setOf(ls->inSupply)
+                                                                                           : m.setOf(ls->outSupply);
+                                net = m.fnNet(set + "." + mm[3].str());
+                                if (net.empty()) fail("supply set " + set + " has no function " + mm[3].str() + " for " + mp.name);
+                            } else if (m.nets.count(j) || m.ports.count(j)) net = j;
+                            else if (!m.fnNet(j).empty()) net = m.fnNet(j);
+                            if (!net.empty()) {
+                                ports += std::string(ports.empty() ? "" : ", ") + "input " + (mp.supply ? "UPF::upfSupplyTypeT " : "logic ") + sp;
+                                bindConns += std::string(bindConns.empty() ? "" : ", ") + "." + sp + "('0)";
+                                std::string upfPort = inst + "/" + sp;   // a UPF path from the power top
+                                m.connects[net].push_back(upfPort);
+                                m.connectWhere[{net, upfPort}] = im.where;
+                            } else {   // a logic net
+                                ports += std::string(ports.empty() ? "" : ", ") + "input logic [" + std::to_string(mp.w - 1) + ":0] " + sp;
+                                bindConns += std::string(bindConns.empty() ? "" : ", ") + "." + sp + "(" + hier(j) + ")";
+                            }
+                            e2 = sp;
+                        }
+                    }
+                    conns += std::string(conns.empty() ? "" : ", ") + "." + mp.name + "(" + e2 + ")";
+                }
+                std::string range = "[" + std::to_string(W - 1) + ":0]";
+                bool arr = din->w != W;   // a one-bit cell on each bit
+                out += "// use_interface_cell -force_function " + im.model + ": " + p.inst + "." + p.port +
+                       " (IEEE 1801-2024 6.62)\nmodule " + modName + "(" + ports + ");\n  logic " + range + " upf_d;\n  wire " + range +
+                       " upf_y;\n  " + mod + " u_model" + (arr ? range : std::string()) + "(" + conns + ");\nendmodule\nbind " + ptFull +
+                       " " + modName + " " + inst + "(" + bindConns + ");\n";
+                IfcEl el;
+                el.port = p.inst + "." + p.port;
+                el.d = rel + ".upf_d";
+                el.y = rel + ".upf_y";
+                ifcElOf[el.port] = (int)ifcEls.size();
+                ifcEls.push_back(el);
+                retModelInsts.push_back(rel);
+                note("use_interface_cell: isolation " + is->name + " on " + el.port + " is simulated by " + im.model + " (" + rel + ")");
+                made++;
+            }
+            if (!made) std::cerr << "msim: UPF: " << im.where << ": use_interface_cell: isolation " << im.strategy << " -force_function applies to no port\n";
+        }
+        return out;
+    }
     // The HDL ports that drive supply nets: their value is the root supply.
     void readHdlPorts() {
         for (auto& h : hdlPorts) {
@@ -1837,6 +2034,7 @@ struct Rt {
                 if (std::string pc = attr("UPF_clamp_value"); !is.clampSet && (pc == "0" || pc == "1" || pc == "Z" || pc == "latch")) cell.clamp = pc;
                 if (!is.supply.empty()) cell.supplies.push_back(m.setOf(is.supply));
                 for (size_t q = 0; q < is.signals.size(); q++) cell.senseLow.push_back(q < is.senseLow.size() ? is.senseLow[q] : 0);
+                if (auto f = ifcElOf.find(cell.port); f != ifcElOf.end()) cell.model = f->second;
                 if (is.signals.empty()) throw Error(is.where + ": isolation " + is.name + " has no -isolation_signal");
                 made.push_back((int)cells.size());
                 cells.push_back(cell);
@@ -1879,6 +2077,7 @@ struct Rt {
                 const Cell& cell = cells[(size_t)ci];
                 for (auto& sn : cell.supplies)
                     if (sets.count(sn)) more.push_back({sets[sn].sig, ANY});
+                if (cell.model >= 0) more.push_back({ifcEls[(size_t)cell.model].ySig, ANY});
                 if (cell.kind == 0)
                     for (auto& s : cell.iso->signals) {
                         int sg = sigOf(s);
@@ -2595,6 +2794,17 @@ struct Rt {
         bool ok = true;
         for (auto& sn : c.supplies) ok &= supplyNormal(sn);
         if (c.kind != 0) return ok ? d : allx(d.w);   // level shifter (9.9), repeater (9.10)
+        if (c.model >= 0) {   // use_interface_cell -force_function (6.62): the model's output
+            IfcEl& e = ifcEls[(size_t)c.model];
+            if (!e.held || !(d == e.last)) {
+                e.held = true;
+                e.last = d;
+                S.holdOn(e.dSig, konst(d), true);
+            }
+            if (!ok) return allx(d.w);
+            Val y = S.get(e.ySig);
+            return y.w == d.w ? y : allx(d.w);
+        }
         bool latch = c.clamp == "latch";
         if (!ok) {
             if (latch) { c.latch = allx(d.w); c.latched = true; }

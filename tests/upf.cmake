@@ -29,8 +29,9 @@ endforeach()
 # 6.36, 6.63); function and model VCMs (6.30.8, 6.30.9); supply ports
 # connected by pg_type (4.5.4.6.2, 6.14, 6.15); table VCMs on fields of
 # packed and unpacked struct ports (6.30 -field); a retention register
-# simulated by its verification model (6.39 -lib_model_name).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield retmodel)
+# simulated by its verification model (6.39 -lib_model_name); isolation
+# cells simulated by their functional model (6.62 -force_function).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield retmodel isomodel)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -375,3 +376,12 @@ upf_error_in(retmodel e_rm1 "map_retention_cell RET_A -domain PD_A -lib_model_na
 upf_error_in(retmodel e_rm2 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{CK UPF_GENERIC_CLOCK}}" "input port D of ret_ff is not connected by -port_map (6.39)")
 upf_error_in(retmodel e_rm3 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{XX UPF_GENERIC_CLOCK}}" "ret_ff has no port XX (6.39)")
 upf_error_in(retmodel e_rm4 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{CK UPF_GENERIC_CLOCK} {CK UPF_GENERIC_DATA}}" "-port_map maps model port CK twice (6.39)")
+set(uic "use_interface_cell X -strategy ISO_A -domain PD_A -force_function")
+upf_error_in(isomodel e_ifc1 "define_isolation_cell -cells ISO_HI -power VDD -enable EN -clamp_cell high\n${uic} -lib_cells ISO_HI" "the functional model ISO_HI clamps to 1 (")
+upf_error_in(isomodel e_ifc2 "${uic} -lib_cells iso_and -port_map {{VDD isolation_supply.power}}" "port EN is not connected: A is already the data input (6.62)")
+upf_error_in(isomodel e_ifc3 "${uic} -lib_cells iso_and -port_map {{EN isolation_signal[1]}}" "strategy ISO_A has no isolation_signal[1] (6.62)")
+upf_error_in(isomodel e_ifc4 "${uic} -lib_cells iso_and -port_map {{EN ~iso}}" "~ is only for isolation_signal, not iso (6.62)")
+upf_error_in(isomodel e_ifc5 "${uic} -lib_cells iso_and -port_map {{EN isolation_signal} {VDD isolation_supply.power} {Y isolation_signal}}" "-port_map connects output port Y; only the data output is an output (6.62)")
+upf_error_in(isomodel e_ifc6 "${uic} -lib_cells iso_and -port_map {{VDD input_supply.power}}" "input_supply.power needs a level-shifter strategy in -strategy (6.62)")
+upf_error_in(isomodel e_ifc7 "${uic} -lib_cells iso_and -port_map {{XX isolation_signal}}" "iso_and has no port XX (6.62)")
+upf_error_in(isomodel e_ifc8 "${uic} -lib_cells iso_and -port_map {{EN isolation_signal} {EN isolation_signal}}" "-port_map maps model port EN twice (6.62)")

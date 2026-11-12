@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- UPF `use_interface_cell -force_function` (IEEE 1801-2024 6.62) is
+  simulated: each isolated port runs through the HDL model of the first
+  library cell, wired by `-port_map` to the isolation signal (or its
+  inverse) and supplies, in place of the strategy's clamp and sense.
 - UPF `map_retention_cell -lib_model_name` (IEEE 1801-2024 6.39) is
   simulated: the mapped register runs as the verification model, wired to
   the clock, data and async set/reset inferred from its always block, the
