@@ -32,6 +32,9 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI `cbError` and `cbPLIError` (38.36.3): called for run-time error
+  messages of the simulation and for errors of VPI calls, with
+  `vpi_chk_error` giving the error. `tests/spec/38.36-vpi-cberror.sv`.
 - VPI class definitions (37.29): `vpiClassDefn`, `vpiExtends`,
   `vpiMethods`, `vpiDerivedClasses` and static `vpiVariables`; a class
   object now reports the class it was made of, and its properties include

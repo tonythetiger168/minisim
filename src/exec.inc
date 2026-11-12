@@ -1436,6 +1436,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             }
             case IK::Display:
                 S.printSys(i.fmt, i.args, !i.nonl);
+                if (g_errHook && (i.fmt.rfind("Error: ", 0) == 0 || i.fmt.rfind("Fatal: ", 0) == 0)) g_errHook(i.fmt);
                 if (S.finished) goto done;  // task ran; $finish already requested
                 pc++;
                 break;

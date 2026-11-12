@@ -102,6 +102,9 @@ inline bool g_cov = false;
 struct Instr;
 inline bool g_hook = false;
 inline void (*g_stmtHook)(const Instr&) = nullptr;
+// VPI cbError (38.36.3): called with the format of each run-time error
+// message ($error, $fatal, a failed assertion or $cast) as it is printed.
+inline void (*g_errHook)(const std::string&) = nullptr;
 inline std::string runLocStr() {
     if (!g_runLoc.line || g_runLoc.file >= g_covFiles.size()) return "";
     return " (" + g_covFiles[g_runLoc.file] + ":" + std::to_string(g_runLoc.line) + ")";

@@ -119,6 +119,8 @@ struct State {
     std::multimap<uint64_t, Put> puts;
     std::vector<Cb*> holdCbs;             // cbForce, cbRelease, cbAssign, cbDeassign (38.36.1)
     std::map<std::pair<uint32_t, uint32_t>, std::vector<Cb*>> stmtCbs;   // cbStmt: by source file id and line
+    std::vector<Cb*> errCbs;              // cbError, cbPLIError (38.36.3)
+    bool inErrCb = false;
     std::vector<Cb*> nbaCbs, endSlot;     // cbNBASynch, cbAtEndOfSimTime of this time slot (38.36.2)
     int mode = vpiMode1800v2009;          // the compatibility mode of the running call (36.12)
     std::vector<char> arrBuf;             // vpi_get_value_array without vpiUserAllocFlag
@@ -151,6 +153,7 @@ inline Obj* mkObj(Obj::Kind k, int type) {
     return o;
 }
 inline void clearErr() { st().err = false; }
+inline void fireErrorCbs(int reason);
 inline void error(int level, const std::string& msg) {
     auto& s = st();
     s.err = true;
@@ -158,6 +161,7 @@ inline void error(int level, const std::string& msg) {
     s.errMsg = msg;
     s.errFile.clear();
     s.errLine = 0;
+    if (level >= vpiError) fireErrorCbs(cbPLIError);   // 38.36.3: an error in a VPI call
 }
 inline char* retStr(std::string s) {
     st().strBuf = std::move(s);
@@ -935,6 +939,56 @@ inline void fillTime(p_vpi_time t, const Obj* o, uint64_t ticks) {
         t->high = (PLI_UINT32)(ticks >> 32);
         t->low = (PLI_UINT32)ticks;
     }
+}
+// cbError and cbPLIError (38.36.3): vpi_chk_error in the callback reports
+// the error. A callback that itself fails does not call them again.
+inline void fireErrorCbs(int reason) {
+    auto& s = st();
+    if (s.inErrCb) return;
+    s.inErrCb = true;
+    std::vector<Cb*> due;
+    for (Cb* c : s.errCbs)
+        if (c->live && c->d.reason == reason) due.push_back(c);
+    bool err = s.err;
+    int lvl = s.errLevel;
+    std::string msg = s.errMsg;
+    for (Cb* c : due) {
+        s_cb_data d = c->d;
+        s_vpi_time t = c->t;
+        d.obj = nullptr;
+        d.value = nullptr;
+        d.time = nullptr;
+        if (c->hasT && t.type != vpiSuppressTime) {
+            fillTime(&t, nullptr, S.now);
+            d.time = &t;
+        }
+        s.err = err;   // what the callback's vpi_chk_error sees
+        s.errLevel = lvl;
+        s.errMsg = msg;
+        d.cb_rtn(&d);
+    }
+    s.err = err;
+    s.errLevel = lvl;
+    s.errMsg = msg;
+    s.inErrCb = false;
+}
+// A run-time error message of the simulation: its first line, the location
+// and scope, without the time.
+inline void onRunError(const std::string& fmt) {
+    std::string m = fmt.substr(0, fmt.find('\n'));
+    if (auto k = m.find(": at time"); k != std::string::npos) m.resize(k);
+    std::string clean;
+    for (size_t k = 0; k < m.size(); k++) {
+        if (m[k] == '%' && k + 1 < m.size() && m[k + 1] == '%') k++;
+        clean += m[k];
+    }
+    auto& s = st();
+    s.err = true;
+    s.errLevel = vpiError;
+    s.errMsg = clean;
+    s.errFile.clear();
+    s.errLine = 0;
+    fireErrorCbs(cbError);
 }
 // A delay given in a s_vpi_time, in ticks.
 inline int64_t sigTicks(const p_vpi_time t, const Obj* o) {
@@ -1740,6 +1794,11 @@ vpiHandle vpi_register_cb(p_cb_data d) {
                 vpi::at(c->at);
             }
             break;
+        case cbError:
+        case cbPLIError:   // 38.36.3
+            s.errCbs.push_back(c);
+            if (d->reason == cbError) g_errHook = vpi::onRunError;
+            break;
         case cbEndOfCompile: s.endCompile.push_back(c); break;
         case cbStartOfSimulation: s.start.push_back(c); break;
         case cbEndOfSimulation: s.endSim.push_back(c); break;
@@ -1769,6 +1828,10 @@ PLI_INT32 vpi_remove_cb(vpiHandle h) {
         l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
     } else if (vpi::assertSysReason(o->cb->d.reason)) {
         auto& l = vpi::st().assertSys;
+        l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
+    }
+    if (o->cb->d.reason == cbError || o->cb->d.reason == cbPLIError) {
+        auto& l = vpi::st().errCbs;
         l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
     }
     if (o->cb->d.reason == cbValueChange && o->cb->obj) {
