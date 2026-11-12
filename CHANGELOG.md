@@ -27,6 +27,9 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- `vpi_user.h`: `vpiFuncType` is 44 and `vpiNetDeclAssign` is 43, as annex K
+  says (they were swapped). A VPI library built against the old header
+  must be rebuilt.
 - `mchar` measures input pin power: `internal_power` groups without a
   `related_pin` get the supply energy of an edge that moves no output, and
   the output arcs on the same pin hold the energy beyond it. The mini45
@@ -461,6 +464,15 @@ Spec references are IEEE 1800-2023 clauses.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
+- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
+  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
+  callback reason and the assertion and coverage declarations of annex M,
+  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
+  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
+  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
+  the caller's mode. New routines `vpi_get_value_array` and
+  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
+  a user system task. See `docs/VPI.md`.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
