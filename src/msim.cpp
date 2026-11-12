@@ -33,6 +33,9 @@
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
+//   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
+//   -xrun, -irun     take the rest of the command line as xrun / irun options
+//                    (also when msim runs as xrun, irun or xmverilog): docs/XRUN.md
 //   -profile [<file>] time every process and region and write a report
 //                    (default simprofile.txt): busiest processes, time per
 //                    instance, file and kind. Runs the interpreter on one thread.
@@ -147,6 +150,7 @@
 #include <unistd.h>
 
 #include "codegen.hpp"
+#include "cov_select.hpp"
 #include "lower.hpp"
 #include "saif.hpp"
 #include "slang/diagnostics/DiagnosticClient.h"
@@ -162,10 +166,12 @@
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
 #include "upf_rt.inc"
+#include "upf_hdl.hpp"
 #include "dpi.inc"
 #include "vpi.inc"
 #include "interactive.inc"
 #include "objview.inc"
+#include "xrun.inc"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -1475,6 +1481,9 @@ Val hook(int op, const std::vector<Val>& a) {
 }
 }  // namespace covapi
 
+// -cm / -cm_hier: the code coverage written (src/cov_select.hpp).
+static covsel::Selection g_covSel;
+
 static bool writeCoverage(const std::string& path, const LowerResult& lw, const std::string& top) {
     covapi::restoreStopped();   // a coverage_control STOP still in force (40.3.2.1)
     std::vector<const Prog*> progs;
@@ -1492,25 +1501,46 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         std::map<size_t, std::vector<uint64_t>> conds;       // index in "conditions" -> hits
     };
     std::vector<InstCov> insts(g_covInsts.size());
+    // Selection (-cm, -cm_hier): the instance path and module of a coverage
+    // instance, and whether a metric of its code in a file is written.
+    auto instPath = [&](uint32_t k) {
+        if (!k || k >= g_covInsts.size()) return std::string();
+        return g_covInsts[k].path.empty() ? top : top + "." + g_covInsts[k].path;
+    };
+    const bool selAll = g_covSel.metrics == covsel::ALL && g_covSel.rules.empty();
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, bool> selCache;   // (instance, file, metric)
+    auto sel = [&](uint32_t m, uint32_t inst, uint32_t file) {
+        if (selAll) return true;
+        auto [it, fresh] = selCache.try_emplace({inst, file, m}, false);
+        if (fresh)
+            it->second = g_covSel.selected(m, instPath(inst), inst < g_covInsts.size() ? g_covInsts[inst].module : "",
+                                           file < g_covFiles.size() ? g_covFiles[file] : "");
+        return it->second;
+    };
     for (const Prog* p : progs) {
         InstCov* ic = p->covInst && p->covInst < insts.size() ? &insts[p->covInst] : nullptr;
         for (auto& i : p->code) {
             if (!i.line) continue;
             auto key = std::make_pair(i.file, i.line);
-            auto& h = lines[key];
-            h = std::max(h, i.hits);
-            if (ic) {
-                auto& ih = ic->lines[key];
-                ih = std::max(ih, i.hits);
+            if (sel(covsel::LINE, p->covInst, i.file)) {
+                auto& h = lines[key];
+                h = std::max(h, i.hits);
+                if (ic) {
+                    auto& ih = ic->lines[key];
+                    ih = std::max(ih, i.hits);
+                }
             }
             // A JmpIfNot is a two-way decision: true = fell through, false = jumped.
+            // n counts every decision of the line, so that it is the same for any selection.
             if (i.k == IK::JmpIfNot) {
                 auto& v = branches[key];
-                if (ic) ic->branches.push_back({i.file, i.line, v.size(), i.hits - i.taken, i.taken});
-                v.push_back({i.hits - i.taken, i.taken});
+                bool on = sel(covsel::BRANCH, p->covInst, i.file);
+                if (ic && on) ic->branches.push_back({i.file, i.line, v.size(), i.hits - i.taken, i.taken});
+                v.push_back({on ? i.hits - i.taken : UINT64_MAX, i.taken});
             }
         }
     }
+
     std::ofstream f(path);
     if (!f) return false;
     f << "{\n \"format\": \"msim-cov\", \"version\": 1, \"tool\": \"msim " MINISIM_VERSION "\", \"top\": " << jstr(top)
@@ -1526,6 +1556,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     first = true;
     for (auto& [k, v] : branches)
         for (size_t n = 0; n < v.size(); n++) {
+            if (v[n].first == UINT64_MAX) continue;   // not selected
             f << (first ? "\n  " : ",\n  ") << "[" << k.first << ", " << k.second << ", " << n << ", " << v[n].first << ", " << v[n].second << "]";
             first = false;
         }
@@ -1542,9 +1573,25 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         }
         return r;
     };
+    // A signal's instance: the longest prefix of its name that is one.
+    std::unordered_map<std::string, uint32_t> instByPath;
+    if (!selAll)
+        for (uint32_t k = 1; k < g_covInsts.size(); k++) instByPath.emplace(instPath(k), k);
+    auto sigSelected = [&](const std::string& full) {
+        if (selAll) return true;
+        std::string_view n = full;
+        while (true) {
+            size_t d = n.rfind('.');
+            if (d == std::string_view::npos) break;
+            n = n.substr(0, d);
+            if (auto it = instByPath.find(std::string(n)); it != instByPath.end()) return sel(covsel::TGL, it->second, 0);
+        }
+        return g_covSel.selected(covsel::TGL, n, "");
+    };
     for (size_t sidx = 0; sidx < S.sigs.size(); sidx++) {
         const auto& g = S.sigs[sidx];
         if (g.hide) continue;
+        if (!sigSelected(top + "." + g.name)) continue;
         static const std::vector<uint64_t> none;
         const auto& R = sidx < S.togRise.size() ? S.togRise[sidx] : none;
         const auto& F = sidx < S.togFall.size() ? S.togFall[sidx] : none;
@@ -1556,6 +1603,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     struct CondSum { const CondDef* d; std::vector<uint64_t> hits; size_t index = 0; };
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, std::string>, CondSum> conds;
     for (auto& d : condDefs()) {
+        if (!sel(covsel::COND, d.inst, d.file)) continue;
         auto& c = conds[{d.file, d.line, d.col, d.text}];
         if (!c.d) { c.d = &d; c.hits.assign(d.counters(), 0); }
         if (c.d->counters() != d.counters()) continue;
@@ -1582,6 +1630,8 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     first = true;
     for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++) {
         const FsmDef& d = fsmDefs()[k];
+        if (!selAll && !g_covSel.selected(covsel::FSM, d.inst, d.module, d.file < g_covFiles.size() ? g_covFiles[d.file] : ""))
+            continue;
         const auto& seen = S.fsmSeen[k];
         auto trans = S.fsmTrans[k];
         f << (first ? "\n  " : ",\n  ") << "{\"module\": " << jstr(d.module) << ", \"inst\": " << jstr(d.inst) << ", \"name\": "
@@ -1613,7 +1663,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         size_t ci = 0;
         for (auto& [key, c] : conds) c.index = ci++;
         for (auto& d : condDefs()) {
-            if (!d.inst || d.inst >= insts.size()) continue;
+            if (!d.inst || d.inst >= insts.size() || !sel(covsel::COND, d.inst, d.file)) continue;
             const CondSum& c = conds[{d.file, d.line, d.col, d.text}];
             if (d.counters() != c.d->counters()) continue;
             auto& h = insts[d.inst].conds[c.index];
@@ -1731,6 +1781,8 @@ static void usage() {
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
+                 "  -xrun ...      the rest is an xrun / irun command line (also when run as xrun or irun)\n"
+                 "  -elab          stop after elaboration, before the run\n"
                  "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
@@ -1746,7 +1798,13 @@ static void usage() {
                  "                 variable points to, as h.addr (x while h is null); handle\n"
                  "                 properties are followed N levels (default 1)\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
-                 "                 see mcov. -cm <metrics> (as VCS) does the same\n"
+                 "                 see mcov\n"
+                 "  -cm <metrics>  the same, with only these code coverage metrics: line+branch+cond+tgl+fsm\n"
+                 "                 (as VCS), b:e:t:f or all (as Xcelium -coverage), bcesftx (as Questa\n"
+                 "                 +cover); covergroups and assertions are always written\n"
+                 "  -cm_hier <f>   the part of the design whose code coverage is written: +tree/-tree\n"
+                 "                 <inst> [depth], +module/-module, +file/-file (as VCS -cm_hier), or\n"
+                 "                 select_coverage / deselect_coverage commands (as an Xcelium covfile)\n"
                  "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
                  "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
@@ -1787,6 +1845,23 @@ int main(int argc, char** argv) {
             (void)!write(2, w.data(), w.size());
             _exit(139);
         });
+    // xrun / irun command line (xrun.inc): translated to msim's options.
+    xrun::Opts xo;
+    std::vector<char*> xargv;
+    if (xrun::wanted(argc, argv, xo)) {
+        for (auto& s : xo.out) xargv.push_back(s.data());
+        if (!xo.tclIn.empty()) {   // -input run.tcl: as an msim -do file
+            static std::string doFile = xo.tool + ".do";
+            if (!xrun::tclToDo(xo.tclIn, doFile, xo.tool)) { std::cerr << xo.tool << ": cannot read " << xo.tclIn << "\n"; return 2; }
+            static std::string doOpt = "-do";
+            xargv.push_back(doOpt.data());
+            xargv.push_back(doFile.data());
+        }
+        xargv.push_back(nullptr);
+        argc = (int)xargv.size() - 1;
+        argv = xargv.data();
+        xrun::teeLog(xo);
+    }
     // Pass 1: take msim's own options out; translate VCS spellings for slang.
     std::vector<std::string> fwd{argv[0]};
     std::vector<std::string> plusargs;
@@ -1799,6 +1874,7 @@ int main(int argc, char** argv) {
     uint64_t maxTime = ~0ULL;
     bool interactiveMode = false;   // -i / -do FILE
     std::string doPath;
+    bool elabOnly = false;   // -elab: stop after elaboration (xrun -elaborate)
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
     bool threadsGiven = false;
@@ -1826,6 +1902,7 @@ int main(int argc, char** argv) {
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
         if (a == "-compile") { compiled = true; continue; }
+        if (a == "-elab") { elabOnly = true; continue; }
         if (a == "-i" || a == "-ucli") { interactiveMode = true; continue; }
         if (a == "-do") { doPath = next("a command file"); interactiveMode = true; continue; }
         if (a == "-no-static-comb") { staticComb = false; continue; }
@@ -1930,9 +2007,30 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
             continue;
         }
-        if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
+        // -cm <metrics>: the code coverage metrics written; VCS line+cond+fsm+tgl+branch,
+        // Xcelium b:e:t:f:u:a or all, Questa bcesftx (src/cov_select.hpp). Covergroups
+        // and assertions are always written.
+        if ((a == "-cm" && i + 1 < argc) || a.starts_with("-cm=")) {
             g_cov = true;
-            ++i;
+            std::string err;
+            std::string_view v = a == "-cm" ? std::string_view(argv[++i]) : a.substr(4);
+            if (!covsel::parseMetrics(v, g_covSel.metrics, err)) {
+                std::cerr << "msim: -cm: " << err << "\n";
+                return 2;
+            }
+            continue;
+        }
+        // -cm_hier <file>: the part of the design whose code coverage is written: VCS
+        // +tree/-tree/+module/-module/+file/-file lines or Xcelium covfile commands.
+        if (a == "-cm_hier" && i + 1 < argc) {
+            std::string err;
+            if (!g_covSel.read(argv[++i], err)) {
+                std::cerr << "msim: -cm_hier: " << err << "\n";
+                return 2;
+            }
+            for (auto& n : g_covSel.notes) std::cerr << "msim: " << n << "\n";
+            g_covSel.notes.clear();
+            if (g_covSel.allops) g_condAllops = true;
             continue;
         }
         if (a == "-cm_cond" && i + 1 < argc) {   // VCS: -cm_cond full+allops (std / basic: the default)
@@ -2200,38 +2298,11 @@ int main(int argc, char** argv) {
     // The VCD's root scope is the top module (several tops: "top").
     if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);
 
-    // Pass 3: lower to the process IR and run on the kernel.
-    LowerResult lowered;
-    try {
-        lowered = lower(*comp,
-                        [](const std::string& n, int w, bool net) { return S.sig(n, w, net); },
-                        [](int s) { return S.newDriver(s); });
-    } catch (const std::exception& ex) {
-        // The message may name something declared in protected code.
-        if (pc.any()) std::cerr << "msim: the design (which has protected code) uses a construct msim cannot simulate yet; details hidden\n";
-        else std::cerr << "msim: " << ex.what() << "\n";
-        return 1;
-    }
-    timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
-    if (g_cov) {   // FSM coverage: the kernel records the state registers' values
-        std::vector<int> watch;
-        std::vector<char> hot;
-        for (auto& d : fsmDefs()) { watch.push_back(d.sig); hot.push_back(d.onehot); }
-        S.fsmWatch(watch, hot);
-    }
-    if (!xpropReport.empty()) {   // -xprop-report: what is merged, what is not and why
-        std::ofstream f(xpropReport);
-        if (!f) { std::cerr << "msim: cannot write " << xpropReport << "\n"; return 1; }
-        size_t ok = 0;
-        for (auto& r : Lowerer::xpReport()) ok += r.ok;
-        f << "xprop " << (Lowerer::xpropMode() == 2 ? "xmerge" : Lowerer::xpropMode() == 1 ? "tmerge" : "off") << ": "
-          << ok << " of " << Lowerer::xpReport().size() << " if / case / edge constructs merged\n";
-        for (auto& r : Lowerer::xpReport())
-            f << r.where << r.what << (r.ok ? ": merged" : ": not merged, it holds " + r.why) << "\n";
-    }
-    if (!upfPath.empty()) {   // power-aware simulation (IEEE 1801-2024 9)
+    // -upf: the power intent is read now; its bind_checker commands (IEEE
+    // 1801-2024 6.12) become bind directives, and the design is elaborated
+    // again with them.
+    if (!upfPath.empty()) {
         auto& rt = upfrt::rt();
-        rt.verbose = upfVerbose;
         try {
             rt.m.load(upfPath, "");
             std::string top = powerTopSet ? powerTop : rt.m.designTop;
@@ -2260,6 +2331,73 @@ int main(int argc, char** argv) {
                 else if (!found.empty()) top = found;
             }
             rt.m.top = top;
+            rt.m.addHdlAttrs(upfHdlAttrs(*comp));   // (* UPF_... *) in the HDL (5.6)
+            if (!rt.m.bindCheckers.empty()) {
+                static std::string bindText;
+                // the simulation top: a checker module nothing instantiates yet is a top too
+                std::string simTop = S.vcdTop;
+                std::set<std::string> checkers;
+                for (auto& b : rt.m.bindCheckers) checkers.insert(b.module);
+                std::vector<std::string> real;
+                for (auto* t : comp->getRoot().topInstances)
+                    if (!checkers.count(std::string(t->getDefinition().name))) real.push_back(std::string(t->name));
+                if (real.size() == 1) simTop = real[0];
+                bindText = rt.m.bindSource(simTop);
+                if (upfVerbose) std::cout << "UPF: " << bindText;
+                driver.syntaxTrees.push_back(slang::syntax::SyntaxTree::fromText(bindText, driver.sourceManager, "upf_bind_checker.sv", "",
+                                                                                 driver.createOptionBag()));
+                comp = driver.createCompilation();
+                driver.reportCompilation(*comp, /*quiet*/ true);
+                if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
+                if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);
+            }
+        } catch (const std::exception& ex) {
+            std::cerr << "msim: UPF: " << ex.what() << "\n";
+            return 1;
+        }
+    }
+
+    // Pass 3: lower to the process IR and run on the kernel.
+    LowerResult lowered;
+    try {
+        lowered = lower(*comp,
+                        [](const std::string& n, int w, bool net) { return S.sig(n, w, net); },
+                        [](int s) { return S.newDriver(s); });
+    } catch (const std::exception& ex) {
+        // The message may name something declared in protected code.
+        if (pc.any()) std::cerr << "msim: the design (which has protected code) uses a construct msim cannot simulate yet; details hidden\n";
+        else std::cerr << "msim: " << ex.what() << "\n";
+        return 1;
+    }
+    timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (elabOnly) { std::cout << "msim: elaborated " << lowered.procs.size() << " processes; not run (-elab)\n"; return 0; }
+    if (g_cov) {   // FSM coverage: the kernel records the state registers' values
+        std::vector<int> watch;
+        std::vector<char> hot;
+        for (auto& d : fsmDefs()) { watch.push_back(d.sig); hot.push_back(d.onehot); }
+        S.fsmWatch(watch, hot);
+    }
+    if (!xpropReport.empty()) {   // -xprop-report: what is merged, what is not and why
+        std::ofstream f(xpropReport);
+        if (!f) { std::cerr << "msim: cannot write " << xpropReport << "\n"; return 1; }
+        size_t ok = 0;
+        for (auto& r : Lowerer::xpReport()) ok += r.ok;
+        f << "xprop " << (Lowerer::xpropMode() == 2 ? "xmerge" : Lowerer::xpropMode() == 1 ? "tmerge" : "off") << ": "
+          << ok << " of " << Lowerer::xpReport().size() << " if / case / edge constructs merged\n";
+        for (auto& r : Lowerer::xpReport())
+            f << r.where << r.what << (r.ok ? ": merged" : ": not merged, it holds " + r.why) << "\n";
+    }
+    if (!upfPath.empty()) {   // power-aware simulation (IEEE 1801-2024 9)
+        auto& rt = upfrt::rt();
+        rt.verbose = upfVerbose;
+        try {
+            rt.m.resolveApplies([](const std::string& mod) {   // apply_power_model without -elements (6.9)
+                std::vector<std::string> r;
+                std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+                for (auto& [full, m] : instCells())
+                    if (m == mod && full.compare(0, pre.size(), pre) == 0) r.push_back(full.substr(pre.size()));
+                return r;
+            });
             rt.bind(lowered);
         } catch (const std::exception& ex) {
             std::cerr << "msim: UPF: " << ex.what() << "\n";

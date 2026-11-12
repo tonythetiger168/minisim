@@ -1,0 +1,7 @@
+1 on: qa=5 qb=5 qm=a keep=a qi=6 qe=5
+2 isolated: qa=0 qb=f qm=a keep=a qi=6 qe=5
+3 VDD_SW off: qa=x qb=x qm=x keep=a qi=6 qe=5
+4 VDD_SW partial on: qa=x qb=x qm=x keep=a qi=6 qe=5
+5 VDD_E off: qa=5 qb=5 qm=a keep=a qi=6 qe=x
+6 driver of d off: qa=x qb=x qm=x keep=x qi=x qe=x
+7 on again: qa=5 qb=5 qm=a keep=a qi=6 qe=5

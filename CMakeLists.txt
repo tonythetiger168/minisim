@@ -62,6 +62,13 @@ endif()
 add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
+# The SAIF reader (src/saif.hpp), state- and path-dependent counts included.
+find_package(Threads REQUIRED)
+add_executable(test_saif tests/test_saif.cpp)
+target_include_directories(test_saif PRIVATE src)
+target_compile_options(test_saif PRIVATE -UNDEBUG)
+target_link_libraries(test_saif PRIVATE Threads::Threads)
+add_test(NAME test_saif COMMAND test_saif ${CMAKE_SOURCE_DIR}/tests/power/gates_sdpd.saif)
 
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
@@ -220,6 +227,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vcd_class
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd_class.cmake)
+  # The xrun / irun command line (msim run as xrun, or msim -xrun).
+  add_test(NAME msim_xrun
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xrun
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_xrun.cmake)
   # Simulation profile (msim -profile): processes, instances, kinds.
   add_test(NAME msim_profile
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -271,6 +283,10 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_excl
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_excl.cmake)
+    add_test(NAME msim_cov_select
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_select
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_cov_select.cmake)
     add_test(NAME msim_cov_inst
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_inst
