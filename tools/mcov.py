@@ -70,6 +70,13 @@ that are justified and writes the reason. ``mcov report -elfile x.el
 that match nothing (stale), that remove items the tests did cover, or that
 have no reason; ``-el-strict`` makes any of those exit status 1.
 
+Formal: ``mcov exclude all.json -formal r.json -o unr.el`` turns what
+``mformal -json r.json`` proved unreachable (``-app toggle`` bits, and
+targets of other apps that name the exclusion they prove) into exclusions
+whose reason says so, for the items the tests did not cover. A target the
+tests did cover is reported, not excluded. ``-formal-scope tb.dut`` says
+where mformal's -top sits in the simulation (found from the names if left out).
+
 Tests: ``mcov rank run1.json run2.json ...`` takes one database per test and
 orders the tests so that each next one adds the most items not yet covered
 (lines, branch outcomes, toggle edges, condition vectors, FSM states and
@@ -1024,6 +1031,102 @@ def draft_exclusions(db, reset_filter=False):
     return "\n".join(out) + "\n"
 
 
+# ---- formal unreachability (mformal) ----
+
+def _formal_map(name, ftop, scope, db):
+    """A hierarchical name from mformal (under its -top, ftop) as the
+    database names it: the top replaced by scope, or, without scope, by the
+    prefix that makes it a signal, FSM or instance of the database."""
+    rest = name[len(ftop):] if ftop and name.startswith(ftop + ".") else "." + name
+    if scope is not None:
+        return scope + rest
+    known = set(db["toggles"]) | {f"{k[1]}.{k[2]}" for k in db["fsms"]} | set(db["insts"])
+    base = rest.split("[")[0]
+    hits = sorted({k[: len(k) - len(base)] for k in known if k.endswith(base)})
+    return (hits[0] + rest) if len(hits) == 1 else None
+
+
+def formal_exclusions(db, paths, scope=None):
+    """(exclusion lines, notes) for what mformal proved unreachable and the
+    tests did not cover. mformal -json gives, per target, "kind" and "result";
+    a toggle target is named <signal>[<bit>]==<value>; a target of another
+    app carries "mcov": the exclusion it proves, its names under mformal's
+    top (state top.u.st IDLE, trans top.u.st A->B, cond file:line N)."""
+    out, notes = [], []
+    seen = set()
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                r = json.load(f)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"mcov: {path}: {e}")
+        if r.get("tool") != "mformal":
+            raise SystemExit(f"mcov: {path} is not an mformal -json result")
+        props = r.get("properties", [])
+        ftop = ""
+        for p in props:
+            if "." in p["name"]:
+                ftop = p["name"].split(".", 1)[0]
+                break
+        for p in props:
+            if p.get("result") != "unreachable":
+                continue
+            why = f"unreachable: mformal ({os.path.basename(path)}" + (f", {p['note']}" if p.get("note") else "") + ")"
+            if p.get("kind") == "toggle":
+                m = re.fullmatch(r"(.*?)(?:\[(\d+)\])?==([01])", p["name"])
+                if not m:
+                    continue
+                sig = _formal_map(m.group(1), ftop, scope, db)
+                tog = db["toggles"].get(sig) if sig else None
+                if tog is None:
+                    notes.append(f"{p['name']}: no such signal in the database")
+                    continue
+                w, rise, fall = tog
+                bit = int(m.group(2) or 0)
+                if bit >= w:
+                    continue
+                if (rise & fall) >> bit & 1:
+                    notes.append(f"{p['name']}: proven unreachable but the tests toggled it (different reset or constraints?)")
+                    continue
+                line = f"toggle {sig}" + (f"[{bit}]" if w > 1 else "")
+            elif p.get("mcov"):
+                kind, _, body = p["mcov"].partition(" ")
+                if kind not in EL_KINDS:
+                    continue
+                w = body.split(" ")
+                if kind in ("state", "trans", "fsm", "toggle", "inst"):
+                    mapped = _formal_map(w[0], ftop, scope, db)
+                    if not mapped:
+                        notes.append(f"{p['name']}: {w[0]} is not in the database")
+                        continue
+                    w[0] = mapped
+                line = kind + " " + " ".join(w)
+            else:
+                continue
+            if line not in seen:
+                seen.add(line)
+                out.append(f"{line}  -- {why}")
+    # Leave out what an exclusion would find covered: try each on a copy of what it touches.
+    keep = []
+    for text in out:
+        body, _, reason = text.partition("  -- ")
+        k, tg, *arg = body.split(" ", 2)
+        r = {"kind": k, "target": tg, "arg": arg[0] if arg else "", "reason": reason, "where": "formal", "n": 0, "covered": 0}
+        trial = {"lines": dict(db["lines"]), "branches": dict(db["branches"]),
+                 "conds": {c: (o, t, list(h)) for c, (o, t, h) in db["conds"].items()},
+                 "fsms": {f: {"file": m["file"], "line": m["line"], "width": m["width"],
+                              "states": {v: list(x) for v, x in m["states"].items()},
+                              "trans": {t: list(x) for t, x in m["trans"].items()}, "extra": dict(m["extra"])}
+                          for f, m in db["fsms"].items()} if k in ("fsm", "state", "trans") else {},
+                 "toggles": dict(db["toggles"]) if k == "toggle" else {}, "cgs": {}, "asserts": {}, "insts": {}}
+        apply_exclusions(trial, [r])
+        if r["covered"]:
+            notes.append(f"{body}: proven unreachable but the tests covered it (different reset or constraints?)")
+        elif r["n"]:
+            keep.append(text)
+    return keep, notes
+
+
 # ---- test ranking ----------------------------------------------------------
 
 def test_items(db):
@@ -1310,6 +1413,10 @@ def main(argv=None):
     x.add_argument("-o", required=True, help="exclusion file to write")
     x.add_argument("-elfile", metavar="FILE", action="append", default=[], help="exclusions already agreed (left out of the draft)")
     x.add_argument("-fsm-reset-filter", action="store_true", help="leave out transitions into reset states")
+    x.add_argument("-formal", metavar="JSON", action="append", default=[],
+                   help="mformal -json results: write only the items it proved unreachable, with that as the reason")
+    x.add_argument("-formal-scope", metavar="PATH",
+                   help="the instance mformal's -top is in the simulation (default: found from the names)")
     x.add_argument("-j", type=int, default=0, help="worker processes for loading (default: available CPUs)")
     k = sub.add_parser("rank", help="order tests by the coverage each adds; one database per test")
     k.add_argument("dbs", nargs="+", help="one database per test")
@@ -1324,6 +1431,15 @@ def main(argv=None):
     rules = []
     for path in getattr(a, "elfile", ()):
         rules += apply_exclusions(db, read_elfile(path))
+    if a.cmd == "exclude" and a.formal:
+        lines, notes = formal_exclusions(db, a.formal, a.formal_scope)
+        for n in notes:
+            print(f"mcov: {n}")
+        with open(a.o, "w", encoding="utf-8") as f:
+            f.write("# mcov exclusions: items proven unreachable by mformal and not covered by the tests\n"
+                    + "".join(l + "\n" for l in lines))
+        print(f"mcov: {len(lines)} unreachable item(s) in {a.o}")
+        return 0
     if a.cmd == "exclude":
         text = draft_exclusions(db, a.fsm_reset_filter)
         with open(a.o, "w", encoding="utf-8") as f:

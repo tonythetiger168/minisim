@@ -401,6 +401,9 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- `mcov exclude -formal`: what `mformal -json` proves unreachable (toggle
+  bits today, other targets that name the exclusion they prove) becomes
+  exclusions with that reason, for the items the tests did not cover.
 - Condition coverage modes (as VCS `-cm_cond`): `full` records every
   combination of the term values (up to 8 terms), `allops` also covers `&`
   and `|` of one-bit operands; interpreter and `-compile`.
