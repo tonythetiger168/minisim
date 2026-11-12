@@ -39,8 +39,9 @@ struct DomRt {
     std::string state;     // current power state of the domain (add_power_state -domain)
     std::string forced;
 };
+struct GroupRt { std::string name, state = "UNDEFINED", forced; };
 struct Cell {               // an isolation or level-shifter cell on a port connection
-    int kind = 0;           // 0 isolation, 1 level shifter
+    int kind = 0;           // 0 isolation, 1 level shifter, 2 repeater
     const Isolation* iso = nullptr;
     std::vector<std::string> supplies;   // all must be NORMAL
     std::vector<int> senseLow;
@@ -71,6 +72,9 @@ struct Rt {
     std::vector<DomRt> doms;
     std::map<std::string, int> domIdx;
     std::vector<Cell> cells;
+    std::vector<GroupRt> groups;
+    std::map<std::string, int> groupIdx;
+    std::map<std::string, std::string> lastState;   // object -> its last power state that is not UNDEFINED (9.4)
     std::vector<RetRt> rets;
     std::vector<std::pair<int, Edge>> watch;
     std::map<int, int> override;   // signal -> 0 X held, 1 retained value held
@@ -152,9 +156,9 @@ struct Rt {
                 if (isSupply(n)) { out = supplyOf(n); return true; }
                 std::string f = m.fnNet(n);
                 if (!f.empty()) { out = supplyOf(f); return true; }
-                if (m.domains.count(n) || m.sets.count(m.setOf(n))) {
+                if (m.domains.count(n) || m.groups.count(n) || m.sets.count(m.setOf(n))) {
                     out.k = EVal::Obj;
-                    out.sym = m.domains.count(n) ? n : m.setOf(n);
+                    out.sym = m.domains.count(n) || m.groups.count(n) ? n : m.setOf(n);
                     return true;
                 }
                 int s = sigOf(n);
@@ -165,6 +169,8 @@ struct Rt {
         c.inState = [this](const std::string& obj, const std::string& st) {
             auto d = domIdx.find(obj);
             if (d != domIdx.end()) return doms[(size_t)d->second].state == st;
+            auto gi = groupIdx.find(obj);
+            if (gi != groupIdx.end()) return groups[(size_t)gi->second].state == st;
             auto it = sets.find(obj);
             return it != sets.end() && it->second.state == st;
         };
@@ -240,11 +246,32 @@ struct Rt {
                 if (!found) std::cerr << "msim: UPF: " << m.domains.at(e).where << ": power domain " << e
                                       << ": no instance '" << p << "' in the design\n";
             }
+        for (auto& gn : m.groupOrder) {
+            groupIdx[gn] = (int)groups.size();
+            groups.push_back({gn, "UNDEFINED", ""});
+        }
+        // every state a transition names is a power state of its object (6.7)
+        for (auto& [obj, ts] : m.transitions) {
+            std::set<std::string> names;
+            const std::vector<PowerState>* st = ts.kind == 'g' ? &m.groups.at(obj).states
+                                              : ts.kind == 'd' ? &m.domains.at(obj).states : &m.sets.at(obj).states;
+            for (auto& ps : *st) names.insert(ps.name);
+            if (ts.kind == 's') { names.insert("ON"); names.insert("OFF"); }
+            for (auto& t : ts.tr) {
+                auto chk = [&](const std::string& sn) {
+                    if (!names.count(sn)) throw Error(t.where + ": transition " + t.name + ": " + sn + " is not a power state of " + obj + " (6.7)");
+                };
+                for (auto& a : t.from) chk(a);
+                for (auto& b : t.to) chk(b);
+                for (auto& [a, b] : t.paired) { chk(a); chk(b); }
+            }
+        }
+        bindLogic(lw);
         // processes: domain, state or not; what each domain drives
         std::vector<std::set<int>> owned(doms.size());
         stateSigs.assign(doms.size(), {});
         for (auto& lp : lw.procs) {
-            if (!lp.port.empty()) continue;   // a port connection is a wire, not logic of either side
+            if (!lp.port.empty() || lp.kind == "upf_wire") continue;   // a port connection is a wire, not logic of either side
             // slang names procedure kinds "Initial", "AlwaysFF", ...; lowering adds "assign", "init", "sampled"
             const std::string& k = lp.kind;
             if (k == "Initial" || k == "Final" || k == "init" || k == "sampled") continue;
@@ -309,6 +336,8 @@ struct Rt {
             for (auto& ps : s.states) addIds(ps.logicExpr, scopeOfName(n));
         for (auto& dn : m.domainOrder)
             for (auto& ps : m.domains.at(dn).states) addIds(ps.logicExpr, m.domains.at(dn).scope);
+        for (auto& gn : m.groupOrder)
+            for (auto& ps : m.groups.at(gn).states) addIds(ps.logicExpr, m.groups.at(gn).scope);
         for (auto& r : rets) {
             if (r.saveSig >= 0) w.insert(r.saveSig);
             if (r.restoreSig >= 0) w.insert(r.restoreSig);
@@ -324,6 +353,90 @@ struct Rt {
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
     }
     std::vector<std::set<int>> stateSigs;
+
+    // Logic ports and nets made by UPF and their connections (6.13, 6.19,
+    // 6.20): each connection is one more continuous assignment, from the
+    // source side to the sink side. A connection to a port of a descendant
+    // instance is a port connection like those of the HDL, so the interface
+    // cell strategies see it (4.5.5).
+    void bindLogic(LowerResult& lw) {
+        auto make1 = [&](const std::string& upfName) {
+            std::string dn = m.design(upfName);
+            auto it = sigByName.find(dn);
+            if (it != sigByName.end()) return it->second;
+            int s = S.sig(dn, 1);
+            sigByName.emplace(dn, s);
+            return s;
+        };
+        for (auto& n : m.logicNets) make1(n);
+        for (auto& [n, d] : m.logicPorts) make1(n);
+        std::string top = S.vcdTop;
+        for (auto& lc : m.logicConns) {
+            int net = sigOf(lc.net);
+            if (net < 0)
+                throw Error(lc.where + ": connect_logic_net: no logic net '" + m.design(lc.net) + "' in the design or made by create_logic_net (6.13 a)");
+            std::string dn = m.design(lc.port);
+            int port = sigOf(lc.port);
+            if (port < 0)
+                throw Error(lc.where + ": connect_logic_net: no port '" + dn + "' in the design or made by create_logic_port");
+            int dir = -1;
+            auto lp = m.logicPorts.find(lc.port);
+            if (lp != m.logicPorts.end()) dir = lp->second == "in" ? 0 : lp->second == "out" ? 1 : 2;
+            else {
+                auto pr = portRecs().find(top.empty() ? dn : top + "." + dn);
+                if (pr == portRecs().end())
+                    throw Error(lc.where + ": connect_logic_net: '" + dn + "' is not a port (6.13)");
+                dir = pr->second.dir;
+            }
+            if (S.sigs[(size_t)port].w != 1 || S.sigs[(size_t)net].w != 1)
+                throw Error(lc.where + ": connect_logic_net: " + dn + " and " + m.design(lc.net) + " must both be one bit of logic (6.13)");
+            if (dir == 2) throw Error(lc.where + ": connect_logic_net: inout port " + dn + " is not supported");
+            // the port is on the interface of the net's scope (LowConn) or
+            // on an instance below it (HighConn)
+            size_t sl = lc.port.rfind('/');
+            std::string owner = sl == std::string::npos ? "" : lc.port.substr(0, sl);
+            bool low = owner == lc.scope;
+            // LowConn of an input and HighConn of an output are sources (6.20)
+            bool portDrives = low ? dir == 0 : dir == 1;
+            if (!low) {
+                // what the HDL already connects to the HighConn
+                for (auto& old : lw.procs) {
+                    if (old.port != dn) continue;
+                    bool same = false, constant = true;
+                    for (auto& in : old.prog.code) {
+                        if (in.k == IK::WaitEdge) {
+                            constant = false;
+                            if (in.events.size() <= 1 ? in.sig == net : false) same = true;
+                        }
+                        if (in.k == IK::Assign && in.sig == net) same = true;
+                    }
+                    if (same) continue;
+                    if (dir == 0 && constant) {
+                        if (!lc.reconnect)
+                            throw Error(lc.where + ": connect_logic_net: input port " + dn + " is driven by a constant; use -reconnect (6.13 c)");
+                        old.prog.code.clear();
+                        old.port.clear();
+                        old.kind = "upf_wire";
+                        continue;
+                    }
+                    throw Error(lc.where + ": connect_logic_net: port " + dn + " is already connected to another net (6.13 b)");
+                }
+            }
+            int src = portDrives ? port : net, dst = portDrives ? net : port;
+            LoweredProc np;
+            Instr a; a.k = IK::Assign; a.sig = dst; a.e = ref(src);
+            np.prog.emit(a);
+            np.prog.emit(waitInstr({{src, ANY}}));
+            Instr j; j.k = IK::Jmp; j.target = 0;
+            np.prog.emit(j);
+            np.loops = true;
+            np.kind = low ? "upf_wire" : "assign";
+            np.scope = m.design(lc.scope);
+            if (!low) { np.port = dn; np.portDir = dir; }
+            lw.procs.push_back(std::move(np));
+            note("logic net " + m.design(lc.net) + (portDrives ? " <- " : " -> ") + dn);
+        }
+    }
 
     // ------------------------------------------- HDL ports on supply nets
     // connect_supply_net to a port of the design that is not a UPF supply
@@ -464,6 +577,19 @@ struct Rt {
                 if (!out.empty()) cell.supplies.push_back(out);
                 made.push_back((int)cells.size());
                 cells.push_back(cell);
+                break;
+            }
+            for (auto& rp : m.reps) {   // 9.10: the repeater's output follows its supply's simstate
+                if (!repApplies(m, rp, c)) continue;
+                Cell cell;
+                cell.kind = 2;
+                cell.port = p.inst + "." + p.port;
+                std::string sn = m.domains.count(rp.supply) ? m.primaryOf(rp.supply) : m.setOf(rp.supply);
+                if (!sets.count(sn)) throw Error(rp.where + ": repeater " + rp.name + ": no supply set '" + rp.supply + "'");
+                cell.supplies.push_back(sn);
+                made.push_back((int)cells.size());
+                cells.push_back(cell);
+                note("repeater " + rp.name + " on " + cell.port);
                 break;
             }
             if (made.empty()) continue;
@@ -745,6 +871,7 @@ struct Rt {
                 else if (st == "OFF") sim = offDef && offDef->simstate != SS_NONE ? offDef->simstate : SS_CORRUPT;
                 else sim = r.known ? r.sim : SS_CORRUPT;
             }
+            if (st != r.state || !r.known) transition(n, "supply set", st, s.complete);
             if (st != r.state || sim != r.sim || !r.known) {
                 if (r.known || st != "OFF") note("supply set " + n + " power state " + st + " (" + simstateName(sim) + ")");
                 bool simChanged = sim != r.sim || !r.known;
@@ -771,6 +898,7 @@ struct Rt {
             if (st == d.state) continue;
             d.state = st;
             note("power domain " + d.name + " power state " + st);
+            transition(d.name, "power domain", st, dd.complete);
             pendingChecks.push_back([this, &d, st, act, &dd]() {
                 if (d.state != st) return;
                 if (st == "ERROR") error("power domain " + d.name + " is in more than one power state");
@@ -781,6 +909,62 @@ struct Rt {
         }
     }
     std::vector<std::function<void()>> pendingChecks;
+
+    // Power state groups (6.22): the legal combinations of the power states
+    // of other objects.
+    void evalGroups() {
+        for (auto& g : groups) {
+            const StateGroup& gg = m.groups.at(g.name);
+            auto cx = ctx(gg.scope, nullptr);
+            std::vector<const PowerState*> act;
+            for (auto& ps : gg.states) {
+                bool a = ps.logicExpr ? truthOf(evalEx(ps.logicExpr, cx, ps.where)) == 1 : g.forced == ps.name;
+                if (a && ps.supplyExpr) a = truthOf(evalEx(ps.supplyExpr, cx, ps.where)) == 1;
+                if (a) act.push_back(&ps);
+            }
+            std::string st = act.size() == 1 ? act[0]->name : act.empty() ? "UNDEFINED" : "ERROR";
+            if (st == g.state) continue;
+            g.state = st;
+            note("power state group " + g.name + " power state " + st);
+            transition(g.name, "power state group", st, gg.complete);
+            pendingChecks.push_back([this, &g, st, act, &gg]() {
+                if (g.state != st) return;
+                if (st == "ERROR") error("power state group " + g.name + " is in more than one power state");
+                else if (act.size() == 1 && act[0]->illegal) error("power state group " + g.name + " is in illegal power state " + st);
+                else if (st == "UNDEFINED" && gg.complete)
+                    error("power state group " + g.name + " matches none of its power states (-complete)");
+            });
+        }
+    }
+
+    // Power state transition detection (9.4): the object went to state `to`.
+    // The transition is from the last state that was not UNDEFINED, which
+    // is an allowed intermediate state while the object's power states are
+    // not complete. An -illegal transition is an error (6.7), and so is a
+    // transition that is not named when the transitions are -complete.
+    void transition(const std::string& obj, const char* what, const std::string& to, bool statesComplete) {
+        if (to == "ERROR" || to.empty()) return;
+        if (to == "UNDEFINED") {
+            if (statesComplete) lastState[obj] = to;
+            return;
+        }
+        auto prev = lastState.find(obj);
+        std::string from = prev == lastState.end() ? "" : prev->second;
+        lastState[obj] = to;
+        if (from.empty() || from == to || from == "UNDEFINED") return;
+        auto it = m.transitions.find(obj);
+        if (it == m.transitions.end()) return;
+        const Transition* legal = nullptr;
+        const Transition* illegal = nullptr;
+        for (auto& t : it->second.tr)
+            if (t.matches(from, to)) (t.illegal ? illegal : legal) = &t;
+        if (illegal)
+            error(std::string(what) + " " + obj + ": illegal state transition " + illegal->name + " (" + from + " -> " + to + ")");
+        else if (legal)
+            note(std::string(what) + " " + obj + ": state transition " + legal->name + " (" + from + " -> " + to + ")");
+        else if (it->second.complete)
+            error(std::string(what) + " " + obj + ": state transition " + from + " -> " + to + " is not defined (-complete)");
+    }
 
     // Apply each domain's simstate (9.6).
     void applyDomains() {
@@ -964,6 +1148,7 @@ struct Rt {
         driveHdlPorts();
         evalSets();
         evalDomainStates();
+        evalGroups();
         applyDomains();
         evalRetention();
         if (!checkArmed && chkSig >= 0) {   // legality is checked once the time step settles
@@ -1121,7 +1306,7 @@ struct Rt {
         const Val& d = a[0];
         bool ok = true;
         for (auto& sn : c.supplies) ok &= supplyNormal(sn);
-        if (c.kind == 1) return ok ? d : allx(d.w);
+        if (c.kind != 0) return ok ? d : allx(d.w);   // level shifter (9.9), repeater (9.10)
         bool latch = c.iso->clamp == "latch";
         if (!ok) {
             if (latch) { c.latch = allx(d.w); c.latched = true; }

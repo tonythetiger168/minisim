@@ -53,9 +53,13 @@ turned on.
 | `add_power_state` on a domain | `-logic_expr` over power states of other objects and logic nets; an `-illegal` state, two states at once, or no state with `-complete` is reported |
 | simstates (9.5, 9.6) | `NORMAL`; `CORRUPT` (and `NOT_NORMAL`): the domain's processes stop, everything they drive is held at `x`; `CORRUPT_ON_ACTIVITY`, `CORRUPT_ON_CHANGE`, `CORRUPT_STATE_ON_ACTIVITY`, `CORRUPT_STATE_ON_CHANGE`: writes by the domain's processes (or its state elements) store `x` |
 | power-up (9.6.7) | the holds are released; combinational logic (`assign`, `always_comb`, `always @*`) re-evaluates; flops stay `x` until their next clock or reset edge |
-| `set_isolation` (9.8) | on each port connection that crosses the domain boundary: `-applies_to`, `-elements`, `-exclude_elements`, `-source`, `-sink`, `-diff_supply_only`, `-no_isolation`; `-clamp_value 0`, `1`, `Z`, `latch`; one or more `-isolation_signal`s with `-isolation_sense`; `x` when the isolation supply is not `NORMAL` or the control is unknown |
+| `set_isolation` (9.8) | on each port connection that crosses the domain boundary: `-applies_to`, `-applies_to_boundary`, `-elements`, `-exclude_elements`, `-source`, `-sink`, `-diff_supply_only`, `-no_isolation`; `-clamp_value 0`, `1`, `Z`, `latch`; one or more `-isolation_signal`s with `-isolation_sense`; `x` when the isolation supply is not `NORMAL` or the control is unknown |
 | `set_level_shifter` (9.9) | `x` when its input or output supply (by default the two domains' primary supplies) is not `NORMAL` |
 | `set_retention` (9.7) | single control (`{ret high}` / `{ret low}`: saved on entry, held through power-down, shown again at power-up, released when the control falls), or separate save and restore signals (edge or level), `-save_event_condition`, `-restore_event_condition`, `-restore_period_condition`, `-powerdown_period_condition`, `-retention_supply` with `RET_SUP_COR` / `NO_RET_SUP_COR`, `SAV_RES_COR`, `-use_retention_as_primary` |
+| `set_repeater` (6.52, 9.10) | a buffer on each port connection the strategy applies to (`-applies_to`, `-applies_to_boundary`, `-elements`, `-exclude_elements`, `-source`, `-sink`, `-update`): its output is `x` while `-repeater_supply` is not `NORMAL` |
+| `create_logic_net`, `create_logic_port`, `connect_logic_net` (6.13, 6.19, 6.20) | one-bit nets and ports made by the power intent, and their connections to HDL ports (`-reconnect` replaces a constant on an input). The net can be an isolation, retention or switch control |
+| `add_state_transition` (6.7, 9.4) | named transitions of a supply set, domain or group (`-from` / `-to`, `-paired`, `-update`): an `-illegal` transition is an error, and with `-complete` so is one that is not named; `UNDEFINED` is passed through; `-upf_verbose` prints each named transition |
+| `create_power_state_group` (6.22) | `add_power_state -group`: the legal combinations of other objects' power states; an `-illegal` state, two states at once, or no state with `-complete` is reported |
 | `create_pst`, `add_port_state`, `add_pst_state` (legacy) | when a time step settles, the supplies must match a row of every PST |
 | `upf_version`, `set_scope`, `set_design_top`, `load_upf` | yes |
 | Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
@@ -70,7 +74,7 @@ schedules and `-threads` are turned off with `-upf`.
 ### Not yet
 
 `map_*`, `use_interface_cell`, `define_*_cell`, `set_port_attributes`,
-`set_simstate_behavior`, repeaters, composite domains, power models and the
+`set_simstate_behavior`, composite domains, power models and the
 other implementation commands are read and ignored with a note.
 Isolation and level shifters sit on port connections between a parent and a
 child instance; a strategy on a port of the simulation top itself, or on a

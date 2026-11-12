@@ -40,6 +40,10 @@ Conventions:
 | `MW_square` | `a * a` |
 | `MW_mac` | `a * b + c`, the addend folded into the tree |
 | `MW_mult_pipe` | multiplier with `STAGES` register stages (for retiming) |
+| `MW_div_pipe`, `MW_sqrt_pipe` | divider and square root with `STAGES` register stages |
+| `MW_prod_sum` | sum of `NUM` products (dot product), unsigned or two's complement |
+| `MW_log2` | `log2(a)` of a normalized 1.x fixed-point number, a 0.x result under one unit low |
+| `MW_exp2` | `2^a` of a 0.x fraction, a 1.x result under one unit low |
 | `MW_mult_seq` | shift-and-add multiplier, one bit per clock, `start` / `done` |
 | `MW_div` | quotient and remainder as the `/` and `%` operators give them, `divide_by_0` |
 | `MW_div_seq` | the same, one quotient bit per clock, `start` / `done` |
@@ -57,6 +61,7 @@ Conventions:
 | `MW_norm` | shift left until the top bit is 1 |
 | `MW_popcount` | number of 1 bits |
 | `MW_pri_enc` | priority encoder, lowest or highest bit first |
+| `MW_thermdec` | binary to thermometer code |
 | `MW_decode` | binary to one-hot |
 | `MW_onehot2bin` | one-hot to binary, with an error flag |
 | `MW_bin2gray`, `MW_gray2bin` | Gray code conversion |
@@ -109,6 +114,7 @@ Division and square root reuse `MW_div` and `MW_sqrt` on the significands.
 | `MW_ram` | flip-flop memory, one write and one read port, registered or combinational read |
 | `MW_fifo_sync` | single-clock FIFO with count, almost-full / almost-empty and error flags |
 | `MW_fifo_async` | dual-clock FIFO with Gray code pointers |
+| `MW_stack` | LIFO stack with count, full / empty and error flags |
 | `MW_arb_fp`, `MW_arb_rr` | fixed priority and round-robin arbiters |
 
 ## Testing
@@ -117,7 +123,7 @@ Division and square root reuse `MW_div` and `MW_sqrt` on the significands.
 instantiates the modules at several widths and in every architecture, drives
 random and corner-case inputs, and compares the outputs with the
 SystemVerilog operators or a behavioural model: `arith.sv`, `muldiv.sv`,
-`bits.sv`, `seq.sv`. The CRC bench checks the published check values of
+`bits.sv`, `seq.sv`, `more.sv`. The CRC bench checks the published check values of
 CRC-16/CCITT-FALSE and CRC-32. The same benches also pass on Verilator 5, and
 the library is clean under `verilator --lint-only -Wall`.
 
