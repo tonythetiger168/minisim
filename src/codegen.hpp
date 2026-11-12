@@ -1410,7 +1410,8 @@ private:
         // Every group (each wakes on its own events, see dseq), when there
         // are few; else, or when that clashes, the largest one alone.
         std::vector<int> all;
-        if (groups.size() > 1 && groups.size() <= 8) {
+        // (A multi-core SoC has a gated clock per core: a few groups per core.)
+        if (groups.size() > 1 && groups.size() <= 1024 && !std::getenv("MSIM_ONEGROUP")) {
             for (auto& g : groups) all.insert(all.end(), g.begin(), g.end());
             std::sort(all.begin(), all.end());
             if (clash(all)) all.clear();
@@ -2381,8 +2382,15 @@ private:
         // that group's processes; one marker NBA per slot commits them all.
         const bool multi = domGroups_ > 1;
         if (multi) {
-            o << "static const uint8_t DSGRP[] = {";
-            for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << domGroup_[dom[j]];
+            // The processes of each group: DSO[DOFF[g] .. DOFF[g + 1]), indices into DS.
+            std::vector<std::vector<size_t>> byG(domGroups_);
+            for (size_t j = 0; j < dom.size(); j++) byG[domGroup_[dom[j]]].push_back(j);
+            o << "static const uint32_t DSO[] = {";
+            size_t c = 0;
+            for (auto& v : byG) for (size_t j : v) o << (c++ ? ", " : "") << j;
+            o << "};\nstatic const uint32_t DOFF[] = {0";
+            c = 0;
+            for (auto& v : byG) { c += v.size(); o << ", " << c; }
             o << "};\nstatic bool dpend = false;\n";
         }
         // Islands (like the kernel's partitions): processes and comb statements
@@ -2477,8 +2485,8 @@ private:
                  "      S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); }, use); S.domainTune[1].done(S.threads); }\n";
         else if (multi) {
             o << "    const int grp = (int)(intptr_t)ctx;\n";
-            if (two) o << "    if (twoNow()) { for (size_t j = 0; j < " << dom.size() << "; j++) if (DSGRP[j] == grp) DS2[j](); } else\n";
-            o << "    for (size_t j = 0; j < " << dom.size() << "; j++) if (DSGRP[j] == grp) DS[j]();\n"
+            if (two) o << "    if (twoNow()) { for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS2[DSO[k]](); } else\n";
+            o << "    for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS[DSO[k]]();\n"
                  "    if (dpend) return;\n    dpend = true;\n";
         } else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
         if (!par && !multi) o << "    for (auto f : DS) f();\n";
