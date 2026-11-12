@@ -38,6 +38,8 @@
 #pragma once
 #include <cmath>
 #include <deque>
+#include <fstream>
+#include <sstream>
 #include <set>
 #include <functional>
 #include <iostream>
@@ -688,6 +690,7 @@ struct Lowerer {
     struct LoopJumps {
         std::vector<size_t> breaks;
         std::vector<size_t> continues;
+        int xpBrk = -1, xpCnt = -1;   // -xprop: break / continue set these flags instead of jumping
     };
     std::vector<LoopJumps> loops;
     // Named sequential blocks around the statement being lowered, each with
@@ -8425,6 +8428,7 @@ struct Lowerer {
         switch (s.kind) {
             case StatementKind::Empty: break;
             case StatementKind::List:
+                if (!loops.empty() && loops.back().xpBrk >= 0) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
                 for (auto* st : s.as<StatementList>().list) stmt(*st);
                 break;
             case StatementKind::Block: {
@@ -8693,11 +8697,13 @@ struct Lowerer {
                     break;
                 }
                 if (loops.empty()) unsupported("break outside a loop");
+                if (loops.back().xpBrk >= 0) { xpSet(loops.back().xpBrk, konst(mk(1, 1))); break; }   // -xprop
                 loops.back().breaks.push_back(emitJmp());
                 break;
             }
             case StatementKind::Continue: {
                 if (loops.empty()) unsupported("continue outside a loop");
+                if (loops.back().xpCnt >= 0) { xpSet(loops.back().xpCnt, konst(mk(1, 1))); break; }   // -xprop
                 loops.back().continues.push_back(emitJmp());
                 break;
             }
@@ -8712,6 +8718,17 @@ struct Lowerer {
                 size_t top = prog.here(), jf = (size_t)-1;
                 if (f.stopExpr) { Instr j; j.k = IK::JmpIfNot; j.e = expr(*f.stopExpr); jf = prog.emit(j); }
                 loops.push_back({});
+                if (f.stopExpr && xpLoopOk(f.body)) {   // -xprop: break / continue become flags
+                    size_t jb = xpLoopBody(f.body);
+                    patch(loops.back().continues, prog.here());
+                    for (const Expression* e : f.steps) exprStmt(*e);
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    prog.code[jf].target = prog.here();
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
+                }
                 stmt(f.body);
                 // continue lands on the step. The step then falls into the
                 // back-edge, which checks the condition again.
@@ -8782,6 +8799,21 @@ struct Lowerer {
                     auto n = node(Op::ArrAddr, std::move(ks));
                     n->arr = da;
                     foreachDynDim(f, bindCont(std::move(n), *da->dynElem), nfixed);
+                } else if (xpLoopOk(f.body)) {   // -xprop: break / continue become flags
+                    size_t jb = xpLoopBody(f.body);
+                    patch(loops.back().continues, prog.here());
+                    for (size_t k = lv.size(); k-- > 0;) {
+                        const Lvl& L = lv[k];
+                        Instr st; st.k = IK::Assign; st.sig = L.var;
+                        st.e = bin(L.up ? Op::Add : Op::Sub, ref(L.var, true), konst(make(1, 0, 32, 0, true)));
+                        prog.emit(st);
+                        Instr back; back.k = IK::Jmp; back.target = L.top; prog.emit(back);
+                        prog.code[L.jf].target = prog.here();
+                    }
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
                 } else stmt(f.body);
                 patch(loops.back().continues, prog.here());
                 for (size_t k = lv.size(); k-- > 0;) {
@@ -10974,6 +11006,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         out.procs.push_back({std::move(lw.prog), loops, "always_comb", curScope});
     }
+    // -xprop configuration file: whether the instance around p is on.
+    static bool xpropHere(const slang::ast::Symbol& p) {
+        if (Lowerer::xpRules().empty()) return true;
+        const auto* inst = instanceAround(p.getParentScope());
+        if (!inst) return true;
+        return Lowerer::xpConfigOn(inst->getHierarchicalPath(), inst->getDefinition().name);
+    }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
         if (p.isFromAssertion) { assertionItem(p); return; }
@@ -10989,7 +11028,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
         int below = checkerDepth > 0 && p.procedureKind == ProceduralBlockKind::AlwaysFF ? lw.fresh(1) : -1;
         if (Lowerer::xpropMode() && checkerDepth == 0 && program < 0 && lw.frames.empty() &&
-            p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final)
+            p.procedureKind != ProceduralBlockKind::Initial && p.procedureKind != ProceduralBlockKind::Final &&
+            xpropHere(p))
             lw.xpProc(p.getBody());   // -xprop
         else
             lw.stmt(p.getBody());

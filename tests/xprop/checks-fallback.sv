@@ -1,10 +1,13 @@
-// msim -xprop: unique / priority if, casex, nested case, negedge; constructs that
-// are not merged (break, a task call) keep the standard behavior.
+// msim -xprop: unique / priority if, casex, nested case, negedge, a for loop
+// with break, a task call; constructs that are not merged (a break out of a
+// while loop, a task with a nonblocking assignment) keep the standard behavior.
 //! args: -xprop
 module top;
   logic a, b; logic [3:0] y, z, w, u, k, s; logic [2:0] sel; logic [3:0] idx;
   logic [7:0] req; logic [1:0] st; logic clk; logic [3:0] f1, f2, f3; int n;
+  logic [3:0] m, f4;
   task automatic bump(inout logic [3:0] x); x = x + 1; endtask
+  task automatic later(input logic [3:0] v); f4 <= v; endtask
   always_comb begin   // unique if
     unique if (a) y = 4'd1;
     else if (b) y = 4'd3;
@@ -22,12 +25,12 @@ module top;
       default: w = 4'd0;
     endcase
   end
-  always_comb begin   // a loop with break is not merged
+  always_comb begin   // a for loop with break
     idx = 4'hf;
     for (int i = 0; i < 8; i++)
       if (req[i]) begin idx = i[3:0]; break; end
   end
-  always_comb begin   // a task call is not merged; the if around the case is
+  always_comb begin   // a task call; an if around a case
     u = 4'd2;
     if (a) bump(u);
     k = 4'd0;
@@ -48,6 +51,14 @@ module top;
       2'd3: s = 4'd9;
     endcase
   end
+  always_comb begin   // a break out of a while loop is not merged
+    m = 4'd0;
+    while (m < 4'd8) begin
+      if (req[m]) break;
+      m = m + 4'd1;
+    end
+  end
+  always @(posedge clk) if (b) later(4'h5);   // a task with <= is not merged
   always @(negedge clk) begin   // negedge, and two blocks of one process
     if (a) f1 <= 4'hc; else f1 <= 4'h3;
     f2 <= f1;
@@ -77,7 +88,7 @@ module top;
   end
 endmodule
 //> y=0111 z=0110 w=0000 idx=4 u=2 k=0 s=0
-//> a=x: y=0xx1 z=0xxx u=0010 s=000x
+//> a=x: y=0xx1 z=0xxx u=001x s=000x
 //> a=x b=x: y=0xx1 k=000x
 //> b=x: y=0x11 k=000x
 //> st=x1: k=00xx s=xx01
@@ -85,9 +96,9 @@ endmodule
 //> sel=x10: w=xx00
 //> sel=0x1: w=0x00
 //> sel=1zx: w=1000
-//> req=x0000000: idx=15
-//> req=00001x00: idx=3
-//> Warning: "checks-fallback.sv", 9: unique if: more than one condition is true at time 11
+//> req=x0000000: idx=X
+//> req=00001x00: idx=X
+//> Warning: "checks-fallback.sv", 12: unique if: more than one condition is true at time 11
 //> f1=c f2=x
 //> a=x: f1=xxxx f2=c
 //> clk 1->x: f1=xxxx f2=xxxx
