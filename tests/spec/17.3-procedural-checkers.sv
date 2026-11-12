@@ -18,7 +18,7 @@ checker c1(event clk, logic [7:0] a, b);
   p2: assert property (@clk a != b) else $display("%0t p2 fail %m a=%0d", $time, a);
   p3: assert final (a != 1) else $display("%0t p3 fail %m", $time);
 endchecker
-checker c2(logic x, event ck = $inferred_clock);
+checker c2(logic [7:0] x, event ck = $inferred_clock);
   px: assert property (@ck x != 3) else $display("%0t px fail %m", $time);
 endchecker
 checker c3(logic y);
