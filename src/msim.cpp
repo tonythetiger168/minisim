@@ -33,6 +33,9 @@
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
+//   -profile [<file>] time every process and region and write a report
+//                    (default simprofile.txt): busiest processes, time per
+//                    instance, file and kind. Runs the interpreter on one thread.
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -1005,7 +1008,6 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
-                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
                     : std::any_of(asserts().begin(), asserts().end(), [](const AssertInfo& a) {
                           return a.hidden || (a.type & (AT_CONCURRENT | AT_FINAL | AT_EXPECT));
                       }) ? "a concurrent, final or expect assertion"
@@ -1021,7 +1023,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         // With a VCD every signal must live in S.sigs, so no private signals.
         // A large design is built as several files at once, one per core (16 at most).
         src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr,
-                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()));
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale());
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -1729,6 +1731,7 @@ static void usage() {
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
+                 "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -1915,6 +1918,11 @@ int main(int argc, char** argv) {
         if (a == "-saif") {
             std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
             saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
+            continue;
+        }
+        if (a == "-profile") {   // profile.hpp
+            prof::P().on = true;
+            if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".txt")) prof::P().path = argv[++i];
             continue;
         }
         if (a == "-cov") {
@@ -2388,6 +2396,10 @@ int main(int argc, char** argv) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
         compiled = false;
     }
+    if (compiled && prof::P().on) {
+        std::cerr << "msim: -compile: -profile times the interpreter; using it\n";
+        compiled = false;
+    }
     bool anyReactive = false;
     for (auto& lp : lowered.procs) anyReactive |= lp.reactive;
     if (compiled && (lowered.programs || anyReactive)) {
@@ -2446,6 +2458,29 @@ int main(int argc, char** argv) {
     // core, unless -threads was given.
     if (!threadsGiven && threads > 1 && vcdPath && vcdPath->ends_with(".fst")) threads--;
     S.threads = threads;
+    // msim -profile: one thread, so that the times add up, and one entry per process.
+    auto profEnt = [&](const LoweredProc& lp) {
+        std::string loc;
+        for (const Instr& in : lp.prog.code)
+            if (in.line) {
+                loc = (in.file < g_covFiles.size() ? g_covFiles[in.file] : std::string("?")) + ":" + std::to_string(in.line);
+                break;
+            }
+
+        // The kinds as they are written in the source.
+        static const std::map<std::string, std::string> kinds = {
+            {"Always", "always"}, {"AlwaysFF", "always_ff"}, {"AlwaysComb", "always_comb"},
+            {"AlwaysLatch", "always_latch"}, {"Initial", "initial"}, {"Final", "final"},
+            {"init", "initializers"}, {"assign", "assign"}};
+        auto k = kinds.find(lp.kind);
+        std::string top = S.vcdTop.empty() ? std::string("top") : S.vcdTop;
+        if (!lp.port.empty()) {   // a port connection: counted in the instance whose port it is
+            size_t dot = lp.port.rfind('.');
+            return prof::P().add("port " + lp.port.substr(dot + 1), top + "." + lp.port.substr(0, dot), "");
+        }
+        return prof::P().add(k == kinds.end() ? lp.kind : k->second, lp.scope.empty() ? top : top + "." + lp.scope, loc);
+    };
+    if (prof::P().on) { S.threads = 1; staticPart = false; prof::P().t0 = std::chrono::steady_clock::now(); }
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
         if (pl.rank[i] >= 0) byRank[pl.rank[i]] = (int)i;
@@ -2454,24 +2489,34 @@ int main(int argc, char** argv) {
         const Prog* pr = &lowered.procs[i].prog;
         for (auto& in : pr->code)
             if (in.k == IK::Assert && !pr->combCtl) pr->combCtl = std::make_shared<ProcCtl>();
+        if (prof::P().on) prof::P().combEnt.push_back(profEnt(lowered.procs[i]));
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
-        if (vpi::st().active && lowered.procs[i].kind == "init") {
+        if (lowered.procs[i].kind == "init") {
             // Declaration initializers take effect before the simulation
-            // starts, so they are not value changes VPI callbacks see (6.8).
+            // starts (6.8): not value changes VPI callbacks see, and not
+            // edges a clocked process registered below could wake on
+            // (logic clk = 0 is no negedge).
             Task t = process(&lowered.procs[i].prog);
             S.all.push_back(t.h);
             t.h.resume();
             continue;
         }
-        if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
-        else if (lowered.procs[i].program >= 0 || lowered.procs[i].reactive)
-            S.spawn(programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial"));
-        else S.spawn(process(&lowered.procs[i].prog));
+        int pe = prof::P().on ? profEnt(lowered.procs[i]) : -1;
+        if (pl.seq[i]) {
+            if (pe >= 0) prof::P().seqEnt.push_back(pe);
+            S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
+            continue;
+        }
+        Task t = lowered.procs[i].program >= 0 || lowered.procs[i].reactive
+                     ? programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial")
+                     : process(&lowered.procs[i].prog);
+        if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
+        S.spawn(t);
     }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
@@ -2523,5 +2568,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!writeSaif()) return 1;
+    if (prof::P().on && !prof::P().write(S.now, S.timescale)) {
+        std::cerr << "msim: cannot write " << prof::P().path << "\n";
+        return 1;
+    }
     return S.exitCode;
 }
