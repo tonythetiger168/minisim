@@ -85,7 +85,9 @@ struct Prog;
 struct UdpRow { std::vector<std::string> in; char state = 0, out = 'x'; int edge = -1; };
 struct UdpTable { int nin = 0; bool seq = false; bool edges = false; std::vector<UdpRow> rows; };
 // IK::Dump commands, one per VCD task (21.7.1).
-enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT };
+enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT,
+               // Extended VCD (21.7.3): args hold [size,] file name; dsel the ports of $dumpports.
+               DC_PORTS, DC_POFF, DC_PON, DC_PALL, DC_PFLUSH, DC_PLIMIT };
 
 // Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
 // is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
