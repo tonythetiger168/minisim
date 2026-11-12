@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 
@@ -12,7 +13,7 @@ mplan, vplan, results, out = sys.argv[1:5]
 os.makedirs(out, exist_ok=True)
 users = os.path.join(out, "users.txt")
 with open(users, "w") as f:
-    f.write("# name:token[:role]\nalice:alice-token-1\nbob:bob-token-22:read\n")
+    f.write("# name:token[:role]\nalice:alice-token-1\nbob:bob-token-22:read\ndave:dave-token-333\nerin:erin-token-4444\n")
 
 
 def call(url, token=None, body=None, ctype="application/json"):
@@ -96,6 +97,67 @@ try:
     # The next report takes the dashboard's annotations as its triage rules.
     rc, text = run("report", vplan, "-results", results, "-o", plan_d, "-label", "s3", "-rules", base + "/api/p/counter/rules", "-fail-on-new")
     expect("report with the server's rules", "known" in text and "owner: carol; bug: CNT-77" in text and "new failure bucket" not in text, text)
+
+    # Several clients at once: three writers push 4 runs each into one project
+    # while others annotate and read it. Every push and annotation must land,
+    # and the files stay whole.
+    writers = [("alice", "alice-token-1"), ("dave", "dave-token-333"), ("erin", "erin-token-4444")]
+    dirs = []
+    for w, _ in writers:
+        for i in range(4):
+            d = os.path.join(out, f"multi_{w}_{i}")
+            run("report", vplan, "-results", results, "-o", d, "-label", f"{w}-{i}", "-time", f"2026-11-0{i + 1}T00:00:00Z")
+            dirs.append((w, d))
+    run("push", base, dirs[0][1], "-token", "alice-token-1", "-project", "busy")  # the project exists before the storm
+    errs = []
+
+    def pusher(w, tok):
+        for i, (who, d) in enumerate(x for x in dirs if x[0] == w):
+            if (who, i) == ("alice", 0):
+                continue
+            rc, text = run("push", base, d, "-token", tok, "-project", "busy")
+            if rc != 0:
+                errs.append(f"push {d}: {text}")
+
+    def annotator(w, tok):
+        for i in range(10):
+            code, text = call(base + "/api/p/busy/annotate", tok, {"signature": f"sig {w} {i}", "status": "known", "owner": w})
+            if code != 200:
+                errs.append(f"annotate {w} {i}: {code} {text}")
+
+    def reader():
+        for _ in range(20):
+            for u in ("/", "/p/busy/", "/api/p/busy", "/api/p/busy/history", "/p/busy/plan.json"):
+                code, text = call(base + u)
+                if code != 200:
+                    errs.append(f"read {u}: {code}")
+                elif u.endswith(".json") or "/api/" in u:
+                    try:
+                        json.loads(text)
+                    except ValueError:
+                        errs.append(f"read {u}: torn JSON")
+
+    ts = [threading.Thread(target=pusher, args=w) for w in writers]
+    ts += [threading.Thread(target=annotator, args=w) for w in writers]
+    ts += [threading.Thread(target=reader) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    expect("concurrent clients", not errs, "\n".join(errs[:10]))
+    code, text = call(base + "/api/p/busy/history")
+    labels = sorted(s["label"] for s in json.loads(text))
+    expect("every concurrent push kept", labels == sorted(f"{w}-{i}" for w, _ in writers for i in range(4)), text[:2000])
+    proj = os.path.join(out, "root", "busy")
+    with open(os.path.join(proj, "audit.jsonl")) as f:
+        audit = [json.loads(x) for x in f]
+    expect("audit of concurrent clients", sum(a["action"] == "push" for a in audit) == 12 and sum(a["action"] == "annotate" for a in audit) == 30
+           and {a["user"] for a in audit} == {"alice", "dave", "erin"}, str(audit)[:2000])
+    with open(os.path.join(proj, "annotations.json")) as f:
+        anns = json.load(f)
+    expect("every concurrent annotation kept", sorted(anns) == sorted(f"sig {w} {i}" for w, _ in writers for i in range(10))
+           and all(v["by"] == v["owner"] for v in anns.values()), str(anns)[:2000])
+    expect("no temporary files left", not [n for n in os.listdir(proj) if ".tmp" in n], str(os.listdir(proj)))
 
     # -private: nothing without a token.
 finally:
