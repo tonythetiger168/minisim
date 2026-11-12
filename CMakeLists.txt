@@ -271,6 +271,10 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_excl
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_excl.cmake)
+    add_test(NAME msim_cov_inst
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_inst
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_cov_inst.cmake)
   endif()
   if(MINISIM_WITH_FST)
     add_executable(test_fst tests/test_fst.cpp)

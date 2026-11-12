@@ -107,10 +107,23 @@ inline uint32_t covFileId(const std::string& path) {
     if (fresh) g_covFiles.push_back(path);
     return it->second;
 }
+// Per-instance coverage: the module instances of the design, by path below
+// the top ("" = the top itself). The lowerer sets g_covInst to the instance
+// it is in; a Prog and a CondDef remember it. 0 = none (a package, a class).
+struct CovInst { std::string path, module; };
+inline std::vector<CovInst> g_covInsts{{}};
+inline uint32_t g_covInst = 0;
+inline uint32_t covInstId(const std::string& path, const std::string& module) {
+    for (size_t k = 1; k < g_covInsts.size(); k++)
+        if (g_covInsts[k].path == path && g_covInsts[k].module == module) return (uint32_t)k;
+    g_covInsts.push_back({path, module});
+    return (uint32_t)g_covInsts.size() - 1;
+}
 // Condition coverage: one entry per instrumented condition (see
 // Op::CondCov). Its counters are g_condHits[base .. base + terms.size()].
 struct CondDef {
     uint32_t file = 0, line = 0, col = 0;
+    uint32_t inst = 0;                // g_covInsts: the instance it is in
     bool isOr = false;
     bool lazy = false;                // the terms run in order until one decides (see condCovLazyEnd)
     std::string text;                 // the whole condition, as written
@@ -401,6 +414,7 @@ struct Prog {
     int pd = -1;           // UPF power domain, -1 for none (initial blocks are never gated, 9.2.1)
     bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
     std::vector<Instr> code;
+    uint32_t covInst = 0;  // g_covInsts: the instance it was lowered in (per-instance coverage)
     // msim -xprop, a clocked block with a clean copy: code[1] tests for an
     // ambiguous clock edge and otherwise jumps here. A clocked function
     // starts here at once in a time step where no signal has changed from
@@ -416,6 +430,7 @@ struct Prog {
     mutable std::shared_ptr<void> combCtl;
     size_t emit(Instr i) {
         if (!i.line) { i.file = g_emitLoc.file; i.line = g_emitLoc.line; }
+        if (code.empty()) covInst = g_covInst;
         code.push_back(i);
         return code.size() - 1;
     }
