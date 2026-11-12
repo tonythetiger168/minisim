@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
+  acknowledge back gets an assertion that it changes only once the
+  acknowledge has caught up (two- and four-phase). The one-bit stability
+  check no longer counts the reset value as a change.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from

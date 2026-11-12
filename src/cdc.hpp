@@ -2303,7 +2303,9 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
     //   a Gray-coded or multi-bit bus: at most one bit changes per source
     //     edge, so the reader sees the old or the new value;
     //   an enable-qualified bus: the data does not change on the reading edge
-    //     where the synchronized control changes.
+    //     where the synchronized control changes;
+    //   a request that reads a synchronized acknowledge back (a handshake):
+    //     it changes only when the acknowledge has caught up with it.
     void writeSva(const std::string& file) {
         auto ok = [](const std::string& n) { return !n.empty() && n.find("<protected>") == std::string::npos; };
         auto edge = [&](const Flop& f) {
@@ -2316,6 +2318,12 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
             if (!f.arst.empty() && ok(m.name(f.arst[0])))
                 c += std::string(" disable iff (") + (f.arstHigh ? "" : "!") + m.name(f.arst[0]) + ")";
             return c;
+        };
+        // A change while the source is in reset (its reset value) is not a
+        // crossing.
+        auto guard = [&](const Flop& f) {
+            if (f.arst.empty() || !ok(m.name(f.arst[0]))) return std::string();
+            return std::string("if (") + (f.arstHigh ? "!" : "") + m.name(f.arst[0]) + ") ";
         };
         auto ident = [](std::string n) {
             for (char& c : n)
@@ -2366,13 +2374,41 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
                 default: break;
             }
             if (!seen.insert(label).second) continue;
+            if (c.check == Stable) {
+                // A handshake: the source also reads a synchronized copy of a
+                // signal from the reading domain (an acknowledge). The
+                // request may then change only once the acknowledge has
+                // caught up with it: two-phase (toggle) or four-phase alike.
+                // A plain copy (the responder's ack) just follows.
+                const Flop* ack = nullptr;
+                int deepest = 0;
+                if (!s.plain)
+                    for (const Root& r : cones[m.flopIx.at(c.src)].all) {
+                        const Flop* af = m.flopOf(r.sym);
+                        if (!af || af->dom != s.dom || r.logic) continue;
+                        const Member& mem = member[af - m.flops.data()];
+                        const Flop* from = mem.src ? m.flopOf(mem.src) : nullptr;
+                        if (mem.pos < 2 || !from || from->dom != f.dom || mem.pos <= deepest) continue;
+                        ack = af;
+                        deepest = mem.pos;
+                    }
+                if (ack && ok(m.name(*ack)) && !seen.count("handshake_" + ident(src))) {
+                    std::string hl = "handshake_" + ident(src), a = m.name(*ack);
+                    seen.insert(hl);
+                    props.push_back({hl, "  // " + src + " (" + m.name(s.dom) + ") -> " + dst + " (" + m.name(f.dom) +
+                                             "): handshake, acknowledged through " + a + "\n" +
+                                             "  cdc_" + hl + ": assert property (" + clocking(s) + " $changed(" + src +
+                                             ") |-> $past(" + a + ") == $past(" + src + "))\n    else $error(\"[mlint cdc] " +
+                                             src + " changed before " + a + " acknowledged its last change\");\n"});
+                }
+            }
             std::string t = "  // " + src + " (" + m.name(s.dom) + ") -> " + dst + " (" + m.name(f.dom) + "): " +
                             c.how + "\n";
             if (c.check == Stable) {
                 std::string n = "n_" + label;
                 t += "  int unsigned " + n + " = 2;  // " + m.name(f.dom) + " edges since " + src + " changed\n" +
                      "  always @(" + edge(f) + ") if (" + n + " < 2) " + n + "++;\n" +
-                     "  always @(" + src + ") begin\n    cdc_" + label + ": assert (" + n +
+                     "  always @(" + src + ") " + guard(s) + "begin\n    cdc_" + label + ": assert (" + n +
                      " >= 2) else $error(\"[mlint cdc] " + what + "\");\n    " + n + " = 0;\n  end\n";
             } else {
                 t += "  cdc_" + label + ": assert property (" + body + ")\n    else $error(\"[mlint cdc] " + what +
