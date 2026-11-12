@@ -7,6 +7,15 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Added
+- Floating point datapath modules, IEEE 754 in any exponent and fraction
+  width with subnormals and all five rounding modes: `MW_fp_add`,
+  `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
+  `MW_fp_cmp` (with minimumNumber / maximumNumber), `MW_fp_i2flt`,
+  `MW_fp_flt2i`, `MW_fp_mac` (fused multiply-add), `MW_fp_recip`,
+  `MW_fp_flt2flt` (format conversion) and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
+  them against an exact rational reference (docs/DATAPATH.md).
+
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
   IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
@@ -27,6 +36,17 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- VPI: a variable of a SystemVerilog type no longer reports `vpiReg` (an
+  `int` is a `vpiIntVar`, a `bit` vector a `vpiBitVar`), a
+  one-dimensional array reports `vpiRegArray` (`vpiIsMemory` is 1 and
+  `vpi_iterate(vpiMemory, ...)` still finds it), `vpiInternalScope` gives
+  the generate scopes, tasks, functions and named blocks instead of the
+  module instances, and objects in a generate block belong to its
+  `vpiGenScope`. Define `VPI_COMPATIBILITY_VERSION_1364v2001` for the old
+  view.
+- `vpi_user.h`: `vpiFuncType` is 44 and `vpiNetDeclAssign` is 43, as annex K
+  says (they were swapped). A VPI library built against the old header
+  must be rebuilt.
 - `mchar` measures input pin power: `internal_power` groups without a
   `related_pin` get the supply energy of an edge that moves no output, and
   the output arcs on the same pin hold the energy beyond it. The mini45
@@ -44,6 +64,36 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
+  the crossings (filter, the path of each through its synchronizer) and the
+  reset synchronizers.
+- `mlint -cdc-abstract FILE` and `-cdc-model FILE`: a block's CDC model (the
+  clock of each port, and which inputs it synchronizes) is written from its
+  RTL and used in the SoC run in place of the RTL, so a block can be a black
+  box or skipped for speed with the same findings at its ports.
+- `mlint -cdc-sva FILE`: writes a module of assertions for the synchronized
+  crossings (a one-bit signal holds for two reading edges, a Gray or
+  multi-bit bus changes one bit at a time, enable-qualified data is stable
+  when its control arrives), to simulate with the design.
+- `mlint` CDC/RDC: a vector written bit by bit, or a struct written field by
+  field, is tracked as separate signals (`top.r[1]`, `top.ctl.req`), so two
+  synchronizers kept in one vector, or a struct with fields in different
+  domains, are no longer mixed up.
+- `mlint` reset tree checks: `RDC005` (a reset synchronizer of one flop) and
+  `RDC006` (an asynchronous reset made by combinational logic of several
+  flops). `-cdc-report` lists the reset synchronizers, their length and how
+  many flops each resets.
+- `mlint` `CDC004` follows synchronized signals through flops: signals
+  synchronized separately that meet again up to `-cdc-depth N` flops later
+  (default 2) are reported, once per set of signals.
+- `mlint -sdc file.sdc`: the CDC and RDC checks take the clocks and how they
+  are related from the timing constraints (`src/cdc_sdc.hpp`, the SDC
+  commands that set a domain, on the shared Tcl interpreter): generated
+  clocks are synchronous to their master, `set_clock_groups -asynchronous`
+  and a false path between two clocks make a pair a crossing, exclusive
+  groups are not checked, any other pair is synchronous. New rule `CDC006`:
+  a flop's clock is not a clock in the SDC file. `-cdc-report` lists the SDC
+  clocks of every domain (`docs/CDC.md`).
 - `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
   the object a module's class handle variable points to is a signal
   `tb.p.addr` that follows the handle (x while it is null), with handle
@@ -147,6 +197,13 @@ Spec references are IEEE 1800-2023 clauses.
   library's cells; the `mpnr` test places, routes and DRC-checks one.
 - `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
   and transitions of FSMs), in the totals, the history and `mplan init`.
+- `mregress -farm`: runs go to a compute farm instead of the local machine:
+  `lsf` (bsub -K), `slurm` (srun), `sge` (qsub -sync y), `ssh:HOST[*N],...`
+  or `cmd:TEMPLATE` for any other launcher. `-farm-opts`, `-farm-cpus`
+  (cores per job and msim -threads), `-farm-retries` (a job that never ran
+  is submitted again), `-farm-wait`, `-farm-dry`. The time limit runs on the
+  farm host, so queue time does not count; results come back through the
+  shared run directory.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
   inside a scope, their port connections and which instance feeds which.
 - `mdebug`: tasks and functions in a module, call output arguments, `force`,
@@ -461,6 +518,99 @@ Spec references are IEEE 1800-2023 clauses.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
+- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
+  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
+  callback reason and the assertion and coverage declarations of annex M,
+  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
+  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
+  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
+  the caller's mode. New routines `vpi_get_value_array` and
+  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
+  a user system task. See `docs/VPI.md`.
+- VPI object model of SystemVerilog (clause 37): packages, interfaces with
+  modports and programs as instances (`vpi_iterate(vpiInstance, NULL)`);
+  generate scopes, tasks, functions and named blocks as internal scopes;
+  variables and nets report their SystemVerilog type (`vpiBitVar`,
+  `vpiIntVar`, `vpiEnumVar`, `vpiStructVar`, `vpiStringVar`, ...) and have a
+  typespec with enum constants, struct members and typedef names; arrays of
+  any number of dimensions with ranges, `vpi_handle_by_multi_index` and
+  names like `top.m[1][2][3]`; `vpiHighConn`; `pkg::name` in
+  `vpi_handle_by_name`. An application built for IEEE 1364
+  (`vpi_compatibility.h`) keeps that standard's view. See `docs/VPI.md`.
+- VPI assertion API (clause 39): assertions are objects found by
+  `vpi_iterate(vpiAssertion, ...)`; `vpi_register_assertion_cb` reports each
+  attempt's start, success, vacuous success, failure and disabled
+  evaluation, and assertion control; the system callbacks
+  (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
+  assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI `cbCreateObj` and `cbSizeChange` (38.36.1); the save, restart and
+  reset callback reasons register (msim has no save, so they never run).
+  `tests/spec/38.36-vpi-sv-callbacks.sv`.
+- VPI constraints (37.31): `vpi_iterate(vpiConstraint, class)`, the items of
+  each block (expressions, implication, if / if-else, foreach, disable soft,
+  solve before), and pure virtual prototypes in `vpiMethods`.
+  `tests/spec/37-vpi-constraints.sv`.
+- VPI module path properties: `vpiPathType`, `vpiPolarity`,
+  `vpiDataPolarity`, `vpiCondition` and `vpiModDataPathIn` (37, 38.10).
+- VPI delays of continuous assignments (38.10): `vpi_get_delays` /
+  `vpi_put_delays` on a `vpiContAssign` with a delay.
+  `tests/spec/38.10-vpi-assign-delay.sv`.
+- VPI primitives (37, 38.10): `vpi_iterate(vpiPrimitive / vpiGate /
+  vpiSwitch / vpiUdp, module)`, `vpiPrimType`, `vpiPrimTerm` terminals with
+  direction and connection, and gate delays through `vpi_get_delays` /
+  `vpi_put_delays`. `tests/spec/38.10-vpi-primitives.sv`.
+- VPI module paths (38.10): `vpi_iterate(vpiModPath, module)`, their input
+  and output terms, and their delays through `vpi_get_delays` /
+  `vpi_put_delays`. `tests/spec/38.10-vpi-modpath.sv`.
+- VPI timing checks: `vpi_iterate(vpiTchk, module)`, their terms, notifier
+  and limits (`vpi_get_delays` / `vpi_put_delays`), and `cbTchkViolation`
+  (38.10, 38.36.1). `tests/spec/38.36-vpi-tchk.sv`.
+- VPI assertion stepping (39.5.2): `vpiAssertionEnableStep` /
+  `vpiAssertionDisableStep` with `cbAssertionStepSuccess` /
+  `cbAssertionStepFailure` for each clock step of each attempt.
+  `tests/spec/39.5-vpi-assert-step.sv`.
+- VPI `vpi_control(vpiCoverageMerge, type, name)` (40.5.1): adds the
+  statement, toggle, FSM or assertion counts of a saved msim coverage
+  database to the current run. `tests/spec/40-vpi-coverage-merge.sv`.
+- VPI `vpi_handle_multi(vpiInterModPath, out, in)` (38.21): the path
+  between two instance ports on one net, its ports, and its interconnect
+  delay through `vpi_get_delays` / `vpi_put_delays`.
+  `tests/spec/38.21-vpi-handle-multi.sv`.
+- VPI `cbError` and `cbPLIError` (38.36.3): called for run-time error
+  messages of the simulation and for errors of VPI calls, with
+  `vpi_chk_error` giving the error. `tests/spec/38.36-vpi-cberror.sv`.
+- VPI class definitions (37.29): `vpiClassDefn`, `vpiExtends`,
+  `vpiMethods`, `vpiDerivedClasses` and static `vpiVariables`; a class
+  object now reports the class it was made of, and its properties include
+  that class's own. `tests/spec/37-vpi-classes.sv`.
+- VPI drivers and loads (37.16, 37.17): `vpiDriver`, `vpiLoad`,
+  `vpiLocalDriver`, `vpiLocalLoad` and `vpiPortInst` on nets and variables
+  give continuous assignments and instance ports, following whole-signal
+  port connections through the hierarchy. `tests/spec/37-vpi-drivers.sv`.
+- VPI structs, containers and classes (37.17, 37.18, 37.29): unpacked
+  struct and union variables with `vpiMember` (also of packed ones),
+  dynamic arrays, queues and associative arrays with their elements, class
+  variables, `vpiClassObj` and its properties.
+- VPI `cbStmt` (38.36.1): a callback each time a statement runs.
+- VPI processes, statements and expressions (37.32 to 37.51):
+  `vpi_iterate(vpiProcess / vpiContAssign, module)`, the statement tree
+  (blocks, assignments, if, case and case items, loops, delay and event
+  controls, task calls, wait, disable, force / release, ...) and
+  expressions (`vpiOperation`, `vpiConstant`, function calls, selects) with
+  `vpiOpType`, `vpiConstType`, `vpiDecompile`, `vpiLineNo`.
+- VPI scheduling (38.35, 38.36): `vpiReturnEvent` gives a `vpiSchedEvent`
+  handle that `vpiCancelEvent` cancels (`vpiScheduled`); inertial,
+  transport and pure transport writes remove pending writes as the standard
+  says; `cbForce`, `cbRelease`, `cbAssign`, `cbDeassign`, `cbNBASynch` and
+  `cbAtEndOfSimTime`; `vpi_get_delays` / `vpi_put_delays` on nets with a
+  declared delay (38.10, 38.30).
+- VPI coverage API (clause 40): `vpi_get` of `vpiStatementCoverage`,
+  `vpiToggleCoverage`, `vpiFsmStateCoverage` and `vpiAssertCoverage` on an
+  instance, `vpiCovered` / `vpiCoveredCount` / `vpiCoveredMax` and the
+  assertion counts on assertions, FSMs, FSM states, nets and bits,
+  `vpi_iterate(vpiFsm)` and `vpiFsmStates`, and `vpi_control` with
+  `vpiCoverageStart`, `Stop`, `Reset`, `Check` and `Save` (`msim -cov`).
+  `vpi_handle_by_name` finds an assertion by its label.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
@@ -712,6 +862,12 @@ Spec references are IEEE 1800-2023 clauses.
   the redundant tests, `-keep FILE` for the short list with the same
   coverage, and with a plan the tests behind each feature's coverage.
   `mplan report -rank` adds it to `plan.html` and `plan.json`.
+- `mplan serve` and `mplan push`: a multi-user server and web dashboard.
+  CI pushes each report; the server keeps the history per project and shows
+  every plan (score, status, tests, requirements, trend) and one page per
+  plan where people set the owner, status, bug id and note of each failure
+  bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
+  and `mplan report -rules URL` to take the annotations as triage rules.
 
 ### Fixed
 - msim memory on big VIP benches: a 2-state unpacked array with more than

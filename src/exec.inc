@@ -64,6 +64,45 @@ static std::vector<int64_t> memIdx(const ArrShape& a, int64_t addr, int64_t k) {
     }
     return idx;
 }
+// A partly indexed memory as the $readmem / $writemem target (21.4):
+// aidx holds the indexes of the leading dimensions and, when pdown is set,
+// the left and right bounds of a slice of the next one. i.arr becomes the
+// lesser dimensioned array they select, in place in the memory.
+static bool memView(Instr& i) {
+    const ArrShape& a = *i.arr;
+    size_t ni = i.aidx.size() - (i.pdown ? 2 : 0);
+    std::vector<int64_t> idx(a.dims.size());
+    auto bad = [&](const char* why) {
+        std::cerr << (i.k == IK::ReadMem ? "$readmem" : "$writemem") << ": " << why << " for " << i.fmt << "\n";
+        return false;
+    };
+    for (size_t d = 0; d < a.dims.size(); d++) idx[d] = a.dims[d].first;
+    for (size_t d = 0; d < ni; d++) {
+        Val v = eval(i.aidx[d], rd);
+        if (v.x) return bad("unknown memory index");
+        idx[d] = v_to_i64(v);
+    }
+    auto view = std::make_shared<ArrShape>(a);
+    view->dims.erase(view->dims.begin(), view->dims.begin() + (long)ni);
+    if (i.pdown) {
+        Val l = eval(i.aidx[ni], rd), r = eval(i.aidx[ni + 1], rd);
+        if (l.x || r.x) return bad("unknown slice bound");
+        int64_t sl = v_to_i64(l), sr = v_to_i64(r);
+        auto [dl, dr] = a.dims[ni];
+        if ((dl <= dr) != (sl <= sr) && sl != sr) return bad("slice in the wrong direction");
+        if (std::min(sl, sr) < std::min(dl, dr) || std::max(sl, sr) > std::max(dl, dr)) return bad("slice out of range");
+        idx[ni] = sl;
+        view->dims[0] = {sl, sr};
+    }
+    int64_t off = a.offset(idx);
+    if (off < 0) return bad("memory index out of range");
+    view->base = a.base + (int)off;
+    int64_t cnt = 1;
+    for (size_t d = 0; d < view->dims.size(); d++) cnt *= view->size(d);
+    view->count = (int)cnt;
+    i.arr = view;
+    return true;
+}
 static void writeMem(const Instr& i) {
     const ArrShape& a = *i.arr;
     auto [l, r] = a.dims[0];
@@ -329,6 +368,17 @@ inline void dynExec(const Instr& i) {
     const int dres = i.dres >= 0 ? R(i.dres) : -1, dkey = i.dkey >= 0 ? R(i.dkey) : -1;
     if (i.dcmd != D_DELETE && i.dcmd != D_DELETE_AT && i.dcmd != D_FIRST && i.dcmd != D_LAST && i.dcmd != D_NEXT && i.dcmd != D_PREV)
         dynAttach(sig);   // a write to an element container made by a read: it joins its array now
+    // VPI cbSizeChange: compare the size before and after this command.
+    struct SizeWatch {
+        int sig = -1;
+        size_t n = 0;
+        static size_t size(int s) {
+            auto it = dynStore().find(s);
+            return it == dynStore().end() ? 0 : it->second.kind == 2 ? it->second.map.size() : it->second.vec.size();
+        }
+        ~SizeWatch() { if (sig >= 0 && size(sig) != n) g_sizeHook(sig); }
+    } watch;
+    if (__builtin_expect(g_sizeHook != nullptr, 0)) { watch.sig = sig; watch.n = SizeWatch::size(sig); }
     auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
@@ -508,6 +558,7 @@ inline void newObject(const Instr& i) {
     if (src) objRng()[obj] = objRng()[src];
     else { uint64_t a = urandomNext(urandomState()), b = urandomNext(urandomState()); objRng()[obj] = seedState(a << 32 | b); }
     S.set(R(i.sig), make((uint64_t)obj, 0, 64));
+    if (__builtin_expect(g_newObjHook != nullptr, 0)) g_newObjHook(obj);
 }
 
 struct JoinState {
@@ -819,6 +870,10 @@ static size_t runAssert(const Instr& i, const shared_ptr<ProcCtl>& ctl, size_t p
     bool ok = truth(eval(i.e, rd)) == 1;
     a.evals++;
     (ok ? a.passes : a.fails)++;
+    if (assertHook()) {   // an immediate assertion's attempt starts and ends at once (39.4.2)
+        assertEvent(i.sig, AE_START, S.now);
+        assertEvent(i.sig, ok ? AE_SUCCESS : AE_FAILURE, S.now);
+    }
     if (!i.join) {
         if (ok) return a.passOn ? pc + 1 : i.hi;
         return a.failOn ? i.target : i.hi;
@@ -1036,7 +1091,10 @@ static void expectDone(const shared_ptr<void>& p, int res) {
     S.reactive.push_back(w->h);
     S.rare = true;
 }
-static void dropAttempts(ConcAssert& c) {   // disabled or killed: expect statements go on
+static void dropAttempts(ConcAssert& c, int ev = AE_DISABLED) {   // disabled or killed: expect statements go on
+    if (assertHook() && !asserts()[c.id].hidden)
+        for (auto& at : c.att)
+            for (uint64_t n = 0; n < at.count; n++) assertEvent(c.id, ev, at.start);
     for (auto& at : c.att) expectDone(at.wait, 2);
     for (auto& p : c.matured) expectDone(p.wait, 2);
     c.att.clear();
@@ -1062,27 +1120,39 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
         std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
             if (t.killGen == a.killGen) return false;
+            if (!a.hidden) for (uint64_t n = 0; n < t.count; n++) assertEvent(c.id, AE_KILLED, t.start);
             expectDone(t.wait, 2);
             return true;
         });
     if (c.disable && truth(eval(c.disable, rd)) == 1) {   // disabled: no pass, no fail (16.12)
         dropAttempts(c);
         c.pending.clear();
-        if (a.on && (ticked & 1)) a.evals++;
+        if (a.on && (ticked & 1)) {
+            a.evals++;
+            if (assertHook() && !a.hidden && !c.procedural) {   // the attempt of this tick starts disabled (39.4.2)
+                assertEvent(c.id, AE_START, S.now);
+                assertEvent(c.id, AE_DISABLED, S.now);
+            }
+        }
         return;
     }
     if (!(ticked & 1)) {
     } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait}); a.evals++; }
+        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait, S.now}); a.evals++; assertEvent(c.id, AE_START, S.now); }
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) { c.att.push_back({c.root, false, 1, a.killGen, p.caps}); a.evals++; }
+            if (!pc->killed && pc->epoch == p.epoch) {
+                c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, nullptr, S.now});
+                a.evals++;
+                assertEvent(c.id, AE_START, S.now);
+            }
         }
         c.pending.clear();
     } else if (a.on) {
-        c.att.push_back({c.root, false, 1, a.killGen, nullptr});
+        c.att.push_back({c.root, false, 1, a.killGen, nullptr, nullptr, nullptr, S.now});
         a.evals++;
+        if (!a.hidden) assertEvent(c.id, AE_START, S.now);
     }
     if (c.att.empty()) {
         for (int f : c.clearFlags) S.set(f, mk(0, 1));
@@ -1120,33 +1190,40 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
         const sva::Node* t = dv.d(at.t);
         ConcAssert::Envs envs;
         if (lenv) std::tie(t, envs) = lenv->finish(t);
+        if (a.step && assertHook() && !a.hidden) {   // VPI stepping (39.5.2): this attempt's step
+            assertStep() = {at.t, t};
+            for (uint64_t n = 0; n < at.count; n++) assertEvent(c.id, t->k == sva::PFALSE ? AE_STEP_FAIL : AE_STEP_OK, at.start);
+        }
         if (c.coverSeq) {   // every match counts (16.14.3)
             if (dv.matches) ended = true;
             if (dv.matches && !a.hidden) {
                 a.passes += at.count * dv.matches;
+                for (uint64_t n = 0; assertHook() && n < at.count * dv.matches; n++) assertEvent(c.id, AE_SUCCESS, at.start);
                 if (a.passOn) runAction(c.pass, at.count * dv.matches, &c.capSlot, at.caps.get());
             }
             if (t->k == sva::DONE) continue;
         } else if (t->k == sva::PTRUE) {
             a.passes += at.count;
+            for (uint64_t n = 0; assertHook() && n < at.count; n++) assertEvent(c.id, dv.nonvac ? AE_SUCCESS : AE_VACUOUS, at.start);
             expectDone(at.wait, 1);
             if (dv.nonvac ? a.passOn : a.vacOn) runAction(c.pass, at.count, &c.capSlot, at.caps.get());
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            for (uint64_t n = 0; assertHook() && n < at.count; n++) assertEvent(c.id, AE_FAILURE, at.start);
             expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (!assertHook() || n.start == at.start) && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
                 (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait, at.start});
     }
     c.att.swap(next);
     if (ended && c.endSig >= 0) {   // the sequence's end point (16.13.6)
@@ -1248,6 +1325,7 @@ inline vector<Task> concEnd() {
         for (auto& at : c.att)
             if (at.killGen == a.killGen && !sva::endValue(at.t)) {
                 a.fails += at.count;
+                for (uint64_t n = 0; assertHook() && !a.hidden && n < at.count; n++) assertEvent(c.id, AE_FAILURE, at.start);
                 if (a.failOn && c.fail)
                     for (uint64_t n = 0; n < at.count; n++) ts.push_back(startProc(c.fail, make_shared<ProcCtl>()));
             }
@@ -1362,7 +1440,10 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         }
         const Instr& i = p->code[pc];
         g_runLoc = {i.file, i.line};
-        if (g_cov) covHit(i.hits);
+        if (g_cov | g_hook) {
+            if (g_cov) covHit(i.hits);
+            if (i.stmtCb) g_stmtHook(i);
+        }
         switch (i.k) {
             case IK::Assign:
             case IK::Nba: {
@@ -1417,9 +1498,10 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             }
             case IK::ReadMem:
             case IK::WriteMem: {
-                if (i.e) {   // a file name known only at run time: a string variable or expression
+                if (i.e || !i.aidx.empty()) {   // a file name known only at run time, or a part of the memory
                     Instr n = i;
-                    n.fmt = v_str(eval(i.e, rd));
+                    if (i.e) n.fmt = v_str(eval(i.e, rd));
+                    if (!i.aidx.empty() && !memView(n)) { pc++; break; }
                     if (i.k == IK::ReadMem) readMem(n); else writeMem(n);
                 } else if (i.k == IK::ReadMem) readMem(i);
                 else writeMem(i);
@@ -1558,6 +1640,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             }
             case IK::Display:
                 S.printSys(i.fmt, i.args, !i.nonl);
+                if (g_errHook && (i.fmt.rfind("Error: ", 0) == 0 || i.fmt.rfind("Fatal: ", 0) == 0)) g_errHook(i.fmt);
                 if (S.finished) goto done;  // task ran; $finish already requested
                 pc++;
                 break;
@@ -1768,7 +1851,10 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
     if (g_cov) covHit(p->code[0].hits);   // the clock wait this function stands for
     while (pc < end) {
         const Instr& i = p->code[pc];
-        if (g_cov) covHit(i.hits);
+        if (g_cov | g_hook) {
+            if (g_cov) covHit(i.hits);
+            if (i.stmtCb) g_stmtHook(i);
+        }
         switch (i.k) {
             case IK::Nba: {
                 Val v = eval(i.e, rd);
