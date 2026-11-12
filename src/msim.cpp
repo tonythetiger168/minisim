@@ -36,6 +36,9 @@
 //   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
 //   -xrun, -irun     take the rest of the command line as xrun / irun options
 //                    (also when msim runs as xrun, irun or xmverilog): docs/XRUN.md
+//   -profile [<file>] time every process and region and write a report
+//                    (default simprofile.txt): busiest processes, time per
+//                    instance, file and kind. Runs the interpreter on one thread.
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -1735,6 +1738,7 @@ static void usage() {
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
                  "  -xrun ...      the rest is an xrun / irun command line (also when run as xrun or irun)\n"
                  "  -elab          stop after elaboration, before the run\n"
+                 "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -1940,6 +1944,11 @@ int main(int argc, char** argv) {
         if (a == "-saif") {
             std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
             saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
+            continue;
+        }
+        if (a == "-profile") {   // profile.hpp
+            prof::P().on = true;
+            if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".txt")) prof::P().path = argv[++i];
             continue;
         }
         if (a == "-cov") {
@@ -2381,8 +2390,26 @@ int main(int argc, char** argv) {
     if ((!sdfRequests().empty() || sdfAtRunTime()) && !gateRecs().empty()) staticComb = staticSeq = false;
     // Paths, SDF and gate delays (30-32) act on drivers; tran and net kinds
     // resolve them: those designs keep every driver.
+    // $dumpports (21.7.4.3) tells which side of a port drives it: every
+    // continuous driver keeps its slot, and its instance is recorded.
+    bool dumpPorts = false;
+    {
+        auto scan = [&](const Prog& p) {
+            for (const Instr& i : p.code) if (i.k == IK::Dump && i.dcmd == DC_PORTS) dumpPorts = true;
+        };
+        for (auto& lp : lowered.procs) scan(lp.prog);
+        for (auto& sp : lowered.subs) if (sp) scan(*sp);
+        if (dumpPorts)
+            for (auto& lp : lowered.procs)
+                for (const Instr& i : lp.prog.code) {
+                    if (i.k != IK::Assign || i.drv < 0 || i.sig < 0 || (size_t)i.sig >= S.sigs.size()) continue;
+                    auto& v = S.drvScope[i.sig];
+                    if (v.size() <= (size_t)i.drv) v.resize((size_t)i.drv + 1);
+                    v[(size_t)i.drv] = lp.scope;
+                }
+    }
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
-        gateRecs().empty())
+        gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
@@ -2394,6 +2421,10 @@ int main(int argc, char** argv) {
     }
     if (compiled && timingChecksOn() && !timingChecks().empty()) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
+    if (compiled && prof::P().on) {
+        std::cerr << "msim: -compile: -profile times the interpreter; using it\n";
         compiled = false;
     }
     bool anyReactive = false;
@@ -2454,6 +2485,29 @@ int main(int argc, char** argv) {
     // core, unless -threads was given.
     if (!threadsGiven && threads > 1 && vcdPath && vcdPath->ends_with(".fst")) threads--;
     S.threads = threads;
+    // msim -profile: one thread, so that the times add up, and one entry per process.
+    auto profEnt = [&](const LoweredProc& lp) {
+        std::string loc;
+        for (const Instr& in : lp.prog.code)
+            if (in.line) {
+                loc = (in.file < g_covFiles.size() ? g_covFiles[in.file] : std::string("?")) + ":" + std::to_string(in.line);
+                break;
+            }
+
+        // The kinds as they are written in the source.
+        static const std::map<std::string, std::string> kinds = {
+            {"Always", "always"}, {"AlwaysFF", "always_ff"}, {"AlwaysComb", "always_comb"},
+            {"AlwaysLatch", "always_latch"}, {"Initial", "initial"}, {"Final", "final"},
+            {"init", "initializers"}, {"assign", "assign"}};
+        auto k = kinds.find(lp.kind);
+        std::string top = S.vcdTop.empty() ? std::string("top") : S.vcdTop;
+        if (!lp.port.empty()) {   // a port connection: counted in the instance whose port it is
+            size_t dot = lp.port.rfind('.');
+            return prof::P().add("port " + lp.port.substr(dot + 1), top + "." + lp.port.substr(0, dot), "");
+        }
+        return prof::P().add(k == kinds.end() ? lp.kind : k->second, lp.scope.empty() ? top : top + "." + lp.scope, loc);
+    };
+    if (prof::P().on) { S.threads = 1; staticPart = false; prof::P().t0 = std::chrono::steady_clock::now(); }
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
         if (pl.rank[i] >= 0) byRank[pl.rank[i]] = (int)i;
@@ -2462,6 +2516,7 @@ int main(int argc, char** argv) {
         const Prog* pr = &lowered.procs[i].prog;
         for (auto& in : pr->code)
             if (in.k == IK::Assert && !pr->combCtl) pr->combCtl = std::make_shared<ProcCtl>();
+        if (prof::P().on) prof::P().combEnt.push_back(profEnt(lowered.procs[i]));
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
@@ -2476,10 +2531,17 @@ int main(int argc, char** argv) {
             t.h.resume();
             continue;
         }
-        if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
-        else if (lowered.procs[i].program >= 0 || lowered.procs[i].reactive)
-            S.spawn(programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial"));
-        else S.spawn(process(&lowered.procs[i].prog));
+        int pe = prof::P().on ? profEnt(lowered.procs[i]) : -1;
+        if (pl.seq[i]) {
+            if (pe >= 0) prof::P().seqEnt.push_back(pe);
+            S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
+            continue;
+        }
+        Task t = lowered.procs[i].program >= 0 || lowered.procs[i].reactive
+                     ? programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial")
+                     : process(&lowered.procs[i].prog);
+        if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
+        S.spawn(t);
     }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
@@ -2496,6 +2558,10 @@ int main(int argc, char** argv) {
     startTimingChecks();
     if (!pathRecs().empty() || !S.icDelay.empty() || !S.shadowOf.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty() || pl.cyclic) staticPart = false;
+    if (vpi::st().active && g_cov) {   // vpi_control(vpiCoverageSave, ...) writes the database now (40.5.1)
+        static const LowerResult* lw = &lowered;
+        covSaveHook() = [](const std::string& path) { return writeCoverage(path, *lw, S.vcdTop); };
+    }
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
@@ -2527,5 +2593,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!writeSaif()) return 1;
+    if (prof::P().on && !prof::P().write(S.now, S.timescale)) {
+        std::cerr << "msim: cannot write " << prof::P().path << "\n";
+        return 1;
+    }
     return S.exitCode;
 }

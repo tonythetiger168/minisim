@@ -38,6 +38,29 @@ oversubscribe the machine. Runs start longest first, by the times in the
 last results.json. ``-compile`` runs every test with msim -compile in its own
 build directory under <o>/build, so the seeds of a test share one C++ build.
 
+Farm. ``-farm`` sends every run to a compute farm instead of this machine:
+
+    -farm lsf                 bsub -K            (IBM Spectrum LSF, OpenLava)
+    -farm slurm               srun               (Slurm)
+    -farm sge                 qsub -sync y       (Grid Engine and its forks)
+    -farm ssh:hostA,hostB*8   ssh, at most one run (or N with *N) per host
+    -farm 'cmd:mysub --name {name} --cpus {cpus} {job}'      any other launcher
+
+``-farm-opts=...`` goes to the submit command as it is (queue, project,
+memory: ``'-farm-opts=-q regress -M 8G'``, with the ``=``). ``-farm-cpus N`` asks for N
+cores per run and gives msim -threads N (default 1). ``-j`` is then the
+number of jobs in flight (default 64), not a number of local CPUs. The
+output directory and the sources must be on a filesystem the farm hosts
+share at the same path: each run is a script ``job.sh`` in its run
+directory that writes ``job.out``, ``job.err`` and ``job.rc`` there, and
+mregress reads them when the launcher returns. A job that never ran (the
+launcher failed, the host died: no ``job.rc``) is submitted again, up to
+``-farm-retries`` times (default 2), and then fails with a reason that
+starts with ``farm:``. ``@timeout`` is enforced on the farm host and does
+not count queue time; ``-farm-wait SEC`` bounds queue plus run time
+(default a day), after which the job is cancelled (bkill / scancel / qdel).
+``-farm-dry`` prints the submit command of every run and runs nothing.
+
 ``-plan FILE`` scores a verification plan against the regression when it is
 done (mplan report: features, history, failure triage) into ``<o>/plan``.
 """
@@ -48,6 +71,7 @@ import glob
 import html
 import json
 import os
+import queue
 import random
 import re
 import shlex
@@ -316,7 +340,127 @@ def signature(reason):
     return s[:160]
 
 
-def run_one(job, sim, exe, outdir, timeout_default, common, cov=False, threads=0, compiled=False):
+class Farm:
+    """A compute farm: wraps a run's job script in the site's submit command.
+
+    The submit command has to block until the job is done (bsub -K, srun,
+    qsub -sync y, ssh); the job's output and exit status come back through
+    files in the run directory, on the shared filesystem."""
+
+    KINDS = ("lsf", "slurm", "sge", "ssh", "cmd")
+
+    def __init__(self, spec, opts="", cpus=1, retries=2, wait=86400.0):
+        kind, _, rest = spec.partition(":")
+        if kind not in self.KINDS or (kind in ("ssh", "cmd")) != bool(rest):
+            raise ValueError("-farm is lsf, slurm, sge, ssh:HOST[*N],... or cmd:TEMPLATE")
+        self.kind, self.opts, self.cpus, self.retries, self.wait = kind, opts.strip(), max(1, cpus), max(0, retries), wait
+        self.template = rest if kind == "cmd" else ""
+        self.dry = False
+        self.hosts = None
+        self.slots = 0
+        if kind == "ssh":
+            self.hosts = queue.Queue()
+            for h in rest.split(","):
+                host, _, n = h.strip().partition("*")
+                if not host or (n and not n.isdigit()):
+                    raise ValueError(f"-farm ssh: bad host {h!r} (expected HOST or HOST*N)")
+                for _ in range(int(n) if n else 1):
+                    self.hosts.put(host)
+                    self.slots += 1
+
+    def submit(self, name, job, host=None):
+        """The shell command that runs the job script and returns when it is done."""
+        q, o = shlex.quote, (" " + self.opts if self.opts else "")
+        if self.kind == "lsf":
+            span = ' -R "span[hosts=1]"' if self.cpus > 1 else ""
+            return f"bsub -K -J {q(name)} -n {self.cpus}{span} -o /dev/null -e /dev/null{o} sh {q(job)}"
+        if self.kind == "slurm":
+            return f"srun --quiet -J {q(name)} -n 1 -c {self.cpus}{o} sh {q(job)}"
+        if self.kind == "sge":
+            pe = f" -pe smp {self.cpus}" if self.cpus > 1 else ""
+            return f"qsub -sync y -b y -N {q(name)}{pe} -o /dev/null -e /dev/null{o} sh {q(job)}"
+        if self.kind == "ssh":
+            return f"ssh -o BatchMode=yes{o} {q(host or 'HOST')} sh {q(job)}"
+        fields = {"name": q(name), "cpus": str(self.cpus), "job": f"sh {q(job)}", "dir": q(os.path.dirname(job))}
+        try:
+            text = self.template.format(**fields)
+        except (KeyError, IndexError, ValueError) as e:
+            raise ValueError(f"-farm cmd: bad template ({e}); the fields are {{job}} {{name}} {{cpus}} {{dir}}")
+        return text if "{job}" in self.template else f"{text} {fields['job']}"
+
+    def cancel(self, name):
+        cmd = {"lsf": f"bkill -J {shlex.quote(name)}", "slurm": f"scancel -n {shlex.quote(name)}",
+               "sge": f"qdel {shlex.quote(name)}"}.get(self.kind)
+        if cmd:
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+    def run(self, name, rundir, base, cmd, timeout):
+        """Run cmd on the farm. Returns (exit status, stdout, stderr, timed out, seconds, farm error or '')."""
+        job = os.path.join(rundir, "job.sh")
+        rc_file = os.path.join(rundir, "job.rc")
+        limit = max(1, int(timeout + 0.999))
+        q = shlex.quote
+        with open(job, "w") as f:
+            # The time limit runs on the farm host, so time in the queue does not count.
+            f.write(f"#!/bin/sh\ncd {q(base)} || exit 126\nt0=$(date +%s.%N)\n"
+                    f"if command -v timeout >/dev/null 2>&1; then lim='timeout -s KILL {limit}'; else lim=; fi\n"
+                    f"$lim sh -c {q(cmd)} > {q(os.path.join(rundir, 'job.out'))} 2> {q(os.path.join(rundir, 'job.err'))}\nrc=$?\n"
+                    f"echo \"$rc $t0 $(date +%s.%N)\" > {q(rc_file)}.tmp && mv {q(rc_file)}.tmp {q(rc_file)}\n")
+        why = ""
+        for attempt in range(self.retries + 1):
+            for stale in ("job.rc", "job.out", "job.err"):
+                try:
+                    os.remove(os.path.join(rundir, stale))
+                except OSError:
+                    pass
+            host = self.hosts.get() if self.hosts is not None else None
+            start = time.time()
+            try:
+                p = subprocess.Popen(self.submit(name, job, host), shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    said, _ = p.communicate(timeout=self.wait)
+                except subprocess.TimeoutExpired:
+                    self.cancel(name)
+                    try:
+                        os.killpg(p.pid, 9)
+                    except OSError:
+                        pass
+                    p.communicate()
+                    return 1, "", "", False, time.time() - start, f"farm: no result after {self.wait:g}s (queued or running); cancelled"
+            finally:
+                if host is not None:
+                    self.hosts.put(host)
+            # The status file can lag behind the launcher on a network filesystem.
+            for _ in range(50):
+                if os.path.exists(rc_file):
+                    break
+                time.sleep(0.1)
+            try:
+                with open(rc_file) as f:
+                    words = f.read().split()
+                rc = int(words[0])
+                try:        # GNU date gives nanoseconds; elsewhere %N stays as text
+                    secs = float(words[2]) - float(words[1])
+                except (ValueError, IndexError):
+                    secs = float(int(words[2].split(".")[0]) - int(words[1].split(".")[0])) if len(words) > 2 else time.time() - start
+            except (OSError, ValueError, IndexError):
+                last = said.decode("utf-8", errors="replace").strip().splitlines()[-1:] or [""]
+                why = f"farm: the job did not run (submit exit {p.returncode}{', ' + last[0][:200] if last[0] else ''})"
+                continue
+            out = err = ""
+            try:
+                with open(os.path.join(rundir, "job.out"), encoding="utf-8", errors="replace") as f:
+                    out = f.read()
+                with open(os.path.join(rundir, "job.err"), encoding="utf-8", errors="replace") as f:
+                    err = f.read()
+            except OSError:
+                pass
+            return rc, out, err, rc == 137 and secs >= limit - 1, max(secs, 0.0), ""
+        return 1, "", "", False, time.time() - start, why + (f", {self.retries + 1} attempts" if self.retries else "")
+
+
+def run_one(job, sim, exe, outdir, timeout_default, common, cov=False, threads=0, compiled=False, farm=None):
     test, seed = job
     if sim in test.opts.get("skip", "").split(","):
         return {"test": test.name, "seed": seed, "status": "skip", "reason": f"@skip={test.opts['skip']}",
@@ -336,6 +480,25 @@ def run_one(job, sim, exe, outdir, timeout_default, common, cov=False, threads=0
     with open(os.path.join(rundir, "cmd.sh"), "w") as f:
         f.write(f"#!/bin/sh\ncd {shlex.quote(test.base)}\n{cmd}\n")
     timeout = float(test.opts.get("timeout", timeout_default))
+    if farm is not None:
+        name = f"mregress_{os.getpid()}_{os.path.basename(rundir)}"
+        if farm.dry:
+            return {"test": test.name, "seed": seed, "status": "skip", "reason": "-farm-dry", "seconds": 0.0, "log": "",
+                    "cmd": farm.submit(name, os.path.join(rundir, "job.sh"))}
+        rc, text, etext, timed_out, secs, why = farm.run(name, rundir, test.base, cmd, timeout)
+        with open(os.path.join(rundir, "sim.log"), "w", encoding="utf-8") as f:
+            f.write(text)
+            if etext:
+                f.write("\n---- stderr ----\n" + etext)
+        if why:
+            status, reason = "fail", why
+        else:
+            status, reason = check(test, args, rc, text.splitlines(), etext.splitlines(), timed_out, sim)
+        if applies(test, "xfail", sim) and not why:
+            status, reason = ("xfail", test.opts["xfail"]) if status == "fail" else ("xpass", "passes: remove @xfail / //! xfail")
+        return {"test": test.name, "seed": seed, "status": status, "reason": reason,
+                "seconds": round(secs, 3), "log": os.path.relpath(os.path.join(rundir, "sim.log"), outdir),
+                "cmd": cmd}
     start = time.time()
     timed_out = False
     # Run in the test list's directory, like the spec suite, so relative
@@ -461,6 +624,13 @@ def main(argv=None):
                     help="msim only: run every test with msim -compile (one C++ build per test, reused by its seeds)")
     ap.add_argument("-cov", action="store_true",
                     help="msim only: collect coverage per run and merge it into <o>/cov.json (see mcov)")
+    ap.add_argument("-farm", metavar="KIND",
+                    help="run on a farm: lsf, slurm, sge, ssh:HOST[*N],... or cmd:TEMPLATE ({job} {name} {cpus} {dir})")
+    ap.add_argument("-farm-opts", default="", metavar="OPTS", help="extra options for the submit command (queue, memory, ...); write -farm-opts='-q regress'")
+    ap.add_argument("-farm-cpus", type=int, default=1, metavar="N", help="cores per farm job, and msim -threads (default 1)")
+    ap.add_argument("-farm-retries", type=int, default=2, metavar="N", help="submit a job that never ran again, up to N times (default 2)")
+    ap.add_argument("-farm-wait", type=float, default=86400, metavar="SEC", help="cancel a job with no result after SEC seconds (default 86400)")
+    ap.add_argument("-farm-dry", action="store_true", help="print each run's submit command and run nothing")
     ap.add_argument("-plan", metavar="FILE",
                     help="score this verification plan against the results (mplan report) into <o>/plan")
     ap.add_argument("-version", action="version", version=f"mregress {VERSION}")
@@ -483,9 +653,20 @@ def main(argv=None):
     if not shutil.which(tool):
         ap.error(f"{tool} not found (put it on PATH or pass -exe)")
 
+    farm = None
+    if a.farm:
+        try:
+            farm = Farm(a.farm, a.farm_opts, a.farm_cpus, a.farm_retries, a.farm_wait)
+            farm.submit("check", "job.sh")
+        except ValueError as e:
+            ap.error(str(e))
+        farm.dry = a.farm_dry
+    elif a.farm_dry or a.farm_opts:
+        ap.error("-farm-dry and -farm-opts need -farm")
     logical, physical = cpu_topology()
     if a.j <= 0:
-        a.j = logical
+        # On a farm -j is the number of jobs in flight: the scheduler owns the cores.
+        a.j = (farm.slots or 64) if farm else logical
     # Each msim run may start its own worker threads. Give each run its share
     # of the physical cores: two busy threads on the hyper-threads of one
     # core slow each other down, and more threads than cores only wait.
@@ -515,7 +696,7 @@ def main(argv=None):
         last = {}
     if last:
         jobs.sort(key=lambda j: -last.get(j[0].name, float("inf")))
-    threads = a.threads or max(1, physical // max(1, min(a.j, len(jobs))))
+    threads = a.threads or (farm.cpus if farm else max(1, physical // max(1, min(a.j, len(jobs)))))
     os.makedirs(outdir, exist_ok=True)
 
     results, start = [], time.time()
@@ -523,15 +704,21 @@ def main(argv=None):
         if a.cov and sim != "msim":
             ap.error("-cov needs -sim msim")
         futs = [pool.submit(run_one, j, sim, exe, outdir, a.timeout, settings.get("common", []), a.cov,
-                            threads if sim == "msim" else 0, a.compile) for j in jobs]
+                            threads if sim == "msim" else 0, a.compile, farm) for j in jobs]
         for fut in cf.as_completed(futs):
             r = fut.result()
             results.append(r)
+            if farm is not None and farm.dry:
+                continue
             if not a.q:
                 tag = r["status"].upper()
                 extra = f"  {r['reason']}" if r["status"] in ("fail", "xpass", "xfail") else ""
                 print(f"{tag}  {r['test']}  seed={r['seed']}  {r['seconds']:.2f}s{extra}", flush=True)
 
+    if farm is not None and farm.dry:
+        for r in sorted(results, key=lambda r: (r["test"], r["seed"])):
+            print(r["cmd"] or f"# {r['test']}: {r['reason']}")
+        return 0
     # A rerun replaces only the runs it repeated; the rest of the record stays.
     redone = {(r["test"], r["seed"]) for r in results}
     results += [r for r in previous if (r["test"], r["seed"]) not in redone]

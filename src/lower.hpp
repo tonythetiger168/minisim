@@ -2021,6 +2021,20 @@ struct Lowerer {
                     continue;
                 }
             }
+            // A whole fixed-size array: the array object (37.19), for
+            // vpi_handle_by_index, vpi_iterate and the value-array calls.
+            if (ValueExpressionBase::isKind(a.kind) && t.isUnpackedArray()) {
+                const Symbol* sym = &a.as<ValueExpressionBase>().symbol;
+                if (auto it = arrMap().find(sym); it != arrMap().end() && !symOverride.count(sym) && !localMap().count(sym)) {
+                    va.kind = VpiArg::Signal;
+                    va.sig = it->second->base;
+                    va.w = it->second->elemW;
+                    va.sgn = it->second->sgn;
+                    va.sym = sym;
+                    site->args.push_back(va);
+                    continue;
+                }
+            }
             va.kind = VpiArg::Value;
             Instr i;
             i.k = IK::Assign;
@@ -3322,7 +3336,7 @@ struct Lowerer {
         std::vector<const slang::ast::Expression*> idx;
         bool constant = true;
     };
-    std::optional<ArrSel> arraySel(const slang::ast::Expression& e) {
+    std::optional<ArrSel> arraySel(const slang::ast::Expression& e, bool partial = false) {
         using namespace slang::ast;
         std::vector<const Expression*> idx;
         const Expression* cur = &e;
@@ -3356,9 +3370,43 @@ struct Lowerer {
         ArrSel s;
         s.a = shape;
         s.idx.assign(idx.rbegin(), idx.rend());
-        if (s.idx.size() != s.a->dims.size()) unsupported("array slice (fewer indices than dimensions)");
+        if (s.idx.size() > s.a->dims.size() || (!partial && s.idx.size() != s.a->dims.size()))
+            unsupported("array slice (fewer indices than dimensions)");
         for (auto* x : s.idx)
             if (!(x->kind == ExpressionKind::IntegerLiteral || x->getConstant())) s.constant = false;
+        return s;
+    }
+    // m[i] of a multidimensional array (7.4.5): the index lists of the
+    // elements of that sub-array, in row-major order. The given indices come
+    // first; the rest run over the remaining dimensions, left to right.
+    std::vector<std::vector<E>> subArrayIdx(const ArrSel& s) {
+        std::vector<E> pre;
+        for (auto* x : s.idx) pre.push_back(expr(*x));
+        size_t fixed = s.idx.size(), nd = s.a->dims.size();
+        int64_t cnt = 1;
+        for (size_t d = fixed; d < nd; d++) { auto [l, r] = s.a->dims[d]; cnt *= (l > r ? l - r : r - l) + 1; }
+        std::vector<std::vector<E>> out;
+        for (int64_t k = 0; k < cnt; k++) {
+            std::vector<E> idx = pre;
+            idx.resize(nd);
+            int64_t rest = k;
+            for (size_t d = nd; d-- > fixed;) {
+                auto [l, r] = s.a->dims[d];
+                int64_t n = (l > r ? l - r : r - l) + 1, o = rest % n;
+                rest /= n;
+                idx[d] = konst(make((uint64_t)(l <= r ? l + o : l - o), 0, 32, 0, true));
+            }
+            out.push_back(std::move(idx));
+        }
+        return out;
+    }
+    std::optional<ArrSel> subArraySel(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        if (x.kind != ExpressionKind::ElementSelect || !x.type->isUnpackedArray() ||
+            x.type->getCanonicalType().kind != SymbolKind::FixedSizeUnpackedArrayType)
+            return std::nullopt;
+        auto s = arraySel(x, true);
+        if (!s || s->idx.size() >= s->a->dims.size() || s->a->dynElem) return std::nullopt;
         return s;
     }
     // The element values of an unpacked-array value of type t, flattened in
@@ -3381,6 +3429,14 @@ struct Lowerer {
         const Type& et = ft.elementType;
         int64_t n = (int64_t)ft.range.width();
         const Expression& x = peel(x0);
+        if (auto sa = subArraySel(x)) {   // m[i]: a sub-array of a multidimensional array (7.4.5)
+            for (auto& idx : subArrayIdx(*sa)) {
+                auto rd = node(Op::ArrRead, std::move(idx));
+                rd->arr = sa->a;
+                out.push_back(rd);
+            }
+            return;
+        }
         if (isDynType(*x.type)) {   // fa = q (7.6): elements left to right; the size is checked by the caller
             const Type& set = x.type->getArrayElementType()->getCanonicalType();
             const Type& ec = et.getCanonicalType();
@@ -3561,6 +3617,26 @@ struct Lowerer {
     bool assignWholeArray(const slang::ast::Expression& l0, const slang::ast::Expression& rhs, bool nba) {
         using namespace slang::ast;
         const Expression& l = peel(l0);
+        if (auto sa = subArraySel(l)) {   // m[i] = ... (7.4.5, 7.6): every element of the sub-array
+            std::vector<E> vals;
+            arrayElems(*l.type, rhs, vals);
+            auto idxs = subArrayIdx(*sa);
+            if (vals.size() != idxs.size()) unsupported("array value with the wrong number of elements");
+            for (auto& v : vals) {   // every value first: m[1] = m[0] then m[0] = m[1] reads before writing
+                if (v->op == Op::Const && !nba) continue;
+                int tmp = fresh(sa->a->elemW);
+                Instr h; h.k = IK::Assign; h.sig = tmp; h.e = v;
+                prog.emit(h);
+                v = ref(tmp, sa->a->sgn);
+            }
+            for (size_t k = 0; k < idxs.size(); k++) {
+                Instr i; i.k = nba ? IK::Nba : IK::Assign;
+                i.sig = sa->a->base; i.arr = sa->a; i.e = vals[k];
+                i.aidx = std::move(idxs[k]);
+                xpDirect(i);
+            }
+            return true;
+        }
         if (classMember(l) && l.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {   // h.a = '{...} (8.4)
             const auto& m = l.as<MemberAccessExpression>();
             const PropSlot* ps = memberSlot(m);
@@ -5026,7 +5102,7 @@ struct Lowerer {
                     if (n < 1 || n > (int64_t)ts.size()) unsupported("production value index out of range");
                     return sized(ref(ts[(size_t)n - 1], e.type->isSigned()), storeW(*e.type), e.type->isSigned(), ctx);
                 }
-                if (int d = dynSig(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key]
+                if (int d = dynValue(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key], a.max()[0]
                     int w = bitsOf(*e.type);
                     needWidth(w);
                     return sized(dynGet(d, e.as<ElementSelectExpression>().selector()), w, e.type->isSigned(), ctx);
@@ -6432,7 +6508,14 @@ struct Lowerer {
                     for (int64_t k = 0; k < dims[dim]; k++) {
                         if (k) fmt += ", ";
                         if (dim + 1 < dims.size()) walk(dim + 1);
-                        else if (flat < el.size()) pfmtSingular(*et, el[flat++], fmt, out);
+                        else if (flat < el.size()) {
+                            E v = el[flat++];
+                            if (v->op == Op::Ref || v->op == Op::ArrRead) {   // an element's raw bits
+                                if (et->isFloating()) v = un(Op::AsReal, v);
+                                else if (et->isString()) v = un(Op::AsStr, v);
+                            }
+                            pfmtSingular(*et, v, fmt, out);
+                        }
                     }
                     fmt += "}";
                 };
@@ -6451,6 +6534,8 @@ struct Lowerer {
                     if (k) fmt += ", ";
                     if (dim + 1 < A.dims.size()) walk(dim + 1);
                     else if (et->isUnpackedStruct() || et->isUnpackedUnion()) pfmtStruct(*et, ref(A.base + flat++), fmt, out);
+                    else if (et->isString()) pfmtSingular(*et, un(Op::AsStr, ref(A.base + flat++)), fmt, out);
+                    else if (et->isFloating()) pfmtSingular(*et, un(Op::AsReal, ref(A.base + flat++)), fmt, out);
                     else pfmtSingular(*et, ref(A.base + flat++, A.sgn), fmt, out);
                 }
                 fmt += "}";
@@ -7125,15 +7210,54 @@ struct Lowerer {
             // slang binds the memory as an output argument: an assignment to it.
             const Expression* mp = &peel(*args[1]);
             if (mp->kind == ExpressionKind::Assignment) mp = &peel(mp->as<AssignmentExpression>().left());
+            // A partly indexed memory (mem[1], mem[1][2:5]) names the lesser
+            // dimensioned array left over (21.4): the indexes go in aidx, and
+            // a slice of the last dimension given adds its left and right
+            // bounds there too (pdown set).
+            std::vector<E> sub;
+            bool slice = false;
+            if (mp->kind == ExpressionKind::RangeSelect) {
+                auto& rs = mp->as<RangeSelectExpression>();
+                E l = expr(rs.left()), r = expr(rs.right());
+                if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                    // [b +: w] covers b .. b+w-1 in the dimension's direction; [b -: w] b-w+1 .. b
+                    auto& vt = rs.value().type->getCanonicalType();
+                    bool asc = vt.kind == SymbolKind::FixedSizeUnpackedArrayType &&
+                               vt.as<FixedSizeUnpackedArrayType>().range.left <
+                                   vt.as<FixedSizeUnpackedArrayType>().range.right;
+                    auto w = rs.right().getConstant();
+                    if (!w || !w->isInteger()) unsupported("$readmem target slice width");
+                    int64_t wn = w->integer().as<int64_t>().value_or(1);
+                    E b = resize(l, 64, rs.left().type->isSigned(), true);
+                    E d = konst(make((uint64_t)(wn - 1), 0, 64, 0, true));
+                    E lo = rs.getSelectionKind() == RangeSelectionKind::IndexedUp ? b : bin(Op::Sub, b, d);
+                    E hi = bin(Op::Add, lo, d);
+                    l = asc ? lo : hi; r = asc ? hi : lo;
+                }
+                sub.push_back(l); sub.push_back(r);
+                slice = true;
+                mp = &peel(rs.value());
+            }
+            std::vector<E> idx;
+            while (mp->kind == ExpressionKind::ElementSelect) {
+                auto& es = mp->as<ElementSelectExpression>();
+                if (!es.value().type->getCanonicalType().isUnpackedArray()) break;
+                idx.insert(idx.begin(), expr(es.selector()));
+                mp = &peel(es.value());
+            }
             const Expression& mem = *mp;
             const Symbol* msym = nullptr;
             if (mem.kind == ExpressionKind::NamedValue) msym = &mem.as<NamedValueExpression>().symbol;
             else if (mem.kind == ExpressionKind::ArbitrarySymbol) msym = mem.as<ArbitrarySymbolExpression>().symbol;
-            if (!msym) unsupported("$readmem target that is not a whole memory");
+            if (!msym) unsupported("$readmem target that is not a memory");
             auto ap = arrFind(msym);
             if (!ap) unsupported("$readmem target that is not an unpacked array");
             if (ap->dynElem) unsupported("$readmem into an array of containers");
+            if (idx.size() >= ap->dims.size()) unsupported("$readmem target that is a single word");
             Instr i; i.k = n[1] == 'r' ? IK::ReadMem : IK::WriteMem;
+            i.aidx = idx;
+            for (auto& x : sub) i.aidx.push_back(x);
+            i.pdown = slice;
             if (fname) i.fmt = *fname;
             else i.e = strOf(*args[0]);
             i.arr = ap;
@@ -8399,6 +8523,7 @@ struct Lowerer {
     }
     void stmt(const slang::ast::Statement& s) {
         struct Depth { int& d; Depth(int& x) : d(x) { d++; } ~Depth() { d--; } } depth(stmtDepth);
+        if (g_cov && !prog.inst) prog.inst = instanceAround(scope);   // statement coverage per instance (40)
         // Each statement's instructions carry its line; a block's own
         // instructions keep the line of the statement around them.
         SrcLoc savedLoc = g_emitLoc;
@@ -9243,6 +9368,23 @@ inline const slang::ast::Symbol* sharedPortVar(const slang::ast::PortSymbol& ps,
     return in;
 }
 
+// Ports whose internal and external connections are both nets of one
+// user-defined nettype are merged into a single simulated net (23.3.3.7.2),
+// whatever the direction: its resolution function sees the drivers of both
+// sides. Returns the internal net when they can be merged.
+inline const slang::ast::Symbol* nettypeCollapses(const slang::ast::PortSymbol& ps, const slang::ast::Symbol& actual) {
+    using namespace slang::ast;
+    const Symbol* in = ps.internalSymbol;
+    if (!in || in->kind != SymbolKind::Net || actual.kind != SymbolKind::Net) return nullptr;
+    const NetType& a = in->as<NetSymbol>().netType;
+    const NetType& b = actual.as<NetSymbol>().netType;
+    if (a.netKind != NetType::UserDefined || b.netKind != NetType::UserDefined) return nullptr;
+    if (&a != &b && (a.getResolutionFunction() != b.getResolutionFunction() ||
+                     !a.getDataType().isMatching(b.getDataType())))
+        return nullptr;
+    return in;
+}
+
 // An inout port whose actual is a whole net of the same width and kind is
 // the same net as its internal net (23.3.3.1). Returns the internal net when
 // the two can share one signal.
@@ -9748,6 +9890,23 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
         initStatic(v);
     }
+    // `output logic q = 5` (23.2.2.3): slang keeps the initializer on the
+    // port; it initializes the port's variable like a declaration's.
+    void handle(const slang::ast::PortSymbol& ps) {
+        using namespace slang::ast;
+        if (ps.direction != ArgumentDirection::Out || !ps.internalSymbol ||
+            ps.internalSymbol->kind != SymbolKind::Variable)
+            return;
+        const Expression* e = ps.getInitializer();
+        if (!e) return;
+        const auto& v = ps.internalSymbol->as<VariableSymbol>();
+        if (!sigmap.count(&v) || arrMap().count(&v) || dynMap().count(&v)) Lowerer::unsupported("this output port initializer");
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        init->setScope(ps.getParentScope());
+        Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
+        i.e = resize(init->expr(*e), storeW(v.getType()), e->type->isSigned(), v.getType().isSigned());
+        init->prog.emit(i);
+    }
     // A class's static property (8.9) starts like a module variable.
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) initStatic(p);
@@ -9871,6 +10030,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         PathRec base;
         base.inst = Lowerer::instPath(tp.getParentScope());
         base.unit = d.ticksPerUnit();
+        base.sym = &tp;
         if (const Expression* c = tp.getConditionExpr()) {
             base.hasCond = true;
             base.cond = termText(*c);
@@ -10247,6 +10407,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.e = els[(size_t)k];
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay());
+                assignGate(ca, i);
                 finishAssign(L, i);
             }
             g_emitLoc = {};
@@ -10270,6 +10431,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.e = slice(resize(L.expr(a.right()), w, false, false), hi, lo);
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay());
+                assignGate(ca, i);
                 finishAssign(L, i);
             }
             g_emitLoc = {};
@@ -10281,8 +10443,26 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.e = lw.expr(a.right());
         lw.setScope(ca.getParentScope());
         i.dly = lw.delays3(ca.getDelay());
+        assignGate(ca, i);
         finishAssign(lw, i);
         g_emitLoc = {};
+    }
+    // A delayed continuous assignment drives through a gateRecs() entry, so
+    // vpi_put_delays can change its delay at run time (38.10).
+    void assignGate(const slang::ast::ContinuousAssignSymbol& ca, Instr& i) {
+        if (i.dly.empty()) return;
+        auto [it, fresh] = assignGates().try_emplace(&ca, (int)gateRecs().size());
+        if (fresh) {
+            GateRec gr;
+            gr.inst = Lowerer::instPath(ca.getParentScope());
+            gr.name = "$assign";
+            std::vector<uint64_t> d3 = i.dly;
+            if (d3.size() > 3) d3.resize(3);
+            std::vector<uint64_t> d12 = expand12(d3);
+            std::copy(d12.begin(), d12.end(), gr.d);
+            gateRecs().push_back(std::move(gr));
+        }
+        i.gate = it->second;
     }
 
     // buf/not/and/nand/or/nor/xor/xnor and pullup/pulldown drive the same way
@@ -10698,12 +10878,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 }
                 continue;
             }
-            if (!ext || ps.isNullPort) continue;
+            if (!ext || ps.isNullPort || Lowerer::peel(*ext).kind == ExpressionKind::EmptyArgument) continue;   // u(a, ): left open (23.3.2)
             Lowerer::lastLoc() = ext->sourceRange.start().valid() ? ext->sourceRange.start() : inst.location;
             // A ref port or a container port joined to a whole variable shares
             // that variable's signal (see sharedPortVar).
             if (ps.internalSymbol && aliasOf().count(ps.internalSymbol) && aliasOf().at(ps.internalSymbol) != ps.internalSymbol &&
-                (ps.internalSymbol->kind != SymbolKind::Net || Lowerer::isDynType(ps.getType())))
+                (ps.internalSymbol->kind != SymbolKind::Net || Lowerer::isDynType(ps.getType()) ||
+                 ps.internalSymbol->as<NetSymbol>().netType.netKind == NetType::UserDefined))
                 continue;
             if (ps.direction == ArgumentDirection::Ref) Lowerer::unsupported("ref port connected to anything but a whole variable");
             if (ps.internalSymbol && Lowerer::isDynType(ps.getType()))
@@ -10729,6 +10910,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
             if (ps.direction != ArgumentDirection::Out && ps.direction != ArgumentDirection::InOut)
                 Lowerer::unsupported("ref port");
+            // An open output with an initializer (`output logic q = 5`): slang
+            // gives the initializer as the connection; nothing is connected.
+            if (ext->kind != ExpressionKind::Assignment && ps.direction == ArgumentDirection::Out &&
+                ext == ps.getInitializer())
+                continue;
             if (ext->kind != ExpressionKind::Assignment)
                 Lowerer::unsupported("output port connection");
             const auto& asg = ext->as<AssignmentExpression>();
@@ -11377,6 +11563,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     portRecs().clear();
     instCells().clear();
     gateRecs().clear();
+    assignGates().clear();
     pulseStyles().clear();
     outLinks().clear();
     inLinks().clear();
@@ -11459,6 +11646,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     // each way, would hold the last driven value for ever.
                     const Symbol* in = inoutCollapses(c->port.as<PortSymbol>(), ns);
                     if (!in) in = sharedPortVar(c->port.as<PortSymbol>(), ns);
+                    if (!in) in = nettypeCollapses(c->port.as<PortSymbol>(), ns);
                     if (in) {
                         if (!up.count(&ns)) up[&ns] = &ns;
                         if (!up.count(in)) up[in] = in;

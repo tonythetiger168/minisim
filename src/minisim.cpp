@@ -46,6 +46,7 @@ using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
 #include "cpu.hpp"
+#include "profile.hpp"
 #include "sva.hpp"
 #include "sva_engine.hpp"
 #include "clocking.hpp"
@@ -563,6 +564,17 @@ struct Sim {
                 combBatch.push_back(r);
             }
             combVals.resize(combBatch.size());
+            if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
+                for (int r : combBatch) {
+                    uint64_t t = prof::Profiler::nowNs();
+                    curComb = r;
+                    if (combs[r].compute) combs[r].commit(combs[r].ctx, combs[r].compute(combs[r].ctx));
+                    else combs[r].fn(combs[r].ctx);
+                    curComb = -1;
+                    prof::P().charge(prof::P().combEnt[r], prof::Profiler::nowNs() - t);
+                }
+                continue;
+            }
             parallelTuned(combTune, combBatch.size(), [&](size_t k) {
                 const Comb& c = combs[combBatch[k]];
                 if (c.compute) combVals[k] = c.compute(c.ctx);
@@ -762,6 +774,14 @@ struct Sim {
     void runSeqs() {
         if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
+        if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
+            for (size_t k = 0; k < seqq.size(); k++) {
+                uint64_t t = prof::Profiler::nowNs();
+                seqBufs[k].clear();
+                seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+                prof::P().charge(prof::P().seqEnt[seqq[k]], prof::Profiler::nowNs() - t);
+            }
+        } else
         parallelTuned(seqTune, seqq.size(), [&](size_t k) {
             seqBufs[k].clear();
             seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
@@ -2167,10 +2187,11 @@ struct Sim {
     }
     // Extended VCD (21.7.3): one file per $dumpports call, holding the ports
     // of the modules it names. Values are compared at the end of each time
-    // slot, so a run without $dumpports pays nothing. Which side drives a
-    // port is not looked at: an input shows D/U/N/Z, an output L/H/X/T and
-    // an inout 0/1/?/F, each bit at strong strength (or highz for z).
-    struct EvcdPort { int sig; char dir; string id; };
+    // slot, so a run without $dumpports pays nothing.
+    struct EvcdPort { int sig; char dir; string id; string inst; };
+    // The instance each continuous driver of a signal belongs to ("" the
+    // top), filled when the design calls $dumpports.
+    std::unordered_map<int, vector<string>> drvScope;
     struct Evcd {
         string path;
         std::ofstream f;
@@ -2180,16 +2201,98 @@ struct Sim {
         uint64_t limit = 0, lastT = ~0ULL;
     };
     std::deque<Evcd> evcds;
+    // One bit of a port (21.7.4.3.1): which side drives it, with what. The
+    // drivers inside the port's module are the DUT (output) side, the rest
+    // the test fixture (input) side. A port with no continuous drivers (a
+    // variable) shows its value as its direction says.
+    struct Side { int n = 0; int s0 = 0, s1 = 0; };   // active drivers, strongest 0 and 1
+    static char sideVal(const Side& d) {
+        if (!d.n) return 'z';
+        return d.s0 > d.s1 ? '0' : d.s1 > d.s0 ? '1' : 'x';
+    }
+    static int sideStr(const Side& d, char v) { return v == '0' ? d.s0 : v == '1' ? d.s1 : std::max(d.s0, d.s1); }
     string evcdValue(const EvcdPort& p, bool asX) {
-        const int w = sigs[p.sig].w;
+        const auto& g = sigs[p.sig];
+        const int w = g.w;
         string bits((size_t)w, 'x');
-        if (!asX) putBits(bits.data(), sigs[p.sig].val, w);
+        if (!asX) putBits(bits.data(), g.val, w);
+        const vector<string>* sc = nullptr;
+        if (!asX && !g.drv.empty())
+            if (auto it = drvScope.find(p.sig); it != drvScope.end()) sc = &it->second;
+        vector<string> dbits;
+        vector<char> inside;
+        if (sc) {
+            for (size_t d = 0; d < g.drv.size(); d++) {
+                string b((size_t)w, 'z');
+                putBits(b.data(), g.drv[d].v, w);
+                dbits.push_back(std::move(b));
+                const string& o = d < sc->size() ? (*sc)[d] : string();
+                inside.push_back(p.inst.empty() || o == p.inst || (o.size() > p.inst.size() && o.compare(0, p.inst.size(), p.inst) == 0 &&
+                                                                   o[p.inst.size()] == '.'));
+            }
+        }
         string v = "p", s0, s1;
-        for (char c : bits) {
-            int k = c == '0' ? 0 : c == '1' ? 1 : c == 'z' ? 3 : 2;
-            v += (p.dir == 'i' ? "DUNZ" : p.dir == 'o' ? "LHXT" : "01?F")[k];
-            s0 += k == 0 || k == 2 ? '6' : '0';
-            s1 += k == 1 || k == 2 ? '6' : '0';
+        for (int k = 0; k < w; k++) {
+            char c = bits[(size_t)k];
+            if (!sc) {   // no drivers to look at: the value, as the direction says
+                int x = c == '0' ? 0 : c == '1' ? 1 : c == 'z' ? 3 : 2;
+                v += (p.dir == 'i' ? "DUNZ" : p.dir == 'o' ? "LHXT" : "01?F")[x];
+                s0 += x == 0 || x == 2 ? '6' : '0';
+                s1 += x == 1 || x == 2 ? '6' : '0';
+                continue;
+            }
+            Side in, out;
+            for (size_t d = 0; d < dbits.size(); d++) {
+                char b = dbits[d][(size_t)k];
+                int a0 = b == '0' || b == 'x' ? g.drv[d].s0 : 0, a1 = b == '1' || b == 'x' ? g.drv[d].s1 : 0;
+                if (!a0 && !a1) continue;
+                Side& sd = inside[d] ? out : in;
+                sd.n++;
+                sd.s0 = std::max(sd.s0, a0);
+                sd.s1 = std::max(sd.s1, a1);
+            }
+            char st;
+            int str0 = 0, str1 = 0;
+            auto strengthOf = [&](char val, int s) {
+                if (val == '0') str0 = s;
+                else if (val == '1') str1 = s;
+                else if (val == 'x') str0 = str1 = s;
+            };
+            char iv = sideVal(in), ov = sideVal(out);
+            if (p.dir != 'b' || !in.n || !out.n) {
+                // One side drives (or the direction fixes the side): its value,
+                // d/u or l/h when two or more drivers are active.
+                bool dut = p.dir == 'o' || (p.dir == 'b' && out.n && !in.n);
+                bool fixture = p.dir == 'i' || (p.dir == 'b' && in.n && !out.n);
+                Side all = in;
+                all.n += out.n;
+                all.s0 = std::max(in.s0, out.s0);
+                all.s1 = std::max(in.s1, out.s1);
+                char val = all.n ? (c == 'z' ? sideVal(all) : c) : 'z';
+                int x = val == '0' ? 0 : val == '1' ? 1 : val == 'z' ? 3 : 2;
+                bool many = all.n >= 2 && x < 2;
+                if (fixture) st = many ? "du"[x] : "DUNZ"[x];
+                else if (dut) st = many ? "lh"[x] : "LHXT"[x];
+                else {   // an inout nobody drives now: F if a side has no driver at all, f if both are three-stated
+                    bool inDrv = false, outDrv = false;
+                    for (char d : inside) (d ? outDrv : inDrv) = true;
+                    st = x == 3 ? (inDrv && outDrv ? 'f' : 'F') : "01?F"[x];
+                }
+                strengthOf(val, sideStr(all, val));
+            } else if (iv == ov && iv != 'x') {   // both drive the same value (21.7.4.3.2)
+                bool sIn = sideStr(in, iv) >= STR_PULL, sOut = sideStr(out, ov) >= STR_PULL;
+                if (sIn == sOut) { st = iv; strengthOf(iv, std::max(sideStr(in, iv), sideStr(out, ov))); }
+                else if (sIn) { st = iv == '0' ? 'd' : 'u'; strengthOf(iv, sideStr(in, iv)); }
+                else { st = iv == '0' ? 'l' : 'h'; strengthOf(iv, sideStr(out, ov)); }
+            } else {   // a conflict
+                st = iv == '0' ? (ov == '1' ? 'A' : 'a')
+                   : iv == '1' ? (ov == '0' ? 'B' : 'b')
+                   : ov == '0' ? 'C' : ov == '1' ? 'c' : '?';
+                strengthOf('x', std::max(std::max(in.s0, in.s1), std::max(out.s0, out.s1)));
+            }
+            v += st;
+            s0 += (char)('0' + str0);
+            s1 += (char)('0' + str1);
         }
         return v + " " + s0 + " " + s1 + " " + p.id + "\n";
     }
@@ -2289,7 +2392,9 @@ struct Sim {
                     scopes += (scopes.empty() ? "" : ", ") + scope;
                     defs << "$scope module " << scope << " $end\n";
                 }
-                EvcdPort p{it->second, fld[0][0], "<" + std::to_string(e.ports.size())};
+                EvcdPort p{it->second, fld[0][0], "<" + std::to_string(e.ports.size()), ""};
+                // The instance as signals name it: the path without the top module.
+                if (size_t d = fld[1].find('.'); d != string::npos) p.inst = fld[1].substr(d + 1);
                 defs << "$var port " << (vec ? "[" + fld[3] + ":" + fld[4] + "]" : string("1")) << " " << p.id << " " << fld[2] << " $end\n";
                 e.ports.push_back(p);
             }
@@ -2427,8 +2532,14 @@ struct Sim {
         listenTo(s, e);
         holdFlags(s, h);
         applyHold(s);
+        if (vpiHoldCb) vpiHoldCb(s, force, true, hi, lo);
     }
     void holdOff(int s, bool force, int hi = -1, int lo = 0) {
+        bool had = holds.count(s) > 0;
+        holdOffAll(s, force, hi, lo);
+        if (had && vpiHoldCb) vpiHoldCb(s, force, false, hi, lo);
+    }
+    void holdOffAll(int s, bool force, int hi, int lo) {
         auto it = holds.find(s);
         if (it == holds.end()) return;
         Hold& h = it->second;
@@ -2508,7 +2619,8 @@ struct Sim {
         }
     }
     void covToggle(int s, const Val& o, const Val& n) {
-        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0) covFsm(fsmOf[s], o, n);
+        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0 && !(g_covStop & 4)) covFsm(fsmOf[s], o, n);
+        if (g_covStop & 2) return;
         if (togRise.size() <= (size_t)s) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
         int w = sigs[s].w;
         auto& R = togRise[s];
@@ -2531,9 +2643,14 @@ struct Sim {
     // callbacks of a signal; vpiRegion runs the callbacks of a point in the
     // time slot (VR_*) and says whether any ran. vpiAt counts the
     // cbAfterDelay callbacks due at each time, so that slot is not skipped.
-    enum { VR_START, VR_RW, VR_RO };
+    // vpiHoldCb reports a force / release (force) or procedural assign /
+    // deassign of signal s (bits hi:lo, hi < 0 the whole signal).
+    // vpiNbaPend: cbNBASynch callbacks wait for the NBA region of this slot.
+    enum { VR_START, VR_RW, VR_RO, VR_NBA };
     void (*vpiChange)(int) = nullptr;
     bool (*vpiRegion)(int) = nullptr;
+    void (*vpiHoldCb)(int s, bool force, bool on, int hi, int lo) = nullptr;
+    bool vpiNbaPend = false;
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         Sig& g = sigs[s];
@@ -2615,6 +2732,20 @@ struct Sim {
 
     void runObserved();
     void matureFinal();
+    // msim -profile (profile.hpp): a process resumed and timed, and the NBA region.
+    void profResume(Handle h) {
+        int e = prof::P().ofHandle(h.address());
+        uint64_t t = prof::Profiler::nowNs();
+        h.resume();
+        prof::P().charge(e, prof::Profiler::nowNs() - t);
+        if (h.done()) prof::P().byHandle.erase(h.address());   // its frame may be reused
+    }
+    void timedNba() {
+        if (!prof::P().on) [[likely]] { applyNba(); return; }
+        uint64_t t = prof::Profiler::nowNs();
+        applyNba();
+        prof::P().chargeRegion(prof::Profiler::NBA, prof::Profiler::nowNs() - t);
+    }
     // The regions after NBA (4.5), once the active set is empty: observed,
     // the reactive set, postponed, and the end-of-slot $past shift. False
     // when all are empty and time can advance. `rare` is set whenever work is
@@ -2622,7 +2753,14 @@ struct Sim {
     // or programs pays one flag test per pass.
     bool slotTail() {
         if (vpiRegion && vpiRegion(VR_RW)) return true;   // cbReadWriteSynch (38.36.2)
-        if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) { runObserved(); return true; }   // observed (4.4.2.5)
+        if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) {   // observed (4.4.2.5)
+            if (prof::P().on) [[unlikely]] {
+                uint64_t t = prof::Profiler::nowNs();
+                runObserved();
+                prof::P().chargeRegion(prof::Profiler::OBSERVED, prof::Profiler::nowNs() - t);
+            } else runObserved();
+            return true;
+        }   // observed (4.4.2.5)
         if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
             // Once the reactive set starts, it runs until it is empty, and
             // only then does the active set run again (4.5).
@@ -2630,7 +2768,8 @@ struct Sim {
                 if (!reactive.empty()) {                   // reactive (4.4.2.6)
                     Handle h = reactive.front(); reactive.pop_front();
                     region = R_REACTIVE;
-                    if (!h.done()) h.resume();
+                    if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
+                    else if (!h.done()) h.resume();
                     region = R_ACTIVE;
                     if (!oneShot.empty())
                         if (auto it = oneShot.find(h.address()); it != oneShot.end()) {
@@ -2644,16 +2783,18 @@ struct Sim {
                 } else if (!reNbaq.empty()) {              // re-NBA
                     nbaRun.clear();
                     nbaRun.swap(reNbaq);
-                    applyNba();
+                    timedNba();
                 } else break;
             }
             return true;
         }
         if (!postq.empty() || !defFin.empty()) {           // postponed ($strobe, $monitor, assert final)
             region = R_POSTPONED;
+            uint64_t pt = prof::P().on ? prof::Profiler::nowNs() : 0;
             matureFinal();
             region = R_ACTIVE;
             drainPost();
+            if (pt) prof::P().chargeRegion(prof::Profiler::POSTPONED, prof::Profiler::nowNs() - pt);
             return true;
         }
         if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
@@ -2819,7 +2960,8 @@ struct Sim {
             for (;;) {                                         // one time slot
                 if (!active.empty()) {                         // active
                     Handle h = active.front(); active.pop_front();
-                    if (!h.done()) h.resume();
+                    if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
+                    else if (!h.done()) h.resume();
                 } else if (!seqq.empty()) {                    // clocked processes, one parallel batch
                     runSeqs();
                 } else if (!combq.empty()) {                   // levelized combinational logic
@@ -2827,11 +2969,13 @@ struct Sim {
                 } else if (!inactive.empty()) {                // inactive (#0)
                     for (auto h : inactive) active.push_back(h);
                     inactive.clear();
-                } else if (!nbaq.empty()) {                    // NBA
+                } else if (!nbaq.empty() || vpiNbaPend) {      // NBA
+                    if (vpiNbaPend && vpiRegion(VR_NBA)) continue;   // cbNBASynch first (38.36.2)
+                    if (nbaq.empty()) continue;
                     // Swap, not move: both buffers keep their capacity across slots.
                     nbaRun.clear();
                     nbaRun.swap(nbaq);
-                    applyNba();
+                    timedNba();
                 } else if (rare || !postq.empty()) {           // observed, reactive set, postponed
                     if (!slotTail()) break;                    // then, and only then, time advances
                 } else break;
