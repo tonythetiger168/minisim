@@ -46,6 +46,9 @@ struct Clock {
     bool generated = false;
     std::string masterClock;   // -master_clock
     std::vector<Obj> masterPins;  // -source
+    double period = 0;         // create_clock -period; 0 when not given
+    double divideBy = 1, multiplyBy = 1;  // create_generated_clock
+    bool edges = false;        // -edges: the period is not a plain ratio
 };
 
 struct ClockGroups {
@@ -270,6 +273,18 @@ private:
         c.generated = gen;
         for (auto& p : a.pos)
             for (auto& o : objects(p, false)) c.sources.push_back(o);
+        auto num = [&](const char* o, double& v) {
+            if (!a.has(o)) return;
+            char* end = nullptr;
+            std::string t = a.get(o);
+            double d = std::strtod(t.c_str(), &end);
+            if (end == t.c_str() || *end || !(d > 0)) error(w[0] + ": " + o + " " + t + ": expected a positive number");
+            v = d;
+        };
+        num("-period", c.period);
+        num("-divide_by", c.divideBy);
+        num("-multiply_by", c.multiplyBy);
+        c.edges = a.has("-edges");
         c.name = a.get("-name");
         if (c.name.empty()) {
             if (c.sources.empty()) error(w[0] + ": a clock with no source needs -name");
