@@ -7210,15 +7210,54 @@ struct Lowerer {
             // slang binds the memory as an output argument: an assignment to it.
             const Expression* mp = &peel(*args[1]);
             if (mp->kind == ExpressionKind::Assignment) mp = &peel(mp->as<AssignmentExpression>().left());
+            // A partly indexed memory (mem[1], mem[1][2:5]) names the lesser
+            // dimensioned array left over (21.4): the indexes go in aidx, and
+            // a slice of the last dimension given adds its left and right
+            // bounds there too (pdown set).
+            std::vector<E> sub;
+            bool slice = false;
+            if (mp->kind == ExpressionKind::RangeSelect) {
+                auto& rs = mp->as<RangeSelectExpression>();
+                E l = expr(rs.left()), r = expr(rs.right());
+                if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                    // [b +: w] covers b .. b+w-1 in the dimension's direction; [b -: w] b-w+1 .. b
+                    auto& vt = rs.value().type->getCanonicalType();
+                    bool asc = vt.kind == SymbolKind::FixedSizeUnpackedArrayType &&
+                               vt.as<FixedSizeUnpackedArrayType>().range.left <
+                                   vt.as<FixedSizeUnpackedArrayType>().range.right;
+                    auto w = rs.right().getConstant();
+                    if (!w || !w->isInteger()) unsupported("$readmem target slice width");
+                    int64_t wn = w->integer().as<int64_t>().value_or(1);
+                    E b = resize(l, 64, rs.left().type->isSigned(), true);
+                    E d = konst(make((uint64_t)(wn - 1), 0, 64, 0, true));
+                    E lo = rs.getSelectionKind() == RangeSelectionKind::IndexedUp ? b : bin(Op::Sub, b, d);
+                    E hi = bin(Op::Add, lo, d);
+                    l = asc ? lo : hi; r = asc ? hi : lo;
+                }
+                sub.push_back(l); sub.push_back(r);
+                slice = true;
+                mp = &peel(rs.value());
+            }
+            std::vector<E> idx;
+            while (mp->kind == ExpressionKind::ElementSelect) {
+                auto& es = mp->as<ElementSelectExpression>();
+                if (!es.value().type->getCanonicalType().isUnpackedArray()) break;
+                idx.insert(idx.begin(), expr(es.selector()));
+                mp = &peel(es.value());
+            }
             const Expression& mem = *mp;
             const Symbol* msym = nullptr;
             if (mem.kind == ExpressionKind::NamedValue) msym = &mem.as<NamedValueExpression>().symbol;
             else if (mem.kind == ExpressionKind::ArbitrarySymbol) msym = mem.as<ArbitrarySymbolExpression>().symbol;
-            if (!msym) unsupported("$readmem target that is not a whole memory");
+            if (!msym) unsupported("$readmem target that is not a memory");
             auto ap = arrFind(msym);
             if (!ap) unsupported("$readmem target that is not an unpacked array");
             if (ap->dynElem) unsupported("$readmem into an array of containers");
+            if (idx.size() >= ap->dims.size()) unsupported("$readmem target that is a single word");
             Instr i; i.k = n[1] == 'r' ? IK::ReadMem : IK::WriteMem;
+            i.aidx = idx;
+            for (auto& x : sub) i.aidx.push_back(x);
+            i.pdown = slice;
             if (fname) i.fmt = *fname;
             else i.e = strOf(*args[0]);
             i.arr = ap;
