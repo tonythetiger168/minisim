@@ -41,11 +41,14 @@ set(MINISIM_CORE_HEADERS
     sdf.hpp
     sdf_annotate.inc
     specify.hpp
+    tcl.hpp
     sva.hpp
     sva_engine.hpp
     tchk.hpp
     tchk.inc
+    tcl.hpp
     upf.hpp
+    upf_vct.hpp
     upf_rt.inc
     vpi.inc
     wave_reader.hpp)
