@@ -1878,7 +1878,7 @@ def rank_main(a):
 
 COMPAT_ALIASES = {"urg": "synopsys", "imc": "cadence", "vcover": "siemens"}
 COMPAT_NAMES = {"synopsys": "synopsys", "snps": "synopsys", "cadence": "cadence", "cdns": "cadence",
-                "siemens": "siemens", "mentor": "siemens", "questa": "siemens"}
+                "siemens": "siemens", "mentor": "siemens"}
 # Options with no meaning here, for every vendor (licence queues, 32/64 bit).
 COMPAT_IGNORED = {"-full64", "-licqueue", "-64bit", "-64", "-32", "-nocopyright", "-batch", "-nolog", "-nostdout"}
 
