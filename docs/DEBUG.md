@@ -148,6 +148,63 @@ A read of one field, or of fixed bits, follows only that part. For
 bits last changed (not the time another field moved) and only the assignments
 that write them. The same holds for `q[3:0]`, in the tool and in the page.
 
+## State machines
+
+    mdebug design.sv -top tb -fsm                      # every state machine
+    mdebug design.sv -top tb -vcd run.vcd -fsm tb.u -at 40
+
+`-fsm` lists the state machines of the design, or those under an instance, or
+one state register. They come from the extractor that `msim -cov` and mlint
+use (`src/fsm_extract.hpp`), so the three tools agree on what a state machine
+is. Each one is shown with its states (the reset state marked) and its
+transitions with the line that makes each:
+
+    tb.u.state  (ctrl, 2 bits, 4 states)  fsm.sv:8
+      states: IDLE=0(reset) RUN=1 WAIT=2 FAIL=3
+      IDLE -> RUN  fsm.sv:15  taken 1 time, first @25
+      RUN -> FAIL  fsm.sv:16  never taken
+      state FAIL never entered
+      @40: WAIT  (since 35)  after IDLE@0 RUN@25
+
+With a waveform it also says how often each transition ran and when first,
+which never ran, which states were never entered, the state at `-at T` with
+the states before it, a transition that ran but is not in the source's list,
+and a value that is not a state. In the page, selecting a state register
+draws its state diagram: the state at the cursor is marked, transitions that
+ran are bright, and an arrow opens its source line.
+
+## Scripts and other programs
+
+    mdebug design.sv -top tb -vcd run.vcd -script queries.txt
+    mdebug design.sv -top tb -vcd run.vcd -script -          # commands on the standard input
+
+`-script` loads the design and the waveform once, then runs one command per
+line and answers each with one line of JSON, so a script, a test or an AI
+agent can ask many questions of one process. Lines that start with `#` are
+skipped. The exit status is 1 when a command failed.
+
+| Command | Answer |
+|---|---|
+| `drivers SIG`, `loads SIG` | `drivers` / `loads`: `file`, `line`, `text`, `kind`, `when`, `target` (and `control` for a load) |
+| `value SIG [T]` | `value` (`8'h43`), `bits`, `since`, at T or at the end |
+| `changes SIG [T0 [T1]]` | `changes`: `[time, bits]` pairs, at most 10000, then `more` is true |
+| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]` | `text`: the lines the option of the same name prints |
+| `scopes`, `signals [SCOPE]` | the instances; the signals (directly inside SCOPE) |
+| `end` | `end` time and `timescale` of the waveform |
+| `help`, `quit` | the command list; stop |
+
+    {"cmd":"value tb.u.state 40","ok":true,"signal":"tb.u.state","time":40,"value":"2'h2","bits":"10","since":35}
+    {"cmd":"value nope","ok":false,"error":"no signal 'nope' in the design"}
+
+`tools/mdebug_api.py` wraps this for Python (installed under
+`share/minisim/python`):
+
+    from mdebug_api import Mdebug
+    with Mdebug(["design.sv", "-top", "tb"], wave="run.vcd") as d:
+        print(d.value("tb.u.state", 40)["value"])
+        for drv in d.drivers("tb.u.state"):
+            print(drv["file"], drv["line"], drv["text"])
+
 ## Memories
 
 msim leaves unpacked arrays out of the waveform unless asked:
