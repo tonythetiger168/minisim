@@ -60,7 +60,7 @@ using Handle = coroutine_handle<>;
 struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; uint8_t fl = 0; uint8_t p0 = 2; uint64_t at = ~0ULL; };  // p0, at: bit 0 before the last change and its time (msim -xprop edges)  // fl: SF_HELD / SF_LISTEN (force, 10.6)  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
-struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
+struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; bool late = false; };
 
 // A process: a coroutine that starts suspended and is owned by the Sim.
 struct Task {
@@ -304,6 +304,7 @@ struct Wheel {
 struct Sim {
     vector<Sig> sigs;
     vector<vector<Waiter>> waiters;                  // dynamic sensitivity
+    vector<Handle> lateBuf;                          // set(): woken always blocks, queued last
     vector<Handle> all;                              // owned coroutines
     // Assertion action blocks (16.14.3) not yet run: most finish on their
     // first resume and are freed then, so a pass action that runs on every
@@ -2721,18 +2722,28 @@ struct Sim {
         // Wake matching waiters and compact the rest in place (no allocation).
         auto& ws = waiters[s];
         size_t keep = 0;
+        // An always woken at the top of its body (its sensitivity list) runs
+        // after the processes this event resumes in mid-body: an initial
+        // past a wait, a task, a fork branch. 4.7 leaves the order open;
+        // this is the order of other simulators, and testbenches that set a
+        // signal on a clock edge from an initial rely on it.
+        size_t nLate = 0;
         for (size_t j = 0; j < ws.size(); j++) {
             Waiter& w = ws[j];
             if (w.fired && *w.fired) continue;  // stale: sibling event already woke it
             if (w.e == ANY || (w.e == POS && pos) || (w.e == NEG && neg)) {
                 if (w.fired) *w.fired = true;
-                active.push_back(w.h);
+                if (w.late) {
+                    if (nLate == lateBuf.size()) lateBuf.push_back(w.h); else lateBuf[nLate] = w.h;
+                    nLate++;
+                } else active.push_back(w.h);
             } else {
                 if (keep != j) ws[keep] = std::move(w);
                 keep++;
             }
         }
         ws.erase(ws.begin() + (ptrdiff_t)keep, ws.end());
+        for (size_t j = 0; j < nLate; j++) active.push_back(lateBuf[j]);
         if ((size_t)s < combOf.size())
             for (int r : combOf[s])
                 if (r != curComb) {
@@ -3079,15 +3090,16 @@ struct ToReactive {
     void await_resume() const {}
 };
 struct Wait {
-    int sig; Edge e;
+    int sig; Edge e; bool late = false;   // late: an always at its sensitivity list (Sim::set)
     bool await_ready() const { return false; }
-    void await_suspend(Handle h) const { S.waiters[sig].push_back({h, e}); }
+    void await_suspend(Handle h) const { S.waiters[sig].push_back({h, e, nullptr, late}); }
     void await_resume() const {}
 };
 // @(e1 or e2 or ...): resumes once, on whichever event happens first.
 // `ev` points at the instruction's event list, which outlives the wait.
 struct WaitAny {
     const vector<pair<int, Edge>>* ev;
+    bool late = false;
     bool await_ready() const { return false; }
     void await_suspend(Handle h) const {
         auto token = make_shared<bool>(false);
@@ -3098,7 +3110,7 @@ struct WaitAny {
             // them whenever the list doubles, so it stays bounded.
             if (ws.size() >= 16 && (ws.size() & (ws.size() - 1)) == 0)
                 std::erase_if(ws, [](const Waiter& w) { return w.fired && *w.fired; });
-            ws.push_back({h, e, token});
+            ws.push_back({h, e, token, late});
         }
     }
     void await_resume() const {}

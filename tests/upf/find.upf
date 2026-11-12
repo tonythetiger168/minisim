@@ -1,0 +1,63 @@
+# find_objects (IEEE 1801-2024 6.33): the power intent of gating.upf with
+# its domains and strategies found in the design instead of named. msim
+# must print gating.out. The design is dut (set_design_top): instance
+# u_core of module core, whose outputs cnt q hi lat and inputs clk rst_n d.
+upf_version 4.0
+set_design_top dut
+
+proc expect {what got want} {
+    if {$got ne $want} { error "find_objects $what: got {$got}, want {$want}" }
+}
+# instances: by name, by module, leaf only, none
+expect inst      [find_objects . -pattern u_*]                         u_core
+expect model     [find_objects . -pattern core -object_type model]     u_core
+expect leaf      [find_objects . -pattern * -leaf_only]                u_core
+expect non_leaf  [find_objects . -pattern * -non_leaf]                 {}
+expect regexp    [find_objects . -pattern {^u_c.r} -regexp]            u_core
+expect exact     [find_objects . -pattern U_CORE -exact -ignore_case]  u_core
+# ports of the design top and of the core, by direction
+expect top_ports [lsort [find_objects . -pattern *_en -object_type port]]          {iso_en sw_en}
+expect core_out  [find_objects u_core -pattern * -object_type port -direction out] {u_core/cnt u_core/q u_core/hi u_core/lat}
+expect core_in   [find_objects u_core -pattern * -object_type port -direction in] {u_core/clk u_core/rst_n u_core/d}
+expect nets      [find_objects . -pattern cnt -object_type net -transitive]          {cnt u_core/cnt}
+
+foreach i [find_objects . -pattern * -object_type inst] {
+    create_power_domain PD_[string toupper [string range $i 2 end]] -elements $i
+}
+create_power_domain PD_TOP -include_scope
+
+foreach s {VDD VSS} {
+    create_supply_port $s
+    create_supply_net $s
+    connect_supply_net $s -ports $s
+}
+create_supply_net VDD_CORE
+expect supply_nets [lsort [find_objects . -pattern VDD* -object_type supply_net]] {VDD VDD_CORE}
+expect supply_in   [find_objects . -pattern * -object_type supply_port -direction in] {VDD VSS}
+
+create_supply_set SS_AON -function {power VDD} -function {ground VSS}
+create_supply_set SS_CORE -function {power VDD_CORE} -function {ground VSS}
+associate_supply_set SS_AON -handle PD_TOP.primary
+associate_supply_set SS_CORE -handle PD_CORE.primary
+
+create_power_switch SW_CORE \
+    -output_supply_port {vout VDD_CORE} \
+    -input_supply_port {vin VDD} \
+    -control_port {en sw_en} \
+    -ack_port {ack ack {en}} \
+    -on_state {on vin {en}} \
+    -off_state {off {!en}}
+
+# the outputs of the core, split by the clamp they need
+foreach {k v} {cnt 0 q 0 hi 1 lat latch} { set clamp($k) $v }
+foreach {k v} {0 ISO_0 1 ISO_1 latch ISO_L} { set name($k) $v }
+set by(0) {}; set by(1) {}; set by(latch) {}
+foreach p [find_objects u_core -pattern * -object_type port -direction out] {
+    lappend by($clamp([lindex [split $p /] end])) $p
+}
+foreach k {0 1 latch} {
+    set_isolation $name($k) -domain PD_CORE -applies_to outputs -elements $by($k) \
+        -isolation_supply SS_AON -clamp_value $k -isolation_signal iso_en -isolation_sense high
+}
+set_level_shifter LS_IN -domain PD_CORE -applies_to inputs \
+    -elements [find_objects u_core -pattern d -object_type port -direction in]

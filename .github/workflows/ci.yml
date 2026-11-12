@@ -57,13 +57,6 @@ jobs:
           if [ "$APT_OK" = 1 ]; then sudo apt-get install -y ngspice
           else echo "::warning::no apt mirror: mspice tests run without the ngspice comparison"; fi
 
-      # A one-node Slurm, so mregress -farm slurm runs on a real scheduler
-      # (test mregress_slurm). Without it that test skips.
-      - name: Start a one-node Slurm (mregress -farm test)
-        if: env.APT_OK == '1'
-        continue-on-error: true
-        run: sudo timeout 300 apt-get install -y slurm-wlm munge && sudo timeout 120 sh tests/regress/slurm_up.sh
-
       - name: Configure, build, and test
         run: CXX=g++ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 
@@ -145,6 +138,13 @@ jobs:
         run: |
           pip install --user yowasp-yosys && echo "$HOME/.local/bin" >> "$GITHUB_PATH" || true
           pip install --user mtkahypar || true
+
+      # A one-node Slurm, so mregress -farm slurm runs on a real scheduler
+      # (test mregress_slurm). Without it that test skips.
+      - name: Start a one-node Slurm (mregress -farm test)
+        if: env.APT_OK == '1'
+        continue-on-error: true
+        run: sudo timeout 300 apt-get install -y slurm-wlm munge && sudo timeout 120 sh tests/regress/slurm_up.sh
 
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang

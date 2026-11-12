@@ -853,6 +853,19 @@ struct Lowerer {
     static const slang::ast::Expression& mtmOf(const slang::ast::MinTypMaxExpression& m) {
         return mtmSelect() == 0 ? m.min() : mtmSelect() == 2 ? m.max() : m.typ();
     }
+    // Does e call a task or function of the design (not a system one)?
+    static bool hasUserCall(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        struct V : ASTVisitor<V, VisitFlags::Expressions> {
+            bool hit = false;
+            void handle(const CallExpression& c) {
+                if (!c.isSystemCall()) hit = true;
+                visitDefault(c);
+            }
+        } v;
+        e.visit(v);
+        return v.hit;
+    }
     // Does e read a specparam that an SDF LABEL changed?
     static bool readsLabel(const slang::ast::Expression& e) {
         using namespace slang::ast;
@@ -1817,9 +1830,22 @@ struct Lowerer {
         if (call.thisClass() && !viaVif) unsupported("method call on a non-class");
         if (sub->lay) return emitAutoCall(*sub, args, wantValue);
 
+        // f(1, g(2)) where g calls f: the call in a later argument would
+        // overwrite the formals set before it, so then every value goes
+        // through a temporary first and the formals are set after.
+        bool staged = false;
+        for (size_t n = 1; n < args.size() && !staged; n++) staged = hasUserCall(*args[n]);
+        std::vector<std::pair<int, int>> stagedSet;   // (formal, temporary)
         for (size_t n = 0; n < args.size(); n++) {
             const auto& formal = sub->args[n];
             const Expression& a = *args[n];
+            if (staged && !formal.arr && formal.dir == ArgumentDirection::In && a.kind != ExpressionKind::EmptyArgument) {
+                int tmp = fresh(formal.w);
+                Instr i; i.k = IK::Assign; i.sig = tmp; i.e = expr(a);
+                prog.emit(i);
+                stagedSet.push_back({formal.sig, tmp});
+                continue;
+            }
             if (formal.dir == ArgumentDirection::Ref) {
                 Instr i; i.k = IK::Assign; i.sig = formal.sig; i.e = addrOf(a);
                 prog.emit(i);
@@ -1851,6 +1877,7 @@ struct Lowerer {
             }
         }
 
+        for (auto [f, t] : stagedSet) { Instr i; i.k = IK::Assign; i.sig = f; i.e = ref(t); prog.emit(i); }
         Instr c;
         c.k = IK::Call;
         c.callee = sub->prog;
@@ -3261,6 +3288,9 @@ struct Lowerer {
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
         if (const Expression* c = modportConn(e)) return expr(*c, ctx);
+        if (!exprOverride.empty())
+            if (auto ov = exprOverride.find(&e); ov != exprOverride.end())
+                return sized(ref(ov->second, e.type->isSigned()), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
         if (e.kind == ExpressionKind::NamedValue && !labelled().empty())   // a LABEL'd specparam (32.4.3)
             if (auto lv = labelled().find(&e.as<NamedValueExpression>().symbol); lv != labelled().end()) {
                 if (e.type->isFloating()) return konst(mkreal(lv->second));
@@ -6807,6 +6837,9 @@ struct Lowerer {
     // ---------- constrained randomization (18) ----------
     std::unordered_map<const slang::ast::Symbol*, Val> constVals;     // foreach indices of a constraint, unrolled
     std::unordered_map<const slang::ast::Symbol*, int> symOverride;   // with {...}: the caller's properties, copied
+    // with {...}: an element of the caller's array or container, by an index
+    // the caller knows (addrs[i]), read into a signal before the call.
+    std::unordered_map<const slang::ast::Expression*, int> exprOverride;
     using BeforeList = std::vector<std::pair<std::vector<E>, std::vector<E>>>;
     std::unordered_map<const slang::ast::Symbol*, E> exprBind;
     // a.sum(), a.sum() with (expr) ... of a fixed-size array (7.12.3): the
@@ -7113,10 +7146,55 @@ struct Lowerer {
             // The caller's own properties named in with {...} are copied
             // first: inside the call `this` is the object being randomized.
             if (info && info->inlineConstraints && savedCls) {
+                auto inObjScope = [&](const Symbol* sym) {
+                    const Scope* sc = sym->getParentScope();
+                    for (ClassInfo* c = wc; c; c = c->base)
+                        if (sc == static_cast<const Scope*>(c->ty)) return true;
+                    return false;
+                };
+                // addrs[i] with addrs the caller's array or container and i
+                // known to the caller (a local, a loop variable, a scalar
+                // property): read the element now, into a signal.
+                struct Sel : ASTVisitor<Sel, VisitFlags::Expressions> {
+                    std::vector<const ElementSelectExpression*> sels;
+                    void handle(const ElementSelectExpression& x) { sels.push_back(&x); visitDefault(x); }
+                } sv;
+                info->inlineConstraints->visit(sv);
+                std::unordered_set<const Expression*> covered;   // the array names read this way
+                for (const ElementSelectExpression* x : sv.sels) {
+                    if (x->value().kind != ExpressionKind::NamedValue) continue;
+                    const Symbol* arr = &x->value().as<NamedValueExpression>().symbol;
+                    auto pm = propMap().find(arr);
+                    if (pm == propMap().end() || pm->second.kind == 0 || inObjScope(arr)) continue;
+                    const Type& et = x->type->getCanonicalType();
+                    if (!et.isIntegral() || isHandleType(*x->type)) continue;
+                    struct Refs : ASTVisitor<Refs, VisitFlags::Expressions> {
+                        std::vector<const Symbol*> syms;
+                        void handle(const NamedValueExpression& n) { syms.push_back(&n.symbol); }
+                    } rv;
+                    x->selector().visit(rv);
+                    bool callerOnly = true;
+                    for (const Symbol* r : rv.syms) {
+                        if (inObjScope(r)) { callerOnly = false; break; }
+                        // a constraint's own foreach iterator has no signal yet
+                        if (r->kind == SymbolKind::Iterator && sigFind(r) < 0) { callerOnly = false; break; }
+                        auto rp = propMap().find(r);
+                        if (rp != propMap().end() && rp->second.kind != 0) { callerOnly = false; break; }
+                    }
+                    if (!callerOnly) continue;
+                    int t = fresh(storeW(*x->type));
+                    Instr a; a.k = IK::Assign; a.sig = t;
+                    a.e = expr(*x);
+                    prog.emit(a);
+                    exprOverride[x] = t;
+                    covered.insert(&x->value());
+                }
                 struct V : ASTVisitor<V, VisitFlags::Expressions> {
+                    const std::unordered_set<const Expression*>* skip;
                     std::vector<const Symbol*> found;
-                    void handle(const NamedValueExpression& n) { found.push_back(&n.symbol); }
+                    void handle(const NamedValueExpression& n) { if (!skip->count(&n)) found.push_back(&n.symbol); }
                 } v;
+                v.skip = &covered;
                 info->inlineConstraints->visit(v);
                 for (const Symbol* sym : v.found) {
                     auto pm = propMap().find(sym);
@@ -7192,6 +7270,7 @@ struct Lowerer {
         if (info && info->inlineConstraints) constraintItems(*info->inlineConstraints, nullptr, rc->items, rc->before);
         curClass = savedCls;
         symOverride = std::move(savedOv);
+        exprOverride.clear();
         i.sig = fresh(32);
         i.rc = rc;
         prog.emit(i);
@@ -11503,6 +11582,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             else lw.prog.emit(waitInstr(rs));
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
+        if (loops && p.procedureKind == ProceduralBlockKind::Always && !lw.prog.code.empty() &&
+            lw.prog.code[0].k == IK::WaitEdge)
+            lw.prog.alwaysTop = true;
         out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind)),
                              curScope, {}, -1,
                              p.procedureKind == ProceduralBlockKind::Initial ? program : -1, checkerDepth > 0});
@@ -12310,6 +12392,21 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
         { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);
+        if (!sub->lay) {   // its static variables: callers are not sensitive to them
+            struct Walk {
+                const std::unordered_map<const slang::ast::Symbol*, int>& sm;
+                std::vector<int>& out;
+                void scope(const slang::ast::Scope& sc) {
+                    for (const auto& m : sc.members()) {
+                        if (m.kind == slang::ast::SymbolKind::Variable || m.kind == slang::ast::SymbolKind::FormalArgument)
+                            if (auto it = sm.find(&m); it != sm.end()) out.push_back(it->second);
+                        if (m.isScope()) scope(m.as<slang::ast::Scope>());
+                    }
+                }
+            } w{sigmap, sub->prog->locals};
+            w.scope(*sub->sym);
+            if (sub->retSig >= 0) sub->prog->locals.push_back(sub->retSig);
+        }
     }
     g_covInst = 0;
     for (Subr* sub : order) patchImplicit(*sub->prog);
