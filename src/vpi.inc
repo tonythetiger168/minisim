@@ -39,7 +39,7 @@ struct Cb;
 // One VPI object. `kind` says which fields are used.
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
-                Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion } kind;
+                Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -47,7 +47,7 @@ struct Obj {
     Val cval;                             // Const, EnumConst: the value
     int64_t left = 0, right = 0;          // Range
     std::vector<int64_t> index;           // Word: its index in each dimension
-    int idx = -1;                         // Systf: systf; Arg: argument; Word / Bit: element index
+    int idx = -1;                         // Systf: systf; Arg: argument; Word / Bit: element index; Fsm, FsmState: the FSM
     const VpiSite* site = nullptr;        // Call, Arg
     const Symbol* sym = nullptr;          // Module: InstanceSymbol; Scope: the scope's symbol; Signal / Param / Port / Word: the symbol
     const Obj* parent = nullptr;          // Word, Bit: the memory or vector; Arg: the call
@@ -90,6 +90,16 @@ struct State {
     std::unordered_map<int, std::vector<Cb*>> assertCbs;   // assertion -> its callbacks (39.4.2)
     std::vector<Cb*> assertSys;                            // callbacks on the assertion system (39.4.1)
     bool assertEnded = false;                              // vpiAssertionSysEnd
+    // Coverage (40): per assertion its attempts, successes, failures, vacuous
+    // successes, disabled and killed attempts; assertions whose counting is
+    // stopped; signal -> its symbol; FSM and FSM state objects.
+    std::vector<std::array<uint64_t, 6>> assertCov;
+    std::vector<char> assertCovOff;
+    bool assertCovAllOff = false;
+    std::unordered_map<int, const Symbol*> sigSym;
+    std::vector<const Prog*> progs;
+    std::unordered_map<int, Obj*> fsmObj;
+    std::map<std::pair<int, size_t>, Obj*> fsmStateObj;
     const VpiSite* cur = nullptr;         // the call whose calltf / compiletf is running
     std::vector<Cb*> start, endCompile, endSim, rw, ro, next;
     std::multimap<uint64_t, Cb*> timed;   // cbAfterDelay, cbAtStartOfSimTime, and delayed synch callbacks
@@ -427,6 +437,12 @@ inline bool isProt(const Obj* o) {
         case Obj::Call:
         case Obj::Arg: p = o->site && o->site->prot; break;
         case Obj::Assertion: p = asserts()[(size_t)o->idx].prot; break;
+        case Obj::Fsm:
+        case Obj::FsmState: {   // the state register's declaration
+            auto it = st().sigSym.find(fsmDefs()[(size_t)o->idx].sig);
+            p = it != st().sigSym.end() && protSym(it->second);
+            break;
+        }
         default: break;
     }
     o->prot = p;
@@ -576,7 +592,7 @@ inline vpiHandle iter(std::vector<vpiHandle> items) {
 // ---- values ----
 inline int64_t sigTicks(const p_vpi_time t, const Obj* o);
 inline Val readObj(const Obj* o) {
-    if (o->kind == Obj::Const || o->kind == Obj::EnumConst) return o->cval;
+    if (o->kind == Obj::Const || o->kind == Obj::EnumConst || o->kind == Obj::FsmState) return o->cval;
     if (o->kind == Obj::Arg && o->site->args[(size_t)o->idx].kind == VpiArg::String) return mkstr(o->site->args[(size_t)o->idx].text);
     if (o->kind == Obj::Arg && o->site->args[(size_t)o->idx].kind == VpiArg::Empty) return make(0, ~0ULL, 1);
     if (o->kind == Obj::Bit) {   // a bit or a part select
@@ -1088,6 +1104,12 @@ inline void onAssert(int id, int ev, uint64_t start) {
         if (ev >= AE_CTL) fireSys(ctlReason(ev - AE_CTL, true));
         return;
     }
+    // Assertion coverage (40.5): an attempt, its outcome. Relaxed atomic
+    // adds: assertions of two processes may end on two worker threads.
+    if ((size_t)id < s.assertCov.size() && !s.assertCovAllOff && !s.assertCovOff[(size_t)id] && ev <= AE_KILLED) {
+        int k = ev == AE_START ? 0 : ev == AE_SUCCESS ? 1 : ev == AE_FAILURE ? 2 : ev == AE_VACUOUS ? 3 : ev == AE_DISABLED ? 4 : ev == AE_KILLED ? 5 : -1;
+        if (k >= 0) __atomic_fetch_add(&s.assertCov[(size_t)id][(size_t)k], 1, __ATOMIC_RELAXED);
+    }
     int reason = 0;
     switch (ev) {
         case AE_START: reason = cbAssertionStart; break;
@@ -1185,6 +1207,265 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
     return 1;
 }
 
+// ---- coverage (40) ----
+// What msim collects with -cov: statements (each source line of a process
+// counts once), toggles (a bit that rose and fell), FSM states; and, always,
+// assertion attempts and outcomes, counted here from the assertion events.
+inline void covInit() {
+    auto& s = st();
+    s.assertCov.assign(asserts().size(), {});
+    s.assertCovOff.assign(asserts().size(), 0);
+    for (auto& [sym, sig] : s.lr->sigOf) s.sigSym.emplace(sig, sym);
+    for (auto& [sym, sh] : arrMap())
+        if (sh && sh->base >= 0 && s.lr->sigOf.count(sym))
+            for (int k = 0; k < sh->count; k++) s.sigSym.emplace(sh->base + k, sym);
+    std::unordered_set<const Prog*> seen;
+    std::function<void(const Prog*)> walk = [&](const Prog* p) {
+        if (!p || !seen.insert(p).second) return;
+        s.progs.push_back(p);
+        for (auto& i : p->code) {
+            if (i.callee) walk(i.callee);
+            for (auto* b : i.branches) walk(b);
+        }
+    };
+    for (auto& p : s.lr->procs) walk(&p.prog);
+    for (auto& p : s.lr->finals) walk(&p.prog);
+    for (auto& p : s.lr->subs) walk(p.get());
+}
+// The instance a signal is declared in.
+inline const InstanceSymbol* sigInst(int sig) {
+    auto it = st().sigSym.find(sig);
+    return it == st().sigSym.end() ? nullptr : instOf(it->second->getParentScope());
+}
+inline Obj* fsmObj(int k) {
+    Obj*& o = st().fsmObj[k];
+    if (!o) {
+        o = mkObj(Obj::Fsm, vpiFsm);
+        o->idx = k;
+        o->sig = fsmDefs()[(size_t)k].sig;
+        o->w = fsmDefs()[(size_t)k].w;
+    }
+    return o;
+}
+inline Obj* fsmStateObj(int k, size_t n) {
+    Obj*& o = st().fsmStateObj[{k, n}];
+    if (!o) {
+        const FsmDef& d = fsmDefs()[(size_t)k];
+        o = mkObj(Obj::FsmState, vpiFsmHandle);
+        o->idx = k;
+        o->pos = n;
+        o->parent = fsmObj(k);
+        o->w = d.w;
+        o->cval = make(d.states[n].first, 0, d.w);
+    }
+    return o;
+}
+inline uint64_t fsmSeenCount(int k, uint64_t v) {
+    if ((size_t)k >= S.fsmSeen.size()) return 0;
+    auto it = S.fsmSeen[(size_t)k].find(v);
+    return it == S.fsmSeen[(size_t)k].end() ? 0 : it->second;
+}
+// Bits of signal `sig` (bits [lo, lo+w)) that rose and fell.
+inline int toggled(int sig, int lo, int w) {
+    if (sig < 0 || (size_t)sig >= S.togRise.size()) return 0;
+    const auto& R = S.togRise[(size_t)sig];
+    const auto& F = S.togFall[(size_t)sig];
+    int n = 0;
+    for (int i = lo; i < lo + w; i++) {
+        size_t q = (size_t)i / 64;
+        if (q < R.size() && q < F.size() && (R[q] >> (i % 64) & 1) && (F[q] >> (i % 64) & 1)) n++;
+    }
+    return n;
+}
+// Statement coverage of an instance (null: the whole design): source lines
+// of its processes that ran, and all of them.
+inline std::pair<int, int> stmtCov(const InstanceSymbol* inst) {
+    std::map<std::pair<uint32_t, uint32_t>, bool> lines;
+    for (const Prog* p : st().progs) {
+        if (inst && p->inst != inst) continue;
+        for (auto& i : p->code)
+            if (i.line) {
+                bool& hit = lines[{i.file, i.line}];
+                hit = hit || i.hits;
+            }
+    }
+    int n = 0;
+    for (auto& [k, h] : lines) n += h;
+    return {n, (int)lines.size()};
+}
+// Toggle coverage of an instance: bits that rose and fell, and all bits.
+inline std::pair<int, int> togCov(const InstanceSymbol* inst) {
+    int n = 0, m = 0;
+    for (size_t g = 0; g < S.sigs.size(); g++) {
+        if (S.sigs[g].hide || (inst && sigInst((int)g) != inst)) continue;
+        n += toggled((int)g, 0, S.sigs[g].w);
+        m += S.sigs[g].w;
+    }
+    return {n, m};
+}
+// FSM state coverage of an instance: states entered, and all states.
+inline std::pair<int, int> fsmCov(const InstanceSymbol* inst) {
+    int n = 0, m = 0;
+    for (size_t k = 0; k < fsmDefs().size(); k++) {
+        if (inst && sigInst(fsmDefs()[k].sig) != inst) continue;
+        for (auto& [v, name] : fsmDefs()[k].states) { m++; n += fsmSeenCount((int)k, v) > 0; }
+    }
+    return {n, m};
+}
+inline bool assertIn(size_t id, const InstanceSymbol* inst) {
+    const AssertInfo& a = asserts()[id];
+    return !a.hidden && (!inst || instOf(static_cast<const Scope*>(a.scope)) == inst);
+}
+// Assertion coverage of an instance: assertions that succeeded (a cover
+// statement: matched), and all assertions.
+inline std::pair<int, int> assertCovOf(const InstanceSymbol* inst) {
+    int n = 0, m = 0;
+    for (size_t k = 0; k < asserts().size(); k++)
+        if (assertIn(k, inst)) { m++; n += k < st().assertCov.size() && st().assertCov[k][1] > 0; }
+    return {n, m};
+}
+inline std::pair<int, int> covOf(int type, const InstanceSymbol* inst) {
+    switch (type) {
+        case vpiStatementCoverage: return stmtCov(inst);
+        case vpiToggleCoverage: return togCov(inst);
+        case vpiFsmStateCoverage: return fsmCov(inst);
+        default: return assertCovOf(inst);
+    }
+}
+inline bool isCovType(int t) {
+    return t == vpiAssertCoverage || t == vpiFsmStateCoverage || t == vpiStatementCoverage || t == vpiToggleCoverage;
+}
+// vpi_get of a coverage property (40.5.2); -1: not one.
+inline int64_t covGet(int prop, const Obj* o) {
+    auto& s = st();
+    bool cov = prop == vpiCovered || prop == vpiCoveredMax || prop == vpiCoveredCount;
+    if (isCovType(prop)) {   // covered items of the type in an instance
+        if (o->kind == Obj::Assertion) return prop == vpiAssertCoverage && s.assertCov[(size_t)o->idx][1] > 0;
+        if (o->kind != Obj::Module) return 0;
+        if (prop != vpiAssertCoverage && !g_cov) return 0;
+        return covOf(prop, &o->sym->as<InstanceSymbol>()).first;
+    }
+    if (o->kind == Obj::Assertion) {
+        const auto& c = s.assertCov[(size_t)o->idx];
+        switch (prop) {
+            case vpiCovered: return c[1] > 0;
+            case vpiCoveredCount: return (int64_t)c[1];
+            case vpiCoveredMax: return 1;
+            case vpiAssertAttemptCovered: return (int64_t)c[0];
+            case vpiAssertSuccessCovered: return (int64_t)c[1];
+            case vpiAssertFailureCovered: return (int64_t)c[2];
+            case vpiAssertVacuousSuccessCovered: return (int64_t)c[3];
+            case vpiAssertDisableCovered: return (int64_t)c[4];
+            case vpiAssertKillCovered: return (int64_t)c[5];
+            default: return -1;
+        }
+    }
+    if (!cov) return -1;
+    if (o->kind == Obj::Fsm) {
+        const FsmDef& d = fsmDefs()[(size_t)o->idx];
+        int64_t n = 0, c = 0;
+        for (auto& [v, name] : d.states) { uint64_t h = fsmSeenCount(o->idx, v); n += h > 0; c += (int64_t)h; }
+        return prop == vpiCovered ? n : prop == vpiCoveredCount ? c : (int64_t)d.states.size();
+    }
+    if (o->kind == Obj::FsmState) {
+        uint64_t h = fsmSeenCount(o->idx, fsmDefs()[(size_t)o->idx].states[o->pos].first);
+        return prop == vpiCovered ? h > 0 : prop == vpiCoveredCount ? (int64_t)h : 1;
+    }
+    // A net or variable, a word or bit of one: its bits that toggled (both ways).
+    if (o->kind == Obj::Signal && o->arr) {
+        const ArrShape& sh = *arrMap().find(o->sym)->second;
+        int64_t n = 0;
+        for (int k = 0; k < sh.count; k++) n += toggled(sh.base + k, 0, sh.elemW);
+        return prop == vpiCoveredMax ? (int64_t)sh.count * sh.elemW : n;
+    }
+    if ((o->kind == Obj::Signal || o->kind == Obj::Word || o->kind == Obj::Bit) && !o->real && !o->str) {
+        int n = o->kind == Obj::Bit ? toggled(o->sig, o->off, o->w) : toggled(o->sig, 0, o->w);
+        return prop == vpiCoveredMax ? o->w : n;
+    }
+    return -1;
+}
+// Zero the counts of a type in an instance (null: everywhere).
+inline void covReset(int type, const InstanceSymbol* inst, const Obj* a) {
+    auto& s = st();
+    if (type == vpiAssertCoverage) {
+        for (size_t k = 0; k < s.assertCov.size(); k++)
+            if (a ? (int)k == a->idx : assertIn(k, inst)) s.assertCov[k] = {};
+    } else if (type == vpiStatementCoverage) {
+        for (const Prog* p : s.progs)
+            if (!inst || p->inst == inst)
+                for (auto& i : p->code) i.hits = i.taken = 0;
+    } else if (type == vpiToggleCoverage) {
+        for (size_t g = 0; g < S.togRise.size(); g++)
+            if (!inst || sigInst((int)g) == inst) {
+                std::fill(S.togRise[g].begin(), S.togRise[g].end(), 0);
+                if (g < S.togFall.size()) std::fill(S.togFall[g].begin(), S.togFall[g].end(), 0);
+            }
+    } else {
+        for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++)
+            if (!inst || sigInst(fsmDefs()[k].sig) == inst) { S.fsmSeen[k].clear(); S.fsmTrans[k].clear(); }
+    }
+}
+// vpi_control for coverage (40.5.1): vpiCoverageStart / Stop / Reset /
+// Check with a coverage type and an instance or assertion handle (null: the
+// whole design); vpiCoverageSave / Merge with a coverage type and a name.
+inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
+    if (op < vpiCoverageStart || op > vpiCoverageSave) return -1;
+    auto& s = st();
+    int type = va_arg(ap, PLI_INT32);
+    if (!isCovType(type)) {
+        error(vpiError, "vpi_control: " + std::to_string(type) + " is not a coverage type (40.5.1)");
+        return 0;
+    }
+    if (type != vpiAssertCoverage && !g_cov) {
+        error(vpiWarning, "vpi_control: statement, toggle and FSM coverage are collected only with msim -cov");
+        return 0;
+    }
+    if (op == vpiCoverageSave || op == vpiCoverageMerge) {
+        const char* name = va_arg(ap, const char*);
+        if (!name || !*name) { error(vpiError, "vpi_control: coverage save / merge needs a database name"); return 0; }
+        if (op == vpiCoverageMerge) {
+            error(vpiWarning, "vpi_control: vpiCoverageMerge is not supported (merge saved databases with mcov merge)");
+            return 0;
+        }
+        if (!covSaveHook() || !covSaveHook()(name)) { error(vpiError, std::string("vpi_control: cannot write coverage to ") + name); return 0; }
+        return 1;
+    }
+    Obj* o = O(va_arg(ap, vpiHandle));
+    if (o && o->kind != Obj::Module && o->kind != Obj::Assertion) {
+        error(vpiError, "vpi_control: a coverage operation needs an instance or assertion handle (or null)");
+        return 0;
+    }
+    if (o && o->kind == Obj::Assertion && type != vpiAssertCoverage) {
+        error(vpiError, "vpi_control: an assertion handle goes with vpiAssertCoverage");
+        return 0;
+    }
+    if (o && denied(o, "vpi_control")) return 0;
+    const InstanceSymbol* inst = o && o->kind == Obj::Module ? &o->sym->as<InstanceSymbol>() : nullptr;
+    if (op == vpiCoverageCheck) {   // TRUE when every item of the type is covered
+        if (o && o->kind == Obj::Assertion) return s.assertCov[(size_t)o->idx][1] > 0;
+        auto [n, m] = covOf(type, inst);
+        return n == m ? 1 : 0;
+    }
+    if (op == vpiCoverageReset) { covReset(type, inst, o && o->kind == Obj::Assertion ? o : nullptr); return 1; }
+    bool stop = op == vpiCoverageStop;
+    if (type == vpiAssertCoverage) {
+        if (!o) s.assertCovAllOff = stop;
+        for (size_t k = 0; k < s.assertCovOff.size(); k++)
+            if (o && (o->kind == Obj::Assertion ? (int)k == o->idx : assertIn(k, inst))) s.assertCovOff[k] = stop;
+            else if (!o) s.assertCovOff[k] = 0;
+        return 1;
+    }
+    // Statement, toggle and FSM counting stops for the whole design: a top
+    // instance (or null) only.
+    if (inst && inst->getParentScope() != &s.comp->getRoot()) {
+        error(vpiWarning, "vpi_control: statement, toggle and FSM coverage start and stop only for the whole design (a top instance or null)");
+        return 0;
+    }
+    int bit = type == vpiStatementCoverage ? 1 : type == vpiToggleCoverage ? 2 : 4;
+    g_covStop = stop ? (g_covStop | bit) : (g_covStop & ~bit);
+    return 1;
+}
+
 // ---- set-up from msim ----
 // Load a VPI library and run its bootstrap: vlog_startup_routines, and the
 // named routine of -load lib:boot (36.9.1).
@@ -1220,6 +1501,7 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
         s.cur = nullptr;
     }
     assertHook() = onAssert;
+    covInit();
     fireList(s.endCompile);
     fireList(s.start);
     fireSys(cbAssertionSysInitialized);   // 39.4.1
@@ -1579,6 +1861,16 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     if (!o) { vpi::error(vpiError, "vpi_handle: null reference handle"); return nullptr; }
     if (vpi::denied(o, "vpi_handle")) return nullptr;
     using slang::ast::SymbolKind;
+    if (o->kind == Obj::Fsm || o->kind == Obj::FsmState) {   // 40.5.2
+        if (type == vpiFsmStateExpression || type == vpiExpr) {
+            auto it = s.sigSym.find(fsmDefs()[(size_t)o->idx].sig);
+            return it == s.sigSym.end() ? nullptr : H(vpi::valueObj(it->second));
+        }
+        if (type == vpiParent && o->kind == Obj::FsmState) return H(const_cast<Obj*>(o->parent));
+        if (type == vpiModule || type == vpiScope || type == vpiInstance)
+            return H(vpi::moduleObj(vpi::sigInst(fsmDefs()[(size_t)o->idx].sig)));
+        return nullptr;
+    }
     switch (type) {
         case vpiParent:
             if (o->kind == Obj::Word || o->kind == Obj::Bit || o->kind == Obj::Range) return H(const_cast<Obj*>(o->parent));
@@ -1717,6 +2009,17 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     if (type == vpiArgument) {
         if (o->kind != Obj::Call) return nullptr;
         for (size_t k = 0; k < o->site->args.size(); k++) add(vpi::argObj(o->site, (int)k));
+        return vpi::iter(std::move(items));
+    }
+    if (type == vpiFsm) {   // the FSMs of an instance (40.5.2)
+        if (o->kind != Obj::Module) return nullptr;
+        for (size_t k = 0; k < fsmDefs().size(); k++)
+            if (vpi::sigInst(fsmDefs()[k].sig) == &o->sym->as<slang::ast::InstanceSymbol>()) add(vpi::fsmObj((int)k));
+        return vpi::iter(std::move(items));
+    }
+    if (type == vpiFsmStates) {
+        if (o->kind != Obj::Fsm) return nullptr;
+        for (size_t n = 0; n < fsmDefs()[(size_t)o->idx].states.size(); n++) add(vpi::fsmStateObj(o->idx, n));
         return vpi::iter(std::move(items));
     }
     if (type == vpiBit) {
@@ -2019,6 +2322,18 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* name, vpiHandle scope) {
         }
         return nullptr;
     };
+    // An assertion, by its label (39.3). Its label also names a scope (16.3):
+    // the name gives the assertion.
+    std::string want = name ? name : "";
+    std::string pre;
+    if (scope) {
+        const char* sn = vpi_get_str(vpiFullName, scope);
+        pre = sn ? std::string(sn) + "." : "";
+    }
+    for (size_t k = 0; k < asserts().size(); k++) {
+        const AssertInfo& a = asserts()[k];
+        if (!a.hidden && (a.name == want || (!pre.empty() && a.name == pre + want))) return H(vpi::assertObj((int)k));
+    }
     if (const slang::ast::Scope* sc = vpi::scopeOf(O(scope)))
         if (vpiHandle h = resolve(sc)) return h;
     return resolve(nullptr);   // a full name, also when a scope is given
@@ -2071,6 +2386,15 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (prop != vpiType && !(prop == vpiSize && expr) && vpi::denied(o, "vpi_get"))
         return vpiUndefined;
     auto isVar = [&] { return o->kind == Obj::Signal || o->kind == Obj::Word; };
+    if (int64_t c = vpi::covGet(prop, o); c >= 0) return (PLI_INT32)std::min<int64_t>(c, INT32_MAX);   // 40.5.2
+    if (o->kind == Obj::Fsm || o->kind == Obj::FsmState) {
+        switch (prop) {
+            case vpiType: return o->type;
+            case vpiSize: return o->w;
+            case vpiLineNo: return (PLI_INT32)fsmDefs()[(size_t)o->idx].line;
+            default: return vpiUndefined;
+        }
+    }
     if (o->kind == Obj::Assertion) {   // 39.3
         const AssertInfo& a = asserts()[(size_t)o->idx];
         switch (prop) {
@@ -2236,6 +2560,14 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
     using slang::ast::SymbolKind;
     if (!o) return nullptr;
     if (prop != vpiType && vpi::denied(o, "vpi_get_str")) return nullptr;
+    if ((o->kind == Obj::Fsm || o->kind == Obj::FsmState) && prop != vpiType) {   // 40.5.2
+        const FsmDef& d = fsmDefs()[(size_t)o->idx];
+        std::string name = o->kind == Obj::Fsm ? d.name : d.states[o->pos].second;
+        if (prop == vpiName) return vpi::retStr(name);
+        if (prop == vpiFullName) return vpi::retStr(o->kind == Obj::Fsm ? d.inst + "." + d.name : d.inst + "." + d.name + "." + name);
+        if (prop == vpiFile && d.file < g_covFiles.size()) return vpi::retStr(g_covFiles[d.file]);
+        return nullptr;
+    }
     if (o->kind == Obj::Assertion && prop != vpiType) {   // 39.3
         const AssertInfo& a = asserts()[(size_t)o->idx];
         if (prop == vpiFullName) return vpi::retStr(a.name);
@@ -2554,9 +2886,11 @@ PLI_INT32 vpi_put_userdata(vpiHandle h, void* d) {
 }   // extern "C"
 namespace vpi {
 inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap);
+inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap);
 inline PLI_INT32 control(PLI_INT32 op, va_list ap) {
     clearErr();
     if (PLI_INT32 r = assertControlOp(op, ap); r >= 0) return r;
+    if (PLI_INT32 r = covControlOp(op, ap); r >= 0) return r;
     if (op == vpiFinish || op == vpiStop) {
         S.finished = true;
         return 1;
