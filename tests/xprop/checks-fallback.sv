@@ -1,11 +1,12 @@
 // msim -xprop: unique / priority if, casex, nested case, negedge, a for loop
-// with break, a task call; constructs that are not merged (a break out of a
-// while loop, a task with a nonblocking assignment) keep the standard behavior.
+// with break, a while loop with break, a task call; constructs that are not
+// merged (disable of an outer block, a task with a nonblocking assignment)
+// keep the standard behavior.
 //! args: -xprop
 module top;
   logic a, b; logic [3:0] y, z, w, u, k, s; logic [2:0] sel; logic [3:0] idx;
   logic [7:0] req; logic [1:0] st; logic clk; logic [3:0] f1, f2, f3; int n;
-  logic [3:0] m, f4;
+  logic [3:0] m, f4, m2;
   task automatic bump(inout logic [3:0] x); x = x + 1; endtask
   task automatic later(input logic [3:0] v); f4 <= v; endtask
   always_comb begin   // unique if
@@ -51,11 +52,20 @@ module top;
       2'd3: s = 4'd9;
     endcase
   end
-  always_comb begin   // a break out of a while loop is not merged
+  always_comb begin   // a while loop with break
     m = 4'd0;
     while (m < 4'd8) begin
       if (req[m]) break;
       m = m + 4'd1;
+    end
+  end
+  always_comb begin   // disable of a block outside the branch is not merged
+    m2 = 4'd0;
+    begin : scan
+      for (int i = 0; i < 8; i++) begin
+        if (req[i]) disable scan;
+        m2 = m2 + 4'd1;
+      end
     end
   end
   always @(posedge clk) if (b) later(4'h5);   // a task with <= is not merged
@@ -98,7 +108,7 @@ endmodule
 //> sel=1zx: w=1000
 //> req=x0000000: idx=X
 //> req=00001x00: idx=X
-//> Warning: "checks-fallback.sv", 12: unique if: more than one condition is true at time 11
+//> Warning: "checks-fallback.sv", 13: unique if: more than one condition is true at time 11
 //> f1=c f2=x
 //> a=x: f1=xxxx f2=c
 //> clk 1->x: f1=xxxx f2=xxxx
