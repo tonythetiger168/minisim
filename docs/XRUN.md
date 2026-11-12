@@ -8,7 +8,15 @@ engine: the options are rewritten to msim's own and the run is msim's.
 ln -s $(which msim) ~/bin/xrun        # or irun, xmverilog, ncverilog
 xrun -64bit -sv -access +rwc -f run.f -top tb -incdir inc -define W=8 -l run.log
 msim -xrun -f run.f -uvm -input run.tcl           # without a link
+msim --compat=cadence -f run.f -top tb            # the same, as every minisim tool spells it
 ```
+
+The plain renames and the options accepted with no effect are msim's table
+in the shared vendor-compatibility layer (`src/compat.hpp`, the same one the
+other minisim tools use); Cadence options match in any case, as in xrun.
+What needs more than a rename (`-f` files, `-incdir` / `-define` values,
+`-top lib.cell:view`, the log, `-input` Tcl, `-sdf_cmd_file`) is handled in
+`src/xrun.inc`.
 
 Options msim does not list below pass through unchanged, so msim's own
 options (`-vcd`, `-compile`, `-threads`, `-profile`, ...) work in this mode too.
