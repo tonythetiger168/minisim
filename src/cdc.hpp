@@ -28,12 +28,15 @@
 //   CDC004  reconvergence: signals from one domain, synchronized separately,
 //           meet again in the reading domain, where they can be a cycle apart.
 //   CDC005  one signal synchronized more than once into the same domain.
+//   CDC006  with -sdc: a flop's clock is not a clock in the SDC file.
 //   RDC001  an asynchronous reset generated in another clock domain: its
 //           release is not synchronous to the flops it resets.
 //   RDC002  one asynchronous reset used directly in several clock domains.
 //   RDC003  a flop with one asynchronous reset feeds a flop with another, in
 //           the same clock domain.
 //   RDC004  (off by default) ... feeds a flop with no asynchronous reset.
+//   RDC005  a reset synchronizer of one flop.
+//   RDC006  an asynchronous reset made by combinational logic of several flops.
 //
 // Constraints: -clock-group a,b says clocks are synchronous to each other
 // (one domain); -static s says a signal does not change while it is read.
@@ -47,6 +50,7 @@
 
 #include "lintir.hpp"
 #include "parallel.hpp"
+#include "cdc_sdc.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/ConversionExpression.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
@@ -61,6 +65,8 @@ struct Options {
     std::vector<std::vector<std::string>> clockGroups;  // -clock-group a,b,c
     std::vector<std::string> statics;                   // -static sig
     bool report = false;                                // -cdc-report
+    std::vector<std::string> sdcFiles;                  // -sdc file
+    int depth = 2;                                      // -cdc-depth N
     int threads = 1;                                    // -threads N
 
     // Takes one command-line option if it is one of these. `next` returns the
@@ -69,6 +75,18 @@ struct Options {
     bool take(const std::string& a, Next&& next) {
         if (a == "-cdc-report") { report = true; return true; }
         if (a == "-static") { statics.push_back(next("a signal")); return true; }
+        if (a == "-sdc") { sdcFiles.push_back(next("an SDC file")); return true; }
+        if (a == "-cdc-depth") {
+            std::string v = next("a number of flops");
+            char* e = nullptr;
+            long k = strtol(v.c_str(), &e, 10);
+            if (v.empty() || *e || k < 0 || k > 64) {
+                std::cerr << "mlint: -cdc-depth needs a number of flops from 0 to 64\n";
+                std::exit(2);
+            }
+            depth = (int)k;
+            return true;
+        }
         if (a == "-clock-group") {
             std::string list = next("clock names"), one;
             std::vector<std::string> g;
@@ -85,7 +103,9 @@ struct Options {
 };
 
 inline const char* usage() {
-    return "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
+    return "  -cdc-depth N   CDC004 follows synchronized signals through N more flops to where they meet (2)\n"
+           "  -sdc FILE      clocks, generated clocks, clock groups and clock-to-clock false paths from an SDC file\n"
+           "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
            "  -static SIG    SIG does not change while it is read: its crossings are not reported\n"
            "  -cdc-report    list the clock domains, the resets and every crossing, safe or not\n";
 }
@@ -195,6 +215,16 @@ struct Model {
     std::unordered_map<Sym, Comb> combs;
     std::unordered_map<Sym, int> labelDepth;
     std::unordered_map<Sym, Sym> group;  // clock -> its group's first clock
+    // With -sdc: the clocks of the file, where each one starts, and how every
+    // pair is related.
+    enum Rel : uint8_t { Sync, Async, Exclusive };
+    struct Sdc {
+        bool on = false;
+        std::vector<std::string> clocks;                 // by index
+        std::unordered_map<Sym, std::vector<int>> at;    // node -> the clocks defined on it
+        std::vector<std::vector<uint8_t>> rel;           // clock x clock
+        std::unordered_map<Sym, std::vector<int>> of;    // domain -> the clocks that reach it
+    } sdc;
     std::unordered_set<Sym> statics;
 
     Sym canon(Sym s) { return join.find(s); }
@@ -301,6 +331,7 @@ struct Model {
     // logic drives (clk & en_latched: the latch has inputs, the clock has none).
     Sym clockRoot(Sym c) const {
         for (int guard = 0; guard < 32; guard++) {
+            if (sdc.on && sdc.at.count(c)) return c;  // a clock is defined here
             if (flopIx.count(c) || bitNodes.count(c)) return c;
             const Comb* n = combOf(c);
             if (!n) return c;
@@ -320,6 +351,48 @@ struct Model {
         Sym r = clockRoot(clk);
         auto g = group.find(r);
         return g == group.end() ? r : g->second;
+    }
+    // The SDC clocks that reach a domain's root: the one defined on it, or,
+    // behind a clock mux, every clock defined in the logic in front of it.
+    std::vector<int> clocksReaching(Sym root) const {
+        std::vector<int> out;
+        std::vector<Sym> todo{root};
+        std::unordered_set<Sym> seen{root};
+        while (!todo.empty() && seen.size() < 4096) {
+            Sym c = todo.back();
+            todo.pop_back();
+            if (auto it = sdc.at.find(c); it != sdc.at.end()) {
+                out.insert(out.end(), it->second.begin(), it->second.end());
+                continue;
+            }
+            if (flopIx.count(c)) continue;  // a divider with no create_generated_clock
+            if (const Comb* n = combOf(c))
+                for (const Edge& e : n->src)
+                    if (seen.insert(e.sym).second) todo.push_back(e.sym);
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+    const std::vector<int>& clocksOf(Sym dom) const {
+        static const std::vector<int> none;
+        auto it = sdc.of.find(dom);
+        return it == sdc.of.end() ? none : it->second;
+    }
+    // Is a path between two domains a crossing? Without an SDC file every
+    // other domain is. With one, a domain is the clocks that reach it: two
+    // domains cross when some pair of their clocks is asynchronous. Exclusive
+    // clocks are never there together, so there is no path to check.
+    bool async(Sym a, Sym b) const {
+        if (a == b) return false;
+        if (!sdc.on) return true;
+        const auto& ca = clocksOf(a);
+        const auto& cb = clocksOf(b);
+        if (ca.empty() || cb.empty()) return true;  // no clock defined: a domain of its own
+        for (int i : ca)
+            for (int j : cb)
+                if (i != j && sdc.rel[i][j] == Async) return true;
+        return false;
     }
 
     // The reset a reset comes from: through wires and inverters, and through a
@@ -410,6 +483,7 @@ struct Model {
             drop(f.ctrl);
             if (f.clkSym) f.dom = domainOf(canon(f.clkSym));
             if (f.from && has(f.arst, f.from)) f.plain = false;
+            if (sdc.on && f.dom && !sdc.of.count(f.dom)) sdc.of[f.dom] = clocksReaching(f.dom);
         }
     }
 };
@@ -929,7 +1003,7 @@ struct Checker {
 
     const Flop* foreign(const Flop& f, Sym r) const {
         const Flop* s = m.flopOf(r);
-        if (!s || !s->dom || !f.dom || s->dom == f.dom || m.statics.count(r)) return nullptr;
+        if (!s || !s->dom || !f.dom || !m.async(s->dom, f.dom) || m.statics.count(r)) return nullptr;
         return s;
     }
     int stages(const Flop& f) const {
@@ -951,6 +1025,21 @@ struct Checker {
     }
 
     std::string clocked(const Flop& f) const { return m.name(f.dom); }
+
+    // CDC006: with an SDC file, a clock it does not define.
+    void unclocked() {
+        std::map<Sym, std::pair<int, SourceLocation>> none;
+        for (const Flop& f : m.flops) {
+            if (!f.dom || !m.clocksOf(f.dom).empty()) continue;
+            auto& e = none[f.dom];
+            if (!e.first++) e.second = f.loc;
+        }
+        for (auto& [d, e] : none)
+            add("CDC006", e.second,
+                "clock '" + m.name(d) + "' of " + std::to_string(e.first) + (e.first == 1 ? " flop" : " flops") +
+                    " is not a clock in the SDC file: it is checked as a domain of its own, asynchronous to "
+                    "every other (add a create_clock or create_generated_clock for it)");
+    }
 
     void run() {
         Prof prof;
@@ -999,6 +1088,7 @@ struct Checker {
         reconverge(first);
         prof.lap("reconvergence");
         rdc();
+        if (m.sdc.on) unclocked();
         prof.lap("resets");
         flush();
         if (opt.report) report();
@@ -1153,32 +1243,217 @@ struct Checker {
     // CDC004: two signals of one domain, each through its own synchronizer,
     // meet in one flop. Each synchronizer can take one cycle more or less, so
     // the pair can show a combination its source never had.
+    // CDC004. Signals of one domain that were synchronized separately and
+    // meet again: in the logic of one flop, or after up to -cdc-depth more
+    // flops of the reading domain (each side registered a different number of
+    // times does not bring them back in step).
     void reconverge(const std::vector<char>& first) {
-        for (size_t i = 0; i < m.flops.size(); i++) {
-            const Flop& f = m.flops[i];
-            if (!f.dom || first[i]) continue;
-            const std::vector<Root>& all = cones[i].all;
-            std::map<Sym, std::vector<std::pair<std::string, Sym>>> byDom;  // source domain -> (name, source)
-            for (const Root& r : all) {
-                const Flop* sf = m.flopOf(r.sym);
-                if (!sf || sf->dom != f.dom) continue;
-                const Member& mem = member[sf - m.flops.data()];
-                if (mem.pos < 2) continue;
-                auto& v = byDom[mem.srcDom];
-                bool dup = false;
-                for (auto& e : v) dup = dup || e.second == mem.src;
-                if (!dup) v.push_back({m.name(*m.flopOf(mem.src)), mem.src});
+        const size_t n = m.flops.size();
+        const int depth = std::max(0, opt.depth);
+        // What a flop carries: synchronized sources, and how many flops after
+        // its synchronizer each one is. Sorted by source; the smallest depth.
+        using Carried = std::vector<std::pair<Sym, int>>;
+        auto put = [](Carried& c, Sym s, int d) {
+            auto it = std::lower_bound(c.begin(), c.end(), s, [](const auto& e, Sym k) { return e.first < k; });
+            if (it != c.end() && it->first == s) {
+                if (d >= it->second) return false;
+                it->second = d;
+                return true;
             }
+            if (c.size() >= 64) return false;  // a flop where everything meets: enough to report
+            c.insert(it, {s, d});
+            return true;
+        };
+        auto depthIn = [](const Carried& c, Sym s) {
+            auto it = std::lower_bound(c.begin(), c.end(), s, [](const auto& e, Sym k) { return e.first < k; });
+            return it != c.end() && it->first == s ? it->second : -1;
+        };
+        std::vector<Carried> direct(n), reach;
+        std::vector<std::vector<int>> preds(n);
+        chunked(n, opt.threads, [&](size_t lo, size_t hi) {
+            for (size_t i = lo; i < hi; i++) {
+                const Flop& f = m.flops[i];
+                if (!f.dom || first[i]) continue;
+                for (const Root& r : cones[i].all) {
+                    const Flop* sf = m.flopOf(r.sym);
+                    if (!sf || sf->dom != f.dom) continue;
+                    size_t j = sf - m.flops.data();
+                    if (member[j].pos >= 2) put(direct[i], member[j].src, 0);
+                    else if (j != i && !first[j] && depth) preds[i].push_back((int)j);
+                }
+                std::sort(preds[i].begin(), preds[i].end());
+                preds[i].erase(std::unique(preds[i].begin(), preds[i].end()), preds[i].end());
+            }
+        });
+        reach = direct;
+        for (int round = 0; round < depth; round++) {
+            std::vector<Carried> grown = direct;
+            std::atomic<bool> changed{false};
+            chunked(n, opt.threads, [&](size_t lo, size_t hi) {
+                for (size_t i = lo; i < hi; i++) {
+                    for (int p : preds[i])
+                        for (auto& [s, d] : reach[p])
+                            if (d < depth) put(grown[i], s, d + 1);
+                    if (grown[i] != reach[i]) changed = true;
+                }
+            });
+            reach.swap(grown);
+            if (!changed) break;
+        }
+        // The same signals meet at one flop and then, in a state machine, at
+        // every flop behind it. One finding for each set of signals: at the
+        // flops where they meet in one cone of logic (as before), otherwise
+        // at the nearest flop, with a count of the others.
+        struct Seq {
+            int flop = -1, far = 0, more = 0;
+            std::string where;
+        };
+        std::map<std::pair<Sym, std::vector<Sym>>, Seq> seqs;
+        std::set<std::pair<Sym, std::vector<Sym>>> met;
+        auto namesOf = [&](const std::vector<Sym>& v) {
+            std::vector<std::string> sorted;
+            for (Sym e : v) sorted.push_back(m.name(*m.flopOf(e)));
+            std::sort(sorted.begin(), sorted.end());
+            std::string names;
+            for (auto& e : sorted) names += (names.empty() ? "'" : ", '") + e + "'";
+            return names;
+        };
+        const char* why = ": each can arrive a cycle apart from the others, so cross one signal (or a Gray code) "
+                          "and derive the rest from it";
+        for (size_t i = 0; i < n; i++) {
+            const Flop& f = m.flops[i];
+            if (reach[i].size() < 2) continue;
+            std::map<Sym, Carried> byDom;  // source domain -> what arrives from it
+            for (auto& e : reach[i]) byDom[m.flopOf(e.first)->dom].push_back(e);
             for (auto& [d, v] : byDom) {
                 if (v.size() < 2) continue;
-                std::sort(v.begin(), v.end());
-                std::string names;
-                for (auto& e : v) names += (names.empty() ? "'" : ", '") + e.first + "'";
-                add("CDC004", f.loc,
-                        names + " (clocked by " + m.name(d) + ") are synchronized separately and meet " +
-                            "again at '" + m.name(f) + "': each can arrive a cycle apart from the " +
-                            "others, so cross one signal (or a Gray code) and derive the rest from it");
+                std::vector<Sym> here, all;
+                int far = 0;
+                for (auto& e : v) {
+                    far = std::max(far, e.second);
+                    all.push_back(e.first);
+                    if (!e.second) here.push_back(e.first);
+                }
+                if (here.size() >= 2) {
+                    met.insert({d, here});
+                    add("CDC004", f.loc,
+                            namesOf(here) + " (clocked by " + m.name(d) + ") are synchronized separately and meet " +
+                                "again at '" + m.name(f) + "'" + why);
+                }
+                if (!far) continue;
+                Seq& q = seqs[{d, all}];
+                std::string where = m.name(f);
+                if (q.flop < 0 || far < q.far || (far == q.far && where < q.where)) {
+                    q.flop = (int)i;
+                    q.far = far;
+                    q.where = where;
+                }
+                q.more++;
             }
+        }
+        for (auto& [key, q] : seqs) {
+            if (met.count(key)) continue;
+            std::string others = q.more > 1 ? " (and at " + std::to_string(q.more - 1) +
+                                                  (q.more == 2 ? " more flop)" : " more flops)")
+                                            : "";
+            add("CDC004", m.flops[q.flop].loc,
+                    namesOf(key.second) + " (clocked by " + m.name(key.first) + ") are synchronized separately " +
+                        "and meet again at '" + q.where + "', " + std::to_string(q.far) +
+                        (q.far == 1 ? " flop" : " flops") + " after the synchronizers" + others + why);
+        }
+    }
+
+    // A reset synchronizer: flops in a row with the same clock and the same
+    // asynchronous reset, the first one fed a constant (asserted at once,
+    // released on the clock), or flops with no reset that sample a reset
+    // input. Returns how many flops, 0 when `g` is something else.
+    int resetSyncStages(const Flop& g) const {
+        if (!g.plain) return 0;
+        int stages = 1;
+        const Flop* f = &g;
+        for (int guard = 0; guard < 16; guard++) {
+            if (!f->from) return f->arst.empty() ? 0 : stages;  // a constant behind the reset
+            Sym r = m.wireRoot(f->from);
+            const Flop* p = m.flopOf(r);
+            if (!p) {
+                // An input, sampled: a synchronizer when the flops have no reset.
+                const Comb* c = m.combOf(r);
+                return f->arst.empty() && g.arst.empty() && (!c || c->src.empty()) ? stages : 0;
+            }
+            if (p == f || !p->plain || p->dom != g.dom || p->arst != g.arst) return 0;
+            f = p;
+            stages++;
+        }
+        return stages;
+    }
+
+    // RDC005 / RDC006: how the asynchronous resets are made.
+    struct ResetSync {
+        const Flop* out;
+        int stages, flops;
+    };
+    std::vector<ResetSync> resetSyncs;
+    void resetTree() {
+        struct Use {
+            int flops = 0;
+            SourceLocation loc;
+            Sym dom = nullptr;
+        };
+        std::map<Sym, Use> uses;  // the reset as wired -> the flops it resets
+        std::vector<Sym> order;
+        for (const Flop& f : m.flops)
+            for (Sym a : f.arst) {
+                Sym r = m.wireRoot(a);
+                Use& u = uses[r];
+                if (!u.flops++) {
+                    u.loc = f.loc;
+                    u.dom = f.dom;
+                    order.push_back(r);
+                }
+            }
+        Tracer tr(m);
+        for (Sym r : order) {
+            const Use& u = uses[r];
+            if (m.statics.count(r)) continue;
+            // The flops behind it: the reset itself, or what a scan mux or a
+            // gate on it is fed.
+            std::vector<const Flop*> made;
+            bool logic = false;
+            if (const Flop* g = m.flopOf(r)) {
+                made.push_back(g);
+            } else {
+                for (const Root& root : tr.roots(r))
+                    if (const Flop* g = m.flopOf(root.sym); g && !m.statics.count(root.sym)) {
+                        made.push_back(g);
+                        logic = logic || root.logic;
+                    }
+            }
+            if (made.size() == 1) {
+                const Flop* g = made[0];
+                int stages = resetSyncStages(*g);
+                if (!stages) continue;
+                resetSyncs.push_back({g, stages, u.flops});
+                if (stages == 1)
+                    add("RDC005", g->loc,
+                            "reset synchronizer '" + m.name(*g) + "' (clocked by " + clocked(*g) + ") is one flop: " +
+                                "when the reset is released near a clock edge it can go metastable and release " +
+                                "the " + std::to_string(u.flops) + (u.flops == 1 ? " flop" : " flops") +
+                                " it resets at different times, so use two flops");
+                continue;
+            }
+            // Logic on a reset: two flops that change together can glitch it.
+            if (made.size() < 2 || !logic) continue;
+            std::vector<std::string> from;
+            for (const Flop* g : made) from.push_back(m.name(*g));
+            std::sort(from.begin(), from.end());
+            std::string names;
+            for (size_t i = 0; i < from.size() && i < 4; i++) names += (i ? ", '" : "'") + from[i] + "'";
+            if (from.size() > 4) names += ", ...";
+            add("RDC006", u.loc,
+                    "asynchronous reset '" + m.name(r) + "' of " + std::to_string(u.flops) +
+                        (u.flops == 1 ? " flop" : " flops") + " is combinational logic of " +
+                        std::to_string(from.size()) + " flops (" + names + "): when they change together the " +
+                        "logic can glitch and reset by accident, so register the reset after the logic");
         }
     }
 
@@ -1210,7 +1485,7 @@ struct Checker {
             for (Sym a : f.arst) {
                 Sym r = m.wireRoot(a);
                 if (const Flop* g = m.flopOf(r)) {
-                    if (g->dom && g->dom != f.dom && !m.statics.count(r)) {
+                    if (g->dom && m.async(g->dom, f.dom) && !m.statics.count(r)) {
                         Use& u = gen[{r, f.dom}];
                         if (!u.flops++) u.loc = f.loc;
                     }
@@ -1232,6 +1507,13 @@ struct Checker {
         }
         for (auto& [r, v] : raw) {
             if (v.size() < 2) continue;
+            if (m.sdc.on) {
+                // Domains the SDC file relates are one domain here.
+                bool cross = false;
+                for (size_t i = 0; i < v.size() && !cross; i++)
+                    for (size_t j = i + 1; j < v.size() && !cross; j++) cross = m.async(v[i].first, v[j].first);
+                if (!cross) continue;
+            }
             std::string names;
             for (auto& e : v) names += (names.empty() ? "" : ", ") + m.name(e.first);
             add("RDC002", v[1].second,
@@ -1239,6 +1521,8 @@ struct Checker {
                         std::to_string(v.size()) + " clock domains (" + names + "): it cannot be released "
                         "synchronously to all of them, so give each domain a reset synchronizer");
         }
+
+        resetTree();
 
         // RDC003 / RDC004: within one clock domain, from a flop one reset can
         // clear at any time into a flop that reset does not clear.
@@ -1288,16 +1572,31 @@ struct Checker {
     // -cdc-report: the domains and every crossing, clean or not.
     void report() {
         std::map<std::string, int> doms, rsts;
+        std::map<std::string, std::string> sdcClocks;
         for (const Flop& f : m.flops) {
             if (f.dom) doms[m.name(f.dom)]++;
+            if (f.dom && m.sdc.on && !sdcClocks.count(m.name(f.dom))) {
+                std::string t;
+                for (int c : m.clocksOf(f.dom)) t += (t.empty() ? "" : ", ") + m.sdc.clocks[c];
+                sdcClocks[m.name(f.dom)] = t.empty() ? "  no SDC clock" : "  SDC clock " + t;
+            }
             for (Sym a : f.arst) rsts[m.name(m.resetRoot(a))]++;
         }
         std::ostream& os = std::cout;
         os << "clock domains: " << doms.size() << "\n";
-        for (auto& [d, k] : doms) os << "  " << d << "  " << k << (k == 1 ? " flop\n" : " flops\n");
+        for (auto& [d, k] : doms) os << "  " << d << "  " << k << (k == 1 ? " flop" : " flops") << sdcClocks[d] << "\n";
         os << "asynchronous resets: " << rsts.size() << "\n";
         for (auto& [d, k] : rsts) os << "  " << d << "  " << k << (k == 1 ? " flop\n" : " flops\n");
         std::vector<std::string> lines;
+        for (const ResetSync& r : resetSyncs)
+            lines.push_back("  " + m.name(*r.out) + " (" + clocked(*r.out) + ")  " + std::to_string(r.stages) +
+                            (r.stages == 1 ? " flop" : " flops") + ", resets " + std::to_string(r.flops) +
+                            (r.flops == 1 ? " flop" : " flops") +
+                            (r.out->arst.empty() ? "" : ", from " + m.name(m.resetRoot(r.out->arst[0]))));
+        std::sort(lines.begin(), lines.end());
+        os << "reset synchronizers: " << lines.size() << "\n";
+        for (auto& l : lines) os << l << "\n";
+        lines.clear();
         for (const Crossing& c : crossings) {
             const Flop& f = m.flops[c.flop];
             const Flop& s = *m.flopOf(c.src);
@@ -1346,6 +1645,221 @@ inline void constrain(Model& m, const Options& opt) {
         if (Sym c = find(n, "-static")) m.statics.insert(c);
 }
 
+// ------------------------------------------------------------------ -sdc
+//
+// The design as an SDC file names it, in the convention of msdc: '/' between
+// instance levels and no top name (u_a/u_b/clk), generate blocks as `name.`
+// and `name[i].`, a register `q` as the cell `q_reg` with pins CK, D and Q,
+// bus bits as name[3].
+struct SdcView : cdcsdc::Design {
+    Model& m;
+    std::vector<std::string> ports, pins, cells, nets;
+    std::unordered_map<std::string, int> dir;
+    std::unordered_map<std::string, Sym> node;  // port, net or pin -> canonical node
+
+    explicit SdcView(Model& m) : m(m) {}
+
+    void put(std::vector<std::string>& into, const std::string& name, const Type& t, Sym s) {
+        Sym c = m.canon(s);
+        node[name] = c;
+        if (t.isIntegral() && t.getBitWidth() > 1 && t.getBitWidth() <= 4096 && t.hasFixedRange()) {
+            auto rg = t.getFixedRange();
+            for (int i = rg.upper(); i >= rg.lower(); i--) {
+                std::string b = name + "[" + std::to_string(i) + "]";
+                auto it = m.bitCanon.find({c, i});
+                node[b] = it == m.bitCanon.end() ? c : m.canon(it->second);
+                into.push_back(std::move(b));
+            }
+        } else {
+            into.push_back(name);
+        }
+    }
+    void walk(const Scope& sc, const std::string& pre) {
+        for (const Symbol& s : sc.members()) {
+            if (namePC() && !namePC()->visible(s)) continue;  // protected IP keeps its names
+            if (isSignal(s)) {
+                std::string nm = pre + std::string(s.name);
+                put(nets, nm, s.as<ValueSymbol>().getType(), &s);
+                if (const Flop* f = m.flopOf(m.canon(&s)); f && f->sym == &s) {
+                    cells.push_back(nm + "_reg");
+                    for (const char* p : {"/Q", "/D", "/CK"}) pins.push_back(nm + "_reg" + p);
+                    node[nm + "_reg/Q"] = m.canon(&s);
+                    if (f->clkSym) node[nm + "_reg/CK"] = m.canon(f->clkSym);
+                }
+            } else if (s.kind == SymbolKind::Instance) {
+                const auto& ch = s.as<InstanceSymbol>();
+                if (!ch.isModule() || ch.body.flags.has(InstanceFlags::Uninstantiated)) continue;
+                std::string p = pre + std::string(ch.name);
+                cells.push_back(p);
+                for (const Symbol* ps : ch.body.getPortList()) {
+                    if (ps->kind != SymbolKind::Port) continue;
+                    const auto& port = ps->as<PortSymbol>();
+                    if (port.internalSymbol && isSignal(*port.internalSymbol))
+                        put(pins, p + "/" + std::string(port.name), port.getType(), port.internalSymbol);
+                }
+                walk(ch.body, p + "/");
+            } else if (s.kind == SymbolKind::GenerateBlock) {
+                const auto& g = s.as<GenerateBlockSymbol>();
+                if (!g.isUninstantiated) walk(g, pre + g.getExternalName() + ".");
+            } else if (s.kind == SymbolKind::GenerateBlockArray) {
+                const auto& ga = s.as<GenerateBlockArraySymbol>();
+                std::string an = ga.name.empty() ? std::string("genblk") : std::string(ga.name);
+                for (const auto* e : ga.entries)
+                    if (!e->isUninstantiated)
+                        walk(*e, pre + an + "[" + (e->getArrayIndex() ? e->getArrayIndex()->toString() : std::string("?")) + "].");
+            }
+        }
+    }
+    void build(Compilation& comp) {
+        for (const InstanceSymbol* top : comp.getRoot().topInstances) {
+            for (const Symbol* ps : top->body.getPortList()) {
+                if (ps->kind != SymbolKind::Port) continue;
+                const auto& port = ps->as<PortSymbol>();
+                if (!port.internalSymbol || !isSignal(*port.internalSymbol)) continue;
+                size_t at = ports.size();
+                put(ports, std::string(port.name), port.getType(), port.internalSymbol);
+                int d = port.direction == ArgumentDirection::In ? 0 : port.direction == ArgumentDirection::Out ? 1 : 2;
+                dir[std::string(port.name)] = d;
+                for (size_t i = at; i < ports.size(); i++) dir[ports[i]] = d;
+            }
+            walk(top->body, "");
+        }
+    }
+
+    const std::vector<std::string>& names(cdcsdc::Kind k) const override {
+        static const std::vector<std::string> none;
+        switch (k) {
+            case cdcsdc::Kind::Port: return ports;
+            case cdcsdc::Kind::Pin: return pins;
+            case cdcsdc::Kind::Cell: return cells;
+            case cdcsdc::Kind::Net: return nets;
+            default: return none;
+        }
+    }
+    int portDir(const std::string& n) const override {
+        auto it = dir.find(n);
+        return it == dir.end() ? -1 : it->second;
+    }
+    Sym at(const cdcsdc::Obj& o) const {
+        if (o.kind == cdcsdc::Kind::Cell) {  // a register cell stands for its output
+            auto it = node.find(o.name + "/Q");
+            return it == node.end() ? nullptr : it->second;
+        }
+        auto it = node.find(o.name);
+        return it == node.end() ? nullptr : it->second;
+    }
+};
+
+// Reads the SDC files: where each clock starts and how each pair is related.
+//   - a generated clock is synchronous to its master;
+//   - set_clock_groups -asynchronous makes the groups asynchronous to each
+//     other, -logically_exclusive and -physically_exclusive make them never
+//     present together (a path between them is not checked);
+//   - set_false_path between two clocks makes them asynchronous: timing no
+//     longer covers the path, so a synchronizer has to;
+//   - any other pair is synchronous, as it is for timing. A file that relates
+//     no clocks at all would make every crossing vanish, so its primary clocks
+//     are taken as asynchronous to each other, with a note.
+inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
+    if (opt.sdcFiles.empty()) return;
+    SdcView view(m);
+    view.build(comp);
+    cdcsdc::Reader rd;
+    rd.design = &view;
+    size_t read = 0;
+    for (auto& f : opt.sdcFiles) {
+        try {
+            rd.load(f);
+            read++;
+        } catch (const std::exception& e) {
+            std::cerr << "mlint: -sdc " << f << ": " << e.what() << "\n";
+        }
+    }
+    if (!read) return;  // nothing to go by: check as without -sdc
+    for (auto& d : rd.diags)
+        if (d.sev == cdcsdc::Diag::ErrorSev || d.code == "no-match" || d.code == "unknown-command")
+            std::cerr << "mlint: " << d.loc.str() << ": " << d.text << "\n";
+
+    Model::Sdc& s = m.sdc;
+    s.on = true;
+    const auto& clocks = rd.sdc.clocks;
+    const int n = (int)clocks.size();
+    std::unordered_map<std::string, int> ix;
+    for (int i = 0; i < n; i++) {
+        s.clocks.push_back(clocks[i].name);
+        ix[clocks[i].name] = i;
+        for (auto& o : clocks[i].sources)
+            if (Sym c = view.at(o)) s.at[c].push_back(i);
+    }
+    // The master of a generated clock: named, or the clock that reaches its
+    // -source pin.
+    std::vector<int> master(n, -1);
+    for (int i = 0; i < n; i++) {
+        const cdcsdc::Clock& c = clocks[i];
+        if (!c.generated) continue;
+        if (auto it = ix.find(c.masterClock); it != ix.end()) master[i] = it->second;
+        for (auto& o : c.masterPins) {
+            if (master[i] >= 0) break;
+            Sym at = view.at(o);
+            if (!at) continue;
+            for (int k : m.clocksReaching(at))
+                if (k != i) { master[i] = k; break; }
+        }
+    }
+    auto root = [&](int i) {
+        for (int hops = 0; master[i] >= 0 && hops < n; hops++) i = master[i];
+        return i;
+    };
+    bool related = false;
+    auto clockPair = [&](const cdcsdc::Exception& e) {
+        if (e.type != cdcsdc::Exception::FalsePath || e.path.from.empty() || e.path.to.empty() || !e.path.through.empty())
+            return false;
+        for (auto* l : {&e.path.from, &e.path.to})
+            for (auto& o : *l)
+                if (o.kind != cdcsdc::Kind::Clock) return false;
+        return true;
+    };
+    for (auto& g : rd.sdc.clockGroups) related = related || g.type != cdcsdc::ClockGroups::None;
+    for (auto& e : rd.sdc.exceptions) related = related || clockPair(e);
+    s.rel.assign(n, std::vector<uint8_t>(n, Model::Sync));
+    if (!related) {
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                if (root(i) != root(j)) s.rel[i][j] = Model::Async;
+        if (n > 1)
+            std::cerr << "mlint: -sdc: no set_clock_groups and no false path between clocks: clocks that are "
+                         "not generated from one another are taken as asynchronous\n";
+    }
+    for (auto& g : rd.sdc.clockGroups) {
+        if (g.type == cdcsdc::ClockGroups::None) continue;
+        // A clock's group; a generated clock that is not listed goes with its
+        // master. One -group alone is against every other clock.
+        std::vector<int> of(n, -1);
+        for (size_t k = 0; k < g.groups.size(); k++)
+            for (auto& name : g.groups[k])
+                if (auto it = ix.find(name); it != ix.end()) of[it->second] = (int)k;
+        for (int i = 0; i < n; i++)
+            for (int j = i, hops = 0; of[i] < 0 && master[j] >= 0 && hops < n; hops++) of[i] = of[j = master[j]];
+        if (g.groups.size() == 1)
+            for (int i = 0; i < n; i++)
+                if (of[i] < 0) of[i] = 1;
+        uint8_t r = g.type == cdcsdc::ClockGroups::Asynchronous ? Model::Async : Model::Exclusive;
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                if (of[i] >= 0 && of[j] >= 0 && of[i] != of[j]) s.rel[i][j] = r;
+    }
+    for (auto& e : rd.sdc.exceptions) {
+        if (!clockPair(e)) continue;
+        for (auto& a : e.path.from)
+            for (auto& b : e.path.to) {
+                auto i = ix.find(a.name), j = ix.find(b.name);
+                if (i == ix.end() || j == ix.end() || i->second == j->second) continue;
+                if (s.rel[i->second][j->second] == Model::Exclusive) continue;
+                s.rel[i->second][j->second] = s.rel[j->second][i->second] = Model::Async;
+            }
+    }
+}
+
 inline void check(Compilation& comp, Report& rep, const Options& opt) {
     Prof prof;
     auto lap = [&](const char* what) { prof.lap(what); };
@@ -1360,6 +1874,7 @@ inline void check(Compilation& comp, Report& rep, const Options& opt) {
     lap("gather");
     m.sealCombs();
     m.nameNodes();
+    readSdc(m, comp, opt);
     constrain(m, opt);
     m.finish();
     lap("model");
