@@ -2684,6 +2684,61 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
                 s.rel[i->second][j->second] = s.rel[j->second][i->second] = Model::Async;
             }
     }
+
+    // Ports: set_input_delay -clock C says a flop clocked by C (outside the
+    // design) launches the input, set_output_delay -clock C that one captures
+    // the output. Each becomes a flop of that clock on the port, so a path
+    // from an input or to an output is checked like any other. A virtual
+    // clock (no source) gets a node of its own.
+    std::vector<Sym> clockNode(n, nullptr);
+    for (auto& [node, list] : s.at)
+        for (int i : list)
+            if (!clockNode[i] || m.pathOf(node) < m.pathOf(clockNode[i])) clockNode[i] = node;
+    auto pseudo = [&](const std::string& label, const Type& t, SourceLocation loc) {
+        m.sliceNames.push_back(label);
+        auto* v = comp.emplace<VariableSymbol>(std::string_view(m.sliceNames.back()), loc, VariableLifetime::Static);
+        v->setType(t);
+        m.sliceLabel[v] = &m.sliceNames.back();
+        return v;
+    };
+    std::map<std::string, const PortSymbol*> topPort;
+    for (const InstanceSymbol* top : comp.getRoot().topInstances)
+        for (const Symbol* ps : top->body.getPortList())
+            if (ps->kind == SymbolKind::Port && !topPort.count(std::string(ps->name)))
+                topPort[std::string(ps->name)] = &ps->as<PortSymbol>();
+    std::set<std::pair<std::string, int>> done;
+    for (const sdc::IoDelay& d : rd.sdc.ioDelays) {
+        auto ci = ix.find(d.clock);
+        if (d.clock.empty() || ci == ix.end()) continue;
+        int c = ci->second;
+        if (!clockNode[c]) {
+            Sym v = pseudo("virtual clock " + d.clock, comp.getLogicType(), SourceLocation::NoLocation);
+            s.at[v].push_back(c);
+            clockNode[c] = v;
+        }
+        for (const sdc::Obj& o : d.ports) {
+            std::string base = o.name.substr(0, o.name.find('['));
+            auto pit = topPort.find(base);
+            if (pit == topPort.end() || !pit->second->internalSymbol || !isSignal(*pit->second->internalSymbol)) continue;
+            if (!done.insert({base + (d.input ? "<" : ">"), c}).second) continue;
+            Sym port = pit->second->internalSymbol;
+            Sym node = m.canon(port);
+            if (s.at.count(node)) continue;  // a clock pin
+            const Type& t = port->as<ValueSymbol>().getType();
+            std::string label = m.pathOf(port) + (d.input ? " (launched by " : " (captured by ") + d.clock + ")";
+            Sym v = pseudo(label, t, port->location);
+            Flop& f = m.flop(v, port->location);
+            f.clkSym = clockNode[c];
+            if (d.input) {
+                m.addComb(port, {m.canon(v)}, true, nullptr);  // the input is that flop
+            } else {
+                f.data = {node};
+                f.from = node;
+                f.fromBits = f.bits;
+                f.plain = false;  // the logic outside reads it
+            }
+        }
+    }
 }
 
 inline void check(Compilation& comp, Report& rep, const Options& opt) {

@@ -21,6 +21,9 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mlint -sdc`: `set_input_delay` / `set_output_delay -clock` give ports a
+  clock domain (virtual clocks included), so an input read without a
+  synchronizer, or an output launched on another clock, is a crossing.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.

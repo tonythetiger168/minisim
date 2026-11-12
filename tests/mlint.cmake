@@ -263,6 +263,22 @@ if(page MATCHES "(src|href)=\"?https?:|url\\(https?:|@import")
   message(FATAL_ERROR "-cdc-html page loads something from the network")
 endif()
 
+# Port domains from set_input_delay / set_output_delay -clock, with a
+# virtual clock: an input read by one flop and an output launched on the
+# wrong clock are crossings; the same clock and a synchronized input are not.
+run(cdc_io.sv "-top;cdc_io;-only;cdc,rdc;-sdc;${SRC}/tests/lint/cdc_io.sdc;-cdc-report")
+foreach(want
+    "virtual clock VIO  3 flops  SDC clock VIO"
+    "cdc_io.din_s (launched by VIO) (virtual clock VIO) -> cdc_io.s1 (cdc_io.clk)  2-flop synchronizer"
+    "[CDC001] 'cdc_io.din_v (launched by VIO)' (clocked by virtual clock VIO) is read by logic clocked by cdc_io.clk through one flop only"
+    "[CDC001] 'cdc_io.dout_v' (clocked by cdc_io.clk) is read by logic clocked by virtual clock VIO with no synchronizer"
+    "2 findings (CDC001 2)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_io.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
 set(one "${out}")
