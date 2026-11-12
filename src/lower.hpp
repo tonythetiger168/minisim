@@ -352,6 +352,13 @@ inline std::function<bool(const slang::ast::Symbol&)>& hideSigIf() {
     return f;
 }
 inline std::vector<int>& hiddenSigs() { static std::vector<int> v; return v; }
+// Per-instance coverage: the g_covInsts id of an instance, named by its path
+// below the top ("" = a top).
+inline uint32_t covInstIdOf(const slang::ast::InstanceSymbol& inst) {
+    std::string p = inst.getHierarchicalPath();
+    size_t dot = p.find('.');
+    return covInstId(dot == std::string::npos ? std::string() : p.substr(dot + 1), std::string(inst.getDefinition().name));
+}
 // Protected code whose lines may not show in coverage (-cov): statements
 // there get no line, so no line or branch coverage is recorded for them.
 inline std::function<bool(slang::SourceLocation)>& hideLocIf() {
@@ -2917,6 +2924,7 @@ struct Lowerer {
             d.line = (uint32_t)covSM()->getLineNumber(ol);
             d.col = (uint32_t)covSM()->getColumnNumber(ol);
         }
+        d.inst = g_covInst;
         d.isOr = orOp;
         d.lazy = lazy;
         d.text = condText(e);
@@ -9463,10 +9471,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         std::string self = inst.isTopLevel() ? curScope : inScope(curScope, std::string(inst.name));
         connectInstance(inst, self);
         curScope = self;
+        uint32_t savedInst = g_covInst;
+        if (g_cov) g_covInst = covInstIdOf(inst);
         int saved = program;
         if (inst.getDefinition().definitionKind == slang::ast::DefinitionKind::Program) program = out.programs++;
         visitDefault(inst);
         program = saved;
+        g_covInst = savedInst;
         curScope = std::move(savedScope);
     }
     // What SDF annotation (32) looks up: each instance's cell, and the
@@ -10025,6 +10036,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     blockIds() = BlockIds{};
     Lowerer::covSM() = comp.getSourceManager();   // statement locations, for coverage and run-time messages
     condDefs().clear();
+    g_covInsts.assign(1, {});
+    g_covInst = 0;
     g_condHits.clear();
     fsmDefs().clear();
     {   // alias statements (10.11), before any signal is made
@@ -10328,6 +10341,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             *sub->prog = std::move(lw.prog);
             continue;
         }
+        g_covInst = 0;
+        if (g_cov)
+            if (const auto* body = sub->sym->getParentScope()->getContainingInstance())
+                if (body->parentInstance) g_covInst = covInstIdOf(*body->parentInstance);
         Lowerer lw(sigmap);
         lw.bind(&subMap, mkSig, &tempSeq, &out.subs);
         lw.setScope(sub->sym);
@@ -10340,6 +10357,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         else lw.stmt(sub->sym->getBody());
         *sub->prog = std::move(lw.prog);
     }
+    g_covInst = 0;
     for (Subr* sub : order) patchImplicit(*sub->prog);
     for (const auto& ex : comp.getDPIExports()) {   // export "DPI-C" (35.5.4)
         using namespace slang::ast;
@@ -10449,7 +10467,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
-                            if (rv.w > 64) Lowerer::unsupported("rand variable wider than 64 bits");
+                            if (rv.w > 64 && (rv.dyn || rv.randc)) Lowerer::unsupported(rv.randc ? "randc variable wider than 64 bits" : "rand container of elements wider than 64 bits");
                         } else Lowerer::unsupported("rand property of this type");
                         if (et->isEnum() && rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // each element: one of the named values
                             RandItem loop;
