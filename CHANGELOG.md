@@ -51,31 +51,17 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
-- VPI assertion API (clause 39): assertions are objects found by
-  `vpi_iterate(vpiAssertion, ...)`; `vpi_register_assertion_cb` reports each
-  attempt's start, success, vacuous success, failure and disabled
-  evaluation, and assertion control; the system callbacks
-  (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
-  assertion operation of `vpi_control` work. See `docs/VPI.md`.
-- VPI object model of SystemVerilog (clause 37): packages, interfaces with
-  modports and programs as instances (`vpi_iterate(vpiInstance, NULL)`);
-  generate scopes, tasks, functions and named blocks as internal scopes;
-  variables and nets report their SystemVerilog type (`vpiBitVar`,
-  `vpiIntVar`, `vpiEnumVar`, `vpiStructVar`, `vpiStringVar`, ...) and have a
-  typespec with enum constants, struct members and typedef names; arrays of
-  any number of dimensions with ranges, `vpi_handle_by_multi_index` and
-  names like `top.m[1][2][3]`; `vpiHighConn`; `pkg::name` in
-  `vpi_handle_by_name`. An application built for IEEE 1364
-  (`vpi_compatibility.h`) keeps that standard's view. See `docs/VPI.md`.
-- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
-  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
-  callback reason and the assertion and coverage declarations of annex M,
-  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
-  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
-  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
-  the caller's mode. New routines `vpi_get_value_array` and
-  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
-  a user system task. See `docs/VPI.md`.
+- `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
+  uvm-core writes (`tr_db.log`): streams, each item's begin, end, fields and
+  parent sequence, those in progress at `-at T`, and stream rows in the
+  viewer's waves.
+- `msim -i` and `msim -do FILE`: interactive simulation like VCS UCLI:
+  `run [T]`, `step`, stops on a signal change, edge or value, `print` of
+  signals and class objects (properties, inherited ones, paths through
+  handles), `force`, `release`, `deposit` and `signals`.
+- `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
+  signal's waves are sent when the page first shows it, so large waveforms
+  are not cut to the one-file page's budget.
 - `mdebug -upf FILE -power [DOMAIN]`: the power domains, their supplies and
   isolation, level-shifter and retention strategies; with the log of
   `msim -upf_verbose`, power states over time. The active trace says when a
@@ -703,8 +689,68 @@ Spec references are IEEE 1800-2023 clauses.
   against 5.8 s. Build option `MINISIM_WITH_BSIM4`.
 - `mspice`: unknowns fixed by a voltage source to ground are eliminated
   first, which keeps the pivots of a long chain of gain stages usable.
+- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
+  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
+  callback reason and the assertion and coverage declarations of annex M,
+  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
+  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
+  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
+  the caller's mode. New routines `vpi_get_value_array` and
+  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
+  a user system task. See `docs/VPI.md`.
+- VPI object model of SystemVerilog (clause 37): packages, interfaces with
+  modports and programs as instances (`vpi_iterate(vpiInstance, NULL)`);
+  generate scopes, tasks, functions and named blocks as internal scopes;
+  variables and nets report their SystemVerilog type (`vpiBitVar`,
+  `vpiIntVar`, `vpiEnumVar`, `vpiStructVar`, `vpiStringVar`, ...) and have a
+  typespec with enum constants, struct members and typedef names; arrays of
+  any number of dimensions with ranges, `vpi_handle_by_multi_index` and
+  names like `top.m[1][2][3]`; `vpiHighConn`; `pkg::name` in
+  `vpi_handle_by_name`. An application built for IEEE 1364
+  (`vpi_compatibility.h`) keeps that standard's view. See `docs/VPI.md`.
+- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
+  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
+  callback reason and the assertion and coverage declarations of annex M,
+  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
+  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
+  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
+  the caller's mode. New routines `vpi_get_value_array` and
+  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
+  a user system task. See `docs/VPI.md`.
+- VPI assertion API (clause 39): assertions are objects found by
+  `vpi_iterate(vpiAssertion, ...)`; `vpi_register_assertion_cb` reports each
+  attempt's start, success, vacuous success, failure and disabled
+  evaluation, and assertion control; the system callbacks
+  (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
+  assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI object model of SystemVerilog (clause 37): packages, interfaces with
+  modports and programs as instances (`vpi_iterate(vpiInstance, NULL)`);
+  generate scopes, tasks, functions and named blocks as internal scopes;
+  variables and nets report their SystemVerilog type (`vpiBitVar`,
+  `vpiIntVar`, `vpiEnumVar`, `vpiStructVar`, `vpiStringVar`, ...) and have a
+  typespec with enum constants, struct members and typedef names; arrays of
+  any number of dimensions with ranges, `vpi_handle_by_multi_index` and
+  names like `top.m[1][2][3]`; `vpiHighConn`; `pkg::name` in
+  `vpi_handle_by_name`. An application built for IEEE 1364
+  (`vpi_compatibility.h`) keeps that standard's view. See `docs/VPI.md`.
+- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
+  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
+  callback reason and the assertion and coverage declarations of annex M,
+  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
+  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
+  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
+  the caller's mode. New routines `vpi_get_value_array` and
+  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
+  a user system task. See `docs/VPI.md`.
 
 ### Fixed
+- msim memory on big VIP benches: a 2-state unpacked array with more than
+  64 elements gets its 0 defaults (6.8) from a loop instead of one
+  instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and
+  an assertion action block (16.14.3) is freed when it finishes instead of
+  at the end of the run (a pass action on every clock grew without bound).
+  A UFS VIP test went from 7.5 GB to 2.3 GB; SD and eMMC tests were killed
+  for memory before.
 - `randomize()` no longer fails when a variable solved first is tied to one
   whose values have holes (`s == d` with `d inside {512, 1024, 4096}` and
   `solve s before d`, or `data.size() == len` with `len` in a set, since
