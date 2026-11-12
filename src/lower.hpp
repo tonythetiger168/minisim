@@ -5023,6 +5023,146 @@ struct Lowerer {
         formatInto(args.subspan(1), dflt, f->fmt, f->kids);
         return sysFnNode(SF_FWRITE, {expr(*args[0]), f}, base == "$fdisplay" ? 1 : 0);
     }
+    // $q_initialize, $q_add, $q_remove, $q_full, $q_exam (20.15): the kernel
+    // keeps the queues; the status (and the other outputs) are written back.
+    E queueCall(const slang::ast::CallExpression& call, std::string_view n) {
+        auto args = call.arguments();
+        if (!stmtDepth) unsupported("a $q_ call outside a procedural statement");
+        auto in = [&](size_t k) { return resize(expr(*args[k]), 32, args[k]->type->isSigned(), true); };
+        auto out = [&](size_t k, E v) {
+            const auto& dst = outArg(*args[k]);
+            Instr w; w.k = IK::Assign;
+            lhs(dst, w);
+            w.e = resize(v, (int)dst.type->getBitWidth(), true, dst.type->isSigned());
+            prog.emit(w);
+        };
+        auto run = [&](int ctl, std::vector<E> kids, int w) {
+            int tmp = fresh(w);
+            Instr h; h.k = IK::Assign; h.sig = tmp; h.e = sysFnNode(SF_QUEUE, std::move(kids), ctl);
+            prog.emit(h);
+            return tmp;
+        };
+        auto last = [&](int ctl) { Val one = mk(0, 32); return resize(sysFnNode(SF_QUEUE, {konst(one)}, ctl), 32, true, true); };
+        if (n == "$q_initialize" && args.size() == 4) { out(3, ref(run(0, {in(0), in(1), in(2)}, 32), true)); return konst(mk(0, 1)); }
+        if (n == "$q_add" && args.size() == 4) { out(3, ref(run(1, {in(0), in(1), in(2)}, 32), true)); return konst(mk(0, 1)); }
+        if (n == "$q_remove" && args.size() == 4) {
+            int st = run(2, {in(0)}, 32);
+            Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Eq, ref(st), konst(mk(0, 32)));   // the outputs change only on success
+            size_t jf = prog.emit(j);
+            out(1, last(3));
+            out(2, last(4));
+            prog.code[jf].target = prog.here();
+            out(3, ref(st, true));
+            return konst(mk(0, 1));
+        }
+        if (n == "$q_full" && args.size() == 2) {
+            int r = run(5, {in(0)}, 64);
+            out(1, slice(ref(r), 31, 0));
+            return resize(slice(ref(r), 63, 32), 32, false, true);
+        }
+        if (n == "$q_exam" && args.size() == 4) {
+            int st = run(6, {in(0), in(1), konst(mk(ticksPerUnit(), 64))}, 32);
+            out(2, last(7));
+            out(3, ref(st, true));
+            return konst(mk(0, 1));
+        }
+        unsupported("this $q_ call");
+    }
+    // $async$and$array and the other PLA tasks (20.16). The personality
+    // memory has one word per output term and one bit per input term, both
+    // counted from the left. A sync task evaluates once, where it is called;
+    // an async one also starts a process that evaluates again whenever an
+    // input term or a memory word changes.
+    bool plaCall(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        bool async = n.starts_with("$async$");
+        if (!async && !n.starts_with("$sync$")) return false;
+        std::string_view rest = n.substr(async ? 7 : 6);
+        int logic = -1;
+        for (auto [name, id] : {std::pair<std::string_view, int>{"and$", 0}, {"or$", 1}, {"nand$", 2}, {"nor$", 3}})
+            if (rest.starts_with(name)) { logic = id; rest.remove_prefix(name.size()); break; }
+        if (logic < 0 || (rest != "array" && rest != "plane")) return false;
+        bool plane = rest == "plane";
+        auto args = call.arguments();
+        if (args.size() != 3) unsupported("PLA task arguments");
+        const Expression& m = peel(*args[0]);
+        if (!ValueExpressionBase::isKind(m.kind)) unsupported("PLA personality that is not a memory");
+        auto shape = arrFind(&m.as<ValueExpressionBase>().symbol);
+        if (!shape || shape->dims.size() != 1) unsupported("PLA personality that is not a one-dimensional memory");
+        int nin = shape->elemW, nout = shape->count;
+        const Expression& dst = outArg(*args[2]);
+        if ((int)args[1]->type->getBitWidth() != nin || (int)dst.type->getBitWidth() != nout)
+            unsupported("PLA terms that do not match the personality memory");
+        bool isAnd = logic == 0 || logic == 2, inv = logic >= 2;
+        auto build = [&](Lowerer& L) {
+            E in = L.expr(*args[1]);
+            std::vector<E> outs;
+            for (int k = 0; k < nout; k++) {
+                E word = ref(shape->base + k);
+                E terms;
+                if (!plane) {   // 1: take the input, 0: leave it out
+                    terms = isAnd ? bin(Op::Or, in, un(Op::Not, word)) : bin(Op::And, in, word);
+                } else {        // 1 the input, 0 its complement, x the worst case, z / ? no part
+                    std::vector<E> bits;
+                    E neutral = konst(mk(isAnd ? 1 : 0, 1));
+                    for (int b = nin - 1; b >= 0; b--) {
+                        E mb = slice(word, b, b), ib = slice(in, b, b);
+                        Val z1 = make(0, 1, 1, 1), x1 = make(0, 1, 1, 0);
+                        E t = mux(bin(Op::CaseEq, mb, konst(mk(1, 1))), ib,
+                                  mux(bin(Op::CaseEq, mb, konst(mk(0, 1))), un(Op::Not, ib),
+                                      mux(bin(Op::CaseEq, mb, konst(z1)), neutral, konst(x1))));
+                        bits.push_back(t);
+                    }
+                    terms = bits.size() == 1 ? bits[0] : concat(bits);
+                }
+                E o = un(isAnd ? Op::RedAnd : Op::RedOr, terms);
+                outs.push_back(inv ? un(Op::Not, o) : o);
+            }
+            E all = outs.size() == 1 ? outs[0] : concat(outs);
+            if (dst.kind == ExpressionKind::Concatenation) {   // {b1, b2, b3}: one write per part
+                int tmp = L.fresh(nout);
+                Instr t; t.k = IK::Assign; t.sig = tmp; t.e = all;
+                L.prog.emit(t);
+                std::vector<std::tuple<const Expression*, int, int>> parts;
+                concatParts(dst, nout - 1, parts);
+                for (auto& [x, hi, lo] : parts) {
+                    Instr w; w.k = IK::Assign;
+                    L.lhs(*x, w);
+                    w.e = slice(ref(tmp), hi, lo);
+                    L.prog.emit(w);
+                }
+                return;
+            }
+            Instr w; w.k = IK::Assign;
+            L.lhs(dst, w);
+            w.e = all;
+            L.prog.emit(w);
+        };
+        build(*this);
+        if (!async) return true;
+        if (!frames.empty() || !store) unsupported("an asynchronous PLA task in an automatic context");
+        Lowerer lw(sigmap);
+        lw.bind(subs, mkSig, tempSeq, store);
+        lw.setScope(scope);
+        std::vector<std::pair<int, Edge>> ev;
+        {   // wait first: the call itself did the first evaluation
+            Lowerer probe(sigmap);
+            probe.bind(subs, mkSig, tempSeq, store);
+            probe.setScope(scope);
+            build(probe);
+            ev = combReadSet(probe.prog);
+        }
+        if (ev.empty()) return true;
+        lw.prog.emit(waitInstr(ev));
+        build(lw);
+        Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+        store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+        Instr f; f.k = IK::Fork; f.join = 2;
+        f.branches.push_back(store->back().get());
+        f.blays.push_back(nullptr);
+        prog.emit(f);
+        return true;
+    }
     // $fgets(str, fd) (21.3.4): the line is written only if one was read.
     E fgetsCall(const slang::ast::CallExpression& call) {
         auto args = call.arguments();
@@ -5395,6 +5535,7 @@ struct Lowerer {
                 }
         }
         if (n == "$system") return args.empty() ? sysFnNode(SF_SYSTEM, {}) : sysFnNode(SF_SYSTEM, {strOf(*args[0])});
+        if (n.starts_with("$q_")) return queueCall(call, n);   // 20.15
         if (n == "$urandom") return args.empty() ? sysFnNode(SF_URANDOM, {}) : sysFnNode(SF_URANDOM_SEED, {a(0)});
         if (n == "$urandom_range" && !args.empty()) {
             std::vector<E> k{a(0)};
@@ -6371,6 +6512,13 @@ struct Lowerer {
             }
             Instr i; i.k = IK::Display;
             i.fmt = escPct("Time scale of (" + name + ") is " + expStr(u) + " / " + expStr(pr));
+            prog.emit(i);
+            return;
+        }
+        if (plaCall(call, n)) return;   // 20.16
+        if (n == "$stacktrace") {   // 20.17: the scope of the call (there is no standard format)
+            Instr i; i.k = IK::Display;
+            i.fmt = escPct("$stacktrace: " + scopeName(call));
             prog.emit(i);
             return;
         }

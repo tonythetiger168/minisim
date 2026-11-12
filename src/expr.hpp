@@ -47,7 +47,9 @@
 #include <algorithm>
 #include <functional>
 #include <initializer_list>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -1446,6 +1448,11 @@ enum SysFnId : int {
     SF_DIST_T,           // (seed, degrees of freedom)
     SF_DIST_ERLANG,      // (seed, k, mean)
     SF_SYSTEM,           // $system(command) (20.17): the shell's exit status
+    // $q_* (20.15), ctl: 0 initialize(id, type, max), 1 add(id, job, inform), 2 remove(id),
+    // 3 the job and 4 the inform value of the last entry removed, 5 full(id),
+    // 6 exam(id, code, ticks per unit), 7 the value of the last exam. The result is the status
+    // (5: full << 32 | status).
+    SF_QUEUE,
     SF_ASSOC_BOUND,      // $low / $high of associative array `sig` (20.7): lo 0 lowest key, 1 highest; x if empty
     SF_FREAD,            // $fread (21.3.4.4): read up to kid1 bytes of fd kid0 into freadBuf(); the count read
     SF_FREAD_GET,        // freadBuf() as a big-endian value of ctl bits (missing bytes read as 0)
@@ -2001,6 +2008,67 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
                     break;
             }
             return make(((uint64_t)(uint32_t)seed << 32) | (uint32_t)r, 0, 64, 0);
+        }
+        case SF_QUEUE: {   // 20.15: stochastic queues
+            struct QEntry { int32_t job, inform; uint64_t at; };
+            struct Q { int type = 1; int64_t max = 0; std::deque<QEntry> e; uint64_t arrivals = 0, firstAt = 0, lastAt = 0;
+                       size_t maxLen = 0; uint64_t removed = 0, waitSum = 0, minWait = 0; };
+            static std::map<int32_t, Q> qs;
+            static std::mutex mu;
+            static thread_local int32_t lastJob = 0, lastInform = 0, lastExam = 0;
+            if (ctl == 3) return sint(lastJob);
+            if (ctl == 4) return sint(lastInform);
+            if (ctl == 7) return sint(lastExam);
+            std::lock_guard<std::mutex> lk(mu);
+            int32_t qid = i32(a[0]);
+            if (ctl == 0) {
+                int32_t type = i32(a[1]), max = i32(a[2]);
+                if (type != 1 && type != 2) return sint(4);
+                if (max <= 0) return sint(5);
+                if (qs.count(qid)) return sint(6);
+                Q q; q.type = type; q.max = max;
+                qs[qid] = q;
+                return sint(0);
+            }
+            auto it = qs.find(qid);
+            if (it == qs.end()) return ctl == 5 ? make(2, 0, 64, 0) : sint(2);
+            Q& q = it->second;
+            switch (ctl) {
+                case 1:
+                    if ((int64_t)q.e.size() >= q.max) return sint(1);
+                    q.e.push_back({i32(a[1]), i32(a[2]), g_simTime});
+                    if (!q.arrivals) q.firstAt = g_simTime;
+                    q.arrivals++; q.lastAt = g_simTime;
+                    q.maxLen = std::max(q.maxLen, q.e.size());
+                    return sint(0);
+                case 2: {
+                    if (q.e.empty()) return sint(3);
+                    QEntry en = q.type == 1 ? q.e.front() : q.e.back();
+                    if (q.type == 1) q.e.pop_front(); else q.e.pop_back();
+                    uint64_t w = g_simTime - en.at;
+                    q.minWait = q.removed ? std::min(q.minWait, w) : w;
+                    q.removed++; q.waitSum += w;
+                    lastJob = en.job; lastInform = en.inform;
+                    return sint(0);
+                }
+                case 5: return make(((uint64_t)((int64_t)q.e.size() >= q.max ? 1 : 0) << 32), 0, 64, 0);
+                case 6: {
+                    uint64_t tpu = a.size() > 2 && u64(a[2]) ? u64(a[2]) : 1;
+                    uint64_t v = 0;
+                    switch (i32(a[1])) {
+                        case 1: lastExam = (int32_t)q.e.size(); return sint(0);
+                        case 2: v = q.arrivals > 1 ? (q.lastAt - q.firstAt) / (q.arrivals - 1) : 0; break;
+                        case 3: lastExam = (int32_t)q.maxLen; return sint(0);
+                        case 4: v = q.minWait; break;
+                        case 5: for (auto& en : q.e) v = std::max(v, g_simTime - en.at); break;
+                        case 6: v = q.removed ? q.waitSum / q.removed : 0; break;
+                        default: lastExam = 0; return sint(0);
+                    }
+                    lastExam = (int32_t)((v + tpu / 2) / tpu);
+                    return sint(0);
+                }
+            }
+            return sint(0);
         }
         case SF_SYSTEM: {   // 20.17: run the command in a shell; the result is its exit status
             Val c = a.empty() ? mkstr("") : a[0];
