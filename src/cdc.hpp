@@ -2747,9 +2747,9 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
     }
 
     // set_case_analysis 0/1: the signal is constant, like -static.
-    for (const sdc::CaseAnalysis& ca : rd.sdc.caseAnalysis)
+    for (const cdcsdc::CaseAnalysis& ca : rd.sdc.caseAnalysis)
         if (ca.value == "0" || ca.value == "1" || ca.value == "zero" || ca.value == "one")
-            for (const sdc::Obj& o : ca.objects)
+            for (const cdcsdc::Obj& o : ca.objects)
                 if (Sym c = view.at(o)) m.statics.insert(c);
 
     // Ports: set_input_delay -clock C says a flop clocked by C (outside the
@@ -2774,7 +2774,7 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
             if (ps->kind == SymbolKind::Port && !topPort.count(std::string(ps->name)))
                 topPort[std::string(ps->name)] = &ps->as<PortSymbol>();
     std::set<std::pair<std::string, int>> done;
-    for (const sdc::IoDelay& d : rd.sdc.ioDelays) {
+    for (const cdcsdc::IoDelay& d : rd.sdc.ioDelays) {
         auto ci = ix.find(d.clock);
         if (d.clock.empty() || ci == ix.end()) continue;
         int c = ci->second;
@@ -2783,7 +2783,7 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
             s.at[v].push_back(c);
             clockNode[c] = v;
         }
-        for (const sdc::Obj& o : d.ports) {
+        for (const cdcsdc::Obj& o : d.ports) {
             std::string base = o.name.substr(0, o.name.find('['));
             auto pit = topPort.find(base);
             if (pit == topPort.end() || !pit->second->internalSymbol || !isSignal(*pit->second->internalSymbol)) continue;
