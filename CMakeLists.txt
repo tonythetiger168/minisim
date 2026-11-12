@@ -267,6 +267,11 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_smoke
                      -P ${CMAKE_SOURCE_DIR}/tests/mregress.cmake)
+    # -farm slurm on a real one-node Slurm (CI starts it); skips without one.
+    add_test(NAME mregress_slurm
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_slurm
+                     -P ${CMAKE_SOURCE_DIR}/tests/mregress_slurm.cmake)
   endif()
   # mplan: a verification plan scored against a regression (tests/plan).
   if(Python3_FOUND)
@@ -288,6 +293,10 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_excl
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_excl.cmake)
+    add_test(NAME msim_cov_select
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_select
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_cov_select.cmake)
     add_test(NAME msim_cov_inst
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_inst
@@ -344,6 +353,9 @@ if(MINISIM_WITH_SLANG)
       add_test(NAME icarus/${name}
                COMMAND ${CMAKE_COMMAND} -DSIM=${IVERILOG} -DVVP=${VVP} -DSV=${sv}
                        -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
+      # Both runs work in tests/spec: a test that writes a file there
+      # ($fopen, $writememh) must not run under both simulators at once.
+      set_tests_properties(spec/${name} icarus/${name} PROPERTIES RESOURCE_LOCK spec_${name})
     endif()
   endforeach()
 
