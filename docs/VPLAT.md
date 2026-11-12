@@ -1,0 +1,267 @@
+# mvplat: virtual platforms
+
+`mvplat` runs the software of a system before its hardware exists. A
+platform is a set of RISC-V harts and a memory map of peripheral models; the
+software is the same ELF file the real board will boot. It is the
+counterpart of Synopsys Virtualizer, Cadence Helium and Siemens Vista.
+
+```sh
+mvplat prog.elf                                  # the built-in board
+mvplat -platform soc.json prog.elf               # a board described in JSON
+mvplat -platform soc.json prog.elf -harts 8      # eight harts, on every core
+mvplat prog.elf -trace commits.log               # what ran, in spike's format
+```
+
+The exit code is the program's own (the test finisher or HTIF `tohost`), so a
+software test is a CI job like any other.
+
+**Free and licensed parts.** The engine described here, which includes the
+harts, time, several harts on several threads, the bundled devices, the
+platform file and the commit log, is part of the free edition
+(Apache-2.0). A licensed extension library adds the
+following:
+
+- the gdb server (`-gdb`)
+- checkpoints (`-save`, `-restore`)
+- the profile (`-profile`)
+- `mvp` model libraries on the bus (C, C++ and SystemC/TLM-2.0 models, the
+  same files `msim -mvp` takes)
+- RTL windows simulated by `msim` in lock step, with DMA from the RTL into
+  the platform
+
+mvplat loads the extension the first time a run asks for one of these, from
+`$MVPLAT_EXT` or from `<prefix>/lib/minisim/libmvplat_ext.so`. The extension
+runs on the same engine, not a copy of it: it builds against the
+headers installed in `<prefix>/include/minisim/vp` (`vp/ext.hpp` is the
+interface). Without the extension, such a run stops with a message that
+names what is missing. Sections marked *(extension)* describe these parts.
+
+## What it simulates
+
+**Harts.** RV32IMAC with Zicsr and Zifencei, machine and user mode:
+`mstatus`, `mtvec` (direct and vectored), `mepc`, `mcause`, `mtval`, `mie`,
+`mip`, `mscratch`, `mcounteren`, `mcountinhibit`, the cycle, time and
+instret counters, `mhartid`, physical memory protection (16 entries, 4-byte grain: OFF, TOR,
+NA4 and NAPOT, locked entries, MPRV), and the Sdtrig CSRs reporting no
+triggers. One instruction per cycle; WFI sleeps
+until an interrupt is pending. Misaligned loads and stores are done, not
+trapped. The RISC-V architecture tests (riscv-tests: rv32ui, rv32um, rv32ua,
+rv32uc, rv32mi, 77 programs) all pass; `tests/mvplat_isa.sh` runs them.
+
+**Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000) on
+its own and then the platform synchronises: devices see time move and
+interrupts are re-evaluated. This is SystemC TLM-2.0's temporal decoupling.
+A quantum ends early at the next timer compare and at the next callback an
+mvp model has armed, so timer interrupts and model delays arrive on time
+whatever the quantum.
+
+**Several harts, several threads.** Harts run in parallel, one per thread
+(`-threads N`, default every CPU). Each hart's stores go to its own write
+buffer during a round and are written back in hart order at its end;
+accesses with side effects (peripheral registers, atomics, LR/SC, HTIF) wait
+for the ordered phase of the round and happen in hart order there. The run
+therefore does not depend on the thread count or on the operating system's
+scheduler: the console, the commit log and the profile are the same, byte
+for byte, on 1 thread and on 64. The test suite checks exactly that.
+
+## The platform file
+
+JSON, with `//` and `/* */` comments. Numbers may be written as strings, in
+hex, with `K`, `M`, `G` suffixes for sizes. Paths are relative to the file.
+
+```json
+{
+  "name": "my-soc",
+  "harts": 2,
+  "mhz": 100,                // hart clock (default 100)
+  "mtime_hz": 10000000,      // CLINT mtime rate (default 10 MHz)
+  "quantum": 1000,           // cycles between synchronisations
+  "reset": "0x80000000",     // the pc before an ELF entry point overrides it
+  "devices": [
+    {"type": "finisher",  "base": "0x00100000"},
+    {"type": "clint",     "base": "0x02000000"},
+    {"type": "plic",      "base": "0x0c000000", "sources": 32},
+    {"type": "uart16550", "name": "uart0", "base": "0x10000000", "irq": 10, "input": "hi\n"},
+    {"type": "rom",       "name": "boot", "base": "0x00001000", "size": "4K", "file": "boot.bin"},
+    {"type": "ram",       "name": "dram", "base": "0x80000000", "size": "128M"},
+    {"type": "mvp", "name": "models", "irq": 20,
+     "sources": ["dma.c", "codec.cpp"], "cflags": "-DFAST",
+     "env": {"DMA_BASE": "0x40000000"}},
+    {"type": "rtl", "name": "acc", "base": "0x40100000", "size": "0x1000", "irq": 30,
+     "msim": ["acc.sv", "acc_tb.sv", "-top", "acc_tb"]}
+  ]
+}
+```
+
+Without `-platform`, the built-in `virt32` board is used: the finisher,
+CLINT, PLIC and UART above, and 128 MiB of RAM at `0x80000000` (`-map` prints
+it). It is the address map most RISC-V bare-metal software already targets.
+
+| Device | Registers | Notes |
+| --- | --- | --- |
+| `ram`, `rom` | plain memory | `file` (and `offset`) preloads it; a ROM refuses writes with an access fault |
+| `uart16550` | 16550 at `base + (index << shift)` | transmit goes to stdout; `input` (or `-input` for the first UART) is what it receives; interrupt on receive data and on THR empty |
+| `clint` | `msip` at `4*h`, `mtimecmp` at `0x4000 + 8*h`, `mtime` at `0xbff8` | `mtime` follows the asking hart's cycle count |
+| `plic` | priorities, pending, per-hart enables, threshold, claim/complete | one M-mode context per hart; level-triggered sources |
+| `finisher` | `0x5555` passes, `0x3333 \| code << 16` fails with `code` | the SiFive test device |
+| `mvp` | the library's own map (`mvp_add_device`) | see below |
+| `rtl` | whatever the RTL decodes | see below |
+
+A program with a `tohost` symbol (the RISC-V tests, proxy kernels) can also
+end the run through HTIF: `(code << 1) | 1` written to `tohost`.
+
+## mvp models on the platform *(extension)*
+
+An `mvp` device is a library of models written against `mvp.h`: exactly the
+files `msim -mvp` takes. `sources` builds it (with `mvp/mvp.c`, the shared
+runtime); `lib` names one already built. The models register their own
+devices and addresses; `env` sets the environment variables they read
+before they do. Line *n* of the library's interrupts (`mvp_set_irq`) is PLIC
+source `irq + n`. A model's `mvp_after_ps` callbacks run at their time, on
+the platform's clock, so a UART model's character time is the same here as
+in RTL simulation.
+
+So one model serves twice: under `msim -mvp` the RTL CPU drives it over
+AXI4-Lite; under `mvplat` the instruction-set simulator does. The SystemC
+adapter in `mvp_tlm.h` comes along, which puts any TLM-2.0 target on the
+platform's bus (`cflags` / `env` carry the SystemC paths, as in VPROTO.md).
+
+## RTL in the platform *(extension)*
+
+An `rtl` device gives a window of the map to a block simulated by `msim`.
+`mvplat` starts `msim` with the arguments in `msim` (paths beside the platform
+file are found), adding `mvp/sv/mvp_vp.sv` and `mvp/mvp_vp.c`; the testbench
+instances `mvp_vp_master`, an AXI4-Lite master, wires it to the block and
+drives a clock and a reset:
+
+```systemverilog
+mvp_vp_master #(.ADDR_W(32), .DATA_W(32), .IRQ_N(1)) vp (
+    .aclk(clk), .aresetn(rst_n),
+    .awaddr, .awprot, .awvalid, .awready, .wdata, .wstrb, .wvalid, .wready,
+    .bresp, .bvalid, .bready, .araddr, .arprot, .arvalid, .arready,
+    .rdata, .rresp, .rvalid, .rready, .irq(irq));
+```
+
+The two simulators run in lock step over a socket pair, with no wall clock in
+between:
+
+- At every quantum the platform tells the RTL to run up to the platform's
+  time; the RTL answers with its interrupt lines (PLIC sources `irq` to
+  `irq + irq_lines - 1`).
+- When a hart reaches the window, the RTL is first brought to the hart's
+  time, then performs the access as an AXI4-Lite transaction on the bus
+  width, with byte strobes for narrow writes. The hart waits for the RTL's
+  answer, and its own clock moves on by the time the transaction took.
+  `SLVERR` and `DECERR` arrive as access faults.
+- When the program ends, the platform ends the simulation with `$finish`, so
+  `final` blocks run, and `msim`'s exit code is checked: if it is not 0, the
+  run fails.
+
+**DMA from RTL.** A bus master in the RTL (a DMA engine, a second CPU)
+reaches the platform's memory map through `mvp_vp_slave`, an AXI4-Lite slave
+in the same file:
+
+```systemverilog
+mvp_vp_slave #(.ADDR_W(32), .DATA_W(32)) mem (
+    .aclk(clk), .aresetn(rst_n),
+    .awaddr, .awprot, .awvalid, .awready, .wdata, .wstrb, .wvalid, .wready,
+    .bresp, .bvalid, .bready, .araddr, .arprot, .arvalid, .arready,
+    .rdata, .rresp, .rvalid, .rready);
+```
+
+Each transfer is one bus word with its byte strobes. The platform serves it
+at once, from RAM, ROM or a peripheral, at the RTL's time. An address that
+nothing maps, a write to ROM, or a device that refuses the access answers
+SLVERR. The platform address is the AXI address plus the device's
+`dma_offset` (default 0). As with any other store, a hart executes code that
+DMA wrote only after `FENCE.I`.
+
+`rtl_base` is the address the RTL sees for the window's first byte (default
+0). One `rtl` device per platform. `MVPLAT_MSIM` (or `msim_path` in the
+device) names the simulator when it is not on `PATH`.
+
+## Debugging
+
+`-trace FILE` writes a commit log, one line per instruction with the
+register written and the memory touched, in spike's format, so a run can be
+compared line by line with another simulator.
+
+*(extension)* `-gdb PORT` waits for gdb before the first instruction (`-gdb 0` takes any
+free port and `-gdb-portfile FILE` writes it down). gdb sees one thread per
+hart and needs no setup: the server sends the `riscv:rv32` target
+description, with the machine CSRs. Supported: breakpoints (`Z0`, `Z1`),
+watchpoints on write, read and access (`Z2`, `Z3`, `Z4`), single step,
+continue, Ctrl-C, register and memory reads and writes, detach and kill. An `ebreak` in the program stops in gdb rather
+than trapping when gdb is attached. The platform is all-stop.
+
+*(extension)* `-profile FILE` (or `-` for stdout) writes the instruction mix of every hart,
+the hot functions (from the ELF symbols), and the accesses each peripheral
+received.
+
+## Checkpoints *(extension)*
+
+`-save FILE` saves the platform when the run stops: every hart, every
+device, all of memory (only the pages that hold something). Use it with
+`-max-cycles` to stop after a boot, and `-restore FILE` to start any number of
+later runs from there; a restored run continues exactly as the original
+would have. `-restore` checks that the platform file describes the same
+board. A platform with an `mvp` library or an `rtl` window cannot be saved:
+their state lives outside the platform, and the save says so.
+
+## Options
+
+| Option | |
+| --- | --- |
+| `-platform FILE` | the platform (default: the built-in `virt32`) |
+| `-elf FILE` | the program (or give it as the first plain argument) |
+| `-harts N` | override the platform's hart count |
+| `-threads N`, `-j N` | threads for the harts (default: every CPU) |
+| `-quantum N` | cycles between synchronisations (default 1000) |
+| `-mhz F` | hart clock |
+| `-max-cycles N` | stop after N cycles, exit code 4 |
+| `-input TEXT` | what the first UART receives |
+| `-trace FILE` | commit log |
+| `-profile FILE` | profile (`-`: stdout) *(extension)* |
+| `-gdb PORT`, `-gdb-portfile FILE` | gdb server *(extension)* |
+| `-save FILE`, `-restore FILE` | checkpoints *(extension)* |
+| `-map` | print the memory map |
+| `-q` | no summary line |
+
+Exit codes: the program's own; 2 for a usage, platform or model error; 3
+when every hart waits for an interrupt nothing can send; 4 at `-max-cycles`.
+
+## Performance
+
+Measured on the container this was developed in (4 cores), with
+`tests/vplat/bench.c` (a sieve and a CRC per hart, no sharing):
+
+| Run | Speed |
+| --- | --- |
+| 1 hart | 150 to 170 MIPS |
+| 4 harts, 4 threads | 190 to 200 MIPS in all |
+
+Each hart keeps a cache of decoded instructions (8192 entries, by address),
+so an instruction is fetched, expanded from its compressed form and split
+into fields once. As the ISA allows, a hart sees a store to code only after
+it executes `FENCE.I`; loading a program, a debugger write and `-restore`
+empty the cache too. Loads and stores to plain memory with nothing to check
+(no PMP in force, no watchpoint, no write buffer) take an inline path. RAM is
+mapped on first touch, so a large memory costs nothing until it is used. A
+co-simulated RTL access costs two socket round trips plus the RTL's own
+simulation time.
+
+## Limits / Not yet
+
+- RV32 only: no RV64, no F/D (floating point), no V, no B (bit-manipulation)
+  extensions, and no supervisor mode or MMU, so no Linux. Bare-metal
+  software, RTOSes (FreeRTOS, Zephyr) and the architecture tests run.
+- No hardware triggers, no Smepmp (`mseccfg`).
+- One instruction per cycle: no pipeline or cache timing model.
+- No Spike or QEMU back end yet (Spike is BSD-licensed and could be linked;
+  QEMU is GPL and could only run as a separate program).
+- One `rtl` window per platform, AXI4-Lite only (no AXI4 bursts, no
+  outstanding transactions); a DMA transfer is one bus word.
+- No IP-XACT import, no GUI; platform files are JSON.
+- Checkpoints exclude `mvp` libraries and RTL windows.
+- The commit log follows spike's layout but has not been compared with spike
+  line by line in CI.
