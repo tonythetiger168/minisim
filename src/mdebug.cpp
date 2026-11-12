@@ -1045,6 +1045,38 @@ struct Tool {
     DB db;
     Vcd vcd;
     bool haveVcd = false;
+    // Class objects in the waveform (msim -vcd-class): tb.p.addr follows the
+    // object handle tb.p points to. Each (wave path, handle signal) is
+    // signal db.signals.size() + k in the page and in script answers.
+    std::vector<std::pair<std::string, int>> objs;
+    void findObjs() {
+        objs.clear();
+        if (!haveVcd) return;
+        for (size_t i = 0; i < db.signals.size(); i++) {
+            if (!db.signals[i]->getType().getCanonicalType().isClass()) continue;
+            const std::string pre = path(*db.signals[i]) + ".";
+            std::vector<std::pair<int, std::string>> kids;   // in the waveform's order: as declared
+            for (auto it = vcd.byName.lower_bound(pre); it != vcd.byName.end() && it->first.compare(0, pre.size(), pre) == 0; ++it)
+                kids.emplace_back(it->second, it->first);
+            std::sort(kids.begin(), kids.end());
+            for (auto& [w, n] : kids) objs.emplace_back(n, (int)i);
+        }
+    }
+    // The waveform name of page signal i (a design signal or an object view).
+    std::string wavePath(size_t i) {
+        return i < db.signals.size() ? path(*db.signals[i]) : objs[i - db.signals.size()].first;
+    }
+    // An object view by its path, or a unique tail of it.
+    const std::string* findObj(const std::string& name) {
+        const std::string* hit = nullptr;
+        int n = 0;
+        for (auto& o : objs) {
+            const std::string& p = o.first;
+            if (p == name) return &p;
+            if (p.size() > name.size() && p.ends_with(name) && p[p.size() - name.size() - 1] == '.') { hit = &p; n++; }
+        }
+        return n == 1 ? hit : nullptr;
+    }
     unsigned threads = 1;
 
     std::string guardText(const Guard& g) {
@@ -2386,6 +2418,13 @@ struct Tool {
                 if (a.size() < 2) { std::cerr << "mdebug: " << c << " needs a signal\n"; return nullptr; }
                 return find(a[1]);
             };
+            // value / changes also take an object view (tb.p.addr), which is not a design signal.
+            std::string objName;
+            auto objSig = [&]() -> const Symbol* {
+                if (a.size() > 1 && haveVcd && !db.byPath.count(a[1]))
+                    if (const std::string* o = findObj(a[1])) { objName = *o; return nullptr; }
+                return sig();
+            };
             auto needWave = [&](const Symbol* s) -> const Wave* {
                 if (!haveVcd) { std::cerr << "mdebug: " << c << " needs -vcd <file>\n"; return nullptr; }
                 const Wave* w = vcd.find(path(*s));
@@ -2410,26 +2449,26 @@ struct Tool {
                     body += "]";
                 }
             } else if (c == "value") {
-                const Symbol* s = sig();
-                const Wave* w = s ? needWave(s) : nullptr;
+                const Symbol* s = objSig();
+                const Wave* w = s ? needWave(s) : objName.empty() ? nullptr : vcd.find(objName);
                 if (!w) ok = false;
                 else {
                     uint64_t t = num(2).value_or(vcd.end);
                     int i = w->at(t);
-                    body = "\"signal\":" + js(path(*s)) + ",\"time\":" + std::to_string(t) + ",\"value\":" +
+                    body = "\"signal\":" + js(s ? path(*s) : objName) + ",\"time\":" + std::to_string(t) + ",\"value\":" +
                            js(i < 0 ? "x" : showBits(w->bits(i))) + ",\"bits\":" + js(i < 0 ? "" : w->bits(i)) +
                            ",\"since\":" + std::to_string(i < 0 ? 0 : w->ch[i].t);
                 }
             } else if (c == "changes") {
-                const Symbol* s = sig();
-                const Wave* w = s ? needWave(s) : nullptr;
+                const Symbol* s = objSig();
+                const Wave* w = s ? needWave(s) : objName.empty() ? nullptr : vcd.find(objName);
                 if (!w) ok = false;
                 else {
                     uint64_t t0 = num(2).value_or(0), t1 = num(3).value_or(vcd.end);
                     const size_t cap = 10000;
                     size_t n = 0;
                     bool more = false;
-                    body = "\"signal\":" + js(path(*s)) + ",\"changes\":[";
+                    body = "\"signal\":" + js(s ? path(*s) : objName) + ",\"changes\":[";
                     for (int i = std::max(0, w->at(t0)); i < (int)w->ch.size() && w->ch[i].t <= t1; i++) {
                         if (w->ch[i].t < t0) continue;
                         if (n == cap) { more = true; break; }
@@ -2568,6 +2607,11 @@ struct Tool {
                << (ty.isIntegral() ? (int)ty.getBitWidth() : 0) << ",\"type\":" << js(ty.toString())
                << ",\"file\":" << sw[i].file << ",\"line\":" << sw[i].line << "}";
         }
+        for (auto& [p, h] : objs) {   // object views: "of" is the handle, where the page shows them
+            const Wave* w = vcd.find(p);
+            os << ",\n{\"path\":" << js(p) << ",\"width\":" << (w ? w->width : 0) << ",\"type\":\"property\",\"file\":"
+               << sw[(size_t)h].file << ",\"line\":" << sw[(size_t)h].line << ",\"of\":" << h << "}";
+        }
         os << "],\n\"drivers\":[";
         auto ids = [&](const std::vector<const Symbol*>& v) {
             std::string o = "[";
@@ -2612,9 +2656,10 @@ struct Tool {
             if (live) { os << ",\"live\":true}\n"; return; }
             os << ",\"waves\":{";
             first = true;
-            std::vector<std::string> part(db.signals.size());
-            std::vector<const Wave*> wv(db.signals.size());
-            for (size_t i = 0; i < db.signals.size(); i++) wv[i] = vcd.find(path(*db.signals[i]));
+            const size_t nSig = db.signals.size() + objs.size();
+            std::vector<std::string> part(nSig);
+            std::vector<const Wave*> wv(nSig);
+            for (size_t i = 0; i < nSig; i++) wv[i] = vcd.find(wavePath(i));
             // A page a browser can open: a budget of changes over all signals.
             size_t waved = 0, cutSigs = 0;
             for (const Wave* w : wv) waved += w != nullptr;
@@ -2624,7 +2669,7 @@ struct Tool {
                 std::cerr << "mdebug: the waves of " << cutSigs << " signals are cut to " << maxChanges << " changes each in the page, "
                           << (center ? "around -at" : "from the start; -at T keeps the changes around T")
                           << " (-max-changes N for more per signal; -serve sends every signal whole, on demand)\n";
-            parallelFor(db.signals.size(), threads, [&](size_t i) {
+            parallelFor(nSig, threads, [&](size_t i) {
                 const Wave* w = wv[i];
                 if (!w) return;
                 std::string& o = part[i];
@@ -2664,7 +2709,7 @@ struct Tool {
     static constexpr size_t kLiveChanges = 4000000;   // per signal
 
     std::string waveJsonOf(size_t sig) {
-        const Wave* w = sig < db.signals.size() && haveVcd ? vcd.find(path(*db.signals[sig])) : nullptr;
+        const Wave* w = sig < db.signals.size() + objs.size() && haveVcd ? vcd.find(wavePath(sig)) : nullptr;
         if (!w) return "null";
         std::string o = "[";
         size_t n = std::min(w->ch.size(), kLiveChanges), k0 = 0;
@@ -2934,6 +2979,7 @@ int main(int argc, char** argv) {
         std::string err;
         if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
         tool.haveVcd = true;
+        tool.findObjs();
     }
 
     bool ok = true;
@@ -2951,10 +2997,14 @@ int main(int argc, char** argv) {
         else if (q.what == "scopes")
             for (auto& s : tool.db.scopes)
                 std::cout << s.path << "  (" << s.def << ")  " << tool.db.src.at(tool.db.src.where(s.loc)) << "\n";
-        else if (q.what == "signals")
+        else if (q.what == "signals") {
             for (auto* s : tool.db.signals)
                 std::cout << path(*s) << "  " << s->getType().toString() << "  "
                           << tool.db.src.at(tool.db.src.where(s->location)) << "\n";
+            for (auto& [p, h] : tool.objs)
+                std::cout << p << "  property of the object " << path(*tool.db.signals[(size_t)h]) << " points to  ("
+                          << tool.vcd.find(p)->width << " bits, from the waveform)\n";
+        }
     }
 
     if (!scriptPath.empty()) {
