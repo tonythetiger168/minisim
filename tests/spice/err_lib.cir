@@ -1,0 +1,7 @@
+a .lib section that the file does not have
+.lib 'corners.lib' ff
+v1 a 0 1
+r1 a 0 1k
+.op
+*> error "no .lib section 'ff'"
+.end

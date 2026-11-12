@@ -823,6 +823,8 @@ struct DynObj {
     std::vector<Val> vec;
     std::map<DynKey, Val> map;
     Val dflt;                   // what a missing element reads as
+    Val typeDflt;               // dflt before a '{default: v} replaced it (7.9.11)
+    bool userDflt = false;      // dflt comes from a '{default: v}
     std::shared_ptr<DynObj> elem;   // elements that are containers: their empty shape (an element holds the id)
     int64_t bound = -1;         // queue [$:N]: at most N + 1 elements
     bool strKey = false;        // associative: string index

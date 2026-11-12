@@ -1,0 +1,23 @@
+.noise: shot, channel and flicker noise of the devices
+* Checked against ngspice 42 (noise v(k) vin dec 10 10 100meg): total output
+* noise 4.845824e-4 V, input-referred 4.391118e-4 V. ngspice integrates the
+* input-referred noise a little differently, hence 1 % there.
+vdd vdd 0 3
+vin in 0 dc 1.0 ac 1
+rg in g 1k
+m1 d g 0 0 nm w=20u l=1u
+rd vdd d 10k
+cl d 0 1p
+q1 c d e qn
+rc vdd c 5k
+re e 0 1k
+d1 c k dm
+rk k 0 100k
+.model nm nmos level=1 vto=0.6 kp=100u lambda=0.02 tox=10n kf=1e-26 af=1 cgso=0.3n cgdo=0.3n
+.model qn npn is=1e-16 bf=120 rb=50 kf=1e-15 af=1 cje=0.2p cjc=0.1p
+.model dm d is=1e-14 kf=1e-16 rs=10
+.noise v(k) vin dec 10 10 100meg
+*> onoise_total 4.845824e-4 1e-3
+*> inoise_total 4.391118e-4 1e-2
+*> no-ngspice
+.end
