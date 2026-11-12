@@ -24,6 +24,8 @@ set(CASES
   "-cfiles 3 examples/timeps.sv"
   "examples/loopreset.sv"
   "-cfiles 3 examples/loopreset.sv"
+  "examples/seqtemp.sv"
+  "-cfiles 3 examples/seqtemp.sv"
   "examples/islands.sv"
   "examples/combbranch.sv"
   "examples/combcycle.sv"

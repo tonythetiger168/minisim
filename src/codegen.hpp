@@ -1336,18 +1336,36 @@ private:
         domRoot_.resize(sigs.size());
         for (size_t x = 0; x < sigs.size(); x++) domRoot_[x] = find((int)x);
         std::vector<std::vector<int>> groups;
+        std::set<int> fixedNba;   // fixed NBA targets of every clocked process
+        for (auto& pr : procs)
+            if (pr.seq && pr.combRank < 0)
+                for (auto& in : pr.prog->code) if (in.k == IK::Nba && !in.arr && in.aidx.empty()) fixedNba.insert(in.sig);
         for (size_t i = 0; i < procs.size(); i++) {
             if (!procs[i].seq || procs[i].combRank >= 0) continue;
             bool forward = true;
+            const char* why = "";
+            int whyLine = 0;
             const auto& code = procs[i].prog->code;
             for (size_t pc = 1; pc + 1 < code.size(); pc++) {
-                if ((code[pc].k == IK::Jmp || code[pc].k == IK::JmpIfNot) && code[pc].target <= pc) forward = false;
-                if (code[pc].k == IK::JmpIfNot && code[pc].xt != Instr::NOX) forward = false;   // a three-way jump: an ordinary clocked function
-                if (code[pc].k == IK::Assign) forward = false;
-                if (code[pc].arr || code[pc].bidx) forward = false;   // no fixed slot: an ordinary clocked function
+                if ((code[pc].k == IK::Jmp || code[pc].k == IK::JmpIfNot) && code[pc].target <= pc) { forward = false; why = "loop"; whyLine = code[pc].line; }
+                if (code[pc].k == IK::JmpIfNot && code[pc].xt != Instr::NOX) { forward = false; why = "three-way jump"; whyLine = code[pc].line; }   // a three-way jump: an ordinary clocked function
+                // A temporary of the process (msim.cpp: localizeSeqBlocking) is a plain store.
+                const bool tmpw = code[pc].k == IK::Assign && code[pc].tmp && code[pc].drv < 0 && !code[pc].arr && code[pc].aidx.empty();
+                if (code[pc].k == IK::Assign && !tmpw) {
+                    forward = false; why = "blocking assign"; whyLine = code[pc].line;
+                }
+                // An array element chosen at run time: its write goes to the
+                // kernel's NBA list (dseq's nb, before the slots commit), when
+                // no fixed slot of the domain writes an element of that array.
+                if (code[pc].k == IK::Nba && code[pc].arr && !code[pc].bidx && code[pc].drv < 0 && code[pc].dyn < 0 && !code[pc].nbaLater &&
+                    !code[pc].de && !code[pc].delay && !std::getenv("MSIM_NODOMARR")) {
+                    bool clash = false;
+                    for (int64_t k = 0; k < code[pc].arr->count; k++) clash |= fixedNba.count((int)(code[pc].arr->base + k)) > 0;
+                    if (clash) { forward = false; why = "array also written at a fixed index"; whyLine = code[pc].line; }
+                } else if (!tmpw && (code[pc].arr || code[pc].bidx)) { forward = false; why = "run-time index"; whyLine = code[pc].line; }   // no fixed slot: an ordinary clocked function
             }
             if (!forward) {
-                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "not in the domain (loop or run-time index): %s line %d\n", procs[i].kind.c_str(), code.empty() ? 0 : code[0].line);
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "not in the domain (%s, line %d): %s line %d\n", why, whyLine, procs[i].kind.c_str(), code.empty() ? 0 : code[0].line);
                 continue;
             }
             // A process that waits on the source signals themselves runs when
@@ -1491,7 +1509,7 @@ private:
                 for (auto& in : procs[i].prog->code)
                     if (in.k == IK::Nba && in.sig >= 0 && (size_t)in.sig < ns) {
                         if (in.hi < 0 || sigs[in.sig].w > 64) cand[in.sig] = 1; else bad[in.sig] = 1;
-                    }
+                    } else if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) bad[in.sig] = 1;   // a temporary: kept in S.sigs
                 continue;
             }
             // Another process may still write one with a plain blocking
@@ -2050,6 +2068,7 @@ private:
         }
         struct Slot { int sig, hi, lo; };
         std::vector<Slot> slots;
+        bool dynArrNba = false;   // a domain process writes an array element chosen at run time
         std::vector<int> slotProc;   // the domain process of each slot
         std::ostringstream fns, fns2;
         // 2-state mode: when no signal the domain reads holds X or Z, every
@@ -2057,10 +2076,16 @@ private:
         // checks runs instead (dsN2, combQ). Only when every statement has one.
         bool two = twoState;
         std::set<int> ext;   // signals in S.sigs that the domain reads
+        // Temporaries of a domain process: only it reads them, and it runs
+        // its 4-state body (its 2-state copy calls that one), so an X they
+        // hold does not keep the rest of the domain off its 2-state path.
+        std::set<int> tmpSig;
+        for (int n : dom)
+            for (auto& in : procs[n].prog->code) if (in.k == IK::Assign && in.tmp) tmpSig.insert(in.sig);
         auto noteRefs = [&](const E& e) {
             std::function<void(const E&)> f = [&](const E& x) {
                 if (!x) return;
-                if (x->op == Op::Ref && !isPriv(x->sig)) ext.insert(x->sig);
+                if (x->op == Op::Ref && !isPriv(x->sig) && !tmpSig.count(x->sig)) ext.insert(x->sig);
                 for (auto& k : x->kids) f(k);
             };
             f(e);
@@ -2071,6 +2096,9 @@ private:
             auto L = [](size_t pc) { return "d_" + std::to_string(pc); };
             fns << "// process " << n << " (" << procs[n].kind << ", cycle domain)\n";
             fns << "static void ds" << n << "() {\n";
+            std::ostringstream& fnsAll = fns2;
+            std::ostringstream fns2;
+            bool hasTmp = false;
             fns2 << "static void ds" << n << "_2() {\n";
             for (size_t pc = 1; pc < end; pc++) {
                 const Instr& i = p.code[pc];
@@ -2079,6 +2107,14 @@ private:
                 noteRefs(i.e);
                 switch (i.k) {
                     case IK::Nba: {
+                        if (i.arr && !i.bidx) {   // an element chosen at run time: through the kernel (see above)
+                            for (auto& a : i.aidx) noteRefs(a);
+                            std::string t = dynTarget(i, fast(i.e), " DNB->push_back({s, v, hi, lo});");
+                            fns << t;
+                            fns2 << t;
+                            dynArrNba = true;
+                            break;
+                        }
                         if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
                         int k = (int)slots.size();
                         slots.push_back({i.sig, i.hi, i.lo});
@@ -2113,11 +2149,20 @@ private:
                         break;
                     }
                     case IK::Jmp: fns << " goto " << L(i.target) << ";\n"; fns2 << " goto " << L(i.target) << ";\n"; break;
+                    case IK::Assign:
+                        if (!i.tmp) throw CodegenUnsupported("instruction in a clocked process");
+                        for (auto& a : i.aidx) noteRefs(a);
+                        if (i.bidx) { noteRefs(i.bidx); fns << dynTarget(i, fast(i.e), " S.poke(s, v, hi, lo);", true); }
+                        else fns << assign(i);
+                        hasTmp = true;
+                        break;
                     default: throw CodegenUnsupported("instruction in a clocked process");
                 }
             }
             fns << L(end) << ": return;\n}\n";
             fns2 << L(end) << ": return;\n}\n";
+            if (hasTmp) fnsAll << "static void ds" << n << "_2() { ds" << n << "(); }\n";
+            else fnsAll << fns2.str();
         }
         // Dense arrays: the hot V and H of neighbouring slots share cache
         // lines (a Val is 56 bytes; interleaved, each slot took its own line).
@@ -2296,6 +2341,7 @@ private:
                 combStmts2.push_back(stmt2(in));
             }
         }
+        o << "static std::vector<Sim::NbaItem>* DNB;\n";
         o << fns.str();
         if (two) o << fns2.str();
         // 2-state mode holds when every private signal is known (pclean, kept
@@ -2393,7 +2439,7 @@ private:
         for (auto* in : combIns) islandOf(in->sig);
         int nIsl = (int)islandId.size();
         const int kGroups = 64;
-        bool par = allPriv && nIsl >= 32 && !serialOnly && !multi;
+        bool par = allPriv && nIsl >= 32 && !serialOnly && !multi && !dynArrNba;
         int G = par ? std::min(nIsl, kGroups) : 0;
         auto groupOf = [&](int sig) { return (int)((int64_t)islandOf(sig) * G / nIsl); };
         if (par) {
@@ -2414,7 +2460,7 @@ private:
             for (int g = 0; g < G; g++) o << (g ? ", " : "") << "dsG" << g;
             o << "};\n";
         }
-        o << "static void dseq(const void* ctx, std::vector<Sim::NbaItem>& nb) {\n    (void)ctx;\n";
+        o << "static void dseq(const void* ctx, std::vector<Sim::NbaItem>& nb) {\n    (void)ctx;\n    DNB = &nb;\n";
         if (par) o << "    CLON = false;\n";
         if (par)
             // Nothing else runs before the NBA region (S.fuseOk()): each group
