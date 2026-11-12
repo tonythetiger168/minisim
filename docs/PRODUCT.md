@@ -37,6 +37,7 @@ the roadmap to 1.0. Release mechanics are in [`RELEASING.md`](RELEASING.md).
 | **mhls** | High-level synthesis: C/C++ functions to SystemVerilog (FSM with datapath or pipeline), with a self-checking testbench and a host-compiler check of the same vectors | Shipping next |
 | **mspice** | SPICE circuit simulator: DC, AC, transient, noise, transfer-function, sensitivity and Fourier analysis, diodes, level-1 and BSIM4 MOSFETs, bipolar transistors, behavioral sources and switches, subcircuits and parameters, `.measure`, `.step`, `.lib` corners, `.alter` and Monte Carlo, CSV, VCD and raw-file output, multi-threaded; see [`SPICE.md`](SPICE.md). Mixed-signal co-simulation with msim comes next | Shipping next |
 | **mchar** | Cell library characterization on mspice: NLDM delay and transition, setup / hold / recovery / removal, internal power and pin capacitance from transistor netlists into Liberty, with the stimulus found from the Liberty functions; see [`CHAR.md`](CHAR.md) | Shipping next |
+| **msupport** | Support agents: one AI agent per product that answers users from that product's documentation, runs a short example in a sandbox and files a ticket when the documentation does not answer (`docs/SUPPORT.md`) | Built and tested; online when the products are complete |
 
 All of them install from one package (`minisim_x.y.z_amd64.deb` /
 `.tar.gz`) and share one version number.

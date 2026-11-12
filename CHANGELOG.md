@@ -37,6 +37,12 @@ Spec references are IEEE 1800-2023 clauses.
   and `mdft` ask the IP author's license proxy over TLS for the value of a
   `license(...)` or `license_string(...)` call in a right; `mlicproxy` is
   such a proxy, driven by a license file. See "Licenses" in `docs/PROTECT.md`.
+- `msupport`: an AI support agent per product. Each answers from its
+  product's documentation (BM25 search over the manuals), can run a short
+  example on the product's tool in a sandbox, and files a ticket when the
+  documentation does not answer; command line, terminal chat and a local web
+  service. Product files for the nine free tools in `support/products/`.
+  Not online yet. See `docs/SUPPORT.md`.
 - Value conversion tables (IEEE 1801-2024 4.10, 6.18, 6.28, Annex B):
   `connect_supply_net` joins a supply net and an HDL port. An output port
   (a regulator model) drives the net; an input port (a macro's power pin) is
