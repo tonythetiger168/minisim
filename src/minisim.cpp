@@ -1043,6 +1043,7 @@ struct Sim {
     // The port connections of variable path outputs: (net, driver) -> the
     // variable and the value the driver last passed on.
     map<pair<int, int>, pair<int, Val>> varPathDrv;
+    bool applyingPathVar = false;   // a delayed change of an SF_PATHV variable is landing
     bool applyingVar = false;
     struct PEv { uint64_t t, gen; Val v; uint8_t s0, s1; };
     map<pair<int, int>, vector<PEv>> pq;
@@ -1126,7 +1127,12 @@ struct Sim {
         else pqPush(s, slot, t, v, s0, s1);
     }
     void applySlot(int s, int slot, const Val& v, uint8_t s0, uint8_t s1) {
-        if (slot == PQ_PATH) { set(s, v); return; }
+        if (slot == PQ_PATH) {
+            applyingPathVar = true;
+            set(s, v);
+            applyingPathVar = false;
+            return;
+        }
         if (slot <= PQ_VAR) {
             int d = PQ_VAR - slot;
             auto vp = varPathDrv.find({s, d});
@@ -1229,11 +1235,14 @@ struct Sim {
             pathsTo[P[k].dst].push_back((int)k);
             pathIn[(size_t)P[k].src] = 1;
             if (!P[k].dstVar) { timedOut[(size_t)P[k].dst] = 1; continue; }
+            bool linked = false;
             for (const PortLink& l : outLinks())
                 if (l.formal == P[k].dst) {
+                    linked = true;
                     varPathDrv[{l.net, l.drv}] = {P[k].dst, sigs[(size_t)l.net].drv[(size_t)l.drv].v};
                     if (now == 0) sigs[(size_t)l.net].val = allx(sigs[(size_t)l.net].w);   // x until the first value arrives
                 }
+            if (!linked && P[k].dstIface) sigs[(size_t)P[k].dst].fl |= SF_PATHV;   // 25.6
         }
         for (auto& [sg, d] : icDelay) timedOut[(size_t)sg] = 1;
         for (auto& [sg, sh] : shadowOf) timedOut[(size_t)sg] = 1;
@@ -2321,7 +2330,9 @@ struct Sim {
     // again; a variable keeps its value until it is next written.
     // force v[3:0] = e holds those bits only (SF_PART): other writes still
     // change the other bits.
-    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8 };   // SF_VPI: a VPI value-change callback watches it
+    // SF_PATHV: a variable that is a path output with no port connection of
+    // its own (an interface terminal, 25.6): its writes arrive after the path delay.
+    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8, SF_PATHV = 16 };   // SF_VPI: a VPI value-change callback watches it
     struct PartHold { int hi, lo; E fe, ae; };
     struct Hold { E fe, ae; vector<PartHold> parts; };
     unordered_map<int, Hold> holds;
@@ -2493,9 +2504,17 @@ struct Sim {
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         Sig& g = sigs[s];
-        if (__builtin_expect(g.fl & (SF_HELD | SF_PART), 0)) {
+        if (__builtin_expect(g.fl & (SF_HELD | SF_PART | SF_PATHV), 0)) {
             if (g.fl & SF_HELD) return;   // forced: other writes are ignored
-            nv = keepHeld(s, nv);         // only some bits are held
+            if (g.fl & SF_PART) nv = keepHeld(s, nv);   // only some bits are held
+            if ((g.fl & SF_PATHV) && !applyingPathVar) {   // 25.6, 30.4: the change arrives after the path delay
+                nv = maskWidth(nv, g.w);
+                nv.sgn = false;
+                Val from = projected(s, PQ_PATH, g.val);
+                if (sameVal(from, nv)) return;
+                pulseSchedule(s, PQ_PATH, g.val, nv, pathLim(s, from, nv), styleOf(s), STR_STRONG, STR_STRONG);
+                return;
+            }
         }
         int o, n;
         if (g.w <= 64) {
