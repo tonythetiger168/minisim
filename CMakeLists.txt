@@ -441,6 +441,7 @@ install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mr
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
 install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
 install(PROGRAMS tools/mplan.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan)
+install(PROGRAMS tools/mplan_serve.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan_serve)
 # The Python interface to mdebug -script (import mdebug_api).
 install(FILES tools/mdebug_api.py DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/python)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc

@@ -763,6 +763,12 @@ Spec references are IEEE 1800-2023 clauses.
   the redundant tests, `-keep FILE` for the short list with the same
   coverage, and with a plan the tests behind each feature's coverage.
   `mplan report -rank` adds it to `plan.html` and `plan.json`.
+- `mplan serve` and `mplan push`: a multi-user server and web dashboard.
+  CI pushes each report; the server keeps the history per project and shows
+  every plan (score, status, tests, requirements, trend) and one page per
+  plan where people set the owner, status, bug id and note of each failure
+  bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
+  and `mplan report -rules URL` to take the annotations as triage rules.
 
 ### Fixed
 - msim memory on big VIP benches: a 2-state unpacked array with more than
