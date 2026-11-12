@@ -211,6 +211,65 @@ foreach(want
   endif()
 endforeach()
 
+# Bits of a vector and fields of a struct written separately are separate
+# signals: two synchronizers in one vector are clean, a first stage read by
+# logic is found by its bit.
+run(cdc_slices.sv "-top;cdc_slices;-only;cdc,RDC001,RDC002,RDC003;-cdc-report")
+foreach(want
+    "cdc_slices.a1 (cdc_slices.aclk) -> cdc_slices.s[0] (cdc_slices.bclk)  3-flop synchronizer"
+    "cdc_slices.a2 (cdc_slices.aclk) -> cdc_slices.s[2] (cdc_slices.bclk)  3-flop synchronizer"
+    "cdc_slices.c_a.req (cdc_slices.aclk) -> cdc_slices.q1 (cdc_slices.bclk)  2-flop synchronizer"
+    "cdc_slices.a1 (cdc_slices.aclk) -> cdc_slices.r[1] (cdc_slices.bclk)  one flop only (CDC001)"
+    "1 finding (CDC001 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_slices.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
+# Block models: -cdc-abstract writes cdc_block's model (the golden one in
+# tests/lint/cdc_block.cdc), and the SoC gives the same findings with the RTL,
+# with the model in place of the RTL, and with the block as a black box.
+execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/cdc_block.sv -top cdc_block -only cdc
+                        -cdc-abstract cdc_block_model.cdc
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ cdc_block_model.cdc got)
+file(READ ${SRC}/tests/lint/cdc_block.cdc want)
+if(NOT rc EQUAL 0 OR NOT got STREQUAL want)
+  message(FATAL_ERROR "-cdc-abstract on cdc_block.sv (exit ${rc}):\n${got}\nexpected:\n${want}\n${err}")
+endif()
+foreach(variant "cdc_block.sv" "cdc_block.sv;-cdc-model;${SRC}/tests/lint/cdc_block.cdc"
+                "cdc_block_bb.sv;-cdc-model;${SRC}/tests/lint/cdc_block.cdc")
+  list(GET variant 0 blk)
+  list(REMOVE_AT variant 0)
+  execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/${blk} ${SRC}/tests/lint/cdc_soc.sv -top cdc_soc -only cdc ${variant}
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0
+     OR NOT out MATCHES "\\[CDC001\\] 'cdc_soc.f_d' \\(clocked by cdc_soc.fclk\\) is read by logic clocked by cdc_soc.sclk"
+     OR NOT out MATCHES "\\[CDC001\\] 'cdc_soc.u_blk.q' \\(clocked by cdc_soc.sclk\\) is read by logic clocked by cdc_soc.fclk"
+     OR NOT out MATCHES "2 findings \\(CDC001 2\\)")
+    message(FATAL_ERROR "cdc_soc.sv with ${blk} ${variant}:\n${out}${err}")
+  endif()
+endforeach()
+
+# -cdc-html: one self-contained page with every crossing and reset synchronizer.
+execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/cdc_clean.sv -top cdc_clean -only cdc,rdc -cdc-html cdc_clean.html
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ cdc_clean.html page)
+foreach(want
+    "<title>CDC: cdc_clean</title>"
+    "{\"src\":\"cdc_clean.gray\",\"sd\":1,\"dst\":\"cdc_clean.gsync\",\"dd\":0,\"how\":\"2-flop synchronizer, Gray coded\""
+    "\"how\":\"one flop only (CDC001)\",\"rule\":\"CDC001\""
+    "{\"out\":\"cdc_clean.a_rst_n\",\"d\":0,\"stages\":2,\"flops\":4}")
+  string(FIND "${page}" "${want}" pos)
+  if(NOT rc EQUAL 0 OR pos EQUAL -1)
+    message(FATAL_ERROR "-cdc-html page missing: ${want}\n${err}")
+  endif()
+endforeach()
+if(page MATCHES "(src|href)=\"?https?:|url\\(https?:|@import")
+  message(FATAL_ERROR "-cdc-html page loads something from the network")
+endif()
+
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
 set(one "${out}")
