@@ -1,0 +1,24 @@
+{
+  "name": "mwave",
+  "title": "mwave waveforms (VCD and FST)",
+  "summary": "Waveform output from msim for GTKWave and Surfer: hierarchical VCD and compressed FST, memories with -vcd-arrays.",
+  "docs": [
+    "README.md#Features",
+    "README.md#Simulating your own design",
+    "README.md#Known limits",
+    "docs/DEBUG.md",
+    "CHANGELOG.md"
+  ],
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "msim",
+    "mcov",
+    "mregress",
+    "mplan",
+    "mbug",
+    "mlint",
+    "mdft",
+    "mdebug"
+  ]
+}
