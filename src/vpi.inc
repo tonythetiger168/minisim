@@ -3230,7 +3230,7 @@ void vpi_get_delays(vpiHandle h, p_vpi_delay d) {
         if (vpi::pathDelayCount(d, "vpi_get_delays")) vpi::pathGetDelays(o, d);
         return;
     }
-    if (o && o->kind == Obj::Prim) {   // 38.10
+    if (o && (o->kind == Obj::Prim || o->kind == Obj::ContAssign)) {   // 38.10
         if (vpi::primDelayCount(o, d, "vpi_get_delays")) vpi::primGetDelays(o, d);
         return;
     }
@@ -3262,7 +3262,7 @@ void vpi_put_delays(vpiHandle h, p_vpi_delay d) {
         if (vpi::pathDelayCount(d, "vpi_put_delays")) vpi::pathPutDelays(o, d);
         return;
     }
-    if (o && o->kind == Obj::Prim) {   // 38.10
+    if (o && (o->kind == Obj::Prim || o->kind == Obj::ContAssign)) {   // 38.10
         if (vpi::primDelayCount(o, d, "vpi_put_delays")) vpi::primPutDelays(o, d);
         return;
     }

@@ -8893,6 +8893,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.e = els[(size_t)k];
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay());
+                assignGate(ca, i);
                 finishAssign(L, i);
             }
             g_emitLoc = {};
@@ -8916,6 +8917,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.e = slice(resize(L.expr(a.right()), w, false, false), hi, lo);
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay());
+                assignGate(ca, i);
                 finishAssign(L, i);
             }
             g_emitLoc = {};
@@ -8927,8 +8929,26 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.e = lw.expr(a.right());
         lw.setScope(ca.getParentScope());
         i.dly = lw.delays3(ca.getDelay());
+        assignGate(ca, i);
         finishAssign(lw, i);
         g_emitLoc = {};
+    }
+    // A delayed continuous assignment drives through a gateRecs() entry, so
+    // vpi_put_delays can change its delay at run time (38.10).
+    void assignGate(const slang::ast::ContinuousAssignSymbol& ca, Instr& i) {
+        if (i.dly.empty()) return;
+        auto [it, fresh] = assignGates().try_emplace(&ca, (int)gateRecs().size());
+        if (fresh) {
+            GateRec gr;
+            gr.inst = Lowerer::instPath(ca.getParentScope());
+            gr.name = "$assign";
+            std::vector<uint64_t> d3 = i.dly;
+            if (d3.size() > 3) d3.resize(3);
+            std::vector<uint64_t> d12 = expand12(d3);
+            std::copy(d12.begin(), d12.end(), gr.d);
+            gateRecs().push_back(std::move(gr));
+        }
+        i.gate = it->second;
     }
 
     // buf/not/and/nand/or/nor/xor/xnor and pullup/pulldown drive the same way
@@ -9999,6 +10019,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     portRecs().clear();
     instCells().clear();
     gateRecs().clear();
+    assignGates().clear();
     pulseStyles().clear();
     outLinks().clear();
     inLinks().clear();
