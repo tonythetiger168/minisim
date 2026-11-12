@@ -23,8 +23,9 @@ endforeach()
 # (6.34, 6.58, 6.59); power models, applied by name and to every instance of
 # a model, with a parameter, and a legacy one (6.3, 6.9, 6.11, 6.31, 6.32);
 # checkers bound into the design by the power intent (6.12); initial blocks
-# replayed at power-up (6.60); attributes written in the HDL (5.6, 5.7).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr)
+# replayed at power-up (6.60); attributes written in the HDL (5.6, 5.7); an
+# abstract power source (6.16).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -216,6 +217,15 @@ execute_process(COMMAND ${MSIM} ${CMAKE_CURRENT_BINARY_DIR}/hdlattr_bad.sv -upf 
 if(rc EQUAL 0 OR NOT err MATCHES "hdlattr_bad.sv:12: attribute UPF_is_analog cannot be \"maybe\" [(]5.6[)]")
   message(FATAL_ERROR "a bad HDL attribute was not reported: ${rc}\n${out}${err}")
 endif()
+
+# Errors of create_abstract_power_source.
+upf_error_in(source e_ps1 "create_abstract_power_source a/b -output_supply_set {out SS_CORE}" "a power source name is a simple name (6.16)")
+upf_error_in(source e_ps2 "create_abstract_power_source P2 -output_supply_set {out SS_CORE} -input_supply_set {i SS_HI} -on_state {ON j {1}}" "-on_state ON: j is not an input supply set of P2")
+upf_error_in(source e_ps3 "create_abstract_power_source P3 -output_supply_set {out SS_CORE} -input_supply_set {i SS_HI} -control_port {c hi} -on_state {ON i {hi}}" "hi is not a control port of power source P3 (6.16)")
+upf_error_in(source e_ps4 "create_abstract_power_source P4 -output_supply_set {out SS_CORE} -input_supply_set {i SS_HI} -ack_port {a ack}" "power source P4 has ack ports but no -supply_set (6.16)")
+upf_error_in(source e_ps5 "create_abstract_power_source PS -update -ack_port {a ack}" "create_abstract_power_source -update only adds -power_switch (6.16)")
+upf_error_in(source e_ps6 "create_abstract_power_source P5 -output_supply_set {out} -input_supply_set {i SS_HI}" "supply set handle out is not associated with a supply set that has functions (6.16)")
+upf_error_in(source e_ps7 "create_power_switch SW -output_supply_port {o VCORE} -input_supply_port {i VHI} -control_port {c lo} -on_state {on i {c}}\ncreate_abstract_power_source PS -update -power_switch SW" "power switch SW of power source PS does not use its control hi (6.16)")
 
 # -power_top names the instance the UPF describes; it wins over set_design_top.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut

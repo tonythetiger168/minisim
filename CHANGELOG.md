@@ -79,6 +79,8 @@ Spec references are IEEE 1800-2023 clauses.
 - UPF (IEEE 1801-2024): `(* UPF_... *)` attributes in the HDL (5.6) are read
   by `msim -upf` and `mlint -upf`, below UPF commands in precedence (5.7);
   the Table 8 model-only and instance-only rules are errors.
+- UPF (IEEE 1801-2024): `create_abstract_power_source` (6.16) switches a
+  supply set between input supply sets, with ack ports.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.

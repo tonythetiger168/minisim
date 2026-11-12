@@ -538,6 +538,19 @@ struct Switch {
     struct Ack { std::string port, net; ExP e; uint64_t delay = 0; };
     std::vector<Ack> acks;
 };
+// create_abstract_power_source (6.16): switches whole supply sets. In
+// simulation each function of the output supply set is driven like the
+// output of a power switch whose inputs are that function of each input set.
+struct PowerSource {
+    std::string name, where, out;                                  // out: the output handle
+    std::vector<std::string> ins;                                  // input handles
+    std::vector<std::pair<std::string, std::string>> ctrls;        // port -> net
+    std::vector<SwitchState> on;                                   // inPort: the input handle
+    std::vector<SwitchState> off;
+    std::vector<Switch::Ack> acks;
+    std::string supply;
+    std::vector<std::string> switches;                             // -power_switch: refined, the switches drive
+};
 struct SigSense { std::string net; int sense = 0; };   // 0 high, 1 low, 2 posedge, 3 negedge
 inline int senseOf(const std::string& s) {
     if (s == "high") return 0;
@@ -752,6 +765,7 @@ struct Model {
         return p == predefinedVcts().end() ? nullptr : &p->second;
     }
     std::map<std::string, Switch> switches;
+    std::map<std::string, PowerSource> sources;
     std::vector<Isolation> isos;
     std::vector<LevelShifter> lss;
     std::vector<Retention> rets;
@@ -830,7 +844,7 @@ struct Model {
         if (it != sets.end()) return it->second;
         // a domain's handle that has not been made yet: an anonymous set
         size_t d = r.rfind('.');
-        if (d != std::string::npos && domains.count(r.substr(0, d))) {
+        if (d != std::string::npos && (domains.count(r.substr(0, d)) || sources.count(r.substr(0, d)))) {
             SupplySet& s = sets[r];
             s.name = r;
             s.where = where;
@@ -1036,7 +1050,63 @@ struct Model {
         r.load(path);
         for (auto& d : r.diags) warnings.push_back(Reader::located(d));
         if (!recording.empty()) throw Error(powerModels[recording].where + ": begin_power_model " + recording + " has no end_power_model (6.11)");
+        finishSources();
         for (auto& sv : saves) writeUpf(sv);
+    }
+    // Each power source becomes one power switch per function of its output
+    // supply set (6.16), unless switches refine it.
+    void finishSources() {
+        for (auto& [name, ps] : sources) {
+            if (ps.out.empty()) throw Error(ps.where + ": power source " + name + " has no -output_supply_set");
+            if (ps.ins.empty()) throw Error(ps.where + ": power source " + name + " has no -input_supply_set");
+            if (!ps.switches.empty()) {
+                // the switches must use the source's controls (6.16)
+                for (auto& sn : ps.switches) {
+                    const Switch& sw = switches.at(sn);
+                    for (auto& [p, nn] : ps.ctrls) {
+                        if (nn.empty()) continue;
+                        bool used = false;
+                        for (auto& [q, mm] : sw.ctrls) if (mm == nn) used = true;
+                        if (!used) throw Error(ps.where + ": power switch " + sn + " of power source " + name + " does not use its control " + nn + " (6.16)");
+                    }
+                    for (auto& a : ps.acks) {
+                        bool drives = false;
+                        for (auto& b : sw.acks) if (b.net == a.net) drives = true;
+                        if (!drives) throw Error(ps.where + ": power switch " + sn + " of power source " + name + " does not drive the ack net " + a.net + " (6.16)");
+                    }
+                }
+                continue;
+            }
+            auto fnOf = [&](const std::string& h) -> const std::map<std::string, std::string>& {
+                std::string r = setOf(name + "." + h);
+                auto it = sets.find(r);
+                if (it == sets.end() || it->second.fn.empty())
+                    throw Error(ps.where + ": power source " + name + ": supply set handle " + h + " is not associated with a supply set that has functions (6.16)");
+                return it->second.fn;
+            };
+            const auto& outFn = fnOf(ps.out);
+            bool acksDone = false;
+            for (auto& [f, outNet] : outFn) {
+                Switch sw;
+                sw.name = name + "." + f;
+                sw.where = ps.where;
+                sw.outPort = "out";
+                sw.outNet = outNet;
+                bool same = true;
+                for (auto& h : ps.ins) {
+                    auto it = fnOf(h).find(f);
+                    if (it == fnOf(h).end()) throw Error(ps.where + ": power source " + name + ": input supply set " + h + " has no " + f + " function");
+                    sw.ins.push_back({h, it->second});
+                    if (it->second != outNet) same = false;
+                }
+                if (same) continue;   // a function the source does not switch (a shared ground)
+                sw.ctrls = ps.ctrls;
+                sw.on = ps.on;
+                sw.off = ps.off;
+                if (!acksDone) { sw.acks = ps.acks; acksDone = true; }
+                switches[sw.name] = sw;
+            }
+        }
     }
     static std::string tclWord(const std::string& w) {
         if (w.empty()) return "{}";
@@ -1440,6 +1510,99 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             SupplySet& s = setRef(primaryOf(dn), c.where());
             if (o.has("-primary_power_net")) s.fn["power"] = join(scope, o.get("-primary_power_net"));
             if (o.has("-primary_ground_net")) s.fn["ground"] = join(scope, o.get("-primary_ground_net"));
+            continue;
+        }
+        if (n == "create_abstract_power_source") {   // 6.16
+            Opts o = opts(c, {"-update"});
+            need(o, 1, "a power source name");
+            static const std::set<std::string> known = {"-output_supply_set", "-input_supply_set", "-control_port", "-on_state", "-off_state",
+                                                        "-supply_set", "-ack_port", "-ack_delay", "-ack_polarity", "-power_switch", "-update"};
+            for (auto& [k, v] : o.v) if (!known.count(k)) throw Error(c.where() + ": create_abstract_power_source: unknown option " + k);
+            if (o.pos[0].find('/') != std::string::npos) throw Error(c.where() + ": a power source name is a simple name (6.16)");
+            std::string name = join(scope, o.pos[0]);
+            bool fresh = !sources.count(name);
+            if (fresh && o.has("-update")) throw Error(c.where() + ": -update of unknown power source " + o.pos[0]);
+            if (!fresh && !o.has("-update")) throw Error(c.where() + ": power source " + o.pos[0] + " is already defined");
+            PowerSource& ps = sources[name];
+            if (fresh) { ps.name = name; ps.where = c.where(); }
+            if (!fresh) {
+                for (auto& [k, v] : o.v)
+                    if (k != "-power_switch" && k != "-update")
+                        throw Error(c.where() + ": create_abstract_power_source -update only adds -power_switch (6.16)");
+            }
+            auto handle = [&](const std::string& v, bool out) {
+                auto l = splitList(v);
+                if (l.empty()) throw Error(c.where() + ": empty supply set handle");
+                std::string h = name + "." + l[0];
+                SupplySet& ss = sets[h];
+                ss.name = h;
+                ss.where = c.where();
+                if (l.size() > 1) { sets.erase(h); setAlias[h] = setOf(join(scope, l[1])); }
+                if (out) ps.out = l[0];
+                else ps.ins.push_back(l[0]);
+            };
+            if (o.has("-output_supply_set")) handle(o.get("-output_supply_set"), true);
+            for (auto& v : o.all("-input_supply_set")) handle(v, false);
+            for (auto& v : o.all("-control_port")) {
+                auto l = splitList(v);
+                if (l.empty()) throw Error(c.where() + ": empty control port");
+                ps.ctrls.push_back({l[0], l.size() > 1 ? join(scope, l[1]) : ""});
+            }
+            for (auto& v : o.all("-on_state")) {
+                auto l = splitList(v);
+                if (l.size() < 3) throw Error(c.where() + ": -on_state needs {name input_supply_set {expr}}");
+                if (std::find(ps.ins.begin(), ps.ins.end(), l[1]) == ps.ins.end())
+                    throw Error(c.where() + ": -on_state " + l[0] + ": " + l[1] + " is not an input supply set of " + o.pos[0]);
+                ps.on.push_back({l[0], l[1], parseExpr(l[2], c.where())});
+            }
+            for (auto& v : o.all("-off_state")) {
+                auto l = splitList(v);
+                if (l.size() < 2) throw Error(c.where() + ": -off_state needs {name {expr}}");
+                ps.off.push_back({l[0], "", parseExpr(l[1], c.where())});
+            }
+            // names in the expressions are control ports (6.16)
+            std::set<std::string> cp;
+            for (auto& [p, nn] : ps.ctrls) cp.insert(p);
+            auto chk = [&](const ExP& e) {
+                std::vector<std::string> ids;
+                exprIds(e, ids);
+                for (auto& id : ids)
+                    if (!cp.count(id)) throw Error(c.where() + ": " + id + " is not a control port of power source " + o.pos[0] + " (6.16)");
+            };
+            for (auto& st : ps.on) chk(st.e);
+            for (auto& st : ps.off) chk(st.e);
+            if (o.has("-supply_set")) ps.supply = setOf(join(scope, o.get("-supply_set")));
+            for (auto& v : o.all("-ack_port")) {
+                auto l = splitList(v);
+                if (l.size() != 2) throw Error(c.where() + ": -ack_port needs {port net}");
+                Switch::Ack a;
+                a.port = l[0];
+                a.net = join(scope, l[1]);
+                a.e = parseExpr("1", c.where());
+                ps.acks.push_back(a);
+            }
+            for (auto& v : o.all("-ack_delay")) {
+                auto l = splitList(v);
+                if (l.size() != 2) throw Error(c.where() + ": -ack_delay needs {port delay}");
+                bool hit = false;
+                for (auto& a : ps.acks) if (a.port == l[0]) { a.delay = std::stoull(l[1]); hit = true; }
+                if (!hit) throw Error(c.where() + ": -ack_delay: no ack port " + l[0]);
+            }
+            for (auto& v : o.all("-ack_polarity")) {
+                auto l = splitList(v);
+                if (l.size() != 2 || (l[1] != "active_high" && l[1] != "active_low"))
+                    throw Error(c.where() + ": -ack_polarity needs {port active_high|active_low}");
+                bool hit = false;
+                for (auto& a : ps.acks) if (a.port == l[0]) { a.e = parseExpr(l[1] == "active_high" ? "1" : "0", c.where()); hit = true; }
+                if (!hit) throw Error(c.where() + ": -ack_polarity: no ack port " + l[0]);
+            }
+            if (!ps.acks.empty() && ps.supply.empty())
+                throw Error(c.where() + ": power source " + o.pos[0] + " has ack ports but no -supply_set (6.16)");
+            for (auto& sw : o.list("-power_switch")) {
+                std::string sn = join(scope, sw);
+                if (!switches.count(sn)) throw Error(c.where() + ": -power_switch: no power switch " + sw);
+                ps.switches.push_back(sn);
+            }
             continue;
         }
         if (n == "create_power_switch") {
@@ -2445,7 +2608,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
 
             "set_retention_control", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
             "define_retention_cell", "define_power_switch_cell", "define_always_on_cell", "define_diode_clamp",
-            "map_retention_clamp_cell", "map_repeater_cell", "create_abstract_power_source", "set_pin_related_supply",
+            "map_retention_clamp_cell", "map_repeater_cell", "set_pin_related_supply",
             "set_related_supply_net", "query_upf", "add_parameter"};
         if (ignored.count(n)) {
             warnings.push_back(c.where() + ": " + n + " is accepted and has no effect in simulation");
