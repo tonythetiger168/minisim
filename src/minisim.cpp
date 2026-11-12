@@ -371,6 +371,13 @@ struct Sim {
     // as m[3], for arrays of at most N elements. 0 (the default): memories
     // are left out, as $dumpvars does (21.7.1.2).
     size_t dumpArrays = 0;
+    // msim -vcd-class [N]: class objects in the waveform. A view signal named
+    // h.prop shows a property of the object the handle signal `handle` points
+    // to; `offs` are property slots from that object (all but the last are
+    // handle properties to follow). It is x while a handle on the way is
+    // null, and is refreshed at the end of each time slot (viewTail).
+    struct ObjView { int sig, handle; vector<int> offs; };
+    vector<ObjView> objViews;
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
     // VCD text is built here and written in large blocks (an ostream insert
@@ -919,6 +926,7 @@ struct Sim {
         closeWaves();
     }
     void closeWaves() {
+        if (!objViews.empty()) viewTail();   // the slot $finish ended
         evcdClose();
 #ifdef MINISIM_FST
         if (fst) { fstWriterClose((fstWriterContext*)fst); fst = nullptr; }
@@ -2198,6 +2206,25 @@ struct Sim {
         }
         e.f << "$end\n";
     }
+    // The end of a time slot: each object view takes the value it shows now.
+    void viewTail() {
+        if (!waving()) return;
+        for (const ObjView& o : objViews) {
+            const Val* src = nullptr;
+            size_t at = (size_t)o.handle;
+            for (size_t k = 0; k < o.offs.size(); k++) {
+                const Val& h = sigs[at].val;
+                if (h.x || h.v == 0 || h.v >= sigs.size()) break;   // null (or not yet set)
+                at = (size_t)h.v + (size_t)o.offs[k];
+                if (at >= sigs.size()) break;
+                if (k + 1 == o.offs.size()) src = &sigs[at].val;
+            }
+            Val nv = src ? *src : allx(sigs[o.sig].w);
+            if (sameBits(nv, sigs[o.sig].val)) continue;
+            sigs[o.sig].val = nv;
+            dump(o.sig);
+        }
+    }
     // The end of a time slot: the first values, then the ports that changed.
     void evcdTail() {
         for (Evcd& e : evcds) {
@@ -2632,6 +2659,7 @@ struct Sim {
         if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
         if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
+        if (!objViews.empty()) { viewTail(); if (evcds.empty()) return false; }   // msim -vcd-class: as $dumpports
         if (!evcds.empty()) { evcdTail(); return false; }   // $dumpports: rare stays set, every slot ends here
         rare = false;
         return false;
@@ -2763,7 +2791,7 @@ struct Sim {
         run(~0ULL, false);
     }
     void run(uint64_t end, bool start = true) {
-        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); }
+        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); if (!objViews.empty()) rare = true; }
         if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
         while (!wheel.empty() && !finished) {
             auto it = wheel.begin();

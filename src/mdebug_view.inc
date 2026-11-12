@@ -242,7 +242,10 @@ function waves(){const cv=$('cv'),RH=22,NW=200,dpr=window.devicePixelRatio||1,w=
   g.fillStyle=css('--dim');g.fillText(st.t0+'',NW,h-8);const e=st.t1+' '+(DB.timescale||'');g.fillText(e,w-8-g.measureText(e).width,h-8);
   $('winfo').textContent=st.rows.length?'click to move the cursor, wheel to zoom':'select a signal to add it'}
 function setT(t){st.t=Math.max(0,Math.min(END,Math.round(t)));$('tcur').textContent=W||TR?'t = '+st.t+' '+(DB.timescale||''):'';sigList();source();panel();waves()}
-function pick(i,jump){st.sig=i;st.scope=scopeOf(S[i].path);if(W&&W[i]&&!st.rows.includes(i))st.rows.push(i);
+// Object views (msim -vcd-class): picking a class handle adds the properties of the object it points to.
+const objKids=new Map();S.forEach((s,i)=>{if(s.of!==undefined)(objKids.get(s.of)||objKids.set(s.of,[]).get(s.of)).push(i)});
+function pick(i,jump){st.sig=i;st.scope=scopeOf(S[S[i].of!==undefined?S[i].of:i].path);if(W&&W[i]&&!st.rows.includes(i))st.rows.push(i);
+  if(W)(objKids.get(i)||[]).forEach(k=>{if(W[k]&&!st.rows.includes(k))st.rows.push(k)});
   const sc=DB.scopes.find(s=>s.path==st.scope);st.file=sc?sc.file:S[i].file;tree();sigList();
   const d=drvOf[i].find(k=>D[k].file==st.file);source(jump||(d!==undefined?D[d].line:S[i].file==st.file?S[i].line:0));panel();waves()}
 function goDriver(i){const d=D[i],own=scopeOf(S[d.sig].path);
