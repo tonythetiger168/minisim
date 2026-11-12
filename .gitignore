@@ -7,3 +7,5 @@ build/
 tests/spec/_regress_*
 __pycache__/
 lib/sky130/pdk/
+*.mcovsave
+tests/spec/spec_*.cov.json
