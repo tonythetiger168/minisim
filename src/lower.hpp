@@ -8915,10 +8915,12 @@ struct Lowerer {
                     }
                     break;
                 }
-                // A static local in a task or function is initialized on the
-                // first call, then left alone. The flag starts as X, so the
-                // first call fails the "already done" test and takes the init.
-                bool once = current && vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
+                // A static local is initialized once (6.21), not on every
+                // entry: on the first call of a task or function, or the
+                // first pass of an always or of a loop body, then left alone.
+                // The flag starts as X, so the first entry fails the "already
+                // done" test and takes the init.
+                bool once = vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
                 auto initVar = [&] {   // a fixed-size array takes its value element by element
                     if (arrFind(&vd.symbol) && assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false)) return;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = expr(*init);
