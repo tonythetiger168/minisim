@@ -1,5 +1,7 @@
-// vpi_tchk.inc - timing checks through VPI (IEEE 1800-2023 37.? timing
-// check diagram, 38.10 delays of a timing check, 38.36.1 cbTchkViolation).
+// vpi_tchk.inc - specify blocks through VPI: timing checks (IEEE 1800-2023
+// clause 37 timing check diagram, 38.10 their limits, 38.36.1
+// cbTchkViolation) and module paths (37 module path diagram, 38.10 their
+// delays).
 // #included in vpi.inc, inside namespace vpi.
 
 inline Obj* tchkObj(int id) {
@@ -160,4 +162,119 @@ inline void onTchk(int id) {
         }
         d.cb_rtn(&d);
     }
+}
+
+// ---- Module paths ----
+// One object per input / output pair of a path declaration ((a, b *> y) is
+// two), as msim keeps them.
+inline Obj* modPathObj(int id) {
+    auto& slot = st().codeObjs[{&pathRecs(), id}];
+    if (!slot) {
+        slot = mkObj(Obj::ModPath, vpiModPath);
+        slot->idx = id;
+    }
+    return slot;
+}
+inline Obj* pathTermObj(int id, int k) {   // k 0: the input, 1: the output
+    auto& slot = st().codeObjs[{&pathRecs()[(size_t)id], id * 2 + k}];
+    if (!slot) {
+        slot = mkObj(Obj::PathTerm, vpiPathTerm);
+        slot->idx = id;
+        slot->pos = (size_t)k;
+        slot->parent = modPathObj(id);
+    }
+    return slot;
+}
+inline Obj* pathModule(const PathRec& p) {
+    return O(vpi_handle_by_name(const_cast<PLI_BYTE8*>(p.inst.c_str()), nullptr));
+}
+inline bool pathIterate(int type, const Obj* o, std::vector<vpiHandle>& items) {
+    if (o->kind == Obj::Module && type == vpiModPath) {
+        std::string me = fullName(*o->sym);
+        for (size_t k = 0; k < pathRecs().size(); k++)
+            if (pathRecs()[k].inst == me) items.push_back(H(modPathObj((int)k)));
+        return true;
+    }
+    if (o->kind == Obj::ModPath && (type == vpiModPathIn || type == vpiModPathOut || type == vpiPathTerm)) {
+        if (type != vpiModPathOut) items.push_back(H(pathTermObj(o->idx, 0)));
+        if (type != vpiModPathIn) items.push_back(H(pathTermObj(o->idx, 1)));
+        return true;
+    }
+    return false;
+}
+inline Obj* pathHandle(int type, const Obj* o) {
+    const PathRec& p = pathRecs()[(size_t)o->idx];
+    if (o->kind == Obj::ModPath) {
+        if (type == vpiModule || type == vpiScope || type == vpiParent) return pathModule(p);
+        return nullptr;
+    }
+    if (type == vpiExpr) return sigObjOf(o->pos == 0 ? p.src : p.dst);
+    if (type == vpiModPath || type == vpiParent) return const_cast<Obj*>(o->parent);
+    return nullptr;
+}
+inline int64_t pathGet(int prop, const Obj* o) {
+    const PathRec& p = pathRecs()[(size_t)o->idx];
+    if (prop == vpiType) return o->type;
+    if (o->kind == Obj::ModPath) {
+        if (prop == vpiModPathHasIfNone) return p.ifnone;
+        return vpiUndefined;
+    }
+    if (prop == vpiDirection) return o->pos == 0 ? vpiInput : vpiOutput;
+    if (prop == vpiEdge && o->pos == 0) return p.edge == 1 ? vpiPosedge : p.edge == 2 ? vpiNegedge : p.edge == 3 ? (vpiPosedge | vpiNegedge) : vpiNoEdge;
+    if (prop == vpiEdge) return vpiNoEdge;
+    return vpiUndefined;
+}
+inline bool pathGetStr(int prop, const Obj* o, std::string& r) {
+    const PathRec& p = pathRecs()[(size_t)o->idx];
+    if (o->kind == Obj::PathTerm && prop == vpiName) { r = o->pos == 0 ? p.in : p.out; return true; }
+    return false;
+}
+// Delays of a path (38.10): 1, 2, 3, 6 or 12 of the 12 transitions, with
+// pulse limits (pulsere_flag) and append_flag.
+inline bool pathDelayCount(p_vpi_delay d, const char* who) {
+    if (!d || !d->da) { error(vpiError, std::string(who) + ": no delay structure"); return false; }
+    int n = d->no_of_delays;
+    if (n != 1 && n != 2 && n != 3 && n != 6 && n != 12) {
+        error(vpiError, std::string(who) + ": a module path has 1, 2, 3, 6 or 12 delays");
+        return false;
+    }
+    return true;
+}
+inline void pathGetDelays(const Obj* o, p_vpi_delay d) {
+    const PathRec& p = pathRecs()[(size_t)o->idx];
+    const Obj* m = pathModule(p);
+    int per = (d->mtm_flag ? 3 : 1) * (d->pulsere_flag ? 3 : 1);
+    for (int k = 0; k < d->no_of_delays; k++) {
+        uint64_t vals[3] = {p.d[k], p.rj[k], p.er[k]};
+        for (int q = 0; q < (d->pulsere_flag ? 3 : 1); q++)
+            for (int mm = 0; mm < (d->mtm_flag ? 3 : 1); mm++) {
+                p_vpi_time t = &d->da[k * per + q * (d->mtm_flag ? 3 : 1) + mm];
+                t->type = d->time_type;
+                fillTime(t, m, vals[q]);
+            }
+    }
+}
+inline void pathPutDelays(const Obj* o, p_vpi_delay d) {
+    PathRec& p = pathRecs()[(size_t)o->idx];
+    const Obj* m = pathModule(p);
+    int per = (d->mtm_flag ? 3 : 1) * (d->pulsere_flag ? 3 : 1);
+    std::vector<uint64_t> dv, rv, ev;
+    for (int k = 0; k < d->no_of_delays; k++) {
+        auto at = [&](int q) {
+            s_vpi_time t = d->da[k * per + q * (d->mtm_flag ? 3 : 1) + (d->mtm_flag ? 1 : 0)];   // typical
+            t.type = d->time_type;
+            return (uint64_t)std::max<int64_t>(0, sigTicks(&t, m));
+        };
+        uint64_t x = at(0);
+        dv.push_back(x);
+        rv.push_back(d->pulsere_flag ? at(1) : rejectOf(x));
+        ev.push_back(d->pulsere_flag ? at(2) : x * (uint64_t)std::max(pulseOpts().errorPct, pulseOpts().rejectPct) / 100);
+    }
+    auto D = expand12(dv), R = expand12(rv), E = expand12(ev);
+    for (int k = 0; k < 12; k++) {
+        p.d[k] = d->append_flag ? p.d[k] + D[(size_t)k] : D[(size_t)k];
+        p.rj[k] = d->append_flag ? p.rj[k] + R[(size_t)k] : R[(size_t)k];
+        p.er[k] = d->append_flag ? p.er[k] + E[(size_t)k] : E[(size_t)k];
+    }
+    p.annotated = true;
 }
