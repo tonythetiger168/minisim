@@ -543,6 +543,9 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI timing checks: `vpi_iterate(vpiTchk, module)`, their terms, notifier
+  and limits (`vpi_get_delays` / `vpi_put_delays`), and `cbTchkViolation`
+  (38.10, 38.36.1). `tests/spec/38.36-vpi-tchk.sv`.
 - VPI assertion stepping (39.5.2): `vpiAssertionEnableStep` /
   `vpiAssertionDisableStep` with `cbAssertionStepSuccess` /
   `cbAssertionStepFailure` for each clock step of each attempt.
