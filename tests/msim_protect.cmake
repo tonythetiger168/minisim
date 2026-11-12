@@ -236,9 +236,15 @@ run(${PROTECT} -keyring acme.keys -key acme_pub.pem -keyowner Acme -keyname acme
 run(${MSIM} -keyfile Acme:acme-1=acme.pem core_lic.svp ${EX}/core_tb.sv -vcd lic_off.vcd)
 file(READ ${OUT}/lic_off.vcd lo)
 reject("${lo}" "hidden_sum")
-run(${MSIM} -keyfile Acme:acme-1=acme.pem -license acme_debug core_lic.svp ${EX}/core_tb.sv -vcd lic_on.vcd)
-file(READ ${OUT}/lic_on.vcd lon)
-expect("${lon}" "hidden_sum")
+# The envelope names no license proxy, so the call is an irregularity
+# (IEEE 1735 8.9): denied with a warning, or an error with -license_fail stop.
+expect("${err}" "license check failed (the envelope has no license_proxyenv); licensed rights are denied")
+run_fail(${MSIM} -keyfile Acme:acme-1=acme.pem -license_fail stop core_lic.svp ${EX}/core_tb.sv)
+expect("${err}" "license check failed: the envelope has no license_proxyenv")
+# The IP user cannot grant a license to themselves.
+run_fail(${MSIM} -keyfile Acme:acme-1=acme.pem -license acme_debug core_lic.svp ${EX}/core_tb.sv)
+expect("${err}" "-license is gone")
+# Licensed rights against a running proxy: tests/license_proxy.sh.
 
 # msim's own messages about protected code (a default assertion failure)
 # name neither the label nor the line (IEEE 1735 9.2.1); the IP's own
