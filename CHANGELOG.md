@@ -16,6 +16,11 @@ Spec references are IEEE 1800-2023 clauses.
 - Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
   `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
   the last place), checked by `tests/dw/more.sv`.
+- VPI constraint details (37.31): `vpiSoft` on expression items, `dist`
+  items as `vpiDistribution` / `vpiDistItem` / `vpiValueRange` objects with
+  `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
+  object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
+  `vpiRefObj` has `vpiName` and `vpiFullName`.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
