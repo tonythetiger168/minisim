@@ -20,8 +20,9 @@ endforeach()
 # equivalent supplies, composite domains, explicit supply connections and
 # simstate behavior (5.6, 6.8, 6.15, 6.17, 6.44, 6.47, 6.50, 6.51, 6.56);
 # corruption and assertion controls and a library's simstate behavior file
-# (6.34, 6.58, 6.59).
-foreach(t logic transitions attributes simctl)
+# (6.34, 6.58, 6.59); power models, applied by name and to every instance of
+# a model, with a parameter, and a legacy one (6.3, 6.9, 6.11, 6.31, 6.32).
+foreach(t logic transitions attributes simctl pmodel)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -145,6 +146,22 @@ foreach(case
   file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badlib.upf "${line}\n")
   upf_error_in(simctl e_lib "load_simstate_behavior mylib -file ${CMAKE_CURRENT_BINARY_DIR}/badlib.upf" "${want}")
 endforeach()
+
+# Errors of power models and parameters.
+upf_error_in(pmodel e_pm1 "define_power_model MAC_PM {}" "power model MAC_PM is already defined (6.31)")
+upf_error_in(pmodel e_pm2 "define_power_model P2 -complete {}\ndefine_power_model P2 -update {}" "power model P2 is -complete; it cannot be updated (6.31)")
+upf_error_in(pmodel e_pm3 "define_power_model P3 {define_power_model P4 {}}" "define_power_model inside power model P3; power models do not nest (6.31)")
+upf_error_in(pmodel e_pm4 "apply_power_model NOPE -elements {u_mac0}" "apply_power_model: no power model NOPE (6.9)")
+upf_error_in(pmodel e_pm5 "define_power_model P5 {add_parameter X -default 1}\napply_power_model P5 -elements {u_mac0/u_core} -parameters {{Y 2}}" "Y is not a parameter of power model P5 (6.9)")
+upf_error_in(pmodel e_pm6 "define_power_model P6 {add_parameter X}\napply_power_model P6 -elements {u_mac0/u_core}" "add_parameter X needs -default (6.3 b)")
+upf_error_in(pmodel e_pm7 "define_power_model P7 {\n  add_parameter X -default 1\n  add_parameter X -default 2\n}\napply_power_model P7 -elements {u_mac0/u_core}" "e_pm7.upf:48: parameter X is already defined in power model P7 (6.3 a)")
+upf_error_in(pmodel e_pm8 "begin_power_model P8" "begin_power_model P8 has no end_power_model (6.11)")
+upf_error_in(pmodel e_pm9 "end_power_model" "end_power_model without begin_power_model (6.32)")
+upf_error_in(pmodel e_pm10 "apply_power_model ROM_PM -elements {u_rom}" "power model ROM_PM is already applied to u_rom")
+upf_error_in(pmodel e_pm11 "define_power_model P9 {}\napply_power_model P9 -elements {u_mac0} -update" "apply_power_model -update: P9 is not applied to u_mac0 (6.9)")
+upf_error_in(pmodel e_pm12 "define_power_model P5 {}\napply_power_model P5 -elements {u_rom/x}" "apply_power_model P5: no instance 'u_dut.u_rom.x' in the design (6.9)")
+upf_error_in(pmodel e_pm13 "define_power_model P10 -for {rom} {}\napply_power_model P10 -elements {u_mac0/u_core}" "an instance of mac_core, which is not a model it is for (6.31)")
+upf_error_in(pmodel e_pm14 "add_parameter Q -type sometimes -default 1" "add_parameter -type sometimes (buildtime, runtime or rate)")
 
 # -power_top names the instance the UPF describes; it wins over set_design_top.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut

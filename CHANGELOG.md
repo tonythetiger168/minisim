@@ -60,6 +60,10 @@ Spec references are IEEE 1800-2023 clauses.
   read and ignored; `mlint -upf` rule `UPF007`. See `docs/LOWPOWER.md`.
 - UPF (IEEE 1801-2024): `sim_corruption_control` (6.59),
   `sim_assertion_control` (6.58) and `load_simstate_behavior` (6.34).
+- UPF (IEEE 1801-2024): power models: `define_power_model` (6.31),
+  `begin_power_model` / `end_power_model` (6.11, 6.32), `apply_power_model`
+  (6.9) with `-supply_map`, `-port_map` and `-parameters`, and
+  `add_parameter` (6.3).
 - `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
   the object a module's class handle variable points to is a signal
   `tb.p.addr` that follows the handle (x while it is null), with handle

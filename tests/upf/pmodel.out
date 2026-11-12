@@ -1,0 +1,5 @@
+1 on: y0=4 y1=4 y2=c
+2 mac0 off, isolated to its clamp 0: y0=0 y1=4 y2=c
+3 mac1 off, clamp 1 from -parameters: y0=0 y1=f y2=c
+4 rom off: y0=0 y1=f y2=x
+5 on again: y0=4 y1=4 y2=c

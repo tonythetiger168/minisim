@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <fstream>
 #include <functional>
+#include <tuple>
 #include <map>
 #include <memory>
 #include <set>
@@ -183,6 +184,28 @@ struct Reader : tcl::Interp {
                 throw Error(m);
             }
     }
+
+    // A power model's commands (6.31): run in a frame of their own, so its
+    // Tcl variables and the caller's do not mix.
+    void runIsolated(const std::string& body, const std::string& file, int line) {
+        std::string savedFile = file_;
+        int savedLine = line_;
+        frames_.emplace_back();
+        globals_.emplace_back();
+        struct Back { Reader& r; std::string f; int l; ~Back() { r.frames_.pop_back(); r.globals_.pop_back(); r.file_ = f; r.line_ = l; } } back{*this, savedFile, savedLine};
+        file_ = file;
+        size_t before = diags.size();
+        try { eval(body, line); } catch (const Ret&) {}
+        for (size_t i = before; i < diags.size(); i++)
+            if (diags[i].sev == tcl::Diag::ErrorSev) {
+                std::string m = located(diags[i]);
+                diags.resize(before);
+                throw Error(m);
+            }
+    }
+    // A variable of the innermost frame (add_parameter, 6.3).
+    void setLocal(const std::string& name, const std::string& v) { setVar(name, v); }
+    bool inFrame() const { return frames_.size() > 1; }
 
     static std::string slurp(const std::string& path) {
         std::ifstream f(path);
@@ -613,6 +636,21 @@ struct SimBehavior {
     std::vector<std::string> models, elements, exclude;
     bool loaded = false;   // from load_simstate_behavior (6.34): its models must exist
 };
+// define_power_model (6.31), or begin_power_model / end_power_model
+// (6.11, 6.32, legacy): commands applied to instances by apply_power_model.
+struct PowerModel {
+    std::string name, where;
+    std::vector<std::string> fors;                        // -for: the models it is for
+    std::vector<std::tuple<std::string, std::string, int>> bodies;   // define_power_model: text, file, line
+    std::vector<Cmd> cmds;                                // begin_power_model: the commands
+    bool complete = false, legacy = false, implementation = false;
+};
+// apply_power_model without -elements (6.9): every instance of the model
+// under the scope, found once the design is known.
+struct PendingApply {
+    Cmd c;
+    std::string scope;
+};
 // The design elements a simulation control selects (6.58, 6.59): with
 // -model, names are relative to each instance of the model (5.8).
 struct ElemSel {
@@ -701,6 +739,13 @@ struct Model {
     std::vector<SupplyConn> supplyConns;
     std::vector<SimBehavior> simBehaviors;
     std::vector<CorrCtl> corrCtls;
+    std::map<std::string, PowerModel> powerModels;
+    std::string recording;                                 // begin_power_model ... end_power_model
+    struct PmCtx { std::string name; std::map<std::string, std::string> overrides; std::set<std::string> defined; };
+    std::vector<PmCtx> pmStack;                            // the power models being applied
+    std::map<std::string, std::string> appliedModels;      // instance (UPF path) -> power model
+    std::vector<PendingApply> pendingApplies;
+    std::map<std::string, std::pair<std::string, std::string>> parameters;   // add_parameter -type outside a model: type, default
     std::vector<AssertCtl> assertCtls;
     std::map<std::string, RetList> retLists;
     std::vector<DesignAttrRule> designAttrs;
@@ -913,6 +958,50 @@ struct Model {
         };
         r.load(path);
         for (auto& d : r.diags) warnings.push_back(Reader::located(d));
+        if (!recording.empty()) throw Error(powerModels[recording].where + ": begin_power_model " + recording + " has no end_power_model (6.11)");
+    }
+    // apply_power_model without -elements (6.9): instancesOf(model) gives
+    // the design paths (from the simulation top, with dots) of a module's
+    // instances. Call once `top` is known.
+    void resolveApplies(const std::function<std::vector<std::string>(const std::string&)>& instancesOf) {
+        auto pend = std::move(pendingApplies);
+        pendingApplies.clear();
+        for (auto& pa : pend) {
+            const PowerModel& pm = powerModels.at(pa.c.w[1]);
+            std::vector<std::string> mods = pm.fors.empty() ? std::vector<std::string>{pm.name} : pm.fors;
+            std::vector<std::string> els;
+            for (auto& mod : mods)
+                for (auto p : instancesOf(mod)) {
+                    if (!top.empty()) {
+                        if (p == top || p.compare(0, top.size() + 1, top + ".") != 0) continue;
+                        p = p.substr(top.size() + 1);
+                    }
+                    for (char& ch : p) if (ch == '.') ch = '/';
+                    if (!pa.scope.empty()) {
+                        if (p.compare(0, pa.scope.size() + 1, pa.scope + "/") != 0) continue;
+                        p = p.substr(pa.scope.size() + 1);
+                    }
+                    if (appliedModels.count(join(pa.scope, p))) continue;   // an explicit -elements wins (5.7)
+                    els.push_back(p);
+                }
+            if (els.empty()) {
+                warnings.push_back(pa.c.where() + ": apply_power_model " + pm.name + ": no instance of its models under this scope");
+                continue;
+            }
+            std::string list;
+            for (auto& e : els) list += (list.empty() ? "" : " ") + e;
+            Cmd c2 = pa.c;
+            c2.w.push_back("-elements");
+            c2.w.push_back(list);
+            Reader r;
+            r.onPuts = [this](const std::string& t) { if (out) *out << t << "\n"; };
+            std::string scope = pa.scope;
+            r.onCmd = [&](const Cmd& c) {
+                run({c}, scope, r, c.file);
+                return std::string();
+            };
+            run({c2}, scope, r, c2.file);
+        }
     }
     std::ostream* out = &std::cout;   // where Tcl puts goes
 
@@ -978,6 +1067,12 @@ struct Model {
 inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader& rd, const std::string& file) {
     for (const Cmd& c : cmds) {
         const std::string& n = c.w[0];
+        if (!recording.empty() && n != "end_power_model") {   // inside begin_power_model (6.11)
+            if (n == "begin_power_model" || n == "define_power_model")
+                throw Error(c.where() + ": " + n + " inside power model " + recording + "; power models do not nest (6.31)");
+            powerModels[recording].cmds.push_back(c);
+            continue;
+        }
         auto need = [&](const Opts& o, size_t k, const char* what) {
             if (o.pos.size() < k) throw Error(c.where() + ": " + n + " needs " + what);
         };
@@ -1472,6 +1567,121 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             }
             if (!sc.hasElements) throw Error(c.where() + ": connect_supply_set needs -elements (the supply set is not a handle of a domain)");
             supplyConns.push_back(sc);
+            continue;
+        }
+        if (n == "define_power_model" || n == "begin_power_model") {   // 6.31, 6.11 (legacy)
+            bool legacy = n == "begin_power_model";
+            if (!pmStack.empty()) throw Error(c.where() + ": " + n + " inside power model " + pmStack.back().name + "; power models do not nest (6.31)");
+            Opts o = opts(c, {"-implementation", "-update", "-complete"});
+            need(o, legacy ? 1 : 2, legacy ? "a power model name" : "a power model name and its commands in braces");
+            if (o.pos.size() > (legacy ? 1u : 2u)) throw Error(c.where() + ": " + n + ": unexpected argument " + o.pos[legacy ? 1 : 2]);
+            std::string name = o.pos[0];
+            bool fresh = !powerModels.count(name);
+            if (!fresh && !o.has("-update")) throw Error(c.where() + ": power model " + name + " is already defined (6.31)");
+            if (fresh && o.has("-update")) throw Error(c.where() + ": -update of unknown power model " + name);
+            PowerModel& pm = powerModels[name];
+            if (!fresh && pm.complete) throw Error(c.where() + ": power model " + name + " is -complete; it cannot be updated (6.31)");
+            if (fresh) { pm.name = name; pm.where = c.where(); pm.legacy = legacy; }
+            for (auto& f : o.list("-for")) pm.fors.push_back(f);
+            if (o.has("-complete")) pm.complete = true;
+            if (o.has("-implementation")) pm.implementation = true;
+            if (legacy) recording = name;
+            else {
+                const std::string& body = o.pos[1];
+                for (const char* bad : {"define_power_model", "begin_power_model"}) {
+                    size_t at = body.find(bad);
+                    if (at != std::string::npos && (at == 0 || std::isspace((unsigned char)body[at - 1]) || body[at - 1] == '[' || body[at - 1] == ';'))
+                        throw Error(c.where() + ": " + bad + " inside power model " + name + "; power models do not nest (6.31)");
+                }
+                pm.bodies.emplace_back(body, c.file, c.line);
+            }
+            continue;
+        }
+        if (n == "end_power_model") {   // 6.32 (legacy)
+            if (recording.empty()) throw Error(c.where() + ": end_power_model without begin_power_model (6.32)");
+            recording.clear();
+            continue;
+        }
+        if (n == "add_parameter") {   // 6.3
+            Opts o = opts(c, {});
+            need(o, 1, "a parameter name");
+            for (auto& [k, v] : o.v)
+                if (k != "-type" && k != "-default" && k != "-description") throw Error(c.where() + ": add_parameter: unknown option " + k);
+            const std::string& pn = o.pos[0];
+            if (!o.has("-default")) throw Error(c.where() + ": add_parameter " + pn + " needs -default (6.3 b)");
+            std::string type = o.get("-type");
+            if (!type.empty() && type != "buildtime" && type != "runtime" && type != "rate")
+                throw Error(c.where() + ": add_parameter -type " + type + " (buildtime, runtime or rate)");
+            if (pmStack.empty()) {
+                if (parameters.count(pn)) throw Error(c.where() + ": parameter " + pn + " is already defined (6.3 a)");
+                parameters[pn] = {type, o.get("-default")};
+                if (type.empty()) rd.setLocal(pn, o.get("-default"));
+                continue;
+            }
+            PmCtx& ctx = pmStack.back();
+            if (!ctx.defined.insert(pn).second) throw Error(c.where() + ": parameter " + pn + " is already defined in power model " + ctx.name + " (6.3 a)");
+            auto ov = ctx.overrides.find(pn);
+            if (type.empty()) rd.setLocal(pn, ov != ctx.overrides.end() ? ov->second : o.get("-default"));
+            continue;
+        }
+        if (n == "apply_power_model") {   // 6.9
+            Opts o = opts(c, {"-update"});
+            need(o, 1, "a power model name");
+            for (auto& [k, v] : o.v)
+                if (k != "-elements" && k != "-supply_map" && k != "-port_map" && k != "-parameters" && k != "-update")
+                    throw Error(c.where() + ": apply_power_model: unknown option " + k);
+            std::string name = o.pos[0];
+            if (!powerModels.count(name)) throw Error(c.where() + ": apply_power_model: no power model " + name + " (6.9)");
+            if (!o.has("-elements")) {   // every instance of the model under this scope, once the design is known
+                pendingApplies.push_back({c, scope});
+                continue;
+            }
+            const PowerModel& pm = powerModels.at(name);
+            std::map<std::string, std::string> params;
+            for (auto& pv : o.list("-parameters")) {
+                auto l = splitList(pv);
+                if (l.size() != 2) throw Error(c.where() + ": -parameters needs {name value} pairs");
+                params[l[0]] = l[1];
+            }
+            for (auto& el : o.list("-elements")) {
+                std::string inst = join(scope, el);
+                auto ap = appliedModels.find(inst);
+                if (o.has("-update")) {
+                    if (ap == appliedModels.end() || ap->second != name)
+                        throw Error(c.where() + ": apply_power_model -update: " + name + " is not applied to " + el + " (6.9)");
+                } else {
+                    if (ap != appliedModels.end())
+                        throw Error(c.where() + ": power model " + ap->second + " is already applied to " + el);
+                    appliedModels[inst] = name;
+                    std::string saved = scope;
+                    struct Back { std::string& s; std::string v; std::vector<PmCtx>& st; ~Back() { s = v; st.pop_back(); } };
+                    pmStack.push_back({name, params, {}});
+                    Back back{scope, saved, pmStack};
+                    scope = inst;
+                    if (pm.legacy) run(pm.cmds, scope, rd, file);
+                    for (auto& [body, bf, bl] : pm.bodies) rd.runIsolated(body, bf, bl);
+                    for (auto& [pn, pv] : params)
+                        if (!pmStack.back().defined.count(pn))
+                            throw Error(c.where() + ": apply_power_model -parameters: " + pn + " is not a parameter of power model " + name + " (6.9)");
+                }
+                // the implied associate_supply_set and connect commands
+                for (auto& sm : o.list("-supply_map")) {
+                    auto l = splitList(sm);
+                    if (l.size() != 2) throw Error(c.where() + ": -supply_map needs {instance_scope_supply_set current_scope_supply_set} pairs");
+                    Cmd a = c;
+                    a.w = {"associate_supply_set", l[1], "-handle", el + "/" + l[0]};
+                    run({a}, scope, rd, file);
+                }
+                for (auto& pmp : o.list("-port_map")) {
+                    auto l = splitList(pmp);
+                    if (l.size() != 2) throw Error(c.where() + ": -port_map needs {instance_scope_port current_scope_net} pairs");
+                    std::string full = join(scope, l[1]);
+                    bool supply = nets.count(full) || ports.count(full);
+                    Cmd a = c;
+                    a.w = {supply ? "connect_supply_net" : "connect_logic_net", l[1], "-ports", "{" + el + "/" + l[0] + "}"};
+                    run({a}, scope, rd, file);
+                }
+            }
             continue;
         }
         if (n == "sim_corruption_control" || n == "sim_assertion_control") {   // 6.59, 6.58
@@ -1970,7 +2180,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             
             "save_upf", 
             "sim_replay_control",
-            "set_retention_control", "define_power_model", "end_power_model", "apply_power_model", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
+            "set_retention_control", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
             "define_retention_cell", "define_power_switch_cell", "define_always_on_cell", "define_diode_clamp",
             "map_retention_clamp_cell", "map_repeater_cell", "create_abstract_power_source", "set_pin_related_supply",
             "set_related_supply_net", "query_upf", "add_parameter"};
@@ -2115,6 +2325,20 @@ struct Finding {
 inline std::vector<Finding> intentErrors(const Model& m, const DomainMap& dm,
                                          const std::function<std::string(const std::string&)>& modelOf) {
     std::vector<Finding> out;
+    // apply_power_model (6.9): each instance exists and is of a model the power model is for (6.31)
+    if (modelOf)
+        for (auto& [inst, pmName] : m.appliedModels) {
+            std::string mod = modelOf(m.design(inst));
+            const PowerModel& pm = m.powerModels.at(pmName);
+            if (mod.empty()) {
+                out.push_back({"UPF001", pm.where, "apply_power_model " + pmName + ": no instance '" + m.design(inst) + "' in the design (6.9)"});
+                continue;
+            }
+            bool forIt = pm.fors.empty() ? mod == pm.name : std::find(pm.fors.begin(), pm.fors.end(), mod) != pm.fors.end();
+            if (!forIt)
+                out.push_back({"UPF007", pm.where, "power model " + pmName + " is applied to " + m.design(inst) + ", an instance of " + mod +
+                                                   ", which is not a model it is for (6.31)"});
+        }
     for (auto& [cn, cd] : m.composites) {
         if (!m.setAlias.count(cn + ".primary")) continue;
         std::string want = m.eqOf(cn + ".primary");

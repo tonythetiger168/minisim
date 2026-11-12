@@ -2252,6 +2252,13 @@ int main(int argc, char** argv) {
                 else if (!found.empty()) top = found;
             }
             rt.m.top = top;
+            rt.m.resolveApplies([](const std::string& mod) {   // apply_power_model without -elements (6.9)
+                std::vector<std::string> r;
+                std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+                for (auto& [full, m] : instCells())
+                    if (m == mod && full.compare(0, pre.size(), pre) == 0) r.push_back(full.substr(pre.size()));
+                return r;
+            });
             rt.bind(lowered);
         } catch (const std::exception& ex) {
             std::cerr << "msim: UPF: " << ex.what() << "\n";
