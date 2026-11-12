@@ -55,6 +55,12 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `mcov` reads and writes UCIS XML (Accellera UCIS 1.0, its XML interchange
+  format): a database named `.xml` is UCIS. Each instance becomes an
+  instanceCoverages scope with its statements, branches, conditions,
+  toggles, FSMs, assertions and covergroups. It also reads what other tools
+  write, such as blocks, case statements with more than two arms and
+  SystemVerilog literal state values.
 - `mlint` reset tree checks: `RDC005` (a reset synchronizer of one flop) and
   `RDC006` (an asynchronous reset made by combinational logic of several
   flops). `-cdc-report` lists the reset synchronizers, their length and how
