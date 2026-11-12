@@ -7,6 +7,14 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Added
+- Floating point datapath modules, IEEE 754 in any exponent and fraction
+  width with subnormals and all five rounding modes: `MW_fp_add`,
+  `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
+  `MW_fp_cmp` (with minimumNumber / maximumNumber), `MW_fp_i2flt`,
+  `MW_fp_flt2i` and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
+  them against an exact rational reference (docs/DATAPATH.md).
+
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
   IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
