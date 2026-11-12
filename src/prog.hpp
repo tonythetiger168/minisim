@@ -104,6 +104,9 @@ inline bool g_cov = false;
 struct Instr;
 inline bool g_hook = false;
 inline void (*g_stmtHook)(const Instr&) = nullptr;
+// VPI cbError (38.36.3): called with the format of each run-time error
+// message ($error, $fatal, a failed assertion or $cast) as it is printed.
+inline void (*g_errHook)(const std::string&) = nullptr;
 // msim -cm_cond (as VCS): full = every combination of the term values of a
 // condition (up to 8 terms), not only the sensitized vectors; allops = also
 // & and | on one-bit operands.
