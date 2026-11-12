@@ -2593,7 +2593,8 @@ struct Sim {
         }
     }
     void covToggle(int s, const Val& o, const Val& n) {
-        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0) covFsm(fsmOf[s], o, n);
+        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0 && !(g_covStop & 4)) covFsm(fsmOf[s], o, n);
+        if (g_covStop & 2) return;
         if (togRise.size() <= (size_t)s) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
         int w = sigs[s].w;
         auto& R = togRise[s];

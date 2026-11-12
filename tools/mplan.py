@@ -8,6 +8,8 @@
     mplan init   -results regress.d [-cov cov.json] -o draft.vplan
     mplan init   -reqs reqs.csv -o draft.vplan
     mplan rank   -results regress.d [uart.vplan] [-by rate] [-keep keep.list]
+    mplan serve  -root /srv/mplan [-port 8080] [-users users.txt]
+    mplan push   http://host:8080 plan.d [-project uart]
 
 A verification plan (vPlan) lists the features of a design and, per feature,
 what proves it: tests (mregress results), code coverage, covergroups and
@@ -92,6 +94,15 @@ test's new points, the coverage so far, its run time, and its unique points
 tests are left out (``-all`` ranks them too). With a plan, each feature
 lists the tests that contribute to its coverage metrics. ``report -rank``
 puts the same table in ``plan.html`` and ``plan.json``.
+
+Server. ``mplan serve`` is a dashboard for many plans and many people: the
+plans with their score, status and trend, one page per plan, and a form on
+every failure bucket to set its owner, status, bug id and note. ``mplan
+push URL plan.d`` uploads a report (from CI); the server keeps the history
+per project under ``-root``. ``-rules`` also takes the server's
+``/api/p/NAME/rules`` URL, so a report carries what people set on the
+dashboard. Tokens (``-users``), roles and the JSON API: ``mplan serve -h``
+and docs/MPLAN.md.
 
 History. ``report`` appends one snapshot per run to ``<o>/history.jsonl``
 (``-history FILE``; ``-no-history`` to leave it alone): the time, a label
@@ -1107,11 +1118,34 @@ def load_rules(path):
     rules = []
     if not path:
         return rules
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except OSError as e:
-        raise SystemExit(f"mplan: {path}: {e.strerror}")
+    if re.match(r"^https?://", path):         # the annotations of an mplan server
+        import urllib.request
+        req = urllib.request.Request(path)
+        if os.environ.get("MPLAN_TOKEN"):
+            req.add_header("Authorization", "Bearer " + os.environ["MPLAN_TOKEN"])
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                text = r.read().decode("utf-8")
+        except OSError as e:
+            raise SystemExit(f"mplan: {path}: {getattr(e, 'reason', e)}")
+    else:
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            raise SystemExit(f"mplan: {path}: {e.strerror}")
+    if text.lstrip().startswith("{"):         # annotations by exact signature (mplan serve)
+        try:
+            anns = json.loads(text).get("buckets", {})
+        except ValueError as e:
+            raise SystemExit(f"mplan: {path}: not JSON ({e})")
+        for sig in sorted(anns):
+            a = anns[sig]
+            ann = {k: str(a[k]) for k in ("status", "owner", "bug", "note") if a.get(k)}
+            if ann.get("status", "open") in ("known", "waived", "open"):
+                rules.append((re.compile("^" + re.escape(sig) + "$"), ann))
+        return rules
+    lines = text.splitlines()
     for no, raw in enumerate(lines, 1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -1758,6 +1792,14 @@ def cmd_rank(a):
     return 0
 
 
+def cmd_serve(a):
+    return tool("mplan_serve").serve(a, sys.modules[__name__])
+
+
+def cmd_push(a):
+    return tool("mplan_serve").push(a, sys.modules[__name__])
+
+
 def cmd_trend(a):
     snaps = read_history(a.history)
     if not snaps:
@@ -1911,6 +1953,20 @@ def main(argv=None):
     k.add_argument("-n", type=int, help="print only the first N ranks")
     k.add_argument("-json", metavar="FILE", help="also write the ranking as JSON")
     k.add_argument("-keep", metavar="FILE", help="write the tests that add coverage, one name a line, in rank order")
+    sv = sub.add_parser("serve", help="a dashboard for many plans and many people (history, triage annotations, JSON API)")
+    sv.add_argument("-root", required=True, metavar="DIR", help="where the projects are kept, one directory each")
+    sv.add_argument("-port", type=int, default=8080, help="TCP port (default 8080; 0 picks a free one)")
+    sv.add_argument("-bind", default="127.0.0.1", metavar="ADDR", help="address to listen on (default 127.0.0.1)")
+    sv.add_argument("-users", metavar="FILE", help="name:token[:role] lines; role is read, write (default) or admin")
+    sv.add_argument("-open", action="store_true", help="anyone who reaches the port may write (trusted networks only)")
+    sv.add_argument("-private", action="store_true", help="reading needs a token too")
+    sv.add_argument("-q", action="store_true", help="do not log requests")
+    pu = sub.add_parser("push", help="upload the output of mplan report to an mplan server")
+    pu.add_argument("url", help="the server, e.g. http://host:8080")
+    pu.add_argument("dir", help="the report directory (plan.d)")
+    pu.add_argument("-project", metavar="NAME", help="project name on the server (default: the plan's name)")
+    pu.add_argument("-token", help="write token (default: the MPLAN_TOKEN environment variable)")
+    pu.add_argument("-timeout", type=float, default=60, metavar="SEC", help="give up after SEC seconds (default 60)")
     d = sub.add_parser("trend", help="print the history as a table")
     d.add_argument("history")
     d.add_argument("-n", type=int, help="only the last N snapshots")
@@ -1923,7 +1979,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     try:
         return {"check": cmd_check, "report": cmd_report, "triage": cmd_triage, "trend": cmd_trend, "init": cmd_init,
-                "rank": cmd_rank}[a.cmd](a)
+                "rank": cmd_rank, "serve": cmd_serve, "push": cmd_push}[a.cmd](a)
     except PlanError as e:
         print(f"mplan: {e}", file=sys.stderr)
         return 2

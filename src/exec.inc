@@ -64,6 +64,45 @@ static std::vector<int64_t> memIdx(const ArrShape& a, int64_t addr, int64_t k) {
     }
     return idx;
 }
+// A partly indexed memory as the $readmem / $writemem target (21.4):
+// aidx holds the indexes of the leading dimensions and, when pdown is set,
+// the left and right bounds of a slice of the next one. i.arr becomes the
+// lesser dimensioned array they select, in place in the memory.
+static bool memView(Instr& i) {
+    const ArrShape& a = *i.arr;
+    size_t ni = i.aidx.size() - (i.pdown ? 2 : 0);
+    std::vector<int64_t> idx(a.dims.size());
+    auto bad = [&](const char* why) {
+        std::cerr << (i.k == IK::ReadMem ? "$readmem" : "$writemem") << ": " << why << " for " << i.fmt << "\n";
+        return false;
+    };
+    for (size_t d = 0; d < a.dims.size(); d++) idx[d] = a.dims[d].first;
+    for (size_t d = 0; d < ni; d++) {
+        Val v = eval(i.aidx[d], rd);
+        if (v.x) return bad("unknown memory index");
+        idx[d] = v_to_i64(v);
+    }
+    auto view = std::make_shared<ArrShape>(a);
+    view->dims.erase(view->dims.begin(), view->dims.begin() + (long)ni);
+    if (i.pdown) {
+        Val l = eval(i.aidx[ni], rd), r = eval(i.aidx[ni + 1], rd);
+        if (l.x || r.x) return bad("unknown slice bound");
+        int64_t sl = v_to_i64(l), sr = v_to_i64(r);
+        auto [dl, dr] = a.dims[ni];
+        if ((dl <= dr) != (sl <= sr) && sl != sr) return bad("slice in the wrong direction");
+        if (std::min(sl, sr) < std::min(dl, dr) || std::max(sl, sr) > std::max(dl, dr)) return bad("slice out of range");
+        idx[ni] = sl;
+        view->dims[0] = {sl, sr};
+    }
+    int64_t off = a.offset(idx);
+    if (off < 0) return bad("memory index out of range");
+    view->base = a.base + (int)off;
+    int64_t cnt = 1;
+    for (size_t d = 0; d < view->dims.size(); d++) cnt *= view->size(d);
+    view->count = (int)cnt;
+    i.arr = view;
+    return true;
+}
 static void writeMem(const Instr& i) {
     const ArrShape& a = *i.arr;
     auto [l, r] = a.dims[0];
@@ -1456,9 +1495,10 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             }
             case IK::ReadMem:
             case IK::WriteMem: {
-                if (i.e) {   // a file name known only at run time: a string variable or expression
+                if (i.e || !i.aidx.empty()) {   // a file name known only at run time, or a part of the memory
                     Instr n = i;
-                    n.fmt = v_str(eval(i.e, rd));
+                    if (i.e) n.fmt = v_str(eval(i.e, rd));
+                    if (!i.aidx.empty() && !memView(n)) { pc++; break; }
                     if (i.k == IK::ReadMem) readMem(n); else writeMem(n);
                 } else if (i.k == IK::ReadMem) readMem(i);
                 else writeMem(i);

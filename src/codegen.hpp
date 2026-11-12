@@ -2546,7 +2546,7 @@ private:
                 if (i.fd) throw CodegenUnsupported("$fstrobe / $fmonitor");
                 if (!i.dly.empty()) throw CodegenUnsupported("delayed continuous assignment");
                 if (i.k == IK::ReadMem || i.k == IK::WriteMem) {   // $readmem / $writemem (21.4, 21.5)
-                    if (!i.arr || readsPriv(i.e) || i.pw == 2) throw CodegenUnsupported("$readmem form");
+                    if (!i.arr || readsPriv(i.e) || i.pw == 2 || !i.aidx.empty()) throw CodegenUnsupported("$readmem form");
                     for (auto& a : i.args) if (readsPriv(a)) throw CodegenUnsupported("$readmem form");
                     mems_.push_back(&i);
                     std::string M_ = "MI" + std::to_string(mems_.size() - 1);

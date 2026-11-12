@@ -367,6 +367,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+  # mlint -cdc-sva writes assertions that msim runs next to the design.
+  add_test(NAME mlint_cdc_sva
+           COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mlint_cdc_sva
+                   -P ${CMAKE_SOURCE_DIR}/tests/mlint_cdc_sva.cmake)
   # Every mlint rule on a marked source file (tests/lint/rules), the
   # configuration, the waivers, and -threads 1 against -threads 4.
   if(Python3_FOUND)
@@ -442,6 +447,7 @@ install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mr
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
 install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
 install(PROGRAMS tools/mplan.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan)
+install(PROGRAMS tools/mplan_serve.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan_serve)
 # The Python interface to mdebug -script (import mdebug_api).
 install(FILES tools/mdebug_api.py DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/python)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
