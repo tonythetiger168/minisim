@@ -32,6 +32,13 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI coverage API (clause 40): `vpi_get` of `vpiStatementCoverage`,
+  `vpiToggleCoverage`, `vpiFsmStateCoverage` and `vpiAssertCoverage` on an
+  instance, `vpiCovered` / `vpiCoveredCount` / `vpiCoveredMax` and the
+  assertion counts on assertions, FSMs, FSM states, nets and bits,
+  `vpi_iterate(vpiFsm)` and `vpiFsmStates`, and `vpi_control` with
+  `vpiCoverageStart`, `Stop`, `Reset`, `Check` and `Save` (`msim -cov`).
+  `vpi_handle_by_name` finds an assertion by its label.
 - VPI assertion API (clause 39): assertions are objects found by
   `vpi_iterate(vpiAssertion, ...)`; `vpi_register_assertion_cb` reports each
   attempt's start, success, vacuous success, failure and disabled

@@ -132,7 +132,14 @@ struct FsmDef {
 };
 inline std::vector<FsmDef>& fsmDefs() { static std::vector<FsmDef> d; return d; }
 // Relaxed atomic add: a task body can run on two worker threads at once.
-inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
+// Coverage paused by VPI (40.5): bit 0 statements and branches, bit 1
+// toggles, bit 2 FSM states (vpiCoverageStop / vpiCoverageStart).
+inline int g_covStop = 0;
+inline void covHit(uint64_t& c) {
+    if (!(g_covStop & 1)) __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED);
+}
+// The database a VPI vpiCoverageSave writes (40.5.1): set by msim.
+inline bool (*&covSaveHook())(const std::string&) { static bool (*f)(const std::string&) = nullptr; return f; }
 
 // ---- DPI-C (IEEE 1800-2023 clause 35, annex H) ----
 // How a value is passed to or from C (35.5.6, H.7). A packed type is passed
@@ -401,6 +408,7 @@ struct Prog {
     int pd = -1;           // UPF power domain, -1 for none (initial blocks are never gated, 9.2.1)
     bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
     std::vector<Instr> code;
+    const void* inst = nullptr;   // msim -cov: the instance it runs in (slang InstanceSymbol), for VPI (40)
     // msim -xprop, a clocked block with a clean copy: code[1] tests for an
     // ambiguous clock edge and otherwise jumps here. A clocked function
     // starts here at once in a time step where no signal has changed from

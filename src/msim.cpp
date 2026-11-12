@@ -2057,6 +2057,10 @@ int main(int argc, char** argv) {
     startTimingChecks();
     if (!pathRecs().empty() || !S.icDelay.empty() || !S.shadowOf.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty() || pl.cyclic) staticPart = false;
+    if (vpi::st().active && g_cov) {   // vpi_control(vpiCoverageSave, ...) writes the database now (40.5.1)
+        static const LowerResult* lw = &lowered;
+        covSaveHook() = [](const std::string& path) { return writeCoverage(path, *lw, S.vcdTop); };
+    }
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
