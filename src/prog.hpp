@@ -97,6 +97,10 @@ inline SrcLoc g_runLoc;   // the statement running now, for run-time error messa
 inline std::string runLocStr();
 inline std::vector<std::string> g_covFiles{""};   // file id -> path; 0 = unknown
 inline bool g_cov = false;
+// msim -cm_cond (as VCS): full = every combination of the term values of a
+// condition (up to 8 terms), not only the sensitized vectors; allops = also
+// & and | on one-bit operands.
+inline bool g_condFull = false, g_condAllops = false;
 inline std::string runLocStr() {
     if (!g_runLoc.line || g_runLoc.file >= g_covFiles.size()) return "";
     return " (" + g_covFiles[g_runLoc.file] + ":" + std::to_string(g_runLoc.line) + ")";
@@ -126,9 +130,12 @@ struct CondDef {
     uint32_t inst = 0;                // g_covInsts: the instance it is in
     bool isOr = false;
     bool lazy = false;                // the terms run in order until one decides (see condCovLazyEnd)
+    bool full = false;                // -cm_cond full: a counter per combination of the term values
+    bool bitwise = false;             // -cm_cond allops: a & b or a | b on one-bit operands
     std::string text;                 // the whole condition, as written
     std::vector<std::string> terms;   // each term, as written
     size_t base = 0;
+    size_t counters() const { return full ? (size_t)1 << terms.size() : terms.size() + 1; }
 };
 inline std::vector<CondDef>& condDefs() { static std::vector<CondDef> d; return d; }
 // FSM coverage: a state register found by the lowerer (fsm_extract.hpp), its

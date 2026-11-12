@@ -272,6 +272,12 @@ that removes items the tests did cover, and one without a reason. Kinds:
 `file`, `line`, `branch`, `cond`, `toggle`, `fsm`, `state`, `trans`, `cg`,
 `assert`; names take `*` and `?`.
 
+**Condition modes** (as VCS `-cm_cond`): `msim -cm_cond full` records every
+combination of the term values of a condition of up to 8 terms (2^n vectors)
+instead of the n + 1 sensitized ones; `-cm_cond allops` also covers `&` and
+`|` of one-bit operands (`assign y = (a & b) | c;`). Join them as
+`-cm_cond full+allops`. Both work with `-compile`.
+
 **Per instance.** The database also keeps each module instance's own lines,
 decisions and condition vectors. `mcov report -instances` prints one row per
 instance (line, branch, condition, toggle, FSM state and transition, for that

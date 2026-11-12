@@ -1595,16 +1595,31 @@ inline Val condCovLazy(size_t base, bool isOr, F&&... terms) {   // for generate
     (step(terms), ...);
     return from_truth(condCovLazyEnd(base, isOr, unknown, decided, at));
 }
+// -cm_cond full: counter k is the combination whose term i has the value of
+// bit n - 1 - i of k (term 1 is the high bit, as the report lists them).
+inline int condCovHitFull(size_t base, bool isOr, const int* t, size_t n) {
+    int deciding = isOr ? 1 : 0, count = 0;
+    bool unknown = false;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (t[i] == 2) unknown = true;
+        else if (t[i] == deciding) count++;
+        k = k << 1 | (size_t)(t[i] == 1);
+    }
+    if (!unknown) __atomic_fetch_add(&g_condHits[base + k], 1, __ATOMIC_RELAXED);
+    return count ? deciding : unknown ? 2 : 1 - deciding;
+}
 // The same for generated code (msim -compile): terms as values, or as the
-// 0 / 1 of the 2-state path.
-inline Val condCovVal(size_t base, bool isOr, std::initializer_list<Val> terms) {
+// 0 / 1 of the 2-state path. mode: 1 = ||, 4 = full.
+inline Val condCovVal(size_t base, int mode, std::initializer_list<Val> terms) {
     int ts[64];
     size_t n = 0;
     for (const Val& v : terms) ts[n++] = truth(v);
-    return from_truth(condCovHit(base, isOr, ts, n));
+    return from_truth(mode & 4 ? condCovHitFull(base, mode & 1, ts, n) : condCovHit(base, mode & 1, ts, n));
 }
-inline uint64_t condCovFast(size_t base, bool isOr, std::initializer_list<int> terms) {
-    return (uint64_t)condCovHit(base, isOr, terms.begin(), terms.size());
+inline uint64_t condCovFast(size_t base, int mode, std::initializer_list<int> terms) {
+    return (uint64_t)(mode & 4 ? condCovHitFull(base, mode & 1, terms.begin(), terms.size())
+                               : condCovHit(base, mode & 1, terms.begin(), terms.size()));
 }
 
 // Current simulation time, for $time / $stime / $realtime (IEEE 1800 20.3).
@@ -2724,7 +2739,8 @@ inline Val eval(const E& e, const Reader& rd) {
             int ts[64];
             size_t n = e->kids.size();
             for (size_t i = 0; i < n; i++) ts[i] = truth(k((int)i));
-            return from_truth(condCovHit((size_t)e->hi, e->lo != 0, ts, n));
+            if (e->lo & 4) return from_truth(condCovHitFull((size_t)e->hi, e->lo & 1, ts, n));
+            return from_truth(condCovHit((size_t)e->hi, e->lo & 1, ts, n));
         }
         case Op::RedAnd: return v_red_and(k(0));
         case Op::RedOr: return v_red_or(k(0));
