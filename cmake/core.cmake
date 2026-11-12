@@ -54,6 +54,7 @@ set(MINISIM_CORE_HEADERS
     vpi_code.inc
     vpi_covmerge.inc
     vpi_data.inc
+    vpi_tchk.inc
     wave_reader.hpp)
 
 add_library(minisim_core INTERFACE)
