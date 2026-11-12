@@ -40,6 +40,10 @@
 //   -profile [<file>] time every process and region and write a report
 //                    (default simprofile.txt): busiest processes, time per
 //                    instance, file and kind. Runs the interpreter on one thread.
+//   -saif_forward <file>  a forward SAIF file (IEEE 1801-2024 Annex J.4, J.5)
+//                    for -saif: a library one adds state- and path-dependent
+//                    activity of its cells, an RTL one keeps only its mapped
+//                    points (repeatable)
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -154,6 +158,7 @@
 #include "cov_select.hpp"
 #include "lower.hpp"
 #include "saif.hpp"
+#include "saif_fwd.hpp"
 #include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/diagnostics/LookupDiags.h"
@@ -2017,6 +2022,77 @@ static std::vector<std::string> implicitTops(slang::driver::Driver& driver, slan
     return tops;
 }
 
+// -saif with -saif_forward (IEEE 1801-2024 Annex J): an RTL forward file
+// keeps only its mapped points (J.5); a library one adds the state- and
+// path-dependent activity of each instance of its cells (J.3.6 to J.3.10, J.4).
+static void writeForwardSaif(const saif::Db& db, const wave::Reader& wr, const std::vector<std::string>& files,
+                             std::ostream& f) {
+    saif::Forward lib, rtl;
+    lib.lib = true;
+    for (auto& p : files) {
+        saif::Forward fw = saif::readForward(p);
+        if (fw.lib) {
+            for (auto& [n, c] : fw.cells) lib.cells[n] = std::move(c);
+            lib.path = p;
+        } else {
+            if (rtl.path.empty()) rtl.path = p;
+            for (auto& in : fw.insts) rtl.insts.push_back(std::move(in));
+        }
+    }
+    if (!rtl.path.empty()) {
+        if (!lib.cells.empty())
+            std::cerr << "msim: -saif_forward: the RTL mapping of " << rtl.path
+                      << " is written; library cells are not mapped points, so " << lib.path << " is not used\n";
+        std::vector<std::string> warn;
+        saif::rtlBackward(db, rtl, f, S.vcdTop, "msim", MINISIM_VERSION, warn);
+        for (auto& w : warn) std::cerr << "msim: -saif_forward: " << w << "\n";
+        return;
+    }
+    std::vector<saif::CellInst> insts;
+    for (auto& [path, mod] : instCells()) {
+        auto it = lib.cells.find(mod);
+        if (it == lib.cells.end()) continue;
+        saif::CellInst ci;
+        ci.path = path;
+        ci.cell = &it->second;
+        std::string pre = path + ".";
+        for (auto pi = portRecs().lower_bound(pre); pi != portRecs().end() && pi->first.compare(0, pre.size(), pre) == 0; ++pi) {
+            std::string pin = pi->first.substr(pre.size());
+            if (pin.find('.') == std::string::npos) ci.output[pin] = pi->second.dir == 1;
+        }
+        insts.push_back(std::move(ci));
+    }
+    std::vector<saif::CellActivity> acts(insts.size());
+    uint64_t end = std::max<uint64_t>(wr.end, db.start);
+    par::parallelFor(insts.size(), par::defaultThreads(), [&](size_t i) {
+        acts[i] = saif::cellActivity(insts[i], wr, db.start, end);
+    });
+    std::map<std::string, size_t> at;
+    for (size_t i = 0; i < insts.size(); i++) at[insts[i].path] = i;
+    saif::WriteHooks h;
+    h.cell = [&](const std::string& p) {
+        auto it = at.find(p);
+        return it == at.end() ? std::string() : insts[it->second].cell->name;
+    };
+    h.isPort = [&](const std::string& p, const std::string& net) {
+        auto it = at.find(p);
+        if (it == at.end()) return false;
+        size_t br = net.find('[');
+        return insts[it->second].output.count(br == std::string::npos ? net : net.substr(0, br)) > 0;
+    };
+    h.pin = [&](const std::string& p, const std::string& pin, std::ostream& os, const std::string& ind) {
+        size_t i = at.at(p);
+        auto& ports = insts[i].cell->ports;
+        auto pd = std::find_if(ports.begin(), ports.end(), [&](auto& x) { return x.first == pin; });
+        if (pd != ports.end()) saif::writePortDirectives(os, pd->second, acts[i].ports.at(pin), ind);
+    };
+    h.extra = [&](const std::string& p, std::ostream& os, const std::string& ind) {
+        auto it = at.find(p);
+        if (it != at.end()) saif::writeLeakage(os, *insts[it->second].cell, acts[it->second], ind);
+    };
+    saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION, &h);
+}
+
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
@@ -2026,6 +2102,7 @@ static void usage() {
                  "  -xrun ...      the rest is an xrun / irun command line (also when run as xrun or irun)\n"
                  "  -elab          stop after elaboration, before the run\n"
                  "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
+                 "  -saif_forward <file>  forward SAIF for -saif: library (SDPD) or RTL mapping\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -2114,6 +2191,7 @@ int main(int argc, char** argv) {
     int vcdClass = 0;   // -vcd-class [N]
     std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
     bool saifTmp = false;   // ...and the waveform was only written for that
+    std::vector<std::string> saifForward;   // -saif_forward (IEEE 1801-2024 Annex J)
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
     bool interactiveMode = false;   // -i / -do FILE
@@ -2245,6 +2323,10 @@ int main(int argc, char** argv) {
         if (a == "-saif") {
             std::string_view nx = i + 1 < argc ? std::string_view(argv[i + 1]) : std::string_view();
             saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
+            continue;
+        }
+        if (a == "-saif_forward" && i + 1 < argc) {
+            saifForward.push_back(argv[++i]);
             continue;
         }
         if (a == "-profile") {   // profile.hpp
@@ -2420,6 +2502,7 @@ int main(int argc, char** argv) {
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (!saifForward.empty() && saifPath.empty()) saifPath = "dump.saif";   // -saif_forward implies -saif
     if (!saifPath.empty() && !vcdPath) {
 #ifdef MINISIM_FST
         vcdPath = saifPath + ".tmp.fst";
@@ -2434,10 +2517,15 @@ int main(int argc, char** argv) {
         S.closeWaves();
         try {
             saif::Db db;
-            saif::load(*vcdPath, db, par::defaultThreads());
+            wave::Reader wr;
+            saif::load(*vcdPath, db, par::defaultThreads(), saifForward.empty() ? nullptr : &wr);
             std::ofstream f(saifPath);
             if (!f) throw saif::Error("cannot write " + saifPath);
-            saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            if (saifForward.empty()) {
+                saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            } else {
+                writeForwardSaif(db, wr, saifForward, f);
+            }
         } catch (const std::exception& e) {
             std::cerr << "msim: -saif: " << e.what() << "\n";
             return false;

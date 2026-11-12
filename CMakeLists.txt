@@ -416,6 +416,10 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME upf
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
+  # Forward SAIF (IEEE 1801-2024 Annex J): msim -saif -saif_forward.
+  add_test(NAME saif_forward
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/saif_fwd.cmake)
 
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>

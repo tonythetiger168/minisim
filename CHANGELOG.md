@@ -138,6 +138,12 @@ Spec references are IEEE 1800-2023 clauses.
   `connect_supply_net -pg_type` with `-cells`, `-domain`, `-elements` (6.14),
   `connect_supply_set -connect` (6.15), and the automatic connection of a
   domain's primary supply set (4.5.4.6.2).
+- Forward SAIF (IEEE 1801-2024 Annex J): `msim -saif_forward <file>`. A
+  library forward file (J.4) adds state-dependent, path-dependent and SDPD
+  toggle counts and state-dependent leakage times for each instance of its
+  cells (J.3.6 to J.3.10); an RTL forward file (J.5) writes only its mapped
+  ports and nets, typed ports as virtual instances (J.3.11). The SAIF reader
+  takes `(INSTANCE "design" path ..)` and `VIRTUAL_INSTANCE`.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.
