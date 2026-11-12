@@ -1,8 +1,19 @@
 name: CI
 
 on:
+  # Branch pushes are already covered by the pull_request run of their PR, so
+  # only main runs on push. Running both doubled every PR's CI and left PR runs
+  # queued for hours behind the hosted-runner limit.
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# A newer push to the same PR makes the older run moot; cancel it. On main every
+# merge keeps its own run, so a red main can be traced to the merge that broke it.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-test:
