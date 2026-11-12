@@ -57,6 +57,14 @@ Spec references are IEEE 1800-2023 clauses.
   the caller's mode. New routines `vpi_get_value_array` and
   `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
   a user system task. See `docs/VPI.md`.
+- `mdebug -script FILE` (`-` for the standard input): one command per line
+  (drivers, loads, value, changes, active, trace, blocks, fsm, scopes,
+  signals, end), one line of JSON per answer, from one process that loads the
+  design and waveform once. `tools/mdebug_api.py` wraps it for Python.
+- `mdebug -fsm [NAME]`: the design's state machines (shared extractor), their
+  states and transitions with source lines; with a waveform, which transitions
+  ran, states never entered, values that are not states, and the state at
+  `-at T`. The viewer page draws the state diagram of a selected state register.
 - `msupport`: an AI support agent per product. Each answers from its
   product's documentation (BM25 search over the manuals), can run a short
   example on the product's tool in a sandbox, and files a ticket when the
@@ -443,6 +451,15 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- Condition coverage modes (as VCS `-cm_cond`): `full` records every
+  combination of the term values (up to 8 terms), `allops` also covers `&`
+  and `|` of one-bit operands; interpreter and `-compile`.
+- Per-instance coverage: `msim -cov` also writes each module instance's own
+  line hits, branch outcomes and condition vectors (interpreter and
+  `-compile`); `mcov report -instances` prints a row per instance with line,
+  branch, condition, toggle and FSM coverage, `-detail -instances` the
+  vectors of each condition per instance, the HTML report an Instances table,
+  and `inst <path>` excludes an instance and everything below it.
 - `mcov` exclusion files and test ranking: `mcov report -elfile` leaves the
   listed lines, branches, condition vectors, toggle bits, FSM states and
   transitions, covergroups and assertions out of every number, each with its

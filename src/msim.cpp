@@ -1188,15 +1188,33 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     for (auto& p : lw.subs) collectProgs(p.get(), progs, seen);
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> lines;            // (file, line) -> hits
     std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint64_t, uint64_t>>> branches;
-    for (const Prog* p : progs)
+    // The same per module instance (Prog::covInst): its own line hits, and
+    // which of the decisions of a line are its own (n as in "branches").
+    struct InstCov {
+        std::map<std::pair<uint32_t, uint32_t>, uint64_t> lines;
+        std::vector<std::array<uint64_t, 5>> branches;       // file, line, n, true, false
+        std::map<size_t, std::vector<uint64_t>> conds;       // index in "conditions" -> hits
+    };
+    std::vector<InstCov> insts(g_covInsts.size());
+    for (const Prog* p : progs) {
+        InstCov* ic = p->covInst && p->covInst < insts.size() ? &insts[p->covInst] : nullptr;
         for (auto& i : p->code) {
             if (!i.line) continue;
             auto key = std::make_pair(i.file, i.line);
             auto& h = lines[key];
             h = std::max(h, i.hits);
+            if (ic) {
+                auto& ih = ic->lines[key];
+                ih = std::max(ih, i.hits);
+            }
             // A JmpIfNot is a two-way decision: true = fell through, false = jumped.
-            if (i.k == IK::JmpIfNot) branches[key].push_back({i.hits - i.taken, i.taken});
+            if (i.k == IK::JmpIfNot) {
+                auto& v = branches[key];
+                if (ic) ic->branches.push_back({i.file, i.line, v.size(), i.hits - i.taken, i.taken});
+                v.push_back({i.hits - i.taken, i.taken});
+            }
         }
+    }
     std::ofstream f(path);
     if (!f) return false;
     f << "{\n \"format\": \"msim-cov\", \"version\": 1, \"tool\": \"msim " MINISIM_VERSION "\", \"top\": " << jstr(top)
@@ -1239,19 +1257,22 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     }
     // Conditions (a && b, a || b, the condition of ?:): per source position,
     // the hits of each vector, summed over the instances of the module.
-    struct CondSum { const CondDef* d; std::vector<uint64_t> hits; };
+    struct CondSum { const CondDef* d; std::vector<uint64_t> hits; size_t index = 0; };
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, std::string>, CondSum> conds;
     for (auto& d : condDefs()) {
         auto& c = conds[{d.file, d.line, d.col, d.text}];
-        if (!c.d) { c.d = &d; c.hits.assign(d.terms.size() + 1, 0); }
-        if (c.d->terms.size() != d.terms.size()) continue;
-        for (size_t k = 0; k <= d.terms.size(); k++) c.hits[k] += g_condHits[d.base + k];
+        if (!c.d) { c.d = &d; c.hits.assign(d.counters(), 0); }
+        if (c.d->counters() != d.counters()) continue;
+        for (size_t k = 0; k < d.counters(); k++) c.hits[k] += g_condHits[d.base + k];
     }
     f << "\n ],\n \"conditions\": [";
     first = true;
     for (auto& [key, c] : conds) {
         f << (first ? "\n  " : ",\n  ") << "[" << c.d->file << ", " << c.d->line << ", " << c.d->col << ", "
-          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? (c.d->lazy ? "\"||s\"" : "\"||\"") : c.d->lazy ? "\"&&s\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
+          << (c.d->terms.size() == 1 ? std::string("\"?:\"")
+              : "\"" + std::string(c.d->bitwise ? (c.d->isOr ? "|" : "&") : (c.d->isOr ? "||" : "&&")) +
+                    (c.d->lazy ? "s" : c.d->full ? "f" : "") + "\"")
+          << ", " << jstr(c.d->text) << ", [";
         for (size_t k = 0; k < c.d->terms.size(); k++) f << (k ? ", " : "") << jstr(c.d->terms[k]);
         f << "], [";
         for (size_t k = 0; k < c.hits.size(); k++) f << (k ? ", " : "") << c.hits[k];
@@ -1288,6 +1309,47 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
             f2 = false;
         }
         f << "]}";
+        first = false;
+    }
+    // Per instance: [path, module, lines [file, line, hits], branches [file,
+    // line, n, true, false], conditions [index in "conditions", hits]].
+    {
+        size_t ci = 0;
+        for (auto& [key, c] : conds) c.index = ci++;
+        for (auto& d : condDefs()) {
+            if (!d.inst || d.inst >= insts.size()) continue;
+            const CondSum& c = conds[{d.file, d.line, d.col, d.text}];
+            if (d.counters() != c.d->counters()) continue;
+            auto& h = insts[d.inst].conds[c.index];
+            h.resize(d.counters(), 0);
+            for (size_t k = 0; k < d.counters(); k++) h[k] += g_condHits[d.base + k];
+        }
+    }
+    f << "\n ],\n \"instances\": [";
+    first = true;
+    for (size_t k = 1; k < insts.size(); k++) {
+        const InstCov& ic = insts[k];
+        f << (first ? "\n  " : ",\n  ") << "[" << jstr(g_covInsts[k].path.empty() ? top : top + "." + g_covInsts[k].path) << ", "
+          << jstr(g_covInsts[k].module) << ", [";
+        bool f2 = true;
+        for (auto& [key, h] : ic.lines) {
+            f << (f2 ? "" : ", ") << "[" << key.first << ", " << key.second << ", " << h << "]";
+            f2 = false;
+        }
+        f << "], [";
+        for (size_t j = 0; j < ic.branches.size(); j++) {
+            auto& b = ic.branches[j];
+            f << (j ? ", " : "") << "[" << b[0] << ", " << b[1] << ", " << b[2] << ", " << b[3] << ", " << b[4] << "]";
+        }
+        f << "], [";
+        f2 = true;
+        for (auto& [ci, h] : ic.conds) {
+            f << (f2 ? "" : ", ") << "[" << ci << ", [";
+            for (size_t j = 0; j < h.size(); j++) f << (j ? ", " : "") << h[j];
+            f << "]]";
+            f2 = false;
+        }
+        f << "]]";
         first = false;
     }
     f << "\n ],\n";
@@ -1385,6 +1447,8 @@ static void usage() {
                  "                 elements each (default 1024) to the VCD or FST, as mem[3]\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov. -cm <metrics> (as VCS) does the same\n"
+                 "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
+                 "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
                  "                 and reuses <dir>/simv while the design is unchanged\n"
@@ -1555,6 +1619,21 @@ int main(int argc, char** argv) {
         if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
             g_cov = true;
             ++i;
+            continue;
+        }
+        if (a == "-cm_cond" && i + 1 < argc) {   // VCS: -cm_cond full+allops (std / basic: the default)
+            std::string_view v = argv[++i];
+            while (!v.empty()) {
+                size_t p = v.find('+');
+                std::string_view w = v.substr(0, p);
+                if (w == "full") g_condFull = true;
+                else if (w == "allops") g_condAllops = true;
+                else if (w != "std" && w != "basic") {
+                    std::cerr << "msim: -cm_cond: unknown mode '" << w << "' (full, allops, std)\n";
+                    return 2;
+                }
+                v = p == std::string_view::npos ? std::string_view() : v.substr(p + 1);
+            }
             continue;
         }
         // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.
