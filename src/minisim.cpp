@@ -2100,10 +2100,11 @@ struct Sim {
     }
     // Extended VCD (21.7.3): one file per $dumpports call, holding the ports
     // of the modules it names. Values are compared at the end of each time
-    // slot, so a run without $dumpports pays nothing. Which side drives a
-    // port is not looked at: an input shows D/U/N/Z, an output L/H/X/T and
-    // an inout 0/1/?/F, each bit at strong strength (or highz for z).
-    struct EvcdPort { int sig; char dir; string id; };
+    // slot, so a run without $dumpports pays nothing.
+    struct EvcdPort { int sig; char dir; string id; string inst; };
+    // The instance each continuous driver of a signal belongs to ("" the
+    // top), filled when the design calls $dumpports.
+    std::unordered_map<int, vector<string>> drvScope;
     struct Evcd {
         string path;
         std::ofstream f;
@@ -2113,16 +2114,98 @@ struct Sim {
         uint64_t limit = 0, lastT = ~0ULL;
     };
     std::deque<Evcd> evcds;
+    // One bit of a port (21.7.4.3.1): which side drives it, with what. The
+    // drivers inside the port's module are the DUT (output) side, the rest
+    // the test fixture (input) side. A port with no continuous drivers (a
+    // variable) shows its value as its direction says.
+    struct Side { int n = 0; int s0 = 0, s1 = 0; };   // active drivers, strongest 0 and 1
+    static char sideVal(const Side& d) {
+        if (!d.n) return 'z';
+        return d.s0 > d.s1 ? '0' : d.s1 > d.s0 ? '1' : 'x';
+    }
+    static int sideStr(const Side& d, char v) { return v == '0' ? d.s0 : v == '1' ? d.s1 : std::max(d.s0, d.s1); }
     string evcdValue(const EvcdPort& p, bool asX) {
-        const int w = sigs[p.sig].w;
+        const auto& g = sigs[p.sig];
+        const int w = g.w;
         string bits((size_t)w, 'x');
-        if (!asX) putBits(bits.data(), sigs[p.sig].val, w);
+        if (!asX) putBits(bits.data(), g.val, w);
+        const vector<string>* sc = nullptr;
+        if (!asX && !g.drv.empty())
+            if (auto it = drvScope.find(p.sig); it != drvScope.end()) sc = &it->second;
+        vector<string> dbits;
+        vector<char> inside;
+        if (sc) {
+            for (size_t d = 0; d < g.drv.size(); d++) {
+                string b((size_t)w, 'z');
+                putBits(b.data(), g.drv[d].v, w);
+                dbits.push_back(std::move(b));
+                const string& o = d < sc->size() ? (*sc)[d] : string();
+                inside.push_back(p.inst.empty() || o == p.inst || (o.size() > p.inst.size() && o.compare(0, p.inst.size(), p.inst) == 0 &&
+                                                                   o[p.inst.size()] == '.'));
+            }
+        }
         string v = "p", s0, s1;
-        for (char c : bits) {
-            int k = c == '0' ? 0 : c == '1' ? 1 : c == 'z' ? 3 : 2;
-            v += (p.dir == 'i' ? "DUNZ" : p.dir == 'o' ? "LHXT" : "01?F")[k];
-            s0 += k == 0 || k == 2 ? '6' : '0';
-            s1 += k == 1 || k == 2 ? '6' : '0';
+        for (int k = 0; k < w; k++) {
+            char c = bits[(size_t)k];
+            if (!sc) {   // no drivers to look at: the value, as the direction says
+                int x = c == '0' ? 0 : c == '1' ? 1 : c == 'z' ? 3 : 2;
+                v += (p.dir == 'i' ? "DUNZ" : p.dir == 'o' ? "LHXT" : "01?F")[x];
+                s0 += x == 0 || x == 2 ? '6' : '0';
+                s1 += x == 1 || x == 2 ? '6' : '0';
+                continue;
+            }
+            Side in, out;
+            for (size_t d = 0; d < dbits.size(); d++) {
+                char b = dbits[d][(size_t)k];
+                int a0 = b == '0' || b == 'x' ? g.drv[d].s0 : 0, a1 = b == '1' || b == 'x' ? g.drv[d].s1 : 0;
+                if (!a0 && !a1) continue;
+                Side& sd = inside[d] ? out : in;
+                sd.n++;
+                sd.s0 = std::max(sd.s0, a0);
+                sd.s1 = std::max(sd.s1, a1);
+            }
+            char st;
+            int str0 = 0, str1 = 0;
+            auto strengthOf = [&](char val, int s) {
+                if (val == '0') str0 = s;
+                else if (val == '1') str1 = s;
+                else if (val == 'x') str0 = str1 = s;
+            };
+            char iv = sideVal(in), ov = sideVal(out);
+            if (p.dir != 'b' || !in.n || !out.n) {
+                // One side drives (or the direction fixes the side): its value,
+                // d/u or l/h when two or more drivers are active.
+                bool dut = p.dir == 'o' || (p.dir == 'b' && out.n && !in.n);
+                bool fixture = p.dir == 'i' || (p.dir == 'b' && in.n && !out.n);
+                Side all = in;
+                all.n += out.n;
+                all.s0 = std::max(in.s0, out.s0);
+                all.s1 = std::max(in.s1, out.s1);
+                char val = all.n ? (c == 'z' ? sideVal(all) : c) : 'z';
+                int x = val == '0' ? 0 : val == '1' ? 1 : val == 'z' ? 3 : 2;
+                bool many = all.n >= 2 && x < 2;
+                if (fixture) st = many ? "du"[x] : "DUNZ"[x];
+                else if (dut) st = many ? "lh"[x] : "LHXT"[x];
+                else {   // an inout nobody drives now: F if a side has no driver at all, f if both are three-stated
+                    bool inDrv = false, outDrv = false;
+                    for (char d : inside) (d ? outDrv : inDrv) = true;
+                    st = x == 3 ? (inDrv && outDrv ? 'f' : 'F') : "01?F"[x];
+                }
+                strengthOf(val, sideStr(all, val));
+            } else if (iv == ov && iv != 'x') {   // both drive the same value (21.7.4.3.2)
+                bool sIn = sideStr(in, iv) >= STR_PULL, sOut = sideStr(out, ov) >= STR_PULL;
+                if (sIn == sOut) { st = iv; strengthOf(iv, std::max(sideStr(in, iv), sideStr(out, ov))); }
+                else if (sIn) { st = iv == '0' ? 'd' : 'u'; strengthOf(iv, sideStr(in, iv)); }
+                else { st = iv == '0' ? 'l' : 'h'; strengthOf(iv, sideStr(out, ov)); }
+            } else {   // a conflict
+                st = iv == '0' ? (ov == '1' ? 'A' : 'a')
+                   : iv == '1' ? (ov == '0' ? 'B' : 'b')
+                   : ov == '0' ? 'C' : ov == '1' ? 'c' : '?';
+                strengthOf('x', std::max(std::max(in.s0, in.s1), std::max(out.s0, out.s1)));
+            }
+            v += st;
+            s0 += (char)('0' + str0);
+            s1 += (char)('0' + str1);
         }
         return v + " " + s0 + " " + s1 + " " + p.id + "\n";
     }
@@ -2203,7 +2286,9 @@ struct Sim {
                     scopes += (scopes.empty() ? "" : ", ") + scope;
                     defs << "$scope module " << scope << " $end\n";
                 }
-                EvcdPort p{it->second, fld[0][0], "<" + std::to_string(e.ports.size())};
+                EvcdPort p{it->second, fld[0][0], "<" + std::to_string(e.ports.size()), ""};
+                // The instance as signals name it: the path without the top module.
+                if (size_t d = fld[1].find('.'); d != string::npos) p.inst = fld[1].substr(d + 1);
                 defs << "$var port " << (vec ? "[" + fld[3] + ":" + fld[4] + "]" : string("1")) << " " << p.id << " " << fld[2] << " $end\n";
                 e.ports.push_back(p);
             }
