@@ -808,7 +808,7 @@ private:
                     for (size_t i = 0; i < e->kids.size(); i++) r += ", [&]() -> Val { return " + ex(e->kids[i]) + "; }";
                     return r + ")";
                 }
-                std::string r = "condCovVal(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
+                std::string r = "condCovVal(" + std::to_string(e->hi) + ", " + std::to_string(e->lo & 5) + ", {";
                 for (size_t i = 0; i < e->kids.size(); i++) r += (i ? ", " : "") + ex(e->kids[i]);
                 return r + "})";
             }
@@ -979,7 +979,7 @@ private:
                 return true;
             case Op::CondCov: {
                 if (e->lo & 2) return false;   // lazy: the Val path
-                std::string r = "condCovFast(" + std::to_string(e->hi) + ", " + (e->lo ? "true" : "false") + ", {";
+                std::string r = "condCovFast(" + std::to_string(e->hi) + ", " + std::to_string(e->lo & 5) + ", {";
                 for (size_t i = 0; i < e->kids.size(); i++) {
                     std::string P;
                     FastInfo fp{};
