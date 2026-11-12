@@ -40,7 +40,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -85,6 +85,9 @@ struct State {
     std::vector<std::unique_ptr<Obj>> objs;
     std::unordered_map<const Symbol*, Obj*> symObj;
     std::map<std::pair<const void*, int>, Obj*> codeObjs;   // statement and expression objects (vpi_code.inc)
+    std::map<std::pair<const void*, const void*>, Obj*> pairObjs;   // struct members, class properties (vpi_data.inc)
+    std::map<std::pair<const Obj*, std::string>, Obj*> dynElems;    // container elements by index or key
+    std::unordered_map<int64_t, Obj*> classObjs;                    // class objects by handle
     std::unordered_map<const VpiSite*, Obj*> callObj;
     std::map<std::pair<const Obj*, int>, Obj*> subObj;   // memory words and bits
     std::unordered_map<int, Obj*> sysObj;
@@ -278,13 +281,28 @@ inline int varType(const Type& t, bool net, int& t05) {
     }
     return 0;
 }
+inline Obj* valueObj(const Symbol* s);
+#include "vpi_data.inc"
 // A variable or net as a VPI object, or null if VPI does not model it.
 inline Obj* valueObj(const Symbol* s) {
     if (auto it = st().symObj.find(s); it != st().symObj.end()) return it->second;
     const Type& t = s->as<ValueSymbol>().getType().getCanonicalType();
     bool net = s->kind == SymbolKind::Net;
     Obj* o = nullptr;
-    if (t.isUnpackedArray()) {
+    if (t.kind == SymbolKind::DynamicArrayType || t.kind == SymbolKind::QueueType || t.isAssociativeArray()) {
+        o = containerObj(s, t);   // 37.18: a dynamic array, queue or associative array
+        if (!o) return nullptr;
+    } else if (t.isClass()) {
+        o = classVarObj(s, t);    // 37.29
+        if (!o) return nullptr;
+    } else if (t.isUnpackedStruct() || t.isUnpackedUnion()) {   // one vector of its members (7.2)
+        int sg = sigOfSym(s);
+        if (sg < 0 || uWidth(t) <= 0) return nullptr;
+        o = mkObj(Obj::Signal, t.isUnpackedStruct() ? (net ? vpiStructNet : vpiStructVar) : (net ? vpiUnionNet : vpiUnionVar));
+        o->sig = sg;
+        o->w = uWidth(t);
+        o->ty = &t;
+    } else if (t.isUnpackedArray()) {
         auto am = arrMap().find(s);
         if (am == arrMap().end() || am->second->dims.empty()) return nullptr;
         const Type* e = &t;
@@ -459,6 +477,8 @@ inline bool isProt(const Obj* o) {
             p = w && w->sym && protectedInstance(instOf(w->sym->getParentScope()));
             break;
         }
+        case Obj::Dyn: p = protSym(o->sym); break;
+        case Obj::DynElem: p = isProt(o->parent); break;
         case Obj::Fsm:
         case Obj::FsmState: {   // the state register's declaration
             auto it = st().sigSym.find(fsmDefs()[(size_t)o->idx].sig);
@@ -615,6 +635,7 @@ inline vpiHandle iter(std::vector<vpiHandle> items) {
 inline int64_t sigTicks(const p_vpi_time t, const Obj* o);
 inline Val readObj(const Obj* o) {
     if (o->kind == Obj::Const || o->kind == Obj::EnumConst || o->kind == Obj::FsmState) return o->cval;
+    if (o->kind == Obj::DynElem) return dynRead(o);
     if (o->kind == Obj::Arg && o->site->args[(size_t)o->idx].kind == VpiArg::String) return mkstr(o->site->args[(size_t)o->idx].text);
     if (o->kind == Obj::Arg && o->site->args[(size_t)o->idx].kind == VpiArg::Empty) return make(0, ~0ULL, 1);
     if (o->kind == Obj::Bit) {   // a bit or a part select
@@ -1970,6 +1991,17 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     if (vpi::denied(o, "vpi_handle")) return nullptr;
     using slang::ast::SymbolKind;
     if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
+    if (type == vpiClassObj && o->type == vpiClassVar) return H(vpi::classObjOf(o));   // 37.29
+    if (o->kind == Obj::DynElem) {
+        if (type == vpiParent) return H(const_cast<Obj*>(o->parent));
+        if (type == vpiIndex) return o->idx >= 0 ? H(vpi::constObj(o->idx)) : nullptr;
+        return nullptr;
+    }
+    if (o->kind == Obj::ClassObj || o->kind == Obj::Dyn) {
+        if (type == vpiTypespec && o->kind == Obj::Dyn && o->ty) return H(vpi::typespecObj(o->ty));
+        if (type != vpiScope && type != vpiModule && type != vpiInstance && type != vpiParent) return nullptr;
+        if (o->kind == Obj::ClassObj) return nullptr;
+    }
     if (o->kind == Obj::Fsm || o->kind == Obj::FsmState) {   // 40.5.2
         if (type == vpiFsmStateExpression || type == vpiExpr) {
             auto it = s.sigSym.find(fsmDefs()[(size_t)o->idx].sig);
@@ -2116,6 +2148,21 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     // protected object can be iterated.
     if (!(type == vpiArgument && o->kind == Obj::Call) && vpi::denied(o, "vpi_iterate")) return nullptr;
     if (vpi::isCode(o)) return vpi::codeIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
+    if (type == vpiMember) {   // the members of a struct or union variable (37.17)
+        if (!vpi::isStructObj(o)) return nullptr;
+        vpi::members(o, items);
+        return vpi::iter(std::move(items));
+    }
+    if (o->kind == Obj::Dyn) {   // the elements a container has now (37.18)
+        if (type != vpiReg && type != vpiVariables && type != vpiElement && type != vpiVarSelect && type != o->t01) return nullptr;
+        vpi::dynElems(o, items);
+        return vpi::iter(std::move(items));
+    }
+    if (o->kind == Obj::ClassObj) {   // the properties of a class object (37.29)
+        if (type != vpiVariables) return nullptr;
+        vpi::classProps(o, *o->ty, items);
+        return vpi::iter(std::move(items));
+    }
     if (type == vpiArgument) {
         if (o->kind != Obj::Call) return nullptr;
         for (size_t k = 0; k < o->site->args.size(); k++) add(vpi::argObj(o->site, (int)k));
@@ -2453,6 +2500,18 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* name, vpiHandle scope) {
 vpiHandle vpi_handle_by_index(vpiHandle h, PLI_INT32 i) {
     vpi::clearErr();
     Obj* o = O(h);
+    if (o && o->kind == Obj::Dyn) {   // an element of a dynamic array or queue, or the entry of an associative array
+        if (vpi::denied(o, "vpi_handle_by_index")) return nullptr;
+        const DynObj* d = vpi::dynOf(o);
+        if (!d) return nullptr;
+        Val k = make((uint64_t)(int64_t)i, 0, 64);
+        if (d->kind == 2) {
+            k = make((uint64_t)(int64_t)i, 0, d->keyW);
+            k.sgn = d->keySgn;
+            if (d->strKey || !d->map.count(d->key(k))) return nullptr;
+        } else if (i < 0 || (size_t)i >= d->vec.size()) return nullptr;
+        return H(vpi::dynElemObj(o, k));
+    }
     if (!o || (o->kind != Obj::Signal && o->kind != Obj::Word)) return nullptr;
     if (vpi::denied(o, "vpi_handle_by_index")) return nullptr;
     if (o->arr) return H(vpi::wordObj(o, i));
@@ -2498,6 +2557,27 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
         return vpiUndefined;
     auto isVar = [&] { return o->kind == Obj::Signal || o->kind == Obj::Word; };
     if (vpi::isCode(o)) return (PLI_INT32)vpi::codeGet(prop, o);
+    if (o->kind == Obj::Dyn) {   // 37.18
+        const DynObj* d = vpi::dynOf(o);
+        switch (prop) {
+            case vpiType: return o->type;
+            case vpiArrayType: return (PLI_INT32)o->left;
+            case vpiSize: return d ? (PLI_INT32)d->size() : 0;
+            case vpiLineNo: return o->sym && srcMgr() ? (PLI_INT32)srcMgr()->getLineNumber(o->sym->location) : 0;
+            default: return vpiUndefined;
+        }
+    }
+    if (o->kind == Obj::ClassObj) {   // 37.29
+        if (prop == vpiType) return vpiClassObj;
+        if (prop == vpiObjId) return o->idx;
+        return vpiUndefined;
+    }
+    if (o->kind == Obj::DynElem) {
+        if (prop == vpiType) return o->type;
+        if (prop == vpiSize) return o->w;
+        if (prop == vpiSigned) return o->sgn;
+        return vpiUndefined;
+    }
     if (o->kind == Obj::SchedEvent) return prop == vpiType ? vpiSchedEvent : prop == vpiScheduled ? o->sched : vpiUndefined;
     if (int64_t c = vpi::covGet(prop, o); c >= 0) return (PLI_INT32)std::min<int64_t>(c, INT32_MAX);   // 40.5.2
     if (o->kind == Obj::Fsm || o->kind == Obj::FsmState) {
@@ -2704,7 +2784,17 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
                 for (int64_t i : x->index) b += "[" + std::to_string(i) + "]";
                 return b;
             }
+            case Obj::DynElem: {
+                std::string b = nameOf(x->parent, full);
+                const DynObj* d = vpi::dynOf(x->parent);
+                if (d && d->strKey) return b + "[\"" + v_str(x->cval) + "\"]";
+                return b + "[" + std::to_string(d && d->kind == 2 ? d->key(x->cval).i : v_to_i64(x->cval)) + "]";
+            }
+            case Obj::ClassObj: return "";
             case Obj::Bit: {
+                if (x->sym && x->sym->kind == SymbolKind::Field)   // a struct member (37.17)
+                    return full ? nameOf(x->parent, true) + "." + std::string(x->sym->name) : std::string(x->sym->name);
+                if (x->sym && x->parent && x->parent->kind == Obj::ClassObj) return std::string(x->sym->name);
                 std::string b = nameOf(x->parent, full);
                 if (x->type == vpiPartSelect) return b + "[" + std::to_string(x->idx) + ":" + std::to_string(x->lidx) + "]";
                 return b + "[" + std::to_string(x->idx) + "]";
@@ -2811,7 +2901,8 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
     }
     if (o->kind == Obj::Iter || o->kind == Obj::Callback || o->kind == Obj::Systf || o->kind == Obj::Module ||
         o->kind == Obj::Scope || o->kind == Obj::Typespec || o->kind == Obj::Member || o->kind == Obj::Range ||
-        o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr)) {
+        o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
+        o->kind == Obj::ClassObj) {
         vpi::error(vpiError, "vpi_get_value: the object has no value");
         return;
     }
@@ -2832,7 +2923,14 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
     if (!o || !v) { vpi::error(vpiError, "vpi_put_value: null handle"); return nullptr; }
     // Protected IP cannot be written from outside it (IEEE 1735 9.7.1).
     if (vpi::isProt(o) && !vpi::inOwnCall(o)) { vpi::error(vpiError, "vpi_put_value: the object is protected"); return nullptr; }
-    bool target = (o->kind == Obj::Signal && !o->arr) || o->kind == Obj::Word || o->kind == Obj::Bit ||
+    if (o->kind == Obj::DynElem) {   // an element of a container: written now (38.35)
+        Val val;
+        if ((flags & 0xfff) == vpiForceFlag || (flags & 0xfff) == vpiReleaseFlag) { vpi::error(vpiError, "vpi_put_value: an element of a dynamic array, queue or associative array cannot be forced"); return nullptr; }
+        if (!vpi::fromValue(o, v, val)) return nullptr;
+        if (!vpi::dynWrite(o, val)) vpi::error(vpiError, "vpi_put_value: the element is no longer in the array");
+        return nullptr;
+    }
+    bool target = (o->kind == Obj::Signal && !o->arr && o->type != vpiClassVar) || o->kind == Obj::Word || o->kind == Obj::Bit ||
                   (o->kind == Obj::Call && o->site->func);
     if (!target || o->sig < 0) { vpi::error(vpiError, "vpi_put_value: the object cannot be written"); return nullptr; }
     Val val;

@@ -543,6 +543,10 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI structs, containers and classes (37.17, 37.18, 37.29): unpacked
+  struct and union variables with `vpiMember` (also of packed ones),
+  dynamic arrays, queues and associative arrays with their elements, class
+  variables, `vpiClassObj` and its properties.
 - VPI `cbStmt` (38.36.1): a callback each time a statement runs.
 - VPI processes, statements and expressions (37.32 to 37.51):
   `vpi_iterate(vpiProcess / vpiContAssign, module)`, the statement tree

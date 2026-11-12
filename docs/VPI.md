@@ -165,6 +165,21 @@ coverage database (the `-cov` JSON) to `name` now. Not supported:
 or stopping statement, toggle or FSM coverage for an instance below the
 top (it is for the whole design).
 
+**Structs, containers and classes (37.17, 37.18, 37.29).** An unpacked
+struct or union variable is a `vpiStructVar` / `vpiUnionVar` (its value is
+one vector of its members); `vpi_iterate(vpiMember, ...)` gives the members
+of an unpacked or packed struct or union, nested ones too, which read,
+write, force and call back like part selects. A dynamic array, queue or
+associative array of integral, real or string elements is a `vpiArrayVar`
+with `vpiArrayType` (`vpiDynamicArray`, `vpiQueueArray`, `vpiAssocArray`)
+and `vpiSize` (the elements it has now); `vpi_handle_by_index` and
+`vpi_iterate(vpiReg, ...)` give its elements (entries in key order), which
+`vpi_get_value` reads and `vpi_put_value` writes (no delay). A class
+variable is a `vpiClassVar`; `vpi_handle(vpiClassObj, var)` gives the
+object it refers to (NULL for a null handle, `vpiObjId`), and
+`vpi_iterate(vpiVariables, obj)` its properties, base class first, static
+ones included, as variables that read and write.
+
 **Processes, statements and expressions (37.32 to 37.51).**
 `vpi_iterate(vpiProcess, module)` gives the `initial`, `always` (with
 `vpiAlwaysType`: `vpiAlways`, `vpiAlwaysComb`, `vpiAlwaysFF`,
@@ -231,8 +246,9 @@ objects in decryption envelopes: see "VPI and DPI" in `docs/PROTECT.md`.
 
 ## Not yet
 
-Class objects, unpacked structs, dynamic arrays, queues and associative
-arrays, the value of a non-constant expression, drivers and loads,
+Class methods and the dynamic type of a class object (a derived object
+shows the properties of the variable's class), containers of structs,
+classes or containers, the value of a non-constant expression, drivers and loads,
 instance arrays as objects, delays of anything but a net (primitives,
 continuous assignments, module paths, timing checks), `vpi_handle_multi`,
 `cbTchkViolation`, `cbError` / `cbPLIError`, interactive mode
@@ -242,7 +258,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
