@@ -611,6 +611,12 @@ struct Lowerer {
     // Named sequential blocks around the statement being lowered, each with
     // the jumps a `disable` of it makes to its end.
     std::vector<std::pair<const slang::ast::Symbol*, std::vector<size_t>>> named;
+    // A modport port with an expression (25.5.4): `.lo(a[3:0])` names that
+    // expression of the interface's signals.
+    static const slang::ast::Expression* modportExpr(const slang::ast::Symbol* sym) {
+        if (sym->kind != slang::ast::SymbolKind::ModportPort) return nullptr;
+        return sym->as<slang::ast::ModportPortSymbol>().explicitConnection;
+    }
     // A statement that is one named begin...end block.
     static const slang::ast::Symbol* namedSeq(const slang::ast::Statement& st) {
         using namespace slang::ast;
@@ -1644,6 +1650,13 @@ struct Lowerer {
         if (vifTarget) { sym = vifTarget; vifTarget = nullptr; viaVif = true; }
         else if (call.thisClass() && call.thisClass()->type->isVirtualInterface()) return vifCall(call, *sym, wantValue);
         if (!sym || !subs) unsupported("subroutine call");
+        // A task or function an interface declares extern and a module exports
+        // through a modport (25.7.4): the call runs the module's body.
+        if (sym->flags.has(MethodFlags::InterfaceExtern))
+            if (const auto* proto = sym->getPrototype(); proto && proto->getFirstExternImpl()) {
+                if (proto->getFirstExternImpl()->getNextImpl()) unsupported("extern forkjoin task with more than one export (25.7.5)");
+                sym = proto->getFirstExternImpl()->impl;
+            }
         if (sym->flags.has(MethodFlags::DPIImport)) return emitDpiCall(call, *sym, wantValue);
         if (sym->flags.has(MethodFlags::Randomize)) return randomizeCall(call);
         if (E r = upfCall(call, *sym, wantValue); r || upfOp(*sym) >= 0) return r;
@@ -4203,6 +4216,7 @@ struct Lowerer {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {   // x, or u.x / blk[2].x (23.6)
                 const Symbol* sym = &e.as<ValueExpressionBase>().symbol;
+                if (const Expression* mx = modportExpr(sym)) return expr2(*mx, ctx);   // .name(expr) (25.5.4)
                 if (auto cv = constVals.find(sym); cv != constVals.end())   // an unrolled foreach index (18.5.8)
                     return sized(konst(cv->second), cv->second.w, cv->second.sgn, ctx);
                 if (auto xb = exprBind.find(sym); xb != exprBind.end())   // `item` of a reduction's with clause
@@ -4758,6 +4772,7 @@ struct Lowerer {
         switch (e.kind) {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {
+                if (const Expression* mx = modportExpr(&e.as<ValueExpressionBase>().symbol)) return lhs(*mx, i);
                 if (dynFind(&e.as<ValueExpressionBase>().symbol) >= 0) unsupported("container assignment here");
                 int sg = sigFind(&e.as<ValueExpressionBase>().symbol);
                 if (sg < 0) unsupported("assignment to a non-signal");
@@ -4843,7 +4858,7 @@ struct Lowerer {
             if (classMember(s.expr) || vifAccess(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x), @(v.x)
             else if (ValueExpressionBase::isKind(s.expr.kind) && eventPtr().count(&s.expr.as<ValueExpressionBase>().symbol))
                 sig = eventSig(s.expr);   // an event that may be an alias (6.17)
-            else if (ValueExpressionBase::isKind(s.expr.kind)) {
+            else if (ValueExpressionBase::isKind(s.expr.kind) && !modportExpr(&s.expr.as<ValueExpressionBase>().symbol)) {
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
             } else {
                 // @(posedge clk[i]), @(a & b): wait on a signal that a
@@ -8157,11 +8172,16 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) reg(p, false);
     }
+    std::unordered_set<const slang::ast::SubroutineSymbol*> subsSeen;
     void handle(const slang::ast::SubroutineSymbol& sub) {
+        if (!subsSeen.insert(&sub).second) return;
         bool m = isClassMethod(sub);
         inMethod += m;
         visitDefault(sub);
         inMethod -= m;
+        // The bodies modules export for an interface's extern methods (25.7.4).
+        if (sub.flags.has(slang::ast::MethodFlags::InterfaceExtern) && sub.getPrototype())
+            for (auto* x = sub.getPrototype()->getFirstExternImpl(); x; x = x->getNextImpl()) handle(*x->impl);
     }
     void handle(const slang::ast::ClassType& c) {
         std::string saved = prefix;
@@ -8202,7 +8222,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     void aliasModports() {
         for (const auto* m : modportPorts) {
-            if (m->explicitConnection) Lowerer::unsupported("modport expression (25.5.4)");
+            if (m->explicitConnection) continue;   // read and written through its expression (Lowerer::modportExpr)
             const slang::ast::Symbol* in = m->internalSymbol;
             if (!in) continue;
             if (auto it = sigmap.find(in); it != sigmap.end()) sigmap[m] = it->second;
@@ -10128,7 +10148,14 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             if (auto ts = inst.body.getTimeScale()) prec = std::min(prec, tsExp(ts->precision));
             visitDefault(inst);
         }
-        void handle(const slang::ast::SubroutineSymbol& s) { found.push_back(&s); }
+        std::unordered_set<const slang::ast::SubroutineSymbol*> seen;
+        void handle(const slang::ast::SubroutineSymbol& s) {
+            if (!seen.insert(&s).second) return;
+            found.push_back(&s);
+            // The bodies modules export for an interface's extern methods (25.7.4).
+            if (s.flags.has(slang::ast::MethodFlags::InterfaceExtern) && s.getPrototype())
+                for (auto* x = s.getPrototype()->getFirstExternImpl(); x; x = x->getNextImpl()) handle(*x->impl);
+        }
         std::vector<const slang::ast::ClassType*> classes;
         void handle(const slang::ast::ClassType& c) { classes.push_back(&c); visitDefault(c); }
         void handle(const slang::ast::CovergroupType&) {}   // its methods are built in (19.8)
