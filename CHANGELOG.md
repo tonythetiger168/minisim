@@ -76,6 +76,11 @@ Spec references are IEEE 1800-2023 clauses.
   clock domain (virtual clocks included), so an input read without a
   synchronizer, or an output launched on another clock, is a crossing.
   `set_case_analysis 0/1` makes a signal static.
+- UPF (IEEE 1801-2024): `set_repeater` and the simulation of repeaters
+  (6.52, 9.10); `create_logic_net`, `create_logic_port` and
+  `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with
+  transition detection (6.7, 9.4); `create_power_state_group` (6.22);
+  `-applies_to_boundary` on isolation and level-shifter strategies.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.
