@@ -853,6 +853,19 @@ struct Lowerer {
     static const slang::ast::Expression& mtmOf(const slang::ast::MinTypMaxExpression& m) {
         return mtmSelect() == 0 ? m.min() : mtmSelect() == 2 ? m.max() : m.typ();
     }
+    // Does e call a task or function of the design (not a system one)?
+    static bool hasUserCall(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        struct V : ASTVisitor<V, VisitFlags::Expressions> {
+            bool hit = false;
+            void handle(const CallExpression& c) {
+                if (!c.isSystemCall()) hit = true;
+                visitDefault(c);
+            }
+        } v;
+        e.visit(v);
+        return v.hit;
+    }
     // Does e read a specparam that an SDF LABEL changed?
     static bool readsLabel(const slang::ast::Expression& e) {
         using namespace slang::ast;
@@ -1817,9 +1830,22 @@ struct Lowerer {
         if (call.thisClass() && !viaVif) unsupported("method call on a non-class");
         if (sub->lay) return emitAutoCall(*sub, args, wantValue);
 
+        // f(1, g(2)) where g calls f: the call in a later argument would
+        // overwrite the formals set before it, so then every value goes
+        // through a temporary first and the formals are set after.
+        bool staged = false;
+        for (size_t n = 1; n < args.size() && !staged; n++) staged = hasUserCall(*args[n]);
+        std::vector<std::pair<int, int>> stagedSet;   // (formal, temporary)
         for (size_t n = 0; n < args.size(); n++) {
             const auto& formal = sub->args[n];
             const Expression& a = *args[n];
+            if (staged && !formal.arr && formal.dir == ArgumentDirection::In && a.kind != ExpressionKind::EmptyArgument) {
+                int tmp = fresh(formal.w);
+                Instr i; i.k = IK::Assign; i.sig = tmp; i.e = expr(a);
+                prog.emit(i);
+                stagedSet.push_back({formal.sig, tmp});
+                continue;
+            }
             if (formal.dir == ArgumentDirection::Ref) {
                 Instr i; i.k = IK::Assign; i.sig = formal.sig; i.e = addrOf(a);
                 prog.emit(i);
@@ -1851,6 +1877,7 @@ struct Lowerer {
             }
         }
 
+        for (auto [f, t] : stagedSet) { Instr i; i.k = IK::Assign; i.sig = f; i.e = ref(t); prog.emit(i); }
         Instr c;
         c.k = IK::Call;
         c.callee = sub->prog;
