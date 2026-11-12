@@ -1084,6 +1084,23 @@ private:
                 fi = {w, false};
                 return true;
             }
+            case Op::ArrRead: {   // a[i] of a one-dimensional array in S.sigs: X when i is outside it or the element is unknown
+                const ArrShape* a = e->arr.get();
+                if (!a || a->base < 0 || a->dynElem || a->dims.size() != 1 || e->kids.size() != 1 || a->elemW < 1 || a->elemW > 64 ||
+                    a->count < 1 || a->twoState)
+                    return false;
+                for (int k = 0; k < a->count; k++)
+                    if (isPriv(a->base + k) || a->base + k >= (int)sigW_.size() || sigW_[a->base + k] != a->elemW) return false;
+                if (!kid(0, A, fa)) return false;
+                auto [l, r] = a->dims[0];
+                std::string off = l <= r ? "((uint64_t)(" + A + ") - (uint64_t)" + std::to_string(l) + "LL)"
+                                         : "((uint64_t)" + std::to_string(l) + "LL - (uint64_t)(" + A + "))";
+                std::string at = "S.sigs[" + std::to_string(a->base) + " + (" + off + " < " + std::to_string(a->count) + " ? " + off + " : 0)].val";
+                out = "(" + at + ".v)";
+                fxOor_.push_back("(" + off + " >= " + std::to_string(a->count) + " || " + at + ".x)");
+                fi = {a->elemW, e->sgn};
+                return true;
+            }
             case Op::DynSlice: {   // a[i +: w]: X when any of it is outside a
                 if (e->lo || e->kids.size() != 2) return false;
                 if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
@@ -2066,6 +2083,8 @@ private:
                         int k = (int)slots.size();
                         slots.push_back({i.sig, i.hi, i.lo});
                         slotProc.push_back(n);
+                        fns << " CLP(" << k << ");";
+                        fns2 << " CLP(" << k << ");";
                         std::string g, u, sl;
                         bool sp = i.hi < 0 && split(i.e, g, u, sl);
                         if (sp) fns2 << " V" << k << " = " << u << "; H" << k << " = 1;\n";
@@ -2100,8 +2119,18 @@ private:
             fns << L(end) << ": return;\n}\n";
             fns2 << L(end) << ": return;\n}\n";
         }
+        // Dense arrays: the hot V and H of neighbouring slots share cache
+        // lines (a Val is 56 bytes; interleaved, each slot took its own line).
+        o << "static Val FA[" << std::max<size_t>(slots.size(), 1) << "]; static uint64_t VA[" << std::max<size_t>(slots.size(), 1)
+          << "]; static uint8_t HA[" << std::max<size_t>(slots.size(), 1) << "];\n";
         for (size_t k = 0; k < slots.size(); k++)
-            o << "static Val F" << k << "; static uint64_t V" << k << "; static uint8_t H" << k << ";\n";
+            o << "static Val& F" << k << " = FA[" << k << "]; static uint64_t& V" << k << " = VA[" << k << "]; static uint8_t& H" << k
+              << " = HA[" << k << "];\n";
+        // The slots written in this time step, in order: the commit visits
+        // only those (a large design has tens of thousands of slots, most
+        // idle in any one cycle). CLON is off for the parallel path.
+        o << "static uint32_t CL[" << std::max<size_t>(slots.size(), 1) << "]; static uint32_t CN; static bool CLOVF, CLON = true;\n"
+             "#define CLP(k) do { if (CLON) { if (CN < sizeof CL / sizeof CL[0]) CL[CN++] = (k); else CLOVF = true; } } while (0)\n";
         std::vector<int> privs;
         for (size_t s = 0; s < priv_.size(); s++) if (priv_[s]) privs.push_back((int)s);
         // Only when something watches every change (a VCD opened at run time).
@@ -2386,6 +2415,7 @@ private:
             o << "};\n";
         }
         o << "static void dseq(const void* ctx, std::vector<Sim::NbaItem>& nb) {\n    (void)ctx;\n";
+        if (par) o << "    CLON = false;\n";
         if (par)
             // Nothing else runs before the NBA region (S.fuseOk()): each group
             // computes, commits and settles its islands in one parallel pass.
@@ -2440,7 +2470,7 @@ private:
         };
         std::vector<std::string> combStmtsQ;
         for (auto& st : combStmts2) combStmtsQ.push_back(bail(st, "{ cdirty = true; return; }"));
-        int nc = chunks("combP", combStmts), nm = chunks("commitP", commitStmts);
+        int nc = chunks("combP", combStmts);
         {
             int nd = chunks("combD", deadStmts);
             o << "static void combDead() {\n";
@@ -2573,8 +2603,60 @@ private:
                  "    if (S.observed) syncP();\n}\n\n";
             return;
         }
+        // The commit is data: one table row per slot and one small loop
+        // over the slots written (generated code per slot was 300 bytes
+        // each, 16 MB on bench/gen_soc.py 512, and the run waited on the
+        // instruction cache). Part writes, nets, clocks and wide signals keep
+        // their generated statement (kind 2).
+        std::vector<int> kind(slots.size(), 2);
+        for (size_t k = 0; k < slots.size(); k++) {
+            const Slot& sl = slots[k];
+            if (sl.hi >= 0) continue;
+            if (isPriv(sl.sig)) kind[k] = 0;
+            else if (!(sigW_[sl.sig] > 64 || sigNet_[sl.sig] || clock_[sl.sig])) kind[k] = 1;
+        }
+        int nm = 0;
+        std::string cms;
+        for (size_t a = 0; a < slots.size(); a += kChunk, nm++) {
+            bool any = false;
+            for (size_t b = a; b < slots.size() && b < a + kChunk; b++) any |= kind[b] == 2;
+            if (!any) { cms += std::string(nm ? ", " : "") + "nullptr"; continue; }
+            o << "static void commitS" << nm << "(uint32_t k) {\n    const bool obs = S.observed; (void)obs;\n    switch (k) {\n";
+            for (size_t b = a; b < slots.size() && b < a + kChunk; b++)
+                if (kind[b] == 2) o << "    case " << b << ":" << commitStmts[b] << "    break;\n";
+            o << "    }\n}\n";
+            cms += std::string(nm ? ", " : "") + "commitS" + std::to_string(nm);
+        }
+        o << "static void (*const CMS[])(uint32_t) = {" << (nm ? cms : "nullptr") << "};\n";
+        o << "struct CTRow { PSig* p; uint64_t m; int32_t sig, w; uint8_t kind; };\n";
+        o << "static const CTRow CTAB[] = {";
+        for (size_t k = 0; k < slots.size(); k++) {
+            int sg = slots[k].sig;
+            o << (k ? ",\n" : "\n") << "{" << (kind[k] == 0 ? "&P" + std::to_string(sg) : std::string("nullptr")) << ", " << M(sigW_[sg])
+              << ", " << sg << ", " << sigW_[sg] << ", " << kind[k] << "}";
+        }
+        if (slots.empty()) o << "{nullptr, 0, 0, 0, 2}";
+        o << "};\n";
+        o << "static void commitOne(uint32_t k, bool obs) {\n"
+             "    const uint8_t h = HA[k];\n"
+             "    if (!h) return;\n"
+             "    const CTRow& t = CTAB[k];\n"
+             "    if (t.kind == 0) {\n"
+             "        HA[k] = 0;\n"
+             "        if (h == 1) { t.p->v = VA[k] & t.m; t.p->x = 0; t.p->z = 0; } else { PW(*t.p, t.w, FA[k]); pclean = false; }\n"
+             "    } else if (t.kind == 1) {\n"
+             "        HA[k] = 0;\n"
+             "        if (h != 1) S.fw(t.sig, FA[k]);\n"
+             "        else if (__builtin_expect(!obs && S.waiters[t.sig].empty(), 1)) {\n"
+             "            Val& q = S.sigs[t.sig].val; q.v = VA[k] & t.m; q.x = 0; q.z = 0; q.real = false; q.str = false;\n"
+             "        } else S.fwSlow(t.sig, make(VA[k] & t.m, 0, t.w));\n"
+             "    } else CMS[k / " << kChunk << "](k);\n"
+             "}\n";
         o << "static void fcommit() {" << (multi ? " dpend = false;" : "");
-        for (int j = 0; j < nm; j++) o << " commitP" << j << "();";
+        o << " const bool obs = S.observed;"
+             " if (!CLOVF) { for (uint32_t j = 0; j < CN; j++) commitOne(CL[j], obs); }"
+             " else for (uint32_t k = 0; k < " << slots.size() << "; k++) commitOne(k, obs);"
+             " CN = 0; CLOVF = false;";
         // The comb pass is queued, not run here: other NBAs of this time
         // step (a testbench driving the inputs) may still follow in the
         // queue, and one pass after all of them is enough.
