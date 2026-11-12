@@ -79,7 +79,7 @@ class Codegen {
 public:
     std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                     const CodegenParts& parts = {}) {
-        for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); scratch_.push_back(g.name.rfind("_tf", 0) == 0); }
+        for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
         std::vector<std::string> chunks;   // one per process: the unit spread over files
         std::string cyc;                   // the cycle domain, kept with main()
         auto chunk = [&](auto&& emit) { std::ostringstream c; emit(c); chunks.push_back(c.str()); };
@@ -349,15 +349,26 @@ public:
         o << SV << "std::atomic<bool> pclean{false};   // every private signal is known (no X or Z bit)\n";        o << SV << "std::atomic<bool> cdirty{false};   // a 2-state comb pass met an unknown value: run the 4-state one\n";
 
         // Private signals start as their S.sigs counterparts do: a variable X, a net Z.
-        for (size_t s = 0; s < priv_.size(); s++)
-            if (priv_[s]) {
-                std::string m = M(sigW_[s]);
-                o << SV << "PSig P" << s << "{0, " << m << ", " << (sigNet_[s] ? m : "0") << "};\n";
-            }
+        // One array, indexed by signal: shared comb code (shareChunks) reaches
+        // the private signals of another instance at a constant distance.
+        {
+            size_t np = 0;
+            for (size_t x = 0; x < priv_.size(); x++) if (priv_[x]) np = x + 1;
+            o << SV << "PSig PA[" << std::max<size_t>(np, 1) << "];\n";
+            for (size_t x = 0; x < priv_.size(); x++)
+                if (priv_[x]) o << SV << "PSig& P" << x << " = PA[" << x << "];\n";
+            o << "static const struct { uint32_t s; uint64_t m; bool net; } PINIT[] = {";
+            size_t c = 0;
+            for (size_t x = 0; x < priv_.size(); x++)
+                if (priv_[x]) o << (c++ ? ", " : "") << "{" << x << ", " << M(sigW_[x]) << ", " << (sigNet_[x] ? "true" : "false") << "}";
+            if (!c) o << "{0, 0, false}";
+            o << "};\n";
+            if (c) privInit_ = "    for (auto& e : PINIT) { PA[e.s].x = e.m; PA[e.s].z = e.net ? e.m : 0; }\n";
+        }
         // Startup statements (one per line). Split, they go to functions
         // spread over the files: in main() they made design.cpp the slowest
         // file to compile (Ibex: 1 MB, 42 s).
-        std::string initText, initCalls;
+        std::string initText = privInit_, initCalls;
         for (size_t i = 0; i < sysArgs_.size(); i++) initText += "    A" + std::to_string(i) + " = {" + sysTrees[i] + "};\n";
         for (size_t i = 0; i < evals_.size(); i++) initText += "    ET" + std::to_string(i) + " = " + evTrees[i] + ";\n";
         for (auto& m : memInit) initText += m;
@@ -650,6 +661,7 @@ public:
 
 private:
     std::vector<int> sigW_;
+    std::vector<std::string> sigName_;
     // Temporaries of the lowering and of msim's call expansion (_tf...): each
     // read follows a write in the same pass, so an X left in one from a pass
     // that did not use it says nothing about 2-state mode.
@@ -1427,6 +1439,336 @@ private:
         domGroups_ = 1;
         return best;
     }
+
+    // ---- shared comb code (one copy per module, like Verilator) ----
+    // The instances of one module get their signals at a constant distance
+    // (c1.cpu.x = c0.cpu.x + D): the comb statements of one instance are those
+    // of another with every signal number moved by D. refScan finds the
+    // signal numbers in generated text (S.sigs[N], R(N, ...), P<N>, ...) and
+    // calls f(at, len, N) for each.
+    template <class F> static void refScan(const std::string& t, F&& f) {
+        static const char* pre[] = {"S.sigs[", "S.waiters[", "S.fwSlow(", "S.fwdv(", "S.fwv(", "S.fw(", "S.drive(",
+                                    "S.get(", "S.set(", "S.poke(", "R(", "int s = "};   // the last: dynTarget
+        auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+        for (size_t i = 0; i < t.size(); i++) {
+            char c = t[i];
+            if (c != 'S' && c != 'R' && c != 'P' && c != 'A' && c != 'V' && c != 'H' && c != 'F' && c != 'C' && c != 'i') continue;
+            if (i > 0 && (idc(t[i - 1]) || t[i - 1] == '.')) continue;
+            size_t at = std::string::npos;
+            int kind = 0;   // 0 a signal number, 1 a private signal P<N>, 2 an array shape AS<N>, 3 an NBA slot
+            if (c == 'V' || c == 'H' || c == 'F' || c == 'C') {
+                for (const char* p : {"VA[", "HA[", "FA[", "CLP("}) {
+                    size_t n = std::strlen(p);
+                    if (t.compare(i, n, p) == 0 && i + n < t.size() && std::isdigit((unsigned char)t[i + n])) { at = i + n, kind = 3; break; }
+                }
+            } else if (c == 'P') {
+                if (i + 1 < t.size() && std::isdigit((unsigned char)t[i + 1])) at = i + 1, kind = 1;
+            } else if (c == 'A') {
+                if (t.compare(i, 2, "AS") == 0 && i + 2 < t.size() && std::isdigit((unsigned char)t[i + 2])) at = i + 2, kind = 2;
+            } else
+                for (const char* p : pre) {
+                    size_t n = std::strlen(p);
+                    if (t.compare(i, n, p) == 0 && i + n < t.size() && std::isdigit((unsigned char)t[i + n])) { at = i + n; break; }
+                }
+            if (at == std::string::npos) continue;
+            size_t e = at;
+            while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
+            if ((kind == 1 || kind == 2) && e < t.size() && idc(t[e])) continue;
+            f(i, at, e, std::strtoll(t.c_str() + at, nullptr, 10), kind);
+            i = e - 1;
+        }
+    }
+    // Signals made after elaboration come in ranges of their own, each with
+    // its own distance between instances: function copies (_tfc), @* arming
+    // flags ($atstar), other function scratch (_tf) and the pieces of wide
+    // signals (numbers past the signal table).
+    // 6: an NBA slot of the cycle domain (refToks moves them past kSlotRef).
+    static constexpr int kRefCls = 7;
+    static constexpr long long kSlotRef = 1LL << 40;
+    // -1: a signal outside the instance `key` (a top-level clock, say): the
+    // same number in every copy. 5: an array shape (refToks makes them negative).
+    int refCls(long long n, const std::string& key) const {
+        if (n < 0) return 5;
+        if (n >= kSlotRef) return 6;
+        if ((size_t)n >= sigName_.size()) return 4;
+        const std::string& m = sigName_[(size_t)n];
+        if (m.rfind("_tfc", 0) == 0) return 1;
+        if (m.rfind("$atstar", 0) == 0) return 2;
+        if (m.rfind("_tf", 0) == 0) return 3;
+        if (m.size() <= key.size() || m.compare(0, key.size(), key) != 0 || m[key.size()] != '.') return -1;
+        return 0;
+    }
+    // Text between the signal numbers, with labels (cb<proc>_, cq<proc>_)
+    // and cold counters made neutral.
+    static std::string refPiece(const std::string& r) {
+        std::string o;
+        o.reserve(r.size());
+        for (size_t i = 0; i < r.size(); i++) {
+            if ((r.compare(i, 2, "cb") == 0 || r.compare(i, 2, "cq") == 0) && (i == 0 || !std::isalnum((unsigned char)r[i - 1])) &&
+                i + 2 < r.size() && std::isdigit((unsigned char)r[i + 2])) {
+                size_t e = i + 2;
+                while (e < r.size() && std::isdigit((unsigned char)r[e])) e++;
+                if (e < r.size() && r[e] == '_') { o += r.substr(i, 2) + "#"; i = e - 1; continue; }
+            }
+            if (r.compare(i, 5, "COLD(") == 0) {
+                size_t e = i + 5;
+                while (e < r.size() && std::isdigit((unsigned char)r[e])) e++;
+                o += "COLD(#"; i = e - 1; continue;
+            }
+            o += r[i];
+        }
+        return o;
+    }
+    struct RefToks { std::vector<std::string> piece; std::vector<long long> num; };
+    static RefToks refToks(const std::string& t) {
+        RefToks r;
+        size_t last = 0;
+        refScan(t, [&](size_t, size_t at, size_t e, long long n, int kind) {
+            r.piece.push_back(refPiece(t.substr(last, at - last)));
+            r.num.push_back(kind == 2 ? -1 - n : kind == 3 ? kSlotRef + n : n);   // array shapes, slots: classes of their own
+            last = e;
+        });
+        r.piece.push_back(refPiece(t.substr(last)));
+        return r;
+    }
+    // Is g the template t with every signal number moved by D[its class]?
+    // Fills the classes not set yet.
+    bool refMatch(const std::string& t, const std::string& g, const std::string& tk, const std::string& gk, long long* D, bool* set) const {
+        RefToks a = refToks(t), b = refToks(g);
+        if (a.num.size() != b.num.size() || a.piece != b.piece) return false;
+        for (size_t k = 0; k < a.num.size(); k++) {
+            int c = refCls(a.num[k], tk);
+            if (c != refCls(b.num[k], gk)) return false;
+            long long d = c == 5 ? a.num[k] - b.num[k] : b.num[k] - a.num[k];   // shapes are stored as -1 - n
+            if (c < 0) { if (d) return false; continue; }
+            if (!set[c]) { set[c] = true; D[c] = d; }
+            else if (D[c] != d) return false;
+        }
+        return true;
+    }
+    // The text with every signal number N written as (N + D<class>).
+    std::string refParam(const std::string& t, const std::string& key) const {
+        std::string r;
+        size_t last = 0;
+        refScan(t, [&](size_t start, size_t at, size_t e, long long n, int kind) {
+            if (kind == 2) { r.append(t, last, start - last); r += "(*AST[" + std::to_string(n) + " + D5])"; last = e; return; }
+            int c = kind == 3 ? 6 : refCls(n, key);
+            if (c < 0) return;   // the same in every copy: left as it is
+            std::string d = "D" + std::to_string(c);
+            if (kind == 1) { r.append(t, last, start - last); r += "PA[" + std::to_string(n) + " + " + d + "]"; }
+            else { r.append(t, last, at - last); r += std::to_string(n) + " + " + d; }
+            last = e;
+        });
+        r.append(t, last, std::string::npos);
+        return r;
+    }
+    // Emits the statements js (indices into text, in rank order) as functions
+    // and returns the calls that run them in order. Within one level the
+    // statements of each instance are kept together; an instance whose
+    // statements equal another's moved by D calls that one's functions with
+    // D. MSIM_NOSHARE=1: plain chunks only.
+    int shareSerial_ = 0;
+    size_t shareSaved_ = 0, shareTotal_ = 0;
+    static std::string dParams() {
+        std::string r;
+        for (int c = 0; c < kRefCls; c++) r += (c ? ", const long D" : "const long D") + std::to_string(c);
+        return r;
+    }
+    static std::string dUnused() {
+        std::string r;
+        for (int c = 0; c < kRefCls; c++) r += " (void)D" + std::to_string(c) + ";";
+        return r;
+    }
+    std::vector<std::string> shareChunks(std::ostream& o, const std::string& name, const std::vector<size_t>& js,
+                                         const std::vector<std::string>& text, const std::vector<int>& unitProc,
+                                         const std::vector<std::vector<const Instr*>>& unitIns,
+                                         const std::vector<CodegenProc>& procs, int kChunk) {
+        std::vector<std::string> calls;
+        std::string buf;
+        int nb = 0, nplain = 0;
+        auto flush = [&] {
+            if (!nb) return;
+            std::string f = name + std::to_string(nplain++);
+            o << "static void " << f << "() {\n    const bool obs = S.observed; (void)obs;\n" << buf << "}\n";
+            calls.push_back(f + "()");
+            buf.clear();
+            nb = 0;
+        };
+        auto plain = [&](size_t j) {
+            buf += text[j];
+            if (++nb >= kChunk) flush();
+        };
+        static const bool off = std::getenv("MSIM_NOSHARE") != nullptr;
+        auto outSig = [&](size_t j) { return unitIns[j].empty() ? -1 : unitIns[j][0]->sig; };
+        auto key = [&](size_t j) -> std::string {   // the instance: the first name component
+            int sg = outSig(j);
+            if (sg < 0 || (size_t)sg >= sigName_.size()) return "";
+            const std::string& n = sigName_[sg];
+            size_t d = n.find('.');
+            return d == std::string::npos ? "" : n.substr(0, d);
+        };
+        auto rest = [&](size_t j) {
+            const std::string& n = sigName_[outSig(j)];
+            return n.substr(n.find('.') + 1);
+        };
+        for (size_t a = 0; a < js.size();) {
+            size_t b = a;
+            int lv = procs[unitProc[js[a]]].combLevel;
+            while (b < js.size() && procs[unitProc[js[b]]].combLevel == lv) b++;
+            // Groups by instance, in order of first appearance.
+            std::vector<std::string> keys;
+            std::map<std::string, std::vector<size_t>> grp;
+            bool asserts = false;   // their reports keep the rank order
+            for (size_t x = a; x < b; x++) asserts |= combAsserts(*procs[unitProc[js[x]]].prog);
+            for (size_t x = a; x < b; x++) {
+                std::string k = off || asserts ? "" : key(js[x]);
+                if (!grp.count(k)) keys.push_back(k);
+                grp[k].push_back(js[x]);
+            }
+            // Template per shape (the names below the instance, in order).
+            std::map<std::string, std::vector<std::string>> tmplOf;   // shape -> keys of the groups that are templates
+            std::map<std::string, std::array<long long, kRefCls>> dOf;   // key -> its distances when it shares
+            std::map<std::string, std::vector<std::string>> users;
+            for (auto& k : keys) {
+                if (k.empty()) continue;
+                auto& g = grp[k];
+                std::string shape;
+                for (size_t j : g) shape += rest(j) + "|";
+                // Against each template of this shape in turn; a new one if none fits
+                // (an instance whose port copy is public, say).
+                bool ok = false;
+                for (const std::string& tk0 : tmplOf[shape]) {
+                    auto& t = grp[tk0];
+                    std::array<long long, kRefCls> D{};
+                    bool set[kRefCls] = {};
+                    ok = g.size() == t.size();
+                    size_t bad = 0;
+                    for (size_t x = 0; ok && x < g.size(); x++) { ok = refMatch(text[t[x]], text[g[x]], tk0, k, D.data(), set); bad = x; }
+                    static const char* dbgS = std::getenv("MSIM_WHYSHARE");
+                    if (!ok && dbgS && *dbgS == '2' && g.size() == t.size()) {
+                        RefToks ta = refToks(text[t[bad]]), tb = refToks(text[g[bad]]);
+                        std::fprintf(stderr, "no share: %s vs %s (%zu/%zu refs)\n", sigName_[outSig(t[bad])].c_str(), sigName_[outSig(g[bad])].c_str(), ta.num.size(), tb.num.size());
+                        for (size_t q = 0; q < std::min(ta.num.size(), tb.num.size()); q++)
+                            std::fprintf(stderr, "   %lld (%s, cls %d) vs %lld (%s, cls %d)\n", ta.num[q], ta.num[q] < (long long)sigName_.size() ? sigName_[ta.num[q]].c_str() : "?", refCls(ta.num[q], tk0),
+                                         tb.num[q], tb.num[q] < (long long)sigName_.size() ? sigName_[tb.num[q]].c_str() : "?", refCls(tb.num[q], k));
+                        if (ta.piece != tb.piece) for (size_t q = 0; q < std::min(ta.piece.size(), tb.piece.size()); q++) if (ta.piece[q] != tb.piece[q]) { std::fprintf(stderr, "   piece: [%s] vs [%s]\n", ta.piece[q].substr(0, 200).c_str(), tb.piece[q].substr(0, 200).c_str()); break; }
+                    }
+                    if (ok) { dOf[k] = D; users[tk0].push_back(k); break; }
+                }
+                if (!ok) tmplOf[shape].push_back(k);
+            }
+            std::map<std::string, std::vector<std::string>> fnsOf;   // template key -> its functions
+            for (auto& k : keys) {
+                auto& g = grp[k];
+                bool isT = users.count(k) > 0;
+                if (!isT && !dOf.count(k)) { for (size_t j : g) plain(j); continue; }
+                flush();
+                const std::string& tk = isT ? k : [&]() -> const std::string& {
+                    for (auto& [t, us] : users) if (std::find(us.begin(), us.end(), k) != us.end()) return t;
+                    return k;
+                }();
+                if (!fnsOf.count(tk)) {
+                    auto& tg = grp[tk];
+                    int id = shareSerial_++;
+                    for (size_t c = 0; c < tg.size(); c += kChunk) {
+                        std::string f = name + "T" + std::to_string(id) + "_" + std::to_string(c / kChunk);
+                        o << "static void " << f << "(" << dParams() << ") {\n    const bool obs = S.observed; (void)obs;" << dUnused() << "\n";
+                        for (size_t x = c; x < tg.size() && x < c + (size_t)kChunk; x++) o << refParam(text[tg[x]], tk);
+                        o << "}\n";
+                        fnsOf[tk].push_back(f);
+                    }
+                }
+                std::array<long long, kRefCls> D{};
+                if (!isT) D = dOf[k];
+                std::string args;
+                for (int c = 0; c < kRefCls; c++) args += (c ? ", " : "") + std::to_string(D[c]);
+                for (auto& f : fnsOf[tk]) calls.push_back(f + "(" + args + ")");
+                if (!isT) for (size_t j : g) shareSaved_ += text[j].size();
+            }
+            for (size_t x = a; x < b; x++) shareTotal_ += text[js[x]].size();
+            a = b;
+        }
+        flush();
+        return calls;
+    }
+    // The clocked functions of the cycle domain (ds<n>, ds<n>_2) from their
+    // bodies. Like the comb code, the processes of instances of one module
+    // share one copy (dsT<n>, moved by D); MSIM_NOSHARE=1 turns that off.
+    void emitDomainFns(std::ostream& o4, std::ostream& o2, const std::vector<int>& dom, const std::vector<CodegenProc>& procs,
+                       const std::vector<std::string>& b4, const std::vector<std::string>& b2, const std::vector<char>& tmp) {
+        static const bool off = std::getenv("MSIM_NOSHARE") != nullptr;
+        auto keyOf = [&](int n) -> std::string {
+            for (auto& in : procs[n].prog->code)
+                if ((in.k == IK::Nba || in.k == IK::Assign) && in.sig >= 0 && (size_t)in.sig < sigName_.size()) {
+                    const std::string& m = sigName_[in.sig];
+                    size_t d = m.find('.');
+                    if (d != std::string::npos && m[0] != '_' && m[0] != '$') return m.substr(0, d);
+                }
+            return "";
+        };
+        std::vector<int> useT(procs.size(), -1);
+        std::vector<char> isT(procs.size());
+        std::vector<std::string> key(procs.size());
+        std::vector<std::array<long long, kRefCls>> useD(procs.size());
+        std::map<std::string, std::vector<int>> tmplOf;   // shape -> template processes
+        for (int n : dom) {
+            if (off) break;
+            key[n] = keyOf(n);
+            if (key[n].empty()) continue;
+            std::string all = b4[n] + "\x01" + b2[n];
+            RefToks rt = refToks(all);
+            std::string shape = tmp[n] ? "T" : "N";
+            for (auto& pc : rt.piece) shape += pc + "\x02";
+            auto& lst = tmplOf[shape];
+            for (int t : lst) {
+                std::array<long long, kRefCls> D{};
+                bool set[kRefCls] = {};
+                if (refMatch(b4[t] + "\x01" + b2[t], all, key[t], key[n], D.data(), set)) { useT[n] = t; useD[n] = D; isT[t] = 1; break; }
+                static const char* dbg = std::getenv("MSIM_WHYSHARE");
+                if (dbg && *dbg == '2') {
+                    RefToks ta = refToks(b4[t] + "\x01" + b2[t]);
+                    for (size_t q = 0; q < ta.num.size(); q++) {
+                        int ca = refCls(ta.num[q], key[t]), cb = refCls(rt.num[q], key[n]);
+                        if (ca != cb) { std::fprintf(stderr, "no share ds%d/ds%d (%s/%s): %lld cls %d vs %lld cls %d\n", t, n, key[t].c_str(), key[n].c_str(), ta.num[q], ca, rt.num[q], cb); break; }
+                    }
+                }
+            }
+            if (useT[n] < 0) lst.push_back(n);
+            if (const char* d3 = std::getenv("MSIM_WHYSHARE"); d3 && *d3 == '3')
+                std::fprintf(stderr, "ds%d key %s shape %zu bytes, %zu templates, uses %d\n", n, key[n].c_str(), shape.size(), lst.size(), useT[n]);
+        }
+        auto args = [&](const std::array<long long, kRefCls>& D) {
+            std::string r;
+            for (int c = 0; c < kRefCls; c++) r += (c ? ", " : "") + std::to_string(D[c]);
+            return r;
+        };
+        size_t saved = 0, total = 0;
+        for (int n : dom) {
+            total += b4[n].size() + b2[n].size();
+            o4 << "// process " << n << " (" << procs[n].kind << ", cycle domain)\n";
+            if (isT[n]) {
+                o4 << "static void __attribute__((noinline)) dsT" << n << "(" << dParams() << ") {" << dUnused() << "\n"
+                   << refParam(b4[n], key[n]) << "}\n";
+                if (!tmp[n])
+                    o2 << "static void __attribute__((noinline)) dsT" << n << "_2(" << dParams() << ") {" << dUnused() << "\n"
+                       << refParam(b2[n], key[n]) << "}\n";
+            }
+            int t = isT[n] ? n : useT[n];
+            if (t >= 0) {
+                std::string a = args(isT[n] ? std::array<long long, kRefCls>{} : useD[n]);
+                o4 << "static void ds" << n << "() { dsT" << t << "(" << a << "); }\n";
+                if (tmp[n]) o2 << "static void ds" << n << "_2() { ds" << n << "(); }\n";
+                else o2 << "static void ds" << n << "_2() { dsT" << t << "_2(" << a << "); }\n";
+                if (!isT[n]) saved += b4[n].size() + b2[n].size();
+                continue;
+            }
+            o4 << "static void ds" << n << "() {\n" << b4[n] << "}\n";
+            if (tmp[n]) o2 << "static void ds" << n << "_2() { ds" << n << "(); }\n";
+            else o2 << "static void ds" << n << "_2() {\n" << b2[n] << "}\n";
+        }
+        if (std::getenv("MSIM_WHYSHARE"))
+            std::fprintf(stderr, "shared clocked code: %zu of %zu bytes are calls to another instance's copy\n", saved, total);
+    }
     std::vector<int> domRoot_;    // cycleDomain: per signal, the signal it is a copy of (itself if none)
     std::vector<int> domGroup_;   // cycleDomain: per process, its clock group in the domain (or -1)
     // The events each clock group of the domain is registered on. One signal
@@ -1587,6 +1929,7 @@ private:
     // the preamble): the statements that keep running the 4-state way.
     int colds_ = 0;
     std::vector<int> coneOuts_;
+    std::string privInit_;       // run(): sets the private signals' first X / Z (PINIT)
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
     std::string cold(const std::string& stmt) {
         return "[&]() __attribute__((noinline, cold)) { COLD(" + std::to_string(colds_++) + ") " + stmt + " }();";
@@ -2091,16 +2434,14 @@ private:
             };
             f(e);
         };
+        std::vector<std::string> dsB4(procs.size()), dsB2(procs.size());
+        std::vector<char> dsTmp(procs.size());
         for (int n : dom) {
             const Prog& p = *procs[n].prog;
             size_t end = p.code.size() - 1;
             auto L = [](size_t pc) { return "d_" + std::to_string(pc); };
-            fns << "// process " << n << " (" << procs[n].kind << ", cycle domain)\n";
-            fns << "static void ds" << n << "() {\n";
-            std::ostringstream& fnsAll = fns2;
-            std::ostringstream fns2;
+            std::ostringstream fns, fns2;   // the bodies; shared or emitted below
             bool hasTmp = false;
-            fns2 << "static void ds" << n << "_2() {\n";
             for (size_t pc = 1; pc < end; pc++) {
                 const Instr& i = p.code[pc];
                 fns << L(pc) << ":";
@@ -2124,15 +2465,17 @@ private:
                         fns2 << " CLP(" << k << ");";
                         std::string g, u, sl;
                         bool sp = i.hi < 0 && split(i.e, g, u, sl);
-                        if (sp) fns2 << " V" << k << " = " << u << "; H" << k << " = 1;\n";
-                        else fns2 << " F" << k << " = " << fast(i.e) << "; H" << k << " = 2;\n";   // no 2-state path: as it is
+                        // Through the arrays (VA[k], not V<k>): shared code moves k.
+                        const std::string K = std::to_string(k), V = " VA[" + K + "]", H = " HA[" + K + "]", F = " FA[" + K + "]";
+                        if (sp) fns2 << V << " = " << u << ";" << H << " = 1;\n";
+                        else fns2 << F << " = " << fast(i.e) << ";" << H << " = 2;\n";   // no 2-state path: as it is
                         // H: 1 = the 2-state value in V<k>, 2 = the Val in F<k>.
                         if (sp) {
-                            if (g.empty()) fns << " V" << k << " = " << u << "; H" << k << " = 1;\n";
-                            else fns << " if (__builtin_expect(" << g << ", 1)) { V" << k << " = " << u << "; H" << k
-                                     << " = 1; } else " << cold("F" + std::to_string(k) + " = " + sl + "; H" + std::to_string(k) + " = 2;") << "\n";
+                            if (g.empty()) fns << V << " = " << u << ";" << H << " = 1;\n";
+                            else fns << " if (__builtin_expect(" << g << ", 1)) {" << V << " = " << u << ";" << H
+                                     << " = 1; } else " << cold(F + " = " + sl + ";" + H + " = 2;") << "\n";
                         } else
-                            fns << " F" << k << " = " << fast(i.e) << "; H" << k << " = 2;\n";
+                            fns << F << " = " << fast(i.e) << ";" << H << " = 2;\n";
                         break;
                     }
                     case IK::JmpIfNot: {
@@ -2160,11 +2503,13 @@ private:
                     default: throw CodegenUnsupported("instruction in a clocked process");
                 }
             }
-            fns << L(end) << ": return;\n}\n";
-            fns2 << L(end) << ": return;\n}\n";
-            if (hasTmp) fnsAll << "static void ds" << n << "_2() { ds" << n << "(); }\n";
-            else fnsAll << fns2.str();
+            fns << L(end) << ": return;\n";
+            fns2 << L(end) << ": return;\n";
+            dsB4[n] = fns.str();
+            dsB2[n] = fns2.str();
+            dsTmp[n] = hasTmp;
         }
+        emitDomainFns(fns, fns2, dom, procs, dsB4, dsB2, dsTmp);
         // Dense arrays: the hot V and H of neighbouring slots share cache
         // lines (a Val is 56 bytes; interleaved, each slot took its own line).
         o << "static Val FA[" << std::max<size_t>(slots.size(), 1) << "]; static uint64_t VA[" << std::max<size_t>(slots.size(), 1)
@@ -2524,14 +2869,19 @@ private:
         };
         std::vector<std::string> combStmtsQ;
         for (auto& st : combStmts2) combStmtsQ.push_back(bail(st, "{ cdirty = true; return; }"));
-        int nc = chunks("combP", combStmts);
+        std::vector<size_t> allUnits(unitProc.size());
+        for (size_t j = 0; j < allUnits.size(); j++) allUnits[j] = j;
+        std::vector<std::string> callsP = shareChunks(o, "combP", allUnits, combStmts, unitProc, unitIns, procs, kChunk);
         {
             int nd = chunks("combD", deadStmts);
             o << "static void combDead() {\n";
             for (int j = 0; j < nd; j++) o << "    combD" << j << "();\n";
             o << "}\n";
         }
-        int nq = two ? chunks("combQ", combStmtsQ) : 0;
+        std::vector<std::string> callsQ;
+        if (two) callsQ = shareChunks(o, "combQ", allUnits, combStmtsQ, unitProc, unitIns, procs, kChunk);
+        if (std::getenv("MSIM_WHYSHARE"))
+            std::fprintf(stderr, "shared comb code: %zu of %zu bytes are calls to another instance's copy\n", shareSaved_, shareTotal_);
         // The clock cone: the comb processes downstream of the outside signals
         // that reach a clock or reset of a clocked process (the top clock and
         // its copies down the hierarchy, gated clocks). When only such a
@@ -2612,12 +2962,15 @@ private:
             if (!coneIns_.empty()) {
                 std::sort(coneIns_.begin(), coneIns_.end());
                 bool privW = false;
-                o << "static void combCone(const void*) {\n    const bool obs = S.observed; (void)obs;\n";
+                std::vector<size_t> coneUnits;
                 for (size_t j = 0; j < unitIns.size(); j++) {
                     if (!inCone[unitProc[j]]) continue;
-                    o << combStmts[j];
+                    coneUnits.push_back(j);
                     for (auto* in : unitIns[j]) privW |= isPriv(in->sig);
                 }
+                std::vector<std::string> callsC = shareChunks(o, "combC", coneUnits, combStmts, unitProc, unitIns, procs, kChunk);
+                o << "static void combCone(const void*) {\n";
+                for (auto& c : callsC) o << "    " << c << ";\n";
                 if (privW) o << "    scanP();\n";
                 o << "    if (S.observed) syncP();\n}\n";
             }
@@ -2625,12 +2978,12 @@ private:
         o << "static void combAll(const void*) {\n";
         if (two) {
             o << "    if (twoNow()) {\n        cdirty = false;\n";
-            for (int j = 0; j < nq; j++) o << "        combQ" << j << "(); if (cdirty) goto slow;\n";
+            for (auto& c : callsQ) o << "        " << c << "; if (cdirty) goto slow;\n";
             o << "        goto done;\n    }\n    slow: ;\n";
-            for (int j = 0; j < nc; j++) o << "    combP" << j << "();\n";
+            for (auto& c : callsP) o << "    " << c << ";\n";
             o << "    scanP(); why4();\n    done: ;\n";
         } else
-            for (int j = 0; j < nc; j++) o << "    combP" << j << "();\n";
+            for (auto& c : callsP) o << "    " << c << ";\n";
         o << "    if (S.observed) syncP();\n}\n";
         if (par) {
             // Per group: its slots' commits, then its comb statements in rank order.
