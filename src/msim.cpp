@@ -159,6 +159,7 @@
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
 #include "upf_rt.inc"
+#include "upf_design.hpp"
 #include "dpi.inc"
 #include "vpi.inc"
 #include "interactive.inc"
@@ -2225,33 +2226,8 @@ int main(int argc, char** argv) {
         auto& rt = upfrt::rt();
         rt.verbose = upfVerbose;
         try {
-            rt.m.load(upfPath, "");
-            std::string top = powerTopSet ? powerTop : rt.m.designTop;
-            for (char& c : top) if (c == '/') c = '.';
-            while (!top.empty() && top[0] == '.') top.erase(0, 1);
-            // a path may start with the simulation top's own name (tb.u_dut)
-            if (!S.vcdTop.empty() && (top == S.vcdTop || top.starts_with(S.vcdTop + "."))) top = top.substr(std::min(top.size(), S.vcdTop.size() + 1));
-            // set_design_top may name the module the UPF was written for
-            if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {
-                std::string found;
-                std::function<void(const slang::ast::InstanceSymbol&, const std::string&)> walk =
-                    [&](const slang::ast::InstanceSymbol& in, const std::string& path) {
-                        if (!found.empty()) return;
-                        if (in.getDefinition().name == top && !path.empty()) { found = path; return; }
-                        for (auto& m : in.body.members())
-                            if (m.kind == slang::ast::SymbolKind::Instance) {
-                                auto& ch = m.as<slang::ast::InstanceSymbol>();
-                                walk(ch, path.empty() ? std::string(ch.name) : path + "." + std::string(ch.name));
-                            }
-                    };
-                for (auto* t : comp->getRoot().topInstances) {
-                    if (t->getDefinition().name == top) { found = "."; break; }
-                    walk(*t, "");
-                }
-                if (found == ".") top.clear();
-                else if (!found.empty()) top = found;
-            }
-            rt.m.top = top;
+            upf::DesignView dv = upf::designView(*comp);
+            upf::loadWithDesign(rt.m, upfPath, *comp, dv, powerTop, powerTopSet);
             rt.bind(lowered);
         } catch (const std::exception& ex) {
             std::cerr << "msim: UPF: " << ex.what() << "\n";

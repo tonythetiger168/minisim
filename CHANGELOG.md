@@ -47,6 +47,11 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- UPF `find_objects` (IEEE 1801-2024 6.33): a UPF file can search the
+  design for instances, instances of a module, ports by direction, nets and
+  its own supply ports and nets (`-transitive`, `-regexp`, `-exact`,
+  `-ignore_case`, `-leaf_only`, `-non_leaf`). msim and mlint share the
+  design walk and the power top lookup (`src/upf_design.hpp`).
 - `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
   the object a module's class handle variable points to is a signal
   `tb.p.addr` that follows the handle (x while it is null), with handle

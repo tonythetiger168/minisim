@@ -22,6 +22,31 @@ file(READ ${D}/gating.out want)
 if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
   message(FATAL_ERROR "tcl.upf: ${rc}\n${out}${err}")
 endif()
+# find_objects (6.33): the same intent with its domains, isolation elements and
+# level-shifter ports found in the design; the UPF checks every query itself.
+foreach(pt "" "tb/u_dut")
+  set(args ${D}/gating.sv -upf ${D}/find.upf)
+  if(pt)
+    list(APPEND args -power_top ${pt})
+  endif()
+  execute_process(COMMAND ${MSIM} ${args} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  file(READ ${D}/gating.out want)
+  if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
+    message(FATAL_ERROR "find.upf (power top '${pt}'): ${rc}\n${out}${err}")
+  endif()
+endforeach()
+execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${D}/find.upf -only upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "0 findings")
+  message(FATAL_ERROR "mlint find.upf is not clean: ${rc}\n${out}${err}")
+endif()
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badfind.upf "set_design_top dut\nfind_objects u_nope -pattern *\n")
+execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/badfind.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "badfind.upf:2: find_objects: no scope 'u_dut.u_nope' in the design")
+  message(FATAL_ERROR "find_objects on a missing scope was not reported: ${rc}\n${out}${err}")
+endif()
+
 # An error inside a proc called from a loop is reported where it is.
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badtcl.upf "proc p {d} {\n  create_power_domain $d -update\n}\nforeach d {A B} { p $d }\n")
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/badtcl.upf
