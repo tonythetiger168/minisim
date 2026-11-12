@@ -582,6 +582,13 @@ struct JoinWait {
 };
 
 struct ProcCtl;
+// VPI thread and frame callbacks (38.36.1), set by vpi.inc once one is
+// registered. Thread: 0 a thread starts, 1 it ends, 2 it runs again after a
+// wait. Frame: 0 a task or function call starts (depth: its frames below
+// it), 1 it returns.
+inline void (*g_threadHook)(int what, ProcCtl& c) = nullptr;
+inline void (*g_frameHook)(int what, ProcCtl& c, size_t depth, const Prog* callee) = nullptr;
+inline ProcCtl* g_ctl = nullptr;   // the running process
 // DPI-C imports (35) are run by dpi.inc, which msim links in. A call that
 // returns a JoinState is an import task waiting on an exported task that
 // consumes time: the process waits for it, then calls resume. kill runs a
@@ -631,6 +638,7 @@ struct ProcCtl {
     int program = -1;
     bool progRoot = false;
     bool reactive = false;   // a program or checker thread: runs in the reactive region set
+    uint64_t seen = 0;       // VPI cbEnterThread: the kernel resume (Sim::resumeN) it last ran in
     bool kidsDone() const {
         for (auto& k : kids) if (!k->ended) return false;
         return true;
@@ -660,6 +668,7 @@ inline void programRootEnded(int p);
 inline void procEnd(ProcCtl& c) {
     if (c.ended) return;
     c.ended = true;
+    if (__builtin_expect(g_threadHook != nullptr, 0)) g_threadHook(1, c);
     if (c.progRoot) programRootEnded(c.program);
     for (Handle h : c.awaiters) S.active.push_back(h);
     c.awaiters.clear();
@@ -756,6 +765,7 @@ inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr)
     c->h = t.h;
     for (int r : p->roots) rootProcs()[r].push_back(c);
     if (anySpans()) liveProcs().push_back(c);
+    if (__builtin_expect(g_threadHook != nullptr, 0)) g_threadHook(0, *c);
     return t;
 }
 // disable of block or task id (9.6.2) for every process inside it: it
@@ -905,7 +915,7 @@ inline void Sim::runObserved() {
     while (!observedQ.empty()) {
         Handle h = observedQ.front();
         observedQ.pop_front();
-        if (!h.done()) h.resume();
+        if (!h.done()) { ++resumeN; h.resume(); }
     }
     // Pending procedural concurrent assertions mature (16.14.6); those whose
     // clock did not tick in this step start at its next tick.
@@ -1392,6 +1402,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
     auto ret = [&]() {
         RetFrame f = std::move(rets.back());
         rets.pop_back();
+        if (__builtin_expect(g_frameHook != nullptr, 0)) g_frameHook(1, *ctl, rets.size(), p);
         p = f.prog;
         pc = f.pc;
         if (f.fr != fr) { lastRet = std::move(fr); fr = std::move(f.fr); }
@@ -1414,6 +1425,12 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         g_fr = fr.get();
         g_ret = lastRet.get();
         g_threadRng = ctl->rngp;
+        g_ctl = ctl.get();
+        if (__builtin_expect(g_threadHook != nullptr, 0) && ctl->seen != S.resumeN) {   // cbEnterThread
+            bool again = ctl->seen != 0;
+            ctl->seen = S.resumeN;
+            if (again && !ctl->killed) g_threadHook(2, *ctl);
+        }
         if (ctl->killed) goto done;
         if (ctl->gen != gen0) [[unlikely]] co_return;   // a disable moved it to a new coroutine
         // A process of a powered-off domain is inactive (1801 9.5.3): it
@@ -1571,6 +1588,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     if (i.rc && i.rc->objTmp >= 0) S.set(R(i.rc->objTmp), make((uint64_t)obj, 0, 64));
                 }
                 int r = doRandomize(obj, i.rc.get());
+                g_ctl = ctl.get();
                 g_fr = fr.get();
                 g_ret = lastRet.get();
                 if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true));
@@ -1626,8 +1644,11 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     if (evbuf.empty()) relFail("wait on nothing");
                     if (evbuf.size() > 1) co_await WaitAny{&evbuf};
                     else co_await Wait{evbuf[0].first, evbuf[0].second};
-                } else if (i.events.size() > 1) co_await WaitAny{&i.events};
-                else co_await Wait{i.sig, i.edge};
+                } else {
+                    bool late = pc == 0 && p == entry && entry->alwaysTop;
+                    if (i.events.size() > 1) co_await WaitAny{&i.events, late};
+                    else co_await Wait{i.sig, i.edge, late};
+                }
                 TO_REACTIVE;
                 ctl->epoch++;   // a deferred assertion flush point (16.4.2)
                 pc++; break;
@@ -1729,6 +1750,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 } else rets.push_back({p, pc + 1, fr});
                 p = callee;
                 pc = 0;
+                if (__builtin_expect(g_frameHook != nullptr, 0)) g_frameHook(0, *ctl, rets.size() - 1, callee);
                 break;
             }
             case IK::Fork: {
