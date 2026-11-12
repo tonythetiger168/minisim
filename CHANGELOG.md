@@ -32,6 +32,7 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI `cbStmt` (38.36.1): a callback each time a statement runs.
 - VPI processes, statements and expressions (37.32 to 37.51):
   `vpi_iterate(vpiProcess / vpiContAssign, module)`, the statement tree
   (blocks, assignments, if, case and case items, loops, delay and event

@@ -1246,7 +1246,10 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         }
         const Instr& i = p->code[pc];
         g_runLoc = {i.file, i.line};
-        if (g_cov) covHit(i.hits);
+        if (g_cov | g_hook) {
+            if (g_cov) covHit(i.hits);
+            if (i.stmtCb) g_stmtHook(i);
+        }
         switch (i.k) {
             case IK::Assign:
             case IK::Nba: {
@@ -1641,7 +1644,10 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
     if (g_cov) covHit(p->code[0].hits);   // the clock wait this function stands for
     while (pc < end) {
         const Instr& i = p->code[pc];
-        if (g_cov) covHit(i.hits);
+        if (g_cov | g_hook) {
+            if (g_cov) covHit(i.hits);
+            if (i.stmtCb) g_stmtHook(i);
+        }
         switch (i.k) {
             case IK::Nba: {
                 Val v = eval(i.e, rd);

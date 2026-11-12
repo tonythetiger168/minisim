@@ -97,6 +97,11 @@ inline SrcLoc g_runLoc;   // the statement running now, for run-time error messa
 inline std::string runLocStr();
 inline std::vector<std::string> g_covFiles{""};   // file id -> path; 0 = unknown
 inline bool g_cov = false;
+// VPI cbStmt (38.36.1): with g_hook set, the interpreter calls g_stmtHook
+// on each instruction marked stmtCb.
+struct Instr;
+inline bool g_hook = false;
+inline void (*g_stmtHook)(const Instr&) = nullptr;
 inline std::string runLocStr() {
     if (!g_runLoc.line || g_runLoc.file >= g_covFiles.size()) return "";
     return " (" + g_covFiles[g_runLoc.file] + ":" + std::to_string(g_runLoc.line) + ")";
@@ -287,6 +292,7 @@ struct Instr {
     // WaitEdge with dynWait: wait for a change of any signal `e` reads,
     // resolved when the wait starts (wait (cond) on automatic variables).
     bool dynWait = false;
+    mutable bool stmtCb = false;   // a VPI cbStmt waits for this instruction (38.36.1)
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
     // Dpi: the import, one entry per argument (arrays only), and the call's

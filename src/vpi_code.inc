@@ -714,3 +714,44 @@ inline const char* codeTypeName(int type) {
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
 }
+
+// ---- cbStmt (38.36.1) ----
+// A statement's code is found by its source line: the first instruction of
+// each run of instructions of that line, in every process and subroutine,
+// calls the callback. Two statements on one line share it.
+inline void onStmt(const Instr& i) {
+    auto& s = st();
+    auto it = s.stmtCbs.find({i.file, i.line});
+    if (it == s.stmtCbs.end()) return;
+    auto list = it->second;   // a callback may register or remove others
+    for (Cb* c : list) {
+        if (!c->live) continue;
+        s_cb_data d = c->d;
+        s_vpi_time t = c->t;
+        d.obj = H(c->obj);
+        d.time = c->hasT ? &t : nullptr;
+        d.value = nullptr;
+        if (c->hasT && t.type != vpiSuppressTime) fillTime(&t, c->obj, S.now);
+        d.cb_rtn(&d);
+    }
+}
+inline bool markStmt(const Obj* o, Cb* c) {
+    slang::SourceRange r = rangeOfCode(o);
+    if (!srcMgr() || !r.start().valid()) return false;
+    auto ol = srcMgr()->getFullyOriginalLoc(r.start());
+    uint32_t file = covFileId(std::string(srcMgr()->getFullPath(ol.buffer()).string()));
+    uint32_t line = (uint32_t)srcMgr()->getLineNumber(ol);
+    bool any = false;
+    for (const Prog* p : st().progs)
+        for (size_t k = 0; k < p->code.size(); k++) {
+            const Instr& i = p->code[k];
+            if (i.file != file || i.line != line) continue;
+            if (k == 0 || p->code[k - 1].file != file || p->code[k - 1].line != line) i.stmtCb = true;
+            any = true;
+        }
+    if (!any) return false;
+    st().stmtCbs[{file, line}].push_back(c);
+    g_stmtHook = onStmt;
+    g_hook = true;
+    return true;
+}
