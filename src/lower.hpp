@@ -5886,6 +5886,7 @@ struct Lowerer {
             out.push_back(name);
             return;
         }
+        if (isTaggedUnion(t)) { pfmtTagged(t, v, fmt, out); return; }
         if (t.kind == SymbolKind::PackedStructType || t.kind == SymbolKind::PackedUnionType) {
             fmt += "'{";
             bool first = true;
@@ -5912,10 +5913,42 @@ struct Lowerer {
         }
         unsupported("%p of this type");
     }
+    // A tagged union prints tag:value of the member its tag names (21.2.1.6),
+    // as '{M:v}; a void member prints as '{M}.
+    void pfmtTagged(const slang::ast::Type& t, E v, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        bool up = t.isUnpackedUnion();
+        int w = up ? uWidth(t) : (int)t.getBitWidth();
+        int tb = tagBitsOf(t);
+        E r = konst(mkstr("'{?}"));
+        std::vector<const FieldSymbol*> fs;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) fs.push_back(&f);
+        for (size_t k = fs.size(); k-- > 0;) {
+            const FieldSymbol& f = *fs[k];
+            const Type& mt = f.getType();
+            std::string sub = "'{" + escPct(std::string(f.name));
+            std::vector<E> subArgs;
+            if (!mt.isVoid()) {
+                int fw = up ? uWidth(mt) : (int)mt.getBitWidth();
+                sub += ":";
+                E part = slice(v, fw - 1, 0);
+                if (up) pfmtBits(mt, part, sub, subArgs);
+                else pfmtSingular(mt, mt.isSigned() ? resize(part, fw, false, true) : part, sub, subArgs);
+            }
+            sub += "}";
+            auto sf = node(Op::SFormat, std::move(subArgs));
+            sf->fmt = sub;
+            E cond = tb > 0 ? bin(Op::CaseEq, slice(v, w - 1, w - tb), konst(mk((uint64_t)k, tb))) : konst(mk(1, 1));
+            r = mux(cond, sf, r);
+        }
+        fmt += "%s";
+        out.push_back(r);
+    }
     // An unpacked struct prints with member names; a union, its first member (21.2.1.6).
     void pfmtStruct(const slang::ast::Type& t0, E v, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
         const Type& t = t0.getCanonicalType();
+        if (isTaggedUnion(t)) { pfmtTagged(t, v, fmt, out); return; }
         fmt += "'{";
         bool first = true;
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
