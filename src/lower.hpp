@@ -655,8 +655,8 @@ struct LowerResult {
     // in every time step (17.7.2). Signal, every step.
     std::vector<std::pair<int, bool>> freeVars;
     std::vector<std::unique_ptr<UdpTable>> udps;   // tables of the user-defined primitives (29)
-    struct TranDecl { int a, b; bool resist; };
-    std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive
+    struct TranDecl { int a, b; bool resist; int aLo = 0, bLo = 0, w = -1; };
+    std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive; w >= 0: only bits [aLo, aLo+w) of a and [bLo, bLo+w) of b
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
     std::string timescale() const {
@@ -10906,6 +10906,44 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
 
     // The child's formal signal. A null port (no internal connection) is skipped.
     struct Formal { int sig; int w; bool sgn; };
+    // An inout port on a constant bit or part select of a net (`.d0(dat[0])`),
+    // or on a whole net it does not collapse into (another net type): a switch between the internal net and those bits, so each side resolves
+    // the other's drivers (23.3.3.1) and neither holds the other's last value.
+    bool inoutTran(const slang::ast::PortSymbol& ps, const slang::ast::Expression& act0, const Formal& f) {
+        using namespace slang::ast;
+        const Expression& act = Lowerer::peel(act0);
+        if (act.kind != ExpressionKind::ElementSelect && act.kind != ExpressionKind::RangeSelect &&
+            act.kind != ExpressionKind::NamedValue && act.kind != ExpressionKind::HierarchicalValue)
+            return false;
+        auto simple = [](const Symbol& s) {
+            if (s.kind != SymbolKind::Net) return false;
+            const auto& n = s.as<NetSymbol>();
+            auto k = n.netType.netKind;
+            return n.getType().isIntegral() && !n.getDelay() && k != NetType::UserDefined && k != NetType::Interconnect &&
+                   k != NetType::TriReg && k != NetType::Unknown;
+        };
+        if (!ps.internalSymbol || !simple(*ps.internalSymbol)) return false;
+        const Expression* root = &act;
+        while (root->kind == ExpressionKind::ElementSelect || root->kind == ExpressionKind::RangeSelect)
+            root = root->kind == ExpressionKind::ElementSelect ? &root->as<ElementSelectExpression>().value()
+                                                               : &root->as<RangeSelectExpression>().value();
+        if (root->kind != ExpressionKind::NamedValue && root->kind != ExpressionKind::HierarchicalValue) return false;
+        if (!simple(root->as<ValueExpressionBase>().symbol)) return false;
+        if ((int)act.type->getBitWidth() != f.w) return false;
+        Lowerer lw(sigmap);
+        prep(lw);
+        Instr i;
+        lw.lhs(act, i);
+        if (i.arr || i.bidx || i.dyn >= 0 || !lw.prog.code.empty()) return false;   // a variable index
+        int id = (int)out.trans.size();
+        out.trans.push_back({f.sig, i.sig, false, 0, i.hi >= 0 ? i.lo : 0, f.w});
+        Instr t;
+        t.k = IK::Tran;
+        t.sig = id;
+        lw.prog.emit(t);
+        out.procs.push_back({std::move(lw.prog), false, "tran"});
+        return true;
+    }
     std::optional<Formal> portFormal(const slang::ast::PortSymbol& ps) {
         using namespace slang::ast;
         const Symbol* sym = ps.internalSymbol;
@@ -11121,6 +11159,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                     inoutCollapses(ps, act.as<ValueExpressionBase>().symbol) && aliasOf().count(ps.internalSymbol))
                     continue;
             }
+            if (ps.direction == ArgumentDirection::InOut && inoutTran(ps, asg.left(), *formal)) continue;
             if (Lowerer::peel(asg.left()).kind != ExpressionKind::Concatenation) linkFormal = formal->sig;
             driveActual(asg, *formal);
             linkFormal = -1;
