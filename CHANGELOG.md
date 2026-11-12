@@ -38,6 +38,10 @@ Spec references are IEEE 1800-2023 clauses.
   stay under it, and so does the git history. `docs/LICENSING.md` holds the
   open-core policy, the proposed free / paid split per tool, and the rule
   that no GPL or other copyleft code enters the tree.
+- Protected IP: the `-license <feature>` option is removed. It let the IP
+  user grant a licensed right to themselves; only the license proxy named by
+  the envelope decides now. `-license_fail stop|deny` chooses what happens
+  when no proxy can be reached.
 
 ### Added
 - `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
@@ -678,6 +682,18 @@ Spec references are IEEE 1800-2023 clauses.
   against 5.8 s. Build option `MINISIM_WITH_BSIM4`.
 - `mspice`: unknowns fixed by a voltage source to ground are eliminated
   first, which keeps the pivots of a long chain of gain stages usable.
+- Protected IP: the IEEE 1735-2023 clause 8 license system. `msim`, `mlint`
+  and `mdft` ask the IP author's license proxy over TLS for the value of a
+  `license(...)` or `license_string(...)` call in a right (`src/licproxy.hpp`).
+  See "Licenses" in `docs/PROTECT.md`.
+- Protected IP, IEEE 1735-2023 5.2, 9.3, 9.4, 9.9 and Annex A checked rule
+  by rule (in `test_protect`): strings without `\` or control
+  characters, lower-case keywords (`` `pragma protect BEGIN `` is an error
+  instead of leaving the source in the clear), key names and rights that
+  differ only in case, end-of-file characters inside an envelope, strict
+  BASE64_TEXT, what tool and common blocks may hold, and viewport lists with
+  `.` or `:` scoped names. Clear modules instantiated in or bound into
+  protected IP are hidden from waveforms, coverage and lint output.
 
 ### Fixed
 - msim memory on big VIP benches: a 2-state unpacked array with more than
