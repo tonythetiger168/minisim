@@ -57,6 +57,9 @@ struct CgBinDef {
 struct CgCpDef {
     std::string name;
     E expr, iff;
+    // Temporaries the expression and iff read, set first at each sample
+    // (an element of a container property through a handle: tr.data[0]).
+    std::vector<std::pair<int, E>> pre, preIff;
     int w = 1;
     bool sgn = false;
     std::vector<std::pair<std::string, uint64_t>> enumVals;   // an enum coverpoint's values

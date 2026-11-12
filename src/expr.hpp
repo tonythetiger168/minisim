@@ -1435,6 +1435,7 @@ enum SysFnId : int {
     SF_OBJ_GETSTATE, // obj.get_randstate(): the generator state as a string
     SF_OBJ_SETSTATE, // obj.set_randstate(state)
     SF_CG,           // a covergroup operation (19): lo is the CgOp, run by g_cgHook
+    SF_COVAPI,       // $coverage_control/get_max/get/save/merge (20.13, 40.3.2): lo picks one, run by g_covApiHook
     // Power-aware simulation (IEEE 1801-2024), run by g_upfHook: a function of
     // package UPF (lo = UpfOp), or a strategy cell on a port connection
     // (lo = UPF_ISO / UPF_LS with the cell's index above the low 8 bits).
@@ -1472,6 +1473,9 @@ inline Val (*g_upfHook)(int op, const std::vector<Val>& a) = nullptr;
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
 enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
 inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
+// 40.3.2: lo 0 control, 1 get_max, 2 get, 3 save, 4 merge. With no hook
+// (no design data) every call answers SV_COV_NOCOV (0).
+inline Val (*g_covApiHook)(int op, const std::vector<Val>& a) = nullptr;
 inline void (*g_sdfHook)(const std::vector<std::string>& a) = nullptr;
 // How %t prints (20.4.3). A %t argument arrives in kernel ticks (10^tickExp s).
 // The default units are the simulation precision, with no decimals, no
@@ -2241,6 +2245,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         case SF_FERROR: return sint(0);
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
         case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
+        case SF_COVAPI: return g_covApiHook ? g_covApiHook(ctl, a) : make(0, 0, 32, 0, true);
         case SF_UPF: return g_upfHook ? g_upfHook(ctl, a) : make(0, 0, 1, 0);
         case SF_SDF: {
             std::vector<std::string> args;
