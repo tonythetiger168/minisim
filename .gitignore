@@ -1,5 +1,6 @@
 build/
 *.vcd
+*.evcd
 *.o
 .vscode/
 .idea/
