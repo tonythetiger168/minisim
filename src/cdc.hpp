@@ -2747,6 +2747,12 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
             }
     }
 
+    // set_case_analysis 0/1: the signal is constant, like -static.
+    for (const sdc::CaseAnalysis& ca : rd.sdc.caseAnalysis)
+        if (ca.value == "0" || ca.value == "1" || ca.value == "zero" || ca.value == "one")
+            for (const sdc::Obj& o : ca.objects)
+                if (Sym c = view.at(o)) m.statics.insert(c);
+
     // Ports: set_input_delay -clock C says a flop clocked by C (outside the
     // design) launches the input, set_output_delay -clock C that one captures
     // the output. Each becomes a flop of that clock on the port, so a path

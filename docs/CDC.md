@@ -102,6 +102,7 @@ mlint rtl/*.sv -top soc_top -sdc soc_top.sdc -cdc-report
 | `set_clock_groups -asynchronous` | The groups are asynchronous to each other: paths between them are crossings. One `-group` alone is against every other clock |
 | `set_clock_groups -logically_exclusive`, `-physically_exclusive` | The clocks are never there together (a functional and a test clock on one mux): paths between them are not checked |
 | `set_input_delay -clock c`, `set_output_delay -clock c` on a port | A flop of clock `c` outside the design launches the input, or captures the output. Inputs and outputs get a domain, so an input read without a synchronizer, or an output launched on another clock, is a crossing. A virtual clock (no source) is a domain of its own |
+| `set_case_analysis 0` / `1` | The signal is constant, as with `-static`: its crossings are not reported, and a clock mux it selects is not CDC008 |
 | `set_false_path -from [get_clocks a] -to [get_clocks b]` | Timing no longer covers the path, so `a` and `b` are asynchronous and it needs a synchronizer |
 | Any other pair of clocks | Synchronous, as for timing: no crossing |
 

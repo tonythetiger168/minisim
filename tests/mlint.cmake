@@ -140,11 +140,12 @@ foreach(want
     message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_none.sdc missing: ${want}\n${out}")
   endif()
 endforeach()
-# set_clock_groups: A against B only; exclusive clocks are no crossing.
+# set_clock_groups: A against B only; exclusive clocks are no crossing, and
+# set_case_analysis makes the clock mux select constant (no CDC008).
 run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_groups.sdc")
 if(NOT out MATCHES "'cdc_sdc.a0' \\(clocked by cdc_sdc.aclk\\) is read by logic clocked by cdc_sdc.bclk"
    OR NOT out MATCHES "'cdc_sdc.d0' \\(clocked by cdc_sdc.div2\\) is read by logic clocked by cdc_sdc.bclk"
-   OR NOT out MATCHES "3 findings \\(CDC001 2, CDC008 1\\)")
+   OR NOT out MATCHES "2 findings \\(CDC001 2\\)")
   message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_groups.sdc:\n${out}")
 endif()
 # A false path between two clocks makes that pair asynchronous.
