@@ -11,7 +11,7 @@ if(NOT rc EQUAL 0)
   message(FATAL_ERROR "msim -do exited ${rc}: ${err}\n${out}")
 endif()
 foreach(want
-    "tb.cnt = 8'bxxxxxxxx\n"
+    "tb.cnt = 8'h0\n"
     "tb.none = null\n"
     "stop 1 set on tb.cnt\n"
     "time 5: stop 2: tb.clk = 1'h1\n"

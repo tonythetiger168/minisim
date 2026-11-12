@@ -1,0 +1,44 @@
+UPF: 0: supply VDD = FULL_ON 1 V
+UPF: 0: power domain PD0 power state OFF
+UPF: 0: power domain PD1 power state OFF
+UPF: 0: power state group CLUSTER power state NONE
+UPF: 0: power domain PD_TOP simstate CORRUPT
+UPF: 0: power domain PD0 simstate CORRUPT
+UPF: 0: power domain PD1 simstate CORRUPT
+UPF: 0: supply VSS = FULL_ON 0 V
+UPF: 0: supply set SS: state transition up (OFF -> ON)
+UPF: 0: supply set SS power state ON (NORMAL)
+UPF: 0: power domain PD_TOP simstate NORMAL
+UPF: 0: power domain PD0 simstate NORMAL
+UPF: 0: power domain PD1 simstate NORMAL
+UPF error: 0: power state group CLUSTER is in illegal power state NONE
+UPF: 1: power domain PD0 power state RUN
+UPF: 1: power domain PD0: state transition turn_on (OFF -> RUN)
+UPF: 1: power state group CLUSTER power state ONE
+UPF: 2: power domain PD0 power state SLEEP
+UPF: 2: power domain PD0: state transition suspend (RUN -> SLEEP)
+UPF: 3: power domain PD0 power state RUN
+UPF: 3: power domain PD0: state transition resume (SLEEP -> RUN)
+UPF: 4: power domain PD1 power state RUN
+UPF: 4: power domain PD1: state transition power (OFF -> RUN)
+UPF: 4: power state group CLUSTER power state BOTH
+UPF: 4: power state group CLUSTER: state transition more (ONE -> BOTH)
+UPF: 5: power domain PD0 power state OFF
+UPF: 5: power domain PD0: state transition turn_off (RUN -> OFF)
+UPF: 5: power state group CLUSTER power state ONE
+UPF: 5: power state group CLUSTER: state transition less (BOTH -> ONE)
+UPF: 6: power domain PD0 power state SLEEP
+UPF error: 6: power domain PD0: illegal state transition no_wake_to_sleep (OFF -> SLEEP)
+UPF: 6: power state group CLUSTER power state BOTH
+UPF: 6: power state group CLUSTER: state transition more (ONE -> BOTH)
+UPF: 7: power domain PD0 power state UNDEFINED
+UPF: 8: power domain PD0 power state RUN
+UPF: 8: power domain PD0: state transition resume (SLEEP -> RUN)
+UPF: 9: power domain PD1 power state SLEEP
+UPF error: 9: power domain PD1: state transition RUN -> SLEEP is not defined (-complete)
+UPF: 10: power domain PD0 power state OFF
+UPF: 10: power domain PD0: state transition turn_off (RUN -> OFF)
+UPF: 10: power domain PD1 power state OFF
+UPF: 10: power domain PD1: state transition power (SLEEP -> OFF)
+UPF: 10: power state group CLUSTER power state NONE
+UPF error: 10: power state group CLUSTER is in illegal power state NONE
