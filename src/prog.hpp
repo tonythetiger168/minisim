@@ -105,6 +105,10 @@ inline void (*g_stmtHook)(const Instr&) = nullptr;
 // VPI cbError (38.36.3): called with the format of each run-time error
 // message ($error, $fatal, a failed assertion or $cast) as it is printed.
 inline void (*g_errHook)(const std::string&) = nullptr;
+// VPI cbCreateObj / cbSizeChange (38.36.1): a class object was made (its
+// first signal), a container's size changed (its handle signal).
+inline void (*g_newObjHook)(int obj) = nullptr;
+inline void (*g_sizeHook)(int sig) = nullptr;
 inline std::string runLocStr() {
     if (!g_runLoc.line || g_runLoc.file >= g_covFiles.size()) return "";
     return " (" + g_covFiles[g_runLoc.file] + ":" + std::to_string(g_runLoc.line) + ")";

@@ -32,6 +32,9 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI `cbCreateObj` and `cbSizeChange` (38.36.1); the save, restart and
+  reset callback reasons register (msim has no save, so they never run).
+  `tests/spec/38.36-vpi-sv-callbacks.sv`.
 - VPI constraints (37.31): `vpi_iterate(vpiConstraint, class)`, the items of
   each block (expressions, implication, if / if-else, foreach, disable soft,
   solve before), and pure virtual prototypes in `vpiMethods`.

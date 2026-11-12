@@ -299,6 +299,17 @@ inline void dynExec(const Instr& i) {
     const int dres = i.dres >= 0 ? R(i.dres) : -1, dkey = i.dkey >= 0 ? R(i.dkey) : -1;
     if (i.dcmd != D_DELETE && i.dcmd != D_DELETE_AT && i.dcmd != D_FIRST && i.dcmd != D_LAST && i.dcmd != D_NEXT && i.dcmd != D_PREV)
         dynAttach(sig);   // a write to an element container made by a read: it joins its array now
+    // VPI cbSizeChange: compare the size before and after this command.
+    struct SizeWatch {
+        int sig = -1;
+        size_t n = 0;
+        static size_t size(int s) {
+            auto it = dynStore().find(s);
+            return it == dynStore().end() ? 0 : it->second.kind == 2 ? it->second.map.size() : it->second.vec.size();
+        }
+        ~SizeWatch() { if (sig >= 0 && size(sig) != n) g_sizeHook(sig); }
+    } watch;
+    if (__builtin_expect(g_sizeHook != nullptr, 0)) { watch.sig = sig; watch.n = SizeWatch::size(sig); }
     auto& d = dynStore()[sig];
     auto arg = [&](size_t n) { return eval(i.args[n], rd); };
     auto idx = [&](size_t n) { Val v = arg(n); return v.x ? (int64_t)-1 : v_to_i64(v); };
@@ -478,6 +489,7 @@ inline void newObject(const Instr& i) {
     if (src) objRng()[obj] = objRng()[src];
     else { uint64_t a = urandomNext(urandomState()), b = urandomNext(urandomState()); objRng()[obj] = seedState(a << 32 | b); }
     S.set(R(i.sig), make((uint64_t)obj, 0, 64));
+    if (__builtin_expect(g_newObjHook != nullptr, 0)) g_newObjHook(obj);
 }
 
 struct JoinState {

@@ -121,6 +121,7 @@ struct State {
     std::vector<Cb*> holdCbs;             // cbForce, cbRelease, cbAssign, cbDeassign (38.36.1)
     std::map<std::pair<uint32_t, uint32_t>, std::vector<Cb*>> stmtCbs;   // cbStmt: by source file id and line
     std::vector<Cb*> tchkCbs;             // cbTchkViolation (38.36.1)
+    std::vector<Cb*> createCbs, sizeCbs;  // cbCreateObj, cbSizeChange (38.36.1)
     std::vector<Cb*> errCbs;              // cbError, cbPLIError (38.36.3)
     bool inErrCb = false;
     std::vector<Cb*> nbaCbs, endSlot;     // cbNBASynch, cbAtEndOfSimTime of this time slot (38.36.2)
@@ -157,6 +158,8 @@ inline Obj* mkObj(Obj::Kind k, int type) {
 inline void clearErr() { st().err = false; }
 inline void fireErrorCbs(int reason);
 inline void onTchk(int id);
+inline void onNewObj(int obj);
+inline void onSizeChange(int sig);
 inline void error(int level, const std::string& msg) {
     auto& s = st();
     s.err = true;
@@ -1845,6 +1848,31 @@ vpiHandle vpi_register_cb(p_cb_data d) {
             s.tchkCbs.push_back(c);
             g_tchkHook = vpi::onTchk;
             break;
+        case cbCreateObj:   // 38.36.1: a class object is made (obj NULL: any; a class definition: its objects)
+            if (c->obj && c->obj->kind != Obj::ClassDefn) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbCreateObj needs NULL or a class definition handle");
+                return nullptr;
+            }
+            s.createCbs.push_back(c);
+            g_newObjHook = vpi::onNewObj;
+            break;
+        case cbSizeChange:   // 38.36.1: a dynamic array, queue or associative array changes size
+            if (!c->obj || c->obj->kind != Obj::Dyn) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbSizeChange needs a dynamic array, queue or associative array handle");
+                return nullptr;
+            }
+            s.sizeCbs.push_back(c);
+            g_sizeHook = vpi::onSizeChange;
+            break;
+        case cbStartOfSave:
+        case cbEndOfSave:
+        case cbStartOfRestart:
+        case cbEndOfRestart:
+        case cbStartOfReset:
+        case cbEndOfReset:   // 38.36.2: msim has no save, restart or reset, so these never fire
+            break;
         case cbError:
         case cbPLIError:   // 38.36.3
             s.errCbs.push_back(c);
@@ -2104,6 +2132,7 @@ inline const char* typeName(int type) {
 #include "vpi_tchk.inc"
 #include "vpi_prim.inc"
 #include "vpi_constr.inc"
+#include "vpi_svcb.inc"
 }   // namespace vpi
 extern "C" {
 

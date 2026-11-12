@@ -56,6 +56,7 @@ set(MINISIM_CORE_HEADERS
     vpi_data.inc
     vpi_prim.inc
     vpi_constr.inc
+    vpi_svcb.inc
     vpi_tchk.inc
     wave_reader.hpp)
 
