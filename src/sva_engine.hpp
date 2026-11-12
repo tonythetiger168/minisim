@@ -664,7 +664,7 @@ struct ConcAssert {
     // attempts have equal terms and the store does not grow with the values.
     using Envs = std::shared_ptr<const std::vector<std::vector<Val>>>;
     // wait: an expect statement's process, resumed with the verdict (16.17).
-    struct Attempt { const sva::Node* t; bool nonvac; uint64_t count; uint64_t killGen; Caps caps; Envs envs = nullptr; std::shared_ptr<void> wait = nullptr; };
+    struct Attempt { const sva::Node* t; bool nonvac; uint64_t count; uint64_t killGen; Caps caps; Envs envs = nullptr; std::shared_ptr<void> wait = nullptr; uint64_t start = 0; };
     std::vector<Attempt> att;
     // Procedural instances (16.14.6): pending ones on the process that queued
     // them (dropped at its next flush point), and matured ones waiting for
@@ -690,6 +690,12 @@ struct ConcAssert {
     std::vector<std::pair<std::vector<std::pair<int, Edge>>, E>> more;
     uint32_t ticked = 0;   // runtime: the clocks that ticked in this time step
     bool due = false;      // runtime: a step is waiting for the observed region
+    // An assume set of a checker (17.7.2): at each tick of its clock, before
+    // the observed region, the active free variables solveVars take random
+    // values, tried again while solveOk (the assumptions' checks in this time
+    // step) is false, up to a limit; an unsuccessful attempt keeps the last.
+    std::vector<int> solveVars;
+    E solveOk;
     std::vector<int> matchFlags;
     std::vector<int> clearFlags;   // .matched flags this assertion reads: cleared after each of its ticks
 };

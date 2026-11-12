@@ -99,6 +99,18 @@ inline SrcLoc g_runLoc;   // the statement running now, for run-time error messa
 inline std::string runLocStr();
 inline std::vector<std::string> g_covFiles{""};   // file id -> path; 0 = unknown
 inline bool g_cov = false;
+// VPI cbStmt (38.36.1): with g_hook set, the interpreter calls g_stmtHook
+// on each instruction marked stmtCb.
+struct Instr;
+inline bool g_hook = false;
+inline void (*g_stmtHook)(const Instr&) = nullptr;
+// VPI cbError (38.36.3): called with the format of each run-time error
+// message ($error, $fatal, a failed assertion or $cast) as it is printed.
+inline void (*g_errHook)(const std::string&) = nullptr;
+// VPI cbCreateObj / cbSizeChange (38.36.1): a class object was made (its
+// first signal), a container's size changed (its handle signal).
+inline void (*g_newObjHook)(int obj) = nullptr;
+inline void (*g_sizeHook)(int sig) = nullptr;
 // msim -cm_cond (as VCS): full = every combination of the term values of a
 // condition (up to 8 terms), not only the sensitized vectors; allops = also
 // & and | on one-bit operands.
@@ -154,7 +166,14 @@ struct FsmDef {
 };
 inline std::vector<FsmDef>& fsmDefs() { static std::vector<FsmDef> d; return d; }
 // Relaxed atomic add: a task body can run on two worker threads at once.
-inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
+// Coverage paused by VPI (40.5): bit 0 statements and branches, bit 1
+// toggles, bit 2 FSM states (vpiCoverageStop / vpiCoverageStart).
+inline int g_covStop = 0;
+inline void covHit(uint64_t& c) {
+    if (!(g_covStop & 1)) __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED);
+}
+// The database a VPI vpiCoverageSave writes (40.5.1): set by msim.
+inline bool (*&covSaveHook())(const std::string&) { static bool (*f)(const std::string&) = nullptr; return f; }
 
 // ---- DPI-C (IEEE 1800-2023 clause 35, annex H) ----
 // How a value is passed to or from C (35.5.6, H.7). A packed type is passed
@@ -302,6 +321,7 @@ struct Instr {
     // WaitEdge with dynWait: wait for a change of any signal `e` reads,
     // resolved when the wait starts (wait (cond) on automatic variables).
     bool dynWait = false;
+    mutable bool stmtCb = false;   // a VPI cbStmt waits for this instruction (38.36.1)
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
     // Dpi: the import, one entry per argument (arrays only), and the call's
@@ -423,6 +443,7 @@ struct Prog {
     int pd = -1;           // UPF power domain, -1 for none (initial blocks are never gated, 9.2.1)
     bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
     std::vector<Instr> code;
+    const void* inst = nullptr;   // msim -cov: the instance it runs in (slang InstanceSymbol), for VPI (40)
     uint32_t covInst = 0;  // g_covInsts: the instance it was lowered in (per-instance coverage)
     // msim -xprop, a clocked block with a clean copy: code[1] tests for an
     // ambiguous clock edge and otherwise jumps here. A clocked function
@@ -433,6 +454,12 @@ struct Prog {
     // fork branch that is a named block, every branch of a named fork).
     // `disable` of one of them from another process ends the process.
     std::vector<int> roots;
+    // Named blocks and tasks some `disable` names (9.6.2): code [s, e) is
+    // block id, and a process there resumes at e when it is disabled. A
+    // task's whole body is one span with e = SIZE_MAX: its caller resumes
+    // after the call.
+    struct Span { int id; size_t s, e; };
+    std::vector<Span> spans;
     // A static combinational process with deferred assertions (a unique
     // case's violation check): the ProcCtl its reports are queued under.
     // Each evaluation is a flush point (16.4.2), as the wait of the process is.
@@ -445,6 +472,9 @@ struct Prog {
     }
     size_t here() const { return code.size(); }
 };
+
+// Some Prog has spans: processes are tracked for disable (9.6.2).
+inline bool& anySpans() { static bool b = false; return b; }
 
 // ---- helpers shared by lowering and tests ----
 // Signals an expression reads, each once, in first-read order. A variable
@@ -647,7 +677,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
     const Instr& w = p.code[n - 2];
     const Instr& j = p.code[n - 1];
     if (j.k != IK::Jmp || j.target != 0 || w.k != IK::WaitEdge) return false;
-    if (!p.roots.empty()) return false;  // another process can `disable` it
+    if (!p.roots.empty() || !p.spans.empty()) return false;  // another process can `disable` it
     c = CombShape{};
     for (size_t i = 0; i + 2 < n; i++) {
         // An always_comb with if / case / loops: jumps that stay in the body.
@@ -811,7 +841,7 @@ inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
     const Instr& w = p.code[0];
     const Instr& j = p.code[n - 1];
     if (w.k != IK::WaitEdge || j.k != IK::Jmp || j.target != 0) return false;
-    if (!p.roots.empty()) return false;  // another process can `disable` it
+    if (!p.roots.empty() || !p.spans.empty()) return false;  // another process can `disable` it
     for (size_t i = 1; i + 1 < n; i++) {
         const Instr& x = p.code[i];
         if (x.k == IK::Nba) {

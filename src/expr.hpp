@@ -1463,8 +1463,17 @@ enum SysFnId : int {
     // negedge << 1 | level (the body tests the signal's level). 1 when an
     // edge that happened in this time step went from or to x / z and none
     // certainly happened.
-    SF_XPROP_EDGE
+    SF_XPROP_EDGE,
+    SF_ANNEXD,           // Annex D optional tasks and functions: lo is the AnnexOp, run by g_annexHook
+    SF_VALUE_WIDTH       // the width in bits of kid0's value, which may be known only at run time (a stream)
 };
+// Annex D (annexd.inc): $countdrivers (kid0 the net signal, kid1 the bit;
+// AD_COUNT_GET k reads count k of the last call), $log / $nolog, $key /
+// $nokey, $input, $reset / $reset_count / $reset_value, $save / $incsave /
+// $restart.
+enum AnnexOp : int { AD_COUNT, AD_COUNT_GET, AD_LOG, AD_NOLOG, AD_KEY, AD_NOKEY, AD_INPUT,
+                     AD_RESET, AD_RESET_COUNT, AD_RESET_VALUE, AD_SAVE, AD_INCSAVE, AD_RESTART };
+inline Val (*g_annexHook)(int op, const std::vector<Val>& a) = nullptr;
 // The kernel's answer for one event (0 no edge now, 1 a certain edge, 2 an ambiguous one).
 inline int (*g_edgeClass)(int sig, bool neg, bool level) = nullptr;
 enum UpfOp : int { UPF_SUPPLY_ON, UPF_SUPPLY_OFF, UPF_SUPPLY_PARTIAL_ON, UPF_SET_SUPPLY_STATE, UPF_SET_POWER_STATE,
@@ -2245,6 +2254,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
         case SF_FERROR: return sint(0);
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
         case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
+        case SF_ANNEXD: return g_annexHook ? g_annexHook(ctl, a) : sint(0);
         case SF_COVAPI: return g_covApiHook ? g_covApiHook(ctl, a) : make(0, 0, 32, 0, true);
         case SF_UPF: return g_upfHook ? g_upfHook(ctl, a) : make(0, 0, 1, 0);
         case SF_SDF: {
@@ -2253,6 +2263,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             if (g_sdfHook) g_sdfHook(args);
             return sint(0);
         }
+        case SF_VALUE_WIDTH: return mk((uint64_t)a[0].w, 32);
         case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();
@@ -2821,9 +2832,24 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::Slice: return v_slice(k(0), e->hi, e->lo);
         case Op::Index: return v_index(k(0), k(1));
         case Op::Concat: {
-            std::vector<Val> parts;
-            for (size_t i = 0; i < e->kids.size(); i++) parts.push_back(k((int)i));
-            return v_concat(parts);
+            // Up to 64 bits (the usual case) the result is built in place, the
+            // way v_concat does it: no vector and no allocation.
+            size_t n = e->kids.size();
+            Val r{0, 0, 0};
+            for (size_t i = 0; i < n; i++) {
+                Val p = k((int)i);
+                if (r.w + p.w > 64) {
+                    std::vector<Val> parts;
+                    parts.reserve(n - i + 1);
+                    if (r.w > 0) parts.push_back(std::move(r));
+                    parts.push_back(std::move(p));
+                    for (i++; i < n; i++) parts.push_back(k((int)i));
+                    return v_concat(parts);
+                }
+                uint64_t rv = p.w >= 64 ? 0 : r.v << p.w, rx = p.w >= 64 ? 0 : r.x << p.w, rz = p.w >= 64 ? 0 : r.z << p.w;
+                r = make(rv | p.v, rx | p.x, r.w + p.w, rz | p.z);
+            }
+            return r;
         }
         case Op::Mux: {   // only the selected operand is evaluated (11.4.11); an unknown condition merges both
             Val c = k(0);

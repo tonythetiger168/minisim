@@ -29,9 +29,13 @@
 //                    pulse styles of every path output (30.7.4)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
 //   -vcd-arrays [N]  also write unpacked array elements (arrays of up to N, default 1024)
+//   -vcd-class [N]   also write class objects through handle variables (h.addr), N levels
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
+//   -profile [<file>] time every process and region and write a report
+//                    (default simprofile.txt): busiest processes, time per
+//                    instance, file and kind. Runs the interpreter on one thread.
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -160,6 +164,8 @@
 #include "upf_rt.inc"
 #include "dpi.inc"
 #include "vpi.inc"
+#include "interactive.inc"
+#include "objview.inc"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -369,7 +375,7 @@ static void inlineCombCalls(LowerResult& lowered) {
     };
     // A body that is only assignments, forward branches, deferred assertions and such calls.
     std::function<bool(const Prog&, int)> okBody = [&](const Prog& c, int depth) {
-        if (depth > 16 || !c.roots.empty()) return false;
+        if (depth > 16 || !c.roots.empty() || !c.spans.empty()) return false;   // spans: a disable finds it by its own code (9.6.2)
         for (size_t pc = 0; pc < c.code.size(); pc++) {
             const Instr& i = c.code[pc];
             if (i.k == IK::Jmp || i.k == IK::JmpIfNot) {
@@ -513,7 +519,7 @@ static void inlineCombCalls(LowerResult& lowered) {
         if (lp.program >= 0 || lp.reactive) continue;
         const Prog& p = lp.prog;
         size_t n = p.code.size();
-        if (n < 3 || !p.roots.empty() || p.code[n - 1].k != IK::Jmp || p.code[n - 1].target != 0 || p.code[n - 2].k != IK::WaitEdge) continue;
+        if (n < 3 || !p.roots.empty() || !p.spans.empty() || p.code[n - 1].k != IK::Jmp || p.code[n - 1].target != 0 || p.code[n - 2].k != IK::WaitEdge) continue;
         bool calls = false, ok = true;
         for (size_t pc = 0; pc + 2 < n && ok; pc++) {
             const Instr& i = p.code[pc];
@@ -1002,12 +1008,12 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
-                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
                     : std::any_of(asserts().begin(), asserts().end(), [](const AssertInfo& a) {
                           return a.hidden || (a.type & (AT_CONCURRENT | AT_FINAL | AT_EXPECT));
                       }) ? "a concurrent, final or expect assertion"
                     : !clockings().empty() ? "a clocking block"
                     : !cgDefs().empty() ? "a covergroup"
+                    : annexDUsed() ? "an Annex D system task"
                     : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -1017,7 +1023,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         // With a VCD every signal must live in S.sigs, so no private signals.
         // A large design is built as several files at once, one per core (16 at most).
         src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr,
-                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()));
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale());
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -1725,6 +1731,7 @@ static void usage() {
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
+                 "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -1735,11 +1742,17 @@ static void usage() {
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -vcd-arrays [N]  also write unpacked array elements (memories) of up to N\n"
                  "                 elements each (default 1024) to the VCD or FST, as mem[3]\n"
+                 "  -vcd-class [N]  also write the properties of the object each class handle\n"
+                 "                 variable points to, as h.addr (x while h is null); handle\n"
+                 "                 properties are followed N levels (default 1)\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov. -cm <metrics> (as VCS) does the same\n"
                  "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
                  "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
+                 "  -i             interactive: run, step, stop on a signal, print (signals and class objects),\n"
+                 "                 force, release, deposit; commands on the standard input (help lists them)\n"
+                 "  -do <file>     the same, with the commands from a file; then the run goes on to its end\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
                  "                 and reuses <dir>/simv while the design is unchanged\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
@@ -1766,6 +1779,7 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+    annexStartup(argc, argv);   // $reset / $restart run msim again (Annex D)
     std::atexit([] { g_framesDead = true; });   // before the kernel's waiting processes are destroyed
     for (int sg : {SIGSEGV, SIGABRT})
         std::signal(sg, [](int) {   // say where, then stop
@@ -1778,10 +1792,13 @@ int main(int argc, char** argv) {
     std::vector<std::string> plusargs;
     uint64_t seed = 0;
     std::optional<std::string> vcdPath;
+    int vcdClass = 0;   // -vcd-class [N]
     std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
     bool saifTmp = false;   // ...and the waveform was only written for that
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
+    bool interactiveMode = false;   // -i / -do FILE
+    std::string doPath;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
     bool threadsGiven = false;
@@ -1809,6 +1826,8 @@ int main(int argc, char** argv) {
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
         if (a == "-compile") { compiled = true; continue; }
+        if (a == "-i" || a == "-ucli") { interactiveMode = true; continue; }
+        if (a == "-do") { doPath = next("a command file"); interactiveMode = true; continue; }
         if (a == "-no-static-comb") { staticComb = false; continue; }
         if (a == "-no-static-seq") { staticSeq = false; continue; }
         if (a == "-no-partition") { staticPart = false; continue; }
@@ -1901,6 +1920,11 @@ int main(int argc, char** argv) {
             saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
             continue;
         }
+        if (a == "-profile") {   // profile.hpp
+            prof::P().on = true;
+            if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".txt")) prof::P().path = argv[++i];
+            continue;
+        }
         if (a == "-cov") {
             g_cov = true;
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
@@ -1924,6 +1948,13 @@ int main(int argc, char** argv) {
                 }
                 v = p == std::string_view::npos ? std::string_view() : v.substr(p + 1);
             }
+            continue;
+        }
+        // -vcd-class [N]: class objects through handle variables, N levels deep (default 1).
+        if (a == "-vcd-class" || a == "-fst-class") {
+            vcdClass = 1;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                vcdClass = std::max(1, std::atoi(argv[++i]));
             continue;
         }
         // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.
@@ -2247,6 +2278,14 @@ int main(int argc, char** argv) {
     }
 
     for (int id : hiddenSigs()) S.sigs[(size_t)id].hide = true;
+    // With protected IP in the design, the lowering's temporaries (_tf...)
+    // stay out of the waveform: one may hold a value computed inside the IP
+    // (an argument of the IP's own system task call).
+    if (hideSigIf())
+        for (auto& g : S.sigs) {
+            size_t dot = g.name.rfind('.');
+            if (g.name.compare(dot == std::string::npos ? 0 : dot + 1, 3, "_tf") == 0) g.hide = true;
+        }
 
     // DPI-C (35): write the header, build the C code and the export stubs,
     // load the libraries, and resolve the imports.
@@ -2296,6 +2335,10 @@ int main(int argc, char** argv) {
         if (!ok) { std::cerr << "msim: DPI: " << err << "\n"; return 1; }
         compiled = false;   // -compile does not run DPI calls yet
     }
+    if (compiled && interactiveMode) {
+        std::cerr << "msim: -compile: the interactive mode is not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
     if (compiled && (!pathRecs().empty() || !sdfRequests().empty() || sdfAtRunTime())) {
         std::cerr << "msim: -compile: specify path delays and SDF annotation are not compiled yet; using the interpreter\n";
         compiled = false;
@@ -2320,8 +2363,26 @@ int main(int argc, char** argv) {
     if ((!sdfRequests().empty() || sdfAtRunTime()) && !gateRecs().empty()) staticComb = staticSeq = false;
     // Paths, SDF and gate delays (30-32) act on drivers; tran and net kinds
     // resolve them: those designs keep every driver.
+    // $dumpports (21.7.4.3) tells which side of a port drives it: every
+    // continuous driver keeps its slot, and its instance is recorded.
+    bool dumpPorts = false;
+    {
+        auto scan = [&](const Prog& p) {
+            for (const Instr& i : p.code) if (i.k == IK::Dump && i.dcmd == DC_PORTS) dumpPorts = true;
+        };
+        for (auto& lp : lowered.procs) scan(lp.prog);
+        for (auto& sp : lowered.subs) if (sp) scan(*sp);
+        if (dumpPorts)
+            for (auto& lp : lowered.procs)
+                for (const Instr& i : lp.prog.code) {
+                    if (i.k != IK::Assign || i.drv < 0 || i.sig < 0 || (size_t)i.sig >= S.sigs.size()) continue;
+                    auto& v = S.drvScope[i.sig];
+                    if (v.size() <= (size_t)i.drv) v.resize((size_t)i.drv + 1);
+                    v[(size_t)i.drv] = lp.scope;
+                }
+    }
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
-        gateRecs().empty())
+        gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
@@ -2335,10 +2396,18 @@ int main(int argc, char** argv) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
         compiled = false;
     }
+    if (compiled && prof::P().on) {
+        std::cerr << "msim: -compile: -profile times the interpreter; using it\n";
+        compiled = false;
+    }
     bool anyReactive = false;
     for (auto& lp : lowered.procs) anyReactive |= lp.reactive;
     if (compiled && (lowered.programs || anyReactive)) {
         std::cerr << "msim: -compile: programs and checkers are not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
+    if (compiled && vcdClass) {
+        std::cerr << "msim: -compile: -vcd-class needs the interpreter; using it\n";
         compiled = false;
     }
     if (compiled) {
@@ -2357,6 +2426,10 @@ int main(int argc, char** argv) {
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
     for (auto& [s, d] : lowered.netDelays) S.netDelay[s] = d;
+    for (auto& t : lowered.trireg) {   // 28.16.2, Annex E
+        if (t.charge != STR_MEDIUM) S.charge[t.sig] = t.charge;
+        if (t.decays) S.decay[t.sig] = Sim::Decay{t.decay, 0, true};
+    }
     for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
@@ -2385,6 +2458,29 @@ int main(int argc, char** argv) {
     // core, unless -threads was given.
     if (!threadsGiven && threads > 1 && vcdPath && vcdPath->ends_with(".fst")) threads--;
     S.threads = threads;
+    // msim -profile: one thread, so that the times add up, and one entry per process.
+    auto profEnt = [&](const LoweredProc& lp) {
+        std::string loc;
+        for (const Instr& in : lp.prog.code)
+            if (in.line) {
+                loc = (in.file < g_covFiles.size() ? g_covFiles[in.file] : std::string("?")) + ":" + std::to_string(in.line);
+                break;
+            }
+
+        // The kinds as they are written in the source.
+        static const std::map<std::string, std::string> kinds = {
+            {"Always", "always"}, {"AlwaysFF", "always_ff"}, {"AlwaysComb", "always_comb"},
+            {"AlwaysLatch", "always_latch"}, {"Initial", "initial"}, {"Final", "final"},
+            {"init", "initializers"}, {"assign", "assign"}};
+        auto k = kinds.find(lp.kind);
+        std::string top = S.vcdTop.empty() ? std::string("top") : S.vcdTop;
+        if (!lp.port.empty()) {   // a port connection: counted in the instance whose port it is
+            size_t dot = lp.port.rfind('.');
+            return prof::P().add("port " + lp.port.substr(dot + 1), top + "." + lp.port.substr(0, dot), "");
+        }
+        return prof::P().add(k == kinds.end() ? lp.kind : k->second, lp.scope.empty() ? top : top + "." + lp.scope, loc);
+    };
+    if (prof::P().on) { S.threads = 1; staticPart = false; prof::P().t0 = std::chrono::steady_clock::now(); }
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
         if (pl.rank[i] >= 0) byRank[pl.rank[i]] = (int)i;
@@ -2393,24 +2489,34 @@ int main(int argc, char** argv) {
         const Prog* pr = &lowered.procs[i].prog;
         for (auto& in : pr->code)
             if (in.k == IK::Assert && !pr->combCtl) pr->combCtl = std::make_shared<ProcCtl>();
+        if (prof::P().on) prof::P().combEnt.push_back(profEnt(lowered.procs[i]));
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
-        if (vpi::st().active && lowered.procs[i].kind == "init") {
+        if (lowered.procs[i].kind == "init") {
             // Declaration initializers take effect before the simulation
-            // starts, so they are not value changes VPI callbacks see (6.8).
+            // starts (6.8): not value changes VPI callbacks see, and not
+            // edges a clocked process registered below could wake on
+            // (logic clk = 0 is no negedge).
             Task t = process(&lowered.procs[i].prog);
             S.all.push_back(t.h);
             t.h.resume();
             continue;
         }
-        if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
-        else if (lowered.procs[i].program >= 0 || lowered.procs[i].reactive)
-            S.spawn(programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial"));
-        else S.spawn(process(&lowered.procs[i].prog));
+        int pe = prof::P().on ? profEnt(lowered.procs[i]) : -1;
+        if (pl.seq[i]) {
+            if (pe >= 0) prof::P().seqEnt.push_back(pe);
+            S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
+            continue;
+        }
+        Task t = lowered.procs[i].program >= 0 || lowered.procs[i].reactive
+                     ? programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial")
+                     : process(&lowered.procs[i].prog);
+        if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
+        S.spawn(t);
     }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
@@ -2427,6 +2533,10 @@ int main(int argc, char** argv) {
     startTimingChecks();
     if (!pathRecs().empty() || !S.icDelay.empty() || !S.shadowOf.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty() || pl.cyclic) staticPart = false;
+    if (vpi::st().active && g_cov) {   // vpi_control(vpiCoverageSave, ...) writes the database now (40.5.1)
+        static const LowerResult* lw = &lowered;
+        covSaveHook() = [](const std::string& path) { return writeCoverage(path, *lw, S.vcdTop); };
+    }
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
@@ -2436,7 +2546,18 @@ int main(int argc, char** argv) {
     }
     covapi::lw = &lowered;
     g_covApiHook = covapi::hook;   // 20.13
-    S.run(maxTime);
+    if (vcdClass && comp) objview::build(*comp, vcdClass);   // before the waveform header
+        if (interactiveMode) {   // msim -i: commands drive the run (interactive.inc)
+        interactive::Session ses;
+        ses.comp = comp.get();
+        ses.maxTime = maxTime;
+        if (doPath.empty()) { ses.prompt = isatty(0); ses.loop(std::cin); }
+        else {
+            std::ifstream df(doPath);
+            if (!df) { std::cerr << "msim: cannot read " << doPath << "\n"; return 2; }
+            ses.loop(df);
+        }
+    } else S.run(maxTime);
     std::vector<Task> finals = concEnd();   // strong obligations still pending fail (16.12.21)
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
@@ -2447,5 +2568,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!writeSaif()) return 1;
+    if (prof::P().on && !prof::P().write(S.now, S.timescale)) {
+        std::cerr << "msim: cannot write " << prof::P().path << "\n";
+        return 1;
+    }
     return S.exitCode;
 }
