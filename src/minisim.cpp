@@ -913,6 +913,7 @@ struct Sim {
         closeWaves();
     }
     void closeWaves() {
+        evcdClose();
 #ifdef MINISIM_FST
         if (fst) { fstWriterClose((fstWriterContext*)fst); fst = nullptr; }
 #endif
@@ -1002,6 +1003,7 @@ struct Sim {
     // The port connections of variable path outputs: (net, driver) -> the
     // variable and the value the driver last passed on.
     map<pair<int, int>, pair<int, Val>> varPathDrv;
+    bool applyingPathVar = false;   // a delayed change of an SF_PATHV variable is landing
     bool applyingVar = false;
     struct PEv { uint64_t t, gen; Val v; uint8_t s0, s1; };
     map<pair<int, int>, vector<PEv>> pq;
@@ -1085,7 +1087,12 @@ struct Sim {
         else pqPush(s, slot, t, v, s0, s1);
     }
     void applySlot(int s, int slot, const Val& v, uint8_t s0, uint8_t s1) {
-        if (slot == PQ_PATH) { set(s, v); return; }
+        if (slot == PQ_PATH) {
+            applyingPathVar = true;
+            set(s, v);
+            applyingPathVar = false;
+            return;
+        }
         if (slot <= PQ_VAR) {
             int d = PQ_VAR - slot;
             auto vp = varPathDrv.find({s, d});
@@ -1188,11 +1195,14 @@ struct Sim {
             pathsTo[P[k].dst].push_back((int)k);
             pathIn[(size_t)P[k].src] = 1;
             if (!P[k].dstVar) { timedOut[(size_t)P[k].dst] = 1; continue; }
+            bool linked = false;
             for (const PortLink& l : outLinks())
                 if (l.formal == P[k].dst) {
+                    linked = true;
                     varPathDrv[{l.net, l.drv}] = {P[k].dst, sigs[(size_t)l.net].drv[(size_t)l.drv].v};
                     if (now == 0) sigs[(size_t)l.net].val = allx(sigs[(size_t)l.net].w);   // x until the first value arrives
                 }
+            if (!linked && P[k].dstIface) sigs[(size_t)P[k].dst].fl |= SF_PATHV;   // 25.6
         }
         for (auto& [sg, d] : icDelay) timedOut[(size_t)sg] = 1;
         for (auto& [sg, sh] : shadowOf) timedOut[(size_t)sg] = 1;
@@ -2097,6 +2107,143 @@ struct Sim {
                 return;
         }
     }
+    // Extended VCD (21.7.3): one file per $dumpports call, holding the ports
+    // of the modules it names. Values are compared at the end of each time
+    // slot, so a run without $dumpports pays nothing. Which side drives a
+    // port is not looked at: an input shows D/U/N/Z, an output L/H/X/T and
+    // an inout 0/1/?/F, each bit at strong strength (or highz for z).
+    struct EvcdPort { int sig; char dir; string id; };
+    struct Evcd {
+        string path;
+        std::ofstream f;
+        vector<EvcdPort> ports;
+        vector<string> last;
+        bool started = false, off = false, stopped = false;
+        uint64_t limit = 0, lastT = ~0ULL;
+    };
+    std::deque<Evcd> evcds;
+    string evcdValue(const EvcdPort& p, bool asX) {
+        const int w = sigs[p.sig].w;
+        string bits((size_t)w, 'x');
+        if (!asX) putBits(bits.data(), sigs[p.sig].val, w);
+        string v = "p", s0, s1;
+        for (char c : bits) {
+            int k = c == '0' ? 0 : c == '1' ? 1 : c == 'z' ? 3 : 2;
+            v += (p.dir == 'i' ? "DUNZ" : p.dir == 'o' ? "LHXT" : "01?F")[k];
+            s0 += k == 0 || k == 2 ? '6' : '0';
+            s1 += k == 1 || k == 2 ? '6' : '0';
+        }
+        return v + " " + s0 + " " + s1 + " " + p.id + "\n";
+    }
+    void evcdStamp(Evcd& e) {
+        if (e.lastT != now) { e.f << '#' << now << '\n'; e.lastT = now; }
+    }
+    void evcdBlock(Evcd& e, const char* kw, bool asX) {
+        evcdStamp(e);
+        e.f << kw << '\n';
+        for (size_t k = 0; k < e.ports.size(); k++) {
+            string v = evcdValue(e.ports[k], asX);
+            e.f << v;
+            if (!asX) e.last[k] = v;
+        }
+        e.f << "$end\n";
+    }
+    // The end of a time slot: the first values, then the ports that changed.
+    void evcdTail() {
+        for (Evcd& e : evcds) {
+            if (!e.f.is_open() || e.stopped) continue;
+            if (!e.started) {
+                e.started = true;
+                evcdBlock(e, "$dumpports", false);
+                if (e.off) evcdBlock(e, "$dumpportsoff", true);
+                continue;
+            }
+            if (e.off) continue;
+            for (size_t k = 0; k < e.ports.size(); k++) {
+                string v = evcdValue(e.ports[k], false);
+                if (v == e.last[k]) continue;
+                evcdStamp(e);
+                e.f << v;
+                e.last[k] = std::move(v);
+            }
+            if (e.limit && (uint64_t)e.f.tellp() >= e.limit) {
+                e.f << "$comment Note: $dumpportslimit reached; dumping stops $end\n";
+                e.stopped = true;
+            }
+        }
+    }
+    void evcdClose() {
+        if (evcds.empty()) return;
+        evcdTail();
+        for (Evcd& e : evcds)
+            if (e.f.is_open()) { e.f << "$vcdclose #" << now << " $end\n"; e.f.close(); }
+        evcds.clear();
+    }
+    void dumpPorts(int cmd, const string& file, int64_t num, const vector<pair<string, bool>>& sel) {
+        if (cmd == DC_PORTS) {
+            string path = file.empty() ? "dumpports.vcd" : file;
+            for (Evcd& e : evcds)
+                if (e.path == path) { cerr << "msim: $dumpports: " << path << " is already being written; the call is ignored (21.7.3.1)\n"; return; }
+            evcds.emplace_back();
+            Evcd& e = evcds.back();
+            e.path = path;
+            e.f.open(path);
+            if (!e.f) { cerr << "msim: $dumpports: cannot write " << path << "\n"; evcds.pop_back(); return; }
+            std::unordered_map<string, int> byName;
+            for (size_t i = 0; i < sigs.size(); i++) byName.emplace(sigs[i].name, (int)i);
+            string top = vcdTop.empty() ? string("top") : vcdTop;
+            std::ostringstream defs;
+            string scope, scopes;
+            for (const auto& [enc, vec] : sel) {
+                vector<string> fld;
+                size_t b = 0, t;
+                while ((t = enc.find('\t', b)) != string::npos) { fld.push_back(enc.substr(b, t - b)); b = t + 1; }
+                fld.push_back(enc.substr(b));
+                if (fld.size() != 6) continue;
+                if (fld[5].size() > 1 && fld[5][0] == '#') {   // the signal id itself
+                    int id = std::atoi(fld[5].c_str() + 1);
+                    if (id >= 0 && (size_t)id < sigs.size()) byName[fld[5]] = id;
+                }
+                auto it = byName.find(fld[5]);
+                if (it == byName.end()) { cerr << "msim: $dumpports: port " << fld[1] << "." << fld[2] << " has no signal and is left out\n"; continue; }
+                if (fld[1] != scope) {
+                    if (!scope.empty()) defs << "$upscope $end\n";
+                    scope = fld[1];
+                    scopes += (scopes.empty() ? "" : ", ") + scope;
+                    defs << "$scope module " << scope << " $end\n";
+                }
+                EvcdPort p{it->second, fld[0][0], "<" + std::to_string(e.ports.size())};
+                defs << "$var port " << (vec ? "[" + fld[3] + ":" + fld[4] + "]" : string("1")) << " " << p.id << " " << fld[2] << " $end\n";
+                e.ports.push_back(p);
+            }
+            if (!scope.empty()) defs << "$upscope $end\n";
+            e.last.assign(e.ports.size(), string());
+            e.f << "$version msim $dumpports(" << scopes << ", \"" << path << "\") $end\n"
+                << "$timescale " << timescale << " $end\n" << defs.str() << "$enddefinitions $end\n";
+            rare = true;   // slotTail() writes the first values at the end of this slot
+            return;
+        }
+        for (Evcd& e : evcds) {
+            if (!file.empty() && e.path != file) continue;   // an unknown name: ignored (21.7.3.7)
+            switch (cmd) {
+                case DC_POFF:
+                    if (e.off) break;
+                    e.off = true;
+                    if (e.started && !e.stopped) evcdBlock(e, "$dumpportsoff", true);
+                    break;
+                case DC_PON:
+                    if (!e.off) break;
+                    e.off = false;
+                    if (e.started && !e.stopped) evcdBlock(e, "$dumpportson", false);
+                    break;
+                case DC_PALL:
+                    if (e.started && !e.off && !e.stopped) evcdBlock(e, "$dumpportsall", false);
+                    break;
+                case DC_PFLUSH: e.f.flush(); break;
+                case DC_PLIMIT: e.limit = num > 0 ? (uint64_t)num : 0; break;
+            }
+        }
+    }
     // $dumpvars without -vcd: the header and the values at the end of the slot.
     void startDump() {
         dumpPend = false;
@@ -2139,7 +2286,9 @@ struct Sim {
     // again; a variable keeps its value until it is next written.
     // force v[3:0] = e holds those bits only (SF_PART): other writes still
     // change the other bits.
-    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8 };   // SF_VPI: a VPI value-change callback watches it
+    // SF_PATHV: a variable that is a path output with no port connection of
+    // its own (an interface terminal, 25.6): its writes arrive after the path delay.
+    enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8, SF_PATHV = 16 };   // SF_VPI: a VPI value-change callback watches it
     struct PartHold { int hi, lo; E fe, ae; };
     struct Hold { E fe, ae; vector<PartHold> parts; };
     unordered_map<int, Hold> holds;
@@ -2311,9 +2460,17 @@ struct Sim {
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         Sig& g = sigs[s];
-        if (__builtin_expect(g.fl & (SF_HELD | SF_PART), 0)) {
+        if (__builtin_expect(g.fl & (SF_HELD | SF_PART | SF_PATHV), 0)) {
             if (g.fl & SF_HELD) return;   // forced: other writes are ignored
-            nv = keepHeld(s, nv);         // only some bits are held
+            if (g.fl & SF_PART) nv = keepHeld(s, nv);   // only some bits are held
+            if ((g.fl & SF_PATHV) && !applyingPathVar) {   // 25.6, 30.4: the change arrives after the path delay
+                nv = maskWidth(nv, g.w);
+                nv.sgn = false;
+                Val from = projected(s, PQ_PATH, g.val);
+                if (sameVal(from, nv)) return;
+                pulseSchedule(s, PQ_PATH, g.val, nv, pathLim(s, from, nv), styleOf(s), STR_STRONG, STR_STRONG);
+                return;
+            }
         }
         int o, n;
         if (g.w <= 64) {
@@ -2419,6 +2576,7 @@ struct Sim {
         if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
         if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
+        if (!evcds.empty()) { evcdTail(); return false; }   // $dumpports: rare stays set, every slot ends here
         rare = false;
         return false;
     }
