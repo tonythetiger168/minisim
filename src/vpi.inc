@@ -41,7 +41,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -2037,7 +2037,7 @@ inline const char* typeName(int type) {
         {vpiAssert, "vpiAssert"}, {vpiAssume, "vpiAssume"}, {vpiCover, "vpiCover"},
         {vpiImmediateAssert, "vpiImmediateAssert"}, {vpiImmediateAssume, "vpiImmediateAssume"},
         {vpiImmediateCover, "vpiImmediateCover"}, {vpiClassObj, "vpiClassObj"}, {vpiClassVar, "vpiClassVar"},
-        {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}};
+        {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}, {vpiInterModPath, "vpiInterModPath"}};
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
 }
@@ -2059,6 +2059,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
     if (type == vpiClassObj && o->type == vpiClassVar) return H(vpi::classObjOf(o));   // 37.29
     if (type == vpiClassDefn || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return H(vpi::classHandle(type, o));
+    if (o->kind == Obj::InterModPath) return nullptr;
     if (o->kind == Obj::DynElem) {
         if (type == vpiParent) return H(const_cast<Obj*>(o->parent));
         if (type == vpiIndex) return o->idx >= 0 ? H(vpi::constObj(o->idx)) : nullptr;
@@ -2227,6 +2228,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
         return vpi::iter(std::move(items));
     }
     if (o->kind == Obj::ClassDefn) return vpi::classIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
+    if (o->kind == Obj::InterModPath) return type == vpiPort ? vpi::iter(std::vector<vpiHandle>(o->items)) : nullptr;   // 38.21
     if (o->kind == Obj::Extends) return nullptr;
     if (o->kind == Obj::ClassObj) {   // the properties of a class object (37.29)
         if (type != vpiVariables) return nullptr;
@@ -2638,6 +2640,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
         }
     }
     if (o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return (PLI_INT32)vpi::classGet(prop, o);
+    if (o->kind == Obj::InterModPath) return prop == vpiType ? vpiInterModPath : vpiUndefined;
     if (prop == vpiVirtual && vpi::isMethod(o)) return o->sym->as<slang::ast::SubroutineSymbol>().isVirtual();
     if (o->kind == Obj::ClassObj) {   // 37.29
         if (prop == vpiType) return vpiClassObj;
@@ -2831,6 +2834,7 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
         vpi::codeGetStr(prop, o, r, have);
         return have ? vpi::retStr(r) : nullptr;
     }
+    if (o->kind == Obj::InterModPath && prop != vpiType) return nullptr;
     if ((o->kind == Obj::ClassDefn || o->kind == Obj::Extends) && prop != vpiType) {   // 37.29
         std::string r;
         return vpi::classGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
@@ -2979,7 +2983,7 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
     if (o->kind == Obj::Iter || o->kind == Obj::Callback || o->kind == Obj::Systf || o->kind == Obj::Module ||
         o->kind == Obj::Scope || o->kind == Obj::Typespec || o->kind == Obj::Member || o->kind == Obj::Range ||
         o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
-        o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) {
+        o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends || o->kind == Obj::InterModPath) {
         vpi::error(vpiError, "vpi_get_value: the object has no value");
         return;
     }
@@ -3087,10 +3091,67 @@ inline bool delayCount(p_vpi_delay d, const char* who) {
     }
     return true;
 }
+// The delays of an inter-module path as VPI gives them: 1, 2, 3, 6 or 12
+// of the 12 transitions, with pulse limits.
+inline bool imDelayCount(p_vpi_delay d, const char* who) {
+    if (!d || !d->da) { error(vpiError, std::string(who) + ": no delay structure"); return false; }
+    int n = d->no_of_delays;
+    if (n != 1 && n != 2 && n != 3 && n != 6 && n != 12) {
+        error(vpiError, std::string(who) + ": an inter-module path has 1, 2, 3, 6 or 12 delays");
+        return false;
+    }
+    return true;
+}
+inline void imGetDelays(const Obj* o, p_vpi_delay d) {
+    Delay12 z;
+    auto it = S.icDelay.find(o->sig);
+    const Delay12& v = it == S.icDelay.end() ? z : it->second;
+    int per = (d->mtm_flag ? 3 : 1) * (d->pulsere_flag ? 3 : 1);
+    for (int k = 0; k < d->no_of_delays; k++) {
+        uint64_t vals[3] = {v.d[k], v.rj[k], v.er[k]};
+        for (int q = 0; q < (d->pulsere_flag ? 3 : 1); q++)
+            for (int m = 0; m < (d->mtm_flag ? 3 : 1); m++) {
+                p_vpi_time t = &d->da[k * per + q * (d->mtm_flag ? 3 : 1) + m];
+                t->type = d->time_type;
+                fillTime(t, o->items.empty() ? nullptr : O(o->items[1]), vals[q]);
+            }
+    }
+}
+inline void imPutDelays(const Obj* o, p_vpi_delay d) {
+    int per = (d->mtm_flag ? 3 : 1) * (d->pulsere_flag ? 3 : 1);
+    std::vector<uint64_t> dv, rv, ev;
+    const Obj* port = O(o->items[1]);
+    for (int k = 0; k < d->no_of_delays; k++) {
+        auto at = [&](int q) {
+            s_vpi_time t = d->da[k * per + q * (d->mtm_flag ? 3 : 1) + (d->mtm_flag ? 1 : 0)];   // typical
+            t.type = d->time_type;
+            return (uint64_t)std::max<int64_t>(0, sigTicks(&t, port));
+        };
+        uint64_t x = at(0);
+        dv.push_back(x);
+        rv.push_back(d->pulsere_flag ? at(1) : rejectOf(x));
+        ev.push_back(d->pulsere_flag ? at(2) : x * (uint64_t)std::max(pulseOpts().errorPct, pulseOpts().rejectPct) / 100);
+    }
+    auto D = expand12(dv), R = expand12(rv), E = expand12(ev);
+    Delay12& v = S.icDelay[o->sig];
+    for (int k = 0; k < 12; k++) {
+        v.d[k] = d->append_flag ? v.d[k] + D[(size_t)k] : D[(size_t)k];
+        v.rj[k] = d->append_flag ? v.rj[k] + R[(size_t)k] : R[(size_t)k];
+        v.er[k] = d->append_flag ? v.er[k] + E[(size_t)k] : E[(size_t)k];
+    }
+    if (S.timedOut.size() < S.sigs.size()) S.timedOut.resize(S.sigs.size(), 0);
+    if (S.pathIn.size() < S.sigs.size()) S.pathIn.resize(S.sigs.size(), 0);
+    if (S.lastChg.size() < S.sigs.size()) S.lastChg.resize(S.sigs.size(), 0);
+    S.timedOut[(size_t)o->sig] = 1;
+}
 }   // namespace vpi
 void vpi_get_delays(vpiHandle h, p_vpi_delay d) {
     vpi::clearErr();
     Obj* o = O(h);
+    if (o && o->kind == Obj::InterModPath) {   // 38.21
+        if (vpi::imDelayCount(d, "vpi_get_delays")) vpi::imGetDelays(o, d);
+        return;
+    }
     auto* nd = vpi::netDelays(o, "vpi_get_delays");
     if (!nd || !vpi::delayCount(d, "vpi_get_delays")) return;
     auto& v = *nd;
@@ -3106,6 +3167,10 @@ void vpi_get_delays(vpiHandle h, p_vpi_delay d) {
 void vpi_put_delays(vpiHandle h, p_vpi_delay d) {
     vpi::clearErr();
     Obj* o = O(h);
+    if (o && o->kind == Obj::InterModPath) {   // 38.21
+        if (vpi::imDelayCount(d, "vpi_put_delays")) vpi::imPutDelays(o, d);
+        return;
+    }
     auto* nd = vpi::netDelays(o, "vpi_put_delays");
     if (!nd || !vpi::delayCount(d, "vpi_put_delays")) return;
     std::vector<uint64_t> v;
@@ -3276,9 +3341,57 @@ inline PLI_INT32 control(PLI_INT32 op, va_list ap) {
     error(vpiWarning, "vpi_control: operation " + std::to_string(op) + " is not supported");
     return 0;
 }
-inline vpiHandle handleMulti(PLI_INT32, vpiHandle, vpiHandle, va_list) {
-    error(vpiWarning, "vpi_handle_multi is not supported");
-    return nullptr;
+// vpi_handle_multi(vpiInterModPath, port1, port2) (38.21): the path from
+// an output (or inout) port of one instance to an input (or inout) port of
+// another on the same net, in either order. Its delays are the
+// interconnect delay of the load port (32.4.4).
+inline vpiHandle handleMulti(PLI_INT32 type, vpiHandle a, vpiHandle b, va_list) {
+    if (type != vpiInterModPath) {
+        error(vpiError, "vpi_handle_multi: only vpiInterModPath is defined");
+        return nullptr;
+    }
+    Obj* x = O(a);
+    Obj* y = O(b);
+    if (!x || !y || x->kind != Obj::Port || y->kind != Obj::Port) {
+        error(vpiError, "vpi_handle_multi: vpiInterModPath needs two port handles");
+        return nullptr;
+    }
+    using slang::ast::ArgumentDirection;
+    auto dirOf = [](const Obj* p) { return p->sym->as<PortSymbol>().direction; };
+    auto drives = [&](const Obj* p) { return dirOf(p) == ArgumentDirection::Out || dirOf(p) == ArgumentDirection::InOut; };
+    auto loads = [&](const Obj* p) { return dirOf(p) == ArgumentDirection::In || dirOf(p) == ArgumentDirection::InOut; };
+    if (!(drives(x) && loads(y))) std::swap(x, y);
+    if (!(drives(x) && loads(y))) {
+        error(vpiError, "vpi_handle_multi: vpiInterModPath needs an output and an input port");
+        return nullptr;
+    }
+    auto netOf = [](const Obj* p) -> const Symbol* {
+        const auto& ps = p->sym->as<PortSymbol>();
+        const InstanceSymbol* inst = instOf(ps.getParentScope());
+        const slang::ast::PortConnection* pc = inst ? inst->getPortConnection(ps) : nullptr;
+        return pc ? rootOf(pc->getExpression()) : nullptr;
+    };
+    const Symbol* n = netOf(x);
+    if (!n || n != netOf(y)) {
+        error(vpiError, "vpi_handle_multi: the ports are not connected to one net");
+        return nullptr;
+    }
+    const auto& in = y->sym->as<PortSymbol>();
+    Obj* lv = in.internalSymbol && ValueSymbol::isKind(in.internalSymbol->kind) ? valueObj(in.internalSymbol) : nullptr;
+    if (!lv || lv->sig < 0 || in.internalSymbol->kind != SymbolKind::Net) {
+        error(vpiError, "vpi_handle_multi: the input port is not a net (an interconnect delay needs one)");
+        return nullptr;
+    }
+    auto& slot = st().pairObjs[{x->sym, y->sym}];
+    if (!slot) {
+        slot = mkObj(Obj::InterModPath, vpiInterModPath);
+        slot->parent = x;   // the source port
+        slot->sym = y->sym; // the load port
+        slot->items = {H(x), H(y)};
+        slot->sig = lv->sig;
+        slot->w = lv->w;
+    }
+    return H(slot);
 }
 // The elements a value-array call covers: `num` elements from the one at
 // `index`, toward the right bound, going on from the left bound after it.
