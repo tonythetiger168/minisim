@@ -51,6 +51,7 @@ set(MINISIM_CORE_HEADERS
     tchk.inc
     tcl.hpp
     upf.hpp
+    upf_impl.inc
     upf_vct.hpp
     upf_rt.inc
     vpi.inc

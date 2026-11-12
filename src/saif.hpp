@@ -233,6 +233,7 @@ struct SaifLex {
     size_t p = 0;
     int line = 1;
     std::string path;
+    bool quoted = false;   // the last word was a "string"
     // returns 0 at the end, '(' or ')' for a parenthesis, 'w' for a word (in tok)
     int next(std::string& tok) {
         for (;;) {
@@ -260,6 +261,7 @@ struct SaifLex {
             return c;
         }
         tok.clear();
+        quoted = c == '"';
         if (c == '"') {
             p++;
             while (p < text.size() && text[p] != '"') tok += text[p++];
@@ -431,6 +433,7 @@ struct SaifParser {
     void instance(SaifLex& lx, Db& db, const std::string& scope, char divider) {
         std::string t;
         if (lx.next(t) != 'w') lx.fail("expected an instance name");
+        if (lx.quoted && lx.next(t) != 'w') lx.fail("expected an instance name");   // (INSTANCE "design" path ..)
         std::string name = t;
         if (divider != '.')
             for (char& c : name)
@@ -441,7 +444,7 @@ struct SaifParser {
             if (k == ')') return;
             if (k != '(') lx.fail("expected ( in instance " + here);
             lx.next(t);
-            if (t == "INSTANCE") instance(lx, db, here, divider);
+            if (t == "INSTANCE" || t == "VIRTUAL_INSTANCE") instance(lx, db, here, divider);
             else if (t == "NET" || t == "PORT") nets(lx, db, here, divider);
             else if (t == "LEAKAGE") sdpd(lx, "", {}, nullptr, &db.states[here]);
             else skip(lx);
@@ -490,8 +493,19 @@ inline void read(const std::string& path, Db& db) {
 }
 
 // Writes the activity as SAIF 2.0, one NET entry per bit.
+// What a caller adds to an instance of the backward file: its cell name
+// (INSTANCE "cell" path, J.3.11), the state-dependent attributes of its pins
+// after a pin's simple ones (J.3.10.3), and leakage (J.3.10.4). Paths are
+// dotted, as the Db names them.
+struct WriteHooks {
+    std::function<std::string(const std::string& path)> cell;
+    std::function<bool(const std::string& path, const std::string& net)> isPort;
+    std::function<void(const std::string& path, const std::string& pin, std::ostream&, const std::string& ind)> pin;
+    std::function<void(const std::string& path, std::ostream&, const std::string& ind)> extra;
+};
+
 inline void write(const Db& db, std::ostream& os, const std::string& design, const std::string& program,
-                      const std::string& version) {
+                      const std::string& version, const WriteHooks* hooks = nullptr) {
     struct Node {
         std::map<std::string, Node> kids;
         std::vector<std::pair<std::string, uint32_t>> nets;
@@ -558,27 +572,39 @@ inline void write(const Db& db, std::ostream& os, const std::string& design, con
     os << "(SAIFILE\n(SAIFVERSION \"2.0\")\n(DIRECTION \"backward\")\n(DESIGN \"" << design << "\")\n"
        << "(VENDOR \"minisim\")\n(PROGRAM_NAME \"" << program << "\")\n(VERSION \"" << version << "\")\n"
        << "(DIVIDER / )\n(TIMESCALE " << num(scale) << " " << unit << ")\n(DURATION " << num(db.duration) << ")\n";
-    std::function<void(const std::string&, const Node&, int)> emit = [&](const std::string& name, const Node& n,
-                                                                         int depth) {
+    std::function<void(const std::string&, const std::string&, const Node&, int)> emit =
+        [&](const std::string& path, const std::string& name, const Node& n, int depth) {
         std::string ind((size_t)depth, ' ');
-        os << ind << "(INSTANCE " << esc(name) << "\n";
-        if (!n.nets.empty()) {
-            os << ind << " (NET\n";
+        std::string cell = hooks && hooks->cell ? hooks->cell(path) : std::string();
+        os << ind << "(INSTANCE ";
+        if (!cell.empty()) os << "\"" << cell << "\" ";
+        os << esc(name) << "\n";
+        // a cell's pins are ports (J.3.10.3); other signals are nets
+        for (int port = 1; port >= 0; port--) {
+            bool any = false;
             for (auto& [nm, id] : n.nets) {
+                bool isPort = !cell.empty() && hooks->isPort && hooks->isPort(path, nm);
+                if (isPort != (port == 1)) continue;
+                if (!any) os << ind << (port ? " (PORT\n" : " (NET\n");
+                any = true;
                 const Bit& b = db.bits[id];
                 os << ind << "  (" << esc(nm) << " (T0 " << num(b.t0) << ") (T1 " << num(b.t1) << ") (TX "
-                   << num(b.tx) << ") (TC " << num(b.tc) << ") (IG 0))\n";
+                   << num(b.tx) << ") (TC " << num(b.tc) << ") (IG 0)";
+                if (port && hooks->pin) hooks->pin(path, nm, os, ind + "   ");
+                os << ")\n";
             }
-            os << ind << " )\n";
+            if (any) os << ind << " )\n";
         }
-        for (auto& [k, kid] : n.kids) emit(k, kid, depth + 1);
+        if (hooks && hooks->extra) hooks->extra(path, os, ind + " ");
+        for (auto& [k, kid] : n.kids) emit(path + "." + k, k, kid, depth + 1);
         os << ind << ")\n";
     };
-    for (auto& [k, kid] : root.kids) emit(k, kid, 0);
+    for (auto& [k, kid] : root.kids) emit(k, k, kid, 0);
     if (!root.nets.empty()) {
         Node top;
         top.nets = root.nets;
-        emit(design.empty() ? "top" : design, top, 0);
+        std::string tn = design.empty() ? "top" : design;
+        emit(tn, tn, top, 0);
     }
     os << ")\n";
 }
