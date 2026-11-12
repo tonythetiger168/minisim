@@ -543,6 +543,12 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI scheduling (38.35, 38.36): `vpiReturnEvent` gives a `vpiSchedEvent`
+  handle that `vpiCancelEvent` cancels (`vpiScheduled`); inertial,
+  transport and pure transport writes remove pending writes as the standard
+  says; `cbForce`, `cbRelease`, `cbAssign`, `cbDeassign`, `cbNBASynch` and
+  `cbAtEndOfSimTime`; `vpi_get_delays` / `vpi_put_delays` on nets with a
+  declared delay (38.10, 38.30).
 - VPI coverage API (clause 40): `vpi_get` of `vpiStatementCoverage`,
   `vpiToggleCoverage`, `vpiFsmStateCoverage` and `vpiAssertCoverage` on an
   instance, `vpiCovered` / `vpiCoveredCount` / `vpiCoveredMax` and the

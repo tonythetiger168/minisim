@@ -165,6 +165,22 @@ coverage database (the `-cov` JSON) to `name` now. Not supported:
 or stopping statement, toggle or FSM coverage for an instance below the
 top (it is for the whole design).
 
+**Scheduling and more callbacks (38.10, 38.30, 38.35, 38.36).** A delayed
+`vpi_put_value` with `vpiReturnEvent` returns a `vpiSchedEvent` handle;
+`vpi_get(vpiScheduled, ev)` is 1 until the write lands, and
+`vpi_put_value(ev, NULL, NULL, vpiCancelEvent)` cancels it. A
+`vpiInertialDelay` write removes the writes still pending on the object, a
+`vpiTransportDelay` write those due after it, a `vpiPureTransportDelay`
+write none; a delayed write of a bit keeps the other bits as they are when
+it lands. `cbForce`, `cbRelease`, `cbAssign` and `cbDeassign` fire on
+`force` / `release` / `assign` / `deassign` (and forces through
+`vpi_put_value`) of their object, or of any object when `obj` is NULL (then
+`obj` of the callback data is the object). `cbNBASynch` runs before the NBA
+updates of its time slot, `cbAtEndOfSimTime` at its end, before
+`cbReadOnlySynch`. `vpi_get_delays` / `vpi_put_delays` read and change the
+rise, fall and turn-off delays of a net declared with a delay (28.16), as
+ticks or scaled time, with `mtm_flag` and `append_flag`.
+
 **Other routines.** `vpi_printf`, `vpi_vprintf`, `vpi_mcd_open`,
 `vpi_mcd_close`, `vpi_mcd_name`, `vpi_mcd_printf`, `vpi_flush`,
 `vpi_chk_error`, `vpi_get_vlog_info`, `vpi_control(vpiFinish)` and
@@ -184,14 +200,16 @@ objects in decryption envelopes: see "VPI and DPI" in `docs/PROTECT.md`.
 
 Class objects, unpacked structs, dynamic arrays, queues and associative
 arrays, statements, processes and expressions, drivers and loads,
-instance arrays as objects, `vpi_get_delays` / `vpi_put_delays`, `cbForce` /
-`cbRelease` / `cbStmt`, and save / restart. A call to something not
+instance arrays as objects, delays of anything but a net (primitives,
+continuous assignments, module paths, timing checks), `vpi_handle_multi`,
+`cbStmt`, `cbTchkViolation`, `cbError` / `cbPLIError`, interactive mode
+callbacks, and save / restart / reset. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

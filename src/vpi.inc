@@ -39,7 +39,7 @@ struct Cb;
 // One VPI object. `kind` says which fields are used.
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
-                Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState } kind;
+                Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -58,6 +58,7 @@ struct Obj {
     std::vector<vpiHandle> items;         // Iter
     size_t pos = 0;
     mutable int8_t prot = -1;             // vpiIsProtected, once worked out (-1: not yet)
+    bool sched = false;                   // SchedEvent: still scheduled (vpiScheduled)
     Cb* cb = nullptr;                     // Callback
 };
 struct Cb {
@@ -105,7 +106,12 @@ struct State {
     std::multimap<uint64_t, Cb*> timed;   // cbAfterDelay, cbAtStartOfSimTime, and delayed synch callbacks
     std::unordered_map<int, std::vector<Cb*>> change;   // signal -> its cbValueChange callbacks
     std::vector<std::unique_ptr<Cb>> cbs;
-    std::multimap<uint64_t, std::pair<int, Val>> puts;   // delayed vpi_put_value writes
+    // A delayed vpi_put_value write: the object, the value, its event handle
+    // (vpiReturnEvent) if one was asked for.
+    struct Put { const Obj* o; Val v; Obj* ev; };
+    std::multimap<uint64_t, Put> puts;
+    std::vector<Cb*> holdCbs;             // cbForce, cbRelease, cbAssign, cbDeassign (38.36.1)
+    std::vector<Cb*> nbaCbs, endSlot;     // cbNBASynch, cbAtEndOfSimTime of this time slot (38.36.2)
     int mode = vpiMode1800v2009;          // the compatibility mode of the running call (36.12)
     std::vector<char> arrBuf;             // vpi_get_value_array without vpiUserAllocFlag
     Compilation* comp = nullptr;
@@ -913,6 +919,36 @@ inline void fire(Cb* c) {
     if (d.reason != cbValueChange) c->live = false;   // the others fire once
     d.cb_rtn(&d);
 }
+// A force, release, procedural assign or deassign of signal `sg` (38.36.1):
+// the callbacks on that object (or on any, obj NULL) get the object and,
+// unless vpiSuppressVal, its value after the change.
+inline void onHold(int sg, bool force, bool on, int hi, int lo) {
+    auto& s = st();
+    int reason = force ? (on ? cbForce : cbRelease) : (on ? cbAssign : cbDeassign);
+    auto list = s.holdCbs;
+    for (Cb* c : list) {
+        if (!c->live || c->d.reason != reason) continue;
+        Obj* o = c->obj;
+        if (o) {   // the object, or a part of it, or the whole of which it is a part
+            if (o->sig != sg) continue;
+            if (o->kind == Obj::Bit && hi >= 0 && (o->off > hi || o->off + o->w - 1 < lo)) continue;
+        } else {
+            auto it = s.sigSym.find(sg);
+            o = it == s.sigSym.end() ? nullptr : valueObj(it->second);
+            if (o && o->arr) o = wordAt(o, sg - arrMap().find(o->sym)->second->base);
+            if (o && isProt(o)) continue;   // nothing of protected code (IEEE 1735 9.7.1)
+        }
+        s_cb_data d = c->d;
+        s_vpi_time t = c->t;
+        s_vpi_value v = c->v;
+        d.obj = H(o);
+        d.time = c->hasT ? &t : nullptr;
+        d.value = c->hasV ? &v : nullptr;
+        if (c->hasT && t.type != vpiSuppressTime) fillTime(&t, o, S.now);
+        if (c->hasV && o && v.format != vpiSuppressVal) getValue(o, &v);
+        d.cb_rtn(&d);
+    }
+}
 inline void fireList(std::vector<Cb*>& l) {
     std::vector<Cb*> now;
     now.swap(l);
@@ -933,20 +969,38 @@ inline bool onRegion(int r) {
         s.timed.erase(a, b);
         S.vpiAt.erase(S.now);
         auto [pa, pb] = s.puts.equal_range(S.now);
-        std::vector<std::pair<int, Val>> writes;
+        std::vector<State::Put> writes;
         for (auto it = pa; it != pb; ++it) writes.push_back(it->second);
         s.puts.erase(pa, pb);
-        for (auto& [sg, v] : writes) S.set(sg, v);
+        for (auto& w : writes) {
+            if (w.ev) w.ev->sched = false;
+            if (w.o->kind == Obj::Bit)   // the other bits keep the value they have when it lands
+                S.set(w.o->sig, v_insert(S.get(w.o->sig), v_resize(w.v, w.o->w, false), w.o->off + w.o->w - 1, w.o->off));
+            else S.set(w.o->sig, w.v);
+        }
         std::vector<Cb*> nxt;
         for (Cb* c : s.next) (c->at < S.now ? due : nxt).push_back(c);
         s.next.swap(nxt);
         for (Cb* c : due) {
             if (c->d.reason == cbReadWriteSynch) s.rw.push_back(c);
             else if (c->d.reason == cbReadOnlySynch) s.ro.push_back(c);
+            else if (c->d.reason == cbAtEndOfSimTime) s.endSlot.push_back(c);
+            else if (c->d.reason == cbNBASynch) { s.nbaCbs.push_back(c); S.vpiNbaPend = true; }
             else fire(c);
         }
-        if (!s.rw.empty() || !s.ro.empty()) S.rare = true;
+        if (!s.rw.empty() || !s.ro.empty() || !s.endSlot.empty()) S.rare = true;
         return false;
+    }
+    if (r == Sim::VR_NBA) {   // cbNBASynch: before the NBA updates of the slot
+        S.vpiNbaPend = false;
+        if (s.nbaCbs.empty()) return false;
+        fireList(s.nbaCbs);
+        return true;
+    }
+    if (r == Sim::VR_RO && !s.endSlot.empty()) {   // cbAtEndOfSimTime, then cbReadOnlySynch
+        fireList(s.endSlot);
+        S.rare = true;
+        return true;
     }
     std::vector<Cb*>& l = r == Sim::VR_RW ? s.rw : s.ro;
     if (l.empty()) return false;
@@ -1609,6 +1663,29 @@ vpiHandle vpi_register_cb(p_cb_data d) {
         case cbNextSimTime:
             c->at = S.now;
             s.next.push_back(c);
+            break;
+        case cbForce:
+        case cbRelease:
+        case cbAssign:
+        case cbDeassign:   // 38.36.1: on one object, or on every one (obj NULL)
+            if (c->obj && (vpi::isProt(c->obj) || (c->obj->kind != Obj::Signal && c->obj->kind != Obj::Word && c->obj->kind != Obj::Bit) || c->obj->arr)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: a force / assign callback needs a net, variable, word or bit (not protected)");
+                return nullptr;
+            }
+            s.holdCbs.push_back(c);
+            S.vpiHoldCb = vpi::onHold;
+            break;
+        case cbNBASynch:
+        case cbAtEndOfSimTime:   // 38.36.2: in this time slot, or `delay` from now
+            if (delay == 0) {
+                if (d->reason == cbNBASynch) { s.nbaCbs.push_back(c); S.vpiNbaPend = true; }
+                else { s.endSlot.push_back(c); S.rare = true; }
+            } else {
+                c->at = S.now + delay;
+                s.timed.insert({c->at, c});
+                vpi::at(c->at);
+            }
             break;
         case cbEndOfCompile: s.endCompile.push_back(c); break;
         case cbStartOfSimulation: s.start.push_back(c); break;
@@ -2386,6 +2463,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (prop != vpiType && !(prop == vpiSize && expr) && vpi::denied(o, "vpi_get"))
         return vpiUndefined;
     auto isVar = [&] { return o->kind == Obj::Signal || o->kind == Obj::Word; };
+    if (o->kind == Obj::SchedEvent) return prop == vpiType ? vpiSchedEvent : prop == vpiScheduled ? o->sched : vpiUndefined;
     if (int64_t c = vpi::covGet(prop, o); c >= 0) return (PLI_INT32)std::min<int64_t>(c, INT32_MAX);   // 40.5.2
     if (o->kind == Obj::Fsm || o->kind == Obj::FsmState) {
         switch (prop) {
@@ -2689,6 +2767,14 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
 vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flags) {
     vpi::clearErr();
     Obj* o = O(h);
+    if ((flags & 0xfff) == vpiCancelEvent) {   // cancel a scheduled write (38.35)
+        if (!o || o->kind != Obj::SchedEvent) { vpi::error(vpiError, "vpi_put_value: vpiCancelEvent needs a vpiSchedEvent handle"); return nullptr; }
+        auto& ps = vpi::st().puts;
+        for (auto it = ps.begin(); it != ps.end(); ++it)
+            if (it->second.ev == o) { ps.erase(it); break; }
+        o->sched = false;
+        return nullptr;
+    }
     if (!o || !v) { vpi::error(vpiError, "vpi_put_value: null handle"); return nullptr; }
     // Protected IP cannot be written from outside it (IEEE 1735 9.7.1).
     if (vpi::isProt(o) && !vpi::inOwnCall(o)) { vpi::error(vpiError, "vpi_put_value: the object is protected"); return nullptr; }
@@ -2710,10 +2796,6 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
         }
         return nullptr;
     }
-    if (mode == vpiCancelEvent) {
-        vpi::error(vpiWarning, "vpi_put_value: cancel is not supported");
-        return nullptr;
-    }
     int64_t d = mode == vpiNoDelay || mode == 0 ? 0 : vpi::sigTicks(t, o);
     if (mode == vpiNoDelay || mode == 0) {
         vpi::write(o, val);
@@ -2722,12 +2804,25 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
         else S.nba(o->sig, val);
     } else {
         uint64_t when = S.now + (uint64_t)d;
-        if (o->kind == Obj::Bit) {   // read-modify-write when it lands
-            Val cur = S.get(o->sig);
-            val = v_insert(cur, v_resize(val, o->w, false), o->off + o->w - 1, o->off);
+        // 38.35: an inertial write removes the writes still pending on the
+        // object, a transport write those due after it; a pure transport
+        // write removes none.
+        auto& ps = vpi::st().puts;
+        if (mode == vpiInertialDelay || mode == vpiTransportDelay)
+            for (auto it = ps.begin(); it != ps.end();)
+                if (it->second.o == o && (mode == vpiInertialDelay || it->first > when)) {
+                    if (it->second.ev) it->second.ev->sched = false;
+                    it = ps.erase(it);
+                } else ++it;
+        Obj* ev = nullptr;
+        if (flags & vpiReturnEvent) {
+            ev = vpi::mkObj(Obj::SchedEvent, vpiSchedEvent);
+            ev->sched = true;
+            ev->parent = o;
         }
-        vpi::st().puts.insert({when, {o->sig, val}});
+        ps.insert({when, {o, val, ev}});
         vpi::at(when);
+        return H(ev);
     }
     return nullptr;
 }
@@ -2739,8 +2834,62 @@ void vpi_get_time(vpiHandle h, p_vpi_time t) {
     vpi::fillTime(t, O(h), S.now);
 }
 
-void vpi_get_delays(vpiHandle, p_vpi_delay) { vpi::error(vpiWarning, "vpi_get_delays is not supported"); }
-void vpi_put_delays(vpiHandle, p_vpi_delay) { vpi::error(vpiWarning, "vpi_put_delays is not supported"); }
+// The delays of a net declared with one (28.16: wire #(rise, fall, turn-off)),
+// 38.10 and 38.30. Rise, fall and turn-off; with mtm_flag each as min, typ,
+// max (all three the same: msim keeps the typical value).
+namespace vpi {
+inline std::vector<uint64_t>* netDelays(const Obj* o, const char* who) {
+    if (!o || o->kind != Obj::Signal || o->arr || !o->sym || o->sym->kind != SymbolKind::Net || o->sig < 0) {
+        error(vpiError, std::string(who) + ": delays are supported on nets only");
+        return nullptr;
+    }
+    if (isProt(o)) { error(vpiError, std::string(who) + ": the object is protected"); return nullptr; }
+    auto it = S.netDelay.find(o->sig);
+    if (it == S.netDelay.end()) {
+        error(vpiError, std::string(who) + ": the net has no declared delay");
+        return nullptr;
+    }
+    return &it->second;
+}
+inline bool delayCount(p_vpi_delay d, const char* who) {
+    if (!d || !d->da || d->no_of_delays < 1 || d->no_of_delays > 3 || d->pulsere_flag) {
+        error(vpiError, std::string(who) + ": a net has 1, 2 or 3 delays (no pulse limits)");
+        return false;
+    }
+    return true;
+}
+}   // namespace vpi
+void vpi_get_delays(vpiHandle h, p_vpi_delay d) {
+    vpi::clearErr();
+    Obj* o = O(h);
+    auto* nd = vpi::netDelays(o, "vpi_get_delays");
+    if (!nd || !vpi::delayCount(d, "vpi_get_delays")) return;
+    auto& v = *nd;
+    for (int k = 0; k < d->no_of_delays; k++) {
+        uint64_t x = (size_t)k < v.size() ? v[(size_t)k] : v.size() == 1 ? v[0] : std::min(v[0], v[1]);   // turn-off: the smaller (28.16)
+        for (int m = 0; m < (d->mtm_flag ? 3 : 1); m++) {
+            p_vpi_time t = &d->da[k * (d->mtm_flag ? 3 : 1) + m];
+            t->type = d->time_type;
+            vpi::fillTime(t, o, x);
+        }
+    }
+}
+void vpi_put_delays(vpiHandle h, p_vpi_delay d) {
+    vpi::clearErr();
+    Obj* o = O(h);
+    auto* nd = vpi::netDelays(o, "vpi_put_delays");
+    if (!nd || !vpi::delayCount(d, "vpi_put_delays")) return;
+    std::vector<uint64_t> v;
+    for (int k = 0; k < d->no_of_delays; k++) {
+        p_vpi_time t = &d->da[k * (d->mtm_flag ? 3 : 1) + (d->mtm_flag ? 1 : 0)];   // typical
+        s_vpi_time tt = *t;
+        tt.type = d->time_type;   // the delays are in time_type
+        int64_t x = vpi::sigTicks(&tt, o);
+        if (d->append_flag && (size_t)k < nd->size()) x += (int64_t)(*nd)[(size_t)k];
+        v.push_back((uint64_t)std::max<int64_t>(0, x));
+    }
+    *nd = std::move(v);
+}
 
 PLI_INT32 vpi_vprintf(const PLI_BYTE8* fmt, va_list ap) {
     vpi::clearErr();
