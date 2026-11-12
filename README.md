@@ -50,6 +50,7 @@ where it does, is in [docs/LICENSING.md](docs/LICENSING.md).
 | `src/parallel.hpp` | Shared by the tools: default thread count, `-threads N`, `par::parallelFor`, `par::Pool` |
 | `src/wave_reader.hpp` | Shared by the tools: `wave::Reader`, VCD (parallel, mapped) and FST into memory |
 | `src/protect.hpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): `msim -keyfile` decrypts with OpenSSL |
+| `src/licproxy.hpp` | IEEE 1735 clause 8 license system: msim asks the IP author's license proxy over TLS |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
