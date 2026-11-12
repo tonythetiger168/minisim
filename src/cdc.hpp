@@ -29,6 +29,8 @@
 //           meet again in the reading domain, where they can be a cycle apart.
 //   CDC005  one signal synchronized more than once into the same domain.
 //   CDC006  with -sdc: a flop's clock is not a clock in the SDC file.
+//   CDC007  a clock read as data by logic.
+//   CDC008  a clock made by combinational logic of a clock and other signals.
 //   RDC001  an asynchronous reset generated in another clock domain: its
 //           release is not synchronous to the flops it resets.
 //   RDC002  one asynchronous reset used directly in several clock domains.
@@ -1431,6 +1433,65 @@ struct Checker {
 
     std::string clocked(const Flop& f) const { return m.name(f.dom); }
 
+    // CDC007 / CDC008: how the clocks are used and made.
+    void clockChecks() {
+        std::map<Sym, int> domFlops;
+        for (const Flop& f : m.flops)
+            if (f.dom) domFlops[f.dom]++;
+        // A node that is the root of a clock (as written by a flop, before
+        // -clock-group joins domains).
+        std::map<Sym, Sym> clockRootOf;  // root -> domain
+        for (const Flop& f : m.flops)
+            if (f.dom && f.clkSym) clockRootOf[m.clockRoot(m.canon(f.clkSym))] = f.dom;
+        // CDC007: a flop whose data or control reads a clock.
+        std::map<std::pair<Sym, Sym>, std::pair<int, SourceLocation>> asData;  // (clock, reading domain)
+        for (size_t i = 0; i < m.flops.size(); i++) {
+            const Flop& f = m.flops[i];
+            if (!f.dom) continue;
+            for (const Root& r : cones[i].all) {
+                if (!clockRootOf.count(r.sym) || m.flopOf(r.sym) || m.statics.count(r.sym)) continue;
+                auto& e = asData[{r.sym, f.dom}];
+                if (!e.first++) e.second = f.loc;
+            }
+        }
+        for (auto& [key, e] : asData)
+            add("CDC007", e.second,
+                "clock '" + m.name(key.first) + "' is read as data by " + std::to_string(e.first) +
+                    (e.first == 1 ? " flop" : " flops") + " clocked by " + m.name(key.second) +
+                    ": its edges are not synchronous to that clock, so sample a divided or toggled copy "
+                    "through a synchronizer");
+        // CDC008: a clock that is logic of another clock and of other signals
+        // (a clock mux made of gates): a change of the other signals can cut
+        // a pulse short.
+        for (auto& [root, dom] : clockRootOf) {
+            const Comb* c = m.combOf(root);
+            if (!c || c->src.size() < 2) continue;
+            Tracer tr(m);
+            std::vector<std::string> clocks, other;
+            for (const Root& r : tr.roots(root)) {
+                if (clockRootOf.count(r.sym) || (m.sdc.on && m.sdc.at.count(r.sym))) clocks.push_back(m.name(r.sym));
+                else if (!m.statics.count(r.sym)) other.push_back(m.name(r.sym));
+            }
+            if (clocks.empty() || other.empty() || (clocks.size() == 1 && clocks[0] == m.name(root))) continue;
+            std::vector<std::string> all = clocks;
+            all.insert(all.end(), other.begin(), other.end());
+            std::sort(all.begin(), all.end());
+            auto list = [](const std::vector<std::string>& v) {
+                std::string o;
+                for (size_t i = 0; i < v.size() && i < 4; i++) o += (i ? ", '" : "'") + v[i] + "'";
+                if (v.size() > 4) o += ", ...";
+                return o;
+            };
+            SourceLocation loc;
+            for (const Flop& f : m.flops)
+                if (f.dom == dom) { loc = f.loc; break; }
+            add("CDC008", loc,
+                "clock '" + m.name(root) + "' of " + std::to_string(domFlops[dom]) +
+                    (domFlops[dom] == 1 ? " flop" : " flops") + " is combinational logic of " + list(all) + ": changing those can glitch the clock, so use a glitch-free clock "
+                    "mux or a clock-gate cell, or declare them -static if they only change in reset");
+        }
+    }
+
     // CDC006: with an SDC file, a clock it does not define.
     void unclocked() {
         std::map<Sym, std::pair<int, SourceLocation>> none;
@@ -1494,6 +1555,7 @@ struct Checker {
         prof.lap("reconvergence");
         rdc();
         if (m.sdc.on) unclocked();
+        clockChecks();
         prof.lap("resets");
         flush();
         if (opt.report) report();
@@ -2682,6 +2744,67 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
                 if (s.rel[i->second][j->second] == Model::Exclusive) continue;
                 s.rel[i->second][j->second] = s.rel[j->second][i->second] = Model::Async;
             }
+    }
+
+    // set_case_analysis 0/1: the signal is constant, like -static.
+    for (const cdcsdc::CaseAnalysis& ca : rd.sdc.caseAnalysis)
+        if (ca.value == "0" || ca.value == "1" || ca.value == "zero" || ca.value == "one")
+            for (const cdcsdc::Obj& o : ca.objects)
+                if (Sym c = view.at(o)) m.statics.insert(c);
+
+    // Ports: set_input_delay -clock C says a flop clocked by C (outside the
+    // design) launches the input, set_output_delay -clock C that one captures
+    // the output. Each becomes a flop of that clock on the port, so a path
+    // from an input or to an output is checked like any other. A virtual
+    // clock (no source) gets a node of its own.
+    std::vector<Sym> clockNode(n, nullptr);
+    for (auto& [node, list] : s.at)
+        for (int i : list)
+            if (!clockNode[i] || m.pathOf(node) < m.pathOf(clockNode[i])) clockNode[i] = node;
+    auto pseudo = [&](const std::string& label, const Type& t, SourceLocation loc) {
+        m.sliceNames.push_back(label);
+        auto* v = comp.emplace<VariableSymbol>(std::string_view(m.sliceNames.back()), loc, VariableLifetime::Static);
+        v->setType(t);
+        m.sliceLabel[v] = &m.sliceNames.back();
+        return v;
+    };
+    std::map<std::string, const PortSymbol*> topPort;
+    for (const InstanceSymbol* top : comp.getRoot().topInstances)
+        for (const Symbol* ps : top->body.getPortList())
+            if (ps->kind == SymbolKind::Port && !topPort.count(std::string(ps->name)))
+                topPort[std::string(ps->name)] = &ps->as<PortSymbol>();
+    std::set<std::pair<std::string, int>> done;
+    for (const cdcsdc::IoDelay& d : rd.sdc.ioDelays) {
+        auto ci = ix.find(d.clock);
+        if (d.clock.empty() || ci == ix.end()) continue;
+        int c = ci->second;
+        if (!clockNode[c]) {
+            Sym v = pseudo("virtual clock " + d.clock, comp.getLogicType(), SourceLocation::NoLocation);
+            s.at[v].push_back(c);
+            clockNode[c] = v;
+        }
+        for (const cdcsdc::Obj& o : d.ports) {
+            std::string base = o.name.substr(0, o.name.find('['));
+            auto pit = topPort.find(base);
+            if (pit == topPort.end() || !pit->second->internalSymbol || !isSignal(*pit->second->internalSymbol)) continue;
+            if (!done.insert({base + (d.input ? "<" : ">"), c}).second) continue;
+            Sym port = pit->second->internalSymbol;
+            Sym node = m.canon(port);
+            if (s.at.count(node)) continue;  // a clock pin
+            const Type& t = port->as<ValueSymbol>().getType();
+            std::string label = m.pathOf(port) + (d.input ? " (launched by " : " (captured by ") + d.clock + ")";
+            Sym v = pseudo(label, t, port->location);
+            Flop& f = m.flop(v, port->location);
+            f.clkSym = clockNode[c];
+            if (d.input) {
+                m.addComb(port, {m.canon(v)}, true, nullptr);  // the input is that flop
+            } else {
+                f.data = {node};
+                f.from = node;
+                f.fromBits = f.bits;
+                f.plain = false;  // the logic outside reads it
+            }
+        }
     }
 }
 
