@@ -32,6 +32,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI primitives (37, 38.10): `vpi_iterate(vpiPrimitive / vpiGate /
+  vpiSwitch / vpiUdp, module)`, `vpiPrimType`, `vpiPrimTerm` terminals with
+  direction and connection, and gate delays through `vpi_get_delays` /
+  `vpi_put_delays`. `tests/spec/38.10-vpi-primitives.sv`.
 - VPI module paths (38.10): `vpi_iterate(vpiModPath, module)`, their input
   and output terms, and their delays through `vpi_get_delays` /
   `vpi_put_delays`. `tests/spec/38.10-vpi-modpath.sv`.
