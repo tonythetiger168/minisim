@@ -304,6 +304,13 @@ struct Rt {
         g.build(m);
         for (size_t i = 0; i < S.sigs.size(); i++) sigByName.emplace(S.sigs[i].name, (int)i);
         for (auto& w : m.warnings) std::cerr << "msim: UPF: " << w << "\n";
+        for (auto& e : retModelEls) {   // map_retention_cell -lib_model_name (6.39)
+            auto a = sigByName.find(e.el), b = sigByName.find(e.q);
+            if (a == sigByName.end() || b == sigByName.end())
+                throw Error("map_retention_cell: no signal " + (a == sigByName.end() ? e.el : e.q) + " for the retention model");
+            e.elSig = a->second;
+            e.qSig = b->second;
+        }
         // supply subnets: every supply port, net and switch port; switches
         // driving a subnet
         std::set<std::string> all(m.ports.begin(), m.ports.end());
@@ -388,6 +395,7 @@ struct Rt {
             // slang names procedure kinds "Initial", "AlwaysFF", ...; lowering adds "assign", "init", "sampled"
             const std::string& k = lp.kind;
             if (k == "Initial" || k == "Final" || k == "init" || k == "sampled") continue;
+            if (inRetModel(lp.scope)) continue;   // a -lib_model_name model is not corrupted (6.39)
             std::string dn = dm.of(lp.scope);
             // set_simstate_behavior (6.56): DISABLE and PORT_CORR_ONLY leave the logic alone
             auto [beh, behAt] = behaviorOf(lp.scope);
@@ -443,6 +451,10 @@ struct Rt {
                     for (int s : w) stateSigs[(size_t)domIdx.at(dn)].insert(s);
             }
         }
+        for (auto& e : retModelEls)
+            for (auto& o : owned) o.erase(e.elSig);
+        for (auto& st2 : stateSigs)
+            for (auto& e : retModelEls) st2.erase(e.elSig);
         for (size_t d = 0; d < doms.size(); d++) {
             for (int s : owned[d])
                 if (S.sigs[(size_t)s].name.find('$') == std::string::npos && !noCorr.count(s)) doms[d].owned.push_back(s);
@@ -498,6 +510,7 @@ struct Rt {
             if (h.hdl2upf) w.insert(h.sig);
             if (h.copyFrom >= 0) w.insert(h.copyFrom);
         }
+        for (auto& e : retModelEls) w.insert(e.qSig);
         for (int s : w) watch.push_back({s, ANY});
         chkSig = S.sig("$upf.check", 1);
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
@@ -1328,6 +1341,317 @@ struct Rt {
         }
         return out;
     }
+    // map_retention_cell -lib_model_name (6.39): each mapped register is
+    // simulated by the model. A wrapper module bound into the register's
+    // instance takes the register's canonical interface, inferred from the
+    // always block that assigns it (UPF_GENERIC_CLOCK, _DATA,
+    // _ASYNC_SET_RESET / _ASYNC_LOAD, _OUTPUT), and instantiates the model
+    // with -port_map; supply ports of the model are connected like
+    // connect_supply_net. The register then follows the model's output, and
+    // neither corruption nor the strategy's retention applies to it.
+    struct RetModelEl { std::string el, q, inst, strategy; int elSig = -1, qSig = -1; bool copied = false; Val last; };
+    std::vector<RetModelEl> retModelEls;
+    std::vector<std::string> retModelInsts;   // design paths of the wrapper instances
+    bool inRetModel(const std::string& scope) const {
+        for (auto& i : retModelInsts) if (DomainMap::within(scope, i)) return true;
+        return false;
+    }
+    std::string retModelSource(slang::ast::Compilation& comp, const std::string& simTop) {
+        using namespace slang::ast;
+        std::string out;
+        int k = 0;
+        auto trim = [](std::string t) {
+            size_t a = t.find_first_not_of(" \t\r\n"), b = t.find_last_not_of(" \t\r\n");
+            return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+        };
+        auto text = [&](const Expression& e) { return e.syntax ? trim(e.syntax->toString()) : std::string(); };
+        auto instAt = [&](const std::string& full) -> const InstanceSymbol* {
+            const Symbol* cur = nullptr;
+            size_t a = 0;
+            while (true) {
+                size_t b = full.find('.', a);
+                std::string part = full.substr(a, b == std::string::npos ? std::string::npos : b - a);
+                if (!cur) {
+                    for (auto* t : comp.getRoot().topInstances) if (t->name == part) cur = t;
+                } else {
+                    const Symbol* c2 = cur->as<InstanceSymbol>().body.find(part);
+                    cur = c2 && c2->kind == SymbolKind::Instance ? c2 : nullptr;
+                }
+                if (!cur) return nullptr;
+                if (b == std::string::npos) return &cur->as<InstanceSymbol>();
+                a = b + 1;
+            }
+        };
+        for (auto& rm : m.retModels) {
+            auto fail = [&](const std::string& msg) -> void { throw Error(rm.where + ": map_retention_cell -lib_model_name " + rm.model + ": " + msg + " (6.39)"); };
+            std::string mod = rm.model.substr(rm.model.rfind('.') == std::string::npos ? 0 : rm.model.rfind('.') + 1);
+            auto def = comp.tryGetDefinition(mod, comp.getRoot());
+            if (!def.definition || def.definition->kind != SymbolKind::Definition) fail("no module " + rm.model);
+            auto& minst = InstanceSymbol::createDefault(comp, def.definition->as<DefinitionSymbol>());
+            struct MP { std::string name; int dir; bool supply; int w; };
+            std::vector<MP> mports;
+            for (const Symbol* q : minst.body.getPortList()) {
+                if (q->kind != SymbolKind::Port) fail(rm.model + " has a port that is not a plain port");
+                auto& qp = q->as<PortSymbol>();
+                int dir = qp.direction == ArgumentDirection::In ? 0 : qp.direction == ArgumentDirection::Out ? 1 : 2;
+                if (dir == 2) fail(rm.model + " has an inout port " + std::string(qp.name));
+                mports.push_back({std::string(qp.name), dir, supplyType(qp.getType()), (int)qp.getType().getBitWidth()});
+            }
+            for (auto& [port, ref] : rm.portMap)
+                if (std::none_of(mports.begin(), mports.end(), [&](const MP& x) { return x.name == port; }))
+                    fail(rm.model + " has no port " + port);
+            // the registers: -elements, or each strategy's elements
+            std::vector<std::pair<const Retention*, std::string>> regs;   // strategy, rooted element
+            for (auto& sn : rm.strategies)
+                for (auto& r : m.rets)
+                    if (r.name == sn && r.domain == rm.domain) {
+                        const auto& els = rm.elements.empty() ? r.elements : rm.elements;
+                        if (els.empty()) fail("strategy " + sn + " names no elements; give -elements");
+                        for (auto& e : els) regs.push_back({&r, e});
+                    }
+            for (auto& [r, e] : regs) {
+                std::string d = m.design(e);
+                std::string full = simTop.empty() ? d : simTop + "." + d;
+                // an instance: every register its clocked blocks assign; else one variable
+                std::vector<std::pair<const InstanceSymbol*, const Symbol*>> vars;
+                if (const InstanceSymbol* is = instAt(full)) {
+                    std::function<void(const InstanceSymbol&)> walk = [&](const InstanceSymbol& in) {
+                        for (auto& pb : in.body.membersOfType<ProceduralBlockSymbol>()) {
+                            if (pb.procedureKind != ProceduralBlockKind::AlwaysFF && pb.procedureKind != ProceduralBlockKind::Always) continue;
+                            std::function<void(const Statement&)> sv = [&](const Statement& st) {
+                                if (st.kind == StatementKind::Timed) sv(st.as<TimedStatement>().stmt);
+                                else if (st.kind == StatementKind::Block) sv(st.as<BlockStatement>().body);
+                                else if (st.kind == StatementKind::List) for (auto* x : st.as<StatementList>().list) sv(*x);
+                                else if (st.kind == StatementKind::Conditional) {
+                                    auto& c = st.as<ConditionalStatement>();
+                                    sv(c.ifTrue);
+                                    if (c.ifFalse) sv(*c.ifFalse);
+                                } else if (st.kind == StatementKind::ExpressionStatement) {
+                                    auto& x = st.as<ExpressionStatement>().expr;
+                                    if (x.kind == ExpressionKind::Assignment) {
+                                        auto& l = x.as<AssignmentExpression>().left();
+                                        if (l.kind == ExpressionKind::NamedValue) {
+                                            const Symbol* v = &l.as<NamedValueExpression>().symbol;
+                                            if (std::none_of(vars.begin(), vars.end(), [&](auto& pv) { return pv.second == v; })) vars.push_back({&in, v});
+                                        }
+                                    }
+                                }
+                            };
+                            if (pb.getBody().kind == StatementKind::Timed) sv(pb.getBody());
+                        }
+                        for (auto& ch : in.body.membersOfType<InstanceSymbol>()) walk(ch);
+                    };
+                    walk(*is);
+                    if (vars.empty()) fail("instance " + e + " has no register");
+                } else {
+                    size_t dot = full.rfind('.');
+                    const InstanceSymbol* is2 = dot == std::string::npos ? nullptr : instAt(full.substr(0, dot));
+                    const Symbol* v = is2 ? is2->body.find(full.substr(dot + 1)) : nullptr;
+                    if (!v || !ValueSymbol::isKind(v->kind)) fail("no register " + e + " in the design");
+                    vars.push_back({is2, v});
+                }
+                for (auto& [is, var] : vars) {
+                    // the always block that assigns it
+                    const ProceduralBlockSymbol* blk = nullptr;
+                    std::function<bool(const Statement&)> assigns = [&](const Statement& st) -> bool {
+                        switch (st.kind) {
+                            case StatementKind::Timed: return assigns(st.as<TimedStatement>().stmt);
+                            case StatementKind::Block: return assigns(st.as<BlockStatement>().body);
+                            case StatementKind::List:
+                                for (auto* x : st.as<StatementList>().list) if (assigns(*x)) return true;
+                                return false;
+                            case StatementKind::Conditional: {
+                                auto& c = st.as<ConditionalStatement>();
+                                return assigns(c.ifTrue) || (c.ifFalse && assigns(*c.ifFalse));
+                            }
+                            case StatementKind::ExpressionStatement: {
+                                auto& x = st.as<ExpressionStatement>().expr;
+                                if (x.kind != ExpressionKind::Assignment) return false;
+                                auto& l = x.as<AssignmentExpression>().left();
+                                return l.kind == ExpressionKind::NamedValue && &l.as<NamedValueExpression>().symbol == var;
+                            }
+                            default: return false;
+                        }
+                    };
+                    for (auto& pb : is->body.membersOfType<ProceduralBlockSymbol>())
+                        if (pb.getBody().kind == StatementKind::Timed && assigns(pb.getBody())) blk = &pb;
+                    std::string vname(var->name);
+                    if (!blk) fail("no clocked always block assigns " + vname);
+                    auto& ts = blk->getBody().as<TimedStatement>();
+                    struct Ev { std::string sig; int edge; };   // 1 posedge, 2 negedge
+                    std::vector<Ev> evs;
+                    auto addEv = [&](const TimingControl& t) {
+                        if (t.kind != TimingControlKind::SignalEvent) fail("the block that assigns " + vname + " is not edge triggered");
+                        auto& se = t.as<SignalEventControl>();
+                        if (se.edge != EdgeKind::PosEdge && se.edge != EdgeKind::NegEdge) fail("the block that assigns " + vname + " is not edge triggered");
+                        evs.push_back({text(se.expr), se.edge == EdgeKind::PosEdge ? 1 : 2});
+                    };
+                    if (ts.timing.kind == TimingControlKind::EventList)
+                        for (auto* t : ts.timing.as<EventListControl>().events) addEv(*t);
+                    else addEv(ts.timing);
+                    // the next state of the clocked branch, and the async events tested by the if chain
+                    const Statement* body = &ts.stmt;
+                    while (body->kind == StatementKind::Block) body = &body->as<BlockStatement>().body;
+                    auto mentions = [](const std::string& t, const std::string& id) {
+                        std::regex re("(^|[^A-Za-z0-9_$.])" + std::regex_replace(id, std::regex(R"([.^$|()\[\]{}*+?\\])"), R"(\$&)") + "($|[^A-Za-z0-9_$])");
+                        return std::regex_search(t, re);
+                    };
+                    std::vector<bool> isAsync(evs.size(), false);
+                    if (evs.size() > 1) {
+                        const Statement* b = body;
+                        while (b->kind == StatementKind::Conditional) {
+                            auto& c = b->as<ConditionalStatement>();
+                            std::string ct = text(*c.conditions[0].expr);
+                            bool any = false;
+                            for (size_t i = 0; i < evs.size(); i++)
+                                if (mentions(ct, evs[i].sig)) { isAsync[i] = true; any = true; }
+                            if (!any || !c.ifFalse) break;
+                            b = c.ifFalse;
+                            while (b->kind == StatementKind::Block) b = &b->as<BlockStatement>().body;
+                        }
+                        body = b;
+                    }
+                    int clk = -1;
+                    for (size_t i = 0; i < evs.size(); i++)
+                        if (!isAsync[i]) {
+                            if (clk >= 0) fail("the block that assigns " + vname + " has two clocks");
+                            clk = (int)i;
+                        }
+                    if (clk < 0) fail("the block that assigns " + vname + " has no clock");
+                    std::function<std::string(const Statement&, const std::string&)> next = [&](const Statement& st, const std::string& cur) -> std::string {
+                        switch (st.kind) {
+                            case StatementKind::Block: return next(st.as<BlockStatement>().body, cur);
+                            case StatementKind::List: {
+                                std::string c2 = cur;
+                                for (auto* x : st.as<StatementList>().list) c2 = next(*x, c2);
+                                return c2;
+                            }
+                            case StatementKind::Conditional: {
+                                auto& c = st.as<ConditionalStatement>();
+                                std::string t = next(c.ifTrue, cur), f = c.ifFalse ? next(*c.ifFalse, cur) : cur;
+                                if (t == f) return t;
+                                return "((" + text(*c.conditions[0].expr) + ") ? " + t + " : " + f + ")";
+                            }
+                            case StatementKind::ExpressionStatement: {
+                                auto& x = st.as<ExpressionStatement>().expr;
+                                if (x.kind != ExpressionKind::Assignment) return cur;
+                                auto& a = x.as<AssignmentExpression>();
+                                if (a.left().kind == ExpressionKind::NamedValue && &a.left().as<NamedValueExpression>().symbol == var)
+                                    return "(" + text(a.right()) + ")";
+                                return cur;
+                            }
+                            case StatementKind::Empty: return cur;
+                            default: fail("the block that assigns " + vname + " has a statement the canonical interface is not inferred from");
+                        }
+                        return cur;
+                    };
+                    std::string data = next(*body, vname);
+                    std::string clkT = (evs[(size_t)clk].edge == 1 ? "" : "!") + std::string("(") + evs[(size_t)clk].sig + ")";
+                    std::string async;
+                    for (size_t i = 0; i < evs.size(); i++)
+                        if (isAsync[i]) async += std::string(async.empty() ? "" : " || ") + (evs[i].edge == 1 ? "(" : "!(") + evs[i].sig + ")";
+                    if (async.empty()) async = "1'b0";
+                    const Type& vt = var->as<ValueSymbol>().getType();
+                    int w = (int)vt.getBitWidth();
+                    if (w <= 0) fail(vname + " is not a vector of bits");
+                    std::string instPath = std::string(is->getHierarchicalPath());   // slang's dotted path from the root
+                    std::string relInst = instPath.substr(simTop.size() + (instPath.size() > simTop.size() ? 1 : 0));
+                    std::string id = std::to_string(k++);
+                    std::string modName = "upf_retm_mod_" + id, inst = "upf_retm_" + id;
+                    std::string root = simTop.empty() ? "" : simTop + ".";
+                    auto hier = [&](const std::string& upfName) { return root + m.design(upfName); };
+                    // the model's ports
+                    std::string ports = "input logic upf_clk, input logic [" + std::to_string(w - 1) + ":0] upf_data, input logic upf_async, "
+                                        "input logic upf_save, input logic upf_restore";
+                    std::string conns;
+                    std::string relInstUpf = relInst;
+                    {
+                        std::string topPre = m.top.empty() ? "" : m.top + ".";
+                        if (!topPre.empty() && relInstUpf.compare(0, topPre.size(), topPre) == 0) relInstUpf = relInstUpf.substr(topPre.size());
+                        else if (relInstUpf == m.top) relInstUpf.clear();
+                        for (char& ch : relInstUpf) if (ch == '.') ch = '/';
+                    }
+                    bool outMapped = false;
+                    int nsup = 0;
+                    std::string supConns;   // tied off in the bind: the runtime drives them from the supply nets
+                    for (auto& mp : mports) {
+                        std::string ref;
+                        for (auto& [port, r2] : rm.portMap) if (port == mp.name) ref = r2;
+                        bool inv = !ref.empty() && ref[0] == '~';
+                        std::string x = inv ? ref.substr(1) : ref;
+                        std::string neg = inv ? "~" : "";
+                        std::string e2;
+                        if (ref.empty()) {
+                            if (mp.dir == 1 && std::count_if(mports.begin(), mports.end(), [](const MP& y) { return y.dir == 1; }) == 1 &&
+                                std::none_of(rm.portMap.begin(), rm.portMap.end(), [](auto& pm) { return pm.second == "UPF_GENERIC_OUTPUT"; })) {
+                                e2 = "upf_q";
+                                outMapped = true;
+                            } else if (mp.dir == 0) fail("input port " + mp.name + " of " + rm.model + " is not connected by -port_map");
+                            else continue;
+                        } else if (x == "UPF_GENERIC_CLOCK") e2 = neg + "upf_clk";
+                        else if (x == "UPF_GENERIC_DATA") e2 = neg + "upf_data";
+                        else if (x == "UPF_GENERIC_ASYNC_SET_RESET" || x == "UPF_GENERIC_ASYNC_LOAD") e2 = neg + "upf_async";
+                        else if (x == "UPF_GENERIC_OUTPUT") {
+                            if (mp.dir != 1) fail("UPF_GENERIC_OUTPUT goes to an output port, not " + mp.name);
+                            e2 = "upf_q";
+                            outMapped = true;
+                        } else if (x == "save_signal") e2 = neg + "upf_save";
+                        else if (x == "restore_signal") e2 = neg + "upf_restore";
+                        else {
+                            // a supply: a supply net or port, retention_supply.f, primary_supply.f
+                            std::string net;
+                            std::string j = Model::join(rm.scope, x);
+                            if (x.rfind("retention_supply.", 0) == 0) net = m.fnNet(r->supply + x.substr(16));
+                            else if (x.rfind("primary_supply.", 0) == 0) net = m.fnNet(m.primaryOf(rm.domain) + x.substr(14));
+                            else if (m.nets.count(j) || m.ports.count(j)) net = j;
+                            else if (!m.fnNet(j).empty()) net = m.fnNet(j);
+                            if (!net.empty()) {
+                                if (mp.dir != 0) fail("supply " + x + " goes to an input port, not " + mp.name);
+                                std::string sp = "upf_sup_" + std::to_string(nsup++);
+                                ports += std::string(", input ") + (mp.supply ? "UPF::upfSupplyTypeT " : "logic ") + sp;
+                                e2 = sp;
+                                supConns += ", ." + sp + "('0)";
+                                std::string upfPort = (relInstUpf.empty() ? "" : relInstUpf + "/") + inst + "/" + sp;
+                                m.connects[net].push_back(upfPort);
+                                m.connectWhere[{net, upfPort}] = rm.where;
+                            } else {
+                                // a logic net
+                                if (inv) fail("~ is only for the symbolic references, not " + x);
+                                e2 = hier(j);
+                            }
+                        }
+                        conns += std::string(conns.empty() ? "" : ", ") + "." + mp.name + "(" + e2 + ")";
+                    }
+                    if (!outMapped) fail("no output port of " + rm.model + " drives " + vname + "; map one to UPF_GENERIC_OUTPUT");
+                    std::string sv = r->save.net.empty() ? "1'b0" : hier(r->save.net), rs = r->restore.net.empty() ? "1'b0" : hier(r->restore.net);
+                    out += "// map_retention_cell " + rm.strategies[0] + " -lib_model_name " + rm.model + ": " + relInst + "." + vname +
+                           " (IEEE 1801-2024 6.39)\nmodule " + modName + "(" + ports + ");\n  logic [" + std::to_string(w - 1) +
+                           ":0] upf_q;\n  " + mod + " u_model(" + conns + ");\nendmodule\nbind " + instPath + " " + modName + " " + inst +
+                           "(.upf_clk(" + clkT + "), .upf_data(" + data + "), .upf_async(" + async + "), .upf_save(" + sv +
+                           "), .upf_restore(" + rs + ")" + supConns + ");\n";
+                    RetModelEl el;
+                    el.el = relInst + "." + vname;
+                    el.inst = relInst + "." + inst;
+                    el.q = el.inst + ".upf_q";
+                    el.strategy = r->name;
+                    retModelEls.push_back(el);
+                    retModelInsts.push_back(el.inst);
+                    note("map_retention_cell: " + el.el + " is simulated by " + rm.model + " (" + el.inst + ")");
+                }
+            }
+        }
+        return out;
+    }
+    void copyRetModels() {
+        for (auto& e : retModelEls) {
+            if (e.qSig < 0) continue;
+            Val v = S.get(e.qSig);
+            if (e.copied && v == e.last) continue;
+            e.copied = true;
+            e.last = v;
+            S.holdOn(e.elSig, konst(v), true);
+        }
+    }
     // The HDL ports that drive supply nets: their value is the root supply.
     void readHdlPorts() {
         for (auto& h : hdlPorts) {
@@ -1610,7 +1934,8 @@ struct Rt {
                 // -applies_to flop / latch is not told apart: both are state elements
                 if (in) rr.els.push_back({s, allx(S.sigs[(size_t)s].w), false});
             }
-            if (rr.els.empty())
+            bool modelled = std::any_of(retModelEls.begin(), retModelEls.end(), [&](const RetModelEl& e) { return e.strategy == r.name; });
+            if (rr.els.empty() && !modelled)
                 std::cerr << "msim: UPF: " << r.where << ": retention " << r.name << " applies to no state element\n";
             note("retention " + r.name + ": " + std::to_string(rr.els.size()) + " state elements");
             rets.push_back(std::move(rr));
@@ -2104,6 +2429,7 @@ struct Rt {
     bool checkArmed = false;
     void evaluate() {
         copyVcmResults();
+        copyRetModels();
         readHdlPorts();
         evalSupplies();
         driveHdlPorts();

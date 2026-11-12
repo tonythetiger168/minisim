@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- UPF `map_retention_cell -lib_model_name` (IEEE 1801-2024 6.39) is
+  simulated: the mapped register runs as the verification model, wired to
+  the clock, data and async set/reset inferred from its always block, the
+  strategy's save and restore signals and its supplies.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
