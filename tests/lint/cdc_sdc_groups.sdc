@@ -8,3 +8,5 @@ create_generated_clock -name U -source [get_ports aclk] -divide_by 2 [get_pins u
 # synchronous to both, as it is for timing.
 set_clock_groups -asynchronous -group {A} -group {B}
 set_clock_groups -physically_exclusive -group {C} -group {T}
+# test_mode is 0 in function: the clock mux is not switched.
+set_case_analysis 0 [get_ports test_mode]

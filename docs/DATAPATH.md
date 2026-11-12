@@ -64,6 +64,39 @@ Conventions:
 | `MW_mux`, `MW_mux_onehot` | `NUM`-to-1 multiplexer, binary or one-hot select |
 | `MW_ecc` | Hamming SECDED: generate check bits, correct one error, flag two |
 
+## Floating point
+
+IEEE 754 binary arithmetic in any format: operands and results are
+`{sign, exponent[EXP-1:0], fraction[FRAC-1:0]}`, with `EXP` and `FRAC`
+parameters (half 5/10, bfloat16 8/7, single 8/23, double 11/52, or anything
+else). Subnormals are full IEEE, not flushed to zero, and every result is
+rounded once, correctly.
+
+- `rnd[2:0]`: 0 to nearest, ties to even; 1 toward zero; 2 toward +inf;
+  3 toward -inf; 4 to nearest, ties away from zero.
+- `status[4:0]` = `{inexact, underflow, overflow, divzero, invalid}`.
+  Underflow is tininess before rounding together with inexact.
+- A NaN result is the canonical quiet NaN (sign 0, fraction MSB 1, rest 0).
+  A signaling NaN operand, `inf - inf`, `0 * inf`, `0/0`, `inf/inf` and the
+  square root of a negative number raise invalid.
+
+| Module | Function |
+| --- | --- |
+| `MW_fp_add`, `MW_fp_sub` | `z = a + b`, `z = a - b` |
+| `MW_fp_addsub` | add or subtract, chosen by `op` (1 subtracts) |
+| `MW_fp_mult` | `z = a * b` |
+| `MW_fp_div` | `z = a / b`; finite / 0 gives a signed infinity and divzero |
+| `MW_fp_sqrt` | `z = sqrt(a)`; `sqrt(-0) = -0` |
+| `MW_fp_mac` | fused `z = a * b + c`, one rounding; `0 * inf` is invalid even with a quiet NaN `c` |
+| `MW_fp_recip` | `z = 1 / a` |
+| `MW_fp_flt2flt` | conversion between two formats (`EXP_A`/`FRAC_A` to `EXP_Z`/`FRAC_Z`), narrowing or widening |
+| `MW_fp_cmp` | `altb`, `aeqb`, `agtb`, `unordered`; `z0`, `z1` are IEEE 754-2019 minimumNumber and maximumNumber (swapped when `zctr` = 1), with `-0 < +0` |
+| `MW_fp_i2flt` | `IW`-bit integer to float, unsigned or two's complement (`tc`) |
+| `MW_fp_flt2i` | float to `IW`-bit integer by `rnd`; NaN, infinity and out-of-range values saturate and raise invalid |
+| `MW_fp_round` | the shared step: rounds `sig * 2^e` (plus a sticky bit) into the format |
+
+Division and square root reuse `MW_div` and `MW_sqrt` on the significands.
+
 ## Sequential
 
 | Module | Function |
@@ -87,6 +120,16 @@ SystemVerilog operators or a behavioural model: `arith.sv`, `muldiv.sv`,
 `bits.sv`, `seq.sv`. The CRC bench checks the published check values of
 CRC-16/CCITT-FALSE and CRC-32. The same benches also pass on Verilator 5, and
 the library is clean under `verilator --lint-only -Wall`.
+
+The floating point modules have their own check, `tests/dw_fp_test.py`
+(`dw/fp` in ctest): an exact reference written with Python fractions rounds
+each result once, and msim must match it bit for bit, flags included, in five
+formats (4/3, half, bfloat16, single, double) and all five rounding modes;
+the fused multiply-add gets operands that nearly cancel, and the format
+conversion goes from each format to another, wider or narrower.
+A third of the operands are zeros, infinities, quiet and signaling NaNs,
+subnormals, the largest and smallest numbers, and near-cancelling pairs.
+`dw_fp_test.py REPO MSIM 3000` runs 75000 vectors instead of 7500.
 
 ## Choosing an adder
 
