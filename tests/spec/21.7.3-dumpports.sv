@@ -1,6 +1,6 @@
 // IEEE 1800-2023 21.7.3 / 21.7.4: $dumpports writes an extended VCD file
 // with the ports of the named instance: inputs as D/U/N/Z, outputs as
-// L/H/X/T, inouts as 0/1/?/F, each with its strength0 and strength1
+// L/H/X/T, an inout by the side that drives it, each with its strength0 and strength1
 // digits. $dumpportsoff dumps every port as unknown, $dumpportson and
 // $dumpportsall dump the current values, $dumpportsflush writes the file
 // out so the test can read it back.
@@ -45,7 +45,7 @@ endmodule
 //> pD 6 0 <0
 //> pDUDU 6060 0606 <1
 //> pH 0 6 <2
-//> p0 6 0 <3
+//> pL 6 0 <3
 //> $end
 //> #1
 //> pU 0 6 <0
@@ -65,12 +65,12 @@ endmodule
 //> pD 6 0 <0
 //> pNDUZ 6600 6060 <1
 //> pH 0 6 <2
-//> p0 6 0 <3
+//> pL 6 0 <3
 //> $end
 //> #6
 //> $dumpportsall
 //> pD 6 0 <0
 //> pNDUZ 6600 6060 <1
 //> pH 0 6 <2
-//> p0 6 0 <3
+//> pL 6 0 <3
 //> $end
