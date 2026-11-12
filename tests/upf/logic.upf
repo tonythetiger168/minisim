@@ -1,0 +1,31 @@
+# Power intent for logic.sv.
+upf_version 4.0
+set_design_top dut
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_CORE -elements {u_core}
+create_supply_port VDD
+create_supply_port VDD_REP
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VDD_REP
+create_supply_net VSS
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VDD_REP -ports {VDD_REP}
+connect_supply_net VSS -ports {VSS}
+create_supply_set SS -function {power VDD} -function {ground VSS}
+create_supply_set SS_REP -function {power VDD_REP} -function {ground VSS}
+associate_supply_set SS -handle PD_TOP.primary
+associate_supply_set SS -handle PD_CORE.primary
+
+# the pmu's outputs, routed by the power intent
+create_logic_net {iso_w mode_w}
+create_logic_port iso_mon -direction out
+connect_logic_net iso_w -ports {u_pmu/iso iso_mon}
+connect_logic_net mode_w -ports {u_pmu/mode}
+connect_logic_net mode_w -ports {u_core/mode} -reconnect
+
+set_isolation ISO -domain PD_CORE -applies_to outputs -elements {u_core/q} \
+    -isolation_supply SS -clamp_value 1 -isolation_signal iso_w -isolation_sense high \
+    -diff_supply_only FALSE
+set_repeater REP -domain PD_CORE -applies_to outputs -elements {u_core/r} -repeater_supply SS_REP
+set_repeater REP -domain PD_CORE -update -exclude_elements {u_core/q}
