@@ -410,3 +410,41 @@ if(PY)
     message(FATAL_ERROR "mdebug -serve: ${rc}\n${out}${err}")
   endif()
 endif()
+
+# UVM transactions (-tr): tests/debug/tr_db.log is what uvm-core 2020.3.1
+# wrote on msim for tests/debug/uvm_record.sv (the mdebug_uvm_tr test makes
+# a fresh one when UVM is there). Streams, one stream with its fields and
+# parent sequence, the transactions in progress at a time, and the page data.
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/tr_db.log -trans
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "uvm_test_top\\.e\\.ag\\.sqr\\.s  6 transactions  \\(0 to 100000\\)\n"
+   OR NOT out MATCHES "uvm_test_top\\.e\\.ag\\.d\\.drive  5 transactions  \\(10000 to 100000\\)\n"
+   OR NOT out MATCHES "uvm_test_top\\.e\\.ag\\.m\\.observed  5 transactions")
+  message(FATAL_ERROR "-trans: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/tr_db.log -trans ag.d.drive
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "#2 t  @10000 to 20000  a='h60 b='h76 sum='h0  \\(in #0 s on uvm_test_top\\.e\\.ag\\.sqr\\.s\\)\n"
+   OR NOT out MATCHES "#14 t  @90000 to 100000  a='hc1 b='h2")
+  message(FATAL_ERROR "-trans ag.d.drive: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/tr_db.log -trans -at 35000 -json ${OUT}/tr.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "drive at 35000:\n  #5 t  @30000 to 40000"
+   OR NOT out MATCHES "observed at 35000:\n  #6 t  @35000 to 40000  a='h22 b='ha sum='h2c\n")
+  message(FATAL_ERROR "-trans -at 35000: ${rc}\n${out}${err}")
+endif()
+file(READ ${OUT}/tr.json j)
+if(NOT j MATCHES "\"trans\":\\{\"end\":100000,\"streams\":\\[\\{\"name\":\"s\",\"scope\":\"uvm_test_top\\.e\\.ag\\.sqr\"")
+  message(FATAL_ERROR "no transactions in the JSON")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/tr_db.log -trans nosuch
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "no transaction stream 'nosuch'")
+  message(FATAL_ERROR "-trans nosuch: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/alu.sv -trans
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "no UVM transaction streams")
+  message(FATAL_ERROR "-tr on a file that is not one passed: ${rc}\n${out}${err}")
+endif()
