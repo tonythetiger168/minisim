@@ -11,6 +11,11 @@ Spec references are IEEE 1800-2023 clauses.
 - Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
   `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
   the last place), checked by `tests/dw/more.sv`.
+- `mdebug` waves: a marker with the time to the cursor (shift+click or `m`),
+  a radix per row (`r`: hex, decimal, signed, binary), find value
+  (next/previous time the selected signal takes it), Del to remove a row,
+  Ctrl+arrows to step changes; the view lives in the page address, so a
+  reload or a copied link opens on it.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
