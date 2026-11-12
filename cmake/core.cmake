@@ -16,6 +16,7 @@
 # installed package, so a header that is used but not listed here fails the
 # build rather than being found by accident through the source tree.
 set(MINISIM_CORE_HEADERS
+    annexd.inc
     clocking.hpp
     cover.hpp
     cover_rt.inc
