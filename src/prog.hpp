@@ -85,7 +85,9 @@ struct Prog;
 struct UdpRow { std::vector<std::string> in; char state = 0, out = 'x'; int edge = -1; };
 struct UdpTable { int nin = 0; bool seq = false; bool edges = false; std::vector<UdpRow> rows; };
 // IK::Dump commands, one per VCD task (21.7.1).
-enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT };
+enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT,
+               // Extended VCD (21.7.3): args hold [size,] file name; dsel the ports of $dumpports.
+               DC_PORTS, DC_POFF, DC_PON, DC_PALL, DC_PFLUSH, DC_PLIMIT };
 
 // Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
 // is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
@@ -97,6 +99,10 @@ inline SrcLoc g_runLoc;   // the statement running now, for run-time error messa
 inline std::string runLocStr();
 inline std::vector<std::string> g_covFiles{""};   // file id -> path; 0 = unknown
 inline bool g_cov = false;
+// msim -cm_cond (as VCS): full = every combination of the term values of a
+// condition (up to 8 terms), not only the sensitized vectors; allops = also
+// & and | on one-bit operands.
+inline bool g_condFull = false, g_condAllops = false;
 inline std::string runLocStr() {
     if (!g_runLoc.line || g_runLoc.file >= g_covFiles.size()) return "";
     return " (" + g_covFiles[g_runLoc.file] + ":" + std::to_string(g_runLoc.line) + ")";
@@ -107,15 +113,31 @@ inline uint32_t covFileId(const std::string& path) {
     if (fresh) g_covFiles.push_back(path);
     return it->second;
 }
+// Per-instance coverage: the module instances of the design, by path below
+// the top ("" = the top itself). The lowerer sets g_covInst to the instance
+// it is in; a Prog and a CondDef remember it. 0 = none (a package, a class).
+struct CovInst { std::string path, module; };
+inline std::vector<CovInst> g_covInsts{{}};
+inline uint32_t g_covInst = 0;
+inline uint32_t covInstId(const std::string& path, const std::string& module) {
+    for (size_t k = 1; k < g_covInsts.size(); k++)
+        if (g_covInsts[k].path == path && g_covInsts[k].module == module) return (uint32_t)k;
+    g_covInsts.push_back({path, module});
+    return (uint32_t)g_covInsts.size() - 1;
+}
 // Condition coverage: one entry per instrumented condition (see
 // Op::CondCov). Its counters are g_condHits[base .. base + terms.size()].
 struct CondDef {
     uint32_t file = 0, line = 0, col = 0;
+    uint32_t inst = 0;                // g_covInsts: the instance it is in
     bool isOr = false;
     bool lazy = false;                // the terms run in order until one decides (see condCovLazyEnd)
+    bool full = false;                // -cm_cond full: a counter per combination of the term values
+    bool bitwise = false;             // -cm_cond allops: a & b or a | b on one-bit operands
     std::string text;                 // the whole condition, as written
     std::vector<std::string> terms;   // each term, as written
     size_t base = 0;
+    size_t counters() const { return full ? (size_t)1 << terms.size() : terms.size() + 1; }
 };
 inline std::vector<CondDef>& condDefs() { static std::vector<CondDef> d; return d; }
 // FSM coverage: a state register found by the lowerer (fsm_extract.hpp), its
@@ -409,6 +431,7 @@ struct Prog {
     bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
     std::vector<Instr> code;
     const void* inst = nullptr;   // msim -cov: the instance it runs in (slang InstanceSymbol), for VPI (40)
+    uint32_t covInst = 0;  // g_covInsts: the instance it was lowered in (per-instance coverage)
     // msim -xprop, a clocked block with a clean copy: code[1] tests for an
     // ambiguous clock edge and otherwise jumps here. A clocked function
     // starts here at once in a time step where no signal has changed from
@@ -418,17 +441,27 @@ struct Prog {
     // fork branch that is a named block, every branch of a named fork).
     // `disable` of one of them from another process ends the process.
     std::vector<int> roots;
+    // Named blocks and tasks some `disable` names (9.6.2): code [s, e) is
+    // block id, and a process there resumes at e when it is disabled. A
+    // task's whole body is one span with e = SIZE_MAX: its caller resumes
+    // after the call.
+    struct Span { int id; size_t s, e; };
+    std::vector<Span> spans;
     // A static combinational process with deferred assertions (a unique
     // case's violation check): the ProcCtl its reports are queued under.
     // Each evaluation is a flush point (16.4.2), as the wait of the process is.
     mutable std::shared_ptr<void> combCtl;
     size_t emit(Instr i) {
         if (!i.line) { i.file = g_emitLoc.file; i.line = g_emitLoc.line; }
+        if (code.empty()) covInst = g_covInst;
         code.push_back(i);
         return code.size() - 1;
     }
     size_t here() const { return code.size(); }
 };
+
+// Some Prog has spans: processes are tracked for disable (9.6.2).
+inline bool& anySpans() { static bool b = false; return b; }
 
 // ---- helpers shared by lowering and tests ----
 // Signals an expression reads, each once, in first-read order. A variable
@@ -625,7 +658,7 @@ inline bool combShape(const Prog& p, CombShape& c) {
     const Instr& w = p.code[n - 2];
     const Instr& j = p.code[n - 1];
     if (j.k != IK::Jmp || j.target != 0 || w.k != IK::WaitEdge) return false;
-    if (!p.roots.empty()) return false;  // another process can `disable` it
+    if (!p.roots.empty() || !p.spans.empty()) return false;  // another process can `disable` it
     c = CombShape{};
     for (size_t i = 0; i + 2 < n; i++) {
         // An always_comb with if / case / loops: jumps that stay in the body.
@@ -789,7 +822,7 @@ inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
     const Instr& w = p.code[0];
     const Instr& j = p.code[n - 1];
     if (w.k != IK::WaitEdge || j.k != IK::Jmp || j.target != 0) return false;
-    if (!p.roots.empty()) return false;  // another process can `disable` it
+    if (!p.roots.empty() || !p.spans.empty()) return false;  // another process can `disable` it
     for (size_t i = 1; i + 1 < n; i++) {
         const Instr& x = p.code[i];
         if (x.k == IK::Nba) {

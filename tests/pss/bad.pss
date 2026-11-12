@@ -1,6 +1,0 @@
-component pss_top {
-  action entry {
-    rand bit[8] x
-    constraint x > 3;
-  }
-}

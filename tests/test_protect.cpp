@@ -11,6 +11,7 @@
 #include <iostream>
 #include <string>
 
+#include "licproxy.hpp"
 #include "protect.hpp"
 
 using namespace protect;
@@ -307,6 +308,87 @@ int main() {
         assert(vps[2].iface && vps[2].name.empty());
         assert(dv.text.substr(vps[2].targetBegin, 9) == "endmodule");
 
+        // Annex A: a viewport takes a list of scoped names, '.' or ':' between scopes.
+        {
+            const char* VL = "`pragma protect begin\n`pragma protect viewport m.a, m:blk:b\nmodule m; endmodule\n`pragma protect end\n";
+            Decrypted dl = decryptSource(encryptSourceV3(VL, va, "vl.sv"), a, "vl.svp");
+            auto& l = dl.envs[0].viewports;
+            assert(l.size() == 2 && l[0].name == "m.a" && l[1].name == "m.blk.b");
+        }
+
+        // IEEE 1735-2023 5.2 and Annex A, rule by rule.
+        auto enc = [&](const std::string& src) { return encryptSourceV3(src, va, "r.sv"); };
+        const std::string body = "`pragma protect begin\nmodule m; endmodule\n`pragma protect end\n";
+        // 5.2.1: strings are printable ASCII without " or backslash; no escapes.
+        assert(throws([&] { enc("`pragma protect author = \"a\\\\b\"\n" + body); }, "printable ASCII without"));
+        assert(throws([&] { enc("`pragma protect author = \"a\tb\"\n" + body); }, "printable ASCII without"));
+        assert(throws([&] { enc("`pragma protect begin_toolblock\n`pragma protect key_keyowner = \"Alice Corp\", key_keyname = \"alice-1\"\n"
+                                "`pragma protect control visibility = \"fu\\\\ll\"\n`pragma protect end_toolblock\n" + body); }, "5.2.1"));
+        // 5.2.2: keywords are lower case, so `pragma protect BEGIN cannot leave
+        // the source in the clear; names may not differ in case alone.
+        assert(throws([&] { enc("`pragma protect BEGIN\nmodule m; endmodule\n`pragma protect END\n"); }, "keywords are lower case"));
+        assert(throws([&] { enc("`pragma protect begin\nmodule m; endmodule\n`pragma protect End\n"); }, "keywords are lower case"));
+        assert(throws([&] { enc("`pragma protect begin_toolblock\n`pragma protect key_keyowner = \"Alice Corp\", key_keyname = \"alice-1\"\n"
+                                "`pragma protect control visibility = \"full\", Visibility = \"none\"\n`pragma protect end_toolblock\n" + body); },
+                      "differ only in letter case"));
+        assert(throws([&] { enc("`pragma protect data_method = \"AES256-CBC-HMAC-SHA512\"\n" + body); }));
+        {
+            Keyring k;
+            k.add(copyPriv(alice.get()), "key1", "Acme");
+            assert(throws([&] { k.add(copyPriv(bob.get()), "KEY1", "ACME"); }, "differ only in letter case"));
+            PublicKeyring pk2;
+            PublicKeyEntry x, y;
+            x.owner = "Acme"; x.name = "key1"; x.pub = pub(alice.get());
+            y.owner = "acme"; y.name = "Key1"; y.pub = pub(bob.get());
+            pk2.add(std::move(x));
+            assert(throws([&] { pk2.add(std::move(y)); }, "differ only in letter case"));
+        }
+        // Inside an envelope: the same rules, before the signature is checked.
+        const std::string good = enc(body);
+        assert(decryptSource(good, a, "g.svp").text.find("module m;") != std::string::npos);
+        auto edit = [&](const std::string& from, const std::string& to) {
+            std::string t = good;
+            size_t at = t.find(from);
+            assert(at != std::string::npos);
+            return t.replace(at, from.size(), to);
+        };
+        assert(throws([&] { decryptSource(edit("`pragma protect key_block", "`pragma protect KEY_BLOCK"), a, "c.svp"); },
+                      "keywords are lower case"));
+        // 5.2.3: no end-of-file character inside an envelope.
+        assert(throws([&] { decryptSource(edit("`pragma protect begin_toolblock\n", "`pragma protect begin_toolblock\n\x05\n"), a, "e.svp"); },
+                      "end-of-file character inside a decryption envelope"));
+        // Annex A: BASE64_TEXT has no spaces; tool and common blocks hold only their own pragmas.
+        {
+            std::string t = good;
+            size_t d = t.find("`pragma protect data_block\n") + 27;
+            t.insert(d + 10, " ");
+            assert(throws([&] { decryptSource(t, a, "b.svp"); }, "is not base64 text"));
+        }
+        assert(throws([&] { decryptSource(edit("`pragma protect end_toolblock", "`pragma protect author = \"x\"\n`pragma protect end_toolblock"), a, "t.svp"); },
+                      "does not belong in a tool block"));
+        assert(throws([&] { decryptSource(edit("`pragma protect begin_toolblock",
+                                               "`pragma protect begin_commonblock\n`pragma protect author = \"x\"\n"
+                                               "`pragma protect end_commonblock\n`pragma protect begin_toolblock"), a, "cb.svp"); },
+                      "only license_proxyenv and license_certificate belong in a common block"));
+        // The encryptor's own output stays inside the grammar: lower-case
+        // keywords, base64 lines, one quoted signature.
+        {
+            size_t at = good.find("`pragma protect begin_protected"), end = good.find("`pragma protect end_protected");
+            std::string env = good.substr(at, end - at);
+            size_t b0 = 0;
+            while (b0 < env.size()) {
+                size_t e = env.find('\n', b0);
+                std::string ln = env.substr(b0, e - b0);
+                b0 = e + 1;
+                if (ln.rfind("`pragma protect ", 0) == 0) {
+                    std::string k = ln.substr(16, ln.find_first_of(" =,", 16) - 16);
+                    for (char c : k) assert(!std::isupper((unsigned char)c));
+                } else {
+                    for (char c : ln) assert(std::isalnum((unsigned char)c) || c == '+' || c == '/' || c == '=');
+                }
+            }
+        }
+
         // Recipe pragmas in the source (5.6.1), with the key in a keyring
         // file in the 6.3.1 pragma exchange format; recipe lines are removed.
         PublicKeyring pk;
@@ -404,6 +486,130 @@ int main() {
     assert(throws([&] { decryptSource("`pragma protect data_block\nAAAA\n", ra, "f.sv"); }, "outside"));
     // A file without envelopes passes through unchanged.
     assert(decryptSource(SRC, none, "s").text == SRC);
+
+    // The license system's messages (IEEE 1735-2023 8.8). The byte strings
+    // are the standard's worked examples.
+    {
+        using namespace licproxy;
+        auto hex = [](const std::string& b) {
+            static const char* d = "0123456789abcdef";
+            std::string h;
+            for (unsigned char c : b) { h += d[c >> 4]; h += d[c & 15]; }
+            return h;
+        };
+        auto bin = [](const std::string& h) {
+            std::string b;
+            for (size_t i = 0; i + 1 < h.size(); i += 2) b += (char)std::stoi(h.substr(i, 2), nullptr, 16);
+            return b;
+        };
+        // 8.8.1: request 123 for license "lic1".
+        assert(hex(encodeRequest(123, "lic1", 0x10)) == "100c02010302017b16046c696331");
+        // 8.8.2: granted, no string, no message.
+        assert(hex(encodeReply(123, true, std::nullopt, std::nullopt, 0x10)) == "100902010302017b010101");
+        // 8.8.2: denied, "" and an explanatory message.
+        assert(hex(encodeReply(123, false, "", "License 'abc' denied", 0x10)) ==
+               "102102010302017b010100160016144c6963656e73652027616263272064656e696564");
+        // 8.8.2: granted, "xyz" and a message.
+        assert(hex(encodeReply(123, true, "xyz", "License 'abc' granted", 0x10)) ==
+               "102502010302017b010101160378797a16154c6963656e7365202761626327206772616e746564");
+        // 8.8.3: request id 0.
+        assert(hex(encodeInfo("License expires in 3 days", 0x10)) ==
+               "102102010302010016194c6963656e7365206578706972657320696e20332064617973");
+        // X.690's own identifier for a sequence is accepted and can be written.
+        assert(hex(encodeRequest(123, "lic1", 0x30)) == "300c02010302017b16046c696331");
+
+        std::vector<Elem> e;
+        size_t used = 0;
+        std::string m = bin("102502010302017b010101160378797a16154c6963656e7365202761626327206772616e746564");
+        assert(decode(m, used, e) == Parse::Ok && used == m.size() && e.size() == 5);
+        assert(e[0].i == 3 && e[1].i == 123 && e[2].k == Elem::Bool && e[2].b && e[3].s == "xyz" &&
+               e[4].s == "License 'abc' granted");
+        m[0] = 0x30;
+        assert(decode(m, used, e) == Parse::Ok && e.size() == 5);
+        // A message arriving in pieces is "more", never "bad"; two messages
+        // in one buffer come out one at a time.
+        for (size_t n = 0; n < m.size(); n++) assert(decode(std::string_view(m).substr(0, n), used, e) == Parse::More);
+        std::string two = m + encodeInfo("hello");
+        assert(decode(two, used, e) == Parse::Ok && used == m.size());
+        assert(decode(std::string_view(two).substr(used), used, e) == Parse::Ok && e[1].i == 0 && e[2].s == "hello");
+        // Not messages: another type first, a length past the sequence, a
+        // type that is not integer / Boolean / IA5String, too few fields,
+        // 8-bit characters in a string.
+        assert(decode(bin("0c03616263"), used, e) == Parse::Bad);
+        assert(decode(bin("100502010302097b"), used, e) == Parse::Bad);
+        assert(decode(bin("100902010302017b040101"), used, e) == Parse::Bad);
+        assert(decode(bin("100602010302017b"), used, e) == Parse::Bad);
+        assert(decode(bin("100902010302017b1601ff"), used, e) == Parse::Bad);
+        // Integers: request ids past one byte, and a long form length.
+        std::string big = encodeRequest(70000, std::string(300, 'a'), 0x10);
+        assert(decode(big, used, e) == Parse::Ok && e[1].i == 70000 && e[2].s.size() == 300);
+        assert(hex(encodeRequest(128, "", 0x10)).substr(10, 8) == "02020080");
+        assert(decode(encodeRequest(128, "x"), used, e) == Parse::Ok && e[1].i == 128);
+
+        // 8.7: the environment variable is port@host pairs separated by ';'.
+        auto eps = parseEndpoints("54321@proxyhost;27000@lic.example.com;7@10.0.0.1;9@[::1];8@fe80::1");
+        assert(eps && eps->size() == 5);
+        assert((*eps)[0].port == "54321" && (*eps)[0].host == "proxyhost");
+        assert((*eps)[1].host == "lic.example.com" && (*eps)[2].host == "10.0.0.1");
+        assert((*eps)[3].host == "::1" && (*eps)[4].host == "fe80::1");
+        for (const char* bad : {"", "proxyhost", "@host", "123@", "12 3@host", "123@ho st", "123@a;", "host:123", "99999@h", "0@h"})
+            assert(!parseEndpoints(bad));
+        assert(legalEnvName("ACME_PROXY") && legalEnvName("_x9") && !legalEnvName("9x") && !legalEnvName("A-B") && !legalEnvName(""));
+
+        // 8.9: irregularities before any connection is tried.
+        Client c;
+        assert(c.check({"", "x"}, "f").why == "the envelope has no license_proxyenv");
+        assert(c.check({"BAD NAME", "x"}, "f").irregular);
+        assert(c.check({"ACME_PROXY", ""}, "f").why == "the envelope has no license_certificate");
+        assert(c.check({"ACME_PROXY", "not a certificate"}, "f").why == "the envelope's license_certificate is not an X.509 certificate");
+        Reply r = c.check({"", ""}, "f");
+        assert(r.irregular && !r.granted && r.str.empty());
+    }
+
+    // The license specification reaches the proxy callback, and a licensing
+    // call is asked through it (8.3, 8.4): license uses the Boolean,
+    // license_string the string.
+    {
+        PKey k = genKey();
+        Keyring ring;
+        ring.add(copyPriv(k.get()), "alice-1", "Alice Corp");
+        V3Options v;
+        ToolRecipe tr;
+        tr.owner = "Alice Corp";
+        tr.name = "alice-1";
+        tr.pub = publicFromDer(publicDer(k.get()));
+        v.tools.push_back(tr);
+        v.tools[0].controls.push_back("visibility = license(\"f1\") ? \"full\" : \"none\", tag = license_string \"f2\", "
+                                      "other = license = \"f3\" ? \"y\" : \"n\"");
+        std::string src = std::string("`pragma protect begin_commonblock\n"
+                                      "`pragma protect license_proxyenv = \"ACME_PROXY\"\n"
+                                      "`pragma protect license_certificate\nQUJDRA==\n"
+                                      "`pragma protect end_commonblock\n") + SRC;
+        std::string env = encryptSourceV3(src, v, "p.sv");
+        DecryptOptions o;
+        std::vector<std::string> asked;
+        o.proxy = [&](const LicenseSpec& spec, const std::string& arg) -> LicenseValue {
+            assert(spec.env == "ACME_PROXY" && spec.certDer == "ABCD");
+            asked.push_back(arg);
+            if (arg == "f1") return {true, "ignored for license"};
+            if (arg == "f2") return {false, "gold"};
+            return {};
+        };
+        // A caller's table is not consulted when the tool has the license system.
+        o.license = [](const std::string&) -> std::optional<std::string> { return "self-granted"; };
+        Decrypted d = decryptSource(env, ring, "p.svp", o);
+        assert((asked == std::vector<std::string>{"f1", "f2", "f3"}));
+        assert(d.envs[0].right("visibility") == "full" && d.envs[0].right("tag") == "gold" && d.envs[0].right("other") == "n");
+        // A tool without the license system: false and "" (8.9), with a note.
+        DecryptOptions none2;
+        int warned = 0;
+        none2.warn = [&](const std::string&) { warned++; };
+        Decrypted dn2 = decryptSource(env, ring, "p.svp", none2);
+        assert(dn2.envs[0].right("visibility") == "none" && dn2.envs[0].right("tag").empty() && warned == 1);
+        // 8.4: license only as the condition of ?:.
+        v.tools[0].controls = {"x = license(\"f1\")"};
+        assert(throws([&] { encryptSourceV3(SRC, v, "p.sv"); }, "expected ? in control"));
+    }
 
     std::cout << "test_protect: all passed\n";
     return 0;

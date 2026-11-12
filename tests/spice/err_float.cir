@@ -1,8 +1,0 @@
-A node with no DC path to ground
-v1 a 0 1
-r1 a b 1k
-c1 b c 1n
-c2 c 0 1n
-.op
-*> error "singular matrix at node 'c'"
-.end

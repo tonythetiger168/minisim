@@ -6,6 +6,8 @@
     mplan triage -results regress.d [-plan uart.vplan] [-rules triage.rules]
     mplan trend  plan.d/history.jsonl
     mplan init   -results regress.d [-cov cov.json] -o draft.vplan
+    mplan init   -reqs reqs.csv -o draft.vplan
+    mplan rank   -results regress.d [uart.vplan] [-by rate] [-keep keep.list]
 
 A verification plan (vPlan) lists the features of a design and, per feature,
 what proves it: tests (mregress results), code coverage, covergroups and
@@ -30,7 +32,9 @@ The plan file. Indentation nests features; ``#`` starts a comment:
         cover  tb.cg_tx                 # a covergroup type, or type.item
         assert tb.dut.u_tx              # assertions in that scope
         feature parity "Parity"
+          req UART-12 UART-13           # the requirements this feature verifies
           test uart_parity_*
+      reqs uart_reqs.csv                # the requirement list (CSV or ReqIF)
       include rx.vplan                  # the features of another plan file
 
 A metric line is ``<kind> <pattern> [goal=PCT] [weight=N]``. In a pattern
@@ -59,6 +63,35 @@ Its status is ``failing`` (a mapped test fails or a mapped assertion
 failed, here or below), ``met`` (every metric reached its goal, here and
 below), ``empty`` (nothing mapped yet), ``not started`` (score 0), or
 ``partial``.
+
+Requirements. ``req ID ...`` in a feature says which requirements it
+verifies; ``reqs FILE`` in the plan (or ``-reqs FILE``) names the list they
+come from. A CSV file (``,`` ``;`` or tab) has a header row with an ``id``
+column and, optionally, ``title`` (or ``name`` / ``summary``), ``text`` (or
+``description``), ``parent`` and ``priority``. A ReqIF file (``.reqif``, or
+a ``.reqifz`` archive, as DOORS, Polarion and Jama export) gives one
+requirement per SPEC-OBJECT: the id is its ``ReqIF.ForeignID`` (else its
+IDENTIFIER), the title ``ReqIF.Name`` / ``ReqIF.ChapterName``, the text
+``ReqIF.Text``, the parent from the specification hierarchy. A requirement
+is ``verified`` (every feature that names it is met), ``failing`` (one of
+them is failing), ``partial``, ``not started``, or ``uncovered`` (no feature
+names it); a requirement with children takes theirs into account. A plan
+that names an id the list does not hold gets a warning. ``-trace FILE``
+writes the traceability matrix as CSV, ``-fail-on-uncovered`` exits 1 on an
+uncovered requirement or an unknown id, and ``init -reqs`` drafts a plan
+with one feature per requirement.
+
+Ranking. ``mplan rank`` reads the coverage database of every run (mregress
+-cov keeps one per run) and says what each test adds. The coverage points
+are mcov's items (``mcov rank`` counts the same ones, per database file). The tests are ordered greedily: first the one with the
+most points, then the one that adds the most new points, and so on (``-by
+rate``: the most new points per second of run time). The table gives each
+test's new points, the coverage so far, its run time, and its unique points
+(covered by no other test). Tests that add nothing are listed as redundant;
+``-keep FILE`` writes the others, one name a line, in rank order. Failing
+tests are left out (``-all`` ranks them too). With a plan, each feature
+lists the tests that contribute to its coverage metrics. ``report -rank``
+puts the same table in ``plan.html`` and ``plan.json``.
 
 History. ``report`` appends one snapshot per run to ``<o>/history.jsonl``
 (``-history FILE``; ``-no-history`` to leave it alone): the time, a label
@@ -93,6 +126,7 @@ Exit status: 0, 1 when a gate fails, 2 on bad usage or a bad plan.
 import argparse
 import bisect
 import concurrent.futures as cf
+import csv
 import datetime
 import html
 import importlib.machinery
@@ -103,6 +137,7 @@ import re
 import shlex
 import sys
 import time
+import zipfile
 
 VERSION = "0.1.0"
 KINDS = ("test", "line", "branch", "toggle", "cond", "fsm", "cover", "assert")
@@ -165,6 +200,8 @@ class Feature:
         self.goal = None       # default goal of the metrics below (inherited)
         self.owner = None
         self.doc = ""
+        self.reqs = []         # requirement ids this feature verifies
+        self.req_files = []    # the plan's requirement lists (kept on the root)
         self.metrics, self.children = [], []
         self.score, self.status = 0.0, "empty"
 
@@ -289,11 +326,25 @@ def parse_plan(path, _stack=None):
             sub = parse_plan(os.path.join(os.path.dirname(path), args[0]), stack_files + [path])
             # A plan with its own name comes in as one feature; a bare list of features is spliced in.
             incoming = [sub] if sub.metrics or getattr(sub, "named", False) else sub.children
+            root.req_files += [p for p in sub.req_files if p not in root.req_files]
             for f in incoming:
                 if any(c.id == f.id for c in cur.children):
                     raise PlanError(f"{where}: feature {f.id!r} is already in {cur.path!r}")
                 f.parent = cur
                 cur.children.append(f)
+            continue
+        if head in ("req", "req:"):
+            ids = [i for a_ in args for i in a_.split(",") if i]
+            if not ids or opts:
+                raise PlanError(f"{where}: expected: req ID [ID ...]")
+            cur.reqs += [i for i in ids if i not in cur.reqs]
+            continue
+        if head == "reqs":
+            if len(args) != 1 or opts:
+                raise PlanError(f"{where}: expected: reqs FILE")
+            rp = os.path.join(os.path.dirname(path), args[0])
+            if rp not in root.req_files:
+                root.req_files.append(rp)
             continue
         if head in KINDS:
             if len(args) != 1:
@@ -305,7 +356,7 @@ def parse_plan(path, _stack=None):
                 raise PlanError(f"{where}: a goal is a percentage, at most 100")
             cur.metrics.append(Metric(head, args[0], goal, _number(opts.get("weight", "1"), "weight", where), where))
             continue
-        raise PlanError(f"{where}: unknown line {head!r} (expected plan, feature, include, "
+        raise PlanError(f"{where}: unknown line {head!r} (expected plan, feature, include, req, reqs, "
                         f"{', '.join(KINDS)}, or owner: / doc: / goal: / weight:)")
     root.named = named
     if _stack is None:      # the whole tree is in: metrics without a goal take the nearest one above
@@ -602,6 +653,434 @@ def unmapped(data):
     return out
 
 
+# ---------------------------------------------------------------- requirements
+
+class Req:
+    __slots__ = ("id", "title", "text", "parent", "priority", "source", "children", "features", "score", "status")
+
+    def __init__(self, ident, title="", text="", parent="", priority="", source=""):
+        self.id, self.title, self.text, self.parent, self.priority, self.source = ident, title, text, parent, priority, source
+        self.children, self.features = [], []
+        self.score, self.status = 0.0, "uncovered"
+
+
+CSV_COLS = {"id": ("id", "req", "req id", "reqid", "req_id", "requirement", "requirement id", "identifier", "key"),
+            "title": ("title", "name", "summary", "heading"),
+            "text": ("text", "description", "desc", "requirement text", "body"),
+            "parent": ("parent", "parent id", "parent_id", "parentid"),
+            "priority": ("priority", "prio", "severity")}
+
+
+def _read_reqs_csv(path):
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        text = f.read()
+    first = text.split("\n", 1)[0]
+    delim = max(",;\t", key=first.count)
+    rows = list(csv.reader(text.splitlines(), delimiter=delim))
+    if not rows:
+        raise PlanError(f"{path}: empty requirement list")
+    head = [h.strip().lower() for h in rows[0]]
+    col = {}
+    for key, names in CSV_COLS.items():
+        for n in names:
+            if n in head:
+                col[key] = head.index(n)
+                break
+    if "id" not in col:
+        raise PlanError(f"{path}: no 'id' column in the header ({', '.join(rows[0])})")
+    out = []
+    for no, row in enumerate(rows[1:], 2):
+        def cell(k):
+            i = col.get(k)
+            return row[i].strip() if i is not None and i < len(row) else ""
+        if not cell("id"):
+            if any(c.strip() for c in row):
+                raise PlanError(f"{path}:{no}: a requirement without an id")
+            continue
+        out.append(Req(cell("id"), cell("title"), cell("text"), cell("parent"), cell("priority"), f"{path}:{no}"))
+    return out
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xml_text(el):
+    return re.sub(r"\s+", " ", "".join(el.itertext())).strip()
+
+
+def _read_reqs_reqif(path):
+    import xml.etree.ElementTree as ET
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as z:
+                names = sorted(n for n in z.namelist() if n.lower().endswith((".reqif", ".xml")))
+                if not names:
+                    raise PlanError(f"{path}: no .reqif file in the archive")
+                roots = [ET.fromstring(z.read(n)) for n in names]
+        else:
+            roots = [ET.parse(path).getroot()]
+    except ET.ParseError as e:
+        raise PlanError(f"{path}: not ReqIF: {e}")
+    out = []
+    for root in roots:
+        # Attribute definitions: IDENTIFIER -> LONG-NAME ("ReqIF.Text", "ReqIF.ForeignID", ...).
+        defs = {el.get("IDENTIFIER"): el.get("LONG-NAME") or "" for el in root.iter() if _local(el.tag).startswith("ATTRIBUTE-DEFINITION-")}
+        objs = {}
+        for so in root.iter():
+            if _local(so.tag) != "SPEC-OBJECT":
+                continue
+            attrs = {}
+            for av in so.iter():
+                if not _local(av.tag).startswith("ATTRIBUTE-VALUE-"):
+                    continue
+                ref = next((_xml_text(r) for d in av if _local(d.tag) == "DEFINITION" for r in d), "")
+                val = av.get("THE-VALUE")
+                if val is None:
+                    val = next((_xml_text(v) for v in av if _local(v.tag) == "THE-VALUE"), "")
+                attrs[defs.get(ref, ref).lower()] = val.strip()
+            pick = lambda *ks: next((attrs[k] for k in ks if attrs.get(k)), "")
+            ident = pick("reqif.foreignid", "id", "identifier", "req id") or so.get("IDENTIFIER") or ""
+            if not ident:
+                continue
+            r = Req(ident, pick("reqif.name", "reqif.chaptername", "title", "name") or so.get("LONG-NAME") or "",
+                    pick("reqif.text", "text", "description"), "", pick("priority", "reqif.priority"), path)
+            objs[so.get("IDENTIFIER")] = r
+        seen = set()
+
+        def hier(el, parent):
+            for h in el:
+                tag = _local(h.tag)
+                if tag == "SPEC-HIERARCHY":
+                    ref = next((_xml_text(r) for o in h if _local(o.tag) == "OBJECT" for r in o), "")
+                    r = objs.get(ref)
+                    if r is not None and ref not in seen:
+                        seen.add(ref)
+                        r.parent = parent
+                        out.append(r)
+                    hier(h, r.id if r is not None else parent)
+                else:
+                    hier(h, parent)
+        for spec in root.iter():
+            if _local(spec.tag) == "SPECIFICATION":
+                hier(spec, "")
+        out += [r for k, r in objs.items() if k not in seen]      # objects in no specification
+    return out
+
+
+def load_reqs(paths):
+    """Requirement lists (CSV or ReqIF) as {id: Req}, in file order."""
+    reqs = {}
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                head = f.read(256).lstrip(b"\xef\xbb\xbf \t\r\n")
+        except OSError as e:
+            raise PlanError(f"{path}: {e.strerror}")
+        got = _read_reqs_reqif(path) if head.startswith((b"<", b"PK")) else _read_reqs_csv(path)
+        for r in got:
+            if r.id in reqs:
+                raise PlanError(f"{r.source}: requirement {r.id!r} is already in {reqs[r.id].source}")
+            reqs[r.id] = r
+    for r in reqs.values():
+        if r.parent and r.parent in reqs and r.parent != r.id:
+            reqs[r.parent].children.append(r)
+        else:
+            r.parent = ""
+    return reqs
+
+
+def trace_reqs(plan, reqs):
+    """Link the plan's features to the requirements and give each a score and a status.
+
+    Returns (requirements in order, ids the plan names that no list holds)."""
+    known = bool(reqs)
+    reqs = dict(reqs)
+    unknown = []
+    for f, _ in plan.walk():
+        for i in f.reqs:
+            if i not in reqs:
+                if known:
+                    unknown.append((i, f.path))
+                    continue
+                reqs[i] = Req(i, source=f.where)
+            reqs[i].features.append(f)
+    done = set()
+
+    def settle(r):
+        if r.id in done:
+            return
+        done.add(r.id)
+        for c in r.children:
+            settle(c)
+        parts = [(f.score, {"met": "verified", "empty": "not started"}.get(f.status, f.status)) for f in r.features]
+        parts += [(c.score, c.status) for c in r.children]
+        sts = [s for _, s in parts]
+        r.score = sum(p for p, _ in parts) / len(parts) if parts else 0.0
+        if not parts or all(s == "uncovered" for s in sts):
+            r.status = "uncovered"
+        elif "failing" in sts:
+            r.status = "failing"
+        elif all(s == "verified" for s in sts):
+            r.status = "verified"
+        elif r.score == 0:
+            r.status = "not started"
+        else:
+            r.status = "partial"
+    order = []
+
+    def visit(r, depth):
+        settle(r)
+        order.append((r, depth))
+        for c in r.children:
+            visit(c, depth + 1)
+    for r in reqs.values():
+        if not r.parent:
+            visit(r, 0)
+    return order, unknown
+
+
+REQ_STATES = ("verified", "partial", "not started", "failing", "uncovered")
+
+
+def req_counts(order):
+    """Counts over the requirements that have no children (the ones a feature has to cover)."""
+    c = {k: 0 for k in REQ_STATES}
+    for r, _ in order:
+        if not r.children:
+            c[r.status] += 1
+    c["total"] = sum(c.values())
+    return c
+
+
+def reqs_json(order, unknown):
+    return {"counts": req_counts(order), "unknown": [{"id": i, "feature": p} for i, p in unknown],
+            "items": [{"id": r.id, "title": r.title, "text": r.text, "parent": r.parent, "priority": r.priority, "depth": d,
+                       "score": round(r.score, 2), "status": r.status, "features": [f.path for f in r.features]} for r, d in order]}
+
+
+def print_reqs(order, unknown, out=None):
+    out = out or sys.stdout
+    if not order:
+        return
+    c = req_counts(order)
+    print(f"\nrequirements: {c['verified']}/{c['total']} verified"
+          + "".join(f", {c[k]} {k}" for k in REQ_STATES[1:] if c[k]), file=out)
+    for r, _ in order:
+        if r.status != "verified" and not r.children:
+            feats = ", ".join(f.path for f in r.features)
+            print(f"  {r.status:<11}  {r.id}" + (f"  {r.title}" if r.title else "") + (f"  ({feats} {r.score:.1f}%)" if feats else ""), file=out)
+    for i, p in unknown:
+        print(f"  warning: feature {p} names requirement {i!r}, which is in no requirement list", file=out)
+
+
+def write_trace(order, path):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(["id", "title", "parent", "priority", "status", "score", "features", "owners", "tests"])
+        for r, _ in order:
+            owners = sorted({f.owner_of() for f in r.features if f.owner_of()})
+            tests = sorted({m.pattern for f in r.features for g, _ in f.walk() for m in g.metrics if m.kind == "test"})
+            w.writerow([r.id, r.title, r.parent, r.priority, r.status, f"{r.score:.1f}", " ".join(f.path for f in r.features),
+                        " ".join(owners), " ".join(tests)])
+
+
+# ---------------------------------------------------------------- per-test coverage and ranking
+
+# The coverage items and their keys are mcov's (mcov.test_items, the same ones
+# mcov rank counts); mplan adds the test names and seeds from the regression,
+# the order by run time, and the features each test serves.
+
+def _owner(k):
+    """The plan-facing owner of an mcov item key: (kind, name) as the matchers know them."""
+    c = k[0]
+    if c in ("l", "b"):
+        return ("file", k[1])
+    if c == "t":
+        return ("toggle", k[1])
+    if c == "c":
+        return ("cond", k[1])
+    if c in ("s", "x"):
+        return ("fsm", f"{k[2]}.{k[3]}")
+    if c == "g":
+        return ("cover", f"{k[1]}.{k[2]}")
+    return ("assert", k[1])
+
+
+class Points:
+    """Every test's coverage as one bit mask over mcov's items (all seeds of a test together).
+
+    The masks are mcov's own (mcov._rank_mask in the workers, mcov.test_layout for the
+    layout, mcov._remap for a run whose layout differs), the same items mcov rank counts."""
+
+    def __init__(self, runs, jobs, include_failing=False):
+        mcov = tool("mcov")
+        tests = test_table(runs)
+        self.skipped = sorted(n for n, t in tests.items() if t["status"] != "pass") if not include_failing else []
+        want = [r for r in runs if (include_failing or tests[r["test"]]["status"] == "pass") and r.get("log")]
+        paths = [os.path.join(r["_dir"], os.path.dirname(r["log"]), "cov.json") for r in want]
+        todo = [p for p in paths if os.path.exists(p)]
+        got = None
+        if jobs > 1 and len(todo) > 1:
+            try:
+                with cf.ProcessPoolExecutor(max_workers=min(jobs, len(todo))) as pool:
+                    got = list(pool.map(mcov._rank_mask, todo, chunksize=max(1, len(todo) // (4 * jobs))))
+            except SystemExit:
+                raise
+            except Exception:           # no fork / not picklable here: read them one by one
+                got = None
+        if got is None:
+            got = [mcov._rank_mask(p) for p in todo]
+        # One layout per digest, in run order, so the numbering does not depend on the worker count.
+        layouts = {}
+        for p, g in zip(todo, got):
+            if g[0] not in layouts:
+                sg, tg, _m, _n = mcov.test_layout(mcov.load(p))
+                layouts[g[0]] = (sg, tg)
+        if len(layouts) <= 1:
+            singles, togs = next(iter(layouts.values()), ([], []))
+            masks = {p: g[1] for p, g in zip(todo, got)}
+            self.total = got[0][2] if got else 0
+        else:                           # several design versions: move every mask onto the union
+            singles, index = [], {}
+            for sg, _ in layouts.values():
+                for k in sg:
+                    if k not in index:
+                        index[k] = len(singles)
+                        singles.append(k)
+            togs, togoff = [], []
+            off = (len(singles) + 7) // 8 * 8
+            for _, tg in layouts.values():
+                for name, w in tg:
+                    k = ("T", name, w)
+                    if k not in index:
+                        index[k] = len(togoff)
+                        togoff.append(off)
+                        togs.append((name, w))
+                        off += (2 * w + 7) // 8 * 8
+            togoff.append(off)
+            dst = (singles, None, index, togoff)
+            masks = {p: mcov._remap(g[1], layouts[g[0]], dst) for p, g in zip(todo, got)}
+            self.total = len(singles) + sum(2 * w for _, w in togs)
+        self.layout = (singles, togs)
+        self.mask, self.seconds = {}, {}
+        for r, p in zip(want, paths):
+            name = r["test"]
+            self.seconds[name] = self.seconds.get(name, 0.0) + r.get("seconds", 0.0)
+            m = masks.get(p)
+            if m is None:
+                self.mask.setdefault(name, None)
+                continue
+            self.mask[name] = m if self.mask.get(name) is None else self.mask[name] | m
+        self.no_data = sorted(n for n, m in self.mask.items() if m is None)
+        for n in self.no_data:
+            self.mask[n] = 0
+        self._owners = None
+
+    def owner_masks(self):
+        """(kind, name) -> the bits of that file / signal / FSM / covergroup item / assertion."""
+        if self._owners is None:
+            singles, togs = self.layout
+            nb = (len(singles) + 7) // 8
+            bufs = {}
+            for i, k in enumerate(singles):
+                buf = bufs.get(_owner(k))
+                if buf is None:
+                    buf = bufs[_owner(k)] = bytearray(nb)
+                buf[i >> 3] |= 1 << (i & 7)
+            self._owners = {o: int.from_bytes(b, "little") for o, b in bufs.items()}
+            off = nb * 8
+            for name, w in togs:
+                self._owners[("toggle", name)] = self._owners.get(("toggle", name), 0) | (((1 << (2 * w)) - 1) << off)
+                off += (2 * w + 7) // 8 * 8
+        return self._owners
+
+
+def rank_tests(pts, by="points"):
+    """Greedy order of the tests by what each adds. Returns the ranking as a dict."""
+    pop = tool("mcov").popcount
+    names = sorted(n for n in pts.mask if n not in pts.no_data)
+    once = multi = 0
+    for n in names:
+        multi |= once & pts.mask[n]
+        once |= pts.mask[n]
+    only = once & ~multi
+    covered, order, left = 0, [], set(names)
+
+    def worth(n, gain):
+        return gain / max(pts.seconds.get(n, 0.0), 1e-3) if by == "rate" else gain
+    # Lazy greedy: a test's gain only shrinks as others are picked, so a stale best that is still best is the best.
+    cand = sorted(((worth(n, pop(pts.mask[n])), n) for n in names), key=lambda x: (-x[0], x[1]))
+    while cand:
+        best = None
+        for i, (w, n) in enumerate(cand):
+            if best is not None and w <= best[0]:
+                break
+            gain = pop(pts.mask[n] & ~covered)
+            w = worth(n, gain)
+            cand[i] = (w, n)
+            if gain and (best is None or w > best[0] or (w == best[0] and n < best[1])):
+                best = (w, n, gain)
+        if best is None:
+            break
+        _, n, gain = best
+        covered |= pts.mask[n]
+        left.discard(n)
+        order.append({"test": n, "new": gain, "points": pop(pts.mask[n]), "unique": pop(pts.mask[n] & only),
+                      "seconds": round(pts.seconds.get(n, 0.0), 3), "covered": pop(covered),
+                      "cumulative": round(100.0 * pop(covered) / pts.total, 2) if pts.total else 0.0})
+        cand = sorted(((w, m) for w, m in cand if m != n), key=lambda x: (-x[0], x[1]))
+    return {"by": by, "points": pts.total, "covered": pop(covered),
+            "coverage": round(100.0 * pop(covered) / pts.total, 2) if pts.total else 0.0,
+            "seconds": round(sum(pts.seconds.get(n, 0.0) for n in names), 3),
+            "seconds_ranked": round(sum(o["seconds"] for o in order), 3),
+            "order": order, "redundant": sorted(left), "no_data": pts.no_data, "not_ranked": pts.skipped}
+
+
+METRIC_OWNER = {"line": ("file", "file"), "branch": ("file", "file"), "cond": ("cond", "cond"), "toggle": ("toggle", "toggle"),
+                "fsm": ("fsm", "fsm"), "cover": ("cover", "cover"), "assert": ("assert", "assert")}
+
+
+def attribute(plan, data, pts, top=10):
+    """Per feature, the tests that cover items of its own coverage metrics: {path: {"tests": N, "top": [[test, items], ...]}}."""
+    pop = tool("mcov").popcount
+    owners = pts.owner_masks()
+    out = {}
+    for f, _ in plan.walk():
+        fm = 0
+        for m in f.metrics:
+            if m.kind in METRIC_OWNER:
+                matcher, kind = METRIC_OWNER[m.kind]
+                for n in data.m[matcher].match(m.pattern):
+                    fm |= owners.get((kind, n), 0)
+        if not fm:
+            continue
+        rows = sorted(([n, pop(mk & fm)] for n, mk in pts.mask.items() if mk & fm), key=lambda r: (-r[1], r[0]))
+        out[f.path] = {"tests": len(rows), "top": rows[:top]}
+    return out
+
+
+def print_rank(rk, attr=None, limit=0, out=None):
+    out = out or sys.stdout
+    rows = [("Rank", "Test", "New", "Coverage", "Seconds", "Unique")]
+    for i, o in enumerate(rk["order"][: limit or None], 1):
+        rows.append((str(i), o["test"], str(o["new"]), f"{o['cumulative']:.1f}%", f"{o['seconds']:.1f}", str(o["unique"])))
+    ws = [max(len(r[i]) for r in rows) for i in range(6)]
+    for r in rows:
+        print(f"{r[0]:>{ws[0]}}  {r[1]:<{ws[1]}}  {r[2]:>{ws[2]}}  {r[3]:>{ws[3]}}  {r[4]:>{ws[4]}}  {r[5]:>{ws[5]}}".rstrip(), file=out)
+    if limit and len(rk["order"]) > limit:
+        print(f"  ... {len(rk['order']) - limit} more", file=out)
+    print(f"\nmplan: {len(rk['order'])} of {len(rk['order']) + len(rk['redundant'])} tests reach {rk['coverage']:.1f}% "
+          f"({rk['covered']}/{rk['points']} points) in {rk['seconds_ranked']:.1f}s of {rk['seconds']:.1f}s", file=out)
+    for label, key in (("redundant (add nothing)", "redundant"), ("no coverage data", "no_data"), ("not ranked (not passing)", "not_ranked")):
+        if rk[key]:
+            print(f"{label}: {', '.join(rk[key][:20])}{' ...' if len(rk[key]) > 20 else ''}", file=out)
+    if attr:
+        print("\ntests behind each feature's coverage:", file=out)
+        for path, a in attr.items():
+            print(f"  {path}: " + ", ".join(f"{n} ({c})" for n, c in a["top"][:5]) + (f" and {a['tests'] - 5} more" if a["tests"] > 5 else ""), file=out)
+
+
 # ---------------------------------------------------------------- triage
 
 GENERIC = re.compile(r"^(timeout$|exit status )")
@@ -810,11 +1289,13 @@ def coverage_totals(data):
     return out
 
 
-def make_snapshot(plan, data, tri, when, label):
+def make_snapshot(plan, data, tri, when, label, trace=None):
     counts = {"pass": 0, "fail": 0, "xfail": 0, "skip": 0}
     for t in data.tests.values():
         counts[t["status"]] += 1
+    extra = {"reqs": req_counts(trace[0])} if trace and trace[0] else {}
     return {
+        **extra,
         "time": when, "label": label or when, "plan": plan.id, "score": round(plan.score, 2), "status": plan.status,
         "features": {f.path: [round(f.score, 2), f.status] for f, d in plan.walk() if d > 0},
         "tests": counts, "runs": len(data.runs), "coverage": coverage_totals(data),
@@ -825,21 +1306,24 @@ def make_snapshot(plan, data, tri, when, label):
 
 # ---------------------------------------------------------------- reports
 
-def plan_json(plan, data, tri, snap, history):
+def plan_json(plan, data, tri, snap, history, trace=None, rank=None):
     def feat(f):
         return {"id": f.id, "path": f.path, "title": f.title, "owner": f.owner_of(), "doc": f.doc, "weight": f.weight,
+                "reqs": f.reqs,
                 "score": round(f.score, 2), "status": f.status, "where": f.where,
                 "metrics": [{"kind": m.kind, "pattern": m.pattern, "goal": m.goal, "weight": m.weight,
                              "score": round(m.score, 2), "hit": m.hit, "total": m.total, "matched": m.matched,
                              "met": m.met, "note": m.note, "bad": m.bad} for m in f.metrics],
                 "features": [feat(c) for c in f.children]}
     return {"format": "mplan", "version": 1, "tool": f"mplan {VERSION}", "snapshot": snap, "plan": feat(plan),
+            "requirements": reqs_json(*trace) if trace and trace[0] else None,
+            "ranking": {**rank[0], "features": rank[1]} if rank else None,
             "triage": tri, "unmapped": unmapped(data), "history": [
                 {"time": s.get("time"), "label": s.get("label"), "score": s.get("score"), "tests": s.get("tests"),
                  "coverage": s.get("coverage")} for s in history]}
 
 
-def print_plan(plan, data, tri, prev, out=None):
+def print_plan(plan, data, tri, prev, out=None, trace=None):
     out = out or sys.stdout
     rows = []
     for f, depth in plan.walk():
@@ -876,6 +1360,8 @@ def print_plan(plan, data, tri, prev, out=None):
     parts = [f"{len(v)} {k}" for k, v in um.items() if v]
     if parts:
         print("not in the plan: " + ", ".join(parts), file=out)
+    if trace:
+        print_reqs(*trace, out)
     print_triage(tri, out)
 
 
@@ -1011,7 +1497,7 @@ def trend_svg(history):
     return "".join(out)
 
 
-def write_html(plan, data, tri, snap, history, path):
+def write_html(plan, data, tri, snap, history, path, trace=None, rank=None):
     esc = html.escape
     feats = [f for f, d in plan.walk() if d > 0]
     met = sum(f.status == "met" for f in feats)
@@ -1022,6 +1508,9 @@ def write_html(plan, data, tri, snap, history, path):
     tiles = [(f"{plan.score:.1f}%", f"plan score ({delta})"), (f"{met}/{len(feats)}", "features met"),
              (f"{c['pass']}/{c['pass'] + c['fail'] + c['xfail']}", "tests passing"),
              (str(len(tri["buckets"])), f"failure buckets ({sum(b['class'] == 'new' for b in tri['buckets'])} new)")]
+    if trace and trace[0]:
+        rc = req_counts(trace[0])
+        tiles.append((f"{rc['verified']}/{rc['total']}", f"requirements verified ({rc['uncovered']} uncovered)"))
     tiles += [(f"{v:.1f}%", {"func": "functional coverage", "assert": "assertions passed or hit", "cond": "condition coverage", "fsm": "FSM coverage"}.get(k, f"{k} coverage"))
               for k, v in cov.items()]
     doc = [f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>mplan: {esc(plan.title)}</title><style>{CSS}</style></head>"
@@ -1038,7 +1527,8 @@ def write_html(plan, data, tri, snap, history, path):
     for f, depth in plan.walk():
         pad = f"style='padding-left:{8 + 18 * depth}px'"
         title = esc(f.title) + (f" <code>{esc(f.path)}</code>" if depth and f.title != f.id else "")
-        rows.append(f"<tr class='feat'><td {pad}>{title}{'<br><span class=sub>' + esc(f.doc) + '</span>' if f.doc else ''}</td>"
+        rows.append(f"<tr class='feat'><td {pad}>{title}{'<br><span class=sub>' + esc(f.doc) + '</span>' if f.doc else ''}"
+                    f"{'<br><span class=sub>verifies ' + esc(', '.join(f.reqs)) + '</span>' if f.reqs else ''}</td>"
                     f"<td class='num'>{f.score:.1f}%</td><td>{bar(f.score)}</td>"
                     f"<td><span class='st {f.status.split()[0]}'>{f.status}</span></td><td>{esc(f.owner_of())}</td><td></td></tr>")
         for m in f.metrics:
@@ -1054,6 +1544,22 @@ def write_html(plan, data, tri, snap, history, path):
                         f"{'; ' + esc(m.note) if m.note else ''}{bad}</td></tr>")
     doc.append("<h2>Features</h2><table><tr><th>Feature / metric</th><th>Score</th><th></th><th>Status</th><th>Owner</th>"
                "<th>Detail</th></tr>" + "".join(rows) + "</table>")
+
+    if trace and trace[0]:
+        order, unknown = trace
+        rows = []
+        for r, depth in order:
+            pad = f"style='padding-left:{8 + 18 * depth}px'"
+            cls = {"verified": "met", "uncovered": "empty", "not started": "not"}.get(r.status, r.status)
+            rows.append(f"<tr><td {pad}><code>{esc(r.id)}</code></td><td>{esc(r.title)}"
+                        f"{'<br><span class=sub>' + esc(r.text[:300]) + '</span>' if r.text else ''}</td>"
+                        f"<td>{esc(r.priority)}</td><td class='num'>{r.score:.1f}%</td><td>{bar(r.score)}</td>"
+                        f"<td><span class='st {cls}'>{r.status}</span></td>"
+                        f"<td>{', '.join('<code>' + esc(f.path) + '</code>' for f in r.features)}</td></tr>")
+        doc.append("<h2>Requirements</h2><table><tr><th>Id</th><th>Requirement</th><th>Priority</th><th>Score</th><th></th>"
+                   "<th>Status</th><th>Verified by</th></tr>" + "".join(rows) + "</table>")
+        if unknown:
+            doc.append("<p class='sub'>In no requirement list: " + ", ".join(f"<code>{esc(i)}</code> (feature {esc(p)})" for i, p in unknown) + "</p>")
 
     doc.append("<h2>Failure triage</h2>")
     if tri["compared_to"]:
@@ -1081,6 +1587,25 @@ def write_html(plan, data, tri, snap, history, path):
                          ("Tests fixed since the last snapshot", tri["fixed_tests"])):
         if items:
             doc.append(f"<details open><summary>{title} ({len(items)})</summary><p>" + "<br>".join(f"<code>{esc(i)}</code>" for i in items[:200]) + "</p></details>")
+
+    if rank:
+        rk, attr = rank
+        rows = "".join(f"<tr><td class='num'>{i}</td><td><code>{esc(o['test'])}</code></td><td class='num'>{o['new']}</td>"
+                       f"<td class='num'>{o['cumulative']:.1f}%</td><td>{bar(o['cumulative'])}</td><td class='num'>{o['seconds']:.1f}</td>"
+                       f"<td class='num'>{o['unique']}</td></tr>" for i, o in enumerate(rk["order"][:500], 1))
+        doc.append(f"<h2>Tests by what they add</h2><p class='sub'>{len(rk['order'])} of {len(rk['order']) + len(rk['redundant'])} tests reach "
+                   f"{rk['coverage']:.1f}% of {rk['points']} coverage points in {rk['seconds_ranked']:.1f}s of {rk['seconds']:.1f}s "
+                   f"(ordered by {'new points per second' if rk['by'] == 'rate' else 'new points'}).</p>"
+                   "<table><tr><th>Rank</th><th>Test</th><th>New points</th><th>Coverage so far</th><th></th><th>Seconds</th>"
+                   "<th>Unique points</th></tr>" + rows + "</table>")
+        for title, items in (("Redundant tests (add nothing)", rk["redundant"]), ("Tests without coverage data", rk["no_data"])):
+            if items:
+                doc.append(f"<details><summary>{title} ({len(items)})</summary><p>" + "<br>".join(f"<code>{esc(i)}</code>" for i in items[:500]) + "</p></details>")
+        if attr:
+            doc.append("<details><summary>Tests behind each feature's coverage</summary><table><tr><th>Feature</th><th>Tests</th><th>Most points</th></tr>"
+                       + "".join(f"<tr><td><code>{esc(p)}</code></td><td class='num'>{a['tests']}</td><td>"
+                                 + ", ".join(f"<code>{esc(n)}</code> ({c})" for n, c in a["top"][:5]) + "</td></tr>" for p, a in attr.items())
+                       + "</table></details>")
 
     um = unmapped(data)
     if any(um.values()):
@@ -1121,6 +1646,15 @@ def cmd_check(a):
     print(f"mplan: {a.plan}: plan {plan.id!r}, {len(feats)} feature(s), {nm} metric(s)")
     for p in empty:
         print(f"  nothing mapped yet: {p}")
+    order, unknown = trace_reqs(plan, load_reqs(plan.req_files + a.reqs))
+    if order:
+        leaves = [r for r, _ in order if not r.children]
+        bare = [r for r in leaves if not r.features]
+        print(f"  {len(leaves)} requirement(s), {len(leaves) - len(bare)} named by a feature")
+        for r in bare:
+            print(f"  no feature verifies: {r.id}" + (f"  {r.title}" if r.title else ""))
+        for i, p in unknown:
+            print(f"  warning: feature {p} names requirement {i!r}, which is in no requirement list")
     return 0
 
 
@@ -1130,6 +1664,7 @@ def cmd_report(a):
     if not a.results and data.db is None:
         raise SystemExit("mplan: report needs -results DIR and / or -cov DB")
     score_feature(plan, data)
+    trace = trace_reqs(plan, load_reqs(plan.req_files + a.reqs))
     outdir = os.path.abspath(a.o)
     hpath = a.history or os.path.join(outdir, "history.jsonl")
     history = read_history(hpath)
@@ -1138,7 +1673,11 @@ def cmd_report(a):
     if history and label and history[-1].get("label") == label:
         history.pop()
     tri = triage(data.runs, data.tests, plan, history, load_rules(a.rules), jobs, data.m["test"])
-    snap = make_snapshot(plan, data, tri, when, label)
+    snap = make_snapshot(plan, data, tri, when, label, trace)
+    rank = None
+    if a.rank:
+        pts = Points(data.runs, jobs)
+        rank = (rank_tests(pts, a.by), attribute(plan, data, pts))
     prev = history[-1] if history else None
     history.append(snap)
     os.makedirs(outdir, exist_ok=True)
@@ -1146,12 +1685,17 @@ def cmd_report(a):
         write_history(hpath, history)
     with open(os.path.join(outdir, "plan.json"), "w", encoding="utf-8") as f:
         # No indent: that keeps the C encoder, several times faster on a large plan.
-        f.write(json.dumps(plan_json(plan, data, tri, snap, history), sort_keys=True) + "\n")
-    write_html(plan, data, tri, snap, history, os.path.join(outdir, "plan.html"))
+        f.write(json.dumps(plan_json(plan, data, tri, snap, history, trace, rank), sort_keys=True) + "\n")
+    write_html(plan, data, tri, snap, history, os.path.join(outdir, "plan.html"), trace, rank)
     if a.md:
         write_md(plan, a.md)
+    if a.trace:
+        write_trace(trace[0], a.trace)
     if not a.q:
-        print_plan(plan, data, tri, prev)
+        print_plan(plan, data, tri, prev, trace=trace)
+        if rank:
+            print()
+            print_rank(rank[0], limit=10)
     else:
         print(f"mplan: {plan.id}: {plan.score:.1f}% ({plan.status})")
     print(f"report: {os.path.relpath(os.path.join(outdir, 'plan.html'))}")
@@ -1166,6 +1710,11 @@ def cmd_report(a):
         fresh = [b for b in tri["buckets"] if b["class"] == "new" and b["status"] == "open"]
         if fresh:
             print(f"mplan: gate: {len(fresh)} new failure bucket(s)")
+            rc = 1
+    if a.fail_on_uncovered:
+        bare = [r.id for r, _ in trace[0] if r.status == "uncovered" and not r.children]
+        if bare or trace[1]:
+            print(f"mplan: gate: {len(bare)} uncovered requirement(s)" + (f", {len(trace[1])} unknown id(s)" if trace[1] else ""))
             rc = 1
     return rc
 
@@ -1188,6 +1737,27 @@ def cmd_triage(a):
     return 1 if a.fail_on_new and fresh else 0
 
 
+def cmd_rank(a):
+    if not a.results:
+        raise SystemExit("mplan: rank needs -results DIR")
+    plan = parse_plan(a.plan) if a.plan else None
+    data, jobs = load_data(a)
+    pts = Points(data.runs, jobs, a.all)
+    if not pts.total:
+        raise SystemExit("mplan: rank: no per-run coverage (run mregress with -cov)")
+    rk = rank_tests(pts, a.by)
+    attr = attribute(plan, data, pts) if plan is not None and data.db is not None else None
+    print_rank(rk, attr, a.n or 0)
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump({"format": "mplan-rank", "version": 1, **rk, "features": attr}, f, indent=1, sort_keys=True)
+            f.write("\n")
+    if a.keep:
+        with open(a.keep, "w", encoding="utf-8") as f:
+            f.write("".join(o["test"] + "\n" for o in rk["order"]))
+    return 0
+
+
 def cmd_trend(a):
     snaps = read_history(a.history)
     if not snaps:
@@ -1195,7 +1765,8 @@ def cmd_trend(a):
     if a.n:
         snaps = snaps[-a.n:]
     covk = [k for k in ("line", "branch", "toggle", "cond", "fsm", "func", "assert") if any(k in (s.get("coverage") or {}) for s in snaps)]
-    head = ["Time", "Label", "Score", "Change", "Tests", "Buckets"] + [k.capitalize() for k in covk]
+    has_reqs = any(s.get("reqs") for s in snaps)
+    head = ["Time", "Label", "Score", "Change", "Tests", "Buckets"] + (["Reqs"] if has_reqs else []) + [k.capitalize() for k in covk]
     rows, last = [], None
     for s in snaps:
         if a.feature:
@@ -1207,7 +1778,9 @@ def cmd_trend(a):
         n = sum(t.get(k, 0) for k in ("pass", "fail", "xfail"))
         rows.append([s.get("time", ""), str(s.get("label", ""))[:16], "-" if score is None else f"{score:.1f}%",
                      "" if score is None or last is None else signed(score - last), f"{t.get('pass', 0)}/{n}",
-                     str(len(s.get("buckets", {})))] + [f"{s['coverage'][k]:.1f}%" if k in (s.get("coverage") or {}) else "-" for k in covk])
+                     str(len(s.get("buckets", {})))]
+                    + ([f"{s['reqs']['verified']}/{s['reqs']['total']}" if s.get("reqs") else "-"] if has_reqs else [])
+                    + [f"{s['coverage'][k]:.1f}%" if k in (s.get("coverage") or {}) else "-" for k in covk])
         if score is not None:
             last = score
     ws = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(head)]
@@ -1220,8 +1793,9 @@ def cmd_trend(a):
 def cmd_init(a):
     """A starting plan from what a regression holds: tests by name prefix, coverage by scope."""
     data, _ = load_data(a)
-    if not data.tests and data.db is None:
-        raise SystemExit("mplan: init needs -results DIR and / or -cov DB")
+    reqs = load_reqs(a.reqs)
+    if not data.tests and data.db is None and not reqs:
+        raise SystemExit("mplan: init needs -results DIR, -cov DB and / or -reqs FILE")
     groups = {}
     for n in sorted(data.tests):
         key = re.split(r"[_.\-/]", n, maxsplit=1)[0] or n
@@ -1229,6 +1803,25 @@ def cmd_init(a):
     name = a.name or "design"
     out = [f"# Draft plan written by mplan init: regroup, rename and add the features that have no test yet.",
            f"plan {name} \"{name} verification plan\"", "  goal: 100"]
+    if reqs:
+        # One feature per requirement, nested like the requirements; the tests and coverage go in by hand.
+        out += [f"  reqs {os.path.relpath(p, os.path.dirname(os.path.abspath(a.o)) if a.o else os.getcwd())}" for p in a.reqs]
+        used = set()
+
+        def emit(r, depth):
+            ident = re.sub(r"[^A-Za-z0-9_\-]", "_", r.id)
+            while (depth, ident) in used:
+                ident += "_"
+            used.add((depth, ident))
+            pad = "  " * (depth + 1)
+            out.append(f"{pad}feature {ident}" + (f" {json.dumps(r.title, ensure_ascii=False)}" if r.title else ""))
+            if not r.children:
+                out.append(f"{pad}  req {r.id}")
+            for c in r.children:
+                emit(c, depth + 1)
+        for r in reqs.values():
+            if not r.parent:
+                emit(r, 0)
     for key, names in groups.items():
         ident = re.sub(r"[^A-Za-z0-9_\-]", "_", key)
         out.append(f"  feature {ident}")
@@ -1276,8 +1869,13 @@ def main(argv=None):
         p.add_argument("-threads", "-j", type=int, default=0, dest="threads",
                        help="workers for reading the inputs (default: every logical CPU this process may use)")
 
+    def reqopt(p):
+        p.add_argument("-reqs", action="append", default=[], metavar="FILE",
+                       help="a requirement list, CSV or ReqIF (.reqif / .reqifz); repeat for several")
+
     c = sub.add_parser("check", help="read a plan and report mistakes")
     c.add_argument("plan")
+    reqopt(c)
     r = sub.add_parser("report", help="score a plan, record a snapshot, write plan.json and plan.html")
     r.add_argument("plan")
     inputs(r)
@@ -1288,6 +1886,12 @@ def main(argv=None):
     r.add_argument("-time", help="time of this snapshot, ISO 8601 (default: SOURCE_DATE_EPOCH, else now)")
     r.add_argument("-rules", metavar="FILE", help="triage rules: /regex/ status=known|waived owner=.. bug=.. note=..")
     r.add_argument("-md", metavar="FILE", help="also write the feature table as Markdown")
+    r.add_argument("-rank", action="store_true", help="also rank the tests by the coverage each adds (see mplan rank)")
+    r.add_argument("-by", choices=("points", "rate"), default="points", help="-rank order: new points, or new points per second")
+    reqopt(r)
+    r.add_argument("-trace", metavar="FILE", help="also write the requirement traceability matrix as CSV")
+    r.add_argument("-fail-on-uncovered", action="store_true",
+                   help="exit 1 when a requirement has no feature, or the plan names an id that no list holds")
     r.add_argument("-gate", action="store_true", help="exit 1 unless the whole plan is met")
     r.add_argument("-min-score", type=float, metavar="PCT", help="exit 1 if the plan score is below PCT")
     r.add_argument("-fail-on-new", action="store_true", help="exit 1 on a new failure bucket that no rule marks known or waived")
@@ -1299,17 +1903,27 @@ def main(argv=None):
     t.add_argument("-rules", metavar="FILE", help="triage rules")
     t.add_argument("-json", metavar="FILE", help="also write the buckets as JSON")
     t.add_argument("-fail-on-new", action="store_true", help="exit 1 on a new bucket that no rule marks known or waived")
+    k = sub.add_parser("rank", help="rank the tests by the coverage each adds; list the redundant ones")
+    k.add_argument("plan", nargs="?", help="a plan, to list the tests behind each feature's coverage")
+    inputs(k)
+    k.add_argument("-by", choices=("points", "rate"), default="points", help="order by new points (default) or new points per second")
+    k.add_argument("-all", action="store_true", help="rank failing tests too")
+    k.add_argument("-n", type=int, help="print only the first N ranks")
+    k.add_argument("-json", metavar="FILE", help="also write the ranking as JSON")
+    k.add_argument("-keep", metavar="FILE", help="write the tests that add coverage, one name a line, in rank order")
     d = sub.add_parser("trend", help="print the history as a table")
     d.add_argument("history")
     d.add_argument("-n", type=int, help="only the last N snapshots")
     d.add_argument("-feature", metavar="PATH", help="the score of one feature (e.g. tx.parity) instead of the plan's")
     i = sub.add_parser("init", help="write a draft plan from a regression's tests and coverage")
     inputs(i)
+    reqopt(i)
     i.add_argument("-name", help="plan name (default: design)")
     i.add_argument("-o", metavar="FILE", help="write the plan here (default: standard output)")
     a = ap.parse_args(argv)
     try:
-        return {"check": cmd_check, "report": cmd_report, "triage": cmd_triage, "trend": cmd_trend, "init": cmd_init}[a.cmd](a)
+        return {"check": cmd_check, "report": cmd_report, "triage": cmd_triage, "trend": cmd_trend, "init": cmd_init,
+                "rank": cmd_rank}[a.cmd](a)
     except PlanError as e:
         print(f"mplan: {e}", file=sys.stderr)
         return 2
