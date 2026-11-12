@@ -529,7 +529,7 @@ struct Isolation {
     std::vector<std::string> signals;
     std::vector<int> senseLow;
     std::string supply, source, sink;
-    bool diffSupplyOnly = true, noIso = false;
+    bool diffSupplyOnly = true, noIso = false, clampSet = false;
     int boundary = 0;    // -applies_to_boundary: 0 both, 1 lower, 2 upper
 };
 struct LevelShifter {
@@ -588,7 +588,53 @@ struct StateGroup {
     std::vector<PowerState> states;
     bool complete = false;
 };
-struct PortStateDef { std::string name; bool off = false; double vmin = 0, vmax = 0; };
+struct PortStateDef { std::string name; bool off = false; double vmin = 0, vmax = 0; bool partial = false; };
+// set_equivalent (6.47): supplies declared equivalent.
+struct Equiv {
+    std::vector<std::string> names;
+    bool functionOnly = false, interchangeable = true;
+    std::string where;
+};
+// create_composite_domain (6.17): a container of domains.
+struct Composite {
+    std::string name, scope, where;
+    std::vector<std::string> subs;
+};
+// connect_supply_set (6.15): elements explicitly powered by a supply set.
+struct SupplyConn {
+    std::string set, scope, where;
+    std::vector<std::string> elements, exclude;
+    bool hasElements = false, transitive = true;
+    std::vector<std::pair<std::string, std::string>> connect;   // function, pg_type
+};
+// set_simstate_behavior (6.56) for models or instances.
+struct SimBehavior {
+    std::string mode, lib, scope, where;
+    std::vector<std::string> models, elements, exclude;
+};
+// set_retention_elements (6.54): a named list of state elements kept together.
+struct RetList {
+    std::string name, scope, where;
+    std::vector<std::string> elements, exclude;
+    std::string appliesTo;            // "", required, optional, not_required, not_optional
+    bool required = true;             // -retention_purpose
+};
+// set_design_attributes (6.44) and set_port_attributes (6.51): attributes
+// of models, instances and ports (5.6), kept as the commands gave them and
+// looked up by precedence (5.7): a named port or element before a model.
+struct DesignAttrRule {
+    std::string scope, where;
+    std::vector<std::string> models, elements, exclude;
+    bool hasElements = false;
+    std::map<std::string, std::string> attrs;
+};
+struct PortAttrRule {
+    std::string scope, where, model;
+    std::vector<std::string> elements, exclude, ports, excludePorts;
+    bool hasElements = false, hasPorts = false;
+    int dirs = 7;   // bit 0 inputs, 1 outputs, 2 inouts
+    std::map<std::string, std::string> attrs;
+};
 struct Pst {
     std::string name, where;
     std::vector<std::string> supplies;
@@ -629,6 +675,15 @@ struct Model {
     std::set<std::string> logicNets;                 // create_logic_net: rooted names
     std::vector<LogicConn> logicConns;
     std::map<std::string, std::vector<PortStateDef>> portStates;
+    std::string partialOn;                           // set_partial_on_translation: "", OFF or FULL_ON
+    std::vector<Equiv> eqNets, eqSets;
+    std::map<std::string, Composite> composites;
+    std::vector<SupplyConn> supplyConns;
+    std::vector<SimBehavior> simBehaviors;
+    std::map<std::string, RetList> retLists;
+    std::vector<DesignAttrRule> designAttrs;
+    std::vector<PortAttrRule> portAttrs;
+    std::map<std::string, std::string> globalAttrs;
     std::vector<Pst> psts;
     std::string version;
     std::vector<std::string> warnings;
@@ -684,6 +739,144 @@ struct Model {
         if (it == domains.end()) return "";
         auto h = it->second.handles.find("primary");
         return setOf(h == it->second.handles.end() ? dom + ".primary" : h->second);
+    }
+
+    // ---- equivalence of supply sets (4.5.5, 6.47) ----
+    // Two supply sets match when they are the same set, when set_equivalent
+    // declares them equivalent (functional equivalence counts unless the
+    // caller asks for electrical only), or when each of their functions is
+    // on the same supply subnet (connect_supply_net and set_equivalent -nets).
+    mutable std::map<std::string, std::string> eqElec_, eqFunc_;
+    mutable bool eqBuilt_ = false;
+    void buildEq() const {
+        eqBuilt_ = true;
+        eqElec_.clear();
+        eqFunc_.clear();
+        std::map<std::string, std::string> up;
+        std::function<std::string(std::string)> find = [&](std::string n) {
+            while (up.count(n) && up[n] != n) n = up[n];
+            return n;
+        };
+        auto unite = [&](const std::string& a, const std::string& b) {
+            std::string x = find(a), y = find(b);
+            if (x != y) up[x] = y;
+        };
+        for (auto& [net, ps] : connects) for (auto& p : ps) unite(p, net);
+        for (auto& e : eqNets)
+            if (!e.functionOnly) for (auto& n : e.names) unite(n, e.names[0]);
+        std::map<std::string, std::string> bySig;   // function signature -> first set with it
+        for (auto& [n, st] : sets) {
+            std::string sig;
+            for (auto& [f, net] : st.fn) sig += f + "=" + find(net) + ";";
+            if (sig.empty()) { eqElec_[n] = n; continue; }
+            auto it = bySig.emplace(sig, n).first;
+            eqElec_[n] = it->second;
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            auto& cls = pass == 0 ? eqElec_ : eqFunc_;
+            if (pass == 1) cls = eqElec_;
+            auto root = [&](std::string n) {
+                for (int k = 0; k < 64; k++) {
+                    auto it = cls.find(n);
+                    if (it == cls.end() || it->second == n) break;
+                    n = it->second;
+                }
+                return n;
+            };
+            for (auto& e : eqSets) {
+                if (e.functionOnly && (pass == 0 || !e.interchangeable)) continue;
+                std::string first;
+                for (auto& n : e.names) {
+                    std::string r = root(setOf(n));
+                    if (first.empty()) first = r;
+                    else if (r != first) cls[r] = first;
+                }
+            }
+            for (auto& [n, st] : sets) { (void)st; cls[n] = root(n); }
+        }
+    }
+    // The equivalence class of a supply set; functional = interchangeable
+    // functional equivalence counts too.
+    std::string eqOf(const std::string& set, bool functional = true) const {
+        if (!eqBuilt_) buildEq();
+        std::string n = setOf(set);
+        const auto& cls = functional ? eqFunc_ : eqElec_;
+        auto it = cls.find(n);
+        return it == cls.end() ? n : it->second;
+    }
+    // Every domain a name stands for: itself, or the subdomains of a composite (6.17).
+    std::vector<std::string> domainsOf(const std::string& n, int depth = 0) const {
+        std::vector<std::string> r;
+        auto c = composites.find(n);
+        if (c == composites.end() || depth > 16) { r.push_back(n); return r; }
+        for (auto& sub : c->second.subs)
+            for (auto& d : domainsOf(sub, depth + 1)) r.push_back(d);
+        return r;
+    }
+
+    // ---- attributes (5.6) ----
+    static bool pathIn(const std::string& path, const std::string& e) {
+        if (e.empty()) return true;
+        return path == e || (path.size() > e.size() && path.compare(0, e.size(), e) == 0 &&
+                             (path[e.size()] == '.' || path[e.size()] == '['));
+    }
+    static bool modelIn(const std::vector<std::string>& models, const std::string& model) {
+        for (auto& mm : models) {
+            size_t dot = mm.rfind('.');   // "lib.model"
+            if (mm == model || (dot != std::string::npos && mm.substr(dot + 1) == model)) return true;
+        }
+        return false;
+    }
+    // The value of attribute `name` of an instance (simulator path) of
+    // `model`; "" if it has none. An instance named by -elements wins over
+    // its model; of the same kind, the later command wins.
+    std::string designAttr(const std::string& inst, const std::string& model, const std::string& name) const {
+        std::string val;
+        int best = 0;
+        for (auto& r : designAttrs) {
+            auto a = r.attrs.find(name);
+            if (a == r.attrs.end()) continue;
+            int rank = 0;
+            if (r.hasElements) {
+                if (!r.models.empty() && !modelIn(r.models, model)) continue;
+                bool in = false;
+                for (auto& e : r.elements) if (design(e) == inst) in = true;
+                for (auto& e : r.exclude) if (design(e) == inst) in = false;
+                if (in) rank = 2;
+            } else if (modelIn(r.models, model)) rank = 1;
+            if (rank && rank >= best) { best = rank; val = a->second; }
+        }
+        return val;
+    }
+    // The value of attribute `name` of port `port` (direction dir: 0 in, 1
+    // out, 2 inout) of instance `inst` of `model`.
+    std::string portAttr(const std::string& inst, const std::string& model, const std::string& port, int dir,
+                         const std::string& name) const {
+        std::string val;
+        int best = 0;
+        std::string full = inst.empty() ? port : inst + "." + port;
+        for (auto& r : portAttrs) {
+            auto a = r.attrs.find(name);
+            if (a == r.attrs.end()) continue;
+            if (!(r.dirs & (1 << dir))) continue;
+            int rank = 0;
+            if (!r.model.empty()) {
+                bool here = r.model == "." ? inst == design(r.scope) : modelIn({r.model}, model);
+                if (!here) continue;
+                if (r.hasPorts) { if (std::find(r.ports.begin(), r.ports.end(), port) != r.ports.end()) rank = 2; }
+                else rank = 1;
+            } else {
+                if (r.hasPorts)
+                    for (auto& pn : r.ports) if (design(pn) == full) rank = 4;
+                if (!rank && r.hasElements)
+                    for (auto& e : r.elements) if (design(e) == inst) rank = 3;
+                for (auto& e : r.exclude) if (design(e) == inst) rank = 0;
+            }
+            for (auto& pn : r.excludePorts)
+                if (pn == port || design(join(r.scope, pn)) == full) rank = 0;
+            if (rank && rank >= best) { best = rank; val = a->second; }
+        }
+        return val;
     }
 
     // ---- reading ----
@@ -1015,6 +1208,27 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 throw Error(c.where() + ": create_power_switch needs -output_supply_port");
             continue;
         }
+        // A strategy of a composite domain is a strategy of each subdomain,
+        // if it is legal in every one (6.17).
+        if (n == "set_isolation" || n == "set_level_shifter" || n == "set_repeater" || n == "set_retention") {
+            size_t di = 0;
+            for (size_t k = 1; k + 1 < c.w.size(); k++) if (c.w[k] == "-domain") di = k + 1;
+            if (di && composites.count(join(scope, c.w[di]))) {
+                Model saved = *this;
+                try {
+                    for (auto& sub : domainsOf(join(scope, c.w[di]))) {
+                        Cmd c2 = c;
+                        c2.w[di] = "/" + sub;
+                        run({c2}, scope, rd, file);
+                    }
+                } catch (Error& e) {
+                    *this = saved;
+                    warnings.push_back(c.where() + ": " + n + " is not applied to composite domain " + c.w[di] +
+                                       ": it is an error in a subdomain (" + e.what() + ")");
+                }
+                continue;
+            }
+        }
         if (n == "set_isolation") {
             Opts o = opts(c, {"-no_isolation", "-force_isolation", "-update"},
                           {"-diff_supply_only", "-use_functional_equivalence"});
@@ -1032,7 +1246,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 std::string a = o.get("-applies_to");
                 is->appliesTo = a == "inputs" ? 0 : a == "outputs" ? 1 : 2;
             }
-            if (o.has("-clamp_value")) is->clamp = o.get("-clamp_value");
+            if (o.has("-clamp_value")) { is->clamp = o.get("-clamp_value"); is->clampSet = true; }
             if (o.has("-isolation_signal")) {
                 is->signals.clear();
                 for (auto& s : o.list("-isolation_signal")) is->signals.push_back(join(scope, s));
@@ -1096,7 +1310,12 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (o.has("-update"))
                 for (auto& x : rets) if (x.name == o.pos[0] && x.domain == dn) rt = &x;
             if (!rt) { rets.push_back({}); rt = &rets.back(); rt->name = o.pos[0]; rt->domain = dn; rt->where = c.where(); }
-            for (auto& e : rooted(o.list("-elements"))) rt->elements.push_back(e);
+            for (auto& e : rooted(o.list("-elements"))) {
+                auto rl = retLists.find(e);   // a named list of set_retention_elements (6.54)
+                if (rl == retLists.end()) { rt->elements.push_back(e); continue; }
+                for (auto& x : rl->second.elements) rt->elements.push_back(x);
+                for (auto& x : rl->second.exclude) rt->exclude.push_back(x);
+            }
             for (auto& e : rooted(o.list("-exclude_elements"))) rt->exclude.push_back(e);
             if (o.has("-retention_supply")) rt->supply = join(scope, o.get("-retention_supply"));
             auto ss = [&](const char* opt, SigSense& out) {
@@ -1131,6 +1350,250 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 throw Error(c.where() + ": -restore_event_condition and -restore_period_condition together (6.53)");
             continue;
         }
+        if (n == "create_composite_domain") {   // 6.17
+            Opts o = opts(c, {"-update"});
+            need(o, 1, "a composite domain name");
+            std::string name = join(scope, o.pos[0]);
+            bool fresh = !composites.count(name);
+            if (fresh && o.has("-update")) throw Error(c.where() + ": -update of unknown composite domain " + o.pos[0]);
+            if (!fresh && !o.has("-update")) throw Error(c.where() + ": composite domain " + o.pos[0] + " is already defined");
+            if (fresh && domains.count(name)) throw Error(c.where() + ": " + o.pos[0] + " is already a power domain");
+            Composite& cd = composites[name];
+            if (fresh) {
+                cd.name = name;
+                cd.scope = scope;
+                cd.where = c.where();
+                // its power states are held like those of a group (6.22)
+                StateGroup& g = groups[name];
+                g.name = name;
+                g.scope = scope;
+                g.where = c.where();
+                groupOrder.push_back(name);
+            }
+            for (auto& sd : o.list("-subdomains")) {
+                std::string sn = join(scope, sd);
+                if (!domains.count(sn) && !composites.count(sn)) throw Error(c.where() + ": no domain " + sd);
+                if (sn == name) throw Error(c.where() + ": composite domain " + o.pos[0] + " contains itself");
+                cd.subs.push_back(sn);
+            }
+            for (auto& sv : o.all("-supply")) {
+                auto l = splitList(sv);
+                if (l.empty()) continue;
+                if (l[0] != "primary") throw Error(c.where() + ": only the primary supply handle can be given for a composite domain (6.17)");
+                if (l.size() > 1) setAlias[name + ".primary"] = setOf(join(scope, l[1]));
+            }
+            eqBuilt_ = false;
+            continue;
+        }
+        if (n == "set_equivalent") {   // 6.47
+            Opts o = opts(c, {"-function_only"}, {"-interchangeable"});
+            if (o.has("-nets") == o.has("-sets")) throw Error(c.where() + ": set_equivalent needs -nets or -sets, not both (6.47)");
+            if (o.has("-interchangeable") && !o.has("-function_only"))
+                throw Error(c.where() + ": -interchangeable without -function_only (6.47)");
+            Equiv e;
+            e.functionOnly = o.has("-function_only");
+            e.interchangeable = o.get("-interchangeable", "TRUE") == "TRUE";
+            e.where = c.where();
+            bool nets = o.has("-nets");
+            for (auto& x : o.list(nets ? "-nets" : "-sets")) {
+                std::string full = join(scope, x);
+                if (nets) {
+                    if (!this->nets.count(full) && !ports.count(full) && fnNet(full).empty())
+                        throw Error(c.where() + ": set_equivalent: no supply net or port " + x);
+                    if (!fnNet(full).empty()) full = fnNet(full);
+                } else full = setRef(full, c.where()).name;
+                e.names.push_back(full);
+            }
+            if (e.names.size() < 2) throw Error(c.where() + ": set_equivalent needs two or more supplies");
+            (nets ? eqNets : eqSets).push_back(e);
+            eqBuilt_ = false;
+            continue;
+        }
+        if (n == "set_partial_on_translation") {   // 6.50
+            if (c.w.size() != 2 || (c.w[1] != "OFF" && c.w[1] != "FULL_ON"))
+                throw Error(c.where() + ": set_partial_on_translation needs OFF or FULL_ON");
+            if (!partialOn.empty() && partialOn != c.w[1])
+                throw Error(c.where() + ": set_partial_on_translation " + c.w[1] + " after " + partialOn + " (6.50)");
+            partialOn = c.w[1];
+            continue;
+        }
+        if (n == "connect_supply_set") {   // 6.15
+            Opts o = opts(c, {}, {"-transitive"});
+            need(o, 1, "a supply set");
+            SupplyConn sc;
+            sc.set = setRef(join(scope, o.pos[0]), c.where()).name;
+            sc.scope = scope;
+            sc.where = c.where();
+            sc.hasElements = o.has("-elements");
+            sc.elements = rooted(o.list("-elements"));
+            sc.exclude = rooted(o.list("-exclude_elements"));
+            sc.transitive = o.get("-transitive", "TRUE") == "TRUE";
+            for (auto& cv : o.all("-connect")) {
+                auto l = splitList(cv);
+                if (l.size() != 2) throw Error(c.where() + ": -connect needs {function pg_type_list}");
+                for (auto& pg : splitList(l[1])) {
+                    for (auto& old : supplyConns)
+                        for (auto& [f, t] : old.connect)
+                            if (old.set != sc.set && t == pg && old.elements == sc.elements && sc.hasElements)
+                                throw Error(c.where() + ": pg_type " + pg + " is already connected to " + old.set + " for these elements (6.15)");
+                    sc.connect.push_back({l[0], pg});
+                }
+            }
+            // a handle of a domain: its elements are those of the domain
+            if (!sc.hasElements) {
+                std::string h = join(scope, o.pos[0]);
+                size_t dot = h.rfind('.');
+                if (dot != std::string::npos && domains.count(h.substr(0, dot))) {
+                    sc.elements = domains[h.substr(0, dot)].elements;
+                    sc.hasElements = true;
+                }
+            }
+            if (!sc.hasElements) throw Error(c.where() + ": connect_supply_set needs -elements (the supply set is not a handle of a domain)");
+            supplyConns.push_back(sc);
+            continue;
+        }
+        if (n == "set_simstate_behavior") {   // 6.56
+            Opts o = opts(c, {});
+            need(o, 1, "ENABLE, SIMSTATE_ONLY, PORT_CORR_ONLY or DISABLE");
+            SimBehavior sb;
+            sb.mode = o.pos[0];
+            if (sb.mode != "ENABLE" && sb.mode != "SIMSTATE_ONLY" && sb.mode != "PORT_CORR_ONLY" && sb.mode != "DISABLE")
+                throw Error(c.where() + ": set_simstate_behavior " + sb.mode + " (ENABLE, SIMSTATE_ONLY, PORT_CORR_ONLY or DISABLE)");
+            sb.lib = o.get("-lib");
+            sb.models = o.list("-models");
+            sb.scope = scope;
+            sb.where = c.where();
+            bool rel = !sb.models.empty() || !sb.lib.empty();   // element names are relative to the models
+            for (auto& e : o.list("-elements")) sb.elements.push_back(rel ? e : join(scope, e));
+            for (auto& e : o.list("-exclude_elements")) sb.exclude.push_back(rel ? e : join(scope, e));
+            if (!sb.exclude.empty() && sb.models.empty() && sb.elements.empty() && sb.lib.empty())
+                throw Error(c.where() + ": -exclude_elements without -models, -elements or -lib (6.56)");
+            if (sb.models.empty() && sb.elements.empty() && sb.lib.empty())
+                throw Error(c.where() + ": set_simstate_behavior names no model or element (6.56)");
+            if (!sb.lib.empty())
+                for (auto& mm : sb.models) {
+                    size_t dot = mm.find('.');
+                    if (dot != std::string::npos && mm.substr(0, dot) != sb.lib)
+                        throw Error(c.where() + ": model " + mm + " is not in library " + sb.lib + " (6.56)");
+                }
+            simBehaviors.push_back(sb);
+            continue;
+        }
+        if (n == "set_retention_elements") {   // 6.54
+            Opts o = opts(c, {}, {"-transitive"});
+            need(o, 1, "a list name");
+            std::string name = join(scope, o.pos[0]);
+            if (retLists.count(name)) throw Error(c.where() + ": retention list " + o.pos[0] + " is already defined in this scope (6.54)");
+            if (!o.has("-elements")) throw Error(c.where() + ": set_retention_elements needs -elements");
+            RetList rl;
+            rl.name = name;
+            rl.scope = scope;
+            rl.where = c.where();
+            rl.elements = rooted(o.list("-elements"));
+            rl.exclude = rooted(o.list("-exclude_elements"));
+            rl.appliesTo = o.get("-applies_to");
+            if (!rl.appliesTo.empty() && rl.appliesTo != "required" && rl.appliesTo != "optional" &&
+                rl.appliesTo != "not_required" && rl.appliesTo != "not_optional")
+                throw Error(c.where() + ": -applies_to " + rl.appliesTo);
+            std::string pu = o.get("-retention_purpose", "required");
+            if (pu != "required" && pu != "optional") throw Error(c.where() + ": -retention_purpose " + pu);
+            rl.required = pu == "required";
+            retLists[name] = rl;
+            continue;
+        }
+        if (n == "set_design_attributes") {   // 6.44
+            Opts o = opts(c, {}, {"-is_soft_macro", "-is_hard_macro", "-is_refinable_macro", "-is_power_aware_model", "-is_leaf_cell", "-is_macro_cell"});
+            DesignAttrRule r;
+            r.scope = scope;
+            r.where = c.where();
+            for (auto& mm : o.list("-models")) r.models.push_back(mm == "." ? std::string(".") : mm);
+            r.hasElements = o.has("-elements");
+            r.elements = rooted(o.list("-elements"));
+            r.exclude = rooted(o.list("-exclude_elements"));
+            if (!r.exclude.empty() && !r.hasElements) throw Error(c.where() + ": -exclude_elements without -elements (6.44)");
+            for (auto& av : o.all("-attribute")) {
+                auto l = splitList(av);
+                if (l.size() != 2) throw Error(c.where() + ": -attribute needs {name value}");
+                r.attrs[l[0]] = l[1];
+            }
+            for (const char* f : {"soft_macro", "hard_macro", "refinable_macro", "power_aware_model", "leaf_cell", "macro_cell"})
+                if (o.has(std::string("-is_") + f)) r.attrs[std::string("UPF_is_") + f] = o.get(std::string("-is_") + f);
+            if (o.has("-switch_cell_type")) {
+                std::string t = o.get("-switch_cell_type");
+                if (t != "coarse_grain" && t != "fine_grain") throw Error(c.where() + ": -switch_cell_type " + t);
+                r.attrs["UPF_switch_cell_type"] = t;
+            }
+            if (r.attrs.empty()) throw Error(c.where() + ": set_design_attributes gives no attribute (6.44)");
+            static const std::map<std::string, std::set<std::string>> legal = {
+                {"UPF_is_soft_macro", {"TRUE", "FALSE"}}, {"UPF_is_hard_macro", {"TRUE", "FALSE"}},
+                {"UPF_is_refinable_macro", {"TRUE", "FALSE"}}, {"UPF_is_power_aware_model", {"TRUE", "FALSE"}},
+                {"UPF_retention", {"required", "optional"}},
+                {"UPF_simstate_behavior", {"ENABLE", "SIMSTATE_ONLY", "PORT_CORR_ONLY", "DISABLE"}}};
+            for (auto& [an, av] : r.attrs) {
+                auto lg = legal.find(an);
+                if (lg != legal.end() && !lg->second.count(av))
+                    throw Error(c.where() + ": attribute " + an + " cannot be " + av + " (5.6)");
+            }
+            if (r.models.empty() && !r.hasElements) {   // global attributes
+                for (auto& [an, av] : r.attrs) globalAttrs[an] = av;
+                continue;
+            }
+            // -models {.}: the model of the current scope, as an element
+            if (r.models.size() == 1 && r.models[0] == "." && !r.hasElements) {
+                r.models.clear();
+                r.hasElements = true;
+                r.elements.push_back(scope);
+            }
+            designAttrs.push_back(r);
+            continue;
+        }
+        if (n == "set_port_attributes") {   // 6.51
+            Opts o = opts(c, {"-unconnected", "-is_analog", "-is_isolated"});
+            PortAttrRule r;
+            r.scope = scope;
+            r.where = c.where();
+            r.model = o.get("-model");
+            r.hasElements = o.has("-elements");
+            r.elements = rooted(o.list("-elements"));
+            r.exclude = rooted(o.list("-exclude_elements"));
+            r.hasPorts = o.has("-ports");
+            for (auto& pn : o.list("-ports")) r.ports.push_back(r.model.empty() ? join(scope, pn) : pn);
+            r.excludePorts = o.list("-exclude_ports");
+            if (r.model.empty() && !r.hasElements && !r.hasPorts)
+                throw Error(c.where() + ": set_port_attributes needs -model, -elements or -ports (6.51)");
+            if (o.has("-applies_to")) {
+                r.dirs = 0;
+                for (auto& d : o.list("-applies_to")) {
+                    if (d == "inputs") r.dirs |= 1;
+                    else if (d == "outputs") r.dirs |= 2;
+                    else if (d == "inouts") r.dirs |= 4;
+                    else throw Error(c.where() + ": -applies_to " + d + " (inputs, outputs, inouts)");
+                }
+            }
+            for (auto& av : o.all("-attribute")) {
+                auto l = splitList(av);
+                if (l.size() != 2) throw Error(c.where() + ": -attribute needs {name value}");
+                r.attrs[l[0]] = l[1];
+            }
+            static const std::pair<const char*, const char*> opt2attr[] = {
+                {"-clamp_value", "UPF_clamp_value"}, {"-async_clamp_value", "UPF_async_clamp_value"},
+                {"-sink_off_clamp", "UPF_sink_off_clamp_value"}, {"-source_off_clamp", "UPF_source_off_clamp_value"},
+                {"-pg_type", "UPF_pg_type"}, {"-related_power_port", "UPF_related_power_port"},
+                {"-related_ground_port", "UPF_related_ground_port"}, {"-related_bias_ports", "UPF_related_bias_ports"},
+                {"-feedthrough", "UPF_feedthrough"}};
+            for (auto& [op, an] : opt2attr) if (o.has(op)) r.attrs[an] = o.get(op);
+            for (const char* op : {"-driver_supply", "-receiver_supply", "-literal_supply"})
+                if (o.has(op)) r.attrs[std::string("UPF_") + (op + 1)] = setRef(join(scope, o.get(op)), c.where()).name;
+            if (o.has("-unconnected")) r.attrs["UPF_unconnected"] = "TRUE";
+            if (o.has("-is_analog")) r.attrs["UPF_is_analog"] = "TRUE";
+            if (o.has("-is_isolated")) r.attrs["UPF_is_isolated"] = "TRUE";
+            if (r.attrs.empty()) throw Error(c.where() + ": set_port_attributes gives no attribute (6.51)");
+            auto acv = r.attrs.find("UPF_async_clamp_value");
+            if (acv != r.attrs.end() && acv->second != "0" && acv->second != "1")
+                throw Error(c.where() + ": -async_clamp_value " + acv->second + " (0 or 1)");
+            portAttrs.push_back(r);
+            continue;
+        }
         if (n == "create_power_state_group") {   // 6.22
             Opts o = opts(c, {});
             need(o, 1, "a group name");
@@ -1156,8 +1619,9 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 continue;
             }
             if (kind == 's' || (!kind && !domains.count(obj) && !groups.count(obj))) obj = setRef(obj, c.where()).name;
-            else if (kind == 'd' && !domains.count(obj)) throw Error(c.where() + ": no domain " + objArg);
+            else if (kind == 'd' && !domains.count(obj) && !composites.count(obj)) throw Error(c.where() + ": no domain " + objArg);
             else if (kind == 'g' && !groups.count(obj)) throw Error(c.where() + ": no power state group " + objArg);
+            if (kind == 'd' && composites.count(obj)) kind = 'g';
             if (!kind) kind = groups.count(obj) ? 'g' : domains.count(obj) ? 'd' : 's';
             bool fresh = !transitions.count(obj);
             if (fresh && o.has("-update")) throw Error(c.where() + ": " + n + " -update: no transitions of " + objArg + " to update");
@@ -1284,7 +1748,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             std::vector<PowerState>* states = nullptr;
             bool* complete = nullptr;
             bool isSet = false;
-            if (groups.count(obj) && !o.has("-supply") && !o.has("-domain")) {
+            if (groups.count(obj) && !o.has("-supply") && (!o.has("-domain") || composites.count(obj))) {
                 states = &groups[obj].states;
                 complete = &groups[obj].complete;
             } else if (o.has("-group")) {
@@ -1339,17 +1803,34 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             Opts o = opts(c, {});
             need(o, 1, "a supply port");
             std::string p = join(scope, o.pos[0]);
+            if (!fnNet(p).empty()) p = fnNet(p);   // a supply set function (6.8)
+            else if (!ports.count(p) && !nets.count(p))
+                throw Error(c.where() + ": " + n + ": no supply port, net or supply set function " + o.pos[0]);
             for (auto& st : o.all("-state")) {
                 auto l = splitList(st);
                 if (l.size() < 2) throw Error(c.where() + ": -state needs {name value}");
                 PortStateDef d;
                 d.name = l[0];
-                if (l[1] == "off") d.off = true;
+                if (l[1] == "off" || l[1] == "OFF") d.off = true;
                 else {
+                    // add_supply_state (6.8): a voltage, or {net_state voltage};
+                    // add_port_state (6.4): a voltage or {min nom max}
+                    auto two = splitList(l[1]);
                     try {
-                        d.vmin = std::stod(l[1]);
-                        d.vmax = std::stod(l.back());
-                    } catch (...) { throw Error(c.where() + ": bad voltage in -state " + st); }
+                        if (n == "add_supply_state" && two.size() == 2 && !std::isdigit((unsigned char)two[0][0]) && two[0][0] != '.') {
+                            if (two[0] == "OFF") d.off = true;
+                            else if (two[0] == "PARTIAL_ON") d.partial = true;
+                            else if (two[0] != "FULL_ON") throw Error(c.where() + ": net state " + two[0] + " in -state " + st);
+                            d.vmin = d.vmax = std::stod(two[1]);
+                        } else if (two.size() > 1) {
+                            d.vmin = std::stod(two.front());
+                            d.vmax = std::stod(two.back());
+                        } else {
+                            d.vmin = std::stod(l[1]);
+                            d.vmax = std::stod(l.back());
+                        }
+                    } catch (Error&) { throw; }
+                    catch (...) { throw Error(c.where() + ": bad voltage in -state " + st); }
                 }
                 portStates[p].push_back(d);
             }
@@ -1384,12 +1865,12 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
         }
         // Accepted and not needed for simulation.
         static const std::set<std::string> ignored = {
-            "set_port_attributes", "set_design_attributes", "map_isolation_cell", "map_level_shifter_cell",
-            "map_retention_cell", "map_power_switch", "use_interface_cell", "name_format", "set_simstate_behavior",
-            "set_partial_on_translation", "set_variation", "set_correlated", "bind_checker", 
-            "set_equivalent", 
+            "map_isolation_cell", "map_level_shifter_cell",
+            "map_retention_cell", "map_power_switch", "use_interface_cell", "name_format", 
+            "set_variation", "set_correlated", "bind_checker", 
+            
             "save_upf", "sim_assertion_control", "sim_corruption_control",
-            "sim_replay_control", "load_simstate_behavior", "create_composite_domain", "set_retention_elements",
+            "sim_replay_control", "load_simstate_behavior",
             "set_retention_control", "define_power_model", "end_power_model", "apply_power_model", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
             "define_retention_cell", "define_power_switch_cell", "define_always_on_cell", "define_diode_clamp",
             "map_retention_clamp_cell", "map_repeater_cell", "create_abstract_power_source", "set_pin_related_supply",
@@ -1482,8 +1963,8 @@ inline std::vector<Crossing> crossings(const DomainMap& dm, const std::vector<Po
 // The filters every interface-cell strategy shares (6.48, 6.49, 6.52):
 // -applies_to, -applies_to_boundary, -elements, -exclude_elements, -source
 // and -sink, for a strategy of `domain` at crossing c.
-inline std::string supplyOfDomain(const Model& m, const std::string& dom) {
-    return dom.empty() ? std::string("<always-on>") : m.primaryOf(dom);
+inline std::string supplyOfDomain(const Model& m, const std::string& dom, bool functional = true) {
+    return dom.empty() ? std::string("<always-on>") : m.eqOf(m.primaryOf(dom), functional);
 }
 inline bool strategyApplies(const Model& m, const std::string& domain, int appliesTo, int boundary,
                             const std::vector<std::string>& elements, const std::vector<std::string>& exclude,
@@ -1501,8 +1982,8 @@ inline bool strategyApplies(const Model& m, const std::string& domain, int appli
     if (!exclude.empty() && namesPort(m, exclude, *c.p)) return false;
     auto matches = [&](const std::string& filter, const std::string& dom) {
         if (filter.empty()) return true;
-        if (m.domains.count(filter)) return filter == dom || m.primaryOf(filter) == supplyOfDomain(m, dom);
-        return m.setOf(filter) == supplyOfDomain(m, dom);
+        if (m.domains.count(filter)) return filter == dom || m.eqOf(m.primaryOf(filter)) == supplyOfDomain(m, dom);
+        return m.eqOf(filter) == supplyOfDomain(m, dom);
     };
     return matches(source, c.from) && matches(sink, c.to);
 }
@@ -1527,7 +2008,62 @@ inline bool repApplies(const Model& m, const Repeater& r, const Crossing& c) {
 struct Finding {
     std::string rule, where, text;
 };
+// Errors of the power intent that do not need the design's ports: a
+// subdomain whose primary supply is not equivalent to its composite
+// domain's (6.17 c); an element of a required retention list that is not
+// retained while another element of its domain is (6.54). `modelOf` gives
+// the model of an instance (for the UPF_retention attribute).
+inline std::vector<Finding> intentErrors(const Model& m, const DomainMap& dm,
+                                         const std::function<std::string(const std::string&)>& modelOf) {
+    std::vector<Finding> out;
+    for (auto& [cn, cd] : m.composites) {
+        if (!m.setAlias.count(cn + ".primary")) continue;
+        std::string want = m.eqOf(cn + ".primary");
+        for (auto& sub : m.domainsOf(cn)) {
+            if (!m.domains.count(sub)) continue;
+            std::string have = m.primaryOf(sub);
+            auto st = m.sets.find(have);
+            if (st == m.sets.end() || st->second.fn.empty()) continue;   // no supply associated yet
+            if (m.eqOf(have) != want)
+                out.push_back({"UPF007", cd.where, "composite domain " + cn + ": the primary supply of subdomain " + sub + " (" + have +
+                                                   ") is not equivalent to " + m.setOf(cn + ".primary") + " (6.17 c)"});
+        }
+    }
+    auto retained = [&](const std::string& path, const std::string& dom) {
+        for (auto& r : m.rets) {
+            if (r.noRet || r.domain != dom) continue;
+            bool in = r.elements.empty();
+            for (auto& e : r.elements) in |= DomainMap::within(path, m.design(e));
+            for (auto& e : r.exclude) if (DomainMap::within(path, m.design(e))) in = false;
+            if (in) return true;
+        }
+        return false;
+    };
+    for (auto& [ln, rl] : m.retLists) {
+        if (!rl.required) continue;
+        for (auto& e : rl.elements) {
+            std::string path = m.design(e);
+            bool excluded = false;
+            for (auto& x : rl.exclude) if (DomainMap::within(path, m.design(x))) excluded = true;
+            if (excluded) continue;
+            if (!rl.appliesTo.empty()) {
+                std::string a = m.designAttr(path, modelOf ? modelOf(path) : std::string(), "UPF_retention");
+                bool keep = rl.appliesTo == "required" ? a == "required" : rl.appliesTo == "optional" ? a == "optional"
+                          : rl.appliesTo == "not_required" ? a != "required" : a != "optional";
+                if (!keep) continue;
+            }
+            std::string dom = dm.of(path);
+            if (dom.empty()) continue;
+            bool any = false;
+            for (auto& r : m.rets) if (!r.noRet && r.domain == dom) any = true;
+            if (any && !retained(path, dom))
+                out.push_back({"UPF007", rl.where, "retention list " + ln + ": " + path + " is not retained, and other elements of " + dom + " are (6.54)"});
+        }
+    }
+    return out;
+}
 struct DesignView {
+    std::map<std::string, std::string> models;   // instance (simulator path) -> its module
     std::set<std::string> instances;   // simulator paths of every instance (and generate block)
     std::set<std::string> signals;     // simulator names of every signal
     std::vector<PortSite> ports;
@@ -1548,6 +2084,8 @@ struct SupplyGraph {
     void build(const Model& m) {
         for (auto& [net, ps] : m.connects)
             for (auto& p : ps) unite(p, net);
+        for (auto& e : m.eqNets)   // electrically equivalent supplies are one subnet (6.47, 9.1)
+            if (!e.functionOnly) for (auto& n : e.names) unite(n, e.names[0]);
         for (auto& [n, sw] : m.switches) {
             if (!sw.outNet.empty()) unite(n + "/" + sw.outPort, sw.outNet);
             for (auto& [p, net] : sw.ins)
@@ -1612,6 +2150,11 @@ inline std::vector<Finding> check(const Model& m, const DesignView& dv) {
     };
     DomainMap dm;
     dm.build(m);
+    auto modelOf = [&](const std::string& inst) {
+        auto it = dv.models.find(inst);
+        return it == dv.models.end() ? std::string() : it->second;
+    };
+    for (auto& e : intentErrors(m, dm, modelOf)) f.push_back(e);
     // UPF001: names that are not in the design
     for (auto& dn : m.domainOrder) {
         const Domain& d = m.domains.at(dn);
@@ -1693,6 +2236,9 @@ inline std::vector<Finding> check(const Model& m, const DesignView& dv) {
         bool iso = false, noIso = false;
         for (auto& is : m.isos)
             if (isoApplies(m, is, c)) (is.noIso ? noIso : iso) = true;
+        if (m.portAttr(c.p->inst, modelOf(c.p->inst), c.p->port, c.p->dir, "UPF_is_isolated") == "TRUE" ||
+            m.portAttr(c.p->inst, modelOf(c.p->inst), c.p->port, c.p->dir, "UPF_is_analog") == "TRUE")
+            noIso = true;
         if (canBeOff(c.from) && !iso && !noIso && powerRoot(c.from) != powerRoot(c.to))
             add("UPF003", c.p->where, "no isolation on " + what + ": " + c.from +
                                           " can be off while the receiver is on, so it sees corrupted values");
@@ -1735,6 +2281,7 @@ inline const std::vector<std::pair<const char*, const char*>>& rules() {
         {"UPF004", "a port crosses between supplies that can have different voltages, with no level shifter"},
         {"UPF005", "an isolation strategy on a domain whose supply is never off (redundant isolation)"},
         {"UPF006", "a PST state names a supply port state that was not defined with add_port_state"},
+        {"UPF007", "the power intent contradicts itself: a composite domain's subdomain on another supply, a required retention list that is not retained"},
     };
     return r;
 }

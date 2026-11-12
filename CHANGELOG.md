@@ -81,6 +81,12 @@ Spec references are IEEE 1800-2023 clauses.
   `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with
   transition detection (6.7, 9.4); `create_power_state_group` (6.22);
   `-applies_to_boundary` on isolation and level-shifter strategies.
+- UPF (IEEE 1801-2024): `create_composite_domain` (6.17), `set_equivalent`
+  (6.47), `connect_supply_set` (6.15), `set_simstate_behavior` (6.56),
+  `set_design_attributes` (6.44), `set_port_attributes` (6.51),
+  `set_retention_elements` (6.54), `set_partial_on_translation` (6.50) and
+  `add_supply_state` with `{net_state voltage}` (6.8) are applied instead of
+  read and ignored; `mlint -upf` rule `UPF007`. See `docs/LOWPOWER.md`.
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.

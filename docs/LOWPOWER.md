@@ -60,6 +60,13 @@ turned on.
 | `create_logic_net`, `create_logic_port`, `connect_logic_net` (6.13, 6.19, 6.20) | one-bit nets and ports made by the power intent, and their connections to HDL ports (`-reconnect` replaces a constant on an input). The net can be an isolation, retention or switch control |
 | `add_state_transition` (6.7, 9.4) | named transitions of a supply set, domain or group (`-from` / `-to`, `-paired`, `-update`): an `-illegal` transition is an error, and with `-complete` so is one that is not named; `UNDEFINED` is passed through; `-upf_verbose` prints each named transition |
 | `create_power_state_group` (6.22) | `add_power_state -group`: the legal combinations of other objects' power states; an `-illegal` state, two states at once, or no state with `-complete` is reported |
+| `create_composite_domain` (6.17) | a strategy (`set_isolation`, `set_level_shifter`, `set_repeater`, `set_retention`) on the composite domain is a strategy of each subdomain, or of none when a subdomain rejects it; the primary supplies of the subdomains must be equivalent; its power states work like those of a group |
+| `set_equivalent` (6.47) | `-nets`: one electrical net, so driving one drives all; `-sets` and `-function_only`: the supplies count as the same in `-source`, `-sink`, `-diff_supply_only` and the composite domain rule |
+| `connect_supply_set` (6.15) | `-elements`, `-exclude_elements`, `-transitive`: the named instances follow that supply set instead of their domain's primary supply |
+| `set_simstate_behavior` (6.56), `UPF_simstate_behavior`, `UPF_is_power_aware_model` | `DISABLE`: the simulator does not corrupt the instance; `PORT_CORR_ONLY` (hard macros only): its logic is left alone and its outputs are `x` while its supply is not `NORMAL`; by `-models`, `-lib`, `-elements`, `-exclude_elements` |
+| `set_design_attributes` (6.44), `set_port_attributes` (6.51) | attributes of models, instances and ports with the precedence of 5.7. Simulated: `-driver_supply` (a primary input of the power top, or an output of an instance with no logic, is `x` while that supply is not `NORMAL`), `-clamp_value` (the clamp of an isolation strategy that gives none), `-is_analog` (no strategy applies), `-is_hard_macro`, `-is_power_aware_model`, `UPF_retention`. The others are kept for the checks |
+| `set_retention_elements` (6.54) | a named list that `set_retention -elements` can use; a `required` element that no strategy retains, in a domain that has retention, is an error |
+| `add_supply_state` (6.8), `set_partial_on_translation` (6.50) | named states of a supply port, net or supply set function, with `{PARTIAL_ON v}` told apart from `FULL_ON`; `PARTIAL_ON` read as `OFF` or `FULL_ON` |
 | `create_pst`, `add_port_state`, `add_pst_state` (legacy) | when a time step settles, the supplies must match a row of every PST |
 | `upf_version`, `set_scope`, `set_design_top`, `load_upf` | yes |
 | Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
@@ -73,8 +80,7 @@ schedules and `-threads` are turned off with `-upf`.
 
 ### Not yet
 
-`map_*`, `use_interface_cell`, `define_*_cell`, `set_port_attributes`,
-`set_simstate_behavior`, composite domains, power models and the
+`map_*`, `use_interface_cell`, `define_*_cell`, power models and the
 other implementation commands are read and ignored with a note.
 Isolation and level shifters sit on port connections between a parent and a
 child instance; a strategy on a port of the simulation top itself, or on a
@@ -89,10 +95,11 @@ has no `namespace`, `upvar`, `regexp` or file I/O.
 |---|---|
 | `UPF001` | A UPF name that is not in the design: a domain element, an isolation, retention or switch control signal |
 | `UPF002` | A domain whose primary supply set has no power function, or a supply function that names no supply net or port |
-| `UPF003` | A port that crosses from a domain that can be off (its power comes from a switch, or a PST / power state turns it off) to one that is on, with no isolation strategy |
+| `UPF003` | A port that crosses from a domain that can be off (its power comes from a switch, or a PST / power state turns it off) to one that is on, with no isolation strategy (a port with `UPF_is_isolated` or `UPF_is_analog` is not reported) |
 | `UPF004` | A port between two supplies that the PST or power states give different voltages, with no level shifter |
 | `UPF005` | An isolation strategy on a domain that is never off: redundant isolation |
 | `UPF006` | A PST state that names a supply port state never defined with `add_port_state` |
+| `UPF007` | Power intent that breaks a rule of the standard: a composite domain whose subdomains have primary supplies that are not equivalent (6.17), a required retention list element that no strategy retains (6.54) |
 
 Findings on ports point at the instance's port connection in the HDL;
 findings on the power intent point at the UPF line.

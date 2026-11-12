@@ -16,8 +16,10 @@ endforeach()
 
 # Logic nets and ports made by the power intent, repeaters (6.13, 6.19, 6.20,
 # 6.52, 9.10); named state transitions and power state groups, which report
-# through -upf_verbose (6.7, 6.22, 9.4).
-foreach(t logic transitions)
+# through -upf_verbose (6.7, 6.22, 9.4); attributes of ports and models,
+# equivalent supplies, composite domains, explicit supply connections and
+# simstate behavior (5.6, 6.8, 6.15, 6.17, 6.44, 6.47, 6.50, 6.51, 6.56).
+foreach(t logic transitions attributes)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -30,15 +32,18 @@ foreach(t logic transitions)
   endif()
 endforeach()
 # Errors of the logic and transition commands, each with its file and line.
-function(upf_error name text want)
-  file(READ ${D}/logic.upf base)
+function(upf_error_in t name text want)
+  file(READ ${D}/${t}.upf base)
   file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${name}.upf "${base}${text}\n")
-  execute_process(COMMAND ${MSIM} ${D}/logic.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/${name}.upf
+  execute_process(COMMAND ${MSIM} ${D}/${t}.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/${name}.upf
                   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
   string(FIND "${err}" "${want}" pos)
   if(rc EQUAL 0 OR pos EQUAL -1)
     message(FATAL_ERROR "${name}: expected the error '${want}': ${rc}\n${out}${err}")
   endif()
+endfunction()
+function(upf_error name text want)
+  upf_error_in(logic ${name} "${text}" "${want}")
 endfunction()
 upf_error(e_const "create_logic_net t1\nconnect_logic_net t1 -ports {u_core/d}" "must both be one bit of logic (6.13)")
 upf_error(e_net "connect_logic_net nope -ports {u_core/r}" "no logic net 'u_dut.nope'")
@@ -83,6 +88,40 @@ foreach(case
     message(FATAL_ERROR "VCT error not reported for: ${line}\nwant: ${want}\n${rc}\n${out}${err}")
   endif()
 endforeach()
+
+# Errors of the attribute, equivalence and composite domain commands.
+set(comp "create_supply_set SS_X -function {power VDD_E} -function {ground VSS}\ncreate_power_domain PD_X -elements {u_e}\nassociate_supply_set SS_X -handle PD_X.primary\ncreate_composite_domain PD_C -subdomains {PD_A PD_X} -supply {primary SS_A}")
+upf_error_in(attributes e_comp "${comp}" "the primary supply of subdomain PD_X (SS_X) is not equivalent to SS_A (6.17 c)")
+upf_error_in(attributes e_pco "set_simstate_behavior PORT_CORR_ONLY -elements {u_a}" "which is not a hard macro (UPF_is_hard_macro, 6.56)")
+upf_error_in(attributes e_eq "set_equivalent -nets {VDD}" "set_equivalent needs two or more supplies")
+upf_error_in(attributes e_eq2 "set_equivalent -nets {VDD VSS} -sets {SS SS_A}" "needs -nets or -sets, not both (6.47)")
+upf_error_in(attributes e_part "set_partial_on_translation FULL_ON" "set_partial_on_translation FULL_ON after OFF (6.50)")
+upf_error_in(attributes e_drv "set_port_attributes -ports {u_a/q} -driver_supply SS_E" "the logic that drives it is on SS_A (6.51)")
+upf_error_in(attributes e_attr "set_design_attributes -models {ip} -attribute {UPF_retention maybe}" "attribute UPF_retention cannot be maybe (5.6)")
+upf_error_in(attributes e_sst "add_supply_state NOPE -state {ON 1.0}" "no supply port, net or supply set function NOPE")
+upf_error_in(attributes e_css "connect_supply_set SS_E" "connect_supply_set needs -elements")
+# a retention list (6.54): a strategy can name it; a required element that no
+# strategy of its domain retains is an error
+file(READ ${D}/retention.upf base)
+string(REPLACE "set_retention RET_A -domain PD_A -elements {u_a/keep}"
+       "set_retention_elements KEEP_A -elements {u_a/keep}\nset_retention RET_A -domain PD_A -elements {KEEP_A}" withlist "${base}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/retlist.upf "${withlist}")
+execute_process(COMMAND ${MSIM} ${D}/retention.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/retlist.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ ${D}/retention.out want)
+if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
+  message(FATAL_ERROR "set_retention_elements: ${rc}\n${out}${err}")
+endif()
+upf_error_in(retention e_retl "set_retention_elements L -elements {u_a/lose}" "retention list L: u_a.lose is not retained, and other elements of PD_A are (6.54)")
+# mlint reports the same intent errors as UPF007
+file(READ ${D}/attributes.upf base)
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/l_comp.upf "${base}${comp}\n")
+execute_process(COMMAND ${MLINT} ${D}/attributes.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/l_comp.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+string(FIND "${out}${err}" "[UPF007] composite domain PD_C: the primary supply of subdomain PD_X" pos)
+if(pos EQUAL -1)
+  message(FATAL_ERROR "mlint: UPF007 was not reported\n${out}${err}")
+endif()
 
 # -power_top names the instance the UPF describes; it wins over set_design_top.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut
