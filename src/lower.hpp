@@ -8844,9 +8844,13 @@ struct Lowerer {
                 // first call, then left alone. The flag starts as X, so the
                 // first call fails the "already done" test and takes the init.
                 bool once = current && vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
-                if (!once) {
+                auto initVar = [&] {   // a fixed-size array takes its value element by element
+                    if (arrFind(&vd.symbol) && assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false)) return;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = expr(*init);
                     prog.emit(i);
+                };
+                if (!once) {
+                    initVar();
                     break;
                 }
                 int flag = freshStatic(1);
@@ -8856,8 +8860,7 @@ struct Lowerer {
                 prog.code[jf].target = prog.here();
                 Instr set; set.k = IK::Assign; set.sig = flag; set.e = konst(mk(1, 1));
                 prog.emit(set);
-                Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = expr(*init);
-                prog.emit(i);
+                initVar();
                 prog.code[js].target = prog.here();
                 break;
             }
