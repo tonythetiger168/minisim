@@ -213,8 +213,16 @@ expression is the expression object itself; `vpiImplication`,
 (the body) and `vpiElseConst`; `vpiConstrForEach` has `vpiVariables` (the
 array), `vpiLoopVars` and `vpiConstraintExpr`; `vpiSoftDisable` has
 `vpiExpr`; `vpiConstraintOrdering` (solve before) has `vpiSolveBefore` and
-`vpiSolveAfter`. Not yet: `unique` constraints as objects, `vpiSoft` on a
-soft expression, the enabled state of an object's constraint.
+`vpiSolveAfter`. `vpiSoft` is 1 on a `soft` expression item and 0 on a
+hard one. A `dist` item is a `vpiDistribution` with `vpiExpr` (the value
+distributed) and `vpiDistItem` items, each with `vpiDistType`
+(`vpiEqualDist` for `:=`, `vpiDivDist` for `:/`), `vpiWeight` and
+`vpiValueRange` (the value, or a `vpiValueRange` object with `vpiLeftRange`
+and `vpiRightRange`). `vpi_iterate(vpiConstraint, class object)` gives the
+object's blocks, its class's own first and then the inherited ones it does
+not override; their `vpiIsConstraintEnabled` follows `constraint_mode`
+(18.9) and their `vpiParent` is the object. A `unique` constraint has no
+object type in annex M, so it is not an item.
 
 **Drivers and loads (37.16, 37.17).** On a net or variable,
 `vpiLocalDriver` gives the continuous assignments inside its module whose
@@ -383,7 +391,7 @@ so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
 ## Not yet
 
 The non-static property
-declarations of a class definition, `unique` constraint items, containers of structs,
+declarations of a class definition, containers of structs,
 classes or containers, the value of a non-constant expression, drivers and
 loads of a bit or part of a signal and of primitive terminals,
 instance arrays as objects, the per-source
@@ -397,7 +405,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

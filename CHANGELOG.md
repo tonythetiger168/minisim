@@ -16,6 +16,11 @@ Spec references are IEEE 1800-2023 clauses.
 - Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
   `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
   the last place), checked by `tests/dw/more.sv`.
+- VPI constraint details (37.31): `vpiSoft` on expression items, `dist`
+  items as `vpiDistribution` / `vpiDistItem` / `vpiValueRange` objects with
+  `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
+  object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
+  `vpiRefObj` has `vpiName` and `vpiFullName`.
 - VPI threads and frames (38.36.1): `vpi_handle(vpiThread / vpiFrame, NULL)`
   in a calltf, thread objects (`vpiParent`, `vpiFrame`, child threads) and
   frame objects (`vpiScope`, `vpiParent`, `vpiThread`, `vpiAutomatic`), both
@@ -94,6 +99,13 @@ Spec references are IEEE 1800-2023 clauses.
   clock domain (virtual clocks included), so an input read without a
   synchronizer, or an output launched on another clock, is a crossing.
   `set_case_analysis 0/1` makes a signal static.
+- `msim -upf` and `mlint -upf` check the implementation commands of IEEE
+  1801-2024 instead of ignoring them: `map_power_switch`, `map_repeater_cell`,
+  `map_retention_cell`, `map_retention_clamp_cell`, `name_format`,
+  `set_correlated`, `set_variation`, `use_interface_cell` (6.37 to 6.41, 6.43,
+  6.57, 6.62) and the `define_*_cell` library commands (clause 7). Each error
+  their clauses list is reported with file, line and clause; the simulation is
+  unchanged.
 - UPF (IEEE 1801-2024): `set_repeater` and the simulation of repeaters
   (6.52, 9.10); `create_logic_net`, `create_logic_port` and
   `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with

@@ -128,6 +128,7 @@ struct State {
     std::vector<Cb*> thrCbs, frameCbs;    // thread and frame callbacks (38.36.1)
     std::unordered_map<const ProcCtl*, Obj*> thrObjs;                 // live threads with a handle
     std::map<std::pair<const ProcCtl*, size_t>, Obj*> frameObjs;      // live frames with a handle
+    std::unordered_set<const Obj*> softObjs;   // constraint items that are soft (vpiSoft, 37.31)
     std::vector<Cb*> errCbs;              // cbError, cbPLIError (38.36.3)
     bool inErrCb = false;
     std::vector<Cb*> nbaCbs, endSlot;     // cbNBASynch, cbAtEndOfSimTime of this time slot (38.36.2)
@@ -2150,7 +2151,7 @@ inline const char* typeName(int type) {
         {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}, {vpiInterModPath, "vpiInterModPath"}, {vpiTchk, "vpiTchk"}, {vpiTchkTerm, "vpiTchkTerm"}, {vpiModPath, "vpiModPath"}, {vpiPathTerm, "vpiPathTerm"},
         {vpiGate, "vpiGate"}, {vpiSwitch, "vpiSwitch"}, {vpiUdp, "vpiUdp"}, {vpiPrimTerm, "vpiPrimTerm"},
         {vpiConstraint, "vpiConstraint"}, {vpiImplication, "vpiImplication"}, {vpiConstrIf, "vpiConstrIf"},
-        {vpiConstrIfElse, "vpiConstrIfElse"}, {vpiConstrForEach, "vpiConstrForEach"}, {vpiSoftDisable, "vpiSoftDisable"}, {vpiThread, "vpiThread"}, {vpiFrame, "vpiFrame"},
+        {vpiConstrIfElse, "vpiConstrIfElse"}, {vpiConstrForEach, "vpiConstrForEach"}, {vpiSoftDisable, "vpiSoftDisable"}, {vpiDistribution, "vpiDistribution"}, {vpiDistItem, "vpiDistItem"}, {vpiValueRange, "vpiValueRange"}, {vpiThread, "vpiThread"}, {vpiFrame, "vpiFrame"},
         {vpiConstraintOrdering, "vpiConstraintOrdering"}};
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
@@ -2365,6 +2366,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     if (o->kind == Obj::InterModPath) return type == vpiPort ? vpi::iter(std::vector<vpiHandle>(o->items)) : nullptr;   // 38.21
     if (o->kind == Obj::Extends) return nullptr;
     if (o->kind == Obj::ClassObj) {   // the properties of a class object (37.29)
+        if (vpi::constrIterate(type, o, items)) return vpi::iter(std::move(items));   // its constraint blocks (18.9)
         if (type != vpiVariables) return nullptr;
         vpi::classProps(o, *o->ty, items);
         return vpi::iter(std::move(items));
@@ -2762,6 +2764,8 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (prop != vpiType && !(prop == vpiSize && expr) && vpi::denied(o, "vpi_get"))
         return vpiUndefined;
     auto isVar = [&] { return o->kind == Obj::Signal || o->kind == Obj::Word; };
+    if (prop == vpiSoft && o->kind == Obj::Expr && o->parent && (o->parent->kind == Obj::Constraint || o->parent->kind == Obj::ConstrItem))
+        return s.softObjs.count(o) ? 1 : 0;   // an expression constraint item (18.5.13)
     if (vpi::isCode(o)) return (PLI_INT32)vpi::codeGet(prop, o);
     if (o->kind == Obj::Dyn) {   // 37.18
         const DynObj* d = vpi::dynOf(o);
