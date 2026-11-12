@@ -322,6 +322,9 @@ if(MINISIM_WITH_SLANG)
       add_test(NAME icarus/${name}
                COMMAND ${CMAKE_COMMAND} -DSIM=${IVERILOG} -DVVP=${VVP} -DSV=${sv}
                        -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
+      # Both runs work in tests/spec: a test that writes a file there
+      # ($fopen, $writememh) must not run under both simulators at once.
+      set_tests_properties(spec/${name} icarus/${name} PROPERTIES RESOURCE_LOCK spec_${name})
     endif()
   endforeach()
 
