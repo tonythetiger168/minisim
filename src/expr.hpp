@@ -187,12 +187,15 @@ inline Val finish(Val a) {
         apply(a.hi[i - 1].v, a.hi[i - 1].x, a.hi[i - 1].z, limbMask(a.w, i));
     return a;
 }
-inline Val make(uint64_t v, uint64_t x, int w, uint64_t z = 0, bool sgn = false) {
-    if (w > 64) {
-        Val a;
-        a.v = v; a.x = x; a.z = z; a.w = w; a.sgn = sgn;
-        return finish(a);
-    }
+[[gnu::noinline]] inline Val makeWide(uint64_t v, uint64_t x, int w, uint64_t z, bool sgn) {
+    Val a;
+    a.v = v; a.x = x; a.z = z; a.w = w; a.sgn = sgn;
+    return finish(a);
+}
+// Always inlined: a simv built as several files otherwise kept one
+// out-of-line copy for every caller (2.5% of Ibex).
+[[gnu::always_inline]] inline Val make(uint64_t v, uint64_t x, int w, uint64_t z = 0, bool sgn = false) {
+    if (__builtin_expect(w > 64, 0)) return makeWide(v, x, w, z, sgn);
     uint64_t m = mask(w);
     x &= m;
     v &= m & ~x;
