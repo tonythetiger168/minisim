@@ -160,11 +160,24 @@ struct Xp {
         auto it = sites.find(key);
         return it != sites.end() && n < it->second.size() ? it->second[n] : std::vector<size_t>{};
     }
+    // Counters of foreach and repeat loops, by statement, in the order the
+    // merging copy makes them: the clean copy uses the same ones, so a jump
+    // from it into the middle of a loop finds the loop where it was.
+    std::unordered_map<const void*, std::vector<int>> loopSig;
+    std::unordered_map<const void*, size_t> loopUse;
     std::unordered_set<const slang::ast::Symbol*> once;   // nonblocking targets assigned at most once a pass
     std::vector<std::pair<size_t, size_t>> guarded, badRanges;
     std::vector<std::function<void()>> ool;
 } xp;
 
+// A loop counter (see Xp::loopSig).
+int xpLoopTemp(const void* key, int w) {
+    if (!xp.on) return fresh(w);
+    if (!xp.clean) { int t = fresh(w); xp.loopSig[key].push_back(t); return t; }
+    size_t n = xp.loopUse[key]++;
+    auto it = xp.loopSig.find(key);
+    return it != xp.loopSig.end() && n < it->second.size() ? it->second[n] : fresh(w);
+}
 // A temporary of the merge. A name with '$' stays out of waveforms and toggle coverage.
 int xpTemp(int w) {
     if (!mkSig) unsupported("temporary");
@@ -563,11 +576,83 @@ static bool xpEscapes(const slang::ast::Statement& st) {
     return v.any;
 }
 bool xpLoopOk(const slang::ast::Statement& body) { return xp.on && !xp.clean && xpEscapes(body); }
-// Lowers the body; returns the jump that leaves the loop when brk is 1 (to be patched to the loop's end).
-size_t xpLoopBody(const slang::ast::Statement& body) {
+// Whether a loop body has a nonblocking assignment or writes an array
+// element (a while or do loop with one keeps the standard behavior: see
+// xpLoopGuard).
+static bool xpHasNba(const slang::ast::Statement& st) {
+    using namespace slang::ast;
+    struct V : ASTVisitor<V, VisitFlags::Statements | VisitFlags::Expressions> {
+        bool any = false;
+        void handle(const AssignmentExpression& a) {
+            if (a.isNonBlocking()) any = true;
+            const Expression* l = &a.left();   // an unpacked array element
+            while (l->kind == ExpressionKind::ElementSelect || l->kind == ExpressionKind::RangeSelect ||
+                   l->kind == ExpressionKind::MemberAccess) {
+                if (l->kind != ExpressionKind::MemberAccess && l->kind == ExpressionKind::ElementSelect &&
+                    l->as<ElementSelectExpression>().value().type->isUnpackedArray()) any = true;
+                l = l->kind == ExpressionKind::ElementSelect ? &l->as<ElementSelectExpression>().value()
+                    : l->kind == ExpressionKind::RangeSelect ? &l->as<RangeSelectExpression>().value()
+                                                              : &l->as<MemberAccessExpression>().value();
+            }
+            visitDefault(a);
+        }
+    } v;
+    st.visit(v);
+    return v.any;
+}
+bool xpCondLoopOk(const slang::ast::Statement& body) { return xpLoopOk(body) && !xpHasNba(body); }
+// The loop's flags, 0 before its first pass.
+void xpLoopStart() {
     LoopJumps& lj = loops.back();
     lj.xpBrk = xpTemp(1);
     lj.xpCnt = xpTemp(1);
+    xpSet(lj.xpBrk, konst(mk(0, 1)));
+    xpSet(lj.xpCnt, konst(mk(0, 1)));
+}
+// Before the condition of a while or do loop, and at the top of a forever
+// loop: a while loop has no bound. Once a break is unknown, the loop may
+// run any number of further passes, and the loop's own variables become
+// unknown, so the condition may never be known false again. Then
+// everything the body assigns becomes x and the loop ends (xpLoopPoison),
+// which covers every number of further passes. Also when the condition
+// itself is unknown. Returns the jump to that code.
+size_t xpLoopGuard(const slang::ast::Expression* cond) {
+    E unk = xpUnk1(ref(loops.back().xpBrk));
+    if (cond) unk = bin(Op::LogOr, std::move(unk), xpUnk1(un(Op::RedOr, expr(*cond))));
+    size_t jf = emitJmpIfNot(std::move(unk));
+    size_t jp = xpJmp();
+    prog.code[jf].target = prog.here();
+    return jp;
+}
+// The code the guards jump to: x into what the body [a, b) assigns. It falls
+// through to the loop's end. Units that are not plain variables cannot
+// occur: the body has no array element writes (xpHasNba).
+void xpLoopPoison(size_t a, size_t b, const std::vector<size_t>& jps) {
+    for (size_t j : jps) prog.code[j].target = prog.here();
+    std::map<int, XpBits> tg;
+    std::string why;
+    for (size_t pc = a; pc < b; pc++) {
+        const Instr& i = prog.code[pc];
+        if (i.k == IK::Call) { xpCallee(i.callee, tg, why, 0); continue; }
+        if (i.k != IK::Assign || i.sig < 0 || i.arr || i.dyn >= 0 || i.drv >= 0 || isRel(i.sig) ||
+            xp.bad.count(i.sig) || !xpSigW(i.sig))
+            continue;
+        tg[i.sig].all = true;
+    }
+    for (const XpUnit& u : xpUnits(tg)) {
+        if (xp.temps.count(u.sig)) continue;
+        Instr i; i.k = IK::Assign; i.sig = u.sig; i.e = xpX(u.w);
+        if (u.hi >= 0) { i.hi = u.hi; i.lo = u.lo; }
+        prog.emit(i);
+    }
+}
+// Lowers the body; returns the jump that leaves the loop when brk is 1 (to be patched to the loop's end).
+size_t xpLoopBody(const slang::ast::Statement& body) {
+    LoopJumps& lj = loops.back();
+    if (lj.xpBrk < 0) {
+        lj.xpBrk = xpTemp(1);
+        lj.xpCnt = xpTemp(1);
+    }
     size_t jb = emitJmpIfNot(xpNot(xpIs(ref(lj.xpBrk), 1)));
     xpSet(lj.xpCnt, konst(mk(0, 1)));
     int brk = lj.xpBrk;

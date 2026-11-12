@@ -96,10 +96,16 @@ tmerge and `4'bxxxx` under xmerge.
 - **Task and function calls** in a branch, when the task or function (and
   every one it calls) assigns only with `=`: the static variables it writes
   are merged like the block's own.
-- **`break` and `continue`** in a `for` or `foreach` loop. Under an unknown
-  condition the rest of the loop merges with "not run". This is
-  pessimistic: each unknown step merges with the state before it, so
-  values that every path agrees on can still come out `x`.
+- **`break` and `continue`** in `for`, `foreach`, `repeat`, `while`,
+  `do ... while` and `forever` loops. Under an unknown condition the rest
+  of the loop merges with "not run". This is pessimistic: each unknown
+  step merges with the state before it, so values that every path agrees
+  on can still come out `x`. A `while`, `do` or `forever` loop has no
+  bound, so once a `break` is unknown (or the loop condition is), the loop
+  may run any number of further passes: everything its body assigns
+  becomes `x` and the loop ends. Such a loop must not hold a nonblocking
+  assignment or an array element write (it then keeps the standard
+  behavior).
 - **Array elements chosen at run time** (`mem[addr] = d`,
   `mem[addr] <= d`). In a possible branch the element takes the merge of
   its present value and the new one. An index with an unknown bit, inside
@@ -126,7 +132,7 @@ A construct that cannot run speculatively keeps the standard behavior
 report names each one:
 
 ```
-xprop tmerge: 13 of 16 if / case / edge constructs merged
+xprop tmerge: 16 of 19 if / case / edge constructs merged
 dut.sv:27: loop body: merged
 dut.sv:57: if: not merged, it holds a jump out of the branch (break, continue, return or disable)
 dut.sv:61: if: not merged, it holds a task or function call statement
@@ -137,8 +143,9 @@ dut.sv:44: case: merged
 - a call of a task or function that has a nonblocking assignment, a delay,
   an event control or a `fork`, or that writes an array element, a
   container or a net;
-- `break` or `continue` out of a `while`, `do ... while`, `forever` or
-  `repeat` loop, and `disable` of a block outside the branch;
+- `break` or `continue` out of a `while`, `do ... while` or `forever` loop
+  whose body has a nonblocking assignment or writes an array element, and
+  `disable` of a block outside the branch;
 - a blocking assignment to a queue, dynamic or associative array, a real, a
   string or a class property;
 - `case ... inside`, `case ... matches`, `if ... matches`, and `casez` /

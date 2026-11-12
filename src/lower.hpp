@@ -8852,7 +8852,7 @@ struct Lowerer {
                     const auto& d = f.loopDims[dk];
                     if (!d.loopVar && !(da && f.loopDims.size() > nfixed)) continue;
                     if (!d.range) unsupported("foreach over a dynamic dimension");
-                    int v = fresh(32);
+                    int v = xpLoopTemp(&d, 32);
                     if (d.loopVar) bindVar(d.loopVar, v);
                     Instr init; init.k = IK::Assign; init.sig = v;
                     init.e = konst(make((uint64_t)d.range->left, 0, 32, 0, true));
@@ -8903,6 +8903,25 @@ struct Lowerer {
             }
             case StatementKind::WhileLoop: {
                 const auto& w = s.as<WhileLoopStatement>();
+                if (xpCondLoopOk(w.body)) {   // -xprop: break / continue become flags
+                    loops.push_back({});
+                    xpLoopStart();
+                    size_t top = prog.here();
+                    size_t jp = xpLoopGuard(&w.cond);
+                    Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
+                    size_t jf = prog.emit(j);
+                    size_t a = prog.here();
+                    size_t jb = xpLoopBody(w.body);
+                    size_t b = prog.here();
+                    patch(loops.back().continues, prog.here());
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    xpLoopPoison(a, b, {jp});
+                    prog.code[jf].target = prog.here();
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
+                }
                 size_t top = prog.here();
                 Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
                 size_t jf = prog.emit(j);
@@ -8917,6 +8936,25 @@ struct Lowerer {
             }
             case StatementKind::DoWhileLoop: {
                 const auto& w = s.as<DoWhileLoopStatement>();
+                if (xpCondLoopOk(w.body)) {   // -xprop: break / continue become flags
+                    loops.push_back({});
+                    xpLoopStart();
+                    size_t top = prog.here();
+                    size_t a = prog.here();
+                    size_t jb = xpLoopBody(w.body);
+                    size_t b = prog.here();
+                    patch(loops.back().continues, prog.here());
+                    size_t jp = xpLoopGuard(&w.cond);
+                    Instr j; j.k = IK::JmpIfNot; j.e = expr(w.cond);
+                    size_t jf = prog.emit(j);
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    xpLoopPoison(a, b, {jp});
+                    prog.code[jf].target = prog.here();
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
+                }
                 size_t top = prog.here();
                 loops.push_back({});
                 stmt(w.body);
@@ -8931,6 +8969,22 @@ struct Lowerer {
                 break;
             }
             case StatementKind::ForeverLoop: {
+                if (const auto& body = s.as<ForeverLoopStatement>().body; xpCondLoopOk(body)) {   // -xprop
+                    loops.push_back({});
+                    xpLoopStart();
+                    size_t top = prog.here();
+                    size_t jp = xpLoopGuard(nullptr);
+                    size_t a = prog.here();
+                    size_t jb = xpLoopBody(body);
+                    size_t b = prog.here();
+                    patch(loops.back().continues, prog.here());
+                    Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
+                    xpLoopPoison(a, b, {jp});
+                    prog.code[jb].target = prog.here();
+                    xpLoopEnd();
+                    loops.pop_back();
+                    break;
+                }
                 size_t top = prog.here();
                 loops.push_back({});
                 stmt(s.as<ForeverLoopStatement>().body);
@@ -8945,8 +8999,11 @@ struct Lowerer {
                 const auto* cv = r.count.getConstant();
                 bool small = (r.count.kind == ExpressionKind::IntegerLiteral || (cv && cv->isInteger())) &&
                              constInt(r.count) <= 1024;
-                if (!small) {   // a counter (12.7.2): x, z or a negative count runs the body zero times
-                    int c = fresh(64);
+                // -xprop: break / continue become flags, in the counter form; the
+                // clean copy uses the same form and counter (xpLoopTemp).
+                bool xpr = xpLoopOk(r.body), xpc = xp.on && xpEscapes(r.body);
+                if (!small || xpc) {   // a counter (12.7.2): x, z or a negative count runs the body zero times
+                    int c = xpLoopTemp(&r, 64);
                     Instr init; init.k = IK::Assign; init.sig = c;
                     init.e = resize(expr(r.count), 64, r.count.type->isSigned(), true);
                     prog.emit(init);
@@ -8956,12 +9013,15 @@ struct Lowerer {
                     Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(c, true), konst(zero));
                     size_t jf = prog.emit(j);
                     loops.push_back({});
-                    stmt(r.body);
+                    size_t jb = (size_t)-1;
+                    if (xpr) jb = xpLoopBody(r.body);
+                    else stmt(r.body);
                     patch(loops.back().continues, prog.here());
                     Instr dec; dec.k = IK::Assign; dec.sig = c; dec.e = bin(Op::Sub, ref(c, true), konst(one));
                     prog.emit(dec);
                     Instr back; back.k = IK::Jmp; back.target = top; prog.emit(back);
                     prog.code[jf].target = prog.here();
+                    if (xpr) { prog.code[jb].target = prog.here(); xpLoopEnd(); }
                     patch(loops.back().breaks, prog.here());
                     loops.pop_back();
                     break;
