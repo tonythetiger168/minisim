@@ -755,3 +755,145 @@ inline bool markStmt(const Obj* o, Cb* c) {
     g_hook = true;
     return true;
 }
+// ---- Drivers and loads of a net or variable (37.16, 37.17) ----
+// A continuous assignment drives the variables its left side names and loads
+// the ones its right side reads; a port of a module instance drives the
+// signal its connection names when it is an output, and loads it when it is
+// an input (inout: both). vpiLocalDriver / vpiLocalLoad stay inside the
+// module of the signal; vpiDriver / vpiLoad follow port connections through
+// the hierarchy (the whole simulated net) and give the continuous
+// assignments and the ports that are not just a whole-signal connection.
+inline const Symbol* rootOf(const Expression* e) {
+    while (e) {
+        switch (e->kind) {
+            case ExpressionKind::Conversion: e = &e->as<ConversionExpression>().operand(); break;
+            case ExpressionKind::Assignment: e = &e->as<AssignmentExpression>().left(); break;
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue: return &e->as<ValueExpressionBase>().symbol;
+            default: return nullptr;
+        }
+    }
+    return nullptr;
+}
+// Does the target expression `e` (the left side of an assignment) write `s`?
+inline bool writes(const Expression& e, const Symbol* s) {
+    switch (e.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue: return &e.as<ValueExpressionBase>().symbol == s;
+        case ExpressionKind::Conversion: return writes(e.as<ConversionExpression>().operand(), s);
+        case ExpressionKind::Assignment: return writes(e.as<AssignmentExpression>().left(), s);
+        case ExpressionKind::ElementSelect: return writes(e.as<ElementSelectExpression>().value(), s);
+        case ExpressionKind::RangeSelect: return writes(e.as<RangeSelectExpression>().value(), s);
+        case ExpressionKind::MemberAccess: return writes(e.as<MemberAccessExpression>().value(), s);
+        case ExpressionKind::Concatenation:
+            for (auto* x : e.as<ConcatenationExpression>().operands())
+                if (writes(*x, s)) return true;
+            return false;
+        default: return false;
+    }
+}
+// Does `e` read `s` anywhere?
+inline bool reads(const Expression& e, const Symbol* s) {
+    bool hit = false;
+    auto v = slang::ast::makeVisitor([&](auto&, const NamedValueExpression& n) { if (&n.symbol == s) hit = true; },
+                                     [&](auto&, const HierarchicalValueExpression& n) { if (&n.symbol == s) hit = true; });
+    e.visit(v);
+    return hit;
+}
+inline const InstanceBodySymbol* bodyOf(const Symbol* s) {
+    for (const Scope* sc = s->getParentScope(); sc; sc = sc->asSymbol().getParentScope())
+        if (sc->asSymbol().kind == SymbolKind::InstanceBody) return &sc->asSymbol().as<InstanceBodySymbol>();
+    return nullptr;
+}
+inline Obj* portOf(const PortSymbol& p) {
+    const auto* b = bodyOf(&p);
+    int k = 0;
+    if (b)
+        for (const Symbol* q : b->getPortList()) {
+            if (q == &p) break;
+            k++;
+        }
+    return portObj(&p, k);
+}
+// The continuous assignments and instance ports inside the module of `body`
+// (not inside its child instances) that drive (drv) or load `s`.
+// `skipWhole`: leave out ports whose connection is the whole of `s`.
+inline void localConn(const InstanceBodySymbol& body, const Symbol* s, bool drv, bool skipWhole, std::vector<Obj*>& out) {
+    auto v = slang::ast::makeVisitor(
+        [&](auto&, const ContinuousAssignSymbol& c) {
+            const auto& a = c.getAssignment();
+            if (a.kind != ExpressionKind::Assignment) return;
+            const auto& ae = a.as<AssignmentExpression>();
+            if (drv ? writes(ae.left(), s) : reads(ae.right(), s)) out.push_back(contAssignObj(c));
+        },
+        [&](auto&, const InstanceSymbol& inst) {   // a child instance: its port connections, not its body
+            for (const PortConnection* pc : inst.getPortConnections()) {
+                if (pc->port.kind != SymbolKind::Port) continue;
+                const auto& p = pc->port.as<PortSymbol>();
+                const Expression* e = pc->getExpression();
+                if (!e) continue;
+                bool in = p.direction == ArgumentDirection::In || p.direction == ArgumentDirection::InOut || p.direction == ArgumentDirection::Ref;
+                bool outp = p.direction == ArgumentDirection::Out || p.direction == ArgumentDirection::InOut || p.direction == ArgumentDirection::Ref;
+                bool hit = drv ? outp && writes(*e, s) : in && reads(*e, s);
+                if (!hit) continue;
+                if (skipWhole && rootOf(e) == s) continue;
+                out.push_back(portOf(p));
+            }
+        },
+        [&](auto&, const ProceduralBlockSymbol&) {},
+        [&](auto&, const SubroutineSymbol&) {});
+    body.visit(v);
+}
+// The nets joined to `s` by whole-signal port connections, `s` first.
+inline std::vector<const Symbol*> simNet(const Symbol* s) {
+    std::vector<const Symbol*> set{s};
+    for (size_t k = 0; k < set.size(); k++) {
+        const Symbol* x = set[k];
+        auto add = [&](const Symbol* y) {
+            if (y && std::find(set.begin(), set.end(), y) == set.end()) set.push_back(y);
+        };
+        const InstanceBodySymbol* b = bodyOf(x);
+        if (!b) continue;
+        // up: a port of this module whose inside is x
+        for (const Symbol* q : b->getPortList()) {
+            if (q->kind != SymbolKind::Port || q->as<PortSymbol>().internalSymbol != x) continue;
+            const InstanceSymbol* inst = b->parentInstance;
+            const PortConnection* pc = inst ? inst->getPortConnection(q->as<PortSymbol>()) : nullptr;
+            if (pc) add(rootOf(pc->getExpression()));
+        }
+        // down: a child instance port connected to the whole of x
+        auto v = slang::ast::makeVisitor(
+            [&](auto&, const InstanceSymbol& inst) {
+                for (const PortConnection* pc : inst.getPortConnections())
+                    if (pc->port.kind == SymbolKind::Port && rootOf(pc->getExpression()) == x) add(pc->port.as<PortSymbol>().internalSymbol);
+            },
+            [&](auto&, const ProceduralBlockSymbol&) {}, [&](auto&, const SubroutineSymbol&) {});
+        b->visit(v);
+    }
+    return set;
+}
+inline bool netConn(int type, const Obj* o, std::vector<vpiHandle>& items) {
+    if (type != vpiDriver && type != vpiLoad && type != vpiLocalDriver && type != vpiLocalLoad && type != vpiPortInst) return false;
+    if (o->kind != Obj::Signal || !o->sym || !ValueSymbol::isKind(o->sym->kind)) return false;
+    const InstanceBodySymbol* b = bodyOf(o->sym);
+    if (!b) return true;
+    std::vector<Obj*> out;
+    if (type == vpiPortInst) {   // the ports of instances this signal connects to (37.16)
+        auto v = slang::ast::makeVisitor(
+            [&](auto&, const InstanceSymbol& inst) {
+                for (const PortConnection* pc : inst.getPortConnections())
+                    if (pc->port.kind == SymbolKind::Port && pc->getExpression() && reads(*pc->getExpression(), o->sym))
+                        out.push_back(portOf(pc->port.as<PortSymbol>()));
+            },
+            [&](auto&, const ProceduralBlockSymbol&) {}, [&](auto&, const SubroutineSymbol&) {});
+        b->visit(v);
+    } else if (type == vpiLocalDriver || type == vpiLocalLoad) {
+        localConn(*b, o->sym, type == vpiLocalDriver, false, out);
+    } else {
+        for (const Symbol* x : simNet(o->sym))
+            if (const auto* xb = bodyOf(x)) localConn(*xb, x, type == vpiDriver, true, out);
+    }
+    for (Obj* x : out)
+        if (std::find_if(items.begin(), items.end(), [&](vpiHandle h) { return O(h) == x; }) == items.end()) items.push_back(H(x));
+    return true;
+}
