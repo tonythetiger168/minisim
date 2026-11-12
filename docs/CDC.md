@@ -116,6 +116,46 @@ Object names follow `msdc`: `/` between instance levels and no top name
 `-cdc-report` prints the SDC clocks of every domain. `-clock-group` and
 `-static` still apply on top of the file.
 
+## Browsing the crossings
+
+`-cdc-html FILE` writes one self-contained page (no network, opens from
+disk) with the clock domains in colour, every crossing in a table that can be
+filtered by name or to those with a finding, the path of the selected
+crossing from its source flop through the synchronizer stages, and the reset
+synchronizers with their length. It follows the light or dark setting of the
+browser.
+
+## Block models
+
+A block can be checked once and then stand in for itself in the SoC run, by
+a model of its ports. `-cdc-abstract FILE` writes the model of the top:
+
+```
+mlint rtl/blk/*.sv -top cdc_block -cdc-abstract cdc_block.cdc
+mlint rtl/soc/*.sv rtl/blk/*.sv -top soc -cdc-model cdc_block.cdc
+```
+
+```
+module cdc_block
+  input  clk_a  clock               # a clock
+  input  d  data clk_a              # read by flops clocked by clk_a
+  input  req  sync clk_b            # read by a synchronizer clocked by clk_b
+  output q  data clk_b              # launched by a flop clocked by clk_b
+  output y  comb                    # combinational from inputs only
+end
+```
+
+With `-cdc-model` (repeatable) every instance of a modeled module is checked
+from its model, not its RTL: the body is not read, so the block can be a
+black box (a module with ports only, for a hard macro or IP whose RTL is not
+there), and a large block costs nothing. A `data` input becomes one flop of
+that clock that logic reads, a `sync` input a two-flop synchronizer, a `data`
+output a flop of that clock. A crossing in front of a `data` input, or from a
+`data` output, is reported in the SoC as it would be with the RTL. `comb` and
+`mixed` (more than one clock, or a clock that is not a port) ports have no
+domain, like primary inputs. Lines may be written by hand; `#` starts a
+comment.
+
 ## Assertions
 
 `-cdc-sva FILE` writes a module `mlint_cdc_sva` with one check per

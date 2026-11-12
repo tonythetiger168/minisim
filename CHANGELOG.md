@@ -21,6 +21,13 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
+  the crossings (filter, the path of each through its synchronizer) and the
+  reset synchronizers.
+- `mlint -cdc-abstract FILE` and `-cdc-model FILE`: a block's CDC model (the
+  clock of each port, and which inputs it synchronizes) is written from its
+  RTL and used in the SoC run in place of the RTL, so a block can be a black
+  box or skipped for speed with the same findings at its ports.
 - `mlint -cdc-sva FILE`: writes a module of assertions for the synchronized
   crossings (a one-bit signal holds for two reading edges, a Gray or
   multi-bit bus changes one bit at a time, enable-qualified data is stable

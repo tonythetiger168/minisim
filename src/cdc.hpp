@@ -52,6 +52,7 @@
 #include "parallel.hpp"
 #include <deque>
 #include <fstream>
+#include <sstream>
 #include "sdc.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/ConversionExpression.h"
@@ -70,6 +71,9 @@ struct Options {
     std::vector<std::string> sdcFiles;                  // -sdc file
     int depth = 2;                                      // -cdc-depth N
     std::string sva;                                    // -cdc-sva FILE
+    std::string abstractOut;                            // -cdc-abstract FILE
+    std::vector<std::string> models;                    // -cdc-model FILE
+    std::string html;                                   // -cdc-html FILE
     int threads = 1;                                    // -threads N
 
     // Takes one command-line option if it is one of these. `next` returns the
@@ -80,6 +84,9 @@ struct Options {
         if (a == "-static") { statics.push_back(next("a signal")); return true; }
         if (a == "-sdc") { sdcFiles.push_back(next("an SDC file")); return true; }
         if (a == "-cdc-sva") { sva = next("an output file"); return true; }
+        if (a == "-cdc-html") { html = next("an output file"); return true; }
+        if (a == "-cdc-abstract") { abstractOut = next("an output file"); return true; }
+        if (a == "-cdc-model") { models.push_back(next("a CDC model file")); return true; }
         if (a == "-cdc-depth") {
             std::string v = next("a number of flops");
             char* e = nullptr;
@@ -107,7 +114,10 @@ struct Options {
 };
 
 inline const char* usage() {
-    return "  -cdc-sva FILE  write SVA for every crossing to FILE, as module mlint_cdc_sva (compile it with the design)\n"
+    return "  -cdc-html FILE  write a page to browse the clock domains, crossings and reset synchronizers\n"
+           "  -cdc-abstract FILE  write the top's CDC model (the clock of each port) for -cdc-model\n"
+           "  -cdc-model FILE  use these block models instead of the blocks' RTL (repeatable)\n"
+           "  -cdc-sva FILE  write SVA for every crossing to FILE, as module mlint_cdc_sva (compile it with the design)\n"
            "  -cdc-depth N   CDC004 follows synchronized signals through N more flops to where they meet (2)\n"
            "  -sdc FILE      clocks, generated clocks, clock groups and clock-to-clock false paths from an SDC file\n"
            "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
@@ -355,6 +365,24 @@ struct Model {
             }
         return one && n == 1;
     }
+    // -cdc-model: blocks described by their ports, not their RTL.
+    struct PortModel {
+        std::string port, kind, clock;  // kind: clock, sync, data, comb, mixed
+        bool output = false;
+    };
+    std::map<std::string, std::vector<PortModel>> blockModels;  // module name -> ports
+    std::vector<const InstanceSymbol*> modeled;                // instances that use one
+    bool isModeled(const InstanceSymbol& inst) const {
+        return !blockModels.empty() && blockModels.count(std::string(inst.getDefinition().name));
+    }
+    // The top's ports, for -cdc-abstract.
+    struct TopPort {
+        std::string name;
+        bool output;
+        Sym sym;
+    };
+    std::vector<TopPort> topPorts;
+    std::string topName;
     std::map<std::pair<Sym, int64_t>, Sym> bitOf;
     std::map<std::pair<Sym, int64_t>, Sym> bitCanon;  // the same, by canonical bus
     std::set<std::pair<Sym, int64_t>> bitDriven;      // bits a port or an assign drives
@@ -974,7 +1002,7 @@ struct Slicer : ASTVisitor<Slicer> {
             // variable to the port.
             if (port.direction != ArgumentDirection::In || baseOf(*outer)) keepWhole(*outer);
         }
-        visitDefault(inst);
+        if (!m.isModeled(inst)) visitDefault(inst);
     }
     void handle(const NetSymbol& n) {
         if (const Expression* init = n.getInitializer(); init && !constant(*init)) var(&n).whole = true;
@@ -1131,6 +1159,10 @@ struct Ports : ASTVisitor<Ports> {
             else
                 for (Sym t : n) wires.push_back({t, {in}, base != nullptr, nullptr});
         }
+        if (m.isModeled(inst)) {
+            m.modeled.push_back(&inst);
+            return;
+        }
         visitDefault(inst);
     }
 
@@ -1178,6 +1210,7 @@ struct Gather : ASTVisitor<Gather> {
     void handle(const InstanceSymbol& inst) {
         // A module nobody instantiates is elaborated for its errors only.
         if (inst.body.flags.has(InstanceFlags::Uninstantiated)) return;
+        if (m.isModeled(inst)) return;  // its model stands in for it
         visitDefault(inst);
     }
 
@@ -1465,6 +1498,8 @@ struct Checker {
         flush();
         if (opt.report) report();
         if (!opt.sva.empty()) writeSva(opt.sva);
+        if (!opt.html.empty()) writeHtml(opt.html);
+        if (!opt.abstractOut.empty()) writeAbstract(opt.abstractOut);
         prof.lap("report");
     }
 
@@ -1949,6 +1984,215 @@ struct Checker {
     }
 
     // -cdc-report: the domains and every crossing, clean or not.
+    // -cdc-html: one self-contained page (no network) to browse the crossings:
+    // the domains in colour, a table to filter, and for the selected crossing
+    // its path from the source flop through the synchronizer stages.
+    static std::string esc(const std::string& t) {
+        std::string o;
+        for (char c : t) {
+            switch (c) {
+                case '&': o += "&amp;"; break;
+                case '<': o += "&lt;"; break;
+                case '>': o += "&gt;"; break;
+                case '"': o += "&quot;"; break;
+                default: o += c;
+            }
+        }
+        return o;
+    }
+    static std::string json(const std::string& t) {
+        std::string o = "\"";
+        for (char c : t) {
+            if (c == '"' || c == '\\') o += '\\';
+            if ((unsigned char)c < 0x20) { o += ' '; continue; }
+            if (c == '<') { o += "\\u003c"; continue; }
+            o += c;
+        }
+        return o + "\"";
+    }
+    void writeHtml(const std::string& file) {
+        std::map<std::string, int> domIx;
+        std::vector<std::string> domNames;
+        std::map<std::string, int> domFlops;
+        for (const Flop& f : m.flops)
+            if (f.dom) domFlops[m.name(f.dom)]++;
+        for (auto& [d, k] : domFlops) {
+            domIx[d] = (int)domNames.size();
+            domNames.push_back(d);
+        }
+        std::vector<std::string> rows;
+        for (const Crossing& c : crossings) {
+            const Flop& f = m.flops[c.flop];
+            const Flop& s = *m.flopOf(c.src);
+            // The path: source, then the reading flop and the plain copies
+            // after it in its domain (the synchronizer), up to 8.
+            std::string chain = "[";
+            int at = c.flop;
+            for (int k = 0; k < 8 && at >= 0; k++) {
+                chain += (k ? "," : "") + json(m.name(m.flops[at]));
+                int nx = -1;
+                for (int g : next[at])
+                    if (nx < 0 || m.name(m.flops[g]) < m.name(m.flops[nx])) nx = g;
+                at = c.how.find("synchronizer") == std::string::npos ? -1 : nx;
+            }
+            chain += "]";
+            std::string rule;
+            if (auto p = c.how.find("(CDC"); p != std::string::npos) rule = c.how.substr(p + 1, 6);
+            rows.push_back("{\"src\":" + json(m.name(s)) + ",\"sd\":" + std::to_string(domIx[m.name(s.dom)]) +
+                           ",\"dst\":" + json(m.name(f)) + ",\"dd\":" + std::to_string(domIx[m.name(f.dom)]) +
+                           ",\"how\":" + json(c.how) + ",\"rule\":" + json(rule) + ",\"chain\":" + chain + "}");
+        }
+        std::sort(rows.begin(), rows.end());
+        std::vector<std::string> rsts;
+        for (const ResetSync& r : resetSyncs)
+            rsts.push_back("{\"out\":" + json(m.name(*r.out)) + ",\"d\":" + std::to_string(domIx[m.name(r.out->dom)]) +
+                           ",\"stages\":" + std::to_string(r.stages) + ",\"flops\":" + std::to_string(r.flops) + "}");
+        std::sort(rsts.begin(), rsts.end());
+        std::string doms = "[";
+        for (size_t i = 0; i < domNames.size(); i++)
+            doms += (i ? "," : "") + std::string("{\"name\":") + json(domNames[i]) + ",\"flops\":" +
+                    std::to_string(domFlops[domNames[i]]) + "}";
+        doms += "]";
+        std::ofstream os(file);
+        if (!os) {
+            std::cerr << "mlint: -cdc-html " << file << ": cannot write\n";
+            return;
+        }
+        os << R"(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CDC: )" << esc(m.topName) << R"(</title>
+<style>
+:root{--bg:#fff;--fg:#1f2328;--mut:#59636e;--line:#d1d9e0;--sel:#eef4ff;--bad:#b42318}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--mut:#9198a1;--line:#30363d;--sel:#1b2a44;--bad:#ff7b72}}
+body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:16px 20px;border-bottom:1px solid var(--line)}h1{font-size:18px;margin:0 0 4px}
+.mut{color:var(--mut)}main{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:0}
+section{padding:12px 20px;min-width:0}#side{border-left:1px solid var(--line)}
+.legend span{display:inline-flex;align-items:center;gap:6px;margin:0 14px 6px 0}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block}
+input,select{font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+table{border-collapse:collapse;width:100%;margin-top:8px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-weight:600;color:var(--mut);font-size:12px}td{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
+tr.r{cursor:pointer}tr.r:hover,tr.on{background:var(--sel)}.bad{color:var(--bad);font-weight:600}
+svg text{font:12px ui-monospace,monospace;fill:var(--fg)}h2{font-size:14px;margin:16px 0 6px}
+</style></head><body>
+<header><h1>Clock-domain crossings of <span id="top"></span></h1><div class="mut" id="sum"></div></header>
+<main><section><div class="legend" id="legend"></div>
+<input id="q" placeholder="Filter by name" size="28"> <select id="kind"><option value="">All crossings</option><option value="bad">With a finding</option><option value="ok">Synchronized</option></select>
+<table><thead><tr><th>Source</th><th>Reader</th><th>How</th></tr></thead><tbody id="rows"></tbody></table></section>
+<section id="side"><h2>Path</h2><div id="path" class="mut">Pick a crossing.</div>
+<h2>Reset synchronizers</h2><table><thead><tr><th>Output</th><th>Stages</th><th>Resets</th></tr></thead><tbody id="rst"></tbody></table></section></main>
+<script>
+const TOP=)" << json(m.topName) << ",DOMS=" << doms << ",X=[";
+        for (size_t i = 0; i < rows.size(); i++) os << (i ? ",\n" : "\n") << rows[i];
+        os << "],R=[";
+        for (size_t i = 0; i < rsts.size(); i++) os << (i ? ",\n" : "\n") << rsts[i];
+        os << R"(];
+const PAL=['#2a78d6','#e0730b','#1a9b5a','#c43e9b','#7a5af5','#b8860b','#0f8c8c','#d1495b'];
+const col=i=>PAL[i%PAL.length];
+const el=(t,a={},...k)=>{const e=document.createElement(t);for(const[n,v]of Object.entries(a))e.setAttribute(n,v);for(const c of k)e.append(c);return e};
+document.getElementById('top').textContent=TOP;
+const bad=X.filter(x=>x.rule).length;
+document.getElementById('sum').textContent=`${DOMS.length} clock domains, ${X.length} crossings, ${bad} with a finding, ${R.length} reset synchronizers`;
+const lg=document.getElementById('legend');
+DOMS.forEach((d,i)=>lg.append(el('span',{},el('i',{class:'sw',style:'background:'+col(i)}),`${d.name} (${d.flops})`)));
+const sw=i=>el('i',{class:'sw',style:'background:'+col(i)+';margin-right:6px'});
+function show(x,tr){document.querySelectorAll('tr.on').forEach(r=>r.classList.remove('on'));tr.classList.add('on');
+ const n=[{t:x.src,d:x.sd}].concat(x.chain.map(t=>({t,d:x.dd})));const W=300,H=46,G=26;
+ const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('width',W+20);s.setAttribute('height',n.length*(H+G)+10);
+ n.forEach((b,i)=>{const y=5+i*(H+G);const r=document.createElementNS(s.namespaceURI,'rect');
+  Object.entries({x:10,y,width:W,height:H,rx:6,fill:'none',stroke:col(b.d),'stroke-width':2}).forEach(([k,v])=>r.setAttribute(k,v));s.append(r);
+  const t=document.createElementNS(s.namespaceURI,'text');t.setAttribute('x',20);t.setAttribute('y',y+19);t.textContent=b.t.length>40?'…'+b.t.slice(-39):b.t;s.append(t);
+  const c=document.createElementNS(s.namespaceURI,'text');c.setAttribute('x',20);c.setAttribute('y',y+36);c.setAttribute('fill-opacity','.7');c.textContent=(i==0?'source, ':i==1?'reader, ':'stage '+i+', ')+DOMS[b.d].name;s.append(c);
+  if(i<n.length-1){const l=document.createElementNS(s.namespaceURI,'line');Object.entries({x1:160,y1:y+H,x2:160,y2:y+H+G,stroke:i==0?'currentColor':col(b.d),'stroke-width':2,'stroke-dasharray':i==0?'4 3':''}).forEach(([k,v])=>l.setAttribute(k,v));s.append(l)}});
+ const p=document.getElementById('path');p.className='';p.replaceChildren(el('div',{class:x.rule?'bad':'mut'},x.how),s)}
+function draw(){const q=document.getElementById('q').value.toLowerCase(),k=document.getElementById('kind').value;const tb=document.getElementById('rows');tb.replaceChildren();
+ X.filter(x=>(!q||(x.src+' '+x.dst).toLowerCase().includes(q))&&(!k||(k=='bad')==!!x.rule)).forEach(x=>{
+  const tr=el('tr',{class:'r'},el('td',{},sw(x.sd),x.src),el('td',{},sw(x.dd),x.dst),el('td',{class:x.rule?'bad':''},x.how));tr.onclick=()=>show(x,tr);tb.append(tr)})}
+document.getElementById('q').oninput=draw;document.getElementById('kind').onchange=draw;draw();
+const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td',{},sw(r.d),r.out),el('td',{class:r.stages<2?'bad':''},String(r.stages)),el('td',{},String(r.flops)))));
+</script></body></html>
+)";
+        std::cerr << "mlint: -cdc-html " << file << ": " << rows.size() << " crossings\n";
+    }
+
+    // -cdc-abstract: the top's model, port by port, for -cdc-model.
+    void writeAbstract(const std::string& file) {
+        std::map<Sym, std::string> clockName;  // domain -> the top port that is its clock
+        std::set<Sym> doms;
+        for (const Flop& f : m.flops)
+            if (f.dom) doms.insert(f.dom);
+        for (const Model::TopPort& p : m.topPorts)
+            if (!p.output) {
+                Sym d = m.domainOf(m.canon(p.sym));
+                if (doms.count(d) && !clockName.count(d)) clockName[d] = p.name;
+            }
+        std::map<Sym, std::vector<int>> readers;  // input node -> flops that read it
+        std::set<Sym> inputs;
+        for (const Model::TopPort& p : m.topPorts)
+            if (!p.output) inputs.insert(m.canon(p.sym));
+        for (size_t i = 0; i < m.flops.size(); i++)
+            for (const Root& r : cones[i].all)
+                if (inputs.count(r.sym)) readers[r.sym].push_back((int)i);
+        auto clockOf = [&](Sym d) -> std::string {
+            auto it = clockName.find(d);
+            return it == clockName.end() ? std::string() : it->second;
+        };
+        std::ofstream os(file);
+        if (!os) {
+            std::cerr << "mlint: -cdc-abstract " << file << ": cannot write\n";
+            return;
+        }
+        os << "# CDC model of " << m.topName << ", written by mlint -cdc-abstract.\n"
+              "# Use it with -cdc-model in place of the module's RTL.\n"
+              "module " << m.topName << "\n";
+        int unknown = 0;
+        for (const Model::TopPort& p : m.topPorts) {
+            Sym c = m.canon(p.sym);
+            std::string kind;
+            if (!p.output) {
+                bool isClock = false;
+                for (auto& [d, n] : clockName) isClock = isClock || n == p.name;
+                if (isClock) {
+                    kind = "clock";
+                } else {
+                    std::set<std::string> clocks;
+                    bool synced = true, any = false;
+                    for (int i : readers[c]) {
+                        const Flop& f = m.flops[i];
+                        if (!f.dom) continue;
+                        any = true;
+                        clocks.insert(clockOf(f.dom));
+                        const auto& fr = cones[i].from;
+                        bool copy = f.plain && fr.size() == 1 && fr[0].sym == c && !fr[0].logic;
+                        synced = synced && copy && chainLen(i) >= 2;
+                    }
+                    if (!any) kind = "comb";
+                    else if (clocks.size() != 1 || clocks.begin()->empty()) kind = "mixed";
+                    else kind = std::string(synced ? "sync " : "data ") + *clocks.begin();
+                }
+            } else {
+                Tracer tr(m);
+                std::set<std::string> clocks;
+                bool flops = false;
+                for (const Root& r : tr.roots(c))
+                    if (const Flop* f = m.flopOf(r.sym); f && f->dom) {
+                        flops = true;
+                        clocks.insert(clockOf(f->dom));
+                    }
+                if (!flops) kind = "comb";
+                else if (clocks.size() != 1 || clocks.begin()->empty()) kind = "mixed";
+                else kind = "data " + *clocks.begin();
+            }
+            if (kind == "mixed") unknown++;
+            os << "  " << (p.output ? "output " : "input  ") << p.name << "  " << kind << "\n";
+        }
+        os << "end\n";
+        std::cerr << "mlint: -cdc-abstract " << file << ": " << m.topPorts.size() << " ports";
+        if (unknown) std::cerr << ", " << unknown << " mixed (more than one clock, or a clock that is not a port)";
+        std::cerr << "\n";
+    }
+
     // -cdc-sva: a module of assertions on the crossings, by hierarchical
     // name, to compile next to the design (an extra top, or bound into it).
     // What makes each kind of crossing safe:
@@ -2233,6 +2477,104 @@ struct SdcView : sdc::Design {
     }
 };
 
+
+// ------------------------------------------------------------- block models
+//
+// A CDC model of a block says, port by port, what the crossing checks need to
+// know about it, so a block can be checked once and then stand in for itself
+// in the SoC (or be a black box whose RTL is not there):
+//
+//   module cdc_block
+//     input  clk_a   clock               # a clock
+//     input  d       data clk_a          # read by flops clocked by clk_a
+//     input  req     sync clk_b          # synchronized into clk_b inside
+//     output q       data clk_b          # launched by a flop clocked by clk_b
+//     output y       comb                # combinational from inputs only
+//   end
+inline void readModels(Model& m, const std::vector<std::string>& files) {
+    for (const std::string& file : files) {
+        std::ifstream in(file);
+        if (!in) {
+            std::cerr << "mlint: -cdc-model " << file << ": cannot open\n";
+            continue;
+        }
+        std::string line, mod;
+        int n = 0;
+        while (std::getline(in, line)) {
+            n++;
+            if (auto h = line.find('#'); h != std::string::npos) line.erase(h);
+            std::istringstream ws(line);
+            std::vector<std::string> w;
+            for (std::string x; ws >> x;) w.push_back(x);
+            if (w.empty()) continue;
+            auto bad = [&](const char* why) {
+                std::cerr << "mlint: " << file << ":" << n << ": " << why << "\n";
+            };
+            if (w[0] == "module" && w.size() == 2) {
+                mod = w[1];
+                m.blockModels[mod];
+            } else if (w[0] == "end") {
+                mod.clear();
+            } else if ((w[0] == "input" || w[0] == "output") && w.size() >= 3 && !mod.empty()) {
+                Model::PortModel p{w[1], w[2], w.size() > 3 ? w[3] : "", w[0] == "output"};
+                bool known = p.kind == "clock" || p.kind == "comb" || p.kind == "mixed" ||
+                             ((p.kind == "data" || p.kind == "sync") && !p.clock.empty());
+                if (!known) { bad("expected clock, data CLK, sync CLK, comb or mixed"); continue; }
+                m.blockModels[mod].push_back(p);
+            } else {
+                bad("expected module NAME, input/output PORT KIND [CLOCK], or end");
+            }
+        }
+    }
+}
+
+// After the design is gathered: each modeled instance becomes the flops its
+// model describes, on the nets its ports connect to.
+inline void applyModels(Model& m, Compilation& comp) {
+    for (const InstanceSymbol* inst : m.modeled) {
+        const auto& ports = m.blockModels.at(std::string(inst->getDefinition().name));
+        std::map<std::string, const ValueSymbol*> sym;
+        for (const Symbol* ps : inst->body.getPortList())
+            if (ps->kind == SymbolKind::Port)
+                if (const Symbol* in = ps->as<PortSymbol>().internalSymbol; in && isSignal(*in))
+                    sym[std::string(ps->name)] = &in->as<ValueSymbol>();
+        std::string here = path(*inst);
+        for (const Model::PortModel& p : ports) {
+            auto it = sym.find(p.port);
+            const ValueSymbol* clk = p.clock.empty() ? nullptr : (sym.count(p.clock) ? sym[p.clock] : nullptr);
+            if (it == sym.end() || (!p.clock.empty() && !clk)) {
+                std::cerr << "mlint: -cdc-model " << inst->getDefinition().name << ": no port "
+                          << (it == sym.end() ? p.port : p.clock) << "\n";
+                continue;
+            }
+            const ValueSymbol* port = it->second;
+            if (p.kind != "data" && p.kind != "sync") continue;
+            if (p.output) {  // launched by a flop of that clock
+                Flop& f = m.flop(port, inst->location);
+                f.clkSym = clk;
+                continue;
+            }
+            // Read by one flop (data), or by a two-flop synchronizer (sync).
+            Sym from = m.canon(port);
+            for (int stage = 1; stage <= (p.kind == "sync" ? 2 : 1); stage++) {
+                m.sliceNames.push_back(here + "." + p.port + (p.kind == "sync" ? " (synchronizer " +
+                                       std::to_string(stage) + " in the model)" : " (read in the model)"));
+                auto* v = comp.emplace<VariableSymbol>(std::string_view(m.sliceNames.back()), inst->location,
+                                                       VariableLifetime::Static);
+                v->setType(port->getType());
+                m.sliceLabel[v] = &m.sliceNames.back();
+                Flop& f = m.flop(v, inst->location);
+                f.clkSym = clk;
+                f.data = {from};
+                f.from = from;
+                f.fromBits = f.bits;
+                f.plain = p.kind == "sync";  // data: logic in the block reads it
+                from = v;
+            }
+        }
+    }
+}
+
 // Reads the SDC files: where each clock starts and how each pair is related.
 //   - a generated clock is synchronous to its master;
 //   - set_clock_groups -asynchronous makes the groups asynchronous to each
@@ -2348,6 +2690,16 @@ inline void check(Compilation& comp, Report& rep, const Options& opt) {
     Prof prof;
     auto lap = [&](const char* what) { prof.lap(what); };
     Model m;
+    readModels(m, opt.models);
+    for (const InstanceSymbol* top : comp.getRoot().topInstances) {
+        if (!m.topName.empty()) break;
+        m.topName = std::string(top->getDefinition().name);
+        for (const Symbol* ps : top->body.getPortList())
+            if (ps->kind == SymbolKind::Port)
+                if (const Symbol* in = ps->as<PortSymbol>().internalSymbol; in && isSignal(*in))
+                    m.topPorts.push_back({std::string(ps->name),
+                                          ps->as<PortSymbol>().direction == ArgumentDirection::Out, in});
+    }
     Slicer slicer(m, comp);
     comp.getRoot().visit(slicer);
     slicer.finish();
@@ -2359,6 +2711,7 @@ inline void check(Compilation& comp, Report& rep, const Options& opt) {
     Gather g(m);
     comp.getRoot().visit(g);
     ports.finishBits();
+    applyModels(m, comp);
     lap("gather");
     m.sealCombs();
     m.nameNodes();
