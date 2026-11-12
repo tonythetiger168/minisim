@@ -254,7 +254,16 @@ struct Session {
                 uint64_t limit = ~0ULL;
                 long slots = -1;
                 if (c == "step") slots = a.size() > 1 ? std::max(1L, std::atol(a[1].c_str())) : 1;
-                else if (a.size() > 1 && a[1] != "-all") limit = S.now + std::strtoull(a[1].c_str(), nullptr, 10);
+                else if (a.size() > 1 && a[1] != "-all") {
+                    // run N, or with a unit as xrun scripts write it: run 100 ns, run 100ns
+                    char* end = nullptr;
+                    double n = std::strtod(a[1].c_str(), &end);
+                    std::string unit = end && *end ? std::string(end) : a.size() > 2 ? a[2] : "";
+                    static const std::map<std::string, int> ex = {{"s", 0}, {"ms", -3}, {"us", -6}, {"ns", -9}, {"ps", -12}, {"fs", -15}};
+                    auto u = ex.find(unit);
+                    double ticks = u == ex.end() ? n : n * std::pow(10.0, u->second - timeFmt().tickExp);
+                    limit = S.now + (uint64_t)std::llround(ticks);
+                }
                 std::string why;
                 if (!advance(limit, slots, why)) { std::cout << "simulation ended at time " << S.now << "\n"; return; }
                 std::cout << "time " << S.now << ": " << why << "\n";
