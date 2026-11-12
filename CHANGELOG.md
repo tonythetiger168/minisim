@@ -16,6 +16,8 @@ Spec references are IEEE 1800-2023 clauses.
 - Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
   `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
   the last place), checked by `tests/dw/more.sv`.
+- VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
+  unknown system task or function name, which the callback may register.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
