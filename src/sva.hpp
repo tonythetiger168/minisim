@@ -35,6 +35,7 @@ struct AssertInfo {
     bool vacOn = true;                   // VacuousOff clears it, PassOn sets it
     bool hidden = false;                 // tracks a sequence's end points (16.13.6): not an assertion
     bool prot = false;                   // declared in protected code (34): kept out of the coverage database
+    bool step = false;                   // VPI stepping is on (39.5.2): report each clock step of each attempt
     // Where it is, for VPI (39.3): the slang statement and scope, the source line.
     const void* stmt = nullptr;
     const void* scope = nullptr;
@@ -58,8 +59,14 @@ inline std::vector<AssertInfo>& asserts() { static std::vector<AssertInfo> v; re
 // AE_CTL + an AssertCtlType: assertion control changed the assertion; with
 // id -1, the whole assertion system (no targets, all levels).
 enum AssertEvent : int {
-    AE_START, AE_SUCCESS, AE_VACUOUS, AE_FAILURE, AE_DISABLED, AE_KILLED, AE_RESET, AE_CTL = 100
+    AE_START, AE_SUCCESS, AE_VACUOUS, AE_FAILURE, AE_DISABLED, AE_KILLED, AE_RESET,
+    AE_STEP_OK, AE_STEP_FAIL,   // one clock step of an attempt (39.5.2), with assertStep() set
+    AE_CTL = 100
 };
+// The states an attempt went from and to in the step being reported: the
+// engine's terms (equal terms are the same state).
+struct AssertStep { const void* from = nullptr; const void* to = nullptr; };
+inline AssertStep& assertStep() { static AssertStep s; return s; }
 using AssertHook = void (*)(int id, int ev, uint64_t start);
 inline AssertHook& assertHook() { static AssertHook h = nullptr; return h; }
 inline void assertEvent(int id, int ev, uint64_t start = 0) {
