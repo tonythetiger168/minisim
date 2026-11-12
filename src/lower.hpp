@@ -11499,6 +11499,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             else lw.prog.emit(waitInstr(rs));
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
+        if (loops && p.procedureKind == ProceduralBlockKind::Always && !lw.prog.code.empty() &&
+            lw.prog.code[0].k == IK::WaitEdge)
+            lw.prog.alwaysTop = true;
         out.procs.push_back({std::move(lw.prog), loops, std::string(slang::ast::toString(p.procedureKind)),
                              curScope, {}, -1,
                              p.procedureKind == ProceduralBlockKind::Initial ? program : -1, checkerDepth > 0});

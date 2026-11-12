@@ -16,7 +16,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 
 | Clause | Topic | Status | Notes / test |
 |---|---|---|---|
-| 4.4–4.9 | Scheduling regions | ✅ | preponed (sampled values), active, inactive (`#0`), NBA, observed, reactive, re-inactive, re-NBA, postponed; once the reactive set starts it runs until it is empty (4.5). Program code runs in the reactive set (24). `4.9.4-nba-strobe`, `16.4-observed-final` |
+| 4.4–4.9 | Scheduling regions | ✅ | preponed (sampled values), active, inactive (`#0`), NBA, observed, reactive, re-inactive, re-NBA, postponed; once the reactive set starts it runs until it is empty (4.5). Program code runs in the reactive set (24). Processes one event resumes run in an order the standard leaves open (4.7): those waiting in the middle of their body (an initial past a wait, a task, a fork branch) go before always procedures woken at their leading event control, as in other simulators, so a value an initial sets on a clock edge is seen on that edge (`4.7-wake-order-initial-first`). `4.9.4-nba-strobe`, `16.4-observed-final` |
 | 5.7.1 | Integer literals | ✅ | sized, unsized, x/z digits, signed (`'s`), and `'0` `'1` `'x` `'z` in any context. `5.7.1-unbased-unsized` |
 | 5.9 | String literals | ✅ | any length, truncated on the left or zero-padded on the left to fit a vector; escape sequences (5.9.1); a line continued with a backslash; triple-quoted literals with newlines and quotes. `5.9-string-literal`, `5.9-string-literals-more` |
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |

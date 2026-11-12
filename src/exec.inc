@@ -1626,8 +1626,11 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     if (evbuf.empty()) relFail("wait on nothing");
                     if (evbuf.size() > 1) co_await WaitAny{&evbuf};
                     else co_await Wait{evbuf[0].first, evbuf[0].second};
-                } else if (i.events.size() > 1) co_await WaitAny{&i.events};
-                else co_await Wait{i.sig, i.edge};
+                } else {
+                    bool late = pc == 0 && p == entry && entry->alwaysTop;
+                    if (i.events.size() > 1) co_await WaitAny{&i.events, late};
+                    else co_await Wait{i.sig, i.edge, late};
+                }
                 TO_REACTIVE;
                 ctl->epoch++;   // a deferred assertion flush point (16.4.2)
                 pc++; break;
