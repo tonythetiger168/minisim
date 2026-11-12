@@ -442,6 +442,10 @@ inline std::vector<int> g_pdMode, g_pdSig;
 struct Prog {
     int pd = -1;           // UPF power domain, -1 for none (initial blocks are never gated, 9.2.1)
     bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
+    // An always procedure whose body starts with an event control: a wait at
+    // code[0] is its sensitivity list. Processes woken mid-body run first on
+    // the event (see Sim::set), as other simulators order them.
+    bool alwaysTop = false;
     std::vector<Instr> code;
     const void* inst = nullptr;   // msim -cov: the instance it runs in (slang InstanceSymbol), for VPI (40)
     uint32_t covInst = 0;  // g_covInsts: the instance it was lowered in (per-instance coverage)
