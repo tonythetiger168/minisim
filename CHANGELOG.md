@@ -543,6 +543,9 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI `cbCreateObj` and `cbSizeChange` (38.36.1); the save, restart and
+  reset callback reasons register (msim has no save, so they never run).
+  `tests/spec/38.36-vpi-sv-callbacks.sv`.
 - VPI constraints (37.31): `vpi_iterate(vpiConstraint, class)`, the items of
   each block (expressions, implication, if / if-else, foreach, disable soft,
   solve before), and pure virtual prototypes in `vpiMethods`.

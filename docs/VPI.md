@@ -351,6 +351,17 @@ may call VPI (35.5.3), as UVM's HDL backdoor does (see `docs/UVM.md`).
 **Protected objects (37.3.6).** `vpiIsProtected`, and the access rules for
 objects in decryption envelopes: see "VPI and DPI" in `docs/PROTECT.md`.
 
+**SystemVerilog object callbacks (38.36.1).** `cbCreateObj` runs as a class
+object is made, with the new object as `obj`; register it with `obj` NULL
+for every class or with a class definition for objects of exactly that
+class. `cbSizeChange` on a dynamic array, queue or associative array runs
+each time its size changes (push, pop, insert, delete, a new key, a new
+size); a write to an existing element does not.
+
+**Save, restart and reset (38.36.2).** msim has no save, restart or reset,
+so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
+`cbStartOfReset` and `cbEndOfReset` register (with a handle) and never run.
+
 ## Not yet
 
 The non-static property
@@ -360,13 +371,16 @@ loads of a bit or part of a signal and of primitive terminals,
 instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
-callbacks, and save / restart / reset. A call to something not
+callbacks, thread and frame callbacks (`cbStartOfThread`, `cbEndOfThread`,
+`cbEnterThread`, `cbStartOfFrame`, `cbEndOfFrame`), `cbReclaimObj` /
+`cbEndOfObject` (msim does not reclaim objects), `cbSignal`,
+`cbUnresolvedSystf`, and `vpi_control(vpiReset)`. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
