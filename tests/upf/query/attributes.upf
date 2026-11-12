@@ -1,0 +1,11 @@
+# Appended to attributes.upf: composite domains and attributes (10.6.1, 10.6.3).
+proc expect {what got want} { if {$got ne $want} { error "query $what: got {$got}, want {$want}" } }
+proc prop {h p} { return [upf_query_object_properties $h -property $p] }
+expect comp      [upf_query_object_type PD_AB]          upfCompositeDomainT
+expect subs      [prop PD_AB upf_subdomains]            {/u_dut/PD_A /u_dut/PD_B}
+expect primary   [prop PD_AB upf_supply_set_handles]    /u_dut/PD_AB.primary
+set a [prop u_m upf_hdl_attributes]
+expect attr_type [upf_query_object_type $a]             upfAttributeT
+expect attr_name [prop $a upf_attr_name]                UPF_is_hard_macro
+expect attr_val  [prop $a upf_attr_value]               TRUE
+expect port_attr [prop [prop u_b/q upf_hdl_attributes] upf_attr_name] UPF_clamp_value

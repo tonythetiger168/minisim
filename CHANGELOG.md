@@ -12,6 +12,9 @@ Spec references are IEEE 1800-2023 clauses.
   `upf_query_object_properties`, `upf_query_object_type`,
   `upf_object_in_class`, `upf_query_object_pathname` and `query_upf`, with
   phase 5 enforced after the first query (docs/LOWPOWER.md).
+- The UPF information model also holds abstract power sources, composite
+  domains, power state groups, state transitions, repeater strategies, power
+  models and attributes (IEEE 1801-2024 10.6.1, 10.6.3).
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
