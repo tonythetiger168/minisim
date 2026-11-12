@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI constraint details (37.31): `vpiSoft` on expression items, `dist`
+  items as `vpiDistribution` / `vpiDistItem` / `vpiValueRange` objects with
+  `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
+  object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
+  `vpiRefObj` has `vpiName` and `vpiFullName`.
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
   width with subnormals and all five rounding modes: `MW_fp_add`,
   `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
