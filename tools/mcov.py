@@ -22,6 +22,12 @@ a term that && or || must be able to skip (it calls a function, or reads
 through a class handle) is counted as it runs: vector i is "term i is the
 first that decides", and the terms after it show as "-".
 
+Instances: the database also has the lines, decisions and condition vectors
+of each module instance by itself. ``mcov report -instances`` prints one row
+per instance (its own code, signals and FSMs; not the instances below it),
+and with -detail each condition's vectors per instance, so that a vector
+only one of two instances of a module reaches shows.
+
 FSM coverage (as VCS -cm fsm): for each state register msim extracted, the
 states entered and the transitions made, out of those its next-state logic
 can make. Transitions into a state the register's reset branch assigns are
@@ -51,6 +57,7 @@ file name also matches as the end of a path:
     trans  tb.dut.u.state RUN->FAIL
     cg     tb.dut.cg_dbg*
     assert tb.dut.a_dbg*
+    inst   tb.dut.u_dbg                -- the instance and all below it
 
 Review: ``mcov exclude all.json -o draft.el`` writes one exclusion per item
 that is not covered, each with the reason "TODO"; a reviewer keeps the ones
@@ -121,6 +128,23 @@ def load_into(db, path):
         r, f = int(rise or "0", 16), int(fall or "0", 16)
         old = toggles.get(name)
         toggles[name] = (max(w, old[0]), r | old[1], f | old[2]) if old else (w, r, f)
+    if d.get("instances"):
+        ckeys = [(files[c[0]], c[1], c[2], c[4]) for c in d.get("conditions", ())]
+        insts = db["insts"]
+        for name, module, lns, brs, cds in d["instances"]:
+            it = insts.get(name)
+            if it is None:
+                it = insts[name] = {"module": module, "lines": {}, "branches": {}, "conds": {}}
+            il, ib, ic = it["lines"], it["branches"], it["conds"]
+            for fi, ln, hits in lns:
+                k = (files[fi], ln)
+                il[k] = il.get(k, 0) + hits
+            for fi, ln, n, t, fl in brs:
+                k = (files[fi], ln, n)
+                old = ib.get(k)
+                ib[k] = (old[0] + t, old[1] + fl) if old else (t, fl)
+            for ci, hits in cds:
+                add_inst_cond(ic, ckeys[ci], hits)
     if d.get("covergroups"):
         merge_cgs(db["cgs"], {g[0]: [g[1], g[2], {i[0]: [i[1], i[2], i[3], i[4], i[5], dict(map(tuple, i[6]))]
                                                   for i in g[3]}] for g in d["covergroups"]})
@@ -137,6 +161,15 @@ def add_cond(conds, key, op, terms, hits):
         h = old[2]
         for i, v in enumerate(hits):
             h[i] += v
+
+
+def add_inst_cond(ic, key, hits):
+    old = ic.get(key)
+    if old is None or len(old) != len(hits):
+        ic[key] = list(hits)
+    else:
+        for i, v in enumerate(hits):
+            old[i] += v
 
 
 def add_fsm(fsms, key, m):
@@ -188,7 +221,8 @@ def merge_asserts(out, asserts):
 
 
 def empty():
-    return {"lines": {}, "branches": {}, "toggles": {}, "conds": {}, "fsms": {}, "tests": [], "cgs": {}, "asserts": {}}
+    return {"lines": {}, "branches": {}, "toggles": {}, "conds": {}, "fsms": {}, "tests": [], "cgs": {}, "asserts": {},
+            "insts": {}}
 
 
 def load(path):
@@ -206,6 +240,20 @@ def merge_into(out, db):
     out["tests"] += db["tests"]
     merge_cgs(out["cgs"], db["cgs"])
     merge_asserts(out["asserts"], db["asserts"])
+    for name, src in db["insts"].items():
+        it = out["insts"].get(name)
+        if it is None:
+            out["insts"][name] = {"module": src["module"], "lines": dict(src["lines"]), "branches": dict(src["branches"]),
+                                  "conds": {k: list(h) for k, h in src["conds"].items()}}
+            continue
+        il, ib = it["lines"], it["branches"]
+        for k, h in src["lines"].items():
+            il[k] = il.get(k, 0) + h
+        for k, (t, f) in src["branches"].items():
+            old = ib.get(k)
+            ib[k] = (old[0] + t, old[1] + f) if old else (t, f)
+        for k, h in src["conds"].items():
+            add_inst_cond(it["conds"], k, h)
     lines, branches, toggles = out["lines"], out["branches"], out["toggles"]
     for k, (op, terms, hits) in db["conds"].items():
         add_cond(out["conds"], k, op, terms, hits)
@@ -267,7 +315,8 @@ def load_all(paths, jobs=0):
 
 def save(db, path):
     files = sorted({k[0] for k in db["lines"]} | {k[0] for k in db["branches"]} | {k[0] for k in db["conds"]} |
-                   {m["file"] for m in db["fsms"].values()})
+                   {m["file"] for m in db["fsms"].values()} |
+                   {k[0] for it in db["insts"].values() for part in ("lines", "branches") for k in it[part]})
     idx = {f: i for i, f in enumerate(files)}
     hexw = lambda v, w: format(v, "x").rjust((w + 3) // 4, "0")
     # One entry per line, like msim writes it. Built with json.dumps per row:
@@ -293,6 +342,12 @@ def save(db, path):
                                       "trans": [[a, b, h, r] for (a, b), (h, r) in sorted(m["trans"].items())],
                                       "extra": [[a, b, h] for (a, b), h in sorted(m["extra"].items())]}
                                      for (mod, inst, name), m in sorted(db["fsms"].items())) + "\n],\n")
+        cidx = {k: i for i, k in enumerate(sorted(db["conds"]))}
+        f.write('"instances": [\n' + rows(
+            [name, it["module"], [[idx[fl], ln, h] for (fl, ln), h in sorted(it["lines"].items())],
+             [[idx[fl], ln, n, t, fa] for (fl, ln, n), (t, fa) in sorted(it["branches"].items())],
+             [[cidx[k], h] for k, h in sorted(it["conds"].items()) if k in cidx]]
+            for name, it in sorted(db["insts"].items())) + "\n],\n")
         f.write('"covergroups": [\n' + rows(
             [name, w, goal, [[i, v[0], v[1], v[2], v[3], v[4],
                               [[b, h] for b, h in v[5].items() if h or v[0] != "cross"]] for i, v in items.items()]]
@@ -370,6 +425,64 @@ def fsm_summary(db, exclude, reset_filter):
     return tot, n
 
 
+def inst_of(name, insts):
+    """The instance that declares a hierarchical name: its longest prefix that is an instance."""
+    while "." in name:
+        name = name.rsplit(".", 1)[0]
+        if name in insts:
+            return name
+    return None
+
+
+def inst_summary(db, exclude, reset_filter):
+    """{instance: [module, line hit, lines, branch hit, outcomes, vector hit,
+    vectors, toggle hit, bits, state hit, states, transition hit, transitions]},
+    each instance counted by itself (not with the instances below it)."""
+    rx = re.compile(exclude) if exclude else None
+    insts = db["insts"]
+    out = {}
+    for name, it in insts.items():
+        if rx and rx.search(name):
+            continue
+        r = [it["module"]] + [0] * 12
+        for (f, _), h in it["lines"].items():
+            if not (rx and rx.search(f)):
+                r[1] += h > 0; r[2] += 1
+        for (f, _, _), (t, fl) in it["branches"].items():
+            if not (rx and rx.search(f)):
+                r[3] += (t > 0) + (fl > 0); r[4] += 2
+        for (f, _, _, _), hits in it["conds"].items():
+            if not (rx and rx.search(f)):
+                r[5] += sum(1 for h in hits if h > 0); r[6] += sum(1 for h in hits if h >= 0)
+        out[name] = r
+    for sig, (w, rise, fall) in db["toggles"].items():
+        if rx and rx.search(sig):
+            continue
+        r = out.get(inst_of(sig, insts))
+        if r:
+            r[7] += popcount(rise & fall); r[8] += w
+    for (mod, inst, name), m in db["fsms"].items():
+        r = out.get(inst)
+        if r and not (rx and (rx.search(m["file"]) or rx.search(f"{inst}.{name}"))):
+            for i, v in enumerate(fsm_score(m, reset_filter)):
+                r[9 + i] += v
+    return out
+
+
+def inst_text(db, exclude, reset_filter):
+    summ = inst_summary(db, exclude, reset_filter)
+    if not summ:
+        return "Instances: none in the database (written by msim 0.1 or older?)"
+    w = max([len(n) for n in summ] + [8])
+    mw = max([len(r[0]) for r in summ.values()] + [6])
+    cell = lambda a, b: f"{pct(a, b):5.1f}% {a:>5}/{b:<5}" if b else f"{'-':>18}"
+    out = [f"{'Instance':<{w}}  {'Module':<{mw}}  {'Line':>18}  {'Branch':>18}  {'Condition':>18}  {'Toggle':>18}  "
+           f"{'FSM state':>18}  {'FSM transition':>18}"]
+    for name, r in sorted(summ.items()):
+        out.append(f"{name:<{w}}  {r[0]:<{mw}}  " + "  ".join(cell(r[i], r[i + 1]) for i in range(1, 13, 2)))
+    return "\n".join(out)
+
+
 def cond_rows(op, terms, hits):
     """One (values per term, hits) row per vector of a condition, in report order."""
     n = len(terms)
@@ -383,9 +496,14 @@ def cond_rows(op, terms, hits):
     return rows
 
 
-def detail_text(db, exclude, reset_filter, uncovered_only):
+def detail_text(db, exclude, reset_filter, uncovered_only, per_inst=False):
     rx = re.compile(exclude) if exclude else None
     out = []
+    by_cond = {}
+    if per_inst:
+        for name, it in db["insts"].items():
+            for k, h in it["conds"].items():
+                by_cond.setdefault(k, []).append((name, h))
     for (f, ln, col, text), (op, terms, hits) in sorted(db["conds"].items()):
         if rx and rx.search(f):
             continue
@@ -398,6 +516,11 @@ def detail_text(db, exclude, reset_filter, uncovered_only):
         for vals, h in cond_rows(op, terms, hits):
             out.append("    " + " ".join(f"{v:^{len(str(i)) + 2}}" for i, v in enumerate(vals, 1)) +
                        f"  {'Excluded' if h < 0 else h if h else 'Not covered'}")
+        # the same rows per instance: a vector one instance never saw shows as 0
+        for name, ih in sorted(by_cond.get((f, ln, col, text), ())):
+            if len(ih) == len(hits) and not (uncovered_only and all(h != 0 for h in ih)):
+                out.append(f"    {name}: " + " ".join("x" if h < 0 else str(h) for h in ih)
+                           + f"  ({sum(1 for h in ih if h > 0)}/{sum(1 for h in ih if h >= 0)})")
     for (mod, inst, name), m in sorted(db["fsms"].items()):
         if rx and (rx.search(m["file"]) or rx.search(f"{inst}.{name}")):
             continue
@@ -572,10 +695,25 @@ def write_html(db, outdir, exclude, files=None, reset_filter=False):
                 f"condition {pct(ch, ct):.1f}% ({ch}/{ct} vectors), FSM states {pct(sh, st):.1f}% ({sh}/{st}), "
                 f"FSM transitions {pct(xh, xt):.1f}% ({xh}/{xt})</p>"
                 f"<table><tr><th>File</th><th>Line</th><th>Branch</th></tr>{''.join(rows)}</table>"
+                f"{inst_html(db, exclude, reset_filter)}"
                 f"<h2>FSMs</h2>{''.join(fsms) or '<p>None found.</p>'}"
                 f"<h2>Conditions</h2>{''.join(conds) or '<p>None.</p>'}"
                 f"<h2>Signals not fully toggled</h2><table><tr><th>Signal</th><th>Bits toggled both ways</th>"
                 f"<th>Missing bits</th></tr>{''.join(togs)}</table>{func_html(db, exclude)}</body></html>")
+
+
+def inst_html(db, exclude, reset_filter):
+    summ = inst_summary(db, exclude, reset_filter)
+    if not summ:
+        return ""
+    def cell(a, b):
+        if not b:
+            return "<td></td>"
+        return f"<td class='{'hit' if a == b else 'part' if a else 'miss'}'>{pct(a, b):.1f}% ({a}/{b})</td>"
+    rows = "".join(f"<tr><td>{html.escape(n)}</td><td>{html.escape(r[0])}</td>"
+                   + "".join(cell(r[i], r[i + 1]) for i in range(1, 13, 2)) + "</tr>" for n, r in sorted(summ.items()))
+    return ("<h2>Instances</h2><table><tr><th>Instance</th><th>Module</th><th>Line</th><th>Branch</th><th>Condition</th>"
+            f"<th>Toggle</th><th>FSM states</th><th>FSM transitions</th></tr>{rows}</table>")
 
 
 def func_html(db, exclude):
@@ -615,7 +753,7 @@ def func_html(db, exclude):
 
 # ---- exclusions ------------------------------------------------------------
 
-EL_KINDS = ("file", "line", "branch", "cond", "toggle", "fsm", "state", "trans", "cg", "assert")
+EL_KINDS = ("file", "line", "branch", "cond", "toggle", "fsm", "state", "trans", "cg", "assert", "inst")
 
 
 def read_elfile(path):
@@ -665,6 +803,20 @@ def apply_exclusions(db, rules):
                 pat, lo, hi = _file_lines(tg, where)
             fm = {}
             ok = lambda f, ln: lo <= ln <= hi and (fm[f] if f in fm else fm.setdefault(f, _file_match(f, pat)))
+            for it in db["insts"].values():      # the per-instance copies; counted once, below
+                if kind in ("file", "line"):
+                    for k in [k for k in it["lines"] if ok(k[0], k[1])]:
+                        del it["lines"][k]
+                if kind in ("file", "branch"):
+                    for k in [k for k in it["branches"] if ok(k[0], k[1])]:
+                        del it["branches"][k]
+                if kind in ("file", "cond"):
+                    for k in [k for k in it["conds"] if ok(k[0], k[1])]:
+                        if arg.isdigit():
+                            if 0 < int(arg) <= len(it["conds"][k]):
+                                it["conds"][k][int(arg) - 1] = -1
+                        else:
+                            del it["conds"][k]
             if kind in ("file", "line"):
                 for k in [k for k in db["lines"] if ok(k[0], k[1])]:
                     n += 1; cov += db["lines"].pop(k) > 0
@@ -738,6 +890,48 @@ def apply_exclusions(db, rules):
                     for t in [t for t in m["trans"] if fnmatch.fnmatchcase(name.get(t[0], ""), a)
                               and fnmatch.fnmatchcase(name.get(t[1], ""), b)]:
                         n += 1; cov += m["trans"].pop(t)[0] > 0
+        elif kind == "inst":
+            # An instance and all below it: its lines, decisions and vectors
+            # leave the totals unless another instance of the module keeps them.
+            gone = [x for x in db["insts"] if fnmatch.fnmatchcase(x, tg) or fnmatch.fnmatchcase(x, tg + ".*")]
+            dead = [db["insts"].pop(x) for x in gone]
+            lines, branches, conds = db["lines"], db["branches"], db["conds"]
+            keep_l, keep_c = {}, {}
+            for it in db["insts"].values():
+                for k, h in it["lines"].items():
+                    keep_l[k] = keep_l.get(k, 0) + h
+                for k in it["conds"]:
+                    keep_c[k] = True
+            for it in dead:
+                for k, h in it["lines"].items():
+                    if k in lines and k not in keep_l:
+                        n += 1; cov += lines.pop(k) > 0
+                    elif k in lines:
+                        lines[k] = keep_l[k]
+                for k in it["branches"]:
+                    if k in branches:
+                        t, fl = branches.pop(k)
+                        n += 2; cov += (t > 0) + (fl > 0)
+                for k, ih in it["conds"].items():
+                    if k not in conds:
+                        continue
+                    if k not in keep_c:
+                        live = [h for h in conds.pop(k)[2] if h >= 0]
+                        n += len(live); cov += sum(1 for h in live if h > 0)
+                    elif len(ih) == len(conds[k][2]):
+                        hits = conds[k][2]
+                        for i, h in enumerate(ih):
+                            if hits[i] >= 0 and h > 0:
+                                hits[i] -= h
+            pre = tuple(g + "." for g in gone)
+            for sig in [x for x in db["toggles"] if x.startswith(pre)] if pre else ():
+                if inst_of(sig, set(gone) | set(db["insts"])) in gone:
+                    w, rise, fall = db["toggles"].pop(sig)
+                    n += w; cov += popcount(rise & fall)
+            for key in [k for k in db["fsms"] if k[1] in gone]:
+                m = db["fsms"].pop(key)
+                n += len(m["states"]) + len(m["trans"])
+                cov += sum(1 for _, h in m["states"].values() if h > 0) + sum(1 for h, _ in m["trans"].values() if h > 0)
         elif kind == "cg":
             for name in [x for x in db["cgs"] if fnmatch.fnmatchcase(x, tg)]:
                 for it in db["cgs"].pop(name)[2].values():
@@ -972,6 +1166,8 @@ def main(argv=None):
     r.add_argument("-uncovered", action="store_true", help="as -detail, only what is not covered")
     r.add_argument("-fsm-reset-filter", action="store_true",
                    help="leave transitions into reset states out of FSM coverage")
+    r.add_argument("-instances", action="store_true",
+                   help="coverage of each module instance; with -detail, each condition's vectors per instance")
     r.add_argument("-elfile", metavar="FILE", action="append", default=[], help="exclusion file (may be repeated)")
     r.add_argument("-el-review", action="store_true", help="list every exclusion, what it removes and what to review")
     r.add_argument("-el-strict", action="store_true",
@@ -1021,12 +1217,14 @@ def main(argv=None):
     (sh, st, xh, xt), fn = fsm_summary(db, a.exclude, a.fsm_reset_filter)
     print(f"Condition: {pct(ch, ct):.1f}% ({ch}/{ct} vectors of {cn} condition(s))")
     print(f"FSM: states {pct(sh, st):.1f}% ({sh}/{st}), transitions {pct(xh, xt):.1f}% ({xh}/{xt}) of {fn} FSM(s)")
+    if a.instances:
+        print(inst_text(db, a.exclude, a.fsm_reset_filter))
     if rules:
         print(f"Excluded: {sum(r['n'] for r in rules)} item(s) by {len(rules)} exclusion(s)")
         if a.el_review:
             print(el_review_text(rules))
     if a.detail or a.uncovered:
-        text = detail_text(db, a.exclude, a.fsm_reset_filter, a.uncovered)
+        text = detail_text(db, a.exclude, a.fsm_reset_filter, a.uncovered, a.instances)
         if text:
             print(text)
     cgs, ftotal, (aok, an, afailed, aidle) = summarize_func(db, a.exclude)

@@ -401,6 +401,12 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
+- Per-instance coverage: `msim -cov` also writes each module instance's own
+  line hits, branch outcomes and condition vectors (interpreter and
+  `-compile`); `mcov report -instances` prints a row per instance with line,
+  branch, condition, toggle and FSM coverage, `-detail -instances` the
+  vectors of each condition per instance, the HTML report an Instances table,
+  and `inst <path>` excludes an instance and everything below it.
 - `mcov` exclusion files and test ranking: `mcov report -elfile` leaves the
   listed lines, branches, condition vectors, toggle bits, FSM states and
   transitions, covergroups and assertions out of every number, each with its
