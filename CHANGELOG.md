@@ -882,6 +882,10 @@ Spec references are IEEE 1800-2023 clauses.
   and `mplan report -rules URL` to take the annotations as triage rules.
 
 ### Fixed
+- `x inside {q}` in a constraint, where `q` is a queue or dynamic array (a
+  caller's variable in `randomize() with`, or a class property), no longer
+  makes randomize() fail: the solver narrows x to the container's elements
+  (11.4.13, 18.5.4). Found by the CCIX VIP's data sequence.
 - msim memory on big VIP benches: a 2-state unpacked array with more than
   64 elements gets its 0 defaults (6.8) from a loop instead of one
   instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and
