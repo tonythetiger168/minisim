@@ -308,6 +308,19 @@ mcov report other.xml -detail                  # another tool's coverage, with m
 mcov merge other.xml cov/*.json -o all.json    # both together
 ```
 
+**Other vendors' coverage commands.** `mcov --compat=synopsys` takes URG
+options, `--compat=cadence` IMC batch commands (`-exec`, `-execcmd`: load,
+merge, report, rank) and `--compat=siemens` `vcover merge`, `report` and
+`ranktest`. A symlink named `urg`, `imc` or `vcover` that you make to mcov
+does the same. The engine is mcov's own; the databases are mcov's (JSON or
+UCIS XML, or a directory of them):
+
+```sh
+mcov --compat=synopsys -dir runs -dbname all.json -report urgReport -format both -grade
+mcov --compat=cadence -execcmd "merge runs -out all.json; load all.json; report -detail -out cov.txt"
+mcov --compat=siemens report -details -output cov.txt all.json
+```
+
 **Which test covers what.** With one database per test, `mcov rank` orders
 the tests so that each next one adds the most items not yet covered, and
 shows what only one test covers and which tests add nothing:

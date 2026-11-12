@@ -55,6 +55,14 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `mcov` takes other vendors' coverage command lines:
+  - URG options with `--compat=synopsys`
+  - IMC batch commands with `--compat=cadence`: `-exec`, `-execcmd`, `load`, `merge -out`, `report`, `rank`
+  - `vcover merge`, `report` and `ranktest` with `--compat=siemens`
+  - the same through a symlink named `urg`, `imc` or `vcover`
+
+  The engine is mcov's own, and it reads mcov's own databases.
+  A database that does not exist is now a one-line error instead of a traceback.
 - `mcov` reads and writes UCIS XML (Accellera UCIS 1.0, its XML interchange
   format): a database named `.xml` is UCIS. Each instance becomes an
   instanceCoverages scope with its statements, branches, conditions,
