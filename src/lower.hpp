@@ -10013,6 +10013,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         PathRec base;
         base.inst = Lowerer::instPath(tp.getParentScope());
         base.unit = d.ticksPerUnit();
+        base.sym = &tp;
         if (const Expression* c = tp.getConditionExpr()) {
             base.hasCond = true;
             base.cond = termText(*c);

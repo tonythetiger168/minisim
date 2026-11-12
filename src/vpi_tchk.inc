@@ -175,7 +175,7 @@ inline Obj* modPathObj(int id) {
     }
     return slot;
 }
-inline Obj* pathTermObj(int id, int k) {   // k 0: the input, 1: the output
+inline Obj* pathTermObj(int id, int k) {   // k 0: the input, 1: the output, 2: the data input
     auto& slot = st().codeObjs[{&pathRecs()[(size_t)id], id * 2 + k}];
     if (!slot) {
         slot = mkObj(Obj::PathTerm, vpiPathTerm);
@@ -184,6 +184,11 @@ inline Obj* pathTermObj(int id, int k) {   // k 0: the input, 1: the output
         slot->parent = modPathObj(id);
     }
     return slot;
+}
+inline const TimingPathSymbol* pathSym(const PathRec& p) { return static_cast<const TimingPathSymbol*>(p.sym); }
+inline int pathPolarity(TimingPathSymbol::Polarity k) {
+    return k == TimingPathSymbol::Polarity::Positive ? vpiPositive
+         : k == TimingPathSymbol::Polarity::Negative ? vpiNegative : vpiUnknown;
 }
 inline Obj* pathModule(const PathRec& p) {
     return O(vpi_handle_by_name(const_cast<PLI_BYTE8*>(p.inst.c_str()), nullptr));
@@ -200,14 +205,22 @@ inline bool pathIterate(int type, const Obj* o, std::vector<vpiHandle>& items) {
         if (type != vpiModPathIn) items.push_back(H(pathTermObj(o->idx, 1)));
         return true;
     }
+    if (o->kind == Obj::ModPath && type == vpiModDataPathIn) {   // (posedge clk => (q +: d)): d
+        const auto* tp = pathSym(pathRecs()[(size_t)o->idx]);
+        if (tp && tp->getEdgeSourceExpr()) items.push_back(H(pathTermObj(o->idx, 2)));
+        return true;
+    }
     return false;
 }
 inline Obj* pathHandle(int type, const Obj* o) {
     const PathRec& p = pathRecs()[(size_t)o->idx];
+    const TimingPathSymbol* tp = pathSym(p);
     if (o->kind == Obj::ModPath) {
         if (type == vpiModule || type == vpiScope || type == vpiParent) return pathModule(p);
+        if (type == vpiCondition && tp && tp->getConditionExpr()) return exprNode(tp->getConditionExpr(), o);
         return nullptr;
     }
+    if (type == vpiExpr && o->pos == 2) return tp ? exprNode(tp->getEdgeSourceExpr(), o) : nullptr;
     if (type == vpiExpr) return sigObjOf(o->pos == 0 ? p.src : p.dst);
     if (type == vpiModPath || type == vpiParent) return const_cast<Obj*>(o->parent);
     return nullptr;
@@ -215,17 +228,30 @@ inline Obj* pathHandle(int type, const Obj* o) {
 inline int64_t pathGet(int prop, const Obj* o) {
     const PathRec& p = pathRecs()[(size_t)o->idx];
     if (prop == vpiType) return o->type;
+    const TimingPathSymbol* tp = pathSym(p);
     if (o->kind == Obj::ModPath) {
         if (prop == vpiModPathHasIfNone) return p.ifnone;
+        if (!tp) return vpiUndefined;
+        if (prop == vpiPathType)   // (a => y) parallel, (a *> y) full
+            return tp->connectionKind == TimingPathSymbol::ConnectionKind::Full ? vpiPathFull : vpiPathParallel;
+        if (prop == vpiPolarity) return pathPolarity(tp->polarity);
+        if (prop == vpiDataPolarity) return tp->getEdgeSourceExpr() ? pathPolarity(tp->edgePolarity) : vpiUndefined;
+        if (prop == vpiLineNo) return srcMgr() ? (int64_t)srcMgr()->getLineNumber(tp->location) : 0;
         return vpiUndefined;
     }
-    if (prop == vpiDirection) return o->pos == 0 ? vpiInput : vpiOutput;
+    if (prop == vpiDirection) return o->pos == 1 ? vpiOutput : vpiInput;
     if (prop == vpiEdge && o->pos == 0) return p.edge == 1 ? vpiPosedge : p.edge == 2 ? vpiNegedge : p.edge == 3 ? (vpiPosedge | vpiNegedge) : vpiNoEdge;
     if (prop == vpiEdge) return vpiNoEdge;
     return vpiUndefined;
 }
 inline bool pathGetStr(int prop, const Obj* o, std::string& r) {
     const PathRec& p = pathRecs()[(size_t)o->idx];
+    if (o->kind == Obj::PathTerm && prop == vpiName && o->pos == 2) {
+        const auto* tp = pathSym(p);
+        if (!tp || !tp->getEdgeSourceExpr()) return false;
+        r = ProcCollector::termText(*tp->getEdgeSourceExpr());
+        return true;
+    }
     if (o->kind == Obj::PathTerm && prop == vpiName) { r = o->pos == 0 ? p.in : p.out; return true; }
     return false;
 }

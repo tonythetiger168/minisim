@@ -65,6 +65,7 @@ struct PathRec {
     uint64_t unit = 1;           // ticks per time unit of the module
     bool annotated = false;
     bool dstVar = false;         // the output is a variable: its port connection is delayed
+    const void* sym = nullptr;   // its TimingPathSymbol (VPI: path type, polarity, condition)
     bool dstIface = false;       // the output is a variable of an interface port (25.6): its writes are delayed
 };
 inline std::vector<PathRec>& pathRecs() { static std::vector<PathRec> v; return v; }
