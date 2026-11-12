@@ -3791,6 +3791,28 @@ struct Lowerer {
             Instr i = dynCmd(t, D_COPY); i.dsrc = relSig(kRelRet, it->second->retSig); prog.emit(i);
             return t;
         }
+        if (e.kind == ExpressionKind::Call && isDynType(*e.type) && e.as<CallExpression>().isSystemCall()) {
+            // qq.pop_front() / pop_back() of a queue of queues (7.10.2.6): the
+            // element is copied out, then removed
+            const auto& call = e.as<CallExpression>();
+            auto n = call.getSubroutineName();
+            if ((n != "pop_front" && n != "pop_back") || call.arguments().empty()) return -1;
+            int outer = dynSig(*call.arguments()[0]);
+            if (outer < 0 || !dynShape(outer).elem) return -1;
+            int t = dynTemp(dynShapeOf(*e.type));
+            { Instr c = dynCmd(t, D_DELETE); prog.emit(c); }   // empty when the queue is
+            Instr j; j.k = IK::JmpIfNot;
+            j.e = bin(Op::Ne, dynSize(outer), konst(mk(0, 32)));
+            size_t at = prog.emit(j);
+            E key = n == "pop_front" ? konst(mk(0, 64)) : bin(Op::Sub, resize(dynSize(outer), 64, false, false), konst(mk(1, 64)));
+            auto r = node(Op::DynElemRef, {key});
+            r->sig = outer;
+            int el = elemRef(outer, r);
+            Instr c = dynCmd(t, D_COPY); c.dsrc = el; prog.emit(c);
+            prog.code[at].target = prog.here();
+            prog.emit(dynCmd(outer, n == "pop_front" ? D_POP_FRONT : D_POP_BACK));   // warns when it is empty
+            return t;
+        }
         if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // m[i] of a container of containers
             const auto& sel = e.as<ElementSelectExpression>();
             // f[i][j] of a fixed-size array of containers: its element's id
@@ -7210,15 +7232,54 @@ struct Lowerer {
             // slang binds the memory as an output argument: an assignment to it.
             const Expression* mp = &peel(*args[1]);
             if (mp->kind == ExpressionKind::Assignment) mp = &peel(mp->as<AssignmentExpression>().left());
+            // A partly indexed memory (mem[1], mem[1][2:5]) names the lesser
+            // dimensioned array left over (21.4): the indexes go in aidx, and
+            // a slice of the last dimension given adds its left and right
+            // bounds there too (pdown set).
+            std::vector<E> sub;
+            bool slice = false;
+            if (mp->kind == ExpressionKind::RangeSelect) {
+                auto& rs = mp->as<RangeSelectExpression>();
+                E l = expr(rs.left()), r = expr(rs.right());
+                if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                    // [b +: w] covers b .. b+w-1 in the dimension's direction; [b -: w] b-w+1 .. b
+                    auto& vt = rs.value().type->getCanonicalType();
+                    bool asc = vt.kind == SymbolKind::FixedSizeUnpackedArrayType &&
+                               vt.as<FixedSizeUnpackedArrayType>().range.left <
+                                   vt.as<FixedSizeUnpackedArrayType>().range.right;
+                    auto w = rs.right().getConstant();
+                    if (!w || !w->isInteger()) unsupported("$readmem target slice width");
+                    int64_t wn = w->integer().as<int64_t>().value_or(1);
+                    E b = resize(l, 64, rs.left().type->isSigned(), true);
+                    E d = konst(make((uint64_t)(wn - 1), 0, 64, 0, true));
+                    E lo = rs.getSelectionKind() == RangeSelectionKind::IndexedUp ? b : bin(Op::Sub, b, d);
+                    E hi = bin(Op::Add, lo, d);
+                    l = asc ? lo : hi; r = asc ? hi : lo;
+                }
+                sub.push_back(l); sub.push_back(r);
+                slice = true;
+                mp = &peel(rs.value());
+            }
+            std::vector<E> idx;
+            while (mp->kind == ExpressionKind::ElementSelect) {
+                auto& es = mp->as<ElementSelectExpression>();
+                if (!es.value().type->getCanonicalType().isUnpackedArray()) break;
+                idx.insert(idx.begin(), expr(es.selector()));
+                mp = &peel(es.value());
+            }
             const Expression& mem = *mp;
             const Symbol* msym = nullptr;
             if (mem.kind == ExpressionKind::NamedValue) msym = &mem.as<NamedValueExpression>().symbol;
             else if (mem.kind == ExpressionKind::ArbitrarySymbol) msym = mem.as<ArbitrarySymbolExpression>().symbol;
-            if (!msym) unsupported("$readmem target that is not a whole memory");
+            if (!msym) unsupported("$readmem target that is not a memory");
             auto ap = arrFind(msym);
             if (!ap) unsupported("$readmem target that is not an unpacked array");
             if (ap->dynElem) unsupported("$readmem into an array of containers");
+            if (idx.size() >= ap->dims.size()) unsupported("$readmem target that is a single word");
             Instr i; i.k = n[1] == 'r' ? IK::ReadMem : IK::WriteMem;
+            i.aidx = idx;
+            for (auto& x : sub) i.aidx.push_back(x);
+            i.pdown = slice;
             if (fname) i.fmt = *fname;
             else i.e = strOf(*args[0]);
             i.arr = ap;
@@ -8484,6 +8545,7 @@ struct Lowerer {
     }
     void stmt(const slang::ast::Statement& s) {
         struct Depth { int& d; Depth(int& x) : d(x) { d++; } ~Depth() { d--; } } depth(stmtDepth);
+        if (g_cov && !prog.inst) prog.inst = instanceAround(scope);   // statement coverage per instance (40)
         // Each statement's instructions carry its line; a block's own
         // instructions keep the line of the statement around them.
         SrcLoc savedLoc = g_emitLoc;
@@ -9850,6 +9912,23 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
         initStatic(v);
     }
+    // `output logic q = 5` (23.2.2.3): slang keeps the initializer on the
+    // port; it initializes the port's variable like a declaration's.
+    void handle(const slang::ast::PortSymbol& ps) {
+        using namespace slang::ast;
+        if (ps.direction != ArgumentDirection::Out || !ps.internalSymbol ||
+            ps.internalSymbol->kind != SymbolKind::Variable)
+            return;
+        const Expression* e = ps.getInitializer();
+        if (!e) return;
+        const auto& v = ps.internalSymbol->as<VariableSymbol>();
+        if (!sigmap.count(&v) || arrMap().count(&v) || dynMap().count(&v)) Lowerer::unsupported("this output port initializer");
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        init->setScope(ps.getParentScope());
+        Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
+        i.e = resize(init->expr(*e), storeW(v.getType()), e->type->isSigned(), v.getType().isSigned());
+        init->prog.emit(i);
+    }
     // A class's static property (8.9) starts like a module variable.
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) initStatic(p);
@@ -9973,6 +10052,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         PathRec base;
         base.inst = Lowerer::instPath(tp.getParentScope());
         base.unit = d.ticksPerUnit();
+        base.sym = &tp;
         if (const Expression* c = tp.getConditionExpr()) {
             base.hasCond = true;
             base.cond = termText(*c);
@@ -10349,6 +10429,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.e = els[(size_t)k];
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay());
+                assignGate(ca, i);
                 finishAssign(L, i);
             }
             g_emitLoc = {};
@@ -10372,6 +10453,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.e = slice(resize(L.expr(a.right()), w, false, false), hi, lo);
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay());
+                assignGate(ca, i);
                 finishAssign(L, i);
             }
             g_emitLoc = {};
@@ -10383,8 +10465,26 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.e = lw.expr(a.right());
         lw.setScope(ca.getParentScope());
         i.dly = lw.delays3(ca.getDelay());
+        assignGate(ca, i);
         finishAssign(lw, i);
         g_emitLoc = {};
+    }
+    // A delayed continuous assignment drives through a gateRecs() entry, so
+    // vpi_put_delays can change its delay at run time (38.10).
+    void assignGate(const slang::ast::ContinuousAssignSymbol& ca, Instr& i) {
+        if (i.dly.empty()) return;
+        auto [it, fresh] = assignGates().try_emplace(&ca, (int)gateRecs().size());
+        if (fresh) {
+            GateRec gr;
+            gr.inst = Lowerer::instPath(ca.getParentScope());
+            gr.name = "$assign";
+            std::vector<uint64_t> d3 = i.dly;
+            if (d3.size() > 3) d3.resize(3);
+            std::vector<uint64_t> d12 = expand12(d3);
+            std::copy(d12.begin(), d12.end(), gr.d);
+            gateRecs().push_back(std::move(gr));
+        }
+        i.gate = it->second;
     }
 
     // buf/not/and/nand/or/nor/xor/xnor and pullup/pulldown drive the same way
@@ -10800,7 +10900,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 }
                 continue;
             }
-            if (!ext || ps.isNullPort) continue;
+            if (!ext || ps.isNullPort || Lowerer::peel(*ext).kind == ExpressionKind::EmptyArgument) continue;   // u(a, ): left open (23.3.2)
             Lowerer::lastLoc() = ext->sourceRange.start().valid() ? ext->sourceRange.start() : inst.location;
             // A ref port or a container port joined to a whole variable shares
             // that variable's signal (see sharedPortVar).
@@ -10832,6 +10932,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             }
             if (ps.direction != ArgumentDirection::Out && ps.direction != ArgumentDirection::InOut)
                 Lowerer::unsupported("ref port");
+            // An open output with an initializer (`output logic q = 5`): slang
+            // gives the initializer as the connection; nothing is connected.
+            if (ext->kind != ExpressionKind::Assignment && ps.direction == ArgumentDirection::Out &&
+                ext == ps.getInitializer())
+                continue;
             if (ext->kind != ExpressionKind::Assignment)
                 Lowerer::unsupported("output port connection");
             const auto& asg = ext->as<AssignmentExpression>();
@@ -11480,6 +11585,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     portRecs().clear();
     instCells().clear();
     gateRecs().clear();
+    assignGates().clear();
     pulseStyles().clear();
     outLinks().clear();
     inLinks().clear();
