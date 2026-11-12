@@ -1,0 +1,21 @@
+{
+  "name": "mdft",
+  "title": "mdft scan-readiness checks",
+  "summary": "Design-for-test checks on RTL: gated clocks, logic-driven resets, latches, mixed edges, combinational loops, and a per-domain flop count for chain planning. Scan insertion and memory BIST belong to the paid edition.",
+  "docs": [
+    "README.md#Design for test",
+    "CHANGELOG.md"
+  ],
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "msim",
+    "mwave",
+    "mcov",
+    "mregress",
+    "mplan",
+    "mbug",
+    "mlint",
+    "mdebug"
+  ]
+}

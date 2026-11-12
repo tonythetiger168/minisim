@@ -25,6 +25,12 @@ Spec references are IEEE 1800-2023 clauses.
   states and transitions with source lines; with a waveform, which transitions
   ran, states never entered, values that are not states, and the state at
   `-at T`. The viewer page draws the state diagram of a selected state register.
+- `msupport`: an AI support agent per product. Each answers from its
+  product's documentation (BM25 search over the manuals), can run a short
+  example on the product's tool in a sandbox, and files a ticket when the
+  documentation does not answer; command line, terminal chat and a local web
+  service. Product files for the nine free tools in `support/products/`.
+  Not online yet. See `docs/SUPPORT.md`.
 - Value conversion tables (IEEE 1801-2024 4.10, 6.18, 6.28, Annex B):
   `connect_supply_net` joins a supply net and an HDL port. An output port
   (a regulator model) drives the net; an input port (a macro's power pin) is
