@@ -608,6 +608,159 @@ static void fixArrayNbas(LowerResult& lowered) {
     }
 }
 
+// `always @*` (9.4.2.2) lowers to WaitEdge(reads) ; body ; Jmp 0: it waits
+// first, so it is not a combinational shape (body ; WaitEdge ; Jmp 0) and
+// stays a coroutine. A body of plain assignments and forward jumps becomes
+//     JmpIfNot armed -> W ; body ; W: WaitEdge(reads, armed) ; Jmp 0
+// which the static schedule ranks like an always_comb (as Verilator treats
+// @*). Unlike always_comb, @* does not run at time 0: its outputs keep their
+// values until an input changes. `armed` (2-state, 0) is set by a one-shot
+// process that waits once on the same inputs, so the body runs from the
+// first change on, as the waiting process would. MSIM_NOATSTAR=1 keeps the
+// coroutines.
+static void rotateAtStar(LowerResult& lowered) {
+    const bool dbg = std::getenv("MSIM_WHYATSTAR") != nullptr;
+    size_t done = 0, np = lowered.procs.size();
+    for (size_t pi = 0; pi < np; pi++) {
+        auto& pr = lowered.procs[pi];
+        Prog& q = pr.prog;
+        size_t n = q.code.size();
+        if (pr.kind != "Always" || !pr.loops || pr.program >= 0 || pr.reactive || n < 3) continue;
+        if (!q.roots.empty() || !q.spans.empty()) continue;
+        const Instr& w = q.code[0];
+        const Instr& j = q.code[n - 1];
+        if (w.k != IK::WaitEdge || w.dynWait || j.k != IK::Jmp || j.target != 0) continue;
+        std::vector<std::pair<int, Edge>> ev = w.events.empty() ? std::vector<std::pair<int, Edge>>{{w.sig, w.edge}} : w.events;
+        bool ok = true;
+        for (auto& [sg, ed] : ev) ok &= ed == ANY && sg >= 0;
+        for (size_t pc = 1; ok && pc + 1 < n; pc++) {
+            const Instr& x = q.code[pc];
+            if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
+                ok &= x.target > pc && x.target <= n - 1 && (x.xt == Instr::NOX || (x.xt > pc && x.xt <= n - 1));
+            } else if (x.k == IK::Assert) ok &= x.join == 1 || x.join == 2;
+            else ok &= x.k == IK::Assign && !x.de && !x.delay && x.dly.empty();
+        }
+        if (!ok) continue;
+        // The wait must cover everything the body reads (the sensitivity of
+        // @*, or a complete hand-written list).
+        auto rs = combReadSet(q);
+        std::set<int> have;
+        for (auto& e : ev) have.insert(e.first);
+        for (auto& e : rs) ok &= have.count(e.first) > 0;
+        if (!ok) { if (dbg) std::cerr << "@* kept: the wait misses a read, line " << q.code[1].line << "\n"; continue; }
+        int armed = S.sig("$atstar" + std::to_string(done), 1, false);
+        S.sigs[(size_t)armed].val = Val{0, 0, 1, 0, false};
+        S.sigs[(size_t)armed].hide = true;
+        Instr gate;
+        gate.k = IK::JmpIfNot;
+        gate.e = ref(armed);
+        gate.target = n - 1;
+        gate.line = q.code[1].line;
+        gate.file = q.code[1].file;
+        Instr wait = q.code[0];
+        ev.push_back({armed, ANY});
+        wait = waitInstr(ev);
+        wait.line = q.code[0].line;
+        wait.file = q.code[0].file;
+        q.code[0] = gate;
+        q.code.insert(q.code.end() - 1, wait);
+        // The one-shot process: wait for the first change, then arm.
+        LoweredProc arm;
+        arm.kind = "Always";
+        arm.loops = false;
+        arm.scope = pr.scope;
+        Instr w1 = waitInstr(std::vector<std::pair<int, Edge>>(ev.begin(), ev.end() - 1));
+        Instr set;
+        set.k = IK::Assign;
+        set.sig = armed;
+        set.e = konst(Val{1, 0, 1, 0, false});
+        arm.prog.code = {w1, set};
+        // The one-shot process takes the block's place in the start order,
+        // so it waits as early as the block would have (a change at time 0
+        // from a later process still wakes it); the block, now ranked, goes last.
+        LoweredProc blk = std::move(pr);
+        lowered.procs[pi] = std::move(arm);
+        lowered.procs.push_back(std::move(blk));
+        done++;
+    }
+    if (dbg) std::cerr << "@* rotated: " << done << "\n";
+}
+
+// A clocked block that keeps working values in module variables with
+// blocking assignments (PicoRV32's `set_mem_do_rinst = 0; ... if (...)
+// set_mem_do_rinst = 1;`) is not a seqShape: its Assigns wake readers, so
+// it stays a coroutine. When no other process, final block or wait touches
+// such a variable and nothing dumps waveforms, nobody can see the change
+// events: its Assigns become temporaries (Instr::tmp, a store without
+// notification; the value is still kept in the signal, so a read before the
+// first write of an activation sees the last one, as before), and the block
+// can join the static clocked schedule. MSIM_NOSEQTMP=1 keeps them.
+static void localizeSeqBlocking(LowerResult& lowered) {
+    const bool dbg = std::getenv("MSIM_WHYSEQTMP") != nullptr;
+    size_t ns = S.sigs.size();
+    // Per signal: the process that touches it, -1 none, -2 more than one or something else.
+    std::vector<int> owner(ns, -1);
+    auto touch = [&](int s, int who) {
+        if (s < 0 || (size_t)s >= ns) return;
+        int& o = owner[s];
+        o = (o == -1 || o == who) ? who : -2;
+    };
+    auto scanProg = [&](const Prog& top, int who) -> bool {
+        std::vector<const Prog*> seen, todo{&top};
+        while (!todo.empty()) {
+            const Prog* p = todo.back(); todo.pop_back();
+            if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+            seen.push_back(p);
+            for (const Instr& i : p->code) {
+                if (i.k == IK::Dump) return false;
+                touch(i.sig, who);
+                for (auto& [sg, ed] : i.events) touch(sg, who);
+                if (i.arr) for (int k = 0; k < i.arr->count; k++) touch(i.arr->base + k, who);
+                if (i.k == IK::Call && i.callee) todo.push_back(i.callee);
+                for (const Prog* b : i.branches) todo.push_back(b);
+            }
+            std::vector<int> rd;
+            std::vector<const Prog*> seen2;
+            collectProgRefs(*p, rd, seen2);
+            for (int r : rd) touch(r, who);
+        }
+        return true;
+    };
+    for (size_t pi = 0; pi < lowered.procs.size(); pi++)
+        if (!scanProg(lowered.procs[pi].prog, (int)pi)) return;
+    for (auto& f : lowered.finals) if (!scanProg(f.prog, -2)) return;
+    for (auto& sp : lowered.subs) if (sp) for (const Instr& i : sp->code) if (i.k == IK::Dump) return;
+    size_t done = 0, procsDone = 0;
+    for (size_t pi = 0; pi < lowered.procs.size(); pi++) {
+        auto& pr = lowered.procs[pi];
+        Prog& q = pr.prog;
+        size_t n = q.code.size();
+        if (!pr.loops || pr.program >= 0 || pr.reactive || n < 3) continue;
+        if (!q.roots.empty() || !q.spans.empty()) continue;
+        if (q.code[0].k != IK::WaitEdge || q.code[n - 1].k != IK::Jmp || q.code[n - 1].target != 0) continue;
+        bool edge = !q.code[0].events.empty() || q.code[0].edge != ANY;
+        for (auto& [sg, ed] : q.code[0].events) edge &= ed != ANY;
+        if (!edge) continue;   // a clocked block only
+        std::vector<size_t> cand;
+        bool ok = true;
+        for (size_t pc = 1; ok && pc + 1 < n; pc++) {
+            const Instr& x = q.code[pc];
+            if (x.k != IK::Assign || x.tmp) continue;
+            ok = x.sig >= 0 && (size_t)x.sig < ns && owner[x.sig] == (int)pi && x.drv < 0 && !x.arr && x.aidx.empty() &&
+                 x.dyn < 0 && !x.de && !x.delay && x.dly.empty() && x.gate < 0 && !x.udp;
+            cand.push_back(pc);
+        }
+        if (!ok || cand.empty()) {
+            if (dbg && !cand.empty()) std::cerr << "seqtmp kept: line " << q.code[1].line << "\n";
+            continue;
+        }
+        for (size_t pc : cand) q.code[pc].tmp = true;
+        done += cand.size();
+        procsDone++;
+    }
+    if (dbg) std::cerr << "seqtmp: " << done << " assigns in " << procsDone << " clocked blocks\n";
+}
+
 // Subroutine calls in a combinational block (always_comb, or an assign whose
 // value calls a function) are expanded in place, so the block is straight
 // code that the static schedule can rank and split like any other. A static
@@ -2866,10 +3019,12 @@ int main(int argc, char** argv) {
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
-    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOSEQTMP")) localizeSeqBlocking(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
