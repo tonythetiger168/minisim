@@ -2531,6 +2531,7 @@ struct Lowerer {
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
                 if (c.conditions.size() != 1) unsupported("pattern conditional");
+                if (E l = lazyExpr(e, ExprCtx{})) return l;   // an arm with a call: only the chosen one runs (11.4.11)
                 return mux(expr(*c.conditions[0].expr), realOf(c.left()), realOf(c.right()));
             }
             case ExpressionKind::Call: {
@@ -2780,6 +2781,7 @@ struct Lowerer {
             case ExpressionKind::ConditionalOp: {
                 const auto& c = e.as<ConditionalExpression>();
                 if (c.conditions.size() != 1) unsupported("pattern conditional");
+                if (E l = lazyExpr(e, ExprCtx{})) return l;   // an arm with a call: only the chosen one runs (11.4.11)
                 return mux(expr(*c.conditions[0].expr), strOf(c.left()), strOf(c.right()));
             }
             case ExpressionKind::Call: {

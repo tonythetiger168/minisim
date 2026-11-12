@@ -75,7 +75,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 11.4.2 | Increment / decrement | ✅ | also inside expressions (`x = i++ + 1`, `while (j++ < 3)`). `11.4.2-incdec-in-expr` |
 | 11.4.3 | Arithmetic incl. unary −/+, ** | ✅ | `11.4.3-arith-unary` |
 | 11.4.4–11.4.10 | Relational, equality, logical, bitwise, reduction, shift | ✅ | `11.4.5-equality`, `11.4.9-reduction` |
-| 11.4.11 | Conditional `?:` | ✅ | |
+| 11.4.11 | Conditional `?:` | ✅ | Only the chosen arm is evaluated, also when the `?:` is a string, real or packed operand of a larger expression. `11.4.11-conditional-lazy-arms` |
 | 11.4.12 | Concatenation, replication | ✅ | zero replication inside a concatenation is ignored. `11.4.12.1-replication`, `11.4.12.1-zero-replication` |
 | 11.4.6 | Wildcard equality `==?` `!=?` | ✅ | `11.4.2-incdec-in-expr` |
 | 11.4.13 | inside | ✅ | values, `[lo:hi]` ranges, real values and ranges, fixed-size arrays and queues as items, and the 2023 tolerance ranges `[A +/- B]`, `[A +%- B]` (with `--std=1800-2023`). `11.4.13-inside`, `11.4.13-inside-arrays` |
