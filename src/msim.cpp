@@ -33,6 +33,9 @@
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
+//   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
+//   -xrun, -irun     take the rest of the command line as xrun / irun options
+//                    (also when msim runs as xrun, irun or xmverilog): docs/XRUN.md
 //   -profile [<file>] time every process and region and write a report
 //                    (default simprofile.txt): busiest processes, time per
 //                    instance, file and kind. Runs the interpreter on one thread.
@@ -166,6 +169,7 @@
 #include "vpi.inc"
 #include "interactive.inc"
 #include "objview.inc"
+#include "xrun.inc"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -1731,6 +1735,8 @@ static void usage() {
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
+                 "  -xrun ...      the rest is an xrun / irun command line (also when run as xrun or irun)\n"
+                 "  -elab          stop after elaboration, before the run\n"
                  "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
@@ -1787,6 +1793,23 @@ int main(int argc, char** argv) {
             (void)!write(2, w.data(), w.size());
             _exit(139);
         });
+    // xrun / irun command line (xrun.inc): translated to msim's options.
+    xrun::Opts xo;
+    std::vector<char*> xargv;
+    if (xrun::wanted(argc, argv, xo)) {
+        for (auto& s : xo.out) xargv.push_back(s.data());
+        if (!xo.tclIn.empty()) {   // -input run.tcl: as an msim -do file
+            static std::string doFile = xo.tool + ".do";
+            if (!xrun::tclToDo(xo.tclIn, doFile, xo.tool)) { std::cerr << xo.tool << ": cannot read " << xo.tclIn << "\n"; return 2; }
+            static std::string doOpt = "-do";
+            xargv.push_back(doOpt.data());
+            xargv.push_back(doFile.data());
+        }
+        xargv.push_back(nullptr);
+        argc = (int)xargv.size() - 1;
+        argv = xargv.data();
+        xrun::teeLog(xo);
+    }
     // Pass 1: take msim's own options out; translate VCS spellings for slang.
     std::vector<std::string> fwd{argv[0]};
     std::vector<std::string> plusargs;
@@ -1799,6 +1822,7 @@ int main(int argc, char** argv) {
     uint64_t maxTime = ~0ULL;
     bool interactiveMode = false;   // -i / -do FILE
     std::string doPath;
+    bool elabOnly = false;   // -elab: stop after elaboration (xrun -elaborate)
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
     bool threadsGiven = false;
@@ -1826,6 +1850,7 @@ int main(int argc, char** argv) {
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
         if (a == "-compile") { compiled = true; continue; }
+        if (a == "-elab") { elabOnly = true; continue; }
         if (a == "-i" || a == "-ucli") { interactiveMode = true; continue; }
         if (a == "-do") { doPath = next("a command file"); interactiveMode = true; continue; }
         if (a == "-no-static-comb") { staticComb = false; continue; }
@@ -2213,6 +2238,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (elabOnly) { std::cout << "msim: elaborated " << lowered.procs.size() << " processes; not run (-elab)\n"; return 0; }
     if (g_cov) {   // FSM coverage: the kernel records the state registers' values
         std::vector<int> watch;
         std::vector<char> hot;

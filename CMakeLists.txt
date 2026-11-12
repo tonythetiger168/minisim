@@ -227,6 +227,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vcd_class
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd_class.cmake)
+  # The xrun / irun command line (msim run as xrun, or msim -xrun).
+  add_test(NAME msim_xrun
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xrun
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_xrun.cmake)
   # Simulation profile (msim -profile): processes, instances, kinds.
   add_test(NAME msim_profile
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
