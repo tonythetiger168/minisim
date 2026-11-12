@@ -69,6 +69,13 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `msim -cm <metrics>` now selects the code coverage metrics written. It takes
+  three notations: VCS `line+branch+cond+tgl+fsm`, Xcelium `b:e:t:f` or
+  `all`, and Questa `bcesftx`. `msim -cm_hier <file>` selects the part of
+  the design by instance, module or file. It reads VCS `+tree`/`-tree`
+  lines and Xcelium covfile `select_coverage` / `deselect_coverage`
+  commands. Before this, `-cm` wrote every metric. Covergroups and
+  assertions are always written.
 - `mlint` clock checks: `CDC007` (a clock read as data) and `CDC008` (a
   clock made by combinational logic of a clock and other signals, which can
   glitch).

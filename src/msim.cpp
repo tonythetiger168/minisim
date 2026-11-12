@@ -150,6 +150,7 @@
 #include <unistd.h>
 
 #include "codegen.hpp"
+#include "cov_select.hpp"
 #include "lower.hpp"
 #include "saif.hpp"
 #include "slang/diagnostics/DiagnosticClient.h"
@@ -1479,6 +1480,9 @@ Val hook(int op, const std::vector<Val>& a) {
 }
 }  // namespace covapi
 
+// -cm / -cm_hier: the code coverage written (src/cov_select.hpp).
+static covsel::Selection g_covSel;
+
 static bool writeCoverage(const std::string& path, const LowerResult& lw, const std::string& top) {
     covapi::restoreStopped();   // a coverage_control STOP still in force (40.3.2.1)
     std::vector<const Prog*> progs;
@@ -1496,25 +1500,46 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         std::map<size_t, std::vector<uint64_t>> conds;       // index in "conditions" -> hits
     };
     std::vector<InstCov> insts(g_covInsts.size());
+    // Selection (-cm, -cm_hier): the instance path and module of a coverage
+    // instance, and whether a metric of its code in a file is written.
+    auto instPath = [&](uint32_t k) {
+        if (!k || k >= g_covInsts.size()) return std::string();
+        return g_covInsts[k].path.empty() ? top : top + "." + g_covInsts[k].path;
+    };
+    const bool selAll = g_covSel.metrics == covsel::ALL && g_covSel.rules.empty();
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, bool> selCache;   // (instance, file, metric)
+    auto sel = [&](uint32_t m, uint32_t inst, uint32_t file) {
+        if (selAll) return true;
+        auto [it, fresh] = selCache.try_emplace({inst, file, m}, false);
+        if (fresh)
+            it->second = g_covSel.selected(m, instPath(inst), inst < g_covInsts.size() ? g_covInsts[inst].module : "",
+                                           file < g_covFiles.size() ? g_covFiles[file] : "");
+        return it->second;
+    };
     for (const Prog* p : progs) {
         InstCov* ic = p->covInst && p->covInst < insts.size() ? &insts[p->covInst] : nullptr;
         for (auto& i : p->code) {
             if (!i.line) continue;
             auto key = std::make_pair(i.file, i.line);
-            auto& h = lines[key];
-            h = std::max(h, i.hits);
-            if (ic) {
-                auto& ih = ic->lines[key];
-                ih = std::max(ih, i.hits);
+            if (sel(covsel::LINE, p->covInst, i.file)) {
+                auto& h = lines[key];
+                h = std::max(h, i.hits);
+                if (ic) {
+                    auto& ih = ic->lines[key];
+                    ih = std::max(ih, i.hits);
+                }
             }
             // A JmpIfNot is a two-way decision: true = fell through, false = jumped.
+            // n counts every decision of the line, so that it is the same for any selection.
             if (i.k == IK::JmpIfNot) {
                 auto& v = branches[key];
-                if (ic) ic->branches.push_back({i.file, i.line, v.size(), i.hits - i.taken, i.taken});
-                v.push_back({i.hits - i.taken, i.taken});
+                bool on = sel(covsel::BRANCH, p->covInst, i.file);
+                if (ic && on) ic->branches.push_back({i.file, i.line, v.size(), i.hits - i.taken, i.taken});
+                v.push_back({on ? i.hits - i.taken : UINT64_MAX, i.taken});
             }
         }
     }
+
     std::ofstream f(path);
     if (!f) return false;
     f << "{\n \"format\": \"msim-cov\", \"version\": 1, \"tool\": \"msim " MINISIM_VERSION "\", \"top\": " << jstr(top)
@@ -1530,6 +1555,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     first = true;
     for (auto& [k, v] : branches)
         for (size_t n = 0; n < v.size(); n++) {
+            if (v[n].first == UINT64_MAX) continue;   // not selected
             f << (first ? "\n  " : ",\n  ") << "[" << k.first << ", " << k.second << ", " << n << ", " << v[n].first << ", " << v[n].second << "]";
             first = false;
         }
@@ -1546,9 +1572,25 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         }
         return r;
     };
+    // A signal's instance: the longest prefix of its name that is one.
+    std::unordered_map<std::string, uint32_t> instByPath;
+    if (!selAll)
+        for (uint32_t k = 1; k < g_covInsts.size(); k++) instByPath.emplace(instPath(k), k);
+    auto sigSelected = [&](const std::string& full) {
+        if (selAll) return true;
+        std::string_view n = full;
+        while (true) {
+            size_t d = n.rfind('.');
+            if (d == std::string_view::npos) break;
+            n = n.substr(0, d);
+            if (auto it = instByPath.find(std::string(n)); it != instByPath.end()) return sel(covsel::TGL, it->second, 0);
+        }
+        return g_covSel.selected(covsel::TGL, n, "");
+    };
     for (size_t sidx = 0; sidx < S.sigs.size(); sidx++) {
         const auto& g = S.sigs[sidx];
         if (g.hide) continue;
+        if (!sigSelected(top + "." + g.name)) continue;
         static const std::vector<uint64_t> none;
         const auto& R = sidx < S.togRise.size() ? S.togRise[sidx] : none;
         const auto& F = sidx < S.togFall.size() ? S.togFall[sidx] : none;
@@ -1560,6 +1602,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     struct CondSum { const CondDef* d; std::vector<uint64_t> hits; size_t index = 0; };
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, std::string>, CondSum> conds;
     for (auto& d : condDefs()) {
+        if (!sel(covsel::COND, d.inst, d.file)) continue;
         auto& c = conds[{d.file, d.line, d.col, d.text}];
         if (!c.d) { c.d = &d; c.hits.assign(d.counters(), 0); }
         if (c.d->counters() != d.counters()) continue;
@@ -1586,6 +1629,8 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     first = true;
     for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++) {
         const FsmDef& d = fsmDefs()[k];
+        if (!selAll && !g_covSel.selected(covsel::FSM, d.inst, d.module, d.file < g_covFiles.size() ? g_covFiles[d.file] : ""))
+            continue;
         const auto& seen = S.fsmSeen[k];
         auto trans = S.fsmTrans[k];
         f << (first ? "\n  " : ",\n  ") << "{\"module\": " << jstr(d.module) << ", \"inst\": " << jstr(d.inst) << ", \"name\": "
@@ -1617,7 +1662,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         size_t ci = 0;
         for (auto& [key, c] : conds) c.index = ci++;
         for (auto& d : condDefs()) {
-            if (!d.inst || d.inst >= insts.size()) continue;
+            if (!d.inst || d.inst >= insts.size() || !sel(covsel::COND, d.inst, d.file)) continue;
             const CondSum& c = conds[{d.file, d.line, d.col, d.text}];
             if (d.counters() != c.d->counters()) continue;
             auto& h = insts[d.inst].conds[c.index];
@@ -1752,7 +1797,13 @@ static void usage() {
                  "                 variable points to, as h.addr (x while h is null); handle\n"
                  "                 properties are followed N levels (default 1)\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
-                 "                 see mcov. -cm <metrics> (as VCS) does the same\n"
+                 "                 see mcov\n"
+                 "  -cm <metrics>  the same, with only these code coverage metrics: line+branch+cond+tgl+fsm\n"
+                 "                 (as VCS), b:e:t:f or all (as Xcelium -coverage), bcesftx (as Questa\n"
+                 "                 +cover); covergroups and assertions are always written\n"
+                 "  -cm_hier <f>   the part of the design whose code coverage is written: +tree/-tree\n"
+                 "                 <inst> [depth], +module/-module, +file/-file (as VCS -cm_hier), or\n"
+                 "                 select_coverage / deselect_coverage commands (as an Xcelium covfile)\n"
                  "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
                  "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
@@ -1955,9 +2006,30 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
             continue;
         }
-        if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
+        // -cm <metrics>: the code coverage metrics written; VCS line+cond+fsm+tgl+branch,
+        // Xcelium b:e:t:f:u:a or all, Questa bcesftx (src/cov_select.hpp). Covergroups
+        // and assertions are always written.
+        if ((a == "-cm" && i + 1 < argc) || a.starts_with("-cm=")) {
             g_cov = true;
-            ++i;
+            std::string err;
+            std::string_view v = a == "-cm" ? std::string_view(argv[++i]) : a.substr(4);
+            if (!covsel::parseMetrics(v, g_covSel.metrics, err)) {
+                std::cerr << "msim: -cm: " << err << "\n";
+                return 2;
+            }
+            continue;
+        }
+        // -cm_hier <file>: the part of the design whose code coverage is written: VCS
+        // +tree/-tree/+module/-module/+file/-file lines or Xcelium covfile commands.
+        if (a == "-cm_hier" && i + 1 < argc) {
+            std::string err;
+            if (!g_covSel.read(argv[++i], err)) {
+                std::cerr << "msim: -cm_hier: " << err << "\n";
+                return 2;
+            }
+            for (auto& n : g_covSel.notes) std::cerr << "msim: " << n << "\n";
+            g_covSel.notes.clear();
+            if (g_covSel.allops) g_condAllops = true;
             continue;
         }
         if (a == "-cm_cond" && i + 1 < argc) {   // VCS: -cm_cond full+allops (std / basic: the default)
