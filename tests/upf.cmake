@@ -2,7 +2,7 @@
 #   cmake -DMSIM=<msim> -DMLINT=<mlint> -DSRC=<source dir> -P upf.cmake
 # Each tests/upf/<name>.sv runs with <name>.upf and must print <name>.out.
 set(D ${SRC}/tests/upf)
-foreach(t gating retention states)
+foreach(t gating retention states vct)
   execute_process(COMMAND ${MSIM} ${D}/${t}.sv -upf ${D}/${t}.upf
                   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
   if(NOT rc EQUAL 0)
@@ -48,6 +48,41 @@ upf_error(e_rep "set_repeater R2 -domain PD_CORE" "set_repeater needs -repeater_
 upf_error(e_tr1 "add_state_transition PD_CORE -domain -transition {t -from A}" "needs both -from and -to (6.7)")
 upf_error(e_tr2 "add_power_state PD_CORE -domain -state {A -logic_expr {u_pmu/req}}\nadd_state_transition PD_CORE -domain -transition {t -from A -to B}" "B is not a power state of PD_CORE (6.7)")
 upf_error(e_tr3 "add_state_transition PD_CORE -domain -transition {t -from A -to A}" "A is both the -from and the -to state (6.7)")
+# UPF is Tcl (5.1): the same intent written with proc, foreach, if, expr and
+# [command] substitution simulates the same.
+execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/tcl.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ ${D}/gating.out want)
+if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
+  message(FATAL_ERROR "tcl.upf: ${rc}\n${out}${err}")
+endif()
+# An error inside a proc called from a loop is reported where it is.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badtcl.upf "proc p {d} {\n  create_power_domain $d -update\n}\nforeach d {A B} { p $d }\n")
+execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/badtcl.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "badtcl.upf:2: -update of unknown domain A")
+  message(FATAL_ERROR "an error in a UPF proc was not reported: ${rc}\n${out}${err}")
+endif()
+
+# Value conversion tables (4.10): a table against the port's direction, a
+# port that needs -vct, and an unknown table are errors.
+foreach(case
+    "connect_supply_net VREG -ports {u_mac/VDD} -vct SV_LOGIC2UPF|u_dut.u_mac.VDD is an input port, but SV_LOGIC2UPF converts an HDL value to a supply state"
+    "connect_supply_net VREG -ports {vreg}|u_dut.vreg is not an input or output port of an instance; name a value conversion table with -vct"
+    "connect_supply_net VREG -ports {u_mac/a} -vct UPF2SV_LOGIC|u_dut.u_mac.a is 4 bits wide"
+    "connect_supply_net VREG -ports {u_mac/VDD} -vct NOPE|no value conversion table 'NOPE'"
+    "create_hdl2upf_vct T -hdl_type {sv} -table {{2 OFF}}|'2' is not a value of SystemVerilog logic"
+    "create_upf2hdl_vct UPF2SV_LOGIC -hdl_type {sv} -table {{OFF 0}}|UPF2SV_LOGIC is already defined [(]Annex B[)]")
+  string(REPLACE "|" ";" case "${case}")
+  list(GET case 0 line)
+  list(GET case 1 want)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badvct.upf "set_design_top dut\ncreate_power_domain PD_TOP -include_scope\ncreate_supply_net VREG\n${line}\n")
+  execute_process(COMMAND ${MSIM} ${D}/vct.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/badvct.upf
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(rc EQUAL 0 OR NOT err MATCHES "${want}")
+    message(FATAL_ERROR "VCT error not reported for: ${line}\nwant: ${want}\n${rc}\n${out}${err}")
+  endif()
+endforeach()
 
 # -power_top names the instance the UPF describes; it wins over set_design_top.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut

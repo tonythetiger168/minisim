@@ -1,0 +1,24 @@
+{
+  "name": "mcov",
+  "title": "mcov coverage",
+  "summary": "Coverage from msim -cov merged across a regression: line, branch, toggle, condition and FSM coverage, covergroups and assertion statistics; text, HTML and LCOV reports and gates.",
+  "docs": [
+    "README.md#Coverage: ",
+    "README.md#Regressions",
+    "README.md#Simulating your own design",
+    "docs/COVERAGE.md",
+    "CHANGELOG.md"
+  ],
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "msim",
+    "mwave",
+    "mregress",
+    "mplan",
+    "mbug",
+    "mlint",
+    "mdft",
+    "mdebug"
+  ]
+}

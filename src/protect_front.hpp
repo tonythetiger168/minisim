@@ -37,6 +37,7 @@
 #include "slang/text/SourceManager.h"
 #include "version.hpp"
 #ifdef MINISIM_HAVE_OPENSSL
+#include "licproxy.hpp"
 #include "protect.hpp"
 #endif
 
@@ -46,7 +47,7 @@ namespace protfront {
 struct Options {
     std::vector<std::string> keyfiles;   // -keyfile [[owner:]name=]priv.pem
     std::vector<std::string> keyrings;   // -keyring file
-    std::map<std::string, std::string> licenses;   // -license feature[=string]
+    bool licenseStop = false;            // -license_fail stop: no proxy connection is an error (1735 8.9)
     std::vector<std::string> dirs;       // +incdir+ / -I / -y directories
 
     // Takes the protect options out of a command line; returns true when
@@ -60,10 +61,16 @@ struct Options {
         if (a == "-keyfile") { keyfiles.push_back(next()); return true; }
         if (a == "-keyring") { keyrings.push_back(next()); return true; }
         if (a == "-license") {
-            std::string f = next();
-            size_t eq = f.find('=');
-            if (eq == std::string::npos) licenses[f] = "";
-            else licenses[f.substr(0, eq)] = f.substr(eq + 1);
+            // The old test stand-in let the IP user grant a licensed right to
+            // themselves; only the IP author's proxy can answer (1735 clause 8).
+            std::cerr << "-license is gone: licensed rights are checked with the IP author's license proxy.\n"
+                         "Set the environment variable the IP names (license_proxyenv) to <port>@<host>; see docs/PROTECT.md.\n";
+            std::exit(2);
+        }
+        if (a == "-license_fail") {
+            std::string v = next();
+            if (v != "stop" && v != "deny") { std::cerr << "-license_fail takes stop or deny\n"; std::exit(2); }
+            licenseStop = v == "stop";
             return true;
         }
         // Directories that may hold protected `include files or library cells
@@ -85,7 +92,8 @@ struct Options {
     static const char* help() {
         return "  -keyfile [[<owner>:]<keyname>=]<private.pem>  key for protected envelopes (repeatable)\n"
                "  -keyring <file>  private keys, one `<key_keyowner> <key_keyname> <private.pem>` per line\n"
-               "  -license <feature>[=<string>]  a license feature for licensed rights (IEEE 1735 7.4.3)\n";
+               "  -license_fail stop|deny  when a protected IP's license proxy cannot be reached: stop, or go on\n"
+               "                   with its licensed rights denied (default; IEEE 1735 8.9)\n";
     }
 };
 
@@ -130,9 +138,27 @@ struct ProtectedCode {
 
     // May a tool show this object (a net or variable)? Outside protected code
     // always; inside, when the rights or a viewport make it visible (1735 9.5).
+    // Is the instance whose body holds `sc`, or one above it, an instance of
+    // protected code the rights do not open? A path through it is opaque
+    // (9.2), so clear-text children and modules bound into it are hidden
+    // too (9.4.2.2: no part of the path to a visible object may be protected).
+    bool insideProtected(const slang::ast::Scope* sc) const {
+        while (sc) {
+            const slang::ast::Symbol& sy = sc->asSymbol();
+            if (sy.kind == slang::ast::SymbolKind::InstanceBody) {
+                const auto* inst = sy.as<slang::ast::InstanceBodySymbol>().parentInstance;
+                if (!inst) return false;
+                if (hidden(inst->getDefinition().location)) return true;
+                sc = inst->getParentScope();
+            } else {
+                sc = sy.getParentScope();
+            }
+        }
+        return false;
+    }
     bool visible(const slang::ast::Symbol& s) const {
         const Envelope* e = envelopeAt(s.location);
-        if (!e) return true;
+        if (!e) return !insideProtected(s.getParentScope());
         std::string vis = e->right("visibility", "none");
         if (vis == "full") return true;
         const slang::ast::InstanceBodySymbol* body = nullptr;
@@ -278,12 +304,24 @@ inline bool preload(slang::driver::Driver& driver, const Options& o, ProtectedCo
         for (auto& k : o.keyrings) ring.loadFile(k);
         for (auto& k : o.keyfiles) ring.add(k);
         protect::DecryptOptions dopt;
-        dopt.license = [&o](const std::string& f) -> std::optional<std::string> {
-            auto it = o.licenses.find(f);
-            if (it == o.licenses.end()) return std::nullopt;
-            return it->second;
-        };
         dopt.warn = [tool](const std::string& m) { std::cerr << tool << ": warning: " << m << "\n"; };
+        // The license system (1735 clause 8): one client for the run, so a
+        // proxy connection is shared by the envelopes that name it (8.3) and
+        // a repeated call is answered from the first reply (8.6).
+        licproxy::Client proxy;
+        proxy.info = [tool](const std::string& m) { std::cerr << tool << ": license proxy: " << m << "\n"; };
+        std::set<std::string> reported;
+        dopt.proxy = [&](const protect::LicenseSpec& spec, const std::string& arg) -> protect::LicenseValue {
+            licproxy::Reply r = proxy.check(licproxy::Spec{spec.env, spec.certDer}, arg);
+            if (r.irregular) {
+                // 8.9: stop, or go on as if the call returned false / "".
+                if (o.licenseStop) throw protect::Error("license check failed: " + r.why);
+                if (reported.insert(r.why).second)
+                    std::cerr << tool << ": warning: license check failed (" << r.why
+                              << "); licensed rights are denied\n";
+            }
+            return {r.granted, r.str};
+        };
         for (auto& [path, text] : found) {
             std::string shown = fs::proximate(path).string();
             protect::Decrypted d;

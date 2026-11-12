@@ -346,6 +346,8 @@ struct Rt {
             addIds(r.r->restorePeriodCond, scopeOfName(r.r->domain));
             addIds(r.r->powerdownCond, scopeOfName(r.r->domain));
         }
+        bindHdlPorts(lw);
+        for (auto& h : hdlPorts) if (h.vct->hdl2upf) w.insert(h.sig);
         for (int s : w) watch.push_back({s, ANY});
         chkSig = S.sig("$upf.check", 1);
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
@@ -433,6 +435,96 @@ struct Rt {
             if (!low) { np.port = dn; np.portDir = dir; }
             lw.procs.push_back(std::move(np));
             note("logic net " + m.design(lc.net) + (portDrives ? " <- " : " -> ") + dn);
+        }
+    }
+
+    // ------------------------------------------- HDL ports on supply nets
+    // connect_supply_net to a port of the design that is not a UPF supply
+    // port (4.10): a value conversion table turns the port's logic value
+    // into the net's supply state (hdl2upf, the port drives the net) or the
+    // net's state into the port's value (upf2hdl, the net drives the port).
+    // Without -vct an output port drives the net through SV_LOGIC2UPF and
+    // an input port is driven through UPF2SV_LOGIC (Annex B).
+    struct HdlPort {
+        int sig = -1;
+        std::string net, port;
+        const Vct* vct = nullptr;
+        int last = -1;   // upf2hdl: the value held on the port
+    };
+    std::vector<HdlPort> hdlPorts;
+    void bindHdlPorts(LowerResult& lw) {
+        std::map<std::string, int> dirOf;   // instance port (simulator name) -> 0 input, 1 output, 2 inout
+        for (auto& lp : lw.procs)
+            if (!lp.port.empty()) dirOf[lp.port] = lp.portDir;
+        for (auto& [net, ps] : m.connects)
+            for (auto& p : ps) {
+                if (isSupply(p)) continue;
+                auto key = std::make_pair(net, p);
+                std::string where = m.connectWhere.count(key) ? m.connectWhere.at(key) : "";
+                auto named = m.connectVct.find(key);
+                int s = sigOf(p);
+                if (s < 0) {
+                    if (named != m.connectVct.end())
+                        throw Error(where + ": connect_supply_net " + net + ": no port '" + m.design(p) + "' in the design");
+                    continue;
+                }
+                HdlPort h;
+                h.sig = s;
+                h.net = net;
+                h.port = p;
+                auto d = dirOf.find(S.sigs[(size_t)s].name);
+                int dir = d == dirOf.end() ? -1 : d->second;
+                if (named != m.connectVct.end()) {
+                    h.vct = m.vct(named->second);
+                    if ((dir == 0 && h.vct->hdl2upf) || (dir == 1 && !h.vct->hdl2upf))
+                        throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) + " is an " +
+                                    (dir == 0 ? "input" : "output") + " port, but " + h.vct->name + " converts " +
+                                    (h.vct->hdl2upf ? "an HDL value to a supply state" : "a supply state to an HDL value"));
+                } else if (dir == 0 || dir == 1) {
+                    h.vct = m.vct(dir == 1 ? "SV_LOGIC2UPF" : "UPF2SV_LOGIC");
+                } else {
+                    throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) +
+                                " is not an input or output port of an instance; name a value conversion table with -vct");
+                }
+                if (S.sigs[(size_t)s].w != 1)
+                    throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) + " is " +
+                                std::to_string(S.sigs[(size_t)s].w) + " bits wide; a value conversion table converts one bit");
+                note(std::string("supply net ") + net + (h.vct->hdl2upf ? " is driven by " : " drives ") + m.design(p) +
+                     " through " + h.vct->name);
+                hdlPorts.push_back(h);
+            }
+        std::map<std::string, std::string> drivers;
+        for (auto& h : hdlPorts) {
+            if (!h.vct->hdl2upf) continue;
+            std::string r = root(h.net);
+            if (swOf.count(r))
+                throw Error("supply net " + h.net + " is driven by the HDL port " + m.design(h.port) + " and by the power switch " +
+                            swOf[r][0]);
+            if (!drivers.emplace(r, h.port).second)
+                throw Error("supply net " + h.net + " is driven by two HDL ports (" + m.design(drivers[r]) + ", " + m.design(h.port) + ")");
+        }
+    }
+    // The HDL ports that drive supply nets: their value is the root supply.
+    void readHdlPorts() {
+        for (auto& h : hdlPorts) {
+            if (!h.vct->hdl2upf) continue;
+            Val v = S.get(h.sig);
+            char c = (v.z & 1) ? 'Z' : (v.x & 1) ? 'X' : (v.v & 1) ? '1' : '0';
+            SupplyVal sv;
+            sv.st = h.vct->toUpf(c);
+            drv[root(h.net)] = sv;
+        }
+    }
+    // The HDL ports that supply nets drive: held at the converted value.
+    void driveHdlPorts() {
+        for (auto& h : hdlPorts) {
+            if (h.vct->hdl2upf) continue;
+            auto it = val.find(root(h.net));
+            char c = h.vct->toHdl(it == val.end() ? S_OFF : it->second.st);
+            if (c == h.last) continue;
+            h.last = c;
+            bool one = c == '1' || c == 'H', zero = c == '0' || c == 'L', z = c == 'Z';
+            S.holdOn(h.sig, konst(make(one ? 1 : 0, one || zero || z ? 0 : 1, 1, z ? 1 : 0)), true);
         }
     }
 
@@ -1051,7 +1143,9 @@ struct Rt {
 
     bool checkArmed = false;
     void evaluate() {
+        readHdlPorts();
         evalSupplies();
+        driveHdlPorts();
         evalSets();
         evalDomainStates();
         evalGroups();

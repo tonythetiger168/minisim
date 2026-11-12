@@ -47,6 +47,7 @@ turned on.
 |---|---|
 | `create_power_domain` (`-elements`, `-include_scope`, `-exclude_elements`, `-supply`) | each instance belongs to the domain with the closest element above it |
 | `create_supply_port`, `create_supply_net` (`-domain`, `-resolve`), `connect_supply_net`, `create_supply_set`, `associate_supply_set`, `set_domain_supply_net` | supply subnets with a state (`OFF`, `FULL_ON`, `PARTIAL_ON`, `UNDETERMINED`) and a voltage (9.2.3) |
+| `connect_supply_net` to an HDL port, `-vct`, `create_hdl2upf_vct`, `create_upf2hdl_vct` (4.10, Annex B) | a supply net connected to a one-bit port of the design that is not a UPF supply port: an output port drives the net (its logic value becomes the supply state), an input port is driven by the net (held at the converted state). The twelve predefined tables of Annex B (`SV_LOGIC2UPF`, `UPF2SV_LOGIC`, the `_GNDZERO` and `VHDL_` ones, `SV_TIED_HI`, ...) and tables of the power intent's own. Without `-vct`: `SV_LOGIC2UPF` for an output, `UPF2SV_LOGIC` for an input |
 | `create_power_switch` | `-on_state`, `-on_partial_state`, `-off_state`, `-error_state`, `-ack_port` with `-ack_delay`, the output value rules of 6.23; several switches on a `-resolve parallel` / `one_hot` net |
 | `add_power_state` on a supply set | `-supply_expr`, `-logic_expr`, `-simstate`, `-illegal`, `-complete`; predefined `ON` (all functions `FULL_ON`) and `OFF` (9.3.2) |
 | `add_power_state` on a domain | `-logic_expr` over power states of other objects and logic nets; an `-illegal` state, two states at once, or no state with `-complete` is reported |
@@ -60,7 +61,8 @@ turned on.
 | `add_state_transition` (6.7, 9.4) | named transitions of a supply set, domain or group (`-from` / `-to`, `-paired`, `-update`): an `-illegal` transition is an error, and with `-complete` so is one that is not named; `UNDEFINED` is passed through; `-upf_verbose` prints each named transition |
 | `create_power_state_group` (6.22) | `add_power_state -group`: the legal combinations of other objects' power states; an `-illegal` state, two states at once, or no state with `-complete` is reported |
 | `create_pst`, `add_port_state`, `add_pst_state` (legacy) | when a time step settles, the supplies must match a row of every PST |
-| `upf_version`, `set_scope`, `set_design_top`, `load_upf`, Tcl `set` and `$var` | yes |
+| `upf_version`, `set_scope`, `set_design_top`, `load_upf` | yes |
+| Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
 
 `initial` blocks are never gated, so testbench and model initialization code
 keeps running in a powered-off domain (9.2.1). Errors print as
@@ -77,9 +79,9 @@ other implementation commands are read and ignored with a note.
 Isolation and level shifters sit on port connections between a parent and a
 child instance; a strategy on a port of the simulation top itself, or on a
 hierarchical reference, has no cell. `-applies_to flop` / `latch` of a
-retention strategy are not told apart. Supply ports connected to HDL ports
-(VCTs, 4.10), Tcl command substitution `[...]`, `foreach` and procedures are
-not supported.
+retention strategy are not told apart. A supply net driven from an HDL port has a state and no voltage. HDL
+ports of the package's `supply_net_type` and `create_vcm` are not supported. Tcl
+has no `namespace`, `upvar`, `regexp` or file I/O.
 
 ## Static checks: `mlint -upf`
 
