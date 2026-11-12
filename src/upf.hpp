@@ -646,6 +646,13 @@ struct SupplyConn {
     bool hasElements = false, transitive = true;
     std::vector<std::pair<std::string, std::string>> connect;   // function, pg_type
 };
+// connect_supply_net -pg_type (6.14): the net goes to every port of the
+// selected instances whose pg_type is in the list, once the design is known.
+struct PgConnect {
+    std::string net, scope, domain, where;
+    std::vector<std::string> pgTypes, cells, elements;
+    const struct Vcm* vcm = nullptr;
+};
 // set_simstate_behavior (6.56) for models or instances.
 struct SimBehavior {
     std::string mode, lib, scope, where;
@@ -773,6 +780,7 @@ struct Model {
     std::map<std::string, Vcm> vcms;                             // "lib::name"
     mutable std::map<std::string, Vcm> builtinVcms;              // Annex B tables and legacy VCTs as VCMs
     std::map<std::pair<std::string, std::string>, const Vcm*> connectVcm;   // {net, port} -> connect_supply_net -vcm
+    std::vector<PgConnect> pgConnects;                           // connect_supply_net -pg_type
     // A VCM named in `scope` (or in the library being created): "lib::name",
     // ".::name" (this library), "IEEE::name", or a simple name visible here.
     const Vcm* findVcm(const std::string& name, const std::string& scope, const std::string& where) const {
@@ -872,6 +880,18 @@ struct Model {
     std::map<std::string, std::string> globalAttrs;
     std::vector<Pst> psts;
     std::string version;
+    // Implementation-only commands (6.37 to 6.41, 6.43, 6.57, 6.62, clause 7), checked and kept.
+    struct ImplCmd {
+        std::string cmd, scope, where;
+        std::vector<std::string> pos;
+        std::multimap<std::string, std::string> opts;
+    };
+    std::vector<ImplCmd> implCmds;
+    std::map<std::string, std::string> nameFormat;                  // name_format affix -> pattern
+    struct Variation { double lo = 1, hi = 1; std::string where; };
+    std::map<std::string, Variation> variations;                    // set_variation: supply -> range
+    std::vector<std::pair<bool, std::vector<std::string>>> correlated;   // set_correlated: {nets?, names}
+    bool implCommand(const Cmd& c, const std::string& scope);
     std::vector<std::string> warnings;
 
     // ---- names ----
@@ -1373,6 +1393,8 @@ struct Model {
     void run(const std::vector<Cmd>& cmds, std::string& scope, Reader& r, const std::string& file);
 };
 
+#include "upf_impl.inc"
+
 inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader& rd, const std::string& file) {
     for (const Cmd& c : cmds) {
         const std::string& n = c.w[0];
@@ -1504,6 +1526,27 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 // the VCM in use in this command's scope, wherever the port is (4.10.2)
                 vm = findVcm(o.get("-vcm"), scope, c.where());
                 if (!vm) throw Error(c.where() + ": connect_supply_net -vcm: no VCM '" + o.get("-vcm") + "' (6.14)");
+            }
+            bool sel = o.has("-pg_type") || o.has("-cells") || o.has("-domain") || o.has("-elements");
+            if (o.has("-ports") && sel)
+                throw Error(c.where() + ": connect_supply_net -ports cannot go with -pg_type, -cells, -domain or -elements (6.14)");
+            if (!o.has("-ports") && !o.has("-pg_type")) throw Error(c.where() + ": connect_supply_net needs -ports or -pg_type (6.14)");
+            if (o.has("-pg_type")) {
+                if (!o.has("-cells") && !o.has("-domain") && !o.has("-elements"))
+                    throw Error(c.where() + ": connect_supply_net -pg_type needs -cells, -domain or -elements (6.14)");
+                PgConnect pc;
+                pc.net = net;
+                pc.scope = scope;
+                pc.where = c.where();
+                for (auto& t : o.list("-pg_type")) pc.pgTypes.push_back(t);
+                pc.cells = o.list("-cells");
+                for (auto& e : o.list("-elements")) pc.elements.push_back(join(scope, e));
+                if (o.has("-domain")) {
+                    pc.domain = join(scope, o.get("-domain"));
+                    if (!domains.count(pc.domain)) throw Error(c.where() + ": connect_supply_net -domain: no power domain " + o.get("-domain"));
+                }
+                pc.vcm = vm;
+                pgConnects.push_back(pc);
             }
             for (auto& p : o.list("-ports")) {
                 std::string port = join(scope, p);
@@ -2989,16 +3032,10 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             t->rows.push_back(r);
             continue;
         }
+        if (implCommand(c, scope)) continue;
         // Accepted and not needed for simulation.
         static const std::set<std::string> ignored = {
-            "map_isolation_cell", "map_level_shifter_cell",
-            "map_retention_cell", "map_power_switch", "use_interface_cell", "name_format", 
-            "set_variation", "set_correlated", 
-            
-
-            "set_retention_control", "define_isolation_cell", "define_level_shifter_cell",
-            "define_retention_cell", "define_power_switch_cell", "define_always_on_cell", "define_diode_clamp",
-            "map_retention_clamp_cell", "map_repeater_cell", "set_pin_related_supply",
+            "map_isolation_cell", "map_level_shifter_cell", "set_retention_control", "set_pin_related_supply",
             "set_related_supply_net", "query_upf", "add_parameter"};
         if (ignored.count(n)) {
             warnings.push_back(c.where() + ": " + n + " is accepted and has no effect in simulation");
