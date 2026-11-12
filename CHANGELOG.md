@@ -963,6 +963,12 @@ Spec references are IEEE 1800-2023 clauses.
   state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
+- A function that writes part-selects of its result or of a local in a
+  loop, called from two continuous assignments or always_comb blocks, hung
+  msim at time 0: each caller was sensitive to the function's own variables,
+  so the callers woke each other forever. Callers are now sensitive only to
+  their operands (10.3.2, 9.2.2.2.1). Five open-ip-portfolio IPs that timed
+  out after 600 s now pass in 2 to 101 s (AES_GCM 27.5 s; Icarus 30 s).
 - `c ? q.pop_front() : d` (and `pop_back`) runs the pop only in the chosen
   arm, after the condition (11.4.11). It used to pop first, so a condition
   on `q.size()` popping the last element gave `d` and lost the element.

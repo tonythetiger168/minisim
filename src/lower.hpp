@@ -12361,6 +12361,21 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
         { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);
+        if (!sub->lay) {   // its static variables: callers are not sensitive to them
+            struct Walk {
+                const std::unordered_map<const slang::ast::Symbol*, int>& sm;
+                std::vector<int>& out;
+                void scope(const slang::ast::Scope& sc) {
+                    for (const auto& m : sc.members()) {
+                        if (m.kind == slang::ast::SymbolKind::Variable || m.kind == slang::ast::SymbolKind::FormalArgument)
+                            if (auto it = sm.find(&m); it != sm.end()) out.push_back(it->second);
+                        if (m.isScope()) scope(m.as<slang::ast::Scope>());
+                    }
+                }
+            } w{sigmap, sub->prog->locals};
+            w.scope(*sub->sym);
+            if (sub->retSig >= 0) sub->prog->locals.push_back(sub->retSig);
+        }
     }
     g_covInst = 0;
     for (Subr* sub : order) patchImplicit(*sub->prog);

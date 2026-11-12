@@ -468,6 +468,11 @@ struct Prog {
     // case's violation check): the ProcCtl its reports are queued under.
     // Each evaluation is a flush point (16.4.2), as the wait of the process is.
     mutable std::shared_ptr<void> combCtl;
+    // A subroutine's own variables (arguments, result, locals) when they are
+    // static signals. A process that calls it is not sensitive to them
+    // (9.2.2.2.1: not what is declared within a called function; 10.3.2: the
+    // operands of the right-hand side).
+    std::vector<int> locals;
     size_t emit(Instr i) {
         if (!i.line) { i.file = g_emitLoc.file; i.line = g_emitLoc.line; }
         if (code.empty()) covInst = g_covInst;
@@ -536,8 +541,12 @@ inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
     std::vector<int> sigs;
     std::vector<const Prog*> seen;
     collectProgRefs(p, sigs, seen);
+    std::unordered_set<int> own;
+    for (const Prog* q : seen)
+        if (q != &p) own.insert(q->locals.begin(), q->locals.end());
     std::vector<std::pair<int, Edge>> ev;
-    for (int s : sigs) ev.push_back({s, ANY});
+    for (int s : sigs)
+        if (!own.count(s)) ev.push_back({s, ANY});
     return ev;
 }
 // Signals a process (or a subroutine it calls) writes whole: an assignment
