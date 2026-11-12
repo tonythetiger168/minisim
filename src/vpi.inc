@@ -114,6 +114,7 @@ struct State {
     struct Put { const Obj* o; Val v; Obj* ev; };
     std::multimap<uint64_t, Put> puts;
     std::vector<Cb*> holdCbs;             // cbForce, cbRelease, cbAssign, cbDeassign (38.36.1)
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<Cb*>> stmtCbs;   // cbStmt: by source file id and line
     std::vector<Cb*> nbaCbs, endSlot;     // cbNBASynch, cbAtEndOfSimTime of this time slot (38.36.2)
     int mode = vpiMode1800v2009;          // the compatibility mode of the running call (36.12)
     std::vector<char> arrBuf;             // vpi_get_value_array without vpiUserAllocFlag
@@ -134,6 +135,7 @@ struct State {
     std::vector<std::string> mcdName = std::vector<std::string>(32);
 };
 inline State& st() { static State s; return s; }
+inline bool markStmt(const Obj* o, Cb* c);   // vpi_code.inc
 
 inline vpiHandle H(Obj* o) { return reinterpret_cast<vpiHandle>(o); }
 inline Obj* O(vpiHandle h) { return reinterpret_cast<Obj*>(h); }
@@ -1557,6 +1559,7 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
     auto& s = st();
     s.comp = &comp;
     s.lr = &lr;
+    covInit();   // also the process list cbStmt uses
     vpiCallHook() = callSite;
     S.vpiChange = onChange;
     S.vpiRegion = onRegion;
@@ -1569,7 +1572,6 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
         s.cur = nullptr;
     }
     assertHook() = onAssert;
-    covInit();
     fireList(s.endCompile);
     fireList(s.start);
     fireSys(cbAssertionSysInitialized);   // 39.4.1
@@ -1690,6 +1692,20 @@ vpiHandle vpi_register_cb(p_cb_data d) {
             s.holdCbs.push_back(c);
             S.vpiHoldCb = vpi::onHold;
             break;
+        case cbStmt: {   // 38.36.1: each time the statement runs
+            Obj* o = c->obj;
+            if (!o || (o->kind != Obj::Stmt && o->kind != Obj::ExprStmt) || vpi::isProt(o)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbStmt needs a statement handle (not protected)");
+                return nullptr;
+            }
+            if (!vpi::markStmt(o, c)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: the statement has no code msim runs");
+                return nullptr;
+            }
+            break;
+        }
         case cbNBASynch:
         case cbAtEndOfSimTime:   // 38.36.2: in this time slot, or `delay` from now
             if (delay == 0) {

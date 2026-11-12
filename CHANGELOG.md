@@ -543,6 +543,7 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI `cbStmt` (38.36.1): a callback each time a statement runs.
 - VPI processes, statements and expressions (37.32 to 37.51):
   `vpi_iterate(vpiProcess / vpiContAssign, module)`, the statement tree
   (blocks, assignments, if, case and case items, loops, delay and event

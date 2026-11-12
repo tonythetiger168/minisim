@@ -208,7 +208,11 @@ it lands. `cbForce`, `cbRelease`, `cbAssign` and `cbDeassign` fire on
 updates of its time slot, `cbAtEndOfSimTime` at its end, before
 `cbReadOnlySynch`. `vpi_get_delays` / `vpi_put_delays` read and change the
 rise, fall and turn-off delays of a net declared with a delay (28.16), as
-ticks or scaled time, with `mtm_flag` and `append_flag`.
+ticks or scaled time, with `mtm_flag` and `append_flag`. `cbStmt` on a
+statement handle calls back each time the statement runs, with the
+statement as `obj`; msim finds the statement's code by its source line, so
+two statements on one line (`#2 n = n + 1;` is a delay control and an
+assignment) share the callback.
 
 **Other routines.** `vpi_printf`, `vpi_vprintf`, `vpi_mcd_open`,
 `vpi_mcd_close`, `vpi_mcd_name`, `vpi_mcd_printf`, `vpi_flush`,
@@ -231,14 +235,14 @@ Class objects, unpacked structs, dynamic arrays, queues and associative
 arrays, the value of a non-constant expression, drivers and loads,
 instance arrays as objects, delays of anything but a net (primitives,
 continuous assignments, module paths, timing checks), `vpi_handle_multi`,
-`cbStmt`, `cbTchkViolation`, `cbError` / `cbPLIError`, interactive mode
+`cbTchkViolation`, `cbError` / `cbPLIError`, interactive mode
 callbacks, and save / restart / reset. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
