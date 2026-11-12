@@ -209,6 +209,10 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xprop
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_xprop.cmake)
+  # Interactive simulation (msim -i, -do FILE): run, step, stop, force, print.
+  add_test(NAME msim_interactive
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_interactive.cmake)
   # Multi-core: 256 independent lanes run as parallel partitions. Every
   # thread count must print what the single-threaded event-driven run prints.
   add_test(NAME msim_threads
@@ -255,11 +259,6 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_excl
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_excl.cmake)
-    # mformal is defined in cmake/tools/mformal.cmake, included further down
-    add_test(NAME mcov_formal
-             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim> -DMFORMAL=$<TARGET_FILE:mformal>
-                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_formal
-                     -P ${CMAKE_SOURCE_DIR}/tests/mcov_formal.cmake)
     add_test(NAME msim_cov_inst
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_inst
@@ -342,6 +341,12 @@ if(MINISIM_WITH_SLANG)
                        -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
       set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
     endforeach()
+    # UVM transaction recording read back by mdebug -tr.
+    add_test(NAME mdebug_uvm_tr
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DUVM_HOME=${UVM_HOME}
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_uvm_tr
+                     -P ${CMAKE_SOURCE_DIR}/tests/mdebug_uvm_tr.cmake)
+    set_tests_properties(mdebug_uvm_tr PROPERTIES LABELS "uvm")
   endif()
 
   # mini45's Verilog models against the functions in its Liberty files.

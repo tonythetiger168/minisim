@@ -544,6 +544,7 @@ struct Pin {
     std::string function, threeState;
     bool clock = false;
     double maxTransition = -1, maxCapacitance = -1;
+    double minPulseHigh = -1, minPulseLow = -1, minPeriod = -1;  // seconds; -1: none
     std::string bus;  // the bus it is a bit of, or ""
     int busBit = -1;
     std::string signalType;  // test_cell pins: test_scan_in, test_scan_enable ...
@@ -957,6 +958,9 @@ struct Library {
             p.clock = gs("clock") == "true";
             if (get("max_transition")) p.maxTransition = std::atof(gs("max_transition").c_str()) * L.timeScale;
             if (get("max_capacitance")) p.maxCapacitance = std::atof(gs("max_capacitance").c_str()) * L.capScale;
+            if (get("min_pulse_width_high")) p.minPulseHigh = std::atof(gs("min_pulse_width_high").c_str()) * L.timeScale;
+            if (get("min_pulse_width_low")) p.minPulseLow = std::atof(gs("min_pulse_width_low").c_str()) * L.timeScale;
+            if (get("min_period")) p.minPeriod = std::atof(gs("min_period").c_str()) * L.timeScale;
             p.signalType = gs("signal_type");
             for (auto* ig : pg.all("internal_power")) {
                 PowerArc pa;

@@ -304,6 +304,11 @@ struct Sim {
     vector<Sig> sigs;
     vector<vector<Waiter>> waiters;                  // dynamic sensitivity
     vector<Handle> all;                              // owned coroutines
+    // Assertion action blocks (16.14.3) not yet run: most finish on their
+    // first resume and are freed then, so a pass action that runs on every
+    // clock does not keep one coroutine per run until the end (gigabytes in
+    // a long run). One that waits joins `all`.
+    std::unordered_set<void*> oneShot;
     deque<Handle> active, inactive;                  // active / inactive regions
     struct NbaItem { int s; Val v; int hi, lo; };    // hi < 0: whole signal
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
@@ -910,6 +915,7 @@ struct Sim {
 
     ~Sim() {
         for (auto h : all) h.destroy();
+        for (void* p : oneShot) Handle::from_address(p).destroy();
         closeWaves();
     }
     void closeWaves() {
@@ -2555,6 +2561,12 @@ struct Sim {
                     region = R_REACTIVE;
                     if (!h.done()) h.resume();
                     region = R_ACTIVE;
+                    if (!oneShot.empty())
+                        if (auto it = oneShot.find(h.address()); it != oneShot.end()) {
+                            oneShot.erase(it);
+                            if (h.done()) h.destroy();
+                            else all.push_back(h);
+                        }
                 } else if (!reInactive.empty()) {          // re-inactive (#0 in the reactive set)
                     for (auto h : reInactive) reactive.push_back(h);
                     reInactive.clear();
@@ -2713,7 +2725,8 @@ struct Sim {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t));
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t)) ||
+                       !active.empty() || !seqq.empty() || !nbaq.empty();   // work queued between slots (msim -i: force, deposit)
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);
