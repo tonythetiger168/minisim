@@ -543,6 +543,9 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI `vpi_control(vpiCoverageMerge, type, name)` (40.5.1): adds the
+  statement, toggle, FSM or assertion counts of a saved msim coverage
+  database to the current run. `tests/spec/40-vpi-coverage-merge.sv`.
 - VPI `vpi_handle_multi(vpiInterModPath, out, in)` (38.21): the path
   between two instance ports on one net, its ports, and its interconnect
   delay through `vpi_get_delays` / `vpi_put_delays`.

@@ -1552,6 +1552,7 @@ inline void covReset(int type, const InstanceSymbol* inst, const Obj* a) {
             if (!inst || sigInst(fsmDefs()[k].sig) == inst) { S.fsmSeen[k].clear(); S.fsmTrans[k].clear(); }
     }
 }
+#include "vpi_covmerge.inc"
 // vpi_control for coverage (40.5.1): vpiCoverageStart / Stop / Reset /
 // Check with a coverage type and an instance or assertion handle (null: the
 // whole design); vpiCoverageSave / Merge with a coverage type and a name.
@@ -1570,10 +1571,7 @@ inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
     if (op == vpiCoverageSave || op == vpiCoverageMerge) {
         const char* name = va_arg(ap, const char*);
         if (!name || !*name) { error(vpiError, "vpi_control: coverage save / merge needs a database name"); return 0; }
-        if (op == vpiCoverageMerge) {
-            error(vpiWarning, "vpi_control: vpiCoverageMerge is not supported (merge saved databases with mcov merge)");
-            return 0;
-        }
+        if (op == vpiCoverageMerge) return covMerge(type, name) ? 1 : 0;
         if (!covSaveHook() || !covSaveHook()(name)) { error(vpiError, std::string("vpi_control: cannot write coverage to ") + name); return 0; }
         return 1;
     }
