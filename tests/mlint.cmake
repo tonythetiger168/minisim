@@ -325,4 +325,22 @@ execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/lint.sv -top t -Werror -quiet
 if(NOT rc EQUAL 1 OR out MATCHES "findings")
   message(FATAL_ERROR "-Werror -quiet: rc=${rc}\n${out}")
 endif()
+# CDC009: a pulse from a fast clock into a slow one is reported; a toggle
+# (pulse synchronizer) and a slow-to-fast pulse are not. Periods come from
+# create_clock, and from the master for a generated clock.
+foreach(sdc cdc_pulse cdc_pulse_div)
+  run(cdc_pulse.sv "-top;cdc_pulse;-only;cdc;-sdc;${SRC}/tests/lint/${sdc}.sdc")
+  if(NOT out MATCHES "\\[CDC009\\] 'cdc_pulse.pulse_f' \\(clocked by cdc_pulse.fclk\\) is read by logic clocked by cdc_pulse.sclk"
+     OR NOT out MATCHES "1 finding \\(CDC009 1\\)")
+    message(FATAL_ERROR "cdc_pulse.sv -sdc ${sdc}.sdc:\n${out}")
+  endif()
+endforeach()
+if(NOT out MATCHES "period 2 into one of period 12")
+  message(FATAL_ERROR "cdc_pulse.sv: generated clock period:\n${out}")
+endif()
+# Without periods there is nothing to compare.
+run(cdc_pulse.sv "-top;cdc_pulse;-only;cdc")
+if(NOT out MATCHES "0 findings")
+  message(FATAL_ERROR "cdc_pulse.sv without -sdc:\n${out}")
+endif()
 message(STATUS "mlint: ok")
