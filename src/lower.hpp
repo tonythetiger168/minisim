@@ -3344,7 +3344,7 @@ struct Lowerer {
         std::vector<const slang::ast::Expression*> idx;
         bool constant = true;
     };
-    std::optional<ArrSel> arraySel(const slang::ast::Expression& e) {
+    std::optional<ArrSel> arraySel(const slang::ast::Expression& e, bool partial = false) {
         using namespace slang::ast;
         std::vector<const Expression*> idx;
         const Expression* cur = &e;
@@ -3378,9 +3378,43 @@ struct Lowerer {
         ArrSel s;
         s.a = shape;
         s.idx.assign(idx.rbegin(), idx.rend());
-        if (s.idx.size() != s.a->dims.size()) unsupported("array slice (fewer indices than dimensions)");
+        if (s.idx.size() > s.a->dims.size() || (!partial && s.idx.size() != s.a->dims.size()))
+            unsupported("array slice (fewer indices than dimensions)");
         for (auto* x : s.idx)
             if (!(x->kind == ExpressionKind::IntegerLiteral || x->getConstant())) s.constant = false;
+        return s;
+    }
+    // m[i] of a multidimensional array (7.4.5): the index lists of the
+    // elements of that sub-array, in row-major order. The given indices come
+    // first; the rest run over the remaining dimensions, left to right.
+    std::vector<std::vector<E>> subArrayIdx(const ArrSel& s) {
+        std::vector<E> pre;
+        for (auto* x : s.idx) pre.push_back(expr(*x));
+        size_t fixed = s.idx.size(), nd = s.a->dims.size();
+        int64_t cnt = 1;
+        for (size_t d = fixed; d < nd; d++) { auto [l, r] = s.a->dims[d]; cnt *= (l > r ? l - r : r - l) + 1; }
+        std::vector<std::vector<E>> out;
+        for (int64_t k = 0; k < cnt; k++) {
+            std::vector<E> idx = pre;
+            idx.resize(nd);
+            int64_t rest = k;
+            for (size_t d = nd; d-- > fixed;) {
+                auto [l, r] = s.a->dims[d];
+                int64_t n = (l > r ? l - r : r - l) + 1, o = rest % n;
+                rest /= n;
+                idx[d] = konst(make((uint64_t)(l <= r ? l + o : l - o), 0, 32, 0, true));
+            }
+            out.push_back(std::move(idx));
+        }
+        return out;
+    }
+    std::optional<ArrSel> subArraySel(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        if (x.kind != ExpressionKind::ElementSelect || !x.type->isUnpackedArray() ||
+            x.type->getCanonicalType().kind != SymbolKind::FixedSizeUnpackedArrayType)
+            return std::nullopt;
+        auto s = arraySel(x, true);
+        if (!s || s->idx.size() >= s->a->dims.size() || s->a->dynElem) return std::nullopt;
         return s;
     }
     // The element values of an unpacked-array value of type t, flattened in
@@ -3403,6 +3437,14 @@ struct Lowerer {
         const Type& et = ft.elementType;
         int64_t n = (int64_t)ft.range.width();
         const Expression& x = peel(x0);
+        if (auto sa = subArraySel(x)) {   // m[i]: a sub-array of a multidimensional array (7.4.5)
+            for (auto& idx : subArrayIdx(*sa)) {
+                auto rd = node(Op::ArrRead, std::move(idx));
+                rd->arr = sa->a;
+                out.push_back(rd);
+            }
+            return;
+        }
         if (isDynType(*x.type)) {   // fa = q (7.6): elements left to right; the size is checked by the caller
             const Type& set = x.type->getArrayElementType()->getCanonicalType();
             const Type& ec = et.getCanonicalType();
@@ -3583,6 +3625,26 @@ struct Lowerer {
     bool assignWholeArray(const slang::ast::Expression& l0, const slang::ast::Expression& rhs, bool nba) {
         using namespace slang::ast;
         const Expression& l = peel(l0);
+        if (auto sa = subArraySel(l)) {   // m[i] = ... (7.4.5, 7.6): every element of the sub-array
+            std::vector<E> vals;
+            arrayElems(*l.type, rhs, vals);
+            auto idxs = subArrayIdx(*sa);
+            if (vals.size() != idxs.size()) unsupported("array value with the wrong number of elements");
+            for (auto& v : vals) {   // every value first: m[1] = m[0] then m[0] = m[1] reads before writing
+                if (v->op == Op::Const && !nba) continue;
+                int tmp = fresh(sa->a->elemW);
+                Instr h; h.k = IK::Assign; h.sig = tmp; h.e = v;
+                prog.emit(h);
+                v = ref(tmp, sa->a->sgn);
+            }
+            for (size_t k = 0; k < idxs.size(); k++) {
+                Instr i; i.k = nba ? IK::Nba : IK::Assign;
+                i.sig = sa->a->base; i.arr = sa->a; i.e = vals[k];
+                i.aidx = std::move(idxs[k]);
+                xpDirect(i);
+            }
+            return true;
+        }
         if (classMember(l) && l.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {   // h.a = '{...} (8.4)
             const auto& m = l.as<MemberAccessExpression>();
             const PropSlot* ps = memberSlot(m);
@@ -5048,7 +5110,7 @@ struct Lowerer {
                     if (n < 1 || n > (int64_t)ts.size()) unsupported("production value index out of range");
                     return sized(ref(ts[(size_t)n - 1], e.type->isSigned()), storeW(*e.type), e.type->isSigned(), ctx);
                 }
-                if (int d = dynSig(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key]
+                if (int d = dynValue(e.as<ElementSelectExpression>().value()); d >= 0) {   // q[i], aa[key], a.max()[0]
                     int w = bitsOf(*e.type);
                     needWidth(w);
                     return sized(dynGet(d, e.as<ElementSelectExpression>().selector()), w, e.type->isSigned(), ctx);
@@ -6454,7 +6516,14 @@ struct Lowerer {
                     for (int64_t k = 0; k < dims[dim]; k++) {
                         if (k) fmt += ", ";
                         if (dim + 1 < dims.size()) walk(dim + 1);
-                        else if (flat < el.size()) pfmtSingular(*et, el[flat++], fmt, out);
+                        else if (flat < el.size()) {
+                            E v = el[flat++];
+                            if (v->op == Op::Ref || v->op == Op::ArrRead) {   // an element's raw bits
+                                if (et->isFloating()) v = un(Op::AsReal, v);
+                                else if (et->isString()) v = un(Op::AsStr, v);
+                            }
+                            pfmtSingular(*et, v, fmt, out);
+                        }
                     }
                     fmt += "}";
                 };
@@ -6473,6 +6542,8 @@ struct Lowerer {
                     if (k) fmt += ", ";
                     if (dim + 1 < A.dims.size()) walk(dim + 1);
                     else if (et->isUnpackedStruct() || et->isUnpackedUnion()) pfmtStruct(*et, ref(A.base + flat++), fmt, out);
+                    else if (et->isString()) pfmtSingular(*et, un(Op::AsStr, ref(A.base + flat++)), fmt, out);
+                    else if (et->isFloating()) pfmtSingular(*et, un(Op::AsReal, ref(A.base + flat++)), fmt, out);
                     else pfmtSingular(*et, ref(A.base + flat++, A.sgn), fmt, out);
                 }
                 fmt += "}";
