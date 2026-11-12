@@ -41,6 +41,7 @@ set(MINISIM_CORE_HEADERS
     sdf.hpp
     sdf_annotate.inc
     specify.hpp
+    tcl.hpp
     sva.hpp
     sva_engine.hpp
     tchk.hpp
