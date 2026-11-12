@@ -157,6 +157,7 @@
 #include "upf_rt.inc"
 #include "dpi.inc"
 #include "vpi.inc"
+#include "interactive.inc"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -1386,6 +1387,9 @@ static void usage() {
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov. -cm <metrics> (as VCS) does the same\n"
                  "  -maxtime <n>   stop after simulation time n\n"
+                 "  -i             interactive: run, step, stop on a signal, print (signals and class objects),\n"
+                 "                 force, release, deposit; commands on the standard input (help lists them)\n"
+                 "  -do <file>     the same, with the commands from a file; then the run goes on to its end\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
                  "                 and reuses <dir>/simv while the design is unchanged\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
@@ -1428,6 +1432,8 @@ int main(int argc, char** argv) {
     bool saifTmp = false;   // ...and the waveform was only written for that
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
+    bool interactiveMode = false;   // -i / -do FILE
+    std::string doPath;
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
     bool threadsGiven = false;
@@ -1455,6 +1461,8 @@ int main(int argc, char** argv) {
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
         if (a == "-compile") { compiled = true; continue; }
+        if (a == "-i" || a == "-ucli") { interactiveMode = true; continue; }
+        if (a == "-do") { doPath = next("a command file"); interactiveMode = true; continue; }
         if (a == "-no-static-comb") { staticComb = false; continue; }
         if (a == "-no-static-seq") { staticSeq = false; continue; }
         if (a == "-no-partition") { staticPart = false; continue; }
@@ -1927,6 +1935,10 @@ int main(int argc, char** argv) {
         if (!ok) { std::cerr << "msim: DPI: " << err << "\n"; return 1; }
         compiled = false;   // -compile does not run DPI calls yet
     }
+    if (compiled && interactiveMode) {
+        std::cerr << "msim: -compile: the interactive mode is not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
     if (compiled && (!pathRecs().empty() || !sdfRequests().empty() || sdfAtRunTime())) {
         std::cerr << "msim: -compile: specify path delays and SDF annotation are not compiled yet; using the interpreter\n";
         compiled = false;
@@ -2064,7 +2076,17 @@ int main(int argc, char** argv) {
         partitionInputs(lowered, pl, po, pi, pt);
         S.buildPartitions(po, pi, pt);
     }
-    S.run(maxTime);
+    if (interactiveMode) {   // msim -i: commands drive the run (interactive.inc)
+        interactive::Session ses;
+        ses.comp = comp.get();
+        ses.maxTime = maxTime;
+        if (doPath.empty()) { ses.prompt = isatty(0); ses.loop(std::cin); }
+        else {
+            std::ifstream df(doPath);
+            if (!df) { std::cerr << "msim: cannot read " << doPath << "\n"; return 2; }
+            ses.loop(df);
+        }
+    } else S.run(maxTime);
     std::vector<Task> finals = concEnd();   // strong obligations still pending fail (16.12.21)
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);

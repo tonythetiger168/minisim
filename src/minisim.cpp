@@ -2551,7 +2551,8 @@ struct Sim {
             auto it = wheel.begin();
             if (it->first > end) break;
             uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t));
+            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t)) ||
+                       !active.empty() || !seqq.empty() || !nbaq.empty();   // work queued between slots (msim -i: force, deposit)
             for (auto h : it->second)
                 if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
             wheel.erase(it);

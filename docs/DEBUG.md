@@ -329,6 +329,45 @@ the task's formals, so the fan-in cone crosses the call. `force` and the
 procedural `assign` are listed as `[..., force]` and `[..., assign]`. A net
 declared with a value (`wire n = a + b;`) is a continuous assignment.
 
+## Interactive simulation (msim -i)
+
+`msim -i` stops before time 0 and reads commands, like VCS UCLI or
+`irun -tcl`. `msim -do FILE` reads them from a file instead; when the
+commands run out, the simulation goes on to its end, so a `-do` file can
+set stops and checks and leave the rest of the run alone.
+
+```
+msim design.sv -i
+msim> stop tb.cnt == 3
+stop 1 set on tb.cnt
+msim> run
+time 35: stop 1: tb.cnt = 8'h3
+msim> print tb.head
+tb.head = item @10 { id = 32'h1, data = 8'h11, tag = "it1", next = big @16 }
+msim> print tb.head.next.id
+tb.head.next.id = 32'h2
+msim> force tb.en 0
+msim> run 30
+time 75: ran to time 75 (next event at 80)
+```
+
+| Command | What it does |
+|---|---|
+| `run [T]` | run until a stop, for `T` time units, or to the end |
+| `step [N]` | run `N` time slots (one by default) |
+| `stop SIG [posedge\|negedge\|== VALUE]` | stop when the signal changes, rises, falls, or takes the value; `stop` alone lists stops |
+| `delete N` | remove stop `N` |
+| `print NAME ...` | a signal, a class handle (class name, object id and every property, inherited ones included) or a path through handles such as `tb.head.next.id` |
+| `force SIG VALUE`, `release SIG` | as the `force` and `release` statements |
+| `deposit SIG VALUE` | set the value once; the design's next assignment overwrites it |
+| `signals [TEXT]` | list signals whose name contains `TEXT` |
+| `time`, `help`, `quit` | |
+
+Values are decimal or sized literals (`8'h40`, `4'b10x1`). Names can leave
+out the top module (`cnt` for `tb.cnt`). `-i` and `-do` use the
+interpreter, so they turn off `-compile`. Lines that start with `#` are
+comments.
+
 ## Limits
 
 - In the page, a condition that reads an `x` or `z` value is undecided
