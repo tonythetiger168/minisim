@@ -1772,6 +1772,11 @@ struct Lowerer {
                 return nullptr;
             }
         }
+        if (sym->flags.has(MethodFlags::InterfaceExtern))   // extern task of an interface: the module that exports it (25.7)
+            if (const auto* pr = sym->getPrototype(); pr && pr->getFirstExternImpl()) {
+                if (pr->getFirstExternImpl()->getNextImpl()) unsupported("extern forkjoin task with more than one export");
+                sym = pr->getFirstExternImpl()->impl;
+            }
         auto it = subs->find(sym);
         if (it == subs->end()) {
             auto sk = skippedSubs().find(sym);
@@ -3141,8 +3146,17 @@ struct Lowerer {
         }
         return nullptr;
     }
+    // A modport port with an expression (.P(r[3:0]), 25.5.4): that expression.
+    static const slang::ast::Expression* modportConn(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) return nullptr;
+        const Symbol& s = e.as<ValueExpressionBase>().symbol;
+        if (s.kind != SymbolKind::ModportPort) return nullptr;
+        return s.as<ModportPortSymbol>().explicitConnection;
+    }
     E expr(const slang::ast::Expression& e, ExprCtx ctx = {}) {
         using namespace slang::ast;
+        if (const Expression* c = modportConn(e)) return expr(*c, ctx);
         if (e.kind == ExpressionKind::NamedValue && !labelled().empty())   // a LABEL'd specparam (32.4.3)
             if (auto lv = labelled().find(&e.as<NamedValueExpression>().symbol); lv != labelled().end()) {
                 if (e.type->isFloating()) return konst(mkreal(lv->second));
@@ -3367,6 +3381,20 @@ struct Lowerer {
         const Type& et = ft.elementType;
         int64_t n = (int64_t)ft.range.width();
         const Expression& x = peel(x0);
+        if (isDynType(*x.type)) {   // fa = q (7.6): elements left to right; the size is checked by the caller
+            const Type& set = x.type->getArrayElementType()->getCanonicalType();
+            const Type& ec = et.getCanonicalType();
+            if (ec.isUnpackedArray() || !(ec.isIntegral() || ec.isFloating() || ec.isString()) || !set.isMatching(ec))
+                unsupported("fixed-size array from a container of another element type");
+            int d = dynSig(x);
+            if (d < 0) unsupported("array value");
+            for (int64_t k = 0; k < n; k++) {
+                auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
+                g->sig = d;
+                out.push_back(g);
+            }
+            return;
+        }
         switch (x.kind) {
             case ExpressionKind::SimpleAssignmentPattern:
                 for (auto* el : x.as<SimpleAssignmentPatternExpression>().elements()) arrayElems(et, *el, out);
@@ -3568,6 +3596,29 @@ struct Lowerer {
         auto ap = arrFind(&sym);
         if (!ap) return false;
         const ArrShape& A = *ap;
+        size_t skip = 0;   // the jump past the write when a container source has the wrong size
+        bool sized = false;
+        if (const auto& r = peel(rhs); isDynType(*r.type)) {
+            // fa = q (7.6): an error, and no write, unless q has as many elements
+            int d = dynSig(r);
+            if (d < 0) return false;
+            int ok = castOk >= 0 ? castOk : fresh(1);
+            Instr o; o.k = IK::Assign; o.sig = ok;
+            o.e = bin(Op::Eq, resize(dynSize(d), 32, false, false), konst(make((uint64_t)A.count, 0, 32, 0, false)));
+            prog.emit(o);
+            if (castOk < 0) {
+                Instr j; j.k = IK::JmpIfNot; j.e = un(Op::LogNot, ref(ok));
+                size_t jo = prog.emit(j);
+                Instr e; e.k = IK::Display;
+                e.fmt = "Error: assignment to a fixed-size array of " + std::to_string(A.count) +
+                        " elements from a container of another size";
+                prog.emit(e);
+                prog.code[jo].target = prog.here();
+            }
+            Instr j; j.k = IK::JmpIfNot; j.e = ref(ok);
+            skip = prog.emit(j);
+            sized = true;
+        }
         std::vector<E> vals;
         arrayElems(lt, rhs, vals);
         if ((int)vals.size() != A.count) unsupported("array value with the wrong number of elements");
@@ -3588,8 +3639,10 @@ struct Lowerer {
             Instr i; i.k = nba ? IK::Nba : IK::Assign; i.sig = A.base + k; i.e = vals[k];
             xpDirect(i);
         }
+        if (sized) prog.code[skip].target = prog.here();
         return true;
     }
+    int castOk = -1;   // set by $cast: the flag a container-to-array size check writes, instead of an error
     int64_t constOffset(const ArrSel& s) {
         std::vector<int64_t> v;
         for (auto* x : s.idx) v.push_back(constInt(*x));
@@ -5059,6 +5112,7 @@ struct Lowerer {
     // Fill i.sig (+ i.hi/i.lo for partial writes) from an assignment target.
     void lhs(const slang::ast::Expression& e, Instr& i) {
         using namespace slang::ast;
+        if (const Expression* c = modportConn(e)) { lhs(*c, i); return; }   // a modport expression (25.5.4)
         switch (e.kind) {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {
@@ -5147,7 +5201,7 @@ struct Lowerer {
             if (classMember(s.expr) || vifAccess(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x), @(v.x)
             else if (ValueExpressionBase::isKind(s.expr.kind) && eventPtr().count(&s.expr.as<ValueExpressionBase>().symbol))
                 sig = eventSig(s.expr);   // an event that may be an alias (6.17)
-            else if (ValueExpressionBase::isKind(s.expr.kind)) {
+            else if (ValueExpressionBase::isKind(s.expr.kind) && !modportConn(s.expr)) {
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
             } else {
                 // @(posedge clk[i]), @(a & b): wait on a signal that a
@@ -5571,8 +5625,35 @@ struct Lowerer {
         const Expression& src = *args[1];
         const Type& dt = dst.type->getCanonicalType();
         const Type& st = src.type->getCanonicalType();
-        if (dt.isClass() || st.isClass() || !(dt.isIntegral() || dt.isFloating()) || !(st.isIntegral() || st.isFloating()))
-            unsupported("$cast of these types");
+        if (dt.isClass() || st.isClass()) unsupported("$cast of these types");
+        if (!(dt.isIntegral() || dt.isFloating()) || !(st.isIntegral() || st.isFloating())) {
+            // Strings, unpacked structs and arrays (6.24.2): the cast is the
+            // assignment dst = type(dst)'(src), which is always valid when
+            // the types are cast compatible; dst gets the converted value.
+            if (!dt.isCastCompatible(st)) unsupported("$cast of these types");
+            static thread_local std::deque<ConversionExpression> convs;
+            static thread_local std::deque<AssignmentExpression> asgs;
+            Expression* rhs = const_cast<Expression*>(&src);
+            if (!dt.isMatching(st))
+                rhs = &convs.emplace_back(*dst.type, ConversionKind::Explicit, *rhs, src.sourceRange);
+            auto& a = asgs.emplace_back(std::nullopt, false, *dst.type, const_cast<Expression&>(dst), *rhs, nullptr,
+                                        call.sourceRange);
+            int ok = fresh(1);
+            Instr o; o.k = IK::Assign; o.sig = ok; o.e = konst(mk(1, 1));
+            prog.emit(o);
+            int saved = castOk;
+            castOk = ok;
+            exprStmt(a);
+            castOk = saved;
+            if (task) {   // as a task, a failed cast is a run-time error (6.24.2)
+                Instr j; j.k = IK::JmpIfNot; j.e = un(Op::LogNot, ref(ok));
+                size_t jo = prog.emit(j);
+                Instr d; d.k = IK::Display; d.fmt = "Error: $cast failed: the source has the wrong number of elements";
+                prog.emit(d);
+                prog.code[jo].target = prog.here();
+            }
+            return resize(ref(ok), 32, false, true);
+        }
         int w = (int)dt.getBitWidth();
         E v;
         if (dt.isFloating()) v = realOf(src);
@@ -7671,7 +7752,9 @@ struct Lowerer {
         int w = (int)a.left().type->getBitWidth();
         needWidth(w);
         std::vector<std::tuple<const Expression*, int, int>> parts;
-        concatParts(a.left(), w - 1, parts);
+        const Expression* tgt = &a.left();
+        if (const Expression* c = modportConn(peel(*tgt))) tgt = c;   // .W({a, b}) (25.5.4)
+        concatParts(*tgt, w - 1, parts);
         int tmp = fresh(w);
         Instr hold; hold.k = IK::Assign; hold.sig = tmp;
         const Expression* saved = lvalue;
@@ -7793,7 +7876,8 @@ struct Lowerer {
             if (a.left().type->isUnpackedArray() && !a.timingControl && !a.isCompound() &&
                 assignWholeArray(a.left(), a.right(), a.isNonBlocking()))
                 return;
-            if (peel(a.left()).kind == ExpressionKind::Concatenation) {
+            if (const Expression* mc = modportConn(peel(a.left()));
+                peel(mc ? *mc : a.left()).kind == ExpressionKind::Concatenation) {
                 concatAssign(a);
                 return;
             }
@@ -9069,6 +9153,12 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         visitDefault(sub);
         inMethod -= m;
     }
+    // extern task t in an interface (25.7): the module task that exports it
+    // is not a member of any scope; its variables are registered here.
+    void handle(const slang::ast::MethodPrototypeSymbol& p) {
+        visitDefault(p);
+        for (auto* x = p.getFirstExternImpl(); x; x = x->getNextImpl()) x->impl->visit(*this);
+    }
     void handle(const slang::ast::ClassType& c) {
         std::string saved = prefix;
         prefix += std::string(c.name) + "::";
@@ -9112,8 +9202,11 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     void aliasModports() {
         for (const auto* m : modportPorts) {
-            if (m->explicitConnection) Lowerer::unsupported("modport expression (25.5.4)");
             const slang::ast::Symbol* in = m->internalSymbol;
+            if (m->explicitConnection) {   // .P(r) names r; .P(r[3:0]) and others are lowered where used (25.5.4)
+                const auto& c = Lowerer::peel(*m->explicitConnection);
+                in = slang::ast::ValueExpressionBase::isKind(c.kind) ? &c.as<slang::ast::ValueExpressionBase>().symbol : nullptr;
+            }
             if (!in) continue;
             if (auto it = sigmap.find(in); it != sigmap.end()) sigmap[m] = it->second;
             if (auto it = arrMap().find(in); it != arrMap().end()) arrMap()[m] = it->second;
@@ -10420,9 +10513,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (w > 64 || !v.getType().isIntegral()) Lowerer::unsupported("a free checker variable wider than 64 bits or not integral");
         bool isConst = v.flags.has(VariableFlags::Const);
         bool active = !isConst && !freeAssigned.count(&v);
-        if (active && checkerAssumes)
-            Lowerer::unsupported("free checker variables constrained by assume statements (17.7.2)");
-        out.freeVars.push_back({sigmap.at(&v), active});
+        // With assume statements, active ones change only at the assume
+        // set's clock, solved there (17.7.2), not in every time step.
+        out.freeVars.push_back({sigmap.at(&v), active && !checkerAssumes});
     }
     void handle(const slang::ast::CheckerInstanceSymbol& ci) {
         using namespace slang::ast;
@@ -10452,9 +10545,22 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         std::swap(freeAssigned, scan.assigned);
         bool savedAssumes = checkerAssumes;
         checkerAssumes = scan.assumes;
+        // The active free variables of this checker (17.7.2): its assume set
+        // solves for them. They are read as they are, also in assertions.
+        Lowerer::FreeSolve fs;
+        if (scan.assumes)
+            for (const auto& v : ci.body.membersOfType<VariableSymbol>())
+                if (v.flags.has(VariableFlags::CheckerFreeVariable) && !v.flags.has(VariableFlags::Const) &&
+                    !freeAssigned.count(&v) && sigmap.count(&v)) {
+                    fs.vars.push_back(sigmap.at(&v));
+                    Lowerer::svaLiveSigs().insert(sigmap.at(&v));
+                }
+        fs.active = !fs.vars.empty();
+        std::swap(Lowerer::freeSolve(), fs);
         checkerDepth++;
         visitDefault(ci);
         checkerDepth--;
+        std::swap(Lowerer::freeSolve(), fs);
         checkerAssumes = savedAssumes;
         for (const auto& c : ci.getPortConnections()) {
             if (c.formal.kind != SymbolKind::FormalArgument) continue;
@@ -11194,6 +11300,14 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 spec.visit(finder);
         else if (m.kind == slang::ast::SymbolKind::ClassType && (m.name == "semaphore" || m.name == "process"))
             m.visit(finder);
+    // A task an interface declares extern and a module exports (25.7): the
+    // module's body, which is not a member of any scope.
+    for (size_t k = 0, n = finder.found.size(); k < n; k++)
+        if (finder.found[k]->flags.has(slang::ast::MethodFlags::InterfaceExtern))
+            if (const auto* pr = finder.found[k]->getPrototype())
+                for (auto* x = pr->getFirstExternImpl(); x; x = x->getNextImpl())
+                    if (std::find(finder.found.begin(), finder.found.end(), x->impl.get()) == finder.found.end())
+                        finder.found.push_back(x->impl.get());
     // Every interface instance gets its virtual interface number (25.9).
     {
         struct IfInst : slang::ast::ASTVisitor<IfInst> {

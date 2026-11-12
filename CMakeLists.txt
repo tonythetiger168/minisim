@@ -215,6 +215,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_interactive
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_interactive.cmake)
+  # Class objects in the waveform (msim -vcd-class), read back by mdebug.
+  add_test(NAME msim_vcd_class
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vcd_class
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd_class.cmake)
   # Multi-core: 256 independent lanes run as parallel partitions. Every
   # thread count must print what the single-threaded event-driven run prints.
   add_test(NAME msim_threads

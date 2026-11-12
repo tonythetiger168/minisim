@@ -102,6 +102,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
 | `-cov [<file>]` | Write line / branch / toggle / condition / FSM coverage (default `cov.json`); see `mcov`. `-cm line+cond+fsm+tgl` (as VCS) does the same |
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
+| `-vcd-class [N]` | Also write class objects: each property of the object a module's class handle variable points to, as `tb.p.addr` (x while the handle is null), following handle properties N levels (default 1). See `docs/DEBUG.md` |
 | `-vcd-arrays [N]` | Also write the elements of unpacked arrays (memories) with at most N elements (default 1024) to the VCD or FST, as `mem[3]`. Off by default: memories are left out, as `$dumpvars` does. `mdebug` uses them to trace through a memory |
 | `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
@@ -357,6 +358,7 @@ mplan report uart.vplan -results regress.d -label $GIT_COMMIT -rules triage.rule
 mplan triage -results regress.d -plan uart.vplan   # only the failure buckets
 mplan trend  plan.d/history.jsonl                  # score, tests and coverage per snapshot
 mplan init   -results regress.d -o draft.vplan     # a starting plan from an existing regression
+mplan report uart.vplan -results regress.d -reqs reqs.reqif -trace trace.csv   # requirement traceability
 ```
 
 `mplan report` scores every feature (weighted, with a goal per metric),

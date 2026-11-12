@@ -44,6 +44,11 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
+  the object a module's class handle variable points to is a signal
+  `tb.p.addr` that follows the handle (x while it is null), with handle
+  properties followed N levels. `mdebug` reads them back: script `value` and
+  `changes`, `-signals`, and the page adds them when the handle is picked.
 - `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
   uvm-core writes (`tr_db.log`): streams, each item's begin, end, fields and
   parent sequence, those in progress at `-at T`, and stream rows in the
@@ -694,6 +699,13 @@ Spec references are IEEE 1800-2023 clauses.
   BASE64_TEXT, what tool and common blocks may hold, and viewport lists with
   `.` or `:` scoped names. Clear modules instantiated in or bound into
   protected IP are hidden from waveforms, coverage and lint output.
+- `mplan`: requirement traceability. `req ID ...` in a feature and a
+  requirement list (`reqs FILE` in the plan or `-reqs FILE`), read from CSV
+  or ReqIF (`.reqif` / `.reqifz`, with the hierarchy). Every requirement is
+  verified, partial, failing, not started or uncovered; the report, the
+  HTML page, `plan.json`, the history and `mplan trend` show it, `-trace`
+  writes the matrix as CSV, `-fail-on-uncovered` gates on it, and
+  `mplan init -reqs` drafts a plan from the list.
 - `mregress -farm`: runs go to a compute farm instead of the local machine:
   `lsf` (bsub -K), `slurm` (srun), `sge` (qsub -sync y), `ssh:HOST[*N],...`
   or `cmd:TEMPLATE` for any other launcher. `-farm-opts`, `-farm-cpus`

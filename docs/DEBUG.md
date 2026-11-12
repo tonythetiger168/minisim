@@ -320,6 +320,32 @@ there to the write `mem[waddr] <= d` whose index was that element, with the
 index and data it had. `-active tb.mem[3]` starts at one element. Without
 `-vcd-arrays` the trace stops at the memory and says so.
 
+## Class objects
+
+A waveform holds signals, and a class object is not one: `new` makes it,
+handles that change point to it, and it is gone when nothing does. With
+`-vcd-class` msim writes what each class handle variable of a module points
+to:
+
+    msim tb.sv -vcd run.vcd -vcd-class        # tb.p.addr, tb.p.next
+    msim tb.sv -fst run.fst -vcd-class 2      # and tb.p.next.addr
+
+Every property of the handle's declared class (base class first) is a
+signal under a scope named after the handle, `tb.p.addr`, that follows the
+handle: when `tb.p` moves to another object the views change with it, and
+they are `x` while it is null. A handle property such as `tb.p.next` is the
+handle value itself; `-vcd-class N` follows it N levels down. Views are
+written at the end of each time slot, and are the same for any `-threads`.
+
+mdebug reads them like any signal: `value tb.p.addr 12` and
+`changes tb.p.addr` in a script, `-signals` lists them, and in the page,
+picking `tb.p` adds a wave row for each of its properties.
+
+Left out: string, real, event, array and queue properties, handles in
+automatic variables or only inside other objects (a UVM component tree;
+use `msim -i` and `print tb.h.next.id`, or `mdebug -tr` for transactions).
+`-compile` runs the interpreter when `-vcd-class` is given.
+
 ## Tasks, calls and force
 
 A task or function declared in a module drives the signals it assigns, as
@@ -406,8 +432,10 @@ comments.
 
 - In the page, a condition that reads an `x` or `z` value is undecided
   (`??`); the command line evaluates all four states.
-- Class objects are not in msim's waveform, so the active-driver trace
-  stops at them with `(not in the waveform)`. Memories need `-vcd-arrays`
+- Class objects are in msim's waveform only through module handle
+  variables (`-vcd-class`, above), and they have no drivers, so the
+  active-driver trace stops at a property with `(not in the waveform)`.
+  Memories need `-vcd-arrays`
   (above); the page's own trace does not follow memory elements yet, the
   command line does.
 - A task's formal arguments are not in the waveform, so the active-driver

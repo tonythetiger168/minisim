@@ -29,6 +29,7 @@
 //                    pulse styles of every path output (30.7.4)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
 //   -vcd-arrays [N]  also write unpacked array elements (arrays of up to N, default 1024)
+//   -vcd-class [N]   also write class objects through handle variables (h.addr), N levels
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
@@ -161,6 +162,7 @@
 #include "dpi.inc"
 #include "vpi.inc"
 #include "interactive.inc"
+#include "objview.inc"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -1737,6 +1739,9 @@ static void usage() {
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -vcd-arrays [N]  also write unpacked array elements (memories) of up to N\n"
                  "                 elements each (default 1024) to the VCD or FST, as mem[3]\n"
+                 "  -vcd-class [N]  also write the properties of the object each class handle\n"
+                 "                 variable points to, as h.addr (x while h is null); handle\n"
+                 "                 properties are followed N levels (default 1)\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov. -cm <metrics> (as VCS) does the same\n"
                  "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
@@ -1784,6 +1789,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> plusargs;
     uint64_t seed = 0;
     std::optional<std::string> vcdPath;
+    int vcdClass = 0;   // -vcd-class [N]
     std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
     bool saifTmp = false;   // ...and the waveform was only written for that
     std::string covPath = "cov.json";
@@ -1934,6 +1940,13 @@ int main(int argc, char** argv) {
                 }
                 v = p == std::string_view::npos ? std::string_view() : v.substr(p + 1);
             }
+            continue;
+        }
+        // -vcd-class [N]: class objects through handle variables, N levels deep (default 1).
+        if (a == "-vcd-class" || a == "-fst-class") {
+            vcdClass = 1;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                vcdClass = std::max(1, std::atoi(argv[++i]));
             continue;
         }
         // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.
@@ -2363,6 +2376,10 @@ int main(int argc, char** argv) {
         std::cerr << "msim: -compile: programs and checkers are not compiled yet; using the interpreter\n";
         compiled = false;
     }
+    if (compiled && vcdClass) {
+        std::cerr << "msim: -compile: -vcd-class needs the interpreter; using it\n";
+        compiled = false;
+    }
     if (compiled) {
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle,
                              seed, covPath);
@@ -2462,7 +2479,8 @@ int main(int argc, char** argv) {
     }
     covapi::lw = &lowered;
     g_covApiHook = covapi::hook;   // 20.13
-    if (interactiveMode) {   // msim -i: commands drive the run (interactive.inc)
+    if (vcdClass && comp) objview::build(*comp, vcdClass);   // before the waveform header
+        if (interactiveMode) {   // msim -i: commands drive the run (interactive.inc)
         interactive::Session ses;
         ses.comp = comp.get();
         ses.maxTime = maxTime;
