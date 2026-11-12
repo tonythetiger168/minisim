@@ -561,7 +561,9 @@ struct Reader {
             if (it == byName.end()) continue;
             size_t w = (size_t)it->second;
             std::vector<Change>().swap(waves[w].ch);
+#ifdef MINISIM_FST
             if (w < pools.size()) std::string().swap(pools[w]);
+#endif
             ready[w] = 0;
         }
     }
