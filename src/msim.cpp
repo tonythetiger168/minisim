@@ -1008,7 +1008,6 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
-                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
                     : std::any_of(asserts().begin(), asserts().end(), [](const AssertInfo& a) {
                           return a.hidden || (a.type & (AT_CONCURRENT | AT_FINAL | AT_EXPECT));
                       }) ? "a concurrent, final or expect assertion"
@@ -1024,7 +1023,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         // With a VCD every signal must live in S.sigs, so no private signals.
         // A large design is built as several files at once, one per core (16 at most).
         src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr,
-                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()));
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale());
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -2497,9 +2496,11 @@ int main(int argc, char** argv) {
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
-        if (vpi::st().active && lowered.procs[i].kind == "init") {
+        if (lowered.procs[i].kind == "init") {
             // Declaration initializers take effect before the simulation
-            // starts, so they are not value changes VPI callbacks see (6.8).
+            // starts (6.8): not value changes VPI callbacks see, and not
+            // edges a clocked process registered below could wake on
+            // (logic clk = 0 is no negedge).
             Task t = process(&lowered.procs[i].prog);
             S.all.push_back(t.h);
             t.h.resume();
