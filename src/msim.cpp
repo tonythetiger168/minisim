@@ -354,6 +354,241 @@ static void mergePartialDrivers(LowerResult& lowered) {
     }
 }
 
+// A for loop with a constant trip count in a clocked process (the reset of
+// a register file: for (int i = 0; i < 16; i++) rf[i] <= 0) is unrolled:
+// each copy reads i as a constant, so an array write gets its fixed
+// element and the process needs neither the blocking writes of i nor a
+// jump back. It then runs in the cycle domain like any other register
+// process (bench/gen_soc.py: 512 such processes were coroutines). The loop
+// variable is automatic and local to the loop (12.7.1); it is kept out of
+// the waveform, which never shows automatic variables (21.7.1.2).
+static void unrollSeqLoops(LowerResult& lowered) {
+    std::set<int> lv(loopVarSigs().begin(), loopVarSigs().end());
+    if (lv.empty()) return;
+    const bool dbg = std::getenv("MSIM_WHYUNROLL") != nullptr;
+    auto plainW = [](const Instr& i) {
+        return i.sig >= 0 && i.hi < 0 && !i.arr && i.aidx.empty() && !i.bidx && i.drv < 0 && i.dyn < 0 && !i.de && !i.delay &&
+               i.dly.empty() && !i.tmp && i.gate < 0 && !i.udp;
+    };
+    // The value of e when signal `var` holds `v` and nothing else is read.
+    auto constEval = [](const E& e, int var, const Val* v, Val& out) {
+        bool other = false;
+        Reader rd = [&](int s) -> Val {
+            if (v && s == var) return *v;
+            other = true;
+            return S.sigs[(size_t)s].val;
+        };
+        try { out = eval(e, rd); } catch (...) { return false; }
+        return !other;
+    };
+    std::function<E(const E&, int, const Val&)> sub = [&](const E& e, int var, const Val& v) -> E {
+        if (!e) return e;
+        if (e->op == Op::Ref && e->sig == var && !e->at && !e->arr) { Val k = v; k.sgn = e->sgn; return konst(k); }
+        bool hit = false;
+        std::function<bool(const E&)> has = [&](const E& x) {
+            if (!x) return false;
+            if (x->op == Op::Ref && x->sig == var) return true;
+            if (has(x->at)) return true;
+            for (auto& k : x->kids) if (has(k)) return true;
+            return false;
+        };
+        hit = has(e);
+        if (!hit) return e;
+        auto c = std::make_shared<Expr>(*e);
+        c->at = sub(c->at, var, v);
+        for (auto& k : c->kids) k = sub(k, var, v);
+        return c;
+    };
+    std::set<int> used;
+    for (auto& lp : lowered.procs) {
+        if (lp.program >= 0 || lp.reactive) continue;
+        auto& code = lp.prog.code;
+        size_t n = code.size();
+        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[0].k != IK::WaitEdge || code[n - 1].k != IK::Jmp ||
+            code[n - 1].target != 0)
+            continue;
+        for (size_t pc = 1; pc + 3 < code.size(); pc++) {
+            // i = c; top: if (!(cond)) goto E; body; step: i = f(i); goto top; E:
+            const Instr& a = code[pc];
+            if (a.k != IK::Assign || !lv.count(a.sig) || !plainW(a)) continue;
+            int var = a.sig;
+            const Instr& t = code[pc + 1];
+            if (t.k != IK::JmpIfNot || t.xt != Instr::NOX || t.target < pc + 4 || t.target >= code.size()) continue;
+            size_t top = pc + 1, E = t.target, step = E - 2;
+            if (code[E - 1].k != IK::Jmp || code[E - 1].target != top) continue;
+            if (code[step].k != IK::Assign || code[step].sig != var || !plainW(code[step])) continue;
+            bool ok = true;
+            for (size_t b = top + 1; b < step && ok; b++) {
+                const Instr& x = code[b];
+                if (x.k == IK::Nba) ok = x.sig != var && x.drv < 0 && x.dyn < 0 && !x.nbaLater && !x.de && !x.delay;
+                else if (x.k == IK::Jmp || x.k == IK::JmpIfNot)
+                    ok = x.target > b && x.target <= E && x.xt == Instr::NOX;   // forward, inside or to the end
+                else ok = false;
+            }
+            // Nothing else jumps into the loop.
+            for (size_t b = 0; b < code.size() && ok; b++) {
+                if (b >= top && b < E) continue;
+                const Instr& x = code[b];
+                if ((x.k == IK::Jmp || x.k == IK::JmpIfNot) && ((x.target > pc && x.target < E) || (x.xt != Instr::NOX && x.xt > pc && x.xt < E)))
+                    ok = false;
+            }
+            Val v;
+            if (!ok || !constEval(a.e, var, nullptr, v)) continue;
+            int w = S.sigs[(size_t)var].w;
+            v = v_resize(v, w, v.sgn); v.sgn = false;
+            std::vector<Instr> out;
+            size_t bodyN = step - (top + 1);
+            std::vector<size_t> breaks;   // jumps to E, patched at the end
+            int iters = 0;
+            while (ok) {
+                Val c;
+                if (!constEval(t.e, var, &v, c) || c.x) { ok = false; break; }
+                if (truth(c) != 1) break;
+                if (++iters > 64 || out.size() + bodyN > 4096) { ok = false; break; }
+                size_t base = out.size();
+                for (size_t b = top + 1; b < step; b++) {
+                    Instr x = code[b];
+                    x.e = sub(x.e, var, v);
+                    for (auto& ai : x.aidx) ai = sub(ai, var, v);
+                    if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
+                        if (x.target == E) breaks.push_back(out.size());
+                        else x.target = base + (x.target - (top + 1));   // the step: the end of this copy
+                    }
+                    if (x.k == IK::Nba && x.arr && x.arr->base >= 0 && !x.arr->dynElem && !x.aidx.empty()) {   // a fixed element now?
+                        std::vector<int64_t> idx;
+                        bool fixed = true;
+                        for (auto& ai : x.aidx) {
+                            Val iv;
+                            if (!constEval(ai, -1, nullptr, iv) || iv.x) { fixed = false; break; }
+                            idx.push_back(v_to_i64(iv));
+                        }
+                        if (fixed) {
+                            int64_t off = x.arr->offset(idx);
+                            if (off < 0) { x = Instr{}; x.k = IK::Jmp; x.target = out.size() + 1; }   // an invalid index writes nothing (7.4.6)
+                            else { x.sig = x.arr->base + (int)off; x.arr = nullptr; x.aidx.clear(); }
+                        }
+                    }
+                    out.push_back(std::move(x));
+                }
+                Val nv;
+                if (!constEval(code[step].e, var, &v, nv)) { ok = false; break; }
+                v = v_resize(nv, w, nv.sgn); v.sgn = false;
+            }
+            if (!ok) continue;
+            // Splice: [pc, E) becomes `out`; later targets move by the difference.
+            size_t start = pc;
+            long delta = (long)out.size() - (long)(E - pc);
+            for (auto& x : out) if ((x.k == IK::Jmp || x.k == IK::JmpIfNot)) x.target += start;
+            for (size_t b : breaks) out[b].target = start + out.size();
+            for (size_t b = 0; b < code.size(); b++) {
+                if (b >= pc && b < E) continue;
+                Instr& x = code[b];
+                if ((x.k == IK::Jmp || x.k == IK::JmpIfNot) && x.target >= E) x.target += delta;
+                if (x.xt != Instr::NOX && x.xt >= E) x.xt += delta;
+            }
+            for (auto& x : out) x.line = x.line ? x.line : code[pc].line;
+            code.erase(code.begin() + (long)pc, code.begin() + (long)E);
+            code.insert(code.begin() + (long)pc, out.begin(), out.end());
+            used.insert(var);
+            if (dbg) std::cerr << "unrolled " << S.sigs[(size_t)var].name << ": " << iters << " times, " << out.size() << " instructions\n";
+            pc += out.size() ? out.size() - 1 : 0;
+        }
+        // What is left of an unrolled variable here: constant writes (its
+        // initial value at the block's entry) that nothing reads.
+        std::set<int> mine;
+        for (auto& x : code) if (x.k == IK::Assign && used.count(x.sig)) mine.insert(x.sig);
+        if (mine.empty()) continue;
+        std::function<void(const E&)> rd = [&](const E& e) {
+            if (!e) return;
+            if (e->op == Op::Ref) mine.erase(e->sig);
+            if (e->arr) mine.erase(e->arr->base);
+            rd(e->at);
+            for (auto& k : e->kids) rd(k);
+        };
+        for (auto& x : code) {
+            rd(x.e); rd(x.bidx); rd(x.de); rd(x.fd); rd(x.self);
+            for (auto& a : x.aidx) rd(a);
+            for (auto& a : x.args) rd(a);
+            if (x.k != IK::Assign && x.sig >= 0) mine.erase(x.sig);
+            for (auto& [sg, ed] : x.events) mine.erase(sg);
+        }
+        for (size_t b = 0; b < code.size(); b++) {
+            Instr& x = code[b];
+            Val k;
+            if (x.k == IK::Assign && mine.count(x.sig) && plainW(x) && constEval(x.e, -1, nullptr, k)) {
+                int ln = x.line;
+                x = Instr{}; x.k = IK::Jmp; x.target = b + 1; x.line = ln;
+            }
+        }
+    }
+    for (int x : used) S.sigs[(size_t)x].hide = true;
+}
+
+// A nonblocking write to an element of a small array chosen at run time
+// (rf[wa] <= y) becomes one fixed write per element, each behind its
+// compare: if (wa == 0) rf[0] <= y; else if (wa == 1) ... An index that
+// matches none (x, z or out of range) writes nothing, as before (7.4.6).
+// The clocked process then has only fixed targets and joins the cycle domain.
+static void fixArrayNbas(LowerResult& lowered) {
+    std::function<bool(const E&)> pure = [&](const E& e) {
+        if (!e) return true;
+        if (e->at) return false;
+        if (!(e->op <= Op::Mux || e->op == Op::WildEq || (e->op == Op::ArrRead && e->arr && !e->arr->dynElem))) return false;
+        for (auto& k : e->kids) if (!pure(k)) return false;
+        return true;
+    };
+    for (auto& lp : lowered.procs) {
+        if (lp.program >= 0 || lp.reactive) continue;
+        auto& code = lp.prog.code;
+        size_t n = code.size();
+        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[0].k != IK::WaitEdge || code[n - 1].k != IK::Jmp ||
+            code[n - 1].target != 0)
+            continue;
+        bool any = false;
+        for (auto& x : code) if (x.k == IK::Nba && x.arr) any = true;
+        if (!any) continue;
+        std::vector<Instr> out;
+        std::vector<char> made;          // a jump made here: its target is already a new pc
+        std::vector<size_t> at(n + 1);   // old pc -> new pc
+        for (size_t pc = 0; pc < n; pc++) {
+            at[pc] = out.size();
+            made.resize(out.size(), 0);
+            const Instr& x = code[pc];
+            const ArrShape* a = x.arr.get();
+            bool ok = x.k == IK::Nba && a && a->base >= 0 && !a->dynElem && x.aidx.size() == 1 && a->dims.size() == 1 && a->count >= 1 &&
+                      a->count <= 32 && x.drv < 0 && x.dyn < 0 && !x.nbaLater && !x.de && !x.delay && x.dly.empty() && !x.bidx &&
+                      std::min(a->dims[0].first, a->dims[0].second) >= 0 && pure(x.aidx[0]) && pure(x.e);
+            if (!ok) { out.push_back(x); made.push_back(0); continue; }
+            auto [l, r] = a->dims[0];
+            std::vector<size_t> ends;
+            for (int o = 0; o < a->count; o++) {
+                int64_t idx = l <= r ? l + o : l - o;
+                Instr j; j.k = IK::JmpIfNot; j.line = x.line;
+                j.e = node(Op::Eq, {x.aidx[0], konst(make((uint64_t)idx, 0, 64))});
+                size_t jp = out.size();
+                out.push_back(j);
+                Instr w = x;
+                w.sig = a->base + o; w.arr = nullptr; w.aidx.clear();
+                out.push_back(w);
+                Instr e; e.k = IK::Jmp; e.line = x.line;
+                ends.push_back(out.size());
+                out.push_back(e);
+                out[jp].target = out.size();   // relative to out, as new pcs
+            }
+            for (size_t k : ends) out[k].target = out.size();
+            made.resize(out.size(), 1);
+        }
+        at[n] = out.size();
+        for (size_t k = 0; k < out.size(); k++) {
+            Instr& x = out[k];
+            if ((x.k != IK::Jmp && x.k != IK::JmpIfNot) || made[k]) continue;
+            x.target = at[std::min<size_t>(x.target, n)];
+            if (x.xt != Instr::NOX) x.xt = at[std::min<size_t>(x.xt, n)];
+        }
+        code = std::move(out);
+    }
+}
+
 // Subroutine calls in a combinational block (always_comb, or an assign whose
 // value calls a function) are expanded in place, so the block is straight
 // code that the static schedule can rank and split like any other. A static
@@ -898,6 +1133,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
                 const Instr& x = q.code[pc];
                 if (x.k == IK::WaitEdge) waits++;
                 else if (x.k == IK::Assign) { blk++; if (x.arr || !x.aidx.empty() || x.bidx) arr++;
+                    if (x.sig >= 0 && (size_t)x.sig < S.sigs.size()) w += " blk(" + S.sigs[(size_t)x.sig].name + ")";
                     if (x.arr) w += " arrW(" + S.sigs[x.arr->base].name + " n=" + std::to_string(x.arr->count) + ")";
                     else if (x.bidx) w += " bidx(" + S.sigs[x.sig].name + ")";
                     if (x.dyn >= 0) w += " dyn"; if (x.de || x.delay || !x.dly.empty()) w += " dly"; }
@@ -2376,7 +2612,9 @@ int main(int argc, char** argv) {
         gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
-    if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
