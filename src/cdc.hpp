@@ -55,7 +55,7 @@
 #include <deque>
 #include <fstream>
 #include <sstream>
-#include "sdc.hpp"
+#include "cdc_sdc.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/ConversionExpression.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
@@ -2440,7 +2440,7 @@ inline void constrain(Model& m, const Options& opt) {
 // instance levels and no top name (u_a/u_b/clk), generate blocks as `name.`
 // and `name[i].`, a register `q` as the cell `q_reg` with pins CK, D and Q,
 // bus bits as name[3].
-struct SdcView : sdc::Design {
+struct SdcView : cdcsdc::Design {
     Model& m;
     std::vector<std::string> ports, pins, cells, nets;
     std::unordered_map<std::string, int> dir;
@@ -2515,13 +2515,13 @@ struct SdcView : sdc::Design {
         }
     }
 
-    const std::vector<std::string>& names(sdc::Kind k) const override {
+    const std::vector<std::string>& names(cdcsdc::Kind k) const override {
         static const std::vector<std::string> none;
         switch (k) {
-            case sdc::Kind::Port: return ports;
-            case sdc::Kind::Pin: return pins;
-            case sdc::Kind::Cell: return cells;
-            case sdc::Kind::Net: return nets;
+            case cdcsdc::Kind::Port: return ports;
+            case cdcsdc::Kind::Pin: return pins;
+            case cdcsdc::Kind::Cell: return cells;
+            case cdcsdc::Kind::Net: return nets;
             default: return none;
         }
     }
@@ -2529,8 +2529,8 @@ struct SdcView : sdc::Design {
         auto it = dir.find(n);
         return it == dir.end() ? -1 : it->second;
     }
-    Sym at(const sdc::Obj& o) const {
-        if (o.kind == sdc::Kind::Cell) {  // a register cell stands for its output
+    Sym at(const cdcsdc::Obj& o) const {
+        if (o.kind == cdcsdc::Kind::Cell) {  // a register cell stands for its output
             auto it = node.find(o.name + "/Q");
             return it == node.end() ? nullptr : it->second;
         }
@@ -2651,9 +2651,8 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
     if (opt.sdcFiles.empty()) return;
     SdcView view(m);
     view.build(comp);
-    sdc::Reader rd;
+    cdcsdc::Reader rd;
     rd.design = &view;
-    rd.threads = (unsigned)std::max(1, opt.threads);
     size_t read = 0;
     for (auto& f : opt.sdcFiles) {
         try {
@@ -2665,7 +2664,7 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
     }
     if (!read) return;  // nothing to go by: check as without -sdc
     for (auto& d : rd.diags)
-        if (d.sev == sdc::Diag::ErrorSev || d.code == "no-match" || d.code == "unknown-command")
+        if (d.sev == cdcsdc::Diag::ErrorSev || d.code == "no-match" || d.code == "unknown-command")
             std::cerr << "mlint: " << d.loc.str() << ": " << d.text << "\n";
 
     Model::Sdc& s = m.sdc;
@@ -2683,7 +2682,7 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
     // -source pin.
     std::vector<int> master(n, -1);
     for (int i = 0; i < n; i++) {
-        const sdc::Clock& c = clocks[i];
+        const cdcsdc::Clock& c = clocks[i];
         if (!c.generated) continue;
         if (auto it = ix.find(c.masterClock); it != ix.end()) master[i] = it->second;
         for (auto& o : c.masterPins) {
@@ -2699,15 +2698,15 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
         return i;
     };
     bool related = false;
-    auto clockPair = [&](const sdc::Exception& e) {
-        if (e.type != sdc::Exception::FalsePath || e.path.from.empty() || e.path.to.empty() || !e.path.through.empty())
+    auto clockPair = [&](const cdcsdc::Exception& e) {
+        if (e.type != cdcsdc::Exception::FalsePath || e.path.from.empty() || e.path.to.empty() || !e.path.through.empty())
             return false;
         for (auto* l : {&e.path.from, &e.path.to})
             for (auto& o : *l)
-                if (o.kind != sdc::Kind::Clock) return false;
+                if (o.kind != cdcsdc::Kind::Clock) return false;
         return true;
     };
-    for (auto& g : rd.sdc.clockGroups) related = related || g.type != sdc::ClockGroups::None;
+    for (auto& g : rd.sdc.clockGroups) related = related || g.type != cdcsdc::ClockGroups::None;
     for (auto& e : rd.sdc.exceptions) related = related || clockPair(e);
     s.rel.assign(n, std::vector<uint8_t>(n, Model::Sync));
     if (!related) {
@@ -2719,7 +2718,7 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
                          "not generated from one another are taken as asynchronous\n";
     }
     for (auto& g : rd.sdc.clockGroups) {
-        if (g.type == sdc::ClockGroups::None) continue;
+        if (g.type == cdcsdc::ClockGroups::None) continue;
         // A clock's group; a generated clock that is not listed goes with its
         // master. One -group alone is against every other clock.
         std::vector<int> of(n, -1);
@@ -2731,7 +2730,7 @@ inline void readSdc(Model& m, Compilation& comp, const Options& opt) {
         if (g.groups.size() == 1)
             for (int i = 0; i < n; i++)
                 if (of[i] < 0) of[i] = 1;
-        uint8_t r = g.type == sdc::ClockGroups::Asynchronous ? Model::Async : Model::Exclusive;
+        uint8_t r = g.type == cdcsdc::ClockGroups::Asynchronous ? Model::Async : Model::Exclusive;
         for (int i = 0; i < n; i++)
             for (int j = 0; j < n; j++)
                 if (of[i] >= 0 && of[j] >= 0 && of[i] != of[j]) s.rel[i][j] = r;

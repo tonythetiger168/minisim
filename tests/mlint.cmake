@@ -148,6 +148,13 @@ if(NOT out MATCHES "'cdc_sdc.a0' \\(clocked by cdc_sdc.aclk\\) is read by logic 
    OR NOT out MATCHES "2 findings \\(CDC001 2\\)")
   message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_groups.sdc:\n${out}")
 endif()
+# The same constraints written with variables, loops, bare names, wildcards,
+# -hierarchical and commands that change no domain give the same result.
+set(groups_out "${out}")
+run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_syntax.sdc")
+if(NOT out STREQUAL groups_out)
+  message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_syntax.sdc differs from cdc_sdc_groups.sdc:\n${out}")
+endif()
 # A false path between two clocks makes that pair asynchronous.
 run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_false.sdc")
 if(NOT out MATCHES "'cdc_sdc.b0' \\(clocked by cdc_sdc.bclk\\) is read by logic clocked by cdc_sdc.cclk"
