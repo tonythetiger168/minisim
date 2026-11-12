@@ -4850,7 +4850,7 @@ struct Lowerer {
             if (classMember(s.expr) || vifAccess(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x), @(v.x)
             else if (ValueExpressionBase::isKind(s.expr.kind) && eventPtr().count(&s.expr.as<ValueExpressionBase>().symbol))
                 sig = eventSig(s.expr);   // an event that may be an alias (6.17)
-            else if (ValueExpressionBase::isKind(s.expr.kind)) {
+            else if (ValueExpressionBase::isKind(s.expr.kind) && !modportConn(s.expr)) {
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
             } else {
                 // @(posedge clk[i]), @(a & b): wait on a signal that a
