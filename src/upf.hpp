@@ -889,6 +889,18 @@ struct Model {
     std::map<std::string, std::string> globalAttrs;
     std::vector<Pst> psts;
     std::string version;
+    // Implementation-only commands (6.37 to 6.41, 6.43, 6.57, 6.62, clause 7), checked and kept.
+    struct ImplCmd {
+        std::string cmd, scope, where;
+        std::vector<std::string> pos;
+        std::multimap<std::string, std::string> opts;
+    };
+    std::vector<ImplCmd> implCmds;
+    std::map<std::string, std::string> nameFormat;                  // name_format affix -> pattern
+    struct Variation { double lo = 1, hi = 1; std::string where; };
+    std::map<std::string, Variation> variations;                    // set_variation: supply -> range
+    std::vector<std::pair<bool, std::vector<std::string>>> correlated;   // set_correlated: {nets?, names}
+    bool implCommand(const Cmd& c, const std::string& scope);
     std::vector<std::string> warnings;
 
     // The design, while the file is read (find_objects); null without one.
@@ -1409,6 +1421,8 @@ struct Model {
                n == "upf_query_object_pathname" || n == "query_upf";
     }
 };
+
+#include "upf_impl.inc"
 
 inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader& rd, const std::string& file) {
     for (const Cmd& c : cmds) {
@@ -3062,16 +3076,10 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             t->rows.push_back(r);
             continue;
         }
+        if (implCommand(c, scope)) continue;
         // Accepted and not needed for simulation.
         static const std::set<std::string> ignored = {
-            "map_isolation_cell", "map_level_shifter_cell",
-            "map_retention_cell", "map_power_switch", "use_interface_cell", "name_format", 
-            "set_variation", "set_correlated", 
-            
-
-            "set_retention_control", "define_isolation_cell", "define_level_shifter_cell",
-            "define_retention_cell", "define_power_switch_cell", "define_always_on_cell", "define_diode_clamp",
-            "map_retention_clamp_cell", "map_repeater_cell", "set_pin_related_supply",
+            "map_isolation_cell", "map_level_shifter_cell", "set_retention_control", "set_pin_related_supply",
             "set_related_supply_net", "add_parameter"};
         if (ignored.count(n)) {
             warnings.push_back(c.where() + ": " + n + " is accepted and has no effect in simulation");

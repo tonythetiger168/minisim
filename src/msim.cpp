@@ -323,7 +323,7 @@ struct Plan {
 // run time; the drive of its ~1700 single-driver nets was another quarter.
 static void mergePartialDrivers(LowerResult& lowered) {
     if (!S.varPathDrv.empty() || !S.loadsOf.empty() || !lowered.netDelays.empty()) return;
-    for (auto& t : S.tranOf) if (!t.empty()) return;
+    if (!lowered.trans.empty()) return;   // switches resolve their nets from the drivers (S.tranOf is set later)
     for (uint8_t b : S.pathIn) if (b) return;
     size_t ns = S.sigs.size();
     std::vector<std::vector<Instr*>> by(ns);
@@ -2063,6 +2063,8 @@ static void usage() {
               << protfront::Options::help() <<
                  "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
                  "                 merges the branches instead of picking one (docs/XPROP.md)\n"
+                 "  -xprop=<file>, -xprop-config <file>  X-propagation set per instance or module\n"
+                 "                 (tree / instance / module {names} {xpropOn|xpropOff}; merge = ...)\n"
                  "  -xprop-report <file>  list every if / case / edge and whether it is merged\n"
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
@@ -2154,7 +2156,13 @@ int main(int argc, char** argv) {
         if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
         if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
         if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }
-        if (a.rfind("-xprop=", 0) == 0) { std::cerr << "msim: bad " << a << " (tmerge, xmerge or off)\n"; return 2; }
+        if (a.rfind("-xprop=", 0) == 0 || a == "-xprop-config") {   // a configuration file (docs/XPROP.md)
+            std::string cfg = a == "-xprop-config" ? next("a file name") : a.substr(7);
+            if (a != "-xprop-config" && !std::ifstream(cfg)) { std::cerr << "msim: bad " << a << " (tmerge, xmerge, off or a configuration file)\n"; return 2; }
+            std::string err = Lowerer::xpReadConfig(cfg);
+            if (!err.empty()) { std::cerr << "msim: -xprop configuration " << cfg << ": " << err << "\n"; return 2; }
+            continue;
+        }
         if (a == "-xprop-report") { xpropReport = next("a file name"); continue; }
         if (a == "-no-pin") { g_pin = 0; continue; }
         if (a == "-pin") { g_pin = 1; continue; }
@@ -2792,7 +2800,7 @@ int main(int argc, char** argv) {
         if (t.charge != STR_MEDIUM) S.charge[t.sig] = t.charge;
         if (t.decays) S.decay[t.sig] = Sim::Decay{t.decay, 0, true};
     }
-    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
+    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist, t.aLo, t.bLo, t.w);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
