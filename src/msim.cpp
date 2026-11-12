@@ -2192,6 +2192,64 @@ int main(int argc, char** argv) {
     // The VCD's root scope is the top module (several tops: "top").
     if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);
 
+    // -upf: the power intent is read now; its bind_checker commands (IEEE
+    // 1801-2024 6.12) become bind directives, and the design is elaborated
+    // again with them.
+    if (!upfPath.empty()) {
+        auto& rt = upfrt::rt();
+        try {
+            rt.m.load(upfPath, "");
+            std::string top = powerTopSet ? powerTop : rt.m.designTop;
+            for (char& c : top) if (c == '/') c = '.';
+            while (!top.empty() && top[0] == '.') top.erase(0, 1);
+            // a path may start with the simulation top's own name (tb.u_dut)
+            if (!S.vcdTop.empty() && (top == S.vcdTop || top.starts_with(S.vcdTop + "."))) top = top.substr(std::min(top.size(), S.vcdTop.size() + 1));
+            // set_design_top may name the module the UPF was written for
+            if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {
+                std::string found;
+                std::function<void(const slang::ast::InstanceSymbol&, const std::string&)> walk =
+                    [&](const slang::ast::InstanceSymbol& in, const std::string& path) {
+                        if (!found.empty()) return;
+                        if (in.getDefinition().name == top && !path.empty()) { found = path; return; }
+                        for (auto& m : in.body.members())
+                            if (m.kind == slang::ast::SymbolKind::Instance) {
+                                auto& ch = m.as<slang::ast::InstanceSymbol>();
+                                walk(ch, path.empty() ? std::string(ch.name) : path + "." + std::string(ch.name));
+                            }
+                    };
+                for (auto* t : comp->getRoot().topInstances) {
+                    if (t->getDefinition().name == top) { found = "."; break; }
+                    walk(*t, "");
+                }
+                if (found == ".") top.clear();
+                else if (!found.empty()) top = found;
+            }
+            rt.m.top = top;
+            if (!rt.m.bindCheckers.empty()) {
+                static std::string bindText;
+                // the simulation top: a checker module nothing instantiates yet is a top too
+                std::string simTop = S.vcdTop;
+                std::set<std::string> checkers;
+                for (auto& b : rt.m.bindCheckers) checkers.insert(b.module);
+                std::vector<std::string> real;
+                for (auto* t : comp->getRoot().topInstances)
+                    if (!checkers.count(std::string(t->getDefinition().name))) real.push_back(std::string(t->name));
+                if (real.size() == 1) simTop = real[0];
+                bindText = rt.m.bindSource(simTop);
+                if (upfVerbose) std::cout << "UPF: " << bindText;
+                driver.syntaxTrees.push_back(slang::syntax::SyntaxTree::fromText(bindText, driver.sourceManager, "upf_bind_checker.sv", "",
+                                                                                 driver.createOptionBag()));
+                comp = driver.createCompilation();
+                driver.reportCompilation(*comp, /*quiet*/ true);
+                if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
+                if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);
+            }
+        } catch (const std::exception& ex) {
+            std::cerr << "msim: UPF: " << ex.what() << "\n";
+            return 1;
+        }
+    }
+
     // Pass 3: lower to the process IR and run on the kernel.
     LowerResult lowered;
     try {
@@ -2225,33 +2283,6 @@ int main(int argc, char** argv) {
         auto& rt = upfrt::rt();
         rt.verbose = upfVerbose;
         try {
-            rt.m.load(upfPath, "");
-            std::string top = powerTopSet ? powerTop : rt.m.designTop;
-            for (char& c : top) if (c == '/') c = '.';
-            while (!top.empty() && top[0] == '.') top.erase(0, 1);
-            // a path may start with the simulation top's own name (tb.u_dut)
-            if (!S.vcdTop.empty() && (top == S.vcdTop || top.starts_with(S.vcdTop + "."))) top = top.substr(std::min(top.size(), S.vcdTop.size() + 1));
-            // set_design_top may name the module the UPF was written for
-            if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {
-                std::string found;
-                std::function<void(const slang::ast::InstanceSymbol&, const std::string&)> walk =
-                    [&](const slang::ast::InstanceSymbol& in, const std::string& path) {
-                        if (!found.empty()) return;
-                        if (in.getDefinition().name == top && !path.empty()) { found = path; return; }
-                        for (auto& m : in.body.members())
-                            if (m.kind == slang::ast::SymbolKind::Instance) {
-                                auto& ch = m.as<slang::ast::InstanceSymbol>();
-                                walk(ch, path.empty() ? std::string(ch.name) : path + "." + std::string(ch.name));
-                            }
-                    };
-                for (auto* t : comp->getRoot().topInstances) {
-                    if (t->getDefinition().name == top) { found = "."; break; }
-                    walk(*t, "");
-                }
-                if (found == ".") top.clear();
-                else if (!found.empty()) top = found;
-            }
-            rt.m.top = top;
             rt.m.resolveApplies([](const std::string& mod) {   // apply_power_model without -elements (6.9)
                 std::vector<std::string> r;
                 std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";

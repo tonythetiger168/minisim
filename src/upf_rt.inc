@@ -458,6 +458,7 @@ struct Rt {
                     if (r.dom >= 0) doms[(size_t)r.dom].owned.push_back(e.sig);
                 }
         bindAsserts();
+        bindReplays(lw);
         // logic signals the runtime reacts to
         std::set<int> w;
         auto addIds = [&](const ExP& e, const std::string& scope) {
@@ -606,6 +607,37 @@ struct Rt {
                 note("sim_assertion_control -type " + ac.type + " on " + name);
                 asrtCtls.push_back(x);
             }
+    }
+    // sim_replay_control (6.60): the initial blocks to run again, by the
+    // domain whose power-up replays them.
+    std::vector<std::pair<const Prog*, int>> replays;
+    void bindReplays(LowerResult& lw) {
+        std::map<std::string, const ReplayCtl*> byModel;   // instances a -model command covers
+        for (auto& rc : m.replayCtls)
+            if (!rc.sel.model.empty())
+                for (auto& i : instancesOf(rc.sel.model)) byModel.emplace(i, &rc);
+        for (auto& rc : m.replayCtls)
+            if (rc.sel.model.empty())
+                for (auto& e : rc.sel.elements) {
+                    auto it = byModel.find(m.design(e));
+                    if (it != byModel.end())
+                        throw Error(rc.where + ": sim_replay_control: " + m.design(e) + " is already covered by sim_replay_control -model " +
+                                    it->second->sel.model + " (" + it->second->where + ", 6.60)");
+                }
+        for (auto& lp : lw.procs) {
+            if (lp.kind != "Initial") continue;
+            for (auto& rc : m.replayCtls) {
+                if (!selected(rc.sel, lp.scope, true)) continue;
+                int d = -1;
+                if (!rc.ctlDomain.empty()) d = domIdx.at(rc.ctlDomain);
+                else if (const SupplyConn* sc = explicitConn(lp.scope)) d = regionOf(sc->set);
+                else if (std::string dn = dm.of(lp.scope); !dn.empty()) d = domIdx.at(dn);
+                if (d < 0) continue;
+                replays.push_back({&lp.prog, d});
+                note("sim_replay_control: an initial block of " + lp.scope + " replays when " + doms[(size_t)d].name + " powers up");
+                break;
+            }
+        }
     }
     void applyAsserts() {
         for (auto& x : asrtCtls) {
@@ -1289,6 +1321,12 @@ struct Rt {
             g_pdMode[i] = nm;
             d.applied = true;
             if (old != -1 || nm != SS_NORMAL) note((d.region ? "elements on " : "power domain ") + d.name + " simstate " + simstateName(nm));
+            if (nm == SS_NORMAL && old != -1 && old != SS_NORMAL && S.now > 0)
+                for (auto& [prog, rd] : replays)
+                    if (rd == (int)i) {
+                        note("sim_replay_control: replaying an initial block on the power-up of " + d.name);
+                        S.spawn(process(prog));
+                    }
             if (nm == SS_CORRUPT && old != SS_CORRUPT) {
                 // Retention: the retained value is kept by the retention
                 // supply; the register itself loses power (9.7.4).
