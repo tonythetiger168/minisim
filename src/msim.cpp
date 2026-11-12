@@ -1261,15 +1261,18 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, std::string>, CondSum> conds;
     for (auto& d : condDefs()) {
         auto& c = conds[{d.file, d.line, d.col, d.text}];
-        if (!c.d) { c.d = &d; c.hits.assign(d.terms.size() + 1, 0); }
-        if (c.d->terms.size() != d.terms.size()) continue;
-        for (size_t k = 0; k <= d.terms.size(); k++) c.hits[k] += g_condHits[d.base + k];
+        if (!c.d) { c.d = &d; c.hits.assign(d.counters(), 0); }
+        if (c.d->counters() != d.counters()) continue;
+        for (size_t k = 0; k < d.counters(); k++) c.hits[k] += g_condHits[d.base + k];
     }
     f << "\n ],\n \"conditions\": [";
     first = true;
     for (auto& [key, c] : conds) {
         f << (first ? "\n  " : ",\n  ") << "[" << c.d->file << ", " << c.d->line << ", " << c.d->col << ", "
-          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? (c.d->lazy ? "\"||s\"" : "\"||\"") : c.d->lazy ? "\"&&s\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
+          << (c.d->terms.size() == 1 ? std::string("\"?:\"")
+              : "\"" + std::string(c.d->bitwise ? (c.d->isOr ? "|" : "&") : (c.d->isOr ? "||" : "&&")) +
+                    (c.d->lazy ? "s" : c.d->full ? "f" : "") + "\"")
+          << ", " << jstr(c.d->text) << ", [";
         for (size_t k = 0; k < c.d->terms.size(); k++) f << (k ? ", " : "") << jstr(c.d->terms[k]);
         f << "], [";
         for (size_t k = 0; k < c.hits.size(); k++) f << (k ? ", " : "") << c.hits[k];
@@ -1316,10 +1319,10 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         for (auto& d : condDefs()) {
             if (!d.inst || d.inst >= insts.size()) continue;
             const CondSum& c = conds[{d.file, d.line, d.col, d.text}];
-            if (d.terms.size() != c.d->terms.size()) continue;
+            if (d.counters() != c.d->counters()) continue;
             auto& h = insts[d.inst].conds[c.index];
-            h.resize(d.terms.size() + 1, 0);
-            for (size_t k = 0; k <= d.terms.size(); k++) h[k] += g_condHits[d.base + k];
+            h.resize(d.counters(), 0);
+            for (size_t k = 0; k < d.counters(); k++) h[k] += g_condHits[d.base + k];
         }
     }
     f << "\n ],\n \"instances\": [";
@@ -1444,6 +1447,8 @@ static void usage() {
                  "                 elements each (default 1024) to the VCD or FST, as mem[3]\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov. -cm <metrics> (as VCS) does the same\n"
+                 "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
+                 "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
                  "                 and reuses <dir>/simv while the design is unchanged\n"
@@ -1614,6 +1619,21 @@ int main(int argc, char** argv) {
         if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
             g_cov = true;
             ++i;
+            continue;
+        }
+        if (a == "-cm_cond" && i + 1 < argc) {   // VCS: -cm_cond full+allops (std / basic: the default)
+            std::string_view v = argv[++i];
+            while (!v.empty()) {
+                size_t p = v.find('+');
+                std::string_view w = v.substr(0, p);
+                if (w == "full") g_condFull = true;
+                else if (w == "allops") g_condAllops = true;
+                else if (w != "std" && w != "basic") {
+                    std::cerr << "msim: -cm_cond: unknown mode '" << w << "' (full, allops, std)\n";
+                    return 2;
+                }
+                v = p == std::string_view::npos ? std::string_view() : v.substr(p + 1);
+            }
             continue;
         }
         // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.

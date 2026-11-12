@@ -2890,13 +2890,28 @@ struct Lowerer {
         const Expression& top = peel(e);
         bool andOp = top.kind == ExpressionKind::BinaryOp && top.as<BinaryExpression>().op == BinaryOperator::LogicalAnd;
         bool orOp = top.kind == ExpressionKind::BinaryOp && top.as<BinaryExpression>().op == BinaryOperator::LogicalOr;
+        // -cm_cond allops: a & b and a | b of one-bit unsigned operands are conditions too
+        auto bit1 = [](const Expression& x) {
+            return x.type->isIntegral() && !x.type->isSigned() && x.type->getBitWidth() == 1;
+        };
+        BinaryOperator bop = andOp ? BinaryOperator::LogicalAnd : BinaryOperator::LogicalOr;
+        bool bitwise = false;
+        if (g_condAllops && top.kind == ExpressionKind::BinaryOp && !andOp && !orOp) {
+            const auto& b = top.as<BinaryExpression>();
+            if ((b.op == BinaryOperator::BinaryAnd || b.op == BinaryOperator::BinaryOr) && bit1(top) && bit1(b.left()) &&
+                bit1(b.right())) {
+                bitwise = true;
+                bop = b.op;
+                (b.op == BinaryOperator::BinaryAnd ? andOp : orOp) = true;
+            }
+        }
         if (&top != &e && (andOp || orOp)) return nullptr;   // c of c ? a : b is itself a && b: covered as that
         if (e.getConstant()) return nullptr;
         std::vector<const Expression*> terms;
         // (a && f()) && b: the inner && is lowered as jumps (lazyExpr), so it stays one term
         auto flat = [&](auto&& self, const Expression& x) -> void {
-            if (x.kind == ExpressionKind::BinaryOp && (andOp || orOp) &&
-                x.as<BinaryExpression>().op == (andOp ? BinaryOperator::LogicalAnd : BinaryOperator::LogicalOr) &&
+            if (x.kind == ExpressionKind::BinaryOp && (andOp || orOp) && x.as<BinaryExpression>().op == bop &&
+                (!bitwise || (bit1(x.as<BinaryExpression>().left()) && bit1(x.as<BinaryExpression>().right()))) &&
                 !sideEffects(x.as<BinaryExpression>().right())) {
                 self(self, x.as<BinaryExpression>().left());
                 self(self, x.as<BinaryExpression>().right());
@@ -2915,15 +2930,18 @@ struct Lowerer {
         // A term that is not safe to evaluate when && or || would skip it:
         // the terms in order, and the vectors of condCovLazyEnd.
         bool lazy = !pure && terms.size() > 1;
+        if (bitwise && lazy) return nullptr;   // & and | evaluate every operand: one with a side effect is not ours to repeat
+        bool full = g_condFull && !lazy && terms.size() > 1 && terms.size() <= 8;
         std::vector<std::string> texts;
         for (const Expression* t : terms) texts.push_back(condText(*t));
         auto n = node(Op::CondCov, std::move(kids));
-        n->hi = (int)condDef(e, orOp, lazy, std::move(texts));
-        n->lo = (orOp ? 1 : 0) | (lazy ? 2 : 0);
+        n->hi = (int)condDef(e, orOp, lazy, std::move(texts), full, bitwise);
+        n->lo = (orOp ? 1 : 0) | (lazy ? 2 : 0) | (full ? 4 : 0);
         return n;
     }
     // Registers a condition; returns the index of its first counter.
-    size_t condDef(const slang::ast::Expression& e, bool orOp, bool lazy, std::vector<std::string> terms) {
+    size_t condDef(const slang::ast::Expression& e, bool orOp, bool lazy, std::vector<std::string> terms, bool full = false,
+                   bool bitwise = false) {
         CondDef d;
         auto loc = e.sourceRange.start();
         if (loc.valid()) {
@@ -2935,10 +2953,12 @@ struct Lowerer {
         d.inst = g_covInst;
         d.isOr = orOp;
         d.lazy = lazy;
+        d.full = full;
+        d.bitwise = bitwise;
         d.text = condText(e);
         d.terms = std::move(terms);
         d.base = g_condHits.size();
-        g_condHits.resize(d.base + d.terms.size() + 1, 0);
+        g_condHits.resize(d.base + (full ? (size_t)1 << d.terms.size() : d.terms.size() + 1), 0);
         condDefs().push_back(std::move(d));
         return condDefs().back().base;
     }
@@ -4550,7 +4570,8 @@ struct Lowerer {
                     }
                     return sized(out, 1, false, ctx);
                 }
-                if (b.op == BinaryOperator::LogicalAnd || b.op == BinaryOperator::LogicalOr)
+                if (b.op == BinaryOperator::LogicalAnd || b.op == BinaryOperator::LogicalOr ||
+                    (g_condAllops && (b.op == BinaryOperator::BinaryAnd || b.op == BinaryOperator::BinaryOr)))
                     if (E cc = condCovExpr(e)) return sized(cc, 1, false, ctx);
                 bool sizeBoth = widthPropagates(b.op) || isDivMod(b.op);
                 // a ** b sizes like a shift: the result is a's width, b is
