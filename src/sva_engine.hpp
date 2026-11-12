@@ -663,7 +663,7 @@ struct ConcAssert {
     // attempts have equal terms and the store does not grow with the values.
     using Envs = std::shared_ptr<const std::vector<std::vector<Val>>>;
     // wait: an expect statement's process, resumed with the verdict (16.17).
-    struct Attempt { const sva::Node* t; bool nonvac; uint64_t count; uint64_t killGen; Caps caps; Envs envs = nullptr; std::shared_ptr<void> wait = nullptr; };
+    struct Attempt { const sva::Node* t; bool nonvac; uint64_t count; uint64_t killGen; Caps caps; Envs envs = nullptr; std::shared_ptr<void> wait = nullptr; uint64_t start = 0; };
     std::vector<Attempt> att;
     // Procedural instances (16.14.6): pending ones on the process that queued
     // them (dropped at its next flush point), and matured ones waiting for

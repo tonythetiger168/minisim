@@ -117,6 +117,28 @@ that standard's variants of the routines (`vpi_get_1364v2005`, ...), and
 application (36.12.2). The default mode is `vpiMode1800v2009`, the newest
 the standard defines. The object model is the same in every mode so far.
 
+**Assertions (clause 39).** Every assertion, assumption and cover,
+concurrent or immediate, is an object: `vpiAssert`, `vpiAssume`,
+`vpiCover`, `vpiImmediateAssert`, `vpiImmediateAssume`, `vpiImmediateCover`,
+from `vpi_iterate(vpiAssertion, NULL)` (all of them) or from an instance or
+scope (those in it), with `vpiName`, `vpiFullName`, `vpiFile`, `vpiLineNo`,
+`vpiIsDeferred`, `vpiIsFinal`, `vpiScope` and `vpiModule`.
+`vpi_register_assertion_cb` (39.4.2) places a callback on one assertion for
+`cbAssertionStart`, `cbAssertionSuccess`, `cbAssertionVacuousSuccess`,
+`cbAssertionFailure` and `cbAssertionDisabledEvaluation` (each with the
+attempt's start time in `s_vpi_attempt_info`), and for the control reasons
+`cbAssertionDisable`, `Enable`, `Reset`, `Kill`, `Lock`, `Unlock` and the
+pass, fail and vacuous action ones; `vpi_remove_cb` removes it.
+`vpi_register_cb` takes the system reasons (39.4.1):
+`cbAssertionSysInitialized` (at the start of simulation), `SysOn`, `SysOff`,
+`SysKill`, `SysLock`, `SysUnlock`, `SysReset`, `SysEnd` (also at the end of
+simulation) and the action ones. `vpi_control` (39.5) takes every assertion
+operation of annex M, on one assertion (`vpi_control(vpiAssertionDisable,
+h)`) or the system (`vpi_control(vpiAssertionSysOff)`). The system tasks of
+20.11 (`$assertoff`, `$assertcontrol`, ...) call the same callbacks. Not
+supported: stepping (`vpiAssertionEnableStep`, `cbAssertionStepSuccess`,
+39.5.2), and `failExpr` of a failure is NULL.
+
 **Other routines.** `vpi_printf`, `vpi_vprintf`, `vpi_mcd_open`,
 `vpi_mcd_close`, `vpi_mcd_name`, `vpi_mcd_printf`, `vpi_flush`,
 `vpi_chk_error`, `vpi_get_vlog_info`, `vpi_control(vpiFinish)` and
@@ -143,7 +165,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `39-vpi-assertions.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

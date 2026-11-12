@@ -39,7 +39,7 @@ struct Cb;
 // One VPI object. `kind` says which fields are used.
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
-                Scope, Typespec, Member, EnumConst, Const, Range, Modport } kind;
+                Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -68,6 +68,8 @@ struct Cb {
     uint64_t at = 0;                      // timed callbacks: when; cbNextSimTime: when registered
     Obj* obj = nullptr;                   // cbValueChange: the object watched
     Obj* self = nullptr;                  // its handle
+    vpi_assertion_callback_func* assertFn = nullptr;   // an assertion callback (39.4.2)
+    int assertId = -1;
 };
 struct Systf {
     s_vpi_systf_data d{};
@@ -84,6 +86,10 @@ struct State {
     std::unordered_map<int, Obj*> sysObj;
     std::unordered_map<const Type*, Obj*> typeObj;
     std::unordered_map<int64_t, Obj*> constObj;
+    std::unordered_map<int, Obj*> assertObj;
+    std::unordered_map<int, std::vector<Cb*>> assertCbs;   // assertion -> its callbacks (39.4.2)
+    std::vector<Cb*> assertSys;                            // callbacks on the assertion system (39.4.1)
+    bool assertEnded = false;                              // vpiAssertionSysEnd
     const VpiSite* cur = nullptr;         // the call whose calltf / compiletf is running
     std::vector<Cb*> start, endCompile, endSim, rw, ro, next;
     std::multimap<uint64_t, Cb*> timed;   // cbAfterDelay, cbAtStartOfSimTime, and delayed synch callbacks
@@ -420,6 +426,7 @@ inline bool isProt(const Obj* o) {
         case Obj::Range: p = isProt(o->parent); break;
         case Obj::Call:
         case Obj::Arg: p = o->site && o->site->prot; break;
+        case Obj::Assertion: p = asserts()[(size_t)o->idx].prot; break;
         default: break;
     }
     o->prot = p;
@@ -988,6 +995,196 @@ public:
     }
 };
 
+// ---- the assertion API (clause 39) ----
+// Every assertion, assumption and cover of the design, concurrent or
+// immediate, is a VPI object (39.3). Callbacks on one assertion are placed
+// with vpi_register_assertion_cb (39.4.2); callbacks on the assertion
+// system with vpi_register_cb (39.4.1). The kernel reports what happens
+// through assertHook (sva.hpp); vpi_control drives assertion control (39.5).
+inline int assertType(const AssertInfo& a) {
+    bool imm = !(a.type & AT_CONCURRENT);
+    if (a.dir == AD_COVER) return imm ? vpiImmediateCover : vpiCover;
+    if (a.dir == AD_ASSUME) return imm ? vpiImmediateAssume : vpiAssume;
+    return imm ? vpiImmediateAssert : vpiAssert;
+}
+inline Obj* assertObj(int id) {
+    if (id < 0 || id >= (int)asserts().size() || asserts()[(size_t)id].hidden) return nullptr;
+    auto& o = st().assertObj[id];
+    if (!o) {
+        o = mkObj(Obj::Assertion, assertType(asserts()[(size_t)id]));
+        o->idx = id;
+        o->sym = static_cast<const Symbol*>(nullptr);
+    }
+    return o;
+}
+// The assertions directly in a scope: in the instance (not below it), or in
+// a task, block or generate scope.
+inline bool assertIn(const AssertInfo& a, const Obj* sc) {
+    if (!a.scope || !sc || !sc->sym) return false;
+    for (const Scope* s = static_cast<const Scope*>(a.scope); s; s = s->asSymbol().getParentScope()) {
+        const Symbol& y = s->asSymbol();
+        if (sc->kind == Obj::Module && y.kind == SymbolKind::InstanceBody) return y.as<InstanceBodySymbol>().parentInstance == sc->sym;
+        if (&y == sc->sym) return true;
+        if (y.kind == SymbolKind::InstanceBody) return false;
+    }
+    return false;
+}
+// The reasons an assertion callback may have, and the system ones (39.4).
+inline bool assertReason(int r) {
+    switch (r) {
+        case cbAssertionStart: case cbAssertionSuccess: case cbAssertionFailure: case cbAssertionVacuousSuccess:
+        case cbAssertionDisabledEvaluation: case cbAssertionStepSuccess: case cbAssertionStepFailure:
+        case cbAssertionLock: case cbAssertionUnlock: case cbAssertionDisable: case cbAssertionEnable:
+        case cbAssertionReset: case cbAssertionKill: case cbAssertionEnablePassAction:
+        case cbAssertionEnableFailAction: case cbAssertionDisablePassAction: case cbAssertionDisableFailAction:
+        case cbAssertionEnableNonvacuousAction: case cbAssertionDisableVacuousAction:
+            return true;
+        default: return false;
+    }
+}
+inline bool assertSysReason(int r) {
+    switch (r) {
+        case cbAssertionSysInitialized: case cbAssertionSysOn: case cbAssertionSysOff: case cbAssertionSysKill:
+        case cbAssertionSysLock: case cbAssertionSysUnlock: case cbAssertionSysEnd: case cbAssertionSysReset:
+        case cbAssertionSysEnablePassAction: case cbAssertionSysEnableFailAction: case cbAssertionSysDisablePassAction:
+        case cbAssertionSysDisableFailAction: case cbAssertionSysEnableNonvacuousAction:
+        case cbAssertionSysDisableVacuousAction:
+            return true;
+        default: return false;
+    }
+}
+// The callback reason of an assertion control (Table 20-5), for one
+// assertion or for the system.
+inline int ctlReason(int ctl, bool sys) {
+    switch (ctl) {
+        case AC_LOCK: return sys ? cbAssertionSysLock : cbAssertionLock;
+        case AC_UNLOCK: return sys ? cbAssertionSysUnlock : cbAssertionUnlock;
+        case AC_ON: return sys ? cbAssertionSysOn : cbAssertionEnable;
+        case AC_OFF: return sys ? cbAssertionSysOff : cbAssertionDisable;
+        case AC_KILL: return sys ? cbAssertionSysKill : cbAssertionKill;
+        case AC_PASSON: return sys ? cbAssertionSysEnablePassAction : cbAssertionEnablePassAction;
+        case AC_PASSOFF: return sys ? cbAssertionSysDisablePassAction : cbAssertionDisablePassAction;
+        case AC_FAILON: return sys ? cbAssertionSysEnableFailAction : cbAssertionEnableFailAction;
+        case AC_FAILOFF: return sys ? cbAssertionSysDisableFailAction : cbAssertionDisableFailAction;
+        case AC_NONVACON: return sys ? cbAssertionSysEnableNonvacuousAction : cbAssertionEnableNonvacuousAction;
+        case AC_VACOFF: return sys ? cbAssertionSysDisableVacuousAction : cbAssertionDisableVacuousAction;
+        default: return 0;
+    }
+}
+inline void fireSys(int reason) {
+    auto list = st().assertSys;   // a callback may register or remove others
+    for (Cb* c : list) {
+        if (!c->live || c->d.reason != reason) continue;
+        s_cb_data d = c->d;
+        s_vpi_time t{vpiSimTime, (PLI_UINT32)(S.now >> 32), (PLI_UINT32)S.now, (double)S.now};
+        d.time = &t;
+        d.value = nullptr;
+        d.cb_rtn(&d);
+    }
+}
+inline void onAssert(int id, int ev, uint64_t start) {
+    auto& s = st();
+    if (id < 0) {   // the assertion system
+        if (ev >= AE_CTL) fireSys(ctlReason(ev - AE_CTL, true));
+        return;
+    }
+    int reason = 0;
+    switch (ev) {
+        case AE_START: reason = cbAssertionStart; break;
+        case AE_SUCCESS: reason = cbAssertionSuccess; break;
+        case AE_VACUOUS: reason = cbAssertionVacuousSuccess; break;
+        case AE_FAILURE: reason = cbAssertionFailure; break;
+        case AE_DISABLED: reason = cbAssertionDisabledEvaluation; break;
+        case AE_RESET: reason = cbAssertionReset; break;
+        case AE_KILLED: return;   // an attempt that $assertkill ended: no outcome (39.4.2)
+        default: reason = ev >= AE_CTL ? ctlReason(ev - AE_CTL, false) : 0;
+    }
+    auto it = s.assertCbs.find(id);
+    if (!reason || it == s.assertCbs.end()) return;
+    auto list = it->second;
+    Obj* a = assertObj(id);
+    for (Cb* c : list) {
+        if (!c->live || c->d.reason != reason) continue;
+        s_vpi_time t{vpiSimTime, (PLI_UINT32)(S.now >> 32), (PLI_UINT32)S.now, (double)S.now};
+        s_vpi_attempt_info info{};
+        info.attemptStartTime = s_vpi_time{vpiSimTime, (PLI_UINT32)(start >> 32), (PLI_UINT32)start, (double)start};
+        info.detail.failExpr = nullptr;
+        bool attempt = ev <= AE_DISABLED;
+        c->assertFn(reason, &t, H(a), attempt ? &info : nullptr, c->d.user_data);
+    }
+}
+// vpi_control for assertions (39.5): on one assertion (a handle follows the
+// operation) or on the whole system.
+inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
+    int ctl = 0;
+    bool sys = false;
+    switch (op) {
+        case vpiAssertionLock: ctl = AC_LOCK; break;
+        case vpiAssertionUnlock: ctl = AC_UNLOCK; break;
+        case vpiAssertionDisable: ctl = AC_OFF; break;
+        case vpiAssertionEnable: ctl = AC_ON; break;
+        case vpiAssertionKill: ctl = AC_KILL; break;
+        case vpiAssertionReset: ctl = -1; break;
+        case vpiAssertionDisablePassAction: ctl = AC_PASSOFF; break;
+        case vpiAssertionEnablePassAction: ctl = AC_PASSON; break;
+        case vpiAssertionDisableFailAction: ctl = AC_FAILOFF; break;
+        case vpiAssertionEnableFailAction: ctl = AC_FAILON; break;
+        case vpiAssertionDisableVacuousAction: ctl = AC_VACOFF; break;
+        case vpiAssertionEnableNonvacuousAction: ctl = AC_NONVACON; break;
+        case vpiAssertionSysLock: ctl = AC_LOCK; sys = true; break;
+        case vpiAssertionSysUnlock: ctl = AC_UNLOCK; sys = true; break;
+        case vpiAssertionSysOn: ctl = AC_ON; sys = true; break;
+        case vpiAssertionSysOff: ctl = AC_OFF; sys = true; break;
+        case vpiAssertionSysKill: ctl = AC_KILL; sys = true; break;
+        case vpiAssertionSysEnd: ctl = -2; sys = true; break;
+        case vpiAssertionSysReset: ctl = -1; sys = true; break;
+        case vpiAssertionSysEnablePassAction: ctl = AC_PASSON; sys = true; break;
+        case vpiAssertionSysDisablePassAction: ctl = AC_PASSOFF; sys = true; break;
+        case vpiAssertionSysEnableFailAction: ctl = AC_FAILON; sys = true; break;
+        case vpiAssertionSysDisableFailAction: ctl = AC_FAILOFF; sys = true; break;
+        case vpiAssertionSysEnableNonvacuousAction: ctl = AC_NONVACON; sys = true; break;
+        case vpiAssertionSysDisableVacuousAction: ctl = AC_VACOFF; sys = true; break;
+        case vpiAssertionEnableStep:
+        case vpiAssertionDisableStep:
+        case vpiAssertionClockSteps:
+            error(vpiError, "vpi_control: assertion stepping (39.5.2) is not supported");
+            return 0;
+        default: return -1;   // not an assertion operation
+    }
+    std::vector<int> ids;
+    if (sys) {
+        for (size_t k = 0; k < asserts().size(); k++)
+            if (!asserts()[k].hidden) ids.push_back((int)k);
+    } else {
+        Obj* o = O(va_arg(ap, vpiHandle));
+        if (!o || o->kind != Obj::Assertion) {
+            error(vpiError, "vpi_control: an assertion operation needs an assertion handle");
+            return 0;
+        }
+        ids.push_back(o->idx);
+    }
+    if (ctl > 0) {
+        if (sys) assertControl(ctl, 15, 7, 0, {});
+        else assertControl(ctl, 255, 7, 0, {asserts()[(size_t)ids[0]].name});
+    } else {
+        // Reset: the attempts in flight are dropped and the assertion goes
+        // back to its state at the start (enabled, actions on, unlocked).
+        // SysEnd: the attempts are dropped and no more start.
+        for (int id : ids) {
+            AssertInfo& a = asserts()[(size_t)id];
+            a.killGen++;
+            if (ctl == -1) {
+                a.on = a.passOn = a.failOn = a.vacOn = true;
+                a.locked = false;
+                if (!sys) onAssert(id, AE_RESET, 0);
+            } else a.on = false;
+        }
+        if (sys) fireSys(ctl == -1 ? cbAssertionSysReset : cbAssertionSysEnd);
+        if (sys && ctl == -2) st().assertEnded = true;
+    }
+    return 1;
+}
+
 // ---- set-up from msim ----
 // Load a VPI library and run its bootstrap: vlog_startup_routines, and the
 // named routine of -load lib:boot (36.9.1).
@@ -1022,11 +1219,16 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
         f.d.compiletf(f.d.user_data);
         s.cur = nullptr;
     }
+    assertHook() = onAssert;
     fireList(s.endCompile);
     fireList(s.start);
+    fireSys(cbAssertionSysInitialized);   // 39.4.1
     if (!s.rw.empty() || !s.ro.empty()) S.rare = true;
 }
-inline void end() { fireList(st().endSim); }
+inline void end() {
+    if (!st().assertEnded) fireSys(cbAssertionSysEnd);
+    fireList(st().endSim);
+}
 }   // namespace vpi
 
 // ---- the vpi_user.h functions ----
@@ -1130,6 +1332,12 @@ vpiHandle vpi_register_cb(p_cb_data d) {
         case cbStartOfSimulation: s.start.push_back(c); break;
         case cbEndOfSimulation: s.endSim.push_back(c); break;
         default:
+            if (vpi::assertSysReason(d->reason)) { s.assertSys.push_back(c); break; }
+            if (vpi::assertReason(d->reason)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: a callback on one assertion is placed with vpi_register_assertion_cb (39.4.2)");
+                return nullptr;
+            }
             vpi::error(vpiWarning, "vpi_register_cb: reason " + std::to_string(d->reason) + " is not supported");
             return nullptr;
     }
@@ -1144,6 +1352,13 @@ PLI_INT32 vpi_remove_cb(vpiHandle h) {
     Obj* o = O(h);
     if (!o || o->kind != Obj::Callback) { vpi::error(vpiError, "vpi_remove_cb: not a callback handle"); return 0; }
     o->cb->live = false;
+    if (o->cb->assertFn) {
+        auto& l = vpi::st().assertCbs[o->cb->assertId];
+        l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
+    } else if (vpi::assertSysReason(o->cb->d.reason)) {
+        auto& l = vpi::st().assertSys;
+        l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
+    }
     if (o->cb->d.reason == cbValueChange && o->cb->obj) {
         auto& l = vpi::st().change[o->cb->obj->sig];
         l.erase(std::remove(l.begin(), l.end(), o->cb), l.end());
@@ -1300,6 +1515,8 @@ template <typename F> void eachMember(const Scope& sc, F&& f) {
         } else if (flat && m.kind == SymbolKind::GenerateBlockArray) {
             for (const auto* e : m.as<GenerateBlockArraySymbol>().entries)
                 if (!e->isUninstantiated) eachMember(*e, f);
+        } else if (m.kind == SymbolKind::StatementBlock && m.name.empty()) {
+            eachMember(m.as<StatementBlockSymbol>(), f);   // an unnamed block is not a scope of its own
         } else if (m.kind == SymbolKind::InstanceArray) {
             std::function<void(const InstanceArraySymbol&)> rec = [&](const InstanceArraySymbol& a) {
                 for (const Symbol* e : a.elements) {
@@ -1341,7 +1558,10 @@ inline const char* typeName(int type) {
         {vpiStructTypespec, "vpiStructTypespec"}, {vpiUnionTypespec, "vpiUnionTypespec"}, {vpiBitTypespec, "vpiBitTypespec"},
         {vpiLogicTypespec, "vpiLogicTypespec"}, {vpiArrayTypespec, "vpiArrayTypespec"}, {vpiVoidTypespec, "vpiVoidTypespec"},
         {vpiTypespecMember, "vpiTypespecMember"}, {vpiPackedArrayTypespec, "vpiPackedArrayTypespec"},
-        {vpiEventTypespec, "vpiEventTypespec"}, {vpiInterfaceTypespec, "vpiInterfaceTypespec"}};
+        {vpiEventTypespec, "vpiEventTypespec"}, {vpiInterfaceTypespec, "vpiInterfaceTypespec"},
+        {vpiAssert, "vpiAssert"}, {vpiAssume, "vpiAssume"}, {vpiCover, "vpiCover"},
+        {vpiImmediateAssert, "vpiImmediateAssert"}, {vpiImmediateAssume, "vpiImmediateAssume"},
+        {vpiImmediateCover, "vpiImmediateCover"}};
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
 }
@@ -1368,6 +1588,14 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
         case vpiModule:
         case vpiInstance: {
             while (o->kind == Obj::Word || o->kind == Obj::Bit) o = const_cast<Obj*>(o->parent);
+            if (o->kind == Obj::Assertion) {
+                const auto* sc = static_cast<const slang::ast::Scope*>(asserts()[(size_t)o->idx].scope);
+                if (!sc) return nullptr;
+                Obj* in = vpi::scopeObj(sc->asSymbol());
+                if (type == vpiScope || !in) return H(in);
+                if (in->kind == Obj::Module) return H(in);
+                return H(vpi::moduleObj(vpi::instOf(sc)));
+            }
             if (o->kind == Obj::Call || o->kind == Obj::Arg) {
                 // The call's own scope is the instance it was written in.
                 return H(vpi::moduleObj(static_cast<const slang::ast::InstanceSymbol*>(o->site->scope)));
@@ -1474,6 +1702,9 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
             case vpiCallback:
                 for (auto& c : s.cbs) if (c->live) add(c->self);
                 break;
+            case vpiAssertion:   // every assertion of the design (39.3)
+                for (size_t k = 0; k < asserts().size(); k++) add(vpi::assertObj((int)k));
+                break;
             default:
                 vpi::error(vpiError, "vpi_iterate: null reference handle");
                 return nullptr;
@@ -1510,6 +1741,12 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
             }
             return vpi::iter(std::move(items));
         }
+    }
+    if (type == vpiAssertion) {   // the assertions in an instance or scope (39.3)
+        if (o->kind != Obj::Module && o->kind != Obj::Scope) return nullptr;
+        for (size_t k = 0; k < asserts().size(); k++)
+            if (!asserts()[k].hidden && vpi::assertIn(asserts()[k], o)) add(vpi::assertObj((int)k));
+        return vpi::iter(std::move(items));
     }
     if (type == vpiRange) {
         auto d = vpi::dimsOf(o);
@@ -1715,6 +1952,18 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* name, vpiHandle scope) {
             bool last = k + 1 == parts.size();
             if (k > 0 && !sc) return nullptr;
             sym = sc ? sc->find(base) : top(base);
+            if (!sym && sc) {   // a name declared in an unnamed block (not a scope of its own)
+                std::function<const slang::ast::Symbol*(const slang::ast::Scope&)> look = [&](const slang::ast::Scope& in) -> const slang::ast::Symbol* {
+                    for (const auto& m : in.members())
+                        if (m.kind == SymbolKind::StatementBlock && m.name.empty()) {
+                            const auto& b = m.as<slang::ast::StatementBlockSymbol>();
+                            if (const auto* f = b.find(base)) return f;
+                            if (const auto* f = look(b)) return f;
+                        }
+                    return nullptr;
+                };
+                sym = look(*sc);
+            }
             if (!sym) return nullptr;
             size_t used = 0;
             while (used < sels.size() && !sels[used].range) {
@@ -1822,6 +2071,20 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (prop != vpiType && !(prop == vpiSize && expr) && vpi::denied(o, "vpi_get"))
         return vpiUndefined;
     auto isVar = [&] { return o->kind == Obj::Signal || o->kind == Obj::Word; };
+    if (o->kind == Obj::Assertion) {   // 39.3
+        const AssertInfo& a = asserts()[(size_t)o->idx];
+        switch (prop) {
+            case vpiType: return o->type;
+            case vpiLineNo: return a.line;
+            case vpiIsDeferred: return a.type & (AT_OBSERVED | AT_FINAL) ? 1 : 0;
+            case vpiIsFinal: return a.type & AT_FINAL ? 1 : 0;
+            case vpiIsCoverSequence: return 0;
+            case vpiIsClockInferred: return 0;
+            default:
+                vpi::error(vpiWarning, "vpi_get: property " + std::to_string(prop) + " of an assertion is not supported");
+                return vpiUndefined;
+        }
+    }
     switch (prop) {
         case vpiType: return vpi::effType(o);
         case vpiSize:
@@ -1973,6 +2236,14 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
     using slang::ast::SymbolKind;
     if (!o) return nullptr;
     if (prop != vpiType && vpi::denied(o, "vpi_get_str")) return nullptr;
+    if (o->kind == Obj::Assertion && prop != vpiType) {   // 39.3
+        const AssertInfo& a = asserts()[(size_t)o->idx];
+        if (prop == vpiFullName) return vpi::retStr(a.name);
+        if (prop == vpiName) return vpi::retStr(a.name.substr(a.name.rfind('.') + 1));
+        if (prop == vpiFile) return vpi::retStr(a.file);
+        vpi::error(vpiWarning, "vpi_get_str: property " + std::to_string(prop) + " of an assertion is not supported");
+        return nullptr;
+    }
     std::function<std::string(const Obj*, bool)> nameOf = [&](const Obj* x, bool full) -> std::string {
         switch (x->kind) {
             case Obj::Call: return s.systfs[(size_t)x->site->systf].name;
@@ -2282,8 +2553,10 @@ PLI_INT32 vpi_put_userdata(vpiHandle h, void* d) {
 
 }   // extern "C"
 namespace vpi {
-inline PLI_INT32 control(PLI_INT32 op, va_list) {
+inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap);
+inline PLI_INT32 control(PLI_INT32 op, va_list ap) {
     clearErr();
+    if (PLI_INT32 r = assertControlOp(op, ap); r >= 0) return r;
     if (op == vpiFinish || op == vpiStop) {
         S.finished = true;
         return 1;
@@ -2447,10 +2720,36 @@ void vpi_put_value_array(vpiHandle h, p_vpi_arrayvalue av, PLI_INT32* index, PLI
     }
 }
 
-// 39.4.2: callbacks on assertions. The assertion API is not implemented yet.
-vpiHandle vpi_register_assertion_cb(vpiHandle, PLI_INT32, vpi_assertion_callback_func*, PLI_BYTE8*) {
-    vpi::error(vpiWarning, "vpi_register_assertion_cb is not supported");
-    return nullptr;
+// 39.4.2: a callback on one assertion. It is called with the reason, the
+// time, the assertion, the attempt (for the start and the outcomes of an
+// attempt; null for a change made by assertion control) and the user data.
+vpiHandle vpi_register_assertion_cb(vpiHandle assertion, PLI_INT32 reason, vpi_assertion_callback_func* fn, PLI_BYTE8* ud) {
+    vpi::clearErr();
+    auto& s = vpi::st();
+    Obj* a = O(assertion);
+    if (!a || a->kind != Obj::Assertion) { vpi::error(vpiError, "vpi_register_assertion_cb: not an assertion handle"); return nullptr; }
+    if (!fn) { vpi::error(vpiError, "vpi_register_assertion_cb: no callback routine"); return nullptr; }
+    if (!vpi::assertReason(reason)) {
+        vpi::error(vpiError, "vpi_register_assertion_cb: reason " + std::to_string(reason) + " is not an assertion callback reason");
+        return nullptr;
+    }
+    if (reason == cbAssertionStepSuccess || reason == cbAssertionStepFailure) {
+        vpi::error(vpiError, "vpi_register_assertion_cb: assertion stepping (39.5.2) is not supported");
+        return nullptr;
+    }
+    if (asserts()[(size_t)a->idx].prot) { vpi::error(vpiError, "vpi_register_assertion_cb: the assertion is protected"); return nullptr; }
+    s.cbs.push_back(std::make_unique<vpi::Cb>());
+    vpi::Cb* c = s.cbs.back().get();
+    c->d.reason = reason;
+    c->d.user_data = ud;
+    c->assertFn = fn;
+    c->assertId = a->idx;
+    s.assertCbs[a->idx].push_back(c);
+    s.active = true;
+    Obj* h = vpi::mkObj(Obj::Callback, vpiCallback);
+    h->cb = c;
+    c->self = h;
+    return H(h);
 }
 
 // IEEE 1364 TF routines that VPI code from other simulators still calls (veriuser.h).

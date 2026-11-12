@@ -701,6 +701,10 @@ static size_t runAssert(const Instr& i, const shared_ptr<ProcCtl>& ctl, size_t p
     bool ok = truth(eval(i.e, rd)) == 1;
     a.evals++;
     (ok ? a.passes : a.fails)++;
+    if (assertHook()) {   // an immediate assertion's attempt starts and ends at once (39.4.2)
+        assertEvent(i.sig, AE_START, S.now);
+        assertEvent(i.sig, ok ? AE_SUCCESS : AE_FAILURE, S.now);
+    }
     if (!i.join) {
         if (ok) return a.passOn ? pc + 1 : i.hi;
         return a.failOn ? i.target : i.hi;
@@ -918,7 +922,10 @@ static void expectDone(const shared_ptr<void>& p, int res) {
     S.reactive.push_back(w->h);
     S.rare = true;
 }
-static void dropAttempts(ConcAssert& c) {   // disabled or killed: expect statements go on
+static void dropAttempts(ConcAssert& c, int ev = AE_DISABLED) {   // disabled or killed: expect statements go on
+    if (assertHook() && !asserts()[c.id].hidden)
+        for (auto& at : c.att)
+            for (uint64_t n = 0; n < at.count; n++) assertEvent(c.id, ev, at.start);
     for (auto& at : c.att) expectDone(at.wait, 2);
     for (auto& p : c.matured) expectDone(p.wait, 2);
     c.att.clear();
@@ -944,27 +951,39 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
         std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
             if (t.killGen == a.killGen) return false;
+            if (!a.hidden) for (uint64_t n = 0; n < t.count; n++) assertEvent(c.id, AE_KILLED, t.start);
             expectDone(t.wait, 2);
             return true;
         });
     if (c.disable && truth(eval(c.disable, rd)) == 1) {   // disabled: no pass, no fail (16.12)
         dropAttempts(c);
         c.pending.clear();
-        if (a.on && (ticked & 1)) a.evals++;
+        if (a.on && (ticked & 1)) {
+            a.evals++;
+            if (assertHook() && !a.hidden && !c.procedural) {   // the attempt of this tick starts disabled (39.4.2)
+                assertEvent(c.id, AE_START, S.now);
+                assertEvent(c.id, AE_DISABLED, S.now);
+            }
+        }
         return;
     }
     if (!(ticked & 1)) {
     } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait}); a.evals++; }
+        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait, S.now}); a.evals++; assertEvent(c.id, AE_START, S.now); }
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) { c.att.push_back({c.root, false, 1, a.killGen, p.caps}); a.evals++; }
+            if (!pc->killed && pc->epoch == p.epoch) {
+                c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, nullptr, S.now});
+                a.evals++;
+                assertEvent(c.id, AE_START, S.now);
+            }
         }
         c.pending.clear();
     } else if (a.on) {
-        c.att.push_back({c.root, false, 1, a.killGen, nullptr});
+        c.att.push_back({c.root, false, 1, a.killGen, nullptr, nullptr, nullptr, S.now});
         a.evals++;
+        if (!a.hidden) assertEvent(c.id, AE_START, S.now);
     }
     if (c.att.empty()) {
         for (int f : c.clearFlags) S.set(f, mk(0, 1));
@@ -1006,29 +1025,32 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
             if (dv.matches) ended = true;
             if (dv.matches && !a.hidden) {
                 a.passes += at.count * dv.matches;
+                for (uint64_t n = 0; assertHook() && n < at.count * dv.matches; n++) assertEvent(c.id, AE_SUCCESS, at.start);
                 if (a.passOn) runAction(c.pass, at.count * dv.matches, &c.capSlot, at.caps.get());
             }
             if (t->k == sva::DONE) continue;
         } else if (t->k == sva::PTRUE) {
             a.passes += at.count;
+            for (uint64_t n = 0; assertHook() && n < at.count; n++) assertEvent(c.id, dv.nonvac ? AE_SUCCESS : AE_VACUOUS, at.start);
             expectDone(at.wait, 1);
             if (dv.nonvac ? a.passOn : a.vacOn) runAction(c.pass, at.count, &c.capSlot, at.caps.get());
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            for (uint64_t n = 0; assertHook() && n < at.count; n++) assertEvent(c.id, AE_FAILURE, at.start);
             expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;
         }
         bool merged = false;
         for (auto& n : next)
-            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
+            if (n.t == t && n.nonvac == dv.nonvac && !n.wait && !at.wait && (!assertHook() || n.start == at.start) && (n.caps == at.caps || (n.caps && at.caps && *n.caps == *at.caps)) &&
                 (n.envs == envs || (n.envs && envs && *n.envs == *envs))) {
                 n.count += at.count;
                 merged = true;
                 break;
             }
-        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait});
+        if (!merged) next.push_back({t, dv.nonvac, at.count, at.killGen, at.caps, std::move(envs), at.wait, at.start});
     }
     c.att.swap(next);
     if (ended && c.endSig >= 0) {   // the sequence's end point (16.13.6)
@@ -1119,6 +1141,7 @@ inline vector<Task> concEnd() {
         for (auto& at : c.att)
             if (at.killGen == a.killGen && !sva::endValue(at.t)) {
                 a.fails += at.count;
+                for (uint64_t n = 0; assertHook() && !a.hidden && n < at.count; n++) assertEvent(c.id, AE_FAILURE, at.start);
                 if (a.failOn && c.fail)
                     for (uint64_t n = 0; n < at.count; n++) ts.push_back(startProc(c.fail, make_shared<ProcCtl>()));
             }

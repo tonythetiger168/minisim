@@ -32,6 +32,12 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI assertion API (clause 39): assertions are objects found by
+  `vpi_iterate(vpiAssertion, ...)`; `vpi_register_assertion_cb` reports each
+  attempt's start, success, vacuous success, failure and disabled
+  evaluation, and assertion control; the system callbacks
+  (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
+  assertion operation of `vpi_control` work. See `docs/VPI.md`.
 - VPI object model of SystemVerilog (clause 37): packages, interfaces with
   modports and programs as instances (`vpi_iterate(vpiInstance, NULL)`);
   generate scopes, tasks, functions and named blocks as internal scopes;
