@@ -1,0 +1,16 @@
+(SAIFILE
+(SAIFVERSION "2.0")
+(DIRECTION "forward")
+(DESIGN "top")
+(DATE "today")
+(VENDOR "test")
+(PROGRAM_NAME "hand")
+(PROGRAM_VERSION "1.0")
+(DIVIDER /)
+(INSTANCE "top" top
+ (NET (y y_net))
+ (INSTANCE "counter" u_cnt
+  (PORT (clk clk) (q q_reg "sequential"))
+ )
+)
+)

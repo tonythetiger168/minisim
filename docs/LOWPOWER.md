@@ -67,6 +67,31 @@ keeps running in a powered-off domain (9.2.1). Errors print as
 Power-aware runs use the interpreter on one thread: `-compile`, the static
 schedules and `-threads` are turned off with `-upf`.
 
+### Forward SAIF (Annex J)
+
+`msim -saif <file> -saif_forward <forward.saif>` writes a backward SAIF file
+shaped by a forward one (`-saif_forward` may be given more than once, and
+implies `-saif dump.saif`):
+
+- A library forward file (J.4: `(SAIFVERSION "2.0" "lib")`, `LIBRARY`,
+  `MODULE`) adds, for every instance of a listed cell, `(INSTANCE "cell" u1
+  (PORT ..) (LEAKAGE ..))`: per pin the simple T0/T1/TX/TC followed by the
+  state-dependent (`COND` .. `COND_DEFAULT`, split into `(RISE)` and `(FALL)`
+  where the directive says `RISE_FALL`), path-dependent (`IOPATH`,
+  `IOPATH_DEFAULT`) or both (SDPD) toggle counts (J.3.7 to J.3.9), and per
+  leakage directive the T1/T0 time of each condition (J.3.6, J.3.10.4).
+  Conditions are priority-encoded. An input toggle counts in the state just
+  before it; an output toggle in the state just before the last input toggle,
+  which is also its path (J.3.7). Pin directions come from the design.
+- An RTL forward file (J.5: `INSTANCE`, `PORT`, `NET` mappings) keeps only the
+  listed points, under their mapped names; a vector is written bit by bit. A
+  port mapping with a type is a `VIRTUAL_INSTANCE` of that type (J.3.11),
+  whose pin is `Q` unless the mapped name ends in `/pin`.
+
+Limits: a toggle whose state has an x or z in a condition pin is not counted
+in any item; a pin wider than one bit has no state-dependent data; when RTL
+and library files are both given, the RTL mapping is written.
+
 ### Not yet
 
 `map_*`, `use_interface_cell`, `define_*_cell`, `set_port_attributes`,
