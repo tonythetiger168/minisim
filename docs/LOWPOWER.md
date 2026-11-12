@@ -48,6 +48,7 @@ turned on.
 | `create_power_domain` (`-elements`, `-include_scope`, `-exclude_elements`, `-supply`) | each instance belongs to the domain with the closest element above it |
 | `create_supply_port`, `create_supply_net` (`-domain`, `-resolve`), `connect_supply_net`, `create_supply_set`, `associate_supply_set`, `set_domain_supply_net` | supply subnets with a state (`OFF`, `FULL_ON`, `PARTIAL_ON`, `UNDETERMINED`) and a voltage (9.2.3) |
 | `connect_supply_net` to an HDL port, `-vct`, `create_hdl2upf_vct`, `create_upf2hdl_vct` (4.10, Annex B) | a supply net connected to a one-bit port of the design that is not a UPF supply port: an output port drives the net (its logic value becomes the supply state), an input port is driven by the net (held at the converted state). The twelve predefined tables of Annex B (`SV_LOGIC2UPF`, `UPF2SV_LOGIC`, the `_GNDZERO` and `VHDL_` ones, `SV_TIED_HI`, ...) and tables of the power intent's own. Without `-vct`: `SV_LOGIC2UPF` for an output, `UPF2SV_LOGIC` for an input |
+| `find_objects` (6.33) | instances (`-object_type inst`, the default), instances by module (`model`), ports with `-direction`, nets, and the UPF's own `supply_port` / `supply_net`, below a scope; `-transitive`, glob (`*` `?`; brackets are part of a name such as `d[3]`), `-regexp`, `-exact`, `-ignore_case`, `-leaf_only`, `-non_leaf`. The result is a Tcl list of names relative to the current scope, so it feeds `foreach`, `-elements` and the other commands. `set_design_top` places the power top as it is read, so queries see the right instance |
 | `create_vcm`, `connect_supply_net -vcm` (4.10, 6.14, 6.30) | value conversion methods. Table VCMs for one-bit (`bit`, `logic`, `std_logic`, `boolean`), real, integer and enum ports, both directions; `-field` converts one field of a packed or unpacked struct port (`a.b` for a nested struct), and a struct input can take one upf2hdl VCM for each field, the other fields staying `x` until their VCM drives them. Every check of 6.30.3 to 6.30.7 (ranges, overlaps, rows for every state or value). hdl2upf: the first row whose range holds the HDL value sets the state, and the voltage when the row gives one (`*`: the HDL value in volts); no row: UNDETERMINED. upf2hdl: the row for the net's state (and voltage) sets the port, `*` the voltage in volts, `Xreal` / `Zreal` the package values; no row is a run-time error. `-vcms` lists are picked from per port by type and direction (4.10.2). A port of type `upfSupplyTypeT` (`supply_net_type`) connects with no VCM. The Annex B tables and the legacy VCTs are VCMs too. Function and model VCMs (6.30.8, 6.30.9): msim checks the function's or module's signature (one input, one output, exactly one side `upfSupplyTypeT`, the HDL side of the port's type), then binds a small module into the simulation top that calls the function, or instantiates the model with `-parameters`, on the port; the HDL side follows the language's own semantics. With `-upf_verbose` the generated SystemVerilog is printed |
 | Supply ports by pg_type (4.5.4.6.2, 6.14, 6.15) | a port's pg_type is its `UPF_pg_type` attribute, from `set_port_attributes -pg_type` or the HDL. `connect_supply_net -pg_type` with `-cells`, `-domain` or `-elements` connects the net to every such port of the selected instances below the scope; `connect_supply_set -connect {function pg_type}` does the same for its elements; and each function of a domain's primary supply set goes automatically to the ports of the default pg_type (`power`: `primary_power`, `ground`: `primary_ground`, the bias functions their own names) of the instances in its extent. A port keeps the first of these that reaches it, in that order, after any `-ports` connection |
 | `create_upf_library`, `use_upf_library`, `load_upf_library` (5.11, 6.29, 6.36, 6.63) | libraries of VCMs: `lib::name`, `IEEE::name` and `.::name` inside a library; `use_upf_library` makes a library's names visible in its scope and the scopes below, or in the library being created; a simple name found in two visible libraries is an error. A library file runs once however often it is loaded |
@@ -93,6 +94,31 @@ keeps running in a powered-off domain (9.2.1). Errors print as
 Power-aware runs use the interpreter on one thread: `-compile`, the static
 schedules and `-threads` are turned off with `-upf`.
 
+### Forward SAIF (Annex J)
+
+`msim -saif <file> -saif_forward <forward.saif>` writes a backward SAIF file
+shaped by a forward one (`-saif_forward` may be given more than once, and
+implies `-saif dump.saif`):
+
+- A library forward file (J.4: `(SAIFVERSION "2.0" "lib")`, `LIBRARY`,
+  `MODULE`) adds, for every instance of a listed cell, `(INSTANCE "cell" u1
+  (PORT ..) (LEAKAGE ..))`: per pin the simple T0/T1/TX/TC followed by the
+  state-dependent (`COND` .. `COND_DEFAULT`, split into `(RISE)` and `(FALL)`
+  where the directive says `RISE_FALL`), path-dependent (`IOPATH`,
+  `IOPATH_DEFAULT`) or both (SDPD) toggle counts (J.3.7 to J.3.9), and per
+  leakage directive the T1/T0 time of each condition (J.3.6, J.3.10.4).
+  Conditions are priority-encoded. An input toggle counts in the state just
+  before it; an output toggle in the state just before the last input toggle,
+  which is also its path (J.3.7). Pin directions come from the design.
+- An RTL forward file (J.5: `INSTANCE`, `PORT`, `NET` mappings) keeps only the
+  listed points, under their mapped names; a vector is written bit by bit. A
+  port mapping with a type is a `VIRTUAL_INSTANCE` of that type (J.3.11),
+  whose pin is `Q` unless the mapped name ends in `/pin`.
+
+Limits: a toggle whose state has an x or z in a condition pin is not counted
+in any item; a pin wider than one bit has no state-dependent data; when RTL
+and library files are both given, the RTL mapping is written.
+
 ### Not yet
 
 The implementation commands are checked and do not change the simulation:
@@ -104,7 +130,9 @@ child instance; a strategy on a port of the simulation top itself, or on a
 hierarchical reference, has no cell. `-applies_to flop` / `latch` of a
 retention strategy are not told apart. A supply net driven from a one-bit HDL
 port through a table has a state and no voltage.
-`create_upf_library` makes no Tcl namespace. Tcl
+`create_upf_library` makes no Tcl namespace. `find_objects -object_type process` is not supported (msim does not name
+processes), and `mdebug -upf` reads files without a design, so it does not
+run `find_objects` on HDL objects. Tcl
 has no `namespace`, `upvar`, `regexp` or file I/O.
 
 ## Static checks: `mlint -upf`
