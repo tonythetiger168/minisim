@@ -180,6 +180,17 @@ object it refers to (NULL for a null handle, `vpiObjId`), and
 `vpi_iterate(vpiVariables, obj)` its properties, base class first, static
 ones included, as variables that read and write.
 
+**Class definitions (37.29).** `vpiClassDefn` from a class variable (its
+declared class), a class typespec, a method, or a class object (the class
+the object was made of, its dynamic type: a `Base` variable holding a
+`Child` object gives `Child`, and the object's `vpiVariables` include
+`Child`'s properties). A class definition has `vpiName`, `vpiFullName`,
+`vpiVirtual` (1 for a `virtual class`), `vpiLineNo`, `vpiFile`; `vpiExtends`
+gives an extends object whose `vpiClassTypespec` names the base class;
+`vpiMethods` iterates the tasks and functions the class declares (each with
+`vpiVirtual`), `vpiDerivedClasses` the classes that extend it, and
+`vpiVariables` its static properties.
+
 **Drivers and loads (37.16, 37.17).** On a net or variable,
 `vpiLocalDriver` gives the continuous assignments inside its module whose
 left side writes it and the output (or inout) ports of child instances
@@ -260,8 +271,8 @@ objects in decryption envelopes: see "VPI and DPI" in `docs/PROTECT.md`.
 
 ## Not yet
 
-Class methods and the dynamic type of a class object (a derived object
-shows the properties of the variable's class), containers of structs,
+Pure virtual method prototypes in `vpiMethods`, the non-static property
+declarations of a class definition, constraints (37.30), containers of structs,
 classes or containers, the value of a non-constant expression, drivers and
 loads of a bit or part of a signal and of primitive terminals,
 instance arrays as objects, delays of anything but a net (primitives,
@@ -273,7 +284,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

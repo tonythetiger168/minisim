@@ -32,6 +32,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI class definitions (37.29): `vpiClassDefn`, `vpiExtends`,
+  `vpiMethods`, `vpiDerivedClasses` and static `vpiVariables`; a class
+  object now reports the class it was made of, and its properties include
+  that class's own. `tests/spec/37-vpi-classes.sv`.
 - VPI drivers and loads (37.16, 37.17): `vpiDriver`, `vpiLoad`,
   `vpiLocalDriver`, `vpiLocalLoad` and `vpiPortInst` on nets and variables
   give continuous assignments and instance ports, following whole-signal
