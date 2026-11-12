@@ -47,6 +47,14 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- UVM (IEEE 1800.2-2020): three tests cover the classes that compiled but
+  had no check of their own: `tests/uvm/base_extras.sv` (`uvm_time`,
+  `uvm_heartbeat`, `uvm_sequence_library`, report macros,
+  `uvm_callback_iter`, `uvm_run_test_callback`, `uvm_root`),
+  `reg_extras.sv` (`uvm_reg_file`, `uvm_reg_indirect_data`, `uvm_reg_fifo`,
+  `uvm_vreg`, `uvm_vreg_field`, `uvm_mem_mam`, block lookups) and
+  `reg_sequences.sv` (the built-in register and memory test sequences of
+  Annex E, each also run against a faulty DUT).
 - `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
   the object a module's class handle variable points to is a signal
   `tb.p.addr` that follows the handle (x while it is null), with handle
@@ -726,6 +734,12 @@ Spec references are IEEE 1800-2023 clauses.
   `mplan report -rank` adds it to `plan.html` and `plan.json`.
 
 ### Fixed
+- `q.size() ? q.pop_front() : d` popped before the size was tested, and
+  `c ? i++ : i` incremented whatever `c` was: an arm of `?:` with a pop or
+  an assignment now runs only when picked (11.4.11). `uvm_reg_fifo` reads
+  depend on it.
+- A `randc` property named in `randomize(v)` lost its cycle (18.11);
+  `uvm_sequence_library` in `UVM_SEQ_LIB_RANDC` mode depends on it.
 - msim memory on big VIP benches: a 2-state unpacked array with more than
   64 elements gets its 0 defaults (6.8) from a loop instead of one
   instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and

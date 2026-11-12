@@ -2946,7 +2946,15 @@ struct Lowerer {
         using namespace slang::ast;
         struct V : ASTVisitor<V, VisitFlags::Expressions> {
             bool found = false;
-            void handle(const CallExpression& c) { if (!c.isSystemCall()) found = true; else visitDefault(c); }
+            void handle(const CallExpression& c) {
+                std::string_view n = c.isSystemCall() ? c.getSubroutineName() : std::string_view{};
+                if (!c.isSystemCall() || n == "pop_front" || n == "pop_back") found = true;   // q.size() ? q.pop_front() : d
+                else visitDefault(c);
+            }
+            void handle(const AssignmentExpression&) { found = true; }
+            void handle(const UnaryExpression& u) {
+                if (OpInfo::isLValue(u.op)) found = true; else visitDefault(u);
+            }
             void handle(const NewClassExpression&) { found = true; }
             void handle(const CopyClassExpression&) { found = true; }
         } v;
