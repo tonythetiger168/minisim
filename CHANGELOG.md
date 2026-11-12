@@ -27,6 +27,17 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- VPI: a variable of a SystemVerilog type no longer reports `vpiReg` (an
+  `int` is a `vpiIntVar`, a `bit` vector a `vpiBitVar`), a
+  one-dimensional array reports `vpiRegArray` (`vpiIsMemory` is 1 and
+  `vpi_iterate(vpiMemory, ...)` still finds it), `vpiInternalScope` gives
+  the generate scopes, tasks, functions and named blocks instead of the
+  module instances, and objects in a generate block belong to its
+  `vpiGenScope`. Define `VPI_COMPATIBILITY_VERSION_1364v2001` for the old
+  view.
+- `vpi_user.h`: `vpiFuncType` is 44 and `vpiNetDeclAssign` is 43, as annex K
+  says (they were swapped). A VPI library built against the old header
+  must be rebuilt.
 - `mchar` measures input pin power: `internal_power` groups without a
   `related_pin` get the supply energy of an edge that moves no output, and
   the output arcs on the same pin hold the energy beyond it. The mini45
@@ -44,6 +55,21 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `mlint` reset tree checks: `RDC005` (a reset synchronizer of one flop) and
+  `RDC006` (an asynchronous reset made by combinational logic of several
+  flops). `-cdc-report` lists the reset synchronizers, their length and how
+  many flops each resets.
+- `mlint` `CDC004` follows synchronized signals through flops: signals
+  synchronized separately that meet again up to `-cdc-depth N` flops later
+  (default 2) are reported, once per set of signals.
+- `mlint -sdc file.sdc`: the CDC and RDC checks take the clocks and how they
+  are related from the timing constraints (`src/cdc_sdc.hpp`, the SDC
+  commands that set a domain, on the shared Tcl interpreter): generated
+  clocks are synchronous to their master, `set_clock_groups -asynchronous`
+  and a false path between two clocks make a pair a crossing, exclusive
+  groups are not checked, any other pair is synchronous. New rule `CDC006`:
+  a flop's clock is not a clock in the SDC file. `-cdc-report` lists the SDC
+  clocks of every domain (`docs/CDC.md`).
 - `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
   the object a module's class handle variable points to is a signal
   `tb.p.addr` that follows the handle (x while it is null), with handle
@@ -147,6 +173,13 @@ Spec references are IEEE 1800-2023 clauses.
   library's cells; the `mpnr` test places, routes and DRC-checks one.
 - `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
   and transitions of FSMs), in the totals, the history and `mplan init`.
+- `mregress -farm`: runs go to a compute farm instead of the local machine:
+  `lsf` (bsub -K), `slurm` (srun), `sge` (qsub -sync y), `ssh:HOST[*N],...`
+  or `cmd:TEMPLATE` for any other launcher. `-farm-opts`, `-farm-cpus`
+  (cores per job and msim -threads), `-farm-retries` (a job that never ran
+  is submitted again), `-farm-wait`, `-farm-dry`. The time limit runs on the
+  farm host, so queue time does not count; results come back through the
+  shared run directory.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
   inside a scope, their port connections and which instance feeds which.
 - `mdebug`: tasks and functions in a module, call output arguments, `force`,
@@ -461,6 +494,31 @@ Spec references are IEEE 1800-2023 clauses.
 - Foreach constraints with several loop variables over containers of
   containers, `foreach (q[i, j]) q[i][j] inside {[1:5]};` (18.5.8.1), also
   over a fixed-size array of queues and associative arrays with string keys.
+- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
+  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
+  callback reason and the assertion and coverage declarations of annex M,
+  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
+  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
+  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
+  the caller's mode. New routines `vpi_get_value_array` and
+  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
+  a user system task. See `docs/VPI.md`.
+- VPI object model of SystemVerilog (clause 37): packages, interfaces with
+  modports and programs as instances (`vpi_iterate(vpiInstance, NULL)`);
+  generate scopes, tasks, functions and named blocks as internal scopes;
+  variables and nets report their SystemVerilog type (`vpiBitVar`,
+  `vpiIntVar`, `vpiEnumVar`, `vpiStructVar`, `vpiStringVar`, ...) and have a
+  typespec with enum constants, struct members and typedef names; arrays of
+  any number of dimensions with ranges, `vpi_handle_by_multi_index` and
+  names like `top.m[1][2][3]`; `vpiHighConn`; `pkg::name` in
+  `vpi_handle_by_name`. An application built for IEEE 1364
+  (`vpi_compatibility.h`) keeps that standard's view. See `docs/VPI.md`.
+- VPI assertion API (clause 39): assertions are objects found by
+  `vpi_iterate(vpiAssertion, ...)`; `vpi_register_assertion_cb` reports each
+  attempt's start, success, vacuous success, failure and disabled
+  evaluation, and assertion control; the system callbacks
+  (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
+  assertion operation of `vpi_control` work. See `docs/VPI.md`.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
@@ -706,13 +764,12 @@ Spec references are IEEE 1800-2023 clauses.
   HTML page, `plan.json`, the history and `mplan trend` show it, `-trace`
   writes the matrix as CSV, `-fail-on-uncovered` gates on it, and
   `mplan init -reqs` drafts a plan from the list.
-- `mregress -farm`: runs go to a compute farm instead of the local machine:
-  `lsf` (bsub -K), `slurm` (srun), `sge` (qsub -sync y), `ssh:HOST[*N],...`
-  or `cmd:TEMPLATE` for any other launcher. `-farm-opts`, `-farm-cpus`
-  (cores per job and msim -threads), `-farm-retries` (a job that never ran
-  is submitted again), `-farm-wait`, `-farm-dry`. The time limit runs on the
-  farm host, so queue time does not count; results come back through the
-  shared run directory.
+- `mplan rank`: per-test coverage and test ranking from the per-run
+  coverage databases of `mregress -cov`. A greedy order by new coverage
+  points (`-by rate`: per second of run time), each test's unique points,
+  the redundant tests, `-keep FILE` for the short list with the same
+  coverage, and with a plan the tests behind each feature's coverage.
+  `mplan report -rank` adds it to `plan.html` and `plan.json`.
 
 ### Fixed
 - msim memory on big VIP benches: a 2-state unpacked array with more than

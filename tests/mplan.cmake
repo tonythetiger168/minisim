@@ -183,3 +183,29 @@ expect("reqif init" ${rc} 0 "${out}" "feature CNT-1 \"Counting\"\n    feature CN
 file(WRITE ${OUT}/bad.csv "name,text\nx,y\n")
 execute_process(COMMAND ${MPLAN} check ${OUT}/rq.vplan -reqs ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("bad reqs" ${rc} 2 "${out}" "bad\\.csv: no 'id' column")
+
+# Ranking: what each passing test adds (per-run coverage databases), the redundant ones, the tests behind a feature.
+execute_process(COMMAND ${MPLAN} rank ${PLAN} -results ${OUT}/r1 -keep ${OUT}/keep.list -json ${OUT}/rank.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("rank" ${rc} 0 "${out}" "1  count_down +54 +39\\.4%" "2  count_wrap +7 +44\\.5%" "3  count_up +2 +46\\.0%"
+       "3 of 3 tests reach 46\\.0% \\(63/137 points\\)" "not ranked \\(not passing\\): sb_check"
+       "count\\.wrap: count_wrap \\(1\\)" "reset: count_down \\(31\\), count_wrap \\(29\\), count_up \\(25\\)")
+file(READ ${OUT}/keep.list keep)
+if(NOT keep STREQUAL "count_down\ncount_wrap\ncount_up\n")
+  message(FATAL_ERROR "keep list wrong:\n${keep}")
+endif()
+execute_process(COMMAND ${MPLAN} rank -results ${OUT}/r1 -all -threads 1 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("rank -all" ${rc} 0 "${out}" "4 of 4 tests reach 48\\.9% \\(67/137 points\\)")
+execute_process(COMMAND ${MPLAN} rank -results ${OUT}/f1 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+expect("rank redundant" ${rc} 0 "${out}" "1  b +170 +87\\.6%" "redundant \\(add nothing\\): a")
+execute_process(COMMAND ${MPLAN} report ${PLAN} -results ${OUT}/r1 -o ${OUT}/kplan -no-history -rank -q
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+file(READ ${OUT}/kplan/plan.html page)
+file(READ ${OUT}/kplan/plan.json js)
+if(NOT page MATCHES "<h2>Tests by what they add</h2>" OR NOT js MATCHES "\"ranking\": {\"by\": \"points\"")
+  message(FATAL_ERROR "report -rank: no ranking in plan.html / plan.json")
+endif()
+execute_process(COMMAND ${MPLAN} rank -results ${OUT}/r3x RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+if(rc EQUAL 0)
+  message(FATAL_ERROR "rank on a missing directory passed")
+endif()

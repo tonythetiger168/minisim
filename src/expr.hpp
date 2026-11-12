@@ -1464,7 +1464,8 @@ enum SysFnId : int {
     // edge that happened in this time step went from or to x / z and none
     // certainly happened.
     SF_XPROP_EDGE,
-    SF_ANNEXD            // Annex D optional tasks and functions: lo is the AnnexOp, run by g_annexHook
+    SF_ANNEXD,           // Annex D optional tasks and functions: lo is the AnnexOp, run by g_annexHook
+    SF_VALUE_WIDTH       // the width in bits of kid0's value, which may be known only at run time (a stream)
 };
 // Annex D (annexd.inc): $countdrivers (kid0 the net signal, kid1 the bit;
 // AD_COUNT_GET k reads count k of the last call), $log / $nolog, $key /
@@ -2262,6 +2263,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             if (g_sdfHook) g_sdfHook(args);
             return sint(0);
         }
+        case SF_VALUE_WIDTH: return mk((uint64_t)a[0].w, 32);
         case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();

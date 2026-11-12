@@ -162,6 +162,48 @@ counts (the `Reqs` column of `mplan trend`), and:
 - `mplan init -reqs FILE -o draft.vplan` drafts a plan with one feature per
   requirement, nested like the requirements.
 
+## Ranking and per-test coverage
+
+`mregress -cov` keeps one coverage database per run. `mplan rank` reads
+them and says what each test adds:
+
+```
+$ mplan rank uart.vplan -results regress.d -keep keep.list
+Rank  Test          New  Coverage  Seconds  Unique
+   1  uart_random  5120     71.3%     41.0     310
+   2  uart_parity   640     80.2%      6.5     122
+   ...
+mplan: 34 of 300 tests reach 92.1% (6610/7177 points) in 97.0s of 900.0s
+redundant (add nothing): uart_smoke, uart_tx_1, ...
+```
+
+A coverage point is one of `mcov`'s items (the same ones `mcov rank`
+counts): a line, a branch outcome, a toggle direction of one bit, a
+condition vector, an FSM state or transition, a covergroup bin, or an
+assertion that passed (a cover directive that was hit). `mcov rank` ranks
+database files; `mplan rank` works from the regression instead: it names
+tests rather than files, joins the seeds of a test, leaves failing tests
+out, can order by run time, and ties the tests to the plan's features. The order is
+greedy: the test with the most points first, then the one that adds the
+most new points, and so on. `-by rate` orders by new points per second of
+run time instead, which gives the cheapest way to the same coverage.
+
+- **New** is what the test adds to the ones above it, **Coverage** the
+  total so far, **Unique** the points no other test covers (removing the
+  test loses them).
+- Tests that add nothing are listed as redundant. `-keep FILE` writes the
+  others, one name a line, in rank order: a short regression with the same
+  coverage.
+- Failing tests are left out; `-all` ranks them too. The seeds of a test
+  count together.
+- With a plan, each feature lists the tests that cover points of its own
+  coverage metrics, most points first.
+- `-json FILE` writes all of it; `-n N` prints only the first N ranks.
+
+`mplan report -rank [-by rate]` puts the ranking and the per-feature tests
+in `plan.html` and `plan.json`. The per-run databases are read in parallel
+(`-threads`). The result does not depend on the worker count.
+
 ## Triage
 
 Every failing run goes into a bucket by its failure signature: mregress's,
