@@ -543,6 +543,10 @@ Spec references are IEEE 1800-2023 clauses.
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI assertion stepping (39.5.2): `vpiAssertionEnableStep` /
+  `vpiAssertionDisableStep` with `cbAssertionStepSuccess` /
+  `cbAssertionStepFailure` for each clock step of each attempt.
+  `tests/spec/39.5-vpi-assert-step.sv`.
 - VPI `vpi_control(vpiCoverageMerge, type, name)` (40.5.1): adds the
   statement, toggle, FSM or assertion counts of a saved msim coverage
   database to the current run. `tests/spec/40-vpi-coverage-merge.sv`.
