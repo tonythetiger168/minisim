@@ -44,6 +44,26 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
 // $writememh / $writememb (21.5): one word per line, every digit written
 // (x and z as x and z), no @ addresses. The default range is the whole
 // memory, lowest address first; start and finish pick a range and order.
+// A multidimensional memory in a $readmem / $writemem file (21.4.3): an
+// address picks a word of the highest dimension, and its words of the
+// lower dimensions follow in row-major order, each dimension from its low
+// address up. k numbers those words; memSub is how many there are.
+static int64_t memSub(const ArrShape& a) {
+    int64_t n = 1;
+    for (size_t d = 1; d < a.dims.size(); d++) n *= std::abs(a.dims[d].first - a.dims[d].second) + 1;
+    return n;
+}
+static std::vector<int64_t> memIdx(const ArrShape& a, int64_t addr, int64_t k) {
+    std::vector<int64_t> idx(a.dims.size());
+    idx[0] = addr;
+    for (size_t d = a.dims.size(); d-- > 1;) {
+        auto [l, r] = a.dims[d];
+        int64_t n = std::abs(l - r) + 1;
+        idx[d] = std::min(l, r) + k % n;
+        k /= n;
+    }
+    return idx;
+}
 static void writeMem(const Instr& i) {
     const ArrShape& a = *i.arr;
     auto [l, r] = a.dims[0];
@@ -54,8 +74,10 @@ static void writeMem(const Instr& i) {
     std::ofstream out(i.fmt);
     if (!out) { std::cerr << "$writemem: cannot open " << i.fmt << "\n"; return; }
     int64_t step = finish < start ? -1 : 1;
+    const int64_t sub = memSub(a);
     for (int64_t ad = start;; ad += step) {
-        int64_t off = a.offset({ad});
+      for (int64_t k = 0; k < sub; k++) {
+        int64_t off = a.offset(memIdx(a, ad, k));
         if (off >= 0) {
             Val v = S.get(R(a.base) + (int)off);
             v.sgn = false;
@@ -74,6 +96,7 @@ static void writeMem(const Instr& i) {
             }
             out << s << "\n";
         }
+      }
         if (ad == finish) break;
     }
 }
@@ -205,10 +228,16 @@ static void readMem(const Instr& i) {
     if (i.args.size() > 1) { Val v = eval(i.args[1], rd); if (!v.x) { finish = v_to_i64(v); haveFinish = true; } }
     int64_t step = (haveFinish && finish < start) ? -1 : 1;
     if (!haveFinish) finish = highA;
-    std::ifstream in(i.fmt);
-    if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    int64_t addr = start;
+    std::string text;
+    if (i.pw == 2) {   // $sreadmemb / $sreadmemh (D.14): the data is in the string arguments
+        for (size_t k = 2; k < i.args.size(); k++) { Val sv = eval(i.args[k], rd); sv.str = true; text += v_str(sv) + "\n"; }
+    } else {
+        std::ifstream in(i.fmt);
+        if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    int64_t addr = start, k = 0;
+    const int64_t sub = memSub(a);
     int bits = i.hex ? 4 : 1;
     int64_t words = 0;
     bool sawAddr = false;
@@ -232,6 +261,7 @@ static void readMem(const Instr& i) {
         p = e;
         if (c == '@') {
             addr = (int64_t)std::stoull(tok, nullptr, 16);
+            k = 0;
             sawAddr = true;
             if (!inRange(addr)) { std::cerr << "$readmem: address " << tok << " out of range in " << i.fmt << "\n"; return; }
             continue;
@@ -251,14 +281,14 @@ static void readMem(const Instr& i) {
                 acc = v_or(v_shl(acc, sh), dig);
             }
             if (!inRange(addr)) break;
-            int64_t off = a.offset({addr});
+            int64_t off = a.offset(memIdx(a, addr, k));
             if (off < 0) break;
             if (a.twoState) {
                 acc.v &= ~acc.x; acc.x = acc.z = 0;
                 for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
             }
             S.set(R(a.base) + (int)off, acc);
-            addr += step;
+            if (++k == sub) { k = 0; addr += step; }
             words++;
             continue;
         }
@@ -274,17 +304,17 @@ static void readMem(const Instr& i) {
             else { std::cerr << "$readmem: bad digit '" << d << "' in " << i.fmt << "\n"; return; }
         }
         if (!inRange(addr)) break;
-        int64_t off = a.offset({addr});
+        int64_t off = a.offset(memIdx(a, addr, k));
         if (off < 0) break;
         if (a.twoState) { v &= ~x; x = z = 0; }
         S.set(R(a.base) + (int)off, make(v, x, a.elemW, z));
-        addr += step;
+        if (++k == sub) { k = 0; addr += step; }
         words++;
     }
     // A file with no @address whose word count differs from the range warns
     // (21.4): the range given by start and finish addresses, or, with no
     // finish address, a file with more words than the memory has room for.
-    int64_t range = (step > 0 ? finish - start : start - finish) + 1;
+    int64_t range = ((step > 0 ? finish - start : start - finish) + 1) * sub;
     if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
 }
@@ -1142,6 +1172,15 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     c.pending.push_back({ctl, ctl->epoch, caps});
     S.rare = true;
 }
+// The assume set of a checker ticked (17.7.2): new random values for its
+// active free variables, tried again while an assumption would fail now.
+static void freeSolveNow(ConcAssert& c) {
+    if (c.solveVars.empty()) return;
+    for (int t = 0; t < 4096; t++) {   // random tries: no search, so a narrow assume set can still miss (allowed)
+        for (int v : c.solveVars) S.set(v, S.freeValue(v));
+        if (!c.solveOk || truth(eval(c.solveOk, rd)) == 1) return;
+    }
+}
 // A multiclock assertion (16.13): one process per clock marks it ticked;
 // the first in a time step runs the assertion in the observed region, once,
 // with every clock that ticked in that step.
@@ -1153,6 +1192,7 @@ inline Task concClockProc(int k, int ci) {
         if (ev->size() > 1) co_await WaitAny{ev};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
         if (iff && truth(eval(iff, rd)) != 1) continue;
+        if (ci == 0) freeSolveNow(c);
         c.ticked |= 1u << ci;
         if (c.due) continue;
         c.due = true;
@@ -1170,6 +1210,7 @@ inline Task concProc(int k) {
         if (ev->size() > 1) co_await WaitAny{ev};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
         if (c.clkIff && truth(eval(c.clkIff, rd)) != 1) continue;   // @(posedge clk iff en)
+        freeSolveNow(c);
         co_await ToObserved{};
         concTick(c);
     }
@@ -1929,3 +1970,4 @@ inline void startClockings() {
 #include "cover_rt.inc"
 #include "tchk.inc"
 #include "sdf_annotate.inc"
+#include "annexd.inc"
