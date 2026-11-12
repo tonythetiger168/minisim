@@ -326,6 +326,10 @@ static void mergePartialDrivers(LowerResult& lowered) {
     for (auto& lp : lowered.procs)
         for (auto& i : lp.prog.code)
             if (i.k == IK::Force) return;   // release goes back to the drivers (10.6.2)
+    for (auto& sp : lowered.subs)   // also a force in a task or function
+        if (sp)
+            for (auto& i : sp->code)
+                if (i.k == IK::Force) return;
     for (auto& lp : lowered.procs) {
         auto& code = lp.prog.code;
         // Only a continuous assign: Assign, wait, jump back.
