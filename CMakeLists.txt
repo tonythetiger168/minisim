@@ -359,6 +359,12 @@ if(MINISIM_WITH_SLANG)
                        -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
       set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
     endforeach()
+    # UVM transaction recording read back by mdebug -tr.
+    add_test(NAME mdebug_uvm_tr
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DUVM_HOME=${UVM_HOME}
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_uvm_tr
+                     -P ${CMAKE_SOURCE_DIR}/tests/mdebug_uvm_tr.cmake)
+    set_tests_properties(mdebug_uvm_tr PROPERTIES LABELS "uvm")
   endif()
 
   # mini45's Verilog models against the functions in its Liberty files.

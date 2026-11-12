@@ -15,6 +15,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
+  uvm-core writes (`tr_db.log`): streams, each item's begin, end, fields and
+  parent sequence, those in progress at `-at T`, and stream rows in the
+  viewer's waves.
 - `msim -i` and `msim -do FILE`: interactive simulation like VCS UCLI:
   `run [T]`, `step`, stops on a signal change, edge or value, `print` of
   signals and class objects (properties, inherited ones, paths through

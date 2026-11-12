@@ -329,6 +329,40 @@ the task's formals, so the fan-in cone crosses the call. `force` and the
 procedural `assign` are listed as `[..., force]` and `[..., assign]`. A net
 declared with a value (`wire n = a + b;`) is a continuous assignment.
 
+## UVM transactions
+
+`-tr FILE` reads the transactions UVM recorded: the text database
+`uvm_text_tr_database` writes (`tr_db.log` by default) when
+`recording_detail` is on, for sequences and sequence items started on a
+sequencer and for every `begin_tr`/`end_tr` in a driver or monitor. Turn it
+on in the testbench and run msim as usual:
+
+```systemverilog
+uvm_config_db#(uvm_bitstream_t)::set(null, "*", "recording_detail", UVM_FULL);
+```
+
+```
+msim -uvmhome $UVM_HOME tb.sv -vcd tb.vcd
+mdebug tb.sv -vcd tb.vcd -tr tr_db.log -trans
+uvm_test_top.e.ag.sqr.s  6 transactions  (0 to 100000)
+uvm_test_top.e.ag.d.drive  5 transactions  (10000 to 100000)
+uvm_test_top.e.ag.m.observed  5 transactions  (15000 to 100000)
+mdebug tb.sv -tr tr_db.log -trans -at 35000
+uvm_test_top.e.ag.d.drive at 35000:
+  #5 t  @30000 to 40000  a='h22 b='ha sum='h0  (in #0 s on uvm_test_top.e.ag.sqr.s)
+uvm_test_top.e.ag.m.observed at 35000:
+  #6 t  @35000 to 40000  a='h22 b='ha sum='h2c
+```
+
+`-trans STREAM` lists one stream (its full name or a unique tail such as
+`ag.d.drive`); `-at T` keeps the transactions in progress at `T`, so the
+driver's item and the monitor's view of the same bus cycle sit side by
+side. Each line gives the fields the item recorded and the sequence it ran
+in. The page draws each stream as a row under the waves, one lane per
+transaction in flight; a click on a transaction shows its fields and
+parent and moves the cursor to its start. Times are the simulation's, the
+same as the waveform's. In `-script`: `trans [STREAM] [T]`.
+
 ## Interactive simulation (msim -i)
 
 `msim -i` stops before time 0 and reads commands, like VCS UCLI or
