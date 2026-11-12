@@ -45,10 +45,8 @@ set(MINISIM_CORE_HEADERS
     sva_engine.hpp
     tchk.hpp
     tchk.inc
-    tcl.hpp
     upf.hpp
     upf_rt.inc
-    upf_vct.hpp
     vpi.inc
     wave_reader.hpp)
 
