@@ -281,3 +281,105 @@ if(PY)
     message(FATAL_ERROR "mdebug_api.py: ${rc}\n${out}${err}")
   endif()
 endif()
+
+# Assertions: the list, and with the simulation log and the waveform each
+# failure with what the assertion sampled at the clock ticks before it and
+# what drove each signal.
+set(SV ${SRC}/tests/debug/assert.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -vcd ${OUT}/assert.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out2)
+file(WRITE ${OUT}/assert.log "${out}${out2}")
+if(NOT "${out}${out2}" MATCHES "tb.u.a_gnt: at time 55")
+  message(FATAL_ERROR "msim assert.sv: no failure of a_gnt at 55 (${rc})\n${out}${out2}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -assert RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("tb.u.a_gnt  assert property  " "assert.sv:5" "a_gnt: assert property (@(posedge clk) disable iff (rst) req |=> gnt);"
+     "tb.u.a_onehot  assert property  " "tb.u.a_imm  assert  ")
+if(out MATCHES "failed|no failure")
+  message(FATAL_ERROR "-assert without a log reported results:\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/assert.vcd -log ${OUT}/assert.log -assert tb.u.a_gnt -json ${OUT}/assert.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("failed 1 time: @55" "failure @55, values sampled before each clock tick:"
+     "@25       @35       @45       @55"
+     "tb.u.req         1         0         1         0"
+     "tb.u.gnt         0         1         0         0"
+     "tb.u.gnt = 0 @54  (since 35)" "gnt <= rst ? 1'b0 : req && !hold  [always_ff @posedge clk]")
+if(NOT rc EQUAL 0 OR out MATCHES "a_onehot")
+  message(FATAL_ERROR "-assert tb.u.a_gnt: rc ${rc}, or another assertion was listed:\n${out}")
+endif()
+file(READ ${OUT}/assert.json page)
+if(NOT page MATCHES "\"name\":\"tb.u.a_gnt\",\"kind\":\"assert property\"" OR NOT page MATCHES "\"fails\":\\[55\\]")
+  message(FATAL_ERROR "the database has no assertions or failures")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/assert.vcd -log ${OUT}/assert.log -assert tb.u.a_imm
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("tb.u.a_imm  assert  " "no failure in the log")
+
+# Coverage: with msim's coverage database, driver lines say how often their
+# line ran, -uncovered lists what never ran or never toggled, and the page's
+# database has the hits per line.
+set(SV ${SRC}/tests/cov/fsm.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -cov ${OUT}/cov.json RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT EXISTS ${OUT}/cov.json)
+  message(FATAL_ERROR "msim -cov: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -cov ${OUT}/cov.json -drivers tb.u.next -uncovered tb.u -json ${OUT}/covdb.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("next = RUN  [always_comb]  when state == IDLE && go  (line ran 3 times)"
+     "next = IDLE  [always_comb]  when state == FAIL  (line never ran)"
+     "assignments on lines that never ran under tb.u:" "signals that never toggled fully:"
+     "tb.u.rst_n  (never fell)" "tb.u.err  (never changed)")
+if(NOT rc EQUAL 0 OR out MATCHES "tb.v.")
+  message(FATAL_ERROR "-uncovered tb.u: rc ${rc}, or another instance was listed:\n${out}${err}")
+endif()
+file(READ ${OUT}/covdb.json page)
+if(NOT page MATCHES "\"cov\":{\"lines\":{\"0\":{\"9\":8" OR NOT page MATCHES "\"19\":0" OR NOT page MATCHES "\"stuck\":{\"[0-9]+\":\"never")
+  message(FATAL_ERROR "the database has no coverage section")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -uncovered RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "needs -cov")
+  message(FATAL_ERROR "-uncovered without -cov: ${rc}\n${out}${err}")
+endif()
+file(WRITE ${OUT}/notcov.json "{}")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -cov ${OUT}/notcov.json RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 2 OR NOT err MATCHES "is not a coverage database")
+  message(FATAL_ERROR "-cov of a file that is not a database: ${rc}\n${out}${err}")
+endif()
+
+# Low power: the domains of a UPF file, and with the log of a power-aware run
+# their states over time; a trace says that a value is x because its domain
+# is off, and names the isolation on a port.
+set(SV ${SRC}/tests/upf/gating.sv)
+set(UPF ${SRC}/tests/upf/gating.upf)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -upf ${UPF} -power_top u_dut -upf_verbose -vcd ${OUT}/upf.vcd
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out2)
+file(WRITE ${OUT}/upf.log "${out}${out2}")
+if(NOT "${out}${out2}" MATCHES "UPF: 45: power domain PD_CORE simstate CORRUPT")
+  message(FATAL_ERROR "msim -upf -upf_verbose: no power-down of PD_CORE at 45 (${rc})\n${out}${out2}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -power_top u_dut -power
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("PD_TOP  " "elements: tb.u_dut  (1 instance)" "primary supply: SS_AON  ground=VSS  power=VDD"
+     "PD_CORE  " "elements: tb.u_dut.u_core  (1 instance)"
+     "isolation ISO_0: outputs, clamp 0, on u_core/cnt u_core/q, enabled by iso_en(high)"
+     "level shifter LS_IN: inputs, on u_core/d")
+if(NOT rc EQUAL 0 OR out MATCHES "states:")
+  message(FATAL_ERROR "-power without a log: rc ${rc}, or power states were reported:\n${out}${err}")
+endif()
+# Without -power_top the UPF's set_design_top finds the instance.
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -log ${OUT}/upf.log -vcd ${OUT}/upf.vcd
+                        -power PD_CORE -active tb.u_dut.u_core.cnt -at 60 -depth 1
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("states: @0 CORRUPT @2 NORMAL @45 CORRUPT @66 NORMAL @90 CORRUPT"
+     "@60: CORRUPT  (since 45)  power switch SW_CORE state off; supply VDD_CORE = OFF"
+     "tb.u_dut.u_core.cnt = 8'bxxxxxxxx @60  (since 45)"
+     "power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF)"
+     "isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)"
+     "x because the domain has no power: no assignment made this value")
+if(NOT rc EQUAL 0 OR out MATCHES "PD_TOP|cnt <= cnt")
+  message(FATAL_ERROR "-power PD_CORE: rc ${rc}, another domain was listed, or an assignment was blamed for a powered-down value:\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -power RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0)
+  message(FATAL_ERROR "-power without -upf passed")
+endif()
