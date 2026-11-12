@@ -925,6 +925,11 @@ Spec references are IEEE 1800-2023 clauses.
   plan where people set the owner, status, bug id and note of each failure
   bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
   and `mplan report -rules URL` to take the annotations as triage rules.
+- `src/compat.hpp` and `docs/COMPAT.md`: one shared layer that lets every tool
+  accept Synopsys, Cadence or Siemens command lines (`--compat=cadence`, or the
+  name the tool was started as). It renames or drops options from a per-tool
+  rule table and prints messages in the chosen vendor's layout. The engine
+  stays the same; nothing is implemented twice. Unit test `test_compat`.
 - `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
   / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
   state times of an instance to `Db::states`. Unit test `test_saif`.
