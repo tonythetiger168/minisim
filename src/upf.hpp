@@ -611,6 +611,26 @@ struct SupplyConn {
 struct SimBehavior {
     std::string mode, lib, scope, where;
     std::vector<std::string> models, elements, exclude;
+    bool loaded = false;   // from load_simstate_behavior (6.34): its models must exist
+};
+// The design elements a simulation control selects (6.58, 6.59): with
+// -model, names are relative to each instance of the model (5.8).
+struct ElemSel {
+    std::string model, domain, scope;
+    std::vector<std::string> elements, exclude;   // design paths, or model-relative with -model
+    bool transitive = true;
+};
+// sim_corruption_control (6.59): corruption turned off for a kind of element.
+struct CorrCtl {
+    std::string type, where;   // real, integer, seq, comb, port, process
+    ElemSel sel;
+};
+// sim_assertion_control (6.58): assertions suspended, reset or killed while
+// their domain (or -controlling_domain) is not NORMAL, or -control_expr holds.
+struct AssertCtl {
+    std::string type = "reset", ctlDomain, where;
+    ExP ctlExpr;
+    ElemSel sel;
 };
 // set_retention_elements (6.54): a named list of state elements kept together.
 struct RetList {
@@ -680,6 +700,8 @@ struct Model {
     std::map<std::string, Composite> composites;
     std::vector<SupplyConn> supplyConns;
     std::vector<SimBehavior> simBehaviors;
+    std::vector<CorrCtl> corrCtls;
+    std::vector<AssertCtl> assertCtls;
     std::map<std::string, RetList> retLists;
     std::vector<DesignAttrRule> designAttrs;
     std::vector<PortAttrRule> portAttrs;
@@ -1452,6 +1474,83 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             supplyConns.push_back(sc);
             continue;
         }
+        if (n == "sim_corruption_control" || n == "sim_assertion_control") {   // 6.59, 6.58
+            bool asrt = n == "sim_assertion_control";
+            Opts o = opts(c, {}, {"-transitive"});
+            static const std::set<std::string> known = {"-elements", "-exclude_elements", "-domain", "-model", "-transitive",
+                                                        "-type", "-controlling_domain", "-control_expr"};
+            for (auto& [k, v] : o.v)
+                if (!known.count(k) || (!asrt && (k == "-controlling_domain" || k == "-control_expr")))
+                    throw Error(c.where() + ": " + n + ": unknown option " + k);
+            if (!o.pos.empty()) throw Error(c.where() + ": " + n + ": unexpected argument " + o.pos[0]);
+            ElemSel sel;
+            sel.model = o.get("-model");
+            sel.scope = scope;
+            sel.transitive = o.get("-transitive", "TRUE") == "TRUE";
+            for (auto& e : o.list("-elements")) sel.elements.push_back(sel.model.empty() ? join(scope, e) : e);
+            for (auto& e : o.list("-exclude_elements")) sel.exclude.push_back(sel.model.empty() ? join(scope, e) : e);
+            if (o.has("-domain")) {
+                sel.domain = join(scope, o.get("-domain"));
+                if (!domains.count(sel.domain)) throw Error(c.where() + ": " + n + ": no power domain " + o.get("-domain"));
+            }
+            if (asrt) {
+                AssertCtl a;
+                a.where = c.where();
+                a.sel = sel;
+                a.type = o.get("-type", "reset");
+                if (a.type != "reset" && a.type != "suspend" && a.type != "kill")
+                    throw Error(c.where() + ": sim_assertion_control -type " + a.type + " (reset, suspend or kill)");
+                if (o.has("-controlling_domain") && o.has("-control_expr"))
+                    throw Error(c.where() + ": sim_assertion_control: -controlling_domain and -control_expr together (6.58)");
+                if (o.has("-controlling_domain")) {
+                    a.ctlDomain = join(scope, o.get("-controlling_domain"));
+                    if (!domains.count(a.ctlDomain)) throw Error(c.where() + ": sim_assertion_control: no power domain " + o.get("-controlling_domain"));
+                }
+                if (o.has("-control_expr")) a.ctlExpr = expr(o.get("-control_expr"), c);
+                assertCtls.push_back(a);
+            } else {
+                CorrCtl cc;
+                cc.where = c.where();
+                cc.sel = sel;
+                if (!o.has("-type")) throw Error(c.where() + ": sim_corruption_control needs -type");
+                cc.type = o.get("-type");
+                static const std::set<std::string> types = {"real", "integer", "seq", "comb", "port", "process"};
+                if (!types.count(cc.type))
+                    throw Error(c.where() + ": sim_corruption_control -type " + cc.type + " (real, integer, seq, comb, port or process)");
+                corrCtls.push_back(cc);
+            }
+            continue;
+        }
+        if (n == "load_simstate_behavior") {   // 6.34
+            Opts o = opts(c, {});
+            need(o, 1, "a library name");
+            if (!o.has("-file")) throw Error(c.where() + ": load_simstate_behavior needs -file");
+            std::string lib = o.pos[0];
+            for (auto f : o.list("-file")) {
+                if (!f.empty() && f[0] != '/') {
+                    size_t sl = file.rfind('/');
+                    if (sl != std::string::npos) f = file.substr(0, sl + 1) + f;
+                }
+                std::ifstream probe(f);
+                if (!probe) throw Error(c.where() + ": load_simstate_behavior: no file " + f);
+                Reader sub;
+                sub.onCmd = [&, f](const Cmd& sc) -> std::string {
+                    if (sc.w[0] != "set_simstate_behavior")
+                        throw Error(sc.where() + ": " + sc.w[0] + " in a simstate behavior file; only set_simstate_behavior is allowed (6.34)");
+                    for (auto& a : sc.w)
+                        if (a == "-lib") throw Error(sc.where() + ": set_simstate_behavior -lib in a simstate behavior file (6.34)");
+                    Cmd c2 = sc;
+                    c2.w.push_back("-lib");
+                    c2.w.push_back(lib);
+                    std::string sco = scope;
+                    run({c2}, sco, sub, f);
+                    simBehaviors.back().loaded = true;
+                    return "";
+                };
+                sub.load(f);
+            }
+            continue;
+        }
         if (n == "set_simstate_behavior") {   // 6.56
             Opts o = opts(c, {});
             need(o, 1, "ENABLE, SIMSTATE_ONLY, PORT_CORR_ONLY or DISABLE");
@@ -1869,8 +1968,8 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             "map_retention_cell", "map_power_switch", "use_interface_cell", "name_format", 
             "set_variation", "set_correlated", "bind_checker", 
             
-            "save_upf", "sim_assertion_control", "sim_corruption_control",
-            "sim_replay_control", "load_simstate_behavior",
+            "save_upf", 
+            "sim_replay_control",
             "set_retention_control", "define_power_model", "end_power_model", "apply_power_model", "create_vcm", "define_isolation_cell", "define_level_shifter_cell",
             "define_retention_cell", "define_power_switch_cell", "define_always_on_cell", "define_diode_clamp",
             "map_retention_clamp_cell", "map_repeater_cell", "create_abstract_power_source", "set_pin_related_supply",

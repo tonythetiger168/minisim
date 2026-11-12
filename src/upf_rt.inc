@@ -372,7 +372,13 @@ struct Rt {
         }
         for (auto& e : intentErrors(m, dm, [this](const std::string& p) { return modelOf(p); }))
             throw Error(e.where + ": " + e.text);
+        for (auto& sb : m.simBehaviors)
+            if (sb.loaded)
+                for (auto& mm : sb.models)
+                    if (instancesOf(mm.substr(mm.find('.') + 1)).empty())
+                        throw Error(sb.where + ": load_simstate_behavior: model " + mm + " is not in the design (6.34)");
         bindLogic(lw);
+        bindTypes(lw);
         // processes: domain, state or not; what each domain drives
         std::vector<std::set<int>> owned(doms.size());
         stateSigs.assign(doms.size(), {});
@@ -390,7 +396,11 @@ struct Rt {
             else if (!dn.empty()) pd = domIdx.at(dn);
             else continue;
             if (owned.size() < doms.size()) { owned.resize(doms.size()); stateSigs.resize(doms.size()); }
-            lp.prog.pd = pd;
+            // sim_corruption_control -type process (6.59): the process is not corrupted
+            bool keepProc = false;
+            for (auto& cc : m.corrCtls)
+                if (cc.type == "process" && selected(cc.sel, lp.scope, true)) keepProc = true;
+            if (keepProc) continue;
             bool st = k == "AlwaysFF" || k == "AlwaysLatch";
             if (k == "Always")
                 for (auto& in : lp.prog.code)
@@ -398,21 +408,30 @@ struct Rt {
                         if (in.events.size() > 1) { for (auto& [s, e] : in.events) if (e != ANY) st = true; }
                         else if (in.edge != ANY) st = true;
                     }
-            lp.prog.pstate = st;
+            std::set<int> wr;
             std::vector<const Prog*> seen;
             std::function<void(const Prog&)> writes = [&](const Prog& p) {
                 for (const Prog* q : seen) if (q == &p) return;
                 seen.push_back(&p);
                 for (auto& in : p.code) {
                     if ((in.k == IK::Assign || in.k == IK::Nba) && in.sig >= 0 && !isRel(in.sig)) {
-                        if (in.arr) for (int k = 0; k < in.arr->count; k++) owned[(size_t)pd].insert(in.arr->base + k);
-                        else owned[(size_t)pd].insert(in.sig);
+                        if (in.arr) for (int k = 0; k < in.arr->count; k++) wr.insert(in.arr->base + k);
+                        else wr.insert(in.sig);
                     }
                     if (in.k == IK::Call && in.callee) writes(*in.callee);
                     for (const Prog* b : in.branches) writes(*b);
                 }
             };
             writes(lp.prog);
+            // sim_corruption_control (6.59): what the process drives that is
+            // not to be corrupted; a process that drives nothing else runs on
+            size_t kept = 0;
+            for (int s : wr)
+                if (noCorruption(s, st)) { noCorr.insert(s); kept++; }
+            if (!wr.empty() && kept == wr.size()) continue;
+            lp.prog.pd = pd;
+            lp.prog.pstate = st;
+            for (int s : wr) owned[(size_t)pd].insert(s);
             if (st) {
                 std::set<int> w;
                 for (auto& in : lp.prog.code)
@@ -425,10 +444,20 @@ struct Rt {
         }
         for (size_t d = 0; d < doms.size(); d++) {
             for (int s : owned[d])
-                if (S.sigs[(size_t)s].name.find('$') == std::string::npos) doms[d].owned.push_back(s);
+                if (S.sigs[(size_t)s].name.find('$') == std::string::npos && !noCorr.count(s)) doms[d].owned.push_back(s);
         }
         bindCells(lw);
         bindRetention();
+        // a retained register is corrupted after all (6.59)
+        for (auto& r : rets)
+            for (auto& e : r.els)
+                if (noCorr.count(e.sig)) {
+                    std::cerr << "msim: UPF: sim_corruption_control: " << S.sigs[(size_t)e.sig].name << " is retained by "
+                              << r.r->name << "; its corruption is not turned off (6.59)\n";
+                    noCorr.erase(e.sig);
+                    if (r.dom >= 0) doms[(size_t)r.dom].owned.push_back(e.sig);
+                }
+        bindAsserts();
         // logic signals the runtime reacts to
         std::set<int> w;
         auto addIds = [&](const ExP& e, const std::string& scope) {
@@ -461,6 +490,7 @@ struct Rt {
             addIds(r.r->restorePeriodCond, scopeOfName(r.r->domain));
             addIds(r.r->powerdownCond, scopeOfName(r.r->domain));
         }
+        for (auto& ac : m.assertCtls) addIds(ac.ctlExpr, ac.sel.scope);
         bindHdlPorts(lw);
         for (auto& h : hdlPorts) if (h.vct->hdl2upf) w.insert(h.sig);
         for (int s : w) watch.push_back({s, ANY});
@@ -468,6 +498,133 @@ struct Rt {
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
     }
     std::vector<std::set<int>> stateSigs;
+
+    // ------------------------------------- simulation controls (6.58, 6.59)
+    std::set<int> noCorr;   // signals sim_corruption_control keeps from corruption
+    std::set<int> realSigs, intSigs;   // variables of type real / shortreal, and of a predefined integer type
+    void bindTypes(LowerResult& lw) {
+        if (m.corrCtls.empty()) return;
+        for (auto& [sym, sid] : lw.sigOf) {
+            if (!sym || !slang::ast::ValueSymbol::isKind(sym->kind)) continue;
+            const auto& t = sym->as<slang::ast::ValueSymbol>().getType().getCanonicalType();
+            if (t.isFloating()) realSigs.insert(sid);
+            else if (t.kind == slang::ast::SymbolKind::PredefinedIntegerType) intSigs.insert(sid);
+        }
+    }
+    // Instances of a model (5.8), as design paths.
+    std::vector<std::string> instancesOf(const std::string& model) const {
+        std::vector<std::string> r;
+        std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+        for (auto& [full, mod] : instCells()) {
+            if (mod != model) continue;
+            if (!pre.empty() && full.compare(0, pre.size(), pre) != 0) continue;
+            r.push_back(full.substr(pre.size()));
+        }
+        return r;
+    }
+    // Whether a control selects a design element: an instance (inst) or a
+    // signal or assertion in one.
+    bool selected(const ElemSel& sel, const std::string& path, bool inst) const {
+        std::string container = inst ? path : parentOf(path);
+        if (!sel.domain.empty() && dm.of(container) != sel.domain) return false;
+        auto hit = [&](const std::string& e) {
+            if (path == e) return true;
+            return sel.transitive ? DomainMap::within(path, e) : container == e;
+        };
+        std::vector<std::string> bases;
+        if (sel.model.empty()) bases.push_back("");
+        else bases = instancesOf(sel.model);
+        for (auto& b : bases) {
+            auto name = [&](const std::string& e) {
+                if (sel.model.empty()) return m.design(e);
+                std::string d = e;
+                for (char& ch : d) if (ch == '/') ch = '.';
+                return b.empty() ? d : b + "." + d;
+            };
+            bool in = false;
+            if (!sel.elements.empty()) {
+                for (auto& e : sel.elements) if (hit(name(e))) in = true;
+            } else if (!sel.model.empty()) in = hit(b);
+            else if (!sel.domain.empty()) in = true;
+            else in = hit(m.design(sel.scope));
+            if (!in) continue;
+            bool out = false;
+            for (auto& e : sel.exclude) if (hit(name(e))) out = true;
+            if (!out) return true;
+        }
+        return false;
+    }
+    // Whether sim_corruption_control keeps signal s (written by a state
+    // process when st) from corruption.
+    bool noCorruption(int s, bool st) const {
+        if (m.corrCtls.empty()) return false;
+        const auto& sg = S.sigs[(size_t)s];
+        bool isPort = false;
+        if (!S.vcdTop.empty()) isPort = portRecs().count(S.vcdTop + "." + sg.name) != 0;
+        for (auto& cc : m.corrCtls) {
+            const std::string& t = cc.type;
+            bool kind = t == "real" ? realSigs.count(s) != 0
+                      : t == "integer" ? intSigs.count(s) != 0
+                      : t == "seq" ? st : t == "comb" ? !st : t == "port" ? isPort : false;
+            if (kind && selected(cc.sel, sg.name, false)) return true;
+        }
+        return false;
+    }
+    // sim_assertion_control: each assertion it selects, and what controls it.
+    struct AsrtCtlRt {
+        const AssertCtl* r;
+        int id;
+        int dom = -1;          // the controlling domain; -1: the expression
+        bool active = false, dead = false;
+    };
+    std::vector<AsrtCtlRt> asrtCtls;
+    std::string designOf(const std::string& simPath) const {
+        std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+        if (!pre.empty() && simPath.compare(0, pre.size(), pre) == 0) return simPath.substr(pre.size());
+        return simPath;
+    }
+    void bindAsserts() {
+        auto& as = asserts();
+        for (auto& ac : m.assertCtls)
+            for (size_t i = 0; i < as.size(); i++) {
+                const AssertInfo& a = as[i];
+                if (a.hidden) continue;
+                std::string inst = designOf(a.inst), name = designOf(a.name);
+                if (!selected(ac.sel, name, false) && !selected(ac.sel, inst, true)) continue;
+                AsrtCtlRt x;
+                x.r = &ac;
+                x.id = (int)i;
+                if (!ac.ctlExpr) {
+                    if (!ac.ctlDomain.empty()) x.dom = domIdx.at(ac.ctlDomain);
+                    else if (const SupplyConn* sc = explicitConn(inst)) x.dom = regionOf(sc->set);
+                    else {
+                        std::string dn = dm.of(inst);
+                        if (dn.empty()) continue;   // in no domain: never off
+                        x.dom = domIdx.at(dn);
+                    }
+                }
+                note("sim_assertion_control -type " + ac.type + " on " + name);
+                asrtCtls.push_back(x);
+            }
+    }
+    void applyAsserts() {
+        for (auto& x : asrtCtls) {
+            if (x.dead) continue;
+            bool act = x.dom >= 0 ? g_pdMode[(size_t)x.dom] != SS_NORMAL
+                                  : truthOf(evalEx(x.r->ctlExpr, ctx(x.r->sel.scope, nullptr), "sim_assertion_control -control_expr")) == 1;
+            if (act == x.active) continue;
+            x.active = act;
+            AssertInfo& a = asserts()[(size_t)x.id];
+            const std::string& t = x.r->type;
+            if (act) {
+                a.on = false;
+                if (t != "suspend") a.killGen++;   // reset and kill end the attempts in progress
+                if (t == "kill") x.dead = true;
+            } else a.on = true;
+            note("assertion " + designOf(a.name) + (act ? (t == "kill" ? " killed" : t == "reset" ? " reset and suspended" : " suspended")
+                                                        : " enabled again"));
+        }
+    }
 
     // Logic ports and nets made by UPF and their connections (6.13, 6.19,
     // 6.20): each connection is one more continuous assignment, from the
@@ -1328,6 +1485,7 @@ struct Rt {
             co_await Delay{0};
             r.checkArmed = false;
             r.checkPst();
+            r.applyAsserts();   // once the time step settles: supplies the testbench turns on at time 0 are on
             auto pc = std::move(r.pendingChecks);
             r.pendingChecks.clear();
             for (auto& f : pc) f();

@@ -58,6 +58,8 @@ Spec references are IEEE 1800-2023 clauses.
   `set_retention_elements` (6.54), `set_partial_on_translation` (6.50) and
   `add_supply_state` with `{net_state voltage}` (6.8) are applied instead of
   read and ignored; `mlint -upf` rule `UPF007`. See `docs/LOWPOWER.md`.
+- UPF (IEEE 1801-2024): `sim_corruption_control` (6.59),
+  `sim_assertion_control` (6.58) and `load_simstate_behavior` (6.34).
 - `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
   the object a module's class handle variable points to is a signal
   `tb.p.addr` that follows the handle (x while it is null), with handle
