@@ -708,40 +708,12 @@ Spec references are IEEE 1800-2023 clauses.
   names like `top.m[1][2][3]`; `vpiHighConn`; `pkg::name` in
   `vpi_handle_by_name`. An application built for IEEE 1364
   (`vpi_compatibility.h`) keeps that standard's view. See `docs/VPI.md`.
-- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
-  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
-  callback reason and the assertion and coverage declarations of annex M,
-  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
-  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
-  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
-  the caller's mode. New routines `vpi_get_value_array` and
-  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
-  a user system task. See `docs/VPI.md`.
 - VPI assertion API (clause 39): assertions are objects found by
   `vpi_iterate(vpiAssertion, ...)`; `vpi_register_assertion_cb` reports each
   attempt's start, success, vacuous success, failure and disabled
   evaluation, and assertion control; the system callbacks
   (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
   assertion operation of `vpi_control` work. See `docs/VPI.md`.
-- VPI object model of SystemVerilog (clause 37): packages, interfaces with
-  modports and programs as instances (`vpi_iterate(vpiInstance, NULL)`);
-  generate scopes, tasks, functions and named blocks as internal scopes;
-  variables and nets report their SystemVerilog type (`vpiBitVar`,
-  `vpiIntVar`, `vpiEnumVar`, `vpiStructVar`, `vpiStringVar`, ...) and have a
-  typespec with enum constants, struct members and typedef names; arrays of
-  any number of dimensions with ranges, `vpi_handle_by_multi_index` and
-  names like `top.m[1][2][3]`; `vpiHighConn`; `pkg::name` in
-  `vpi_handle_by_name`. An application built for IEEE 1364
-  (`vpi_compatibility.h`) keeps that standard's view. See `docs/VPI.md`.
-- VPI headers complete (annexes K, L, M): `vpi_user.h` has every constant of
-  annex K, `sv_vpi_user.h` every object type, relation, property, operator,
-  callback reason and the assertion and coverage declarations of annex M,
-  and the new `vpi_compatibility.h` (annex L, 36.12) binds an application
-  built with `VPI_COMPATIBILITY_VERSION_<standard>` to that standard's
-  variants of the routines; `vpi_get(vpiCompatibilityMode, NULL)` returns
-  the caller's mode. New routines `vpi_get_value_array` and
-  `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
-  a user system task. See `docs/VPI.md`.
 
 ### Fixed
 - msim memory on big VIP benches: a 2-state unpacked array with more than
