@@ -10449,7 +10449,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
-                            if (rv.w > 64) Lowerer::unsupported("rand variable wider than 64 bits");
+                            if (rv.w > 64 && (rv.dyn || rv.randc)) Lowerer::unsupported(rv.randc ? "randc variable wider than 64 bits" : "rand container of elements wider than 64 bits");
                         } else Lowerer::unsupported("rand property of this type");
                         if (et->isEnum() && rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // each element: one of the named values
                             RandItem loop;
