@@ -201,7 +201,7 @@ inline int tsExp(const slang::TimeScaleValue& v) {
 struct BlockIds {
     std::unordered_map<const slang::ast::Symbol*, int> id;
     std::unordered_set<int> roots;
-    std::vector<const slang::ast::Symbol*> disabledFromOutside;
+    std::unordered_set<const slang::ast::Symbol*> targets;   // every block and task some disable names
     int of(const slang::ast::Symbol* s) {
         auto [it, fresh] = id.try_emplace(s, (int)id.size());
         return it->second;
@@ -604,6 +604,21 @@ struct Lowerer {
     // Named sequential blocks around the statement being lowered, each with
     // the jumps a `disable` of it makes to its end.
     std::vector<std::pair<const slang::ast::Symbol*, std::vector<size_t>>> named;
+    // Named blocks being lowered that have a fork in them (9.6.2:
+    // disabling one ends what it forked).
+    std::unordered_set<const slang::ast::Symbol*> forkyBlocks;
+    static bool hasFork(const slang::ast::Statement& st) {
+        using namespace slang::ast;
+        struct F : ASTVisitor<F, VisitFlags::Statements> {
+            bool any = false;
+            void handle(const BlockStatement& b) {
+                if (b.blockKind != StatementBlockKind::Sequential) any = true;
+                visitDefault(b);
+            }
+        } f;
+        st.visit(f);
+        return f.any;
+    }
     // A statement that is one named begin...end block.
     static const slang::ast::Symbol* namedSeq(const slang::ast::Statement& st) {
         using namespace slang::ast;
@@ -7200,9 +7215,13 @@ struct Lowerer {
                     if (!b.blockSymbol || b.blockSymbol->name.empty()) { stmt(b.body); break; }
                     size_t k = named.size();
                     named.push_back({b.blockSymbol, {}});
+                    if (blockIds().targets.count(b.blockSymbol) && hasFork(b.body)) forkyBlocks.insert(b.blockSymbol);
                     labelSym = b.blockSymbol;   // label: assert ... names the assertion
                     labelOf = &b.body;
+                    size_t s0 = prog.here();
                     stmt(b.body);
+                    if (blockIds().targets.count(b.blockSymbol))   // another process may disable it (9.6.2)
+                    { prog.spans.push_back({blockIds().of(b.blockSymbol), s0, prog.here()}); anySpans() = true; }
                     patch(named[k].second, prog.here());   // disable blk: jump past it
                     named.pop_back();
                     break;
@@ -7818,13 +7837,17 @@ struct Lowerer {
                 const auto& d = s.as<DisableStatement>();
                 if (d.target.kind != ExpressionKind::ArbitrarySymbol) unsupported("disable target");
                 const Symbol* sym = d.target.as<ArbitrarySymbolExpression>().symbol;
-                if (sym->kind != SymbolKind::StatementBlock) unsupported("disable of a task");
+                if (sym->kind != SymbolKind::StatementBlock && sym->kind != SymbolKind::Subroutine) unsupported("disable target");
+                // Inside the block, in a process's own code, with nothing
+                // forked in it: no other process can be inside it, so a jump
+                // past it is the whole disable.
                 for (size_t k = named.size(); k-- > 0;)
-                    if (named[k].first == sym) { named[k].second.push_back(emitJmp()); return; }
-                // A block another process is running: end that process.
+                    if (named[k].first == sym && !current && !forkyBlocks.count(sym)) { named[k].second.push_back(emitJmp()); return; }
+                // A block or task some process is running: a process it is
+                // the whole of ends; any other process inside it resumes
+                // after it, this one included (a task disabling itself).
                 Instr i; i.k = IK::Disable;
                 i.sig = blockIds().of(sym);
-                blockIds().disabledFromOutside.push_back(sym);
                 prog.emit(i);
                 break;
             }
@@ -10023,6 +10046,16 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     dynPending().clear();
     dynPendingAt().clear();
     blockIds() = BlockIds{};
+    anySpans() = false;
+    {   // The blocks and tasks a disable names (9.6.2), before any code is lowered.
+        struct DisTargets : slang::ast::ASTVisitor<DisTargets, slang::ast::VisitFlags::Symbols | slang::ast::VisitFlags::Statements> {
+            void handle(const slang::ast::DisableStatement& d) {
+                if (d.target.kind == slang::ast::ExpressionKind::ArbitrarySymbol)
+                    blockIds().targets.insert(d.target.as<slang::ast::ArbitrarySymbolExpression>().symbol);
+            }
+        } dt;
+        comp.getRoot().visit(dt);
+    }
     Lowerer::covSM() = comp.getSourceManager();   // statement locations, for coverage and run-time messages
     condDefs().clear();
     g_condHits.clear();
@@ -10338,6 +10371,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         lw.current = sub;
         if (lw.curClass && lw.curClass->builtin) lw.builtinMethod(*lw.curClass, *sub);
         else lw.stmt(sub->sym->getBody());
+        if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
+        { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);
     }
     for (Subr* sub : order) patchImplicit(*sub->prog);
@@ -10570,10 +10605,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             }
         }
     }
-    for (const slang::ast::Symbol* b : blockIds().disabledFromOutside)
-        if (!blockIds().roots.count(blockIds().of(b)))
-            Lowerer::unsupported(("disable of block '" + std::string(b->name) +
-                                  "' from outside it, unless it is a whole initial or fork branch").c_str());
     if (g_cov) {   // FSM coverage: the state registers and their transitions
         const slang::SourceManager* sm = comp.getSourceManager();
         for (ExtractedFsm& x : extractFsms(comp.getRoot())) {
