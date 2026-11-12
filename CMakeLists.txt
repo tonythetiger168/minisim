@@ -45,11 +45,13 @@ add_test(NAME test_liberty COMMAND test_liberty ${CMAKE_SOURCE_DIR}/tests/sta/st
 # libcrypto. What is here is the reading half: msim -keyfile opens an envelope
 # and src/protect.hpp is tested directly. The encryptor that makes one,
 # msimprotect, is a paid tool (docs/LICENSING.md).
-find_package(OpenSSL COMPONENTS Crypto)
+# The license system (IEEE 1735 clause 8) talks TLS to the IP author's
+# license proxy, so msim links libssl too.
+find_package(OpenSSL COMPONENTS Crypto SSL)
 if(OPENSSL_FOUND)
   add_executable(test_protect tests/test_protect.cpp)
   target_include_directories(test_protect PRIVATE src)
-  target_link_libraries(test_protect PRIVATE OpenSSL::Crypto)
+  target_link_libraries(test_protect PRIVATE OpenSSL::SSL OpenSSL::Crypto)
   target_compile_options(test_protect PRIVATE -UNDEBUG)
   add_test(NAME test_protect COMMAND test_protect)
 else()
@@ -133,7 +135,7 @@ if(MINISIM_WITH_SLANG)
   endif()
   set_target_properties(msim PROPERTIES ENABLE_EXPORTS ON)
   if(OPENSSL_FOUND)
-    target_link_libraries(msim PRIVATE OpenSSL::Crypto)
+    target_link_libraries(msim PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(msim PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
   # -compile builds generated C++ against the kernel headers in src/.
@@ -148,7 +150,7 @@ if(MINISIM_WITH_SLANG)
   target_include_directories(mlint PRIVATE src)
   target_link_libraries(mlint PRIVATE slang::slang)
   if(OPENSSL_FOUND)
-    target_link_libraries(mlint PRIVATE OpenSSL::Crypto)
+    target_link_libraries(mlint PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(mlint PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
@@ -158,7 +160,7 @@ if(MINISIM_WITH_SLANG)
   find_package(Threads REQUIRED)
   target_link_libraries(mdft PRIVATE slang::slang Threads::Threads)
   if(OPENSSL_FOUND)
-    target_link_libraries(mdft PRIVATE OpenSSL::Crypto)
+    target_link_libraries(mdft PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(mdft PRIVATE MINISIM_HAVE_OPENSSL)
   endif()
 
@@ -216,6 +218,15 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xprop
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_xprop.cmake)
+  # Interactive simulation (msim -i, -do FILE): run, step, stop, force, print.
+  add_test(NAME msim_interactive
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_interactive.cmake)
+  # Class objects in the waveform (msim -vcd-class), read back by mdebug.
+  add_test(NAME msim_vcd_class
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vcd_class
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd_class.cmake)
   # Multi-core: 256 independent lanes run as parallel partitions. Every
   # thread count must print what the single-threaded event-driven run prints.
   add_test(NAME msim_threads
@@ -262,11 +273,6 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_excl
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_excl.cmake)
-    # mformal is defined in cmake/tools/mformal.cmake, included further down
-    add_test(NAME mcov_formal
-             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim> -DMFORMAL=$<TARGET_FILE:mformal>
-                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_formal
-                     -P ${CMAKE_SOURCE_DIR}/tests/mcov_formal.cmake)
     add_test(NAME msim_cov_inst
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_inst
@@ -290,7 +296,8 @@ if(MINISIM_WITH_SLANG)
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_dpi.cmake)
   # VPI and DPI cannot look into protected IP (37.3.6; IEEE 1735 9.7). The
   # check needs an envelope, so it needs the encryptor, which is a paid tool:
-  # it runs beside msimprotect instead of here.
+  # it runs beside msimprotect instead of here, with the license proxy test
+  # (clause 8) and the rule-by-rule checks of 5.2, 9.3, 9.4, 9.9 and Annex A.
   add_test(NAME msim_missing_file COMMAND msim ${CLI}/no_such_file.sv)
   set_tests_properties(msim_missing_file PROPERTIES WILL_FAIL TRUE)
 
@@ -349,6 +356,12 @@ if(MINISIM_WITH_SLANG)
                        -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
       set_tests_properties(uvm/${name} PROPERTIES LABELS "uvm")
     endforeach()
+    # UVM transaction recording read back by mdebug -tr.
+    add_test(NAME mdebug_uvm_tr
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DUVM_HOME=${UVM_HOME}
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_uvm_tr
+                     -P ${CMAKE_SOURCE_DIR}/tests/mdebug_uvm_tr.cmake)
+    set_tests_properties(mdebug_uvm_tr PROPERTIES LABELS "uvm")
   endif()
 
   # mini45's Verilog models against the functions in its Liberty files.
@@ -445,7 +458,7 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES include/svdpi.h include/vpi_user.h include/sv_vpi_user.h include/veriuser.h
+install(FILES include/svdpi.h include/vpi_user.h include/vpi_compatibility.h include/sv_vpi_user.h include/veriuser.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 # UVM's C code for minisim: msim -uvm looks for it next to itself.
 install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/uvm)

@@ -2541,12 +2541,12 @@ private:
                     throw CodegenUnsupported(std::string("array or variable-index ") + (i.drv >= 0 ? "continuous assign" : "write (instruction " + std::to_string((int)i.k) + ")"));
                 if (i.de || i.nbaLater) throw CodegenUnsupported("delay expression or intra-assignment delay");
                 if (i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) throw CodegenUnsupported("dynamic array");
-                if (!p.roots.empty()) throw CodegenUnsupported("disable of a named block");
+                if (!p.roots.empty() || !p.spans.empty()) throw CodegenUnsupported("disable of a named block");
                 if (i.k == IK::Finish && i.hi > 0) throw CodegenUnsupported("$fatal exit status");
                 if (i.fd) throw CodegenUnsupported("$fstrobe / $fmonitor");
                 if (!i.dly.empty()) throw CodegenUnsupported("delayed continuous assignment");
                 if (i.k == IK::ReadMem || i.k == IK::WriteMem) {   // $readmem / $writemem (21.4, 21.5)
-                    if (!i.arr || readsPriv(i.e)) throw CodegenUnsupported("$readmem form");
+                    if (!i.arr || readsPriv(i.e) || i.pw == 2) throw CodegenUnsupported("$readmem form");
                     for (auto& a : i.args) if (readsPriv(a)) throw CodegenUnsupported("$readmem form");
                     mems_.push_back(&i);
                     std::string M_ = "MI" + std::to_string(mems_.size() - 1);
