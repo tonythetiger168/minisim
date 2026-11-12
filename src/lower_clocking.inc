@@ -139,9 +139,50 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
         if (!cv) continue;
         const Expression* init = cv->getInitializer();
         if (!init) unsupported("a clockvar with no signal");
-        int sig = sigmap.at(cv);
         bool in = cv->direction == ArgumentDirection::In || cv->direction == ArgumentDirection::InOut;
         bool out = cv->direction == ArgumentDirection::Out || cv->direction == ArgumentDirection::InOut;
+        if (auto ca = arrMap().find(cv); ca != arrMap().end()) {   // logic [9:0] a [3]: each element on its own
+            const ArrShape& A = *ca->second;
+            const Expression& ie = peel(*init);
+            const Symbol* ts = ValueExpressionBase::isKind(ie.kind) ? &ie.as<ValueExpressionBase>().symbol : nullptr;
+            if (ts)
+                if (const auto* mp = ts->as_if<ModportPortSymbol>(); mp && mp->internalSymbol) ts = mp->internalSymbol;
+            auto T = ts ? arrFind(ts) : nullptr;
+            if (!T || T->count != A.count || T->elemW != A.elemW || T->dynElem)
+                unsupported("a clockvar of an array that is not a whole array of the same shape (14.3)");
+            bool net = ts->kind == SymbolKind::Net;
+            auto [ik, it] = cv->inputSkew.hasValue() ? skewOf(cv->inputSkew, 0) : std::pair{dinK, dinT};
+            auto [ok, ot] = cv->outputSkew.hasValue() ? skewOf(cv->outputSkew, 1) : std::pair{doutK, doutT};
+            if (out && ok == 0) unsupported("#1step as an output skew (14.4)");
+            for (int n = 0; n < A.count; n++) {
+                if (in) {
+                    ClockingRT::In x;
+                    x.cv = A.base + n;
+                    x.kind = ik;
+                    x.skew = it;
+                    E src = ref(T->base + n, T->sgn);
+                    x.src = ik == 0 ? sampledE(src) : src;
+                    if (ik == 2) collectRefs(src, x.refs);
+                    r.ins.push_back(std::move(x));
+                }
+                if (out) {
+                    ClockingRT::Out o;
+                    o.cv = A.base + n;
+                    o.w = A.elemW;
+                    o.skew = ot;
+                    ClockingRT::Piece p{T->base + n, 0, A.elemW};
+                    if (net && mkSig && (size_t)p.sig < sigInfo().size()) {   // driven through a hidden variable
+                        p.net = p.sig;
+                        p.netLo = 0;
+                        p.sig = mkSig(sigInfo()[p.net].first + "$cbdrv" + std::to_string((*tempSeq)++), A.elemW, false);
+                    }
+                    o.pieces.push_back(p);
+                    r.outs.push_back(std::move(o));
+                }
+            }
+            continue;
+        }
+        int sig = sigmap.at(cv);
         if (in) {
             ClockingRT::In x;
             x.cv = sig;
@@ -199,6 +240,60 @@ const slang::ast::ClockVarSymbol* clockvarOf(const slang::ast::Expression& e) {
         default: return nullptr;
     }
 }
+// cb.a <= e or cb.a[i] <= e on an array clockvar whose first element is
+// signal cvBase (14.16): one drive per element, the one i names.
+void cbArrayDrive(int cbi, int cvBase, const ArrShape& A, const slang::ast::AssignmentExpression& a) {
+    using namespace slang::ast;
+    std::vector<const Expression*> idx;
+    const Expression* cur = &a.left();
+    while (cur->kind == ExpressionKind::ElementSelect &&
+           cur->as<ElementSelectExpression>().value().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+        idx.push_back(&cur->as<ElementSelectExpression>().selector());
+        cur = &cur->as<ElementSelectExpression>().value();
+    }
+    std::reverse(idx.begin(), idx.end());
+    if (cur->kind == ExpressionKind::ElementSelect || cur->kind == ExpressionKind::RangeSelect ||
+        (!idx.empty() && idx.size() != A.dims.size()))
+        unsupported("a synchronous drive of part of an array clockvar (14.16)");
+    if (a.timingControl && a.timingControl->kind != TimingControlKind::CycleDelay)
+        unsupported("an intra-assignment delay in a synchronous drive (14.16)");
+    std::vector<E> vals;
+    if (idx.empty()) {
+        arrayElems(*a.left().type, a.right(), vals);
+        if ((int)vals.size() != A.count) unsupported("a synchronous drive of an array of another size (14.16)");
+    }
+    std::vector<E> sel;
+    for (auto* x : idx) sel.push_back(resize(expr(*x), 64, x->type->isSigned(), true));
+    auto& outs = clockings()[cbi].outs;
+    for (int n = 0; n < A.count; n++) {
+        size_t skip = SIZE_MAX;
+        if (!idx.empty()) {   // only the element the index names
+            E cond;
+            int64_t rest = n;
+            for (size_t d = A.dims.size(); d-- > 0;) {
+                int64_t sz = A.size(d), o = rest % sz;
+                rest /= sz;
+                auto [l, rr] = A.dims[d];
+                int64_t v = l <= rr ? l + o : l - o;
+                E eq = bin(Op::Eq, sel[d], konst(make((uint64_t)v, 0, 64, 0, true)));
+                cond = cond ? bin(Op::And, cond, eq) : eq;
+            }
+            skip = emitJmpIfNot(cond);
+        }
+        Instr i;
+        i.k = IK::CbDrive;
+        i.sig = cvBase + n;
+        i.dkey = cbi;
+        i.dres = -1;
+        for (size_t k = 0; k < outs.size(); k++)
+            if (outs[k].cv == i.sig) i.dres = (int)k;
+        if (i.dres < 0) unsupported("a drive of a clocking input (14.16)");
+        i.e = idx.empty() ? vals[n] : expr(a.right());
+        if (a.timingControl) i.de = expr(a.timingControl->as<CycleDelayControl>().expr);
+        prog.emit(i);
+        if (skip != SIZE_MAX) prog.code[skip].target = prog.code.size();
+    }
+}
 bool syncDrive(const slang::ast::AssignmentExpression& a) {
     using namespace slang::ast;
     const ClockVarSymbol* cv = clockvarOf(a.left());
@@ -206,6 +301,10 @@ bool syncDrive(const slang::ast::AssignmentExpression& a) {
     if (!a.isNonBlocking()) unsupported("a write to a clockvar other than a synchronous drive (14.16)");
     const auto& cb = cv->getParentScope()->asSymbol().as<ClockingBlockSymbol>();
     int idx = clockingIdx(cb);
+    if (auto ca = arrMap().find(cv); ca != arrMap().end()) {
+        cbArrayDrive(idx, ca->second->base, *ca->second, a);
+        return true;
+    }
     Instr i;
     i.k = IK::CbDrive;
     lhs(a.left(), i);

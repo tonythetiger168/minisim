@@ -1,0 +1,45 @@
+# Power intent for pmodel.sv: power models (6.31, 6.9), a parameter
+# (6.3) and a legacy model (6.11, 6.32).
+upf_version 4.0
+set_design_top dut
+
+define_power_model MAC_PM -for {mac} {
+    add_parameter CLAMP -default 0
+    # the interface supplies: primary (always on) and the core's switched one
+    create_power_domain PD_MAC -include_scope -supply {primary} -supply {core}
+    create_power_domain PD_CORE -elements {u_core} -supply {primary PD_MAC.core}
+    set_isolation ISO -domain PD_CORE -applies_to outputs -isolation_supply PD_MAC.primary \
+        -clamp_value $CLAMP -isolation_signal iso -isolation_sense high
+}
+
+begin_power_model ROM_PM -for {rom}
+    create_power_domain PD_ROM -include_scope -supply {primary}
+end_power_model
+
+create_power_domain PD_TOP -include_scope
+create_supply_port VDD
+create_supply_port VSW0
+create_supply_port VSW1
+create_supply_port VROM
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSW0
+create_supply_net VSW1
+create_supply_net VROM
+create_supply_net VSS
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VSW0 -ports {VSW0}
+connect_supply_net VSW1 -ports {VSW1}
+connect_supply_net VROM -ports {VROM}
+connect_supply_net VSS -ports {VSS}
+create_supply_set SS -function {power VDD} -function {ground VSS}
+create_supply_set SS0 -function {power VSW0} -function {ground VSS}
+create_supply_set SS1 -function {power VSW1} -function {ground VSS}
+create_supply_set SSR -function {power VROM} -function {ground VSS}
+associate_supply_set SS -handle PD_TOP.primary
+
+apply_power_model MAC_PM -elements {u_mac1} -parameters {{CLAMP 1}} \
+    -supply_map {{PD_MAC.primary SS} {PD_MAC.core SS1}}
+# every other instance of mac
+apply_power_model MAC_PM -supply_map {{PD_MAC.primary SS} {PD_MAC.core SS0}}
+apply_power_model ROM_PM -elements {u_rom} -supply_map {{PD_ROM.primary SSR}}

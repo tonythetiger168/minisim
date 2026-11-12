@@ -8,15 +8,20 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
+  one cycle, crossing from a clock of shorter period into one of longer
+  period through a plain synchronizer, can be missed. Periods come from
+  `create_clock -period`, and for a generated clock from its master with
+  `-divide_by` / `-multiply_by`. A toggle or a held request is not reported.
+- Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
+  `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
+  the last place), checked by `tests/dw/more.sv`.
 - VPI threads and frames (38.36.1): `vpi_handle(vpiThread / vpiFrame, NULL)`
   in a calltf, thread objects (`vpiParent`, `vpiFrame`, child threads) and
   frame objects (`vpiScope`, `vpiParent`, `vpiThread`, `vpiAutomatic`), both
   with `vpiValid`, and the callbacks `cbStartOfThread`, `cbEndOfThread`,
   `cbEnterThread`, `cbStartOfFrame` and `cbEndOfFrame`. The value of a
   system task argument that is an automatic variable no longer crashes.
-- Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
-  `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
-  the last place), checked by `tests/dw/more.sv`.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -75,6 +80,13 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `msim -cm <metrics>` now selects the code coverage metrics written. It takes
+  three notations: VCS `line+branch+cond+tgl+fsm`, Xcelium `b:e:t:f` or
+  `all`, and Questa `bcesftx`. `msim -cm_hier <file>` selects the part of
+  the design by instance, module or file. It reads VCS `+tree`/`-tree`
+  lines and Xcelium covfile `select_coverage` / `deselect_coverage`
+  commands. Before this, `-cm` wrote every metric. Covergroups and
+  assertions are always written.
 - `mlint` clock checks: `CDC007` (a clock read as data) and `CDC008` (a
   clock made by combinational logic of a clock and other signals, which can
   glitch).
@@ -87,6 +99,39 @@ Spec references are IEEE 1800-2023 clauses.
   `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with
   transition detection (6.7, 9.4); `create_power_state_group` (6.22);
   `-applies_to_boundary` on isolation and level-shifter strategies.
+- UPF (IEEE 1801-2024): `create_composite_domain` (6.17), `set_equivalent`
+  (6.47), `connect_supply_set` (6.15), `set_simstate_behavior` (6.56),
+  `set_design_attributes` (6.44), `set_port_attributes` (6.51),
+  `set_retention_elements` (6.54), `set_partial_on_translation` (6.50) and
+  `add_supply_state` with `{net_state voltage}` (6.8) are applied instead of
+  read and ignored; `mlint -upf` rule `UPF007`. See `docs/LOWPOWER.md`.
+- UPF (IEEE 1801-2024): `sim_corruption_control` (6.59),
+  `sim_assertion_control` (6.58) and `load_simstate_behavior` (6.34).
+- UPF (IEEE 1801-2024): power models: `define_power_model` (6.31),
+  `begin_power_model` / `end_power_model` (6.11, 6.32), `apply_power_model`
+  (6.9) with `-supply_map`, `-port_map` and `-parameters`, and
+  `add_parameter` (6.3).
+- UPF (IEEE 1801-2024): `bind_checker` (6.12) instantiates checker modules
+  in the design through SV `bind` directives; `sim_replay_control` (6.60)
+  runs initial blocks again when their domain powers up; `save_upf` (6.42)
+  writes the power intent of a scope.
+- UPF (IEEE 1801-2024): `(* UPF_... *)` attributes in the HDL (5.6) are read
+  by `msim -upf` and `mlint -upf`, below UPF commands in precedence (5.7);
+  the Table 8 model-only and instance-only rules are errors.
+- UPF (IEEE 1801-2024): `create_abstract_power_source` (6.16) switches a
+  supply set between input supply sets, with ack ports.
+- UPF (IEEE 1801-2024): value conversion methods (`create_vcm`, 6.30) with
+  `connect_supply_net -vcm`: tables for one-bit, real, integer and enum HDL
+  ports, VCM lists, and ports of type `upfSupplyTypeT` without conversion
+  (4.10); UPF libraries (`create_upf_library`, `use_upf_library`,
+  `load_upf_library`; 5.11, 6.29, 6.36, 6.63).
+- UPF (IEEE 1801-2024): function and model VCMs (6.30.8, 6.30.9) are
+  simulated: the function is called, or the model instantiated, on the port
+  through a module bound into the simulation top.
+- UPF (IEEE 1801-2024): supply ports connected by pg_type:
+  `connect_supply_net -pg_type` with `-cells`, `-domain`, `-elements` (6.14),
+  `connect_supply_set -connect` (6.15), and the automatic connection of a
+  domain's primary supply set (4.5.4.6.2).
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.
@@ -518,6 +563,17 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `break` and `continue` in `while`, `do ... while`, `repeat` and
+  `forever` loops are merged; once a break or the condition of an unbounded
+  loop is unknown, what the loop assigns becomes x. Fixed: a `foreach` or
+  `repeat` loop whose body met an unknown condition in the clean copy
+  continued with a stale loop counter.
+- `-xprop`: a configuration file (`-xprop=<file>` or `-xprop-config <file>`,
+  VCS style: `tree`, `instance`, `module`, `merge`) turns X-propagation on or
+  off per instance, subtree or module. Branches that call tasks or functions
+  are merged (their writes too); `break` and `continue` in `for` / `foreach`
+  loops are merged; an array write whose index has an unknown bit merges
+  into every element the index may name.
 - `-xprop`: the clean copy uses the standard `case`, and clocked blocks skip
   the ambiguous-edge test when nothing went from or to x. Ibex with
   `-xprop` now costs about 12% more than without (was 30%).
@@ -891,11 +947,20 @@ Spec references are IEEE 1800-2023 clauses.
   plan where people set the owner, status, bug id and note of each failure
   bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
   and `mplan report -rules URL` to take the annotations as triage rules.
+- `src/compat.hpp` and `docs/COMPAT.md`: one shared layer that lets every tool
+  accept Synopsys, Cadence or Siemens command lines (`--compat=cadence`, or the
+  name the tool was started as). It renames or drops options from a per-tool
+  rule table and prints messages in the chosen vendor's layout. The engine
+  stays the same; nothing is implemented twice. Unit test `test_compat`.
 - `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
   / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
   state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
+- `c ? q.pop_front() : d` (and `pop_back`) runs the pop only in the chosen
+  arm, after the condition (11.4.11). It used to pop first, so a condition
+  on `q.size()` popping the last element gave `d` and lost the element.
+  Found by the SPI VIP's slave model.
 - `x inside {q}` in a constraint, where `q` is a queue or dynamic array (a
   caller's variable in `randomize() with`, or a class property), no longer
   makes randomize() fail: the solver narrows x to the container's elements
