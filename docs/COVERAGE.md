@@ -18,9 +18,9 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 |---|---|---|---|
 | 4.4–4.9 | Scheduling regions | ✅ | preponed (sampled values), active, inactive (`#0`), NBA, observed, reactive, re-inactive, re-NBA, postponed; once the reactive set starts it runs until it is empty (4.5). Program code runs in the reactive set (24). `4.9.4-nba-strobe`, `16.4-observed-final` |
 | 5.7.1 | Integer literals | ✅ | sized, unsized, x/z digits, signed (`'s`), and `'0` `'1` `'x` `'z` in any context. `5.7.1-unbased-unsized` |
-| 5.9 | String literals | 🟡 | up to 8 characters (64 bits). `5.9-string-literal` |
+| 5.9 | String literals | ✅ | any length, truncated on the left or zero-padded on the left to fit a vector; escape sequences (5.9.1); a line continued with a backslash; triple-quoted literals with newlines and quotes. `5.9-string-literal`, `5.9-string-literals-more` |
 | 6.5–6.7 | Nets: wire, tri, strengths | ✅ | resolution by drive strength (PR #15) |
-| 6.6.3–6.6.8 | wand/triand, wor/trior, tri0, tri1, trireg, supply0/supply1 | ✅ | wired AND/OR resolution, pull to 0/1 when undriven, trireg holds its last value (starts at x). `interconnect` nets take the width of the ports they connect (6.6.8). Not yet: arrays of these nets. `6.6.3-wired-nets`, `6.6.4-trireg`, `6.6.8-interconnect` |
+| 6.6.3–6.6.8 | wand/triand, wor/trior, tri0, tri1, trireg, supply0/supply1 | ✅ | wired AND/OR resolution, pull to 0/1 when undriven, trireg holds its last value (starts at x). `interconnect` nets take the width of the ports they connect (6.6.8). Arrays of these nets, each element resolving on its own. `6.6.3-wired-nets`, `21.4.3-readmem-multidim`, `6.6.4-trireg`, `6.6.8-interconnect` |
 | 6.6.7 | User-defined nettypes | 🟡 | `nettype T n;` and `nettype T n with f;`: the resolution function gets a dynamic array of the continuous drivers' values, runs when one changes and once at time 0 (also with no drivers), for integral and real types. Not yet: unpacked struct and array data types, part drivers. `6.6.7-nettype`, `6.6.7-nettype-resolution` |
 | 6.11 | Integer types | ✅ | int, byte, shortint, longint, integer, bit. `6.11-integer-types` |
 | 6.8 | Default values | ✅ | 2-state variables (int, bit, real, string) and unpacked arrays of them start at 0 / 0.0 / ""; 4-state at x. `6.8-default-values` |
@@ -124,7 +124,7 @@ passing (XPASS). `-sim iverilog` runs the same suite on Icarus.
 | 21.2.2–21.2.3 | $strobe, $monitor | ✅ | |
 | 21.3 | File I/O | ✅ | `$fopen` (descriptors and multichannel), `$fclose`, `$fdisplay`/`$fwrite` and b/o/h forms, `$fgets`, `$fgetc`, `$ungetc`, `$feof`, `$fscanf`, `$sscanf` (all conversions, `%*`, widths), `$fseek`, `$ftell`, `$rewind`, `$fflush`, `$fstrobe` and `$fmonitor` (any number active; `$fclose` cancels them), `$fread` into a variable or a 1-D memory with start and count. Not yet: `$fread` into an unpacked struct. `21.3-file-io`, `21.3.1-multichannel`, `21.3.2-fstrobe-fmonitor`, `21.3.4.4-fread` |
 | 21.3.3 | $sformatf, $sformat, $swrite | ✅ | the same formats as $display |
-| 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. Not yet: multidimensional targets. `21.4-readmem` |
+| 21.4 | $readmemh, $readmemb | 🟡 | 1-D memories: comments, `@addr`, start/finish, descending loads, the word-count warning. multidimensional memories in row-major order, each dimension from its low address up, an address picking a word of the highest dimension (21.4.3), for `$writememh`/`$writememb` too. Not yet: a partly indexed memory (`mem[1]`) as the target. `21.4-readmem`, `21.4.3-readmem-multidim` |
 | 21.5 | $writememh, $writememb | ✅ | 1-D memories, optional start/finish. `21.5-writemem` |
 | 21.6 | $test$plusargs, $value$plusargs | ✅ | `msim t.sv +N=5`; formats %d %h %o %b %s %f. `21.6-plusargs` |
 | 20.6.1 | $typename | ✅ | built-in, packed, enum, struct, array, class and string types, with the 20.6.1 spacing rules. `20.6.1-typename` |

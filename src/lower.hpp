@@ -6288,7 +6288,7 @@ struct Lowerer {
             if (!msym) unsupported("$readmem target that is not a whole memory");
             auto ap = arrFind(msym);
             if (!ap) unsupported("$readmem target that is not an unpacked array");
-            if (ap->dims.size() != 1) unsupported("$readmem into a multidimensional array");
+            if (ap->dynElem) unsupported("$readmem into an array of containers");
             Instr i; i.k = n[1] == 'r' ? IK::ReadMem : IK::WriteMem;
             if (fname) i.fmt = *fname;
             else i.e = strOf(*args[0]);
@@ -8219,7 +8219,12 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             default: break;
         }
         if (k == NR_WIRE) return;
-        if (n.getType().isUnpackedArray()) Lowerer::unsupported("an array of wand/wor/tri0/tri1/trireg/supply nets");
+        if (n.getType().isUnpackedArray()) {   // wor w [0:1]: each element resolves on its own (6.6.3)
+            auto a = arrMap().find(&n);
+            if (a == arrMap().end() || a->second->dynElem) Lowerer::unsupported("this array of wand/wor/tri0/tri1/trireg/supply nets");
+            for (int e = 0; e < a->second->count; e++) netKinds().push_back({a->second->base + e, k});
+            return;
+        }
         netKinds().push_back({sigmap.at(&n), k});
     }
     // A checker instance (17.3): its variables and output formals are named

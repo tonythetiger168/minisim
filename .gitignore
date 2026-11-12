@@ -6,3 +6,4 @@ build/
 tests/spec/_regress_*
 __pycache__/
 lib/sky130/pdk/
+tests/spec/spec_*.hex
